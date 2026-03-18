@@ -232,3 +232,192 @@ fn merge_key_not_found() {
 
     assert_eq!(None, get_counter(&tree, "b", 1));
 }
+
+#[test]
+fn merge_after_weak_tombstone() {
+    let folder = tempfile::tempdir().unwrap();
+    let tree = open_tree_with_counter(&folder);
+
+    tree.insert("counter", 50_i64.to_le_bytes(), 0);
+    tree.remove_weak("counter", 1);
+    tree.merge("counter", 7_i64.to_le_bytes(), 2);
+
+    // WeakTombstone stops base search — merge with base=None
+    assert_eq!(Some(7), get_counter(&tree, "counter", 3));
+}
+
+/// Merge operator that always fails
+struct FailingMerge;
+
+impl MergeOperator for FailingMerge {
+    fn merge(
+        &self,
+        _key: &[u8],
+        _base_value: Option<&[u8]>,
+        _operands: &[&[u8]],
+    ) -> lsm_tree::Result<UserValue> {
+        Err(lsm_tree::Error::MergeOperator)
+    }
+}
+
+#[test]
+fn merge_error_propagation() {
+    let folder = tempfile::tempdir().unwrap();
+    let tree = Config::new(
+        folder,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_merge_operator(Some(Arc::new(FailingMerge)))
+    .open()
+    .unwrap();
+
+    tree.merge("key", b"op1".to_vec(), 0);
+
+    let result = tree.get("key", 1);
+    assert!(result.is_err());
+}
+
+#[test]
+fn merge_multi_get() {
+    let folder = tempfile::tempdir().unwrap();
+    let tree = open_tree_with_counter(&folder);
+
+    tree.insert("a", 10_i64.to_le_bytes(), 0);
+    tree.merge("b", 1_i64.to_le_bytes(), 1);
+    tree.merge("b", 2_i64.to_le_bytes(), 2);
+    tree.insert("c", 30_i64.to_le_bytes(), 3);
+
+    let results = tree.multi_get(["a", "b", "c", "missing"], 4).unwrap();
+
+    assert_eq!(
+        results[0]
+            .as_ref()
+            .map(|v| i64::from_le_bytes((**v).try_into().unwrap())),
+        Some(10)
+    );
+    assert_eq!(
+        results[1]
+            .as_ref()
+            .map(|v| i64::from_le_bytes((**v).try_into().unwrap())),
+        Some(3)
+    );
+    assert_eq!(
+        results[2]
+            .as_ref()
+            .map(|v| i64::from_le_bytes((**v).try_into().unwrap())),
+        Some(30)
+    );
+    assert!(results[3].is_none());
+}
+
+#[test]
+fn merge_prefix_scan() -> lsm_tree::Result<()> {
+    let folder = tempfile::tempdir()?;
+    let tree = open_tree_with_counter(&folder);
+
+    tree.merge("user:1:score", 10_i64.to_le_bytes(), 0);
+    tree.merge("user:1:score", 20_i64.to_le_bytes(), 1);
+    tree.merge("user:2:score", 5_i64.to_le_bytes(), 2);
+    tree.insert("other", 99_i64.to_le_bytes(), 3);
+
+    let items: Vec<_> = tree
+        .prefix("user:", 4, None)
+        .map(|guard| {
+            let (key, value): (lsm_tree::UserKey, lsm_tree::UserValue) =
+                guard.into_inner().unwrap();
+            let val = i64::from_le_bytes((*value).try_into().unwrap());
+            (String::from_utf8(key.to_vec()).unwrap(), val)
+        })
+        .collect();
+
+    assert_eq!(items.len(), 2);
+    assert_eq!(items[0], ("user:1:score".to_string(), 30)); // 10 + 20
+    assert_eq!(items[1], ("user:2:score".to_string(), 5));
+
+    Ok(())
+}
+
+#[test]
+fn merge_contains_key() {
+    let folder = tempfile::tempdir().unwrap();
+    let tree = open_tree_with_counter(&folder);
+
+    tree.merge("exists", 1_i64.to_le_bytes(), 0);
+
+    // MergeOperand should count as "key exists" after resolution
+    assert!(tree.contains_key("exists", 1).unwrap());
+    assert!(!tree.contains_key("missing", 1).unwrap());
+}
+
+#[test]
+fn merge_major_compaction() -> lsm_tree::Result<()> {
+    let folder = tempfile::tempdir()?;
+    let tree = open_tree_with_counter(&folder);
+
+    // Write and flush multiple times to create multiple tables.
+    // Use gc_seqno_threshold=0 to preserve merge operands during flush
+    // (they can't be resolved since the base may be in a different table).
+    tree.insert("counter", 100_i64.to_le_bytes(), 0);
+    tree.flush_active_memtable(0)?;
+
+    tree.merge("counter", 10_i64.to_le_bytes(), 1);
+    tree.flush_active_memtable(0)?;
+
+    tree.merge("counter", 20_i64.to_le_bytes(), 2);
+    tree.flush_active_memtable(0)?;
+
+    // Before compaction: read path should resolve across tables
+    assert_eq!(Some(130), get_counter(&tree, "counter", 3));
+
+    // Major compaction should merge all into single entry
+    tree.major_compact(64_000_000, 3)?;
+
+    assert_eq!(Some(130), get_counter(&tree, "counter", 3));
+    assert_eq!(1, tree.table_count());
+
+    Ok(())
+}
+
+#[test]
+fn merge_reverse_range_scan() -> lsm_tree::Result<()> {
+    let folder = tempfile::tempdir()?;
+    let tree = open_tree_with_counter(&folder);
+
+    tree.insert("a", 10_i64.to_le_bytes(), 0);
+    tree.merge("b", 1_i64.to_le_bytes(), 1);
+    tree.merge("b", 2_i64.to_le_bytes(), 2);
+    tree.insert("c", 30_i64.to_le_bytes(), 3);
+
+    let items: Vec<_> = tree
+        .iter(4, None)
+        .rev()
+        .map(|guard| {
+            let (key, value): (lsm_tree::UserKey, lsm_tree::UserValue) =
+                guard.into_inner().unwrap();
+            let val = i64::from_le_bytes((*value).try_into().unwrap());
+            (String::from_utf8(key.to_vec()).unwrap(), val)
+        })
+        .collect();
+
+    assert_eq!(items.len(), 3);
+    assert_eq!(items[0], ("c".to_string(), 30));
+    assert_eq!(items[1], ("b".to_string(), 3)); // merged: 1 + 2
+    assert_eq!(items[2], ("a".to_string(), 10));
+
+    Ok(())
+}
+
+#[test]
+fn merge_overwrite_then_merge() {
+    let folder = tempfile::tempdir().unwrap();
+    let tree = open_tree_with_counter(&folder);
+
+    // Insert → overwrite → merge
+    tree.insert("key", 10_i64.to_le_bytes(), 0);
+    tree.insert("key", 20_i64.to_le_bytes(), 1);
+    tree.merge("key", 5_i64.to_le_bytes(), 2);
+
+    // Should merge with latest base (20), not first (10)
+    assert_eq!(Some(25), get_counter(&tree, "key", 3));
+}

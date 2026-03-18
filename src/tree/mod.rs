@@ -665,12 +665,11 @@ impl AbstractTree for Tree {
         let entry = Self::get_internal_entry_from_version(&super_version, key, seqno)?;
 
         match entry {
-            Some(entry) if entry.key.value_type == ValueType::MergeOperand => {
+            Some(ref entry) if entry.key.value_type == ValueType::MergeOperand => {
                 if let Some(merge_op) = &self.config.merge_operator {
-                    Self::resolve_merge_get(&super_version, key, seqno, entry, merge_op.as_ref())
+                    Self::resolve_merge_get(&super_version, key, seqno, merge_op.as_ref())
                 } else {
-                    // No merge operator configured — return raw operand bytes
-                    Ok(Some(entry.value))
+                    Ok(Some(entry.value.clone()))
                 }
             }
             Some(entry) => Ok(Some(entry.value)),
@@ -691,17 +690,11 @@ impl AbstractTree for Tree {
                 let entry = Self::get_internal_entry_from_version(&super_version, key, seqno)?;
 
                 match entry {
-                    Some(entry) if entry.key.value_type == ValueType::MergeOperand => {
+                    Some(ref entry) if entry.key.value_type == ValueType::MergeOperand => {
                         if let Some(merge_op) = &self.config.merge_operator {
-                            Self::resolve_merge_get(
-                                &super_version,
-                                key,
-                                seqno,
-                                entry,
-                                merge_op.as_ref(),
-                            )
+                            Self::resolve_merge_get(&super_version, key, seqno, merge_op.as_ref())
                         } else {
-                            Ok(Some(entry.value))
+                            Ok(Some(entry.value.clone()))
                         }
                     }
                     Some(entry) => Ok(Some(entry.value)),
@@ -819,32 +812,27 @@ impl Tree {
 
     /// Resolves merge operands for a point read.
     ///
-    /// Called when `get()` encounters a MergeOperand as the top entry.
-    /// Collects all entries for the key across all storage layers (active memtable,
+    /// Collects ALL entries for the key across all storage layers (active memtable,
     /// sealed memtables, disk tables), identifies the base value, and applies the
-    /// merge operator.
+    /// merge operator. Entries are processed from newest to oldest (descending seqno).
     fn resolve_merge_get(
         super_version: &SuperVersion,
         key: &[u8],
         seqno: SeqNo,
-        first_entry: InternalValue,
         merge_op: &dyn crate::merge_operator::MergeOperator,
     ) -> crate::Result<Option<UserValue>> {
         let mut operands: Vec<UserValue> = Vec::new();
         let mut base_value: Option<UserValue> = None;
+        let mut found_base = false;
 
-        // Process entries from a source. Returns true if a base value
-        // or tombstone was found (stop scanning).
+        // Process a single entry. Returns true if search should stop.
         let mut process_entry = |entry: &InternalValue| -> bool {
             match entry.key.value_type {
                 ValueType::Value | ValueType::Indirection => {
                     base_value = Some(entry.value.clone());
                     true
                 }
-                ValueType::Tombstone | ValueType::WeakTombstone => {
-                    // Tombstone kills everything below — no base value
-                    true
-                }
+                ValueType::Tombstone | ValueType::WeakTombstone => true,
                 ValueType::MergeOperand => {
                     operands.push(entry.value.clone());
                     false
@@ -852,40 +840,27 @@ impl Tree {
             }
         };
 
-        // Process the first entry (which we already know is a MergeOperand)
-        process_entry(&first_entry);
-
-        // Scan active memtable for remaining entries of this key
-        let active_entries = super_version.active_memtable.get_all_for_key(key, seqno);
-        let mut found_base = false;
-        // Skip the first entry (already processed) by comparing seqno
-        for entry in &active_entries {
-            if entry.key.seqno == first_entry.key.seqno {
-                continue;
-            }
+        // 1. Scan active memtable — returns all entries for key in desc seqno order
+        for entry in &super_version.active_memtable.get_all_for_key(key, seqno) {
             if process_entry(entry) {
                 found_base = true;
                 break;
             }
         }
 
-        // Scan sealed memtables
+        // 2. Scan sealed memtables (newest first)
         if !found_base {
-            for mt in super_version.sealed_memtables.iter().rev() {
-                let entries = mt.get_all_for_key(key, seqno);
-                for entry in &entries {
+            'sealed: for mt in super_version.sealed_memtables.iter().rev() {
+                for entry in &mt.get_all_for_key(key, seqno) {
                     if process_entry(entry) {
                         found_base = true;
-                        break;
+                        break 'sealed;
                     }
-                }
-                if found_base {
-                    break;
                 }
             }
         }
 
-        // Scan tables on disk
+        // 3. Scan tables on disk (each table returns at most one entry per key)
         if !found_base {
             let key_hash = crate::table::filter::standard_bloom::Builder::get_hash(key);
 
@@ -904,14 +879,13 @@ impl Tree {
         }
 
         if operands.is_empty() {
-            // Only base value or nothing — should not happen since first_entry was MergeOperand
             return Ok(base_value);
         }
 
         // Reverse operands to chronological order (ascending seqno)
         operands.reverse();
 
-        let operand_refs: Vec<&[u8]> = operands.iter().map(|v| v.as_ref()).collect();
+        let operand_refs: Vec<&[u8]> = operands.iter().map(AsRef::as_ref).collect();
         let merged = merge_op.merge(key, base_value.as_deref(), &operand_refs)?;
 
         Ok(Some(merged))

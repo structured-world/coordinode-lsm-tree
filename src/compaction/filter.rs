@@ -141,7 +141,7 @@ impl<'a> ItemAccessor<'a> {
     /// This method will return an error if blob retrieval fails.
     pub fn value(&self) -> crate::Result<UserValue> {
         match self.item.key.value_type {
-            crate::ValueType::Value => Ok(self.item.value.clone()),
+            crate::ValueType::Value | crate::ValueType::MergeOperand => Ok(self.item.value.clone()),
             crate::ValueType::Indirection => {
                 // Resolve and read the value from a blob file.
                 let mut reader = &self.item.value[..];
@@ -162,7 +162,6 @@ impl<'a> ItemAccessor<'a> {
                     Err(crate::Error::Unrecoverable)
                 }
             }
-            crate::ValueType::MergeOperand => Ok(self.item.value.clone()),
             crate::ValueType::WeakTombstone | crate::ValueType::Tombstone => {
                 unreachable!("tombstones are filtered out before calling filter")
             }

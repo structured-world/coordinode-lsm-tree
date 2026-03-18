@@ -148,7 +148,7 @@ impl Memtable {
     /// ordered by descending sequence number (newest first).
     ///
     /// Used by the merge operator read path to collect all operands for a key.
-    pub fn get_all_for_key(&self, key: &[u8], seqno: SeqNo) -> Vec<InternalValue> {
+    pub(crate) fn get_all_for_key(&self, key: &[u8], seqno: SeqNo) -> Vec<InternalValue> {
         if seqno == 0 {
             return Vec::new();
         }

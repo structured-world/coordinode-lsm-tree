@@ -75,7 +75,7 @@ impl<I: DoubleEndedIterator<Item = crate::Result<InternalValue>>> MvccStream<I> 
         // Reverse to chronological order (ascending seqno)
         operands.reverse();
 
-        let operand_refs: Vec<&[u8]> = operands.iter().map(|v| v.as_ref()).collect();
+        let operand_refs: Vec<&[u8]> = operands.iter().map(AsRef::as_ref).collect();
         let merged = merge_op.merge(user_key, base_value.as_deref(), &operand_refs)?;
 
         Ok(InternalValue::from_components(
@@ -86,34 +86,15 @@ impl<I: DoubleEndedIterator<Item = crate::Result<InternalValue>>> MvccStream<I> 
         ))
     }
 
-    /// Resolves a single merge operand (no other entries for this key).
-    fn resolve_merge_single(
-        &self,
-        entry: &InternalValue,
-        merge_op: &dyn MergeOperator,
-    ) -> crate::Result<InternalValue> {
-        let operand_refs: Vec<&[u8]> = vec![entry.value.as_ref()];
-        let merged = merge_op.merge(&entry.key.user_key, None, &operand_refs)?;
-        Ok(InternalValue::from_components(
-            entry.key.user_key.clone(),
-            merged,
-            entry.key.seqno,
-            ValueType::Value,
-        ))
-    }
-
     /// Resolves buffered entries for reverse iteration merge.
-    /// `entries` are in ascending seqno order (oldest first, as collected by next_back).
+    /// `entries` are in ascending seqno order (oldest first, as collected by `next_back`).
     fn resolve_merge_buffered(&self, entries: Vec<InternalValue>) -> crate::Result<InternalValue> {
-        let merge_op = match &self.merge_operator {
-            Some(op) => op,
-            None => {
-                // No merge operator — return newest entry (last in ascending order)
-                return entries
-                    .into_iter()
-                    .last()
-                    .ok_or(crate::Error::Unrecoverable);
-            }
+        let Some(merge_op) = &self.merge_operator else {
+            // No merge operator — return newest entry (last in ascending order)
+            return entries
+                .into_iter()
+                .last()
+                .ok_or(crate::Error::Unrecoverable);
         };
 
         // entries are in ascending seqno order (oldest→newest)
@@ -147,7 +128,7 @@ impl<I: DoubleEndedIterator<Item = crate::Result<InternalValue>>> MvccStream<I> 
         // Reverse operands to chronological order (ascending seqno)
         operands.reverse();
 
-        let operand_refs: Vec<&[u8]> = operands.iter().map(|v| v.as_ref()).collect();
+        let operand_refs: Vec<&[u8]> = operands.iter().map(AsRef::as_ref).collect();
         let merged = merge_op.merge(&result_key, base_value.as_deref(), &operand_refs)?;
 
         Ok(InternalValue::from_components(
@@ -201,11 +182,17 @@ impl<I: DoubleEndedIterator<Item = crate::Result<InternalValue>>> DoubleEndedIte
     for MvccStream<I>
 {
     fn next_back(&mut self) -> Option<Self::Item> {
-        // Buffer for collecting entries in merge-aware reverse iteration
+        // Buffer ALL entries for a key during reverse iteration when merge operator is configured
+        let has_merge_op = self.merge_operator.is_some();
         let mut key_entries: Vec<InternalValue> = Vec::new();
+        let mut has_merge_operand = false;
 
         loop {
             let tail = fail_iter!(self.inner.next_back()?);
+
+            if tail.key.value_type.is_merge_operand() {
+                has_merge_operand = true;
+            }
 
             let prev = match self.inner.peek_back() {
                 Some(Ok(prev)) => prev,
@@ -221,45 +208,34 @@ impl<I: DoubleEndedIterator<Item = crate::Result<InternalValue>>> DoubleEndedIte
                         .expect_err("should be error")));
                 }
                 None => {
-                    // Last item in iterator — check if we have buffered merge entries
-                    if !key_entries.is_empty() {
+                    // Last item — resolve merge if needed
+                    if has_merge_op && has_merge_operand {
                         key_entries.push(tail);
                         return Some(self.resolve_merge_buffered(key_entries));
                     }
-                    // Check if this single entry is a merge operand
-                    if tail.key.value_type.is_merge_operand() {
-                        if let Some(merge_op) = self.merge_operator.clone() {
-                            return Some(self.resolve_merge_single(&tail, merge_op.as_ref()));
-                        }
+                    if !key_entries.is_empty() {
+                        // Had multi-version key but no merge operands — return newest (tail)
+                        return Some(Ok(tail));
                     }
                     return Some(Ok(tail));
                 }
             };
 
             if prev.key.user_key < tail.key.user_key {
-                // `tail` is the newest entry for this key
-                if !key_entries.is_empty() {
+                // `tail` is the newest entry for this key — boundary reached
+                if has_merge_op && has_merge_operand {
                     key_entries.push(tail);
                     return Some(self.resolve_merge_buffered(key_entries));
                 }
-                // Check if this single entry needs merge resolution
-                if tail.key.value_type.is_merge_operand() {
-                    if let Some(merge_op) = self.merge_operator.clone() {
-                        return Some(self.resolve_merge_single(&tail, merge_op.as_ref()));
-                    }
-                }
+                // Normal: return newest version
                 return Some(Ok(tail));
             }
 
-            // Same key — if merge operator is configured and any entry is MergeOperand,
-            // we need to buffer entries for merge resolution
-            if self.merge_operator.is_some() && tail.key.value_type.is_merge_operand() {
-                key_entries.push(tail);
-            } else if !key_entries.is_empty() {
-                // Already buffering for this key — continue
+            // Same key — buffer entry for potential merge resolution
+            if has_merge_op {
                 key_entries.push(tail);
             }
-            // Otherwise: normal behavior — just skip older versions (loop continues)
+            // Without merge operator: just skip older versions (loop continues)
         }
     }
 }
@@ -864,5 +840,246 @@ mod tests {
         test_reverse!(vec);
 
         Ok(())
+    }
+
+    mod merge_operator_tests {
+        use super::*;
+        use std::sync::Arc;
+        use test_log::test;
+
+        /// Concatenation merge operator for testing
+        struct ConcatMerge;
+
+        impl crate::merge_operator::MergeOperator for ConcatMerge {
+            fn merge(
+                &self,
+                _key: &[u8],
+                base_value: Option<&[u8]>,
+                operands: &[&[u8]],
+            ) -> crate::Result<crate::UserValue> {
+                let mut result = match base_value {
+                    Some(b) => String::from_utf8_lossy(b).to_string(),
+                    None => String::new(),
+                };
+                for op in operands {
+                    if !result.is_empty() {
+                        result.push(',');
+                    }
+                    result.push_str(&String::from_utf8_lossy(op));
+                }
+                Ok(result.into_bytes().into())
+            }
+        }
+
+        fn merge_op() -> Option<Arc<dyn crate::merge_operator::MergeOperator>> {
+            Some(Arc::new(ConcatMerge))
+        }
+
+        #[test]
+        #[expect(clippy::unwrap_used)]
+        fn mvcc_merge_forward_operands_only() -> crate::Result<()> {
+            let vec = vec![
+                InternalValue::from_components("a", "op2", 2, ValueType::MergeOperand),
+                InternalValue::from_components("a", "op1", 1, ValueType::MergeOperand),
+            ];
+
+            let iter = Box::new(vec.into_iter().map(Ok));
+            let mut iter = MvccStream::new(iter, merge_op());
+
+            let item = iter.next().unwrap()?;
+            assert_eq!(item.key.value_type, ValueType::Value);
+            assert_eq!(&*item.value, b"op1,op2");
+            assert!(iter.next().is_none());
+
+            Ok(())
+        }
+
+        #[test]
+        #[expect(clippy::unwrap_used)]
+        fn mvcc_merge_forward_with_base() -> crate::Result<()> {
+            let vec = vec![
+                InternalValue::from_components("a", "op2", 3, ValueType::MergeOperand),
+                InternalValue::from_components("a", "op1", 2, ValueType::MergeOperand),
+                InternalValue::from_components("a", "base", 1, ValueType::Value),
+            ];
+
+            let iter = Box::new(vec.into_iter().map(Ok));
+            let mut iter = MvccStream::new(iter, merge_op());
+
+            let item = iter.next().unwrap()?;
+            assert_eq!(&*item.value, b"base,op1,op2");
+            assert!(iter.next().is_none());
+
+            Ok(())
+        }
+
+        #[test]
+        #[expect(clippy::unwrap_used)]
+        fn mvcc_merge_forward_with_tombstone() -> crate::Result<()> {
+            let vec = vec![
+                InternalValue::from_components("a", "op1", 3, ValueType::MergeOperand),
+                InternalValue::from_components("a", "", 2, ValueType::Tombstone),
+                InternalValue::from_components("a", "old", 1, ValueType::Value),
+            ];
+
+            let iter = Box::new(vec.into_iter().map(Ok));
+            let mut iter = MvccStream::new(iter, merge_op());
+
+            // Merge above tombstone: no base
+            let item = iter.next().unwrap()?;
+            assert_eq!(&*item.value, b"op1");
+            assert!(iter.next().is_none());
+
+            Ok(())
+        }
+
+        #[test]
+        #[expect(clippy::unwrap_used)]
+        fn mvcc_merge_forward_mixed_keys() -> crate::Result<()> {
+            let vec = vec![
+                InternalValue::from_components("a", "val_a", 5, ValueType::Value),
+                InternalValue::from_components("b", "op2", 4, ValueType::MergeOperand),
+                InternalValue::from_components("b", "op1", 3, ValueType::MergeOperand),
+                InternalValue::from_components("c", "val_c", 2, ValueType::Value),
+            ];
+
+            let iter = Box::new(vec.into_iter().map(Ok));
+            let iter = MvccStream::new(iter, merge_op());
+            let out: Vec<_> = iter.map(Result::unwrap).collect();
+
+            assert_eq!(out.len(), 3);
+            assert_eq!(&*out[0].value, b"val_a");
+            assert_eq!(&*out[1].value, b"op1,op2");
+            assert_eq!(&*out[2].value, b"val_c");
+
+            Ok(())
+        }
+
+        #[test]
+        #[expect(clippy::unwrap_used)]
+        fn mvcc_merge_reverse_operands_with_base() -> crate::Result<()> {
+            let vec = vec![
+                InternalValue::from_components("a", "op2", 3, ValueType::MergeOperand),
+                InternalValue::from_components("a", "op1", 2, ValueType::MergeOperand),
+                InternalValue::from_components("a", "base", 1, ValueType::Value),
+            ];
+
+            let iter = Box::new(vec.into_iter().map(Ok));
+            let mut iter = MvccStream::new(iter, merge_op());
+
+            let item = iter.next_back().unwrap()?;
+            assert_eq!(&*item.value, b"base,op1,op2");
+            assert!(iter.next_back().is_none());
+
+            Ok(())
+        }
+
+        #[test]
+        #[expect(clippy::unwrap_used)]
+        fn mvcc_merge_reverse_operands_only() -> crate::Result<()> {
+            let vec = vec![
+                InternalValue::from_components("a", "op2", 2, ValueType::MergeOperand),
+                InternalValue::from_components("a", "op1", 1, ValueType::MergeOperand),
+            ];
+
+            let iter = Box::new(vec.into_iter().map(Ok));
+            let mut iter = MvccStream::new(iter, merge_op());
+
+            let item = iter.next_back().unwrap()?;
+            assert_eq!(&*item.value, b"op1,op2");
+            assert!(iter.next_back().is_none());
+
+            Ok(())
+        }
+
+        #[test]
+        #[expect(clippy::unwrap_used)]
+        fn mvcc_merge_reverse_mixed_keys() -> crate::Result<()> {
+            let vec = vec![
+                InternalValue::from_components("a", "val_a", 5, ValueType::Value),
+                InternalValue::from_components("b", "op2", 4, ValueType::MergeOperand),
+                InternalValue::from_components("b", "op1", 3, ValueType::MergeOperand),
+                InternalValue::from_components("c", "val_c", 2, ValueType::Value),
+            ];
+
+            let iter = Box::new(vec.into_iter().map(Ok));
+            let iter = MvccStream::new(iter, merge_op());
+            let out: Vec<_> = iter.rev().map(Result::unwrap).collect();
+
+            // Reverse: c, b(merged), a
+            assert_eq!(out.len(), 3);
+            assert_eq!(&*out[0].value, b"val_c");
+            assert_eq!(&*out[1].value, b"op1,op2");
+            assert_eq!(&*out[2].value, b"val_a");
+
+            Ok(())
+        }
+
+        #[test]
+        #[expect(clippy::unwrap_used)]
+        fn mvcc_merge_reverse_single_operand_last() -> crate::Result<()> {
+            // Single merge operand as last item in reverse iteration
+            let vec = vec![InternalValue::from_components(
+                "a",
+                "op1",
+                1,
+                ValueType::MergeOperand,
+            )];
+
+            let iter = Box::new(vec.into_iter().map(Ok));
+            let mut iter = MvccStream::new(iter, merge_op());
+
+            let item = iter.next_back().unwrap()?;
+            assert_eq!(&*item.value, b"op1");
+            assert_eq!(item.key.value_type, ValueType::Value);
+
+            Ok(())
+        }
+
+        #[test]
+        #[expect(clippy::unwrap_used)]
+        fn mvcc_merge_no_operator_passthrough() -> crate::Result<()> {
+            // Without merge operator, MergeOperand entries returned as-is (latest version wins)
+            let vec = vec![
+                InternalValue::from_components("a", "op2", 2, ValueType::MergeOperand),
+                InternalValue::from_components("a", "op1", 1, ValueType::MergeOperand),
+            ];
+
+            let iter = Box::new(vec.into_iter().map(Ok));
+            let mut iter = MvccStream::new(iter, None);
+
+            let item = iter.next().unwrap()?;
+            assert_eq!(item.key.value_type, ValueType::MergeOperand);
+            assert_eq!(&*item.value, b"op2"); // latest only
+            assert!(iter.next().is_none());
+
+            Ok(())
+        }
+
+        #[test]
+        #[expect(clippy::unwrap_used)]
+        fn mvcc_merge_reverse_single_operand_with_different_key() -> crate::Result<()> {
+            // Single merge operand key followed by regular key in reverse
+            let vec = vec![
+                InternalValue::from_components("a", "val_a", 5, ValueType::Value),
+                InternalValue::from_components("b", "op1", 3, ValueType::MergeOperand),
+            ];
+
+            let iter = Box::new(vec.into_iter().map(Ok));
+            let mut iter = MvccStream::new(iter, merge_op());
+
+            // Reverse: b(merged), a
+            let item = iter.next_back().unwrap()?;
+            assert_eq!(&*item.key.user_key, b"b");
+            assert_eq!(&*item.value, b"op1");
+            assert_eq!(item.key.value_type, ValueType::Value);
+
+            let item = iter.next_back().unwrap()?;
+            assert_eq!(&*item.key.user_key, b"a");
+
+            assert!(iter.next_back().is_none());
+
+            Ok(())
+        }
     }
 }

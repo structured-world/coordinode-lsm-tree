@@ -126,7 +126,7 @@ impl<'a, I: Iterator<Item = Item>, F: StreamFilter + 'a> CompactionStream<'a, I,
 
     /// Collects merge operands and resolves them via the merge operator.
     ///
-    /// `head` is the first MergeOperand entry (highest seqno).
+    /// `head` is the first `MergeOperand` entry (highest seqno).
     /// Collects subsequent same-key entries, merges them, and returns the merged Value.
     fn resolve_merge_operands(
         &mut self,
@@ -179,7 +179,7 @@ impl<'a, I: Iterator<Item = Item>, F: StreamFilter + 'a> CompactionStream<'a, I,
         // Reverse to chronological order (ascending seqno)
         operands.reverse();
 
-        let operand_refs: Vec<&[u8]> = operands.iter().map(|v| v.as_ref()).collect();
+        let operand_refs: Vec<&[u8]> = operands.iter().map(AsRef::as_ref).collect();
         let merged = merge_op.merge(&user_key, base_value.as_deref(), &operand_refs)?;
 
         Ok(InternalValue::from_components(
@@ -276,8 +276,11 @@ impl<'a, I: Iterator<Item = Item>, F: StreamFilter + 'a> Iterator for Compaction
                         }
                     }
                 } else if peeked.key.seqno < self.gc_seqno_threshold {
-                    // Merge operands below GC watermark: collapse via merge operator
-                    if head.key.value_type.is_merge_operand() {
+                    // Merge operands below GC watermark: collapse via merge operator.
+                    // Both head AND peeked must be below threshold for MVCC safety.
+                    if head.key.value_type.is_merge_operand()
+                        && head.key.seqno < self.gc_seqno_threshold
+                    {
                         if let Some(merge_op) = self.merge_operator.clone() {
                             let mut merged =
                                 fail_iter!(self.resolve_merge_operands(head, merge_op.as_ref()));
@@ -287,24 +290,28 @@ impl<'a, I: Iterator<Item = Item>, F: StreamFilter + 'a> Iterator for Compaction
                             }
                             return Some(Ok(merged));
                         }
-                    }
 
-                    if head.key.value_type == ValueType::Tombstone && self.evict_tombstones {
+                        // No merge operator — DO NOT drain merge operands.
+                        // They are additive deltas, not superseding versions.
+                        // The read path will resolve them on-the-fly.
+                    } else {
+                        if head.key.value_type == ValueType::Tombstone && self.evict_tombstones {
+                            fail_iter!(self.drain_key(&head.key.user_key));
+                            continue;
+                        }
+
+                        // NOTE: If next item is an actual value, and current value is weak tombstone,
+                        // drop the tombstone
+                        let drop_weak_tombstone = peeked.key.value_type == ValueType::Value
+                            && head.key.value_type == ValueType::WeakTombstone;
+
+                        // NOTE: Next item is expired,
+                        // so the tail of this user key is entirely expired, so drain it all
                         fail_iter!(self.drain_key(&head.key.user_key));
-                        continue;
-                    }
 
-                    // NOTE: If next item is an actual value, and current value is weak tombstone,
-                    // drop the tombstone
-                    let drop_weak_tombstone = peeked.key.value_type == ValueType::Value
-                        && head.key.value_type == ValueType::WeakTombstone;
-
-                    // NOTE: Next item is expired,
-                    // so the tail of this user key is entirely expired, so drain it all
-                    fail_iter!(self.drain_key(&head.key.user_key));
-
-                    if drop_weak_tombstone {
-                        continue;
+                        if drop_weak_tombstone {
+                            continue;
+                        }
                     }
                 }
             } else if head.is_tombstone() && self.evict_tombstones {
@@ -349,6 +356,7 @@ mod tests {
                     "V" => ValueType::Value,
                     "T" => ValueType::Tombstone,
                     "W" => ValueType::WeakTombstone,
+                    "M" => ValueType::MergeOperand,
                     _ => panic!("Unknown value type"),
                 };
 
@@ -937,6 +945,271 @@ mod tests {
                 //
                 kv(b"d", 0, b"c", false),
             ]);
+        }
+    }
+
+    mod merge_operator_tests {
+        use super::*;
+        use std::sync::Arc;
+        use test_log::test;
+
+        /// Concatenation merge operator: joins all operands with ","
+        struct ConcatMerge;
+
+        impl crate::merge_operator::MergeOperator for ConcatMerge {
+            fn merge(
+                &self,
+                _key: &[u8],
+                base_value: Option<&[u8]>,
+                operands: &[&[u8]],
+            ) -> crate::Result<UserValue> {
+                let mut result = match base_value {
+                    Some(b) => String::from_utf8_lossy(b).to_string(),
+                    None => String::new(),
+                };
+                for op in operands {
+                    if !result.is_empty() {
+                        result.push(',');
+                    }
+                    result.push_str(&String::from_utf8_lossy(op));
+                }
+                Ok(result.into_bytes().into())
+            }
+        }
+
+        fn merge_op() -> Option<Arc<dyn crate::merge_operator::MergeOperator>> {
+            Some(Arc::new(ConcatMerge))
+        }
+
+        #[test]
+        #[expect(clippy::unwrap_used)]
+        fn compaction_merge_operands_below_gc() -> crate::Result<()> {
+            // All entries below gc_seqno_threshold=1000 → should be merged
+            #[rustfmt::skip]
+            let vec = stream![
+                "a", "op2", "M",
+                "a", "op1", "M",
+            ];
+
+            let iter = vec.iter().cloned().map(Ok);
+            let mut iter = CompactionStream::new(iter, 1_000).with_merge_operator(merge_op());
+
+            let item = iter.next().unwrap()?;
+            assert_eq!(item.key.value_type, ValueType::Value);
+            assert_eq!(&*item.value, b"op1,op2");
+            assert!(iter.next().is_none());
+
+            Ok(())
+        }
+
+        #[test]
+        #[expect(clippy::unwrap_used)]
+        fn compaction_merge_with_base_below_gc() -> crate::Result<()> {
+            // Merge operands + base value, all below gc threshold
+            #[rustfmt::skip]
+            let vec = stream![
+                "a", "op2", "M",
+                "a", "op1", "M",
+                "a", "base", "V",
+            ];
+
+            let iter = vec.iter().cloned().map(Ok);
+            let mut iter = CompactionStream::new(iter, 1_000).with_merge_operator(merge_op());
+
+            let item = iter.next().unwrap()?;
+            assert_eq!(item.key.value_type, ValueType::Value);
+            assert_eq!(&*item.value, b"base,op1,op2");
+            assert!(iter.next().is_none());
+
+            Ok(())
+        }
+
+        #[test]
+        #[expect(clippy::unwrap_used)]
+        fn compaction_merge_with_tombstone_below_gc() -> crate::Result<()> {
+            // Merge operand above tombstone → merge with no base
+            #[rustfmt::skip]
+            let vec = stream![
+                "a", "op1", "M",
+                "a", "", "T",
+            ];
+
+            let iter = vec.iter().cloned().map(Ok);
+            let mut iter = CompactionStream::new(iter, 1_000).with_merge_operator(merge_op());
+
+            let item = iter.next().unwrap()?;
+            assert_eq!(item.key.value_type, ValueType::Value);
+            assert_eq!(&*item.value, b"op1");
+            assert!(iter.next().is_none());
+
+            Ok(())
+        }
+
+        #[test]
+        #[expect(clippy::unwrap_used)]
+        fn compaction_merge_above_gc_preserved() -> crate::Result<()> {
+            // Entries above gc_seqno_threshold → NOT merged, preserved as-is
+            #[rustfmt::skip]
+            let vec = stream![
+                "a", "op2", "M",
+                "a", "op1", "M",
+            ];
+
+            let iter = vec.iter().cloned().map(Ok);
+            let mut iter = CompactionStream::new(iter, 0) // gc_threshold=0, nothing expired
+                .with_merge_operator(merge_op());
+
+            let item = iter.next().unwrap()?;
+            assert_eq!(item.key.value_type, ValueType::MergeOperand);
+            assert_eq!(&*item.value, b"op2");
+
+            let item = iter.next().unwrap()?;
+            assert_eq!(item.key.value_type, ValueType::MergeOperand);
+            assert_eq!(&*item.value, b"op1");
+
+            assert!(iter.next().is_none());
+
+            Ok(())
+        }
+
+        #[test]
+        #[expect(clippy::unwrap_used)]
+        fn compaction_merge_lone_operand_below_gc() -> crate::Result<()> {
+            // Single merge operand (only entry for key) below gc → resolve to Value
+            let vec = vec![
+                InternalValue::from_components("a", "lone_op", 5, ValueType::MergeOperand),
+                InternalValue::from_components("b", "regular", 6, ValueType::Value),
+            ];
+
+            let iter = vec.iter().cloned().map(Ok);
+            let mut iter = CompactionStream::new(iter, 1_000).with_merge_operator(merge_op());
+
+            let item = iter.next().unwrap()?;
+            assert_eq!(item.key.value_type, ValueType::Value);
+            assert_eq!(&*item.value, b"lone_op");
+            assert_eq!(&*item.key.user_key, b"a");
+
+            let item = iter.next().unwrap()?;
+            assert_eq!(&*item.key.user_key, b"b");
+            assert_eq!(&*item.value, b"regular");
+
+            assert!(iter.next().is_none());
+
+            Ok(())
+        }
+
+        #[test]
+        #[expect(clippy::unwrap_used)]
+        fn compaction_merge_last_item_operand() -> crate::Result<()> {
+            // Last item in entire stream is a merge operand below gc
+            let vec = vec![InternalValue::from_components(
+                "z",
+                "last",
+                5,
+                ValueType::MergeOperand,
+            )];
+
+            let iter = vec.iter().cloned().map(Ok);
+            let mut iter = CompactionStream::new(iter, 1_000).with_merge_operator(merge_op());
+
+            let item = iter.next().unwrap()?;
+            assert_eq!(item.key.value_type, ValueType::Value);
+            assert_eq!(&*item.value, b"last");
+
+            assert!(iter.next().is_none());
+
+            Ok(())
+        }
+
+        #[test]
+        #[expect(clippy::unwrap_used)]
+        fn compaction_merge_mixed_keys() -> crate::Result<()> {
+            // Multiple keys, some with merge operands, some without
+            let vec = vec![
+                InternalValue::from_components("a", "val_a", 10, ValueType::Value),
+                InternalValue::from_components("b", "op2", 9, ValueType::MergeOperand),
+                InternalValue::from_components("b", "op1", 8, ValueType::MergeOperand),
+                InternalValue::from_components("b", "base_b", 7, ValueType::Value),
+                InternalValue::from_components("c", "val_c", 6, ValueType::Value),
+            ];
+
+            let iter = vec.iter().cloned().map(Ok);
+            let iter = CompactionStream::new(iter, 1_000).with_merge_operator(merge_op());
+
+            let out: Vec<_> = iter.map(Result::unwrap).collect();
+
+            assert_eq!(out.len(), 3);
+            assert_eq!(&*out[0].key.user_key, b"a");
+            assert_eq!(&*out[0].value, b"val_a");
+            assert_eq!(&*out[1].key.user_key, b"b");
+            assert_eq!(&*out[1].value, b"base_b,op1,op2");
+            assert_eq!(&*out[2].key.user_key, b"c");
+            assert_eq!(&*out[2].value, b"val_c");
+
+            Ok(())
+        }
+
+        #[test]
+        #[expect(clippy::unwrap_used)]
+        fn compaction_merge_no_operator_passthrough() -> crate::Result<()> {
+            // Without merge operator, MergeOperand entries pass through unchanged
+            #[rustfmt::skip]
+            let vec = stream![
+                "a", "op1", "M",
+            ];
+
+            let iter = vec.iter().cloned().map(Ok);
+            let mut iter = CompactionStream::new(iter, 1_000);
+
+            let item = iter.next().unwrap()?;
+            assert_eq!(item.key.value_type, ValueType::MergeOperand);
+            assert_eq!(&*item.value, b"op1");
+
+            Ok(())
+        }
+
+        #[test]
+        #[expect(clippy::unwrap_used)]
+        fn compaction_merge_with_weak_tombstone() -> crate::Result<()> {
+            // Merge operand above weak tombstone → merge with no base
+            #[rustfmt::skip]
+            let vec = stream![
+                "a", "op1", "M",
+                "a", "", "W",
+                "a", "old_val", "V",
+            ];
+
+            let iter = vec.iter().cloned().map(Ok);
+            let mut iter = CompactionStream::new(iter, 1_000).with_merge_operator(merge_op());
+
+            let item = iter.next().unwrap()?;
+            assert_eq!(item.key.value_type, ValueType::Value);
+            assert_eq!(&*item.value, b"op1");
+            assert!(iter.next().is_none());
+
+            Ok(())
+        }
+
+        #[test]
+        #[expect(clippy::unwrap_used)]
+        fn compaction_merge_seqno_zeroing() -> crate::Result<()> {
+            // Merged value should get seqno zeroed when below threshold
+            #[rustfmt::skip]
+            let vec = stream![
+                "a", "op1", "M",
+                "a", "base", "V",
+            ];
+
+            let iter = vec.iter().cloned().map(Ok);
+            let mut iter = CompactionStream::new(iter, 1_000)
+                .with_merge_operator(merge_op())
+                .zero_seqnos(true);
+
+            let item = iter.next().unwrap()?;
+            assert_eq!(item.key.seqno, 0);
+            assert_eq!(&*item.value, b"base,op1");
+
+            Ok(())
         }
     }
 }
