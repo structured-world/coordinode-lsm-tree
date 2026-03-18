@@ -545,3 +545,45 @@ fn merge_first_last_key_value() {
     let last = tree.last_key_value(4, None).unwrap().key().unwrap();
     assert_eq!(&*last, b"e");
 }
+
+#[test]
+fn merge_multiple_operands_in_single_table() -> lsm_tree::Result<()> {
+    let folder = tempfile::tempdir()?;
+    let tree = open_tree_with_counter(&folder);
+
+    // Write base + multiple operands, flush with gc_threshold=0
+    // to preserve all entries individually in one SST
+    tree.insert("counter", 100_i64.to_le_bytes(), 0);
+    tree.merge("counter", 10_i64.to_le_bytes(), 1);
+    tree.merge("counter", 20_i64.to_le_bytes(), 2);
+    tree.merge("counter", 30_i64.to_le_bytes(), 3);
+    tree.flush_active_memtable(0)?;
+
+    // All 4 entries are in the same table. table.get() returns only
+    // the newest (MergeOperand@3), but resolve_merge_get must collect
+    // all entries via range scan to produce the correct result.
+    assert_eq!(Some(160), get_counter(&tree, "counter", 4));
+
+    Ok(())
+}
+
+#[test]
+fn merge_operand_above_watermark_preserves_tail() -> lsm_tree::Result<()> {
+    let folder = tempfile::tempdir()?;
+    let tree = open_tree_with_counter(&folder);
+
+    // Write entries with specific seqnos
+    tree.insert("counter", 100_i64.to_le_bytes(), 0);
+    tree.merge("counter", 10_i64.to_le_bytes(), 5);
+    tree.merge("counter", 20_i64.to_le_bytes(), 10);
+
+    // Flush with gc_threshold=7: seqno 0 and 5 are below, seqno 10 is above.
+    // The operand at seqno=10 must NOT cause the tail (seqno=5, seqno=0)
+    // to be drained — they are needed for merge resolution.
+    tree.flush_active_memtable(7)?;
+
+    // Read should still resolve correctly: 100 + 10 + 20 = 130
+    assert_eq!(Some(130), get_counter(&tree, "counter", 11));
+
+    Ok(())
+}

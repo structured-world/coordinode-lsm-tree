@@ -860,21 +860,39 @@ impl Tree {
             }
         }
 
-        // 3. Scan tables on disk (each table returns at most one entry per key)
+        // 3. Scan tables on disk
         if !found_base {
             let key_hash = crate::table::filter::standard_bloom::Builder::get_hash(key);
+            let key_slice = crate::Slice::from(key);
 
-            // NOTE: table.get() returns at most one entry per table (highest seqno).
-            // Multiple merge operands within a single table are resolved during
-            // compaction, so each table yields at most one MergeOperand or Value.
             for table in super_version
                 .version
                 .iter_levels()
                 .flat_map(|lvl| lvl.iter())
                 .filter_map(|run| run.get_for_key(key))
             {
+                // Use bloom-filtered point lookup first (fast path)
                 if let Some(entry) = table.get(key, seqno, key_hash)? {
-                    if process_entry(&entry) {
+                    if entry.key.value_type.is_merge_operand() {
+                        // Table may contain multiple entries for this key
+                        // (e.g., after flush with gc_threshold=0).
+                        // Fall back to range scan to collect all of them.
+                        let range = key_slice.clone()..=key_slice.clone();
+                        for item in table.range(range) {
+                            let item = item?;
+                            if item.key.seqno >= seqno {
+                                continue;
+                            }
+                            if process_entry(&item) {
+                                found_base = true;
+                                break;
+                            }
+                        }
+                    } else if process_entry(&entry) {
+                        found_base = true;
+                    }
+
+                    if found_base {
                         break;
                     }
                 }

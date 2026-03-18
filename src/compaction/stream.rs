@@ -296,6 +296,13 @@ impl<'a, I: Iterator<Item = Item>, F: StreamFilter + 'a> Iterator for Compaction
                         // No merge operator — DO NOT drain merge operands.
                         // They are additive deltas, not superseding versions.
                         // The read path will resolve them on-the-fly.
+                    } else if head.key.value_type.is_merge_operand() {
+                        // Head is a MergeOperand at or above the GC watermark,
+                        // while the next version is below the watermark.
+                        // It is NOT safe to drain the remaining versions: they
+                        // may contain merge operands that still contribute to
+                        // the merged value for future snapshots. Emit head as-is
+                        // and leave the tail for later processing.
                     } else {
                         if head.key.value_type == ValueType::Tombstone && self.evict_tombstones {
                             fail_iter!(self.drain_key(&head.key.user_key));
@@ -307,9 +314,20 @@ impl<'a, I: Iterator<Item = Item>, F: StreamFilter + 'a> Iterator for Compaction
                         let drop_weak_tombstone = peeked.key.value_type == ValueType::Value
                             && head.key.value_type == ValueType::WeakTombstone;
 
-                        // NOTE: Next item is expired,
-                        // so the tail of this user key is entirely expired, so drain it all
-                        fail_iter!(self.drain_key(&head.key.user_key));
+                        // If this key's history includes merge operands but we
+                        // don't have a merge operator, we must NOT drain the
+                        // tail. Merge operands are additive deltas and dropping
+                        // them without first collapsing via the merge operator
+                        // would change the logical value.
+                        let has_merge_operands = head.key.value_type.is_merge_operand()
+                            || peeked.key.value_type.is_merge_operand();
+
+                        // NOTE: Next item is expired, so the tail of this user
+                        // key is entirely expired, so drain it all — except when
+                        // we would drop merge operands without a merge operator.
+                        if !(has_merge_operands && self.merge_operator.is_none()) {
+                            fail_iter!(self.drain_key(&head.key.user_key));
+                        }
 
                         if drop_weak_tombstone {
                             continue;
