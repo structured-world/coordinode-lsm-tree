@@ -90,7 +90,7 @@ impl InternalValue {
     ///
     /// # Panics
     ///
-    /// Panics if the key length is empty or greater than 2^16, or the value length is greater than 2^32.
+    /// Panics if the key is empty or longer than 2^16 bytes, or the value is longer than 2^32 bytes.
     pub fn new_merge_operand<K: Into<UserKey>, V: Into<UserValue>>(
         key: K,
         value: V,

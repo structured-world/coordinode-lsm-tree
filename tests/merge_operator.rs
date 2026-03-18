@@ -1,3 +1,4 @@
+// Guard import is required: into_inner() and key() are trait methods from IterGuard (re-exported as Guard)
 use lsm_tree::{AbstractTree, Config, Guard, MergeOperator, SequenceNumberCounter, UserValue};
 use std::sync::Arc;
 

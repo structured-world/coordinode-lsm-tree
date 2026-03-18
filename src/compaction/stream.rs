@@ -159,9 +159,11 @@ impl<'a, I: Iterator<Item = Item>, F: StreamFilter + 'a> CompactionStream<'a, I,
                 ValueType::MergeOperand => {
                     operands.push(next.value);
                 }
+                // NOTE: Indirection (blob pointer) is treated as opaque base value here.
+                // BlobTree merge resolution during compaction is handled by the
+                // RelocatingCompaction flavour which resolves blob references first.
                 ValueType::Value | ValueType::Indirection => {
                     base_value = Some(next.value);
-                    // Drain any remaining entries for this key below the base
                     self.drain_key(&user_key)?;
                     break;
                 }

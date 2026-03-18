@@ -48,6 +48,7 @@ use std::panic::RefUnwindSafe;
 ///     }
 /// }
 /// ```
+#[cfg_attr(coverage_nightly, coverage(off))]
 pub trait MergeOperator: Send + Sync + RefUnwindSafe + 'static {
     /// Merges operands with an optional base value.
     ///

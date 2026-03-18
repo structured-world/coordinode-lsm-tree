@@ -185,14 +185,9 @@ impl<I: DoubleEndedIterator<Item = crate::Result<InternalValue>>> DoubleEndedIte
         // Buffer ALL entries for a key during reverse iteration when merge operator is configured
         let has_merge_op = self.merge_operator.is_some();
         let mut key_entries: Vec<InternalValue> = Vec::new();
-        let mut has_merge_operand = false;
 
         loop {
             let tail = fail_iter!(self.inner.next_back()?);
-
-            if tail.key.value_type.is_merge_operand() {
-                has_merge_operand = true;
-            }
 
             let prev = match self.inner.peek_back() {
                 Some(Ok(prev)) => prev,
@@ -208,8 +203,9 @@ impl<I: DoubleEndedIterator<Item = crate::Result<InternalValue>>> DoubleEndedIte
                         .expect_err("should be error")));
                 }
                 None => {
-                    // Last item — resolve merge if needed
-                    if has_merge_op && has_merge_operand {
+                    // Last item — resolve merge only if newest entry is a MergeOperand.
+                    // A Value/Tombstone as newest supersedes all entries below it.
+                    if has_merge_op && tail.key.value_type.is_merge_operand() {
                         key_entries.push(tail);
                         return Some(self.resolve_merge_buffered(key_entries));
                     }
@@ -218,8 +214,9 @@ impl<I: DoubleEndedIterator<Item = crate::Result<InternalValue>>> DoubleEndedIte
             };
 
             if prev.key.user_key < tail.key.user_key {
-                // `tail` is the newest entry for this key — boundary reached
-                if has_merge_op && has_merge_operand {
+                // `tail` is the newest entry for this key — boundary reached.
+                // Only merge if the newest entry is a MergeOperand.
+                if has_merge_op && tail.key.value_type.is_merge_operand() {
                     key_entries.push(tail);
                     return Some(self.resolve_merge_buffered(key_entries));
                 }

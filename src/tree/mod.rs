@@ -864,6 +864,9 @@ impl Tree {
         if !found_base {
             let key_hash = crate::table::filter::standard_bloom::Builder::get_hash(key);
 
+            // NOTE: table.get() returns at most one entry per table (highest seqno).
+            // Multiple merge operands within a single table are resolved during
+            // compaction, so each table yields at most one MergeOperand or Value.
             for table in super_version
                 .version
                 .iter_levels()
