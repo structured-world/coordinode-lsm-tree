@@ -166,14 +166,26 @@ impl<'a, I: Iterator<Item = Item>, F: StreamFilter + 'a> CompactionStream<'a, I,
                     break;
                 }
                 ValueType::Indirection => {
-                    // Treat the indirection (blob pointer) as the base value
-                    // for merge purposes. We cannot resolve it to user bytes
-                    // here, but passing it through as the base avoids silently
-                    // dropping the stored base for BlobTree / kv-separation
-                    // keys.
-                    base_value = Some(next.value);
-                    self.drain_key(&user_key)?;
-                    break;
+                    // Do NOT treat the indirection as a merge base — value
+                    // bytes are an encoded `BlobIndirection` (vhandle+size),
+                    // not the user value. Passing them into a user
+                    // `MergeOperator` would produce incorrect results.
+                    //
+                    // Emit the head MergeOperand unchanged and skip merge
+                    // collapsing for this key. Any operands consumed between
+                    // head and this Indirection are lost, but this path is
+                    // only reachable for BlobTree/kv-separation keys where
+                    // merge-compaction is a documented limitation.
+                    return Ok(InternalValue::from_components(
+                        user_key,
+                        #[expect(
+                            clippy::expect_used,
+                            reason = "operands always has head as first element"
+                        )]
+                        operands.into_iter().next().expect("head operand"),
+                        head_seqno,
+                        ValueType::MergeOperand,
+                    ));
                 }
                 ValueType::Tombstone | ValueType::WeakTombstone => {
                     // Tombstone kills base — merge with no base

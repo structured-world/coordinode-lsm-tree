@@ -826,10 +826,19 @@ impl Tree {
         let mut found_base = false;
 
         // Process a single entry. Returns true if search should stop.
+        let mut has_indirection_base = false;
+
+        // Process a single entry. Returns true if search should stop.
         let mut process_entry = |entry: &InternalValue| -> bool {
             match entry.key.value_type {
-                ValueType::Value | ValueType::Indirection => {
+                ValueType::Value => {
                     base_value = Some(entry.value.clone());
+                    true
+                }
+                ValueType::Indirection => {
+                    // Indirection entries point to blob-stored values and must
+                    // not be forwarded as raw bytes to the merge operator.
+                    has_indirection_base = true;
                     true
                 }
                 ValueType::Tombstone | ValueType::WeakTombstone => true,
@@ -897,6 +906,14 @@ impl Tree {
                     }
                 }
             }
+        }
+
+        if has_indirection_base {
+            // We encountered an indirection as the would-be base value.
+            // Indirection payloads are internal blob pointers and must not be
+            // passed to the merge operator as user data. Reject merge
+            // resolution for this key.
+            return Ok(None);
         }
 
         if operands.is_empty() {
