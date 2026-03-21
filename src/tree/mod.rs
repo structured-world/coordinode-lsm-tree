@@ -662,26 +662,12 @@ impl AbstractTree for Tree {
             .expect("lock is poisoned")
             .get_version_for_snapshot(seqno);
 
-        let entry = Self::get_internal_entry_from_version(&super_version, key, seqno)?;
-
-        match entry {
-            Some(entry) if entry.key.value_type == ValueType::MergeOperand => {
-                if let Some(merge_op) = &self.config.merge_operator {
-                    Self::resolve_merge_get(&super_version, key, seqno, merge_op.as_ref())
-                } else if Self::is_suppressed_by_range_tombstones(
-                    &super_version,
-                    key,
-                    entry.key.seqno,
-                    seqno,
-                ) {
-                    Ok(None)
-                } else {
-                    Ok(Some(entry.value))
-                }
-            }
-            Some(entry) => Ok(Some(entry.value)),
-            None => Ok(None),
-        }
+        Self::resolve_or_passthrough(
+            &super_version,
+            key,
+            seqno,
+            self.config.merge_operator.as_ref(),
+        )
     }
 
     fn multi_get<K: AsRef<[u8]>>(
@@ -693,27 +679,12 @@ impl AbstractTree for Tree {
 
         keys.into_iter()
             .map(|key| {
-                let key = key.as_ref();
-                let entry = Self::get_internal_entry_from_version(&super_version, key, seqno)?;
-
-                match entry {
-                    Some(ref entry) if entry.key.value_type == ValueType::MergeOperand => {
-                        if let Some(merge_op) = &self.config.merge_operator {
-                            Self::resolve_merge_get(&super_version, key, seqno, merge_op.as_ref())
-                        } else if Self::is_suppressed_by_range_tombstones(
-                            &super_version,
-                            key,
-                            entry.key.seqno,
-                            seqno,
-                        ) {
-                            Ok(None)
-                        } else {
-                            Ok(Some(entry.value.clone()))
-                        }
-                    }
-                    Some(entry) => Ok(Some(entry.value)),
-                    None => Ok(None),
-                }
+                Self::resolve_or_passthrough(
+                    &super_version,
+                    key.as_ref(),
+                    seqno,
+                    self.config.merge_operator.as_ref(),
+                )
             })
             .collect()
     }
@@ -764,6 +735,38 @@ impl AbstractTree for Tree {
 }
 
 impl Tree {
+    /// Shared point-read logic for `get()` and `multi_get()`: finds the newest
+    /// entry, applies merge resolution or RT suppression, and returns the value.
+    fn resolve_or_passthrough(
+        super_version: &SuperVersion,
+        key: &[u8],
+        seqno: SeqNo,
+        merge_operator: Option<&Arc<dyn crate::merge_operator::MergeOperator>>,
+    ) -> crate::Result<Option<UserValue>> {
+        let entry = Self::get_internal_entry_from_version(super_version, key, seqno)?;
+
+        match entry {
+            Some(entry) if entry.key.value_type == ValueType::MergeOperand => {
+                if let Some(merge_op) = merge_operator {
+                    // Always resolve even for a single operand: there may be
+                    // older operands or a base value in lower storage layers.
+                    Self::resolve_merge_get(super_version, key, seqno, merge_op.as_ref())
+                } else if Self::is_suppressed_by_range_tombstones(
+                    super_version,
+                    key,
+                    entry.key.seqno,
+                    seqno,
+                ) {
+                    Ok(None)
+                } else {
+                    Ok(Some(entry.value))
+                }
+            }
+            Some(entry) => Ok(Some(entry.value)),
+            None => Ok(None),
+        }
+    }
+
     #[doc(hidden)]
     pub fn create_internal_range<'a, K: AsRef<[u8]> + 'a, R: RangeBounds<K> + 'a>(
         version: SuperVersion,
