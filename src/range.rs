@@ -235,9 +235,13 @@ impl TreeIter {
                                     Ok(true) => {
                                         single_tables.push(table.clone());
                                     }
-                                    Err(_) => {
+                                    Err(e) => {
                                         // On I/O error reading the filter, include the segment
                                         // conservatively to avoid missing data.
+                                        log::warn!(
+                                            "prefix bloom check failed for table {:?}: {e}",
+                                            table.id(),
+                                        );
                                         single_tables.push(table.clone());
                                     }
                                 }

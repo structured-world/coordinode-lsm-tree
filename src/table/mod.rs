@@ -790,7 +790,7 @@ impl Table {
             let block = self.load_block(
                 filter_block_handle,
                 BlockType::Filter,
-                CompressionType::None,
+                CompressionType::None, // NOTE: Filter blocks are never compressed (crate invariant)
             )?;
             let block = FilterBlock::new(block);
             return block.maybe_contains_hash(prefix_hash);

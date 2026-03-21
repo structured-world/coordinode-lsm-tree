@@ -59,6 +59,12 @@ impl<W: std::io::Write + std::io::Seek> FilterWriter<W> for FullFilterWriter {
     fn register_key(&mut self, key: &UserKey) -> crate::Result<()> {
         self.bloom_hash_buffer.push(Builder::get_hash(key));
 
+        // NOTE: Prefix hashes are intentionally not deduplicated across keys.
+        // Duplicate hashes (from keys sharing a prefix) set the same bloom bits
+        // (idempotent), so correctness is unaffected. Deduplication would require
+        // a HashSet adding memory overhead, while the only cost of duplicates is
+        // a slightly larger `n` passed to the bloom builder which marginally
+        // increases filter size — a worthwhile trade-off.
         if let Some(extractor) = &self.prefix_extractor {
             for prefix in extractor.prefixes(key.as_ref()) {
                 self.bloom_hash_buffer.push(Builder::get_hash(prefix));
