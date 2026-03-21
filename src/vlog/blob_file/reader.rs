@@ -155,8 +155,11 @@ impl<'a> Reader<'a> {
             return Err(crate::Error::InvalidHeader("Blob"));
         }
 
+        // Slice exactly on_disk_val_len bytes — important for V3 backward
+        // compat where the read buffer is 4 bytes larger than the actual frame
+        // (over-read from using V4 max header size).
         let data_offset = header_len + key.len();
-        let raw_data = value.slice(data_offset..);
+        let raw_data = value.slice(data_offset..data_offset + on_disk_val_len as usize);
 
         {
             // Checksum covers on-disk key + raw value data (upstream #277).
@@ -807,5 +810,108 @@ mod tests {
     fn blob_header_len_v4_is_42() {
         assert_eq!(BLOB_HEADER_LEN, 42);
         assert_eq!(BLOB_HEADER_LEN_V3, 38);
+    }
+
+    /// Write a V3 blob file manually and verify the reader handles it
+    /// via the V3 backward compat path (no header_crc validation).
+    #[test]
+    fn blob_reader_v3_backward_compat_roundtrip() -> crate::Result<()> {
+        use crate::file_accessor::FileAccessor;
+        use crate::vlog::{blob_file::Inner as BlobFileInner, ValueHandle};
+        use byteorder::WriteBytesExt;
+        use std::io::Write;
+        use std::sync::{atomic::AtomicBool, Arc};
+
+        let folder = tempfile::tempdir()?;
+        let blob_file_path = folder.path().join("0");
+
+        let key = b"abc";
+        let value = b"hello_v3";
+
+        // V3 data checksum: xxh3_128(key + value) — no header_crc
+        let checksum = {
+            let mut hasher = xxhash_rust::xxh3::Xxh3::default();
+            hasher.update(key);
+            hasher.update(value);
+            hasher.digest128()
+        };
+
+        // Write V3 blob file manually using sfa framing
+        {
+            let file = std::fs::File::create(&blob_file_path)?;
+            let mut sfa_writer = sfa::Writer::from_writer(file);
+            sfa_writer.start("data")?;
+
+            // V3 frame: BLOB magic, no header_crc
+            sfa_writer.write_all(b"BLOB")?;
+            sfa_writer.write_u128::<byteorder::LittleEndian>(checksum)?;
+            sfa_writer.write_u64::<byteorder::LittleEndian>(42)?; // seqno
+            #[expect(clippy::cast_possible_truncation)]
+            sfa_writer.write_u16::<byteorder::LittleEndian>(key.len() as u16)?;
+            #[expect(clippy::cast_possible_truncation)]
+            sfa_writer.write_u32::<byteorder::LittleEndian>(value.len() as u32)?;
+            #[expect(clippy::cast_possible_truncation)]
+            sfa_writer.write_u32::<byteorder::LittleEndian>(value.len() as u32)?;
+            sfa_writer.write_all(key)?;
+            sfa_writer.write_all(value)?;
+
+            // Write metadata
+            sfa_writer.start("meta")?;
+            let metadata = crate::vlog::blob_file::meta::Metadata {
+                id: 0,
+                version: 3,
+                created_at: 0,
+                item_count: 1,
+                total_compressed_bytes: value.len() as u64,
+                total_uncompressed_bytes: value.len() as u64,
+                key_range: crate::KeyRange::new((key[..].into(), key[..].into())),
+                compression: CompressionType::None,
+            };
+            metadata.encode_into(&mut sfa_writer)?;
+            let mut inner = sfa_writer.into_inner()?;
+            inner.sync_all()?;
+        }
+
+        // Construct a BlobFile with V3 metadata for the reader
+        let file = File::open(&blob_file_path)?;
+        let file2 = File::open(&blob_file_path)?;
+        let blob_file = crate::BlobFile(Arc::new(BlobFileInner {
+            id: 0,
+            tree_id: 0,
+            path: blob_file_path,
+            meta: crate::vlog::blob_file::meta::Metadata {
+                id: 0,
+                version: 3,
+                created_at: 0,
+                item_count: 1,
+                total_compressed_bytes: value.len() as u64,
+                total_uncompressed_bytes: value.len() as u64,
+                key_range: crate::KeyRange::new((key[..].into(), key[..].into())),
+                compression: CompressionType::None,
+            },
+            is_deleted: AtomicBool::new(false),
+            checksum: crate::Checksum::from_raw(0),
+            file_accessor: FileAccessor::File(Arc::new(file2)),
+        }));
+
+        let reader = Reader::new(&blob_file, &file);
+
+        // V3 frame offset: sfa "data" segment header comes first.
+        // Find actual data start via sfa reader.
+        let sfa_reader = sfa::Reader::new(&blob_file.0.path)?;
+        let data_section = sfa_reader.toc().section(b"data").unwrap();
+        let data_start = data_section.pos();
+
+        let handle = ValueHandle {
+            blob_file_id: 0,
+            offset: data_start,
+            #[expect(clippy::cast_possible_truncation)]
+            on_disk_size: value.len() as u32,
+        };
+
+        let result = reader.get(key, &handle)?;
+        assert_eq!(result, value);
+
+        Ok(())
     }
 }

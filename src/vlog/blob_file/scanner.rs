@@ -247,4 +247,101 @@ mod tests {
 
         Ok(())
     }
+
+    /// Write a V3 blob file (b"BLOB" magic, no header_crc) manually,
+    /// then verify the scanner can read it with V3 backward compat path.
+    #[test]
+    fn blob_scanner_reads_v3_format() -> crate::Result<()> {
+        use byteorder::{LittleEndian, WriteBytesExt};
+        use std::io::Write;
+
+        let dir = tempdir()?;
+        let blob_file_path = dir.path().join("0");
+
+        let key = b"abc";
+        let value = b"hello_v3";
+
+        // V3 data checksum: xxh3_128(key + value) — no header_crc
+        let checksum = {
+            let mut hasher = xxhash_rust::xxh3::Xxh3::default();
+            hasher.update(key);
+            hasher.update(value);
+            hasher.digest128()
+        };
+
+        // Manually write V3 blob file using sfa framing
+        {
+            let file = std::fs::File::create(&blob_file_path)?;
+            let mut sfa_writer = sfa::Writer::from_writer(file);
+            sfa_writer.start("data")?;
+
+            // V3 frame: BLOB magic, no header_crc
+            sfa_writer.write_all(b"BLOB")?;
+            sfa_writer.write_u128::<LittleEndian>(checksum)?;
+            sfa_writer.write_u64::<LittleEndian>(42)?; // seqno
+            #[expect(clippy::cast_possible_truncation)]
+            sfa_writer.write_u16::<LittleEndian>(key.len() as u16)?;
+            #[expect(clippy::cast_possible_truncation)]
+            sfa_writer.write_u32::<LittleEndian>(value.len() as u32)?; // real_val_len
+            #[expect(clippy::cast_possible_truncation)]
+            sfa_writer.write_u32::<LittleEndian>(value.len() as u32)?; // on_disk_val_len
+            sfa_writer.write_all(key)?;
+            sfa_writer.write_all(value)?;
+
+            // Write metadata section
+            sfa_writer.start("meta")?;
+            let metadata = crate::vlog::blob_file::meta::Metadata {
+                id: 0,
+                version: 3,
+                created_at: 0,
+                item_count: 1,
+                total_compressed_bytes: value.len() as u64,
+                total_uncompressed_bytes: value.len() as u64,
+                key_range: crate::KeyRange::new((key[..].into(), key[..].into())),
+                compression: crate::CompressionType::None,
+            };
+            metadata.encode_into(&mut sfa_writer)?;
+            let mut inner = sfa_writer.into_inner()?;
+            inner.sync_all()?;
+        }
+
+        // Scanner should read the V3 frame successfully
+        let mut scanner = Scanner::new(&blob_file_path, 0)?;
+        let entry = scanner.next().unwrap()?;
+        assert_eq!(entry.key, Slice::from(&key[..]));
+        assert_eq!(entry.value, Slice::from(&value[..]));
+        assert_eq!(entry.seqno, 42);
+        assert!(scanner.next().is_none());
+
+        Ok(())
+    }
+
+    /// Scanner rejects frames with invalid magic (neither V3 nor V4).
+    #[test]
+    fn blob_scanner_rejects_invalid_magic() -> crate::Result<()> {
+        let dir = tempdir()?;
+        let blob_file_path = dir.path().join("0");
+
+        {
+            let mut writer = BlobFileWriter::new(&blob_file_path, 0, 0)?;
+            writer.write(b"key", 0, b"value")?;
+            writer.finish()?;
+        }
+
+        // Corrupt magic bytes at offset 0 (after sfa segment header)
+        let mut raw = std::fs::read(&blob_file_path)?;
+        // sfa "data" segment header is at the start; find BLOB/BLO4 magic
+        let magic_pos = raw.windows(4).position(|w| w == b"BLO4").unwrap();
+        raw[magic_pos..magic_pos + 4].copy_from_slice(b"XXXX");
+        std::fs::write(&blob_file_path, &raw)?;
+
+        let mut scanner = Scanner::new(&blob_file_path, 0)?;
+        let result = scanner.next().unwrap();
+        assert!(
+            matches!(result, Err(crate::Error::InvalidHeader("Blob"))),
+            "expected InvalidHeader for bad magic, got: {result:?}",
+        );
+
+        Ok(())
+    }
 }
