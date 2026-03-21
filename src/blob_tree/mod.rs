@@ -241,14 +241,19 @@ impl AbstractTree for BlobTree {
 
         let prefix_bytes = prefix.as_ref();
 
-        // Correct: PrefixExtractor::prefixes() returns sub-slices of the original
-        // key, so the scan prefix matches the exact bytes hashed at write time.
-        let prefix_hash =
-            if self.index.config.prefix_extractor.is_some() && !prefix_bytes.is_empty() {
+        // Only compute prefix hash when the scan prefix is a valid extractor boundary.
+        // See Tree::create_prefix for detailed rationale.
+        let prefix_hash = if let Some(extractor) = &self.index.config.prefix_extractor {
+            if !prefix_bytes.is_empty()
+                && extractor.prefixes(prefix_bytes).any(|p| p == prefix_bytes)
+            {
                 Some(Builder::get_hash(prefix_bytes))
             } else {
                 None
-            };
+            }
+        } else {
+            None
+        };
 
         let super_version = self.index.get_version_for_snapshot(seqno);
         let tree = self.clone();

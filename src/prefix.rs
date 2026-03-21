@@ -50,6 +50,12 @@ pub trait PrefixExtractor:
     /// Implementations should return prefixes from shortest to longest.
     /// The full key itself may or may not be included (it is always indexed
     /// separately by the standard bloom path).
+    ///
+    /// # Performance note
+    ///
+    /// Returns `Box<dyn Iterator>` for object safety (`Arc<dyn PrefixExtractor>`).
+    /// Most extractors yield 1–5 prefixes per key, so the allocation is negligible
+    /// compared to the bloom hash + I/O cost.
     fn prefixes<'a>(&self, key: &'a [u8]) -> Box<dyn Iterator<Item = &'a [u8]> + 'a>;
 }
 

@@ -400,3 +400,36 @@ fn prefix_bloom_skip_on_compacted_levels() -> lsm_tree::Result<()> {
 
     Ok(())
 }
+
+#[test]
+fn prefix_bloom_non_boundary_prefix_no_false_negative() -> lsm_tree::Result<()> {
+    let folder = tempfile::tempdir()?;
+    let tree = tree_with_prefix_bloom(&folder)?;
+
+    // The ColonSeparatedPrefix extractor indexes "adj:", "adj:out:", etc.
+    // A scan for "adj" (no trailing colon) is NOT an extractor boundary,
+    // so prefix bloom must NOT be used (it would cause false negatives).
+    // The scan must still return correct results via key-range filtering.
+    tree.insert("adj:out:1", "v1", 0);
+    tree.insert("adj:in:1", "v2", 1);
+    tree.insert("other:1", "v3", 2);
+    tree.flush_active_memtable(0)?;
+
+    // "adj" is not a colon-terminated boundary — bloom skip must be disabled
+    let results: Vec<_> = tree
+        .create_prefix("adj", 3, None)
+        .collect::<Result<Vec<_>, _>>()?;
+    assert_eq!(
+        results.len(),
+        2,
+        "must find keys even though 'adj' is not an extractor boundary"
+    );
+
+    // "adj:" IS a valid boundary — bloom skip can be used safely
+    let results: Vec<_> = tree
+        .create_prefix("adj:", 3, None)
+        .collect::<Result<Vec<_>, _>>()?;
+    assert_eq!(results.len(), 2);
+
+    Ok(())
+}
