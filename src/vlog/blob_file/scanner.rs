@@ -229,7 +229,7 @@ mod tests {
     /// checksum catches the corruption.
     #[test]
     fn blob_scanner_corrupted_value_detected_by_data_checksum() -> crate::Result<()> {
-        use crate::vlog::blob_file::writer::{BLOB_HEADER_LEN, BLOB_HEADER_MAGIC_V4};
+        use crate::vlog::blob_file::writer::BLOB_HEADER_LEN;
 
         let dir = tempdir()?;
         let blob_file_path = dir.path().join("0");
