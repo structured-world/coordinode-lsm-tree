@@ -408,7 +408,13 @@ impl<'a, I: Iterator<Item = Item>, F: StreamFilter + 'a> Iterator for Compaction
                 }
             }
 
-            if self.zero_seqnos && head.key.seqno < self.gc_seqno_threshold {
+            // Zero seqnos for collapsed entries, but NOT for preserved MergeOperands:
+            // multiple operands for the same key would all become seqno=0, creating
+            // duplicate internal keys that destabilize reads.
+            if self.zero_seqnos
+                && head.key.seqno < self.gc_seqno_threshold
+                && !head.key.value_type.is_merge_operand()
+            {
                 head.key.seqno = 0;
             }
 
