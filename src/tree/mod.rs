@@ -666,7 +666,7 @@ impl AbstractTree for Tree {
             &super_version,
             key,
             seqno,
-            self.config.merge_operator.as_ref(),
+            self.config.merge_operator.as_deref(),
         )
     }
 
@@ -683,7 +683,7 @@ impl AbstractTree for Tree {
                     &super_version,
                     key.as_ref(),
                     seqno,
-                    self.config.merge_operator.as_ref(),
+                    self.config.merge_operator.as_deref(),
                 )
             })
             .collect()
@@ -741,7 +741,7 @@ impl Tree {
         super_version: &SuperVersion,
         key: &[u8],
         seqno: SeqNo,
-        merge_operator: Option<&Arc<dyn crate::merge_operator::MergeOperator>>,
+        merge_operator: Option<&dyn crate::merge_operator::MergeOperator>,
     ) -> crate::Result<Option<UserValue>> {
         let entry = Self::get_internal_entry_from_version(super_version, key, seqno)?;
 
@@ -750,7 +750,7 @@ impl Tree {
                 if let Some(merge_op) = merge_operator {
                     // Always resolve even for a single operand: there may be
                     // older operands or a base value in lower storage layers.
-                    Self::resolve_merge_get(super_version, key, seqno, merge_op.as_ref())
+                    Self::resolve_merge_get(super_version, key, seqno, merge_op)
                 } else if Self::is_suppressed_by_range_tombstones(
                     super_version,
                     key,
