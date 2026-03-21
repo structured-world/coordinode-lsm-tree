@@ -93,6 +93,11 @@ fn main() {
         std::process::exit(1);
     }
 
+    if bench_config.key_size == 0 {
+        eprintln!("Error: --key-size must be > 0");
+        std::process::exit(1);
+    }
+
     // Use provided path or create a temp directory.
     let _tmpdir;
     let db_path = match &cli.db {

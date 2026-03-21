@@ -30,6 +30,9 @@ impl Workload for ReadWhileWriting {
         let remainder = config.num % reader_count as u64;
         let barrier = Barrier::new(threads);
 
+        // Timer starts before thread spawn — spawn overhead is negligible
+        // (<1ms) compared to benchmark duration. Moving start() inside the
+        // barrier would require sharing the reporter across threads.
         reporter.start();
 
         std::thread::scope(|s| {
@@ -84,7 +87,9 @@ impl Workload for ReadWhileWriting {
                 }
             });
 
-            // Collect reader results.
+            // Collect reader results. Only reader ops are counted in ops_total —
+            // this is a read throughput benchmark with concurrent write pressure,
+            // matching RocksDB db_bench semantics.
             for handle in reader_handles {
                 let local_reporter = handle.join().expect("reader thread panicked");
                 reporter.merge(&local_reporter);

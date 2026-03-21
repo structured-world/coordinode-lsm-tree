@@ -69,6 +69,10 @@ pub fn prefill_prefix_keys(
             // Break if suffix exceeds u16 range (> 65535 keys per prefix).
             // This caps total keys at 256 * 65535 ≈ 16M for NUM_PREFIXES=256.
             let Ok(suffix_u16) = u16::try_from(suffix) else {
+                eprintln!(
+                    "Warning: prefix {prefix} truncated at {} keys (u16 suffix overflow)",
+                    u16::MAX
+                );
                 break;
             };
             let suffix_bytes = suffix_u16.to_be_bytes();

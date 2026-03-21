@@ -22,8 +22,11 @@ impl Reporter {
         }
     }
 
-    /// Start the measurement timer.
+    /// Start the measurement timer, resetting all prior state.
     pub fn start(&mut self) {
+        self.histogram.reset();
+        self.elapsed = Duration::ZERO;
+        self.ops_counted = 0;
         self.start = Some(Instant::now());
     }
 
