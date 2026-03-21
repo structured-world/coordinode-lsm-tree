@@ -20,6 +20,12 @@ impl Workload for PrefixScan {
         seqno: &AtomicU64,
         reporter: &mut Reporter,
     ) -> lsm_tree::Result<()> {
+        // Prefix keys use 2-byte prefix + 2-byte suffix = 4 bytes minimum.
+        assert!(
+            config.key_size >= 4,
+            "prefixscan requires --key-size >= 4 (2-byte prefix + 2-byte suffix)"
+        );
+
         // Prefill with structured prefix keys.
         prefill_prefix_keys(tree, config, seqno, NUM_PREFIXES)?;
 
@@ -40,7 +46,7 @@ impl Workload for PrefixScan {
                 // actual read I/O, especially with --use-blob-tree.
                 let _ = item.size()?;
             }
-            reporter.record(t.elapsed().as_nanos() as u64);
+            reporter.record_duration(t.elapsed());
         }
 
         reporter.stop();

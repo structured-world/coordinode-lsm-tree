@@ -32,7 +32,7 @@ impl Workload for ReadRandom {
 
             let t = Instant::now();
             let result = tree.get(&key, read_seq)?;
-            reporter.record(t.elapsed().as_nanos() as u64);
+            reporter.record_duration(t.elapsed());
 
             if result.is_some() {
                 found += 1;

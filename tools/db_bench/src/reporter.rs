@@ -28,11 +28,20 @@ impl Reporter {
     }
 
     /// Record a single operation's latency in nanoseconds.
+    /// Values exceeding the histogram max (10s) are clamped to avoid silent drops.
     #[inline]
     pub fn record(&mut self, nanos: u64) {
-        if self.histogram.record(nanos).is_ok() {
-            self.ops_counted += 1;
-        }
+        // Clamp to histogram max rather than silently dropping extreme values.
+        let clamped = nanos.min(self.histogram.high());
+        let _ = self.histogram.record(clamped);
+        self.ops_counted += 1;
+    }
+
+    /// Record a [`Duration`] as nanoseconds, saturating at u64::MAX.
+    #[inline]
+    pub fn record_duration(&mut self, d: Duration) {
+        let nanos = u64::try_from(d.as_nanos()).unwrap_or(u64::MAX);
+        self.record(nanos);
     }
 
     /// Stop the measurement timer.

@@ -37,7 +37,7 @@ impl Workload for SeekRandom {
             if let Some(next) = iter.next() {
                 let _ = next.size()?;
             }
-            reporter.record(t.elapsed().as_nanos() as u64);
+            reporter.record_duration(t.elapsed());
         }
 
         reporter.stop();

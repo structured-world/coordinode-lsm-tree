@@ -32,7 +32,7 @@ impl Workload for Overwrite {
 
             let t = Instant::now();
             tree.insert(key, value, seq);
-            reporter.record(t.elapsed().as_nanos() as u64);
+            reporter.record_duration(t.elapsed());
         }
 
         reporter.stop();

@@ -93,7 +93,10 @@ fn main() {
     let db_path = match &cli.db {
         Some(p) => p.clone(),
         None => {
-            _tmpdir = tempfile::tempdir().expect("failed to create temp dir");
+            _tmpdir = tempfile::tempdir().unwrap_or_else(|e| {
+                eprintln!("Error: failed to create temp directory: {e}");
+                std::process::exit(1);
+            });
             _tmpdir.path().to_path_buf()
         }
     };
@@ -111,15 +114,22 @@ fn main() {
     eprintln!("DB path:     {}", db_path.display());
     eprintln!();
 
-    let tree = config::create_tree(&db_path, &bench_config).expect("failed to open tree");
+    let tree = config::create_tree(&db_path, &bench_config).unwrap_or_else(|e| {
+        eprintln!("Error: failed to open tree: {e}");
+        std::process::exit(1);
+    });
     let seqno = AtomicU64::new(1);
     let mut reporter = Reporter::new();
 
-    let workload = create_workload(&cli.benchmark).expect("unknown benchmark");
+    let workload = create_workload(&cli.benchmark).unwrap_or_else(|| {
+        eprintln!("Error: unknown benchmark '{}'", cli.benchmark);
+        std::process::exit(1);
+    });
 
-    workload
-        .run(&tree, &bench_config, &seqno, &mut reporter)
-        .expect("benchmark failed");
+    if let Err(e) = workload.run(&tree, &bench_config, &seqno, &mut reporter) {
+        eprintln!("Error: benchmark failed: {e}");
+        std::process::exit(1);
+    }
 
     if cli.json {
         let json_config = JsonConfig {

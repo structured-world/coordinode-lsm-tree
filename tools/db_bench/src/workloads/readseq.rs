@@ -32,7 +32,7 @@ impl Workload for ReadSeq {
                     // Force value materialization so read throughput reflects
                     // actual I/O, especially with --use-blob-tree.
                     let _size = item.size()?;
-                    reporter.record(t.elapsed().as_nanos() as u64);
+                    reporter.record_duration(t.elapsed());
 
                     count += 1;
                     if count >= config.num {

@@ -154,11 +154,18 @@ fn run_mvcc_test(ops: Vec<MvccOp>) -> Result<(), TestCaseError> {
     }
 
     // Sample snapshot points to keep verification time bounded.
+    // Always include the last snapshot to verify the final tree state.
     let check_points: Vec<u64> = if snapshot_seqnos.len() <= 20 {
         snapshot_seqnos.clone()
     } else {
         let step = snapshot_seqnos.len() / 20;
-        snapshot_seqnos.iter().step_by(step).copied().collect()
+        let mut points: Vec<u64> = snapshot_seqnos.iter().step_by(step).copied().collect();
+        if let Some(&last) = snapshot_seqnos.last() {
+            if points.last() != Some(&last) {
+                points.push(last);
+            }
+        }
+        points
     };
 
     // Verify at each historical snapshot point.

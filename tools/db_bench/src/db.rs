@@ -99,6 +99,10 @@ pub fn prefill_prefix_keys(
 /// large datasets.
 #[inline]
 pub fn make_sequential_key(index: u64, key_size: usize) -> Vec<u8> {
+    debug_assert!(
+        key_size >= 8 || index < (1u64 << (key_size * 8)),
+        "index {index} exceeds unique key space for key_size {key_size}"
+    );
     let be_bytes = index.to_be_bytes();
     let mut key = Vec::with_capacity(key_size);
     let copy_len = key_size.min(be_bytes.len());

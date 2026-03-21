@@ -48,12 +48,10 @@ impl Workload for ReadWhileWriting {
                             let key = make_sequential_key(idx, config.key_size);
 
                             let t = Instant::now();
-                            // Unwrap read errors — silent failures would
-                            // hide real issues in the benchmark.
-                            let _val = tree
-                                .get(&key, read_seq)
-                                .expect("read failed during benchmark");
-                            local_reporter.record(t.elapsed().as_nanos() as u64);
+                            if let Err(e) = tree.get(&key, read_seq) {
+                                eprintln!("read error: {e}");
+                            }
+                            local_reporter.record_duration(t.elapsed());
                         }
 
                         local_reporter

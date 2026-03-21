@@ -7,7 +7,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 /// Writes to a small set of "hot" keys repeatedly, flushing periodically
-/// to create overlapping SSTs that stress the merge/compaction path.
+/// to create overlapping SSTs that stress the compaction merge path.
+///
+/// NOTE: This uses `insert()` (full overwrites), not merge operands —
+/// lsm-tree's merge operator API is internal to compaction. The workload
+/// exercises the SST-level k-way merge during major compaction, which is
+/// the primary merge cost path. True merge-operand benchmarks will be
+/// added when the public merge API is available (CoordiNode posting lists).
 pub struct MergeRandom;
 
 impl Workload for MergeRandom {
@@ -32,7 +38,7 @@ impl Workload for MergeRandom {
 
             let t = Instant::now();
             tree.insert(key, value, seq);
-            reporter.record(t.elapsed().as_nanos() as u64);
+            reporter.record_duration(t.elapsed());
 
             if (i + 1) % flush_interval == 0 {
                 tree.flush_active_memtable(0)?;
