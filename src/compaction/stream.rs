@@ -173,10 +173,6 @@ impl<'a, I: Iterator<Item = Item>, F: StreamFilter + 'a> CompactionStream<'a, I,
                 // entries unchanged via the pending buffer to avoid data loss.
                 // The first entry is returned immediately; the rest are buffered
                 // for subsequent next() calls.
-                #[expect(
-                    clippy::expect_used,
-                    reason = "collected always has head as first element"
-                )]
                 let first = collected.remove(0);
                 self.pending.extend(collected);
                 return Ok(first);
