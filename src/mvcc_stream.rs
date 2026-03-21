@@ -42,11 +42,7 @@ impl<I: DoubleEndedIterator<Item = crate::Result<InternalValue>>> MvccStream<I> 
     /// When set, operands or base values suppressed by a range tombstone are
     /// treated as a deletion boundary (merge stops, base = None).
     #[must_use]
-    pub fn with_range_tombstones(
-        mut self,
-        rts: Vec<(RangeTombstone, SeqNo)>,
-        _read_seqno: SeqNo,
-    ) -> Self {
+    pub fn with_range_tombstones(mut self, rts: Vec<(RangeTombstone, SeqNo)>) -> Self {
         self.range_tombstones = rts;
         self
     }
@@ -1314,8 +1310,7 @@ mod tests {
             ];
 
             let iter = Box::new(vec.into_iter().map(Ok));
-            let mut iter =
-                MvccStream::new(iter, merge_op()).with_range_tombstones(vec![(rt, 4)], 4);
+            let mut iter = MvccStream::new(iter, merge_op()).with_range_tombstones(vec![(rt, 4)]);
 
             let item = iter.next().unwrap()?;
             assert_eq!(item.key.value_type, ValueType::Value);
@@ -1342,8 +1337,7 @@ mod tests {
             ];
 
             let iter = Box::new(vec.into_iter().map(Ok));
-            let mut iter =
-                MvccStream::new(iter, merge_op()).with_range_tombstones(vec![(rt, 5)], 5);
+            let mut iter = MvccStream::new(iter, merge_op()).with_range_tombstones(vec![(rt, 5)]);
 
             let item = iter.next().unwrap()?;
             assert_eq!(item.key.value_type, ValueType::Value);
@@ -1368,8 +1362,7 @@ mod tests {
             ];
 
             let iter = Box::new(vec.into_iter().map(Ok));
-            let mut iter =
-                MvccStream::new(iter, merge_op()).with_range_tombstones(vec![(rt, 4)], 4);
+            let mut iter = MvccStream::new(iter, merge_op()).with_range_tombstones(vec![(rt, 4)]);
 
             let item = iter.next_back().unwrap()?;
             assert_eq!(item.key.value_type, ValueType::Value);
@@ -1396,8 +1389,7 @@ mod tests {
             ];
 
             let iter = Box::new(vec.into_iter().map(Ok));
-            let mut iter =
-                MvccStream::new(iter, merge_op()).with_range_tombstones(vec![(rt, 6)], 6);
+            let mut iter = MvccStream::new(iter, merge_op()).with_range_tombstones(vec![(rt, 6)]);
 
             let item = iter.next().unwrap()?;
             // Head is RT-suppressed → merge skipped, head returned as-is
@@ -1422,8 +1414,7 @@ mod tests {
             ];
 
             let iter = Box::new(vec.into_iter().map(Ok));
-            let mut iter =
-                MvccStream::new(iter, merge_op()).with_range_tombstones(vec![(rt, 6)], 6);
+            let mut iter = MvccStream::new(iter, merge_op()).with_range_tombstones(vec![(rt, 6)]);
 
             let item = iter.next_back().unwrap()?;
             // Head is RT-suppressed → merge skipped

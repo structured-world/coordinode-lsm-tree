@@ -148,6 +148,8 @@ impl Memtable {
     /// ordered by descending sequence number (newest first).
     ///
     /// Used by the merge operator read path to collect all operands for a key.
+    // Allocates a Vec and clones entries — acceptable for the merge slow-path.
+    // A zero-copy iterator API would avoid this but changes the skiplist contract.
     pub(crate) fn get_all_for_key(&self, key: &[u8], seqno: SeqNo) -> Vec<InternalValue> {
         if seqno == 0 {
             return Vec::new();

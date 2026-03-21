@@ -386,7 +386,7 @@ impl TreeIter {
             // while RangeTombstoneFilter below consumes it for post-merge
             // filtering. An Arc<[_]> could avoid the copy if RT sets grow large.
             let iter = MvccStream::new(merged, lock.merge_operator.clone())
-                .with_range_tombstones(all_range_tombstones.clone(), seqno);
+                .with_range_tombstones(all_range_tombstones.clone());
 
             let iter = iter.filter(|x| match x {
                 Ok(value) => !value.key.is_tombstone(),

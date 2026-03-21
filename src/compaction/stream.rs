@@ -177,8 +177,12 @@ impl<'a, I: Iterator<Item = Item>, F: StreamFilter + 'a> CompactionStream<'a, I,
                 // entries unchanged via the pending buffer to avoid data loss.
                 // The first entry is returned immediately; the rest are buffered
                 // for subsequent next() calls.
-                let first = collected.remove(0);
-                self.pending.extend(collected);
+                let mut iter = collected.into_iter();
+                #[expect(clippy::expect_used, reason = "collected always has head")]
+                let first = iter
+                    .next()
+                    .expect("collected should contain at least one element");
+                self.pending.extend(iter);
                 return Ok(first);
             }
 

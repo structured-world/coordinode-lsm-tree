@@ -861,3 +861,37 @@ fn merge_rt_partial_suppression_across_layers() -> lsm_tree::Result<()> {
 
     Ok(())
 }
+
+/// RT suppression on no-operator path: get() and multi_get() must agree.
+#[test]
+fn merge_rt_no_operator_get_and_multi_get_agree() -> lsm_tree::Result<()> {
+    let folder = tempfile::tempdir()?;
+
+    // Open tree WITHOUT merge operator
+    let tree = lsm_tree::Config::new(
+        &folder,
+        lsm_tree::SequenceNumberCounter::default(),
+        lsm_tree::SequenceNumberCounter::default(),
+    )
+    .open()?;
+
+    // Write a MergeOperand directly (no operator needed for writing)
+    tree.merge("key", b"operand_bytes", 0);
+
+    // RT at seqno=5 suppresses the operand@0
+    tree.remove_range("key", "key\x00", 5);
+
+    // Both get() and multi_get() should return None (RT-suppressed)
+    assert_eq!(None, tree.get("key", 6)?);
+
+    let results = tree.multi_get(["key"], 6)?;
+    assert!(
+        results[0].is_none(),
+        "multi_get must agree with get on RT suppression"
+    );
+
+    // Without RT (read at seqno before RT is visible): operand visible
+    assert!(tree.get("key", 1)?.is_some());
+
+    Ok(())
+}

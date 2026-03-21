@@ -665,7 +665,7 @@ impl AbstractTree for Tree {
         let entry = Self::get_internal_entry_from_version(&super_version, key, seqno)?;
 
         match entry {
-            Some(ref entry) if entry.key.value_type == ValueType::MergeOperand => {
+            Some(entry) if entry.key.value_type == ValueType::MergeOperand => {
                 if let Some(merge_op) = &self.config.merge_operator {
                     Self::resolve_merge_get(&super_version, key, seqno, merge_op.as_ref())
                 } else if Self::is_suppressed_by_range_tombstones(
@@ -676,7 +676,7 @@ impl AbstractTree for Tree {
                 ) {
                     Ok(None)
                 } else {
-                    Ok(Some(entry.value.clone()))
+                    Ok(Some(entry.value))
                 }
             }
             Some(entry) => Ok(Some(entry.value)),
