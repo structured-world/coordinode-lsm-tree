@@ -201,7 +201,8 @@ mod tests {
             writer.finish()?;
         }
 
-        // Tamper seqno at offset 0 + magic(4) + checksum(16) = 20
+        // Tamper seqno at file offset 0 + magic(4) + checksum(16) = 20.
+        // sfa has no inline section headers — data starts at byte 0.
         let mut raw = std::fs::read(&blob_file_path)?;
         let seqno_offset = 20;
         raw[seqno_offset..seqno_offset + 8].copy_from_slice(&99u64.to_le_bytes());
@@ -232,7 +233,8 @@ mod tests {
             writer.finish()?;
         }
 
-        // Tamper value payload: header(42) + key(3) = 45
+        // Tamper value payload at file offset header(42) + key(3) = 45.
+        // sfa has no inline section headers — data starts at byte 0.
         let value_offset = BLOB_HEADER_LEN + 3;
         let mut raw = std::fs::read(&blob_file_path)?;
         raw[value_offset] ^= 0xFF;

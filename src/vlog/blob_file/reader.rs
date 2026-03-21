@@ -53,8 +53,9 @@ impl<'a> Reader<'a> {
         // Always read with V4 (max) header size so that version detection
         // is self-describing from the frame magic — no dependency on
         // metadata version which could be corrupted independently.
-        // For V3 frames, the extra 4 bytes read are harmless (they come
-        // from the next frame or the metadata section).
+        // For V3 frames, the extra 4 bytes read are harmless: they come
+        // from the next frame or metadata section (which always follows),
+        // and raw_data is sliced to exact on_disk_val_len before use.
         let add_size = (BLOB_HEADER_LEN as u64) + (key.len() as u64);
 
         // Validate the full on-disk read size (header + key + value) against the limit.

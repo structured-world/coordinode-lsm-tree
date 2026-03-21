@@ -39,7 +39,11 @@ fn check_size_cap(len: usize) -> crate::Result<()> {
 pub const BLOB_HEADER_MAGIC_V3: &[u8] = b"BLOB";
 
 /// V4 blob frame magic (includes header checksum).
-pub const BLOB_HEADER_MAGIC: &[u8] = b"BLO4";
+pub const BLOB_HEADER_MAGIC_V4: &[u8] = b"BLO4";
+
+/// Backwards-compatible alias for V4 blob frame magic.
+/// Prefer `BLOB_HEADER_MAGIC_V4` in new code.
+pub const BLOB_HEADER_MAGIC: &[u8] = BLOB_HEADER_MAGIC_V4;
 
 /// V3 blob frame header length (38 bytes, no `header_crc`).
 pub const BLOB_HEADER_LEN_V3: usize = BLOB_HEADER_MAGIC_V3.len()
@@ -73,10 +77,13 @@ pub fn validate_header_crc(
         hasher.update(&key_len.to_le_bytes());
         hasher.update(&real_val_len.to_le_bytes());
         hasher.update(&on_disk_val_len.to_le_bytes());
-        hasher.digest128() as u32
+        // digest() returns u64 (cheaper than digest128 for a 4-byte CRC)
+        hasher.digest() as u32
     };
 
     if stored_crc != recomputed_crc {
+        // Reuses ChecksumMismatch (header CRC vs data checksum distinguished
+        // by the caller's log::error context, not the error variant).
         return Err(crate::Error::ChecksumMismatch {
             got: crate::Checksum::from_raw(u128::from(recomputed_crc)),
             expected: crate::Checksum::from_raw(u128::from(stored_crc)),
@@ -240,7 +247,7 @@ impl Writer {
             hasher.update(&(key.len() as u16).to_le_bytes());
             hasher.update(&uncompressed_len.to_le_bytes());
             hasher.update(&compressed_len_u32.to_le_bytes());
-            hasher.digest128() as u32
+            hasher.digest() as u32
         };
 
         // Data checksum includes header_crc bytes so that even if an
