@@ -14,6 +14,7 @@ use crate::{
     checksum::{ChecksumType, ChecksummedWriter},
     coding::Encode,
     file::fsync_directory,
+    prefix::PrefixExtractor,
     range_tombstone::RangeTombstone,
     table::{
         writer::{
@@ -27,7 +28,7 @@ use crate::{
     Checksum, CompressionType, InternalValue, TableId, UserKey, ValueType,
 };
 use index::BlockIndexWriter;
-use std::{fs::File, io::BufWriter, path::PathBuf};
+use std::{fs::File, io::BufWriter, path::PathBuf, sync::Arc};
 
 #[derive(Copy, Clone, PartialEq, Eq, Debug, std::hash::Hash)]
 pub struct LinkedFile {
@@ -235,6 +236,12 @@ impl Writer {
     pub fn use_bloom_policy(mut self, bloom_policy: BloomConstructionPolicy) -> Self {
         self.bloom_policy = bloom_policy;
         self.filter_writer = self.filter_writer.set_filter_policy(bloom_policy);
+        self
+    }
+
+    #[must_use]
+    pub fn use_prefix_extractor(mut self, extractor: Option<Arc<dyn PrefixExtractor>>) -> Self {
+        self.filter_writer = self.filter_writer.set_prefix_extractor(extractor);
         self
     }
 

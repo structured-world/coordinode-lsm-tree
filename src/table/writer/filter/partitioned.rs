@@ -6,6 +6,7 @@ use super::FilterWriter;
 use crate::{
     checksum::ChecksummedWriter,
     config::BloomConstructionPolicy,
+    prefix::PrefixExtractor,
     table::{
         block::Header as BlockHeader, filter::standard_bloom::Builder, Block, BlockHandle,
         BlockOffset, IndexBlock, KeyedBlockHandle,
@@ -15,6 +16,7 @@ use crate::{
 use std::{
     fs::File,
     io::{BufWriter, Seek, Write},
+    sync::Arc,
 };
 
 pub struct PartitionedFilterWriter {
@@ -35,6 +37,8 @@ pub struct PartitionedFilterWriter {
     last_key: Option<UserKey>,
 
     compression: CompressionType,
+
+    prefix_extractor: Option<Arc<dyn PrefixExtractor>>,
 }
 
 impl PartitionedFilterWriter {
@@ -54,6 +58,8 @@ impl PartitionedFilterWriter {
             last_key: None,
 
             compression: CompressionType::None,
+
+            prefix_extractor: None,
         }
     }
 
@@ -160,8 +166,22 @@ impl<W: std::io::Write + std::io::Seek> FilterWriter<W> for PartitionedFilterWri
         self
     }
 
+    fn set_prefix_extractor(
+        mut self: Box<Self>,
+        extractor: Option<Arc<dyn PrefixExtractor>>,
+    ) -> Box<dyn FilterWriter<W>> {
+        self.prefix_extractor = extractor;
+        self
+    }
+
     fn register_key(&mut self, key: &UserKey) -> crate::Result<()> {
         self.bloom_hash_buffer.push(Builder::get_hash(key));
+
+        if let Some(extractor) = &self.prefix_extractor {
+            for prefix in extractor.prefixes(key.as_ref()) {
+                self.bloom_hash_buffer.push(Builder::get_hash(prefix));
+            }
+        }
 
         self.approx_filter_size = self
             .bloom_policy

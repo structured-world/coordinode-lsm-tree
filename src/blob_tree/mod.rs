@@ -237,22 +237,37 @@ impl AbstractTree for BlobTree {
         index: Option<(Arc<Memtable>, SeqNo)>,
     ) -> Box<dyn DoubleEndedIterator<Item = IterGuardImpl> + Send + 'static> {
         use crate::range::prefix_to_range;
+        use crate::table::filter::standard_bloom::Builder;
+
+        let prefix_bytes = prefix.as_ref();
+
+        let prefix_hash =
+            if self.index.config.prefix_extractor.is_some() && !prefix_bytes.is_empty() {
+                Some(Builder::get_hash(prefix_bytes))
+            } else {
+                None
+            };
 
         let super_version = self.index.get_version_for_snapshot(seqno);
         let tree = self.clone();
 
-        let range = prefix_to_range(prefix.as_ref());
+        let range = prefix_to_range(prefix_bytes);
 
         Box::new(
-            crate::Tree::create_internal_range(super_version.clone(), &range, seqno, index).map(
-                move |kv| {
-                    IterGuardImpl::Blob(Guard {
-                        tree: tree.clone(),
-                        version: super_version.version.clone(),
-                        kv,
-                    })
-                },
-            ),
+            crate::Tree::create_internal_range_with_prefix_hash(
+                super_version.clone(),
+                &range,
+                seqno,
+                index,
+                prefix_hash,
+            )
+            .map(move |kv| {
+                IterGuardImpl::Blob(Guard {
+                    tree: tree.clone(),
+                    version: super_version.version.clone(),
+                    kv,
+                })
+            }),
         )
     }
 
@@ -411,7 +426,8 @@ impl AbstractTree for BlobTree {
                 Bloom(policy) => policy,
                 None => BloomConstructionPolicy::BitsPerKey(0.0),
             }
-        });
+        })
+        .use_prefix_extractor(self.index.config.prefix_extractor.clone());
 
         if index_partitioning {
             table_writer = table_writer.use_partitioned_index();

@@ -390,7 +390,8 @@ impl AbstractTree for Tree {
                 Bloom(policy) => policy,
                 None => BloomConstructionPolicy::BitsPerKey(0.0),
             }
-        });
+        })
+        .use_prefix_extractor(self.config.prefix_extractor.clone());
 
         if index_partitioning {
             table_writer = table_writer.use_partitioned_index();
@@ -716,6 +717,23 @@ impl Tree {
         seqno: SeqNo,
         ephemeral: Option<(Arc<Memtable>, SeqNo)>,
     ) -> impl DoubleEndedIterator<Item = crate::Result<InternalValue>> + 'static {
+        Self::create_internal_range_with_prefix_hash(version, range, seqno, ephemeral, None)
+    }
+
+    /// Like [`Tree::create_internal_range`], but with an optional prefix hash
+    /// for prefix bloom filter skipping during prefix scans.
+    #[doc(hidden)]
+    pub fn create_internal_range_with_prefix_hash<
+        'a,
+        K: AsRef<[u8]> + 'a,
+        R: RangeBounds<K> + 'a,
+    >(
+        version: SuperVersion,
+        range: &'a R,
+        seqno: SeqNo,
+        ephemeral: Option<(Arc<Memtable>, SeqNo)>,
+        prefix_hash: Option<u64>,
+    ) -> impl DoubleEndedIterator<Item = crate::Result<InternalValue>> + 'static {
         use crate::range::{IterState, TreeIter};
         use std::ops::Bound::{self, Excluded, Included, Unbounded};
 
@@ -733,7 +751,11 @@ impl Tree {
 
         let bounds: (Bound<UserKey>, Bound<UserKey>) = (lo, hi);
 
-        let iter_state = { IterState { version, ephemeral } };
+        let iter_state = IterState {
+            version,
+            ephemeral,
+            prefix_hash,
+        };
 
         TreeIter::create_range(iter_state, bounds, seqno)
     }
@@ -1050,10 +1072,39 @@ impl Tree {
         seqno: SeqNo,
         ephemeral: Option<(Arc<Memtable>, SeqNo)>,
     ) -> impl DoubleEndedIterator<Item = crate::Result<KvPair>> + 'static {
-        use crate::range::prefix_to_range;
+        use crate::range::{prefix_to_range, IterState, TreeIter};
+        use crate::table::filter::standard_bloom::Builder;
 
-        let range = prefix_to_range(prefix.as_ref());
-        self.create_range(&range, seqno, ephemeral)
+        let prefix_bytes = prefix.as_ref();
+
+        // Compute prefix hash for bloom filter skipping when a prefix extractor
+        // is configured. The hash of the raw prefix is checked against segment
+        // bloom filters that index extracted prefixes.
+        let prefix_hash = if self.config.prefix_extractor.is_some() && !prefix_bytes.is_empty() {
+            Some(Builder::get_hash(prefix_bytes))
+        } else {
+            None
+        };
+
+        let range = prefix_to_range(prefix_bytes);
+
+        #[expect(clippy::expect_used, reason = "lock is expected to not be poisoned")]
+        let super_version = self
+            .version_history
+            .read()
+            .expect("lock is poisoned")
+            .get_version_for_snapshot(seqno);
+
+        let iter_state = IterState {
+            version: super_version,
+            ephemeral,
+            prefix_hash,
+        };
+
+        TreeIter::create_range(iter_state, range, seqno).map(|item| match item {
+            Ok(kv) => Ok((kv.key.user_key, kv.value)),
+            Err(e) => Err(e),
+        })
     }
 
     /// Adds an item to the active memtable.

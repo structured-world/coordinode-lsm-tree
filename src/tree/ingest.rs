@@ -92,7 +92,8 @@ impl<'a> Ingestion<'a> {
             tree.config
                 .index_block_restart_interval_policy
                 .get(INITIAL_CANONICAL_LEVEL),
-        );
+        )
+        .use_prefix_extractor(tree.config.prefix_extractor.clone());
 
         if index_partitioning {
             writer = writer.use_partitioned_index();

@@ -9,9 +9,10 @@ pub use full::FullFilterWriter;
 pub use partitioned::PartitionedFilterWriter;
 
 use crate::{
-    checksum::ChecksummedWriter, config::BloomConstructionPolicy, CompressionType, UserKey,
+    checksum::ChecksummedWriter, config::BloomConstructionPolicy, prefix::PrefixExtractor,
+    CompressionType, UserKey,
 };
-use std::{fs::File, io::BufWriter};
+use std::{fs::File, io::BufWriter, sync::Arc};
 
 pub trait FilterWriter<W: std::io::Write> {
     // NOTE: We purposefully use a UserKey instead of &[u8]
@@ -38,4 +39,9 @@ pub trait FilterWriter<W: std::io::Write> {
     ) -> Box<dyn FilterWriter<W>>;
 
     fn use_partition_size(self: Box<Self>, size: u32) -> Box<dyn FilterWriter<W>>;
+
+    fn set_prefix_extractor(
+        self: Box<Self>,
+        extractor: Option<Arc<dyn PrefixExtractor>>,
+    ) -> Box<dyn FilterWriter<W>>;
 }

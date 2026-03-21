@@ -773,6 +773,33 @@ impl Table {
         self.metadata.key_range.overlaps_with_bounds(bounds)
     }
 
+    /// Checks the bloom filter for a prefix hash.
+    ///
+    /// Returns `Ok(true)` if the prefix may exist in this table (or if no
+    /// filter is available), `Ok(false)` if the prefix is definitely absent.
+    ///
+    /// This is used by prefix scans to skip segments that contain no keys
+    /// with a matching prefix. The prefix must have been indexed at write
+    /// time via a [`PrefixExtractor`](crate::PrefixExtractor).
+    pub(crate) fn maybe_contains_prefix(&self, prefix_hash: u64) -> crate::Result<bool> {
+        if let Some(block) = &self.pinned_filter_block {
+            return block.maybe_contains_hash(prefix_hash);
+        }
+
+        if let Some(filter_block_handle) = &self.regions.filter {
+            let block = self.load_block(
+                filter_block_handle,
+                BlockType::Filter,
+                CompressionType::None,
+            )?;
+            let block = FilterBlock::new(block);
+            return block.maybe_contains_hash(prefix_hash);
+        }
+
+        // No filter available — cannot rule out the prefix
+        Ok(true)
+    }
+
     /// Returns the highest effective sequence number in the table.
     ///
     /// For tables produced by flush/compaction (`global_seqno == 0`), this
