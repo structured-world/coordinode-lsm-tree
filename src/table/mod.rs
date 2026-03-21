@@ -782,10 +782,31 @@ impl Table {
     /// with a matching prefix. The prefix must have been indexed at write
     /// time via a [`PrefixExtractor`](crate::PrefixExtractor).
     pub(crate) fn maybe_contains_prefix(&self, prefix_hash: u64) -> crate::Result<bool> {
+        // Full (non-partitioned) filter — single bloom covers the entire table
         if let Some(block) = &self.pinned_filter_block {
             return block.maybe_contains_hash(prefix_hash);
         }
 
+        // Partitioned filter — prefix could be in any partition, so check all.
+        // Return Ok(true) if ANY partition might contain the prefix.
+        if let Some(filter_idx) = &self.pinned_filter_index {
+            let iter = filter_idx.iter();
+            for filter_block_handle in iter {
+                let handle = filter_block_handle.materialize(filter_idx.as_slice());
+                let block = self.load_block(
+                    &handle.into_inner(),
+                    BlockType::Filter,
+                    CompressionType::None,
+                )?;
+                let block = FilterBlock::new(block);
+                if block.maybe_contains_hash(prefix_hash)? {
+                    return Ok(true);
+                }
+            }
+            return Ok(false);
+        }
+
+        // Unpinned full filter — load from disk
         if let Some(filter_block_handle) = &self.regions.filter {
             let block = self.load_block(
                 filter_block_handle,

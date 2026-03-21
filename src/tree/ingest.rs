@@ -101,8 +101,6 @@ impl<'a> Ingestion<'a> {
             writer = writer.use_partitioned_filter();
         }
 
-        // NOTE: prefix extractor must be set AFTER partitioned filter setup,
-        // because use_partitioned_filter() replaces the filter writer entirely.
         writer = writer.use_prefix_extractor(tree.config.prefix_extractor.clone());
 
         Ok(Self {

@@ -399,10 +399,6 @@ impl AbstractTree for Tree {
             table_writer = table_writer.use_partitioned_filter();
         }
 
-        // NOTE: prefix extractor must be set AFTER partitioned filter setup,
-        // because use_partitioned_filter() replaces the filter writer entirely.
-        // TODO: make use_partitioned_filter() preserve the extractor to avoid
-        // this ordering requirement across all call sites.
         table_writer = table_writer.use_prefix_extractor(self.config.prefix_extractor.clone());
 
         // Set range tombstones BEFORE writing KV items so that if MultiWriter

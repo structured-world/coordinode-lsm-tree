@@ -438,8 +438,6 @@ impl AbstractTree for BlobTree {
             table_writer = table_writer.use_partitioned_filter();
         }
 
-        // NOTE: prefix extractor must be set AFTER partitioned filter setup,
-        // because use_partitioned_filter() replaces the filter writer entirely.
         table_writer =
             table_writer.use_prefix_extractor(self.index.config.prefix_extractor.clone());
 
