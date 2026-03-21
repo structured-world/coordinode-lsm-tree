@@ -20,7 +20,8 @@ impl Workload for PrefixScan {
         seqno: &AtomicU64,
         reporter: &mut Reporter,
     ) -> lsm_tree::Result<()> {
-        // Prefix keys use 2-byte prefix + 2-byte suffix = 4 bytes minimum.
+        // Prefix keys: 2-byte u16 prefix + 2-byte u16 suffix = 4 bytes minimum.
+        // Below this, keys collapse and the benchmark is meaningless.
         assert!(
             config.key_size >= 4,
             "prefixscan requires --key-size >= 4 (2-byte prefix + 2-byte suffix)"
