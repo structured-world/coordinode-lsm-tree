@@ -128,4 +128,28 @@ mod tests {
         let prefixes: Vec<&[u8]> = extractor.prefixes(b"").collect();
         assert!(prefixes.is_empty());
     }
+
+    #[test]
+    fn is_valid_prefix_boundary_colon_terminated() {
+        let extractor = ColonSeparatedPrefix;
+        // "adj:" is a valid boundary — extractor emits it for "adj:" input
+        assert!(extractor.is_valid_prefix_boundary(b"adj:"));
+        assert!(extractor.is_valid_prefix_boundary(b"adj:out:"));
+        assert!(extractor.is_valid_prefix_boundary(b"adj:out:42:"));
+    }
+
+    #[test]
+    fn is_valid_prefix_boundary_non_boundary() {
+        let extractor = ColonSeparatedPrefix;
+        // "adj" (no trailing colon) is NOT a valid boundary
+        assert!(!extractor.is_valid_prefix_boundary(b"adj"));
+        assert!(!extractor.is_valid_prefix_boundary(b"adj:out"));
+        assert!(!extractor.is_valid_prefix_boundary(b"noseparator"));
+    }
+
+    #[test]
+    fn is_valid_prefix_boundary_empty() {
+        let extractor = ColonSeparatedPrefix;
+        assert!(!extractor.is_valid_prefix_boundary(b""));
+    }
 }

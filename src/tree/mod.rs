@@ -1082,6 +1082,8 @@ impl Tree {
 
         // Only enable bloom-based table skipping when the scan prefix is a
         // valid boundary for the configured extractor (see trait docs).
+        // Builder::get_hash is intentionally coupled to the bloom filter's
+        // hash function — write path and read path must use the same hash.
         let prefix_hash = self
             .config
             .prefix_extractor
