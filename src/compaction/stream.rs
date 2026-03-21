@@ -269,14 +269,12 @@ impl<'a, I: Iterator<Item = Item>, F: StreamFilter + 'a> Iterator for Compaction
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
-            // If there are pending entries (e.g., operands buffered while resolving
-            // a merge with an Indirection base), process them through the same
-            // compaction pipeline as regular items from `inner`.
-            let mut head = if let Some(entry) = self.pending.pop_front() {
-                entry
-            } else {
-                fail_iter!(self.inner.next()?)
-            };
+            // Pending entries (from Indirection bailout) go through the same pipeline.
+            let next = self
+                .pending
+                .pop_front()
+                .map_or_else(|| self.inner.next(), |e| Some(Ok(e)));
+            let mut head = fail_iter!(next?);
 
             if !head.is_tombstone() {
                 match fail_iter!(self.filter.filter_item(&head)) {
@@ -303,8 +301,6 @@ impl<'a, I: Iterator<Item = Item>, F: StreamFilter + 'a> Iterator for Compaction
                         if let Some(watcher) = &mut self.dropped_callback {
                             watcher.on_dropped(&head);
                         }
-
-                        // Ignore
                         continue;
                     }
                 }
@@ -349,7 +345,7 @@ impl<'a, I: Iterator<Item = Item>, F: StreamFilter + 'a> Iterator for Compaction
                         if let Some(merge_op) = self.merge_operator.clone() {
                             let mut merged =
                                 fail_iter!(self.resolve_merge_operands(head, merge_op.as_ref()));
-
+                            // Skip zeroing for partial merges (MergeOperand) to avoid duplicate keys
                             if self.zero_seqnos
                                 && merged.key.seqno < self.gc_seqno_threshold
                                 && !merged.key.value_type.is_merge_operand()
@@ -375,43 +371,29 @@ impl<'a, I: Iterator<Item = Item>, F: StreamFilter + 'a> Iterator for Compaction
                             continue;
                         }
 
-                        // NOTE: If next item is an actual value, and current value is weak tombstone,
-                        // drop the tombstone
+                        // Drop weak tombstone if next item is Value
                         let drop_weak_tombstone = peeked.key.value_type == ValueType::Value
                             && head.key.value_type == ValueType::WeakTombstone;
-
-                        // NOTE: Next item is expired, so the tail of this user
-                        // key is entirely expired, so drain it all.
-                        //
-                        // At this point, `head` is *not* a MergeOperand (those
-                        // cases are handled in the branches above). Even if
-                        // older versions include merge operands, they are all
-                        // below the GC watermark and cannot affect the newest
-                        // visible value, so it is safe to drop them here.
+                        // Tail expired — drain (head is never MergeOperand here)
                         fail_iter!(self.drain_key(&head.key.user_key));
 
                         if drop_weak_tombstone {
                             continue;
                         }
                     }
-                }
-            } else if head.is_tombstone() && self.evict_tombstones {
+                } else if head.is_tombstone() && self.evict_tombstones {
                 continue;
             } else if head.key.value_type.is_merge_operand()
                 && head.key.seqno < self.gc_seqno_threshold
             {
-                // Last item in the entire stream is a MergeOperand below GC.
-                // The filter section above (`!head.is_tombstone()`) only applies
-                // the stream filter — it does not consume or skip the entry.
+                // Last stream item is a MergeOperand below GC — partial merge.
                 if let Some(merge_op) = self.merge_operator.clone() {
                     let merged = fail_iter!(self.resolve_merge_operands(head, merge_op.as_ref()));
                     head = merged;
                 }
             }
 
-            // Zero seqnos for collapsed entries, but NOT for preserved MergeOperands:
-            // multiple operands for the same key would all become seqno=0, creating
-            // duplicate internal keys that destabilize reads.
+            // Zero seqnos below GC, but skip MergeOperands (duplicate key risk)
             if self.zero_seqnos
                 && head.key.seqno < self.gc_seqno_threshold
                 && !head.key.value_type.is_merge_operand()
