@@ -288,7 +288,7 @@ fn merge_error_propagation() {
     tree.merge("key", b"op1".to_vec(), 0);
 
     let result = tree.get("key", 1);
-    assert!(result.is_err());
+    assert!(matches!(result, Err(lsm_tree::Error::MergeOperator)));
 }
 
 #[test]

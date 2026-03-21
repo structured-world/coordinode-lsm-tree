@@ -350,7 +350,10 @@ impl<'a, I: Iterator<Item = Item>, F: StreamFilter + 'a> Iterator for Compaction
                             let mut merged =
                                 fail_iter!(self.resolve_merge_operands(head, merge_op.as_ref()));
 
-                            if self.zero_seqnos && merged.key.seqno < self.gc_seqno_threshold {
+                            if self.zero_seqnos
+                                && merged.key.seqno < self.gc_seqno_threshold
+                                && !merged.key.value_type.is_merge_operand()
+                            {
                                 merged.key.seqno = 0;
                             }
                             return Some(Ok(merged));

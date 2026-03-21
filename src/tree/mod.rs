@@ -668,6 +668,13 @@ impl AbstractTree for Tree {
             Some(ref entry) if entry.key.value_type == ValueType::MergeOperand => {
                 if let Some(merge_op) = &self.config.merge_operator {
                     Self::resolve_merge_get(&super_version, key, seqno, merge_op.as_ref())
+                } else if Self::is_suppressed_by_range_tombstones(
+                    &super_version,
+                    key,
+                    entry.key.seqno,
+                    seqno,
+                ) {
+                    Ok(None)
                 } else {
                     Ok(Some(entry.value.clone()))
                 }
@@ -954,10 +961,11 @@ impl Tree {
             return Ok(base_value);
         }
 
-        // Reverse operands to chronological order (ascending seqno)
-        operands.reverse();
-
-        let operand_refs: Vec<&[u8]> = operands.iter().map(AsRef::as_ref).collect();
+        // Build operand refs in chronological order (ascending seqno)
+        let mut operand_refs: Vec<&[u8]> = Vec::with_capacity(operands.len());
+        for op in operands.iter().rev() {
+            operand_refs.push(op.as_ref());
+        }
         let merged = merge_op.merge(key, base_value.as_deref(), &operand_refs)?;
 
         Ok(Some(merged))
