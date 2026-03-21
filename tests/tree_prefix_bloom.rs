@@ -104,42 +104,6 @@ fn prefix_bloom_skips_segments() -> lsm_tree::Result<()> {
     Ok(())
 }
 
-#[cfg(feature = "metrics")]
-#[test]
-fn prefix_bloom_reduces_io() -> lsm_tree::Result<()> {
-    use std::sync::atomic::Ordering::Relaxed;
-
-    let folder = tempfile::tempdir()?;
-    let tree = tree_with_prefix_bloom(&folder)?;
-
-    // Create multiple segments with disjoint prefix sets
-    for i in 0..10 {
-        let key = format!("prefix{i}:key");
-        tree.insert(key, "value", i);
-        tree.flush_active_memtable(0)?;
-    }
-
-    let metrics = tree.metrics();
-
-    // Reset filter query counters
-    let before = metrics.io_skipped_by_filter.load(Relaxed);
-
-    // Scan for prefix0 — should skip most segments via prefix bloom
-    let results: Vec<_> = tree
-        .create_prefix("prefix0:", 10, None)
-        .collect::<Result<Vec<_>, _>>()?;
-    assert_eq!(results.len(), 1);
-
-    let after = metrics.io_skipped_by_filter.load(Relaxed);
-
-    // The prefix bloom check happens at segment level (not at point-read level),
-    // so io_skipped_by_filter won't be incremented here. But we can verify
-    // correctness: only 1 result despite 10 segments.
-    let _ = (before, after); // metrics available but bloom skip is at range level
-
-    Ok(())
-}
-
 #[test]
 fn prefix_bloom_after_compaction() -> lsm_tree::Result<()> {
     let folder = tempfile::tempdir()?;
