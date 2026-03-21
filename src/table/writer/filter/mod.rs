@@ -14,6 +14,10 @@ use crate::{
 };
 use std::{fs::File, io::BufWriter, sync::Arc};
 
+// NOTE: This trait is pub because the `table::writer` module is pub, but it is
+// NOT re-exported from the crate root — no downstream can implement it.
+// All methods are required (no defaults) because `Box<Self>` return prevents
+// providing defaults without a `Sized` bound that would break trait object usage.
 pub trait FilterWriter<W: std::io::Write> {
     // NOTE: We purposefully use a UserKey instead of &[u8]
     // so we can clone it without heap allocation, if needed
