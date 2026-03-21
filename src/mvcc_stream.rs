@@ -35,6 +35,7 @@ impl<I: DoubleEndedIterator<Item = crate::Result<InternalValue>>> MvccStream<I> 
         let mut operands: Vec<UserValue> = vec![head.value.clone()];
         let mut base_value: Option<UserValue> = None;
         let mut found_base = false;
+        let mut saw_indirection_base = false;
 
         // Collect remaining same-key entries
         loop {
@@ -54,9 +55,17 @@ impl<I: DoubleEndedIterator<Item = crate::Result<InternalValue>>> MvccStream<I> 
                 ValueType::MergeOperand => {
                     operands.push(next.value);
                 }
-                ValueType::Value | ValueType::Indirection => {
+                ValueType::Value => {
                     base_value = Some(next.value);
                     found_base = true;
+                    break;
+                }
+                ValueType::Indirection => {
+                    // Indirection payloads are internal blob pointers and must not be
+                    // used as a merge base user value. Remember that we saw an
+                    // indirection base so we can skip merge resolution for this key.
+                    found_base = true;
+                    saw_indirection_base = true;
                     break;
                 }
                 ValueType::Tombstone | ValueType::WeakTombstone => {
@@ -70,6 +79,12 @@ impl<I: DoubleEndedIterator<Item = crate::Result<InternalValue>>> MvccStream<I> 
         // Drain any remaining same-key entries
         if found_base {
             self.drain_key_min(user_key)?;
+        }
+
+        // If the base would be an indirection, do not attempt to resolve the merge;
+        // just return the newest entry unchanged.
+        if saw_indirection_base {
+            return Ok(head.clone());
         }
 
         // Reverse to chronological order (ascending seqno)
@@ -105,6 +120,8 @@ impl<I: DoubleEndedIterator<Item = crate::Result<InternalValue>>> MvccStream<I> 
         let mut result_key = UserKey::empty();
 
         // Process in descending seqno order (newest first) to match forward merge semantics
+        let mut saw_indirection = false;
+
         for entry in entries.iter().rev() {
             if result_seqno == 0 {
                 result_seqno = entry.key.seqno;
@@ -115,14 +132,28 @@ impl<I: DoubleEndedIterator<Item = crate::Result<InternalValue>>> MvccStream<I> 
                 ValueType::MergeOperand => {
                     operands.push(entry.value.clone());
                 }
-                ValueType::Value | ValueType::Indirection => {
+                ValueType::Value => {
                     base_value = Some(entry.value.clone());
+                    break;
+                }
+                ValueType::Indirection => {
+                    // Do not use indirection bytes as a merge base; stop scanning
+                    // older versions.
+                    saw_indirection = true;
                     break;
                 }
                 ValueType::Tombstone | ValueType::WeakTombstone => {
                     break;
                 }
             }
+        }
+
+        // If the base is an indirection, return the newest entry unchanged.
+        if saw_indirection {
+            return entries
+                .into_iter()
+                .last()
+                .ok_or(crate::Error::Unrecoverable);
         }
 
         // Reverse operands to chronological order (ascending seqno)
@@ -1082,6 +1113,55 @@ mod tests {
 
             assert!(iter.next_back().is_none());
 
+            Ok(())
+        }
+
+        /// Forward: MergeOperand above an Indirection base must return the
+        /// MergeOperand unchanged — indirection bytes are internal blob
+        /// pointers, not user data.
+        #[test]
+        #[expect(clippy::unwrap_used, reason = "test assertion")]
+        fn merge_forward_indirection_base_returns_head() -> crate::Result<()> {
+            let vec = vec![
+                InternalValue::from_components("a", "op2", 3, ValueType::MergeOperand),
+                InternalValue::from_components("a", "op1", 2, ValueType::MergeOperand),
+                InternalValue::from_components("a", "blob_ptr", 1, ValueType::Indirection),
+            ];
+
+            let iter = Box::new(vec.into_iter().map(Ok));
+            let mut iter = MvccStream::new(iter, merge_op());
+
+            let item = iter.next().unwrap()?;
+            assert_eq!(&*item.key.user_key, b"a");
+            // Must return head MergeOperand unchanged, NOT merged with blob pointer
+            assert_eq!(item.key.value_type, ValueType::MergeOperand);
+            assert_eq!(&*item.value, b"op2");
+
+            assert!(iter.next().is_none());
+            Ok(())
+        }
+
+        /// Reverse: MergeOperand above an Indirection base must return the
+        /// newest MergeOperand unchanged.
+        #[test]
+        #[expect(clippy::unwrap_used, reason = "test assertion")]
+        fn merge_reverse_indirection_base_returns_newest() -> crate::Result<()> {
+            let vec = vec![
+                InternalValue::from_components("a", "op2", 3, ValueType::MergeOperand),
+                InternalValue::from_components("a", "op1", 2, ValueType::MergeOperand),
+                InternalValue::from_components("a", "blob_ptr", 1, ValueType::Indirection),
+            ];
+
+            let iter = Box::new(vec.into_iter().map(Ok));
+            let mut iter = MvccStream::new(iter, merge_op());
+
+            let item = iter.next_back().unwrap()?;
+            assert_eq!(&*item.key.user_key, b"a");
+            // Must return newest MergeOperand unchanged
+            assert_eq!(item.key.value_type, ValueType::MergeOperand);
+            assert_eq!(&*item.value, b"op2");
+
+            assert!(iter.next_back().is_none());
             Ok(())
         }
     }

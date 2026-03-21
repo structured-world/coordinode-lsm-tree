@@ -3,7 +3,7 @@
 // (found in the LICENSE-* files in the repository)
 
 use crate::{merge_operator::MergeOperator, InternalValue, SeqNo, UserKey, UserValue, ValueType};
-use std::{iter::Peekable, sync::Arc};
+use std::{collections::VecDeque, iter::Peekable, sync::Arc};
 
 type Item = crate::Result<InternalValue>;
 
@@ -65,6 +65,10 @@ pub struct CompactionStream<'a, I: Iterator<Item = Item>, F: StreamFilter = NoFi
 
     /// Merge operator for collapsing merge operands during compaction
     merge_operator: Option<Arc<dyn MergeOperator>>,
+
+    /// Entries that could not be merged (e.g., Indirection base) and need
+    /// to be re-emitted unchanged on subsequent `next()` calls.
+    pending: VecDeque<InternalValue>,
 }
 
 impl<I: Iterator<Item = Item>> CompactionStream<'_, I, NoFilter> {
@@ -81,6 +85,7 @@ impl<I: Iterator<Item = Item>> CompactionStream<'_, I, NoFilter> {
             evict_tombstones: false,
             zero_seqnos: false,
             merge_operator: None,
+            pending: VecDeque::new(),
         }
     }
 }
@@ -96,6 +101,7 @@ impl<'a, I: Iterator<Item = Item>, F: StreamFilter + 'a> CompactionStream<'a, I,
             evict_tombstones: self.evict_tombstones,
             zero_seqnos: self.zero_seqnos,
             merge_operator: self.merge_operator,
+            pending: self.pending,
         }
     }
 
@@ -136,7 +142,10 @@ impl<'a, I: Iterator<Item = Item>, F: StreamFilter + 'a> CompactionStream<'a, I,
     ) -> crate::Result<InternalValue> {
         let user_key = head.key.user_key.clone();
         let head_seqno = head.key.seqno;
-        let mut operands: Vec<UserValue> = vec![head.value];
+
+        // Store full entries so we can re-emit them unchanged if we hit an
+        // Indirection base and cannot resolve the merge.
+        let mut collected: Vec<InternalValue> = vec![head];
         let mut base_value: Option<UserValue> = None;
 
         // Collect remaining same-key entries
@@ -153,12 +162,32 @@ impl<'a, I: Iterator<Item = Item>, F: StreamFilter + 'a> CompactionStream<'a, I,
                 break;
             }
 
+            // Check for Indirection BEFORE consuming — the indirection entry
+            // stays in the stream and will be emitted normally by next().
+            let is_indirection = self.inner.peek().is_some_and(
+                |peeked| matches!(peeked, Ok(p) if p.key.value_type == ValueType::Indirection),
+            );
+
+            if is_indirection {
+                // Cannot merge with a blob-pointer base. Re-emit all consumed
+                // entries unchanged via the pending buffer to avoid data loss.
+                // The first entry is returned immediately; the rest are buffered
+                // for subsequent next() calls.
+                #[expect(
+                    clippy::expect_used,
+                    reason = "collected always has head as first element"
+                )]
+                let first = collected.remove(0);
+                self.pending.extend(collected);
+                return Ok(first);
+            }
+
             #[expect(clippy::expect_used, reason = "we just checked peek is Some")]
             let next = self.inner.next().expect("peeked value should exist")?;
 
             match next.key.value_type {
                 ValueType::MergeOperand => {
-                    operands.push(next.value);
+                    collected.push(next);
                 }
                 ValueType::Value => {
                     base_value = Some(next.value);
@@ -166,26 +195,8 @@ impl<'a, I: Iterator<Item = Item>, F: StreamFilter + 'a> CompactionStream<'a, I,
                     break;
                 }
                 ValueType::Indirection => {
-                    // Do NOT treat the indirection as a merge base — value
-                    // bytes are an encoded `BlobIndirection` (vhandle+size),
-                    // not the user value. Passing them into a user
-                    // `MergeOperator` would produce incorrect results.
-                    //
-                    // Emit the head MergeOperand unchanged and skip merge
-                    // collapsing for this key. Any operands consumed between
-                    // head and this Indirection are lost, but this path is
-                    // only reachable for BlobTree/kv-separation keys where
-                    // merge-compaction is a documented limitation.
-                    return Ok(InternalValue::from_components(
-                        user_key,
-                        #[expect(
-                            clippy::expect_used,
-                            reason = "operands always has head as first element"
-                        )]
-                        operands.into_iter().next().expect("head operand"),
-                        head_seqno,
-                        ValueType::MergeOperand,
-                    ));
+                    // Unreachable: handled by the peek check above.
+                    unreachable!("Indirection should be caught by peek check");
                 }
                 ValueType::Tombstone | ValueType::WeakTombstone => {
                     // Tombstone kills base — merge with no base
@@ -198,10 +209,14 @@ impl<'a, I: Iterator<Item = Item>, F: StreamFilter + 'a> CompactionStream<'a, I,
             }
         }
 
-        // Reverse to chronological order (ascending seqno)
-        operands.reverse();
+        // Extract operand values for merge
+        let operands: Vec<UserValue> = collected.into_iter().map(|e| e.value).collect();
 
-        let operand_refs: Vec<&[u8]> = operands.iter().map(AsRef::as_ref).collect();
+        // Reverse to chronological order (ascending seqno)
+        let mut operands_reversed = operands;
+        operands_reversed.reverse();
+
+        let operand_refs: Vec<&[u8]> = operands_reversed.iter().map(AsRef::as_ref).collect();
         let merged = merge_op.merge(&user_key, base_value.as_deref(), &operand_refs)?;
 
         Ok(InternalValue::from_components(
@@ -242,6 +257,13 @@ impl<'a, I: Iterator<Item = Item>, F: StreamFilter + 'a> Iterator for Compaction
     type Item = Item;
 
     fn next(&mut self) -> Option<Self::Item> {
+        // Re-emit entries that could not be merged (e.g., because the base
+        // was an Indirection). These have already been through collection
+        // and just need to be passed through unchanged.
+        if let Some(entry) = self.pending.pop_front() {
+            return Some(Ok(entry));
+        }
+
         loop {
             let mut head = fail_iter!(self.inner.next()?);
 
@@ -397,6 +419,7 @@ mod tests {
                     "T" => ValueType::Tombstone,
                     "W" => ValueType::WeakTombstone,
                     "M" => ValueType::MergeOperand,
+                    "I" => ValueType::Indirection,
                     _ => panic!("Unknown value type"),
                 };
 
@@ -1249,6 +1272,41 @@ mod tests {
             assert_eq!(item.key.seqno, 0);
             assert_eq!(&*item.value, b"base,op1");
 
+            Ok(())
+        }
+
+        /// When merge operands sit above an Indirection base, compaction must
+        /// preserve ALL entries unchanged — no operand may be dropped.
+        #[test]
+        #[expect(clippy::unwrap_used, reason = "test assertion")]
+        fn compaction_merge_indirection_base_preserves_all() -> crate::Result<()> {
+            #[rustfmt::skip]
+            let vec = stream![
+                "a", "op2", "M",
+                "a", "op1", "M",
+                "a", "blob_ptr", "I",
+            ];
+
+            let iter = vec.iter().cloned().map(Ok);
+            let mut iter = CompactionStream::new(iter, 1_000).with_merge_operator(merge_op());
+
+            // All three entries must be emitted unchanged
+            let item = iter.next().unwrap()?;
+            assert_eq!(&*item.key.user_key, b"a");
+            assert_eq!(item.key.value_type, ValueType::MergeOperand);
+            assert_eq!(&*item.value, b"op2");
+
+            let item = iter.next().unwrap()?;
+            assert_eq!(&*item.key.user_key, b"a");
+            assert_eq!(item.key.value_type, ValueType::MergeOperand);
+            assert_eq!(&*item.value, b"op1");
+
+            let item = iter.next().unwrap()?;
+            assert_eq!(&*item.key.user_key, b"a");
+            assert_eq!(item.key.value_type, ValueType::Indirection);
+            assert_eq!(&*item.value, b"blob_ptr");
+
+            assert!(iter.next().is_none());
             Ok(())
         }
     }

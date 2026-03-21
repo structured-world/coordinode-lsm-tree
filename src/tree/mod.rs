@@ -911,8 +911,17 @@ impl Tree {
         if has_indirection_base {
             // We encountered an indirection as the would-be base value.
             // Indirection payloads are internal blob pointers and must not be
-            // passed to the merge operator as user data. Reject merge
-            // resolution for this key.
+            // passed to the merge operator as user data.
+            //
+            // Fall back to the raw newest merge operand (if any), instead of
+            // reporting the key as missing. This preserves backward-compatible
+            // behavior for callers that expect at least the latest operand when
+            // merge resolution over an indirection base is not supported.
+            if let Some(latest_operand) = operands.first() {
+                return Ok(Some(latest_operand.clone()));
+            }
+
+            // No visible merge operands; nothing user-visible to return.
             return Ok(None);
         }
 
