@@ -854,6 +854,8 @@ impl Tree {
         // the run layout.
         let mut best: Option<InternalValue> = None;
 
+        // No short-circuit on `best.seqno == seqno`: table.get() returns
+        // entries with seqno strictly < read_seqno, so equality never holds.
         for table in version
             .iter_levels()
             .flat_map(|lvl| lvl.iter())

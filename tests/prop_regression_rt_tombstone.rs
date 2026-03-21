@@ -1,5 +1,9 @@
-// Regression tests for #53: point tombstone invisible when range tombstone
-// exists in a prior SST.
+// Regression tests for a range/point tombstone bug: point tombstone invisible
+// when range tombstone exists in a prior SST.
+//
+// When `optimize_runs` merges disjoint L0 tables from different flush epochs,
+// a newer point tombstone can end up in a run iterated AFTER an older value,
+// causing `get()` to return stale data instead of None.
 
 use lsm_tree::{get_tmp_folder, AbstractTree, AnyTree, Config, SequenceNumberCounter};
 use test_log::test;
@@ -24,6 +28,11 @@ fn baseline_point_tombstone_across_ssts() -> lsm_tree::Result<()> {
     // SST-1: insert key=2
     tree.insert(vec![2u8], vec![0u8], 1);
     tree.flush_active_memtable(0)?;
+
+    assert!(
+        tree.get(&[2u8], 2)?.is_some(),
+        "value should be visible before the point tombstone"
+    );
 
     // SST-2: point tombstone for key=2
     tree.remove(vec![2u8], 2);
@@ -50,6 +59,11 @@ fn regression_rt_same_sst_then_tombstone_in_next() -> lsm_tree::Result<()> {
     tree.remove_range(&[0u8], &[3u8], 1);
     tree.insert(vec![2u8], vec![0u8], 2);
     tree.flush_active_memtable(0)?;
+
+    assert!(
+        tree.get(&[2u8], 3)?.is_some(),
+        "insert after the RT should be visible before the later point tombstone"
+    );
 
     // SST-2: point tombstone key=2@3
     tree.remove(vec![2u8], 3);
@@ -86,6 +100,11 @@ fn regression_remove_range_then_insert_then_remove() -> lsm_tree::Result<()> {
     tree.remove_range(&[0u8], &[3u8], 5); // range tombstone
     tree.insert(vec![2u8], vec![0u8], 6); // insert AFTER RT
     tree.flush_active_memtable(0)?;
+
+    assert!(
+        tree.get(&[2u8], 7)?.is_some(),
+        "insert after the RT should be visible before the final point tombstone"
+    );
 
     // SST-3: point tombstone for key=2@7
     tree.remove(vec![2u8], 7);
