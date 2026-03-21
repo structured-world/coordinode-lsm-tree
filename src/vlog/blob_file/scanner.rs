@@ -192,6 +192,8 @@ mod tests {
     /// CRC catches the corruption.
     #[test]
     fn blob_scanner_v4_corrupted_seqno_detected_by_header_crc() -> crate::Result<()> {
+        use crate::vlog::blob_file::writer::BLOB_HEADER_MAGIC_V4;
+
         let dir = tempdir()?;
         let blob_file_path = dir.path().join("0");
 
@@ -201,18 +203,23 @@ mod tests {
             writer.finish()?;
         }
 
-        // Tamper seqno at file offset 0 + magic(4) + checksum(16) = 20.
-        // sfa has no inline section headers — data starts at byte 0.
+        // Find frame start by searching for magic (robust against sfa framing).
         let mut raw = std::fs::read(&blob_file_path)?;
-        let seqno_offset = 20;
+        let frame_start = raw
+            .windows(4)
+            .position(|w| w == BLOB_HEADER_MAGIC_V4)
+            .unwrap();
+
+        // Tamper seqno: frame_start + magic(4) + checksum(16) = +20
+        let seqno_offset = frame_start + 20;
         raw[seqno_offset..seqno_offset + 8].copy_from_slice(&99u64.to_le_bytes());
         std::fs::write(&blob_file_path, &raw)?;
 
         let mut scanner = Scanner::new(&blob_file_path, 0)?;
         let result = scanner.next().unwrap();
         assert!(
-            matches!(result, Err(crate::Error::ChecksumMismatch { .. })),
-            "expected ChecksumMismatch for corrupted seqno, got: {result:?}",
+            matches!(result, Err(crate::Error::HeaderCrcMismatch { .. })),
+            "expected HeaderCrcMismatch for corrupted seqno, got: {result:?}",
         );
 
         Ok(())
@@ -222,7 +229,7 @@ mod tests {
     /// checksum catches the corruption.
     #[test]
     fn blob_scanner_corrupted_value_detected_by_data_checksum() -> crate::Result<()> {
-        use crate::vlog::blob_file::writer::BLOB_HEADER_LEN;
+        use crate::vlog::blob_file::writer::{BLOB_HEADER_LEN, BLOB_HEADER_MAGIC_V4};
 
         let dir = tempdir()?;
         let blob_file_path = dir.path().join("0");
@@ -233,10 +240,15 @@ mod tests {
             writer.finish()?;
         }
 
-        // Tamper value payload at file offset header(42) + key(3) = 45.
-        // sfa has no inline section headers — data starts at byte 0.
-        let value_offset = BLOB_HEADER_LEN + 3;
+        // Find frame start by searching for magic (robust against sfa framing).
         let mut raw = std::fs::read(&blob_file_path)?;
+        let frame_start = raw
+            .windows(4)
+            .position(|w| w == BLOB_HEADER_MAGIC_V4)
+            .unwrap();
+
+        // Tamper value payload: frame_start + header(42) + key(3)
+        let value_offset = frame_start + BLOB_HEADER_LEN + 3;
         raw[value_offset] ^= 0xFF;
         std::fs::write(&blob_file_path, &raw)?;
 

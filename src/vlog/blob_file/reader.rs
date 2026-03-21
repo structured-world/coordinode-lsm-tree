@@ -314,8 +314,8 @@ mod tests {
 
         let result = reader.get(b"k", &handle);
         assert!(
-            matches!(result, Err(crate::Error::ChecksumMismatch { .. })),
-            "expected ChecksumMismatch (header CRC), got: {result:?}",
+            matches!(result, Err(crate::Error::HeaderCrcMismatch { .. })),
+            "expected HeaderCrcMismatch, got: {result:?}",
         );
     }
 
@@ -383,9 +383,9 @@ mod tests {
         let reader = Reader::new(blob_file, &file);
 
         match reader.get(b"a", &handle) {
-            Err(crate::Error::ChecksumMismatch { .. }) => { /* header CRC catches it */ }
-            Ok(_) => panic!("expected ChecksumMismatch, but got Ok"),
-            Err(other) => panic!("expected ChecksumMismatch (header CRC), got: {other:?}"),
+            Err(crate::Error::HeaderCrcMismatch { .. }) => { /* header CRC catches it */ }
+            Ok(_) => panic!("expected HeaderCrcMismatch, but got Ok"),
+            Err(other) => panic!("expected HeaderCrcMismatch, got: {other:?}"),
         }
 
         Ok(())
@@ -454,9 +454,9 @@ mod tests {
         let reader = Reader::new(blob_file, &file);
 
         match reader.get(b"a", &handle) {
-            Err(crate::Error::ChecksumMismatch { .. }) => { /* header CRC catches it */ }
-            Ok(_) => panic!("expected ChecksumMismatch, but got Ok"),
-            Err(other) => panic!("expected ChecksumMismatch (header CRC), got: {other:?}"),
+            Err(crate::Error::HeaderCrcMismatch { .. }) => { /* header CRC catches it */ }
+            Ok(_) => panic!("expected HeaderCrcMismatch, but got Ok"),
+            Err(other) => panic!("expected HeaderCrcMismatch, got: {other:?}"),
         }
 
         Ok(())
@@ -489,8 +489,8 @@ mod tests {
 
         let result = reader.get(b"a", &handle);
         assert!(
-            matches!(result, Err(crate::Error::ChecksumMismatch { .. })),
-            "expected ChecksumMismatch (header CRC), got: {result:?}",
+            matches!(result, Err(crate::Error::HeaderCrcMismatch { .. })),
+            "expected HeaderCrcMismatch, got: {result:?}",
         );
         Ok(())
     }
@@ -765,8 +765,8 @@ mod tests {
 
         let result = reader.get(b"key", &handle);
         assert!(
-            matches!(result, Err(crate::Error::ChecksumMismatch { .. })),
-            "expected ChecksumMismatch for corrupted seqno, got: {result:?}",
+            matches!(result, Err(crate::Error::HeaderCrcMismatch { .. })),
+            "expected HeaderCrcMismatch for corrupted seqno, got: {result:?}",
         );
 
         Ok(())
@@ -798,8 +798,8 @@ mod tests {
 
         let result = reader.get(b"key", &handle);
         assert!(
-            matches!(result, Err(crate::Error::ChecksumMismatch { .. })),
-            "expected ChecksumMismatch for corrupted header_crc field, got: {result:?}",
+            matches!(result, Err(crate::Error::HeaderCrcMismatch { .. })),
+            "expected HeaderCrcMismatch for corrupted header_crc field, got: {result:?}",
         );
 
         Ok(())

@@ -82,11 +82,9 @@ pub fn validate_header_crc(
     };
 
     if stored_crc != recomputed_crc {
-        // Reuses ChecksumMismatch (header CRC vs data checksum distinguished
-        // by the caller's log::error context, not the error variant).
-        return Err(crate::Error::ChecksumMismatch {
-            got: crate::Checksum::from_raw(u128::from(recomputed_crc)),
-            expected: crate::Checksum::from_raw(u128::from(stored_crc)),
+        return Err(crate::Error::HeaderCrcMismatch {
+            got: recomputed_crc,
+            expected: stored_crc,
         });
     }
 
