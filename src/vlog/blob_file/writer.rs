@@ -50,7 +50,7 @@ pub const BLOB_HEADER_LEN_V3: usize = BLOB_HEADER_MAGIC_V3.len()
     + std::mem::size_of::<u32>(); // On-disk value length
 
 /// V4 blob frame header length (42 bytes, includes `header_crc`).
-pub const BLOB_HEADER_LEN: usize = BLOB_HEADER_LEN_V3 + std::mem::size_of::<u32>(); // Header CRC
+pub const BLOB_HEADER_LEN_V4: usize = BLOB_HEADER_LEN_V3 + std::mem::size_of::<u32>(); // Header CRC
 
 /// Compute V4 header CRC from header fields.
 /// Returns a 4-byte truncated xxh3 hash.
@@ -277,7 +277,7 @@ impl Writer {
         self.writer.write_all(&value)?;
 
         // Update offset
-        self.offset += BLOB_HEADER_LEN as u64;
+        self.offset += BLOB_HEADER_LEN_V4 as u64;
         self.offset += key.len() as u64;
         self.offset += value.len() as u64;
 

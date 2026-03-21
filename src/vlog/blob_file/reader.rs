@@ -5,7 +5,7 @@
 use crate::{
     vlog::{
         blob_file::writer::{
-            validate_header_crc, BLOB_HEADER_LEN, BLOB_HEADER_MAGIC_V3, BLOB_HEADER_MAGIC_V4,
+            validate_header_crc, BLOB_HEADER_LEN_V4, BLOB_HEADER_MAGIC_V3, BLOB_HEADER_MAGIC_V4,
         },
         ValueHandle,
     },
@@ -56,7 +56,7 @@ impl<'a> Reader<'a> {
         // For V3 frames, the extra 4 bytes read are harmless: they come
         // from the next frame or metadata section (which always follows),
         // and raw_data is sliced to exact on_disk_val_len before use.
-        let add_size = (BLOB_HEADER_LEN as u64) + (key.len() as u64);
+        let add_size = (BLOB_HEADER_LEN_V4 as u64) + (key.len() as u64);
 
         // Validate the full on-disk read size (header + key + value) against the limit.
         // Allow header+key overhead on top of the data cap.
@@ -138,7 +138,7 @@ impl<'a> Reader<'a> {
 
         // Actual header length determined from frame magic, not metadata.
         let header_len = if frame_is_v4 {
-            BLOB_HEADER_LEN
+            BLOB_HEADER_LEN_V4
         } else {
             crate::vlog::blob_file::writer::BLOB_HEADER_LEN_V3
         };
@@ -541,7 +541,7 @@ mod tests {
         // Tamper on-disk key bytes.
         // Header layout: MAGIC(4) + Checksum(16) + SeqNo(8) + KeyLen(2) + RealValLen(4) + OnDiskValLen(4) = 38
         // Key starts at offset 38 from blob start.
-        let key_offset = handle.offset as usize + BLOB_HEADER_LEN;
+        let key_offset = handle.offset as usize + BLOB_HEADER_LEN_V4;
         let mut raw = std::fs::read(&blob_file.0.path)?;
         raw[key_offset] ^= 0xFF; // flip bits in first key byte
         let corrupted_key = raw[key_offset..key_offset + 3].to_vec();
@@ -652,8 +652,8 @@ mod tests {
         let blob_file = writer.finish()?;
         let blob_file = blob_file.first().unwrap();
 
-        // Value payload starts after header + key: offset + BLOB_HEADER_LEN + key_len
-        let payload_offset = handle.offset as usize + BLOB_HEADER_LEN + b"key".len();
+        // Value payload starts after header + key: offset + BLOB_HEADER_LEN_V4 + key_len
+        let payload_offset = handle.offset as usize + BLOB_HEADER_LEN_V4 + b"key".len();
         let mut raw = std::fs::read(&blob_file.0.path)?;
         raw[payload_offset] ^= 0xFF; // flip bits in first value byte
         std::fs::write(&blob_file.0.path, &raw)?;
@@ -687,7 +687,7 @@ mod tests {
         let blob_file = writer.finish()?;
         let blob_file = blob_file.first().unwrap();
 
-        let key_offset = handle.offset as usize + BLOB_HEADER_LEN;
+        let key_offset = handle.offset as usize + BLOB_HEADER_LEN_V4;
         let mut raw = std::fs::read(&blob_file.0.path)?;
         raw[key_offset] ^= 0xFF;
         std::fs::write(&blob_file.0.path, &raw)?;
@@ -721,7 +721,7 @@ mod tests {
         let blob_file = writer.finish()?;
         let blob_file = blob_file.first().unwrap();
 
-        let key_offset = handle.offset as usize + BLOB_HEADER_LEN;
+        let key_offset = handle.offset as usize + BLOB_HEADER_LEN_V4;
         let mut raw = std::fs::read(&blob_file.0.path)?;
         raw[key_offset] ^= 0xFF;
         std::fs::write(&blob_file.0.path, &raw)?;
@@ -806,11 +806,11 @@ mod tests {
         Ok(())
     }
 
-    /// Verify V4 header layout: BLOB_HEADER_LEN = 42 bytes
+    /// Verify V4 header layout: BLOB_HEADER_LEN_V4 = 42 bytes
     /// (magic:4 + checksum:16 + seqno:8 + key_len:2 + real_val_len:4 + on_disk_val_len:4 + header_crc:4).
     #[test]
     fn blob_header_len_v4_is_42() {
-        assert_eq!(BLOB_HEADER_LEN, 42);
+        assert_eq!(BLOB_HEADER_LEN_V4, 42);
         assert_eq!(BLOB_HEADER_LEN_V3, 38);
     }
 

@@ -229,7 +229,7 @@ mod tests {
     /// checksum catches the corruption.
     #[test]
     fn blob_scanner_corrupted_value_detected_by_data_checksum() -> crate::Result<()> {
-        use crate::vlog::blob_file::writer::BLOB_HEADER_LEN;
+        use crate::vlog::blob_file::writer::BLOB_HEADER_LEN_V4;
 
         let dir = tempdir()?;
         let blob_file_path = dir.path().join("0");
@@ -246,7 +246,7 @@ mod tests {
         let frame_start = 0usize;
 
         // Tamper value payload: frame_start + header(42) + key(3)
-        let value_offset = frame_start + BLOB_HEADER_LEN + 3;
+        let value_offset = frame_start + BLOB_HEADER_LEN_V4 + 3;
         raw[value_offset] ^= 0xFF;
         std::fs::write(&blob_file_path, &raw)?;
 
@@ -341,9 +341,9 @@ mod tests {
             writer.finish()?;
         }
 
-        // Corrupt magic bytes at offset 0 (after sfa segment header)
+        // Corrupt magic bytes at offset 0 (start of first frame).
         let mut raw = std::fs::read(&blob_file_path)?;
-        // First frame starts at offset 0 (sfa has no inline headers).
+        // First frame starts at offset 0 because sfa has no inline headers.
         raw[0..4].copy_from_slice(b"XXXX");
         std::fs::write(&blob_file_path, &raw)?;
 
