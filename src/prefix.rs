@@ -50,6 +50,10 @@ pub trait PrefixExtractor:
     /// Do **not** include the full key itself — it is always indexed
     /// separately by the standard bloom path.
     ///
+    /// The returned iterator must be finite and yield a small number of
+    /// prefixes per key (typically 1–5). It is called on the write path
+    /// for every key during flush and compaction.
+    ///
     /// # Performance note
     ///
     /// Returns `Box<dyn Iterator>` for object safety (`Arc<dyn PrefixExtractor>`).

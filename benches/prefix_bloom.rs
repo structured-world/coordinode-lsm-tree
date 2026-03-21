@@ -47,8 +47,9 @@ fn setup_tree(
         tree.flush_active_memtable(0).unwrap();
     }
 
-    // Compact to L1 for single-table runs (bloom skip applies here)
-    tree.major_compact(1, 0).unwrap();
+    // Compact to L1 for single-table runs (bloom skip applies here).
+    // Use u64::MAX target size to avoid pathological micro-tables.
+    tree.major_compact(u64::MAX, 0).unwrap();
     tree
 }
 

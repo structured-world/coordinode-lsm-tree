@@ -357,40 +357,21 @@ fn prefix_bloom_skip_on_compacted_levels() -> lsm_tree::Result<()> {
     let folder = tempfile::tempdir()?;
     let tree = tree_with_prefix_bloom(&folder)?;
 
-    // Create disjoint segments and compact to L1+ where single-table runs
-    // enable the prefix bloom skip path (Ok(false) branch in range.rs).
-    // L0 tables are multi-table runs where bloom is not checked.
-
-    // To exercise the bloom-skip Ok(false) branch, we need tables where:
-    //   1. key_range overlaps with the scan prefix (passes key_range check)
-    //   2. bloom filter says "no" for the prefix (passes bloom check as false)
+    // To exercise the bloom-skip Ok(false) branch we need L1+ tables where:
+    //   1. The on-disk key_range overlaps the scan prefix (so the table
+    //      passes the key_range check and is considered a candidate), but
+    //   2. The bloom filter for that table returns Ok(false) for the scan
+    //      prefix (so we can safely skip I/O for that table).
     //
-    // This happens with sorted compaction output: a table with keys
-    // [aaa:0099, zzz:0000] has key_range spanning both prefixes, but its
-    // bloom only contains hashes for the keys actually in it. If we scan for
-    // a prefix that's in the key_range gap (e.g., "mmm:"), the bloom
-    // correctly reports false.
-    //
-    // Strategy: interleave two prefix groups in the same flush so keys are
-    // sorted together, then compact with small target_size. Some output
-    // tables will contain keys from only one prefix group but may have a
-    // key_range that spans across both.
-    // To exercise the bloom-skip Ok(false) branch, we need L1+ tables where:
-    //   1. key_range overlaps with the scan prefix (passes key_range check)
-    //   2. bloom filter says "no" for the prefix (returns Ok(false))
-    //
-    // Strategy: flush two batches with disjoint prefixes, then compact to L1
-    // with large target_size so each prefix group stays in its own table.
-    // Scanning for one prefix will key_range-skip the other (disjoint ranges).
-    // But scanning for a non-existent prefix "mmm:" that falls BETWEEN the
-    // two ranges will key_range-match tables whose range spans [aaa:*, zzz:*]
-    // or that happen to be adjacent — and the bloom will correctly reject.
-    //
-    // However, since compaction sorts keys and creates disjoint output tables,
-    // no single table will span both prefixes. So we use a different approach:
-    // create many tables in L1 with the SAME prefix, then scan for a prefix
-    // that is NOT in ANY bloom. Each table's key_range will overlap with the
-    // scan range but the bloom correctly rejects.
+    // We create many tables in L1 that all contain keys under the same broad
+    // "data:" namespace but with varying suffixes. The prefix extractor
+    // (ColonSeparatedPrefix) inserts only the prefixes that actually occur in
+    // the table into the bloom filter (e.g., "data:", "data:0:", ...). The
+    // test then scans for a synthetically chosen prefix under "data:" that
+    // lies within the tables' key_range but is not one of the prefixes that
+    // ever appeared as a key prefix in any table. As a result, each table's
+    // key_range overlaps the scan prefix, but its bloom filter correctly
+    // rejects the lookup and returns Ok(false).
 
     let mut seqno = 0u64;
 
@@ -430,12 +411,13 @@ fn prefix_bloom_skip_on_compacted_levels() -> lsm_tree::Result<()> {
         .collect::<Result<Vec<_>, _>>()?;
     assert_eq!(results.len(), 0);
 
-    // "data:9:" falls WITHIN the table's key_range [data:0:*, data:4:*] but was
-    // never written — no key ever produced "data:9:" as an extracted prefix.
+    // "data:3x:" falls WITHIN the table's key_range [data:0:*, data:4:*]
+    // (lexicographically between "data:3:" and "data:4:") but was never
+    // written — it is a valid extractor boundary that no key ever produced.
     // This exercises the Ok(false) bloom-skip branch: key_range says "yes"
     // but bloom correctly says "no".
     let results: Vec<_> = tree
-        .create_prefix("data:9:", seqno, None)
+        .create_prefix("data:3x:", seqno, None)
         .collect::<Result<Vec<_>, _>>()?;
     assert_eq!(results.len(), 0);
 
