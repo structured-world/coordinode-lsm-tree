@@ -42,6 +42,8 @@ impl Workload for PrefixScan {
             let prefix_bytes = prefix_idx.to_be_bytes();
 
             let t = Instant::now();
+            // prefix_bytes is [u8; 2] (Copy) — pass by value is fine,
+            // prefix() takes K: AsRef<[u8]> which [u8; N] implements.
             let mut iter = tree.prefix(prefix_bytes, read_seq, None);
             for _ in 0..SCAN_LIMIT {
                 let Some(item) = iter.next() else { break };

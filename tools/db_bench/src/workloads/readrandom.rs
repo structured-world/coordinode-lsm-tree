@@ -1,5 +1,5 @@
 use crate::config::BenchConfig;
-use crate::db::{make_sequential_key, prefill_sequential, read_seqno};
+use crate::db::{prefill_sequential, read_seqno};
 use crate::reporter::Reporter;
 use crate::workloads::Workload;
 use lsm_tree::{AbstractTree, AnyTree};
@@ -24,19 +24,25 @@ impl Workload for ReadRandom {
         let mut rng = rand::rng();
         let mut found = 0u64;
 
-        // Pre-generate keys so per-iteration allocation is not included in read latency.
-        let keys: Vec<Vec<u8>> = (0..config.num)
-            .map(|i| make_sequential_key(i, config.key_size))
-            .collect();
+        // Key is generated before Instant::now() so allocation cost is
+        // excluded from the timed region. A reusable buffer avoids per-op
+        // heap allocation without pre-generating all keys upfront.
+        let mut key_buf = vec![0u8; config.key_size];
 
         reporter.start();
 
         for _ in 0..config.num {
             let idx: u64 = rng.random_range(0..config.num);
-            let key = &keys[idx as usize];
+            // Write index into reusable buffer (trailing bytes for small keys).
+            let be = idx.to_be_bytes();
+            if config.key_size >= 8 {
+                key_buf[..8].copy_from_slice(&be);
+            } else {
+                key_buf.copy_from_slice(&be[8 - config.key_size..]);
+            }
 
             let t = Instant::now();
-            let result = tree.get(key, read_seq)?;
+            let result = tree.get(&key_buf, read_seq)?;
             reporter.record_duration(t.elapsed());
 
             if result.is_some() {
