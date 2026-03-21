@@ -587,3 +587,94 @@ fn merge_operand_above_watermark_preserves_tail() -> lsm_tree::Result<()> {
 
     Ok(())
 }
+
+/// Merge state persists across tree reopen (crash recovery).
+#[test]
+fn merge_persists_after_reopen() -> lsm_tree::Result<()> {
+    let folder = tempfile::tempdir()?;
+
+    {
+        let tree = open_tree_with_counter(&folder);
+        tree.insert("counter", 100_i64.to_le_bytes(), 0);
+        tree.merge("counter", 5_i64.to_le_bytes(), 1);
+        tree.merge("counter", 10_i64.to_le_bytes(), 2);
+        tree.flush_active_memtable(0)?;
+    }
+
+    // Reopen tree — merge operands must be recovered from disk
+    let tree = open_tree_with_counter(&folder);
+    assert_eq!(Some(115), get_counter(&tree, "counter", 3));
+
+    // Add more operands after reopen
+    tree.merge("counter", 20_i64.to_le_bytes(), 3);
+    assert_eq!(Some(135), get_counter(&tree, "counter", 4));
+
+    Ok(())
+}
+
+/// Merge after major compaction fully resolves operands into a single Value.
+#[test]
+fn merge_major_compaction_resolves_all() -> lsm_tree::Result<()> {
+    let folder = tempfile::tempdir()?;
+    let tree = open_tree_with_counter(&folder);
+
+    tree.insert("counter", 10_i64.to_le_bytes(), 0);
+    tree.merge("counter", 5_i64.to_le_bytes(), 1);
+    tree.merge("counter", 3_i64.to_le_bytes(), 2);
+    tree.flush_active_memtable(0)?;
+
+    // Before compaction: read should resolve across operands
+    assert_eq!(Some(18), get_counter(&tree, "counter", 3));
+
+    // Major compaction merges all operands with the base
+    tree.major_compact(64_000_000, 3)?;
+
+    // After compaction, the key should be a single Value = 18
+    assert_eq!(Some(18), get_counter(&tree, "counter", 3));
+
+    // New operands stack on top of the compacted base
+    tree.merge("counter", 2_i64.to_le_bytes(), 3);
+    assert_eq!(Some(20), get_counter(&tree, "counter", 4));
+
+    Ok(())
+}
+
+/// Merge operands with range iteration and snapshot isolation.
+#[test]
+fn merge_range_with_snapshot_isolation() -> lsm_tree::Result<()> {
+    let folder = tempfile::tempdir()?;
+    let tree = open_tree_with_counter(&folder);
+
+    tree.insert("a", 10_i64.to_le_bytes(), 0);
+    tree.merge("a", 5_i64.to_le_bytes(), 1);
+    tree.insert("b", 20_i64.to_le_bytes(), 2);
+    tree.merge("b", 3_i64.to_le_bytes(), 3);
+
+    // Snapshot at seqno=3: sees a=10+5=15, b=20 (merge on b at seqno=3 not visible)
+    let items: Vec<_> = tree
+        .iter(3, None)
+        .map(|guard| {
+            let (_k, v): (lsm_tree::UserKey, lsm_tree::UserValue) = guard.into_inner().unwrap();
+            i64::from_le_bytes((*v).try_into().unwrap())
+        })
+        .collect();
+
+    assert_eq!(items.len(), 2);
+    assert_eq!(items[0], 15); // a: 10 + 5
+    assert_eq!(items[1], 20); // b: only base, merge not visible
+
+    // Full view: a=15, b=23
+    let items: Vec<_> = tree
+        .iter(4, None)
+        .map(|guard| {
+            let (_k, v): (lsm_tree::UserKey, lsm_tree::UserValue) = guard.into_inner().unwrap();
+            i64::from_le_bytes((*v).try_into().unwrap())
+        })
+        .collect();
+
+    assert_eq!(items.len(), 2);
+    assert_eq!(items[0], 15); // a: 10 + 5
+    assert_eq!(items[1], 23); // b: 20 + 3
+
+    Ok(())
+}

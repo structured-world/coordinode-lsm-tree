@@ -1164,5 +1164,89 @@ mod tests {
             assert!(iter.next_back().is_none());
             Ok(())
         }
+
+        /// Merge operator error must propagate through forward iteration.
+        #[test]
+        fn merge_forward_error_propagation() {
+            struct FailMerge;
+            impl crate::merge_operator::MergeOperator for FailMerge {
+                fn merge(
+                    &self,
+                    _key: &[u8],
+                    _base_value: Option<&[u8]>,
+                    _operands: &[&[u8]],
+                ) -> crate::Result<crate::UserValue> {
+                    Err(crate::Error::MergeOperator)
+                }
+            }
+
+            let vec = vec![
+                InternalValue::from_components("a", "op1", 2, ValueType::MergeOperand),
+                InternalValue::from_components("a", "base", 1, ValueType::Value),
+            ];
+
+            let iter = Box::new(vec.into_iter().map(Ok));
+            let fail_op: Option<Arc<dyn crate::merge_operator::MergeOperator>> =
+                Some(Arc::new(FailMerge));
+            let mut iter = MvccStream::new(iter, fail_op);
+
+            assert!(matches!(
+                iter.next(),
+                Some(Err(crate::Error::MergeOperator))
+            ));
+        }
+
+        /// Merge operator error must propagate through reverse iteration.
+        #[test]
+        fn merge_reverse_error_propagation() {
+            struct FailMerge;
+            impl crate::merge_operator::MergeOperator for FailMerge {
+                fn merge(
+                    &self,
+                    _key: &[u8],
+                    _base_value: Option<&[u8]>,
+                    _operands: &[&[u8]],
+                ) -> crate::Result<crate::UserValue> {
+                    Err(crate::Error::MergeOperator)
+                }
+            }
+
+            let vec = vec![
+                InternalValue::from_components("a", "op1", 2, ValueType::MergeOperand),
+                InternalValue::from_components("a", "base", 1, ValueType::Value),
+            ];
+
+            let iter = Box::new(vec.into_iter().map(Ok));
+            let fail_op: Option<Arc<dyn crate::merge_operator::MergeOperator>> =
+                Some(Arc::new(FailMerge));
+            let mut iter = MvccStream::new(iter, fail_op);
+
+            assert!(matches!(
+                iter.next_back(),
+                Some(Err(crate::Error::MergeOperator))
+            ));
+        }
+
+        /// WeakTombstone stops base search same as regular Tombstone.
+        #[test]
+        #[expect(clippy::unwrap_used, reason = "test assertion")]
+        fn merge_forward_weak_tombstone_stops_base() -> crate::Result<()> {
+            let vec = vec![
+                InternalValue::from_components("a", "op1", 3, ValueType::MergeOperand),
+                InternalValue::from_components("a", "", 2, ValueType::WeakTombstone),
+                InternalValue::from_components("a", "old_base", 1, ValueType::Value),
+            ];
+
+            let iter = Box::new(vec.into_iter().map(Ok));
+            let mut iter = MvccStream::new(iter, merge_op());
+
+            let item = iter.next().unwrap()?;
+            // WeakTombstone blocks base — merge with no base
+            assert_eq!(item.key.value_type, ValueType::Value);
+            assert_eq!(&*item.value, b"op1");
+
+            assert!(iter.next().is_none());
+            Ok(())
+        }
     }
 }

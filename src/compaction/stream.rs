@@ -1305,5 +1305,118 @@ mod tests {
             assert!(iter.next().is_none());
             Ok(())
         }
+
+        /// Exact GC boundary: head.seqno == gc_seqno_threshold should NOT merge.
+        #[test]
+        #[expect(clippy::unwrap_used, reason = "test assertion")]
+        fn compaction_merge_at_exact_gc_boundary() -> crate::Result<()> {
+            // gc_threshold=999; head.seqno=999 (NOT below threshold)
+            // Entries should be preserved as-is
+            let vec = vec![
+                InternalValue::from_components("a", "op2", 999, ValueType::MergeOperand),
+                InternalValue::from_components("a", "op1", 998, ValueType::MergeOperand),
+            ];
+
+            let iter = vec.iter().cloned().map(Ok);
+            let mut iter = CompactionStream::new(iter, 999).with_merge_operator(merge_op());
+
+            // head.seqno == gc_threshold → NOT below → preserved as MergeOperand
+            let item = iter.next().unwrap()?;
+            assert_eq!(item.key.value_type, ValueType::MergeOperand);
+            assert_eq!(&*item.value, b"op2");
+
+            Ok(())
+        }
+
+        /// DroppedKvCallback receives dropped merge operands during compaction.
+        #[test]
+        #[expect(clippy::unwrap_used, reason = "test assertion")]
+        fn compaction_merge_dropped_callback() -> crate::Result<()> {
+            #[rustfmt::skip]
+            let vec = stream![
+                "a", "op2", "M",
+                "a", "op1", "M",
+                "a", "base", "V",
+            ];
+
+            let mut callback = TrackCallback::default();
+
+            let iter = vec.iter().cloned().map(Ok);
+            let mut iter = CompactionStream::new(iter, 1_000)
+                .with_merge_operator(merge_op())
+                .with_drop_callback(&mut callback);
+
+            let item = iter.next().unwrap()?;
+            assert_eq!(item.key.value_type, ValueType::Value);
+            assert_eq!(&*item.value, b"base,op1,op2");
+            assert!(iter.next().is_none());
+
+            // The base Value is consumed by merge (not dropped);
+            // operands are consumed by merge (not dropped via callback).
+            // DroppedKvCallback fires for entries DRAINED after base is found.
+            // In this case there are no entries after the base, so callback
+            // should have no items.
+            assert!(callback.items.is_empty());
+
+            Ok(())
+        }
+
+        /// Head above GC, peeked below GC: head must be preserved as MergeOperand.
+        #[test]
+        #[expect(clippy::unwrap_used, reason = "test assertion")]
+        fn compaction_merge_head_above_gc_peeked_below() -> crate::Result<()> {
+            // head.seqno=10 (above gc=7), peeked.seqno=5 (below gc=7)
+            let vec = vec![
+                InternalValue::from_components("a", "op_new", 10, ValueType::MergeOperand),
+                InternalValue::from_components("a", "op_old", 5, ValueType::MergeOperand),
+                InternalValue::from_components("a", "base", 2, ValueType::Value),
+            ];
+
+            let iter = vec.iter().cloned().map(Ok);
+            let mut iter = CompactionStream::new(iter, 7).with_merge_operator(merge_op());
+
+            // Head is above GC → emit as-is (MergeOperand)
+            let item = iter.next().unwrap()?;
+            assert_eq!(item.key.value_type, ValueType::MergeOperand);
+            assert_eq!(&*item.value, b"op_new");
+
+            // Remaining entries preserved for future merge resolution
+            let item = iter.next().unwrap()?;
+            assert_eq!(&*item.key.user_key, b"a");
+
+            Ok(())
+        }
+
+        /// Merge operator error propagates correctly during compaction.
+        #[test]
+        fn compaction_merge_error_propagation() {
+            struct FailMerge;
+            impl crate::merge_operator::MergeOperator for FailMerge {
+                fn merge(
+                    &self,
+                    _key: &[u8],
+                    _base_value: Option<&[u8]>,
+                    _operands: &[&[u8]],
+                ) -> crate::Result<crate::UserValue> {
+                    Err(crate::Error::MergeOperator)
+                }
+            }
+
+            #[rustfmt::skip]
+            let vec = stream![
+                "a", "op1", "M",
+                "a", "base", "V",
+            ];
+
+            let iter = vec.iter().cloned().map(Ok);
+            let fail_op: Option<Arc<dyn crate::merge_operator::MergeOperator>> =
+                Some(Arc::new(FailMerge));
+            let mut iter = CompactionStream::new(iter, 1_000).with_merge_operator(fail_op);
+
+            assert!(matches!(
+                iter.next(),
+                Some(Err(crate::Error::MergeOperator))
+            ));
+        }
     }
 }
