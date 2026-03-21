@@ -54,6 +54,8 @@ pub const BLOB_HEADER_LEN: usize = BLOB_HEADER_LEN_V3 + std::mem::size_of::<u32>
 
 /// Validate V4 header CRC: recompute from header fields and compare
 /// against the stored value.
+// `pub` not `pub(crate)`: module is already private, and pub(crate)
+// triggers clippy::pub_crate warning. Effective visibility is crate.
 pub fn validate_header_crc(
     seqno: u64,
     key_len: u16,
