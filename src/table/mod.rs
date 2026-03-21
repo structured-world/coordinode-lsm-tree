@@ -787,9 +787,11 @@ impl Table {
             return block.maybe_contains_hash(prefix_hash);
         }
 
-        // Partitioned / TLI filters: the partition index is keyed by user key,
-        // not by prefix hash, so we cannot seek to the right partition without
-        // scanning all of them (expensive). Fall back conservatively.
+        // Partitioned / TLI filters: partition index is keyed by user key, not
+        // prefix hash — we would need to scan ALL partitions to check the prefix,
+        // which is O(partitions) I/O and defeats the purpose of bloom skip.
+        // Returning Ok(true) is correct (conservative: segment is NOT skipped).
+        // Future: accept prefix bounds to seek overlapping partitions only.
         if self.pinned_filter_index.is_some() || self.regions.filter_tli.is_some() {
             return Ok(true);
         }
