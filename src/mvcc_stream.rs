@@ -232,7 +232,7 @@ impl<I: DoubleEndedIterator<Item = crate::Result<InternalValue>>> Iterator for M
     fn next(&mut self) -> Option<Self::Item> {
         let head = fail_iter!(self.inner.next()?);
 
-        if head.key.value_type.is_merge_operand() {
+        if head.key.value_type.is_merge_operand() && !self.is_rt_suppressed(&head) {
             // Clone the Arc (not the operator) — resolve_merge_forward needs
             // &mut self which conflicts with borrowing self.merge_operator.
             if let Some(merge_op) = self.merge_operator.clone() {
@@ -294,7 +294,10 @@ impl<I: DoubleEndedIterator<Item = crate::Result<InternalValue>>> DoubleEndedIte
             if prev.key.user_key < tail.key.user_key {
                 // `tail` is the newest entry for this key — boundary reached.
                 // Only merge if the newest entry is a MergeOperand.
-                if has_merge_op && tail.key.value_type.is_merge_operand() {
+                if has_merge_op
+                    && tail.key.value_type.is_merge_operand()
+                    && !self.is_rt_suppressed(&tail)
+                {
                     key_entries.push(tail);
                     return Some(self.resolve_merge_buffered(key_entries));
                 }

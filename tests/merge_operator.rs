@@ -767,7 +767,11 @@ fn merge_blob_tree_indirection_fallback() -> lsm_tree::Result<()> {
 
     // get should return the raw operand bytes (fallback when base is Indirection)
     let result = tree.get("big", 2)?;
-    assert!(result.is_some());
+    assert_eq!(
+        result,
+        Some(5_i64.to_le_bytes().to_vec().into()),
+        "BlobTree indirection fallback must return latest operand bytes"
+    );
 
     Ok(())
 }

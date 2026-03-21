@@ -134,7 +134,10 @@ impl<'a, I: Iterator<Item = Item>, F: StreamFilter + 'a> CompactionStream<'a, I,
     /// Collects merge operands and resolves them via the merge operator.
     ///
     /// `head` is the first `MergeOperand` entry (highest seqno).
-    /// Collects subsequent same-key entries, merges them, and returns the merged Value.
+    /// Collects subsequent same-key entries, merges them, and returns the result.
+    /// When a base value or tombstone boundary is found, the result is a `Value`
+    /// (complete merge). When no boundary is found (partial merge), the result
+    /// remains a `MergeOperand` so future compactions can find the real base.
     fn resolve_merge_operands(
         &mut self,
         head: InternalValue,
@@ -147,6 +150,7 @@ impl<'a, I: Iterator<Item = Item>, F: StreamFilter + 'a> CompactionStream<'a, I,
         // Indirection base and cannot resolve the merge.
         let mut collected: Vec<InternalValue> = vec![head];
         let mut base_value: Option<UserValue> = None;
+        let mut found_boundary = false;
 
         // Collect remaining same-key entries
         loop {
@@ -187,6 +191,7 @@ impl<'a, I: Iterator<Item = Item>, F: StreamFilter + 'a> CompactionStream<'a, I,
                 }
                 ValueType::Value => {
                     base_value = Some(next.value);
+                    found_boundary = true;
                     self.drain_key(&user_key)?;
                     break;
                 }
@@ -196,6 +201,7 @@ impl<'a, I: Iterator<Item = Item>, F: StreamFilter + 'a> CompactionStream<'a, I,
                 }
                 ValueType::Tombstone | ValueType::WeakTombstone => {
                     // Tombstone kills base — merge with no base
+                    found_boundary = true;
                     if let Some(watcher) = &mut self.dropped_callback {
                         watcher.on_dropped(&next);
                     }
@@ -215,11 +221,20 @@ impl<'a, I: Iterator<Item = Item>, F: StreamFilter + 'a> CompactionStream<'a, I,
         let operand_refs: Vec<&[u8]> = operands_reversed.iter().map(AsRef::as_ref).collect();
         let merged = merge_op.merge(&user_key, base_value.as_deref(), &operand_refs)?;
 
+        // Complete merge (base or tombstone found): emit as Value.
+        // Partial merge (no boundary in this stream — base may be in lower level):
+        // emit as MergeOperand so future compactions can find the real base.
+        let result_type = if found_boundary {
+            ValueType::Value
+        } else {
+            ValueType::MergeOperand
+        };
+
         Ok(InternalValue::from_components(
             user_key,
             merged,
             head_seqno,
-            ValueType::Value,
+            result_type,
         ))
     }
 
@@ -253,15 +268,15 @@ impl<'a, I: Iterator<Item = Item>, F: StreamFilter + 'a> Iterator for Compaction
     type Item = Item;
 
     fn next(&mut self) -> Option<Self::Item> {
-        // Re-emit entries that could not be merged (e.g., because the base
-        // was an Indirection). These have already been through collection
-        // and just need to be passed through unchanged.
-        if let Some(entry) = self.pending.pop_front() {
-            return Some(Ok(entry));
-        }
-
         loop {
-            let mut head = fail_iter!(self.inner.next()?);
+            // If there are pending entries (e.g., operands buffered while resolving
+            // a merge with an Indirection base), process them through the same
+            // compaction pipeline as regular items from `inner`.
+            let mut head = if let Some(entry) = self.pending.pop_front() {
+                entry
+            } else {
+                fail_iter!(self.inner.next()?)
+            };
 
             if !head.is_tombstone() {
                 match fail_iter!(self.filter.filter_item(&head)) {
@@ -272,7 +287,17 @@ impl<'a, I: Iterator<Item = Item>, F: StreamFilter + 'a> Iterator for Compaction
                             watcher.on_dropped(&head);
                         }
                         head.value = new_value;
-                        head.key.value_type = new_type;
+
+                        // Preserve MergeOperand type when filter replaces a value:
+                        // turning a MergeOperand into a Value/Indirection would shadow
+                        // the real base in lower levels and break merge resolution.
+                        if head.key.value_type.is_merge_operand()
+                            && (new_type == ValueType::Value || new_type == ValueType::Indirection)
+                        {
+                            // Keep as MergeOperand — only update the value bytes.
+                        } else {
+                            head.key.value_type = new_type;
+                        }
                     }
                     StreamFilterVerdict::Drop => {
                         if let Some(watcher) = &mut self.dropped_callback {
@@ -1043,7 +1068,7 @@ mod tests {
         #[test]
         #[expect(clippy::unwrap_used, reason = "test assertion")]
         fn compaction_merge_operands_below_gc() -> crate::Result<()> {
-            // All entries below gc_seqno_threshold=1000 → should be merged
+            // All entries below gc_seqno_threshold=1000, no base → partial merge
             #[rustfmt::skip]
             let vec = stream![
                 "a", "op2", "M",
@@ -1054,7 +1079,8 @@ mod tests {
             let mut iter = CompactionStream::new(iter, 1_000).with_merge_operator(merge_op());
 
             let item = iter.next().unwrap()?;
-            assert_eq!(item.key.value_type, ValueType::Value);
+            // Partial merge (no base boundary) → stays MergeOperand
+            assert_eq!(item.key.value_type, ValueType::MergeOperand);
             assert_eq!(&*item.value, b"op1,op2");
             assert!(iter.next().is_none());
 
@@ -1134,7 +1160,7 @@ mod tests {
         #[test]
         #[expect(clippy::unwrap_used, reason = "test assertion")]
         fn compaction_merge_lone_operand_below_gc() -> crate::Result<()> {
-            // Single merge operand (only entry for key) below gc → resolve to Value
+            // Single merge operand (only entry for key) below gc → partial merge
             let vec = vec![
                 InternalValue::from_components("a", "lone_op", 5, ValueType::MergeOperand),
                 InternalValue::from_components("b", "regular", 6, ValueType::Value),
@@ -1144,7 +1170,8 @@ mod tests {
             let mut iter = CompactionStream::new(iter, 1_000).with_merge_operator(merge_op());
 
             let item = iter.next().unwrap()?;
-            assert_eq!(item.key.value_type, ValueType::Value);
+            // Partial merge (no base boundary) → stays MergeOperand
+            assert_eq!(item.key.value_type, ValueType::MergeOperand);
             assert_eq!(&*item.value, b"lone_op");
             assert_eq!(&*item.key.user_key, b"a");
 
@@ -1172,7 +1199,8 @@ mod tests {
             let mut iter = CompactionStream::new(iter, 1_000).with_merge_operator(merge_op());
 
             let item = iter.next().unwrap()?;
-            assert_eq!(item.key.value_type, ValueType::Value);
+            // Partial merge (no base boundary) → stays MergeOperand
+            assert_eq!(item.key.value_type, ValueType::MergeOperand);
             assert_eq!(&*item.value, b"last");
 
             assert!(iter.next().is_none());
