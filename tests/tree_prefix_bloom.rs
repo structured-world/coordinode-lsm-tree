@@ -237,7 +237,7 @@ fn prefix_bloom_unpinned_filter() -> lsm_tree::Result<()> {
     // Create tree with unpinned filters to exercise the fallback load path
     // in Table::maybe_contains_prefix
     let tree = Config::new(
-        folder,
+        &folder,
         SequenceNumberCounter::default(),
         SequenceNumberCounter::default(),
     )
@@ -280,7 +280,7 @@ fn prefix_bloom_blob_tree() -> lsm_tree::Result<()> {
 
     // Create BlobTree with prefix extractor to exercise BlobTree::prefix path
     let tree = Config::new(
-        folder,
+        &folder,
         SequenceNumberCounter::default(),
         SequenceNumberCounter::default(),
     )
