@@ -579,7 +579,11 @@ impl Table {
                 )));
             }
 
-            Self::decode_range_tombstones(&block)?
+            let mut rts = Self::decode_range_tombstones(&block)?;
+            // Sort by (start asc, seqno desc) to enable binary search in
+            // table-skip and point-read suppression paths.
+            rts.sort();
+            rts
         } else {
             Vec::new()
         };
@@ -785,6 +789,20 @@ impl Table {
     #[must_use]
     pub fn get_highest_seqno(&self) -> SeqNo {
         self.metadata.seqnos.1 + self.global_seqno()
+    }
+
+    /// Returns the highest sequence number from KV entries only,
+    /// excluding range tombstone seqnos.
+    ///
+    /// This enables more aggressive table-skip: a covering RT stored
+    /// in the same table can trigger skip because its seqno may exceed
+    /// the KV-only max even though it doesn't exceed the overall max.
+    ///
+    /// For tables written before this field was introduced, falls back
+    /// to `get_highest_seqno()` (conservative but correct).
+    #[must_use]
+    pub fn get_highest_kv_seqno(&self) -> SeqNo {
+        self.metadata.highest_kv_seqno + self.global_seqno()
     }
 
     /// Returns the number of tombstone markers in the `Table`.

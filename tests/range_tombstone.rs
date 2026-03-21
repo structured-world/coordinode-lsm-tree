@@ -1144,6 +1144,122 @@ fn range_tombstone_memtable_narrow_range_queries_ignore_disjoint_rt() -> lsm_tre
     Ok(())
 }
 
+// --- Separate KV/RT seqno bounds ---
+
+/// Tables that contain both KVs and range tombstones should track
+/// separate `highest_kv_seqno`. This enables table-skip for a covering
+/// RT stored in the same table: `rt.seqno > highest_kv_seqno` can be
+/// true even when `rt.seqno <= highest_seqno`.
+#[test]
+fn kv_seqno_excludes_range_tombstone_seqno() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let tree = open_tree(folder.path());
+
+    // KVs at seqno 1..4
+    tree.insert("a", "val_a", 1);
+    tree.insert("b", "val_b", 2);
+    tree.insert("c", "val_c", 3);
+    tree.insert("d", "val_d", 4);
+
+    // RT at seqno 10 — higher than any KV
+    tree.remove_range("a", "z", 10);
+
+    // Flush everything into a single SST
+    tree.flush_active_memtable(0)?;
+
+    let table = find_rt_table(&tree);
+
+    // highest_seqno includes RT seqno (10)
+    assert_eq!(table.get_highest_seqno(), 10);
+    // highest_kv_seqno excludes RT — only KVs (max is 4)
+    assert_eq!(table.get_highest_kv_seqno(), 4);
+
+    Ok(())
+}
+
+/// Table-skip should work when the covering RT is in the same table,
+/// thanks to `get_highest_kv_seqno()`. Verify via range iteration:
+/// if table-skip fires, the suppressed keys never appear.
+#[test]
+fn table_skip_with_colocated_range_tombstone() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let tree = open_tree(folder.path());
+
+    // KVs at seqno 1..3
+    tree.insert("a", "val_a", 1);
+    tree.insert("b", "val_b", 2);
+    tree.insert("c", "val_c", 3);
+
+    // Covering RT [a, z) at seqno 10 — in the same memtable
+    tree.remove_range("a", "z", 10);
+
+    // Flush: both KVs and RT go into one SST
+    tree.flush_active_memtable(0)?;
+
+    // Range scan at seqno 11 — all keys suppressed
+    assert_eq!(collect_keys(&tree, 11)?, Vec::<Vec<u8>>::new());
+    // Reverse scan too
+    assert_eq!(collect_keys_rev(&tree, 11)?, Vec::<Vec<u8>>::new());
+
+    // Point reads also suppressed
+    assert_eq!(None, tree.get("a", 11)?);
+    assert_eq!(None, tree.get("b", 11)?);
+    assert_eq!(None, tree.get("c", 11)?);
+
+    Ok(())
+}
+
+/// Binary search correctness: covering RT with start exactly at table min key.
+#[test]
+fn table_skip_rt_start_equals_table_min() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let tree = open_tree(folder.path());
+
+    tree.insert("m", "val_m", 1);
+    tree.insert("n", "val_n", 2);
+    tree.insert("o", "val_o", 3);
+
+    // RT starts exactly at "m" (table min)
+    tree.remove_range("m", "p", 10);
+    tree.flush_active_memtable(0)?;
+
+    assert_eq!(collect_keys(&tree, 11)?, Vec::<Vec<u8>>::new());
+    assert_eq!(None, tree.get("m", 11)?);
+    assert_eq!(None, tree.get("n", 11)?);
+    assert_eq!(None, tree.get("o", 11)?);
+
+    Ok(())
+}
+
+/// Point-read binary search: multiple RTs in a table, only one covers the key.
+#[test]
+fn point_read_binary_search_multiple_rts() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let tree = open_tree(folder.path());
+
+    tree.insert("a", "val_a", 1);
+    tree.insert("d", "val_d", 2);
+    tree.insert("g", "val_g", 3);
+    tree.insert("j", "val_j", 4);
+
+    // Two disjoint RTs
+    tree.remove_range("a", "c", 10); // covers "a"
+    tree.remove_range("g", "i", 11); // covers "g"
+
+    tree.flush_active_memtable(0)?;
+
+    // "a" suppressed by first RT
+    assert_eq!(None, tree.get("a", 12)?);
+    // "d" not covered by any RT
+    assert_eq!(Some("val_d".as_bytes().into()), tree.get("d", 12)?);
+    // "g" suppressed by second RT
+    assert_eq!(None, tree.get("g", 12)?);
+    // "j" not covered
+    assert_eq!(Some("val_j".as_bytes().into()), tree.get("j", 12)?);
+
+    Ok(())
+}
+
 #[test]
 fn range_tombstone_disjoint_survives_recovery_for_narrow_scans() -> lsm_tree::Result<()> {
     let folder = get_tmp_folder();

@@ -42,6 +42,12 @@ pub struct ParsedMeta {
     pub index_block_count: u64,
     pub key_range: KeyRange,
     pub(super) seqnos: (SeqNo, SeqNo),
+
+    /// Highest seqno from KV entries only (excludes range tombstones).
+    ///
+    /// Falls back to `seqnos.1` (overall max) for tables written before
+    /// this field was introduced, which is conservative but correct.
+    pub(super) highest_kv_seqno: SeqNo,
     pub file_size: u64,
     pub item_count: u64,
     pub tombstone_count: u64,
@@ -189,6 +195,15 @@ impl ParsedMeta {
             (min, max)
         };
 
+        // Optional field introduced for table-skip optimization.
+        // Old tables lack this key; fall back to overall max (conservative).
+        let highest_kv_seqno = if let Some(item) = block.point_read(b"seqno#kv_max", SeqNo::MAX) {
+            let mut bytes = &item.value[..];
+            bytes.read_u64::<LittleEndian>().unwrap_or(seqnos.1)
+        } else {
+            seqnos.1
+        };
+
         let data_block_compression = {
             let bytes = block
                 .point_read(b"compression#data", SeqNo::MAX)
@@ -214,6 +229,7 @@ impl ParsedMeta {
             index_block_count,
             key_range,
             seqnos,
+            highest_kv_seqno,
             file_size,
             item_count,
             tombstone_count,

@@ -239,18 +239,33 @@ impl TreeIter {
             for table in single_tables {
                 // Table-skip: if a range tombstone fully covers this table
                 // with a higher seqno, skip it entirely (avoid I/O).
-                // NOTE: get_highest_seqno() includes RT seqnos, so a covering
-                // RT stored in the same table won't trigger skip (conservative
-                // but correct). Separate KV/RT seqno bounds would improve this.
-                // key_range.max() is inclusive, fully_covers uses half-open: max < rt.end
-                let is_covered = all_range_tombstones.iter().any(|(rt, cutoff)| {
-                    rt.visible_at(*cutoff)
-                        && rt.fully_covers(
-                            table.metadata.key_range.min(),
-                            table.metadata.key_range.max(),
-                        )
-                        && rt.seqno > table.get_highest_seqno()
-                });
+                //
+                // Uses get_highest_kv_seqno() which excludes RT seqnos, so a
+                // covering RT stored in the same table can now trigger skip.
+                //
+                // Binary search on sorted RT list: partition_point finds the
+                // first RT with start > table_min; only the prefix [0..idx]
+                // can have start <= table_min (required for fully_covers).
+                let table_min: &[u8] = table.metadata.key_range.min().as_ref();
+                let table_max: &[u8] = table.metadata.key_range.max().as_ref();
+                let table_kv_seqno = table.get_highest_kv_seqno();
+
+                let candidate_end =
+                    all_range_tombstones.partition_point(|(rt, _)| rt.start.as_ref() <= table_min);
+
+                // SAFETY: partition_point returns 0..=len, so this slice never panics.
+                #[expect(
+                    clippy::indexing_slicing,
+                    reason = "partition_point guarantees idx <= len"
+                )]
+                let is_covered =
+                    all_range_tombstones[..candidate_end]
+                        .iter()
+                        .any(|(rt, cutoff)| {
+                            rt.visible_at(*cutoff)
+                                && rt.fully_covers(table_min, table_max)
+                                && rt.seqno > table_kv_seqno
+                        });
 
                 if !is_covered {
                     let reader = table

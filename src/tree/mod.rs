@@ -816,6 +816,9 @@ impl Tree {
         // or widens metadata in the inclusive-upper-bound fallback. That makes
         // `metadata.key_range.contains_key(key)` a sound early reject here and
         // avoids scanning RT blocks for unrelated SSTs on point reads.
+        //
+        // Per-table RT lists are sorted by (start asc, seqno desc) on load,
+        // so binary search narrows candidates to RTs with start <= key.
         for table in super_version
             .version
             .iter_levels()
@@ -824,8 +827,17 @@ impl Tree {
             .filter(|t| !t.range_tombstones().is_empty())
             .filter(|t| t.metadata.key_range.contains_key(key))
         {
-            for rt in table.range_tombstones() {
-                if rt.should_suppress(key, key_seqno, read_seqno) {
+            let rts = table.range_tombstones();
+            let candidate_end = rts.partition_point(|rt| rt.start.as_ref() <= key);
+
+            // SAFETY: partition_point returns 0..=len, so this slice never panics.
+            #[expect(
+                clippy::indexing_slicing,
+                reason = "partition_point guarantees idx <= len"
+            )]
+            let candidates = &rts[..candidate_end];
+            for rt in candidates {
+                if rt.visible_at(read_seqno) && key < rt.end.as_ref() && key_seqno < rt.seqno {
                     return true;
                 }
             }

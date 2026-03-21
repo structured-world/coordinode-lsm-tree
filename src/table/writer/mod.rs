@@ -303,6 +303,7 @@ impl Writer {
 
         self.meta.lowest_seqno = self.meta.lowest_seqno.min(seqno);
         self.meta.highest_seqno = self.meta.highest_seqno.max(seqno);
+        self.meta.highest_kv_seqno = self.meta.highest_kv_seqno.max(seqno);
 
         Ok(())
     }
@@ -436,6 +437,7 @@ impl Writer {
             {
                 let saved_lo = self.meta.lowest_seqno;
                 let saved_hi = self.meta.highest_seqno;
+                let saved_kv_hi = self.meta.highest_kv_seqno;
 
                 // Write a sentinel key to force index block creation in RT-only
                 // tables. The sentinel must use the start key of the same
@@ -455,6 +457,7 @@ impl Writer {
                 // actual block contents for consistency with recovery/tests.
                 self.meta.lowest_seqno = saved_lo;
                 self.meta.highest_seqno = saved_hi;
+                self.meta.highest_kv_seqno = saved_kv_hi;
 
                 // Ensure the table's key range covers all range tombstones.
                 self.meta.first_key = Some(start);
@@ -598,6 +601,7 @@ impl Writer {
                     "restart_interval#index",
                     &self.index_block_restart_interval.to_le_bytes(),
                 ),
+                meta("seqno#kv_max", &self.meta.highest_kv_seqno.to_le_bytes()),
                 meta("seqno#max", &self.meta.highest_seqno.to_le_bytes()),
                 meta("seqno#min", &self.meta.lowest_seqno.to_le_bytes()),
                 meta("table_id", &self.table_id.to_le_bytes()),
