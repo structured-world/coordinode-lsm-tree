@@ -837,7 +837,9 @@ impl Tree {
             )]
             let candidates = &rts[..candidate_end];
             for rt in candidates {
-                if rt.visible_at(read_seqno) && key < rt.end.as_ref() && key_seqno < rt.seqno {
+                // Binary search already narrowed to start <= key; should_suppress
+                // re-checks contains_key (harmless) and avoids semantic drift.
+                if rt.should_suppress(key, key_seqno, read_seqno) {
                     return true;
                 }
             }

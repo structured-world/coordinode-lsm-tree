@@ -236,6 +236,11 @@ impl TreeIter {
                 }
             }
 
+            // Sort SST-sourced RTs by start key for binary search in
+            // table-skip below. The full list is re-sorted (with memtable RTs)
+            // later for the RangeTombstoneFilter.
+            all_range_tombstones.sort_by(|a, b| a.0.cmp(&b.0));
+
             for table in single_tables {
                 // Table-skip: if a range tombstone fully covers this table
                 // with a higher seqno, skip it entirely (avoid I/O).

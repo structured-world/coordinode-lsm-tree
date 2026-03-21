@@ -197,9 +197,11 @@ impl ParsedMeta {
 
         // Optional field introduced for table-skip optimization.
         // Old tables lack this key; fall back to overall max (conservative).
+        // If the key exists but is truncated, propagate the I/O error to
+        // surface metadata corruption rather than silently falling back.
         let highest_kv_seqno = if let Some(item) = block.point_read(b"seqno#kv_max", SeqNo::MAX) {
             let mut bytes = &item.value[..];
-            bytes.read_u64::<LittleEndian>().unwrap_or(seqnos.1)
+            bytes.read_u64::<LittleEndian>()?
         } else {
             seqnos.1
         };

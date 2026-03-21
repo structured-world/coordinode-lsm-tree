@@ -580,8 +580,8 @@ impl Table {
             }
 
             let mut rts = Self::decode_range_tombstones(&block)?;
-            // Sort by (start asc, seqno desc) to enable binary search in
-            // table-skip and point-read suppression paths.
+            // Sort range tombstones using their `Ord` implementation to enable
+            // binary search in table-skip and point-read suppression paths.
             rts.sort();
             rts
         } else {
