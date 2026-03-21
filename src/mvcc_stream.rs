@@ -288,7 +288,7 @@ impl<I: DoubleEndedIterator<Item = crate::Result<InternalValue>>> DoubleEndedIte
                         && !self.is_rt_suppressed(&tail)
                     {
                         self.key_entries_buf.push(tail);
-                        let entries = std::mem::take(&mut self.key_entries_buf);
+                        let entries = self.key_entries_buf.drain(..).collect();
                         return Some(self.resolve_merge_buffered(entries));
                     }
                     return Some(Ok(tail));
