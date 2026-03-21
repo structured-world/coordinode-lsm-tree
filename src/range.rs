@@ -237,10 +237,11 @@ impl TreeIter {
             }
 
             // Sort SST-sourced RTs by start key for binary search in
-            // table-skip below. Uses explicit start-key comparator so the
-            // partition_point invariant is enforced locally, independent of
-            // RangeTombstone::Ord. The full list is re-sorted (with memtable
-            // RTs) later for the RangeTombstoneFilter.
+            // table-skip below. This is intentionally a separate sort from
+            // the full sort+dedup later: table-skip runs here (before memtable
+            // RTs are collected), so only SST RTs are present. The later sort
+            // covers the complete list. Both sorts are O(n log n) on their
+            // respective subsets; the SST-only subset is typically small.
             all_range_tombstones.sort_by(|(a, _), (b, _)| a.start.cmp(&b.start));
 
             for table in single_tables {
