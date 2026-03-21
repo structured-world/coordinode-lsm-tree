@@ -237,8 +237,10 @@ impl TreeIter {
                                     }
                                     Err(e) => {
                                         // On I/O error reading the filter, include the segment
-                                        // conservatively to avoid missing data.
-                                        log::warn!(
+                                        // conservatively to avoid missing data. Use debug level
+                                        // to avoid log noise during transient I/O issues in
+                                        // prefix-heavy workloads.
+                                        log::debug!(
                                             "prefix bloom check failed for table {:?}: {e}",
                                             table.id(),
                                         );
