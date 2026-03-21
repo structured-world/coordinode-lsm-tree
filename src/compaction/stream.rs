@@ -1446,5 +1446,68 @@ mod tests {
                 Some(Err(crate::Error::MergeOperator))
             ));
         }
+
+        /// Complete merge (with base) emits Value; partial merge emits MergeOperand.
+        #[test]
+        #[expect(clippy::unwrap_used, reason = "test assertion")]
+        fn compaction_merge_complete_vs_partial() -> crate::Result<()> {
+            // Complete merge: operand + base → Value
+            #[rustfmt::skip]
+            let vec = stream![
+                "a", "op1", "M",
+                "a", "base", "V",
+                "b", "op2", "M",
+                "b", "op1", "M",
+            ];
+
+            let iter = vec.iter().cloned().map(Ok);
+            let iter = CompactionStream::new(iter, 1_000).with_merge_operator(merge_op());
+            let out: Vec<_> = iter.map(Result::unwrap).collect();
+
+            assert_eq!(out.len(), 2);
+            // "a": base found → complete merge → Value
+            assert_eq!(out[0].key.value_type, ValueType::Value);
+            assert_eq!(&*out[0].value, b"base,op1");
+            // "b": no base → partial merge → MergeOperand
+            assert_eq!(out[1].key.value_type, ValueType::MergeOperand);
+            assert_eq!(&*out[1].value, b"op1,op2");
+
+            Ok(())
+        }
+
+        /// Stream filter that replaces values preserves MergeOperand type.
+        #[test]
+        #[expect(clippy::unwrap_used, reason = "test assertion")]
+        fn compaction_filter_preserves_merge_operand_type() -> crate::Result<()> {
+            struct UpperFilter;
+            impl StreamFilter for UpperFilter {
+                fn filter_item(
+                    &mut self,
+                    _item: &InternalValue,
+                ) -> crate::Result<StreamFilterVerdict> {
+                    Ok(StreamFilterVerdict::Replace((
+                        ValueType::Value,
+                        b"REPLACED".to_vec().into(),
+                    )))
+                }
+            }
+
+            let vec = vec![InternalValue::from_components(
+                "a",
+                "op1",
+                5,
+                ValueType::MergeOperand,
+            )];
+
+            let iter = vec.iter().cloned().map(Ok);
+            let mut iter = CompactionStream::new(iter, 1_000).with_filter(UpperFilter);
+
+            let item = iter.next().unwrap()?;
+            // Filter tried to set Value, but MergeOperand type must be preserved
+            assert_eq!(item.key.value_type, ValueType::MergeOperand);
+            assert_eq!(&*item.value, b"REPLACED");
+
+            Ok(())
+        }
     }
 }

@@ -282,8 +282,12 @@ impl<I: DoubleEndedIterator<Item = crate::Result<InternalValue>>> DoubleEndedIte
                         .expect_err("should be error")));
                 }
                 None => {
-                    // Last item — resolve merge only if newest entry is a MergeOperand.
-                    if has_merge_op && tail.key.value_type.is_merge_operand() {
+                    // Last item — resolve merge only if newest entry is a MergeOperand
+                    // and not RT-suppressed.
+                    if has_merge_op
+                        && tail.key.value_type.is_merge_operand()
+                        && !self.is_rt_suppressed(&tail)
+                    {
                         key_entries.push(tail);
                         return Some(self.resolve_merge_buffered(key_entries));
                     }
@@ -1362,6 +1366,58 @@ mod tests {
             let item = iter.next_back().unwrap()?;
             assert_eq!(item.key.value_type, ValueType::Value);
             // base@1 suppressed → merge with no base
+            assert_eq!(&*item.value, b"op1");
+
+            assert!(iter.next_back().is_none());
+            Ok(())
+        }
+
+        /// Forward: if the newest MergeOperand is RT-suppressed, skip merge
+        /// entirely — pass through for the post-filter to suppress.
+        #[test]
+        #[expect(clippy::unwrap_used, reason = "test assertion")]
+        fn merge_forward_rt_suppresses_head() -> crate::Result<()> {
+            use crate::range_tombstone::RangeTombstone;
+
+            // RT at seqno 5 covers "a" → head@3 is suppressed
+            let rt = RangeTombstone::new(b"a".to_vec().into(), b"b".to_vec().into(), 5);
+
+            let vec = vec![
+                InternalValue::from_components("a", "op1", 3, ValueType::MergeOperand),
+                InternalValue::from_components("a", "base", 1, ValueType::Value),
+            ];
+
+            let iter = Box::new(vec.into_iter().map(Ok));
+            let mut iter = MvccStream::new(iter, merge_op()).with_range_tombstones(vec![rt], 6);
+
+            let item = iter.next().unwrap()?;
+            // Head is RT-suppressed → merge skipped, head returned as-is
+            assert_eq!(item.key.value_type, ValueType::MergeOperand);
+            assert_eq!(&*item.value, b"op1");
+
+            assert!(iter.next().is_none());
+            Ok(())
+        }
+
+        /// Reverse: if the newest MergeOperand is RT-suppressed, skip merge.
+        #[test]
+        #[expect(clippy::unwrap_used, reason = "test assertion")]
+        fn merge_reverse_rt_suppresses_head() -> crate::Result<()> {
+            use crate::range_tombstone::RangeTombstone;
+
+            let rt = RangeTombstone::new(b"a".to_vec().into(), b"b".to_vec().into(), 5);
+
+            let vec = vec![
+                InternalValue::from_components("a", "op1", 3, ValueType::MergeOperand),
+                InternalValue::from_components("a", "base", 1, ValueType::Value),
+            ];
+
+            let iter = Box::new(vec.into_iter().map(Ok));
+            let mut iter = MvccStream::new(iter, merge_op()).with_range_tombstones(vec![rt], 6);
+
+            let item = iter.next_back().unwrap()?;
+            // Head is RT-suppressed → merge skipped
+            assert_eq!(item.key.value_type, ValueType::MergeOperand);
             assert_eq!(&*item.value, b"op1");
 
             assert!(iter.next_back().is_none());
