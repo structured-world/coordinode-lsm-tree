@@ -58,7 +58,9 @@ pub trait PrefixExtractor:
     ///
     /// Returns `Box<dyn Iterator>` for object safety (`Arc<dyn PrefixExtractor>`).
     /// Most extractors yield 1–5 prefixes per key, so the allocation is negligible
-    /// compared to the bloom hash + I/O cost.
+    /// compared to the bloom hash + I/O cost. A callback-based `for_each_prefix`
+    /// alternative could avoid this allocation but would expand the trait API
+    /// surface; consider adding it if profiling shows measurable overhead.
     fn prefixes<'a>(&self, key: &'a [u8]) -> Box<dyn Iterator<Item = &'a [u8]> + 'a>;
 
     /// Returns `true` if `prefix` is a valid scan boundary for this extractor.

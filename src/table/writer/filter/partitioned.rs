@@ -177,12 +177,13 @@ impl<W: std::io::Write + std::io::Seek> FilterWriter<W> for PartitionedFilterWri
     fn register_key(&mut self, key: &UserKey) -> crate::Result<()> {
         self.bloom_hash_buffer.push(Builder::get_hash(key));
 
-        // NOTE: Prefix hashes are intentionally not deduplicated across keys.
-        // Duplicate hashes (from keys sharing a prefix) set the same bloom bits
-        // (idempotent), so correctness is unaffected. Deduplication would require
-        // a HashSet per partition adding memory overhead, while the only cost of
-        // duplicates is a slightly larger `n` passed to the bloom builder which
-        // marginally increases filter size — a worthwhile trade-off.
+        // NOTE: Prefix hashes are intentionally not deduplicated.
+        // Correctness: duplicate hashes set the same bloom bits (idempotent).
+        // Sizing: `estimated_filter_size` overestimates slightly, producing a
+        //   larger-than-minimum filter — this lowers FPR, a net positive.
+        // Performance: dedup alternatives (HashSet per partition, or sort+dedup
+        //   per key) add O(n) memory or O(n log n) CPU per key on the hot write
+        //   path, which is worse than the marginal filter size increase.
         if let Some(extractor) = &self.prefix_extractor {
             for prefix in extractor.prefixes(key.as_ref()) {
                 self.bloom_hash_buffer.push(Builder::get_hash(prefix));
