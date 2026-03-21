@@ -843,17 +843,32 @@ impl Tree {
         // https://fjall-rs.github.io/post/bloom-filter-hash-sharing/
         let key_hash = crate::table::filter::standard_bloom::Builder::get_hash(key);
 
+        // Track the entry with the highest seqno across all tables.
+        //
+        // `optimize_runs` can merge disjoint tables from different flush
+        // epochs into a single run, which may reorder them relative to
+        // tables in other runs. A newer point tombstone can end up in a
+        // run that is iterated AFTER an older run containing a value for
+        // the same key (see issue #53). Selecting the highest-seqno entry
+        // across all matching tables ensures correctness regardless of
+        // the run layout.
+        let mut best: Option<InternalValue> = None;
+
         for table in version
             .iter_levels()
             .flat_map(|lvl| lvl.iter())
             .filter_map(|run| run.get_for_key(key))
         {
             if let Some(item) = table.get(key, seqno, key_hash)? {
-                return Ok(ignore_tombstone_value(item));
+                let dominated = best.as_ref().is_some_and(|b| b.key.seqno >= item.key.seqno);
+
+                if !dominated {
+                    best = Some(item);
+                }
             }
         }
 
-        Ok(None)
+        Ok(best.and_then(ignore_tombstone_value))
     }
 
     fn get_internal_entry_from_sealed_memtables(
