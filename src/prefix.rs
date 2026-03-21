@@ -12,8 +12,9 @@
 ///
 /// # Thread Safety
 ///
-/// Implementations must be `Send + Sync` because the extractor is shared across
-/// flush, compaction, and read threads via `Arc`.
+/// Implementations must be `Send + Sync + UnwindSafe + RefUnwindSafe`.
+/// The extractor is shared across flush, compaction, and read threads via `Arc`,
+/// and may be accessed across panic boundaries (e.g., `catch_unwind` in tests).
 ///
 /// # Example
 ///

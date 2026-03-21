@@ -464,8 +464,8 @@ fn prefix_bloom_negative_lookup_in_key_range_gap() -> lsm_tree::Result<()> {
 
     // Create a single table with keys spanning a wide range but only two
     // prefix groups: "aaa:" and "zzz:". After flush, the table's key_range
-    // is [aaa:0, zzz:9]. Any prefix scan for "mmm:" overlaps the key_range
-    // but "mmm:" was never indexed in the bloom → Ok(false) branch fires.
+    // is [aaa:0, zzz:19]. Scanning "mmm:" overlaps the key_range but "mmm:"
+    // was never indexed in the bloom → Ok(false) branch fires.
     for i in 0..10 {
         tree.insert(format!("aaa:{i}"), "v", i);
     }
