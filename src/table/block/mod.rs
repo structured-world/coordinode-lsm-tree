@@ -155,11 +155,18 @@ impl Block {
         // Validate both size fields before any I/O or hashing to fail fast
         // on malformed headers. The on-disk data_length may include encryption
         // overhead (nonce + auth tag), so allow the provider's declared margin.
+        // max_overhead() is contractually bounded to fit in u32 (see trait doc).
+        // The addition cannot overflow: MAX_DECOMPRESSION_SIZE is 256 MiB,
+        // leaving >3.7 GiB of headroom in u32.
         #[expect(
             clippy::cast_possible_truncation,
-            reason = "overhead is a few dozen bytes"
+            reason = "max_overhead() is contractually bounded to u32 (see EncryptionProvider doc)"
         )]
         let enc_overhead = encryption.map_or(0u32, |e| e.max_overhead() as u32);
+        debug_assert!(
+            (MAX_DECOMPRESSION_SIZE as u64) + u64::from(enc_overhead) <= u64::from(u32::MAX),
+            "encryption overhead would overflow u32 size cap"
+        );
 
         if header.data_length > MAX_DECOMPRESSION_SIZE + enc_overhead {
             return Err(crate::Error::DecompressedSizeTooLarge {
