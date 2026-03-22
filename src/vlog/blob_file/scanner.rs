@@ -68,6 +68,9 @@ impl Scanner {
             data_end,
         })
     }
+    // No `with_reader` constructor: Scanner is crate-private (parent
+    // `vlog` module is not re-exported from lib.rs), so there are no
+    // external callers. All internal usage goes through `new()`.
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -496,6 +499,11 @@ mod tests {
 
         // Craft a valid SFA file with a "data" TOC entry where
         // pos=1 and len=u64::MAX, causing pos+len to overflow.
+        //
+        // Hand-encoding is intentional: the sfa crate derives TOC
+        // values from real stream positions, so it cannot produce
+        // overflowing entries through its public API. The binary
+        // format below matches sfa 1.x's stable on-disk layout.
         //
         // SFA layout: [section data...] [TOC] [Trailer]
         // TOC entry:  [pos: u64 LE] [len: u64 LE] [name_len: u16 LE] [name]
