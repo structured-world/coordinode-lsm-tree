@@ -692,85 +692,86 @@ fn multi_level_sparse_keyspace_data_integrity() -> crate::Result<()> {
     )
     .open()?;
 
-    // Use tiny target_size so data actually propagates through L1 into L2.
-    let leveled = Arc::new(
+    let mut seqno = 0u64;
+    let val = &[b'v'; 100]; // 100-byte values for meaningful table sizes
+
+    // Phase 1: Build up data across L1, L2, and deeper levels using a
+    // medium target_size. This naturally populates intermediate levels
+    // (unlike tiny target_size=1 which pushes everything to Lmax,
+    // leaving L1-L4 empty and causing cascading trivial-moves).
+    //
+    // target_size=256, threshold=4 → L1 target=1024, L2 target=10240.
+    // Multiple rounds push data through L1→L2 naturally.
+    let medium = Arc::new(
         Strategy::default()
             .with_l0_threshold(4)
-            .with_table_target_size(1),
+            .with_table_target_size(256),
     );
-    let mut seqno = 0u64;
-
-    // Step 1: Populate L1+L2 with data across the full keyspace.
-    // Flush each range separately so tables have narrow key ranges.
-    // Multiple rounds + multiple compactions per round push data to L2.
-    for _round in 0..5 {
-        // Low range [a,d]
-        tree.insert("a", "val", seqno);
-        tree.insert("d", "val", seqno);
+    for _round in 0..8 {
+        tree.insert("a", val, seqno);
+        tree.insert("d", val, seqno);
+        tree.insert("m", val, seqno); // gap key
+        tree.insert("n", val, seqno); // gap key
+        tree.insert("x", val, seqno);
+        tree.insert("z", val, seqno);
         tree.flush_active_memtable(seqno)?;
         seqno += 1;
 
-        // Gap range [m,n] — ends up in L2 as gap-filling tables
-        tree.insert("m", "gap_val", seqno);
-        tree.insert("n", "gap_val", seqno);
+        tree.insert("b", val, seqno);
+        tree.insert("c", val, seqno);
+        tree.insert("y", val, seqno);
         tree.flush_active_memtable(seqno)?;
         seqno += 1;
 
-        // High range [x,z]
-        tree.insert("x", "val", seqno);
-        tree.insert("z", "val", seqno);
+        tree.insert("a", val, seqno);
+        tree.insert("z", val, seqno);
         tree.flush_active_memtable(seqno)?;
         seqno += 1;
 
-        // Padding flush to reach l0_threshold=4
-        tree.insert("a", "val", seqno);
-        tree.insert("z", "val", seqno);
+        tree.insert("d", val, seqno);
+        tree.insert("x", val, seqno);
         tree.flush_active_memtable(seqno)?;
         seqno += 1;
 
-        // Compact multiple times to propagate through levels
         for _ in 0..3 {
-            tree.compact(leveled.clone(), seqno)?;
+            tree.compact(medium.clone(), seqno)?;
         }
     }
 
-    // Verify L2 actually has data before multi-level test
+    // Verify L2+ has data
     let version = tree.current_version();
-    let l2_non_empty =
-        (2..version.level_count()).any(|idx| version.level(idx).is_some_and(|l| !l.is_empty()));
     assert!(
-        l2_non_empty,
-        "L2+ must have data for multi-level overlap test to be meaningful",
+        (2..version.level_count()).any(|idx| version.level(idx).is_some_and(|l| !l.is_empty())),
+        "L2+ must have data before multi-level test",
     );
 
-    // Step 2: Flush narrow-range L0 tables (only low + high, no gap).
-    // Each flush creates a table with a narrow key_range.
+    // Phase 2: Flush narrow-range L0 tables and trigger multi-level.
+    // Use same target_size=256 so L1 stays "oversized" from Phase 1,
+    // and flush enough L0 tables that L0 score > L1 score.
     let multi = Arc::new(
         Strategy::default()
             .with_multi_level(true)
-            .with_table_target_size(64)
+            .with_table_target_size(256)
             .with_l0_threshold(4),
     );
 
-    for _k in 0..4 {
-        // Flush [a,d] only
-        tree.insert("a", "val", seqno);
-        tree.insert("d", "val", seqno);
+    for _k in 0..10 {
+        // Flush [a,d] only — narrow key range
+        tree.insert("a", val, seqno);
+        tree.insert("d", val, seqno);
         tree.flush_active_memtable(seqno)?;
         seqno += 1;
 
-        // Flush [x,z] only
-        tree.insert("x", "val", seqno);
-        tree.insert("z", "val", seqno);
+        // Flush [x,z] only — narrow key range
+        tree.insert("x", val, seqno);
+        tree.insert("z", val, seqno);
         tree.flush_active_memtable(seqno)?;
         seqno += 1;
     }
 
     let result = tree.compact(multi.clone(), seqno)?;
 
-    // Verify multi-level path fired (L0+L1→L2).
-    // CompactionResult lets us assert the merge path was taken and
-    // data landed in L2+, covering the per-range overlap code.
+    // Verify multi-level path fired (L0 won scoring, L1 oversized → L0+L1→L2).
     assert_eq!(
         result.action,
         crate::compaction::CompactionAction::Merged,
