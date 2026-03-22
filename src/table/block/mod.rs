@@ -164,7 +164,7 @@ impl Block {
         )]
         let enc_overhead = encryption.map_or(0u32, |e| e.max_overhead() as u32);
         debug_assert!(
-            (MAX_DECOMPRESSION_SIZE as u64) + u64::from(enc_overhead) <= u64::from(u32::MAX),
+            u32::try_from(u64::from(MAX_DECOMPRESSION_SIZE) + u64::from(enc_overhead)).is_ok(),
             "encryption overhead would overflow u32 size cap"
         );
 
