@@ -100,7 +100,13 @@ impl Strategy {
     /// Default = 1.0
     #[must_use]
     pub fn with_size_ratio(mut self, ratio: f64) -> Self {
-        self.size_ratio = ratio;
+        // Clamp invalid values: NaN, negative, and infinite are replaced
+        // with the default (1.0). Zero is allowed (exact-size-match only).
+        self.size_ratio = if ratio.is_finite() && ratio >= 0.0 {
+            ratio
+        } else {
+            1.0
+        };
         self
     }
 
@@ -248,9 +254,9 @@ impl CompactionStrategy for Strategy {
             //   (total / largest - 1) * 100 >= threshold
             // is equivalent to:
             //   total * 100 >= largest * (100 + threshold)
-            let lhs = u128::from(total_size) * 100;
+            let lhs = u128::from(total_size).saturating_mul(100);
             let rhs = u128::from(largest_run_size)
-                * (100 + u128::from(self.max_space_amplification_percent));
+                .saturating_mul(100 + u128::from(self.max_space_amplification_percent));
 
             if lhs >= rhs {
                 let table_ids: HashSet<TableId> = runs
