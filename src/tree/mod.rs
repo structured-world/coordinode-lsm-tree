@@ -912,7 +912,6 @@ impl Tree {
         // this key and process them in descending seqno order so that newer
         // MergeOperands are seen before older bases/tombstones.
         if !found_base {
-            let key_hash = crate::table::filter::standard_bloom::Builder::get_hash(key);
             let key_slice = crate::Slice::from(key);
 
             let mut disk_entries: Vec<InternalValue> = Vec::new();
@@ -939,11 +938,9 @@ impl Tree {
 
             for entry in &disk_entries {
                 if is_rt_suppressed(entry) {
-                    found_base = true;
                     break;
                 }
                 if process_entry(entry) {
-                    found_base = true;
                     break;
                 }
             }
