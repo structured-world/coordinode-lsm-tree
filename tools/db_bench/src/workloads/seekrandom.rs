@@ -2,7 +2,7 @@ use crate::config::BenchConfig;
 use crate::db::{make_sequential_key, prefill_sequential, read_seqno};
 use crate::reporter::Reporter;
 use crate::workloads::Workload;
-use lsm_tree::{AbstractTree, AnyTree, Guard}; // Guard trait required for .size()
+use lsm_tree::{AbstractTree, AnyTree, Guard}; // Guard trait required for .value()
 use rand::Rng;
 use std::sync::atomic::AtomicU64;
 use std::time::Instant;
@@ -33,7 +33,7 @@ impl Workload for SeekRandom {
             // Seek to key and read the next entry.
             let mut iter = tree.range(key.., read_seq, None);
             // Force full value read including blob payload (BlobTree).
-            // Guard::size() only reads indirection metadata.
+            // Guard::value() reads the full blob payload.
             if let Some(next) = iter.next() {
                 let _ = next.value()?;
             }

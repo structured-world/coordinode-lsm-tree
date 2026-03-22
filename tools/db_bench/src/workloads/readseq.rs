@@ -2,7 +2,7 @@ use crate::config::BenchConfig;
 use crate::db::{prefill_sequential, read_seqno};
 use crate::reporter::Reporter;
 use crate::workloads::Workload;
-use lsm_tree::{AbstractTree, AnyTree, Guard}; // Guard trait required for .size()
+use lsm_tree::{AbstractTree, AnyTree, Guard}; // Guard trait required for .value()
 use std::sync::atomic::AtomicU64;
 use std::time::Instant;
 
@@ -30,7 +30,7 @@ impl Workload for ReadSeq {
             match iter.next() {
                 Some(item) => {
                     // Force full value read including blob payload (BlobTree).
-                    // Guard::size() only reads indirection metadata.
+                    // Guard::value() reads the full blob payload.
                     let _ = item.value()?;
                     reporter.record_duration(t.elapsed());
 

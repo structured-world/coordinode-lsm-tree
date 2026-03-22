@@ -2,7 +2,7 @@ use crate::config::BenchConfig;
 use crate::db::{prefill_prefix_keys, read_seqno};
 use crate::reporter::Reporter;
 use crate::workloads::Workload;
-use lsm_tree::{AbstractTree, AnyTree, Guard}; // Guard trait required for .size()
+use lsm_tree::{AbstractTree, AnyTree, Guard}; // Guard trait required for .value()
 use rand::Rng;
 use std::sync::atomic::AtomicU64;
 use std::time::Instant;
