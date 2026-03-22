@@ -170,13 +170,20 @@ pub fn compare_prefixed_slice(
     // Slow path: materialize prefix+suffix into a contiguous buffer for
     // custom comparators. Uses a stack buffer for typical key sizes to
     // avoid heap allocation on the hot binary-search path.
-    const STACK_BUF_LEN: usize = 256;
     let total_len = prefix.len() + suffix.len();
 
-    if total_len <= STACK_BUF_LEN {
-        let mut buf = [0_u8; STACK_BUF_LEN];
-        buf[..prefix.len()].copy_from_slice(prefix);
-        buf[prefix.len()..total_len].copy_from_slice(suffix);
+    if total_len <= 256 {
+        let mut buf = [0_u8; 256];
+
+        // SAFETY (indexing): total_len <= 256 == buf.len(), and
+        // prefix.len() + suffix.len() == total_len, so all slices are in bounds.
+        #[expect(clippy::indexing_slicing, reason = "total_len <= 256 checked above")]
+        {
+            buf[..prefix.len()].copy_from_slice(prefix);
+            buf[prefix.len()..total_len].copy_from_slice(suffix);
+        }
+
+        #[expect(clippy::indexing_slicing, reason = "total_len <= 256 checked above")]
         return cmp.compare(&buf[..total_len], needle);
     }
 
