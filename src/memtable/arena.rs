@@ -40,6 +40,9 @@ impl Arena {
     /// Creates a new arena with the given capacity in bytes.
     pub fn new(capacity: u32) -> Self {
         Self {
+            // Global allocator guarantees alignment >= align_of::<usize>() (4+ bytes
+            // on all supported targets), which satisfies AtomicU32's 4-byte requirement.
+            // The debug_assert in get_atomic_u32 catches any violation at runtime.
             buf: UnsafeCell::new(vec![0u8; capacity as usize].into_boxed_slice()),
             // Reserve offset 0 as the UNSET sentinel.
             offset: AtomicU32::new(1),
@@ -103,8 +106,9 @@ impl Arena {
     pub unsafe fn get_bytes(&self, offset: u32, len: u32) -> &[u8] {
         // SAFETY: the caller guarantees `offset..offset+len` lies within a
         // previously allocated, fully initialised arena region.  The bump
-        // allocator ensures no two allocations overlap, and the acquire/release
-        // pair on `self.offset` guarantees visibility of prior writes.
+        // allocator ensures no two allocations overlap.  Memory ordering
+        // (visibility of writes) is the caller's responsibility — typically
+        // ensured by the CAS in `insert()` that publishes the node offset.
         let buf = &*self.buf.get();
         let start = offset as usize;
         let end = start + len as usize;
