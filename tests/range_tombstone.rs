@@ -1174,6 +1174,57 @@ fn kv_seqno_excludes_range_tombstone_seqno() -> lsm_tree::Result<()> {
     // highest_kv_seqno excludes RT — only KVs (max is 4)
     assert_eq!(table.get_highest_kv_seqno(), 4);
 
+    // Invariant: KV-only seqno must not exceed overall max
+    assert!(table.get_highest_kv_seqno() <= table.get_highest_seqno());
+
+    Ok(())
+}
+
+/// Without range tombstones, highest_kv_seqno equals highest_seqno
+/// (all items are KV entries, none are RTs).
+#[test]
+fn kv_seqno_equals_overall_when_no_range_tombstones() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let tree = open_tree(folder.path());
+
+    tree.insert("a", "val_a", 1);
+    tree.insert("b", "val_b", 2);
+    tree.insert("c", "val_c", 3);
+
+    tree.flush_active_memtable(0)?;
+
+    let table = tree
+        .current_version()
+        .iter_tables()
+        .next()
+        .expect("should have one table")
+        .clone();
+
+    assert_eq!(table.get_highest_seqno(), 3);
+    assert_eq!(table.get_highest_kv_seqno(), 3);
+
+    Ok(())
+}
+
+/// RT-only table: highest_kv_seqno is 0 because no KV items exist
+/// (only the sentinel entry which has its seqno restored after write).
+#[test]
+fn kv_seqno_zero_for_rt_only_table() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let tree = open_tree(folder.path());
+
+    // Only an RT, no KV inserts
+    tree.remove_range("a", "z", 10);
+
+    tree.flush_active_memtable(0)?;
+
+    let table = find_rt_table(&tree);
+
+    // Overall seqno includes the RT
+    assert_eq!(table.get_highest_seqno(), 10);
+    // KV-only seqno is 0 — sentinel seqno is restored to pre-write state
+    assert_eq!(table.get_highest_kv_seqno(), 0);
+
     Ok(())
 }
 
