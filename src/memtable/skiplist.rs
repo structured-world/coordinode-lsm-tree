@@ -946,6 +946,17 @@ impl DoubleEndedIterator for Range<'_> {
             return None;
         }
 
+        // If back is before front in key order, the range is empty
+        // (e.g., start bound > end bound).
+        if self
+            .map
+            .compare_key(self.back, &self.map.node_internal_key(self.front))
+            == CmpOrdering::Less
+        {
+            self.done = true;
+            return None;
+        }
+
         let node = self.back;
 
         // If front and back have converged, this is the last element.
