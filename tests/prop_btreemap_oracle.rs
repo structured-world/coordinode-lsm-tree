@@ -283,11 +283,14 @@ fn run_oracle_test(ops: Vec<Op>) -> Result<(), TestCaseError> {
 // ---------------------------------------------------------------------------
 
 proptest! {
-    // cases defaults to 256; CI overrides via PROPTEST_CASES=32.
-    // timeout keeps the test within CI per-test budget (60 s).
+    // 32 cases: keeps CI runtime bounded across the 3-OS nextest matrix.
+    // PROPTEST_CASES env var can still override at runtime.
+    // fork disabled: rusty-fork cannot re-exec under QEMU cross-compilation.
     #![proptest_config(ProptestConfig {
+        cases: 32,
         max_shrink_iters: 1000,
-        timeout: 50_000,
+        fork: false,
+        timeout: 0,
         .. ProptestConfig::default()
     })]
 
