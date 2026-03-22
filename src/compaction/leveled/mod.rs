@@ -333,8 +333,13 @@ impl Strategy {
                 )]
                 let mut current_target = lmax_size as f64;
 
-                for idx in (1..lmax_idx).rev() {
-                    let canonical = idx.saturating_sub(level_shift);
+                // Only backfill down to the effective L1 (accounting for
+                // level_shift), not to physical level 1, so we don't
+                // overwrite slots below the shifted canonical L1.
+                let dynamic_l1_idx = level_shift + 1;
+
+                for idx in (dynamic_l1_idx..lmax_idx).rev() {
+                    let canonical = idx - level_shift;
                     // In the forward formula, target(k+1)/target(k) = ratio[k-1],
                     // so backwards: target(k) = target(k+1) / ratio[k-1]
                     let ratio_idx = canonical.saturating_sub(1);
@@ -359,9 +364,10 @@ impl Strategy {
                     }
                 }
 
-                // Fallback: if dynamic L1 target is too small, use static
+                // Fallback: if dynamic L1 target is too small, use static.
+                // Compare the shifted L1 slot, not physical slot 1.
                 let static_l1 = self.level_base_size();
-                if targets.get(1).copied().unwrap_or(0) < static_l1 {
+                if targets.get(dynamic_l1_idx).copied().unwrap_or(0) < static_l1 {
                     return self.compute_static_targets(level_shift);
                 }
 
@@ -719,6 +725,10 @@ impl CompactionStrategy for Strategy {
 
             // Multi-level compaction: if L1 is already oversized, skip it
             // and compact L0+L1 directly into L2 in one pass.
+            // NOTE: Currently triggers on pre-compaction L1 score. A future
+            // improvement could use projected post-compaction bytes to also
+            // catch cases where L1 is close to its target and this batch
+            // would push it over.
             if self.multi_level {
                 let l1_score = scores.get(canonical_l1_idx).map_or(0.0, |(s, _)| *s);
                 let l2_idx = canonical_l1_idx + 1;

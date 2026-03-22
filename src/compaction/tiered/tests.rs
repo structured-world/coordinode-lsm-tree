@@ -1,5 +1,8 @@
 use super::*;
-use crate::{AbstractTree, Config, SequenceNumberCounter, MAX_SEQNO};
+use crate::{
+    compaction::{state::CompactionState, CompactionStrategy},
+    AbstractTree, Config, SequenceNumberCounter, MAX_SEQNO,
+};
 use std::sync::Arc;
 use test_log::test;
 
@@ -279,5 +282,115 @@ fn stcs_multiple_compaction_cycles() -> crate::Result<()> {
         );
     }
 
+    Ok(())
+}
+
+#[test]
+fn stcs_get_name() {
+    let strategy = Strategy::default();
+    assert_eq!(strategy.get_name(), "SizeTieredCompaction");
+}
+
+#[test]
+fn stcs_get_config_serialization() {
+    let strategy = Strategy::default()
+        .with_size_ratio(0.5)
+        .with_min_merge_width(8)
+        .with_max_merge_width(16)
+        .with_max_space_amplification_percent(300)
+        .with_table_target_size(128 * 1024 * 1024);
+
+    let config = strategy.get_config();
+    assert_eq!(config.len(), 5, "should serialize all 5 parameters");
+
+    // Verify keys exist
+    let keys: Vec<_> = config.iter().map(|(k, _)| k.as_ref()).collect();
+    assert!(keys.iter().any(|k| k == b"tiered_size_ratio"));
+    assert!(keys.iter().any(|k| k == b"tiered_min_merge_width"));
+    assert!(keys.iter().any(|k| k == b"tiered_max_merge_width"));
+    assert!(keys.iter().any(|k| k == b"tiered_max_space_amp_pct"));
+    assert!(keys.iter().any(|k| k == b"tiered_target_size"));
+}
+
+#[test]
+fn stcs_builder_with_size_ratio() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let tree = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .open()?;
+
+    // Flush 4 runs with overlapping keys
+    flush_overlapping(&tree, 4, 0)?;
+
+    // Very tight size_ratio=0.01 means only nearly-identical-sized runs merge
+    // All our flushes are similar, so this should still trigger
+    let strategy = Arc::new(
+        Strategy::default()
+            .with_size_ratio(0.01)
+            .with_min_merge_width(2)
+            .with_max_space_amplification_percent(u64::MAX),
+    );
+    tree.compact(strategy, 4)?;
+
+    // Some merging should occur (runs are similarly sized)
+    assert!(tree.table_count() < 4);
+
+    Ok(())
+}
+
+#[test]
+fn stcs_max_merge_width_less_than_min_no_merge() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let tree = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .open()?;
+
+    // Flush 4 overlapping runs
+    flush_overlapping(&tree, 4, 0)?;
+    assert_eq!(4, tree.table_count());
+
+    // Configure max_merge_width=2 but min_merge_width=4.
+    // prefix_len might be >= 4 (min), but merge_count = min(prefix, 2) = 2 < 4 (min).
+    // Guard should prevent merge.
+    let strategy = Arc::new(
+        Strategy::default()
+            .with_min_merge_width(4)
+            .with_max_merge_width(2)
+            .with_max_space_amplification_percent(u64::MAX),
+    );
+    tree.compact(strategy, 4)?;
+
+    // No merge should occur — misconfigured max < min is guarded
+    assert_eq!(4, tree.table_count());
+    Ok(())
+}
+
+#[test]
+fn stcs_single_run_no_compaction() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let tree = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .open()?;
+
+    // Single flush = single run in L0
+    tree.insert("a", "v", 0);
+    tree.flush_active_memtable(0)?;
+
+    assert_eq!(1, tree.table_count());
+
+    let strategy = Arc::new(Strategy::default().with_min_merge_width(2));
+    tree.compact(strategy, 1)?;
+
+    // Single run → DoNothing (runs.len() < 2)
+    assert_eq!(1, tree.table_count());
     Ok(())
 }

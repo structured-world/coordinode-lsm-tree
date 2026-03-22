@@ -480,3 +480,155 @@ fn multi_level_data_integrity() -> crate::Result<()> {
 
     Ok(())
 }
+
+// --- Coverage: get_config, get_name, builder methods ---
+
+#[test]
+fn leveled_get_name() {
+    use crate::compaction::CompactionStrategy;
+    let strategy = Strategy::default();
+    assert_eq!(strategy.get_name(), "LeveledCompaction");
+}
+
+#[test]
+fn leveled_get_config_includes_new_fields() {
+    use crate::compaction::CompactionStrategy;
+    let strategy = Strategy::default()
+        .with_dynamic_level_bytes(true)
+        .with_multi_level(true);
+
+    let config = strategy.get_config();
+
+    let keys: Vec<_> = config.iter().map(|(k, _)| k.as_ref()).collect();
+    assert!(
+        keys.iter().any(|k| k == b"leveled_dynamic"),
+        "should have leveled_dynamic key",
+    );
+    assert!(
+        keys.iter().any(|k| k == b"leveled_multi_level"),
+        "should have leveled_multi_level key",
+    );
+    assert!(
+        keys.iter().any(|k| k == b"leveled_l0_threshold"),
+        "should have leveled_l0_threshold key",
+    );
+    assert!(
+        keys.iter().any(|k| k == b"leveled_target_size"),
+        "should have leveled_target_size key",
+    );
+    assert!(
+        keys.iter().any(|k| k == b"leveled_level_ratio_policy"),
+        "should have leveled_level_ratio_policy key",
+    );
+}
+
+#[test]
+fn leveled_builder_chaining() {
+    use crate::compaction::CompactionStrategy;
+    // Exercise all builder methods to cover their code paths
+    let strategy = Strategy::default()
+        .with_l0_threshold(8)
+        .with_table_target_size(32 * 1024 * 1024)
+        .with_level_ratio_policy(vec![8.0, 10.0])
+        .with_dynamic_level_bytes(true)
+        .with_multi_level(true);
+
+    let config = strategy.get_config();
+    assert!(!config.is_empty());
+    assert_eq!(strategy.get_name(), "LeveledCompaction");
+}
+
+// --- Coverage: dynamic leveling with enough data to exercise backward computation ---
+
+#[test]
+fn dynamic_leveling_multiple_levels() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let tree = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .open()?;
+
+    let strategy = Arc::new(
+        Strategy::default()
+            .with_dynamic_level_bytes(true)
+            .with_l0_threshold(4)
+            .with_table_target_size(1), // tiny tables → many levels get populated
+    );
+
+    let mut seqno = 0u64;
+
+    // Multiple rounds of flush + compact to push data through levels
+    for _round in 0..12 {
+        for _k in 0..4 {
+            tree.insert("a", "val", seqno);
+            tree.insert(format!("key_{seqno}").as_bytes(), "val", seqno);
+            tree.insert("z", "val", seqno);
+            tree.flush_active_memtable(seqno)?;
+            seqno += 1;
+        }
+        // Run compaction multiple times per round to propagate through levels
+        for _ in 0..3 {
+            tree.compact(strategy.clone(), seqno)?;
+        }
+    }
+
+    // All keys should be readable
+    for s in 0..seqno {
+        assert!(
+            tree.get(format!("key_{s}").as_bytes(), MAX_SEQNO)?
+                .is_some(),
+            "key_{s} should exist",
+        );
+    }
+
+    Ok(())
+}
+
+// --- Coverage: multi-level with L1 overflowing into L2 ---
+
+#[test]
+fn multi_level_with_both_flags() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let tree = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .open()?;
+
+    // Test that both dynamic + multi_level work together
+    let strategy = Arc::new(
+        Strategy::default()
+            .with_dynamic_level_bytes(true)
+            .with_multi_level(true)
+            .with_table_target_size(1),
+    );
+
+    let mut seqno = 0u64;
+
+    for _round in 0..10 {
+        for _k in 0..4 {
+            tree.insert("a", "val", seqno);
+            tree.insert(format!("key_{seqno}").as_bytes(), "val", seqno);
+            tree.insert("z", "val", seqno);
+            tree.flush_active_memtable(seqno)?;
+            seqno += 1;
+        }
+        for _ in 0..3 {
+            tree.compact(strategy.clone(), seqno)?;
+        }
+    }
+
+    // All data readable
+    for s in 0..seqno {
+        assert!(
+            tree.get(format!("key_{s}").as_bytes(), MAX_SEQNO)?
+                .is_some(),
+            "key_{s} should exist",
+        );
+    }
+
+    Ok(())
+}
