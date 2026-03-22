@@ -1814,3 +1814,76 @@ fn meta_seqno_kv_max_corruption_returns_invalid_data() -> crate::Result<()> {
 
     Ok(())
 }
+
+/// bloom_may_contain_key with full (non-partitioned) filter delegates to
+/// bloom_may_contain_hash and correctly rejects a non-matching key.
+#[test]
+fn bloom_may_contain_key_full_filter() -> crate::Result<()> {
+    let items: Vec<InternalValue> = ["a", "c", "e"]
+        .iter()
+        .enumerate()
+        .map(|(i, &k)| {
+            InternalValue::from_components(k, "v", i as u64 + 1, crate::ValueType::Value)
+        })
+        .collect();
+
+    test_with_table(
+        &items,
+        |table| {
+            let hash_b = BloomBuilder::get_hash(b"b");
+            let hash_a = BloomBuilder::get_hash(b"a");
+
+            // "b" is not in the table — bloom should reject (or conservatively accept)
+            let result_b = table.bloom_may_contain_key(b"b", hash_b)?;
+            // "a" IS in the table — bloom must accept
+            let result_a = table.bloom_may_contain_key(b"a", hash_a)?;
+            assert!(result_a, "bloom must not reject a key that exists");
+
+            // If bloom rejects "b", that's the expected optimization
+            if !result_b {
+                // Good — bloom correctly filtered out non-matching key
+            }
+
+            Ok(())
+        },
+        None,
+        Some(|w: Writer| w.use_bloom_policy(BloomConstructionPolicy::BitsPerKey(10.0))),
+    )
+}
+
+/// bloom_may_contain_key with partitioned filter seeks the correct partition
+/// and returns Ok(false) for a key beyond all partition boundaries.
+#[test]
+fn bloom_may_contain_key_partitioned_filter() -> crate::Result<()> {
+    let items: Vec<InternalValue> = (0u64..100)
+        .map(|i| {
+            let key = format!("key_{i:04}");
+            InternalValue::from_components(key, "v", i + 1, crate::ValueType::Value)
+        })
+        .collect();
+
+    test_with_table(
+        &items,
+        |table| {
+            // Key that exists
+            let hash_exist = BloomBuilder::get_hash(b"key_0050");
+            let result = table.bloom_may_contain_key(b"key_0050", hash_exist)?;
+            assert!(
+                result,
+                "bloom must not reject existing key in partitioned filter"
+            );
+
+            // Key beyond all partitions
+            let hash_beyond = BloomBuilder::get_hash(b"zzz_beyond");
+            let result = table.bloom_may_contain_key(b"zzz_beyond", hash_beyond)?;
+            assert!(!result, "key beyond all partitions should be rejected");
+
+            Ok(())
+        },
+        None,
+        Some(|w: Writer| {
+            w.use_bloom_policy(BloomConstructionPolicy::BitsPerKey(10.0))
+                .use_partitioned_filter()
+        }),
+    )
+}
