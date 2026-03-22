@@ -76,6 +76,8 @@ impl MergeOperator for CounterMerge {
     }
 }
 
+// Mirrors tests/merge_operator.rs helper — unwrap is intentional in test code
+// to surface failures as panics with full backtrace context.
 fn get_counter(tree: &lsm_tree::AnyTree, key: &[u8], seqno: u64) -> Option<i64> {
     tree.get(key, seqno)
         .unwrap()
