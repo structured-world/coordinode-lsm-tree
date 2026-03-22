@@ -123,3 +123,77 @@ impl Manifest {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use byteorder::WriteBytesExt;
+    use std::io::Write;
+
+    /// Write the mandatory manifest sections (format_version, tree_type,
+    /// level_count, filter_hash_type) into an sfa archive at `path`.
+    /// If `comparator_name` is `Some`, also writes that section.
+    fn write_test_manifest(path: &std::path::Path, comparator_name: Option<&str>) {
+        let file = std::fs::File::create(path).unwrap();
+        let mut writer = sfa::Writer::from_writer(std::io::BufWriter::new(file));
+
+        writer.start("format_version").unwrap();
+        writer.write_u8(FormatVersion::V4.into()).unwrap();
+
+        writer.start("tree_type").unwrap();
+        writer.write_u8(TreeType::Standard.into()).unwrap();
+
+        writer.start("level_count").unwrap();
+        writer.write_u8(7).unwrap();
+
+        writer.start("filter_hash_type").unwrap();
+        writer.write_u8(u8::from(ChecksumType::Xxh3)).unwrap();
+
+        if let Some(name) = comparator_name {
+            writer.start("comparator_name").unwrap();
+            writer.write_all(name.as_bytes()).unwrap();
+        }
+
+        writer.finish().unwrap();
+    }
+
+    #[test]
+    fn manifest_without_comparator_name_defaults_to_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("manifest");
+
+        write_test_manifest(&path, None);
+
+        let reader = sfa::Reader::new(&path).unwrap();
+        let manifest = Manifest::decode_from(&path, &reader).unwrap();
+        assert_eq!(manifest.comparator_name, "default");
+    }
+
+    #[test]
+    fn manifest_with_comparator_name_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("manifest");
+
+        write_test_manifest(&path, Some("u64-big-endian"));
+
+        let reader = sfa::Reader::new(&path).unwrap();
+        let manifest = Manifest::decode_from(&path, &reader).unwrap();
+        assert_eq!(manifest.comparator_name, "u64-big-endian");
+    }
+
+    #[test]
+    fn manifest_rejects_oversized_comparator_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("manifest");
+
+        let long_name = "x".repeat(300);
+        write_test_manifest(&path, Some(&long_name));
+
+        let reader = sfa::Reader::new(&path).unwrap();
+        let result = Manifest::decode_from(&path, &reader);
+        assert!(
+            matches!(result, Err(crate::Error::DecompressedSizeTooLarge { .. })),
+            "expected DecompressedSizeTooLarge"
+        );
+    }
+}
