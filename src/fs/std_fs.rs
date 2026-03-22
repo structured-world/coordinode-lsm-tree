@@ -140,6 +140,8 @@ impl Fs for StdFs {
     }
 
     fn sync_directory(&self, path: &Path) -> io::Result<()> {
+        // Mirrors crate::file::fsync_directory — debug_assert only, matching
+        // existing codebase convention. Callers are internal and always pass dirs.
         #[cfg(not(target_os = "windows"))]
         {
             let dir = File::open(path)?;
@@ -147,6 +149,7 @@ impl Fs for StdFs {
             dir.sync_all()
         }
 
+        // Windows cannot fsync directories — no-op, same as crate::file::fsync_directory.
         #[cfg(target_os = "windows")]
         {
             let _ = path;
@@ -202,6 +205,7 @@ mod sys {
         // https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-lockfileex
         const LOCKFILE_EXCLUSIVE_LOCK: u32 = 0x0000_0002;
 
+        #[allow(non_snake_case)]
         unsafe extern "system" {
             fn LockFileEx(
                 h_file: *mut std::ffi::c_void,
@@ -223,7 +227,7 @@ mod sys {
         }
 
         let handle = file.as_raw_handle();
-        let mut overlapped: Overlapped = Overlapped {
+        let mut overlapped = Overlapped {
             internal: 0,
             internal_high: 0,
             offset: 0,
