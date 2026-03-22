@@ -746,12 +746,16 @@ fn multi_level_sparse_keyspace_data_integrity() -> crate::Result<()> {
     );
 
     // Phase 2: Flush narrow-range L0 tables and trigger multi-level.
-    // Use same target_size=256 so L1 stays "oversized" from Phase 1,
-    // and flush enough L0 tables that L0 score > L1 score.
+    // Use LARGER target_size (1024) than Phase 1 (256) so that:
+    //   L1 target = 1024 * 4 = 4096 bytes
+    //   L1 score = L1_bytes / 4096 ≈ 1.x–3.x  (L1 has a few KB from Phase 1)
+    //   L0 score = 20 / 4 = 5.0 > L1 score    (L0 wins → multi-level path)
+    // With Phase 1's target_size=256 (L1 target=1024), L1 score would be
+    // too high (~10+) and L1 would outscore L0.
     let multi = Arc::new(
         Strategy::default()
             .with_multi_level(true)
-            .with_table_target_size(256)
+            .with_table_target_size(1024)
             .with_l0_threshold(4),
     );
 
@@ -772,6 +776,8 @@ fn multi_level_sparse_keyspace_data_integrity() -> crate::Result<()> {
     let result = tree.compact(multi.clone(), seqno)?;
 
     // Verify multi-level path fired (L0 won scoring, L1 oversized → L0+L1→L2).
+    // tables_in must exceed L0 table count (20) because multi-level includes
+    // ALL L1 tables plus any overlapping L2 tables.
     assert_eq!(
         result.action,
         crate::compaction::CompactionAction::Merged,
@@ -781,6 +787,11 @@ fn multi_level_sparse_keyspace_data_integrity() -> crate::Result<()> {
         result.dest_level.is_some_and(|lvl| lvl >= 2),
         "multi-level skip should target L2+, got {:?}",
         result.dest_level,
+    );
+    assert!(
+        result.tables_in > 20,
+        "multi-level should include L0 (20) + L1 + L2 overlap tables, got {}",
+        result.tables_in,
     );
 
     // All data must be readable — both sparse keys and gap keys.
