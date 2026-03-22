@@ -35,6 +35,9 @@ fn check_size_cap(len: usize) -> crate::Result<()> {
     Ok(())
 }
 
+// Note: these constants are `pub` for crate-internal use but the parent
+// `vlog` module is NOT exported from `lib.rs`, so they are not public API.
+
 /// V3 blob frame magic (no header checksum).
 pub const BLOB_HEADER_MAGIC_V3: &[u8] = b"BLOB";
 

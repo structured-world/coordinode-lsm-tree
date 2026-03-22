@@ -36,6 +36,8 @@ macro_rules! read_u128 {
 
 pub const METADATA_HEADER_MAGIC: &[u8] = b"META";
 
+// Note: `pub` for crate-internal use; parent `vlog` module is NOT
+// exported from `lib.rs`, so this struct is not public API.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Metadata {
     pub id: BlobFileId,
