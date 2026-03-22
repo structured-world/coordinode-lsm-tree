@@ -390,6 +390,11 @@ mod tests {
     fn test_compare_prefixed_slice_custom_comparator() {
         use std::cmp::Ordering::{Equal, Greater, Less};
 
+        assert_eq!(
+            crate::comparator::UserComparator::name(&ReverseComparator),
+            "test-reverse",
+        );
+
         // With reverse comparator, "abc" > "xyz" (reversed)
         assert_eq!(
             Greater,
