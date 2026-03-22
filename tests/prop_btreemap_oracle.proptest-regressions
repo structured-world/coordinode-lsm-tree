@@ -1,8 +1,0 @@
-# Seeds for failure cases proptest has generated in the past. It is
-# automatically read and these particular cases re-run before any
-# novel cases are generated.
-#
-# It is recommended to check this file in to source control so that
-# everyone who runs the test benefits from these saved cases.
-cc d12c6b4c2e5de2b9686eeeeff703802486864df69b90ae26e636b7b31e1b6314 # shrinks to ops = [Insert { key_idx: 3, value: [0] }, Flush, Insert { key_idx: 0, value: [0] }, Insert { key_idx: 0, value: [0] }, Insert { key_idx: 0, value: [0] }, RemoveRange { start_idx: 0, end_idx: 2 }, Insert { key_idx: 2, value: [0] }, Flush, Remove { key_idx: 2 }, Flush]
-cc 39a8f147690d2da6eb1565240b32bb827ca8d0f1bd2101955ce3b4c7069c50bc # shrinks to ops = [Insert { key_idx: 2, value: [0] }, Flush, Insert { key_idx: 1, value: [0] }, Insert { key_idx: 0, value: [0] }, Insert { key_idx: 2, value: [0] }, Flush, Insert { key_idx: 0, value: [1] }, Flush, Insert { key_idx: 1, value: [0] }, Insert { key_idx: 1, value: [0] }]
