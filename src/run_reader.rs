@@ -116,6 +116,10 @@ impl Iterator for RunReader {
                 self.lo_reader = None;
                 self.lo += 1;
 
+                // Strict `<`: when lo reaches hi, this branch is skipped and
+                // the hi table is read via ensure_hi_initialized (which uses
+                // table.range() to respect the range end bound). `.iter()` is
+                // only used for middle tables that are fully consumed.
                 if self.lo < self.hi {
                     self.lo_reader = Some(Box::new(
                         #[expect(
