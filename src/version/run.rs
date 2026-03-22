@@ -153,6 +153,8 @@ impl<T: Ranged> Run<T> {
 
     /// Returns the sub slice of tables in the run that have
     /// a key range overlapping the input key range.
+    ///
+    /// Uses lexicographic ordering. For custom comparators, use [`get_overlapping_cmp`].
     pub fn get_overlapping<'a>(&'a self, key_range: &'a KeyRange) -> &'a [T] {
         let range = key_range.min()..=key_range.max();
 
