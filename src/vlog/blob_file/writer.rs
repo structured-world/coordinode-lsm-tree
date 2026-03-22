@@ -134,7 +134,7 @@ impl<FS: Fs> Writer<FS> {
     ) -> crate::Result<Self> {
         let path = path.as_ref();
 
-        let file = fs.open(path, &FsOpenOptions::new().write(true).create(true))?;
+        let file = fs.open(path, &FsOpenOptions::new().write(true).create_new(true))?;
         let writer = BufWriter::new(file);
         let writer = ChecksummedWriter::new(writer);
         let mut writer = sfa::Writer::from_writer(writer);
