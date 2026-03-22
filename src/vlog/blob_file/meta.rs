@@ -16,7 +16,7 @@ macro_rules! read_u64 {
     ($block:expr, $name:expr) => {{
         let bytes = $block
             .point_read($name, SeqNo::MAX)
-            .unwrap_or_else(|| panic!("meta property {:?} should exist", $name));
+            .ok_or(crate::Error::InvalidHeader("BlobFileMeta"))?;
 
         let mut bytes = &bytes.value[..];
         bytes.read_u64::<LittleEndian>()?
@@ -27,7 +27,7 @@ macro_rules! read_u128 {
     ($block:expr, $name:expr) => {{
         let bytes = $block
             .point_read($name, SeqNo::MAX)
-            .unwrap_or_else(|| panic!("meta property {:?} should exist", $name));
+            .ok_or(crate::Error::InvalidHeader("BlobFileMeta"))?;
 
         let mut bytes = &bytes.value[..];
         bytes.read_u128::<LittleEndian>()?
@@ -147,25 +147,22 @@ impl Metadata {
         let total_uncompressed_bytes = read_u64!(block, b"uncompressed_size");
 
         let compression = {
-            #[expect(clippy::expect_used, reason = "compression is expected to exist")]
             let bytes = block
                 .point_read(b"compression", SeqNo::MAX)
-                .expect("compression should exist");
+                .ok_or(crate::Error::InvalidHeader("BlobFileMeta"))?;
 
             let mut bytes = &bytes.value[..];
             CompressionType::decode_from(&mut bytes)?
         };
 
         let key_range = KeyRange::new((
-            #[expect(clippy::expect_used, reason = "key min is expected to exist")]
             block
                 .point_read(b"key#min", SeqNo::MAX)
-                .expect("key min should exist")
+                .ok_or(crate::Error::InvalidHeader("BlobFileMeta"))?
                 .value,
-            #[expect(clippy::expect_used, reason = "key max is expected to exist")]
             block
                 .point_read(b"key#max", SeqNo::MAX)
-                .expect("key max should exist")
+                .ok_or(crate::Error::InvalidHeader("BlobFileMeta"))?
                 .value,
         ));
 
@@ -186,6 +183,13 @@ impl Metadata {
 mod tests {
     use super::*;
     use test_log::test;
+
+    #[test]
+    fn test_blob_file_meta_corrupt_returns_err() {
+        // Truncated metadata (just the magic header) must return Err, not panic
+        let buf = Slice::from(METADATA_HEADER_MAGIC.to_vec());
+        assert!(Metadata::from_slice(&buf).is_err());
+    }
 
     #[test]
     #[expect(clippy::unwrap_used)]
