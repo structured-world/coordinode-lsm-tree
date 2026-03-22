@@ -21,7 +21,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::unix::io::AsRawFd;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::AtomicU64;
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 
@@ -527,7 +527,11 @@ impl RingThread {
         unsafe {
             if ring.submission().push(&sqe).is_err() {
                 // SQ full — flush current batch to make room, then retry.
-                let _ = ring.submit();
+                if let Err(e) = ring.submit() {
+                    let errno = e.raw_os_error().unwrap_or(5 /* EIO */);
+                    let _ = op.result_tx.send(-errno);
+                    return;
+                }
                 for cqe in ring.completion() {
                     let cid = cqe.user_data();
                     if let Some(tx) = pending.remove(&cid) {
@@ -535,8 +539,8 @@ impl RingThread {
                     }
                 }
                 if ring.submission().push(&sqe).is_err() {
-                    // Still full after flush — report ENOSPC to caller.
-                    let _ = op.result_tx.send(-28 /* ENOSPC */);
+                    // Still full after flush — io_uring ring is saturated.
+                    let _ = op.result_tx.send(-16 /* EBUSY */);
                     return;
                 }
             }
@@ -592,7 +596,10 @@ impl RingThread {
     /// Sends an operation to the ring thread and blocks on the result.
     fn send_and_wait(&self, op: Op, rx: mpsc::Receiver<i32>) -> io::Result<i32> {
         {
-            let guard = self.tx.lock().expect("ring thread tx lock poisoned");
+            let guard = self
+                .tx
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             let sender = guard.as_ref().ok_or_else(|| {
                 io::Error::new(io::ErrorKind::BrokenPipe, "io_uring thread shut down")
             })?;
@@ -618,9 +625,19 @@ impl Drop for RingThread {
     fn drop(&mut self) {
         // Drop the sender to close the channel — this unblocks the event
         // loop's recv() and lets it drain remaining in-flight ops.
-        *self.tx.get_mut().expect("tx lock poisoned") = None;
+        // Handle poison gracefully: during shutdown we only need to clear
+        // the sender and join the thread, regardless of prior panics.
+        let tx = match self.tx.get_mut() {
+            Ok(tx) => tx,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        *tx = None;
 
-        if let Some(handle) = self.handle.get_mut().expect("handle lock poisoned").take() {
+        let handle_slot = match self.handle.get_mut() {
+            Ok(h) => h,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let Some(handle) = handle_slot.take() {
             let _ = handle.join();
         }
     }
@@ -907,18 +924,22 @@ mod tests {
 
         for chunk_start in (0..1000).step_by(100) {
             let file = Arc::clone(&file);
-            handles.push(thread::spawn(move || {
+            handles.push(thread::spawn(move || -> io::Result<()> {
                 let mut buf = [0u8; 100];
-                let n = FsFile::read_at(file.as_ref(), &mut buf, chunk_start as u64).unwrap();
+                let n = FsFile::read_at(file.as_ref(), &mut buf, chunk_start as u64)?;
                 assert_eq!(n, 100);
                 for (i, &byte) in buf.iter().enumerate() {
                     assert_eq!(byte, ((chunk_start + i) % 256) as u8);
                 }
+                Ok(())
             }));
         }
 
         for h in handles {
-            h.join().expect("thread panicked");
+            match h.join() {
+                Ok(result) => result?,
+                Err(_) => return Err(io::Error::new(io::ErrorKind::Other, "thread panicked")),
+            }
         }
 
         Ok(())
