@@ -34,7 +34,18 @@ const MAX_HEIGHT: usize = 20;
 /// Sentinel offset meaning "no node".  Offset 0 is reserved in the arena.
 const UNSET: u32 = 0;
 
-/// Default arena capacity (64 MiB).
+/// Default arena capacity.
+///
+/// On 32-bit targets the virtual address space is limited (~3 GiB user),
+/// so a smaller default prevents OOM when multiple memtables coexist
+/// (e.g. in test suites).  The arena stores only key bytes and node
+/// metadata — values live in a separate heap-backed Vec — so 4 MiB
+/// handles tens of thousands of entries comfortably.
+#[cfg(target_pointer_width = "32")]
+const DEFAULT_ARENA_CAPACITY: u32 = 4 * 1024 * 1024;
+
+/// Default arena capacity (64 MiB) for 64-bit targets.
+#[cfg(not(target_pointer_width = "32"))]
 const DEFAULT_ARENA_CAPACITY: u32 = 64 * 1024 * 1024;
 
 // ---------------------------------------------------------------------------
@@ -1134,7 +1145,7 @@ mod tests {
     fn concurrent_inserts() {
         use std::sync::Arc;
 
-        let map = Arc::new(SkipMap::with_capacity(32 * 1024 * 1024));
+        let map = Arc::new(SkipMap::with_capacity(4 * 1024 * 1024));
         let n_threads = 8;
         let n_per_thread = 1000;
 
