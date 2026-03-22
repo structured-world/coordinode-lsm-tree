@@ -1803,7 +1803,7 @@ fn meta_seqno_kv_max_corruption_returns_invalid_data() -> crate::Result<()> {
         let trailer = sfa::Reader::from_reader(&mut f)?;
         let regions = ParsedRegions::parse_from_toc(trailer.toc())?;
 
-        let result = ParsedMeta::load_with_handle(&f, &regions.metadata);
+        let result = ParsedMeta::load_with_handle(&f, &regions.metadata, None);
 
         let err = result.expect_err("corrupted seqno#kv_max should cause an error");
         assert!(
