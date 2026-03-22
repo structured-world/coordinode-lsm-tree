@@ -377,51 +377,62 @@ impl Block {
             });
         }
 
-        let buf = crate::file::read_exact(file, *handle.offset(), handle.size() as usize)?;
+        // When encryption is active, read header and payload separately
+        // so the payload lands directly in an owned Vec — no intermediate
+        // Slice, no overlap of encrypted + decrypted buffers.
+        // When no encryption, read the whole block into a Slice (single I/O,
+        // zero-copy on the None-compression path).
+        let (header, data) = if let Some(enc) = encryption {
+            // Read header into a stack-sized buffer.
+            let header_len = Header::serialized_len();
+            let mut header_buf = vec![0u8; header_len];
+            let n = file.read_at(&mut header_buf, *handle.offset())?;
+            if n != header_len {
+                return Err(crate::Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "block header read_at: short read",
+                )));
+            }
+            let header_copy = Header::decode_from(&mut &header_buf[..])?;
 
-        let header = Header::decode_from(&mut &buf[..])?;
+            if u64::from(header_copy.data_length) > u64::from(MAX_DECOMPRESSION_SIZE) + enc_overhead
+            {
+                return Err(crate::Error::DecompressedSizeTooLarge {
+                    declared: u64::from(header_copy.data_length),
+                    limit: u64::from(MAX_DECOMPRESSION_SIZE) + enc_overhead,
+                });
+            }
 
-        let actual_data_len = buf.len().saturating_sub(Header::serialized_len());
+            if header_copy.uncompressed_length > MAX_DECOMPRESSION_SIZE {
+                return Err(crate::Error::DecompressedSizeTooLarge {
+                    declared: u64::from(header_copy.uncompressed_length),
+                    limit: u64::from(MAX_DECOMPRESSION_SIZE),
+                });
+            }
 
-        if header.data_length as usize != actual_data_len {
-            return Err(crate::Error::InvalidHeader("Block"));
-        }
+            // Read payload directly into a Vec — no Slice involved.
+            let payload_len = header_copy.data_length as usize;
+            let mut payload_vec = vec![0u8; payload_len];
+            let n = file.read_at(&mut payload_vec, *handle.offset() + header_len as u64)?;
+            if n != payload_len {
+                return Err(crate::Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "block payload read_at: short read",
+                )));
+            }
 
-        if header.uncompressed_length > MAX_DECOMPRESSION_SIZE {
-            return Err(crate::Error::DecompressedSizeTooLarge {
-                declared: u64::from(header.uncompressed_length),
-                limit: u64::from(MAX_DECOMPRESSION_SIZE),
-            });
-        }
-
-        #[expect(clippy::indexing_slicing)]
-        let checksum = Checksum::from_raw(crate::hash::hash128(&buf[Header::serialized_len()..]));
-
-        checksum.check(header.checksum).inspect_err(|_| {
-            log::error!(
-                "Checksum mismatch for block {handle:?}, got={}, expected={}",
-                checksum,
-                header.checksum,
-            );
-        })?;
-
-        // When encryption is active, copy the payload into an owned Vec and
-        // explicitly drop the original Slice before decrypting in-place.
-        // This reduces peak memory from (Slice + decrypted Vec) to
-        // max(Slice, Vec) — the two never coexist.
-        let data = if let Some(enc) = encryption {
-            #[expect(
-                clippy::indexing_slicing,
-                reason = "header was decoded from buf, so it has at least Header::serialized_len() bytes"
-            )]
-            let payload_vec = buf[Header::serialized_len()..].to_vec();
-            // Explicitly drop the original Slice so it is released before
-            // decryption begins, reducing peak memory.
-            drop(buf);
+            let checksum = Checksum::from_raw(crate::hash::hash128(&payload_vec));
+            checksum.check(header_copy.checksum).inspect_err(|_| {
+                log::error!(
+                    "Checksum mismatch for block {handle:?}, got={}, expected={}",
+                    checksum,
+                    header_copy.checksum,
+                );
+            })?;
 
             let decrypted = enc.decrypt_vec(payload_vec)?;
 
-            match compression {
+            let data = match compression {
                 CompressionType::None => {
                     #[expect(
                         clippy::cast_possible_truncation,
@@ -429,7 +440,7 @@ impl Block {
                     )]
                     let actual_len = decrypted.len() as u32;
 
-                    if header.uncompressed_length != actual_len {
+                    if header_copy.uncompressed_length != actual_len {
                         return Err(crate::Error::InvalidHeader("Block"));
                     }
 
@@ -438,12 +449,12 @@ impl Block {
 
                 #[cfg(feature = "lz4")]
                 CompressionType::Lz4 => {
-                    let mut decompressed = vec![0u8; header.uncompressed_length as usize];
+                    let mut decompressed = vec![0u8; header_copy.uncompressed_length as usize];
 
                     let bytes_written = lz4_flex::decompress_into(&decrypted, &mut decompressed)
                         .map_err(|_| crate::Error::Decompress(compression))?;
 
-                    if bytes_written != header.uncompressed_length as usize {
+                    if bytes_written != header_copy.uncompressed_length as usize {
                         return Err(crate::Error::Decompress(compression));
                     }
 
@@ -452,19 +463,52 @@ impl Block {
 
                 #[cfg(feature = "zstd")]
                 CompressionType::Zstd(_) => {
-                    let decompressed =
-                        zstd::bulk::decompress(&decrypted, header.uncompressed_length as usize)
-                            .map_err(|_| crate::Error::Decompress(compression))?;
+                    let decompressed = zstd::bulk::decompress(
+                        &decrypted,
+                        header_copy.uncompressed_length as usize,
+                    )
+                    .map_err(|_| crate::Error::Decompress(compression))?;
 
-                    if decompressed.len() != header.uncompressed_length as usize {
+                    if decompressed.len() != header_copy.uncompressed_length as usize {
                         return Err(crate::Error::Decompress(compression));
                     }
 
                     Slice::from(decompressed)
                 }
-            }
+            };
+
+            (header_copy, data)
         } else {
-            match compression {
+            // Single I/O read — header + payload in one Slice.
+            let buf = crate::file::read_exact(file, *handle.offset(), handle.size() as usize)?;
+
+            let header_copy = Header::decode_from(&mut &buf[..])?;
+
+            let actual_data_len = buf.len().saturating_sub(Header::serialized_len());
+            if header_copy.data_length as usize != actual_data_len {
+                return Err(crate::Error::InvalidHeader("Block"));
+            }
+
+            if header_copy.uncompressed_length > MAX_DECOMPRESSION_SIZE {
+                return Err(crate::Error::DecompressedSizeTooLarge {
+                    declared: u64::from(header_copy.uncompressed_length),
+                    limit: u64::from(MAX_DECOMPRESSION_SIZE),
+                });
+            }
+
+            #[expect(clippy::indexing_slicing)]
+            let checksum =
+                Checksum::from_raw(crate::hash::hash128(&buf[Header::serialized_len()..]));
+
+            checksum.check(header_copy.checksum).inspect_err(|_| {
+                log::error!(
+                    "Checksum mismatch for block {handle:?}, got={}, expected={}",
+                    checksum,
+                    header_copy.checksum,
+                );
+            })?;
+
+            let data = match compression {
                 CompressionType::None => {
                     let value = buf.slice(Header::serialized_len()..);
 
@@ -474,7 +518,7 @@ impl Block {
                     )]
                     let actual_len = value.len() as u32;
 
-                    if header.uncompressed_length != actual_len {
+                    if header_copy.uncompressed_length != actual_len {
                         return Err(crate::Error::InvalidHeader("Block"));
                     }
 
@@ -486,13 +530,13 @@ impl Block {
                     #[expect(clippy::indexing_slicing)]
                     let compressed_data = &buf[Header::serialized_len()..];
 
-                    let mut decompressed = vec![0u8; header.uncompressed_length as usize];
+                    let mut decompressed = vec![0u8; header_copy.uncompressed_length as usize];
 
                     let bytes_written =
                         lz4_flex::decompress_into(compressed_data, &mut decompressed)
                             .map_err(|_| crate::Error::Decompress(compression))?;
 
-                    if bytes_written != header.uncompressed_length as usize {
+                    if bytes_written != header_copy.uncompressed_length as usize {
                         return Err(crate::Error::Decompress(compression));
                     }
 
@@ -506,17 +550,19 @@ impl Block {
 
                     let decompressed = zstd::bulk::decompress(
                         compressed_data,
-                        header.uncompressed_length as usize,
+                        header_copy.uncompressed_length as usize,
                     )
                     .map_err(|_| crate::Error::Decompress(compression))?;
 
-                    if decompressed.len() != header.uncompressed_length as usize {
+                    if decompressed.len() != header_copy.uncompressed_length as usize {
                         return Err(crate::Error::Decompress(compression));
                     }
 
                     Slice::from(decompressed)
                 }
-            }
+            };
+
+            (header_copy, data)
         };
 
         Ok(Self { header, data })
