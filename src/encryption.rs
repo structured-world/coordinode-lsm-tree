@@ -125,14 +125,14 @@ impl Aes256GcmProvider {
 ///
 /// Returns the RNG directly (not `Result`) because callers are
 /// `thread_local!` init and fork-reseed, neither of which can propagate
-/// errors. `OsRng` is infallible on all platforms we target.
+/// errors. This function will panic if OS entropy is unavailable.
 #[cfg(feature = "encryption")]
 fn new_chacha_rng() -> rand_chacha::ChaCha20Rng {
     use rand_core::SeedableRng;
 
     #[expect(
         clippy::expect_used,
-        reason = "OsRng infallible on supported platforms"
+        reason = "intentionally panics if OsRng is unavailable"
     )]
     rand_chacha::ChaCha20Rng::from_rng(rand_core::OsRng)
         .expect("OS RNG should be available for initial CSPRNG seed")
