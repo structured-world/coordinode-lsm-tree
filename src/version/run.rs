@@ -330,6 +330,8 @@ mod tests {
     use super::*;
     use test_log::test;
 
+    use crate::comparator::DefaultUserComparator;
+
     #[derive(Clone)]
     struct FakeTable {
         id: u64,
@@ -346,6 +348,15 @@ mod tests {
         FakeTable {
             id,
             key_range: KeyRange::new((min.as_bytes().into(), max.as_bytes().into())),
+        }
+    }
+
+    /// Reverse comparator for testing non-lexicographic ordering.
+    struct ReverseCmp;
+
+    impl UserComparator for ReverseCmp {
+        fn compare(&self, a: &[u8], b: &[u8]) -> std::cmp::Ordering {
+            b.cmp(a)
         }
     }
 
@@ -572,5 +583,103 @@ mod tests {
                 .map(|x| x.id)
                 .collect::<Vec<_>>(),
         );
+    }
+
+    #[test]
+    fn push_cmp_sorts_by_comparator() {
+        let mut run = Run::new(vec![s(0, "a", "d")]).unwrap();
+
+        // With default (lexicographic) comparator, "e" > "a" → appended after
+        run.push_cmp(s(1, "e", "j"), &DefaultUserComparator);
+        assert_eq!(0, run[0].id);
+        assert_eq!(1, run[1].id);
+
+        // With reverse comparator, "k" is "smaller" than "e" → sorted before
+        let mut rev_run = Run::new(vec![s(0, "e", "j")]).unwrap();
+        rev_run.push_cmp(s(1, "k", "o"), &ReverseCmp);
+        // Reverse order: k > e lexicographically, but ReverseCmp reverses → k < e
+        assert_eq!(1, rev_run[0].id); // "k" sorts first in reverse
+        assert_eq!(0, rev_run[1].id); // "e" sorts second in reverse
+    }
+
+    #[test]
+    fn get_overlapping_cmp_reverse() {
+        // With reverse comparator, SST key ranges store (comparator-min, comparator-max).
+        // Reverse comparator-min is the lexicographic max, so min > max lexicographically.
+        // Run sorted by comparator-min: z, o, j, d (descending lexicographic).
+        let items = vec![
+            s(3, "z", "p"),
+            s(2, "o", "k"),
+            s(1, "j", "e"),
+            s(0, "d", "a"),
+        ];
+        let run = Run(items);
+
+        let result = run
+            .get_overlapping_cmp(&KeyRange::new((b"j".into(), b"j".into())), &ReverseCmp)
+            .iter()
+            .map(|x| x.id)
+            .collect::<Vec<_>>();
+        assert_eq!(&[1], &*result);
+
+        let result = run
+            .get_overlapping_cmp(&KeyRange::new((b"o".into(), b"e".into())), &ReverseCmp)
+            .iter()
+            .map(|x| x.id)
+            .collect::<Vec<_>>();
+        assert_eq!(&[2, 1], &*result);
+    }
+
+    #[test]
+    fn range_overlap_indexes_cmp_reverse() {
+        let items = vec![
+            s(3, "z", "p"),
+            s(2, "o", "k"),
+            s(1, "j", "e"),
+            s(0, "d", "a"),
+        ];
+        let run = Run(items);
+        let cmp = ReverseCmp;
+
+        assert_eq!(
+            Some((0, 3)),
+            run.range_overlap_indexes_cmp::<&[u8], _>(&.., &cmp)
+        );
+
+        // Inclusive range covering one table (z..=p in reverse = first table)
+        assert_eq!(
+            Some((0, 0)),
+            run.range_overlap_indexes_cmp(&(b"z" as &[u8]..=b"p"), &cmp)
+        );
+
+        // Inclusive range covering two tables (z..=k)
+        assert_eq!(
+            Some((0, 1)),
+            run.range_overlap_indexes_cmp(&(b"z" as &[u8]..=b"k"), &cmp)
+        );
+
+        // Out of range (beyond last table in reverse order)
+        assert!(run
+            .range_overlap_indexes_cmp(&(b"\x00" as &[u8]..=b"\x00"), &cmp)
+            .is_none());
+    }
+
+    #[test]
+    fn get_for_key_cmp_reverse() {
+        let items = vec![
+            s(3, "z", "p"),
+            s(2, "o", "k"),
+            s(1, "j", "e"),
+            s(0, "d", "a"),
+        ];
+        let run = Run(items);
+        let cmp = ReverseCmp;
+
+        assert_eq!(3, run.get_for_key_cmp(b"z", &cmp).unwrap().id);
+        assert_eq!(3, run.get_for_key_cmp(b"p", &cmp).unwrap().id);
+        assert_eq!(2, run.get_for_key_cmp(b"k", &cmp).unwrap().id);
+        assert_eq!(1, run.get_for_key_cmp(b"e", &cmp).unwrap().id);
+        assert_eq!(0, run.get_for_key_cmp(b"a", &cmp).unwrap().id);
+        assert!(run.get_for_key_cmp(b"\x00", &cmp).is_none());
     }
 }
