@@ -385,7 +385,12 @@ impl SkipMap {
     )]
     fn node_value_type(&self, node: u32) -> ValueType {
         let m = unsafe { self.meta(node) };
-        ValueType::try_from(m[10]).expect("valid ValueType discriminant")
+        let byte = m[10];
+        debug_assert!(
+            byte <= 4,
+            "invalid ValueType byte {byte} at node offset {node}, meta={m:?}",
+        );
+        ValueType::try_from(byte).expect("valid ValueType discriminant")
     }
 
     #[expect(

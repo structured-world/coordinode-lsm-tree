@@ -143,6 +143,10 @@ impl Arena {
     /// that the block pointer is visible.
     pub unsafe fn get_bytes(&self, offset: u32, len: u32) -> &[u8] {
         let (ptr, off) = self.decode(offset);
+        debug_assert!(
+            off + len as usize <= BLOCK_SIZE as usize,
+            "get_bytes: off={off} + len={len} exceeds BLOCK_SIZE={BLOCK_SIZE} (offset={offset})",
+        );
         // SAFETY: caller guarantees the range is allocated and initialised.
         std::slice::from_raw_parts(ptr.add(off), len as usize)
     }
