@@ -144,6 +144,69 @@ mod encrypted {
         Ok(())
     }
 
+    #[test]
+    fn encrypted_data_tamper_fails() -> lsm_tree::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let encryption = Arc::new(Aes256GcmProvider::new(&test_key()));
+
+        // Write and flush encrypted data
+        {
+            let tree = make_config(dir.path())
+                .data_block_compression_policy(lsm_tree::config::CompressionPolicy::all(
+                    lsm_tree::CompressionType::None,
+                ))
+                .with_encryption(Some(encryption.clone()))
+                .open()?;
+
+            tree.insert(b"secret", b"sensitive-value", 0);
+            tree.flush_active_memtable(0)?;
+        }
+        // Tree dropped — all files flushed
+
+        // Tamper with the SST file on disk
+        let sst_path = find_table_file(dir.path());
+        let mut sst_bytes = std::fs::read(&sst_path)?;
+
+        // Flip bytes in the middle of the data section (after the header)
+        let tamper_offset = sst_bytes.len() / 2;
+        for i in 0..8 {
+            if tamper_offset + i < sst_bytes.len() {
+                #[expect(clippy::indexing_slicing, reason = "bounds checked")]
+                {
+                    sst_bytes[tamper_offset + i] ^= 0xFF;
+                }
+            }
+        }
+        std::fs::write(&sst_path, &sst_bytes)?;
+
+        // Reopen the tree and attempt to read — should fail with
+        // checksum mismatch or decryption error, either during open
+        // (table recovery reads meta/index blocks) or during get().
+        let open_result = make_config(dir.path())
+            .data_block_compression_policy(lsm_tree::config::CompressionPolicy::all(
+                lsm_tree::CompressionType::None,
+            ))
+            .with_encryption(Some(encryption))
+            .open();
+
+        match open_result {
+            Err(_) => {
+                // Tamper detected during recovery — expected
+            }
+            Ok(tree) => {
+                // Recovery succeeded (tamper was in data block, not meta/index).
+                // The read must fail.
+                let result = tree.get(b"secret", u64::MAX);
+                assert!(
+                    result.is_err(),
+                    "reading tampered encrypted data should fail, got: {result:?}"
+                );
+            }
+        }
+
+        Ok(())
+    }
+
     fn find_table_file(dir: &std::path::Path) -> std::path::PathBuf {
         // Table files live in the `tables/` subdirectory, named by numeric ID
         let tables_dir = dir.join("tables");
