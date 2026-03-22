@@ -89,6 +89,11 @@ pub struct Memtable {
     /// starvation is not a concern here: range deletes are rare, the write-side
     /// critical section is O(log n) with n typically small, and the memtable
     /// rotates (becoming read-only) well before contention could accumulate.
+    // NOTE: The interval tree uses lexicographic `Ord` on `UserKey` for
+    // containment queries. With a custom comparator, RT suppression in
+    // the memtable may produce incorrect results for non-lexicographic
+    // orderings. Threading the comparator into the AVL tree is tracked
+    // as a follow-up issue.
     pub(crate) range_tombstones: RwLock<interval_tree::IntervalTree>,
 
     /// Approximate active memtable size.
