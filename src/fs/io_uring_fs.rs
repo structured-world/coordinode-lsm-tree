@@ -683,6 +683,7 @@ mod tests {
     use super::*;
     use std::io::{Read, Write};
     use std::sync::Arc;
+    // Shadows #[test] to enable log capture in test output.
     use test_log::test;
 
     /// Returns an `IoUringFs` or `None` if not available (e.g. old kernel,
