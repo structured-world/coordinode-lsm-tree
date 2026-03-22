@@ -275,7 +275,8 @@ impl Drop for Arena {
         for block in &*self.blocks {
             let ptr = block.load(Ordering::Relaxed);
             if !ptr.is_null() {
-                // SAFETY: ptr was allocated via alloc_zeroed with block_layout().
+                // SAFETY: `ptr` was allocated for this arena using `block_layout()`,
+                // so deallocating with the same layout is valid.
                 unsafe {
                     std::alloc::dealloc(ptr, layout);
                 }

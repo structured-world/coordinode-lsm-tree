@@ -941,7 +941,7 @@ impl DoubleEndedIterator for Range<'_> {
             self.back_init = true;
         }
 
-        if self.back == UNSET {
+        if self.back == UNSET || self.front == UNSET {
             self.done = true;
             return None;
         }
