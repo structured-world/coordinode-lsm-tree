@@ -45,19 +45,18 @@ impl Scanner {
 
         let mut file = File::open(path)?;
         let sfa_reader = sfa::Reader::from_reader(&mut file)?;
-        let data_section = sfa_reader
-            .toc()
-            .section(b"data")
-            .ok_or(crate::Error::InvalidHeader(
-                "BlobFile: missing data section",
-            ))?;
+        let data_section = sfa_reader.toc().section(b"data").ok_or_else(|| {
+            log::error!("BlobFile: SFA TOC has no \"data\" section");
+            crate::Error::InvalidHeader("BlobFile")
+        })?;
         let data_start = data_section.pos();
-        let data_end =
-            data_start
-                .checked_add(data_section.len())
-                .ok_or(crate::Error::InvalidHeader(
-                    "BlobFile: data section offset overflow",
-                ))?;
+        let data_end = data_start.checked_add(data_section.len()).ok_or_else(|| {
+            log::error!(
+                "BlobFile: data section offset overflow (pos={data_start}, len={})",
+                data_section.len()
+            );
+            crate::Error::InvalidHeader("BlobFile")
+        })?;
 
         file.seek(std::io::SeekFrom::Start(data_start))?;
         let file_reader = BufReader::with_capacity(32_000, file);
