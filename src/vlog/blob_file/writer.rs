@@ -241,9 +241,9 @@ impl Writer {
             compressed_len_u32,
         );
 
-        // Data checksum includes header_crc bytes so that even if an
-        // attacker recomputes header_crc after tampering header fields,
-        // the data checksum still detects the change.
+        // Data checksum includes header_crc bytes so that changes to header
+        // fields without correspondingly updating the data checksum will be
+        // detected as an inconsistency between header and data.
         let checksum = {
             let mut hasher = xxhash_rust::xxh3::Xxh3::default();
             hasher.update(key);

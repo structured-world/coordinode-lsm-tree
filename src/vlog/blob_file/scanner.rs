@@ -247,8 +247,9 @@ mod tests {
         let mut raw = std::fs::read(&blob_file_path)?;
         let frame_start = 0usize;
 
-        // Tamper value payload: frame_start + header(42) + key(3)
-        let value_offset = frame_start + BLOB_HEADER_LEN_V4 + 3;
+        // Tamper value payload: frame_start + header + key
+        let key = b"key";
+        let value_offset = frame_start + BLOB_HEADER_LEN_V4 + key.len();
         raw[value_offset] ^= 0xFF;
         std::fs::write(&blob_file_path, &raw)?;
 
