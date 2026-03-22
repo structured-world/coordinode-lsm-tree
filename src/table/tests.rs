@@ -1465,6 +1465,8 @@ fn rt_block(data: Vec<u8>) -> Block {
 /// with the given field and expected byte offset.
 fn assert_rt_decode_error(data: Vec<u8>, expected_field: &str, expected_offset: u64) {
     let block = rt_block(data);
+    // Uses DefaultUserComparator: tests verify structural decode errors
+    // (truncation, missing fields), not comparator-dependent ordering.
     match Table::decode_range_tombstones(&block, &crate::comparator::DefaultUserComparator) {
         Err(crate::Error::RangeTombstoneDecode { field, offset }) => {
             assert_eq!(
