@@ -750,7 +750,13 @@ impl CompactionStrategy for Strategy {
 
                         // Include overlapping L2 tables — query per input table
                         // range instead of one coarse aggregate to avoid pulling
-                        // in gap-filling L2 tables on sparse keyspaces (#72)
+                        // in gap-filling L2 tables on sparse keyspaces (#72).
+                        //
+                        // NOTE: If output compresses into fewer tables than
+                        // inputs, an output table's key_range may span a gap
+                        // and overlap an excluded L2 table. This is safe:
+                        // optimize_runs() will place them into separate runs,
+                        // and a future L2 compaction merges them back.
                         for table in first_level
                             .iter()
                             .flat_map(|run| run.iter())
