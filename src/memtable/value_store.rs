@@ -232,6 +232,10 @@ impl Drop for ValueStore {
             )]
             let layout =
                 std::alloc::Layout::array::<UserValue>(SEGMENT_SIZE).expect("segment layout");
+            // SAFETY: `seg_ptr` came from `alloc_zeroed(layout)` in
+            // `ensure_segment()`, all initialised entries were dropped above,
+            // and `Drop` has exclusive access — so this frees that allocation
+            // exactly once with the original layout.
             unsafe {
                 std::alloc::dealloc(seg_ptr.cast::<u8>(), layout);
             }
