@@ -205,7 +205,9 @@ mod sys {
         // https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-lockfileex
         const LOCKFILE_EXCLUSIVE_LOCK: u32 = 0x0000_0002;
 
-        #[allow(non_snake_case)]
+        // allow (not expect) — this block only compiles on Windows, so #[expect]
+        // would fire "unfulfilled lint expectation" on other platforms.
+        #[allow(non_snake_case)] // FFI name matches Windows API
         unsafe extern "system" {
             fn LockFileEx(
                 h_file: *mut std::ffi::c_void,
