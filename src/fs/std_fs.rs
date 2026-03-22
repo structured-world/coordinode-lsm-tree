@@ -78,7 +78,11 @@ impl FsFile for File {
 
         #[cfg(not(any(unix, windows)))]
         {
-            compile_error!("unsupported platform");
+            let _ = (buf, offset);
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "read_at is not supported on this platform",
+            ))
         }
     }
 
