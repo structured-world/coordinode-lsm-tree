@@ -219,9 +219,11 @@ fn compare_prefixed_slice_lexicographic(
         return Greater;
     }
 
+    // SAFETY: rest_len == 0 means prefix.len() <= needle.len(), so
+    // max_pfx_len == prefix.len() <= needle.len() and needle[max_pfx_len..] is in-bounds.
     #[expect(
         unsafe_code,
-        reason = "max_pfx_len is min(prefix.len(), needle.len()), so needle[max_pfx_len..] is always in-bounds"
+        reason = "max_pfx_len <= needle.len() guaranteed by rest_len == 0 guard above"
     )]
     let remaining_needle = unsafe { needle.get_unchecked(max_pfx_len..) };
     suffix.cmp(remaining_needle)
@@ -355,6 +357,42 @@ mod tests {
         assert_eq!(
             Greater,
             compare_prefixed_slice(&[0xFF], &[], &[0x10], &DefaultUserComparator)
+        );
+    }
+
+    /// Reverse comparator to exercise the Vec-allocation slow path.
+    struct ReverseComparator;
+    impl crate::comparator::UserComparator for ReverseComparator {
+        fn compare(&self, a: &[u8], b: &[u8]) -> std::cmp::Ordering {
+            b.cmp(a)
+        }
+    }
+
+    #[test]
+    fn test_compare_prefixed_slice_custom_comparator() {
+        use std::cmp::Ordering::{Equal, Greater, Less};
+
+        // With reverse comparator, "abc" > "xyz" (reversed)
+        assert_eq!(
+            Greater,
+            compare_prefixed_slice(b"ab", b"c", b"xyz", &ReverseComparator)
+        );
+        assert_eq!(
+            Less,
+            compare_prefixed_slice(b"xy", b"z", b"abc", &ReverseComparator)
+        );
+        assert_eq!(
+            Equal,
+            compare_prefixed_slice(b"ab", b"c", b"abc", &ReverseComparator)
+        );
+        // Empty cases
+        assert_eq!(
+            Equal,
+            compare_prefixed_slice(b"", b"", b"", &ReverseComparator)
+        );
+        assert_eq!(
+            Less, // reversed: non-empty > empty
+            compare_prefixed_slice(b"a", b"", b"", &ReverseComparator)
         );
     }
 }

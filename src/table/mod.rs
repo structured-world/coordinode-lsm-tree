@@ -585,7 +585,7 @@ impl Table {
                 )));
             }
 
-            let mut rts = Self::decode_range_tombstones(&block)?;
+            let mut rts = Self::decode_range_tombstones(&block, comparator.as_ref())?;
             // Sort range tombstones by (start asc, seqno desc) using the
             // user comparator so the order matches the tree's key ordering.
             // The seqno-desc tiebreaker ensures higher-seqno RTs are checked
@@ -679,7 +679,10 @@ impl Table {
         clippy::cast_possible_truncation,
         reason = "block sizes are bounded well within usize on all supported platforms"
     )]
-    fn decode_range_tombstones(block: &Block) -> crate::Result<Vec<RangeTombstone>> {
+    fn decode_range_tombstones(
+        block: &Block,
+        comparator: &dyn crate::comparator::UserComparator,
+    ) -> crate::Result<Vec<RangeTombstone>> {
         use byteorder::{ReadBytesExt, LE};
         use std::io::Cursor;
 
@@ -759,8 +762,9 @@ impl Table {
             let start = UserKey::from(start_buf);
             let end = UserKey::from(end_buf);
 
-            // Validate invariant: start < end (reject corrupted data)
-            if start >= end {
+            // Validate invariant: start < end using the tree's comparator
+            // (reject corrupted or misordered intervals)
+            if comparator.compare(&start, &end) != std::cmp::Ordering::Less {
                 log::error!("Range tombstone block: invalid interval (start >= end)");
                 return Err(crate::Error::RangeTombstoneDecode {
                     field: "interval",
