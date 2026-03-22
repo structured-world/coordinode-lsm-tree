@@ -308,13 +308,20 @@ impl TreeIter {
                                     // Demote to single-table path so it also
                                     // benefits from the range-tombstone table-skip
                                     // optimization below.
-                                    #[expect(clippy::unwrap_used, reason = "length checked above")]
-                                    single_tables.push(surviving.into_iter().next().unwrap());
+                                    if let Some(table) = surviving.into_iter().next() {
+                                        single_tables.push(table);
+                                    }
                                 }
                                 _ => {
-                                    if let Some(new_run) = Run::new(surviving) {
-                                        multi_runs.push(Arc::new(new_run));
-                                    }
+                                    // surviving.len() >= 2, so Run::new cannot
+                                    // return None (only empty vecs yield None).
+                                    #[expect(
+                                        clippy::expect_used,
+                                        reason = "Run::new returns None only for empty vecs"
+                                    )]
+                                    let new_run =
+                                        Run::new(surviving).expect("non-empty surviving tables");
+                                    multi_runs.push(Arc::new(new_run));
                                 }
                             }
                         } else {

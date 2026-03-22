@@ -610,6 +610,11 @@ fn prefix_bloom_multi_table_run_bloom_rejection() -> lsm_tree::Result<()> {
     //
     // Scanning "b:" has bounds [b:, b;). Table 1 overlaps (a:1 < b: < c:9),
     // but "b:" was never written → bloom returns Ok(false).
+    //
+    // False-positive note: each table has 18 keys + 9 prefixes = 27 hashes
+    // at the default 10 bits-per-key, giving a bloom with ~270 bits. The
+    // probability that a single random probe returns a false positive is
+    // ≈0.8% — negligible for a deterministic test with fixed keys.
     for i in 1..=9 {
         tree.insert(format!("a:{i}"), "v", i - 1);
         tree.insert(format!("c:{i}"), "v", 9 + i - 1);
