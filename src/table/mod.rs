@@ -889,6 +889,44 @@ impl Table {
         self.bloom_may_contain_hash(key_hash)
     }
 
+    /// Checks the bloom filter for a key, with partition-aware seeking.
+    ///
+    /// Unlike [`bloom_may_contain_key_hash`](Self::bloom_may_contain_key_hash)
+    /// which falls back to `Ok(true)` for partitioned filters, this method
+    /// uses the user key to seek the partition index and check only the
+    /// matching partition's bloom filter.
+    pub(crate) fn bloom_may_contain_key(&self, key: &[u8], key_hash: u64) -> crate::Result<bool> {
+        // Full (non-partitioned) filter — delegate to hash-only path
+        if self.pinned_filter_block.is_some() {
+            return self.bloom_may_contain_hash(key_hash);
+        }
+
+        // Partitioned filter with pinned TLI — seek to the matching partition
+        if let Some(filter_idx) = &self.pinned_filter_index {
+            let mut iter = filter_idx.iter(self.comparator.clone());
+            iter.seek(key, SeqNo::MAX);
+
+            if let Some(filter_block_handle) = iter.next() {
+                let filter_block_handle = filter_block_handle.materialize(filter_idx.as_slice());
+
+                let block = self.load_block(
+                    &filter_block_handle.into_inner(),
+                    BlockType::Filter,
+                    CompressionType::None,
+                )?;
+                let block = FilterBlock::new(block);
+                return block.maybe_contains_hash(key_hash);
+            }
+
+            // Key is beyond all partition boundaries — definitely absent
+            return Ok(false);
+        }
+
+        // Unpinned filter — fall through to hash-only path (handles both
+        // unpinned full filters and the no-filter case)
+        self.bloom_may_contain_hash(key_hash)
+    }
+
     /// Returns the highest effective sequence number in the table.
     ///
     /// For tables produced by flush/compaction (`global_seqno == 0`), this

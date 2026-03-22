@@ -821,6 +821,7 @@ impl Tree {
         use crate::range::{IterState, TreeIter};
 
         let key_hash = crate::table::filter::standard_bloom::Builder::get_hash(key);
+        let bloom_key = crate::Slice::from(key);
         let comparator = version.active_memtable.comparator.clone();
 
         let iter_state = IterState {
@@ -830,6 +831,7 @@ impl Tree {
             comparator,
             prefix_hash: None,
             key_hash: Some(key_hash),
+            bloom_key: Some(bloom_key),
             #[cfg(feature = "metrics")]
             metrics: None,
         };
@@ -906,6 +908,7 @@ impl Tree {
             comparator,
             prefix_hash,
             key_hash: None,
+            bloom_key: None,
             #[cfg(feature = "metrics")]
             metrics: None,
         };
@@ -1295,6 +1298,7 @@ impl Tree {
             comparator: self.config.comparator.clone(),
             prefix_hash,
             key_hash: None,
+            bloom_key: None,
             #[cfg(feature = "metrics")]
             metrics: Some(self.0.metrics.clone()),
         };
