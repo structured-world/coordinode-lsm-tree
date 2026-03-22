@@ -231,9 +231,10 @@ pub trait Fs: Send + Sync + 'static {
 
     /// Returns all entries in a directory (order is unspecified).
     ///
-    /// Eagerly collects results because `read_dir` is a cold-path
-    /// operation (recovery, compaction file listing). Callers that
-    /// need a specific order must sort the returned `Vec`.
+    /// Returns a `Vec` rather than a streaming iterator because
+    /// `read_dir` is a cold-path operation (recovery, compaction file
+    /// listing) where directory sizes are bounded by LSM level count.
+    /// Callers that need a specific order must sort the result.
     ///
     /// # Errors
     ///
