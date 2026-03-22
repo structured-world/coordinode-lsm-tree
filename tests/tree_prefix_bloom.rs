@@ -550,11 +550,16 @@ fn prefix_bloom_multi_table_run_skipping() -> lsm_tree::Result<()> {
     tree.insert("delta:2", "v8", 7);
     tree.flush_active_memtable(0)?;
 
-    // Verify we have multiple tables (multi-table run in L0).
+    // Verify L0 contains a multi-table run (not just single-table runs).
+    // optimize_runs fuses disjoint single-table runs into one multi-table
+    // run, so 4 disjoint flushes produce a single run with 4 tables.
+    let version = tree.current_version();
+    let l0 = version.level(0).expect("L0 should exist");
+    let max_run_len = l0.iter().map(|r| r.len()).max().unwrap_or(0);
     assert!(
-        tree.table_count() >= 4,
-        "expected >=4 tables, got {}",
-        tree.table_count(),
+        max_run_len >= 4,
+        "expected a multi-table run with >=4 tables in L0, \
+         but largest run has {max_run_len} table(s)",
     );
 
     // Each prefix scan should find exactly 2 keys — the bloom filter
