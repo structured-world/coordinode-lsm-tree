@@ -160,8 +160,6 @@ pub fn compare_prefixed_slice(
     needle: &[u8],
     cmp: &dyn crate::comparator::UserComparator,
 ) -> std::cmp::Ordering {
-    use std::cmp::Ordering::{Equal, Greater, Less};
-
     // Fast path: zero-allocation bytewise comparison for the default
     // (lexicographic) comparator. This is the hot path for block index
     // and data block binary searches.
