@@ -29,6 +29,19 @@ impl Workload for PrefixScan {
             .into());
         }
 
+        // Reject num values that exceed the u16 prefix × u16 suffix space.
+        let max_keys = u64::from(NUM_PREFIXES) * u64::from(u16::MAX);
+        if config.num > max_keys {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "prefixscan --num {} exceeds prefix corpus capacity ({max_keys})",
+                    config.num,
+                ),
+            )
+            .into());
+        }
+
         // Prefill with structured prefix keys.
         prefill_prefix_keys(tree, config, seqno, NUM_PREFIXES)?;
 

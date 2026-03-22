@@ -3,8 +3,8 @@ use crate::db::make_sequential_key;
 use crate::reporter::Reporter;
 use crate::workloads::Workload;
 use lsm_tree::{
-    config::BlockSizePolicy, AbstractTree, AnyTree, Cache, Config, MergeOperator,
-    SequenceNumberCounter, UserValue,
+    config::{BlockSizePolicy, CompressionPolicy},
+    AbstractTree, AnyTree, Cache, Config, MergeOperator, SequenceNumberCounter, UserValue,
 };
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -80,6 +80,7 @@ impl Workload for MergeRandom {
             SequenceNumberCounter::default(),
         )
         .data_block_size_policy(BlockSizePolicy::all(config.block_size))
+        .data_block_compression_policy(CompressionPolicy::all(config.compression.to_lsm()))
         .use_cache(cache)
         .with_merge_operator(Some(Arc::new(CounterMerge)))
         .open()?;

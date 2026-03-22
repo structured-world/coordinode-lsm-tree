@@ -155,7 +155,8 @@ fn run_single(
     cli: &Cli,
     github_entries: &mut Vec<serde_json::Value>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // Each benchmark gets a fresh temp directory.
+    // Each benchmark gets a fresh temp directory by default.
+    // With --db, all workloads share the same path (useful for read-after-fill).
     let _tmpdir;
     let db_path = match &cli.db {
         Some(p) => p.clone(),

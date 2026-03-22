@@ -16,6 +16,7 @@ jobs:
 
       - name: Generate bot token
         id: bot-token
+        if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
         uses: actions/create-github-app-token@v1
         with:
           app-id: ${{ secrets.RELEASER_APP_ID }}
@@ -31,6 +32,7 @@ jobs:
         run: bash .github/scripts/run-benchmarks.sh 200000
 
       - name: Store benchmark results
+        if: steps.bot-token.outputs.token != ''
         uses: benchmark-action/github-action-benchmark@v1
         with:
           name: "lsm-tree db_bench"
