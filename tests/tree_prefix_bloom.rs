@@ -243,6 +243,7 @@ fn prefix_bloom_unpinned_filter() -> lsm_tree::Result<()> {
     )
     .prefix_extractor(Arc::new(ColonSeparatedPrefix))
     .filter_block_pinning_policy(PinningPolicy::all(false))
+    .filter_block_partitioning_policy(PinningPolicy::all(false))
     .open()?;
 
     let tree = match tree {
@@ -257,6 +258,10 @@ fn prefix_bloom_unpinned_filter() -> lsm_tree::Result<()> {
     tree.insert("c:1", "v3", 2);
     tree.insert("d:1", "v4", 3);
     tree.flush_active_memtable(0)?;
+
+    // Compact to L1 — prefix bloom check only applies to single-table runs.
+    // With unpinned filters, maybe_contains_prefix hits the regions.filter path.
+    tree.major_compact(u64::MAX, 0)?;
 
     // Prefix scan on unpinned filters exercises the load_block fallback
     let results: Vec<_> = tree
