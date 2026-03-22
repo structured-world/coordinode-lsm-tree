@@ -1003,22 +1003,21 @@ fn merge_bloom_with_overlapping_non_matching_table() -> lsm_tree::Result<()> {
     let tree = open_tree_with_counter(&folder);
 
     // Table 1: wide key range [aaa, zzz] that does NOT contain "counter".
-    // Its key_range overlaps "counter" but bloom will reject it.
+    // Its key_range overlaps "counter"; bloom may reject it (best-effort).
     tree.insert("aaa", 0_i64.to_le_bytes(), 0);
     tree.insert("zzz", 0_i64.to_le_bytes(), 1);
     tree.flush_active_memtable(0)?;
 
-    // Table 2: contains "counter" base value — bloom will accept it.
+    // Table 2: contains "counter" base value.
     tree.insert("counter", 100_i64.to_le_bytes(), 2);
     tree.flush_active_memtable(0)?;
 
     // Merge operand in active memtable
     tree.merge("counter", 10_i64.to_le_bytes(), 3);
 
-    // resolve_merge_via_pipeline builds a key..=key range with bloom hash:
-    //   Table 1: key_range [aaa,zzz] overlaps "counter" ✓, bloom → Ok(false) → SKIP
-    //   Table 2: key_range [counter,counter] overlaps ✓, bloom → Ok(true) → INCLUDE
-    //   merge(Some(100), [10]) = 110
+    // resolve_merge_via_pipeline builds a key..=key range with bloom hash.
+    // Table 1 does not contain "counter" so it contributes nothing.
+    // merge(Some(100), [10]) = 110
     assert_eq!(Some(110), get_counter(&tree, "counter", 4));
 
     Ok(())

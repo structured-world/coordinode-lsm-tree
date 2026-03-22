@@ -869,9 +869,9 @@ fn prefix_bloom_skip_metrics_zero_without_extractor() -> lsm_tree::Result<()> {
 /// Prefix scan correctness when an L0 single-table run has a wide key range
 /// that overlaps the scanned prefix but does not contain any matching keys.
 /// Ensures the non-matching table does not affect scan results, independent of
-/// whether the prefix bloom rejects the scanned prefix.
+/// whether the prefix bloom happens to reject the scanned prefix.
 #[test]
-fn prefix_bloom_rejects_in_l0_single_table_run() -> lsm_tree::Result<()> {
+fn prefix_scan_l0_wide_non_matching_table_does_not_affect_results() -> lsm_tree::Result<()> {
     let folder = tempfile::tempdir()?;
     let tree = tree_with_prefix_bloom(&folder)?;
 

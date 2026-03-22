@@ -291,9 +291,11 @@ impl TreeIter {
                             );
                         }
 
-                        // If a prefix hash is available, filter individual tables
-                        // within the multi-table run using their bloom filters.
-                        if let Some(prefix_hash) = lock.prefix_hash {
+                        // If a prefix or key hash is available, filter individual
+                        // tables within the multi-table run using their bloom
+                        // filters. This covers both prefix scans (prefix_hash)
+                        // and point-read merge pipelines (key_hash).
+                        if lock.prefix_hash.is_some() || lock.key_hash.is_some() {
                             let bounds = (
                                 user_range.0.as_ref().map(std::convert::AsRef::as_ref),
                                 user_range.1.as_ref().map(std::convert::AsRef::as_ref),
@@ -308,27 +310,7 @@ impl TreeIter {
                                         return false;
                                     }
 
-                                    // On I/O error reading the filter, include the
-                                    // table conservatively to avoid missing data.
-                                    let contains = table
-                                        .maybe_contains_prefix(prefix_hash)
-                                        .inspect_err(|e| {
-                                            log::debug!(
-                                                "prefix bloom check failed for table {:?}: {e}",
-                                                table.id(),
-                                            );
-                                        })
-                                        .unwrap_or(true);
-
-                                    #[cfg(feature = "metrics")]
-                                    if !contains {
-                                        if let Some(m) = &lock.metrics {
-                                            m.prefix_bloom_skips
-                                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                        }
-                                    }
-
-                                    contains
+                                    bloom_passes(lock, table)
                                 })
                                 .cloned()
                                 .collect();
