@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1774207881168,
+  "lastUpdate": 1774210543896,
   "repoUrl": "https://github.com/structured-world/lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -624,6 +624,84 @@ window.BENCHMARK_DATA = {
             "value": 440066.027066635,
             "unit": "ops/sec",
             "extra": "P50: 2.0us | P99: 8.0us | P99.9: 16.1us\nthreads: 1 | elapsed: 0.45s | num: 200000"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "ec762361df54422c5bb7b75b3e387f56ffecd5ff",
+          "message": "refactor(fs): migrate crate::file::read_exact to FsFile::read_at (#111)\n\n## Summary\n\n- Change `file::read_exact()` to accept `&impl FsFile` instead of\n`&std::fs::File`, delegating to `FsFile::read_at()` and removing\nplatform-specific `#[cfg(unix)]`/`#[cfg(windows)]` code from the\nfunction\n- Propagate the `FsFile` trait bound to `Block::from_file`,\n`Table::read_tli`, and `ParsedMeta::load_with_handle`\n- Explicit deref `Arc<File>` at call sites where generic type inference\nrequires it\n\n## Technical Details\n\n`read_exact()` previously duplicated the platform-specific pread logic\nthat already exists in the `FsFile` trait impl for `std::fs::File`. This\nremoves that duplication and makes `read_exact()` work with any `FsFile`\nimplementation, enabling pluggable filesystem backends for the read\npath.\n\nNo behavioral changes — all existing callers pass `std::fs::File` which\nimplements `FsFile`.\n\n## Test Plan\n\n- All 431 unit tests pass\n- All integration tests pass\n- All proptest tests pass\n- `cargo clippy --lib` clean\n\nCloses #89",
+          "timestamp": "2026-03-22T22:10:10+02:00",
+          "tree_id": "bbbd96fc7c374efbda7bd19513ee30591f74145a",
+          "url": "https://github.com/structured-world/lsm-tree/commit/ec762361df54422c5bb7b75b3e387f56ffecd5ff"
+        },
+        "date": 1774210542617,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 2060406.9491221549,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 2.2us | P99.9: 5.2us\nthreads: 1 | elapsed: 0.10s | num: 200000"
+          },
+          {
+            "name": "fillrandom",
+            "value": 971130.9664016557,
+            "unit": "ops/sec",
+            "extra": "P50: 0.9us | P99: 1.9us | P99.9: 4.2us\nthreads: 1 | elapsed: 0.21s | num: 200000"
+          },
+          {
+            "name": "readrandom",
+            "value": 570777.7575830265,
+            "unit": "ops/sec",
+            "extra": "P50: 1.5us | P99: 5.5us | P99.9: 11.7us\nthreads: 1 | elapsed: 0.35s | num: 200000"
+          },
+          {
+            "name": "readseq",
+            "value": 2389207.6337429755,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 4.3us | P99.9: 8.8us\nthreads: 1 | elapsed: 0.08s | num: 200000"
+          },
+          {
+            "name": "seekrandom",
+            "value": 359190.0737966782,
+            "unit": "ops/sec",
+            "extra": "P50: 2.4us | P99: 6.5us | P99.9: 13.4us\nthreads: 1 | elapsed: 0.56s | num: 200000"
+          },
+          {
+            "name": "prefixscan",
+            "value": 189374.67841102267,
+            "unit": "ops/sec",
+            "extra": "P50: 4.9us | P99: 6.7us | P99.9: 16.2us\nthreads: 1 | elapsed: 1.06s | num: 200000"
+          },
+          {
+            "name": "overwrite",
+            "value": 930709.6788808693,
+            "unit": "ops/sec",
+            "extra": "P50: 0.8us | P99: 3.0us | P99.9: 9.7us\nthreads: 1 | elapsed: 0.21s | num: 200000"
+          },
+          {
+            "name": "mergerandom",
+            "value": 742389.502588677,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 0.5us | P99.9: 0.8us\nthreads: 1 | elapsed: 0.27s | num: 200000"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 459307.8084348388,
+            "unit": "ops/sec",
+            "extra": "P50: 1.9us | P99: 7.9us | P99.9: 16.9us\nthreads: 1 | elapsed: 0.44s | num: 200000"
           }
         ]
       }
