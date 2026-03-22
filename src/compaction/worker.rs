@@ -527,6 +527,11 @@ fn merge_tables(
 
             compactor.write(item)?;
 
+            // NOTE: When stop_signal fires mid-merge, the loop exits early but
+            // compaction proceeds to commit whatever was written so far. The
+            // resulting CompactionResult will report `Merged` even though not
+            // all input items were processed. This is pre-existing behavior:
+            // partial merge output is valid and committed to the version history.
             if idx % 1_000_000 == 0 && opts.stop_signal.is_stopped() {
                 log::debug!("Stopping amidst compaction because of stop signal");
                 return Ok(());
