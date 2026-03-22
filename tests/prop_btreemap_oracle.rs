@@ -1,8 +1,8 @@
 // Property-based model test: compare lsm-tree against BTreeMap oracle.
 //
 // The oracle models MVCC using (key, Reverse(seqno)) ordering, where
-// None values represent tombstones. Range tombstones are stored separately
-// and applied during reads.
+// None values represent point tombstones. Range tombstones are not modeled
+// here; they are covered by dedicated tests in range_tombstone.rs.
 //
 // Keys are 2–4 bytes with a small first-byte alphabet (0..4), so multiple
 // keys naturally share leading bytes and prefix scans exercise grouping,
@@ -24,7 +24,8 @@ use std::collections::BTreeMap;
 type MvccKey = (Vec<u8>, Reverse<u64>);
 
 /// Simplified MVCC oracle without range tombstones.
-/// Range tombstone testing is in prop_range_tombstone.rs.
+/// Range tombstone testing lives in tests/range_tombstone.rs and
+/// tests/range_tombstone_ephemeral.rs.
 #[derive(Debug, Clone)]
 struct Oracle {
     /// (key, Reverse(seqno)) -> Some(value) for puts, None for tombstones.
@@ -132,8 +133,8 @@ fn key_strategy() -> impl Strategy<Value = Vec<u8>> {
 
 // NOTE: RemoveRange is excluded from this oracle because it only models
 // point operations. Range tombstone semantics (including interaction with
-// point tombstones across SSTs) are covered by prop_range_tombstone.rs
-// and related regression tests instead.
+// point tombstones across SSTs) are covered by range_tombstone.rs,
+// range_tombstone_ephemeral.rs, and related regression tests instead.
 #[derive(Debug, Clone)]
 enum Op {
     Insert { key: Vec<u8>, value: Vec<u8> },
