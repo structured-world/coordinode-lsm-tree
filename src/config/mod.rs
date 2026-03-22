@@ -261,17 +261,21 @@ pub struct Config {
     #[doc(hidden)]
     pub(crate) comparator: SharedComparator,
 
-    /// The global sequence number generator
-    ///
-    /// Should be shared between multiple trees of a database
     /// Block-level encryption provider for encryption at rest.
     ///
     /// When set, all blocks (data, index, filter, meta) are encrypted
     /// using this provider after compression and before checksumming.
     pub encryption: Option<Arc<dyn EncryptionProvider>>,
 
+    /// The global sequence number generator.
+    ///
+    /// Should be shared between multiple trees of a database.
     pub(crate) seqno: SharedSequenceNumberGenerator,
 
+    /// Sequence number watermark that is visible to readers.
+    ///
+    /// Used for MVCC snapshots and to control which updates are
+    /// observable in a given view of the database.
     pub(crate) visible_seqno: SharedSequenceNumberGenerator,
 }
 

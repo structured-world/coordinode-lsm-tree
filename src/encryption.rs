@@ -36,9 +36,18 @@ pub trait EncryptionProvider:
     ///
     /// The returned bytes may include a nonce/IV prefix and an
     /// authentication tag — the layout is provider-defined.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error::Encrypt`] if the encryption operation fails.
     fn encrypt(&self, plaintext: &[u8]) -> crate::Result<Vec<u8>>;
 
     /// Decrypt `ciphertext` previously produced by [`encrypt`](EncryptionProvider::encrypt).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error::Decrypt`] if the ciphertext is invalid,
+    /// tampered, or encrypted with a different key.
     fn decrypt(&self, ciphertext: &[u8]) -> crate::Result<Vec<u8>>;
 }
 
@@ -93,6 +102,10 @@ impl Aes256GcmProvider {
 
     /// Create a provider from a key slice, returning an error if the
     /// length is not 32 bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error::Encrypt`] if `key` is not exactly 32 bytes.
     pub fn from_slice(key: &[u8]) -> crate::Result<Self> {
         let key: &[u8; 32] = key
             .try_into()
@@ -144,7 +157,7 @@ impl EncryptionProvider for Aes256GcmProvider {
         #[expect(clippy::indexing_slicing, reason = "length checked above")]
         let nonce = GenericArray::from_slice(&ciphertext[..Self::NONCE_LEN]);
 
-        #[expect(clippy::indexing_slicing, reason = "length checked above")]
+        // Safe: ciphertext.len() >= NONCE_LEN + TAG_LEN checked above
         let tag_start = ciphertext.len() - Self::TAG_LEN;
 
         #[expect(clippy::indexing_slicing, reason = "length checked above")]
