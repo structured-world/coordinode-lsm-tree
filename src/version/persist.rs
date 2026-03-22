@@ -6,11 +6,20 @@ use crate::{
 use byteorder::{LittleEndian, WriteBytesExt};
 use std::{io::BufWriter, path::Path};
 
+/// Maximum comparator name length, enforced symmetrically on write
+/// (here) and read (`Manifest::decode_from`).
+const MAX_COMPARATOR_NAME_LEN: usize = 256;
+
 pub fn persist_version(
     folder: &Path,
     version: &Version,
     comparator_name: &str,
 ) -> crate::Result<()> {
+    assert!(
+        comparator_name.len() <= MAX_COMPARATOR_NAME_LEN,
+        "comparator name exceeds {MAX_COMPARATOR_NAME_LEN} bytes",
+    );
+
     log::trace!(
         "Persisting version {} in {}",
         version.id(),
