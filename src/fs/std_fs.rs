@@ -428,7 +428,9 @@ mod tests {
         let file = fs.open(&path, &opts)?;
         FsFile::lock_exclusive(&file)?;
 
-        // Lock acquired — if we got here without blocking, the test passes
+        // Verifies flock() syscall succeeds without error. Testing actual
+        // lock contention (try_lock from second thread) is out of scope for
+        // the Fs trait definition — belongs in integration tests.
         Ok(())
     }
 
