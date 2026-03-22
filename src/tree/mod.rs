@@ -123,15 +123,18 @@ impl AbstractTree for Tree {
 
         let key = Slice::from(key);
 
-        for kv in super_version
-            .active_memtable
-            .range(InternalKey::new(key.clone(), SeqNo::MAX, ValueType::Value)..)
-        {
+        for kv in super_version.active_memtable.range_internal((
+            Bound::Included(InternalKey::new(key.clone(), SeqNo::MAX, ValueType::Value)),
+            Bound::Unbounded,
+        )) {
             log::info!("[Active] {kv:?}");
         }
 
         for mt in super_version.sealed_memtables.iter().rev() {
-            for kv in mt.range(InternalKey::new(key.clone(), SeqNo::MAX, ValueType::Value)..) {
+            for kv in mt.range_internal((
+                Bound::Included(InternalKey::new(key.clone(), SeqNo::MAX, ValueType::Value)),
+                Bound::Unbounded,
+            )) {
                 log::info!("[Sealed #{}] {kv:?}", mt.id());
             }
         }
@@ -140,7 +143,7 @@ impl AbstractTree for Tree {
             .version
             .iter_levels()
             .flat_map(|lvl| lvl.iter())
-            .filter_map(|run| run.get_for_key(&key))
+            .filter_map(|run| run.get_for_key_cmp(&key, self.config.comparator.as_ref()))
         {
             for kv in table.range(..) {
                 let kv = kv?;
@@ -164,7 +167,12 @@ impl AbstractTree for Tree {
             .expect("lock is poisoned")
             .get_version_for_snapshot(seqno);
 
-        Self::get_internal_entry_from_version(&super_version, key, seqno)
+        Self::get_internal_entry_from_version(
+            &super_version,
+            key,
+            seqno,
+            self.config.comparator.as_ref(),
+        )
     }
 
     fn current_version(&self) -> Version {
@@ -270,7 +278,10 @@ impl AbstractTree for Tree {
             &self.config.path,
             |v| {
                 let mut copy = v.clone();
-                copy.active_memtable = Arc::new(Memtable::new(self.memtable_id_counter.next()));
+                copy.active_memtable = Arc::new(Memtable::new(
+                    self.memtable_id_counter.next(),
+                    self.config.comparator.clone(),
+                ));
                 copy.sealed_memtables = Arc::default();
                 copy.version = Version::new(v.version.id() + 1, self.tree_type());
                 Ok(copy)
@@ -430,6 +441,7 @@ impl AbstractTree for Tree {
                     self.config.descriptor_table.clone(),
                     pin_filter,
                     pin_index,
+                    self.config.comparator.clone(),
                     #[cfg(feature = "metrics")]
                     self.metrics.clone(),
                 )
@@ -503,7 +515,10 @@ impl AbstractTree for Tree {
         }
 
         let mut copy = version_history_lock.latest_version();
-        copy.active_memtable = Arc::new(Memtable::new(self.memtable_id_counter.next()));
+        copy.active_memtable = Arc::new(Memtable::new(
+            self.memtable_id_counter.next(),
+            self.config.comparator.clone(),
+        ));
         copy.sealed_memtables = Arc::new(SealedMemtables::default());
 
         // Rotate does not modify the memtable, so it cannot break snapshots
@@ -566,7 +581,10 @@ impl AbstractTree for Tree {
         let yanked_memtable = super_version.active_memtable;
 
         let mut copy = version_history_lock.latest_version();
-        copy.active_memtable = Arc::new(Memtable::new(self.memtable_id_counter.next()));
+        copy.active_memtable = Arc::new(Memtable::new(
+            self.memtable_id_counter.next(),
+            self.config.comparator.clone(),
+        ));
         copy.sealed_memtables =
             Arc::new(super_version.sealed_memtables.add(yanked_memtable.clone()));
 
@@ -667,6 +685,7 @@ impl AbstractTree for Tree {
             key,
             seqno,
             self.config.merge_operator.as_ref(),
+            self.config.comparator.as_ref(),
         )
     }
 
@@ -684,6 +703,7 @@ impl AbstractTree for Tree {
                     key.as_ref(),
                     seqno,
                     self.config.merge_operator.as_ref(),
+                    self.config.comparator.as_ref(),
                 )
             })
             .collect()
@@ -742,8 +762,9 @@ impl Tree {
         key: &[u8],
         seqno: SeqNo,
         merge_operator: Option<&Arc<dyn crate::merge_operator::MergeOperator>>,
+        comparator: &dyn crate::comparator::UserComparator,
     ) -> crate::Result<Option<UserValue>> {
-        let entry = Self::get_internal_entry_from_version(super_version, key, seqno)?;
+        let entry = Self::get_internal_entry_from_version(super_version, key, seqno, comparator)?;
 
         match entry {
             Some(entry) if entry.key.value_type == ValueType::MergeOperand => {
@@ -883,6 +904,7 @@ impl Tree {
         super_version: &SuperVersion,
         key: &[u8],
         seqno: SeqNo,
+        comparator: &dyn crate::comparator::UserComparator,
     ) -> crate::Result<Option<InternalValue>> {
         // Search order: active → sealed → SST (newest first). A point
         // tombstone in a newer source is authoritative — no older source
@@ -914,7 +936,8 @@ impl Tree {
         }
 
         // Now look in tables... this may involve disk I/O
-        let entry = Self::get_internal_entry_from_tables(&super_version.version, key, seqno)?;
+        let entry =
+            Self::get_internal_entry_from_tables(&super_version.version, key, seqno, comparator)?;
 
         if let Some(entry) = entry {
             if Self::is_suppressed_by_range_tombstones(super_version, key, entry.key.seqno, seqno) {
@@ -987,6 +1010,7 @@ impl Tree {
         version: &Version,
         key: &[u8],
         seqno: SeqNo,
+        comparator: &dyn crate::comparator::UserComparator,
     ) -> crate::Result<Option<InternalValue>> {
         // NOTE: Create key hash for hash sharing
         // https://fjall-rs.github.io/post/bloom-filter-hash-sharing/
@@ -1006,7 +1030,7 @@ impl Tree {
                 let mut best: Option<InternalValue> = None;
 
                 for run in level.iter() {
-                    if let Some(table) = run.get_for_key(key) {
+                    if let Some(table) = run.get_for_key_cmp(key, comparator) {
                         if let Some(item) = table.get(key, seqno, key_hash)? {
                             match &best {
                                 // >= keeps first-seen on tie. Seqno is monotonically
@@ -1031,7 +1055,7 @@ impl Tree {
                 }
             } else {
                 for run in level.iter() {
-                    if let Some(table) = run.get_for_key(key) {
+                    if let Some(table) = run.get_for_key_cmp(key, comparator) {
                         if let Some(item) = table.get(key, seqno, key_hash)? {
                             return Ok(ignore_tombstone_value(item));
                         }
@@ -1309,12 +1333,14 @@ impl Tree {
             .max()
             .unwrap_or_default();
 
+        let comparator = config.comparator.clone();
+
         let inner = TreeInner {
             id: tree_id,
             memtable_id_counter: SequenceNumberCounter::new(1),
             table_id_counter: SequenceNumberCounter::new(highest_table_id + 1),
             blob_file_id_counter: SequenceNumberCounter::default(),
-            version_history: Arc::new(RwLock::new(SuperVersions::new(version))),
+            version_history: Arc::new(RwLock::new(SuperVersions::new(version, comparator))),
             stop_signal: StopSignal::default(),
             config: Arc::new(config),
             major_compaction_lock: RwLock::default(),
@@ -1455,6 +1481,7 @@ impl Tree {
                     config.descriptor_table.clone(),
                     pin_filter,
                     pin_index,
+                    config.comparator.clone(),
                     #[cfg(feature = "metrics")]
                     metrics.clone(),
                 )?;

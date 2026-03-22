@@ -29,6 +29,7 @@ pub use writer::Writer;
 
 use crate::{
     cache::Cache,
+    comparator::SharedComparator,
     descriptor_table::DescriptorTable,
     file_accessor::FileAccessor,
     range_tombstone::RangeTombstone,
@@ -246,7 +247,7 @@ impl Table {
         let filter_block = if let Some(block) = &self.pinned_filter_block {
             Some(Cow::Borrowed(block))
         } else if let Some(filter_idx) = &self.pinned_filter_index {
-            let mut iter = filter_idx.iter();
+            let mut iter = filter_idx.iter(self.comparator.clone());
             iter.seek(key, seqno);
 
             if let Some(filter_block_handle) = iter.next() {
@@ -325,13 +326,13 @@ impl Table {
 
             let block = self.load_data_block(block_handle.as_ref())?;
 
-            if let Some(item) = block.point_read(key, seqno) {
+            if let Some(item) = block.point_read(key, seqno, &self.comparator) {
                 return Ok(Some(item));
             }
 
             // NOTE: If the last block key is higher than ours,
             // our key cannot be in the next block
-            if block_handle.end_key() > &key {
+            if self.comparator.compare(block_handle.end_key(), key) == std::cmp::Ordering::Greater {
                 return Ok(None);
             }
         }
@@ -367,6 +368,7 @@ impl Table {
             block_count,
             self.metadata.data_block_compression,
             self.global_seqno(),
+            self.comparator.clone(),
         )
     }
 
@@ -402,6 +404,7 @@ impl Table {
             self.file_accessor.clone(),
             self.cache.clone(),
             self.metadata.data_block_compression,
+            self.comparator.clone(),
             #[cfg(feature = "metrics")]
             self.metrics.clone(),
         );
@@ -455,6 +458,7 @@ impl Table {
         descriptor_table: Option<Arc<DescriptorTable>>,
         pin_filter: bool,
         pin_index: bool,
+        comparator: SharedComparator,
         #[cfg(feature = "metrics")] metrics: Arc<Metrics>,
     ) -> crate::Result<Self> {
         use meta::ParsedMeta;
@@ -499,6 +503,7 @@ impl Table {
                 path: Arc::clone(&file_path),
                 file_accessor: file_accessor.clone(),
                 table_id: (tree_id, metadata.id).into(),
+                comparator: comparator.clone(),
 
                 #[cfg(feature = "metrics")]
                 metrics: metrics.clone(),
@@ -510,7 +515,7 @@ impl Table {
             );
 
             let block = Self::read_tli(&regions, &file, metadata.index_block_compression)?;
-            BlockIndexImpl::Full(FullBlockIndex::new(block))
+            BlockIndexImpl::Full(FullBlockIndex::new(block, comparator.clone()))
         } else {
             log::trace!("Creating volatile, full block index");
 
@@ -521,6 +526,7 @@ impl Table {
                 handle: regions.tli,
                 path: Arc::clone(&file_path),
                 table_id: (tree_id, metadata.id).into(),
+                comparator: comparator.clone(),
 
                 #[cfg(feature = "metrics")]
                 metrics: metrics.clone(),
@@ -618,6 +624,8 @@ impl Table {
 
             checksum,
             global_seqno,
+
+            comparator,
 
             #[cfg(feature = "metrics")]
             metrics,

@@ -147,45 +147,29 @@ pub fn longest_shared_prefix_length(s1: &[u8], s2: &[u8]) -> usize {
 }
 
 #[must_use]
-pub fn compare_prefixed_slice(prefix: &[u8], suffix: &[u8], needle: &[u8]) -> std::cmp::Ordering {
-    use std::cmp::Ordering::{Equal, Greater};
-
-    if needle.is_empty() {
-        let combined_len = prefix.len() + suffix.len();
-        return if combined_len > 0 { Greater } else { Equal };
-    }
-
-    let max_pfx_len = prefix.len().min(needle.len());
-
-    {
-        #[expect(unsafe_code, reason = "We checked for max_pfx_len")]
-        let prefix = unsafe { prefix.get_unchecked(0..max_pfx_len) };
-
-        #[expect(unsafe_code, reason = "We checked for max_pfx_len")]
-        let needle = unsafe { needle.get_unchecked(0..max_pfx_len) };
-
-        match prefix.cmp(needle) {
-            Equal => {}
-            ordering => return ordering,
-        }
-    }
-
-    let rest_len = prefix.len().saturating_sub(needle.len());
-    if rest_len > 0 {
-        return Greater;
-    }
-
-    #[expect(
-        unsafe_code,
-        reason = "We know that the prefix is definitely not longer than the needle so we can safely truncate"
-    )]
-    let needle = unsafe { needle.get_unchecked(max_pfx_len..) };
-    suffix.cmp(needle)
+pub fn compare_prefixed_slice(
+    prefix: &[u8],
+    suffix: &[u8],
+    needle: &[u8],
+    cmp: &dyn crate::comparator::UserComparator,
+) -> std::cmp::Ordering {
+    // Reconstruct the full key and delegate to the comparator.
+    // This avoids splitting the comparison logic and ensures the custom
+    // comparator always sees complete keys.
+    //
+    // TODO: For very large keys this creates a temporary allocation.
+    // A future optimization could add a `compare_concat` method to
+    // UserComparator for prefix+suffix comparison without allocation.
+    let mut full_key = Vec::with_capacity(prefix.len() + suffix.len());
+    full_key.extend_from_slice(prefix);
+    full_key.extend_from_slice(suffix);
+    cmp.compare(&full_key, needle)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::comparator::DefaultUserComparator;
     use test_log::test;
 
     #[test]
@@ -205,39 +189,111 @@ mod tests {
     fn test_compare_prefixed_slice() {
         use std::cmp::Ordering::{Equal, Greater, Less};
 
-        assert_eq!(Greater, compare_prefixed_slice(&[0, 161], &[], &[0]));
-
-        assert_eq!(Equal, compare_prefixed_slice(b"abc", b"xyz", b"abcxyz"));
-        assert_eq!(Equal, compare_prefixed_slice(b"abc", b"", b"abc"));
-        assert_eq!(Equal, compare_prefixed_slice(b"abc", b"abc", b"abcabc"));
-        assert_eq!(Equal, compare_prefixed_slice(b"", b"", b""));
-        assert_eq!(Less, compare_prefixed_slice(b"a", b"", b"y"));
-        assert_eq!(Less, compare_prefixed_slice(b"a", b"", b"yyy"));
-        assert_eq!(Less, compare_prefixed_slice(b"a", b"", b"yyy"));
-        assert_eq!(Less, compare_prefixed_slice(b"yyyy", b"a", b"yyyyb"));
-        assert_eq!(Less, compare_prefixed_slice(b"yyy", b"b", b"yyyyb"));
-        assert_eq!(Less, compare_prefixed_slice(b"abc", b"d", b"abce"));
-        assert_eq!(Less, compare_prefixed_slice(b"ab", b"", b"ac"));
-        assert_eq!(Greater, compare_prefixed_slice(b"a", b"", b""));
-        assert_eq!(Greater, compare_prefixed_slice(b"", b"a", b""));
-        assert_eq!(Greater, compare_prefixed_slice(b"a", b"a", b""));
-        assert_eq!(Greater, compare_prefixed_slice(b"b", b"a", b"a"));
-        assert_eq!(Greater, compare_prefixed_slice(b"a", b"b", b"a"));
-        assert_eq!(Greater, compare_prefixed_slice(b"abc", b"xy", b"abcw"));
-        assert_eq!(Greater, compare_prefixed_slice(b"ab", b"cde", b"a"));
-        assert_eq!(Greater, compare_prefixed_slice(b"abcd", b"zz", b"abc"));
-        assert_eq!(Greater, compare_prefixed_slice(b"abc", b"d", b"abc"));
         assert_eq!(
             Greater,
-            compare_prefixed_slice(b"aaaa", b"aaab", b"aaaaaaaa")
+            compare_prefixed_slice(&[0, 161], &[], &[0], &DefaultUserComparator)
+        );
+
+        assert_eq!(
+            Equal,
+            compare_prefixed_slice(b"abc", b"xyz", b"abcxyz", &DefaultUserComparator)
+        );
+        assert_eq!(
+            Equal,
+            compare_prefixed_slice(b"abc", b"", b"abc", &DefaultUserComparator)
+        );
+        assert_eq!(
+            Equal,
+            compare_prefixed_slice(b"abc", b"abc", b"abcabc", &DefaultUserComparator)
+        );
+        assert_eq!(
+            Equal,
+            compare_prefixed_slice(b"", b"", b"", &DefaultUserComparator)
+        );
+        assert_eq!(
+            Less,
+            compare_prefixed_slice(b"a", b"", b"y", &DefaultUserComparator)
+        );
+        assert_eq!(
+            Less,
+            compare_prefixed_slice(b"a", b"", b"yyy", &DefaultUserComparator)
+        );
+        assert_eq!(
+            Less,
+            compare_prefixed_slice(b"a", b"", b"yyy", &DefaultUserComparator)
+        );
+        assert_eq!(
+            Less,
+            compare_prefixed_slice(b"yyyy", b"a", b"yyyyb", &DefaultUserComparator)
+        );
+        assert_eq!(
+            Less,
+            compare_prefixed_slice(b"yyy", b"b", b"yyyyb", &DefaultUserComparator)
+        );
+        assert_eq!(
+            Less,
+            compare_prefixed_slice(b"abc", b"d", b"abce", &DefaultUserComparator)
+        );
+        assert_eq!(
+            Less,
+            compare_prefixed_slice(b"ab", b"", b"ac", &DefaultUserComparator)
         );
         assert_eq!(
             Greater,
-            compare_prefixed_slice(b"aaaa", b"aaba", b"aaaaaaaa")
+            compare_prefixed_slice(b"a", b"", b"", &DefaultUserComparator)
         );
-        assert_eq!(Greater, compare_prefixed_slice(b"abcd", b"x", b"abc"));
+        assert_eq!(
+            Greater,
+            compare_prefixed_slice(b"", b"a", b"", &DefaultUserComparator)
+        );
+        assert_eq!(
+            Greater,
+            compare_prefixed_slice(b"a", b"a", b"", &DefaultUserComparator)
+        );
+        assert_eq!(
+            Greater,
+            compare_prefixed_slice(b"b", b"a", b"a", &DefaultUserComparator)
+        );
+        assert_eq!(
+            Greater,
+            compare_prefixed_slice(b"a", b"b", b"a", &DefaultUserComparator)
+        );
+        assert_eq!(
+            Greater,
+            compare_prefixed_slice(b"abc", b"xy", b"abcw", &DefaultUserComparator)
+        );
+        assert_eq!(
+            Greater,
+            compare_prefixed_slice(b"ab", b"cde", b"a", &DefaultUserComparator)
+        );
+        assert_eq!(
+            Greater,
+            compare_prefixed_slice(b"abcd", b"zz", b"abc", &DefaultUserComparator)
+        );
+        assert_eq!(
+            Greater,
+            compare_prefixed_slice(b"abc", b"d", b"abc", &DefaultUserComparator)
+        );
+        assert_eq!(
+            Greater,
+            compare_prefixed_slice(b"aaaa", b"aaab", b"aaaaaaaa", &DefaultUserComparator)
+        );
+        assert_eq!(
+            Greater,
+            compare_prefixed_slice(b"aaaa", b"aaba", b"aaaaaaaa", &DefaultUserComparator)
+        );
+        assert_eq!(
+            Greater,
+            compare_prefixed_slice(b"abcd", b"x", b"abc", &DefaultUserComparator)
+        );
 
-        assert_eq!(Less, compare_prefixed_slice(&[0x7F], &[], &[0x80]));
-        assert_eq!(Greater, compare_prefixed_slice(&[0xFF], &[], &[0x10]));
+        assert_eq!(
+            Less,
+            compare_prefixed_slice(&[0x7F], &[], &[0x80], &DefaultUserComparator)
+        );
+        assert_eq!(
+            Greater,
+            compare_prefixed_slice(&[0xFF], &[], &[0x10], &DefaultUserComparator)
+        );
     }
 }

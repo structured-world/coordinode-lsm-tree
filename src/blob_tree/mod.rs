@@ -171,7 +171,12 @@ impl BlobTree {
         key: &[u8],
         seqno: SeqNo,
     ) -> crate::Result<Option<UserValue>> {
-        let Some(item) = crate::Tree::get_internal_entry_from_version(super_version, key, seqno)?
+        let Some(item) = crate::Tree::get_internal_entry_from_version(
+            super_version,
+            key,
+            seqno,
+            self.index.config.comparator.as_ref(),
+        )?
         else {
             return Ok(None);
         };
@@ -519,6 +524,7 @@ impl AbstractTree for BlobTree {
                     self.index.config.descriptor_table.clone(),
                     pin_filter,
                     pin_index,
+                    self.index.config.comparator.clone(),
                     #[cfg(feature = "metrics")]
                     self.index.metrics.clone(),
                 )

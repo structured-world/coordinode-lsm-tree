@@ -54,6 +54,7 @@ fn test_with_table(
                 Some(Arc::new(DescriptorTable::new(10))),
                 false,
                 false,
+                crate::comparator::default_comparator(),
                 #[cfg(feature = "metrics")]
                 metrics,
             )?;
@@ -84,6 +85,7 @@ fn test_with_table(
                 Some(Arc::new(DescriptorTable::new(10))),
                 true,
                 false,
+                crate::comparator::default_comparator(),
                 #[cfg(feature = "metrics")]
                 metrics,
             )?;
@@ -114,6 +116,7 @@ fn test_with_table(
                 Some(Arc::new(DescriptorTable::new(10))),
                 false,
                 true,
+                crate::comparator::default_comparator(),
                 #[cfg(feature = "metrics")]
                 metrics,
             )?;
@@ -144,6 +147,7 @@ fn test_with_table(
                 Some(Arc::new(DescriptorTable::new(10))),
                 true,
                 true,
+                crate::comparator::default_comparator(),
                 #[cfg(feature = "metrics")]
                 metrics,
             )?;
@@ -174,6 +178,7 @@ fn test_with_table(
                 None,
                 true,
                 true,
+                crate::comparator::default_comparator(),
                 #[cfg(feature = "metrics")]
                 metrics,
             )?;
@@ -222,6 +227,7 @@ fn test_with_table(
                 Some(Arc::new(DescriptorTable::new(10))),
                 false,
                 false,
+                crate::comparator::default_comparator(),
                 #[cfg(feature = "metrics")]
                 metrics,
             )?;
@@ -251,6 +257,7 @@ fn test_with_table(
                 Some(Arc::new(DescriptorTable::new(10))),
                 true,
                 false,
+                crate::comparator::default_comparator(),
                 #[cfg(feature = "metrics")]
                 metrics,
             )?;
@@ -280,6 +287,7 @@ fn test_with_table(
                 Some(Arc::new(DescriptorTable::new(10))),
                 false,
                 true,
+                crate::comparator::default_comparator(),
                 #[cfg(feature = "metrics")]
                 metrics,
             )?;
@@ -310,6 +318,7 @@ fn test_with_table(
                 Some(Arc::new(DescriptorTable::new(10))),
                 true,
                 true,
+                crate::comparator::default_comparator(),
                 #[cfg(feature = "metrics")]
                 metrics,
             )?;
@@ -340,6 +349,7 @@ fn test_with_table(
                 None,
                 true,
                 true,
+                crate::comparator::default_comparator(),
                 #[cfg(feature = "metrics")]
                 metrics,
             )?;
@@ -1225,6 +1235,7 @@ fn table_read_fuzz_1() -> crate::Result<()> {
         Some(Arc::new(crate::DescriptorTable::new(10))),
         true,
         true,
+        crate::comparator::default_comparator(),
     )
     .unwrap();
 
@@ -1299,6 +1310,7 @@ fn table_partitioned_index() -> crate::Result<()> {
         Some(Arc::new(crate::DescriptorTable::new(10))),
         true,
         true,
+        crate::comparator::default_comparator(),
         #[cfg(feature = "metrics")]
         Default::default(),
     )
@@ -1409,6 +1421,7 @@ fn table_global_seqno() -> crate::Result<()> {
         Some(Arc::new(crate::DescriptorTable::new(10))),
         true,
         true,
+        crate::comparator::default_comparator(),
         #[cfg(feature = "metrics")]
         Default::default(),
     )
@@ -1612,6 +1625,7 @@ fn load_block_range_tombstone_metrics() -> crate::Result<()> {
         Some(Arc::new(DescriptorTable::new(10))),
         false,
         false,
+        crate::comparator::default_comparator(),
         #[cfg(feature = "metrics")]
         metrics.clone(),
     )?;

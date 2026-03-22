@@ -414,7 +414,7 @@ impl TreeIter {
                         .map(|rt| (rt, seqno)),
                 );
 
-                let iter = memtable.range(range.clone());
+                let iter = memtable.range_internal(range.clone());
 
                 iters.push(Box::new(
                     iter.filter(move |item| seqno_filter(item.key.seqno, seqno))
@@ -433,7 +433,7 @@ impl TreeIter {
                         .map(|rt| (rt, seqno)),
                 );
 
-                let iter = lock.version.active_memtable.range(range.clone());
+                let iter = lock.version.active_memtable.range_internal(range.clone());
 
                 iters.push(Box::new(
                     iter.filter(move |item| seqno_filter(item.key.seqno, seqno))
@@ -450,7 +450,7 @@ impl TreeIter {
                 );
 
                 let iter = Box::new(
-                    mt.range(range)
+                    mt.range_internal(range)
                         .filter(move |item| seqno_filter(item.key.seqno, *eph_seqno))
                         .map(Ok),
                 );
