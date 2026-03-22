@@ -586,12 +586,15 @@ impl Table {
             }
 
             let mut rts = Self::decode_range_tombstones(&block)?;
-            // Sort range tombstones by (start asc, seqno desc) to enable
-            // binary search in point-read suppression paths. Uses explicit
-            // comparator so the partition_point invariant is independent of
-            // Ord changes. The seqno-desc tiebreaker ensures higher-seqno
-            // RTs are checked first when multiple share the same start key.
-            rts.sort_unstable_by(|a, b| a.start.cmp(&b.start).then_with(|| b.seqno.cmp(&a.seqno)));
+            // Sort range tombstones by (start asc, seqno desc) using the
+            // user comparator so the order matches the tree's key ordering.
+            // The seqno-desc tiebreaker ensures higher-seqno RTs are checked
+            // first when multiple share the same start key.
+            let cmp = &comparator;
+            rts.sort_unstable_by(|a, b| {
+                cmp.compare(&a.start, &b.start)
+                    .then_with(|| b.seqno.cmp(&a.seqno))
+            });
             rts
         } else {
             Vec::new()

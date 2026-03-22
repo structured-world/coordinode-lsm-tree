@@ -783,6 +783,7 @@ impl Tree {
                     key,
                     entry.key.seqno,
                     seqno,
+                    comparator,
                 ) {
                     Ok(None)
                 } else {
@@ -814,11 +815,13 @@ impl Tree {
         let key_hash = crate::table::filter::standard_bloom::Builder::get_hash(key);
         let key_slice = crate::Slice::from(key);
         let range = key_slice.clone()..=key_slice;
+        let comparator = version.active_memtable.comparator.clone();
 
         let iter_state = IterState {
             version,
             ephemeral: None,
             merge_operator: Some(merge_operator),
+            comparator,
             prefix_hash: None,
             key_hash: Some(key_hash),
             #[cfg(feature = "metrics")]
@@ -919,7 +922,13 @@ impl Tree {
             };
 
             // Check if any range tombstone suppresses this entry
-            if Self::is_suppressed_by_range_tombstones(super_version, key, entry.key.seqno, seqno) {
+            if Self::is_suppressed_by_range_tombstones(
+                super_version,
+                key,
+                entry.key.seqno,
+                seqno,
+                comparator,
+            ) {
                 return Ok(None);
             }
             return Ok(Some(entry));
@@ -933,7 +942,13 @@ impl Tree {
                 return Ok(None);
             };
 
-            if Self::is_suppressed_by_range_tombstones(super_version, key, entry.key.seqno, seqno) {
+            if Self::is_suppressed_by_range_tombstones(
+                super_version,
+                key,
+                entry.key.seqno,
+                seqno,
+                comparator,
+            ) {
                 return Ok(None);
             }
             return Ok(Some(entry));
@@ -944,7 +959,13 @@ impl Tree {
             Self::get_internal_entry_from_tables(&super_version.version, key, seqno, comparator)?;
 
         if let Some(entry) = entry {
-            if Self::is_suppressed_by_range_tombstones(super_version, key, entry.key.seqno, seqno) {
+            if Self::is_suppressed_by_range_tombstones(
+                super_version,
+                key,
+                entry.key.seqno,
+                seqno,
+                comparator,
+            ) {
                 return Ok(None);
             }
             return Ok(Some(entry));
@@ -960,6 +981,7 @@ impl Tree {
         key: &[u8],
         key_seqno: SeqNo,
         read_seqno: SeqNo,
+        comparator: &dyn crate::comparator::UserComparator,
     ) -> bool {
         // Check active memtable range tombstones.
         // Future optimization: skip lock when memtable has no RTs (atomic count).
@@ -979,13 +1001,7 @@ impl Tree {
 
         // Check SST table range tombstones.
         //
-        // Flush/RT-only writes widen persisted table key ranges to include RT
-        // coverage, and compaction either clips RTs to the output table range
-        // or widens metadata in the inclusive-upper-bound fallback. That makes
-        // `metadata.key_range.contains_key(key)` a sound early reject here and
-        // avoids scanning RT blocks for unrelated SSTs on point reads.
-        //
-        // Per-table RT lists are sorted by start key on load,
+        // Per-table RT lists are sorted by start key (using comparator) on load,
         // so binary search narrows candidates to RTs with start <= key.
         for table in super_version
             .version
@@ -993,15 +1009,22 @@ impl Tree {
             .flat_map(|lvl| lvl.iter())
             .flat_map(|run| run.iter())
             .filter(|t| !t.range_tombstones().is_empty())
-            .filter(|t| t.metadata.key_range.contains_key(key))
         {
             let rts = table.range_tombstones();
-            let candidate_end = rts.partition_point(|rt| rt.start.as_ref() <= key);
+
+            // Binary search: find the first RT whose start is > key (in comparator order).
+            // All RTs before that index have start <= key and are candidates.
+            let candidate_end = rts.partition_point(|rt| {
+                comparator.compare(&rt.start, key) != std::cmp::Ordering::Greater
+            });
 
             for rt in rts.iter().take(candidate_end) {
-                // Binary search already narrowed to start <= key; should_suppress
-                // re-checks contains_key (harmless) and avoids semantic drift.
-                if rt.should_suppress(key, key_seqno, read_seqno) {
+                // Check: start <= key < end (in comparator order) AND seqno visibility.
+                if rt.visible_at(read_seqno)
+                    && comparator.compare(&rt.start, key) != std::cmp::Ordering::Greater
+                    && comparator.compare(key, &rt.end) == std::cmp::Ordering::Less
+                    && key_seqno < rt.seqno
+                {
                     return true;
                 }
             }

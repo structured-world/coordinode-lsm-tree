@@ -18,6 +18,11 @@ use std::sync::Arc;
 /// - **Antisymmetry**: `compare(a, b) == Less` iff `compare(b, a) == Greater`
 /// - **Reflexivity**: `compare(a, a) == Equal`
 ///
+/// - **Bytewise equality**: `compare(a, b) == Equal` **must** imply `a == b`
+///   byte-for-byte. Bloom filters and hash indexes operate on raw bytes;
+///   if two byte-different keys compare as equal, hash-based lookups will
+///   produce false negatives.
+///
 /// Violating these invariants corrupts the sort order and produces incorrect
 /// query results.
 ///
