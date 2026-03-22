@@ -1003,6 +1003,129 @@ mod tests {
     }
 
     #[test]
+    fn empty_buffer_returns_zero() -> io::Result<()> {
+        let Some(fs) = try_io_uring() else {
+            return Ok(());
+        };
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("empty_buf.bin");
+
+        let opts = FsOpenOptions::new().write(true).create(true).read(true);
+        let mut file = fs.open(&path, &opts)?;
+        file.write_all(b"data")?;
+
+        // read_at with empty buffer
+        let n = FsFile::read_at(&file, &mut [], 0)?;
+        assert_eq!(n, 0);
+
+        // Read::read with empty buffer
+        let n = file.read(&mut [])?;
+        assert_eq!(n, 0);
+
+        // Write::write with empty buffer
+        let n = file.write(&[])?;
+        assert_eq!(n, 0);
+
+        // flush is a no-op
+        file.flush()?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn sync_directory_rejects_file() -> io::Result<()> {
+        let Some(fs) = try_io_uring() else {
+            return Ok(());
+        };
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("not_a_dir.txt");
+
+        let opts = FsOpenOptions::new().write(true).create(true);
+        fs.open(&path, &opts)?;
+
+        let err = fs.sync_directory(&path).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+
+        Ok(())
+    }
+
+    #[test]
+    fn seek_overflow_returns_error() -> io::Result<()> {
+        let Some(fs) = try_io_uring() else {
+            return Ok(());
+        };
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("seek_overflow.bin");
+
+        let opts = FsOpenOptions::new().write(true).create(true).read(true);
+        let mut file = fs.open(&path, &opts)?;
+        file.write_all(b"data")?;
+
+        // Seek to near u64::MAX, then seek forward — should overflow.
+        file.seek(SeekFrom::Start(u64::MAX - 1))?;
+        let err = file.seek(SeekFrom::Current(2)).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+
+        // SeekFrom::End with positive overflow
+        let err = file.seek(SeekFrom::End(i64::MAX)).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+
+        Ok(())
+    }
+
+    #[test]
+    fn debug_impl() {
+        let Some(fs) = try_io_uring() else {
+            return;
+        };
+        let debug = format!("{fs:?}");
+        assert!(debug.contains("IoUringFs"));
+    }
+
+    #[test]
+    fn with_ring_size() -> io::Result<()> {
+        // Test non-default ring size.
+        let fs = IoUringFs::with_ring_size(64);
+        if fs.is_err() {
+            eprintln!("skipping: io_uring not available");
+            return Ok(());
+        }
+        let fs = fs?;
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("ring64.bin");
+        let opts = FsOpenOptions::new().write(true).create(true);
+        let mut file = fs.open(&path, &opts)?;
+        file.write_all(b"ok")?;
+        FsFile::sync_all(&file)?;
+        assert_eq!(fs.metadata(&path)?.len, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn seek_negative_from_current() -> io::Result<()> {
+        let Some(fs) = try_io_uring() else {
+            return Ok(());
+        };
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("seek_neg.bin");
+
+        let opts = FsOpenOptions::new().write(true).create(true).read(true);
+        let mut file = fs.open(&path, &opts)?;
+        file.write_all(b"abcdefghij")?;
+
+        // Seek to position 8, then back 3
+        file.seek(SeekFrom::Start(8))?;
+        let pos = file.seek(SeekFrom::Current(-3))?;
+        assert_eq!(pos, 5);
+
+        let mut buf = [0u8; 5];
+        file.read_exact(&mut buf)?;
+        assert_eq!(&buf, b"fghij");
+
+        Ok(())
+    }
+
+    #[test]
     fn clone_shares_ring() -> io::Result<()> {
         let Some(fs) = try_io_uring() else {
             return Ok(());
