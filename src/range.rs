@@ -178,9 +178,13 @@ impl TreeIter {
     /// Fast path for single-key point-read merge resolution.
     ///
     /// Unlike [`create_range`], this skips:
-    /// - Range tombstone collection from non-bloom-passing tables
     /// - RT sort + dedup + table-skip computation
     /// - `RangeTombstoneFilter` wrapper (uses inline post-merge RT check instead)
+    /// - Reverse-direction RT clone+sort (point reads are forward-only)
+    ///
+    /// Range tombstones are still collected from all tables (not just
+    /// bloom-passing) because an RT in a bloom-negative table can suppress
+    /// the target key. Only iterator construction is bloom-gated.
     ///
     /// `MvccStream::is_rt_suppressed` handles merge-internal suppression; the
     /// post-merge filter catches RT-suppressed resolved entries that would
@@ -221,9 +225,19 @@ impl TreeIter {
                 .iter_levels()
                 .flat_map(|lvl| lvl.iter())
             {
-                // Collect RTs from ALL tables regardless of bloom — an RT
-                // in a non-matching table can still suppress the target key.
+                // Collect RTs from all key-range-overlapping tables regardless
+                // of bloom — an RT in a bloom-negative table can still suppress
+                // the target key. The key-range check avoids loading RTs from
+                // tables that cannot possibly contain a covering tombstone.
+                let bounds = (
+                    user_range.0.as_ref().map(std::convert::AsRef::as_ref),
+                    user_range.1.as_ref().map(std::convert::AsRef::as_ref),
+                );
+
                 for table in run.iter() {
+                    if !table.check_key_range_overlap(&bounds) {
+                        continue;
+                    }
                     range_tombstones.extend(
                         table
                             .range_tombstones()
@@ -340,6 +354,8 @@ impl TreeIter {
             }
 
             let merged = Merger::new(iters, lock.comparator.clone());
+            // Clone is cheap: point-read RT sets are typically 0-2 entries.
+            // An Arc would add indirection overhead that exceeds the clone cost.
             let iter = MvccStream::new(merged, lock.merge_operator.clone())
                 .with_range_tombstones(range_tombstones.clone());
 
