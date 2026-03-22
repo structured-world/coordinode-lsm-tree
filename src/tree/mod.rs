@@ -821,6 +821,9 @@ impl Tree {
         use crate::range::{IterState, TreeIter};
 
         let key_hash = crate::table::filter::standard_bloom::Builder::get_hash(key);
+        // NOTE: Slice::from(&[u8]) copies the key (small, typically < 100 bytes).
+        // This runs once per merge resolution, not per-table — cost is negligible
+        // compared to the I/O saved by partition-aware bloom filtering.
         let bloom_key = crate::Slice::from(key);
         let comparator = version.active_memtable.comparator.clone();
 
