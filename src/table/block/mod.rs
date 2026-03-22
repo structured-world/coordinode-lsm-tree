@@ -377,30 +377,30 @@ impl Block {
             });
         }
 
-        // When encryption is active, read header and payload separately
-        // so the payload lands directly in an owned Vec — no intermediate
-        // Slice, no overlap of encrypted + decrypted buffers.
-        // When no encryption, read the whole block into a Slice (single I/O,
-        // zero-copy on the None-compression path).
+        // When encryption is active, read the whole block into an owned
+        // Vec (single I/O, single allocation), parse the header, then strip
+        // the header prefix so decrypt_vec operates on the payload in-place.
+        // No intermediate Slice, no overlap of encrypted + decrypted buffers.
+        // When no encryption, read into a Slice (zero-copy on the
+        // None-compression path).
         let (header, data) = if let Some(enc) = encryption {
-            // Read header into a stack-sized buffer.
             let header_len = Header::serialized_len();
-            let mut header_buf = vec![0u8; header_len];
-            let n = file.read_at(&mut header_buf, *handle.offset())?;
-            if n != header_len {
+            let block_size = handle.size() as usize;
+
+            let mut buf = vec![0u8; block_size];
+            let n = file.read_at(&mut buf, *handle.offset())?;
+            if n != block_size {
                 return Err(crate::Error::Io(std::io::Error::new(
                     std::io::ErrorKind::UnexpectedEof,
-                    "block header read_at: short read",
+                    "block read_at: short read",
                 )));
             }
-            let header_copy = Header::decode_from(&mut &header_buf[..])?;
 
-            if u64::from(header_copy.data_length) > u64::from(MAX_DECOMPRESSION_SIZE) + enc_overhead
-            {
-                return Err(crate::Error::DecompressedSizeTooLarge {
-                    declared: u64::from(header_copy.data_length),
-                    limit: u64::from(MAX_DECOMPRESSION_SIZE) + enc_overhead,
-                });
+            let header_copy = Header::decode_from(&mut &buf[..header_len])?;
+
+            let actual_data_len = block_size.saturating_sub(header_len);
+            if header_copy.data_length as usize != actual_data_len {
+                return Err(crate::Error::InvalidHeader("Block"));
             }
 
             if header_copy.uncompressed_length > MAX_DECOMPRESSION_SIZE {
@@ -410,18 +410,9 @@ impl Block {
                 });
             }
 
-            // Read payload directly into a Vec — no Slice involved.
-            let payload_len = header_copy.data_length as usize;
-            let mut payload_vec = vec![0u8; payload_len];
-            let n = file.read_at(&mut payload_vec, *handle.offset() + header_len as u64)?;
-            if n != payload_len {
-                return Err(crate::Error::Io(std::io::Error::new(
-                    std::io::ErrorKind::UnexpectedEof,
-                    "block payload read_at: short read",
-                )));
-            }
-
-            let checksum = Checksum::from_raw(crate::hash::hash128(&payload_vec));
+            // Checksum covers the on-disk payload (after header).
+            #[expect(clippy::indexing_slicing, reason = "header was decoded from buf")]
+            let checksum = Checksum::from_raw(crate::hash::hash128(&buf[header_len..]));
             checksum.check(header_copy.checksum).inspect_err(|_| {
                 log::error!(
                     "Checksum mismatch for block {handle:?}, got={}, expected={}",
@@ -430,7 +421,11 @@ impl Block {
                 );
             })?;
 
-            let decrypted = enc.decrypt_vec(payload_vec)?;
+            // Strip header prefix so buf contains only the payload.
+            buf.copy_within(header_len.., 0);
+            buf.truncate(actual_data_len);
+
+            let decrypted = enc.decrypt_vec(buf)?;
 
             let data = match compression {
                 CompressionType::None => {
