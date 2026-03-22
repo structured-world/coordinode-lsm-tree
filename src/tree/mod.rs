@@ -906,52 +906,45 @@ impl Tree {
         }
 
         // 3. Scan tables on disk
+        //
+        // L0 runs can overlap and iter_levels()/run ordering is not
+        // guaranteed newest-first. Collect all matching on-disk entries for
+        // this key and process them in descending seqno order so that newer
+        // MergeOperands are seen before older bases/tombstones.
         if !found_base {
             let key_hash = crate::table::filter::standard_bloom::Builder::get_hash(key);
             let key_slice = crate::Slice::from(key);
 
-            // TODO(#46): L0 runs can overlap — this flat scan may stop at
-            // a base in an older L0 run while a newer run has operands.
-            // The #46 refactor should use the same L0/L1+ split strategy
-            // as get_internal_entry_from_version.
-            for table in super_version
+            let mut disk_entries: Vec<InternalValue> = Vec::new();
+
+            for run in super_version
                 .version
                 .iter_levels()
                 .flat_map(|lvl| lvl.iter())
-                .filter_map(|run| run.get_for_key(key))
             {
-                // Use bloom-filtered point lookup first (fast path)
-                if let Some(entry) = table.get(key, seqno, key_hash)? {
-                    if is_rt_suppressed(&entry) {
-                        found_base = true;
-                    } else if entry.key.value_type.is_merge_operand() {
-                        // Table may contain multiple entries for this key
-                        // (e.g., after flush with gc_threshold=0).
-                        // Fall back to range scan to collect all of them.
-                        // Perf: range scan filters by seqno post-hoc; a seek-based
-                        // approach (#46) would avoid scanning non-visible versions.
-                        let range = key_slice.clone()..=key_slice.clone();
-                        for item in table.range(range) {
-                            let item = item?;
-                            if item.key.seqno >= seqno {
-                                continue;
-                            }
-                            if is_rt_suppressed(&item) {
-                                found_base = true;
-                                break;
-                            }
-                            if process_entry(&item) {
-                                found_base = true;
-                                break;
-                            }
+                if let Some(table) = run.get_for_key(key) {
+                    let range = key_slice.clone()..=key_slice.clone();
+                    for item in table.range(range) {
+                        let item = item?;
+                        if item.key.seqno >= seqno {
+                            continue;
                         }
-                    } else if process_entry(&entry) {
-                        found_base = true;
+                        disk_entries.push(item);
                     }
+                }
+            }
 
-                    if found_base {
-                        break;
-                    }
+            // Newest-first by seqno
+            disk_entries.sort_by(|a, b| b.key.seqno.cmp(&a.key.seqno));
+
+            for entry in &disk_entries {
+                if is_rt_suppressed(entry) {
+                    found_base = true;
+                    break;
+                }
+                if process_entry(entry) {
+                    found_base = true;
+                    break;
                 }
             }
         }
