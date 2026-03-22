@@ -28,6 +28,7 @@ impl Workload for ReadWhileWriting {
         let reader_count = std::cmp::min(threads - 1, max_readers);
         threads = reader_count + 1; // recompute for barrier
                                     // Distribute ops across readers, giving remainder to the last reader.
+                                    // reader_count is always small (< --threads), safe to cast on all targets.
         let base_ops = config.num / reader_count as u64;
         let remainder = config.num % reader_count as u64;
         let barrier = Barrier::new(threads);
@@ -70,7 +71,9 @@ impl Workload for ReadWhileWriting {
 
                 // Writer inserts new random keys (not overwrites) to create
                 // concurrent write pressure without contending on specific keys.
-                // This matches the RocksDB db_bench readwhilewriting workload.
+                // Writer inserts a fixed config.num keys — it may finish before
+                // readers, which is intentional (fixed write volume, measured read
+                // throughput). This matches RocksDB db_bench readwhilewriting.
                 for _ in 0..config.num {
                     let key = make_random_key(config.key_size);
                     let value = make_value(config.value_size);
