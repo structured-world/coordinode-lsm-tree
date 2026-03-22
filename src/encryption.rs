@@ -333,6 +333,8 @@ impl EncryptionProvider for Aes256GcmProvider {
         use aes_gcm::aead::generic_array::GenericArray;
         use aes_gcm::AeadInPlace;
 
+        // Error::Decrypt takes &'static str — can't include runtime lengths
+        // without changing the upstream error type to accept String/Cow.
         let min_len = Self::NONCE_LEN + Self::TAG_LEN;
         if buf.len() < min_len {
             return Err(crate::Error::Decrypt(
