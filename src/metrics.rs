@@ -46,8 +46,11 @@ pub struct Metrics {
     /// Number of IOs that were skipped due to filter
     pub(crate) io_skipped_by_filter: AtomicUsize,
 
-    /// Number of segments skipped during prefix scans because the
-    /// prefix bloom filter returned `Ok(false)`.
+    /// Number of segments skipped during prefix scans via
+    /// [`Tree::create_prefix`] because the prefix bloom filter
+    /// returned `Ok(false)`.
+    ///
+    /// Note: `BlobTree` prefix scans do not currently record this metric.
     pub(crate) prefix_bloom_skips: AtomicUsize,
 
     /// Number of data block bytes that were requested from OS or disk
@@ -254,7 +257,10 @@ impl Metrics {
         self.io_skipped_by_filter.load(Relaxed)
     }
 
-    /// Number of segments skipped during prefix scans by prefix bloom filters.
+    /// Number of segments skipped during [`Tree::create_prefix`] scans
+    /// by prefix bloom filters.
+    ///
+    /// Note: `BlobTree` prefix scans do not currently record this metric.
     pub fn prefix_bloom_skips(&self) -> usize {
         self.prefix_bloom_skips.load(Relaxed)
     }
