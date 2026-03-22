@@ -823,7 +823,7 @@ impl Tree {
             merge_operator,
             prefix_hash,
             #[cfg(feature = "metrics")]
-            metrics: Arc::default(),
+            metrics: None,
         };
 
         TreeIter::create_range(iter_state, bounds, seqno)
@@ -1330,7 +1330,7 @@ impl Tree {
             merge_operator: self.config.merge_operator.clone(),
             prefix_hash,
             #[cfg(feature = "metrics")]
-            metrics: self.0.metrics.clone(),
+            metrics: Some(self.0.metrics.clone()),
         };
 
         TreeIter::create_range(iter_state, range, seqno).map(|item| match item {

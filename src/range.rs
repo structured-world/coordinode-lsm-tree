@@ -80,8 +80,9 @@ pub struct IterState {
     pub(crate) prefix_hash: Option<u64>,
 
     /// Metrics handle for recording prefix bloom skips.
+    /// `None` for non-prefix iterators to avoid unnecessary allocation.
     #[cfg(feature = "metrics")]
-    pub(crate) metrics: Arc<crate::Metrics>,
+    pub(crate) metrics: Option<Arc<crate::Metrics>>,
 }
 
 type BoxedMerge<'a> = Box<dyn DoubleEndedIterator<Item = crate::Result<InternalValue>> + Send + 'a>;
@@ -238,9 +239,10 @@ impl TreeIter {
                                         // Prefix bloom says this segment has no matching keys
                                         // — skip it entirely.
                                         #[cfg(feature = "metrics")]
-                                        lock.metrics
-                                            .prefix_bloom_skips
-                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                        if let Some(m) = &lock.metrics {
+                                            m.prefix_bloom_skips
+                                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                        }
                                     }
                                     Ok(true) => {
                                         single_tables.push(table.clone());

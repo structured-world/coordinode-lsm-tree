@@ -787,11 +787,12 @@ fn prefix_bloom_skip_metrics() -> lsm_tree::Result<()> {
         assert_eq!(results.len(), 0, "prefix '{prefix}' should match no keys");
     }
 
-    // With ~1% FP rate and 24 queries, probability of zero skips = 0.99^24 ≈ 78%.
-    // That's too high for a single-query test. But the bloom indexed 1000 keys ×
-    // 3 prefixes each (e.g. "aaa:", "zzz:"), so 6 entries. At 10 bpk on 6 entries
-    // the filter is tiny (~60 bits) with relatively high FP. With 24 queries it's
-    // very unlikely that ALL are false positives.
+    // This is a probabilistic smoke test: we issue many lookups for prefixes
+    // that do not exist but fall within the table's key range. For any
+    // reasonable prefix-bloom configuration with a non-zero false-positive
+    // rate, we expect at least one of these lookups to be fully filtered by
+    // the bloom (counted as a skip). If this ever flakes, it likely indicates
+    // a change in how prefix blooms or their metrics are configured.
     let skips = tree.metrics().prefix_bloom_skips();
     assert!(
         skips > 0,
