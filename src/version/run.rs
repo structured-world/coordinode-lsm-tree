@@ -666,6 +666,28 @@ mod tests {
         assert!(run
             .range_overlap_indexes_cmp(&(b"\x00" as &[u8]..=b"\x00"), &cmp)
             .is_none());
+
+        // Exclusive start bound: skip first table (z..p), start from second (o..k)
+        let bounds_excl_start: (Bound<&[u8]>, Bound<&[u8]>) =
+            (Bound::Excluded(b"p"), Bound::Included(b"a"));
+        assert_eq!(
+            Some((1, 3)),
+            run.range_overlap_indexes_cmp::<&[u8], _>(&bounds_excl_start, &cmp)
+        );
+
+        // Exclusive end bound: include first table only
+        let bounds_excl_end: (Bound<&[u8]>, Bound<&[u8]>) =
+            (Bound::Included(b"z"), Bound::Excluded(b"o"));
+        assert_eq!(
+            Some((0, 0)),
+            run.range_overlap_indexes_cmp::<&[u8], _>(&bounds_excl_end, &cmp)
+        );
+
+        // Semi-open range (start..): Excluded end = Unbounded
+        assert_eq!(
+            Some((2, 3)),
+            run.range_overlap_indexes_cmp(&(b"j" as &[u8]..), &cmp)
+        );
     }
 
     #[test]
