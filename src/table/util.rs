@@ -167,11 +167,21 @@ pub fn compare_prefixed_slice(
         return compare_prefixed_slice_lexicographic(prefix, suffix, needle);
     }
 
-    // Slow path: reconstruct the full key for custom comparators.
-    // Allocates a temporary Vec per comparison. This is acceptable because
-    // custom comparators are uncommon and the allocation is short-lived.
-    // A future `UserComparator::compare_concat` method could eliminate this.
-    let mut full_key = Vec::with_capacity(prefix.len() + suffix.len());
+    // Slow path: materialize prefix+suffix into a contiguous buffer for
+    // custom comparators. Uses a stack buffer for typical key sizes to
+    // avoid heap allocation on the hot binary-search path.
+    const STACK_BUF_LEN: usize = 256;
+    let total_len = prefix.len() + suffix.len();
+
+    if total_len <= STACK_BUF_LEN {
+        let mut buf = [0_u8; STACK_BUF_LEN];
+        buf[..prefix.len()].copy_from_slice(prefix);
+        buf[prefix.len()..total_len].copy_from_slice(suffix);
+        return cmp.compare(&buf[..total_len], needle);
+    }
+
+    // Fallback for unusually large keys: allocate a temporary Vec.
+    let mut full_key = Vec::with_capacity(total_len);
     full_key.extend_from_slice(prefix);
     full_key.extend_from_slice(suffix);
     cmp.compare(&full_key, needle)
