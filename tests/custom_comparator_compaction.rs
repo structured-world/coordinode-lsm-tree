@@ -1,7 +1,15 @@
 use lsm_tree::compaction::{Leveled, SizeTiered};
 use lsm_tree::{
-    AbstractTree, Config, Guard, MergeOperator, SeqNo, SequenceNumberCounter, SharedComparator,
-    UserComparator, UserValue,
+    // Guard import is required: into_inner() is a trait method from IterGuard (re-exported as Guard)
+    AbstractTree,
+    Config,
+    Guard as _,
+    MergeOperator,
+    SeqNo,
+    SequenceNumberCounter,
+    SharedComparator,
+    UserComparator,
+    UserValue,
 };
 use std::cmp::Ordering;
 use std::sync::Arc;
