@@ -5,10 +5,7 @@
 // Format constants live in writer (the format definition site).
 // Extracting to a shared module is an upstream structural decision.
 use super::writer::{validate_header_crc, BLOB_HEADER_MAGIC_V3, BLOB_HEADER_MAGIC_V4};
-use crate::{
-    vlog::{blob_file::meta::METADATA_HEADER_MAGIC, BlobFileId},
-    Checksum, SeqNo, UserKey, UserValue,
-};
+use crate::{vlog::BlobFileId, Checksum, SeqNo, UserKey, UserValue};
 use byteorder::{LittleEndian, ReadBytesExt};
 use std::{
     fs::File,
@@ -16,31 +13,73 @@ use std::{
     path::Path,
 };
 
-/// Reads through a blob file in order
+/// Reads through a blob file in order.
+///
+/// Termination is determined by the SFA table-of-contents: the scanner
+/// stops when the read position reaches the end of the "data" section,
+/// not when it encounters specific magic bytes. This avoids silent data
+/// loss if corrupted frame bytes happen to match the metadata header
+/// magic (`META`).
 pub struct Scanner {
     pub(crate) blob_file_id: BlobFileId, // TODO: remove unused?
     inner: BufReader<File>,
     is_terminated: bool,
+
+    /// Byte offset where the "data" section ends (from the SFA TOC).
+    data_end: u64,
 }
 
 impl Scanner {
     /// Initializes a new blob file reader.
     ///
+    /// Reads the SFA table-of-contents to determine the "data" section
+    /// boundary, then positions the reader at the start of the data
+    /// section.
+    ///
     /// # Errors
     ///
-    /// Will return `Err` if an IO error occurs.
+    /// Will return `Err` if an IO error occurs or the blob file lacks
+    /// a "data" section.
     pub fn new<P: AsRef<Path>>(path: P, blob_file_id: BlobFileId) -> crate::Result<Self> {
-        let file_reader = BufReader::with_capacity(32_000, File::open(path)?);
-        Ok(Self::with_reader(blob_file_id, file_reader))
+        let path = path.as_ref();
+
+        let sfa_reader = sfa::Reader::new(path)?;
+        let data_section = sfa_reader
+            .toc()
+            .section(b"data")
+            .ok_or(crate::Error::InvalidHeader(
+                "BlobFile: missing data section",
+            ))?;
+        let data_start = data_section.pos();
+        let data_end = data_start + data_section.len();
+
+        let mut file_reader = BufReader::with_capacity(32_000, File::open(path)?);
+        file_reader.seek(std::io::SeekFrom::Start(data_start))?;
+
+        Ok(Self {
+            blob_file_id,
+            inner: file_reader,
+            is_terminated: false,
+            data_end,
+        })
     }
 
-    /// Initializes a new blob file reader.
+    /// Initializes a new blob file reader with a pre-opened reader.
+    ///
+    /// `data_end` is the byte offset where the "data" section ends
+    /// (obtained from the SFA table-of-contents). The reader must
+    /// already be positioned at the start of the data section.
     #[must_use]
-    pub fn with_reader(blob_file_id: BlobFileId, file_reader: BufReader<File>) -> Self {
+    pub fn with_reader(
+        blob_file_id: BlobFileId,
+        file_reader: BufReader<File>,
+        data_end: u64,
+    ) -> Self {
         Self {
             blob_file_id,
             inner: file_reader,
             is_terminated: false,
+            data_end,
         }
     }
 }
@@ -64,16 +103,18 @@ impl Iterator for Scanner {
 
         let offset = fail_iter!(self.inner.stream_position());
 
+        // Terminate when the read position reaches the end of the "data"
+        // section (from the SFA TOC), not when magic bytes match META.
+        if offset >= self.data_end {
+            self.is_terminated = true;
+            return None;
+        }
+
         let frame_is_v4;
 
         {
             let mut buf = [0; BLOB_HEADER_MAGIC_V4.len()];
             fail_iter!(self.inner.read_exact(&mut buf));
-
-            if buf == METADATA_HEADER_MAGIC {
-                self.is_terminated = true;
-                return None;
-            }
 
             frame_is_v4 = buf == BLOB_HEADER_MAGIC_V4;
             if !frame_is_v4 && buf != BLOB_HEADER_MAGIC_V3 {
@@ -363,6 +404,56 @@ mod tests {
         assert!(
             matches!(result, Err(crate::Error::InvalidHeader("Blob"))),
             "expected InvalidHeader for bad magic, got: {result:?}",
+        );
+
+        Ok(())
+    }
+
+    /// Corruption that produces META bytes at a frame boundary must
+    /// surface as an error, not silently terminate iteration.
+    ///
+    /// Regression test for #50: the old scanner checked for `b"META"`
+    /// magic to detect the metadata section boundary, which meant
+    /// corruption matching those bytes caused silent data loss.
+    #[test]
+    fn blob_scanner_meta_corruption_is_not_silent_eof() -> crate::Result<()> {
+        let dir = tempdir()?;
+        let blob_file_path = dir.path().join("0");
+
+        {
+            let mut writer = BlobFileWriter::new(&blob_file_path, 0, 0)?;
+            writer.write(b"a", 0, &b"v".repeat(50))?;
+            writer.write(b"b", 1, &b"w".repeat(50))?;
+            writer.finish()?;
+        }
+
+        // Read the raw file and find the start of the second frame by
+        // scanning for the V4 magic after the first frame.
+        let mut raw = std::fs::read(&blob_file_path)?;
+        let second_frame_offset = {
+            use crate::vlog::blob_file::writer::BLOB_HEADER_LEN_V4;
+            // First frame: header + key("a") + value(50 bytes)
+            BLOB_HEADER_LEN_V4 + 1 + 50
+        };
+
+        // Corrupt the second frame's magic to b"META".
+        raw[second_frame_offset..second_frame_offset + 4].copy_from_slice(b"META");
+        std::fs::write(&blob_file_path, &raw)?;
+
+        let mut scanner = Scanner::new(&blob_file_path, 0)?;
+
+        // First frame should still be readable (it's intact).
+        let first = scanner.next().unwrap();
+        assert!(first.is_ok(), "first frame should be OK: {first:?}");
+
+        // Second frame has corrupted magic — scanner must return an
+        // error, NOT silently terminate.
+        let second = scanner
+            .next()
+            .expect("scanner must not silently terminate on META-corrupted magic");
+        assert!(
+            matches!(second, Err(crate::Error::InvalidHeader("Blob"))),
+            "expected InvalidHeader for META-corrupted magic, got: {second:?}",
         );
 
         Ok(())
