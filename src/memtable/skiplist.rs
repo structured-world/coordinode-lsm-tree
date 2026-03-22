@@ -75,9 +75,9 @@ const fn node_size(height: usize) -> u32 {
 /// A concurrent ordered map backed by an arena-allocated skiplist.
 ///
 /// Provides lock-free traversal and CAS-based inserts with O(log n) expected
-/// time.  Value storage uses a mutex-protected Vec (see `values` field), so
-/// value reads acquire a brief lock.  Keys are [`InternalKey`] (ordered by
-/// `user_key` ascending, then seqno descending).
+/// time.  Values are stored in a lock-free segmented [`ValueStore`] so large
+/// blobs do not bloat the arena; value reads are wait-free.  Keys are
+/// [`InternalKey`] (ordered by `user_key` ascending, then seqno descending).
 pub struct SkipMap {
     arena: Arena,
     /// Lock-free segmented storage for values.  Keys live in the arena for

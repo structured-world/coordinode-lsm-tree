@@ -188,15 +188,14 @@ impl Arena {
         let block_idx = (offset >> BLOCK_SHIFT) as usize;
         let off = (offset & BLOCK_MASK) as usize;
 
-        // Block pointers are write-once.  In the common case the Acquire load
-        // sees the non-null pointer immediately.  The spin is a safety net for
-        // the rare window between cursor advance and ensure_block completion
-        // on another core.
-        let mut ptr = self.blocks[block_idx].load(Ordering::Acquire);
-        while ptr.is_null() {
-            std::hint::spin_loop();
-            ptr = self.blocks[block_idx].load(Ordering::Acquire);
-        }
+        // Ensure the block exists.  This is a no-op (single atomic load) if
+        // the block is already allocated.  Calling ensure_block here is the
+        // only fully reliable approach because alloc()'s ensure_block runs
+        // before its CAS, and a failed CAS means the block might never be
+        // ensured by that thread.
+        self.ensure_block(block_idx);
+        let ptr = self.blocks[block_idx].load(Ordering::Acquire);
+        debug_assert!(!ptr.is_null());
 
         (ptr, off)
     }

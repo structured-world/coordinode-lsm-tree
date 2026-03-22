@@ -34,8 +34,7 @@ pub struct Memtable {
     ///
     /// Nodes are allocated from a contiguous byte arena for cache locality
     /// and O(1) bulk deallocation when the memtable is dropped.  Traversal of
-    /// the skiplist index uses atomic loads and CAS for inserts; accessing the
-    /// associated values may still acquire internal locks.
+    /// the skiplist index uses atomic loads and CAS for inserts.
     #[doc(hidden)]
     pub items: skiplist::SkipMap,
 
