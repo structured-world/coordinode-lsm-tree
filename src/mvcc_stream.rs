@@ -231,12 +231,14 @@ impl<I: DoubleEndedIterator<Item = crate::Result<InternalValue>>> Iterator for M
     fn next(&mut self) -> Option<Self::Item> {
         let head = fail_iter!(self.inner.next()?);
 
-        if head.key.value_type.is_merge_operand() && !self.is_rt_suppressed(&head) {
+        if head.key.value_type.is_merge_operand() {
             // Clone the Arc (not the operator) — resolve_merge_forward needs
             // &mut self which conflicts with borrowing self.merge_operator.
             if let Some(merge_op) = self.merge_operator.clone() {
-                let result = self.resolve_merge_forward(&head, merge_op.as_ref());
-                return Some(result);
+                if !self.is_rt_suppressed(&head) {
+                    let result = self.resolve_merge_forward(&head, merge_op.as_ref());
+                    return Some(result);
+                }
             }
         }
 
