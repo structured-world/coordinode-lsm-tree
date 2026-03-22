@@ -294,11 +294,20 @@ mod tests {
             sfa_writer.write_all(b"BLOB")?;
             sfa_writer.write_u128::<LittleEndian>(checksum)?;
             sfa_writer.write_u64::<LittleEndian>(42)?; // seqno
-            #[expect(clippy::cast_possible_truncation)]
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "test key length fits in u16"
+            )]
             sfa_writer.write_u16::<LittleEndian>(key.len() as u16)?;
-            #[expect(clippy::cast_possible_truncation)]
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "test value length fits in u32"
+            )]
             sfa_writer.write_u32::<LittleEndian>(value.len() as u32)?; // real_val_len
-            #[expect(clippy::cast_possible_truncation)]
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "test value length fits in u32"
+            )]
             sfa_writer.write_u32::<LittleEndian>(value.len() as u32)?; // on_disk_val_len
             sfa_writer.write_all(key)?;
             sfa_writer.write_all(value)?;

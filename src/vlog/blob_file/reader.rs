@@ -848,11 +848,20 @@ mod tests {
             sfa_writer.write_all(b"BLOB")?;
             sfa_writer.write_u128::<byteorder::LittleEndian>(checksum)?;
             sfa_writer.write_u64::<byteorder::LittleEndian>(42)?; // seqno
-            #[expect(clippy::cast_possible_truncation)]
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "test key length fits in u16"
+            )]
             sfa_writer.write_u16::<byteorder::LittleEndian>(key.len() as u16)?;
-            #[expect(clippy::cast_possible_truncation)]
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "test value length fits in u32"
+            )]
             sfa_writer.write_u32::<byteorder::LittleEndian>(value.len() as u32)?;
-            #[expect(clippy::cast_possible_truncation)]
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "test value length fits in u32"
+            )]
             sfa_writer.write_u32::<byteorder::LittleEndian>(value.len() as u32)?;
             sfa_writer.write_all(key)?;
             sfa_writer.write_all(value)?;
@@ -907,7 +916,10 @@ mod tests {
         let handle = ValueHandle {
             blob_file_id: 0,
             offset: data_start,
-            #[expect(clippy::cast_possible_truncation)]
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "test value length fits in u32"
+            )]
             on_disk_size: value.len() as u32,
         };
 
