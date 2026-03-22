@@ -570,7 +570,10 @@ impl SkipMap {
         };
 
         // Walk down from the list height to the target level, narrowing
-        // the search window at each level above `level`.
+        // Walk down from the list height, narrowing the search window at
+        // each level above `level`.  `node` starts at preds[level+1] (or
+        // head) whose height >= level+1; we only advance to nodes reachable
+        // at level `lv`, so every node touched has height > lv.
         let list_h = self.height.load(Ordering::Acquire);
         for lv in (level + 1..list_h).rev() {
             let mut next = self.next_at(node, lv);
