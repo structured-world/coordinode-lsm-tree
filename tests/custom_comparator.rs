@@ -391,3 +391,32 @@ fn reopen_default_tree_with_default_comparator_succeeds() -> lsm_tree::Result<()
 
     Ok(())
 }
+
+/// Comparator with a name exceeding the 256-byte limit.
+struct OversizedNameComparator;
+
+impl UserComparator for OversizedNameComparator {
+    fn name(&self) -> &'static str {
+        // 300 chars — exceeds MAX_COMPARATOR_NAME_BYTES (256)
+        "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+    }
+
+    fn compare(&self, a: &[u8], b: &[u8]) -> Ordering {
+        a.cmp(b)
+    }
+}
+
+#[test]
+fn oversized_comparator_name_rejected_on_create() {
+    let folder = tempfile::tempdir().unwrap();
+    let cmp: SharedComparator = Arc::new(OversizedNameComparator);
+
+    let result = Config::new(&folder, Default::default(), Default::default())
+        .comparator(cmp)
+        .open();
+
+    assert!(
+        matches!(result, Err(lsm_tree::Error::Io(_))),
+        "expected Io error for oversized comparator name"
+    );
+}
