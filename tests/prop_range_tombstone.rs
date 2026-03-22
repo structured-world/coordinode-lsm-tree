@@ -44,7 +44,7 @@ impl RtOracle {
             *rt_seqno < read_seqno
                 && key >= start.as_slice()
                 && key < end.as_slice()
-                && *rt_seqno >= kv_seqno
+                && *rt_seqno > kv_seqno
         })
     }
 
