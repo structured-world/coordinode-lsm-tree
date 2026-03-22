@@ -32,13 +32,13 @@ pub struct FsOpenOptions {
     pub read: bool,
     /// Open for writing.
     pub write: bool,
-    /// Create the file if it does not exist (requires `write`).
+    /// Create the file if it does not exist.
     pub create: bool,
-    /// Fail if the file already exists (requires `write` and `create`).
+    /// Create a new file and fail if it already exists.
     pub create_new: bool,
-    /// Truncate the file to zero length on open (requires `write`).
+    /// Truncate the file to zero length on open.
     pub truncate: bool,
-    /// Open in append mode (requires `write`).
+    /// Open in append mode, so writes go to the end of the file.
     pub append: bool,
 }
 

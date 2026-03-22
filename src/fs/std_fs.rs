@@ -140,12 +140,16 @@ impl Fs for StdFs {
     }
 
     fn sync_directory(&self, path: &Path) -> io::Result<()> {
-        // Mirrors crate::file::fsync_directory — debug_assert only, matching
-        // existing codebase convention. Callers are internal and always pass dirs.
         #[cfg(not(target_os = "windows"))]
         {
+            let metadata = std::fs::metadata(path)?;
+            if !metadata.is_dir() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "sync_directory: path is not a directory",
+                ));
+            }
             let dir = File::open(path)?;
-            debug_assert!(dir.metadata()?.is_dir());
             dir.sync_all()
         }
 
@@ -205,9 +209,7 @@ mod sys {
         // https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-lockfileex
         const LOCKFILE_EXCLUSIVE_LOCK: u32 = 0x0000_0002;
 
-        // allow (not expect) — this block only compiles on Windows, so #[expect]
-        // would fire "unfulfilled lint expectation" on other platforms.
-        #[allow(non_snake_case)] // FFI name matches Windows API
+        #[expect(non_snake_case, reason = "FFI name matches Windows API")]
         unsafe extern "system" {
             fn LockFileEx(
                 h_file: *mut std::ffi::c_void,
