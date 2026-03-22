@@ -796,7 +796,9 @@ impl Table {
             return Ok(true);
         }
 
-        // Unpinned full filter — load from disk
+        // Unpinned full filter — load from disk.
+        // Safe: if we reach here, filter_tli is None (no partitioned filter),
+        // so regions.filter is a single full-table bloom, not a concatenation.
         if let Some(filter_block_handle) = &self.regions.filter {
             let block = self.load_block(
                 filter_block_handle,
