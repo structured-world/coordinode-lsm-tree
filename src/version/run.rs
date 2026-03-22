@@ -105,7 +105,7 @@ impl<T: Ranged> Run<T> {
 
     /// Like [`get_for_key`], but uses a custom comparator for key ordering.
     ///
-    /// Run tables are sorted by key_range in comparator order (set during
+    /// Run tables are sorted by `key_range` in comparator order (set during
     /// table build from the comparator-sorted memtable), so the binary
     /// search here must use the same comparator to find the right table.
     pub fn get_for_key_cmp(
