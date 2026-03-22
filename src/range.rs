@@ -285,17 +285,17 @@ impl TreeIter {
                                         return false;
                                     }
 
-                                    match table.maybe_contains_prefix(prefix_hash) {
-                                        Ok(false) => false,
-                                        Ok(true) => true,
-                                        Err(e) => {
+                                    // On I/O error reading the filter, include the
+                                    // table conservatively to avoid missing data.
+                                    table
+                                        .maybe_contains_prefix(prefix_hash)
+                                        .inspect_err(|e| {
                                             log::debug!(
                                                 "prefix bloom check failed for table {:?}: {e}",
                                                 table.id(),
                                             );
-                                            true
-                                        }
-                                    }
+                                        })
+                                        .unwrap_or(true)
                                 })
                                 .cloned()
                                 .collect();
