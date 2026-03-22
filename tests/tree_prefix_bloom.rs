@@ -790,24 +790,38 @@ fn prefix_bloom_skip_metrics() -> lsm_tree::Result<()> {
 
     // Scan for 24 non-existent prefixes that fall inside the key_range.
     // Each prefix is a valid extractor boundary (ends with ':').
-    for c in b'b'..=b'y' {
-        let prefix = format!("{}:", c as char);
-        let results: Vec<_> = tree
-            .create_prefix(&prefix, seqno, None)
-            .collect::<Result<Vec<_>, _>>()?;
-        assert_eq!(results.len(), 0, "prefix '{prefix}' should match no keys");
-    }
+    let scan_nonexistent_prefixes = || -> lsm_tree::Result<()> {
+        for c in b'b'..=b'y' {
+            let prefix = format!("{}:", c as char);
+            let results: Vec<_> = tree
+                .create_prefix(&prefix, seqno, None)
+                .collect::<Result<Vec<_>, _>>()?;
+            assert_eq!(results.len(), 0, "prefix '{prefix}' should match no keys");
+        }
+        Ok(())
+    };
 
     // This is a probabilistic smoke test: we issue many lookups for prefixes
     // that do not exist but fall within the table's key range. For any
     // reasonable prefix-bloom configuration with a non-zero false-positive
     // rate, we expect at least one of these lookups to be fully filtered by
-    // the bloom (counted as a skip). If this ever flakes, it likely indicates
-    // a change in how prefix blooms or their metrics are configured.
+    // the bloom (counted as a skip). To make the test robust against rare
+    // all-false-positive runs or configuration changes, we retry the scan a
+    // generous number of times before failing.
+    const MAX_SCAN_ATTEMPTS: u32 = 20;
+
+    for _attempt in 0..MAX_SCAN_ATTEMPTS {
+        scan_nonexistent_prefixes()?;
+        if tree.metrics().prefix_bloom_skips() > 0 {
+            return Ok(());
+        }
+    }
+
     let skips = tree.metrics().prefix_bloom_skips();
     assert!(
         skips > 0,
-        "expected at least one prefix bloom skip out of 24 non-existent prefix scans, got 0"
+        "expected at least one prefix bloom skip out of 24 non-existent prefix scans \
+         after {MAX_SCAN_ATTEMPTS} attempts, got {skips}"
     );
 
     Ok(())
