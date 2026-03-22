@@ -64,8 +64,9 @@ pub fn prefill_prefix_keys(
             let mut key = Vec::with_capacity(config.key_size);
             key.extend_from_slice(&prefix_bytes);
             // Use u16 suffix to keep minimum key size at 4 bytes (2+2).
-            // Break if suffix exceeds u16 range (> 65535 keys per prefix).
-            // This caps total keys at 256 * 65535 ≈ 16M for NUM_PREFIXES=256.
+            // Break if suffix exceeds u16 range (> 65_536 keys per prefix).
+            // With a u16 suffix this caps total keys at num_prefixes * 65_536
+            // (e.g. 256 * 65_536 = 16.8M for NUM_PREFIXES=256).
             let Ok(suffix_u16) = u16::try_from(suffix) else {
                 eprintln!(
                     "Warning: prefix {prefix} truncated at {} keys (u16 suffix overflow)",

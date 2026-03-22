@@ -1,8 +1,8 @@
 // Property-based model test: compare lsm-tree against BTreeMap oracle.
 //
 // The oracle models MVCC using (key, Reverse(seqno)) ordering, where
-// None values represent tombstones. Range tombstones are stored separately
-// and applied during reads.
+// None values represent tombstones. This oracle only models point
+// tombstones; range tombstones are tested separately in prop_range_tombstone.rs.
 
 mod common;
 

@@ -7,6 +7,7 @@ use crate::config::{BenchConfig, Compression};
 use crate::reporter::{JsonConfig, Reporter};
 use crate::workloads::{available_benchmarks, create_workload};
 use clap::Parser;
+use lsm_tree::AbstractTree; // for get_highest_seqno
 use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
 
@@ -176,7 +177,10 @@ fn run_single(
     );
 
     let tree = config::create_tree(&db_path, bench_config)?;
-    let seqno = AtomicU64::new(1);
+    // When --db reuses a directory, start from existing highest seqno to
+    // avoid duplicate/non-monotonic sequence numbers.
+    let initial_seqno = tree.get_highest_seqno().map_or(1, |s| s.saturating_add(1));
+    let seqno = AtomicU64::new(initial_seqno);
     let mut reporter = Reporter::new();
 
     let workload = create_workload(benchmark_name)
