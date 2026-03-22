@@ -136,6 +136,26 @@ impl Iterator for Scanner {
             None
         };
 
+        // Verify the declared frame payload fits within the data section
+        // before allocating buffers. Without this, a corrupted key_len or
+        // on_disk_val_len could cause a huge allocation or read past
+        // data_end into the TOC/trailer region.
+        {
+            let header_len = if frame_is_v4 {
+                super::writer::BLOB_HEADER_LEN_V4 as u64
+            } else {
+                super::writer::BLOB_HEADER_LEN_V3 as u64
+            };
+            let frame_end = offset
+                .saturating_add(header_len)
+                .saturating_add(u64::from(key_len))
+                .saturating_add(u64::from(on_disk_val_len));
+            if frame_end > self.data_end {
+                self.is_terminated = true;
+                return Some(Err(crate::Error::InvalidHeader("Blob")));
+            }
+        }
+
         let key = fail_iter!(UserKey::from_reader(&mut self.inner, key_len as usize));
 
         let value = fail_iter!(UserValue::from_reader(
