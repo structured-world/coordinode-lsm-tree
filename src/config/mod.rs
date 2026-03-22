@@ -180,6 +180,7 @@ pub struct Config<F: Fs = StdFs> {
     ///
     // All Config fields are `#[doc(hidden)] pub` by convention — callers use
     // builder methods or `..Default::default()`, not struct literals directly.
+    // A `with_fs()` builder will be added when call-site refactoring lands.
     #[doc(hidden)]
     pub fs: Arc<F>,
 

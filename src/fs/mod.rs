@@ -22,7 +22,10 @@ use std::path::{Path, PathBuf};
 /// Options for opening a file through the [`Fs`] trait.
 ///
 /// Mirrors the builder API of [`std::fs::OpenOptions`].
-#[allow(clippy::struct_excessive_bools)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "mirrors std::fs::OpenOptions which uses bool flags for each mode"
+)]
 #[derive(Clone, Debug)]
 pub struct FsOpenOptions {
     /// Open for reading.
