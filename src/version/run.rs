@@ -88,6 +88,10 @@ impl<T: Ranged> Run<T> {
     }
 
     /// Like [`push`], but sorts tables using a custom comparator for key ordering.
+    ///
+    /// Re-sorts the entire run on each call (mirrors [`push`] behavior).
+    /// Acceptable for typical run sizes (<100 tables); for bulk insertion
+    /// use [`extend`] followed by a single sort.
     pub fn push_cmp(&mut self, item: T, cmp: &dyn UserComparator) {
         self.0.push(item);
 
