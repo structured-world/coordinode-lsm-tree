@@ -78,6 +78,8 @@ impl<T: Ranged> Run<T> {
     /// Pushes a table into the run and re-sorts by min key using lexicographic
     /// byte ordering. Only correct when the tree uses the default comparator.
     /// For custom comparators, use [`push_cmp`] instead.
+    ///
+    /// Kept public for backward compatibility with existing callers and unit tests.
     pub fn push(&mut self, item: T) {
         self.0.push(item);
 
@@ -160,6 +162,8 @@ impl<T: Ranged> Run<T> {
     }
 
     /// Like [`get_overlapping`], but uses a custom comparator for key ordering.
+    ///
+    /// Lifetime on `key_range` mirrors [`get_overlapping`] for API consistency.
     pub fn get_overlapping_cmp<'a>(
         &'a self,
         key_range: &'a KeyRange,
