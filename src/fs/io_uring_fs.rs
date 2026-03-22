@@ -479,6 +479,12 @@ impl RingThread {
                     Ok(_) => break,
                     Err(ref e) if e.raw_os_error() == Some(4 /* EINTR */) => {}
                     Err(e) => {
+                        // Fatal ring error — drain all pending callers with
+                        // the error. This is safe because: (a) a non-EINTR
+                        // submit_and_wait failure means the ring fd is bad
+                        // or the kernel rejected the submission, so no SQEs
+                        // are in-flight referencing caller buffers; (b) the
+                        // IoUring is dropped on return, cancelling any ops.
                         let errno = e.raw_os_error().unwrap_or(5 /* EIO */);
                         for (_, tx) in pending.drain() {
                             let _ = tx.send(-errno);
@@ -593,6 +599,8 @@ impl RingThread {
 
     /// Submits a pwrite to the ring and blocks until completion.
     fn submit_write(&self, fd: i32, buf: &[u8], offset: u64) -> io::Result<u32> {
+        // io_uring SQE length field is u32. In practice LSM block writes
+        // are 4-64 KB, so the cap is never reached.
         let len = u32::try_from(buf.len()).unwrap_or(u32::MAX);
         let (tx, rx) = mpsc::sync_channel(1);
         let op = Op {
