@@ -4,6 +4,9 @@
 // When `optimize_runs` merges disjoint L0 tables from different flush epochs,
 // a newer point tombstone can end up in a run iterated AFTER an older value,
 // causing `get()` to return stale data instead of None.
+//
+// `optimize_runs` is called on every version creation (flush, compaction),
+// so flushing multiple memtables is sufficient to trigger the reordering.
 
 use lsm_tree::{get_tmp_folder, AbstractTree, AnyTree, Config, SequenceNumberCounter};
 use test_log::test;
