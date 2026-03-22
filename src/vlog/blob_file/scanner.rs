@@ -343,7 +343,6 @@ mod tests {
     /// Scanner rejects frames with invalid magic (neither V3 nor V4).
     #[test]
     fn blob_scanner_rejects_invalid_magic() -> crate::Result<()> {
-        use crate::vlog::blob_file::writer::BLOB_HEADER_MAGIC_V4;
         let dir = tempdir()?;
         let blob_file_path = dir.path().join("0");
 
