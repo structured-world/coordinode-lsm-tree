@@ -5,8 +5,10 @@
 //! Arena-based concurrent skiplist for memtable storage.
 //!
 //! Nodes are allocated from a contiguous [`Arena`] for cache locality and O(1)
-//! bulk deallocation when the memtable is dropped.  Concurrent reads are
-//! lock-free (atomic loads on next-pointers); inserts use CAS with retry.
+//! bulk deallocation when the memtable is dropped.  Concurrent skiplist
+//! traversal is lock-free (atomic loads on next-pointers); inserts use CAS with
+//! retry on tower links.  Values are stored in a separate mutex-protected Vec,
+//! so value access acquires a brief lock.
 //!
 //! The design follows the arena-skiplist pattern used by Pebble/CockroachDB
 //! and Badger, adapted for Rust's ownership model and the lsm-tree
@@ -61,6 +63,7 @@ const OFF_HEIGHT: u32 = 11;
 const OFF_TOWER: u32 = 24;
 
 /// Byte size of a node with the given tower `height`.
+#[allow(clippy::cast_possible_truncation)] // height <= MAX_HEIGHT (20), always fits in u32
 const fn node_size(height: usize) -> u32 {
     OFF_TOWER + (height as u32) * 4
 }
@@ -71,9 +74,10 @@ const fn node_size(height: usize) -> u32 {
 
 /// A concurrent ordered map backed by an arena-allocated skiplist.
 ///
-/// Provides lock-free reads and CAS-based inserts with O(log n) expected
-/// time for both operations.  Keys are [`InternalKey`] (ordered by user_key
-/// ascending, then seqno descending).
+/// Provides lock-free traversal and CAS-based inserts with O(log n) expected
+/// time.  Value storage uses a mutex-protected Vec (see `values` field), so
+/// value reads acquire a brief lock.  Keys are [`InternalKey`] (ordered by
+/// user_key ascending, then seqno descending).
 pub(crate) struct SkipMap {
     arena: Arena,
     /// Heap-backed storage for values.  Keys live in the arena for cache
@@ -102,13 +106,23 @@ impl SkipMap {
 
         // Allocate the head sentinel with MAX_HEIGHT.
         let head_size = node_size(MAX_HEIGHT);
+        #[expect(
+            clippy::expect_used,
+            reason = "arena capacity is a fixed configuration; exhaustion is fatal"
+        )]
         let head = arena
             .alloc(head_size, 4)
             .expect("arena must fit at least the head sentinel");
 
         // Head is zero-initialised by the arena; set the height byte.
+        // SAFETY: head was just allocated with size head_size >= OFF_HEIGHT+1;
+        // we have exclusive access because no other thread can see this arena yet.
         unsafe {
-            arena.get_bytes_mut(head, head_size)[OFF_HEIGHT as usize] = MAX_HEIGHT as u8;
+            let bytes = arena.get_bytes_mut(head, head_size);
+            #[allow(clippy::indexing_slicing)] // OFF_HEIGHT (11) < head_size (104) by construction
+            {
+                bytes[OFF_HEIGHT as usize] = MAX_HEIGHT as u8;
+            }
         }
 
         // Seed PRNG with an address-derived non-zero value.
@@ -139,6 +153,7 @@ impl SkipMap {
     ///
     /// Multiple entries with the same `user_key` but different `seqno` are
     /// expected (MVCC).  No deduplication is performed.
+    #[allow(clippy::indexing_slicing)] // preds/succs are [u32; MAX_HEIGHT]; level < height <= MAX_HEIGHT
     pub fn insert(&self, key: &InternalKey, value: &UserValue) {
         let height = self.random_height();
         let node = self.alloc_node(key, value, height);
@@ -164,12 +179,18 @@ impl SkipMap {
 
         for level in 0..height {
             loop {
+                // SAFETY: `node` was allocated with `height` levels and
+                // `level < height`, so `tower_atomic(node, level)` is within
+                // the node's arena allocation.
                 // new_node.next[level] = succs[level]
                 unsafe {
                     self.tower_atomic(node, level)
                         .store(succs[level], Ordering::Release);
                 }
 
+                // SAFETY: `preds[level]` is a valid node established by
+                // `find_splice` — either the head sentinel (MAX_HEIGHT levels)
+                // or a previously inserted node with height > level.
                 // CAS pred.next[level] from succs[level] to new_node
                 let pred_next = unsafe { self.tower_atomic(preds[level], level) };
                 match pred_next.compare_exchange_weak(
@@ -243,14 +264,21 @@ impl SkipMap {
     ///
     /// Key data is stored in the arena for comparison locality.
     /// Value data is appended to the heap-backed `values` Vec.
+    #[allow(clippy::cast_possible_truncation)] // key_bytes.len() <= u16::MAX, value idx <= u32::MAX, height <= MAX_HEIGHT (20)
     fn alloc_node(&self, key: &InternalKey, value: &UserValue, height: usize) -> u32 {
         let key_bytes: &[u8] = &key.user_key;
 
         // Allocate key data in the arena.
+        #[expect(
+            clippy::expect_used,
+            reason = "arena capacity is fixed; exhaustion is fatal"
+        )]
         let key_offset = self
             .arena
             .alloc(key_bytes.len() as u32, 1)
             .expect("arena exhausted (key data)");
+        // SAFETY: key_offset was just allocated with size key_bytes.len();
+        // exclusive access before publish.
         unsafe {
             self.arena
                 .get_bytes_mut(key_offset, key_bytes.len() as u32)
@@ -271,18 +299,36 @@ impl SkipMap {
 
         // Allocate the node header + tower.
         let n_size = node_size(height);
+        #[expect(
+            clippy::expect_used,
+            reason = "arena capacity is fixed; exhaustion is fatal"
+        )]
         let node = self.arena.alloc(n_size, 4).expect("arena exhausted (node)");
 
         // Write immutable metadata.
+        // SAFETY: node was just allocated with size >= OFF_TOWER (24 bytes);
+        // exclusive access before publish.
         unsafe {
             let meta = self.arena.get_bytes_mut(node, OFF_TOWER);
-            meta[0..4].copy_from_slice(&key_offset.to_ne_bytes());
-            meta[4..8].copy_from_slice(&value_idx.to_ne_bytes());
-            meta[8..10].copy_from_slice(&(key_bytes.len() as u16).to_ne_bytes());
-            meta[10] = u8::from(key.value_type);
-            meta[11] = height as u8;
-            // meta[12..16] reserved (padding)
-            meta[16..24].copy_from_slice(&key.seqno.to_ne_bytes());
+
+            let (key_off_bytes, rest) = meta.split_at_mut(4);
+            key_off_bytes.copy_from_slice(&key_offset.to_ne_bytes());
+            let (val_idx_bytes, rest) = rest.split_at_mut(4);
+            val_idx_bytes.copy_from_slice(&value_idx.to_ne_bytes());
+            let (key_len_bytes, rest) = rest.split_at_mut(2);
+            key_len_bytes.copy_from_slice(&(key_bytes.len() as u16).to_ne_bytes());
+            // value_type and height are single bytes
+            if let Some(vt_byte) = rest.first_mut() {
+                *vt_byte = u8::from(key.value_type);
+            }
+            if let Some(h_byte) = rest.get_mut(1) {
+                *h_byte = height as u8;
+            }
+            // rest[2..6] is reserved padding, skip it
+            // seqno at rest[6..14] (= original offset 16..24)
+            if let Some(seqno_bytes) = rest.get_mut(6..14) {
+                seqno_bytes.copy_from_slice(&key.seqno.to_ne_bytes());
+            }
             // Tower entries are already zero (= UNSET) from arena zero-init.
         }
 
@@ -302,26 +348,51 @@ impl SkipMap {
         self.arena.get_bytes(node, OFF_TOWER)
     }
 
+    #[allow(clippy::indexing_slicing)] // metadata is exactly OFF_TOWER (24) bytes by construction
+    #[expect(
+        clippy::expect_used,
+        reason = "infallible: 4-byte slice always converts to [u8; 4]"
+    )]
     fn node_key_offset(&self, node: u32) -> u32 {
         let m = unsafe { self.meta(node) };
         u32::from_ne_bytes(m[0..4].try_into().expect("4 bytes"))
     }
 
+    #[allow(clippy::indexing_slicing)] // metadata is exactly OFF_TOWER (24) bytes by construction
+    #[expect(
+        clippy::expect_used,
+        reason = "infallible: 2-byte slice always converts to [u8; 2]"
+    )]
     fn node_key_len(&self, node: u32) -> u16 {
         let m = unsafe { self.meta(node) };
         u16::from_ne_bytes(m[8..10].try_into().expect("2 bytes"))
     }
 
+    #[allow(clippy::indexing_slicing)] // metadata is exactly OFF_TOWER (24) bytes by construction
+    #[expect(
+        clippy::expect_used,
+        reason = "ValueType discriminant written during alloc_node is always valid"
+    )]
     fn node_value_type(&self, node: u32) -> ValueType {
         let m = unsafe { self.meta(node) };
         ValueType::try_from(m[10]).expect("valid ValueType discriminant")
     }
 
+    #[allow(clippy::indexing_slicing)] // metadata is exactly OFF_TOWER (24) bytes by construction
+    #[expect(
+        clippy::expect_used,
+        reason = "infallible: 4-byte slice always converts to [u8; 4]"
+    )]
     fn node_value_idx(&self, node: u32) -> u32 {
         let m = unsafe { self.meta(node) };
         u32::from_ne_bytes(m[4..8].try_into().expect("4 bytes"))
     }
 
+    #[allow(clippy::indexing_slicing)] // metadata is exactly OFF_TOWER (24) bytes by construction
+    #[expect(
+        clippy::expect_used,
+        reason = "infallible: 8-byte slice always converts to [u8; 8]"
+    )]
     fn node_seqno(&self, node: u32) -> SeqNo {
         let m = unsafe { self.meta(node) };
         u64::from_ne_bytes(m[16..24].try_into().expect("8 bytes"))
@@ -349,12 +420,14 @@ impl SkipMap {
     /// Clones the value for `node` from the heap-backed values Vec.
     #[expect(
         clippy::expect_used,
-        reason = "Mutex is never poisoned in normal operation"
+        reason = "Mutex is never poisoned in normal operation; value_idx is always valid"
     )]
     fn node_value(&self, node: u32) -> UserValue {
         let idx = self.node_value_idx(node) as usize;
         let vals = self.values.lock().expect("values lock poisoned");
-        vals[idx].clone()
+        vals.get(idx)
+            .expect("value_idx is set during alloc_node and always valid")
+            .clone()
     }
 
     // -----------------------------------------------------------------------
@@ -367,12 +440,16 @@ impl SkipMap {
     ///
     /// `level` must be < the node's height.
     unsafe fn tower_atomic(&self, node: u32, level: usize) -> &std::sync::atomic::AtomicU32 {
+        // SAFETY: caller guarantees level < node height; node + OFF_TOWER + level*4
+        // is within the node's arena allocation and 4-byte aligned.
         self.arena
             .get_atomic_u32(node + OFF_TOWER + (level as u32) * 4)
     }
 
     /// Loads the next-pointer at `level` for `node`.
     fn next_at(&self, node: u32, level: usize) -> u32 {
+        // SAFETY: next_at is only called with levels within the node's height
+        // or the head sentinel's MAX_HEIGHT.
         unsafe { self.tower_atomic(node, level).load(Ordering::Acquire) }
     }
 
@@ -406,6 +483,7 @@ impl SkipMap {
     // -----------------------------------------------------------------------
 
     /// Populates `preds` and `succs` arrays with the splice point for `key`.
+    #[allow(clippy::indexing_slicing)] // level < list_h <= MAX_HEIGHT
     fn find_splice(
         &self,
         key: &InternalKey,
@@ -434,6 +512,7 @@ impl SkipMap {
 
     /// Re-searches at a single `level` starting from the stored predecessor
     /// (or a higher-level predecessor as fallback).
+    #[allow(clippy::indexing_slicing)] // level < MAX_HEIGHT; preds/succs are [u32; MAX_HEIGHT]
     fn find_splice_for_level(
         &self,
         key: &InternalKey,
@@ -702,6 +781,13 @@ impl Entry<'_> {
         self.map.node_internal_key(self.node)
     }
 
+    /// Returns a borrowed reference to the raw user_key bytes stored in
+    /// the arena.  This is cheaper than [`key()`](Self::key) when only the
+    /// user_key is needed (avoids allocating a new `Slice`).
+    pub fn user_key_bytes(&self) -> &[u8] {
+        self.map.node_user_key_bytes(self.node)
+    }
+
     /// Reconstructs the value (allocates a new `Slice`).
     pub fn value(&self) -> UserValue {
         self.map.node_value(self.node)
@@ -874,6 +960,12 @@ impl<'a> DoubleEndedIterator for Range<'a> {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[expect(
+    clippy::unwrap_used,
+    clippy::indexing_slicing,
+    clippy::expect_used,
+    reason = "tests use unwrap/indexing/expect for brevity"
+)]
 mod tests {
     use super::*;
     use crate::ValueType;

@@ -29,12 +29,14 @@ pub struct Memtable {
     /// The user key comparator used for ordering entries.
     pub(crate) comparator: SharedComparator,
 
-    /// The actual content, stored in an arena-based lock-free skiplist.
+    /// The actual content, stored in an arena-based skiplist with lock-free traversal.
     ///
     /// Nodes are allocated from a contiguous byte arena for cache locality
-    /// and O(1) bulk deallocation when the memtable is dropped.  Reads are
-    /// lock-free (atomic loads); inserts use CAS with retry.
-    items: skiplist::SkipMap,
+    /// and O(1) bulk deallocation when the memtable is dropped.  Traversal of
+    /// the skiplist index uses atomic loads and CAS for inserts; accessing the
+    /// associated values may still acquire internal locks.
+    #[doc(hidden)]
+    pub items: skiplist::SkipMap,
 
     /// Range tombstones stored in an interval tree.
     ///
@@ -156,8 +158,7 @@ impl Memtable {
         let cmp = self.comparator.as_ref();
 
         let mut iter = self.items.range(lower_bound..).take_while(|entry| {
-            let entry_key = entry.key();
-            cmp.compare(&entry_key.user_key, key) == std::cmp::Ordering::Equal
+            cmp.compare(entry.user_key_bytes(), key) == std::cmp::Ordering::Equal
         });
 
         iter.next().map(|entry| InternalValue {
@@ -180,12 +181,12 @@ impl Memtable {
         // ValueType is not part of InternalKey ordering (only user_key + Reverse(seqno)),
         // so the value type here is arbitrary — it does not affect seek position.
         let lower_bound = InternalKey::new(key, seqno - 1, ValueType::Value);
+        let cmp = self.comparator.as_ref();
 
         self.items
             .range(lower_bound..)
             .take_while(|entry| {
-                let entry_key = entry.key();
-                &*entry_key.user_key == key
+                cmp.compare(entry.user_key_bytes(), key) == std::cmp::Ordering::Equal
             })
             .map(|entry| InternalValue {
                 key: entry.key(),

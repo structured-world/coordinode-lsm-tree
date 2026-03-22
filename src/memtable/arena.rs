@@ -4,10 +4,10 @@
 
 //! Bump-allocating arena for skiplist node storage.
 //!
-//! All node data (metadata, keys, values, tower pointers) is allocated from a
-//! single contiguous byte buffer via an atomic bump pointer.  This gives better
-//! cache locality than per-node heap allocation and enables O(1) bulk
-//! deallocation when the memtable is dropped.
+//! All node data (metadata, keys, tower pointers) is allocated from a single
+//! contiguous byte buffer via an atomic bump pointer.  This gives better cache
+//! locality than per-node heap allocation and enables O(1) bulk deallocation
+//! when the memtable is dropped.
 
 use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -50,8 +50,6 @@ impl Arena {
     pub fn capacity(&self) -> u32 {
         // SAFETY: reading `.len()` is a read-only operation on the boxed slice
         // and does not conflict with concurrent writes to different regions.
-        // SAFETY: reading `.len()` is a read-only operation on the boxed slice
-        // and does not conflict with concurrent writes to different regions.
         unsafe { (&*self.buf.get()).len() as u32 }
     }
 
@@ -60,7 +58,9 @@ impl Arena {
     /// Returns the start offset of the allocated region, or `None` if the
     /// arena is exhausted.  `align` **must** be a power of two.
     pub fn alloc(&self, size: u32, align: u32) -> Option<u32> {
-        debug_assert!(align.is_power_of_two());
+        if !align.is_power_of_two() {
+            return None;
+        }
 
         let cap = self.capacity();
 
@@ -92,9 +92,17 @@ impl Arena {
     /// The caller must ensure that `offset..offset+len` was previously
     /// allocated by this arena and that initial writes to the region have
     /// been completed (with appropriate memory ordering).
+    #[allow(clippy::indexing_slicing)]
     pub unsafe fn get_bytes(&self, offset: u32, len: u32) -> &[u8] {
+        // SAFETY: the caller guarantees `offset..offset+len` lies within a
+        // previously allocated, fully initialised arena region.  The bump
+        // allocator ensures no two allocations overlap, and the acquire/release
+        // pair on `self.offset` guarantees visibility of prior writes.
         let buf = &*self.buf.get();
-        &buf[offset as usize..offset as usize + len as usize]
+        let start = offset as usize;
+        let end = start + len as usize;
+        debug_assert!(end <= buf.len(), "arena get_bytes out of bounds");
+        &buf[start..end]
     }
 
     /// Returns an exclusive reference to `len` bytes starting at `offset`.
@@ -104,9 +112,16 @@ impl Arena {
     /// The caller must ensure exclusive access to the given range (typically
     /// right after allocation, before publishing the node offset to other
     /// threads).
+    #[allow(clippy::indexing_slicing, clippy::mut_from_ref)]
     pub unsafe fn get_bytes_mut(&self, offset: u32, len: u32) -> &mut [u8] {
+        // SAFETY: the caller guarantees exclusive access to the given range.
+        // This is typically called immediately after `alloc()`, before the
+        // resulting offset is published to any other thread.
         let buf = &mut *self.buf.get();
-        &mut buf[offset as usize..offset as usize + len as usize]
+        let start = offset as usize;
+        let end = start + len as usize;
+        debug_assert!(end <= buf.len(), "arena get_bytes_mut out of bounds");
+        &mut buf[start..end]
     }
 
     /// Interprets 4 bytes at `offset` as an [`AtomicU32`] reference.
@@ -117,8 +132,12 @@ impl Arena {
     /// - The region `[offset, offset+4)` must have been previously allocated.
     /// - No `&mut` reference to the same 4 bytes may exist concurrently.
     pub unsafe fn get_atomic_u32(&self, offset: u32) -> &AtomicU32 {
+        // SAFETY: the caller guarantees alignment and prior allocation.
+        // `AtomicU32::from_ptr` requires a valid, aligned, dereferenceable
+        // pointer for the given lifetime — the arena buffer is heap-allocated
+        // and lives as long as `&self`.
         let buf = &*self.buf.get();
-        let ptr = buf.as_ptr().add(offset as usize) as *mut u32;
+        let ptr = buf.as_ptr().add(offset as usize).cast_mut().cast::<u32>();
         debug_assert!(ptr.is_aligned(), "AtomicU32 requires 4-byte alignment");
         AtomicU32::from_ptr(ptr)
     }
@@ -131,6 +150,7 @@ impl Arena {
 }
 
 #[cfg(test)]
+#[expect(clippy::expect_used, reason = "tests use expect for brevity")]
 mod tests {
     use super::*;
 
@@ -142,11 +162,14 @@ mod tests {
         assert!(off >= 1); // 0 is reserved
         assert_eq!(off % 4, 0); // aligned
 
+        // SAFETY: `off` was just allocated with size 4; we have exclusive
+        // access because no other thread can see this arena yet.
         unsafe {
             let bytes = arena.get_bytes_mut(off, 4);
             bytes.copy_from_slice(&[1, 2, 3, 4]);
         }
 
+        // SAFETY: the region was allocated and written above.
         let read = unsafe { arena.get_bytes(off, 4) };
         assert_eq!(read, &[1, 2, 3, 4]);
     }
@@ -155,9 +178,7 @@ mod tests {
     fn alloc_respects_alignment() {
         let arena = Arena::new(256);
 
-        // Allocate 1 byte (unaligned)
         let a = arena.alloc(1, 1).expect("ok");
-        // Allocate 4 bytes with 4-byte alignment
         let b = arena.alloc(4, 4).expect("ok");
         assert_eq!(b % 4, 0);
         assert!(b > a);
@@ -167,7 +188,7 @@ mod tests {
     fn alloc_returns_none_on_exhaustion() {
         let arena = Arena::new(16);
 
-        let _ = arena.alloc(12, 1); // use most of the space
+        let _ = arena.alloc(12, 1);
         assert!(arena.alloc(16, 1).is_none());
     }
 
@@ -176,6 +197,7 @@ mod tests {
         let arena = Arena::new(64);
         let off = arena.alloc(4, 4).expect("ok");
 
+        // SAFETY: `off` is a freshly allocated, 4-byte-aligned region of 4 bytes.
         unsafe {
             let atom = arena.get_atomic_u32(off);
             atom.store(42, Ordering::Relaxed);
@@ -211,7 +233,9 @@ mod tests {
         // All offsets must be unique and non-overlapping
         all_offsets.sort();
         for pair in all_offsets.windows(2) {
-            assert!(pair[1] >= pair[0] + 64, "allocations must not overlap");
+            let a = pair.first().copied().expect("windows(2)");
+            let b = pair.last().copied().expect("windows(2)");
+            assert!(b >= a + 64, "allocations must not overlap");
         }
     }
 }
