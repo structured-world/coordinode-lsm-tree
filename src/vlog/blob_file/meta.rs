@@ -98,11 +98,14 @@ impl Metadata {
         // TODO: no binary index
         let buf = DataBlock::encode_into_vec(&meta_items, 1, 0.0)?;
 
+        // Blob file metadata blocks are not encrypted — they contain
+        // only structural metadata (version, counts, key range), not user data.
         Block::write_into(
             writer,
             &buf,
             crate::table::block::BlockType::Meta,
             CompressionType::None,
+            None,
         )?;
 
         Ok(())
@@ -120,7 +123,7 @@ impl Metadata {
         }
 
         // TODO: Block::from_slice
-        let block = Block::from_reader(reader, CompressionType::None)?;
+        let block = Block::from_reader(reader, CompressionType::None, None)?;
         let block = DataBlock::new(block);
 
         // Metadata keys are always lexicographic, so use the default comparator.
@@ -227,7 +230,14 @@ mod tests {
 
         let mut buf = Vec::new();
         buf.write_all(METADATA_HEADER_MAGIC).unwrap();
-        Block::write_into(&mut buf, &encoded, BlockType::Meta, CompressionType::None).unwrap();
+        Block::write_into(
+            &mut buf,
+            &encoded,
+            BlockType::Meta,
+            CompressionType::None,
+            None,
+        )
+        .unwrap();
 
         let buf = Slice::from(buf);
         let result = Metadata::from_slice(&buf);

@@ -55,7 +55,11 @@ impl Scanner {
         reader: &mut BufReader<File>,
         compression: CompressionType,
     ) -> crate::Result<DataBlock> {
-        let block = Block::from_reader(reader, compression);
+        // NOTE: Scanner reads blocks sequentially during compaction/recovery.
+        // Encryption is not applied here because the scanner operates on the
+        // raw data section which is read block-by-block via BufReader.
+        // TODO: Thread encryption through scanner when needed.
+        let block = Block::from_reader(reader, compression, None);
 
         match block {
             Ok(block) => {
