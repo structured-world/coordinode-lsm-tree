@@ -2,6 +2,18 @@ use hdrhistogram::Histogram;
 use serde::Serialize;
 use std::time::{Duration, Instant};
 
+/// Derived metrics from a benchmark run.
+struct Summary {
+    secs: f64,
+    ops: u64,
+    ops_per_sec: f64,
+    mb_per_sec: f64,
+    p50: f64,
+    p99: f64,
+    p999: f64,
+    p9999: f64,
+}
+
 /// Collects per-operation latencies and computes summary statistics.
 pub struct Reporter {
     histogram: Histogram<u64>,
@@ -75,8 +87,9 @@ impl Reporter {
         self.ops_counted += other.ops_counted;
     }
 
-    /// Print human-readable results.
-    pub fn print_human(&self, benchmark: &str, entry_size: usize) {
+    /// Compute derived metrics from raw histogram + elapsed time.
+    /// Shared by both human-readable and JSON output to avoid drift.
+    fn summary(&self, entry_size: usize) -> Summary {
         let secs = self.elapsed.as_secs_f64();
         let ops = self.ops_counted;
         let ops_per_sec = if secs > 0.0 { ops as f64 / secs } else { 0.0 };
@@ -84,39 +97,47 @@ impl Reporter {
         // (readwhilewriting), ops_counted reflects only measured ops (reads),
         // so MB/sec represents read throughput under write pressure.
         let mb_per_sec = ops_per_sec * entry_size as f64 / (1024.0 * 1024.0);
+        Summary {
+            secs,
+            ops,
+            ops_per_sec,
+            mb_per_sec,
+            p50: self.percentile_us(50.0),
+            p99: self.percentile_us(99.0),
+            p999: self.percentile_us(99.9),
+            p9999: self.percentile_us(99.99),
+        }
+    }
 
+    /// Print human-readable results.
+    pub fn print_human(&self, benchmark: &str, entry_size: usize) {
+        let s = self.summary(entry_size);
         println!(
-            "{benchmark:<20} {ops:>12} ops in {secs:.2}s  ({ops_per_sec:>12.0} ops/sec, {mb_per_sec:.1} MB/sec)"
+            "{benchmark:<20} {:>12} ops in {:.2}s  ({:>12.0} ops/sec, {:.1} MB/sec)",
+            s.ops, s.secs, s.ops_per_sec, s.mb_per_sec,
         );
         println!(
             "{:20} P50: {:.1}us  P99: {:.1}us  P99.9: {:.1}us  P99.99: {:.1}us",
-            "",
-            self.percentile_us(50.0),
-            self.percentile_us(99.0),
-            self.percentile_us(99.9),
-            self.percentile_us(99.99),
+            "", s.p50, s.p99, s.p999, s.p9999,
         );
     }
 
     /// Produce JSON output.
     pub fn to_json(&self, benchmark: &str, config: &JsonConfig) -> String {
-        let secs = self.elapsed.as_secs_f64();
-        let ops = self.ops_counted;
-        let ops_per_sec = if secs > 0.0 { ops as f64 / secs } else { 0.0 };
-        let mb_per_sec = ops_per_sec * config.entry_size as f64 / (1024.0 * 1024.0);
+        let s = self.summary(config.entry_size);
 
         let report = JsonReport {
             benchmark: benchmark.to_string(),
             config: config.clone(),
-            elapsed_secs: secs,
-            ops_total: ops,
-            ops_per_sec,
-            mb_per_sec,
+            elapsed_secs: s.secs,
+            ops_total: s.ops,
+            ops_per_sec: s.ops_per_sec,
+            mb_per_sec: s.mb_per_sec,
             latency_us: LatencyUs {
-                p50: self.percentile_us(50.0),
-                p99: self.percentile_us(99.0),
-                p999: self.percentile_us(99.9),
-                p9999: self.percentile_us(99.99),
+                p50: s.p50,
+                p99: s.p99,
+                p999: s.p999,
+                p9999: s.p9999,
             },
         };
 
