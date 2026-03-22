@@ -303,9 +303,12 @@ impl Writer {
 
         self.meta.lowest_seqno = self.meta.lowest_seqno.min(seqno);
         self.meta.highest_seqno = self.meta.highest_seqno.max(seqno);
-        // All item types (values, point tombstones, weak tombstones) are KV
-        // entries stored in data blocks. Only range tombstones (written via
-        // write_range_tombstone) are excluded from highest_kv_seqno.
+        // highest_kv_seqno tracks the highest seqno among user KV entries
+        // written via write() (values, point tombstones, weak tombstones).
+        // Range tombstones (via write_range_tombstone) are excluded. In
+        // RT-only tables, finish() writes a synthetic sentinel via write()
+        // but restores highest_kv_seqno afterwards, so this bound reflects
+        // only actual user KV items.
         self.meta.highest_kv_seqno = self.meta.highest_kv_seqno.max(seqno);
 
         Ok(())
