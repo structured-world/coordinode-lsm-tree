@@ -1177,11 +1177,12 @@ fn kv_seqno_excludes_range_tombstone_seqno() -> lsm_tree::Result<()> {
     Ok(())
 }
 
-/// Table-skip should work when the covering RT is in the same table,
-/// thanks to `get_highest_kv_seqno()`. Verify via range iteration:
-/// if table-skip fires, the suppressed keys never appear.
+/// When a covering range tombstone and its covered KVs are colocated in the
+/// same table, reads at a higher seqno should not observe those KVs.
+/// This verifies that the colocated range tombstone correctly suppresses
+/// the covered keys for range scans (forward and reverse) and point lookups.
 #[test]
-fn table_skip_with_colocated_range_tombstone() -> lsm_tree::Result<()> {
+fn colocated_range_tombstone_suppresses_keys() -> lsm_tree::Result<()> {
     let folder = get_tmp_folder();
     let tree = open_tree(folder.path());
 
