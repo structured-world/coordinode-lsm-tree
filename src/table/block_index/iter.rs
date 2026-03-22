@@ -3,6 +3,7 @@
 // (found in the LICENSE-* files in the repository)
 
 use crate::{
+    comparator::SharedComparator,
     table::{block::ParsedItem, index_block::Iter as IndexBlockIter, IndexBlock, KeyedBlockHandle},
     SeqNo,
 };
@@ -18,6 +19,37 @@ self_cell!(
 );
 
 impl OwnedIndexBlockIter {
+    /// Creates an owned iterator from a block and a comparator.
+    pub fn from_block(block: IndexBlock, comparator: SharedComparator) -> Self {
+        Self::new(block, |b| b.iter(comparator))
+    }
+
+    /// Creates an owned iterator with optional lower/upper seek bounds.
+    ///
+    /// Returns `None` if either seek operation indicates that no items
+    /// fall within the given bounds.
+    pub fn from_block_with_bounds(
+        block: IndexBlock,
+        comparator: SharedComparator,
+        lo: Option<(&[u8], SeqNo)>,
+        hi: Option<(&[u8], SeqNo)>,
+    ) -> Option<Self> {
+        let mut iter = Self::from_block(block, comparator);
+
+        if let Some((key, seqno)) = lo {
+            if !iter.seek_lower(key, seqno) {
+                return None;
+            }
+        }
+        if let Some((key, seqno)) = hi {
+            if !iter.seek_upper(key, seqno) {
+                return None;
+            }
+        }
+
+        Some(iter)
+    }
+
     pub fn seek_lower(&mut self, needle: &[u8], seqno: SeqNo) -> bool {
         self.with_dependent_mut(|_, m| m.seek(needle, seqno))
     }
