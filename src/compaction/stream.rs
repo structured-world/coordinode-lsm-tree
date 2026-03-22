@@ -290,11 +290,12 @@ impl<'a, I: Iterator<Item = Item>, F: StreamFilter + 'a> Iterator for Compaction
                         }
                         head.value = new_value;
 
-                        // Preserve MergeOperand type when filter replaces a value:
-                        // turning a MergeOperand into a Value/Indirection would shadow
-                        // the real base in lower levels and break merge resolution.
-                        let preserve_merge_type = head.key.value_type.is_merge_operand()
-                            && (new_type == ValueType::Value || new_type == ValueType::Indirection);
+                        // Preserve MergeOperand type only when filter replaces it
+                        // with a Value: turning a MergeOperand into an Indirection
+                        // would store blob-pointer bytes under MergeOperand type,
+                        // confusing merge resolution or reads.
+                        let preserve_merge_type =
+                            head.key.value_type.is_merge_operand() && new_type == ValueType::Value;
                         if !preserve_merge_type {
                             head.key.value_type = new_type;
                         }
