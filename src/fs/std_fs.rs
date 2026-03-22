@@ -40,15 +40,15 @@ impl Iterator for StdReadDir {
 
 impl FsFile for File {
     fn sync_all(&self) -> io::Result<()> {
-        File::sync_all(self)
+        Self::sync_all(self)
     }
 
     fn sync_data(&self) -> io::Result<()> {
-        File::sync_data(self)
+        Self::sync_data(self)
     }
 
     fn metadata(&self) -> io::Result<FsMetadata> {
-        let m = File::metadata(self)?;
+        let m = Self::metadata(self)?;
         Ok(FsMetadata {
             len: m.len(),
             is_dir: m.is_dir(),
@@ -57,7 +57,7 @@ impl FsFile for File {
     }
 
     fn set_len(&self, size: u64) -> io::Result<()> {
-        File::set_len(self, size)
+        Self::set_len(self, size)
     }
 
     fn lock_exclusive(&self) -> io::Result<()> {

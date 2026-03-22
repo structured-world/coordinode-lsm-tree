@@ -22,6 +22,7 @@ use std::path::{Path, PathBuf};
 /// Options for opening a file through the [`Fs`] trait.
 ///
 /// Mirrors the builder API of [`std::fs::OpenOptions`].
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Clone, Debug)]
 pub struct FsOpenOptions {
     /// Open for reading.
@@ -129,20 +130,40 @@ pub struct FsDirEntry {
 /// metadata operations needed by the storage engine.
 pub trait FsFile: Read + Write + Seek + Send + Sync {
     /// Flushes all OS-internal buffers and metadata to durable storage.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if the sync operation fails.
     fn sync_all(&self) -> io::Result<()>;
 
     /// Flushes file data (but not necessarily metadata) to durable storage.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if the sync operation fails.
     fn sync_data(&self) -> io::Result<()>;
 
     /// Returns metadata for this open file handle.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if metadata cannot be retrieved.
     fn metadata(&self) -> io::Result<FsMetadata>;
 
     /// Truncates or extends the file to the specified length.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if the length change fails.
     fn set_len(&self, size: u64) -> io::Result<()>;
 
     /// Acquires an exclusive (write) lock on this file.
     ///
     /// Blocks until the lock is acquired.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if locking fails or is unsupported.
     fn lock_exclusive(&self) -> io::Result<()>;
 }
 
@@ -167,30 +188,62 @@ pub trait Fs: Send + Sync + 'static {
     type ReadDir: Iterator<Item = io::Result<FsDirEntry>>;
 
     /// Opens a file at `path` with the given options.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if the file cannot be opened.
     fn open(&self, path: &Path, opts: &FsOpenOptions) -> io::Result<Self::File>;
 
     /// Recursively creates all directories leading to `path`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if directory creation fails.
     fn create_dir_all(&self, path: &Path) -> io::Result<()>;
 
     /// Returns an iterator over the entries in a directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if the directory cannot be read.
     fn read_dir(&self, path: &Path) -> io::Result<Self::ReadDir>;
 
     /// Removes a single file.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if the file cannot be removed.
     fn remove_file(&self, path: &Path) -> io::Result<()>;
 
     /// Recursively removes a directory and all of its contents.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if the directory cannot be removed.
     fn remove_dir_all(&self, path: &Path) -> io::Result<()>;
 
     /// Renames a file or directory from `from` to `to`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if the rename fails.
     fn rename(&self, from: &Path, to: &Path) -> io::Result<()>;
 
     /// Returns metadata for the file or directory at `path`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if metadata cannot be retrieved.
     fn metadata(&self, path: &Path) -> io::Result<FsMetadata>;
 
     /// Ensures directory metadata is persisted to durable storage.
     ///
     /// On platforms that do not support directory fsync (e.g. Windows),
     /// this may be a no-op.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if the sync operation fails.
     fn sync_directory(&self, path: &Path) -> io::Result<()>;
 
     /// Returns `true` if a file or directory exists at `path`.
