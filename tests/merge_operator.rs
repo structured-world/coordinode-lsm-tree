@@ -898,7 +898,7 @@ fn merge_rt_no_operator_get_and_multi_get_agree() -> lsm_tree::Result<()> {
 
 /// RT suppresses operand in disk range scan during merge resolution.
 /// Exercises the is_rt_suppressed path inside the table.range() fallback
-/// in resolve_merge_via_pipeline (line ~909).
+/// in resolve_merge_via_pipeline.
 #[test]
 fn merge_rt_suppresses_operand_in_disk_range_scan() -> lsm_tree::Result<()> {
     let folder = tempfile::tempdir()?;
