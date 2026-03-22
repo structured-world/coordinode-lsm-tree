@@ -586,7 +586,7 @@ fn dynamic_leveling_multiple_levels() -> crate::Result<()> {
     Ok(())
 }
 
-// --- Coverage: multi-level skip actually fires ---
+// --- Coverage: multi-level compaction with oversized L1 ---
 
 #[test]
 fn multi_level_skip_fires_when_l1_oversized() -> crate::Result<()> {
@@ -599,8 +599,8 @@ fn multi_level_skip_fires_when_l1_oversized() -> crate::Result<()> {
     .open()?;
 
     // target_size=1 → L1 target = 1*4 = 4 bytes. Any real table exceeds this.
-    // Use multi_level from the start but run many rounds of flush+compact
-    // to build up data across levels, ensuring L1 becomes oversized.
+    // Multi-level enabled from the start. Repeated flush+compact cycles
+    // exercise the multi-level check in choose() on every L0→L1 decision.
     let strategy = Arc::new(
         Strategy::default()
             .with_multi_level(true)
@@ -610,9 +610,7 @@ fn multi_level_skip_fires_when_l1_oversized() -> crate::Result<()> {
 
     let mut seqno = 0u64;
 
-    // Run enough rounds to guarantee L1 gets populated and oversized.
-    // Each round flushes 4 overlapping tables, triggering L0→L1 (or L0+L1→L2).
-    for _round in 0..6 {
+    for _round in 0..8 {
         for _k in 0..4 {
             tree.insert("a", "val", seqno);
             tree.insert(format!("k_{seqno}").as_bytes(), "val", seqno);
@@ -620,21 +618,18 @@ fn multi_level_skip_fires_when_l1_oversized() -> crate::Result<()> {
             tree.flush_active_memtable(seqno)?;
             seqno += 1;
         }
-        // Compact multiple times per round to propagate through levels
         for _ in 0..4 {
             tree.compact(strategy.clone(), seqno)?;
         }
     }
 
-    // Verify multi-level actually pushed data past L1 into deeper levels.
-    // With target_size=1, L1 target is only 4 bytes. After 6 rounds of
-    // overlapping data, data MUST have propagated beyond L1.
+    // Data MUST have propagated beyond L1 into deeper levels.
     let version = tree.current_version();
-    let has_data_beyond_l1 =
+    let has_deep_data =
         (2..version.level_count()).any(|idx| version.level(idx).is_some_and(|l| !l.is_empty()));
     assert!(
-        has_data_beyond_l1,
-        "data should have been compacted into L2+ (multi-level skip or overflow)",
+        has_deep_data,
+        "data should exist in L2+ after repeated compaction with multi_level",
     );
 
     // All data should be readable

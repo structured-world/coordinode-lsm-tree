@@ -352,9 +352,11 @@ impl Strategy {
                             }),
                     );
 
-                    // Guard against invalid ratios (zero, negative, NaN, infinite)
+                    // Guard against invalid ratios (zero, negative, NaN, infinite).
+                    // Fall back to static targets instead of leaving partial
+                    // dynamic targets with u64::MAX in lower-level slots.
                     if !ratio.is_finite() || ratio <= 0.0 {
-                        break;
+                        return self.compute_static_targets(level_shift);
                     }
 
                     current_target /= ratio;
