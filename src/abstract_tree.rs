@@ -123,6 +123,8 @@ pub trait AbstractTree: sealed::Sealed {
                 .map(|mt| mt.iter().map(Ok))
                 .collect::<Vec<_>>(),
         );
+        // RT suppression is not needed here: flush writes both entries and RTs
+        // to the output tables. Suppression happens at read time, not write time.
         let stream = CompactionStream::new(merger, seqno_threshold)
             .with_merge_operator(self.tree_config().merge_operator.clone());
 

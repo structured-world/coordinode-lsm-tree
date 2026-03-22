@@ -909,17 +909,13 @@ fn merge_rt_suppresses_operand_in_disk_range_scan() -> lsm_tree::Result<()> {
     tree.merge("counter", 10_i64.to_le_bytes(), 1);
     tree.flush_active_memtable(0)?;
 
-    // RT kills base@0 but not operand@1 (RT at seqno=2, visible at seqno>=3)
-    // When resolve_merge_get scans the disk table via range scan, it should
-    // skip base@0 (RT-suppressed) and merge with no base.
+    // RT at seqno=2 suppresses all entries with seqno < 2 (kills base@0 and op@1)
     tree.remove_range("counter", "counter\x00", 2);
 
     // New operand above RT
     tree.merge("counter", 20_i64.to_le_bytes(), 3);
 
-    // op@1 is NOT suppressed (seqno=1 < RT@2? Yes! so it IS suppressed)
-    // Actually: RT@2 suppresses entries with seqno < 2, so base@0 and op@1 are BOTH suppressed
-    // Only op@3 survives: merge(None, [20]) = 20
+    // RT@2 suppresses base@0 and op@1. Only op@3 survives: merge(None, [20]) = 20
     assert_eq!(Some(20), get_counter(&tree, "counter", 4));
 
     Ok(())
