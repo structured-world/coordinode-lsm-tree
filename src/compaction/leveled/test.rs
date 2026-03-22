@@ -354,7 +354,7 @@ fn dynamic_leveling_data_integrity() -> crate::Result<()> {
     let strategy = Arc::new(
         Strategy::default()
             .with_dynamic_level_bytes(true)
-            .with_table_target_size(1), // tiny tables to force multi-level usage
+            .with_table_target_size(1), // tiny tables to force many small output tables under dynamic leveling
     );
 
     // Insert and compact multiple rounds
@@ -598,19 +598,14 @@ fn multi_level_skip_fires_when_l1_oversized() -> crate::Result<()> {
     )
     .open()?;
 
-    // target_size=1 → L1 target = 1*4 = 4 bytes. Any real table exceeds this.
-    // Multi-level enabled from the start. Repeated flush+compact cycles
-    // exercise the multi-level check in choose() on every L0→L1 decision.
-    let strategy = Arc::new(
-        Strategy::default()
-            .with_multi_level(true)
-            .with_table_target_size(1)
-            .with_l0_threshold(4),
-    );
+    // Step 1: Fill L1 with overlapping data using normal leveled compaction.
+    // Use default target_size (64MiB) so data stays in L1 instead of
+    // trivial-moving to Lmax (which happens with target_size=1).
+    let leveled = Arc::new(Strategy::default().with_l0_threshold(4));
 
     let mut seqno = 0u64;
 
-    for _round in 0..8 {
+    for _round in 0..3 {
         for _k in 0..4 {
             tree.insert("a", "val", seqno);
             tree.insert(format!("k_{seqno}").as_bytes(), "val", seqno);
@@ -618,18 +613,42 @@ fn multi_level_skip_fires_when_l1_oversized() -> crate::Result<()> {
             tree.flush_active_memtable(seqno)?;
             seqno += 1;
         }
-        for _ in 0..4 {
-            tree.compact(strategy.clone(), seqno)?;
-        }
+        tree.compact(leveled.clone(), seqno)?;
+    }
+
+    // Step 2: Compact with multi_level + tiny target so L1 is immediately
+    // scored > 1.0 (L1 target = 1*4 = 4 bytes, any table exceeds this).
+    let multi = Arc::new(
+        Strategy::default()
+            .with_multi_level(true)
+            .with_table_target_size(1)
+            .with_l0_threshold(4),
+    );
+
+    // Flush 4 overlapping tables to trigger L0→L1 (or L0+L1→L2 skip)
+    for _k in 0..4 {
+        tree.insert("a", "val", seqno);
+        tree.insert(format!("k_{seqno}").as_bytes(), "val", seqno);
+        tree.insert("z", "val", seqno);
+        tree.flush_active_memtable(seqno)?;
+        seqno += 1;
+    }
+
+    // Run compaction multiple times to ensure the multi-level path is exercised
+    for _ in 0..5 {
+        tree.compact(multi.clone(), seqno)?;
     }
 
     // Data MUST have propagated beyond L1 into deeper levels.
+    // NOTE: We cannot assert the specific L0+L1→L2 skip path fired because
+    // compact() returns Result<()>, not the Choice made. See #73 for the
+    // planned CompactionResult API that would enable precise path assertions.
     let version = tree.current_version();
     let has_deep_data =
         (2..version.level_count()).any(|idx| version.level(idx).is_some_and(|l| !l.is_empty()));
     assert!(
         has_deep_data,
-        "data should exist in L2+ after repeated compaction with multi_level",
+        "data should exist in L2+ after compaction with multi_level",
     );
 
     // All data should be readable
@@ -665,7 +684,10 @@ fn dynamic_leveling_fallback_to_static() -> crate::Result<()> {
     );
 
     // Flush a small amount of data — dynamic targets will be tiny
-    // compared to level_base_size (64M * 4 = 256M), so fallback fires.
+    // compared to level_base_size (64M * 4 = 256M), so the dynamic path
+    // falls back to static targets. compact() returns Result<()> so we
+    // cannot directly assert which path ran (see #73), but exercising this
+    // code path ensures compute_level_targets covers the fallback branch.
     for i in 0..4u8 {
         tree.insert("a", "v", u64::from(i));
         tree.insert([b'k', i].as_slice(), "v", u64::from(i));
