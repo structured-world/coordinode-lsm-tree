@@ -299,7 +299,7 @@ impl TreeIter {
 
                                     // On I/O error reading the filter, include the
                                     // table conservatively to avoid missing data.
-                                    table
+                                    let contains = table
                                         .maybe_contains_prefix(prefix_hash)
                                         .inspect_err(|e| {
                                             log::debug!(
@@ -307,7 +307,17 @@ impl TreeIter {
                                                 table.id(),
                                             );
                                         })
-                                        .unwrap_or(true)
+                                        .unwrap_or(true);
+
+                                    #[cfg(feature = "metrics")]
+                                    if !contains {
+                                        if let Some(m) = &lock.metrics {
+                                            m.prefix_bloom_skips
+                                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                        }
+                                    }
+
+                                    contains
                                 })
                                 .cloned()
                                 .collect();
