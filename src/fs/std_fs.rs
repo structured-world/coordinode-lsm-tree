@@ -145,7 +145,7 @@ mod sys {
     // Declare flock directly to avoid requiring libc as a direct dependency.
     const LOCK_EX: i32 = 2;
 
-    extern "C" {
+    unsafe extern "C" {
         fn flock(fd: i32, operation: i32) -> i32;
     }
 
@@ -175,7 +175,7 @@ mod sys {
         // https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-lockfileex
         const LOCKFILE_EXCLUSIVE_LOCK: u32 = 0x0000_0002;
 
-        extern "system" {
+        unsafe extern "system" {
             fn LockFileEx(
                 h_file: *mut std::ffi::c_void,
                 dw_flags: u32,
