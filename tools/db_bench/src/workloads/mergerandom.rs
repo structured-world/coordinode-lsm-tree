@@ -23,7 +23,7 @@ impl MergeOperator for CounterMerge {
     ) -> lsm_tree::Result<UserValue> {
         let mut counter: i64 = match base_value {
             Some(bytes) if bytes.len() == 8 => {
-                i64::from_le_bytes(bytes.try_into().expect("checked length"))
+                i64::from_le_bytes(bytes.try_into().unwrap_or_default())
             }
             Some(_) => return Err(lsm_tree::Error::MergeOperator),
             None => 0,
@@ -33,7 +33,7 @@ impl MergeOperator for CounterMerge {
             if operand.len() != 8 {
                 return Err(lsm_tree::Error::MergeOperator);
             }
-            counter += i64::from_le_bytes((*operand).try_into().expect("checked length"));
+            counter += i64::from_le_bytes((*operand).try_into().unwrap_or_default());
         }
 
         Ok(counter.to_le_bytes().to_vec().into())
@@ -110,13 +110,15 @@ impl Workload for MergeRandom {
 
         reporter.stop();
 
-        // Verify: each hot key should have counter = num / hot_keys.
-        let expected = (config.num / hot_keys) as i64;
+        // Key 0 gets base + 1 if remainder > 0 (since 0 % hot_keys == 0 for all ops).
+        let base = config.num / hot_keys;
+        let remainder = config.num % hot_keys;
+        let expected = (base + if remainder > 0 { 1 } else { 0 }) as i64;
         let read_seqno = seqno.load(Ordering::Relaxed);
         let sample_key = make_sequential_key(0, config.key_size);
         if let Some(val) = tree.get(&sample_key, read_seqno)? {
             let actual = if val.len() >= 8 {
-                i64::from_le_bytes(val[..8].try_into().expect("checked length"))
+                i64::from_le_bytes(val[..8].try_into().unwrap_or_default())
             } else {
                 eprintln!("Warning: merge result too short ({} bytes)", val.len());
                 0

@@ -137,10 +137,13 @@ fn main() {
 
     if cli.github_json {
         let array = serde_json::Value::Array(github_entries);
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&array).expect("failed to serialize")
-        );
+        match serde_json::to_string_pretty(&array) {
+            Ok(json) => println!("{json}"),
+            Err(e) => {
+                eprintln!("Error: failed to serialize GitHub JSON: {e}");
+                failures += 1;
+            }
+        }
     }
 
     if failures > 0 {
