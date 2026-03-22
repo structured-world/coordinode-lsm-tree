@@ -918,7 +918,10 @@ impl Table {
                 return block.maybe_contains_hash(key_hash);
             }
 
-            // Key is beyond all partition boundaries — definitely absent
+            // iter.next() == None means the key is beyond all partition
+            // boundaries (seek found no ceiling entry in the TLI, which is
+            // ordered by each partition's last user key). The key cannot
+            // exist in this table. Same logic as Table::get (line ~265).
             return Ok(false);
         }
 
