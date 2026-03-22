@@ -503,6 +503,10 @@ impl SkipMap {
     }
 
     /// Compares two nodes by key without allocating (reads raw arena bytes).
+    ///
+    /// Ordering: `(user_key via comparator, Reverse(seqno))`.  `value_type` is
+    /// intentionally excluded — it is not part of [`InternalKey::Ord`] or
+    /// [`InternalKey::compare_with`], and `(user_key, seqno)` is unique per entry.
     fn compare_nodes(&self, a: u32, b: u32) -> CmpOrdering {
         let a_uk = self.node_user_key_bytes(a);
         let b_uk = self.node_user_key_bytes(b);
