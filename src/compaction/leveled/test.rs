@@ -286,3 +286,189 @@ fn leveled_sequential_inserts() -> crate::Result<()> {
 
     Ok(())
 }
+
+// --- Dynamic Leveling Tests ---
+
+#[test]
+fn dynamic_leveling_empty() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let tree = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .open()?;
+
+    // Dynamic leveling on an empty tree should behave like static (DoNothing)
+    let strategy = Arc::new(Strategy::default().with_dynamic_level_bytes(true));
+    tree.compact(strategy, 0)?;
+
+    assert_eq!(0, tree.table_count());
+    Ok(())
+}
+
+#[test]
+fn dynamic_leveling_basic_compaction() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let tree = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .open()?;
+
+    // Insert enough overlapping data to trigger L0→L1 compaction
+    for i in 0..4u8 {
+        tree.insert("a", "v", u64::from(i));
+        tree.insert([b'k', i].as_slice(), "v", u64::from(i));
+        tree.insert("z", "v", u64::from(i));
+        tree.flush_active_memtable(u64::from(i))?;
+    }
+
+    assert_eq!(4, tree.table_count());
+
+    let strategy = Arc::new(Strategy::default().with_dynamic_level_bytes(true));
+    tree.compact(strategy, 4)?;
+
+    // Compaction should still work — data should be merged
+    assert!(tree.table_count() < 4, "tables should be compacted");
+
+    // All data should be readable
+    for i in 0..4u8 {
+        assert!(tree.get([b'k', i].as_slice(), MAX_SEQNO)?.is_some());
+    }
+
+    Ok(())
+}
+
+#[test]
+fn dynamic_leveling_data_integrity() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let tree = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .open()?;
+
+    let strategy = Arc::new(
+        Strategy::default()
+            .with_dynamic_level_bytes(true)
+            .with_table_target_size(1), // tiny tables to force multi-level usage
+    );
+
+    // Insert and compact multiple rounds
+    for round in 0..5u64 {
+        for k in 0..4u8 {
+            tree.insert(
+                "a",
+                format!("r{round}").as_bytes(),
+                round * 4 + u64::from(k),
+            );
+            tree.insert(
+                [b'k', k].as_slice(),
+                format!("r{round}").as_bytes(),
+                round * 4 + u64::from(k),
+            );
+            tree.insert(
+                "z",
+                format!("r{round}").as_bytes(),
+                round * 4 + u64::from(k),
+            );
+            tree.flush_active_memtable(round * 4 + u64::from(k))?;
+        }
+        tree.compact(strategy.clone(), (round + 1) * 4)?;
+    }
+
+    // All data should be readable with latest values
+    for k in 0..4u8 {
+        let val = tree.get([b'k', k].as_slice(), MAX_SEQNO)?;
+        assert!(val.is_some(), "key k{k} should exist");
+        assert_eq!(val.as_deref(), Some(b"r4".as_slice()));
+    }
+
+    Ok(())
+}
+
+// --- Multi-Level Compaction Tests ---
+
+#[test]
+fn multi_level_no_skip_when_l1_has_room() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let tree = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .open()?;
+
+    // Insert enough to trigger L0→L1 but L1 should be under its target
+    for i in 0..4u8 {
+        tree.insert("a", "v", u64::from(i));
+        tree.insert([b'k', i].as_slice(), "v", u64::from(i));
+        tree.insert("z", "v", u64::from(i));
+        tree.flush_active_memtable(u64::from(i))?;
+    }
+
+    let strategy = Arc::new(Strategy::default().with_multi_level(true));
+    tree.compact(strategy, 4)?;
+
+    // L1 has room — normal L0→L1 compaction, not multi-level skip
+    // Data should still be compacted and readable
+    assert!(tree.table_count() < 4);
+
+    for i in 0..4u8 {
+        assert!(tree.get([b'k', i].as_slice(), MAX_SEQNO)?.is_some());
+    }
+
+    Ok(())
+}
+
+#[test]
+fn multi_level_data_integrity() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let tree = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .open()?;
+
+    let strategy = Arc::new(
+        Strategy::default()
+            .with_multi_level(true)
+            .with_table_target_size(1), // tiny tables to stress test
+    );
+
+    // Run multiple rounds of inserts + compaction
+    for round in 0..8u64 {
+        for k in 0..4u8 {
+            tree.insert(
+                "a",
+                format!("r{round}").as_bytes(),
+                round * 4 + u64::from(k),
+            );
+            tree.insert(
+                [b'k', k].as_slice(),
+                format!("r{round}").as_bytes(),
+                round * 4 + u64::from(k),
+            );
+            tree.insert(
+                "z",
+                format!("r{round}").as_bytes(),
+                round * 4 + u64::from(k),
+            );
+            tree.flush_active_memtable(round * 4 + u64::from(k))?;
+        }
+        tree.compact(strategy.clone(), (round + 1) * 4)?;
+    }
+
+    // All keys readable with latest values
+    for k in 0..4u8 {
+        let val = tree.get([b'k', k].as_slice(), MAX_SEQNO)?;
+        assert!(val.is_some(), "key k{k} should exist");
+        assert_eq!(val.as_deref(), Some(b"r7".as_slice()));
+    }
+
+    Ok(())
+}
