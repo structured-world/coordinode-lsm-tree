@@ -38,6 +38,9 @@ use std::fs::File;
 /// independent storage formats that may diverge in the future.
 const MAX_DECOMPRESSION_SIZE: u32 = 256 * 1024 * 1024;
 
+/// Maximum encryption overhead per block (12-byte nonce + 16-byte GCM tag).
+const ENCRYPTION_OVERHEAD: u32 = 28;
+
 /// A block on disk
 ///
 /// Consists of a fixed-size header and some bytes (the data/payload).
@@ -159,8 +162,6 @@ impl Block {
         // Validate both size fields before any I/O or hashing to fail fast
         // on malformed headers. The on-disk data_length may include encryption
         // overhead (nonce + auth tag), so allow a bounded margin.
-        const ENCRYPTION_OVERHEAD: u32 = 28; // 12-byte nonce + 16-byte GCM tag
-
         if header.data_length > MAX_DECOMPRESSION_SIZE + ENCRYPTION_OVERHEAD {
             return Err(crate::Error::DecompressedSizeTooLarge {
                 declared: u64::from(header.data_length),
@@ -259,11 +260,10 @@ impl Block {
         encryption: Option<&dyn EncryptionProvider>,
     ) -> crate::Result<Self> {
         // handle.size() includes Header::serialized_len(), so allow that overhead.
-        // Encrypted blocks add nonce + tag (28 bytes) to the on-disk size.
-        const ENCRYPTION_OVERHEAD: u64 = 28;
+        // Encrypted blocks add nonce + tag to the on-disk size.
         let max_on_disk_size = u64::from(MAX_DECOMPRESSION_SIZE)
             + Header::serialized_len() as u64
-            + ENCRYPTION_OVERHEAD;
+            + u64::from(ENCRYPTION_OVERHEAD);
 
         if u64::from(handle.size()) > max_on_disk_size {
             return Err(crate::Error::DecompressedSizeTooLarge {
