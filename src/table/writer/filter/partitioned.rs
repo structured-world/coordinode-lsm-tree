@@ -177,18 +177,14 @@ impl<W: std::io::Write + std::io::Seek> FilterWriter<W> for PartitionedFilterWri
     fn register_key(&mut self, key: &UserKey) -> crate::Result<()> {
         self.bloom_hash_buffer.push(Builder::get_hash(key));
 
-        // NOTE: Prefix hashes are intentionally not deduplicated.
-        // Correctness: duplicate hashes set the same bloom bits (idempotent).
-        // Sizing: `estimated_filter_size` overestimates slightly, producing a
-        //   larger-than-minimum filter — this lowers FPR, a net positive.
-        // Performance: dedup alternatives (HashSet per partition, or sort+dedup
-        //   per key) add O(n) memory or O(n log n) CPU per key on the hot write
-        //   path, which is worse than the marginal filter size increase.
-        if let Some(extractor) = &self.prefix_extractor {
-            for prefix in extractor.prefixes(key.as_ref()) {
-                self.bloom_hash_buffer.push(Builder::get_hash(prefix));
-            }
-        }
+        // NOTE: Prefix hashes are NOT inserted for partitioned filters.
+        // Table::maybe_contains_prefix returns Ok(true) for partitioned/TLI
+        // filters (partition index is keyed by user key, not prefix hash),
+        // so prefix hashes would only increase CPU and filter size with no
+        // read-side benefit. The prefix_extractor field is still accepted to
+        // keep the writer API uniform; it will be used once partitioned-prefix
+        // checks are implemented.
+        let _ = &self.prefix_extractor;
 
         self.approx_filter_size = self
             .bloom_policy

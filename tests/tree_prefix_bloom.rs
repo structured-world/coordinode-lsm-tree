@@ -492,7 +492,7 @@ fn prefix_bloom_negative_lookup_in_key_range_gap() -> lsm_tree::Result<()> {
         tree.table_count(),
     );
 
-    // "mmm:" falls in the key_range [aaa:0, zzz:9] but was never written.
+    // "mmm:" falls in the key_range [aaa:0, zzz:19] but was never written.
     // The bloom filter should report Ok(false) for the prefix hash.
     // With 20 keys at 10 bpk, the bloom is ~200 bits — FPR for random
     // prefixes is low enough that "mmm:" should be rejected.
