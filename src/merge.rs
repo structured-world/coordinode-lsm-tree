@@ -10,6 +10,8 @@ type IterItem = crate::Result<InternalValue>;
 
 pub type BoxedIterator<'a> = Box<dyn DoubleEndedIterator<Item = IterItem> + Send + 'a>;
 
+// Arc clone per heap entry is an atomic ref-count bump. The heap holds at most
+// one entry per source iterator (typically <10), so the overhead is negligible.
 struct HeapItem(usize, InternalValue, SharedComparator);
 
 impl Eq for HeapItem {}
