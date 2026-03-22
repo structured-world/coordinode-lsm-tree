@@ -117,11 +117,13 @@ impl Block {
         let encrypted_buf = encryption.map(|enc| enc.encrypt(payload)).transpose()?;
         let payload: &[u8] = encrypted_buf.as_deref().unwrap_or(payload);
 
-        #[expect(clippy::cast_possible_truncation, reason = "blocks are limited to u32")]
-        {
-            header.data_length = payload.len() as u32;
-            header.checksum = Checksum::from_raw(crate::hash::hash128(payload));
-        }
+        // Validate encrypted payload fits in the u32 on-disk format before casting.
+        let payload_len = u32::try_from(payload.len()).map_err(|_| {
+            crate::Error::Encrypt("encrypted payload exceeds u32::MAX block format limit")
+        })?;
+
+        header.data_length = payload_len;
+        header.checksum = Checksum::from_raw(crate::hash::hash128(payload));
 
         header.encode_into(&mut writer)?;
         writer.write_all(payload)?;
