@@ -15,7 +15,8 @@ pub fn persist_version(
         return Err(crate::Error::from(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             format!(
-                "comparator name exceeds {} bytes",
+                "comparator name is {} bytes (max {})",
+                comparator_name.len(),
                 crate::comparator::MAX_COMPARATOR_NAME_BYTES,
             ),
         )));

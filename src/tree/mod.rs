@@ -1334,6 +1334,9 @@ impl Tree {
         // BEFORE recover_levels, so a rejected open is side-effect free
         // — recover_levels loads tables and cleans up orphans.
         // Tree type is checked after recovery (needs the Version object).
+        // NOTE: the version file is read twice (here for metadata, then inside
+        // recover_levels for table/blob data). This is intentional — metadata
+        // validation must complete before any disk-mutating recovery work.
         {
             let version_id = crate::version::recovery::get_current_version(&config.path)?;
             let manifest_path = config.path.join(format!("v{version_id}"));
