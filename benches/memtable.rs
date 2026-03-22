@@ -26,10 +26,7 @@ fn memtable_get_hit(c: &mut Criterion) {
         b.iter(|| {
             assert_eq!(
                 [1, 2, 3],
-                &*memtable
-                    .get(b"abc_w5wa35aw35naw", MAX_SEQNO)
-                    .unwrap()
-                    .value,
+                &*memtable.get(b"abc_w5wa35aw35naw", MAX_SEQNO).unwrap().value,
             )
         });
     });
