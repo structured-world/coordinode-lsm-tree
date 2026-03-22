@@ -47,10 +47,13 @@ pub struct Metrics {
     pub(crate) io_skipped_by_filter: AtomicUsize,
 
     /// Number of segments skipped during prefix scans via
-    /// [`Tree::create_prefix`] because the prefix bloom filter
+    /// [`Tree::create_prefix`] where the per-table prefix bloom filter
     /// returned `Ok(false)`.
     ///
-    /// Note: `BlobTree` prefix scans do not currently record this metric.
+    /// This currently counts skips only in the single-table run path
+    /// of `TreeIter::create_range`; multi-table runs and `BlobTree`
+    /// prefix scans do not yet record this metric, so it should be
+    /// treated as a lower bound.
     pub(crate) prefix_bloom_skips: AtomicUsize,
 
     /// Number of data block bytes that were requested from OS or disk
@@ -258,9 +261,10 @@ impl Metrics {
     }
 
     /// Number of segments skipped during [`Tree::create_prefix`] scans
-    /// by prefix bloom filters.
+    /// by prefix bloom filters (single-table run path only).
     ///
-    /// Note: `BlobTree` prefix scans do not currently record this metric.
+    /// This is a lower bound — multi-table runs and `BlobTree` prefix
+    /// scans do not yet record this metric.
     pub fn prefix_bloom_skips(&self) -> usize {
         self.prefix_bloom_skips.load(Relaxed)
     }
