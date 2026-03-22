@@ -325,7 +325,7 @@ impl Block {
 
         let buf = match compression {
             CompressionType::None => {
-                if let Some(ref plain) = decrypted {
+                if let Some(plain) = decrypted {
                     #[expect(
                         clippy::cast_possible_truncation,
                         reason = "values are u32 length max"
@@ -336,8 +336,7 @@ impl Block {
                         return Err(crate::Error::InvalidHeader("Block"));
                     }
 
-                    #[expect(clippy::expect_used, reason = "checked via ref above")]
-                    Slice::from(decrypted.expect("checked"))
+                    Slice::from(plain)
                 } else {
                     let value = buf.slice(Header::serialized_len()..);
 
