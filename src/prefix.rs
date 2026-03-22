@@ -70,8 +70,8 @@ pub trait PrefixExtractor:
 
     /// Returns `true` if `prefix` is a valid scan boundary for this extractor.
     ///
-    /// A scan boundary is valid when **every key** that would be matched by the
-    /// prefix range `[prefix, prefix+1)` had `prefix` indexed via
+    /// A scan boundary is valid when **every key** that the tree would consider
+    /// a match for this prefix in a prefix scan had `prefix` indexed via
     /// [`prefixes`](Self::prefixes) at write time. This is the contract that
     /// makes bloom-based table skipping safe: if the bloom filter says "no
     /// match", we can skip the table because every matching key would have
