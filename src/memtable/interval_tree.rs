@@ -95,7 +95,7 @@ impl Node {
     clippy::expect_used,
     reason = "rotation invariant: left child must exist"
 )]
-#[expect(
+#[allow(
     clippy::unnecessary_box_returns,
     reason = "tree rotations pass Box<Node> through; unboxing would add needless allocation"
 )]
@@ -112,7 +112,7 @@ fn rotate_right(mut node: Box<Node>) -> Box<Node> {
     clippy::expect_used,
     reason = "rotation invariant: right child must exist"
 )]
-#[expect(
+#[allow(
     clippy::unnecessary_box_returns,
     reason = "tree rotations pass Box<Node> through; unboxing would add needless allocation"
 )]
@@ -129,7 +129,7 @@ fn rotate_left(mut node: Box<Node>) -> Box<Node> {
     clippy::expect_used,
     reason = "balance factor guarantees child existence"
 )]
-#[expect(
+#[allow(
     clippy::unnecessary_box_returns,
     reason = "tree rotations pass Box<Node> through; unboxing would add needless allocation"
 )]
