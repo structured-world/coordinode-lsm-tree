@@ -122,8 +122,9 @@ pub struct FsDirEntry {
     /// Full path to the entry.
     pub path: PathBuf,
     /// File name component (without parent path).
-    // String (not OsString) — lsm-tree uses numeric file names for tables/blobs,
-    // lossy conversion is acceptable and keeps the API ergonomic.
+    // String (not OsString) — lsm-tree uses numeric file names for tables/blobs.
+    // StdFs::read_dir returns InvalidData for non-UTF-8 names (not lossy) since
+    // any such name indicates filesystem corruption for this crate's usage.
     pub file_name: String,
     /// Whether this entry is a directory.
     pub is_dir: bool,
