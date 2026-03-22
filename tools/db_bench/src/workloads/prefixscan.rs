@@ -47,9 +47,8 @@ impl Workload for PrefixScan {
             let mut iter = tree.prefix(prefix_bytes, read_seq, None);
             for _ in 0..SCAN_LIMIT {
                 let Some(item) = iter.next() else { break };
-                // Force value materialization so the benchmark reflects
-                // actual read I/O, especially with --use-blob-tree.
-                let _ = item.size()?;
+                // Force full value read including blob payload (BlobTree).
+                let _ = item.value()?;
             }
             reporter.record_duration(t.elapsed());
         }

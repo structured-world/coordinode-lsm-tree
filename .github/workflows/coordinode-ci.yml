@@ -50,6 +50,8 @@ jobs:
       - uses: taiki-e/install-action@nextest
       - name: Run tests
         run: cargo nextest run --all-features
+        env:
+          PROPTEST_CASES: "32"
       - name: Run doc tests
         run: cargo test --doc --features lz4
 

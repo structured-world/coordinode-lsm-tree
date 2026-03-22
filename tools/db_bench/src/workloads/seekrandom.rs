@@ -32,10 +32,10 @@ impl Workload for SeekRandom {
             let t = Instant::now();
             // Seek to key and read the next entry.
             let mut iter = tree.range(key.., read_seq, None);
-            // Force value materialization so seek latency reflects
-            // actual I/O, especially with --use-blob-tree.
+            // Force full value read including blob payload (BlobTree).
+            // Guard::size() only reads indirection metadata.
             if let Some(next) = iter.next() {
-                let _ = next.size()?;
+                let _ = next.value()?;
             }
             reporter.record_duration(t.elapsed());
         }

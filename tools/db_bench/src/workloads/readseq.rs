@@ -29,9 +29,9 @@ impl Workload for ReadSeq {
             let t = Instant::now();
             match iter.next() {
                 Some(item) => {
-                    // Force value materialization so read throughput reflects
-                    // actual I/O, especially with --use-blob-tree.
-                    let _size = item.size()?;
+                    // Force full value read including blob payload (BlobTree).
+                    // Guard::size() only reads indirection metadata.
+                    let _ = item.value()?;
                     reporter.record_duration(t.elapsed());
 
                     count += 1;
