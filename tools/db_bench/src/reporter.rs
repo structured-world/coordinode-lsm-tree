@@ -14,6 +14,8 @@ impl Reporter {
     pub fn new() -> Self {
         Self {
             // Record up to 10 seconds (10_000_000_000 ns) with 3 significant digits.
+            // Histogram creation with constant params cannot fail at runtime.
+            #[expect(clippy::expect_used, reason = "constant histogram params")]
             histogram: Histogram::new_with_max(10_000_000_000, 3)
                 .expect("failed to create histogram"),
             start: None,
@@ -118,6 +120,8 @@ impl Reporter {
             },
         };
 
+        // Serialization of a fixed struct with primitive fields cannot fail.
+        #[expect(clippy::expect_used, reason = "fixed struct serialization")]
         serde_json::to_string_pretty(&report).expect("failed to serialize JSON")
     }
 

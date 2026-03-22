@@ -90,6 +90,8 @@ impl Workload for ReadWhileWriting {
             // Stop timing once readers have finished; writer may still be running.
             reporter.stop();
 
+            // Writer panic = broken benchmark, not recoverable.
+            #[expect(clippy::expect_used, reason = "writer panic is unrecoverable")]
             writer_handle.join().expect("writer thread panicked");
         });
 
