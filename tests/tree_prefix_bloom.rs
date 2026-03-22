@@ -775,6 +775,17 @@ fn prefix_bloom_skip_metrics() -> lsm_tree::Result<()> {
     }
     tree.flush_active_memtable(0)?;
 
+    // The test relies on the single-table prefix-bloom fast path
+    // (run.len() == 1) in TreeIter::create_range. Fail early if flush
+    // produces multiple tables so metric failures reflect a real bloom
+    // regression rather than layout differences.
+    assert_eq!(
+        tree.table_count(),
+        1,
+        "expected single-table run; flush produced {} tables",
+        tree.table_count()
+    );
+
     assert_eq!(tree.metrics().prefix_bloom_skips(), 0);
 
     // Scan for 24 non-existent prefixes that fall inside the key_range.

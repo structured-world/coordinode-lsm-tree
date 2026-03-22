@@ -79,8 +79,10 @@ pub struct IterState {
     /// hash will be skipped entirely during the scan.
     pub(crate) prefix_hash: Option<u64>,
 
-    /// Metrics handle for recording prefix bloom skips.
-    /// `None` for non-prefix iterators to avoid unnecessary allocation.
+    /// Optional metrics handle for recording prefix-related statistics (e.g. bloom skips).
+    ///
+    /// `None` when the caller does not wish to record metrics; this is
+    /// independent of whether the iterator uses a prefix.
     #[cfg(feature = "metrics")]
     pub(crate) metrics: Option<Arc<crate::Metrics>>,
 }
