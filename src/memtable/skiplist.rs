@@ -823,6 +823,9 @@ impl<'a> Iterator for Iter<'a> {
             self.done = true;
         } else {
             self.front = self.map.next_at(node, 0);
+            if self.front == UNSET {
+                self.done = true;
+            }
         }
 
         Some(Entry {
@@ -911,6 +914,9 @@ impl<'a> Iterator for Range<'a> {
             self.done = true;
         } else {
             self.front = self.map.next_at(node, 0);
+            if self.front == UNSET {
+                self.done = true;
+            }
         }
 
         Some(Entry {
