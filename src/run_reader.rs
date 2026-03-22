@@ -155,8 +155,12 @@ impl RunReader {
             let lo_table = self.run.deref().get(self.lo).expect("should exist");
 
             // Bloom-check the lo boundary table before creating the reader.
-            // If rejected, mark as initialized but leave lo_reader as None.
-            if !self.bloom.should_skip(lo_table) {
+            // If rejected, mark as initialized, leave lo_reader as None,
+            // and advance lo so the Phase 2 intermediate loop doesn't
+            // re-check the same table (avoiding double metric counts).
+            if self.bloom.should_skip(lo_table) {
+                self.lo += 1;
+            } else {
                 self.lo_reader = Some(Box::new(lo_table.range(self.range.clone())));
             }
             self.lo_initialized = true;
@@ -171,7 +175,11 @@ impl RunReader {
             )]
             let hi_table = self.run.deref().get(self.hi).expect("should exist");
 
-            if !self.bloom.should_skip(hi_table) {
+            if self.bloom.should_skip(hi_table) {
+                if self.hi > 0 {
+                    self.hi -= 1;
+                }
+            } else {
                 self.hi_reader = Some(Box::new(hi_table.range(self.range.clone())));
             }
             self.hi_initialized = true;
@@ -186,44 +194,46 @@ impl Iterator for RunReader {
         self.ensure_lo_initialized();
 
         loop {
+            // Phase 1: drain the current lo-side reader.
             if let Some(lo_reader) = &mut self.lo_reader {
                 if let Some(item) = lo_reader.next() {
                     return Some(item);
                 }
-
-                // NOTE: Lo reader is empty, get next one
                 self.lo_reader = None;
                 self.lo += 1;
-
-                // Strict `<`: when lo reaches hi, this branch is skipped and
-                // the hi table is read via ensure_hi_initialized (which uses
-                // table.range() to respect the range end bound). `.iter()` is
-                // only used for middle tables that are fully consumed.
-                // Bloom-rejected intermediate tables are skipped without I/O.
-                while self.lo < self.hi {
-                    #[expect(
-                        clippy::expect_used,
-                        reason = "hi is at most equal to the last slot; so because 0 <= lo < hi, it must be a valid index"
-                    )]
-                    let table = self.run.get(self.lo).expect("should exist");
-
-                    if self.bloom.should_skip(table) {
-                        self.lo += 1;
-                        continue;
-                    }
-
-                    self.lo_reader = Some(Box::new(table.iter()));
-                    break;
-                }
-            } else {
-                // Lo exhausted — initialize hi reader if needed and consume from it
-                self.ensure_hi_initialized();
-
-                if let Some(hi_reader) = &mut self.hi_reader {
-                    return hi_reader.next();
-                }
-                return None;
             }
+
+            // Phase 2: advance through intermediate tables, bloom-skipping
+            // rejected ones. This also handles the case where the lo
+            // boundary table was bloom-rejected in ensure_lo_initialized
+            // (lo_reader is None from the start).
+            while self.lo < self.hi {
+                #[expect(
+                    clippy::expect_used,
+                    reason = "hi is at most equal to the last slot; so because 0 <= lo < hi, it must be a valid index"
+                )]
+                let table = self.run.get(self.lo).expect("should exist");
+
+                if self.bloom.should_skip(table) {
+                    self.lo += 1;
+                    continue;
+                }
+
+                self.lo_reader = Some(Box::new(table.iter()));
+                break;
+            }
+
+            if self.lo_reader.is_some() {
+                continue;
+            }
+
+            // Phase 3: all intermediates exhausted/skipped — drain hi reader.
+            self.ensure_hi_initialized();
+
+            if let Some(hi_reader) = &mut self.hi_reader {
+                return hi_reader.next();
+            }
+            return None;
         }
     }
 }
@@ -233,42 +243,46 @@ impl DoubleEndedIterator for RunReader {
         self.ensure_hi_initialized();
 
         loop {
+            // Phase 1: drain the current hi-side reader.
             if let Some(hi_reader) = &mut self.hi_reader {
                 if let Some(item) = hi_reader.next_back() {
                     return Some(item);
                 }
-
-                // NOTE: Hi reader is empty, get prev one
                 self.hi_reader = None;
-                self.hi -= 1;
-
-                while self.lo < self.hi {
-                    #[expect(
-                        clippy::expect_used,
-                        reason = "because 0 <= lo <= hi, and hi monotonically decreases, hi must be a valid index"
-                    )]
-                    let table = self.run.get(self.hi).expect("should exist");
-
-                    if self.bloom.should_skip(table) {
-                        if self.hi == 0 {
-                            break;
-                        }
-                        self.hi -= 1;
-                        continue;
-                    }
-
-                    self.hi_reader = Some(Box::new(table.iter()));
-                    break;
+                if self.hi > 0 {
+                    self.hi -= 1;
                 }
-            } else {
-                // Hi exhausted — initialize lo reader if needed and consume from it
-                self.ensure_lo_initialized();
-
-                if let Some(lo_reader) = &mut self.lo_reader {
-                    return lo_reader.next_back();
-                }
-                return None;
             }
+
+            // Phase 2: advance backward through intermediates.
+            while self.lo < self.hi {
+                #[expect(
+                    clippy::expect_used,
+                    reason = "because 0 <= lo <= hi, and hi monotonically decreases, hi must be a valid index"
+                )]
+                let table = self.run.get(self.hi).expect("should exist");
+
+                if self.bloom.should_skip(table) {
+                    // Safe: while lo < hi guarantees hi >= 1
+                    self.hi -= 1;
+                    continue;
+                }
+
+                self.hi_reader = Some(Box::new(table.iter()));
+                break;
+            }
+
+            if self.hi_reader.is_some() {
+                continue;
+            }
+
+            // Phase 3: all intermediates exhausted/skipped — drain lo reader.
+            self.ensure_lo_initialized();
+
+            if let Some(lo_reader) = &mut self.lo_reader {
+                return lo_reader.next_back();
+            }
+            return None;
         }
     }
 }
@@ -683,5 +697,27 @@ mod tests {
 
         assert_eq!(hints.prefix_hash, Some(42));
         assert_eq!(hints.key_hash, Some(99));
+    }
+
+    #[cfg(feature = "metrics")]
+    #[test]
+    fn bloom_skip_increments_prefix_bloom_skips_metric() -> crate::Result<()> {
+        let (level, _dir) = make_bloom_test_run()?;
+        let hash = find_rejected_hash(&level);
+
+        let metrics = Arc::new(crate::Metrics::default());
+        let hints = BloomHints {
+            prefix_hash: Some(hash),
+            key_hash: None,
+            metrics: Some(metrics.clone()),
+        };
+
+        let reader = RunReader::new(level, ..).unwrap().with_bloom_hints(hints);
+        let _: Vec<_> = reader.flatten().collect();
+
+        // 4 tables bloom-rejected = 4 metric increments
+        assert_eq!(metrics.prefix_bloom_skips(), 4);
+
+        Ok(())
     }
 }
