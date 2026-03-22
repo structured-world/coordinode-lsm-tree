@@ -692,7 +692,7 @@ fn drop_tables(
 
     drop(compaction_state);
 
-    log::trace!("Dropped {} tables", tables_dropped);
+    log::trace!("Dropped {tables_dropped} tables");
 
     Ok(CompactionResult {
         action: CompactionAction::Dropped,
