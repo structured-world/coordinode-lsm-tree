@@ -521,3 +521,98 @@ fn prefix_bloom_negative_lookup_in_key_range_gap() -> lsm_tree::Result<()> {
 
     Ok(())
 }
+
+/// Multi-table runs (typically L0) now support per-table prefix bloom
+/// skipping. This test creates multiple flushes WITHOUT compaction so
+/// the tables remain in a single multi-table L0 run, then verifies
+/// that prefix scans still return correct results (tables whose bloom
+/// reports no match are skipped transparently).
+#[test]
+fn prefix_bloom_multi_table_run_skipping() -> lsm_tree::Result<()> {
+    let folder = tempfile::tempdir()?;
+    let tree = tree_with_prefix_bloom(&folder)?;
+
+    // Flush 4 batches — each batch has a distinct prefix group.
+    // Without compaction these stay in L0 as a multi-table run.
+    tree.insert("alpha:1", "v1", 0);
+    tree.insert("alpha:2", "v2", 1);
+    tree.flush_active_memtable(0)?;
+
+    tree.insert("beta:1", "v3", 2);
+    tree.insert("beta:2", "v4", 3);
+    tree.flush_active_memtable(0)?;
+
+    tree.insert("gamma:1", "v5", 4);
+    tree.insert("gamma:2", "v6", 5);
+    tree.flush_active_memtable(0)?;
+
+    tree.insert("delta:1", "v7", 6);
+    tree.insert("delta:2", "v8", 7);
+    tree.flush_active_memtable(0)?;
+
+    // Verify we have multiple tables (multi-table run in L0).
+    assert!(
+        tree.table_count() >= 4,
+        "expected >=4 tables, got {}",
+        tree.table_count(),
+    );
+
+    // Each prefix scan should find exactly 2 keys — the bloom filter
+    // skips tables that definitely don't contain the queried prefix.
+    for prefix in &["alpha:", "beta:", "gamma:", "delta:"] {
+        let results: Vec<_> = tree
+            .create_prefix(prefix, 8, None)
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(
+            results.len(),
+            2,
+            "prefix '{prefix}' should match exactly 2 keys",
+        );
+    }
+
+    // Non-existent prefix returns nothing.
+    let results: Vec<_> = tree
+        .create_prefix("omega:", 8, None)
+        .collect::<Result<Vec<_>, _>>()?;
+    assert_eq!(results.len(), 0);
+
+    Ok(())
+}
+
+/// Verify that multi-table run prefix bloom skipping works correctly
+/// with overlapping key ranges (L0 tables may overlap). Two flushes
+/// with interleaved keys ensure the tables' key ranges overlap, and
+/// prefix bloom filtering must still produce correct results.
+#[test]
+fn prefix_bloom_multi_table_run_overlapping_keys() -> lsm_tree::Result<()> {
+    let folder = tempfile::tempdir()?;
+    let tree = tree_with_prefix_bloom(&folder)?;
+
+    // First flush: mix of prefixes
+    tree.insert("user:1:name", "Alice", 0);
+    tree.insert("order:1:item", "widget", 1);
+    tree.flush_active_memtable(0)?;
+
+    // Second flush: overlapping key range with different prefix mix
+    tree.insert("user:2:name", "Bob", 2);
+    tree.insert("order:2:item", "gadget", 3);
+    tree.flush_active_memtable(0)?;
+
+    assert!(tree.table_count() >= 2);
+
+    // Both flushes contain "user:" keys — prefix scan must find all of them
+    let results: Vec<_> = tree
+        .create_prefix("user:", 4, None)
+        .collect::<Result<Vec<_>, _>>()?;
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0].0.as_ref(), b"user:1:name");
+    assert_eq!(results[1].0.as_ref(), b"user:2:name");
+
+    // Both flushes contain "order:" keys
+    let results: Vec<_> = tree
+        .create_prefix("order:", 4, None)
+        .collect::<Result<Vec<_>, _>>()?;
+    assert_eq!(results.len(), 2);
+
+    Ok(())
+}
