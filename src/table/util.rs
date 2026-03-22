@@ -81,8 +81,9 @@ pub fn load_block(
         #[cfg(feature = "metrics")]
         metrics.table_file_opened_uncached.fetch_add(1, Relaxed);
 
-        // the descriptor table, so the else-branch needs an explicit
-        // type annotation to trigger coercion.
+        // The if-branch returns Arc<dyn FsFile> from the descriptor
+        // table, so the else-branch needs an explicit type annotation
+        // to trigger unsizing coercion.
         let fd: Arc<dyn FsFile> = Arc::new(fd);
         (fd, true)
     };
