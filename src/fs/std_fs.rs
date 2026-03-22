@@ -187,14 +187,21 @@ mod sys {
     pub(super) fn lock_exclusive(file: &File) -> io::Result<()> {
         let fd = file.as_raw_fd();
 
-        // SAFETY: fd is a valid file descriptor owned by `file`.
-        #[expect(unsafe_code, reason = "flock FFI call with valid fd")]
-        let ret = unsafe { flock(fd, LOCK_EX) };
+        loop {
+            // SAFETY: fd is a valid file descriptor owned by `file`.
+            #[expect(unsafe_code, reason = "flock FFI call with valid fd")]
+            let ret = unsafe { flock(fd, LOCK_EX) };
 
-        if ret != 0 {
-            return Err(io::Error::last_os_error());
+            if ret == 0 {
+                return Ok(());
+            }
+
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(err);
         }
-        Ok(())
     }
 }
 
