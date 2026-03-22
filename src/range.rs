@@ -221,6 +221,19 @@ impl TreeIter {
                 .iter_levels()
                 .flat_map(|lvl| lvl.iter())
             {
+                // Collect RTs from ALL tables regardless of bloom — an RT
+                // in a non-matching table can still suppress the target key.
+                for table in run.iter() {
+                    range_tombstones.extend(
+                        table
+                            .range_tombstones()
+                            .iter()
+                            .filter(|rt| range_tombstone_overlaps_bounds(rt, &user_range))
+                            .map(|rt| (rt.clone(), seqno)),
+                    );
+                }
+
+                // Build iterators only from bloom-passing tables.
                 match run.len() {
                     0 => {}
                     1 => {
@@ -232,14 +245,6 @@ impl TreeIter {
                             user_range.1.as_ref().map(std::convert::AsRef::as_ref),
                         )) && bloom_passes(lock, table)
                         {
-                            range_tombstones.extend(
-                                table
-                                    .range_tombstones()
-                                    .iter()
-                                    .filter(|rt| range_tombstone_overlaps_bounds(rt, &user_range))
-                                    .map(|rt| (rt.clone(), seqno)),
-                            );
-
                             let reader =
                                 table
                                     .range(user_range.clone())
@@ -263,16 +268,6 @@ impl TreeIter {
                             })
                             .cloned()
                             .collect();
-
-                        for table in &surviving {
-                            range_tombstones.extend(
-                                table
-                                    .range_tombstones()
-                                    .iter()
-                                    .filter(|rt| range_tombstone_overlaps_bounds(rt, &user_range))
-                                    .map(|rt| (rt.clone(), seqno)),
-                            );
-                        }
 
                         match surviving.len() {
                             0 => {}
