@@ -369,17 +369,9 @@ struct UnsafeSendConstPtr(*const u8);
 // for the duration of the io_uring op because the caller blocks until
 // the CQE is received.
 #[expect(unsafe_code, reason = "marking raw-pointer wrapper as Send")]
-#[expect(
-    clippy::non_send_fields_in_send_ty,
-    reason = "raw pointer intentionally sent — lifetime guaranteed by blocking caller"
-)]
 unsafe impl Send for UnsafeSendMutPtr {}
 
 #[expect(unsafe_code, reason = "marking raw-pointer wrapper as Send")]
-#[expect(
-    clippy::non_send_fields_in_send_ty,
-    reason = "raw pointer intentionally sent — lifetime guaranteed by blocking caller"
-)]
 unsafe impl Send for UnsafeSendConstPtr {}
 
 /// An I/O operation to submit to the ring.
