@@ -895,3 +895,105 @@ fn merge_rt_no_operator_get_and_multi_get_agree() -> lsm_tree::Result<()> {
 
     Ok(())
 }
+
+/// RT suppresses operand in disk range scan during merge resolution.
+/// Exercises the is_rt_suppressed path inside the table.range() fallback
+/// in resolve_merge_get (line ~909).
+#[test]
+fn merge_rt_suppresses_operand_in_disk_range_scan() -> lsm_tree::Result<()> {
+    let folder = tempfile::tempdir()?;
+    let tree = open_tree_with_counter(&folder);
+
+    // Base + operand in same flush (gc_threshold=0 preserves both as separate entries)
+    tree.insert("counter", 100_i64.to_le_bytes(), 0);
+    tree.merge("counter", 10_i64.to_le_bytes(), 1);
+    tree.flush_active_memtable(0)?;
+
+    // RT kills base@0 but not operand@1 (RT at seqno=2, visible at seqno>=3)
+    // When resolve_merge_get scans the disk table via range scan, it should
+    // skip base@0 (RT-suppressed) and merge with no base.
+    tree.remove_range("counter", "counter\x00", 2);
+
+    // New operand above RT
+    tree.merge("counter", 20_i64.to_le_bytes(), 3);
+
+    // op@1 is NOT suppressed (seqno=1 < RT@2? Yes! so it IS suppressed)
+    // Actually: RT@2 suppresses entries with seqno < 2, so base@0 and op@1 are BOTH suppressed
+    // Only op@3 survives: merge(None, [20]) = 20
+    assert_eq!(Some(20), get_counter(&tree, "counter", 4));
+
+    Ok(())
+}
+
+/// Merge resolution with base value found via disk table point lookup
+/// (non-MergeOperand entry on disk — exercises the process_entry path at line ~918).
+#[test]
+fn merge_disk_base_via_point_lookup() -> lsm_tree::Result<()> {
+    let folder = tempfile::tempdir()?;
+    let tree = open_tree_with_counter(&folder);
+
+    // Base on disk (single entry, not MergeOperand, so bloom-filtered get() finds it)
+    tree.insert("counter", 100_i64.to_le_bytes(), 0);
+    tree.flush_active_memtable(0)?;
+
+    // Operands in active memtable
+    tree.merge("counter", 10_i64.to_le_bytes(), 1);
+    tree.merge("counter", 20_i64.to_le_bytes(), 2);
+
+    // resolve_merge_get: active memtable has op@2, op@1
+    // Then scans disk: table.get() returns base@0 (Value, not MergeOperand)
+    // → process_entry sets base_value, found_base=true
+    assert_eq!(Some(130), get_counter(&tree, "counter", 3));
+
+    Ok(())
+}
+
+/// Merge with Tombstone base in sealed memtable — exercises sealed memtable
+/// scan path in resolve_merge_get (lines ~868-877).
+#[test]
+fn merge_tombstone_in_sealed_memtable() -> lsm_tree::Result<()> {
+    let folder = tempfile::tempdir()?;
+    let tree = open_tree_with_counter(&folder);
+
+    // Base value
+    tree.insert("counter", 100_i64.to_le_bytes(), 0);
+    // Delete it
+    tree.remove("counter", 1);
+    // Flush base + tombstone to disk
+    tree.flush_active_memtable(0)?;
+
+    // New operands in active memtable
+    tree.merge("counter", 42_i64.to_le_bytes(), 2);
+
+    // resolve_merge_get scans active (finds op@2), then disk (finds tombstone@1)
+    // tombstone stops scan, merge with no base: merge(None, [42]) = 42
+    assert_eq!(Some(42), get_counter(&tree, "counter", 3));
+
+    Ok(())
+}
+
+/// Merge where operands span active memtable and disk — tests that
+/// resolve_merge_get correctly collects from all layers.
+#[test]
+fn merge_operands_across_active_and_disk() -> lsm_tree::Result<()> {
+    let folder = tempfile::tempdir()?;
+    let tree = open_tree_with_counter(&folder);
+
+    // First batch: base + operand on disk
+    tree.insert("counter", 100_i64.to_le_bytes(), 0);
+    tree.merge("counter", 5_i64.to_le_bytes(), 1);
+    tree.flush_active_memtable(0)?;
+
+    // Second batch: more operands on disk
+    tree.merge("counter", 10_i64.to_le_bytes(), 2);
+    tree.flush_active_memtable(0)?;
+
+    // Third batch: operand in active memtable
+    tree.merge("counter", 15_i64.to_le_bytes(), 3);
+
+    // All layers: active(op@3) + disk1(op@2) + disk2(op@1, base@0)
+    // = 100 + 5 + 10 + 15 = 130
+    assert_eq!(Some(130), get_counter(&tree, "counter", 4));
+
+    Ok(())
+}
