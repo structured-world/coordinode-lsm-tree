@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 /// node construction, then read concurrently).  Tower entries are the exception
 /// — they are accessed through [`AtomicU32`] references obtained via
 /// [`get_atomic_u32`](Self::get_atomic_u32).
-pub(crate) struct Arena {
+pub struct Arena {
     /// The backing buffer.  Accessed through `UnsafeCell` because:
     /// - Allocation writes to a region that no other thread can reach (the
     ///   allocating thread owns the just-bumped range).
@@ -50,7 +50,10 @@ impl Arena {
     pub fn capacity(&self) -> u32 {
         // SAFETY: reading `.len()` is a read-only operation on the boxed slice
         // and does not conflict with concurrent writes to different regions.
-        unsafe { (&*self.buf.get()).len() as u32 }
+        #[allow(clippy::cast_possible_truncation)] // capacity is set from u32 in new()
+        unsafe {
+            (&*self.buf.get()).len() as u32
+        }
     }
 
     /// Allocates `size` bytes with the given alignment.
@@ -73,14 +76,12 @@ impl Arena {
                 return None;
             }
 
-            match self.offset.compare_exchange_weak(
-                cur,
-                new_end,
-                Ordering::AcqRel,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => return Some(aligned),
-                Err(_) => continue,
+            if self
+                .offset
+                .compare_exchange_weak(cur, new_end, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
+            {
+                return Some(aligned);
             }
         }
     }
@@ -137,6 +138,7 @@ impl Arena {
         // pointer for the given lifetime — the arena buffer is heap-allocated
         // and lives as long as `&self`.
         let buf = &*self.buf.get();
+        #[allow(clippy::cast_ptr_alignment)] // caller guarantees 4-byte alignment
         let ptr = buf.as_ptr().add(offset as usize).cast_mut().cast::<u32>();
         debug_assert!(ptr.is_aligned(), "AtomicU32 requires 4-byte alignment");
         AtomicU32::from_ptr(ptr)

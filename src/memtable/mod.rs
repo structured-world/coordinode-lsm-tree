@@ -2,9 +2,9 @@
 // This source code is licensed under both the Apache 2.0 and MIT License
 // (found in the LICENSE-* files in the repository)
 
-pub(crate) mod arena;
+pub mod arena;
 pub mod interval_tree;
-pub(crate) mod skiplist;
+pub mod skiplist;
 
 use crate::comparator::SharedComparator;
 use crate::key::InternalKey;

@@ -12,7 +12,7 @@
 //!
 //! The design follows the arena-skiplist pattern used by Pebble/CockroachDB
 //! and Badger, adapted for Rust's ownership model and the lsm-tree
-//! `InternalKey` ordering (user_key ASC, seqno DESC).
+//! `InternalKey` ordering (`user_key` ASC, seqno DESC).
 
 use super::arena::Arena;
 use crate::key::InternalKey;
@@ -77,8 +77,8 @@ const fn node_size(height: usize) -> u32 {
 /// Provides lock-free traversal and CAS-based inserts with O(log n) expected
 /// time.  Value storage uses a mutex-protected Vec (see `values` field), so
 /// value reads acquire a brief lock.  Keys are [`InternalKey`] (ordered by
-/// user_key ascending, then seqno descending).
-pub(crate) struct SkipMap {
+/// `user_key` ascending, then seqno descending).
+pub struct SkipMap {
     arena: Arena,
     /// Heap-backed storage for values.  Keys live in the arena for cache
     /// locality during comparisons; values live here so large blobs don't
@@ -121,13 +121,16 @@ impl SkipMap {
             let bytes = arena.get_bytes_mut(head, head_size);
             #[allow(clippy::indexing_slicing)] // OFF_HEIGHT (11) < head_size (104) by construction
             {
-                bytes[OFF_HEIGHT as usize] = MAX_HEIGHT as u8;
+                #[allow(clippy::cast_possible_truncation)] // MAX_HEIGHT = 20, fits in u8
+                {
+                    bytes[OFF_HEIGHT as usize] = MAX_HEIGHT as u8;
+                }
             }
         }
 
         // Seed PRNG with an address-derived non-zero value.
         let seed = {
-            let p = &arena as *const Arena as u64;
+            let p = (&raw const arena) as u64;
             if p == 0 {
                 0xDEAD_BEEF
             } else {
@@ -398,10 +401,10 @@ impl SkipMap {
         u64::from_ne_bytes(m[16..24].try_into().expect("8 bytes"))
     }
 
-    /// Returns the raw user_key bytes stored in the arena for `node`.
+    /// Returns the raw `user_key` bytes stored in the arena for `node`.
     fn node_user_key_bytes(&self, node: u32) -> &[u8] {
         let off = self.node_key_offset(node);
-        let len = self.node_key_len(node) as u32;
+        let len = u32::from(self.node_key_len(node));
         unsafe { self.arena.get_bytes(off, len) }
     }
 
@@ -434,11 +437,12 @@ impl SkipMap {
     // Internal: tower access
     // -----------------------------------------------------------------------
 
-    /// Returns a reference to the AtomicU32 next-pointer at `level` for `node`.
+    /// Returns a reference to the `AtomicU32` next-pointer at `level` for `node`.
     ///
     /// # Safety
     ///
     /// `level` must be < the node's height.
+    #[allow(clippy::cast_possible_truncation)] // level < MAX_HEIGHT (20), fits in u32
     unsafe fn tower_atomic(&self, node: u32, level: usize) -> &std::sync::atomic::AtomicU32 {
         // SAFETY: caller guarantees level < node height; node + OFF_TOWER + level*4
         // is within the node's arena allocation and 4-byte aligned.
@@ -462,8 +466,8 @@ impl SkipMap {
     // Internal: key comparison
     // -----------------------------------------------------------------------
 
-    /// Compares the key stored at `node` with `target` using InternalKey
-    /// ordering (user_key ASC, seqno DESC).
+    /// Compares the key stored at `node` with `target` using `InternalKey`
+    /// ordering (`user_key` ASC, seqno DESC).
     fn compare_key(&self, node: u32, target: &InternalKey) -> CmpOrdering {
         let node_uk = self.node_user_key_bytes(node);
         let target_uk: &[u8] = &target.user_key;
@@ -599,12 +603,10 @@ impl SkipMap {
                 if next == UNSET {
                     break;
                 }
-                // Advance while next <= target (i.e. not Greater)
-                if self.compare_key(next, target) != CmpOrdering::Greater {
-                    node = next;
-                } else {
+                if self.compare_key(next, target) == CmpOrdering::Greater {
                     break;
                 }
+                node = next;
             }
         }
 
@@ -622,11 +624,10 @@ impl SkipMap {
                 if next == UNSET {
                     break;
                 }
-                if self.compare_key(next, target) != CmpOrdering::Greater {
-                    node = next;
-                } else {
+                if self.compare_key(next, target) == CmpOrdering::Greater {
                     break;
                 }
+                node = next;
             }
         }
 
@@ -749,13 +750,9 @@ impl SkipMap {
         z ^= z >> 31;
 
         // Count pairs of trailing zero bits → geometric(P=1/4)
-        let mut h = 1;
-        let mut bits = z;
-        while h < MAX_HEIGHT && (bits & 3) == 0 {
-            h += 1;
-            bits >>= 2;
-        }
-        h
+        let tz = z.trailing_zeros() as usize;
+        // Each pair of trailing zero bits adds one level
+        (1 + tz / 2).min(MAX_HEIGHT)
     }
 }
 
@@ -770,20 +767,20 @@ impl Default for SkipMap {
 // ---------------------------------------------------------------------------
 
 /// A reference to a key-value pair stored in the skiplist arena.
-pub(crate) struct Entry<'a> {
+pub struct Entry<'a> {
     map: &'a SkipMap,
     node: u32,
 }
 
 impl Entry<'_> {
-    /// Reconstructs the [`InternalKey`] (allocates a new `Slice` for user_key).
+    /// Reconstructs the [`InternalKey`] (allocates a new `Slice` for `user_key`).
     pub fn key(&self) -> InternalKey {
         self.map.node_internal_key(self.node)
     }
 
-    /// Returns a borrowed reference to the raw user_key bytes stored in
+    /// Returns a borrowed reference to the raw `user_key` bytes stored in
     /// the arena.  This is cheaper than [`key()`](Self::key) when only the
-    /// user_key is needed (avoids allocating a new `Slice`).
+    /// `user_key` is needed (avoids allocating a new `Slice`).
     pub fn user_key_bytes(&self) -> &[u8] {
         self.map.node_user_key_bytes(self.node)
     }
@@ -799,7 +796,7 @@ impl Entry<'_> {
 // ---------------------------------------------------------------------------
 
 /// Forward + backward iterator over all entries in a [`SkipMap`].
-pub(crate) struct Iter<'a> {
+pub struct Iter<'a> {
     map: &'a SkipMap,
     front: u32,
     back: u32,
@@ -831,7 +828,7 @@ impl<'a> Iterator for Iter<'a> {
     }
 }
 
-impl<'a> DoubleEndedIterator for Iter<'a> {
+impl DoubleEndedIterator for Iter<'_> {
     fn next_back(&mut self) -> Option<Self::Item> {
         if self.done {
             return None;
@@ -868,7 +865,7 @@ impl<'a> DoubleEndedIterator for Iter<'a> {
 // ---------------------------------------------------------------------------
 
 /// Forward + backward iterator over a range of entries in a [`SkipMap`].
-pub(crate) struct Range<'a> {
+pub struct Range<'a> {
     map: &'a SkipMap,
     end_bound: Bound<InternalKey>,
     front: u32,
@@ -919,7 +916,7 @@ impl<'a> Iterator for Range<'a> {
     }
 }
 
-impl<'a> DoubleEndedIterator for Range<'a> {
+impl DoubleEndedIterator for Range<'_> {
     fn next_back(&mut self) -> Option<Self::Item> {
         if self.done {
             return None;
