@@ -206,7 +206,7 @@ impl Fs for IoUringFs {
 /// (metadata, truncate, lock), while routing reads, writes, and fsyncs
 /// through the shared `io_uring` ring.
 pub struct IoUringFile {
-    /// Underlying [`std::fs::File`] — owns the fd, used for metadata/set_len/lock.
+    /// Underlying [`std::fs::File`] — owns the fd, used for metadata, `set_len`, lock.
     file: File,
 
     /// Tracked cursor position for [`Read`]/[`Write`]/[`Seek`] impls.
@@ -350,7 +350,7 @@ impl Seek for IoUringFile {
 // Ring thread internals
 // ---------------------------------------------------------------------------
 
-/// Wrapper to send a raw pointer across threads.
+/// Newtype wrapper for sending a `*mut u8` across threads.
 ///
 /// # Safety
 ///
@@ -358,29 +358,41 @@ impl Seek for IoUringFile {
 /// `io_uring` operation completes. This is upheld because the submitting
 /// thread blocks on an `mpsc::Receiver` and cannot drop the buffer until
 /// the CQE is received.
-struct UnsafeSend<T>(T);
+struct UnsafeSendMutPtr(*mut u8);
 
-// SAFETY: see struct-level doc. The raw pointers wrapped by UnsafeSend
-// are guaranteed valid for the duration of the io_uring op because the
-// caller blocks until the CQE is received.
+/// Newtype wrapper for sending a `*const u8` across threads.
+///
+/// See [`UnsafeSendMutPtr`] for safety contract.
+struct UnsafeSendConstPtr(*const u8);
+
+// SAFETY: see struct-level docs. The raw pointers are guaranteed valid
+// for the duration of the io_uring op because the caller blocks until
+// the CQE is received.
 #[expect(unsafe_code, reason = "marking raw-pointer wrapper as Send")]
 #[expect(
     clippy::non_send_fields_in_send_ty,
-    reason = "raw pointers are intentionally sent — lifetime guaranteed by blocking caller"
+    reason = "raw pointer intentionally sent — lifetime guaranteed by blocking caller"
 )]
-unsafe impl<T> Send for UnsafeSend<T> {}
+unsafe impl Send for UnsafeSendMutPtr {}
+
+#[expect(unsafe_code, reason = "marking raw-pointer wrapper as Send")]
+#[expect(
+    clippy::non_send_fields_in_send_ty,
+    reason = "raw pointer intentionally sent — lifetime guaranteed by blocking caller"
+)]
+unsafe impl Send for UnsafeSendConstPtr {}
 
 /// An I/O operation to submit to the ring.
 enum OpKind {
     Read {
         fd: i32,
-        buf: UnsafeSend<*mut u8>,
+        buf: UnsafeSendMutPtr,
         len: u32,
         offset: u64,
     },
     Write {
         fd: i32,
-        buf: UnsafeSend<*const u8>,
+        buf: UnsafeSendConstPtr,
         len: u32,
         offset: u64,
     },
@@ -578,7 +590,7 @@ impl RingThread {
         let op = Op {
             kind: OpKind::Read {
                 fd,
-                buf: UnsafeSend(buf.as_mut_ptr()),
+                buf: UnsafeSendMutPtr(buf.as_mut_ptr()),
                 len,
                 offset,
             },
@@ -594,7 +606,7 @@ impl RingThread {
         let op = Op {
             kind: OpKind::Write {
                 fd,
-                buf: UnsafeSend(buf.as_ptr()),
+                buf: UnsafeSendConstPtr(buf.as_ptr()),
                 len,
                 offset,
             },
