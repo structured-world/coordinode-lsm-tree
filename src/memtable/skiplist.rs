@@ -563,20 +563,25 @@ impl SkipMap {
         succs: &mut [u32; MAX_HEIGHT],
         level: usize,
     ) {
-        // Start from the predecessor at the level above (if available).
-        let mut node = if level + 1 < MAX_HEIGHT {
-            preds[level + 1]
-        } else {
-            self.head
-        };
+        // Re-search from the head sentinel (which has MAX_HEIGHT levels).
+        // We cannot start from preds[level+1] because that node's tower
+        // height may be only level+2, making higher-level reads OOB.
+        // Starting from head is safe and still O(log n) via the walk-down.
+        let mut node = self.head;
+        let list_h = self.height.load(Ordering::Acquire);
 
-        // Search directly at the target level from the starting node.
-        // We don't walk down from higher levels because `node` (preds[level+1])
-        // may have a tower height of only level+2 — reading higher levels
-        // would be an out-of-bounds arena read.
-        //
-        // This is correct because: the starting node is already the best
-        // predecessor at level+1, so searching at level from it is sufficient.
+        // Walk down from the list height, narrowing the search at each level.
+        // Every node reached via next_at(node, lv) was linked at level lv,
+        // so its height > lv — tower reads are always in-bounds.
+        for lv in (level + 1..list_h).rev() {
+            let mut next = self.next_at(node, lv);
+            while next != UNSET && self.compare_key(next, key) == CmpOrdering::Less {
+                node = next;
+                next = self.next_at(node, lv);
+            }
+        }
+
+        // Final search at the target level.
         let mut next = self.next_at(node, level);
         while next != UNSET && self.compare_key(next, key) == CmpOrdering::Less {
             node = next;
