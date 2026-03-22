@@ -42,8 +42,11 @@ fn partitioned_bloom_skip_for_point_reads() -> lsm_tree::Result<()> {
     Ok(())
 }
 
-/// Tests that a key beyond all partition boundaries is correctly rejected
-/// by the partitioned bloom filter (Table::get path).
+/// Tests that a key beyond all partition boundaries is correctly rejected.
+///
+/// For keys beyond the table's key range, Table::get skips via key-range
+/// overlap check (before bloom). The unit test in table::tests covers the
+/// bloom_may_contain_key Ok(false) path directly.
 #[test_log::test]
 fn partitioned_bloom_skip_beyond_partitions() -> lsm_tree::Result<()> {
     use lsm_tree::{
