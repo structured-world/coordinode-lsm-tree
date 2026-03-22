@@ -202,7 +202,7 @@ mod tests {
         assert!(!extractor.is_valid_scan_boundary(b""));
     }
 
-    /// Extractor that overrides `is_valid_scan_boundary` with an O(1) sentinel
+    /// Extractor that overrides `is_valid_scan_boundary` with an O(1) length
     /// check instead of iterating all prefixes via the default implementation.
     struct FixedLengthPrefix;
 
