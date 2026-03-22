@@ -171,6 +171,7 @@ fn bloom_passes(state: &IterState, table: &crate::table::Table) -> bool {
 
     if let Some(key_hash) = state.key_hash {
         let result = if let Some(bloom_key) = &state.bloom_key {
+            // UserKey (Slice) implements Deref<Target=[u8]>, coerces to &[u8]
             table.bloom_may_contain_key(bloom_key, key_hash)
         } else {
             table.bloom_may_contain_key_hash(key_hash)

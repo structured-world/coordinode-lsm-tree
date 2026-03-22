@@ -895,6 +895,9 @@ impl Table {
     /// which falls back to `Ok(true)` for partitioned filters, this method
     /// uses the user key to seek the partition index and check only the
     /// matching partition's bloom filter.
+    ///
+    /// `key_hash` must be the xxh3 hash of `key` (pre-computed by the caller
+    /// to avoid redundant hashing — same pattern as [`Table::get`]).
     pub(crate) fn bloom_may_contain_key(&self, key: &[u8], key_hash: u64) -> crate::Result<bool> {
         // Full (non-partitioned) filter — delegate to hash-only path
         if self.pinned_filter_block.is_some() {
