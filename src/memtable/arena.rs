@@ -13,18 +13,25 @@
 use std::ptr;
 use std::sync::atomic::{AtomicPtr, AtomicU32, Ordering};
 
-/// Bits used for the within-block offset.  2^22 = 4 MiB per block.
+/// Bits used for the within-block offset.
+///
+/// On 64-bit: 2^26 = 64 MiB per block (1M entries fit in block 0,
+/// avoiding multi-block decode overhead).
+/// On 32-bit: 2^22 = 4 MiB per block (keeps allocation within
+/// the limited virtual address space).
+#[cfg(target_pointer_width = "32")]
 const BLOCK_SHIFT: u32 = 22;
+#[cfg(not(target_pointer_width = "32"))]
+const BLOCK_SHIFT: u32 = 26;
 
-/// Size of each arena block in bytes (4 MiB).
+/// Size of each arena block in bytes.
 const BLOCK_SIZE: u32 = 1 << BLOCK_SHIFT;
 
 /// Bitmask for extracting the within-block offset from an encoded u32.
 const BLOCK_MASK: u32 = BLOCK_SIZE - 1;
 
-/// Maximum number of blocks.  With 4 MiB blocks and 10-bit index this
-/// supports up to 4 GiB total arena capacity.
-const MAX_BLOCKS: usize = 1 << (32 - BLOCK_SHIFT); // 1024
+/// Maximum number of blocks.  Supports up to 4 GiB total arena capacity.
+const MAX_BLOCKS: usize = 1 << (32 - BLOCK_SHIFT);
 
 /// A multi-block bump-allocating arena.
 ///
@@ -77,7 +84,11 @@ impl Arena {
         }
 
         loop {
-            let cur = self.cursor.load(Ordering::Relaxed);
+            // Acquire pairs with the AcqRel CAS below: any thread that reads
+            // a cursor value (block_idx, offset) is guaranteed to see the
+            // corresponding blocks[block_idx] pointer set by ensure_block,
+            // which runs before the CAS that published this cursor value.
+            let cur = self.cursor.load(Ordering::Acquire);
             let block_idx = cur >> BLOCK_SHIFT;
             let offset = cur & BLOCK_MASK;
             let aligned = (offset + align - 1) & !(align - 1);
@@ -178,8 +189,9 @@ impl Arena {
 
     /// Decodes an encoded offset into `(block_base_ptr, within_block_offset)`.
     ///
-    /// Block pointers are write-once (set in `ensure_block`, never changed).
-    /// `Acquire` ordering pairs with the `AcqRel` CAS in `ensure_block`.
+    /// Hot path: single `Acquire` load (branch-predicted non-null).
+    /// Cold path: `ensure_block` allocates the block on first access.
+    #[inline]
     #[expect(
         clippy::indexing_slicing,
         reason = "block_idx < MAX_BLOCKS by construction (alloc enforces this)"
@@ -187,15 +199,16 @@ impl Arena {
     unsafe fn decode(&self, offset: u32) -> (*mut u8, usize) {
         let block_idx = (offset >> BLOCK_SHIFT) as usize;
         let off = (offset & BLOCK_MASK) as usize;
-
-        // Ensure the block exists.  This is a no-op (single atomic load) if
-        // the block is already allocated.  Calling ensure_block here is the
-        // only fully reliable approach because alloc()'s ensure_block runs
-        // before its CAS, and a failed CAS means the block might never be
-        // ensured by that thread.
-        self.ensure_block(block_idx);
         let ptr = self.blocks[block_idx].load(Ordering::Acquire);
-        debug_assert!(!ptr.is_null());
+        // Hot path: block already allocated (almost always true).
+        // Cold fallback: allocate on first access — handles the rare window
+        // between cursor advance and ensure_block visibility across cores.
+        let ptr = if ptr.is_null() {
+            self.ensure_block(block_idx);
+            self.blocks[block_idx].load(Ordering::Acquire)
+        } else {
+            ptr
+        };
 
         (ptr, off)
     }
