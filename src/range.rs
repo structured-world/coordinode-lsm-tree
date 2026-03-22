@@ -10,7 +10,7 @@ use crate::{
     mvcc_stream::MvccStream,
     range_tombstone::RangeTombstone,
     range_tombstone_filter::RangeTombstoneFilter,
-    run_reader::RunReader,
+    run_reader::{BloomHints, RunReader},
     value::{SeqNo, UserKey},
     version::{Run, SuperVersion},
     BoxedIterator, InternalValue,
@@ -139,41 +139,6 @@ fn range_tombstone_overlaps_bounds(
     overlaps_lo && overlaps_hi
 }
 
-/// Checks prefix and key bloom filters for a table.
-///
-/// Returns `true` if the table should be included (bloom says "maybe" or no
-/// filter available), `false` if it can be safely skipped.
-fn bloom_passes(state: &IterState, table: &crate::table::Table) -> bool {
-    if let Some(prefix_hash) = state.prefix_hash {
-        match table.maybe_contains_prefix(prefix_hash) {
-            Ok(false) => {
-                #[cfg(feature = "metrics")]
-                if let Some(m) = &state.metrics {
-                    m.prefix_bloom_skips
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                }
-                return false;
-            }
-            Err(e) => {
-                log::debug!("prefix bloom check failed for table {:?}: {e}", table.id(),);
-            }
-            _ => {}
-        }
-    }
-
-    if let Some(key_hash) = state.key_hash {
-        match table.bloom_may_contain_key_hash(key_hash) {
-            Ok(false) => return false,
-            Err(e) => {
-                log::debug!("key bloom check failed for table {:?}: {e}", table.id(),);
-            }
-            _ => {}
-        }
-    }
-
-    true
-}
-
 impl TreeIter {
     /// Fast path for single-key point-read merge resolution.
     ///
@@ -226,6 +191,13 @@ impl TreeIter {
                 user_range.1.as_ref().map(std::convert::AsRef::as_ref),
             );
 
+            let bloom_hints = BloomHints {
+                prefix_hash: lock.prefix_hash,
+                key_hash: lock.key_hash,
+                #[cfg(feature = "metrics")]
+                metrics: lock.metrics.clone(),
+            };
+
             for run in lock
                 .version
                 .version
@@ -256,7 +228,8 @@ impl TreeIter {
                         #[expect(clippy::expect_used, reason = "we checked for length")]
                         let table = run.first().expect("should exist");
 
-                        if table.check_key_range_overlap(&bounds) && bloom_passes(lock, table) {
+                        if table.check_key_range_overlap(&bounds) && !bloom_hints.should_skip(table)
+                        {
                             let reader =
                                 table
                                     .range(user_range.clone())
@@ -271,7 +244,8 @@ impl TreeIter {
                         let surviving: Vec<_> = run
                             .iter()
                             .filter(|table| {
-                                table.check_key_range_overlap(&bounds) && bloom_passes(lock, table)
+                                table.check_key_range_overlap(&bounds)
+                                    && !bloom_hints.should_skip(table)
                             })
                             .cloned()
                             .collect();
@@ -442,6 +416,13 @@ impl TreeIter {
             let mut single_tables = Vec::new();
             let mut multi_runs = Vec::new();
 
+            let bloom_hints = BloomHints {
+                prefix_hash: lock.prefix_hash,
+                key_hash: lock.key_hash,
+                #[cfg(feature = "metrics")]
+                metrics: lock.metrics.clone(),
+            };
+
             for run in lock
                 .version
                 .version
@@ -469,7 +450,7 @@ impl TreeIter {
                         if table.check_key_range_overlap(&(
                             user_range.0.as_ref().map(std::convert::AsRef::as_ref),
                             user_range.1.as_ref().map(std::convert::AsRef::as_ref),
-                        )) && bloom_passes(lock, table)
+                        )) && !bloom_hints.should_skip(table)
                         {
                             single_tables.push(table.clone());
                         }
@@ -488,57 +469,18 @@ impl TreeIter {
                             );
                         }
 
-                        // If a prefix or key hash is available, filter individual
-                        // tables within the multi-table run using their bloom
-                        // filters. This covers both prefix scans (prefix_hash)
-                        // and point-read merge pipelines (key_hash).
-                        if lock.prefix_hash.is_some() || lock.key_hash.is_some() {
-                            let bounds = (
-                                user_range.0.as_ref().map(std::convert::AsRef::as_ref),
-                                user_range.1.as_ref().map(std::convert::AsRef::as_ref),
-                            );
-
-                            let surviving: Vec<_> = run
-                                .iter()
-                                .filter(|table| {
-                                    // Cheap key-range metadata check first to avoid
-                                    // bloom filter I/O for non-overlapping tables.
-                                    if !table.check_key_range_overlap(&bounds) {
-                                        return false;
-                                    }
-
-                                    bloom_passes(lock, table)
-                                })
-                                .cloned()
-                                .collect();
-
-                            match surviving.len() {
-                                0 => {
-                                    // All tables in this run were filtered out.
-                                }
-                                1 => {
-                                    // Demote to single-table path so it also
-                                    // benefits from the range-tombstone table-skip
-                                    // optimization below.
-                                    if let Some(table) = surviving.into_iter().next() {
-                                        single_tables.push(table);
-                                    }
-                                }
-                                _ => {
-                                    // surviving.len() >= 2, so Run::new cannot
-                                    // return None (only empty vecs yield None).
-                                    #[expect(
-                                        clippy::expect_used,
-                                        reason = "Run::new returns None only for empty vecs"
-                                    )]
-                                    let new_run =
-                                        Run::new(surviving).expect("non-empty surviving tables");
-                                    multi_runs.push(Arc::new(new_run));
-                                }
-                            }
-                        } else {
-                            multi_runs.push(run.clone());
-                        }
+                        // Bloom filtering is applied lazily inside RunReader
+                        // (per-table, on demand) rather than upfront. This avoids
+                        // O(N) bloom checks when only a prefix of the run is consumed.
+                        //
+                        // Trade-off: the old upfront approach could "demote" a
+                        // multi-table run to the single-table path when bloom
+                        // filtering left only 1 survivor, enabling range-tombstone
+                        // table-skip. With lazy bloom this demotion is lost, but
+                        // the table-skip benefit is marginal (requires an RT that
+                        // fully covers the lone survivor) while the lazy approach
+                        // benefits all partial-scan workloads.
+                        multi_runs.push(run.clone());
                     }
                 }
             }
@@ -594,6 +536,7 @@ impl TreeIter {
 
             for run in multi_runs {
                 if let Some(reader) = RunReader::new(run, user_range.clone()) {
+                    let reader = reader.with_bloom_hints(bloom_hints.clone());
                     iters.push(Box::new(reader.filter(move |item| match item {
                         Ok(item) => seqno_filter(item.key.seqno, seqno),
                         Err(_) => true,

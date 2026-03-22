@@ -48,8 +48,9 @@ pub struct Metrics {
 
     /// Number of segments skipped during prefix scans via
     /// [`Tree::create_prefix`] where the per-table prefix bloom filter
-    /// returned `Ok(false)`. Counted in both single-table and
-    /// multi-table run paths of `TreeIter::create_range`.
+    /// returned `Ok(false)`. Counted in `BloomHints::should_skip` which
+    /// is called from both the single-table path of `TreeIter::create_range`
+    /// and lazily inside `RunReader` for multi-table runs.
     ///
     /// Note: `BlobTree` prefix scans do not currently record this metric.
     pub(crate) prefix_bloom_skips: AtomicUsize,
