@@ -119,6 +119,8 @@ impl Fs for StdFs {
     }
 
     fn read_dir(&self, path: &Path) -> io::Result<Vec<FsDirEntry>> {
+        // Fail-fast on bad entries is intentional: non-UTF-8 filenames in an
+        // lsm-tree data directory indicate filesystem corruption (see FsDirEntry docs).
         std::fs::read_dir(path)?
             .map(|res| {
                 let entry = res?;
