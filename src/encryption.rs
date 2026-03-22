@@ -303,10 +303,10 @@ impl EncryptionProvider for Aes256GcmProvider {
 
         let nonce = aes_gcm::Aes256Gcm::generate_nonce(&mut OsRng);
 
-        // Shift plaintext right by NONCE_LEN to make room for the nonce
-        // at front, then write the nonce into the gap. Single memmove via
-        // copy_within avoids the Splice iterator adapter overhead.
+        // Reserve space for nonce prefix + tag suffix in one allocation,
+        // then shift plaintext right and write the nonce into the gap.
         let plaintext_len = buf.len();
+        buf.reserve(Self::NONCE_LEN + Self::TAG_LEN);
         buf.resize(plaintext_len + Self::NONCE_LEN, 0);
         buf.copy_within(..plaintext_len, Self::NONCE_LEN);
         #[expect(
@@ -314,8 +314,6 @@ impl EncryptionProvider for Aes256GcmProvider {
             reason = "buf was just resized to include NONCE_LEN"
         )]
         buf[..Self::NONCE_LEN].copy_from_slice(&nonce);
-        // Reserve space for the tag that will be appended after encryption.
-        buf.reserve(Self::TAG_LEN);
 
         #[expect(
             clippy::indexing_slicing,
