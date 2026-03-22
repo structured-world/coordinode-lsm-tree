@@ -1330,9 +1330,10 @@ impl Tree {
 
         log::info!("Recovering LSM-tree at {}", config.path.display());
 
-        // Validate manifest metadata (format version, tree type, comparator
-        // name) BEFORE recover_levels, so a rejected open is side-effect free
+        // Validate manifest metadata (format version, comparator name)
+        // BEFORE recover_levels, so a rejected open is side-effect free
         // — recover_levels loads tables and cleans up orphans.
+        // Tree type is checked after recovery (needs the Version object).
         {
             let version_id = crate::version::recovery::get_current_version(&config.path)?;
             let manifest_path = config.path.join(format!("v{version_id}"));
