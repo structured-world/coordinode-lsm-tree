@@ -30,7 +30,8 @@ impl Workload for PrefixScan {
         }
 
         // Reject num values that exceed the u16 prefix × u16 suffix space.
-        let max_keys = u64::from(NUM_PREFIXES) * u64::from(u16::MAX);
+        // u16 suffix has 65536 values (0..=65535), not u16::MAX (65535).
+        let max_keys = u64::from(NUM_PREFIXES) * (u64::from(u16::MAX) + 1);
         if config.num > max_keys {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
