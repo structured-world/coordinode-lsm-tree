@@ -262,11 +262,12 @@ fn u64_comparator_compaction_with_tombstones() -> lsm_tree::Result<()> {
 // These tests verify that compaction-merged SSTs retain correct ordering
 // under a genuinely non-lexicographic comparator.
 //
-// Currently IGNORED because Run::push() in src/version/run.rs sorts tables
-// by min key using lexicographic .cmp() instead of the custom comparator.
-// This causes inter-SST ordering to be wrong after compaction. The bug also
-// affects KeyRange overlap checks in key_range.rs and range_overlap_indexes()
-// in version/run.rs.
+// NOTE: These tests also serve as regression coverage for a historical bug
+// where Run::push() in src/version/run.rs sorted tables by min key using
+// lexicographic .cmp() instead of the custom comparator, which caused
+// incorrect inter-SST ordering after compaction and affected KeyRange
+// overlap checks in key_range.rs and range_overlap_indexes() in
+// version/run.rs.
 // ===========================================================================
 
 #[test]
@@ -651,9 +652,10 @@ fn u64_comparator_merge_multiple_keys_compaction() -> lsm_tree::Result<()> {
 // ===========================================================================
 // Section 4: Merge operator + ReverseComparator
 //
-// These test merge operand resolution with a genuinely non-lexicographic
-// comparator. The in-memtable tests pass; the cross-flush and post-compaction
-// tests hit the same Run::push() sorting bug as Section 2.
+// These tests exercise merge-operand resolution with a genuinely
+// non-lexicographic comparator across in-memtable, cross-flush, and
+// post-compaction scenarios. Historically some of these cases reproduced
+// the Run::push() sorting bug fixed in Section 2.
 // ===========================================================================
 
 #[test]

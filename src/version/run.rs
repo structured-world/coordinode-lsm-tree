@@ -75,6 +75,9 @@ impl<T: Ranged> Run<T> {
         &mut self.0
     }
 
+    /// Pushes a table into the run and re-sorts by min key using lexicographic
+    /// byte ordering. Only correct when the tree uses the default comparator.
+    /// For custom comparators, use [`push_cmp`] instead.
     pub fn push(&mut self, item: T) {
         self.0.push(item);
 
