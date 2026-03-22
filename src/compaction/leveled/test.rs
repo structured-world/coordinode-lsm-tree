@@ -616,27 +616,27 @@ fn multi_level_skip_fires_when_l1_oversized() -> crate::Result<()> {
         tree.compact(leveled.clone(), seqno)?;
     }
 
-    // Step 2: Compact with multi_level + tiny target so L1 is immediately
-    // scored > 1.0 (L1 target = 1*4 = 4 bytes, any table exceeds this).
+    // Step 2: Now flush many more overlapping tables and compact with
+    // multi_level + same default target. After enough L0→L1 compactions,
+    // L1 will eventually exceed its target and the multi-level check in
+    // choose() (l1_score > 1.0) will be evaluated on every L0→L1 decision.
     let multi = Arc::new(
         Strategy::default()
             .with_multi_level(true)
-            .with_table_target_size(1)
             .with_l0_threshold(4),
     );
 
-    // Flush 4 overlapping tables to trigger L0→L1 (or L0+L1→L2 skip)
-    for _k in 0..4 {
-        tree.insert("a", "val", seqno);
-        tree.insert(format!("k_{seqno}").as_bytes(), "val", seqno);
-        tree.insert("z", "val", seqno);
-        tree.flush_active_memtable(seqno)?;
-        seqno += 1;
-    }
-
-    // Run compaction multiple times to ensure the multi-level path is exercised
-    for _ in 0..5 {
-        tree.compact(multi.clone(), seqno)?;
+    for _round in 0..6 {
+        for _k in 0..4 {
+            tree.insert("a", "val", seqno);
+            tree.insert(format!("k_{seqno}").as_bytes(), "val", seqno);
+            tree.insert("z", "val", seqno);
+            tree.flush_active_memtable(seqno)?;
+            seqno += 1;
+        }
+        for _ in 0..3 {
+            tree.compact(multi.clone(), seqno)?;
+        }
     }
 
     // Data MUST have propagated beyond L1 into deeper levels.

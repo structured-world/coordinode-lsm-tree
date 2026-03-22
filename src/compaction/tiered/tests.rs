@@ -393,3 +393,42 @@ fn stcs_single_run_no_compaction() -> crate::Result<()> {
     assert_eq!(1, tree.table_count());
     Ok(())
 }
+
+#[test]
+fn stcs_dissimilar_sizes_break() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let tree = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .open()?;
+
+    // Create runs of very different sizes so the size-ratio break fires.
+    // First run: tiny (1 key)
+    tree.insert("a", "v", 0);
+    tree.insert("z", "v", 0);
+    tree.flush_active_memtable(0)?;
+
+    // Second run: much larger (many keys → bigger table)
+    for k in 0..200u16 {
+        tree.insert("a", "v", 1);
+        tree.insert(k.to_be_bytes().as_slice(), "large_value_padding_xxxxx", 1);
+        tree.insert("z", "v", 1);
+    }
+    tree.flush_active_memtable(1)?;
+
+    // Very tight size_ratio=0.01, min_merge_width=2.
+    // The two runs differ hugely in size, so ratio > 1.01 → break fires.
+    let strategy = Arc::new(
+        Strategy::default()
+            .with_size_ratio(0.01)
+            .with_min_merge_width(2)
+            .with_max_space_amplification_percent(u64::MAX),
+    );
+    tree.compact(strategy, 2)?;
+
+    // No merge — sizes too different
+    assert_eq!(2, tree.table_count());
+    Ok(())
+}
