@@ -583,8 +583,8 @@ impl Table {
             // Sort range tombstones by (start asc, seqno desc) to enable
             // binary search in point-read suppression paths. Uses explicit
             // comparator so the partition_point invariant is independent of
-            // Ord changes. The seqno desc tiebreaker lets suppression checks
-            // short-circuit on the highest-seqno RT for a given start key.
+            // Ord changes. The seqno-desc tiebreaker ensures higher-seqno
+            // RTs are checked first when multiple share the same start key.
             rts.sort_unstable_by(|a, b| a.start.cmp(&b.start).then_with(|| b.seqno.cmp(&a.seqno)));
             rts
         } else {

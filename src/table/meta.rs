@@ -204,7 +204,19 @@ impl ParsedMeta {
         // surface metadata corruption rather than silently falling back.
         let highest_kv_seqno = if let Some(item) = block.point_read(b"seqno#kv_max", SeqNo::MAX) {
             let mut bytes = &item.value[..];
-            bytes.read_u64::<LittleEndian>()?
+            let value = bytes.read_u64::<LittleEndian>()?;
+            // KV-only seqno must not exceed the overall max (which includes
+            // both KV and RT seqnos). A value above seqnos.1 indicates
+            // on-disk corruption — surface it rather than silently using
+            // a bogus bound that could cause incorrect table-skip decisions.
+            if value > seqnos.1 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "seqno#kv_max exceeds seqno#max",
+                )
+                .into());
+            }
+            value
         } else {
             seqnos.1
         };
