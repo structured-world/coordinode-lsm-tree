@@ -88,7 +88,7 @@ pub struct Writer {
 
     bloom_policy: BloomConstructionPolicy,
 
-    /// Stored so use_partitioned_filter() can re-apply it to the new writer
+    /// Stored so `use_partitioned_filter()` can re-apply it to the new writer
     prefix_extractor: Option<Arc<dyn PrefixExtractor>>,
 
     /// Tracks the previously written item to detect weak tombstone/value pairs

@@ -87,7 +87,7 @@ pub trait PrefixExtractor:
 ///
 /// Used by both `Tree::create_prefix` and `BlobTree::prefix` to avoid
 /// duplicating the boundary-check + hashing logic.
-pub(crate) fn compute_prefix_hash(
+pub fn compute_prefix_hash(
     extractor: Option<&std::sync::Arc<dyn PrefixExtractor>>,
     prefix_bytes: &[u8],
 ) -> Option<u64> {
