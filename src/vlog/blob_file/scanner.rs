@@ -91,15 +91,15 @@ impl Iterator for Scanner {
         let on_disk_val_len = fail_iter!(self.inner.read_u32::<LittleEndian>());
 
         // V4: read and validate header CRC using shared validator.
+        // On CRC failure, terminate the scanner so subsequent next() calls
+        // don't read from a mid-frame stream position.
         let stored_header_crc = if frame_is_v4 {
             let crc = fail_iter!(self.inner.read_u32::<LittleEndian>());
-            fail_iter!(validate_header_crc(
-                seqno,
-                key_len,
-                real_val_len,
-                on_disk_val_len,
-                crc
-            ));
+            if let Err(e) = validate_header_crc(seqno, key_len, real_val_len, on_disk_val_len, crc)
+            {
+                self.is_terminated = true;
+                return Some(Err(e));
+            }
             Some(crc)
         } else {
             None

@@ -40,7 +40,10 @@ impl<'a> Reader<'a> {
         Self { blob_file, file }
     }
 
-    #[expect(clippy::too_many_lines)]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "blob read/validation path is kept in one function so error handling and size checks stay co-located"
+    )]
     pub fn get(&self, key: &'a [u8], vhandle: &'a ValueHandle) -> crate::Result<UserValue> {
         debug_assert_eq!(vhandle.blob_file_id, self.blob_file.id());
 
@@ -110,9 +113,10 @@ impl<'a> Reader<'a> {
         // header fields is still caught by the data checksum.
         let stored_header_crc = if frame_is_v4 {
             let crc = reader.read_u32::<LittleEndian>()?;
-            // real_val_len was read as u32 (line above), widened to usize;
-            // cast back is lossless on supported targets (>= 32-bit usize).
-            #[expect(clippy::cast_possible_truncation)]
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "real_val_len originates as u32, round-tripped through usize; lossless on supported targets"
+            )]
             validate_header_crc(seqno, key_len, real_val_len as u32, on_disk_val_len, crc)?;
             Some(crc)
         } else {
