@@ -1,4 +1,4 @@
-# Standalone benchmark tool — not part of the coordinode-lsm-tree workspace.
+# Standalone benchmark tool — not part of the main coordinode-lsm-tree crate.
 # Build with: cd tools/db_bench && cargo build --release
 [package]
 name = "db-bench"
