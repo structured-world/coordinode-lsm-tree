@@ -34,7 +34,7 @@ const DEFAULT_SQ_ENTRIES: u32 = 256;
 /// Returns `false` on any failure (old kernel, seccomp restrictions, etc.).
 #[must_use]
 pub fn is_io_uring_available() -> bool {
-    IoUring::new(2).is_ok()
+    IoUring::new(DEFAULT_SQ_ENTRIES).is_ok()
 }
 
 // ---------------------------------------------------------------------------
@@ -314,16 +314,17 @@ impl Write for IoUringFile {
         if buf.is_empty() {
             return Ok(0);
         }
-        // In append mode, always write at current EOF regardless of cursor.
-        // This matches O_APPEND semantics since io_uring uses explicit offsets.
-        let offset = if self.is_append {
-            self.file.metadata()?.len()
-        } else {
-            *self.cursor.get_mut()
-        };
-        let n = self.ring.submit_write(self.file.as_raw_fd(), buf, offset)?;
-        // Update cursor to reflect new position (EOF for append, advanced for normal).
-        *self.cursor.get_mut() = offset + u64::from(n);
+        let cursor = self.cursor.get_mut();
+        // In append mode, write at current EOF to match O_APPEND semantics.
+        // fstat per write is ~100ns — negligible for journal/SST append patterns.
+        // Cursor-based tracking would break if seek() is called before write().
+        if self.is_append {
+            *cursor = self.file.metadata()?.len();
+        }
+        let n = self
+            .ring
+            .submit_write(self.file.as_raw_fd(), buf, *cursor)?;
+        *cursor += u64::from(n);
         Ok(n as usize)
     }
 
@@ -423,17 +424,19 @@ struct Op {
 
 /// Dedicated thread that owns the `io_uring` ring.
 ///
-/// Operations are submitted via `mpsc::Sender` and results are returned
-/// through per-operation `mpsc::SyncSender` channels.
+/// Operations are submitted via bounded `mpsc::SyncSender` (sized to match
+/// the ring) and results are returned through per-operation channels.
 struct RingThread {
-    tx: Mutex<Option<mpsc::Sender<Op>>>,
+    tx: Mutex<Option<mpsc::SyncSender<Op>>>,
     handle: Mutex<Option<thread::JoinHandle<()>>>,
 }
 
 impl RingThread {
     fn spawn(sq_entries: u32) -> io::Result<Self> {
         let ring = IoUring::new(sq_entries)?;
-        let (tx, rx) = mpsc::channel();
+        // Bound the submission channel to ring capacity — provides
+        // natural backpressure when callers outpace the I/O thread.
+        let (tx, rx) = mpsc::sync_channel(sq_entries as usize);
 
         // If event_loop panics after submitting SQEs, those SQEs still
         // reference caller buffers. Letting the panic propagate would close
