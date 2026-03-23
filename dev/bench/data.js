@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1774266784466,
+  "lastUpdate": 1774269471372,
   "repoUrl": "https://github.com/structured-world/lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -1248,6 +1248,84 @@ window.BENCHMARK_DATA = {
             "value": 477980.910742533,
             "unit": "ops/sec",
             "extra": "P50: 1.8us | P99: 7.8us | P99.9: 16.7us\nthreads: 1 | elapsed: 0.42s | num: 200000"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "5b32b1cf8d0815dad2493c3bcaf7598c6e4168aa",
+          "message": "perf(encryption): replace OsRng with thread-local seeded CSPRNG (#104)\n\n## Summary\n\n- Replace per-block `OsRng` (`getrandom` syscall) with a thread-local\n`ChaCha20Rng` seeded once from `OsRng` per thread\n- Eliminates 1-10 µs syscall overhead per block encryption under\ncontention\n- Fork-aware: tracks process ID via `ForkAwareRng` and reseeds after\n`fork()` to prevent nonce reuse across PIDs\n- No security reduction — `ChaCha20Rng` is a CSPRNG with identical\nguarantees\n\n## Technical Details\n\n- `rand_chacha 0.3` added as optional dep gated behind `encryption`\nfeature (already in transitive dep tree via `aes-gcm` — zero new\ndownloads)\n- `rand_core` types (`OsRng`, `SeedableRng`) accessed via\n`aes_gcm::aead::rand_core` re-export to avoid version-skew with a direct\ndependency\n- Module-scope `thread_local!` with `ForkAwareRng` wrapper — compares\n`std::process::id()` on each call and reseeds if PID changed\n- Single `borrow_mut()` per call — reseed and use share the same\n`RefMut` guard\n- `EncryptionProvider` trait API unchanged; change is internal to\n`Aes256GcmProvider::encrypt()`\n\n## Known Limitations\n\n- Estimated 5-15% improvement for write-heavy encrypted workloads; no\nbenchmark added yet\n\n## Test Plan\n\n- [x] All 11 encryption unit tests pass (including fork-aware reseed +\nnonce uniqueness)\n- [x] All 3 encryption integration tests pass (`encryption_roundtrip`)\n- [x] `cargo clippy --features encryption -- -D warnings` clean\n\nCloses #87\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n\n## Summary by CodeRabbit\n\n* **New Features**\n* Enhanced encryption feature with improved random number generation\ninfrastructure.\n* Optimized nonce generation with thread-local caching for better\nperformance.\n* Added fork-aware random number generation to ensure security across\nprocess forks.\n\n* **Tests**\n  * Added tests validating nonce uniqueness and fork-aware behavior.\n\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-03-23T14:36:46+02:00",
+          "tree_id": "e37545fb1fe8bcc041192af0ebc4ddbe7c4cfae7",
+          "url": "https://github.com/structured-world/lsm-tree/commit/5b32b1cf8d0815dad2493c3bcaf7598c6e4168aa"
+        },
+        "date": 1774269470367,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 2067500.2441717787,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 2.3us | P99.9: 5.3us\nthreads: 1 | elapsed: 0.10s | num: 200000"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1293912.160107552,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 1.4us | P99.9: 5.7us\nthreads: 1 | elapsed: 0.15s | num: 200000"
+          },
+          {
+            "name": "readrandom",
+            "value": 545845.9194599161,
+            "unit": "ops/sec",
+            "extra": "P50: 1.6us | P99: 5.8us | P99.9: 12.0us\nthreads: 1 | elapsed: 0.37s | num: 200000"
+          },
+          {
+            "name": "readseq",
+            "value": 2393064.134358107,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 4.3us | P99.9: 8.5us\nthreads: 1 | elapsed: 0.08s | num: 200000"
+          },
+          {
+            "name": "seekrandom",
+            "value": 412615.2559225907,
+            "unit": "ops/sec",
+            "extra": "P50: 2.1us | P99: 6.2us | P99.9: 12.0us\nthreads: 1 | elapsed: 0.48s | num: 200000"
+          },
+          {
+            "name": "prefixscan",
+            "value": 200823.26936972968,
+            "unit": "ops/sec",
+            "extra": "P50: 4.7us | P99: 6.6us | P99.9: 14.7us\nthreads: 1 | elapsed: 1.00s | num: 200000"
+          },
+          {
+            "name": "overwrite",
+            "value": 1202598.0423014704,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.7us | P99.9: 6.0us\nthreads: 1 | elapsed: 0.17s | num: 200000"
+          },
+          {
+            "name": "mergerandom",
+            "value": 675868.4717239138,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 0.6us | P99.9: 4.3us\nthreads: 1 | elapsed: 0.30s | num: 200000"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 494393.16742709896,
+            "unit": "ops/sec",
+            "extra": "P50: 1.7us | P99: 8.8us | P99.9: 15.4us\nthreads: 1 | elapsed: 0.40s | num: 200000"
           }
         ]
       }
