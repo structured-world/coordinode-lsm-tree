@@ -157,10 +157,7 @@ mod tests {
             writer.write_all(name.as_bytes())?;
         }
 
-        writer.finish().map_err(|e| match e {
-            sfa::Error::Io(e) => crate::Error::from(e),
-            _ => unreachable!(),
-        })?;
+        writer.finish()?;
         Ok(())
     }
 
@@ -227,10 +224,7 @@ mod tests {
         writer.start("comparator_name")?;
         writer.write_all(&[0xFF, 0xFE])?;
 
-        writer.finish().map_err(|e| match e {
-            sfa::Error::Io(e) => crate::Error::from(e),
-            _ => unreachable!(),
-        })?;
+        writer.finish()?;
 
         let reader = sfa::Reader::new(&path)?;
         let result = Manifest::decode_from(&path, &reader);
