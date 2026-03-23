@@ -27,6 +27,8 @@ pub fn read_exact(file: &dyn FsFile, offset: u64, size: usize) -> std::io::Resul
     #[expect(unsafe_code, reason = "see safety")]
     let mut builder = unsafe { Slice::builder_unzeroed(size) };
 
+    // Single call is correct: FsFile::read_at has pread(2) semantics —
+    // on regular files a short read means EOF, not "try again".
     let bytes_read = file.read_at(&mut builder, offset)?;
 
     if bytes_read != size {
