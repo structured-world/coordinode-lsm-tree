@@ -202,13 +202,23 @@ impl KeyRange {
     /// Used by multi-level compaction to reduce redundant L2 overlap queries
     /// when L0 tables overlap (#122 Part 2).
     #[must_use]
-    pub fn merge_sorted_cmp(
+    pub(crate) fn merge_sorted_cmp(
         ranges: impl IntoIterator<Item = Self>,
         cmp: &dyn crate::comparator::UserComparator,
     ) -> Vec<Self> {
         let mut out: Vec<Self> = Vec::new();
+        // Track previous min key to assert sorted-input precondition
+        let mut prev_min: Option<UserKey> = None;
 
         for r in ranges {
+            debug_assert!(
+                prev_min
+                    .as_ref()
+                    .is_none_or(|pm| cmp.compare(pm, r.min()) != std::cmp::Ordering::Greater),
+                "merge_sorted_cmp: input ranges must be sorted by min key in comparator order",
+            );
+            prev_min = Some(r.min().clone());
+
             if let Some(last) = out.last_mut() {
                 // Ranges overlap or are adjacent when last.max >= r.min
                 if cmp.compare(last.max(), r.min()) != std::cmp::Ordering::Less {
