@@ -494,7 +494,7 @@ mod tests {
         }
 
         #[test]
-        fn exclusive_no_overlap() {
+        fn exclusive_overlap() {
             let kr = KeyRange(UserKey::from("f"), UserKey::from("a"));
             // Excluded "a" as hi → hi must be > min "f" in reverse.
             // cmp("a", "f") = reverse(a.cmp(f)) = reverse(Less) = Greater → true.

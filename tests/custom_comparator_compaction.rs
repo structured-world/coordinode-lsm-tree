@@ -878,10 +878,10 @@ fn reverse_comparator_merge_range_scan_after_compaction() -> lsm_tree::Result<()
 // ===========================================================================
 // Section 5: Ingestion write guards with custom comparator (#118)
 //
-// The ingestion guards use `key > *prev` (lexicographic) instead of
-// comparator-aware ordering. With a reverse comparator, keys must be
-// supplied in reverse-lexicographic order, but the guard rejects them
-// because they appear "decreasing" under default byte comparison.
+// Historically, ingestion guards used lexicographic `key > *prev`.
+// These tests validate the fixed behavior: ordering is now enforced
+// by the configured comparator, so reverse-comparator ingestion accepts
+// reverse-lexicographic key order.
 // ===========================================================================
 
 #[test]
