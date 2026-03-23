@@ -1,6 +1,6 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1774296108710,
-  "repoUrl": "https://github.com/structured-world/lsm-tree",
+  "lastUpdate": 1774300091865,
+  "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
       {
@@ -2028,6 +2028,86 @@ window.BENCHMARK_DATA = {
             "value": 498609.23673511326,
             "unit": "ops/sec",
             "extra": "P50: 1.7us | P99: 7.9us | P99.9: 14.2us\nthreads: 1 | elapsed: 0.40s | num: 200000"
+          }
+        ]
+      }
+    ],
+    "coordinode-lsm-tree db_bench": [
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "2feddbe8a188bb5d990f90612b2082e8c0fb6a2f",
+          "message": "chore: rename crate to coordinode-lsm-tree (#147)\n\n## Summary\n\n- Rename crate `lsm-tree` → `coordinode-lsm-tree` for crates.io\npublication\n- Bump version to `4.0.0` (fork epoch)\n- Keep `[lib] name = \"lsm_tree\"` — all downstream code (`use\nlsm_tree::`) works unchanged via `package` alias\n\n## Changes\n\n- `Cargo.toml`: name, version, repository, homepage, keywords\n- `tools/db_bench/Cargo.toml`: use `package = \"coordinode-lsm-tree\"`\nalias\n- `README.md`: badge URLs → coordinode-lsm-tree\n- `.github/workflows/benchmark.yml`: dashboard name\n- `.github/copilot-instructions.md`: project name\n\n## What stays the same\n\n- `[lib] name = \"lsm_tree\"` — Rust lib name unchanged\n- All `use lsm_tree::` in source code — zero changes needed\n- Consumers use: `lsm-tree = { package = \"coordinode-lsm-tree\", ... }`\n- `cargo publish --dry-run` passes\n\n## Test plan\n\n- [x] `cargo check` passes\n- [x] `cargo check --manifest-path tools/db_bench/Cargo.toml` passes\n- [x] `cargo test --lib` — 482 passed, 0 failed\n- [x] `cargo publish --dry-run --allow-dirty` — uploads\n`coordinode-lsm-tree v4.0.0`\n\nCloses #125 (Phases 1-2)",
+          "timestamp": "2026-03-23T23:06:57+02:00",
+          "tree_id": "7016ea1a4b98c0dd5da0a32f49c6e4b076315eb1",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/2feddbe8a188bb5d990f90612b2082e8c0fb6a2f"
+        },
+        "date": 1774300090291,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 1899794.3947516282,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.8us | P99.9: 3.9us\nthreads: 1 | elapsed: 0.11s | num: 200000"
+          },
+          {
+            "name": "fillrandom",
+            "value": 994035.1973648684,
+            "unit": "ops/sec",
+            "extra": "P50: 0.9us | P99: 2.0us | P99.9: 6.6us\nthreads: 1 | elapsed: 0.20s | num: 200000"
+          },
+          {
+            "name": "readrandom",
+            "value": 582614.0504072491,
+            "unit": "ops/sec",
+            "extra": "P50: 1.5us | P99: 4.6us | P99.9: 9.9us\nthreads: 1 | elapsed: 0.34s | num: 200000"
+          },
+          {
+            "name": "readseq",
+            "value": 3064834.61478155,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 3.3us | P99.9: 5.9us\nthreads: 1 | elapsed: 0.07s | num: 200000"
+          },
+          {
+            "name": "seekrandom",
+            "value": 393328.9444378617,
+            "unit": "ops/sec",
+            "extra": "P50: 2.2us | P99: 5.3us | P99.9: 9.9us\nthreads: 1 | elapsed: 0.51s | num: 200000"
+          },
+          {
+            "name": "prefixscan",
+            "value": 223393.29804423658,
+            "unit": "ops/sec",
+            "extra": "P50: 4.2us | P99: 5.1us | P99.9: 10.8us\nthreads: 1 | elapsed: 0.90s | num: 200000"
+          },
+          {
+            "name": "overwrite",
+            "value": 1080898.660443371,
+            "unit": "ops/sec",
+            "extra": "P50: 0.8us | P99: 2.4us | P99.9: 5.4us\nthreads: 1 | elapsed: 0.19s | num: 200000"
+          },
+          {
+            "name": "mergerandom",
+            "value": 788208.5265560852,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 0.6us | P99.9: 4.0us\nthreads: 1 | elapsed: 0.25s | num: 200000"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 502978.1664169355,
+            "unit": "ops/sec",
+            "extra": "P50: 1.7us | P99: 5.9us | P99.9: 10.8us\nthreads: 1 | elapsed: 0.40s | num: 200000"
           }
         ]
       }
