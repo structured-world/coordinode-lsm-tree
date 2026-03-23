@@ -170,8 +170,15 @@ pub trait FsFile: Read + Write + Seek + Send + Sync {
     /// Equivalent to `pread(2)` on Unix. Multiple threads can call this
     /// concurrently on the same file handle without synchronization.
     ///
-    /// On regular files, a short read (fewer bytes than `buf.len()`)
-    /// indicates EOF — the caller does not need a retry loop.
+    /// Implementations must provide *fill-or-EOF* semantics: on success,
+    /// this method either fills `buf` completely and returns
+    /// `Ok(buf.len())`, or returns `Ok(n)` with `n < buf.len()` only if
+    /// the read has reached EOF. Callers may rely on a short read
+    /// indicating EOF and therefore do not need a retry loop.
+    ///
+    /// Implementations are responsible for handling OS-level short reads
+    /// and interrupts internally (for example, by retrying on `EINTR`)
+    /// so that the above guarantee holds unless an error is returned.
     ///
     /// # Errors
     ///
