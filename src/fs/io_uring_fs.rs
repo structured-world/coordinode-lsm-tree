@@ -146,8 +146,14 @@ impl Fs for IoUringFs {
             .map(|res| {
                 let entry = res?;
                 let file_type = entry.file_type()?;
-                let file_name = entry.file_name().into_string().map_err(|_| {
-                    io::Error::new(io::ErrorKind::InvalidData, "non-UTF-8 filename")
+                let file_name_os = entry.file_name();
+                let file_name = file_name_os.into_string().map_err(|os| {
+                    #[expect(
+                        clippy::unnecessary_debug_formatting,
+                        reason = "OsString has no Display impl — Debug is required"
+                    )]
+                    let msg = format!("non-UTF-8 filename in directory {}: {os:?}", path.display());
+                    io::Error::new(io::ErrorKind::InvalidData, msg)
                 })?;
                 Ok(FsDirEntry {
                     path: entry.path(),
@@ -259,7 +265,9 @@ impl FsFile for IoUringFile {
             let remaining = buf.get_mut(total_read..).ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidInput, "read_at offset out of bounds")
             })?;
-            let current_offset = offset + total_read as u64;
+            let current_offset = offset.checked_add(total_read as u64).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "read_at offset overflow")
+            })?;
 
             let n = loop {
                 match self.ring.submit_read(fd, remaining, current_offset) {
