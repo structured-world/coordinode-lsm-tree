@@ -7,8 +7,8 @@
 #[cfg(feature = "zstd")]
 mod zstd_dict {
     use lsm_tree::{
-        config::CompressionPolicy, AbstractTree, CompressionType, Config, SequenceNumberCounter,
-        ZstdDictionary,
+        config::CompressionPolicy, AbstractTree, CompressionType, Config, Guard,
+        SequenceNumberCounter, ZstdDictionary,
     };
     use std::sync::Arc;
 
@@ -87,8 +87,6 @@ mod zstd_dict {
         tree.flush_active_memtable(0)?;
 
         // Range scan should work correctly with dictionary compression.
-        // AbstractTree::range returns IterGuardImpl (infallible iteration over
-        // visible snapshot); errors would surface as panics inside the iterator.
         let items: Vec<_> = tree
             .range(
                 "key-00010".as_bytes()..="key-00020".as_bytes(),
@@ -101,6 +99,11 @@ mod zstd_dict {
             11,
             "range scan should return 11 items (inclusive)"
         );
+
+        // Verify actual key-value content, not just count
+        let pairs: Vec<_> = items.into_iter().map(|g| g.into_inner().unwrap()).collect();
+        assert_eq!(pairs.first().unwrap().0.as_ref(), b"key-00010");
+        assert_eq!(pairs.last().unwrap().0.as_ref(), b"key-00020");
 
         Ok(())
     }
