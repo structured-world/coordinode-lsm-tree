@@ -11,101 +11,98 @@ use crate::{
     config::Config,
     slice_windows::{GrowingWindowsExt, ShrinkingWindowsExt},
     table::{util::aggregate_run_key_range, Table},
-    version::{run::Ranged, Run, Version},
+    version::{run::Ranged, Level, Version},
     HashSet, TableId,
 };
 
 /// Tries to find the most optimal compaction set from one level into the other.
+///
+/// Scans all runs in both levels to handle transient multi-run states from
+/// multi-level compaction (#108). See #122 Part 3.
 fn pick_minimal_compaction(
-    curr_run: &Run<Table>,
-    next_run: Option<&Run<Table>>,
+    curr_level: &Level,
+    next_level: &Level,
     hidden_set: &HiddenSet,
     _overshoot: u64,
     table_base_size: u64,
     cmp: &dyn crate::comparator::UserComparator,
 ) -> Option<(HashSet<TableId>, bool)> {
     // NOTE: Find largest trivial move (if it exists)
-    if let Some(window) = curr_run.shrinking_windows().find(|window| {
-        if hidden_set.is_blocked(window.iter().map(Table::id)) {
-            // IMPORTANT: Compaction is blocked because of other
-            // on-going compaction
-            return false;
+    // Check all runs in curr_level for a window that doesn't overlap ANY run
+    // in next_level.
+    for curr_run in curr_level.iter() {
+        if let Some(window) = curr_run.shrinking_windows().find(|window| {
+            if hidden_set.is_blocked(window.iter().map(Table::id)) {
+                return false;
+            }
+
+            if next_level.is_empty() {
+                return true;
+            }
+
+            let key_range = aggregate_run_key_range(window);
+
+            // Must not overlap ANY run in the next level
+            next_level
+                .iter()
+                .all(|run| run.get_overlapping_cmp(&key_range, cmp).is_empty())
+        }) {
+            let ids = window.iter().map(Table::id).collect();
+            return Some((ids, true));
         }
-
-        let Some(next_run) = &next_run else {
-            // No run in next level, so we can trivially move
-            return true;
-        };
-
-        let key_range = aggregate_run_key_range(window);
-
-        next_run.get_overlapping_cmp(&key_range, cmp).is_empty()
-    }) {
-        let ids = window.iter().map(Table::id).collect();
-        return Some((ids, true));
     }
 
     // NOTE: Look for merges
-    if let Some(next_run) = &next_run {
-        next_run
-            .growing_windows()
-            .take_while(|window| {
-                // Cap at 50x tables per compaction for now
-                //
-                // At this point, all compactions are too large anyway
-                // so we can escape early
-                let next_level_size = window.iter().map(Table::file_size).sum::<u64>();
-                next_level_size <= (50 * table_base_size)
-            })
-            .filter_map(|window| {
-                if hidden_set.is_blocked(window.iter().map(Table::id)) {
-                    // IMPORTANT: Compaction is blocked because of other
-                    // on-going compaction
-                    return None;
-                }
-
-                let key_range = aggregate_run_key_range(window);
-
-                // Pull in all contained tables in current level into compaction
-                let curr_level_pull_in = curr_run.get_contained_cmp(&key_range, cmp);
-
-                let curr_level_size = curr_level_pull_in.iter().map(Table::file_size).sum::<u64>();
-
-                if curr_level_size == 0 {
-                    return None;
-                }
-
-                // TODO: toggling this statement can deadlock compactions because if there are only larger-than-overshoot
-                //  compactions, they would not be chosen
-                // if curr_level_size < overshoot {
-                //     return None;
-                // }
-
-                if hidden_set.is_blocked(curr_level_pull_in.iter().map(Table::id)) {
-                    // IMPORTANT: Compaction is blocked because of other
-                    // on-going compaction
-                    return None;
-                }
-
-                let next_level_size = window.iter().map(Table::file_size).sum::<u64>();
-
-                let compaction_bytes = curr_level_size + next_level_size;
-
-                #[expect(clippy::cast_precision_loss)]
-                let write_amp = (next_level_size as f32) / (curr_level_size as f32);
-
-                Some((window, curr_level_pull_in, write_amp, compaction_bytes))
-            })
-            // Find the compaction with the smallest write set
-            .min_by_key(|(_, _, _waf, bytes)| *bytes)
-            .map(|(window, curr_level_pull_in, _, _)| {
-                let mut ids: HashSet<_> = window.iter().map(Table::id).collect();
-                ids.extend(curr_level_pull_in.iter().map(Table::id));
-                (ids, false)
-            })
-    } else {
-        None
+    // Iterate windows across all runs in next_level, pull in from all runs
+    // in curr_level.
+    if next_level.is_empty() {
+        return None;
     }
+
+    next_level
+        .iter()
+        .flat_map(|run| run.growing_windows())
+        .take_while(|window| {
+            let next_level_size = window.iter().map(Table::file_size).sum::<u64>();
+            next_level_size <= (50 * table_base_size)
+        })
+        .filter_map(|window| {
+            if hidden_set.is_blocked(window.iter().map(Table::id)) {
+                return None;
+            }
+
+            let key_range = aggregate_run_key_range(window);
+
+            // Pull in contained tables from ALL runs in curr_level
+            let curr_level_pull_in: Vec<&Table> = curr_level
+                .iter()
+                .flat_map(|run| run.get_contained_cmp(&key_range, cmp))
+                .collect();
+
+            let curr_level_size = curr_level_pull_in
+                .iter()
+                .map(|t| Table::file_size(t))
+                .sum::<u64>();
+
+            if curr_level_size == 0 {
+                return None;
+            }
+
+            if hidden_set.is_blocked(curr_level_pull_in.iter().map(|t| Table::id(t))) {
+                return None;
+            }
+
+            let next_level_size = window.iter().map(Table::file_size).sum::<u64>();
+            let compaction_bytes = curr_level_size + next_level_size;
+
+            Some((window, curr_level_pull_in, compaction_bytes))
+        })
+        .min_by_key(|(_, _, bytes)| *bytes)
+        .map(|(window, curr_level_pull_in, _)| {
+            let mut ids: HashSet<_> = window.iter().map(Table::id).collect();
+            ids.extend(curr_level_pull_in.iter().map(|t| Table::id(t)));
+            (ids, false)
+        })
 }
 
 #[doc(hidden)]
@@ -828,27 +825,9 @@ impl CompactionStrategy for Strategy {
         // subset of tables rather than the full set. Compaction still makes
         // forward progress and the transient multi-run state heals within one
         // or two additional passes.
-        // Soft invariant: L1+ levels are usually single-run but may have
-        // multiple runs transiently after multi-level compaction (#108).
-        // Log rather than assert — this is a performance concern (suboptimal
-        // pick), not a correctness issue. See #122 Part 3 for multi-run picker.
-        if !level.is_disjoint() {
-            log::debug!(
-                "L{} has {} runs (expected 1)",
-                level_idx_with_highest_score,
-                level.run_count()
-            );
-        }
-
-        #[expect(
-            clippy::expect_used,
-            reason = "first run should exist because score is >0.0"
-        )]
         let Some((table_ids, can_trivial_move)) = pick_minimal_compaction(
-            level
-                .first_run()
-                .expect("level should have at least one run"),
-            next_level.first_run().map(std::ops::Deref::deref),
+            level,
+            next_level,
             state.hidden_set(),
             overshoot_bytes,
             self.target_size,
