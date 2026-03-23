@@ -132,6 +132,7 @@ impl Fs for IoUringFs {
         Ok(Box::new(IoUringFile {
             file,
             cursor: AtomicU64::new(cursor),
+            is_append: opts.append,
             ring: Arc::clone(&self.inner),
         }))
     }
@@ -223,6 +224,10 @@ pub struct IoUringFile {
     /// pattern and to allow potential future shared cursor access.
     cursor: AtomicU64,
 
+    /// Whether the file was opened in append mode. When true, writes
+    /// always go to current EOF regardless of cursor/seek position.
+    is_append: bool,
+
     /// Shared reference to the ring thread.
     ring: Arc<RingThread>,
 }
@@ -309,11 +314,16 @@ impl Write for IoUringFile {
         if buf.is_empty() {
             return Ok(0);
         }
-        let cursor = self.cursor.get_mut();
-        let n = self
-            .ring
-            .submit_write(self.file.as_raw_fd(), buf, *cursor)?;
-        *cursor += u64::from(n);
+        // In append mode, always write at current EOF regardless of cursor.
+        // This matches O_APPEND semantics since io_uring uses explicit offsets.
+        let offset = if self.is_append {
+            self.file.metadata()?.len()
+        } else {
+            *self.cursor.get_mut()
+        };
+        let n = self.ring.submit_write(self.file.as_raw_fd(), buf, offset)?;
+        // Update cursor to reflect new position (EOF for append, advanced for normal).
+        *self.cursor.get_mut() = offset + u64::from(n);
         Ok(n as usize)
     }
 
@@ -574,14 +584,12 @@ impl RingThread {
         // (blocked on the result channel — see UnsafeSend safety contract).
         #[expect(unsafe_code, reason = "io_uring SQE push")]
         unsafe {
-            if ring.submission().push(&sqe).is_err() {
-                // SQ full — submit pending SQEs to the kernel and harvest
-                // any already-completed CQEs to free SQ slots. This is
-                // best-effort: if no completions are available the retry
-                // below will fail with EBUSY, which is the correct outcome
-                // for a genuinely saturated ring.
+            while ring.submission().push(&sqe).is_err() {
+                // SQ full — wait for at least one completion to free a slot.
+                // Since the Fs API is synchronous, callers are already blocking;
+                // backpressure here is natural, not an error.
                 loop {
-                    match ring.submit() {
+                    match ring.submit_and_wait(1) {
                         Ok(_) => break,
                         Err(ref e) if e.raw_os_error() == Some(4 /* EINTR */) => {}
                         Err(e) => {
@@ -596,11 +604,6 @@ impl RingThread {
                     if let Some(tx) = pending.remove(&cid) {
                         let _ = tx.send(cqe.result());
                     }
-                }
-                if ring.submission().push(&sqe).is_err() {
-                    // Still full after flush — io_uring ring is saturated.
-                    let _ = op.result_tx.send(-16 /* EBUSY */);
-                    return;
                 }
             }
         }
