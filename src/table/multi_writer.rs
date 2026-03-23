@@ -174,16 +174,22 @@ impl MultiWriter {
                 if let Some(max_exclusive) = max_exclusive {
                     for rt in tombstones {
                         if let Some(clipped) = rt.intersect_opt(first_key.as_ref(), max_exclusive) {
-                            // Widen last_key to cover the clipped RT so point
-                            // reads for keys in the gap will consult this table.
-                            // Safe: the RT is clipped to [first_key, clip_upper)
-                            // and clip_upper is the next table's first key — so
-                            // the widened range does not overlap the next table.
+                            // Widen last_key so point reads for keys in the
+                            // gap will consult this table for RT suppression.
                             //
-                            // Only last_key needs widening: intersect_opt already
-                            // clamps clipped.start >= first_key.
+                            // Guard: clipped.end is exclusive but last_key is
+                            // inclusive.  When clipped.end == clip_upper (the
+                            // next table's first key), setting last_key to that
+                            // value would make adjacent tables' key_ranges
+                            // overlap, breaking Run::get_for_key_cmp.  Only
+                            // widen when strictly less than clip_upper.
+                            //
+                            // Only last_key needs widening: intersect_opt
+                            // already clamps clipped.start >= first_key.
                             if let Some(existing) = &mut writer.meta.last_key {
-                                if clipped.end.as_ref() > existing.as_ref() {
+                                let safe = clip_upper
+                                    .map_or(true, |upper| clipped.end.as_ref() < upper.as_ref());
+                                if safe && clipped.end.as_ref() > existing.as_ref() {
                                     *existing = clipped.end.clone();
                                 }
                             }
@@ -594,6 +600,104 @@ mod tests {
             total_rts > 0,
             "BUG: RT [m,p)@20 was dropped by compaction clip — \
              no output table preserved it (gap between tables)",
+        );
+
+        Ok(())
+    }
+
+    // Edge case (#32): RT spans past the next table's first key, so
+    // clipped.end == clip_upper.  Widening last_key to clip_upper would
+    // make adjacent tables' key_ranges overlap and break Run::get_for_key_cmp.
+    // Verify the RT is still written but key_range stays disjoint.
+    #[test]
+    fn clip_rt_spanning_next_table_does_not_overlap_key_ranges() -> crate::Result<()> {
+        use crate::{fs::StdFs, InternalValue, UserKey};
+        use std::sync::Arc;
+
+        let folder = tempfile::tempdir()?;
+        let base_path = folder.path().join("tables");
+        std::fs::create_dir_all(&base_path)?;
+
+        let id_gen = SequenceNumberCounter::default();
+        let fs: Arc<dyn crate::fs::Fs> = Arc::new(StdFs);
+
+        let mut mw = super::MultiWriter::new(base_path.clone(), id_gen, 100, 1, fs)?
+            .use_clip_range_tombstones();
+
+        // RT [m, r) — end "r" > next table's first key "q", so after
+        // clipping to [first_key, clip_upper="q") the clipped.end == "q".
+        mw.set_range_tombstones(vec![crate::range_tombstone::RangeTombstone::new(
+            UserKey::from(b"m" as &[u8]),
+            UserKey::from(b"r" as &[u8]),
+            20,
+        )]);
+
+        // Table 1: [a, l]
+        mw.write(InternalValue::from_components(
+            UserKey::from(b"a" as &[u8]),
+            vec![0u8; 4_000],
+            1,
+            crate::ValueType::Value,
+        ))?;
+        mw.write(InternalValue::from_components(
+            UserKey::from(b"l" as &[u8]),
+            vec![0u8; 4_000],
+            2,
+            crate::ValueType::Value,
+        ))?;
+        // Table 2: [q, z]
+        mw.write(InternalValue::from_components(
+            UserKey::from(b"q" as &[u8]),
+            vec![0u8; 4_000],
+            3,
+            crate::ValueType::Value,
+        ))?;
+        mw.write(InternalValue::from_components(
+            UserKey::from(b"z" as &[u8]),
+            vec![0u8; 4_000],
+            4,
+            crate::ValueType::Value,
+        ))?;
+
+        let results = mw.finish()?;
+        assert!(results.len() >= 2);
+
+        let cache = Arc::new(crate::Cache::with_capacity_bytes(64 * 1_024));
+        let comparator: crate::SharedComparator = Arc::new(crate::DefaultUserComparator);
+
+        let mut tables = Vec::new();
+        for (table_id, checksum) in &results {
+            tables.push(crate::Table::recover(
+                base_path.join(table_id.to_string()),
+                *checksum,
+                0,
+                0,
+                cache.clone(),
+                None,
+                false,
+                false,
+                None,
+                comparator.clone(),
+                #[cfg(feature = "metrics")]
+                Arc::new(crate::Metrics::default()),
+            )?);
+        }
+
+        // Key ranges must be disjoint: table1.max < table2.min
+        let t1_max = tables[0].metadata.key_range.max();
+        let t2_min = tables[1].metadata.key_range.min();
+        assert!(
+            t1_max.as_ref() < t2_min.as_ref(),
+            "key_ranges must be disjoint: table1.max={:?} must be < table2.min={:?}",
+            t1_max,
+            t2_min,
+        );
+
+        // RT must still be written to at least one output table
+        let total_rts: usize = tables.iter().map(|t| t.range_tombstones().len()).sum();
+        assert!(
+            total_rts > 0,
+            "RT [m,r)@20 must be preserved in at least one output table",
         );
 
         Ok(())
