@@ -1308,7 +1308,7 @@ mod tests {
             // Tamper a byte in the encrypted payload (after header)
             let mid = Header::serialized_len() + 1;
             if mid < buf.len() {
-                #[expect(clippy::indexing_slicing)]
+                #[expect(clippy::indexing_slicing, reason = "mid < buf.len() checked above")]
                 {
                     buf[mid] ^= 0xFF;
                 }
