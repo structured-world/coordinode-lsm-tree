@@ -137,9 +137,10 @@ impl MultiWriter {
             let (metadata, checksum) = writer.finish()?;
 
             let file: Arc<dyn FsFile> = Arc::new(std::fs::File::open(&path)?);
-            let file_accessor = descriptor_table.map_or(FileAccessor::File(file.clone()), |dt| {
-                FileAccessor::DescriptorTable(dt)
-            });
+            let file_accessor = descriptor_table.map_or_else(
+                || FileAccessor::File(file.clone()),
+                FileAccessor::DescriptorTable,
+            );
             file_accessor.insert_for_blob_file((tree_id, blob_file_id).into(), file);
 
             let blob_file = BlobFile(Arc::new(BlobFileInner {

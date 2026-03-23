@@ -70,7 +70,9 @@ impl FsFile for File {
         let mut filled = 0usize;
 
         while filled < buf.len() {
-            let remaining = buf.get_mut(filled..).unwrap_or(&mut []);
+            // SAFETY: loop guard `filled < buf.len()` ensures this is in-bounds.
+            #[expect(clippy::expect_used, reason = "filled < buf.len() by loop guard")]
+            let remaining = buf.get_mut(filled..).expect("filled < buf.len()");
             let off = offset.saturating_add(filled as u64);
 
             let n = {
