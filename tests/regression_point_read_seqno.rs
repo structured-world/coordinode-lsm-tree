@@ -13,7 +13,7 @@ use lsm_tree::{AbstractTree, Config, SequenceNumberCounter};
 /// This test uses the shared counter (correct API usage) and verifies the
 /// same operation pattern works correctly.
 #[test]
-fn with_post_compact_flush() -> lsm_tree::Result<()> {
+fn point_read_after_compact_flush_returns_latest_value() -> lsm_tree::Result<()> {
     let tmpdir = lsm_tree::get_tmp_folder();
     let seqno = SequenceNumberCounter::default();
     let visible_seqno = SequenceNumberCounter::default();
