@@ -90,6 +90,7 @@ impl Arena {
             let cur = self.cursor.load(Ordering::Acquire);
             let block_idx = cur >> BLOCK_SHIFT;
             let offset = cur & BLOCK_MASK;
+            // Cannot overflow: offset < BLOCK_SIZE (≤ 2^26), align ≤ 4.
             let aligned = (offset + align - 1) & !(align - 1);
 
             if let Some(new_end) = aligned.checked_add(size) {

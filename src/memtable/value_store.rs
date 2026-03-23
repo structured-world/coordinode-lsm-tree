@@ -51,7 +51,12 @@ pub struct ValueStore {
 
 impl ValueStore {
     /// Creates a new empty store.
+    ///
+    /// Allocates a fixed-size segment-pointer array (~512 KiB on 64-bit).
+    /// This is acceptable: one array per memtable, and memtables are few.
     pub fn new() -> Self {
+        // Vec optimizes the repeated-null pattern into a single memset.
+        // Using Box::new_zeroed_slice would be cleaner but requires nightly.
         let mut segments = Vec::with_capacity(MAX_SEGMENTS);
         for _ in 0..MAX_SEGMENTS {
             segments.push(AtomicPtr::new(ptr::null_mut()));
