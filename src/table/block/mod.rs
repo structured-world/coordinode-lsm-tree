@@ -1064,6 +1064,10 @@ mod tests {
     // --- Encrypted block roundtrip tests ---
     // These exercise the encrypt_vec/decrypt_vec code paths in write_into,
     // from_reader, and from_file that are untouched by the non-encrypted tests.
+    //
+    // NOTE: The tempfile + write + reopen + handle pattern is duplicated across
+    // from_file tests (both encrypted and non-encrypted). Extracting a helper
+    // would touch the entire test module — left for a separate cleanup PR.
 
     #[cfg(feature = "encryption")]
     mod encrypted {
