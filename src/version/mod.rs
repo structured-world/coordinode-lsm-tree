@@ -273,6 +273,10 @@ impl Version {
                             })
                             .collect::<crate::Result<Vec<_>>>()?;
 
+                        // Tables are in persisted order, which preserves the
+                        // comparator-sorted order from when the run was written.
+                        // No re-sort needed — the manifest faithfully round-trips
+                        // the run's table sequence.
                         Ok(Arc::new(
                             #[expect(
                                 clippy::expect_used,
