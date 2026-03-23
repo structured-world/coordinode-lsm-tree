@@ -364,8 +364,8 @@ mod tests {
                 dict_id: 0xDEAD_BEEF,
             }
             .encode_into_vec();
-            // 1 byte tag + 1 byte level + 4 bytes dict_id = 6
-            assert_eq!(6, serialized.len());
+            // tag=4, level=3 as i8, dict_id=0xDEAD_BEEF in little-endian
+            assert_eq!(serialized, [4, 3, 0xEF, 0xBE, 0xAD, 0xDE]);
         }
 
         #[test]
@@ -405,13 +405,16 @@ mod tests {
 
         #[test]
         fn compression_zstd_dict_decode_rejects_invalid_level() {
-            // Build a tag-4 payload with invalid level
-            let corrupted = {
-                let mut buf = vec![4u8, 0]; // tag=4, level=0 (invalid)
-                buf.extend_from_slice(&42u32.to_le_bytes());
-                buf
-            };
-            let result = CompressionType::decode_from(&mut &corrupted[..]);
+            // Serialize a valid ZstdDict, then corrupt the level byte to 0
+            let mut buf = CompressionType::ZstdDict {
+                level: 3,
+                dict_id: 42,
+            }
+            .encode_into_vec();
+            assert_eq!(buf[0], 4); // tag
+            buf[1] = 0; // corrupt level to 0 (out of range 1..=22)
+
+            let result = CompressionType::decode_from(&mut &buf[..]);
             assert!(result.is_err(), "level 0 should be rejected on decode");
         }
 
