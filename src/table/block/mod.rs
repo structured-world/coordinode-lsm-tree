@@ -400,16 +400,16 @@ impl Block {
                 clippy::indexing_slicing,
                 reason = "buf.len() == block_size == handle.size() ≥ Header::serialized_len()"
             )]
-            let header_copy = Header::decode_from(&mut &buf[..header_len])?;
+            let parsed_header = Header::decode_from(&mut &buf[..header_len])?;
 
             let actual_data_len = block_size.saturating_sub(header_len);
-            if header_copy.data_length as usize != actual_data_len {
+            if parsed_header.data_length as usize != actual_data_len {
                 return Err(crate::Error::InvalidHeader("Block"));
             }
 
-            if header_copy.uncompressed_length > MAX_DECOMPRESSION_SIZE {
+            if parsed_header.uncompressed_length > MAX_DECOMPRESSION_SIZE {
                 return Err(crate::Error::DecompressedSizeTooLarge {
-                    declared: u64::from(header_copy.uncompressed_length),
+                    declared: u64::from(parsed_header.uncompressed_length),
                     limit: u64::from(MAX_DECOMPRESSION_SIZE),
                 });
             }
@@ -417,11 +417,11 @@ impl Block {
             // Checksum covers the on-disk payload (after header).
             #[expect(clippy::indexing_slicing, reason = "header was decoded from buf")]
             let checksum = Checksum::from_raw(crate::hash::hash128(&buf[header_len..]));
-            checksum.check(header_copy.checksum).inspect_err(|_| {
+            checksum.check(parsed_header.checksum).inspect_err(|_| {
                 log::error!(
                     "Checksum mismatch for block {handle:?}, got={}, expected={}",
                     checksum,
-                    header_copy.checksum,
+                    parsed_header.checksum,
                 );
             })?;
 
@@ -439,7 +439,7 @@ impl Block {
                     )]
                     let actual_len = decrypted.len() as u32;
 
-                    if header_copy.uncompressed_length != actual_len {
+                    if parsed_header.uncompressed_length != actual_len {
                         return Err(crate::Error::InvalidHeader("Block"));
                     }
 
@@ -448,12 +448,12 @@ impl Block {
 
                 #[cfg(feature = "lz4")]
                 CompressionType::Lz4 => {
-                    let mut decompressed = vec![0u8; header_copy.uncompressed_length as usize];
+                    let mut decompressed = vec![0u8; parsed_header.uncompressed_length as usize];
 
                     let bytes_written = lz4_flex::decompress_into(&decrypted, &mut decompressed)
                         .map_err(|_| crate::Error::Decompress(compression))?;
 
-                    if bytes_written != header_copy.uncompressed_length as usize {
+                    if bytes_written != parsed_header.uncompressed_length as usize {
                         return Err(crate::Error::Decompress(compression));
                     }
 
@@ -464,11 +464,11 @@ impl Block {
                 CompressionType::Zstd(_) => {
                     let decompressed = zstd::bulk::decompress(
                         &decrypted,
-                        header_copy.uncompressed_length as usize,
+                        parsed_header.uncompressed_length as usize,
                     )
                     .map_err(|_| crate::Error::Decompress(compression))?;
 
-                    if decompressed.len() != header_copy.uncompressed_length as usize {
+                    if decompressed.len() != parsed_header.uncompressed_length as usize {
                         return Err(crate::Error::Decompress(compression));
                     }
 
@@ -476,21 +476,21 @@ impl Block {
                 }
             };
 
-            (header_copy, data)
+            (parsed_header, data)
         } else {
             // Single I/O read — header + payload in one Slice.
             let buf = crate::file::read_exact(file, *handle.offset(), handle.size() as usize)?;
 
-            let header_copy = Header::decode_from(&mut &buf[..])?;
+            let parsed_header = Header::decode_from(&mut &buf[..])?;
 
             let actual_data_len = buf.len().saturating_sub(Header::serialized_len());
-            if header_copy.data_length as usize != actual_data_len {
+            if parsed_header.data_length as usize != actual_data_len {
                 return Err(crate::Error::InvalidHeader("Block"));
             }
 
-            if header_copy.uncompressed_length > MAX_DECOMPRESSION_SIZE {
+            if parsed_header.uncompressed_length > MAX_DECOMPRESSION_SIZE {
                 return Err(crate::Error::DecompressedSizeTooLarge {
-                    declared: u64::from(header_copy.uncompressed_length),
+                    declared: u64::from(parsed_header.uncompressed_length),
                     limit: u64::from(MAX_DECOMPRESSION_SIZE),
                 });
             }
@@ -499,11 +499,11 @@ impl Block {
             let checksum =
                 Checksum::from_raw(crate::hash::hash128(&buf[Header::serialized_len()..]));
 
-            checksum.check(header_copy.checksum).inspect_err(|_| {
+            checksum.check(parsed_header.checksum).inspect_err(|_| {
                 log::error!(
                     "Checksum mismatch for block {handle:?}, got={}, expected={}",
                     checksum,
-                    header_copy.checksum,
+                    parsed_header.checksum,
                 );
             })?;
 
@@ -517,7 +517,7 @@ impl Block {
                     )]
                     let actual_len = value.len() as u32;
 
-                    if header_copy.uncompressed_length != actual_len {
+                    if parsed_header.uncompressed_length != actual_len {
                         return Err(crate::Error::InvalidHeader("Block"));
                     }
 
@@ -529,13 +529,13 @@ impl Block {
                     #[expect(clippy::indexing_slicing)]
                     let compressed_data = &buf[Header::serialized_len()..];
 
-                    let mut decompressed = vec![0u8; header_copy.uncompressed_length as usize];
+                    let mut decompressed = vec![0u8; parsed_header.uncompressed_length as usize];
 
                     let bytes_written =
                         lz4_flex::decompress_into(compressed_data, &mut decompressed)
                             .map_err(|_| crate::Error::Decompress(compression))?;
 
-                    if bytes_written != header_copy.uncompressed_length as usize {
+                    if bytes_written != parsed_header.uncompressed_length as usize {
                         return Err(crate::Error::Decompress(compression));
                     }
 
@@ -549,11 +549,11 @@ impl Block {
 
                     let decompressed = zstd::bulk::decompress(
                         compressed_data,
-                        header_copy.uncompressed_length as usize,
+                        parsed_header.uncompressed_length as usize,
                     )
                     .map_err(|_| crate::Error::Decompress(compression))?;
 
-                    if decompressed.len() != header_copy.uncompressed_length as usize {
+                    if decompressed.len() != parsed_header.uncompressed_length as usize {
                         return Err(crate::Error::Decompress(compression));
                     }
 
@@ -561,7 +561,7 @@ impl Block {
                 }
             };
 
-            (header_copy, data)
+            (parsed_header, data)
         };
 
         Ok(Self { header, data })
@@ -1223,6 +1223,101 @@ mod tests {
             );
             let block = Block::from_file(&file, handle, CompressionType::Zstd(3), Some(&enc))?;
             assert_eq!(data, &*block.data);
+            Ok(())
+        }
+
+        #[test]
+        fn block_from_file_encrypted_wrong_key_fails() -> crate::Result<()> {
+            use std::io::Write;
+
+            let enc_write = test_provider();
+            let enc_read = crate::encryption::Aes256GcmProvider::new(&[0x99; 32]);
+            let data = b"encrypted block data";
+            let mut buf = vec![];
+            let header = Block::write_into(
+                &mut buf,
+                data,
+                BlockType::Data,
+                CompressionType::None,
+                Some(&enc_write),
+            )?;
+
+            let dir = tempfile::tempdir()?;
+            let path = dir.path().join("block");
+            let mut file = std::fs::File::create(&path)?;
+            file.write_all(&buf)?;
+            file.sync_all()?;
+            drop(file);
+
+            let file = std::fs::File::open(&path)?;
+            let handle = crate::table::BlockHandle::new(
+                BlockOffset(0),
+                header.data_length + Header::serialized_len() as u32,
+            );
+            let result = Block::from_file(&file, handle, CompressionType::None, Some(&enc_read));
+            assert!(result.is_err());
+            Ok(())
+        }
+
+        #[test]
+        fn block_from_reader_encrypted_wrong_key_fails() -> crate::Result<()> {
+            let enc_write = test_provider();
+            let enc_read = crate::encryption::Aes256GcmProvider::new(&[0x99; 32]);
+            let data = b"encrypted block data";
+            let mut writer = vec![];
+
+            Block::write_into(
+                &mut writer,
+                data,
+                BlockType::Data,
+                CompressionType::None,
+                Some(&enc_write),
+            )?;
+
+            let mut reader = &writer[..];
+            let result = Block::from_reader(&mut reader, CompressionType::None, Some(&enc_read));
+            assert!(result.is_err());
+            Ok(())
+        }
+
+        #[test]
+        fn block_from_file_encrypted_checksum_tamper_detected() -> crate::Result<()> {
+            use std::io::Write;
+
+            let enc = test_provider();
+            let data = b"data for tamper test";
+            let mut buf = vec![];
+            let header = Block::write_into(
+                &mut buf,
+                data,
+                BlockType::Data,
+                CompressionType::None,
+                Some(&enc),
+            )?;
+
+            // Tamper a byte in the encrypted payload (after header)
+            let mid = Header::serialized_len() + 1;
+            if mid < buf.len() {
+                #[expect(clippy::indexing_slicing)]
+                {
+                    buf[mid] ^= 0xFF;
+                }
+            }
+
+            let dir = tempfile::tempdir()?;
+            let path = dir.path().join("block");
+            let mut file = std::fs::File::create(&path)?;
+            file.write_all(&buf)?;
+            file.sync_all()?;
+            drop(file);
+
+            let file = std::fs::File::open(&path)?;
+            let handle = crate::table::BlockHandle::new(
+                BlockOffset(0),
+                header.data_length + Header::serialized_len() as u32,
+            );
+            let result = Block::from_file(&file, handle, CompressionType::None, Some(&enc));
+            assert!(result.is_err());
             Ok(())
         }
     }
