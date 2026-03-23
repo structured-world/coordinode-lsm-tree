@@ -754,20 +754,14 @@ impl CompactionStrategy for Strategy {
                         // [x,z] → [a,z]) covers gaps and pulls in L2 tables
                         // that don't actually overlap any input table.
                         //
-                        // Per-table queries are O(input_tables * log L2_tables).
-                        // Merging input ranges into disjoint intervals first
-                        // would reduce queries but adds complexity; not worth it
-                        // given typical input sizes (~10–30 tables). See #120.
+                        // Per-table queries are O(L2_runs * input_tables *
+                        // log L2_run_size). Merging input ranges into disjoint
+                        // intervals first would reduce queries but adds
+                        // complexity; not worth it for typical input sizes
+                        // (~10–30 tables). See #120.
                         for run in l2.iter() {
-                            for l1_run in target_level.iter() {
-                                for t in l1_run.iter() {
-                                    for l2t in run.get_overlapping(t.key_range()) {
-                                        table_ids.insert(Table::id(l2t));
-                                    }
-                                }
-                            }
-                            for l0_run in first_level.iter() {
-                                for t in l0_run.iter() {
+                            for input_run in target_level.iter().chain(first_level.iter()) {
+                                for t in input_run.iter() {
                                     for l2t in run.get_overlapping(t.key_range()) {
                                         table_ids.insert(Table::id(l2t));
                                     }
