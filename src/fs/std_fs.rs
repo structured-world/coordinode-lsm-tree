@@ -65,26 +65,49 @@ impl FsFile for File {
     }
 
     fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::FileExt;
-            FileExt::read_at(self, buf, offset)
+        // Fill-or-EOF loop: retry on short reads and EINTR so that callers
+        // see either a full buffer or a short read that signals EOF.
+        let mut filled = 0usize;
+
+        while filled < buf.len() {
+            let n = {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::FileExt;
+                    match FileExt::read_at(self, &mut buf[filled..], offset + filled as u64) {
+                        Ok(n) => n,
+                        Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                        Err(e) => return Err(e),
+                    }
+                }
+
+                #[cfg(windows)]
+                {
+                    use std::os::windows::fs::FileExt;
+                    match FileExt::seek_read(self, &mut buf[filled..], offset + filled as u64) {
+                        Ok(n) => n,
+                        Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                        Err(e) => return Err(e),
+                    }
+                }
+
+                #[cfg(not(any(unix, windows)))]
+                {
+                    let _ = (buf, offset);
+                    return Err(io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        "read_at is not supported on this platform",
+                    ));
+                }
+            };
+
+            if n == 0 {
+                break; // EOF
+            }
+            filled += n;
         }
 
-        #[cfg(windows)]
-        {
-            use std::os::windows::fs::FileExt;
-            FileExt::seek_read(self, buf, offset)
-        }
-
-        #[cfg(not(any(unix, windows)))]
-        {
-            let _ = (buf, offset);
-            Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "read_at is not supported on this platform",
-            ))
-        }
+        Ok(filled)
     }
 
     fn lock_exclusive(&self) -> io::Result<()> {
