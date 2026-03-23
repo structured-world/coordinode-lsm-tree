@@ -391,6 +391,8 @@ mod tests {
         let arena = Arena::new();
         assert!(arena.alloc(100, 3).is_none()); // 3 is not a power of two
         assert!(arena.alloc(0, 4).is_none()); // zero size
+        assert!(arena.alloc(BLOCK_SIZE, 1).is_none()); // size == BLOCK_SIZE
+        assert!(arena.alloc(BLOCK_SIZE + 1, 1).is_none()); // size > BLOCK_SIZE
     }
 
     #[test]
@@ -423,14 +425,10 @@ mod tests {
     fn exact_block_fill_does_not_corrupt() {
         let arena = Arena::new();
 
-        // Cursor starts at 1.  Fill block 0 up to offset BLOCK_SIZE - 1
-        // (leaving 1 byte unused — the fix means we can't fill a block
-        // to exactly BLOCK_SIZE).
-        let skip = BLOCK_SIZE - 2; // 1 + (BLOCK_SIZE - 2) = BLOCK_SIZE - 1
-        let s = arena.alloc(skip, 1).expect("skip");
-        assert_eq!(s >> BLOCK_SHIFT, 0, "skip should be in block 0");
+        // Jump the cursor directly to block 1, offset 0 — avoids allocating
+        // an entire block 0 (64 MiB on 64-bit) just to advance past it.
+        arena.cursor.store(1 << BLOCK_SHIFT, Ordering::Relaxed);
 
-        // Any next allocation overflows block 0 → lands in block 1.
         // Allocate (BLOCK_SIZE - 4) bytes to bring block 1's cursor to
         // offset BLOCK_SIZE - 4.
         let filler = BLOCK_SIZE - 4;
