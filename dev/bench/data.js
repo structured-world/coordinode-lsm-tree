@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1774290861764,
+  "lastUpdate": 1774292750070,
   "repoUrl": "https://github.com/structured-world/lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -1872,6 +1872,84 @@ window.BENCHMARK_DATA = {
             "value": 525608.465712753,
             "unit": "ops/sec",
             "extra": "P50: 1.6us | P99: 7.7us | P99.9: 15.8us\nthreads: 1 | elapsed: 0.38s | num: 200000"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "75867395eeb9bf6c99cf176f067a853b03dc8a72",
+          "message": "fix: thread UserComparator through Run, KeyRange, and Version methods (#117)\n\n## Summary\n\nExtends comparator-aware coverage (#98 core fix landed in #100) to\nremaining code paths, plus fixes #122.\n\n- **Leveled compaction `choose()`** — all overlap detection, key range\naggregation, trivial move decisions now use comparator\n- **`pick_minimal_compaction` multi-run aware (#122)** — accepts\n`&Level` instead of `&Run`, scans all runs for overlap/containment.\nEliminates missed tables in transient multi-run levels from multi-level\ncompaction (#108)\n- **`RunReader::new_cmp`** — comparator-aware table selection for range\nscans (`create_range` + `create_range_point`)\n- **`OwnedBounds::contains`** — comparator-aware containment for\n`drop_range` strategy\n- **`get_contained_cmp`** — comparator-aware table containment in runs\n- **`Level::aggregate_key_range_cmp`** + **`KeyRange::aggregate_cmp`** +\n**`KeyRange::contains_range_cmp`** — cross-run aggregation with\ncomparator\n\n## What #100 covered vs what this PR adds\n\n| Area | #100 | This PR |\n|------|------|---------|\n| `Run::push_cmp`, `get_overlapping_cmp`, `range_overlap_indexes_cmp` |\nDone | — |\n| `optimize_runs` + `Version::with_*` comparator threading | Done | — |\n| Leveled `choose()` comparator threading | — | Done |\n| `pick_minimal_compaction` multi-run aware (#122) | — | Done |\n| `RunReader::new_cmp` for range scans | — | Done |\n| `OwnedBounds::contains` with comparator | — | Done |\n| `get_contained_cmp`, `contains_range_cmp`, `aggregate_cmp` | — | Done\n|\n| `Level::aggregate_key_range_cmp` | — | Done |\n| `RunReader::new` public API preservation | — | Done |\n| `trim_slice` deduplication | — | Done |\n\n## Test Plan\n\n- [x] 4 regression tests with `ReverseComparator` (compaction, leveled,\nmerge operator, tombstone)\n- [x] Unit test for `get_contained_cmp` with reverse comparator\n- [x] All 17 custom_comparator tests pass + 17\ncustom_comparator_compaction (2 ignored — #116)\n- [x] `cargo check` + `cargo clippy --lib` clean\n\nCloses #122\n\n## Related\n\n- #116 — range bounds interpretation for reverse comparator (blocks\nrange scan tests)",
+          "timestamp": "2026-03-23T21:04:44+02:00",
+          "tree_id": "393a896098ac68d7fb00f3b56e133fbe7a072a15",
+          "url": "https://github.com/structured-world/lsm-tree/commit/75867395eeb9bf6c99cf176f067a853b03dc8a72"
+        },
+        "date": 1774292748338,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 1962507.5492759154,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 2.3us | P99.9: 5.3us\nthreads: 1 | elapsed: 0.10s | num: 200000"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1256481.9390270528,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 1.4us | P99.9: 5.7us\nthreads: 1 | elapsed: 0.16s | num: 200000"
+          },
+          {
+            "name": "readrandom",
+            "value": 597586.1874430607,
+            "unit": "ops/sec",
+            "extra": "P50: 1.5us | P99: 5.5us | P99.9: 11.6us\nthreads: 1 | elapsed: 0.33s | num: 200000"
+          },
+          {
+            "name": "readseq",
+            "value": 2337271.1756008896,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 4.2us | P99.9: 8.3us\nthreads: 1 | elapsed: 0.09s | num: 200000"
+          },
+          {
+            "name": "seekrandom",
+            "value": 395624.3527227055,
+            "unit": "ops/sec",
+            "extra": "P50: 2.2us | P99: 6.3us | P99.9: 12.3us\nthreads: 1 | elapsed: 0.51s | num: 200000"
+          },
+          {
+            "name": "prefixscan",
+            "value": 195585.34901092164,
+            "unit": "ops/sec",
+            "extra": "P50: 4.8us | P99: 6.6us | P99.9: 15.1us\nthreads: 1 | elapsed: 1.02s | num: 200000"
+          },
+          {
+            "name": "overwrite",
+            "value": 1184983.7274183354,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.8us | P99.9: 6.1us\nthreads: 1 | elapsed: 0.17s | num: 200000"
+          },
+          {
+            "name": "mergerandom",
+            "value": 664018.7348105093,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 2.1us | P99.9: 4.1us\nthreads: 1 | elapsed: 0.30s | num: 200000"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 506384.7418904307,
+            "unit": "ops/sec",
+            "extra": "P50: 1.7us | P99: 9.0us | P99.9: 16.0us\nthreads: 1 | elapsed: 0.39s | num: 200000"
           }
         ]
       }
