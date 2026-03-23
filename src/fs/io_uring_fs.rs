@@ -450,7 +450,7 @@ impl RingThread {
         reason = "rx is moved into the spawned thread — must be owned"
     )]
     fn event_loop(mut ring: IoUring, rx: mpsc::Receiver<Op>) {
-        let mut pending: HashMap<u64, mpsc::SyncSender<i32>> = HashMap::new();
+        let mut pending: HashMap<u64, mpsc::SyncSender<i32>> = HashMap::default();
         let mut next_id: u64 = 0;
 
         loop {
