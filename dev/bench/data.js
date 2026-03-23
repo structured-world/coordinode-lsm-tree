@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1774280351254,
+  "lastUpdate": 1774286010471,
   "repoUrl": "https://github.com/structured-world/lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -1560,6 +1560,84 @@ window.BENCHMARK_DATA = {
             "value": 510888.07605290384,
             "unit": "ops/sec",
             "extra": "P50: 1.7us | P99: 6.9us | P99.9: 11.2us\nthreads: 1 | elapsed: 0.39s | num: 200000"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "e99ede98b1cb553be5096decb22cc2b9a8db8d1c",
+          "message": "perf(encryption): reduce allocations in encrypt/decrypt block pipeline (#105)\n\n## Summary\n\n- Add `encrypt_vec`/`decrypt_vec` buffer-reusing methods to\n`EncryptionProvider` trait\n- `Aes256GcmProvider` overrides both for in-place encrypt/decrypt\n(memmove instead of alloc)\n- Write path: reuses owned compression buffer via `encrypt_vec` (saves 1\nalloc per block)\n- Read `from_reader`: reads into Vec when encrypted, `decrypt_vec`\nreuses buffer in-place\n- Read `from_file`: encrypted path reads into Vec via single `read_at`,\nstrips header via `copy_within`, then `decrypt_vec` in-place — single\nI/O, single allocation, no Slice\n\n## Technical Details\n\n**Trait extension** — `encrypt_vec(Vec<u8>)` and `decrypt_vec(Vec<u8>)`\nwith default impls delegating to `encrypt`/`decrypt`.\nBackwards-compatible: existing implementors automatically get the\ndefault.\n\n**AES-256-GCM in-place strategy:**\n- `encrypt_vec`: `reserve(28)` → `resize` + `copy_within` (shift right)\n→ `copy_from_slice` (nonce) → encrypt in-place → `extend(tag)`\n- `decrypt_vec`: `copy_within` (shift left, strip nonce) → `truncate`\n(strip tag) → decrypt in-place → return\n\n**Block pipeline savings (per block with encryption enabled):**\n| Path | Before | After |\n|------|--------|-------|\n| Write (compress+encrypt) | 2 allocs | 1 alloc |\n| Read `from_reader` | 3 allocs, peak 2× block | 2 allocs, peak 1× block\n|\n| Read `from_file` | Slice + Vec copy overlap | single Vec via\n`read_at`, no Slice |\n\n## Test Plan\n\n- [x] 7 unit tests for `encrypt_vec`/`decrypt_vec` (roundtrip,\ncross-interop, empty, tampered, truncated)\n- [x] 2 tests for default trait method delegation (XorProvider stub)\n- [x] 14 encrypted block tests (roundtrip × compression ×\nfrom_reader/from_file + error paths)\n- [x] All lib tests pass\n- [x] Clippy clean (0 warnings)\n- [x] Codecov patch coverage passing\n\nCloses #88\n\n## Related\n\n- #127 — extract tempfile helper for `from_file` tests (out of scope for\nthis PR)\n- #128 — mixed-load encryption stress test (out of scope for this PR)",
+          "timestamp": "2026-03-23T19:11:23+02:00",
+          "tree_id": "a8888455876b4fe0461f96cce4b025620996636e",
+          "url": "https://github.com/structured-world/lsm-tree/commit/e99ede98b1cb553be5096decb22cc2b9a8db8d1c"
+        },
+        "date": 1774286008855,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 1964341.5629717764,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 2.4us | P99.9: 5.4us\nthreads: 1 | elapsed: 0.10s | num: 200000"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1272315.2808462312,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 1.3us | P99.9: 5.6us\nthreads: 1 | elapsed: 0.16s | num: 200000"
+          },
+          {
+            "name": "readrandom",
+            "value": 575062.7279861344,
+            "unit": "ops/sec",
+            "extra": "P50: 1.5us | P99: 5.7us | P99.9: 11.9us\nthreads: 1 | elapsed: 0.35s | num: 200000"
+          },
+          {
+            "name": "readseq",
+            "value": 2397160.180220899,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 4.3us | P99.9: 8.1us\nthreads: 1 | elapsed: 0.08s | num: 200000"
+          },
+          {
+            "name": "seekrandom",
+            "value": 383063.8111680508,
+            "unit": "ops/sec",
+            "extra": "P50: 2.2us | P99: 6.4us | P99.9: 13.0us\nthreads: 1 | elapsed: 0.52s | num: 200000"
+          },
+          {
+            "name": "prefixscan",
+            "value": 192365.2365185311,
+            "unit": "ops/sec",
+            "extra": "P50: 4.9us | P99: 6.9us | P99.9: 15.6us\nthreads: 1 | elapsed: 1.04s | num: 200000"
+          },
+          {
+            "name": "overwrite",
+            "value": 1233004.5504094583,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.7us | P99.9: 5.9us\nthreads: 1 | elapsed: 0.16s | num: 200000"
+          },
+          {
+            "name": "mergerandom",
+            "value": 622018.6045702425,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 0.5us | P99.9: 3.9us\nthreads: 1 | elapsed: 0.32s | num: 200000"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 457674.2121957102,
+            "unit": "ops/sec",
+            "extra": "P50: 1.9us | P99: 8.3us | P99.9: 14.4us\nthreads: 1 | elapsed: 0.44s | num: 200000"
           }
         ]
       }
