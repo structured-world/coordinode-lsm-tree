@@ -557,10 +557,16 @@ impl RingThread {
                 // best-effort: if no completions are available the retry
                 // below will fail with EBUSY, which is the correct outcome
                 // for a genuinely saturated ring.
-                if let Err(e) = ring.submit() {
-                    let errno = e.raw_os_error().unwrap_or(5 /* EIO */);
-                    let _ = op.result_tx.send(-errno);
-                    return;
+                loop {
+                    match ring.submit() {
+                        Ok(_) => break,
+                        Err(ref e) if e.raw_os_error() == Some(4 /* EINTR */) => {}
+                        Err(e) => {
+                            let errno = e.raw_os_error().unwrap_or(5 /* EIO */);
+                            let _ = op.result_tx.send(-errno);
+                            return;
+                        }
+                    }
                 }
                 for cqe in ring.completion() {
                     let cid = cqe.user_data();
