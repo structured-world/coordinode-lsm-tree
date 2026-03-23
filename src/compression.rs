@@ -437,5 +437,13 @@ mod tests {
             let dict = ZstdDictionary::new(raw);
             assert_eq!(dict.raw(), raw);
         }
+
+        #[test]
+        fn zstd_dictionary_debug_format() {
+            let dict = ZstdDictionary::new(b"test");
+            let debug = format!("{dict:?}");
+            assert!(debug.contains("ZstdDictionary"));
+            assert!(debug.contains("size: 4"));
+        }
     }
 }

@@ -437,4 +437,24 @@ mod tests {
         assert!(super::check_size_cap(MAX_DECOMPRESSION_SIZE).is_ok());
         assert!(super::check_size_cap(0).is_ok());
     }
+
+    #[test]
+    #[cfg(feature = "zstd")]
+    fn blob_write_zstd_dict_unsupported() -> crate::Result<()> {
+        let folder = tempfile::tempdir()?;
+        let path = folder.path().join("test.blob");
+        let dict = crate::compression::ZstdDictionary::new(b"test dictionary");
+        let compression = CompressionType::ZstdDict {
+            level: 3,
+            dict_id: dict.id(),
+        };
+        let mut writer = Writer::new(&path, 0, 0)?.use_compression(compression);
+
+        let result = writer.write(b"key", 0, b"value");
+        assert!(
+            matches!(&result, Err(crate::Error::Io(e)) if e.kind() == std::io::ErrorKind::Unsupported),
+            "expected Io(Unsupported), got: {result:?}",
+        );
+        Ok(())
+    }
 }
