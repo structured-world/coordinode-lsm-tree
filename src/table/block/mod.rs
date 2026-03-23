@@ -1329,18 +1329,18 @@ mod tests {
         }
 
         #[test]
-        fn block_from_file_encrypted_undersized_handle_rejected() {
+        fn block_from_file_encrypted_undersized_handle_rejected() -> crate::Result<()> {
             use std::io::Write;
 
             let enc = test_provider();
-            let dir = tempfile::tempdir().unwrap();
+            let dir = tempfile::tempdir()?;
             let path = dir.path().join("block");
-            let mut file = std::fs::File::create(&path).unwrap();
-            file.write_all(b"tiny").unwrap();
-            file.sync_all().unwrap();
+            let mut file = std::fs::File::create(&path)?;
+            file.write_all(b"tiny")?;
+            file.sync_all()?;
             drop(file);
 
-            let file = std::fs::File::open(&path).unwrap();
+            let file = std::fs::File::open(&path)?;
             // Handle size smaller than Header::serialized_len()
             let handle = crate::table::BlockHandle::new(BlockOffset(0), 2);
             let result = Block::from_file(&file, handle, CompressionType::None, Some(&enc));
@@ -1350,6 +1350,7 @@ mod tests {
                 "expected InvalidHeader for undersized handle, got: {:?}",
                 result.err(),
             );
+            Ok(())
         }
 
         #[test]
@@ -1380,6 +1381,68 @@ mod tests {
                 header.data_length + Header::serialized_len() as u32,
             );
             let block = Block::from_file(&file, handle, CompressionType::None, Some(&enc))?;
+            assert_eq!(&*block.data, &data[..]);
+            Ok(())
+        }
+
+        #[test]
+        fn block_roundtrip_encrypted_uncompressed_large() -> crate::Result<()> {
+            let enc = test_provider();
+            let data = vec![0xCC_u8; 32 * 1024]; // 32 KiB
+            let mut writer = vec![];
+
+            Block::write_into(
+                &mut writer,
+                &data,
+                BlockType::Data,
+                CompressionType::None,
+                Some(&enc),
+            )?;
+
+            let mut reader = &writer[..];
+            let block = Block::from_reader(&mut reader, CompressionType::None, Some(&enc))?;
+            assert_eq!(&*block.data, &data[..]);
+            Ok(())
+        }
+
+        #[test]
+        #[cfg(feature = "lz4")]
+        fn block_roundtrip_encrypted_lz4_large() -> crate::Result<()> {
+            let enc = test_provider();
+            let data = vec![0xDD_u8; 32 * 1024]; // 32 KiB
+            let mut writer = vec![];
+
+            Block::write_into(
+                &mut writer,
+                &data,
+                BlockType::Data,
+                CompressionType::Lz4,
+                Some(&enc),
+            )?;
+
+            let mut reader = &writer[..];
+            let block = Block::from_reader(&mut reader, CompressionType::Lz4, Some(&enc))?;
+            assert_eq!(&*block.data, &data[..]);
+            Ok(())
+        }
+
+        #[test]
+        #[cfg(feature = "zstd")]
+        fn block_roundtrip_encrypted_zstd_large() -> crate::Result<()> {
+            let enc = test_provider();
+            let data = vec![0xEE_u8; 32 * 1024]; // 32 KiB
+            let mut writer = vec![];
+
+            Block::write_into(
+                &mut writer,
+                &data,
+                BlockType::Data,
+                CompressionType::Zstd(3),
+                Some(&enc),
+            )?;
+
+            let mut reader = &writer[..];
+            let block = Block::from_reader(&mut reader, CompressionType::Zstd(3), Some(&enc))?;
             assert_eq!(&*block.data, &data[..]);
             Ok(())
         }
