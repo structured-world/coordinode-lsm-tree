@@ -600,9 +600,15 @@ impl RingThread {
         // io_uring SQE length field is u32. In practice LSM block reads
         // are 4-64 KB, so the cap is never reached. Reject oversized
         // buffers explicitly rather than silently truncating.
-        let len = u32::try_from(buf.len()).map_err(|_| {
-            io::Error::new(io::ErrorKind::InvalidInput, "read buffer exceeds u32::MAX")
-        })?;
+        // SQE length is u32, but CQE result is i32 — cap at i32::MAX
+        // to ensure the byte count is always representable.
+        if buf.len() > i32::MAX as usize {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "buffer exceeds i32::MAX",
+            ));
+        }
+        let len = buf.len() as u32;
         let (tx, rx) = mpsc::sync_channel(1);
         let op = Op {
             kind: OpKind::Read {
@@ -746,7 +752,7 @@ mod tests {
         let opts = FsOpenOptions::new().write(true).create(true);
         let mut file = fs.open(&path, &opts)?;
         file.write_all(b"hello world")?;
-        FsFile::sync_all(&file)?;
+        file.sync_all()?;
         drop(file);
 
         let opts = FsOpenOptions::new().read(true);
@@ -769,14 +775,14 @@ mod tests {
         let opts = FsOpenOptions::new().write(true).create(true).read(true);
         let mut file = fs.open(&path, &opts)?;
         file.write_all(b"hello world")?;
-        FsFile::sync_data(&file)?;
+        file.sync_data()?;
 
         let mut buf = [0u8; 5];
-        let n = FsFile::read_at(&file, &mut buf, 6)?;
+        let n = file.read_at(&mut buf, 6)?;
         assert_eq!(n, 5);
         assert_eq!(&buf, b"world");
 
-        let n = FsFile::read_at(&file, &mut buf, 0)?;
+        let n = file.read_at(&mut buf, 0)?;
         assert_eq!(n, 5);
         assert_eq!(&buf, b"hello");
 
@@ -862,7 +868,7 @@ mod tests {
         let mut file = fs.open(&path, &opts)?;
         file.write_all(b"12345")?;
 
-        let meta = FsFile::metadata(&file)?;
+        let meta = file.metadata()?;
         assert!(meta.is_file);
         assert_eq!(meta.len, 5);
 
@@ -880,9 +886,9 @@ mod tests {
         let opts = FsOpenOptions::new().write(true).create(true).read(true);
         let mut file = fs.open(&path, &opts)?;
         file.write_all(b"hello world")?;
-        FsFile::set_len(&file, 5)?;
+        file.set_len(5)?;
 
-        let meta = FsFile::metadata(&file)?;
+        let meta = file.metadata()?;
         assert_eq!(meta.len, 5);
 
         Ok(())
@@ -898,7 +904,7 @@ mod tests {
         let path = dir.path().join("lockfile");
         let opts = FsOpenOptions::new().write(true).create(true);
         let file = fs.open(&path, &opts)?;
-        FsFile::lock_exclusive(&file)?;
+        file.lock_exclusive()?;
 
         Ok(())
     }
@@ -978,7 +984,7 @@ mod tests {
         // Write 1000 bytes: each byte = (offset % 256)
         let data: Vec<u8> = (0..1000).map(|i| (i % 256) as u8).collect();
         file.write_all(&data)?;
-        FsFile::sync_all(&file)?;
+        file.sync_all()?;
 
         let file = Arc::new(file);
         let mut handles = Vec::new();
@@ -987,7 +993,7 @@ mod tests {
             let file = Arc::clone(&file);
             handles.push(thread::spawn(move || -> io::Result<()> {
                 let mut buf = [0u8; 100];
-                let n = FsFile::read_at(file.as_ref(), &mut buf, chunk_start as u64)?;
+                let n = file.read_at(&mut buf, chunk_start as u64)?;
                 assert_eq!(n, 100);
                 for (i, &byte) in buf.iter().enumerate() {
                     assert_eq!(byte, ((chunk_start + i) % 256) as u8);
@@ -1044,7 +1050,7 @@ mod tests {
         file.write_all(b"data")?;
 
         // read_at with empty buffer
-        let n = FsFile::read_at(&file, &mut [], 0)?;
+        let n = file.read_at(&mut [], 0)?;
         assert_eq!(n, 0);
 
         // Read::read with empty buffer
@@ -1138,7 +1144,7 @@ mod tests {
         let opts = FsOpenOptions::new().write(true).create(true);
         let mut file = fs.open(&path, &opts)?;
         file.write_all(b"ok")?;
-        FsFile::sync_all(&file)?;
+        file.sync_all()?;
         assert_eq!(fs.metadata(&path)?.len, 2);
         Ok(())
     }
@@ -1184,8 +1190,8 @@ mod tests {
         let mut f2 = fs2.open(&p2, &opts)?;
         f1.write_all(b"one")?;
         f2.write_all(b"two")?;
-        FsFile::sync_all(&f1)?;
-        FsFile::sync_all(&f2)?;
+        f1.sync_all()?;
+        f2.sync_all()?;
 
         assert_eq!(fs.metadata(&p1)?.len, 3);
         assert_eq!(fs2.metadata(&p2)?.len, 3);
