@@ -450,7 +450,7 @@ mod tests {
 
         #[test]
         fn both_unbounded() {
-            let kr = KeyRange(UserKey::from("a"), UserKey::from("f"));
+            let kr = KeyRange(UserKey::from("f"), UserKey::from("a"));
             let bounds = (Unbounded, Unbounded);
             assert!(kr.overlaps_with_bounds_cmp(&bounds, &ReverseComparator));
         }
