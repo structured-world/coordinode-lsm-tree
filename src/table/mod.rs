@@ -899,6 +899,12 @@ impl Table {
     /// `key_hash` must be the xxh3 hash of `key` (pre-computed by the caller
     /// to avoid redundant hashing — same pattern as [`Table::get`]).
     pub(crate) fn bloom_may_contain_key(&self, key: &[u8], key_hash: u64) -> crate::Result<bool> {
+        debug_assert_eq!(
+            crate::table::filter::standard_bloom::Builder::get_hash(key),
+            key_hash,
+            "bloom_may_contain_key: key_hash must be BloomBuilder::get_hash(key)"
+        );
+
         // Full (non-partitioned) filter — delegate to hash-only path.
         // A table has either pinned_filter_block (full) or pinned_filter_index
         // (partitioned), never both — checked at construction time.
