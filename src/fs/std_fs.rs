@@ -70,11 +70,14 @@ impl FsFile for File {
         let mut filled = 0usize;
 
         while filled < buf.len() {
+            let remaining = buf.get_mut(filled..).unwrap_or(&mut []);
+            let off = offset + filled as u64;
+
             let n = {
                 #[cfg(unix)]
                 {
                     use std::os::unix::fs::FileExt;
-                    match FileExt::read_at(self, &mut buf[filled..], offset + filled as u64) {
+                    match FileExt::read_at(self, remaining, off) {
                         Ok(n) => n,
                         Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
                         Err(e) => return Err(e),
@@ -84,7 +87,7 @@ impl FsFile for File {
                 #[cfg(windows)]
                 {
                     use std::os::windows::fs::FileExt;
-                    match FileExt::seek_read(self, &mut buf[filled..], offset + filled as u64) {
+                    match FileExt::seek_read(self, remaining, off) {
                         Ok(n) => n,
                         Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
                         Err(e) => return Err(e),
