@@ -6,7 +6,7 @@ use super::run::Ranged;
 use crate::comparator::UserComparator;
 use crate::version::Run;
 
-pub fn optimize_runs<T: Clone + Ranged>(
+pub(crate) fn optimize_runs<T: Clone + Ranged>(
     runs: Vec<Run<T>>,
     cmp: &dyn UserComparator,
 ) -> Vec<Run<T>> {

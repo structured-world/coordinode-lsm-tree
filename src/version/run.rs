@@ -91,16 +91,22 @@ impl<T: Ranged> Run<T> {
     ///
     /// Re-sorts the entire run on each call (mirrors [`push`] behavior).
     /// Acceptable for typical run sizes (<100 tables); for bulk insertion
-    /// use [`extend`] followed by a single sort.
+    /// use [`extend`] followed by [`sort_by_cmp`].
     pub fn push_cmp(&mut self, item: T, cmp: &dyn UserComparator) {
         self.0.push(item);
+        self.sort_by_cmp(cmp);
+    }
 
+    /// Sorts the run by min key using the provided user comparator.
+    ///
+    /// Use after [`extend`] to re-establish ordering in a single pass.
+    pub fn sort_by_cmp(&mut self, cmp: &dyn UserComparator) {
         self.0
             .sort_by(|a, b| cmp.compare(a.key_range().min(), b.key_range().min()));
     }
 
     /// Appends items without re-sorting. Callers must ensure the run remains
-    /// sorted (e.g. by calling [`push_cmp`] per item, or by sorting afterward).
+    /// sorted (e.g. via [`sort_by_cmp`] after all items are added).
     pub fn extend(&mut self, items: Vec<T>) {
         self.0.extend(items);
     }
@@ -691,7 +697,7 @@ mod tests {
             run.range_overlap_indexes_cmp::<&[u8], _>(&bounds_excl_end, &cmp)
         );
 
-        // Semi-open range (start..): Excluded end = Unbounded
+        // Semi-open range (start..): Included start, Unbounded end
         assert_eq!(
             Some((2, 3)),
             run.range_overlap_indexes_cmp(&(b"j" as &[u8]..), &cmp)
