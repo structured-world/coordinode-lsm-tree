@@ -109,16 +109,16 @@ mod zstd_dict {
     }
 
     #[test]
-    fn zstd_dict_with_multiple_levels() -> lsm_tree::Result<()> {
-        // Use per-level compression: None for L0, ZstdDict for deeper levels
+    fn zstd_dict_with_per_level_policy() -> lsm_tree::Result<()> {
+        // Per-level policy: ZstdDict for L0 (exercised by flush), None for deeper.
         let dir = tempfile::tempdir()?;
         let dict = make_test_dictionary();
         let compression = CompressionType::zstd_dict(3, dict.id())?;
 
         let tree = make_config(dir.path())
             .data_block_compression_policy(CompressionPolicy::new([
-                CompressionType::None,
                 compression,
+                CompressionType::None,
             ]))
             .zstd_dictionary(Some(Arc::new(dict)))
             .open()?;
@@ -220,6 +220,39 @@ mod zstd_dict {
                 .expect("key should exist");
             assert_eq!(got.as_ref(), expected.as_bytes(), "mismatch at key {key}");
         }
+
+        Ok(())
+    }
+
+    #[test]
+    fn reopen_with_wrong_dict_fails_at_recovery() -> lsm_tree::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let dict = make_test_dictionary();
+        let compression = CompressionType::zstd_dict(3, dict.id())?;
+
+        // Write data with dict A
+        {
+            let tree = make_config(dir.path())
+                .data_block_compression_policy(CompressionPolicy::all(compression))
+                .zstd_dictionary(Some(Arc::new(dict.clone())))
+                .open()?;
+
+            tree.insert(b"key", b"value", 0);
+            tree.flush_active_memtable(0)?;
+        }
+
+        // Reopen with dict B → should fail at recovery
+        let wrong_dict = ZstdDictionary::new(b"completely different dictionary bytes");
+        let wrong_compression = CompressionType::zstd_dict(3, wrong_dict.id())?;
+        let result = make_config(dir.path())
+            .data_block_compression_policy(CompressionPolicy::all(wrong_compression))
+            .zstd_dictionary(Some(Arc::new(wrong_dict)))
+            .open();
+
+        assert!(
+            matches!(result, Err(lsm_tree::Error::ZstdDictMismatch { .. })),
+            "expected ZstdDictMismatch on reopen with wrong dict",
+        );
 
         Ok(())
     }

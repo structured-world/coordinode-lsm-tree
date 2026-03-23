@@ -509,6 +509,21 @@ impl Table {
         let metadata =
             ParsedMeta::load_with_handle(&file, &regions.metadata, encryption.as_deref())?;
 
+        // Fail-fast: if this table was written with dictionary compression,
+        // verify the caller provided the matching dictionary. Without this
+        // check, reopening with the wrong dictionary (or None) would only
+        // surface as a decompression error on the first data-block read.
+        #[cfg(feature = "zstd")]
+        if let CompressionType::ZstdDict { dict_id, .. } = metadata.data_block_compression {
+            let got = zstd_dictionary.as_ref().map(|d| d.id());
+            if got != Some(dict_id) {
+                return Err(crate::Error::ZstdDictMismatch {
+                    expected: dict_id,
+                    got,
+                });
+            }
+        }
+
         let file_handle: Arc<dyn FsFile> = Arc::new(file);
 
         let file_accessor = if let Some(dt) = descriptor_table {
