@@ -15,8 +15,8 @@
 //! to [`std::fs`] since they do not benefit from `io_uring`.
 
 use super::{Fs, FsDirEntry, FsFile, FsMetadata, FsOpenOptions};
+use crate::HashMap;
 use io_uring::{opcode, types, IoUring};
-use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::unix::io::AsRawFd;

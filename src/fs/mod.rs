@@ -15,7 +15,7 @@
 //!
 //! # Platform-specific backends
 //!
-//! - **Linux 5.6+**: [`IoUringFs`] — batched SQE submission via `io_uring`
+//! - **Linux 5.6+**: `IoUringFs` — batched SQE submission via `io_uring`
 //!   (feature-gated: `io-uring`)
 //! - **Windows**: IOCP (`IoCompletionPort`) could provide similar batched
 //!   completion semantics — not yet implemented, tracked for when Windows
