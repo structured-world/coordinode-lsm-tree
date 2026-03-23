@@ -387,6 +387,10 @@ impl Block {
             let header_len = Header::serialized_len();
             let block_size = handle.size() as usize;
 
+            if block_size < header_len {
+                return Err(crate::Error::InvalidHeader("Block"));
+            }
+
             let mut buf = vec![0u8; block_size];
             let n = file.read_at(&mut buf, *handle.offset())?;
             if n != block_size {
