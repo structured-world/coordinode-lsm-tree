@@ -822,14 +822,14 @@ impl CompactionStrategy for Strategy {
         // (#108) can leave temporary multi-run levels when per-table L2 overlap
         // selection excludes gap-filling tables. This is self-healing — the next
         // compaction pass merges the runs back. See #122.
-        debug_assert!(
-            level.run_count() <= 2,
-            "level should have at most 2 runs (1 normal + 1 transient from multi-level compaction)"
-        );
-        debug_assert!(
-            next_level.run_count() <= 2,
-            "next level should have at most 2 runs (1 normal + 1 transient from multi-level compaction)"
-        );
+        //
+        // pick_minimal_compaction operates on first_run() only, so skip L1+
+        // compaction when levels are multi-run to avoid missing tables in the
+        // second run. The next intra-level or L0→L1 compaction will heal the
+        // multi-run state first.
+        if !level.is_disjoint() || !next_level.is_disjoint() {
+            return Choice::DoNothing;
+        }
 
         #[expect(
             clippy::expect_used,
