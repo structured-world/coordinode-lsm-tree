@@ -122,6 +122,10 @@ pub struct Writer<FS: Fs = StdFs> {
 impl<FS: Fs> Writer<FS> {
     /// Initializes a new blob file writer.
     ///
+    /// Uses `create_new` (not `create+truncate`) because blob file IDs are
+    /// monotonically unique — a path collision indicates a bug, not a retry.
+    /// Orphaned files from crashes are cleaned up during recovery.
+    ///
     /// # Errors
     ///
     /// Will return `Err` if an IO error occurs.
