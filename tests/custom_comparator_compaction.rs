@@ -204,7 +204,16 @@ fn u64_comparator_major_compaction() -> lsm_tree::Result<()> {
     }
     tree.flush_active_memtable(0)?;
 
+    assert!(
+        tree.table_count() >= 2,
+        "need multiple SSTs before compaction"
+    );
     tree.major_compact(SeqNo::MAX, 1_000)?;
+    assert_eq!(
+        1,
+        tree.table_count(),
+        "major compaction should merge into 1 SST"
+    );
 
     let items: Vec<u64> = tree
         .iter(SeqNo::MAX, None)
@@ -360,7 +369,16 @@ fn reverse_comparator_major_compaction() -> lsm_tree::Result<()> {
     tree.insert("e", "val_e", seqno.next());
     tree.flush_active_memtable(0)?;
 
+    assert!(
+        tree.table_count() >= 2,
+        "need multiple SSTs before compaction"
+    );
     tree.major_compact(SeqNo::MAX, 1_000)?;
+    assert_eq!(
+        1,
+        tree.table_count(),
+        "major compaction should merge into 1 SST"
+    );
 
     let items: Vec<String> = tree
         .iter(SeqNo::MAX, None)
