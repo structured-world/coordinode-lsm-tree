@@ -615,6 +615,8 @@ mod tests {
                 false,
                 false,
                 None,
+                #[cfg(feature = "zstd")]
+                None,
                 comparator.clone(),
                 #[cfg(feature = "metrics")]
                 Arc::new(crate::Metrics::default()),
@@ -702,6 +704,8 @@ mod tests {
                 None,
                 false,
                 false,
+                None,
+                #[cfg(feature = "zstd")]
                 None,
                 comparator.clone(),
                 #[cfg(feature = "metrics")]
