@@ -297,11 +297,10 @@ impl EncryptionProvider for Aes256GcmProvider {
     }
 
     fn encrypt_vec(&self, mut buf: Vec<u8>) -> crate::Result<Vec<u8>> {
-        use aes_gcm::aead::OsRng;
         use aes_gcm::AeadCore;
         use aes_gcm::AeadInPlace;
 
-        let nonce = aes_gcm::Aes256Gcm::generate_nonce(&mut OsRng);
+        let nonce = thread_local_rng(|rng| aes_gcm::Aes256Gcm::generate_nonce(rng));
 
         // Reserve space for nonce prefix + tag suffix in one allocation,
         // then shift plaintext right and write the nonce into the gap.
