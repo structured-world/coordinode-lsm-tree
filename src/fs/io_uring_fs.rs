@@ -600,22 +600,12 @@ impl RingThread {
 
     /// Submits a pread to the ring and blocks until completion.
     fn submit_read(&self, fd: i32, buf: &mut [u8], offset: u64) -> io::Result<u32> {
-        // io_uring SQE length field is u32. In practice LSM block reads
-        // are 4-64 KB, so the cap is never reached. Reject oversized
-        // buffers explicitly rather than silently truncating.
         // SQE length is u32, but CQE result is i32 — cap at i32::MAX
-        // to ensure the byte count is always representable.
-        if buf.len() > i32::MAX as usize {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "buffer exceeds i32::MAX",
-            ));
-        }
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "buf.len() is bounded by i32::MAX above, and i32::MAX < u32::MAX so the cast is lossless"
-        )]
-        let len = buf.len() as u32;
+        // to ensure the byte count is always representable. In practice
+        // LSM block reads are 4-64 KB, so the cap is never reached.
+        let len: u32 = i32::try_from(buf.len())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "buffer exceeds i32::MAX"))?
+            .unsigned_abs();
         let (tx, rx) = mpsc::sync_channel(1);
         let op = Op {
             kind: OpKind::Read {
@@ -632,18 +622,11 @@ impl RingThread {
     /// Submits a pwrite to the ring and blocks until completion.
     fn submit_write(&self, fd: i32, buf: &[u8], offset: u64) -> io::Result<u32> {
         // SQE length is u32, but CQE result is i32 — cap at i32::MAX
-        // to ensure the byte count is always representable.
-        if buf.len() > i32::MAX as usize {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "buffer exceeds i32::MAX",
-            ));
-        }
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "buf.len() is bounded by i32::MAX above, and i32::MAX < u32::MAX so the cast is lossless"
-        )]
-        let len = buf.len() as u32;
+        // to ensure the byte count is always representable. In practice
+        // LSM block writes are 4-64 KB, so the cap is never reached.
+        let len: u32 = i32::try_from(buf.len())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "buffer exceeds i32::MAX"))?
+            .unsigned_abs();
         let (tx, rx) = mpsc::sync_channel(1);
         let op = Op {
             kind: OpKind::Write {
