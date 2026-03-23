@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1774292750070,
+  "lastUpdate": 1774296108710,
   "repoUrl": "https://github.com/structured-world/lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -1950,6 +1950,84 @@ window.BENCHMARK_DATA = {
             "value": 506384.7418904307,
             "unit": "ops/sec",
             "extra": "P50: 1.7us | P99: 9.0us | P99.9: 16.0us\nthreads: 1 | elapsed: 0.39s | num: 200000"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "cdba6eeef94adf80d3550dcd5feb0f995fa0a1de",
+          "message": "fix(compaction): preserve range tombstones covering gaps between output tables (#137)\n\n## Summary\n\n- Fix RT clipping during compaction table rotation: clip to `[first_key,\nnext_table_first_key)` instead of `[first_key, upper_bound(last_key))`,\npreserving RTs that span the gap between output tables\n- Widen table `key_range` metadata to include gap-covering RTs so point\nreads consult the correct table — guarded to avoid disjoint-run overlap\nwhen `clipped.end == clip_upper`\n- Add regression tests: gap-covering RT preservation + key_range\ndisjointness when RT spans past next table\n\n## Technical Details\n\nWhen `MultiWriter` rotates during compaction, `write_rts_to_writer`\nclipped each range tombstone to the output table's KV key range\n`[first_key, upper_bound(last_key))`. If compaction produced tables\n`[a,l]` and `[q,z]`, an RT `[m,p)` fell entirely in the gap and was\ndropped by both tables — silently losing delete semantics for keys in\nlower levels.\n\nThe fix passes `self.current_key` (the first key of the **next** table)\nas the clip upper bound during rotation. This extends the\n\"responsibility range\" of the finishing table to cover the gap.\n\nThe table's `key_range.last_key` is widened to include the clipped RT's\nend **only when strictly less than `clip_upper`** — setting it to\nexactly `clip_upper` would make adjacent tables' key_ranges overlap and\nbreak `Run::get_for_key_cmp` for the boundary key.\n\n## Known Limitations\n\n- With the current compaction architecture (major_compact merges all\ntables, leveled pulls in overlapping tables recursively), the gap\nscenario is unlikely in practice. The fix is defensive for future\npartial/incremental compaction strategies.\n- When an RT spans past the next table's first key (`clipped.end ==\nclip_upper`), `last_key` is NOT widened to avoid disjoint-run overlap.\nGap keys in this edge case may not be found for RT suppression via the\nkey_range filter.\n\n## Test Plan\n\n- [x] `clip_preserves_rt_covering_gap_between_output_tables` —\nMultiWriter with forced rotation, RT in gap preserved\n- [x] `clip_rt_spanning_next_table_does_not_overlap_key_ranges` — RT\nspans past next table, key_ranges stay disjoint\n- [x] All lib tests pass (484)\n- [x] All range_tombstone integration tests pass (41)\n- [x] `cargo clippy --all-features -- -D warnings` clean\n\nCloses #32",
+          "timestamp": "2026-03-23T22:00:41+02:00",
+          "tree_id": "ed98314ca27b46dbc133ac318f74fa4c11029b69",
+          "url": "https://github.com/structured-world/lsm-tree/commit/cdba6eeef94adf80d3550dcd5feb0f995fa0a1de"
+        },
+        "date": 1774296107581,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 1908919.4404021748,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 2.3us | P99.9: 5.3us\nthreads: 1 | elapsed: 0.10s | num: 200000"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1315314.0395791938,
+            "unit": "ops/sec",
+            "extra": "P50: 0.6us | P99: 1.7us | P99.9: 5.2us\nthreads: 1 | elapsed: 0.15s | num: 200000"
+          },
+          {
+            "name": "readrandom",
+            "value": 631627.9005253261,
+            "unit": "ops/sec",
+            "extra": "P50: 1.4us | P99: 5.5us | P99.9: 11.2us\nthreads: 1 | elapsed: 0.32s | num: 200000"
+          },
+          {
+            "name": "readseq",
+            "value": 2415957.4764425424,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 4.1us | P99.9: 8.1us\nthreads: 1 | elapsed: 0.08s | num: 200000"
+          },
+          {
+            "name": "seekrandom",
+            "value": 414327.30564444716,
+            "unit": "ops/sec",
+            "extra": "P50: 2.1us | P99: 6.2us | P99.9: 11.9us\nthreads: 1 | elapsed: 0.48s | num: 200000"
+          },
+          {
+            "name": "prefixscan",
+            "value": 196352.26578242698,
+            "unit": "ops/sec",
+            "extra": "P50: 4.8us | P99: 6.8us | P99.9: 14.9us\nthreads: 1 | elapsed: 1.02s | num: 200000"
+          },
+          {
+            "name": "overwrite",
+            "value": 1202874.4899225761,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.7us | P99.9: 6.0us\nthreads: 1 | elapsed: 0.17s | num: 200000"
+          },
+          {
+            "name": "mergerandom",
+            "value": 700498.8266154305,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 2.1us | P99.9: 3.7us\nthreads: 1 | elapsed: 0.29s | num: 200000"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 498609.23673511326,
+            "unit": "ops/sec",
+            "extra": "P50: 1.7us | P99: 7.9us | P99.9: 14.2us\nthreads: 1 | elapsed: 0.40s | num: 200000"
           }
         ]
       }
