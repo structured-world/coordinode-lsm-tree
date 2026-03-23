@@ -3,7 +3,7 @@
 // (found in the LICENSE-* files in the repository)
 
 use crate::{
-    fs::{Fs, FsFile, FsOpenOptions},
+    fs::{Fs, FsFile},
     Slice,
 };
 use std::{io::Write, path::Path};
@@ -58,9 +58,14 @@ pub fn rewrite_atomic(path: &Path, content: &[u8], fs: &impl Fs) -> std::io::Res
     temp_file.as_file_mut().sync_all()?;
     temp_file.persist(path)?;
 
-    // TODO: not sure why it fails on Windows...
+    // Suppress unused-variable warning on Windows where the post-persist
+    // sync block is skipped (directory fsync is unsupported).
+    let _ = &fs;
+
     #[cfg(not(target_os = "windows"))]
     {
+        use crate::fs::FsOpenOptions;
+
         let file = fs.open(path, &FsOpenOptions::new().read(true))?;
         FsFile::sync_all(&file)?;
 
