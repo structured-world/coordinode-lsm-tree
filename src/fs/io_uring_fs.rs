@@ -422,6 +422,9 @@ impl RingThread {
         let ring = IoUring::new(sq_entries)?;
         let (tx, rx) = mpsc::channel();
 
+        // If event_loop panics, the channel closes and callers receive
+        // BrokenPipe from send_and_wait. The panic is captured by
+        // JoinHandle and surfaced when RingThread is dropped.
         let handle = thread::Builder::new()
             .name("lsm-io-uring".into())
             .spawn(move || Self::event_loop(ring, rx))?;
