@@ -1930,7 +1930,7 @@ mod tests {
         }
 
         #[test]
-        fn block_zstd_dict_missing_returns_error() {
+        fn block_zstd_dict_missing_returns_error() -> crate::Result<()> {
             let dict = test_dict();
             let compression = test_compression(&dict);
             let mut sink = vec![];
@@ -1943,8 +1943,7 @@ mod tests {
                 compression,
                 None,
                 Some(&dict),
-            )
-            .unwrap();
+            )?;
 
             // Read without dict → ZstdDictMismatch
             let mut reader = &sink[..];
@@ -1956,10 +1955,11 @@ mod tests {
                 ),
                 "expected ZstdDictMismatch with got=None",
             );
+            Ok(())
         }
 
         #[test]
-        fn block_zstd_dict_wrong_dict_returns_error() {
+        fn block_zstd_dict_wrong_dict_returns_error() -> crate::Result<()> {
             let dict = test_dict();
             let compression = test_compression(&dict);
             let wrong_dict = ZstdDictionary::new(b"completely different dictionary bytes");
@@ -1973,8 +1973,7 @@ mod tests {
                 compression,
                 None,
                 Some(&dict),
-            )
-            .unwrap();
+            )?;
 
             let mut reader = &sink[..];
             let result = Block::from_reader(&mut reader, compression, None, Some(&wrong_dict));
@@ -1985,6 +1984,7 @@ mod tests {
                 ),
                 "expected ZstdDictMismatch with got=Some",
             );
+            Ok(())
         }
 
         #[test]
