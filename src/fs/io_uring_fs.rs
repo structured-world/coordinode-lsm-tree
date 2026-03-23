@@ -205,7 +205,7 @@ impl Fs for IoUringFs {
 /// Wraps a [`std::fs::File`] for fd ownership and cold-path operations
 /// (metadata, truncate, lock), while routing reads, writes, and fsyncs
 /// through the shared `io_uring` ring.
-pub struct IoUringFile {
+pub(crate) struct IoUringFile {
     /// Underlying [`std::fs::File`] — owns the fd, used for metadata, `set_len`, lock.
     file: File,
 
@@ -263,12 +263,7 @@ impl FsFile for IoUringFile {
                 match self.ring.submit_read(fd, remaining, current_offset) {
                     Ok(n) => break n,
                     Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                    Err(e) => {
-                        if total_read > 0 {
-                            return Ok(total_read);
-                        }
-                        return Err(e);
-                    }
+                    Err(e) => return Err(e),
                 }
             };
 
@@ -795,7 +790,7 @@ mod tests {
         file.write_all(b"data")?;
         drop(file);
 
-        let entries: Vec<_> = fs.read_dir(&nested)?.collect::<io::Result<Vec<_>>>()?;
+        let entries: Vec<_> = fs.read_dir(&nested)?;
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].file_name, "data.bin");
 

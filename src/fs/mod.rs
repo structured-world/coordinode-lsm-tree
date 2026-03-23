@@ -21,7 +21,7 @@ mod io_uring_fs;
 pub use std_fs::StdFs;
 
 #[cfg(all(target_os = "linux", feature = "io-uring"))]
-pub use io_uring_fs::{is_io_uring_available, IoUringFile, IoUringFs};
+pub use io_uring_fs::{is_io_uring_available, IoUringFs};
 
 use std::io::{self, Read, Seek, Write};
 use std::path::{Path, PathBuf};
