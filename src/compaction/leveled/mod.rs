@@ -753,6 +753,11 @@ impl CompactionStrategy for Strategy {
                         // An aggregate across disjoint tables (e.g. [a,d] and
                         // [x,z] → [a,z]) covers gaps and pulls in L2 tables
                         // that don't actually overlap any input table.
+                        //
+                        // Per-table queries are O(input_tables * log L2_tables).
+                        // Merging input ranges into disjoint intervals first
+                        // would reduce queries but adds complexity; not worth it
+                        // given typical input sizes (~10–30 tables) in choose().
                         for run in l2.iter() {
                             for l1_run in target_level.iter() {
                                 for t in l1_run.iter() {
