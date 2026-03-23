@@ -41,8 +41,9 @@ pub struct LinkedFile {
 
 /// Serializes and compresses values into blocks and writes them to disk as a table.
 ///
-/// The `FS: Fs` bound guarantees that `FS::File` implements `FsFile + Write + Seek`,
-/// which satisfies `BlockIndexWriter` / `FilterWriter` trait requirements.
+/// `BlockIndexWriter` / `FilterWriter` are generic over a writer `W: Write + Seek`.
+/// With `W = BufWriter<FS::File>`, the `FS: Fs` bound ensures `FS::File: Write + Seek`,
+/// so `BufWriter<FS::File>` satisfies the required trait bounds.
 pub struct Writer<FS: Fs = StdFs> {
     /// Filesystem backend
     fs: Arc<FS>,
