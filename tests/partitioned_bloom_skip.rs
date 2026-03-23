@@ -28,10 +28,10 @@ impl MergeOperator for SumMerge {
     }
 }
 
-/// Tests that partitioned bloom filters correctly skip non-matching keys
+/// Tests that partitioned bloom filters are consulted for non-matching keys
 /// via the Table::get path (which has partition-aware bloom seeking).
 ///
-/// Metrics confirm the filter rejects the table for a non-matching key.
+/// Metrics confirm that a filter lookup occurred for a non-matching key.
 #[test_log::test]
 #[cfg(feature = "metrics")]
 fn partitioned_bloom_skip_for_point_reads() -> lsm_tree::Result<()> {
