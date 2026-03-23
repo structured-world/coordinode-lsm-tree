@@ -1066,8 +1066,10 @@ mod tests {
         let opts = FsOpenOptions::new().write(true).create(true);
         fs.open(&path, &opts)?;
 
-        let err = fs.sync_directory(&path).unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        match fs.sync_directory(&path) {
+            Ok(()) => panic!("sync_directory on a file should fail"),
+            Err(err) => assert_eq!(err.kind(), io::ErrorKind::InvalidInput),
+        }
 
         Ok(())
     }
@@ -1086,17 +1088,23 @@ mod tests {
 
         // Seek to near u64::MAX, then seek forward — should overflow.
         file.seek(SeekFrom::Start(u64::MAX - 1))?;
-        let err = file.seek(SeekFrom::Current(2)).unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        match file.seek(SeekFrom::Current(2)) {
+            Ok(_) => panic!("seek past u64::MAX should fail"),
+            Err(err) => assert_eq!(err.kind(), io::ErrorKind::InvalidInput),
+        }
 
         // SeekFrom::Current negative past zero — should underflow.
         file.seek(SeekFrom::Start(0))?;
-        let err = file.seek(SeekFrom::Current(-1)).unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        match file.seek(SeekFrom::Current(-1)) {
+            Ok(_) => panic!("seek before zero should fail"),
+            Err(err) => assert_eq!(err.kind(), io::ErrorKind::InvalidInput),
+        }
 
         // SeekFrom::End negative past zero — should underflow.
-        let err = file.seek(SeekFrom::End(-100)).unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        match file.seek(SeekFrom::End(-100)) {
+            Ok(_) => panic!("seek before zero should fail"),
+            Err(err) => assert_eq!(err.kind(), io::ErrorKind::InvalidInput),
+        }
 
         Ok(())
     }
