@@ -425,11 +425,21 @@ impl RingThread {
         let ring = IoUring::new(sq_entries)?;
         let (tx, rx) = mpsc::channel();
 
-        // If event_loop panics, the channel closes and callers receive
-        // BrokenPipe from send_and_wait. The panic is logged in Drop.
+        // If event_loop panics after submitting SQEs, those SQEs still
+        // reference caller buffers. Letting the panic propagate would close
+        // the channel, unblocking callers who then drop their buffers — UB.
+        // catch_unwind + abort is the only sound option.
         let handle = thread::Builder::new()
             .name("lsm-io-uring".into())
-            .spawn(move || Self::event_loop(ring, rx))?;
+            .spawn(move || {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    Self::event_loop(ring, rx);
+                }));
+                if result.is_err() {
+                    log::error!("io_uring ring thread panicked; aborting to avoid UB");
+                    std::process::abort();
+                }
+            })?;
 
         Ok(Self {
             tx: Mutex::new(Some(tx)),
