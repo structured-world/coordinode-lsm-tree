@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1774261146460,
+  "lastUpdate": 1774266784466,
   "repoUrl": "https://github.com/structured-world/lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -1170,6 +1170,84 @@ window.BENCHMARK_DATA = {
             "value": 454123.3025554974,
             "unit": "ops/sec",
             "extra": "P50: 1.9us | P99: 7.9us | P99.9: 15.9us\nthreads: 1 | elapsed: 0.44s | num: 200000"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "befb45007bdbbd0ec23ce38b3bd7cc9935e18693",
+          "message": "test+fix: integration tests for compaction/merge with custom comparator (#100)\n\n## Summary\n\n- Add 19 integration tests exercising compaction and merge operator\npaths with custom `UserComparator` implementations (`ReverseComparator`,\n`U64BigEndianComparator`)\n- Fix bug where `Run::push()` sorted tables lexicographically instead of\nby the configured comparator, breaking inter-SST ordering for\nnon-lexicographic comparators (#98)\n- Add unit tests for all new comparator-aware `Run` methods (`push_cmp`,\n`get_for_key_cmp`, `get_overlapping_cmp`, `range_overlap_indexes_cmp`)\n\n## What changed\n\n**Tests** (`tests/custom_comparator_compaction.rs`):\n- Compaction with Leveled, SizeTiered, and major_compact strategies\n- Merge operator resolution through compaction stream with custom\ncomparator\n- Tombstone handling and cross-flush merge operands\n- Update and delete scenarios after compaction\n- Range scans after compaction (2 ignored — RunReader comparator\nplumbing tracked in #116)\n\n**Bug fix** (discovered during test development):\n- `Run::push()` used lexicographic `.cmp()` to sort tables instead of\nthe custom comparator\n- Added `push_cmp()`, `range_overlap_indexes_cmp()`,\n`get_overlapping_cmp()` to `Run`\n- Added `overlaps_with_key_range_cmp()` to `KeyRange`\n- Threaded comparator through `optimize_runs()`,\n`Version::with_new_l0_run()`, `with_merge()`, `with_moved()`,\n`with_dropped()` and all callers\n- Added doc comments clarifying lexicographic assumptions on existing\nmethods (`push`, `get_overlapping`, `extend`, `contains_key`)\n\n**Unit tests** (`src/version/run.rs`):\n- `push_cmp_sorts_by_comparator` — verifies comparator-aware sorting\n- `get_for_key_cmp_reverse` — point lookup with reverse comparator\n- `get_overlapping_cmp_reverse` — overlap detection with reverse\ncomparator\n- `range_overlap_indexes_cmp_reverse` — inclusive, exclusive, and\nsemi-open bounds\n\n## Test plan\n\n- [x] 17/19 new integration tests pass (2 range scan tests ignored —\n#116)\n- [x] All library unit tests pass\n- [x] All existing integration tests pass (custom_comparator,\nmerge_operator, compaction_filter, etc.)\n- [x] Clippy clean (`cargo clippy --lib --tests`)\n\nCloses #86\nFixes #98\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n## Summary by CodeRabbit\n\n* **Refactor**\n* Propagated comparator context through versioning and compaction flows\nso run transformations (merge/move/drop/new-L0) accept a comparator.\n\n* **New Features**\n* Comparator-aware run APIs and range operations enabling custom\nordering for insertion, sorting, and overlap queries.\n\n* **Documentation**\n* Clarified key-range behavior: default is lexicographic and pointed to\ncomparator-based overlap API.\n\n* **Tests**\n* Added integration tests validating custom comparators across\ncompaction, merge, tombstone, and iteration.\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-03-23T13:51:49+02:00",
+          "tree_id": "e6e9fb0334af23e65171d0bb7622fc8da299ec22",
+          "url": "https://github.com/structured-world/lsm-tree/commit/befb45007bdbbd0ec23ce38b3bd7cc9935e18693"
+        },
+        "date": 1774266782580,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 1984197.2971502524,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 2.3us | P99.9: 5.3us\nthreads: 1 | elapsed: 0.10s | num: 200000"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1253442.4700678252,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 1.4us | P99.9: 5.7us\nthreads: 1 | elapsed: 0.16s | num: 200000"
+          },
+          {
+            "name": "readrandom",
+            "value": 541667.3110250721,
+            "unit": "ops/sec",
+            "extra": "P50: 1.7us | P99: 5.6us | P99.9: 11.6us\nthreads: 1 | elapsed: 0.37s | num: 200000"
+          },
+          {
+            "name": "readseq",
+            "value": 2425439.2682740777,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 4.2us | P99.9: 8.4us\nthreads: 1 | elapsed: 0.08s | num: 200000"
+          },
+          {
+            "name": "seekrandom",
+            "value": 381970.60837008833,
+            "unit": "ops/sec",
+            "extra": "P50: 2.3us | P99: 6.4us | P99.9: 12.3us\nthreads: 1 | elapsed: 0.52s | num: 200000"
+          },
+          {
+            "name": "prefixscan",
+            "value": 195600.6839889902,
+            "unit": "ops/sec",
+            "extra": "P50: 4.8us | P99: 6.8us | P99.9: 18.8us\nthreads: 1 | elapsed: 1.02s | num: 200000"
+          },
+          {
+            "name": "overwrite",
+            "value": 1145685.1717754707,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.8us | P99.9: 6.0us\nthreads: 1 | elapsed: 0.17s | num: 200000"
+          },
+          {
+            "name": "mergerandom",
+            "value": 718056.7379855699,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 0.5us | P99.9: 4.5us\nthreads: 1 | elapsed: 0.28s | num: 200000"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 477980.910742533,
+            "unit": "ops/sec",
+            "extra": "P50: 1.8us | P99: 7.8us | P99.9: 16.7us\nthreads: 1 | elapsed: 0.42s | num: 200000"
           }
         ]
       }
