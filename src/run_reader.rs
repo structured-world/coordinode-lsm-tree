@@ -45,7 +45,10 @@ impl RunReader {
     ///
     /// For trees with a custom [`UserComparator`], use [`new_cmp`] instead.
     #[must_use]
-    #[expect(dead_code, reason = "public API — used by external callers and tests")]
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "public API — used by external callers")
+    )]
     pub fn new<R: RangeBounds<UserKey> + Clone + Send + 'static>(
         run: Arc<Run<Table>>,
         range: R,
