@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1774300535384,
+  "lastUpdate": 1774306283713,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -2106,6 +2106,84 @@ window.BENCHMARK_DATA = {
             "value": 528414.6399083164,
             "unit": "ops/sec",
             "extra": "P50: 1.6us | P99: 7.7us | P99.9: 13.7us\nthreads: 1 | elapsed: 0.38s | num: 200000"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "8c09303c5316dc33e8c1d613947b121497365bfc",
+          "message": "fix: thread UserComparator through ingestion guards and range overlap (#139)\n\n## Summary\n\n- Replace lexicographic `key > *prev` in ingestion write guards with\ncomparator-aware ordering via `config.comparator.compare()`\n- Assertion messages updated to say \"ordered after ... by configured\ncomparator\"\n- Add `KeyRange::overlaps_with_bounds_cmp()` for comparator-aware bounds\noverlap detection\n- Replace `check_key_range_overlap` with `check_key_range_overlap_cmp`\nin all range scan paths (`create_range` + `create_range_point`)\n- Un-ignore reverse comparator range scan tests (now passing)\n\n## Files changed\n\n| File | Change |\n|------|--------|\n| `src/tree/ingest.rs` | 4 write guards → comparator-aware ordering +\nupdated messages |\n| `src/blob_tree/ingest.rs` | 3 write guards → comparator-aware ordering\n+ updated messages |\n| `src/key_range.rs` | Add `overlaps_with_bounds_cmp()` + unit tests |\n| `src/table/mod.rs` | Replace `check_key_range_overlap` with\n`check_key_range_overlap_cmp` |\n| `src/range.rs` | Use `check_key_range_overlap_cmp` at all 5 call sites\n|\n| `tests/custom_comparator_compaction.rs` | Un-ignore 2 range scan\ntests, add 2 ingestion guard tests |\n| `tests/ingestion_api.rs` | Update `should_panic` expected message |\n\n## Test plan\n\n- [x] All 4 previously-failing tests now pass (2 range scan + 2\ningestion)\n- [x] 8 new unit tests for `overlaps_with_bounds_cmp` with reverse\ncomparator\n- [x] 488+ unit tests pass\n- [x] All integration tests pass (including prop tests)\n- [x] No regressions in default (lexicographic) comparator paths\n\nCloses #116",
+          "timestamp": "2026-03-24T00:50:23+02:00",
+          "tree_id": "9cfd2c5f9626858c7b490a93115b83c0c2a51dfb",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/8c09303c5316dc33e8c1d613947b121497365bfc"
+        },
+        "date": 1774306282582,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 2004860.7849731673,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 2.3us | P99.9: 5.3us\nthreads: 1 | elapsed: 0.10s | num: 200000"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1314487.8798926661,
+            "unit": "ops/sec",
+            "extra": "P50: 0.6us | P99: 1.3us | P99.9: 5.2us\nthreads: 1 | elapsed: 0.15s | num: 200000"
+          },
+          {
+            "name": "readrandom",
+            "value": 627865.6514300929,
+            "unit": "ops/sec",
+            "extra": "P50: 1.4us | P99: 5.4us | P99.9: 11.7us\nthreads: 1 | elapsed: 0.32s | num: 200000"
+          },
+          {
+            "name": "readseq",
+            "value": 2412632.1074407804,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 4.2us | P99.9: 8.1us\nthreads: 1 | elapsed: 0.08s | num: 200000"
+          },
+          {
+            "name": "seekrandom",
+            "value": 397108.30339921016,
+            "unit": "ops/sec",
+            "extra": "P50: 2.1us | P99: 6.3us | P99.9: 13.1us\nthreads: 1 | elapsed: 0.50s | num: 200000"
+          },
+          {
+            "name": "prefixscan",
+            "value": 193535.49114026068,
+            "unit": "ops/sec",
+            "extra": "P50: 4.8us | P99: 6.6us | P99.9: 15.4us\nthreads: 1 | elapsed: 1.03s | num: 200000"
+          },
+          {
+            "name": "overwrite",
+            "value": 1209573.6301336724,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.7us | P99.9: 5.9us\nthreads: 1 | elapsed: 0.17s | num: 200000"
+          },
+          {
+            "name": "mergerandom",
+            "value": 721648.2506663674,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 2.1us | P99.9: 4.3us\nthreads: 1 | elapsed: 0.28s | num: 200000"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 530406.7891220357,
+            "unit": "ops/sec",
+            "extra": "P50: 1.6us | P99: 7.7us | P99.9: 13.0us\nthreads: 1 | elapsed: 0.38s | num: 200000"
           }
         ]
       }
