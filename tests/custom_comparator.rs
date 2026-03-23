@@ -604,3 +604,64 @@ fn reverse_comparator_compaction_with_tombstone() -> lsm_tree::Result<()> {
 
     Ok(())
 }
+
+/// Exercises RunReader::new_cmp path in range scans.
+/// Needs multiple SSTs in a single disjoint run (L1+) so RunReader
+/// is used instead of single-table fast path.
+#[test]
+fn u64_comparator_range_scan_multi_table_run() -> lsm_tree::Result<()> {
+    use lsm_tree::compaction::Leveled;
+
+    let folder = tempfile::tempdir()?;
+    let cmp: SharedComparator = Arc::new(U64BigEndianComparator);
+
+    let tree = Config::new(folder, Default::default(), Default::default())
+        .comparator(cmp)
+        .open()?;
+
+    // Create 3 flushes with disjoint key ranges → after leveled compaction
+    // they end up as one multi-table run in L1.
+    for &key in &[10u64, 20, 30] {
+        tree.insert(key.to_be_bytes(), format!("v{key}"), key);
+    }
+    tree.flush_active_memtable(0)?;
+
+    for &key in &[40u64, 50, 60] {
+        tree.insert(key.to_be_bytes(), format!("v{key}"), key);
+    }
+    tree.flush_active_memtable(0)?;
+
+    for &key in &[70u64, 80, 90] {
+        tree.insert(key.to_be_bytes(), format!("v{key}"), key);
+    }
+    tree.flush_active_memtable(0)?;
+
+    // Compact into L1 — creates multi-table run
+    tree.compact(Arc::new(Leveled::default()), 100)?;
+
+    // Full range scan — exercises RunReader::new_cmp on multi-table run
+    let items: Vec<u64> = tree
+        .iter(100, None)
+        .map(|g| {
+            let (k, _) = g.into_inner().unwrap();
+            u64::from_be_bytes(k[..8].try_into().unwrap())
+        })
+        .collect();
+
+    assert_eq!(items, vec![10, 20, 30, 40, 50, 60, 70, 80, 90]);
+
+    // Bounded range scan — exercises RunReader::new_cmp with bounds
+    let lo = 30u64.to_be_bytes();
+    let hi = 70u64.to_be_bytes();
+    let items: Vec<u64> = tree
+        .range(lo..=hi, 100, None)
+        .map(|g| {
+            let (k, _) = g.into_inner().unwrap();
+            u64::from_be_bytes(k[..8].try_into().unwrap())
+        })
+        .collect();
+
+    assert_eq!(items, vec![30, 40, 50, 60, 70]);
+
+    Ok(())
+}
