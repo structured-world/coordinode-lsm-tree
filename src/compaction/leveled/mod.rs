@@ -818,8 +818,18 @@ impl CompactionStrategy for Strategy {
             return Choice::DoNothing;
         };
 
-        debug_assert!(level.is_disjoint(), "level should be disjoint");
-        debug_assert!(next_level.is_disjoint(), "next level should be disjoint");
+        // Levels are typically single-run (disjoint), but multi-level compaction
+        // (#108) can leave temporary multi-run levels when per-table L2 overlap
+        // selection excludes gap-filling tables. This is self-healing — the next
+        // compaction pass merges the runs back. See #122.
+        debug_assert!(
+            level.run_count() <= 2,
+            "level should have at most 2 runs (1 normal + 1 transient from multi-level compaction)"
+        );
+        debug_assert!(
+            next_level.run_count() <= 2,
+            "next level should have at most 2 runs (1 normal + 1 transient from multi-level compaction)"
+        );
 
         #[expect(
             clippy::expect_used,
