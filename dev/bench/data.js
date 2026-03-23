@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1774269471372,
+  "lastUpdate": 1774271461961,
   "repoUrl": "https://github.com/structured-world/lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -1326,6 +1326,84 @@ window.BENCHMARK_DATA = {
             "value": 494393.16742709896,
             "unit": "ops/sec",
             "extra": "P50: 1.7us | P99: 8.8us | P99.9: 15.4us\nthreads: 1 | elapsed: 0.40s | num: 200000"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "61cf608c7d682025fb2a426d0ffebc45199b31bf",
+          "message": "perf: partition-aware bloom filtering for point-read pipeline (#102)\n\n## Summary\n\n- Add `Table::bloom_may_contain_key(key, key_hash)` — seeks the\npartitioned filter TLI by user key and checks only the matching\npartition's bloom filter, replacing the conservative `Ok(true)` fallback\n- Add `bloom_key` field to `IterState`, populated by\n`resolve_merge_via_pipeline` for single-key point-read pipelines\n- `bloom_passes()` dispatches to the key-aware method when `bloom_key`\nis available, falls back to hash-only path otherwise\n- `debug_assert` ensures `bloom_key` is never set without `key_hash`\n\n## Technical Details\n\nPreviously, `bloom_may_contain_key_hash` returned `Ok(true)` for\npartitioned/TLI filter configurations because the partition index is\nkeyed by user key boundaries, not by raw hash — checking by hash alone\nwould require scanning all partitions. The new `bloom_may_contain_key`\nmethod accepts the actual user key, seeks the TLI to the correct\npartition in O(log P), and queries only that partition's bloom filter.\nKeys beyond all partition boundaries return `Ok(false)` (definite miss).\n\nThe existing `bloom_may_contain_key_hash` (hash-only) path is preserved\nunchanged for callers that don't have the key available (e.g. prefix\nscans).\n\n`pinned_filter_block` and `pinned_filter_index` are mutually exclusive\n(set at construction time), so the branch order in\n`bloom_may_contain_key` is safe.\n\n`Slice::from(key)` in the merge pipeline copies the key once per\nresolution (not zero-copy), but the cost is negligible compared to I/O\nsavings.\n\n## Known Limitations\n\n- Only `resolve_merge_via_pipeline` sets `bloom_key` — general range\nscans still use hash-only bloom pre-filtering (which is correct but less\neffective for partitioned filters)\n- Unpinned filter TLI path falls through to hash-only (consistent with\nexisting `unimplemented!` for unpinned TLI in `Table::get`)\n\n## Test Plan\n\n- [x] `partitioned_bloom_skip_for_point_reads` — verifies bloom filter\nis queried for non-matching key with partitioned filters (metrics:\n`filter_queries >= 1`)\n- [x] `partitioned_bloom_skip_beyond_partitions` — verifies key beyond\nall partition boundaries is correctly rejected\n- [x] `partitioned_bloom_skip_merge_pipeline` — exercises\n`bloom_may_contain_key` through the merge pipeline with bracketing\ndistractor keys\n- [x] `full_filter_bloom_skip_merge_pipeline` — covers the full-filter\ndelegation path through the merge pipeline\n- [x] `bloom_may_contain_key_full_filter` — unit test: both methods\nagree for full filters\n- [x] `bloom_may_contain_key_partitioned_filter` — unit test: contrast\nassertion proving key-based rejects while hash-only returns conservative\n`Ok(true)`\n- [x] All existing tests pass unchanged\n\nCloses #83\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n## Summary by CodeRabbit\n\n* **Performance Improvements**\n* Partition-aware bloom checks reduce unnecessary reads by skipping keys\noutside targeted partitions.\n\n* **New Features**\n* Key-aware bloom query path added; iterators now include the bloom key\nwhen available to enable more precise partitioned filtering while\npreserving conservative behavior when partition info is absent.\n\n* **Tests**\n* Added unit and integration tests validating full and partitioned bloom\nbehavior across point reads and merge-pipeline scenarios.\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-03-23T15:09:41+02:00",
+          "tree_id": "c4df5f5eca798a06ec6ada85a6e94d80a093f25d",
+          "url": "https://github.com/structured-world/lsm-tree/commit/61cf608c7d682025fb2a426d0ffebc45199b31bf"
+        },
+        "date": 1774271460942,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 1994172.3702572263,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 2.3us | P99.9: 5.3us\nthreads: 1 | elapsed: 0.10s | num: 200000"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1296803.561421995,
+            "unit": "ops/sec",
+            "extra": "P50: 0.6us | P99: 1.4us | P99.9: 5.5us\nthreads: 1 | elapsed: 0.15s | num: 200000"
+          },
+          {
+            "name": "readrandom",
+            "value": 611814.0759672897,
+            "unit": "ops/sec",
+            "extra": "P50: 1.4us | P99: 5.5us | P99.9: 11.5us\nthreads: 1 | elapsed: 0.33s | num: 200000"
+          },
+          {
+            "name": "readseq",
+            "value": 2440687.4508613343,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 4.2us | P99.9: 8.1us\nthreads: 1 | elapsed: 0.08s | num: 200000"
+          },
+          {
+            "name": "seekrandom",
+            "value": 397995.90198345575,
+            "unit": "ops/sec",
+            "extra": "P50: 2.2us | P99: 6.2us | P99.9: 12.2us\nthreads: 1 | elapsed: 0.50s | num: 200000"
+          },
+          {
+            "name": "prefixscan",
+            "value": 197978.4760315185,
+            "unit": "ops/sec",
+            "extra": "P50: 4.7us | P99: 6.4us | P99.9: 15.0us\nthreads: 1 | elapsed: 1.01s | num: 200000"
+          },
+          {
+            "name": "overwrite",
+            "value": 1186803.626653511,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.8us | P99.9: 6.0us\nthreads: 1 | elapsed: 0.17s | num: 200000"
+          },
+          {
+            "name": "mergerandom",
+            "value": 661774.6672941922,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 2.1us | P99.9: 3.3us\nthreads: 1 | elapsed: 0.30s | num: 200000"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 505507.3918222775,
+            "unit": "ops/sec",
+            "extra": "P50: 1.7us | P99: 10.0us | P99.9: 16.2us\nthreads: 1 | elapsed: 0.40s | num: 200000"
           }
         ]
       }
