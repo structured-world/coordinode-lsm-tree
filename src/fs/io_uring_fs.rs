@@ -349,6 +349,9 @@ impl Seek for IoUringFile {
                 })?
             }
         };
+        // Note: new_pos may exceed i64::MAX (kernel loff_t range). This
+        // matches std::fs::File::seek which also returns u64. The kernel
+        // will reject out-of-range offsets at the actual I/O syscall.
         *cursor = new_pos;
         Ok(new_pos)
     }
@@ -979,6 +982,7 @@ mod tests {
         let opts = FsOpenOptions::new().write(true).create(true).read(true);
         let mut file = fs.open(&path, &opts)?;
         // Write 1000 bytes: each byte = (offset % 256)
+        #[expect(clippy::cast_possible_truncation, reason = "% 256 guarantees 0..=255")]
         let data: Vec<u8> = (0..1000).map(|i| (i % 256) as u8).collect();
         file.write_all(&data)?;
         file.sync_all()?;
@@ -993,7 +997,9 @@ mod tests {
                 let n = file.read_at(&mut buf, chunk_start as u64)?;
                 assert_eq!(n, 100);
                 for (i, &byte) in buf.iter().enumerate() {
-                    assert_eq!(byte, ((chunk_start + i) % 256) as u8);
+                    #[expect(clippy::cast_possible_truncation, reason = "% 256 guarantees 0..=255")]
+                    let expected = ((chunk_start + i) % 256) as u8;
+                    assert_eq!(byte, expected);
                 }
                 Ok(())
             }));
