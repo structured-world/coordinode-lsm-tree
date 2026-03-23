@@ -146,8 +146,9 @@ fn run_oracle_test(ops: Vec<Op>) -> Result<(), TestCaseError> {
 
     // Apply all ops.
     // Data seqnos come from the shared counter (as required by the API).
-    // Internal operations (flush, compact) also advance this counter via
-    // upgrade_version, keeping SV seqnos and data seqnos interleaved.
+    // Internal operations (flush, compact) may also advance this counter via
+    // upgrade_version when they do work, keeping SV seqnos and data seqnos
+    // interleaved in those cases.
     for op in &ops {
         match op {
             Op::Insert { key_idx, value } => {
