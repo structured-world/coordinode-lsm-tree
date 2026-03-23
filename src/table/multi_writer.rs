@@ -136,22 +136,60 @@ impl MultiWriter {
 
     /// Writes range tombstones to the given writer, respecting the clip mode.
     ///
-    /// - **clip=true** (compaction): intersect each RT with the table's KV key range.
-    /// - **clip=false** (flush): write all overlapping RTs unmodified so they cover
-    ///   keys in older SSTs outside this memtable's key range.
-    fn write_rts_to_writer(tombstones: &[RangeTombstone], clip: bool, writer: &mut Writer) {
+    /// - **clip=true** (compaction): intersect each RT with the table's
+    ///   "responsibility range".  For intermediate tables (rotation)
+    ///   `clip_upper` is the first key of the *next* output table, so the
+    ///   range extends past the table's last KV key and covers the gap.
+    ///   For the final table `clip_upper` is `None` and we fall back to
+    ///   `upper_bound_exclusive(last_key)`.
+    /// - **clip=false** (flush): write all overlapping RTs unmodified so they
+    ///   cover keys in older SSTs outside this memtable's key range.
+    fn write_rts_to_writer(
+        tombstones: &[RangeTombstone],
+        clip: bool,
+        writer: &mut Writer,
+        clip_upper: Option<&UserKey>,
+    ) {
         if let (Some(first_key), Some(last_key)) =
             (writer.meta.first_key.clone(), writer.meta.last_key.clone())
         {
             if clip {
-                // Compaction mode: clip RTs to this table's key range.
-                if let Some(max_exclusive) =
-                    crate::range_tombstone::upper_bound_exclusive(last_key.as_ref())
-                {
+                // Compaction mode: clip RTs to this table's responsibility range.
+                //
+                // For intermediate tables (rotation) `clip_upper` is the first key
+                // of the next output table — the range [first_key, next_key) covers
+                // the gap between tables so RTs spanning it are preserved.
+                //
+                // For the final table `clip_upper` is None and we derive the
+                // exclusive upper bound from the table's last KV key.
+                let derived_upper;
+                let max_exclusive: Option<&[u8]> = if let Some(upper) = clip_upper {
+                    Some(upper.as_ref())
+                } else {
+                    derived_upper =
+                        crate::range_tombstone::upper_bound_exclusive(last_key.as_ref());
+                    derived_upper.as_deref()
+                };
+
+                if let Some(max_exclusive) = max_exclusive {
                     for rt in tombstones {
-                        if let Some(clipped) =
-                            rt.intersect_opt(first_key.as_ref(), max_exclusive.as_ref())
-                        {
+                        if let Some(clipped) = rt.intersect_opt(first_key.as_ref(), max_exclusive) {
+                            // Widen key_range to cover the clipped RT so point
+                            // reads for keys in the gap will consult this table.
+                            // Safe because the RT is clipped to [first_key, clip_upper)
+                            // and clip_upper is the next table's first key — so the
+                            // widened range does not overlap the next table.
+                            if let Some(existing) = &mut writer.meta.first_key {
+                                if clipped.start.as_ref() < existing.as_ref() {
+                                    *existing = clipped.start.clone();
+                                }
+                            }
+                            if let Some(existing) = &mut writer.meta.last_key {
+                                if clipped.end.as_ref() > existing.as_ref() {
+                                    *existing = clipped.end.clone();
+                                }
+                            }
+
                             writer.write_range_tombstone(clipped);
                         }
                     }
@@ -348,13 +386,15 @@ impl MultiWriter {
         // Write range tombstones to the finishing writer.
         // In flush mode (clip=false) tombstones are written unmodified because
         // they must cover keys in older SSTs outside this memtable's key range.
-        // In compaction mode (clip=true) tombstones are clipped to the output
-        // table's KV range because the input tables are consumed.
+        // In compaction mode (clip=true) tombstones are clipped to the table's
+        // responsibility range [first_key, current_key) — current_key is the
+        // first key of the NEW table, so this covers the gap between tables.
         if !self.range_tombstones.is_empty() {
             Self::write_rts_to_writer(
                 &self.range_tombstones,
                 self.clip_range_tombstones,
                 &mut old_writer,
+                self.current_key.as_ref(),
             );
         }
 
@@ -398,12 +438,14 @@ impl MultiWriter {
     pub fn finish(mut self) -> crate::Result<Vec<(TableId, Checksum)>> {
         self.writer.spill_block()?;
 
-        // Write range tombstones to the last writer (same logic as rotate).
+        // Write range tombstones to the last writer. No next table exists,
+        // so clip_upper=None falls back to upper_bound_exclusive(last_key).
         if !self.range_tombstones.is_empty() {
             Self::write_rts_to_writer(
                 &self.range_tombstones,
                 self.clip_range_tombstones,
                 &mut self.writer,
+                None,
             );
         }
 
@@ -460,6 +502,101 @@ mod tests {
         tree.major_compact(1_024, 0)?;
         assert_eq!(1, tree.table_count());
         assert_eq!(1, tree.len(SeqNo::MAX, None)?);
+
+        Ok(())
+    }
+
+    // Regression (#32): compaction clip must preserve RT covering gap between
+    // output tables.  Before the fix, MultiWriter clipped each RT to
+    // [first_key, upper_bound(last_key)) — RTs in the gap were dropped by all
+    // tables.  The fix clips to [first_key, next_table_first_key) during
+    // rotation, covering the gap, and widens key_range so point reads find it.
+    #[test]
+    fn clip_preserves_rt_covering_gap_between_output_tables() -> crate::Result<()> {
+        use crate::range_tombstone::RangeTombstone;
+        use crate::{fs::StdFs, InternalValue, UserKey};
+        use std::sync::Arc;
+
+        let folder = tempfile::tempdir()?;
+        let base_path = folder.path().join("tables");
+        std::fs::create_dir_all(&base_path)?;
+
+        let id_gen = SequenceNumberCounter::default();
+        let fs: Arc<dyn crate::fs::Fs> = Arc::new(StdFs);
+
+        // Tiny target_size to force rotation between "l" and "q"
+        let mut mw = super::MultiWriter::new(base_path.clone(), id_gen, 100, 1, fs)?
+            .use_clip_range_tombstones();
+
+        mw.set_range_tombstones(vec![RangeTombstone::new(
+            UserKey::from(b"m" as &[u8]),
+            UserKey::from(b"p" as &[u8]),
+            20,
+        )]);
+
+        // Table 1: keys [a, l]  — values large enough to fill a 4 KiB data
+        // block and push file_pos past target_size so rotation fires on "q".
+        mw.write(InternalValue::from_components(
+            UserKey::from(b"a" as &[u8]),
+            vec![0u8; 4_000],
+            1,
+            crate::ValueType::Value,
+        ))?;
+        mw.write(InternalValue::from_components(
+            UserKey::from(b"l" as &[u8]),
+            vec![0u8; 4_000],
+            2,
+            crate::ValueType::Value,
+        ))?;
+        // Table 2: keys [q, z]  — rotation happens before "q"
+        mw.write(InternalValue::from_components(
+            UserKey::from(b"q" as &[u8]),
+            vec![0u8; 4_000],
+            3,
+            crate::ValueType::Value,
+        ))?;
+        mw.write(InternalValue::from_components(
+            UserKey::from(b"z" as &[u8]),
+            vec![0u8; 4_000],
+            4,
+            crate::ValueType::Value,
+        ))?;
+
+        let results = mw.finish()?;
+        assert!(
+            results.len() >= 2,
+            "expected 2+ output tables to verify gap, got {}",
+            results.len(),
+        );
+
+        // Recover each output table and count preserved RTs
+        let cache = Arc::new(crate::Cache::with_capacity_bytes(64 * 1_024));
+        let comparator: crate::SharedComparator = Arc::new(crate::DefaultUserComparator);
+        let mut total_rts = 0;
+
+        for (table_id, checksum) in &results {
+            let table = crate::Table::recover(
+                base_path.join(table_id.to_string()),
+                *checksum,
+                0,
+                0,
+                cache.clone(),
+                None,
+                false,
+                false,
+                None,
+                comparator.clone(),
+                #[cfg(feature = "metrics")]
+                Arc::new(crate::Metrics::default()),
+            )?;
+            total_rts += table.range_tombstones().len();
+        }
+
+        assert!(
+            total_rts > 0,
+            "BUG: RT [m,p)@20 was dropped by compaction clip — \
+             no output table preserved it (gap between tables)",
+        );
 
         Ok(())
     }

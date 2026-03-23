@@ -290,6 +290,12 @@ impl Writer {
         self
     }
 
+    /// Returns range tombstones collected so far (test-only accessor).
+    #[cfg(test)]
+    pub(crate) fn range_tombstone_count(&self) -> usize {
+        self.range_tombstones.len()
+    }
+
     /// Adds a range tombstone to be written into this table's RT block.
     pub(crate) fn write_range_tombstone(&mut self, rt: RangeTombstone) {
         self.meta.lowest_seqno = self.meta.lowest_seqno.min(rt.seqno);
