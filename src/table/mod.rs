@@ -821,7 +821,7 @@ impl Table {
             .store(true, std::sync::atomic::Ordering::Release);
     }
 
-    /// Checks if a key range is (partially or fully) contained in this table.
+    /// Checks if a key range overlaps (partially or fully) with this table's key range.
     pub(crate) fn check_key_range_overlap_cmp(
         &self,
         bounds: &(Bound<&[u8]>, Bound<&[u8]>),

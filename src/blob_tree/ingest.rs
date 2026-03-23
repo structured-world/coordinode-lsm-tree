@@ -76,7 +76,7 @@ impl<'a> BlobIngestion<'a> {
         if let Some(prev) = &self.last_key {
             assert!(
                 self.tree.index.config.comparator.compare(prev, &key) == Ordering::Less,
-                "next key in ingestion must be greater than last key"
+                "next key in ingestion must be ordered after last key by configured comparator"
             );
         }
 
@@ -116,7 +116,7 @@ impl<'a> BlobIngestion<'a> {
         if let Some(prev) = &self.last_key {
             assert!(
                 self.tree.index.config.comparator.compare(prev, &key) == Ordering::Less,
-                "next key in ingestion must be greater than last key"
+                "next key in ingestion must be ordered after last key by configured comparator"
             );
         }
 
@@ -137,7 +137,7 @@ impl<'a> BlobIngestion<'a> {
         if let Some(prev) = &self.last_key {
             assert!(
                 self.tree.index.config.comparator.compare(prev, &key) == Ordering::Less,
-                "next key in ingestion must be greater than last key"
+                "next key in ingestion must be ordered after last key by configured comparator"
             );
         }
 
