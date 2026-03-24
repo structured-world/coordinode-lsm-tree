@@ -275,9 +275,10 @@ fn run_single(
         });
     }
 
-    // Pick the median by ops/sec.
+    // Pick the lower median by ops/sec to avoid upward bias for even N:
+    // len=1 → 0, len=2 → 0, len=3 → 1, len=4 → 1, etc.
     results.sort_by(|a, b| a.ops_per_sec.total_cmp(&b.ops_per_sec));
-    let median_idx = results.len() / 2;
+    let median_idx = (results.len() - 1) / 2;
     let median = &results[median_idx];
 
     let factor = calibration.map_or(1.0, CalibrationScore::factor);
