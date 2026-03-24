@@ -1485,7 +1485,7 @@ impl Tree {
         config: &Config,
         #[cfg(feature = "metrics")] metrics: &Arc<Metrics>,
     ) -> crate::Result<Version> {
-        use crate::{file::fsync_directory, TableId};
+        use crate::{file::fsync_directory, fs::Fs, TableId};
 
         let tree_path = tree_path.as_ref();
 
@@ -1642,7 +1642,7 @@ impl Tree {
 
         for blob_file_path in orphaned_blob_files {
             log::debug!("Deleting orphaned blob file {}", blob_file_path.display());
-            std::fs::remove_file(&blob_file_path)?;
+            (*config.fs).remove_file(&blob_file_path)?;
         }
 
         Ok(version)
