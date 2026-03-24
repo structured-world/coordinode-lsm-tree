@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1774321016679,
+  "lastUpdate": 1774323379573,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -3042,6 +3042,84 @@ window.BENCHMARK_DATA = {
             "value": 519882.7183058823,
             "unit": "ops/sec",
             "extra": "P50: 1.6us | P99: 7.8us | P99.9: 13.3us\nthreads: 1 | elapsed: 0.38s | num: 200000"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "62ae0b5ab8445587fd64a35591cd85aa9ae3d8d8",
+          "message": "docs: add benchmark dashboard link and update badges (#151)\n\n## Summary\n\n- Add codecov, benchmarks dashboard, deps.rs, and license badges; remove\nUpstream CI badge\n- Expand benchmarks section with link to CI dashboard and regression\nthresholds\n- Reframe project identity as independent derivative work (remove\nupstream contribution claims)\n- Update license references to Apache-2.0 in README and CONTRIBUTING.md\n\n## Test plan\n\n- [ ] Verify badge URLs resolve correctly\n- [ ] Verify benchmark dashboard link works\n\nCloses #124\n\n---------\n\nCo-authored-by: Copilot <175728472+Copilot@users.noreply.github.com>",
+          "timestamp": "2026-03-24T05:34:45+02:00",
+          "tree_id": "74896e85e6692e8c2c4e6cfe5c4ef38410c08656",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/62ae0b5ab8445587fd64a35591cd85aa9ae3d8d8"
+        },
+        "date": 1774323377929,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 1969189.509560356,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 2.3us | P99.9: 5.3us\nthreads: 1 | elapsed: 0.10s | num: 200000"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1258805.248301475,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 1.5us | P99.9: 5.7us\nthreads: 1 | elapsed: 0.16s | num: 200000"
+          },
+          {
+            "name": "readrandom",
+            "value": 625214.5286889519,
+            "unit": "ops/sec",
+            "extra": "P50: 1.4us | P99: 5.4us | P99.9: 11.1us\nthreads: 1 | elapsed: 0.32s | num: 200000"
+          },
+          {
+            "name": "readseq",
+            "value": 2486690.7956905747,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 4.3us | P99.9: 8.3us\nthreads: 1 | elapsed: 0.08s | num: 200000"
+          },
+          {
+            "name": "seekrandom",
+            "value": 402016.7354461354,
+            "unit": "ops/sec",
+            "extra": "P50: 2.1us | P99: 6.2us | P99.9: 12.5us\nthreads: 1 | elapsed: 0.50s | num: 200000"
+          },
+          {
+            "name": "prefixscan",
+            "value": 202712.8008134816,
+            "unit": "ops/sec",
+            "extra": "P50: 4.6us | P99: 7.0us | P99.9: 14.9us\nthreads: 1 | elapsed: 0.99s | num: 200000"
+          },
+          {
+            "name": "overwrite",
+            "value": 1191785.3027856592,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.8us | P99.9: 6.1us\nthreads: 1 | elapsed: 0.17s | num: 200000"
+          },
+          {
+            "name": "mergerandom",
+            "value": 758589.0141169319,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 2.1us | P99.9: 3.6us\nthreads: 1 | elapsed: 0.26s | num: 200000"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 516507.2501903193,
+            "unit": "ops/sec",
+            "extra": "P50: 1.7us | P99: 7.9us | P99.9: 13.3us\nthreads: 1 | elapsed: 0.39s | num: 200000"
           }
         ]
       }
