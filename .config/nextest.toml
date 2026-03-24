@@ -5,13 +5,12 @@ dir = "target/nextest"
 slow-timeout = { period = "10s", terminate-after = 6 }
 fail-fast = true
 
-# Property tests may take longer than unit tests (proptest runs N cases).
-# CI uses PROPTEST_CASES=32; local runs default to 256.
-# Budget: 120s × 8 = 960s (16 min) — enough for 256 local cases.
-# Measured worst case: prop_range_tombstone ~700s with 256 cases on M-series Mac.
+# Property tests run 32 cases by default (same as CI).
+# Override with PROPTEST_CASES=256 for thorough local runs.
+# Budget: 30s × 4 = 120s — enough for 32 cases with I/O.
 [[profile.default.overrides]]
 filter = "test(prop_)"
-slow-timeout = { period = "120s", terminate-after = 8 }
+slow-timeout = { period = "30s", terminate-after = 4 }
 
 # CI profile: retries for flaky tests, JUnit XML output, longer timeouts.
 [profile.ci]

@@ -17,7 +17,9 @@ fn blob_tree_fifo_limit() -> lsm_tree::Result<()> {
 
     let compaction = Arc::new(lsm_tree::compaction::Fifo::new(10, None));
 
-    for _ in 0..100 {
+    // 20 iterations is enough: FIFO limit is 10, so after 10+ rounds the
+    // invariant (blob_file_count < 10) is exercised on every iteration.
+    for _ in 0..20 {
         tree.insert(nanoid::nanoid!(), "$", 0);
         tree.flush_active_memtable(0)?;
         tree.compact(compaction.clone(), 0)?;
