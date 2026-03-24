@@ -12,10 +12,14 @@ use std::time::Instant;
 /// Fixed reference composite.  All normalized results are expressed relative
 /// to this constant so they stay in a human-readable ops/sec range.
 ///
-/// Set so that `factor ≈ 1.0` on a typical `ubuntu-latest` GitHub runner.
-/// Adjust after the first calibrated CI run if needed — changing this
-/// constant rescales *all* historical results (reset the dashboard).
-pub const REFERENCE_COMPOSITE: f64 = 10_000.0;
+/// Calibrated so that `factor ≈ 1.0` on a typical `ubuntu-latest` GitHub
+/// runner (~23K composite), keeping normalized values in the same ballpark
+/// as pre-normalization CI results.  Derived by comparing local raw ops/sec
+/// against historical CI results and scaling by the local composite.
+///
+/// Changing this constant rescales *all* historical results (reset the
+/// dashboard).
+pub const REFERENCE_COMPOSITE: f64 = 23_000.0;
 
 /// Raw calibration measurements for the current runner.
 #[derive(Debug, Clone)]
@@ -237,9 +241,9 @@ mod tests {
             seq_write_iops: 100_000.0,
             rand_read_iops: 50_000.0,
             cpu_score: 3000.0,
-            composite: 5_000.0,
+            composite: 11_500.0,
         };
-        // factor = REFERENCE / composite = 10000 / 5000 = 2.0
+        // factor = REFERENCE / composite = 23000 / 11500 = 2.0
         assert!((score.factor() - 2.0).abs() < 0.001);
     }
 
