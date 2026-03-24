@@ -135,6 +135,7 @@ fn compaction_filter_seqno_below_cutoff_removes_item() -> lsm_tree::Result<()> {
 
     let seqno_new = seqno_counter.next();
     tree.insert("new", "val_new", seqno_new);
+    assert!(seqno_old < seqno_new, "expected monotonic seqno allocation");
 
     tree.flush_active_memtable(0)?;
 
