@@ -2,8 +2,7 @@
 //!
 //! Sets up a global [`tracing`] subscriber backed by [`tracing_flame::FlameLayer`].
 //! All tracing spans emitted during the benchmark run are collected into a single
-//! folded-stacks file (`all.folded`) which is later split per workload and
-//! rendered into SVG flamegraphs by `inferno-flamegraph`.
+//! folded-stacks file (`all.folded`) and rendered into an SVG by `inferno-flamegraph`.
 
 use std::path::{Path, PathBuf};
 use tracing_flame::FlameLayer;
@@ -25,6 +24,7 @@ impl FlameGuard {
 /// Initialise the global tracing subscriber with a `FlameLayer`.
 ///
 /// All spans are written to `{output_dir}/all.folded`.
+/// Thread IDs are collapsed for cleaner flamegraphs.
 /// The returned guard **must** be held until all workloads have finished;
 /// dropping it flushes the output file.
 pub fn setup(output_dir: &Path) -> Result<FlameGuard, Box<dyn std::error::Error>> {
@@ -32,6 +32,7 @@ pub fn setup(output_dir: &Path) -> Result<FlameGuard, Box<dyn std::error::Error>
 
     let folded_path = output_dir.join("all.folded");
     let (flame_layer, guard) = FlameLayer::with_file(&folded_path)?;
+    let flame_layer = flame_layer.with_threads_collapsed(true);
 
     tracing_subscriber::registry().with(flame_layer).init();
 

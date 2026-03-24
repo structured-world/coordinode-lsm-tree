@@ -35,23 +35,11 @@ jobs:
             --features flamegraph -- \
             --benchmark all --num 100000 --flamegraph --skip-calibration
 
-      - name: Generate flamegraph SVGs
+      - name: Generate flamegraph SVG
         run: |
           cd target/flamegraphs
-          # Split the combined folded-stacks file by workload span.
-          # Each line starts with "bench workload=<name>;..." — extract
-          # per-workload files and strip the root span for cleaner graphs.
-          for workload in $(grep -oP '(?<=workload=)\w+' all.folded | sort -u); do
-            grep "workload=${workload}" all.folded \
-              | sed "s/^bench workload=${workload} //" \
-              > "${workload}.folded"
-            inferno-flamegraph --title "${workload}" "${workload}.folded" \
-              > "${workload}.svg" || true
-          done
-          # Also generate a combined flamegraph with all workloads.
-          inferno-flamegraph --title "all workloads" all.folded > all.svg || true
-          # Clean up intermediate .folded files (keep all.folded for debugging).
-          rm -f *.folded
+          inferno-flamegraph --title "db_bench all workloads" all.folded > flamegraph.svg
+          rm -f all.folded
 
       - name: Deploy to gh-pages
         if: github.ref == 'refs/heads/main'
