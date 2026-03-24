@@ -99,7 +99,7 @@ fn scan_vs_query(c: &mut Criterion) {
             b.iter(|| {
                 let count = tree
                     .iter(MAX, None)
-                    .filter_map(|guard| guard.into_inner().ok())
+                    .map(|guard| guard.into_inner().unwrap())
                     .filter(|(key, _)| {
                         let buf = &key[..8];
                         let (int_bytes, _rest) = buf.split_at(std::mem::size_of::<u64>());
@@ -176,7 +176,7 @@ fn scan_vs_prefix(c: &mut Criterion) {
             b.iter(|| {
                 let count = tree
                     .iter(MAX, None)
-                    .filter_map(|guard| guard.into_inner().ok())
+                    .map(|guard| guard.into_inner().unwrap())
                     .filter(|(key, _)| key.starts_with(prefix.as_bytes()))
                     .count();
                 assert_eq!(count, 10);
