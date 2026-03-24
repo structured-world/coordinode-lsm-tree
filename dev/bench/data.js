@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1774356615093,
+  "lastUpdate": 1774364343703,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -3510,6 +3510,84 @@ window.BENCHMARK_DATA = {
             "value": 528786.5851475518,
             "unit": "ops/sec",
             "extra": "P50: 1.6us | P99: 7.6us | P99.9: 12.9us\nthreads: 1 | elapsed: 0.38s | num: 200000"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "433d169b54af11f51bc2d5a4fecd17bd502130bb",
+          "message": "feat(compaction): expose seqno in CompactionFilter ItemAccessor (#160)\n\n## Summary\n\n- Add `ItemAccessor::seqno()` method to `CompactionFilter`, exposing the\nsequence number of items during compaction\n- Enables retention-aware MVCC GC patterns (e.g. keep versions within a\ntime window)\n\n## Technical Details\n\nSingle method addition to `ItemAccessor` in `src/compaction/filter.rs` —\ndelegates to `item.key.seqno`. Marked `#[must_use]` consistent with\nexisting `key()` method.\n\n## Test Plan\n\n- `compaction_filter_seqno_matches_insert_time_value` — verifies\n`seqno()` returns correct values matching insert-time seqnos\n- `compaction_filter_seqno_below_cutoff_removes_item` — end-to-end\nretention-based GC: items below seqno cutoff are removed, above are kept\n\nCloses #156",
+          "timestamp": "2026-03-24T16:57:54+02:00",
+          "tree_id": "283e540d5b24b7c8462073a5786564b330a0b720",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/433d169b54af11f51bc2d5a4fecd17bd502130bb"
+        },
+        "date": 1774364342579,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 2008396.019222519,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 2.3us | P99.9: 5.3us\nthreads: 1 | elapsed: 0.10s | num: 200000"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1268347.3901526497,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 1.3us | P99.9: 5.2us\nthreads: 1 | elapsed: 0.16s | num: 200000"
+          },
+          {
+            "name": "readrandom",
+            "value": 584047.0753623684,
+            "unit": "ops/sec",
+            "extra": "P50: 1.5us | P99: 5.6us | P99.9: 11.7us\nthreads: 1 | elapsed: 0.34s | num: 200000"
+          },
+          {
+            "name": "readseq",
+            "value": 2464701.682428783,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 4.3us | P99.9: 8.6us\nthreads: 1 | elapsed: 0.08s | num: 200000"
+          },
+          {
+            "name": "seekrandom",
+            "value": 401244.78329619893,
+            "unit": "ops/sec",
+            "extra": "P50: 2.2us | P99: 6.4us | P99.9: 12.3us\nthreads: 1 | elapsed: 0.50s | num: 200000"
+          },
+          {
+            "name": "prefixscan",
+            "value": 202950.43991659125,
+            "unit": "ops/sec",
+            "extra": "P50: 4.6us | P99: 6.1us | P99.9: 15.1us\nthreads: 1 | elapsed: 0.99s | num: 200000"
+          },
+          {
+            "name": "overwrite",
+            "value": 1099039.4933357597,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.8us | P99.9: 6.6us\nthreads: 1 | elapsed: 0.18s | num: 200000"
+          },
+          {
+            "name": "mergerandom",
+            "value": 673114.1307549508,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 0.5us | P99.9: 3.3us\nthreads: 1 | elapsed: 0.30s | num: 200000"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 475673.37166813575,
+            "unit": "ops/sec",
+            "extra": "P50: 1.8us | P99: 8.1us | P99.9: 16.2us\nthreads: 1 | elapsed: 0.42s | num: 200000"
           }
         ]
       }
