@@ -118,7 +118,8 @@ impl Reporter {
         let normalized_ops = s.ops_per_sec * calibration_factor;
         let normalized_mb = s.mb_per_sec * calibration_factor;
 
-        if (calibration_factor - 1.0).abs() > f64::EPSILON {
+        const CALIBRATION_TOLERANCE: f64 = 1e-3;
+        if (calibration_factor - 1.0).abs() > CALIBRATION_TOLERANCE {
             println!(
                 "{benchmark:<20} {:>12} ops in {:.2}s  ({:>12.0} ops/sec normalized, {:.1} MB/sec)",
                 s.ops, s.secs, normalized_ops, normalized_mb,
