@@ -1626,9 +1626,12 @@ impl Tree {
         }
 
         if tables.len() < cnt {
-            // Route configuration is NOT persisted.  To distinguish a removed
-            // route (config error) from a deleted SST (data corruption), check
-            // each missing table's level against the current routes:
+            // Route configuration is NOT persisted.  This is a best-effort
+            // heuristic: it checks each missing table's level against the
+            // current routes, but cannot detect same-level path changes
+            // (e.g., L0 routed to /hot_old → /hot_new).  Persisting route
+            // provenance per-table in the manifest would enable exact
+            // detection but requires a format change.
             //
             // - Level IS covered by a current route → its directory was scanned
             //   and the file was not found → data corruption / deletion.
