@@ -738,6 +738,52 @@ fn missing_table_without_routes_returns_unrecoverable() -> lsm_tree::Result<()> 
 }
 
 #[test]
+fn deleted_sst_with_routes_configured_returns_unrecoverable() -> lsm_tree::Result<()> {
+    let dir = tempfile::tempdir()?;
+
+    // Phase 1: write data WITH routes — tables go to hot tier
+    {
+        let config = three_tier_config(dir.path());
+        let tree = config.open()?;
+
+        tree.insert("a", "value_a", 0);
+        tree.insert("b", "value_b", 1);
+        tree.flush_active_memtable(0)?;
+    }
+
+    // Phase 2: delete a table file from the hot tier (simulates corruption)
+    let hot_tables_dir = dir.path().join("hot").join("tables");
+    for entry in std::fs::read_dir(&hot_tables_dir)? {
+        let entry = entry?;
+        if entry.file_type()?.is_file() {
+            std::fs::remove_file(entry.path())?;
+            break;
+        }
+    }
+
+    // Phase 3: reopen WITH THE SAME routes — L0 is covered by hot route,
+    // so the missing table is corruption, NOT a route mismatch
+    {
+        let config = three_tier_config(dir.path());
+
+        match config.open() {
+            Err(lsm_tree::Error::Unrecoverable) => {}
+            Err(lsm_tree::Error::RouteMismatch { expected, found }) => {
+                panic!(
+                    "BUG: got RouteMismatch(expected={expected}, found={found}) \
+                     but the table was deleted from a covered route — \
+                     should be Unrecoverable"
+                );
+            }
+            Err(e) => panic!("expected Unrecoverable, got: {e:?}"),
+            Ok(_) => panic!("expected Unrecoverable error, but open succeeded"),
+        }
+    }
+
+    Ok(())
+}
+
+#[test]
 #[should_panic(expected = "empty or inverted level route range")]
 fn empty_range_panics() {
     let _config = Config::new(

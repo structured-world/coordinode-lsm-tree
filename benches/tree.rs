@@ -18,7 +18,7 @@ fn full_scan(c: &mut Criterion) {
                 SequenceNumberCounter::default(),
                 SequenceNumberCounter::default(),
             )
-            .use_cache(Cache::with_capacity_bytes(0).into())
+            .use_cache(Arc::new(Cache::with_capacity_bytes(0)))
             .open()
             .unwrap();
 
@@ -43,7 +43,7 @@ fn full_scan(c: &mut Criterion) {
                 SequenceNumberCounter::default(),
                 SequenceNumberCounter::default(),
             )
-            .use_cache(Cache::with_capacity_bytes(100_000_000).into())
+            .use_cache(Arc::new(Cache::with_capacity_bytes(100_000_000)))
             .open()
             .unwrap();
 
@@ -80,7 +80,7 @@ fn scan_vs_query(c: &mut Criterion) {
             SequenceNumberCounter::default(),
             SequenceNumberCounter::default(),
         )
-        .use_cache(Cache::with_capacity_bytes(0).into())
+        .use_cache(Arc::new(Cache::with_capacity_bytes(0)))
         .open()
         .unwrap();
 
@@ -149,7 +149,7 @@ fn scan_vs_prefix(c: &mut Criterion) {
             SequenceNumberCounter::default(),
             SequenceNumberCounter::default(),
         )
-        .use_cache(Cache::with_capacity_bytes(0).into())
+        .use_cache(Arc::new(Cache::with_capacity_bytes(0)))
         .open()
         .unwrap();
 

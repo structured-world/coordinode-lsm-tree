@@ -114,8 +114,10 @@ pub enum Error {
     /// written.  Recovery found fewer tables on disk than the manifest expects,
     /// which means some previously routed directories are no longer reachable.
     ///
-    /// Unlike [`Unrecoverable`](Self::Unrecoverable), this is a configuration
-    /// error, not data corruption — re-adding the missing route(s) will fix it.
+    /// Unlike [`Unrecoverable`](Self::Unrecoverable), this often indicates a
+    /// configuration error rather than data corruption — re-adding the missing
+    /// route(s) will typically fix it.  However, the same condition can arise
+    /// if SST files were deleted while `level_routes` is configured.
     RouteMismatch {
         /// Number of tables listed in the manifest.
         expected: usize,

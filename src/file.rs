@@ -94,7 +94,12 @@ pub fn fsync_directory(_path: &Path, _fs: &dyn Fs) -> std::io::Result<()> {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::useless_vec)]
+#[expect(
+    clippy::unwrap_used,
+    clippy::indexing_slicing,
+    clippy::useless_vec,
+    reason = "test code"
+)]
 mod tests {
     use super::*;
     use crate::fs::StdFs;

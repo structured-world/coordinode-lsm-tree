@@ -1626,19 +1626,38 @@ impl Tree {
         }
 
         if tables.len() < cnt {
-            if config.level_routes.is_some() {
-                log::error!(
-                    "Route mismatch: expected {} tables but found {} — \
-                     level_routes may not cover all previously used folders. \
-                     Missing table IDs: {:?}",
-                    cnt,
-                    tables.len(),
-                    table_map.keys(),
-                );
-                return Err(crate::Error::RouteMismatch {
-                    expected: cnt,
-                    found: tables.len(),
-                });
+            // Route configuration is NOT persisted.  To distinguish a removed
+            // route (config error) from a deleted SST (data corruption), check
+            // each missing table's level against the current routes:
+            //
+            // - Level IS covered by a current route → its directory was scanned
+            //   and the file was not found → data corruption / deletion.
+            // - Level is NOT covered → falls back to primary (always scanned).
+            //   If the table isn't there, it was likely in a route that has
+            //   since been removed from the config.
+            //
+            // Return RouteMismatch only when ALL missing tables are on levels
+            // not covered by any current route.  If ANY missing table is on a
+            // covered level, at least one SST was genuinely lost.
+            if let Some(routes) = &config.level_routes {
+                let all_missing_uncovered = table_map
+                    .values()
+                    .all(|(level, _, _)| !routes.iter().any(|r| r.levels.contains(level)));
+
+                if all_missing_uncovered {
+                    log::error!(
+                        "Route mismatch: expected {} tables but found {} — \
+                         level_routes do not cover all previously used levels. \
+                         Missing table IDs: {:?}",
+                        cnt,
+                        tables.len(),
+                        table_map.keys(),
+                    );
+                    return Err(crate::Error::RouteMismatch {
+                        expected: cnt,
+                        found: tables.len(),
+                    });
+                }
             }
 
             log::error!(
