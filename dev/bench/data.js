@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1774326599292,
+  "lastUpdate": 1774327286800,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -3354,6 +3354,84 @@ window.BENCHMARK_DATA = {
             "value": 529140.8067947987,
             "unit": "ops/sec",
             "extra": "P50: 1.6us | P99: 8.8us | P99.9: 15.3us\nthreads: 1 | elapsed: 0.38s | num: 200000"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "64bcf6849ae53f53c0ff1e336918d940b0715227",
+          "message": "perf(bench): add multi-threaded support to all db_bench workloads (#155)\n\n## Summary\n- Extract `run_threaded` helper + `distribute_ops` into `mod.rs` —\nshared threading boilerplate for all workloads\n- Add `--threads N` support to all 8 single-threaded workloads:\n`fillseq`, `fillrandom`, `readrandom`, `readseq`, `seekrandom`,\n`prefixscan`, `overwrite`, `mergerandom`\n- Previously only `readwhilewriting` honored `--threads`; all others\nsilently ignored it\n\n## Design decisions\n| Workload | Multi-thread strategy |\n|----------|----------------------|\n| `fillseq`, `readseq` | Partitioned key ranges (thread t owns `[start,\nstart+ops)`) |\n| `fillrandom`, `overwrite`, `readrandom`, `seekrandom`, `prefixscan` |\nShared data, random access (contention intentional) |\n| `mergerandom` | Global op range partitioned to preserve key\ndistribution; flush + compact timed after thread join |\n\n## Test plan\n- [x] `cargo clippy -- -D warnings` — clean\n- [x] `cargo test --lib` — 515 passed, 0 failed\n- [x] All 9 workloads tested with `--threads 1` and `--threads 4`\n- [x] `mergerandom` counter verification passes with 4 threads\n- [x] `--benchmark all --github-json` works with both thread counts\n\nCloses #136",
+          "timestamp": "2026-03-24T06:40:24+02:00",
+          "tree_id": "b192d9b6e48f3acd062cd601d8ac7445da082f94",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/64bcf6849ae53f53c0ff1e336918d940b0715227"
+        },
+        "date": 1774327285777,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 1995586.9191751976,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 2.3us | P99.9: 5.3us\nthreads: 1 | elapsed: 0.10s | num: 200000"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1248275.7177424661,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 1.6us | P99.9: 5.8us\nthreads: 1 | elapsed: 0.16s | num: 200000"
+          },
+          {
+            "name": "readrandom",
+            "value": 578085.5335586688,
+            "unit": "ops/sec",
+            "extra": "P50: 1.5us | P99: 5.6us | P99.9: 11.6us\nthreads: 1 | elapsed: 0.35s | num: 200000"
+          },
+          {
+            "name": "readseq",
+            "value": 2498525.1518344367,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 4.2us | P99.9: 8.6us\nthreads: 1 | elapsed: 0.08s | num: 200000"
+          },
+          {
+            "name": "seekrandom",
+            "value": 372416.9622690615,
+            "unit": "ops/sec",
+            "extra": "P50: 2.4us | P99: 6.4us | P99.9: 12.7us\nthreads: 1 | elapsed: 0.54s | num: 200000"
+          },
+          {
+            "name": "prefixscan",
+            "value": 200574.07207752633,
+            "unit": "ops/sec",
+            "extra": "P50: 4.6us | P99: 7.1us | P99.9: 15.9us\nthreads: 1 | elapsed: 1.00s | num: 200000"
+          },
+          {
+            "name": "overwrite",
+            "value": 1129677.5754471268,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.8us | P99.9: 6.6us\nthreads: 1 | elapsed: 0.18s | num: 200000"
+          },
+          {
+            "name": "mergerandom",
+            "value": 679503.592591553,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 2.1us | P99.9: 3.2us\nthreads: 1 | elapsed: 0.29s | num: 200000"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 494835.12253301527,
+            "unit": "ops/sec",
+            "extra": "P50: 1.7us | P99: 8.0us | P99.9: 15.6us\nthreads: 1 | elapsed: 0.40s | num: 200000"
           }
         ]
       }
