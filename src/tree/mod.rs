@@ -1530,6 +1530,10 @@ impl Tree {
         };
 
         let mut tables = vec![];
+        // Track recovered table IDs so duplicate sightings (via symlinks,
+        // junctions, or case-insensitive aliases of the same directory) are
+        // skipped rather than orphan-deleted.
+        let mut recovered_table_ids: crate::HashSet<TableId> = crate::HashSet::default();
         let mut orphaned_tables: Vec<(std::path::PathBuf, Arc<dyn crate::fs::Fs>)> = vec![];
 
         // Scan all configured table folders (primary + level routes).
@@ -1602,10 +1606,19 @@ impl Tree {
                     )?;
 
                     tables.push(table);
+                    recovered_table_ids.insert(table_id);
 
                     if tables.len() % progress_mod == 0 {
                         log::debug!("Recovered {}/{cnt} tables", tables.len());
                     }
+                } else if recovered_table_ids.contains(&table_id) {
+                    // Duplicate sighting of an already-recovered manifest table
+                    // (e.g., via symlink or case-insensitive alias). Skip it —
+                    // do NOT treat as orphan or the live SST will be deleted.
+                    log::warn!(
+                        "Skipping duplicate sighting of manifest table {table_id} in {}",
+                        table_file_path.display(),
+                    );
                 } else {
                     orphaned_tables.push((table_file_path, folder_fs.clone()));
                 }
