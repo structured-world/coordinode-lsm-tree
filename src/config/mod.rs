@@ -545,15 +545,17 @@ impl<F: Fs> Config<F> {
     /// recovery: the primary folder plus every [`LevelRoute`] folder.
     #[must_use]
     pub fn all_tables_folders(&self) -> Vec<(PathBuf, Arc<dyn Fs>)> {
-        let mut folders = vec![(
-            self.path.join(TABLES_FOLDER),
-            self.fs.clone() as Arc<dyn Fs>,
-        )];
+        let primary_fs: Arc<dyn Fs> = self.fs.clone();
+        let mut folders: Vec<(PathBuf, Arc<dyn Fs>)> =
+            vec![(self.path.join(TABLES_FOLDER), primary_fs)];
 
         if let Some(routes) = &self.level_routes {
             for route in routes {
                 let folder = route.path.join(TABLES_FOLDER);
-                if !folders.iter().any(|(p, _)| *p == folder) {
+                if !folders
+                    .iter()
+                    .any(|(p, fs)| *p == folder && Arc::ptr_eq(fs, &route.fs))
+                {
                     folders.push((folder, route.fs.clone()));
                 }
             }

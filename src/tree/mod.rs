@@ -1521,7 +1521,7 @@ impl Tree {
         };
 
         let mut tables = vec![];
-        let mut orphaned_tables = vec![];
+        let mut orphaned_tables: Vec<(std::path::PathBuf, Arc<dyn crate::fs::Fs>)> = vec![];
 
         // Scan all configured table folders (primary + level routes).
         let all_folders = config.all_tables_folders();
@@ -1584,7 +1584,7 @@ impl Tree {
                         log::debug!("Recovered {}/{cnt} tables", tables.len());
                     }
                 } else {
-                    orphaned_tables.push(table_file_path);
+                    orphaned_tables.push((table_file_path, folder_fs.clone()));
                 }
             }
         }
@@ -1612,9 +1612,9 @@ impl Tree {
         // But only after we definitely recovered the latest version
         Self::cleanup_orphaned_version(tree_path, version.id())?;
 
-        for table_path in orphaned_tables {
+        for (table_path, orphan_fs) in orphaned_tables {
             log::debug!("Deleting orphaned table {}", table_path.display());
-            std::fs::remove_file(&table_path)?;
+            orphan_fs.remove_file(&table_path)?;
         }
 
         for blob_file_path in orphaned_blob_files {

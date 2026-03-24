@@ -363,33 +363,64 @@ fn empty_routes_normalizes_to_none() {
     assert!(config.level_routes.is_none());
 }
 
-// all_tables_folders deduplicates when a route path equals the primary path.
+// all_tables_folders deduplicates when a route shares both path AND Fs with primary.
 #[test]
-fn all_tables_folders_dedup_same_as_primary() {
+fn all_tables_folders_dedup_same_path_and_fs() {
     let dir = tempfile::tempdir().unwrap();
     let primary = dir.path().join("db");
+    let shared_fs: Arc<dyn lsm_tree::fs::Fs> = Arc::new(StdFs);
+
+    let mut config = Config::new(
+        &primary,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    );
+    // Inject same Arc so ptr_eq matches
+    config.fs = Arc::new(StdFs); // primary gets its own
+    let config = config.level_routes(vec![
+        LevelRoute {
+            levels: 0..2,
+            path: dir.path().join("other"),
+            fs: shared_fs.clone(),
+        },
+        LevelRoute {
+            levels: 2..5,
+            path: dir.path().join("other"), // same path + same Arc
+            fs: shared_fs,
+        },
+    ]);
+
+    let folders = config.all_tables_folders();
+    // primary + other = 2 (second "other" deduplicated by path+fs)
+    assert_eq!(folders.len(), 2);
+}
+
+// Different Fs instances on same path are NOT deduplicated (safety).
+#[test]
+fn all_tables_folders_different_fs_same_path_not_deduped() {
+    let dir = tempfile::tempdir().unwrap();
 
     let config = Config::new(
-        &primary,
+        dir.path().join("db"),
         SequenceNumberCounter::default(),
         SequenceNumberCounter::default(),
     )
     .level_routes(vec![
         LevelRoute {
             levels: 0..2,
-            path: primary.clone(), // same as primary
-            fs: Arc::new(StdFs),
+            path: dir.path().join("shared"),
+            fs: Arc::new(StdFs), // different Arc
         },
         LevelRoute {
             levels: 2..5,
-            path: dir.path().join("other"),
+            path: dir.path().join("shared"), // same path, different Arc<StdFs>
             fs: Arc::new(StdFs),
         },
     ]);
 
     let folders = config.all_tables_folders();
-    // primary + other = 2 (duplicate removed)
-    assert_eq!(folders.len(), 2);
+    // primary + shared(fs1) + shared(fs2) = 3 (not deduped — different Fs ptrs)
+    assert_eq!(folders.len(), 3);
 }
 
 // Same-device Move stays as Move (no unnecessary rewrite).
