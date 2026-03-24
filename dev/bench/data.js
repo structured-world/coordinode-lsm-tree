@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1774368996429,
+  "lastUpdate": 1774372842109,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -3744,6 +3744,84 @@ window.BENCHMARK_DATA = {
             "value": 487870.1134225077,
             "unit": "ops/sec",
             "extra": "P50: 1.8us | P99: 8.0us | P99.9: 15.1us\nthreads: 1 | elapsed: 0.41s | num: 200000"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "25550c6ccac384e2b7f8cf4333e19fd2ddf8b5be",
+          "message": "perf(bench): normalize results against runner calibration (#162)\n\n## Summary\n\n- Add runner calibration workload (sequential write, random read, CPU\nCRC32) that measures hardware capabilities before benchmarks run,\nnormalizing ops/sec so results are comparable across different CI\nrunners\n- Add `--iterations N` flag (default 3 for `--github-json`) with median\nselection to reduce within-runner variance\n- Tighten CI regression thresholds from 15%/25% to 10%/15%\n- Optimize criterion benchmarks: reduce bloom filter size 100M→1M, trim\nFPR levels 5→3, reduce tree/level_manifest segment counts\n\n## Technical Details\n\n**Calibration** (`tools/db_bench/src/calibrate.rs`):\n- Sequential 4K write IOPS (64 MiB file)\n- Random 4K read IOPS (10K reads from 64 MiB file, deterministic LCG\noffsets)\n- CPU throughput (bitwise CRC32 over 64 MiB, `black_box`-guarded)\n- Weighted geometric mean: `seq^0.3 * rand^0.4 * cpu^0.3`\n- `REFERENCE_COMPOSITE = 23_000` (factor ≈ 1.0 on ubuntu-latest)\n\n**Normalization**: `normalized = raw_ops * REFERENCE / composite`\n\n**New CLI flags**: `--iterations N`, `--skip-calibration`\n\n**Criterion optimizations** (estimated ~60% runtime reduction):\n- `bloom.rs`: filter n=100M→1M, FPR levels [0.1..0.00001]→[0.01, 0.001,\n0.0001]\n- `tree.rs`: segments [1..512]→[1,4,16,64,128], drop 1M-item scans\n- `level_manifest.rs`: segments [0..4000]→[0..1000]\n\n## Test plan\n\n- [x] `cargo test --manifest-path tools/db_bench/Cargo.toml` — 6/6\npassed\n- [x] `cargo clippy` — clean\n- [x] `cargo test --lib` — 516 passed\n- [x] Manual test: `--github-json`, `--skip-calibration`, `--iterations\n2`\n- [ ] CI benchmark workflow runs successfully with calibration\n\nCloses #161\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n## Summary by CodeRabbit\n\n* **New Features**\n* Optional multi-iteration benchmark runs with median selection and a\nflag to skip calibration.\n* Hardware calibration to normalize throughput reporting; outputs show\ncalibrated and raw metrics.\n\n* **Chores**\n  * Tightened CI benchmark regression thresholds.\n  * Reduced benchmark input sizes to shorten test execution time.\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-03-24T19:19:25+02:00",
+          "tree_id": "48f9339c9c099e9af76d2b173faa663f4ff4e83a",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/25550c6ccac384e2b7f8cf4333e19fd2ddf8b5be"
+        },
+        "date": 1774372841100,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 1289592.9636621,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 1919954 ops/sec | factor: 0.672 | P50: 0.4us | P99: 2.4us | P99.9: 5.4us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3 | runner: seq_wr=214730 rand_rd=590179 cpu=123 composite=34242.5"
+          },
+          {
+            "name": "fillrandom",
+            "value": 712145.6470742999,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 1060247 ops/sec | factor: 0.672 | P50: 0.7us | P99: 2.9us | P99.9: 7.1us\nthreads: 1 | elapsed: 0.19s | num: 200000 | iterations: 3 | runner: seq_wr=214730 rand_rd=590179 cpu=123 composite=34242.5"
+          },
+          {
+            "name": "readrandom",
+            "value": 371690.7330306526,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 553375 ops/sec | factor: 0.672 | P50: 1.6us | P99: 5.7us | P99.9: 12.1us\nthreads: 1 | elapsed: 0.36s | num: 200000 | iterations: 3 | runner: seq_wr=214730 rand_rd=590179 cpu=123 composite=34242.5"
+          },
+          {
+            "name": "readseq",
+            "value": 1657060.5943896933,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 2467042 ops/sec | factor: 0.672 | P50: 0.2us | P99: 4.3us | P99.9: 8.1us\nthreads: 1 | elapsed: 0.08s | num: 200000 | iterations: 3 | runner: seq_wr=214730 rand_rd=590179 cpu=123 composite=34242.5"
+          },
+          {
+            "name": "seekrandom",
+            "value": 253811.60250966853,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 377876 ops/sec | factor: 0.672 | P50: 2.3us | P99: 6.4us | P99.9: 13.9us\nthreads: 1 | elapsed: 0.53s | num: 200000 | iterations: 3 | runner: seq_wr=214730 rand_rd=590179 cpu=123 composite=34242.5"
+          },
+          {
+            "name": "prefixscan",
+            "value": 135063.03666320688,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 201083 ops/sec | factor: 0.672 | P50: 4.6us | P99: 6.3us | P99.9: 15.6us\nthreads: 1 | elapsed: 0.99s | num: 200000 | iterations: 3 | runner: seq_wr=214730 rand_rd=590179 cpu=123 composite=34242.5"
+          },
+          {
+            "name": "overwrite",
+            "value": 769441.9689476031,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 1145550 ops/sec | factor: 0.672 | P50: 0.7us | P99: 2.8us | P99.9: 6.1us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3 | runner: seq_wr=214730 rand_rd=590179 cpu=123 composite=34242.5"
+          },
+          {
+            "name": "mergerandom",
+            "value": 422188.39966286067,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 628557 ops/sec | factor: 0.672 | P50: 0.3us | P99: 2.1us | P99.9: 3.6us\nthreads: 1 | elapsed: 0.32s | num: 200000 | iterations: 3 | runner: seq_wr=214730 rand_rd=590179 cpu=123 composite=34242.5"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 334017.95382902323,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 497288 ops/sec | factor: 0.672 | P50: 1.8us | P99: 5.5us | P99.9: 13.0us\nthreads: 1 | elapsed: 0.40s | num: 200000 | iterations: 3 | runner: seq_wr=214730 rand_rd=590179 cpu=123 composite=34242.5"
           }
         ]
       }
