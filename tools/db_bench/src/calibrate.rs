@@ -139,9 +139,12 @@ fn calibrate_rand_read() -> std::io::Result<f64> {
     Ok(iops)
 }
 
-/// CPU: CRC32 over 256 MiB in-memory buffer → MB/s.
+/// CPU: CRC32 over 64 MiB in-memory buffer → MB/s.
+///
+/// 64 MiB is large enough to exceed L3 cache on most runners, keeping the
+/// measurement meaningful, while completing in <1s even on slow CI hardware.
 fn calibrate_cpu() -> f64 {
-    const SIZE: usize = 256 * 1024 * 1024;
+    const SIZE: usize = 64 * 1024 * 1024;
     // Allocate and fill to ensure pages are faulted in.
     let buf = vec![0x55u8; SIZE];
 
@@ -151,7 +154,10 @@ fn calibrate_cpu() -> f64 {
     let elapsed = start.elapsed().as_secs_f64();
 
     let mb_per_sec = (SIZE as f64 / (1024.0 * 1024.0)) / elapsed;
-    eprintln!("  cpu (crc32): {SIZE} bytes in {elapsed:.3}s = {mb_per_sec:.0} MB/s");
+    eprintln!(
+        "  cpu (crc32): {} MiB in {elapsed:.3}s = {mb_per_sec:.0} MB/s",
+        SIZE / (1024 * 1024)
+    );
     mb_per_sec
 }
 

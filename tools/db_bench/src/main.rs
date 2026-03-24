@@ -229,9 +229,17 @@ fn run_single(
     let mut results: Vec<IterationResult> = Vec::with_capacity(iterations as usize);
 
     for iter in 0..iterations {
-        // Each iteration gets a fresh temp directory.
+        // Each iteration gets a fresh database so results are comparable.
+        // With --db, create per-iteration subdirectories to avoid data
+        // accumulation across iterations (fill workloads would append,
+        // read workloads would prefill on top of existing data).
         let _tmpdir;
         let db_path = match &cli.db {
+            Some(p) if iterations > 1 => {
+                let sub = p.join(format!("iter-{iter}"));
+                std::fs::create_dir_all(&sub)?;
+                sub
+            }
             Some(p) => p.clone(),
             None => {
                 _tmpdir = tempfile::tempdir()?;
@@ -261,11 +269,7 @@ fn run_single(
     }
 
     // Pick the median by ops/sec.
-    results.sort_by(|a, b| {
-        a.ops_per_sec
-            .partial_cmp(&b.ops_per_sec)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    results.sort_by(|a, b| a.ops_per_sec.total_cmp(&b.ops_per_sec));
     let median_idx = results.len() / 2;
     let median = &results[median_idx];
 
