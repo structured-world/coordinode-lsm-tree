@@ -18,11 +18,12 @@ pub mod util;
 pub mod writer;
 
 #[cfg(test)]
-#[allow(
+#[expect(
     clippy::unwrap_used,
     clippy::indexing_slicing,
     clippy::useless_vec,
-    clippy::needless_borrows_for_generic_args
+    clippy::needless_borrows_for_generic_args,
+    reason = "test code"
 )]
 mod tests;
 

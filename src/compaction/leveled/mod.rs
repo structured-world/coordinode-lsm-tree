@@ -3,11 +3,12 @@
 // (found in the LICENSE-* files in the repository)
 
 #[cfg(test)]
-#[allow(
+#[expect(
     clippy::unwrap_used,
     clippy::indexing_slicing,
     clippy::useless_vec,
-    clippy::unnecessary_map_or
+    clippy::unnecessary_map_or,
+    reason = "test code"
 )]
 mod test;
 

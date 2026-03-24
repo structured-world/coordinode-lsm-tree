@@ -109,15 +109,16 @@ pub enum Error {
 
     /// Route-compatibility mismatch on reopen.
     ///
-    /// The current [`level_routes`](crate::Config::level_routes) configuration
-    /// does not cover all table folders that were used when the tree was last
-    /// written.  Recovery found fewer tables on disk than the manifest expects,
-    /// which means some previously routed directories are no longer reachable.
+    /// Recovery found fewer tables on disk than the manifest expects, and all
+    /// missing tables are on levels not covered by any current
+    /// [`level_route`](crate::Config::level_routes).  This typically means a
+    /// previously configured route was removed, leaving its directory
+    /// unreachable.
     ///
-    /// Unlike [`Unrecoverable`](Self::Unrecoverable), this often indicates a
-    /// configuration error rather than data corruption — re-adding the missing
-    /// route(s) will typically fix it.  However, the same condition can arise
-    /// if SST files were deleted while `level_routes` is configured.
+    /// Re-adding the missing route(s) will usually resolve the error.  If
+    /// missing tables are on levels that *are* covered by a current route,
+    /// recovery returns [`Unrecoverable`](Self::Unrecoverable) instead
+    /// (the SST files were genuinely lost).
     RouteMismatch {
         /// Number of tables listed in the manifest.
         expected: usize,
