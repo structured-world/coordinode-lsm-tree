@@ -24,24 +24,24 @@ impl Workload for ReadSeq {
         // Each thread scans its own key range partition.
         run_threaded(config, reporter, |_t, my_ops, start| {
             let mut local = Reporter::new();
+            if my_ops == 0 {
+                return Ok(local);
+            }
+
             let read_seq = read_seqno(seqno);
             let mut count = 0u64;
 
             let start_key = make_sequential_key(start, config.key_size);
             let mut iter = tree.range(start_key.., read_seq, None);
 
-            loop {
+            while count < my_ops {
                 let t = Instant::now();
                 match iter.next() {
                     Some(item) => {
                         // Force full value read including blob payload (BlobTree).
                         let _ = item.value()?;
                         local.record_duration(t.elapsed());
-
                         count += 1;
-                        if count >= my_ops {
-                            break;
-                        }
                     }
                     None => {
                         break;

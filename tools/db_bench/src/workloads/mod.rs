@@ -60,9 +60,19 @@ where
     F: Fn(usize, u64, u64) -> lsm_tree::Result<Reporter> + Sync,
 {
     let (threads, base_ops, remainder) = distribute_ops(config.num, config.threads);
-    let barrier = Barrier::new(threads);
 
     reporter.start();
+
+    // Fast-path: avoid thread::scope + Barrier overhead for the default
+    // single-thread case so --threads 1 stays comparable to the prior
+    // non-threaded implementation.
+    if threads == 1 {
+        let local = thread_fn(0, config.num, 0)?;
+        reporter.merge(&local);
+        return Ok(());
+    }
+
+    let barrier = Barrier::new(threads);
 
     let scope_result: lsm_tree::Result<()> = std::thread::scope(|s| {
         let handles: Vec<_> = (0..threads)
