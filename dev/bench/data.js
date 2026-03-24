@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1774366057297,
+  "lastUpdate": 1774368996429,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -3666,6 +3666,84 @@ window.BENCHMARK_DATA = {
             "value": 447665.7997887053,
             "unit": "ops/sec",
             "extra": "P50: 2.0us | P99: 8.0us | P99.9: 13.7us\nthreads: 1 | elapsed: 0.45s | num: 200000"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "distinct": true,
+          "id": "5add112c416fab0a76ef123cf43bf93e0f8427c0",
+          "message": "ci: add CodeRabbit config with auto-labeling for PRs\n\nCodeRabbit was only auto-labeling issues but not pull requests.\nEnable auto_label via repo-level config file.",
+          "timestamp": "2026-03-24T18:14:26+02:00",
+          "tree_id": "6dcafcc52eaa0035241effad18a9358c3019f7d2",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/5add112c416fab0a76ef123cf43bf93e0f8427c0"
+        },
+        "date": 1774368995025,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 2024218.6015204028,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 2.2us | P99.9: 5.2us\nthreads: 1 | elapsed: 0.10s | num: 200000"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1307603.574216686,
+            "unit": "ops/sec",
+            "extra": "P50: 0.6us | P99: 2.0us | P99.9: 5.5us\nthreads: 1 | elapsed: 0.15s | num: 200000"
+          },
+          {
+            "name": "readrandom",
+            "value": 601827.4882869702,
+            "unit": "ops/sec",
+            "extra": "P50: 1.4us | P99: 5.4us | P99.9: 11.1us\nthreads: 1 | elapsed: 0.33s | num: 200000"
+          },
+          {
+            "name": "readseq",
+            "value": 2480753.569581119,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 4.3us | P99.9: 8.3us\nthreads: 1 | elapsed: 0.08s | num: 200000"
+          },
+          {
+            "name": "seekrandom",
+            "value": 416573.3611766524,
+            "unit": "ops/sec",
+            "extra": "P50: 2.1us | P99: 6.3us | P99.9: 12.3us\nthreads: 1 | elapsed: 0.48s | num: 200000"
+          },
+          {
+            "name": "prefixscan",
+            "value": 199235.52928940597,
+            "unit": "ops/sec",
+            "extra": "P50: 4.7us | P99: 7.1us | P99.9: 15.3us\nthreads: 1 | elapsed: 1.00s | num: 200000"
+          },
+          {
+            "name": "overwrite",
+            "value": 1222312.1321073484,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.7us | P99.9: 6.0us\nthreads: 1 | elapsed: 0.16s | num: 200000"
+          },
+          {
+            "name": "mergerandom",
+            "value": 728633.751530732,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 2.0us | P99.9: 3.5us\nthreads: 1 | elapsed: 0.27s | num: 200000"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 487870.1134225077,
+            "unit": "ops/sec",
+            "extra": "P50: 1.8us | P99: 8.0us | P99.9: 15.1us\nthreads: 1 | elapsed: 0.41s | num: 200000"
           }
         ]
       }
