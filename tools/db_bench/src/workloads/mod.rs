@@ -32,6 +32,9 @@ pub trait Workload {
 /// Thread `t` gets `base_ops + if t < remainder { 1 } else { 0 }` ops.
 /// Its global starting index is `t * base_ops + min(t, remainder)`.
 pub(crate) fn distribute_ops(total: u64, threads: usize) -> (usize, u64, u64) {
+    if total == 0 {
+        return (1, 0, 0);
+    }
     // Benchmark tool targets 64-bit; on 32-bit this caps at usize::MAX threads.
     let threads = std::cmp::min(threads.max(1), usize::try_from(total).unwrap_or(usize::MAX));
     let base = total / threads as u64;
