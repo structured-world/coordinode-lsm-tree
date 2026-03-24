@@ -406,6 +406,7 @@ impl<'a, I: Iterator<Item = Item>, F: StreamFilter + 'a> Iterator for Compaction
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::useless_vec)]
 mod tests {
     use super::*;
     use crate::{value::InternalValue, ValueType};

@@ -303,6 +303,7 @@ impl Drop for Arena {
 
 #[cfg(test)]
 #[expect(clippy::expect_used, reason = "tests use expect for brevity")]
+#[allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::useless_vec)]
 mod tests {
     use super::*;
 

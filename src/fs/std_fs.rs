@@ -311,6 +311,7 @@ mod sys {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::useless_vec)]
 mod tests {
     use super::*;
     use std::io::{Read, Write};

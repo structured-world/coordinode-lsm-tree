@@ -362,7 +362,7 @@ impl<T: Ranged> Run<T> {
 }
 
 #[cfg(test)]
-#[expect(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::useless_vec)]
 mod tests {
     use super::*;
     use test_log::test;

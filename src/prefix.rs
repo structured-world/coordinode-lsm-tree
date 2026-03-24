@@ -121,6 +121,7 @@ pub fn compute_prefix_hash(
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::useless_vec)]
 mod tests {
     use super::*;
     // Shadows std's #[test] with test_log's version for structured logging.

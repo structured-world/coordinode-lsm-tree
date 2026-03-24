@@ -3,6 +3,12 @@
 // (found in the LICENSE-* files in the repository)
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::indexing_slicing,
+    clippy::useless_vec,
+    clippy::unnecessary_map_or
+)]
 mod test;
 
 use super::{Choice, CompactionStrategy, Input as CompactionInput};

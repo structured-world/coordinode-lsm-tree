@@ -1626,6 +1626,21 @@ impl Tree {
         }
 
         if tables.len() < cnt {
+            if config.level_routes.is_some() {
+                log::error!(
+                    "Route mismatch: expected {} tables but found {} — \
+                     level_routes may not cover all previously used folders. \
+                     Missing table IDs: {:?}",
+                    cnt,
+                    tables.len(),
+                    table_map.keys(),
+                );
+                return Err(crate::Error::RouteMismatch {
+                    expected: cnt,
+                    found: tables.len(),
+                });
+            }
+
             log::error!(
                 "Recovered less tables than expected: {:?}",
                 table_map.keys(),

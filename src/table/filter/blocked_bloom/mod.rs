@@ -37,6 +37,14 @@ pub struct BlockedBloomFilterReader<'a> {
 }
 
 impl<'a> BlockedBloomFilterReader<'a> {
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "bloom filter metadata (num_blocks, k, offset) always fits in usize"
+    )]
+    #[expect(
+        clippy::expect_used,
+        reason = "offset is always within slice bounds after reading the fixed-size header"
+    )]
     pub fn new(slice: &'a [u8]) -> crate::Result<Self> {
         let mut reader = Cursor::new(slice);
 
@@ -74,20 +82,14 @@ impl<'a> BlockedBloomFilterReader<'a> {
         })
     }
 
-    fn bytes(&self) -> &[u8] {
-        self.inner.bytes()
-    }
-
-    /// Size of bloom filter in bytes
-    #[must_use]
-    fn len(&self) -> usize {
-        self.inner.bytes().len()
-    }
-
     /// Returns `true` if the hash may be contained.
     ///
     /// Will never have a false negative.
     #[must_use]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "block_idx and bit_idx are bounded by filter dimensions which fit in usize"
+    )]
     pub fn contains_hash(&self, mut h1: u64) -> bool {
         let mut h2 = secondary_hash(h1);
 

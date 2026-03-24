@@ -649,6 +649,49 @@ fn recovery_creates_missing_routed_tables_dir() -> lsm_tree::Result<()> {
 }
 
 #[test]
+fn reopen_missing_route_returns_route_mismatch() -> lsm_tree::Result<()> {
+    let dir = tempfile::tempdir()?;
+
+    // Phase 1: write data with hot tier at L0-L1
+    {
+        let config = three_tier_config(dir.path());
+        let tree = config.open()?;
+
+        tree.insert("a", "value_a", 0);
+        tree.insert("b", "value_b", 1);
+        tree.flush_active_memtable(0)?;
+        // Tables now live in the hot tier directory
+    }
+
+    // Phase 2: reopen WITHOUT the hot tier route — tables are unreachable
+    {
+        let config = Config::new(
+            dir.path().join("primary"),
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .level_routes(vec![
+            // Only warm tier; hot tier (0..2) is missing
+            LevelRoute {
+                levels: 2..5,
+                path: dir.path().join("warm"),
+                fs: Arc::new(StdFs),
+            },
+        ]);
+
+        match config.open() {
+            Err(lsm_tree::Error::RouteMismatch { expected, found }) => {
+                assert!(expected > found, "expected={expected} found={found}");
+            }
+            Err(e) => panic!("expected RouteMismatch, got: {e:?}"),
+            Ok(_) => panic!("expected RouteMismatch error, but open succeeded"),
+        }
+    }
+
+    Ok(())
+}
+
+#[test]
 #[should_panic(expected = "empty or inverted level route range")]
 fn empty_range_panics() {
     let _config = Config::new(

@@ -53,6 +53,12 @@ impl Builder {
 
     /// Constructs a bloom filter that can hold `n` items
     /// while maintaining a certain false positive rate `fpr`.
+    #[expect(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "truncation and precision loss are fine because this is a probabilistic filter sizing"
+    )]
     #[must_use]
     pub fn with_fp_rate(n: usize, fpr: f32) -> Self {
         use std::f32::consts::LN_2;
@@ -88,6 +94,12 @@ impl Builder {
     /// with `bpk` bits per key.
     ///
     /// 10 bits per key is a sensible default.
+    #[expect(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "truncation and precision loss are fine because this is a probabilistic filter sizing"
+    )]
     #[must_use]
     pub fn with_bpk(n: usize, bpk: u8) -> Self {
         use std::f32::consts::LN_2;
@@ -109,6 +121,12 @@ impl Builder {
         }
     }
 
+    #[expect(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "truncation and precision loss are fine because this is a probabilistic filter sizing"
+    )]
     fn calculate_m(n: usize, fp_rate: f32) -> usize {
         use std::f32::consts::LN_2;
 

@@ -324,6 +324,7 @@ impl<I: DoubleEndedIterator<Item = crate::Result<InternalValue>>> DoubleEndedIte
 
 #[cfg(test)]
 #[expect(clippy::string_lit_as_bytes)]
+#[allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::useless_vec)]
 mod tests {
     use super::*;
     use crate::{value::InternalValue, ValueType};

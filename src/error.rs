@@ -106,6 +106,23 @@ pub enum Error {
         /// (captured before reading bytes for that field).
         offset: u64,
     },
+
+    /// Route-compatibility mismatch on reopen.
+    ///
+    /// The current [`level_routes`](crate::Config::level_routes) configuration
+    /// does not cover all table folders that were used when the tree was last
+    /// written.  Recovery found fewer tables on disk than the manifest expects,
+    /// which means some previously routed directories are no longer reachable.
+    ///
+    /// Unlike [`Unrecoverable`](Self::Unrecoverable), this is a configuration
+    /// error, not data corruption — re-adding the missing route(s) will fix it.
+    RouteMismatch {
+        /// Number of tables listed in the manifest.
+        expected: usize,
+
+        /// Number of tables actually found across all configured routes.
+        found: usize,
+    },
 }
 
 impl std::fmt::Display for Error {
