@@ -692,6 +692,52 @@ fn reopen_missing_route_returns_route_mismatch() -> lsm_tree::Result<()> {
 }
 
 #[test]
+fn missing_table_without_routes_returns_unrecoverable() -> lsm_tree::Result<()> {
+    let dir = tempfile::tempdir()?;
+
+    // Phase 1: write data without level_routes
+    {
+        let config = Config::new(
+            dir.path().join("primary"),
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        );
+        let tree = config.open()?;
+
+        tree.insert("a", "value_a", 0);
+        tree.insert("b", "value_b", 1);
+        tree.flush_active_memtable(0)?;
+    }
+
+    // Phase 2: delete a table file to simulate corruption
+    let tables_dir = dir.path().join("primary").join("tables");
+    for entry in std::fs::read_dir(&tables_dir)? {
+        let entry = entry?;
+        if entry.file_type()?.is_file() {
+            std::fs::remove_file(entry.path())?;
+            break; // remove just one
+        }
+    }
+
+    // Phase 3: reopen without routes — should get Unrecoverable, not RouteMismatch
+    {
+        let config = Config::new(
+            dir.path().join("primary"),
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        );
+
+        match config.open() {
+            Err(lsm_tree::Error::Unrecoverable) => {}
+            Err(e) => panic!("expected Unrecoverable, got: {e:?}"),
+            Ok(_) => panic!("expected Unrecoverable error, but open succeeded"),
+        }
+    }
+
+    Ok(())
+}
+
+#[test]
 #[should_panic(expected = "empty or inverted level route range")]
 fn empty_range_panics() {
     let _config = Config::new(
