@@ -363,35 +363,31 @@ fn empty_routes_normalizes_to_none() {
     assert!(config.level_routes.is_none());
 }
 
-// all_tables_folders deduplicates when a route shares both path AND Fs with primary.
+// all_tables_folders deduplicates routes with the same path.
 #[test]
-fn all_tables_folders_dedup_same_path_and_fs() {
+fn all_tables_folders_dedup_same_path_routes() {
     let dir = tempfile::tempdir().unwrap();
-    let primary = dir.path().join("db");
-    let shared_fs: Arc<dyn lsm_tree::fs::Fs> = Arc::new(StdFs);
 
-    let mut config = Config::new(
-        &primary,
+    let config = Config::new(
+        dir.path().join("db"),
         SequenceNumberCounter::default(),
         SequenceNumberCounter::default(),
-    );
-    // Inject same Arc so ptr_eq matches
-    config.fs = Arc::new(StdFs); // primary gets its own
-    let config = config.level_routes(vec![
+    )
+    .level_routes(vec![
         LevelRoute {
             levels: 0..2,
             path: dir.path().join("other"),
-            fs: shared_fs.clone(),
+            fs: Arc::new(StdFs),
         },
         LevelRoute {
             levels: 2..5,
-            path: dir.path().join("other"), // same path + same Arc
-            fs: shared_fs,
+            path: dir.path().join("other"), // same path as above
+            fs: Arc::new(StdFs),
         },
     ]);
 
     let folders = config.all_tables_folders();
-    // primary + other = 2 (second "other" deduplicated by path+fs)
+    // primary + other = 2 (second "other" deduplicated by path)
     assert_eq!(folders.len(), 2);
 }
 
@@ -650,6 +646,21 @@ fn recovery_creates_missing_routed_tables_dir() -> lsm_tree::Result<()> {
     }
 
     Ok(())
+}
+
+#[test]
+#[should_panic(expected = "empty or inverted level route range")]
+fn empty_range_panics() {
+    let _config = Config::new(
+        "/tmp/test",
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .level_routes(vec![LevelRoute {
+        levels: 3..3, // empty
+        path: "/a".into(),
+        fs: Arc::new(StdFs),
+    }]);
 }
 
 #[test]

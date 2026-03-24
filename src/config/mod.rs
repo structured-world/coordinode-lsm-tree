@@ -594,9 +594,19 @@ impl<F: Fs> Config<F> {
     ///
     /// # Panics
     ///
-    /// Panics if any two routes have overlapping level ranges.
+    /// Panics if any route has an empty range or if any two routes have
+    /// overlapping level ranges.
     #[must_use]
     pub fn level_routes(mut self, routes: Vec<LevelRoute>) -> Self {
+        // Validate no empty/inverted ranges
+        for route in &routes {
+            assert!(
+                route.levels.start < route.levels.end,
+                "empty or inverted level route range: {:?}",
+                route.levels,
+            );
+        }
+
         // Validate no overlapping ranges
         for (i, a) in routes.iter().enumerate() {
             for b in routes.iter().skip(i + 1) {

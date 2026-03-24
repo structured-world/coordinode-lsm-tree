@@ -123,26 +123,17 @@ pub fn do_compaction(opts: &Options) -> crate::Result<CompactionResult> {
             if opts.config.level_routes.is_some() {
                 let (dst_folder, _) = opts.config.tables_folder_for_level(payload.dest_level);
                 let version = &version_history_lock.latest_version().version;
-                let cross_device = 'check: {
-                    for (level_idx, level) in version.iter_levels().enumerate() {
-                        #[expect(
-                            clippy::cast_possible_truncation,
-                            reason = "level index is always < 256"
-                        )]
-                        let (src_folder, _) = opts.config.tables_folder_for_level(level_idx as u8);
-                        if src_folder == dst_folder {
-                            continue;
-                        }
-                        for run in level.iter() {
-                            if run.iter().any(|t| payload.table_ids.contains(&t.id())) {
-                                break 'check true;
-                            }
-                        }
-                    }
-                    false
-                };
-                if cross_device {
-                    log::debug!("Converting trivial move to merge: cross-device level routing");
+                // Check actual on-disk table paths (not configured routing) to
+                // handle tables that may have been recovered from a different
+                // tier after route reconfiguration.
+                let cross_folder = version
+                    .iter_levels()
+                    .flat_map(|level| level.iter())
+                    .flat_map(|run| run.iter())
+                    .filter(|t| payload.table_ids.contains(&t.id()))
+                    .any(|t| t.path.parent() != Some(dst_folder.as_path()));
+                if cross_folder {
+                    log::debug!("Converting trivial move to merge: cross-folder level routing");
                     return merge_tables(compaction_state, version_history_lock, opts, &payload);
                 }
             }
