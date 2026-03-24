@@ -794,24 +794,42 @@ fn deleted_sst_with_routes_configured_returns_unrecoverable() -> lsm_tree::Resul
 
 #[test]
 fn mixed_missing_covered_and_uncovered_returns_unrecoverable() -> lsm_tree::Result<()> {
+    use lsm_tree::compaction::PullDown;
+
     let dir = tempfile::tempdir()?;
 
-    // Phase 1: write data with 3-tier config, flush twice to get tables in hot tier
+    // Phase 1: create tables at DIFFERENT levels:
+    // - Compact one table to L3 (warm tier, 2..5)
+    // - Leave one table at L0 (hot tier, 0..2)
     {
         let config = three_tier_config(dir.path());
         let tree = config.open()?;
 
+        // First write → flush to L0 → compact to L3 (warm tier)
         tree.insert("a", "value_a", 0);
         tree.flush_active_memtable(0)?;
+        tree.compact(Arc::new(PullDown(0, 3)), 1)?;
 
-        tree.insert("b", "value_b", 1);
+        // Second write → flush to L0 (stays in hot tier)
+        tree.insert("b", "value_b", 2);
         tree.flush_active_memtable(0)?;
     }
 
-    // Phase 2: delete a table from hot tier (covered by route 0..2)
-    let hot_tables_dir = dir.path().join("hot").join("tables");
+    // Verify: warm tier has tables, hot tier has tables
+    let warm_tables = dir.path().join("warm").join("tables");
+    let hot_tables = dir.path().join("hot").join("tables");
+    assert!(
+        std::fs::read_dir(&warm_tables)?.count() > 0,
+        "warm tier should have at least one table"
+    );
+    assert!(
+        std::fs::read_dir(&hot_tables)?.count() > 0,
+        "hot tier should have at least one table"
+    );
+
+    // Phase 2: delete a table from warm tier (covered by warm route 2..5)
     let mut deleted = false;
-    for entry in std::fs::read_dir(&hot_tables_dir)? {
+    for entry in std::fs::read_dir(&warm_tables)? {
         let entry = entry?;
         if entry.file_type()?.is_file() {
             std::fs::remove_file(entry.path())?;
@@ -819,21 +837,21 @@ fn mixed_missing_covered_and_uncovered_returns_unrecoverable() -> lsm_tree::Resu
             break;
         }
     }
-    assert!(deleted, "expected to delete at least one table file");
+    assert!(deleted, "expected to delete at least one warm table");
 
-    // Phase 3: reopen WITHOUT warm route (2..5 removed) but WITH hot route (0..2)
-    // One table missing from covered level (deleted) + warm route removed.
-    // Since at least one missing table is on a covered level → Unrecoverable.
+    // Phase 3: reopen WITHOUT hot route (0..2 removed), WITH warm route (2..5)
+    // - Warm table deleted → missing on covered level (corruption)
+    // - Hot table unreachable → missing on uncovered level (route mismatch)
+    // Mixed: at least one on a covered level → Unrecoverable
     {
-        let hot = dir.path().join("hot");
         let config = Config::new(
             dir.path().join("primary"),
             SequenceNumberCounter::default(),
             SequenceNumberCounter::default(),
         )
         .level_routes(vec![LevelRoute {
-            levels: 0..2,
-            path: hot,
+            levels: 2..5,
+            path: dir.path().join("warm"),
             fs: Arc::new(StdFs),
         }]);
 
