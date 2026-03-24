@@ -111,7 +111,7 @@ pub enum Error {
     ///
     /// Recovery found fewer tables on disk than the manifest expects, and all
     /// missing tables are on levels not covered by any current
-    /// [`level_route`](crate::Config::level_routes).  This typically means a
+    /// [`level_routes`](crate::Config::level_routes).  This typically means a
     /// previously configured route was removed, leaving its directory
     /// unreachable.
     ///

@@ -1,4 +1,5 @@
 use criterion::{criterion_group, criterion_main, Criterion};
+// Guard trait import required for .into_inner() on IterGuardImpl
 use lsm_tree::{AbstractTree, Cache, Config, Guard, SeqNo, SequenceNumberCounter};
 use std::sync::Arc;
 use tempfile::tempdir;

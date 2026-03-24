@@ -1648,17 +1648,17 @@ impl Tree {
                     .all(|(level, _, _)| !routes.iter().any(|r| r.levels.contains(level)));
 
                 if all_missing_uncovered {
+                    let found = tables.len();
+                    let missing_ids: Vec<_> = table_map.keys().collect();
+
                     log::error!(
-                        "Route mismatch: expected {} tables but found {} — \
+                        "Route mismatch: expected {cnt} tables but found {found} — \
                          level_routes do not cover all previously used levels. \
-                         Missing table IDs: {:?}",
-                        cnt,
-                        tables.len(),
-                        table_map.keys(),
+                         Missing table IDs: {missing_ids:?}",
                     );
                     return Err(crate::Error::RouteMismatch {
                         expected: cnt,
-                        found: tables.len(),
+                        found,
                     });
                 }
             }
