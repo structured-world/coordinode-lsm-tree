@@ -793,6 +793,67 @@ fn deleted_sst_with_routes_configured_returns_unrecoverable() -> lsm_tree::Resul
 }
 
 #[test]
+fn mixed_missing_covered_and_uncovered_returns_unrecoverable() -> lsm_tree::Result<()> {
+    let dir = tempfile::tempdir()?;
+
+    // Phase 1: write data with 3-tier config, flush twice to get tables in hot tier
+    {
+        let config = three_tier_config(dir.path());
+        let tree = config.open()?;
+
+        tree.insert("a", "value_a", 0);
+        tree.flush_active_memtable(0)?;
+
+        tree.insert("b", "value_b", 1);
+        tree.flush_active_memtable(0)?;
+    }
+
+    // Phase 2: delete a table from hot tier (covered by route 0..2)
+    let hot_tables_dir = dir.path().join("hot").join("tables");
+    let mut deleted = false;
+    for entry in std::fs::read_dir(&hot_tables_dir)? {
+        let entry = entry?;
+        if entry.file_type()?.is_file() {
+            std::fs::remove_file(entry.path())?;
+            deleted = true;
+            break;
+        }
+    }
+    assert!(deleted, "expected to delete at least one table file");
+
+    // Phase 3: reopen WITHOUT warm route (2..5 removed) but WITH hot route (0..2)
+    // One table missing from covered level (deleted) + warm route removed.
+    // Since at least one missing table is on a covered level → Unrecoverable.
+    {
+        let hot = dir.path().join("hot");
+        let config = Config::new(
+            dir.path().join("primary"),
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .level_routes(vec![LevelRoute {
+            levels: 0..2,
+            path: hot,
+            fs: Arc::new(StdFs),
+        }]);
+
+        match config.open() {
+            Err(lsm_tree::Error::Unrecoverable) => {}
+            Err(lsm_tree::Error::RouteMismatch { expected, found }) => {
+                panic!(
+                    "BUG: got RouteMismatch(expected={expected}, found={found}) \
+                     but at least one missing table is on a covered level"
+                );
+            }
+            Err(e) => panic!("expected Unrecoverable, got: {e:?}"),
+            Ok(_) => panic!("expected error, but open succeeded"),
+        }
+    }
+
+    Ok(())
+}
+
+#[test]
 #[should_panic(expected = "empty or inverted level route range")]
 fn empty_range_panics() {
     let _config = Config::new(
