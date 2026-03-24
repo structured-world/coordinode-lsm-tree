@@ -41,10 +41,6 @@ impl<'a> BlockedBloomFilterReader<'a> {
         clippy::cast_possible_truncation,
         reason = "bloom filter metadata (num_blocks, k, offset) always fits in usize"
     )]
-    #[expect(
-        clippy::expect_used,
-        reason = "offset is always within slice bounds after reading the fixed-size header"
-    )]
     pub fn new(slice: &'a [u8]) -> crate::Result<Self> {
         let mut reader = Cursor::new(slice);
 
@@ -59,26 +55,33 @@ impl<'a> BlockedBloomFilterReader<'a> {
         // NOTE: Filter type
         let filter_type = reader.read_u8()?;
         let filter_type = FilterType::try_from(filter_type)?;
-        assert_eq!(
-            FilterType::BlockedBloom,
-            filter_type,
-            "Invalid filter type, got={filter_type:?}, expected={:?}",
-            FilterType::BlockedBloom,
-        );
+        if filter_type != FilterType::BlockedBloom {
+            return Err(crate::Error::InvalidHeader(
+                "BloomFilter: wrong filter type",
+            ));
+        }
 
-        // NOTE: Hash type (unused)
+        // NOTE: Hash type (unused, must be 0)
         let hash_type = reader.read_u8()?;
-        assert_eq!(0, hash_type, "Invalid bloom hash type");
+        if hash_type != 0 {
+            return Err(crate::Error::InvalidHeader(
+                "BloomFilter: invalid hash type",
+            ));
+        }
 
         let num_blocks = reader.read_u64::<LittleEndian>()? as usize;
         let k = reader.read_u64::<LittleEndian>()? as usize;
 
         let offset = reader.position() as usize;
 
+        let data = slice
+            .get(offset..)
+            .ok_or(crate::Error::InvalidHeader("BloomFilter: truncated data"))?;
+
         Ok(Self {
             k,
             num_blocks,
-            inner: BitArrayReader::new(slice.get(offset..).expect("should be in bounds")),
+            inner: BitArrayReader::new(data),
         })
     }
 
@@ -191,5 +194,53 @@ mod tests {
         assert!(!filter.contains(b"asdasdasdasdasdasdasd"));
 
         Ok(())
+    }
+
+    #[test]
+    fn corrupted_filter_type_returns_error() {
+        // Build a valid filter, then corrupt the filter-type byte
+        let mut filter = Builder::with_fp_rate(10, 0.0001);
+        for i in 0..10u8 {
+            filter.set_with_hash(Builder::get_hash(&[i]));
+        }
+        let mut bytes = filter.build();
+
+        // Filter type byte is right after MAGIC_BYTES (4 bytes)
+        // Set it to StandardBloom (0) instead of BlockedBloom (1)
+        bytes[crate::file::MAGIC_BYTES.len()] = 0;
+
+        let result = BlockedBloomFilterReader::new(&bytes);
+        assert!(
+            result.is_err(),
+            "wrong filter type should return error, not panic"
+        );
+    }
+
+    #[test]
+    fn corrupted_hash_type_returns_error() {
+        let mut filter = Builder::with_fp_rate(10, 0.0001);
+        for i in 0..10u8 {
+            filter.set_with_hash(Builder::get_hash(&[i]));
+        }
+        let mut bytes = filter.build();
+
+        // Hash type byte is after MAGIC_BYTES + filter_type (1 byte)
+        bytes[crate::file::MAGIC_BYTES.len() + 1] = 99;
+
+        let result = BlockedBloomFilterReader::new(&bytes);
+        assert!(
+            result.is_err(),
+            "invalid hash type should return error, not panic"
+        );
+    }
+
+    #[test]
+    fn truncated_filter_returns_error() {
+        // Provide only the magic bytes — not enough data for the full header
+        let result = BlockedBloomFilterReader::new(&crate::file::MAGIC_BYTES);
+        assert!(
+            result.is_err(),
+            "truncated input should return error, not panic"
+        );
     }
 }
