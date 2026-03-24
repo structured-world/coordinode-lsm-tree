@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1774320707637,
+  "lastUpdate": 1774321016679,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -2964,6 +2964,84 @@ window.BENCHMARK_DATA = {
             "value": 469996.632286131,
             "unit": "ops/sec",
             "extra": "P50: 1.8us | P99: 9.7us | P99.9: 16.4us\nthreads: 1 | elapsed: 0.43s | num: 200000"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "863d14341ed4ae5f8bb8b0684cdbe4fc09c3962a",
+          "message": "feat(fs): io_uring Fs implementation for high-throughput I/O (#106)\n\n## Summary\n\n- `IoUringFs` implementing the object-safe `dyn Fs` trait with dedicated\nI/O thread and opportunistic SQE batching\n- `IoUringFile` implementing `dyn FsFile` — routes read/write/fsync\nthrough the ring; cold-path ops (mkdir, stat, rename) delegate to\n`std::fs`\n- `read_at` provides fill-or-EOF semantics with internal EINTR retry,\nmatching the `FsFile` trait contract\n- Runtime probe `is_io_uring_available()` for graceful fallback\n- Feature-gated: `io-uring = [\"dep:io-uring\"]`, Linux-only target\ndependency\n- 21 tests including concurrent `read_at` from 10 threads and edge-case\ncoverage\n\n## Design Decisions\n\n- **No libc dependency for errno constants** — values like `EINTR (4)`\nand `EIO (5)` are inlined with comments, consistent with `StdFs` which\nuses raw FFI for `flock` without importing libc\n- **Oversized buffers rejected with `InvalidInput`** — SQE length is\n`u32` but CQE result is `i32`, so buffers exceeding `i32::MAX` are\nrejected via `i32::try_from(buf.len())?.unsigned_abs()`. In practice LSM\nblock I/O is 4-64 KB\n- **Fatal ring error aborts the process** — if `submit_and_wait` fails\n(non-EINTR), previously submitted SQEs may still reference caller\nbuffers. `std::process::abort()` is the only sound option\n- **Ring thread panic aborts via `catch_unwind`** — if `event_loop`\npanics after submitting SQEs, those SQEs still reference caller buffers.\n`pending` map is wrapped in `ManuallyDrop` so SyncSenders survive stack\nunwinding, keeping callers blocked. `catch_unwind` + `abort` then kills\nthe process before any buffer can be freed\n- **Append mode uses `is_append` flag** — writes always query\n`file.metadata()?.len()` for the current EOF, ignoring the seek cursor.\nThis matches O_APPEND semantics since io_uring uses explicit offsets\n- **SQ full uses backpressure, not error** — when the submission queue\nis full, `enqueue` calls `submit_and_wait(1)` to drain a completion and\nretries the push. Since the Fs API is synchronous, callers are already\nblocking; backpressure is natural\n- **`AtomicU64` for cursor** — could be plain `u64` (already `Sync`),\nkept for interior-mutability pattern consistency and potential future\nshared cursor access\n- **Mutex on send_and_wait hot path** — guards `Option<SyncSender>` for\nclean shutdown. Lock held only for `send()` duration (~ns), negligible\nvs I/O latency (~µs) Submission channel is bounded to ring capacity\n(sync_channel) for natural backpressure\n- **FxHash for pending map** — uses `crate::HashMap` (FxBuildHasher) for\nreduced hashing overhead on the I/O thread hot path\n- **Seek positions may exceed `i64::MAX`** — matches\n`std::fs::File::seek` behavior; kernel rejects out-of-range offsets at\nthe actual I/O syscall\n- **Ring-thread error paths excluded from coverage** — `event_loop`,\n`enqueue`, and `Drop` contain error recovery (EINTR, SQ overflow, fatal\nring failure, mutex poisoning) that requires kernel fault injection to\nexercise\n\n## Test Plan\n\n- [x] `cargo check` — clean build without `io-uring` feature\n(macOS/Windows)\n- [x] `cargo test --lib` — all existing tests pass (no regressions)\n- [x] `cargo test --lib --features io-uring` — 21 io_uring tests\n(requires Linux 5.6+)\n- [x] Edge cases: empty buffers, seek overflow/underflow, sync_directory\nvalidation, Debug impl\n- [ ] Benchmark: compaction throughput StdFs vs IoUringFs on NVMe\n\nCloses #77",
+          "timestamp": "2026-03-24T04:55:49+02:00",
+          "tree_id": "6c104e08fd3ef2eb5962674f65f4bdc5dae7483d",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/863d14341ed4ae5f8bb8b0684cdbe4fc09c3962a"
+        },
+        "date": 1774321015763,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 1954712.019999206,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 2.3us | P99.9: 5.3us\nthreads: 1 | elapsed: 0.10s | num: 200000"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1270048.4772423569,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 1.7us | P99.9: 5.3us\nthreads: 1 | elapsed: 0.16s | num: 200000"
+          },
+          {
+            "name": "readrandom",
+            "value": 627668.8774890621,
+            "unit": "ops/sec",
+            "extra": "P50: 1.4us | P99: 5.4us | P99.9: 11.3us\nthreads: 1 | elapsed: 0.32s | num: 200000"
+          },
+          {
+            "name": "readseq",
+            "value": 2510193.1097834837,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 4.2us | P99.9: 8.2us\nthreads: 1 | elapsed: 0.08s | num: 200000"
+          },
+          {
+            "name": "seekrandom",
+            "value": 412113.073062855,
+            "unit": "ops/sec",
+            "extra": "P50: 2.1us | P99: 6.2us | P99.9: 12.5us\nthreads: 1 | elapsed: 0.49s | num: 200000"
+          },
+          {
+            "name": "prefixscan",
+            "value": 204120.06387880247,
+            "unit": "ops/sec",
+            "extra": "P50: 4.6us | P99: 6.3us | P99.9: 14.9us\nthreads: 1 | elapsed: 0.98s | num: 200000"
+          },
+          {
+            "name": "overwrite",
+            "value": 1205322.477459837,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.7us | P99.9: 5.9us\nthreads: 1 | elapsed: 0.17s | num: 200000"
+          },
+          {
+            "name": "mergerandom",
+            "value": 682782.9922047656,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 2.1us | P99.9: 3.2us\nthreads: 1 | elapsed: 0.29s | num: 200000"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 519882.7183058823,
+            "unit": "ops/sec",
+            "extra": "P50: 1.6us | P99: 7.8us | P99.9: 13.3us\nthreads: 1 | elapsed: 0.38s | num: 200000"
           }
         ]
       }
