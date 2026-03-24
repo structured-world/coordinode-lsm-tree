@@ -115,8 +115,11 @@ pub fn do_compaction(opts: &Options) -> crate::Result<CompactionResult> {
             merge_tables(compaction_state, version_history_lock, opts, &payload)
         }
         Choice::Move(payload) => {
-            // Cross-device trivial moves are not possible — the file must be
-            // rewritten to end up on the correct storage tier. Convert to merge.
+            // Cross-folder trivial moves are not possible — the file must be
+            // rewritten to end up in the correct storage tier directory.
+            // This applies even when both folders are on the same filesystem,
+            // because rename() across tiered paths would break the routing
+            // invariant (table path = f(level)).
             if opts.config.level_routes.is_some() {
                 let (dst_folder, _) = opts.config.tables_folder_for_level(payload.dest_level);
                 let version = &version_history_lock.latest_version().version;

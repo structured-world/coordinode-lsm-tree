@@ -76,6 +76,15 @@ pub struct LevelRoute {
     pub fs: Arc<dyn Fs>,
 }
 
+impl std::fmt::Debug for LevelRoute {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LevelRoute")
+            .field("levels", &self.levels)
+            .field("path", &self.path)
+            .finish_non_exhaustive()
+    }
+}
+
 /// LSM-tree type
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum TreeType {
@@ -569,6 +578,14 @@ impl<F: Fs> Config<F> {
     /// Each [`LevelRoute`] maps a range of LSM levels to a base directory
     /// and filesystem backend. Levels not covered by any route fall back to
     /// the primary `path` and `fs`.
+    ///
+    /// # Reopen contract
+    ///
+    /// The route configuration is **not persisted** in the manifest.
+    /// A tree must be reopened with the same `level_routes` that were used
+    /// when it was created. Reopening with different routes will cause
+    /// recovery to fail (`Unrecoverable`) because routed SST files will
+    /// not be found in the expected directories.
     ///
     /// # Panics
     ///

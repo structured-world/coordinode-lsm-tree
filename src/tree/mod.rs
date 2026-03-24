@@ -1449,12 +1449,17 @@ impl Tree {
         (*config.fs).create_dir_all(&path)?;
 
         // Create tables directories for all configured paths (primary + routes).
+        // Fsync both the tables dir AND its parent to make the directory entry
+        // durable on POSIX (crash between mkdir and parent fsync loses the entry).
         for (table_folder_path, folder_fs) in config.all_tables_folders() {
-            folder_fs.create_dir_all(&table_folder_path)?;
-            fsync_directory(&table_folder_path, &*folder_fs)?;
+            if let Some(parent) = table_folder_path.parent() {
+                folder_fs.create_dir_all(&table_folder_path)?;
+                fsync_directory(&table_folder_path, &*folder_fs)?;
+                fsync_directory(parent, &*folder_fs)?;
+            }
         }
 
-        // IMPORTANT: fsync folders on Unix
+        // IMPORTANT: fsync primary folder on Unix
         fsync_directory(&path, &*config.fs)?;
 
         let inner = TreeInner::create_new(config)?;
@@ -1530,6 +1535,9 @@ impl Tree {
             if !folder_fs.exists(table_base_folder)? {
                 folder_fs.create_dir_all(table_base_folder)?;
                 fsync_directory(table_base_folder, &**folder_fs)?;
+                if let Some(parent) = table_base_folder.parent() {
+                    fsync_directory(parent, &**folder_fs)?;
+                }
             }
 
             for dirent in folder_fs.read_dir(table_base_folder)? {
@@ -1550,7 +1558,13 @@ impl Tree {
                 }
 
                 let table_file_name = &file_name;
-                assert!(!is_dir);
+                if is_dir {
+                    log::warn!(
+                        "Skipping unexpected directory in tables folder: {}",
+                        table_file_path.display()
+                    );
+                    continue;
+                }
 
                 let table_id = table_file_name.parse::<TableId>().map_err(|e| {
                     log::error!("invalid table file name {table_file_name:?}: {e:?}");
