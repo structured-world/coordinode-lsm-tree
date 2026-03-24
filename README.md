@@ -9,7 +9,7 @@
 [![docs.rs](https://img.shields.io/docsrs/coordinode-lsm-tree?color=green)](https://docs.rs/coordinode-lsm-tree)
 ![MSRV](https://img.shields.io/badge/MSRV-1.90.0-blue)
 [![dependency status](https://deps.rs/repo/github/structured-world/coordinode-lsm-tree/status.svg)](https://deps.rs/repo/github/structured-world/coordinode-lsm-tree)
-![License](https://img.shields.io/badge/license-Apache--2.0-blue)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue)](#license)
 
 > LSM-tree engine for [CoordiNode](https://github.com/structured-world/coordinode), maintained by [Structured World Foundation](https://sw.foundation).
 > Derivative work of [fjall-rs/lsm-tree](https://github.com/fjall-rs/lsm-tree), developed independently with diverging features: zstd dictionary compression, custom sequence number generators, batch get, intra-L0 compaction, and security hardening.
@@ -84,8 +84,8 @@ Uses [`bytes`](https://github.com/tokio-rs/bytes) as the underlying `Slice` type
 
 ## Benchmarks
 
-Continuous benchmarks run on every merge to `main`. Results are published to the
-[benchmark dashboard](https://structured-world.github.io/coordinode-lsm-tree/dev/bench/).
+Benchmarks run on every push to `main` and on pull requests. Results from `main`
+are published to the [benchmark dashboard](https://structured-world.github.io/coordinode-lsm-tree/dev/bench/).
 PRs that regress performance by >15% trigger an alert; >25% regression fails CI.
 
 To run benchmarks locally:
