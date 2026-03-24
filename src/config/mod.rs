@@ -23,6 +23,7 @@ use crate::{
     compaction::filter::Factory,
     comparator::{self, SharedComparator},
     encryption::EncryptionProvider,
+    file::TABLES_FOLDER,
     fs::{Fs, StdFs},
     merge_operator::MergeOperator,
     path::absolute_path,
@@ -32,9 +33,48 @@ use crate::{
     SharedSequenceNumberGenerator, Tree,
 };
 use std::{
+    ops::Range,
     path::{Path, PathBuf},
     sync::Arc,
 };
+
+/// Per-level filesystem routing entry for tiered storage.
+///
+/// Maps a range of LSM levels to a base directory and filesystem backend.
+/// Tables at these levels are stored under `path/tables/`.
+///
+/// # Example
+///
+/// ```
+/// use lsm_tree::config::LevelRoute;
+/// use lsm_tree::fs::StdFs;
+/// use std::sync::Arc;
+///
+/// // Hot tier: L0-L1 on NVMe
+/// let hot = LevelRoute {
+///     levels: 0..2,
+///     path: "/mnt/nvme/db".into(),
+///     fs: Arc::new(StdFs),
+/// };
+///
+/// // Cold tier: L4-L6 on HDD
+/// let cold = LevelRoute {
+///     levels: 4..7,
+///     path: "/mnt/hdd/db".into(),
+///     fs: Arc::new(StdFs),
+/// };
+/// ```
+#[derive(Clone)]
+pub struct LevelRoute {
+    /// LSM levels this route covers (e.g., `0..2` for L0–L1).
+    pub levels: Range<u8>,
+
+    /// Base data directory for tables at these levels.
+    pub path: PathBuf,
+
+    /// Filesystem backend for I/O at these levels.
+    pub fs: Arc<dyn Fs>,
+}
 
 /// LSM-tree type
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -184,6 +224,17 @@ pub struct Config<F: Fs = StdFs> {
     #[doc(hidden)]
     pub fs: Arc<F>,
 
+    /// Per-level filesystem routing for tiered storage.
+    ///
+    /// When set, tables at different LSM levels can be stored on different
+    /// storage devices (e.g., NVMe for L0–L1, SSD for L2–L4, HDD for L5–L6).
+    /// Each entry maps a range of levels to a base directory and filesystem
+    /// backend. Uncovered levels fall back to the primary `path` and `fs`.
+    ///
+    /// Zero overhead when `None` — a single branch check, no allocations.
+    #[doc(hidden)]
+    pub level_routes: Option<Vec<LevelRoute>>,
+
     /// Block cache to use
     #[doc(hidden)]
     pub cache: Arc<Cache>,
@@ -308,6 +359,7 @@ impl Default for Config {
         Self {
             path: absolute_path(Path::new(DEFAULT_FILE_FOLDER)),
             fs: Arc::new(StdFs),
+            level_routes: None,
             descriptor_table: Some(Arc::new(DescriptorTable::new(256))),
             seqno: SharedSequenceNumberGenerator::from(SequenceNumberCounter::default()),
             visible_seqno: SharedSequenceNumberGenerator::from(SequenceNumberCounter::default()),
@@ -472,6 +524,74 @@ impl Config {
 }
 
 impl<F: Fs> Config<F> {
+    /// Returns the tables folder path and [`Fs`] backend for the given level.
+    ///
+    /// If [`level_routes`](Self::level_routes) has an entry covering this
+    /// level, uses that entry's path and `Fs`. Otherwise falls back to the
+    /// primary [`path`](Self::path) and [`fs`](Self::fs).
+    #[must_use]
+    pub fn tables_folder_for_level(&self, level: u8) -> (PathBuf, Arc<dyn Fs>) {
+        if let Some(routes) = &self.level_routes {
+            for route in routes {
+                if route.levels.contains(&level) {
+                    return (route.path.join(TABLES_FOLDER), route.fs.clone());
+                }
+            }
+        }
+        (self.path.join(TABLES_FOLDER), self.fs.clone())
+    }
+
+    /// Returns all unique tables folders that need to be scanned during
+    /// recovery: the primary folder plus every [`LevelRoute`] folder.
+    #[must_use]
+    pub fn all_tables_folders(&self) -> Vec<(PathBuf, Arc<dyn Fs>)> {
+        let mut folders = vec![(
+            self.path.join(TABLES_FOLDER),
+            self.fs.clone() as Arc<dyn Fs>,
+        )];
+
+        if let Some(routes) = &self.level_routes {
+            for route in routes {
+                let folder = route.path.join(TABLES_FOLDER);
+                if !folders.iter().any(|(p, _)| *p == folder) {
+                    folders.push((folder, route.fs.clone()));
+                }
+            }
+        }
+
+        folders
+    }
+
+    /// Configures per-level filesystem routing for tiered storage.
+    ///
+    /// Each [`LevelRoute`] maps a range of LSM levels to a base directory
+    /// and filesystem backend. Levels not covered by any route fall back to
+    /// the primary `path` and `fs`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if any two routes have overlapping level ranges.
+    #[must_use]
+    pub fn level_routes(mut self, routes: Vec<LevelRoute>) -> Self {
+        // Validate no overlapping ranges
+        for (i, a) in routes.iter().enumerate() {
+            for b in routes.iter().skip(i + 1) {
+                assert!(
+                    a.levels.end <= b.levels.start || b.levels.end <= a.levels.start,
+                    "overlapping level routes: {:?} and {:?}",
+                    a.levels,
+                    b.levels,
+                );
+            }
+        }
+        self.level_routes = if routes.is_empty() {
+            None
+        } else {
+            Some(routes)
+        };
+        self
+    }
+
     /// Overrides the sequence number generator.
     ///
     /// By default, [`SequenceNumberCounter`] is used. This allows plugging in

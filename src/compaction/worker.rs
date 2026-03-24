@@ -115,6 +115,35 @@ pub fn do_compaction(opts: &Options) -> crate::Result<CompactionResult> {
             merge_tables(compaction_state, version_history_lock, opts, &payload)
         }
         Choice::Move(payload) => {
+            // Cross-device trivial moves are not possible — the file must be
+            // rewritten to end up on the correct storage tier. Convert to merge.
+            if opts.config.level_routes.is_some() {
+                let (dst_folder, _) = opts.config.tables_folder_for_level(payload.dest_level);
+                let version = &version_history_lock.latest_version().version;
+                let cross_device = 'check: {
+                    for (level_idx, level) in version.iter_levels().enumerate() {
+                        #[expect(
+                            clippy::cast_possible_truncation,
+                            reason = "level index is always < 256"
+                        )]
+                        let (src_folder, _) = opts.config.tables_folder_for_level(level_idx as u8);
+                        if src_folder == dst_folder {
+                            continue;
+                        }
+                        for run in level.iter() {
+                            if run.iter().any(|t| payload.table_ids.contains(&t.id())) {
+                                break 'check true;
+                            }
+                        }
+                    }
+                    false
+                };
+                if cross_device {
+                    log::debug!("Converting trivial move to merge: cross-device level routing");
+                    return merge_tables(compaction_state, version_history_lock, opts, &payload);
+                }
+            }
+
             drop(version_history_lock);
 
             move_tables(&compaction_state, opts, &payload)
