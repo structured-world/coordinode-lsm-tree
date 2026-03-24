@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1774311816605,
+  "lastUpdate": 1774314248595,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -2574,6 +2574,84 @@ window.BENCHMARK_DATA = {
             "value": 453364.87695025525,
             "unit": "ops/sec",
             "extra": "P50: 1.9us | P99: 7.9us | P99.9: 14.6us\nthreads: 1 | elapsed: 0.44s | num: 200000"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "19a4ebbff1917fa6e6b107d2342670e741dbd9f7",
+          "message": "perf(compaction): merge input ranges before L2 overlap query (#146)\n\n## Summary\n\n- Add `KeyRange::merge_sorted_cmp()` to coalesce sorted key ranges into\ndisjoint intervals using a custom comparator\n- Replace per-table L2 overlap queries in multi-level compaction with\nmerged-interval queries, reducing redundant binary searches when L0\ntables overlap\n- Parts 1 and 3 of #122 were already completed in #117; this PR\nimplements Part 2 (merge input ranges optimization)\n\n## Technical Details\n\nPreviously, multi-level compaction queried L2 once per input table —\nO(L2_runs × input_tables × log L2_run_size). With overlapping L0 tables,\nmany queries hit the same L2 regions redundantly.\n\nNow, input key ranges from L0+L1 are sorted and merged into disjoint\nintervals first, then L2 is queried with the (typically much smaller)\nset of merged intervals.\n\n## Test Plan\n\n- 8 unit tests for `merge_sorted_cmp` (empty, single, disjoint,\noverlapping, adjacent, contained, mixed, reverse comparator)\n- All 21 existing leveled compaction tests pass (including multi-level\ndata integrity tests)\n- Full suite: 490 lib + 33 doc tests pass, zero clippy warnings\n\nCloses #122",
+          "timestamp": "2026-03-24T03:03:09+02:00",
+          "tree_id": "5f6da4558b268559a66cb74fa60b662cfe4e3d63",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/19a4ebbff1917fa6e6b107d2342670e741dbd9f7"
+        },
+        "date": 1774314247659,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 2025642.8765072797,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 2.3us | P99.9: 5.3us\nthreads: 1 | elapsed: 0.10s | num: 200000"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1297364.8444226026,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 1.3us | P99.9: 4.8us\nthreads: 1 | elapsed: 0.15s | num: 200000"
+          },
+          {
+            "name": "readrandom",
+            "value": 605814.2984890486,
+            "unit": "ops/sec",
+            "extra": "P50: 1.5us | P99: 5.6us | P99.9: 11.1us\nthreads: 1 | elapsed: 0.33s | num: 200000"
+          },
+          {
+            "name": "readseq",
+            "value": 2370357.5879975995,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 4.2us | P99.9: 7.4us\nthreads: 1 | elapsed: 0.08s | num: 200000"
+          },
+          {
+            "name": "seekrandom",
+            "value": 403972.86059421947,
+            "unit": "ops/sec",
+            "extra": "P50: 2.1us | P99: 6.2us | P99.9: 11.9us\nthreads: 1 | elapsed: 0.50s | num: 200000"
+          },
+          {
+            "name": "prefixscan",
+            "value": 183162.04272471875,
+            "unit": "ops/sec",
+            "extra": "P50: 5.1us | P99: 7.5us | P99.9: 15.2us\nthreads: 1 | elapsed: 1.09s | num: 200000"
+          },
+          {
+            "name": "overwrite",
+            "value": 1218391.6240010795,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.7us | P99.9: 7.3us\nthreads: 1 | elapsed: 0.16s | num: 200000"
+          },
+          {
+            "name": "mergerandom",
+            "value": 675854.192514147,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 0.5us | P99.9: 4.1us\nthreads: 1 | elapsed: 0.30s | num: 200000"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 520530.1272453073,
+            "unit": "ops/sec",
+            "extra": "P50: 1.6us | P99: 7.8us | P99.9: 12.8us\nthreads: 1 | elapsed: 0.38s | num: 200000"
           }
         ]
       }
