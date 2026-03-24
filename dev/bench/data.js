@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1774317176325,
+  "lastUpdate": 1774317263286,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -2730,6 +2730,84 @@ window.BENCHMARK_DATA = {
             "value": 480323.90469596564,
             "unit": "ops/sec",
             "extra": "P50: 1.8us | P99: 10.7us | P99.9: 16.9us\nthreads: 1 | elapsed: 0.42s | num: 200000"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "1e2c02f60092d0041a3c6d606e7b6ac9bf20956e",
+          "message": "perf(merge): replace IntervalHeap with sorted-vec heap + replace_min/replace_max (#148)\n\n## Summary\n\n- Replace `IntervalHeap` with a custom `MergeHeap` backed by a sorted\nvector supporting both min and max extraction on a single data structure\n- Add `replace_min`/`replace_max` — replaces the extremum in-place and\nslides into sorted position. Common case (same source keeps winning in\nsequential scans) completes in **1 comparison** vs 2×O(log n) for the\nold pop+push pattern\n- Store comparator once in the heap instead of cloning the `Arc` into\nevery `HeapItem`, eliminating per-item atomic ref-count traffic\n- Add source-index tiebreaker to entry comparison for deterministic MVCC\nordering when key+seqno tie\n\n## Technical Details\n\nThe sorted-vector approach is competitive with a binary heap for the\ntypical merge fan-in (n=2–30) due to cache-friendly sequential layout\nand negligible `memmove` cost. A single heap (not two separate min/max\nheaps) preserves `DoubleEndedIterator` mixed forward/reverse correctness\nrequired by prefix ping-pong iteration.\n\nDuring implementation, discovered that the original `IntervalHeap`'s\npop+push pattern implicitly preserved source ordering for equal entries.\nThe new replace-in-place pattern broke this, causing MVCC bugs when\nkey+seqno tie across levels. Fixed by adding source index as a\ncomparison tiebreaker — an improvement over the original's accidental\nstability.\n\n## Test Plan\n\n- [x] All 496 existing tests pass (0 failures)\n- [x] Clippy clean (`-D warnings`)\n- [x] New unit tests: heap ordering (min/max), replace_min/replace_max\n(stays/slides), seqno tiebreak, source-index tiebreak, mixed min/max,\nempty/single element\n- [x] New merge tests: interleaved, many sources, seqno ordering\n- [x] Verified mixed forward/reverse iteration (`tree_disjoint_prefix`\nping-pong test)\n- [x] Verified compaction filter correctness with overlapping seqnos\n\nCloses #142",
+          "timestamp": "2026-03-24T03:53:11+02:00",
+          "tree_id": "beb255829461f3b12ab951f487fa1c025f3f3021",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/1e2c02f60092d0041a3c6d606e7b6ac9bf20956e"
+        },
+        "date": 1774317262390,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 1977935.6139629832,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 2.3us | P99.9: 5.4us\nthreads: 1 | elapsed: 0.10s | num: 200000"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1273441.8356714998,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 1.6us | P99.9: 5.6us\nthreads: 1 | elapsed: 0.16s | num: 200000"
+          },
+          {
+            "name": "readrandom",
+            "value": 543008.0542592761,
+            "unit": "ops/sec",
+            "extra": "P50: 1.6us | P99: 5.7us | P99.9: 16.2us\nthreads: 1 | elapsed: 0.37s | num: 200000"
+          },
+          {
+            "name": "readseq",
+            "value": 2549054.872267944,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 4.2us | P99.9: 7.4us\nthreads: 1 | elapsed: 0.08s | num: 200000"
+          },
+          {
+            "name": "seekrandom",
+            "value": 367074.90578063566,
+            "unit": "ops/sec",
+            "extra": "P50: 2.4us | P99: 6.4us | P99.9: 13.7us\nthreads: 1 | elapsed: 0.54s | num: 200000"
+          },
+          {
+            "name": "prefixscan",
+            "value": 204024.67312809272,
+            "unit": "ops/sec",
+            "extra": "P50: 4.6us | P99: 6.1us | P99.9: 15.5us\nthreads: 1 | elapsed: 0.98s | num: 200000"
+          },
+          {
+            "name": "overwrite",
+            "value": 1147015.1119642456,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.9us | P99.9: 6.4us\nthreads: 1 | elapsed: 0.17s | num: 200000"
+          },
+          {
+            "name": "mergerandom",
+            "value": 689579.0737962114,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 2.1us | P99.9: 4.3us\nthreads: 1 | elapsed: 0.29s | num: 200000"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 462709.81035558484,
+            "unit": "ops/sec",
+            "extra": "P50: 1.9us | P99: 8.0us | P99.9: 13.9us\nthreads: 1 | elapsed: 0.43s | num: 200000"
           }
         ]
       }
