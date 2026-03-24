@@ -3,13 +3,16 @@
 </p>
 
 [![CI](https://github.com/structured-world/coordinode-lsm-tree/actions/workflows/coordinode-ci.yml/badge.svg)](https://github.com/structured-world/coordinode-lsm-tree/actions/workflows/coordinode-ci.yml)
-[![Upstream CI](https://github.com/fjall-rs/lsm-tree/actions/workflows/test.yml/badge.svg)](https://github.com/fjall-rs/lsm-tree/actions/workflows/test.yml)
-[![docs.rs](https://img.shields.io/docsrs/coordinode-lsm-tree?color=green)](https://docs.rs/coordinode-lsm-tree)
+[![codecov](https://codecov.io/gh/structured-world/coordinode-lsm-tree/graph/badge.svg)](https://codecov.io/gh/structured-world/coordinode-lsm-tree)
+[![Benchmarks](https://img.shields.io/badge/benchmarks-dashboard-orange)](https://structured-world.github.io/coordinode-lsm-tree/dev/bench/)
 [![Crates.io](https://img.shields.io/crates/v/coordinode-lsm-tree?color=blue)](https://crates.io/crates/coordinode-lsm-tree)
+[![docs.rs](https://img.shields.io/docsrs/coordinode-lsm-tree?color=green)](https://docs.rs/coordinode-lsm-tree)
 ![MSRV](https://img.shields.io/badge/MSRV-1.90.0-blue)
+[![dependency status](https://deps.rs/repo/github/structured-world/coordinode-lsm-tree/status.svg)](https://deps.rs/repo/github/structured-world/coordinode-lsm-tree)
+![License](https://img.shields.io/badge/license-Apache--2.0-blue)
 
-> **Maintained fork** by [Structured World Foundation](https://sw.foundation) for the [CoordiNode](https://github.com/structured-world/coordinode) database engine.
-> Based on [fjall-rs/lsm-tree](https://github.com/fjall-rs/lsm-tree). We contribute patches upstream and maintain additional features needed for CoordiNode (zstd compression, custom sequence number generators, batch get, intra-L0 compaction, security hardening).
+> LSM-tree engine for [CoordiNode](https://github.com/structured-world/coordinode), maintained by [Structured World Foundation](https://sw.foundation).
+> Derivative work of [fjall-rs/lsm-tree](https://github.com/fjall-rs/lsm-tree), developed independently with diverging features: zstd dictionary compression, custom sequence number generators, batch get, intra-L0 compaction, and security hardening.
 
 > [!IMPORTANT]
 > This fork now introduces a fork-specific **disk format V4** compatibility boundary.
@@ -79,7 +82,13 @@ Uses [`bytes`](https://github.com/tokio-rs/bytes) as the underlying `Slice` type
 
 *Disabled by default.*
 
-## Run unit benchmarks
+## Benchmarks
+
+Continuous benchmarks run on every merge to `main`. Results are published to the
+[benchmark dashboard](https://structured-world.github.io/coordinode-lsm-tree/dev/bench/).
+PRs that regress performance by >15% trigger an alert; >25% regression fails CI.
+
+To run benchmarks locally:
 
 ```bash
 cargo bench --features lz4
@@ -97,11 +106,11 @@ USDT (TRC-20): `TFDsezHa1cBkoeZT5q2T49Wp66K8t2DmdA`
 
 ## License
 
-All source code is licensed under MIT OR Apache-2.0.
+All source code is licensed under Apache-2.0.
 
-All contributions are to be licensed as MIT OR Apache-2.0.
+All contributions are to be licensed as Apache-2.0.
 
-Original project by [fjall-rs](https://github.com/fjall-rs/lsm-tree). This fork is maintained by [Structured World Foundation](https://sw.foundation).
+Originally derived from [fjall-rs/lsm-tree](https://github.com/fjall-rs/lsm-tree). Independently maintained by [Structured World Foundation](https://sw.foundation).
 
 ## Footnotes
 
