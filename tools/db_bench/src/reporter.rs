@@ -125,8 +125,8 @@ impl Reporter {
                 s.ops, s.secs, normalized_ops, normalized_mb,
             );
             println!(
-                "{:20} raw: {:.0} ops/sec | factor: {:.3}",
-                "", s.ops_per_sec, calibration_factor,
+                "{:20} raw: {:.0} ops/sec, {:.1} MB/sec | factor: {:.3}",
+                "", s.ops_per_sec, s.mb_per_sec, calibration_factor,
             );
         } else {
             println!(

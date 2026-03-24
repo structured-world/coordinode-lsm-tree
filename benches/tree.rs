@@ -58,7 +58,7 @@ fn scan_vs_query(c: &mut Criterion) {
 
     let mut group = c.benchmark_group("scan vs query");
 
-    for size in [100_000] {
+    for size in [10_000, 100_000] {
         let path = tempdir().unwrap();
 
         let tree = Config::new(path)
