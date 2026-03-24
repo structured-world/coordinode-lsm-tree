@@ -238,7 +238,8 @@ fn run_single(
             Some(p) if iterations > 1 => {
                 let sub = p.join(format!("iter-{iter}"));
                 // Clean previous iteration data so each run starts fresh.
-                // These are benchmark-created `iter-N` dirs, not user data.
+                // Safe: these are `iter-0`, `iter-1`, … subdirs created by
+                // this tool — the naming scheme cannot collide with user data.
                 if let Err(e) = std::fs::remove_dir_all(&sub) {
                     if e.kind() != std::io::ErrorKind::NotFound {
                         return Err(e.into());
