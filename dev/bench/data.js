@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1774401237377,
+  "lastUpdate": 1774413416510,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -4134,6 +4134,84 @@ window.BENCHMARK_DATA = {
             "value": 356934.8711726238,
             "unit": "ops/sec (normalized)",
             "extra": "raw: 539789 ops/sec | factor: 0.661 | P50: 1.7us | P99: 4.2us | P99.9: 11.7us\nthreads: 1 | elapsed: 0.37s | num: 200000 | iterations: 3 | runner: seq_wr=209854 rand_rd=624387 cpu=123 composite=34782.7"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "890707a5917d45f1cad74a635ebf9a4fe7b10625",
+          "message": "feat(compression): CompressionProvider trait + pure Rust zstd backend (#176)\n\n## Summary\n\n- Add `CompressionProvider` trait abstracting zstd compress/decompress\nbehind compile-time selected backends\n- Add `zstd-pure` feature flag using\n[`structured-zstd`](https://github.com/structured-world/structured-zstd)\n— zero C dependencies\n- Replace all direct `zstd::bulk::*` calls with `ZstdBackend::*`\ndispatch through the trait\n- Both backends produce RFC 8878 compliant zstd frames\n(cross-compatible)\n\n## Technical Details\n\n**New files:**\n- `build.rs` — sets `cfg(zstd_any)` when either `zstd` or `zstd-pure`\nfeature is active, with `cargo:rerun-if-env-changed` for correct\nincremental rebuilds\n- `src/compression/mod.rs` — `CompressionProvider` trait + `ZstdBackend`\ntype alias (was `src/compression.rs`)\n- `src/compression/zstd_ffi.rs` — C FFI backend wrapping `zstd::bulk::*`\n- `src/compression/zstd_pure.rs` — pure Rust backend wrapping\n`structured_zstd`\n\n**cfg migration:** ~150 `cfg(feature = \"zstd\")` → `cfg(zstd_any)` across\n27 files so that `CompressionType::Zstd`, `ZstdDict`, `ZstdDictionary`,\nand all related match arms/parameters compile with either backend.\n\n**Backend precedence:** When both `zstd` and `zstd-pure` are enabled,\nthe C FFI backend takes precedence.\n\n**Decompression safety:** The pure Rust backend enforces capacity limits\n_during_ decode via `StreamingDecoder`'s `Read` impl — reads at most\n`capacity` bytes into a fixed buffer, preventing unbounded allocation\nfrom crafted zstd frames. Dictionary decompression uses `FrameDecoder`\n(StreamingDecoder lacks dict API) with a post-decode size check; the\nblock layer's `uncompressed_length` validation (capped at 256 MiB)\nprovides the primary bound.\n\n## Known Limitations\n\n- `zstd-pure` compression uses the `Fastest` level regardless of\nrequested level (higher levels not yet implemented in structured-zstd)\n- Dictionary compression not yet supported by pure Rust backend\n(dictionary decompression works)\n- Pure Rust decompression throughput ~2–3.5× slower than C reference\n- Dictionary is re-parsed from raw bytes on every decompress call (same\nas C FFI backend; cached precompiled dictionaries are a Phase 2\noptimization)\n\n## Test Plan\n\n- [x] `cargo check` — no features, `zstd`, `zstd-pure`, both features\n- [x] `cargo clippy` — zero warnings on lib code for all feature combos\n- [x] `cargo nextest run --features zstd` — 976 passed, 6 skipped\n- [x] `cargo nextest run --features zstd-pure` — 964 passed, 6 skipped\n(12 dict tests correctly gated on `feature = \"zstd\"`)\n- [x] `cargo test --doc --features zstd` — 34 passed, 2 ignored\n- [x] `cargo tree --features zstd-pure` — zero C dependencies in tree\n\nCloses #157\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n## Summary by CodeRabbit\n\n* **New Features**\n* Added a `zstd-pure` feature providing a pure-Rust Zstd backend (no C\ncompiler or system libs required).\n* Build script enables a unified Zstd configuration; when both backends\nare enabled, the C FFI backend takes precedence.\n\n* **Documentation**\n* README expanded to describe both Zstd backend options,\ninteroperability, precedence, and current pure-Rust limitations (Fastest\nmode only, no dictionary compression, slower decompression).\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-03-25T06:35:37+02:00",
+          "tree_id": "121379cc1b6d93dac2a6ddcf3bc81a65be837469",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/890707a5917d45f1cad74a635ebf9a4fe7b10625"
+        },
+        "date": 1774413415188,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 1326543.2837851713,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 2012589 ops/sec | factor: 0.659 | P50: 0.3us | P99: 2.3us | P99.9: 5.3us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3 | runner: seq_wr=216167 rand_rd=615816 cpu=123 composite=34894.9"
+          },
+          {
+            "name": "fillrandom",
+            "value": 735439.3795002841,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 1115785 ops/sec | factor: 0.659 | P50: 0.7us | P99: 2.9us | P99.9: 6.2us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3 | runner: seq_wr=216167 rand_rd=615816 cpu=123 composite=34894.9"
+          },
+          {
+            "name": "readrandom",
+            "value": 394440.00386952795,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 598432 ops/sec | factor: 0.659 | P50: 1.5us | P99: 5.5us | P99.9: 11.3us\nthreads: 1 | elapsed: 0.33s | num: 200000 | iterations: 3 | runner: seq_wr=216167 rand_rd=615816 cpu=123 composite=34894.9"
+          },
+          {
+            "name": "readseq",
+            "value": 1631709.1067514895,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 2475577 ops/sec | factor: 0.659 | P50: 0.2us | P99: 4.2us | P99.9: 8.4us\nthreads: 1 | elapsed: 0.08s | num: 200000 | iterations: 3 | runner: seq_wr=216167 rand_rd=615816 cpu=123 composite=34894.9"
+          },
+          {
+            "name": "seekrandom",
+            "value": 259976.46811686477,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 394428 ops/sec | factor: 0.659 | P50: 2.2us | P99: 6.4us | P99.9: 12.3us\nthreads: 1 | elapsed: 0.51s | num: 200000 | iterations: 3 | runner: seq_wr=216167 rand_rd=615816 cpu=123 composite=34894.9"
+          },
+          {
+            "name": "prefixscan",
+            "value": 131800.71591743617,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 199964 ops/sec | factor: 0.659 | P50: 4.6us | P99: 7.2us | P99.9: 14.7us\nthreads: 1 | elapsed: 1.00s | num: 200000 | iterations: 3 | runner: seq_wr=216167 rand_rd=615816 cpu=123 composite=34894.9"
+          },
+          {
+            "name": "overwrite",
+            "value": 777723.1572778897,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 1179937 ops/sec | factor: 0.659 | P50: 0.7us | P99: 2.8us | P99.9: 6.3us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3 | runner: seq_wr=216167 rand_rd=615816 cpu=123 composite=34894.9"
+          },
+          {
+            "name": "mergerandom",
+            "value": 484320.4308057616,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 734795 ops/sec | factor: 0.659 | P50: 0.3us | P99: 2.1us | P99.9: 3.0us\nthreads: 1 | elapsed: 0.27s | num: 200000 | iterations: 3 | runner: seq_wr=216167 rand_rd=615816 cpu=123 composite=34894.9"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 358555.8415192324,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 543989 ops/sec | factor: 0.659 | P50: 1.6us | P99: 5.4us | P99.9: 12.0us\nthreads: 1 | elapsed: 0.37s | num: 200000 | iterations: 3 | runner: seq_wr=216167 rand_rd=615816 cpu=123 composite=34894.9"
           }
         ]
       }
