@@ -5,8 +5,8 @@ dir = "target/nextest"
 slow-timeout = { period = "10s", terminate-after = 6 }
 fail-fast = true
 
-# Property tests run 32 cases by default (same as CI).
-# Override with PROPTEST_CASES=256 for thorough local runs.
+# Property tests are tuned to run 32 cases (hardcoded in ProptestConfig).
+# Edit proptest config in test files to increase for thorough local runs.
 # Budget: 30s × 4 = 120s — enough for 32 cases with I/O.
 [[profile.default.overrides]]
 filter = "test(prop_)"
