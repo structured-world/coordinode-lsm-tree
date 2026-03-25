@@ -55,6 +55,10 @@ impl CompressionProvider for ZstdPureProvider {
         dict_raw: &[u8],
         capacity: usize,
     ) -> crate::Result<Vec<u8>> {
+        // NOTE: Dictionary is re-parsed from raw bytes on every call.
+        // The C FFI backend has the same per-call overhead (Decompressor::with_dictionary
+        // also re-initializes). Caching would require adding precompiled dictionary
+        // state to the CompressionProvider trait, which is a Phase 2 optimization.
         let dict = structured_zstd::decoding::Dictionary::decode_dict(dict_raw)
             .map_err(|e| crate::Error::Io(std::io::Error::other(e)))?;
 
