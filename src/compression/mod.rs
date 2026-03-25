@@ -5,10 +5,10 @@
 // Backend modules — only one is compiled based on feature flags.
 // When both `zstd` and `zstd-pure` are enabled, C FFI takes precedence.
 #[cfg(feature = "zstd")]
-pub mod zstd_ffi;
+mod zstd_ffi;
 
 #[cfg(all(feature = "zstd-pure", not(feature = "zstd")))]
-pub mod zstd_pure;
+mod zstd_pure;
 
 use crate::coding::{Decode, Encode};
 use byteorder::{ReadBytesExt, WriteBytesExt};

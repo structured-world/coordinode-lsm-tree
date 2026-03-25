@@ -18,15 +18,12 @@
 use super::CompressionProvider;
 use std::io::Read;
 
-/// Decompress using `StreamingDecoder` (implements `Read`), reading at most
-/// `capacity` bytes into a pre-allocated buffer. If the frame contains more
-/// data than `capacity`, the excess is never allocated — the limit is
-/// enforced during decode, not after.
-fn bounded_streaming_decode(source: &[u8], capacity: usize) -> crate::Result<Vec<u8>> {
-    let mut decoder = structured_zstd::decoding::StreamingDecoder::new(source)
-        .map_err(|e| crate::Error::Io(std::io::Error::other(e)))?;
-
-    // Pre-allocate exactly `capacity` bytes and read into it.
+/// Read at most `capacity` bytes from `reader` into a pre-allocated buffer,
+/// then probe for excess data. Returns the filled portion of the buffer.
+///
+/// The limit is enforced _during_ decode — the Vec never grows beyond
+/// `capacity`, preventing unbounded allocation from crafted frames.
+fn bounded_read(reader: &mut impl Read, capacity: usize) -> crate::Result<Vec<u8>> {
     let mut output = vec![0u8; capacity];
     let mut filled = 0;
 
@@ -37,17 +34,17 @@ fn bounded_streaming_decode(source: &[u8], capacity: usize) -> crate::Result<Vec
                 declared: filled as u64,
                 limit: capacity as u64,
             })?;
-        match decoder.read(dest) {
+        match reader.read(dest) {
             Ok(0) => break,
             Ok(n) => filled += n,
             Err(e) => return Err(crate::Error::Io(e)),
         }
     }
 
-    // Probe for excess data: if the decoder still has bytes after filling
+    // Probe for excess data: if the reader still has bytes after filling
     // the buffer, the frame exceeds capacity.
     let mut probe = [0u8; 1];
-    match decoder.read(&mut probe) {
+    match reader.read(&mut probe) {
         Ok(0) => {}
         Ok(_) => {
             return Err(crate::Error::DecompressedSizeTooLarge {
@@ -77,7 +74,9 @@ impl CompressionProvider for ZstdPureProvider {
     }
 
     fn decompress(data: &[u8], capacity: usize) -> crate::Result<Vec<u8>> {
-        bounded_streaming_decode(data, capacity)
+        let mut decoder = structured_zstd::decoding::StreamingDecoder::new(data)
+            .map_err(|e| crate::Error::Io(std::io::Error::other(e)))?;
+        bounded_read(&mut decoder, capacity)
     }
 
     fn compress_with_dict(_data: &[u8], _level: i32, _dict_raw: &[u8]) -> crate::Result<Vec<u8>> {
@@ -101,7 +100,6 @@ impl CompressionProvider for ZstdPureProvider {
             .map_err(|e| crate::Error::Io(std::io::Error::other(e)))?;
 
         // FrameDecoder supports dictionaries (unlike StreamingDecoder).
-        // Use its Read impl with the same bounded-read pattern as decompress().
         let mut decoder = structured_zstd::decoding::FrameDecoder::new();
         decoder
             .add_dict(dict)
@@ -110,37 +108,6 @@ impl CompressionProvider for ZstdPureProvider {
             .init(data)
             .map_err(|e| crate::Error::Io(std::io::Error::other(e)))?;
 
-        let mut output = vec![0u8; capacity];
-        let mut filled = 0;
-
-        loop {
-            let dest = output
-                .get_mut(filled..)
-                .ok_or(crate::Error::DecompressedSizeTooLarge {
-                    declared: filled as u64,
-                    limit: capacity as u64,
-                })?;
-            match decoder.read(dest) {
-                Ok(0) => break,
-                Ok(n) => filled += n,
-                Err(e) => return Err(crate::Error::Io(e)),
-            }
-        }
-
-        // Probe for excess data.
-        let mut probe = [0u8; 1];
-        match decoder.read(&mut probe) {
-            Ok(0) => {}
-            Ok(_) => {
-                return Err(crate::Error::DecompressedSizeTooLarge {
-                    declared: (filled + 1) as u64,
-                    limit: capacity as u64,
-                });
-            }
-            Err(e) => return Err(crate::Error::Io(e)),
-        }
-
-        output.truncate(filled);
-        Ok(output)
+        bounded_read(&mut decoder, capacity)
     }
 }
