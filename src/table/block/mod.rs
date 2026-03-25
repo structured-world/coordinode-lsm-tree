@@ -18,6 +18,9 @@ pub use offset::BlockOffset;
 pub use r#type::BlockType;
 pub(crate) use trailer::{Trailer, TRAILER_START_MARKER};
 
+#[cfg(zstd_any)]
+use crate::compression::CompressionProvider as _;
+
 use crate::{
     coding::{Decode, Encode},
     encryption::EncryptionProvider,
@@ -69,7 +72,7 @@ impl Block {
         block_type: BlockType,
         compression: CompressionType,
         encryption: Option<&dyn EncryptionProvider>,
-        #[cfg(feature = "zstd")] zstd_dict: Option<&crate::compression::ZstdDictionary>,
+        #[cfg(zstd_any)] zstd_dict: Option<&crate::compression::ZstdDictionary>,
     ) -> crate::Result<Header> {
         if data.len() > MAX_DECOMPRESSION_SIZE as usize {
             return Err(crate::Error::DecompressedSizeTooLarge {
@@ -88,7 +91,7 @@ impl Block {
         };
 
         // Compression step — produces an owned Vec when a compressor is active.
-        #[cfg(any(feature = "lz4", feature = "zstd"))]
+        #[cfg(any(feature = "lz4", zstd_any))]
         let mut compressed_buf: Option<Vec<u8>> = None;
 
         match compression {
@@ -99,15 +102,12 @@ impl Block {
                 compressed_buf = Some(lz4_flex::compress(data));
             }
 
-            #[cfg(feature = "zstd")]
+            #[cfg(zstd_any)]
             CompressionType::Zstd(level) => {
-                compressed_buf = Some(
-                    zstd::bulk::compress(data, level)
-                        .map_err(|e| crate::Error::Io(std::io::Error::other(e)))?,
-                );
+                compressed_buf = Some(crate::compression::ZstdBackend::compress(data, level)?);
             }
 
-            #[cfg(feature = "zstd")]
+            #[cfg(zstd_any)]
             CompressionType::ZstdDict { level, dict_id } => {
                 let dict = zstd_dict.ok_or(crate::Error::ZstdDictMismatch {
                     expected: dict_id,
@@ -120,13 +120,11 @@ impl Block {
                     });
                 }
 
-                compressed_buf = Some({
-                    let mut compressor = zstd::bulk::Compressor::with_dictionary(level, dict.raw())
-                        .map_err(|e| crate::Error::Io(std::io::Error::other(e)))?;
-                    compressor
-                        .compress(data)
-                        .map_err(|e| crate::Error::Io(std::io::Error::other(e)))?
-                });
+                compressed_buf = Some(crate::compression::ZstdBackend::compress_with_dict(
+                    data,
+                    level,
+                    dict.raw(),
+                )?);
             }
         }
 
@@ -134,7 +132,7 @@ impl Block {
         // when available, eliminating one allocation on the compress+encrypt path.
         let encrypted_buf: Option<Vec<u8>>;
 
-        #[cfg(any(feature = "lz4", feature = "zstd"))]
+        #[cfg(any(feature = "lz4", zstd_any))]
         {
             encrypted_buf = if let Some(enc) = encryption {
                 Some(match compressed_buf.take() {
@@ -146,7 +144,7 @@ impl Block {
             };
         }
 
-        #[cfg(not(any(feature = "lz4", feature = "zstd")))]
+        #[cfg(not(any(feature = "lz4", zstd_any)))]
         {
             encrypted_buf = encryption.map(|enc| enc.encrypt(data)).transpose()?;
         }
@@ -155,11 +153,11 @@ impl Block {
         let payload: &[u8] = if let Some(ref enc) = encrypted_buf {
             enc
         } else {
-            #[cfg(any(feature = "lz4", feature = "zstd"))]
+            #[cfg(any(feature = "lz4", zstd_any))]
             {
                 compressed_buf.as_deref().unwrap_or(data)
             }
-            #[cfg(not(any(feature = "lz4", feature = "zstd")))]
+            #[cfg(not(any(feature = "lz4", zstd_any)))]
             {
                 data
             }
@@ -231,7 +229,7 @@ impl Block {
         reader: &mut R,
         compression: CompressionType,
         encryption: Option<&dyn EncryptionProvider>,
-        #[cfg(feature = "zstd")] zstd_dict: Option<&crate::compression::ZstdDictionary>,
+        #[cfg(zstd_any)] zstd_dict: Option<&crate::compression::ZstdDictionary>,
     ) -> crate::Result<Self> {
         let header = Header::decode_from(reader)?;
 
@@ -306,11 +304,13 @@ impl Block {
                     Slice::from(buf)
                 }
 
-                #[cfg(feature = "zstd")]
+                #[cfg(zstd_any)]
                 CompressionType::Zstd(_) => {
-                    let decompressed =
-                        zstd::bulk::decompress(&decrypted, header.uncompressed_length as usize)
-                            .map_err(|_| crate::Error::Decompress(compression))?;
+                    let decompressed = crate::compression::ZstdBackend::decompress(
+                        &decrypted,
+                        header.uncompressed_length as usize,
+                    )
+                    .map_err(|_| crate::Error::Decompress(compression))?;
 
                     if decompressed.len() != header.uncompressed_length as usize {
                         return Err(crate::Error::Decompress(compression));
@@ -319,7 +319,7 @@ impl Block {
                     Slice::from(decompressed)
                 }
 
-                #[cfg(feature = "zstd")]
+                #[cfg(zstd_any)]
                 CompressionType::ZstdDict { dict_id, .. } => {
                     let dict = zstd_dict.ok_or(crate::Error::ZstdDictMismatch {
                         expected: dict_id,
@@ -332,11 +332,12 @@ impl Block {
                         });
                     }
 
-                    let mut decompressor = zstd::bulk::Decompressor::with_dictionary(dict.raw())
-                        .map_err(|_| crate::Error::Decompress(compression))?;
-                    let decompressed = decompressor
-                        .decompress(&decrypted, header.uncompressed_length as usize)
-                        .map_err(|_| crate::Error::Decompress(compression))?;
+                    let decompressed = crate::compression::ZstdBackend::decompress_with_dict(
+                        &decrypted,
+                        dict.raw(),
+                        header.uncompressed_length as usize,
+                    )
+                    .map_err(|_| crate::Error::Decompress(compression))?;
 
                     if decompressed.len() != header.uncompressed_length as usize {
                         return Err(crate::Error::Decompress(compression));
@@ -386,11 +387,13 @@ impl Block {
                     Slice::from(buf)
                 }
 
-                #[cfg(feature = "zstd")]
+                #[cfg(zstd_any)]
                 CompressionType::Zstd(_) => {
-                    let decompressed =
-                        zstd::bulk::decompress(&raw_data, header.uncompressed_length as usize)
-                            .map_err(|_| crate::Error::Decompress(compression))?;
+                    let decompressed = crate::compression::ZstdBackend::decompress(
+                        &raw_data,
+                        header.uncompressed_length as usize,
+                    )
+                    .map_err(|_| crate::Error::Decompress(compression))?;
 
                     if decompressed.len() != header.uncompressed_length as usize {
                         return Err(crate::Error::Decompress(compression));
@@ -399,7 +402,7 @@ impl Block {
                     Slice::from(decompressed)
                 }
 
-                #[cfg(feature = "zstd")]
+                #[cfg(zstd_any)]
                 CompressionType::ZstdDict { dict_id, .. } => {
                     let dict = zstd_dict.ok_or(crate::Error::ZstdDictMismatch {
                         expected: dict_id,
@@ -412,11 +415,12 @@ impl Block {
                         });
                     }
 
-                    let mut decompressor = zstd::bulk::Decompressor::with_dictionary(dict.raw())
-                        .map_err(|_| crate::Error::Decompress(compression))?;
-                    let decompressed = decompressor
-                        .decompress(&raw_data, header.uncompressed_length as usize)
-                        .map_err(|_| crate::Error::Decompress(compression))?;
+                    let decompressed = crate::compression::ZstdBackend::decompress_with_dict(
+                        &raw_data,
+                        dict.raw(),
+                        header.uncompressed_length as usize,
+                    )
+                    .map_err(|_| crate::Error::Decompress(compression))?;
 
                     if decompressed.len() != header.uncompressed_length as usize {
                         return Err(crate::Error::Decompress(compression));
@@ -444,7 +448,7 @@ impl Block {
         handle: BlockHandle,
         compression: CompressionType,
         encryption: Option<&dyn EncryptionProvider>,
-        #[cfg(feature = "zstd")] zstd_dict: Option<&crate::compression::ZstdDictionary>,
+        #[cfg(zstd_any)] zstd_dict: Option<&crate::compression::ZstdDictionary>,
     ) -> crate::Result<Self> {
         // handle.size() includes Header::serialized_len(), so allow that overhead.
         // Encrypted blocks add provider-specific overhead to the on-disk size.
@@ -553,9 +557,9 @@ impl Block {
                     Slice::from(decompressed)
                 }
 
-                #[cfg(feature = "zstd")]
+                #[cfg(zstd_any)]
                 CompressionType::Zstd(_) => {
-                    let decompressed = zstd::bulk::decompress(
+                    let decompressed = crate::compression::ZstdBackend::decompress(
                         &decrypted,
                         parsed_header.uncompressed_length as usize,
                     )
@@ -568,7 +572,7 @@ impl Block {
                     Slice::from(decompressed)
                 }
 
-                #[cfg(feature = "zstd")]
+                #[cfg(zstd_any)]
                 CompressionType::ZstdDict { dict_id, .. } => {
                     let dict = zstd_dict.ok_or(crate::Error::ZstdDictMismatch {
                         expected: dict_id,
@@ -581,11 +585,12 @@ impl Block {
                         });
                     }
 
-                    let mut decompressor = zstd::bulk::Decompressor::with_dictionary(dict.raw())
-                        .map_err(|_| crate::Error::Decompress(compression))?;
-                    let decompressed = decompressor
-                        .decompress(&decrypted, parsed_header.uncompressed_length as usize)
-                        .map_err(|_| crate::Error::Decompress(compression))?;
+                    let decompressed = crate::compression::ZstdBackend::decompress_with_dict(
+                        &decrypted,
+                        dict.raw(),
+                        parsed_header.uncompressed_length as usize,
+                    )
+                    .map_err(|_| crate::Error::Decompress(compression))?;
 
                     if decompressed.len() != parsed_header.uncompressed_length as usize {
                         return Err(crate::Error::Decompress(compression));
@@ -661,12 +666,12 @@ impl Block {
                     Slice::from(decompressed)
                 }
 
-                #[cfg(feature = "zstd")]
+                #[cfg(zstd_any)]
                 CompressionType::Zstd(_) => {
                     #[expect(clippy::indexing_slicing, reason = "header was decoded from buf")]
                     let compressed_data = &buf[Header::serialized_len()..];
 
-                    let decompressed = zstd::bulk::decompress(
+                    let decompressed = crate::compression::ZstdBackend::decompress(
                         compressed_data,
                         parsed_header.uncompressed_length as usize,
                     )
@@ -679,7 +684,7 @@ impl Block {
                     Slice::from(decompressed)
                 }
 
-                #[cfg(feature = "zstd")]
+                #[cfg(zstd_any)]
                 CompressionType::ZstdDict { dict_id, .. } => {
                     #[expect(clippy::indexing_slicing, reason = "header was decoded from buf")]
                     let compressed_data = &buf[Header::serialized_len()..];
@@ -695,11 +700,12 @@ impl Block {
                         });
                     }
 
-                    let mut decompressor = zstd::bulk::Decompressor::with_dictionary(dict.raw())
-                        .map_err(|_| crate::Error::Decompress(compression))?;
-                    let decompressed = decompressor
-                        .decompress(compressed_data, parsed_header.uncompressed_length as usize)
-                        .map_err(|_| crate::Error::Decompress(compression))?;
+                    let decompressed = crate::compression::ZstdBackend::decompress_with_dict(
+                        compressed_data,
+                        dict.raw(),
+                        parsed_header.uncompressed_length as usize,
+                    )
+                    .map_err(|_| crate::Error::Decompress(compression))?;
 
                     if decompressed.len() != parsed_header.uncompressed_length as usize {
                         return Err(crate::Error::Decompress(compression));
@@ -739,7 +745,7 @@ mod tests {
             BlockType::Data,
             CompressionType::None,
             None,
-            #[cfg(feature = "zstd")]
+            #[cfg(zstd_any)]
             None,
         )?;
 
@@ -760,7 +766,7 @@ mod tests {
             handle,
             CompressionType::None,
             None,
-            #[cfg(feature = "zstd")]
+            #[cfg(zstd_any)]
             None,
         )?;
         assert_eq!(data, &*block.data);
@@ -781,7 +787,7 @@ mod tests {
             BlockType::Data,
             CompressionType::Lz4,
             None,
-            #[cfg(feature = "zstd")]
+            #[cfg(zstd_any)]
             None,
         )?;
 
@@ -802,7 +808,7 @@ mod tests {
             handle,
             CompressionType::Lz4,
             None,
-            #[cfg(feature = "zstd")]
+            #[cfg(zstd_any)]
             None,
         )?;
         assert_eq!(data, &*block.data);
@@ -811,7 +817,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "zstd")]
+    #[cfg(zstd_any)]
     fn block_from_file_roundtrip_zstd() -> crate::Result<()> {
         use std::io::Write;
 
@@ -854,7 +860,7 @@ mod tests {
             BlockType::Data,
             CompressionType::None,
             None,
-            #[cfg(feature = "zstd")]
+            #[cfg(zstd_any)]
             None,
         )?;
 
@@ -864,7 +870,7 @@ mod tests {
                 &mut reader,
                 CompressionType::None,
                 None,
-                #[cfg(feature = "zstd")]
+                #[cfg(zstd_any)]
                 None,
             )?;
             assert_eq!(b"abcdefabcdefabcdef", &*block.data);
@@ -883,7 +889,7 @@ mod tests {
             BlockType::Data,
             CompressionType::Lz4,
             None,
-            #[cfg(feature = "zstd")]
+            #[cfg(zstd_any)]
             None,
         )?;
 
@@ -893,7 +899,7 @@ mod tests {
                 &mut reader,
                 CompressionType::Lz4,
                 None,
-                #[cfg(feature = "zstd")]
+                #[cfg(zstd_any)]
                 None,
             )?;
             assert_eq!(b"abcdefabcdefabcdef", &*block.data);
@@ -915,7 +921,7 @@ mod tests {
             BlockType::Data,
             CompressionType::Lz4,
             None,
-            #[cfg(feature = "zstd")]
+            #[cfg(zstd_any)]
             None,
         )
         .unwrap();
@@ -938,7 +944,7 @@ mod tests {
             &mut r,
             CompressionType::Lz4,
             None,
-            #[cfg(feature = "zstd")]
+            #[cfg(zstd_any)]
             None,
         );
 
@@ -964,7 +970,7 @@ mod tests {
             BlockType::Data,
             CompressionType::Lz4,
             None,
-            #[cfg(feature = "zstd")]
+            #[cfg(zstd_any)]
             None,
         )
         .unwrap();
@@ -982,7 +988,7 @@ mod tests {
             &mut r,
             CompressionType::Lz4,
             None,
-            #[cfg(feature = "zstd")]
+            #[cfg(zstd_any)]
             None,
         );
 
@@ -1026,7 +1032,7 @@ mod tests {
             &mut cursor,
             CompressionType::Lz4,
             None,
-            #[cfg(feature = "zstd")]
+            #[cfg(zstd_any)]
             None,
         );
 
@@ -1050,7 +1056,7 @@ mod tests {
             BlockType::Data,
             CompressionType::Lz4,
             None,
-            #[cfg(feature = "zstd")]
+            #[cfg(zstd_any)]
             None,
         )
         .unwrap();
@@ -1079,7 +1085,7 @@ mod tests {
             handle,
             CompressionType::Lz4,
             None,
-            #[cfg(feature = "zstd")]
+            #[cfg(zstd_any)]
             None,
         );
 
@@ -1103,7 +1109,7 @@ mod tests {
             BlockType::Data,
             CompressionType::Lz4,
             None,
-            #[cfg(feature = "zstd")]
+            #[cfg(zstd_any)]
             None,
         )
         .unwrap();
@@ -1127,7 +1133,7 @@ mod tests {
             handle,
             CompressionType::Lz4,
             None,
-            #[cfg(feature = "zstd")]
+            #[cfg(zstd_any)]
             None,
         );
 
@@ -1149,7 +1155,7 @@ mod tests {
             BlockType::Data,
             CompressionType::None,
             None,
-            #[cfg(feature = "zstd")]
+            #[cfg(zstd_any)]
             None,
         )
         .unwrap();
@@ -1168,7 +1174,7 @@ mod tests {
             &mut r,
             CompressionType::None,
             None,
-            #[cfg(feature = "zstd")]
+            #[cfg(zstd_any)]
             None,
         );
 
@@ -1194,7 +1200,7 @@ mod tests {
             handle,
             CompressionType::None,
             None,
-            #[cfg(feature = "zstd")]
+            #[cfg(zstd_any)]
             None,
         );
 
@@ -1206,14 +1212,15 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "zstd")]
+    #[cfg(zstd_any)]
     fn zstd_corrupted_uncompressed_length_triggers_decompress_error() {
         use crate::coding::Encode;
         use std::io::Cursor;
 
         let payload: &[u8] = b"hello world";
 
-        let compressed = zstd::bulk::compress(payload, 3).expect("zstd compress failed");
+        let compressed =
+            crate::compression::ZstdBackend::compress(payload, 3).expect("zstd compress failed");
 
         let data_length = compressed.len() as u32;
         let uncompressed_length_corrupted = payload.len() as u32 + 1;
@@ -1241,7 +1248,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "zstd")]
+    #[cfg(zstd_any)]
     fn block_roundtrip_zstd() -> crate::Result<()> {
         let mut writer = vec![];
 
@@ -1273,7 +1280,7 @@ mod tests {
             BlockType::Data,
             CompressionType::None,
             None,
-            #[cfg(feature = "zstd")]
+            #[cfg(zstd_any)]
             None,
         );
         assert!(
@@ -1283,7 +1290,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "zstd")]
+    #[cfg(zstd_any)]
     fn block_roundtrip_zstd_large_data() -> crate::Result<()> {
         let data = vec![0xABu8; 64 * 1024]; // 64KB
         let mut writer = vec![];
@@ -1339,7 +1346,7 @@ mod tests {
                 BlockType::Data,
                 CompressionType::None,
                 Some(&enc),
-                #[cfg(feature = "zstd")]
+                #[cfg(zstd_any)]
                 None,
             )?;
 
@@ -1348,7 +1355,7 @@ mod tests {
                 &mut reader,
                 CompressionType::None,
                 Some(&enc),
-                #[cfg(feature = "zstd")]
+                #[cfg(zstd_any)]
                 None,
             )?;
             assert_eq!(data, &*block.data);
@@ -1368,7 +1375,7 @@ mod tests {
                 BlockType::Data,
                 CompressionType::Lz4,
                 Some(&enc),
-                #[cfg(feature = "zstd")]
+                #[cfg(zstd_any)]
                 None,
             )?;
 
@@ -1377,7 +1384,7 @@ mod tests {
                 &mut reader,
                 CompressionType::Lz4,
                 Some(&enc),
-                #[cfg(feature = "zstd")]
+                #[cfg(zstd_any)]
                 None,
             )?;
             assert_eq!(data, &*block.data);
@@ -1385,7 +1392,7 @@ mod tests {
         }
 
         #[test]
-        #[cfg(feature = "zstd")]
+        #[cfg(zstd_any)]
         fn block_roundtrip_encrypted_zstd() -> crate::Result<()> {
             let enc = test_provider();
             let data = b"abcdefabcdefabcdef";
@@ -1397,7 +1404,7 @@ mod tests {
                 BlockType::Data,
                 CompressionType::Zstd(3),
                 Some(&enc),
-                #[cfg(feature = "zstd")]
+                #[cfg(zstd_any)]
                 None,
             )?;
 
@@ -1406,7 +1413,7 @@ mod tests {
                 &mut reader,
                 CompressionType::Zstd(3),
                 Some(&enc),
-                #[cfg(feature = "zstd")]
+                #[cfg(zstd_any)]
                 None,
             )?;
             assert_eq!(data, &*block.data);
@@ -1426,7 +1433,7 @@ mod tests {
                 BlockType::Data,
                 CompressionType::None,
                 Some(&enc),
-                #[cfg(feature = "zstd")]
+                #[cfg(zstd_any)]
                 None,
             )?;
 
@@ -1447,7 +1454,7 @@ mod tests {
                 handle,
                 CompressionType::None,
                 Some(&enc),
-                #[cfg(feature = "zstd")]
+                #[cfg(zstd_any)]
                 None,
             )?;
             assert_eq!(data, &*block.data);
@@ -1468,7 +1475,7 @@ mod tests {
                 BlockType::Data,
                 CompressionType::Lz4,
                 Some(&enc),
-                #[cfg(feature = "zstd")]
+                #[cfg(zstd_any)]
                 None,
             )?;
 
@@ -1489,7 +1496,7 @@ mod tests {
                 handle,
                 CompressionType::Lz4,
                 Some(&enc),
-                #[cfg(feature = "zstd")]
+                #[cfg(zstd_any)]
                 None,
             )?;
             assert_eq!(data, &*block.data);
@@ -1497,7 +1504,7 @@ mod tests {
         }
 
         #[test]
-        #[cfg(feature = "zstd")]
+        #[cfg(zstd_any)]
         fn block_from_file_encrypted_zstd() -> crate::Result<()> {
             use std::io::Write;
 
@@ -1510,7 +1517,7 @@ mod tests {
                 BlockType::Data,
                 CompressionType::Zstd(3),
                 Some(&enc),
-                #[cfg(feature = "zstd")]
+                #[cfg(zstd_any)]
                 None,
             )?;
 
@@ -1531,7 +1538,7 @@ mod tests {
                 handle,
                 CompressionType::Zstd(3),
                 Some(&enc),
-                #[cfg(feature = "zstd")]
+                #[cfg(zstd_any)]
                 None,
             )?;
             assert_eq!(data, &*block.data);
@@ -1552,7 +1559,7 @@ mod tests {
                 BlockType::Data,
                 CompressionType::None,
                 Some(&enc_write),
-                #[cfg(feature = "zstd")]
+                #[cfg(zstd_any)]
                 None,
             )?;
 
@@ -1573,7 +1580,7 @@ mod tests {
                 handle,
                 CompressionType::None,
                 Some(&enc_read),
-                #[cfg(feature = "zstd")]
+                #[cfg(zstd_any)]
                 None,
             );
             assert!(
@@ -1597,7 +1604,7 @@ mod tests {
                 BlockType::Data,
                 CompressionType::None,
                 Some(&enc_write),
-                #[cfg(feature = "zstd")]
+                #[cfg(zstd_any)]
                 None,
             )?;
 
@@ -1606,7 +1613,7 @@ mod tests {
                 &mut reader,
                 CompressionType::None,
                 Some(&enc_read),
-                #[cfg(feature = "zstd")]
+                #[cfg(zstd_any)]
                 None,
             );
             assert!(
@@ -1630,7 +1637,7 @@ mod tests {
                 BlockType::Data,
                 CompressionType::None,
                 Some(&enc),
-                #[cfg(feature = "zstd")]
+                #[cfg(zstd_any)]
                 None,
             )?;
 
@@ -1660,7 +1667,7 @@ mod tests {
                 handle,
                 CompressionType::None,
                 Some(&enc),
-                #[cfg(feature = "zstd")]
+                #[cfg(zstd_any)]
                 None,
             );
             assert!(
@@ -1691,7 +1698,7 @@ mod tests {
                 handle,
                 CompressionType::None,
                 Some(&enc),
-                #[cfg(feature = "zstd")]
+                #[cfg(zstd_any)]
                 None,
             );
 
@@ -1716,7 +1723,7 @@ mod tests {
                 BlockType::Data,
                 CompressionType::None,
                 Some(&enc),
-                #[cfg(feature = "zstd")]
+                #[cfg(zstd_any)]
                 None,
             )?;
 
@@ -1737,7 +1744,7 @@ mod tests {
                 handle,
                 CompressionType::None,
                 Some(&enc),
-                #[cfg(feature = "zstd")]
+                #[cfg(zstd_any)]
                 None,
             )?;
             assert_eq!(&*block.data, &data[..]);
@@ -1756,7 +1763,7 @@ mod tests {
                 BlockType::Data,
                 CompressionType::None,
                 Some(&enc),
-                #[cfg(feature = "zstd")]
+                #[cfg(zstd_any)]
                 None,
             )?;
 
@@ -1765,7 +1772,7 @@ mod tests {
                 &mut reader,
                 CompressionType::None,
                 Some(&enc),
-                #[cfg(feature = "zstd")]
+                #[cfg(zstd_any)]
                 None,
             )?;
             assert_eq!(&*block.data, &data[..]);
@@ -1785,7 +1792,7 @@ mod tests {
                 BlockType::Data,
                 CompressionType::Lz4,
                 Some(&enc),
-                #[cfg(feature = "zstd")]
+                #[cfg(zstd_any)]
                 None,
             )?;
 
@@ -1794,7 +1801,7 @@ mod tests {
                 &mut reader,
                 CompressionType::Lz4,
                 Some(&enc),
-                #[cfg(feature = "zstd")]
+                #[cfg(zstd_any)]
                 None,
             )?;
             assert_eq!(&*block.data, &data[..]);
@@ -1802,7 +1809,7 @@ mod tests {
         }
 
         #[test]
-        #[cfg(feature = "zstd")]
+        #[cfg(zstd_any)]
         fn block_roundtrip_encrypted_zstd_large() -> crate::Result<()> {
             let enc = test_provider();
             let data = vec![0xEE_u8; 32 * 1024]; // 32 KiB
@@ -1814,7 +1821,7 @@ mod tests {
                 BlockType::Data,
                 CompressionType::Zstd(3),
                 Some(&enc),
-                #[cfg(feature = "zstd")]
+                #[cfg(zstd_any)]
                 None,
             )?;
 
@@ -1823,7 +1830,7 @@ mod tests {
                 &mut reader,
                 CompressionType::Zstd(3),
                 Some(&enc),
-                #[cfg(feature = "zstd")]
+                #[cfg(zstd_any)]
                 None,
             )?;
             assert_eq!(&*block.data, &data[..]);
