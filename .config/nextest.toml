@@ -21,7 +21,7 @@ status-level = "all"
 final-status-level = "flaky"
 
 [profile.ci.junit]
-path = "target/nextest/ci/junit.xml"
+path = "junit.xml"
 store-success-output = false
 store-failure-output = true
 

@@ -66,6 +66,7 @@ jobs:
         if: always() && runner.os == 'Linux'
         with:
           files: target/nextest/ci/junit.xml
+          check_name: Test Results (${{ matrix.os }}, ${{ matrix.rust }})
 
   cross:
     needs: lint
