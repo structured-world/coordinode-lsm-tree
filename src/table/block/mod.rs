@@ -1281,10 +1281,11 @@ mod tests {
         let mut cursor = Cursor::new(buf);
         let result = Block::from_reader(&mut cursor, CompressionType::Zstd(3), None, None);
 
-        assert!(
-            result.is_err(),
-            "expected decompression error for decreased uncompressed_length, got Ok",
-        );
+        match result {
+            Err(crate::Error::Decompress(CompressionType::Zstd(_))) => { /* expected */ }
+            Ok(_) => panic!("expected Error::Decompress, but got Ok(Block)"),
+            Err(other) => panic!("expected Error::Decompress, got different error: {other:?}"),
+        }
     }
 
     #[test]

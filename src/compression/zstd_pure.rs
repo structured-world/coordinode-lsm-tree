@@ -47,11 +47,15 @@ fn bounded_streaming_decode(source: &[u8], capacity: usize) -> crate::Result<Vec
     // Probe for excess data: if the decoder still has bytes after filling
     // the buffer, the frame exceeds capacity.
     let mut probe = [0u8; 1];
-    if decoder.read(&mut probe).unwrap_or(0) > 0 {
-        return Err(crate::Error::DecompressedSizeTooLarge {
-            declared: (filled + 1) as u64,
-            limit: capacity as u64,
-        });
+    match decoder.read(&mut probe) {
+        Ok(0) => {}
+        Ok(_) => {
+            return Err(crate::Error::DecompressedSizeTooLarge {
+                declared: (filled + 1) as u64,
+                limit: capacity as u64,
+            });
+        }
+        Err(e) => return Err(crate::Error::Io(e)),
     }
 
     output.truncate(filled);
@@ -96,31 +100,47 @@ impl CompressionProvider for ZstdPureProvider {
         let dict = structured_zstd::decoding::Dictionary::decode_dict(dict_raw)
             .map_err(|e| crate::Error::Io(std::io::Error::other(e)))?;
 
-        // StreamingDecoder doesn't support dictionaries directly.
-        // Use FrameDecoder with decode_all_to_vec — the capacity is enforced
-        // by the block layer's uncompressed_length validation (capped at
-        // MAX_DECOMPRESSION_SIZE = 256 MiB before this function is called).
+        // FrameDecoder supports dictionaries (unlike StreamingDecoder).
+        // Use its Read impl with the same bounded-read pattern as decompress().
         let mut decoder = structured_zstd::decoding::FrameDecoder::new();
         decoder
             .add_dict(dict)
             .map_err(|e| crate::Error::Io(std::io::Error::other(e)))?;
-
-        let mut output = Vec::with_capacity(capacity);
         decoder
-            .decode_all_to_vec(data, &mut output)
+            .init(data)
             .map_err(|e| crate::Error::Io(std::io::Error::other(e)))?;
 
-        // Post-decode check: the block layer already validates
-        // uncompressed_length <= MAX_DECOMPRESSION_SIZE before calling us,
-        // so well-formed frames won't exceed capacity. This catches only
-        // corrupted frames that bypass the header check.
-        if output.len() > capacity {
-            return Err(crate::Error::DecompressedSizeTooLarge {
-                declared: output.len() as u64,
-                limit: capacity as u64,
-            });
+        let mut output = vec![0u8; capacity];
+        let mut filled = 0;
+
+        loop {
+            let dest = output
+                .get_mut(filled..)
+                .ok_or(crate::Error::DecompressedSizeTooLarge {
+                    declared: filled as u64,
+                    limit: capacity as u64,
+                })?;
+            match decoder.read(dest) {
+                Ok(0) => break,
+                Ok(n) => filled += n,
+                Err(e) => return Err(crate::Error::Io(e)),
+            }
         }
 
+        // Probe for excess data.
+        let mut probe = [0u8; 1];
+        match decoder.read(&mut probe) {
+            Ok(0) => {}
+            Ok(_) => {
+                return Err(crate::Error::DecompressedSizeTooLarge {
+                    declared: (filled + 1) as u64,
+                    limit: capacity as u64,
+                });
+            }
+            Err(e) => return Err(crate::Error::Io(e)),
+        }
+
+        output.truncate(filled);
         Ok(output)
     }
 }
