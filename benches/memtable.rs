@@ -8,7 +8,7 @@ fn default_cmp() -> SharedComparator {
 }
 
 fn memtable_get_hit(c: &mut Criterion) {
-    let memtable = Memtable::new(0, &default_cmp());
+    let memtable = Memtable::new(0, default_cmp());
 
     memtable.insert(InternalValue::from_components(
         "abc_w5wa35aw35naw",
@@ -37,7 +37,7 @@ fn memtable_get_hit(c: &mut Criterion) {
 }
 
 fn memtable_get_snapshot(c: &mut Criterion) {
-    let memtable = Memtable::new(0, &default_cmp());
+    let memtable = Memtable::new(0, default_cmp());
 
     memtable.insert(InternalValue::from_components(
         "abc_w5wa35aw35naw",
@@ -72,7 +72,7 @@ fn memtable_get_snapshot(c: &mut Criterion) {
 }
 
 fn memtable_get_miss(c: &mut Criterion) {
-    let memtable = Memtable::new(0, &default_cmp());
+    let memtable = Memtable::new(0, default_cmp());
 
     for _ in 0..1_000_000 {
         memtable.insert(InternalValue::from_components(
@@ -90,7 +90,7 @@ fn memtable_get_miss(c: &mut Criterion) {
 
 fn memtable_highest_seqno(c: &mut Criterion) {
     c.bench_function("memtable highest seqno", |b| {
-        let memtable = Memtable::new(0, &default_cmp());
+        let memtable = Memtable::new(0, default_cmp());
 
         for x in 0..100_000 {
             memtable.insert(InternalValue::from_components(

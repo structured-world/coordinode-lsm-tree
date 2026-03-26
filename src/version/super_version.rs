@@ -41,7 +41,7 @@ impl SuperVersions {
 
         Self {
             versions: vec![SuperVersion {
-                active_memtable: Arc::new(Memtable::new(0, comparator)),
+                active_memtable: Arc::new(Memtable::new(0, comparator.clone())),
                 sealed_memtables: Arc::default(),
                 version,
                 seqno: 0,
@@ -221,7 +221,7 @@ mod tests {
     use test_log::test;
 
     fn new_memtable(id: u64) -> Memtable {
-        Memtable::new(id, &default_comparator())
+        Memtable::new(id, default_comparator())
     }
 
     fn test_super_versions(versions: Vec<SuperVersion>) -> SuperVersions {

@@ -281,7 +281,7 @@ impl AbstractTree for Tree {
                 let mut copy = v.clone();
                 copy.active_memtable = Arc::new(Memtable::new(
                     self.memtable_id_counter.next(),
-                    &self.config.comparator,
+                    self.config.comparator.clone(),
                 ));
                 copy.sealed_memtables = Arc::default();
                 copy.version = Version::new(v.version.id() + 1, self.tree_type());
@@ -537,7 +537,7 @@ impl AbstractTree for Tree {
         let mut copy = version_history_lock.latest_version();
         copy.active_memtable = Arc::new(Memtable::new(
             self.memtable_id_counter.next(),
-            &self.config.comparator,
+            self.config.comparator.clone(),
         ));
         copy.sealed_memtables = Arc::new(SealedMemtables::default());
 
@@ -603,7 +603,7 @@ impl AbstractTree for Tree {
         let mut copy = version_history_lock.latest_version();
         copy.active_memtable = Arc::new(Memtable::new(
             self.memtable_id_counter.next(),
-            &self.config.comparator,
+            self.config.comparator.clone(),
         ));
         copy.sealed_memtables =
             Arc::new(super_version.sealed_memtables.add(yanked_memtable.clone()));

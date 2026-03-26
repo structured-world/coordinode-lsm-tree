@@ -25,6 +25,9 @@ use std::collections::BTreeMap;
 pub struct ActiveTombstoneSet {
     comparator: SharedComparator,
     seqno_counts: BTreeMap<SeqNo, u32>,
+    // A comparator-ordered Vec keeps expiry deterministic for custom
+    // comparators; overlap cardinality is typically small, so O(t) inserts are
+    // an acceptable tradeoff for a compact structure with cheap tail expiry.
     pending_expiry: Vec<(UserKey, u64, SeqNo)>,
     next_id: u64,
 }

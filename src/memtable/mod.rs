@@ -85,11 +85,11 @@ impl Memtable {
 
     // `pub` + `#[doc(hidden)]`: used by the host crate (fjall) to construct
     // ephemeral memtables. Not part of the semver-stable API.
-    // The comparator parameter is mandatory because memtable ordering must
-    // match the tree's comparator; a default would silently produce wrong order.
+    // Keep the comparator by-value for hidden-public API compatibility while
+    // still requiring callers to pass the tree comparator explicitly.
     #[doc(hidden)]
     #[must_use]
-    pub fn new(id: MemtableId, comparator: &SharedComparator) -> Self {
+    pub fn new(id: MemtableId, comparator: SharedComparator) -> Self {
         Self {
             id,
             items: skiplist::SkipMap::new(comparator.clone()),
@@ -339,7 +339,7 @@ mod tests {
     use test_log::test;
 
     fn new_memtable(id: MemtableId) -> Memtable {
-        Memtable::new(id, &default_comparator())
+        Memtable::new(id, default_comparator())
     }
 
     #[test]
