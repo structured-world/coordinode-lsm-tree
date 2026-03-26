@@ -88,6 +88,10 @@ impl Memtable {
     // Keep the comparator by-value for hidden-public API compatibility while
     // still requiring callers to pass the tree comparator explicitly.
     #[doc(hidden)]
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "hidden-public constructor keeps the preexisting by-value signature for compatibility"
+    )]
     #[must_use]
     pub fn new(id: MemtableId, comparator: SharedComparator) -> Self {
         Self {
