@@ -132,15 +132,18 @@ impl DoubleEndedIterator for TreeIter {
 fn range_tombstone_overlaps_bounds(
     rt: &RangeTombstone,
     bounds: &(Bound<UserKey>, Bound<UserKey>),
+    comparator: &dyn crate::comparator::UserComparator,
 ) -> bool {
     let overlaps_lo = match &bounds.0 {
-        Bound::Included(key) | Bound::Excluded(key) => rt.end.as_ref() > key.as_ref(),
+        Bound::Included(key) | Bound::Excluded(key) => {
+            comparator.compare(&rt.end, key) == std::cmp::Ordering::Greater
+        }
         Bound::Unbounded => true,
     };
 
     let overlaps_hi = match &bounds.1 {
-        Bound::Included(key) => rt.start.as_ref() <= key.as_ref(),
-        Bound::Excluded(key) => rt.start.as_ref() < key.as_ref(),
+        Bound::Included(key) => comparator.compare(&rt.start, key) != std::cmp::Ordering::Greater,
+        Bound::Excluded(key) => comparator.compare(&rt.start, key) == std::cmp::Ordering::Less,
         Bound::Unbounded => true,
     };
 
@@ -264,7 +267,13 @@ impl TreeIter {
                         table
                             .range_tombstones()
                             .iter()
-                            .filter(|rt| range_tombstone_overlaps_bounds(rt, &user_range))
+                            .filter(|rt| {
+                                range_tombstone_overlaps_bounds(
+                                    rt,
+                                    &user_range,
+                                    lock.comparator.as_ref(),
+                                )
+                            })
                             .map(|rt| (rt.clone(), seqno)),
                     );
                 }
@@ -342,7 +351,9 @@ impl TreeIter {
                     memtable
                         .range_tombstones_sorted()
                         .into_iter()
-                        .filter(|rt| range_tombstone_overlaps_bounds(rt, &user_range))
+                        .filter(|rt| {
+                            range_tombstone_overlaps_bounds(rt, &user_range, lock.comparator.as_ref())
+                        })
                         .map(|rt| (rt, seqno)),
                 );
 
@@ -360,7 +371,9 @@ impl TreeIter {
                         .active_memtable
                         .range_tombstones_sorted()
                         .into_iter()
-                        .filter(|rt| range_tombstone_overlaps_bounds(rt, &user_range))
+                        .filter(|rt| {
+                            range_tombstone_overlaps_bounds(rt, &user_range, lock.comparator.as_ref())
+                        })
                         .map(|rt| (rt, seqno)),
                 );
 
@@ -374,8 +387,12 @@ impl TreeIter {
             let merged = Merger::new(iters, lock.comparator.clone());
             // Clone is cheap: point-read RT sets are typically 0-2 entries.
             // An Arc would add indirection overhead that exceeds the clone cost.
-            let iter = MvccStream::new(merged, lock.merge_operator.clone())
-                .with_range_tombstones(range_tombstones.clone());
+            let iter = MvccStream::new_with_comparator(
+                merged,
+                lock.merge_operator.clone(),
+                lock.comparator.clone(),
+            )
+            .with_range_tombstones(range_tombstones.clone());
 
             // Post-merge RT suppression: unlike create_range which uses
             // RangeTombstoneFilter (requires sorted RTs + O(n log n) init),
@@ -386,7 +403,12 @@ impl TreeIter {
                         return false;
                     }
                     !range_tombstones.iter().any(|(rt, cutoff)| {
-                        rt.should_suppress(&value.key.user_key, value.key.seqno, *cutoff)
+                        rt.should_suppress_with(
+                            &value.key.user_key,
+                            value.key.seqno,
+                            *cutoff,
+                            lock.comparator.as_ref(),
+                        )
                     })
                 }
                 Err(_) => true,
@@ -485,7 +507,13 @@ impl TreeIter {
                             table
                                 .range_tombstones()
                                 .iter()
-                                .filter(|rt| range_tombstone_overlaps_bounds(rt, &user_range))
+                                .filter(|rt| {
+                                    range_tombstone_overlaps_bounds(
+                                        rt,
+                                        &user_range,
+                                        lock.comparator.as_ref(),
+                                    )
+                                })
                                 .map(|rt| (rt.clone(), seqno)),
                         );
 
@@ -511,7 +539,13 @@ impl TreeIter {
                                 table
                                     .range_tombstones()
                                     .iter()
-                                    .filter(|rt| range_tombstone_overlaps_bounds(rt, &user_range))
+                                    .filter(|rt| {
+                                        range_tombstone_overlaps_bounds(
+                                            rt,
+                                            &user_range,
+                                            lock.comparator.as_ref(),
+                                        )
+                                    })
                                     .map(|rt| (rt.clone(), seqno)),
                             );
                         }
@@ -580,7 +614,9 @@ impl TreeIter {
             // RTs are collected), so only SST RTs are present. The later sort
             // covers the complete list. Both sorts are O(n log n) on their
             // respective subsets; the SST-only subset is typically small.
-            all_range_tombstones.sort_unstable_by(|(a, _), (b, _)| a.start.cmp(&b.start));
+            all_range_tombstones.sort_unstable_by(|(a, _), (b, _)| {
+                lock.comparator.compare(&a.start, &b.start)
+            });
 
             for table in single_tables {
                 // Table-skip: if a range tombstone fully covers this table
@@ -599,7 +635,9 @@ impl TreeIter {
                 let table_kv_seqno = table.get_highest_kv_seqno();
 
                 let candidate_end =
-                    all_range_tombstones.partition_point(|(rt, _)| rt.start.as_ref() <= table_min);
+                    all_range_tombstones.partition_point(|(rt, _)| {
+                        lock.comparator.compare(&rt.start, table_min) != std::cmp::Ordering::Greater
+                    });
 
                 let is_covered =
                     all_range_tombstones
@@ -607,7 +645,11 @@ impl TreeIter {
                         .take(candidate_end)
                         .any(|(rt, cutoff)| {
                             rt.visible_at(*cutoff)
-                                && rt.fully_covers(table_min, table_max)
+                                && rt.fully_covers_with(
+                                    table_min,
+                                    table_max,
+                                    lock.comparator.as_ref(),
+                                )
                                 && rt.seqno > table_kv_seqno
                         });
 
@@ -640,7 +682,9 @@ impl TreeIter {
                     memtable
                         .range_tombstones_sorted()
                         .into_iter()
-                        .filter(|rt| range_tombstone_overlaps_bounds(rt, &user_range))
+                        .filter(|rt| {
+                            range_tombstone_overlaps_bounds(rt, &user_range, lock.comparator.as_ref())
+                        })
                         .map(|rt| (rt, seqno)),
                 );
 
@@ -659,7 +703,9 @@ impl TreeIter {
                         .active_memtable
                         .range_tombstones_sorted()
                         .into_iter()
-                        .filter(|rt| range_tombstone_overlaps_bounds(rt, &user_range))
+                        .filter(|rt| {
+                            range_tombstone_overlaps_bounds(rt, &user_range, lock.comparator.as_ref())
+                        })
                         .map(|rt| (rt, seqno)),
                 );
 
@@ -675,7 +721,9 @@ impl TreeIter {
                 all_range_tombstones.extend(
                     mt.range_tombstones_sorted()
                         .into_iter()
-                        .filter(|rt| range_tombstone_overlaps_bounds(rt, &user_range))
+                        .filter(|rt| {
+                            range_tombstone_overlaps_bounds(rt, &user_range, lock.comparator.as_ref())
+                        })
                         .map(|rt| (rt, *eph_seqno)),
                 );
 
@@ -691,8 +739,12 @@ impl TreeIter {
             // Clone needed: MvccStream uses the RT set for merge suppression,
             // while RangeTombstoneFilter below consumes it for post-merge
             // filtering. An Arc<[_]> could avoid the copy if RT sets grow large.
-            let iter = MvccStream::new(merged, lock.merge_operator.clone())
-                .with_range_tombstones(all_range_tombstones.clone());
+            let iter = MvccStream::new_with_comparator(
+                merged,
+                lock.merge_operator.clone(),
+                lock.comparator.clone(),
+            )
+            .with_range_tombstones(all_range_tombstones.clone());
 
             let iter = iter.filter(|x| match x {
                 Ok(value) => !value.key.is_tombstone(),
@@ -704,7 +756,9 @@ impl TreeIter {
             // When the same RT appears from different sources with different
             // cutoffs (e.g., persisted SST + ephemeral), keep the max cutoff
             // so the RT stays visible if ANY source's snapshot includes it.
-            all_range_tombstones.sort_by(|a, b| a.0.cmp(&b.0));
+            all_range_tombstones.sort_by(|a, b| {
+                a.0.cmp_with_comparator(&b.0, lock.comparator.as_ref())
+            });
             all_range_tombstones.dedup_by(|a, b| {
                 if a.0 == b.0 {
                     // dedup_by passes (a=later, b=earlier); b survives, a is
@@ -725,7 +779,11 @@ impl TreeIter {
             {
                 Box::new(iter)
             } else {
-                Box::new(RangeTombstoneFilter::new(iter, all_range_tombstones))
+                Box::new(RangeTombstoneFilter::new_with_comparator(
+                    iter,
+                    all_range_tombstones,
+                    lock.comparator.clone(),
+                ))
             }
         })
     }

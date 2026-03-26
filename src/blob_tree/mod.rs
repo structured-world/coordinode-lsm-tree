@@ -427,6 +427,7 @@ impl AbstractTree for BlobTree {
             0,
             level_fs,
         )?
+        .set_comparator(self.index.config.comparator.clone())
         .use_data_block_restart_interval(data_block_restart_interval)
         .use_index_block_restart_interval(index_block_restart_interval)
         .use_data_block_compression(data_block_compression)

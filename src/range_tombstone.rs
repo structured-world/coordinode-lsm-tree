@@ -2,7 +2,7 @@
 // This source code is licensed under both the Apache 2.0 and MIT License
 // (found in the LICENSE-* files in the repository)
 
-use crate::{SeqNo, UserKey};
+use crate::{SeqNo, UserKey, comparator::UserComparator};
 use std::cmp::Reverse;
 
 /// A range tombstone that deletes all keys in `[start, end)` at a given sequence number.
@@ -38,7 +38,14 @@ impl RangeTombstone {
     /// Returns `true` if `key` is within `[start, end)`.
     #[must_use]
     pub fn contains_key(&self, key: &[u8]) -> bool {
-        self.start.as_ref() <= key && key < self.end.as_ref()
+        self.contains_key_with(key, &crate::comparator::DefaultUserComparator)
+    }
+
+    /// Returns `true` if `key` is within `[start, end)` using the tree comparator.
+    #[must_use]
+    pub fn contains_key_with(&self, key: &[u8], comparator: &dyn UserComparator) -> bool {
+        comparator.compare(&self.start, key) != std::cmp::Ordering::Greater
+            && comparator.compare(key, &self.end) == std::cmp::Ordering::Less
     }
 
     /// Returns `true` if this tombstone is visible at the given read seqno.
@@ -56,7 +63,26 @@ impl RangeTombstone {
     /// Suppress iff: `kv_seqno < self.seqno AND self.contains_key(key) AND self.visible_at(read_seqno)`
     #[must_use]
     pub fn should_suppress(&self, key: &[u8], kv_seqno: SeqNo, read_seqno: SeqNo) -> bool {
-        self.visible_at(read_seqno) && self.contains_key(key) && kv_seqno < self.seqno
+        self.should_suppress_with(
+            key,
+            kv_seqno,
+            read_seqno,
+            &crate::comparator::DefaultUserComparator,
+        )
+    }
+
+    /// Comparator-aware variant of [`RangeTombstone::should_suppress`].
+    #[must_use]
+    pub fn should_suppress_with(
+        &self,
+        key: &[u8],
+        kv_seqno: SeqNo,
+        read_seqno: SeqNo,
+        comparator: &dyn UserComparator,
+    ) -> bool {
+        self.visible_at(read_seqno)
+            && self.contains_key_with(key, comparator)
+            && kv_seqno < self.seqno
     }
 
     /// Returns the intersection of this tombstone with `[min, max)`, or `None`
@@ -65,18 +91,29 @@ impl RangeTombstone {
     /// The resulting tombstone has the same seqno as `self`.
     #[must_use]
     pub fn intersect_opt(&self, min: &[u8], max: &[u8]) -> Option<Self> {
-        let new_start_ref = if self.start.as_ref() > min {
+        self.intersect_opt_with(min, max, &crate::comparator::DefaultUserComparator)
+    }
+
+    /// Comparator-aware variant of [`RangeTombstone::intersect_opt`].
+    #[must_use]
+    pub fn intersect_opt_with(
+        &self,
+        min: &[u8],
+        max: &[u8],
+        comparator: &dyn UserComparator,
+    ) -> Option<Self> {
+        let new_start_ref = if comparator.compare(&self.start, min) == std::cmp::Ordering::Greater {
             self.start.as_ref()
         } else {
             min
         };
-        let new_end_ref = if self.end.as_ref() < max {
+        let new_end_ref = if comparator.compare(&self.end, max) == std::cmp::Ordering::Less {
             self.end.as_ref()
         } else {
             max
         };
 
-        if new_start_ref < new_end_ref {
+        if comparator.compare(new_start_ref, new_end_ref) == std::cmp::Ordering::Less {
             Some(Self {
                 start: UserKey::from(new_start_ref),
                 end: UserKey::from(new_end_ref),
@@ -94,7 +131,35 @@ impl RangeTombstone {
     /// strictly less than the exclusive `end`.
     #[must_use]
     pub fn fully_covers(&self, min: &[u8], max: &[u8]) -> bool {
-        self.start.as_ref() <= min && max < self.end.as_ref()
+        self.fully_covers_with(min, max, &crate::comparator::DefaultUserComparator)
+    }
+
+    /// Comparator-aware variant of [`RangeTombstone::fully_covers`].
+    #[must_use]
+    pub fn fully_covers_with(
+        &self,
+        min: &[u8],
+        max: &[u8],
+        comparator: &dyn UserComparator,
+    ) -> bool {
+        comparator.compare(&self.start, min) != std::cmp::Ordering::Greater
+            && comparator.compare(max, &self.end) == std::cmp::Ordering::Less
+    }
+
+    /// Comparator-aware ordering for range tombstone processing.
+    ///
+    /// Ordered by `(start asc, seqno desc, end asc)` using the user comparator
+    /// for user-key components.
+    #[must_use]
+    pub fn cmp_with_comparator(
+        &self,
+        other: &Self,
+        comparator: &dyn UserComparator,
+    ) -> std::cmp::Ordering {
+        comparator
+            .compare(&self.start, &other.start)
+            .then_with(|| other.seqno.cmp(&self.seqno))
+            .then_with(|| comparator.compare(&self.end, &other.end))
     }
 }
 
@@ -141,8 +206,23 @@ impl CoveringRt {
         expect(dead_code, reason = "wired up in table-skip optimization")
     )]
     pub fn covers_table(&self, table_min: &[u8], table_max: &[u8], table_max_seqno: SeqNo) -> bool {
-        self.start.as_ref() <= table_min
-            && table_max < self.end.as_ref()
+        self.covers_table_with(
+            table_min,
+            table_max,
+            table_max_seqno,
+            &crate::comparator::DefaultUserComparator,
+        )
+    }
+
+    pub fn covers_table_with(
+        &self,
+        table_min: &[u8],
+        table_max: &[u8],
+        table_max_seqno: SeqNo,
+        comparator: &dyn UserComparator,
+    ) -> bool {
+        comparator.compare(&self.start, table_min) != std::cmp::Ordering::Greater
+            && comparator.compare(table_max, &self.end) == std::cmp::Ordering::Less
             && self.seqno > table_max_seqno
     }
 }

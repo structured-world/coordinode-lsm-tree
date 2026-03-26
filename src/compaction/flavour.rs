@@ -79,6 +79,7 @@ pub(super) fn prepare_table_writer(
         payload.dest_level,
         level_fs,
     )?
+    .set_comparator(opts.config.comparator.clone())
     // Compaction consumes input tables, so clip RTs to each output table's key range.
     .use_clip_range_tombstones();
 

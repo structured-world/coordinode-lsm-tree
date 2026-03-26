@@ -9,12 +9,13 @@
 
 use crate::range_tombstone::CoveringRt;
 use crate::range_tombstone::RangeTombstone;
-use crate::{SeqNo, UserKey};
+use crate::{SeqNo, UserKey, comparator::SharedComparator};
 use std::cmp::Ordering;
 
 /// An AVL-balanced BST keyed by range tombstone `start`, augmented with
 /// subtree-level metadata for efficient interval queries.
 pub struct IntervalTree {
+    comparator: SharedComparator,
     root: Option<Box<Node>>,
     len: usize,
 }
@@ -48,14 +49,15 @@ impl Node {
         }
     }
 
-    fn update_augmentation(&mut self) {
+    fn update_augmentation(&mut self, comparator: &dyn crate::comparator::UserComparator) {
         self.subtree_max_end = self.tombstone.end.clone();
         self.subtree_max_seqno = self.tombstone.seqno;
         self.subtree_min_seqno = self.tombstone.seqno;
         self.height = 1;
 
         if let Some(ref left) = self.left {
-            if left.subtree_max_end > self.subtree_max_end {
+            if comparator.compare(&left.subtree_max_end, &self.subtree_max_end) == Ordering::Greater
+            {
                 self.subtree_max_end = left.subtree_max_end.clone();
             }
             if left.subtree_max_seqno > self.subtree_max_seqno {
@@ -68,7 +70,9 @@ impl Node {
         }
 
         if let Some(ref right) = self.right {
-            if right.subtree_max_end > self.subtree_max_end {
+            if comparator.compare(&right.subtree_max_end, &self.subtree_max_end)
+                == Ordering::Greater
+            {
                 self.subtree_max_end = right.subtree_max_end.clone();
             }
             if right.subtree_max_seqno > self.subtree_max_seqno {
@@ -101,12 +105,15 @@ impl Node {
     clippy::unnecessary_box_returns,
     reason = "tree rotations pass Box<Node> through; unboxing would add needless allocation"
 )]
-fn rotate_right(mut node: Box<Node>) -> Box<Node> {
+fn rotate_right(
+    mut node: Box<Node>,
+    comparator: &dyn crate::comparator::UserComparator,
+) -> Box<Node> {
     let mut new_root = node.left.take().expect("rotate_right requires left child");
     node.left = new_root.right.take();
-    node.update_augmentation();
+    node.update_augmentation(comparator);
     new_root.right = Some(node);
-    new_root.update_augmentation();
+    new_root.update_augmentation(comparator);
     new_root
 }
 
@@ -120,12 +127,15 @@ fn rotate_right(mut node: Box<Node>) -> Box<Node> {
     clippy::unnecessary_box_returns,
     reason = "tree rotations pass Box<Node> through; unboxing would add needless allocation"
 )]
-fn rotate_left(mut node: Box<Node>) -> Box<Node> {
+fn rotate_left(
+    mut node: Box<Node>,
+    comparator: &dyn crate::comparator::UserComparator,
+) -> Box<Node> {
     let mut new_root = node.right.take().expect("rotate_left requires right child");
     node.right = new_root.left.take();
-    node.update_augmentation();
+    node.update_augmentation(comparator);
     new_root.left = Some(node);
-    new_root.update_augmentation();
+    new_root.update_augmentation(comparator);
     new_root
 }
 
@@ -139,8 +149,11 @@ fn rotate_left(mut node: Box<Node>) -> Box<Node> {
     clippy::unnecessary_box_returns,
     reason = "tree rotations pass Box<Node> through; unboxing would add needless allocation"
 )]
-fn balance(mut node: Box<Node>) -> Box<Node> {
-    node.update_augmentation();
+fn balance(
+    mut node: Box<Node>,
+    comparator: &dyn crate::comparator::UserComparator,
+) -> Box<Node> {
+    node.update_augmentation(comparator);
     let bf = node.balance_factor();
 
     if bf > 1 {
@@ -148,10 +161,10 @@ fn balance(mut node: Box<Node>) -> Box<Node> {
         if let Some(ref left) = node.left {
             if left.balance_factor() < 0 {
                 // Left-Right case
-                node.left = Some(rotate_left(node.left.take().expect("just checked")));
+                node.left = Some(rotate_left(node.left.take().expect("just checked"), comparator));
             }
         }
-        return rotate_right(node);
+        return rotate_right(node, comparator);
     }
 
     if bf < -1 {
@@ -159,42 +172,46 @@ fn balance(mut node: Box<Node>) -> Box<Node> {
         if let Some(ref right) = node.right {
             if right.balance_factor() > 0 {
                 // Right-Left case
-                node.right = Some(rotate_right(node.right.take().expect("just checked")));
+                node.right = Some(rotate_right(node.right.take().expect("just checked"), comparator));
             }
         }
-        return rotate_left(node);
+        return rotate_left(node, comparator);
     }
 
     node
 }
 
 /// Returns `(node, was_new)` — `was_new` is false when a duplicate was replaced.
-fn insert_node(node: Option<Box<Node>>, tombstone: RangeTombstone) -> (Box<Node>, bool) {
+fn insert_node(
+    node: Option<Box<Node>>,
+    tombstone: RangeTombstone,
+    comparator: &dyn crate::comparator::UserComparator,
+) -> (Box<Node>, bool) {
     let Some(mut node) = node else {
         return (Box::new(Node::new(tombstone)), true);
     };
 
     let was_new;
-    match tombstone.cmp(&node.tombstone) {
+    match tombstone.cmp_with_comparator(&node.tombstone, comparator) {
         Ordering::Less => {
-            let (child, new) = insert_node(node.left.take(), tombstone);
+            let (child, new) = insert_node(node.left.take(), tombstone, comparator);
             node.left = Some(child);
             was_new = new;
         }
         Ordering::Greater => {
-            let (child, new) = insert_node(node.right.take(), tombstone);
+            let (child, new) = insert_node(node.right.take(), tombstone, comparator);
             node.right = Some(child);
             was_new = new;
         }
         Ordering::Equal => {
             // Duplicate — replace (shouldn't normally happen)
             node.tombstone = tombstone;
-            node.update_augmentation();
+            node.update_augmentation(comparator);
             return (node, false);
         }
     }
 
-    (balance(node), was_new)
+    (balance(node, comparator), was_new)
 }
 
 /// Like `collect_overlapping`, but returns `true` as soon as any overlapping
@@ -205,6 +222,7 @@ fn any_overlapping_suppresses(
     key: &[u8],
     key_seqno: SeqNo,
     read_seqno: SeqNo,
+    comparator: &dyn crate::comparator::UserComparator,
 ) -> bool {
     let Some(n) = node else { return false };
 
@@ -212,22 +230,28 @@ fn any_overlapping_suppresses(
         return false;
     }
 
-    if n.subtree_max_end.as_ref() <= key {
+    if comparator.compare(&n.subtree_max_end, key) != Ordering::Greater {
         return false;
     }
 
-    if any_overlapping_suppresses(n.left.as_deref(), key, key_seqno, read_seqno) {
+    if any_overlapping_suppresses(n.left.as_deref(), key, key_seqno, read_seqno, comparator) {
         return true;
     }
 
-    if n.tombstone.start.as_ref() <= key {
-        if n.tombstone.contains_key(key)
+    if comparator.compare(&n.tombstone.start, key) != Ordering::Greater {
+        if n.tombstone.contains_key_with(key, comparator)
             && n.tombstone.visible_at(read_seqno)
             && n.tombstone.seqno > key_seqno
         {
             return true;
         }
-        return any_overlapping_suppresses(n.right.as_deref(), key, key_seqno, read_seqno);
+        return any_overlapping_suppresses(
+            n.right.as_deref(),
+            key,
+            key_seqno,
+            read_seqno,
+            comparator,
+        );
     }
 
     false
@@ -248,6 +272,7 @@ fn collect_covering(
     max: &[u8],
     read_seqno: SeqNo,
     best: &mut Option<CoveringRt>,
+    comparator: &dyn crate::comparator::UserComparator,
 ) {
     let Some(n) = node else { return };
 
@@ -258,16 +283,16 @@ fn collect_covering(
 
     // Prune: max_end <= max means no interval in subtree can fully cover [min, max]
     // (need end > max, i.e., max_end > max for half-open covering)
-    if n.subtree_max_end.as_ref() <= max {
+    if comparator.compare(&n.subtree_max_end, max) != Ordering::Greater {
         return;
     }
 
     // Recurse left
-    collect_covering(n.left.as_deref(), min, max, read_seqno, best);
+    collect_covering(n.left.as_deref(), min, max, read_seqno, best, comparator);
 
     // Check current node: must have start <= min AND max < end
-    if n.tombstone.start.as_ref() <= min
-        && n.tombstone.fully_covers(min, max)
+    if comparator.compare(&n.tombstone.start, min) != Ordering::Greater
+        && n.tombstone.fully_covers_with(min, max, comparator)
         && n.tombstone.visible_at(read_seqno)
     {
         let dominated = best.as_ref().is_some_and(|b| n.tombstone.seqno <= b.seqno);
@@ -277,8 +302,8 @@ fn collect_covering(
     }
 
     // Only go right if some right-subtree entry might have start <= min
-    if n.tombstone.start.as_ref() <= min {
-        collect_covering(n.right.as_deref(), min, max, read_seqno, best);
+    if comparator.compare(&n.tombstone.start, min) != Ordering::Greater {
+        collect_covering(n.right.as_deref(), min, max, read_seqno, best, comparator);
     }
 }
 
@@ -286,12 +311,22 @@ impl IntervalTree {
     /// Creates a new empty interval tree.
     #[must_use]
     pub fn new() -> Self {
-        Self { root: None, len: 0 }
+        Self::new_with_comparator(crate::comparator::default_comparator())
+    }
+
+    /// Creates a new empty interval tree with the given comparator.
+    #[must_use]
+    pub fn new_with_comparator(comparator: SharedComparator) -> Self {
+        Self {
+            comparator,
+            root: None,
+            len: 0,
+        }
     }
 
     /// Inserts a range tombstone into the tree. O(log n).
     pub fn insert(&mut self, tombstone: RangeTombstone) {
-        let (root, was_new) = insert_node(self.root.take(), tombstone);
+        let (root, was_new) = insert_node(self.root.take(), tombstone, self.comparator.as_ref());
         self.root = Some(root);
         if was_new {
             self.len += 1;
@@ -304,7 +339,13 @@ impl IntervalTree {
     /// O(log n + k) where k is the number of overlapping tombstones.
     /// Uses early-exit traversal to avoid allocating a Vec.
     pub fn query_suppression(&self, key: &[u8], key_seqno: SeqNo, read_seqno: SeqNo) -> bool {
-        any_overlapping_suppresses(self.root.as_deref(), key, key_seqno, read_seqno)
+        any_overlapping_suppresses(
+            self.root.as_deref(),
+            key,
+            key_seqno,
+            read_seqno,
+            self.comparator.as_ref(),
+        )
     }
 
     /// Returns the highest-seqno visible tombstone that fully covers `[min, max]`,
@@ -319,7 +360,14 @@ impl IntervalTree {
         read_seqno: SeqNo,
     ) -> Option<CoveringRt> {
         let mut best = None;
-        collect_covering(self.root.as_deref(), min, max, read_seqno, &mut best);
+        collect_covering(
+            self.root.as_deref(),
+            min,
+            max,
+            read_seqno,
+            &mut best,
+            self.comparator.as_ref(),
+        );
         best
     }
 

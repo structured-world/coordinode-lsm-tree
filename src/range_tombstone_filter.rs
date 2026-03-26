@@ -12,7 +12,7 @@
 
 use crate::active_tombstone_set::{ActiveTombstoneSet, ActiveTombstoneSetReverse};
 use crate::range_tombstone::RangeTombstone;
-use crate::{InternalValue, SeqNo};
+use crate::{InternalValue, SeqNo, comparator::SharedComparator};
 
 /// Wraps a bidirectional KV stream and suppresses entries covered by range tombstones.
 ///
@@ -21,6 +21,7 @@ use crate::{InternalValue, SeqNo};
 /// uses its own `index_seqno` while disk segments use the outer scan seqno.
 pub struct RangeTombstoneFilter<I> {
     inner: I,
+    comparator: SharedComparator,
 
     // Forward state: (tombstone, per-source cutoff)
     fwd_tombstones: Vec<(RangeTombstone, SeqNo)>,
@@ -42,16 +43,35 @@ impl<I> RangeTombstoneFilter<I> {
     /// Forward and reverse sorting is deferred to first `next()` /
     /// `next_back()` respectively, so construction is O(1).
     #[must_use]
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "backward-compatible default-comparator constructor")
+    )]
     pub fn new(inner: I, fwd_tombstones: Vec<(RangeTombstone, SeqNo)>) -> Self {
-        Self {
+        Self::new_with_comparator(
             inner,
             fwd_tombstones,
+            crate::comparator::default_comparator(),
+        )
+    }
+
+    /// Creates a new bidirectional filter with the given comparator.
+    #[must_use]
+    pub fn new_with_comparator(
+        inner: I,
+        fwd_tombstones: Vec<(RangeTombstone, SeqNo)>,
+        comparator: SharedComparator,
+    ) -> Self {
+        Self {
+            inner,
+            comparator: comparator.clone(),
+            fwd_tombstones,
             fwd_idx: 0,
-            fwd_active: ActiveTombstoneSet::new(),
+            fwd_active: ActiveTombstoneSet::new_with_comparator(comparator.clone()),
             fwd_initialized: false,
             rev_tombstones: Vec::new(),
             rev_idx: 0,
-            rev_active: ActiveTombstoneSetReverse::new(),
+            rev_active: ActiveTombstoneSetReverse::new_with_comparator(comparator),
             rev_initialized: false,
         }
     }
@@ -59,7 +79,9 @@ impl<I> RangeTombstoneFilter<I> {
     /// Ensures forward tombstones are sorted (start asc, seqno desc, end asc).
     fn ensure_fwd_initialized(&mut self) {
         if !self.fwd_initialized {
-            self.fwd_tombstones.sort_by(|a, b| a.0.cmp(&b.0));
+            let comparator = self.comparator.as_ref();
+            self.fwd_tombstones
+                .sort_by(|a, b| a.0.cmp_with_comparator(&b.0, comparator));
             self.fwd_initialized = true;
         }
     }
@@ -71,8 +93,13 @@ impl<I> RangeTombstoneFilter<I> {
             // preserving tie-breaking semantics from the pre-lazy implementation.
             self.ensure_fwd_initialized();
             self.rev_tombstones = self.fwd_tombstones.clone();
-            self.rev_tombstones
-                .sort_by(|a, b| (&b.0.end, &b.0.seqno).cmp(&(&a.0.end, &a.0.seqno)));
+            let comparator = self.comparator.as_ref();
+            self.rev_tombstones.sort_by(|a, b| {
+                comparator
+                    .compare(&b.0.end, &a.0.end)
+                    .then_with(|| b.0.seqno.cmp(&a.0.seqno))
+                    .then_with(|| comparator.compare(&a.0.start, &b.0.start))
+            });
             self.rev_initialized = true;
         }
     }
@@ -80,7 +107,7 @@ impl<I> RangeTombstoneFilter<I> {
     /// Activates forward tombstones whose start <= `current_key`.
     fn fwd_activate_up_to(&mut self, key: &[u8]) {
         while let Some((rt, cutoff)) = self.fwd_tombstones.get(self.fwd_idx) {
-            if rt.start.as_ref() <= key {
+            if self.comparator.compare(&rt.start, key) != std::cmp::Ordering::Greater {
                 self.fwd_active.activate(rt, *cutoff);
                 self.fwd_idx += 1;
             } else {
@@ -92,7 +119,7 @@ impl<I> RangeTombstoneFilter<I> {
     /// Activates reverse tombstones whose end > `current_key`.
     fn rev_activate_up_to(&mut self, key: &[u8]) {
         while let Some((rt, cutoff)) = self.rev_tombstones.get(self.rev_idx) {
-            if rt.end.as_ref() > key {
+            if self.comparator.compare(&rt.end, key) == std::cmp::Ordering::Greater {
                 self.rev_active.activate(rt, *cutoff);
                 self.rev_idx += 1;
             } else {

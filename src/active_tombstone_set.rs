@@ -12,9 +12,12 @@
 //! A unique monotonic `id` on each heap entry ensures total ordering in the
 //! heap (no equality on the tuple), which makes expiry deterministic.
 
-use crate::{SeqNo, UserKey, range_tombstone::RangeTombstone};
-use std::cmp::Reverse;
-use std::collections::{BTreeMap, BinaryHeap};
+use crate::{
+    SeqNo, UserKey,
+    comparator::SharedComparator,
+    range_tombstone::RangeTombstone,
+};
+use std::collections::BTreeMap;
 
 /// Tracks active range tombstones during forward iteration.
 ///
@@ -24,18 +27,30 @@ use std::collections::{BTreeMap, BinaryHeap};
 /// Uses a min-heap (via `Reverse`) keyed by `(end, id, seqno)` so the
 /// tombstone expiring soonest (smallest `end`) is at the top.
 pub struct ActiveTombstoneSet {
+    comparator: SharedComparator,
     seqno_counts: BTreeMap<SeqNo, u32>,
-    pending_expiry: BinaryHeap<Reverse<(UserKey, u64, SeqNo)>>,
+    pending_expiry: Vec<(UserKey, u64, SeqNo)>,
     next_id: u64,
 }
 
 impl ActiveTombstoneSet {
     /// Creates a new forward active tombstone set.
     #[must_use]
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "backward-compatible default-comparator constructor")
+    )]
     pub fn new() -> Self {
+        Self::new_with_comparator(crate::comparator::default_comparator())
+    }
+
+    /// Creates a new forward active tombstone set with the given comparator.
+    #[must_use]
+    pub fn new_with_comparator(comparator: SharedComparator) -> Self {
         Self {
+            comparator,
             seqno_counts: BTreeMap::new(),
-            pending_expiry: BinaryHeap::new(),
+            pending_expiry: Vec::new(),
             next_id: 0,
         }
     }
@@ -54,8 +69,13 @@ impl ActiveTombstoneSet {
         let id = self.next_id;
         self.next_id += 1;
         *self.seqno_counts.entry(rt.seqno).or_insert(0) += 1;
-        self.pending_expiry
-            .push(Reverse((rt.end.clone(), id, rt.seqno)));
+        self.pending_expiry.push((rt.end.clone(), id, rt.seqno));
+        let comparator = self.comparator.as_ref();
+        self.pending_expiry.sort_unstable_by(|a, b| {
+            comparator
+                .compare(&b.0, &a.0)
+                .then_with(|| b.1.cmp(&a.1))
+        });
     }
 
     /// Expires tombstones whose `end <= current_key`.
@@ -68,8 +88,8 @@ impl ActiveTombstoneSet {
     ///
     /// Panics if an expiry pop has no matching activation in the seqno multiset.
     pub fn expire_until(&mut self, current_key: &[u8]) {
-        while let Some(Reverse((end, _, seqno))) = self.pending_expiry.peek() {
-            if current_key >= end.as_ref() {
+        while let Some((end, _, seqno)) = self.pending_expiry.last() {
+            if self.comparator.compare(end, current_key) != std::cmp::Ordering::Greater {
                 let seqno = *seqno;
                 self.pending_expiry.pop();
                 #[expect(
@@ -147,18 +167,30 @@ impl ActiveTombstoneSet {
 /// Uses a max-heap keyed by `(start, id, seqno)` so the tombstone
 /// expiring soonest (largest `start`) is at the top.
 pub struct ActiveTombstoneSetReverse {
+    comparator: SharedComparator,
     seqno_counts: BTreeMap<SeqNo, u32>,
-    pending_expiry: BinaryHeap<(UserKey, u64, SeqNo)>,
+    pending_expiry: Vec<(UserKey, u64, SeqNo)>,
     next_id: u64,
 }
 
 impl ActiveTombstoneSetReverse {
     /// Creates a new reverse active tombstone set.
     #[must_use]
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "backward-compatible default-comparator constructor")
+    )]
     pub fn new() -> Self {
+        Self::new_with_comparator(crate::comparator::default_comparator())
+    }
+
+    /// Creates a new reverse active tombstone set with the given comparator.
+    #[must_use]
+    pub fn new_with_comparator(comparator: SharedComparator) -> Self {
         Self {
+            comparator,
             seqno_counts: BTreeMap::new(),
-            pending_expiry: BinaryHeap::new(),
+            pending_expiry: Vec::new(),
             next_id: 0,
         }
     }
@@ -182,6 +214,12 @@ impl ActiveTombstoneSetReverse {
         self.next_id += 1;
         *self.seqno_counts.entry(rt.seqno).or_insert(0) += 1;
         self.pending_expiry.push((rt.start.clone(), id, rt.seqno));
+        let comparator = self.comparator.as_ref();
+        self.pending_expiry.sort_unstable_by(|a, b| {
+            comparator
+                .compare(&a.0, &b.0)
+                .then_with(|| b.1.cmp(&a.1))
+        });
     }
 
     /// Expires tombstones whose `start > current_key`.
@@ -193,8 +231,8 @@ impl ActiveTombstoneSetReverse {
     ///
     /// Panics if an expiry pop has no matching activation in the seqno multiset.
     pub fn expire_until(&mut self, current_key: &[u8]) {
-        while let Some((start, _, seqno)) = self.pending_expiry.peek() {
-            if current_key < start.as_ref() {
+        while let Some((start, _, seqno)) = self.pending_expiry.last() {
+            if self.comparator.compare(current_key, start) == std::cmp::Ordering::Less {
                 let seqno = *seqno;
                 self.pending_expiry.pop();
                 #[expect(

@@ -5,7 +5,7 @@
 use crate::double_ended_peekable::{DoubleEndedPeekable, DoubleEndedPeekableExt};
 use crate::merge_operator::MergeOperator;
 use crate::range_tombstone::RangeTombstone;
-use crate::{InternalValue, SeqNo, UserKey, UserValue, ValueType};
+use crate::{InternalValue, SeqNo, UserKey, UserValue, ValueType, comparator::SharedComparator};
 use std::sync::Arc;
 
 /// Consumes a stream of KVs and emits a new stream according to MVCC and tombstone rules
@@ -14,6 +14,7 @@ use std::sync::Arc;
 pub struct MvccStream<I: DoubleEndedIterator<Item = crate::Result<InternalValue>>> {
     inner: DoubleEndedPeekable<crate::Result<InternalValue>, I>,
     merge_operator: Option<Arc<dyn MergeOperator>>,
+    comparator: SharedComparator,
 
     /// Range tombstones with per-source visibility cutoffs. When set, merge
     /// resolution skips entries suppressed by an RT (treats them as a
@@ -29,9 +30,20 @@ impl<I: DoubleEndedIterator<Item = crate::Result<InternalValue>>> MvccStream<I> 
     /// Initializes a new multi-version-aware iterator.
     #[must_use]
     pub fn new(iter: I, merge_operator: Option<Arc<dyn MergeOperator>>) -> Self {
+        Self::new_with_comparator(iter, merge_operator, crate::comparator::default_comparator())
+    }
+
+    /// Initializes a new multi-version-aware iterator with the given comparator.
+    #[must_use]
+    pub fn new_with_comparator(
+        iter: I,
+        merge_operator: Option<Arc<dyn MergeOperator>>,
+        comparator: SharedComparator,
+    ) -> Self {
         Self {
             inner: iter.double_ended_peekable(),
             merge_operator,
+            comparator,
             range_tombstones: Vec::new(),
             key_entries_buf: Vec::new(),
         }
@@ -49,9 +61,14 @@ impl<I: DoubleEndedIterator<Item = crate::Result<InternalValue>>> MvccStream<I> 
 
     /// Returns true if the entry is suppressed by any installed range tombstone.
     fn is_rt_suppressed(&self, entry: &InternalValue) -> bool {
-        self.range_tombstones
-            .iter()
-            .any(|(rt, cutoff)| rt.should_suppress(&entry.key.user_key, entry.key.seqno, *cutoff))
+        self.range_tombstones.iter().any(|(rt, cutoff)| {
+            rt.should_suppress_with(
+                &entry.key.user_key,
+                entry.key.seqno,
+                *cutoff,
+                self.comparator.as_ref(),
+            )
+        })
     }
 
     /// Collects all entries for the given key and applies the merge operator (forward).

@@ -50,11 +50,6 @@ pub struct Memtable {
     /// starvation is not a concern here: range deletes are rare, the write-side
     /// critical section is O(log n) with n typically small, and the memtable
     /// rotates (becoming read-only) well before contention could accumulate.
-    // NOTE: The interval tree uses lexicographic `Ord` on `UserKey` for
-    // containment queries. With a custom comparator, RT suppression in
-    // the memtable may produce incorrect results for non-lexicographic
-    // orderings. Threading the comparator into the AVL tree is tracked
-    // as a follow-up issue.
     pub(crate) range_tombstones: RwLock<interval_tree::IntervalTree>,
 
     /// Approximate active memtable size.
@@ -98,8 +93,10 @@ impl Memtable {
         Self {
             id,
             items: skiplist::SkipMap::new(comparator.clone()),
-            comparator,
-            range_tombstones: RwLock::new(interval_tree::IntervalTree::new()),
+            comparator: comparator.clone(),
+            range_tombstones: RwLock::new(interval_tree::IntervalTree::new_with_comparator(
+                comparator.clone(),
+            )),
             approximate_size: AtomicU64::default(),
             highest_seqno: AtomicU64::default(),
             requested_rotation: AtomicBool::default(),
@@ -236,7 +233,7 @@ impl Memtable {
         );
 
         // Reject invalid intervals in release builds (debug_assert is not enough)
-        if start >= end {
+        if self.comparator.compare(&start, &end) != std::cmp::Ordering::Less {
             return 0;
         }
 

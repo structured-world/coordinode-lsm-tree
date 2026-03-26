@@ -47,6 +47,7 @@ pub struct MultiWriter {
     bloom_policy: BloomConstructionPolicy,
 
     current_key: Option<UserKey>,
+    comparator: crate::SharedComparator,
 
     linked_blobs: HashMap<BlobFileId, LinkedFile>,
 
@@ -112,6 +113,7 @@ impl MultiWriter {
             bloom_policy: BloomConstructionPolicy::default(),
 
             current_key: None,
+            comparator: crate::comparator::default_comparator(),
 
             linked_blobs: HashMap::default(),
             range_tombstones: Vec::new(),
@@ -129,6 +131,12 @@ impl MultiWriter {
     /// Enables RT clipping: each tombstone is intersected with the output
     /// table's KV key range. Use this for compaction where input tables are
     /// consumed; do NOT use for flush where RTs must cover older SSTs.
+    #[must_use]
+    pub fn set_comparator(mut self, comparator: crate::SharedComparator) -> Self {
+        self.comparator = comparator;
+        self
+    }
+
     #[must_use]
     pub fn use_clip_range_tombstones(mut self) -> Self {
         self.clip_range_tombstones = true;
@@ -155,6 +163,7 @@ impl MultiWriter {
         clip: bool,
         writer: &mut Writer,
         clip_upper: Option<&UserKey>,
+        comparator: &dyn crate::comparator::UserComparator,
     ) {
         if let (Some(first_key), Some(last_key)) =
             (writer.meta.first_key.clone(), writer.meta.last_key.clone())
@@ -179,7 +188,11 @@ impl MultiWriter {
 
                 if let Some(max_exclusive) = max_exclusive {
                     for rt in tombstones {
-                        if let Some(clipped) = rt.intersect_opt(first_key.as_ref(), max_exclusive) {
+                        if let Some(clipped) = rt.intersect_opt_with(
+                            first_key.as_ref(),
+                            max_exclusive,
+                            comparator,
+                        ) {
                             // Widen last_key so point reads for keys in the
                             // gap will consult this table for RT suppression.
                             //
@@ -197,9 +210,14 @@ impl MultiWriter {
                             // Only last_key needs widening: intersect_opt
                             // already clamps clipped.start >= first_key.
                             if let Some(existing) = &mut writer.meta.last_key {
-                                let safe = clip_upper
-                                    .is_some_and(|upper| clipped.end.as_ref() < upper.as_ref());
-                                if safe && clipped.end.as_ref() > existing.as_ref() {
+                                let safe = clip_upper.is_some_and(|upper| {
+                                    comparator.compare(&clipped.end, upper.as_ref())
+                                        == std::cmp::Ordering::Less
+                                });
+                                if safe
+                                    && comparator.compare(&clipped.end, existing.as_ref())
+                                        == std::cmp::Ordering::Greater
+                                {
                                     *existing = clipped.end.clone();
                                 }
                             }
@@ -214,13 +232,17 @@ impl MultiWriter {
                     // unchanged; widening it during compaction would break the
                     // disjoint-run invariant that point reads rely on.
                     for rt in tombstones {
-                        let clipped_start = if rt.start.as_ref() > first_key.as_ref() {
+                        let clipped_start = if comparator.compare(&rt.start, first_key.as_ref())
+                            == std::cmp::Ordering::Greater
+                        {
                             rt.start.as_ref()
                         } else {
                             first_key.as_ref()
                         };
 
-                        if clipped_start < rt.end.as_ref() {
+                        if comparator.compare(clipped_start, &rt.end)
+                            == std::cmp::Ordering::Less
+                        {
                             writer.write_range_tombstone(RangeTombstone::new(
                                 UserKey::from(clipped_start),
                                 rt.end.clone(),
@@ -242,7 +264,9 @@ impl MultiWriter {
                 for rt in tombstones {
                     match &mut writer.meta.first_key {
                         Some(existing) => {
-                            if rt.start.as_ref() < existing.as_ref() {
+                            if comparator.compare(&rt.start, existing.as_ref())
+                                == std::cmp::Ordering::Less
+                            {
                                 *existing = rt.start.clone();
                             }
                         }
@@ -252,7 +276,9 @@ impl MultiWriter {
                     }
                     match &mut writer.meta.last_key {
                         Some(existing) => {
-                            if rt.end.as_ref() > existing.as_ref() {
+                            if comparator.compare(&rt.end, existing.as_ref())
+                                == std::cmp::Ordering::Greater
+                            {
                                 *existing = rt.end.clone();
                             }
                         }
@@ -425,6 +451,7 @@ impl MultiWriter {
                 self.clip_range_tombstones,
                 &mut old_writer,
                 self.current_key.as_ref(),
+                self.comparator.as_ref(),
             );
         }
 
@@ -476,6 +503,7 @@ impl MultiWriter {
                 self.clip_range_tombstones,
                 &mut self.writer,
                 None,
+                self.comparator.as_ref(),
             );
         }
 
