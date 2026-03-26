@@ -28,6 +28,8 @@ impl Slice {
     #[doc(hidden)]
     #[must_use]
     pub unsafe fn builder_unzeroed(len: usize) -> Builder {
+        // SAFETY: callers opt into the uninitialized builder contract via this
+        // unsafe API and must fully initialize the returned buffer before any read.
         unsafe { ByteView::builder_unzeroed(len) }
     }
 

@@ -167,7 +167,7 @@ impl ActiveTombstoneSet {
 /// a key < `end` (strict `>`: `rt.end > current_key`), and expired when
 /// `current_key < rt.start`.
 ///
-/// Uses a sorted vector keyed by `(start desc, id asc)` in comparator order,
+/// Uses a sorted vector keyed by `(start asc, id asc)` in comparator order,
 /// with the expiring-soonest tombstone kept at the tail for cheap `last()`.
 pub struct ActiveTombstoneSetReverse {
     comparator: SharedComparator,
