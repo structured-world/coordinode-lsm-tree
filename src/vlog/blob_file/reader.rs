@@ -247,12 +247,7 @@ impl<'a> Reader<'a> {
 }
 
 #[cfg(test)]
-#[allow(
-    clippy::unwrap_used,
-    clippy::indexing_slicing,
-    clippy::useless_vec,
-    reason = "test code"
-)]
+#[expect(clippy::unwrap_used, clippy::indexing_slicing, reason = "test code")]
 mod tests {
     use super::*;
     use crate::SequenceNumberCounter;
