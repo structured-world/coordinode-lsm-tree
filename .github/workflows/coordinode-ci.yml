@@ -23,7 +23,7 @@ jobs:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.94.0
+          toolchain: stable
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - name: Format
@@ -37,7 +37,7 @@ jobs:
     strategy:
       fail-fast: true
       matrix:
-        rust: ["1.94.0", "1.92.0"]
+        rust: [stable, "1.92.0"]
         os: [ubuntu-latest, windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
@@ -76,7 +76,7 @@ jobs:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.94.0
+          toolchain: stable
       - name: Install cross
         run: cargo install cross
       - name: Cross test
