@@ -723,10 +723,12 @@ impl Block {
 }
 
 #[cfg(test)]
-#[expect(
+#[allow(
     clippy::unwrap_used,
     clippy::indexing_slicing,
     clippy::useless_vec,
+    clippy::cast_possible_truncation,
+    clippy::expect_used,
     reason = "test code"
 )]
 mod tests {

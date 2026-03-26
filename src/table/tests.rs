@@ -2,6 +2,12 @@
 // This source code is licensed under both the Apache 2.0 and MIT License
 // (found in the LICENSE-* files in the repository)
 
+#![allow(
+    clippy::doc_markdown,
+    clippy::default_trait_access,
+    clippy::expect_used
+)]
+
 use super::*;
 use crate::{
     config::BloomConstructionPolicy, fs::StdFs,
@@ -33,10 +39,10 @@ fn test_with_table(
         }
 
         for (idx, item) in items.iter().enumerate() {
-            if let Some(rotate) = rotate_every {
-                if idx % rotate == 0 {
-                    writer.spill_block()?;
-                }
+            if let Some(rotate) = rotate_every
+                && idx % rotate == 0
+            {
+                writer.spill_block()?;
             }
             writer.write(item.clone())?;
         }
@@ -221,10 +227,10 @@ fn test_with_table(
         }
 
         for (idx, item) in items.iter().enumerate() {
-            if let Some(rotate) = rotate_every {
-                if idx % rotate == 0 {
-                    writer.spill_block()?;
-                }
+            if let Some(rotate) = rotate_every
+                && idx % rotate == 0
+            {
+                writer.spill_block()?;
             }
             writer.write(item.clone())?;
         }
@@ -1349,7 +1355,7 @@ fn table_partitioned_index() -> crate::Result<()> {
         None,
         crate::comparator::default_comparator(),
         #[cfg(feature = "metrics")]
-        Default::default(),
+        Arc::default(),
     )
     .unwrap();
 
@@ -1463,7 +1469,7 @@ fn table_global_seqno() -> crate::Result<()> {
         None,
         crate::comparator::default_comparator(),
         #[cfg(feature = "metrics")]
-        Default::default(),
+        Arc::default(),
     )
     .unwrap();
 
@@ -1850,8 +1856,8 @@ fn meta_seqno_kv_max_corruption_returns_invalid_data() -> crate::Result<()> {
     Ok(())
 }
 
-/// bloom_may_contain_key with full (non-partitioned) filter delegates to
-/// bloom_may_contain_hash. Both methods agree for full filters.
+/// `bloom_may_contain_key` with full (non-partitioned) filter delegates to
+/// `bloom_may_contain_hash`. Both methods agree for full filters.
 #[test]
 fn bloom_may_contain_key_full_filter() -> crate::Result<()> {
     let items: Vec<InternalValue> = ["a", "c", "e"]
@@ -1894,10 +1900,10 @@ fn bloom_may_contain_key_full_filter() -> crate::Result<()> {
     )
 }
 
-/// bloom_may_contain_key with partitioned filter seeks the correct partition
+/// `bloom_may_contain_key` with partitioned filter seeks the correct partition
 /// and returns Ok(false) for a key beyond all partition boundaries.
 ///
-/// Contrast: bloom_may_contain_key_hash returns Ok(true) conservatively
+/// Contrast: `bloom_may_contain_key_hash` returns Ok(true) conservatively
 /// for the same key because it cannot seek partitions by hash alone.
 /// This is the core behavioral improvement introduced by this PR.
 #[test]

@@ -16,12 +16,15 @@ use std::collections::BTreeMap;
 // Oracle
 // ---------------------------------------------------------------------------
 
+type VersionedKey = (Vec<u8>, Reverse<u64>);
+type VersionedValue = Option<Vec<u8>>;
+
 /// Simplified MVCC oracle without range tombstones.
 /// Range tombstone testing is in prop_range_tombstone.rs.
 #[derive(Debug, Clone)]
 struct Oracle {
     /// (key, Reverse(seqno)) -> Some(value) for puts, None for tombstones.
-    data: BTreeMap<(Vec<u8>, Reverse<u64>), Option<Vec<u8>>>,
+    data: BTreeMap<VersionedKey, VersionedValue>,
 }
 
 impl Oracle {

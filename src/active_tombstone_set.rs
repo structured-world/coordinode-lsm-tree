@@ -12,11 +12,7 @@
 //! A unique monotonic `id` on each expiry entry ensures total ordering even
 //! when multiple tombstones share the same boundary key.
 
-use crate::{
-    SeqNo, UserKey,
-    comparator::SharedComparator,
-    range_tombstone::RangeTombstone,
-};
+use crate::{SeqNo, UserKey, comparator::SharedComparator, range_tombstone::RangeTombstone};
 use std::collections::BTreeMap;
 
 /// Tracks active range tombstones during forward iteration.
@@ -38,7 +34,10 @@ impl ActiveTombstoneSet {
     #[must_use]
     #[cfg_attr(
         not(test),
-        expect(dead_code, reason = "backward-compatible default-comparator constructor")
+        expect(
+            dead_code,
+            reason = "backward-compatible default-comparator constructor"
+        )
     )]
     pub fn new() -> Self {
         Self::new_with_comparator(crate::comparator::default_comparator())
@@ -94,23 +93,22 @@ impl ActiveTombstoneSet {
     /// Panics if an expiry pop has no matching activation in the seqno multiset.
     pub fn expire_until(&mut self, current_key: &[u8]) {
         while let Some((end, _, seqno)) = self.pending_expiry.last() {
-            if self.comparator.compare(end, current_key) != std::cmp::Ordering::Greater {
-                let seqno = *seqno;
-                self.pending_expiry.pop();
-                #[expect(
-                    clippy::expect_used,
-                    reason = "expiry pop must have matching activation"
-                )]
-                let count = self
-                    .seqno_counts
-                    .get_mut(&seqno)
-                    .expect("expiry pop must have matching activation");
-                *count -= 1;
-                if *count == 0 {
-                    self.seqno_counts.remove(&seqno);
-                }
-            } else {
+            if self.comparator.compare(end, current_key) == std::cmp::Ordering::Greater {
                 break;
+            }
+            let seqno = *seqno;
+            self.pending_expiry.pop();
+            #[expect(
+                clippy::expect_used,
+                reason = "expiry pop must have matching activation"
+            )]
+            let count = self
+                .seqno_counts
+                .get_mut(&seqno)
+                .expect("expiry pop must have matching activation");
+            *count -= 1;
+            if *count == 0 {
+                self.seqno_counts.remove(&seqno);
             }
         }
     }
@@ -183,7 +181,10 @@ impl ActiveTombstoneSetReverse {
     #[must_use]
     #[cfg_attr(
         not(test),
-        expect(dead_code, reason = "backward-compatible default-comparator constructor")
+        expect(
+            dead_code,
+            reason = "backward-compatible default-comparator constructor"
+        )
     )]
     pub fn new() -> Self {
         Self::new_with_comparator(crate::comparator::default_comparator())
@@ -224,11 +225,11 @@ impl ActiveTombstoneSetReverse {
             .binary_search_by(|(start, existing_id, _)| {
                 comparator
                     .compare(start, &rt.start)
-                    .reverse()
                     .then_with(|| existing_id.cmp(&id))
             })
             .unwrap_or_else(|idx| idx);
-        self.pending_expiry.insert(pos, (rt.start.clone(), id, rt.seqno));
+        self.pending_expiry
+            .insert(pos, (rt.start.clone(), id, rt.seqno));
     }
 
     /// Expires tombstones whose `start > current_key`.

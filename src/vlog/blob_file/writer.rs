@@ -373,6 +373,10 @@ mod tests {
         let path = folder.path().join("test.blob");
         let mut writer = Writer::new(&path, 0, 0, &StdFs)?;
 
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "MAX_DECOMPRESSION_SIZE fits in u32"
+        )]
         let oversize = MAX_DECOMPRESSION_SIZE as u32 + 1;
         let result = writer.write_raw(b"key", 0, b"small-on-disk", oversize);
         assert!(
@@ -388,6 +392,10 @@ mod tests {
         let path = folder.path().join("test.blob");
         let mut writer = Writer::new(&path, 0, 0, &StdFs)?;
 
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "MAX_DECOMPRESSION_SIZE fits in u32"
+        )]
         let at_limit = MAX_DECOMPRESSION_SIZE as u32;
         let result = writer.write_raw(b"key", 0, b"small-on-disk", at_limit);
         assert!(result.is_ok(), "expected Ok, got: {result:?}");
@@ -401,6 +409,10 @@ mod tests {
         let mut writer = Writer::new(&path, 0, 0, &StdFs)?;
 
         let oversize_value = vec![0u8; MAX_DECOMPRESSION_SIZE + 1];
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "MAX_DECOMPRESSION_SIZE fits in u32"
+        )]
         let result = writer.write_raw(b"key", 0, &oversize_value, MAX_DECOMPRESSION_SIZE as u32);
         assert!(
             matches!(result, Err(crate::Error::DecompressedSizeTooLarge { .. })),

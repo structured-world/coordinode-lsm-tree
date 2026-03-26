@@ -352,7 +352,11 @@ impl TreeIter {
                         .range_tombstones_sorted()
                         .into_iter()
                         .filter(|rt| {
-                            range_tombstone_overlaps_bounds(rt, &user_range, lock.comparator.as_ref())
+                            range_tombstone_overlaps_bounds(
+                                rt,
+                                &user_range,
+                                lock.comparator.as_ref(),
+                            )
                         })
                         .map(|rt| (rt, seqno)),
                 );
@@ -372,7 +376,11 @@ impl TreeIter {
                         .range_tombstones_sorted()
                         .into_iter()
                         .filter(|rt| {
-                            range_tombstone_overlaps_bounds(rt, &user_range, lock.comparator.as_ref())
+                            range_tombstone_overlaps_bounds(
+                                rt,
+                                &user_range,
+                                lock.comparator.as_ref(),
+                            )
                         })
                         .map(|rt| (rt, seqno)),
                 );
@@ -614,9 +622,8 @@ impl TreeIter {
             // RTs are collected), so only SST RTs are present. The later sort
             // covers the complete list. Both sorts are O(n log n) on their
             // respective subsets; the SST-only subset is typically small.
-            all_range_tombstones.sort_unstable_by(|(a, _), (b, _)| {
-                lock.comparator.compare(&a.start, &b.start)
-            });
+            all_range_tombstones
+                .sort_unstable_by(|(a, _), (b, _)| lock.comparator.compare(&a.start, &b.start));
 
             for table in single_tables {
                 // Table-skip: if a range tombstone fully covers this table
@@ -634,10 +641,9 @@ impl TreeIter {
                 let table_max: &[u8] = table.metadata.key_range.max().as_ref();
                 let table_kv_seqno = table.get_highest_kv_seqno();
 
-                let candidate_end =
-                    all_range_tombstones.partition_point(|(rt, _)| {
-                        lock.comparator.compare(&rt.start, table_min) != std::cmp::Ordering::Greater
-                    });
+                let candidate_end = all_range_tombstones.partition_point(|(rt, _)| {
+                    lock.comparator.compare(&rt.start, table_min) != std::cmp::Ordering::Greater
+                });
 
                 let is_covered =
                     all_range_tombstones
@@ -683,7 +689,11 @@ impl TreeIter {
                         .range_tombstones_sorted()
                         .into_iter()
                         .filter(|rt| {
-                            range_tombstone_overlaps_bounds(rt, &user_range, lock.comparator.as_ref())
+                            range_tombstone_overlaps_bounds(
+                                rt,
+                                &user_range,
+                                lock.comparator.as_ref(),
+                            )
                         })
                         .map(|rt| (rt, seqno)),
                 );
@@ -704,7 +714,11 @@ impl TreeIter {
                         .range_tombstones_sorted()
                         .into_iter()
                         .filter(|rt| {
-                            range_tombstone_overlaps_bounds(rt, &user_range, lock.comparator.as_ref())
+                            range_tombstone_overlaps_bounds(
+                                rt,
+                                &user_range,
+                                lock.comparator.as_ref(),
+                            )
                         })
                         .map(|rt| (rt, seqno)),
                 );
@@ -722,7 +736,11 @@ impl TreeIter {
                     mt.range_tombstones_sorted()
                         .into_iter()
                         .filter(|rt| {
-                            range_tombstone_overlaps_bounds(rt, &user_range, lock.comparator.as_ref())
+                            range_tombstone_overlaps_bounds(
+                                rt,
+                                &user_range,
+                                lock.comparator.as_ref(),
+                            )
                         })
                         .map(|rt| (rt, *eph_seqno)),
                 );
@@ -756,9 +774,8 @@ impl TreeIter {
             // When the same RT appears from different sources with different
             // cutoffs (e.g., persisted SST + ephemeral), keep the max cutoff
             // so the RT stays visible if ANY source's snapshot includes it.
-            all_range_tombstones.sort_by(|a, b| {
-                a.0.cmp_with_comparator(&b.0, lock.comparator.as_ref())
-            });
+            all_range_tombstones
+                .sort_by(|a, b| a.0.cmp_with_comparator(&b.0, lock.comparator.as_ref()));
             all_range_tombstones.dedup_by(|a, b| {
                 if a.0 == b.0 {
                     // dedup_by passes (a=later, b=earlier); b survives, a is

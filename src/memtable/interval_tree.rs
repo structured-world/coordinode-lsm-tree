@@ -149,31 +149,34 @@ fn rotate_left(
     clippy::unnecessary_box_returns,
     reason = "tree rotations pass Box<Node> through; unboxing would add needless allocation"
 )]
-fn balance(
-    mut node: Box<Node>,
-    comparator: &dyn crate::comparator::UserComparator,
-) -> Box<Node> {
+fn balance(mut node: Box<Node>, comparator: &dyn crate::comparator::UserComparator) -> Box<Node> {
     node.update_augmentation(comparator);
     let bf = node.balance_factor();
 
     if bf > 1 {
         // Left-heavy
-        if let Some(ref left) = node.left {
-            if left.balance_factor() < 0 {
-                // Left-Right case
-                node.left = Some(rotate_left(node.left.take().expect("just checked"), comparator));
-            }
+        if let Some(ref left) = node.left
+            && left.balance_factor() < 0
+        {
+            // Left-Right case
+            node.left = Some(rotate_left(
+                node.left.take().expect("just checked"),
+                comparator,
+            ));
         }
         return rotate_right(node, comparator);
     }
 
     if bf < -1 {
         // Right-heavy
-        if let Some(ref right) = node.right {
-            if right.balance_factor() > 0 {
-                // Right-Left case
-                node.right = Some(rotate_right(node.right.take().expect("just checked"), comparator));
-            }
+        if let Some(ref right) = node.right
+            && right.balance_factor() > 0
+        {
+            // Right-Left case
+            node.right = Some(rotate_right(
+                node.right.take().expect("just checked"),
+                comparator,
+            ));
         }
         return rotate_left(node, comparator);
     }

@@ -30,7 +30,11 @@ impl<I: DoubleEndedIterator<Item = crate::Result<InternalValue>>> MvccStream<I> 
     /// Initializes a new multi-version-aware iterator.
     #[must_use]
     pub fn new(iter: I, merge_operator: Option<Arc<dyn MergeOperator>>) -> Self {
-        Self::new_with_comparator(iter, merge_operator, crate::comparator::default_comparator())
+        Self::new_with_comparator(
+            iter,
+            merge_operator,
+            crate::comparator::default_comparator(),
+        )
     }
 
     /// Initializes a new multi-version-aware iterator with the given comparator.
@@ -251,11 +255,11 @@ impl<I: DoubleEndedIterator<Item = crate::Result<InternalValue>>> Iterator for M
         if head.key.value_type.is_merge_operand() {
             // Clone the Arc (not the operator) — resolve_merge_forward needs
             // &mut self which conflicts with borrowing self.merge_operator.
-            if let Some(merge_op) = self.merge_operator.clone() {
-                if !self.is_rt_suppressed(&head) {
-                    let result = self.resolve_merge_forward(&head, merge_op.as_ref());
-                    return Some(result);
-                }
+            if let Some(merge_op) = self.merge_operator.clone()
+                && !self.is_rt_suppressed(&head)
+            {
+                let result = self.resolve_merge_forward(&head, merge_op.as_ref());
+                return Some(result);
             }
         }
 
@@ -340,8 +344,8 @@ impl<I: DoubleEndedIterator<Item = crate::Result<InternalValue>>> DoubleEndedIte
 }
 
 #[cfg(test)]
-#[expect(clippy::string_lit_as_bytes)]
-#[expect(
+#[allow(clippy::string_lit_as_bytes)]
+#[allow(
     clippy::unwrap_used,
     clippy::indexing_slicing,
     clippy::useless_vec,
@@ -947,6 +951,7 @@ mod tests {
         Ok(())
     }
 
+    #[allow(clippy::doc_markdown, clippy::unnecessary_wraps)]
     mod merge_operator_tests {
         use super::*;
         use std::sync::Arc;
@@ -976,8 +981,8 @@ mod tests {
             }
         }
 
-        fn merge_op() -> Option<Arc<dyn crate::merge_operator::MergeOperator>> {
-            Some(Arc::new(ConcatMerge))
+        fn merge_op() -> Arc<dyn crate::merge_operator::MergeOperator> {
+            Arc::new(ConcatMerge)
         }
 
         #[test]
@@ -989,7 +994,7 @@ mod tests {
             ];
 
             let iter = Box::new(vec.into_iter().map(Ok));
-            let mut iter = MvccStream::new(iter, merge_op());
+            let mut iter = MvccStream::new(iter, Some(merge_op()));
 
             let item = iter.next().unwrap()?;
             assert_eq!(item.key.value_type, ValueType::Value);
@@ -1009,7 +1014,7 @@ mod tests {
             ];
 
             let iter = Box::new(vec.into_iter().map(Ok));
-            let mut iter = MvccStream::new(iter, merge_op());
+            let mut iter = MvccStream::new(iter, Some(merge_op()));
 
             let item = iter.next().unwrap()?;
             assert_eq!(&*item.value, b"base,op1,op2");
@@ -1028,7 +1033,7 @@ mod tests {
             ];
 
             let iter = Box::new(vec.into_iter().map(Ok));
-            let mut iter = MvccStream::new(iter, merge_op());
+            let mut iter = MvccStream::new(iter, Some(merge_op()));
 
             // Merge above tombstone: no base
             let item = iter.next().unwrap()?;
@@ -1039,7 +1044,7 @@ mod tests {
         }
 
         #[test]
-        #[expect(clippy::unwrap_used, reason = "test assertion")]
+        #[allow(clippy::unwrap_used, reason = "test assertion")]
         fn mvcc_merge_forward_mixed_keys() -> crate::Result<()> {
             let vec = vec![
                 InternalValue::from_components("a", "val_a", 5, ValueType::Value),
@@ -1049,7 +1054,7 @@ mod tests {
             ];
 
             let iter = Box::new(vec.into_iter().map(Ok));
-            let iter = MvccStream::new(iter, merge_op());
+            let iter = MvccStream::new(iter, Some(merge_op()));
             let out: Vec<_> = iter.map(Result::unwrap).collect();
 
             assert_eq!(out.len(), 3);
@@ -1070,7 +1075,7 @@ mod tests {
             ];
 
             let iter = Box::new(vec.into_iter().map(Ok));
-            let mut iter = MvccStream::new(iter, merge_op());
+            let mut iter = MvccStream::new(iter, Some(merge_op()));
 
             let item = iter.next_back().unwrap()?;
             assert_eq!(&*item.value, b"base,op1,op2");
@@ -1088,7 +1093,7 @@ mod tests {
             ];
 
             let iter = Box::new(vec.into_iter().map(Ok));
-            let mut iter = MvccStream::new(iter, merge_op());
+            let mut iter = MvccStream::new(iter, Some(merge_op()));
 
             let item = iter.next_back().unwrap()?;
             assert_eq!(&*item.value, b"op1,op2");
@@ -1098,7 +1103,7 @@ mod tests {
         }
 
         #[test]
-        #[expect(clippy::unwrap_used, reason = "test assertion")]
+        #[allow(clippy::unwrap_used, reason = "test assertion")]
         fn mvcc_merge_reverse_mixed_keys() -> crate::Result<()> {
             let vec = vec![
                 InternalValue::from_components("a", "val_a", 5, ValueType::Value),
@@ -1108,7 +1113,7 @@ mod tests {
             ];
 
             let iter = Box::new(vec.into_iter().map(Ok));
-            let iter = MvccStream::new(iter, merge_op());
+            let iter = MvccStream::new(iter, Some(merge_op()));
             let out: Vec<_> = iter.rev().map(Result::unwrap).collect();
 
             // Reverse: c, b(merged), a
@@ -1132,7 +1137,7 @@ mod tests {
             )];
 
             let iter = Box::new(vec.into_iter().map(Ok));
-            let mut iter = MvccStream::new(iter, merge_op());
+            let mut iter = MvccStream::new(iter, Some(merge_op()));
 
             let item = iter.next_back().unwrap()?;
             assert_eq!(&*item.value, b"op1");
@@ -1171,7 +1176,7 @@ mod tests {
             ];
 
             let iter = Box::new(vec.into_iter().map(Ok));
-            let mut iter = MvccStream::new(iter, merge_op());
+            let mut iter = MvccStream::new(iter, Some(merge_op()));
 
             // Reverse: b(merged), a
             let item = iter.next_back().unwrap()?;
@@ -1200,7 +1205,7 @@ mod tests {
             ];
 
             let iter = Box::new(vec.into_iter().map(Ok));
-            let mut iter = MvccStream::new(iter, merge_op());
+            let mut iter = MvccStream::new(iter, Some(merge_op()));
 
             let item = iter.next().unwrap()?;
             assert_eq!(&*item.key.user_key, b"a");
@@ -1224,7 +1229,7 @@ mod tests {
             ];
 
             let iter = Box::new(vec.into_iter().map(Ok));
-            let mut iter = MvccStream::new(iter, merge_op());
+            let mut iter = MvccStream::new(iter, Some(merge_op()));
 
             let item = iter.next_back().unwrap()?;
             assert_eq!(&*item.key.user_key, b"a");
@@ -1309,7 +1314,7 @@ mod tests {
             ];
 
             let iter = Box::new(vec.into_iter().map(Ok));
-            let mut iter = MvccStream::new(iter, merge_op());
+            let mut iter = MvccStream::new(iter, Some(merge_op()));
 
             let item = iter.next().unwrap()?;
             // WeakTombstone blocks base — merge with no base
@@ -1335,7 +1340,8 @@ mod tests {
             ];
 
             let iter = Box::new(vec.into_iter().map(Ok));
-            let mut iter = MvccStream::new(iter, merge_op()).with_range_tombstones(vec![(rt, 4)]);
+            let mut iter =
+                MvccStream::new(iter, Some(merge_op())).with_range_tombstones(vec![(rt, 4)]);
 
             let item = iter.next().unwrap()?;
             assert_eq!(item.key.value_type, ValueType::Value);
@@ -1362,7 +1368,8 @@ mod tests {
             ];
 
             let iter = Box::new(vec.into_iter().map(Ok));
-            let mut iter = MvccStream::new(iter, merge_op()).with_range_tombstones(vec![(rt, 5)]);
+            let mut iter =
+                MvccStream::new(iter, Some(merge_op())).with_range_tombstones(vec![(rt, 5)]);
 
             let item = iter.next().unwrap()?;
             assert_eq!(item.key.value_type, ValueType::Value);
@@ -1387,7 +1394,8 @@ mod tests {
             ];
 
             let iter = Box::new(vec.into_iter().map(Ok));
-            let mut iter = MvccStream::new(iter, merge_op()).with_range_tombstones(vec![(rt, 4)]);
+            let mut iter =
+                MvccStream::new(iter, Some(merge_op())).with_range_tombstones(vec![(rt, 4)]);
 
             let item = iter.next_back().unwrap()?;
             assert_eq!(item.key.value_type, ValueType::Value);
@@ -1414,7 +1422,8 @@ mod tests {
             ];
 
             let iter = Box::new(vec.into_iter().map(Ok));
-            let mut iter = MvccStream::new(iter, merge_op()).with_range_tombstones(vec![(rt, 6)]);
+            let mut iter =
+                MvccStream::new(iter, Some(merge_op())).with_range_tombstones(vec![(rt, 6)]);
 
             let item = iter.next().unwrap()?;
             // Head is RT-suppressed → merge skipped, head returned as-is
@@ -1439,7 +1448,8 @@ mod tests {
             ];
 
             let iter = Box::new(vec.into_iter().map(Ok));
-            let mut iter = MvccStream::new(iter, merge_op()).with_range_tombstones(vec![(rt, 6)]);
+            let mut iter =
+                MvccStream::new(iter, Some(merge_op())).with_range_tombstones(vec![(rt, 6)]);
 
             let item = iter.next_back().unwrap()?;
             // Head is RT-suppressed → merge skipped

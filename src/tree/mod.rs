@@ -281,7 +281,7 @@ impl AbstractTree for Tree {
                 let mut copy = v.clone();
                 copy.active_memtable = Arc::new(Memtable::new(
                     self.memtable_id_counter.next(),
-                    self.config.comparator.clone(),
+                    &self.config.comparator,
                 ));
                 copy.sealed_memtables = Arc::default();
                 copy.version = Version::new(v.version.id() + 1, self.tree_type());
@@ -537,7 +537,7 @@ impl AbstractTree for Tree {
         let mut copy = version_history_lock.latest_version();
         copy.active_memtable = Arc::new(Memtable::new(
             self.memtable_id_counter.next(),
-            self.config.comparator.clone(),
+            &self.config.comparator,
         ));
         copy.sealed_memtables = Arc::new(SealedMemtables::default());
 
@@ -603,7 +603,7 @@ impl AbstractTree for Tree {
         let mut copy = version_history_lock.latest_version();
         copy.active_memtable = Arc::new(Memtable::new(
             self.memtable_id_counter.next(),
-            self.config.comparator.clone(),
+            &self.config.comparator,
         ));
         copy.sealed_memtables =
             Arc::new(super_version.sealed_memtables.add(yanked_memtable.clone()));
@@ -1089,21 +1089,21 @@ impl Tree {
                 let mut best: Option<InternalValue> = None;
 
                 for run in level.iter() {
-                    if let Some(table) = run.get_for_key_cmp(key, comparator) {
-                        if let Some(item) = table.get(key, seqno, key_hash)? {
-                            match &best {
-                                // >= keeps first-seen on tie. Seqno is monotonically
-                                // unique per write; equal seqno for the same user key
-                                // across tables is impossible in normal operation.
-                                Some(current) if current.key.seqno >= item.key.seqno => {}
-                                _ => {
-                                    // Short-circuit: seqno is the read horizon, so no
-                                    // other run in this level can have a higher one.
-                                    if item.key.seqno == seqno {
-                                        return Ok(ignore_tombstone_value(item));
-                                    }
-                                    best = Some(item);
+                    if let Some(table) = run.get_for_key_cmp(key, comparator)
+                        && let Some(item) = table.get(key, seqno, key_hash)?
+                    {
+                        match &best {
+                            // >= keeps first-seen on tie. Seqno is monotonically
+                            // unique per write; equal seqno for the same user key
+                            // across tables is impossible in normal operation.
+                            Some(current) if current.key.seqno >= item.key.seqno => {}
+                            _ => {
+                                // Short-circuit: seqno is the read horizon, so no
+                                // other run in this level can have a higher one.
+                                if item.key.seqno == seqno {
+                                    return Ok(ignore_tombstone_value(item));
                                 }
+                                best = Some(item);
                             }
                         }
                     }
@@ -1114,10 +1114,10 @@ impl Tree {
                 }
             } else {
                 for run in level.iter() {
-                    if let Some(table) = run.get_for_key_cmp(key, comparator) {
-                        if let Some(item) = table.get(key, seqno, key_hash)? {
-                            return Ok(ignore_tombstone_value(item));
-                        }
+                    if let Some(table) = run.get_for_key_cmp(key, comparator)
+                        && let Some(item) = table.get(key, seqno, key_hash)?
+                    {
+                        return Ok(ignore_tombstone_value(item));
                     }
                 }
             }
@@ -1427,7 +1427,7 @@ impl Tree {
             memtable_id_counter: SequenceNumberCounter::new(1),
             table_id_counter: SequenceNumberCounter::new(highest_table_id + 1),
             blob_file_id_counter: SequenceNumberCounter::default(),
-            version_history: Arc::new(RwLock::new(SuperVersions::new(version, comparator))),
+            version_history: Arc::new(RwLock::new(SuperVersions::new(version, &comparator))),
             stop_signal: StopSignal::default(),
             config: Arc::new(config),
             major_compaction_lock: RwLock::default(),

@@ -18,7 +18,7 @@ pub mod util;
 pub mod writer;
 
 #[cfg(test)]
-#[expect(
+#[allow(
     clippy::unwrap_used,
     clippy::indexing_slicing,
     clippy::useless_vec,
@@ -298,16 +298,16 @@ impl Table {
             None
         };
 
-        if let Some(filter_block) = &filter_block {
-            if !filter_block.maybe_contains_hash(key_hash)? {
-                #[cfg(feature = "metrics")]
-                {
-                    self.metrics.filter_queries.fetch_add(1, Relaxed);
-                    self.metrics.io_skipped_by_filter.fetch_add(1, Relaxed);
-                }
-
-                return Ok(None);
+        if let Some(filter_block) = &filter_block
+            && !filter_block.maybe_contains_hash(key_hash)?
+        {
+            #[cfg(feature = "metrics")]
+            {
+                self.metrics.filter_queries.fetch_add(1, Relaxed);
+                self.metrics.io_skipped_by_filter.fetch_add(1, Relaxed);
             }
+
+            return Ok(None);
         }
 
         let item = self.point_read(key, seqno);

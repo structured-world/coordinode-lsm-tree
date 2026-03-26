@@ -3,7 +3,7 @@
 // (found in the LICENSE-* files in the repository)
 
 #[cfg(test)]
-#[expect(
+#[allow(
     clippy::unwrap_used,
     clippy::indexing_slicing,
     clippy::useless_vec,
@@ -753,51 +753,50 @@ impl CompactionStrategy for Strategy {
                 if l1_score > 1.0
                     && l2_idx < version.level_count()
                     && !version.level_is_busy(l2_idx, state.hidden_set())
+                    && let Some(l2) = version.level(l2_idx)
                 {
-                    if let Some(l2) = version.level(l2_idx) {
-                        // Include ALL L1 tables (we're emptying L1 into L2)
-                        table_ids.extend(target_level.list_ids());
+                    // Include ALL L1 tables (we're emptying L1 into L2)
+                    table_ids.extend(target_level.list_ids());
 
-                        // Include overlapping L2 tables — query per merged
-                        // interval instead of one coarse aggregate (#72).
-                        // An aggregate across disjoint tables (e.g. [a,d] and
-                        // [x,z] → [a,z]) covers gaps and pulls in L2 tables
-                        // that don't actually overlap any input table.
-                        //
-                        // Merge input key ranges into disjoint intervals first
-                        // to reduce redundant queries when L0 tables overlap
-                        // (#122 Part 2). Sort by comparator-min, then coalesce.
-                        {
-                            let mut input_ranges: Vec<_> = target_level
-                                .iter()
-                                .chain(first_level.iter())
-                                .flat_map(|run| run.iter())
-                                .map(|t| t.key_range().clone())
-                                .collect();
-                            input_ranges.sort_by(|a, b| cmp.compare(a.min(), b.min()));
+                    // Include overlapping L2 tables — query per merged
+                    // interval instead of one coarse aggregate (#72).
+                    // An aggregate across disjoint tables (e.g. [a,d] and
+                    // [x,z] → [a,z]) covers gaps and pulls in L2 tables
+                    // that don't actually overlap any input table.
+                    //
+                    // Merge input key ranges into disjoint intervals first
+                    // to reduce redundant queries when L0 tables overlap
+                    // (#122 Part 2). Sort by comparator-min, then coalesce.
+                    {
+                        let mut input_ranges: Vec<_> = target_level
+                            .iter()
+                            .chain(first_level.iter())
+                            .flat_map(|run| run.iter())
+                            .map(|t| t.key_range().clone())
+                            .collect();
+                        input_ranges.sort_by(|a, b| cmp.compare(a.min(), b.min()));
 
-                            let merged = crate::KeyRange::merge_sorted_cmp(input_ranges, cmp);
+                        let merged = crate::KeyRange::merge_sorted_cmp(input_ranges, cmp);
 
-                            for run in l2.iter() {
-                                for interval in &merged {
-                                    for l2t in run.get_overlapping_cmp(interval, cmp) {
-                                        table_ids.insert(Table::id(l2t));
-                                    }
+                        for run in l2.iter() {
+                            for interval in &merged {
+                                for l2t in run.get_overlapping_cmp(interval, cmp) {
+                                    table_ids.insert(Table::id(l2t));
                                 }
                             }
                         }
-
-                        #[expect(
-                            clippy::cast_possible_truncation,
-                            reason = "level index is bounded by level count (7)"
-                        )]
-                        return Choice::Merge(CompactionInput {
-                            table_ids,
-                            dest_level: l2_idx as u8,
-                            canonical_level: 2,
-                            target_size: self.target_size,
-                        });
                     }
+
+                    #[expect(
+                        clippy::cast_possible_truncation,
+                        reason = "level index is bounded by level count (7)"
+                    )]
+                    return Choice::Merge(CompactionInput {
+                        table_ids,
+                        dest_level: l2_idx as u8,
+                        canonical_level: 2,
+                        target_size: self.target_size,
+                    });
                 }
             }
 

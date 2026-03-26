@@ -233,7 +233,7 @@ fn merge_multiple_operands_only() {
         tree.merge("sum", (i as i64).to_le_bytes(), i);
     }
 
-    assert_eq!(Some(0 + 1 + 2 + 3 + 4), get_counter(&tree, "sum", 5));
+    assert_eq!(Some(10), get_counter(&tree, "sum", 5));
 }
 
 #[test]

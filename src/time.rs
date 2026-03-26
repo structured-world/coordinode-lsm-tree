@@ -7,10 +7,10 @@ pub fn unix_timestamp() -> std::time::Duration {
     #[cfg(test)]
     #[allow(clippy::significant_drop_in_scrutinee, clippy::expect_used)]
     {
-        if let Some(cell) = NOW_OVERRIDE.get() {
-            if let Some(override_val) = *cell.lock().expect("lock is poisoned") {
-                return override_val;
-            }
+        if let Some(cell) = NOW_OVERRIDE.get()
+            && let Some(override_val) = *cell.lock().expect("lock is poisoned")
+        {
+            return override_val;
         }
     }
 

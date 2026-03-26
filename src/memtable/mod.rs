@@ -89,7 +89,7 @@ impl Memtable {
     // match the tree's comparator; a default would silently produce wrong order.
     #[doc(hidden)]
     #[must_use]
-    pub fn new(id: MemtableId, comparator: SharedComparator) -> Self {
+    pub fn new(id: MemtableId, comparator: &SharedComparator) -> Self {
         Self {
             id,
             items: skiplist::SkipMap::new(comparator.clone()),
@@ -339,7 +339,7 @@ mod tests {
     use test_log::test;
 
     fn new_memtable(id: MemtableId) -> Memtable {
-        Memtable::new(id, default_comparator())
+        Memtable::new(id, &default_comparator())
     }
 
     #[test]

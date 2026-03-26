@@ -110,7 +110,7 @@ mod tests {
         let n = 1_000_000;
         let estimated_size = policy.estimated_filter_size(n);
         // For 1 million keys and 1% false positive rate, the size should be around 1.2 MB
-        assert!((estimated_size as f32) < 1_300_000.0);
-        assert!((estimated_size as f32) > 1_100_000.0);
+        assert!(estimated_size < 1_300_000);
+        assert!(estimated_size > 1_100_000);
     }
 }

@@ -624,7 +624,10 @@ fn reverse_comparator_memtable_range_tombstone_point_read() -> lsm_tree::Result<
 
     // Reverse comparator order is e < d < c < b < a, so [d, b) must suppress d and c.
     let size = tree.remove_range("d", "b", 10);
-    assert!(size > 0, "valid comparator-ordered interval must not be rejected");
+    assert!(
+        size > 0,
+        "valid comparator-ordered interval must not be rejected"
+    );
 
     assert_eq!(tree.get("e", 11)?, Some("val_e".as_bytes().into()));
     assert_eq!(tree.get("d", 11)?, None);
@@ -654,7 +657,10 @@ fn reverse_comparator_range_tombstone_scan_after_flush() -> lsm_tree::Result<()>
     tree.flush_active_memtable(5)?;
 
     let size = tree.remove_range("d", "b", 10);
-    assert!(size > 0, "valid comparator-ordered interval must not be rejected");
+    assert!(
+        size > 0,
+        "valid comparator-ordered interval must not be rejected"
+    );
     tree.flush_active_memtable(11)?;
 
     let items: Vec<_> = tree

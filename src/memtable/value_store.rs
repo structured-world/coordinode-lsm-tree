@@ -249,7 +249,12 @@ impl Drop for ValueStore {
 }
 
 #[cfg(test)]
-#[expect(clippy::expect_used, reason = "tests use expect for brevity")]
+#[allow(
+    clippy::expect_used,
+    clippy::unwrap_used,
+    clippy::cast_possible_truncation,
+    reason = "tests use expect/unwrap and narrow casts for brevity"
+)]
 mod tests {
     use super::*;
 
@@ -284,7 +289,7 @@ mod tests {
         }
 
         // Last entry is in segment 1
-        let last_idx = SEGMENT_SIZE as u32;
+        let last_idx = u32::try_from(SEGMENT_SIZE).unwrap();
         assert_eq!(
             &*unsafe { store.get(last_idx) },
             format!("v{SEGMENT_SIZE}").as_bytes()
@@ -300,7 +305,7 @@ mod tests {
         let n_per_thread = 1000usize;
 
         // Concurrent appends.
-        let handles: Vec<_> = (0..n_threads)
+        let all: Vec<(u32, String)> = (0..n_threads)
             .map(|t| {
                 let store = Arc::clone(&store);
                 std::thread::spawn(move || {
@@ -312,10 +317,6 @@ mod tests {
                     indices
                 })
             })
-            .collect();
-
-        let all: Vec<(u32, String)> = handles
-            .into_iter()
             .flat_map(|h| h.join().expect("thread ok"))
             .collect();
 

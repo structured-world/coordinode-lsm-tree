@@ -33,7 +33,7 @@ fn baseline_point_tombstone_across_ssts() -> lsm_tree::Result<()> {
     tree.flush_active_memtable(0)?;
 
     assert!(
-        tree.get(&[2u8], 2)?.is_some(),
+        tree.get([2u8], 2)?.is_some(),
         "value should be visible before the point tombstone"
     );
 
@@ -42,7 +42,7 @@ fn baseline_point_tombstone_across_ssts() -> lsm_tree::Result<()> {
     tree.flush_active_memtable(0)?;
 
     // Point tombstone in newer SST should shadow insert in older SST
-    let result = tree.get(&[2u8], 3)?;
+    let result = tree.get([2u8], 3)?;
     assert_eq!(
         result, None,
         "point tombstone in newer SST should shadow insert"
@@ -64,7 +64,7 @@ fn regression_rt_same_sst_then_tombstone_in_next() -> lsm_tree::Result<()> {
     tree.flush_active_memtable(0)?;
 
     assert!(
-        tree.get(&[2u8], 3)?.is_some(),
+        tree.get([2u8], 3)?.is_some(),
         "insert after the RT should be visible before the later point tombstone"
     );
 
@@ -72,7 +72,7 @@ fn regression_rt_same_sst_then_tombstone_in_next() -> lsm_tree::Result<()> {
     tree.remove(vec![2u8], 3);
     tree.flush_active_memtable(0)?;
 
-    let result = tree.get(&[2u8], 4)?;
+    let result = tree.get([2u8], 4)?;
     assert_eq!(
         result, None,
         "point tombstone should shadow insert even with RT present"
@@ -105,7 +105,7 @@ fn regression_remove_range_then_insert_then_remove() -> lsm_tree::Result<()> {
     tree.flush_active_memtable(0)?;
 
     assert!(
-        tree.get(&[2u8], 7)?.is_some(),
+        tree.get([2u8], 7)?.is_some(),
         "insert after the RT should be visible before the final point tombstone"
     );
 
@@ -114,7 +114,7 @@ fn regression_remove_range_then_insert_then_remove() -> lsm_tree::Result<()> {
     tree.flush_active_memtable(0)?;
 
     // The point tombstone at seqno 7 should shadow the insert at seqno 6
-    let result = tree.get(&[2u8], 8)?;
+    let result = tree.get([2u8], 8)?;
     assert_eq!(
         result, None,
         "point tombstone at seqno 7 must remain visible and shadow insert at seqno 6, \

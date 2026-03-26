@@ -362,7 +362,7 @@ impl<T: Ranged> Run<T> {
 }
 
 #[cfg(test)]
-#[expect(
+#[allow(
     clippy::unwrap_used,
     clippy::indexing_slicing,
     clippy::useless_vec,

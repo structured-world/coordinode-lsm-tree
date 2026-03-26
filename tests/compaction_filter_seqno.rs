@@ -6,7 +6,9 @@ use std::sync::{Arc, Mutex};
 use test_log::test;
 
 /// Collects (key, seqno) pairs observed by the compaction filter.
-struct SeqnoCollector(Arc<Mutex<Vec<(Vec<u8>, SeqNo)>>>);
+type SeenSeqnos = Arc<Mutex<Vec<(Vec<u8>, SeqNo)>>>;
+
+struct SeqnoCollector(SeenSeqnos);
 
 impl CompactionFilter for SeqnoCollector {
     fn filter_item(
@@ -21,7 +23,7 @@ impl CompactionFilter for SeqnoCollector {
     }
 }
 
-struct SeqnoCollectorFactory(Arc<Mutex<Vec<(Vec<u8>, SeqNo)>>>);
+struct SeqnoCollectorFactory(SeenSeqnos);
 
 impl Factory for SeqnoCollectorFactory {
     fn name(&self) -> &str {
@@ -38,7 +40,7 @@ fn compaction_filter_seqno_matches_insert_time_value() -> lsm_tree::Result<()> {
     let folder = get_tmp_folder();
 
     let seqno_counter = SequenceNumberCounter::default();
-    let collected: Arc<Mutex<Vec<(Vec<u8>, SeqNo)>>> = Arc::new(Mutex::new(Vec::new()));
+    let collected: SeenSeqnos = Arc::new(Mutex::new(Vec::new()));
 
     let config = lsm_tree::Config::new(
         &folder,

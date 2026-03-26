@@ -198,7 +198,7 @@ impl Iterator for Scanner {
 }
 
 #[cfg(test)]
-#[expect(
+#[allow(
     clippy::unwrap_used,
     clippy::indexing_slicing,
     clippy::useless_vec,
@@ -319,7 +319,7 @@ mod tests {
         Ok(())
     }
 
-    /// Write a V3 blob file (b"BLOB" magic, no header_crc) manually,
+    /// Write a V3 blob file (b"BLOB" magic, no `header_crc`) manually,
     /// then verify the scanner can read it with V3 backward compat path.
     #[test]
     fn blob_scanner_reads_v3_format() -> crate::Result<()> {

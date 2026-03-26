@@ -130,8 +130,8 @@ mod tests {
     use byteorder::WriteBytesExt;
     use std::io::Write;
 
-    /// Write the mandatory manifest sections (format_version, tree_type,
-    /// level_count, filter_hash_type) into an sfa archive at `path`.
+    /// Write the mandatory manifest sections (`format_version`, `tree_type`,
+    /// `level_count`, `filter_hash_type`) into an sfa archive at `path`.
     /// If `comparator_name` is `Some`, also writes that section.
     fn write_test_manifest(
         path: &std::path::Path,

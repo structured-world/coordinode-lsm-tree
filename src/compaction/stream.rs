@@ -251,10 +251,8 @@ impl<'a, I: Iterator<Item = Item>, F: StreamFilter + 'a> CompactionStream<'a, I,
                 if let Ok(kv) = kv {
                     let expired = kv.key.user_key == key;
 
-                    if expired {
-                        if let Some(watcher) = &mut self.dropped_callback {
-                            watcher.on_dropped(kv);
-                        }
+                    if expired && let Some(watcher) = &mut self.dropped_callback {
+                        watcher.on_dropped(kv);
                     }
 
                     expired
@@ -334,12 +332,11 @@ impl<'a, I: Iterator<Item = Item>, F: StreamFilter + 'a> Iterator for Compaction
                     // collapse via partial merge (result stays MergeOperand if no base found)
                     if head.key.value_type.is_merge_operand()
                         && head.key.seqno < self.gc_seqno_threshold
+                        && let Some(merge_op) = self.merge_operator.clone()
                     {
-                        if let Some(merge_op) = self.merge_operator.clone() {
-                            let merged =
-                                fail_iter!(self.resolve_merge_operands(head, merge_op.as_ref()));
-                            head = merged;
-                        }
+                        let merged =
+                            fail_iter!(self.resolve_merge_operands(head, merge_op.as_ref()));
+                        head = merged;
                     }
                 } else if peeked.key.seqno < self.gc_seqno_threshold {
                     // Merge operands below GC watermark: collapse via merge operator.
@@ -406,10 +403,12 @@ impl<'a, I: Iterator<Item = Item>, F: StreamFilter + 'a> Iterator for Compaction
 }
 
 #[cfg(test)]
-#[expect(
+#[allow(
     clippy::unwrap_used,
     clippy::indexing_slicing,
     clippy::useless_vec,
+    clippy::doc_markdown,
+    clippy::unnecessary_wraps,
     reason = "test code"
 )]
 mod tests {
@@ -898,9 +897,9 @@ mod tests {
                             !seqno,
                         )
                         .unwrap();
-                    cursor.write_u8(if tomb { 1 } else { 0 }).unwrap();
+                    cursor.write_u8(u8::from(tomb)).unwrap();
 
-                    debug_assert_eq!(len, cursor.position() as usize);
+                    debug_assert_eq!(len, usize::try_from(cursor.position()).unwrap());
 
                     key_builder.freeze()
                 },
@@ -914,7 +913,7 @@ mod tests {
             /// The previous user key
             ///
             /// Note that the user key is NOT the full KV key
-            /// because we embed MVCC information into the key (user_key#seqno#type).
+            /// because we embed MVCC information into the key (`user_key#seqno#type`).
             prev_user_key: Option<UserKey>,
 
             /// MVCC watermark we can safely delete if an item < watermark
@@ -929,30 +928,27 @@ mod tests {
                 // User key len
                 let ukl = l - TRAILER_SIZE;
 
-                match &self.prev_user_key {
-                    Some(prev) => {
-                        let user_key = &value.key.user_key[..ukl];
+                if let Some(prev) = &self.prev_user_key {
+                    let user_key = &value.key.user_key[..ukl];
 
-                        if prev == &user_key {
-                            // We found another, older version of the previous key
-                            let mut seqno = &value.key.user_key[(ukl + 1)..l - 1];
-                            debug_assert_eq!(8, seqno.len());
+                    if prev == &user_key {
+                        // We found another, older version of the previous key
+                        let mut seqno = &value.key.user_key[(ukl + 1)..l - 1];
+                        debug_assert_eq!(8, seqno.len());
 
-                            // IMPORTANT: Invert the seqno back to normal value
-                            let seqno = !seqno.read_u64::<BE>().unwrap();
+                        // IMPORTANT: Invert the seqno back to normal value
+                        let seqno = !seqno.read_u64::<BE>().unwrap();
 
-                            if seqno < self.mvcc_watermark {
-                                return Ok(StreamFilterVerdict::Drop);
-                            }
-                        } else {
-                            let user_key = &value.key.user_key.slice(..ukl);
-                            self.prev_user_key = Some(user_key.clone());
+                        if seqno < self.mvcc_watermark {
+                            return Ok(StreamFilterVerdict::Drop);
                         }
-                    }
-                    None => {
+                    } else {
                         let user_key = &value.key.user_key.slice(..ukl);
                         self.prev_user_key = Some(user_key.clone());
                     }
+                } else {
+                    let user_key = &value.key.user_key.slice(..ukl);
+                    self.prev_user_key = Some(user_key.clone());
                 }
 
                 Ok(StreamFilterVerdict::Keep)
@@ -1055,8 +1051,8 @@ mod tests {
             }
         }
 
-        fn merge_op() -> Option<Arc<dyn crate::merge_operator::MergeOperator>> {
-            Some(Arc::new(ConcatMerge))
+        fn merge_op() -> Arc<dyn crate::merge_operator::MergeOperator> {
+            Arc::new(ConcatMerge)
         }
 
         #[test]
@@ -1070,7 +1066,7 @@ mod tests {
             ];
 
             let iter = vec.iter().cloned().map(Ok);
-            let mut iter = CompactionStream::new(iter, 1_000).with_merge_operator(merge_op());
+            let mut iter = CompactionStream::new(iter, 1_000).with_merge_operator(Some(merge_op()));
 
             let item = iter.next().unwrap()?;
             // Partial merge (no base boundary) → stays MergeOperand
@@ -1093,7 +1089,7 @@ mod tests {
             ];
 
             let iter = vec.iter().cloned().map(Ok);
-            let mut iter = CompactionStream::new(iter, 1_000).with_merge_operator(merge_op());
+            let mut iter = CompactionStream::new(iter, 1_000).with_merge_operator(Some(merge_op()));
 
             let item = iter.next().unwrap()?;
             assert_eq!(item.key.value_type, ValueType::Value);
@@ -1114,7 +1110,7 @@ mod tests {
             ];
 
             let iter = vec.iter().cloned().map(Ok);
-            let mut iter = CompactionStream::new(iter, 1_000).with_merge_operator(merge_op());
+            let mut iter = CompactionStream::new(iter, 1_000).with_merge_operator(Some(merge_op()));
 
             let item = iter.next().unwrap()?;
             assert_eq!(item.key.value_type, ValueType::Value);
@@ -1136,7 +1132,7 @@ mod tests {
 
             let iter = vec.iter().cloned().map(Ok);
             let mut iter = CompactionStream::new(iter, 0) // gc_threshold=0, nothing expired
-                .with_merge_operator(merge_op());
+                .with_merge_operator(Some(merge_op()));
 
             let item = iter.next().unwrap()?;
             assert_eq!(item.key.value_type, ValueType::MergeOperand);
@@ -1161,7 +1157,7 @@ mod tests {
             ];
 
             let iter = vec.iter().cloned().map(Ok);
-            let mut iter = CompactionStream::new(iter, 1_000).with_merge_operator(merge_op());
+            let mut iter = CompactionStream::new(iter, 1_000).with_merge_operator(Some(merge_op()));
 
             let item = iter.next().unwrap()?;
             // Partial merge (no base boundary) → stays MergeOperand
@@ -1190,7 +1186,7 @@ mod tests {
             )];
 
             let iter = vec.iter().cloned().map(Ok);
-            let mut iter = CompactionStream::new(iter, 1_000).with_merge_operator(merge_op());
+            let mut iter = CompactionStream::new(iter, 1_000).with_merge_operator(Some(merge_op()));
 
             let item = iter.next().unwrap()?;
             // Partial merge (no base boundary) → stays MergeOperand
@@ -1203,7 +1199,7 @@ mod tests {
         }
 
         #[test]
-        #[expect(clippy::unwrap_used, reason = "test assertion")]
+        #[allow(clippy::unwrap_used, reason = "test assertion")]
         fn compaction_merge_mixed_keys() -> crate::Result<()> {
             // Multiple keys, some with merge operands, some without
             let vec = vec![
@@ -1215,7 +1211,7 @@ mod tests {
             ];
 
             let iter = vec.iter().cloned().map(Ok);
-            let iter = CompactionStream::new(iter, 1_000).with_merge_operator(merge_op());
+            let iter = CompactionStream::new(iter, 1_000).with_merge_operator(Some(merge_op()));
 
             let out: Vec<_> = iter.map(Result::unwrap).collect();
 
@@ -1261,7 +1257,7 @@ mod tests {
             ];
 
             let iter = vec.iter().cloned().map(Ok);
-            let mut iter = CompactionStream::new(iter, 1_000).with_merge_operator(merge_op());
+            let mut iter = CompactionStream::new(iter, 1_000).with_merge_operator(Some(merge_op()));
 
             let item = iter.next().unwrap()?;
             assert_eq!(item.key.value_type, ValueType::Value);
@@ -1283,7 +1279,7 @@ mod tests {
 
             let iter = vec.iter().cloned().map(Ok);
             let mut iter = CompactionStream::new(iter, 1_000)
-                .with_merge_operator(merge_op())
+                .with_merge_operator(Some(merge_op()))
                 .zero_seqnos(true);
 
             let item = iter.next().unwrap()?;
@@ -1306,7 +1302,7 @@ mod tests {
             ];
 
             let iter = vec.iter().cloned().map(Ok);
-            let mut iter = CompactionStream::new(iter, 1_000).with_merge_operator(merge_op());
+            let mut iter = CompactionStream::new(iter, 1_000).with_merge_operator(Some(merge_op()));
 
             // All three entries must be emitted unchanged
             let item = iter.next().unwrap()?;
@@ -1340,7 +1336,7 @@ mod tests {
             ];
 
             let iter = vec.iter().cloned().map(Ok);
-            let mut iter = CompactionStream::new(iter, 999).with_merge_operator(merge_op());
+            let mut iter = CompactionStream::new(iter, 999).with_merge_operator(Some(merge_op()));
 
             // head.seqno == gc_threshold → NOT below → preserved as MergeOperand
             let item = iter.next().unwrap()?;
@@ -1365,7 +1361,7 @@ mod tests {
 
             let iter = vec.iter().cloned().map(Ok);
             let mut iter = CompactionStream::new(iter, 1_000)
-                .with_merge_operator(merge_op())
+                .with_merge_operator(Some(merge_op()))
                 .with_drop_callback(&mut callback);
 
             let item = iter.next().unwrap()?;
@@ -1395,7 +1391,7 @@ mod tests {
             ];
 
             let iter = vec.iter().cloned().map(Ok);
-            let mut iter = CompactionStream::new(iter, 7).with_merge_operator(merge_op());
+            let mut iter = CompactionStream::new(iter, 7).with_merge_operator(Some(merge_op()));
 
             // Head is above GC → emit as-is (MergeOperand)
             let item = iter.next().unwrap()?;
@@ -1443,7 +1439,7 @@ mod tests {
 
         /// Complete merge (with base) emits Value; partial merge emits MergeOperand.
         #[test]
-        #[expect(clippy::unwrap_used, reason = "test assertion")]
+        #[allow(clippy::unwrap_used, reason = "test assertion")]
         fn compaction_merge_complete_vs_partial() -> crate::Result<()> {
             // Complete merge: operand + base → Value
             #[rustfmt::skip]
@@ -1455,7 +1451,7 @@ mod tests {
             ];
 
             let iter = vec.iter().cloned().map(Ok);
-            let iter = CompactionStream::new(iter, 1_000).with_merge_operator(merge_op());
+            let iter = CompactionStream::new(iter, 1_000).with_merge_operator(Some(merge_op()));
             let out: Vec<_> = iter.map(Result::unwrap).collect();
 
             assert_eq!(out.len(), 2);

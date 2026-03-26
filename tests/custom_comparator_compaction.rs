@@ -305,9 +305,9 @@ fn reverse_comparator_leveled_compaction() -> lsm_tree::Result<()> {
         .open()?;
 
     for c in b'a'..=b'i' {
-        tree.insert(&[c], format!("v_{}", c as char), seqno.next());
+        tree.insert([c], format!("v_{}", c as char), seqno.next());
         // Flush every 3 keys to create multiple SSTs
-        if (c - b'a' + 1) % 3 == 0 {
+        if (c - b'a' + 1).is_multiple_of(3) {
             tree.flush_active_memtable(0)?;
         }
     }
@@ -339,8 +339,8 @@ fn reverse_comparator_size_tiered_compaction() -> lsm_tree::Result<()> {
         .open()?;
 
     for c in b'a'..=b'i' {
-        tree.insert(&[c], format!("v_{}", c as char), seqno.next());
-        if (c - b'a' + 1) % 3 == 0 {
+        tree.insert([c], format!("v_{}", c as char), seqno.next());
+        if (c - b'a' + 1).is_multiple_of(3) {
             tree.flush_active_memtable(0)?;
         }
     }
@@ -462,7 +462,7 @@ fn reverse_comparator_range_scan_after_compaction() -> lsm_tree::Result<()> {
         .open()?;
 
     for c in b'a'..=b'f' {
-        tree.insert(&[c], format!("v_{}", c as char), seqno.next());
+        tree.insert([c], format!("v_{}", c as char), seqno.next());
     }
     tree.flush_active_memtable(0)?;
     tree.major_compact(u64::MAX, SeqNo::MAX)?;
@@ -842,7 +842,7 @@ fn reverse_comparator_merge_range_scan_after_compaction() -> lsm_tree::Result<()
 
     // Insert base values for a..e
     for c in b'a'..=b'e' {
-        tree.insert(&[c], 10_i64.to_le_bytes(), seqno.next());
+        tree.insert([c], 10_i64.to_le_bytes(), seqno.next());
     }
     tree.flush_active_memtable(0)?;
 

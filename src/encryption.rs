@@ -365,6 +365,12 @@ impl EncryptionProvider for Aes256GcmProvider {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::doc_markdown,
+    clippy::redundant_clone,
+    clippy::unnecessary_wraps,
+    clippy::redundant_closure_for_method_calls
+)]
 mod tests {
     use super::*;
 
@@ -375,7 +381,7 @@ mod tests {
     }
 
     /// Minimal provider that only implements required methods,
-    /// exercising the default encrypt_vec/decrypt_vec implementations.
+    /// exercising the default `encrypt_vec/decrypt_vec` implementations.
     struct XorProvider;
 
     impl std::panic::UnwindSafe for XorProvider {}
@@ -417,7 +423,7 @@ mod tests {
         let ciphertext = provider.encrypt(plaintext)?;
 
         let via_decrypt = provider.decrypt(&ciphertext)?;
-        let via_decrypt_vec = provider.decrypt_vec(ciphertext.clone())?;
+        let via_decrypt_vec = provider.decrypt_vec(ciphertext)?;
         assert_eq!(via_decrypt, via_decrypt_vec);
         assert_eq!(via_decrypt_vec, plaintext);
         Ok(())
@@ -558,18 +564,16 @@ mod tests {
             Ok(())
         }
 
-        /// Verify ForkAwareRng reseeds when it detects a PID change.
+        /// Verify `ForkAwareRng` reseeds when it detects a PID change.
         ///
         /// Asserts on deterministic state (PID restoration) rather than
         /// probabilistic RNG output to avoid flaky CI.
         #[test]
         fn fork_aware_rng_reseeds_on_pid_change() {
-            use aes_gcm::aead::rand_core::RngCore;
-
             let rng = ForkAwareRng::new();
 
             // Generate a value with the current PID (ensures RNG is initialized).
-            let _ = rng.with_rng(|r| r.next_u64());
+            let _ = rng.with_rng(aes_gcm::aead::rand_core::RngCore::next_u64);
 
             // Simulate fork by setting a fake PID that differs from the real one.
             let current_pid = std::process::id();
@@ -579,7 +583,7 @@ mod tests {
 
             // Next call sees real PID != fake PID → reseeds from OsRng and
             // restores the stored PID to the real process ID.
-            let _ = rng.with_rng(|r| r.next_u64());
+            let _ = rng.with_rng(aes_gcm::aead::rand_core::RngCore::next_u64);
 
             // Deterministic assertion: PID was restored after reseed.
             assert_eq!(

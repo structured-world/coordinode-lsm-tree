@@ -97,7 +97,7 @@ pub fn fsync_directory(_path: &Path, _fs: &dyn Fs) -> std::io::Result<()> {
 }
 
 #[cfg(test)]
-#[expect(
+#[allow(
     clippy::unwrap_used,
     clippy::indexing_slicing,
     clippy::useless_vec,

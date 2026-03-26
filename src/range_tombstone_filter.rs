@@ -45,7 +45,10 @@ impl<I> RangeTombstoneFilter<I> {
     #[must_use]
     #[cfg_attr(
         not(test),
-        expect(dead_code, reason = "backward-compatible default-comparator constructor")
+        expect(
+            dead_code,
+            reason = "backward-compatible default-comparator constructor"
+        )
     )]
     pub fn new(inner: I, fwd_tombstones: Vec<(RangeTombstone, SeqNo)>) -> Self {
         Self::new_with_comparator(
@@ -107,12 +110,11 @@ impl<I> RangeTombstoneFilter<I> {
     /// Activates forward tombstones whose start <= `current_key`.
     fn fwd_activate_up_to(&mut self, key: &[u8]) {
         while let Some((rt, cutoff)) = self.fwd_tombstones.get(self.fwd_idx) {
-            if self.comparator.compare(&rt.start, key) != std::cmp::Ordering::Greater {
-                self.fwd_active.activate(rt, *cutoff);
-                self.fwd_idx += 1;
-            } else {
+            if self.comparator.compare(&rt.start, key) == std::cmp::Ordering::Greater {
                 break;
             }
+            self.fwd_active.activate(rt, *cutoff);
+            self.fwd_idx += 1;
         }
     }
 

@@ -13,7 +13,7 @@ fn merger(c: &mut Criterion) {
         c.bench_function(&format!("Merge {num}"), |b| {
             let memtables = (0..num)
                 .map(|_| {
-                    let table = Memtable::new(0, cmp.clone());
+                    let table = Memtable::new(0, &cmp);
 
                     for _ in 0..100 {
                         table.insert(InternalValue::from_components(
@@ -50,7 +50,7 @@ fn mvcc_stream(c: &mut Criterion) {
         c.bench_function(&format!("MVCC stream {num} versions"), |b| {
             let memtables = (0..num)
                 .map(|_| {
-                    let table = Memtable::new(0, cmp.clone());
+                    let table = Memtable::new(0, &cmp);
 
                     for key in 'a'..='z' {
                         table.insert(InternalValue::from_components(

@@ -468,7 +468,7 @@ mod tests {
         let key = vec![0xAA; usize::from(u16::MAX)];
         let successor = upper_bound_exclusive(&key).expect("non-max key should have successor");
         assert!(key.as_slice() < successor.as_ref());
-        assert!(successor.len() <= usize::from(u16::MAX));
+        assert!(u16::try_from(successor.len()).is_ok());
     }
 
     #[test]

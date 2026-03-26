@@ -331,10 +331,11 @@ impl Decode for CompressionType {
 }
 
 #[cfg(test)]
-#[expect(
+#[allow(
     clippy::unwrap_used,
     clippy::indexing_slicing,
     clippy::useless_vec,
+    clippy::expect_used,
     reason = "test code"
 )]
 mod tests {

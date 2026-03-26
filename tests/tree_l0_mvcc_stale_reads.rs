@@ -50,7 +50,7 @@ fn regression_overwrite_across_ssts() -> lsm_tree::Result<()> {
     tree.insert(vec![1u8], vec![0u8], 7);
 
     // Must return SST-3's value [1], not SST-2's stale value [0]
-    let result = tree.get(&[0u8], 8)?;
+    let result = tree.get([0u8], 8)?;
     assert_eq!(
         result,
         Some(vec![1u8].into()),
@@ -120,7 +120,7 @@ fn regression_two_ssts_same_key() -> lsm_tree::Result<()> {
     // Active memtable: key=1@3
     tree.insert(vec![1u8], vec![0u8], 3);
 
-    let result = tree.get(&[0u8], 4)?;
+    let result = tree.get([0u8], 4)?;
     assert_eq!(result, Some(vec![1u8].into()));
 
     Ok(())
@@ -153,7 +153,7 @@ fn regression_three_ssts_overwrite() -> lsm_tree::Result<()> {
     tree.flush_active_memtable(0)?;
 
     // No active memtable data
-    let result = tree.get(&[0u8], 6)?;
+    let result = tree.get([0u8], 6)?;
     assert_eq!(
         result,
         Some(vec![1u8].into()),
@@ -193,7 +193,7 @@ fn regression_tombstone_across_reordered_runs() -> lsm_tree::Result<()> {
     tree.insert(vec![1u8], vec![0u8], 5);
 
     // key=0 was deleted at seqno=4, must return None
-    let result = tree.get(&[0u8], 6)?;
+    let result = tree.get([0u8], 6)?;
     assert_eq!(
         result, None,
         "key=0 should be deleted by tombstone from SST-3"
@@ -233,14 +233,14 @@ fn regression_mvcc_snapshot_across_reordered_runs() -> lsm_tree::Result<()> {
 
     // Snapshot at seqno=3: should see key=0@2 val=0 (seqno 5 not visible)
     assert_eq!(
-        tree.get(&[0u8], 3)?,
+        tree.get([0u8], 3)?,
         Some(vec![0u8].into()),
         "snapshot@3 should see old value"
     );
 
     // Snapshot at seqno=6: should see key=0@5 val=1
     assert_eq!(
-        tree.get(&[0u8], 6)?,
+        tree.get([0u8], 6)?,
         Some(vec![1u8].into()),
         "snapshot@6 should see new value"
     );

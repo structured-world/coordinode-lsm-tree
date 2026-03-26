@@ -53,7 +53,7 @@ fn flush_writes_to_hot_tier() -> lsm_tree::Result<()> {
         .filter(|e| {
             e.file_name()
                 .to_str()
-                .map_or(false, |n| n.parse::<u64>().is_ok())
+                .is_some_and(|n| n.parse::<u64>().is_ok())
         })
         .collect();
 
@@ -69,7 +69,7 @@ fn flush_writes_to_hot_tier() -> lsm_tree::Result<()> {
         .filter(|e| {
             e.file_name()
                 .to_str()
-                .map_or(false, |n| n.parse::<u64>().is_ok())
+                .is_some_and(|n| n.parse::<u64>().is_ok())
         })
         .collect();
 
@@ -106,7 +106,7 @@ fn compaction_writes_to_correct_tier() -> lsm_tree::Result<()> {
         .filter(|e| {
             e.file_name()
                 .to_str()
-                .map_or(false, |n| n.parse::<u64>().is_ok())
+                .is_some_and(|n| n.parse::<u64>().is_ok())
         })
         .count();
 
@@ -243,7 +243,7 @@ fn count_table_files(dir: &std::path::Path) -> usize {
                 .filter(|e| {
                     e.file_name()
                         .to_str()
-                        .map_or(false, |n| n.parse::<u64>().is_ok())
+                        .is_some_and(|n| n.parse::<u64>().is_ok())
                 })
                 .count()
         })

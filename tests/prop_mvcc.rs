@@ -16,8 +16,11 @@ use std::collections::BTreeMap;
 // Oracle
 // ---------------------------------------------------------------------------
 
+type VersionedKey = (Vec<u8>, Reverse<u64>);
+type VersionedValue = Option<Vec<u8>>;
+
 struct MvccOracle {
-    data: BTreeMap<(Vec<u8>, Reverse<u64>), Option<Vec<u8>>>,
+    data: BTreeMap<VersionedKey, VersionedValue>,
 }
 
 impl MvccOracle {
@@ -158,12 +161,12 @@ fn run_mvcc_test(ops: Vec<MvccOp>) -> Result<(), TestCaseError> {
         snapshot_seqnos.clone()
     } else {
         // Ceiling division so step >= 2 when len > 20, bounding to ~20 checks.
-        let step = (snapshot_seqnos.len() + 19) / 20;
+        let step = snapshot_seqnos.len().div_ceil(20);
         let mut points: Vec<u64> = snapshot_seqnos.iter().step_by(step).copied().collect();
-        if let Some(&last) = snapshot_seqnos.last() {
-            if points.last() != Some(&last) {
-                points.push(last);
-            }
+        if let Some(&last) = snapshot_seqnos.last()
+            && points.last() != Some(&last)
+        {
+            points.push(last);
         }
         points
     };

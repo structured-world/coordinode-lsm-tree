@@ -36,7 +36,7 @@ pub struct SuperVersions {
 }
 
 impl SuperVersions {
-    pub fn new(version: Version, comparator: SharedComparator) -> Self {
+    pub fn new(version: Version, comparator: &SharedComparator) -> Self {
         let comparator_name: Arc<str> = comparator.name().into();
 
         Self {
@@ -221,7 +221,7 @@ mod tests {
     use test_log::test;
 
     fn new_memtable(id: u64) -> Memtable {
-        Memtable::new(id, default_comparator())
+        Memtable::new(id, &default_comparator())
     }
 
     fn test_super_versions(versions: Vec<SuperVersion>) -> SuperVersions {

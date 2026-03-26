@@ -463,7 +463,10 @@ impl SkipMap {
     unsafe fn tower_atomic(&self, node: u32, level: usize) -> &std::sync::atomic::AtomicU32 {
         // SAFETY: caller guarantees level < node height; node + OFF_TOWER + level*4
         // is within the node's arena allocation and 4-byte aligned.
-        unsafe { self.arena.get_atomic_u32(node + OFF_TOWER + (level as u32) * 4) }
+        unsafe {
+            self.arena
+                .get_atomic_u32(node + OFF_TOWER + (level as u32) * 4)
+        }
     }
 
     /// Loads the next-pointer at `level` for `node`.
@@ -963,10 +966,12 @@ impl DoubleEndedIterator for Range<'_> {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-#[expect(
+#[allow(
     clippy::unwrap_used,
     clippy::indexing_slicing,
     clippy::expect_used,
+    clippy::doc_markdown,
+    clippy::cast_sign_loss,
     reason = "tests use unwrap/indexing/expect for brevity"
 )]
 mod tests {

@@ -636,7 +636,7 @@ fn multi_level_skip_fires_when_l1_oversized() -> crate::Result<()> {
 
     // Single compact should trigger multi-level: L0 wins scoring,
     // L1 is oversized (real table > 256 byte target) → L0+L1→L2 skip
-    let result = tree.compact(multi.clone(), seqno)?;
+    let result = tree.compact(multi, seqno)?;
 
     // compact() now returns CompactionResult so we can assert the merge path fired
     assert_eq!(
@@ -722,7 +722,7 @@ fn multi_level_sparse_keyspace_data_integrity() -> crate::Result<()> {
         seqno += 1;
     }
 
-    let result = tree.compact(multi.clone(), seqno)?;
+    let result = tree.compact(multi, seqno)?;
 
     // Verify the compaction produced a merge targeting L2+
     assert_eq!(

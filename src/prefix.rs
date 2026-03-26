@@ -121,7 +121,7 @@ pub fn compute_prefix_hash(
 }
 
 #[cfg(test)]
-#[expect(
+#[allow(
     clippy::unwrap_used,
     clippy::indexing_slicing,
     clippy::useless_vec,

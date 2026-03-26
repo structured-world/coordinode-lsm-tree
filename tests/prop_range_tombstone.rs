@@ -16,8 +16,11 @@ use std::collections::BTreeMap;
 // Minimal oracle (range tombstone focused)
 // ---------------------------------------------------------------------------
 
+type VersionedKey = (Vec<u8>, Reverse<u64>);
+type VersionedValue = Option<Vec<u8>>;
+
 struct RtOracle {
-    data: BTreeMap<(Vec<u8>, Reverse<u64>), Option<Vec<u8>>>,
+    data: BTreeMap<VersionedKey, VersionedValue>,
     range_tombstones: Vec<(Vec<u8>, Vec<u8>, u64)>,
 }
 

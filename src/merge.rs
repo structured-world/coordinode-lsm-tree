@@ -132,6 +132,7 @@ impl<I: DoubleEndedIterator<Item = IterItem>> DoubleEndedIterator for Merger<I> 
 }
 
 #[cfg(test)]
+#[allow(clippy::unnecessary_wraps)]
 mod tests {
     use super::*;
     use crate::ValueType::Value;
@@ -227,19 +228,18 @@ mod tests {
     #[test]
     #[expect(clippy::unwrap_used, reason = "test assertions")]
     fn merge_many_sources() -> crate::Result<()> {
-        let sources: Vec<Vec<IterItem>> = (0..8)
-            .map(|i| {
-                vec![Ok(InternalValue::from_components(
-                    format!("{}", (b'a' + i) as char),
-                    b"",
-                    0,
-                    Value,
-                ))]
-            })
-            .collect();
-
         let iter = Merger::new(
-            sources.into_iter().map(|s| s.into_iter()).collect(),
+            (0..8)
+                .map(|i| {
+                    vec![Ok(InternalValue::from_components(
+                        format!("{}", (b'a' + i) as char),
+                        b"",
+                        0,
+                        Value,
+                    ))]
+                    .into_iter()
+                })
+                .collect(),
             comparator::default_comparator(),
         );
 

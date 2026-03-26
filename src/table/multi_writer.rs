@@ -188,11 +188,9 @@ impl MultiWriter {
 
                 if let Some(max_exclusive) = max_exclusive {
                     for rt in tombstones {
-                        if let Some(clipped) = rt.intersect_opt_with(
-                            first_key.as_ref(),
-                            max_exclusive,
-                            comparator,
-                        ) {
+                        if let Some(clipped) =
+                            rt.intersect_opt_with(first_key.as_ref(), max_exclusive, comparator)
+                        {
                             // Widen last_key so point reads for keys in the
                             // gap will consult this table for RT suppression.
                             //
@@ -240,9 +238,7 @@ impl MultiWriter {
                             first_key.as_ref()
                         };
 
-                        if comparator.compare(clipped_start, &rt.end)
-                            == std::cmp::Ordering::Less
-                        {
+                        if comparator.compare(clipped_start, &rt.end) == std::cmp::Ordering::Less {
                             writer.write_range_tombstone(RangeTombstone::new(
                                 UserKey::from(clipped_start),
                                 rt.end.clone(),
@@ -525,7 +521,7 @@ impl MultiWriter {
 }
 
 #[cfg(test)]
-#[expect(
+#[allow(
     clippy::unwrap_used,
     clippy::indexing_slicing,
     clippy::useless_vec,
@@ -752,9 +748,7 @@ mod tests {
         let t2_min = tables[1].metadata.key_range.min();
         assert!(
             t1_max.as_ref() < t2_min.as_ref(),
-            "key_ranges must be disjoint: table1.max={:?} must be < table2.min={:?}",
-            t1_max,
-            t2_min,
+            "key_ranges must be disjoint: table1.max={t1_max:?} must be < table2.min={t2_min:?}",
         );
 
         // RT must still be written to at least one output table

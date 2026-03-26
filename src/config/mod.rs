@@ -519,13 +519,13 @@ impl Config {
         }
 
         // Blob files don't support dictionary compression — reject early.
-        if let Some(ref kv_opts) = self.kv_separation_opts {
-            if matches!(kv_opts.compression, CompressionType::ZstdDict { .. }) {
-                return Err(crate::Error::Io(std::io::Error::new(
-                    std::io::ErrorKind::Unsupported,
-                    "zstd dictionary compression is not supported for blob files",
-                )));
-            }
+        if let Some(ref kv_opts) = self.kv_separation_opts
+            && matches!(kv_opts.compression, CompressionType::ZstdDict { .. })
+        {
+            return Err(crate::Error::Io(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "zstd dictionary compression is not supported for blob files",
+            )));
         }
 
         Ok(())

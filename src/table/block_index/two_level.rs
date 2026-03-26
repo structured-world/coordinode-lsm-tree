@@ -117,10 +117,10 @@ impl Iterator for Iter {
     type Item = crate::Result<KeyedBlockHandle>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if let Some(lo_block) = &mut self.lo_consumer {
-            if let Some(item) = lo_block.next() {
-                return Some(Ok(item));
-            }
+        if let Some(lo_block) = &mut self.lo_consumer
+            && let Some(item) = lo_block.next()
+        {
+            return Some(Ok(item));
         }
 
         if self.tli.is_none() && !self.init_tli() {
@@ -167,10 +167,10 @@ impl Iterator for Iter {
         }
 
         // Nothing more found, consume from hi consumer
-        if let Some(hi_block) = &mut self.hi_consumer {
-            if let Some(item) = hi_block.next() {
-                return Some(Ok(item));
-            }
+        if let Some(hi_block) = &mut self.hi_consumer
+            && let Some(item) = hi_block.next()
+        {
+            return Some(Ok(item));
         }
 
         None
@@ -179,10 +179,10 @@ impl Iterator for Iter {
 
 impl DoubleEndedIterator for Iter {
     fn next_back(&mut self) -> Option<Self::Item> {
-        if let Some(hi_block) = &mut self.hi_consumer {
-            if let Some(item) = hi_block.next_back() {
-                return Some(Ok(item));
-            }
+        if let Some(hi_block) = &mut self.hi_consumer
+            && let Some(item) = hi_block.next_back()
+        {
+            return Some(Ok(item));
         }
 
         if self.tli.is_none() && !self.init_tli() {
@@ -229,10 +229,10 @@ impl DoubleEndedIterator for Iter {
         }
 
         // Nothing more found, consume from lo consumer
-        if let Some(lo_block) = &mut self.lo_consumer {
-            if let Some(item) = lo_block.next_back() {
-                return Some(Ok(item));
-            }
+        if let Some(lo_block) = &mut self.lo_consumer
+            && let Some(item) = lo_block.next_back()
+        {
+            return Some(Ok(item));
         }
 
         None
