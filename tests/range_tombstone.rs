@@ -1144,6 +1144,34 @@ fn range_tombstone_memtable_narrow_range_queries_ignore_disjoint_rt() -> lsm_tre
     Ok(())
 }
 
+// Regression: a flushed broad RT plus a newer narrow RT must not suppress
+// unrelated keys inserted after the flush. This reproduces a property-test
+// failure where the flushed table incorrectly hid key [5] after key [0] was
+// reinserted in the active memtable.
+#[test]
+fn flushed_broad_rt_does_not_hide_unrelated_keys_after_reinsert() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let tree = open_tree(folder.path());
+
+    tree.remove_range(vec![0], vec![8], 1);
+    tree.insert(vec![5], vec![5], 2);
+    tree.remove_range(vec![0], vec![1], 3);
+    tree.flush_active_memtable(0)?;
+
+    tree.insert(vec![0], vec![0], 4);
+
+    assert_eq!(Some(vec![0].into()), tree.get(vec![0], 5)?);
+    assert_eq!(Some(vec![5].into()), tree.get(vec![5], 5)?);
+
+    let keys: Vec<Vec<u8>> = tree
+        .iter(5, None)
+        .map(|item| item.key().map(|k| k.to_vec()))
+        .collect::<lsm_tree::Result<_>>()?;
+    assert_eq!(keys, vec![vec![0], vec![5]]);
+
+    Ok(())
+}
+
 // --- Separate KV/RT seqno bounds ---
 
 /// Tables that contain both KVs and range tombstones should track
