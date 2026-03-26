@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1774559633922,
+  "lastUpdate": 1774561366269,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -4368,6 +4368,84 @@ window.BENCHMARK_DATA = {
             "value": 320571.37304466893,
             "unit": "ops/sec (normalized)",
             "extra": "raw: 490538 ops/sec | factor: 0.654 | P50: 1.8us | P99: 5.2us | P99.9: 13.1us\nthreads: 1 | elapsed: 0.41s | num: 200000 | iterations: 3 | runner: seq_wr=219554 rand_rd=681562 cpu=108 composite=35194.6"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "962795745894d71ea6f5c6ab79a54f8eca38a276",
+          "message": "test(table): add zstd dict helper coverage (#181)\n\n## Summary\n- extend the shared test_with_table helper to optionally carry a zstd\ndictionary through writer and all table recovery matrix variants\n- add unit-level ZstdDict coverage for the helper using a focused table\npoint-read round-trip\n- fix the partitioned-index helper path so dictionary-compressed tables\nare reopened with the matching dictionary in every matrix variant\n\n## Testing\n- cargo fmt --all --check\n- cargo clippy --all-features --all-targets -- -D warnings\n- cargo nextest run --all-features\n- cargo test --doc --all-features\n- cargo check --all-features in tools/db_bench\n\nCloses #177",
+          "timestamp": "2026-03-26T23:41:16+02:00",
+          "tree_id": "5538136a0a2856b96a6e80f3461a113b447eb244",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/962795745894d71ea6f5c6ab79a54f8eca38a276"
+        },
+        "date": 1774561364283,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 880757.6295947902,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 1923689 ops/sec | factor: 0.458 | P50: 0.4us | P99: 1.8us | P99.9: 3.7us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3 | runner: seq_wr=335874 rand_rd=1140922 cpu=117 composite=50235.0"
+          },
+          {
+            "name": "fillrandom",
+            "value": 476890.2645146566,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 1041590 ops/sec | factor: 0.458 | P50: 0.8us | P99: 2.5us | P99.9: 6.4us\nthreads: 1 | elapsed: 0.19s | num: 200000 | iterations: 3 | runner: seq_wr=335874 rand_rd=1140922 cpu=117 composite=50235.0"
+          },
+          {
+            "name": "readrandom",
+            "value": 272129.16678280785,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 594365 ops/sec | factor: 0.458 | P50: 1.5us | P99: 4.6us | P99.9: 9.8us\nthreads: 1 | elapsed: 0.34s | num: 200000 | iterations: 3 | runner: seq_wr=335874 rand_rd=1140922 cpu=117 composite=50235.0"
+          },
+          {
+            "name": "readseq",
+            "value": 1482995.1190967935,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 3239053 ops/sec | factor: 0.458 | P50: 0.2us | P99: 3.2us | P99.9: 5.5us\nthreads: 1 | elapsed: 0.06s | num: 200000 | iterations: 3 | runner: seq_wr=335874 rand_rd=1140922 cpu=117 composite=50235.0"
+          },
+          {
+            "name": "seekrandom",
+            "value": 186130.44445028433,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 406533 ops/sec | factor: 0.458 | P50: 2.1us | P99: 5.2us | P99.9: 10.0us\nthreads: 1 | elapsed: 0.49s | num: 200000 | iterations: 3 | runner: seq_wr=335874 rand_rd=1140922 cpu=117 composite=50235.0"
+          },
+          {
+            "name": "prefixscan",
+            "value": 102036.57681014432,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 222861 ops/sec | factor: 0.458 | P50: 4.2us | P99: 5.4us | P99.9: 11.1us\nthreads: 1 | elapsed: 0.90s | num: 200000 | iterations: 3 | runner: seq_wr=335874 rand_rd=1140922 cpu=117 composite=50235.0"
+          },
+          {
+            "name": "overwrite",
+            "value": 488346.72707429365,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 1066612 ops/sec | factor: 0.458 | P50: 0.8us | P99: 2.4us | P99.9: 6.0us\nthreads: 1 | elapsed: 0.19s | num: 200000 | iterations: 3 | runner: seq_wr=335874 rand_rd=1140922 cpu=117 composite=50235.0"
+          },
+          {
+            "name": "mergerandom",
+            "value": 349149.1916657986,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 762587 ops/sec | factor: 0.458 | P50: 0.4us | P99: 0.8us | P99.9: 3.7us\nthreads: 1 | elapsed: 0.26s | num: 200000 | iterations: 3 | runner: seq_wr=335874 rand_rd=1140922 cpu=117 composite=50235.0"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 223446.67386403232,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 488036 ops/sec | factor: 0.458 | P50: 1.9us | P99: 4.0us | P99.9: 10.0us\nthreads: 1 | elapsed: 0.41s | num: 200000 | iterations: 3 | runner: seq_wr=335874 rand_rd=1140922 cpu=117 composite=50235.0"
           }
         ]
       }
