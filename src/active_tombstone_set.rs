@@ -77,8 +77,13 @@ impl ActiveTombstoneSet {
         let insert_idx = self
             .pending_expiry
             .binary_search_by(|(existing_end, existing_id, _)| {
-                // Compare `target` to `existing` so the Vec stays sorted by
-                // `(end desc, id asc)` and the earliest expiry remains at `last()`.
+                // `binary_search_by` uses the closure to position the new
+                // target within the existing slice order. Because this Vec is
+                // intentionally sorted by `(end desc, id asc)`, we compare the
+                // target `(end, id)` against the existing probe here.
+                // Swapping the arguments would search as if the slice were in
+                // ascending comparator order and would break the tested expiry
+                // invariant that the earliest tombstone stays at `last()`.
                 comparator
                     .compare(&end, existing_end)
                     .then_with(|| existing_id.cmp(&id))

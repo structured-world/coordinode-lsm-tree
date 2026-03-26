@@ -129,14 +129,19 @@ impl MultiWriter {
     }
 
     /// Enables RT clipping: each tombstone is intersected with the output
-    /// table's KV key range. Use this for compaction where input tables are
-    /// consumed; do NOT use for flush where RTs must cover older SSTs.
+    /// Sets the user comparator used for output ordering and RT clipping.
     #[must_use]
     pub fn set_comparator(mut self, comparator: crate::SharedComparator) -> Self {
         self.comparator = comparator;
         self
     }
 
+    /// Enables RT clipping to the output table's responsibility range.
+    ///
+    /// Clipped RTs may extend beyond the table's own KV key range to cover the
+    /// gap up to the next output table. Use this for compaction where input
+    /// tables are consumed; do NOT use for flush where RTs must cover older
+    /// SSTs.
     #[must_use]
     pub fn use_clip_range_tombstones(mut self) -> Self {
         self.clip_range_tombstones = true;
