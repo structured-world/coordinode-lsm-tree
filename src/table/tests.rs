@@ -535,7 +535,7 @@ fn table_point_read_zstd_dictionary() -> crate::Result<()> {
                         SeqNo::MAX,
                         BloomBuilder::get_hash(b"key-00001"),
                     )?
-                    .unwrap()
+                    .expect("test assertion: expected value for key-00001")
                     .value,
             );
             Ok(())
