@@ -7,10 +7,10 @@
 //! During forward or reverse scans, range tombstones must be activated when
 //! the scan enters their range and expired when it leaves. These sets use
 //! a seqno multiset (`BTreeMap<SeqNo, u32>`) for O(log t) max-seqno queries,
-//! and a heap for efficient expiry tracking.
+//! and a comparator-ordered expiry queue for deterministic retirement.
 //!
-//! A unique monotonic `id` on each heap entry ensures total ordering in the
-//! heap (no equality on the tuple), which makes expiry deterministic.
+//! A unique monotonic `id` on each expiry entry ensures total ordering even
+//! when multiple tombstones share the same boundary key.
 
 use crate::{
     SeqNo, UserKey,
@@ -24,8 +24,8 @@ use std::collections::BTreeMap;
 /// Tombstones are activated when the scan reaches their `start` key, and
 /// expired when the scan reaches or passes their `end` key.
 ///
-/// Uses a min-heap (via `Reverse`) keyed by `(end, id, seqno)` so the
-/// tombstone expiring soonest (smallest `end`) is at the top.
+/// Uses a sorted vector keyed by `(end asc, id asc)` in comparator order,
+/// with the expiring-soonest tombstone kept at the tail for cheap `last()`.
 pub struct ActiveTombstoneSet {
     comparator: SharedComparator,
     seqno_counts: BTreeMap<SeqNo, u32>,
@@ -69,13 +69,18 @@ impl ActiveTombstoneSet {
         let id = self.next_id;
         self.next_id += 1;
         *self.seqno_counts.entry(rt.seqno).or_insert(0) += 1;
-        self.pending_expiry.push((rt.end.clone(), id, rt.seqno));
+        let end = rt.end.clone();
+        let seqno = rt.seqno;
         let comparator = self.comparator.as_ref();
-        self.pending_expiry.sort_unstable_by(|a, b| {
-            comparator
-                .compare(&b.0, &a.0)
-                .then_with(|| b.1.cmp(&a.1))
-        });
+        let insert_idx = self
+            .pending_expiry
+            .binary_search_by(|(existing_end, existing_id, _)| {
+                comparator
+                    .compare(existing_end, &end)
+                    .then_with(|| existing_id.cmp(&id))
+            })
+            .unwrap_or_else(|idx| idx);
+        self.pending_expiry.insert(insert_idx, (end, id, seqno));
     }
 
     /// Expires tombstones whose `end <= current_key`.
@@ -164,8 +169,8 @@ impl ActiveTombstoneSet {
 /// a key < `end` (strict `>`: `rt.end > current_key`), and expired when
 /// `current_key < rt.start`.
 ///
-/// Uses a max-heap keyed by `(start, id, seqno)` so the tombstone
-/// expiring soonest (largest `start`) is at the top.
+/// Uses a sorted vector keyed by `(start desc, id asc)` in comparator order,
+/// with the expiring-soonest tombstone kept at the tail for cheap `last()`.
 pub struct ActiveTombstoneSetReverse {
     comparator: SharedComparator,
     seqno_counts: BTreeMap<SeqNo, u32>,
@@ -213,13 +218,17 @@ impl ActiveTombstoneSetReverse {
         let id = self.next_id;
         self.next_id += 1;
         *self.seqno_counts.entry(rt.seqno).or_insert(0) += 1;
-        self.pending_expiry.push((rt.start.clone(), id, rt.seqno));
         let comparator = self.comparator.as_ref();
-        self.pending_expiry.sort_unstable_by(|a, b| {
-            comparator
-                .compare(&a.0, &b.0)
-                .then_with(|| b.1.cmp(&a.1))
-        });
+        let pos = self
+            .pending_expiry
+            .binary_search_by(|(start, existing_id, _)| {
+                comparator
+                    .compare(start, &rt.start)
+                    .reverse()
+                    .then_with(|| existing_id.cmp(&id))
+            })
+            .unwrap_or_else(|idx| idx);
+        self.pending_expiry.insert(pos, (rt.start.clone(), id, rt.seqno));
     }
 
     /// Expires tombstones whose `start > current_key`.
