@@ -738,10 +738,10 @@ impl Drop for RingThread {
             Ok(h) => h,
             Err(poisoned) => poisoned.into_inner(),
         };
-        if let Some(handle) = handle_slot.take() {
-            if handle.join().is_err() {
-                log::error!("io_uring ring thread panicked during shutdown");
-            }
+        if let Some(handle) = handle_slot.take()
+            && handle.join().is_err()
+        {
+            log::error!("io_uring ring thread panicked during shutdown");
         }
     }
 }
