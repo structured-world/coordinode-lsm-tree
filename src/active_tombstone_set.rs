@@ -77,6 +77,8 @@ impl ActiveTombstoneSet {
         let insert_idx = self
             .pending_expiry
             .binary_search_by(|(existing_end, existing_id, _)| {
+                // Compare `target` to `existing` so the Vec stays sorted by
+                // `(end desc, id asc)` and the earliest expiry remains at `last()`.
                 comparator
                     .compare(&end, existing_end)
                     .then_with(|| existing_id.cmp(&id))
