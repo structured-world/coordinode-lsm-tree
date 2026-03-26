@@ -550,6 +550,38 @@ impl Config {
     }
 }
 
+#[cfg(all(test, zstd_any))]
+mod tests {
+    use super::*;
+    use crate::{CompressionType, SequenceNumberCounter};
+
+    #[test]
+    fn blob_zstd_dict_compression_is_rejected() {
+        let folder = tempfile::tempdir().unwrap_or_else(|err| panic!("tempdir failed: {err}"));
+        let cfg = Config::new(
+            folder.path(),
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_kv_separation(Some(KvSeparationOptions::default().compression(
+            CompressionType::ZstdDict {
+                level: 3,
+                dict_id: 7,
+            },
+        )));
+
+        let err = match cfg.validate_zstd_dictionary() {
+            Ok(()) => panic!("blob-file zstd dictionary compression must be rejected"),
+            Err(err) => err,
+        };
+
+        assert!(
+            err.to_string()
+                .contains("zstd dictionary compression is not supported for blob files")
+        );
+    }
+}
+
 impl<F: Fs> Config<F> {
     /// Returns the tables folder path and [`Fs`] backend for the given level.
     ///

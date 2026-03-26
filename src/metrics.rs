@@ -283,6 +283,14 @@ mod tests {
     }
 
     #[test]
+    fn zero_query_cache_hit_rates_return_one() {
+        let m = Metrics::default();
+        assert!((m.data_block_cache_hit_rate() - 1.0).abs() < f64::EPSILON);
+        assert!((m.filter_block_cache_hit_rate() - 1.0).abs() < f64::EPSILON);
+        assert!((m.index_block_cache_hit_rate() - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
     fn block_io_includes_range_tombstone() {
         let m = Metrics::default();
         m.data_block_io_requested.store(10, Relaxed);
