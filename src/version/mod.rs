@@ -14,16 +14,16 @@ pub use persist::persist_version;
 pub use run::Run;
 pub use super_version::{SuperVersion, SuperVersions};
 
+use crate::TreeType;
 use crate::blob_tree::{FragmentationEntry, FragmentationMap};
 use crate::checksum::ChecksumType;
 use crate::coding::Encode;
 use crate::compaction::state::hidden_set::HiddenSet;
 use crate::version::recovery::Recovery;
-use crate::TreeType;
 use crate::{
+    HashSet, KeyRange, Table, TableId,
     comparator::UserComparator,
     vlog::{BlobFile, BlobFileId},
-    HashSet, KeyRange, Table, TableId,
 };
 use optimize::optimize_runs;
 use run::Ranged;

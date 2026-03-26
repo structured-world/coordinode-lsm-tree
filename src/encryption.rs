@@ -265,8 +265,8 @@ impl EncryptionProvider for Aes256GcmProvider {
     }
 
     fn decrypt(&self, ciphertext: &[u8]) -> crate::Result<Vec<u8>> {
-        use aes_gcm::aead::generic_array::GenericArray;
         use aes_gcm::AeadInPlace;
+        use aes_gcm::aead::generic_array::GenericArray;
 
         let min_len = Self::NONCE_LEN + Self::TAG_LEN;
         if ciphertext.len() < min_len {
@@ -329,8 +329,8 @@ impl EncryptionProvider for Aes256GcmProvider {
     }
 
     fn decrypt_vec(&self, mut buf: Vec<u8>) -> crate::Result<Vec<u8>> {
-        use aes_gcm::aead::generic_array::GenericArray;
         use aes_gcm::AeadInPlace;
+        use aes_gcm::aead::generic_array::GenericArray;
 
         // Error::Decrypt takes &'static str — can't include runtime lengths
         // without changing the upstream error type to accept String/Cow.

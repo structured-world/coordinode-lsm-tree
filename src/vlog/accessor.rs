@@ -3,10 +3,10 @@
 // (found in the LICENSE-* files in the repository)
 
 use crate::{
+    Cache, GlobalTableId, TreeId, UserValue,
     fs::FsFile,
     version::BlobFileList,
-    vlog::{blob_file::reader::Reader, ValueHandle},
-    Cache, GlobalTableId, TreeId, UserValue,
+    vlog::{ValueHandle, blob_file::reader::Reader},
 };
 use std::{path::Path, sync::Arc};
 

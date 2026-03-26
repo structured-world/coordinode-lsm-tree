@@ -3,7 +3,7 @@
 // (found in the LICENSE-* files in the repository)
 
 use super::{Choice, CompactionStrategy, Input};
-use crate::{compaction::state::CompactionState, table::Table, version::Version, Config};
+use crate::{Config, compaction::state::CompactionState, table::Table, version::Version};
 
 /// Moves down a level into the destination level.
 pub struct Strategy(pub u8, pub u8);

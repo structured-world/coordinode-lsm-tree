@@ -8,7 +8,7 @@
 // `optimize_runs` is called on every version creation (flush, compaction),
 // so flushing multiple memtables is sufficient to trigger the reordering.
 
-use lsm_tree::{get_tmp_folder, AbstractTree, AnyTree, Config, SequenceNumberCounter};
+use lsm_tree::{AbstractTree, AnyTree, Config, SequenceNumberCounter, get_tmp_folder};
 use test_log::test;
 
 fn open_tree(path: &std::path::Path) -> AnyTree {

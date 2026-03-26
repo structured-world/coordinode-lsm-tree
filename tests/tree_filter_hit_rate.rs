@@ -2,7 +2,7 @@
 #[cfg(feature = "metrics")]
 fn tree_filter_hit_rate() -> lsm_tree::Result<()> {
     use lsm_tree::{
-        get_tmp_folder, AbstractTree, Config, KvSeparationOptions, SeqNo, SequenceNumberCounter,
+        AbstractTree, Config, KvSeparationOptions, SeqNo, SequenceNumberCounter, get_tmp_folder,
     };
 
     let a = {
@@ -55,7 +55,7 @@ fn tree_filter_hit_rate() -> lsm_tree::Result<()> {
 #[test_log::test]
 #[cfg(feature = "metrics")]
 fn tree_filter_hit_rate_hit() -> lsm_tree::Result<()> {
-    use lsm_tree::{get_tmp_folder, AbstractTree, Config, SeqNo, SequenceNumberCounter};
+    use lsm_tree::{AbstractTree, Config, SeqNo, SequenceNumberCounter, get_tmp_folder};
 
     let folder = get_tmp_folder();
     let path = folder.path();

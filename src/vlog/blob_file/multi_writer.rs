@@ -5,17 +5,17 @@
 use super::writer::Writer;
 use crate::fs::FsFile;
 use crate::{
+    BlobFile, CompressionType, DescriptorTable, SeqNo, SequenceNumberCounter, TreeId,
     file_accessor::FileAccessor,
     fs::Fs,
     vlog::{
-        blob_file::{Inner as BlobFileInner, Metadata},
         ValueHandle,
+        blob_file::{Inner as BlobFileInner, Metadata},
     },
-    BlobFile, CompressionType, DescriptorTable, SeqNo, SequenceNumberCounter, TreeId,
 };
 use std::{
     path::{Path, PathBuf},
-    sync::{atomic::AtomicBool, Arc},
+    sync::{Arc, atomic::AtomicBool},
 };
 
 /// Blob file writer, may write multiple blob files

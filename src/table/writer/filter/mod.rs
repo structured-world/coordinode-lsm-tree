@@ -9,8 +9,8 @@ pub use full::FullFilterWriter;
 pub use partitioned::PartitionedFilterWriter;
 
 use crate::{
-    checksum::ChecksummedWriter, config::BloomConstructionPolicy, encryption::EncryptionProvider,
-    prefix::PrefixExtractor, CompressionType, UserKey,
+    CompressionType, UserKey, checksum::ChecksummedWriter, config::BloomConstructionPolicy,
+    encryption::EncryptionProvider, prefix::PrefixExtractor,
 };
 use std::sync::Arc;
 

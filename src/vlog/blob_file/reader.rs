@@ -6,14 +6,14 @@
 use crate::compression::CompressionProvider as _;
 
 use crate::{
+    BlobFile, Checksum, CompressionType, UserValue,
     fs::FsFile,
     vlog::{
-        blob_file::writer::{
-            validate_header_crc, BLOB_HEADER_LEN_V4, BLOB_HEADER_MAGIC_V3, BLOB_HEADER_MAGIC_V4,
-        },
         ValueHandle,
+        blob_file::writer::{
+            BLOB_HEADER_LEN_V4, BLOB_HEADER_MAGIC_V3, BLOB_HEADER_MAGIC_V4, validate_header_crc,
+        },
     },
-    BlobFile, Checksum, CompressionType, UserValue,
 };
 use byteorder::{LittleEndian, ReadBytesExt};
 use std::io::{Cursor, Read};
@@ -255,9 +255,9 @@ impl<'a> Reader<'a> {
 )]
 mod tests {
     use super::*;
+    use crate::SequenceNumberCounter;
     use crate::fs::StdFs;
     use crate::vlog::blob_file::writer::BLOB_HEADER_LEN_V3;
-    use crate::SequenceNumberCounter;
     use std::fs::File;
     use std::sync::Arc;
     use test_log::test;
@@ -928,10 +928,10 @@ mod tests {
     #[test]
     fn blob_reader_v3_backward_compat_roundtrip() -> crate::Result<()> {
         use crate::file_accessor::FileAccessor;
-        use crate::vlog::{blob_file::Inner as BlobFileInner, ValueHandle};
+        use crate::vlog::{ValueHandle, blob_file::Inner as BlobFileInner};
         use byteorder::WriteBytesExt;
         use std::io::Write;
-        use std::sync::{atomic::AtomicBool, Arc};
+        use std::sync::{Arc, atomic::AtomicBool};
 
         let folder = tempfile::tempdir()?;
         let blob_file_path = folder.path().join("0");

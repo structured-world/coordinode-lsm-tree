@@ -4,16 +4,16 @@
 
 use super::KeyedBlockHandle;
 use crate::{
+    Cache, CompressionType, GlobalTableId, SeqNo, UserKey,
     comparator::SharedComparator,
     encryption::EncryptionProvider,
     file_accessor::FileAccessor,
     table::{
-        block::BlockType,
-        block_index::{iter::OwnedIndexBlockIter, BlockIndexIter},
-        util::load_block,
         BlockHandle, IndexBlock,
+        block::BlockType,
+        block_index::{BlockIndexIter, iter::OwnedIndexBlockIter},
+        util::load_block,
     },
-    Cache, CompressionType, GlobalTableId, SeqNo, UserKey,
 };
 use std::{path::PathBuf, sync::Arc};
 

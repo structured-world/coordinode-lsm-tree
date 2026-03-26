@@ -7,13 +7,13 @@
 #[cfg(feature = "zstd")]
 mod zstd_dict {
     use lsm_tree::{
-        config::CompressionPolicy,
         AbstractTree,
         CompressionType,
         Config,
         Guard, // trait import — required for IterGuardImpl::into_inner()
         SequenceNumberCounter,
         ZstdDictionary,
+        config::CompressionPolicy,
     };
     use std::sync::Arc;
 

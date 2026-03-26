@@ -1,8 +1,8 @@
 // Found by model testing
 
 use lsm_tree::{
-    config::BlockSizePolicy, get_tmp_folder, AbstractTree, KvSeparationOptions, Result,
-    SequenceNumberCounter,
+    AbstractTree, KvSeparationOptions, Result, SequenceNumberCounter, config::BlockSizePolicy,
+    get_tmp_folder,
 };
 use std::sync::Arc;
 use test_log::test;

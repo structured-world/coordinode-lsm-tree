@@ -5,8 +5,8 @@
 use crate::table::block::Header;
 use crate::table::{Block, BlockOffset};
 use crate::{GlobalTableId, UserValue};
-use quick_cache::sync::Cache as QuickCache;
 use quick_cache::Weighter;
+use quick_cache::sync::Cache as QuickCache;
 
 const TAG_BLOCK: u8 = 0;
 const TAG_BLOB: u8 = 1;

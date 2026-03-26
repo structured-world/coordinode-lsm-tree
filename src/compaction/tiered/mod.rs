@@ -4,8 +4,8 @@
 
 use super::{Choice, CompactionStrategy, Input as CompactionInput};
 use crate::{
-    compaction::state::CompactionState, config::Config, table::Table, version::Version, HashSet,
-    KvPair, TableId,
+    HashSet, KvPair, TableId, compaction::state::CompactionState, config::Config, table::Table,
+    version::Version,
 };
 
 #[cfg(test)]

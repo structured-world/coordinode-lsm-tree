@@ -1,7 +1,7 @@
 use lsm_tree::compaction::filter::{
     CompactionFilter, Context as CompactionFilterContext, Factory, ItemAccessor, Verdict,
 };
-use lsm_tree::{get_tmp_folder, AbstractTree, SeqNo, SequenceNumberCounter};
+use lsm_tree::{AbstractTree, SeqNo, SequenceNumberCounter, get_tmp_folder};
 use std::sync::{Arc, Mutex};
 use test_log::test;
 

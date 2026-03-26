@@ -4,8 +4,8 @@
 
 use super::{Choice, CompactionStrategy};
 use crate::{
-    compaction::state::CompactionState, config::Config, time::unix_timestamp, version::Version,
-    HashSet, KvPair,
+    HashSet, KvPair, compaction::state::CompactionState, config::Config, time::unix_timestamp,
+    version::Version,
 };
 
 #[doc(hidden)]

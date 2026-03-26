@@ -3,10 +3,10 @@
 // (found in the LICENSE-* files in the repository)
 
 use crate::{
+    SeqNo,
     comparator::SharedComparator,
     double_ended_peekable::{DoubleEndedPeekable, DoubleEndedPeekableExt},
-    table::{block::Decoder, index_block::IndexBlockParsedItem, KeyedBlockHandle},
-    SeqNo,
+    table::{KeyedBlockHandle, block::Decoder, index_block::IndexBlockParsedItem},
 };
 
 pub struct Iter<'a> {

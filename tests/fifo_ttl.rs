@@ -1,6 +1,6 @@
 use lsm_tree::{
-    compaction::Fifo, get_tmp_folder, AbstractTree, Config, KvSeparationOptions,
-    SequenceNumberCounter,
+    AbstractTree, Config, KvSeparationOptions, SequenceNumberCounter, compaction::Fifo,
+    get_tmp_folder,
 };
 use std::sync::Arc;
 

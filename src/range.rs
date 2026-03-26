@@ -3,6 +3,7 @@
 // (found in the LICENSE-* files in the repository)
 
 use crate::{
+    BoxedIterator, InternalValue,
     key::InternalKey,
     memtable::Memtable,
     merge::Merger,
@@ -13,7 +14,6 @@ use crate::{
     run_reader::RunReader,
     value::{SeqNo, UserKey},
     version::{Run, SuperVersion},
-    BoxedIterator, InternalValue,
 };
 use self_cell::self_cell;
 use std::{

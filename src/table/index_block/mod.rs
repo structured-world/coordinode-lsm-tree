@@ -9,16 +9,16 @@ pub use block_handle::{BlockHandle, KeyedBlockHandle};
 pub use iter::Iter;
 
 use super::{
-    block::{BlockOffset, Encoder, Trailer},
     Block,
+    block::{BlockOffset, Encoder, Trailer},
 };
 use crate::Slice;
 use crate::{
+    SeqNo,
     table::{
         block::{Decoder, ParsedItem},
-        util::{compare_prefixed_slice, SliceIndexes},
+        util::{SliceIndexes, compare_prefixed_slice},
     },
-    SeqNo,
 };
 
 #[derive(Debug)]

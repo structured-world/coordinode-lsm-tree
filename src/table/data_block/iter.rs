@@ -3,13 +3,13 @@
 // (found in the LICENSE-* files in the repository)
 
 use crate::{
+    InternalValue, SeqNo,
     comparator::SharedComparator,
     double_ended_peekable::{DoubleEndedPeekable, DoubleEndedPeekableExt},
     table::{
         block::{Decoder, ParsedItem},
         data_block::DataBlockParsedItem,
     },
-    InternalValue, SeqNo,
 };
 
 /// The data block iterator handles double-ended scans over a data block

@@ -2,7 +2,7 @@
 // This source code is licensed under both the Apache 2.0 and MIT License
 // (found in the LICENSE-* files in the repository)
 
-use lsm_tree::{get_tmp_folder, AbstractTree, Config, Guard, SequenceNumberCounter};
+use lsm_tree::{AbstractTree, Config, Guard, SequenceNumberCounter, get_tmp_folder};
 use test_log::test;
 
 /// Test that iterators can be stored in a struct (proving they're 'static)

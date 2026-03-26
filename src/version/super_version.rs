@@ -3,12 +3,12 @@
 // (found in the LICENSE-* files in the repository)
 
 use crate::{
+    MAX_SEQNO, SeqNo, SharedSequenceNumberGenerator,
     comparator::SharedComparator,
     fs::Fs,
     memtable::Memtable,
     tree::sealed::SealedMemtables,
-    version::{persist_version, Version},
-    SeqNo, SharedSequenceNumberGenerator, MAX_SEQNO,
+    version::{Version, persist_version},
 };
 use std::{collections::VecDeque, path::Path, sync::Arc};
 

@@ -10,6 +10,7 @@ pub mod ingest;
 pub use gc::{FragmentationEntry, FragmentationMap};
 
 use crate::{
+    Cache, Config, Memtable, SeqNo, TableId, TreeId, UserKey, UserValue,
     abstract_tree::{AbstractTree, RangeItem},
     coding::Decode,
     iter_guard::{IterGuard, IterGuardImpl},
@@ -18,7 +19,6 @@ use crate::{
     value::InternalValue,
     version::Version,
     vlog::{Accessor, BlobFile, BlobFileWriter},
-    Cache, Config, Memtable, SeqNo, TableId, TreeId, UserKey, UserValue,
 };
 use handle::BlobIndirection;
 use std::{
@@ -108,7 +108,8 @@ fn resolve_value_handle(
             Ok(None) => {
                 panic!(
                     "value handle ({:?} => {:?}) did not match any blob - this is a bug; version={}",
-                    item.key.user_key, vptr.vhandle,
+                    item.key.user_key,
+                    vptr.vhandle,
                     version.id(),
                 );
             }
@@ -137,7 +138,7 @@ pub struct BlobTree {
 
 impl BlobTree {
     pub(crate) fn open(config: Config) -> crate::Result<Self> {
-        use crate::file::{fsync_directory, BLOBS_FOLDER};
+        use crate::file::{BLOBS_FOLDER, fsync_directory};
         use crate::fs::Fs;
 
         let index = crate::Tree::open(config)?;
@@ -413,7 +414,9 @@ impl AbstractTree for BlobTree {
         let index_partitioning = self.index.config.index_block_partitioning_policy.get(0);
         let filter_partitioning = self.index.config.filter_block_partitioning_policy.get(0);
 
-        log::debug!("Flushing memtable(s) and performing key-value separation, data_block_restart_interval={data_block_restart_interval}, index_block_restart_interval={index_block_restart_interval}, data_block_size={data_block_size}, data_block_compression={data_block_compression:?}, index_block_compression={index_block_compression:?}");
+        log::debug!(
+            "Flushing memtable(s) and performing key-value separation, data_block_restart_interval={data_block_restart_interval}, index_block_restart_interval={index_block_restart_interval}, data_block_size={data_block_size}, data_block_compression={data_block_compression:?}, index_block_compression={index_block_compression:?}"
+        );
         log::debug!("=> to table(s) in {}", table_folder.display());
         log::debug!("=> to blob file(s) at {}", self.blobs_folder.display());
 

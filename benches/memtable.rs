@@ -1,5 +1,5 @@
-use criterion::{criterion_group, criterion_main, Criterion};
-use lsm_tree::{DefaultUserComparator, InternalValue, Memtable, SharedComparator, MAX_SEQNO};
+use criterion::{Criterion, criterion_group, criterion_main};
+use lsm_tree::{DefaultUserComparator, InternalValue, MAX_SEQNO, Memtable, SharedComparator};
 use nanoid::nanoid;
 use std::sync::Arc;
 

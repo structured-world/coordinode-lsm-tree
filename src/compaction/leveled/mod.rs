@@ -14,12 +14,12 @@ mod test;
 
 use super::{Choice, CompactionStrategy, Input as CompactionInput};
 use crate::{
-    compaction::state::{hidden_set::HiddenSet, CompactionState},
+    HashSet, TableId,
+    compaction::state::{CompactionState, hidden_set::HiddenSet},
     config::Config,
     slice_windows::{GrowingWindowsExt, ShrinkingWindowsExt},
-    table::{util::aggregate_run_key_range, Table},
-    version::{run::Ranged, Level, Version},
-    HashSet, TableId,
+    table::{Table, util::aggregate_run_key_range},
+    version::{Level, Version, run::Ranged},
 };
 
 /// Tries to find the most optimal compaction set from one level into the other.

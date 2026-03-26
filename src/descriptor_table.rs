@@ -2,8 +2,8 @@
 // This source code is licensed under both the Apache 2.0 and MIT License
 // (found in the LICENSE-* files in the repository)
 
-use crate::{fs::FsFile, GlobalTableId};
-use quick_cache::{sync::Cache as QuickCache, UnitWeighter};
+use crate::{GlobalTableId, fs::FsFile};
+use quick_cache::{UnitWeighter, sync::Cache as QuickCache};
 use std::sync::Arc;
 
 const TAG_BLOCK: u8 = 0;

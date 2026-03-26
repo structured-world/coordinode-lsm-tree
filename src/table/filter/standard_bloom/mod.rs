@@ -9,7 +9,7 @@ pub use builder::Builder;
 use super::bit_array::BitArrayReader;
 use crate::{
     file::MAGIC_BYTES,
-    table::filter::{standard_bloom::builder::secondary_hash, FilterType},
+    table::filter::{FilterType, standard_bloom::builder::secondary_hash},
 };
 use byteorder::{LittleEndian, ReadBytesExt};
 use std::io::{Cursor, Read};

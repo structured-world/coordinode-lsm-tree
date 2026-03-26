@@ -2,8 +2,8 @@
 // This source code is licensed under both the Apache 2.0 and MIT License
 // (found in the LICENSE-* files in the repository)
 
-use crate::comparator::UserComparator;
 use crate::KeyRange;
+use crate::comparator::UserComparator;
 use std::ops::{Bound, RangeBounds};
 
 pub trait Ranged {
@@ -494,9 +494,10 @@ mod tests {
             run.range_overlap_indexes(&(b"z" as &[u8]..=b"zzz"))
         );
         assert_eq!(Some((3, 3)), run.range_overlap_indexes(&(b"z" as &[u8]..)));
-        assert!(run
-            .range_overlap_indexes(&(b"zzz" as &[u8]..=b"zzzzzzz"))
-            .is_none());
+        assert!(
+            run.range_overlap_indexes(&(b"zzz" as &[u8]..=b"zzzzzzz"))
+                .is_none()
+        );
     }
 
     #[test]
@@ -568,8 +569,8 @@ mod tests {
 
     #[test]
     fn run_range_contained_cmp_reverse() {
-        use crate::comparator::UserComparator;
         use crate::TableId;
+        use crate::comparator::UserComparator;
 
         struct ReverseCmp;
         impl UserComparator for ReverseCmp {
@@ -783,9 +784,10 @@ mod tests {
         );
 
         // Out of range (beyond last table in reverse order)
-        assert!(run
-            .range_overlap_indexes_cmp(&(b"\x00" as &[u8]..=b"\x00"), &cmp)
-            .is_none());
+        assert!(
+            run.range_overlap_indexes_cmp(&(b"\x00" as &[u8]..=b"\x00"), &cmp)
+                .is_none()
+        );
 
         // Exclusive start bound: skip first table (z..p), start from second (o..k)
         let bounds_excl_start: (Bound<&[u8]>, Bound<&[u8]>) =

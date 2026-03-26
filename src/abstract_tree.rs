@@ -3,8 +3,8 @@
 // (found in the LICENSE-* files in the repository)
 
 use crate::{
-    iter_guard::IterGuardImpl, table::Table, version::Version, vlog::BlobFile, AnyTree, BlobTree,
-    Config, Guard, InternalValue, KvPair, Memtable, SeqNo, TableId, Tree, UserKey, UserValue,
+    AnyTree, BlobTree, Config, Guard, InternalValue, KvPair, Memtable, SeqNo, TableId, Tree,
+    UserKey, UserValue, iter_guard::IterGuardImpl, table::Table, version::Version, vlog::BlobFile,
 };
 use std::{
     ops::RangeBounds,

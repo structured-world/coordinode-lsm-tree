@@ -1,6 +1,6 @@
 use crate::{
     checksum::ChecksummedWriter,
-    file::{fsync_directory, rewrite_atomic, CURRENT_VERSION_FILE},
+    file::{CURRENT_VERSION_FILE, fsync_directory, rewrite_atomic},
     fs::{Fs, FsFile, FsOpenOptions},
     version::Version,
 };

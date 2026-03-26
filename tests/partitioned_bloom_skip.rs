@@ -36,8 +36,8 @@ impl MergeOperator for SumMerge {
 #[cfg(feature = "metrics")]
 fn partitioned_bloom_skip_for_point_reads() -> lsm_tree::Result<()> {
     use lsm_tree::{
-        config::PinningPolicy, get_tmp_folder, AbstractTree, Config, SequenceNumberCounter,
-        MAX_SEQNO,
+        AbstractTree, Config, MAX_SEQNO, SequenceNumberCounter, config::PinningPolicy,
+        get_tmp_folder,
     };
 
     let folder = get_tmp_folder();
@@ -80,8 +80,8 @@ fn partitioned_bloom_skip_for_point_reads() -> lsm_tree::Result<()> {
 #[test_log::test]
 fn partitioned_bloom_skip_beyond_partitions() -> lsm_tree::Result<()> {
     use lsm_tree::{
-        config::PinningPolicy, get_tmp_folder, AbstractTree, Config, SequenceNumberCounter,
-        MAX_SEQNO,
+        AbstractTree, Config, MAX_SEQNO, SequenceNumberCounter, config::PinningPolicy,
+        get_tmp_folder,
     };
 
     let folder = get_tmp_folder();
@@ -116,8 +116,8 @@ fn partitioned_bloom_skip_beyond_partitions() -> lsm_tree::Result<()> {
 #[test_log::test]
 fn partitioned_bloom_skip_merge_pipeline() -> lsm_tree::Result<()> {
     use lsm_tree::{
-        config::PinningPolicy, get_tmp_folder, AbstractTree, Config, SequenceNumberCounter,
-        MAX_SEQNO,
+        AbstractTree, Config, MAX_SEQNO, SequenceNumberCounter, config::PinningPolicy,
+        get_tmp_folder,
     };
 
     let folder = get_tmp_folder();
@@ -159,8 +159,8 @@ fn partitioned_bloom_skip_merge_pipeline() -> lsm_tree::Result<()> {
 #[test_log::test]
 fn full_filter_bloom_skip_merge_pipeline() -> lsm_tree::Result<()> {
     use lsm_tree::{
-        config::PinningPolicy, get_tmp_folder, AbstractTree, Config, SequenceNumberCounter,
-        MAX_SEQNO,
+        AbstractTree, Config, MAX_SEQNO, SequenceNumberCounter, config::PinningPolicy,
+        get_tmp_folder,
     };
 
     let folder = get_tmp_folder();

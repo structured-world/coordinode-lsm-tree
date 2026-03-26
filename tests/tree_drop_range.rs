@@ -1,4 +1,4 @@
-use lsm_tree::{get_tmp_folder, AbstractTree, AnyTree, Config, SeqNo, SequenceNumberCounter};
+use lsm_tree::{AbstractTree, AnyTree, Config, SeqNo, SequenceNumberCounter, get_tmp_folder};
 use std::ops::Bound::{Excluded, Included, Unbounded};
 
 fn populate_tables(tree: &AnyTree) -> lsm_tree::Result<()> {

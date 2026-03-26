@@ -15,18 +15,18 @@ pub(crate) use decoder::{Decodable, Decoder, ParsedItem};
 pub(crate) use encoder::{Encodable, Encoder};
 pub use header::Header;
 pub use offset::BlockOffset;
+pub(crate) use trailer::{TRAILER_START_MARKER, Trailer};
 pub use r#type::BlockType;
-pub(crate) use trailer::{Trailer, TRAILER_START_MARKER};
 
 #[cfg(zstd_any)]
 use crate::compression::CompressionProvider as _;
 
 use crate::{
+    Checksum, CompressionType, Slice,
     coding::{Decode, Encode},
     encryption::EncryptionProvider,
     fs::FsFile,
     table::BlockHandle,
-    Checksum, CompressionType, Slice,
 };
 
 /// Safety cap on block payload size (256 MiB).

@@ -16,13 +16,13 @@
 
 use super::{Fs, FsDirEntry, FsFile, FsMetadata, FsOpenOptions};
 use crate::HashMap;
-use io_uring::{opcode, types, IoUring};
+use io_uring::{IoUring, opcode, types};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::unix::io::AsRawFd;
 use std::path::Path;
 use std::sync::atomic::AtomicU64;
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 
 /// Default number of `io_uring` submission queue entries.

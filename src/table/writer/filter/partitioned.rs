@@ -4,15 +4,15 @@
 
 use super::FilterWriter;
 use crate::{
+    CompressionType, UserKey,
     checksum::ChecksummedWriter,
     config::BloomConstructionPolicy,
     encryption::EncryptionProvider,
     prefix::PrefixExtractor,
     table::{
-        block::Header as BlockHeader, filter::standard_bloom::Builder, Block, BlockHandle,
-        BlockOffset, IndexBlock, KeyedBlockHandle,
+        Block, BlockHandle, BlockOffset, IndexBlock, KeyedBlockHandle,
+        block::Header as BlockHeader, filter::standard_bloom::Builder,
     },
-    CompressionType, UserKey,
 };
 use std::{
     io::{Seek, Write},

@@ -3,8 +3,8 @@ name = "coordinode-lsm-tree"
 description = "A K.I.S.S. implementation of log-structured merge trees (LSM-trees/LSMTs) — CoordiNode fork"
 license = "Apache-2.0"
 version = "4.1.0"
-edition = "2021"
-rust-version = "1.90"
+edition = "2024"
+rust-version = "1.92"
 readme = "README.md"
 include = ["src/**/*", "build.rs", "LICENSE-APACHE", "README.md", "CHANGELOG.md"]
 repository = "https://github.com/structured-world/coordinode-lsm-tree"
@@ -84,4 +84,3 @@ name = "bloom"
 harness = false
 path = "benches/bloom.rs"
 required-features = []
-

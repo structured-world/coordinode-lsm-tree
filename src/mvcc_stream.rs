@@ -332,7 +332,7 @@ impl<I: DoubleEndedIterator<Item = crate::Result<InternalValue>>> DoubleEndedIte
 )]
 mod tests {
     use super::*;
-    use crate::{value::InternalValue, ValueType};
+    use crate::{ValueType, value::InternalValue};
     use test_log::test;
 
     macro_rules! stream {

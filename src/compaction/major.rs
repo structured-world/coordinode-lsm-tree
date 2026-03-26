@@ -4,7 +4,7 @@
 
 use super::{Choice, CompactionStrategy, Input as CompactionInput};
 use crate::{
-    compaction::state::CompactionState, config::Config, table::Table, version::Version, HashSet,
+    HashSet, compaction::state::CompactionState, config::Config, table::Table, version::Version,
 };
 
 /// Compacts all tables into the last level

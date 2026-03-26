@@ -2,12 +2,12 @@
 mod tests {
     use crate::comparator::default_comparator;
     use crate::{
-        table::{
-            block::{BlockType, Header, ParsedItem},
-            Block, DataBlock,
-        },
         Checksum, InternalValue, SeqNo, Slice,
         ValueType::{Tombstone, Value},
+        table::{
+            Block, DataBlock,
+            block::{BlockType, Header, ParsedItem},
+        },
     };
     use test_log::test;
 

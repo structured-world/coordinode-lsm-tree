@@ -2,18 +2,18 @@
 // This source code is licensed under both the Apache 2.0 and MIT License
 // (found in the LICENSE-* files in the repository)
 
-use super::{data_block::Iter as DataBlockIter, BlockOffset, DataBlock, GlobalTableId};
+use super::{BlockOffset, DataBlock, GlobalTableId, data_block::Iter as DataBlockIter};
 use crate::{
+    Cache, CompressionType, InternalValue, SeqNo, UserKey,
     comparator::SharedComparator,
     encryption::EncryptionProvider,
     file_accessor::FileAccessor,
     table::{
+        BlockHandle,
         block::ParsedItem,
         block_index::{BlockIndexIter, BlockIndexIterImpl},
         util::load_block,
-        BlockHandle,
     },
-    Cache, CompressionType, InternalValue, SeqNo, UserKey,
 };
 use self_cell::self_cell;
 use std::{path::PathBuf, sync::Arc};

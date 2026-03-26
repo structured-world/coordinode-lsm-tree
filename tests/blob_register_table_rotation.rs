@@ -1,6 +1,6 @@
 use lsm_tree::{
-    config::BlockSizePolicy, get_tmp_folder, AbstractTree, KvSeparationOptions,
-    SequenceNumberCounter,
+    AbstractTree, KvSeparationOptions, SequenceNumberCounter, config::BlockSizePolicy,
+    get_tmp_folder,
 };
 use test_log::test;
 

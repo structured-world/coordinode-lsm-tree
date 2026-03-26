@@ -1,8 +1,8 @@
+use lsm_tree::compaction::PullDown;
 use lsm_tree::compaction::filter::{
     CompactionFilter, Context as CompactionFilterContext, Factory, ItemAccessor, Verdict,
 };
-use lsm_tree::compaction::PullDown;
-use lsm_tree::{get_tmp_folder, AbstractTree, KvSeparationOptions, SeqNo, SequenceNumberCounter};
+use lsm_tree::{AbstractTree, KvSeparationOptions, SeqNo, SequenceNumberCounter, get_tmp_folder};
 use std::sync::{Arc, Mutex};
 use test_log::test;
 
@@ -11,7 +11,7 @@ fn u32_s(n: u32) -> [u8; 4] {
 }
 
 fn u32_f(mut buf: &[u8]) -> u32 {
-    use byteorder::{ReadBytesExt, BE};
+    use byteorder::{BE, ReadBytesExt};
 
     buf.read_u32::<BE>().unwrap()
 }

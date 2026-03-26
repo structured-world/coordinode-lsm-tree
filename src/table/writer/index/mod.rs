@@ -9,8 +9,8 @@ pub use full::FullIndexWriter;
 pub use partitioned::PartitionedIndexWriter;
 
 use crate::{
-    checksum::ChecksummedWriter, encryption::EncryptionProvider,
-    table::index_block::KeyedBlockHandle, CompressionType,
+    CompressionType, checksum::ChecksummedWriter, encryption::EncryptionProvider,
+    table::index_block::KeyedBlockHandle,
 };
 use std::sync::Arc;
 

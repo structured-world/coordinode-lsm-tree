@@ -4,9 +4,9 @@
 
 use super::{Choice, CompactionStrategy};
 use crate::{
-    compaction::{state::CompactionState, Input},
-    version::Version,
     Config,
+    compaction::{Input, state::CompactionState},
+    version::Version,
 };
 
 /// Pulls down and merges a level into the destination level.

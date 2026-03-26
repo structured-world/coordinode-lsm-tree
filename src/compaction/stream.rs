@@ -2,7 +2,7 @@
 // This source code is licensed under both the Apache 2.0 and MIT License
 // (found in the LICENSE-* files in the repository)
 
-use crate::{merge_operator::MergeOperator, InternalValue, SeqNo, UserKey, UserValue, ValueType};
+use crate::{InternalValue, SeqNo, UserKey, UserValue, ValueType, merge_operator::MergeOperator};
 use std::{collections::VecDeque, iter::Peekable, sync::Arc};
 
 type Item = crate::Result<InternalValue>;
@@ -414,7 +414,7 @@ impl<'a, I: Iterator<Item = Item>, F: StreamFilter + 'a> Iterator for Compaction
 )]
 mod tests {
     use super::*;
-    use crate::{value::InternalValue, ValueType};
+    use crate::{ValueType, value::InternalValue};
     use test_log::test;
 
     macro_rules! stream {
@@ -871,7 +871,7 @@ mod tests {
 
     pub mod custom_mvcc {
         use super::*;
-        use byteorder::{ReadBytesExt, WriteBytesExt, BE};
+        use byteorder::{BE, ReadBytesExt, WriteBytesExt};
         use test_log::test;
 
         /// MVCC trailer size (anything but user key)

@@ -4,13 +4,15 @@
 
 use super::{CompactionAction, CompactionResult, CompactionStrategy, Input as CompactionPayload};
 use crate::{
+    BlobFile, Config, HashSet, InternalValue, SeqNo, SequenceNumberCounter,
+    SharedSequenceNumberGenerator, Table, TableId,
     blob_tree::FragmentationMap,
     compaction::{
+        Choice,
         filter::{Context, StreamFilterAdapter},
         flavour::{RelocatingCompaction, StandardCompaction},
         state::CompactionState,
         stream::CompactionStream,
-        Choice,
     },
     file::BLOBS_FOLDER,
     merge::Merger,
@@ -19,8 +21,6 @@ use crate::{
     tree::inner::TreeId,
     version::{Run, SuperVersions, Version},
     vlog::{BlobFileMergeScanner, BlobFileScanner, BlobFileWriter},
-    BlobFile, Config, HashSet, InternalValue, SeqNo, SequenceNumberCounter,
-    SharedSequenceNumberGenerator, Table, TableId,
 };
 use std::{
     sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard},
@@ -225,9 +225,9 @@ fn move_tables(
         .should_decline_compaction(payload.table_ids.iter().copied())
     {
         log::warn!(
-        "Compaction task created by {:?} contained hidden tables, declining to run it - please report this at https://github.com/fjall-rs/lsm-tree/issues/new?template=bug_report.md",
-        opts.strategy.get_name(),
-    );
+            "Compaction task created by {:?} contained hidden tables, declining to run it - please report this at https://github.com/fjall-rs/lsm-tree/issues/new?template=bug_report.md",
+            opts.strategy.get_name(),
+        );
         return Ok(CompactionResult::nothing());
     }
 
@@ -734,10 +734,10 @@ fn drop_tables(
 mod tests {
     use super::{create_compaction_stream, pick_run_indexes};
     use crate::{
-        compaction::{state::CompactionState, Choice, CompactionStrategy, Input},
+        AbstractTree, Config, KvSeparationOptions, SequenceNumberCounter, TableId,
+        compaction::{Choice, CompactionStrategy, Input, state::CompactionState},
         config::BlockSizePolicy,
         version::Version,
-        AbstractTree, Config, KvSeparationOptions, SequenceNumberCounter, TableId,
     };
     use std::sync::Arc;
     use test_log::test;
@@ -756,14 +756,16 @@ mod tests {
         tree.insert("a", "a", 0);
         tree.flush_active_memtable(0)?;
 
-        assert!(create_compaction_stream(
-            &tree.current_version(),
-            &[666],
-            0,
-            None,
-            crate::comparator::default_comparator()
-        )?
-        .is_none());
+        assert!(
+            create_compaction_stream(
+                &tree.current_version(),
+                &[666],
+                0,
+                None,
+                crate::comparator::default_comparator()
+            )?
+            .is_none()
+        );
 
         Ok(())
     }

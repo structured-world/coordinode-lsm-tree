@@ -4,9 +4,9 @@
 // destination level, and that recovery discovers tables across all paths.
 
 use lsm_tree::{
+    AbstractTree, Config, SequenceNumberCounter,
     config::{CompressionPolicy, LevelRoute},
     fs::StdFs,
-    AbstractTree, Config, SequenceNumberCounter,
 };
 use std::sync::Arc;
 

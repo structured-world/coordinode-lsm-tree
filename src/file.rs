@@ -3,8 +3,8 @@
 // (found in the LICENSE-* files in the repository)
 
 use crate::{
-    fs::{Fs, FsFile},
     Slice,
+    fs::{Fs, FsFile},
 };
 use std::{io::Write, path::Path};
 
@@ -37,7 +37,10 @@ pub fn read_exact(file: &dyn FsFile, offset: u64, size: usize) -> std::io::Resul
     if bytes_read != size {
         return Err(std::io::Error::new(
             std::io::ErrorKind::UnexpectedEof,
-            format!("read_exact({bytes_read}) at {offset} did not read enough bytes {size}; file has length {}", file.metadata()?.len),
+            format!(
+                "read_exact({bytes_read}) at {offset} did not read enough bytes {size}; file has length {}",
+                file.metadata()?.len
+            ),
         ));
     }
 

@@ -1,6 +1,6 @@
 use lsm_tree::{
-    config::CompressionPolicy, get_tmp_folder, AbstractTree, Config, KvSeparationOptions, SeqNo,
-    SequenceNumberCounter,
+    AbstractTree, Config, KvSeparationOptions, SeqNo, SequenceNumberCounter,
+    config::CompressionPolicy, get_tmp_folder,
 };
 use test_log::test;
 

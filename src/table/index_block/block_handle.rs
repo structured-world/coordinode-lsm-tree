@@ -2,6 +2,7 @@
 // This source code is licensed under both the Apache 2.0 and MIT License
 // (found in the LICENSE-* files in the repository)
 
+use crate::{SeqNo, UserKey};
 use crate::{
     coding::{Decode, Encode},
     table::{
@@ -10,7 +11,6 @@ use crate::{
         util::SliceIndexes,
     },
 };
-use crate::{SeqNo, UserKey};
 use byteorder::{ReadBytesExt, WriteBytesExt};
 use std::io::{Cursor, Seek};
 use varint_rs::{VarintReader, VarintWriter};

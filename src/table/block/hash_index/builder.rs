@@ -2,7 +2,7 @@
 // This source code is licensed under both the Apache 2.0 and MIT License
 // (found in the LICENSE-* files in the repository)
 
-use super::{calculate_bucket_position, MARKER_CONFLICT, MARKER_FREE};
+use super::{MARKER_CONFLICT, MARKER_FREE, calculate_bucket_position};
 use byteorder::WriteBytesExt;
 
 /// With 254, pointers [0 - 253] can be indexed.

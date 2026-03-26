@@ -2,9 +2,9 @@
 // This source code is licensed under both the Apache 2.0 and MIT License
 // (found in the LICENSE-* files in the repository)
 
+use crate::InternalValue;
 use crate::comparator::SharedComparator;
 use crate::heap::{HeapEntry, MergeHeap};
-use crate::InternalValue;
 
 type IterItem = crate::Result<InternalValue>;
 
@@ -134,8 +134,8 @@ impl<I: DoubleEndedIterator<Item = IterItem>> DoubleEndedIterator for Merger<I> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::comparator;
     use crate::ValueType::Value;
+    use crate::comparator;
     use test_log::test;
 
     #[test]

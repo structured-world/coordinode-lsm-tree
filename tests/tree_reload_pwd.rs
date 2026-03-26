@@ -1,5 +1,5 @@
 use fs_extra::dir::CopyOptions;
-use lsm_tree::{get_tmp_folder, AbstractTree, Config, SeqNo, SequenceNumberCounter};
+use lsm_tree::{AbstractTree, Config, SeqNo, SequenceNumberCounter, get_tmp_folder};
 use test_log::test;
 
 const ITEM_COUNT: usize = 10_000;

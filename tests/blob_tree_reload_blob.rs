@@ -1,5 +1,5 @@
 use lsm_tree::{
-    get_tmp_folder, AbstractTree, Config, Guard, SeqNo, SequenceNumberCounter, TreeType,
+    AbstractTree, Config, Guard, SeqNo, SequenceNumberCounter, TreeType, get_tmp_folder,
 };
 use test_log::test;
 

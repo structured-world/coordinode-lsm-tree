@@ -10,12 +10,12 @@ mod iter_test;
 pub use iter::Iter;
 
 use super::block::{
-    binary_index::Reader as BinaryIndexReader, hash_index::Reader as HashIndexReader, Block,
-    Decodable, Decoder, Encodable, Encoder, ParsedItem, Trailer, TRAILER_START_MARKER,
+    Block, Decodable, Decoder, Encodable, Encoder, ParsedItem, TRAILER_START_MARKER, Trailer,
+    binary_index::Reader as BinaryIndexReader, hash_index::Reader as HashIndexReader,
 };
 use crate::key::InternalKey;
 use crate::table::block::hash_index::{MARKER_CONFLICT, MARKER_FREE};
-use crate::table::util::{compare_prefixed_slice, SliceIndexes};
+use crate::table::util::{SliceIndexes, compare_prefixed_slice};
 use crate::{InternalValue, SeqNo, Slice, ValueType};
 use byteorder::WriteBytesExt;
 use byteorder::{LittleEndian, ReadBytesExt};
@@ -566,12 +566,12 @@ impl DataBlock {
 mod tests {
     use crate::comparator::default_comparator;
     use crate::{
-        table::{
-            block::{BlockType, Header, ParsedItem},
-            Block, DataBlock,
-        },
         Checksum, InternalValue, SeqNo, Slice,
         ValueType::{Tombstone, Value},
+        table::{
+            Block, DataBlock,
+            block::{BlockType, Header, ParsedItem},
+        },
     };
     use test_log::test;
 
@@ -763,9 +763,11 @@ mod tests {
                 Some(items[0].clone()),
                 data_block.point_read(b"abc", 777, &default_comparator())
             );
-            assert!(data_block
-                .point_read(b"abc", 1, &default_comparator())
-                .is_none());
+            assert!(
+                data_block
+                    .point_read(b"abc", 1, &default_comparator())
+                    .is_none()
+            );
         }
 
         Ok(())
@@ -1252,10 +1254,12 @@ mod tests {
                 > 0,
         );
 
-        assert!(data_block
-            .point_read(b"pla:venus:fact", SeqNo::MAX, &default_comparator())
-            .expect("should exist")
-            .is_tombstone());
+        assert!(
+            data_block
+                .point_read(b"pla:venus:fact", SeqNo::MAX, &default_comparator())
+                .expect("should exist")
+                .is_tombstone()
+        );
 
         Ok(())
     }

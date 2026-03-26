@@ -1,5 +1,5 @@
 // Guard: trait import required for .key() method on iterator items (IterGuard trait)
-use lsm_tree::{get_tmp_folder, AbstractTree, AnyTree, Config, Guard, SequenceNumberCounter};
+use lsm_tree::{AbstractTree, AnyTree, Config, Guard, SequenceNumberCounter, get_tmp_folder};
 use test_log::test;
 
 fn open_tree(path: &std::path::Path) -> AnyTree {
@@ -618,8 +618,8 @@ fn range_tombstone_prefix_iteration_with_sst() -> lsm_tree::Result<()> {
 // --- Test P: Compaction with MultiWriter rotation preserves RTs across tables ---
 #[test]
 fn range_tombstone_survives_compaction_with_rotation() -> lsm_tree::Result<()> {
-    use lsm_tree::config::CompressionPolicy;
     use lsm_tree::CompressionType;
+    use lsm_tree::config::CompressionPolicy;
 
     let folder = get_tmp_folder();
 
@@ -1003,8 +1003,8 @@ fn range_tombstone_disjoint_survives_multiple_compactions() -> lsm_tree::Result<
 #[test]
 #[ignore = "allocates ~68 MiB to force MultiWriter rotation — run with --ignored"]
 fn range_tombstone_multi_table_flush_keeps_newer_values_reachable() -> lsm_tree::Result<()> {
-    use lsm_tree::config::CompressionPolicy;
     use lsm_tree::CompressionType;
+    use lsm_tree::config::CompressionPolicy;
 
     let folder = get_tmp_folder();
     // Disable compression: large repetitive payloads compress to almost nothing

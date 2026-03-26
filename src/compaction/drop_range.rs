@@ -5,8 +5,8 @@
 use super::{Choice, CompactionStrategy};
 use crate::compaction::state::CompactionState;
 use crate::version::Version;
-use crate::{config::Config, slice::Slice, version::run::Ranged, KeyRange};
 use crate::{HashSet, Table};
+use crate::{KeyRange, config::Config, slice::Slice, version::run::Ranged};
 use std::ops::{Bound, RangeBounds};
 
 #[derive(Clone, Debug)]

@@ -5,8 +5,8 @@
 use super::{Block, BlockHandle, DataBlock};
 use crate::fs::FsFile;
 use crate::{
-    checksum::ChecksumType, coding::Decode, comparator::default_comparator,
-    table::block::BlockType, CompressionType, KeyRange, SeqNo, TableId,
+    CompressionType, KeyRange, SeqNo, TableId, checksum::ChecksumType, coding::Decode,
+    comparator::default_comparator, table::block::BlockType,
 };
 use byteorder::{LittleEndian, ReadBytesExt};
 use std::ops::Deref;

@@ -1,4 +1,4 @@
-use lsm_tree::{get_tmp_folder, AbstractTree, Config, Guard, SeqNo, SequenceNumberCounter};
+use lsm_tree::{AbstractTree, Config, Guard, SeqNo, SequenceNumberCounter, get_tmp_folder};
 use test_log::test;
 
 #[test]
@@ -163,9 +163,10 @@ fn tree_shadowing_range() -> lsm_tree::Result<()> {
     tree.flush_active_memtable(0)?;
 
     assert_eq!(tree.len(SeqNo::MAX, None)?, ITEM_COUNT);
-    assert!(tree
-        .iter(SeqNo::MAX, None)
-        .all(|x| &*x.value().unwrap() == "old".as_bytes()));
+    assert!(
+        tree.iter(SeqNo::MAX, None)
+            .all(|x| &*x.value().unwrap() == "old".as_bytes())
+    );
 
     for x in 0..ITEM_COUNT as u64 {
         let key = x.to_be_bytes();
@@ -174,16 +175,18 @@ fn tree_shadowing_range() -> lsm_tree::Result<()> {
     }
 
     assert_eq!(tree.len(SeqNo::MAX, None)?, ITEM_COUNT);
-    assert!(tree
-        .iter(SeqNo::MAX, None)
-        .all(|x| &*x.value().unwrap() == "new".as_bytes()));
+    assert!(
+        tree.iter(SeqNo::MAX, None)
+            .all(|x| &*x.value().unwrap() == "new".as_bytes())
+    );
 
     tree.flush_active_memtable(0)?;
 
     assert_eq!(tree.len(SeqNo::MAX, None)?, ITEM_COUNT);
-    assert!(tree
-        .iter(SeqNo::MAX, None)
-        .all(|x| &*x.value().unwrap() == "new".as_bytes()));
+    assert!(
+        tree.iter(SeqNo::MAX, None)
+            .all(|x| &*x.value().unwrap() == "new".as_bytes())
+    );
 
     Ok(())
 }
@@ -209,9 +212,10 @@ fn tree_shadowing_range_blob() -> lsm_tree::Result<()> {
     tree.flush_active_memtable(0)?;
 
     assert_eq!(tree.len(SeqNo::MAX, None)?, ITEM_COUNT);
-    assert!(tree
-        .iter(SeqNo::MAX, None)
-        .all(|x| &*x.value().unwrap() == "old".as_bytes()));
+    assert!(
+        tree.iter(SeqNo::MAX, None)
+            .all(|x| &*x.value().unwrap() == "old".as_bytes())
+    );
 
     for x in 0..ITEM_COUNT as u64 {
         let key = x.to_be_bytes();
@@ -220,16 +224,18 @@ fn tree_shadowing_range_blob() -> lsm_tree::Result<()> {
     }
 
     assert_eq!(tree.len(SeqNo::MAX, None)?, ITEM_COUNT);
-    assert!(tree
-        .iter(SeqNo::MAX, None)
-        .all(|x| &*x.value().unwrap() == "new".as_bytes()));
+    assert!(
+        tree.iter(SeqNo::MAX, None)
+            .all(|x| &*x.value().unwrap() == "new".as_bytes())
+    );
 
     tree.flush_active_memtable(0)?;
 
     assert_eq!(tree.len(SeqNo::MAX, None)?, ITEM_COUNT);
-    assert!(tree
-        .iter(SeqNo::MAX, None)
-        .all(|x| &*x.value().unwrap() == "new".as_bytes()));
+    assert!(
+        tree.iter(SeqNo::MAX, None)
+            .all(|x| &*x.value().unwrap() == "new".as_bytes())
+    );
 
     Ok(())
 }
@@ -263,9 +269,10 @@ fn tree_shadowing_prefix() -> lsm_tree::Result<()> {
         tree.prefix("prefix".as_bytes(), SeqNo::MAX, None).count(),
         ITEM_COUNT
     );
-    assert!(tree
-        .iter(SeqNo::MAX, None)
-        .all(|x| &*x.value().unwrap() == "old".as_bytes()));
+    assert!(
+        tree.iter(SeqNo::MAX, None)
+            .all(|x| &*x.value().unwrap() == "old".as_bytes())
+    );
 
     for x in 0..ITEM_COUNT as u64 {
         let value = "new".as_bytes();
@@ -284,9 +291,10 @@ fn tree_shadowing_prefix() -> lsm_tree::Result<()> {
         tree.prefix("prefix".as_bytes(), SeqNo::MAX, None).count(),
         ITEM_COUNT
     );
-    assert!(tree
-        .iter(SeqNo::MAX, None)
-        .all(|x| &*x.value().unwrap() == "new".as_bytes()));
+    assert!(
+        tree.iter(SeqNo::MAX, None)
+            .all(|x| &*x.value().unwrap() == "new".as_bytes())
+    );
 
     tree.flush_active_memtable(0)?;
 
@@ -299,9 +307,10 @@ fn tree_shadowing_prefix() -> lsm_tree::Result<()> {
         tree.prefix("prefix".as_bytes(), SeqNo::MAX, None).count(),
         ITEM_COUNT
     );
-    assert!(tree
-        .iter(SeqNo::MAX, None)
-        .all(|x| &*x.value().unwrap() == "new".as_bytes()));
+    assert!(
+        tree.iter(SeqNo::MAX, None)
+            .all(|x| &*x.value().unwrap() == "new".as_bytes())
+    );
 
     Ok(())
 }
@@ -337,9 +346,10 @@ fn tree_shadowing_prefix_blob() -> lsm_tree::Result<()> {
         tree.prefix("prefix".as_bytes(), SeqNo::MAX, None).count(),
         ITEM_COUNT
     );
-    assert!(tree
-        .iter(SeqNo::MAX, None)
-        .all(|x| &*x.value().unwrap() == "old".as_bytes()));
+    assert!(
+        tree.iter(SeqNo::MAX, None)
+            .all(|x| &*x.value().unwrap() == "old".as_bytes())
+    );
 
     for x in 0..ITEM_COUNT as u64 {
         let value = "new".as_bytes();
@@ -358,9 +368,10 @@ fn tree_shadowing_prefix_blob() -> lsm_tree::Result<()> {
         tree.prefix("prefix".as_bytes(), SeqNo::MAX, None).count(),
         ITEM_COUNT
     );
-    assert!(tree
-        .iter(SeqNo::MAX, None)
-        .all(|x| &*x.value().unwrap() == "new".as_bytes()));
+    assert!(
+        tree.iter(SeqNo::MAX, None)
+            .all(|x| &*x.value().unwrap() == "new".as_bytes())
+    );
 
     tree.flush_active_memtable(0)?;
 
@@ -373,9 +384,10 @@ fn tree_shadowing_prefix_blob() -> lsm_tree::Result<()> {
         tree.prefix("prefix".as_bytes(), SeqNo::MAX, None).count(),
         ITEM_COUNT
     );
-    assert!(tree
-        .iter(SeqNo::MAX, None)
-        .all(|x| &*x.value().unwrap() == "new".as_bytes()));
+    assert!(
+        tree.iter(SeqNo::MAX, None)
+            .all(|x| &*x.value().unwrap() == "new".as_bytes())
+    );
 
     Ok(())
 }

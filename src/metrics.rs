@@ -179,11 +179,7 @@ impl Metrics {
         let queries = self.data_block_load_count() as f64;
         let hits = self.data_block_load_cached_count() as f64;
 
-        if queries == 0.0 {
-            1.0
-        } else {
-            hits / queries
-        }
+        if queries == 0.0 { 1.0 } else { hits / queries }
     }
 
     /// Filter block cache efficiency in percent (0.0 - 1.0).
@@ -191,11 +187,7 @@ impl Metrics {
         let queries = self.filter_block_load_count() as f64;
         let hits = self.filter_block_load_cached_count() as f64;
 
-        if queries == 0.0 {
-            1.0
-        } else {
-            hits / queries
-        }
+        if queries == 0.0 { 1.0 } else { hits / queries }
     }
 
     /// Index block cache efficiency in percent (0.0 - 1.0).
@@ -203,11 +195,7 @@ impl Metrics {
         let queries = self.index_block_load_count() as f64;
         let hits = self.index_block_load_cached_count() as f64;
 
-        if queries == 0.0 {
-            1.0
-        } else {
-            hits / queries
-        }
+        if queries == 0.0 { 1.0 } else { hits / queries }
     }
 
     /// Range tombstone block cache efficiency in percent (0.0 - 1.0).
@@ -215,11 +203,7 @@ impl Metrics {
         let queries = self.range_tombstone_block_load_count() as f64;
         let hits = self.range_tombstone_block_load_cached_count() as f64;
 
-        if queries == 0.0 {
-            1.0
-        } else {
-            hits / queries
-        }
+        if queries == 0.0 { 1.0 } else { hits / queries }
     }
 
     /// Block cache efficiency in percent (0.0 - 1.0).
@@ -227,11 +211,7 @@ impl Metrics {
         let queries = self.block_loads() as f64;
         let hits = self.block_load_cached_count() as f64;
 
-        if queries == 0.0 {
-            1.0
-        } else {
-            hits / queries
-        }
+        if queries == 0.0 { 1.0 } else { hits / queries }
     }
 
     /// Filter efficiency in percent (0.0 - 1.0).

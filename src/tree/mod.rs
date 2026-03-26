@@ -7,7 +7,9 @@ pub mod inner;
 pub mod sealed;
 
 use crate::{
-    compaction::{drop_range::OwnedBounds, state::CompactionState, CompactionStrategy},
+    AbstractTree, Checksum, KvPair, SeqNo, SequenceNumberCounter, TableId, UserKey, UserValue,
+    ValueType,
+    compaction::{CompactionStrategy, drop_range::OwnedBounds, state::CompactionState},
     config::Config,
     file::CURRENT_VERSION_FILE,
     format_version::FormatVersion,
@@ -18,10 +20,8 @@ use crate::{
     slice::Slice,
     table::Table,
     value::InternalValue,
-    version::{recovery::recover, SuperVersion, SuperVersions, Version},
+    version::{SuperVersion, SuperVersions, Version, recovery::recover},
     vlog::BlobFile,
-    AbstractTree, Checksum, KvPair, SeqNo, SequenceNumberCounter, TableId, UserKey, UserValue,
-    ValueType,
 };
 use inner::{TreeId, TreeInner};
 use std::{
@@ -1201,7 +1201,9 @@ impl Tree {
 
         // Check for old version
         if config.path.join("version").try_exists()? {
-            log::error!("It looks like you are trying to open a V1 database - the database needs a manual migration, however a migration tool is not provided, as V1 is extremely outdated.");
+            log::error!(
+                "It looks like you are trying to open a V1 database - the database needs a manual migration, however a migration tool is not provided, as V1 is extremely outdated."
+            );
             return Err(crate::Error::InvalidVersion(FormatVersion::V1.into()));
         }
 
@@ -1232,7 +1234,7 @@ impl Tree {
         strategy: Arc<dyn CompactionStrategy>,
         mvcc_gc_watermark: SeqNo,
     ) -> crate::Result<crate::compaction::CompactionResult> {
-        use crate::compaction::worker::{do_compaction, Options};
+        use crate::compaction::worker::{Options, do_compaction};
 
         let mut opts = Options::from_tree(self, strategy);
         opts.mvcc_gc_watermark = mvcc_gc_watermark;
@@ -1290,7 +1292,7 @@ impl Tree {
         ephemeral: Option<(Arc<Memtable>, SeqNo)>,
     ) -> impl DoubleEndedIterator<Item = crate::Result<KvPair>> + 'static {
         use crate::prefix::compute_prefix_hash;
-        use crate::range::{prefix_to_range, IterState, TreeIter};
+        use crate::range::{IterState, TreeIter, prefix_to_range};
 
         let prefix_bytes = prefix.as_ref();
 
@@ -1485,7 +1487,7 @@ impl Tree {
         config: &Config,
         #[cfg(feature = "metrics")] metrics: &Arc<Metrics>,
     ) -> crate::Result<Version> {
-        use crate::{file::fsync_directory, fs::Fs, TableId};
+        use crate::{TableId, file::fsync_directory, fs::Fs};
 
         let tree_path = tree_path.as_ref();
 

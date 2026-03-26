@@ -2,9 +2,9 @@
 // This source code is licensed under both the Apache 2.0 and MIT License
 // (found in the LICENSE-* files in the repository)
 
+use crate::GlobalTableId;
 use crate::descriptor_table::DescriptorTable;
 use crate::fs::FsFile;
-use crate::GlobalTableId;
 use std::sync::Arc;
 
 /// Allows accessing a file (either cached or pinned)

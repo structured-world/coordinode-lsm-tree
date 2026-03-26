@@ -38,7 +38,7 @@ pub use movedown::Strategy as MoveDown;
 pub use pulldown::Strategy as PullDown;
 
 use crate::{
-    compaction::state::CompactionState, config::Config, version::Version, HashSet, KvPair, TableId,
+    HashSet, KvPair, TableId, compaction::state::CompactionState, config::Config, version::Version,
 };
 
 /// The action taken during a compaction run.

@@ -3,13 +3,13 @@
 // (found in the LICENSE-* files in the repository)
 
 use crate::{
+    SequenceNumberCounter, TableId,
     compaction::state::CompactionState,
     config::Config,
     stop_signal::StopSignal,
-    version::{persist_version, SuperVersions, Version},
-    SequenceNumberCounter, TableId,
+    version::{SuperVersions, Version, persist_version},
 };
-use std::sync::{atomic::AtomicU64, Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock, atomic::AtomicU64};
 
 #[cfg(feature = "metrics")]
 use crate::metrics::Metrics;

@@ -6,11 +6,11 @@ use crate::SeqNo;
 use std::{
     fmt::Debug,
     sync::{
+        Arc,
         atomic::{
             AtomicU64,
             Ordering::{AcqRel, Acquire, Release},
         },
-        Arc,
     },
 };
 

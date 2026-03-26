@@ -1,6 +1,6 @@
 // Found by model testing
 
-use lsm_tree::{get_tmp_folder, AbstractTree, KvSeparationOptions, Result, SequenceNumberCounter};
+use lsm_tree::{AbstractTree, KvSeparationOptions, Result, SequenceNumberCounter, get_tmp_folder};
 use std::sync::Arc;
 use test_log::test;
 

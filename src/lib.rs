@@ -64,9 +64,7 @@ macro_rules! fail_iter {
 }
 
 macro_rules! unwrap {
-    ($x:expr) => {{
-        $x.expect("should read")
-    }};
+    ($x:expr) => {{ $x.expect("should read") }};
 }
 
 mod any_tree;
@@ -181,15 +179,15 @@ pub type KvPair = (UserKey, UserValue);
 
 #[doc(hidden)]
 pub use {
-    blob_tree::{handle::BlobIndirection, Guard as BlobGuard},
+    blob_tree::{Guard as BlobGuard, handle::BlobIndirection},
     checksum::Checksum,
     iter_guard::IterGuardImpl,
     key_range::KeyRange,
     merge::BoxedIterator,
     slice::Builder,
     table::{GlobalTableId, Table, TableId},
-    tree::inner::TreeId,
     tree::Guard as StandardGuard,
+    tree::inner::TreeId,
     value::InternalValue,
 };
 
@@ -215,7 +213,7 @@ pub use {
     merge_operator::MergeOperator,
     prefix::PrefixExtractor,
     seqno::{
-        SequenceNumberCounter, SequenceNumberGenerator, SharedSequenceNumberGenerator, MAX_SEQNO,
+        MAX_SEQNO, SequenceNumberCounter, SequenceNumberGenerator, SharedSequenceNumberGenerator,
     },
     slice::Slice,
     tree::Tree,

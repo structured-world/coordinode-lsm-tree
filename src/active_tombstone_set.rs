@@ -12,7 +12,7 @@
 //! A unique monotonic `id` on each heap entry ensures total ordering in the
 //! heap (no equality on the tuple), which makes expiry deterministic.
 
-use crate::{range_tombstone::RangeTombstone, SeqNo, UserKey};
+use crate::{SeqNo, UserKey, range_tombstone::RangeTombstone};
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BinaryHeap};
 
@@ -68,7 +68,7 @@ impl ActiveTombstoneSet {
     ///
     /// Panics if an expiry pop has no matching activation in the seqno multiset.
     pub fn expire_until(&mut self, current_key: &[u8]) {
-        while let Some(Reverse((ref end, _, seqno))) = self.pending_expiry.peek() {
+        while let Some(Reverse((end, _, seqno))) = self.pending_expiry.peek() {
             if current_key >= end.as_ref() {
                 let seqno = *seqno;
                 self.pending_expiry.pop();
@@ -193,7 +193,7 @@ impl ActiveTombstoneSetReverse {
     ///
     /// Panics if an expiry pop has no matching activation in the seqno multiset.
     pub fn expire_until(&mut self, current_key: &[u8]) {
-        while let Some((ref start, _, seqno)) = self.pending_expiry.peek() {
+        while let Some((start, _, seqno)) = self.pending_expiry.peek() {
             if current_key < start.as_ref() {
                 let seqno = *seqno;
                 self.pending_expiry.pop();

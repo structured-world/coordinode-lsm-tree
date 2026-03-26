@@ -11,12 +11,12 @@ use crate::comparator::SharedComparator;
 use crate::key::InternalKey;
 use crate::range_tombstone::RangeTombstone;
 use crate::{
-    value::{InternalValue, SeqNo},
     UserKey, ValueType,
+    value::{InternalValue, SeqNo},
 };
 use std::ops::RangeBounds;
-use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::RwLock;
+use std::sync::atomic::{AtomicBool, AtomicU64};
 
 pub use crate::tree::inner::MemtableId;
 
@@ -336,8 +336,8 @@ impl Memtable {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::comparator::default_comparator;
     use crate::ValueType;
+    use crate::comparator::default_comparator;
     use std::sync::{Arc, Barrier};
     use test_log::test;
 

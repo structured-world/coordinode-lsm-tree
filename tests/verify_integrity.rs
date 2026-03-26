@@ -1,11 +1,11 @@
 use lsm_tree::{
-    // AbstractTree must be in scope for enum_dispatch method resolution on AnyTree
-    get_tmp_folder,
-    verify,
     AbstractTree,
     Config,
     KvSeparationOptions,
     SequenceNumberCounter,
+    // AbstractTree must be in scope for enum_dispatch method resolution on AnyTree
+    get_tmp_folder,
+    verify,
 };
 use test_log::test;
 

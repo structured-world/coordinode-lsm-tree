@@ -20,6 +20,8 @@ pub use restart_interval::RestartIntervalPolicy;
 pub type PartitioningPolicy = PinningPolicy;
 
 use crate::{
+    AnyTree, BlobTree, Cache, CompressionType, DescriptorTable, SequenceNumberCounter,
+    SharedSequenceNumberGenerator, Tree,
     compaction::filter::Factory,
     comparator::{self, SharedComparator},
     encryption::EncryptionProvider,
@@ -29,8 +31,6 @@ use crate::{
     path::absolute_path,
     prefix::PrefixExtractor,
     version::DEFAULT_LEVEL_COUNT,
-    AnyTree, BlobTree, Cache, CompressionType, DescriptorTable, SequenceNumberCounter,
-    SharedSequenceNumberGenerator, Tree,
 };
 use std::{
     ops::Range,

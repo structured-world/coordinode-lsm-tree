@@ -1,6 +1,6 @@
 use lsm_tree::{
-    config::PinningPolicy, AbstractTree, Config, Guard, KvSeparationOptions, PrefixExtractor,
-    SequenceNumberCounter, Tree,
+    AbstractTree, Config, Guard, KvSeparationOptions, PrefixExtractor, SequenceNumberCounter, Tree,
+    config::PinningPolicy,
 };
 use std::sync::Arc;
 

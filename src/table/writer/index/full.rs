@@ -3,13 +3,13 @@
 // (found in the LICENSE-* files in the repository)
 
 use crate::{
+    CompressionType,
     checksum::ChecksummedWriter,
     encryption::EncryptionProvider,
     table::{
-        block::Header as BlockHeader, index_block::KeyedBlockHandle,
-        writer::index::BlockIndexWriter, Block, IndexBlock,
+        Block, IndexBlock, block::Header as BlockHeader, index_block::KeyedBlockHandle,
+        writer::index::BlockIndexWriter,
     },
-    CompressionType,
 };
 use std::sync::Arc;
 

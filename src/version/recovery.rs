@@ -3,8 +3,8 @@
 // (found in the LICENSE-* files in the repository)
 
 use crate::{
-    coding::Decode, file::CURRENT_VERSION_FILE, version::VersionId, vlog::BlobFileId, Checksum,
-    SeqNo, TableId, TreeType,
+    Checksum, SeqNo, TableId, TreeType, coding::Decode, file::CURRENT_VERSION_FILE,
+    version::VersionId, vlog::BlobFileId,
 };
 use byteorder::{LittleEndian, ReadBytesExt};
 use std::path::Path;

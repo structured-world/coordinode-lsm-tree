@@ -1,4 +1,4 @@
-use lsm_tree::{get_tmp_folder, AbstractTree, SequenceNumberCounter};
+use lsm_tree::{AbstractTree, SequenceNumberCounter, get_tmp_folder};
 use test_log::test;
 
 #[test]

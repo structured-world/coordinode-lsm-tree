@@ -12,7 +12,7 @@
 
 // Guard: trait import required for .key() method on iterator items (IterGuard trait)
 use lsm_tree::{
-    get_tmp_folder, AbstractTree, AnyTree, Config, Guard, Memtable, SequenceNumberCounter, UserKey,
+    AbstractTree, AnyTree, Config, Guard, Memtable, SequenceNumberCounter, UserKey, get_tmp_folder,
 };
 use std::sync::Arc;
 use test_log::test;

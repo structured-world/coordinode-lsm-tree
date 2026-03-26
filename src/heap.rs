@@ -19,8 +19,8 @@
 //! - No tree-pointer overhead
 //! - `memmove` of ≤30 entries is negligible
 
-use crate::comparator::SharedComparator;
 use crate::InternalValue;
+use crate::comparator::SharedComparator;
 use std::cmp::Ordering;
 
 /// A single entry in the merge heap.
@@ -190,8 +190,8 @@ impl MergeHeap {
 #[expect(clippy::unwrap_used, reason = "test assertions use unwrap for brevity")]
 mod tests {
     use super::*;
-    use crate::comparator;
     use crate::ValueType::Value;
+    use crate::comparator;
     use test_log::test;
 
     fn entry(key: &str, seqno: u64) -> HeapEntry {

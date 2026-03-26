@@ -2,8 +2,8 @@
 // This source code is licensed under both the Apache 2.0 and MIT License
 // (found in the LICENSE-* files in the repository)
 
-use crate::range::prefix_upper_range;
 use crate::UserKey;
+use crate::range::prefix_upper_range;
 use std::ops::RangeBounds;
 
 pub use crate::range::prefix_to_range;

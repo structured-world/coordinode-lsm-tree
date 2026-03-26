@@ -2,7 +2,7 @@
 // This source code is licensed under both the Apache 2.0 and MIT License
 // (found in the LICENSE-* files in the repository)
 
-use crate::{table::Scanner, version::Run, InternalValue, Table};
+use crate::{InternalValue, Table, table::Scanner, version::Run};
 use std::sync::Arc;
 
 /// Scans through a disjoint run

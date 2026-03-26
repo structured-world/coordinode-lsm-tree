@@ -1,5 +1,5 @@
 use lsm_tree::{
-    config::BlockSizePolicy, get_tmp_folder, AbstractTree, Config, SequenceNumberCounter,
+    AbstractTree, Config, SequenceNumberCounter, config::BlockSizePolicy, get_tmp_folder,
 };
 use test_log::test;
 

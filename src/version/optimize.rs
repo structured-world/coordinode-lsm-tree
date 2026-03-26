@@ -47,8 +47,8 @@ pub fn optimize_runs<T: Clone + Ranged>(
 #[expect(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use crate::comparator::DefaultUserComparator;
     use crate::KeyRange;
+    use crate::comparator::DefaultUserComparator;
     use test_log::test;
 
     fn default_cmp() -> &'static DefaultUserComparator {

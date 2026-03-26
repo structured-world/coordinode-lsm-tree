@@ -1,12 +1,12 @@
 use lsm_tree::{
+    AbstractTree, Config,
     compaction::filter::{
         CompactionFilter, Context as CompactionFilterContext, Factory, ItemAccessor, Verdict,
     },
-    AbstractTree, Config,
 };
 use std::sync::{
-    atomic::{AtomicU64, Ordering::Relaxed},
     Arc,
+    atomic::{AtomicU64, Ordering::Relaxed},
 };
 use test_log::test;
 

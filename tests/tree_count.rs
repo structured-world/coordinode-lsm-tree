@@ -1,4 +1,4 @@
-use lsm_tree::{get_tmp_folder, AbstractTree, Config, Guard, SeqNo, SequenceNumberCounter, Slice};
+use lsm_tree::{AbstractTree, Config, Guard, SeqNo, SequenceNumberCounter, Slice, get_tmp_folder};
 use test_log::test;
 
 const ITEM_COUNT: usize = 1_000;

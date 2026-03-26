@@ -1,10 +1,9 @@
 use crate::{
+    HashMap,
     blob_tree::FragmentationMap,
     vlog::{BlobFile, BlobFileId},
-    HashMap,
 };
 
-// TODO: MSRV: [1.91] Replace with BTreeMap + extract_if
 #[derive(Clone, Default)]
 pub struct BlobFileList(HashMap<BlobFileId, BlobFile>);
 

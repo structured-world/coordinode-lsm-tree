@@ -35,6 +35,7 @@ pub use scanner::Scanner;
 pub use writer::Writer;
 
 use crate::{
+    Checksum, CompressionType, InternalValue, SeqNo, TreeId, UserKey,
     cache::Cache,
     comparator::SharedComparator,
     descriptor_table::DescriptorTable,
@@ -48,7 +49,6 @@ use crate::{
         regions::ParsedRegions,
         writer::LinkedFile,
     },
-    Checksum, CompressionType, InternalValue, SeqNo, TreeId, UserKey,
 };
 use block_index::BlockIndexImpl;
 use inner::Inner;
@@ -114,7 +114,7 @@ impl Table {
     }
 
     pub fn list_blob_file_references(&self) -> crate::Result<Option<Vec<LinkedFile>>> {
-        use byteorder::{ReadBytesExt, LE};
+        use byteorder::{LE, ReadBytesExt};
 
         Ok(if let Some(handle) = &self.regions.linked_blob_files {
             let table_id = self.global_id();
@@ -401,7 +401,7 @@ impl Table {
     /// Will return `Err` if an IO error occurs.
     #[must_use]
     #[doc(hidden)]
-    pub fn iter(&self) -> impl DoubleEndedIterator<Item = crate::Result<InternalValue>> {
+    pub fn iter(&self) -> impl DoubleEndedIterator<Item = crate::Result<InternalValue>> + use<> {
         self.range(..)
     }
 
@@ -415,7 +415,7 @@ impl Table {
     pub fn range<R: RangeBounds<UserKey> + Send>(
         &self,
         range: R,
-    ) -> impl DoubleEndedIterator<Item = crate::Result<InternalValue>> + Send {
+    ) -> impl DoubleEndedIterator<Item = crate::Result<InternalValue>> + Send + use<R> {
         let index_iter = self.block_index.iter();
 
         let mut iter = Iter::new(
@@ -766,7 +766,7 @@ impl Table {
         block: &Block,
         comparator: &dyn crate::comparator::UserComparator,
     ) -> crate::Result<Vec<RangeTombstone>> {
-        use byteorder::{ReadBytesExt, LE};
+        use byteorder::{LE, ReadBytesExt};
         use std::io::Cursor;
 
         let mut tombstones = Vec::new();

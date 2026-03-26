@@ -1,7 +1,7 @@
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, criterion_group, criterion_main};
 use lsm_tree::merge::{BoxedIterator, Merger};
 use lsm_tree::{
-    mvcc_stream::MvccStream, DefaultUserComparator, InternalValue, Memtable, SharedComparator,
+    DefaultUserComparator, InternalValue, Memtable, SharedComparator, mvcc_stream::MvccStream,
 };
 use nanoid::nanoid;
 use std::sync::Arc;

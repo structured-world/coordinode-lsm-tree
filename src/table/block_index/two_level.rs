@@ -2,18 +2,18 @@
 // This source code is licensed under both the Apache 2.0 and MIT License
 // (found in the LICENSE-* files in the repository)
 
+use crate::SeqNo;
 use crate::comparator::SharedComparator;
 use crate::encryption::EncryptionProvider;
 use crate::file_accessor::FileAccessor;
 use crate::table::{IndexBlock, KeyedBlockHandle};
-use crate::SeqNo;
 use crate::{
+    Cache, CompressionType, GlobalTableId, UserKey,
     table::{
         block::BlockType,
-        block_index::{iter::OwnedIndexBlockIter, BlockIndexIter},
+        block_index::{BlockIndexIter, iter::OwnedIndexBlockIter},
         util::load_block,
     },
-    Cache, CompressionType, GlobalTableId, UserKey,
 };
 use std::{path::PathBuf, sync::Arc};
 

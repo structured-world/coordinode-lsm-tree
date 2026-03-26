@@ -1,4 +1,4 @@
-use lsm_tree::{get_tmp_folder, AbstractTree, Config, SeqNo, SequenceNumberCounter};
+use lsm_tree::{AbstractTree, Config, SeqNo, SequenceNumberCounter, get_tmp_folder};
 use std::sync::Arc;
 use test_log::test;
 
@@ -36,29 +36,35 @@ fn compaction_readers_grouping() -> lsm_tree::Result<()> {
     // breaking this
     tree.compact(Arc::new(lsm_tree::compaction::PullDown(2, 3)), 0)?;
 
-    assert!(!tree
-        .current_version()
-        .level(0)
-        .expect("level should exist")
-        .is_empty());
+    assert!(
+        !tree
+            .current_version()
+            .level(0)
+            .expect("level should exist")
+            .is_empty()
+    );
 
-    assert!(tree
-        .current_version()
-        .level(1)
-        .expect("level should exist")
-        .is_empty());
+    assert!(
+        tree.current_version()
+            .level(1)
+            .expect("level should exist")
+            .is_empty()
+    );
 
-    assert!(tree
-        .current_version()
-        .level(2)
-        .expect("level should exist")
-        .is_empty());
+    assert!(
+        tree.current_version()
+            .level(2)
+            .expect("level should exist")
+            .is_empty()
+    );
 
-    assert!(!tree
-        .current_version()
-        .level(3)
-        .expect("level should exist")
-        .is_empty());
+    assert!(
+        !tree
+            .current_version()
+            .level(3)
+            .expect("level should exist")
+            .is_empty()
+    );
 
     Ok(())
 }

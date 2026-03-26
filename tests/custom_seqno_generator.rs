@@ -3,11 +3,11 @@
 // (found in the LICENSE-* files in the repository)
 
 use lsm_tree::{
-    AbstractTree, Config, SeqNo, SequenceNumberCounter, SequenceNumberGenerator,
-    SharedSequenceNumberGenerator, MAX_SEQNO,
+    AbstractTree, Config, MAX_SEQNO, SeqNo, SequenceNumberCounter, SequenceNumberGenerator,
+    SharedSequenceNumberGenerator,
 };
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// A custom generator that starts from a configurable offset,
 /// proving the trait-object wiring works end-to-end.

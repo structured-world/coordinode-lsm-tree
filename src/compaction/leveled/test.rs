@@ -1,5 +1,5 @@
 use super::*;
-use crate::{AbstractTree, Config, SequenceNumberCounter, MAX_SEQNO};
+use crate::{AbstractTree, Config, MAX_SEQNO, SequenceNumberCounter};
 use std::sync::Arc;
 use test_log::test;
 

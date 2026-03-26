@@ -268,12 +268,14 @@ fn u64_comparator_compaction_with_tombstones() -> lsm_tree::Result<()> {
 
     assert_eq!(items, vec![10, 30, 50]);
 
-    assert!(tree
-        .get(20u64.to_be_bytes().as_ref(), SeqNo::MAX)?
-        .is_none());
-    assert!(tree
-        .get(40u64.to_be_bytes().as_ref(), SeqNo::MAX)?
-        .is_none());
+    assert!(
+        tree.get(20u64.to_be_bytes().as_ref(), SeqNo::MAX)?
+            .is_none()
+    );
+    assert!(
+        tree.get(40u64.to_be_bytes().as_ref(), SeqNo::MAX)?
+            .is_none()
+    );
 
     Ok(())
 }

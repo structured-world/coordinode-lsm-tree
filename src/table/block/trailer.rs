@@ -3,8 +3,8 @@
 // (found in the LICENSE-* files in the repository)
 
 use super::{
-    encoder::{Encodable, Encoder},
     Block,
+    encoder::{Encodable, Encoder},
 };
 use crate::table::block::hash_index::MAX_POINTERS_FOR_HASH_INDEX;
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};

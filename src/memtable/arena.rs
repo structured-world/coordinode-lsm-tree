@@ -152,13 +152,13 @@ impl Arena {
     /// establish happens-before (typically via the skiplist CAS chain) so
     /// that the block pointer is visible.
     pub unsafe fn get_bytes(&self, offset: u32, len: u32) -> &[u8] {
-        let (ptr, off) = self.decode(offset);
+        let (ptr, off) = unsafe { self.decode(offset) };
         debug_assert!(
             off + len as usize <= BLOCK_SIZE as usize,
             "get_bytes: off={off} + len={len} exceeds BLOCK_SIZE={BLOCK_SIZE} (offset={offset})",
         );
         // SAFETY: caller guarantees the range is allocated and initialised.
-        std::slice::from_raw_parts(ptr.add(off), len as usize)
+        unsafe { std::slice::from_raw_parts(ptr.add(off), len as usize) }
     }
 
     /// Returns an exclusive reference to `len` bytes at the encoded `offset`.
@@ -171,10 +171,10 @@ impl Arena {
         reason = "interior mutability by design; caller guarantees exclusive access"
     )]
     pub unsafe fn get_bytes_mut(&self, offset: u32, len: u32) -> &mut [u8] {
-        let (ptr, off) = self.decode(offset);
+        let (ptr, off) = unsafe { self.decode(offset) };
         // SAFETY: caller guarantees exclusive access (typically right after alloc,
         // before the node offset is published to other threads).
-        std::slice::from_raw_parts_mut(ptr.add(off), len as usize)
+        unsafe { std::slice::from_raw_parts_mut(ptr.add(off), len as usize) }
     }
 
     /// Interprets 4 bytes at `offset` as an [`AtomicU32`] reference.
@@ -185,7 +185,7 @@ impl Arena {
     /// - The region `[offset, offset+4)` must have been previously allocated.
     /// - No `&mut` reference to the same 4 bytes may exist concurrently.
     pub unsafe fn get_atomic_u32(&self, offset: u32) -> &AtomicU32 {
-        let (ptr, off) = self.decode(offset);
+        let (ptr, off) = unsafe { self.decode(offset) };
         // SAFETY: caller guarantees alignment and prior allocation.
         // alloc(..., 4) ensures within-block alignment; the block base has
         // at least pointer-width alignment from the global allocator.
@@ -193,8 +193,8 @@ impl Arena {
             clippy::cast_ptr_alignment,
             reason = "caller guarantees 4-byte alignment via alloc(..., 4)"
         )]
-        let atom_ptr = ptr.add(off).cast::<u32>();
-        AtomicU32::from_ptr(atom_ptr)
+        let atom_ptr = unsafe { ptr.add(off).cast::<u32>() };
+        unsafe { AtomicU32::from_ptr(atom_ptr) }
     }
 
     // -----------------------------------------------------------------------

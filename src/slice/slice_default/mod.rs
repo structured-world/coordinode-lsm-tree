@@ -28,7 +28,7 @@ impl Slice {
     #[doc(hidden)]
     #[must_use]
     pub unsafe fn builder_unzeroed(len: usize) -> Builder {
-        ByteView::builder_unzeroed(len)
+        unsafe { ByteView::builder_unzeroed(len) }
     }
 
     pub(crate) fn slice(&self, range: impl std::ops::RangeBounds<usize>) -> Self {

@@ -3,9 +3,9 @@
 // (found in the LICENSE-* files in the repository)
 
 use crate::{
-    comparator::SharedComparator,
-    table::{block::ParsedItem, index_block::Iter as IndexBlockIter, IndexBlock, KeyedBlockHandle},
     SeqNo,
+    comparator::SharedComparator,
+    table::{IndexBlock, KeyedBlockHandle, block::ParsedItem, index_block::Iter as IndexBlockIter},
 };
 use self_cell::self_cell;
 
@@ -97,10 +97,10 @@ impl DoubleEndedIterator for OwnedIndexBlockIter {
 mod tests {
     use super::*;
     use crate::{
-        comparator::default_comparator,
-        table::block::{BlockOffset, BlockType, Header},
-        table::BlockHandle,
         Checksum,
+        comparator::default_comparator,
+        table::BlockHandle,
+        table::block::{BlockOffset, BlockType, Header},
     };
 
     /// Builds an IndexBlock containing entries with the given keys (seqno=0 for all).

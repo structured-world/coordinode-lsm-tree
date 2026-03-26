@@ -4,12 +4,12 @@
 
 use super::FilterWriter;
 use crate::{
+    CompressionType, UserKey,
     checksum::ChecksummedWriter,
     config::BloomConstructionPolicy,
     encryption::EncryptionProvider,
     prefix::PrefixExtractor,
-    table::{filter::standard_bloom::Builder, Block},
-    CompressionType, UserKey,
+    table::{Block, filter::standard_bloom::Builder},
 };
 use std::sync::Arc;
 

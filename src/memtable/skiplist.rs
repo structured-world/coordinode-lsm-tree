@@ -137,11 +137,7 @@ impl SkipMap {
         // Seed PRNG with an address-derived non-zero value.
         let seed = {
             let p = (&raw const arena) as u64;
-            if p == 0 {
-                0xDEAD_BEEF
-            } else {
-                p
-            }
+            if p == 0 { 0xDEAD_BEEF } else { p }
         };
 
         Self {
@@ -347,7 +343,7 @@ impl SkipMap {
     ///
     /// `node` must be a valid node offset previously returned by `alloc_node`.
     unsafe fn meta(&self, node: u32) -> &[u8] {
-        self.arena.get_bytes(node, OFF_TOWER)
+        unsafe { self.arena.get_bytes(node, OFF_TOWER) }
     }
 
     #[expect(
@@ -467,8 +463,7 @@ impl SkipMap {
     unsafe fn tower_atomic(&self, node: u32, level: usize) -> &std::sync::atomic::AtomicU32 {
         // SAFETY: caller guarantees level < node height; node + OFF_TOWER + level*4
         // is within the node's arena allocation and 4-byte aligned.
-        self.arena
-            .get_atomic_u32(node + OFF_TOWER + (level as u32) * 4)
+        unsafe { self.arena.get_atomic_u32(node + OFF_TOWER + (level as u32) * 4) }
     }
 
     /// Loads the next-pointer at `level` for `node`.
@@ -654,11 +649,7 @@ impl SkipMap {
             }
         }
 
-        if node == self.head {
-            UNSET
-        } else {
-            node
-        }
+        if node == self.head { UNSET } else { node }
     }
 
     /// Finds the last node whose key < `target`, or UNSET.
@@ -680,11 +671,7 @@ impl SkipMap {
             }
         }
 
-        if node == self.head {
-            UNSET
-        } else {
-            node
-        }
+        if node == self.head { UNSET } else { node }
     }
 
     /// Returns the last node in the skiplist, or UNSET if empty.
@@ -702,11 +689,7 @@ impl SkipMap {
             }
         }
 
-        if node == self.head {
-            UNSET
-        } else {
-            node
-        }
+        if node == self.head { UNSET } else { node }
     }
 
     /// Finds the predecessor of `target_node` at level 0 using a top-down
@@ -747,11 +730,7 @@ impl SkipMap {
             }
         }
 
-        if node == self.head {
-            UNSET
-        } else {
-            node
-        }
+        if node == self.head { UNSET } else { node }
     }
 
     // -----------------------------------------------------------------------

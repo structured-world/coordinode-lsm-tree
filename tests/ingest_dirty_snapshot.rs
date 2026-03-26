@@ -1,4 +1,4 @@
-use lsm_tree::{get_tmp_folder, AbstractTree, Config, SequenceNumberCounter};
+use lsm_tree::{AbstractTree, Config, SequenceNumberCounter, get_tmp_folder};
 
 #[test]
 fn ingestion_dirty_snapshot() -> lsm_tree::Result<()> {

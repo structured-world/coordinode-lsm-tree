@@ -4,8 +4,8 @@
 
 use super::binary_index::Reader as BinaryIndexReader;
 use crate::{
-    table::{block::Trailer, Block},
     SeqNo, Slice,
+    table::{Block, block::Trailer},
 };
 use byteorder::{LittleEndian, ReadBytesExt};
 use std::{io::Cursor, marker::PhantomData};

@@ -4,10 +4,10 @@
 
 use super::{Block, DataBlock};
 use crate::{
+    CompressionType, InternalValue, SeqNo,
     comparator::SharedComparator,
     encryption::EncryptionProvider,
     table::{block::BlockType, iter::OwnedDataBlockIter},
-    CompressionType, InternalValue, SeqNo,
 };
 use std::{fs::File, io::BufReader, path::Path, sync::Arc};
 

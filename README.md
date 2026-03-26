@@ -7,7 +7,7 @@
 [![Benchmarks](https://img.shields.io/badge/benchmarks-dashboard-orange)](https://structured-world.github.io/coordinode-lsm-tree/dev/bench/)
 [![Crates.io](https://img.shields.io/crates/v/coordinode-lsm-tree?color=blue)](https://crates.io/crates/coordinode-lsm-tree)
 [![docs.rs](https://img.shields.io/docsrs/coordinode-lsm-tree?color=green)](https://docs.rs/coordinode-lsm-tree)
-![MSRV](https://img.shields.io/badge/MSRV-1.90.0-blue)
+![MSRV](https://img.shields.io/badge/MSRV-1.92.0-blue)
 [![dependency status](https://deps.rs/repo/github/structured-world/coordinode-lsm-tree/status.svg)](https://deps.rs/repo/github/structured-world/coordinode-lsm-tree)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](#license)
 

@@ -3,7 +3,7 @@
 // (found in the LICENSE-* files in the repository)
 
 use crate::{
-    blob_tree::ingest::BlobIngestion, tree::ingest::Ingestion, AnyTree, UserKey, UserValue,
+    AnyTree, UserKey, UserValue, blob_tree::ingest::BlobIngestion, tree::ingest::Ingestion,
 };
 
 /// Unified ingestion builder over `AnyTree`

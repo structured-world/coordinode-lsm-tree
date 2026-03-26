@@ -12,7 +12,7 @@
 //! data) verify that get_internal_entry_from_tables always returns the entry
 //! with the highest visible seqno across all L0 runs.
 
-use lsm_tree::{get_tmp_folder, AbstractTree, Config, SequenceNumberCounter};
+use lsm_tree::{AbstractTree, Config, SequenceNumberCounter, get_tmp_folder};
 use test_log::test;
 
 /// Exact reproducer from issue #52.
