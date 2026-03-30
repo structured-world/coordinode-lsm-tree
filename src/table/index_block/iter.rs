@@ -3,14 +3,14 @@
 // (found in the LICENSE-* files in the repository)
 
 use crate::{
+    SeqNo,
     comparator::SharedComparator,
     double_ended_peekable::{DoubleEndedPeekable, DoubleEndedPeekableExt},
     table::{
+        KeyedBlockHandle,
         block::{Decoder, ParsedItem},
         index_block::IndexBlockParsedItem,
-        KeyedBlockHandle,
     },
-    SeqNo,
 };
 
 pub struct Iter<'a> {
@@ -226,13 +226,13 @@ impl DoubleEndedIterator for Iter<'_> {
 mod tests {
     use super::*;
     use crate::{
+        Checksum,
         coding::Decode,
         comparator::default_comparator,
         table::{
-            block::{BlockType, Header, ParsedItem, Trailer},
             Block, BlockHandle, BlockOffset, IndexBlock, KeyedBlockHandle,
+            block::{BlockType, Header, ParsedItem, Trailer},
         },
-        Checksum,
     };
     use byteorder::{ByteOrder, LittleEndian, ReadBytesExt};
     use std::io::Cursor;
