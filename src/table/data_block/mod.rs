@@ -28,6 +28,7 @@ impl Decodable<DataBlockParsedItem> for InternalValue {
         reader: &mut Cursor<&[u8]>,
         offset: usize,
         data: &'a [u8],
+        entries_end: usize,
     ) -> Option<(&'a [u8], SeqNo)> {
         let value_type = unwrap!(reader.read_u8());
 
@@ -42,7 +43,12 @@ impl Decodable<DataBlockParsedItem> for InternalValue {
             clippy::cast_possible_truncation,
             reason = "blocks tend to be some megabytes in size at most, so position should fit into usize"
         )]
-        let key_start = offset + reader.position() as usize;
+        let key_start = offset.checked_add(reader.position() as usize)?;
+        let key_end = key_start.checked_add(key_len)?;
+        if key_end > entries_end {
+            return None;
+        }
+
         #[expect(
             clippy::cast_possible_wrap,
             reason = "key_len is bounded by u16::MAX, no wrap expected"
@@ -50,19 +56,22 @@ impl Decodable<DataBlockParsedItem> for InternalValue {
         let key_len_i64 = key_len as i64;
         unwrap!(reader.seek_relative(key_len_i64));
 
-        let key = data.get(key_start..(key_start + key_len));
+        let key = data.get(key_start..key_end);
 
         key.map(|k| (k, seqno))
     }
 
-    fn parse_full(reader: &mut Cursor<&[u8]>, offset: usize) -> Option<DataBlockParsedItem> {
+    fn parse_full(
+        reader: &mut Cursor<&[u8]>,
+        offset: usize,
+        entries_end: usize,
+    ) -> Option<DataBlockParsedItem> {
         let value_type = unwrap!(reader.read_u8());
         if value_type == TRAILER_START_MARKER {
             return None;
         }
 
-        #[expect(clippy::expect_used, reason = "value_type is expected to be valid")]
-        let value_type = ValueType::try_from(value_type).expect("should be valid value type");
+        let value_type = ValueType::try_from(value_type).ok()?;
 
         let seqno = unwrap!(reader.read_u64_varint());
 
@@ -71,12 +80,19 @@ impl Decodable<DataBlockParsedItem> for InternalValue {
             clippy::cast_possible_truncation,
             reason = "blocks tend to be some megabytes in size at most, so position should fit into usize"
         )]
-        let key_start = offset + reader.position() as usize;
+        let key_start = offset.checked_add(reader.position() as usize)?;
         #[expect(
             clippy::cast_possible_wrap,
             reason = "key_len is bounded by u16::MAX, no wrap expected"
         )]
         let key_len_i64 = key_len as i64;
+        if key_start > entries_end {
+            return None;
+        }
+        let key_end = key_start.checked_add(key_len)?;
+        if key_end > entries_end {
+            return None;
+        }
         unwrap!(reader.seek_relative(key_len_i64));
 
         let is_value = !value_type.is_tombstone();
@@ -90,12 +106,19 @@ impl Decodable<DataBlockParsedItem> for InternalValue {
             clippy::cast_possible_truncation,
             reason = "blocks tend to be some megabytes in size at most, so position should fit into usize"
         )]
-        let val_offset = offset + reader.position() as usize;
+        let val_offset = offset.checked_add(reader.position() as usize)?;
         #[expect(
             clippy::cast_possible_wrap,
             reason = "val_len is bounded by u32::MAX, no wrap expected"
         )]
         let val_len_i64 = val_len as i64;
+        if val_offset > entries_end {
+            return None;
+        }
+        let val_end = val_offset.checked_add(val_len)?;
+        if val_end > entries_end {
+            return None;
+        }
         unwrap!(reader.seek_relative(val_len_i64));
 
         Some(if is_value {
@@ -103,15 +126,15 @@ impl Decodable<DataBlockParsedItem> for InternalValue {
                 value_type,
                 seqno,
                 prefix: None,
-                key: SliceIndexes(key_start, key_start + key_len),
-                value: Some(SliceIndexes(val_offset, val_offset + val_len)),
+                key: SliceIndexes(key_start, key_end),
+                value: Some(SliceIndexes(val_offset, val_end)),
             }
         } else {
             DataBlockParsedItem {
                 value_type,
                 seqno,
                 prefix: None,
-                key: SliceIndexes(key_start, key_start + key_len),
+                key: SliceIndexes(key_start, key_end),
                 value: None, // TODO: enum value/tombstone, so value is not Option for values
             }
         })
@@ -121,23 +144,42 @@ impl Decodable<DataBlockParsedItem> for InternalValue {
         reader: &mut Cursor<&[u8]>,
         offset: usize,
         base_key_offset: usize,
+        base_key_end: usize,
+        entries_end: usize,
     ) -> Option<DataBlockParsedItem> {
         let value_type = unwrap!(reader.read_u8());
         if value_type == TRAILER_START_MARKER {
             return None;
         }
-        let value_type = unwrap!(ValueType::try_from(value_type));
+        let value_type = ValueType::try_from(value_type).ok()?;
 
         let seqno = unwrap!(reader.read_u64_varint());
 
         let shared_prefix_len: usize = unwrap!(reader.read_u16_varint()).into();
         let rest_key_len: usize = unwrap!(reader.read_u16_varint()).into();
+        if base_key_end < base_key_offset || base_key_end > offset {
+            return None;
+        }
+        // base_key_end is the byte offset where the restart head's key ends.
+        // (base_key_end - base_key_offset) == restart_key_len, so this check
+        // rejects shared_prefix_len > restart_key_len.
+        let prefix_end = base_key_offset.checked_add(shared_prefix_len)?;
+        if prefix_end > base_key_end {
+            return None;
+        }
 
         #[expect(
             clippy::cast_possible_truncation,
             reason = "truncation is not expected to happen"
         )]
-        let key_offset = offset + reader.position() as usize;
+        let key_offset = offset.checked_add(reader.position() as usize)?;
+        if key_offset > entries_end {
+            return None;
+        }
+        let key_end = key_offset.checked_add(rest_key_len)?;
+        if key_end > entries_end {
+            return None;
+        }
 
         #[expect(
             clippy::cast_possible_wrap,
@@ -157,10 +199,17 @@ impl Decodable<DataBlockParsedItem> for InternalValue {
             clippy::cast_possible_truncation,
             reason = "truncation is not expected to happen"
         )]
-        let val_offset = offset + reader.position() as usize;
+        let val_offset = offset.checked_add(reader.position() as usize)?;
+        if val_offset > entries_end {
+            return None;
+        }
+        let val_end = val_offset.checked_add(val_len)?;
+        if val_end > entries_end {
+            return None;
+        }
         #[expect(
             clippy::cast_possible_wrap,
-            reason = "val_len is bounded by u16::MAX, no wrap expected"
+            reason = "val_len is bounded by u32::MAX, fits in i64 without wrap"
         )]
         let val_len_i64 = val_len as i64;
         unwrap!(reader.seek_relative(val_len_i64));
@@ -169,22 +218,16 @@ impl Decodable<DataBlockParsedItem> for InternalValue {
             DataBlockParsedItem {
                 value_type,
                 seqno,
-                prefix: Some(SliceIndexes(
-                    base_key_offset,
-                    base_key_offset + shared_prefix_len,
-                )),
-                key: SliceIndexes(key_offset, key_offset + rest_key_len),
-                value: Some(SliceIndexes(val_offset, val_offset + val_len)),
+                prefix: Some(SliceIndexes(base_key_offset, prefix_end)),
+                key: SliceIndexes(key_offset, key_end),
+                value: Some(SliceIndexes(val_offset, val_end)),
             }
         } else {
             DataBlockParsedItem {
                 value_type,
                 seqno,
-                prefix: Some(SliceIndexes(
-                    base_key_offset,
-                    base_key_offset + shared_prefix_len,
-                )),
-                key: SliceIndexes(key_offset, key_offset + rest_key_len),
+                prefix: Some(SliceIndexes(base_key_offset, prefix_end)),
+                key: SliceIndexes(key_offset, key_end),
                 value: None,
             }
         })
@@ -296,8 +339,16 @@ impl ParsedItem<InternalValue> for DataBlockParsedItem {
         }
     }
 
+    fn seqno(&self) -> SeqNo {
+        self.seqno
+    }
+
     fn key_offset(&self) -> usize {
         self.key.0
+    }
+
+    fn key_end_offset(&self) -> usize {
+        self.key.1
     }
 
     fn materialize(&self, bytes: &Slice) -> InternalValue {
@@ -564,16 +615,331 @@ impl DataBlock {
 #[cfg(test)]
 #[expect(clippy::expect_used)]
 mod tests {
+    use super::DataBlockParsedItem;
     use crate::comparator::default_comparator;
     use crate::{
         Checksum, InternalValue, SeqNo, Slice,
         ValueType::{Tombstone, Value},
         table::{
             Block, DataBlock,
-            block::{BlockType, Header, ParsedItem},
+            block::{BlockType, Decodable, Encodable, Header, ParsedItem},
         },
     };
+    use byteorder::ReadBytesExt;
+    use std::io::{Cursor, Seek};
     use test_log::test;
+    use varint_rs::VarintReader;
+
+    fn make_truncated_data_entry(shared_prefix_len: usize) -> Vec<u8> {
+        let value = InternalValue::from_components("abcdef", "payload", 0, Value);
+        let mut bytes = Vec::new();
+        value
+            .encode_truncated_into(&mut bytes, &mut (), shared_prefix_len)
+            .expect("encoding test InternalValue into truncated form must succeed");
+        bytes
+    }
+
+    fn make_full_data_entry() -> Vec<u8> {
+        let value = InternalValue::from_components("abcdef", "payload", 0, Value);
+        let mut bytes = Vec::new();
+        value
+            .encode_full_into(&mut bytes, &mut ())
+            .expect("encoding full test InternalValue must succeed");
+        bytes
+    }
+
+    fn make_full_tombstone_entry() -> Vec<u8> {
+        let value = InternalValue::from_components("abcdef", "", 0, Tombstone);
+        let mut bytes = Vec::new();
+        value
+            .encode_full_into(&mut bytes, &mut ())
+            .expect("encoding full tombstone InternalValue must succeed");
+        bytes
+    }
+
+    fn make_truncated_tombstone_entry(shared_prefix_len: usize) -> Vec<u8> {
+        let value = InternalValue::from_components("abcdef", "", 0, Tombstone);
+        let mut bytes = Vec::new();
+        value
+            .encode_truncated_into(&mut bytes, &mut (), shared_prefix_len)
+            .expect("encoding tombstone InternalValue into truncated form must succeed");
+        bytes
+    }
+
+    fn data_shared_prefix_len_offset(bytes: &[u8]) -> usize {
+        let mut cursor = Cursor::new(bytes);
+        let _value_type = cursor
+            .read_u8()
+            .expect("test fixture encoding must contain a value type byte");
+        let _seqno = cursor
+            .read_u64_varint()
+            .expect("test fixture encoding must contain a seqno varint");
+        usize::try_from(cursor.position())
+            .expect("cursor position must fit into usize in test environment")
+    }
+
+    fn data_rest_key_len_offset(bytes: &[u8]) -> usize {
+        let mut cursor = Cursor::new(bytes);
+        let _value_type = cursor
+            .read_u8()
+            .expect("test fixture encoding must contain a value type byte");
+        let _seqno = cursor
+            .read_u64_varint()
+            .expect("test fixture encoding must contain a seqno varint");
+        let _shared_prefix_len = cursor
+            .read_u16_varint()
+            .expect("test fixture encoding must contain a shared-prefix varint");
+        usize::try_from(cursor.position())
+            .expect("cursor position must fit into usize in test environment")
+    }
+
+    fn data_value_len_offset(bytes: &[u8]) -> usize {
+        let mut cursor = Cursor::new(bytes);
+        let _value_type = cursor
+            .read_u8()
+            .expect("test fixture encoding must contain a value type byte");
+        let _seqno = cursor
+            .read_u64_varint()
+            .expect("test fixture encoding must contain a seqno varint");
+        let _shared_prefix_len = cursor
+            .read_u16_varint()
+            .expect("test fixture encoding must contain a shared-prefix varint");
+        let rest_key_len: usize = cursor
+            .read_u16_varint()
+            .expect("test fixture encoding must contain a rest-key-length varint")
+            .into();
+        #[expect(
+            clippy::cast_possible_wrap,
+            reason = "rest_key_len is encoded as u16 in test fixture"
+        )]
+        cursor
+            .seek_relative(rest_key_len as i64)
+            .expect("rest key skip in test fixture should succeed");
+        usize::try_from(cursor.position())
+            .expect("cursor position must fit into usize in test environment")
+    }
+
+    fn data_full_key_len_offset(bytes: &[u8]) -> usize {
+        let mut cursor = Cursor::new(bytes);
+        let _value_type = cursor
+            .read_u8()
+            .expect("test fixture encoding must contain a value type byte");
+        let _seqno = cursor
+            .read_u64_varint()
+            .expect("test fixture encoding must contain a seqno varint");
+        usize::try_from(cursor.position())
+            .expect("cursor position must fit into usize in test environment")
+    }
+
+    fn data_full_value_len_offset(bytes: &[u8]) -> usize {
+        let mut cursor = Cursor::new(bytes);
+        let _value_type = cursor
+            .read_u8()
+            .expect("test fixture encoding must contain a value type byte");
+        let _seqno = cursor
+            .read_u64_varint()
+            .expect("test fixture encoding must contain a seqno varint");
+        let key_len: usize = cursor
+            .read_u16_varint()
+            .expect("test fixture encoding must contain a key-length varint")
+            .into();
+        #[expect(
+            clippy::cast_possible_wrap,
+            reason = "key_len is encoded as u16 in test fixture"
+        )]
+        cursor
+            .seek_relative(key_len as i64)
+            .expect("key skip in test fixture should succeed");
+        usize::try_from(cursor.position())
+            .expect("cursor position must fit into usize in test environment")
+    }
+
+    #[test]
+    fn parse_full_rejects_restart_key_span_overlapping_trailer_region() {
+        let mut bytes = make_full_tombstone_entry();
+        let offset = 16;
+        let entries_end = offset + bytes.len();
+        let key_len_pos = data_full_key_len_offset(&bytes);
+        *bytes
+            .get_mut(key_len_pos)
+            .expect("key_len_pos must point to an existing byte in test fixture") = 8;
+        bytes.extend_from_slice(&[0u8; 32]);
+
+        let mut cursor = Cursor::new(bytes.as_slice());
+        let parsed = <InternalValue as Decodable<DataBlockParsedItem>>::parse_full(
+            &mut cursor,
+            offset,
+            entries_end,
+        );
+        assert!(parsed.is_none());
+    }
+
+    #[test]
+    fn parse_full_rejects_restart_value_span_overlapping_trailer_region() {
+        let mut bytes = make_full_data_entry();
+        let offset = 16;
+        let entries_end = offset + bytes.len();
+        let val_len_pos = data_full_value_len_offset(&bytes);
+        *bytes
+            .get_mut(val_len_pos)
+            .expect("val_len_pos must point to an existing byte in test fixture") = 8;
+        bytes.extend_from_slice(&[0u8; 32]);
+
+        let mut cursor = Cursor::new(bytes.as_slice());
+        let parsed = <InternalValue as Decodable<DataBlockParsedItem>>::parse_full(
+            &mut cursor,
+            offset,
+            entries_end,
+        );
+        assert!(parsed.is_none());
+    }
+
+    #[test]
+    fn parse_full_returns_none_for_unknown_value_type_byte() {
+        let mut bytes = make_full_tombstone_entry();
+        let value_type = bytes
+            .get_mut(0)
+            .expect("full entry fixture must contain value_type byte");
+        *value_type = 5;
+
+        let offset = 16;
+        let entries_end = offset + bytes.len();
+        let mut cursor = Cursor::new(bytes.as_slice());
+        let parsed = <InternalValue as Decodable<DataBlockParsedItem>>::parse_full(
+            &mut cursor,
+            offset,
+            entries_end,
+        );
+        assert!(parsed.is_none());
+    }
+
+    #[test]
+    fn parse_truncated_rejects_prefix_span_crossing_restart_key_boundary() {
+        let mut bytes = make_truncated_data_entry(2);
+        let shared_len_pos = data_shared_prefix_len_offset(&bytes);
+        *bytes
+            .get_mut(shared_len_pos)
+            .expect("shared_len_pos must point to an existing byte in test fixture") = 7;
+
+        let offset = 16;
+        let entries_end = offset + bytes.len();
+        let mut cursor = Cursor::new(bytes.as_slice());
+        let parsed = <InternalValue as Decodable<DataBlockParsedItem>>::parse_truncated(
+            &mut cursor,
+            offset,
+            8,
+            14,
+            entries_end,
+        );
+        assert!(parsed.is_none());
+    }
+
+    #[test]
+    fn parse_truncated_returns_none_for_unknown_value_type_byte() {
+        let mut bytes = make_truncated_tombstone_entry(2);
+        let value_type = bytes
+            .get_mut(0)
+            .expect("truncated entry fixture must contain value_type byte");
+        *value_type = 5;
+
+        let offset = 16;
+        let entries_end = offset + bytes.len();
+        let mut cursor = Cursor::new(bytes.as_slice());
+        let parsed = <InternalValue as Decodable<DataBlockParsedItem>>::parse_truncated(
+            &mut cursor,
+            offset,
+            8,
+            14,
+            entries_end,
+        );
+        assert!(parsed.is_none());
+    }
+
+    #[test]
+    fn parse_truncated_rejects_key_span_crossing_block_boundary() {
+        let mut bytes = make_truncated_tombstone_entry(2);
+        let rest_len_pos = data_rest_key_len_offset(&bytes);
+        *bytes
+            .get_mut(rest_len_pos)
+            .expect("rest_len_pos must point to an existing byte in test fixture") = 64;
+
+        let offset = 16;
+        let entries_end = offset + bytes.len();
+        let mut cursor = Cursor::new(bytes.as_slice());
+        let parsed = <InternalValue as Decodable<DataBlockParsedItem>>::parse_truncated(
+            &mut cursor,
+            offset,
+            8,
+            14,
+            entries_end,
+        );
+        assert!(parsed.is_none());
+    }
+
+    #[test]
+    fn parse_truncated_rejects_value_span_crossing_block_boundary() {
+        let mut bytes = make_truncated_data_entry(2);
+        let val_len_pos = data_value_len_offset(&bytes);
+        *bytes
+            .get_mut(val_len_pos)
+            .expect("val_len_pos must point to an existing byte in test fixture") = 127;
+
+        let offset = 16;
+        let entries_end = offset + bytes.len();
+        let mut cursor = Cursor::new(bytes.as_slice());
+        let parsed = <InternalValue as Decodable<DataBlockParsedItem>>::parse_truncated(
+            &mut cursor,
+            offset,
+            8,
+            14,
+            entries_end,
+        );
+        assert!(parsed.is_none());
+    }
+
+    #[test]
+    fn parse_truncated_rejects_key_span_overlapping_trailer_region() {
+        let mut bytes = make_truncated_tombstone_entry(2);
+        let offset = 16;
+        let entries_end = offset + bytes.len();
+        let rest_len_pos = data_rest_key_len_offset(&bytes);
+        *bytes
+            .get_mut(rest_len_pos)
+            .expect("rest_len_pos must point to an existing byte in test fixture") = 6;
+        bytes.extend_from_slice(&[0u8; 32]);
+
+        let mut cursor = Cursor::new(bytes.as_slice());
+        let parsed = <InternalValue as Decodable<DataBlockParsedItem>>::parse_truncated(
+            &mut cursor,
+            offset,
+            8,
+            14,
+            entries_end,
+        );
+        assert!(parsed.is_none());
+    }
+
+    #[test]
+    fn parse_truncated_rejects_value_span_overlapping_trailer_region() {
+        let mut bytes = make_truncated_data_entry(2);
+        let offset = 16;
+        let entries_end = offset + bytes.len();
+        let val_len_pos = data_value_len_offset(&bytes);
+        *bytes
+            .get_mut(val_len_pos)
+            .expect("val_len_pos must point to an existing byte in test fixture") = 8;
+        bytes.extend_from_slice(&[0u8; 32]);
+
+        let mut cursor = Cursor::new(bytes.as_slice());
+        let parsed = <InternalValue as Decodable<DataBlockParsedItem>>::parse_truncated(
+            &mut cursor,
+            offset,
+            8,
+            14,
+            entries_end,
+        );
+        assert!(parsed.is_none());
+    }
 
     #[test]
     fn data_block_ping_pong_fuzz_1() -> crate::Result<()> {
