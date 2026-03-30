@@ -499,6 +499,57 @@ fn table_point_read() -> crate::Result<()> {
 }
 
 #[test]
+fn table_point_read_index_block_restart_interval() -> crate::Result<()> {
+    let items: Vec<_> = (0u32..24)
+        .map(|i| {
+            let key = format!("adj:out:vertex-0001:edge-{i:04}");
+            let value = format!("value-{i:04}");
+            crate::InternalValue::from_components(
+                key.as_bytes(),
+                value.as_bytes(),
+                u64::from(i),
+                crate::ValueType::Value,
+            )
+        })
+        .collect();
+
+    test_with_table(
+        &items,
+        |table| {
+            assert_eq!(
+                b"value-0011",
+                &*table
+                    .get(
+                        b"adj:out:vertex-0001:edge-0011",
+                        SeqNo::MAX,
+                        BloomBuilder::get_hash(b"adj:out:vertex-0001:edge-0011"),
+                    )?
+                    .expect("test assertion: expected value for edge-0011")
+                    .value,
+            );
+
+            let range = table
+                .range(
+                    UserKey::from("adj:out:vertex-0001:edge-0008")
+                        ..=UserKey::from("adj:out:vertex-0001:edge-0012"),
+                )
+                .flatten()
+                .collect::<Vec<_>>();
+
+            assert_eq!(items[8..=12], range);
+
+            Ok(())
+        },
+        Some(1),
+        Some(|writer: Writer| {
+            writer
+                .use_data_block_size(128)
+                .use_index_block_restart_interval(4)
+        }),
+    )
+}
+
+#[test]
 #[cfg(feature = "zstd")]
 fn table_point_read_zstd_dictionary() -> crate::Result<()> {
     let dict = Arc::new(make_test_dictionary());

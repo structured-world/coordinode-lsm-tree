@@ -149,13 +149,11 @@ fn rt_ops_strategy() -> impl Strategy<Value = Vec<RtOp>> {
 
 fn run_rt_test(ops: Vec<RtOp>) -> Result<(), TestCaseError> {
     let tmpdir = lsm_tree::get_tmp_folder();
-    let tree = Config::new(
-        &tmpdir,
-        SequenceNumberCounter::default(),
-        SequenceNumberCounter::default(),
-    )
-    .open()
-    .map_err(|e| TestCaseError::fail(format!("open: {e}")))?;
+    let seqno_counter = SequenceNumberCounter::default();
+    let visible_seqno = SequenceNumberCounter::default();
+    let tree = Config::new(&tmpdir, seqno_counter.clone(), visible_seqno.clone())
+        .open()
+        .map_err(|e| TestCaseError::fail(format!("open: {e}")))?;
 
     let mut oracle = RtOracle::new();
     let mut seqno: u64 = 1;
@@ -168,6 +166,7 @@ fn run_rt_test(ops: Vec<RtOp>) -> Result<(), TestCaseError> {
                 oracle.insert(key.clone(), val.clone(), seqno);
                 tree.insert(key, val, seqno);
                 seqno += 1;
+                visible_seqno.fetch_max(seqno);
             }
             RtOp::DeleteRange { lo, hi } => {
                 let start = key_from_idx(*lo);
@@ -176,6 +175,7 @@ fn run_rt_test(ops: Vec<RtOp>) -> Result<(), TestCaseError> {
                     oracle.remove_range(start.clone(), end.clone(), seqno);
                     tree.remove_range(&start, &end, seqno);
                     seqno += 1;
+                    visible_seqno.fetch_max(seqno);
                 }
             }
             RtOp::Flush => {
@@ -190,7 +190,9 @@ fn run_rt_test(ops: Vec<RtOp>) -> Result<(), TestCaseError> {
     }
 
     // Verify at current seqno.
-    let read_seqno = seqno;
+    // Use visibility watermark so reads always reference the newest super-version,
+    // even if compaction/flush advanced internal version seqnos independently.
+    let read_seqno = visible_seqno.get();
 
     // Point reads.
     for idx in 0..KEY_SPACE {
@@ -264,4 +266,26 @@ proptest! {
     fn prop_range_tombstone_correctness(ops in rt_ops_strategy()) {
         run_rt_test(ops)?;
     }
+}
+
+#[test]
+fn regression_point_read_after_flush_and_followup_insert() -> Result<(), TestCaseError> {
+    let ops = vec![
+        RtOp::Compact,
+        RtOp::Compact,
+        RtOp::Compact,
+        RtOp::Compact,
+        RtOp::Insert {
+            key_idx: 0,
+            value: 0,
+        },
+        RtOp::Flush,
+        RtOp::Insert {
+            key_idx: 0,
+            value: 1,
+        },
+    ];
+
+    run_rt_test(ops)?;
+    Ok(())
 }
