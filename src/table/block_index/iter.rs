@@ -48,16 +48,16 @@ impl OwnedIndexBlockIter {
     ) -> Option<Self> {
         let mut iter = Self::from_block(block, comparator);
 
+        // Use incremental bound-cursor methods: seek_lower_bound_cursor
+        // resets front but preserves back; seek_upper_bound_cursor preserves
+        // front (the candidate seeded by seek_lower's peek()).
         if let Some((key, seqno)) = lo
-            && !iter.seek_lower(key, seqno)
+            && !iter.with_dependent_mut(|_, m| m.seek_lower_bound_cursor(key, seqno))
         {
             return None;
         }
-        // NOTE: seek_upper on index blocks (restart_interval=1) always succeeds —
-        // it positions the back-end cursor but does not reject out-of-range bounds.
-        // The None path here guards against future decoder changes.
         if let Some((key, seqno)) = hi
-            && !iter.seek_upper(key, seqno)
+            && !iter.with_dependent_mut(|_, m| m.seek_upper_bound_cursor(key, seqno))
         {
             return None;
         }
@@ -65,12 +65,23 @@ impl OwnedIndexBlockIter {
         Some(iter)
     }
 
+    /// Full lower-bound re-seek: resets both front and back caches.
+    ///
+    /// For incremental bound positioning that preserves the back cache,
+    /// `from_block_with_bounds` uses `seek_lower_bound_cursor` internally.
     pub fn seek_lower(&mut self, needle: &[u8], seqno: SeqNo) -> bool {
-        self.with_dependent_mut(|_, m| m.seek_lower_bound_cursor(needle, seqno))
+        self.with_dependent_mut(|_, m| m.seek(needle, seqno))
     }
 
-    pub fn seek_upper(&mut self, needle: &[u8], seqno: SeqNo) -> bool {
-        self.with_dependent_mut(|_, m| m.seek_upper_bound_cursor(needle, seqno))
+    /// Upper-bound seek for forward-limit positioning: resets back cache
+    /// but does not check back-cache validity (allows all-same-end-key blocks).
+    pub fn seek_upper(&mut self, needle: &[u8], _seqno: SeqNo) -> bool {
+        self.with_dependent_mut(|_, m| {
+            // reset_front=false: preserve front cache from prior seek_lower
+            // reset_back=true: clear stale back state from reverse iteration
+            // check_back_cache=false: forward-limit mode, don't require peek_back
+            m.seek_upper_impl(needle, false, true, false)
+        })
     }
 }
 

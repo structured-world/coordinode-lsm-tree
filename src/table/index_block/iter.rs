@@ -85,7 +85,7 @@ impl<'a> Iter<'a> {
         self.seek_upper_impl(needle, true, true, true)
     }
 
-    fn seek_upper_impl(
+    pub(crate) fn seek_upper_impl(
         &mut self,
         needle: &[u8],
         reset_front: bool,
