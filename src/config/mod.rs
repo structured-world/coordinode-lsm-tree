@@ -776,6 +776,10 @@ impl<F: Fs> Config<F> {
     #[must_use]
     pub fn data_block_restart_interval_policy(mut self, policy: RestartIntervalPolicy) -> Self {
         assert!(
+            !policy.is_empty(),
+            "data block restart interval policy must not be empty",
+        );
+        assert!(
             policy.iter().all(|interval| *interval > 0),
             "data block restart interval must be greater than zero",
         );
@@ -795,6 +799,10 @@ impl<F: Fs> Config<F> {
     /// Panics if any restart interval in `policy` is zero.
     #[must_use]
     pub fn index_block_restart_interval_policy(mut self, policy: RestartIntervalPolicy) -> Self {
+        assert!(
+            !policy.is_empty(),
+            "index block restart interval policy must not be empty",
+        );
         assert!(
             policy.iter().all(|interval| *interval > 0),
             "index block restart interval must be greater than zero",

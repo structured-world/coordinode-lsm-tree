@@ -202,6 +202,10 @@ impl Writer {
 
     #[must_use]
     pub fn use_partitioned_filter(mut self) -> Self {
+        assert!(
+            self.meta.data_block_count == 0 && self.chunk.is_empty(),
+            "partitioned filter must be configured before writing starts",
+        );
         self.filter_writer = Box::new(filter::PartitionedFilterWriter::new(self.bloom_policy))
             .use_tli_compression(self.index_block_compression)
             .set_prefix_extractor(self.prefix_extractor.clone())
