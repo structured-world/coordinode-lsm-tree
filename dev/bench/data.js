@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1774593140079,
+  "lastUpdate": 1774963659527,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -4524,6 +4524,84 @@ window.BENCHMARK_DATA = {
             "value": 355933.37232274393,
             "unit": "ops/sec (normalized)",
             "extra": "raw: 534231 ops/sec | factor: 0.666 | P50: 1.7us | P99: 4.3us | P99.9: 11.8us\nthreads: 1 | elapsed: 0.37s | num: 200000 | iterations: 3 | runner: seq_wr=210508 rand_rd=611226 cpu=123 composite=34521.4"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "2a78e7eb0441c6d3af9a3267a88644154264795e",
+          "message": "perf(table): support compressed index blocks (#182)\n\n## Summary\n- enable index block restart intervals > 1 for index block encoding,\nmetadata, and seek paths\n- fix seek_upper behavior across compressed restart intervals by\nadvancing to the next restart head when the trimmed tail is still below\nneedle\n- fix restart_interval=1 upper-seek limit for all-same-end-key blocks by\nsplitting seek_upper_impl behavior by cursor mode\n- harden data_block and index_block parsers: checked_add for all offset\narithmetic, reject key/value spans exceeding block boundaries\n- harden decoder: reject EOF offsets in reader_at, reject zero-length\nbinary indexes, fail-close forward iteration after back-cursor\ncorruption (poison_back_cursor delegates to clamp_upper_to_lo so next()\nalso stops), clear hi_scanner stack at fill_stack entry\n- fix dead is_none() guard in both seek_upper and\nadvance_upper_restart_interval post-fill_stack — use stack.is_empty() to\ndetect corruption after poison_back_cursor switched to clamp semantics\n- fail-close seek_upper_impl after clamped\nadvance_upper_restart_interval\n- narrow decoder module visibility to pub(crate), narrow peek reset\nhelpers to pub(crate)\n- thread entries_end into parse_restart_key for bounded binary-search\nprobes (avoids full-item decode, validates key spans against\nentries_end)\n- propagate meta_partition_size through use_partitioned_filter (was\nmissing, matching use_partitioned_index)\n- add pre-write guard to use_partitioned_filter preventing mid-stream\nfilter-writer swap\n- fix misleading \"compression policy\" panic message in\nRestartIntervalPolicy::new\n- add doc comments to encode_into_vec_with_restart_interval,\nBlockIndexWriter trait method, seek_upper semantics, base_key_end\nvalidation\n- add regression tests: EOF binary-index offsets, zero-length binary\nindex, poison-back-cursor fail-close, corrupted restart-head key,\nempty-policy rejection, post-write filter/index swap rejection\n- align release automation by disabling publish in release-plz config\n(git_only=true, publish=false)\n\n## Testing\n- cargo fmt --all -- --check\n- cargo nextest run --workspace (1017 tests, 0 failed)\n- cargo clippy --all-targets -- -D warnings\n- cargo test --doc --all-features\n- cargo check --all-features (tools/db_bench)\n- cargo bench --bench index_block --no-run\n\n## Related\n- #184 — make block decoder trailer validation fallible (tracked\nseparately)\n\nCloses #170\nCloses #189\nCloses #183\nCloses #190\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n## Summary by CodeRabbit\n\n* **New Features**\n* Index encoding now supports configurable restart intervals (rejects\nzero); writers expose a builder to set it.\n* New public APIs to encode index blocks with custom restart intervals.\n\n* **Bug Fixes**\n* Decoding/iteration now fail-closed on truncated/corrupted blocks,\npreventing panics and out-of-bounds reads.\n* Configuration validates non-zero/ non-empty restart policies and\nprevents changing intervals after writing starts.\n\n* **Tests**\n* Added benchmarks and many unit/integration tests for restart\nintervals, decoding robustness, and point reads.\n\n* **Chores**\n  * Release flow set to git-only; crates.io publishing disabled.\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-03-31T16:26:04+03:00",
+          "tree_id": "2a6f6db329f57e2d4fb91f31daa80b7996ebf8eb",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/2a78e7eb0441c6d3af9a3267a88644154264795e"
+        },
+        "date": 1774963657337,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 1132555.1301038002,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 2084974 ops/sec | factor: 0.543 | P50: 0.3us | P99: 2.0us | P99.9: 5.0us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3 | runner: seq_wr=239464 rand_rd=924917 cpu=123 composite=42341.8"
+          },
+          {
+            "name": "fillrandom",
+            "value": 642398.8531958979,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 1182622 ops/sec | factor: 0.543 | P50: 0.7us | P99: 2.6us | P99.9: 5.8us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3 | runner: seq_wr=239464 rand_rd=924917 cpu=123 composite=42341.8"
+          },
+          {
+            "name": "readrandom",
+            "value": 278112.4060998146,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 511990 ops/sec | factor: 0.543 | P50: 1.8us | P99: 5.1us | P99.9: 13.8us\nthreads: 1 | elapsed: 0.39s | num: 200000 | iterations: 3 | runner: seq_wr=239464 rand_rd=924917 cpu=123 composite=42341.8"
+          },
+          {
+            "name": "readseq",
+            "value": 1384599.5589743878,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 2548975 ops/sec | factor: 0.543 | P50: 0.2us | P99: 3.7us | P99.9: 7.5us\nthreads: 1 | elapsed: 0.08s | num: 200000 | iterations: 3 | runner: seq_wr=239464 rand_rd=924917 cpu=123 composite=42341.8"
+          },
+          {
+            "name": "seekrandom",
+            "value": 191005.68984187345,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 351631 ops/sec | factor: 0.543 | P50: 2.5us | P99: 6.4us | P99.9: 15.0us\nthreads: 1 | elapsed: 0.57s | num: 200000 | iterations: 3 | runner: seq_wr=239464 rand_rd=924917 cpu=123 composite=42341.8"
+          },
+          {
+            "name": "prefixscan",
+            "value": 103544.48815212664,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 190620 ops/sec | factor: 0.543 | P50: 4.9us | P99: 6.9us | P99.9: 18.0us\nthreads: 1 | elapsed: 1.05s | num: 200000 | iterations: 3 | runner: seq_wr=239464 rand_rd=924917 cpu=123 composite=42341.8"
+          },
+          {
+            "name": "overwrite",
+            "value": 639714.8419517766,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 1177681 ops/sec | factor: 0.543 | P50: 0.7us | P99: 2.6us | P99.9: 5.8us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3 | runner: seq_wr=239464 rand_rd=924917 cpu=123 composite=42341.8"
+          },
+          {
+            "name": "mergerandom",
+            "value": 380039.86591234076,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 699633 ops/sec | factor: 0.543 | P50: 0.3us | P99: 1.9us | P99.9: 3.2us\nthreads: 1 | elapsed: 0.29s | num: 200000 | iterations: 3 | runner: seq_wr=239464 rand_rd=924917 cpu=123 composite=42341.8"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 254420.498847161,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 468375 ops/sec | factor: 0.543 | P50: 2.0us | P99: 4.1us | P99.9: 13.9us\nthreads: 1 | elapsed: 0.43s | num: 200000 | iterations: 3 | runner: seq_wr=239464 rand_rd=924917 cpu=123 composite=42341.8"
           }
         ]
       }
