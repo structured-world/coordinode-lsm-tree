@@ -1020,7 +1020,7 @@ mod builder_tests {
     }
 
     #[test]
-    #[should_panic(expected = "compression policy may not be empty")]
+    #[should_panic(expected = "restart interval policy may not be empty")]
     fn index_restart_interval_policy_rejects_empty() {
         let folder = match tempfile::tempdir() {
             Ok(folder) => folder,
@@ -1035,7 +1035,7 @@ mod builder_tests {
     }
 
     #[test]
-    #[should_panic(expected = "compression policy may not be empty")]
+    #[should_panic(expected = "restart interval policy may not be empty")]
     fn data_restart_interval_policy_rejects_empty() {
         let folder = match tempfile::tempdir() {
             Ok(folder) => folder,

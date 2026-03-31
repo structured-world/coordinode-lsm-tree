@@ -208,6 +208,7 @@ impl Writer {
         );
         self.filter_writer = Box::new(filter::PartitionedFilterWriter::new(self.bloom_policy))
             .use_tli_compression(self.index_block_compression)
+            .use_partition_size(self.meta_partition_size)
             .set_prefix_extractor(self.prefix_extractor.clone())
             .use_encryption(self.encryption.clone());
         self
