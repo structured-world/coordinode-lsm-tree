@@ -237,6 +237,9 @@ impl<'a, Item: Decodable<Parsed>, Parsed: ParsedItem<Item>> Decoder<'a, Item, Pa
     }
 
     fn get_key_at(&self, pos: usize, entries_end: usize) -> Option<(&[u8], SeqNo)> {
+        if pos >= entries_end {
+            return None;
+        }
         let bytes = &self.block.data;
         let mut cursor = Self::reader_at(bytes, pos)?;
         Item::parse_restart_key(&mut cursor, pos, bytes, entries_end)

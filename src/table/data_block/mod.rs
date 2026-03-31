@@ -30,15 +30,15 @@ impl Decodable<DataBlockParsedItem> for InternalValue {
         data: &'a [u8],
         entries_end: usize,
     ) -> Option<(&'a [u8], SeqNo)> {
-        let value_type = unwrap!(reader.read_u8());
+        let value_type = reader.read_u8().ok()?;
 
         if value_type == TRAILER_START_MARKER {
             return None;
         }
 
-        let seqno = unwrap!(reader.read_u64_varint());
+        let seqno = reader.read_u64_varint().ok()?;
 
-        let key_len: usize = unwrap!(reader.read_u16_varint()).into();
+        let key_len: usize = reader.read_u16_varint().ok()?.into();
         #[expect(
             clippy::cast_possible_truncation,
             reason = "blocks tend to be some megabytes in size at most, so position should fit into usize"
@@ -54,7 +54,7 @@ impl Decodable<DataBlockParsedItem> for InternalValue {
             reason = "key_len is bounded by u16::MAX, no wrap expected"
         )]
         let key_len_i64 = key_len as i64;
-        unwrap!(reader.seek_relative(key_len_i64));
+        reader.seek_relative(key_len_i64).ok()?;
 
         let key = data.get(key_start..key_end);
 
@@ -66,16 +66,16 @@ impl Decodable<DataBlockParsedItem> for InternalValue {
         offset: usize,
         entries_end: usize,
     ) -> Option<DataBlockParsedItem> {
-        let value_type = unwrap!(reader.read_u8());
+        let value_type = reader.read_u8().ok()?;
         if value_type == TRAILER_START_MARKER {
             return None;
         }
 
         let value_type = ValueType::try_from(value_type).ok()?;
 
-        let seqno = unwrap!(reader.read_u64_varint());
+        let seqno = reader.read_u64_varint().ok()?;
 
-        let key_len: usize = unwrap!(reader.read_u16_varint()).into();
+        let key_len: usize = reader.read_u16_varint().ok()?.into();
         #[expect(
             clippy::cast_possible_truncation,
             reason = "blocks tend to be some megabytes in size at most, so position should fit into usize"
@@ -93,12 +93,12 @@ impl Decodable<DataBlockParsedItem> for InternalValue {
         if key_end > entries_end {
             return None;
         }
-        unwrap!(reader.seek_relative(key_len_i64));
+        reader.seek_relative(key_len_i64).ok()?;
 
         let is_value = !value_type.is_tombstone();
 
         let val_len: usize = if is_value {
-            unwrap!(reader.read_u32_varint()) as usize
+            reader.read_u32_varint().ok()? as usize
         } else {
             0
         };
@@ -119,7 +119,7 @@ impl Decodable<DataBlockParsedItem> for InternalValue {
         if val_end > entries_end {
             return None;
         }
-        unwrap!(reader.seek_relative(val_len_i64));
+        reader.seek_relative(val_len_i64).ok()?;
 
         Some(if is_value {
             DataBlockParsedItem {
@@ -147,16 +147,16 @@ impl Decodable<DataBlockParsedItem> for InternalValue {
         base_key_end: usize,
         entries_end: usize,
     ) -> Option<DataBlockParsedItem> {
-        let value_type = unwrap!(reader.read_u8());
+        let value_type = reader.read_u8().ok()?;
         if value_type == TRAILER_START_MARKER {
             return None;
         }
         let value_type = ValueType::try_from(value_type).ok()?;
 
-        let seqno = unwrap!(reader.read_u64_varint());
+        let seqno = reader.read_u64_varint().ok()?;
 
-        let shared_prefix_len: usize = unwrap!(reader.read_u16_varint()).into();
-        let rest_key_len: usize = unwrap!(reader.read_u16_varint()).into();
+        let shared_prefix_len: usize = reader.read_u16_varint().ok()?.into();
+        let rest_key_len: usize = reader.read_u16_varint().ok()?.into();
         if base_key_end < base_key_offset || base_key_end > offset {
             return None;
         }
@@ -186,12 +186,12 @@ impl Decodable<DataBlockParsedItem> for InternalValue {
             reason = "rest_key_len is bounded by u16::MAX, no wrap expected"
         )]
         let rest_key_len_i64 = rest_key_len as i64;
-        unwrap!(reader.seek_relative(rest_key_len_i64));
+        reader.seek_relative(rest_key_len_i64).ok()?;
 
         let is_value = !value_type.is_tombstone();
 
         let val_len: usize = if is_value {
-            unwrap!(reader.read_u32_varint()) as usize
+            reader.read_u32_varint().ok()? as usize
         } else {
             0
         };
@@ -212,7 +212,7 @@ impl Decodable<DataBlockParsedItem> for InternalValue {
             reason = "val_len is bounded by u32::MAX, fits in i64 without wrap"
         )]
         let val_len_i64 = val_len as i64;
-        unwrap!(reader.seek_relative(val_len_i64));
+        reader.seek_relative(val_len_i64).ok()?;
 
         Some(if is_value {
             DataBlockParsedItem {

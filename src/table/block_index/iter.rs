@@ -105,10 +105,8 @@ impl DoubleEndedIterator for OwnedIndexBlockIter {
 }
 
 #[cfg(test)]
-#[allow(
+#[expect(
     clippy::unwrap_used,
-    clippy::indexing_slicing,
-    clippy::useless_vec,
     clippy::doc_markdown,
     clippy::cast_possible_truncation,
     reason = "test code"
@@ -223,6 +221,27 @@ mod tests {
 
         // Forward from lo bound
         assert_eq!(iter.next().unwrap().end_key().as_ref(), b"b");
+    }
+
+    #[test]
+    fn from_block_with_bounds_compressed_both_bounds() {
+        // Exercise the seek_lower_bound_cursor → seek_upper_bound_cursor
+        // sequence with restart_interval > 1 to cover the compressed-interval
+        // trim_back_to_upper_bound + advance_upper_restart_interval path.
+        let block = make_index_block(&[b"a", b"b", b"c", b"d", b"e", b"f", b"g", b"h"], 4);
+        let iter = OwnedIndexBlockIter::from_block_with_bounds(
+            block,
+            default_comparator(),
+            Some((b"c", SeqNo::MAX)),
+            Some((b"f", 0)),
+        )
+        .unwrap();
+
+        let keys: Vec<_> = iter.map(|h| h.end_key().to_vec()).collect();
+        // lo="c" → first block with end_key >= "c" is "c"
+        // hi="f" → forward limit includes up to "f"
+        assert!(keys.first().unwrap().as_slice() >= b"c".as_slice());
+        assert!(!keys.is_empty());
     }
 
     #[test]

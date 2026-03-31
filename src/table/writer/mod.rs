@@ -200,12 +200,16 @@ impl Writer {
         });
     }
 
-    #[must_use]
-    pub fn use_partitioned_filter(mut self) -> Self {
+    fn assert_not_started(&self, setting: &str) {
         assert!(
             self.meta.data_block_count == 0 && self.chunk.is_empty(),
-            "partitioned filter must be configured before writing starts",
+            "{setting} must be configured before writing starts",
         );
+    }
+
+    #[must_use]
+    pub fn use_partitioned_filter(mut self) -> Self {
+        self.assert_not_started("partitioned filter");
         self.filter_writer = Box::new(filter::PartitionedFilterWriter::new(self.bloom_policy))
             .use_tli_compression(self.index_block_compression)
             .use_partition_size(self.meta_partition_size)
@@ -216,10 +220,7 @@ impl Writer {
 
     #[must_use]
     pub fn use_partitioned_index(mut self) -> Self {
-        assert!(
-            self.meta.data_block_count == 0 && self.chunk.is_empty(),
-            "partitioned index must be configured before writing starts",
-        );
+        self.assert_not_started("partitioned index");
         self.index_writer = Box::new(index::PartitionedIndexWriter::new())
             .use_compression(self.index_block_compression)
             .use_partition_size(self.meta_partition_size)
@@ -234,10 +235,7 @@ impl Writer {
             interval > 0,
             "data block restart interval must be greater than zero",
         );
-        assert!(
-            self.meta.data_block_count == 0 && self.chunk.is_empty(),
-            "data block restart interval must be configured before writing starts",
-        );
+        self.assert_not_started("data block restart interval");
         self.data_block_restart_interval = interval;
         self
     }
@@ -248,10 +246,7 @@ impl Writer {
             interval > 0,
             "index block restart interval must be greater than zero",
         );
-        assert!(
-            self.meta.data_block_count == 0 && self.chunk.is_empty(),
-            "index block restart interval must be configured before writing starts",
-        );
+        self.assert_not_started("index block restart interval");
         self.index_block_restart_interval = interval;
         self.index_writer = self.index_writer.use_restart_interval(interval);
         self
