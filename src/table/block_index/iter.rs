@@ -46,6 +46,13 @@ impl OwnedIndexBlockIter {
         lo: Option<(&[u8], SeqNo)>,
         hi: Option<(&[u8], SeqNo)>,
     ) -> Option<Self> {
+        // Short-circuit contradictory bounds: lo > hi means an empty range.
+        if let (Some((lo_key, _)), Some((hi_key, _))) = (lo, hi)
+            && comparator.compare(lo_key, hi_key) == std::cmp::Ordering::Greater
+        {
+            return None;
+        }
+
         let mut iter = Self::from_block(block, comparator);
 
         // Use incremental bound-cursor methods: seek_lower_bound_cursor
@@ -260,6 +267,19 @@ mod tests {
         );
 
         assert!(iter.is_none());
+    }
+
+    #[test]
+    fn from_block_with_bounds_inverted_bounds_returns_none() {
+        let block = make_index_block(&[b"a", b"b", b"c", b"d", b"e"], 1);
+        let iter = OwnedIndexBlockIter::from_block_with_bounds(
+            block,
+            default_comparator(),
+            Some((b"d", SeqNo::MAX)),
+            Some((b"b", 0)),
+        );
+
+        assert!(iter.is_none(), "inverted lo > hi must return None");
     }
 
     #[test]
