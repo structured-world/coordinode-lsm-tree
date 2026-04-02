@@ -62,7 +62,7 @@ pub struct ParsedMeta {
 macro_rules! read_u8 {
     ($block:expr, $name:expr, $cmp:expr) => {{
         let bytes = $block
-            .point_read($name, SeqNo::MAX, $cmp)
+            .point_read($name, SeqNo::MAX, $cmp)?
             .unwrap_or_else(|| panic!("meta property {:?} should exist", $name));
 
         let mut bytes = &bytes.value[..];
@@ -73,7 +73,7 @@ macro_rules! read_u8 {
 macro_rules! read_u64 {
     ($block:expr, $name:expr, $cmp:expr) => {{
         let bytes = $block
-            .point_read($name, SeqNo::MAX, $cmp)
+            .point_read($name, SeqNo::MAX, $cmp)?
             .unwrap_or_else(|| panic!("meta property {:?} should exist", $name));
 
         let mut bytes = &bytes.value[..];
@@ -138,7 +138,7 @@ impl ParsedMeta {
         #[expect(clippy::indexing_slicing)]
         {
             let table_version = block
-                .point_read(b"table_version", SeqNo::MAX, &cmp)
+                .point_read(b"table_version", SeqNo::MAX, &cmp)?
                 .expect("Table version should exist")
                 .value;
 
@@ -152,7 +152,7 @@ impl ParsedMeta {
 
         {
             let hash_type = block
-                .point_read(b"filter_hash_type", SeqNo::MAX, &cmp)
+                .point_read(b"filter_hash_type", SeqNo::MAX, &cmp)?
                 .expect("Filter hash type should exist")
                 .value;
 
@@ -166,7 +166,7 @@ impl ParsedMeta {
 
         {
             let hash_type = block
-                .point_read(b"checksum_type", SeqNo::MAX, &cmp)
+                .point_read(b"checksum_type", SeqNo::MAX, &cmp)?
                 .expect("Checksum type should exist")
                 .value;
 
@@ -193,7 +193,7 @@ impl ParsedMeta {
 
         let created_at = {
             let bytes = block
-                .point_read(b"created_at", SeqNo::MAX, &cmp)
+                .point_read(b"created_at", SeqNo::MAX, &cmp)?
                 .expect("created_at timestamp should exist");
 
             let mut bytes = &bytes.value[..];
@@ -202,11 +202,11 @@ impl ParsedMeta {
 
         let key_range = KeyRange::new((
             block
-                .point_read(b"key#min", SeqNo::MAX, &cmp)
+                .point_read(b"key#min", SeqNo::MAX, &cmp)?
                 .expect("key min should exist")
                 .value,
             block
-                .point_read(b"key#max", SeqNo::MAX, &cmp)
+                .point_read(b"key#max", SeqNo::MAX, &cmp)?
                 .expect("key max should exist")
                 .value,
         ));
@@ -214,7 +214,7 @@ impl ParsedMeta {
         let seqnos = {
             let min = {
                 let bytes = block
-                    .point_read(b"seqno#min", SeqNo::MAX, &cmp)
+                    .point_read(b"seqno#min", SeqNo::MAX, &cmp)?
                     .expect("seqno min should exist")
                     .value;
                 let mut bytes = &bytes[..];
@@ -223,7 +223,7 @@ impl ParsedMeta {
 
             let max = {
                 let bytes = block
-                    .point_read(b"seqno#max", SeqNo::MAX, &cmp)
+                    .point_read(b"seqno#max", SeqNo::MAX, &cmp)?
                     .expect("seqno max should exist")
                     .value;
                 let mut bytes = &bytes[..];
@@ -241,7 +241,7 @@ impl ParsedMeta {
         // If the key exists but is truncated, propagate the I/O error to
         // surface metadata corruption rather than silently falling back.
         let highest_kv_seqno =
-            if let Some(item) = block.point_read(b"seqno#kv_max", SeqNo::MAX, &cmp) {
+            if let Some(item) = block.point_read(b"seqno#kv_max", SeqNo::MAX, &cmp)? {
                 let mut bytes = &item.value[..];
                 validated_kv_seqno(bytes.read_u64::<LittleEndian>()?, seqnos.1)?
             } else {
@@ -250,7 +250,7 @@ impl ParsedMeta {
 
         let data_block_compression = {
             let bytes = block
-                .point_read(b"compression#data", SeqNo::MAX, &cmp)
+                .point_read(b"compression#data", SeqNo::MAX, &cmp)?
                 .expect("size should exist");
 
             let mut bytes = &bytes.value[..];
@@ -259,7 +259,7 @@ impl ParsedMeta {
 
         let index_block_compression = {
             let bytes = block
-                .point_read(b"compression#index", SeqNo::MAX, &cmp)
+                .point_read(b"compression#index", SeqNo::MAX, &cmp)?
                 .expect("size should exist");
 
             let mut bytes = &bytes.value[..];

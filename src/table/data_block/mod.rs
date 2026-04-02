@@ -465,44 +465,56 @@ impl DataBlock {
             .map(|reader| reader.bucket_count())
     }
 
-    #[must_use]
+    /// Performs a point read for a single key/seqno pair.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error::InvalidTag`] if the wrapped block is not a data
+    /// or meta block, or [`crate::Error::InvalidTrailer`] if the block trailer
+    /// is malformed.
+    ///
+    /// # Breaking change
+    ///
+    /// Previously returned `Option<InternalValue>`; now returns
+    /// `Result<Option<InternalValue>>` so trailer corruption is surfaced
+    /// instead of silently skipped.
     pub fn point_read(
         &self,
         needle: &[u8],
         seqno: SeqNo,
         comparator: &crate::comparator::SharedComparator,
-    ) -> Option<InternalValue> {
+    ) -> crate::Result<Option<InternalValue>> {
+        // Validate trailer once via try_iter (which calls Decoder::try_new
+        // internally). This must happen before get_hash_index_reader /
+        // get_binary_index_reader which read trailer fields without their own
+        // validation.
+        let mut iter = self.try_iter(comparator.clone())?;
+
         let iter = if let Some(hash_index_reader) = self.get_hash_index_reader() {
             match hash_index_reader.get(needle) {
                 MARKER_FREE => {
-                    return None;
+                    return Ok(None);
                 }
                 MARKER_CONFLICT => {
                     // NOTE: Fallback to seqno-aware binary search
-                    let mut iter = self.iter(comparator.clone());
-
                     if !iter.seek_to_key_seqno(needle, seqno) {
-                        return None;
+                        return Ok(None);
                     }
 
                     iter
                 }
                 idx => {
                     let offset: usize = self.get_binary_index_reader().get(usize::from(idx));
-
-                    let mut iter = self.iter(comparator.clone());
                     iter.seek_to_offset(offset);
 
                     iter
                 }
             }
         } else {
-            let mut iter = self.iter(comparator.clone());
-
             // NOTE: Seqno-aware binary search reduces linear scanning by skipping most
             // restart intervals that contain only versions newer than the target seqno
             if !iter.seek_to_key_seqno(needle, seqno) {
-                return None;
+                return Ok(None);
             }
 
             iter
@@ -513,7 +525,7 @@ impl DataBlock {
             match item.compare_key(needle, &self.inner.data, comparator.as_ref()) {
                 std::cmp::Ordering::Greater => {
                     // We are past our searched key
-                    return None;
+                    return Ok(None);
                 }
                 std::cmp::Ordering::Equal => {
                     // If key is same as needle, check sequence number
@@ -528,10 +540,40 @@ impl DataBlock {
                 continue;
             }
 
-            return Some(item.materialize(&self.inner.data));
+            return Ok(Some(item.materialize(&self.inner.data)));
         }
 
-        None
+        Ok(None)
+    }
+
+    /// Creates a fallible iterator over the data block.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error::InvalidTag`] if the block is not a data or meta
+    /// block, or [`crate::Error::InvalidTrailer`] if the block trailer is
+    /// malformed (e.g. `restart_interval == 0`).
+    pub fn try_iter(
+        &self,
+        comparator: crate::comparator::SharedComparator,
+    ) -> crate::Result<Iter<'_>> {
+        use crate::table::block::BlockType;
+
+        // DataBlock is used for both Data and Meta blocks (same encoding).
+        if !matches!(
+            self.inner.header.block_type,
+            BlockType::Data | BlockType::Meta
+        ) {
+            return Err(crate::Error::InvalidTag((
+                "BlockType",
+                self.inner.header.block_type.into(),
+            )));
+        }
+        Ok(Iter::new(
+            &self.inner.data,
+            Decoder::<InternalValue, DataBlockParsedItem>::try_new(&self.inner)?,
+            comparator,
+        ))
     }
 
     #[must_use]
@@ -613,7 +655,7 @@ impl DataBlock {
 }
 
 #[cfg(test)]
-#[expect(clippy::expect_used)]
+#[expect(clippy::expect_used, clippy::indexing_slicing)]
 mod tests {
     use super::DataBlockParsedItem;
     use crate::comparator::default_comparator;
@@ -1035,21 +1077,21 @@ mod tests {
 
             assert!(
                 data_block
-                    .point_read(b"a", SeqNo::MAX, &default_comparator())
+                    .point_read(b"a", SeqNo::MAX, &default_comparator())?
                     .is_none(),
                 "should return None because a does not exist",
             );
 
             assert!(
                 data_block
-                    .point_read(b"b", SeqNo::MAX, &default_comparator())
+                    .point_read(b"b", SeqNo::MAX, &default_comparator())?
                     .is_some(),
                 "should return Some because b exists",
             );
 
             assert!(
                 data_block
-                    .point_read(b"z", SeqNo::MAX, &default_comparator())
+                    .point_read(b"z", SeqNo::MAX, &default_comparator())?
                     .is_none(),
                 "should return Some because z does not exist",
             );
@@ -1087,13 +1129,13 @@ mod tests {
         for needle in items {
             assert_eq!(
                 Some(needle.clone()),
-                data_block.point_read(&needle.key.user_key, SeqNo::MAX, &default_comparator()),
+                data_block.point_read(&needle.key.user_key, SeqNo::MAX, &default_comparator())?,
             );
         }
 
         assert_eq!(
             None,
-            data_block.point_read(b"yyy", SeqNo::MAX, &default_comparator())
+            data_block.point_read(b"yyy", SeqNo::MAX, &default_comparator())?
         );
 
         Ok(())
@@ -1127,11 +1169,11 @@ mod tests {
 
             assert_eq!(
                 Some(items[0].clone()),
-                data_block.point_read(b"abc", 777, &default_comparator())
+                data_block.point_read(b"abc", 777, &default_comparator())?
             );
             assert!(
                 data_block
-                    .point_read(b"abc", 1, &default_comparator())
+                    .point_read(b"abc", 1, &default_comparator())?
                     .is_none()
             );
         }
@@ -1167,7 +1209,7 @@ mod tests {
 
             assert_eq!(
                 Some(items[0].clone()),
-                data_block.point_read(b"hello", 777, &default_comparator())
+                data_block.point_read(b"hello", 777, &default_comparator())?
             );
         }
 
@@ -1208,13 +1250,13 @@ mod tests {
                     &needle.key.user_key,
                     needle.key.seqno + 1,
                     &default_comparator()
-                ),
+                )?,
             );
         }
 
         assert_eq!(
             None,
-            data_block.point_read(b"yyy", SeqNo::MAX, &default_comparator())
+            data_block.point_read(b"yyy", SeqNo::MAX, &default_comparator())?
         );
 
         Ok(())
@@ -1251,13 +1293,13 @@ mod tests {
                     &needle.key.user_key,
                     needle.key.seqno + 1,
                     &default_comparator()
-                ),
+                )?,
             );
         }
 
         assert_eq!(
             None,
-            data_block.point_read(b"yyy", SeqNo::MAX, &default_comparator())
+            data_block.point_read(b"yyy", SeqNo::MAX, &default_comparator())?
         );
 
         Ok(())
@@ -1290,13 +1332,13 @@ mod tests {
         for needle in items {
             assert_eq!(
                 Some(needle.clone()),
-                data_block.point_read(&needle.key.user_key, SeqNo::MAX, &default_comparator()),
+                data_block.point_read(&needle.key.user_key, SeqNo::MAX, &default_comparator())?,
             );
         }
 
         assert_eq!(
             None,
-            data_block.point_read(b"yyy", SeqNo::MAX, &default_comparator())
+            data_block.point_read(b"yyy", SeqNo::MAX, &default_comparator())?
         );
 
         Ok(())
@@ -1338,13 +1380,13 @@ mod tests {
                     &needle.key.user_key,
                     needle.key.seqno + 1,
                     &default_comparator()
-                ),
+                )?,
             );
         }
 
         assert_eq!(
             None,
-            data_block.point_read(b"yyy", SeqNo::MAX, &default_comparator())
+            data_block.point_read(b"yyy", SeqNo::MAX, &default_comparator())?
         );
 
         Ok(())
@@ -1381,11 +1423,11 @@ mod tests {
 
         assert_eq!(
             Some(items.get(1).cloned().unwrap()),
-            data_block.point_read(&[233, 233], SeqNo::MAX, &default_comparator())
+            data_block.point_read(&[233, 233], SeqNo::MAX, &default_comparator())?
         );
         assert_eq!(
             None,
-            data_block.point_read(b"yyy", SeqNo::MAX, &default_comparator())
+            data_block.point_read(b"yyy", SeqNo::MAX, &default_comparator())?
         );
 
         Ok(())
@@ -1429,15 +1471,15 @@ mod tests {
 
         assert_eq!(
             Some(items.get(1).cloned().unwrap()),
-            data_block.point_read(&[233, 233], SeqNo::MAX, &default_comparator())
+            data_block.point_read(&[233, 233], SeqNo::MAX, &default_comparator())?
         );
         assert_eq!(
             Some(items.last().cloned().unwrap()),
-            data_block.point_read(&[255, 255, 0], SeqNo::MAX, &default_comparator())
+            data_block.point_read(&[255, 255, 0], SeqNo::MAX, &default_comparator())?
         );
         assert_eq!(
             None,
-            data_block.point_read(b"yyy", SeqNo::MAX, &default_comparator())
+            data_block.point_read(b"yyy", SeqNo::MAX, &default_comparator())?
         );
 
         Ok(())
@@ -1481,15 +1523,15 @@ mod tests {
 
         assert_eq!(
             Some(items.get(1).cloned().unwrap()),
-            data_block.point_read(&[233, 233], SeqNo::MAX, &default_comparator())
+            data_block.point_read(&[233, 233], SeqNo::MAX, &default_comparator())?
         );
         assert_eq!(
             Some(items.last().cloned().unwrap()),
-            data_block.point_read(&[255, 255, 0], SeqNo::MAX, &default_comparator())
+            data_block.point_read(&[255, 255, 0], SeqNo::MAX, &default_comparator())?
         );
         assert_eq!(
             None,
-            data_block.point_read(b"yyy", SeqNo::MAX, &default_comparator())
+            data_block.point_read(b"yyy", SeqNo::MAX, &default_comparator())?
         );
 
         Ok(())
@@ -1533,15 +1575,15 @@ mod tests {
 
         assert_eq!(
             Some(items.get(1).cloned().unwrap()),
-            data_block.point_read(&[233, 233], SeqNo::MAX, &default_comparator())
+            data_block.point_read(&[233, 233], SeqNo::MAX, &default_comparator())?
         );
         assert_eq!(
             Some(items.last().cloned().unwrap()),
-            data_block.point_read(&[255, 255, 0], SeqNo::MAX, &default_comparator())
+            data_block.point_read(&[255, 255, 0], SeqNo::MAX, &default_comparator())?
         );
         assert_eq!(
             None,
-            data_block.point_read(b"yyy", SeqNo::MAX, &default_comparator())
+            data_block.point_read(b"yyy", SeqNo::MAX, &default_comparator())?
         );
 
         Ok(())
@@ -1578,13 +1620,13 @@ mod tests {
                     &needle.key.user_key,
                     needle.key.seqno + 1,
                     &default_comparator()
-                ),
+                )?,
             );
         }
 
         assert_eq!(
             None,
-            data_block.point_read(b"yyy", SeqNo::MAX, &default_comparator())
+            data_block.point_read(b"yyy", SeqNo::MAX, &default_comparator())?
         );
 
         Ok(())
@@ -1622,7 +1664,7 @@ mod tests {
 
         assert!(
             data_block
-                .point_read(b"pla:venus:fact", SeqNo::MAX, &default_comparator())
+                .point_read(b"pla:venus:fact", SeqNo::MAX, &default_comparator())?
                 .expect("should exist")
                 .is_tombstone()
         );
@@ -1672,13 +1714,13 @@ mod tests {
                     &needle.key.user_key,
                     needle.key.seqno + 1,
                     &default_comparator()
-                ),
+                )?,
             );
         }
 
         assert_eq!(
             None,
-            data_block.point_read(b"yyy", SeqNo::MAX, &default_comparator())
+            data_block.point_read(b"yyy", SeqNo::MAX, &default_comparator())?
         );
 
         Ok(())
@@ -1715,28 +1757,28 @@ mod tests {
             // seqno=4 → should see version with seqno=3 (first with seqno < 4)
             assert_eq!(
                 Some(items[2].clone()),
-                data_block.point_read(b"a", 4, &default_comparator()),
+                data_block.point_read(b"a", 4, &default_comparator())?,
                 "restart_interval={restart_interval}: seqno=4 should return v3",
             );
 
             // seqno=3 → should see version with seqno=2
             assert_eq!(
                 Some(items[3].clone()),
-                data_block.point_read(b"a", 3, &default_comparator()),
+                data_block.point_read(b"a", 3, &default_comparator())?,
                 "restart_interval={restart_interval}: seqno=3 should return v2",
             );
 
             // seqno=6 → should see latest version (seqno=5)
             assert_eq!(
                 Some(items[0].clone()),
-                data_block.point_read(b"a", 6, &default_comparator()),
+                data_block.point_read(b"a", 6, &default_comparator())?,
                 "restart_interval={restart_interval}: seqno=6 should return v5",
             );
 
             // seqno=1 → no visible version (all seqno >= 1)
             assert!(
                 data_block
-                    .point_read(b"a", 1, &default_comparator())
+                    .point_read(b"a", 1, &default_comparator())?
                     .is_none(),
                 "restart_interval={restart_interval}: seqno=1 should return None",
             );
@@ -1744,7 +1786,7 @@ mod tests {
             // Non-existent key
             assert!(
                 data_block
-                    .point_read(b"b", SeqNo::MAX, &default_comparator())
+                    .point_read(b"b", SeqNo::MAX, &default_comparator())?
                     .is_none(),
                 "restart_interval={restart_interval}: key 'b' should not exist",
             );
@@ -1784,24 +1826,152 @@ mod tests {
             // Read "b" at seqno=4 → should return version with seqno=3
             assert_eq!(
                 Some(items[5].clone()),
-                data_block.point_read(b"b", 4, &default_comparator()),
+                data_block.point_read(b"b", 4, &default_comparator())?,
                 "restart_interval={restart_interval}: b@4 should return b3",
             );
 
             // Read "a" at seqno=2 → should return version with seqno=1
             assert_eq!(
                 Some(items[2].clone()),
-                data_block.point_read(b"a", 2, &default_comparator()),
+                data_block.point_read(b"a", 2, &default_comparator())?,
                 "restart_interval={restart_interval}: a@2 should return a1",
             );
 
             // Read "c" at seqno=2 → should return version with seqno=1
             assert_eq!(
                 Some(items[8].clone()),
-                data_block.point_read(b"c", 2, &default_comparator()),
+                data_block.point_read(b"c", 2, &default_comparator())?,
                 "restart_interval={restart_interval}: c@2 should return c1",
             );
         }
+
+        Ok(())
+    }
+
+    #[test]
+    fn try_iter_zero_restart_interval_returns_invalid_trailer() -> crate::Result<()> {
+        use crate::table::block::Trailer;
+
+        let items = [InternalValue::from_components(b"a", b"v", 0, Value)];
+        let mut bytes = DataBlock::encode_into_vec(&items, 1, 0.0)?;
+
+        let block = Block {
+            data: bytes.clone().into(),
+            header: Header {
+                block_type: BlockType::Data,
+                checksum: Checksum::from_raw(0),
+                data_length: 0,
+                uncompressed_length: 0,
+            },
+        };
+        let trailer_offset = Trailer::new(&block).trailer_offset();
+        bytes[trailer_offset] = 0;
+
+        let corrupt_block = DataBlock::new(Block {
+            data: bytes.into(),
+            header: Header {
+                block_type: BlockType::Data,
+                checksum: Checksum::from_raw(0),
+                data_length: 0,
+                uncompressed_length: 0,
+            },
+        });
+
+        assert!(
+            matches!(
+                corrupt_block.try_iter(default_comparator()),
+                Err(crate::Error::InvalidTrailer)
+            ),
+            "zero restart_interval must return InvalidTrailer",
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn point_read_zero_restart_interval_returns_invalid_trailer() -> crate::Result<()> {
+        use crate::table::block::Trailer;
+
+        let items = [InternalValue::from_components(b"a", b"v", 0, Value)];
+        let mut bytes = DataBlock::encode_into_vec(&items, 1, 0.0)?;
+
+        let block = Block {
+            data: bytes.clone().into(),
+            header: Header {
+                block_type: BlockType::Data,
+                checksum: Checksum::from_raw(0),
+                data_length: 0,
+                uncompressed_length: 0,
+            },
+        };
+        let trailer_offset = Trailer::new(&block).trailer_offset();
+        bytes[trailer_offset] = 0;
+
+        let corrupt_block = DataBlock::new(Block {
+            data: bytes.into(),
+            header: Header {
+                block_type: BlockType::Data,
+                checksum: Checksum::from_raw(0),
+                data_length: 0,
+                uncompressed_length: 0,
+            },
+        });
+
+        assert!(
+            matches!(
+                corrupt_block.point_read(b"a", SeqNo::MAX, &default_comparator()),
+                Err(crate::Error::InvalidTrailer)
+            ),
+            "point_read on corrupt block must return InvalidTrailer",
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn point_read_zero_restart_interval_hash_path_returns_invalid_trailer() -> crate::Result<()> {
+        use crate::table::block::Trailer;
+
+        // Use hash_index_ratio > 0 so the hash-index fast path is exercised.
+        let items = [InternalValue::from_components(b"a", b"v", 0, Value)];
+        let mut bytes = DataBlock::encode_into_vec(&items, 1, 1.33)?;
+
+        let original_block = DataBlock::new(Block {
+            data: bytes.clone().into(),
+            header: Header {
+                block_type: BlockType::Data,
+                checksum: Checksum::from_raw(0),
+                data_length: 0,
+                uncompressed_length: 0,
+            },
+        });
+        assert!(
+            original_block.hash_bucket_count().is_some(),
+            "test fixture must build a hash index so point_read takes the hash fast path",
+        );
+        let trailer_offset = Trailer::new(&original_block.inner).trailer_offset();
+        bytes[trailer_offset] = 0;
+
+        let corrupt_block = DataBlock::new(Block {
+            data: bytes.into(),
+            header: Header {
+                block_type: BlockType::Data,
+                checksum: Checksum::from_raw(0),
+                data_length: 0,
+                uncompressed_length: 0,
+            },
+        });
+
+        // The upfront Decoder::try_new guard must reject the block before
+        // get_hash_index_reader() / get_binary_index_reader() touch the
+        // corrupt trailer.
+        assert!(
+            matches!(
+                corrupt_block.point_read(b"a", SeqNo::MAX, &default_comparator()),
+                Err(crate::Error::InvalidTrailer)
+            ),
+            "point_read with hash index on corrupt block must return InvalidTrailer",
+        );
 
         Ok(())
     }
