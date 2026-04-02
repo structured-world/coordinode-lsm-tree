@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1774963659527,
+  "lastUpdate": 1775157161094,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -4602,6 +4602,84 @@ window.BENCHMARK_DATA = {
             "value": 254420.498847161,
             "unit": "ops/sec (normalized)",
             "extra": "raw: 468375 ops/sec | factor: 0.543 | P50: 2.0us | P99: 4.1us | P99.9: 13.9us\nthreads: 1 | elapsed: 0.43s | num: 200000 | iterations: 3 | runner: seq_wr=239464 rand_rd=924917 cpu=123 composite=42341.8"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "617a2f49557232f72a455b411dc7ea275637bf3e",
+          "message": "refactor(table): make block decoder trailer validation fallible (#199)\n\n## Summary\n\n- Introduce `Decoder::try_new` that returns `Error::InvalidTrailer` on\nundersized blocks, zero `restart_interval`, invalid\n`binary_index_step_size`, or corrupt binary/hash-index layout metadata\n- Add `Trailer::try_new` size guard to prevent underflow on truncated\nblocks; `Trailer::new` delegates to `try_new` (panic instead of UB)\n- Add `DataBlock::try_iter` / `IndexBlock::try_iter` fallible wrappers\nand wire all table-reader validation paths through them\n- `FullBlockIndex::new` validates block type and trailer at construction\ntime; the pinned filter index does the same at load time\n- `DataBlock::point_read` returns `Result<Option<InternalValue>>`\n(breaking change from `Option<InternalValue>`) so trailer corruption is\nsurfaced instead of silently skipped\n- `Scanner`, `table::Iter`, `TwoLevelBlockIndex::Iter`, and\n`VolatileBlockIndex::Iter` are poisoned on all error paths so callers\ncannot silently skip corrupt blocks\n- Add corruption regression tests that tamper trailer fields and assert\nstructured error (no panic)\n\n## Test plan\n\n- [x] 1026/1026 tests pass with `cargo nextest run`\n- [x] 8 corruption regression tests verify `Error::InvalidTrailer` for\ntampered blocks\n- [x] `cargo clippy --all-features -- -D warnings` passes\n- [x] `cargo fmt --all -- --check` passes\n\n## Related\n\n- #193 — make meta block field reads fallible (out of scope for this PR)\n- #194 — two-level index scan stops prematurely on empty child\npartitions (pre-existing, out of scope)\n- #195 — blob file metadata corruption regression test (out of scope)\n- #196 — make index block bound-cursor helpers fallible (pre-existing\nAPI, out of scope)\n- #197 — add infallible OwnedIndexBlockIter constructor for\npre-validated blocks (out of scope)\n- #198 — validate block type on cache-hit path (pre-existing, out of\nscope)\n\nSupersedes #191 (closed — too many review threads).\n\nCloses #184\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n## Summary by CodeRabbit\n\n* **Bug Fixes**\n* Stronger validation rejects malformed/corrupt block trailers, indexes,\nand metadata earlier, returning clear errors instead of silently\nfailing.\n* Iteration, scanning and readers now surface the first encountered\nerror, halt further reads, and avoid silent data loss.\n* Point-reads and recovery now propagate decoding errors rather than\ntreating corrupted data as “not found.”\n\n* **Tests**\n* Added regression tests to assert invalid trailers, corrupted layouts,\nand related error paths are detected and reported.\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-04-02T22:11:20+03:00",
+          "tree_id": "b735954b36fc565d76c7056d9887d5e2cb0c2d4f",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/617a2f49557232f72a455b411dc7ea275637bf3e"
+        },
+        "date": 1775157159788,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 1177142.7219108867,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 2087989 ops/sec | factor: 0.564 | P50: 0.3us | P99: 1.9us | P99.9: 4.9us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3 | runner: seq_wr=217874 rand_rd=904919 cpu=123 composite=40796.9"
+          },
+          {
+            "name": "fillrandom",
+            "value": 659267.3531171128,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 1169393 ops/sec | factor: 0.564 | P50: 0.7us | P99: 2.5us | P99.9: 5.9us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3 | runner: seq_wr=217874 rand_rd=904919 cpu=123 composite=40796.9"
+          },
+          {
+            "name": "readrandom",
+            "value": 299141.4929523825,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 530610 ops/sec | factor: 0.564 | P50: 1.7us | P99: 5.1us | P99.9: 13.2us\nthreads: 1 | elapsed: 0.38s | num: 200000 | iterations: 3 | runner: seq_wr=217874 rand_rd=904919 cpu=123 composite=40796.9"
+          },
+          {
+            "name": "readseq",
+            "value": 1462483.2581787338,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 2594119 ops/sec | factor: 0.564 | P50: 0.2us | P99: 3.8us | P99.9: 7.8us\nthreads: 1 | elapsed: 0.08s | num: 200000 | iterations: 3 | runner: seq_wr=217874 rand_rd=904919 cpu=123 composite=40796.9"
+          },
+          {
+            "name": "seekrandom",
+            "value": 202446.01625093337,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 359094 ops/sec | factor: 0.564 | P50: 2.4us | P99: 6.0us | P99.9: 14.0us\nthreads: 1 | elapsed: 0.56s | num: 200000 | iterations: 3 | runner: seq_wr=217874 rand_rd=904919 cpu=123 composite=40796.9"
+          },
+          {
+            "name": "prefixscan",
+            "value": 107022.82697559228,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 189835 ops/sec | factor: 0.564 | P50: 4.9us | P99: 7.1us | P99.9: 16.3us\nthreads: 1 | elapsed: 1.05s | num: 200000 | iterations: 3 | runner: seq_wr=217874 rand_rd=904919 cpu=123 composite=40796.9"
+          },
+          {
+            "name": "overwrite",
+            "value": 678599.6523813711,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 1203684 ops/sec | factor: 0.564 | P50: 0.7us | P99: 2.5us | P99.9: 6.1us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3 | runner: seq_wr=217874 rand_rd=904919 cpu=123 composite=40796.9"
+          },
+          {
+            "name": "mergerandom",
+            "value": 416274.22632071265,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 738378 ops/sec | factor: 0.564 | P50: 0.3us | P99: 1.9us | P99.9: 3.4us\nthreads: 1 | elapsed: 0.27s | num: 200000 | iterations: 3 | runner: seq_wr=217874 rand_rd=904919 cpu=123 composite=40796.9"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 271257.4146247556,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 481150 ops/sec | factor: 0.564 | P50: 1.9us | P99: 5.0us | P99.9: 13.6us\nthreads: 1 | elapsed: 0.42s | num: 200000 | iterations: 3 | runner: seq_wr=217874 rand_rd=904919 cpu=123 composite=40796.9"
           }
         ]
       }
