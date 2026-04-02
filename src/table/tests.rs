@@ -2108,7 +2108,14 @@ fn bloom_may_contain_key_partitioned_filter() -> crate::Result<()> {
 /// We build a table with a partitioned (two-level) index containing multiple
 /// child partitions and then iterate through the block index with bounds that
 /// span several partitions. Both forward (`next`) and reverse (`next_back`)
-/// directions are verified to yield the correct number of block handles.
+/// directions are verified to yield the correct block handle sequences.
+///
+/// NOTE: With well-formed data and `restart_interval=1` (default), the TLI
+/// and child partitions use the same seek precision, so `Ok(None)` on a
+/// child is not triggered naturally. The fix is a defensive loop that
+/// guards against coarser seeks (`restart_interval > 1`) and edge cases
+/// in `seek_upper_bound_cursor`. This test validates overall iteration
+/// correctness rather than the exact `Ok(None)` path.
 #[test]
 #[expect(clippy::unwrap_used)]
 fn two_level_index_scan_skips_empty_child_partition() -> crate::Result<()> {
