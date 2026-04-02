@@ -201,7 +201,7 @@ impl IndexBlock {
 }
 
 #[cfg(test)]
-#[expect(clippy::unwrap_used, reason = "test code")]
+#[expect(clippy::unwrap_used, clippy::indexing_slicing, reason = "test code")]
 mod tests {
     use super::*;
     use crate::table::BlockHandle;

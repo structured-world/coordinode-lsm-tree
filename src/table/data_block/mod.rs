@@ -635,7 +635,7 @@ impl DataBlock {
 }
 
 #[cfg(test)]
-#[expect(clippy::expect_used)]
+#[expect(clippy::expect_used, clippy::indexing_slicing)]
 mod tests {
     use super::DataBlockParsedItem;
     use crate::comparator::default_comparator;
