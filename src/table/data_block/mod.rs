@@ -472,7 +472,7 @@ impl DataBlock {
     /// Returns [`crate::Error::InvalidTrailer`] if the block trailer is
     /// malformed.
     ///
-    /// # Breaking change (v5)
+    /// # Breaking change
     ///
     /// Previously returned `Option<InternalValue>`; now returns
     /// `Result<Option<InternalValue>>` so trailer corruption is surfaced
