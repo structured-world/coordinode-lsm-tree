@@ -2,10 +2,10 @@
 // This source code is licensed under both the Apache 2.0 and MIT License
 // (found in the LICENSE-* files in the repository)
 
-use super::{TRAILER_START_MARKER, binary_index::Reader as BinaryIndexReader};
+use super::{binary_index::Reader as BinaryIndexReader, TRAILER_START_MARKER};
 use crate::{
+    table::{block::Trailer, Block},
     SeqNo, Slice,
-    table::{Block, block::Trailer},
 };
 use byteorder::{LittleEndian, ReadBytesExt};
 use std::{io::Cursor, marker::PhantomData};
@@ -133,9 +133,11 @@ impl<'a, Item: Decodable<Parsed>, Parsed: ParsedItem<Item>> Decoder<'a, Item, Pa
     ///
     /// # Errors
     ///
-    /// Returns [`crate::Error::InvalidTrailer`] when the on-disk
-    /// `restart_interval` is zero or the `binary_index_step_size` is not 2 or
-    /// 4.
+    /// Returns [`crate::Error::InvalidTrailer`] when:
+    /// - the block is too small to contain a trailer,
+    /// - `restart_interval` is zero,
+    /// - `binary_index_step_size` is not 2 or 4, or
+    /// - binary/hash-index layout metadata is inconsistent.
     pub fn try_new(block: &'a Block) -> crate::Result<Self> {
         let trailer = Trailer::try_new(block)?;
         let mut reader = trailer.as_slice();
@@ -969,13 +971,13 @@ impl<Item: Decodable<Parsed>, Parsed: ParsedItem<Item>> DoubleEndedIterator
 mod tests {
     use super::Decoder;
     use crate::{
-        Checksum, InternalValue,
         table::{
-            Block, BlockHandle, BlockOffset, DataBlock, IndexBlock, KeyedBlockHandle,
             block::{BlockType, Header, Trailer},
             data_block::DataBlockParsedItem,
             index_block::IndexBlockParsedItem,
+            Block, BlockHandle, BlockOffset, DataBlock, IndexBlock, KeyedBlockHandle,
         },
+        Checksum, InternalValue,
     };
     use byteorder::{ByteOrder, LittleEndian};
 
