@@ -65,6 +65,8 @@ pub struct Iter {
 
     #[cfg(feature = "metrics")]
     pub(crate) metrics: Arc<Metrics>,
+
+    poisoned: bool,
 }
 
 impl Iter {
@@ -85,7 +87,17 @@ impl Iter {
 
             #[cfg(feature = "metrics")]
             metrics: index.metrics.clone(),
+            poisoned: false,
         }
+    }
+
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "matches Iterator::next return type"
+    )]
+    fn poison<E: Into<crate::Error>>(&mut self, err: E) -> Option<crate::Result<KeyedBlockHandle>> {
+        self.poisoned = true;
+        Some(Err(err.into()))
     }
 }
 
@@ -105,10 +117,14 @@ impl Iterator for Iter {
     type Item = crate::Result<KeyedBlockHandle>;
 
     fn next(&mut self) -> Option<Self::Item> {
+        if self.poisoned {
+            return None;
+        }
+
         if let Some(inner) = &mut self.inner {
             inner.next().map(Ok)
         } else {
-            let block = fail_iter!(load_block(
+            let block = match load_block(
                 self.table_id,
                 &self.path,
                 &self.file_accessor,
@@ -121,17 +137,24 @@ impl Iterator for Iter {
                 None,
                 #[cfg(feature = "metrics")]
                 &self.metrics,
-            ));
+            ) {
+                Ok(b) => b,
+                Err(e) => return self.poison(e),
+            };
             let index_block = IndexBlock::new(block);
             let lo = self.lo.as_ref().map(|(k, s)| (k.as_ref(), *s));
             let hi = self.hi.as_ref().map(|(k, s)| (k.as_ref(), *s));
 
-            let mut iter = fail_iter!(OwnedIndexBlockIter::from_block_with_bounds(
+            let mut iter = match OwnedIndexBlockIter::from_block_with_bounds(
                 index_block,
                 self.comparator.clone(),
                 lo,
                 hi,
-            ))?;
+            ) {
+                Ok(Some(it)) => it,
+                Ok(None) => return None,
+                Err(e) => return self.poison(e),
+            };
 
             let next_item = iter.next().map(Ok);
 
@@ -144,10 +167,14 @@ impl Iterator for Iter {
 
 impl DoubleEndedIterator for Iter {
     fn next_back(&mut self) -> Option<Self::Item> {
+        if self.poisoned {
+            return None;
+        }
+
         if let Some(inner) = &mut self.inner {
             inner.next_back().map(Ok)
         } else {
-            let block = fail_iter!(load_block(
+            let block = match load_block(
                 self.table_id,
                 &self.path,
                 &self.file_accessor,
@@ -160,17 +187,24 @@ impl DoubleEndedIterator for Iter {
                 None,
                 #[cfg(feature = "metrics")]
                 &self.metrics,
-            ));
+            ) {
+                Ok(b) => b,
+                Err(e) => return self.poison(e),
+            };
             let index_block = IndexBlock::new(block);
             let lo = self.lo.as_ref().map(|(k, s)| (k.as_ref(), *s));
             let hi = self.hi.as_ref().map(|(k, s)| (k.as_ref(), *s));
 
-            let mut iter = fail_iter!(OwnedIndexBlockIter::from_block_with_bounds(
+            let mut iter = match OwnedIndexBlockIter::from_block_with_bounds(
                 index_block,
                 self.comparator.clone(),
                 lo,
                 hi,
-            ))?;
+            ) {
+                Ok(Some(it)) => it,
+                Ok(None) => return None,
+                Err(e) => return self.poison(e),
+            };
 
             let next_item = iter.next_back().map(Ok);
 
