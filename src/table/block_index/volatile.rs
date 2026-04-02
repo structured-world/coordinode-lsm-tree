@@ -99,6 +99,45 @@ impl Iter {
         self.poisoned = true;
         Some(Err(err.into()))
     }
+
+    /// Lazily loads the index block and initialises the bounded iterator.
+    ///
+    /// On `Ok(None)` (empty range) the iterator is marked exhausted so
+    /// subsequent `next()` / `next_back()` calls return `None` without
+    /// re-loading the block from disk.
+    fn init_inner(&mut self) -> crate::Result<Option<OwnedIndexBlockIter>> {
+        let block = load_block(
+            self.table_id,
+            &self.path,
+            &self.file_accessor,
+            &self.cache,
+            &self.handle,
+            BlockType::Index,
+            self.compression,
+            self.encryption.as_deref(),
+            #[cfg(zstd_any)]
+            None,
+            #[cfg(feature = "metrics")]
+            &self.metrics,
+        )?;
+        let index_block = IndexBlock::new(block);
+        let lo = self.lo.as_ref().map(|(k, s)| (k.as_ref(), *s));
+        let hi = self.hi.as_ref().map(|(k, s)| (k.as_ref(), *s));
+
+        let iter = OwnedIndexBlockIter::from_block_with_bounds(
+            index_block,
+            self.comparator.clone(),
+            lo,
+            hi,
+        )?;
+
+        if iter.is_none() {
+            // Empty range: mark exhausted to prevent repeated I/O.
+            self.poisoned = true;
+        }
+
+        Ok(iter)
+    }
 }
 
 impl BlockIndexIter for Iter {
@@ -124,42 +163,14 @@ impl Iterator for Iter {
         if let Some(inner) = &mut self.inner {
             inner.next().map(Ok)
         } else {
-            let block = match load_block(
-                self.table_id,
-                &self.path,
-                &self.file_accessor,
-                &self.cache,
-                &self.handle,
-                BlockType::Index,
-                self.compression,
-                self.encryption.as_deref(),
-                #[cfg(zstd_any)]
-                None,
-                #[cfg(feature = "metrics")]
-                &self.metrics,
-            ) {
-                Ok(b) => b,
-                Err(e) => return self.poison(e),
-            };
-            let index_block = IndexBlock::new(block);
-            let lo = self.lo.as_ref().map(|(k, s)| (k.as_ref(), *s));
-            let hi = self.hi.as_ref().map(|(k, s)| (k.as_ref(), *s));
-
-            let mut iter = match OwnedIndexBlockIter::from_block_with_bounds(
-                index_block,
-                self.comparator.clone(),
-                lo,
-                hi,
-            ) {
+            let mut iter = match self.init_inner() {
                 Ok(Some(it)) => it,
                 Ok(None) => return None,
                 Err(e) => return self.poison(e),
             };
 
             let next_item = iter.next().map(Ok);
-
             self.inner = Some(iter);
-
             next_item
         }
     }
@@ -174,42 +185,14 @@ impl DoubleEndedIterator for Iter {
         if let Some(inner) = &mut self.inner {
             inner.next_back().map(Ok)
         } else {
-            let block = match load_block(
-                self.table_id,
-                &self.path,
-                &self.file_accessor,
-                &self.cache,
-                &self.handle,
-                BlockType::Index,
-                self.compression,
-                self.encryption.as_deref(),
-                #[cfg(zstd_any)]
-                None,
-                #[cfg(feature = "metrics")]
-                &self.metrics,
-            ) {
-                Ok(b) => b,
-                Err(e) => return self.poison(e),
-            };
-            let index_block = IndexBlock::new(block);
-            let lo = self.lo.as_ref().map(|(k, s)| (k.as_ref(), *s));
-            let hi = self.hi.as_ref().map(|(k, s)| (k.as_ref(), *s));
-
-            let mut iter = match OwnedIndexBlockIter::from_block_with_bounds(
-                index_block,
-                self.comparator.clone(),
-                lo,
-                hi,
-            ) {
+            let mut iter = match self.init_inner() {
                 Ok(Some(it)) => it,
                 Ok(None) => return None,
                 Err(e) => return self.poison(e),
             };
 
             let next_item = iter.next_back().map(Ok);
-
             self.inner = Some(iter);
-
             next_item
         }
     }
