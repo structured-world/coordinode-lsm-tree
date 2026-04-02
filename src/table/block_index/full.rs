@@ -4,7 +4,9 @@
 
 use crate::SeqNo;
 use crate::comparator::SharedComparator;
+use crate::table::block::Decoder;
 use crate::table::block_index::{BlockIndexIter, iter::OwnedIndexBlockIter};
+use crate::table::index_block::IndexBlockParsedItem;
 use crate::table::{IndexBlock, KeyedBlockHandle};
 
 /// Index that translates item keys to data block handles
@@ -16,8 +18,21 @@ pub struct FullBlockIndex {
 }
 
 impl FullBlockIndex {
-    pub fn new(block: IndexBlock, comparator: SharedComparator) -> Self {
-        Self { block, comparator }
+    /// Creates a new full block index.
+    ///
+    /// Eagerly validates the block trailer so that subsequent `iter()` calls
+    /// cannot panic on malformed blocks.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error::InvalidTrailer`] if the block trailer is
+    /// malformed.
+    pub fn new(block: IndexBlock, comparator: SharedComparator) -> crate::Result<Self> {
+        // Validate trailer layout once at construction so later iter() calls
+        // cannot panic. Block type is the caller's responsibility (checked by
+        // read_tli / filter_tli path before reaching here).
+        Decoder::<KeyedBlockHandle, IndexBlockParsedItem>::try_new(&block.inner)?;
+        Ok(Self { block, comparator })
     }
 
     pub fn inner(&self) -> &IndexBlock {
@@ -34,10 +49,12 @@ impl FullBlockIndex {
     }
 
     pub fn iter(&self) -> Iter {
-        Iter(OwnedIndexBlockIter::from_block(
-            self.block.clone(),
-            self.comparator.clone(),
-        ))
+        // Invariant: trailer was validated in `new`, so `from_block` cannot fail.
+        #[expect(clippy::expect_used, reason = "trailer validated at construction")]
+        Iter(
+            OwnedIndexBlockIter::from_block(self.block.clone(), self.comparator.clone())
+                .expect("trailer validated at construction"),
+        )
     }
 }
 

@@ -102,6 +102,22 @@ impl IndexBlock {
         Trailer::new(&self.inner).item_count()
     }
 
+    /// Creates a fallible iterator over the index block.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error::InvalidTrailer`] if the block trailer is
+    /// malformed (e.g. `restart_interval == 0`).
+    pub fn try_iter(
+        &self,
+        comparator: crate::comparator::SharedComparator,
+    ) -> crate::Result<Iter<'_>> {
+        Ok(Iter::new(
+            Decoder::<KeyedBlockHandle, IndexBlockParsedItem>::try_new(&self.inner)?,
+            comparator,
+        ))
+    }
+
     #[must_use]
     pub fn iter(&self, comparator: crate::comparator::SharedComparator) -> Iter<'_> {
         Iter::new(
@@ -225,5 +241,45 @@ mod tests {
             panic!("restart interval of zero must be rejected");
         };
         assert!(matches!(err, crate::Error::Io(e) if e.kind() == ErrorKind::InvalidInput));
+    }
+
+    #[test]
+    fn try_iter_zero_restart_interval_returns_invalid_trailer() {
+        use crate::Checksum;
+        use crate::table::block::{BlockType, Header, Trailer};
+
+        let handles = make_shared_prefix_handles(4);
+        let mut bytes = IndexBlock::encode_into_vec_with_restart_interval(&handles, 2).unwrap();
+
+        let block = Block {
+            data: bytes.clone().into(),
+            header: Header {
+                block_type: BlockType::Index,
+                checksum: Checksum::from_raw(0),
+                data_length: 0,
+                uncompressed_length: 0,
+            },
+        };
+        let trailer_offset = Trailer::new(&block).trailer_offset();
+        bytes[trailer_offset] = 0;
+
+        let corrupt_index = IndexBlock::new(Block {
+            data: bytes.into(),
+            header: Header {
+                block_type: BlockType::Index,
+                checksum: Checksum::from_raw(0),
+                data_length: 0,
+                uncompressed_length: 0,
+            },
+        });
+
+        let cmp = crate::comparator::default_comparator();
+        assert!(
+            matches!(
+                corrupt_index.try_iter(cmp),
+                Err(crate::Error::InvalidTrailer)
+            ),
+            "zero restart_interval must return InvalidTrailer",
+        );
     }
 }

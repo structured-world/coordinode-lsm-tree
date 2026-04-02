@@ -126,12 +126,12 @@ impl Iterator for Iter {
             let lo = self.lo.as_ref().map(|(k, s)| (k.as_ref(), *s));
             let hi = self.hi.as_ref().map(|(k, s)| (k.as_ref(), *s));
 
-            let mut iter = OwnedIndexBlockIter::from_block_with_bounds(
+            let mut iter = fail_iter!(OwnedIndexBlockIter::from_block_with_bounds(
                 index_block,
                 self.comparator.clone(),
                 lo,
                 hi,
-            )?;
+            ))?;
 
             let next_item = iter.next().map(Ok);
 
@@ -165,12 +165,12 @@ impl DoubleEndedIterator for Iter {
             let lo = self.lo.as_ref().map(|(k, s)| (k.as_ref(), *s));
             let hi = self.hi.as_ref().map(|(k, s)| (k.as_ref(), *s));
 
-            let mut iter = OwnedIndexBlockIter::from_block_with_bounds(
+            let mut iter = fail_iter!(OwnedIndexBlockIter::from_block_with_bounds(
                 index_block,
                 self.comparator.clone(),
                 lo,
                 hi,
-            )?;
+            ))?;
 
             let next_item = iter.next_back().map(Ok);
 

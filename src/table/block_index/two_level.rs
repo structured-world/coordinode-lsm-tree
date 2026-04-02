@@ -56,6 +56,7 @@ impl TwoLevelBlockIndex {
 
             #[cfg(feature = "metrics")]
             metrics: self.metrics.clone(),
+            poisoned: false,
         }
     }
 }
@@ -80,10 +81,21 @@ pub struct Iter {
 
     #[cfg(feature = "metrics")]
     metrics: Arc<Metrics>,
+
+    poisoned: bool,
 }
 
 impl Iter {
-    fn init_tli(&mut self) -> bool {
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "matches Iterator::next return type"
+    )]
+    fn poison<E: Into<crate::Error>>(&mut self, err: E) -> Option<crate::Result<KeyedBlockHandle>> {
+        self.poisoned = true;
+        Some(Err(err.into()))
+    }
+
+    fn init_tli(&mut self) -> crate::Result<bool> {
         let lo = self.lo.as_ref().map(|(k, s)| (k.as_ref(), *s));
         let hi = self.hi.as_ref().map(|(k, s)| (k.as_ref(), *s));
 
@@ -92,11 +104,11 @@ impl Iter {
             self.comparator.clone(),
             lo,
             hi,
-        ) {
+        )? {
             self.tli = Some(it);
-            true
+            Ok(true)
         } else {
-            false
+            Ok(false)
         }
     }
 }
@@ -117,21 +129,29 @@ impl Iterator for Iter {
     type Item = crate::Result<KeyedBlockHandle>;
 
     fn next(&mut self) -> Option<Self::Item> {
+        if self.poisoned {
+            return None;
+        }
+
         if let Some(lo_block) = &mut self.lo_consumer
             && let Some(item) = lo_block.next()
         {
             return Some(Ok(item));
         }
 
-        if self.tli.is_none() && !self.init_tli() {
-            return None;
+        if self.tli.is_none() {
+            match self.init_tli() {
+                Ok(true) => {}
+                Ok(false) => return None,
+                Err(e) => return self.poison(e),
+            }
         }
 
         if let Some(tli) = &mut self.tli {
             let next_lowest_block = tli.next();
 
             if let Some(handle) = next_lowest_block {
-                let block = fail_iter!(load_block(
+                let block = match load_block(
                     self.table_id,
                     &self.path,
                     &self.file_accessor,
@@ -144,17 +164,26 @@ impl Iterator for Iter {
                     None,
                     #[cfg(feature = "metrics")]
                     &self.metrics,
-                ));
+                ) {
+                    Ok(b) => b,
+                    Err(e) => return self.poison(e),
+                };
                 let index_block = IndexBlock::new(block);
                 let lo = self.lo.as_ref().map(|(k, s)| (k.as_ref(), *s));
                 let hi = self.hi.as_ref().map(|(k, s)| (k.as_ref(), *s));
 
-                let mut iter = OwnedIndexBlockIter::from_block_with_bounds(
+                // TODO(#194): empty child partition (trimmed by lo/hi bounds) stops
+                // the scan via `?` instead of continuing to the next TLI entry.
+                let mut iter = match OwnedIndexBlockIter::from_block_with_bounds(
                     index_block,
                     self.comparator.clone(),
                     lo,
                     hi,
-                )?;
+                ) {
+                    Ok(Some(it)) => it,
+                    Ok(None) => return None,
+                    Err(e) => return self.poison(e),
+                };
 
                 let next_item = iter.next().map(Ok);
 
@@ -179,21 +208,29 @@ impl Iterator for Iter {
 
 impl DoubleEndedIterator for Iter {
     fn next_back(&mut self) -> Option<Self::Item> {
+        if self.poisoned {
+            return None;
+        }
+
         if let Some(hi_block) = &mut self.hi_consumer
             && let Some(item) = hi_block.next_back()
         {
             return Some(Ok(item));
         }
 
-        if self.tli.is_none() && !self.init_tli() {
-            return None;
+        if self.tli.is_none() {
+            match self.init_tli() {
+                Ok(true) => {}
+                Ok(false) => return None,
+                Err(e) => return self.poison(e),
+            }
         }
 
         if let Some(tli) = &mut self.tli {
             let next_highest_block = tli.next_back();
 
             if let Some(handle) = next_highest_block {
-                let block = fail_iter!(load_block(
+                let block = match load_block(
                     self.table_id,
                     &self.path,
                     &self.file_accessor,
@@ -206,17 +243,25 @@ impl DoubleEndedIterator for Iter {
                     None,
                     #[cfg(feature = "metrics")]
                     &self.metrics,
-                ));
+                ) {
+                    Ok(b) => b,
+                    Err(e) => return self.poison(e),
+                };
                 let index_block = IndexBlock::new(block);
                 let lo = self.lo.as_ref().map(|(k, s)| (k.as_ref(), *s));
                 let hi = self.hi.as_ref().map(|(k, s)| (k.as_ref(), *s));
 
-                let mut iter = OwnedIndexBlockIter::from_block_with_bounds(
+                // TODO(#194): same empty-partition issue as in next()
+                let mut iter = match OwnedIndexBlockIter::from_block_with_bounds(
                     index_block,
                     self.comparator.clone(),
                     lo,
                     hi,
-                )?;
+                ) {
+                    Ok(Some(it)) => it,
+                    Ok(None) => return None,
+                    Err(e) => return self.poison(e),
+                };
 
                 let next_item = iter.next_back().map(Ok);
 

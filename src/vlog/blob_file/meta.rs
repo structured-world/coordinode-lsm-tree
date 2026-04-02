@@ -16,7 +16,7 @@ use std::io::{Read, Write};
 macro_rules! read_u64 {
     ($block:expr, $name:expr, $cmp:expr) => {{
         let bytes = $block
-            .point_read($name, SeqNo::MAX, $cmp)
+            .point_read($name, SeqNo::MAX, $cmp)?
             .ok_or(crate::Error::InvalidHeader("BlobFileMeta"))?;
 
         let mut bytes = &bytes.value[..];
@@ -27,7 +27,7 @@ macro_rules! read_u64 {
 macro_rules! read_u128 {
     ($block:expr, $name:expr, $cmp:expr) => {{
         let bytes = $block
-            .point_read($name, SeqNo::MAX, $cmp)
+            .point_read($name, SeqNo::MAX, $cmp)?
             .ok_or(crate::Error::InvalidHeader("BlobFileMeta"))?;
 
         let mut bytes = &bytes.value[..];
@@ -146,7 +146,7 @@ impl Metadata {
 
         let version = {
             let bytes = block
-                .point_read(b"blob_file_version", SeqNo::MAX, &cmp)
+                .point_read(b"blob_file_version", SeqNo::MAX, &cmp)?
                 .ok_or(crate::Error::InvalidHeader("BlobFileMeta"))?;
             *bytes
                 .value
@@ -170,7 +170,7 @@ impl Metadata {
 
         let compression = {
             let bytes = block
-                .point_read(b"compression", SeqNo::MAX, &cmp)
+                .point_read(b"compression", SeqNo::MAX, &cmp)?
                 .ok_or(crate::Error::InvalidHeader("BlobFileMeta"))?;
 
             let mut bytes = &bytes.value[..];
@@ -179,11 +179,11 @@ impl Metadata {
 
         let key_range = KeyRange::new((
             block
-                .point_read(b"key#min", SeqNo::MAX, &cmp)
+                .point_read(b"key#min", SeqNo::MAX, &cmp)?
                 .ok_or(crate::Error::InvalidHeader("BlobFileMeta"))?
                 .value,
             block
-                .point_read(b"key#max", SeqNo::MAX, &cmp)
+                .point_read(b"key#max", SeqNo::MAX, &cmp)?
                 .ok_or(crate::Error::InvalidHeader("BlobFileMeta"))?
                 .value,
         ));

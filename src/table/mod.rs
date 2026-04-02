@@ -345,7 +345,7 @@ impl Table {
 
             let block = self.load_data_block(block_handle.as_ref())?;
 
-            if let Some(item) = block.point_read(key, seqno, &self.comparator) {
+            if let Some(item) = block.point_read(key, seqno, &self.comparator)? {
                 return Ok(Some(item));
             }
 
@@ -577,7 +577,7 @@ impl Table {
                 metadata.index_block_compression,
                 encryption.as_deref(),
             )?;
-            BlockIndexImpl::Full(FullBlockIndex::new(block, comparator.clone()))
+            BlockIndexImpl::Full(FullBlockIndex::new(block, comparator.clone())?)
         } else {
             log::trace!("Creating volatile, full block index");
 
@@ -605,7 +605,17 @@ impl Table {
                 #[cfg(zstd_any)]
                 None,
             )?;
-            Some(IndexBlock::new(block))
+            if block.header.block_type != BlockType::Index {
+                return Err(crate::Error::InvalidTag((
+                    "BlockType",
+                    block.header.block_type.into(),
+                )));
+            }
+            let idx = IndexBlock::new(block);
+            // Validate filter index trailer eagerly (same as FullBlockIndex::new)
+            // so later iter() calls cannot panic on malformed blocks.
+            idx.try_iter(comparator.clone())?;
+            Some(idx)
         } else {
             None
         };

@@ -89,8 +89,11 @@ impl DoubleEndedIterator for OwnedDataBlockIter {
     }
 }
 
-fn create_data_block_reader(block: DataBlock, comparator: SharedComparator) -> OwnedDataBlockIter {
-    OwnedDataBlockIter::new(block, |b| b.iter(comparator))
+fn create_data_block_reader(
+    block: DataBlock,
+    comparator: SharedComparator,
+) -> crate::Result<OwnedDataBlockIter> {
+    OwnedDataBlockIter::try_new(block, |b| b.try_iter(comparator))
 }
 
 pub struct Iter {
@@ -119,6 +122,11 @@ pub struct Iter {
     hi_data_block: Option<OwnedDataBlockIter>,
 
     range: Bounds,
+
+    /// Set on unrecoverable block-init error so subsequent `next()` /
+    /// `next_back()` calls return `None` instead of skipping past the
+    /// corrupt block.
+    poisoned: bool,
 
     #[cfg(feature = "metrics")]
     metrics: Arc<Metrics>,
@@ -166,6 +174,7 @@ impl Iter {
             hi_data_block: None,
 
             range: (None, None),
+            poisoned: false,
 
             #[cfg(feature = "metrics")]
             metrics,
@@ -181,10 +190,30 @@ impl Iter {
     }
 }
 
+impl Iter {
+    /// Marks the iterator as permanently failed so subsequent `next()` /
+    /// `next_back()` calls return `None` instead of skipping past the error.
+    ///
+    /// Returns `Some(Err(...))` so callers can `return self.poison(e)` directly
+    /// inside `Iterator::next`.
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "matches Iterator::next return type"
+    )]
+    fn poison<E: Into<crate::Error>>(&mut self, err: E) -> Option<crate::Result<InternalValue>> {
+        self.poisoned = true;
+        Some(Err(err.into()))
+    }
+}
+
 impl Iterator for Iter {
     type Item = crate::Result<InternalValue>;
 
     fn next(&mut self) -> Option<Self::Item> {
+        if self.poisoned {
+            return None;
+        }
+
         // Always try to keep iterating inside the already-materialized low data block first; this
         // lets callers consume multiple entries without touching the index or cache again.
         if let Some(block) = &mut self.lo_data_block
@@ -255,32 +284,39 @@ impl Iterator for Iter {
                 self.hi_data_block = None;
                 return None;
             };
-            let handle = fail_iter!(handle);
+            let handle = match handle {
+                Ok(h) => h,
+                Err(e) => return self.poison(e),
+            };
 
             // Load the next data block referenced by the index handle.  We try the shared block
             // cache first to avoid hitting the filesystem, and fall back to `load_block` on miss.
             let block = match self.cache.get_block(self.table_id, handle.offset()) {
                 Some(block) => block,
-                None => {
-                    fail_iter!(load_block(
-                        self.table_id,
-                        &self.path,
-                        &self.file_accessor,
-                        &self.cache,
-                        &BlockHandle::new(handle.offset(), handle.size()),
-                        crate::table::block::BlockType::Data,
-                        self.compression,
-                        self.encryption.as_deref(),
-                        #[cfg(zstd_any)]
-                        self.zstd_dictionary.as_deref(),
-                        #[cfg(feature = "metrics")]
-                        &self.metrics,
-                    ))
-                }
+                None => match load_block(
+                    self.table_id,
+                    &self.path,
+                    &self.file_accessor,
+                    &self.cache,
+                    &BlockHandle::new(handle.offset(), handle.size()),
+                    crate::table::block::BlockType::Data,
+                    self.compression,
+                    self.encryption.as_deref(),
+                    #[cfg(zstd_any)]
+                    self.zstd_dictionary.as_deref(),
+                    #[cfg(feature = "metrics")]
+                    &self.metrics,
+                ) {
+                    Ok(b) => b,
+                    Err(e) => return self.poison(e),
+                },
             };
             let block = DataBlock::new(block);
 
-            let mut reader = create_data_block_reader(block, self.comparator.clone());
+            let mut reader = match create_data_block_reader(block, self.comparator.clone()) {
+                Ok(r) => r,
+                Err(e) => return self.poison(e),
+            };
 
             // Forward path: seek the low side first to avoid returning entries below the lower
             // bound, then clamp the iterator on the high side. This guarantees iteration stays in
@@ -310,6 +346,10 @@ impl Iterator for Iter {
 
 impl DoubleEndedIterator for Iter {
     fn next_back(&mut self) -> Option<Self::Item> {
+        if self.poisoned {
+            return None;
+        }
+
         // Mirror the forward iterator: prefer consuming buffered items from the high data block to
         // avoid touching the index once a block has been materialized.
         if let Some(block) = &mut self.hi_data_block
@@ -375,32 +415,39 @@ impl DoubleEndedIterator for Iter {
                 self.hi_data_block = None;
                 return None;
             };
-            let handle = fail_iter!(handle);
+            let handle = match handle {
+                Ok(h) => h,
+                Err(e) => return self.poison(e),
+            };
 
             // Retrieve the next data block from the cache (or disk on miss) so the high-side reader
             // can serve entries in reverse order.
             let block = match self.cache.get_block(self.table_id, handle.offset()) {
                 Some(block) => block,
-                None => {
-                    fail_iter!(load_block(
-                        self.table_id,
-                        &self.path,
-                        &self.file_accessor,
-                        &self.cache,
-                        &BlockHandle::new(handle.offset(), handle.size()),
-                        crate::table::block::BlockType::Data,
-                        self.compression,
-                        self.encryption.as_deref(),
-                        #[cfg(zstd_any)]
-                        self.zstd_dictionary.as_deref(),
-                        #[cfg(feature = "metrics")]
-                        &self.metrics,
-                    ))
-                }
+                None => match load_block(
+                    self.table_id,
+                    &self.path,
+                    &self.file_accessor,
+                    &self.cache,
+                    &BlockHandle::new(handle.offset(), handle.size()),
+                    crate::table::block::BlockType::Data,
+                    self.compression,
+                    self.encryption.as_deref(),
+                    #[cfg(zstd_any)]
+                    self.zstd_dictionary.as_deref(),
+                    #[cfg(feature = "metrics")]
+                    &self.metrics,
+                ) {
+                    Ok(b) => b,
+                    Err(e) => return self.poison(e),
+                },
             };
             let block = DataBlock::new(block);
 
-            let mut reader = create_data_block_reader(block, self.comparator.clone());
+            let mut reader = match create_data_block_reader(block, self.comparator.clone()) {
+                Ok(r) => r,
+                Err(e) => return self.poison(e),
+            };
 
             // Reverse path: clamp the high side first so `next_back` never yields an entry above
             // the upper bound, then apply the low-side seek to avoid stepping below the lower

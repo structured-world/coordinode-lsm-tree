@@ -20,8 +20,16 @@ self_cell!(
 
 impl OwnedIndexBlockIter {
     /// Creates an owned iterator from a block and a comparator.
-    pub(crate) fn from_block(block: IndexBlock, comparator: SharedComparator) -> Self {
-        Self::new(block, |b| b.iter(comparator))
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error::InvalidTrailer`] if the block trailer is
+    /// malformed (e.g. `restart_interval == 0`).
+    pub(crate) fn from_block(
+        block: IndexBlock,
+        comparator: SharedComparator,
+    ) -> crate::Result<Self> {
+        Self::try_new(block, |b| b.try_iter(comparator))
     }
 
     /// Creates an owned iterator with optional lower/upper seek bounds.
@@ -38,22 +46,28 @@ impl OwnedIndexBlockIter {
     /// (`restart_interval > 1`) where upper-bound seeking trims the right
     /// edge of the active decoder window.
     ///
-    /// Returns `None` for `hi` only if that upper-bound cursor seek reports
-    /// failure.
+    /// Returns `Ok(None)` when the requested range is empty: if `lo > hi`,
+    /// if the lower-bound seek finds no entry, or if the upper-bound cursor
+    /// seek reports failure.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error::InvalidTrailer`] if the block trailer is
+    /// malformed.
     pub(crate) fn from_block_with_bounds(
         block: IndexBlock,
         comparator: SharedComparator,
         lo: Option<(&[u8], SeqNo)>,
         hi: Option<(&[u8], SeqNo)>,
-    ) -> Option<Self> {
+    ) -> crate::Result<Option<Self>> {
         // Short-circuit contradictory bounds: lo > hi means an empty range.
         if let (Some((lo_key, _)), Some((hi_key, _))) = (lo, hi)
             && comparator.compare(lo_key, hi_key) == std::cmp::Ordering::Greater
         {
-            return None;
+            return Ok(None);
         }
 
-        let mut iter = Self::from_block(block, comparator);
+        let mut iter = Self::from_block(block, comparator)?;
 
         // Use incremental bound-cursor methods: seek_lower_bound_cursor
         // resets front but preserves back; seek_upper_bound_cursor preserves
@@ -61,15 +75,15 @@ impl OwnedIndexBlockIter {
         if let Some((key, seqno)) = lo
             && !iter.with_dependent_mut(|_, m| m.seek_lower_bound_cursor(key, seqno))
         {
-            return None;
+            return Ok(None);
         }
         if let Some((key, seqno)) = hi
             && !iter.with_dependent_mut(|_, m| m.seek_upper_bound_cursor(key, seqno))
         {
-            return None;
+            return Ok(None);
         }
 
-        Some(iter)
+        Ok(Some(iter))
     }
 
     /// Full lower-bound re-seek: resets both front and back caches.
@@ -161,7 +175,7 @@ mod tests {
     #[test]
     fn from_block_iterates_all_entries() {
         let block = make_index_block(&[b"a", b"b", b"c"], 1);
-        let mut iter = OwnedIndexBlockIter::from_block(block, default_comparator());
+        let mut iter = OwnedIndexBlockIter::from_block(block, default_comparator()).unwrap();
 
         let keys: Vec<_> = iter.by_ref().map(|h| h.end_key().to_vec()).collect();
         assert_eq!(keys, vec![b"a", b"b", b"c"]);
@@ -171,7 +185,8 @@ mod tests {
     fn from_block_with_bounds_no_bounds_returns_all() {
         let block = make_index_block(&[b"a", b"b", b"c"], 1);
         let iter =
-            OwnedIndexBlockIter::from_block_with_bounds(block, default_comparator(), None, None);
+            OwnedIndexBlockIter::from_block_with_bounds(block, default_comparator(), None, None)
+                .unwrap();
 
         assert!(iter.is_some());
         let keys: Vec<_> = iter.unwrap().map(|h| h.end_key().to_vec()).collect();
@@ -186,7 +201,8 @@ mod tests {
             default_comparator(),
             Some((b"b", SeqNo::MAX)),
             None,
-        );
+        )
+        .unwrap();
 
         assert!(iter.is_some());
         let keys: Vec<_> = iter.unwrap().map(|h| h.end_key().to_vec()).collect();
@@ -204,6 +220,7 @@ mod tests {
             None,
             Some((b"c", 0)),
         )
+        .unwrap()
         .unwrap();
 
         // Forward iteration still starts from the beginning
@@ -229,6 +246,7 @@ mod tests {
             Some((b"b", SeqNo::MAX)),
             Some((b"c", 0)),
         )
+        .unwrap()
         .unwrap();
 
         let keys: Vec<_> = iter.map(|h| h.end_key().to_vec()).collect();
@@ -247,6 +265,7 @@ mod tests {
             Some((b"c", SeqNo::MAX)),
             Some((b"f", 0)),
         )
+        .unwrap()
         .unwrap();
 
         let keys: Vec<_> = iter.map(|h| h.end_key().to_vec()).collect();
@@ -264,7 +283,8 @@ mod tests {
             default_comparator(),
             Some((b"z", SeqNo::MAX)),
             None,
-        );
+        )
+        .unwrap();
 
         assert!(iter.is_none());
     }
@@ -277,7 +297,8 @@ mod tests {
             default_comparator(),
             Some((b"d", SeqNo::MAX)),
             Some((b"b", 0)),
-        );
+        )
+        .unwrap();
 
         assert!(iter.is_none(), "inverted lo > hi must return None");
     }
@@ -301,7 +322,8 @@ mod tests {
             default_comparator(),
             Some((b"adj:out:vertex-0001:edge-0002", SeqNo::MAX)),
             None,
-        );
+        )
+        .unwrap();
 
         assert!(iter.is_some());
         let keys: Vec<_> = iter.unwrap().map(|h| h.end_key().to_vec()).collect();
@@ -336,6 +358,7 @@ mod tests {
             None,
             Some((b"adj:out:vertex-0001:edge-0002", 0)),
         )
+        .unwrap()
         .unwrap();
 
         let keys: Vec<_> =
@@ -353,7 +376,7 @@ mod tests {
     #[test]
     fn seek_upper_with_equal_end_keys_keeps_full_forward_limit_span() {
         let block = make_index_block(&[b"k", b"k", b"k", b"k"], 1);
-        let mut iter = OwnedIndexBlockIter::from_block(block, default_comparator());
+        let mut iter = OwnedIndexBlockIter::from_block(block, default_comparator()).unwrap();
 
         assert!(iter.seek_upper(b"k", SeqNo::MAX));
 

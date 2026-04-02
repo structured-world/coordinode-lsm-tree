@@ -50,7 +50,7 @@ impl Scanner {
             zstd_dictionary.as_deref(),
         )?;
         let cmp = comparator.clone();
-        let iter = OwnedDataBlockIter::new(block, |b| b.iter(cmp));
+        let iter = OwnedDataBlockIter::try_new(block, |b| b.try_iter(cmp))?;
 
         Ok(Self {
             reader,
@@ -114,17 +114,32 @@ impl Iterator for Scanner {
             }
 
             // Init new block
-            let block = fail_iter!(Self::fetch_next_block(
+            let block = match Self::fetch_next_block(
                 &mut self.reader,
                 self.compression,
                 self.encryption.as_deref(),
                 #[cfg(zstd_any)]
                 self.zstd_dictionary.as_deref(),
-            ));
+            ) {
+                Ok(block) => block,
+                Err(e) => {
+                    self.read_count = self.block_count;
+                    return Some(Err(e));
+                }
+            };
             let cmp = self.comparator.clone();
-            self.iter = OwnedDataBlockIter::new(block, |b| b.iter(cmp));
-
-            self.read_count += 1;
+            match OwnedDataBlockIter::try_new(block, |b| b.try_iter(cmp)) {
+                Ok(iter) => {
+                    self.iter = iter;
+                    self.read_count += 1;
+                }
+                Err(e) => {
+                    // Poison the scanner so callers cannot silently skip
+                    // the corrupt block and resume on later blocks.
+                    self.read_count = self.block_count;
+                    return Some(Err(e));
+                }
+            }
         }
     }
 }
