@@ -573,11 +573,15 @@ mod tests {
     }
 
     #[test]
-    fn next_stays_none_when_binary_index_offset_exceeds_block_bounds() {
+    fn try_iter_rejects_invalid_binary_index_offset() {
         let index = make_corrupted_index_block_with_invalid_binary_index_offset();
-        let mut iter = index.iter(default_comparator());
-
-        assert!(iter.next().is_none());
-        assert!(iter.next().is_none());
+        // try_iter rejects the block eagerly due to invalid layout metadata
+        assert!(
+            matches!(
+                index.try_iter(default_comparator()),
+                Err(crate::Error::InvalidTrailer)
+            ),
+            "corrupt binary_index_offset must be rejected by try_iter",
+        );
     }
 }

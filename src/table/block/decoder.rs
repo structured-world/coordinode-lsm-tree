@@ -10,6 +10,21 @@ use crate::{
 use byteorder::{LittleEndian, ReadBytesExt};
 use std::{io::Cursor, marker::PhantomData};
 
+/// Validates that `restart_interval` and `binary_index_step_size` read from a
+/// block trailer are within their allowed ranges.
+///
+/// Returns `Err(crate::Error::InvalidTrailer)` on malformed values that would
+/// otherwise trigger an assertion failure deeper in the decoder.
+fn validate_trailer_fields(restart_interval: u8, binary_index_step_size: u8) -> crate::Result<()> {
+    if restart_interval == 0 {
+        return Err(crate::Error::InvalidTrailer);
+    }
+    if binary_index_step_size != 2 && binary_index_step_size != 4 {
+        return Err(crate::Error::InvalidTrailer);
+    }
+    Ok(())
+}
+
 /// Represents an object that was parsed from a byte array
 ///
 /// Parsed items only hold references to their keys and values, use `materialize` to create an owned value.
@@ -113,27 +128,24 @@ impl<'a, Item: Decodable<Parsed>, Parsed: ParsedItem<Item>> Decoder<'a, Item, Pa
         self.restart_interval
     }
 
-    #[must_use]
-    pub fn new(block: &'a Block) -> Self {
-        let trailer = Trailer::new(block);
+    /// Creates a new block decoder, returning an error on malformed trailer
+    /// fields instead of panicking.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error::InvalidTrailer`] when:
+    /// - the block is too small to contain a trailer,
+    /// - `restart_interval` is zero,
+    /// - `binary_index_step_size` is not 2 or 4, or
+    /// - binary/hash-index layout metadata is inconsistent.
+    pub fn try_new(block: &'a Block) -> crate::Result<Self> {
+        let trailer = Trailer::try_new(block)?;
         let mut reader = trailer.as_slice();
 
         let restart_interval = unwrap!(reader.read_u8());
-        // Invalid on-disk restart interval is treated as hard corruption.
-        // Silently coercing 0 -> 1 would hide malformed blocks and may misroute seeks
-        // because downstream binary search assumes restart_interval >= 1.
-        // TODO(#184): move trailer-field validation to a fallible decoder constructor.
-        assert!(
-            restart_interval > 0,
-            "block restart interval must be greater than zero",
-        );
-
         let binary_index_step_size = unwrap!(reader.read_u8());
 
-        debug_assert!(
-            binary_index_step_size == 2 || binary_index_step_size == 4,
-            "invalid binary index step size",
-        );
+        validate_trailer_fields(restart_interval, binary_index_step_size)?;
 
         let binary_index_len = unwrap!(reader.read_u32::<LittleEndian>());
         let binary_index_offset = unwrap!(reader.read_u32::<LittleEndian>());
@@ -168,8 +180,29 @@ impl<'a, Item: Decodable<Parsed>, Parsed: ParsedItem<Item>> Decoder<'a, Item, Pa
             hash_index_offset,
             cached_entries_end: None,
         };
-        decoder.cached_entries_end = decoder.compute_entries_end();
-        decoder
+        decoder.cached_entries_end = Some(
+            decoder
+                .compute_entries_end()
+                .ok_or(crate::Error::InvalidTrailer)?,
+        );
+        Ok(decoder)
+    }
+
+    /// Creates a new block decoder.
+    ///
+    /// # Panics
+    ///
+    /// Panics on any block corruption detected by [`Self::try_new`]:
+    /// undersized blocks, invalid trailer fields, or inconsistent
+    /// binary/hash-index layout metadata. Prefer `try_new` in I/O paths
+    /// where corrupt blocks should produce a structured error.
+    #[must_use]
+    #[expect(
+        clippy::expect_used,
+        reason = "infallible wrapper for test/non-I/O paths"
+    )]
+    pub fn new(block: &'a Block) -> Self {
+        Self::try_new(block).expect("valid block trailer")
     }
 
     fn binary_index_bounds(&self) -> Option<(usize, usize)> {
@@ -1125,9 +1158,13 @@ mod tests {
                 uncompressed_length: 0,
             },
         };
-        let decoder = Decoder::<KeyedBlockHandle, IndexBlockParsedItem>::new(&block);
-
-        assert!(decoder.entries_end().is_none());
+        assert!(
+            matches!(
+                Decoder::<KeyedBlockHandle, IndexBlockParsedItem>::try_new(&block),
+                Err(crate::Error::InvalidTrailer)
+            ),
+            "bogus binary_index_offset must be rejected by try_new",
+        );
     }
 
     #[test]
@@ -1150,9 +1187,13 @@ mod tests {
                 uncompressed_length: 0,
             },
         };
-        let decoder = Decoder::<KeyedBlockHandle, IndexBlockParsedItem>::new(&block);
-
-        assert!(decoder.entries_end().is_none());
+        assert!(
+            matches!(
+                Decoder::<KeyedBlockHandle, IndexBlockParsedItem>::try_new(&block),
+                Err(crate::Error::InvalidTrailer)
+            ),
+            "zero binary_index_offset must be rejected as InvalidTrailer",
+        );
     }
 
     #[test]
@@ -1174,9 +1215,13 @@ mod tests {
                 uncompressed_length: 0,
             },
         };
-        let decoder = Decoder::<KeyedBlockHandle, IndexBlockParsedItem>::new(&block);
-
-        assert!(decoder.entries_end().is_none());
+        assert!(
+            matches!(
+                Decoder::<KeyedBlockHandle, IndexBlockParsedItem>::try_new(&block),
+                Err(crate::Error::InvalidTrailer)
+            ),
+            "missing marker before binary index must be rejected as InvalidTrailer",
+        );
     }
 
     #[test]
@@ -1202,9 +1247,13 @@ mod tests {
                 uncompressed_length: 0,
             },
         };
-        let mut decoder = Decoder::<KeyedBlockHandle, IndexBlockParsedItem>::new(&block);
-
-        assert!(!decoder.seek(|_, _| true, false));
+        assert!(
+            matches!(
+                Decoder::<KeyedBlockHandle, IndexBlockParsedItem>::try_new(&block),
+                Err(crate::Error::InvalidTrailer)
+            ),
+            "binary index slice past block end must be rejected as InvalidTrailer",
+        );
     }
 
     #[test]
@@ -1246,9 +1295,13 @@ mod tests {
                 uncompressed_length: 0,
             },
         };
-        let mut decoder = Decoder::<KeyedBlockHandle, IndexBlockParsedItem>::new(&block);
-
-        assert!(!decoder.seek(|_, _| true, false));
+        assert!(
+            matches!(
+                Decoder::<KeyedBlockHandle, IndexBlockParsedItem>::try_new(&block),
+                Err(crate::Error::InvalidTrailer)
+            ),
+            "binary index slice spilling into trailer must be rejected as InvalidTrailer",
+        );
     }
 
     #[test]
@@ -1274,9 +1327,13 @@ mod tests {
                 uncompressed_length: 0,
             },
         };
-        let mut decoder = Decoder::<KeyedBlockHandle, IndexBlockParsedItem>::new(&block);
-
-        assert!(!decoder.seek(|_, _| true, false));
+        assert!(
+            matches!(
+                Decoder::<KeyedBlockHandle, IndexBlockParsedItem>::try_new(&block),
+                Err(crate::Error::InvalidTrailer)
+            ),
+            "binary index slice shorter than metadata boundary must be rejected as InvalidTrailer",
+        );
     }
 
     #[test]
@@ -1706,9 +1763,13 @@ mod tests {
                 uncompressed_length: 0,
             },
         };
-        let decoder = Decoder::<InternalValue, DataBlockParsedItem>::new(&block);
-
-        assert!(decoder.binary_index_bounds().is_none());
+        assert!(
+            matches!(
+                Decoder::<InternalValue, DataBlockParsedItem>::try_new(&block),
+                Err(crate::Error::InvalidTrailer)
+            ),
+            "hash index spilling past trailer must be rejected as InvalidTrailer",
+        );
     }
 
     #[test]
@@ -1742,9 +1803,13 @@ mod tests {
                 uncompressed_length: 0,
             },
         };
-        let decoder = Decoder::<InternalValue, DataBlockParsedItem>::new(&block);
-
-        assert!(decoder.binary_index_bounds().is_none());
+        assert!(
+            matches!(
+                Decoder::<InternalValue, DataBlockParsedItem>::try_new(&block),
+                Err(crate::Error::InvalidTrailer)
+            ),
+            "hash index ending before trailer must be rejected as InvalidTrailer",
+        );
     }
 
     #[test]
@@ -1768,11 +1833,12 @@ mod tests {
                 uncompressed_length: 0,
             },
         };
-        let decoder = Decoder::<KeyedBlockHandle, IndexBlockParsedItem>::new(&block);
-
         assert!(
-            decoder.binary_index_bounds().is_none(),
-            "zero-length binary index must be rejected"
+            matches!(
+                Decoder::<KeyedBlockHandle, IndexBlockParsedItem>::try_new(&block),
+                Err(crate::Error::InvalidTrailer)
+            ),
+            "zero-length binary index must be rejected as InvalidTrailer",
         );
     }
 
@@ -1832,5 +1898,111 @@ mod tests {
             !result,
             "seek must fail when every binary index entry points at data.len()"
         );
+    }
+
+    #[test]
+    fn try_new_zero_restart_interval_returns_invalid_trailer() {
+        let handles = make_handles(4);
+        let mut bytes = IndexBlock::encode_into_vec_with_restart_interval(&handles, 2).unwrap();
+
+        // Locate trailer and zero out restart_interval (first trailer byte).
+        let block = Block {
+            data: bytes.clone().into(),
+            header: Header {
+                block_type: BlockType::Index,
+                checksum: Checksum::from_raw(0),
+                data_length: 0,
+                uncompressed_length: 0,
+            },
+        };
+        let trailer_offset = Trailer::new(&block).trailer_offset();
+        bytes[trailer_offset] = 0;
+
+        let corrupt_block = Block {
+            data: bytes.into(),
+            header: Header {
+                block_type: BlockType::Index,
+                checksum: Checksum::from_raw(0),
+                data_length: 0,
+                uncompressed_length: 0,
+            },
+        };
+
+        assert!(
+            matches!(
+                Decoder::<KeyedBlockHandle, IndexBlockParsedItem>::try_new(&corrupt_block),
+                Err(crate::Error::InvalidTrailer)
+            ),
+            "zero restart_interval must return InvalidTrailer",
+        );
+    }
+
+    #[test]
+    fn try_new_invalid_binary_index_step_size_returns_invalid_trailer() {
+        let handles = make_handles(4);
+        let mut bytes = IndexBlock::encode_into_vec_with_restart_interval(&handles, 2).unwrap();
+
+        let block = Block {
+            data: bytes.clone().into(),
+            header: Header {
+                block_type: BlockType::Index,
+                checksum: Checksum::from_raw(0),
+                data_length: 0,
+                uncompressed_length: 0,
+            },
+        };
+        let trailer_offset = Trailer::new(&block).trailer_offset();
+        // Corrupt binary_index_step_size (second trailer byte) to an invalid value.
+        bytes[trailer_offset + 1] = 3;
+
+        let corrupt_block = Block {
+            data: bytes.into(),
+            header: Header {
+                block_type: BlockType::Index,
+                checksum: Checksum::from_raw(0),
+                data_length: 0,
+                uncompressed_length: 0,
+            },
+        };
+
+        assert!(
+            matches!(
+                Decoder::<KeyedBlockHandle, IndexBlockParsedItem>::try_new(&corrupt_block),
+                Err(crate::Error::InvalidTrailer)
+            ),
+            "invalid step size must return InvalidTrailer",
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "valid block trailer")]
+    fn new_panics_on_zero_restart_interval() {
+        let handles = make_handles(4);
+        let mut bytes = IndexBlock::encode_into_vec_with_restart_interval(&handles, 2).unwrap();
+
+        let block = Block {
+            data: bytes.clone().into(),
+            header: Header {
+                block_type: BlockType::Index,
+                checksum: Checksum::from_raw(0),
+                data_length: 0,
+                uncompressed_length: 0,
+            },
+        };
+        let trailer_offset = Trailer::new(&block).trailer_offset();
+        bytes[trailer_offset] = 0;
+
+        let corrupt_block = Block {
+            data: bytes.into(),
+            header: Header {
+                block_type: BlockType::Index,
+                checksum: Checksum::from_raw(0),
+                data_length: 0,
+                uncompressed_length: 0,
+            },
+        };
+
+        // Must panic, not silently succeed.
+        let _ = Decoder::<KeyedBlockHandle, IndexBlockParsedItem>::new(&corrupt_block);
     }
 }

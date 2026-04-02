@@ -33,8 +33,29 @@ pub struct Trailer<'a> {
 }
 
 impl<'a> Trailer<'a> {
+    /// # Panics
+    ///
+    /// Panics if the block is too small to contain a trailer. Prefer
+    /// [`Self::try_new`] in I/O paths.
+    #[expect(
+        clippy::expect_used,
+        reason = "infallible wrapper, callers guarantee valid blocks"
+    )]
     pub fn new(block: &'a Block) -> Self {
-        Self { block }
+        Self::try_new(block).expect("block too small for trailer")
+    }
+
+    /// Creates a trailer reference after validating that the block is large
+    /// enough to contain the fixed-size trailer.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error::InvalidTrailer`] if the block is too small.
+    pub fn try_new(block: &'a Block) -> crate::Result<Self> {
+        if block.data.len() < TRAILER_SIZE {
+            return Err(crate::Error::InvalidTrailer);
+        }
+        Ok(Self { block })
     }
 
     /// Returns the trailer position.
