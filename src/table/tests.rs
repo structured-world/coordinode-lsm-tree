@@ -2110,12 +2110,14 @@ fn bloom_may_contain_key_partitioned_filter() -> crate::Result<()> {
 /// span several partitions. Both forward (`next`) and reverse (`next_back`)
 /// directions are verified to yield the correct block handle sequences.
 ///
-/// NOTE: With well-formed data and `restart_interval=1` (default), the TLI
-/// and child partitions use the same seek precision, so `Ok(None)` on a
-/// child is not triggered naturally. The fix is a defensive loop that
-/// guards against coarser seeks (`restart_interval > 1`) and edge cases
-/// in `seek_upper_bound_cursor`. This test validates overall iteration
-/// correctness rather than the exact `Ok(None)` path.
+/// NOTE: The `Ok(None)` child path cannot be triggered with well-formed
+/// block data regardless of `restart_interval` — `trim_back_to_upper_bound`
+/// always restores a covering entry when the stack empties, so
+/// `seek_upper_bound_cursor` returns `true`. The `Ok(None)` branch fires
+/// only when `fill_stack` or `advance_upper_restart_interval` encounters
+/// a corrupt/malformed block (empty stack after decode failure). The fix
+/// is therefore a defensive guard; this test validates overall iteration
+/// correctness through the two-level path.
 #[test]
 fn two_level_index_scan_skips_empty_child_partition() -> crate::Result<()> {
     use crate::ValueType::Value;
