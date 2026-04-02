@@ -3,16 +3,17 @@
 // (found in the LICENSE-* files in the repository)
 
 use crate::{
-    CompressionType, InternalValue, KeyRange, SeqNo, Slice,
     checksum::ChecksumType,
     coding::{Decode, Encode},
     comparator::default_comparator,
     table::{Block, DataBlock},
     vlog::BlobFileId,
+    CompressionType, InternalValue, KeyRange, SeqNo, Slice,
 };
 use byteorder::{LittleEndian, ReadBytesExt};
 use std::io::{Read, Write};
 
+// TODO(#195): add corruption regression test for this error path
 macro_rules! read_u64 {
     ($block:expr, $name:expr, $cmp:expr) => {{
         let bytes = $block
