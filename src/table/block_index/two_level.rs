@@ -150,9 +150,11 @@ impl Iterator for Iter {
         }
 
         if let Some(tli) = &mut self.tli {
-            let next_lowest_block = tli.next();
+            loop {
+                let Some(handle) = tli.next() else {
+                    break;
+                };
 
-            if let Some(handle) = next_lowest_block {
                 let block = match load_block(
                     self.table_id,
                     &self.path,
@@ -174,9 +176,6 @@ impl Iterator for Iter {
                 let lo = self.lo.as_ref().map(|(k, s)| (k.as_ref(), *s));
                 let hi = self.hi.as_ref().map(|(k, s)| (k.as_ref(), *s));
 
-                // TODO(#194): empty child partition (trimmed by lo/hi bounds)
-                // currently causes an early `return None` instead of continuing
-                // to the next TLI entry.
                 let mut iter = match OwnedIndexBlockIter::from_block_with_bounds(
                     index_block,
                     self.comparator.clone(),
@@ -184,7 +183,7 @@ impl Iterator for Iter {
                     hi,
                 ) {
                     Ok(Some(it)) => it,
-                    Ok(None) => return None,
+                    Ok(None) => continue,
                     Err(e) => return self.poison(e),
                 };
 
@@ -230,9 +229,11 @@ impl DoubleEndedIterator for Iter {
         }
 
         if let Some(tli) = &mut self.tli {
-            let next_highest_block = tli.next_back();
+            loop {
+                let Some(handle) = tli.next_back() else {
+                    break;
+                };
 
-            if let Some(handle) = next_highest_block {
                 let block = match load_block(
                     self.table_id,
                     &self.path,
@@ -254,7 +255,6 @@ impl DoubleEndedIterator for Iter {
                 let lo = self.lo.as_ref().map(|(k, s)| (k.as_ref(), *s));
                 let hi = self.hi.as_ref().map(|(k, s)| (k.as_ref(), *s));
 
-                // TODO(#194): same empty-partition issue as in next()
                 let mut iter = match OwnedIndexBlockIter::from_block_with_bounds(
                     index_block,
                     self.comparator.clone(),
@@ -262,7 +262,7 @@ impl DoubleEndedIterator for Iter {
                     hi,
                 ) {
                     Ok(Some(it)) => it,
-                    Ok(None) => return None,
+                    Ok(None) => continue,
                     Err(e) => return self.poison(e),
                 };
 
