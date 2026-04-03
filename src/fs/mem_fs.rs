@@ -60,8 +60,11 @@ impl MemFs {
     /// Creates a new, empty in-memory filesystem.
     #[must_use]
     pub fn new() -> Self {
+        let mut state = State::default();
+        // Seed the root directory so exists("/") and read_dir("/") work.
+        state.dirs.insert(PathBuf::from("/"));
         Self {
-            state: Arc::new(RwLock::new(State::default())),
+            state: Arc::new(RwLock::new(state)),
         }
     }
 }
@@ -147,32 +150,43 @@ impl Write for MemFile {
     }
 }
 
-#[expect(
-    clippy::cast_possible_wrap,
-    clippy::cast_sign_loss,
-    reason = "MemFs is a test/ephemeral backend — files never exceed usize::MAX"
-)]
 impl Seek for MemFile {
     fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
-        let len = {
-            let data = lock(&self.data)?;
-            data.len() as i64
+        let new_pos: u64 = match pos {
+            SeekFrom::Start(n) => n,
+            SeekFrom::End(n) => {
+                let len = {
+                    let data = lock(&self.data)?;
+                    u64::try_from(data.len()).map_err(|_| {
+                        io::Error::other("in-memory file length does not fit in u64")
+                    })?
+                };
+                let result = i128::from(len) + i128::from(n);
+                if result < 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "seek to negative position",
+                    ));
+                }
+                u64::try_from(result).map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "seek position overflow")
+                })?
+            }
+            SeekFrom::Current(n) => {
+                let result = i128::from(self.cursor) + i128::from(n);
+                if result < 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "seek to negative position",
+                    ));
+                }
+                u64::try_from(result).map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "seek position overflow")
+                })?
+            }
         };
 
-        let new_pos = match pos {
-            SeekFrom::Start(n) => i64::try_from(n).unwrap_or(i64::MAX),
-            SeekFrom::End(n) => len.saturating_add(n),
-            SeekFrom::Current(n) => (self.cursor as i64).saturating_add(n),
-        };
-
-        if new_pos < 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "seek to negative position",
-            ));
-        }
-
-        self.cursor = new_pos as u64;
+        self.cursor = new_pos;
         Ok(self.cursor)
     }
 }
@@ -316,11 +330,10 @@ impl Fs for MemFs {
                 lock(&data)?.clear();
             }
 
-            let cursor = if opts.append {
-                lock(&data)?.len() as u64
-            } else {
-                0
-            };
+            // Cursor starts at 0 even in append mode — append only affects
+            // where writes land (Write::write checks is_append), not the
+            // read cursor. This matches std::fs::File behaviour.
+            let cursor = 0;
 
             Ok(Box::new(MemFile {
                 data,
@@ -536,7 +549,15 @@ impl Fs for MemFs {
         }
     }
 
-    fn sync_directory(&self, _path: &Path) -> io::Result<()> {
+    fn sync_directory(&self, path: &Path) -> io::Result<()> {
+        // Durability is a no-op, but validate the path is an existing directory.
+        let state = read_state(&self.state)?;
+        if !state.dirs.contains(path) {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("sync_directory: not a directory: {}", path.display()),
+            ));
+        }
         Ok(())
     }
 
