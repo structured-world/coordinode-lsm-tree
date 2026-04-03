@@ -4,8 +4,8 @@
 
 // Format constants live in writer (the format definition site).
 // Extracting to a shared module is an upstream structural decision.
-use super::writer::{validate_header_crc, BLOB_HEADER_MAGIC_V3, BLOB_HEADER_MAGIC_V4};
-use crate::{vlog::BlobFileId, Checksum, SeqNo, UserKey, UserValue};
+use super::writer::{BLOB_HEADER_MAGIC_V3, BLOB_HEADER_MAGIC_V4, validate_header_crc};
+use crate::{Checksum, SeqNo, UserKey, UserValue, vlog::BlobFileId};
 use byteorder::{LittleEndian, ReadBytesExt};
 use std::{
     fs::File,
@@ -201,7 +201,7 @@ impl Iterator for Scanner {
 #[expect(clippy::unwrap_used, clippy::indexing_slicing, reason = "test code")]
 mod tests {
     use super::*;
-    use crate::{fs::StdFs, vlog::blob_file::writer::Writer as BlobFileWriter, Slice};
+    use crate::{Slice, fs::StdFs, vlog::blob_file::writer::Writer as BlobFileWriter};
     use tempfile::tempdir;
     use test_log::test;
 

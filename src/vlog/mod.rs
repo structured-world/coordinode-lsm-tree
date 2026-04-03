@@ -7,20 +7,21 @@ pub mod blob_file;
 mod handle;
 
 pub use {
-    accessor::Accessor, blob_file::merge::MergeScanner as BlobFileMergeScanner,
+    accessor::Accessor, blob_file::BlobFile,
+    blob_file::merge::MergeScanner as BlobFileMergeScanner,
     blob_file::multi_writer::MultiWriter as BlobFileWriter,
-    blob_file::scanner::Scanner as BlobFileScanner, blob_file::BlobFile, handle::ValueHandle,
+    blob_file::scanner::Scanner as BlobFileScanner, handle::ValueHandle,
 };
 
 use crate::{
+    Checksum, DescriptorTable, TreeId,
     file_accessor::FileAccessor,
     fs::Fs,
     vlog::blob_file::{Inner as BlobFileInner, Metadata},
-    Checksum, DescriptorTable, TreeId,
 };
 use std::{
     path::{Path, PathBuf},
-    sync::{atomic::AtomicBool, Arc},
+    sync::{Arc, atomic::AtomicBool},
 };
 
 pub fn recover_blob_files(

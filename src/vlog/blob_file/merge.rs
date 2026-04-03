@@ -3,7 +3,7 @@
 // (found in the LICENSE-* files in the repository)
 
 use super::scanner::Scanner as BlobFileScanner;
-use crate::vlog::{blob_file::scanner::ScanEntry, BlobFileId};
+use crate::vlog::{BlobFileId, blob_file::scanner::ScanEntry};
 use interval_heap::IntervalHeap;
 use std::cmp::Reverse;
 
@@ -98,7 +98,7 @@ impl Iterator for MergeScanner {
 mod tests {
     use super::super::scanner::Scanner;
     use super::*;
-    use crate::{fs::StdFs, vlog::blob_file::writer::Writer as BlobFileWriter, Slice};
+    use crate::{Slice, fs::StdFs, vlog::blob_file::writer::Writer as BlobFileWriter};
     use tempfile::tempdir;
     use test_log::test;
 
