@@ -287,6 +287,11 @@ mod tests {
         meta.encode_into(&mut buf).unwrap();
 
         // Corrupt the last 4 bytes of the block (trailer region).
+        // This triggers a ChecksumMismatch in `Block::from_reader` — the
+        // first defense layer.  The deeper point_read → ok_or path (which
+        // previously could panic) is exercised separately by
+        // `test_blob_file_meta_missing_field_returns_err`, where the block
+        // is structurally valid but omits a required property.
         let len = buf.len();
         assert!(len >= 4, "buffer too small for corruption");
         #[expect(clippy::indexing_slicing, reason = "length checked above")]
