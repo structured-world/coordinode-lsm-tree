@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1775175885558,
+  "lastUpdate": 1775179034000,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -4758,6 +4758,84 @@ window.BENCHMARK_DATA = {
             "value": 203663.77054191285,
             "unit": "ops/sec (normalized)",
             "extra": "raw: 451177 ops/sec | factor: 0.451 | P50: 2.0us | P99: 6.1us | P99.9: 10.8us\nthreads: 1 | elapsed: 0.44s | num: 200000 | iterations: 3 | runner: seq_wr=363857 rand_rd=1118242 cpu=116 composite=50952.0"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "f8fe8881b20391188e7bed059c27f35accc3bb9b",
+          "message": "fix(table): validate block type on cache-hit path (#203)\n\n## Summary\n\n- Add block type validation on cache-hit path in `load_block()` —\npreviously only the I/O miss path checked `block.header.block_type`, so\na corrupted handle pointing at a cached block of the wrong type would\nslip through silently\n- Remove redundant `cache.get_block()` fast-path in `iter.rs`\nforward/reverse iterators — both now go through `load_block()` which\nalready checks the cache internally and validates block type on both\npaths\n\n## Test plan\n\n- [x] Regression test `load_block_cache_hit_rejects_wrong_block_type`:\ncaches an Index block, requests the same offset as Data, asserts\n`InvalidTag` is returned\n- [x] Full suite: 1028 tests passed\n- [x] Clippy clean\n\nCloses #198\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n## Summary by CodeRabbit\n\n* **Bug Fixes**\n* Consistently validate cached vs on-disk blocks during table reads to\nprevent wrong block types being returned.\n* Preserve existing error handling when validation fails to avoid silent\ndata-mismatch returns.\n\n* **Tests**\n* Added a regression test to ensure cached block type validation and\nprevent future regressions.\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-04-03T04:15:52+03:00",
+          "tree_id": "c1348477788500ea6114fcd730634fd455fc1d72",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/f8fe8881b20391188e7bed059c27f35accc3bb9b"
+        },
+        "date": 1775179033030,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 1143518.3068946302,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 2084042 ops/sec | factor: 0.549 | P50: 0.3us | P99: 2.0us | P99.9: 4.9us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3 | runner: seq_wr=229580 rand_rd=930753 cpu=123 composite=41917.1"
+          },
+          {
+            "name": "fillrandom",
+            "value": 663408.9161535563,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 1209051 ops/sec | factor: 0.549 | P50: 0.7us | P99: 2.4us | P99.9: 5.6us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3 | runner: seq_wr=229580 rand_rd=930753 cpu=123 composite=41917.1"
+          },
+          {
+            "name": "readrandom",
+            "value": 294229.29866928805,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 536228 ops/sec | factor: 0.549 | P50: 1.7us | P99: 5.3us | P99.9: 12.8us\nthreads: 1 | elapsed: 0.37s | num: 200000 | iterations: 3 | runner: seq_wr=229580 rand_rd=930753 cpu=123 composite=41917.1"
+          },
+          {
+            "name": "readseq",
+            "value": 1384331.488837049,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 2522920 ops/sec | factor: 0.549 | P50: 0.2us | P99: 3.8us | P99.9: 7.4us\nthreads: 1 | elapsed: 0.08s | num: 200000 | iterations: 3 | runner: seq_wr=229580 rand_rd=930753 cpu=123 composite=41917.1"
+          },
+          {
+            "name": "seekrandom",
+            "value": 202718.94304183443,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 369452 ops/sec | factor: 0.549 | P50: 2.4us | P99: 5.9us | P99.9: 13.9us\nthreads: 1 | elapsed: 0.54s | num: 200000 | iterations: 3 | runner: seq_wr=229580 rand_rd=930753 cpu=123 composite=41917.1"
+          },
+          {
+            "name": "prefixscan",
+            "value": 104468.8904540609,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 190393 ops/sec | factor: 0.549 | P50: 4.9us | P99: 7.2us | P99.9: 16.4us\nthreads: 1 | elapsed: 1.05s | num: 200000 | iterations: 3 | runner: seq_wr=229580 rand_rd=930753 cpu=123 composite=41917.1"
+          },
+          {
+            "name": "overwrite",
+            "value": 660524.428555056,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 1203794 ops/sec | factor: 0.549 | P50: 0.7us | P99: 2.5us | P99.9: 5.7us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3 | runner: seq_wr=229580 rand_rd=930753 cpu=123 composite=41917.1"
+          },
+          {
+            "name": "mergerandom",
+            "value": 399772.91349782486,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 728579 ops/sec | factor: 0.549 | P50: 0.3us | P99: 0.5us | P99.9: 2.4us\nthreads: 1 | elapsed: 0.27s | num: 200000 | iterations: 3 | runner: seq_wr=229580 rand_rd=930753 cpu=123 composite=41917.1"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 259461.63956831733,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 472864 ops/sec | factor: 0.549 | P50: 1.9us | P99: 5.1us | P99.9: 13.4us\nthreads: 1 | elapsed: 0.42s | num: 200000 | iterations: 3 | runner: seq_wr=229580 rand_rd=930753 cpu=123 composite=41917.1"
           }
         ]
       }
