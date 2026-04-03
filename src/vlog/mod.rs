@@ -66,7 +66,9 @@ pub fn recover_blob_files(
         })?;
 
         let blob_file_path = &dirent.path;
-        assert!(!dirent.is_dir);
+        if dirent.is_dir {
+            continue;
+        }
 
         if let Some(&(_, checksum)) = ids.iter().find(|(id, _)| id == &blob_file_id) {
             log::trace!(
