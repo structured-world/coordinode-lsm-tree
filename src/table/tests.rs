@@ -1916,7 +1916,9 @@ fn load_block_cache_hit_rejects_wrong_block_type() -> crate::Result<()> {
         1,
         crate::ValueType::Value,
     ))?;
-    let (_, checksum) = writer.finish()?.unwrap();
+    let (_, checksum) = writer
+        .finish()?
+        .expect("finish() returns Some after writing data items");
 
     #[cfg(feature = "metrics")]
     let metrics = Arc::new(crate::metrics::Metrics::default());
