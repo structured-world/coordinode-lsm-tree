@@ -3,12 +3,12 @@
 // (found in the LICENSE-* files in the repository)
 
 use crate::{
+    CompressionType, InternalValue, KeyRange, SeqNo, Slice,
     checksum::ChecksumType,
     coding::{Decode, Encode},
     comparator::default_comparator,
     table::{Block, DataBlock},
     vlog::BlobFileId,
-    CompressionType, InternalValue, KeyRange, SeqNo, Slice,
 };
 use byteorder::{LittleEndian, ReadBytesExt};
 use std::io::{Read, Write};

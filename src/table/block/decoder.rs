@@ -2,10 +2,10 @@
 // This source code is licensed under both the Apache 2.0 and MIT License
 // (found in the LICENSE-* files in the repository)
 
-use super::{binary_index::Reader as BinaryIndexReader, TRAILER_START_MARKER};
+use super::{TRAILER_START_MARKER, binary_index::Reader as BinaryIndexReader};
 use crate::{
-    table::{block::Trailer, Block},
     SeqNo, Slice,
+    table::{Block, block::Trailer},
 };
 use byteorder::{LittleEndian, ReadBytesExt};
 use std::{io::Cursor, marker::PhantomData};
@@ -979,13 +979,13 @@ impl<Item: Decodable<Parsed>, Parsed: ParsedItem<Item>> DoubleEndedIterator
 mod tests {
     use super::Decoder;
     use crate::{
+        Checksum, InternalValue,
         table::{
+            Block, BlockHandle, BlockOffset, DataBlock, IndexBlock, KeyedBlockHandle,
             block::{BlockType, Header, Trailer},
             data_block::DataBlockParsedItem,
             index_block::IndexBlockParsedItem,
-            Block, BlockHandle, BlockOffset, DataBlock, IndexBlock, KeyedBlockHandle,
         },
-        Checksum, InternalValue,
     };
     use byteorder::{ByteOrder, LittleEndian};
 

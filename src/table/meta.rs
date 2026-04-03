@@ -5,8 +5,8 @@
 use super::{Block, BlockHandle, DataBlock};
 use crate::fs::FsFile;
 use crate::{
-    checksum::ChecksumType, coding::Decode, comparator::default_comparator,
-    table::block::BlockType, CompressionType, KeyRange, SeqNo, TableId,
+    CompressionType, KeyRange, SeqNo, TableId, checksum::ChecksumType, coding::Decode,
+    comparator::default_comparator, table::block::BlockType,
 };
 use byteorder::{LittleEndian, ReadBytesExt};
 use std::ops::Deref;
@@ -322,7 +322,7 @@ mod tests {
     // Regression tests for #201: ParsedMeta panics on corrupted meta
     // ---------------------------------------------------------------
 
-    use crate::{coding::Encode, InternalValue};
+    use crate::{InternalValue, coding::Encode};
 
     fn meta(key: &str, value: &[u8]) -> InternalValue {
         InternalValue::from_components(key, value, 0, crate::ValueType::Value)
