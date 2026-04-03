@@ -249,6 +249,14 @@ impl Fs for MemFs {
         let is_dir = state.dirs.contains(&path);
         let wants_write = opts.write || opts.append;
 
+        // Mirror std::fs::OpenOptions: at least one access mode is required.
+        if !opts.read && !wants_write {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "open requires at least read, write, or append access",
+            ));
+        }
+
         // Mirror std::fs::OpenOptions: truncate/create require write access.
         if opts.truncate && !wants_write {
             return Err(io::Error::new(
@@ -633,6 +641,37 @@ mod tests {
         fs.rename(src, dst)?;
         assert!(!fs.exists(src)?);
         assert!(fs.exists(dst)?);
+
+        Ok(())
+    }
+
+    #[test]
+    fn rename_atomically_replaces_existing_destination() -> io::Result<()> {
+        let fs = MemFs::new();
+        fs.create_dir_all(Path::new("/dir"))?;
+
+        let src = Path::new("/dir/new.txt");
+        let dst = Path::new("/dir/existing.txt");
+
+        // Create destination with old content
+        let opts = FsOpenOptions::new().write(true).create(true);
+        let mut file = fs.open(dst, &opts)?;
+        file.write_all(b"old")?;
+        drop(file);
+
+        // Create source with new content
+        let mut file = fs.open(src, &opts)?;
+        file.write_all(b"new")?;
+        drop(file);
+
+        // Rename should atomically replace destination
+        fs.rename(src, dst)?;
+        assert!(!fs.exists(src)?);
+
+        let mut file = fs.open(dst, &FsOpenOptions::new().read(true))?;
+        let mut buf = String::new();
+        file.read_to_string(&mut buf)?;
+        assert_eq!(buf, "new");
 
         Ok(())
     }

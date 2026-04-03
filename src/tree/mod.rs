@@ -1201,6 +1201,11 @@ impl Tree {
     pub(crate) fn open(config: Config) -> crate::Result<Self> {
         log::debug!("Opening LSM-tree at {}", config.path.display());
 
+        // NOTE: try_exists() and recover() below use std::fs directly, bypassing
+        // the pluggable Fs trait. This means MemFs (and other non-StdFs backends)
+        // cannot reopen a tree after drop — only new tree creation works.
+        // Tracked in: #209
+
         // Check for old version
         if config.path.join("version").try_exists()? {
             log::error!(

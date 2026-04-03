@@ -3,8 +3,8 @@
 // (found in the LICENSE-* files in the repository)
 
 use crate::{
-    Slice,
     fs::{Fs, FsFile},
+    Slice,
 };
 use std::{io::Write, path::Path};
 
@@ -63,37 +63,35 @@ pub fn rewrite_atomic(path: &Path, content: &[u8], fs: &dyn Fs) -> std::io::Resu
     )]
     let folder = path.parent().expect("should have a parent");
 
-    // PID + monotonic seq gives uniqueness within a process and across
-    // concurrent processes. A crash-then-PID-reuse collision is theoretically
-    // possible but vanishingly unlikely (requires exact PID reuse AND seq
-    // counter restart to same value). lsm-tree uses exclusive file locking
-    // so the same data directory is never written by two processes.
-    let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
     let pid = std::process::id();
-    let tmp_path = folder.join(format!(".tmp_{pid}_{seq}"));
 
-    let result = (|| -> std::io::Result<()> {
-        let mut file = fs.open(
-            &tmp_path,
+    // Retry with incrementing seq on AlreadyExists — handles leftover temp
+    // files from a previous crash (PID can be reused, especially in containers).
+    let tmp_path = loop {
+        let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let candidate = folder.join(format!(".tmp_{pid}_{seq}"));
+        match fs.open(
+            &candidate,
             &FsOpenOptions::new().write(true).create_new(true),
-        )?;
-        file.write_all(content)?;
-        file.flush()?;
-        FsFile::sync_all(&*file)?;
-        drop(file);
-        // std::fs::rename overwrites existing destinations on all platforms
-        // (Rust uses MoveFileExW with MOVEFILE_REPLACE_EXISTING on Windows).
-        fs.rename(&tmp_path, path)?;
-        Ok(())
-    })();
+        ) {
+            Ok(mut file) => {
+                file.write_all(content)?;
+                file.flush()?;
+                FsFile::sync_all(&*file)?;
+                break candidate;
+            }
+            // Leftover temp file from a previous crash — retry with next seq.
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e),
+        }
+    };
 
-    if result.is_err() {
-        // Best-effort cleanup of the temp file on any failure path.
-        // Safe to call even if fs.open() failed (file never created) —
-        // remove_file will return NotFound which we ignore.
+    // std::fs::rename overwrites existing destinations on all platforms
+    // (Rust uses MoveFileExW with MOVEFILE_REPLACE_EXISTING on Windows).
+    if let Err(e) = fs.rename(&tmp_path, path) {
         let _ = fs.remove_file(&tmp_path);
+        return Err(e);
     }
-    result?;
     fsync_directory(folder, fs)?;
 
     Ok(())

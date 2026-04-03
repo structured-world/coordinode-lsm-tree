@@ -45,7 +45,9 @@ impl FileAccessor {
         path: &Path,
     ) -> std::io::Result<(Arc<dyn FsFile>, bool)> {
         match self {
-            Self::File(fd) => Ok((fd.clone(), true)),
+            // Pinned FD — not a descriptor-table cache event; report as miss
+            // so metrics reflect only actual cache traffic.
+            Self::File(fd) => Ok((fd.clone(), false)),
             Self::DescriptorTable { table, fs } => {
                 if let Some(fd) = table.access_for_table(table_id) {
                     return Ok((fd, true));
@@ -68,7 +70,7 @@ impl FileAccessor {
         path: &Path,
     ) -> std::io::Result<(Arc<dyn FsFile>, bool)> {
         match self {
-            Self::File(fd) => Ok((fd.clone(), true)),
+            Self::File(fd) => Ok((fd.clone(), false)),
             Self::DescriptorTable { table, fs } => {
                 if let Some(fd) = table.access_for_blob_file(table_id) {
                     return Ok((fd, true));
