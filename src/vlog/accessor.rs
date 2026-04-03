@@ -3,9 +3,9 @@
 // (found in the LICENSE-* files in the repository)
 
 use crate::{
-    Cache, GlobalTableId, TreeId, UserValue,
     version::BlobFileList,
-    vlog::{ValueHandle, blob_file::reader::Reader},
+    vlog::{blob_file::reader::Reader, ValueHandle},
+    Cache, GlobalTableId, TreeId, UserValue,
 };
 use std::path::Path;
 

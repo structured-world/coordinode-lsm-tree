@@ -7,11 +7,11 @@ use crate::compression::CompressionProvider as _;
 
 use super::meta::Metadata;
 use crate::{
-    Checksum, CompressionType, KeyRange, SeqNo, TreeId, UserKey,
     checksum::ChecksummedWriter,
     fs::{Fs, FsFile, FsOpenOptions},
     time::unix_timestamp,
     vlog::BlobFileId,
+    Checksum, CompressionType, KeyRange, SeqNo, TreeId, UserKey,
 };
 use byteorder::{LittleEndian, WriteBytesExt};
 use std::{

@@ -7,21 +7,20 @@ pub mod blob_file;
 mod handle;
 
 pub use {
-    accessor::Accessor, blob_file::BlobFile,
-    blob_file::merge::MergeScanner as BlobFileMergeScanner,
+    accessor::Accessor, blob_file::merge::MergeScanner as BlobFileMergeScanner,
     blob_file::multi_writer::MultiWriter as BlobFileWriter,
-    blob_file::scanner::Scanner as BlobFileScanner, handle::ValueHandle,
+    blob_file::scanner::Scanner as BlobFileScanner, blob_file::BlobFile, handle::ValueHandle,
 };
 
 use crate::{
-    Checksum, DescriptorTable, TreeId,
     file_accessor::FileAccessor,
     fs::Fs,
     vlog::blob_file::{Inner as BlobFileInner, Metadata},
+    Checksum, DescriptorTable, TreeId,
 };
 use std::{
     path::{Path, PathBuf},
-    sync::{Arc, atomic::AtomicBool},
+    sync::{atomic::AtomicBool, Arc},
 };
 
 pub fn recover_blob_files(
@@ -32,7 +31,9 @@ pub fn recover_blob_files(
     fs: &Arc<dyn Fs>,
 ) -> crate::Result<(Vec<BlobFile>, Vec<PathBuf>)> {
     // Recover directly from read_dir; treat NotFound as empty (avoids TOCTOU
-    // with a separate exists() check).
+    // with a separate exists() check). This is correct even when `ids` is
+    // non-empty: the blobs folder may not exist for standard (non-blob) trees,
+    // and callers handle missing blob files via orphan detection.
     let entries = match fs.read_dir(folder) {
         Ok(entries) => entries,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {

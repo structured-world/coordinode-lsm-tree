@@ -408,6 +408,24 @@ impl Fs for MemFs {
             ));
         }
 
+        // Reject renaming onto an existing directory. Otherwise `to` would end
+        // up present in both `files` and `dirs`, corrupting MemFs state.
+        if state.dirs.contains(to) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("destination is a directory: {}", to.display()),
+            ));
+        }
+
+        // Directory renames are not implemented in MemFs because they require
+        // updating descendant paths in both `dirs` and `files`.
+        if state.dirs.contains(from) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("path is a directory: {}", from.display()),
+            ));
+        }
+
         if let Some(data) = state.files.remove(from) {
             state.files.insert(to.to_path_buf(), data);
             Ok(())

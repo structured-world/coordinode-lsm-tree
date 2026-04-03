@@ -3,8 +3,8 @@
 // (found in the LICENSE-* files in the repository)
 
 use crate::{
-    Slice,
     fs::{Fs, FsFile},
+    Slice,
 };
 use std::{io::Write, path::Path};
 
@@ -88,7 +88,9 @@ pub fn rewrite_atomic(path: &Path, content: &[u8], fs: &dyn Fs) -> std::io::Resu
     })();
 
     if result.is_err() {
-        // Best-effort cleanup of the temp file on any failure.
+        // Best-effort cleanup of the temp file on any failure path.
+        // Safe to call even if fs.open() failed (file never created) —
+        // remove_file will return NotFound which we ignore.
         let _ = fs.remove_file(&tmp_path);
     }
     result?;
