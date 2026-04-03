@@ -40,10 +40,7 @@ impl OwnedIndexBlockIter {
     /// [`crate::table::block::Decoder::try_new`] or a prior successful
     /// `from_block` call). Calling this on an unvalidated block may panic
     /// inside the decoder.
-    pub(crate) fn from_validated_block(
-        block: IndexBlock,
-        comparator: SharedComparator,
-    ) -> Self {
+    pub(crate) fn from_validated_block(block: IndexBlock, comparator: SharedComparator) -> Self {
         Self::new(block, |b| b.iter(comparator))
     }
 
