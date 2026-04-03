@@ -265,8 +265,10 @@ mod tests {
     }
 
     /// Regression test for #195: corrupt the block trailer (last bytes) of a
-    /// valid blob file metadata block.  `from_slice` must return `Err` (the
-    /// checksum catches the corruption), not panic.
+    /// valid blob file metadata block.  `from_slice` must return `Err`, not
+    /// panic.  The checksum layer catches byte-level corruption before trailer
+    /// parsing; the `point_read` → `ok_or` error path for missing/malformed
+    /// fields is exercised by `test_blob_file_meta_missing_field_returns_err`.
     #[test]
     #[expect(clippy::unwrap_used)]
     fn test_blob_file_meta_corrupted_trailer_returns_err() {
