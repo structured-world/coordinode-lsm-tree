@@ -83,7 +83,7 @@ impl FragmentationMap {
 
 impl crate::coding::Encode for FragmentationMap {
     fn encode_into<W: std::io::Write>(&self, writer: &mut W) -> Result<(), crate::Error> {
-        use byteorder::{WriteBytesExt, LE};
+        use byteorder::{LE, WriteBytesExt};
 
         #[expect(
             clippy::cast_possible_truncation,
@@ -114,7 +114,7 @@ impl crate::coding::Decode for FragmentationMap {
     where
         Self: Sized,
     {
-        use byteorder::{ReadBytesExt, LE};
+        use byteorder::{LE, ReadBytesExt};
 
         let len = reader.read_u32::<LE>()?;
         let mut map =
@@ -168,11 +168,11 @@ impl DroppedKvCallback for FragmentationMap {
 mod tests {
     use super::*;
     use crate::{
+        ValueType,
         coding::{Decode, Encode},
         compaction::stream::CompactionStream,
         value::InternalValue,
         vlog::ValueHandle,
-        ValueType,
     };
     use std::collections::HashMap;
     use test_log::test;

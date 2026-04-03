@@ -30,9 +30,15 @@ pub fn recover_blob_files(
     descriptor_table: Option<&Arc<DescriptorTable>>,
     fs: &Arc<dyn Fs>,
 ) -> crate::Result<(Vec<BlobFile>, Vec<PathBuf>)> {
-    if !fs.exists(folder)? {
-        return Ok((vec![], vec![]));
-    }
+    // Recover directly from read_dir; treat NotFound as empty (avoids TOCTOU
+    // with a separate exists() check).
+    let entries = match fs.read_dir(folder) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok((vec![], vec![]));
+        }
+        Err(e) => return Err(e.into()),
+    };
 
     let cnt = ids.len();
 
@@ -47,7 +53,7 @@ pub fn recover_blob_files(
     let mut blob_files = Vec::with_capacity(ids.len());
     let mut orphaned_blob_files = vec![];
 
-    for (idx, dirent) in fs.read_dir(folder)?.into_iter().enumerate() {
+    for (idx, dirent) in entries.into_iter().enumerate() {
         let file_name = &dirent.file_name;
 
         // https://en.wikipedia.org/wiki/.DS_Store
@@ -60,15 +66,18 @@ pub fn recover_blob_files(
             continue;
         }
 
+        // Skip directories before parsing — non-numeric directory names would
+        // fail the parse and abort recovery.
+        if dirent.is_dir {
+            continue;
+        }
+
         let blob_file_id = file_name.parse::<BlobFileId>().map_err(|e| {
             log::error!("invalid blob file name {file_name:?}: {e:?}");
             crate::Error::Unrecoverable
         })?;
 
         let blob_file_path = &dirent.path;
-        if dirent.is_dir {
-            continue;
-        }
 
         if let Some(&(_, checksum)) = ids.iter().find(|(id, _)| id == &blob_file_id) {
             log::trace!(

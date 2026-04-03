@@ -757,9 +757,7 @@ mod tests {
     #[test]
     fn remove_file_nonexistent_fails() -> io::Result<()> {
         let fs = MemFs::new();
-        let err = fs
-            .remove_file(Path::new("/missing"))
-            .err().unwrap();
+        let err = fs.remove_file(Path::new("/missing")).err().unwrap();
         assert_eq!(err.kind(), io::ErrorKind::NotFound);
         Ok(())
     }
@@ -769,7 +767,8 @@ mod tests {
         let fs = MemFs::new();
         let err = fs
             .rename(Path::new("/missing"), Path::new("/dst"))
-            .err().unwrap();
+            .err()
+            .unwrap();
         assert_eq!(err.kind(), io::ErrorKind::NotFound);
         Ok(())
     }

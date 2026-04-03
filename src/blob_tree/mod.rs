@@ -10,6 +10,7 @@ pub mod ingest;
 pub use gc::{FragmentationEntry, FragmentationMap};
 
 use crate::{
+    Cache, Config, Memtable, SeqNo, TableId, TreeId, UserKey, UserValue,
     abstract_tree::{AbstractTree, RangeItem},
     coding::Decode,
     iter_guard::{IterGuard, IterGuardImpl},
@@ -18,7 +19,6 @@ use crate::{
     value::InternalValue,
     version::Version,
     vlog::{Accessor, BlobFile, BlobFileWriter},
-    Cache, Config, Memtable, SeqNo, TableId, TreeId, UserKey, UserValue,
 };
 use handle::BlobIndirection;
 use std::{
@@ -138,7 +138,7 @@ pub struct BlobTree {
 
 impl BlobTree {
     pub(crate) fn open(config: Config) -> crate::Result<Self> {
-        use crate::file::{fsync_directory, BLOBS_FOLDER};
+        use crate::file::{BLOBS_FOLDER, fsync_directory};
 
         let index = crate::Tree::open(config)?;
 

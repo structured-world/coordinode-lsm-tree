@@ -119,7 +119,9 @@ impl Table {
         Ok(if let Some(handle) = &self.regions.linked_blob_files {
             let table_id = self.global_id();
 
-            let (fd, _cache_hit) = self.file_accessor.get_or_open_table(&table_id, &self.path)?;
+            let (fd, _cache_hit) = self
+                .file_accessor
+                .get_or_open_table(&table_id, &self.path)?;
 
             // Read the exact region using pread-style helper
             let buf =
@@ -524,7 +526,10 @@ impl Table {
         let file_handle: Arc<dyn FsFile> = Arc::from(file);
 
         let file_accessor = if let Some(dt) = descriptor_table {
-            FileAccessor::DescriptorTable { table: dt, fs: fs.clone() }
+            FileAccessor::DescriptorTable {
+                table: dt,
+                fs: fs.clone(),
+            }
         } else {
             FileAccessor::File(file_handle.clone())
         };

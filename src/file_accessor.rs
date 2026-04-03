@@ -2,9 +2,9 @@
 // This source code is licensed under both the Apache 2.0 and MIT License
 // (found in the LICENSE-* files in the repository)
 
+use crate::GlobalTableId;
 use crate::descriptor_table::DescriptorTable;
 use crate::fs::{Fs, FsFile, FsOpenOptions};
-use crate::GlobalTableId;
 use std::path::Path;
 use std::sync::Arc;
 

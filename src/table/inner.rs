@@ -7,19 +7,19 @@ use crate::metrics::Metrics;
 
 use super::{block_index::BlockIndexImpl, meta::ParsedMeta, regions::ParsedRegions};
 use crate::{
+    Checksum, GlobalTableId, SeqNo,
     cache::Cache,
     comparator::SharedComparator,
     encryption::EncryptionProvider,
     file_accessor::FileAccessor,
     fs::Fs,
     range_tombstone::RangeTombstone,
-    table::{filter::block::FilterBlock, IndexBlock},
+    table::{IndexBlock, filter::block::FilterBlock},
     tree::inner::TreeId,
-    Checksum, GlobalTableId, SeqNo,
 };
 use std::{
     path::PathBuf,
-    sync::{atomic::AtomicBool, Arc, OnceLock},
+    sync::{Arc, OnceLock, atomic::AtomicBool},
 };
 
 pub struct Inner {

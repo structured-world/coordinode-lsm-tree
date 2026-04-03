@@ -3,15 +3,15 @@
     reason = "benchmark setup favors concise panic messages"
 )]
 
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use lsm_tree::{
-    fs::StdFs,
-    table::{
-        filter::standard_bloom::Builder as BloomBuilder, BlockHandle, BlockOffset, IndexBlock,
-        KeyedBlockHandle, Table, Writer,
-    },
     Cache, Checksum, DefaultUserComparator, DescriptorTable, InternalValue, SeqNo,
     SharedComparator, TableId, ValueType,
+    fs::StdFs,
+    table::{
+        BlockHandle, BlockOffset, IndexBlock, KeyedBlockHandle, Table, Writer,
+        filter::standard_bloom::Builder as BloomBuilder,
+    },
 };
 use std::sync::Arc;
 use tempfile::TempDir;

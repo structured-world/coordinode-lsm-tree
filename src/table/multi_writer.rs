@@ -4,10 +4,10 @@
 
 use super::{filter::BloomConstructionPolicy, writer::Writer};
 use crate::{
+    Checksum, CompressionType, HashMap, SequenceNumberCounter, TableId, UserKey,
     blob_tree::handle::BlobIndirection, encryption::EncryptionProvider, fs::Fs,
     prefix::PrefixExtractor, range_tombstone::RangeTombstone, table::writer::LinkedFile,
-    value::InternalValue, vlog::BlobFileId, Checksum, CompressionType, HashMap,
-    SequenceNumberCounter, TableId, UserKey,
+    value::InternalValue, vlog::BlobFileId,
 };
 use std::{path::PathBuf, sync::Arc};
 
@@ -533,7 +533,7 @@ impl MultiWriter {
     reason = "test code"
 )]
 mod tests {
-    use crate::{config::CompressionPolicy, AbstractTree, Config, SeqNo, SequenceNumberCounter};
+    use crate::{AbstractTree, Config, SeqNo, SequenceNumberCounter, config::CompressionPolicy};
     use test_log::test;
 
     // NOTE: Tests that versions of the same key stay
@@ -579,7 +579,7 @@ mod tests {
     #[test]
     fn clip_preserves_rt_covering_gap_between_output_tables() -> crate::Result<()> {
         use crate::range_tombstone::RangeTombstone;
-        use crate::{fs::StdFs, InternalValue, UserKey};
+        use crate::{InternalValue, UserKey, fs::StdFs};
         use std::sync::Arc;
 
         let folder = tempfile::tempdir()?;
@@ -675,7 +675,7 @@ mod tests {
     // Verify the RT is still written but key_range stays disjoint.
     #[test]
     fn clip_rt_spanning_next_table_does_not_overlap_key_ranges() -> crate::Result<()> {
-        use crate::{fs::StdFs, InternalValue, UserKey};
+        use crate::{InternalValue, UserKey, fs::StdFs};
         use std::sync::Arc;
 
         let folder = tempfile::tempdir()?;

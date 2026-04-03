@@ -4,8 +4,8 @@
 
 use super::{Block, BlockHandle, GlobalTableId};
 use crate::{
-    encryption::EncryptionProvider, file_accessor::FileAccessor, table::block::BlockType,
-    version::run::Ranged, Cache, CompressionType, KeyRange, Table,
+    Cache, CompressionType, KeyRange, Table, encryption::EncryptionProvider,
+    file_accessor::FileAccessor, table::block::BlockType, version::run::Ranged,
 };
 use std::path::Path;
 
