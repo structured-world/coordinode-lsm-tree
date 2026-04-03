@@ -74,12 +74,10 @@ pub fn recover_blob_files(
                 blob_file_path.display(),
             );
 
-            let file = fs.open(blob_file_path, &crate::fs::FsOpenOptions::new().read(true))?;
+            let mut file = fs.open(blob_file_path, &crate::fs::FsOpenOptions::new().read(true))?;
 
             let meta = {
-                let mut reader_file =
-                    fs.open(blob_file_path, &crate::fs::FsOpenOptions::new().read(true))?;
-                let reader = sfa::Reader::from_reader(&mut reader_file)?;
+                let reader = sfa::Reader::from_reader(&mut file)?;
                 let toc = reader.toc();
 
                 let metadata_section = toc.section(b"meta")
