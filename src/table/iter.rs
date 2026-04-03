@@ -289,27 +289,24 @@ impl Iterator for Iter {
                 Err(e) => return self.poison(e),
             };
 
-            // Load the next data block referenced by the index handle.  We try the shared block
-            // cache first to avoid hitting the filesystem, and fall back to `load_block` on miss.
-            let block = match self.cache.get_block(self.table_id, handle.offset()) {
-                Some(block) => block,
-                None => match load_block(
-                    self.table_id,
-                    &self.path,
-                    &self.file_accessor,
-                    &self.cache,
-                    &BlockHandle::new(handle.offset(), handle.size()),
-                    crate::table::block::BlockType::Data,
-                    self.compression,
-                    self.encryption.as_deref(),
-                    #[cfg(zstd_any)]
-                    self.zstd_dictionary.as_deref(),
-                    #[cfg(feature = "metrics")]
-                    &self.metrics,
-                ) {
-                    Ok(b) => b,
-                    Err(e) => return self.poison(e),
-                },
+            // Load the next data block via `load_block`, which checks the block cache
+            // internally and validates block type on both cache-hit and I/O paths.
+            let block = match load_block(
+                self.table_id,
+                &self.path,
+                &self.file_accessor,
+                &self.cache,
+                &BlockHandle::new(handle.offset(), handle.size()),
+                crate::table::block::BlockType::Data,
+                self.compression,
+                self.encryption.as_deref(),
+                #[cfg(zstd_any)]
+                self.zstd_dictionary.as_deref(),
+                #[cfg(feature = "metrics")]
+                &self.metrics,
+            ) {
+                Ok(b) => b,
+                Err(e) => return self.poison(e),
             };
             let block = DataBlock::new(block);
 
@@ -420,27 +417,24 @@ impl DoubleEndedIterator for Iter {
                 Err(e) => return self.poison(e),
             };
 
-            // Retrieve the next data block from the cache (or disk on miss) so the high-side reader
-            // can serve entries in reverse order.
-            let block = match self.cache.get_block(self.table_id, handle.offset()) {
-                Some(block) => block,
-                None => match load_block(
-                    self.table_id,
-                    &self.path,
-                    &self.file_accessor,
-                    &self.cache,
-                    &BlockHandle::new(handle.offset(), handle.size()),
-                    crate::table::block::BlockType::Data,
-                    self.compression,
-                    self.encryption.as_deref(),
-                    #[cfg(zstd_any)]
-                    self.zstd_dictionary.as_deref(),
-                    #[cfg(feature = "metrics")]
-                    &self.metrics,
-                ) {
-                    Ok(b) => b,
-                    Err(e) => return self.poison(e),
-                },
+            // Load the next data block via `load_block`, which checks the block cache
+            // internally and validates block type on both cache-hit and I/O paths.
+            let block = match load_block(
+                self.table_id,
+                &self.path,
+                &self.file_accessor,
+                &self.cache,
+                &BlockHandle::new(handle.offset(), handle.size()),
+                crate::table::block::BlockType::Data,
+                self.compression,
+                self.encryption.as_deref(),
+                #[cfg(zstd_any)]
+                self.zstd_dictionary.as_deref(),
+                #[cfg(feature = "metrics")]
+                &self.metrics,
+            ) {
+                Ok(b) => b,
+                Err(e) => return self.poison(e),
             };
             let block = DataBlock::new(block);
 

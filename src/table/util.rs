@@ -55,6 +55,13 @@ pub fn load_block(
     log::trace!("load {block_type:?} block {handle:?}");
 
     if let Some(block) = cache.get_block(table_id, handle.offset()) {
+        if block.header.block_type != block_type {
+            return Err(crate::Error::InvalidTag((
+                "BlockType",
+                block.header.block_type.into(),
+            )));
+        }
+
         #[cfg(feature = "metrics")]
         match block_type {
             BlockType::Filter => {
