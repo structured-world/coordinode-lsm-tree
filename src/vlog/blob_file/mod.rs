@@ -10,13 +10,13 @@ pub mod scanner;
 pub mod writer;
 
 use crate::{
-    blob_tree::FragmentationMap, file_accessor::FileAccessor, vlog::BlobFileId, Checksum,
-    GlobalTableId, TreeId,
+    Checksum, GlobalTableId, TreeId, blob_tree::FragmentationMap, file_accessor::FileAccessor,
+    vlog::BlobFileId,
 };
 pub use meta::Metadata;
 use std::{
     path::{Path, PathBuf},
-    sync::{atomic::AtomicBool, Arc},
+    sync::{Arc, atomic::AtomicBool},
 };
 
 /// A blob file is an immutable, sorted, contiguous file that contains large key-value pairs (blobs)

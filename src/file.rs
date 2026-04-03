@@ -3,8 +3,8 @@
 // (found in the LICENSE-* files in the repository)
 
 use crate::{
-    fs::{Fs, FsFile},
     Slice,
+    fs::{Fs, FsFile},
 };
 use std::{io::Write, path::Path};
 
