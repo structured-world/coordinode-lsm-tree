@@ -76,6 +76,8 @@ pub fn rewrite_atomic(path: &Path, content: &[u8], fs: &dyn Fs) -> std::io::Resu
         file.flush()?;
         FsFile::sync_all(&*file)?;
         drop(file);
+        // std::fs::rename overwrites existing destinations on all platforms
+        // (Rust uses MoveFileExW with MOVEFILE_REPLACE_EXISTING on Windows).
         fs.rename(&tmp_path, path)?;
         Ok(())
     })();

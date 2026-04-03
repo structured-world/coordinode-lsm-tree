@@ -61,7 +61,7 @@ pub fn recover_blob_files(
         }
 
         let blob_file_id = file_name.parse::<BlobFileId>().map_err(|e| {
-            log::error!("invalid table file name {file_name:?}: {e:?}");
+            log::error!("invalid blob file name {file_name:?}: {e:?}");
             crate::Error::Unrecoverable
         })?;
 
