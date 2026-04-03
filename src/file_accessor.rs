@@ -106,7 +106,7 @@ impl std::fmt::Debug for FileAccessor {
         match self {
             Self::File(_) => write!(f, "FileAccessor::Pinned"),
             Self::DescriptorTable { .. } => {
-                write!(f, "FileAccessor::Cached")
+                write!(f, "FileAccessor::DescriptorTable")
             }
         }
     }

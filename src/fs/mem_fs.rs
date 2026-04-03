@@ -396,6 +396,13 @@ impl Fs for MemFs {
         let state = read_state(&self.state)?;
 
         if !state.dirs.contains(path) {
+            // Distinguish "path is a file" from "path does not exist".
+            if state.files.contains_key(path) {
+                return Err(io::Error::other(format!(
+                    "not a directory: {}",
+                    path.display()
+                )));
+            }
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
                 format!("directory not found: {}", path.display()),
@@ -484,6 +491,9 @@ impl Fs for MemFs {
 
         state.files.retain(|p, _| !p.starts_with(path));
         state.dirs.retain(|p| !p.starts_with(path));
+
+        // Re-seed root so exists("/") and read_dir("/") remain valid.
+        state.dirs.insert(PathBuf::from("/"));
         Ok(())
     }
 

@@ -274,11 +274,14 @@ pub trait Fs: Send + Sync + 'static {
     /// Returns an I/O error if the directory cannot be removed.
     fn remove_dir_all(&self, path: &Path) -> io::Result<()>;
 
-    /// Renames a file or directory from `from` to `to`.
+    /// Renames a file from `from` to `to`.
     ///
     /// If `to` already exists as a regular file, it is atomically replaced.
     /// This is required by [`rewrite_atomic`](crate::file::rewrite_atomic)
     /// for crash-safe version pointer updates.
+    ///
+    /// lsm-tree only renames files (table files, version pointers), never
+    /// directories. [`MemFs`] rejects directory renames with `InvalidInput`.
     ///
     /// # Errors
     ///
