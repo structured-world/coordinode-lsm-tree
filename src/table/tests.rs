@@ -1890,6 +1890,103 @@ fn load_block_range_tombstone_metrics() -> crate::Result<()> {
     Ok(())
 }
 
+/// Regression test for <https://github.com/structured-world/coordinode-lsm-tree/issues/198>:
+/// `load_block` must validate the cached block's `block_type` against the
+/// caller's expected type.  Before the fix the cache-hit path returned the
+/// block unconditionally, so a corrupted block handle pointing at a cached
+/// block of the wrong type (e.g. a data block at an index block offset)
+/// would slip through without an error.
+#[test]
+fn load_block_cache_hit_rejects_wrong_block_type() -> crate::Result<()> {
+    use crate::{
+        CompressionType,
+        cache::Cache,
+        descriptor_table::DescriptorTable,
+        table::{block::BlockType, util::load_block},
+    };
+
+    let dir = tempdir()?;
+    let file = dir.path().join("table");
+
+    // Build a minimal table with one data block.
+    let mut writer = Writer::new(file.clone(), 0, 0, Arc::new(StdFs))?;
+    writer.write(InternalValue::from_components(
+        b"a",
+        b"v1",
+        1,
+        crate::ValueType::Value,
+    ))?;
+    let (_, checksum) = writer.finish()?.unwrap();
+
+    #[cfg(feature = "metrics")]
+    let metrics = Arc::new(crate::metrics::Metrics::default());
+
+    let table = Table::recover(
+        file,
+        checksum,
+        0,
+        0,
+        Arc::new(Cache::with_capacity_bytes(10_000_000)),
+        Some(Arc::new(DescriptorTable::new(10))),
+        false,
+        false,
+        None,
+        #[cfg(zstd_any)]
+        None,
+        crate::comparator::default_comparator(),
+        #[cfg(feature = "metrics")]
+        metrics.clone(),
+    )?;
+
+    let table_id = table.global_id();
+
+    // The range-tombstone block handle is type-specific, but every table has a
+    // TLI (top-level index) block whose handle we can reuse.  Load it first as
+    // an Index block (correct type) so it lands in the cache.
+    let tli_handle = table.regions.tli;
+    let fresh_cache = Arc::new(Cache::with_capacity_bytes(10_000_000));
+
+    let _block = load_block(
+        table_id,
+        &table.path,
+        &table.file_accessor,
+        &fresh_cache,
+        &tli_handle,
+        BlockType::Index,
+        CompressionType::None,
+        None,
+        #[cfg(zstd_any)]
+        None,
+        #[cfg(feature = "metrics")]
+        &metrics,
+    )?;
+
+    // Now request the same offset but claim it is a Data block.  The block is
+    // already cached (as Index), so the cache-hit path must detect the type
+    // mismatch and return `Error::InvalidTag`.
+    let result = load_block(
+        table_id,
+        &table.path,
+        &table.file_accessor,
+        &fresh_cache,
+        &tli_handle,
+        BlockType::Data,
+        CompressionType::None,
+        None,
+        #[cfg(zstd_any)]
+        None,
+        #[cfg(feature = "metrics")]
+        &metrics,
+    );
+
+    assert!(
+        matches!(&result, Err(crate::Error::InvalidTag(("BlockType", _)))),
+        "expected InvalidTag for block type mismatch on cache hit, got Ok or wrong Err",
+    );
+
+    Ok(())
+}
+
 /// End-to-end corruption test: tamper on-disk `seqno#kv_max` so it exceeds
 /// `seqno#max`, then verify that `ParsedMeta::load_with_handle` rejects the
 /// file with an `InvalidData` error.
