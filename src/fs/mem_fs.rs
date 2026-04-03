@@ -213,6 +213,8 @@ impl FsFile for MemFile {
         Ok(copy_from_data(buf, &data, offset as usize))
     }
 
+    /// No-op: in-memory files are not shared across processes. MemFs is a
+    /// test/ephemeral backend — cross-process exclusivity is not meaningful.
     fn lock_exclusive(&self) -> io::Result<()> {
         Ok(())
     }

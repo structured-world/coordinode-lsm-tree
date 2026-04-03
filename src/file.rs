@@ -3,8 +3,8 @@
 // (found in the LICENSE-* files in the repository)
 
 use crate::{
-    Slice,
     fs::{Fs, FsFile},
+    Slice,
 };
 use std::{io::Write, path::Path};
 
@@ -63,6 +63,11 @@ pub fn rewrite_atomic(path: &Path, content: &[u8], fs: &dyn Fs) -> std::io::Resu
     )]
     let folder = path.parent().expect("should have a parent");
 
+    // PID + monotonic seq gives uniqueness within a process and across
+    // concurrent processes. A crash-then-PID-reuse collision is theoretically
+    // possible but vanishingly unlikely (requires exact PID reuse AND seq
+    // counter restart to same value). lsm-tree uses exclusive file locking
+    // so the same data directory is never written by two processes.
     let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
     let pid = std::process::id();
     let tmp_path = folder.join(format!(".tmp_{pid}_{seq}"));
