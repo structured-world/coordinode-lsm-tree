@@ -83,7 +83,17 @@ pub fn load_block(
         return Ok(block);
     }
 
-    let fd = file_accessor.get_or_open_table(&table_id, path)?;
+    #[cfg(feature = "metrics")]
+    let (fd, cache_hit) = file_accessor.get_or_open_table(&table_id, path)?;
+    #[cfg(not(feature = "metrics"))]
+    let (fd, _) = file_accessor.get_or_open_table(&table_id, path)?;
+
+    #[cfg(feature = "metrics")]
+    if cache_hit {
+        metrics.table_file_opened_cached.fetch_add(1, Relaxed);
+    } else {
+        metrics.table_file_opened_uncached.fetch_add(1, Relaxed);
+    }
 
     let block = Block::from_file(
         fd.as_ref(),

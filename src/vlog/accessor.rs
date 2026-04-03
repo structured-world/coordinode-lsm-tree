@@ -34,7 +34,7 @@ impl<'a> Accessor<'a> {
 
         let bf_id = GlobalTableId::from((tree_id, blob_file.id()));
 
-        let file = blob_file
+        let (file, _) = blob_file
             .file_accessor()
             .get_or_open_blob_file(&bf_id, &base_path.join(vhandle.blob_file_id.to_string()))?;
 

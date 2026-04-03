@@ -36,41 +36,47 @@ impl FileAccessor {
     }
 
     /// Returns a cached table FD or opens the file via [`Fs`] on cache miss.
+    ///
+    /// The returned `bool` indicates whether the file descriptor was already
+    /// cached (`true`) or freshly opened (`false`).
     pub fn get_or_open_table(
         &self,
         table_id: &GlobalTableId,
         path: &Path,
-    ) -> std::io::Result<Arc<dyn FsFile>> {
+    ) -> std::io::Result<(Arc<dyn FsFile>, bool)> {
         match self {
-            Self::File(fd) => Ok(fd.clone()),
+            Self::File(fd) => Ok((fd.clone(), true)),
             Self::DescriptorTable { table, fs } => {
                 if let Some(fd) = table.access_for_table(table_id) {
-                    return Ok(fd);
+                    return Ok((fd, true));
                 }
                 let fd: Arc<dyn FsFile> =
                     Arc::from(fs.open(path, &FsOpenOptions::new().read(true))?);
                 table.insert_for_table(*table_id, fd.clone());
-                Ok(fd)
+                Ok((fd, false))
             }
         }
     }
 
     /// Returns a cached blob file FD or opens it via [`Fs`] on cache miss.
+    ///
+    /// The returned `bool` indicates whether the file descriptor was already
+    /// cached (`true`) or freshly opened (`false`).
     pub fn get_or_open_blob_file(
         &self,
         table_id: &GlobalTableId,
         path: &Path,
-    ) -> std::io::Result<Arc<dyn FsFile>> {
+    ) -> std::io::Result<(Arc<dyn FsFile>, bool)> {
         match self {
-            Self::File(fd) => Ok(fd.clone()),
+            Self::File(fd) => Ok((fd.clone(), true)),
             Self::DescriptorTable { table, fs } => {
                 if let Some(fd) = table.access_for_blob_file(table_id) {
-                    return Ok(fd);
+                    return Ok((fd, true));
                 }
                 let fd: Arc<dyn FsFile> =
                     Arc::from(fs.open(path, &FsOpenOptions::new().read(true))?);
                 table.insert_for_blob_file(*table_id, fd.clone());
-                Ok(fd)
+                Ok((fd, false))
             }
         }
     }

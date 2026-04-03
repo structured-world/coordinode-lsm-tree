@@ -424,7 +424,7 @@ impl AbstractTree for BlobTree {
             self.index.table_id_counter.clone(),
             64 * 1_024 * 1_024,
             0,
-            level_fs,
+            level_fs.clone(),
         )?
         .set_comparator(self.index.config.comparator.clone())
         .use_data_block_restart_interval(data_block_restart_interval)
@@ -544,7 +544,7 @@ impl AbstractTree for BlobTree {
                     self.index.id,
                     self.index.config.cache.clone(),
                     self.index.config.descriptor_table.clone(),
-                    self.index.config.fs.clone(),
+                    level_fs.clone(),
                     pin_filter,
                     pin_index,
                     self.index.config.encryption.clone(),

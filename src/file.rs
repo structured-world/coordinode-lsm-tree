@@ -76,7 +76,11 @@ pub fn rewrite_atomic(path: &Path, content: &[u8], fs: &dyn Fs) -> std::io::Resu
         FsFile::sync_all(&*file)?;
     }
 
-    fs.rename(&tmp_path, path)?;
+    if let Err(e) = fs.rename(&tmp_path, path) {
+        // Best-effort cleanup of the temp file.
+        let _ = fs.remove_file(&tmp_path);
+        return Err(e);
+    }
     fsync_directory(folder, fs)?;
 
     Ok(())

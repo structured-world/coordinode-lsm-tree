@@ -1,4 +1,5 @@
 use lsm_tree::fs::MemFs;
+// Guard trait import required for IterGuardImpl::into_inner() method dispatch.
 use lsm_tree::{AbstractTree, Config, Guard, SeqNo, SequenceNumberCounter};
 use test_log::test;
 

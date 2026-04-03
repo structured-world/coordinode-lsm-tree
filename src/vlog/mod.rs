@@ -30,7 +30,7 @@ pub fn recover_blob_files(
     descriptor_table: Option<&Arc<DescriptorTable>>,
     fs: &Arc<dyn Fs>,
 ) -> crate::Result<(Vec<BlobFile>, Vec<PathBuf>)> {
-    if !folder.try_exists()? {
+    if !fs.exists(folder)? {
         return Ok((vec![], vec![]));
     }
 
@@ -47,9 +47,8 @@ pub fn recover_blob_files(
     let mut blob_files = Vec::with_capacity(ids.len());
     let mut orphaned_blob_files = vec![];
 
-    for (idx, dirent) in std::fs::read_dir(folder)?.enumerate() {
-        let dirent = dirent?;
-        let file_name = dirent.file_name();
+    for (idx, dirent) in fs.read_dir(folder)?.into_iter().enumerate() {
+        let file_name = &dirent.file_name;
 
         // https://en.wikipedia.org/wiki/.DS_Store
         if file_name == ".DS_Store" {
@@ -57,22 +56,17 @@ pub fn recover_blob_files(
         }
 
         // https://en.wikipedia.org/wiki/AppleSingle_and_AppleDouble_formats
-        if file_name.to_string_lossy().starts_with("._") {
+        if file_name.starts_with("._") {
             continue;
         }
 
-        let blob_file_name = file_name.to_str().ok_or_else(|| {
-            log::error!("invalid table file name {}", file_name.display());
+        let blob_file_id = file_name.parse::<BlobFileId>().map_err(|e| {
+            log::error!("invalid table file name {file_name:?}: {e:?}");
             crate::Error::Unrecoverable
         })?;
 
-        let blob_file_id = blob_file_name.parse::<BlobFileId>().map_err(|e| {
-            log::error!("invalid table file name {blob_file_name:?}: {e:?}");
-            crate::Error::Unrecoverable
-        })?;
-
-        let blob_file_path = dirent.path();
-        assert!(!blob_file_path.is_dir());
+        let blob_file_path = &dirent.path;
+        assert!(!dirent.is_dir);
 
         if let Some(&(_, checksum)) = ids.iter().find(|(id, _)| id == &blob_file_id) {
             log::trace!(
@@ -80,10 +74,10 @@ pub fn recover_blob_files(
                 blob_file_path.display(),
             );
 
-            let file = fs.open(&blob_file_path, &crate::fs::FsOpenOptions::new().read(true))?;
+            let file = fs.open(blob_file_path, &crate::fs::FsOpenOptions::new().read(true))?;
 
             let meta = {
-                let reader = sfa::Reader::new(&blob_file_path)?;
+                let reader = sfa::Reader::new(blob_file_path)?;
                 let toc = reader.toc();
 
                 let metadata_section = toc.section(b"meta")
@@ -111,7 +105,7 @@ pub fn recover_blob_files(
 
             blob_files.push(BlobFile(Arc::new(BlobFileInner {
                 id: blob_file_id,
-                path: blob_file_path,
+                path: blob_file_path.clone(),
                 meta,
                 is_deleted: AtomicBool::new(false),
                 checksum,

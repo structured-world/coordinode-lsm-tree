@@ -392,7 +392,7 @@ impl AbstractTree for Tree {
             self.table_id_counter.clone(),
             64 * 1_024 * 1_024,
             0,
-            level_fs,
+            level_fs.clone(),
         )?
         .set_comparator(self.config.comparator.clone())
         .use_data_block_restart_interval(data_block_restart_interval)
@@ -453,7 +453,7 @@ impl AbstractTree for Tree {
                     self.id,
                     self.config.cache.clone(),
                     self.config.descriptor_table.clone(),
-                    self.config.fs.clone(),
+                    level_fs.clone(),
                     pin_filter,
                     pin_index,
                     self.config.encryption.clone(),
@@ -1598,7 +1598,7 @@ impl Tree {
                         tree_id,
                         config.cache.clone(),
                         config.descriptor_table.clone(),
-                        config.fs.clone(),
+                        folder_fs.clone(),
                         pin_filter,
                         pin_index,
                         config.encryption.clone(),

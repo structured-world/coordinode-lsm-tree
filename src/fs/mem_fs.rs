@@ -32,8 +32,9 @@ use std::sync::{Arc, Mutex, RwLock};
 
 /// In-memory [`Fs`] backend for testing and ephemeral in-memory trees.
 ///
-/// Backed by a `HashMap<PathBuf, Vec<u8>>` — no disk I/O is performed.
-/// Clones share the same backing store.
+/// Backed by a `HashMap<PathBuf, Arc<Mutex<Vec<u8>>>>` — no disk I/O is
+/// performed. Clones share the same backing store, and individual file
+/// contents are synchronized through a per-file [`Mutex`].
 ///
 /// # Example
 ///
@@ -257,7 +258,7 @@ impl Fs for MemFs {
                 data,
                 cursor: 0,
                 readable: opts.read,
-                writable: true,
+                writable: opts.write || opts.append,
                 is_append: opts.append,
             }));
         }
@@ -293,7 +294,7 @@ impl Fs for MemFs {
                 data,
                 cursor: 0,
                 readable: opts.read,
-                writable: true,
+                writable: opts.write || opts.append,
                 is_append: opts.append,
             }))
         } else {
@@ -369,6 +370,12 @@ impl Fs for MemFs {
 
     fn remove_dir_all(&self, path: &Path) -> io::Result<()> {
         let mut state = write_state(&self.state)?;
+        if !state.dirs.contains(path) && !state.files.contains_key(path) {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("path not found: {}", path.display()),
+            ));
+        }
         state.files.retain(|p, _| !p.starts_with(path));
         state.dirs.retain(|p| !p.starts_with(path));
         Ok(())
@@ -376,6 +383,19 @@ impl Fs for MemFs {
 
     fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
         let mut state = write_state(&self.state)?;
+
+        // Validate destination parent exists (mirrors std::fs behaviour).
+        if let Some(parent) = to.parent()
+            && !parent.as_os_str().is_empty()
+            && parent != Path::new("/")
+            && !state.dirs.contains(parent)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("destination parent not found: {}", parent.display()),
+            ));
+        }
+
         if let Some(data) = state.files.remove(from) {
             state.files.insert(to.to_path_buf(), data);
             Ok(())
@@ -442,11 +462,9 @@ fn write_state(rw: &RwLock<State>) -> io::Result<std::sync::RwLockWriteGuard<'_,
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-#[allow(
+#[expect(
     clippy::unwrap_used,
-    clippy::expect_used,
     clippy::indexing_slicing,
-    clippy::useless_vec,
     clippy::unnecessary_wraps,
     reason = "test code"
 )]
