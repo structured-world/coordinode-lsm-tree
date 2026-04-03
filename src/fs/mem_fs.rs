@@ -213,7 +213,7 @@ impl FsFile for MemFile {
         Ok(copy_from_data(buf, &data, offset as usize))
     }
 
-    /// No-op: in-memory files are not shared across processes. MemFs is a
+    /// No-op: in-memory files are not shared across processes. `MemFs` is a
     /// test/ephemeral backend — cross-process exclusivity is not meaningful.
     fn lock_exclusive(&self) -> io::Result<()> {
         Ok(())
@@ -372,12 +372,22 @@ impl Fs for MemFs {
 
     fn remove_dir_all(&self, path: &Path) -> io::Result<()> {
         let mut state = write_state(&self.state)?;
-        if !state.dirs.contains(path) && !state.files.contains_key(path) {
+
+        // Reject files — std::fs::remove_dir_all errors on non-directories.
+        if state.files.contains_key(path) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("path is not a directory: {}", path.display()),
+            ));
+        }
+
+        if !state.dirs.contains(path) {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
                 format!("path not found: {}", path.display()),
             ));
         }
+
         state.files.retain(|p, _| !p.starts_with(path));
         state.dirs.retain(|p| !p.starts_with(path));
         Ok(())
