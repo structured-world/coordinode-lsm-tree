@@ -2,12 +2,12 @@
 // This source code is licensed under both the Apache 2.0 and MIT License
 // (found in the LICENSE-* files in the repository)
 
-use crate::SeqNo;
 use crate::comparator::SharedComparator;
 use crate::table::block::{BlockType, Decoder};
-use crate::table::block_index::{BlockIndexIter, iter::OwnedIndexBlockIter};
+use crate::table::block_index::{iter::OwnedIndexBlockIter, BlockIndexIter};
 use crate::table::index_block::IndexBlockParsedItem;
 use crate::table::{IndexBlock, KeyedBlockHandle};
+use crate::SeqNo;
 
 /// Index that translates item keys to data block handles
 ///
@@ -54,12 +54,10 @@ impl FullBlockIndex {
     }
 
     pub fn iter(&self) -> Iter {
-        // Invariant: trailer was validated in `new`, so `from_block` cannot fail.
-        #[expect(clippy::expect_used, reason = "trailer validated at construction")]
-        Iter(
-            OwnedIndexBlockIter::from_block(self.block.clone(), self.comparator.clone())
-                .expect("trailer validated at construction"),
-        )
+        Iter(OwnedIndexBlockIter::from_validated_block(
+            self.block.clone(),
+            self.comparator.clone(),
+        ))
     }
 }
 

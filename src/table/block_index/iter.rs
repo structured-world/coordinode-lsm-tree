@@ -32,6 +32,21 @@ impl OwnedIndexBlockIter {
         Self::try_new(block, |b| b.try_iter(comparator))
     }
 
+    /// Creates an owned iterator from a pre-validated block.
+    ///
+    /// # Safety contract (logical)
+    ///
+    /// The caller **must** have already validated the block trailer (e.g. via
+    /// [`crate::table::block::Decoder::try_new`] or a prior successful
+    /// `from_block` call). Calling this on an unvalidated block may panic
+    /// inside the decoder.
+    pub(crate) fn from_validated_block(
+        block: IndexBlock,
+        comparator: SharedComparator,
+    ) -> Self {
+        Self::new(block, |b| b.iter(comparator))
+    }
+
     /// Creates an owned iterator with optional lower/upper seek bounds.
     ///
     /// The lower bound `lo`, if provided, seeks the forward cursor to the
@@ -184,6 +199,15 @@ mod tests {
         let mut iter = OwnedIndexBlockIter::from_block(block, default_comparator()).unwrap();
 
         let keys: Vec<_> = iter.by_ref().map(|h| h.end_key().to_vec()).collect();
+        assert_eq!(keys, vec![b"a", b"b", b"c"]);
+    }
+
+    #[test]
+    fn from_validated_block_iterates_all_entries() {
+        let block = make_index_block(&[b"a", b"b", b"c"], 1);
+        let iter = OwnedIndexBlockIter::from_validated_block(block, default_comparator());
+
+        let keys: Vec<_> = iter.map(|h| h.end_key().to_vec()).collect();
         assert_eq!(keys, vec![b"a", b"b", b"c"]);
     }
 
