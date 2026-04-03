@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1775179034000,
+  "lastUpdate": 1775200729762,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -4836,6 +4836,84 @@ window.BENCHMARK_DATA = {
             "value": 259461.63956831733,
             "unit": "ops/sec (normalized)",
             "extra": "raw: 472864 ops/sec | factor: 0.549 | P50: 1.9us | P99: 5.1us | P99.9: 13.4us\nthreads: 1 | elapsed: 0.42s | num: 200000 | iterations: 3 | runner: seq_wr=229580 rand_rd=930753 cpu=123 composite=41917.1"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "d20c47488fc747baa6c047530fec50919bac5756",
+          "message": "refactor(table): make all meta/trailer reads fallible for truncated blocks (#204)\n\n## Summary\n\n- Replace all `expect`/`assert_eq!`/`unwrap_or_else(panic!)` in\n`TableMeta::load_with_handle` with\n`.ok_or(Error::InvalidHeader(\"TableMeta\"))?` — missing or malformed meta\nfields now return structured errors instead of panicking\n- Replace `unwrap!` macro calls in `Decoder::try_new` trailer reads with\n`.map_err(|_| Error::InvalidTrailer)?` for defense-in-depth\n- Add corruption regression test for blob file metadata trailer (#195)\n\n## Test plan\n\n- [x] 5 new `TableMeta` tests: valid roundtrip + 4 corruption variants\n(missing `table_version`, wrong version, missing `key#min`, missing\n`compression#data`)\n- [x] 1 new `BlobFileMeta` test: corrupted trailer bytes → `Err`\n- [x] Full suite: 1034 tests passed, 34 doc-tests passed, clippy clean\n\nCloses #201\nSupersedes #192, #193, #195\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n## Summary by CodeRabbit\n\n* **Bug Fixes**\n* Strengthened parsing of table and block metadata so malformed or\ntruncated header/trailer data now return explicit errors instead of\ncausing panics.\n\n* **Tests**\n* Added regression tests that corrupt metadata/trailer bytes to verify\nerror returns and removal of panic paths.\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-04-03T10:17:22+03:00",
+          "tree_id": "e6a18b71944e3f6a2eb9aa5d6fe841ee6741cb7d",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/d20c47488fc747baa6c047530fec50919bac5756"
+        },
+        "date": 1775200728831,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 1121926.6140176652,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 2016701 ops/sec | factor: 0.556 | P50: 0.4us | P99: 2.0us | P99.9: 5.0us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3 | runner: seq_wr=220417 rand_rd=927627 cpu=123 composite=41343.3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 672978.173008736,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 1209701 ops/sec | factor: 0.556 | P50: 0.7us | P99: 2.4us | P99.9: 5.7us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3 | runner: seq_wr=220417 rand_rd=927627 cpu=123 composite=41343.3"
+          },
+          {
+            "name": "readrandom",
+            "value": 312918.14218303247,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 562481 ops/sec | factor: 0.556 | P50: 1.6us | P99: 5.1us | P99.9: 13.0us\nthreads: 1 | elapsed: 0.36s | num: 200000 | iterations: 3 | runner: seq_wr=220417 rand_rd=927627 cpu=123 composite=41343.3"
+          },
+          {
+            "name": "readseq",
+            "value": 1421670.3243003474,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 2555501 ops/sec | factor: 0.556 | P50: 0.2us | P99: 3.7us | P99.9: 7.6us\nthreads: 1 | elapsed: 0.08s | num: 200000 | iterations: 3 | runner: seq_wr=220417 rand_rd=927627 cpu=123 composite=41343.3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 207320.14876824451,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 372665 ops/sec | factor: 0.556 | P50: 2.3us | P99: 6.0us | P99.9: 13.7us\nthreads: 1 | elapsed: 0.54s | num: 200000 | iterations: 3 | runner: seq_wr=220417 rand_rd=927627 cpu=123 composite=41343.3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 102770.32844409894,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 184733 ops/sec | factor: 0.556 | P50: 5.0us | P99: 7.4us | P99.9: 16.8us\nthreads: 1 | elapsed: 1.08s | num: 200000 | iterations: 3 | runner: seq_wr=220417 rand_rd=927627 cpu=123 composite=41343.3"
+          },
+          {
+            "name": "overwrite",
+            "value": 659725.2116320718,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 1185879 ops/sec | factor: 0.556 | P50: 0.7us | P99: 2.5us | P99.9: 6.2us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3 | runner: seq_wr=220417 rand_rd=927627 cpu=123 composite=41343.3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 416907.74379717454,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 749406 ops/sec | factor: 0.556 | P50: 0.3us | P99: 1.9us | P99.9: 3.7us\nthreads: 1 | elapsed: 0.27s | num: 200000 | iterations: 3 | runner: seq_wr=220417 rand_rd=927627 cpu=123 composite=41343.3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 268170.82974465756,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 482046 ops/sec | factor: 0.556 | P50: 1.8us | P99: 7.2us | P99.9: 14.5us\nthreads: 1 | elapsed: 0.41s | num: 200000 | iterations: 3 | runner: seq_wr=220417 rand_rd=927627 cpu=123 composite=41343.3"
           }
         ]
       }
