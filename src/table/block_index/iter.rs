@@ -34,12 +34,25 @@ impl OwnedIndexBlockIter {
 
     /// Creates an owned iterator from a pre-validated block.
     ///
+    /// Uses the infallible [`IndexBlock::iter`] path, which delegates to
+    /// [`crate::table::block::Decoder::new`]. The decoder still parses the
+    /// trailer bytes (it needs the field values), but the caller's
+    /// prior validation guarantees the internal `expect` cannot fire,
+    /// making the call effectively infallible and removing `Result`
+    /// overhead from the hot path.
+    ///
     /// # Safety contract (logical)
     ///
-    /// The caller **must** have already validated the block trailer (e.g. via
-    /// [`crate::table::block::Decoder::try_new`] or a prior successful
-    /// `from_block` call). Calling this on an unvalidated block may panic
-    /// inside the decoder.
+    /// The caller **must** have already validated both:
+    ///
+    /// - the block trailer (e.g. via
+    ///   [`crate::table::block::Decoder::try_new`] or a prior successful
+    ///   `from_block` call); and
+    /// - that the wrapped block is an index block satisfying the same
+    ///   `BlockType::Index` invariant checked by `try_iter`.
+    ///
+    /// Calling this on a block that violates either invariant may panic
+    /// inside the decoder or produce nonsensical iteration results.
     pub(crate) fn from_validated_block(block: IndexBlock, comparator: SharedComparator) -> Self {
         Self::new(block, |b| b.iter(comparator))
     }
@@ -159,7 +172,7 @@ mod tests {
         Checksum,
         comparator::default_comparator,
         table::BlockHandle,
-        table::block::{BlockOffset, BlockType, Header},
+        table::block::{BlockOffset, BlockType, Decoder, Header},
     };
 
     /// Builds an IndexBlock containing entries with the given keys (seqno=0 for all).
@@ -200,8 +213,15 @@ mod tests {
     }
 
     #[test]
-    fn from_validated_block_iterates_all_entries() {
+    fn from_validated_block_after_prevalidation_iterates_all_entries() {
         let block = make_index_block(&[b"a", b"b", b"c"], 1);
+
+        // Pre-validate: mirrors what FullBlockIndex::new does.
+        Decoder::<KeyedBlockHandle, crate::table::index_block::IndexBlockParsedItem>::try_new(
+            &block.inner,
+        )
+        .unwrap();
+
         let iter = OwnedIndexBlockIter::from_validated_block(block, default_comparator());
 
         let keys: Vec<_> = iter.map(|h| h.end_key().to_vec()).collect();
