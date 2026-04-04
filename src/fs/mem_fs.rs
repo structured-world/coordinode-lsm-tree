@@ -258,6 +258,29 @@ impl Fs for MemFs {
     fn open(&self, path: &Path, opts: &FsOpenOptions) -> io::Result<Box<dyn FsFile>> {
         let mut state = write_state(&self.state)?;
         let path = path.to_path_buf();
+        let wants_write = opts.write || opts.append;
+
+        // Validate flag combinations first (path-independent), before any
+        // filesystem lookups. This ensures consistent InvalidInput errors
+        // regardless of whether the parent directory exists.
+        if !opts.read && !wants_write {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "open requires at least read, write, or append access",
+            ));
+        }
+        if opts.truncate && !wants_write {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "truncate requires write or append access",
+            ));
+        }
+        if (opts.create || opts.create_new) && !wants_write {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "create/create_new requires write or append access",
+            ));
+        }
 
         // Verify parent directory exists (mirrors std::fs behaviour).
         if let Some(parent) = path.parent()
@@ -265,7 +288,6 @@ impl Fs for MemFs {
             && parent != Path::new("/")
             && !state.dirs.contains(parent)
         {
-            // Distinguish "parent is a file" from "parent doesn't exist".
             if state.files.contains_key(parent) {
                 return Err(io::Error::other(format!(
                     "parent is not a directory: {}",
@@ -280,15 +302,6 @@ impl Fs for MemFs {
 
         let exists = state.files.contains_key(&path);
         let is_dir = state.dirs.contains(&path);
-        let wants_write = opts.write || opts.append;
-
-        // Mirror std::fs::OpenOptions: at least one access mode is required.
-        if !opts.read && !wants_write {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "open requires at least read, write, or append access",
-            ));
-        }
 
         // Opening a directory path without create flags is an error (mirrors EISDIR).
         if is_dir && !opts.create && !opts.create_new {
@@ -296,20 +309,6 @@ impl Fs for MemFs {
                 "path is a directory: {}",
                 path.display()
             )));
-        }
-
-        // Mirror std::fs::OpenOptions: truncate/create require write access.
-        if opts.truncate && !wants_write {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "truncate requires write or append access",
-            ));
-        }
-        if (opts.create || opts.create_new) && !wants_write {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "create/create_new requires write or append access",
-            ));
         }
 
         // Reject creating a file at a path that is already a directory.
@@ -475,6 +474,12 @@ impl Fs for MemFs {
 
     fn remove_file(&self, path: &Path) -> io::Result<()> {
         let mut state = write_state(&self.state)?;
+        if state.dirs.contains(path) {
+            return Err(io::Error::other(format!(
+                "cannot remove_file on directory: {}",
+                path.display()
+            )));
+        }
         if state.files.remove(path).is_none() {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
