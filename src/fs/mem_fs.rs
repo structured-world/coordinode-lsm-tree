@@ -894,6 +894,42 @@ mod tests {
     }
 
     #[test]
+    fn read_append_cursor_starts_at_zero() -> io::Result<()> {
+        let fs = MemFs::new();
+        fs.create_dir_all(Path::new("/dir"))?;
+
+        let path = Path::new("/dir/rw_append.txt");
+        let opts = FsOpenOptions::new().write(true).create(true);
+        let mut file = fs.open(path, &opts)?;
+        file.write_all(b"existing")?;
+        drop(file);
+
+        // Open with read + append — cursor should start at 0 for reads,
+        // but writes go to EOF.
+        let opts = FsOpenOptions::new().read(true).append(true);
+        let mut file = fs.open(path, &opts)?;
+
+        // Read should return existing content from offset 0.
+        let mut buf = [0u8; 8];
+        let n = file.read(&mut buf)?;
+        assert_eq!(n, 8);
+        assert_eq!(&buf, b"existing");
+
+        // Write appends to EOF.
+        file.write_all(b"+new")?;
+        drop(file);
+
+        // Verify full content.
+        let opts = FsOpenOptions::new().read(true);
+        let mut file = fs.open(path, &opts)?;
+        let mut buf = String::new();
+        file.read_to_string(&mut buf)?;
+        assert_eq!(buf, "existing+new");
+
+        Ok(())
+    }
+
+    #[test]
     fn seek_and_overwrite() -> io::Result<()> {
         let fs = MemFs::new();
         fs.create_dir_all(Path::new("/dir"))?;
