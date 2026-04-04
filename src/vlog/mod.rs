@@ -31,14 +31,17 @@ pub fn recover_blob_files(
     descriptor_table: Option<&Arc<DescriptorTable>>,
     fs: &Arc<dyn Fs>,
 ) -> crate::Result<(Vec<BlobFile>, Vec<PathBuf>)> {
-    // Recover directly from read_dir; treat NotFound as empty (avoids TOCTOU
-    // with a separate exists() check). This is correct even when `ids` is
-    // non-empty: the blobs folder may not exist for standard (non-blob) trees,
-    // and callers handle missing blob files via orphan detection.
+    // Recover directly from read_dir; treat NotFound as empty only for
+    // standard (non-blob) trees where no blob folder is expected.
+    // If the manifest references blob files (ids non-empty) but the folder
+    // is missing, that is unrecoverable corruption — fail fast.
     let entries = match fs.read_dir(folder) {
         Ok(entries) => entries,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Ok((vec![], vec![]));
+            if ids.is_empty() {
+                return Ok((vec![], vec![]));
+            }
+            return Err(crate::Error::Unrecoverable);
         }
         Err(e) => return Err(e.into()),
     };
@@ -173,12 +176,12 @@ mod tests {
     }
 
     #[test]
-    fn vlog_recovery_nonexistent_folder_returns_empty() {
+    fn vlog_recovery_nonexistent_folder_no_ids_returns_empty() {
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("no_such_dir");
         let (blob_files, orphans) = recover_blob_files(
             &missing,
-            &[(0, Checksum::from_raw(0))],
+            &[],
             0,
             None,
             &(Arc::new(crate::fs::StdFs) as Arc<dyn crate::fs::Fs>),
@@ -186,5 +189,19 @@ mod tests {
         .unwrap();
         assert!(blob_files.is_empty());
         assert!(orphans.is_empty());
+    }
+
+    #[test]
+    fn vlog_recovery_nonexistent_folder_with_ids_returns_unrecoverable() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("no_such_dir");
+        let result = recover_blob_files(
+            &missing,
+            &[(0, Checksum::from_raw(0))],
+            0,
+            None,
+            &(Arc::new(crate::fs::StdFs) as Arc<dyn crate::fs::Fs>),
+        );
+        assert!(matches!(result, Err(crate::Error::Unrecoverable)));
     }
 }
