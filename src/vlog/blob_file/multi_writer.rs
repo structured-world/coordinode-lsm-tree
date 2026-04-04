@@ -116,7 +116,7 @@ impl MultiWriter {
             old_writer,
             self.passthrough_compression,
             self.descriptor_table.clone(),
-            &*self.fs,
+            &self.fs,
         )?;
         self.results.extend(blob_file);
 
@@ -127,7 +127,7 @@ impl MultiWriter {
         writer: Writer,
         passthrough_compression: CompressionType,
         descriptor_table: Option<Arc<DescriptorTable>>,
-        fs: &dyn Fs,
+        fs: &Arc<dyn Fs>,
     ) -> crate::Result<Option<BlobFile>> {
         if writer.item_count > 0 {
             let blob_file_id = writer.blob_file_id;
@@ -143,13 +143,16 @@ impl MultiWriter {
 
             let (metadata, checksum) = writer.finish()?;
 
-            // NOTE: Read-back uses std::fs::File because FileAccessor/DescriptorTable
-            // expect Arc<dyn FsFile>. Migrating the read path to Fs is a separate scope.
-            let file: Arc<dyn FsFile> = Arc::new(std::fs::File::open(&path)?);
-            let file_accessor = descriptor_table.map_or_else(
-                || FileAccessor::File(file.clone()),
-                FileAccessor::DescriptorTable,
-            );
+            let file: Arc<dyn FsFile> =
+                Arc::from(fs.open(&path, &crate::fs::FsOpenOptions::new().read(true))?);
+            let file_accessor = if let Some(dt) = descriptor_table {
+                FileAccessor::DescriptorTable {
+                    table: dt,
+                    fs: fs.clone(),
+                }
+            } else {
+                FileAccessor::File(file.clone())
+            };
             file_accessor.insert_for_blob_file((tree_id, blob_file_id).into(), file);
 
             let blob_file = BlobFile(Arc::new(BlobFileInner {
@@ -258,7 +261,7 @@ impl MultiWriter {
             self.active_writer,
             self.passthrough_compression,
             self.descriptor_table.clone(),
-            &*self.fs,
+            &self.fs,
         )?;
         self.results.extend(blob_file);
         Ok(self.results)

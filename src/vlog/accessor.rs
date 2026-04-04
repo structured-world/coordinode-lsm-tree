@@ -4,11 +4,10 @@
 
 use crate::{
     Cache, GlobalTableId, TreeId, UserValue,
-    fs::FsFile,
     version::BlobFileList,
     vlog::{ValueHandle, blob_file::reader::Reader},
 };
-use std::{path::Path, sync::Arc};
+use std::path::Path;
 
 pub struct Accessor<'a>(&'a BlobFileList);
 
@@ -35,22 +34,12 @@ impl<'a> Accessor<'a> {
 
         let bf_id = GlobalTableId::from((tree_id, blob_file.id()));
 
-        let (file, fd_cache_miss) =
-            if let Some(cached_fd) = blob_file.file_accessor().access_for_blob_file(&bf_id) {
-                (cached_fd, false)
-            } else {
-                let file: Arc<dyn FsFile> = Arc::new(std::fs::File::open(
-                    base_path.join(vhandle.blob_file_id.to_string()),
-                )?);
-                (file, true)
-            };
+        let (file, _) = blob_file
+            .file_accessor()
+            .get_or_open_blob_file(&bf_id, &base_path.join(vhandle.blob_file_id.to_string()))?;
 
         let value = Reader::new(blob_file, file.as_ref()).get(key, vhandle)?;
         cache.insert_blob(tree_id, vhandle, value.clone());
-
-        if fd_cache_miss {
-            blob_file.file_accessor().insert_for_blob_file(bf_id, file);
-        }
 
         Ok(Some(value))
     }
