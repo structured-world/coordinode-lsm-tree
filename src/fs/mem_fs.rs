@@ -125,6 +125,9 @@ impl Write for MemFile {
         if !self.writable {
             return Err(io::Error::other("file not opened for writing"));
         }
+        if buf.is_empty() {
+            return Ok(0);
+        }
         let mut data = lock(&self.data)?;
 
         let pos = if self.is_append {
@@ -242,6 +245,31 @@ impl FsFile for MemFile {
     }
 }
 
+/// Validates that the parent directory of `path` exists and is a directory.
+///
+/// Returns `Ok(())` when the parent is root, empty, or an existing directory.
+/// Returns `Err(Other)` when the parent is a file, or `Err(NotFound)` when
+/// it does not exist at all.
+fn ensure_parent_dir(path: &Path, state: &State) -> io::Result<()> {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+        && parent != Path::new("/")
+        && !state.dirs.contains(parent)
+    {
+        if state.files.contains_key(parent) {
+            return Err(io::Error::other(format!(
+                "parent is not a directory: {}",
+                parent.display()
+            )));
+        }
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("parent directory does not exist: {}", parent.display()),
+        ));
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Fs for MemFs
 // ---------------------------------------------------------------------------
@@ -251,10 +279,6 @@ impl FsFile for MemFile {
     reason = "RwLock guards are intentionally held for the duration of each method"
 )]
 impl Fs for MemFs {
-    #[expect(
-        clippy::too_many_lines,
-        reason = "open() validates many flag combinations"
-    )]
     fn open(&self, path: &Path, opts: &FsOpenOptions) -> io::Result<Box<dyn FsFile>> {
         let mut state = write_state(&self.state)?;
         let path = path.to_path_buf();
@@ -288,23 +312,7 @@ impl Fs for MemFs {
             ));
         }
 
-        // Verify parent directory exists (mirrors std::fs behaviour).
-        if let Some(parent) = path.parent()
-            && !parent.as_os_str().is_empty()
-            && parent != Path::new("/")
-            && !state.dirs.contains(parent)
-        {
-            if state.files.contains_key(parent) {
-                return Err(io::Error::other(format!(
-                    "parent is not a directory: {}",
-                    parent.display()
-                )));
-            }
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("parent directory does not exist: {}", parent.display()),
-            ));
-        }
+        ensure_parent_dir(&path, &state)?;
 
         let exists = state.files.contains_key(&path);
         let is_dir = state.dirs.contains(&path);
@@ -524,23 +532,7 @@ impl Fs for MemFs {
     fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
         let mut state = write_state(&self.state)?;
 
-        // Validate destination parent exists (mirrors std::fs behaviour).
-        if let Some(parent) = to.parent()
-            && !parent.as_os_str().is_empty()
-            && parent != Path::new("/")
-            && !state.dirs.contains(parent)
-        {
-            if state.files.contains_key(parent) {
-                return Err(io::Error::other(format!(
-                    "destination parent is not a directory: {}",
-                    parent.display()
-                )));
-            }
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("destination parent not found: {}", parent.display()),
-            ));
-        }
+        ensure_parent_dir(to, &state)?;
 
         // Reject renaming onto an existing directory. Otherwise `to` would end
         // up present in both `files` and `dirs`, corrupting MemFs state.
