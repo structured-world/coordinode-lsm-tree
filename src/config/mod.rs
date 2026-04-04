@@ -450,6 +450,7 @@ impl Config {
     /// # Example
     ///
     /// ```
+    /// # fn main() -> lsm_tree::Result<()> {
     /// use lsm_tree::{Config, SequenceNumberCounter};
     /// use lsm_tree::fs::MemFs;
     ///
@@ -459,8 +460,9 @@ impl Config {
     ///     SequenceNumberCounter::default(),
     /// )
     /// .with_fs(MemFs::new())
-    /// .open()
-    /// .unwrap();
+    /// .open()?;
+    /// # Ok(())
+    /// # }
     /// ```
     #[must_use]
     pub fn with_fs<F: Fs>(mut self, fs: F) -> Self {

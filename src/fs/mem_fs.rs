@@ -269,10 +269,16 @@ impl Fs for MemFs {
                 "open requires at least read, write, or append access",
             ));
         }
-        if opts.truncate && !wants_write {
+        if opts.truncate && opts.append {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "truncate requires write or append access",
+                "truncate and append cannot be used together",
+            ));
+        }
+        if opts.truncate && !opts.write {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "truncate requires write access",
             ));
         }
         if (opts.create || opts.create_new) && !wants_write {
