@@ -133,7 +133,9 @@ impl Write for MemFile {
             self.cursor as usize
         };
 
-        let end = pos + buf.len();
+        let end = pos.checked_add(buf.len()).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "write position overflow")
+        })?;
         if end > data.len() {
             data.resize(end, 0);
         }
@@ -249,6 +251,7 @@ impl FsFile for MemFile {
     reason = "RwLock guards are intentionally held for the duration of each method"
 )]
 impl Fs for MemFs {
+    #[expect(clippy::too_many_lines, reason = "open() validates many flag combinations")]
     fn open(&self, path: &Path, opts: &FsOpenOptions) -> io::Result<Box<dyn FsFile>> {
         let mut state = write_state(&self.state)?;
         let path = path.to_path_buf();
@@ -259,6 +262,13 @@ impl Fs for MemFs {
             && parent != Path::new("/")
             && !state.dirs.contains(parent)
         {
+            // Distinguish "parent is a file" from "parent doesn't exist".
+            if state.files.contains_key(parent) {
+                return Err(io::Error::other(format!(
+                    "parent is not a directory: {}",
+                    parent.display()
+                )));
+            }
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
                 format!("parent directory does not exist: {}", parent.display()),
@@ -506,6 +516,12 @@ impl Fs for MemFs {
             && parent != Path::new("/")
             && !state.dirs.contains(parent)
         {
+            if state.files.contains_key(parent) {
+                return Err(io::Error::other(format!(
+                    "destination parent is not a directory: {}",
+                    parent.display()
+                )));
+            }
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
                 format!("destination parent not found: {}", parent.display()),
