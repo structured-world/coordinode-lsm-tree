@@ -103,15 +103,13 @@ pub fn rewrite_atomic(path: &Path, content: &[u8], fs: &dyn Fs) -> std::io::Resu
     Ok(())
 }
 
-#[cfg(not(target_os = "windows"))]
+/// Delegates directory sync to the backend.
+///
+/// On Windows, `StdFs::sync_directory` already returns `Ok(())` (directory
+/// fsync is unsupported), but non-`StdFs` backends (e.g., `MemFs`) may use
+/// this call for path validation. Always delegate rather than short-circuiting.
 pub fn fsync_directory(path: &Path, fs: &dyn Fs) -> std::io::Result<()> {
     fs.sync_directory(path)
-}
-
-#[cfg(target_os = "windows")]
-pub fn fsync_directory(_path: &Path, _fs: &dyn Fs) -> std::io::Result<()> {
-    // Cannot fsync directory on Windows
-    Ok(())
 }
 
 #[cfg(test)]

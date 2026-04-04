@@ -643,7 +643,10 @@ impl Config {
             for route in routes {
                 let folder = route.path.join(TABLES_FOLDER);
                 // Dedup by path: scanning the same directory twice would cause
-                // already-recovered tables to be classified as orphans and deleted.
+                // already-recovered tables to be classified as orphans and
+                // deleted. Routing the same path through different Fs backends
+                // is a configuration error (level_routes validation in
+                // Config::level_routes rejects overlapping ranges).
                 if !folders.iter().any(|(p, _)| *p == folder) {
                     folders.push((folder, route.fs.clone()));
                 }
