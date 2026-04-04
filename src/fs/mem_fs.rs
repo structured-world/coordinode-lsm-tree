@@ -389,7 +389,7 @@ impl Fs for MemFs {
             if state.files.contains_key(&current) {
                 return Err(io::Error::new(
                     io::ErrorKind::AlreadyExists,
-                    format!("ancestor is a file: {}", current.display()),
+                    format!("path conflicts with existing file: {}", current.display()),
                 ));
             }
             to_create.push(current.clone());
