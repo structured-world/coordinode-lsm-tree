@@ -59,8 +59,9 @@ impl FileAccessor {
         }
     }
 
-    /// Returns a cached blob file FD or opens it via [`Fs`] on cache miss.
-    /// Returns a blob file FD. See [`get_or_open_table`](Self::get_or_open_table) for
+    /// Returns a blob file FD, opening via [`Fs`] on descriptor-table cache miss.
+    ///
+    /// See [`get_or_open_table`](Self::get_or_open_table) for
     /// semantics of the `Option<bool>` cache-hit indicator.
     pub fn get_or_open_blob_file(
         &self,

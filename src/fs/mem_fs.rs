@@ -245,6 +245,14 @@ impl FsFile for MemFile {
     }
 }
 
+/// Rejects empty paths before they can create entries in the `/`-rooted namespace.
+fn ensure_non_empty_path(path: &Path) -> io::Result<()> {
+    if path.as_os_str().is_empty() {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "empty path"));
+    }
+    Ok(())
+}
+
 /// Validates that the parent directory of `path` exists and is a directory.
 ///
 /// Returns `Ok(())` when the parent is root, empty, or an existing directory.
@@ -280,6 +288,7 @@ fn ensure_parent_dir(path: &Path, state: &State) -> io::Result<()> {
 )]
 impl Fs for MemFs {
     fn open(&self, path: &Path, opts: &FsOpenOptions) -> io::Result<Box<dyn FsFile>> {
+        ensure_non_empty_path(path)?;
         let mut state = write_state(&self.state)?;
         let path = path.to_path_buf();
         let wants_write = opts.write || opts.append;
@@ -393,6 +402,7 @@ impl Fs for MemFs {
     }
 
     fn create_dir_all(&self, path: &Path) -> io::Result<()> {
+        ensure_non_empty_path(path)?;
         let mut state = write_state(&self.state)?;
 
         // Collect all components first, then validate, then insert.
@@ -530,6 +540,8 @@ impl Fs for MemFs {
     }
 
     fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
+        ensure_non_empty_path(from)?;
+        ensure_non_empty_path(to)?;
         let mut state = write_state(&self.state)?;
 
         ensure_parent_dir(to, &state)?;
@@ -1161,6 +1173,71 @@ mod tests {
         fs.open(Path::new("/dir/file"), &opts)?;
 
         let err = fs.remove_dir_all(Path::new("/dir/file")).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        Ok(())
+    }
+
+    #[test]
+    fn set_len_without_write_access_returns_error() -> io::Result<()> {
+        let fs = MemFs::new();
+        fs.create_dir_all(Path::new("/dir"))?;
+
+        let path = Path::new("/dir/file.bin");
+        let mut file = fs.open(path, &FsOpenOptions::new().write(true).create(true))?;
+        file.write_all(b"data")?;
+        drop(file);
+
+        let file = fs.open(path, &FsOpenOptions::new().read(true))?;
+        assert!(file.set_len(1).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn read_at_without_read_access_returns_error() -> io::Result<()> {
+        let fs = MemFs::new();
+        fs.create_dir_all(Path::new("/dir"))?;
+
+        let path = Path::new("/dir/file.bin");
+        let mut file = fs.open(path, &FsOpenOptions::new().write(true).create(true))?;
+        file.write_all(b"data")?;
+
+        let mut buf = [0u8; 1];
+        assert!(file.read_at(&mut buf, 0).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn open_empty_path_returns_invalid_input() -> io::Result<()> {
+        let fs = MemFs::new();
+        let err = fs
+            .open(Path::new(""), &FsOpenOptions::new().read(true))
+            .map(|_| ())
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        Ok(())
+    }
+
+    #[test]
+    fn create_dir_all_empty_path_returns_invalid_input() -> io::Result<()> {
+        let fs = MemFs::new();
+        let err = fs.create_dir_all(Path::new("")).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        Ok(())
+    }
+
+    #[test]
+    fn rename_empty_path_returns_invalid_input() -> io::Result<()> {
+        let fs = MemFs::new();
+        fs.create_dir_all(Path::new("/dir"))?;
+        let opts = FsOpenOptions::new().write(true).create(true);
+        fs.open(Path::new("/dir/file"), &opts)?;
+
+        let err = fs.rename(Path::new(""), Path::new("/dir/dst")).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+
+        let err = fs
+            .rename(Path::new("/dir/file"), Path::new(""))
+            .unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
         Ok(())
     }

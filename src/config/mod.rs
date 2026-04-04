@@ -221,7 +221,7 @@ pub struct Config {
     #[doc(hidden)]
     pub path: PathBuf,
 
-    /// Filesystem backend
+    /// Default filesystem backend for levels without an explicit route.
     ///
     /// Defaults to [`StdFs`]. Use [`Config::with_fs`] to plug in an
     /// alternative backend such as [`MemFs`](crate::fs::MemFs).
@@ -442,7 +442,7 @@ impl Config {
         }
     }
 
-    /// Sets the filesystem backend.
+    /// Sets the default filesystem backend used for levels without an explicit route.
     ///
     /// Defaults to [`StdFs`]. Use [`MemFs`](crate::fs::MemFs) for
     /// in-memory trees (testing, ephemeral indexes).
@@ -470,7 +470,7 @@ impl Config {
         self
     }
 
-    /// Sets the filesystem backend from an existing shared handle.
+    /// Sets the default filesystem backend from an existing shared handle.
     ///
     /// Useful when multiple configs should reuse the same backend
     /// instance, including trait objects and backends that are not `Clone`.
