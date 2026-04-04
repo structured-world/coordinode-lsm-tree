@@ -4,11 +4,12 @@
 
 use super::Tree;
 use crate::{
-    BlobIndirection, SeqNo, UserKey, UserValue, config::FilterPolicyEntry,
+    BlobIndirection, SeqNo, UserKey, UserValue, config::FilterPolicyEntry, fs::Fs,
     table::multi_writer::MultiWriter,
 };
 use std::cmp::Ordering;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 pub const INITIAL_CANONICAL_LEVEL: usize = 1;
 
@@ -20,6 +21,8 @@ pub const INITIAL_CANONICAL_LEVEL: usize = 1;
 /// using the same table writer configuration that is used for flush and compaction.
 pub struct Ingestion<'a> {
     pub(crate) folder: PathBuf,
+    /// Level-routed filesystem backend for the target level.
+    pub(crate) level_fs: Arc<dyn Fs>,
     tree: &'a Tree,
     pub(crate) writer: MultiWriter,
     seqno: SeqNo,
@@ -54,7 +57,7 @@ impl<'a> Ingestion<'a> {
             tree.table_id_counter.clone(),
             64 * 1_024 * 1_024,
             6,
-            level_fs,
+            level_fs.clone(),
         )?
         .set_comparator(tree.config.comparator.clone())
         .use_bloom_policy({
@@ -116,6 +119,7 @@ impl<'a> Ingestion<'a> {
 
         Ok(Self {
             folder,
+            level_fs,
             tree,
             writer,
             seqno: 0,
@@ -311,6 +315,7 @@ impl<'a> Ingestion<'a> {
                     self.tree.id,
                     self.tree.config.cache.clone(),
                     self.tree.config.descriptor_table.clone(),
+                    self.level_fs.clone(),
                     false,
                     false,
                     self.tree.config.encryption.clone(),

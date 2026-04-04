@@ -47,53 +47,69 @@ pub fn read_exact(file: &dyn FsFile, offset: u64, size: usize) -> std::io::Resul
     Ok(builder.freeze().into())
 }
 
-/// Atomically rewrites a file.
+/// Atomically rewrites a file via the [`Fs`] trait.
+///
+/// Writes `content` to a temporary file in the same directory, fsyncs it,
+/// then renames over `path`. This ensures readers never see a partial write.
 pub fn rewrite_atomic(path: &Path, content: &[u8], fs: &dyn Fs) -> std::io::Result<()> {
+    use crate::fs::FsOpenOptions;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
     #[expect(
         clippy::expect_used,
         reason = "every file should have a parent directory"
     )]
     let folder = path.parent().expect("should have a parent");
 
-    // NOTE: tempfile crate uses std::fs internally; migrating temp-file
-    // creation to Fs would require a custom implementation.
-    let mut temp_file = tempfile::NamedTempFile::new_in(folder)?;
-    temp_file.write_all(content)?;
-    temp_file.flush()?;
-    temp_file.as_file_mut().sync_all()?;
-    temp_file.persist(path)?;
+    let pid = std::process::id();
 
-    // Suppress unused-variable warning on Windows where the post-persist
-    // sync block is skipped (directory fsync is unsupported).
-    let _ = &fs;
+    // Retry with incrementing seq on AlreadyExists — handles leftover temp
+    // files from a previous crash (PID can be reused, especially in containers).
+    let tmp_path = loop {
+        let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let candidate = folder.join(format!(".tmp_{pid}_{seq}"));
+        match fs.open(
+            &candidate,
+            &FsOpenOptions::new().write(true).create_new(true),
+        ) {
+            Ok(mut file) => {
+                let write_result = file
+                    .write_all(content)
+                    .and_then(|()| file.flush())
+                    .and_then(|()| FsFile::sync_all(&*file));
+                if let Err(e) = write_result {
+                    drop(file);
+                    let _ = fs.remove_file(&candidate);
+                    return Err(e);
+                }
+                break candidate;
+            }
+            // Leftover temp file from a previous crash — retry with next seq.
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e),
+        }
+    };
 
-    #[cfg(not(target_os = "windows"))]
-    {
-        use crate::fs::FsOpenOptions;
-
-        let file = fs.open(path, &FsOpenOptions::new().read(true))?;
-        FsFile::sync_all(&*file)?;
-
-        #[expect(
-            clippy::expect_used,
-            reason = "files should always have a parent directory"
-        )]
-        let folder = path.parent().expect("should have parent folder");
-        fs.sync_directory(folder)?;
+    // std::fs::rename overwrites existing destinations on all platforms
+    // (Rust uses MoveFileExW with MOVEFILE_REPLACE_EXISTING on Windows).
+    if let Err(e) = fs.rename(&tmp_path, path) {
+        let _ = fs.remove_file(&tmp_path);
+        return Err(e);
     }
+    fsync_directory(folder, fs)?;
 
     Ok(())
 }
 
-#[cfg(not(target_os = "windows"))]
+/// Delegates directory sync to the backend.
+///
+/// On Windows, `StdFs::sync_directory` already returns `Ok(())` (directory
+/// fsync is unsupported), but non-`StdFs` backends (e.g., `MemFs`) may use
+/// this call for path validation. Always delegate rather than short-circuiting.
 pub fn fsync_directory(path: &Path, fs: &dyn Fs) -> std::io::Result<()> {
     fs.sync_directory(path)
-}
-
-#[cfg(target_os = "windows")]
-pub fn fsync_directory(_path: &Path, _fs: &dyn Fs) -> std::io::Result<()> {
-    // Cannot fsync directory on Windows
-    Ok(())
 }
 
 #[cfg(test)]
@@ -141,6 +157,36 @@ mod tests {
 
         let content = std::fs::read_to_string(&path)?;
         assert_eq!("newcontent", content);
+
+        Ok(())
+    }
+
+    /// Verifies that `StdFs::rename` atomically replaces an existing
+    /// destination file — the contract required by `rewrite_atomic`.
+    #[test]
+    fn std_fs_rename_replaces_existing_file() -> crate::Result<()> {
+        use crate::fs::{Fs, FsOpenOptions};
+
+        let dir = tempfile::tempdir()?;
+        let src = dir.path().join("src.txt");
+        let dst = dir.path().join("dst.txt");
+
+        // Create both files via Fs trait.
+        let opts = FsOpenOptions::new().write(true).create(true);
+        let mut f = StdFs.open(&src, &opts)?;
+        f.write_all(b"new")?;
+        drop(f);
+
+        let mut f = StdFs.open(&dst, &opts)?;
+        f.write_all(b"old")?;
+        drop(f);
+
+        StdFs.rename(&src, &dst)?;
+
+        // dst now has src content, src is gone.
+        let content = std::fs::read_to_string(&dst)?;
+        assert_eq!("new", content);
+        assert!(!src.exists());
 
         Ok(())
     }

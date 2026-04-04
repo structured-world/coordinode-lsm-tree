@@ -15,7 +15,7 @@ use std::{path::PathBuf, sync::Arc};
 ///
 /// This results in a sorted "run" of tables
 pub struct MultiWriter {
-    fs: Arc<dyn Fs>,
+    pub(crate) fs: Arc<dyn Fs>,
 
     pub(crate) base_path: PathBuf,
 
@@ -647,6 +647,7 @@ mod tests {
                 0,
                 cache.clone(),
                 None,
+                Arc::new(StdFs),
                 false,
                 false,
                 None,
@@ -737,6 +738,7 @@ mod tests {
                 0,
                 cache.clone(),
                 None,
+                Arc::new(StdFs),
                 false,
                 false,
                 None,

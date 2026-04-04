@@ -371,6 +371,7 @@ impl StandardCompaction {
 
     fn consume_writer(self, opts: &Options, dst_lvl: usize) -> crate::Result<Vec<Table>> {
         let table_base_folder = self.table_writer.base_path.clone();
+        let level_fs = self.table_writer.fs.clone();
 
         let pin_filter = opts.config.filter_block_pinning_policy.get(dst_lvl);
         let pin_index = opts.config.index_block_pinning_policy.get(dst_lvl);
@@ -386,6 +387,7 @@ impl StandardCompaction {
                     opts.tree_id,
                     opts.config.cache.clone(),
                     opts.config.descriptor_table.clone(),
+                    level_fs.clone(),
                     pin_filter,
                     pin_index,
                     opts.config.encryption.clone(),

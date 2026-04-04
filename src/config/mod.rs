@@ -216,22 +216,17 @@ impl KvSeparationOptions {
 }
 
 /// Tree configuration builder
-///
-/// The generic parameter `F` selects the filesystem backend.
-/// It defaults to [`StdFs`], so existing code that writes `Config`
-/// without a type parameter continues to work unchanged.
-pub struct Config<F: Fs = StdFs> {
+pub struct Config {
     /// Folder path
     #[doc(hidden)]
     pub path: PathBuf,
 
-    /// Filesystem backend
+    /// Default filesystem backend for levels without an explicit route.
     ///
-    // All Config fields are `#[doc(hidden)] pub` by convention — callers use
-    // builder methods or `..Default::default()`, not struct literals directly.
-    // A `with_fs()` builder will be added when call-site refactoring lands.
+    /// Defaults to [`StdFs`]. Use [`Config::with_fs`] to plug in an
+    /// alternative backend such as [`MemFs`](crate::fs::MemFs).
     #[doc(hidden)]
-    pub fs: Arc<F>,
+    pub fs: Arc<dyn Fs>,
 
     /// Per-level filesystem routing for tiered storage.
     ///
@@ -447,6 +442,44 @@ impl Config {
         }
     }
 
+    /// Sets the default filesystem backend used for levels without an explicit route.
+    ///
+    /// Defaults to [`StdFs`]. Use [`MemFs`](crate::fs::MemFs) for
+    /// in-memory trees (testing, ephemeral indexes).
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # fn main() -> lsm_tree::Result<()> {
+    /// use lsm_tree::{Config, SequenceNumberCounter};
+    /// use lsm_tree::fs::MemFs;
+    ///
+    /// let tree = Config::new(
+    ///     "/virtual/tree",
+    ///     SequenceNumberCounter::default(),
+    ///     SequenceNumberCounter::default(),
+    /// )
+    /// .with_fs(MemFs::new())
+    /// .open()?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn with_fs<F: Fs>(mut self, fs: F) -> Self {
+        self.fs = Arc::new(fs);
+        self
+    }
+
+    /// Sets the default filesystem backend from an existing shared handle.
+    ///
+    /// Useful when multiple configs should reuse the same backend
+    /// instance, including trait objects and backends that are not `Clone`.
+    #[must_use]
+    pub fn with_shared_fs(mut self, fs: Arc<dyn Fs>) -> Self {
+        self.fs = fs;
+        self
+    }
+
     /// Opens a tree using the config.
     ///
     /// # Errors
@@ -582,7 +615,7 @@ mod tests {
     }
 }
 
-impl<F: Fs> Config<F> {
+impl Config {
     /// Returns the tables folder path and [`Fs`] backend for the given level.
     ///
     /// If [`level_routes`](Self::level_routes) has an entry covering this
@@ -612,7 +645,10 @@ impl<F: Fs> Config<F> {
             for route in routes {
                 let folder = route.path.join(TABLES_FOLDER);
                 // Dedup by path: scanning the same directory twice would cause
-                // already-recovered tables to be classified as orphans and deleted.
+                // already-recovered tables to be classified as orphans and
+                // deleted. Routing the same path through different Fs backends
+                // is a configuration error (level_routes validation in
+                // Config::level_routes rejects overlapping ranges).
                 if !folders.iter().any(|(p, _)| *p == folder) {
                     folders.push((folder, route.fs.clone()));
                 }

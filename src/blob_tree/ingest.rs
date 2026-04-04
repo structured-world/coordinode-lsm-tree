@@ -227,6 +227,7 @@ impl<'a> BlobIngestion<'a> {
                     index.id,
                     index.config.cache.clone(),
                     index.config.descriptor_table.clone(),
+                    self.table.level_fs.clone(),
                     false,
                     false,
                     index.config.encryption.clone(),

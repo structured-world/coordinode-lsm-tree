@@ -82,6 +82,7 @@ fn test_with_table_impl(
                 0,
                 Arc::new(Cache::with_capacity_bytes(1_000_000)),
                 Some(Arc::new(DescriptorTable::new(10))),
+                Arc::new(StdFs),
                 false,
                 false,
                 None,
@@ -99,7 +100,7 @@ fn test_with_table_impl(
             assert_eq!(0, table.pinned_filter_size(), "should not pin filter");
             assert!(matches!(
                 table.file_accessor,
-                FileAccessor::DescriptorTable(..)
+                FileAccessor::DescriptorTable { .. }
             ));
 
             f(table)?;
@@ -116,6 +117,7 @@ fn test_with_table_impl(
                 0,
                 Arc::new(Cache::with_capacity_bytes(1_000_000)),
                 Some(Arc::new(DescriptorTable::new(10))),
+                Arc::new(StdFs),
                 true,
                 false,
                 None,
@@ -133,7 +135,7 @@ fn test_with_table_impl(
             // assert!(table.pinned_filter_size() > 0, "should pin filter");
             assert!(matches!(
                 table.file_accessor,
-                FileAccessor::DescriptorTable(..)
+                FileAccessor::DescriptorTable { .. }
             ));
 
             f(table)?;
@@ -150,6 +152,7 @@ fn test_with_table_impl(
                 0,
                 Arc::new(Cache::with_capacity_bytes(1_000_000)),
                 Some(Arc::new(DescriptorTable::new(10))),
+                Arc::new(StdFs),
                 false,
                 true,
                 None,
@@ -167,7 +170,7 @@ fn test_with_table_impl(
             assert_eq!(0, table.pinned_filter_size(), "should not pin filter");
             assert!(matches!(
                 table.file_accessor,
-                FileAccessor::DescriptorTable(..)
+                FileAccessor::DescriptorTable { .. }
             ));
 
             f(table)?;
@@ -184,6 +187,7 @@ fn test_with_table_impl(
                 0,
                 Arc::new(Cache::with_capacity_bytes(1_000_000)),
                 Some(Arc::new(DescriptorTable::new(10))),
+                Arc::new(StdFs),
                 true,
                 true,
                 None,
@@ -201,7 +205,7 @@ fn test_with_table_impl(
             // assert!(table.pinned_filter_size() > 0, "should pin filter");
             assert!(matches!(
                 table.file_accessor,
-                FileAccessor::DescriptorTable(..)
+                FileAccessor::DescriptorTable { .. }
             ));
 
             f(table)?;
@@ -218,6 +222,7 @@ fn test_with_table_impl(
                 0,
                 Arc::new(Cache::with_capacity_bytes(1_000_000)),
                 None,
+                Arc::new(StdFs),
                 true,
                 true,
                 None,
@@ -275,6 +280,7 @@ fn test_with_table_impl(
                 0,
                 Arc::new(Cache::with_capacity_bytes(1_000_000)),
                 Some(Arc::new(DescriptorTable::new(10))),
+                Arc::new(StdFs),
                 false,
                 false,
                 None,
@@ -291,7 +297,7 @@ fn test_with_table_impl(
             assert_eq!(0, table.pinned_filter_size(), "should not pin filter");
             assert!(matches!(
                 table.file_accessor,
-                FileAccessor::DescriptorTable(..)
+                FileAccessor::DescriptorTable { .. }
             ));
 
             f(table)?;
@@ -308,6 +314,7 @@ fn test_with_table_impl(
                 0,
                 Arc::new(Cache::with_capacity_bytes(1_000_000)),
                 Some(Arc::new(DescriptorTable::new(10))),
+                Arc::new(StdFs),
                 true,
                 false,
                 None,
@@ -324,7 +331,7 @@ fn test_with_table_impl(
             // assert!(table.pinned_filter_size() > 0, "should pin filter");
             assert!(matches!(
                 table.file_accessor,
-                FileAccessor::DescriptorTable(..)
+                FileAccessor::DescriptorTable { .. }
             ));
 
             f(table)?;
@@ -341,6 +348,7 @@ fn test_with_table_impl(
                 0,
                 Arc::new(Cache::with_capacity_bytes(1_000_000)),
                 Some(Arc::new(DescriptorTable::new(10))),
+                Arc::new(StdFs),
                 false,
                 true,
                 None,
@@ -358,7 +366,7 @@ fn test_with_table_impl(
             // assert_eq!(0, table.pinned_filter_size(), "should not pin filter");
             assert!(matches!(
                 table.file_accessor,
-                FileAccessor::DescriptorTable(..)
+                FileAccessor::DescriptorTable { .. }
             ));
 
             f(table)?;
@@ -375,6 +383,7 @@ fn test_with_table_impl(
                 0,
                 Arc::new(Cache::with_capacity_bytes(1_000_000)),
                 Some(Arc::new(DescriptorTable::new(10))),
+                Arc::new(StdFs),
                 true,
                 true,
                 None,
@@ -392,7 +401,7 @@ fn test_with_table_impl(
             // assert!(table.pinned_filter_size() > 0, "should pin filter");
             assert!(matches!(
                 table.file_accessor,
-                FileAccessor::DescriptorTable(..)
+                FileAccessor::DescriptorTable { .. }
             ));
 
             f(table)?;
@@ -409,6 +418,7 @@ fn test_with_table_impl(
                 0,
                 Arc::new(Cache::with_capacity_bytes(1_000_000)),
                 None,
+                Arc::new(StdFs),
                 true,
                 true,
                 None,
@@ -1420,6 +1430,7 @@ fn table_read_fuzz_1() -> crate::Result<()> {
         0,
         Arc::new(crate::Cache::with_capacity_bytes(0)),
         Some(Arc::new(crate::DescriptorTable::new(10))),
+        Arc::new(StdFs),
         true,
         true,
         None,
@@ -1498,6 +1509,7 @@ fn table_partitioned_index() -> crate::Result<()> {
         0,
         Arc::new(crate::Cache::with_capacity_bytes(0)),
         Some(Arc::new(crate::DescriptorTable::new(10))),
+        Arc::new(StdFs),
         true,
         true,
         None,
@@ -1612,6 +1624,7 @@ fn table_global_seqno() -> crate::Result<()> {
         0,
         Arc::new(crate::Cache::with_capacity_bytes(0)),
         Some(Arc::new(crate::DescriptorTable::new(10))),
+        Arc::new(StdFs),
         true,
         true,
         None,
@@ -1823,6 +1836,7 @@ fn load_block_range_tombstone_metrics() -> crate::Result<()> {
         // with how filter and index recovery reads are handled.
         Arc::new(Cache::with_capacity_bytes(10_000_000)),
         Some(Arc::new(DescriptorTable::new(10))),
+        Arc::new(StdFs),
         false,
         false,
         None,
@@ -1930,6 +1944,7 @@ fn load_block_cache_hit_rejects_wrong_block_type() -> crate::Result<()> {
         0,
         Arc::new(Cache::with_capacity_bytes(10_000_000)),
         Some(Arc::new(DescriptorTable::new(10))),
+        Arc::new(StdFs),
         false,
         false,
         None,
@@ -2253,6 +2268,7 @@ fn two_level_index_scan_skips_empty_child_partition() -> crate::Result<()> {
         0,
         Arc::new(crate::Cache::with_capacity_bytes(0)),
         Some(Arc::new(crate::DescriptorTable::new(10))),
+        Arc::new(StdFs),
         true,
         false,
         None,

@@ -40,7 +40,7 @@ use crate::{
     comparator::SharedComparator,
     descriptor_table::DescriptorTable,
     file_accessor::FileAccessor,
-    fs::FsFile,
+    fs::{Fs, FsFile, FsOpenOptions},
     range_tombstone::RangeTombstone,
     table::{
         block::{BlockType, ParsedItem},
@@ -119,22 +119,13 @@ impl Table {
         Ok(if let Some(handle) = &self.regions.linked_blob_files {
             let table_id = self.global_id();
 
-            let (fd, fd_cache_miss) =
-                if let Some(fd) = self.file_accessor.access_for_table(&table_id) {
-                    (fd, false)
-                } else {
-                    let fd: Arc<dyn FsFile> = Arc::new(std::fs::File::open(&*self.path)?);
-                    (fd, true)
-                };
+            let (fd, _) = self
+                .file_accessor
+                .get_or_open_table(&table_id, &self.path)?;
 
             // Read the exact region using pread-style helper
             let buf =
                 crate::file::read_exact(fd.as_ref(), *handle.offset(), handle.size() as usize)?;
-
-            // If we opened the file here, cache the FD for future accesses
-            if fd_cache_miss {
-                self.file_accessor.insert_for_table(table_id, fd);
-            }
 
             // Parse the buffer
             let mut reader = &buf[..];
@@ -489,6 +480,7 @@ impl Table {
         tree_id: TreeId,
         cache: Arc<Cache>,
         descriptor_table: Option<Arc<DescriptorTable>>,
+        fs: Arc<dyn Fs>,
         pin_filter: bool,
         pin_index: bool,
         encryption: Option<Arc<dyn crate::encryption::EncryptionProvider>>,
@@ -501,7 +493,7 @@ impl Table {
         use std::sync::atomic::AtomicBool;
 
         log::debug!("Recovering table from file {}", file_path.display());
-        let mut file = std::fs::File::open(&file_path)?;
+        let mut file = fs.open(&file_path, &FsOpenOptions::new().read(true))?;
         let file_path = Arc::new(file_path);
 
         #[cfg(feature = "metrics")]
@@ -514,7 +506,7 @@ impl Table {
 
         log::trace!("Reading meta block, with meta_ptr={:?}", regions.metadata);
         let metadata =
-            ParsedMeta::load_with_handle(&file, &regions.metadata, encryption.as_deref())?;
+            ParsedMeta::load_with_handle(&*file, &regions.metadata, encryption.as_deref())?;
 
         // Fail-fast: if this table was written with dictionary compression,
         // verify the caller provided the matching dictionary. Without this
@@ -531,10 +523,13 @@ impl Table {
             }
         }
 
-        let file_handle: Arc<dyn FsFile> = Arc::new(file);
+        let file_handle: Arc<dyn FsFile> = Arc::from(file);
 
         let file_accessor = if let Some(dt) = descriptor_table {
-            FileAccessor::DescriptorTable(dt)
+            FileAccessor::DescriptorTable {
+                table: dt,
+                fs: fs.clone(),
+            }
         } else {
             FileAccessor::File(file_handle.clone())
         };
@@ -705,6 +700,7 @@ impl Table {
             cache,
 
             file_accessor,
+            fs,
 
             block_index: Arc::new(block_index),
 
