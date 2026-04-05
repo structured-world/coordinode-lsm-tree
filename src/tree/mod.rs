@@ -63,6 +63,66 @@ impl IterGuard for Guard {
     }
 }
 
+/// Trait for monomorphized table point-read results.
+///
+/// Allows `find_in_tables` to operate generically over `InternalValue` (for
+/// `get`) and `(InternalValue, Block)` (for `get_pinned`), generating optimal
+/// code for each path without runtime dispatch or extra refcount overhead.
+trait TablePointLookup: Sized {
+    fn lookup(
+        table: &Table,
+        key: &[u8],
+        seqno: SeqNo,
+        key_hash: u64,
+    ) -> crate::Result<Option<Self>>;
+    fn entry_seqno(&self) -> SeqNo;
+    fn filter_tombstone(self) -> Option<Self>;
+}
+
+/// Lookup result for standard `get()` — entry only, no block retained.
+type TableEntry = InternalValue;
+
+impl TablePointLookup for TableEntry {
+    fn lookup(
+        table: &Table,
+        key: &[u8],
+        seqno: SeqNo,
+        key_hash: u64,
+    ) -> crate::Result<Option<Self>> {
+        table.get(key, seqno, key_hash)
+    }
+
+    fn entry_seqno(&self) -> SeqNo {
+        self.key.seqno
+    }
+
+    fn filter_tombstone(self) -> Option<Self> {
+        ignore_tombstone_value(self)
+    }
+}
+
+/// Lookup result for `get_pinned()` — entry + block for zero-copy pinning.
+type TableEntryWithBlock = (InternalValue, crate::table::Block);
+
+impl TablePointLookup for TableEntryWithBlock {
+    fn lookup(
+        table: &Table,
+        key: &[u8],
+        seqno: SeqNo,
+        key_hash: u64,
+    ) -> crate::Result<Option<Self>> {
+        table.get_with_block(key, seqno, key_hash)
+    }
+
+    fn entry_seqno(&self) -> SeqNo {
+        self.0.key.seqno
+    }
+
+    fn filter_tombstone(self) -> Option<Self> {
+        ignore_tombstone_value(self.0).map(|iv| (iv, self.1))
+    }
+}
+
 fn ignore_tombstone_value(item: InternalValue) -> Option<InternalValue> {
     if item.is_tombstone() {
         None
@@ -1027,6 +1087,10 @@ impl Tree {
                 )
                 .map(|opt| opt.map(PinnableSlice::owned));
             }
+            // Pinned/Owned reflects backing storage, not value semantics.
+            // Unresolved merge operands from disk are Pinned (block-backed),
+            // from memtable are Owned — this is intentional and consistent
+            // with the PinnableSlice contract.
             return Ok(Some(PinnableSlice::pinned(block, entry.value)));
         }
 
@@ -1042,45 +1106,7 @@ impl Tree {
         key_hash: u64,
         comparator: &dyn crate::comparator::UserComparator,
     ) -> crate::Result<Option<(InternalValue, crate::table::Block)>> {
-        for (level_idx, level) in version.iter_levels().enumerate() {
-            if level_idx == 0 {
-                let mut best: Option<(InternalValue, crate::table::Block)> = None;
-
-                for run in level.iter() {
-                    if let Some(table) = run.get_for_key_cmp(key, comparator)
-                        && let Some((item, block)) = table.get_with_block(key, seqno, key_hash)?
-                    {
-                        match &best {
-                            Some((current, _)) if current.key.seqno >= item.key.seqno => {}
-                            _ => {
-                                // Short-circuit: point reads use an exclusive upper bound,
-                                // so the highest possible visible seqno is read_seqno - 1.
-                                // If we found that version, no other run in this level can
-                                // have a higher visible seqno.
-                                if item.key.seqno.checked_add(1) == Some(seqno) {
-                                    return Ok(ignore_tombstone_value(item).map(|iv| (iv, block)));
-                                }
-                                best = Some((item, block));
-                            }
-                        }
-                    }
-                }
-
-                if let Some((entry, block)) = best {
-                    return Ok(ignore_tombstone_value(entry).map(|iv| (iv, block)));
-                }
-            } else {
-                for run in level.iter() {
-                    if let Some(table) = run.get_for_key_cmp(key, comparator)
-                        && let Some((item, block)) = table.get_with_block(key, seqno, key_hash)?
-                    {
-                        return Ok(ignore_tombstone_value(item).map(|iv| (iv, block)));
-                    }
-                }
-            }
-        }
-
-        Ok(None)
+        Self::find_in_tables::<TableEntryWithBlock>(version, key, seqno, key_hash, comparator)
     }
 
     /// Resolves merge operands for a point read via a bloom-filtered iterator pipeline.
@@ -1455,38 +1481,38 @@ impl Tree {
         seqno: SeqNo,
         comparator: &dyn crate::comparator::UserComparator,
     ) -> crate::Result<Option<InternalValue>> {
-        // NOTE: Create key hash for hash sharing
-        // https://fjall-rs.github.io/post/bloom-filter-hash-sharing/
         let key_hash = crate::table::filter::standard_bloom::Builder::get_hash(key);
+        Self::find_in_tables::<TableEntry>(version, key, seqno, key_hash, comparator)
+    }
 
-        // L0: optimize_runs may merge disjoint SSTs from different temporal
-        // epochs into the same run, so run iteration order does not guarantee
-        // newest-first. We must check ALL runs and keep the highest seqno.
-        //
-        // L1+: key ranges within a level do not overlap, so at most one run
-        // can contain the key — return on the first match.
-        //
-        // Once a level yields a match, lower levels cannot contain newer data,
-        // so we stop early.
+    /// Generic level-walk for point reads, monomorphized over the lookup result type.
+    ///
+    /// L0: check ALL runs, keep highest seqno (runs may not be newest-first).
+    /// L1+: at most one run contains the key — return on first match.
+    /// Once a level yields a match, lower levels cannot have newer data.
+    fn find_in_tables<T: TablePointLookup>(
+        version: &Version,
+        key: &[u8],
+        seqno: SeqNo,
+        key_hash: u64,
+        comparator: &dyn crate::comparator::UserComparator,
+    ) -> crate::Result<Option<T>> {
         for (level_idx, level) in version.iter_levels().enumerate() {
             if level_idx == 0 {
-                let mut best: Option<InternalValue> = None;
+                let mut best: Option<T> = None;
 
                 for run in level.iter() {
                     if let Some(table) = run.get_for_key_cmp(key, comparator)
-                        && let Some(item) = table.get(key, seqno, key_hash)?
+                        && let Some(item) = T::lookup(table, key, seqno, key_hash)?
                     {
                         match &best {
-                            // >= keeps first-seen on tie. Seqno is monotonically
-                            // unique per write; equal seqno for the same user key
-                            // across tables is impossible in normal operation.
-                            Some(current) if current.key.seqno >= item.key.seqno => {}
+                            Some(current) if current.entry_seqno() >= item.entry_seqno() => {}
                             _ => {
                                 // Short-circuit: point reads use exclusive upper bound,
                                 // so the highest visible seqno is read_seqno - 1.
                                 // If matched, no other L0 run can have a higher one.
-                                if item.key.seqno.checked_add(1) == Some(seqno) {
-                                    return Ok(ignore_tombstone_value(item));
+                                if item.entry_seqno().checked_add(1) == Some(seqno) {
+                                    return Ok(item.filter_tombstone());
                                 }
                                 best = Some(item);
                             }
@@ -1495,14 +1521,14 @@ impl Tree {
                 }
 
                 if let Some(entry) = best {
-                    return Ok(ignore_tombstone_value(entry));
+                    return Ok(entry.filter_tombstone());
                 }
             } else {
                 for run in level.iter() {
                     if let Some(table) = run.get_for_key_cmp(key, comparator)
-                        && let Some(item) = table.get(key, seqno, key_hash)?
+                        && let Some(item) = T::lookup(table, key, seqno, key_hash)?
                     {
-                        return Ok(ignore_tombstone_value(item));
+                        return Ok(item.filter_tombstone());
                     }
                 }
             }
@@ -1739,7 +1765,7 @@ impl Tree {
     /// Returns the total bytes added and new size of the memtable.
     #[doc(hidden)]
     #[must_use]
-    pub fn append_batch(&self, items: Vec<InternalValue>) -> (u64, u64) {
+    pub(crate) fn append_batch(&self, items: Vec<InternalValue>) -> (u64, u64) {
         // Hold the read guard for the entire insert to prevent rotate_memtable()
         // from sealing this memtable mid-batch (which could cause data loss if
         // a concurrent flush persists only a prefix of the batch).

@@ -106,6 +106,12 @@ impl WriteBatch {
     }
 
     /// Adds a merge operand for a key.
+    ///
+    /// Multiple `merge()` calls for the same key within one batch are supported:
+    /// they produce distinct merge operands that are resolved together during
+    /// reads (via the configured [`MergeOperator`](crate::MergeOperator)).
+    /// The duplicate-key warning in the struct doc applies to mixed operation
+    /// types (e.g. `insert` + `remove` on the same key), not to multiple merges.
     pub fn merge<K: Into<UserKey>, V: Into<UserValue>>(&mut self, key: K, value: V) {
         self.entries.push(WriteBatchEntry::Merge {
             key: key.into(),

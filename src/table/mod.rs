@@ -261,6 +261,12 @@ impl Table {
     /// Returns `Ok(BloomResult::Skip)` if the bloom filter says the key is definitely absent
     /// (and updates metrics accordingly), `Ok(BloomResult::Proceed { has_filter })` otherwise.
     fn check_bloom(&self, key: &[u8], key_hash: u64) -> crate::Result<BloomResult> {
+        debug_assert_eq!(
+            key_hash,
+            crate::table::filter::standard_bloom::Builder::get_hash(key),
+            "key_hash must match the hash of the provided key"
+        );
+
         let filter_block = if let Some(block) = &self.pinned_filter_block {
             Some(Cow::Borrowed(block))
         } else if let Some(filter_idx) = &self.pinned_filter_index {
