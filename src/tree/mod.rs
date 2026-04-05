@@ -1053,11 +1053,9 @@ impl Tree {
                         match &best {
                             Some((current, _)) if current.key.seqno >= item.key.seqno => {}
                             _ => {
-                                // Short-circuit: mirrors get_internal_entry_from_tables.
-                                // Table::get translates the seqno, so item.key.seqno is
-                                // table-local. This comparison is valid: if the returned
-                                // seqno equals the (translated) read horizon, no other
-                                // run can have a higher one.
+                                // Short-circuit: Table::get/get_with_block now return
+                                // global seqnos. If the entry seqno equals the read
+                                // horizon, no other run in this level can have a higher one.
                                 if item.key.seqno == seqno {
                                     return Ok(ignore_tombstone_value(item).map(|iv| (iv, block)));
                                 }

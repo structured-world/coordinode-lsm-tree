@@ -329,7 +329,8 @@ impl Table {
         seqno: SeqNo,
         key_hash: u64,
     ) -> crate::Result<Option<InternalValue>> {
-        let seqno = seqno.saturating_sub(self.global_seqno());
+        let global_seqno = self.global_seqno();
+        let seqno = seqno.saturating_sub(global_seqno);
 
         if self.metadata.seqnos.0 >= seqno {
             return Ok(None);
@@ -340,12 +341,14 @@ impl Table {
             return Ok(None);
         }
 
-        let item = self.point_read(key, seqno);
+        let item = self.point_read(key, seqno)?;
 
-        #[cfg(not(feature = "metrics"))]
-        {
-            item
-        }
+        // Translate table-local seqno back to global coordinate so callers
+        // can compare across tables/memtables (L0 best-selection, RT suppression).
+        let item = item.map(|mut iv| {
+            iv.key.seqno += global_seqno;
+            iv
+        });
 
         #[cfg(feature = "metrics")]
         {
@@ -354,29 +357,26 @@ impl Table {
             // and we actually waste an I/O for a non-existing item.
             // Otherwise, the filter efficiency decreases whenever an item is hit.
             // https://github.com/fjall-rs/lsm-tree/issues/246
-            item.inspect(|maybe_kv| {
-                if maybe_kv.is_none() && bloom.has_filter() {
-                    self.metrics.filter_queries.fetch_add(1, Relaxed);
-                }
-            })
+            if item.is_none() && bloom.has_filter() {
+                self.metrics.filter_queries.fetch_add(1, Relaxed);
+            }
         }
+
+        Ok(item)
     }
 
     /// Like [`Table::get`], but also returns the [`Block`] containing the value.
     ///
     /// Used by `get_pinned()` to construct `PinnableSlice::Pinned`.
     ///
-    /// NOTE: returns table-local seqnos (same as `get()`). For tables with
-    /// non-zero `global_seqno` (bulk ingestion), callers comparing seqnos
-    /// across tables/memtables must account for the offset. This is a
-    /// pre-existing design shared with `Table::get`.
     pub(crate) fn get_with_block(
         &self,
         key: &[u8],
         seqno: SeqNo,
         key_hash: u64,
     ) -> crate::Result<Option<(InternalValue, Block)>> {
-        let seqno = seqno.saturating_sub(self.global_seqno());
+        let global_seqno = self.global_seqno();
+        let seqno = seqno.saturating_sub(global_seqno);
 
         if self.metadata.seqnos.0 >= seqno {
             return Ok(None);
@@ -387,22 +387,23 @@ impl Table {
             return Ok(None);
         }
 
-        let item = self.point_read_with_block(key, seqno);
+        let result = self.point_read_with_block(key, seqno)?;
 
-        #[cfg(not(feature = "metrics"))]
-        {
-            item
-        }
+        // Translate table-local seqno back to global coordinate (see Table::get).
+        let result = result.map(|(mut iv, block)| {
+            iv.key.seqno += global_seqno;
+            (iv, block)
+        });
 
         #[cfg(feature = "metrics")]
         {
             use std::sync::atomic::Ordering::Relaxed;
-            item.inspect(|maybe_kv| {
-                if maybe_kv.is_none() && bloom.has_filter() {
-                    self.metrics.filter_queries.fetch_add(1, Relaxed);
-                }
-            })
+            if result.is_none() && bloom.has_filter() {
+                self.metrics.filter_queries.fetch_add(1, Relaxed);
+            }
         }
+
+        Ok(result)
     }
 
     // TODO: maybe we can skip Fuse costs of the user key
