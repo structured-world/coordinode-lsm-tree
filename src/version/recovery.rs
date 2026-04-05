@@ -217,6 +217,9 @@ mod tests {
     }
 
     /// Write a version sfa archive with a corrupt `table_count` (`u32::MAX`).
+    ///
+    /// All four sfa sections are written because `recover()` requires them
+    /// all — only the tables section carries the corrupt payload.
     fn write_corrupt_table_count(folder: &Path, id: u64, fs: &dyn Fs) -> crate::Result<()> {
         let path = folder.join(format!("v{id}"));
         let file = fs.open(
@@ -247,6 +250,9 @@ mod tests {
     }
 
     /// Write a version sfa archive with a corrupt `blob_file_count` (`u32::MAX`).
+    ///
+    /// All four sfa sections required by `recover()` are present — only the
+    /// `blob_files` section carries the corrupt payload.
     fn write_corrupt_blob_count(folder: &Path, id: u64, fs: &dyn Fs) -> crate::Result<()> {
         let path = folder.join(format!("v{id}"));
         let file = fs.open(
