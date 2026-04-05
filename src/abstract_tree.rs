@@ -556,10 +556,11 @@ pub trait AbstractTree: sealed::Sealed {
 
     /// Retrieves an item from the tree as a [`PinnableSlice`].
     ///
-    /// When the value is backed by an on-disk data block, the returned
-    /// [`PinnableSlice::Pinned`] variant holds a reference to that block's
-    /// decompressed buffer, avoiding a data copy. Memtable and blob-resolved
-    /// values use the [`PinnableSlice::Owned`] variant.
+    /// When the value is backed by an on-disk data block, implementations
+    /// may return [`PinnableSlice::Pinned`] holding a reference to that block's
+    /// decompressed buffer (avoiding a data copy). Memtable and blob-resolved
+    /// values use [`PinnableSlice::Owned`]. The default implementation always
+    /// returns `Owned`; only [`Tree`] overrides with the pinned path.
     ///
     /// The existing [`AbstractTree::get`] method is unaffected.
     ///

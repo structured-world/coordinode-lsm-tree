@@ -149,7 +149,11 @@ impl WriteBatch {
         // Reject mixed-op duplicates unconditionally — in release builds these
         // cause silent data loss (one entry overwrites the other in the skiplist).
         {
-            let mut seen: crate::HashMap<crate::UserKey, ValueType> = crate::HashMap::default();
+            let mut seen: crate::HashMap<crate::UserKey, ValueType> =
+                crate::HashMap::with_capacity_and_hasher(
+                    self.entries.len(),
+                    rustc_hash::FxBuildHasher,
+                );
             for entry in &self.entries {
                 let (key, vtype) = match entry {
                     WriteBatchEntry::Insert { key, .. } => (key, ValueType::Value),

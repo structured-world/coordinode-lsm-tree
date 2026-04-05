@@ -90,7 +90,7 @@ fn bench_write_batch(c: &mut Criterion) {
     }
 
     // Compare with individual inserts
-    for batch_size in [10, 50, 100] {
+    for batch_size in [10, 50, 100, 500] {
         group.bench_with_input(
             BenchmarkId::new("individual_inserts", batch_size),
             &batch_size,

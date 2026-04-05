@@ -711,19 +711,11 @@ impl AbstractTree for BlobTree {
                 .collect();
         }
 
-        // Delegate to Tree's batch internal entry lookup, then resolve blobs
-        let mut sorted_indices: Vec<usize> = (0..n).collect();
-        sorted_indices.sort_by(|&a, &b| comparator.compare(keys[a].as_ref(), keys[b].as_ref()));
-
-        let key_hashes: Vec<u64> = keys
-            .iter()
-            .map(|k| crate::table::filter::standard_bloom::Builder::get_hash(k.as_ref()))
-            .collect();
-
+        // Phase 1: Check memtables (unsorted — defer sort+hash for SST phase)
         let mut internal_entries: Vec<Option<crate::value::InternalValue>> = vec![None; n];
-        let mut remaining_sorted: Vec<usize> = Vec::with_capacity(n);
+        let mut remaining: Vec<usize> = Vec::with_capacity(n);
 
-        for &idx in &sorted_indices {
+        for idx in 0..n {
             let key = keys[idx].as_ref();
             if let Some(entry) = super_version.active_memtable.get(key, seqno) {
                 internal_entries[idx] = Some(entry);
@@ -735,22 +727,30 @@ impl AbstractTree for BlobTree {
                 internal_entries[idx] = Some(entry);
                 continue;
             }
-            remaining_sorted.push(idx);
+            remaining.push(idx);
         }
 
-        if !remaining_sorted.is_empty() {
+        // Phase 2: Sort + hash only if memtable misses exist
+        if !remaining.is_empty() {
+            remaining.sort_by(|&a, &b| comparator.compare(keys[a].as_ref(), keys[b].as_ref()));
+
+            let key_hashes: Vec<u64> = keys
+                .iter()
+                .map(|k| crate::table::filter::standard_bloom::Builder::get_hash(k.as_ref()))
+                .collect();
+
             crate::Tree::batch_get_from_tables(
                 &super_version.version,
                 &keys,
                 &key_hashes,
-                &remaining_sorted,
+                &remaining,
                 seqno,
                 comparator,
                 &mut internal_entries,
             )?;
         }
 
-        // Resolve each entry (tombstones, RT suppression, blob indirections)
+        // Phase 3: Resolve each entry (tombstones, RT suppression, merge, blob indirections)
         let mut results = vec![None; n];
         for idx in 0..n {
             if let Some(item) = internal_entries[idx].take() {
@@ -764,6 +764,12 @@ impl AbstractTree for BlobTree {
                     seqno,
                     comparator,
                 ) {
+                    continue;
+                }
+                // Merge operand resolution — delegate to resolve_key which handles
+                // the full pipeline (merge + blob indirection) via Tree internals.
+                if item.key.value_type.is_merge_operand() {
+                    results[idx] = self.resolve_key(&super_version, keys[idx].as_ref(), seqno)?;
                     continue;
                 }
                 let (_, v) = resolve_value_handle(

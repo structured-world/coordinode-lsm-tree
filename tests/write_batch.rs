@@ -31,7 +31,7 @@ fn write_batch_insert_and_read() -> lsm_tree::Result<()> {
 }
 
 #[test]
-fn write_batch_mixed_operations() -> lsm_tree::Result<()> {
+fn write_batch_insert_and_remove_different_keys() -> lsm_tree::Result<()> {
     let folder = get_tmp_folder();
     let tree = Config::new(
         &folder,
