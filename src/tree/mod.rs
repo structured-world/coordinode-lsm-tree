@@ -806,7 +806,7 @@ impl AbstractTree for Tree {
         let comparator = self.config.comparator.as_ref();
         let merge_operator = self.config.merge_operator.as_ref();
 
-        // Collect keys and pre-compute bloom hashes once
+        // Collect keys up front; bloom hashes computed lazily in Phase 2
         let keys: Vec<_> = keys.into_iter().collect();
         let n = keys.len();
         if n == 0 {
