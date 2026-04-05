@@ -11,6 +11,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [4.3.0](https://github.com/structured-world/coordinode-lsm-tree/compare/v4.2.0...v4.3.0) - 2026-04-05
+
+### Added
+
+- *(fs)* MemFs — in-memory Fs implementation for testing and in-memory trees ([#211](https://github.com/structured-world/coordinode-lsm-tree/pull/211))
+
+### Fixed
+
+- *(table)* validate block type on cache-hit path ([#203](https://github.com/structured-world/coordinode-lsm-tree/pull/203))
+- *(table)* two-level index scan stops prematurely on empty child partitions ([#202](https://github.com/structured-world/coordinode-lsm-tree/pull/202))
+
+### Performance
+
+- *(table)* add infallible OwnedIndexBlockIter constructor for pre-validated blocks ([#206](https://github.com/structured-world/coordinode-lsm-tree/pull/206))
+
+### Refactored
+
+- *(fs)* migrate Tree::open recovery path to Fs trait ([#212](https://github.com/structured-world/coordinode-lsm-tree/pull/212))
+- *(table)* make index block bound-cursor helpers fallible ([#205](https://github.com/structured-world/coordinode-lsm-tree/pull/205))
+- *(table)* make all meta/trailer reads fallible for truncated blocks ([#204](https://github.com/structured-world/coordinode-lsm-tree/pull/204))
+- *(table)* make block decoder trailer validation fallible ([#199](https://github.com/structured-world/coordinode-lsm-tree/pull/199))
+
 ## [4.2.0](https://github.com/structured-world/coordinode-lsm-tree/compare/v4.1.0...v4.2.0) - 2026-03-26
 
 ### Added
