@@ -177,3 +177,114 @@ pub fn recover(folder: &Path, fs: &dyn Fs) -> crate::Result<Recovery> {
         gc_stats,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fs::{FsOpenOptions, MemFs};
+    use byteorder::{LittleEndian, WriteBytesExt};
+
+    /// Write a CURRENT pointer so `recover()` can find the version file.
+    fn write_current(folder: &Path, version_id: u64, fs: &dyn Fs) -> crate::Result<()> {
+        let path = folder.join(CURRENT_VERSION_FILE);
+        let mut f = fs.open(
+            &path,
+            &FsOpenOptions::new().write(true).create(true).truncate(true),
+        )?;
+        f.write_u64::<LittleEndian>(version_id)?;
+        f.write_u128::<LittleEndian>(0)?; // checksum placeholder
+        f.write_u8(0)?; // checksum type
+        Ok(())
+    }
+
+    /// Write a version sfa archive with a corrupt `table_count` (`u32::MAX`).
+    fn write_corrupt_table_count(folder: &Path, id: u64, fs: &dyn Fs) -> crate::Result<()> {
+        let path = folder.join(format!("v{id}"));
+        let file = fs.open(
+            &path,
+            &FsOpenOptions::new().write(true).create(true).truncate(true),
+        )?;
+        let mut w = sfa::Writer::from_writer(std::io::BufWriter::new(file));
+
+        w.start("tree_type")?;
+        w.write_u8(0)?;
+
+        w.start("tables")?;
+        w.write_u8(1)?; // 1 level
+        w.write_u8(1)?; // 1 run
+        w.write_u32::<LittleEndian>(u32::MAX)?; // corrupt: exceeds section length
+
+        w.start("blob_files")?;
+        w.write_u32::<LittleEndian>(0)?;
+
+        w.start("blob_gc_stats")?;
+        w.write_u32::<LittleEndian>(0)?;
+
+        w.finish().map_err(|e| match e {
+            sfa::Error::Io(e) => crate::Error::from(e),
+            _ => crate::Error::Unrecoverable,
+        })?;
+        Ok(())
+    }
+
+    /// Write a version sfa archive with a corrupt `blob_file_count` (`u32::MAX`).
+    fn write_corrupt_blob_count(folder: &Path, id: u64, fs: &dyn Fs) -> crate::Result<()> {
+        let path = folder.join(format!("v{id}"));
+        let file = fs.open(
+            &path,
+            &FsOpenOptions::new().write(true).create(true).truncate(true),
+        )?;
+        let mut w = sfa::Writer::from_writer(std::io::BufWriter::new(file));
+
+        w.start("tree_type")?;
+        w.write_u8(0)?;
+
+        w.start("tables")?;
+        w.write_u8(0)?; // 0 levels
+
+        w.start("blob_files")?;
+        w.write_u32::<LittleEndian>(u32::MAX)?; // corrupt
+
+        w.start("blob_gc_stats")?;
+        w.write_u32::<LittleEndian>(0)?;
+
+        w.finish().map_err(|e| match e {
+            sfa::Error::Io(e) => crate::Error::from(e),
+            _ => crate::Error::Unrecoverable,
+        })?;
+        Ok(())
+    }
+
+    #[test]
+    fn recover_rejects_corrupt_table_count() -> crate::Result<()> {
+        let fs = MemFs::new();
+        let folder = Path::new("/corrupt/tables");
+        fs.create_dir_all(folder)?;
+
+        write_current(folder, 1, &fs)?;
+        write_corrupt_table_count(folder, 1, &fs)?;
+
+        let result = recover(folder, &fs);
+        assert!(result.is_err(), "expected error for corrupt table_count");
+
+        Ok(())
+    }
+
+    #[test]
+    fn recover_rejects_corrupt_blob_file_count() -> crate::Result<()> {
+        let fs = MemFs::new();
+        let folder = Path::new("/corrupt/blobs");
+        fs.create_dir_all(folder)?;
+
+        write_current(folder, 1, &fs)?;
+        write_corrupt_blob_count(folder, 1, &fs)?;
+
+        let result = recover(folder, &fs);
+        assert!(
+            result.is_err(),
+            "expected error for corrupt blob_file_count"
+        );
+
+        Ok(())
+    }
+}
