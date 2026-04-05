@@ -359,9 +359,10 @@ impl Table {
         #[cfg(feature = "metrics")]
         {
             use std::sync::atomic::Ordering::Relaxed;
-            // NOTE: Only increment the filter queries when the filter reported a miss
-            // and we actually waste an I/O for a non-existing item.
-            // Otherwise, the filter efficiency decreases whenever an item is hit.
+            // NOTE: `check_bloom()` accounts for lookups rejected by the filter
+            // (skip I/O entirely). This path accounts for negative point lookups
+            // that still reached storage even though a filter was present, so
+            // `filter_queries` remains interpretable alongside `filter_efficiency()`.
             // https://github.com/fjall-rs/lsm-tree/issues/246
             if item.is_none() && bloom.has_filter() {
                 self.metrics.filter_queries.fetch_add(1, Relaxed);
