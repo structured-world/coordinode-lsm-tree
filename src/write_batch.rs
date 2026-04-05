@@ -40,10 +40,15 @@ enum WriteBatchEntry {
 /// Batch of write operations applied with a shared seqno.
 ///
 /// **Duplicate keys:** all entries receive the same seqno. If the batch
-/// contains multiple operations on the same key, their relative order is
-/// **not** guaranteed after insertion into the memtable's skiplist (which
-/// orders by `(user_key, seqno, value_type)`). Callers should avoid
-/// duplicate keys within a single batch, or canonicalize them beforehand.
+/// contains multiple operations on the same user key, their relative order is
+/// **not** guaranteed after insertion into the memtable's skiplist, because
+/// the effective ordering for these entries is `(user_key, seqno)` (that is,
+/// `value_type` does not break ties). As a result, duplicate operations in a
+/// single batch are especially subtle: two ops for the same key in the same
+/// batch compare equal on ordering fields, so concurrent inserts/readers may
+/// observe either one first while the batch is being materialized into the
+/// memtable. Callers should avoid duplicate keys within a single batch, or
+/// canonicalize them beforehand into the final intended operation per key.
 ///
 /// # Examples
 ///
