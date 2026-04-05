@@ -352,7 +352,7 @@ impl Table {
         // Translate table-local seqno back to global coordinate so callers
         // can compare across tables/memtables (L0 best-selection, RT suppression).
         let item = item.map(|mut iv| {
-            iv.key.seqno += global_seqno;
+            iv.key.seqno = iv.key.seqno.saturating_add(global_seqno);
             iv
         });
 
@@ -398,7 +398,7 @@ impl Table {
 
         // Translate table-local seqno back to global coordinate (see Table::get).
         let result = result.map(|(mut iv, block)| {
-            iv.key.seqno += global_seqno;
+            iv.key.seqno = iv.key.seqno.saturating_add(global_seqno);
             (iv, block)
         });
 

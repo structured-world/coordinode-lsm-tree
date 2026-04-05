@@ -860,10 +860,12 @@ impl AbstractTree for Tree {
         if !remaining.is_empty() {
             remaining.sort_by(|&a, &b| comparator.compare(keys[a].as_ref(), keys[b].as_ref()));
 
-            let key_hashes: Vec<u64> = keys
-                .iter()
-                .map(|k| crate::table::filter::standard_bloom::Builder::get_hash(k.as_ref()))
-                .collect();
+            // Hash only keys that actually reach SST lookup (not all N keys).
+            let mut key_hashes = vec![0u64; n];
+            for &idx in &remaining {
+                key_hashes[idx] =
+                    crate::table::filter::standard_bloom::Builder::get_hash(keys[idx].as_ref());
+            }
 
             Self::batch_get_from_tables(
                 &super_version.version,
