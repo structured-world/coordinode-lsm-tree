@@ -13,12 +13,31 @@ use crate::{
 use byteorder::{LittleEndian, ReadBytesExt};
 use std::path::Path;
 
+/// Reads and validates the CURRENT version pointer file.
+///
+/// The file format is: `version_id: u64 | checksum: u128 | checksum_type: u8`
+/// (25 bytes total, written atomically by `rewrite_atomic`).
+///
+/// Returns the version ID after verifying the checksum type tag is valid.
+/// The checksum itself is not validated here — it is the hash of the version
+/// *file* content, which is validated after the file is fully read in
+/// [`recover()`].
 pub fn get_current_version(folder: &Path, fs: &dyn Fs) -> crate::Result<VersionId> {
     use byteorder::{LittleEndian, ReadBytesExt};
 
     let path = folder.join(CURRENT_VERSION_FILE);
     let mut file = fs.open(&path, &FsOpenOptions::new().read(true))?;
+
     let version_id = file.read_u64::<LittleEndian>()?;
+    let _checksum = file.read_u128::<LittleEndian>()?;
+    let checksum_type = file.read_u8()?;
+
+    // Validate checksum type tag — a non-zero value indicates corruption
+    // or a file from an incompatible version (only xxh3 = 0 is supported).
+    if checksum_type != 0 {
+        return Err(crate::Error::InvalidTag(("ChecksumType", checksum_type)));
+    }
+
     Ok(version_id)
 }
 
@@ -39,8 +58,6 @@ pub struct Recovery {
 pub fn recover(folder: &Path, fs: &dyn Fs) -> crate::Result<Recovery> {
     let curr_version_id = get_current_version(folder, fs)?;
     let version_file_path = folder.join(format!("v{curr_version_id}"));
-
-    // TODO: maybe validate current version using the checksum in "current"
 
     log::info!(
         "Recovering current manifest at {}",
@@ -266,8 +283,13 @@ mod tests {
         write_current(folder, 1, &fs)?;
         write_corrupt_table_count(folder, 1, &fs)?;
 
-        let result = recover(folder, &fs);
-        assert!(result.is_err(), "expected error for corrupt table_count");
+        let Err(err) = recover(folder, &fs) else {
+            panic!("corrupt table_count should fail");
+        };
+        assert!(
+            matches!(err, crate::Error::Unrecoverable),
+            "expected Unrecoverable, got: {err:?}"
+        );
 
         Ok(())
     }
@@ -281,10 +303,12 @@ mod tests {
         write_current(folder, 1, &fs)?;
         write_corrupt_blob_count(folder, 1, &fs)?;
 
-        let result = recover(folder, &fs);
+        let Err(err) = recover(folder, &fs) else {
+            panic!("corrupt blob_file_count should fail");
+        };
         assert!(
-            result.is_err(),
-            "expected error for corrupt blob_file_count"
+            matches!(err, crate::Error::Unrecoverable),
+            "expected Unrecoverable, got: {err:?}"
         );
 
         Ok(())
