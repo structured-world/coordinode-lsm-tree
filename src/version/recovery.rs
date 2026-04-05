@@ -3,18 +3,23 @@
 // (found in the LICENSE-* files in the repository)
 
 use crate::{
-    Checksum, SeqNo, TableId, TreeType, coding::Decode, file::CURRENT_VERSION_FILE,
-    version::VersionId, vlog::BlobFileId,
+    Checksum, SeqNo, TableId, TreeType,
+    coding::Decode,
+    file::CURRENT_VERSION_FILE,
+    fs::{Fs, FsOpenOptions, open_section_reader},
+    version::VersionId,
+    vlog::BlobFileId,
 };
 use byteorder::{LittleEndian, ReadBytesExt};
 use std::path::Path;
 
-pub fn get_current_version(folder: &std::path::Path) -> crate::Result<VersionId> {
+pub fn get_current_version(folder: &Path, fs: &dyn Fs) -> crate::Result<VersionId> {
     use byteorder::{LittleEndian, ReadBytesExt};
 
-    std::fs::File::open(folder.join(CURRENT_VERSION_FILE))
-        .and_then(|mut f| f.read_u64::<LittleEndian>())
-        .map_err(Into::into)
+    let path = folder.join(CURRENT_VERSION_FILE);
+    let mut file = fs.open(&path, &FsOpenOptions::new().read(true))?;
+    let version_id = file.read_u64::<LittleEndian>()?;
+    Ok(version_id)
 }
 
 pub struct RecoveredTable {
@@ -31,8 +36,8 @@ pub struct Recovery {
     pub gc_stats: crate::blob_tree::FragmentationMap,
 }
 
-pub fn recover(folder: &Path) -> crate::Result<Recovery> {
-    let curr_version_id = get_current_version(folder)?;
+pub fn recover(folder: &Path, fs: &dyn Fs) -> crate::Result<Recovery> {
+    let curr_version_id = get_current_version(folder, fs)?;
     let version_file_path = folder.join(format!("v{curr_version_id}"));
 
     // TODO: maybe validate current version using the checksum in "current"
@@ -42,20 +47,22 @@ pub fn recover(folder: &Path) -> crate::Result<Recovery> {
         version_file_path.display(),
     );
 
-    let reader = sfa::Reader::new(&version_file_path)?;
+    let mut file = fs.open(&version_file_path, &FsOpenOptions::new().read(true))?;
+    let reader = sfa::Reader::from_reader(&mut file)?;
     let toc = reader.toc();
 
     // // TODO: vvv move into Version::decode vvv
     let mut levels = vec![];
 
     {
-        let mut reader = toc
+        let section = toc
             .section(b"tables")
             .ok_or(crate::Error::Unrecoverable)
             .inspect_err(|_| {
                 log::error!("tables section not found in version #{curr_version_id} - maybe the file is corrupted?");
-            })?
-            .buf_reader(&version_file_path)?;
+            })?;
+
+        let mut reader = open_section_reader(fs, &version_file_path, section)?;
 
         let level_count = reader.read_u8()?;
 
@@ -95,13 +102,14 @@ pub fn recover(folder: &Path) -> crate::Result<Recovery> {
     }
 
     let blob_file_ids = {
-        let mut reader = toc
+        let section = toc
             .section(b"blob_files")
             .ok_or(crate::Error::Unrecoverable)
             .inspect_err(|_| {
                 log::error!("blob_files section not found in version #{curr_version_id} - maybe the file is corrupted?");
-            })?
-            .buf_reader(&version_file_path)?;
+            })?;
+
+        let mut reader = open_section_reader(fs, &version_file_path, section)?;
 
         let blob_file_count = reader.read_u32::<LittleEndian>()?;
         let mut blob_file_ids = Vec::with_capacity(blob_file_count as usize);
@@ -128,27 +136,27 @@ pub fn recover(folder: &Path) -> crate::Result<Recovery> {
     debug_assert!(blob_file_ids.is_sorted_by_key(|(id, _)| id));
 
     let gc_stats = {
-        let mut reader = toc
+        let section = toc
             .section(b"blob_gc_stats")
             .ok_or(crate::Error::Unrecoverable)
             .inspect_err(|_| {
                 log::error!("blob_gc_stats section not found in version #{curr_version_id} - maybe the file is corrupted?");
-            })?
-            .buf_reader(&version_file_path)?;
+            })?;
+
+        let mut reader = open_section_reader(fs, &version_file_path, section)?;
 
         crate::blob_tree::FragmentationMap::decode_from(&mut reader)?
     };
 
     Ok(Recovery {
         tree_type: {
-            let byte = toc.section(b"tree_type").ok_or(crate::Error::Unrecoverable)
+            let section = toc.section(b"tree_type").ok_or(crate::Error::Unrecoverable)
             .inspect_err(|_|{
                 log::error!("tree_type section not found in version #{curr_version_id} - maybe the file is corrupted?");
-            })?
-            .buf_reader(
-                &version_file_path
-            )?
-            .read_u8()?;
+            })?;
+
+            let mut reader = open_section_reader(fs, &version_file_path, section)?;
+            let byte = reader.read_u8()?;
 
             TreeType::try_from(byte).map_err(|()| crate::Error::InvalidHeader("TreeType"))?
         },

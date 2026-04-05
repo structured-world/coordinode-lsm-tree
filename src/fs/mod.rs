@@ -313,3 +313,17 @@ pub trait Fs: Send + Sync + 'static {
     /// (for example, due to permission issues or transient backend failures).
     fn exists(&self, path: &Path) -> io::Result<bool>;
 }
+
+/// Opens a section of an sfa archive for buffered reading via the [`Fs`] trait.
+///
+/// Replaces [`sfa::TocEntry::buf_reader`] which opens files through
+/// [`std::fs`] directly, bypassing the pluggable filesystem.
+pub(crate) fn open_section_reader(
+    fs: &dyn Fs,
+    path: &Path,
+    section: &sfa::TocEntry,
+) -> io::Result<io::BufReader<io::Take<Box<dyn FsFile>>>> {
+    let mut file = fs.open(path, &FsOpenOptions::new().read(true))?;
+    file.seek(io::SeekFrom::Start(section.pos()))?;
+    Ok(io::BufReader::new(file.take(section.len())))
+}

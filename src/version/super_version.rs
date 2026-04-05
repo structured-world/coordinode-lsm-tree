@@ -77,7 +77,12 @@ impl SuperVersions {
         self.len().saturating_sub(1)
     }
 
-    pub fn maintenance(&mut self, folder: &Path, gc_watermark: SeqNo) -> crate::Result<()> {
+    pub fn maintenance(
+        &mut self,
+        folder: &Path,
+        gc_watermark: SeqNo,
+        fs: &dyn Fs,
+    ) -> crate::Result<()> {
         if gc_watermark == 0 {
             return Ok(());
         }
@@ -101,8 +106,8 @@ impl SuperVersions {
                 );
 
                 let path = folder.join(format!("v{}", head.version.id()));
-                if path.try_exists()? {
-                    std::fs::remove_file(path)?;
+                if fs.exists(&path)? {
+                    fs.remove_file(&path)?;
                 }
 
                 self.versions.pop_front();
@@ -218,6 +223,7 @@ impl SuperVersions {
 mod tests {
     use super::*;
     use crate::comparator::default_comparator;
+    use crate::fs::StdFs;
     use test_log::test;
 
     fn new_memtable(id: u64) -> Memtable {
@@ -254,7 +260,7 @@ mod tests {
             },
         ]);
 
-        history.maintenance(Path::new("."), 0)?;
+        history.maintenance(Path::new("."), 0, &StdFs)?;
 
         assert_eq!(history.free_list_len(), 2);
 
@@ -284,7 +290,7 @@ mod tests {
             },
         ]);
 
-        history.maintenance(Path::new("."), 3)?;
+        history.maintenance(Path::new("."), 3, &StdFs)?;
 
         assert_eq!(history.len(), 1);
 
@@ -320,7 +326,7 @@ mod tests {
             },
         ]);
 
-        history.maintenance(Path::new("."), 3)?;
+        history.maintenance(Path::new("."), 3, &StdFs)?;
 
         assert_eq!(history.len(), 2);
 
@@ -344,7 +350,7 @@ mod tests {
             },
         ]);
 
-        history.maintenance(Path::new("."), 3)?;
+        history.maintenance(Path::new("."), 3, &StdFs)?;
 
         assert_eq!(history.len(), 2);
 
@@ -368,7 +374,7 @@ mod tests {
             },
         ]);
 
-        history.maintenance(Path::new("."), 3)?;
+        history.maintenance(Path::new("."), 3, &StdFs)?;
 
         assert_eq!(history.len(), 1);
 

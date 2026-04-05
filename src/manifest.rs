@@ -2,7 +2,11 @@
 // This source code is licensed under both the Apache 2.0 and MIT License
 // (found in the LICENSE-* files in the repository)
 
-use crate::{FormatVersion, TreeType, checksum::ChecksumType};
+use crate::{
+    FormatVersion, TreeType,
+    checksum::ChecksumType,
+    fs::{Fs, open_section_reader},
+};
 use byteorder::ReadBytesExt;
 use std::{io::Read, path::Path};
 
@@ -18,7 +22,11 @@ pub struct Manifest {
 }
 
 impl Manifest {
-    pub fn decode_from(path: &Path, reader: &sfa::Reader) -> Result<Self, crate::Error> {
+    pub fn decode_from(
+        path: &Path,
+        reader: &sfa::Reader,
+        fs: &dyn Fs,
+    ) -> Result<Self, crate::Error> {
         let toc = reader.toc();
 
         let version = {
@@ -30,7 +38,7 @@ impl Manifest {
                 .section(b"format_version")
                 .expect("format_version section should exist in manifest");
 
-            let mut reader = section.buf_reader(path)?;
+            let mut reader = open_section_reader(fs, path, section)?;
             let version = reader.read_u8()?;
             FormatVersion::try_from(version).map_err(|()| crate::Error::InvalidVersion(version))?
         };
@@ -44,7 +52,7 @@ impl Manifest {
                 .section(b"tree_type")
                 .expect("tree_type section should exist in manifest");
 
-            let mut reader = section.buf_reader(path)?;
+            let mut reader = open_section_reader(fs, path, section)?;
             let tree_type = reader.read_u8()?;
             tree_type
                 .try_into()
@@ -60,7 +68,7 @@ impl Manifest {
                 .section(b"level_count")
                 .expect("level_count section should exist in manifest");
 
-            let mut reader = section.buf_reader(path)?;
+            let mut reader = open_section_reader(fs, path, section)?;
             reader.read_u8()?
         };
 
@@ -77,8 +85,7 @@ impl Manifest {
                     .section(b"filter_hash_type")
                     .expect("filter_hash_type section should exist in manifest");
 
-                section
-                    .buf_reader(path)?
+                open_section_reader(fs, path, section)?
                     .bytes()
                     .collect::<Result<Vec<_>, _>>()?
             };
@@ -108,7 +115,7 @@ impl Manifest {
                 }
 
                 let mut bytes = Vec::new();
-                section.buf_reader(path)?.read_to_end(&mut bytes)?;
+                open_section_reader(fs, path, section)?.read_to_end(&mut bytes)?;
 
                 String::from_utf8(bytes).map_err(|e| crate::Error::Utf8(e.utf8_error()))?
             }
@@ -127,6 +134,7 @@ impl Manifest {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fs::StdFs;
     use byteorder::WriteBytesExt;
     use std::io::Write;
 
@@ -168,8 +176,9 @@ mod tests {
 
         write_test_manifest(&path, None)?;
 
-        let reader = sfa::Reader::new(&path)?;
-        let manifest = Manifest::decode_from(&path, &reader)?;
+        let mut file = StdFs.open(&path, &crate::fs::FsOpenOptions::new().read(true))?;
+        let reader = sfa::Reader::from_reader(&mut file)?;
+        let manifest = Manifest::decode_from(&path, &reader, &StdFs)?;
         assert_eq!(manifest.comparator_name, "default");
         Ok(())
     }
@@ -181,8 +190,9 @@ mod tests {
 
         write_test_manifest(&path, Some("u64-big-endian"))?;
 
-        let reader = sfa::Reader::new(&path)?;
-        let manifest = Manifest::decode_from(&path, &reader)?;
+        let mut file = StdFs.open(&path, &crate::fs::FsOpenOptions::new().read(true))?;
+        let reader = sfa::Reader::from_reader(&mut file)?;
+        let manifest = Manifest::decode_from(&path, &reader, &StdFs)?;
         assert_eq!(manifest.comparator_name, "u64-big-endian");
         Ok(())
     }
@@ -195,8 +205,9 @@ mod tests {
         let long_name = "x".repeat(300);
         write_test_manifest(&path, Some(&long_name))?;
 
-        let reader = sfa::Reader::new(&path)?;
-        let result = Manifest::decode_from(&path, &reader);
+        let mut file = StdFs.open(&path, &crate::fs::FsOpenOptions::new().read(true))?;
+        let reader = sfa::Reader::from_reader(&mut file)?;
+        let result = Manifest::decode_from(&path, &reader, &StdFs);
         assert!(
             matches!(result, Err(crate::Error::DecompressedSizeTooLarge { .. })),
             "expected DecompressedSizeTooLarge"
@@ -226,8 +237,9 @@ mod tests {
 
         writer.finish()?;
 
-        let reader = sfa::Reader::new(&path)?;
-        let result = Manifest::decode_from(&path, &reader);
+        let mut file = StdFs.open(&path, &crate::fs::FsOpenOptions::new().read(true))?;
+        let reader = sfa::Reader::from_reader(&mut file)?;
+        let result = Manifest::decode_from(&path, &reader, &StdFs);
         assert!(
             matches!(result, Err(crate::Error::Utf8(_))),
             "expected Utf8 error"
