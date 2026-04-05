@@ -74,7 +74,9 @@ pub fn recover(folder: &Path, fs: &dyn Fs) -> crate::Result<Recovery> {
                 let mut run = vec![];
                 let table_count = reader.read_u32::<LittleEndian>()?;
 
-                // Bound by section length (33 bytes per entry) to reject corrupt counts.
+                // Bound by total section length (33 bytes per entry). Uses
+                // section.len() because BufReader buffering makes
+                // Take::limit() unreliable for remaining-byte checks.
                 if u64::from(table_count) > section.len() / 33 {
                     return Err(crate::Error::Unrecoverable);
                 }
@@ -118,7 +120,7 @@ pub fn recover(folder: &Path, fs: &dyn Fs) -> crate::Result<Recovery> {
 
         let blob_file_count = reader.read_u32::<LittleEndian>()?;
 
-        // Bound by section length (25 bytes per entry, 4-byte count header).
+        // Bound by section payload (25 bytes per entry, minus 4-byte count header).
         if u64::from(blob_file_count) > section.len().saturating_sub(4) / 25 {
             return Err(crate::Error::Unrecoverable);
         }

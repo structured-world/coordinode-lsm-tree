@@ -1736,7 +1736,11 @@ impl Tree {
 
             if dirent.file_name.starts_with('v') && dirent.file_name != version_str {
                 log::trace!("Cleanup orphaned version {}", dirent.file_name);
-                fs.remove_file(&dirent.path)?;
+                match fs.remove_file(&dirent.path) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(e.into()),
+                }
             }
         }
 
