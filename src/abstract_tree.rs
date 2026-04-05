@@ -693,12 +693,16 @@ pub trait AbstractTree: sealed::Sealed {
         keys.into_iter().map(|key| self.get(key, seqno)).collect()
     }
 
-    /// Applies a [`WriteBatch`] atomically with the given sequence number.
+    /// Applies a [`WriteBatch`] with the given sequence number.
     ///
-    /// All entries in the batch share a single seqno, making them appear as
-    /// an atomic unit for MVCC reads. This is more efficient than individual
+    /// All entries share a single seqno. This is more efficient than individual
     /// writes because the version-history lock and memtable size accounting
     /// are performed only once for the entire batch.
+    ///
+    /// **Visibility:** entries become individually visible to concurrent readers
+    /// as they are inserted. For atomic batch visibility, the caller must
+    /// publish `seqno` (via `visible_seqno.fetch_max(seqno + 1)`) only
+    /// **after** this method returns.
     ///
     /// Returns the total bytes added and new size of the memtable.
     ///

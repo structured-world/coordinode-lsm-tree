@@ -2,16 +2,22 @@
 // This source code is licensed under both the Apache 2.0 and MIT License
 // (found in the LICENSE-* files in the repository)
 
-//! Atomic write batch for bulk memtable insertion.
+//! Write batch for bulk memtable insertion with shared seqno.
 //!
 //! A [`WriteBatch`] collects multiple write operations (insert, remove, merge)
-//! and applies them atomically to the active memtable with a single seqno.
+//! and applies them to the active memtable with a single seqno.
 //! This reduces per-operation overhead:
 //!
 //! - **One version-history lock** acquisition instead of N
 //! - **Batch size accounting**: single `fetch_add` for total size
-//! - **Shared seqno**: all entries in a batch share the same sequence number,
-//!   making the batch appear as an atomic unit for MVCC reads
+//! - **Shared seqno**: all entries in a batch share the same sequence number
+//!
+//! **Visibility contract:** entries are inserted into the memtable one at a time
+//! and become individually visible to concurrent readers as they are written.
+//! Atomic batch visibility requires the **caller** to publish the batch seqno
+//! (via `visible_seqno.fetch_max(batch_seqno + 1)`) only **after**
+//! [`AbstractTree::apply_batch`] returns. This is the same pattern used by
+//! fjall's keyspace for single-writer batches.
 
 use crate::{UserKey, UserValue, ValueType, value::InternalValue};
 

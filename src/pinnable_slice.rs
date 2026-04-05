@@ -21,7 +21,7 @@
 
 use crate::{Slice, UserValue, table::Block};
 
-/// A value reference that may be pinned in the block cache.
+/// A value reference that may share the decompressed block buffer.
 ///
 /// Use [`PinnableSlice::as_ref`] to access the raw bytes regardless of variant.
 ///
@@ -50,7 +50,7 @@ pub enum PinnableSlice {
 }
 
 impl PinnableSlice {
-    /// Creates a pinned value referencing data within a block cache entry.
+    /// Creates a pinned value sharing the decompressed block buffer.
     #[must_use]
     pub fn pinned(block: Block, value: Slice) -> Self {
         Self::Pinned {
@@ -59,13 +59,13 @@ impl PinnableSlice {
         }
     }
 
-    /// Creates an owned value (not pinned in any cache).
+    /// Creates an owned value (not sharing any block buffer).
     #[must_use]
     pub fn owned(value: UserValue) -> Self {
         Self::Owned(value)
     }
 
-    /// Returns `true` if this value is pinned in the block cache.
+    /// Returns `true` if this value shares the decompressed block buffer.
     #[must_use]
     pub fn is_pinned(&self) -> bool {
         matches!(self, Self::Pinned { .. })

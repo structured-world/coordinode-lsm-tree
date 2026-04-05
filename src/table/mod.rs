@@ -261,7 +261,8 @@ impl Table {
                 )?;
                 Some(Cow::Owned(FilterBlock::new(block)))
             } else {
-                None
+                // Key sorts past the last filter partition — definite miss.
+                return Ok((false, true));
             }
         } else if let Some(_filter_tli_handle) = &self.regions.filter_tli {
             unimplemented!("unpinned filter TLI not supported");
