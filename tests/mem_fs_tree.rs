@@ -4,8 +4,7 @@ use lsm_tree::{AbstractTree, Config, Guard, SeqNo, SequenceNumberCounter};
 use test_log::test;
 
 /// Returns a unique virtual path for each test to avoid host-path collisions.
-/// `Tree::open` probes `CURRENT` via `std::fs`; using `tempfile::tempdir`
-/// ensures no leftover on-disk state can trigger the unsupported reopen path.
+/// Using `tempfile::tempdir` ensures no leftover on-disk state can interfere.
 fn test_path(name: &str) -> (tempfile::TempDir, std::path::PathBuf) {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join(name);
@@ -195,6 +194,69 @@ fn memfs_shared_across_trees() -> lsm_tree::Result<()> {
         !tables2.exists(),
         "tables dir should NOT exist on host disk"
     );
+
+    Ok(())
+}
+
+/// Verifies the full MemFs round-trip: create tree → write → flush → drop → reopen → read.
+///
+/// This is the core scenario unlocked by #209 (migrating Tree::open recovery
+/// path to the Fs trait). Before that change, `Tree::open` used `std::fs`
+/// directly for version detection and recovery, so MemFs trees could not be
+/// reopened after drop.
+#[test]
+fn memfs_reopen_recovers_flushed_data() -> lsm_tree::Result<()> {
+    use std::sync::Arc;
+
+    let (_dir, path) = test_path("reopen");
+    let fs: Arc<dyn lsm_tree::fs::Fs> = Arc::new(MemFs::new());
+
+    // Phase 1: create, write, flush, drop
+    {
+        let tree = Config::new(
+            &path,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(Arc::clone(&fs))
+        .open()?;
+
+        tree.insert("alpha", "one", 0);
+        tree.insert("beta", "two", 1);
+        tree.insert("gamma", "three", 2);
+
+        tree.flush_active_memtable(0)?;
+
+        assert_eq!(tree.len(SeqNo::MAX, None)?, 3);
+    } // tree dropped here — MemFs retains all data
+
+    // Phase 2: reopen from the same MemFs and verify data survived
+    {
+        let tree = Config::new(
+            &path,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(Arc::clone(&fs))
+        .open()?;
+
+        assert_eq!(tree.len(SeqNo::MAX, None)?, 3);
+
+        let val = tree
+            .get("alpha", SeqNo::MAX)?
+            .expect("alpha should survive reopen");
+        assert_eq!(&*val, b"one");
+
+        let val = tree
+            .get("beta", SeqNo::MAX)?
+            .expect("beta should survive reopen");
+        assert_eq!(&*val, b"two");
+
+        let val = tree
+            .get("gamma", SeqNo::MAX)?
+            .expect("gamma should survive reopen");
+        assert_eq!(&*val, b"three");
+    }
 
     Ok(())
 }
