@@ -46,12 +46,10 @@ enum WriteBatchEntry {
 ///
 /// - **Repeated `merge()` on the same key:** safe. All merge operands are
 ///   collected during reads regardless of skiplist position.
-/// - **Mixed ops on the same key** (e.g. `insert` + `remove`): **unsafe** —
-///   one operation will be lost. Callers must canonicalize mixed-op
-///   duplicates into a single final operation before batching.
-///
-/// In debug builds, `materialize()` asserts that no user key appears with
-/// differing `value_type`s to catch accidental mixed-op batches early.
+/// - **Mixed ops on the same key** (e.g. `insert` + `remove`): not allowed.
+///   `materialize()` rejects these batches with `Error::MixedOperationBatch`
+///   in all builds. Callers must canonicalize mixed-op duplicates into a
+///   single final operation before batching.
 ///
 /// # Examples
 ///
