@@ -685,16 +685,90 @@ impl AbstractTree for BlobTree {
         self.resolve_key(&super_version, key.as_ref(), seqno)
     }
 
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "indices are generated from 0..n range, always in bounds"
+    )]
     fn multi_get<K: AsRef<[u8]>>(
         &self,
         keys: impl IntoIterator<Item = K>,
         seqno: SeqNo,
     ) -> crate::Result<Vec<Option<crate::UserValue>>> {
         let super_version = self.index.get_version_for_snapshot(seqno);
+        let comparator = self.index.config.comparator.as_ref();
 
-        keys.into_iter()
-            .map(|key| self.resolve_key(&super_version, key.as_ref(), seqno))
-            .collect()
+        let keys: Vec<_> = keys.into_iter().collect();
+        let n = keys.len();
+        if n == 0 {
+            return Ok(Vec::new());
+        }
+
+        // For small batches, use the simple per-key path
+        if n <= 2 {
+            return keys
+                .iter()
+                .map(|key| self.resolve_key(&super_version, key.as_ref(), seqno))
+                .collect();
+        }
+
+        // Delegate to Tree's batch internal entry lookup, then resolve blobs
+        let mut sorted_indices: Vec<usize> = (0..n).collect();
+        sorted_indices.sort_by(|&a, &b| comparator.compare(keys[a].as_ref(), keys[b].as_ref()));
+
+        let key_hashes: Vec<u64> = keys
+            .iter()
+            .map(|k| crate::table::filter::standard_bloom::Builder::get_hash(k.as_ref()))
+            .collect();
+
+        let mut internal_entries: Vec<Option<crate::value::InternalValue>> = vec![None; n];
+        let mut remaining_sorted: Vec<usize> = Vec::with_capacity(n);
+
+        for &idx in &sorted_indices {
+            let key = keys[idx].as_ref();
+            if let Some(entry) = super_version.active_memtable.get(key, seqno) {
+                internal_entries[idx] = Some(entry);
+                continue;
+            }
+            if let Some(entry) =
+                crate::Tree::get_internal_entry_from_sealed_memtables(&super_version, key, seqno)
+            {
+                internal_entries[idx] = Some(entry);
+                continue;
+            }
+            remaining_sorted.push(idx);
+        }
+
+        if !remaining_sorted.is_empty() {
+            crate::Tree::batch_get_from_tables(
+                &super_version.version,
+                &keys,
+                &key_hashes,
+                &remaining_sorted,
+                seqno,
+                comparator,
+                &mut internal_entries,
+            )?;
+        }
+
+        // Resolve each entry (tombstones, blob indirections)
+        let mut results = vec![None; n];
+        for idx in 0..n {
+            if let Some(item) = internal_entries[idx].take() {
+                if item.is_tombstone() {
+                    continue;
+                }
+                let (_, v) = resolve_value_handle(
+                    self.id(),
+                    self.blobs_folder.as_path(),
+                    &self.index.config.cache,
+                    &super_version.version,
+                    item,
+                )?;
+                results[idx] = Some(v);
+            }
+        }
+
+        Ok(results)
     }
 
     fn merge<K: Into<UserKey>, V: Into<UserValue>>(

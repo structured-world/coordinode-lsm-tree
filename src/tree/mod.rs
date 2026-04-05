@@ -1386,7 +1386,7 @@ impl Tree {
         clippy::indexing_slicing,
         reason = "indices come from 0..n range and are always within keys/key_hashes/results bounds"
     )]
-    fn batch_get_from_tables<K: AsRef<[u8]>>(
+    pub(crate) fn batch_get_from_tables<K: AsRef<[u8]>>(
         version: &Version,
         keys: &[K],
         key_hashes: &[u64],
@@ -1507,7 +1507,7 @@ impl Tree {
         Ok(None)
     }
 
-    fn get_internal_entry_from_sealed_memtables(
+    pub(crate) fn get_internal_entry_from_sealed_memtables(
         super_version: &SuperVersion,
         key: &[u8],
         seqno: SeqNo,

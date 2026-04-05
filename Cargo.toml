@@ -90,3 +90,9 @@ name = "index_block"
 harness = false
 path = "benches/index_block.rs"
 required-features = []
+
+[[bench]]
+name = "batch_ops"
+harness = false
+path = "benches/batch_ops.rs"
+required-features = []
