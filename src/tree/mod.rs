@@ -1732,12 +1732,16 @@ impl Tree {
     #[must_use]
     pub fn append_batch(&self, items: Vec<InternalValue>) -> (u64, u64) {
         #[expect(clippy::expect_used, reason = "lock is expected to not be poisoned")]
-        self.version_history
-            .read()
-            .expect("lock is poisoned")
-            .latest_version()
-            .active_memtable
-            .insert_batch(items)
+        let memtable = Arc::clone(
+            &self
+                .version_history
+                .read()
+                .expect("lock is poisoned")
+                .latest_version()
+                .active_memtable,
+        );
+        // Lock dropped here — insert_batch runs without holding version_history
+        memtable.insert_batch(items)
     }
 
     /// Recovers previous state, by loading the level manifest, tables and blob files.

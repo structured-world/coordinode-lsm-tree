@@ -234,22 +234,12 @@ impl Table {
         self.metadata.file_size
     }
 
-    pub fn get(
-        &self,
-        key: &[u8],
-        seqno: SeqNo,
-        key_hash: u64,
-    ) -> crate::Result<Option<InternalValue>> {
-        #[cfg(feature = "metrics")]
-        use std::sync::atomic::Ordering::Relaxed;
-
-        // Translate seqno to "our" seqno
-        let seqno = seqno.saturating_sub(self.global_seqno());
-
-        if self.metadata.seqnos.0 >= seqno {
-            return Ok(None);
-        }
-
+    /// Loads the filter block (if any) and checks the bloom filter.
+    ///
+    /// Returns `Ok(false)` if the bloom filter says the key is definitely absent,
+    /// `Ok(true)` if point read should proceed.
+    fn check_bloom(&self, key: &[u8], seqno: SeqNo, key_hash: u64) -> crate::Result<(bool, bool)> {
+        // Returns (should_proceed, has_filter)
         let filter_block = if let Some(block) = &self.pinned_filter_block {
             Some(Cow::Borrowed(block))
         } else if let Some(filter_idx) = &self.pinned_filter_index {
@@ -262,13 +252,11 @@ impl Table {
                 let block = self.load_block(
                     &filter_block_handle.into_inner(),
                     BlockType::Filter,
-                    CompressionType::None, // NOTE: We never write a filter block with compression
+                    CompressionType::None,
                     #[cfg(zstd_any)]
                     None,
                 )?;
-                let block = FilterBlock::new(block);
-
-                Some(Cow::Owned(block))
+                Some(Cow::Owned(FilterBlock::new(block)))
             } else {
                 None
             }
@@ -278,26 +266,46 @@ impl Table {
             let block = self.load_block(
                 filter_block_handle,
                 BlockType::Filter,
-                CompressionType::None, // NOTE: We never write a filter block with compression
+                CompressionType::None,
                 #[cfg(zstd_any)]
                 None,
             )?;
-            let block = FilterBlock::new(block);
-
-            Some(Cow::Owned(block))
+            Some(Cow::Owned(FilterBlock::new(block)))
         } else {
             None
         };
 
+        let has_filter = filter_block.is_some();
+
         if let Some(filter_block) = &filter_block
             && !filter_block.maybe_contains_hash(key_hash)?
         {
+            return Ok((false, has_filter));
+        }
+
+        Ok((true, has_filter))
+    }
+
+    pub fn get(
+        &self,
+        key: &[u8],
+        seqno: SeqNo,
+        key_hash: u64,
+    ) -> crate::Result<Option<InternalValue>> {
+        let seqno = seqno.saturating_sub(self.global_seqno());
+
+        if self.metadata.seqnos.0 >= seqno {
+            return Ok(None);
+        }
+
+        let (proceed, has_filter) = self.check_bloom(key, seqno, key_hash)?;
+        if !proceed {
             #[cfg(feature = "metrics")]
             {
+                use std::sync::atomic::Ordering::Relaxed;
                 self.metrics.filter_queries.fetch_add(1, Relaxed);
                 self.metrics.io_skipped_by_filter.fetch_add(1, Relaxed);
             }
-
             return Ok(None);
         }
 
@@ -310,12 +318,13 @@ impl Table {
 
         #[cfg(feature = "metrics")]
         {
+            use std::sync::atomic::Ordering::Relaxed;
             // NOTE: Only increment the filter queries when the filter reported a miss
             // and we actually waste an I/O for a non-existing item.
             // Otherwise, the filter efficiency decreases whenever an item is hit.
             // https://github.com/fjall-rs/lsm-tree/issues/246
             item.inspect(|maybe_kv| {
-                if maybe_kv.is_none() && filter_block.is_some() {
+                if maybe_kv.is_none() && has_filter {
                     self.metrics.filter_queries.fetch_add(1, Relaxed);
                 }
             })
@@ -331,63 +340,20 @@ impl Table {
         seqno: SeqNo,
         key_hash: u64,
     ) -> crate::Result<Option<(InternalValue, Block)>> {
-        #[cfg(feature = "metrics")]
-        use std::sync::atomic::Ordering::Relaxed;
-
         let seqno = seqno.saturating_sub(self.global_seqno());
 
         if self.metadata.seqnos.0 >= seqno {
             return Ok(None);
         }
 
-        let filter_block = if let Some(block) = &self.pinned_filter_block {
-            Some(std::borrow::Cow::Borrowed(block))
-        } else if let Some(filter_idx) = &self.pinned_filter_index {
-            let mut iter = filter_idx.iter(self.comparator.clone());
-            iter.seek(key, seqno);
-
-            if let Some(filter_block_handle) = iter.next() {
-                let filter_block_handle = filter_block_handle.materialize(filter_idx.as_slice());
-
-                let block = self.load_block(
-                    &filter_block_handle.into_inner(),
-                    BlockType::Filter,
-                    CompressionType::None,
-                    #[cfg(zstd_any)]
-                    None,
-                )?;
-                let block = FilterBlock::new(block);
-
-                Some(std::borrow::Cow::Owned(block))
-            } else {
-                None
-            }
-        } else if let Some(_filter_tli_handle) = &self.regions.filter_tli {
-            unimplemented!("unpinned filter TLI not supported");
-        } else if let Some(filter_block_handle) = &self.regions.filter {
-            let block = self.load_block(
-                filter_block_handle,
-                BlockType::Filter,
-                CompressionType::None,
-                #[cfg(zstd_any)]
-                None,
-            )?;
-            let block = FilterBlock::new(block);
-
-            Some(std::borrow::Cow::Owned(block))
-        } else {
-            None
-        };
-
-        if let Some(filter_block) = &filter_block
-            && !filter_block.maybe_contains_hash(key_hash)?
-        {
+        let (proceed, has_filter) = self.check_bloom(key, seqno, key_hash)?;
+        if !proceed {
             #[cfg(feature = "metrics")]
             {
+                use std::sync::atomic::Ordering::Relaxed;
                 self.metrics.filter_queries.fetch_add(1, Relaxed);
                 self.metrics.io_skipped_by_filter.fetch_add(1, Relaxed);
             }
-
             return Ok(None);
         }
 
@@ -400,8 +366,9 @@ impl Table {
 
         #[cfg(feature = "metrics")]
         {
+            use std::sync::atomic::Ordering::Relaxed;
             item.inspect(|maybe_kv| {
-                if maybe_kv.is_none() && filter_block.is_some() {
+                if maybe_kv.is_none() && has_filter {
                     self.metrics.filter_queries.fetch_add(1, Relaxed);
                 }
             })

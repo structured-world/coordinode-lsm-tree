@@ -2,18 +2,20 @@
 // This source code is licensed under both the Apache 2.0 and MIT License
 // (found in the LICENSE-* files in the repository)
 
-//! Zero-copy value reference that can pin block cache entries.
+//! Zero-copy value reference that keeps the decompressed block buffer alive.
 //!
 //! [`PinnableSlice`] is inspired by `RocksDB`'s `PinnableSlice`
 //! (`include/rocksdb/slice.h:179-263`). It wraps a value that was read from
-//! the LSM tree and indicates whether the underlying data is pinned in the
-//! block cache (via an `Arc`-shared [`Block`]) or independently owned
-//! (e.g. from a memtable or merge result).
+//! the LSM tree and indicates whether the underlying data shares the
+//! decompressed block buffer or is independently owned (e.g. from a memtable
+//! or merge result).
 //!
-//! When the value comes from an on-disk data block that is in the block cache,
-//! holding a `PinnableSlice::Pinned` keeps the block alive (preventing
-//! eviction) for the duration of the reference. The value bytes point directly
-//! into the block's decompressed data — no copy is performed.
+//! When the value comes from an on-disk data block, holding a
+//! `PinnableSlice::Pinned` keeps the block's decompressed buffer alive
+//! (via the refcounted [`Slice`] / `ByteView` backing) for the duration of
+//! the reference. The value bytes are a sub-slice of that buffer — no copy
+//! is performed. Note: this does **not** prevent the block cache from
+//! evicting its entry; it only ensures the backing memory remains valid.
 //!
 //! Memtable and blob-resolved values use the `Owned` variant.
 
@@ -25,15 +27,16 @@ use crate::{Slice, UserValue, table::Block};
 ///
 /// # Lifetime
 ///
-/// As long as a `PinnableSlice::Pinned` is alive, the underlying
-/// [`Block`] will not be evicted from the cache. Drop the `PinnableSlice`
-/// when you are done with the value to allow cache eviction.
+/// The `Pinned` variant holds a [`Block`] clone whose `data` field is a
+/// refcounted [`Slice`]. As long as the `PinnableSlice` is alive, the
+/// decompressed block buffer remains valid. Dropping it releases the
+/// reference count on the underlying `ByteView` allocation.
 #[derive(Clone)]
 pub enum PinnableSlice {
-    /// Value pinned in block cache — zero copy.
+    /// Value sharing the decompressed block buffer — zero copy.
     ///
-    /// The [`Block`] (which is `Arc`-based) keeps the decompressed block
-    /// data alive. `value` is a sub-slice of the block's data created via
+    /// The [`Block`] keeps the decompressed data alive via refcounted
+    /// `Slice` / `ByteView`. `value` is a sub-slice created via
     /// [`Slice::slice`], sharing the same backing allocation.
     Pinned {
         /// Keeps the block alive in the cache.
@@ -88,8 +91,8 @@ impl PinnableSlice {
 
     /// Converts this `PinnableSlice` into an owned `UserValue`.
     ///
-    /// For the `Pinned` variant, this unpins the block and returns the
-    /// value slice (which is already reference-counted via `ByteView`).
+    /// For the `Pinned` variant, the `Block` is dropped but the returned
+    /// `Slice` still shares the same `ByteView` backing allocation.
     /// For the `Owned` variant, the value is returned directly.
     #[must_use]
     pub fn into_value(self) -> UserValue {

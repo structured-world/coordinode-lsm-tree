@@ -216,7 +216,7 @@ impl Memtable {
                 .try_into()
                 .expect("should fit into u64");
 
-            total_size += item_size;
+            total_size = total_size.saturating_add(item_size);
 
             if item.key.seqno > max_seqno {
                 max_seqno = item.key.seqno;
