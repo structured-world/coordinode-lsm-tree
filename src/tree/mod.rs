@@ -11,7 +11,6 @@ use crate::{
     ValueType,
     compaction::{CompactionStrategy, drop_range::OwnedBounds, state::CompactionState},
     config::Config,
-    file::CURRENT_VERSION_FILE,
     format_version::FormatVersion,
     iter_guard::{IterGuard, IterGuardImpl},
     key::InternalKey,
@@ -1210,11 +1209,15 @@ impl Tree {
             return Err(crate::Error::InvalidVersion(FormatVersion::V1.into()));
         }
 
-        // TODO: replace exists() probe with atomic read attempt (#213)
-        let tree = if config.fs.exists(&config.path.join(CURRENT_VERSION_FILE))? {
-            Self::recover(config)
-        } else {
-            Self::create_new(config)
+        // Decide between recovery and fresh creation atomically by attempting
+        // to read the CURRENT version file. This avoids a TOCTOU race that
+        // would occur if we probed with exists() first.
+        let tree = match crate::version::recovery::get_current_version(&config.path, &*config.fs) {
+            Ok(_) => Self::recover(config),
+            Err(crate::Error::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+                Self::create_new(config)
+            }
+            Err(e) => Err(e),
         }?;
 
         Ok(tree)

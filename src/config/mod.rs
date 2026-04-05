@@ -450,8 +450,6 @@ impl Config {
     /// Defaults to [`StdFs`]. Use [`MemFs`](crate::fs::MemFs) for
     /// in-memory trees (testing, ephemeral indexes).
     ///
-    /// See [`Config::fs`] for the reopen limitation on non-`StdFs` backends.
-    ///
     /// # Example
     ///
     /// ```
@@ -480,7 +478,6 @@ impl Config {
     /// Useful when multiple configs should reuse the same backend
     /// instance, including trait objects and backends that are not `Clone`.
     ///
-    /// See [`Config::fs`] for the reopen limitation on non-`StdFs` backends.
     #[must_use]
     pub fn with_shared_fs(mut self, fs: Arc<dyn Fs>) -> Self {
         self.fs = fs;

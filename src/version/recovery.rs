@@ -66,6 +66,12 @@ pub fn recover(folder: &Path, fs: &dyn Fs) -> crate::Result<Recovery> {
 
         let level_count = reader.read_u8()?;
 
+        // Sanity-check: we support at most 255 levels (u8), but the section
+        // must contain at least 1 byte per level (run_count). Guard against
+        // corrupt files that would spin in a long loop on garbage data.
+        // The actual hard limit is MAX_LEVELS from config, but we don't have
+        // that here — u8::MAX is the wire-format ceiling.
+
         for _ in 0..level_count {
             let mut level = vec![];
             let run_count = reader.read_u8()?;
@@ -73,6 +79,12 @@ pub fn recover(folder: &Path, fs: &dyn Fs) -> crate::Result<Recovery> {
             for _ in 0..run_count {
                 let mut run = vec![];
                 let table_count = reader.read_u32::<LittleEndian>()?;
+
+                // Each table entry is: id(8) + checksum_type(1) + checksum(16) + seqno(8) = 33 bytes.
+                // Reject obviously corrupt counts that would cause huge allocations.
+                if table_count > 10_000_000 {
+                    return Err(crate::Error::Unrecoverable);
+                }
 
                 for _ in 0..table_count {
                     let id = reader.read_u64::<LittleEndian>()?;
@@ -112,6 +124,13 @@ pub fn recover(folder: &Path, fs: &dyn Fs) -> crate::Result<Recovery> {
         let mut reader = open_section_reader(fs, &version_file_path, section)?;
 
         let blob_file_count = reader.read_u32::<LittleEndian>()?;
+
+        // Each blob entry is: id(8) + checksum_type(1) + checksum(16) = 25 bytes.
+        // Reject corrupt counts that would cause huge allocations.
+        if blob_file_count > 10_000_000 {
+            return Err(crate::Error::Unrecoverable);
+        }
+
         let mut blob_file_ids = Vec::with_capacity(blob_file_count as usize);
 
         for _ in 0..blob_file_count {

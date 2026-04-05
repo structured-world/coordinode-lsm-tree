@@ -225,7 +225,7 @@ impl SuperVersions {
 mod tests {
     use super::*;
     use crate::comparator::default_comparator;
-    use crate::fs::MemFs;
+    use crate::fs::{Fs, FsOpenOptions, MemFs};
     use test_log::test;
 
     fn new_memtable(id: u64) -> Memtable {
@@ -239,146 +239,196 @@ mod tests {
         }
     }
 
+    /// Seed version files (`v1`, `v2`, ...) into `fs` at `dir` for each
+    /// `SuperVersion` in the list. This makes GC tests exercise the real
+    /// `Fs::remove_file` path instead of only hitting `NotFound`.
+    fn seed_version_files(dir: &Path, versions: &SuperVersions, fs: &dyn Fs) -> crate::Result<()> {
+        fs.create_dir_all(dir)?;
+        for sv in &versions.versions {
+            let path = dir.join(format!("v{}", sv.version.id()));
+            fs.open(
+                &path,
+                &FsOpenOptions::new().write(true).create(true).truncate(true),
+            )?;
+        }
+        Ok(())
+    }
+
     #[test]
     fn super_version_gc_above_watermark() -> crate::Result<()> {
+        let fs = MemFs::new();
+        let dir = Path::new("/gc/above");
         let mut history = test_super_versions(vec![
             SuperVersion {
                 active_memtable: Arc::new(new_memtable(0)),
                 sealed_memtables: Arc::default(),
-                version: Version::new(0, crate::TreeType::Standard),
+                version: Version::new(1, crate::TreeType::Standard),
                 seqno: 0,
             },
             SuperVersion {
                 active_memtable: Arc::new(new_memtable(0)),
                 sealed_memtables: Arc::default(),
-                version: Version::new(0, crate::TreeType::Standard),
+                version: Version::new(2, crate::TreeType::Standard),
                 seqno: 1,
             },
             SuperVersion {
                 active_memtable: Arc::new(new_memtable(0)),
                 sealed_memtables: Arc::default(),
-                version: Version::new(0, crate::TreeType::Standard),
+                version: Version::new(3, crate::TreeType::Standard),
                 seqno: 2,
             },
         ]);
+        seed_version_files(dir, &history, &fs)?;
 
-        history.maintenance(Path::new("."), 0, &MemFs::new())?;
+        // gc_watermark=0 → early return, no GC
+        history.maintenance(dir, 0, &fs)?;
 
         assert_eq!(history.free_list_len(), 2);
+        // All version files still present (no GC ran)
+        assert!(fs.exists(&dir.join("v1"))?);
+        assert!(fs.exists(&dir.join("v2"))?);
+        assert!(fs.exists(&dir.join("v3"))?);
 
         Ok(())
     }
 
     #[test]
     fn super_version_gc_below_watermark_simple() -> crate::Result<()> {
+        let fs = MemFs::new();
+        let dir = Path::new("/gc/simple");
         let mut history = test_super_versions(vec![
             SuperVersion {
                 active_memtable: Arc::new(new_memtable(0)),
                 sealed_memtables: Arc::default(),
-                version: Version::new(0, crate::TreeType::Standard),
+                version: Version::new(1, crate::TreeType::Standard),
                 seqno: 0,
             },
             SuperVersion {
                 active_memtable: Arc::new(new_memtable(0)),
                 sealed_memtables: Arc::default(),
-                version: Version::new(0, crate::TreeType::Standard),
+                version: Version::new(2, crate::TreeType::Standard),
                 seqno: 1,
             },
             SuperVersion {
                 active_memtable: Arc::new(new_memtable(0)),
                 sealed_memtables: Arc::default(),
-                version: Version::new(0, crate::TreeType::Standard),
+                version: Version::new(3, crate::TreeType::Standard),
                 seqno: 2,
             },
         ]);
+        seed_version_files(dir, &history, &fs)?;
 
-        history.maintenance(Path::new("."), 3, &MemFs::new())?;
+        history.maintenance(dir, 3, &fs)?;
 
         assert_eq!(history.len(), 1);
+        // v1 and v2 deleted by GC, v3 kept
+        assert!(!fs.exists(&dir.join("v1"))?);
+        assert!(!fs.exists(&dir.join("v2"))?);
+        assert!(fs.exists(&dir.join("v3"))?);
 
         Ok(())
     }
 
     #[test]
     fn super_version_gc_below_watermark_simple_2() -> crate::Result<()> {
+        let fs = MemFs::new();
+        let dir = Path::new("/gc/simple2");
         let mut history = test_super_versions(vec![
             SuperVersion {
                 active_memtable: Arc::new(new_memtable(0)),
                 sealed_memtables: Arc::default(),
-                version: Version::new(0, crate::TreeType::Standard),
+                version: Version::new(1, crate::TreeType::Standard),
                 seqno: 0,
             },
             SuperVersion {
                 active_memtable: Arc::new(new_memtable(0)),
                 sealed_memtables: Arc::default(),
-                version: Version::new(0, crate::TreeType::Standard),
+                version: Version::new(2, crate::TreeType::Standard),
                 seqno: 1,
             },
             SuperVersion {
                 active_memtable: Arc::new(new_memtable(0)),
                 sealed_memtables: Arc::default(),
-                version: Version::new(0, crate::TreeType::Standard),
+                version: Version::new(3, crate::TreeType::Standard),
                 seqno: 2,
             },
             SuperVersion {
                 active_memtable: Arc::new(new_memtable(0)),
                 sealed_memtables: Arc::default(),
-                version: Version::new(0, crate::TreeType::Standard),
+                version: Version::new(4, crate::TreeType::Standard),
                 seqno: 8,
             },
         ]);
+        seed_version_files(dir, &history, &fs)?;
 
-        history.maintenance(Path::new("."), 3, &MemFs::new())?;
+        history.maintenance(dir, 3, &fs)?;
 
         assert_eq!(history.len(), 2);
+        // v1 and v2 deleted, v3 and v4 kept
+        assert!(!fs.exists(&dir.join("v1"))?);
+        assert!(!fs.exists(&dir.join("v2"))?);
+        assert!(fs.exists(&dir.join("v3"))?);
+        assert!(fs.exists(&dir.join("v4"))?);
 
         Ok(())
     }
 
     #[test]
     fn super_version_gc_below_watermark_keep() -> crate::Result<()> {
+        let fs = MemFs::new();
+        let dir = Path::new("/gc/keep");
         let mut history = test_super_versions(vec![
             SuperVersion {
                 active_memtable: Arc::new(new_memtable(0)),
                 sealed_memtables: Arc::default(),
-                version: Version::new(0, crate::TreeType::Standard),
+                version: Version::new(1, crate::TreeType::Standard),
                 seqno: 0,
             },
             SuperVersion {
                 active_memtable: Arc::new(new_memtable(0)),
                 sealed_memtables: Arc::default(),
-                version: Version::new(0, crate::TreeType::Standard),
+                version: Version::new(2, crate::TreeType::Standard),
                 seqno: 8,
             },
         ]);
+        seed_version_files(dir, &history, &fs)?;
 
-        history.maintenance(Path::new("."), 3, &MemFs::new())?;
+        history.maintenance(dir, 3, &fs)?;
 
         assert_eq!(history.len(), 2);
+        // Both kept — no version below watermark has a successor also below watermark
+        assert!(fs.exists(&dir.join("v1"))?);
+        assert!(fs.exists(&dir.join("v2"))?);
 
         Ok(())
     }
 
     #[test]
     fn super_version_gc_below_watermark_shadowed() -> crate::Result<()> {
+        let fs = MemFs::new();
+        let dir = Path::new("/gc/shadowed");
         let mut history = test_super_versions(vec![
             SuperVersion {
                 active_memtable: Arc::new(new_memtable(0)),
                 sealed_memtables: Arc::default(),
-                version: Version::new(0, crate::TreeType::Standard),
+                version: Version::new(1, crate::TreeType::Standard),
                 seqno: 0,
             },
             SuperVersion {
                 active_memtable: Arc::new(new_memtable(0)),
                 sealed_memtables: Arc::default(),
-                version: Version::new(0, crate::TreeType::Standard),
+                version: Version::new(2, crate::TreeType::Standard),
                 seqno: 2,
             },
         ]);
+        seed_version_files(dir, &history, &fs)?;
 
-        history.maintenance(Path::new("."), 3, &MemFs::new())?;
+        history.maintenance(dir, 3, &fs)?;
 
         assert_eq!(history.len(), 1);
+        // v1 deleted, v2 kept
+        assert!(!fs.exists(&dir.join("v1"))?);
+        assert!(fs.exists(&dir.join("v2"))?);
 
         Ok(())
     }
