@@ -296,3 +296,46 @@ fn write_batch_multi_get_after_batch() -> lsm_tree::Result<()> {
 
     Ok(())
 }
+
+#[test]
+fn write_batch_mixed_ops_rejected() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let tree = Config::new(
+        &folder,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .open()?;
+
+    let mut batch = WriteBatch::new();
+    batch.insert("conflict", "value");
+    batch.remove("conflict"); // mixed op on same key
+
+    let result = tree.apply_batch(batch, 0);
+    assert!(
+        matches!(result, Err(lsm_tree::Error::MixedOperationBatch)),
+        "mixed insert+remove on same key must be rejected",
+    );
+
+    Ok(())
+}
+
+#[test]
+fn write_batch_repeated_merge_accepted() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let tree = Config::new(
+        &folder,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_merge_operator(Some(Arc::new(ConcatMerge)))
+    .open()?;
+
+    let mut batch = WriteBatch::new();
+    batch.merge("k", "A");
+    batch.merge("k", "B"); // same op type on same key = ok
+
+    tree.apply_batch(batch, 0)?; // must not error
+
+    Ok(())
+}

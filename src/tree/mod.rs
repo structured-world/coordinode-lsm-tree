@@ -829,20 +829,13 @@ impl AbstractTree for Tree {
                 .collect();
         }
 
-        // Sort indices by key for sequential I/O access patterns
-        let mut sorted_indices: Vec<usize> = (0..n).collect();
-        sorted_indices.sort_by(|&a, &b| comparator.compare(keys[a].as_ref(), keys[b].as_ref()));
-
-        let key_hashes: Vec<u64> = keys
-            .iter()
-            .map(|k| crate::table::filter::standard_bloom::Builder::get_hash(k.as_ref()))
-            .collect();
-
-        // Phase 1: Check active + sealed memtables (in sorted order for cache locality)
+        // Phase 1: Check active + sealed memtables (unsorted — memtable lookup
+        // is O(log n) per key regardless of order, skip sort+hash overhead for
+        // memtable-only batches).
         let mut internal_entries: Vec<Option<InternalValue>> = vec![None; n];
-        let mut remaining_sorted: Vec<usize> = Vec::with_capacity(n);
+        let mut remaining: Vec<usize> = Vec::with_capacity(n);
 
-        for &idx in &sorted_indices {
+        for idx in 0..n {
             let key = keys[idx].as_ref();
 
             // Active memtable
@@ -859,21 +852,24 @@ impl AbstractTree for Tree {
                 continue;
             }
 
-            remaining_sorted.push(idx);
+            remaining.push(idx);
         }
 
-        // NOTE: Cannot prune remaining keys by memtable range tombstones here
-        // because RT suppression depends on the entry's seqno (key_seqno < rt.seqno),
-        // which we don't know until after the SST lookup. Phase 3 handles RT suppression
-        // via resolve_entry after finding each entry.
+        // Phase 2: Sort remaining keys + compute bloom hashes only if needed
+        // (memtable-only batches skip this entirely).
+        if !remaining.is_empty() {
+            remaining.sort_by(|&a, &b| comparator.compare(keys[a].as_ref(), keys[b].as_ref()));
 
-        // Phase 2: Batch table lookups for remaining keys (sorted order → sequential I/O)
-        if !remaining_sorted.is_empty() {
+            let key_hashes: Vec<u64> = keys
+                .iter()
+                .map(|k| crate::table::filter::standard_bloom::Builder::get_hash(k.as_ref()))
+                .collect();
+
             Self::batch_get_from_tables(
                 &super_version.version,
                 &keys,
                 &key_hashes,
-                &remaining_sorted,
+                &remaining,
                 seqno,
                 comparator,
                 &mut internal_entries,
@@ -1420,11 +1416,13 @@ impl Tree {
                 // L0: must check ALL runs, keep highest seqno per key.
                 // Track keys at the seqno ceiling (seqno + 1 == read_seqno) —
                 // no other L0 run can beat them, so skip in subsequent runs.
-                let mut at_ceiling: crate::HashSet<usize> = crate::HashSet::default();
+                // Bitmap: idx is always in 0..keys.len(), dense enough for Vec<bool>
+                // instead of HashSet to avoid hashing overhead in the L0 inner loop.
+                let mut at_ceiling = vec![false; keys.len()];
 
                 for run in level.iter() {
                     for &idx in &still_remaining {
-                        if at_ceiling.contains(&idx) {
+                        if at_ceiling[idx] {
                             continue;
                         }
                         let key = keys[idx].as_ref();
@@ -1435,7 +1433,7 @@ impl Tree {
                                 Some(current) if current.key.seqno >= item.key.seqno => {}
                                 _ => {
                                     if item.key.seqno.checked_add(1) == Some(seqno) {
-                                        at_ceiling.insert(idx);
+                                        at_ceiling[idx] = true;
                                     }
                                     results[idx] = Some(item);
                                 }
