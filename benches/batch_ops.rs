@@ -75,12 +75,15 @@ fn bench_write_batch(c: &mut Criterion) {
                 .open()
                 .unwrap();
 
+                // Pre-generate fixed keys — reuse across iterations so
+                // memtable doesn't grow unboundedly (overwrites, not appends).
+                let keys: Vec<String> = (0..size).map(|i| format!("key_{i:04}")).collect();
                 let mut seqno = 0u64;
 
                 b.iter(|| {
                     let mut batch = WriteBatch::with_capacity(size);
-                    for i in 0..size {
-                        batch.insert(format!("key_{seqno}_{i:04}"), format!("value_{i}"));
+                    for k in &keys {
+                        batch.insert(k.as_str(), "value");
                     }
                     tree.apply_batch(batch, seqno).unwrap();
                     seqno += 1;
@@ -104,11 +107,12 @@ fn bench_write_batch(c: &mut Criterion) {
                 .open()
                 .unwrap();
 
+                let keys: Vec<String> = (0..size).map(|i| format!("key_{i:04}")).collect();
                 let mut seqno = 0u64;
 
                 b.iter(|| {
-                    for i in 0..size {
-                        tree.insert(format!("key_{seqno}_{i:04}"), format!("value_{i}"), seqno);
+                    for k in &keys {
+                        tree.insert(k.as_str(), "value", seqno);
                     }
                     seqno += 1;
                 });
