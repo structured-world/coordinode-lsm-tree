@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1775347479991,
+  "lastUpdate": 1775395133399,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -5148,6 +5148,84 @@ window.BENCHMARK_DATA = {
             "value": 272114.0208921818,
             "unit": "ops/sec (normalized)",
             "extra": "raw: 502784 ops/sec | factor: 0.541 | P50: 1.8us | P99: 4.0us | P99.9: 13.0us\nthreads: 1 | elapsed: 0.40s | num: 200000 | iterations: 3 | runner: seq_wr=237500 rand_rd=939197 cpu=123 composite=42497.0"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "5b6eed969c6e650b2966ab19b96aa9a968c995d7",
+          "message": "refactor(fs): migrate Tree::open recovery path to Fs trait (#212)\n\n## Summary\n\n- Replace all `try_exists()` / `std::fs` calls in the recovery path with\npluggable `Fs` trait methods, enabling MemFs and future non-StdFs\nbackends to reopen trees\n- Add `open_section_reader()` helper to replace\n`sfa::TocEntry::buf_reader()` which used `std::fs` directly\n- Thread `&dyn Fs` through `recover()`, `get_current_version()`,\n`cleanup_orphaned_version()`, `SuperVersions::maintenance()`, and\n`Manifest::decode_from()`\n- Eliminate TOCTOU race in `Tree::open` — replace `exists()` probe with\natomic read attempt via `get_current_version()`\n- Eliminate TOCTOU race in version GC — replace `exists()` +\n`remove_file()` with idempotent `remove_file()` that treats `NotFound`\nas success (both `SuperVersions::maintenance` and\n`cleanup_orphaned_version`)\n- Validate `table_count` and `blob_file_count` against section length in\nrecovery to prevent allocation-based DoS from corrupt version files\n- Validate CURRENT file checksum type before trusting version_id —\ndetects torn/corrupt pointer files\n- Document `NotFound` contract on `Fs::remove_file`\n\n## Behavior change\n\n`cleanup_orphaned_version` now fails fast on non-UTF-8 filenames (via\n`Fs::read_dir` returning `InvalidData`) instead of silently skipping\nthem with `to_string_lossy()`. This is intentional — version files are\nalways `v{u64}`, so non-UTF-8 entries indicate filesystem corruption and\nshould surface as an error.\n\n## Test plan\n\n- [x] All 1087 tests pass (existing + new)\n- [x] 36 doc-tests pass\n- [x] Clippy clean (0 warnings)\n- [x] MemFs round-trip: create → write → flush → drop → reopen → read\n- [x] MemFs manifest decode\n- [x] GC tests with seeded version files and distinct IDs — verify\nactual file deletion\n- [x] Non-UTF-8 filename regression test (Unix-only, platform-specific\nerror handling)\n- [x] Corruption tests: corrupt `table_count` and `blob_file_count` →\n`Unrecoverable`\n- [x] Maintenance tests isolated from working directory (MemFs)\n\nCloses #209\nCloses #213\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n## Summary by CodeRabbit\n\n* **Bug Fixes**\n* Recovery now detects corrupted manifests and rejects extreme/corrupt\ncounts; non‑UTF‑8 filename errors during reopen are surfaced correctly.\n* Version/manifest GC deletes via the configured storage backend and\ntreats missing files as no‑ops.\n\n* **Refactor**\n* Core I/O, manifest decoding and version recovery consistently use the\nconfigured, pluggable filesystem backend.\n\n* **Tests**\n* Added in‑memory and Unix regression tests for reopen, recovery, GC,\nand corrupt manifest scenarios.\n\n* **Documentation**\n* Removed docs claiming reopening was limited to the default filesystem.\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-04-05T16:17:29+03:00",
+          "tree_id": "2214e4972656c27b8d1dcec2ee99838a462efce4",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/5b6eed969c6e650b2966ab19b96aa9a968c995d7"
+        },
+        "date": 1775395131691,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 1092125.7943618628,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 1996134 ops/sec | factor: 0.547 | P50: 0.4us | P99: 2.0us | P99.9: 4.9us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3 | runner: seq_wr=227142 rand_rd=945580 cpu=123 composite=42038.3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 662287.7427869305,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 1210497 ops/sec | factor: 0.547 | P50: 0.7us | P99: 2.4us | P99.9: 5.7us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3 | runner: seq_wr=227142 rand_rd=945580 cpu=123 composite=42038.3"
+          },
+          {
+            "name": "readrandom",
+            "value": 301573.1739548904,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 551201 ops/sec | factor: 0.547 | P50: 1.6us | P99: 5.2us | P99.9: 12.9us\nthreads: 1 | elapsed: 0.36s | num: 200000 | iterations: 3 | runner: seq_wr=227142 rand_rd=945580 cpu=123 composite=42038.3"
+          },
+          {
+            "name": "readseq",
+            "value": 1390008.0909630626,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 2540589 ops/sec | factor: 0.547 | P50: 0.2us | P99: 3.8us | P99.9: 7.4us\nthreads: 1 | elapsed: 0.08s | num: 200000 | iterations: 3 | runner: seq_wr=227142 rand_rd=945580 cpu=123 composite=42038.3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 207838.6852551498,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 379877 ops/sec | factor: 0.547 | P50: 2.3us | P99: 5.8us | P99.9: 13.7us\nthreads: 1 | elapsed: 0.53s | num: 200000 | iterations: 3 | runner: seq_wr=227142 rand_rd=945580 cpu=123 composite=42038.3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 96882.33379206192,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 177077 ops/sec | factor: 0.547 | P50: 5.3us | P99: 7.4us | P99.9: 17.1us\nthreads: 1 | elapsed: 1.13s | num: 200000 | iterations: 3 | runner: seq_wr=227142 rand_rd=945580 cpu=123 composite=42038.3"
+          },
+          {
+            "name": "overwrite",
+            "value": 665022.107397812,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 1215495 ops/sec | factor: 0.547 | P50: 0.7us | P99: 2.5us | P99.9: 5.8us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3 | runner: seq_wr=227142 rand_rd=945580 cpu=123 composite=42038.3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 405206.53738245915,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 740617 ops/sec | factor: 0.547 | P50: 0.3us | P99: 1.8us | P99.9: 3.3us\nthreads: 1 | elapsed: 0.27s | num: 200000 | iterations: 3 | runner: seq_wr=227142 rand_rd=945580 cpu=123 composite=42038.3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 261563.26267758454,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 478073 ops/sec | factor: 0.547 | P50: 1.9us | P99: 5.0us | P99.9: 14.0us\nthreads: 1 | elapsed: 0.42s | num: 200000 | iterations: 3 | runner: seq_wr=227142 rand_rd=945580 cpu=123 composite=42038.3"
           }
         ]
       }
