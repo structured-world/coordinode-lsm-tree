@@ -446,9 +446,11 @@ fn multi_get_with_merge_operands_on_disk() -> lsm_tree::Result<()> {
     tree.insert("k2", "plain", 2);
     tree.flush_active_memtable(0)?;
 
-    let results = tree.multi_get(["k1", "k2"], SeqNo::MAX)?;
+    // Use 3+ keys to exercise the batch code path (≤2 keys uses simple per-key path)
+    let results = tree.multi_get(["k1", "k2", "missing"], SeqNo::MAX)?;
     assert_eq!(results[0].as_deref(), Some(b"AB".as_slice()));
     assert_eq!(results[1].as_deref(), Some(b"plain".as_slice()));
+    assert_eq!(results[2], None);
 
     Ok(())
 }

@@ -39,6 +39,12 @@ enum WriteBatchEntry {
 
 /// Batch of write operations applied with a shared seqno.
 ///
+/// **Duplicate keys:** all entries receive the same seqno. If the batch
+/// contains multiple operations on the same key, their relative order is
+/// **not** guaranteed after insertion into the memtable's skiplist (which
+/// orders by `(user_key, seqno, value_type)`). Callers should avoid
+/// duplicate keys within a single batch, or canonicalize them beforehand.
+///
 /// # Examples
 ///
 /// ```
@@ -122,7 +128,7 @@ impl WriteBatch {
     /// Materializes all entries into [`InternalValue`]s with the given seqno.
     #[doc(hidden)]
     #[must_use]
-    pub fn materialize(self, seqno: crate::SeqNo) -> Vec<InternalValue> {
+    pub(crate) fn materialize(self, seqno: crate::SeqNo) -> Vec<InternalValue> {
         self.entries
             .into_iter()
             .map(|entry| match entry {
