@@ -2,15 +2,22 @@
 // This source code is licensed under both the Apache 2.0 and MIT License
 // (found in the LICENSE-* files in the repository)
 
-use crate::{FormatVersion, TreeType, checksum::ChecksumType};
+use crate::{
+    FormatVersion, TreeType,
+    checksum::ChecksumType,
+    fs::{Fs, open_section_reader},
+};
 use byteorder::ReadBytesExt;
 use std::{io::Read, path::Path};
 
 pub struct Manifest {
     pub version: FormatVersion,
-    #[expect(
-        dead_code,
-        reason = "deserialized from on-disk manifest, retained for validation"
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "deserialized from on-disk manifest, retained for validation; read in tests"
+        )
     )]
     pub tree_type: TreeType,
     pub level_count: u8,
@@ -18,7 +25,11 @@ pub struct Manifest {
 }
 
 impl Manifest {
-    pub fn decode_from(path: &Path, reader: &sfa::Reader) -> Result<Self, crate::Error> {
+    pub fn decode_from(
+        path: &Path,
+        reader: &sfa::Reader,
+        fs: &dyn Fs,
+    ) -> Result<Self, crate::Error> {
         let toc = reader.toc();
 
         let version = {
@@ -30,7 +41,7 @@ impl Manifest {
                 .section(b"format_version")
                 .expect("format_version section should exist in manifest");
 
-            let mut reader = section.buf_reader(path)?;
+            let mut reader = open_section_reader(fs, path, section)?;
             let version = reader.read_u8()?;
             FormatVersion::try_from(version).map_err(|()| crate::Error::InvalidVersion(version))?
         };
@@ -44,7 +55,7 @@ impl Manifest {
                 .section(b"tree_type")
                 .expect("tree_type section should exist in manifest");
 
-            let mut reader = section.buf_reader(path)?;
+            let mut reader = open_section_reader(fs, path, section)?;
             let tree_type = reader.read_u8()?;
             tree_type
                 .try_into()
@@ -60,7 +71,7 @@ impl Manifest {
                 .section(b"level_count")
                 .expect("level_count section should exist in manifest");
 
-            let mut reader = section.buf_reader(path)?;
+            let mut reader = open_section_reader(fs, path, section)?;
             reader.read_u8()?
         };
 
@@ -77,8 +88,7 @@ impl Manifest {
                     .section(b"filter_hash_type")
                     .expect("filter_hash_type section should exist in manifest");
 
-                section
-                    .buf_reader(path)?
+                open_section_reader(fs, path, section)?
                     .bytes()
                     .collect::<Result<Vec<_>, _>>()?
             };
@@ -108,7 +118,7 @@ impl Manifest {
                 }
 
                 let mut bytes = Vec::new();
-                section.buf_reader(path)?.read_to_end(&mut bytes)?;
+                open_section_reader(fs, path, section)?.read_to_end(&mut bytes)?;
 
                 String::from_utf8(bytes).map_err(|e| crate::Error::Utf8(e.utf8_error()))?
             }
@@ -127,17 +137,22 @@ impl Manifest {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fs::{Fs, FsOpenOptions, StdFs};
     use byteorder::WriteBytesExt;
     use std::io::Write;
 
     /// Write the mandatory manifest sections (`format_version`, `tree_type`,
-    /// `level_count`, `filter_hash_type`) into an sfa archive at `path`.
-    /// If `comparator_name` is `Some`, also writes that section.
+    /// `level_count`, `filter_hash_type`) into an sfa archive via the [`Fs`]
+    /// trait. If `comparator_name` is `Some`, also writes that section.
     fn write_test_manifest(
         path: &std::path::Path,
         comparator_name: Option<&str>,
+        fs: &dyn Fs,
     ) -> crate::Result<()> {
-        let file = std::fs::File::create(path)?;
+        let file = fs.open(
+            path,
+            &FsOpenOptions::new().write(true).create(true).truncate(true),
+        )?;
         let mut writer = sfa::Writer::from_writer(std::io::BufWriter::new(file));
 
         writer.start("format_version")?;
@@ -161,15 +176,25 @@ mod tests {
         Ok(())
     }
 
+    /// Decode a manifest from `path` using the given [`Fs`] backend.
+    fn decode_manifest(path: &std::path::Path, fs: &dyn Fs) -> crate::Result<Manifest> {
+        let mut file = fs.open(path, &FsOpenOptions::new().read(true))?;
+        let reader = sfa::Reader::from_reader(&mut file)?;
+        Manifest::decode_from(path, &reader, fs)
+    }
+
+    // ------------------------------------------------------------------
+    // StdFs tests
+    // ------------------------------------------------------------------
+
     #[test]
     fn manifest_without_comparator_name_defaults_to_default() -> crate::Result<()> {
         let dir = tempfile::tempdir()?;
         let path = dir.path().join("manifest");
 
-        write_test_manifest(&path, None)?;
+        write_test_manifest(&path, None, &StdFs)?;
 
-        let reader = sfa::Reader::new(&path)?;
-        let manifest = Manifest::decode_from(&path, &reader)?;
+        let manifest = decode_manifest(&path, &StdFs)?;
         assert_eq!(manifest.comparator_name, "default");
         Ok(())
     }
@@ -179,10 +204,9 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let path = dir.path().join("manifest");
 
-        write_test_manifest(&path, Some("u64-big-endian"))?;
+        write_test_manifest(&path, Some("u64-big-endian"), &StdFs)?;
 
-        let reader = sfa::Reader::new(&path)?;
-        let manifest = Manifest::decode_from(&path, &reader)?;
+        let manifest = decode_manifest(&path, &StdFs)?;
         assert_eq!(manifest.comparator_name, "u64-big-endian");
         Ok(())
     }
@@ -193,10 +217,9 @@ mod tests {
         let path = dir.path().join("manifest");
 
         let long_name = "x".repeat(300);
-        write_test_manifest(&path, Some(&long_name))?;
+        write_test_manifest(&path, Some(&long_name), &StdFs)?;
 
-        let reader = sfa::Reader::new(&path)?;
-        let result = Manifest::decode_from(&path, &reader);
+        let result = decode_manifest(&path, &StdFs);
         assert!(
             matches!(result, Err(crate::Error::DecompressedSizeTooLarge { .. })),
             "expected DecompressedSizeTooLarge"
@@ -209,8 +232,13 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let path = dir.path().join("manifest");
 
-        // Write manifest with invalid UTF-8 bytes in comparator_name
-        let file = std::fs::File::create(&path)?;
+        // Write manifest with invalid UTF-8 bytes in comparator_name.
+        // This needs raw Write access — write_test_manifest only handles
+        // valid strings, so we inline the sfa construction here.
+        let file = StdFs.open(
+            &path,
+            &FsOpenOptions::new().write(true).create(true).truncate(true),
+        )?;
         let mut writer = sfa::Writer::from_writer(std::io::BufWriter::new(file));
 
         writer.start("format_version")?;
@@ -226,12 +254,50 @@ mod tests {
 
         writer.finish()?;
 
-        let reader = sfa::Reader::new(&path)?;
-        let result = Manifest::decode_from(&path, &reader);
+        let result = decode_manifest(&path, &StdFs);
         assert!(
             matches!(result, Err(crate::Error::Utf8(_))),
             "expected Utf8 error"
         );
+        Ok(())
+    }
+
+    // ------------------------------------------------------------------
+    // MemFs tests — verify decode_from works with non-StdFs backends
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn manifest_memfs_default_comparator() -> crate::Result<()> {
+        use crate::fs::MemFs;
+
+        let fs = MemFs::new();
+        let dir = std::path::Path::new("/memfs");
+        fs.create_dir_all(dir)?;
+        let path = dir.join("manifest_default");
+
+        write_test_manifest(&path, None, &fs)?;
+
+        let manifest = decode_manifest(&path, &fs)?;
+        assert_eq!(manifest.comparator_name, "default");
+        assert_eq!(manifest.level_count, 7);
+        assert!(matches!(manifest.version, FormatVersion::V4));
+        assert!(matches!(manifest.tree_type, TreeType::Standard));
+        Ok(())
+    }
+
+    #[test]
+    fn manifest_memfs_custom_comparator_round_trips() -> crate::Result<()> {
+        use crate::fs::MemFs;
+
+        let fs = MemFs::new();
+        let dir = std::path::Path::new("/memfs");
+        fs.create_dir_all(dir)?;
+        let path = dir.join("manifest_custom");
+
+        write_test_manifest(&path, Some("u64-big-endian"), &fs)?;
+
+        let manifest = decode_manifest(&path, &fs)?;
+        assert_eq!(manifest.comparator_name, "u64-big-endian");
         Ok(())
     }
 }

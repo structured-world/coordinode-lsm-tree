@@ -251,7 +251,11 @@ fn move_tables(
         &*opts.config.fs,
     )?;
 
-    if let Err(e) = version_history_lock.maintenance(&opts.config.path, opts.mvcc_gc_watermark) {
+    if let Err(e) = version_history_lock.maintenance(
+        &opts.config.path,
+        opts.mvcc_gc_watermark,
+        &*opts.config.fs,
+    ) {
         log::error!("Manifest maintenance failed: {e:?}");
         return Err(e);
     }
@@ -619,7 +623,7 @@ fn merge_tables(
         .show(payload.table_ids.iter().copied());
 
     version_history_lock
-        .maintenance(&opts.config.path, opts.mvcc_gc_watermark)
+        .maintenance(&opts.config.path, opts.mvcc_gc_watermark, &*opts.config.fs)
         .inspect_err(|e| {
             log::error!("Manifest maintenance failed: {e:?}");
         })?;
@@ -698,7 +702,11 @@ fn drop_tables(
         &*opts.config.fs,
     )?;
 
-    if let Err(e) = version_history_lock.maintenance(&opts.config.path, opts.mvcc_gc_watermark) {
+    if let Err(e) = version_history_lock.maintenance(
+        &opts.config.path,
+        opts.mvcc_gc_watermark,
+        &*opts.config.fs,
+    ) {
         log::error!("Manifest maintenance failed: {e:?}");
         return Err(e);
     }

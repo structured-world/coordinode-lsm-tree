@@ -11,7 +11,6 @@ use crate::{
     ValueType,
     compaction::{CompactionStrategy, drop_range::OwnedBounds, state::CompactionState},
     config::Config,
-    file::CURRENT_VERSION_FILE,
     format_version::FormatVersion,
     iter_guard::{IterGuard, IterGuardImpl},
     key::InternalKey,
@@ -517,7 +516,8 @@ impl AbstractTree for Tree {
             &*self.config.fs,
         )?;
 
-        if let Err(e) = version_lock.maintenance(&self.config.path, gc_watermark) {
+        if let Err(e) = version_lock.maintenance(&self.config.path, gc_watermark, &*self.config.fs)
+        {
             log::warn!("Version GC failed: {e:?}");
         }
 
@@ -1201,23 +1201,23 @@ impl Tree {
     pub(crate) fn open(config: Config) -> crate::Result<Self> {
         log::debug!("Opening LSM-tree at {}", config.path.display());
 
-        // NOTE: try_exists() and recover() below use std::fs directly, bypassing
-        // the pluggable Fs trait. This means MemFs (and other non-StdFs backends)
-        // cannot reopen a tree after drop — only new tree creation works.
-        // Tracked in: #209
-
         // Check for old version
-        if config.path.join("version").try_exists()? {
+        if config.fs.exists(&config.path.join("version"))? {
             log::error!(
                 "It looks like you are trying to open a V1 database - the database needs a manual migration, however a migration tool is not provided, as V1 is extremely outdated."
             );
             return Err(crate::Error::InvalidVersion(FormatVersion::V1.into()));
         }
 
-        let tree = if config.path.join(CURRENT_VERSION_FILE).try_exists()? {
-            Self::recover(config)
-        } else {
-            Self::create_new(config)
+        // Decide between recovery and fresh creation atomically by attempting
+        // to read the CURRENT version file. This avoids a TOCTOU race that
+        // would occur if we probed with exists() first.
+        let tree = match crate::version::recovery::get_current_version(&config.path, &*config.fs) {
+            Ok(_) => Self::recover(config),
+            Err(crate::Error::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+                Self::create_new(config)
+            }
+            Err(e) => Err(e),
         }?;
 
         Ok(tree)
@@ -1366,10 +1366,14 @@ impl Tree {
         // recover_levels for table/blob data). This is intentional — metadata
         // validation must complete before any disk-mutating recovery work.
         {
-            let version_id = crate::version::recovery::get_current_version(&config.path)?;
+            let version_id =
+                crate::version::recovery::get_current_version(&config.path, &*config.fs)?;
             let manifest_path = config.path.join(format!("v{version_id}"));
-            let reader = sfa::Reader::new(&manifest_path)?;
-            let manifest = Manifest::decode_from(&manifest_path, &reader)?;
+            let mut manifest_file = config
+                .fs
+                .open(&manifest_path, &crate::fs::FsOpenOptions::new().read(true))?;
+            let reader = sfa::Reader::from_reader(&mut manifest_file)?;
+            let manifest = Manifest::decode_from(&manifest_path, &reader, &*config.fs)?;
 
             if !matches!(manifest.version, FormatVersion::V3 | FormatVersion::V4) {
                 return Err(crate::Error::InvalidVersion(manifest.version.into()));
@@ -1497,7 +1501,7 @@ impl Tree {
 
         let tree_path = tree_path.as_ref();
 
-        let recovery = recover(tree_path)?;
+        let recovery = recover(tree_path, &*config.fs)?;
 
         let mut table_map = {
             let mut result: crate::HashMap<TableId, (u8 /* Level index */, Checksum, SeqNo)> =
@@ -1693,7 +1697,7 @@ impl Tree {
 
         // NOTE: Cleanup old versions
         // But only after we definitely recovered the latest version
-        Self::cleanup_orphaned_version(tree_path, version.id())?;
+        Self::cleanup_orphaned_version(tree_path, version.id(), &*config.fs)?;
 
         for (table_path, orphan_fs) in orphaned_tables {
             log::debug!("Deleting orphaned table {}", table_path.display());
@@ -1708,24 +1712,35 @@ impl Tree {
         Ok(version)
     }
 
+    /// Removes stale version files left over from a crash during version swap.
+    ///
+    /// # Behavior change vs pre-Fs-trait code
+    ///
+    /// The previous implementation used `std::fs::read_dir` + `to_string_lossy()`,
+    /// which silently skipped non-UTF-8 filenames. `Fs::read_dir` returns
+    /// `InvalidData` for such entries instead (see [`FsDirEntry`] docs), so this
+    /// function now fails fast on non-UTF-8 names. This is intentional: version
+    /// files are always `v{u64}` — any non-UTF-8 entry indicates filesystem
+    /// corruption and should surface as an error rather than be silently ignored.
     fn cleanup_orphaned_version(
         path: &Path,
         latest_version_id: crate::version::VersionId,
+        fs: &dyn crate::fs::Fs,
     ) -> crate::Result<()> {
         let version_str = format!("v{latest_version_id}");
 
-        for file in std::fs::read_dir(path)? {
-            let dirent = file?;
-
-            if dirent.file_type()?.is_dir() {
+        for dirent in fs.read_dir(path)? {
+            if dirent.is_dir {
                 continue;
             }
 
-            let name = dirent.file_name();
-
-            if name.to_string_lossy().starts_with('v') && *name != *version_str {
-                log::trace!("Cleanup orphaned version {}", name.display());
-                std::fs::remove_file(dirent.path())?;
+            if dirent.file_name.starts_with('v') && dirent.file_name != version_str {
+                log::trace!("Cleanup orphaned version {}", dirent.file_name);
+                match fs.remove_file(&dirent.path) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(e.into()),
+                }
             }
         }
 

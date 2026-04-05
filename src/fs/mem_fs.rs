@@ -9,13 +9,6 @@
 //!
 //! # Known limitations
 //!
-//! - **Tree reopen**: `Tree::open` checks for the `CURRENT` version file
-//!   via `Path::try_exists()` (bypasses `Fs`). New trees work correctly
-//!   (the check returns `false` → `create_new`), but reopening an
-//!   in-memory tree after drop is not supported.
-//! - **Version GC**: Old version file cleanup in `SuperVersions::gc` uses
-//!   `std::fs` directly — stale version entries accumulate in memory
-//!   until the `MemFs` is dropped. Acceptable for testing / ephemeral use.
 //! - **Compaction**: Some code paths in the compaction finalization still
 //!   bypass the `Fs` trait. Write + flush + point-read works; compaction
 //!   may fail with `ENOENT` on virtual paths.
