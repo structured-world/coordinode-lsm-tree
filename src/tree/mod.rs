@@ -1210,6 +1210,7 @@ impl Tree {
             return Err(crate::Error::InvalidVersion(FormatVersion::V1.into()));
         }
 
+        // TODO: replace exists() probe with atomic read attempt (#213)
         let tree = if config.fs.exists(&config.path.join(CURRENT_VERSION_FILE))? {
             Self::recover(config)
         } else {
