@@ -1269,7 +1269,7 @@ impl Tree {
 
     /// Checks if a key at `key_seqno` is suppressed by any range tombstone
     /// in the active memtable, sealed memtables, or SST tables, visible at `read_seqno`.
-    fn is_suppressed_by_range_tombstones(
+    pub(crate) fn is_suppressed_by_range_tombstones(
         super_version: &SuperVersion,
         key: &[u8],
         key_seqno: SeqNo,

@@ -750,11 +750,20 @@ impl AbstractTree for BlobTree {
             )?;
         }
 
-        // Resolve each entry (tombstones, blob indirections)
+        // Resolve each entry (tombstones, RT suppression, blob indirections)
         let mut results = vec![None; n];
         for idx in 0..n {
             if let Some(item) = internal_entries[idx].take() {
                 if item.is_tombstone() {
+                    continue;
+                }
+                if crate::Tree::is_suppressed_by_range_tombstones(
+                    &super_version,
+                    keys[idx].as_ref(),
+                    item.key.seqno,
+                    seqno,
+                    comparator,
+                ) {
                     continue;
                 }
                 let (_, v) = resolve_value_handle(

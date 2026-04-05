@@ -365,6 +365,11 @@ impl Table {
     /// Like [`Table::get`], but also returns the [`Block`] containing the value.
     ///
     /// Used by `get_pinned()` to construct `PinnableSlice::Pinned`.
+    ///
+    /// NOTE: returns table-local seqnos (same as `get()`). For tables with
+    /// non-zero `global_seqno` (bulk ingestion), callers comparing seqnos
+    /// across tables/memtables must account for the offset. This is a
+    /// pre-existing design shared with `Table::get`.
     pub(crate) fn get_with_block(
         &self,
         key: &[u8],
