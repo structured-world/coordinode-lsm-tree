@@ -29,7 +29,7 @@ fn bench_multi_get(c: &mut Criterion) {
 
         group.bench_with_input(BenchmarkId::new("disk", count), &count, |b, _| {
             b.iter(|| {
-                tree.multi_get(&keys, SeqNo::MAX).unwrap();
+                std::hint::black_box(tree.multi_get(&keys, SeqNo::MAX).unwrap());
             });
         });
     }
@@ -44,14 +44,14 @@ fn bench_get_pinned(c: &mut Criterion) {
 
     group.bench_function("disk_hit", |b| {
         b.iter(|| {
-            tree.get_pinned("key_000500", SeqNo::MAX).unwrap();
+            std::hint::black_box(tree.get_pinned("key_000500", SeqNo::MAX).unwrap());
         });
     });
 
     // Compare with regular get
     group.bench_function("get_regular", |b| {
         b.iter(|| {
-            tree.get("key_000500", SeqNo::MAX).unwrap();
+            std::hint::black_box(tree.get("key_000500", SeqNo::MAX).unwrap());
         });
     });
 
