@@ -1446,22 +1446,37 @@ impl Tree {
                 // Remove found keys (both values and tombstones)
                 still_remaining.retain(|&(idx, _)| results[idx].is_none());
             } else {
-                // L1+: one disjoint run per level, keys are sorted, so we can process
-                // them sequentially against the sorted run.
+                // L1+ runs have non-overlapping key ranges within a level.
+                // Once get_for_key_cmp identifies a covering run for a key,
+                // no other run in this level can contain it. We split into:
+                // - `not_covered`: key range didn't match any run yet → try next run
+                // - `covered_miss`: covering run found but table.get returned None
+                //   (bloom false negative or key absent) → skip remaining runs in
+                //   this level, but keep for lower levels
+                let mut covered_miss: Vec<(usize, u64)> = Vec::new();
+
                 for run in level.iter() {
-                    let mut new_remaining = Vec::with_capacity(still_remaining.len());
+                    let mut not_covered = Vec::with_capacity(still_remaining.len());
                     for &(idx, hash) in &still_remaining {
                         let key = keys[idx].as_ref();
-                        if let Some(table) = run.get_for_key_cmp(key, comparator)
-                            && let Some(item) = table.get(key, seqno, hash)?
-                        {
-                            results[idx] = Some(item);
+                        if let Some(table) = run.get_for_key_cmp(key, comparator) {
+                            if let Some(item) = table.get(key, seqno, hash)? {
+                                results[idx] = Some(item);
+                            } else {
+                                // Covering run found, but key not present — no other
+                                // run in this level can have it. Keep for lower levels.
+                                covered_miss.push((idx, hash));
+                            }
                         } else {
-                            new_remaining.push((idx, hash));
+                            not_covered.push((idx, hash));
                         }
                     }
-                    still_remaining = new_remaining;
+                    still_remaining = not_covered;
                 }
+
+                // Merge back: keys without a covering run + keys with a covering
+                // miss both proceed to lower levels.
+                still_remaining.extend(covered_miss);
             }
         }
 

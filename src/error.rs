@@ -110,9 +110,12 @@ pub enum Error {
     /// A [`WriteBatch`](crate::WriteBatch) contains mixed operation types
     /// (e.g. insert + remove) for the same user key.
     ///
-    /// Mixed ops at the same logical version are rejected because they have
-    /// ambiguous, tie-break-dependent semantics in the memtable/skiplist and
-    /// are easy to misuse; this is not a duplicate-key data-loss issue.
+    /// Mixed ops at the same logical version are rejected because the
+    /// memtable/skiplist ordering ties on `(user_key, seqno)` and does not
+    /// include `value_type` as a tie-breaker. That would otherwise make the
+    /// outcome ambiguous and could silently shadow/overwrite one operation
+    /// with the other (effectively tie-break-dependent "last write wins"
+    /// semantics).
     MixedOperationBatch,
 
     /// Route-compatibility mismatch on reopen.
