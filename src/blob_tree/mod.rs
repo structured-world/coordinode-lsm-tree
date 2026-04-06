@@ -746,7 +746,7 @@ impl AbstractTree for BlobTree {
             crate::Tree::batch_get_from_tables(
                 &super_version.version,
                 &keys,
-                &miss_keys,
+                miss_keys,
                 seqno,
                 comparator,
                 &mut internal_entries,

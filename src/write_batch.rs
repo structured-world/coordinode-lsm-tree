@@ -149,24 +149,24 @@ impl WriteBatch {
         // Reject mixed-op duplicates unconditionally — in release builds these
         // cause silent data loss (one entry overwrites the other in the skiplist).
         {
-            let mut seen: crate::HashMap<crate::UserKey, ValueType> =
-                crate::HashMap::with_capacity_and_hasher(
+            let mut seen: std::collections::HashMap<&[u8], ValueType, rustc_hash::FxBuildHasher> =
+                std::collections::HashMap::with_capacity_and_hasher(
                     self.entries.len(),
                     rustc_hash::FxBuildHasher,
                 );
             for entry in &self.entries {
-                let (key, vtype) = match entry {
-                    WriteBatchEntry::Insert { key, .. } => (key, ValueType::Value),
-                    WriteBatchEntry::Remove { key } => (key, ValueType::Tombstone),
-                    WriteBatchEntry::RemoveWeak { key } => (key, ValueType::WeakTombstone),
-                    WriteBatchEntry::Merge { key, .. } => (key, ValueType::MergeOperand),
+                let (key_bytes, vtype): (&[u8], _) = match entry {
+                    WriteBatchEntry::Insert { key, .. } => (key.as_ref(), ValueType::Value),
+                    WriteBatchEntry::Remove { key } => (key.as_ref(), ValueType::Tombstone),
+                    WriteBatchEntry::RemoveWeak { key } => (key.as_ref(), ValueType::WeakTombstone),
+                    WriteBatchEntry::Merge { key, .. } => (key.as_ref(), ValueType::MergeOperand),
                 };
-                if let Some(&prev_type) = seen.get(key) {
+                if let Some(&prev_type) = seen.get(key_bytes) {
                     if prev_type != vtype {
                         return Err(crate::Error::MixedOperationBatch);
                     }
                 } else {
-                    seen.insert(key.clone(), vtype);
+                    seen.insert(key_bytes, vtype);
                 }
             }
         }

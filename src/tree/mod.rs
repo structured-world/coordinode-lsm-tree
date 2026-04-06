@@ -873,7 +873,7 @@ impl AbstractTree for Tree {
             Self::batch_get_from_tables(
                 &super_version.version,
                 &keys,
-                &miss_keys,
+                miss_keys,
                 seqno,
                 comparator,
                 &mut internal_entries,
@@ -1398,15 +1398,15 @@ impl Tree {
     pub(crate) fn batch_get_from_tables<K: AsRef<[u8]>>(
         version: &Version,
         keys: &[K],
-        miss_keys: &[(usize, u64)],
+        miss_keys: Vec<(usize, u64)>,
         seqno: SeqNo,
         comparator: &dyn crate::comparator::UserComparator,
         results: &mut [Option<InternalValue>],
     ) -> crate::Result<()> {
         debug_assert!(miss_keys.iter().all(|&(i, _)| i < keys.len()));
 
-        // Track which (idx, hash) pairs still need to be found
-        let mut still_remaining: Vec<(usize, u64)> = miss_keys.to_vec();
+        // Consume the caller's Vec directly — no allocation+copy.
+        let mut still_remaining = miss_keys;
 
         for (level_idx, level) in version.iter_levels().enumerate() {
             if still_remaining.is_empty() {
