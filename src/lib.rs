@@ -133,6 +133,7 @@ pub(crate) mod metrics;
 pub mod mvcc_stream;
 
 mod path;
+mod pinnable_slice;
 mod prefix;
 
 #[doc(hidden)]
@@ -161,6 +162,7 @@ pub mod util;
 
 mod value;
 mod value_type;
+mod write_batch;
 
 /// Integrity verification for SST and blob files.
 pub mod verify;
@@ -195,6 +197,9 @@ pub use encryption::EncryptionProvider;
 
 #[cfg(feature = "encryption")]
 pub use encryption::Aes256GcmProvider;
+
+pub use pinnable_slice::PinnableSlice;
+pub use write_batch::WriteBatch;
 
 pub use {
     abstract_tree::AbstractTree,

@@ -185,6 +185,61 @@ impl Memtable {
         self.items.is_empty() && self.range_tombstone_count() == 0
     }
 
+    /// Inserts multiple items into the memtable in bulk.
+    ///
+    /// More efficient than calling [`Memtable::insert`] in a loop because it
+    /// performs a single `fetch_add` for the total size and a single
+    /// `fetch_max` for the highest seqno.
+    ///
+    /// Returns `(total_bytes_added, new_memtable_size)`.
+    #[doc(hidden)]
+    pub fn insert_batch(&self, items: Vec<InternalValue>) -> (u64, u64) {
+        if items.is_empty() {
+            let size = self
+                .approximate_size
+                .load(std::sync::atomic::Ordering::Acquire);
+            return (0, size);
+        }
+
+        let mut total_size: u64 = 0;
+        let mut max_seqno: u64 = 0;
+
+        let overhead =
+            std::mem::size_of::<InternalValue>() + std::mem::size_of::<SharedComparator>();
+
+        for item in &items {
+            #[expect(
+                clippy::expect_used,
+                reason = "keys are limited to 16-bit length + values are limited to 32-bit length"
+            )]
+            let item_size: u64 = (item.key.user_key.len() + item.value.len() + overhead)
+                .try_into()
+                .expect("should fit into u64");
+
+            total_size = total_size.saturating_add(item_size);
+
+            if item.key.seqno > max_seqno {
+                max_seqno = item.key.seqno;
+            }
+        }
+
+        let size_before = self
+            .approximate_size
+            .fetch_add(total_size, std::sync::atomic::Ordering::AcqRel);
+
+        for item in items {
+            let key = InternalKey::new(item.key.user_key, item.key.seqno, item.key.value_type);
+            self.items.insert(&key, &item.value);
+        }
+
+        self.highest_seqno
+            .fetch_max(max_seqno, std::sync::atomic::Ordering::AcqRel);
+
+        // fetch_add returns value BEFORE the add, so size_before + total_size
+        // = value AFTER add = new memtable size. Same pattern as Memtable::insert().
+        (total_size, size_before + total_size)
+    }
+
     /// Inserts an item into the memtable
     #[doc(hidden)]
     pub fn insert(&self, item: InternalValue) -> (u64, u64) {

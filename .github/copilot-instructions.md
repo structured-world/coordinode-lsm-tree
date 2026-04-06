@@ -25,6 +25,7 @@ This is a **maintained fork** of [fjall-rs/lsm-tree](https://github.com/fjall-rs
 - **Unsizing coercions:** `Arc::new(ConcreteType) as Arc<dyn Trait>` is valid Rust — the compiler performs an unsizing coercion from `Arc<T>` to `Arc<dyn Trait>` when `T: Trait`. This is NOT an invalid cast. Do not flag it as a compile error.
 - **Feature gates:** Code behind `#[cfg(feature = "...")]` must compile with any combination of features. Variables used only in feature-gated branches must also be feature-gated.
 - **Definite initialization:** `let x: T;` without a default value is valid Rust — the compiler tracks initialization per control-flow path and does not drop uninitialized bindings; do not flag this as a bug when the variable is only used in paths that initialize it.
+- **Unit structs as values:** `struct Foo;` (unit struct) is both a type AND a value (constructor). Writing `HashMap::with_capacity_and_hasher(n, FxBuildHasher)` is valid when `FxBuildHasher` is a unit struct — do not confuse with type aliases (`type Foo = Bar`) which cannot be used as values.
 
 ## Testing Standards
 

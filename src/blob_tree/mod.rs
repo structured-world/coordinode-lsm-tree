@@ -667,6 +667,10 @@ impl AbstractTree for BlobTree {
         self.index.get_highest_persisted_seqno()
     }
 
+    fn apply_batch(&self, batch: crate::WriteBatch, seqno: SeqNo) -> crate::Result<(u64, u64)> {
+        self.index.apply_batch(batch, seqno)
+    }
+
     fn insert<K: Into<UserKey>, V: Into<UserValue>>(
         &self,
         key: K,
@@ -681,16 +685,119 @@ impl AbstractTree for BlobTree {
         self.resolve_key(&super_version, key.as_ref(), seqno)
     }
 
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "indices are generated from 0..n range, always in bounds"
+    )]
     fn multi_get<K: AsRef<[u8]>>(
         &self,
         keys: impl IntoIterator<Item = K>,
         seqno: SeqNo,
     ) -> crate::Result<Vec<Option<crate::UserValue>>> {
-        let super_version = self.index.get_version_for_snapshot(seqno);
+        let keys: Vec<_> = keys.into_iter().collect();
+        let n = keys.len();
+        if n == 0 {
+            return Ok(Vec::new());
+        }
 
-        keys.into_iter()
-            .map(|key| self.resolve_key(&super_version, key.as_ref(), seqno))
-            .collect()
+        let super_version = self.index.get_version_for_snapshot(seqno);
+        let comparator = self.index.config.comparator.as_ref();
+
+        // For small batches, use the simple per-key path
+        if n <= 2 {
+            return keys
+                .iter()
+                .map(|key| self.resolve_key(&super_version, key.as_ref(), seqno))
+                .collect();
+        }
+
+        // Phase 1: Check memtables (unsorted — defer sort+hash for SST phase)
+        let mut internal_entries: Vec<Option<crate::value::InternalValue>> = vec![None; n];
+        let mut remaining: Vec<usize> = Vec::with_capacity(n);
+
+        for idx in 0..n {
+            let key = keys[idx].as_ref();
+            if let Some(entry) = super_version.active_memtable.get(key, seqno) {
+                internal_entries[idx] = Some(entry);
+                continue;
+            }
+            if let Some(entry) =
+                crate::Tree::get_internal_entry_from_sealed_memtables(&super_version, key, seqno)
+            {
+                internal_entries[idx] = Some(entry);
+                continue;
+            }
+            remaining.push(idx);
+        }
+
+        // Phase 2: Sort + hash only if memtable misses exist
+        if !remaining.is_empty() {
+            remaining.sort_by(|&a, &b| comparator.compare(keys[a].as_ref(), keys[b].as_ref()));
+
+            let miss_keys: Vec<(usize, u64)> = remaining
+                .iter()
+                .map(|&idx| {
+                    let hash =
+                        crate::table::filter::standard_bloom::Builder::get_hash(keys[idx].as_ref());
+                    (idx, hash)
+                })
+                .collect();
+
+            crate::Tree::batch_get_from_tables(
+                &super_version.version,
+                &keys,
+                miss_keys,
+                seqno,
+                comparator,
+                &mut internal_entries,
+            )?;
+        }
+
+        // Phase 3: Resolve each entry (tombstones, RT suppression, merge, blob indirections)
+        let mut results = vec![None; n];
+        for idx in 0..n {
+            if let Some(item) = internal_entries[idx].take() {
+                if item.is_tombstone() {
+                    continue;
+                }
+                if crate::Tree::is_suppressed_by_range_tombstones(
+                    &super_version,
+                    keys[idx].as_ref(),
+                    item.key.seqno,
+                    seqno,
+                    comparator,
+                ) {
+                    continue;
+                }
+                // Merge operand resolution. Merge operands in BlobTree are stored
+                // inline (not as blob indirection), so the pipeline result is a
+                // plain value. Without a merge operator, return raw operand value
+                // (same as resolve_key / resolve_pinned_entry behavior).
+                if item.key.value_type.is_merge_operand() {
+                    if let Some(merge_op) = &self.index.config.merge_operator {
+                        results[idx] = crate::Tree::resolve_merge_via_pipeline(
+                            super_version.clone(),
+                            keys[idx].as_ref(),
+                            seqno,
+                            Arc::clone(merge_op),
+                        )?;
+                    } else {
+                        results[idx] = Some(item.value);
+                    }
+                    continue;
+                }
+                let (_, v) = resolve_value_handle(
+                    self.id(),
+                    self.blobs_folder.as_path(),
+                    &self.index.config.cache,
+                    &super_version.version,
+                    item,
+                )?;
+                results[idx] = Some(v);
+            }
+        }
+
+        Ok(results)
     }
 
     fn merge<K: Into<UserKey>, V: Into<UserValue>>(

@@ -554,6 +554,44 @@ pub trait AbstractTree: sealed::Sealed {
     /// Will return `Err` if an IO error occurs.
     fn get<K: AsRef<[u8]>>(&self, key: K, seqno: SeqNo) -> crate::Result<Option<UserValue>>;
 
+    /// Retrieves an item from the tree as a [`PinnableSlice`].
+    ///
+    /// When the value is backed by an on-disk data block, implementations
+    /// may return [`PinnableSlice::Pinned`] holding a reference to that block's
+    /// decompressed buffer (avoiding a data copy). Memtable and blob-resolved
+    /// values use [`PinnableSlice::Owned`]. The default implementation always
+    /// returns `Owned`; only [`Tree`] overrides with the pinned path.
+    ///
+    /// The existing [`AbstractTree::get`] method is unaffected.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # let folder = tempfile::tempdir()?;
+    /// use lsm_tree::{AbstractTree, Config, Tree};
+    ///
+    /// let tree = Config::new(&folder, Default::default(), Default::default()).open()?;
+    /// tree.insert("a", "my_value", 0);
+    ///
+    /// let item = tree.get_pinned("a", 1)?;
+    /// assert_eq!(item.as_ref().map(|v| v.as_ref()), Some("my_value".as_bytes()));
+    /// #
+    /// # Ok::<(), lsm_tree::Error>(())
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Will return `Err` if an IO error occurs.
+    fn get_pinned<K: AsRef<[u8]>>(
+        &self,
+        key: K,
+        seqno: SeqNo,
+    ) -> crate::Result<Option<crate::PinnableSlice>> {
+        // Default: delegate to get() and wrap as Owned
+        self.get(key, seqno)
+            .map(|opt| opt.map(crate::PinnableSlice::owned))
+    }
+
     /// Returns `true` if the tree contains the specified key.
     ///
     /// # Examples
@@ -655,6 +693,44 @@ pub trait AbstractTree: sealed::Sealed {
     ) -> crate::Result<Vec<Option<UserValue>>> {
         keys.into_iter().map(|key| self.get(key, seqno)).collect()
     }
+
+    /// Applies a [`WriteBatch`] with the given sequence number.
+    ///
+    /// All entries share a single seqno. This is more efficient than individual
+    /// writes because the version-history lock and memtable size accounting
+    /// are performed only once for the entire batch.
+    ///
+    /// **Visibility:** entries become individually visible to concurrent readers
+    /// as they are inserted. For atomic batch visibility, the caller must
+    /// publish `seqno` (via `visible_seqno.fetch_max(seqno + 1)`) only
+    /// **after** this method returns.
+    ///
+    /// Returns the total bytes added and new size of the memtable.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # let folder = tempfile::tempdir()?;
+    /// use lsm_tree::{AbstractTree, Config, Tree, WriteBatch};
+    ///
+    /// let tree = Config::new(&folder, Default::default(), Default::default()).open()?;
+    ///
+    /// let mut batch = WriteBatch::new();
+    /// batch.insert("key1", "value1");
+    /// batch.insert("key2", "value2");
+    /// batch.remove("key3");
+    ///
+    /// let (bytes_added, memtable_size) = tree.apply_batch(batch, 0)?;
+    /// assert!(bytes_added > 0);
+    /// #
+    /// # Ok::<(), lsm_tree::Error>(())
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::MixedOperationBatch`](crate::Error::MixedOperationBatch)
+    /// if the batch contains mixed operation types for the same user key.
+    fn apply_batch(&self, batch: crate::WriteBatch, seqno: SeqNo) -> crate::Result<(u64, u64)>;
 
     /// Inserts a key-value pair into the tree.
     ///

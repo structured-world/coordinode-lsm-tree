@@ -93,6 +93,28 @@ impl std::fmt::Debug for Table {
     }
 }
 
+/// Result of a bloom filter check.
+enum BloomResult {
+    /// Bloom says key is definitely absent — skip point read.
+    Skip,
+    /// Point read should proceed.
+    Proceed {
+        /// Whether a filter was present (used for metrics accounting).
+        has_filter: bool,
+    },
+}
+
+impl BloomResult {
+    fn should_skip(&self) -> bool {
+        matches!(self, Self::Skip)
+    }
+
+    #[cfg(feature = "metrics")]
+    fn has_filter(&self) -> bool {
+        matches!(self, Self::Proceed { has_filter: true })
+    }
+}
+
 impl Table {
     #[must_use]
     pub fn global_seqno(&self) -> SeqNo {
@@ -234,27 +256,25 @@ impl Table {
         self.metadata.file_size
     }
 
-    pub fn get(
-        &self,
-        key: &[u8],
-        seqno: SeqNo,
-        key_hash: u64,
-    ) -> crate::Result<Option<InternalValue>> {
-        #[cfg(feature = "metrics")]
-        use std::sync::atomic::Ordering::Relaxed;
-
-        // Translate seqno to "our" seqno
-        let seqno = seqno.saturating_sub(self.global_seqno());
-
-        if self.metadata.seqnos.0 >= seqno {
-            return Ok(None);
-        }
+    /// Loads the filter block (if any) and checks the bloom filter.
+    ///
+    /// Returns `Ok(BloomResult::Skip)` if the bloom filter says the key is definitely absent
+    /// (and updates metrics accordingly), `Ok(BloomResult::Proceed { has_filter })` otherwise.
+    fn check_bloom(&self, key: &[u8], key_hash: u64) -> crate::Result<BloomResult> {
+        debug_assert_eq!(
+            key_hash,
+            crate::table::filter::standard_bloom::Builder::get_hash(key),
+            "key_hash must match the hash of the provided key"
+        );
 
         let filter_block = if let Some(block) = &self.pinned_filter_block {
             Some(Cow::Borrowed(block))
         } else if let Some(filter_idx) = &self.pinned_filter_index {
             let mut iter = filter_idx.iter(self.comparator.clone());
-            iter.seek(key, seqno);
+            // Filter partitions are written with seqno=0, making the seqno
+            // parameter irrelevant to partition selection. Use MAX_SEQNO
+            // consistently to match the index-block seek in Table::range().
+            iter.seek(key, crate::seqno::MAX_SEQNO);
 
             if let Some(filter_block_handle) = iter.next() {
                 let filter_block_handle = filter_block_handle.materialize(filter_idx.as_slice());
@@ -262,15 +282,20 @@ impl Table {
                 let block = self.load_block(
                     &filter_block_handle.into_inner(),
                     BlockType::Filter,
-                    CompressionType::None, // NOTE: We never write a filter block with compression
+                    CompressionType::None,
                     #[cfg(zstd_any)]
                     None,
                 )?;
-                let block = FilterBlock::new(block);
-
-                Some(Cow::Owned(block))
+                Some(Cow::Owned(FilterBlock::new(block)))
             } else {
-                None
+                // Key sorts past the last filter partition — definite miss.
+                #[cfg(feature = "metrics")]
+                {
+                    use std::sync::atomic::Ordering::Relaxed;
+                    self.metrics.filter_queries.fetch_add(1, Relaxed);
+                    self.metrics.io_skipped_by_filter.fetch_add(1, Relaxed);
+                }
+                return Ok(BloomResult::Skip);
             }
         } else if let Some(_filter_tli_handle) = &self.regions.filter_tli {
             unimplemented!("unpinned filter TLI not supported");
@@ -278,55 +303,124 @@ impl Table {
             let block = self.load_block(
                 filter_block_handle,
                 BlockType::Filter,
-                CompressionType::None, // NOTE: We never write a filter block with compression
+                CompressionType::None,
                 #[cfg(zstd_any)]
                 None,
             )?;
-            let block = FilterBlock::new(block);
-
-            Some(Cow::Owned(block))
+            Some(Cow::Owned(FilterBlock::new(block)))
         } else {
             None
         };
+
+        let has_filter = filter_block.is_some();
 
         if let Some(filter_block) = &filter_block
             && !filter_block.maybe_contains_hash(key_hash)?
         {
             #[cfg(feature = "metrics")]
             {
+                use std::sync::atomic::Ordering::Relaxed;
                 self.metrics.filter_queries.fetch_add(1, Relaxed);
                 self.metrics.io_skipped_by_filter.fetch_add(1, Relaxed);
             }
+            return Ok(BloomResult::Skip);
+        }
 
+        Ok(BloomResult::Proceed { has_filter })
+    }
+
+    pub fn get(
+        &self,
+        key: &[u8],
+        seqno: SeqNo,
+        key_hash: u64,
+    ) -> crate::Result<Option<InternalValue>> {
+        let global_seqno = self.global_seqno();
+        let seqno = seqno.saturating_sub(global_seqno);
+
+        if self.metadata.seqnos.0 >= seqno {
             return Ok(None);
         }
 
-        let item = self.point_read(key, seqno);
-
-        #[cfg(not(feature = "metrics"))]
-        {
-            item
+        let bloom = self.check_bloom(key, key_hash)?;
+        if bloom.should_skip() {
+            return Ok(None);
         }
+
+        let item = self.point_read(key, seqno)?;
+
+        // Translate table-local seqno back to global coordinate so callers
+        // can compare across tables/memtables (L0 best-selection, RT suppression).
+        let item = item.map(|mut iv| {
+            iv.key.seqno = iv.key.seqno.saturating_add(global_seqno);
+            iv
+        });
 
         #[cfg(feature = "metrics")]
         {
-            // NOTE: Only increment the filter queries when the filter reported a miss
-            // and we actually waste an I/O for a non-existing item.
-            // Otherwise, the filter efficiency decreases whenever an item is hit.
+            use std::sync::atomic::Ordering::Relaxed;
+            // NOTE: `check_bloom()` accounts for lookups rejected by the filter
+            // (skip I/O entirely). This path accounts for negative point lookups
+            // that still reached storage even though a filter was present, so
+            // `filter_queries` remains interpretable alongside `filter_efficiency()`.
             // https://github.com/fjall-rs/lsm-tree/issues/246
-            item.inspect(|maybe_kv| {
-                if maybe_kv.is_none() && filter_block.is_some() {
-                    self.metrics.filter_queries.fetch_add(1, Relaxed);
-                }
-            })
+            if item.is_none() && bloom.has_filter() {
+                self.metrics.filter_queries.fetch_add(1, Relaxed);
+            }
         }
+
+        Ok(item)
     }
 
-    // TODO: maybe we can skip Fuse costs of the user key
-    // TODO: because we just want to return the value
-    // TODO: we would need to return something like ValueType + Value
-    // TODO: so the caller can decide whether to return the value or not
-    fn point_read(&self, key: &[u8], seqno: SeqNo) -> crate::Result<Option<InternalValue>> {
+    /// Like [`Table::get`], but also returns the [`Block`] containing the value.
+    ///
+    /// Used by `get_pinned()` to construct `PinnableSlice::Pinned`.
+    ///
+    pub(crate) fn get_with_block(
+        &self,
+        key: &[u8],
+        seqno: SeqNo,
+        key_hash: u64,
+    ) -> crate::Result<Option<(InternalValue, Block)>> {
+        let global_seqno = self.global_seqno();
+        let seqno = seqno.saturating_sub(global_seqno);
+
+        if self.metadata.seqnos.0 >= seqno {
+            return Ok(None);
+        }
+
+        let bloom = self.check_bloom(key, key_hash)?;
+        if bloom.should_skip() {
+            return Ok(None);
+        }
+
+        let result = self.point_read_with_block(key, seqno)?;
+
+        // Translate table-local seqno back to global coordinate (see Table::get).
+        let result = result.map(|(mut iv, block)| {
+            iv.key.seqno = iv.key.seqno.saturating_add(global_seqno);
+            (iv, block)
+        });
+
+        #[cfg(feature = "metrics")]
+        {
+            use std::sync::atomic::Ordering::Relaxed;
+            if result.is_none() && bloom.has_filter() {
+                self.metrics.filter_queries.fetch_add(1, Relaxed);
+            }
+        }
+
+        Ok(result)
+    }
+
+    /// Shared block-index walk for point reads. Returns the matching entry
+    /// together with the [`DataBlock`] it was found in, so callers that need
+    /// the block (e.g. for [`PinnableSlice`]) can keep it alive.
+    fn point_read_inner(
+        &self,
+        key: &[u8],
+        seqno: SeqNo,
+    ) -> crate::Result<Option<(InternalValue, DataBlock)>> {
         let Some(iter) = self.block_index.forward_reader(key, seqno) else {
             return Ok(None);
         };
@@ -334,10 +428,10 @@ impl Table {
         for block_handle in iter {
             let block_handle = block_handle?;
 
-            let block = self.load_data_block(block_handle.as_ref())?;
+            let data_block = self.load_data_block(block_handle.as_ref())?;
 
-            if let Some(item) = block.point_read(key, seqno, &self.comparator)? {
-                return Ok(Some(item));
+            if let Some(item) = data_block.point_read(key, seqno, &self.comparator)? {
+                return Ok(Some((item, data_block)));
             }
 
             // NOTE: If the last block key is higher than ours,
@@ -348,6 +442,25 @@ impl Table {
         }
 
         Ok(None)
+    }
+
+    fn point_read(&self, key: &[u8], seqno: SeqNo) -> crate::Result<Option<InternalValue>> {
+        self.point_read_inner(key, seqno)
+            .map(|opt| opt.map(|(iv, _)| iv))
+    }
+
+    /// Like [`Table::point_read`], but also returns the underlying [`Block`].
+    ///
+    /// Holding on to the returned [`Block`] (e.g. for [`PinnableSlice`]) keeps the
+    /// block data alive while the value is in use, but does not guarantee that the
+    /// cache will retain its own entry for that block.
+    fn point_read_with_block(
+        &self,
+        key: &[u8],
+        seqno: SeqNo,
+    ) -> crate::Result<Option<(InternalValue, Block)>> {
+        self.point_read_inner(key, seqno)
+            .map(|opt| opt.map(|(iv, db)| (iv, db.inner)))
     }
 
     /// Creates a scanner over the `Table`.
