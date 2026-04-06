@@ -11,6 +11,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [4.3.1](https://github.com/structured-world/coordinode-lsm-tree/compare/v4.3.0...v4.3.1) - 2026-04-06
+
+### Performance
+
+- *(compression)* use numeric zstd levels in pure Rust backend ([#226](https://github.com/structured-world/coordinode-lsm-tree/pull/226))
+- batch multi_get + PinnableSlice + WriteBatch ([#214](https://github.com/structured-world/coordinode-lsm-tree/pull/214))
+
 ## [4.3.0](https://github.com/structured-world/coordinode-lsm-tree/compare/v4.2.0...v4.3.0) - 2026-04-05
 
 ### Added
