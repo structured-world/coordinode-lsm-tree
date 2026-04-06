@@ -1475,8 +1475,15 @@ impl Tree {
                 }
 
                 // Merge back: keys without a covering run + keys with a covering
-                // miss both proceed to lower levels.
+                // miss both proceed to lower levels. Re-sort to preserve
+                // comparator order for the next level's sequential scan.
+                let needs_sort = !covered_miss.is_empty();
                 still_remaining.extend(covered_miss);
+                if needs_sort {
+                    still_remaining.sort_by(|&(a, _), &(b, _)| {
+                        comparator.compare(keys[a].as_ref(), keys[b].as_ref())
+                    });
+                }
             }
         }
 

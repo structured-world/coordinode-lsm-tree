@@ -1,18 +1,42 @@
 use lsm_tree::{
-    AbstractTree, Config, KvSeparationOptions, PinnableSlice, SeqNo, SequenceNumberCounter,
-    get_tmp_folder,
+    AbstractTree, AnyTree, Config, KvSeparationOptions, MergeOperator, PinnableSlice, SeqNo,
+    SequenceNumberCounter, UserValue, get_tmp_folder,
 };
+use std::sync::Arc;
 use test_log::test;
 
-#[test]
-fn get_pinned_memtable_returns_owned() -> lsm_tree::Result<()> {
+fn setup_tree() -> (AnyTree, tempfile::TempDir) {
     let folder = get_tmp_folder();
     let tree = Config::new(
         &folder,
         SequenceNumberCounter::default(),
         SequenceNumberCounter::default(),
     )
-    .open()?;
+    .open()
+    .unwrap();
+    (tree, folder)
+}
+
+struct ConcatMerge;
+
+impl MergeOperator for ConcatMerge {
+    fn merge(
+        &self,
+        _key: &[u8],
+        base: Option<&[u8]>,
+        operands: &[&[u8]],
+    ) -> lsm_tree::Result<UserValue> {
+        let mut result = base.unwrap_or_default().to_vec();
+        for op in operands {
+            result.extend_from_slice(op);
+        }
+        Ok(result.into())
+    }
+}
+
+#[test]
+fn get_pinned_memtable_returns_owned() -> lsm_tree::Result<()> {
+    let (tree, _folder) = setup_tree();
 
     tree.insert("a", "value_a", 0);
 
@@ -31,13 +55,7 @@ fn get_pinned_memtable_returns_owned() -> lsm_tree::Result<()> {
 
 #[test]
 fn get_pinned_disk_returns_pinned() -> lsm_tree::Result<()> {
-    let folder = get_tmp_folder();
-    let tree = Config::new(
-        &folder,
-        SequenceNumberCounter::default(),
-        SequenceNumberCounter::default(),
-    )
-    .open()?;
+    let (tree, _folder) = setup_tree();
 
     tree.insert("a", "disk_value", 0);
     tree.flush_active_memtable(0)?;
@@ -55,13 +73,7 @@ fn get_pinned_disk_returns_pinned() -> lsm_tree::Result<()> {
 
 #[test]
 fn get_pinned_missing_key_returns_none() -> lsm_tree::Result<()> {
-    let folder = get_tmp_folder();
-    let tree = Config::new(
-        &folder,
-        SequenceNumberCounter::default(),
-        SequenceNumberCounter::default(),
-    )
-    .open()?;
+    let (tree, _folder) = setup_tree();
 
     let result = tree.get_pinned("nonexistent", 1)?;
     assert!(result.is_none());
@@ -71,13 +83,7 @@ fn get_pinned_missing_key_returns_none() -> lsm_tree::Result<()> {
 
 #[test]
 fn get_pinned_tombstoned_key_returns_none() -> lsm_tree::Result<()> {
-    let folder = get_tmp_folder();
-    let tree = Config::new(
-        &folder,
-        SequenceNumberCounter::default(),
-        SequenceNumberCounter::default(),
-    )
-    .open()?;
+    let (tree, _folder) = setup_tree();
 
     tree.insert("a", "value", 0);
     tree.remove("a", 1);
@@ -90,13 +96,7 @@ fn get_pinned_tombstoned_key_returns_none() -> lsm_tree::Result<()> {
 
 #[test]
 fn get_pinned_into_value_conversion() -> lsm_tree::Result<()> {
-    let folder = get_tmp_folder();
-    let tree = Config::new(
-        &folder,
-        SequenceNumberCounter::default(),
-        SequenceNumberCounter::default(),
-    )
-    .open()?;
+    let (tree, _folder) = setup_tree();
 
     tree.insert("a", "my_value", 0);
 
@@ -109,13 +109,7 @@ fn get_pinned_into_value_conversion() -> lsm_tree::Result<()> {
 
 #[test]
 fn get_pinned_matches_get() -> lsm_tree::Result<()> {
-    let folder = get_tmp_folder();
-    let tree = Config::new(
-        &folder,
-        SequenceNumberCounter::default(),
-        SequenceNumberCounter::default(),
-    )
-    .open()?;
+    let (tree, _folder) = setup_tree();
 
     for i in 0..20u32 {
         tree.insert(format!("key_{i:04}"), format!("val_{i}"), u64::from(i));
@@ -193,13 +187,7 @@ fn get_pinned_blob_tree_returns_owned() -> lsm_tree::Result<()> {
 
 #[test]
 fn get_pinned_with_range_tombstone_returns_none() -> lsm_tree::Result<()> {
-    let folder = get_tmp_folder();
-    let tree = Config::new(
-        &folder,
-        SequenceNumberCounter::default(),
-        SequenceNumberCounter::default(),
-    )
-    .open()?;
+    let (tree, _folder) = setup_tree();
 
     tree.insert("a", "val_a", 0);
     tree.insert("b", "val_b", 1);
@@ -230,15 +218,8 @@ fn get_pinned_with_range_tombstone_returns_none() -> lsm_tree::Result<()> {
 #[test]
 fn get_pinned_after_compaction_returns_pinned() -> lsm_tree::Result<()> {
     use lsm_tree::compaction::Leveled;
-    use std::sync::Arc;
 
-    let folder = get_tmp_folder();
-    let tree = Config::new(
-        &folder,
-        SequenceNumberCounter::default(),
-        SequenceNumberCounter::default(),
-    )
-    .open()?;
+    let (tree, _folder) = setup_tree();
 
     // Write and flush multiple times to create L0 tables
     for batch in 0..3u32 {
@@ -264,13 +245,7 @@ fn get_pinned_after_compaction_returns_pinned() -> lsm_tree::Result<()> {
 
 #[test]
 fn get_pinned_sealed_memtable_returns_owned() -> lsm_tree::Result<()> {
-    let folder = get_tmp_folder();
-    let tree = Config::new(
-        &folder,
-        SequenceNumberCounter::default(),
-        SequenceNumberCounter::default(),
-    )
-    .open()?;
+    let (tree, _folder) = setup_tree();
 
     tree.insert("a", "val_sealed", 0);
 
@@ -289,13 +264,7 @@ fn get_pinned_sealed_memtable_returns_owned() -> lsm_tree::Result<()> {
 
 #[test]
 fn get_pinned_disk_exercises_pinned_methods() -> lsm_tree::Result<()> {
-    let folder = get_tmp_folder();
-    let tree = Config::new(
-        &folder,
-        SequenceNumberCounter::default(),
-        SequenceNumberCounter::default(),
-    )
-    .open()?;
+    let (tree, _folder) = setup_tree();
 
     tree.insert("a", "pinned_value", 0);
     tree.flush_active_memtable(0)?;
@@ -337,13 +306,7 @@ fn get_pinned_disk_exercises_pinned_methods() -> lsm_tree::Result<()> {
 
 #[test]
 fn get_pinned_empty_value_on_disk() -> lsm_tree::Result<()> {
-    let folder = get_tmp_folder();
-    let tree = Config::new(
-        &folder,
-        SequenceNumberCounter::default(),
-        SequenceNumberCounter::default(),
-    )
-    .open()?;
+    let (tree, _folder) = setup_tree();
 
     // Insert with empty value
     tree.insert("empty", "", 0);
@@ -359,13 +322,7 @@ fn get_pinned_empty_value_on_disk() -> lsm_tree::Result<()> {
 
 #[test]
 fn get_pinned_tombstone_on_disk_returns_none() -> lsm_tree::Result<()> {
-    let folder = get_tmp_folder();
-    let tree = Config::new(
-        &folder,
-        SequenceNumberCounter::default(),
-        SequenceNumberCounter::default(),
-    )
-    .open()?;
+    let (tree, _folder) = setup_tree();
 
     tree.insert("a", "value", 0);
     tree.remove("a", 1);
@@ -380,13 +337,7 @@ fn get_pinned_tombstone_on_disk_returns_none() -> lsm_tree::Result<()> {
 
 #[test]
 fn get_pinned_range_tombstone_on_disk_suppresses() -> lsm_tree::Result<()> {
-    let folder = get_tmp_folder();
-    let tree = Config::new(
-        &folder,
-        SequenceNumberCounter::default(),
-        SequenceNumberCounter::default(),
-    )
-    .open()?;
+    let (tree, _folder) = setup_tree();
 
     tree.insert("a", "v1", 0);
     tree.insert("b", "v2", 1);
@@ -411,24 +362,7 @@ fn get_pinned_range_tombstone_on_disk_suppresses() -> lsm_tree::Result<()> {
 
 #[test]
 fn get_pinned_with_merge_operator_in_memtable() -> lsm_tree::Result<()> {
-    use lsm_tree::{MergeOperator, UserValue};
-    use std::sync::Arc;
-
-    struct ConcatMerge;
-    impl MergeOperator for ConcatMerge {
-        fn merge(
-            &self,
-            _key: &[u8],
-            base: Option<&[u8]>,
-            operands: &[&[u8]],
-        ) -> lsm_tree::Result<UserValue> {
-            let mut result = base.unwrap_or_default().to_vec();
-            for op in operands {
-                result.extend_from_slice(op);
-            }
-            Ok(result.into())
-        }
-    }
+    // ConcatMerge defined at module scope
 
     let folder = get_tmp_folder();
     let tree = Config::new(
@@ -452,24 +386,7 @@ fn get_pinned_with_merge_operator_in_memtable() -> lsm_tree::Result<()> {
 
 #[test]
 fn get_pinned_with_merge_operator_in_sealed_memtable() -> lsm_tree::Result<()> {
-    use lsm_tree::{MergeOperator, UserValue};
-    use std::sync::Arc;
-
-    struct ConcatMerge;
-    impl MergeOperator for ConcatMerge {
-        fn merge(
-            &self,
-            _key: &[u8],
-            base: Option<&[u8]>,
-            operands: &[&[u8]],
-        ) -> lsm_tree::Result<UserValue> {
-            let mut result = base.unwrap_or_default().to_vec();
-            for op in operands {
-                result.extend_from_slice(op);
-            }
-            Ok(result.into())
-        }
-    }
+    // ConcatMerge defined at module scope
 
     let folder = get_tmp_folder();
     let tree = Config::new(
@@ -494,24 +411,7 @@ fn get_pinned_with_merge_operator_in_sealed_memtable() -> lsm_tree::Result<()> {
 
 #[test]
 fn get_pinned_with_merge_operator_on_disk() -> lsm_tree::Result<()> {
-    use lsm_tree::{MergeOperator, UserValue};
-    use std::sync::Arc;
-
-    struct ConcatMerge;
-    impl MergeOperator for ConcatMerge {
-        fn merge(
-            &self,
-            _key: &[u8],
-            base: Option<&[u8]>,
-            operands: &[&[u8]],
-        ) -> lsm_tree::Result<UserValue> {
-            let mut result = base.unwrap_or_default().to_vec();
-            for op in operands {
-                result.extend_from_slice(op);
-            }
-            Ok(result.into())
-        }
-    }
+    // ConcatMerge defined at module scope
 
     let folder = get_tmp_folder();
     let tree = Config::new(
@@ -536,13 +436,7 @@ fn get_pinned_with_merge_operator_on_disk() -> lsm_tree::Result<()> {
 
 #[test]
 fn get_pinned_sealed_memtable_tombstone_returns_none() -> lsm_tree::Result<()> {
-    let folder = get_tmp_folder();
-    let tree = Config::new(
-        &folder,
-        SequenceNumberCounter::default(),
-        SequenceNumberCounter::default(),
-    )
-    .open()?;
+    let (tree, _folder) = setup_tree();
 
     tree.insert("a", "value", 0);
     tree.remove("a", 1);
@@ -556,13 +450,7 @@ fn get_pinned_sealed_memtable_tombstone_returns_none() -> lsm_tree::Result<()> {
 
 #[test]
 fn get_pinned_sealed_memtable_range_tombstone_suppresses() -> lsm_tree::Result<()> {
-    let folder = get_tmp_folder();
-    let tree = Config::new(
-        &folder,
-        SequenceNumberCounter::default(),
-        SequenceNumberCounter::default(),
-    )
-    .open()?;
+    let (tree, _folder) = setup_tree();
 
     tree.insert("b", "value", 0);
     tree.remove_range("a", "c", 1);
