@@ -78,17 +78,19 @@ fn bench_write_batch(c: &mut Criterion) {
             BenchmarkId::new("insert", batch_size),
             &batch_size,
             |b, &size| {
-                let (tree, _folder) = setup_empty_tree();
                 let keys: Vec<String> = (0..size).map(|i| format!("key_{i:04}")).collect();
 
-                b.iter(|| {
-                    let mut batch = WriteBatch::with_capacity(size);
-                    for k in &keys {
-                        batch.insert(k.as_str(), "value");
-                    }
-                    // Same seqno each iteration: pure overwrite, no version accumulation.
-                    tree.apply_batch(batch, 0).unwrap();
-                });
+                b.iter_batched(
+                    setup_empty_tree,
+                    |(tree, _folder)| {
+                        let mut batch = WriteBatch::with_capacity(size);
+                        for k in &keys {
+                            batch.insert(k.as_str(), "value");
+                        }
+                        tree.apply_batch(batch, 0).unwrap();
+                    },
+                    criterion::BatchSize::SmallInput,
+                );
             },
         );
     }
@@ -99,14 +101,17 @@ fn bench_write_batch(c: &mut Criterion) {
             BenchmarkId::new("individual_inserts", batch_size),
             &batch_size,
             |b, &size| {
-                let (tree, _folder) = setup_empty_tree();
                 let keys: Vec<String> = (0..size).map(|i| format!("key_{i:04}")).collect();
 
-                b.iter(|| {
-                    for k in &keys {
-                        tree.insert(k.as_str(), "value", 0);
-                    }
-                });
+                b.iter_batched(
+                    setup_empty_tree,
+                    |(tree, _folder)| {
+                        for k in &keys {
+                            tree.insert(k.as_str(), "value", 0);
+                        }
+                    },
+                    criterion::BatchSize::SmallInput,
+                );
             },
         );
     }
