@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1775395681699,
+  "lastUpdate": 1775479618109,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -5304,6 +5304,84 @@ window.BENCHMARK_DATA = {
             "value": 283433.1104358807,
             "unit": "ops/sec (normalized)",
             "extra": "raw: 511521 ops/sec | factor: 0.554 | P50: 1.8us | P99: 4.9us | P99.9: 12.9us\nthreads: 1 | elapsed: 0.39s | num: 200000 | iterations: 3 | runner: seq_wr=230615 rand_rd=905921 cpu=122 composite=41508.9"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "6f86575fefc05f76bd7ac18b76656f54b76fc62e",
+          "message": "perf: batch multi_get + PinnableSlice + WriteBatch (#214)\n\n## Summary\n\n- **Batch multi_get**: deferred sort+hash after memtable phase, sorted\nkey access for SSTs, L0 seqno ceiling skip, BlobTree batch path with RT\nsuppression\n- **PinnableSlice**: zero-copy `get_pinned()` API — `Pinned` variant\nkeeps decompressed block buffer alive via refcounted `Slice`/`ByteView`,\n`Owned` for memtable/merge/blob values\n- **WriteBatch**: `apply_batch(batch, seqno) -> Result<(u64, u64)>` —\nshared seqno, single lock, `Error::MixedOperationBatch` rejects mixed-op\nduplicates unconditionally\n- **Table::get seqno fix**: returns global seqnos (was table-local for\ningested tables)\n- **Deps**: update `structured-zstd 0.0.1 → 0.0.7\n\n## Technical Details\n\n### Batch multi_get\n- Phase 1 (memtable): unsorted scan — memtable lookup is O(log n)\nregardless of order\n- Phase 2 (SST): sort remaining keys + compute bloom hashes only if\nmemtable misses exist (memtable-only batches skip entirely)\n- L0: Vec<bool> bitmap tracks keys at seqno ceiling (entry_seqno + 1 ==\nread_seqno), skips them in subsequent runs\n- L1+: sorted key access for sequential I/O\n- BlobTree: batch path with sorted keys, bloom hashes, RT suppression\n(was naive per-key loop)\n- Small batches (≤2 keys) use simple per-key path\n- Monomorphized `find_in_tables<T: TablePointLookup>` — zero-cost\ngeneric for `get` (no Block overhead) and `get_pinned` (retains Block)\n\n### PinnableSlice\n- `Pinned { _block: Block, value: Slice }` — block buffer alive via\nrefcount, does NOT prevent cache eviction\n- `resolve_pinned_entry` helper — single source of truth for\ntombstone/RT/merge resolution, used by both `get_pinned` and `multi_get`\n- `Table::point_read_inner` — shared block-index walk for `point_read`\nand `point_read_with_block`\n- `BloomResult` enum — DRY filter-loading with cfg(metrics) gating\n\n### WriteBatch\n- `apply_batch` returns `Result` — `Error::MixedOperationBatch` if same\nuser key has differing op types (insert + remove)\n- Repeated `merge()` on same key is safe (same value_type)\n- `Memtable::insert_batch` — single `saturating_add` for total size\n- Version-history read guard held for entire batch to prevent\n`rotate_memtable` race\n\n### Table::get global seqno\n- `Table::get` and `get_with_block` now add `global_seqno` back to\nreturned `InternalValue` seqno\n- Fixes L0 best-selection and RT suppression for bulk-ingested tables\nwith non-zero `global_seqno`\n- L0 fast-path: `checked_add(1) == Some(seqno)` (was dead code with `==\nseqno`)\n\n## Test Plan\n\n- [x] 1229 tests pass (`cargo nextest run --all-features`)\n- [x] 41 doc-tests pass (`cargo test --doc`)\n- [x] Clippy clean (`cargo clippy --all-targets --all-features -- -D\nwarnings`)\n- [x] Criterion benchmarks: multi_get (10-500 keys), get_pinned vs get,\nwrite_batch vs individual inserts\n- [x] MixedOperationBatch rejection test + repeated merge acceptance\ntest\n\n## Related\n\n- #223 — per-SST batch point-read (Table::batch_get) — follow-up\noptimization\n\nCloses #143\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n## Summary by CodeRabbit\n\n* **New Features**\n* Zero-copy pinned reads and a pinned-read API; WriteBatch for grouped\natomic writes and a bulk memtable insert path.\n\n* **Performance Improvements**\n* Batched multi-get pipeline and optimized table point-lookup for large\nrequests.\n\n* **Bug Fixes**\n* Rejected batches that mix conflicting operations on the same key\n(MixedOperationBatch).\n\n* **Documentation**\n* README clarifies batch-optimized multi_get, pinning, and atomic batch\nvisibility.\n\n* **Tests / Benchmarks**\n* New integration tests and Criterion benchmarks for pinned reads,\nmulti_get, and write batches.\n\n* **Chores**\n  * Dependency version bumped and benchmark target added.\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-04-06T15:45:38+03:00",
+          "tree_id": "de7ae2d0edea8ef28a544c521e02ab7a74a74cc4",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/6f86575fefc05f76bd7ac18b76656f54b76fc62e"
+        },
+        "date": 1775479616823,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 1216281.4162948378,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 1893985 ops/sec | factor: 0.642 | P50: 0.4us | P99: 2.4us | P99.9: 5.8us\nthreads: 1 | elapsed: 0.11s | num: 200000 | iterations: 3 | runner: seq_wr=221559 rand_rd=707347 cpu=108 composite=35815.4"
+          },
+          {
+            "name": "fillrandom",
+            "value": 662719.4645972243,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 1031982 ops/sec | factor: 0.642 | P50: 0.7us | P99: 3.1us | P99.9: 9.5us\nthreads: 1 | elapsed: 0.19s | num: 200000 | iterations: 3 | runner: seq_wr=221559 rand_rd=707347 cpu=108 composite=35815.4"
+          },
+          {
+            "name": "readrandom",
+            "value": 294935.4384856734,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 459271 ops/sec | factor: 0.642 | P50: 2.0us | P99: 6.3us | P99.9: 13.6us\nthreads: 1 | elapsed: 0.44s | num: 200000 | iterations: 3 | runner: seq_wr=221559 rand_rd=707347 cpu=108 composite=35815.4"
+          },
+          {
+            "name": "readseq",
+            "value": 1471061.0918393773,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 2290726 ops/sec | factor: 0.642 | P50: 0.3us | P99: 4.5us | P99.9: 9.1us\nthreads: 1 | elapsed: 0.09s | num: 200000 | iterations: 3 | runner: seq_wr=221559 rand_rd=707347 cpu=108 composite=35815.4"
+          },
+          {
+            "name": "seekrandom",
+            "value": 213509.50381264018,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 332475 ops/sec | factor: 0.642 | P50: 2.6us | P99: 7.2us | P99.9: 14.9us\nthreads: 1 | elapsed: 0.60s | num: 200000 | iterations: 3 | runner: seq_wr=221559 rand_rd=707347 cpu=108 composite=35815.4"
+          },
+          {
+            "name": "prefixscan",
+            "value": 110680.18859462412,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 172350 ops/sec | factor: 0.642 | P50: 5.4us | P99: 7.0us | P99.9: 16.9us\nthreads: 1 | elapsed: 1.16s | num: 200000 | iterations: 3 | runner: seq_wr=221559 rand_rd=707347 cpu=108 composite=35815.4"
+          },
+          {
+            "name": "overwrite",
+            "value": 718082.3005311881,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 1118193 ops/sec | factor: 0.642 | P50: 0.7us | P99: 3.0us | P99.9: 6.9us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3 | runner: seq_wr=221559 rand_rd=707347 cpu=108 composite=35815.4"
+          },
+          {
+            "name": "mergerandom",
+            "value": 473897.38234757184,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 737950 ops/sec | factor: 0.642 | P50: 0.4us | P99: 0.6us | P99.9: 3.4us\nthreads: 1 | elapsed: 0.27s | num: 200000 | iterations: 3 | runner: seq_wr=221559 rand_rd=707347 cpu=108 composite=35815.4"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 291324.2625736475,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 453648 ops/sec | factor: 0.642 | P50: 2.0us | P99: 5.9us | P99.9: 13.5us\nthreads: 1 | elapsed: 0.44s | num: 200000 | iterations: 3 | runner: seq_wr=221559 rand_rd=707347 cpu=108 composite=35815.4"
           }
         ]
       }
