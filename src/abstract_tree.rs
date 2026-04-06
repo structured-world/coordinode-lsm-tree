@@ -236,7 +236,7 @@ pub trait AbstractTree: sealed::Sealed {
         0
     }
 
-    /// Gets the space usage of all filters in the tree.
+    /// Gets the disk space usage of all filters in the tree.
     ///
     /// May not correspond to the actual memory size because filter blocks may be paged out.
     fn filter_size(&self) -> u64;
