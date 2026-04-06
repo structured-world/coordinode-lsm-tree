@@ -1386,14 +1386,14 @@ impl Tree {
 
     /// Queries tables for multiple keys using sorted access order.
     ///
-    /// `remaining_sorted` contains indices into `keys` for keys not yet found,
-    /// in comparator-sorted order. Keys are looked up individually via
-    /// `Table::get`, but sorted order improves I/O locality. Bloom hashes are
-    /// pre-computed once and reused across all tables. Per-SST batched bloom
-    /// checks and block walks are tracked in #223.
+    /// `miss_keys` contains `(key_index, bloom_hash)` pairs for keys not yet
+    /// found, in comparator-sorted order. Keys are looked up individually via
+    /// `Table::get`, but sorted order improves I/O locality. The precomputed
+    /// bloom hash in each pair is reused across all table probes. Per-SST
+    /// batched bloom checks and block walks are tracked in `#223`.
     #[expect(
         clippy::indexing_slicing,
-        reason = "indices come from 0..n range and are always within keys/key_hashes/results bounds"
+        reason = "miss_keys entries carry batch-local indices; callers must pass a results slice aligned with keys"
     )]
     pub(crate) fn batch_get_from_tables<K: AsRef<[u8]>>(
         version: &Version,
@@ -1403,6 +1403,7 @@ impl Tree {
         comparator: &dyn crate::comparator::UserComparator,
         results: &mut [Option<InternalValue>],
     ) -> crate::Result<()> {
+        debug_assert_eq!(results.len(), keys.len());
         debug_assert!(miss_keys.iter().all(|&(i, _)| i < keys.len()));
 
         // Consume the caller's Vec directly — no allocation+copy.
