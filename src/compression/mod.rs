@@ -82,7 +82,10 @@ pub type ZstdBackend = zstd_pure::ZstdPureProvider;
 /// ```
 #[cfg(zstd_any)]
 pub struct ZstdDictionary {
-    id: u32,
+    /// Full 64-bit xxh3 hash used as the collision-resistant cache key for the
+    /// thread-local `FrameDecoder` in the pure Rust backend. The public
+    /// `id() -> u32` method returns the lower 32 bits for external consumers.
+    id: u64,
     raw: Arc<[u8]>,
 
     /// Pre-compiled decompressor dictionary, lazily initialized on first use.
@@ -144,9 +147,25 @@ impl ZstdDictionary {
             .get_or_init(|| zstd::dict::DecoderDictionary::copy(&self.raw))
     }
 
-    /// Returns the dictionary ID (truncated xxh3 hash of the raw bytes).
+    /// Returns a 32-bit dictionary fingerprint (lower 32 bits of xxh3).
+    ///
+    /// Intended for display and external interop (e.g., matching against the
+    /// dict ID embedded in a zstd frame header). For internal cache keying
+    /// use [`id64`](ZstdDictionary::id64) to avoid hash collisions.
     #[must_use]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "intentional: public API returns 32-bit fingerprint"
+    )]
     pub fn id(&self) -> u32 {
+        self.id as u32
+    }
+
+    /// Returns the full 64-bit xxh3 fingerprint used as a collision-resistant
+    /// cache key inside the pure Rust backend's TLS decoder.
+    #[cfg(all(feature = "zstd-pure", not(feature = "zstd")))]
+    #[must_use]
+    pub(crate) fn id64(&self) -> u64 {
         self.id
     }
 
@@ -161,20 +180,20 @@ impl ZstdDictionary {
 impl std::fmt::Debug for ZstdDictionary {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ZstdDictionary")
-            .field("id", &format_args!("{:#010x}", self.id))
+            .field("id", &format_args!("{:#018x}", self.id))
             .field("size", &self.raw.len())
             .finish_non_exhaustive() // `prepared` cache omitted — implementation detail
     }
 }
 
-/// Compute a 32-bit dictionary ID from raw bytes via truncated xxh3.
+/// Compute the full 64-bit xxh3 dictionary fingerprint.
+///
+/// The full 64-bit value is used as the collision-resistant cache key inside
+/// the pure Rust backend's thread-local `FrameDecoder`. The public `id()`
+/// method returns only the lower 32 bits for backward-compatible display.
 #[cfg(zstd_any)]
-#[expect(
-    clippy::cast_possible_truncation,
-    reason = "intentionally truncated to 32-bit fingerprint"
-)]
-fn compute_dict_id(raw: &[u8]) -> u32 {
-    xxhash_rust::xxh3::xxh3_64(raw) as u32
+fn compute_dict_id(raw: &[u8]) -> u64 {
+    xxhash_rust::xxh3::xxh3_64(raw)
 }
 
 /// Compression algorithm to use

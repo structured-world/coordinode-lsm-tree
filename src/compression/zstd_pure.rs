@@ -103,7 +103,11 @@ impl CompressionProvider for ZstdPureProvider {
         // needed. If the active dictionary changes (e.g. different table),
         // the decoder is re-initialised transparently.
         thread_local! {
-            static TLS_DECODER: std::cell::RefCell<Option<(u32, FrameDecoder)>> =
+            // Keyed by the full 64-bit xxh3 fingerprint (`dict.id64()`), not
+            // the truncated 32-bit public fingerprint, to avoid decoder reuse
+            // when two distinct dictionaries happen to share the same 32-bit
+            // prefix. A 64-bit collision is 2^32× less likely than a 32-bit one.
+            static TLS_DECODER: std::cell::RefCell<Option<(u64, FrameDecoder)>> =
                 const { std::cell::RefCell::new(None) };
         }
 
@@ -111,15 +115,15 @@ impl CompressionProvider for ZstdPureProvider {
             let mut state = cell.borrow_mut();
 
             // Re-initialise if this is the first call in this thread or if
-            // the dictionary has changed (different dict_id → different table).
-            if !matches!(&*state, Some((id, _)) if *id == dict.id()) {
+            // the dictionary has changed (different id64 → different table).
+            if !matches!(&*state, Some((id, _)) if *id == dict.id64()) {
                 let parsed = Dictionary::decode_dict(dict.raw())
                     .map_err(|e| crate::Error::Io(std::io::Error::other(e)))?;
                 let mut decoder = FrameDecoder::new();
                 decoder
                     .add_dict(parsed)
                     .map_err(|e| crate::Error::Io(std::io::Error::other(e)))?;
-                *state = Some((dict.id(), decoder));
+                *state = Some((dict.id64(), decoder));
             }
 
             let Some((_, decoder)) = state.as_mut() else {
@@ -139,13 +143,25 @@ impl CompressionProvider for ZstdPureProvider {
                 .decode_all_to_vec(data, &mut output)
                 .map_err(|e| crate::Error::Io(std::io::Error::other(e)))?;
 
+            // Enforce the same capacity limit as `decompress` and the C backend:
+            // reject frames that decompress to more bytes than the caller declared.
+            // `decode_all_to_vec` allocates without a hard cap, so this post-decode
+            // check prevents unbounded allocation on corrupted or crafted frames.
+            if output.len() > capacity {
+                return Err(crate::Error::DecompressedSizeTooLarge {
+                    declared: output.len() as u64,
+                    limit: capacity as u64,
+                });
+            }
+
             Ok(output)
         })
     }
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, reason = "test code")]
+#[expect(clippy::unwrap_used, reason = "test code")]
+#[expect(clippy::expect_used, reason = "test code")]
 mod tests {
     use super::*;
     use crate::compression::ZstdDictionary;
@@ -201,5 +217,20 @@ mod tests {
                     .expect("decompression should succeed on every call");
             assert_eq!(result, PLAINTEXT);
         }
+    }
+
+    #[test]
+    fn decompress_with_dict_rejects_frame_exceeding_capacity() {
+        // Capacity smaller than the plaintext — should return an error, not
+        // silently return truncated output (regression for the post-decode
+        // capacity guard added to `decode_all_to_vec`).
+        let dict = ZstdDictionary::new(DICT);
+        let too_small = PLAINTEXT.len() / 2;
+        let result = ZstdPureProvider::decompress_with_dict(COMPRESSED, &dict, too_small);
+        assert!(
+            result.is_err(),
+            "expected DecompressedSizeTooLarge but got Ok({:?})",
+            result.unwrap()
+        );
     }
 }
