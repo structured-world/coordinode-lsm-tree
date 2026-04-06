@@ -133,20 +133,34 @@ impl CompressionProvider for ZstdPureProvider {
                 )));
             };
 
-            // `decode_all_to_vec` calls `init(&mut input)` internally — the
-            // mutable borrow advances the slice cursor past the frame header
-            // before block decoding begins, which is the correct usage of
-            // `FrameDecoder`. The dictionary stored in `decoder.dicts` is
-            // reused on every call without re-parsing.
+            // `decode_all_to_vec` decodes the entire frame in one pass and
+            // appends to `output`. The dictionary stored in `decoder.dicts`
+            // is reused without re-parsing on every call.
+            //
+            // The `bounded_read` approach used by the non-dictionary path
+            // (`decompress`) is not applicable here: `bounded_read` calls
+            // `Read::read` in a loop, which requires the decoder to pull
+            // compressed blocks lazily from an internal reader reference.
+            // `StreamingDecoder` supports this (it holds a `&[u8]` reference);
+            // `FrameDecoder` does not — it processes the full slice at once
+            // and its `Read` impl returns 0 bytes after `init` if not used
+            // together with `decode_all_to_vec`.
+            //
+            // The capacity limit is therefore enforced by a post-decode check
+            // rather than during streaming. The allocation is bounded by the
+            // frame content size: zstd frames embed the decompressed size in
+            // their header, so allocations from crafted frames are bounded by
+            // that declared size. If the declared size itself is maliciously
+            // large, the post-decode check below returns `DecompressedSizeTooLarge`
+            // before the data is used.
             let mut output = Vec::with_capacity(capacity);
             decoder
                 .decode_all_to_vec(data, &mut output)
                 .map_err(|e| crate::Error::Io(std::io::Error::other(e)))?;
 
-            // Enforce the same capacity limit as `decompress` and the C backend:
-            // reject frames that decompress to more bytes than the caller declared.
-            // `decode_all_to_vec` allocates without a hard cap, so this post-decode
-            // check prevents unbounded allocation on corrupted or crafted frames.
+            // Return an error if the frame decompressed to more bytes than
+            // the caller declared. Matches the bounded behaviour of
+            // `decompress()` and the C FFI backend.
             if output.len() > capacity {
                 return Err(crate::Error::DecompressedSizeTooLarge {
                     declared: output.len() as u64,
