@@ -65,6 +65,67 @@ fn bounded_read(reader: &mut impl Read, capacity: usize) -> crate::Result<Vec<u8
     Ok(output)
 }
 
+/// Strips the `Dict_ID` field from a zstd frame header.
+///
+/// structured-zstd rejects `id=0` for [`Dictionary::from_raw_content`], so the
+/// pure backend internally assigns a synthetic non-zero id derived from the dict
+/// content hash. That id is an implementation detail — it must not be embedded in
+/// compressed frames because the C zstd library always records `dictID=0` (absent)
+/// for raw-content dicts, and its decompressor rejects frames whose `dictID`
+/// doesn't match the loaded `ZSTD_DDict`'s id.
+///
+/// Stripping the field aligns the output format: both backends produce frames with
+/// no embedded dict id for raw-content dicts, enabling mutual cross-backend
+/// decompression.
+///
+/// Returns the frame unchanged if no dict id is present (`Dict_ID_Flag == 0`).
+fn strip_dict_id(frame: Vec<u8>) -> Vec<u8> {
+    // Minimum valid frame: magic (4 bytes) + Frame_Header_Descriptor (1 byte).
+    let Some(&fhd) = frame.get(4) else {
+        return frame; // Frame_Header_Descriptor absent — leave unchanged.
+    };
+
+    let dict_id_flag = fhd & 0x03; // bits [1:0]: Dict_ID_Flag
+    if dict_id_flag == 0 {
+        return frame; // No dict ID present.
+    }
+
+    // Dict_ID_Flag encodes the byte-width of the Dict_ID field:
+    //   1 → 1 byte, 2 → 2 bytes, 3 → 4 bytes.
+    let dict_id_len: usize = match dict_id_flag {
+        1 => 1,
+        2 => 2,
+        3 => 4,
+        _ => return frame, // unreachable: dict_id_flag is 2 bits
+    };
+
+    // Single_Segment_Flag (FHD bit 5): when set, no Window_Descriptor follows FHD.
+    let single_segment = (fhd >> 5) & 0x01 != 0;
+    let wd_len: usize = usize::from(!single_segment); // 1 if WD present, else 0
+
+    // Dict_ID immediately follows: magic(4) + FHD(1) + optional WD.
+    let dict_id_start = 5 + wd_len;
+    if frame.len() < dict_id_start + dict_id_len {
+        return frame; // Malformed frame — leave unchanged; decompressor will reject it.
+    }
+
+    // Build a new frame with Dict_ID_Flag cleared and the Dict_ID bytes removed.
+    let new_fhd = fhd & !0x03u8; // Clear bits [1:0]
+    let mut out = Vec::with_capacity(frame.len() - dict_id_len);
+    if let Some(magic) = frame.get(..4) {
+        out.extend_from_slice(magic); // Frame magic
+    }
+    out.push(new_fhd); // Modified FHD
+    if !single_segment && let Some(&wd) = frame.get(5) {
+        out.push(wd); // Window_Descriptor (pass through)
+    }
+    // Skip the Dict_ID bytes; copy the rest (FCS + blocks + optional checksum).
+    if let Some(rest) = frame.get(dict_id_start + dict_id_len..) {
+        out.extend_from_slice(rest);
+    }
+    out
+}
+
 /// Pure Rust zstd backend.
 pub struct ZstdPureProvider;
 
@@ -129,12 +190,19 @@ impl CompressionProvider for ZstdPureProvider {
         // formats. We replicate this behaviour here so that `ZstdDictionary` values
         // created from raw training corpora (without a finalized header) also work.
         //
+        // Whether the dictionary uses the finalized-dict format (magic header)
+        // or raw content. Only raw-content dict frames need post-processing
+        // to strip the embedded dictID (see below).
+        let is_raw_content = !dict_raw.starts_with(&DICT_MAGIC);
+
         // ID derivation for raw content dictionaries:
-        //   - Use the lower 32 bits of the xxh3 hash of `dict_raw` (matching the
-        //     formula in `ZstdDictionary::id()`), clamped to at least 1 because
-        //     id=0 is rejected by `FrameCompressor::set_dictionary`.
-        //   - Both compress and decompress derive the same ID from the same bytes,
-        //     so the dict_id written into the frame header is consistent.
+        //   - Use the lower 32 bits of the xxh3 hash of `dict_raw`, clamped
+        //     to at least 1. (id=0 is rejected by `FrameCompressor::set_dictionary`
+        //     in structured-zstd.) This id is used INTERNALLY only — it is
+        //     stripped from the frame output before returning (see `strip_dict_id`).
+        //   - Stripping the id makes the frame format match the C API convention
+        //     (dictID=0 / absent for raw-content), enabling cross-backend
+        //     decompression (pure → C FFI and vice versa).
         let dict_key = xxhash_rust::xxh3::xxh3_64(dict_raw);
 
         TLS_COMPRESSOR.with(|cell| {
@@ -149,11 +217,11 @@ impl CompressionProvider for ZstdPureProvider {
                 } else {
                     #[expect(
                         clippy::cast_possible_truncation,
-                        reason = "intentional: lower 32 bits of xxh3 as dict id"
+                        reason = "intentional: lower 32 bits of xxh3 as internal dict id"
                     )]
                     let id = {
                         let h = dict_key as u32;
-                        h.max(1) // id=0 is invalid; collision probability is negligible
+                        h.max(1) // id=0 is rejected by set_dictionary; internal use only
                     };
                     Dictionary::from_raw_content(id, dict_raw.to_vec())
                         .map_err(|e| crate::Error::Io(std::io::Error::other(e)))?
@@ -200,8 +268,20 @@ impl CompressionProvider for ZstdPureProvider {
             compressor.set_drain(Vec::new());
             compressor.compress();
 
-            compressor.take_drain().ok_or_else(|| {
+            let compressed = compressor.take_drain().ok_or_else(|| {
                 crate::Error::Io(std::io::Error::other("drain missing after compress"))
+            })?;
+
+            // For raw-content dicts the pure backend internally assigns a
+            // synthetic non-zero dictID (structured-zstd rejects id=0).
+            // That ID is an implementation detail: strip it from the frame
+            // header so the output matches the C API convention of recording
+            // dictID=0 for raw-content dicts. This makes frames produced here
+            // decompressible by the C FFI backend and vice versa.
+            Ok(if is_raw_content {
+                strip_dict_id(compressed)
+            } else {
+                compressed
             })
         })
     }
@@ -234,6 +314,17 @@ impl CompressionProvider for ZstdPureProvider {
                 const { std::cell::RefCell::new(None) };
         }
 
+        // For raw-content dicts the compressed frame has no embedded dictID
+        // (stripped by `compress_with_dict`; the C FFI backend also omits it).
+        // `FrameDecoder::init` treats a missing or zero dictID as "no dict
+        // required" and skips dict lookup. We use `force_dict` after `init`
+        // to load the dict unconditionally for raw-content frames.
+        //
+        // For finalized dicts the frame embeds the dictID from the dict header;
+        // `init` loads the matching dict automatically. `decode_all_to_vec`
+        // handles this via the standard path.
+        let is_raw_content = !dict.raw().starts_with(&DICT_MAGIC);
+
         TLS_DECODER.with(|cell| {
             let mut state = cell.borrow_mut();
 
@@ -243,15 +334,21 @@ impl CompressionProvider for ZstdPureProvider {
                 // Mirror the format-detection logic in `compress_with_dict`:
                 // finalized dictionaries (magic `0x37A430EC`) are parsed with
                 // `decode_dict`; raw content bytes use `from_raw_content` with
-                // the same ID formula so the dict_id in the frame header matches.
+                // the same synthetic id formula as `compress_with_dict` so that
+                // `force_dict` can locate the dict in the internal dicts map.
                 let parsed = if dict.raw().starts_with(&DICT_MAGIC) {
                     Dictionary::decode_dict(dict.raw())
                         .map_err(|e| crate::Error::Io(std::io::Error::other(e)))?
                 } else {
-                    // `dict.id()` returns the raw lower 32 bits of xxh3, which
-                    // may theoretically be 0 (probability ≈ 1/2³²). Clamp to at
-                    // least 1 because id=0 is reserved in the zstd frame format.
-                    Dictionary::from_raw_content(dict.id().max(1), dict.raw().to_vec())
+                    #[expect(
+                        clippy::cast_possible_truncation,
+                        reason = "intentional: lower 32 bits of xxh3 as internal dict id"
+                    )]
+                    let raw_content_id = {
+                        let h = xxhash_rust::xxh3::xxh3_64(dict.raw()) as u32;
+                        h.max(1) // id=0 is rejected; used internally for force_dict keying
+                    };
+                    Dictionary::from_raw_content(raw_content_id, dict.raw().to_vec())
                         .map_err(|e| crate::Error::Io(std::io::Error::other(e)))?
                 };
                 let mut decoder = FrameDecoder::new();
@@ -268,57 +365,82 @@ impl CompressionProvider for ZstdPureProvider {
                 )));
             };
 
-            // `decode_all_to_vec` decodes the entire frame in one pass and
-            // appends to `output`. The dictionary stored in `decoder.dicts`
-            // is reused without re-parsing on every call.
-            //
-            // The `bounded_read` approach used by the non-dictionary path
-            // (`decompress`) is not applicable here: `bounded_read` calls
-            // `Read::read` in a loop, which requires the decoder to pull
-            // compressed blocks lazily from an internal reader reference.
-            // `StreamingDecoder` supports this (it holds a `&[u8]` reference);
-            // `FrameDecoder` does not — it processes the full slice at once
-            // and its `Read` impl returns 0 bytes after `init` if not used
-            // together with `decode_all_to_vec`.
-            //
-            // The capacity limit is therefore enforced by a post-decode check
-            // rather than during streaming. The allocation is bounded by the
-            // frame content size: zstd frames embed the decompressed size in
-            // their header, so allocations from crafted frames are bounded by
-            // that declared size. If the declared size itself is maliciously
-            // large, the post-decode check below returns `DecompressedSizeTooLarge`
-            // before the data is used.
-            let mut output = Vec::with_capacity(capacity);
-            decoder.decode_all_to_vec(data, &mut output).map_err(|e| {
-                // `decode_all_to_vec` uses the Vec's capacity as a hard
-                // allocation limit. When the frame's decompressed content
-                // would exceed that limit, it returns `TargetTooSmall`.
-                // Normalise this to `DecompressedSizeTooLarge` for a
-                // consistent error API with the C FFI backend.
-                if matches!(
-                    e,
-                    structured_zstd::decoding::errors::FrameDecoderError::TargetTooSmall
-                ) {
-                    crate::Error::DecompressedSizeTooLarge {
-                        declared: capacity as u64 + 1,
+            if is_raw_content {
+                // Raw-content dict path: frames have no embedded dictID
+                // (C API and post-strip pure frames both produce dictID=0).
+                // `decode_all_to_vec` calls `init` internally, which would
+                // skip dict loading for dictID=0. Instead, use the manual
+                // flow: `init` → `force_dict` → `decode_blocks` → `collect`.
+                //
+                // `force_dict` loads the dict unconditionally regardless of
+                // the frame's dictID field, handling both backends uniformly:
+                //   - Frame produced by C FFI backend (dictID=0 → no id): force_dict loads dict.
+                //   - Frame produced by new pure backend (dictID stripped → no id): same.
+                //   - Frame produced by old pure backend (dictID=synthetic): force_dict
+                //     re-loads same dict (idempotent, since init would already load it).
+                use structured_zstd::decoding::BlockDecodingStrategy;
+                let mut cursor = std::io::Cursor::new(data);
+                decoder
+                    .init(&mut cursor)
+                    .map_err(|e| crate::Error::Io(std::io::Error::other(e)))?;
+
+                // Derive the same synthetic id used in `add_dict` above.
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "intentional: lower 32 bits of xxh3 as internal dict id"
+                )]
+                let raw_content_id = {
+                    let h = xxhash_rust::xxh3::xxh3_64(dict.raw()) as u32;
+                    h.max(1)
+                };
+                decoder
+                    .force_dict(raw_content_id)
+                    .map_err(|e| crate::Error::Io(std::io::Error::other(e)))?;
+                decoder
+                    .decode_blocks(&mut cursor, BlockDecodingStrategy::All)
+                    .map_err(|e| crate::Error::Io(std::io::Error::other(e)))?;
+                let output = decoder.collect().ok_or_else(|| {
+                    crate::Error::Io(std::io::Error::other(
+                        "FrameDecoder produced no output for raw-content dict frame",
+                    ))
+                })?;
+                if output.len() > capacity {
+                    return Err(crate::Error::DecompressedSizeTooLarge {
+                        declared: output.len() as u64,
                         limit: capacity as u64,
-                    }
-                } else {
-                    crate::Error::Io(std::io::Error::other(e))
+                    });
                 }
-            })?;
-
-            // Return an error if the frame decompressed to more bytes than
-            // the caller declared. Matches the bounded behaviour of
-            // `decompress()` and the C FFI backend.
-            if output.len() > capacity {
-                return Err(crate::Error::DecompressedSizeTooLarge {
-                    declared: output.len() as u64,
-                    limit: capacity as u64,
-                });
+                Ok(output)
+            } else {
+                // Finalized dict path: the frame embeds the dictID from the
+                // dict header; `decode_all_to_vec` → `init` loads the matching
+                // dict automatically via the standard dictID lookup.
+                //
+                // The capacity limit is enforced by `decode_all_to_vec`: it
+                // pre-allocates exactly `capacity` bytes (via `Vec::with_capacity`)
+                // and `TargetTooSmall` is returned if the frame exceeds that.
+                let mut output = Vec::with_capacity(capacity);
+                decoder.decode_all_to_vec(data, &mut output).map_err(|e| {
+                    if matches!(
+                        e,
+                        structured_zstd::decoding::errors::FrameDecoderError::TargetTooSmall
+                    ) {
+                        crate::Error::DecompressedSizeTooLarge {
+                            declared: capacity as u64 + 1,
+                            limit: capacity as u64,
+                        }
+                    } else {
+                        crate::Error::Io(std::io::Error::other(e))
+                    }
+                })?;
+                if output.len() > capacity {
+                    return Err(crate::Error::DecompressedSizeTooLarge {
+                        declared: output.len() as u64,
+                        limit: capacity as u64,
+                    });
+                }
+                Ok(output)
             }
-
-            Ok(output)
         })
     }
 }

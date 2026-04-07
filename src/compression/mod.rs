@@ -2,12 +2,19 @@
 // This source code is licensed under both the Apache 2.0 and MIT License
 // (found in the LICENSE-* files in the repository)
 
-// Backend modules — only one is compiled based on feature flags.
-// When both `zstd` and `zstd-pure` are enabled, C FFI takes precedence.
+// Backend modules — only one is active at runtime based on feature flags.
+// When both `zstd` and `zstd-pure` are enabled, C FFI takes precedence as
+// the active `ZstdBackend`. The `zstd_pure` module is still compiled when
+// `zstd-pure` is enabled (regardless of `zstd`) so that its code and tests
+// remain visible to `cargo clippy --all-features` and cross-backend tests.
 #[cfg(feature = "zstd")]
 mod zstd_ffi;
 
-#[cfg(all(feature = "zstd-pure", not(feature = "zstd")))]
+// When both backends are compiled (--all-features), zstd_pure items are not
+// used in production (the FFI backend takes precedence) but must remain visible
+// for cross-backend interoperability tests.
+#[cfg(feature = "zstd-pure")]
+#[cfg_attr(all(feature = "zstd-pure", feature = "zstd"), allow(dead_code))]
 mod zstd_pure;
 
 use crate::coding::{Decode, Encode};
@@ -179,7 +186,8 @@ impl ZstdDictionary {
 
     /// Returns the full 64-bit xxh3 fingerprint used as a collision-resistant
     /// cache key inside the pure Rust backend's TLS decoder.
-    #[cfg(all(feature = "zstd-pure", not(feature = "zstd")))]
+    #[cfg(feature = "zstd-pure")]
+    #[cfg_attr(all(feature = "zstd-pure", feature = "zstd"), allow(dead_code))]
     #[must_use]
     pub(crate) fn id64(&self) -> u64 {
         self.id
@@ -584,5 +592,71 @@ mod tests {
             assert!(debug.contains("ZstdDictionary"));
             assert!(debug.contains("size: 4"));
         }
+    }
+}
+
+// Cross-backend interoperability tests.
+//
+// Verifies that frames produced by the pure Rust backend can be decompressed
+// by the C FFI backend (and vice versa) when using raw-content dictionaries.
+//
+// Both backends use dictID=0 for raw-content dicts:
+//   - FFI backend (libzstd):  always records dictID=0 for raw-content dicts.
+//   - Pure backend (structured-zstd): now also uses dictID=0, matching the
+//     C API convention so that frames are mutually decompressible.
+//
+// Only compiled when BOTH `zstd` (C FFI) and `zstd-pure` features are active.
+#[cfg(all(test, feature = "zstd", feature = "zstd-pure"))]
+#[allow(clippy::unwrap_used, clippy::expect_used, reason = "test code")]
+mod cross_backend_interop_tests {
+    use super::zstd_ffi::ZstdFfiProvider;
+    use super::zstd_pure::ZstdPureProvider;
+    use super::{CompressionProvider, ZstdDictionary};
+    use test_log::test;
+
+    // Raw-content dictionary: must NOT start with the zstd finalized-dict magic
+    // (0x37, 0xA4, 0x30, 0xEC), so both backends treat it as bare LZ77 history.
+    const RAW_DICT: &[u8] = b"the quick brown fox jumps over the lazy dog. \
+        the quick brown fox jumps over the lazy dog. \
+        key-00042 value-00042 key-00043 value-00043 ";
+
+    const PLAINTEXT: &[u8] = b"key-00042 value-00042 key-00043 value-00043";
+
+    #[test]
+    fn pure_compress_ffi_decompress_raw_content_dict_roundtrip() {
+        // Pure backend writes dictID=0 in the frame (raw-content convention).
+        // FFI decompressor loads the same bytes as a raw-content DDict with
+        // id=0. IDs match, so decompression succeeds.
+        let compressed = ZstdPureProvider::compress_with_dict(PLAINTEXT, 3, RAW_DICT)
+            .expect("pure compress_with_dict should succeed");
+
+        let dict = ZstdDictionary::new(RAW_DICT);
+        let decompressed =
+            ZstdFfiProvider::decompress_with_dict(&compressed, &dict, PLAINTEXT.len() * 4)
+                .expect("ffi decompress must succeed: pure→FFI raw-content dict cross-backend");
+
+        assert_eq!(
+            decompressed, PLAINTEXT,
+            "pure→FFI round-trip with raw-content dict must return original plaintext"
+        );
+    }
+
+    #[test]
+    fn ffi_compress_pure_decompress_raw_content_dict_roundtrip() {
+        // FFI backend records dictID=0 in the frame (C API convention).
+        // Pure backend loads the same bytes as a raw-content Dictionary with
+        // id=0. IDs match, so decompression succeeds.
+        let compressed = ZstdFfiProvider::compress_with_dict(PLAINTEXT, 3, RAW_DICT)
+            .expect("ffi compress_with_dict should succeed");
+
+        let dict = ZstdDictionary::new(RAW_DICT);
+        let decompressed =
+            ZstdPureProvider::decompress_with_dict(&compressed, &dict, PLAINTEXT.len() * 4)
+                .expect("pure decompress must succeed: FFI→pure raw-content dict cross-backend");
+
+        assert_eq!(
+            decompressed, PLAINTEXT,
+            "FFI→pure round-trip with raw-content dict must return original plaintext"
+        );
     }
 }
