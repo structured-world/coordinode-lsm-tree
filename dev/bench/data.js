@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1775490445575,
+  "lastUpdate": 1775579071739,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -5538,6 +5538,84 @@ window.BENCHMARK_DATA = {
             "value": 237371.20820738518,
             "unit": "ops/sec (normalized)",
             "extra": "raw: 421595 ops/sec | factor: 0.563 | P50: 2.2us | P99: 4.5us | P99.9: 14.8us\nthreads: 1 | elapsed: 0.47s | num: 200000 | iterations: 3 | runner: seq_wr=227551 rand_rd=878991 cpu=123 composite=40850.3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "ab61d33f93764e719ef398bd122aaae5f031cf84",
+          "message": "perf(compression): cache pre-compiled Dictionary across block decompress calls (#227)\n\n## Summary\n\n- **C FFI backend**: `DecoderDictionary<'static>` (wraps `ZSTD_DDict`)\nis now cached in `ZstdDictionary` via `Arc<OnceLock<...>>` — parsed once\nper process, shared across all clones of the same dictionary handle,\nzero re-parsing on subsequent blocks\n- **Pure Rust backend**: `FrameDecoder` with dictionary pre-loaded is\ncached in thread-local storage keyed by `dict_id` — parsed once per\nthread, no mutex needed (`FrameDecoder` is `!Send`)\n- **Correctness fix**: latent bug in pure Rust `decompress_with_dict` —\nwas calling `init(data)` on a `Copy` slice (only read the frame header;\ndecode buffer stayed empty, always returning `Ok([])`); replaced with\n`decode_all_to_vec(&mut input)` which fully decodes the frame\n\n## Changes\n\n| File | Change |\n|------|--------|\n| `src/compression/mod.rs` | Add `prepared:\nArc<OnceLock<DecoderDictionary<'static>>>` to `ZstdDictionary`; add\n`decoder_dict()` accessor; change `decompress_with_dict` signature to\ntake `&ZstdDictionary` |\n| `src/compression/zstd_ffi.rs` | Use\n`Decompressor::with_prepared_dictionary(dict.decoder_dict())` — no more\nper-call `ZSTD_createDDict` |\n| `src/compression/zstd_pure.rs` | TLS-cached `FrameDecoder`; fix\ncorrectness bug; add unit tests with pre-generated test vectors |\n| `src/table/block/mod.rs` | Update 4 `decompress_with_dict` call sites\nto pass `&dict` instead of `dict.raw()` |\n| `benches/zstd_dict.rs` | New: warm/cold per-block latency benchmarks |\n\n## Test Plan\n\n- [x] `cargo clippy --features zstd --all-targets -- -D warnings` —\nclean\n- [x] `cargo clippy --features zstd-pure --all-targets -- -D warnings` —\nclean\n- [x] `cargo nextest run --features zstd --workspace` — 1168/1168 passed\n- [x] `cargo nextest run --features zstd-pure --workspace` — 1157/1157\npassed\n- [x] `cargo test --doc --workspace` — 41/41 passed\n- [x] `cargo build --bench zstd_dict --features zstd` — compiles\n- [x] `cargo build --bench zstd_dict --features zstd-pure` — compiles\n\nCloses #217\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n## Summary by CodeRabbit\n\n* **Tests**\n* Added a benchmark to measure decompression performance using zstd\ndictionaries.\n\n* **Refactor**\n* Improved compression API to use dictionary objects and enable internal\ndictionary caching for better decompression efficiency.\n* Compression module is now hidden from generated public documentation.\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-04-07T19:23:06+03:00",
+          "tree_id": "671c6d588a6a9d0b0d5a37cb33f0872f0b2403ad",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/ab61d33f93764e719ef398bd122aaae5f031cf84"
+        },
+        "date": 1775579070317,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 975651.9888312398,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 1950308 ops/sec | factor: 0.500 | P50: 0.4us | P99: 1.9us | P99.9: 3.8us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3 | runner: seq_wr=336033 rand_rd=912806 cpu=117 composite=45976.5"
+          },
+          {
+            "name": "fillrandom",
+            "value": 406973.1839685128,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 813531 ops/sec | factor: 0.500 | P50: 1.0us | P99: 3.2us | P99.9: 7.7us\nthreads: 1 | elapsed: 0.25s | num: 200000 | iterations: 3 | runner: seq_wr=336033 rand_rd=912806 cpu=117 composite=45976.5"
+          },
+          {
+            "name": "readrandom",
+            "value": 216828.27312077183,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 433435 ops/sec | factor: 0.500 | P50: 2.1us | P99: 5.3us | P99.9: 10.7us\nthreads: 1 | elapsed: 0.46s | num: 200000 | iterations: 3 | runner: seq_wr=336033 rand_rd=912806 cpu=117 composite=45976.5"
+          },
+          {
+            "name": "readseq",
+            "value": 1592085.0741692944,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 3182545 ops/sec | factor: 0.500 | P50: 0.2us | P99: 3.6us | P99.9: 6.4us\nthreads: 1 | elapsed: 0.06s | num: 200000 | iterations: 3 | runner: seq_wr=336033 rand_rd=912806 cpu=117 composite=45976.5"
+          },
+          {
+            "name": "seekrandom",
+            "value": 161998.50086642226,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 323832 ops/sec | factor: 0.500 | P50: 2.8us | P99: 6.0us | P99.9: 11.8us\nthreads: 1 | elapsed: 0.62s | num: 200000 | iterations: 3 | runner: seq_wr=336033 rand_rd=912806 cpu=117 composite=45976.5"
+          },
+          {
+            "name": "prefixscan",
+            "value": 110686.30460405447,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 221260 ops/sec | factor: 0.500 | P50: 4.2us | P99: 5.7us | P99.9: 12.3us\nthreads: 1 | elapsed: 0.90s | num: 200000 | iterations: 3 | runner: seq_wr=336033 rand_rd=912806 cpu=117 composite=45976.5"
+          },
+          {
+            "name": "overwrite",
+            "value": 386202.50549860875,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 772011 ops/sec | factor: 0.500 | P50: 1.0us | P99: 3.6us | P99.9: 8.5us\nthreads: 1 | elapsed: 0.26s | num: 200000 | iterations: 3 | runner: seq_wr=336033 rand_rd=912806 cpu=117 composite=45976.5"
+          },
+          {
+            "name": "mergerandom",
+            "value": 380260.6261186645,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 760133 ops/sec | factor: 0.500 | P50: 0.4us | P99: 0.7us | P99.9: 3.7us\nthreads: 1 | elapsed: 0.26s | num: 200000 | iterations: 3 | runner: seq_wr=336033 rand_rd=912806 cpu=117 composite=45976.5"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 185713.20211867147,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 371237 ops/sec | factor: 0.500 | P50: 2.5us | P99: 4.9us | P99.9: 11.1us\nthreads: 1 | elapsed: 0.54s | num: 200000 | iterations: 3 | runner: seq_wr=336033 rand_rd=912806 cpu=117 composite=45976.5"
           }
         ]
       }
