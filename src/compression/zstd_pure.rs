@@ -16,6 +16,14 @@
 use super::CompressionProvider;
 use std::io::Read;
 
+/// Zstd finalized dictionary magic number (little-endian `0x37A4_30EC`).
+///
+/// A dictionary blob that begins with these four bytes is a fully trained,
+/// finalized zstd dictionary containing entropy tables and must be parsed
+/// with [`Dictionary::decode_dict`]. A blob without this prefix is treated
+/// as raw content and is loaded via [`Dictionary::from_raw_content`].
+const DICT_MAGIC: [u8; 4] = [0x37, 0xA4, 0x30, 0xEC];
+
 /// Read at most `capacity` bytes from `reader` into a pre-allocated buffer,
 /// then probe for excess data. Returns the filled portion of the buffer.
 ///
@@ -127,7 +135,6 @@ impl CompressionProvider for ZstdPureProvider {
         //     id=0 is rejected by `FrameCompressor::set_dictionary`.
         //   - Both compress and decompress derive the same ID from the same bytes,
         //     so the dict_id written into the frame header is consistent.
-        const DICT_MAGIC: [u8; 4] = [0x37, 0xA4, 0x30, 0xEC];
         let dict_key = xxhash_rust::xxh3::xxh3_64(dict_raw);
 
         TLS_COMPRESSOR.with(|cell| {
@@ -237,7 +244,6 @@ impl CompressionProvider for ZstdPureProvider {
                 // finalized dictionaries (magic `0x37A430EC`) are parsed with
                 // `decode_dict`; raw content bytes use `from_raw_content` with
                 // the same ID formula so the dict_id in the frame header matches.
-                const DICT_MAGIC: [u8; 4] = [0x37, 0xA4, 0x30, 0xEC];
                 let parsed = if dict.raw().starts_with(&DICT_MAGIC) {
                     Dictionary::decode_dict(dict.raw())
                         .map_err(|e| crate::Error::Io(std::io::Error::other(e)))?
