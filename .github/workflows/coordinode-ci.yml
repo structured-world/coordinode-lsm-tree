@@ -59,6 +59,26 @@ jobs:
         working-directory: tools/db_bench
         run: cargo check --all-features
 
+  test-zstd-pure:
+    needs: lint
+    timeout-minutes: 15
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: ubuntu-cargo-zstd-pure
+      - uses: taiki-e/install-action@nextest
+      - name: Run tests (zstd-pure backend, no C zstd)
+        # zstd_pure_dict integration tests are gated with
+        # #[cfg(all(feature = "zstd-pure", not(feature = "zstd")))], so they
+        # are skipped by --all-features. Run without "zstd" to exercise the
+        # pure Rust dictionary compression path independently.
+        run: cargo nextest run --profile ci --no-default-features --features zstd-pure,lz4
+
   cross:
     needs: lint
     timeout-minutes: 15

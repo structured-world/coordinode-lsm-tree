@@ -176,10 +176,9 @@ impl CompressionProvider for ZstdPureProvider {
                     Dictionary::decode_dict(dict.raw())
                         .map_err(|e| crate::Error::Io(std::io::Error::other(e)))?
                 } else {
-                    // `dict.id()` already returns u32 (lower 32 bits of xxh3).
-                    // Clamp to 1 because id=0 is rejected by `add_dict`.
-                    let id = dict.id().max(1);
-                    Dictionary::from_raw_content(id, dict.raw().to_vec())
+                    // `dict.id()` already returns a normalized non-zero u32
+                    // (lower 32 bits of xxh3, clamped to 1); use it directly.
+                    Dictionary::from_raw_content(dict.id(), dict.raw().to_vec())
                         .map_err(|e| crate::Error::Io(std::io::Error::other(e)))?
                 };
                 let mut decoder = FrameDecoder::new();

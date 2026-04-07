@@ -35,12 +35,13 @@ pub trait CompressionProvider {
     /// Decompress a zstd frame, pre-allocating `capacity` bytes.
     fn decompress(data: &[u8], capacity: usize) -> crate::Result<Vec<u8>>;
 
-    /// Compress `data` using a pre-trained, finalized zstd dictionary.
+    /// Compress `data` using a zstd dictionary.
     ///
-    /// `dict_raw` must be a finalized zstd dictionary (magic `0x37A430EC` header,
-    /// entropy tables, content) — the same format produced by `zstd --train` and
-    /// by [`ZstdDictionary::raw`]. Both the C FFI backend and the pure Rust backend
-    /// support this format.
+    /// `dict_raw` may be either a finalized zstd dictionary (magic `0x37A430EC`
+    /// header, entropy tables, content — produced by `zstd --train` or
+    /// [`ZstdDictionary::raw`]) or a raw content dictionary (bare bytes used as
+    /// LZ77 history). Both the C FFI backend and the pure Rust backend accept
+    /// either representation.
     fn compress_with_dict(data: &[u8], level: i32, dict_raw: &[u8]) -> crate::Result<Vec<u8>>;
 
     /// Decompress a zstd frame that was compressed with a dictionary.
@@ -154,18 +155,25 @@ impl ZstdDictionary {
             .get_or_init(|| zstd::dict::DecoderDictionary::copy(&self.raw))
     }
 
-    /// Returns a 32-bit dictionary fingerprint (lower 32 bits of xxh3).
+    /// Returns a normalized 32-bit dictionary fingerprint (lower 32 bits of
+    /// xxh3, clamped to 1).
     ///
-    /// Intended for display and external interop (e.g., matching against the
-    /// dict ID embedded in a zstd frame header). For internal cache keying
-    /// use [`id64`](ZstdDictionary::id64) to avoid hash collisions.
+    /// The ID is always ≥ 1 because zstd dict ID 0 means "no dictionary".
+    /// All callers — config validation, `CompressionType::ZstdDict`, and the
+    /// frame encoder/decoder — must use this method so that stored metadata and
+    /// frame headers agree on the same value.
+    ///
+    /// For internal cache keying use [`id64`](ZstdDictionary::id64) to avoid
+    /// hash collisions.
     #[must_use]
     #[expect(
         clippy::cast_possible_truncation,
         reason = "intentional: public API returns 32-bit fingerprint"
     )]
     pub fn id(&self) -> u32 {
-        self.id as u32
+        // id=0 means "no dictionary" in the zstd frame format; clamp to 1 so
+        // metadata, config validation, and frame headers all see the same value.
+        (self.id as u32).max(1)
     }
 
     /// Returns the full 64-bit xxh3 fingerprint used as a collision-resistant

@@ -275,11 +275,14 @@ mod zstd_pure_dict {
     };
     use std::sync::Arc;
 
-    /// Build a synthetic dictionary from repetitive sample data.
+    /// Build a raw-content dictionary from repetitive sample data.
     ///
-    /// Uses a training corpus similar to the C-backend tests so the dictionary
-    /// is meaningful (repeated key/value patterns) and exercises the entropy
-    /// table seeding path in `FrameCompressor::set_dictionary_from_bytes`.
+    /// Uses a corpus similar to the C-backend tests so the dictionary content is
+    /// meaningful (repeated key/value patterns). `ZstdDictionary::new(&samples)`
+    /// creates a raw-content dictionary here (no finalized-dictionary magic
+    /// header), so this helper covers the raw-content compression path in the
+    /// pure Rust backend. For the finalized-dictionary path see
+    /// `pure_finalized_dict_roundtrip`.
     fn make_test_dictionary() -> ZstdDictionary {
         let mut samples = Vec::new();
         for i in 0u32..500 {
@@ -437,6 +440,57 @@ mod zstd_pure_dict {
             ),
             "expected ZstdDictMismatch with got=None",
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn pure_finalized_dict_roundtrip() -> lsm_tree::Result<()> {
+        // Exercises the `Dictionary::decode_dict` path in the pure Rust backend.
+        //
+        // A finalized zstd dictionary (magic `0x37A430EC`, entropy tables,
+        // content) is passed to `ZstdDictionary::new`. The pure backend detects
+        // the magic prefix and calls `decode_dict` rather than `from_raw_content`,
+        // exercising a different code path from the raw-content tests above.
+        //
+        // Dict bytes: produced by `zstd::dict::from_continuous` on a small corpus
+        // (the same fixture used by the unit tests in `src/compression/zstd_pure.rs`).
+        const FINALIZED_DICT: &[u8] = &[
+            55, 164, 48, 236, 98, 64, 12, 7, 42, 16, 120, 62, 7, 204, 192, 51, 240, 12, 60, 3, 207,
+            192, 51, 240, 12, 60, 3, 207, 192, 51, 24, 17, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 128, 48, 165, 148, 2, 227, 76, 8, 33, 132, 16, 66, 136, 136, 136, 60, 84, 160, 64,
+            65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65,
+            65, 65, 65, 193, 231, 162, 40, 138, 162, 40, 138, 162, 40, 165, 148, 82, 74, 169, 170,
+            234, 1, 100, 160, 170, 193, 96, 48, 24, 12, 6, 131, 193, 96, 48, 12, 195, 48, 12, 195,
+            48, 12, 195, 48, 198, 24, 99, 140, 153, 29, 1, 0, 0, 0, 4, 0, 0, 0, 8, 0, 0, 0, 3, 3,
+            3, 3, 3, 3, 3, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+            1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2,
+        ];
+
+        let dir = tempfile::tempdir()?;
+        let dict = ZstdDictionary::new(FINALIZED_DICT);
+        let compression = CompressionType::zstd_dict(3, dict.id())?;
+
+        let tree = make_config(dir.path())
+            .data_block_compression_policy(CompressionPolicy::all(compression))
+            .zstd_dictionary(Some(Arc::new(dict.clone())))
+            .open()?;
+
+        for i in 0u32..50 {
+            let key = format!("key-{i:05}");
+            let val = format!("value-{i:05}");
+            tree.insert(key.as_bytes(), val.as_bytes(), i.into());
+        }
+        tree.flush_active_memtable(0)?;
+
+        for i in 0u32..50 {
+            let key = format!("key-{i:05}");
+            let expected = format!("value-{i:05}");
+            let got = tree
+                .get(key.as_bytes(), lsm_tree::MAX_SEQNO)?
+                .expect("key should exist");
+            assert_eq!(got.as_ref(), expected.as_bytes(), "mismatch at key {key}");
+        }
 
         Ok(())
     }
