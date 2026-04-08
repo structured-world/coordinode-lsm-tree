@@ -708,6 +708,52 @@ mod tests {
     }
 
     #[test]
+    fn compress_with_dict_raw_content_empty_plaintext_roundtrips_at_capacity_one() {
+        // Regression: empty plaintext with a raw-content (non-finalized) dictionary
+        // must round-trip when capacity=1. The raw-content path goes through
+        // `decode_raw_content_bounded`; this smoke test ensures it handles an empty
+        // frame correctly (FCS=0, so the bomb-check is skipped before we enter the
+        // loop).
+        let raw_dict = b"raw content dictionary for empty payload smoke test";
+        let dict = ZstdDictionary::new(raw_dict);
+
+        let compressed = ZstdPureProvider::compress_with_dict(&[], 3, raw_dict)
+            .expect("compression of empty payload with raw-content dict should succeed");
+
+        let decompressed = ZstdPureProvider::decompress_with_dict(&compressed, &dict, 1).expect(
+            "decompression of empty payload with raw-content dict (capacity=1) should succeed",
+        );
+
+        assert!(
+            decompressed.is_empty(),
+            "decompressed output of empty payload must be empty; got {decompressed:?}"
+        );
+    }
+
+    #[test]
+    fn compress_with_dict_raw_content_empty_plaintext_roundtrips_at_exact_capacity() {
+        // Regression: empty plaintext with a raw-content dictionary must succeed even
+        // when capacity=0 (exact capacity for 0-byte output). The `remaining==0`
+        // early-return inside `decode_raw_content_bounded` must not fire before the
+        // decoder has had a chance to read the final (empty) block and mark the
+        // frame as finished.
+        let raw_dict = b"raw content dictionary for empty payload exact-capacity test";
+        let dict = ZstdDictionary::new(raw_dict);
+
+        let compressed = ZstdPureProvider::compress_with_dict(&[], 3, raw_dict)
+            .expect("compression of empty payload with raw-content dict should succeed");
+
+        let decompressed = ZstdPureProvider::decompress_with_dict(&compressed, &dict, 0).expect(
+            "decompression of empty payload with raw-content dict (capacity=0) should succeed",
+        );
+
+        assert!(
+            decompressed.is_empty(),
+            "decompressed output of empty payload must be empty; got {decompressed:?}"
+        );
+    }
+
+    #[test]
     fn decompress_with_dict_raw_content_rejects_frame_exceeding_capacity() {
         // Raw-content dict path: the frame is produced by the pure backend with a
         // raw-content (non-finalized) dictionary. The decompressor must return
