@@ -126,8 +126,12 @@ fn strip_dict_id(frame: Vec<u8>) -> Vec<u8> {
         out.extend_from_slice(magic); // Frame magic
     }
     out.push(new_fhd); // Modified FHD
-    if !single_segment && let Some(&wd) = frame.get(5) {
-        out.push(wd); // Window_Descriptor (pass through)
+    if !single_segment {
+        // Window_Descriptor is present at byte 5 when !single_segment.
+        // frame.len() >= dict_id_start + dict_id_len >= 7 when !single_segment (wd_len=1).
+        if let Some(&wd) = frame.get(5) {
+            out.push(wd);
+        }
     }
     // Skip the Dict_ID bytes; copy the rest (FCS + blocks + optional checksum).
     if let Some(rest) = frame.get(dict_id_start + dict_id_len..) {
@@ -530,11 +534,9 @@ impl CompressionProvider for ZstdPureProvider {
                 *state = Some((dict.id64(), decoder));
             }
 
+            // Unreachable: the branch above always initialises `state`.
             let Some((_, decoder)) = state.as_mut() else {
-                // Unreachable: the branch above always initialises `state`.
-                return Err(crate::Error::Io(std::io::Error::other(
-                    "TLS_DECODER unexpectedly empty after initialisation",
-                )));
+                unreachable!("TLS_DECODER always initialised above");
             };
 
             do_decompress_with_dict(decoder, data, dict.raw(), capacity, is_raw_content)
@@ -767,6 +769,102 @@ mod tests {
         assert!(
             matches!(result, Err(crate::Error::DecompressedSizeTooLarge { .. })),
             "capacity=0 with non-empty frame must return DecompressedSizeTooLarge; got {result:?}",
+        );
+    }
+
+    // --- strip_dict_id unit tests ---
+    //
+    // These tests call `strip_dict_id` directly with crafted frame byte sequences
+    // to cover branches that are unreachable via normal compress_with_dict calls
+    // (e.g., frames that are too short, have no dict_id, or use narrow dict_id
+    // encodings). `strip_dict_id` only reads the header region, so the crafted
+    // frames do not need valid block data.
+
+    #[test]
+    fn strip_dict_id_unchanged_if_frame_too_short() {
+        // Frames shorter than 5 bytes cannot contain a Frame_Header_Descriptor —
+        // the function must return the input unchanged.
+        let short = vec![0x28_u8, 0xB5, 0x2F];
+        assert_eq!(strip_dict_id(short.clone()), short);
+    }
+
+    #[test]
+    fn strip_dict_id_unchanged_if_no_dict_id_flag() {
+        // FHD = 0x20: single_segment=1 (bit5), dict_id_flag=0 (bits[1:0]).
+        // No Dict_ID field present — frame must be returned unchanged.
+        let frame = vec![0x28_u8, 0xB5, 0x2F, 0xFD, 0x20, 0xAA];
+        assert_eq!(strip_dict_id(frame.clone()), frame);
+    }
+
+    #[test]
+    fn strip_dict_id_removes_1byte_dict_id() {
+        // FHD = 0x21: single_segment=1, dict_id_flag=1 → 1-byte Dict_ID.
+        // Frame layout: magic(4) + FHD(1) + dict_id(1) + rest(1) = 7 bytes.
+        let frame = vec![0x28_u8, 0xB5, 0x2F, 0xFD, 0x21, 0x42, 0xFF];
+        let stripped = strip_dict_id(frame);
+        // Expect: magic + FHD (bits[1:0] cleared) + rest; dict_id byte removed.
+        assert_eq!(stripped, vec![0x28_u8, 0xB5, 0x2F, 0xFD, 0x20, 0xFF]);
+    }
+
+    #[test]
+    fn strip_dict_id_removes_2byte_dict_id() {
+        // FHD = 0x22: single_segment=1, dict_id_flag=2 → 2-byte Dict_ID.
+        // Frame layout: magic(4) + FHD(1) + dict_id(2) + rest(1) = 8 bytes.
+        let frame = vec![0x28_u8, 0xB5, 0x2F, 0xFD, 0x22, 0x01, 0x02, 0xFF];
+        let stripped = strip_dict_id(frame);
+        // Expect: magic + FHD (bits[1:0] cleared) + rest; 2 dict_id bytes removed.
+        assert_eq!(stripped, vec![0x28_u8, 0xB5, 0x2F, 0xFD, 0x20, 0xFF]);
+    }
+
+    #[test]
+    fn strip_dict_id_unchanged_if_malformed_too_short_for_dict_id() {
+        // FHD = 0x21 claims a 1-byte dict_id at byte 5, but only 5 bytes total —
+        // frame is malformed and must be returned unchanged.
+        let frame = vec![0x28_u8, 0xB5, 0x2F, 0xFD, 0x21]; // only 5 bytes
+        assert_eq!(strip_dict_id(frame.clone()), frame);
+    }
+
+    #[test]
+    fn strip_dict_id_preserves_window_descriptor_in_multi_segment_frame() {
+        // FHD = 0x03: single_segment=0 (bit5 clear), dict_id_flag=3 → 4-byte Dict_ID.
+        // Frame layout: magic(4) + FHD(1) + WD(1) + dict_id(4) + rest(1) = 11 bytes.
+        let frame = vec![
+            0x28_u8, 0xB5, 0x2F, 0xFD, // magic
+            0x03, // FHD: single_segment=0, dict_id_flag=3
+            0x70, // Window_Descriptor
+            0x01, 0x02, 0x03, 0x04, // 4-byte Dict_ID
+            0xFF, // rest
+        ];
+        let stripped = strip_dict_id(frame);
+        // Expect: magic + FHD (bits[1:0] cleared to 0x00) + WD (preserved) + rest.
+        assert_eq!(stripped, vec![0x28_u8, 0xB5, 0x2F, 0xFD, 0x00, 0x70, 0xFF]);
+    }
+
+    #[test]
+    fn decompress_with_dict_returns_error_on_corrupt_finalized_frame() {
+        // Corrupt input must return an error on the finalized dict path.
+        // Exercises the Io error branch in do_decompress_with_dict when
+        // decode_all_to_vec returns a non-TargetTooSmall decode failure.
+        let dict = ZstdDictionary::new(DICT);
+        let corrupt = b"not a valid zstd frame at all";
+        let result = ZstdPureProvider::decompress_with_dict(corrupt, &dict, 1024);
+        assert!(
+            result.is_err(),
+            "corrupt frame must return an error on finalized dict path; got {result:?}",
+        );
+    }
+
+    #[test]
+    fn decompress_with_dict_returns_error_on_corrupt_raw_content_frame() {
+        // Corrupt input must return an error on the raw-content dict path.
+        // Exercises the init() error branch in do_decompress_with_dict.
+        let raw_dict = b"some raw content dictionary bytes";
+        let dict = ZstdDictionary::new(raw_dict);
+        let corrupt = b"not a valid zstd frame at all";
+        let result = ZstdPureProvider::decompress_with_dict(corrupt, &dict, 1024);
+        assert!(
+            result.is_err(),
+            "corrupt frame must return an error on raw-content dict path; got {result:?}",
         );
     }
 }
