@@ -119,8 +119,9 @@ jobs:
       - uses: taiki-e/install-action@nextest
       # proptest cases: 32 hardcoded in ProptestConfig
       - run: cargo +nightly llvm-cov --no-report nextest --all-features
-      # zstd feature: run separately to exercise dictionary-compression paths
-      # not covered by --all-features (which uses the same zstd backend).
+      # zstd feature: run with a narrower feature set (zstd + lz4, no defaults)
+      # to validate the zstd backend in isolation. --all-features already enables
+      # zstd (zstd-pure is an alias), so this step covers the non-default path.
       - run: cargo +nightly llvm-cov --no-report nextest --no-default-features --features zstd,lz4
       - run: cargo +nightly llvm-cov --no-report --doc --features lz4
       - run: cargo +nightly llvm-cov report --doctests --lcov --output-path lcov.info

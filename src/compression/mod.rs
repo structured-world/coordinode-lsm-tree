@@ -27,11 +27,12 @@ pub trait CompressionProvider {
 
     /// Compress `data` using a zstd dictionary.
     ///
-    /// `dict_raw` may be either a finalized zstd dictionary (magic `0x37A430EC`
-    /// header, entropy tables, content — produced by `zstd --train` or
-    /// [`ZstdDictionary::raw`]) or a raw content dictionary (bare bytes used as
-    /// LZ77 history). The zstd backend in this crate accepts either
-    /// representation.
+    /// `dict_raw` may be either a finalized zstd dictionary (header bytes
+    /// `37 A4 30 EC`, i.e. little-endian integer `0xEC30A437`, followed by
+    /// entropy tables and content — produced by `zstd --train`; accessible
+    /// via [`ZstdDictionary::raw`] for persistence and interop) or raw content
+    /// bytes (bare bytes used as LZ77 history). The zstd backend in this crate
+    /// accepts either representation.
     fn compress_with_dict(data: &[u8], level: i32, dict_raw: &[u8]) -> crate::Result<Vec<u8>>;
 
     /// Decompress a zstd frame that was compressed with a dictionary.

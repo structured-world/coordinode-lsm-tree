@@ -176,7 +176,7 @@ fn decode_raw_content_bounded(
             }
             let prev_len = output.len();
             output.resize(new_len, 0u8);
-            // SAFETY: output was just resized to new_len (= prev_len + can), so
+            // Invariant: output was just resized to new_len (= prev_len + can), so
             // prev_len.. is always a valid slice. This cannot fail.
             let dest = output
                 .get_mut(prev_len..)
@@ -341,7 +341,7 @@ impl CompressionProvider for ZstdPureProvider {
         //
         // Two dictionary formats are supported:
         //
-        // 1. **Finalized zstd dictionary** (magic `0x37A430EC` prefix): produced by
+        // 1. **Finalized zstd dictionary** (magic bytes `37 A4 30 EC` prefix): produced by
         //    `zstd --train` / `zstd::dict::from_continuous` and the C zstd library.
         //    Contains entropy tables (Huffman + FSE) that prime the compressor's
         //    coding state for better ratios. Parsed via `Dictionary::decode_dict`.
@@ -497,7 +497,7 @@ impl CompressionProvider for ZstdPureProvider {
             // the dictionary has changed (different id64 → different table).
             if !matches!(&*state, Some((id, _)) if *id == dict.id64()) {
                 // Mirror the format-detection logic in `compress_with_dict`:
-                // finalized dictionaries (magic `0x37A430EC`) are parsed with
+                // finalized dictionaries (magic bytes `37 A4 30 EC`) are parsed with
                 // `decode_dict`; raw content bytes use `from_raw_content` with
                 // the same synthetic id formula as `compress_with_dict` so that
                 // `force_dict` can locate the dict in the internal dicts map.

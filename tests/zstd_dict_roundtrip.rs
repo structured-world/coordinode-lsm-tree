@@ -257,7 +257,7 @@ mod zstd_dict {
 
         assert!(
             tree.table_count() >= 3,
-            "expected at least 3 L0 SSTs before compaction; got {}",
+            "expected at least 3 tables before compaction; got {}",
             tree.table_count()
         );
 
