@@ -141,15 +141,16 @@ fn decode_raw_content_bounded(
         let remaining = capacity.saturating_sub(output.len());
 
         if !decoder.is_finished() {
-            if remaining == 0 {
-                // Frame is still producing data but the budget is exhausted.
-                return Err(crate::Error::DecompressedSizeTooLarge {
-                    declared: capacity as u64 + 1,
-                    limit: capacity as u64,
-                });
-            }
+            // Use `remaining.max(1)` so the decoder advances past empty frames even
+            // when `capacity == 0` (remaining would be 0 before any blocks are
+            // decoded). For non-empty frames `can_collect()` will be > 0 after this
+            // call and the size guard below rejects them; for empty frames the
+            // decoder marks itself finished with 0 bytes collectible.
             decoder
-                .decode_blocks(&mut *cursor, BlockDecodingStrategy::UptoBytes(remaining))
+                .decode_blocks(
+                    &mut *cursor,
+                    BlockDecodingStrategy::UptoBytes(remaining.max(1)),
+                )
                 .map_err(|e| crate::Error::Io(std::io::Error::other(e)))?;
         }
 
