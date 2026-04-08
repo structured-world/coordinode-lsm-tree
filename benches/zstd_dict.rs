@@ -4,9 +4,16 @@
 
 //! Benchmark: per-block zstd dictionary decompression latency.
 //!
-//! Measures the cost of `decompress_with_dict` for a single compressed block,
-//! both cold (first call, dictionary not yet cached in the backend's TLS /
-//! `OnceLock`) and warm (subsequent calls, dictionary already cached).
+//! Measures the cost of `decompress_with_dict` for a single compressed block.
+//! Two scenarios are covered:
+//!
+//! - **`warm`** — steady-state per-block cost with a long-lived `ZstdDictionary`
+//!   handle; the TLS `FrameDecoder` is pre-populated before timing starts.
+//! - **`tls_hit`** — each iteration receives a *fresh* `ZstdDictionary` handle,
+//!   but because all iterations share the same dictionary bytes (same xxh3 hash
+//!   key), the thread-local `FrameDecoder` remains cached across iterations.
+//!   This measures the steady-state per-block cost when callers reconstruct the
+//!   handle on every operation.
 //!
 //! Run with:
 //!

@@ -16,7 +16,8 @@
 use super::CompressionProvider;
 use std::io::Read;
 
-/// Zstd finalized dictionary magic number (little-endian `0x37A4_30EC`).
+/// Zstd finalized dictionary magic number (bytes `37 A4 30 EC`,
+/// little-endian `0xEC30_A437`).
 ///
 /// A dictionary blob that begins with these four bytes is a fully trained,
 /// finalized zstd dictionary containing entropy tables and must be parsed
@@ -935,29 +936,34 @@ mod tests {
 
     #[test]
     fn decompress_with_dict_returns_error_on_corrupt_finalized_frame() {
-        // Corrupt input must return an error on the finalized dict path.
-        // Exercises the Io error branch in do_decompress_with_dict when
-        // decode_all_to_vec returns a non-TargetTooSmall decode failure.
+        // Build a real compressed frame, then truncate it to force a decode
+        // failure on the finalized-dict path.  Exercises the Io error branch in
+        // do_decompress_with_dict when decode_all_to_vec fails.
         let dict = ZstdDictionary::new(DICT);
-        let corrupt = b"not a valid zstd frame at all";
-        let result = ZstdPureProvider::decompress_with_dict(corrupt, &dict, 1024);
+        let mut frame = ZstdPureProvider::compress_with_dict(PLAINTEXT, 3, DICT)
+            .expect("compression must succeed");
+        frame.pop(); // truncate last byte → corrupt frame
+        let result = ZstdPureProvider::decompress_with_dict(&frame, &dict, 1024);
         assert!(
-            result.is_err(),
-            "corrupt frame must return an error on finalized dict path; got {result:?}",
+            matches!(result, Err(crate::Error::Io(_))),
+            "corrupt frame must return Err(Io(_)) on finalized dict path; got {result:?}",
         );
     }
 
     #[test]
     fn decompress_with_dict_returns_error_on_corrupt_raw_content_frame() {
-        // Corrupt input must return an error on the raw-content dict path.
-        // Exercises the init() error branch in do_decompress_with_dict.
-        let raw_dict = b"some raw content dictionary bytes";
+        // Build a real raw-content compressed frame, then truncate it to force a
+        // failure on the raw-content path.  Exercises the init()/decode error
+        // branch in do_decompress_with_dict.
+        let raw_dict = b"some raw content dictionary bytes for testing corruption";
         let dict = ZstdDictionary::new(raw_dict);
-        let corrupt = b"not a valid zstd frame at all";
-        let result = ZstdPureProvider::decompress_with_dict(corrupt, &dict, 1024);
+        let mut frame = ZstdPureProvider::compress_with_dict(PLAINTEXT, 3, raw_dict)
+            .expect("compression must succeed");
+        frame.pop(); // truncate last byte → corrupt frame
+        let result = ZstdPureProvider::decompress_with_dict(&frame, &dict, 1024);
         assert!(
-            result.is_err(),
-            "corrupt frame must return an error on raw-content dict path; got {result:?}",
+            matches!(result, Err(crate::Error::Io(_))),
+            "corrupt frame must return Err(Io(_)) on raw-content dict path; got {result:?}",
         );
     }
 

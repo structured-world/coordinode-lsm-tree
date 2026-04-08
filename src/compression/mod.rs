@@ -90,12 +90,23 @@ impl Clone for ZstdDictionary {
 
 #[cfg(zstd_any)]
 impl ZstdDictionary {
-    /// Creates a new dictionary from raw bytes.
+    /// Creates a new dictionary handle from raw bytes.
     ///
-    /// The raw bytes should be a pre-trained zstd dictionary (e.g., output
-    /// of `zstd::dict::from_continuous` or `zstd --train`). The dictionary
-    /// ID is stored as a full 64-bit xxh3 hash; the public [`ZstdDictionary::id`]
-    /// method returns the lower 32 bits for external consumers.
+    /// `raw` may be either:
+    ///
+    /// * A **finalized zstd dictionary** — bytes starting with the magic
+    ///   `37 A4 30 EC` (as produced by `zstd --train` or
+    ///   [`ZstdDictionary::raw`]).  The backend parses it with the full
+    ///   entropy-table decoder.
+    /// * A **raw content dictionary** — arbitrary bytes used as LZ77 history
+    ///   (no magic header).  Useful when the caller controls the training data
+    ///   and does not need the full entropy-table overhead.
+    ///
+    /// Both forms are accepted by [`CompressionProvider::compress_with_dict`]
+    /// and [`CompressionProvider::decompress_with_dict`].
+    ///
+    /// The dictionary ID stored in this handle is the lower 32 bits of the
+    /// xxh3-64 hash of `raw`; see [`ZstdDictionary::id`].
     #[must_use]
     pub fn new(raw: &[u8]) -> Self {
         Self {
@@ -104,19 +115,19 @@ impl ZstdDictionary {
         }
     }
 
-    /// Returns a 32-bit dictionary fingerprint (lower 32 bits of xxh3).
+    /// Returns a 32-bit fingerprint derived from the dictionary content.
     ///
-    /// Intended for config validation (matching a `CompressionType::ZstdDict`
-    /// `dict_id` against the supplied `ZstdDictionary`) and external interop.
+    /// The fingerprint is the lower 32 bits of the xxh3-64 hash of the raw
+    /// dictionary bytes.  It is stable for a given byte sequence and is
+    /// intended for config validation (matching a `CompressionType::ZstdDict`
+    /// `dict_id` field against the supplied `ZstdDictionary`) and external
+    /// interop.
     ///
-    /// The value is the raw lower 32 bits of xxh3 and may theoretically be `0`
-    /// (probability ≈ 1/2³²). Backends that embed a dict ID in the zstd frame
-    /// header (where id=0 is reserved) are responsible for clamping to at
-    /// least 1 themselves. Config validation is unaffected: both sides derive
-    /// the ID from the same bytes and therefore agree even in the zero case.
-    ///
-    /// For internal cache keying use [`id64`](ZstdDictionary::id64) to avoid
-    /// hash collisions.
+    /// The value may theoretically be `0` (probability ≈ 1/2³²). Backends
+    /// that embed a dict ID in the zstd frame header (where id=0 is reserved)
+    /// are responsible for clamping to at least 1 themselves.  Config
+    /// validation is unaffected: both sides derive the ID from the same bytes
+    /// and therefore agree even in the zero case.
     #[must_use]
     #[expect(
         clippy::cast_possible_truncation,
