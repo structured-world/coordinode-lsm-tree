@@ -62,15 +62,19 @@ jobs:
   test-zstd:
     needs: lint
     timeout-minutes: 15
+    strategy:
+      fail-fast: true
+      matrix:
+        rust: [stable, "1.92.0"]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: stable
+          toolchain: ${{ matrix.rust }}
       - uses: Swatinem/rust-cache@v2
         with:
-          prefix-key: ubuntu-cargo-zstd
+          prefix-key: ubuntu-cargo-zstd-${{ matrix.rust }}
       - uses: taiki-e/install-action@nextest
       - name: Clippy (zstd backend)
         run: cargo clippy --no-default-features --features zstd,lz4 --all-targets -- -D warnings
