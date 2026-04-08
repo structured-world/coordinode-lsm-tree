@@ -95,7 +95,7 @@ fn strip_dict_id(mut frame: Vec<u8>) -> Vec<u8> {
         1 => 1,
         2 => 2,
         3 => 4,
-        // SAFETY: dict_id_flag = fhd & 0x03 is always 0, 1, 2, or 3.
+        // Invariant: dict_id_flag = fhd & 0x03 is always 0, 1, 2, or 3.
         // 0 is handled by the early return above; 1, 2, 3 are matched above.
         _ => unreachable!("dict_id_flag is a 2-bit field; 0 is handled, 1–3 matched"),
     };
@@ -158,19 +158,29 @@ fn decode_raw_content_bounded(
         // Drain collectible bytes from the decoder's internal buffer.
         let can = decoder.can_collect();
         if can > 0 {
-            if output.len() + can > capacity {
+            // Use checked_add to avoid usize overflow when output.len() or can
+            // are near usize::MAX.  Overflow is treated as a limit violation.
+            let new_len =
+                output
+                    .len()
+                    .checked_add(can)
+                    .ok_or(crate::Error::DecompressedSizeTooLarge {
+                        declared: u64::MAX,
+                        limit: capacity as u64,
+                    })?;
+            if new_len > capacity {
                 return Err(crate::Error::DecompressedSizeTooLarge {
-                    declared: (output.len() + can) as u64,
+                    declared: new_len as u64,
                     limit: capacity as u64,
                 });
             }
             let prev_len = output.len();
-            output.resize(prev_len + can, 0u8);
-            // SAFETY: output was just resized to prev_len + can, so
+            output.resize(new_len, 0u8);
+            // SAFETY: output was just resized to new_len (= prev_len + can), so
             // prev_len.. is always a valid slice. This cannot fail.
             let dest = output
                 .get_mut(prev_len..)
-                .unwrap_or_else(|| unreachable!("output resized to prev_len + can above"));
+                .unwrap_or_else(|| unreachable!("output resized to new_len above"));
             // `read_exact` ensures all `can` bytes are drained in one call.
             // `Read::read` may do short reads, which would leave zero-filled
             // slack and corrupt capacity accounting on the next iteration.
@@ -197,7 +207,9 @@ fn decode_raw_content_bounded(
 fn do_decompress_with_dict(
     decoder: &mut structured_zstd::decoding::FrameDecoder,
     data: &[u8],
-    dict_raw: &[u8],
+    // Pre-computed synthetic id for the raw-content path: `dict.id().max(1)`.
+    // Unused on the finalized-dict path (`is_raw_content = false`).
+    raw_content_id: u32,
     capacity: usize,
     is_raw_content: bool,
 ) -> crate::Result<Vec<u8>> {
@@ -232,15 +244,8 @@ fn do_decompress_with_dict(
             });
         }
 
-        // Derive the same synthetic id used in `add_dict` above.
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "intentional: lower 32 bits of xxh3 as internal dict id"
-        )]
-        let raw_content_id = {
-            let h = xxhash_rust::xxh3::xxh3_64(dict_raw) as u32;
-            h.max(1)
-        };
+        // `raw_content_id` was computed by the caller from `dict.id().max(1)`,
+        // reusing the cached xxh3 fingerprint without re-hashing dict_raw.
         decoder
             .force_dict(raw_content_id)
             .map_err(|e| crate::Error::Io(std::io::Error::other(e)))?;
@@ -519,7 +524,7 @@ impl CompressionProvider for ZstdPureProvider {
                 unreachable!("TLS_DECODER always initialised above");
             };
 
-            do_decompress_with_dict(decoder, data, dict.raw(), capacity, is_raw_content)
+            do_decompress_with_dict(decoder, data, dict.id().max(1), capacity, is_raw_content)
         })
     }
 }
