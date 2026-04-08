@@ -136,6 +136,65 @@ fn strip_dict_id(frame: Vec<u8>) -> Vec<u8> {
     out
 }
 
+/// Incrementally decodes `data` using the pre-initialised `decoder` and
+/// collects the output, enforcing a hard `capacity` limit even when the frame
+/// has no `Frame_Content_Size` field (FCS omitted → `content_size()` == 0).
+///
+/// Unlike `decode_blocks(All)`, which fills the decoder's internal buffer
+/// without bound before the caller can check the size, this uses
+/// `BlockDecodingStrategy::UptoBytes(remaining)` to stop decoding once the
+/// internal buffer reaches the remaining capacity budget, then drains
+/// collectible bytes into the output vector before the next iteration.
+fn decode_raw_content_bounded(
+    decoder: &mut structured_zstd::decoding::FrameDecoder,
+    cursor: &mut std::io::Cursor<&[u8]>,
+    capacity: usize,
+) -> crate::Result<Vec<u8>> {
+    use structured_zstd::decoding::BlockDecodingStrategy;
+
+    let mut output: Vec<u8> = Vec::new();
+    loop {
+        let remaining = capacity.saturating_sub(output.len());
+
+        if !decoder.is_finished() {
+            if remaining == 0 {
+                // Frame is still producing data but the budget is exhausted.
+                return Err(crate::Error::DecompressedSizeTooLarge {
+                    declared: capacity as u64 + 1,
+                    limit: capacity as u64,
+                });
+            }
+            decoder
+                .decode_blocks(&mut *cursor, BlockDecodingStrategy::UptoBytes(remaining))
+                .map_err(|e| crate::Error::Io(std::io::Error::other(e)))?;
+        }
+
+        // Drain collectible bytes from the decoder's internal buffer.
+        let can = decoder.can_collect();
+        if can > 0 {
+            if output.len() + can > capacity {
+                return Err(crate::Error::DecompressedSizeTooLarge {
+                    declared: (output.len() + can) as u64,
+                    limit: capacity as u64,
+                });
+            }
+            let prev_len = output.len();
+            output.resize(prev_len + can, 0u8);
+            let dest = output.get_mut(prev_len..).ok_or_else(|| {
+                crate::Error::Io(std::io::Error::other(
+                    "FrameDecoder drain buffer slice out of bounds",
+                ))
+            })?;
+            decoder.read(dest).map_err(crate::Error::Io)?;
+        }
+
+        if decoder.is_finished() && decoder.can_collect() == 0 {
+            break;
+        }
+    }
+    Ok(output)
+}
+
 /// Pure Rust zstd backend.
 pub struct ZstdPureProvider;
 
@@ -394,7 +453,6 @@ impl CompressionProvider for ZstdPureProvider {
                 //   - Frame produced by new pure backend (dictID stripped → no id): same.
                 //   - Frame produced by old pure backend (dictID=synthetic): force_dict
                 //     re-loads same dict (idempotent, since init would already load it).
-                use structured_zstd::decoding::BlockDecodingStrategy;
                 let mut cursor = std::io::Cursor::new(data);
                 decoder
                     .init(&mut cursor)
@@ -425,21 +483,8 @@ impl CompressionProvider for ZstdPureProvider {
                 decoder
                     .force_dict(raw_content_id)
                     .map_err(|e| crate::Error::Io(std::io::Error::other(e)))?;
-                decoder
-                    .decode_blocks(&mut cursor, BlockDecodingStrategy::All)
-                    .map_err(|e| crate::Error::Io(std::io::Error::other(e)))?;
-                let output = decoder.collect().ok_or_else(|| {
-                    crate::Error::Io(std::io::Error::other(
-                        "FrameDecoder produced no output for raw-content dict frame",
-                    ))
-                })?;
-                if output.len() > capacity {
-                    return Err(crate::Error::DecompressedSizeTooLarge {
-                        declared: output.len() as u64,
-                        limit: capacity as u64,
-                    });
-                }
-                Ok(output)
+
+                decode_raw_content_bounded(decoder, &mut cursor, capacity)
             } else {
                 // Finalized dict path: the frame embeds the dictID from the
                 // dict header; `decode_all_to_vec` → `init` loads the matching

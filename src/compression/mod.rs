@@ -605,7 +605,7 @@ mod tests {
 //
 // Only compiled when BOTH `zstd` (C FFI) and `zstd-pure` features are active.
 #[cfg(all(test, feature = "zstd", feature = "zstd-pure"))]
-#[expect(clippy::unwrap_used, clippy::expect_used, reason = "test code")]
+#[expect(clippy::expect_used, reason = "test code")]
 mod cross_backend_interop_tests {
     use super::zstd_ffi::ZstdFfiProvider;
     use super::zstd_pure::ZstdPureProvider;
