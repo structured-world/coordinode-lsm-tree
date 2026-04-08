@@ -195,6 +195,100 @@ fn decode_raw_content_bounded(
     Ok(output)
 }
 
+/// Executes the actual decompression once the `decoder` has been initialised
+/// with the correct dictionary.
+///
+/// Separated from the `TLS_DECODER.with` closure so that LLVM's coverage
+/// instrumentation can attribute lines to this named function (closure bodies
+/// are not always attributed correctly by `llvm-cov`).
+///
+/// Dispatches to the appropriate path based on `is_raw_content`:
+/// - `true` → manual `init` + `force_dict` + [`decode_raw_content_bounded`]
+/// - `false` → `decode_all_to_vec` (finalized dict, embedded dictID)
+fn do_decompress_with_dict(
+    decoder: &mut structured_zstd::decoding::FrameDecoder,
+    data: &[u8],
+    dict_raw: &[u8],
+    capacity: usize,
+    is_raw_content: bool,
+) -> crate::Result<Vec<u8>> {
+    if is_raw_content {
+        // Raw-content dict path: frames have no embedded dictID
+        // (C API and post-strip pure frames both produce dictID=0).
+        // `decode_all_to_vec` calls `init` internally, which would
+        // skip dict loading for dictID=0. Instead, use the manual
+        // flow: `init` → `force_dict` → `decode_blocks` → `collect`.
+        //
+        // `force_dict` loads the dict unconditionally regardless of
+        // the frame's dictID field, handling both backends uniformly:
+        //   - Frame produced by C FFI backend (dictID=0 → no id): force_dict loads dict.
+        //   - Frame produced by new pure backend (dictID stripped → no id): same.
+        //   - Frame produced by old pure backend (dictID=synthetic): force_dict
+        //     re-loads same dict (idempotent, since init would already load it).
+        let mut cursor = std::io::Cursor::new(data);
+        decoder
+            .init(&mut cursor)
+            .map_err(|e| crate::Error::Io(std::io::Error::other(e)))?;
+
+        // Decompression-bomb guard: if the frame header declares a
+        // content size larger than `capacity`, reject before allocating
+        // the output buffer. `content_size()` returns 0 when the
+        // frame omits the FCS field (size unknown); in that case the
+        // post-decode check on `output.len()` below acts as fallback.
+        let declared_size = decoder.content_size();
+        if declared_size > 0 && declared_size > capacity as u64 {
+            return Err(crate::Error::DecompressedSizeTooLarge {
+                declared: declared_size,
+                limit: capacity as u64,
+            });
+        }
+
+        // Derive the same synthetic id used in `add_dict` above.
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "intentional: lower 32 bits of xxh3 as internal dict id"
+        )]
+        let raw_content_id = {
+            let h = xxhash_rust::xxh3::xxh3_64(dict_raw) as u32;
+            h.max(1)
+        };
+        decoder
+            .force_dict(raw_content_id)
+            .map_err(|e| crate::Error::Io(std::io::Error::other(e)))?;
+
+        decode_raw_content_bounded(decoder, &mut cursor, capacity)
+    } else {
+        // Finalized dict path: the frame embeds the dictID from the
+        // dict header; `decode_all_to_vec` → `init` loads the matching
+        // dict automatically via the standard dictID lookup.
+        //
+        // The capacity limit is enforced by `decode_all_to_vec`: it
+        // pre-allocates exactly `capacity` bytes (via `Vec::with_capacity`)
+        // and `TargetTooSmall` is returned if the frame exceeds that.
+        let mut output = Vec::with_capacity(capacity);
+        decoder.decode_all_to_vec(data, &mut output).map_err(|e| {
+            if matches!(
+                e,
+                structured_zstd::decoding::errors::FrameDecoderError::TargetTooSmall
+            ) {
+                crate::Error::DecompressedSizeTooLarge {
+                    declared: capacity as u64 + 1,
+                    limit: capacity as u64,
+                }
+            } else {
+                crate::Error::Io(std::io::Error::other(e))
+            }
+        })?;
+        if output.len() > capacity {
+            return Err(crate::Error::DecompressedSizeTooLarge {
+                declared: output.len() as u64,
+                limit: capacity as u64,
+            });
+        }
+        Ok(output)
+    }
+}
+
 /// Pure Rust zstd backend.
 pub struct ZstdPureProvider;
 
@@ -440,81 +534,7 @@ impl CompressionProvider for ZstdPureProvider {
                 )));
             };
 
-            if is_raw_content {
-                // Raw-content dict path: frames have no embedded dictID
-                // (C API and post-strip pure frames both produce dictID=0).
-                // `decode_all_to_vec` calls `init` internally, which would
-                // skip dict loading for dictID=0. Instead, use the manual
-                // flow: `init` → `force_dict` → `decode_blocks` → `collect`.
-                //
-                // `force_dict` loads the dict unconditionally regardless of
-                // the frame's dictID field, handling both backends uniformly:
-                //   - Frame produced by C FFI backend (dictID=0 → no id): force_dict loads dict.
-                //   - Frame produced by new pure backend (dictID stripped → no id): same.
-                //   - Frame produced by old pure backend (dictID=synthetic): force_dict
-                //     re-loads same dict (idempotent, since init would already load it).
-                let mut cursor = std::io::Cursor::new(data);
-                decoder
-                    .init(&mut cursor)
-                    .map_err(|e| crate::Error::Io(std::io::Error::other(e)))?;
-
-                // Decompression-bomb guard: if the frame header declares a
-                // content size larger than `capacity`, reject before allocating
-                // the output buffer. `content_size()` returns 0 when the
-                // frame omits the FCS field (size unknown); in that case the
-                // post-decode check on `output.len()` below acts as fallback.
-                let declared_size = decoder.content_size();
-                if declared_size > 0 && declared_size > capacity as u64 {
-                    return Err(crate::Error::DecompressedSizeTooLarge {
-                        declared: declared_size,
-                        limit: capacity as u64,
-                    });
-                }
-
-                // Derive the same synthetic id used in `add_dict` above.
-                #[expect(
-                    clippy::cast_possible_truncation,
-                    reason = "intentional: lower 32 bits of xxh3 as internal dict id"
-                )]
-                let raw_content_id = {
-                    let h = xxhash_rust::xxh3::xxh3_64(dict.raw()) as u32;
-                    h.max(1)
-                };
-                decoder
-                    .force_dict(raw_content_id)
-                    .map_err(|e| crate::Error::Io(std::io::Error::other(e)))?;
-
-                decode_raw_content_bounded(decoder, &mut cursor, capacity)
-            } else {
-                // Finalized dict path: the frame embeds the dictID from the
-                // dict header; `decode_all_to_vec` → `init` loads the matching
-                // dict automatically via the standard dictID lookup.
-                //
-                // The capacity limit is enforced by `decode_all_to_vec`: it
-                // pre-allocates exactly `capacity` bytes (via `Vec::with_capacity`)
-                // and `TargetTooSmall` is returned if the frame exceeds that.
-                let mut output = Vec::with_capacity(capacity);
-                decoder.decode_all_to_vec(data, &mut output).map_err(|e| {
-                    if matches!(
-                        e,
-                        structured_zstd::decoding::errors::FrameDecoderError::TargetTooSmall
-                    ) {
-                        crate::Error::DecompressedSizeTooLarge {
-                            declared: capacity as u64 + 1,
-                            limit: capacity as u64,
-                        }
-                    } else {
-                        crate::Error::Io(std::io::Error::other(e))
-                    }
-                })?;
-                if output.len() > capacity {
-                    return Err(crate::Error::DecompressedSizeTooLarge {
-                        declared: output.len() as u64,
-                        limit: capacity as u64,
-                    });
-                }
-                Ok(output)
-            }
+            do_decompress_with_dict(decoder, data, dict.raw(), capacity, is_raw_content)
         })
     }
 }
