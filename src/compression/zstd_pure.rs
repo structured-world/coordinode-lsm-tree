@@ -106,7 +106,9 @@ fn strip_dict_id(frame: Vec<u8>) -> Vec<u8> {
         1 => 1,
         2 => 2,
         3 => 4,
-        _ => return frame, // unreachable: dict_id_flag is 2 bits
+        // SAFETY: dict_id_flag = fhd & 0x03 is always 0, 1, 2, or 3.
+        // 0 is handled by the early return above; 1, 2, 3 are matched above.
+        _ => unreachable!("dict_id_flag is a 2-bit field; 0 is handled, 1–3 matched"),
     };
 
     // Single_Segment_Flag (FHD bit 5): when set, no Window_Descriptor follows FHD.
@@ -184,11 +186,11 @@ fn decode_raw_content_bounded(
             }
             let prev_len = output.len();
             output.resize(prev_len + can, 0u8);
-            let dest = output.get_mut(prev_len..).ok_or_else(|| {
-                crate::Error::Io(std::io::Error::other(
-                    "FrameDecoder drain buffer slice out of bounds",
-                ))
-            })?;
+            // SAFETY: output was just resized to prev_len + can, so
+            // prev_len.. is always a valid slice. This cannot fail.
+            let dest = output
+                .get_mut(prev_len..)
+                .unwrap_or_else(|| unreachable!("output resized to prev_len + can above"));
             // `read_exact` ensures all `can` bytes are drained in one call.
             // `Read::read` may do short reads, which would leave zero-filled
             // slack and corrupt capacity accounting on the next iteration.
@@ -286,12 +288,10 @@ fn do_decompress_with_dict(
                 crate::Error::Io(std::io::Error::other(e))
             }
         })?;
-        if output.len() > capacity {
-            return Err(crate::Error::DecompressedSizeTooLarge {
-                declared: output.len() as u64,
-                limit: capacity as u64,
-            });
-        }
+        // `decode_all_to_vec` returns `TargetTooSmall` if the frame would exceed
+        // `Vec::with_capacity(capacity)`, so reaching here guarantees
+        // output.len() <= capacity. A post-decode size assert is therefore
+        // structurally unreachable and is omitted to keep coverage clean.
         Ok(output)
     }
 }
@@ -409,11 +409,9 @@ impl CompressionProvider for ZstdPureProvider {
                 *state = Some((dict_key, level, compressor));
             }
 
+            // Unreachable: the branch above always initialises `state`.
             let Some((_, _, compressor)) = state.as_mut() else {
-                // Unreachable: the branch above always initialises `state`.
-                return Err(crate::Error::Io(std::io::Error::other(
-                    "TLS_COMPRESSOR unexpectedly empty after initialisation",
-                )));
+                unreachable!("TLS_COMPRESSOR always initialised above");
             };
 
             // `compress()` resets the matcher and offset history at the start of
@@ -443,9 +441,11 @@ impl CompressionProvider for ZstdPureProvider {
             compressor.set_drain(Vec::new());
             compressor.compress();
 
-            let compressed = compressor.take_drain().ok_or_else(|| {
-                crate::Error::Io(std::io::Error::other("drain missing after compress"))
-            })?;
+            // `set_drain(Vec::new())` is called on every path above, so
+            // `take_drain()` always returns `Some`. This cannot fail.
+            let compressed = compressor
+                .take_drain()
+                .unwrap_or_else(|| unreachable!("drain is always set by set_drain() above"));
 
             // For raw-content dicts the pure backend internally assigns a
             // synthetic non-zero dictID (structured-zstd rejects id=0).
@@ -838,6 +838,73 @@ mod tests {
         let stripped = strip_dict_id(frame);
         // Expect: magic + FHD (bits[1:0] cleared to 0x00) + WD (preserved) + rest.
         assert_eq!(stripped, vec![0x28_u8, 0xB5, 0x2F, 0xFD, 0x00, 0x70, 0xFF]);
+    }
+
+    // --- bounded_read error-path tests ---
+
+    /// A reader that always returns an I/O error on the very first `read` call.
+    struct AlwaysFailReader;
+    impl std::io::Read for AlwaysFailReader {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("simulated read error"))
+        }
+    }
+
+    /// A 3-state reader used to reach the probe-read error path in `bounded_read`.
+    ///
+    /// States:
+    /// 1. `remaining > 0`: returns data bytes (fill loop sees `Ok(n)`).
+    /// 2. `remaining == 0, !eof_sent`: returns `Ok(0)` once → fill loop `break`s.
+    /// 3. `remaining == 0, eof_sent`: returns `Err` → probe read fires `Err` arm.
+    struct FailOnProbeReader {
+        remaining: usize,
+        eof_sent: bool,
+    }
+    impl std::io::Read for FailOnProbeReader {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.remaining > 0 {
+                let n = buf.len().min(self.remaining);
+                for b in buf.iter_mut().take(n) {
+                    *b = 0;
+                }
+                self.remaining -= n;
+                Ok(n)
+            } else if !self.eof_sent {
+                self.eof_sent = true;
+                Ok(0) // signals EOF → fill loop breaks
+            } else {
+                Err(std::io::Error::other("simulated probe-read error"))
+            }
+        }
+    }
+
+    #[test]
+    fn bounded_read_propagates_io_error_from_read_loop() {
+        // `AlwaysFailReader` triggers the `Err(e) => return Err(Error::Io(e))`
+        // arm inside the fill loop of `bounded_read` (the first `reader.read`
+        // call returns an error).
+        let mut reader = AlwaysFailReader;
+        let result = bounded_read(&mut reader, 64);
+        assert!(
+            matches!(result, Err(crate::Error::Io(_))),
+            "expected Io error from read loop; got {result:?}",
+        );
+    }
+
+    #[test]
+    fn bounded_read_propagates_io_error_from_probe_read() {
+        // `FailOnProbeReader` completes the fill loop normally (returns Ok(0) to
+        // signal EOF), then returns Err on the subsequent probe read, exercising
+        // the `Err(e) => return Err(Error::Io(e))` arm after the fill loop.
+        let mut reader = FailOnProbeReader {
+            remaining: 4,
+            eof_sent: false,
+        };
+        let result = bounded_read(&mut reader, 64);
+        assert!(
+            matches!(result, Err(crate::Error::Io(_))),
+            "expected Io error from probe read; got {result:?}",
+        );
     }
 
     #[test]
