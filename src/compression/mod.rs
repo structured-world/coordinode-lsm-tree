@@ -96,9 +96,9 @@ impl ZstdDictionary {
     /// `raw` may be either:
     ///
     /// * A **finalized zstd dictionary** — bytes starting with the magic
-    ///   `37 A4 30 EC` (as produced by `zstd --train` or
-    ///   [`ZstdDictionary::raw`]).  The backend parses it with the full
-    ///   entropy-table decoder.
+    ///   `37 A4 30 EC` (as produced by `zstd --train`; accessible via
+    ///   [`ZstdDictionary::raw`] for persistence and interop).  The backend
+    ///   parses it with the full entropy-table decoder.
     /// * A **raw content dictionary** — arbitrary bytes used as LZ77 history
     ///   (no magic header).  Useful when the caller controls the training data
     ///   and does not need the full entropy-table overhead.

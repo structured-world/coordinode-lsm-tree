@@ -650,8 +650,9 @@ mod tests {
     }
 
     #[test]
-    fn compress_with_dict_roundtrip_all_levels() {
-        // Compression must round-trip correctly across the full valid level range.
+    fn compress_with_dict_roundtrip_representative_levels() {
+        // Compression must round-trip correctly at representative points across
+        // the valid level range (1=fastest, 3=default, 9=balanced, 19=best).
         let dict = ZstdDictionary::new(DICT);
 
         for level in [1, 3, 9, 19] {
