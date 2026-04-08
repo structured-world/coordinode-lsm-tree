@@ -185,7 +185,10 @@ fn decode_raw_content_bounded(
                     "FrameDecoder drain buffer slice out of bounds",
                 ))
             })?;
-            decoder.read(dest).map_err(crate::Error::Io)?;
+            // `read_exact` ensures all `can` bytes are drained in one call.
+            // `Read::read` may do short reads, which would leave zero-filled
+            // slack and corrupt capacity accounting on the next iteration.
+            decoder.read_exact(dest).map_err(crate::Error::Io)?;
         }
 
         if decoder.is_finished() && decoder.can_collect() == 0 {

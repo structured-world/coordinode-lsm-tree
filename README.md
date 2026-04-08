@@ -73,6 +73,7 @@ Allows using `Zstd` compression via a pure Rust implementation, powered by
 Requires no C compiler or system libraries — compiles with `cargo build` alone.
 Supports both regular zstd (`CompressionType::Zstd`) and dictionary compression
 (`CompressionType::ZstdDict`) for improved ratios on small table blocks (4–64 KiB).
+Blob-file dictionary compression is currently not supported.
 
 Both backends produce RFC 8878-compliant zstd frames, so data compressed by one
 can be decompressed by the other. When both `zstd` and `zstd-pure` are enabled,
