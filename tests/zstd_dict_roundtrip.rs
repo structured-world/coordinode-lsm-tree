@@ -430,12 +430,14 @@ mod zstd_dict {
             ))
             .open();
 
+        let expected_id = dict.id();
         assert!(
             matches!(
                 result,
-                Err(lsm_tree::Error::ZstdDictMismatch { got: None, .. })
+                Err(lsm_tree::Error::ZstdDictMismatch { expected, got: None })
+                    if expected == expected_id
             ),
-            "expected ZstdDictMismatch{{got: None}} when dict is missing for blob compression",
+            "expected ZstdDictMismatch{{expected: {expected_id}, got: None}} when dict is missing",
         );
 
         Ok(())
