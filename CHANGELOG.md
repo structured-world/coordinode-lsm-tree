@@ -11,6 +11,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [4.5.0](https://github.com/structured-world/coordinode-lsm-tree/compare/v4.4.0...v4.5.0) - 2026-04-09
+
+### Added
+
+- *(vlog)* dictionary compression for blob files ([#233](https://github.com/structured-world/coordinode-lsm-tree/pull/233))
+
 ## [4.4.0](https://github.com/structured-world/coordinode-lsm-tree/compare/v4.3.1...v4.4.0) - 2026-04-09
 
 ### Added
