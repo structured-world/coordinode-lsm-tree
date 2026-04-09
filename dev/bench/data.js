@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1775732084258,
+  "lastUpdate": 1775745826913,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -5772,6 +5772,84 @@ window.BENCHMARK_DATA = {
             "value": 265976.3203808889,
             "unit": "ops/sec (normalized)",
             "extra": "raw: 417340 ops/sec | factor: 0.637 | P50: 2.2us | P99: 5.9us | P99.9: 13.8us\nthreads: 1 | elapsed: 0.48s | num: 200000 | iterations: 3 | runner: seq_wr=218359 rand_rd=728891 cpu=108 composite=36089.0"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "0fc0539eead6e49894719eca978b52c086c4bac9",
+          "message": "feat(vlog): dictionary compression for blob files (#233)\n\n## Summary\n\n- Wire `ZstdDict` compression through the full blob-file I/O path\n(write, read, compaction filter reads, GC relocation)\n- Remove the explicit \"blob-file dictionary compression not supported\"\nrejection guards\n- Implement actual `compress_with_dict` / `decompress_with_dict` usage\nvia the `ZstdBackend` provider\n- Add `zstd_dictionary` field + `.dict()` builder to\n`KvSeparationOptions` with config-level validation (missing dict or\nmismatched `dict_id` → `Error::ZstdDictMismatch` at `open()`)\n\n## Technical Details\n\n**Write path** (`BlobFileWriter` / `MultiWriter` / `Writer`):\n- Added `zstd_dictionary: Option<Arc<ZstdDictionary>>` field and\n`use_zstd_dictionary()` builder\n- `ZstdDict` arm in `write_raw` calls `ZstdBackend::compress_with_dict`;\nerrors if dict absent\n- `rotate()` in `MultiWriter` threads the dictionary into each new\n`Writer`\n\n**Read path** (`Reader` / `Accessor`):\n- Added `zstd_dictionary: Option<&ZstdDictionary>` field and\n`with_dict()` builder to `Reader`\n- `ZstdDict` arm validates `dict_id` matches, then calls\n`ZstdBackend::decompress_with_dict`\n- `Accessor` stores dict reference and passes it into `Reader` on every\n`get()`\n\n**Higher-level wiring** (`BlobTree`, compaction filter):\n- `resolve_value_handle` receives dict via `#[cfg(zstd_any)]` parameter;\nall three call sites updated\n- `BlobFileWriter` creation in flush/GC path calls\n`.use_zstd_dictionary(kv_opts.zstd_dictionary.clone())`\n- `AccessorShared::get_indirect_value` in compaction filter constructs\n`Accessor` with dict\n\n**Config validation** (`KvSeparationOptions`):\n- `validate_zstd_dictionary` now checks blob compression in addition to\nSST compression\n- Missing dict → `ZstdDictMismatch { expected, got: None }`\n- Mismatched id → `ZstdDictMismatch { expected, got: Some(actual) }`\n\n**Misc**:\n- `ZstdDictionary` gains `PartialEq`/`Eq` impls (compare by `id`) so\n`KvSeparationOptions` can derive `PartialEq`\n- README: removed \"blob-file dictionary compression not supported\"\nlimitation note\n\n## Test Plan\n\n- `cargo nextest run --workspace --all-features` — 1266/1266 passed\n- `cargo test --doc --all-features` — 41/41 passed\n- `cargo clippy --all-targets --all-features -- -D warnings` — clean\n\nNew integration tests in `tests/zstd_dict_roundtrip.rs`:\n- `blob_zstd_dict_roundtrip_write_flush_read` — write blobs, flush, read\nback\n- `blob_zstd_dict_roundtrip_survives_major_compact` — blobs survive\nGC/relocation compaction\n- `blob_zstd_dict_missing_at_open_is_rejected` — missing dict caught at\n`open()`\n- `blob_zstd_dict_id_mismatch_at_open_is_rejected` — mismatched dict_id\ncaught at `open()`\n\nCloses #230\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n## Summary by CodeRabbit\n\n* **New Features**\n* Zstd dictionary compression now supports blob-backed values; reads and\nwrites can use a supplied dictionary for compression/decompression.\n\n* **Validation**\n* Configuration now enforces a matching Zstd dictionary when\ndictionary-based compression is enabled and surfaces clear\nmismatch/missing-dictionary errors.\n\n* **Documentation**\n* README updated to state Zstd dictionary compression applies to small\ntable blocks and blob files.\n\n* **Tests**\n* Added end-to-end and edge-case tests covering blob round-trips,\ncompaction persistence, range/prefix/multi-get reads, and config\nvalidation.\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-04-09T17:42:39+03:00",
+          "tree_id": "afcdfdaabba23f4f3d0aa31cc660ee801e625c61",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/0fc0539eead6e49894719eca978b52c086c4bac9"
+        },
+        "date": 1775745825910,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 1204850.5525356098,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 1940188 ops/sec | factor: 0.621 | P50: 0.4us | P99: 2.4us | P99.9: 5.8us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3 | runner: seq_wr=231775 rand_rd=743275 cpu=109 composite=37037.2"
+          },
+          {
+            "name": "fillrandom",
+            "value": 648275.2515067102,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 1043927 ops/sec | factor: 0.621 | P50: 0.7us | P99: 3.1us | P99.9: 7.5us\nthreads: 1 | elapsed: 0.19s | num: 200000 | iterations: 3 | runner: seq_wr=231775 rand_rd=743275 cpu=109 composite=37037.2"
+          },
+          {
+            "name": "readrandom",
+            "value": 289096.85236871266,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 465537 ops/sec | factor: 0.621 | P50: 1.9us | P99: 6.4us | P99.9: 13.3us\nthreads: 1 | elapsed: 0.43s | num: 200000 | iterations: 3 | runner: seq_wr=231775 rand_rd=743275 cpu=109 composite=37037.2"
+          },
+          {
+            "name": "readseq",
+            "value": 1405131.667896422,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 2262704 ops/sec | factor: 0.621 | P50: 0.3us | P99: 4.7us | P99.9: 9.5us\nthreads: 1 | elapsed: 0.09s | num: 200000 | iterations: 3 | runner: seq_wr=231775 rand_rd=743275 cpu=109 composite=37037.2"
+          },
+          {
+            "name": "seekrandom",
+            "value": 204082.04201244522,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 328636 ops/sec | factor: 0.621 | P50: 2.7us | P99: 7.0us | P99.9: 15.5us\nthreads: 1 | elapsed: 0.61s | num: 200000 | iterations: 3 | runner: seq_wr=231775 rand_rd=743275 cpu=109 composite=37037.2"
+          },
+          {
+            "name": "prefixscan",
+            "value": 113402.29583579481,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 182613 ops/sec | factor: 0.621 | P50: 5.1us | P99: 6.9us | P99.9: 17.1us\nthreads: 1 | elapsed: 1.10s | num: 200000 | iterations: 3 | runner: seq_wr=231775 rand_rd=743275 cpu=109 composite=37037.2"
+          },
+          {
+            "name": "overwrite",
+            "value": 672418.2434038012,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 1082805 ops/sec | factor: 0.621 | P50: 0.7us | P99: 3.1us | P99.9: 6.9us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3 | runner: seq_wr=231775 rand_rd=743275 cpu=109 composite=37037.2"
+          },
+          {
+            "name": "mergerandom",
+            "value": 471755.1258042507,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 759674 ops/sec | factor: 0.621 | P50: 0.3us | P99: 0.5us | P99.9: 3.2us\nthreads: 1 | elapsed: 0.26s | num: 200000 | iterations: 3 | runner: seq_wr=231775 rand_rd=743275 cpu=109 composite=37037.2"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 283929.1652989099,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 457215 ops/sec | factor: 0.621 | P50: 2.0us | P99: 4.8us | P99.9: 13.5us\nthreads: 1 | elapsed: 0.44s | num: 200000 | iterations: 3 | runner: seq_wr=231775 rand_rd=743275 cpu=109 composite=37037.2"
           }
         ]
       }
