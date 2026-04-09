@@ -138,6 +138,14 @@ pub struct KvSeparationOptions {
 
     #[doc(hidden)]
     pub age_cutoff: f32,
+
+    /// Pre-trained zstd dictionary for blob-file dictionary compression.
+    ///
+    /// Required when `compression` is [`CompressionType::ZstdDict`].
+    /// The `dict_id` in the compression type must match [`ZstdDictionary::id`].
+    #[cfg(zstd_any)]
+    #[doc(hidden)]
+    pub zstd_dictionary: Option<std::sync::Arc<crate::compression::ZstdDictionary>>,
 }
 
 impl Default for KvSeparationOptions {
@@ -154,6 +162,9 @@ impl Default for KvSeparationOptions {
 
             staleness_threshold: 0.25,
             age_cutoff: 0.25,
+
+            #[cfg(zstd_any)]
+            zstd_dictionary: None,
         }
     }
 }
@@ -211,6 +222,21 @@ impl KvSeparationOptions {
     #[must_use]
     pub fn age_cutoff(mut self, ratio: f32) -> Self {
         self.age_cutoff = ratio;
+        self
+    }
+
+    /// Sets the zstd dictionary for blob-file dictionary compression.
+    ///
+    /// Required when [`compression`](Self::compression) is set to
+    /// [`CompressionType::ZstdDict`].  The `dict_id` encoded in the
+    /// compression type must equal [`ZstdDictionary::id()`] of the
+    /// supplied dictionary; [`Config::open`] will return
+    /// [`Error::ZstdDictMismatch`](crate::Error::ZstdDictMismatch) if
+    /// they disagree.
+    #[cfg(zstd_any)]
+    #[must_use]
+    pub fn dict(mut self, dictionary: std::sync::Arc<crate::compression::ZstdDictionary>) -> Self {
+        self.zstd_dictionary = Some(dictionary);
         self
     }
 }
@@ -538,14 +564,27 @@ impl Config {
             }
         }
 
-        // Blob files don't support dictionary compression — reject early.
+        // Blob files with ZstdDict compression must have a matching dictionary.
         if let Some(ref kv_opts) = self.kv_separation_opts
-            && matches!(kv_opts.compression, CompressionType::ZstdDict { .. })
+            && let CompressionType::ZstdDict {
+                dict_id: required, ..
+            } = kv_opts.compression
         {
-            return Err(crate::Error::Io(std::io::Error::new(
-                std::io::ErrorKind::Unsupported,
-                "zstd dictionary compression is not supported for blob files",
-            )));
+            match kv_opts.zstd_dictionary.as_ref().map(|d| d.id()) {
+                None => {
+                    return Err(crate::Error::ZstdDictMismatch {
+                        expected: required,
+                        got: None,
+                    });
+                }
+                Some(actual) if actual != required => {
+                    return Err(crate::Error::ZstdDictMismatch {
+                        expected: required,
+                        got: Some(actual),
+                    });
+                }
+                _ => {}
+            }
         }
 
         Ok(())
@@ -573,10 +612,12 @@ impl Config {
 #[cfg(all(test, zstd_any))]
 mod tests {
     use super::*;
-    use crate::{CompressionType, SequenceNumberCounter};
+    use crate::{CompressionType, SequenceNumberCounter, compression::ZstdDictionary};
+    use std::sync::Arc;
 
     #[test]
-    fn blob_zstd_dict_compression_is_rejected() {
+    fn blob_zstd_dict_no_dict_is_rejected() {
+        // ZstdDict compression for blobs without providing a dictionary must fail.
         let folder = tempfile::tempdir().unwrap_or_else(|err| panic!("tempdir failed: {err}"));
         let cfg = Config::new(
             folder.path(),
@@ -590,14 +631,70 @@ mod tests {
             },
         )));
 
-        let err = match cfg.validate_zstd_dictionary() {
-            Ok(()) => panic!("blob-file zstd dictionary compression must be rejected"),
-            Err(err) => err,
-        };
+        assert!(
+            matches!(
+                cfg.validate_zstd_dictionary(),
+                Err(crate::Error::ZstdDictMismatch {
+                    expected: 7,
+                    got: None
+                })
+            ),
+            "expected ZstdDictMismatch when no dictionary is supplied",
+        );
+    }
+
+    #[test]
+    fn blob_zstd_dict_id_mismatch_is_rejected() {
+        // ZstdDict compression with a dictionary whose id doesn't match the
+        // compression type's dict_id must fail.
+        let folder = tempfile::tempdir().unwrap_or_else(|err| panic!("tempdir failed: {err}"));
+        let dict = Arc::new(ZstdDictionary::new(b"sample training data for test"));
+        let wrong_dict_id = dict.id().wrapping_add(1);
+        let cfg = Config::new(
+            folder.path(),
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_kv_separation(Some(
+            KvSeparationOptions::default()
+                .compression(CompressionType::ZstdDict {
+                    level: 3,
+                    dict_id: wrong_dict_id,
+                })
+                .dict(Arc::clone(&dict)),
+        ));
 
         assert!(
-            err.to_string()
-                .contains("zstd dictionary compression is not supported for blob files")
+            matches!(
+                cfg.validate_zstd_dictionary(),
+                Err(crate::Error::ZstdDictMismatch { .. })
+            ),
+            "expected ZstdDictMismatch when dict_id doesn't match dictionary",
+        );
+    }
+
+    #[test]
+    fn blob_zstd_dict_matching_dict_is_accepted() {
+        // ZstdDict compression with a correctly matching dictionary must succeed.
+        let folder = tempfile::tempdir().unwrap_or_else(|err| panic!("tempdir failed: {err}"));
+        let dict = Arc::new(ZstdDictionary::new(b"sample training data for test"));
+        let cfg = Config::new(
+            folder.path(),
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_kv_separation(Some(
+            KvSeparationOptions::default()
+                .compression(CompressionType::ZstdDict {
+                    level: 3,
+                    dict_id: dict.id(),
+                })
+                .dict(Arc::clone(&dict)),
+        ));
+
+        assert!(
+            cfg.validate_zstd_dictionary().is_ok(),
+            "matching dictionary must be accepted",
         );
     }
 }

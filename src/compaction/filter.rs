@@ -104,7 +104,20 @@ impl AccessorShared<'_> {
         user_key: &[u8],
         vhandle: &ValueHandle,
     ) -> crate::Result<Option<UserValue>> {
-        Accessor::new(&self.version.blob_files).get(
+        let accessor = {
+            let a = Accessor::new(&self.version.blob_files);
+            #[cfg(zstd_any)]
+            let a = a.with_dict(
+                self.opts
+                    .config
+                    .kv_separation_opts
+                    .as_ref()
+                    .and_then(|o| o.zstd_dictionary.as_deref()),
+            );
+            a
+        };
+
+        accessor.get(
             self.opts.tree_id,
             self.blobs_folder,
             user_key,

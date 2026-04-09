@@ -120,6 +120,11 @@ pub struct Writer {
     pub(crate) last_key: Option<UserKey>,
 
     pub(crate) compression: CompressionType,
+
+    /// Dictionary for `ZstdDict` compression.  Must be supplied when
+    /// `compression` is [`CompressionType::ZstdDict`].
+    #[cfg(zstd_any)]
+    pub(crate) zstd_dictionary: Option<std::sync::Arc<crate::compression::ZstdDictionary>>,
 }
 
 impl Writer {
@@ -163,11 +168,28 @@ impl Writer {
             last_key: None,
 
             compression: CompressionType::None,
+
+            #[cfg(zstd_any)]
+            zstd_dictionary: None,
         })
     }
 
     pub fn use_compression(mut self, compressor: CompressionType) -> Self {
         self.compression = compressor;
+        self
+    }
+
+    /// Provides the zstd dictionary for [`CompressionType::ZstdDict`] writes.
+    ///
+    /// Must be called before writing any blobs when the compression type is
+    /// `ZstdDict`.  Passing `None` clears a previously set dictionary.
+    #[cfg(zstd_any)]
+    #[must_use]
+    pub fn use_zstd_dictionary(
+        mut self,
+        dict: Option<std::sync::Arc<crate::compression::ZstdDictionary>>,
+    ) -> Self {
+        self.zstd_dictionary = dict;
         self
     }
 
@@ -220,11 +242,24 @@ impl Writer {
             }
 
             #[cfg(zstd_any)]
-            CompressionType::ZstdDict { .. } => {
-                return Err(crate::Error::Io(std::io::Error::new(
-                    std::io::ErrorKind::Unsupported,
-                    "zstd dictionary compression is not supported for blob files",
-                )));
+            CompressionType::ZstdDict { level, dict_id } => {
+                let dict =
+                    self.zstd_dictionary
+                        .as_deref()
+                        .ok_or(crate::Error::ZstdDictMismatch {
+                            expected: *dict_id,
+                            got: None,
+                        })?;
+                if dict.id() != *dict_id {
+                    return Err(crate::Error::ZstdDictMismatch {
+                        expected: *dict_id,
+                        got: Some(dict.id()),
+                    });
+                }
+                let compressed =
+                    crate::compression::ZstdBackend::compress_with_dict(value, *level, dict.raw())?;
+                check_size_cap(compressed.len())?;
+                std::borrow::Cow::Owned(compressed)
             }
         };
 
@@ -454,20 +489,45 @@ mod tests {
 
     #[test]
     #[cfg(zstd_any)]
-    fn blob_write_zstd_dict_unsupported() -> crate::Result<()> {
+    fn blob_write_zstd_dict_no_dict_returns_mismatch() -> crate::Result<()> {
+        // ZstdDict compression without a dictionary must return ZstdDictMismatch.
         let folder = tempfile::tempdir()?;
         let path = folder.path().join("test.blob");
-        let dict = crate::compression::ZstdDictionary::new(b"test dictionary");
+        let dict = crate::compression::ZstdDictionary::new(b"test dictionary content for blob");
         let compression = CompressionType::ZstdDict {
             level: 3,
             dict_id: dict.id(),
         };
+        // Intentionally do NOT call use_zstd_dictionary — no dict supplied.
         let mut writer = Writer::new(&path, 0, 0, &StdFs)?.use_compression(compression);
 
         let result = writer.write(b"key", 0, b"value");
         assert!(
-            matches!(&result, Err(crate::Error::Io(e)) if e.kind() == std::io::ErrorKind::Unsupported),
-            "expected Io(Unsupported), got: {result:?}",
+            matches!(result, Err(crate::Error::ZstdDictMismatch { .. })),
+            "expected ZstdDictMismatch when no dictionary is supplied, got: {result:?}",
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(zstd_any)]
+    fn blob_write_zstd_dict_with_dict_succeeds() -> crate::Result<()> {
+        // ZstdDict compression with a matching dictionary must succeed.
+        let folder = tempfile::tempdir()?;
+        let path = folder.path().join("test.blob");
+        let dict = crate::compression::ZstdDictionary::new(b"test dictionary content for blob");
+        let compression = CompressionType::ZstdDict {
+            level: 3,
+            dict_id: dict.id(),
+        };
+        let mut writer = Writer::new(&path, 0, 0, &StdFs)?
+            .use_compression(compression)
+            .use_zstd_dictionary(Some(std::sync::Arc::new(dict)));
+
+        let result = writer.write(b"key", 0, b"hello world blob value");
+        assert!(
+            result.is_ok(),
+            "expected Ok with matching dictionary, got: {result:?}"
         );
         Ok(())
     }

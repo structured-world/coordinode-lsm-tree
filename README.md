@@ -63,8 +63,8 @@ Allows using `Zstd` compression via a pure Rust implementation, powered by
 [`structured-zstd`](https://github.com/structured-world/structured-zstd) (managed fork of ruzstd).
 Requires no C compiler or system libraries — compiles with `cargo build` alone.
 Supports both regular zstd (`CompressionType::Zstd`) and dictionary compression
-(`CompressionType::ZstdDict`) for improved ratios on small table blocks (4–64 KiB).
-Blob-file dictionary compression is currently not supported.
+(`CompressionType::ZstdDict`) for improved ratios on small table blocks (4–64 KiB)
+and blob files.
 
 **Current limitations:**
 - Decompression throughput is ~2–3.5× slower than the C reference implementation

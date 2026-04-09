@@ -48,6 +48,13 @@ impl IterGuard for Guard {
                 &self.tree.index.config.cache,
                 &self.version,
                 kv,
+                #[cfg(zstd_any)]
+                self.tree
+                    .index
+                    .config
+                    .kv_separation_opts
+                    .as_ref()
+                    .and_then(|o| o.zstd_dictionary.as_deref()),
             )
             .map(|(k, v)| (k, Some(v)))
         } else {
@@ -78,6 +85,13 @@ impl IterGuard for Guard {
             &self.tree.index.config.cache,
             &self.version,
             self.kv?,
+            #[cfg(zstd_any)]
+            self.tree
+                .index
+                .config
+                .kv_separation_opts
+                .as_ref()
+                .and_then(|o| o.zstd_dictionary.as_deref()),
         )
     }
 }
@@ -88,13 +102,21 @@ fn resolve_value_handle(
     cache: &Cache,
     version: &Version,
     item: InternalValue,
+    #[cfg(zstd_any)] zstd_dictionary: Option<&crate::compression::ZstdDictionary>,
 ) -> RangeItem {
     if item.key.value_type.is_indirection() {
         let mut cursor = std::io::Cursor::new(item.value);
         let vptr = BlobIndirection::decode_from(&mut cursor)?;
 
         // Resolve indirection using value log
-        match Accessor::new(&version.blob_files).get(
+        let accessor = {
+            let a = Accessor::new(&version.blob_files);
+            #[cfg(zstd_any)]
+            let a = a.with_dict(zstd_dictionary);
+            a
+        };
+
+        match accessor.get(
             tree_id,
             blobs_folder,
             &item.key.user_key,
@@ -188,6 +210,12 @@ impl BlobTree {
             &self.index.config.cache,
             &super_version.version,
             item,
+            #[cfg(zstd_any)]
+            self.index
+                .config
+                .kv_separation_opts
+                .as_ref()
+                .and_then(|o| o.zstd_dictionary.as_deref()),
         )?;
 
         Ok(Some(v))
@@ -471,15 +499,20 @@ impl AbstractTree for BlobTree {
             .as_ref()
             .expect("kv separation options should exist");
 
-        let mut blob_writer = BlobFileWriter::new(
-            self.index.0.blob_file_id_counter.clone(),
-            self.index.config.path.join(BLOBS_FOLDER),
-            self.id(),
-            self.index.config.descriptor_table.clone(),
-            self.index.config.fs.clone(),
-        )?
-        .use_target_size(kv_opts.file_target_size)
-        .use_compression(kv_opts.compression);
+        let mut blob_writer = {
+            let w = BlobFileWriter::new(
+                self.index.0.blob_file_id_counter.clone(),
+                self.index.config.path.join(BLOBS_FOLDER),
+                self.id(),
+                self.index.config.descriptor_table.clone(),
+                self.index.config.fs.clone(),
+            )?
+            .use_target_size(kv_opts.file_target_size)
+            .use_compression(kv_opts.compression);
+            #[cfg(zstd_any)]
+            let w = w.use_zstd_dictionary(kv_opts.zstd_dictionary.clone());
+            w
+        };
 
         let separation_threshold = kv_opts.separation_threshold;
 
@@ -792,6 +825,12 @@ impl AbstractTree for BlobTree {
                     &self.index.config.cache,
                     &super_version.version,
                     item,
+                    #[cfg(zstd_any)]
+                    self.index
+                        .config
+                        .kv_separation_opts
+                        .as_ref()
+                        .and_then(|o| o.zstd_dictionary.as_deref()),
                 )?;
                 results[idx] = Some(v);
             }

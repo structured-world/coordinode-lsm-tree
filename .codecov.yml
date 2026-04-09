@@ -1,0 +1,6 @@
+coverage:
+  ignore:
+    # structured-zstd bundles its pure-Rust implementation under src/.
+    # llvm-cov captures those files; exclude them so only workspace sources
+    # count toward patch and project coverage.
+    - "zstd/**"

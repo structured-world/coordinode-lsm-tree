@@ -34,6 +34,10 @@ pub struct MultiWriter {
     compression: CompressionType,
     passthrough_compression: CompressionType,
 
+    /// Dictionary for `ZstdDict` compression, shared across all rotated writers.
+    #[cfg(zstd_any)]
+    zstd_dictionary: Option<std::sync::Arc<crate::compression::ZstdDictionary>>,
+
     tree_id: TreeId,
     descriptor_table: Option<Arc<DescriptorTable>>,
 }
@@ -69,6 +73,9 @@ impl MultiWriter {
             compression: CompressionType::None,
             passthrough_compression: CompressionType::None,
 
+            #[cfg(zstd_any)]
+            zstd_dictionary: None,
+
             tree_id,
             descriptor_table,
             fs,
@@ -101,6 +108,21 @@ impl MultiWriter {
         self
     }
 
+    /// Provides the zstd dictionary for [`CompressionType::ZstdDict`] writes.
+    ///
+    /// The dictionary is propagated to every rotated writer so that all blob
+    /// files produced by this `MultiWriter` use the same dictionary.
+    #[cfg(zstd_any)]
+    #[must_use]
+    pub fn use_zstd_dictionary(
+        mut self,
+        dict: Option<std::sync::Arc<crate::compression::ZstdDictionary>>,
+    ) -> Self {
+        self.active_writer = self.active_writer.use_zstd_dictionary(dict.clone());
+        self.zstd_dictionary = dict;
+        self
+    }
+
     /// Sets up a new writer for the next blob file.
     fn rotate(&mut self) -> crate::Result<()> {
         log::debug!("Rotating blob file writer");
@@ -108,8 +130,13 @@ impl MultiWriter {
         let new_blob_file_id = self.id_generator.next();
         let blob_file_path = self.folder.join(new_blob_file_id.to_string());
 
-        let new_writer = Writer::new(blob_file_path, new_blob_file_id, self.tree_id, &*self.fs)?
-            .use_compression(self.compression);
+        let new_writer = {
+            let w = Writer::new(blob_file_path, new_blob_file_id, self.tree_id, &*self.fs)?
+                .use_compression(self.compression);
+            #[cfg(zstd_any)]
+            let w = w.use_zstd_dictionary(self.zstd_dictionary.clone());
+            w
+        };
 
         let old_writer = std::mem::replace(&mut self.active_writer, new_writer);
         let blob_file = Self::consume_writer(
