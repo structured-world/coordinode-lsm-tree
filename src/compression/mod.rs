@@ -107,8 +107,10 @@ impl ZstdDictionary {
     /// Both forms are accepted by [`CompressionProvider::compress_with_dict`]
     /// and [`CompressionProvider::decompress_with_dict`].
     ///
-    /// The dictionary ID stored in this handle is the lower 32 bits of the
-    /// xxh3-64 hash of `raw`; see [`ZstdDictionary::id`].
+    /// The handle stores the full 64-bit xxh3 hash of `raw` internally.
+    /// [`ZstdDictionary::id`] returns the lower 32 bits for external consumers
+    /// (config validation, frame header); [`ZstdDictionary::id64`] exposes the
+    /// full fingerprint for use as a cache key.
     #[must_use]
     pub fn new(raw: &[u8]) -> Self {
         Self {

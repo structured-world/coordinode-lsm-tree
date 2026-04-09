@@ -267,8 +267,8 @@ mod zstd_dict {
         // If major_compact() ever regresses to a no-op, this guard catches it before
         // the read assertions, which would otherwise pass against the original L0 tables.
         assert_eq!(
-            0,
-            tree.level_table_count(0).unwrap_or(0),
+            Some(0),
+            tree.level_table_count(0),
             "L0 must be empty after major_compact — compaction may not have run"
         );
 
