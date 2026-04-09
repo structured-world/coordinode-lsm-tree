@@ -11,6 +11,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [4.4.0](https://github.com/structured-world/coordinode-lsm-tree/compare/v4.3.1...v4.4.0) - 2026-04-09
+
+### Added
+
+- *(compression)* enable dictionary compression in pure Rust backend ([#229](https://github.com/structured-world/coordinode-lsm-tree/pull/229))
+
+### Performance
+
+- *(compression)* cache pre-compiled Dictionary across block decompress calls ([#227](https://github.com/structured-world/coordinode-lsm-tree/pull/227))
+
 ## [4.3.1](https://github.com/structured-world/coordinode-lsm-tree/compare/v4.3.0...v4.3.1) - 2026-04-06
 
 ### Performance
