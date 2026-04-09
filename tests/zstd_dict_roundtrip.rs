@@ -263,6 +263,15 @@ mod zstd_dict {
 
         tree.major_compact(u64::MAX, 0)?;
 
+        // Verify compaction actually ran: L0 must be empty after major compaction.
+        // If major_compact() ever regresses to a no-op, this guard catches it before
+        // the read assertions, which would otherwise pass against the original L0 tables.
+        assert_eq!(
+            0,
+            tree.level_table_count(0).unwrap_or(0),
+            "L0 must be empty after major_compact — compaction may not have run"
+        );
+
         // All 300 keys must be readable after compaction.
         for batch in 0u32..3 {
             for i in 0u32..100 {
