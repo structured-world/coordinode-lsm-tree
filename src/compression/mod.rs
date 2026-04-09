@@ -90,8 +90,10 @@ impl Clone for ZstdDictionary {
     }
 }
 
-/// Two dictionaries are equal when their full 64-bit xxh3 fingerprints agree,
-/// which is equivalent to comparing the raw bytes that produced those fingerprints.
+/// Two dictionaries are equal when their full 64-bit xxh3 fingerprints agree.
+/// Equality is defined by the 64-bit `id` field; hash collisions between
+/// dictionaries with different raw bytes are theoretically possible but
+/// extremely unlikely given the xxh3-64 collision probability.
 #[cfg(zstd_any)]
 impl PartialEq for ZstdDictionary {
     fn eq(&self, other: &Self) -> bool {

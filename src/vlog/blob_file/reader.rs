@@ -1075,7 +1075,7 @@ mod tests {
         Ok(())
     }
 
-    /// Write a blob with ZstdDict, then read it back without supplying a
+    /// Write a blob with `ZstdDict`, then read it back without supplying a
     /// dictionary.  Expect `ZstdDictMismatch { got: None }`.
     #[test]
     #[cfg(zstd_any)]
