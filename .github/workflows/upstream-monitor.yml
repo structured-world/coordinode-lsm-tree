@@ -114,8 +114,10 @@ jobs:
             BODY="${REST#*$'\t'}"
             SHORT=$(git rev-parse --short "$SHA")
             LINE="- \`$SHORT\` $SUBJECT"
+            # Conventional Commits §5 treats `BREAKING CHANGE:` and
+            # `BREAKING-CHANGE:` as equivalent footer tokens — match both.
             if [[ "$SUBJECT" =~ $BREAKING_RE ]] \
-               || printf '%s\n' "$BODY" | grep -qE '^BREAKING CHANGE:'; then
+               || printf '%s\n' "$BODY" | grep -qE '^BREAKING[ -]CHANGE:'; then
               echo "$LINE" >> /tmp/sync/breaking.txt
             elif [[ "$SUBJECT" =~ $FEAT_RE ]]; then
               echo "$LINE" >> /tmp/sync/feat.txt
@@ -191,6 +193,10 @@ jobs:
                 TITLE_SAFE=$(md_escape "$TITLE")
                 echo "- [${UPSTREAM_REPO}${REF}](https://github.com/${UPSTREAM_REPO}/issues/${NUM}) — ${TITLE_SAFE}" \
                   >> /tmp/sync/refs.md
+              else
+                # Log to stderr so partial reference output is debuggable
+                # (transient API failures, rate limits, missing issues, etc.).
+                echo "warn: failed to resolve title for ${UPSTREAM_REPO}${REF}" >&2
               fi
             done
           fi
@@ -242,6 +248,7 @@ jobs:
           BODY=/tmp/sync/body.md
           : > "$BODY"
 
+          UPSTREAM_HEAD_SHORT=$(git rev-parse --short "${UPSTREAM_REMOTE}/main")
           if [ "$NEW_RELEASE" = "true" ]; then
             {
               echo "## Upstream Sync: ${UPSTREAM_PREV_TAG:-(none)} → ${UPSTREAM_LATEST_TAG}"
@@ -249,7 +256,10 @@ jobs:
               echo "**Release:** [${UPSTREAM_LATEST_TAG}](https://github.com/${UPSTREAM_REPO}/releases/tag/${UPSTREAM_LATEST_TAG})"
             } >> "$BODY"
           else
-            echo "## Upstream Sync (no new release tag)" >> "$BODY"
+            # In-development commits between releases — anchor the heading
+            # to the last synced tag and the upstream HEAD short SHA so the
+            # baseline is still visible at a glance.
+            echo "## Upstream Sync: ${UPSTREAM_PREV_TAG:-(none)} → main@${UPSTREAM_HEAD_SHORT}" >> "$BODY"
           fi
           {
             echo "**Commits:** ${BEHIND} new since last sync"
@@ -318,7 +328,11 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          SYNC_BRANCH="chore/upstream-sync-$(date +%Y%m%d)"
+          # Branch name carries the date + run number so a second run on the
+          # same UTC day (manual `workflow_dispatch` after the cron run, or a
+          # re-run while the previous PR is still open) gets a distinct name
+          # and doesn't collide with an existing remote branch / open PR.
+          SYNC_BRANCH="chore/upstream-sync-$(date +%Y%m%d)-${GITHUB_RUN_NUMBER}"
           git checkout -b "$SYNC_BRANCH" origin/main
 
           # Helper: append the review checklist as the last section of the body.
@@ -334,20 +348,25 @@ jobs:
           }
 
           if git merge --no-commit --no-ff "${UPSTREAM_REMOTE}/main" 2>&1; then
-            # Advance the persisted last-synced tag on every successful merge,
-            # regardless of whether this run detected a release boundary. The
-            # state file is lazily bootstrapped — the first sync run with
-            # behind > 0 writes it; until then, the `git tag --merged
+            append_checklist
+            # Commit 1: the upstream merge itself — pure upstream content,
+            # clean for `git log --first-parent` / blame / "what came from
+            # upstream" tooling.
+            git commit -m "chore: sync upstream (${BEHIND} new commits)"
+
+            # Commit 2 (separate): advance the persisted last-synced tag.
+            # Kept out of the merge commit so fork-only bookkeeping doesn't
+            # mix with upstream content. Lazy-bootstrap: first sync with
+            # behind > 0 writes the file; until then the `git tag --merged
             # origin/main` inference in the detect step covers the gap.
-            # Runs with behind == 0 don't reach this step and don't need to
-            # write the file (state is unchanged).
+            # Runs with behind == 0 don't reach this step.
             if [ -n "${UPSTREAM_LATEST_TAG}" ]; then
               mkdir -p "$(dirname "$STATE_FILE")"
               echo "$UPSTREAM_LATEST_TAG" > "$STATE_FILE"
               git add "$STATE_FILE"
+              git commit -m "chore: bump upstream sync state to ${UPSTREAM_LATEST_TAG}"
             fi
-            append_checklist
-            git commit -m "chore: sync upstream (${BEHIND} new commits)"
+
             git push origin "$SYNC_BRANCH"
 
             gh pr create \
@@ -362,31 +381,50 @@ jobs:
             # nothing to abort and the bare command would fail under `set -e`.
             git merge --abort 2>/dev/null || true
 
-            # Insert conflict + manual-resolution sections BEFORE the
-            # checklist so the issue reads top-to-bottom: summary → changes
-            # → conflicts → resolution → checklist.
-            {
-              echo "### Conflicting files"
-              echo
-              echo '```'
-              echo "$CONFLICTS"
-              echo '```'
-              echo
-              echo "### Manual resolution"
-              echo
-              echo '```bash'
-              echo "git remote add upstream ${UPSTREAM_URL}"
-              echo "git fetch upstream main"
-              echo "git checkout -b chore/upstream-sync main"
-              echo "git merge upstream/main"
-              echo "# Resolve conflicts, then push"
-              echo '```'
-              echo
-            } >> "$BODY_PATH"
+            if [ -n "$CONFLICTS" ]; then
+              # Real conflicts — list the files and provide manual-resolution
+              # snippet. Sections go BEFORE the checklist so the issue reads
+              # top-to-bottom: summary → changes → conflicts → resolution
+              # → checklist.
+              {
+                echo "### Conflicting files"
+                echo
+                echo '```'
+                echo "$CONFLICTS"
+                echo '```'
+                echo
+                echo "### Manual resolution"
+                echo
+                echo '```bash'
+                echo "git remote add upstream ${UPSTREAM_URL}"
+                echo "git fetch upstream main"
+                echo "git checkout -b chore/upstream-sync main"
+                echo "git merge upstream/main"
+                echo "# Resolve conflicts, then push"
+                echo '```'
+                echo
+              } >> "$BODY_PATH"
+              ISSUE_TITLE="Upstream sync conflict (${BEHIND} new commits)"
+            else
+              # Merge failed for a non-conflict reason (dirty tree from a
+              # prior step, internal git error, hook refusal). Don't fake a
+              # conflict body — emit a clearly different signal so on-call
+              # investigates the workflow itself.
+              {
+                echo "### Merge failed without conflicts"
+                echo
+                echo "\`git merge --no-commit --no-ff ${UPSTREAM_REMOTE}/main\` returned non-zero"
+                echo "but no unmerged paths were detected. This usually means a"
+                echo "pre-merge refusal (dirty tree, hook rejection, internal git error)"
+                echo "rather than a content conflict. Inspect the workflow run logs."
+                echo
+              } >> "$BODY_PATH"
+              ISSUE_TITLE="Upstream sync merge failed without conflicts (${BEHIND} new commits)"
+            fi
             append_checklist
 
             gh issue create \
-              --title "Upstream sync conflict (${BEHIND} new commits)" \
+              --title "$ISSUE_TITLE" \
               --body-file "$BODY_PATH" \
               --label "upstream-sync"
           fi
