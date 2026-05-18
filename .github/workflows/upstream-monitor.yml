@@ -8,10 +8,16 @@ on:
 permissions:
   contents: write
   pull-requests: write
+  issues: write
+
+env:
+  UPSTREAM_REMOTE: upstream
+  UPSTREAM_URL: https://github.com/fjall-rs/lsm-tree.git
+  UPSTREAM_REPO: fjall-rs/lsm-tree
 
 jobs:
   check-upstream:
-    timeout-minutes: 10
+    timeout-minutes: 15
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -20,111 +26,278 @@ jobs:
           fetch-depth: 0
 
       - name: Add upstream remote
-        run: git remote add upstream https://github.com/fjall-rs/lsm-tree.git
+        run: git remote add "$UPSTREAM_REMOTE" "$UPSTREAM_URL"
 
-      - name: Fetch upstream and origin
+      - name: Fetch upstream and origin (with tags)
         run: |
-          git fetch upstream main
+          git fetch --tags "$UPSTREAM_REMOTE" main
           git fetch origin main
 
-      - name: Check for new upstream commits
-        id: check
+      - name: Detect upstream changes and release
+        id: detect
         run: |
-          BEHIND=$(git rev-list origin/main..upstream/main --count)
-          echo "behind=$BEHIND" >> "$GITHUB_OUTPUT"
-          echo "Commits behind upstream: $BEHIND"
+          set -euo pipefail
 
-      - name: Try merge and create PR or issue
-        if: steps.check.outputs.behind > 0
+          BEHIND=$(git rev-list "origin/main..${UPSTREAM_REMOTE}/main" --count)
+          echo "behind=$BEHIND" >> "$GITHUB_OUTPUT"
+
+          UPSTREAM_LATEST_TAG=$(git tag -l --sort=-v:refname --merged "${UPSTREAM_REMOTE}/main" \
+            | grep -E '^v?[0-9]+\.[0-9]+\.[0-9]+$' | head -1 || true)
+          UPSTREAM_PREV_TAG=$(git tag -l --sort=-v:refname --merged "origin/main" \
+            | grep -E '^v?[0-9]+\.[0-9]+\.[0-9]+$' | head -1 || true)
+          echo "upstream_latest_tag=$UPSTREAM_LATEST_TAG" >> "$GITHUB_OUTPUT"
+          echo "upstream_prev_tag=$UPSTREAM_PREV_TAG" >> "$GITHUB_OUTPUT"
+
+          NEW_RELEASE=false
+          if [ -n "$UPSTREAM_LATEST_TAG" ] && [ "$UPSTREAM_LATEST_TAG" != "$UPSTREAM_PREV_TAG" ]; then
+            NEW_RELEASE=true
+          fi
+          echo "new_release=$NEW_RELEASE" >> "$GITHUB_OUTPUT"
+
+          echo "Commits behind upstream: $BEHIND"
+          echo "Upstream latest tag: ${UPSTREAM_LATEST_TAG:-<none>}"
+          echo "Upstream tag in our main: ${UPSTREAM_PREV_TAG:-<none>}"
+          echo "New release available: $NEW_RELEASE"
+
+      - name: Build change report
+        if: steps.detect.outputs.behind > 0
+        id: report
+        env:
+          BEHIND: ${{ steps.detect.outputs.behind }}
+          NEW_RELEASE: ${{ steps.detect.outputs.new_release }}
+          UPSTREAM_LATEST_TAG: ${{ steps.detect.outputs.upstream_latest_tag }}
+          UPSTREAM_PREV_TAG: ${{ steps.detect.outputs.upstream_prev_tag }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          mkdir -p /tmp/sync
+          : > /tmp/sync/breaking.txt
+          : > /tmp/sync/feat.txt
+          : > /tmp/sync/fix.txt
+          : > /tmp/sync/perf.txt
+          : > /tmp/sync/other.txt
+
+          # Categorise each new upstream commit by conventional commit prefix.
+          git log "origin/main..${UPSTREAM_REMOTE}/main" --format='%H%x09%s' \
+            | while IFS=$'\t' read -r SHA SUBJECT; do
+                SHORT=$(git rev-parse --short "$SHA")
+                LINE="- \`$SHORT\` $SUBJECT"
+                case "$SUBJECT" in
+                  *"BREAKING CHANGE"*|*"!:"*)
+                    echo "$LINE" >> /tmp/sync/breaking.txt ;;
+                  feat:*|feat\(*)
+                    echo "$LINE" >> /tmp/sync/feat.txt ;;
+                  fix:*|fix\(*)
+                    echo "$LINE" >> /tmp/sync/fix.txt ;;
+                  perf:*|perf\(*)
+                    echo "$LINE" >> /tmp/sync/perf.txt ;;
+                  *)
+                    echo "$LINE" >> /tmp/sync/other.txt ;;
+                esac
+              done
+
+          # Extract referenced upstream issue/PR numbers from commit
+          # subjects + bodies; resolve titles via API for the first 20.
+          git log "origin/main..${UPSTREAM_REMOTE}/main" --format='%s%n%b' \
+            | grep -oE '#[0-9]+' | sort -u > /tmp/sync/refs_raw.txt || true
+
+          : > /tmp/sync/refs.md
+          if [ -s /tmp/sync/refs_raw.txt ]; then
+            head -20 /tmp/sync/refs_raw.txt | while read -r REF; do
+              NUM="${REF#\#}"
+              TITLE=$(gh issue view "$NUM" --repo "$UPSTREAM_REPO" --json title --jq '.title' 2>/dev/null \
+                || gh pr view "$NUM" --repo "$UPSTREAM_REPO" --json title --jq '.title' 2>/dev/null \
+                || true)
+              if [ -n "$TITLE" ]; then
+                echo "- [${UPSTREAM_REPO}${REF}](https://github.com/${UPSTREAM_REPO}/issues/${NUM}) — ${TITLE}" \
+                  >> /tmp/sync/refs.md
+              fi
+            done
+          fi
+
+          # Fork overlap: files touched by both upstream (since last shared
+          # commit) AND our fork (commits in origin/main not in upstream/main).
+          MERGE_BASE=$(git merge-base origin/main "${UPSTREAM_REMOTE}/main")
+          git diff --name-only "$MERGE_BASE..${UPSTREAM_REMOTE}/main" | sort -u > /tmp/sync/upstream_files.txt
+          git diff --name-only "$MERGE_BASE..origin/main" | sort -u > /tmp/sync/fork_files.txt
+          comm -12 /tmp/sync/upstream_files.txt /tmp/sync/fork_files.txt > /tmp/sync/overlap.txt || true
+
+          # Emit summary counts for use in subsequent steps.
+          {
+            echo "breaking=$(wc -l < /tmp/sync/breaking.txt | tr -d ' ')"
+            echo "feat=$(wc -l < /tmp/sync/feat.txt | tr -d ' ')"
+            echo "fix=$(wc -l < /tmp/sync/fix.txt | tr -d ' ')"
+            echo "perf=$(wc -l < /tmp/sync/perf.txt | tr -d ' ')"
+            echo "other=$(wc -l < /tmp/sync/other.txt | tr -d ' ')"
+            echo "overlap=$(wc -l < /tmp/sync/overlap.txt | tr -d ' ')"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Compose structured body
+        if: steps.detect.outputs.behind > 0
+        id: body
+        env:
+          BEHIND: ${{ steps.detect.outputs.behind }}
+          NEW_RELEASE: ${{ steps.detect.outputs.new_release }}
+          UPSTREAM_LATEST_TAG: ${{ steps.detect.outputs.upstream_latest_tag }}
+          UPSTREAM_PREV_TAG: ${{ steps.detect.outputs.upstream_prev_tag }}
+        run: |
+          set -euo pipefail
+
+          BODY=/tmp/sync/body.md
+          : > "$BODY"
+
+          if [ "$NEW_RELEASE" = "true" ]; then
+            {
+              echo "## Upstream Sync: ${UPSTREAM_PREV_TAG:-<none>} → ${UPSTREAM_LATEST_TAG}"
+              echo
+              echo "**Release:** [${UPSTREAM_LATEST_TAG}](https://github.com/${UPSTREAM_REPO}/releases/tag/${UPSTREAM_LATEST_TAG})"
+            } >> "$BODY"
+          else
+            echo "## Upstream Sync (no new release tag)" >> "$BODY"
+          fi
+          {
+            echo "**Commits:** ${BEHIND} new since last sync"
+            echo "**Upstream:** [${UPSTREAM_REPO}](https://github.com/${UPSTREAM_REPO})"
+            echo
+            echo "### Changes by category"
+            echo
+          } >> "$BODY"
+
+          emit_section() {
+            local title="$1" file="$2"
+            if [ -s "$file" ]; then
+              {
+                echo "#### ${title} ($(wc -l < "$file" | tr -d ' '))"
+                echo
+                cat "$file"
+                echo
+              } >> "$BODY"
+            fi
+          }
+
+          emit_section "⚠️ Breaking" /tmp/sync/breaking.txt
+          emit_section "✨ Features" /tmp/sync/feat.txt
+          emit_section "🐛 Fixes"    /tmp/sync/fix.txt
+          emit_section "⚡ Performance" /tmp/sync/perf.txt
+          emit_section "📝 Other"    /tmp/sync/other.txt
+
+          if [ -s /tmp/sync/refs.md ]; then
+            {
+              echo "### Referenced upstream issues / PRs"
+              echo
+              cat /tmp/sync/refs.md
+              echo
+            } >> "$BODY"
+          fi
+
+          if [ -s /tmp/sync/overlap.txt ]; then
+            {
+              echo "### Fork overlap — files modified by both upstream and our fork"
+              echo
+              echo "Manual review recommended (semantic conflicts possible even on clean merge):"
+              echo
+              while read -r FILE; do
+                echo "- \`${FILE}\`"
+              done < /tmp/sync/overlap.txt
+              echo
+            } >> "$BODY"
+          fi
+
+          {
+            echo "### Review checklist"
+            echo
+            echo "- [ ] Breaking changes evaluated for fork impact"
+            echo "- [ ] Overlapping files reviewed for semantic conflicts"
+            echo "- [ ] Fork-specific tests pass with upstream changes"
+            echo "- [ ] \`coordinode-lsm-tree\` version bumped in consumer projects if upstream cuts a release"
+          } >> "$BODY"
+
+          echo "body_path=$BODY" >> "$GITHUB_OUTPUT"
+
+      - name: Try merge and create PR or conflict issue
+        if: steps.detect.outputs.behind > 0
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          BEHIND: ${{ steps.check.outputs.behind }}
+          BEHIND: ${{ steps.detect.outputs.behind }}
+          BODY_PATH: ${{ steps.body.outputs.body_path }}
         run: |
+          set -euo pipefail
+
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
           SYNC_BRANCH="chore/upstream-sync-$(date +%Y%m%d)"
           git checkout -b "$SYNC_BRANCH" origin/main
 
-          if git merge --no-commit --no-ff upstream/main 2>&1; then
-            git commit -m "chore: sync upstream ($BEHIND new commits)"
+          if git merge --no-commit --no-ff "${UPSTREAM_REMOTE}/main" 2>&1; then
+            git commit -m "chore: sync upstream (${BEHIND} new commits)"
             git push origin "$SYNC_BRANCH"
 
             gh pr create \
-              --title "chore: sync upstream ($BEHIND new commits)" \
-              --body "$(cat <<'EOF'
-          ## Upstream Sync
-
-          Automated sync from [fjall-rs/lsm-tree](https://github.com/fjall-rs/lsm-tree) main branch.
-
-          **Commits behind:** ${{ steps.check.outputs.behind }}
-
-          ### Review checklist
-          - [ ] Review upstream changes for breaking modifications
-          - [ ] Verify our patches still apply cleanly
-          - [ ] Run full test suite
-          EOF
-          )" \
+              --title "chore: sync upstream (${BEHIND} new commits)" \
+              --body-file "$BODY_PATH" \
               --base main \
               --head "$SYNC_BRANCH"
           else
             CONFLICTS=$(git diff --name-only --diff-filter=U 2>/dev/null || true)
             git merge --abort
 
+            {
+              echo
+              echo "### Conflicting files"
+              echo
+              echo '```'
+              echo "$CONFLICTS"
+              echo '```'
+              echo
+              echo "### Manual resolution"
+              echo
+              echo '```bash'
+              echo "git remote add upstream ${UPSTREAM_URL}"
+              echo "git fetch upstream main"
+              echo "git checkout -b chore/upstream-sync main"
+              echo "git merge upstream/main"
+              echo "# Resolve conflicts, then push"
+              echo '```'
+            } >> "$BODY_PATH"
+
             gh issue create \
-              --title "Upstream sync conflict ($BEHIND new commits)" \
-              --body "$(cat <<EOF
-          ## Upstream Sync Conflict
-
-          Automated merge from [fjall-rs/lsm-tree](https://github.com/fjall-rs/lsm-tree) main branch failed due to conflicts.
-
-          **Commits behind:** $BEHIND
-
-          ### Conflicting files
-          \`\`\`
-          $CONFLICTS
-          \`\`\`
-
-          ### Resolution
-          Manual merge required:
-          \`\`\`bash
-          git remote add upstream https://github.com/fjall-rs/lsm-tree.git
-          git fetch upstream main
-          git checkout -b chore/upstream-sync main
-          git merge upstream/main
-          # Resolve conflicts, then push
-          \`\`\`
-          EOF
-          )" \
-              --label "upstream-sync"
+              --title "Upstream sync conflict (${BEHIND} new commits)" \
+              --body-file "$BODY_PATH"
           fi
 
       - name: Check for merged feature branches
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          git fetch upstream main
+          set -euo pipefail
 
-          for ref in $(git for-each-ref --format='%(refname:short)' refs/remotes/origin/feat/#* refs/remotes/origin/fix/#*); do
+          for ref in $(git for-each-ref --format='%(refname:short)' \
+                         'refs/remotes/origin/feat/#*' \
+                         'refs/remotes/origin/fix/#*'); do
             BRANCH="${ref#origin/}"
             BRANCH_TIP=$(git rev-parse "$ref")
 
-            if git merge-base --is-ancestor "$BRANCH_TIP" upstream/main 2>/dev/null; then
-              echo "Branch '$BRANCH' is fully merged into upstream/main"
+            if git merge-base --is-ancestor "$BRANCH_TIP" "${UPSTREAM_REMOTE}/main" 2>/dev/null; then
+              echo "Branch '$BRANCH' is fully merged into ${UPSTREAM_REMOTE}/main"
 
-              EXISTING=$(gh issue list --search "Upstream merged: $BRANCH" --state open --json number --jq 'length')
+              EXISTING=$(gh issue list \
+                --search "Upstream merged: $BRANCH" \
+                --state open --json number --jq 'length')
               if [ "$EXISTING" = "0" ]; then
+                BODY_FILE=$(mktemp)
+                {
+                  echo "Branch \`$BRANCH\` has been fully merged into ${UPSTREAM_REPO} main branch."
+                  echo
+                  echo "This branch can likely be deleted. Please verify and clean up."
+                  echo
+                  echo "**Branch tip:** \`$BRANCH_TIP\`"
+                } > "$BODY_FILE"
                 gh issue create \
                   --title "Upstream merged: $BRANCH" \
-                  --body "$(cat <<EOF
-          Branch \`$BRANCH\` has been fully merged into upstream's main branch.
-
-          This branch can likely be deleted. Please verify and clean up.
-
-          **Branch tip:** \`$BRANCH_TIP\`
-          EOF
-          )" \
-                  --label "upstream-sync"
+                  --body-file "$BODY_FILE"
+                rm -f "$BODY_FILE"
               fi
             fi
           done
