@@ -158,8 +158,10 @@ pub fn load_block(
 ///
 /// Dispatch:
 /// - **`x86_64` with AVX2** (runtime-detected): 32-byte vectorized lanes via `_mm256_cmpeq_epi8`.
+/// - **`x86_64` without AVX2**: 16-byte SSE2 lanes via `_mm_cmpeq_epi8` — SSE2 is the mandatory
+///   `x86_64` ISA baseline, so this path needs no runtime check, only the AVX2 negative result.
 /// - **`aarch64` little-endian**: 16-byte vectorized lanes via NEON (`ARMv8` baseline — no runtime check).
-/// - **Everything else** (incl. `x86_64` without AVX2, big-endian aarch64): 8-byte word stride via XOR + trailing zeros.
+/// - **Everything else** (incl. big-endian aarch64, 32-bit x86, riscv, powerpc): 8-byte word stride via XOR + trailing zeros.
 ///
 /// `is_x86_feature_detected!` caches the CPUID result, so the per-call dispatch
 /// cost is one cached atomic load on `x86_64`.
@@ -171,6 +173,10 @@ pub fn longest_shared_prefix_length(s1: &[u8], s2: &[u8]) -> usize {
             // SAFETY: AVX2 availability just verified via runtime CPU feature detection.
             return unsafe { lsp_avx2(s1, s2) };
         }
+        // SAFETY: SSE2 is part of the mandatory x86_64 ISA baseline — every x86_64 CPU
+        // supports it, so no runtime check is required. The `#[target_feature(enable = "sse2")]`
+        // attribute on `lsp_sse2` documents this contract explicitly.
+        return unsafe { lsp_sse2(s1, s2) };
     }
     #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
     {
@@ -180,15 +186,18 @@ pub fn longest_shared_prefix_length(s1: &[u8], s2: &[u8]) -> usize {
         // shipped flavour: Linux servers, Apple Silicon, Android, iOS).
         return unsafe { lsp_neon(s1, s2) };
     }
-    // On LE aarch64 the NEON dispatch arm above unconditionally returns, so the
-    // scalar tail is statically unreachable; on x86_64 the AVX2 arm is gated
-    // on runtime CPU detection, so the scalar tail is genuinely reachable
-    // when AVX2 is unavailable — the expect only applies to LE aarch64.
+    // On x86_64 the SSE2 arm above unconditionally returns, and on LE aarch64 the NEON
+    // arm does the same — so the scalar tail is statically unreachable on both. It IS
+    // reachable on every other target (BE aarch64, 32-bit x86, riscv, powerpc, …),
+    // which is the whole point of having a portable fallback.
     #[cfg_attr(
-        all(target_arch = "aarch64", target_endian = "little"),
+        any(
+            target_arch = "x86_64",
+            all(target_arch = "aarch64", target_endian = "little")
+        ),
         expect(
             unreachable_code,
-            reason = "NEON arm above is unconditional on LE aarch64; scalar tail only reached on other archs/endianness"
+            reason = "x86_64 SSE2 and LE aarch64 NEON arms above are unconditional; scalar tail only reached on other archs/endianness"
         )
     )]
     lsp_scalar(s1, s2)
@@ -283,6 +292,66 @@ unsafe fn lsp_avx2(s1: &[u8], s2: &[u8]) -> usize {
     }
 
     // Tail: byte-stride (≤31 bytes left, not worth dispatching a narrower kernel).
+    while i < min_len {
+        // SAFETY: i < min_len ≤ s{1,2}.len()
+        let (a, b) = unsafe { (*s1.get_unchecked(i), *s2.get_unchecked(i)) };
+        if a != b {
+            return i;
+        }
+        i += 1;
+    }
+
+    min_len
+}
+
+/// SSE2 implementation — 16 bytes per iteration via `_mm_cmpeq_epi8`.
+///
+/// Used on `x86_64` hosts that lack AVX2 (older Intel Atoms, some sandboxed
+/// VMs / containers, AMD pre-Excavator, low-power embedded `x86_64`). SSE2 is
+/// mandatory in the `x86_64` ISA baseline, so no runtime detection is needed.
+///
+/// # Safety
+///
+/// Caller must be on `target_arch = "x86_64"`. The `#[target_feature(enable = "sse2")]`
+/// attribute is satisfied unconditionally on `x86_64` — every CPU supports SSE2.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse2")]
+#[expect(unsafe_code, reason = "intrinsics require unsafe")]
+#[must_use]
+unsafe fn lsp_sse2(s1: &[u8], s2: &[u8]) -> usize {
+    use std::arch::x86_64::{__m128i, _mm_cmpeq_epi8, _mm_loadu_si128, _mm_movemask_epi8};
+
+    let min_len = s1.len().min(s2.len());
+    let mut i = 0;
+
+    while i + 16 <= min_len {
+        // SAFETY: i + 16 <= min_len ≤ s{1,2}.len() — both 16-byte loads are in-bounds.
+        // `_mm_loadu_si128` is the *unaligned* load, so the u8→__m128i pointer cast
+        // does not require 16-byte alignment (the pointer is only used by `loadu`).
+        #[expect(
+            clippy::cast_ptr_alignment,
+            reason = "_mm_loadu_si128 explicitly performs an unaligned 16-byte load"
+        )]
+        let (va, vb) = unsafe {
+            (
+                _mm_loadu_si128(s1.as_ptr().add(i).cast::<__m128i>()),
+                _mm_loadu_si128(s2.as_ptr().add(i).cast::<__m128i>()),
+            )
+        };
+        // Register-only SSE2 intrinsics under #[target_feature(enable = "sse2")] —
+        // safe in stable Rust without an inner `unsafe` block.
+        let cmp = _mm_cmpeq_epi8(va, vb);
+        // `_mm_movemask_epi8` returns the 16-bit byte-mask as a signed `i32`
+        // (low 16 bits used, high 16 zero). Reinterpret as `u32` for trailing-zeros math.
+        let mask = _mm_movemask_epi8(cmp).cast_unsigned();
+        // SSE2 mask is 16 bits, so a full-match lane is `0xFFFF`, not `u32::MAX`.
+        if mask != 0xFFFF {
+            return i + (!mask).trailing_zeros() as usize;
+        }
+        i += 16;
+    }
+
+    // Tail: byte-stride (≤15 bytes left).
     while i < min_len {
         // SAFETY: i < min_len ≤ s{1,2}.len()
         let (a, b) = unsafe { (*s1.get_unchecked(i), *s2.get_unchecked(i)) };
@@ -599,16 +668,16 @@ mod tests {
     proptest::proptest! {
         #[test]
         fn lsp_scalar_equals_reference(
-            s1 in proptest::collection::vec(proptest::num::u8::ANY, 0..1024),
-            s2 in proptest::collection::vec(proptest::num::u8::ANY, 0..1024),
+            s1 in proptest::collection::vec(proptest::num::u8::ANY, 0..=1024),
+            s2 in proptest::collection::vec(proptest::num::u8::ANY, 0..=1024),
         ) {
             proptest::prop_assert_eq!(lsp_scalar(&s1, &s2), lsp_reference(&s1, &s2));
         }
 
         #[test]
         fn longest_shared_prefix_length_equals_reference(
-            s1 in proptest::collection::vec(proptest::num::u8::ANY, 0..1024),
-            s2 in proptest::collection::vec(proptest::num::u8::ANY, 0..1024),
+            s1 in proptest::collection::vec(proptest::num::u8::ANY, 0..=1024),
+            s2 in proptest::collection::vec(proptest::num::u8::ANY, 0..=1024),
         ) {
             proptest::prop_assert_eq!(longest_shared_prefix_length(&s1, &s2), lsp_reference(&s1, &s2));
         }

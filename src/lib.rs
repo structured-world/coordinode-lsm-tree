@@ -180,6 +180,12 @@ pub type UserValue = Slice;
 /// KV-tuple (key + value)
 pub type KvPair = (UserKey, UserValue);
 
+// The `#[doc(hidden)]` block below re-exports crate internals that are reachable
+// at the crate root for benchmarks and integration tests, but are NOT part of the
+// public API contract — they carry no semver guarantee and may be renamed, moved,
+// or removed without a major version bump. External callers that import these
+// hidden items do so at their own risk. `cargo doc` excludes them from generated
+// rustdoc output; only intra-crate test/bench code is expected to use them.
 #[doc(hidden)]
 pub use {
     blob_tree::{Guard as BlobGuard, handle::BlobIndirection},
@@ -188,6 +194,7 @@ pub use {
     key_range::KeyRange,
     merge::BoxedIterator,
     slice::Builder,
+    // Re-exported for `benches/lsp.rs` only — see hidden-block contract above.
     table::util::longest_shared_prefix_length,
     table::{GlobalTableId, Table, TableId},
     tree::Guard as StandardGuard,
