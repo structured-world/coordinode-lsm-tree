@@ -106,12 +106,26 @@ jobs:
           echo "New release available: $NEW_RELEASE"
 
       - name: Check skip conditions
-        # Early skip gate — runs BEFORE Build change report and Compose
-        # body steps so cron runs on already-considered upstream HEADs
-        # short-circuit before the expensive Build step (which issues up
-        # to 20 upstream API calls for title resolution per ref). The
-        # merge step still re-checks defensively, but the API-quota
-        # win is here.
+        # Early skip gate — runs BEFORE the expensive Build step (which
+        # issues up to 20 upstream API calls for title resolution).
+        #
+        # Single rule: if a sync artifact (PR or issue) already exists
+        # for THIS upstream HEAD — in any state (open, closed, merged)
+        # — skip. Each sync PR/issue title carries `(upstream@<short>)`
+        # for searchability.
+        #
+        # The state semantics collapse cleanly:
+        #   - open → review in progress, don't stack
+        #   - merged → user accepted; origin/main has advanced, next
+        #     run reads BEHIND=0
+        #   - closed (not merged) → user decided "no" for this HEAD;
+        #     closing the PR IS the "considered" signal, no manual
+        #     state-file edit required
+        # All three reduce to "don't resurface this HEAD until upstream
+        # advances and produces a new short SHA".
+        #
+        # workflow_dispatch input `force=true` bypasses this gate for
+        # explicit "re-surface anyway" runs.
         if: steps.detect.outputs.behind != '0'
         id: skip
         env:
@@ -120,37 +134,28 @@ jobs:
           FORCE: ${{ inputs.force }}
         run: |
           set -euo pipefail
-          SHOULD_RUN=true
-          REASON=""
 
-          # An open sync PR is unresolved review work — don't stack.
-          # Ensure the label exists first (otherwise the query fails
-          # against a missing label with non-zero exit). Idempotent.
+          # Ensure the `upstream-sync` label exists (gh queries against
+          # a missing label exit non-zero). Idempotent.
           gh label create "upstream-sync" \
             --color "fbca04" \
             --description "Automated upstream synchronization — merge conflicts, release tracking" \
             --force >/dev/null
-          OPEN_SYNC_PRS=$(gh pr list \
-            --label upstream-sync --state open \
-            --json number --jq 'length')
-          if [ "$OPEN_SYNC_PRS" -gt 0 ]; then
-            SHOULD_RUN=false
-            REASON="${OPEN_SYNC_PRS} open sync PR(s) already exist"
-          fi
 
-          # Already-considered upstream HEAD (close-without-merge memory).
-          if [ "$SHOULD_RUN" = "true" ] && [ "$FORCE" != "true" ]; then
-            CONSIDERED_TAG="upstream-sync-considered/${UPSTREAM_HEAD_SHORT}"
-            if git ls-remote --tags --exit-code origin "refs/tags/${CONSIDERED_TAG}" >/dev/null 2>&1; then
+          SHOULD_RUN=true
+          if [ "$FORCE" != "true" ]; then
+            # GitHub search index strips `@` and `#` from query text;
+            # the title fragment `upstream-${UPSTREAM_HEAD_SHORT}` uses
+            # a dash so it survives intact and remains greppable.
+            QUERY="upstream-${UPSTREAM_HEAD_SHORT} in:title label:upstream-sync repo:${GITHUB_REPOSITORY}"
+            COUNT=$(gh api -X GET search/issues -f q="$QUERY" --jq '.total_count')
+            if [ "$COUNT" -gt 0 ]; then
               SHOULD_RUN=false
-              REASON="upstream HEAD ${UPSTREAM_HEAD_SHORT} already considered (tag ${CONSIDERED_TAG})"
+              echo "Skip: ${COUNT} sync artifact(s) for upstream-${UPSTREAM_HEAD_SHORT} already exist (open/closed/merged). Subsequent steps will short-circuit."
             fi
           fi
 
           echo "should_run=$SHOULD_RUN" >> "$GITHUB_OUTPUT"
-          if [ "$SHOULD_RUN" = "false" ]; then
-            echo "Skip: ${REASON}. Subsequent steps will short-circuit."
-          fi
 
       - name: Build change report
         if: steps.detect.outputs.behind != '0' && steps.skip.outputs.should_run == 'true'
@@ -453,13 +458,16 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          # Skip conditions (open sync PR exists, considered-tag for
-          # current upstream HEAD) are evaluated in the earlier
-          # `Check skip conditions` step. This step's `if:` gate
-          # already includes `steps.skip.outputs.should_run == 'true'`,
-          # so we don't re-check here. `upstream-sync` label is also
-          # ensured in the skip step.
-          CONSIDERED_TAG="upstream-sync-considered/${UPSTREAM_HEAD_SHORT}"
+          # Skip conditions (any sync artifact for current upstream HEAD)
+          # are evaluated in the earlier `Check skip conditions` step.
+          # This step's `if:` gate already includes
+          # `steps.skip.outputs.should_run == 'true'`, so we don't re-check
+          # here. `upstream-sync` label is also ensured in the skip step.
+          #
+          # All sync PR / issue titles include the `upstream-<short>`
+          # fragment that the skip-step search looks for. The fragment
+          # uses a dash (not `@` or `#`) so GitHub's search-text
+          # normaliser doesn't strip it.
 
           # Branch name carries the date + run number so a second run on the
           # same UTC day (manual `workflow_dispatch` after the cron run) gets
@@ -484,7 +492,7 @@ jobs:
             # Commit 1: the upstream merge itself — pure upstream content,
             # clean for `git log --first-parent` / blame / "what came from
             # upstream" tooling.
-            git commit -m "chore: sync upstream (${BEHIND} new commits)"
+            git commit -m "chore: sync upstream-${UPSTREAM_HEAD_SHORT} (${BEHIND} new commits)"
 
             # Commit 2 (separate): advance the persisted last-synced tag.
             # Kept out of the merge commit so fork-only bookkeeping doesn't
@@ -508,7 +516,7 @@ jobs:
             git push origin "$SYNC_BRANCH"
 
             gh pr create \
-              --title "chore: sync upstream (${BEHIND} new commits)" \
+              --title "chore: sync upstream-${UPSTREAM_HEAD_SHORT} (${BEHIND} new commits)" \
               --body-file "$BODY_PATH" \
               --base main \
               --head "$SYNC_BRANCH" \
@@ -547,7 +555,7 @@ jobs:
                 echo '```'
                 echo
               } >> "$BODY_PATH"
-              ISSUE_TITLE="Upstream sync conflict (${BEHIND} new commits)"
+              ISSUE_TITLE="Upstream sync conflict for upstream-${UPSTREAM_HEAD_SHORT} (${BEHIND} new commits)"
             else
               # Merge failed for a non-conflict reason (dirty tree from a
               # prior step, internal git error, hook refusal). Don't fake a
@@ -562,7 +570,7 @@ jobs:
                 echo "rather than a content conflict. Inspect the workflow run logs."
                 echo
               } >> "$BODY_PATH"
-              ISSUE_TITLE="Upstream sync merge failed without conflicts (${BEHIND} new commits)"
+              ISSUE_TITLE="Upstream sync merge failed without conflicts for upstream-${UPSTREAM_HEAD_SHORT} (${BEHIND} new commits)"
             fi
             append_checklist
 
@@ -572,37 +580,12 @@ jobs:
               --label "upstream-sync"
           fi
 
-          # Mark this exact upstream HEAD as "considered" — applies on
-          # both routes (successful merge / problem report). For a fork
-          # with permanent divergences (renames, cherry-pick-only
-          # relationships), the conflict route is the steady state and
-          # without this tag every cron run would refile the same issue.
-          # The tag stays regardless of how the maintainer dispositions
-          # the surfaced artifact.
-          #
-          # IMPORTANT: tag points at `origin/main` (our own HEAD), not
-          # `upstream/main`. The upstream short SHA lives only in the
-          # tag NAME. Pointing the tag at upstream's HEAD would make
-          # GitHub reject the push when upstream's commits include
-          # workflow file changes — the default GITHUB_TOKEN has no
-          # `workflows: write` scope, so any ref that surfaces unseen
-          # workflow content fails server-side. Pointing at our own
-          # main avoids that check entirely; the tag is a marker, the
-          # target commit is irrelevant.
-          #
-          # `-f` because `actions/checkout` with fetch-depth=0 brings
-          # all origin tags into the local clone, so a force=true
-          # re-run against the same upstream HEAD finds the local tag
-          # already present. Plain `git tag` would abort the step
-          # under `set -e` after the PR/issue had already been opened.
-          # `|| true` on the push is for the remote-side collision
-          # which is harmless (same target).
-          git tag -f "$CONSIDERED_TAG" origin/main
-          # `+refs/tags/...` is the localised refspec form for tag
-          # override (equivalent to `--force` but scoped to just this
-          # ref). `|| true` because a remote-side collision is
-          # harmless (target is identical or only the tag NAME mattered).
-          git push origin "+refs/tags/${CONSIDERED_TAG}" || true
+          # No tag-push here: the "considered" signal is the existence
+          # of the PR/issue artifact itself (queried by title in the
+          # Check skip conditions step). Closing the auto-PR without
+          # merging is the user's "I've seen this" action; the
+          # closed PR remains in repo history and satisfies the
+          # search query, so future runs skip until upstream advances.
 
       - name: Check for merged feature branches
         env:
