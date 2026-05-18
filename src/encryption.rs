@@ -148,30 +148,29 @@ impl Aes256GcmProvider {
     }
 }
 
-/// Create a new [`ChaCha20Rng`](rand_chacha::ChaCha20Rng) seeded from the OS RNG.
+/// Create a new [`ChaCha20Rng`](rand_chacha::ChaCha20Rng) seeded from the OS RNG
+/// (via the getrandom-backed `SysRng` exposed by aes-gcm's `Generate` trait).
 ///
 /// Returns the RNG directly (not `Result`) because callers are
 /// `thread_local!` init and fork-reseed, neither of which can propagate
 /// errors. This function will panic if OS entropy is unavailable.
 #[cfg(feature = "encryption")]
 fn new_chacha_rng() -> rand_chacha::ChaCha20Rng {
-    // Use rand_core re-exported by aes_gcm to avoid version-skew with a
-    // direct rand_core dependency.
-    use aes_gcm::aead::rand_core::{OsRng, SeedableRng};
+    use aes_gcm::aead::Generate;
+    use aes_gcm::aead::rand_core::SeedableRng;
 
-    #[expect(
-        clippy::expect_used,
-        reason = "intentionally panics if OsRng is unavailable"
-    )]
-    rand_chacha::ChaCha20Rng::from_rng(OsRng)
-        .expect("OS RNG should be available for initial CSPRNG seed")
+    // `<[u8; 32]>::generate()` pulls 32 bytes from the getrandom-backed
+    // `SysRng` and panics on OS entropy failure (same semantics as the
+    // previous `ChaCha20Rng::from_rng(OsRng).expect(...)`).
+    let seed: [u8; 32] = <[u8; 32]>::generate();
+    rand_chacha::ChaCha20Rng::from_seed(seed)
 }
 
 /// Thread-local CSPRNG wrapper with fork-aware PID tracking.
 ///
 /// On each access, compares the stored PID with `std::process::id()`.
 /// If they differ (i.e. the process was forked), the RNG is reseeded
-/// from `OsRng` to avoid nonce reuse across processes.
+/// from the OS RNG to avoid nonce reuse across processes.
 #[cfg(feature = "encryption")]
 struct ForkAwareRng {
     pid: std::cell::Cell<u32>,
@@ -216,7 +215,7 @@ thread_local! {
 /// Using a thread-local [`ChaCha20Rng`](rand_chacha::ChaCha20Rng) avoids a
 /// `getrandom` syscall on every nonce generation, which saves 1-10 µs per
 /// block under contention. The RNG is cryptographically secure and seeded
-/// from `OsRng` on first access per thread, and is lazily reseeded on the
+/// from the OS RNG on first access per thread, and is lazily reseeded on the
 /// next use if the process ID changes (e.g., after a `fork()`) to reduce
 /// the risk of nonce reuse across processes.
 #[cfg(feature = "encryption")]
@@ -235,28 +234,28 @@ impl EncryptionProvider for Aes256GcmProvider {
     }
 
     fn encrypt(&self, plaintext: &[u8]) -> crate::Result<Vec<u8>> {
-        use aes_gcm::AeadCore;
-        use aes_gcm::AeadInPlace;
+        // aes-gcm 0.11.0-rc.3 prerelease surface (pinned in Cargo.toml).
+        // Migration trigger: bump when aes-gcm 0.11.0 stable ships.
+        use aes_gcm::aead::{AeadInOut, Generate, Nonce};
 
-        let nonce = thread_local_rng(|rng| aes_gcm::Aes256Gcm::generate_nonce(rng));
+        let nonce = thread_local_rng(Nonce::<aes_gcm::Aes256Gcm>::generate_from_rng);
 
         let mut buf = Vec::with_capacity(Self::NONCE_LEN + plaintext.len() + Self::TAG_LEN);
         buf.extend_from_slice(&nonce);
         buf.extend_from_slice(plaintext);
 
-        // encrypt_in_place_detached operates on buf[NONCE_LEN..] (the plaintext portion).
+        // encrypt_inout_detached operates on buf[NONCE_LEN..] (the plaintext portion).
         // Indexing is safe: buf was allocated as nonce + plaintext.
         //
-        // TODO: pass block context (table_id, offset, block_type) as AAD to
-        // bind ciphertext authenticity to its position and prevent block
-        // substitution attacks. Requires extending EncryptionProvider API.
+        // AAD wiring (block context: table_id, offset, block_type, dict_id, window_log)
+        // tracked separately — see lsm-tree #250/#251/#252.
         #[expect(
             clippy::indexing_slicing,
             reason = "buf length = NONCE_LEN + plaintext.len()"
         )]
         let tag = self
             .cipher
-            .encrypt_in_place_detached(&nonce, b"", &mut buf[Self::NONCE_LEN..])
+            .encrypt_inout_detached(&nonce, b"", (&mut buf[Self::NONCE_LEN..]).into())
             .map_err(|_| crate::Error::Encrypt("AES-256-GCM encryption failed"))?;
 
         buf.extend_from_slice(&tag);
@@ -265,8 +264,7 @@ impl EncryptionProvider for Aes256GcmProvider {
     }
 
     fn decrypt(&self, ciphertext: &[u8]) -> crate::Result<Vec<u8>> {
-        use aes_gcm::AeadInPlace;
-        use aes_gcm::aead::generic_array::GenericArray;
+        use aes_gcm::aead::{AeadInOut, Nonce, Tag};
 
         let min_len = Self::NONCE_LEN + Self::TAG_LEN;
         if ciphertext.len() < min_len {
@@ -276,19 +274,21 @@ impl EncryptionProvider for Aes256GcmProvider {
         }
 
         #[expect(clippy::indexing_slicing, reason = "length checked above")]
-        let nonce = GenericArray::from_slice(&ciphertext[..Self::NONCE_LEN]);
+        let nonce = Nonce::<aes_gcm::Aes256Gcm>::try_from(&ciphertext[..Self::NONCE_LEN])
+            .map_err(|_| crate::Error::Decrypt("AES-256-GCM nonce length mismatch"))?;
 
         // Safe: ciphertext.len() >= NONCE_LEN + TAG_LEN checked above
         let tag_start = ciphertext.len() - Self::TAG_LEN;
 
         #[expect(clippy::indexing_slicing, reason = "length checked above")]
-        let tag = GenericArray::from_slice(&ciphertext[tag_start..]);
+        let tag = Tag::<aes_gcm::Aes256Gcm>::try_from(&ciphertext[tag_start..])
+            .map_err(|_| crate::Error::Decrypt("AES-256-GCM tag length mismatch"))?;
 
         #[expect(clippy::indexing_slicing, reason = "length checked above")]
         let mut buf = ciphertext[Self::NONCE_LEN..tag_start].to_vec();
 
         self.cipher
-            .decrypt_in_place_detached(nonce, b"", &mut buf, tag)
+            .decrypt_inout_detached(&nonce, b"", (&mut buf[..]).into(), &tag)
             .map_err(|_| {
                 crate::Error::Decrypt("AES-256-GCM decryption failed (bad key or tampered data)")
             })?;
@@ -297,10 +297,9 @@ impl EncryptionProvider for Aes256GcmProvider {
     }
 
     fn encrypt_vec(&self, mut buf: Vec<u8>) -> crate::Result<Vec<u8>> {
-        use aes_gcm::AeadCore;
-        use aes_gcm::AeadInPlace;
+        use aes_gcm::aead::{AeadInOut, Generate, Nonce};
 
-        let nonce = thread_local_rng(|rng| aes_gcm::Aes256Gcm::generate_nonce(rng));
+        let nonce = thread_local_rng(Nonce::<aes_gcm::Aes256Gcm>::generate_from_rng);
 
         // Reserve space for nonce prefix + tag suffix in one allocation,
         // then shift plaintext right and write the nonce into the gap.
@@ -320,7 +319,7 @@ impl EncryptionProvider for Aes256GcmProvider {
         )]
         let tag = self
             .cipher
-            .encrypt_in_place_detached(&nonce, b"", &mut buf[Self::NONCE_LEN..])
+            .encrypt_inout_detached(&nonce, b"", (&mut buf[Self::NONCE_LEN..]).into())
             .map_err(|_| crate::Error::Encrypt("AES-256-GCM encryption failed"))?;
 
         buf.extend_from_slice(&tag);
@@ -329,8 +328,7 @@ impl EncryptionProvider for Aes256GcmProvider {
     }
 
     fn decrypt_vec(&self, mut buf: Vec<u8>) -> crate::Result<Vec<u8>> {
-        use aes_gcm::AeadInPlace;
-        use aes_gcm::aead::generic_array::GenericArray;
+        use aes_gcm::aead::{AeadInOut, Nonce, Tag};
 
         // Error::Decrypt takes &'static str — can't include runtime lengths
         // without changing the upstream error type to accept String/Cow.
@@ -343,11 +341,13 @@ impl EncryptionProvider for Aes256GcmProvider {
 
         // Copy nonce and tag to the stack before mutating the buffer.
         #[expect(clippy::indexing_slicing, reason = "length checked above")]
-        let nonce = *GenericArray::from_slice(&buf[..Self::NONCE_LEN]);
+        let nonce = Nonce::<aes_gcm::Aes256Gcm>::try_from(&buf[..Self::NONCE_LEN])
+            .map_err(|_| crate::Error::Decrypt("AES-256-GCM nonce length mismatch"))?;
 
         let tag_start = buf.len() - Self::TAG_LEN;
         #[expect(clippy::indexing_slicing, reason = "length checked above")]
-        let tag = *GenericArray::from_slice(&buf[tag_start..]);
+        let tag = Tag::<aes_gcm::Aes256Gcm>::try_from(&buf[tag_start..])
+            .map_err(|_| crate::Error::Decrypt("AES-256-GCM tag length mismatch"))?;
 
         // Strip nonce prefix and tag suffix via copy_within + truncate
         // (single memmove, avoids Drain iterator adapter overhead).
@@ -355,7 +355,7 @@ impl EncryptionProvider for Aes256GcmProvider {
         buf.truncate(tag_start - Self::NONCE_LEN);
 
         self.cipher
-            .decrypt_in_place_detached(&nonce, b"", &mut buf, &tag)
+            .decrypt_inout_detached(&nonce, b"", (&mut buf[..]).into(), &tag)
             .map_err(|_| {
                 crate::Error::Decrypt("AES-256-GCM decryption failed (bad key or tampered data)")
             })?;
@@ -564,32 +564,49 @@ mod tests {
             Ok(())
         }
 
-        /// Verify `ForkAwareRng` reseeds when it detects a PID change.
+        /// Verify `ForkAwareRng` actually REPLACES the inner RNG (not just
+        /// restores PID bookkeeping) when it detects a PID change.
         ///
-        /// Asserts on deterministic state (PID restoration) rather than
-        /// probabilistic RNG output to avoid flaky CI.
+        /// Stamps a deterministic large `word_pos` into the inner ChaCha20Rng,
+        /// triggers fake-PID reseed, and asserts `word_pos` was reset to a
+        /// fresh-RNG value. If the `*rng_ref = new_chacha_rng()` line were
+        /// removed from `with_rng`, the stamped offset would survive and this
+        /// test would fail.
+        /// Distinctive word_pos that cannot occur naturally on a freshly-seeded
+        /// RNG after a single u64 draw (which advances word_pos by 2).
+        const SENTINEL_WORD_POS: u128 = 0xDEAD_BEEF_u128;
+
         #[test]
         fn fork_aware_rng_reseeds_on_pid_change() {
             let rng = ForkAwareRng::new();
 
-            // Generate a value with the current PID (ensures RNG is initialized).
-            let _ = rng.with_rng(aes_gcm::aead::rand_core::RngCore::next_u64);
+            // Initialize the lazy RNG.
+            let _ = rng.with_rng(aes_gcm::aead::rand_core::Rng::next_u64);
+            rng.rng.borrow_mut().set_word_pos(SENTINEL_WORD_POS);
+            assert_eq!(rng.rng.borrow().get_word_pos(), SENTINEL_WORD_POS);
 
-            // Simulate fork by setting a fake PID that differs from the real one.
-            let current_pid = std::process::id();
-            let fake_pid = current_pid ^ 1;
-            rng.pid.set(fake_pid);
-            assert_eq!(rng.pid.get(), fake_pid, "PID should be set to fake value");
+            // Simulate fork: stamp a fake PID different from the real one.
+            let real_pid = std::process::id();
+            rng.pid.set(real_pid ^ 1);
 
-            // Next call sees real PID != fake PID → reseeds from OsRng and
-            // restores the stored PID to the real process ID.
-            let _ = rng.with_rng(aes_gcm::aead::rand_core::RngCore::next_u64);
+            // Next access detects PID mismatch → replaces the inner RNG with
+            // a fresh seed from the OS RNG. After one u64 draw on the fresh
+            // RNG, word_pos must be
+            // a small fresh-RNG value, NOT SENTINEL_WORD_POS + 2.
+            let _ = rng.with_rng(aes_gcm::aead::rand_core::Rng::next_u64);
 
-            // Deterministic assertion: PID was restored after reseed.
             assert_eq!(
                 rng.pid.get(),
-                std::process::id(),
+                real_pid,
                 "PID should be restored to real process ID after reseed"
+            );
+
+            let post_word_pos = rng.rng.borrow().get_word_pos();
+            assert!(
+                post_word_pos < SENTINEL_WORD_POS,
+                "inner RNG was not replaced on reseed: post word_pos {post_word_pos:#x} \
+                 should be a fresh-RNG value, not {SENTINEL_WORD_POS:#x}+ \
+                 (would indicate fork-safety reseed is broken)"
             );
         }
 

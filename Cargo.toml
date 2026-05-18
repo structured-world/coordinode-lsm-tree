@@ -42,14 +42,19 @@ sfa = "~1.0.0"
 tempfile = "3.20.0"
 varint-rs = "2.2.0"
 xxhash-rust = { version = "0.8.15", features = ["xxh3"] }
-aes-gcm = { version = "0.10", optional = true, features = ["aes"] }
-# Pinned to 0.3 because aes-gcm 0.10.x re-exports rand_core 0.6 traits via
-# `aead::rand_core`, and rand_chacha 0.10 implements rand_core 0.10 — the two
-# trait families are not interchangeable, so the bump introduced in PR #243
-# breaks `cargo build --features encryption` on src/encryption.rs. Re-bump
-# after aes-gcm 0.11 stabilises or src/encryption.rs is migrated off rand_chacha.
-# Tracked in #246.
-rand_chacha = { version = "0.3", optional = true }
+# Exact pin on a prerelease — RC API can churn between releases, so locking
+# the exact version is intentional. The 0.11 surface we depend on:
+#   - aes_gcm::aead::{AeadInOut, Generate, Nonce, Tag}
+#   - AeadInOut::{encrypt_inout_detached, decrypt_inout_detached}
+#   - Nonce::generate_from_rng (via Generate)
+#   - Nonce::try_from / Tag::try_from
+# rand_core re-exported via aes-gcm's `rand_core` feature so `aead::rand_core`
+# exposes the rand_core 0.10 trait family (no version-skew).
+# TODO: bump to stable aes-gcm 0.11.0 once released — at that point this pin
+# becomes a normal "^0.11" caret requirement and the API list above can be
+# treated as the public 0.11 surface, not a prerelease snapshot.
+aes-gcm = { version = "=0.11.0-rc.3", optional = true, features = ["aes", "rand_core"] }
+rand_chacha = { version = "0.10", optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = { version = "0.7", optional = true }
