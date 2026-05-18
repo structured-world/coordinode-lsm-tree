@@ -16,8 +16,6 @@ reviews:
   related_issues: true
   related_prs: true
   suggested_labels: true
-  auto_label:
-    enabled: true
   auto_review:
     enabled: true
     auto_incremental_review: true

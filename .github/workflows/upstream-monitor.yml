@@ -14,6 +14,7 @@ env:
   UPSTREAM_REMOTE: upstream
   UPSTREAM_URL: https://github.com/fjall-rs/lsm-tree.git
   UPSTREAM_REPO: fjall-rs/lsm-tree
+  STATE_FILE: .github/state/last-upstream-sync.txt
 
 jobs:
   check-upstream:
@@ -43,8 +44,16 @@ jobs:
 
           UPSTREAM_LATEST_TAG=$(git tag -l --sort=-v:refname --merged "${UPSTREAM_REMOTE}/main" \
             | grep -E '^v?[0-9]+\.[0-9]+\.[0-9]+$' | head -1 || true)
-          UPSTREAM_PREV_TAG=$(git tag -l --sort=-v:refname --merged "origin/main" \
-            | grep -E '^v?[0-9]+\.[0-9]+\.[0-9]+$' | head -1 || true)
+
+          # Prefer the explicit state file; fall back to inference from
+          # `--merged origin/main` if the file is missing (first run) or
+          # if a non-merge sync strategy ever desyncs the inference.
+          if [ -f "$STATE_FILE" ]; then
+            UPSTREAM_PREV_TAG=$(tr -d '[:space:]' < "$STATE_FILE")
+          else
+            UPSTREAM_PREV_TAG=$(git tag -l --sort=-v:refname --merged "origin/main" \
+              | grep -E '^v?[0-9]+\.[0-9]+\.[0-9]+$' | head -1 || true)
+          fi
           echo "upstream_latest_tag=$UPSTREAM_LATEST_TAG" >> "$GITHUB_OUTPUT"
           echo "upstream_prev_tag=$UPSTREAM_PREV_TAG" >> "$GITHUB_OUTPUT"
 
@@ -56,11 +65,11 @@ jobs:
 
           echo "Commits behind upstream: $BEHIND"
           echo "Upstream latest tag: ${UPSTREAM_LATEST_TAG:-<none>}"
-          echo "Upstream tag in our main: ${UPSTREAM_PREV_TAG:-<none>}"
+          echo "Last synced upstream tag: ${UPSTREAM_PREV_TAG:-<none>}"
           echo "New release available: $NEW_RELEASE"
 
       - name: Build change report
-        if: steps.detect.outputs.behind > 0
+        if: steps.detect.outputs.behind != '0'
         id: report
         env:
           BEHIND: ${{ steps.detect.outputs.behind }}
@@ -78,50 +87,85 @@ jobs:
           : > /tmp/sync/perf.txt
           : > /tmp/sync/other.txt
 
-          # Categorise each new upstream commit by conventional commit prefix.
-          git log "origin/main..${UPSTREAM_REMOTE}/main" --format='%H%x09%s' \
-            | while IFS=$'\t' read -r SHA SUBJECT; do
-                SHORT=$(git rev-parse --short "$SHA")
-                LINE="- \`$SHORT\` $SUBJECT"
-                case "$SUBJECT" in
-                  *"BREAKING CHANGE"*|*"!:"*)
-                    echo "$LINE" >> /tmp/sync/breaking.txt ;;
-                  feat:*|feat\(*)
-                    echo "$LINE" >> /tmp/sync/feat.txt ;;
-                  fix:*|fix\(*)
-                    echo "$LINE" >> /tmp/sync/fix.txt ;;
-                  perf:*|perf\(*)
-                    echo "$LINE" >> /tmp/sync/perf.txt ;;
-                  *)
-                    echo "$LINE" >> /tmp/sync/other.txt ;;
-                esac
+          # Categorise each new upstream commit by anchored conventional-commit prefix.
+          # `<type>(scope)?!?:` — `!` after type marks BREAKING; `BREAKING CHANGE`
+          # in commit body (not subject) is the canonical conventional-commit footer
+          # marker, so we also scan body lines.
+          BREAKING_RE='^[a-z]+(\([^)]*\))?!:'
+          FEAT_RE='^feat(\([^)]*\))?:'
+          FIX_RE='^fix(\([^)]*\))?:'
+          PERF_RE='^perf(\([^)]*\))?:'
+
+          while IFS=$'\t' read -r SHA SUBJECT BODY; do
+            SHORT=$(git rev-parse --short "$SHA")
+            LINE="- \`$SHORT\` $SUBJECT"
+            if [[ "$SUBJECT" =~ $BREAKING_RE ]] || echo "$BODY" | grep -qE '^BREAKING CHANGE:'; then
+              echo "$LINE" >> /tmp/sync/breaking.txt
+            elif [[ "$SUBJECT" =~ $FEAT_RE ]]; then
+              echo "$LINE" >> /tmp/sync/feat.txt
+            elif [[ "$SUBJECT" =~ $FIX_RE ]]; then
+              echo "$LINE" >> /tmp/sync/fix.txt
+            elif [[ "$SUBJECT" =~ $PERF_RE ]]; then
+              echo "$LINE" >> /tmp/sync/perf.txt
+            else
+              echo "$LINE" >> /tmp/sync/other.txt
+            fi
+          done < <(git log "origin/main..${UPSTREAM_REMOTE}/main" \
+                     --format='%H%x09%s%x09%b' -z \
+                     | tr '\0' '\n')
+
+          # Extract referenced issues / PRs. Capture both bare `#NNN`
+          # (resolved against UPSTREAM_REPO) and qualified `owner/repo#NNN`
+          # (rendered as plain links, not silently rewritten).
+          : > /tmp/sync/refs_bare.txt
+          : > /tmp/sync/refs_qualified.txt
+          git log "origin/main..${UPSTREAM_REMOTE}/main" --format='%s%n%b' \
+            | grep -oE '([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)?#[0-9]+' \
+            | sort -u \
+            | while read -r REF; do
+                if [[ "$REF" == *"/"* ]]; then
+                  echo "$REF" >> /tmp/sync/refs_qualified.txt
+                else
+                  echo "$REF" >> /tmp/sync/refs_bare.txt
+                fi
               done
 
-          # Extract referenced upstream issue/PR numbers from commit
-          # subjects + bodies; resolve titles via API for the first 20.
-          git log "origin/main..${UPSTREAM_REMOTE}/main" --format='%s%n%b' \
-            | grep -oE '#[0-9]+' | sort -u > /tmp/sync/refs_raw.txt || true
-
           : > /tmp/sync/refs.md
-          if [ -s /tmp/sync/refs_raw.txt ]; then
-            head -20 /tmp/sync/refs_raw.txt | while read -r REF; do
+          # Resolve bare refs against UPSTREAM_REPO via a single Issues API call
+          # (PRs are issues under the hood, so we don't need an issue→PR fallback).
+          if [ -s /tmp/sync/refs_bare.txt ]; then
+            head -20 /tmp/sync/refs_bare.txt | while read -r REF; do
               NUM="${REF#\#}"
-              TITLE=$(gh issue view "$NUM" --repo "$UPSTREAM_REPO" --json title --jq '.title' 2>/dev/null \
-                || gh pr view "$NUM" --repo "$UPSTREAM_REPO" --json title --jq '.title' 2>/dev/null \
-                || true)
+              TITLE=$(gh api "repos/${UPSTREAM_REPO}/issues/${NUM}" --jq '.title' 2>/dev/null || true)
               if [ -n "$TITLE" ]; then
                 echo "- [${UPSTREAM_REPO}${REF}](https://github.com/${UPSTREAM_REPO}/issues/${NUM}) — ${TITLE}" \
                   >> /tmp/sync/refs.md
               fi
             done
           fi
+          # Qualified refs: render as link without title resolution (cross-repo,
+          # may not be readable without extra auth).
+          if [ -s /tmp/sync/refs_qualified.txt ]; then
+            while read -r REF; do
+              REPO_PART="${REF%%#*}"
+              NUM="${REF##*#}"
+              echo "- [${REF}](https://github.com/${REPO_PART}/issues/${NUM})" \
+                >> /tmp/sync/refs.md
+            done < /tmp/sync/refs_qualified.txt
+          fi
 
-          # Fork overlap: files touched by both upstream (since last shared
-          # commit) AND our fork (commits in origin/main not in upstream/main).
+          # Fork overlap: files touched by upstream (since the last shared
+          # commit) AND by fork-specific commits (commits on origin/main that
+          # are NOT in upstream/main — excludes upstream commits we already
+          # merged in, which would otherwise drown out the signal).
           MERGE_BASE=$(git merge-base origin/main "${UPSTREAM_REMOTE}/main")
-          git diff --name-only "$MERGE_BASE..${UPSTREAM_REMOTE}/main" | sort -u > /tmp/sync/upstream_files.txt
-          git diff --name-only "$MERGE_BASE..origin/main" | sort -u > /tmp/sync/fork_files.txt
-          comm -12 /tmp/sync/upstream_files.txt /tmp/sync/fork_files.txt > /tmp/sync/overlap.txt || true
+          git diff --name-only "$MERGE_BASE..${UPSTREAM_REMOTE}/main" \
+            | sort -u > /tmp/sync/upstream_files.txt
+          git log origin/main --not "${UPSTREAM_REMOTE}/main" \
+            --name-only --format= \
+            | grep -v '^$' | sort -u > /tmp/sync/fork_files.txt || true
+          comm -12 /tmp/sync/upstream_files.txt /tmp/sync/fork_files.txt \
+            > /tmp/sync/overlap.txt || true
 
           # Emit summary counts for use in subsequent steps.
           {
@@ -133,8 +177,8 @@ jobs:
             echo "overlap=$(wc -l < /tmp/sync/overlap.txt | tr -d ' ')"
           } >> "$GITHUB_OUTPUT"
 
-      - name: Compose structured body
-        if: steps.detect.outputs.behind > 0
+      - name: Compose structured body (head)
+        if: steps.detect.outputs.behind != '0'
         id: body
         env:
           BEHIND: ${{ steps.detect.outputs.behind }}
@@ -184,7 +228,7 @@ jobs:
 
           if [ -s /tmp/sync/refs.md ]; then
             {
-              echo "### Referenced upstream issues / PRs"
+              echo "### Referenced issues / PRs"
               echo
               cat /tmp/sync/refs.md
               echo
@@ -204,22 +248,18 @@ jobs:
             } >> "$BODY"
           fi
 
-          {
-            echo "### Review checklist"
-            echo
-            echo "- [ ] Breaking changes evaluated for fork impact"
-            echo "- [ ] Overlapping files reviewed for semantic conflicts"
-            echo "- [ ] Fork-specific tests pass with upstream changes"
-            echo "- [ ] \`coordinode-lsm-tree\` version bumped in consumer projects if upstream cuts a release"
-          } >> "$BODY"
-
+          # NOTE: review checklist is appended LAST by the merge step so that
+          # on the conflict path, the conflict + manual-resolution section can
+          # be inserted before it (rather than trailing the checklist out of
+          # reading order).
           echo "body_path=$BODY" >> "$GITHUB_OUTPUT"
 
       - name: Try merge and create PR or conflict issue
-        if: steps.detect.outputs.behind > 0
+        if: steps.detect.outputs.behind != '0'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           BEHIND: ${{ steps.detect.outputs.behind }}
+          UPSTREAM_LATEST_TAG: ${{ steps.detect.outputs.upstream_latest_tag }}
           BODY_PATH: ${{ steps.body.outputs.body_path }}
         run: |
           set -euo pipefail
@@ -230,7 +270,27 @@ jobs:
           SYNC_BRANCH="chore/upstream-sync-$(date +%Y%m%d)"
           git checkout -b "$SYNC_BRANCH" origin/main
 
+          # Helper: append the review checklist as the last section of the body.
+          append_checklist() {
+            {
+              echo "### Review checklist"
+              echo
+              echo "- [ ] Breaking changes evaluated for fork impact"
+              echo "- [ ] Overlapping files reviewed for semantic conflicts"
+              echo "- [ ] Fork-specific tests pass with upstream changes"
+              echo "- [ ] \`coordinode-lsm-tree\` version bumped in consumer projects if upstream cuts a release"
+            } >> "$BODY_PATH"
+          }
+
           if git merge --no-commit --no-ff "${UPSTREAM_REMOTE}/main" 2>&1; then
+            # Advance the persisted last-synced tag so future runs read it
+            # directly (no inference from `--merged` git history shape).
+            if [ -n "${UPSTREAM_LATEST_TAG}" ]; then
+              mkdir -p "$(dirname "$STATE_FILE")"
+              echo "$UPSTREAM_LATEST_TAG" > "$STATE_FILE"
+              git add "$STATE_FILE"
+            fi
+            append_checklist
             git commit -m "chore: sync upstream (${BEHIND} new commits)"
             git push origin "$SYNC_BRANCH"
 
@@ -243,8 +303,10 @@ jobs:
             CONFLICTS=$(git diff --name-only --diff-filter=U 2>/dev/null || true)
             git merge --abort
 
+            # Insert conflict + manual-resolution sections BEFORE the
+            # checklist so the issue reads top-to-bottom: summary → changes
+            # → conflicts → resolution → checklist.
             {
-              echo
               echo "### Conflicting files"
               echo
               echo '```'
@@ -260,11 +322,14 @@ jobs:
               echo "git merge upstream/main"
               echo "# Resolve conflicts, then push"
               echo '```'
+              echo
             } >> "$BODY_PATH"
+            append_checklist
 
             gh issue create \
               --title "Upstream sync conflict (${BEHIND} new commits)" \
-              --body-file "$BODY_PATH"
+              --body-file "$BODY_PATH" \
+              --label "ci"
           fi
 
       - name: Check for merged feature branches
@@ -296,7 +361,8 @@ jobs:
                 } > "$BODY_FILE"
                 gh issue create \
                   --title "Upstream merged: $BRANCH" \
-                  --body-file "$BODY_FILE"
+                  --body-file "$BODY_FILE" \
+                  --label "ci"
                 rm -f "$BODY_FILE"
               fi
             fi
