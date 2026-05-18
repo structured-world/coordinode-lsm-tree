@@ -234,6 +234,8 @@ impl EncryptionProvider for Aes256GcmProvider {
     }
 
     fn encrypt(&self, plaintext: &[u8]) -> crate::Result<Vec<u8>> {
+        // aes-gcm 0.11.0-rc.3 prerelease surface (pinned in Cargo.toml).
+        // Migration trigger: bump when aes-gcm 0.11.0 stable ships.
         use aes_gcm::aead::{AeadInOut, Generate, Nonce};
 
         let nonce = thread_local_rng(Nonce::<aes_gcm::Aes256Gcm>::generate_from_rng);
