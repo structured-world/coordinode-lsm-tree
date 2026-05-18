@@ -61,8 +61,18 @@ jobs:
           # A future "track upstream pre-releases" feature would extend this
           # pattern explicitly.
           SEMVER_RE='^v[0-9]+\.[0-9]+\.[0-9]+$'
-          UPSTREAM_LATEST_TAG=$(git tag -l --sort=-v:refname --merged "${UPSTREAM_REMOTE}/main" \
-            | grep -E "$SEMVER_RE" | head -1 || true)
+          # Intersect "tags actually published on the upstream remote"
+          # with "tags reachable from upstream/main" — guarantees the
+          # picked tag is an upstream-origin tag (not a fork-local
+          # `v4.4.0` that happens to sit on a commit ancestral to
+          # upstream/main via a back-merge or shared base). Mirrors
+          # the safety property the bootstrap fallback below already
+          # has via its own `comm -12`.
+          UPSTREAM_LATEST_TAG=$(comm -12 \
+            <(git ls-remote --tags --refs "$UPSTREAM_REMOTE" \
+                | awk '{sub(/refs\/tags\//,"",$2); print $2}' | sort -u) \
+            <(git tag -l --merged "${UPSTREAM_REMOTE}/main" | sort -u) \
+            | grep -E "$SEMVER_RE" | sort -V | tail -1 || true)
 
           # Prefer the explicit state file. Fall back to inference from
           # `--merged origin/main` only as a BOOTSTRAP for the first sync
@@ -94,6 +104,14 @@ jobs:
             echo "upstream_head_short=$UPSTREAM_HEAD_SHORT"
           } >> "$GITHUB_OUTPUT"
 
+          # NEW_RELEASE drives the heading shape in the sync body; it
+          # does NOT independently trigger a sync. A tag-only release
+          # cut on an upstream HEAD that's already in `origin/main`
+          # (BEHIND=0) is intentionally NOT surfaced — for a fork that
+          # has already decided about that exact upstream code, the
+          # downstream release ceremony is irrelevant. Whatever
+          # release-transition info eventually matters will appear in
+          # the heading of the next BEHIND>0 sync.
           NEW_RELEASE=false
           if [ -n "$UPSTREAM_LATEST_TAG" ] && [ "$UPSTREAM_LATEST_TAG" != "$UPSTREAM_PREV_TAG" ]; then
             NEW_RELEASE=true
@@ -157,6 +175,17 @@ jobs:
 
           echo "should_run=$SHOULD_RUN" >> "$GITHUB_OUTPUT"
 
+      # NOTE on the two-half `if:` gate below (and on the two downstream
+      # steps that mirror it): BOTH halves are load-bearing.
+      #   - `behind != '0'` short-circuits when there's nothing to sync.
+      #   - `skip.outputs.should_run == 'true'` short-circuits when the
+      #     current upstream HEAD was already surfaced (open/closed/merged
+      #     PR or issue). Since the `Check skip conditions` step itself
+      #     gates on `behind != '0'`, removing that predicate from any
+      #     downstream `if:` would leave `should_run` as the empty string
+      #     in the behind=0 case and the step would NEVER run. If a
+      #     future edit relaxes either predicate, the other must move
+      #     in lock-step or the step gets silently disabled.
       - name: Build change report
         if: steps.detect.outputs.behind != '0' && steps.skip.outputs.should_run == 'true'
         env:
@@ -346,6 +375,15 @@ jobs:
           # overlap list is a "look here for possible semantic conflicts"
           # hint for the reviewer, not a precise change-summary. Use the
           # PR diff for authoritative final state.
+          #
+          # NOT using `-M` (rename detection) on the upstream diff: with
+          # `-M`, git collapses renames into a single new-path entry.
+          # Without `-M`, an upstream rename of `foo.rs` → `bar.rs` shows
+          # BOTH `foo.rs` (delete) AND `bar.rs` (add). For a fork that
+          # has edited `foo.rs` pre-rename (the common case), the
+          # without-`-M` form catches the overlap on `foo.rs`; with `-M`
+          # the overlap would silently miss because git only emits
+          # `bar.rs`. Coverage > precision for this hint.
           MERGE_BASE=$(git merge-base origin/main "${UPSTREAM_REMOTE}/main")
           git diff --name-only "$MERGE_BASE..${UPSTREAM_REMOTE}/main" \
             | sort -u > /tmp/sync/upstream_files.txt
@@ -619,16 +657,23 @@ jobs:
             if git merge-base --is-ancestor "$BRANCH_TIP" "${UPSTREAM_REMOTE}/main" 2>/dev/null; then
               echo "Branch '$BRANCH' is fully merged into ${UPSTREAM_REMOTE}/main"
 
-              # GitHub's issue-search engine strips `#` from the query
-              # (and from the indexed issue text), so searching for the
-              # raw branch name `feat/#123-foo` would silently miss
-              # existing issues titled "Upstream merged: feat/#123-foo".
-              # Strip `#` from BRANCH before the search; the indexed
-              # title is stripped too so the match works.
+              # `gh issue list --search` is GitHub free-text search:
+              # it tokenises and matches CONTAINS, not exact-title. For
+              # short branch slugs (e.g., `feat/123-foo` after `#`
+              # strip — search drops `#` regardless), this can match
+              # unrelated issues containing those tokens and falsely
+              # suppress a legitimate "Upstream merged" notification.
+              #
+              # Pull a wider candidate set with the same loose search,
+              # then post-filter to EXACT title equality on the client.
+              # The expected title includes the literal `#` (it's part
+              # of the branch convention and lives in the indexed title).
+              EXPECTED_TITLE="Upstream merged: $BRANCH"
               SEARCH_BRANCH="${BRANCH//\#/}"
               EXISTING=$(gh issue list \
                 --search "Upstream merged: $SEARCH_BRANCH" \
-                --state open --json number --jq 'length')
+                --state open --json title \
+                --jq "[.[] | select(.title == \"$EXPECTED_TITLE\")] | length")
               if [ "$EXISTING" = "0" ]; then
                 BODY_FILE=$(mktemp)
                 {
