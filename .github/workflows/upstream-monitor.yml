@@ -489,16 +489,6 @@ jobs:
               --base main \
               --head "$SYNC_BRANCH" \
               --label "upstream-sync"
-
-            # Mark this exact upstream HEAD as "considered" by pushing a
-            # tag that future runs check for. This is what makes
-            # close-without-merge a permanent decision until upstream
-            # advances — the tag stays regardless of PR outcome.
-            # `|| true` because a tag collision is harmless (means we
-            # already surfaced this HEAD; the new PR was a redundant
-            # workflow_dispatch with force=true).
-            git tag "$CONSIDERED_TAG" "${UPSTREAM_REMOTE}/main"
-            git push origin "$CONSIDERED_TAG" || true
           else
             CONFLICTS=$(git diff --name-only --diff-filter=U 2>/dev/null || true)
             # Defensive: if the merge failed before entering merge state
@@ -557,6 +547,17 @@ jobs:
               --body-file "$BODY_PATH" \
               --label "upstream-sync"
           fi
+
+          # Mark this exact upstream HEAD as "considered" — applies on
+          # BOTH branches (successful merge PR + conflict issue). For a
+          # fork with permanent divergences (renames, cherry-pick-only
+          # relationships), the conflict path is the steady state and
+          # without this tag every cron run would refile the same issue.
+          # The tag stays regardless of how the maintainer dispositions
+          # the surfaced artifact. `|| true` because a tag collision on
+          # an explicit force=true re-run is harmless.
+          git tag "$CONSIDERED_TAG" "${UPSTREAM_REMOTE}/main"
+          git push origin "$CONSIDERED_TAG" || true
 
       - name: Check for merged feature branches
         env:
