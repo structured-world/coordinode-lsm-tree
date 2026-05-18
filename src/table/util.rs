@@ -161,7 +161,10 @@ pub fn load_block(
 /// - **`x86_64` without AVX2**: 16-byte SSE2 lanes via `_mm_cmpeq_epi8` — SSE2 is the mandatory
 ///   `x86_64` ISA baseline, so this path needs no runtime check, only the AVX2 negative result.
 /// - **`aarch64` little-endian**: 16-byte vectorized lanes via NEON (`ARMv8` baseline — no runtime check).
-/// - **Everything else** (incl. big-endian aarch64, 32-bit x86, riscv, powerpc): 8-byte word stride via XOR + trailing zeros.
+/// - **Everything else** (incl. big-endian aarch64, 32-bit x86, riscv, powerpc): 8-byte word
+///   stride via XOR. First-mismatch position uses `trailing_zeros() / 8` on little-endian
+///   targets and `leading_zeros() / 8` on big-endian, so the byte ordering of the word matches
+///   the byte ordering of the source slice on either endianness.
 ///
 /// `is_x86_feature_detected!` caches the CPUID result, so the per-call dispatch
 /// cost is one cached atomic load on `x86_64`.
@@ -205,9 +208,14 @@ pub fn longest_shared_prefix_length(s1: &[u8], s2: &[u8]) -> usize {
 
 /// 8-byte word-stride scalar implementation — works on every platform, no intrinsics.
 ///
-/// Compares 8 bytes at a time via `u64` XOR and locates the first mismatching
-/// byte using `trailing_zeros() / 8`. Falls back to a byte loop for the tail
-/// shorter than 8 bytes.
+/// Compares 8 bytes at a time via `u64` XOR and locates the first mismatching byte
+/// using an endian-aware bit-count:
+/// - **Little-endian** (`target_endian = "little"`): `trailing_zeros() / 8` — the
+///   lowest-numbered bit in the XOR word corresponds to the first source byte.
+/// - **Big-endian** (`target_endian = "big"`): `leading_zeros() / 8` — the highest-numbered
+///   bit in the XOR word corresponds to the first source byte.
+///
+/// Tail shorter than 8 bytes falls back to a byte-by-byte loop.
 #[must_use]
 pub(crate) fn lsp_scalar(s1: &[u8], s2: &[u8]) -> usize {
     let min_len = s1.len().min(s2.len());
