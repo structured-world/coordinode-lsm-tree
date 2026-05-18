@@ -240,11 +240,18 @@ jobs:
           # cleanly. The post-tokenise regex then exact-matches the ref
           # grammar, dropping accidental candidates like file-path
           # citations (`path/to/file#42`) which have multiple slashes.
+          #
+          # Refs are capped pre-split (REFS_CAP=20 total of any type).
+          # Refs are second-tier info — the sync report's primary value
+          # is "upstream has N new commits, mergeable: yes/no". Curious
+          # readers can drill into the commit log for the full set.
+          REFS_CAP=20
           git log "origin/main..${UPSTREAM_REMOTE}/main" --format='%s%n%b' \
             | tr -s '[:space:](){}[],;<>!?"'"'" '\n' \
             | sed 's/\.$//' \
             | grep -E '^([A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9._-]+)?#[0-9]+$' \
             | sort -u \
+            | head -"$REFS_CAP" \
             | while read -r REF; do
                 if [[ "$REF" == *"/"* ]]; then
                   echo "$REF" >> /tmp/sync/refs_qualified.txt
@@ -285,15 +292,14 @@ jobs:
           }
 
           : > /tmp/sync/refs.md
-          # Both ref lists are capped to keep PR/issue bodies bounded when an
-          # upstream sync brings in many references. Bare refs are also
-          # API-rate-limit-bound (one title lookup per ref).
-          REFS_CAP=20
+          # Bare and qualified ref files are already capped pre-split by
+          # REFS_CAP — readers just iterate them. No per-list cap or
+          # "N more" footer needed.
 
           # Resolve bare refs against UPSTREAM_REPO via a single Issues API call
           # (PRs are issues under the hood, so we don't need an issue→PR fallback).
           if [ -s /tmp/sync/refs_bare.txt ]; then
-            head -"$REFS_CAP" /tmp/sync/refs_bare.txt | while read -r REF; do
+            while read -r REF; do
               NUM="${REF#\#}"
               TITLE=$(gh api "repos/${UPSTREAM_REPO}/issues/${NUM}" --jq '.title' 2>/dev/null || true)
               if [ -n "$TITLE" ]; then
@@ -311,27 +317,17 @@ jobs:
                 echo "- [${UPSTREAM_REPO}${REF}](https://github.com/${UPSTREAM_REPO}/issues/${NUM}) — _title unavailable_" \
                   >> /tmp/sync/refs.md
               fi
-            done
-            BARE_TOTAL=$(wc -l < /tmp/sync/refs_bare.txt | tr -d ' ')
-            if [ "$BARE_TOTAL" -gt "$REFS_CAP" ]; then
-              REMAINING=$((BARE_TOTAL - REFS_CAP))
-              echo "- _…and ${REMAINING} more bare ref(s) not shown — see commit log_" >> /tmp/sync/refs.md
-            fi
+            done < /tmp/sync/refs_bare.txt
           fi
           # Qualified refs: render as link without title resolution (cross-repo,
-          # may not be readable without extra auth). Symmetric cap.
+          # may not be readable without extra auth).
           if [ -s /tmp/sync/refs_qualified.txt ]; then
-            head -"$REFS_CAP" /tmp/sync/refs_qualified.txt | while read -r REF; do
+            while read -r REF; do
               REPO_PART="${REF%%#*}"
               NUM="${REF##*#}"
               echo "- [${REF}](https://github.com/${REPO_PART}/issues/${NUM})" \
                 >> /tmp/sync/refs.md
-            done
-            QUAL_TOTAL=$(wc -l < /tmp/sync/refs_qualified.txt | tr -d ' ')
-            if [ "$QUAL_TOTAL" -gt "$REFS_CAP" ]; then
-              REMAINING=$((QUAL_TOTAL - REFS_CAP))
-              echo "- _…and ${REMAINING} more qualified ref(s) not shown — see commit log_" >> /tmp/sync/refs.md
-            fi
+            done < /tmp/sync/refs_qualified.txt
           fi
 
           # Fork overlap: files touched by upstream (since the last shared
@@ -640,8 +636,15 @@ jobs:
             if git merge-base --is-ancestor "$BRANCH_TIP" "${UPSTREAM_REMOTE}/main" 2>/dev/null; then
               echo "Branch '$BRANCH' is fully merged into ${UPSTREAM_REMOTE}/main"
 
+              # GitHub's issue-search engine strips `#` from the query
+              # (and from the indexed issue text), so searching for the
+              # raw branch name `feat/#123-foo` would silently miss
+              # existing issues titled "Upstream merged: feat/#123-foo".
+              # Strip `#` from BRANCH before the search; the indexed
+              # title is stripped too so the match works.
+              SEARCH_BRANCH="${BRANCH//\#/}"
               EXISTING=$(gh issue list \
-                --search "Upstream merged: $BRANCH" \
+                --search "Upstream merged: $SEARCH_BRANCH" \
                 --state open --json number --jq 'length')
               if [ "$EXISTING" = "0" ]; then
                 BODY_FILE=$(mktemp)
