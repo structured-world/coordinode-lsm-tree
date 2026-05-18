@@ -16,6 +16,59 @@
 //! Checksums protect the encrypted (on-disk) bytes so that corruption is
 //! detected cheaply before any decryption attempt.
 
+/// Canonical block AAD: identifies WHERE a ciphertext belongs.
+///
+/// An adversary who learns the key cannot substitute a `[nonce|ciphertext|tag]`
+/// blob from another block at the same key when this AAD is threaded through
+/// every `encrypt`/`decrypt` call from the block I/O layer.
+///
+/// Wire layout (17 bytes, big-endian):
+///
+/// ```text
+/// [table_id: u64 BE | block_offset: u64 BE | block_type: u8]
+/// ```
+///
+/// - `table_id` — the global table identifier (`GlobalTableId`).
+/// - `block_offset` — the on-disk byte offset where the block header starts.
+/// - `block_type` — the [`BlockType`](crate::table::block::BlockType)
+///   discriminant, repeated here as AAD so blocks of different types at
+///   identical (table, offset) — should that ever happen — cannot be swapped.
+///
+/// The AAD bytes are encoded directly into a stack-allocated buffer by
+/// [`encode_block_aad`] — no allocation, no heap traffic per block.
+pub const BLOCK_AAD_LEN: usize = 17;
+
+/// Encode a canonical block AAD into a stack buffer.
+///
+/// See [`BLOCK_AAD_LEN`] for the wire layout. Callers pass the returned
+/// `[u8; BLOCK_AAD_LEN]` (or a `&[u8]` view of it) to
+/// [`EncryptionProvider::encrypt`] / [`EncryptionProvider::decrypt`].
+#[must_use]
+pub fn encode_block_aad(table_id: u64, block_offset: u64, block_type: u8) -> [u8; BLOCK_AAD_LEN] {
+    let mut aad = [0u8; BLOCK_AAD_LEN];
+    aad[0..8].copy_from_slice(&table_id.to_be_bytes());
+    aad[8..16].copy_from_slice(&block_offset.to_be_bytes());
+    aad[16] = block_type;
+    aad
+}
+
+/// Bundle of `(provider, aad)` threaded through block I/O.
+///
+/// Bundling the AAD with the provider keeps the block API surface unchanged
+/// for the common "no encryption" case while making it impossible to encrypt
+/// a block without supplying its identity-binding AAD. Callers construct the
+/// context inline at each block write/read site; `aad` is built via
+/// [`encode_block_aad`].
+#[derive(Copy, Clone)]
+pub struct EncryptionContext<'a> {
+    /// The encryption provider that performs the AEAD operations.
+    pub provider: &'a dyn EncryptionProvider,
+    /// Associated authenticated data binding the ciphertext to its block
+    /// identity. For block I/O this is the 17-byte tuple
+    /// `(table_id, block_offset, block_type)` from [`encode_block_aad`].
+    pub aad: &'a [u8],
+}
+
 /// Block encryption provider.
 ///
 /// Implementors handle key management, nonce generation, and algorithm
@@ -27,20 +80,36 @@
 /// - [`encrypt`](EncryptionProvider::encrypt) must be deterministic in output
 ///   *format* (but not value — nonces should be random or unique).
 /// - [`decrypt`](EncryptionProvider::decrypt) must accept the exact byte
-///   sequence returned by `encrypt` and recover the original plaintext.
+///   sequence returned by `encrypt` *and the same `aad`*, and recover the
+///   original plaintext. A different `aad` MUST fail decryption.
 /// - Both methods must be safe to call concurrently from multiple threads.
+///
+/// # Associated authenticated data (AAD)
+///
+/// The block I/O layer always passes a canonical 17-byte AAD via
+/// [`encode_block_aad`] so that ciphertext integrity binds to block location
+/// (table id, on-disk offset, block type). This defeats block-swap attacks
+/// where an adversary with the key copies a valid `[nonce|ct|tag]` blob from
+/// one location to another. Custom providers MUST honour this contract — the
+/// same `aad` bytes seen at encrypt time MUST be required at decrypt time.
 pub trait EncryptionProvider:
     Send + Sync + std::panic::UnwindSafe + std::panic::RefUnwindSafe
 {
-    /// Encrypt `plaintext`, returning an opaque ciphertext blob.
+    /// Encrypt `plaintext`, authenticated against `aad`, returning an opaque
+    /// ciphertext blob.
     ///
     /// The returned bytes may include a nonce/IV prefix and an
     /// authentication tag — the layout is provider-defined.
     ///
+    /// `aad` is included in the authentication tag computation but is NOT
+    /// stored in the returned ciphertext; the caller must supply the same
+    /// `aad` bytes to [`decrypt`](EncryptionProvider::decrypt). See the
+    /// trait-level docs for the block-AAD format.
+    ///
     /// # Errors
     ///
     /// Returns [`crate::Error::Encrypt`] if the encryption operation fails.
-    fn encrypt(&self, plaintext: &[u8]) -> crate::Result<Vec<u8>>;
+    fn encrypt(&self, plaintext: &[u8], aad: &[u8]) -> crate::Result<Vec<u8>>;
 
     /// Maximum number of bytes that encryption adds to a plaintext payload.
     ///
@@ -50,13 +119,18 @@ pub trait EncryptionProvider:
     /// Returns `u32` because block sizes are `u32`-bounded on disk.
     fn max_overhead(&self) -> u32;
 
-    /// Decrypt `ciphertext` previously produced by [`encrypt`](EncryptionProvider::encrypt).
+    /// Decrypt `ciphertext` previously produced by
+    /// [`encrypt`](EncryptionProvider::encrypt), verifying it against `aad`.
+    ///
+    /// `aad` must match exactly the bytes passed to `encrypt`. A mismatch
+    /// produces [`crate::Error::Decrypt`] just like a tampered ciphertext.
     ///
     /// # Errors
     ///
     /// Returns [`crate::Error::Decrypt`] if the ciphertext is invalid,
-    /// tampered, or encrypted with a different key.
-    fn decrypt(&self, ciphertext: &[u8]) -> crate::Result<Vec<u8>>;
+    /// tampered, encrypted with a different key, or authenticated against
+    /// different `aad`.
+    fn decrypt(&self, ciphertext: &[u8], aad: &[u8]) -> crate::Result<Vec<u8>>;
 
     /// Encrypt an owned plaintext buffer, reusing its allocation when possible.
     ///
@@ -67,8 +141,8 @@ pub trait EncryptionProvider:
     /// # Errors
     ///
     /// Returns [`crate::Error::Encrypt`] if the encryption operation fails.
-    fn encrypt_vec(&self, plaintext: Vec<u8>) -> crate::Result<Vec<u8>> {
-        self.encrypt(&plaintext)
+    fn encrypt_vec(&self, plaintext: Vec<u8>, aad: &[u8]) -> crate::Result<Vec<u8>> {
+        self.encrypt(&plaintext, aad)
     }
 
     /// Decrypt an owned ciphertext buffer, reusing its allocation when possible.
@@ -80,9 +154,10 @@ pub trait EncryptionProvider:
     /// # Errors
     ///
     /// Returns [`crate::Error::Decrypt`] if the ciphertext is invalid,
-    /// tampered, or encrypted with a different key.
-    fn decrypt_vec(&self, ciphertext: Vec<u8>) -> crate::Result<Vec<u8>> {
-        self.decrypt(&ciphertext)
+    /// tampered, encrypted with a different key, or authenticated against
+    /// different `aad`.
+    fn decrypt_vec(&self, ciphertext: Vec<u8>, aad: &[u8]) -> crate::Result<Vec<u8>> {
+        self.decrypt(&ciphertext, aad)
     }
 }
 
@@ -233,7 +308,7 @@ impl EncryptionProvider for Aes256GcmProvider {
         }
     }
 
-    fn encrypt(&self, plaintext: &[u8]) -> crate::Result<Vec<u8>> {
+    fn encrypt(&self, plaintext: &[u8], aad: &[u8]) -> crate::Result<Vec<u8>> {
         use aes_gcm::AeadInOut;
         use aes_gcm::aead::Generate;
 
@@ -247,17 +322,14 @@ impl EncryptionProvider for Aes256GcmProvider {
 
         // encrypt_inout_detached operates on buf[NONCE_LEN..] (the plaintext portion).
         // Indexing is safe: buf was allocated as nonce + plaintext.
-        //
-        // TODO: pass block context (table_id, offset, block_type) as AAD to
-        // bind ciphertext authenticity to its position and prevent block
-        // substitution attacks. Requires extending EncryptionProvider API.
+        // `aad` binds the ciphertext to its block identity (see trait docs).
         #[expect(
             clippy::indexing_slicing,
             reason = "buf length = NONCE_LEN + plaintext.len()"
         )]
         let tag = self
             .cipher
-            .encrypt_inout_detached(&nonce, b"", buf[Self::NONCE_LEN..].as_mut().into())
+            .encrypt_inout_detached(&nonce, aad, buf[Self::NONCE_LEN..].as_mut().into())
             .map_err(|_| crate::Error::Encrypt("AES-256-GCM encryption failed"))?;
 
         buf.extend_from_slice(&tag);
@@ -265,7 +337,7 @@ impl EncryptionProvider for Aes256GcmProvider {
         Ok(buf)
     }
 
-    fn decrypt(&self, ciphertext: &[u8]) -> crate::Result<Vec<u8>> {
+    fn decrypt(&self, ciphertext: &[u8], aad: &[u8]) -> crate::Result<Vec<u8>> {
         use aes_gcm::AeadInOut;
 
         let min_len = Self::NONCE_LEN + Self::TAG_LEN;
@@ -291,15 +363,17 @@ impl EncryptionProvider for Aes256GcmProvider {
         let mut buf = ciphertext[Self::NONCE_LEN..tag_start].to_vec();
 
         self.cipher
-            .decrypt_inout_detached(&nonce, b"", buf.as_mut_slice().into(), &tag)
+            .decrypt_inout_detached(&nonce, aad, buf.as_mut_slice().into(), &tag)
             .map_err(|_| {
-                crate::Error::Decrypt("AES-256-GCM decryption failed (bad key or tampered data)")
+                crate::Error::Decrypt(
+                    "AES-256-GCM decryption failed (bad key, tampered data, or AAD mismatch)",
+                )
             })?;
 
         Ok(buf)
     }
 
-    fn encrypt_vec(&self, mut buf: Vec<u8>) -> crate::Result<Vec<u8>> {
+    fn encrypt_vec(&self, mut buf: Vec<u8>, aad: &[u8]) -> crate::Result<Vec<u8>> {
         use aes_gcm::AeadInOut;
         use aes_gcm::aead::Generate;
 
@@ -325,7 +399,7 @@ impl EncryptionProvider for Aes256GcmProvider {
         )]
         let tag = self
             .cipher
-            .encrypt_inout_detached(&nonce, b"", buf[Self::NONCE_LEN..].as_mut().into())
+            .encrypt_inout_detached(&nonce, aad, buf[Self::NONCE_LEN..].as_mut().into())
             .map_err(|_| crate::Error::Encrypt("AES-256-GCM encryption failed"))?;
 
         buf.extend_from_slice(&tag);
@@ -333,7 +407,7 @@ impl EncryptionProvider for Aes256GcmProvider {
         Ok(buf)
     }
 
-    fn decrypt_vec(&self, mut buf: Vec<u8>) -> crate::Result<Vec<u8>> {
+    fn decrypt_vec(&self, mut buf: Vec<u8>, aad: &[u8]) -> crate::Result<Vec<u8>> {
         use aes_gcm::AeadInOut;
 
         // Error::Decrypt takes &'static str — can't include runtime lengths
@@ -361,9 +435,11 @@ impl EncryptionProvider for Aes256GcmProvider {
         buf.truncate(tag_start - Self::NONCE_LEN);
 
         self.cipher
-            .decrypt_inout_detached(&nonce, b"", buf.as_mut_slice().into(), &tag)
+            .decrypt_inout_detached(&nonce, aad, buf.as_mut_slice().into(), &tag)
             .map_err(|_| {
-                crate::Error::Decrypt("AES-256-GCM decryption failed (bad key or tampered data)")
+                crate::Error::Decrypt(
+                    "AES-256-GCM decryption failed (bad key, tampered data, or AAD mismatch)",
+                )
             })?;
 
         Ok(buf)
@@ -394,7 +470,10 @@ mod tests {
     impl std::panic::RefUnwindSafe for XorProvider {}
 
     impl EncryptionProvider for XorProvider {
-        fn encrypt(&self, plaintext: &[u8]) -> crate::Result<Vec<u8>> {
+        fn encrypt(&self, plaintext: &[u8], _aad: &[u8]) -> crate::Result<Vec<u8>> {
+            // XorProvider is non-authenticated by design (it's a test stub
+            // exercising the default `encrypt_vec` / `decrypt_vec` paths);
+            // AAD is intentionally ignored here.
             Ok(plaintext.iter().map(|b| b ^ 0xAA).collect())
         }
 
@@ -402,7 +481,7 @@ mod tests {
             0
         }
 
-        fn decrypt(&self, ciphertext: &[u8]) -> crate::Result<Vec<u8>> {
+        fn decrypt(&self, ciphertext: &[u8], _aad: &[u8]) -> crate::Result<Vec<u8>> {
             Ok(ciphertext.iter().map(|b| b ^ 0xAA).collect())
         }
     }
@@ -412,11 +491,11 @@ mod tests {
         let provider = XorProvider;
         let plaintext = b"test default encrypt_vec";
 
-        let via_encrypt = provider.encrypt(plaintext)?;
-        let via_encrypt_vec = provider.encrypt_vec(plaintext.to_vec())?;
+        let via_encrypt = provider.encrypt(plaintext, &[])?;
+        let via_encrypt_vec = provider.encrypt_vec(plaintext.to_vec(), &[])?;
         assert_eq!(via_encrypt, via_encrypt_vec);
 
-        let decrypted = provider.decrypt(&via_encrypt_vec)?;
+        let decrypted = provider.decrypt(&via_encrypt_vec, &[])?;
         assert_eq!(decrypted, plaintext);
         Ok(())
     }
@@ -426,10 +505,10 @@ mod tests {
         let provider = XorProvider;
         let plaintext = b"test default decrypt_vec";
 
-        let ciphertext = provider.encrypt(plaintext)?;
+        let ciphertext = provider.encrypt(plaintext, &[])?;
 
-        let via_decrypt = provider.decrypt(&ciphertext)?;
-        let via_decrypt_vec = provider.decrypt_vec(ciphertext)?;
+        let via_decrypt = provider.decrypt(&ciphertext, &[])?;
+        let via_decrypt_vec = provider.decrypt_vec(ciphertext, &[])?;
         assert_eq!(via_decrypt, via_decrypt_vec);
         assert_eq!(via_decrypt_vec, plaintext);
         Ok(())
@@ -448,14 +527,14 @@ mod tests {
             let provider = Aes256GcmProvider::new(&test_key());
             let plaintext = b"hello world, this is a block of data!";
 
-            let ciphertext = provider.encrypt(plaintext)?;
+            let ciphertext = provider.encrypt(plaintext, &[])?;
             assert_ne!(&ciphertext[..], plaintext.as_slice());
             assert_eq!(
                 ciphertext.len(),
                 Aes256GcmProvider::NONCE_LEN + plaintext.len() + Aes256GcmProvider::TAG_LEN,
             );
 
-            let decrypted = provider.decrypt(&ciphertext)?;
+            let decrypted = provider.decrypt(&ciphertext, &[])?;
             assert_eq!(decrypted, plaintext);
             Ok(())
         }
@@ -465,8 +544,8 @@ mod tests {
             let provider = Aes256GcmProvider::new(&test_key());
             let plaintext = b"";
 
-            let ciphertext = provider.encrypt(plaintext)?;
-            let decrypted = provider.decrypt(&ciphertext)?;
+            let ciphertext = provider.encrypt(plaintext, &[])?;
+            let decrypted = provider.decrypt(&ciphertext, &[])?;
             assert_eq!(decrypted, plaintext);
             Ok(())
         }
@@ -476,15 +555,15 @@ mod tests {
             let provider = Aes256GcmProvider::new(&test_key());
             let plaintext = b"deterministic input";
 
-            let ct1 = provider.encrypt(plaintext)?;
-            let ct2 = provider.encrypt(plaintext)?;
+            let ct1 = provider.encrypt(plaintext, &[])?;
+            let ct2 = provider.encrypt(plaintext, &[])?;
             assert_ne!(
                 ct1, ct2,
                 "random nonces should produce different ciphertexts"
             );
 
             // Both decrypt to the same plaintext
-            assert_eq!(provider.decrypt(&ct1)?, provider.decrypt(&ct2)?,);
+            assert_eq!(provider.decrypt(&ct1, &[])?, provider.decrypt(&ct2, &[])?,);
             Ok(())
         }
 
@@ -493,8 +572,8 @@ mod tests {
             let provider1 = Aes256GcmProvider::new(&[0x01; 32]);
             let provider2 = Aes256GcmProvider::new(&[0x02; 32]);
 
-            let ciphertext = provider1.encrypt(b"secret")?;
-            let result = provider2.decrypt(&ciphertext);
+            let ciphertext = provider1.encrypt(b"secret", &[])?;
+            let result = provider2.decrypt(&ciphertext, &[]);
             assert!(result.is_err());
             Ok(())
         }
@@ -502,7 +581,7 @@ mod tests {
         #[test]
         fn tampered_ciphertext_fails_decrypt() -> crate::Result<()> {
             let provider = Aes256GcmProvider::new(&test_key());
-            let mut ciphertext = provider.encrypt(b"data")?;
+            let mut ciphertext = provider.encrypt(b"data", &[])?;
 
             // Flip a byte in the ciphertext body
             let mid = Aes256GcmProvider::NONCE_LEN + 1;
@@ -513,7 +592,7 @@ mod tests {
                 }
             }
 
-            let result = provider.decrypt(&ciphertext);
+            let result = provider.decrypt(&ciphertext, &[]);
             assert!(result.is_err());
             Ok(())
         }
@@ -521,7 +600,7 @@ mod tests {
         #[test]
         fn truncated_ciphertext_fails_decrypt() -> crate::Result<()> {
             let provider = Aes256GcmProvider::new(&test_key());
-            let result = provider.decrypt(&[0u8; 10]); // less than nonce + tag
+            let result = provider.decrypt(&[0u8; 10], &[]); // less than nonce + tag
             assert!(result.is_err());
             Ok(())
         }
@@ -539,8 +618,8 @@ mod tests {
             let provider = Aes256GcmProvider::new(&test_key());
             let plaintext = vec![0xAB_u8; 64 * 1024]; // 64 KiB
 
-            let ciphertext = provider.encrypt(&plaintext)?;
-            let decrypted = provider.decrypt(&ciphertext)?;
+            let ciphertext = provider.encrypt(&plaintext, &[])?;
+            let decrypted = provider.decrypt(&ciphertext, &[])?;
             assert_eq!(decrypted, plaintext);
             Ok(())
         }
@@ -554,7 +633,7 @@ mod tests {
 
             let mut nonces = std::collections::HashSet::new();
             for _ in 0..1000 {
-                let ct = provider.encrypt(plaintext)?;
+                let ct = provider.encrypt(plaintext, &[])?;
 
                 #[expect(clippy::indexing_slicing, reason = "ct always >= NONCE_LEN")]
                 #[expect(clippy::expect_used, reason = "test assertion")]
@@ -576,17 +655,21 @@ mod tests {
         /// probabilistic RNG output to avoid flaky CI.
         #[test]
         fn fork_aware_rng_reseeds_on_pid_change() {
+            // In rand_core 0.10 the infallible `next_u32`/`next_u64`/`fill_bytes`
+            // methods moved from the (now-marker) `RngCore` trait onto the new
+            // `Rng` supertrait. ChaCha20 is a deterministic PRNG so the
+            // infallible path is correct.
+            fn tickle(rng: &ForkAwareRng) {
+                rng.with_rng(|r| {
+                    use aes_gcm::aead::rand_core::Rng;
+                    let _ = r.next_u64();
+                });
+            }
+
             let rng = ForkAwareRng::new();
 
             // Generate a value with the current PID (ensures RNG is initialized).
-            let _ = rng.with_rng(|r| {
-                // In rand_core 0.10 the infallible `next_u32`/`next_u64`/`fill_bytes`
-                // methods moved from the (now-marker) `RngCore` trait onto the new
-                // `Rng` supertrait. ChaCha20 is a deterministic PRNG so the
-                // infallible path is correct.
-                use aes_gcm::aead::rand_core::Rng;
-                r.next_u64()
-            });
+            tickle(&rng);
 
             // Simulate fork by setting a fake PID that differs from the real one.
             let current_pid = std::process::id();
@@ -596,14 +679,7 @@ mod tests {
 
             // Next call sees real PID != fake PID → reseeds from OsRng and
             // restores the stored PID to the real process ID.
-            let _ = rng.with_rng(|r| {
-                // In rand_core 0.10 the infallible `next_u32`/`next_u64`/`fill_bytes`
-                // methods moved from the (now-marker) `RngCore` trait onto the new
-                // `Rng` supertrait. ChaCha20 is a deterministic PRNG so the
-                // infallible path is correct.
-                use aes_gcm::aead::rand_core::Rng;
-                r.next_u64()
-            });
+            tickle(&rng);
 
             // Deterministic assertion: PID was restored after reseed.
             assert_eq!(
@@ -618,14 +694,14 @@ mod tests {
             let provider = Aes256GcmProvider::new(&test_key());
             let plaintext = b"block data for encrypt_vec test";
 
-            let ciphertext = provider.encrypt_vec(plaintext.to_vec())?;
+            let ciphertext = provider.encrypt_vec(plaintext.to_vec(), &[])?;
             assert_eq!(
                 ciphertext.len(),
                 Aes256GcmProvider::NONCE_LEN + plaintext.len() + Aes256GcmProvider::TAG_LEN,
             );
 
             // encrypt_vec output must be decryptable by decrypt
-            let decrypted = provider.decrypt(&ciphertext)?;
+            let decrypted = provider.decrypt(&ciphertext, &[])?;
             assert_eq!(decrypted, plaintext);
             Ok(())
         }
@@ -636,8 +712,8 @@ mod tests {
             let plaintext = b"block data for decrypt_vec test";
 
             // encrypt output must be decryptable by decrypt_vec
-            let ciphertext = provider.encrypt(plaintext)?;
-            let decrypted = provider.decrypt_vec(ciphertext)?;
+            let ciphertext = provider.encrypt(plaintext, &[])?;
+            let decrypted = provider.decrypt_vec(ciphertext, &[])?;
             assert_eq!(decrypted, plaintext);
             Ok(())
         }
@@ -647,8 +723,8 @@ mod tests {
             let provider = Aes256GcmProvider::new(&test_key());
             let plaintext = vec![0xCD_u8; 16 * 1024]; // 16 KiB
 
-            let ciphertext = provider.encrypt_vec(plaintext.clone())?;
-            let decrypted = provider.decrypt_vec(ciphertext)?;
+            let ciphertext = provider.encrypt_vec(plaintext.clone(), &[])?;
+            let decrypted = provider.decrypt_vec(ciphertext, &[])?;
             assert_eq!(decrypted, plaintext);
             Ok(())
         }
@@ -657,8 +733,8 @@ mod tests {
         fn encrypt_vec_empty() -> crate::Result<()> {
             let provider = Aes256GcmProvider::new(&test_key());
 
-            let ciphertext = provider.encrypt_vec(vec![])?;
-            let decrypted = provider.decrypt_vec(ciphertext)?;
+            let ciphertext = provider.encrypt_vec(vec![], &[])?;
+            let decrypted = provider.decrypt_vec(ciphertext, &[])?;
             assert!(decrypted.is_empty());
             Ok(())
         }
@@ -666,7 +742,7 @@ mod tests {
         #[test]
         fn decrypt_vec_truncated_fails() -> crate::Result<()> {
             let provider = Aes256GcmProvider::new(&test_key());
-            let result = provider.decrypt_vec(vec![0u8; 10]);
+            let result = provider.decrypt_vec(vec![0u8; 10], &[]);
             assert!(result.is_err());
             Ok(())
         }
@@ -674,7 +750,7 @@ mod tests {
         #[test]
         fn decrypt_vec_tampered_fails() -> crate::Result<()> {
             let provider = Aes256GcmProvider::new(&test_key());
-            let mut ciphertext = provider.encrypt_vec(b"data".to_vec())?;
+            let mut ciphertext = provider.encrypt_vec(b"data".to_vec(), &[])?;
 
             let mid = Aes256GcmProvider::NONCE_LEN + 1;
             if mid < ciphertext.len() {
@@ -684,7 +760,7 @@ mod tests {
                 }
             }
 
-            let result = provider.decrypt_vec(ciphertext);
+            let result = provider.decrypt_vec(ciphertext, &[]);
             assert!(result.is_err());
             Ok(())
         }

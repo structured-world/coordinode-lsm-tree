@@ -572,7 +572,11 @@ impl Table {
             file,
             regions.tli,
             compression,
-            encryption,
+            // FOUNDATION ONLY: empty AAD; per-block AAD wiring → #248.
+            encryption.map(|p| crate::encryption::EncryptionContext {
+                provider: p,
+                aad: &[],
+            }),
             #[cfg(zstd_any)]
             None,
         )?;
@@ -716,7 +720,13 @@ impl Table {
                 file_handle.as_ref(),
                 filter_tli_handle,
                 metadata.index_block_compression,
-                encryption.as_deref(),
+                // FOUNDATION ONLY: empty AAD; per-block AAD wiring → #248.
+                encryption
+                    .as_deref()
+                    .map(|p| crate::encryption::EncryptionContext {
+                        provider: p,
+                        aad: &[],
+                    }),
                 #[cfg(zstd_any)]
                 None,
             )?;
@@ -748,7 +758,13 @@ impl Table {
                         file_handle.as_ref(),
                         filter_handle,
                         crate::CompressionType::None, // NOTE: We never write a filter block with compression
-                        encryption.as_deref(),
+                        // FOUNDATION ONLY: empty AAD; per-block AAD wiring → #248.
+                        encryption
+                            .as_deref()
+                            .map(|p| crate::encryption::EncryptionContext {
+                                provider: p,
+                                aad: &[],
+                            }),
                         #[cfg(zstd_any)]
                         None,
                     )
@@ -777,7 +793,13 @@ impl Table {
                 file_handle.as_ref(),
                 rt_handle,
                 crate::CompressionType::None,
-                encryption.as_deref(),
+                // FOUNDATION ONLY: empty AAD; per-block AAD wiring → #248.
+                encryption
+                    .as_deref()
+                    .map(|p| crate::encryption::EncryptionContext {
+                        provider: p,
+                        aad: &[],
+                    }),
                 #[cfg(zstd_any)]
                 None,
             )?;

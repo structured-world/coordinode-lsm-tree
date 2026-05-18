@@ -86,7 +86,13 @@ impl PartitionedFilterWriter {
             &filter_bytes,
             crate::table::block::BlockType::Filter,
             CompressionType::None,
-            self.encryption.as_deref(),
+            // FOUNDATION ONLY: empty AAD; per-block AAD wiring → #248.
+            self.encryption
+                .as_deref()
+                .map(|p| crate::encryption::EncryptionContext {
+                    provider: p,
+                    aad: &[],
+                }),
             #[cfg(zstd_any)]
             None, // filter blocks don't use dictionary compression
         )?;
@@ -135,7 +141,13 @@ impl PartitionedFilterWriter {
             &bytes,
             crate::table::block::BlockType::Index,
             self.compression,
-            self.encryption.as_deref(),
+            // FOUNDATION ONLY: empty AAD; per-block AAD wiring → #248.
+            self.encryption
+                .as_deref()
+                .map(|p| crate::encryption::EncryptionContext {
+                    provider: p,
+                    aad: &[],
+                }),
             #[cfg(zstd_any)]
             None, // filter blocks don't use dictionary compression
         )?;

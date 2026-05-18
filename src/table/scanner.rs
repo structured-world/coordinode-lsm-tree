@@ -75,10 +75,18 @@ impl Scanner {
         encryption: Option<&dyn EncryptionProvider>,
         #[cfg(zstd_any)] zstd_dict: Option<&crate::compression::ZstdDictionary>,
     ) -> crate::Result<DataBlock> {
+        // FOUNDATION ONLY: EncryptionContext is wired structurally with empty
+        // AAD. Per-block AAD computation (table_id, offset, block_type) lands
+        // with the BlockTransform refactor in #248 — this scanner needs the
+        // refactor to thread the table context down.
+        let enc_ctx = encryption.map(|p| crate::encryption::EncryptionContext {
+            provider: p,
+            aad: &[],
+        });
         let block = Block::from_reader(
             reader,
             compression,
-            encryption,
+            enc_ctx,
             #[cfg(zstd_any)]
             zstd_dict,
         );

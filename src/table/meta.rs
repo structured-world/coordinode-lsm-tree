@@ -118,7 +118,11 @@ impl ParsedMeta {
             file,
             *handle,
             CompressionType::None,
-            encryption,
+            // FOUNDATION ONLY: empty AAD; per-block AAD wiring → #248.
+            encryption.map(|p| crate::encryption::EncryptionContext {
+                provider: p,
+                aad: &[],
+            }),
             #[cfg(zstd_any)]
             None,
         )?;

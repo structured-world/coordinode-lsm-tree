@@ -27,7 +27,6 @@ use crate::compression::CompressionProvider as _;
 use crate::{
     Checksum, CompressionType, Slice,
     coding::{Decode, Encode},
-    encryption::EncryptionProvider,
     fs::FsFile,
     table::BlockHandle,
 };
@@ -69,12 +68,20 @@ impl Block {
     /// contain the raw dictionary bytes matching the `dict_id` in the
     /// compression type. For all other compression types, `zstd_dict` is
     /// ignored.
+    ///
+    /// `encryption.aad` (when `Some`) is passed to the AEAD operation as
+    /// associated authenticated data. For block I/O this is the canonical
+    /// 17-byte tuple `(table_id, block_offset, block_type)` produced by
+    /// [`encryption::encode_block_aad`](crate::encryption::encode_block_aad).
+    /// The same `aad` MUST be supplied to [`from_reader`](Block::from_reader)
+    /// / [`from_file`](Block::from_file) when reading the block back, or
+    /// decryption fails with [`crate::Error::Decrypt`].
     pub fn write_into<W: std::io::Write>(
         mut writer: &mut W,
         data: &[u8],
         block_type: BlockType,
         compression: CompressionType,
-        encryption: Option<&dyn EncryptionProvider>,
+        encryption: Option<crate::encryption::EncryptionContext<'_>>,
         #[cfg(zstd_any)] zstd_dict: Option<&crate::compression::ZstdDictionary>,
     ) -> crate::Result<Header> {
         if data.len() > MAX_DECOMPRESSION_SIZE as usize {
@@ -137,10 +144,10 @@ impl Block {
 
         #[cfg(any(feature = "lz4", zstd_any))]
         {
-            encrypted_buf = if let Some(enc) = encryption {
+            encrypted_buf = if let Some(ctx) = encryption {
                 Some(match compressed_buf.take() {
-                    Some(owned) => enc.encrypt_vec(owned)?,
-                    None => enc.encrypt(data)?,
+                    Some(owned) => ctx.provider.encrypt_vec(owned, ctx.aad)?,
+                    None => ctx.provider.encrypt(data, ctx.aad)?,
                 })
             } else {
                 None
@@ -149,7 +156,9 @@ impl Block {
 
         #[cfg(not(any(feature = "lz4", zstd_any)))]
         {
-            encrypted_buf = encryption.map(|enc| enc.encrypt(data)).transpose()?;
+            encrypted_buf = encryption
+                .map(|ctx| ctx.provider.encrypt(data, ctx.aad))
+                .transpose()?;
         }
 
         // Determine the final on-disk payload reference.
@@ -176,7 +185,7 @@ impl Block {
         // beyond max_overhead() will be caught by this check (payload > limit).
         // Cap at u32::MAX to guarantee the subsequent as-u32 cast is safe.
         let max_payload = (u64::from(MAX_DECOMPRESSION_SIZE)
-            + encryption.map_or(0u64, |enc| u64::from(enc.max_overhead())))
+            + encryption.map_or(0u64, |ctx| u64::from(ctx.provider.max_overhead())))
         .min(u64::from(u32::MAX));
 
         if payload.len() as u64 > max_payload {
@@ -231,7 +240,7 @@ impl Block {
     pub fn from_reader<R: std::io::Read>(
         reader: &mut R,
         compression: CompressionType,
-        encryption: Option<&dyn EncryptionProvider>,
+        encryption: Option<crate::encryption::EncryptionContext<'_>>,
         #[cfg(zstd_any)] zstd_dict: Option<&crate::compression::ZstdDictionary>,
     ) -> crate::Result<Self> {
         let header = Header::decode_from(reader)?;
@@ -241,7 +250,7 @@ impl Block {
         // overhead (nonce + auth tag), so allow the provider's declared margin.
         // Use u64 arithmetic to avoid any possibility of u32 overflow
         // (consistent with from_file).
-        let enc_overhead = encryption.map_or(0u64, |e| u64::from(e.max_overhead()));
+        let enc_overhead = encryption.map_or(0u64, |ctx| u64::from(ctx.provider.max_overhead()));
         let max_data_length = u64::from(MAX_DECOMPRESSION_SIZE) + enc_overhead;
 
         if u64::from(header.data_length) > max_data_length {
@@ -262,7 +271,7 @@ impl Block {
         // reuse the buffer in-place (one allocation instead of two).
         // When no encryption, read into a Slice which may use optimized
         // reference-counted storage.
-        let data = if let Some(enc) = encryption {
+        let data = if let Some(ctx) = encryption {
             let mut raw_vec = vec![0u8; header.data_length as usize];
             reader.read_exact(&mut raw_vec)?;
 
@@ -276,7 +285,7 @@ impl Block {
             })?;
 
             // Decrypt in-place, reusing the read buffer.
-            let decrypted = enc.decrypt_vec(raw_vec)?;
+            let decrypted = ctx.provider.decrypt_vec(raw_vec, ctx.aad)?;
 
             match compression {
                 CompressionType::None => {
@@ -450,12 +459,12 @@ impl Block {
         file: &dyn FsFile,
         handle: BlockHandle,
         compression: CompressionType,
-        encryption: Option<&dyn EncryptionProvider>,
+        encryption: Option<crate::encryption::EncryptionContext<'_>>,
         #[cfg(zstd_any)] zstd_dict: Option<&crate::compression::ZstdDictionary>,
     ) -> crate::Result<Self> {
         // handle.size() includes Header::serialized_len(), so allow that overhead.
         // Encrypted blocks add provider-specific overhead to the on-disk size.
-        let enc_overhead = encryption.map_or(0u64, |e| u64::from(e.max_overhead()));
+        let enc_overhead = encryption.map_or(0u64, |ctx| u64::from(ctx.provider.max_overhead()));
         let max_on_disk_size =
             u64::from(MAX_DECOMPRESSION_SIZE) + Header::serialized_len() as u64 + enc_overhead;
 
@@ -472,7 +481,7 @@ impl Block {
         // No intermediate Slice, no overlap of encrypted + decrypted buffers.
         // When no encryption, read into a Slice (zero-copy on the
         // None-compression path).
-        let (header, data) = if let Some(enc) = encryption {
+        let (header, data) = if let Some(ctx) = encryption {
             let header_len = Header::serialized_len();
             let block_size = handle.size() as usize;
 
@@ -529,7 +538,7 @@ impl Block {
             buf.copy_within(header_len.., 0);
             buf.truncate(actual_data_len);
 
-            let decrypted = enc.decrypt_vec(buf)?;
+            let decrypted = ctx.provider.decrypt_vec(buf, ctx.aad)?;
 
             let data = match compression {
                 CompressionType::None => {
@@ -1391,7 +1400,10 @@ mod tests {
                 data,
                 BlockType::Data,
                 CompressionType::None,
-                Some(&enc),
+                Some(crate::encryption::EncryptionContext {
+                    provider: &enc,
+                    aad: &[],
+                }),
                 #[cfg(zstd_any)]
                 None,
             )?;
@@ -1400,7 +1412,10 @@ mod tests {
             let block = Block::from_reader(
                 &mut reader,
                 CompressionType::None,
-                Some(&enc),
+                Some(crate::encryption::EncryptionContext {
+                    provider: &enc,
+                    aad: &[],
+                }),
                 #[cfg(zstd_any)]
                 None,
             )?;
@@ -1420,7 +1435,10 @@ mod tests {
                 data,
                 BlockType::Data,
                 CompressionType::Lz4,
-                Some(&enc),
+                Some(crate::encryption::EncryptionContext {
+                    provider: &enc,
+                    aad: &[],
+                }),
                 #[cfg(zstd_any)]
                 None,
             )?;
@@ -1429,7 +1447,10 @@ mod tests {
             let block = Block::from_reader(
                 &mut reader,
                 CompressionType::Lz4,
-                Some(&enc),
+                Some(crate::encryption::EncryptionContext {
+                    provider: &enc,
+                    aad: &[],
+                }),
                 #[cfg(zstd_any)]
                 None,
             )?;
@@ -1449,7 +1470,10 @@ mod tests {
                 data,
                 BlockType::Data,
                 CompressionType::Zstd(3),
-                Some(&enc),
+                Some(crate::encryption::EncryptionContext {
+                    provider: &enc,
+                    aad: &[],
+                }),
                 #[cfg(zstd_any)]
                 None,
             )?;
@@ -1458,7 +1482,10 @@ mod tests {
             let block = Block::from_reader(
                 &mut reader,
                 CompressionType::Zstd(3),
-                Some(&enc),
+                Some(crate::encryption::EncryptionContext {
+                    provider: &enc,
+                    aad: &[],
+                }),
                 #[cfg(zstd_any)]
                 None,
             )?;
@@ -1478,7 +1505,10 @@ mod tests {
                 data,
                 BlockType::Data,
                 CompressionType::None,
-                Some(&enc),
+                Some(crate::encryption::EncryptionContext {
+                    provider: &enc,
+                    aad: &[],
+                }),
                 #[cfg(zstd_any)]
                 None,
             )?;
@@ -1499,7 +1529,10 @@ mod tests {
                 &file,
                 handle,
                 CompressionType::None,
-                Some(&enc),
+                Some(crate::encryption::EncryptionContext {
+                    provider: &enc,
+                    aad: &[],
+                }),
                 #[cfg(zstd_any)]
                 None,
             )?;
@@ -1520,7 +1553,10 @@ mod tests {
                 data,
                 BlockType::Data,
                 CompressionType::Lz4,
-                Some(&enc),
+                Some(crate::encryption::EncryptionContext {
+                    provider: &enc,
+                    aad: &[],
+                }),
                 #[cfg(zstd_any)]
                 None,
             )?;
@@ -1541,7 +1577,10 @@ mod tests {
                 &file,
                 handle,
                 CompressionType::Lz4,
-                Some(&enc),
+                Some(crate::encryption::EncryptionContext {
+                    provider: &enc,
+                    aad: &[],
+                }),
                 #[cfg(zstd_any)]
                 None,
             )?;
@@ -1562,7 +1601,10 @@ mod tests {
                 data,
                 BlockType::Data,
                 CompressionType::Zstd(3),
-                Some(&enc),
+                Some(crate::encryption::EncryptionContext {
+                    provider: &enc,
+                    aad: &[],
+                }),
                 #[cfg(zstd_any)]
                 None,
             )?;
@@ -1583,7 +1625,10 @@ mod tests {
                 &file,
                 handle,
                 CompressionType::Zstd(3),
-                Some(&enc),
+                Some(crate::encryption::EncryptionContext {
+                    provider: &enc,
+                    aad: &[],
+                }),
                 #[cfg(zstd_any)]
                 None,
             )?;
@@ -1604,7 +1649,10 @@ mod tests {
                 data,
                 BlockType::Data,
                 CompressionType::None,
-                Some(&enc_write),
+                Some(crate::encryption::EncryptionContext {
+                    provider: &enc_write,
+                    aad: &[],
+                }),
                 #[cfg(zstd_any)]
                 None,
             )?;
@@ -1625,7 +1673,10 @@ mod tests {
                 &file,
                 handle,
                 CompressionType::None,
-                Some(&enc_read),
+                Some(crate::encryption::EncryptionContext {
+                    provider: &enc_read,
+                    aad: &[],
+                }),
                 #[cfg(zstd_any)]
                 None,
             );
@@ -1649,7 +1700,10 @@ mod tests {
                 data,
                 BlockType::Data,
                 CompressionType::None,
-                Some(&enc_write),
+                Some(crate::encryption::EncryptionContext {
+                    provider: &enc_write,
+                    aad: &[],
+                }),
                 #[cfg(zstd_any)]
                 None,
             )?;
@@ -1658,7 +1712,10 @@ mod tests {
             let result = Block::from_reader(
                 &mut reader,
                 CompressionType::None,
-                Some(&enc_read),
+                Some(crate::encryption::EncryptionContext {
+                    provider: &enc_read,
+                    aad: &[],
+                }),
                 #[cfg(zstd_any)]
                 None,
             );
@@ -1682,7 +1739,10 @@ mod tests {
                 data,
                 BlockType::Data,
                 CompressionType::None,
-                Some(&enc),
+                Some(crate::encryption::EncryptionContext {
+                    provider: &enc,
+                    aad: &[],
+                }),
                 #[cfg(zstd_any)]
                 None,
             )?;
@@ -1712,7 +1772,10 @@ mod tests {
                 &file,
                 handle,
                 CompressionType::None,
-                Some(&enc),
+                Some(crate::encryption::EncryptionContext {
+                    provider: &enc,
+                    aad: &[],
+                }),
                 #[cfg(zstd_any)]
                 None,
             );
@@ -1743,7 +1806,10 @@ mod tests {
                 &file,
                 handle,
                 CompressionType::None,
-                Some(&enc),
+                Some(crate::encryption::EncryptionContext {
+                    provider: &enc,
+                    aad: &[],
+                }),
                 #[cfg(zstd_any)]
                 None,
             );
@@ -1768,7 +1834,10 @@ mod tests {
                 &data,
                 BlockType::Data,
                 CompressionType::None,
-                Some(&enc),
+                Some(crate::encryption::EncryptionContext {
+                    provider: &enc,
+                    aad: &[],
+                }),
                 #[cfg(zstd_any)]
                 None,
             )?;
@@ -1789,7 +1858,10 @@ mod tests {
                 &file,
                 handle,
                 CompressionType::None,
-                Some(&enc),
+                Some(crate::encryption::EncryptionContext {
+                    provider: &enc,
+                    aad: &[],
+                }),
                 #[cfg(zstd_any)]
                 None,
             )?;
@@ -1808,7 +1880,10 @@ mod tests {
                 &data,
                 BlockType::Data,
                 CompressionType::None,
-                Some(&enc),
+                Some(crate::encryption::EncryptionContext {
+                    provider: &enc,
+                    aad: &[],
+                }),
                 #[cfg(zstd_any)]
                 None,
             )?;
@@ -1817,7 +1892,10 @@ mod tests {
             let block = Block::from_reader(
                 &mut reader,
                 CompressionType::None,
-                Some(&enc),
+                Some(crate::encryption::EncryptionContext {
+                    provider: &enc,
+                    aad: &[],
+                }),
                 #[cfg(zstd_any)]
                 None,
             )?;
@@ -1837,7 +1915,10 @@ mod tests {
                 &data,
                 BlockType::Data,
                 CompressionType::Lz4,
-                Some(&enc),
+                Some(crate::encryption::EncryptionContext {
+                    provider: &enc,
+                    aad: &[],
+                }),
                 #[cfg(zstd_any)]
                 None,
             )?;
@@ -1846,7 +1927,10 @@ mod tests {
             let block = Block::from_reader(
                 &mut reader,
                 CompressionType::Lz4,
-                Some(&enc),
+                Some(crate::encryption::EncryptionContext {
+                    provider: &enc,
+                    aad: &[],
+                }),
                 #[cfg(zstd_any)]
                 None,
             )?;
@@ -1866,7 +1950,10 @@ mod tests {
                 &data,
                 BlockType::Data,
                 CompressionType::Zstd(3),
-                Some(&enc),
+                Some(crate::encryption::EncryptionContext {
+                    provider: &enc,
+                    aad: &[],
+                }),
                 #[cfg(zstd_any)]
                 None,
             )?;
@@ -1875,7 +1962,10 @@ mod tests {
             let block = Block::from_reader(
                 &mut reader,
                 CompressionType::Zstd(3),
-                Some(&enc),
+                Some(crate::encryption::EncryptionContext {
+                    provider: &enc,
+                    aad: &[],
+                }),
                 #[cfg(zstd_any)]
                 None,
             )?;
@@ -2084,12 +2174,23 @@ mod tests {
                 data,
                 BlockType::Data,
                 compression,
-                Some(&enc),
+                Some(crate::encryption::EncryptionContext {
+                    provider: &enc,
+                    aad: &[],
+                }),
                 Some(&dict),
             )?;
 
             let mut reader = &writer[..];
-            let block = Block::from_reader(&mut reader, compression, Some(&enc), Some(&dict))?;
+            let block = Block::from_reader(
+                &mut reader,
+                compression,
+                Some(crate::encryption::EncryptionContext {
+                    provider: &enc,
+                    aad: &[],
+                }),
+                Some(&dict),
+            )?;
             assert_eq!(data, &*block.data);
             Ok(())
         }
@@ -2109,7 +2210,10 @@ mod tests {
                 &data,
                 BlockType::Data,
                 compression,
-                Some(&enc),
+                Some(crate::encryption::EncryptionContext {
+                    provider: &enc,
+                    aad: &[],
+                }),
                 Some(&dict),
             )?;
 
@@ -2125,7 +2229,16 @@ mod tests {
                 BlockOffset(0),
                 header.data_length + Header::serialized_len() as u32,
             );
-            let block = Block::from_file(&file, handle, compression, Some(&enc), Some(&dict))?;
+            let block = Block::from_file(
+                &file,
+                handle,
+                compression,
+                Some(crate::encryption::EncryptionContext {
+                    provider: &enc,
+                    aad: &[],
+                }),
+                Some(&dict),
+            )?;
             assert_eq!(&*block.data, &data[..]);
             Ok(())
         }

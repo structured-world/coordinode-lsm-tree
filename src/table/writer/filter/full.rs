@@ -123,7 +123,13 @@ impl<W: std::io::Write + std::io::Seek> FilterWriter<W> for FullFilterWriter {
                 &filter_bytes,
                 crate::table::block::BlockType::Filter,
                 CompressionType::None,
-                self.encryption.as_deref(),
+                // FOUNDATION ONLY: empty AAD; per-block AAD wiring → #248.
+                self.encryption
+                    .as_deref()
+                    .map(|p| crate::encryption::EncryptionContext {
+                        provider: p,
+                        aad: &[],
+                    }),
                 #[cfg(zstd_any)]
                 None,
             )?;

@@ -98,11 +98,24 @@ pub fn load_block(
     #[cfg(not(feature = "metrics"))]
     let _ = cache_event;
 
+    // FOUNDATION ONLY: empty AAD here (and on every other read/write site).
+    // The AAD trait surface, EncryptionContext, encode_block_aad helper, and
+    // BLOCK_AAD_LEN are all in place — but consistent per-block AAD wiring
+    // across writer/scanner/meta/load_block lands in one pass with the #248
+    // BlockTransform refactor. Mixing real AAD here with empty AAD elsewhere
+    // would cause `aad mismatch` decrypt failures because writer + reader
+    // must agree byte-for-byte.
+    let enc_ctx = encryption.map(|p| crate::encryption::EncryptionContext {
+        provider: p,
+        aad: &[],
+    });
+    let _ = (table_id, block_type); // available for #248; unused in foundation phase
+
     let block = Block::from_file(
         fd.as_ref(),
         *handle,
         compression,
-        encryption,
+        enc_ctx,
         #[cfg(zstd_any)]
         zstd_dict,
     )?;

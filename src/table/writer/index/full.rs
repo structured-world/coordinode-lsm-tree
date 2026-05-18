@@ -88,7 +88,13 @@ impl<W: std::io::Write + std::io::Seek> BlockIndexWriter<W> for FullIndexWriter 
             &bytes,
             crate::table::block::BlockType::Index,
             self.compression,
-            self.encryption.as_deref(),
+            // FOUNDATION ONLY: empty AAD; real per-block AAD lands in #248.
+            self.encryption
+                .as_deref()
+                .map(|p| crate::encryption::EncryptionContext {
+                    provider: p,
+                    aad: &[],
+                }),
             #[cfg(zstd_any)]
             None, // index blocks don't use dictionary compression (dict trained on data, not index structures)
         )?;

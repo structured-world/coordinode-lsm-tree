@@ -439,7 +439,15 @@ impl Writer {
             &self.block_buffer,
             super::block::BlockType::Data,
             self.data_block_compression,
-            self.encryption.as_deref(),
+            // FOUNDATION ONLY: empty AAD here AND in load_block. Per-block
+            // AAD activation (table_id + offset + type) is wired
+            // consistently across all writers/readers by #248.
+            self.encryption
+                .as_deref()
+                .map(|p| crate::encryption::EncryptionContext {
+                    provider: p,
+                    aad: &[],
+                }),
             #[cfg(zstd_any)]
             self.zstd_dictionary.as_deref(),
         )?;
@@ -617,7 +625,13 @@ impl Writer {
                 &self.block_buffer,
                 crate::table::block::BlockType::RangeTombstone,
                 CompressionType::None,
-                self.encryption.as_deref(),
+                // FOUNDATION ONLY: empty AAD; per-block AAD wiring → #248.
+                self.encryption
+                    .as_deref()
+                    .map(|p| crate::encryption::EncryptionContext {
+                        provider: p,
+                        aad: &[],
+                    }),
                 #[cfg(zstd_any)]
                 None,
             )?;
@@ -751,7 +765,13 @@ impl Writer {
                 &self.block_buffer,
                 crate::table::block::BlockType::Meta,
                 CompressionType::None,
-                self.encryption.as_deref(),
+                // FOUNDATION ONLY: empty AAD; per-block AAD wiring → #248.
+                self.encryption
+                    .as_deref()
+                    .map(|p| crate::encryption::EncryptionContext {
+                        provider: p,
+                        aad: &[],
+                    }),
                 #[cfg(zstd_any)]
                 None,
             )?;
