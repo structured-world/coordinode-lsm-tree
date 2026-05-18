@@ -357,7 +357,10 @@ jobs:
               --head "$SYNC_BRANCH"
           else
             CONFLICTS=$(git diff --name-only --diff-filter=U 2>/dev/null || true)
-            git merge --abort
+            # Defensive: if the merge failed before entering merge state
+            # (e.g., internal git error rather than conflicts), there's
+            # nothing to abort and the bare command would fail under `set -e`.
+            git merge --abort 2>/dev/null || true
 
             # Insert conflict + manual-resolution sections BEFORE the
             # checklist so the issue reads top-to-bottom: summary → changes
