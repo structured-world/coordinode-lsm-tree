@@ -158,8 +158,8 @@ pub fn load_block(
 ///
 /// Dispatch:
 /// - **`x86_64` with AVX2** (runtime-detected): 32-byte vectorized lanes via `_mm256_cmpeq_epi8`.
-/// - **`aarch64`**: 16-byte vectorized lanes via NEON (`ARMv8` baseline — no runtime check).
-/// - **Everything else** (including `x86_64` without AVX2): 8-byte word stride via XOR + trailing zeros.
+/// - **`aarch64` little-endian**: 16-byte vectorized lanes via NEON (`ARMv8` baseline — no runtime check).
+/// - **Everything else** (incl. `x86_64` without AVX2, big-endian aarch64): 8-byte word stride via XOR + trailing zeros.
 ///
 /// `is_x86_feature_detected!` caches the CPUID result, so the per-call dispatch
 /// cost is one cached atomic load on `x86_64`.
@@ -172,14 +172,24 @@ pub fn longest_shared_prefix_length(s1: &[u8], s2: &[u8]) -> usize {
             return unsafe { lsp_avx2(s1, s2) };
         }
     }
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
     {
         // SAFETY: NEON is mandatory in the ARMv8 baseline that `target_arch = "aarch64"` implies.
+        // The kernel relies on LE byte order for `trailing_zeros() / 8` mismatch position math
+        // and for NEON lane-to-memory mapping — restricted to LE aarch64 (the only practically
+        // shipped flavour: Linux servers, Apple Silicon, Android, iOS).
         return unsafe { lsp_neon(s1, s2) };
     }
+    // On LE aarch64 the NEON dispatch arm above unconditionally returns, so the
+    // scalar tail is statically unreachable; on x86_64 the AVX2 arm is gated
+    // on runtime CPU detection, so the scalar tail is genuinely reachable
+    // when AVX2 is unavailable — the expect only applies to LE aarch64.
     #[cfg_attr(
-        any(target_arch = "x86_64", target_arch = "aarch64"),
-        allow(unreachable_code)
+        all(target_arch = "aarch64", target_endian = "little"),
+        expect(
+            unreachable_code,
+            reason = "NEON arm above is unconditional on LE aarch64; scalar tail only reached on other archs/endianness"
+        )
     )]
     lsp_scalar(s1, s2)
 }
@@ -247,15 +257,25 @@ unsafe fn lsp_avx2(s1: &[u8], s2: &[u8]) -> usize {
 
     while i + 32 <= min_len {
         // SAFETY: i + 32 <= min_len ≤ s{1,2}.len() — both 32-byte loads are in-bounds.
+        // `_mm256_loadu_si256` is the *unaligned* load, so the u8→__m256i pointer cast
+        // does not require 32-byte alignment (the pointer is only used by `loadu`).
+        #[expect(
+            clippy::cast_ptr_alignment,
+            reason = "_mm256_loadu_si256 explicitly performs an unaligned 32-byte load"
+        )]
         let (va, vb) = unsafe {
             (
                 _mm256_loadu_si256(s1.as_ptr().add(i).cast::<__m256i>()),
                 _mm256_loadu_si256(s2.as_ptr().add(i).cast::<__m256i>()),
             )
         };
-        // SAFETY: AVX2 feature gate guarantees these intrinsics are available.
-        let cmp = unsafe { _mm256_cmpeq_epi8(va, vb) };
-        let mask = unsafe { _mm256_movemask_epi8(cmp) } as u32;
+        // Register-only AVX2 intrinsics under #[target_feature(enable = "avx2")] —
+        // no `unsafe` block needed; the function-level `unsafe` covers their availability.
+        let cmp = _mm256_cmpeq_epi8(va, vb);
+        // `_mm256_movemask_epi8` returns the byte-mask as a signed `i32`. We treat the
+        // bit pattern as `u32` for trailing-zeros math — `cast_unsigned()` makes the
+        // sign-preserving reinterpretation explicit.
+        let mask = _mm256_movemask_epi8(cmp).cast_unsigned();
         if mask != u32::MAX {
             return i + (!mask).trailing_zeros() as usize;
         }
@@ -277,12 +297,16 @@ unsafe fn lsp_avx2(s1: &[u8], s2: &[u8]) -> usize {
 
 /// NEON implementation — 16 bytes per iteration via `vceqq_u8` + byte-wise mask reduction.
 ///
+/// Restricted to **little-endian** aarch64 because the lane-to-memory mapping of
+/// `vgetq_lane_u64` and the `trailing_zeros() / 8` mismatch-position math both
+/// assume LE byte order. Big-endian aarch64 falls back to the scalar kernel.
+///
 /// # Safety
 ///
 /// NEON is part of the `ARMv8` baseline and is always available on `target_arch = "aarch64"`,
 /// so no runtime detection is needed. The `unsafe` is required only because the intrinsics
 /// themselves are `unsafe fn`.
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(target_arch = "aarch64", target_endian = "little"))]
 #[target_feature(enable = "neon")]
 #[expect(unsafe_code, reason = "intrinsics require unsafe")]
 #[must_use]
