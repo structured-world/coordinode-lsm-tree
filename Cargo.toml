@@ -101,3 +101,9 @@ name = "zstd_dict"
 harness = false
 path = "benches/zstd_dict.rs"
 required-features = []
+
+[[bench]]
+name = "lsp"
+harness = false
+path = "benches/lsp.rs"
+required-features = []

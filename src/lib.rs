@@ -188,6 +188,7 @@ pub use {
     key_range::KeyRange,
     merge::BoxedIterator,
     slice::Builder,
+    table::util::longest_shared_prefix_length,
     table::{GlobalTableId, Table, TableId},
     tree::Guard as StandardGuard,
     tree::inner::TreeId,
