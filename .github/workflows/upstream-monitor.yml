@@ -76,7 +76,6 @@ jobs:
 
       - name: Build change report
         if: steps.detect.outputs.behind != '0'
-        id: report
         env:
           BEHIND: ${{ steps.detect.outputs.behind }}
           NEW_RELEASE: ${{ steps.detect.outputs.new_release }}
@@ -166,12 +165,14 @@ jobs:
                 fi
               done || true
 
-          # Markdown-escape a title so backticks / pipes / brackets in
-          # upstream issue titles don't break the surrounding list-item
-          # rendering or link syntax. Single-quoted sed expressions are
-          # intentional — the backticks are literal characters to match,
-          # not command substitutions (shellcheck SC2016 is a false positive
-          # for sed scripts).
+          # Markdown-escape a title so backticks / pipes / brackets / angle
+          # brackets in upstream issue titles don't break the surrounding
+          # list-item rendering, link syntax, or trigger Markdown's raw-HTML
+          # pass (a title like `Use <T> as bound` would otherwise have
+          # `<T>` interpreted as an unknown HTML tag and stripped).
+          # Single-quoted sed expressions are intentional — backticks are
+          # literal characters to match, not command substitutions
+          # (shellcheck SC2016 is a false positive for sed scripts).
           # shellcheck disable=SC2016
           md_escape() {
             printf '%s' "$1" \
@@ -179,14 +180,21 @@ jobs:
                     -e 's/`/\\`/g' \
                     -e 's/|/\\|/g' \
                     -e 's/\[/\\[/g' \
-                    -e 's/\]/\\]/g'
+                    -e 's/\]/\\]/g' \
+                    -e 's/</\&lt;/g' \
+                    -e 's/>/\&gt;/g'
           }
 
           : > /tmp/sync/refs.md
+          # Both ref lists are capped to keep PR/issue bodies bounded when an
+          # upstream sync brings in many references. Bare refs are also
+          # API-rate-limit-bound (one title lookup per ref).
+          REFS_CAP=20
+
           # Resolve bare refs against UPSTREAM_REPO via a single Issues API call
           # (PRs are issues under the hood, so we don't need an issue→PR fallback).
           if [ -s /tmp/sync/refs_bare.txt ]; then
-            head -20 /tmp/sync/refs_bare.txt | while read -r REF; do
+            head -"$REFS_CAP" /tmp/sync/refs_bare.txt | while read -r REF; do
               NUM="${REF#\#}"
               TITLE=$(gh api "repos/${UPSTREAM_REPO}/issues/${NUM}" --jq '.title' 2>/dev/null || true)
               if [ -n "$TITLE" ]; then
@@ -199,16 +207,26 @@ jobs:
                 echo "warn: failed to resolve title for ${UPSTREAM_REPO}${REF}" >&2
               fi
             done
+            BARE_TOTAL=$(wc -l < /tmp/sync/refs_bare.txt | tr -d ' ')
+            if [ "$BARE_TOTAL" -gt "$REFS_CAP" ]; then
+              REMAINING=$((BARE_TOTAL - REFS_CAP))
+              echo "- _…and ${REMAINING} more bare ref(s) not shown — see commit log_" >> /tmp/sync/refs.md
+            fi
           fi
           # Qualified refs: render as link without title resolution (cross-repo,
-          # may not be readable without extra auth).
+          # may not be readable without extra auth). Symmetric cap.
           if [ -s /tmp/sync/refs_qualified.txt ]; then
-            while read -r REF; do
+            head -"$REFS_CAP" /tmp/sync/refs_qualified.txt | while read -r REF; do
               REPO_PART="${REF%%#*}"
               NUM="${REF##*#}"
               echo "- [${REF}](https://github.com/${REPO_PART}/issues/${NUM})" \
                 >> /tmp/sync/refs.md
-            done < /tmp/sync/refs_qualified.txt
+            done
+            QUAL_TOTAL=$(wc -l < /tmp/sync/refs_qualified.txt | tr -d ' ')
+            if [ "$QUAL_TOTAL" -gt "$REFS_CAP" ]; then
+              REMAINING=$((QUAL_TOTAL - REFS_CAP))
+              echo "- _…and ${REMAINING} more qualified ref(s) not shown — see commit log_" >> /tmp/sync/refs.md
+            fi
           fi
 
           # Fork overlap: files touched by upstream (since the last shared
@@ -218,21 +236,16 @@ jobs:
           MERGE_BASE=$(git merge-base origin/main "${UPSTREAM_REMOTE}/main")
           git diff --name-only "$MERGE_BASE..${UPSTREAM_REMOTE}/main" \
             | sort -u > /tmp/sync/upstream_files.txt
-          git log origin/main --not "${UPSTREAM_REMOTE}/main" \
+          git log "${MERGE_BASE}..origin/main" --not "${UPSTREAM_REMOTE}/main" \
             --name-only --format= \
             | grep -v '^$' | sort -u > /tmp/sync/fork_files.txt || true
           comm -12 /tmp/sync/upstream_files.txt /tmp/sync/fork_files.txt \
             > /tmp/sync/overlap.txt || true
 
           # Emit summary counts for use in subsequent steps.
-          {
-            echo "breaking=$(wc -l < /tmp/sync/breaking.txt | tr -d ' ')"
-            echo "feat=$(wc -l < /tmp/sync/feat.txt | tr -d ' ')"
-            echo "fix=$(wc -l < /tmp/sync/fix.txt | tr -d ' ')"
-            echo "perf=$(wc -l < /tmp/sync/perf.txt | tr -d ' ')"
-            echo "other=$(wc -l < /tmp/sync/other.txt | tr -d ' ')"
-            echo "overlap=$(wc -l < /tmp/sync/overlap.txt | tr -d ' ')"
-          } >> "$GITHUB_OUTPUT"
+          # Counts go directly into the rendered body in the next step; no
+          # downstream step consumes them as workflow outputs, so we don't
+          # emit step outputs here (was unused noise on every run).
 
       - name: Compose structured body (head)
         if: steps.detect.outputs.behind != '0'
@@ -248,7 +261,6 @@ jobs:
           BODY=/tmp/sync/body.md
           : > "$BODY"
 
-          UPSTREAM_HEAD_SHORT=$(git rev-parse --short "${UPSTREAM_REMOTE}/main")
           if [ "$NEW_RELEASE" = "true" ]; then
             {
               echo "## Upstream Sync: ${UPSTREAM_PREV_TAG:-(none)} → ${UPSTREAM_LATEST_TAG}"
@@ -259,6 +271,7 @@ jobs:
             # In-development commits between releases — anchor the heading
             # to the last synced tag and the upstream HEAD short SHA so the
             # baseline is still visible at a glance.
+            UPSTREAM_HEAD_SHORT=$(git rev-parse --short "${UPSTREAM_REMOTE}/main")
             echo "## Upstream Sync: ${UPSTREAM_PREV_TAG:-(none)} → main@${UPSTREAM_HEAD_SHORT}" >> "$BODY"
           fi
           {
@@ -328,10 +341,20 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
+          # Skip if a previous sync PR is still open (review in progress).
+          # Otherwise every cron run (Mon/Thu) + every workflow_dispatch
+          # would stack new sync PRs on top of unresolved ones.
+          OPEN_SYNC_PRS=$(gh pr list \
+            --label upstream-sync --state open \
+            --json number --jq 'length')
+          if [ "$OPEN_SYNC_PRS" -gt 0 ]; then
+            echo "Skip: ${OPEN_SYNC_PRS} open sync PR(s) already exist — resolve them before opening another."
+            exit 0
+          fi
+
           # Branch name carries the date + run number so a second run on the
-          # same UTC day (manual `workflow_dispatch` after the cron run, or a
-          # re-run while the previous PR is still open) gets a distinct name
-          # and doesn't collide with an existing remote branch / open PR.
+          # same UTC day (manual `workflow_dispatch` after the cron run) gets
+          # a distinct name and doesn't collide with an existing remote branch.
           SYNC_BRANCH="chore/upstream-sync-$(date +%Y%m%d)-${GITHUB_RUN_NUMBER}"
           git checkout -b "$SYNC_BRANCH" origin/main
 
@@ -364,7 +387,13 @@ jobs:
               mkdir -p "$(dirname "$STATE_FILE")"
               echo "$UPSTREAM_LATEST_TAG" > "$STATE_FILE"
               git add "$STATE_FILE"
-              git commit -m "chore: bump upstream sync state to ${UPSTREAM_LATEST_TAG}"
+              # Between-release runs re-write the same tag → staged diff
+              # is empty. Skip the bump commit in that case; an unguarded
+              # `git commit` would fail under `set -e` and abort the step
+              # before `git push` / `gh pr create`.
+              if ! git diff --cached --quiet; then
+                git commit -m "chore: bump upstream sync state to ${UPSTREAM_LATEST_TAG}"
+              fi
             fi
 
             git push origin "$SYNC_BRANCH"
@@ -373,7 +402,8 @@ jobs:
               --title "chore: sync upstream (${BEHIND} new commits)" \
               --body-file "$BODY_PATH" \
               --base main \
-              --head "$SYNC_BRANCH"
+              --head "$SYNC_BRANCH" \
+              --label "upstream-sync"
           else
             CONFLICTS=$(git diff --name-only --diff-filter=U 2>/dev/null || true)
             # Defensive: if the merge failed before entering merge state
@@ -395,6 +425,10 @@ jobs:
                 echo
                 echo "### Manual resolution"
                 echo
+                # User-facing snippet: keep the conventional `upstream`
+                # remote name (literal, not `${UPSTREAM_REMOTE}`) so it
+                # matches what developers actually type locally and
+                # remains valid regardless of the workflow's env block.
                 echo '```bash'
                 echo "git remote add upstream ${UPSTREAM_URL}"
                 echo "git fetch upstream main"

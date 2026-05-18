@@ -20,6 +20,10 @@ reviews:
     enabled: true
     auto_incremental_review: true
     drafts: false
+    # Single `main` base: feat/#NNN and fix/#NNN are PR source branches per
+    # our convention (CLAUDE.md), not long-lived integration targets — there
+    # are no release/* branches in this repo. Widen this list if that ever
+    # changes.
     base_branches: ["main"]
     ignore_title_keywords: ["WIP", "DO NOT MERGE"]
   path_instructions:
@@ -42,7 +46,16 @@ reviews:
       instructions: |
         Compaction is crash-safety critical. Every state mutation must be atomic.
         Verify no partial writes can corrupt on-disk state.
-    - path: "src/encryption.rs"
+    # Glob (not the bare `src/encryption.rs` path) so the rule survives a
+    # module-vs-single-file refactor — covers the current single-file form,
+    # `src/encryption/` directory layouts, and any future `encryption_*.rs`
+    # split.
+    - path: "src/encryption*.rs"
+      instructions: |
+        Security-critical code. Review for timing attacks, nonce reuse, key handling.
+        RNG must be CSPRNG. No hardcoded keys or IVs. AEAD nonces must never repeat
+        under the same key. Fork-aware reseed must be preserved.
+    - path: "src/encryption/**"
       instructions: |
         Security-critical code. Review for timing attacks, nonce reuse, key handling.
         RNG must be CSPRNG. No hardcoded keys or IVs. AEAD nonces must never repeat
