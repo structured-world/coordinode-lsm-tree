@@ -42,8 +42,14 @@ jobs:
           BEHIND=$(git rev-list "origin/main..${UPSTREAM_REMOTE}/main" --count)
           echo "behind=$BEHIND" >> "$GITHUB_OUTPUT"
 
+          # Match fjall-rs's `v`-prefixed stable semver only. Pre-release tags
+          # like `v1.2.3-rc1` and build-metadata like `v1.2.3+build.5` are
+          # intentionally excluded — we don't auto-sync unstable releases.
+          # A future "track upstream pre-releases" feature would extend this
+          # pattern explicitly.
+          SEMVER_RE='^v[0-9]+\.[0-9]+\.[0-9]+$'
           UPSTREAM_LATEST_TAG=$(git tag -l --sort=-v:refname --merged "${UPSTREAM_REMOTE}/main" \
-            | grep -E '^v?[0-9]+\.[0-9]+\.[0-9]+$' | head -1 || true)
+            | grep -E "$SEMVER_RE" | head -1 || true)
 
           # Prefer the explicit state file; fall back to inference from
           # `--merged origin/main` if the file is missing (first run) or
@@ -52,7 +58,7 @@ jobs:
             UPSTREAM_PREV_TAG=$(tr -d '[:space:]' < "$STATE_FILE")
           else
             UPSTREAM_PREV_TAG=$(git tag -l --sort=-v:refname --merged "origin/main" \
-              | grep -E '^v?[0-9]+\.[0-9]+\.[0-9]+$' | head -1 || true)
+              | grep -E "$SEMVER_RE" | head -1 || true)
           fi
           echo "upstream_latest_tag=$UPSTREAM_LATEST_TAG" >> "$GITHUB_OUTPUT"
           echo "upstream_prev_tag=$UPSTREAM_PREV_TAG" >> "$GITHUB_OUTPUT"
@@ -64,8 +70,8 @@ jobs:
           echo "new_release=$NEW_RELEASE" >> "$GITHUB_OUTPUT"
 
           echo "Commits behind upstream: $BEHIND"
-          echo "Upstream latest tag: ${UPSTREAM_LATEST_TAG:-<none>}"
-          echo "Last synced upstream tag: ${UPSTREAM_PREV_TAG:-<none>}"
+          echo "Upstream latest tag: ${UPSTREAM_LATEST_TAG:-(none)}"
+          echo "Last synced upstream tag: ${UPSTREAM_PREV_TAG:-(none)}"
           echo "New release available: $NEW_RELEASE"
 
       - name: Build change report
@@ -96,10 +102,20 @@ jobs:
           FIX_RE='^fix(\([^)]*\))?:'
           PERF_RE='^perf(\([^)]*\))?:'
 
-          while IFS=$'\t' read -r SHA SUBJECT BODY; do
+          # Read NUL-delimited records from `git log -z`. Each record holds
+          # `SHA\tSUBJECT\tBODY`; BODY may contain its own newlines (footers,
+          # multi-paragraph descriptions). We split fields via parameter
+          # expansion rather than `IFS=$'\t' read` so internal newlines stay
+          # inside BODY and don't get treated as record separators.
+          while IFS= read -r -d '' RECORD; do
+            SHA="${RECORD%%$'\t'*}"
+            REST="${RECORD#*$'\t'}"
+            SUBJECT="${REST%%$'\t'*}"
+            BODY="${REST#*$'\t'}"
             SHORT=$(git rev-parse --short "$SHA")
             LINE="- \`$SHORT\` $SUBJECT"
-            if [[ "$SUBJECT" =~ $BREAKING_RE ]] || echo "$BODY" | grep -qE '^BREAKING CHANGE:'; then
+            if [[ "$SUBJECT" =~ $BREAKING_RE ]] \
+               || printf '%s\n' "$BODY" | grep -qE '^BREAKING CHANGE:'; then
               echo "$LINE" >> /tmp/sync/breaking.txt
             elif [[ "$SUBJECT" =~ $FEAT_RE ]]; then
               echo "$LINE" >> /tmp/sync/feat.txt
@@ -111,16 +127,34 @@ jobs:
               echo "$LINE" >> /tmp/sync/other.txt
             fi
           done < <(git log "origin/main..${UPSTREAM_REMOTE}/main" \
-                     --format='%H%x09%s%x09%b' -z \
-                     | tr '\0' '\n')
+                     --format='%H%x09%s%x09%b' -z)
 
           # Extract referenced issues / PRs. Capture both bare `#NNN`
           # (resolved against UPSTREAM_REPO) and qualified `owner/repo#NNN`
           # (rendered as plain links, not silently rewritten).
+          #
+          # Strategy: tokenise the commit text into one candidate per line by
+          # treating whitespace, parens, brackets, commas, semicolons, and
+          # angle brackets as separators, then exact-match each token against
+          # the ref grammar. This prevents file-path citations like
+          # `path/to/file#42` from being misread as `to/file#42` qualified
+          # refs (the inline `grep -oE` form was greedy and matched the
+          # longest substring rather than complete tokens).
+          #
+          # `owner` grammar follows GitHub's rules: letters/digits/`-`, no
+          # leading `-`, no `.` or `_` (which `path` segments freely use).
+          # `repo` is more permissive: letters/digits + `.` `_` `-`.
           : > /tmp/sync/refs_bare.txt
           : > /tmp/sync/refs_qualified.txt
+          # Token separators include sentence punctuation so refs at the end
+          # of a sentence (`Closes fjall-rs/lsm-tree#456.`) get split off
+          # cleanly. The post-tokenise regex then exact-matches the ref
+          # grammar, dropping accidental candidates like file-path
+          # citations (`path/to/file#42`) which have multiple slashes.
           git log "origin/main..${UPSTREAM_REMOTE}/main" --format='%s%n%b' \
-            | grep -oE '([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)?#[0-9]+' \
+            | tr -s '[:space:](){}[],;<>!?"'"'" '\n' \
+            | sed 's/\.$//' \
+            | grep -E '^([A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9._-]+)?#[0-9]+$' \
             | sort -u \
             | while read -r REF; do
                 if [[ "$REF" == *"/"* ]]; then
@@ -128,7 +162,23 @@ jobs:
                 else
                   echo "$REF" >> /tmp/sync/refs_bare.txt
                 fi
-              done
+              done || true
+
+          # Markdown-escape a title so backticks / pipes / brackets in
+          # upstream issue titles don't break the surrounding list-item
+          # rendering or link syntax. Single-quoted sed expressions are
+          # intentional — the backticks are literal characters to match,
+          # not command substitutions (shellcheck SC2016 is a false positive
+          # for sed scripts).
+          # shellcheck disable=SC2016
+          md_escape() {
+            printf '%s' "$1" \
+              | sed -e 's/\\/\\\\/g' \
+                    -e 's/`/\\`/g' \
+                    -e 's/|/\\|/g' \
+                    -e 's/\[/\\[/g' \
+                    -e 's/\]/\\]/g'
+          }
 
           : > /tmp/sync/refs.md
           # Resolve bare refs against UPSTREAM_REPO via a single Issues API call
@@ -138,7 +188,8 @@ jobs:
               NUM="${REF#\#}"
               TITLE=$(gh api "repos/${UPSTREAM_REPO}/issues/${NUM}" --jq '.title' 2>/dev/null || true)
               if [ -n "$TITLE" ]; then
-                echo "- [${UPSTREAM_REPO}${REF}](https://github.com/${UPSTREAM_REPO}/issues/${NUM}) — ${TITLE}" \
+                TITLE_SAFE=$(md_escape "$TITLE")
+                echo "- [${UPSTREAM_REPO}${REF}](https://github.com/${UPSTREAM_REPO}/issues/${NUM}) — ${TITLE_SAFE}" \
                   >> /tmp/sync/refs.md
               fi
             done
@@ -193,7 +244,7 @@ jobs:
 
           if [ "$NEW_RELEASE" = "true" ]; then
             {
-              echo "## Upstream Sync: ${UPSTREAM_PREV_TAG:-<none>} → ${UPSTREAM_LATEST_TAG}"
+              echo "## Upstream Sync: ${UPSTREAM_PREV_TAG:-(none)} → ${UPSTREAM_LATEST_TAG}"
               echo
               echo "**Release:** [${UPSTREAM_LATEST_TAG}](https://github.com/${UPSTREAM_REPO}/releases/tag/${UPSTREAM_LATEST_TAG})"
             } >> "$BODY"
@@ -283,8 +334,13 @@ jobs:
           }
 
           if git merge --no-commit --no-ff "${UPSTREAM_REMOTE}/main" 2>&1; then
-            # Advance the persisted last-synced tag so future runs read it
-            # directly (no inference from `--merged` git history shape).
+            # Advance the persisted last-synced tag on every successful merge,
+            # regardless of whether this run detected a release boundary. The
+            # state file is lazily bootstrapped — the first sync run with
+            # behind > 0 writes it; until then, the `git tag --merged
+            # origin/main` inference in the detect step covers the gap.
+            # Runs with behind == 0 don't reach this step and don't need to
+            # write the file (state is unchanged).
             if [ -n "${UPSTREAM_LATEST_TAG}" ]; then
               mkdir -p "$(dirname "$STATE_FILE")"
               echo "$UPSTREAM_LATEST_TAG" > "$STATE_FILE"
@@ -329,7 +385,7 @@ jobs:
             gh issue create \
               --title "Upstream sync conflict (${BEHIND} new commits)" \
               --body-file "$BODY_PATH" \
-              --label "ci"
+              --label "upstream-sync"
           fi
 
       - name: Check for merged feature branches
@@ -338,6 +394,11 @@ jobs:
         run: |
           set -euo pipefail
 
+          # Our branch convention (per CLAUDE.md) is `<type>/#<issue_id>[-slug]`,
+          # so the literal `#` is part of every feature/fix branch name. Branches
+          # without the leading `#` (e.g., `feat/foo` or `feat/123-foo`) are not
+          # produced by our workflow and are intentionally skipped. If the
+          # convention changes, broaden these patterns.
           for ref in $(git for-each-ref --format='%(refname:short)' \
                          'refs/remotes/origin/feat/#*' \
                          'refs/remotes/origin/fix/#*'); do
@@ -362,7 +423,7 @@ jobs:
                 gh issue create \
                   --title "Upstream merged: $BRANCH" \
                   --body-file "$BODY_FILE" \
-                  --label "ci"
+                  --label "upstream-sync"
                 rm -f "$BODY_FILE"
               fi
             fi
