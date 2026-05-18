@@ -215,6 +215,11 @@ pub(crate) fn lsp_scalar(s1: &[u8], s2: &[u8]) -> usize {
 
     while i + 8 <= min_len {
         // SAFETY: i + 8 <= min_len <= s{1,2}.len() — both 8-byte reads are in-bounds.
+        // `read_unaligned` documents that the pointer needs no alignment, so the
+        // `*const u8 -> *const u64` cast is sound. Clippy's `cast_ptr_alignment`
+        // does NOT fire here (verified across all CI targets including BE powerpc64)
+        // because the cast feeds directly into `read_unaligned`, which clippy
+        // recognises as an unaligned-load idiom.
         #[expect(unsafe_code, reason = "bounds checked by loop guard above")]
         let (a, b) = unsafe {
             (
