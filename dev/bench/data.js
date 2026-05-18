@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779064860708,
+  "lastUpdate": 1779067959877,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -5928,6 +5928,84 @@ window.BENCHMARK_DATA = {
             "value": 254393.7815790257,
             "unit": "ops/sec (normalized)",
             "extra": "raw: 456454 ops/sec | factor: 0.557 | P50: 1.9us | P99: 7.5us | P99.9: 15.6us\nthreads: 1 | elapsed: 0.44s | num: 200000 | iterations: 3 | runner: seq_wr=225163 rand_rd=908770 cpu=123 composite=41268.4"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "49699333+dependabot[bot]@users.noreply.github.com",
+            "name": "dependabot[bot]",
+            "username": "dependabot[bot]"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "d8cb62fb7c38fb8ab42ff64884fabc58e4ecbec3",
+          "message": "ci(deps): bump actions/github-script from 7 to 9 (#237)\n\nBumps [actions/github-script](https://github.com/actions/github-script)\nfrom 7 to 9.\n<details>\n<summary>Release notes</summary>\n<p><em>Sourced from <a\nhref=\"https://github.com/actions/github-script/releases\">actions/github-script's\nreleases</a>.</em></p>\n<blockquote>\n<h2>v9.0.0</h2>\n<p><strong>New features:</strong></p>\n<ul>\n<li><strong><code>getOctokit</code> factory function</strong> —\nAvailable directly in the script context. Create additional\nauthenticated Octokit clients with different tokens for multi-token\nworkflows, GitHub App tokens, and cross-org access. See <a\nhref=\"https://github.com/actions/github-script#creating-additional-clients-with-getoctokit\">Creating\nadditional clients with <code>getOctokit</code></a> for details and\nexamples.</li>\n<li><strong>Orchestration ID in user-agent</strong> — The\n<code>ACTIONS_ORCHESTRATION_ID</code> environment variable is\nautomatically appended to the user-agent string for request\ntracing.</li>\n</ul>\n<p><strong>Breaking changes:</strong></p>\n<ul>\n<li><strong><code>require('@actions/github')</code> no longer works in\nscripts.</strong> The upgrade to <code>@actions/github</code> v9\n(ESM-only) means <code>require('@actions/github')</code> will fail at\nruntime. If you previously used patterns like <code>const { getOctokit }\n= require('@actions/github')</code> to create secondary clients, use the\nnew injected <code>getOctokit</code> function instead — it's available\ndirectly in the script context with no imports needed.</li>\n<li><code>getOctokit</code> is now an injected function parameter.\nScripts that declare <code>const getOctokit = ...</code> or <code>let\ngetOctokit = ...</code> will get a <code>SyntaxError</code> because\nJavaScript does not allow <code>const</code>/<code>let</code>\nredeclaration of function parameters. Use the injected\n<code>getOctokit</code> directly, or use <code>var getOctokit =\n...</code> if you need to redeclare it.</li>\n<li>If your script accesses other <code>@actions/github</code> internals\nbeyond the standard <code>github</code>/<code>octokit</code> client, you\nmay need to update those references for v9 compatibility.</li>\n</ul>\n<h2>What's Changed</h2>\n<ul>\n<li>Add ACTIONS_ORCHESTRATION_ID to user-agent string by <a\nhref=\"https://github.com/Copilot\"><code>@​Copilot</code></a> in <a\nhref=\"https://redirect.github.com/actions/github-script/pull/695\">actions/github-script#695</a></li>\n<li>ci: use deployment: false for integration test environments by <a\nhref=\"https://github.com/salmanmkc\"><code>@​salmanmkc</code></a> in <a\nhref=\"https://redirect.github.com/actions/github-script/pull/712\">actions/github-script#712</a></li>\n<li>feat!: add getOctokit to script context, upgrade\n<code>@​actions/github</code> v9, <code>@​octokit/core</code> v7, and\nrelated packages by <a\nhref=\"https://github.com/salmanmkc\"><code>@​salmanmkc</code></a> in <a\nhref=\"https://redirect.github.com/actions/github-script/pull/700\">actions/github-script#700</a></li>\n</ul>\n<h2>New Contributors</h2>\n<ul>\n<li><a href=\"https://github.com/Copilot\"><code>@​Copilot</code></a> made\ntheir first contribution in <a\nhref=\"https://redirect.github.com/actions/github-script/pull/695\">actions/github-script#695</a></li>\n</ul>\n<p><strong>Full Changelog</strong>: <a\nhref=\"https://github.com/actions/github-script/compare/v8.0.0...v9.0.0\">https://github.com/actions/github-script/compare/v8.0.0...v9.0.0</a></p>\n<h2>v8.0.0</h2>\n<h2>What's Changed</h2>\n<ul>\n<li>Update Node.js version support to 24.x by <a\nhref=\"https://github.com/salmanmkc\"><code>@​salmanmkc</code></a> in <a\nhref=\"https://redirect.github.com/actions/github-script/pull/637\">actions/github-script#637</a></li>\n<li>README for updating actions/github-script from v7 to v8 by <a\nhref=\"https://github.com/sneha-krip\"><code>@​sneha-krip</code></a> in <a\nhref=\"https://redirect.github.com/actions/github-script/pull/653\">actions/github-script#653</a></li>\n</ul>\n<h2>⚠️ Minimum Compatible Runner Version</h2>\n<p><strong>v2.327.1</strong><br />\n<a\nhref=\"https://github.com/actions/runner/releases/tag/v2.327.1\">Release\nNotes</a></p>\n<p>Make sure your runner is updated to this version or newer to use this\nrelease.</p>\n<h2>New Contributors</h2>\n<ul>\n<li><a href=\"https://github.com/salmanmkc\"><code>@​salmanmkc</code></a>\nmade their first contribution in <a\nhref=\"https://redirect.github.com/actions/github-script/pull/637\">actions/github-script#637</a></li>\n<li><a\nhref=\"https://github.com/sneha-krip\"><code>@​sneha-krip</code></a> made\ntheir first contribution in <a\nhref=\"https://redirect.github.com/actions/github-script/pull/653\">actions/github-script#653</a></li>\n</ul>\n<p><strong>Full Changelog</strong>: <a\nhref=\"https://github.com/actions/github-script/compare/v7.1.0...v8.0.0\">https://github.com/actions/github-script/compare/v7.1.0...v8.0.0</a></p>\n<h2>v7.1.0</h2>\n<h2>What's Changed</h2>\n<ul>\n<li>Upgrade husky to v9 by <a\nhref=\"https://github.com/benelan\"><code>@​benelan</code></a> in <a\nhref=\"https://redirect.github.com/actions/github-script/pull/482\">actions/github-script#482</a></li>\n<li>Add workflow file for publishing releases to immutable action\npackage by <a\nhref=\"https://github.com/Jcambass\"><code>@​Jcambass</code></a> in <a\nhref=\"https://redirect.github.com/actions/github-script/pull/485\">actions/github-script#485</a></li>\n<li>Upgrade IA Publish by <a\nhref=\"https://github.com/Jcambass\"><code>@​Jcambass</code></a> in <a\nhref=\"https://redirect.github.com/actions/github-script/pull/486\">actions/github-script#486</a></li>\n<li>Fix workflow status badges by <a\nhref=\"https://github.com/joshmgross\"><code>@​joshmgross</code></a> in <a\nhref=\"https://redirect.github.com/actions/github-script/pull/497\">actions/github-script#497</a></li>\n<li>Update usage of <code>actions/upload-artifact</code> by <a\nhref=\"https://github.com/joshmgross\"><code>@​joshmgross</code></a> in <a\nhref=\"https://redirect.github.com/actions/github-script/pull/512\">actions/github-script#512</a></li>\n<li>Clear up package name confusion by <a\nhref=\"https://github.com/joshmgross\"><code>@​joshmgross</code></a> in <a\nhref=\"https://redirect.github.com/actions/github-script/pull/514\">actions/github-script#514</a></li>\n<li>Update dependencies with <code>npm audit fix</code> by <a\nhref=\"https://github.com/joshmgross\"><code>@​joshmgross</code></a> in <a\nhref=\"https://redirect.github.com/actions/github-script/pull/515\">actions/github-script#515</a></li>\n<li>Specify that the used script is JavaScript by <a\nhref=\"https://github.com/timotk\"><code>@​timotk</code></a> in <a\nhref=\"https://redirect.github.com/actions/github-script/pull/478\">actions/github-script#478</a></li>\n<li>chore: Add Dependabot for NPM and Actions by <a\nhref=\"https://github.com/nschonni\"><code>@​nschonni</code></a> in <a\nhref=\"https://redirect.github.com/actions/github-script/pull/472\">actions/github-script#472</a></li>\n</ul>\n<!-- raw HTML omitted -->\n</blockquote>\n<p>... (truncated)</p>\n</details>\n<details>\n<summary>Commits</summary>\n<ul>\n<li><a\nhref=\"https://github.com/actions/github-script/commit/3a2844b7e9c422d3c10d287c895573f7108da1b3\"><code>3a2844b</code></a>\nMerge pull request <a\nhref=\"https://redirect.github.com/actions/github-script/issues/700\">#700</a>\nfrom actions/salmanmkc/expose-getoctokit + prepare re...</li>\n<li><a\nhref=\"https://github.com/actions/github-script/commit/ca10bbdd1a7739de09e99a200c7a59f5d73a4079\"><code>ca10bbd</code></a>\nfix: use <code>@​octokit/core/</code>types import for v7\ncompatibility</li>\n<li><a\nhref=\"https://github.com/actions/github-script/commit/86e48e20ac85c970ed1f96e718fd068173948b7b\"><code>86e48e2</code></a>\nmerge: incorporate main branch changes</li>\n<li><a\nhref=\"https://github.com/actions/github-script/commit/c1084728b5b935ec4ddc1e4cee877b01797b3ff9\"><code>c108472</code></a>\nchore: rebuild dist for v9 upgrade and getOctokit factory</li>\n<li><a\nhref=\"https://github.com/actions/github-script/commit/afff112e4f8b57c718168af75b89ce00bc8d091d\"><code>afff112</code></a>\nMerge pull request <a\nhref=\"https://redirect.github.com/actions/github-script/issues/712\">#712</a>\nfrom actions/salmanmkc/deployment-false + fix user-ag...</li>\n<li><a\nhref=\"https://github.com/actions/github-script/commit/ff8117e5b78c415f814f39ad6998f424fee7b817\"><code>ff8117e</code></a>\nci: fix user-agent test to handle orchestration ID</li>\n<li><a\nhref=\"https://github.com/actions/github-script/commit/81c6b7876079abe10ff715951c9fc7b3e1ab389d\"><code>81c6b78</code></a>\nci: use deployment: false to suppress deployment noise from integration\ntests</li>\n<li><a\nhref=\"https://github.com/actions/github-script/commit/3953caf8858d318f37b6cc53a9f5708859b5a7b7\"><code>3953caf</code></a>\ndocs: update README examples from <a\nhref=\"https://github.com/v8\"><code>@​v8</code></a> to <a\nhref=\"https://github.com/v9\"><code>@​v9</code></a>, add getOctokit docs\nand v9 brea...</li>\n<li><a\nhref=\"https://github.com/actions/github-script/commit/c17d55b90dcdb3d554d0027a6c180a7adc2daf78\"><code>c17d55b</code></a>\nci: add getOctokit integration test job</li>\n<li><a\nhref=\"https://github.com/actions/github-script/commit/a047196d9a02fe92098771cafbb98c2f1814e408\"><code>a047196</code></a>\ntest: add getOctokit integration tests via callAsyncFunction</li>\n<li>Additional commits viewable in <a\nhref=\"https://github.com/actions/github-script/compare/v7...v9\">compare\nview</a></li>\n</ul>\n</details>\n<br />\n\n\n[![Dependabot compatibility\nscore](https://dependabot-badges.githubapp.com/badges/compatibility_score?dependency-name=actions/github-script&package-manager=github_actions&previous-version=7&new-version=9)](https://docs.github.com/en/github/managing-security-vulnerabilities/about-dependabot-security-updates#about-compatibility-scores)\n\nDependabot will resolve any conflicts with this PR as long as you don't\nalter it yourself. You can also trigger a rebase manually by commenting\n`@dependabot rebase`.\n\n[//]: # (dependabot-automerge-start)\n[//]: # (dependabot-automerge-end)\n\n---\n\n<details>\n<summary>Dependabot commands and options</summary>\n<br />\n\nYou can trigger Dependabot actions by commenting on this PR:\n- `@dependabot rebase` will rebase this PR\n- `@dependabot recreate` will recreate this PR, overwriting any edits\nthat have been made to it\n- `@dependabot show <dependency name> ignore conditions` will show all\nof the ignore conditions of the specified dependency\n- `@dependabot ignore this major version` will close this PR and stop\nDependabot creating any more for this major version (unless you reopen\nthe PR or upgrade to it yourself)\n- `@dependabot ignore this minor version` will close this PR and stop\nDependabot creating any more for this minor version (unless you reopen\nthe PR or upgrade to it yourself)\n- `@dependabot ignore this dependency` will close this PR and stop\nDependabot creating any more for this dependency (unless you reopen the\nPR or upgrade to it yourself)\n\n\n</details>\n\nSigned-off-by: dependabot[bot] <support@github.com>\nCo-authored-by: dependabot[bot] <49699333+dependabot[bot]@users.noreply.github.com>",
+          "timestamp": "2026-05-18T04:27:57+03:00",
+          "tree_id": "9045ad652878b7b8dc1c761f98444594be003709",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/d8cb62fb7c38fb8ab42ff64884fabc58e4ecbec3"
+        },
+        "date": 1779067958884,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 1199109.5017969378,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 1909738 ops/sec | factor: 0.628 | P50: 0.4us | P99: 2.5us | P99.9: 5.8us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3 | runner: seq_wr=220965 rand_rd=751625 cpu=108 composite=36630.5"
+          },
+          {
+            "name": "fillrandom",
+            "value": 695323.284802194,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 1107393 ops/sec | factor: 0.628 | P50: 0.7us | P99: 3.1us | P99.9: 7.6us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3 | runner: seq_wr=220965 rand_rd=751625 cpu=108 composite=36630.5"
+          },
+          {
+            "name": "readrandom",
+            "value": 298294.0492268953,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 475072 ops/sec | factor: 0.628 | P50: 1.9us | P99: 6.5us | P99.9: 13.4us\nthreads: 1 | elapsed: 0.42s | num: 200000 | iterations: 3 | runner: seq_wr=220965 rand_rd=751625 cpu=108 composite=36630.5"
+          },
+          {
+            "name": "readseq",
+            "value": 1359743.6777350865,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 2165569 ops/sec | factor: 0.628 | P50: 0.3us | P99: 4.4us | P99.9: 9.3us\nthreads: 1 | elapsed: 0.09s | num: 200000 | iterations: 3 | runner: seq_wr=220965 rand_rd=751625 cpu=108 composite=36630.5"
+          },
+          {
+            "name": "seekrandom",
+            "value": 217271.61782972762,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 346033 ops/sec | factor: 0.628 | P50: 2.5us | P99: 7.0us | P99.9: 14.4us\nthreads: 1 | elapsed: 0.58s | num: 200000 | iterations: 3 | runner: seq_wr=220965 rand_rd=751625 cpu=108 composite=36630.5"
+          },
+          {
+            "name": "prefixscan",
+            "value": 105786.36231661707,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 168479 ops/sec | factor: 0.628 | P50: 5.6us | P99: 7.3us | P99.9: 17.3us\nthreads: 1 | elapsed: 1.19s | num: 200000 | iterations: 3 | runner: seq_wr=220965 rand_rd=751625 cpu=108 composite=36630.5"
+          },
+          {
+            "name": "overwrite",
+            "value": 712313.6613421607,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 1134452 ops/sec | factor: 0.628 | P50: 0.7us | P99: 2.9us | P99.9: 6.7us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3 | runner: seq_wr=220965 rand_rd=751625 cpu=108 composite=36630.5"
+          },
+          {
+            "name": "mergerandom",
+            "value": 484572.8773203379,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 771745 ops/sec | factor: 0.628 | P50: 0.4us | P99: 2.1us | P99.9: 3.2us\nthreads: 1 | elapsed: 0.26s | num: 200000 | iterations: 3 | runner: seq_wr=220965 rand_rd=751625 cpu=108 composite=36630.5"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 284647.4135803387,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 453338 ops/sec | factor: 0.628 | P50: 2.0us | P99: 4.9us | P99.9: 13.2us\nthreads: 1 | elapsed: 0.44s | num: 200000 | iterations: 3 | runner: seq_wr=220965 rand_rd=751625 cpu=108 composite=36630.5"
           }
         ]
       }
