@@ -32,11 +32,12 @@ jobs:
       github.event.workflow_run.pull_requests[0] != null
 
     steps:
-      - name: Checkout PR head
-        uses: actions/checkout@v6
-        with:
-          ref: ${{ github.event.workflow_run.head_sha }}
-
+      # Intentionally NO `actions/checkout` here. `workflow_run` workflows run
+      # in the BASE-repo context with write tokens; checking out the PR head
+      # SHA would expose us to execution of PR-author-controlled code in a
+      # privileged context (CodeQL `actions/untrusted-checkout/high`). We only
+      # need API/CLI surface — every step below operates on the GitHub API
+      # against the head SHA without ever materialising PR content on disk.
       - name: Dependabot metadata
         id: metadata
         uses: dependabot/fetch-metadata@v3
