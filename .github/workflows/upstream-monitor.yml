@@ -51,9 +51,16 @@ jobs:
           UPSTREAM_LATEST_TAG=$(git tag -l --sort=-v:refname --merged "${UPSTREAM_REMOTE}/main" \
             | grep -E "$SEMVER_RE" | head -1 || true)
 
-          # Prefer the explicit state file; fall back to inference from
-          # `--merged origin/main` if the file is missing (first run) or
-          # if a non-merge sync strategy ever desyncs the inference.
+          # Prefer the explicit state file. Fall back to inference from
+          # `--merged origin/main` only as a BOOTSTRAP for the first sync
+          # — once the file is written by the merge step, future runs read
+          # it directly. The inference is best-effort: `--merged` lists
+          # tags reachable from `origin/main`, which can return an older
+          # tag than what was actually synced last (e.g., if our main
+          # hasn't merged the upstream commit the latest stable tag points
+          # at) or an empty string for a freshly forked branch with no
+          # tags merged yet. That mismatch only matters until the first
+          # successful sync writes the state file.
           if [ -f "$STATE_FILE" ]; then
             UPSTREAM_PREV_TAG=$(tr -d '[:space:]' < "$STATE_FILE")
           else
@@ -166,10 +173,16 @@ jobs:
               done || true
 
           # Markdown-escape a title so backticks / pipes / brackets / angle
-          # brackets in upstream issue titles don't break the surrounding
-          # list-item rendering, link syntax, or trigger Markdown's raw-HTML
-          # pass (a title like `Use <T> as bound` would otherwise have
-          # `<T>` interpreted as an unknown HTML tag and stripped).
+          # brackets / emphasis markers in upstream issue titles don't
+          # break the surrounding list-item rendering, link syntax, or
+          # heading parse:
+          #   - `<` / `>` → `&lt;` / `&gt;`  (raw-HTML pass would eat
+          #     `Use <T> as bound`)
+          #   - `*` / `_` → escaped (`fix *foo* path` would render in
+          #     italics; `__bar__` would render in bold)
+          #   - `#` → escaped (titles like `#42 regression` at the start
+          #     of a line in a list item could otherwise be parsed as a
+          #     heading)
           # Single-quoted sed expressions are intentional — backticks are
           # literal characters to match, not command substitutions
           # (shellcheck SC2016 is a false positive for sed scripts).
@@ -182,7 +195,10 @@ jobs:
                     -e 's/\[/\\[/g' \
                     -e 's/\]/\\]/g' \
                     -e 's/</\&lt;/g' \
-                    -e 's/>/\&gt;/g'
+                    -e 's/>/\&gt;/g' \
+                    -e 's/\*/\\*/g' \
+                    -e 's/_/\\_/g' \
+                    -e 's/#/\\#/g'
           }
 
           : > /tmp/sync/refs.md
@@ -202,9 +218,15 @@ jobs:
                 echo "- [${UPSTREAM_REPO}${REF}](https://github.com/${UPSTREAM_REPO}/issues/${NUM}) — ${TITLE_SAFE}" \
                   >> /tmp/sync/refs.md
               else
-                # Log to stderr so partial reference output is debuggable
-                # (transient API failures, rate limits, missing issues, etc.).
-                echo "warn: failed to resolve title for ${UPSTREAM_REPO}${REF}" >&2
+                # API lookup failed (404, transient error, private/withheld
+                # issue, rate limit, etc.). Render the ref as a plain link
+                # without a title rather than dropping it — the reader still
+                # sees the upstream commit referenced something, and the
+                # link will resolve if/when access is granted. Log to stderr
+                # so the failed lookups are debuggable from workflow logs.
+                echo "warn: failed to resolve title for ${UPSTREAM_REPO}${REF} (rendering without title)" >&2
+                echo "- [${UPSTREAM_REPO}${REF}](https://github.com/${UPSTREAM_REPO}/issues/${NUM}) — _title unavailable_" \
+                  >> /tmp/sync/refs.md
               fi
             done
             BARE_TOTAL=$(wc -l < /tmp/sync/refs_bare.txt | tr -d ' ')
@@ -230,9 +252,16 @@ jobs:
           fi
 
           # Fork overlap: files touched by upstream (since the last shared
-          # commit) AND by fork-specific commits (commits on origin/main that
-          # are NOT in upstream/main — excludes upstream commits we already
-          # merged in, which would otherwise drown out the signal).
+          # commit) AND by fork-specific commits (commits on origin/main
+          # since MERGE_BASE that are NOT in upstream/main).
+          #
+          # `--name-only --format=` emits one path per file per commit, so
+          # the fork-side set includes any file touched by ANY fork-only
+          # commit in the window — even if a later fork commit reverted
+          # the change. This produces a deliberately broad signal: the
+          # overlap list is a "look here for possible semantic conflicts"
+          # hint for the reviewer, not a precise change-summary. Use the
+          # PR diff for authoritative final state.
           MERGE_BASE=$(git merge-base origin/main "${UPSTREAM_REMOTE}/main")
           git diff --name-only "$MERGE_BASE..${UPSTREAM_REMOTE}/main" \
             | sort -u > /tmp/sync/upstream_files.txt
@@ -329,7 +358,10 @@ jobs:
           echo "body_path=$BODY" >> "$GITHUB_OUTPUT"
 
       - name: Try merge and create PR or conflict issue
-        if: steps.detect.outputs.behind != '0'
+        # Gated on the body step succeeding so a body-composition failure
+        # doesn't cascade into a confusing "ambiguous redirect" when this
+        # step tries to append to an empty BODY_PATH.
+        if: steps.detect.outputs.behind != '0' && steps.body.outcome == 'success'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           BEHIND: ${{ steps.detect.outputs.behind }}
@@ -340,6 +372,15 @@ jobs:
 
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Ensure the `upstream-sync` label exists in the repo.
+          # `gh pr create --label` / `gh issue create --label` exit non-zero
+          # for unknown labels, which would abort this step before any
+          # artifact is produced. `--force` makes the call idempotent.
+          gh label create "upstream-sync" \
+            --color "fbca04" \
+            --description "Automated upstream synchronization — merge conflicts, release tracking" \
+            --force >/dev/null
 
           # Skip if a previous sync PR is still open (review in progress).
           # Otherwise every cron run (Mon/Thu) + every workflow_dispatch
@@ -469,11 +510,23 @@ jobs:
         run: |
           set -euo pipefail
 
+          # Ensure the `upstream-sync` label exists (same idempotent call
+          # as the merge step). Required because `gh issue create --label`
+          # exits non-zero for unknown labels and would abort the step.
+          gh label create "upstream-sync" \
+            --color "fbca04" \
+            --description "Automated upstream synchronization — merge conflicts, release tracking" \
+            --force >/dev/null
+
           # Our branch convention (per CLAUDE.md) is `<type>/#<issue_id>[-slug]`,
           # so the literal `#` is part of every feature/fix branch name. Branches
           # without the leading `#` (e.g., `feat/foo` or `feat/123-foo`) are not
           # produced by our workflow and are intentionally skipped. If the
           # convention changes, broaden these patterns.
+          #
+          # Patterns are single-quoted so the shell doesn't expand the `*`
+          # (a `nullglob`-enabled shell would otherwise risk silent
+          # expansion before `git for-each-ref` ever sees the glob).
           for ref in $(git for-each-ref --format='%(refname:short)' \
                          'refs/remotes/origin/feat/#*' \
                          'refs/remotes/origin/fix/#*'); do
