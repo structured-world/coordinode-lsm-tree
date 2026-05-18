@@ -332,10 +332,11 @@ impl AbstractTree for Tree {
     }
 
     fn clear(&self) -> crate::Result<()> {
+        let config = self.tree_config();
         let mut versions = self.get_version_history_lock();
 
         versions.upgrade_version(
-            &self.config.path,
+            &config.path,
             |v| {
                 let mut copy = v.clone();
                 copy.active_memtable = Arc::new(Memtable::new(
@@ -346,9 +347,9 @@ impl AbstractTree for Tree {
                 copy.version = Version::new(v.version.id() + 1, self.tree_type());
                 Ok(copy)
             },
-            &self.config.seqno,
-            &self.config.visible_seqno,
-            &*self.config.fs,
+            &config.seqno,
+            &config.visible_seqno,
+            &*config.fs,
         )
     }
 
@@ -643,10 +644,6 @@ impl AbstractTree for Tree {
             .expect("lock is poisoned")
             .latest_version()
             .active_memtable
-    }
-
-    fn tree_type(&self) -> crate::TreeType {
-        crate::TreeType::Standard
     }
 
     #[expect(clippy::significant_drop_tightening)]

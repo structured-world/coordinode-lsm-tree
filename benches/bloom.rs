@@ -1,5 +1,5 @@
 use criterion::{Criterion, criterion_group, criterion_main};
-use rand::{Rng, RngCore};
+use rand::RngExt;
 
 // Not really worth it anymore on new CPUs...?
 fn fast_block_index(c: &mut Criterion) {
@@ -36,7 +36,7 @@ fn standard_filter_construction(c: &mut Criterion) {
 
         b.iter(|| {
             let mut key = [0; 16];
-            rng.fill_bytes(&mut key);
+            rng.fill(&mut key[..]);
 
             filter.set_with_hash(Builder::get_hash(&key));
         });
@@ -47,7 +47,7 @@ fn standard_filter_construction(c: &mut Criterion) {
 
         b.iter(|| {
             let mut key = [0; 16];
-            rng.fill_bytes(&mut key);
+            rng.fill(&mut key[..]);
 
             filter.set_with_hash(Builder::get_hash(&key));
         });
