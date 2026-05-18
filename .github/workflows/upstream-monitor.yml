@@ -137,8 +137,9 @@ jobs:
         #
         # Single rule: if a sync artifact (PR or issue) already exists
         # for THIS upstream HEAD — in any state (open, closed, merged)
-        # — skip. Each sync PR/issue title carries `(upstream@<short>)`
-        # for searchability.
+        # — skip. Each sync PR/issue title carries `upstream-<short>`
+        # for searchability (dash, not `@`, so GitHub's search-text
+        # normaliser doesn't strip it).
         #
         # The state semantics collapse cleanly:
         #   - open → review in progress, don't stack
@@ -255,6 +256,13 @@ jobs:
             fi
           done < <(git log "origin/main..${UPSTREAM_REMOTE}/main" \
                      --format='%H%x09%s%x09%b' -z)
+          # `%x09` (tab) field separator is safe for current parsing
+          # because we only inspect SUBJECT for prefix patterns and
+          # BODY for `^BREAKING[ -]CHANGE:` at line start — both
+          # tolerant of embedded tabs in BODY. If future parsing reads
+          # arbitrary BODY structure (e.g., counts characters or
+          # parses tables), switch to a multi-character sentinel like
+          # `%H%n--SEP--%n%s%n--SEP--%n%b` to avoid the brittleness.
 
           # Extract referenced issues / PRs. Capture both bare `#NNN`
           # (resolved against UPSTREAM_REPO) and qualified `owner/repo#NNN`
@@ -293,7 +301,7 @@ jobs:
             | sed 's/\.$//' \
             | grep -E '^([A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9._-]+)?#[0-9]+$' \
             | sort -u \
-            | head -"$REFS_CAP" \
+            | head -n "$REFS_CAP" \
             | while read -r REF; do
                 if [[ "$REF" == *"/"* ]]; then
                   echo "$REF" >> /tmp/sync/refs_qualified.txt
@@ -392,14 +400,24 @@ jobs:
           # without-`-M` form catches the overlap on `foo.rs`; with `-M`
           # the overlap would silently miss because git only emits
           # `bar.rs`. Coverage > precision for this hint.
-          MERGE_BASE=$(git merge-base origin/main "${UPSTREAM_REMOTE}/main")
-          git diff --name-only "$MERGE_BASE..${UPSTREAM_REMOTE}/main" \
-            | sort -u > /tmp/sync/upstream_files.txt
-          git log "${MERGE_BASE}..origin/main" --not "${UPSTREAM_REMOTE}/main" \
-            --name-only --format= \
-            | grep -v '^$' | sort -u > /tmp/sync/fork_files.txt || true
-          comm -12 /tmp/sync/upstream_files.txt /tmp/sync/fork_files.txt \
-            > /tmp/sync/overlap.txt || true
+          # `git merge-base` returns non-zero when histories are
+          # unrelated (extremely rare for a fork but possible after a
+          # force-push or upstream rewrite). Guard with `|| true` and
+          # skip overlap detection when MERGE_BASE is empty — the
+          # rest of the report still renders.
+          MERGE_BASE=$(git merge-base origin/main "${UPSTREAM_REMOTE}/main" || true)
+          : > /tmp/sync/overlap.txt
+          if [ -n "$MERGE_BASE" ]; then
+            git diff --name-only "$MERGE_BASE..${UPSTREAM_REMOTE}/main" \
+              | sort -u > /tmp/sync/upstream_files.txt
+            git log "${MERGE_BASE}..origin/main" --not "${UPSTREAM_REMOTE}/main" \
+              --name-only --format= \
+              | grep -v '^$' | sort -u > /tmp/sync/fork_files.txt || true
+            comm -12 /tmp/sync/upstream_files.txt /tmp/sync/fork_files.txt \
+              > /tmp/sync/overlap.txt || true
+          else
+            echo "warn: no merge-base between origin/main and ${UPSTREAM_REMOTE}/main — fork-overlap detection skipped" >&2
+          fi
 
           # Emit summary counts for use in subsequent steps.
           # Counts go directly into the rendered body in the next step; no
@@ -515,10 +533,12 @@ jobs:
           # uses a dash (not `@` or `#`) so GitHub's search-text
           # normaliser doesn't strip it.
 
-          # Branch name carries the date + run number so a second run on the
-          # same UTC day (manual `workflow_dispatch` after the cron run) gets
-          # a distinct name and doesn't collide with an existing remote branch.
-          SYNC_BRANCH="chore/upstream-sync-$(date +%Y%m%d)-${GITHUB_RUN_NUMBER}"
+          # Branch name carries date + run number + run attempt so:
+          #   - cron + workflow_dispatch on the same UTC day get distinct
+          #     branches (GITHUB_RUN_NUMBER differs between runs);
+          #   - re-running a failed workflow run gets a distinct branch
+          #     (GITHUB_RUN_ATTEMPT increments while RUN_NUMBER stays).
+          SYNC_BRANCH="chore/upstream-sync-$(date +%Y%m%d)-${GITHUB_RUN_NUMBER}-${GITHUB_RUN_ATTEMPT}"
           git checkout -b "$SYNC_BRANCH" origin/main
 
           # Helper: append the review checklist as the last section of the body.
@@ -676,12 +696,15 @@ jobs:
               # then post-filter to EXACT title equality on the client.
               # The expected title includes the literal `#` (it's part
               # of the branch convention and lives in the indexed title).
+              # Pass EXPECTED_TITLE to jq via `--arg` (not string
+              # interpolation) so any quote/backslash in BRANCH
+              # cannot break the jq filter syntax.
               EXPECTED_TITLE="Upstream merged: $BRANCH"
               SEARCH_BRANCH="${BRANCH//\#/}"
               EXISTING=$(gh issue list \
                 --search "Upstream merged: $SEARCH_BRANCH" \
                 --state open --json title \
-                --jq "[.[] | select(.title == \"$EXPECTED_TITLE\")] | length")
+                | jq --arg t "$EXPECTED_TITLE" '[.[] | select(.title == $t)] | length')
               if [ "$EXISTING" = "0" ]; then
                 BODY_FILE=$(mktemp)
                 {
