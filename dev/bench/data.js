@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1775745826913,
+  "lastUpdate": 1779064860708,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -5850,6 +5850,84 @@ window.BENCHMARK_DATA = {
             "value": 283929.1652989099,
             "unit": "ops/sec (normalized)",
             "extra": "raw: 457215 ops/sec | factor: 0.621 | P50: 2.0us | P99: 4.8us | P99.9: 13.5us\nthreads: 1 | elapsed: 0.44s | num: 200000 | iterations: 3 | runner: seq_wr=231775 rand_rd=743275 cpu=109 composite=37037.2"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "e8500f094d3705601efc718a32c37fc94773f80d",
+          "message": "build(deps): update all dependencies + adopt upstream blob-tree clear() fix (#236)\n\n## Summary\n\n- **Dependency refresh**: all crates in `Cargo.toml` / `Cargo.lock`\nbumped to latest, including major-version bumps that required code\nchanges.\n- **Adopted upstream bug fix** (fjall-rs/lsm-tree#286):\n`BlobTree::clear()` was corrupting the on-disk tree by skipping the\nversion-manifest update, causing recovery to fail on reopen with *\"Tried\nto open a BlobTree, but the existing tree is of type StandardTree\"*.\nCherry-picked upstream `db394880`, adapted to our diverged\n`Memtable::new(id, comparator)` signature and `&*config.fs` argument,\nplus rewrote the new default `tree_type()` impl in idiomatic `if/else`\nto satisfy our stricter `deny(clippy::all)` (`obfuscated_if_else`,\n`unnecessary_lazy_evaluations`).\n\n## Commits\n\n1. `build(deps)` — `cargo update` for ~30 semver-compatible bumps;\nmanifest bumps for `structured-zstd 0.0.12 → 0.0.21` (our maintained\nfork; each pre-1.0 bump is breaking) and `rand 0.9 → 0.10` (dev-dep\nmajor bump — adapted `benches/bloom.rs` to `RngExt::random()` and\n`Rng::fill()` after `RngCore` was removed from rand crate root).\n2. `test(blob_tree)` — regression test reproducing upstream #286: insert\ninto kv-separated tree → `clear()` → reopen fails. Written **before**\nthe fix per the test-first protocol; failed cleanly on stock code.\n3. `fix` — cherry-pick of upstream `db394880` adapted to our fork. After\nthe fix the regression test passes.\n\n## Upstream sync analysis\n\nPost-divergence commits in `fjall-rs/lsm-tree:main` evaluated for\nadoption:\n\n| Upstream | Adopted | Reason |\n|---|---|---|\n| `bad4fe0a` (seqno of point-read ingested items) | ❌ | Our refactor\nalready adjusts `global_seqno` at the `get` / `get_with_block` caller\nlevel, so the bug doesn't reproduce here. |\n| `db394880` + `557cd0db` (clear() blob tree corruption #286) | ✅ | Real\nbug, also present in our fork — adopted with regression test. |\n| `05c082ff` + `a8db0880` (`Slice::as_slice()` convenience) | ❌ | Pure\nAPI addition; `Slice` already implements `Deref<Target=[u8]>`. Can be\nadded separately if needed. |\n\nOpen upstream issues triaged: none are confirmed bugs (only #289 —\ningestion-pinning enhancement).\n\n## Test plan\n\n- [x] `cargo check --all-features --all-targets` clean\n- [x] `cargo clippy --all-features --all-targets -- -D warnings` clean\n- [x] `cargo nextest run --all-features` — 1271 passed, 6 skipped\n- [x] `cargo test --doc --all-features` — 41 passed, 2 ignored\n- [x] New regression test `blob_tree_clear_then_reopen_succeeds` fails\non stock fork, passes after the fix\n\nCloses #235\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n\n## Summary by CodeRabbit\n\n* **New Features**\n* AbstractTree trait now provides a default tree type selection based on\nconfiguration.\n\n* **Bug Fixes**\n* Fixed BlobTree clear operation to properly reset version history,\npreventing potential corruption when reopening the tree.\n\n* **Chores**\n  * Updated dependencies: structured-zstd and rand.\n\n* **Tests**\n  * Added regression test for blob tree clear and reopen operations.\n\n<!-- review_stack_entry_start -->\n\n[![Review Change\nStack](https://storage.googleapis.com/coderabbit_public_assets/review-stack-in-coderabbit-ui.svg)](https://app.coderabbit.ai/change-stack/structured-world/coordinode-lsm-tree/pull/236?utm_source=github_walkthrough&utm_medium=github&utm_campaign=change_stack)\n\n<!-- review_stack_entry_end -->\n\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->\n\n---------\n\nCo-authored-by: marvin-j97 <marvin.janke.97@gmail.com>",
+          "timestamp": "2026-05-18T03:39:47+03:00",
+          "tree_id": "8ddb290e2ecd78b55e98417a356951c4191743f7",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/e8500f094d3705601efc718a32c37fc94773f80d"
+        },
+        "date": 1779064859718,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 1176777.328682438,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 2111468 ops/sec | factor: 0.557 | P50: 0.3us | P99: 2.0us | P99.9: 5.0us\nthreads: 1 | elapsed: 0.09s | num: 200000 | iterations: 3 | runner: seq_wr=225163 rand_rd=908770 cpu=123 composite=41268.4"
+          },
+          {
+            "name": "fillrandom",
+            "value": 671642.2475625958,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 1205114 ops/sec | factor: 0.557 | P50: 0.7us | P99: 2.6us | P99.9: 6.1us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3 | runner: seq_wr=225163 rand_rd=908770 cpu=123 composite=41268.4"
+          },
+          {
+            "name": "readrandom",
+            "value": 293045.2809561007,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 525805 ops/sec | factor: 0.557 | P50: 1.7us | P99: 5.4us | P99.9: 13.1us\nthreads: 1 | elapsed: 0.38s | num: 200000 | iterations: 3 | runner: seq_wr=225163 rand_rd=908770 cpu=123 composite=41268.4"
+          },
+          {
+            "name": "readseq",
+            "value": 1388504.1520238821,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 2491366 ops/sec | factor: 0.557 | P50: 0.2us | P99: 3.8us | P99.9: 8.1us\nthreads: 1 | elapsed: 0.08s | num: 200000 | iterations: 3 | runner: seq_wr=225163 rand_rd=908770 cpu=123 composite=41268.4"
+          },
+          {
+            "name": "seekrandom",
+            "value": 202005.40131769123,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 362454 ops/sec | factor: 0.557 | P50: 2.4us | P99: 6.1us | P99.9: 14.2us\nthreads: 1 | elapsed: 0.55s | num: 200000 | iterations: 3 | runner: seq_wr=225163 rand_rd=908770 cpu=123 composite=41268.4"
+          },
+          {
+            "name": "prefixscan",
+            "value": 101526.96933354416,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 182168 ops/sec | factor: 0.557 | P50: 5.1us | P99: 7.6us | P99.9: 17.3us\nthreads: 1 | elapsed: 1.10s | num: 200000 | iterations: 3 | runner: seq_wr=225163 rand_rd=908770 cpu=123 composite=41268.4"
+          },
+          {
+            "name": "overwrite",
+            "value": 695252.640025987,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 1247478 ops/sec | factor: 0.557 | P50: 0.6us | P99: 2.5us | P99.9: 5.7us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3 | runner: seq_wr=225163 rand_rd=908770 cpu=123 composite=41268.4"
+          },
+          {
+            "name": "mergerandom",
+            "value": 411953.13543014193,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 739159 ops/sec | factor: 0.557 | P50: 0.3us | P99: 1.8us | P99.9: 3.2us\nthreads: 1 | elapsed: 0.27s | num: 200000 | iterations: 3 | runner: seq_wr=225163 rand_rd=908770 cpu=123 composite=41268.4"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 254393.7815790257,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 456454 ops/sec | factor: 0.557 | P50: 1.9us | P99: 7.5us | P99.9: 15.6us\nthreads: 1 | elapsed: 0.44s | num: 200000 | iterations: 3 | runner: seq_wr=225163 rand_rd=908770 cpu=123 composite=41268.4"
           }
         ]
       }
