@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779067959877,
+  "lastUpdate": 1779068139085,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -6006,6 +6006,84 @@ window.BENCHMARK_DATA = {
             "value": 284647.4135803387,
             "unit": "ops/sec (normalized)",
             "extra": "raw: 453338 ops/sec | factor: 0.628 | P50: 2.0us | P99: 4.9us | P99.9: 13.2us\nthreads: 1 | elapsed: 0.44s | num: 200000 | iterations: 3 | runner: seq_wr=220965 rand_rd=751625 cpu=108 composite=36630.5"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "49699333+dependabot[bot]@users.noreply.github.com",
+            "name": "dependabot[bot]",
+            "username": "dependabot[bot]"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "851e583e3892f91b3a72ea1065bf7080d44c9dea",
+          "message": "ci(deps): bump actions/create-github-app-token from 1 to 3 (#238)\n\nBumps\n[actions/create-github-app-token](https://github.com/actions/create-github-app-token)\nfrom 1 to 3.\n<details>\n<summary>Release notes</summary>\n<p><em>Sourced from <a\nhref=\"https://github.com/actions/create-github-app-token/releases\">actions/create-github-app-token's\nreleases</a>.</em></p>\n<blockquote>\n<h2>v3.0.0</h2>\n<h1><a\nhref=\"https://github.com/actions/create-github-app-token/compare/v2.2.2...v3.0.0\">3.0.0</a>\n(2026-03-14)</h1>\n<ul>\n<li>feat!: node 24 support (<a\nhref=\"https://redirect.github.com/actions/create-github-app-token/issues/275\">#275</a>)\n(<a\nhref=\"https://github.com/actions/create-github-app-token/commit/2e564a0bb8e7cc2b907b2401a2afe177882d4325\">2e564a0</a>)</li>\n<li>fix!: require <code>NODE_USE_ENV_PROXY</code> for proxy support (<a\nhref=\"https://redirect.github.com/actions/create-github-app-token/issues/342\">#342</a>)\n(<a\nhref=\"https://github.com/actions/create-github-app-token/commit/4451bcbc139f8124b0bf04f968ea2586b17df458\">4451bcb</a>)</li>\n</ul>\n<h3>Bug Fixes</h3>\n<ul>\n<li>remove custom proxy handling (<a\nhref=\"https://redirect.github.com/actions/create-github-app-token/issues/143\">#143</a>)\n(<a\nhref=\"https://github.com/actions/create-github-app-token/commit/dce0ab05f36f30b22fd14289fd36655c618e4e8e\">dce0ab0</a>)</li>\n</ul>\n<h3>BREAKING CHANGES</h3>\n<ul>\n<li>Custom proxy handling has been removed. If you use HTTP_PROXY or\nHTTPS_PROXY, you must now also set NODE_USE_ENV_PROXY=1 on the action\nstep.</li>\n<li>Requires <a\nhref=\"https://github.com/actions/runner/releases/tag/v2.327.1\">Actions\nRunner v2.327.1</a> or later if you are using a self-hosted runner.</li>\n</ul>\n<h2>v3.0.0-beta.6</h2>\n<h1><a\nhref=\"https://github.com/actions/create-github-app-token/compare/v3.0.0-beta.5...v3.0.0-beta.6\">3.0.0-beta.6</a>\n(2026-03-13)</h1>\n<h3>Bug Fixes</h3>\n<ul>\n<li><strong>deps:</strong> bump <code>@​actions/core</code> from 1.11.1\nto 3.0.0 (<a\nhref=\"https://redirect.github.com/actions/create-github-app-token/issues/337\">#337</a>)\n(<a\nhref=\"https://github.com/actions/create-github-app-token/commit/b04413352d4644ac2131b9a90c074f5e93ca18a1\">b044133</a>)</li>\n<li><strong>deps:</strong> bump minimatch from 9.0.5 to 9.0.9 (<a\nhref=\"https://redirect.github.com/actions/create-github-app-token/issues/335\">#335</a>)\n(<a\nhref=\"https://github.com/actions/create-github-app-token/commit/5cbc65624c9ddc4589492bda7c8b146223e8c3e4\">5cbc656</a>)</li>\n<li><strong>deps:</strong> bump the production-dependencies group with 4\nupdates (<a\nhref=\"https://redirect.github.com/actions/create-github-app-token/issues/336\">#336</a>)\n(<a\nhref=\"https://github.com/actions/create-github-app-token/commit/6bda5bc1410576b9a0879ce6076d53345485bba9\">6bda5bc</a>)</li>\n<li><strong>deps:</strong> bump undici from 7.16.0 to 7.18.2 (<a\nhref=\"https://redirect.github.com/actions/create-github-app-token/issues/323\">#323</a>)\n(<a\nhref=\"https://github.com/actions/create-github-app-token/commit/b4f638f48ee0dcdbb0bc646c48e4cb2a2de847fe\">b4f638f</a>)</li>\n</ul>\n<h2>v3.0.0-beta.5</h2>\n<h1><a\nhref=\"https://github.com/actions/create-github-app-token/compare/v3.0.0-beta.4...v3.0.0-beta.5\">3.0.0-beta.5</a>\n(2026-03-13)</h1>\n<ul>\n<li>fix!: require <code>NODE_USE_ENV_PROXY</code> for proxy support (<a\nhref=\"https://redirect.github.com/actions/create-github-app-token/issues/342\">#342</a>)\n(<a\nhref=\"https://github.com/actions/create-github-app-token/commit/d53a1cdfde844c958786293adcaf739ecb8b5eb9\">d53a1cd</a>)</li>\n</ul>\n<h3>BREAKING CHANGES</h3>\n<ul>\n<li>Custom proxy handling has been removed. If you use HTTP_PROXY or\nHTTPS_PROXY, you must now also set NODE_USE_ENV_PROXY=1 on the action\nstep.</li>\n</ul>\n<h2>v3.0.0-beta.4</h2>\n<h1><a\nhref=\"https://github.com/actions/create-github-app-token/compare/v3.0.0-beta.3...v3.0.0-beta.4\">3.0.0-beta.4</a>\n(2026-03-13)</h1>\n<h3>Bug Fixes</h3>\n<ul>\n<li><strong>deps:</strong> bump <code>@​octokit/auth-app</code> from\n7.2.1 to 8.0.1 (<a\nhref=\"https://redirect.github.com/actions/create-github-app-token/issues/257\">#257</a>)\n(<a\nhref=\"https://github.com/actions/create-github-app-token/commit/bef1eaf1c0ac2b148ee2a0a74c65fbe6db0631f1\">bef1eaf</a>)</li>\n<li><strong>deps:</strong> bump <code>@​octokit/request</code> from\n9.2.3 to 10.0.2 (<a\nhref=\"https://redirect.github.com/actions/create-github-app-token/issues/256\">#256</a>)\n(<a\nhref=\"https://github.com/actions/create-github-app-token/commit/5d7307be63501c0070c634b0ae8fec74e8208130\">5d7307b</a>)</li>\n<li><strong>deps:</strong> bump glob from 10.4.5 to 10.5.0 (<a\nhref=\"https://redirect.github.com/actions/create-github-app-token/issues/305\">#305</a>)\n(<a\nhref=\"https://github.com/actions/create-github-app-token/commit/5480f4325a18c025ee16d7e081413854624e9edc\">5480f43</a>)</li>\n<li><strong>deps:</strong> bump p-retry from 6.2.1 to 7.1.0 (<a\nhref=\"https://redirect.github.com/actions/create-github-app-token/issues/294\">#294</a>)\n(<a\nhref=\"https://github.com/actions/create-github-app-token/commit/dce3be8b284f45e65caed11a610e2bef738d15b4\">dce3be8</a>)</li>\n</ul>\n<!-- raw HTML omitted -->\n</blockquote>\n<p>... (truncated)</p>\n</details>\n<details>\n<summary>Changelog</summary>\n<p><em>Sourced from <a\nhref=\"https://github.com/actions/create-github-app-token/blob/main/CHANGELOG.md\">actions/create-github-app-token's\nchangelog</a>.</em></p>\n<blockquote>\n<h1>Changelog</h1>\n<h2><a\nhref=\"https://github.com/actions/create-github-app-token/compare/v3.1.1...v3.2.0\">3.2.0</a>\n(2026-05-12)</h2>\n<h3>Features</h3>\n<ul>\n<li>add support for enterprise-level GitHub Apps (<a\nhref=\"https://redirect.github.com/actions/create-github-app-token/issues/263\">#263</a>)\n(<a\nhref=\"https://github.com/actions/create-github-app-token/commit/952a2a7073df6bfa5f49bc469ec895b6ec1acea4\">952a2a7</a>)</li>\n<li>support full repository names in <code>repositories</code> input (<a\nhref=\"https://redirect.github.com/actions/create-github-app-token/issues/372\">#372</a>)\n(<a\nhref=\"https://github.com/actions/create-github-app-token/commit/85eb8dd41472213aed25d1a126460e0069138ab6\">85eb8dd</a>)</li>\n</ul>\n<h3>Bug Fixes</h3>\n<ul>\n<li><strong>deps:</strong> bump <code>@​actions/core</code> from 3.0.0\nto 3.0.1 in the production-dependencies group (<a\nhref=\"https://redirect.github.com/actions/create-github-app-token/issues/364\">#364</a>)\n(<a\nhref=\"https://github.com/actions/create-github-app-token/commit/43e5c345bfd4d4f3ecea019ad0042001a09dd857\">43e5c34</a>)</li>\n<li>validate private-key input (<a\nhref=\"https://redirect.github.com/actions/create-github-app-token/issues/376\">#376</a>)\n(<a\nhref=\"https://github.com/actions/create-github-app-token/commit/f24bbd89643991c0de27ae823c01791b2c6bafdd\">f24bbd8</a>)</li>\n</ul>\n</blockquote>\n</details>\n<details>\n<summary>Commits</summary>\n<ul>\n<li><a\nhref=\"https://github.com/actions/create-github-app-token/commit/bcd2ba49218906704ab6c1aa796996da409d3eb1\"><code>bcd2ba4</code></a>\nchore(main): release 3.2.0 (<a\nhref=\"https://redirect.github.com/actions/create-github-app-token/issues/370\">#370</a>)</li>\n<li><a\nhref=\"https://github.com/actions/create-github-app-token/commit/f24bbd89643991c0de27ae823c01791b2c6bafdd\"><code>f24bbd8</code></a>\nfix: validate private-key input (<a\nhref=\"https://redirect.github.com/actions/create-github-app-token/issues/376\">#376</a>)</li>\n<li><a\nhref=\"https://github.com/actions/create-github-app-token/commit/363531b6d972a60a00b3f1e6bb139e5e6c764cd9\"><code>363531b</code></a>\ndocs: capitalize Git as a proper noun in README (<a\nhref=\"https://redirect.github.com/actions/create-github-app-token/issues/374\">#374</a>)</li>\n<li><a\nhref=\"https://github.com/actions/create-github-app-token/commit/fd2801133e469d2950f2c5af5e591d6b2ad833c8\"><code>fd28011</code></a>\ndocs: update procedure to configure Git (<a\nhref=\"https://redirect.github.com/actions/create-github-app-token/issues/287\">#287</a>)</li>\n<li><a\nhref=\"https://github.com/actions/create-github-app-token/commit/85eb8dd41472213aed25d1a126460e0069138ab6\"><code>85eb8dd</code></a>\nfeat: support full repository names in <code>repositories</code> input\n(<a\nhref=\"https://redirect.github.com/actions/create-github-app-token/issues/372\">#372</a>)</li>\n<li><a\nhref=\"https://github.com/actions/create-github-app-token/commit/c9aabb83728c3bd519212fa657ebc07e1f2a5dec\"><code>c9aabb8</code></a>\nbuild(deps-dev): bump yaml from 2.8.3 to 2.8.4 in the\ndevelopment-dependencie...</li>\n<li><a\nhref=\"https://github.com/actions/create-github-app-token/commit/e02e816e5591415258a53bf735aff57977dcd5e2\"><code>e02e816</code></a>\nbuild(deps-dev): bump undici from 7.24.6 to 8.2.0 (<a\nhref=\"https://redirect.github.com/actions/create-github-app-token/issues/366\">#366</a>)</li>\n<li><a\nhref=\"https://github.com/actions/create-github-app-token/commit/8d835bfd37aa48fcb8e709925115857568d98bc4\"><code>8d835bf</code></a>\nbuild(deps-dev): bump esbuild from 0.27.4 to 0.28.0 in the\ndevelopment-depend...</li>\n<li><a\nhref=\"https://github.com/actions/create-github-app-token/commit/952a2a7073df6bfa5f49bc469ec895b6ec1acea4\"><code>952a2a7</code></a>\nfeat: add support for enterprise-level GitHub Apps (<a\nhref=\"https://redirect.github.com/actions/create-github-app-token/issues/263\">#263</a>)</li>\n<li><a\nhref=\"https://github.com/actions/create-github-app-token/commit/43e5c345bfd4d4f3ecea019ad0042001a09dd857\"><code>43e5c34</code></a>\nfix(deps): bump <code>@​actions/core</code> from 3.0.0 to 3.0.1 in the\nproduction-dependenc...</li>\n<li>Additional commits viewable in <a\nhref=\"https://github.com/actions/create-github-app-token/compare/v1...v3\">compare\nview</a></li>\n</ul>\n</details>\n<br />\n\n\n[![Dependabot compatibility\nscore](https://dependabot-badges.githubapp.com/badges/compatibility_score?dependency-name=actions/create-github-app-token&package-manager=github_actions&previous-version=1&new-version=3)](https://docs.github.com/en/github/managing-security-vulnerabilities/about-dependabot-security-updates#about-compatibility-scores)\n\nDependabot will resolve any conflicts with this PR as long as you don't\nalter it yourself. You can also trigger a rebase manually by commenting\n`@dependabot rebase`.\n\n[//]: # (dependabot-automerge-start)\n[//]: # (dependabot-automerge-end)\n\n---\n\n<details>\n<summary>Dependabot commands and options</summary>\n<br />\n\nYou can trigger Dependabot actions by commenting on this PR:\n- `@dependabot rebase` will rebase this PR\n- `@dependabot recreate` will recreate this PR, overwriting any edits\nthat have been made to it\n- `@dependabot show <dependency name> ignore conditions` will show all\nof the ignore conditions of the specified dependency\n- `@dependabot ignore this major version` will close this PR and stop\nDependabot creating any more for this major version (unless you reopen\nthe PR or upgrade to it yourself)\n- `@dependabot ignore this minor version` will close this PR and stop\nDependabot creating any more for this minor version (unless you reopen\nthe PR or upgrade to it yourself)\n- `@dependabot ignore this dependency` will close this PR and stop\nDependabot creating any more for this dependency (unless you reopen the\nPR or upgrade to it yourself)\n\n\n</details>\n\nSigned-off-by: dependabot[bot] <support@github.com>\nCo-authored-by: dependabot[bot] <49699333+dependabot[bot]@users.noreply.github.com>",
+          "timestamp": "2026-05-18T04:28:11+03:00",
+          "tree_id": "cbde0e8f8b2e9d89c004e97eb2b647e9deec4840",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/851e583e3892f91b3a72ea1065bf7080d44c9dea"
+        },
+        "date": 1779068138073,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 1250906.2007611105,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 1968707 ops/sec | factor: 0.635 | P50: 0.3us | P99: 2.4us | P99.9: 5.7us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3 | runner: seq_wr=220694 rand_rd=728324 cpu=108 composite=36198.0"
+          },
+          {
+            "name": "fillrandom",
+            "value": 671721.063097547,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 1057171 ops/sec | factor: 0.635 | P50: 0.7us | P99: 3.2us | P99.9: 7.2us\nthreads: 1 | elapsed: 0.19s | num: 200000 | iterations: 3 | runner: seq_wr=220694 rand_rd=728324 cpu=108 composite=36198.0"
+          },
+          {
+            "name": "readrandom",
+            "value": 286636.6098312856,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 451116 ops/sec | factor: 0.635 | P50: 2.0us | P99: 6.6us | P99.9: 13.7us\nthreads: 1 | elapsed: 0.44s | num: 200000 | iterations: 3 | runner: seq_wr=220694 rand_rd=728324 cpu=108 composite=36198.0"
+          },
+          {
+            "name": "readseq",
+            "value": 1467978.1063982,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 2310340 ops/sec | factor: 0.635 | P50: 0.2us | P99: 4.6us | P99.9: 9.4us\nthreads: 1 | elapsed: 0.09s | num: 200000 | iterations: 3 | runner: seq_wr=220694 rand_rd=728324 cpu=108 composite=36198.0"
+          },
+          {
+            "name": "seekrandom",
+            "value": 221304.97444933915,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 348295 ops/sec | factor: 0.635 | P50: 2.5us | P99: 7.1us | P99.9: 14.3us\nthreads: 1 | elapsed: 0.57s | num: 200000 | iterations: 3 | runner: seq_wr=220694 rand_rd=728324 cpu=108 composite=36198.0"
+          },
+          {
+            "name": "prefixscan",
+            "value": 117655.3899176707,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 185169 ops/sec | factor: 0.635 | P50: 5.1us | P99: 6.6us | P99.9: 16.8us\nthreads: 1 | elapsed: 1.08s | num: 200000 | iterations: 3 | runner: seq_wr=220694 rand_rd=728324 cpu=108 composite=36198.0"
+          },
+          {
+            "name": "overwrite",
+            "value": 709292.166768447,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 1116301 ops/sec | factor: 0.635 | P50: 0.7us | P99: 3.0us | P99.9: 7.1us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3 | runner: seq_wr=220694 rand_rd=728324 cpu=108 composite=36198.0"
+          },
+          {
+            "name": "mergerandom",
+            "value": 489724.6912560415,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 770741 ops/sec | factor: 0.635 | P50: 0.4us | P99: 0.5us | P99.9: 3.5us\nthreads: 1 | elapsed: 0.26s | num: 200000 | iterations: 3 | runner: seq_wr=220694 rand_rd=728324 cpu=108 composite=36198.0"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 268454.28139758686,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 422500 ops/sec | factor: 0.635 | P50: 2.2us | P99: 5.6us | P99.9: 14.4us\nthreads: 1 | elapsed: 0.47s | num: 200000 | iterations: 3 | runner: seq_wr=220694 rand_rd=728324 cpu=108 composite=36198.0"
           }
         ]
       }
