@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779068563512,
+  "lastUpdate": 1779089475753,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -6474,6 +6474,84 @@ window.BENCHMARK_DATA = {
             "value": 273655.5079303307,
             "unit": "ops/sec (normalized)",
             "extra": "raw: 500085 ops/sec | factor: 0.547 | P50: 1.8us | P99: 4.1us | P99.9: 13.3us\nthreads: 1 | elapsed: 0.40s | num: 200000 | iterations: 3 | runner: seq_wr=220232 rand_rd=967360 cpu=123 composite=42030.8"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "fc790a55c032bb0e112de6270e0cbc929f050607",
+          "message": "perf(util): SIMD longest_shared_prefix_length() (Phase 2.1) (#245)\n\n## Summary\n\nReplaces the byte-by-byte `iter().zip().take_while().count()` in\n`longest_shared_prefix_length` with runtime-dispatched SIMD kernels:\n\n- **x86_64 + AVX2** (runtime via `is_x86_feature_detected!`): 32-byte\nlanes, `_mm256_cmpeq_epi8` + `_mm256_movemask_epi8`.\n- **aarch64 little-endian**: 16-byte NEON lanes via `vceqq_u8` +\ndual-u64 mask reduction. Restricted to LE because `trailing_zeros()/8`\nmismatch math and `vgetq_lane_u64` lane order both depend on LE byte\norder; big-endian aarch64 falls through to scalar.\n- **Everywhere else** (incl. x86_64 without AVX2, BE aarch64): 8-byte\n`u64` word stride via XOR + `trailing_zeros()/8`. Endian-aware via\n`target_endian` cfg.\n\nPer CLAUDE.md principle 3: runtime CPU detection only, never\n`#[cfg(target_feature)]`. Same binary ships to all x86_64 CPUs; scalar\nfallback always present.\n\n## Measured speedup (aarch64 NEON, M1, criterion `--quick`)\n\n|        Size | Pattern        | byte_loop | dispatched | speedup |\n|------------:|----------------|----------:|-----------:|--------:|\n|        256B | full match     |  121.0 ns |    12.0 ns |  **10×** |\n|        256B | quarter match  |   28.2 ns |     4.7 ns |   **6×** |\n|       1024B | full match     |  452.8 ns |    44.5 ns |  **10×** |\n|       1024B | quarter match  |  130.7 ns |    12.3 ns |  **11×** |\n\nx86_64 AVX2 numbers will land via CI on the bench gh-pages dashboard\n(#244 once merged).\n\n## Coverage\n\n- **Unit tests** (6 new + 1 original) — boundary stride sizes\n(0/7/8/9/15/16/17/31/32/33/63/64/127/128/255/256), asymmetric lengths\n(scalar + dispatched), extreme byte patterns (all-zero, all-FF,\nzero-vs-FF, alternating), one-empty pairs.\n- **Property tests** (proptest, 256 cases each) — `lsp_scalar` and\ndispatched `longest_shared_prefix_length` must both equal the\nbyte-by-byte reference for any random input up to 1 KiB.\n- **Integration** — function is the sole per-key cost in\n`src/table/block/encoder.rs:142`. All 1276 table-writing / flush /\ncompaction tests in the existing suite continue to pass.\n- **Bench** — new `benches/lsp.rs` with 6 sizes × 2 mismatch patterns ×\n{dispatched, byte_loop}, throughput in GiB/s.\n- **Cross-target CI** — verified on x86_64 (lint+test), aarch64-gnu,\naarch64-musl, i686, powerpc64 (BE), riscv64gc — all pass; scalar\nfallback handles BE and non-SIMD targets correctly.\n\n## Test plan\n\n- [x] `cargo check --all-features --all-targets` clean\n- [x] `cargo clippy --all-features --all-targets -- -D warnings` clean\n(both aarch64 + x86_64-apple-darwin)\n- [x] `cargo nextest run --all-features` — 1276 passed, 6 skipped\n- [x] `cargo test --doc --all-features` — 41 passed, 2 ignored\n- [x] `cargo bench --bench lsp -- --quick` runs and shows expected\nspeedup\n- [x] SIMD/scalar parity proven for all boundary sizes via deterministic\n+ property tests\n- [x] CI green on all cross-compile targets (incl. BE powerpc64 →\nexercises scalar fallback)\n\nCloses #219\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n## Summary by CodeRabbit\n\n* **Chores**\n* Added a local microbenchmark target for shared-prefix performance and\nenabled it for local runs.\n* Updated an optional dependency version and exposed the shared-prefix\nhelper at the crate root.\n\n* **Refactor**\n* Reworked shared-prefix computation to use platform-accelerated paths\nwith safe fallbacks for broader performance.\n\n* **Tests**\n* Expanded unit, kernel-specific, and property-based tests covering\nboundaries, patterns, truncation, and randomized inputs.\n\n<!-- review_stack_entry_start -->\n\n[![Review Change\nStack](https://storage.googleapis.com/coderabbit_public_assets/review-stack-in-coderabbit-ui.svg)](https://app.coderabbit.ai/change-stack/structured-world/coordinode-lsm-tree/pull/245?utm_source=github_walkthrough&utm_medium=github&utm_campaign=change_stack)\n\n<!-- review_stack_entry_end -->\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-05-18T10:30:00+03:00",
+          "tree_id": "cf9cdbadeb1340a644b20b28de7e79989bbe9393",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/fc790a55c032bb0e112de6270e0cbc929f050607"
+        },
+        "date": 1779089474725,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 1239037.199664856,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 1929449 ops/sec | factor: 0.642 | P50: 0.4us | P99: 2.5us | P99.9: 5.8us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3 | runner: seq_wr=223814 rand_rd=702157 cpu=108 composite=35816.0"
+          },
+          {
+            "name": "fillrandom",
+            "value": 674617.1868398564,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 1050525 ops/sec | factor: 0.642 | P50: 0.7us | P99: 3.2us | P99.9: 8.3us\nthreads: 1 | elapsed: 0.19s | num: 200000 | iterations: 3 | runner: seq_wr=223814 rand_rd=702157 cpu=108 composite=35816.0"
+          },
+          {
+            "name": "readrandom",
+            "value": 281785.5185904247,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 438801 ops/sec | factor: 0.642 | P50: 2.1us | P99: 6.5us | P99.9: 13.7us\nthreads: 1 | elapsed: 0.46s | num: 200000 | iterations: 3 | runner: seq_wr=223814 rand_rd=702157 cpu=108 composite=35816.0"
+          },
+          {
+            "name": "readseq",
+            "value": 1488892.6348979492,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 2318528 ops/sec | factor: 0.642 | P50: 0.2us | P99: 4.7us | P99.9: 9.6us\nthreads: 1 | elapsed: 0.09s | num: 200000 | iterations: 3 | runner: seq_wr=223814 rand_rd=702157 cpu=108 composite=35816.0"
+          },
+          {
+            "name": "seekrandom",
+            "value": 205098.63925836998,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 319383 ops/sec | factor: 0.642 | P50: 2.8us | P99: 7.3us | P99.9: 15.2us\nthreads: 1 | elapsed: 0.63s | num: 200000 | iterations: 3 | runner: seq_wr=223814 rand_rd=702157 cpu=108 composite=35816.0"
+          },
+          {
+            "name": "prefixscan",
+            "value": 117581.763529307,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 183100 ops/sec | factor: 0.642 | P50: 5.1us | P99: 6.9us | P99.9: 16.4us\nthreads: 1 | elapsed: 1.09s | num: 200000 | iterations: 3 | runner: seq_wr=223814 rand_rd=702157 cpu=108 composite=35816.0"
+          },
+          {
+            "name": "overwrite",
+            "value": 679907.6962262535,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 1058763 ops/sec | factor: 0.642 | P50: 0.7us | P99: 3.2us | P99.9: 9.0us\nthreads: 1 | elapsed: 0.19s | num: 200000 | iterations: 3 | runner: seq_wr=223814 rand_rd=702157 cpu=108 composite=35816.0"
+          },
+          {
+            "name": "mergerandom",
+            "value": 480427.78048191196,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 748130 ops/sec | factor: 0.642 | P50: 0.4us | P99: 2.2us | P99.9: 3.6us\nthreads: 1 | elapsed: 0.27s | num: 200000 | iterations: 3 | runner: seq_wr=223814 rand_rd=702157 cpu=108 composite=35816.0"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 260953.53568945095,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 406361 ops/sec | factor: 0.642 | P50: 2.3us | P99: 5.7us | P99.9: 14.3us\nthreads: 1 | elapsed: 0.49s | num: 200000 | iterations: 3 | runner: seq_wr=223814 rand_rd=702157 cpu=108 composite=35816.0"
           }
         ]
       }
