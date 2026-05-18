@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779089475753,
+  "lastUpdate": 1779113931815,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -6552,6 +6552,84 @@ window.BENCHMARK_DATA = {
             "value": 260953.53568945095,
             "unit": "ops/sec (normalized)",
             "extra": "raw: 406361 ops/sec | factor: 0.642 | P50: 2.3us | P99: 5.7us | P99.9: 14.3us\nthreads: 1 | elapsed: 0.49s | num: 200000 | iterations: 3 | runner: seq_wr=223814 rand_rd=702157 cpu=108 composite=35816.0"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "2416cf3c4b97177bd1c88b05d57e96beb869f5fe",
+          "message": "fix(encryption): restore --features encryption build (aes-gcm 0.11.0-rc.3 + rand_chacha 0.10) (#258)\n\n## Summary\n\nRestores `cargo build --features encryption` on `main` after the\ndependabot bump in #243 broke trait-bound resolution. AAD-bound block\nidentity is intentionally NOT in this PR — that's the separate #250 /\n#251 / #252 / #253 track.\n\n## Changes\n\n- **`Cargo.toml`** — `aes-gcm = \"=0.11.0-rc.3\"` (exact pin, prerelease\ncan churn) with `rand_core` feature so `aead::rand_core` is re-exported\non the new trait family; `rand_chacha = \"0.10\"`\n- **`src/encryption.rs`** — API migration:\n- `AeadInPlace` → `AeadInOut` (`encrypt_inout_detached` /\n`decrypt_inout_detached`)\n  - `GenericArray::from_slice` → `Nonce::try_from` / `Tag::try_from`\n  - `Aes256Gcm::generate_nonce(rng)` → `Nonce::generate_from_rng(rng)`\n- `ChaCha20Rng::from_rng(OsRng).expect(..)` → `<[u8; 32]>::generate()` +\n`from_seed` (preserves fork-aware reseed + thread-local CSPRNG perf)\n- test: `Rng::next_u64` (rand_core 0.10 marker-trait shape — `RngCore`\nis now a marker, methods on `Rng` supertrait)\n\n## Why rand_chacha is preserved (deliberate)\n\nThread-local `ChaCha20Rng` seeded once per thread from `OsRng`, reseeded\non PID change:\n- **Performance**: avoids `getrandom` syscall on every nonce generation\n(1-10 µs per block under contention)\n- **Fork safety**: `ForkAwareRng` reseeds when it detects PID mismatch —\nAES-GCM is catastrophically broken on nonce reuse, a forked process\nsharing parent's RNG state would reuse nonces under the same key\n\n## CI hardening (already applied)\n\nMain-branch ruleset patched to require:\n- `lint`\n- `test (stable, ubuntu-latest)`\n\nAfter this, a PR with `lint: FAILURE` or `test: SKIPPED` cannot be\nauto-promoted by dependabot or any other path — `gh pr merge --auto`\nhonors required checks. No workflow file rewrite needed.\n\n## Test plan\n\n- [x] `cargo build --features encryption` clean\n- [x] `cargo clippy --all-features --all-targets -- -D warnings` clean\n- [x] `cargo nextest run --all-features` — 1277/1277 pass, including 16\n`src/encryption.rs::tests::aes256gcm::*` and\n`tests/encryption_roundtrip.rs`\n- [x] Ruleset checked: `lint` and `test (stable, ubuntu-latest)` listed\nas required\n\n## Out of scope\n\nAAD-bound block identity (binding ciphertext to `table_id` +\n`block_offset` + `dict_id` + `window_log` to defeat block-swap,\ndict-substitution, decompression-bomb, key-epoch attacks) lives in #250\n(spec) → #252 (BlockIdentity refactor) → #251 (wire impl) → #253\n(threat-model regression suite). Per Phase 6 of #215.\n\nCloses #246\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n## Summary by CodeRabbit\n\n* **Chores**\n* Pinned and updated cryptography and RNG dependencies to specific newer\nversions for consistent behavior.\n\n* **Refactor**\n* Updated encryption internals to use the newer crypto API while\npreserving on-disk data layout and error distinctions.\n* Improved RNG seeding and fork-resilience, and adjusted tests to\nreflect deterministic reseeding behavior.\n\n<!-- review_stack_entry_start -->\n\n[![Review Change\nStack](https://storage.googleapis.com/coderabbit_public_assets/review-stack-in-coderabbit-ui.svg)](https://app.coderabbit.ai/change-stack/structured-world/coordinode-lsm-tree/pull/258?utm_source=github_walkthrough&utm_medium=github&utm_campaign=change_stack)\n\n<!-- review_stack_entry_end -->\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-05-18T17:17:27+03:00",
+          "tree_id": "10c454d4d2cec7cac40425387d81ada33cb44ecb",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/2416cf3c4b97177bd1c88b05d57e96beb869f5fe"
+        },
+        "date": 1779113930055,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 2946833.88329379,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 2518617 ops/sec | factor: 1.170 | P50: 0.3us | P99: 2.0us | P99.9: 4.6us\nthreads: 1 | elapsed: 0.08s | num: 200000 | iterations: 3 | runner: seq_wr=18258 rand_rd=849464 cpu=140 composite=19657.8"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1681571.5742026318,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 1437215 ops/sec | factor: 1.170 | P50: 0.5us | P99: 2.5us | P99.9: 5.3us\nthreads: 1 | elapsed: 0.14s | num: 200000 | iterations: 3 | runner: seq_wr=18258 rand_rd=849464 cpu=140 composite=19657.8"
+          },
+          {
+            "name": "readrandom",
+            "value": 695934.405930532,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 594805 ops/sec | factor: 1.170 | P50: 1.5us | P99: 5.1us | P99.9: 10.7us\nthreads: 1 | elapsed: 0.34s | num: 200000 | iterations: 3 | runner: seq_wr=18258 rand_rd=849464 cpu=140 composite=19657.8"
+          },
+          {
+            "name": "readseq",
+            "value": 3476216.9296776154,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 2971073 ops/sec | factor: 1.170 | P50: 0.2us | P99: 3.7us | P99.9: 6.8us\nthreads: 1 | elapsed: 0.07s | num: 200000 | iterations: 3 | runner: seq_wr=18258 rand_rd=849464 cpu=140 composite=19657.8"
+          },
+          {
+            "name": "seekrandom",
+            "value": 525636.2268096313,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 449254 ops/sec | factor: 1.170 | P50: 2.0us | P99: 5.6us | P99.9: 11.4us\nthreads: 1 | elapsed: 0.45s | num: 200000 | iterations: 3 | runner: seq_wr=18258 rand_rd=849464 cpu=140 composite=19657.8"
+          },
+          {
+            "name": "prefixscan",
+            "value": 276884.5887519276,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 236649 ops/sec | factor: 1.170 | P50: 4.0us | P99: 5.1us | P99.9: 13.3us\nthreads: 1 | elapsed: 0.85s | num: 200000 | iterations: 3 | runner: seq_wr=18258 rand_rd=849464 cpu=140 composite=19657.8"
+          },
+          {
+            "name": "overwrite",
+            "value": 1717883.3622892906,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 1468250 ops/sec | factor: 1.170 | P50: 0.5us | P99: 2.4us | P99.9: 5.2us\nthreads: 1 | elapsed: 0.14s | num: 200000 | iterations: 3 | runner: seq_wr=18258 rand_rd=849464 cpu=140 composite=19657.8"
+          },
+          {
+            "name": "mergerandom",
+            "value": 704011.4092745412,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 601708 ops/sec | factor: 1.170 | P50: 0.3us | P99: 1.8us | P99.9: 2.6us\nthreads: 1 | elapsed: 0.33s | num: 200000 | iterations: 3 | runner: seq_wr=18258 rand_rd=849464 cpu=140 composite=19657.8"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 651795.2070071183,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 557080 ops/sec | factor: 1.170 | P50: 1.6us | P99: 3.9us | P99.9: 10.5us\nthreads: 1 | elapsed: 0.36s | num: 200000 | iterations: 3 | runner: seq_wr=18258 rand_rd=849464 cpu=140 composite=19657.8"
           }
         ]
       }
