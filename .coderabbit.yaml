@@ -25,8 +25,10 @@ reviews:
     drafts: false
     # Single `main` base: feat/#NNN and fix/#NNN are PR source branches per
     # our convention (CLAUDE.md), not long-lived integration targets — there
-    # are no release/* branches in this repo. Widen this list if that ever
-    # changes.
+    # are no release/* branches in this repo. The `upstream-monitor.yml`
+    # workflow also creates `chore/upstream-sync-*` sync PRs, and those
+    # ALWAYS target `main` (see the `--base main` flag on `gh pr create`).
+    # Widen this list if either convention ever changes.
     base_branches: ["main"]
     ignore_title_keywords: ["WIP", "DO NOT MERGE"]
   path_instructions:
@@ -52,12 +54,22 @@ reviews:
     # Two near-identical blocks (single-file and module-directory layouts)
     # so the rule survives a module-vs-single-file refactor — covers the
     # current `src/encryption.rs`, any future `src/encryption_*.rs` split,
-    # and a `src/encryption/` directory. The duplication is intentional;
-    # CodeRabbit's path_instructions schema does not document YAML-anchor
-    # support reliably across versions, so we keep both blocks explicit.
-    # If a future schema cleanly supports anchors, collapse to:
-    #     - &enc-review &enc-glob path: "src/encryption*.rs"
-    #     - <<: *enc-review path: "src/encryption/**"
+    # and a `src/encryption/` directory.
+    #
+    # Why duplicate instead of consolidate:
+    #   - YAML anchors (&enc-review / *enc-review): CodeRabbit's
+    #     path_instructions schema doesn't document anchor support
+    #     reliably across versions.
+    #   - Brace expansion (`src/encryption{*.rs,/**}`): no schema
+    #     guarantee that CodeRabbit's glob engine supports brace
+    #     expansion — silently no-matching is the failure mode.
+    #   - Single broader glob (`src/encryption*`): may not cross `/`
+    #     in CodeRabbit's matcher → nested files lose context.
+    #
+    # The duplication is intentional given those uncertainties. The
+    # mirrored `⚠️ Keep this block in sync` trailers below remind
+    # editors to update both. Collapse if/when the schema clearly
+    # supports one of the above patterns.
     - path: "src/encryption*.rs"
       instructions: |
         Security-critical code. Review for timing attacks, nonce reuse, key handling.
