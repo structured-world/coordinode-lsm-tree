@@ -148,7 +148,8 @@ impl Aes256GcmProvider {
     }
 }
 
-/// Create a new [`ChaCha20Rng`](rand_chacha::ChaCha20Rng) seeded from the OS RNG.
+/// Create a new [`ChaCha20Rng`](rand_chacha::ChaCha20Rng) seeded from the OS RNG
+/// (via the getrandom-backed `SysRng` exposed by aes-gcm's `Generate` trait).
 ///
 /// Returns the RNG directly (not `Result`) because callers are
 /// `thread_local!` init and fork-reseed, neither of which can propagate
@@ -169,7 +170,7 @@ fn new_chacha_rng() -> rand_chacha::ChaCha20Rng {
 ///
 /// On each access, compares the stored PID with `std::process::id()`.
 /// If they differ (i.e. the process was forked), the RNG is reseeded
-/// from `OsRng` to avoid nonce reuse across processes.
+/// from the OS RNG to avoid nonce reuse across processes.
 #[cfg(feature = "encryption")]
 struct ForkAwareRng {
     pid: std::cell::Cell<u32>,
@@ -214,7 +215,7 @@ thread_local! {
 /// Using a thread-local [`ChaCha20Rng`](rand_chacha::ChaCha20Rng) avoids a
 /// `getrandom` syscall on every nonce generation, which saves 1-10 µs per
 /// block under contention. The RNG is cryptographically secure and seeded
-/// from `OsRng` on first access per thread, and is lazily reseeded on the
+/// from the OS RNG on first access per thread, and is lazily reseeded on the
 /// next use if the process ID changes (e.g., after a `fork()`) to reduce
 /// the risk of nonce reuse across processes.
 #[cfg(feature = "encryption")]
@@ -561,36 +562,49 @@ mod tests {
             Ok(())
         }
 
-        /// Verify `ForkAwareRng` reseeds when it detects a PID change.
+        /// Verify `ForkAwareRng` actually REPLACES the inner RNG (not just
+        /// restores PID bookkeeping) when it detects a PID change.
         ///
-        /// Asserts on deterministic state (PID restoration) rather than
-        /// probabilistic RNG output to avoid flaky CI.
+        /// Stamps a deterministic large `word_pos` into the inner ChaCha20Rng,
+        /// triggers fake-PID reseed, and asserts `word_pos` was reset to a
+        /// fresh-RNG value. If the `*rng_ref = new_chacha_rng()` line were
+        /// removed from `with_rng`, the stamped offset would survive and this
+        /// test would fail.
+        /// Distinctive word_pos that cannot occur naturally on a freshly-seeded
+        /// RNG after a single u64 draw (which advances word_pos by 2).
+        const SENTINEL_WORD_POS: u128 = 0xDEAD_BEEF_u128;
+
         #[test]
         fn fork_aware_rng_reseeds_on_pid_change() {
             let rng = ForkAwareRng::new();
 
-            // Generate a value with the current PID (ensures RNG is initialized).
-            // In rand_core 0.10 `RngCore` is a marker; the `next_u64` method is on the
-            // `Rng` supertrait. ChaCha20Rng implements both.
+            // Initialize the lazy RNG.
+            let _ = rng.with_rng(aes_gcm::aead::rand_core::Rng::next_u64);
+            rng.rng.borrow_mut().set_word_pos(SENTINEL_WORD_POS);
+            assert_eq!(rng.rng.borrow().get_word_pos(), SENTINEL_WORD_POS);
+
+            // Simulate fork: stamp a fake PID different from the real one.
+            let real_pid = std::process::id();
+            rng.pid.set(real_pid ^ 1);
+
+            // Next access detects PID mismatch → replaces the inner RNG with
+            // a fresh seed from the OS RNG. After one u64 draw on the fresh
+            // RNG, word_pos must be
+            // a small fresh-RNG value, NOT SENTINEL_WORD_POS + 2.
             let _ = rng.with_rng(aes_gcm::aead::rand_core::Rng::next_u64);
 
-            // Simulate fork by setting a fake PID that differs from the real one.
-            let current_pid = std::process::id();
-            let fake_pid = current_pid ^ 1;
-            rng.pid.set(fake_pid);
-            assert_eq!(rng.pid.get(), fake_pid, "PID should be set to fake value");
-
-            // Next call sees real PID != fake PID → reseeds from OsRng and
-            // restores the stored PID to the real process ID.
-            // In rand_core 0.10 `RngCore` is a marker; the `next_u64` method is on the
-            // `Rng` supertrait. ChaCha20Rng implements both.
-            let _ = rng.with_rng(aes_gcm::aead::rand_core::Rng::next_u64);
-
-            // Deterministic assertion: PID was restored after reseed.
             assert_eq!(
                 rng.pid.get(),
-                std::process::id(),
+                real_pid,
                 "PID should be restored to real process ID after reseed"
+            );
+
+            let post_word_pos = rng.rng.borrow().get_word_pos();
+            assert!(
+                post_word_pos < SENTINEL_WORD_POS,
+                "inner RNG was not replaced on reseed: post word_pos {post_word_pos:#x} \
+                 should be a fresh-RNG value, not {SENTINEL_WORD_POS:#x}+ \
+                 (would indicate fork-safety reseed is broken)"
             );
         }
 
