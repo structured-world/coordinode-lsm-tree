@@ -87,14 +87,22 @@ jobs:
           if [ -f "$STATE_FILE" ]; then
             UPSTREAM_PREV_TAG=$(tr -d '[:space:]' < "$STATE_FILE")
           else
-            # Intersect "tags reachable from origin/main" with "tags
-            # reachable from upstream/main" — guarantees the inferred
-            # tag is upstream-origin and excludes fork-local release
-            # tags (e.g., our own `v4.4.0`) that would otherwise be
-            # mistaken for a previous upstream sync point.
+            # Triple intersection — mirrors UPSTREAM_LATEST_TAG safety:
+            #   (a) tags actually PUBLISHED on the upstream remote
+            #       (`git ls-remote --tags --refs` — not just present
+            #       in the local tag DB, which contains fork tags too),
+            #   (b) tags reachable from origin/main,
+            #   (c) tags reachable from upstream/main.
+            # A fork-local `v4.4.0` that happens to sit on a commit
+            # reachable from both main heads via back-merge would
+            # still survive (a) ∩ (b) ∩ (c) only if upstream also
+            # publishes that exact tag name — which it doesn't.
             UPSTREAM_PREV_TAG=$(comm -12 \
-              <(git tag -l --merged "origin/main" | sort) \
-              <(git tag -l --merged "${UPSTREAM_REMOTE}/main" | sort) \
+              <(git ls-remote --tags --refs "$UPSTREAM_REMOTE" \
+                  | awk '{sub(/refs\/tags\//,"",$2); print $2}' | sort -u) \
+              <(comm -12 \
+                  <(git tag -l --merged "origin/main" | sort -u) \
+                  <(git tag -l --merged "${UPSTREAM_REMOTE}/main" | sort -u)) \
               | grep -E "$SEMVER_RE" | sort -V | tail -1 || true)
           fi
           UPSTREAM_HEAD_SHORT=$(git rev-parse --short "${UPSTREAM_REMOTE}/main")
