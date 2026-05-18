@@ -1,7 +1,10 @@
 # yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
 
 language: "en-US"
-early_access: true
+# Stable channel — early-access features change between releases without
+# notice, which makes review output non-reproducible across runs.
+# Re-enable explicitly only when an early-access feature is needed.
+early_access: false
 
 reviews:
   profile: "assertive"
@@ -60,11 +63,13 @@ reviews:
         Security-critical code. Review for timing attacks, nonce reuse, key handling.
         RNG must be CSPRNG. No hardcoded keys or IVs. AEAD nonces must never repeat
         under the same key. Fork-aware reseed must be preserved.
+        ⚠️ Keep this block in sync with the `src/encryption/**` rule below.
     - path: "src/encryption/**"
       instructions: |
         Security-critical code. Review for timing attacks, nonce reuse, key handling.
         RNG must be CSPRNG. No hardcoded keys or IVs. AEAD nonces must never repeat
         under the same key. Fork-aware reseed must be preserved.
+        ⚠️ Keep this block in sync with the `src/encryption*.rs` rule above.
   tools:
     shellcheck:
       enabled: true

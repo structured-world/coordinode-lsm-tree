@@ -4,6 +4,11 @@ on:
   schedule:
     - cron: "0 8 * * 1,4"
   workflow_dispatch:
+    inputs:
+      force:
+        description: "Bypass the 'already-considered tag' skip and open a fresh sync PR even if upstream HEAD was previously surfaced."
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -75,8 +80,12 @@ jobs:
             UPSTREAM_PREV_TAG=$(git tag -l --sort=-v:refname --merged "origin/main" \
               | grep -E "$SEMVER_RE" | head -1 || true)
           fi
-          echo "upstream_latest_tag=$UPSTREAM_LATEST_TAG" >> "$GITHUB_OUTPUT"
-          echo "upstream_prev_tag=$UPSTREAM_PREV_TAG" >> "$GITHUB_OUTPUT"
+          UPSTREAM_HEAD_SHORT=$(git rev-parse --short "${UPSTREAM_REMOTE}/main")
+          {
+            echo "upstream_latest_tag=$UPSTREAM_LATEST_TAG"
+            echo "upstream_prev_tag=$UPSTREAM_PREV_TAG"
+            echo "upstream_head_short=$UPSTREAM_HEAD_SHORT"
+          } >> "$GITHUB_OUTPUT"
 
           NEW_RELEASE=false
           if [ -n "$UPSTREAM_LATEST_TAG" ] && [ "$UPSTREAM_LATEST_TAG" != "$UPSTREAM_PREV_TAG" ]; then
@@ -149,13 +158,17 @@ jobs:
           # (resolved against UPSTREAM_REPO) and qualified `owner/repo#NNN`
           # (rendered as plain links, not silently rewritten).
           #
-          # Strategy: tokenise the commit text into one candidate per line by
-          # treating whitespace, parens, brackets, commas, semicolons, and
-          # angle brackets as separators, then exact-match each token against
-          # the ref grammar. This prevents file-path citations like
-          # `path/to/file#42` from being misread as `to/file#42` qualified
-          # refs (the inline `grep -oE` form was greedy and matched the
-          # longest substring rather than complete tokens).
+          # Strategy: tokenise the commit text into one candidate per line
+          # by treating whitespace, parens, brackets, commas, semicolons,
+          # angle brackets, exclamation/question marks, AND single/double
+          # quotes + apostrophes as separators, then exact-match each
+          # token against the ref grammar. This prevents file-path
+          # citations like `path/to/file#42` from being misread as
+          # `to/file#42` qualified refs (the inline `grep -oE` form was
+          # greedy and matched the longest substring rather than complete
+          # tokens). Apostrophes are intentionally separators so
+          # `don't#42` tokenises as `don`, `t`, `#42` — `t` and `don`
+          # fail the ref grammar and only `#42` is kept.
           #
           # `owner` grammar follows GitHub's rules: letters/digits/`-`, no
           # leading `-`, no `.` or `_` (which `path` segments freely use).
@@ -292,6 +305,7 @@ jobs:
           NEW_RELEASE: ${{ steps.detect.outputs.new_release }}
           UPSTREAM_LATEST_TAG: ${{ steps.detect.outputs.upstream_latest_tag }}
           UPSTREAM_PREV_TAG: ${{ steps.detect.outputs.upstream_prev_tag }}
+          UPSTREAM_HEAD_SHORT: ${{ steps.detect.outputs.upstream_head_short }}
         run: |
           set -euo pipefail
 
@@ -308,7 +322,6 @@ jobs:
             # In-development commits between releases — anchor the heading
             # to the last synced tag and the upstream HEAD short SHA so the
             # baseline is still visible at a glance.
-            UPSTREAM_HEAD_SHORT=$(git rev-parse --short "${UPSTREAM_REMOTE}/main")
             echo "## Upstream Sync: ${UPSTREAM_PREV_TAG:-(none)} → main@${UPSTREAM_HEAD_SHORT}" >> "$BODY"
           fi
           {
@@ -374,7 +387,9 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           BEHIND: ${{ steps.detect.outputs.behind }}
           UPSTREAM_LATEST_TAG: ${{ steps.detect.outputs.upstream_latest_tag }}
+          UPSTREAM_HEAD_SHORT: ${{ steps.detect.outputs.upstream_head_short }}
           BODY_PATH: ${{ steps.body.outputs.body_path }}
+          FORCE: ${{ inputs.force }}
         run: |
           set -euo pipefail
 
@@ -398,6 +413,27 @@ jobs:
             --json number --jq 'length')
           if [ "$OPEN_SYNC_PRS" -gt 0 ]; then
             echo "Skip: ${OPEN_SYNC_PRS} open sync PR(s) already exist — resolve them before opening another."
+            exit 0
+          fi
+
+          # Skip if this exact upstream HEAD was already surfaced via a
+          # prior sync PR (which the maintainer either merged or closed
+          # without merging — the "considered-but-not-merged" case
+          # matters for forks with permanent divergences from renames /
+          # cherry-picks that intentionally never absorb upstream).
+          #
+          # Mechanism: each successful PR creation pushes a tag
+          # `upstream-sync-considered/<short-sha>` pointing at upstream
+          # HEAD. Re-runs against the same upstream HEAD see the tag
+          # and exit early. New upstream commits → new short SHA → no
+          # tag match → workflow proceeds normally.
+          #
+          # workflow_dispatch input `force: true` bypasses this gate
+          # for explicit "I want to re-surface" runs.
+          CONSIDERED_TAG="upstream-sync-considered/${UPSTREAM_HEAD_SHORT}"
+          if [ "$FORCE" != "true" ] \
+             && git ls-remote --tags --exit-code origin "refs/tags/${CONSIDERED_TAG}" >/dev/null 2>&1; then
+            echo "Skip: upstream HEAD ${UPSTREAM_HEAD_SHORT} already considered (tag ${CONSIDERED_TAG} exists). Use workflow_dispatch with force=true to re-surface."
             exit 0
           fi
 
@@ -453,6 +489,16 @@ jobs:
               --base main \
               --head "$SYNC_BRANCH" \
               --label "upstream-sync"
+
+            # Mark this exact upstream HEAD as "considered" by pushing a
+            # tag that future runs check for. This is what makes
+            # close-without-merge a permanent decision until upstream
+            # advances — the tag stays regardless of PR outcome.
+            # `|| true` because a tag collision is harmless (means we
+            # already surfaced this HEAD; the new PR was a redundant
+            # workflow_dispatch with force=true).
+            git tag "$CONSIDERED_TAG" "${UPSTREAM_REMOTE}/main"
+            git push origin "$CONSIDERED_TAG" || true
           else
             CONFLICTS=$(git diff --name-only --diff-filter=U 2>/dev/null || true)
             # Defensive: if the merge failed before entering merge state
