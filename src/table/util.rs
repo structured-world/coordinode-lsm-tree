@@ -605,8 +605,9 @@ mod tests {
     #[test]
     fn longest_shared_prefix_length_matches_reference_on_boundaries() {
         // Same coverage as `lsp_scalar_matches_reference_on_boundaries`, but exercises
-        // the *dispatched* path — on x86_64 with AVX2 this hits the AVX2 kernel, on
-        // aarch64 it hits NEON, and otherwise it falls back to the scalar kernel.
+        // the *dispatched* path — on x86_64 this hits AVX2 when available and SSE2
+        // otherwise, on little-endian aarch64 it hits NEON, and on other targets it
+        // falls back to the scalar kernel.
         for total_len in [
             0_usize, 1, 7, 8, 9, 15, 16, 17, 31, 32, 33, 63, 64, 127, 128, 255, 256,
         ] {
