@@ -46,10 +46,15 @@ reviews:
       instructions: |
         Compaction is crash-safety critical. Every state mutation must be atomic.
         Verify no partial writes can corrupt on-disk state.
-    # Glob (not the bare `src/encryption.rs` path) so the rule survives a
-    # module-vs-single-file refactor — covers the current single-file form,
-    # `src/encryption/` directory layouts, and any future `encryption_*.rs`
-    # split.
+    # Two near-identical blocks (single-file and module-directory layouts)
+    # so the rule survives a module-vs-single-file refactor — covers the
+    # current `src/encryption.rs`, any future `src/encryption_*.rs` split,
+    # and a `src/encryption/` directory. The duplication is intentional;
+    # CodeRabbit's path_instructions schema does not document YAML-anchor
+    # support reliably across versions, so we keep both blocks explicit.
+    # If a future schema cleanly supports anchors, collapse to:
+    #     - &enc-review &enc-glob path: "src/encryption*.rs"
+    #     - <<: *enc-review path: "src/encryption/**"
     - path: "src/encryption*.rs"
       instructions: |
         Security-critical code. Review for timing attacks, nonce reuse, key handling.
