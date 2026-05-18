@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779068139085,
+  "lastUpdate": 1779068276511,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -6084,6 +6084,84 @@ window.BENCHMARK_DATA = {
             "value": 268454.28139758686,
             "unit": "ops/sec (normalized)",
             "extra": "raw: 422500 ops/sec | factor: 0.635 | P50: 2.2us | P99: 5.6us | P99.9: 14.4us\nthreads: 1 | elapsed: 0.47s | num: 200000 | iterations: 3 | runner: seq_wr=220694 rand_rd=728324 cpu=108 composite=36198.0"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "49699333+dependabot[bot]@users.noreply.github.com",
+            "name": "dependabot[bot]",
+            "username": "dependabot[bot]"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "1f69645faec9738039d9457d1e9a00535d992612",
+          "message": "chore(deps): update strum requirement from 0.27.2 to 0.28.0 (#242)\n\nUpdates the requirements on\n[strum](https://github.com/Peternator7/strum) to permit the latest\nversion.\n<details>\n<summary>Release notes</summary>\n<p><em>Sourced from <a\nhref=\"https://github.com/Peternator7/strum/releases\">strum's\nreleases</a>.</em></p>\n<blockquote>\n<h2>v0.28.0</h2>\n<h2>What's Changed</h2>\n<ul>\n<li>Updated the CHANGELOG for the new release by <a\nhref=\"https://github.com/Peternator7\"><code>@​Peternator7</code></a> in\n<a\nhref=\"https://redirect.github.com/Peternator7/strum/pull/452\">Peternator7/strum#452</a></li>\n<li>Add missing <code>#[automatically_derived]</code> by <a\nhref=\"https://github.com/clechasseur\"><code>@​clechasseur</code></a> in\n<a\nhref=\"https://redirect.github.com/Peternator7/strum/pull/462\">Peternator7/strum#462</a></li>\n<li>Bump MSRV to v1.71 by <a\nhref=\"https://github.com/paolobarbolini\"><code>@​paolobarbolini</code></a>\nin <a\nhref=\"https://redirect.github.com/Peternator7/strum/pull/466\">Peternator7/strum#466</a></li>\n<li>Use absolute paths in proc macro by <a\nhref=\"https://github.com/Snarpix\"><code>@​Snarpix</code></a> in <a\nhref=\"https://redirect.github.com/Peternator7/strum/pull/469\">Peternator7/strum#469</a></li>\n<li>Upgrade <code>phf</code> to v0.13 by <a\nhref=\"https://github.com/paolobarbolini\"><code>@​paolobarbolini</code></a>\nin <a\nhref=\"https://redirect.github.com/Peternator7/strum/pull/465\">Peternator7/strum#465</a></li>\n<li>docs: Fix typo by <a\nhref=\"https://github.com/j-g00da\"><code>@​j-g00da</code></a> in <a\nhref=\"https://redirect.github.com/Peternator7/strum/pull/463\">Peternator7/strum#463</a></li>\n<li>Allow any kind of passthrough attributes on\n<code>EnumDiscriminants</code> by <a\nhref=\"https://github.com/clechasseur\"><code>@​clechasseur</code></a> in\n<a\nhref=\"https://redirect.github.com/Peternator7/strum/pull/461\">Peternator7/strum#461</a></li>\n<li>Fix existing cargo fmt + clippy issues and add GH actions by <a\nhref=\"https://github.com/Peternator7\"><code>@​Peternator7</code></a> in\n<a\nhref=\"https://redirect.github.com/Peternator7/strum/pull/473\">Peternator7/strum#473</a></li>\n<li>[EnumDiscriminant] Automatically add Default by <a\nhref=\"https://github.com/Peternator7\"><code>@​Peternator7</code></a> in\n<a\nhref=\"https://redirect.github.com/Peternator7/strum/pull/474\">Peternator7/strum#474</a></li>\n<li>Honor parse_err_ty attribute when the enum has a default variant by\n<a href=\"https://github.com/scovich\"><code>@​scovich</code></a> in <a\nhref=\"https://redirect.github.com/Peternator7/strum/pull/431\">Peternator7/strum#431</a></li>\n<li>Make TryFrom and FromStr infallible if there's a default by <a\nhref=\"https://github.com/Peternator7\"><code>@​Peternator7</code></a> in\n<a\nhref=\"https://redirect.github.com/Peternator7/strum/pull/476\">Peternator7/strum#476</a></li>\n<li>Implement core::fmt::Display for ParseError by <a\nhref=\"https://github.com/Peternator7\"><code>@​Peternator7</code></a> in\n<a\nhref=\"https://redirect.github.com/Peternator7/strum/pull/477\">Peternator7/strum#477</a></li>\n<li>Peternator7/0.28 by <a\nhref=\"https://github.com/Peternator7\"><code>@​Peternator7</code></a> in\n<a\nhref=\"https://redirect.github.com/Peternator7/strum/pull/475\">Peternator7/strum#475</a></li>\n</ul>\n<h2>New Contributors</h2>\n<ul>\n<li><a\nhref=\"https://github.com/clechasseur\"><code>@​clechasseur</code></a>\nmade their first contribution in <a\nhref=\"https://redirect.github.com/Peternator7/strum/pull/462\">Peternator7/strum#462</a></li>\n<li><a href=\"https://github.com/Snarpix\"><code>@​Snarpix</code></a> made\ntheir first contribution in <a\nhref=\"https://redirect.github.com/Peternator7/strum/pull/469\">Peternator7/strum#469</a></li>\n<li><a href=\"https://github.com/j-g00da\"><code>@​j-g00da</code></a> made\ntheir first contribution in <a\nhref=\"https://redirect.github.com/Peternator7/strum/pull/463\">Peternator7/strum#463</a></li>\n<li><a href=\"https://github.com/scovich\"><code>@​scovich</code></a> made\ntheir first contribution in <a\nhref=\"https://redirect.github.com/Peternator7/strum/pull/431\">Peternator7/strum#431</a></li>\n</ul>\n<p><strong>Full Changelog</strong>: <a\nhref=\"https://github.com/Peternator7/strum/compare/v0.27.2...v0.28.0\">https://github.com/Peternator7/strum/compare/v0.27.2...v0.28.0</a></p>\n</blockquote>\n</details>\n<details>\n<summary>Changelog</summary>\n<p><em>Sourced from <a\nhref=\"https://github.com/Peternator7/strum/blob/master/CHANGELOG.md\">strum's\nchangelog</a>.</em></p>\n<blockquote>\n<h2>0.28.0</h2>\n<ul>\n<li>\n<p><a\nhref=\"https://redirect.github.com/Peternator7/strum/pull/461\">#461</a>:\nAllow any kind of passthrough attributes on\n<code>EnumDiscriminants</code>.</p>\n<ul>\n<li>Previously only list-style attributes (e.g.\n<code>#[strum_discriminants(derive(...))]</code>) were supported. Now\npath-only\n(e.g. <code>#[strum_discriminants(non_exhaustive)]</code>) and\nname/value (e.g. <code>#[strum_discriminants(doc =\n&quot;foo&quot;)]</code>)\nattributes are also supported.</li>\n</ul>\n</li>\n<li>\n<p><a\nhref=\"https://redirect.github.com/Peternator7/strum/pull/462\">#462</a>:\nAdd missing <code>#[automatically_derived]</code> to generated impls not\ncovered by <a\nhref=\"https://redirect.github.com/Peternator7/strum/pull/444\">#444</a>.</p>\n</li>\n<li>\n<p><a\nhref=\"https://redirect.github.com/Peternator7/strum/pull/466\">#466</a>:\nBump MSRV to 1.71, required to keep up with updated <code>syn</code> and\n<code>windows-sys</code> dependencies. This is a breaking change if\nyou're on an old version of rust.</p>\n</li>\n<li>\n<p><a\nhref=\"https://redirect.github.com/Peternator7/strum/pull/469\">#469</a>:\nUse absolute paths in generated proc macro code to avoid\npotential name conflicts.</p>\n</li>\n<li>\n<p><a\nhref=\"https://redirect.github.com/Peternator7/strum/pull/465\">#465</a>:\nUpgrade <code>phf</code> dependency to v0.13.</p>\n</li>\n<li>\n<p><a\nhref=\"https://redirect.github.com/Peternator7/strum/pull/473\">#473</a>:\nFix <code>cargo fmt</code> / <code>clippy</code> issues and add GitHub\nActions CI.</p>\n</li>\n<li>\n<p><a\nhref=\"https://redirect.github.com/Peternator7/strum/pull/477\">#477</a>:\n<code>strum::ParseError</code> now implements\n<code>core::fmt::Display</code> instead\n<code>std::fmt::Display</code> to make it <code>#[no_std]</code>\ncompatible. Note the <code>Error</code> trait wasn't available in core\nuntil <code>1.81</code>\nso <code>strum::ParseError</code> still only implements that in std.</p>\n</li>\n<li>\n<p><a\nhref=\"https://redirect.github.com/Peternator7/strum/pull/476\">#476</a>:\n<strong>Breaking Change</strong> - <code>EnumString</code> now\nimplements <code>From&lt;&amp;str&gt;</code>\n(infallible) instead of <code>TryFrom&lt;&amp;str&gt;</code> when the\nenum has a <code>#[strum(default)]</code> variant. This more accurately\nreflects that parsing cannot fail in that case. If you need the old\n<code>TryFrom</code> behavior, you can opt back in using\n<code>parse_error_ty</code> and <code>parse_error_fn</code>:</p>\n<pre lang=\"rust\"><code>#[derive(EnumString)]\n#[strum(parse_error_ty = strum::ParseError, parse_error_fn =\nmake_error)]\npub enum Color {\n    Red,\n    #[strum(default)]\n    Other(String),\n}\n<p>fn make_error(x: &amp;str) -&gt; strum::ParseError {\nstrum::ParseError::VariantNotFound\n}\n</code></pre></p>\n</li>\n<li>\n<p><a\nhref=\"https://redirect.github.com/Peternator7/strum/pull/431\">#431</a>:\nFix bug where <code>EnumString</code> ignored the\n<code>parse_err_ty</code>\nattribute when the enum had a <code>#[strum(default)]</code>\nvariant.</p>\n</li>\n<li>\n<p><a\nhref=\"https://redirect.github.com/Peternator7/strum/pull/474\">#474</a>:\nEnumDiscriminants will now copy <code>default</code> over from the\noriginal enum to the Discriminant enum.</p>\n<pre lang=\"rust\"><code>#[derive(Debug, Default, EnumDiscriminants)]\n#[strum_discriminants(derive(Default))] // &lt;- Remove this in 0.28.\nenum MyEnum {\n    #[default] // &lt;- Will be the #[default] on the MyEnumDiscriminant\n    #[strum_discriminants(default)] // &lt;- Remove this in 0.28\n    Variant0,\n    Variant1 { a: NonDefault },\n}\n</code></pre>\n</li>\n</ul>\n<!-- raw HTML omitted -->\n</blockquote>\n<p>... (truncated)</p>\n</details>\n<details>\n<summary>Commits</summary>\n<ul>\n<li><a\nhref=\"https://github.com/Peternator7/strum/commit/7376771128834d28bb9beba5c39846cba62e71ec\"><code>7376771</code></a>\nPeternator7/0.28 (<a\nhref=\"https://redirect.github.com/Peternator7/strum/issues/475\">#475</a>)</li>\n<li><a\nhref=\"https://github.com/Peternator7/strum/commit/26e63cd964a2e364331a5dd977d589bb9f649d8c\"><code>26e63cd</code></a>\nDisplay exists in core (<a\nhref=\"https://redirect.github.com/Peternator7/strum/issues/477\">#477</a>)</li>\n<li><a\nhref=\"https://github.com/Peternator7/strum/commit/9334c728eedaa8a992d1388a8f4564bbccad1934\"><code>9334c72</code></a>\nMake TryFrom and FromStr infallible if there's a default (<a\nhref=\"https://redirect.github.com/Peternator7/strum/issues/476\">#476</a>)</li>\n<li><a\nhref=\"https://github.com/Peternator7/strum/commit/0ccbbf823c16e827afc263182cd55e99e3b2a52e\"><code>0ccbbf8</code></a>\nHonor parse_err_ty attribute when the enum has a default variant (<a\nhref=\"https://redirect.github.com/Peternator7/strum/issues/431\">#431</a>)</li>\n<li><a\nhref=\"https://github.com/Peternator7/strum/commit/2c9e5a9259189ce8397f2f4967060240c6bafd74\"><code>2c9e5a9</code></a>\nAutomatically add Default implementation to EnumDiscriminant if it\nexists on ...</li>\n<li><a\nhref=\"https://github.com/Peternator7/strum/commit/e241243e48359b8b811b8eaccdcfa1ae87138e0d\"><code>e241243</code></a>\nFix existing cargo fmt + clippy issues and add GH actions (<a\nhref=\"https://redirect.github.com/Peternator7/strum/issues/473\">#473</a>)</li>\n<li><a\nhref=\"https://github.com/Peternator7/strum/commit/639b67fefd20eaead1c5d2ea794e9afe70a00312\"><code>639b67f</code></a>\nfeat: allow any kind of passthrough attributes on\n<code>EnumDiscriminants</code> (<a\nhref=\"https://redirect.github.com/Peternator7/strum/issues/461\">#461</a>)</li>\n<li><a\nhref=\"https://github.com/Peternator7/strum/commit/0ea1e2d0fd1460e7492ea32e6b460394d9199ff8\"><code>0ea1e2d</code></a>\ndocs: Fix typo (<a\nhref=\"https://redirect.github.com/Peternator7/strum/issues/463\">#463</a>)</li>\n<li><a\nhref=\"https://github.com/Peternator7/strum/commit/36c051b91086b37d531c63ccf5a49266832a846d\"><code>36c051b</code></a>\nUpgrade <code>phf</code> to v0.13 (<a\nhref=\"https://redirect.github.com/Peternator7/strum/issues/465\">#465</a>)</li>\n<li><a\nhref=\"https://github.com/Peternator7/strum/commit/9328b38617dc6f4a3bc5fdac03883d3fc766cf34\"><code>9328b38</code></a>\nUse absolute paths in proc macro (<a\nhref=\"https://redirect.github.com/Peternator7/strum/issues/469\">#469</a>)</li>\n<li>Additional commits viewable in <a\nhref=\"https://github.com/Peternator7/strum/compare/v0.27.2...v0.28.0\">compare\nview</a></li>\n</ul>\n</details>\n<br />\n\n\nDependabot will resolve any conflicts with this PR as long as you don't\nalter it yourself. You can also trigger a rebase manually by commenting\n`@dependabot rebase`.\n\n[//]: # (dependabot-automerge-start)\n[//]: # (dependabot-automerge-end)\n\n---\n\n<details>\n<summary>Dependabot commands and options</summary>\n<br />\n\nYou can trigger Dependabot actions by commenting on this PR:\n- `@dependabot rebase` will rebase this PR\n- `@dependabot recreate` will recreate this PR, overwriting any edits\nthat have been made to it\n- `@dependabot show <dependency name> ignore conditions` will show all\nof the ignore conditions of the specified dependency\n- `@dependabot ignore this major version` will close this PR and stop\nDependabot creating any more for this major version (unless you reopen\nthe PR or upgrade to it yourself)\n- `@dependabot ignore this minor version` will close this PR and stop\nDependabot creating any more for this minor version (unless you reopen\nthe PR or upgrade to it yourself)\n- `@dependabot ignore this dependency` will close this PR and stop\nDependabot creating any more for this dependency (unless you reopen the\nPR or upgrade to it yourself)\n\n\n</details>\n\nSigned-off-by: dependabot[bot] <support@github.com>\nCo-authored-by: dependabot[bot] <49699333+dependabot[bot]@users.noreply.github.com>",
+          "timestamp": "2026-05-18T04:28:47+03:00",
+          "tree_id": "49e1104acf18ed7b4b9baeff7a006c7e4599585e",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/1f69645faec9738039d9457d1e9a00535d992612"
+        },
+        "date": 1779068275490,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 1211744.9985402026,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 2143370 ops/sec | factor: 0.565 | P50: 0.3us | P99: 2.0us | P99.9: 5.0us\nthreads: 1 | elapsed: 0.09s | num: 200000 | iterations: 3 | runner: seq_wr=214887 rand_rd=908322 cpu=123 composite=40683.1"
+          },
+          {
+            "name": "fillrandom",
+            "value": 684673.292002701,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 1211070 ops/sec | factor: 0.565 | P50: 0.7us | P99: 2.5us | P99.9: 6.0us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3 | runner: seq_wr=214887 rand_rd=908322 cpu=123 composite=40683.1"
+          },
+          {
+            "name": "readrandom",
+            "value": 278057.330635246,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 491836 ops/sec | factor: 0.565 | P50: 1.8us | P99: 5.5us | P99.9: 13.7us\nthreads: 1 | elapsed: 0.41s | num: 200000 | iterations: 3 | runner: seq_wr=214887 rand_rd=908322 cpu=123 composite=40683.1"
+          },
+          {
+            "name": "readseq",
+            "value": 1440675.8173293823,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 2548310 ops/sec | factor: 0.565 | P50: 0.2us | P99: 3.8us | P99.9: 7.6us\nthreads: 1 | elapsed: 0.08s | num: 200000 | iterations: 3 | runner: seq_wr=214887 rand_rd=908322 cpu=123 composite=40683.1"
+          },
+          {
+            "name": "seekrandom",
+            "value": 212096.93300714018,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 375163 ops/sec | factor: 0.565 | P50: 2.3us | P99: 6.0us | P99.9: 13.9us\nthreads: 1 | elapsed: 0.53s | num: 200000 | iterations: 3 | runner: seq_wr=214887 rand_rd=908322 cpu=123 composite=40683.1"
+          },
+          {
+            "name": "prefixscan",
+            "value": 104691.83675063252,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 185182 ops/sec | factor: 0.565 | P50: 5.0us | P99: 7.1us | P99.9: 16.9us\nthreads: 1 | elapsed: 1.08s | num: 200000 | iterations: 3 | runner: seq_wr=214887 rand_rd=908322 cpu=123 composite=40683.1"
+          },
+          {
+            "name": "overwrite",
+            "value": 689488.4920558097,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 1219588 ops/sec | factor: 0.565 | P50: 0.7us | P99: 2.6us | P99.9: 6.1us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3 | runner: seq_wr=214887 rand_rd=908322 cpu=123 composite=40683.1"
+          },
+          {
+            "name": "mergerandom",
+            "value": 414642.7485519042,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 733432 ops/sec | factor: 0.565 | P50: 0.3us | P99: 0.6us | P99.9: 3.5us\nthreads: 1 | elapsed: 0.27s | num: 200000 | iterations: 3 | runner: seq_wr=214887 rand_rd=908322 cpu=123 composite=40683.1"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 257359.83518161677,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 455226 ops/sec | factor: 0.565 | P50: 2.0us | P99: 4.5us | P99.9: 15.4us\nthreads: 1 | elapsed: 0.44s | num: 200000 | iterations: 3 | runner: seq_wr=214887 rand_rd=908322 cpu=123 composite=40683.1"
           }
         ]
       }
