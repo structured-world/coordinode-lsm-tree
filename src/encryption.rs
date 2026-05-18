@@ -155,16 +155,15 @@ impl Aes256GcmProvider {
 /// errors. This function will panic if OS entropy is unavailable.
 #[cfg(feature = "encryption")]
 fn new_chacha_rng() -> rand_chacha::ChaCha20Rng {
-    // Use rand_core re-exported by aes_gcm to avoid version-skew with a
-    // direct rand_core dependency.
-    use aes_gcm::aead::rand_core::{OsRng, SeedableRng};
+    // Pull 32 bytes from the system CSPRNG via aes-gcm's getrandom-backed
+    // `Generate` helper, then deterministically expand to a ChaCha20Rng instance.
+    // This avoids depending on a specific OsRng/SysRng path (aes-gcm 0.11 / aead 0.6
+    // moved OsRng out of the trait crate and into `getrandom::SysRng`) — `Generate`
+    // is the stable, version-skew-free entry point exposed by the AEAD ecosystem.
+    use aes_gcm::aead::{Generate, rand_core::SeedableRng};
 
-    #[expect(
-        clippy::expect_used,
-        reason = "intentionally panics if OsRng is unavailable"
-    )]
-    rand_chacha::ChaCha20Rng::from_rng(OsRng)
-        .expect("OS RNG should be available for initial CSPRNG seed")
+    let seed: [u8; 32] = <[u8; 32]>::generate();
+    rand_chacha::ChaCha20Rng::from_seed(seed)
 }
 
 /// Thread-local CSPRNG wrapper with fork-aware PID tracking.
@@ -235,16 +234,18 @@ impl EncryptionProvider for Aes256GcmProvider {
     }
 
     fn encrypt(&self, plaintext: &[u8]) -> crate::Result<Vec<u8>> {
-        use aes_gcm::AeadCore;
-        use aes_gcm::AeadInPlace;
+        use aes_gcm::AeadInOut;
+        use aes_gcm::aead::Generate;
 
-        let nonce = thread_local_rng(|rng| aes_gcm::Aes256Gcm::generate_nonce(rng));
+        let nonce: aes_gcm::aead::Nonce<aes_gcm::Aes256Gcm> = thread_local_rng(|rng| {
+            aes_gcm::aead::Nonce::<aes_gcm::Aes256Gcm>::generate_from_rng(rng)
+        });
 
         let mut buf = Vec::with_capacity(Self::NONCE_LEN + plaintext.len() + Self::TAG_LEN);
         buf.extend_from_slice(&nonce);
         buf.extend_from_slice(plaintext);
 
-        // encrypt_in_place_detached operates on buf[NONCE_LEN..] (the plaintext portion).
+        // encrypt_inout_detached operates on buf[NONCE_LEN..] (the plaintext portion).
         // Indexing is safe: buf was allocated as nonce + plaintext.
         //
         // TODO: pass block context (table_id, offset, block_type) as AAD to
@@ -256,7 +257,7 @@ impl EncryptionProvider for Aes256GcmProvider {
         )]
         let tag = self
             .cipher
-            .encrypt_in_place_detached(&nonce, b"", &mut buf[Self::NONCE_LEN..])
+            .encrypt_inout_detached(&nonce, b"", buf[Self::NONCE_LEN..].as_mut().into())
             .map_err(|_| crate::Error::Encrypt("AES-256-GCM encryption failed"))?;
 
         buf.extend_from_slice(&tag);
@@ -265,8 +266,7 @@ impl EncryptionProvider for Aes256GcmProvider {
     }
 
     fn decrypt(&self, ciphertext: &[u8]) -> crate::Result<Vec<u8>> {
-        use aes_gcm::AeadInPlace;
-        use aes_gcm::aead::generic_array::GenericArray;
+        use aes_gcm::AeadInOut;
 
         let min_len = Self::NONCE_LEN + Self::TAG_LEN;
         if ciphertext.len() < min_len {
@@ -276,19 +276,22 @@ impl EncryptionProvider for Aes256GcmProvider {
         }
 
         #[expect(clippy::indexing_slicing, reason = "length checked above")]
-        let nonce = GenericArray::from_slice(&ciphertext[..Self::NONCE_LEN]);
+        let nonce =
+            aes_gcm::aead::Nonce::<aes_gcm::Aes256Gcm>::try_from(&ciphertext[..Self::NONCE_LEN])
+                .map_err(|_| crate::Error::Decrypt("nonce slice length mismatch"))?;
 
         // Safe: ciphertext.len() >= NONCE_LEN + TAG_LEN checked above
         let tag_start = ciphertext.len() - Self::TAG_LEN;
 
         #[expect(clippy::indexing_slicing, reason = "length checked above")]
-        let tag = GenericArray::from_slice(&ciphertext[tag_start..]);
+        let tag = aes_gcm::aead::Tag::<aes_gcm::Aes256Gcm>::try_from(&ciphertext[tag_start..])
+            .map_err(|_| crate::Error::Decrypt("tag slice length mismatch"))?;
 
         #[expect(clippy::indexing_slicing, reason = "length checked above")]
         let mut buf = ciphertext[Self::NONCE_LEN..tag_start].to_vec();
 
         self.cipher
-            .decrypt_in_place_detached(nonce, b"", &mut buf, tag)
+            .decrypt_inout_detached(&nonce, b"", buf.as_mut_slice().into(), &tag)
             .map_err(|_| {
                 crate::Error::Decrypt("AES-256-GCM decryption failed (bad key or tampered data)")
             })?;
@@ -297,10 +300,12 @@ impl EncryptionProvider for Aes256GcmProvider {
     }
 
     fn encrypt_vec(&self, mut buf: Vec<u8>) -> crate::Result<Vec<u8>> {
-        use aes_gcm::AeadCore;
-        use aes_gcm::AeadInPlace;
+        use aes_gcm::AeadInOut;
+        use aes_gcm::aead::Generate;
 
-        let nonce = thread_local_rng(|rng| aes_gcm::Aes256Gcm::generate_nonce(rng));
+        let nonce: aes_gcm::aead::Nonce<aes_gcm::Aes256Gcm> = thread_local_rng(|rng| {
+            aes_gcm::aead::Nonce::<aes_gcm::Aes256Gcm>::generate_from_rng(rng)
+        });
 
         // Reserve space for nonce prefix + tag suffix in one allocation,
         // then shift plaintext right and write the nonce into the gap.
@@ -320,7 +325,7 @@ impl EncryptionProvider for Aes256GcmProvider {
         )]
         let tag = self
             .cipher
-            .encrypt_in_place_detached(&nonce, b"", &mut buf[Self::NONCE_LEN..])
+            .encrypt_inout_detached(&nonce, b"", buf[Self::NONCE_LEN..].as_mut().into())
             .map_err(|_| crate::Error::Encrypt("AES-256-GCM encryption failed"))?;
 
         buf.extend_from_slice(&tag);
@@ -329,8 +334,7 @@ impl EncryptionProvider for Aes256GcmProvider {
     }
 
     fn decrypt_vec(&self, mut buf: Vec<u8>) -> crate::Result<Vec<u8>> {
-        use aes_gcm::AeadInPlace;
-        use aes_gcm::aead::generic_array::GenericArray;
+        use aes_gcm::AeadInOut;
 
         // Error::Decrypt takes &'static str — can't include runtime lengths
         // without changing the upstream error type to accept String/Cow.
@@ -343,11 +347,13 @@ impl EncryptionProvider for Aes256GcmProvider {
 
         // Copy nonce and tag to the stack before mutating the buffer.
         #[expect(clippy::indexing_slicing, reason = "length checked above")]
-        let nonce = *GenericArray::from_slice(&buf[..Self::NONCE_LEN]);
+        let nonce = aes_gcm::aead::Nonce::<aes_gcm::Aes256Gcm>::try_from(&buf[..Self::NONCE_LEN])
+            .map_err(|_| crate::Error::Decrypt("nonce slice length mismatch"))?;
 
         let tag_start = buf.len() - Self::TAG_LEN;
         #[expect(clippy::indexing_slicing, reason = "length checked above")]
-        let tag = *GenericArray::from_slice(&buf[tag_start..]);
+        let tag = aes_gcm::aead::Tag::<aes_gcm::Aes256Gcm>::try_from(&buf[tag_start..])
+            .map_err(|_| crate::Error::Decrypt("tag slice length mismatch"))?;
 
         // Strip nonce prefix and tag suffix via copy_within + truncate
         // (single memmove, avoids Drain iterator adapter overhead).
@@ -355,7 +361,7 @@ impl EncryptionProvider for Aes256GcmProvider {
         buf.truncate(tag_start - Self::NONCE_LEN);
 
         self.cipher
-            .decrypt_in_place_detached(&nonce, b"", &mut buf, &tag)
+            .decrypt_inout_detached(&nonce, b"", buf.as_mut_slice().into(), &tag)
             .map_err(|_| {
                 crate::Error::Decrypt("AES-256-GCM decryption failed (bad key or tampered data)")
             })?;
@@ -573,7 +579,14 @@ mod tests {
             let rng = ForkAwareRng::new();
 
             // Generate a value with the current PID (ensures RNG is initialized).
-            let _ = rng.with_rng(aes_gcm::aead::rand_core::RngCore::next_u64);
+            let _ = rng.with_rng(|r| {
+                // In rand_core 0.10 the infallible `next_u32`/`next_u64`/`fill_bytes`
+                // methods moved from the (now-marker) `RngCore` trait onto the new
+                // `Rng` supertrait. ChaCha20 is a deterministic PRNG so the
+                // infallible path is correct.
+                use aes_gcm::aead::rand_core::Rng;
+                r.next_u64()
+            });
 
             // Simulate fork by setting a fake PID that differs from the real one.
             let current_pid = std::process::id();
@@ -583,7 +596,14 @@ mod tests {
 
             // Next call sees real PID != fake PID → reseeds from OsRng and
             // restores the stored PID to the real process ID.
-            let _ = rng.with_rng(aes_gcm::aead::rand_core::RngCore::next_u64);
+            let _ = rng.with_rng(|r| {
+                // In rand_core 0.10 the infallible `next_u32`/`next_u64`/`fill_bytes`
+                // methods moved from the (now-marker) `RngCore` trait onto the new
+                // `Rng` supertrait. ChaCha20 is a deterministic PRNG so the
+                // infallible path is correct.
+                use aes_gcm::aead::rand_core::Rng;
+                r.next_u64()
+            });
 
             // Deterministic assertion: PID was restored after reseed.
             assert_eq!(
