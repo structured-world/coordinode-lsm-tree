@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779068278713,
+  "lastUpdate": 1779068382586,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -6240,6 +6240,84 @@ window.BENCHMARK_DATA = {
             "value": 254712.60374911118,
             "unit": "ops/sec (normalized)",
             "extra": "raw: 464975 ops/sec | factor: 0.548 | P50: 2.0us | P99: 5.3us | P99.9: 13.7us\nthreads: 1 | elapsed: 0.43s | num: 200000 | iterations: 3 | runner: seq_wr=228831 rand_rd=937317 cpu=123 composite=41986.3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "49699333+dependabot[bot]@users.noreply.github.com",
+            "name": "dependabot[bot]",
+            "username": "dependabot[bot]"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "b441d571717624461e02c82870c31aefd7246333",
+          "message": "chore(deps): update nanoid requirement from 0.4.0 to 0.5.0 (#241)\n\n[//]: # (dependabot-start)\n⚠️  **Dependabot is rebasing this PR** ⚠️ \n\nRebasing might not happen immediately, so don't worry if this takes some\ntime.\n\nNote: if you make any changes to this PR yourself, they will take\nprecedence over the rebase.\n\n---\n\n[//]: # (dependabot-end)\n\nUpdates the requirements on\n[nanoid](https://github.com/mrdimidium/nanoid) to permit the latest\nversion.\n<details>\n<summary>Changelog</summary>\n<p><em>Sourced from <a\nhref=\"https://github.com/mrdimidium/nanoid/blob/main/CHANGELOG.md\">nanoid's\nchangelog</a>.</em></p>\n<blockquote>\n<h2>0.5.0</h2>\n<ul>\n<li>Bump <code>rand</code> to 0.9</li>\n<li>Add <code>rngs::thread_local</code> random source (<a\nhref=\"https://redirect.github.com/mrdimidium/nanoid/issues/36\">#36</a>)</li>\n<li><code>format</code> now accepts any <code>FnMut(usize) -&gt;\nVec&lt;u8&gt;</code> random generator, enabling\nseeded and stateful RNGs (<a\nhref=\"https://redirect.github.com/mrdimidium/nanoid/issues/32\">#32</a>,\n<a\nhref=\"https://redirect.github.com/mrdimidium/nanoid/issues/41\">#41</a>).\nNon-capturing <code>fn(usize) -&gt; Vec&lt;u8&gt;</code>\ncallers continue to work unchanged.</li>\n<li><code>nanoid!</code> macro size argument now accepts any expression,\nnot only a single\ntoken (<a\nhref=\"https://redirect.github.com/mrdimidium/nanoid/issues/28\">#28</a>)</li>\n<li>Specialized fast path for alphabets whose size is a power of two (<a\nhref=\"https://redirect.github.com/mrdimidium/nanoid/issues/35\">#35</a>).\nNote: for seeded RNGs paired with a power-of-two alphabet (e.g.\n<code>SAFE</code>, the\nnew <code>HEX_*</code> presets), the number of random bytes consumed per\nID has changed\n— the output for a given seed will differ from 0.4.0.</li>\n<li>Add <code>alphabet::HEX_LOWERCASE</code> and\n<code>alphabet::HEX_UPPERCASE</code> presets (<a\nhref=\"https://redirect.github.com/mrdimidium/nanoid/issues/39\">#39</a>)</li>\n<li>Optional <code>smartstring</code> feature for small-string-optimized\noutput (<a\nhref=\"https://redirect.github.com/mrdimidium/nanoid/issues/29\">#29</a>)</li>\n<li>Refreshed CI (GitHub Actions across OS matrix), drop\nTravis/AppVeyor</li>\n<li>Switched benchmarks to <code>criterion</code></li>\n</ul>\n<h2>0.4.0</h2>\n<ul>\n<li>merge <a\nhref=\"https://redirect.github.com/mrdimidium/nanoid/issues/25\">#25</a>,\nfrom <a href=\"https://github.com/fundon\"><code>@​fundon</code></a>: bump\nthe rand#0.8</li>\n<li>merge <a\nhref=\"https://redirect.github.com/mrdimidium/nanoid/issues/18\">#18</a>,\nfrom <a\nhref=\"https://github.com/svenstaro\"><code>@​svenstaro</code></a></li>\n<li>merge <a\nhref=\"https://redirect.github.com/mrdimidium/nanoid/issues/21\">#21</a>,\nfrom <a\nhref=\"https://github.com/svenstaro\"><code>@​svenstaro</code></a></li>\n<li>merge <a\nhref=\"https://redirect.github.com/mrdimidium/nanoid/issues/19\">#19</a>,\nfrom <a\nhref=\"https://github.com/svenstaro\"><code>@​svenstaro</code></a></li>\n<li>merge <a\nhref=\"https://redirect.github.com/mrdimidium/nanoid/issues/20\">#20</a>,\nfrom <a\nhref=\"https://github.com/svenstaro\"><code>@​svenstaro</code></a></li>\n<li>merge <a\nhref=\"https://redirect.github.com/mrdimidium/nanoid/issues/16\">#16</a>,\nfrom <a href=\"https://github.com/Exr0n\"><code>@​Exr0n</code></a></li>\n<li>merge <a\nhref=\"https://redirect.github.com/mrdimidium/nanoid/issues/15\">#15</a>,\nfrom <a href=\"https://github.com/Exr0n\"><code>@​Exr0n</code></a></li>\n<li>merge <a\nhref=\"https://redirect.github.com/mrdimidium/nanoid/issues/10\">#10</a>,\nfrom <a href=\"https://github.com/nbraud\"><code>@​nbraud</code></a></li>\n</ul>\n<h2>0.3.0</h2>\n<ul>\n<li>merge <a\nhref=\"https://redirect.github.com/mrdimidium/nanoid/issues/3\">#3</a>,\nfrom <a\nhref=\"https://github.com/TheIronBorn\"><code>@​TheIronBorn</code></a>:\nvarious small improvements</li>\n<li>merge <a\nhref=\"https://redirect.github.com/mrdimidium/nanoid/issues/4\">#4</a>,\nfrom <a\nhref=\"https://github.com/delimitry\"><code>@​delimitry</code></a>: fix\ntypo in function name</li>\n<li>Replace the <code>~</code> to <code>-</code> in alphabet</li>\n<li>Add the common macros</li>\n<li>Refactor structure. Remove pseudo-fast generator. Move format in\n<code>lib.rs</code></li>\n</ul>\n<h2>0.2.0</h2>\n<ul>\n<li>Added support for Windows</li>\n<li>Moved to system randomness generator</li>\n</ul>\n<h2>0.1.3</h2>\n<ul>\n<li>Renamed the safe alphabet</li>\n<li>Added readme from rustdoc</li>\n</ul>\n<h2>0.1.2</h2>\n<ul>\n<li>Updated the random number engine.</li>\n<li>Fixed bugs in documentation.</li>\n</ul>\n<h2>0.1.1</h2>\n<ul>\n<li>Integrated performance tests</li>\n<li>Added example of custom random number generator.</li>\n</ul>\n<!-- raw HTML omitted -->\n</blockquote>\n<p>... (truncated)</p>\n</details>\n<details>\n<summary>Commits</summary>\n<ul>\n<li><a\nhref=\"https://github.com/mrdimidium/nanoid/commit/359c02d6f87260bd431e19374ccfca2890fdab1e\"><code>359c02d</code></a>\nchore: 0.5.0 release</li>\n<li><a\nhref=\"https://github.com/mrdimidium/nanoid/commit/f0ad07fc16b96b4c00d76fa10853fa377ad8ee05\"><code>f0ad07f</code></a>\n<a\nhref=\"https://redirect.github.com/mrdimidium/nanoid/issues/39\">#39</a>:\nAdd hex alphabets</li>\n<li><a\nhref=\"https://github.com/mrdimidium/nanoid/commit/7f961f211fa6a1162bb0fd6bd5c6ff195005ec00\"><code>7f961f2</code></a>\nMerge pull request <a\nhref=\"https://redirect.github.com/mrdimidium/nanoid/issues/35\">#35</a>\nfrom tmccombs/fast-impl</li>\n<li><a\nhref=\"https://github.com/mrdimidium/nanoid/commit/91a79fc9f11e463109dcba342d684ffdd5291862\"><code>91a79fc</code></a>\nUpdate fast impl for actual format signature</li>\n<li><a\nhref=\"https://github.com/mrdimidium/nanoid/commit/ed800e971f01b589cad8d2c8b09973f8eacfd1a1\"><code>ed800e9</code></a>\nfeat: Use specialized implementation for alphabets with size 2^n</li>\n<li><a\nhref=\"https://github.com/mrdimidium/nanoid/commit/fef0b2eace7dbda294cca78fd5c8e96c188a00bc\"><code>fef0b2e</code></a>\nMerge pull request <a\nhref=\"https://redirect.github.com/mrdimidium/nanoid/issues/41\">#41</a>\nfrom sidarth164/sid/fnmut</li>\n<li><a\nhref=\"https://github.com/mrdimidium/nanoid/commit/61e0606f9c558171238aa9caf29d02bf90fb7806\"><code>61e0606</code></a>\ndocs: update README and added an example</li>\n<li><a\nhref=\"https://github.com/mrdimidium/nanoid/commit/2004ff99bbe549e7323ac01bd43070aa1f11c33e\"><code>2004ff9</code></a>\nfeat: support passing mutable functions as random generators</li>\n<li><a\nhref=\"https://github.com/mrdimidium/nanoid/commit/3d405c51cd6932318cb5766d0a3adab0c0c704f5\"><code>3d405c5</code></a>\nFix ci for prs</li>\n<li><a\nhref=\"https://github.com/mrdimidium/nanoid/commit/7011b102d07f7f2ba2f7c96d0b196a9a349dc9cd\"><code>7011b10</code></a>\nFixup readme, delete old example</li>\n<li>Additional commits viewable in <a\nhref=\"https://github.com/mrdimidium/nanoid/compare/v0.4.0...v0.5.0\">compare\nview</a></li>\n</ul>\n</details>\n<br />\n\n\nDependabot will resolve any conflicts with this PR as long as you don't\nalter it yourself. You can also trigger a rebase manually by commenting\n`@dependabot rebase`.\n\n[//]: # (dependabot-automerge-start)\n[//]: # (dependabot-automerge-end)\n\n---\n\n<details>\n<summary>Dependabot commands and options</summary>\n<br />\n\nYou can trigger Dependabot actions by commenting on this PR:\n- `@dependabot rebase` will rebase this PR\n- `@dependabot recreate` will recreate this PR, overwriting any edits\nthat have been made to it\n- `@dependabot show <dependency name> ignore conditions` will show all\nof the ignore conditions of the specified dependency\n- `@dependabot ignore this major version` will close this PR and stop\nDependabot creating any more for this major version (unless you reopen\nthe PR or upgrade to it yourself)\n- `@dependabot ignore this minor version` will close this PR and stop\nDependabot creating any more for this minor version (unless you reopen\nthe PR or upgrade to it yourself)\n- `@dependabot ignore this dependency` will close this PR and stop\nDependabot creating any more for this dependency (unless you reopen the\nPR or upgrade to it yourself)\n\n\n</details>\n\nSigned-off-by: dependabot[bot] <support@github.com>\nCo-authored-by: dependabot[bot] <49699333+dependabot[bot]@users.noreply.github.com>",
+          "timestamp": "2026-05-18T04:31:53+03:00",
+          "tree_id": "3b793c56a6b6deb743d2a2eab930b2d0f9db6564",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/b441d571717624461e02c82870c31aefd7246333"
+        },
+        "date": 1779068381053,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 879633.0132183491,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 1980414 ops/sec | factor: 0.444 | P50: 0.4us | P99: 1.7us | P99.9: 3.6us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3 | runner: seq_wr=360190 rand_rd=1167997 cpu=117 composite=51782.4"
+          },
+          {
+            "name": "fillrandom",
+            "value": 474664.280043474,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 1068663 ops/sec | factor: 0.444 | P50: 0.8us | P99: 2.3us | P99.9: 5.8us\nthreads: 1 | elapsed: 0.19s | num: 200000 | iterations: 3 | runner: seq_wr=360190 rand_rd=1167997 cpu=117 composite=51782.4"
+          },
+          {
+            "name": "readrandom",
+            "value": 238267.99056785816,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 536439 ops/sec | factor: 0.444 | P50: 1.7us | P99: 4.7us | P99.9: 9.6us\nthreads: 1 | elapsed: 0.37s | num: 200000 | iterations: 3 | runner: seq_wr=360190 rand_rd=1167997 cpu=117 composite=51782.4"
+          },
+          {
+            "name": "readseq",
+            "value": 1419492.544218858,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 3195858 ops/sec | factor: 0.444 | P50: 0.2us | P99: 3.2us | P99.9: 5.5us\nthreads: 1 | elapsed: 0.06s | num: 200000 | iterations: 3 | runner: seq_wr=360190 rand_rd=1167997 cpu=117 composite=51782.4"
+          },
+          {
+            "name": "seekrandom",
+            "value": 161851.69362592493,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 364394 ops/sec | factor: 0.444 | P50: 2.3us | P99: 5.9us | P99.9: 12.0us\nthreads: 1 | elapsed: 0.55s | num: 200000 | iterations: 3 | runner: seq_wr=360190 rand_rd=1167997 cpu=117 composite=51782.4"
+          },
+          {
+            "name": "prefixscan",
+            "value": 97001.06692143131,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 218389 ops/sec | factor: 0.444 | P50: 4.3us | P99: 5.8us | P99.9: 10.9us\nthreads: 1 | elapsed: 0.92s | num: 200000 | iterations: 3 | runner: seq_wr=360190 rand_rd=1167997 cpu=117 composite=51782.4"
+          },
+          {
+            "name": "overwrite",
+            "value": 481759.01556351944,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 1084636 ops/sec | factor: 0.444 | P50: 0.8us | P99: 2.3us | P99.9: 5.5us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3 | runner: seq_wr=360190 rand_rd=1167997 cpu=117 composite=51782.4"
+          },
+          {
+            "name": "mergerandom",
+            "value": 361734.40903849294,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 814412 ops/sec | factor: 0.444 | P50: 0.4us | P99: 0.6us | P99.9: 3.8us\nthreads: 1 | elapsed: 0.25s | num: 200000 | iterations: 3 | runner: seq_wr=360190 rand_rd=1167997 cpu=117 composite=51782.4"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 197713.86889063963,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 445135 ops/sec | factor: 0.444 | P50: 2.0us | P99: 4.4us | P99.9: 9.6us\nthreads: 1 | elapsed: 0.45s | num: 200000 | iterations: 3 | runner: seq_wr=360190 rand_rd=1167997 cpu=117 composite=51782.4"
           }
         ]
       }
