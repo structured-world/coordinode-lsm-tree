@@ -663,6 +663,82 @@ mod tests {
         }
     }
 
+    /// Shared boundary-walk used by every per-kernel test: for each `total_len`
+    /// in the SIMD-stride-boundary set, flip the byte at `mismatch_at` (or none,
+    /// at `mismatch_at == total_len`) and assert the kernel under test agrees
+    /// with the byte-by-byte reference, both at full and asymmetric lengths.
+    fn assert_kernel_matches_reference<F: Fn(&[u8], &[u8]) -> usize>(label: &str, kernel: F) {
+        for total_len in [
+            0_usize, 1, 7, 8, 9, 15, 16, 17, 31, 32, 33, 63, 64, 127, 128, 255, 256,
+        ] {
+            for mismatch_at in 0..=total_len {
+                let mut a = vec![0xAA; total_len];
+                let mut b = a.clone();
+                if mismatch_at < total_len {
+                    #[expect(
+                        clippy::expect_used,
+                        reason = "test: mismatch_at < total_len = b.len() guarantees in-bounds"
+                    )]
+                    {
+                        *b.get_mut(mismatch_at).expect("in bounds") ^= 0xFF;
+                    }
+                }
+                let want = lsp_reference(&a, &b);
+                assert_eq!(
+                    want,
+                    kernel(&a, &b),
+                    "{label} @ len={total_len} mismatch_at={mismatch_at}"
+                );
+
+                // Asymmetric: truncate `a` to `mismatch_at`, leave `b` at full length.
+                a.truncate(mismatch_at);
+                let want_short = lsp_reference(&a, &b);
+                assert_eq!(
+                    want_short,
+                    kernel(&a, &b),
+                    "{label} asym len={mismatch_at} vs {total_len}"
+                );
+            }
+        }
+    }
+
+    /// Direct test for the SSE2 16-byte kernel. Required because CI `x86_64` runners
+    /// have AVX2 → the dispatch path never hits `lsp_sse2` and coverage would be
+    /// 0% even though all dispatched tests pass. Calling the kernel directly
+    /// guarantees the SSE2-path exercise the boundary cases.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn lsp_sse2_matches_reference_on_boundaries() {
+        // SAFETY: SSE2 is mandatory in the x86_64 ISA baseline.
+        assert_kernel_matches_reference("sse2", |a, b| unsafe { lsp_sse2(a, b) });
+    }
+
+    /// Direct test for the AVX2 32-byte kernel, gated by runtime CPU detection.
+    /// Without this, AVX2 lines are only exercised via the dispatched path, which
+    /// is fine for coverage on AVX2-capable runners — but the direct test makes
+    /// the AVX2 contract explicit (matches reference on every boundary case).
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn lsp_avx2_matches_reference_on_boundaries() {
+        if !std::is_x86_feature_detected!("avx2") {
+            // No AVX2 on this host — nothing to verify directly.
+            return;
+        }
+        // SAFETY: AVX2 availability just verified via runtime CPU feature detection.
+        assert_kernel_matches_reference("avx2", |a, b| unsafe { lsp_avx2(a, b) });
+    }
+
+    /// Direct test for the NEON 16-byte kernel on LE aarch64. Required because
+    /// CI codecov runs on `x86_64` Linux — the NEON kernel never executes there
+    /// even when cross-compiling, but this test gates onto LE aarch64 runners
+    /// (e.g. macos-latest on M1/M2) to keep the path covered.
+    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+    #[test]
+    fn lsp_neon_matches_reference_on_boundaries() {
+        // SAFETY: NEON is mandatory in the ARMv8 baseline (`target_arch = "aarch64"`).
+        assert_kernel_matches_reference("neon", |a, b| unsafe { lsp_neon(a, b) });
+    }
+
     // All implementations must agree with the byte-by-byte reference for any input —
     // proptest version with random byte patterns up to 1 KiB.
     proptest::proptest! {
