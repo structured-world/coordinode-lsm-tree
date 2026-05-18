@@ -15,6 +15,14 @@ env:
   UPSTREAM_URL: https://github.com/fjall-rs/lsm-tree.git
   UPSTREAM_REPO: fjall-rs/lsm-tree
   STATE_FILE: .github/state/last-upstream-sync.txt
+  # All implicit-target `gh` calls (label create, pr list, pr create,
+  # issue create) must target OUR repo. Without GH_REPO set, gh infers
+  # the target from git remotes — and we add `upstream` (fjall-rs) as
+  # a remote in the first step, which can take precedence and route
+  # write operations to a repo where our GITHUB_TOKEN has no access
+  # (403). `gh api repos/${UPSTREAM_REPO}/issues/${NUM}` calls use an
+  # explicit path so they're unaffected by GH_REPO.
+  GH_REPO: ${{ github.repository }}
 
 jobs:
   check-upstream:
