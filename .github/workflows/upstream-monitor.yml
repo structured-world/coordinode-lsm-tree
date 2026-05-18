@@ -549,14 +549,26 @@ jobs:
           fi
 
           # Mark this exact upstream HEAD as "considered" — applies on
-          # BOTH branches (successful merge PR + conflict issue). For a
-          # fork with permanent divergences (renames, cherry-pick-only
-          # relationships), the conflict path is the steady state and
+          # both routes (successful merge / problem report). For a fork
+          # with permanent divergences (renames, cherry-pick-only
+          # relationships), the conflict route is the steady state and
           # without this tag every cron run would refile the same issue.
           # The tag stays regardless of how the maintainer dispositions
-          # the surfaced artifact. `|| true` because a tag collision on
-          # an explicit force=true re-run is harmless.
-          git tag "$CONSIDERED_TAG" "${UPSTREAM_REMOTE}/main"
+          # the surfaced artifact.
+          #
+          # IMPORTANT: tag points at `origin/main` (our own HEAD), not
+          # `upstream/main`. The upstream short SHA lives only in the
+          # tag NAME. Pointing the tag at upstream's HEAD would make
+          # GitHub reject the push when upstream's commits include
+          # workflow file changes — the default GITHUB_TOKEN has no
+          # `workflows: write` scope, so any ref that surfaces unseen
+          # workflow content fails server-side. Pointing at our own
+          # main avoids that check entirely; the tag is a marker, the
+          # target commit is irrelevant.
+          #
+          # `|| true` because a tag collision on an explicit
+          # force=true re-run is harmless.
+          git tag "$CONSIDERED_TAG" origin/main
           git push origin "$CONSIDERED_TAG" || true
 
       - name: Check for merged feature branches
