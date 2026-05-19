@@ -316,6 +316,46 @@ pub trait Fs: Send + Sync + 'static {
     /// Returns an I/O error if the existence of `path` cannot be determined
     /// (for example, due to permission issues or transient backend failures).
     fn exists(&self, path: &Path) -> io::Result<bool>;
+
+    /// Creates a hard link `dst` that refers to the same inode as `src`.
+    ///
+    /// Used by [`Tree::create_checkpoint`](crate::Tree::create_checkpoint)
+    /// to snapshot SST and blob files in O(1) per file without duplicating
+    /// data on disk. After the link is created, deleting either path leaves
+    /// the other intact; the inode is reclaimed only after the last link
+    /// is removed.
+    ///
+    /// # Cross-filesystem fallback
+    ///
+    /// Hard links cannot span filesystems. Implementations that detect a
+    /// cross-device situation (Unix `EXDEV`) MUST fall back to a byte copy
+    /// so that callers can treat `hard_link` as always-succeeding when the
+    /// destination filesystem is writable. The fallback emits a warning
+    /// via [`log::warn`] so operators can notice unexpected copies.
+    ///
+    /// In-memory backends ([`MemFs`](crate::fs::MemFs)) do not have inodes;
+    /// they implement this as a byte copy that produces an independent file
+    /// with the same contents.
+    ///
+    /// # Default implementation
+    ///
+    /// Returns [`io::ErrorKind::Unsupported`]. Backends that want to
+    /// participate in [`Tree::create_checkpoint`](crate::Tree::create_checkpoint)
+    /// MUST override this method; otherwise checkpoint will surface
+    /// `Unsupported` and refuse to snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if `src` does not exist, `dst` already exists,
+    /// the destination's parent directory is missing, or the fallback copy
+    /// fails.
+    fn hard_link(&self, src: &Path, dst: &Path) -> io::Result<()> {
+        let _ = (src, dst);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Fs::hard_link is not implemented for this backend",
+        ))
+    }
 }
 
 /// Opens a section of an sfa archive for buffered reading via the [`Fs`] trait.

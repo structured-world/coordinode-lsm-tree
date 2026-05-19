@@ -844,7 +844,17 @@ impl Table {
 
             #[cfg(zstd_any)]
             zstd_dictionary,
+
+            deletion_pause: std::sync::OnceLock::new(),
         })))
+    }
+
+    /// Installs the tree-wide deletion pause used by checkpoints.
+    ///
+    /// Idempotent: a second call is a no-op. Called by the owning tree
+    /// after recovery and after compaction registers freshly-built tables.
+    pub(crate) fn install_deletion_pause(&self, pause: Arc<crate::deletion_pause::DeletionPause>) {
+        let _ = self.0.deletion_pause.set(pause);
     }
 
     #[must_use]

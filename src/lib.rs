@@ -102,6 +102,11 @@ mod any_tree;
 
 mod abstract_tree;
 
+pub(crate) mod deletion_pause;
+
+#[doc(hidden)]
+pub mod checkpoint;
+
 #[doc(hidden)]
 pub mod blob_tree;
 
@@ -242,7 +247,7 @@ pub use pinnable_slice::PinnableSlice;
 pub use write_batch::WriteBatch;
 
 pub use {
-    abstract_tree::AbstractTree,
+    abstract_tree::{AbstractTree, CheckpointInfo},
     any_tree::AnyTree,
     blob_tree::BlobTree,
     cache::Cache,

@@ -15,6 +15,27 @@ pub type RangeItem = crate::Result<KvPair>;
 
 type FlushToTablesResult = (Vec<Table>, Option<Vec<BlobFile>>);
 
+/// Summary of a checkpoint produced by
+/// [`AbstractTree::create_checkpoint`].
+///
+/// All byte counts are *logical* file sizes — hard links share the
+/// underlying inode storage, so a checkpoint's marginal disk usage is
+/// typically zero until the original files are compacted away.
+#[derive(Debug, Clone, Copy)]
+pub struct CheckpointInfo {
+    /// Number of SST files captured.
+    pub sst_files: usize,
+    /// Number of blob (value-log) files captured. Always `0` for a
+    /// standard [`Tree`].
+    pub blob_files: usize,
+    /// Sum of the logical file sizes of every captured SST + blob.
+    pub total_bytes: u64,
+    /// The version ID embedded in the checkpoint's `current` pointer.
+    pub version_id: u64,
+    /// The maximum visible sequence number at checkpoint time.
+    pub seqno: SeqNo,
+}
+
 // Sealed on purpose: this trait is still public as a consumer-side bound
 // (`&impl AbstractTree`), but external implementations are no longer part of
 // the supported extension surface. Internal flush/version hooks keep evolving
@@ -61,6 +82,34 @@ pub trait AbstractTree: sealed::Sealed {
 
     #[doc(hidden)]
     fn get_version_history_lock(&self) -> RwLockWriteGuard<'_, crate::version::SuperVersions>;
+
+    /// Creates a hard-linked checkpoint of the tree's on-disk state in
+    /// `target_path` for point-in-time recovery (PITR) backup.
+    ///
+    /// The checkpoint is a fully functional tree that can be opened
+    /// independently via [`Config::open`](crate::Config::open). All SST files
+    /// (and blob files, for [`BlobTree`]) are hard-linked rather than
+    /// copied, so the operation is O(1) per file and consumes zero
+    /// additional disk space until the original files are compacted away
+    /// — at which point the inode is kept alive by the checkpoint link.
+    ///
+    /// While the checkpoint is being built, compaction continues normally
+    /// but the physical removal of obsolete files is deferred until the
+    /// checkpoint hard-links are in place. This is implemented by an
+    /// internal reference-counted deletion gate; callers do not have to
+    /// pause compaction themselves.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - the active memtable could not be flushed,
+    /// - `target_path` already exists (to prevent accidental overwrites),
+    /// - a hard link / copy fall-back could not be created, or
+    /// - the manifest / version pointer files could not be replicated.
+    ///
+    /// On error the checkpoint directory may contain a partial subset of
+    /// the live files; callers are expected to remove it.
+    fn create_checkpoint(&self, target_path: &std::path::Path) -> crate::Result<CheckpointInfo>;
 
     /// Seals the active memtable and flushes to table(s).
     ///

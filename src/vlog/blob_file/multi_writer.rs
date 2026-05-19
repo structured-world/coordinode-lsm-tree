@@ -204,6 +204,8 @@ impl MultiWriter {
                         passthrough_compression
                     },
                 },
+                fs: fs.clone(),
+                deletion_pause: std::sync::OnceLock::new(),
             }));
 
             Ok(Some(blob_file))

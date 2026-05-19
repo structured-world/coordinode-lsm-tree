@@ -620,6 +620,47 @@ impl Fs for MemFs {
         let state = read_state(&self.state)?;
         Ok(state.files.contains_key(path) || state.dirs.contains(path))
     }
+
+    fn hard_link(&self, src: &Path, dst: &Path) -> io::Result<()> {
+        ensure_non_empty_path(src)?;
+        ensure_non_empty_path(dst)?;
+        let mut state = write_state(&self.state)?;
+
+        ensure_parent_dir(dst, &state)?;
+
+        if state.dirs.contains(dst) {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("destination is a directory: {}", dst.display()),
+            ));
+        }
+        if state.files.contains_key(dst) {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("destination already exists: {}", dst.display()),
+            ));
+        }
+
+        // MemFs has no inode concept — produce an independent copy so the
+        // destination has the same byte contents but its own backing buffer.
+        // This matches the documented [`Fs::hard_link`] semantics for
+        // in-memory backends.
+        let bytes = {
+            let src_data = state.files.get(src).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("source file not found: {}", src.display()),
+                )
+            })?;
+            let guard = lock(src_data)?;
+            guard.clone()
+        };
+
+        state
+            .files
+            .insert(dst.to_path_buf(), Arc::new(Mutex::new(bytes)));
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1238,6 +1279,64 @@ mod tests {
             .rename(Path::new("/dir/file"), Path::new(""))
             .unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        Ok(())
+    }
+
+    #[test]
+    fn hard_link_creates_independent_copy() -> io::Result<()> {
+        let fs = MemFs::new();
+        fs.create_dir_all(Path::new("/dir"))?;
+
+        let src = Path::new("/dir/src.bin");
+        let dst = Path::new("/dir/dst.bin");
+        let opts = FsOpenOptions::new().write(true).create(true);
+        let mut file = fs.open(src, &opts)?;
+        file.write_all(b"checkpoint")?;
+        drop(file);
+
+        fs.hard_link(src, dst)?;
+
+        // Both exist and contain the same bytes.
+        let opts = FsOpenOptions::new().read(true);
+        let mut buf = String::new();
+        fs.open(src, &opts)?.read_to_string(&mut buf)?;
+        assert_eq!(buf, "checkpoint");
+        let mut buf = String::new();
+        fs.open(dst, &opts)?.read_to_string(&mut buf)?;
+        assert_eq!(buf, "checkpoint");
+
+        // Removing the source leaves the destination intact.
+        fs.remove_file(src)?;
+        assert!(!fs.exists(src)?);
+        assert!(fs.exists(dst)?);
+        Ok(())
+    }
+
+    #[test]
+    fn hard_link_rejects_existing_destination() -> io::Result<()> {
+        let fs = MemFs::new();
+        fs.create_dir_all(Path::new("/dir"))?;
+
+        let opts = FsOpenOptions::new().write(true).create(true);
+        fs.open(Path::new("/dir/a"), &opts)?;
+        fs.open(Path::new("/dir/b"), &opts)?;
+
+        let err = fs
+            .hard_link(Path::new("/dir/a"), Path::new("/dir/b"))
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+        Ok(())
+    }
+
+    #[test]
+    fn hard_link_rejects_missing_source() -> io::Result<()> {
+        let fs = MemFs::new();
+        fs.create_dir_all(Path::new("/dir"))?;
+
+        let err = fs
+            .hard_link(Path::new("/dir/missing"), Path::new("/dir/dst"))
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
         Ok(())
     }
 }

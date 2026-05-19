@@ -204,6 +204,13 @@ impl Fs for IoUringFs {
     fn exists(&self, path: &Path) -> io::Result<bool> {
         path.try_exists()
     }
+
+    fn hard_link(&self, src: &Path, dst: &Path) -> io::Result<()> {
+        // Hard linking is a metadata-only operation; io_uring offers no
+        // throughput benefit, so delegate to [`StdFs`] for the EXDEV
+        // fallback logic.
+        super::StdFs.hard_link(src, dst)
+    }
 }
 
 // ---------------------------------------------------------------------------

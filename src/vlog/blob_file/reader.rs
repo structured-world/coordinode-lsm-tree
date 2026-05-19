@@ -1049,6 +1049,8 @@ mod tests {
             is_deleted: AtomicBool::new(false),
             checksum: crate::Checksum::from_raw(0),
             file_accessor: FileAccessor::File(Arc::new(file2)),
+            fs: Arc::new(crate::fs::StdFs),
+            deletion_pause: std::sync::OnceLock::new(),
         }));
 
         let reader = Reader::new(&blob_file, &file);

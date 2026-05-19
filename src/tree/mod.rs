@@ -172,6 +172,24 @@ impl AbstractTree for Tree {
         0
     }
 
+    fn create_checkpoint(
+        &self,
+        target_path: &std::path::Path,
+    ) -> crate::Result<crate::CheckpointInfo> {
+        crate::checkpoint::run_checkpoint(
+            self,
+            &crate::checkpoint::CheckpointParams {
+                target_root: target_path,
+                target_fs: &self.config.fs,
+                src_root: &self.config.path,
+                src_fs: &self.config.fs,
+                deletion_pause: &self.deletion_pause,
+                visible_seqno: &self.config.visible_seqno,
+                include_blobs: false,
+            },
+        )
+    }
+
     fn print_trace(&self, key: &[u8]) -> crate::Result<()> {
         #[expect(clippy::expect_used, reason = "lock is expected to not be poisoned")]
         let super_version = self
@@ -546,6 +564,18 @@ impl AbstractTree for Tree {
             tables.len(),
             blob_files.map(<[BlobFile]>::len).unwrap_or_default(),
         );
+
+        // Wire the tree-wide deletion pause into every fresh table / blob
+        // file so an in-flight checkpoint defers their cleanup if they
+        // later get marked `is_deleted` by compaction.
+        for table in tables {
+            table.install_deletion_pause(Arc::clone(&self.deletion_pause));
+        }
+        if let Some(bfs) = blob_files {
+            for bf in bfs {
+                bf.install_deletion_pause(Arc::clone(&self.deletion_pause));
+            }
+        }
 
         #[expect(clippy::expect_used, reason = "lock is expected to not be poisoned")]
         let mut _compaction_state = self.compaction_state.lock().expect("lock is poisoned");
@@ -1878,6 +1908,8 @@ impl Tree {
 
         let comparator = config.comparator.clone();
 
+        let deletion_pause = crate::deletion_pause::DeletionPause::new();
+
         let inner = TreeInner {
             id: tree_id,
             memtable_id_counter: SequenceNumberCounter::new(1),
@@ -1889,10 +1921,35 @@ impl Tree {
             major_compaction_lock: RwLock::default(),
             flush_lock: Mutex::default(),
             compaction_state: Arc::new(Mutex::new(CompactionState::default())),
+            deletion_pause: Arc::clone(&deletion_pause),
 
             #[cfg(feature = "metrics")]
             metrics,
         };
+
+        // Install the pause on every recovered table / blob file so their
+        // Drop impls consult it when a checkpoint is in flight. Snapshot
+        // the Arc handles into owned collections so the read lock is
+        // released before iterating (avoids `significant_drop_tightening`).
+        #[expect(clippy::expect_used, reason = "lock is expected to not be poisoned")]
+        let (recovered_tables, recovered_blobs): (Vec<Table>, Vec<BlobFile>) = inner
+            .version_history
+            .read()
+            .map(|lock| {
+                let version = &lock.latest_version().version;
+                (
+                    version.iter_tables().cloned().collect(),
+                    version.blob_files.iter().cloned().collect(),
+                )
+            })
+            .expect("lock is poisoned");
+
+        for table in &recovered_tables {
+            table.install_deletion_pause(Arc::clone(&deletion_pause));
+        }
+        for blob_file in &recovered_blobs {
+            blob_file.install_deletion_pause(Arc::clone(&deletion_pause));
+        }
 
         Ok(Self(Arc::new(inner)))
     }
