@@ -121,6 +121,17 @@ where
     }
 
     /// Returns `true` if the key may be present.
+    ///
+    /// MUST be paired with [`BurrBuilder::build`] (the key-based build
+    /// path): the probe hashes `key` via the filter's `BuildHasher` and
+    /// looks the hash up under the same hashing the builder used.
+    /// Calling `contains(&k)` on a filter built via
+    /// [`BurrBuilder::build_from_hashes`] is NOT valid — those filters
+    /// were built from caller-supplied u64 hashes that, in general, do
+    /// not equal `BuildHasher::hash_one(&k)`, and the probe will report
+    /// inserted keys as absent (false negative). Use
+    /// [`Self::contains_hash`] with the same u64 hashing the builder
+    /// used in that case.
     pub fn contains<Q: Hash + ?Sized>(&self, key: &Q) -> bool {
         let mut scratch = self.new_scratch();
         self.contains_in(key, &mut scratch)
@@ -190,6 +201,12 @@ where
     }
 
     /// Allocation-free probe using a caller-provided scratch.
+    ///
+    /// Same pairing contract as [`Self::contains`]: only valid when
+    /// the filter was built via [`BurrBuilder::build`] (key-based
+    /// path). A filter built via [`BurrBuilder::build_from_hashes`]
+    /// must be probed with [`Self::contains_hash`] instead, otherwise
+    /// the probe reports inserted keys as absent.
     ///
     /// Walks layers descend-only: for each layer, recompute the equation
     /// under that layer's seed+m and check the per-block threshold. If

@@ -73,8 +73,12 @@ impl PartitionedFilterWriter {
     fn spill_filter_partition(&mut self, key: &UserKey) -> crate::Result<()> {
         let hash_count = self.bloom_hash_buffer.len();
         let partition_index = self.tli_handles.len();
-        let filter_bytes = build_burr_filter_bytes(self.bloom_policy, &self.bloom_hash_buffer)?;
-        self.bloom_hash_buffer.clear();
+        // mem::take moves the accumulated hash buffer into the BuRR
+        // builder so it can be consumed during the per-layer
+        // recursion, avoiding a to_vec() clone of the entire buffer
+        // for every partition spill.
+        let hashes = std::mem::take(&mut self.bloom_hash_buffer);
+        let filter_bytes = build_burr_filter_bytes(self.bloom_policy, hashes)?;
 
         // An empty BuRR build result means the policy is inactive for
         // this key population (e.g. fpr <= 0 or bpk out of [1, 64]).

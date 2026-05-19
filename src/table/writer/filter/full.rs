@@ -106,7 +106,9 @@ impl<W: std::io::Write + std::io::Seek> FilterWriter<W> for FullFilterWriter {
         // bailing out would leave an empty unfinished section in the
         // output and desynchronise the reported block count from what
         // was actually written.
-        let filter_bytes = build_burr_filter_bytes(self.bloom_policy, &self.bloom_hash_buffer)?;
+        // `finish` consumes `Box<Self>`, so we can move `bloom_hash_buffer`
+        // into the BuRR builder directly — no `to_vec()` clone.
+        let filter_bytes = build_burr_filter_bytes(self.bloom_policy, self.bloom_hash_buffer)?;
 
         if filter_bytes.is_empty() {
             log::trace!("BuRR policy produced empty filter — skipping block write");

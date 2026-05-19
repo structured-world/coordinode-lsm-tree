@@ -86,7 +86,23 @@ where
     /// already hashed every key with xxh3 for filter-block indexing
     /// and pipes those u64s directly into BuRR.
     pub fn build_from_hashes(&self, hashes: &[u64]) -> Result<BurrFilter<S>, BurrBuildError> {
-        let mut remaining: Vec<u64> = hashes.to_vec();
+        // Borrowed-slice variant — copies the input into the per-layer
+        // working buffer. Use [`Self::build_from_hashes_owned`] to move
+        // an existing `Vec<u64>` instead, avoiding the up-front clone
+        // on large filter partitions.
+        self.build_from_hashes_owned(hashes.to_vec())
+    }
+
+    /// Same as [`Self::build_from_hashes`] but consumes a caller-owned
+    /// `Vec<u64>` directly, saving the up-front `to_vec()` clone. The
+    /// filter writer uses this on its accumulated `bloom_hash_buffer`
+    /// so per-partition construction doesn't pay the copy cost twice
+    /// (once here, once during the per-layer recursion).
+    pub fn build_from_hashes_owned(
+        &self,
+        hashes: Vec<u64>,
+    ) -> Result<BurrFilter<S>, BurrBuildError> {
+        let mut remaining: Vec<u64> = hashes;
         let mut layers: Vec<BurrLayer<S>> = Vec::with_capacity(usize::from(self.params.max_layers));
 
         for layer_idx in 0..self.params.max_layers {

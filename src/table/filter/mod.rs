@@ -92,9 +92,12 @@ impl BloomConstructionPolicy {
 /// Returns an empty `Vec` if `hashes` is empty or the policy parameters
 /// are invalid for `n = hashes.len()` — callers should treat that as
 /// "no filter for this block".
+///
+/// Consumes `hashes` so the writer's accumulated `bloom_hash_buffer` can
+/// be `mem::take`n straight in without a `to_vec()` copy at the boundary.
 pub(crate) fn build_burr_filter_bytes(
     policy: BloomConstructionPolicy,
-    hashes: &[u64],
+    hashes: Vec<u64>,
 ) -> crate::Result<Vec<u8>> {
     if hashes.is_empty() {
         return Ok(Vec::new());
@@ -107,7 +110,7 @@ pub(crate) fn build_burr_filter_bytes(
         log::error!("BuRR builder init failed: {e:?}");
         crate::Error::Unrecoverable
     })?;
-    let filter = builder.build_from_hashes(hashes).map_err(|e| {
+    let filter = builder.build_from_hashes_owned(hashes).map_err(|e| {
         log::error!("BuRR build_from_hashes failed: {e:?}");
         crate::Error::Unrecoverable
     })?;
@@ -144,7 +147,7 @@ mod tests {
     #[test]
     fn build_burr_filter_bytes_empty_returns_empty() {
         let policy = BloomConstructionPolicy::BitsPerKey(10.0);
-        let bytes = build_burr_filter_bytes(policy, &[]).unwrap();
+        let bytes = build_burr_filter_bytes(policy, Vec::new()).unwrap();
         assert!(bytes.is_empty());
     }
 
@@ -155,7 +158,7 @@ mod tests {
         let hashes: Vec<u64> = (0..1_000_u64)
             .map(|i| crate::hash::hash64(&i.to_le_bytes()))
             .collect();
-        let bytes = build_burr_filter_bytes(policy, &hashes).unwrap();
+        let bytes = build_burr_filter_bytes(policy, hashes.clone()).unwrap();
         assert!(!bytes.is_empty());
         let reader = BurrFilterReader::new(&bytes).expect("reader");
         for h in &hashes {
@@ -250,7 +253,7 @@ mod extra_tests {
         let hashes: Vec<u64> = (0..10)
             .map(|i: u64| crate::hash::hash64(&i.to_le_bytes()))
             .collect();
-        let bytes = build_burr_filter_bytes(policy, &hashes).unwrap();
+        let bytes = build_burr_filter_bytes(policy, hashes).unwrap();
         assert!(bytes.is_empty());
     }
 }
