@@ -1,6 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2025-present, Structured World Foundation
-// This source code is licensed under the Apache 2.0 License
-// (found in the LICENSE-APACHE file in the repository)
 
 //! Pure Rust zstd backend via the `structured-zstd` crate.
 //!
