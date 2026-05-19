@@ -105,7 +105,15 @@ jobs:
                   <(git tag -l --merged "${UPSTREAM_REMOTE}/main" | sort -u)) \
               | grep -E "$SEMVER_RE" | sort -V | tail -1 || true)
           fi
-          UPSTREAM_HEAD_SHORT=$(git rev-parse --short "${UPSTREAM_REMOTE}/main")
+          # Pin abbreviation length: `git rev-parse --short` (no `=N`) returns
+          # the shortest currently-unique prefix, which lengthens as the
+          # repository grows. Because UPSTREAM_HEAD_SHORT is the stable
+          # identifier in PR/issue titles AND the skip-check search query,
+          # a length drift between runs would fail to match the previous
+          # artifact and re-surface the same upstream HEAD as "new".
+          # 12 chars is well above the collision threshold for any
+          # foreseeable upstream history size.
+          UPSTREAM_HEAD_SHORT=$(git rev-parse --short=12 "${UPSTREAM_REMOTE}/main")
           {
             echo "upstream_latest_tag=$UPSTREAM_LATEST_TAG"
             echo "upstream_prev_tag=$UPSTREAM_PREV_TAG"
@@ -346,8 +354,10 @@ jobs:
           # REFS_CAP — readers just iterate them. No per-list cap or
           # "N more" footer needed.
 
-          # Resolve bare refs against UPSTREAM_REPO via a single Issues API call
-          # (PRs are issues under the hood, so we don't need an issue→PR fallback).
+          # Resolve bare refs against UPSTREAM_REPO. One `gh api repos/.../issues/<num>`
+          # request per referenced ref (PRs are issues under the hood, so a single
+          # endpoint covers both — no issue→PR fallback needed). REFS_CAP=20 above
+          # bounds the total number of lookups per workflow run.
           if [ -s /tmp/sync/refs_bare.txt ]; then
             while read -r REF; do
               NUM="${REF#\#}"
@@ -617,7 +627,19 @@ jobs:
                 echo "git fetch upstream main"
                 echo "git checkout -b chore/upstream-sync main"
                 echo "git merge upstream/main"
-                echo "# Resolve conflicts, then push"
+                echo "# ...resolve conflicts in your editor..."
+                echo "git add <resolved-files>"
+                if [ -n "${UPSTREAM_LATEST_TAG}" ]; then
+                  # Advance the sync watermark so the next workflow run's
+                  # release-heading uses this tag as UPSTREAM_PREV_TAG instead
+                  # of the stale baseline. Only emitted when upstream actually
+                  # cut a tag at-or-before the synced HEAD.
+                  echo "mkdir -p .github/state"
+                  echo "echo \"${UPSTREAM_LATEST_TAG}\" > .github/state/last-upstream-sync.txt"
+                  echo "git add .github/state/last-upstream-sync.txt"
+                fi
+                echo "git commit"
+                echo "git push -u origin chore/upstream-sync"
                 echo '```'
                 echo
               } >> "$BODY_PATH"
