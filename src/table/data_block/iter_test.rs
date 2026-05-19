@@ -1442,7 +1442,7 @@ mod tests {
     mod devirt {
         use crate::comparator::UserComparator;
         use crate::{
-            Checksum, InternalValue, SeqNo, Slice,
+            Checksum, InternalValue, SeqNo,
             ValueType::Value,
             table::{
                 Block, DataBlock,
@@ -1575,13 +1575,13 @@ mod tests {
                 let lex_seek = lex_iter.seek(&needle, SeqNo::MAX);
                 let lex_landing = lex_iter
                     .next()
-                    .map(|e| Slice::from(e.materialize(data_block.as_slice()).key.user_key));
+                    .map(|e| e.materialize(data_block.as_slice()).key.user_key);
 
                 let mut dyn_iter = data_block.iter(dyn_cmp.clone());
                 let dyn_seek = dyn_iter.seek(&needle, SeqNo::MAX);
                 let dyn_landing = dyn_iter
                     .next()
-                    .map(|e| Slice::from(e.materialize(data_block.as_slice()).key.user_key));
+                    .map(|e| e.materialize(data_block.as_slice()).key.user_key);
 
                 assert_eq!(
                     lex_seek, dyn_seek,
