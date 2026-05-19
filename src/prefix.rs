@@ -109,15 +109,13 @@ pub fn compute_prefix_hash(
     extractor: Option<&std::sync::Arc<dyn PrefixExtractor>>,
     prefix_bytes: &[u8],
 ) -> Option<u64> {
-    use crate::table::filter::standard_bloom::Builder;
-
     if prefix_bytes.is_empty() {
         return None;
     }
 
     extractor
         .filter(|e| e.is_valid_scan_boundary(prefix_bytes))
-        .map(|_| Builder::get_hash(prefix_bytes))
+        .map(|_| crate::hash::hash64(prefix_bytes))
 }
 
 #[cfg(test)]

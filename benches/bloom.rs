@@ -1,7 +1,21 @@
-use criterion::{Criterion, criterion_group, criterion_main};
-use rand::RngExt;
+//! BuRR filter microbenches (construction + probe).
+//!
+//! The bench file is still named `bloom.rs` for git-history continuity —
+//! the standard bloom filter it used to benchmark has been replaced by
+//! BuRR (Bumped Ribbon Retrieval). Compare absolute numbers against the
+//! pre-BuRR runs to track migration deltas.
 
-// Not really worth it anymore on new CPUs...?
+use criterion::{Criterion, criterion_group, criterion_main};
+use lsm_tree::hash::hash64;
+use lsm_tree::table::filter::ribbon::burr::{
+    BurrBuilder, BurrFilter, BurrFilterReader, BurrParams,
+};
+use rand::RngExt;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::BuildHasherDefault;
+
+type Hasher = BuildHasherDefault<DefaultHasher>;
+
 fn fast_block_index(c: &mut Criterion) {
     pub fn fast_impl(h: u64, num_blocks: usize) -> usize {
         // https://lemire.me/blog/2016/06/27/a-fast-alternative-to-the-modulo-reduction/
@@ -26,75 +40,66 @@ fn fast_block_index(c: &mut Criterion) {
     });
 }
 
-fn standard_filter_construction(c: &mut Criterion) {
-    use lsm_tree::table::filter::standard_bloom::Builder;
-
+fn burr_filter_construction(c: &mut Criterion) {
     let mut rng = rand::rng();
 
-    c.bench_function("standard bloom filter add key, 1M", |b| {
-        let mut filter = Builder::with_fp_rate(1_000_000, 0.01);
+    for n in [100_000_usize, 1_000_000] {
+        let label = format!("burr filter build, {n} keys @ FPR=1%");
+        c.bench_function(&label, |b| {
+            // Pre-hash a key universe so the bench measures BuRR build cost,
+            // not RNG.
+            let mut keys = Vec::with_capacity(n);
+            for _ in 0..n {
+                let mut key = [0_u8; 16];
+                rng.fill(&mut key[..]);
+                keys.push(hash64(&key));
+            }
 
-        b.iter(|| {
-            let mut key = [0; 16];
-            rng.fill(&mut key[..]);
-
-            filter.set_with_hash(Builder::get_hash(&key));
+            b.iter(|| {
+                let params = BurrParams::with_fp_rate(n, 0.01).expect("params");
+                let builder = BurrBuilder::new(params, Hasher::default()).expect("builder");
+                let filter: BurrFilter<Hasher> = builder.build_from_hashes(&keys).expect("build");
+                std::hint::black_box(filter.layer_count());
+            });
         });
-    });
-
-    c.bench_function("standard bloom filter add key, 10M", |b| {
-        let mut filter = Builder::with_fp_rate(10_000_000, 0.01);
-
-        b.iter(|| {
-            let mut key = [0; 16];
-            rng.fill(&mut key[..]);
-
-            filter.set_with_hash(Builder::get_hash(&key));
-        });
-    });
+    }
 }
 
-fn standard_filter_contains(c: &mut Criterion) {
-    use lsm_tree::table::filter::standard_bloom::Builder;
-
-    let keys = (0..100_000u128)
+fn burr_filter_contains(c: &mut Criterion) {
+    let keys: Vec<Vec<u8>> = (0..100_000_u128)
         .map(|x| x.to_be_bytes().to_vec())
-        .collect::<Vec<_>>();
+        .collect();
 
-    // 3 representative FPR levels (low / medium / high precision).
-    // Reduced from 5 to cut benchmark count without losing coverage.
-    for fpr in [0.01, 0.001, 0.0001] {
-        // Bloom filter sized larger than the key set to trigger CPU cache misses,
-        // but not so large that setup time dominates (was 100M, now 1M).
-        let n = 1_000_000;
+    for fpr in [0.01_f32, 0.001, 0.0001] {
+        let n = 1_000_000_usize;
 
-        let mut filter = Builder::with_fp_rate(n, fpr);
-
-        for key in &keys {
-            filter.set_with_hash(Builder::get_hash(key));
+        let hashes: Vec<u64> = keys.iter().map(|k| hash64(k)).collect();
+        // Pad to n with random hashes so the filter is sized realistically.
+        let mut rng = rand::rng();
+        let mut padded = hashes.clone();
+        while padded.len() < n {
+            padded.push(rng.random::<u64>());
         }
 
-        let mut rng = rand::rng();
-
-        let filter_bytes = filter.build();
+        let params = BurrParams::with_fp_rate(n, fpr).expect("params");
+        let builder = BurrBuilder::new(params, Hasher::default()).expect("builder");
+        let filter = builder.build_from_hashes(&padded).expect("build");
+        let filter_bytes = filter.to_wire_bytes();
 
         c.bench_function(
-            &format!(
-                "standard bloom filter contains key, true positive ({}%)",
-                fpr * 100.0,
-            ),
+            &format!("burr filter contains, true positive (FPR={}%)", fpr * 100.0),
             |b| {
                 b.iter(|| {
                     use rand::seq::IndexedRandom;
-                    use lsm_tree::table::filter::standard_bloom::StandardBloomFilterReader as Reader;
 
-                    // NOTE: To make the costs more realistic, we
-                    // pretend we are reading the filter straight from the block
-                    let filter = Reader::new(&filter_bytes).unwrap();
+                    // Realistic cost: parse the wire bytes per probe (the
+                    // table reader keeps a long-lived reader, but parsing
+                    // is cheap — it's a header pass over a slice).
+                    let reader = BurrFilterReader::new(&filter_bytes).unwrap();
 
                     let sample = keys.choose(&mut rng).unwrap();
-                    let hash = Builder::get_hash(sample);
-                    assert!(filter.contains_hash(hash));
+                    let hash = hash64(sample);
+                    assert!(reader.contains_hash(hash));
                 });
             },
         );
@@ -104,7 +109,7 @@ fn standard_filter_contains(c: &mut Criterion) {
 criterion_group!(
     benches,
     fast_block_index,
-    standard_filter_construction,
-    standard_filter_contains,
+    burr_filter_construction,
+    burr_filter_contains,
 );
 criterion_main!(benches);

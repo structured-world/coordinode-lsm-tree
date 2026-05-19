@@ -784,8 +784,7 @@ impl AbstractTree for BlobTree {
             let miss_keys: Vec<(usize, u64)> = remaining
                 .iter()
                 .map(|&idx| {
-                    let hash =
-                        crate::table::filter::standard_bloom::Builder::get_hash(keys[idx].as_ref());
+                    let hash = crate::hash::hash64(keys[idx].as_ref());
                     (idx, hash)
                 })
                 .collect();

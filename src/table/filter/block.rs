@@ -2,7 +2,7 @@
 // This source code is licensed under both the Apache 2.0 and MIT License
 // (found in the LICENSE-* files in the repository)
 
-use crate::table::{Block, filter::standard_bloom::StandardBloomFilterReader};
+use crate::table::{Block, filter::ribbon::burr::BurrFilterReader};
 
 #[derive(Clone)]
 pub struct FilterBlock(Block);
@@ -14,7 +14,7 @@ impl FilterBlock {
     }
 
     pub fn maybe_contains_hash(&self, hash: u64) -> crate::Result<bool> {
-        Ok(StandardBloomFilterReader::new(&self.0.data)?.contains_hash(hash))
+        Ok(BurrFilterReader::new(&self.0.data)?.contains_hash(hash))
     }
 
     /// Returns the block size in bytes.

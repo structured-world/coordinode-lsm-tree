@@ -110,7 +110,7 @@ pub mod file;
 /// Pluggable filesystem abstraction for I/O backends.
 pub mod fs;
 
-mod hash;
+pub mod hash;
 mod heap;
 mod ingestion;
 mod iter_guard;

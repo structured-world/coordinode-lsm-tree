@@ -11,7 +11,7 @@ use crate::{
     prefix::PrefixExtractor,
     table::{
         Block, BlockHandle, BlockOffset, IndexBlock, KeyedBlockHandle,
-        block::Header as BlockHeader, filter::standard_bloom::Builder,
+        block::Header as BlockHeader, filter::build_burr_filter_bytes,
     },
 };
 use std::{
@@ -71,15 +71,8 @@ impl PartitionedFilterWriter {
     }
 
     fn spill_filter_partition(&mut self, key: &UserKey) -> crate::Result<()> {
-        let filter_bytes = {
-            let mut builder = self.bloom_policy.init(self.bloom_hash_buffer.len());
-
-            for hash in self.bloom_hash_buffer.drain(..) {
-                builder.set_with_hash(hash);
-            }
-
-            builder.build()
-        };
+        let filter_bytes = build_burr_filter_bytes(self.bloom_policy, &self.bloom_hash_buffer)?;
+        self.bloom_hash_buffer.clear();
 
         let header = Block::write_into(
             &mut self.final_filter_buffer,
@@ -104,12 +97,11 @@ impl PartitionedFilterWriter {
         ));
 
         log::trace!(
-            "Built Bloom filter partition ({}B) with end_key={key:?} at +{:#X?}",
+            "Built BuRR filter partition ({}B) with end_key={key:?} at +{:#X?}",
             filter_bytes.len(),
             self.relative_file_pos,
         );
 
-        self.bloom_hash_buffer.clear();
         self.approx_filter_size = 0;
         self.relative_file_pos += u64::from(bytes_written);
 
@@ -196,7 +188,7 @@ impl<W: std::io::Write + std::io::Seek> FilterWriter<W> for PartitionedFilterWri
     }
 
     fn register_key(&mut self, key: &UserKey) -> crate::Result<()> {
-        self.bloom_hash_buffer.push(Builder::get_hash(key));
+        self.bloom_hash_buffer.push(crate::hash::hash64(key));
 
         // NOTE: Prefix hashes are NOT inserted for partitioned filters.
         // Table::maybe_contains_prefix returns Ok(true) for partitioned/TLI

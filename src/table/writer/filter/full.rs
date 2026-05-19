@@ -9,7 +9,7 @@ use crate::{
     config::BloomConstructionPolicy,
     encryption::EncryptionProvider,
     prefix::PrefixExtractor,
-    table::{Block, filter::standard_bloom::Builder},
+    table::{Block, filter::build_burr_filter_bytes},
 };
 use std::sync::Arc;
 
@@ -69,15 +69,15 @@ impl<W: std::io::Write + std::io::Seek> FilterWriter<W> for FullFilterWriter {
     }
 
     fn register_key(&mut self, key: &UserKey) -> crate::Result<()> {
-        self.bloom_hash_buffer.push(Builder::get_hash(key));
+        self.bloom_hash_buffer.push(crate::hash::hash64(key));
 
-        // NOTE: Prefix hashes are intentionally not deduplicated — duplicate
-        // hashes set the same bloom bits (idempotent). This can significantly
-        // inflate the bloom entry count when many keys share few prefixes, but
-        // in exchange it lowers effective FPR and keeps construction simple.
+        // Prefix hashes are intentionally not deduplicated. The filter
+        // treats each hash as an independent membership token; duplicates
+        // inflate the entry count but keep construction simple and lower
+        // effective FPR slightly.
         if let Some(extractor) = &self.prefix_extractor {
             for prefix in extractor.prefixes(key.as_ref()) {
-                self.bloom_hash_buffer.push(Builder::get_hash(prefix));
+                self.bloom_hash_buffer.push(crate::hash::hash64(prefix));
             }
         }
 
@@ -96,24 +96,21 @@ impl<W: std::io::Write + std::io::Seek> FilterWriter<W> for FullFilterWriter {
             let n = self.bloom_hash_buffer.len();
 
             log::trace!(
-                "Constructing Bloom filter with {n} entries: {:?}",
+                "Constructing BuRR filter with {n} entries: {:?}",
                 self.bloom_policy,
             );
 
             let start = std::time::Instant::now();
 
-            let filter_bytes = {
-                let mut builder = self.bloom_policy.init(n);
+            let filter_bytes = build_burr_filter_bytes(self.bloom_policy, &self.bloom_hash_buffer)?;
 
-                for hash in self.bloom_hash_buffer {
-                    builder.set_with_hash(hash);
-                }
-
-                builder.build()
-            };
+            if filter_bytes.is_empty() {
+                log::trace!("BuRR policy produced empty filter — skipping block write");
+                return Ok(0);
+            }
 
             log::trace!(
-                "Built Bloom filter ({}B) in {:?}",
+                "Built BuRR filter ({}B) in {:?}",
                 filter_bytes.len(),
                 start.elapsed(),
             );

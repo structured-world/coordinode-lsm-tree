@@ -861,8 +861,7 @@ impl AbstractTree for Tree {
             let miss_keys: Vec<(usize, u64)> = remaining
                 .iter()
                 .map(|&idx| {
-                    let hash =
-                        crate::table::filter::standard_bloom::Builder::get_hash(keys[idx].as_ref());
+                    let hash = crate::hash::hash64(keys[idx].as_ref());
                     (idx, hash)
                 })
                 .collect();
@@ -1068,7 +1067,7 @@ impl Tree {
         }
 
         // Tables — Pinned (value shares decompressed block buffer)
-        let key_hash = crate::table::filter::standard_bloom::Builder::get_hash(key);
+        let key_hash = crate::hash::hash64(key);
 
         if let Some((entry, block)) = Self::get_internal_entry_with_block_from_tables(
             &super_version.version,
@@ -1120,7 +1119,7 @@ impl Tree {
     ) -> crate::Result<Option<UserValue>> {
         use crate::range::{IterState, TreeIter};
 
-        let key_hash = crate::table::filter::standard_bloom::Builder::get_hash(key);
+        let key_hash = crate::hash::hash64(key);
         // NOTE: Slice::from(&[u8]) copies the key (small, typically < 100 bytes).
         // This runs once per merge resolution, not per-table — cost is negligible
         // compared to the I/O saved by partition-aware bloom filtering.
@@ -1493,7 +1492,7 @@ impl Tree {
         seqno: SeqNo,
         comparator: &dyn crate::comparator::UserComparator,
     ) -> crate::Result<Option<InternalValue>> {
-        let key_hash = crate::table::filter::standard_bloom::Builder::get_hash(key);
+        let key_hash = crate::hash::hash64(key);
         Self::find_in_tables::<TableEntry>(version, key, seqno, key_hash, comparator)
     }
 

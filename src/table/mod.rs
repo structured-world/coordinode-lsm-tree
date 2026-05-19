@@ -270,7 +270,7 @@ impl Table {
     fn check_bloom(&self, key: &[u8], key_hash: u64) -> crate::Result<BloomResult> {
         debug_assert_eq!(
             key_hash,
-            crate::table::filter::standard_bloom::Builder::get_hash(key),
+            crate::hash::hash64(key),
             "key_hash must match the hash of the provided key"
         );
 
@@ -1087,7 +1087,7 @@ impl Table {
     /// to avoid redundant hashing — same pattern as [`Table::get`]).
     pub(crate) fn bloom_may_contain_key(&self, key: &[u8], key_hash: u64) -> crate::Result<bool> {
         debug_assert_eq!(
-            crate::table::filter::standard_bloom::Builder::get_hash(key),
+            crate::hash::hash64(key),
             key_hash,
             "bloom_may_contain_key: key_hash must be BloomBuilder::get_hash(key)"
         );
