@@ -624,3 +624,165 @@ fn burr_filter_contains_returns_false_for_definitely_absent() {
         "expected most non-inserted keys to report absent, got false_count={false_count}"
     );
 }
+
+#[test]
+fn contains_hash_from_bytes_round_trips_against_decoded() {
+    // The single-pass parse+probe entry point used by FilterBlock must
+    // produce the same answer as the decoded-then-probed reader for
+    // every inserted hash.
+    use super::contains_hash_from_bytes;
+    use super::filter::BurrFilterReader;
+
+    let n = 500_usize;
+    let params = BurrParams::with_fp_rate(n, 0.01).expect("params");
+    let builder = BurrBuilder::new(params, DefaultBuildHasher::default()).expect("builder");
+    let hashes: Vec<u64> = (0..n as u64)
+        .map(|i| crate::hash::hash64(&i.to_le_bytes()))
+        .collect();
+    let filter = builder.build_from_hashes(&hashes).expect("build");
+    let bytes = filter.to_wire_bytes();
+    let reader = BurrFilterReader::new(&bytes).expect("decoder");
+
+    for h in &hashes {
+        let single = contains_hash_from_bytes(&bytes, *h).expect("ok");
+        let decoded = reader.contains_hash(*h);
+        assert_eq!(single, decoded, "single-pass and decoded disagree on {h}");
+        assert!(single, "inserted hash {h} not present in single-pass probe");
+    }
+}
+
+#[test]
+fn contains_hash_from_bytes_rejects_short_buffer() {
+    use super::contains_hash_from_bytes;
+    let err = contains_hash_from_bytes(&[0_u8; 4], 42).expect_err("short buffer must error");
+    assert!(
+        matches!(err, crate::Error::InvalidHeader("BurrFilter")),
+        "expected InvalidHeader(\"BurrFilter\"), got: {err:?}",
+    );
+}
+
+#[test]
+fn contains_hash_from_bytes_rejects_bad_magic() {
+    use super::contains_hash_from_bytes;
+    let params = BurrParams::with_fp_rate(50, 0.01).expect("params");
+    let builder = BurrBuilder::new(params, DefaultBuildHasher::default()).expect("builder");
+    let hashes: Vec<u64> = (0..50_u64)
+        .map(|i| crate::hash::hash64(&[i as u8]))
+        .collect();
+    let filter = builder.build_from_hashes(&hashes).expect("build");
+    let mut bytes = filter.to_wire_bytes();
+    bytes[0] ^= 0xFF;
+    let err = contains_hash_from_bytes(&bytes, 0).expect_err("bad magic must error");
+    assert!(
+        matches!(err, crate::Error::InvalidHeader("BurrFilter")),
+        "expected InvalidHeader(\"BurrFilter\"), got: {err:?}",
+    );
+}
+
+#[test]
+fn contains_hash_from_bytes_rejects_bad_version() {
+    use super::contains_hash_from_bytes;
+    let params = BurrParams::with_fp_rate(50, 0.01).expect("params");
+    let builder = BurrBuilder::new(params, DefaultBuildHasher::default()).expect("builder");
+    let hashes: Vec<u64> = (0..50_u64)
+        .map(|i| crate::hash::hash64(&[i as u8]))
+        .collect();
+    let filter = builder.build_from_hashes(&hashes).expect("build");
+    let mut bytes = filter.to_wire_bytes();
+    let version_offset = crate::file::MAGIC_BYTES.len() + 1;
+    bytes[version_offset] = 0xFE;
+    let err = contains_hash_from_bytes(&bytes, 0).expect_err("bad version must error");
+    assert!(
+        matches!(err, crate::Error::InvalidHeader("BurrFilter version")),
+        "expected InvalidHeader(\"BurrFilter version\"), got: {err:?}",
+    );
+}
+
+#[test]
+fn contains_hash_from_bytes_rejects_bad_filter_type() {
+    use super::contains_hash_from_bytes;
+    let params = BurrParams::with_fp_rate(50, 0.01).expect("params");
+    let builder = BurrBuilder::new(params, DefaultBuildHasher::default()).expect("builder");
+    let hashes: Vec<u64> = (0..50_u64)
+        .map(|i| crate::hash::hash64(&[i as u8]))
+        .collect();
+    let filter = builder.build_from_hashes(&hashes).expect("build");
+    let mut bytes = filter.to_wire_bytes();
+    let filter_type_offset = crate::file::MAGIC_BYTES.len();
+    bytes[filter_type_offset] = 0xAB;
+    let err = contains_hash_from_bytes(&bytes, 0).expect_err("bad filter_type must error");
+    assert!(
+        matches!(err, crate::Error::InvalidTag(("FilterType", 0xAB))),
+        "expected InvalidTag((\"FilterType\", 0xAB)), got: {err:?}",
+    );
+}
+
+#[test]
+fn contains_hash_from_bytes_rejects_bad_params() {
+    use super::contains_hash_from_bytes;
+    let params = BurrParams::with_fp_rate(50, 0.01).expect("params");
+    let builder = BurrBuilder::new(params, DefaultBuildHasher::default()).expect("builder");
+    let hashes: Vec<u64> = (0..50_u64)
+        .map(|i| crate::hash::hash64(&[i as u8]))
+        .collect();
+    let filter = builder.build_from_hashes(&hashes).expect("build");
+    let mut bytes = filter.to_wire_bytes();
+    // Set num_layers = 0 → InvalidHeader("BurrFilter params").
+    let num_layers_offset = crate::file::MAGIC_BYTES.len() + 5;
+    bytes[num_layers_offset] = 0;
+    let err = contains_hash_from_bytes(&bytes, 0).expect_err("num_layers=0 must error");
+    assert!(
+        matches!(err, crate::Error::InvalidHeader("BurrFilter params")),
+        "expected InvalidHeader(\"BurrFilter params\"), got: {err:?}",
+    );
+}
+
+#[test]
+fn contains_hash_from_bytes_rejects_corrupted_layer_payload() {
+    // Tampered num_blocks → checked-add validation in
+    // contains_hash_from_bytes must reject the layer header before
+    // reaching the slice.
+    use super::contains_hash_from_bytes;
+    let params = BurrParams::with_fp_rate(50, 0.01).expect("params");
+    let builder = BurrBuilder::new(params, DefaultBuildHasher::default()).expect("builder");
+    let hashes: Vec<u64> = (0..50_u64)
+        .map(|i| crate::hash::hash64(&[i as u8]))
+        .collect();
+    let filter = builder.build_from_hashes(&hashes).expect("build");
+    let mut bytes = filter.to_wire_bytes();
+    let layer_header_start = crate::file::MAGIC_BYTES.len() + 6 + 8;
+    let num_blocks_offset = layer_header_start + 4;
+    bytes[num_blocks_offset] = bytes[num_blocks_offset].wrapping_add(1);
+    let err = contains_hash_from_bytes(&bytes, 0).expect_err("corrupted num_blocks must error");
+    assert!(
+        matches!(err, crate::Error::InvalidHeader("BurrFilter layer payload")),
+        "expected InvalidHeader(\"BurrFilter layer payload\"), got: {err:?}",
+    );
+}
+
+#[test]
+fn contains_hash_from_bytes_returns_false_for_non_inserted() {
+    // Smoke for the not-present branch — exercises the per-set-bit
+    // loop's normal exit path (where acc != fingerprint).
+    use super::contains_hash_from_bytes;
+    let n = 200_usize;
+    let params = BurrParams::with_fp_rate(n, 0.001).expect("params");
+    let builder = BurrBuilder::new(params, DefaultBuildHasher::default()).expect("builder");
+    let hashes: Vec<u64> = (0..n as u64)
+        .map(|i| crate::hash::hash64(&i.to_le_bytes()))
+        .collect();
+    let filter = builder.build_from_hashes(&hashes).expect("build");
+    let bytes = filter.to_wire_bytes();
+
+    let mut absent_count = 0_u32;
+    for i in 10_000..11_000_u64 {
+        let h = crate::hash::hash64(&i.to_le_bytes());
+        if !contains_hash_from_bytes(&bytes, h).expect("ok") {
+            absent_count += 1;
+        }
+    }
+    assert!(
+        absent_count > 950,
+        "expected most non-inserted hashes to report absent, got absent_count={absent_count}",
+    );
+}
