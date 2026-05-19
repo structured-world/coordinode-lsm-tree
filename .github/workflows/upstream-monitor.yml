@@ -2,7 +2,7 @@ name: Upstream Monitor
 
 on:
   schedule:
-    - cron: "0 8 * * 1,4"
+    - cron: "0 8 * * *"
   workflow_dispatch:
     inputs:
       force:
@@ -183,10 +183,19 @@ jobs:
             # the title fragment `upstream-${UPSTREAM_HEAD_SHORT}` uses
             # a dash so it survives intact and remains greppable.
             QUERY="upstream-${UPSTREAM_HEAD_SHORT} in:title label:upstream-sync repo:${GITHUB_REPOSITORY}"
-            COUNT=$(gh api -X GET search/issues -f q="$QUERY" --jq '.total_count')
-            if [ "$COUNT" -gt 0 ]; then
-              SHOULD_RUN=false
-              echo "Skip: ${COUNT} sync artifact(s) for upstream-${UPSTREAM_HEAD_SHORT} already exist (open/closed/merged). Subsequent steps will short-circuit."
+            # Best-effort lookup: a transient search/issues failure (rate
+            # limit, 5xx, network blip) must NOT block surfacing upstream
+            # changes. On lookup failure, default to SHOULD_RUN=true and
+            # log a warning — at worst we re-surface an already-considered
+            # HEAD (the maintainer can resolve the dup), which is strictly
+            # better than silently dropping the sync run.
+            if COUNT=$(gh api -X GET search/issues -f q="$QUERY" --jq '.total_count' 2>/dev/null); then
+              if [ "$COUNT" -gt 0 ]; then
+                SHOULD_RUN=false
+                echo "Skip: ${COUNT} sync artifact(s) for upstream-${UPSTREAM_HEAD_SHORT} already exist (open/closed/merged). Subsequent steps will short-circuit."
+              fi
+            else
+              echo "warn: search/issues lookup failed (rate limit / API error). Treating as not-yet-surfaced; sync run will proceed." >&2
             fi
           fi
 
@@ -230,6 +239,27 @@ jobs:
           FIX_RE='^fix(\([^)]*\))?:'
           PERF_RE='^perf(\([^)]*\))?:'
 
+          # Escape Markdown metacharacters in commit subjects. Upstream
+          # subjects can contain backticks, brackets, pipes, leading `#`,
+          # `@mentions`, etc. — un-escaped, they would corrupt the rendered
+          # categorised list or trigger unintended notifications in this
+          # repo. Defined inline (not shared with the refs.md step) because
+          # bash functions don't cross `run:` boundaries.
+          md_escape() {
+            sed -e 's/`/\\`/g' \
+                -e 's/|/\\|/g' \
+                -e 's/\[/\\[/g' \
+                -e 's/\]/\\]/g' \
+                -e 's/(/\\(/g' \
+                -e 's/)/\\)/g' \
+                -e 's/</\\</g' \
+                -e 's/>/\\>/g' \
+                -e 's/\*/\\*/g' \
+                -e 's/_/\\_/g' \
+                -e 's/#/\\#/g' \
+                -e 's/@/\\@/g'
+          }
+
           # Read NUL-delimited records from `git log -z`. Each record holds
           # `SHA\tSUBJECT\tBODY`; BODY may contain its own newlines (footers,
           # multi-paragraph descriptions). We split fields via parameter
@@ -241,7 +271,8 @@ jobs:
             SUBJECT="${REST%%$'\t'*}"
             BODY="${REST#*$'\t'}"
             SHORT=$(git rev-parse --short "$SHA")
-            LINE="- \`$SHORT\` $SUBJECT"
+            SUBJECT_SAFE=$(printf '%s' "$SUBJECT" | md_escape)
+            LINE="- \`$SHORT\` $SUBJECT_SAFE"
             # Conventional Commits §5 treats `BREAKING CHANGE:` and
             # `BREAKING-CHANGE:` as equivalent footer tokens — match both.
             # Heuristic limitation: a `revert: <breaking change>` commit
@@ -707,25 +738,28 @@ jobs:
             if git merge-base --is-ancestor "$BRANCH_TIP" "${UPSTREAM_REMOTE}/main" 2>/dev/null; then
               echo "Branch '$BRANCH' is fully merged into ${UPSTREAM_REMOTE}/main"
 
-              # `gh issue list --search` is GitHub free-text search:
-              # it tokenises and matches CONTAINS, not exact-title. For
-              # short branch slugs (e.g., `feat/123-foo` after `#`
-              # strip — search drops `#` regardless), this can match
-              # unrelated issues containing those tokens and falsely
-              # suppress a legitimate "Upstream merged" notification.
-              #
-              # Pull a wider candidate set with the same loose search,
-              # then post-filter to EXACT title equality on the client.
-              # The expected title includes the literal `#` (it's part
-              # of the branch convention and lives in the indexed title).
-              # Pass EXPECTED_TITLE to jq via `--arg` (not string
-              # interpolation) so any quote/backslash in BRANCH
-              # cannot break the jq filter syntax.
+              # Dedupe via the same search/issues endpoint the skip-gate
+              # above uses, for two reasons:
+              #   1. `--state all` semantics: a closed "Upstream merged"
+              #      issue means the maintainer already acknowledged this
+              #      branch — closing it shouldn't cause the next run to
+              #      re-create it (which `gh issue list --state open` would).
+              #   2. No implicit pagination cap: `gh issue list` defaults to
+              #      a small page size and silently truncates; search/issues
+              #      returns total_count over the full match set, so the
+              #      post-filter is reliable.
+              # GitHub search strips `#` from query text, so SEARCH_BRANCH
+              # uses the dashed form. EXPECTED_TITLE keeps the literal `#`
+              # (it's part of the indexed title) and is passed to jq via
+              # `--arg` so any quote/backslash in BRANCH can't break filter
+              # syntax. We post-filter to exact-title match on the client
+              # because search is CONTAINS-tokenised, not exact-title.
               EXPECTED_TITLE="Upstream merged: $BRANCH"
               SEARCH_BRANCH="${BRANCH//\#/}"
-              EXISTING=$(gh issue list \
-                --search "Upstream merged: $SEARCH_BRANCH" \
-                --state open --json title \
+              EXISTING_JSON=$(gh api -X GET search/issues \
+                -f q="Upstream merged: ${SEARCH_BRANCH} label:upstream-sync repo:${GITHUB_REPOSITORY}" \
+                --jq '[.items[] | {title}]' 2>/dev/null || echo '[]')
+              EXISTING=$(printf '%s' "$EXISTING_JSON" \
                 | jq --arg t "$EXPECTED_TITLE" '[.[] | select(.title == $t)] | length')
               if [ "$EXISTING" = "0" ]; then
                 BODY_FILE=$(mktemp)
