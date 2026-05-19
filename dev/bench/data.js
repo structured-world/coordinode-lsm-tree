@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779175650226,
+  "lastUpdate": 1779178273203,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -6786,6 +6786,84 @@ window.BENCHMARK_DATA = {
             "value": 573315.5215625536,
             "unit": "ops/sec (normalized)",
             "extra": "raw: 530984 ops/sec | factor: 1.080 | P50: 1.7us | P99: 4.0us | P99.9: 10.8us\nthreads: 1 | elapsed: 0.38s | num: 200000 | iterations: 3 | runner: seq_wr=24619 rand_rd=828473 cpu=140 composite=21301.8"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "255865126+sw-release-bot[bot]@users.noreply.github.com",
+            "name": "sw-release-bot[bot]",
+            "username": "sw-release-bot[bot]"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "6f0d811758496b4a56e60a75ce9a0e8c3b249e11",
+          "message": "chore: release v4.5.0 (#234)\n\n## 🤖 New release\n\n* `coordinode-lsm-tree`: 4.4.0 -> 4.5.0\n\n<details><summary><i><b>Changelog</b></i></summary><p>\n\n<blockquote>\n\n##\n[4.5.0](https://github.com/structured-world/coordinode-lsm-tree/compare/v4.4.0...v4.5.0)\n- 2026-05-19\n\n### Added\n\n- *(ci)* smart upstream-monitor with release intelligence + path-aware\nCodeRabbit profile\n([#264](https://github.com/structured-world/coordinode-lsm-tree/pull/264))\n- *(vlog)* dictionary compression for blob files\n([#233](https://github.com/structured-world/coordinode-lsm-tree/pull/233))\n\n### Fixed\n\n- *(encryption)* restore --features encryption build (aes-gcm\n0.11.0-rc.3 + rand_chacha 0.10)\n([#258](https://github.com/structured-world/coordinode-lsm-tree/pull/258))\n\n### Performance\n\n- devirtualize lexicographic comparator on block binary-search hot path\n([#266](https://github.com/structured-world/coordinode-lsm-tree/pull/266))\n- *(util)* SIMD longest_shared_prefix_length() (Phase 2.1)\n([#245](https://github.com/structured-world/coordinode-lsm-tree/pull/245))\n</blockquote>\n\n\n</p></details>\n\n---\nThis PR was generated with\n[release-plz](https://github.com/release-plz/release-plz/).\n\nCo-authored-by: sw-release-bot[bot] <255865126+sw-release-bot[bot]@users.noreply.github.com>",
+          "timestamp": "2026-05-19T11:09:54+03:00",
+          "tree_id": "7b251ee2c20195e5990992c1a25b827624a567c2",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/6f0d811758496b4a56e60a75ce9a0e8c3b249e11"
+        },
+        "date": 1779178271638,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 1212148.0486146263,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 1867775 ops/sec | factor: 0.649 | P50: 0.4us | P99: 2.6us | P99.9: 5.9us\nthreads: 1 | elapsed: 0.11s | num: 200000 | iterations: 3 | runner: seq_wr=224265 rand_rd=682325 cpu=109 composite=35440.2"
+          },
+          {
+            "name": "fillrandom",
+            "value": 656262.2987714246,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 1011222 ops/sec | factor: 0.649 | P50: 0.7us | P99: 3.2us | P99.9: 9.5us\nthreads: 1 | elapsed: 0.20s | num: 200000 | iterations: 3 | runner: seq_wr=224265 rand_rd=682325 cpu=109 composite=35440.2"
+          },
+          {
+            "name": "readrandom",
+            "value": 287384.2141945515,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 442825 ops/sec | factor: 0.649 | P50: 2.0us | P99: 6.4us | P99.9: 13.8us\nthreads: 1 | elapsed: 0.45s | num: 200000 | iterations: 3 | runner: seq_wr=224265 rand_rd=682325 cpu=109 composite=35440.2"
+          },
+          {
+            "name": "readseq",
+            "value": 1478548.8473029872,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 2278267 ops/sec | factor: 0.649 | P50: 0.2us | P99: 4.8us | P99.9: 9.5us\nthreads: 1 | elapsed: 0.09s | num: 200000 | iterations: 3 | runner: seq_wr=224265 rand_rd=682325 cpu=109 composite=35440.2"
+          },
+          {
+            "name": "seekrandom",
+            "value": 210244.43188624468,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 323961 ops/sec | factor: 0.649 | P50: 2.7us | P99: 7.3us | P99.9: 14.9us\nthreads: 1 | elapsed: 0.62s | num: 200000 | iterations: 3 | runner: seq_wr=224265 rand_rd=682325 cpu=109 composite=35440.2"
+          },
+          {
+            "name": "prefixscan",
+            "value": 118177.26381944011,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 182097 ops/sec | factor: 0.649 | P50: 5.1us | P99: 7.3us | P99.9: 16.5us\nthreads: 1 | elapsed: 1.10s | num: 200000 | iterations: 3 | runner: seq_wr=224265 rand_rd=682325 cpu=109 composite=35440.2"
+          },
+          {
+            "name": "overwrite",
+            "value": 683457.353426151,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 1053126 ops/sec | factor: 0.649 | P50: 0.7us | P99: 3.2us | P99.9: 7.2us\nthreads: 1 | elapsed: 0.19s | num: 200000 | iterations: 3 | runner: seq_wr=224265 rand_rd=682325 cpu=109 composite=35440.2"
+          },
+          {
+            "name": "mergerandom",
+            "value": 490769.1783137203,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 756216 ops/sec | factor: 0.649 | P50: 0.4us | P99: 0.6us | P99.9: 3.2us\nthreads: 1 | elapsed: 0.26s | num: 200000 | iterations: 3 | runner: seq_wr=224265 rand_rd=682325 cpu=109 composite=35440.2"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 264726.89902541734,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 407912 ops/sec | factor: 0.649 | P50: 2.3us | P99: 5.0us | P99.9: 14.1us\nthreads: 1 | elapsed: 0.49s | num: 200000 | iterations: 3 | runner: seq_wr=224265 rand_rd=682325 cpu=109 composite=35440.2"
           }
         ]
       }
