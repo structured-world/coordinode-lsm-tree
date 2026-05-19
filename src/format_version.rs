@@ -1,6 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2024-present, fjall-rs
-// This source code is licensed under both the Apache 2.0 and MIT License
-// (found in the LICENSE-* files in the repository)
+// Copyright (c) 2026-present, Structured World Foundation
 
 /// Disk format version
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -16,6 +16,19 @@ pub enum FormatVersion {
 
     /// Version for range-tombstone SST semantics
     V4,
+
+    /// `BuRR` (Bumped Ribbon Retrieval) filter wire format. Filter
+    /// blocks are no longer Bloom-encoded; the `filter_type` byte +
+    /// per-layer header layout is documented in
+    /// `src/table/filter/ribbon/burr/wire.rs`.
+    ///
+    /// V3/V4 ↔ V5 incompatibility is enforced primarily by the manifest
+    /// version gate at `Tree::open` (returns `InvalidVersion` for
+    /// anything other than V5). If the manifest is bypassed and a
+    /// pre-V5 filter block reaches the decoder, the `BuRR` magic + the
+    /// `filter_type=2` byte plus `format_version=1` inside the `BuRR`
+    /// header will reject the older Bloom-shaped payload.
+    V5,
 }
 
 impl std::fmt::Display for FormatVersion {
@@ -31,6 +44,7 @@ impl From<FormatVersion> for u8 {
             FormatVersion::V2 => 2,
             FormatVersion::V3 => 3,
             FormatVersion::V4 => 4,
+            FormatVersion::V5 => 5,
         }
     }
 }
@@ -44,6 +58,7 @@ impl TryFrom<u8> for FormatVersion {
             2 => Ok(Self::V2),
             3 => Ok(Self::V3),
             4 => Ok(Self::V4),
+            5 => Ok(Self::V5),
             _ => Err(()),
         }
     }

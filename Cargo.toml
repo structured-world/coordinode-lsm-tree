@@ -1,6 +1,6 @@
 [package]
 name = "coordinode-lsm-tree"
-description = "A K.I.S.S. implementation of log-structured merge trees (LSM-trees/LSMTs) — CoordiNode fork"
+description = "Embedded LSM-tree storage engine: BuRR filters, zstd dictionary compression, MVCC, range tombstones, merge operators, K/V separation, AES-256-GCM at rest."
 license = "Apache-2.0"
 version = "4.5.0"
 edition = "2024"
@@ -9,8 +9,19 @@ readme = "README.md"
 include = ["src/**/*", "build.rs", "LICENSE-APACHE", "README.md", "CHANGELOG.md"]
 repository = "https://github.com/structured-world/coordinode-lsm-tree"
 homepage = "https://github.com/structured-world/coordinode-lsm-tree"
-keywords = ["lsm-tree", "storage", "database", "coordinode", "key-value"]
-categories = ["data-structures", "database-implementations"]
+documentation = "https://docs.rs/coordinode-lsm-tree"
+keywords = ["lsm-tree", "storage", "database", "embedded", "key-value"]
+categories = ["data-structures", "database-implementations", "filesystem", "compression"]
+
+[package.metadata.docs.rs]
+# Build the docs.rs page with every feature enabled so the rendered
+# crate page exposes the full public API surface (zstd dictionary
+# compression, encryption, io-uring, bytes integration, metrics,
+# ribbon-serde). cfg(docsrs) is set so #[cfg_attr(docsrs, ...)] items
+# render their feature/availability badges.
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+targets = ["x86_64-unknown-linux-gnu"]
 
 [lib]
 name = "lsm_tree"
@@ -20,11 +31,26 @@ path = "src/lib.rs"
 default = []
 io-uring = ["dep:io-uring"]
 lz4 = ["dep:lz4_flex"]
+# The previous `zstd-pure = ["zstd"]` alias was removed. It was
+# documented as deprecated when there were two candidate zstd backends
+# on the roadmap; only structured-zstd remains, so the alias serves no
+# purpose and is dropped per the standard deprecation lifecycle. The
+# removal is signalled to release tooling as a breaking change via the
+# conventional `!` markers on this PR's breaking commits (BuRR filter
+# wire format, V5 manifest gate); release-plz raises the crate's major
+# version on the next release tag accordingly.
 zstd = ["dep:structured-zstd"]
-zstd-pure = ["zstd"]
 encryption = ["dep:aes-gcm", "dep:rand_chacha"]
 bytes_1 = ["dep:bytes"]
 metrics = []
+# Vendored Ribbon filter retains its `#[cfg(feature = "ribbon-serde")]`
+# guards (renamed from upstream's bare `serde` feature to avoid clashing
+# with any future top-level serde feature in this crate). We do not
+# consume the serde repr from inside this crate — the BuRR on-disk
+# format is byteorder-encoded — but the feature wires `serde` as an
+# optional dep so `--all-features` builds and a future extraction back
+# into a standalone crate compile cleanly.
+ribbon-serde = ["dep:serde"]
 
 [dependencies]
 bytes = { version = "1", optional = true }
@@ -38,6 +64,9 @@ structured-zstd = { version = "0.0.21", optional = true, default-features = fals
 quick_cache = { version = "0.6.16", default-features = false, features = [] }
 rustc-hash = "2.1.1"
 self_cell = "1.2.0"
+# Optional — only pulled in by the vendored Ribbon filter under the
+# `ribbon-serde` feature flag (off by default).
+serde = { version = "1", optional = true, features = ["derive"] }
 sfa = "~1.0.0"
 tempfile = "3.20.0"
 varint-rs = "2.2.0"
@@ -65,6 +94,9 @@ fs_extra = "1.3.0"
 nanoid = "0.5.0"
 proptest = "1"
 rand = "0.10.1"
+# Used by the vendored ribbon-filter's #[cfg(feature = "ribbon-serde")]
+# round-trip tests. Dev-only; production code does not depend on it.
+serde_json = "1"
 strum = { version = "0.28.0", features = ["derive"] }
 test-log = "0.2.18"
 

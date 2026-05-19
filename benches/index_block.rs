@@ -8,10 +8,8 @@ use lsm_tree::{
     Cache, Checksum, DefaultUserComparator, DescriptorTable, InternalValue, SeqNo,
     SharedComparator, TableId, ValueType,
     fs::StdFs,
-    table::{
-        BlockHandle, BlockOffset, IndexBlock, KeyedBlockHandle, Table, Writer,
-        filter::standard_bloom::Builder as BloomBuilder,
-    },
+    hash::hash64,
+    table::{BlockHandle, BlockOffset, IndexBlock, KeyedBlockHandle, Table, Writer},
 };
 use std::sync::Arc;
 use tempfile::TempDir;
@@ -130,7 +128,7 @@ fn build_table_for_point_read(restart_interval: u8) -> BenchTable {
 
     BenchTable {
         _dir: dir,
-        key_hash: BloomBuilder::get_hash(&key),
+        key_hash: hash64(&key),
         key,
         table,
     }

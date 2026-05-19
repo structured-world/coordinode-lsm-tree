@@ -1,6 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2024-present, fjall-rs
-// This source code is licensed under both the Apache 2.0 and MIT License
-// (found in the LICENSE-* files in the repository)
+// Copyright (c) 2026-present, Structured World Foundation
 
 use super::FilterWriter;
 use crate::{
@@ -11,7 +11,7 @@ use crate::{
     prefix::PrefixExtractor,
     table::{
         Block, BlockHandle, BlockOffset, IndexBlock, KeyedBlockHandle,
-        block::Header as BlockHeader, filter::standard_bloom::Builder,
+        block::Header as BlockHeader, filter::build_burr_filter_bytes,
     },
 };
 use std::{
@@ -71,15 +71,39 @@ impl PartitionedFilterWriter {
     }
 
     fn spill_filter_partition(&mut self, key: &UserKey) -> crate::Result<()> {
-        let filter_bytes = {
-            let mut builder = self.bloom_policy.init(self.bloom_hash_buffer.len());
+        let hash_count = self.bloom_hash_buffer.len();
+        let partition_index = self.tli_handles.len();
+        // mem::replace (rather than mem::take) preserves the buffer's
+        // grown capacity for the next partition. `take` leaves a
+        // capacity-0 Vec behind, which would force a reallocation on
+        // every register_key call following a spill. Tables with many
+        // partitions can spill thousands of times during a single
+        // flush/compaction, so the saved reallocations matter on the
+        // write hot path.
+        let old_cap = self.bloom_hash_buffer.capacity();
+        let hashes = std::mem::replace(&mut self.bloom_hash_buffer, Vec::with_capacity(old_cap));
+        let filter_bytes = build_burr_filter_bytes(self.bloom_policy, hashes)?;
 
-            for hash in self.bloom_hash_buffer.drain(..) {
-                builder.set_with_hash(hash);
-            }
-
-            builder.build()
-        };
+        // An empty BuRR build result means the policy is inactive for
+        // this key population (e.g. fpr <= 0 or bpk out of [1, 64]).
+        // For PARTITIONED filters, silently skipping a partition AND
+        // its TLI entry causes false negatives at read time: keys in
+        // this range would binary-search to a later partition's
+        // filter, which doesn't contain them, and Table::check_bloom
+        // would report "definitely not present" → false negative on a
+        // live key.
+        //
+        // Fail closed: return Unrecoverable so the writer aborts table
+        // creation rather than persisting a partially-filtered table.
+        // In practice this path is unreachable — BloomConstructionPolicy::
+        // is_active() is checked upstream before any keys are buffered.
+        if filter_bytes.is_empty() {
+            log::error!(
+                "BuRR partitioned writer received empty filter bytes for partition {partition_index} \
+                 ({hash_count} hashes) — policy likely inactive (silent skip would cause false negatives)",
+            );
+            return Err(crate::Error::Unrecoverable);
+        }
 
         let header = Block::write_into(
             &mut self.final_filter_buffer,
@@ -104,12 +128,11 @@ impl PartitionedFilterWriter {
         ));
 
         log::trace!(
-            "Built Bloom filter partition ({}B) with end_key={key:?} at +{:#X?}",
+            "Built BuRR filter partition ({}B) with end_key={key:?} at +{:#X?}",
             filter_bytes.len(),
             self.relative_file_pos,
         );
 
-        self.bloom_hash_buffer.clear();
         self.approx_filter_size = 0;
         self.relative_file_pos += u64::from(bytes_written);
 
@@ -196,7 +219,7 @@ impl<W: std::io::Write + std::io::Seek> FilterWriter<W> for PartitionedFilterWri
     }
 
     fn register_key(&mut self, key: &UserKey) -> crate::Result<()> {
-        self.bloom_hash_buffer.push(Builder::get_hash(key));
+        self.bloom_hash_buffer.push(crate::hash::hash64(key));
 
         // NOTE: Prefix hashes are NOT inserted for partitioned filters.
         // Table::maybe_contains_prefix returns Ok(true) for partitioned/TLI

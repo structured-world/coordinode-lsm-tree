@@ -1,9 +1,9 @@
+// SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2024-present, fjall-rs
-// This source code is licensed under both the Apache 2.0 and MIT License
-// (found in the LICENSE-* files in the repository)
+// Copyright (c) 2026-present, Structured World Foundation
 
 #[cfg(feature = "zstd")]
-mod zstd_pure;
+mod zstd_backend;
 
 use crate::coding::{Decode, Encode};
 use byteorder::{ReadBytesExt, WriteBytesExt};
@@ -50,7 +50,7 @@ pub trait CompressionProvider {
 
 /// The active zstd backend (pure Rust via `structured-zstd`).
 #[cfg(feature = "zstd")]
-pub type ZstdBackend = zstd_pure::ZstdPureProvider;
+pub type ZstdBackend = zstd_backend::ZstdProvider;
 
 /// Pre-trained zstd dictionary for improved compression of small blocks.
 ///

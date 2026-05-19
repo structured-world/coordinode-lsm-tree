@@ -1,6 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2024-present, fjall-rs
-// This source code is licensed under both the Apache 2.0 and MIT License
-// (found in the LICENSE-* files in the repository)
+// Copyright (c) 2026-present, Structured World Foundation
 
 #![allow(
     clippy::doc_markdown,
@@ -10,10 +10,7 @@
 #![expect(clippy::expect_used, reason = "test code")]
 
 use super::*;
-use crate::{
-    config::BloomConstructionPolicy, fs::StdFs,
-    table::filter::standard_bloom::Builder as BloomBuilder,
-};
+use crate::{config::BloomConstructionPolicy, fs::StdFs, hash::hash64};
 use tempfile::tempdir;
 use test_log::test;
 
@@ -482,19 +479,13 @@ fn table_point_read() -> crate::Result<()> {
             assert_eq!(
                 b"abc",
                 &*table
-                    .get(b"abc", SeqNo::MAX, BloomBuilder::get_hash(b"abc"))?
+                    .get(b"abc", SeqNo::MAX, hash64(b"abc"))?
                     .unwrap()
                     .key
                     .user_key,
             );
-            assert_eq!(
-                None,
-                table.get(b"def", SeqNo::MAX, BloomBuilder::get_hash(b"def"))?,
-            );
-            assert_eq!(
-                None,
-                table.get(b"____", SeqNo::MAX, BloomBuilder::get_hash(b"____"))?,
-            );
+            assert_eq!(None, table.get(b"def", SeqNo::MAX, hash64(b"def"))?,);
+            assert_eq!(None, table.get(b"____", SeqNo::MAX, hash64(b"____"))?,);
 
             assert_eq!(
                 table.metadata.key_range,
@@ -532,7 +523,7 @@ fn table_point_read_index_block_restart_interval() -> crate::Result<()> {
                     .get(
                         b"adj:out:vertex-0001:edge-0011",
                         SeqNo::MAX,
-                        BloomBuilder::get_hash(b"adj:out:vertex-0001:edge-0011"),
+                        hash64(b"adj:out:vertex-0001:edge-0011"),
                     )?
                     .expect("test assertion: expected value for edge-0011")
                     .value,
@@ -591,11 +582,7 @@ fn table_point_read_zstd_dictionary() -> crate::Result<()> {
             assert_eq!(
                 b"value-00001-padding-to-make-it-longer",
                 &*table
-                    .get(
-                        b"key-00001",
-                        SeqNo::MAX,
-                        BloomBuilder::get_hash(b"key-00001"),
-                    )?
+                    .get(b"key-00001", SeqNo::MAX, hash64(b"key-00001"),)?
                     .expect("test assertion: expected value for key-00001")
                     .value,
             );
@@ -695,7 +682,7 @@ fn table_point_read_mvcc_block_boundary() -> crate::Result<()> {
         |table| {
             assert_eq!(2, table.metadata.data_block_count);
 
-            let key_hash = BloomBuilder::get_hash(b"a");
+            let key_hash = hash64(b"a");
 
             assert_eq!(
                 b"5",
@@ -898,7 +885,7 @@ fn table_point_read_partitioned_filter_smoke_test() -> crate::Result<()> {
             assert_eq!(1, table.metadata.data_block_count);
 
             for item in &items {
-                let key_hash = BloomBuilder::get_hash(&item.key.user_key);
+                let key_hash = hash64(&item.key.user_key);
 
                 assert_eq!(
                     item.value,
@@ -942,62 +929,14 @@ fn table_partitioned_filter() -> crate::Result<()> {
                 "filter TLI should exist"
             );
 
-            assert_eq!(
-                b"a7",
-                &*table
-                    .get(b"a", 8, BloomBuilder::get_hash(b"a"))?
-                    .unwrap()
-                    .value,
-            );
-            assert_eq!(
-                b"a6",
-                &*table
-                    .get(b"a", 7, BloomBuilder::get_hash(b"a"))?
-                    .unwrap()
-                    .value,
-            );
-            assert_eq!(
-                b"a5",
-                &*table
-                    .get(b"a", 6, BloomBuilder::get_hash(b"a"))?
-                    .unwrap()
-                    .value,
-            );
-            assert_eq!(
-                b"a4",
-                &*table
-                    .get(b"a", 5, BloomBuilder::get_hash(b"a"))?
-                    .unwrap()
-                    .value,
-            );
-            assert_eq!(
-                b"a3",
-                &*table
-                    .get(b"a", 4, BloomBuilder::get_hash(b"a"))?
-                    .unwrap()
-                    .value,
-            );
-            assert_eq!(
-                b"b5",
-                &*table
-                    .get(b"b", 6, BloomBuilder::get_hash(b"b"))?
-                    .unwrap()
-                    .value,
-            );
-            assert_eq!(
-                b"c8",
-                &*table
-                    .get(b"c", 9, BloomBuilder::get_hash(b"c"))?
-                    .unwrap()
-                    .value,
-            );
-            assert_eq!(
-                b"d10",
-                &*table
-                    .get(b"d", 11, BloomBuilder::get_hash(b"d"))?
-                    .unwrap()
-                    .value,
-            );
+            assert_eq!(b"a7", &*table.get(b"a", 8, hash64(b"a"))?.unwrap().value,);
+            assert_eq!(b"a6", &*table.get(b"a", 7, hash64(b"a"))?.unwrap().value,);
+            assert_eq!(b"a5", &*table.get(b"a", 6, hash64(b"a"))?.unwrap().value,);
+            assert_eq!(b"a4", &*table.get(b"a", 5, hash64(b"a"))?.unwrap().value,);
+            assert_eq!(b"a3", &*table.get(b"a", 4, hash64(b"a"))?.unwrap().value,);
+            assert_eq!(b"b5", &*table.get(b"b", 6, hash64(b"b"))?.unwrap().value,);
+            assert_eq!(b"c8", &*table.get(b"c", 9, hash64(b"c"))?.unwrap().value,);
+            assert_eq!(b"d10", &*table.get(b"d", 11, hash64(b"d"))?.unwrap().value,);
             Ok(())
         },
         None,
@@ -1531,62 +1470,14 @@ fn table_partitioned_index() -> crate::Result<()> {
         "should use partitioned index",
     );
 
-    assert_eq!(
-        b"a7",
-        &*table
-            .get(b"a", 8, BloomBuilder::get_hash(b"a"))?
-            .unwrap()
-            .value,
-    );
-    assert_eq!(
-        b"a6",
-        &*table
-            .get(b"a", 7, BloomBuilder::get_hash(b"a"))?
-            .unwrap()
-            .value,
-    );
-    assert_eq!(
-        b"a5",
-        &*table
-            .get(b"a", 6, BloomBuilder::get_hash(b"a"))?
-            .unwrap()
-            .value,
-    );
-    assert_eq!(
-        b"a4",
-        &*table
-            .get(b"a", 5, BloomBuilder::get_hash(b"a"))?
-            .unwrap()
-            .value,
-    );
-    assert_eq!(
-        b"a3",
-        &*table
-            .get(b"a", 4, BloomBuilder::get_hash(b"a"))?
-            .unwrap()
-            .value,
-    );
-    assert_eq!(
-        b"b5",
-        &*table
-            .get(b"b", 6, BloomBuilder::get_hash(b"b"))?
-            .unwrap()
-            .value,
-    );
-    assert_eq!(
-        b"c8",
-        &*table
-            .get(b"c", 9, BloomBuilder::get_hash(b"c"))?
-            .unwrap()
-            .value,
-    );
-    assert_eq!(
-        b"d10",
-        &*table
-            .get(b"d", 11, BloomBuilder::get_hash(b"d"))?
-            .unwrap()
-            .value,
-    );
+    assert_eq!(b"a7", &*table.get(b"a", 8, hash64(b"a"))?.unwrap().value,);
+    assert_eq!(b"a6", &*table.get(b"a", 7, hash64(b"a"))?.unwrap().value,);
+    assert_eq!(b"a5", &*table.get(b"a", 6, hash64(b"a"))?.unwrap().value,);
+    assert_eq!(b"a4", &*table.get(b"a", 5, hash64(b"a"))?.unwrap().value,);
+    assert_eq!(b"a3", &*table.get(b"a", 4, hash64(b"a"))?.unwrap().value,);
+    assert_eq!(b"b5", &*table.get(b"b", 6, hash64(b"b"))?.unwrap().value,);
+    assert_eq!(b"c8", &*table.get(b"c", 9, hash64(b"c"))?.unwrap().value,);
+    assert_eq!(b"d10", &*table.get(b"d", 11, hash64(b"d"))?.unwrap().value,);
 
     Ok(())
 }
@@ -1637,19 +1528,9 @@ fn table_global_seqno() -> crate::Result<()> {
     .unwrap();
 
     // global seqno is 7, so a1 is = 8 -> can not be read by snapshot=8
-    assert!(
-        table
-            .get(b"a1", 8, BloomBuilder::get_hash(b"a1"))?
-            .is_none()
-    );
+    assert!(table.get(b"a1", 8, hash64(b"a1"))?.is_none());
 
-    assert_eq!(
-        b"a0",
-        &*table
-            .get(b"a0", 8, BloomBuilder::get_hash(b"a0"))?
-            .unwrap()
-            .value,
-    );
+    assert_eq!(b"a0", &*table.get(b"a0", 8, hash64(b"a0"))?.unwrap().value,);
 
     Ok(())
 }
@@ -2135,8 +2016,8 @@ fn bloom_may_contain_key_full_filter() -> crate::Result<()> {
     test_with_table(
         &items,
         |table| {
-            let hash_a = BloomBuilder::get_hash(b"a");
-            let hash_b = BloomBuilder::get_hash(b"b");
+            let hash_a = hash64(b"a");
+            let hash_b = hash64(b"b");
 
             // Existing key: both methods must accept
             assert!(
@@ -2183,7 +2064,7 @@ fn bloom_may_contain_key_partitioned_filter() -> crate::Result<()> {
         &items,
         |table| {
             // Key that exists: both methods must accept
-            let hash_exist = BloomBuilder::get_hash(b"key_0050");
+            let hash_exist = hash64(b"key_0050");
             assert!(
                 table.bloom_may_contain_key(b"key_0050", hash_exist)?,
                 "bloom must not reject existing key in partitioned filter"
@@ -2193,7 +2074,7 @@ fn bloom_may_contain_key_partitioned_filter() -> crate::Result<()> {
             // seek finds no ceiling and must return Ok(false).
             // Note: pinned_filter_index is always loaded when filter_tli exists
             // (unconditional in Table::recover), so this is always the partition-aware path.
-            let hash_beyond = BloomBuilder::get_hash(b"zzz_beyond");
+            let hash_beyond = hash64(b"zzz_beyond");
             assert!(
                 !table.bloom_may_contain_key(b"zzz_beyond", hash_beyond)?,
                 "key beyond all partitions should be rejected when partition index is available"

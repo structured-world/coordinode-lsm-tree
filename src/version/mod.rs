@@ -1,6 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2024-present, fjall-rs
-// This source code is licensed under both the Apache 2.0 and MIT License
-// (found in the LICENSE-* files in the repository)
+// Copyright (c) 2026-present, Structured World Foundation
 
 mod blob_file_list;
 mod optimize;
@@ -712,7 +712,7 @@ impl Version {
         //
 
         writer.start("format_version")?;
-        writer.write_u8(FormatVersion::V4.into())?;
+        writer.write_u8(FormatVersion::V5.into())?;
 
         writer.start("crate_version")?;
         writer.write_all(env!("CARGO_PKG_VERSION").as_bytes())?;

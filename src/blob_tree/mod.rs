@@ -1,6 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2024-present, fjall-rs
-// This source code is licensed under both the Apache 2.0 and MIT License
-// (found in the LICENSE-* files in the repository)
+// Copyright (c) 2026-present, Structured World Foundation
 
 mod gc;
 pub mod handle;
@@ -784,8 +784,7 @@ impl AbstractTree for BlobTree {
             let miss_keys: Vec<(usize, u64)> = remaining
                 .iter()
                 .map(|&idx| {
-                    let hash =
-                        crate::table::filter::standard_bloom::Builder::get_hash(keys[idx].as_ref());
+                    let hash = crate::hash::hash64(keys[idx].as_ref());
                     (idx, hash)
                 })
                 .collect();

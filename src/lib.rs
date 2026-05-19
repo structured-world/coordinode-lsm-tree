@@ -1,43 +1,59 @@
+// SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2024-present, fjall-rs
-// This source code is licensed under both the Apache 2.0 and MIT License
-// (found in the LICENSE-* files in the repository)
+// Copyright (c) 2026-present, Structured World Foundation
 
-//! A K.I.S.S. implementation of log-structured merge trees (LSM-trees/LSMTs).
+//! Embedded LSM-tree storage engine.
 //!
-//! ##### NOTE
+//! Provides keyed point reads, prefix and range scans, MVCC snapshots, block
+//! and file-descriptor caching, and a configurable compaction subsystem. No
+//! write-ahead log — durability is the caller's responsibility (`flush_active_memtable`
+//! forces persistence when needed).
 //!
-//! > This crate only provides a primitive LSM-tree, not a full storage engine.
-//! > You probably want to use <https://crates.io/crates/fjall> instead.
-//! > For example, it does not ship with a write-ahead log, so writes are not
-//! > persisted until manually flushing the memtable.
+//! ## Highlights
 //!
-//! ##### About
+//! - **AMQ filter**: `BuRR` (Bumped Ribbon Retrieval, Walzer & Dillinger 2022) for
+//!   per-key and per-prefix membership checks. ~30% smaller filter blocks than a
+//!   same-FPR Bloom filter, or ~10× tighter FPR at the same memory budget.
+//! - **Compression**: pure-Rust zstd (incl. dictionary mode), LZ4, or none —
+//!   per-table and per-level policy.
+//! - **Encryption at rest**: AES-256-GCM block encryption with a caller-supplied
+//!   key.
+//! - **Range tombstones**: `delete_range` / `delete_prefix` (SST-encoded; the
+//!   feature was added in disk format V4 and remains supported in the current
+//!   V5 format — V5's breaking change is the filter wire format, not the
+//!   tombstone encoding).
+//! - **Merge operators**: commutative-merge LSM operations with lazy resolution.
+//! - **K/V separation (`BlobTree`)**: large-value workloads with automatic GC.
+//! - **Pluggable `Fs`**: standard, in-memory, `io_uring`, or custom backends.
+//! - **MVCC**: snapshot reads at a chosen `SeqNo`, custom `UserComparator`.
+//! - **Concurrency**: thread-safe `BTreeMap`-like API.
 //!
-//! This crate exports a `Tree` that supports a subset of the `BTreeMap` API.
+//! Keys: up to 65,535 bytes (`u16` length field). Values: up to 4,294,967,295
+//! bytes (`u32` length field, `2³² − 1`). Larger keys and values
+//! carry a proportional performance cost.
 //!
-//! LSM-trees are an alternative to B-trees to persist a sorted list of items (e.g. a database table)
-//! on disk and perform fast lookup queries.
-//! Instead of updating a disk-based data structure in-place,
-//! deltas (inserts and deletes) are added into an in-memory write buffer (`Memtable`).
-//! Data is then flushed to disk-resident table files when the write buffer reaches some threshold.
+//! ## Quick start
 //!
-//! Amassing many tables on disk will degrade read performance and waste disk space, so tables
-//! can be periodically merged into larger tables in a process called `Compaction`.
-//! Different compaction strategies have different advantages and drawbacks, and should be chosen based
-//! on the workload characteristics.
+//! ```no_run
+//! use lsm_tree::{AbstractTree, Config, SequenceNumberCounter};
 //!
-//! Because maintaining an efficient structure is deferred to the compaction process, writing to an LSMT
-//! is very fast (_O(1)_ complexity).
+//! let folder = tempfile::tempdir().unwrap();
+//! let seqno = SequenceNumberCounter::default();
+//! let tree = Config::new(&folder, seqno.clone(), SequenceNumberCounter::default())
+//!     .open()
+//!     .unwrap();
 //!
-//! Keys are limited to 65536 bytes, values are limited to 2^32 bytes. As is normal with any kind of storage
-//! engine, larger keys and values have a bigger performance impact.
-
-#![doc(
-    html_logo_url = "https://raw.githubusercontent.com/structured-world/coordinode-lsm-tree/main/logo.png"
-)]
-#![doc(
-    html_favicon_url = "https://raw.githubusercontent.com/structured-world/coordinode-lsm-tree/main/logo.png"
-)]
+//! tree.insert("key", "value", seqno.next());
+//! let value = tree.get("key", lsm_tree::SeqNo::MAX).unwrap();
+//! assert_eq!(value.map(|v| v.to_vec()), Some(b"value".to_vec()));
+//! ```
+//!
+//! ## On-disk format
+//!
+//! Current version: **V5**. V5 introduces a wire-format break for filter
+//! blocks (`BuRR` replaces Bloom); V3 and V4 databases are not readable by
+//! this version and vice versa. The manifest version gate rejects pre-V5
+//! databases at `Tree::open` time.
 #![deny(clippy::all, missing_docs, clippy::cargo)]
 #![deny(clippy::unwrap_used)]
 #![deny(clippy::indexing_slicing)]
@@ -110,7 +126,7 @@ pub mod file;
 /// Pluggable filesystem abstraction for I/O backends.
 pub mod fs;
 
-mod hash;
+pub mod hash;
 mod heap;
 mod ingestion;
 mod iter_guard;

@@ -1,6 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2024-present, fjall-rs
-// This source code is licensed under both the Apache 2.0 and MIT License
-// (found in the LICENSE-* files in the repository)
+// Copyright (c) 2026-present, Structured World Foundation
 
 use super::FilterWriter;
 use crate::{
@@ -9,7 +9,7 @@ use crate::{
     config::BloomConstructionPolicy,
     encryption::EncryptionProvider,
     prefix::PrefixExtractor,
-    table::{Block, filter::standard_bloom::Builder},
+    table::{Block, filter::build_burr_filter_bytes},
 };
 use std::sync::Arc;
 
@@ -69,15 +69,15 @@ impl<W: std::io::Write + std::io::Seek> FilterWriter<W> for FullFilterWriter {
     }
 
     fn register_key(&mut self, key: &UserKey) -> crate::Result<()> {
-        self.bloom_hash_buffer.push(Builder::get_hash(key));
+        self.bloom_hash_buffer.push(crate::hash::hash64(key));
 
-        // NOTE: Prefix hashes are intentionally not deduplicated — duplicate
-        // hashes set the same bloom bits (idempotent). This can significantly
-        // inflate the bloom entry count when many keys share few prefixes, but
-        // in exchange it lowers effective FPR and keeps construction simple.
+        // Prefix hashes are intentionally not deduplicated. The filter
+        // treats each hash as an independent membership token; duplicates
+        // inflate the entry count but keep construction simple and lower
+        // effective FPR slightly.
         if let Some(extractor) = &self.prefix_extractor {
             for prefix in extractor.prefixes(key.as_ref()) {
-                self.bloom_hash_buffer.push(Builder::get_hash(prefix));
+                self.bloom_hash_buffer.push(crate::hash::hash64(prefix));
             }
         }
 
@@ -90,44 +90,48 @@ impl<W: std::io::Write + std::io::Seek> FilterWriter<W> for FullFilterWriter {
     ) -> crate::Result<usize> {
         if self.bloom_hash_buffer.is_empty() {
             log::trace!("Filter writer has no buffered hashes - not building filter");
-        } else {
-            file_writer.start("filter")?;
-
-            let n = self.bloom_hash_buffer.len();
-
-            log::trace!(
-                "Constructing Bloom filter with {n} entries: {:?}",
-                self.bloom_policy,
-            );
-
-            let start = std::time::Instant::now();
-
-            let filter_bytes = {
-                let mut builder = self.bloom_policy.init(n);
-
-                for hash in self.bloom_hash_buffer {
-                    builder.set_with_hash(hash);
-                }
-
-                builder.build()
-            };
-
-            log::trace!(
-                "Built Bloom filter ({}B) in {:?}",
-                filter_bytes.len(),
-                start.elapsed(),
-            );
-
-            Block::write_into(
-                file_writer,
-                &filter_bytes,
-                crate::table::block::BlockType::Filter,
-                CompressionType::None,
-                self.encryption.as_deref(),
-                #[cfg(zstd_any)]
-                None,
-            )?;
+            return Ok(0);
         }
+
+        let n = self.bloom_hash_buffer.len();
+
+        log::trace!(
+            "Constructing BuRR filter with {n} entries: {:?}",
+            self.bloom_policy,
+        );
+
+        let start = std::time::Instant::now();
+        // Build BEFORE opening the archive section. An invalid policy
+        // can produce empty bytes; opening start("filter") and then
+        // bailing out would leave an empty unfinished section in the
+        // output and desynchronise the reported block count from what
+        // was actually written.
+        // `finish` consumes `Box<Self>`, so we can move `bloom_hash_buffer`
+        // into the BuRR builder directly — no `to_vec()` clone.
+        let filter_bytes = build_burr_filter_bytes(self.bloom_policy, self.bloom_hash_buffer)?;
+
+        if filter_bytes.is_empty() {
+            log::trace!("BuRR policy produced empty filter — skipping block write");
+            return Ok(0);
+        }
+
+        file_writer.start("filter")?;
+
+        log::trace!(
+            "Built BuRR filter ({}B) in {:?}",
+            filter_bytes.len(),
+            start.elapsed(),
+        );
+
+        Block::write_into(
+            file_writer,
+            &filter_bytes,
+            crate::table::block::BlockType::Filter,
+            CompressionType::None,
+            self.encryption.as_deref(),
+            #[cfg(zstd_any)]
+            None,
+        )?;
 
         Ok(1)
     }
