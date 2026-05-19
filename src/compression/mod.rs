@@ -13,7 +13,7 @@ use std::io::{Read, Write};
 use std::sync::Arc;
 
 #[cfg(feature = "zstd")]
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 /// Zstd compression backend operations.
 ///
@@ -89,6 +89,15 @@ pub struct ZstdDictionary {
     /// to a single call per `ZstdDictionary` instance.
     #[cfg(feature = "zstd")]
     prepared: Arc<OnceLock<structured_zstd::decoding::DictionaryHandle>>,
+    /// Serialises the first-use parse so a cold start across N threads pays
+    /// exactly one dictionary parse, not N. `OnceLock` alone does not provide
+    /// this: every racer would do the full parse before reaching `set()`, and
+    /// the losers' parsed `Dictionary` tables would linger in their TLS
+    /// `FrameDecoder`s — defeating the main win of pre-parsed sharing. The
+    /// fast path is `prepared.get()` BEFORE taking this lock, so the mutex
+    /// is contended only on the first cold start and never on hot paths.
+    #[cfg(feature = "zstd")]
+    prepare_lock: Arc<Mutex<()>>,
 }
 
 #[cfg(zstd_any)]
@@ -99,6 +108,8 @@ impl Clone for ZstdDictionary {
             raw: Arc::clone(&self.raw),
             #[cfg(feature = "zstd")]
             prepared: Arc::clone(&self.prepared),
+            #[cfg(feature = "zstd")]
+            prepare_lock: Arc::clone(&self.prepare_lock),
         }
     }
 }
@@ -145,6 +156,8 @@ impl ZstdDictionary {
             raw: Arc::from(raw),
             #[cfg(feature = "zstd")]
             prepared: Arc::new(OnceLock::new()),
+            #[cfg(feature = "zstd")]
+            prepare_lock: Arc::new(Mutex::new(())),
         }
     }
 
@@ -171,6 +184,27 @@ impl ZstdDictionary {
         use structured_zstd::decoding::{Dictionary, DictionaryHandle};
         const DICT_MAGIC: [u8; 4] = [0x37, 0xA4, 0x30, 0xEC];
 
+        // Fast path: lock-free read once the OnceLock is populated. Hot
+        // decompress calls hit this on every invocation after the first.
+        if let Some(handle) = self.prepared.get() {
+            return Ok(handle.clone());
+        }
+
+        // Cold path: serialise the parse so a cold start across N threads
+        // pays exactly one parse, not N. `OnceLock::set` alone would let
+        // every racer do the full parse before checking the cache, and the
+        // losers' tables would linger in their TLS `FrameDecoder`s — the
+        // main win of #232 is the per-dict O(1)-parse contract, not just
+        // the cache hit on subsequent calls. Poisoning is benign here: the
+        // critical section is a single side-effect-free parse + `OnceLock::set`,
+        // so we strip the poison rather than propagate it.
+        let _guard = self
+            .prepare_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        // Double-check: another thread may have populated the OnceLock while
+        // we waited on the mutex. In that case skip the parse entirely.
         if let Some(handle) = self.prepared.get() {
             return Ok(handle.clone());
         }
@@ -189,11 +223,11 @@ impl ZstdDictionary {
             DictionaryHandle::from_dictionary(dict)
         };
 
-        // Race-tolerant set: on collision, `set` returns our handle back via
-        // the Err arm. Both racers produced equivalent handles (same raw bytes
-        // → same parsed `Dictionary`), so returning the local clone is
-        // identical to returning the cached one. The cache is populated for
-        // future callers regardless of who won.
+        // Set is guaranteed to succeed inside the mutex (only the lock
+        // holder ever reaches here past the double-check above), but we
+        // tolerate Err defensively for the same reason `OnceLock::set`
+        // exists — to keep the code resilient if a future refactor moves
+        // the parse outside the lock.
         let _ = self.prepared.set(handle.clone());
         Ok(handle)
     }
@@ -663,7 +697,10 @@ mod tests {
             // Bytes that LOOK like a finalized dict (magic prefix matches)
             // but are otherwise malformed must surface a parse error
             // through `prepared_handle` rather than panicking. The OnceLock
-            // must NOT be populated with anything on failure.
+            // must NOT be populated with anything on failure — otherwise a
+            // future caller would skip the (now-deterministically-failing)
+            // parse and silently fall back to a stale cached value, breaking
+            // the retry-on-failure contract.
             let mut bad = vec![0x37, 0xA4, 0x30, 0xEC]; // valid magic
             bad.extend_from_slice(&[0xFF; 16]); // garbage payload
             let dict = ZstdDictionary::new(&bad);
@@ -671,6 +708,10 @@ mod tests {
             assert!(
                 result.is_err(),
                 "corrupted finalized dict must surface parse error",
+            );
+            assert!(
+                dict.prepared.get().is_none(),
+                "failed parse must NOT populate the OnceLock — retry-on-failure contract",
             );
         }
 
@@ -706,22 +747,19 @@ mod tests {
 
         #[cfg(feature = "zstd")]
         #[test]
-        fn prepared_handle_finalized_dict_parses_from_test_vector() {
-            // Use one of the canned test-vector dictionaries (validity is
-            // guaranteed by the existing decompress tests).
+        fn prepared_handle_is_lazy_and_populated_after_first_call() {
+            // The cache contract is lazy-init: `ZstdDictionary::new` must
+            // NOT eagerly parse, and the OnceLock must transition from
+            // `None` to `Some(_)` precisely on the first `prepared_handle`
+            // call. This pins both halves of the contract — a regression
+            // either way (eager parse OR no caching) lights up the assert.
             //
-            // We cannot easily build a "good" finalized dict here without
-            // re-implementing the zstd dict-builder; the existing
-            // zstd_backend tests cover the finalized path end-to-end via
-            // real compressed frames. This test confirms the
-            // raw-content branch is at least taken for non-magic bytes
-            // (covered by prepared_handle_raw_content_dict_parses_and_memoizes
-            // above), and the finalized-magic-but-malformed branch surfaces
-            // errors (prepared_handle_rejects_corrupted_finalized_magic).
-            //
-            // What this test adds: a fresh `ZstdDictionary` reports
-            // `.prepared.get() == None` BEFORE the first call — i.e. the
-            // cache is genuinely lazy, not eagerly filled in `new()`.
+            // The end-to-end "real finalized dict parses successfully" path
+            // is exercised by the existing `zstd_backend` round-trip suite
+            // (which feeds real compressed frames through `decompress_with_dict`,
+            // implicitly going through `prepared_handle`); duplicating the
+            // dict-builder here would require linking the zstd dict trainer
+            // and adds no coverage over what the backend tests already give.
             let dict = ZstdDictionary::new(b"laziness test bytes");
             assert!(
                 dict.prepared.get().is_none(),
