@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779113931815,
+  "lastUpdate": 1779152476431,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -6630,6 +6630,84 @@ window.BENCHMARK_DATA = {
             "value": 651795.2070071183,
             "unit": "ops/sec (normalized)",
             "extra": "raw: 557080 ops/sec | factor: 1.170 | P50: 1.6us | P99: 3.9us | P99.9: 10.5us\nthreads: 1 | elapsed: 0.36s | num: 200000 | iterations: 3 | runner: seq_wr=18258 rand_rd=849464 cpu=140 composite=19657.8"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "3105d3aec3c5d491b4254d5778a4876f2f1de3b3",
+          "message": "feat(ci): smart upstream-monitor with release intelligence + path-aware CodeRabbit profile (#264)\n\n> Supersedes #259 (closed unmerged for a clean review history after the\nprevious PR accumulated 70+ resolved threads across 9 review rounds).\nSame branch, same scope, same body.\n\n## Summary\n\nTwo CI tooling files. Together they upgrade the fork's upstream-sync\nflow from \"count commits and try a merge\" to a Dependabot-style\ndependency-aware sync surface that respects maintainer decisions.\n\n- **`.github/workflows/upstream-monitor.yml`** — full rewrite. Surfaces\nupstream changes as a structured PR (clean merge) or issue (conflict),\ncategorises commits by Conventional Commits, anchors the report to a\nrelease tag when one is available, resolves referenced upstream\nissues/PRs to titles, flags fork-overlap files for manual review, and\ntracks \"already considered\" upstream HEADs so a closed sync PR isn't\nauto-recreated until upstream advances.\n- **`.coderabbit.yaml`** — expanded from a 7-line stub to a full\npath-aware review profile: knowledge-base linked to the project's\n`copilot-instructions.md` + `instructions/*.instructions.md`,\npath-specific review focus for security/compaction/encryption areas,\nfull label-enrichment catalog matching the repo's actual label set.\n\n## What the maintainer sees on a sync run\n\nEach run produces ONE artifact for the current upstream HEAD:\n\n- **Clean merge** → sync PR with title `chore: sync upstream-<short> (N\nnew commits)`, body containing release detection, conventional-commit\ncategorisation (Breaking ⚠️ / Features ✨ / Fixes 🐛 / Performance ⚡ /\nOther 📝), referenced upstream issues/PRs with resolved titles,\nfork-overlap file list, and a review checklist.\n- **Conflict** → issue with title `Upstream sync conflict for\nupstream-<short> (N new commits)` carrying the same context plus a\nmanual-resolution snippet. This is the steady state for forks with\npermanent rename / cherry-pick divergences.\n- **Pre-merge failure** (dirty tree, internal git error) → distinct\nissue title `Upstream sync merge failed without conflicts for\nupstream-<short>` so on-call investigates the workflow rather than\nchasing phantom conflicts.\n\n## \"Already considered\" semantic\n\nMaintainer interactions on the auto-PR/issue ARE the considered signal —\nno separate state file edit or tag bump needed:\n\n- **Open** → review in progress, future runs skip via `gh search issues\n\"upstream-<short> in:title label:upstream-sync\"`.\n- **Merged** → user accepted; origin/main advances; next run reads\n`BEHIND=0` naturally.\n- **Closed without merge** → user said \"no\" for this upstream HEAD;\nclosed PR/issue still satisfies the title search, future runs skip until\nupstream advances (new short SHA → no search match → new artifact\nsurfaced).\n\n`workflow_dispatch` input `force=true` bypasses the skip for explicit\n\"re-surface anyway\" runs.\n\n## Other workflow behaviour locked in\n\n- **State file** `.github/state/last-upstream-sync.txt` — written on\neach successful merge, lazily bootstrapped via `--merged origin/main ∩\n--merged upstream/main` (intersection guarantees only upstream-origin\ntags qualify, fork's own releases excluded).\n- **Idempotent label create** — `upstream-sync` label is\n`--force`-created at the top of every gh-creating step so a\ndeleted/missing label doesn't abort the workflow.\n- **Early skip gate** — skip-check runs before the expensive Build step\n(up to 20 upstream API calls per ref), short-circuiting cron noise.\n- **Sync-branch naming** — `chore/upstream-sync-<date>-<run-number>`\navoids same-UTC-day collisions on re-runs.\n- **Body composition** — checklist appended last on both routes (success\n/ conflict); conflict block inserted before checklist for top-to-bottom\nreading order.\n- **GH_REPO** pinned at workflow env level so `gh` calls don't\naccidentally route to the upstream remote.\n- **md_escape** covers `` ` `` `|` `[` `]` `(` `)` `<` `>` `*` `_` `#`\nso arbitrary upstream issue titles can't break the rendered markdown.\n- **Pre-split refs cap** — at most 20 referenced issues/PRs rendered per\nsync report; the report's primary value is \"upstream has N new,\nmergeable: yes/no\" rather than exhaustive ref enumeration.\n\n## `.coderabbit.yaml` deliverables\n\n- `profile: assertive`, `poem: false`, `auto_incremental_review: true`,\n`drafts: false`, `early_access: false` (stable channel for reproducible\nreviews).\n- `path_instructions` for `src/**/*.rs`, `tests/**`, `benches/**`,\n`src/compaction/**`, `src/encryption*.rs` + `src/encryption/**`\n(mirrored blocks with `⚠️ Keep in sync` trailer; brace expansion + YAML\nanchors rejected as schema-uncertain).\n- `knowledge_base.code_guidelines.filePatterns` →\n`.github/copilot-instructions.md` +\n`.github/instructions/*.instructions.md`.\n- `issue_enrichment.labeling.auto_apply_labels: true` with 14 labels\nmatching this repo's actual catalog (`bug`, `enhancement`,\n`performance`, `refactor`, `test`, `ci`, `documentation`, `comparator`,\n`compaction`, `crash-safety`, `encryption`, `fs-trait`,\n`upstream-candidate`, `fork-only`).\n- `base_branches: [\"main\"]` documented inline (sync PRs also target\n`main`).\n\n## Test plan\n\n- [x] YAML parses (both files)\n- [x] yamllint clean (both files)\n- [x] shellcheck clean (every `run: |` block)\n- [x] Locally tested: NUL-record parser handles multi-line commit body\nwith `BREAKING CHANGE:` footer (2 records in / 2 categorised);\nref-tokeniser strips path/to/file#42 false-positives and captures\n`fjall-rs/lsm-tree#456.` cross-repo refs after trailing-`.` strip;\nconventional-commit regex anchors prevent false-positive breaking-change\nclassification.\n- [x] Live-tested end-to-end via 5 `workflow_dispatch` runs on this\nbranch — caught and fixed: (a) `gh` routing through upstream remote →\npinned `GH_REPO`; (b) `git push` of tag pointing at upstream rejected\nfor workflow files → simplified mechanism to title-search (no tags); (c)\nskip-check ordering moved before expensive Build for API-quota savings.\n- [x] Close-without-merge respected: closing the test sync issue → next\n`workflow_dispatch` correctly emits `Skip: N sync artifact(s) for\nupstream-<short> already exist`.\n\n## Out of scope (tracked separately if revisited)\n\n- `force=true` in cron mode (currently dispatch-only).\n- Multi-branch base support (sync always targets `main`; widen\n`base_branches` if that changes).\n- Pre-release upstream tags (semver regex intentionally stable-only).\n\nCloses #126\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n## Summary by CodeRabbit\n\n* **Chores**\n* Upgraded upstream sync: run daily, added manual \"force\" resurfacing,\nlonger timeouts, env-based state handling, improved detection and\nstructured summaries of upstream releases, safer branch/merge handling,\nand clearer automated issue/PR creation on failures or conflicts.\n* Expanded review automation: set default language and disabled\nearly-access, broader review checks and path scopes, enabled linters and\nGitHub checks with increased timeout, auto-review/chat auto-replies,\nenriched labeling and knowledge-base scopes.\n\n<!-- review_stack_entry_start -->\n\n[![Review Change\nStack](https://storage.googleapis.com/coderabbit_public_assets/review-stack-in-coderabbit-ui.svg)](https://app.coderabbit.ai/change-stack/structured-world/coordinode-lsm-tree/pull/264?utm_source=github_walkthrough&utm_medium=github&utm_campaign=change_stack)\n\n<!-- review_stack_entry_end -->\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-05-19T03:59:56+03:00",
+          "tree_id": "0c415390fb3668d2954e91149abb1b2199ff8f1a",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/3105d3aec3c5d491b4254d5778a4876f2f1de3b3"
+        },
+        "date": 1779152474652,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 1096873.315172438,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 2020424 ops/sec | factor: 0.543 | P50: 0.4us | P99: 2.1us | P99.9: 5.0us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3 | runner: seq_wr=230711 rand_rd=952696 cpu=123 composite=42365.7"
+          },
+          {
+            "name": "fillrandom",
+            "value": 614354.6951606381,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 1131632 ops/sec | factor: 0.543 | P50: 0.7us | P99: 2.6us | P99.9: 6.5us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3 | runner: seq_wr=230711 rand_rd=952696 cpu=123 composite=42365.7"
+          },
+          {
+            "name": "readrandom",
+            "value": 296588.0629198126,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 546311 ops/sec | factor: 0.543 | P50: 1.6us | P99: 5.2us | P99.9: 13.1us\nthreads: 1 | elapsed: 0.37s | num: 200000 | iterations: 3 | runner: seq_wr=230711 rand_rd=952696 cpu=123 composite=42365.7"
+          },
+          {
+            "name": "readseq",
+            "value": 1385007.5215426534,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 2551163 ops/sec | factor: 0.543 | P50: 0.2us | P99: 3.8us | P99.9: 7.8us\nthreads: 1 | elapsed: 0.08s | num: 200000 | iterations: 3 | runner: seq_wr=230711 rand_rd=952696 cpu=123 composite=42365.7"
+          },
+          {
+            "name": "seekrandom",
+            "value": 208683.11486890516,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 384391 ops/sec | factor: 0.543 | P50: 2.3us | P99: 6.0us | P99.9: 13.6us\nthreads: 1 | elapsed: 0.52s | num: 200000 | iterations: 3 | runner: seq_wr=230711 rand_rd=952696 cpu=123 composite=42365.7"
+          },
+          {
+            "name": "prefixscan",
+            "value": 101578.56257076559,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 187106 ops/sec | factor: 0.543 | P50: 5.0us | P99: 6.9us | P99.9: 16.8us\nthreads: 1 | elapsed: 1.07s | num: 200000 | iterations: 3 | runner: seq_wr=230711 rand_rd=952696 cpu=123 composite=42365.7"
+          },
+          {
+            "name": "overwrite",
+            "value": 658461.4763824788,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 1212876 ops/sec | factor: 0.543 | P50: 0.7us | P99: 2.5us | P99.9: 5.7us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3 | runner: seq_wr=230711 rand_rd=952696 cpu=123 composite=42365.7"
+          },
+          {
+            "name": "mergerandom",
+            "value": 400965.613888904,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 738573 ops/sec | factor: 0.543 | P50: 0.3us | P99: 1.9us | P99.9: 3.2us\nthreads: 1 | elapsed: 0.27s | num: 200000 | iterations: 3 | runner: seq_wr=230711 rand_rd=952696 cpu=123 composite=42365.7"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 272680.0870996466,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 502273 ops/sec | factor: 0.543 | P50: 1.8us | P99: 4.2us | P99.9: 12.8us\nthreads: 1 | elapsed: 0.40s | num: 200000 | iterations: 3 | runner: seq_wr=230711 rand_rd=952696 cpu=123 composite=42365.7"
           }
         ]
       }
