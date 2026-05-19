@@ -383,7 +383,27 @@ mod tests {
             })
         }
 
-        const DYN_MIN_PROBES: usize = 2;
+        /// Minimum number of `compare()` calls a working dyn BS makes on
+        /// the BS-dominated index block: `⌈log2(128)⌉ = 7` probes.
+        ///
+        /// For `restart_interval == 1` (used by [`build_index_block_bs_dominated`]),
+        /// the index-block `seek` / `seek_upper` paths skip the
+        /// `advance_while` / `trim_back_to_upper_bound` linear-scan branches
+        /// in `seek_with_cache_resets` / `seek_upper_impl`, so the dyn count
+        /// equals the BS probe count exactly. lex-leak makes 0 calls.
+        ///
+        /// `assert delta >= 7` cleanly catches the lex-leak. A weaker
+        /// threshold could match an inflated lex-leak count if linear-scan
+        /// contributions were possible.
+        const DYN_MIN_BS_PROBES: usize = 7;
+
+        /// Above-max needle (9 bytes > any 8-byte encoded key) — used to
+        /// bound any potential linear-scan contribution.
+        fn above_max_needle() -> Vec<u8> {
+            let mut v = 127_u64.to_be_bytes().to_vec();
+            v.push(0xFF);
+            v
+        }
 
         #[test]
         fn index_block_seek_lex_path_skips_vtable() {
@@ -450,7 +470,7 @@ mod tests {
                 is_lex_count: Arc::new(AtomicUsize::new(0)),
                 lex: false,
             });
-            let needle = 64_u64.to_be_bytes();
+            let needle = above_max_needle();
 
             let before = count.load(AtomicOrdering::Relaxed);
             {
@@ -459,8 +479,8 @@ mod tests {
             }
             let delta = count.load(AtomicOrdering::Relaxed) - before;
             assert!(
-                delta >= DYN_MIN_PROBES,
-                "index seek dyn BS must call compare() at least {DYN_MIN_PROBES} times \
+                delta >= DYN_MIN_BS_PROBES,
+                "index seek dyn BS must call compare() at least {DYN_MIN_BS_PROBES} times \
                  (log2(128 restart heads) probes), got {delta} — lex closure leaked into dyn BS?",
             );
         }
@@ -474,7 +494,7 @@ mod tests {
                 is_lex_count: Arc::new(AtomicUsize::new(0)),
                 lex: false,
             });
-            let needle = 64_u64.to_be_bytes();
+            let needle = above_max_needle();
 
             let before = count.load(AtomicOrdering::Relaxed);
             {
@@ -483,8 +503,8 @@ mod tests {
             }
             let delta = count.load(AtomicOrdering::Relaxed) - before;
             assert!(
-                delta >= DYN_MIN_PROBES,
-                "index seek_upper dyn BS must call compare() at least {DYN_MIN_PROBES} times \
+                delta >= DYN_MIN_BS_PROBES,
+                "index seek_upper dyn BS must call compare() at least {DYN_MIN_BS_PROBES} times \
                  (log2(128 restart heads) probes), got {delta} — lex closure leaked into dyn BS?",
             );
         }

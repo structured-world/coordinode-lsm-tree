@@ -1510,10 +1510,35 @@ mod tests {
             }))
         }
 
-        /// Minimum number of `compare()` calls a working dyn path is expected
-        /// to make for any single seek on the BS-dominated block. See
-        /// [`build_block_bs_dominated`] for the math.
-        const DYN_MIN_PROBES: usize = 2;
+        /// Minimum number of `compare()` calls a working dyn binary-search
+        /// is expected to make on the BS-dominated block: `⌈log2(128)⌉ = 7`
+        /// probes against restart heads.
+        ///
+        /// Discrimination math (paired with an ABOVE-MAX needle in the
+        /// dyn tests for `seek_upper` / `seek_upper_exclusive`):
+        ///   - working dyn path:  7 BS probes + 1 linear-scan `compare_key` = 8
+        ///   - lex closure leak:  0 BS probes + 1 linear-scan `compare_key` = 1
+        ///
+        /// `assert delta >= 7` cleanly catches the lex-leak even after
+        /// accounting for the bounded linear-scan contribution. A weaker
+        /// threshold (e.g. `>= 2`) would fail to discriminate for needles
+        /// that produce 2+ linear-scan calls — for example an exact-key
+        /// needle hits in `seek_upper_exclusive` reverse scan
+        /// (Equal-skip then Less-return), which can satisfy `>= 2` even
+        /// when the BS predicate accidentally took the lex path.
+        const DYN_MIN_BS_PROBES: usize = 7;
+
+        /// Builds a needle that sorts strictly above the maximum encoded
+        /// key (key 127 in [`build_block_bs_dominated`]). Choosing this
+        /// needle bounds the reverse linear-scan contribution to exactly
+        /// 1 `compare_key` call (`peek_back` lands on key 127 → Less →
+        /// returns immediately), keeping the dyn / lex-leak discrimination
+        /// math above clean.
+        fn above_max_needle() -> Vec<u8> {
+            let mut v = 127_u64.to_be_bytes().to_vec();
+            v.push(0xFF);
+            v
+        }
 
         #[test]
         fn data_block_seek_lex_path_skips_vtable() -> crate::Result<()> {
@@ -1593,9 +1618,9 @@ mod tests {
         #[test]
         fn data_block_seek_to_key_seqno_dyn_path_invokes_compare() -> crate::Result<()> {
             // `seek_to_key_seqno` is the FORWARD seqno-aware binary search
-            // exposed without an attached linear scan — perfect isolation for
-            // the BS predicate. Any non-zero `compare()` call here proves the
-            // dyn closure ran for the forward BS predicate.
+            // exposed WITHOUT an attached linear scan — perfect isolation
+            // for the BS predicate. Working dyn path → exactly 7 BS probes.
+            // Lex closure leak → 0 calls.
             let data_block = build_block_bs_dominated()?;
             let count = Arc::new(AtomicUsize::new(0));
             let cmp: Arc<dyn UserComparator> = Arc::new(CountingComparator {
@@ -1612,21 +1637,26 @@ mod tests {
             }
             let delta = count.load(AtomicOrdering::Relaxed) - before;
             assert!(
-                delta >= 1,
-                "seek_to_key_seqno dyn BS must call compare(), got {delta} (lex closure leaked into dyn path?)",
+                delta >= DYN_MIN_BS_PROBES,
+                "seek_to_key_seqno dyn BS must call compare() at least {DYN_MIN_BS_PROBES} times \
+                 (log2(128 restart heads) probes, no linear scan), got {delta} — lex closure leaked into dyn BS?",
             );
             Ok(())
         }
 
         #[test]
         fn data_block_seek_upper_dyn_path_invokes_compare() -> crate::Result<()> {
-            // `seek_upper` does binary search + linear scan. In dyn path the
-            // linear scan also calls `compare_key` (which then calls
-            // `cmp.compare()` via its own dyn branch). To rule out the
-            // false-positive "lex closure leaked into BS but linear scan still
-            // calls compare()", we use the BS-dominated block (see
-            // `build_block_bs_dominated`) and assert count >= DYN_MIN_PROBES,
-            // which is impossible to reach from linear-scan calls alone.
+            // `seek_upper` does binary search + reverse linear scan. In dyn
+            // path the linear scan also calls `compare_key` (which goes
+            // through `cmp.compare()` via its own dyn branch). To prevent
+            // the linear scan from inflating the count to a value that a
+            // lex-BS-leak could also reach via scan-only contribution, we
+            // use an ABOVE-MAX needle (see `above_max_needle`): BS lands on
+            // key 127, peek_back returns key 127, compare_key → Less → loop
+            // exits → exactly 1 linear-scan call.
+            //
+            //   working dyn:  7 BS probes + 1 linear = 8  ✓ delta >= 7
+            //   lex-leak:     0 BS probes + 1 linear = 1  ✗ delta >= 7
             let data_block = build_block_bs_dominated()?;
             let count = Arc::new(AtomicUsize::new(0));
             let cmp: Arc<dyn UserComparator> = Arc::new(CountingComparator {
@@ -1634,7 +1664,7 @@ mod tests {
                 is_lex_count: Arc::new(AtomicUsize::new(0)),
                 lex: false,
             });
-            let needle = 64_u64.to_be_bytes();
+            let needle = above_max_needle();
 
             let before = count.load(AtomicOrdering::Relaxed);
             {
@@ -1643,8 +1673,8 @@ mod tests {
             }
             let delta = count.load(AtomicOrdering::Relaxed) - before;
             assert!(
-                delta >= DYN_MIN_PROBES,
-                "seek_upper dyn BS must call compare() at least {DYN_MIN_PROBES} times \
+                delta >= DYN_MIN_BS_PROBES,
+                "seek_upper dyn BS must call compare() at least {DYN_MIN_BS_PROBES} times \
                  (log2(128 restart heads) probes), got {delta} — lex closure leaked into dyn BS?",
             );
             Ok(())
@@ -1652,8 +1682,17 @@ mod tests {
 
         #[test]
         fn data_block_seek_upper_exclusive_dyn_path_invokes_compare() -> crate::Result<()> {
-            // Same isolation strategy as `seek_upper`: BS-dominated block makes
-            // BS predicate count impossible to fake from linear-scan-only calls.
+            // Same above-max-needle strategy as `seek_upper`. For
+            // `seek_upper_exclusive` (last key < needle) with needle
+            // above-max: BS lands on key 127, peek_back returns key 127,
+            // compare_key → Less → return true. Exactly 1 linear-scan call.
+            //
+            // The earlier version used `needle = 64` (exact-key match),
+            // which caused the reverse scan to consume Equal (key 64) THEN
+            // continue to key 63 (Less, return) — 2 linear calls. With the
+            // old `>= 2` threshold, a leaked-lex BS would still pass
+            // (0 + 2 = 2). The above-max needle bounds linear contribution
+            // to 1, restoring the discrimination math.
             let data_block = build_block_bs_dominated()?;
             let count = Arc::new(AtomicUsize::new(0));
             let cmp: Arc<dyn UserComparator> = Arc::new(CountingComparator {
@@ -1661,7 +1700,7 @@ mod tests {
                 is_lex_count: Arc::new(AtomicUsize::new(0)),
                 lex: false,
             });
-            let needle = 64_u64.to_be_bytes();
+            let needle = above_max_needle();
 
             let before = count.load(AtomicOrdering::Relaxed);
             {
@@ -1670,8 +1709,8 @@ mod tests {
             }
             let delta = count.load(AtomicOrdering::Relaxed) - before;
             assert!(
-                delta >= DYN_MIN_PROBES,
-                "seek_upper_exclusive dyn BS must call compare() at least {DYN_MIN_PROBES} times \
+                delta >= DYN_MIN_BS_PROBES,
+                "seek_upper_exclusive dyn BS must call compare() at least {DYN_MIN_BS_PROBES} times \
                  (log2(128 restart heads) probes), got {delta} — lex closure leaked into dyn BS?",
             );
             Ok(())
