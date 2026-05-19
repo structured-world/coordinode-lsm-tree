@@ -338,8 +338,11 @@ impl ParsedItem<InternalValue> for DataBlockParsedItem {
             // Lex fast path mirrors the prefix branch (which already
             // short-circuits through `compare_prefixed_slice_lexicographic`):
             // skip the `dyn UserComparator::compare` vtable call when the
-            // default comparator is in use. Restart-head probes during binary
-            // search land here every iteration.
+            // default comparator is in use. This branch is on the linear-scan
+            // and trim paths (e.g. `advance_while`, `trim_back_to_upper_bound`,
+            // and the linear-scan loops in `iter.rs`) — the binary-search
+            // predicates themselves are devirtualized independently at their
+            // construction sites in `iter.rs` and never reach `compare_key`.
             if cmp.is_lexicographic() {
                 key.cmp(needle)
             } else {

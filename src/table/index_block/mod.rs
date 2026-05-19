@@ -47,9 +47,13 @@ impl ParsedItem<KeyedBlockHandle> for IndexBlockParsedItem {
         } else {
             let key = unsafe { bytes.get_unchecked(self.end_key.0..self.end_key.1) };
             // Lex fast path: avoid the `dyn UserComparator::compare` vtable
-            // on the binary-search hot path (restart heads probed every
-            // iteration). The prefix branch above already short-circuits
-            // through `compare_prefixed_slice_lexicographic`.
+            // on the linear-scan and trim paths that iterate parsed items
+            // (e.g. `advance_while`, `trim_back_to_upper_bound`, and the
+            // linear-scan loops in `iter.rs`). The binary-search predicates
+            // themselves are devirtualized independently at their construction
+            // sites in `iter.rs` and never reach `compare_key`. The prefix
+            // branch above already short-circuits through
+            // `compare_prefixed_slice_lexicographic`.
             if cmp.is_lexicographic() {
                 key.cmp(needle)
             } else {
@@ -318,7 +322,15 @@ mod tests {
         use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
         struct CountingComparator {
+            /// Counts `compare()` invocations — proves the lex devirt path
+            /// successfully bypasses the `dyn UserComparator::compare` vtable.
             count: Arc<AtomicUsize>,
+            /// Counts `is_lexicographic()` invocations. The lex devirt
+            /// strategy gates each entry point on `is_lexicographic()`; this
+            /// counter proves the lex branch was actually selected (a
+            /// regression that always selected the dyn branch would leave
+            /// this at 0 in lex tests AND keep `count` at 0).
+            is_lex_count: Arc<AtomicUsize>,
             lex: bool,
         }
 
@@ -331,6 +343,7 @@ mod tests {
                 a.cmp(b)
             }
             fn is_lexicographic(&self) -> bool {
+                self.is_lex_count.fetch_add(1, AtomicOrdering::Relaxed);
                 self.lex
             }
         }
@@ -379,23 +392,32 @@ mod tests {
             // Per-entry-point snapshot localises any regression.
             let index_block = build_index_block_bs_dominated();
             let count = Arc::new(AtomicUsize::new(0));
+            let is_lex_count = Arc::new(AtomicUsize::new(0));
             let cmp: Arc<dyn UserComparator> = Arc::new(CountingComparator {
                 count: count.clone(),
+                is_lex_count: is_lex_count.clone(),
                 lex: true,
             });
             let needle = 64_u64.to_be_bytes();
 
             let before = count.load(AtomicOrdering::Relaxed);
+            let before_lex = is_lex_count.load(AtomicOrdering::Relaxed);
             {
                 let mut iter = index_block.iter(cmp.clone());
                 let _ = iter.seek(&needle, crate::SeqNo::MAX);
             }
             let after_seek = count.load(AtomicOrdering::Relaxed);
+            let after_seek_lex = is_lex_count.load(AtomicOrdering::Relaxed);
             assert_eq!(
                 after_seek - before,
                 0,
                 "index seek lex path leaked into dyn: {} compare() calls",
                 after_seek - before,
+            );
+            assert!(
+                after_seek_lex - before_lex >= 1,
+                "index seek lex path must consult is_lexicographic() to select the lex closure, got {} calls",
+                after_seek_lex - before_lex,
             );
 
             {
@@ -403,11 +425,17 @@ mod tests {
                 let _ = iter.seek_upper(&needle, crate::SeqNo::MAX);
             }
             let after_upper = count.load(AtomicOrdering::Relaxed);
+            let after_upper_lex = is_lex_count.load(AtomicOrdering::Relaxed);
             assert_eq!(
                 after_upper - after_seek,
                 0,
                 "index seek_upper lex path leaked into dyn: {} compare() calls",
                 after_upper - after_seek,
+            );
+            assert!(
+                after_upper_lex - after_seek_lex >= 1,
+                "index seek_upper lex path must consult is_lexicographic(), got {} calls",
+                after_upper_lex - after_seek_lex,
             );
         }
 
@@ -419,6 +447,7 @@ mod tests {
             let count = Arc::new(AtomicUsize::new(0));
             let cmp: Arc<dyn UserComparator> = Arc::new(CountingComparator {
                 count: count.clone(),
+                is_lex_count: Arc::new(AtomicUsize::new(0)),
                 lex: false,
             });
             let needle = 64_u64.to_be_bytes();
@@ -442,6 +471,7 @@ mod tests {
             let count = Arc::new(AtomicUsize::new(0));
             let cmp: Arc<dyn UserComparator> = Arc::new(CountingComparator {
                 count: count.clone(),
+                is_lex_count: Arc::new(AtomicUsize::new(0)),
                 lex: false,
             });
             let needle = 64_u64.to_be_bytes();
@@ -488,28 +518,55 @@ mod tests {
 
             let lex: Arc<dyn UserComparator> = Arc::new(CountingComparator {
                 count: Arc::new(AtomicUsize::new(0)),
+                is_lex_count: Arc::new(AtomicUsize::new(0)),
                 lex: true,
             });
             let dyn_cmp: Arc<dyn UserComparator> = Arc::new(CountingComparator {
                 count: Arc::new(AtomicUsize::new(0)),
+                is_lex_count: Arc::new(AtomicUsize::new(0)),
                 lex: false,
             });
 
-            // Boundary needles: below-min, low-exact, mid-exact, high-exact,
-            // exact-tail, above-max — covers partition_point left==0,
-            // left==len, and exact-hit cases.
-            for needle_val in &[0_u64, 1, 16, 24, 31, 100] {
-                let needle = needle_val.to_be_bytes();
+            // Boundary needles covering the full `partition_point` table:
+            //   - empty slice          → BELOW min (sorts before any non-empty)
+            //   - exact-min (key 0)
+            //   - 9-byte between-keys  → strictly between [0…0,16] and [0…0,17]
+            //   - exact-mid (key 16)
+            //   - exact-tail (key 31)  → last key, exercises left==len
+            //   - above-max (9 bytes)  → above any 8-byte key
+            //
+            // The previous version used only `to_be_bytes()` values which were
+            // all exact-keys + one above-max, missing the genuine below-min
+            // and between-key cases.
+            let between_16_and_17: Vec<u8> = {
+                let mut v = 16_u64.to_be_bytes().to_vec();
+                v.push(0); // 9 bytes: > 16, < 17 lexicographically
+                v
+            };
+            let above_max: Vec<u8> = {
+                let mut v = 31_u64.to_be_bytes().to_vec();
+                v.push(0xFF);
+                v
+            };
+            let needles: Vec<(&str, Vec<u8>)> = vec![
+                ("below-min (empty slice)", vec![]),
+                ("exact-min (key 0)", 0_u64.to_be_bytes().to_vec()),
+                ("between keys 16 and 17", between_16_and_17),
+                ("exact-mid (key 16)", 16_u64.to_be_bytes().to_vec()),
+                ("exact-tail (key 31)", 31_u64.to_be_bytes().to_vec()),
+                ("above-max (key 31 + 0xFF)", above_max),
+            ];
 
+            for (label, needle) in &needles {
                 let mut lex_iter = index_block.iter(lex.clone());
-                let lex_seek = lex_iter.seek(&needle, crate::SeqNo::MAX);
+                let lex_seek = lex_iter.seek(needle, crate::SeqNo::MAX);
 
                 let mut dyn_iter = index_block.iter(dyn_cmp.clone());
-                let dyn_seek = dyn_iter.seek(&needle, crate::SeqNo::MAX);
+                let dyn_seek = dyn_iter.seek(needle, crate::SeqNo::MAX);
 
                 assert_eq!(
                     lex_seek, dyn_seek,
-                    "index seek result must match for needle {needle_val}",
+                    "index seek result must match for needle {label} ({needle:?})",
                 );
 
                 // Compare landing end_key bytes (handles' materialized end_key).
@@ -522,7 +579,7 @@ mod tests {
                 assert_eq!(
                     lex_landing.as_ref().map(|s| s.as_ref().to_vec()),
                     dyn_landing.as_ref().map(|s| s.as_ref().to_vec()),
-                    "index landing end_key must match for needle {needle_val}",
+                    "index landing end_key must match for needle {label} ({needle:?})",
                 );
             }
         }
