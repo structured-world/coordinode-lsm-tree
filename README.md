@@ -13,7 +13,7 @@ LSM-tree storage engine in Rust. Embedded library; provides keyed point reads, p
 
 ## Status
 
-On-disk format version **V4**. Older V3 databases are read-only on this version; databases written here are not readable by V3 binaries. Versioning is single-monotonic — every breaking format change bumps to the next version with explicit migration notes.
+On-disk format version **V5**. V5 introduces a wire-format break for filter blocks (BuRR replaces Bloom); V3 and V4 databases are not readable by this version and vice versa. Versioning is single-monotonic — every breaking format change bumps to the next version with explicit migration notes.
 
 ## Features
 
