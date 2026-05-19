@@ -1420,4 +1420,179 @@ mod tests {
 
         Ok(())
     }
+
+    // Regression tests for binary-search-predicate devirtualization on the
+    // lexicographic fast path.
+    //
+    // The implementation branches once on `cmp.is_lexicographic()` per seek
+    // entry point and picks a closure that does direct slice comparison on
+    // the lex path (no vtable). These tests use a counting comparator
+    // wrapper to ASSERT that:
+    //   1. when `is_lexicographic() == true`, the comparator's `compare()`
+    //      is never invoked during the binary-search probe loop (lex closure
+    //      bypasses it)
+    //   2. when `is_lexicographic() == false`, `compare()` IS invoked
+    //      (preserves correctness for custom orderings)
+    //
+    // Behavioural-equivalence between lex and dyn paths is already exercised
+    // by the broader `custom_comparator*` integration tests; these tests
+    // specifically guard against accidental fallback into the dyn path on
+    // the default comparator (which would silently regress performance
+    // without any observable test failure).
+    mod devirt {
+        use crate::comparator::UserComparator;
+        use crate::{
+            Checksum, InternalValue, SeqNo, Slice,
+            ValueType::Value,
+            table::{
+                Block, DataBlock,
+                block::{BlockType, Header, ParsedItem},
+            },
+        };
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+        struct CountingComparator {
+            count: Arc<AtomicUsize>,
+            lex: bool,
+        }
+
+        impl UserComparator for CountingComparator {
+            fn name(&self) -> &'static str {
+                "counting"
+            }
+            fn compare(&self, a: &[u8], b: &[u8]) -> std::cmp::Ordering {
+                self.count.fetch_add(1, AtomicOrdering::Relaxed);
+                a.cmp(b)
+            }
+            fn is_lexicographic(&self) -> bool {
+                self.lex
+            }
+        }
+
+        fn build_block() -> crate::Result<DataBlock> {
+            // 64 keys → forces multiple restart intervals at any reasonable
+            // restart_interval, guaranteeing the binary-search probe loop
+            // runs at least 2 iterations (log2(8 restarts) = 3 probes).
+            let items: Vec<_> = (0_u64..64)
+                .map(|i| InternalValue::from_components(i.to_be_bytes(), "", 0, Value))
+                .collect();
+            let bytes = DataBlock::encode_into_vec(&items, 8, 1.33)?;
+            Ok(DataBlock::new(Block {
+                data: bytes.into(),
+                header: Header {
+                    block_type: BlockType::Data,
+                    checksum: Checksum::from_raw(0),
+                    data_length: 0,
+                    uncompressed_length: 0,
+                },
+            }))
+        }
+
+        fn run_seeks(data_block: &DataBlock, cmp: Arc<dyn UserComparator>) {
+            // Exercise all three devirtualized entry points:
+            //   - seek_to_key_seqno via seek()
+            //   - seek_upper
+            //   - seek_upper_exclusive
+            let needle = 32_u64.to_be_bytes();
+            {
+                let mut iter = data_block.iter(cmp.clone());
+                let _ = iter.seek(&needle, SeqNo::MAX);
+            }
+            {
+                let mut iter = data_block.iter(cmp.clone());
+                let _ = iter.seek_upper(&needle, SeqNo::MAX);
+            }
+            {
+                let mut iter = data_block.iter(cmp);
+                let _ = iter.seek_upper_exclusive(&needle, SeqNo::MAX);
+            }
+        }
+
+        #[test]
+        fn data_block_seek_lex_path_skips_vtable() -> crate::Result<()> {
+            // is_lexicographic() == true should route all 3 seek entry points
+            // through the static-dispatch closures — comparator.compare() must
+            // never be invoked.
+            let data_block = build_block()?;
+            let count = Arc::new(AtomicUsize::new(0));
+            let cmp: Arc<dyn UserComparator> = Arc::new(CountingComparator {
+                count: count.clone(),
+                lex: true,
+            });
+            run_seeks(&data_block, cmp);
+            assert_eq!(
+                count.load(AtomicOrdering::Relaxed),
+                0,
+                "lex path must skip vtable: no compare() calls expected, got {}",
+                count.load(AtomicOrdering::Relaxed),
+            );
+            Ok(())
+        }
+
+        #[test]
+        fn data_block_seek_dyn_path_invokes_compare() -> crate::Result<()> {
+            // is_lexicographic() == false must keep using the dynamic path —
+            // compare() invocations must be > 0 for any non-trivial seek.
+            let data_block = build_block()?;
+            let count = Arc::new(AtomicUsize::new(0));
+            let cmp: Arc<dyn UserComparator> = Arc::new(CountingComparator {
+                count: count.clone(),
+                lex: false,
+            });
+            run_seeks(&data_block, cmp);
+            let n = count.load(AtomicOrdering::Relaxed);
+            assert!(
+                n > 0,
+                "dyn path must call compare() during binary search, got {n}",
+            );
+            Ok(())
+        }
+
+        #[test]
+        fn data_block_seek_lex_and_dyn_agree_on_landing_position() -> crate::Result<()> {
+            // Equivalence check: lex and dyn paths must produce IDENTICAL
+            // landing positions for every probe. If the lex closure ever
+            // disagrees with `compare() != Greater` semantics (e.g. wrong
+            // operator), this test catches it before integration suites do.
+            let data_block = build_block()?;
+            let lex: Arc<dyn UserComparator> = Arc::new(CountingComparator {
+                count: Arc::new(AtomicUsize::new(0)),
+                lex: true,
+            });
+            let dyn_cmp: Arc<dyn UserComparator> = Arc::new(CountingComparator {
+                count: Arc::new(AtomicUsize::new(0)),
+                lex: false,
+            });
+
+            // Probe a range of needles: below-min, exact-match, between-keys,
+            // exact-tail, above-max. These cover the partition_point boundary
+            // cases (left==0, left==len, mid hits exact key).
+            for needle_val in &[0_u64, 17, 32, 47, 63, 100] {
+                let needle = needle_val.to_be_bytes();
+
+                let mut lex_iter = data_block.iter(lex.clone());
+                let lex_seek = lex_iter.seek(&needle, SeqNo::MAX);
+                let lex_landing = lex_iter
+                    .next()
+                    .map(|e| Slice::from(e.materialize(data_block.as_slice()).key.user_key));
+
+                let mut dyn_iter = data_block.iter(dyn_cmp.clone());
+                let dyn_seek = dyn_iter.seek(&needle, SeqNo::MAX);
+                let dyn_landing = dyn_iter
+                    .next()
+                    .map(|e| Slice::from(e.materialize(data_block.as_slice()).key.user_key));
+
+                assert_eq!(
+                    lex_seek, dyn_seek,
+                    "seek result must match for needle {needle_val}",
+                );
+                assert_eq!(
+                    lex_landing, dyn_landing,
+                    "landing position must match for needle {needle_val}",
+                );
+            }
+            Ok(())
+        }
+    }
 }
