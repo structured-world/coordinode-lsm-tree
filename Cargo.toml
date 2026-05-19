@@ -31,6 +31,13 @@ path = "src/lib.rs"
 default = []
 io-uring = ["dep:io-uring"]
 lz4 = ["dep:lz4_flex"]
+# The previous `zstd-pure = ["zstd"]` alias was removed at this major
+# version boundary. It was documented as deprecated when there were
+# two candidate zstd backends on the roadmap; only structured-zstd
+# remains, so the alias serves no purpose and is dropped per the
+# standard deprecation lifecycle. This PR's other breaking commits
+# (BuRR filter wire format, V5 manifest gate) already trigger the
+# major bump, so the removal lands in the same semver step.
 zstd = ["dep:structured-zstd"]
 encryption = ["dep:aes-gcm", "dep:rand_chacha"]
 bytes_1 = ["dep:bytes"]
