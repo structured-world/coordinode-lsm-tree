@@ -81,6 +81,39 @@ jobs:
       - name: Run tests (zstd backend)
         run: cargo nextest run --profile ci --no-default-features --features zstd,lz4
 
+  no-std-check:
+    # Tracks no-std + alloc migration progress. The crate is incrementally
+    # being ported to support `#![no_std]` builds: modules with std-only
+    # dependencies stay gated behind `#[cfg(feature = "std")]` until they
+    # are migrated. This job runs `cargo check --no-default-features
+    # --features alloc` on a true no-std-only target (the `thumbv7em-none-eabihf`
+    # cross-compile target has no std at all, so any leaked `std::*` import
+    # surfaces here even if the host toolchain has std available).
+    #
+    # The job is currently EXPECTED TO FAIL — that's the whole point. It is
+    # the canonical progress meter for the migration: the number of compile
+    # errors must monotonically decrease across PRs until it reaches zero,
+    # at which point the `continue-on-error: true` flag below is removed and
+    # this becomes a gating check. New code added to this crate MUST be
+    # no-std-friendly (prefer `core::*` / `alloc::*`, gate std-only behind
+    # `#[cfg(feature = "std")]`); reviewers should request the error count
+    # from this job and compare against main.
+    needs: lint
+    continue-on-error: true
+    timeout-minutes: 10
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.92.0"
+          targets: thumbv7em-none-eabihf
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: ubuntu-cargo-no-std
+      - name: Check (no_std + alloc)
+        run: cargo check --target thumbv7em-none-eabihf --no-default-features --features alloc
+
   cross:
     needs: lint
     timeout-minutes: 15
