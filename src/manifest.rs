@@ -156,7 +156,7 @@ mod tests {
         let mut writer = sfa::Writer::from_writer(std::io::BufWriter::new(file));
 
         writer.start("format_version")?;
-        writer.write_u8(FormatVersion::V4.into())?;
+        writer.write_u8(FormatVersion::V5.into())?;
 
         writer.start("tree_type")?;
         writer.write_u8(TreeType::Standard.into())?;
@@ -242,7 +242,7 @@ mod tests {
         let mut writer = sfa::Writer::from_writer(std::io::BufWriter::new(file));
 
         writer.start("format_version")?;
-        writer.write_u8(FormatVersion::V4.into())?;
+        writer.write_u8(FormatVersion::V5.into())?;
         writer.start("tree_type")?;
         writer.write_u8(TreeType::Standard.into())?;
         writer.start("level_count")?;
@@ -280,7 +280,7 @@ mod tests {
         let manifest = decode_manifest(&path, &fs)?;
         assert_eq!(manifest.comparator_name, "default");
         assert_eq!(manifest.level_count, 7);
-        assert!(matches!(manifest.version, FormatVersion::V4));
+        assert!(matches!(manifest.version, FormatVersion::V5));
         assert!(matches!(manifest.tree_type, TreeType::Standard));
         Ok(())
     }

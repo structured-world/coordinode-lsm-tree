@@ -1,6 +1,6 @@
 [package]
 name = "coordinode-lsm-tree"
-description = "A K.I.S.S. implementation of log-structured merge trees (LSM-trees/LSMTs) — CoordiNode fork"
+description = "Embedded LSM-tree storage engine: BuRR filters, zstd dictionary compression, MVCC, range tombstones, merge operators, K/V separation, AES-256-GCM at rest."
 license = "Apache-2.0"
 version = "4.5.0"
 edition = "2024"
@@ -9,8 +9,19 @@ readme = "README.md"
 include = ["src/**/*", "build.rs", "LICENSE-APACHE", "README.md", "CHANGELOG.md"]
 repository = "https://github.com/structured-world/coordinode-lsm-tree"
 homepage = "https://github.com/structured-world/coordinode-lsm-tree"
-keywords = ["lsm-tree", "storage", "database", "coordinode", "key-value"]
-categories = ["data-structures", "database-implementations"]
+documentation = "https://docs.rs/coordinode-lsm-tree"
+keywords = ["lsm-tree", "storage", "database", "embedded", "key-value"]
+categories = ["data-structures", "database-implementations", "filesystem", "compression"]
+
+[package.metadata.docs.rs]
+# Build the docs.rs page with every feature enabled so the rendered
+# crate page exposes the full public API surface (zstd dictionary
+# compression, encryption, io-uring, bytes integration, metrics,
+# ribbon-serde). cfg(docsrs) is set so #[cfg_attr(docsrs, ...)] items
+# render their feature/availability badges.
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+targets = ["x86_64-unknown-linux-gnu"]
 
 [lib]
 name = "lsm_tree"
@@ -21,7 +32,6 @@ default = []
 io-uring = ["dep:io-uring"]
 lz4 = ["dep:lz4_flex"]
 zstd = ["dep:structured-zstd"]
-zstd-pure = ["zstd"]
 encryption = ["dep:aes-gcm", "dep:rand_chacha"]
 bytes_1 = ["dep:bytes"]
 metrics = []

@@ -277,6 +277,26 @@ pub struct BurrFilterReader<'a> {
     decoded: super::wire::DecodedFilter<'a>,
 }
 
+/// Single-pass parse + probe over a wire-format BuRR filter buffer.
+///
+/// This is the preferred entry point for the LSM table read path: it
+/// parses the header and walks per-layer payloads in place without
+/// allocating an intermediate `BurrFilterReader` (the
+/// `Vec<LayerView>` inside is the only heap allocation a fresh reader
+/// would do). Use this when the wire buffer is already in the block
+/// cache and you only need a one-shot membership check.
+///
+/// Behaviour matches `BurrFilterReader::new(bytes)?.contains_hash(hash)`
+/// modulo allocation: on a structurally invalid header returns
+/// `Err(InvalidHeader)`; on payload-level corruption (truncated z
+/// slice past header-validated lengths) fails closed with `Ok(true)`
+/// so the caller falls through to a real index lookup rather than
+/// reporting a false negative.
+#[inline]
+pub fn contains_hash_from_bytes(bytes: &[u8], hash: u64) -> crate::Result<bool> {
+    super::wire::contains_hash_from_bytes(bytes, hash)
+}
+
 impl<'a> BurrFilterReader<'a> {
     /// Parse a serialized BuRR filter slice. Returns an error if the
     /// magic bytes don't match, the version is unrecognised, or the

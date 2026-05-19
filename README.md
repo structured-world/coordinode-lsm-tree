@@ -1,6 +1,4 @@
-<p align="center">
-  <img src="/logo.png" height="160">
-</p>
+# coordinode-lsm-tree
 
 [![CI](https://github.com/structured-world/coordinode-lsm-tree/actions/workflows/coordinode-ci.yml/badge.svg)](https://github.com/structured-world/coordinode-lsm-tree/actions/workflows/coordinode-ci.yml)
 [![codecov](https://codecov.io/gh/structured-world/coordinode-lsm-tree/graph/badge.svg)](https://codecov.io/gh/structured-world/coordinode-lsm-tree)
@@ -11,107 +9,104 @@
 [![dependency status](https://deps.rs/repo/github/structured-world/coordinode-lsm-tree/status.svg)](https://deps.rs/repo/github/structured-world/coordinode-lsm-tree)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](#license)
 
-> LSM-tree engine for [CoordiNode](https://github.com/structured-world/coordinode), maintained by [Structured World Foundation](https://sw.foundation).
-> Derivative work of [fjall-rs/lsm-tree](https://github.com/fjall-rs/lsm-tree), developed independently with diverging features: zstd dictionary compression, custom sequence number generators, multi_get (batch-optimized), PinnableSlice zero-copy reads, WriteBatch seqno-grouped batch writes with caller-controlled atomic visibility, intra-L0 compaction, and security hardening.
+LSM-tree storage engine in Rust. Embedded library; provides keyed point reads, prefix and range scans, MVCC snapshots, compaction, and a block cache. No write-ahead log — durability is the caller's responsibility. Built for [CoordiNode](https://github.com/structured-world/coordinode); usable standalone.
 
-> [!IMPORTANT]
-> This fork now introduces a fork-specific **disk format V4** compatibility boundary.
-> `V4` is a breaking on-disk change relative to `V3` because the fork persists new semantics such as range tombstones and merge operands.
-> New code may continue reading supported `V3` databases, but databases written with these `V4` semantics must not be opened by older `V3` binaries.
+## Status
 
-A K.I.S.S. implementation of log-structured merge trees (LSM-trees/LSMTs) in Rust.
+On-disk format version **V4**. Older V3 databases are read-only on this version; databases written here are not readable by V3 binaries. Versioning is single-monotonic — every breaking format change bumps to the next version with explicit migration notes.
 
-> [!NOTE]
-> This crate only provides a primitive LSM-tree, not a full storage engine.
-> For example, it does not ship with a write-ahead log.
-> You probably want to use https://github.com/fjall-rs/fjall instead.
+## Features
 
-## About
+### Read path
 
-This is the most feature-rich LSM-tree implementation in Rust! It features:
+- Point reads via `get` / `multi_get` (batch-optimized).
+- `PinnableSlice` for zero-copy reads.
+- `BurrFilter` AMQ filter (Bumped Ribbon Retrieval, Walzer & Dillinger 2022): ~1% memory overhead vs the information-theoretic minimum — ~30% smaller filter blocks than a same-FPR Bloom filter, or ~10× tighter FPR at the same memory budget. Used for both per-key and per-prefix membership checks.
+- Forward and reverse range / prefix iteration.
+- Block cache with size cap.
+- File-descriptor cache to bound `fopen` syscalls.
 
-- Thread-safe `BTreeMap`-like API
-- Mostly [safe](./UNSAFE.md) & 100% stable Rust
-- Block-based tables with compression support & prefix truncation
-  - Optional block hash indexes in data blocks for faster point lookups [[3]](#footnotes)
-  - Per-level filter/index block pinning configuration
-- Range & prefix searching with forward and reverse iteration
-- Block caching to keep hot data in memory
-- File descriptor caching with upper bound to reduce `fopen` syscalls
-- *AMQ* filters (currently Bloom filters) to improve point lookup performance
-- Multi-versioning of KVs, enabling snapshot reads
-- Optionally partitioned block index & filters for better cache efficiency [[1]](#footnotes)
-- Leveled and FIFO compaction
-- Optional key-value separation for large value workloads [[2]](#footnotes), with automatic garbage collection
-- Single deletion tombstones ("weak" deletion)
-- Optional compaction filters to run custom logic during compactions
+### Write path
 
-Keys are limited to 65536 bytes, values are limited to 2^32 bytes.
-As is normal with any kind of storage engine, larger keys and values have a bigger performance impact.
+- `WriteBatch` with seqno-grouped batch writes — caller-controlled atomic visibility.
+- Single deletion tombstones (`remove_weak`).
+- Range tombstones (`delete_range` / `delete_prefix`).
+- Merge operators for commutative LSM operations.
+- Optional key-value separation (BlobTree) for large-value workloads with automatic garbage collection.
+
+### Compaction
+
+- Leveled, size-tiered, dynamic-leveled, and FIFO strategies.
+- Intra-L0 compaction for overlapping runs.
+- Major compaction (full force flush + merge).
+- Optional compaction filters for custom logic during compactions.
+- Merge-aware compaction resolves operands lazily.
+
+### Storage & encoding
+
+- Block-based tables with optional compression (none / LZ4 / Zstd) and prefix truncation.
+- Per-table data block size policy and per-table compression policy.
+- Optional **zstd dictionary compression** — trained per-table or per-column for small (4-64 KiB) blocks and blob files.
+- Optional **block-level encryption at rest** — AES-256-GCM, key supplied by caller.
+- Optional per-table block hash indexes for faster point lookups [[3]](#footnotes).
+- Optional partitioned block index & filters for better cache efficiency [[1]](#footnotes).
+- Per-level filter/index block pinning configuration.
+
+### Concurrency & API
+
+- Thread-safe `BTreeMap`-like API.
+- `SequenceNumberGenerator` trait — pluggable seqno source.
+- Custom `UserComparator` for non-lexicographic ordering.
+- MVCC: snapshot reads at a chosen `SeqNo`.
+
+### Internals
+
+- 100% stable Rust, MSRV 1.92.
+- No FFI: zstd via [`structured-zstd`](https://github.com/structured-world/structured-zstd) (pure-Rust), LZ4 via `lz4_flex`, AES via `aes-gcm`.
+- Pluggable `Fs` trait — back the engine on the standard filesystem, on `io_uring`, on an in-memory `MemFs`, or on a custom implementation.
+- Pluggable `CompressionProvider` for third-party codecs.
+
+## Limits
+
+- Keys: up to 65 536 bytes.
+- Values: up to 2³² bytes.
+- Larger keys and values carry a proportional performance cost.
 
 ## Feature flags
 
-### lz4
-
-Allows using `LZ4` compression, powered by [`lz4_flex`](https://github.com/PSeitz/lz4_flex).
-
-*Disabled by default.*
-
-### zstd
-
-Allows using `Zstd` compression via a pure Rust implementation, powered by
-[`structured-zstd`](https://github.com/structured-world/structured-zstd) (managed fork of ruzstd).
-Requires no C compiler or system libraries — compiles with `cargo build` alone.
-Supports both regular zstd (`CompressionType::Zstd`) and dictionary compression
-(`CompressionType::ZstdDict`) for improved ratios on small table blocks (4–64 KiB)
-and blob files.
-
-**Current limitations:**
-- Decompression throughput is ~2–3.5× slower than the C reference implementation
-
-*Disabled by default.*
-
-### zstd-pure
-
-Deprecated alias for `zstd`. Enabling `zstd-pure` is equivalent to enabling `zstd`
-and will be removed in a future release.
-
-*Disabled by default.*
-
-### bytes
-
-Uses [`bytes`](https://github.com/tokio-rs/bytes) as the underlying `Slice` type.
-
-*Disabled by default.*
+| Flag | Default | Effect |
+|---|---|---|
+| `lz4` | off | LZ4 block compression via [`lz4_flex`](https://github.com/PSeitz/lz4_flex). |
+| `zstd` | off | Zstd block compression via [`structured-zstd`](https://github.com/structured-world/structured-zstd). Supports `CompressionType::Zstd` and dictionary-mode `CompressionType::ZstdDict`. Decompression throughput is currently ~2–3.5× slower than the C reference implementation. |
+| `encryption` | off | AES-256-GCM block encryption (`aes-gcm`). |
+| `io-uring` | off (linux only) | `io_uring`-backed `Fs` implementation. |
+| `bytes_1` | off | Use [`bytes`](https://github.com/tokio-rs/bytes) as the underlying `Slice` type. |
+| `metrics` | off | Counters and timers exposed via the `Metrics` accessor. |
+| `ribbon-serde` | off | Serde derives on the internal Ribbon filter representation. Not used by the on-disk format. |
 
 ## Benchmarks
 
-CI runs [`db_bench`](tools/db_bench) on every push to `main` and on pull requests.
-Results from `main` are published to the
-[benchmark dashboard](https://structured-world.github.io/coordinode-lsm-tree/dev/bench/).
-PRs that regress performance by >15% trigger an alert; >25% regression fails CI.
+CI runs [`db_bench`](tools/db_bench) on every push to `main` and on pull requests. Results from `main` are published to the [benchmark dashboard](https://structured-world.github.io/coordinode-lsm-tree/dev/bench/). PRs regressing performance by more than 15% trigger an alert; more than 25% fails CI.
 
-Flamegraphs are generated on every merge to `main` using instrumented `db_bench` runs
-and published under `flamegraphs/<commit-sha>/flamegraph.svg` on
-[gh-pages](https://structured-world.github.io/coordinode-lsm-tree/).
+Flamegraphs are generated on every merge to `main` from instrumented `db_bench` runs and published under `flamegraphs/<commit-sha>/flamegraph.svg` on [gh-pages](https://structured-world.github.io/coordinode-lsm-tree/).
 
-To run Criterion microbenchmarks locally:
+Local Criterion microbenchmarks:
 
 ```bash
 cargo bench --features lz4
 ```
 
-To generate flamegraphs locally (requires the `flamegraph` feature):
+Local flamegraphs:
 
 ```bash
 cd tools/db_bench
 cargo run --release --features flamegraph -- \
   --benchmark all --num 100000 --flamegraph --skip-calibration
-# Folded stacks written to target/flamegraphs/all.folded
-# Render with: cargo install inferno && inferno-flamegraph target/flamegraphs/all.folded > flame.svg
+# Folded stacks: target/flamegraphs/all.folded
+# Render: cargo install inferno && inferno-flamegraph target/flamegraphs/all.folded > flame.svg
 ```
 
-## Support the Project
+## Support the project
 
 <div align="center">
 
@@ -123,11 +118,9 @@ USDT (TRC-20): `TFDsezHa1cBkoeZT5q2T49Wp66K8t2DmdA`
 
 ## License
 
-All source code is licensed under Apache-2.0.
+All source code is licensed under Apache-2.0. Contributions are accepted under the same license.
 
-All contributions are to be licensed as Apache-2.0.
-
-Originally derived from [fjall-rs/lsm-tree](https://github.com/fjall-rs/lsm-tree). Independently maintained by [Structured World Foundation](https://sw.foundation).
+Maintained by [Structured World Foundation](https://sw.foundation).
 
 ## Footnotes
 

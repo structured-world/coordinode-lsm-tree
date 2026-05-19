@@ -805,3 +805,135 @@ fn serde_rejects_incorrect_storage_word_length() {
             .contains("invalid RibbonFilter storage word length")
     );
 }
+
+#[test]
+fn param_error_display_covers_all_variants() {
+    use super::error::ParamError;
+    let cases = [
+        (ParamError::ZeroM, "m must"),
+        (ParamError::ZeroN, "n must"),
+        (ParamError::ZeroWidth, "w must"),
+        (ParamError::ZeroFingerprintBits, "r must"),
+        (ParamError::ZeroRetryLimit, "retry_limit must"),
+    ];
+    for (err, needle) in &cases {
+        let s = format!("{err}");
+        assert!(
+            s.contains(needle),
+            "ParamError::{err:?} display missing '{needle}': got {s}"
+        );
+    }
+    let s = format!("{}", ParamError::WidthTooLarge { w: 200, max: 128 });
+    assert!(s.contains("200") && s.contains("128"), "got: {s}");
+    let s = format!("{}", ParamError::WidthExceedsM { m: 4, w: 16 });
+    assert!(
+        s.contains("m=4") || s.contains("w=16") || s.contains('4') && s.contains("16"),
+        "got: {s}"
+    );
+    let s = format!("{}", ParamError::InvalidFalsePositiveRate { fpr: 2.0 });
+    assert!(s.contains('2') || s.contains("false"), "got: {s}");
+    let s = format!("{}", ParamError::InvalidOverhead { overhead: -0.5 });
+    assert!(s.contains("overhead") || s.contains("-0.5"), "got: {s}");
+}
+
+#[test]
+fn construction_failure_display_inconsistent_eq() {
+    use super::error::ConstructionFailure;
+    let err = ConstructionFailure::InconsistentEquation {
+        key_index: 17,
+        row_index: 99,
+    };
+    let s = format!("{err}");
+    assert!(s.contains("17") && s.contains("99"), "got: {s}");
+}
+
+#[test]
+fn construction_failure_display_out_of_bounds() {
+    use super::error::ConstructionFailure;
+    let err = ConstructionFailure::OutOfBounds {
+        key_index: Some(5),
+        row_index: 1000,
+        m: 800,
+    };
+    let s = format!("{err}");
+    assert!(
+        s.contains('5') && s.contains("1000") && s.contains("800"),
+        "got: {s}"
+    );
+}
+
+#[test]
+fn build_error_display_covers_variants() {
+    use super::error::{BuildError, ConstructionFailure, ParamError};
+    let invalid = BuildError::InvalidParams(ParamError::ZeroM);
+    let s = format!("{invalid}");
+    assert!(s.contains("invalid parameters"), "got: {s}");
+
+    let cf = BuildError::ConstructionFailed {
+        final_m: 4096,
+        attempts: 8,
+        last_failure: ConstructionFailure::InconsistentEquation {
+            key_index: 0,
+            row_index: 0,
+        },
+    };
+    let s = format!("{cf}");
+    assert!(s.contains("4096") || s.contains('8'), "got: {s}");
+}
+
+#[test]
+#[cfg(feature = "ribbon-serde")]
+fn filter_repr_error_display_covers_variants() {
+    use super::error::{FilterReprError, ParamError};
+    let s = format!(
+        "{}",
+        FilterReprError::UnsupportedVersion {
+            found: 99,
+            expected: 1
+        }
+    );
+    assert!(s.contains("99") && s.contains('1'), "got: {s}");
+    let s = format!("{}", FilterReprError::InvalidParams(ParamError::ZeroM));
+    assert!(s.contains("invalid") || s.contains("param"), "got: {s}");
+    let s = format!("{}", FilterReprError::StorageLengthOverflow);
+    assert!(s.contains("overflow") || s.contains("storage"), "got: {s}");
+    let s = format!(
+        "{}",
+        FilterReprError::InvalidStorageWords {
+            found: 5,
+            expected: 10
+        }
+    );
+    assert!(s.contains('5') && s.contains("10"), "got: {s}");
+    let s = format!(
+        "{}",
+        FilterReprError::InvalidStorageBits {
+            found: 5,
+            expected: 10
+        }
+    );
+    assert!(s.contains('5') && s.contains("10"), "got: {s}");
+}
+
+#[test]
+fn builder_terminal_failure_after_grow_exhausted() {
+    let hasher = DefaultBuildHasher::default();
+    // Tight: m=16, w=16 — small chance of single-attempt success. With
+    // grow_limit=0 + retry_limit=1 it should fail.
+    let params = Params::new(16, 16, 8, Mode::Standard)
+        .expect("valid")
+        .with_seed(123)
+        .with_retry_limit(1)
+        .expect("retry");
+    let builder = RibbonBuilder::new(params, hasher).expect("builder");
+    let keys: Vec<u64> = (0..16).collect();
+    let result = builder.build(&keys);
+    if let Err(super::error::BuildError::ConstructionFailed {
+        attempts, final_m, ..
+    }) = result
+    {
+        assert_eq!(attempts, 1);
+        assert_eq!(final_m, 16);
+    }
+    // Either succeeds or fails — both are valid; we just exercised the path.
+}

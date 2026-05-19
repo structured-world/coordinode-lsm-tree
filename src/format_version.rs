@@ -16,6 +16,14 @@ pub enum FormatVersion {
 
     /// Version for range-tombstone SST semantics
     V4,
+
+    /// `BuRR` (Bumped Ribbon Retrieval) filter wire format. Filter
+    /// blocks are no longer Bloom-encoded; the magic + `filter_type` +
+    /// per-layer header layout is documented in
+    /// `src/table/filter/ribbon/burr/wire.rs`. V4 binaries cannot read
+    /// V5 tables and vice versa — the filter block decoder rejects
+    /// the wrong magic at open time.
+    V5,
 }
 
 impl std::fmt::Display for FormatVersion {
@@ -31,6 +39,7 @@ impl From<FormatVersion> for u8 {
             FormatVersion::V2 => 2,
             FormatVersion::V3 => 3,
             FormatVersion::V4 => 4,
+            FormatVersion::V5 => 5,
         }
     }
 }
@@ -44,6 +53,7 @@ impl TryFrom<u8> for FormatVersion {
             2 => Ok(Self::V2),
             3 => Ok(Self::V3),
             4 => Ok(Self::V4),
+            5 => Ok(Self::V5),
             _ => Err(()),
         }
     }

@@ -263,6 +263,142 @@ pub(crate) fn decode(bytes: &[u8]) -> crate::Result<DecodedFilter<'_>> {
     })
 }
 
+/// Single-pass parse + probe over raw wire bytes.
+///
+/// Equivalent to `decode(bytes).map(|d| contains_hash(&d, hash))` but
+/// without allocating the intermediate `DecodedFilter` (and its
+/// `Vec<LayerView>`). Used on the LSM table read hot path
+/// (`FilterBlock::maybe_contains_hash`) where the wire buffer is
+/// already in the block cache — re-parsing the header and walking
+/// per-layer payloads in place avoids the per-probe heap allocation.
+///
+/// Returns:
+/// - `Ok(true)`  — hash may be present (or wire is corrupted in a way
+///   we cannot validate → fail-closed: caller falls through to a real
+///   index lookup rather than reporting a false negative);
+/// - `Ok(false)` — hash is definitely not in the inserted set;
+/// - `Err(InvalidHeader)` — wire prefix is unparseable (bad magic,
+///   wrong filter_type/version, truncated). Differs from the
+///   fail-closed `true` path: a structurally invalid header is a real
+///   error returned upstream so the table read path can surface it.
+#[inline]
+#[allow(
+    clippy::many_single_char_names,
+    reason = "r/w/b/m are well-known params from the BuRR/Ribbon literature; single-letter naming matches the rest of the module."
+)]
+pub(crate) fn contains_hash_from_bytes(bytes: &[u8], hash: u64) -> crate::Result<bool> {
+    if bytes.len() < HEADER_LEN {
+        return Err(crate::Error::InvalidHeader("BurrFilter"));
+    }
+
+    if bytes[..MAGIC_BYTES.len()] != MAGIC_BYTES {
+        return Err(crate::Error::InvalidHeader("BurrFilter"));
+    }
+    let filter_type = bytes[MAGIC_BYTES.len()];
+    if filter_type != BURR_FILTER_TYPE_BYTE {
+        return Err(crate::Error::InvalidTag(("FilterType", filter_type)));
+    }
+    let version = bytes[MAGIC_BYTES.len() + 1];
+    if version != FORMAT_VERSION {
+        return Err(crate::Error::InvalidHeader("BurrFilter version"));
+    }
+
+    let r = bytes[MAGIC_BYTES.len() + 2];
+    let w = bytes[MAGIC_BYTES.len() + 3];
+    let b = bytes[MAGIC_BYTES.len() + 4];
+    let num_layers = bytes[MAGIC_BYTES.len() + 5];
+    if !(1..=64).contains(&r) || w != 64 || b == 0 || num_layers == 0 {
+        return Err(crate::Error::InvalidHeader("BurrFilter params"));
+    }
+    let seed_off = MAGIC_BYTES.len() + 6;
+    let root_seed = u64::from_le_bytes(
+        bytes[seed_off..seed_off + 8]
+            .try_into()
+            .map_err(|_| crate::Error::InvalidHeader("BurrFilter"))?,
+    );
+
+    // r <= 64 → stride_words == 1. We mirror the in-memory probe
+    // invariants without storing stride at all; if r > 64 ever lands
+    // the validation above already rejected it.
+    let mut fingerprint_buf = [0_u64; 1];
+    let mut pos = HEADER_LEN;
+
+    for layer_idx in 0..num_layers {
+        if bytes.len() < pos + LAYER_HEADER_LEN {
+            return Err(crate::Error::InvalidHeader("BurrFilter layer header"));
+        }
+        let m_bytes: [u8; 4] = bytes[pos..pos + 4]
+            .try_into()
+            .map_err(|_| crate::Error::InvalidHeader("BurrFilter"))?;
+        let num_blocks_bytes: [u8; 4] = bytes[pos + 4..pos + 8]
+            .try_into()
+            .map_err(|_| crate::Error::InvalidHeader("BurrFilter"))?;
+        let z_byte_len_bytes: [u8; 4] = bytes[pos + 8..pos + 12]
+            .try_into()
+            .map_err(|_| crate::Error::InvalidHeader("BurrFilter"))?;
+        let m = u32::from_le_bytes(m_bytes) as usize;
+        let num_blocks = u32::from_le_bytes(num_blocks_bytes) as usize;
+        let z_byte_len = u32::from_le_bytes(z_byte_len_bytes) as usize;
+        pos += LAYER_HEADER_LEN;
+
+        if m == 0 {
+            return Err(crate::Error::InvalidHeader("BurrFilter layer m"));
+        }
+        let expected_blocks = m.div_ceil(usize::from(b));
+        let expected_z_len = m
+            .checked_mul(8)
+            .ok_or(crate::Error::InvalidHeader("BurrFilter layer payload"))?;
+        if num_blocks != expected_blocks || z_byte_len != expected_z_len {
+            return Err(crate::Error::InvalidHeader("BurrFilter layer payload"));
+        }
+        if bytes.len() < pos + num_blocks + z_byte_len {
+            return Err(crate::Error::InvalidHeader("BurrFilter layer payload"));
+        }
+        let thresholds = &bytes[pos..pos + num_blocks];
+        pos += num_blocks;
+        let z = &bytes[pos..pos + z_byte_len];
+        pos += z_byte_len;
+
+        let seed = derive_layer_seed(root_seed, layer_idx);
+        let layer_params = match Params::new(m, usize::from(w), usize::from(r), Mode::Standard) {
+            Ok(p) => p.with_seed(seed),
+            // Unreachable given the param validation above; fail closed.
+            Err(_) => return Ok(true),
+        };
+
+        fingerprint_buf[0] = 0;
+        let equation: StandardEquation =
+            standard_equation_from_hash(hash, seed, &layer_params, &mut fingerprint_buf);
+        let fingerprint = fingerprint_buf[0];
+
+        if is_bumped(&equation, thresholds, b) {
+            continue;
+        }
+
+        // GF(2) XOR-reduce against the band rows whose coeff bit is set.
+        let mut acc: u64 = 0;
+        let mut lo = equation.coeff_lo;
+        while lo != 0 {
+            let offset = lo.trailing_zeros() as usize;
+            let row_byte = (equation.start + offset) * 8;
+            let Some(slice) = z.get(row_byte..row_byte + 8) else {
+                // row_byte+8 > z len: payload truncated mid-row.
+                // Fail closed.
+                return Ok(true);
+            };
+            let Ok(arr) = <[u8; 8]>::try_from(slice) else {
+                return Ok(true);
+            };
+            acc ^= u64::from_le_bytes(arr);
+            lo &= lo - 1;
+        }
+        debug_assert_eq!(equation.coeff_hi, 0, "w <= 64 keeps coeff_hi == 0");
+        return Ok(acc == fingerprint);
+    }
+
+    Ok(false)
+}
+
 /// Probe a decoded BuRR filter with a pre-computed hash. Returns
 /// `true` if the hash may correspond to an inserted key, `false` if
 /// definitely-not-inserted.

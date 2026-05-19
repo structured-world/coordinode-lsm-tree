@@ -3,7 +3,7 @@
 // (found in the LICENSE-* files in the repository)
 
 #[cfg(feature = "zstd")]
-mod zstd_pure;
+mod zstd_backend;
 
 use crate::coding::{Decode, Encode};
 use byteorder::{ReadBytesExt, WriteBytesExt};
@@ -50,7 +50,7 @@ pub trait CompressionProvider {
 
 /// The active zstd backend (pure Rust via `structured-zstd`).
 #[cfg(feature = "zstd")]
-pub type ZstdBackend = zstd_pure::ZstdPureProvider;
+pub type ZstdBackend = zstd_backend::ZstdProvider;
 
 /// Pre-trained zstd dictionary for improved compression of small blocks.
 ///

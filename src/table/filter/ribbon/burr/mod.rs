@@ -77,7 +77,7 @@ pub(crate) mod wire;
 
 pub use builder::BurrBuilder;
 pub use error::{BurrBuildError, BurrConstructionFailure};
-pub use filter::{BurrFilter, BurrFilterReader};
+pub use filter::{BurrFilter, BurrFilterReader, contains_hash_from_bytes};
 pub use params::BurrParams;
 
 #[cfg(test)]

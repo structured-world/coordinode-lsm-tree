@@ -51,7 +51,7 @@ fn rewrite_manifest_format_version(path: &Path, version: u8) -> lsm_tree::Result
 }
 
 #[test]
-fn tree_writes_v4_manifest_and_recovers_it() -> lsm_tree::Result<()> {
+fn tree_writes_v5_manifest_and_recovers_it() -> lsm_tree::Result<()> {
     let folder = get_tmp_folder();
     let path = folder.path();
 
@@ -66,7 +66,7 @@ fn tree_writes_v4_manifest_and_recovers_it() -> lsm_tree::Result<()> {
         tree.insert("a", "a", 0);
         tree.flush_active_memtable(0)?;
 
-        assert_eq!(4, read_manifest_format_version(path)?);
+        assert_eq!(5, read_manifest_format_version(path)?);
     }
 
     {
@@ -78,14 +78,19 @@ fn tree_writes_v4_manifest_and_recovers_it() -> lsm_tree::Result<()> {
         .open()?;
 
         assert_eq!(Some("a".as_bytes().into()), tree.get("a", 1)?);
-        assert_eq!(4, read_manifest_format_version(path)?);
+        assert_eq!(5, read_manifest_format_version(path)?);
     }
 
     Ok(())
 }
 
 #[test]
-fn tree_recovers_safe_v3_manifest() -> lsm_tree::Result<()> {
+fn tree_rejects_pre_v5_manifest() -> lsm_tree::Result<()> {
+    // V5 introduced a wire-format break for filter blocks (BuRR replaces
+    // Bloom). V3/V4 tables on disk cannot be read by this version and
+    // vice versa — opening a V4-tagged manifest must fail with
+    // InvalidVersion at recovery time rather than silently misreading
+    // filter bytes later.
     let folder = get_tmp_folder();
     let path = folder.path();
 
@@ -100,21 +105,24 @@ fn tree_recovers_safe_v3_manifest() -> lsm_tree::Result<()> {
         tree.insert("a", "a", 0);
         tree.flush_active_memtable(0)?;
 
+        assert_eq!(5, read_manifest_format_version(path)?);
+        rewrite_manifest_format_version(path, 4)?;
         assert_eq!(4, read_manifest_format_version(path)?);
-        rewrite_manifest_format_version(path, 3)?;
-        assert_eq!(3, read_manifest_format_version(path)?);
     }
 
-    {
-        let tree = Config::new(
-            path,
-            SequenceNumberCounter::default(),
-            SequenceNumberCounter::default(),
-        )
-        .open()?;
+    let reopened = Config::new(
+        path,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .open();
 
-        assert_eq!(Some("a".as_bytes().into()), tree.get("a", 1)?);
-        assert_eq!(3, read_manifest_format_version(path)?);
+    match reopened {
+        Err(lsm_tree::Error::InvalidVersion(v)) => {
+            assert_eq!(v, 4, "V4 manifest must be rejected with the right version");
+        }
+        Err(other) => panic!("expected InvalidVersion(4), got: {other:?}"),
+        Ok(_) => panic!("V4 manifest must be rejected by V5 binary"),
     }
 
     Ok(())
@@ -136,7 +144,7 @@ fn tree_rejects_unsupported_manifest_version() -> lsm_tree::Result<()> {
         tree.insert("a", "a", 0);
         tree.flush_active_memtable(0)?;
 
-        assert_eq!(4, read_manifest_format_version(path)?);
+        assert_eq!(5, read_manifest_format_version(path)?);
         rewrite_manifest_format_version(path, 99)?;
         assert_eq!(99, read_manifest_format_version(path)?);
     }
