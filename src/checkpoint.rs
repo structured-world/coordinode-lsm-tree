@@ -51,24 +51,35 @@ fn blob_link_name(id: crate::vlog::BlobFileId) -> String {
 
 /// Creates the directory structure for a fresh checkpoint.
 ///
-/// Builds `<target>`, `<target>/tables`, and optionally `<target>/blobs`
-/// under `target_fs`. Rejects an already existing target so a
-/// partially-overlapping checkpoint cannot be accidentally produced.
+/// Uses the atomic [`Fs::create_dir`] primitive (POSIX `mkdir(2)`) to
+/// claim the target directory: two concurrent callers race the kernel
+/// and the losing one observes [`std::io::ErrorKind::AlreadyExists`].
+/// This replaces an earlier `exists()` + `create_dir_all()` sequence
+/// that had a TOCTOU window between the two calls.
+///
+/// Once the leaf directory is ours, the `tables/` and (optionally)
+/// `blobs/` subdirectories are created. The caller's parent path must
+/// exist; this function does not recurse.
 pub fn prepare_target(target: &Path, include_blobs: bool, target_fs: &dyn Fs) -> crate::Result<()> {
-    if target_fs.exists(target)? {
-        return Err(crate::Error::from(std::io::Error::new(
-            std::io::ErrorKind::AlreadyExists,
-            format!(
-                "checkpoint target {} already exists; refusing to overwrite",
-                target.display(),
-            ),
-        )));
-    }
+    // Atomic claim — fails with AlreadyExists if any other process /
+    // thread / prior checkpoint already created the directory.
+    target_fs.create_dir(target).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::AlreadyExists {
+            std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                format!(
+                    "checkpoint target {} already exists; refusing to overwrite",
+                    target.display(),
+                ),
+            )
+        } else {
+            e
+        }
+    })?;
 
-    target_fs.create_dir_all(target)?;
-    target_fs.create_dir_all(&target.join(TABLES_FOLDER))?;
+    target_fs.create_dir(&target.join(TABLES_FOLDER))?;
     if include_blobs {
-        target_fs.create_dir_all(&target.join(BLOBS_FOLDER))?;
+        target_fs.create_dir(&target.join(BLOBS_FOLDER))?;
     }
     Ok(())
 }
@@ -103,10 +114,15 @@ pub fn link_or_copy_cross_fs(
     let mut buf = vec![0u8; 64 * 1024].into_boxed_slice();
     let mut total: u64 = 0;
     loop {
-        let n = src_file.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
+        // Retry on EINTR — matches `StdFs::copy_fallback` and avoids
+        // spurious checkpoint failures when a signal arrives during the
+        // copy (common under shell-managed Ctrl-C handlers).
+        let n = match src_file.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
         #[expect(
             clippy::indexing_slicing,
             reason = "n was just produced by read() and is bounded by buf.len()"
@@ -197,8 +213,44 @@ fn copy_metadata_file(
     Ok(())
 }
 
-/// Replicates the manifest, the active version snapshot (`v<id>`), and the
-/// `current` pointer file from the source tree into the checkpoint.
+/// Writes the checkpoint's `current` pointer for the captured
+/// `version_id`.
+///
+/// The original source-tree `CURRENT` may have advanced concurrently
+/// between when we captured `version` and when we get here — copying it
+/// verbatim would risk pointing the checkpoint at a `v<N+1>` that we
+/// never linked. Instead we write a fresh `current` file in the same
+/// wire format as [`crate::version::persist_version`]: `u64 version_id`
+/// + `u128 checksum` + `u8 checksum_type`.
+///
+/// The checksum field is intentionally written as zero: recovery's
+/// [`crate::version::recovery`] reads it for forward-compatibility but
+/// does not validate it against the `v<id>` file's contents, so any
+/// value works. The zero is a deliberate "no checksum carried" sentinel,
+/// not an attempt to forge a real digest.
+fn write_current_for_version(
+    target_fs: &dyn Fs,
+    target_root: &Path,
+    version_id: u64,
+) -> crate::Result<()> {
+    use crate::file::rewrite_atomic;
+    use byteorder::{LittleEndian, WriteBytesExt};
+
+    let mut content = vec![];
+    content.write_u64::<LittleEndian>(version_id)?;
+    content.write_u128::<LittleEndian>(0)?; // checksum (not validated on read)
+    content.write_u8(0)?; // checksum_type = 0 (xxh3)
+
+    rewrite_atomic(&target_root.join(CURRENT_VERSION_FILE), &content, target_fs)?;
+    Ok(())
+}
+
+/// Replicates manifest + `v<id>` + writes a fresh `current` pointer.
+///
+/// Pulls the manifest and the active version snapshot (`v<id>`) from
+/// the source tree into the checkpoint, then writes a fresh `current`
+/// pointer for the captured version (see [`write_current_for_version`]
+/// for why we don't copy the live file).
 ///
 /// `version_id` is the ID of the version captured at checkpoint time; the
 /// corresponding `v<id>` file MUST exist on the source because checkpoint
@@ -213,7 +265,9 @@ pub fn copy_metadata(
 ) -> crate::Result<()> {
     // Manifest stores level count + comparator name; required on open.
     copy_metadata_file(src_fs, src_root, target_fs, target_root, "manifest")?;
-    // Active version snapshot.
+    // Active version snapshot — `v<id>` is immutable once published,
+    // so copying it verbatim is race-free regardless of concurrent
+    // version transitions.
     copy_metadata_file(
         src_fs,
         src_root,
@@ -221,16 +275,13 @@ pub fn copy_metadata(
         target_root,
         &format!("v{version_id}"),
     )?;
-    // CURRENT pointer must be copied LAST so a crash between version copy
-    // and CURRENT copy leaves the checkpoint in a "version present, no
-    // pointer" state — equivalent to a tree that was just created.
-    copy_metadata_file(
-        src_fs,
-        src_root,
-        target_fs,
-        target_root,
-        CURRENT_VERSION_FILE,
-    )?;
+    // CURRENT pointer is generated fresh for the captured `version_id`
+    // (NOT copied from source) so a concurrent publish to `v<N+1>` on
+    // the source can never leave the checkpoint pointing at a version
+    // we did not link. Written LAST so a crash before this point leaves
+    // the checkpoint in a "version present, no pointer" state, which
+    // recovery treats as a freshly-initialised tree.
+    write_current_for_version(target_fs, target_root, version_id)?;
     Ok(())
 }
 
@@ -254,6 +305,47 @@ pub struct CheckpointParams<'a> {
     pub include_blobs: bool,
 }
 
+/// RAII guard that removes a partially-built checkpoint directory on
+/// early return. Call [`PartialCheckpointGuard::commit`] just before the
+/// final success path to disarm it; otherwise its `Drop` walks the tree
+/// and best-effort removes it.
+struct PartialCheckpointGuard<'a> {
+    target_root: &'a Path,
+    target_fs: &'a Arc<dyn Fs>,
+    armed: bool,
+}
+
+impl<'a> PartialCheckpointGuard<'a> {
+    fn new(target_root: &'a Path, target_fs: &'a Arc<dyn Fs>) -> Self {
+        Self {
+            target_root,
+            target_fs,
+            armed: true,
+        }
+    }
+
+    fn commit(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for PartialCheckpointGuard<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // Best-effort: a failure to clean up the partial checkpoint is
+        // logged but does not turn into a panic — the original error
+        // from `run_checkpoint` is what the caller wants to see.
+        if let Err(e) = self.target_fs.remove_dir_all(self.target_root) {
+            log::warn!(
+                "Failed to clean up partial checkpoint at {}: {e:?}",
+                self.target_root.display(),
+            );
+        }
+    }
+}
+
 /// Common driver shared by [`Tree`](crate::Tree) and
 /// [`BlobTree`](crate::BlobTree). Performs the flush + link + metadata
 /// copy under a held [`Pause`](crate::deletion_pause::Pause) guard.
@@ -271,6 +363,12 @@ pub fn run_checkpoint<T: AbstractTree>(
 
     prepare_target(target_root, include_blobs, &**target_fs)?;
 
+    // From this point on, any early return must clean up the partial
+    // checkpoint so retries against the same path don't hit
+    // `AlreadyExists`. The guard is disarmed via `commit()` once the
+    // final `fsync_directory` succeeds.
+    let cleanup = PartialCheckpointGuard::new(target_root, target_fs);
+
     // Hold the pause guard for the duration of the checkpoint so any
     // tables / blob files that compaction marks as deleted are held back.
     let _pause = deletion_pause.acquire();
@@ -281,8 +379,15 @@ pub fn run_checkpoint<T: AbstractTree>(
     // current visible seqno — the data is durable in either case.
     tree.flush_active_memtable(SeqNo::MAX)?;
 
-    let version = tree.current_version();
+    // Capture the seqno BEFORE the version snapshot. Reading
+    // `visible_seqno` after `current_version()` would let concurrent
+    // writers advance the counter past data that never made it into the
+    // checkpoint, so PITR consumers could move the recovery cutoff past
+    // records they still need from WAL / replication. The "before"
+    // ordering means `CheckpointInfo::seqno` is a lower bound on the
+    // seqno reflected in the version snapshot — safe for cutoffs.
     let captured_seqno = visible_seqno.get();
+    let version = tree.current_version();
 
     let (sst_files, sst_bytes) = link_tables(&version, target_root, target_fs)?;
 
@@ -293,7 +398,20 @@ pub fn run_checkpoint<T: AbstractTree>(
     };
 
     copy_metadata(&**src_fs, src_root, &**target_fs, target_root, version.id())?;
+
+    // fsync each populated child directory BEFORE the root so the
+    // directory entries we just created (`tables/<id>`, `blobs/<id>`,
+    // `current`, `manifest`, `v<id>`) survive a power loss. The root
+    // fsync alone only persists the existence of `tables/` and
+    // `blobs/`, not their contents.
+    fsync_directory(&target_root.join(TABLES_FOLDER), &**target_fs)?;
+    if include_blobs {
+        fsync_directory(&target_root.join(BLOBS_FOLDER), &**target_fs)?;
+    }
+
     fsync_directory(target_root, &**target_fs)?;
+
+    cleanup.commit();
 
     Ok(CheckpointInfo {
         sst_files,

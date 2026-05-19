@@ -427,6 +427,34 @@ impl Fs for MemFs {
         Ok(())
     }
 
+    fn create_dir(&self, path: &Path) -> io::Result<()> {
+        ensure_non_empty_path(path)?;
+        let mut state = write_state(&self.state)?;
+
+        // Atomic single-leaf create: reject if anything (file OR dir)
+        // already occupies the path. Mirrors POSIX `mkdir(2)` semantics.
+        if state.dirs.contains(path) || state.files.contains_key(path) {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("path already exists: {}", path.display()),
+            ));
+        }
+
+        // Parent must exist; we do not recurse.
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+            && !state.dirs.contains(parent)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("parent directory does not exist: {}", parent.display()),
+            ));
+        }
+
+        state.dirs.insert(path.to_path_buf());
+        Ok(())
+    }
+
     fn read_dir(&self, path: &Path) -> io::Result<Vec<FsDirEntry>> {
         let state = read_state(&self.state)?;
 
@@ -1304,6 +1332,22 @@ mod tests {
         let mut buf = String::new();
         fs.open(dst, &opts)?.read_to_string(&mut buf)?;
         assert_eq!(buf, "checkpoint");
+
+        // Critical invariant: `MemFs::hard_link` returns an *independent*
+        // copy (no `Arc<Mutex<Vec<u8>>>` aliasing). Mutate the source and
+        // verify the destination is unaffected — if the test only relied
+        // on `remove_file` it would pass even with an aliased buffer.
+        let mut writer = fs.open(src, &FsOpenOptions::new().write(true).truncate(true))?;
+        writer.write_all(b"mutated")?;
+        drop(writer);
+
+        let mut after = String::new();
+        fs.open(dst, &FsOpenOptions::new().read(true))?
+            .read_to_string(&mut after)?;
+        assert_eq!(
+            after, "checkpoint",
+            "dst must not see writes to src — buffers must be independent",
+        );
 
         // Removing the source leaves the destination intact.
         fs.remove_file(src)?;

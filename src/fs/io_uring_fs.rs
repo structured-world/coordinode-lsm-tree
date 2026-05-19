@@ -144,6 +144,10 @@ impl Fs for IoUringFs {
         std::fs::create_dir_all(path)
     }
 
+    fn create_dir(&self, path: &Path) -> io::Result<()> {
+        std::fs::create_dir(path)
+    }
+
     fn read_dir(&self, path: &Path) -> io::Result<Vec<FsDirEntry>> {
         // Delegate to std::fs — directory listing doesn't benefit from io_uring.
         std::fs::read_dir(path)?

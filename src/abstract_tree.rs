@@ -87,11 +87,33 @@ pub trait AbstractTree: sealed::Sealed {
     /// `target_path` for point-in-time recovery (PITR) backup.
     ///
     /// The checkpoint is a fully functional tree that can be opened
-    /// independently via [`Config::open`](crate::Config::open). All SST files
-    /// (and blob files, for [`BlobTree`]) are hard-linked rather than
-    /// copied, so the operation is O(1) per file and consumes zero
-    /// additional disk space until the original files are compacted away
-    /// — at which point the inode is kept alive by the checkpoint link.
+    /// independently via [`Config::open`](crate::Config::open). For the
+    /// common single-filesystem case all SST files (and blob files, for
+    /// [`BlobTree`]) are hard-linked rather than copied, so the operation
+    /// is O(1) per file and consumes zero additional disk space until the
+    /// original files are compacted away — at which point the inode is
+    /// kept alive by the checkpoint link.
+    ///
+    /// # Cross-filesystem / cross-backend fall-back
+    ///
+    /// When a source file lives on a different filesystem than the
+    /// checkpoint target — e.g. an SST routed to a hot tier via
+    /// [`level_routes`](crate::Config::level_routes) on a separate volume,
+    /// or a backup directory on a foreign mount — the hard link cannot
+    /// be created (Unix `EXDEV`). In that case the checkpoint silently
+    /// falls back to a streamed byte copy, which:
+    ///
+    /// - takes time linear in the file size instead of O(1), and
+    /// - consumes disk space equal to the copied bytes on the target
+    ///   volume (no inode sharing across filesystems).
+    ///
+    /// The fall-back is logged via [`log::warn`] so operators using
+    /// tiered storage or detached backup volumes can spot it. Same applies
+    /// when the source and target use entirely different [`Fs`](crate::fs::Fs)
+    /// backends (e.g. [`MemFs`](crate::fs::MemFs) → [`StdFs`](crate::fs::StdFs)
+    /// in tests).
+    ///
+    /// # Concurrency
     ///
     /// While the checkpoint is being built, compaction continues normally
     /// but the physical removal of obsolete files is deferred until the
@@ -107,8 +129,8 @@ pub trait AbstractTree: sealed::Sealed {
     /// - a hard link / copy fall-back could not be created, or
     /// - the manifest / version pointer files could not be replicated.
     ///
-    /// On error the checkpoint directory may contain a partial subset of
-    /// the live files; callers are expected to remove it.
+    /// On error any partial checkpoint files are removed automatically
+    /// (best-effort) so callers can safely retry against the same path.
     fn create_checkpoint(&self, target_path: &std::path::Path) -> crate::Result<CheckpointInfo>;
 
     /// Seals the active memtable and flushes to table(s).

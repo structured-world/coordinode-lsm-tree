@@ -247,6 +247,36 @@ pub trait Fs: Send + Sync + 'static {
     /// Returns an I/O error if directory creation fails.
     fn create_dir_all(&self, path: &Path) -> io::Result<()>;
 
+    /// Atomically creates a single directory at `path`.
+    ///
+    /// Unlike [`create_dir_all`](Self::create_dir_all), this method must
+    /// FAIL with [`io::ErrorKind::AlreadyExists`] when `path` already
+    /// exists — it is the POSIX `mkdir(2)` primitive used by
+    /// [`Tree::create_checkpoint`](crate::Tree::create_checkpoint) to
+    /// claim its target directory without a TOCTOU window.
+    ///
+    /// The parent directory must already exist; this method does not
+    /// recurse.
+    ///
+    /// # Default implementation
+    ///
+    /// Returns [`io::ErrorKind::Unsupported`]. Backends that want to be
+    /// usable as a checkpoint target MUST override this method.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::ErrorKind::AlreadyExists`] if `path` already exists,
+    /// [`io::ErrorKind::NotFound`] if the parent directory does not
+    /// exist, or another I/O error if creation fails for backend-specific
+    /// reasons.
+    fn create_dir(&self, path: &Path) -> io::Result<()> {
+        let _ = path;
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Fs::create_dir is not implemented for this backend",
+        ))
+    }
+
     /// Returns all entries in a directory (order is unspecified).
     ///
     /// Returns a `Vec` rather than a streaming iterator because

@@ -118,6 +118,10 @@ impl Fs for StdFs {
         std::fs::create_dir_all(path)
     }
 
+    fn create_dir(&self, path: &Path) -> io::Result<()> {
+        std::fs::create_dir(path)
+    }
+
     fn read_dir(&self, path: &Path) -> io::Result<Vec<FsDirEntry>> {
         // Fail-fast on bad entries is intentional: non-UTF-8 filenames in an
         // lsm-tree data directory indicate filesystem corruption (see FsDirEntry docs).
@@ -207,9 +211,19 @@ impl Fs for StdFs {
 
 /// Detects `EXDEV` (cross-device link) errors across platforms.
 ///
-/// Unix exposes the raw `EXDEV` (errno 18 on Linux/macOS/BSDs). Windows
-/// reports the equivalent failure as [`io::ErrorKind::Unsupported`] or
-/// [`io::ErrorKind::PermissionDenied`] depending on the volume layout.
+/// Unix exposes the raw `EXDEV` (errno 18 on Linux/macOS/BSDs); we also
+/// accept [`io::ErrorKind::CrossesDevices`] (stable since Rust 1.85) and
+/// [`io::ErrorKind::Unsupported`] which Windows surfaces when a volume
+/// configuration disallows hard links altogether.
+///
+/// We deliberately do NOT treat [`io::ErrorKind::PermissionDenied`] as a
+/// cross-device signal even though Windows can sometimes surface
+/// cross-volume link failures that way. Misclassifying genuine ACL /
+/// permission errors as "different filesystem" would silently turn a
+/// "you can't read this" into a full byte copy, hiding real security
+/// misconfigurations. Operators hitting that edge case on Windows can
+/// fix it explicitly (move the target volume, adjust ACLs); the
+/// fall-back is opt-out by design.
 fn is_cross_device(err: &io::Error) -> bool {
     #[cfg(unix)]
     {

@@ -20,6 +20,13 @@ use std::{
 };
 
 /// A blob file is an immutable, sorted, contiguous file that contains large key-value pairs (blobs)
+//
+// `#[derive(Debug)]` cannot be used because [`Fs`] is not `Debug` (trait
+// objects without an explicit `Debug` bound would require boxing through
+// `dyn Debug`). A manual impl that prints stable identifiers gives the
+// same operational ergonomics as the previous derived `Debug` without
+// pulling `Debug` into the `Fs` trait bound (which would cascade through
+// every backend).
 pub struct Inner {
     /// Blob file ID
     pub id: BlobFileId,
@@ -56,6 +63,21 @@ pub struct Inner {
 impl Inner {
     fn global_id(&self) -> GlobalTableId {
         GlobalTableId::from((self.tree_id, self.id))
+    }
+}
+
+impl core::fmt::Debug for Inner {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("blob_file::Inner")
+            .field("id", &self.id)
+            .field("tree_id", &self.tree_id)
+            .field("path", &self.path)
+            .field(
+                "is_deleted",
+                &self.is_deleted.load(std::sync::atomic::Ordering::Relaxed),
+            )
+            .field("meta", &self.meta)
+            .finish_non_exhaustive()
     }
 }
 
