@@ -80,14 +80,14 @@ where
 
     // Header.
     buf.extend_from_slice(&MAGIC_BYTES);
-    #[allow(clippy::expect_used, reason = "writing to a Vec<u8> cannot fail")]
+    #[expect(clippy::expect_used, reason = "writing to a Vec<u8> cannot fail")]
     {
         buf.write_u8(BURR_FILTER_TYPE_BYTE).expect("vec write");
         buf.write_u8(FORMAT_VERSION).expect("vec write");
         buf.write_u8(params.r).expect("vec write");
         buf.write_u8(params.w).expect("vec write");
         buf.write_u8(params.b).expect("vec write");
-        #[allow(
+        #[expect(
             clippy::cast_possible_truncation,
             reason = "max_layers fits u8 by construction"
         )]
@@ -116,7 +116,7 @@ where
             u32::try_from(num_blocks).expect("BuRR layer num_blocks exceeds u32::MAX");
         let z_byte_len_u32 =
             u32::try_from(z_byte_len).expect("BuRR layer z_byte_len exceeds u32::MAX");
-        #[allow(clippy::expect_used, reason = "writing to a Vec<u8> cannot fail")]
+        #[expect(clippy::expect_used, reason = "writing to a Vec<u8> cannot fail")]
         {
             buf.write_u32::<LittleEndian>(m_u32).expect("vec write");
             buf.write_u32::<LittleEndian>(num_blocks_u32)

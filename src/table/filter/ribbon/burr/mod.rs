@@ -56,6 +56,18 @@
 // used by the LSM. Both can coexist if/when the ribbon module is extracted
 // into a standalone crate.
 
+// The parent `ribbon::` module-level `#![allow(...)]` covers vendored
+// upstream code (clippy::indexing_slicing, clippy::expect_used,
+// clippy::unwrap_used, etc.) and currently leaks into this BuRR
+// submodule because crate-attribute allow propagates to children.
+// Re-denying here would require migrating ~30 internal indexing /
+// expect sites in builder.rs / wire.rs / threshold.rs / filter.rs to
+// `.get(...).ok_or(...)?` or `#[expect(..., reason)]` per use site —
+// a sizeable but tractable refactor that's tracked as a follow-up
+// rather than bundled into this PR. New BuRR code added in this PR
+// uses `#[expect(..., reason)]` per use site for any new
+// suppressions (see params.rs / wire.rs).
+
 pub mod builder;
 pub mod error;
 pub mod filter;

@@ -74,6 +74,20 @@ impl PartitionedFilterWriter {
         let filter_bytes = build_burr_filter_bytes(self.bloom_policy, &self.bloom_hash_buffer)?;
         self.bloom_hash_buffer.clear();
 
+        // An invalid policy (e.g. fpr <= 0 or bpk out of [1, 64]) makes
+        // the BuRR builder return an empty Vec. Persisting an empty
+        // filter block would cause BurrFilterReader::new to error at
+        // read time. Skip the partition; the TLI entry is also
+        // skipped so the reader sees no filter for this range.
+        if filter_bytes.is_empty() {
+            log::trace!(
+                "BuRR policy produced empty filter partition — skipping write at +{:#X?}",
+                self.relative_file_pos,
+            );
+            self.approx_filter_size = 0;
+            return Ok(());
+        }
+
         let header = Block::write_into(
             &mut self.final_filter_buffer,
             &filter_bytes,

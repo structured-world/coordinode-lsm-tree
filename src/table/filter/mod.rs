@@ -37,14 +37,11 @@ impl BloomConstructionPolicy {
     /// instead of buffering hashes that will later be dropped.
     #[must_use]
     pub fn is_active(&self) -> bool {
-        match self {
-            // BurrParams::with_bpk requires bpk in [1.0, 64.0].
-            Self::BitsPerKey(bpk) => (1.0..=64.0).contains(bpk),
-            // BurrParams::with_fp_rate requires fpr in (0.0, 1.0) and
-            // ceil(-log2(fpr)) in 1..=64. The lower fpr bound is set so
-            // r doesn't exceed 64: fpr >= 2^-64 ≈ 5.42e-20.
-            Self::FalsePositiveRate(fpr) => *fpr > 0.0 && *fpr < 1.0,
-        }
+        // Delegate to `burr_params` so this method is exact-equivalent
+        // to "would this policy produce a non-empty filter for n=1?".
+        // Anything stricter (e.g. fpr too small → r > 64) is captured
+        // by the params constructor's own validation.
+        self.burr_params(1).is_some()
     }
 
     /// Build `BurrParams` for the given key count under this policy.

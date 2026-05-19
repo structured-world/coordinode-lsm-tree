@@ -51,7 +51,10 @@ fn burr_fpr_at_one_percent_is_within_envelope() {
             false_positives += 1;
         }
     }
-    #[allow(clippy::cast_precision_loss)]
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "test code: precision loss acceptable in rate calculations"
+    )]
     let fpr = false_positives as f64 / probe_count as f64;
     assert!(
         fpr < 0.05,
@@ -129,7 +132,10 @@ fn burr_build_from_hashes_and_contains_hash_round_trip() {
             false_positives += 1;
         }
     }
-    #[allow(clippy::cast_precision_loss)]
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "test code: precision loss acceptable in rate calculations"
+    )]
     let fpr = false_positives as f64 / probe_count as f64;
     assert!(fpr < 0.05, "realised FPR {fpr} too high");
 }
@@ -276,7 +282,10 @@ fn burr_negative_keys_obey_fpr_envelope_at_low_target() {
             false_positives += 1;
         }
     }
-    #[allow(clippy::cast_precision_loss)]
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "test code: precision loss acceptable in rate calculations"
+    )]
     let fpr = false_positives as f64 / probe_count as f64;
     // BuRR at FPR=0.001 typically realises ≤ 0.5%. Allow envelope.
     assert!(fpr < 0.01, "realised FPR {fpr} > 1% envelope around 0.1%");

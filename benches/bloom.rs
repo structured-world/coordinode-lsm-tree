@@ -137,7 +137,14 @@ fn ribbon_filter_contains(c: &mut Criterion) {
     for fpr in [0.01_f32, 0.001, 0.0001] {
         let n = 1_000_000_usize;
         // r = ceil(-log2(fpr)) — matches what BuRR picks internally.
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "r is derived from bounded FPR inputs for this benchmark"
+        )]
+        #[expect(
+            clippy::cast_sign_loss,
+            reason = "(-log2(fpr)).ceil() is non-negative for fpr in (0, 1)"
+        )]
         let r = (-fpr.log2()).ceil() as usize;
         let params = Params::new(n, 64, r, Mode::Standard)
             .expect("ribbon params")

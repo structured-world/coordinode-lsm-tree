@@ -52,6 +52,7 @@ impl Params {
         Ok(params)
     }
 
+    #[must_use]
     pub fn with_seed(mut self, seed: u64) -> Self {
         self.seed = seed;
         self
