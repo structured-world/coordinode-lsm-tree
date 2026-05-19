@@ -20,6 +20,10 @@
 //! 4. Copy the manifest, version file (`v<id>`), and `current` pointer.
 //! 5. Drop the pause guard — queued deletions run.
 
+// `Path`, `io::{Read, Write}` and `io::copy` come from `std::*` because
+// no `core` / `alloc` equivalents exist; they are also the same types
+// the underlying `Fs` trait operates on, so this module inherits its
+// host `fs` module's std dependency rather than introducing a new one.
 use crate::{
     AbstractTree, CheckpointInfo, SeqNo,
     file::{BLOBS_FOLDER, CURRENT_VERSION_FILE, TABLES_FOLDER, fsync_directory},
@@ -27,10 +31,10 @@ use crate::{
     version::Version,
     vlog::BlobFile,
 };
+use alloc::{sync::Arc, vec};
 use std::{
     io::{Read, Write},
     path::Path,
-    sync::Arc,
 };
 
 /// Internal helper: returns the byte-name used inside the checkpoint

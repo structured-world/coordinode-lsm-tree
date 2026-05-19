@@ -22,14 +22,15 @@
 //! blob-file `Inner`, the [`Drop`] check is O(1) and lock-free in the
 //! common case (no checkpoint in progress).
 
+// Prefer `alloc`/`core` for primitives that exist there. `Mutex` and
+// `PathBuf` have no alloc-only equivalent in the standard library and
+// stay on `std::*` — they carry the same std dependency that the
+// underlying `Fs` trait already pulls in, so this module's no-std
+// posture matches `crate::fs` exactly.
 use crate::fs::Fs;
-use std::{
-    path::PathBuf,
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicU32, Ordering},
-    },
-};
+use alloc::sync::Arc;
+use core::sync::atomic::{AtomicU32, Ordering};
+use std::{path::PathBuf, sync::Mutex};
 
 /// Shared state controlling whether file deletions are deferred.
 ///
@@ -50,8 +51,8 @@ struct QueuedDeletion {
     path: PathBuf,
 }
 
-impl std::fmt::Debug for DeletionPause {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Debug for DeletionPause {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("DeletionPause")
             .field("active", &self.active.load(Ordering::Relaxed))
             .field("queued", &self.queue.lock().map(|q| q.len()).unwrap_or(0))
