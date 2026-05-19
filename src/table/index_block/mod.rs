@@ -325,11 +325,17 @@ mod tests {
             /// Counts `compare()` invocations — proves the lex devirt path
             /// successfully bypasses the `dyn UserComparator::compare` vtable.
             count: Arc<AtomicUsize>,
-            /// Counts `is_lexicographic()` invocations. The lex devirt
-            /// strategy gates each entry point on `is_lexicographic()`; this
-            /// counter proves the lex branch was actually selected (a
-            /// regression that always selected the dyn branch would leave
-            /// this at 0 in lex tests AND keep `count` at 0).
+            /// Counts `is_lexicographic()` invocations. Sanity counter:
+            /// asserts the comparator was consulted at all, guarding the
+            /// false-negative where `count == 0` trivially because no
+            /// comparator-touching code ran (empty block, early bail-out).
+            ///
+            /// NOTE: `is_lex_count > 0` does NOT prove the BS predicate
+            /// factory selected the lex branch — the no-prefix `compare_key`
+            /// in `index_block/mod.rs` also calls `is_lexicographic()` per
+            /// item, so this counter can be incremented from either source.
+            /// The TRUE proof that the lex BS predicate ran is `count == 0`
+            /// (no `compare()` vtable invocations).
             is_lex_count: Arc<AtomicUsize>,
             lex: bool,
         }
@@ -580,19 +586,22 @@ mod tests {
                 ("above-max (key 31 + 0xFF)", above_max),
             ];
 
+            // Exercise both devirtualized entry points (`seek` and
+            // `seek_upper`) against the same boundary needle table. The
+            // two have different predicate shapes (forward seqno-aware
+            // 3-way vs reverse `<` / `<=`), so the call-count assertions
+            // above wouldn't catch a landing mismatch from a wrong
+            // operator in the lex closure of either one.
             for (label, needle) in &needles {
+                // seek (forward, seqno-aware)
                 let mut lex_iter = index_block.iter(lex.clone());
                 let lex_seek = lex_iter.seek(needle, crate::SeqNo::MAX);
-
                 let mut dyn_iter = index_block.iter(dyn_cmp.clone());
                 let dyn_seek = dyn_iter.seek(needle, crate::SeqNo::MAX);
-
                 assert_eq!(
                     lex_seek, dyn_seek,
                     "index seek result must match for needle {label} ({needle:?})",
                 );
-
-                // Compare landing end_key bytes (handles' materialized end_key).
                 let lex_landing = lex_iter
                     .next()
                     .map(|h| h.materialize(index_block.as_slice()).end_key().clone());
@@ -602,7 +611,30 @@ mod tests {
                 assert_eq!(
                     lex_landing.as_ref().map(|s| s.as_ref().to_vec()),
                     dyn_landing.as_ref().map(|s| s.as_ref().to_vec()),
-                    "index landing end_key must match for needle {label} ({needle:?})",
+                    "index seek landing must match for needle {label} ({needle:?})",
+                );
+
+                // seek_upper (reverse upper-bound — exercises seek_upper_impl
+                // which has different `<` vs `<=` predicate logic at
+                // restart_interval == 1).
+                let mut lex_iter = index_block.iter(lex.clone());
+                let lex_upper = lex_iter.seek_upper(needle, crate::SeqNo::MAX);
+                let mut dyn_iter = index_block.iter(dyn_cmp.clone());
+                let dyn_upper = dyn_iter.seek_upper(needle, crate::SeqNo::MAX);
+                assert_eq!(
+                    lex_upper, dyn_upper,
+                    "index seek_upper result must match for needle {label} ({needle:?})",
+                );
+                let lex_upper_landing = lex_iter
+                    .next_back()
+                    .map(|h| h.materialize(index_block.as_slice()).end_key().clone());
+                let dyn_upper_landing = dyn_iter
+                    .next_back()
+                    .map(|h| h.materialize(index_block.as_slice()).end_key().clone());
+                assert_eq!(
+                    lex_upper_landing.as_ref().map(|s| s.as_ref().to_vec()),
+                    dyn_upper_landing.as_ref().map(|s| s.as_ref().to_vec()),
+                    "index seek_upper landing must match for needle {label} ({needle:?})",
                 );
             }
         }

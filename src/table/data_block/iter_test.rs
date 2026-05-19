@@ -1456,13 +1456,20 @@ mod tests {
             /// Counts `compare()` invocations — proves the lex devirt path
             /// successfully bypasses the `dyn UserComparator::compare` vtable.
             count: Arc<AtomicUsize>,
-            /// Counts `is_lexicographic()` invocations. The lex devirt
-            /// strategy gates each entry point on `is_lexicographic()`, so
-            /// this counter PROVES the lex branch was actually selected (a
-            /// regression that always selected the dyn branch would leave
-            /// this at 0 in lex tests AND keep `count` at 0, both passing
-            /// the original weaker assertion). Required to fully discriminate
-            /// "lex branch ran" from "no seeks happened at all".
+            /// Counts `is_lexicographic()` invocations. This is a sanity
+            /// counter — it asserts the comparator was actually consulted,
+            /// guarding against the false-negative where `count == 0`
+            /// trivially because the seek never reached any branch that
+            /// touches the comparator (empty block, early bail-out, etc.).
+            ///
+            /// NOTE: `is_lex_count > 0` does NOT prove the BS predicate
+            /// factory took the lex branch — the no-prefix `compare_key`
+            /// fast path in `data_block/mod.rs` ALSO calls
+            /// `is_lexicographic()` once per linear-scan step, so this
+            /// counter can be incremented by either source. The TRUE proof
+            /// that the lex BS predicate ran is `count == 0` (no
+            /// `compare()` vtable invocations — a regression that selected
+            /// the dyn branch would call `compare()` and increment `count`).
             is_lex_count: Arc<AtomicUsize>,
             lex: bool,
         }
@@ -1797,26 +1804,70 @@ mod tests {
                 ("above-max (key 63 + 0xFF)", above_max),
             ];
 
+            // Exercise all three devirtualized entry points against the
+            // same boundary needle table. Each entry point has a distinct
+            // predicate shape (forward seqno-aware 3-way, reverse `<=`,
+            // reverse `<`), so call-count assertions alone wouldn't catch
+            // a `<` vs `<=` landing mismatch.
             for (label, needle) in &needles {
+                // seek (forward seqno-aware, inclusive)
                 let mut lex_iter = data_block.iter(lex.clone());
                 let lex_seek = lex_iter.seek(needle, SeqNo::MAX);
                 let lex_landing = lex_iter
                     .next()
                     .map(|e| e.materialize(data_block.as_slice()).key.user_key);
-
                 let mut dyn_iter = data_block.iter(dyn_cmp.clone());
                 let dyn_seek = dyn_iter.seek(needle, SeqNo::MAX);
                 let dyn_landing = dyn_iter
                     .next()
                     .map(|e| e.materialize(data_block.as_slice()).key.user_key);
-
                 assert_eq!(
                     lex_seek, dyn_seek,
                     "seek result must match for needle {label} ({needle:?})",
                 );
                 assert_eq!(
                     lex_landing, dyn_landing,
-                    "landing position must match for needle {label} ({needle:?})",
+                    "seek landing must match for needle {label} ({needle:?})",
+                );
+
+                // seek_upper (reverse, inclusive — last key <= needle)
+                let mut lex_iter = data_block.iter(lex.clone());
+                let lex_upper = lex_iter.seek_upper(needle, SeqNo::MAX);
+                let lex_upper_landing = lex_iter
+                    .next_back()
+                    .map(|e| e.materialize(data_block.as_slice()).key.user_key);
+                let mut dyn_iter = data_block.iter(dyn_cmp.clone());
+                let dyn_upper = dyn_iter.seek_upper(needle, SeqNo::MAX);
+                let dyn_upper_landing = dyn_iter
+                    .next_back()
+                    .map(|e| e.materialize(data_block.as_slice()).key.user_key);
+                assert_eq!(
+                    lex_upper, dyn_upper,
+                    "seek_upper result must match for needle {label} ({needle:?})",
+                );
+                assert_eq!(
+                    lex_upper_landing, dyn_upper_landing,
+                    "seek_upper landing must match for needle {label} ({needle:?})",
+                );
+
+                // seek_upper_exclusive (reverse, exclusive — last key < needle)
+                let mut lex_iter = data_block.iter(lex.clone());
+                let lex_excl = lex_iter.seek_upper_exclusive(needle, SeqNo::MAX);
+                let lex_excl_landing = lex_iter
+                    .next()
+                    .map(|e| e.materialize(data_block.as_slice()).key.user_key);
+                let mut dyn_iter = data_block.iter(dyn_cmp.clone());
+                let dyn_excl = dyn_iter.seek_upper_exclusive(needle, SeqNo::MAX);
+                let dyn_excl_landing = dyn_iter
+                    .next()
+                    .map(|e| e.materialize(data_block.as_slice()).key.user_key);
+                assert_eq!(
+                    lex_excl, dyn_excl,
+                    "seek_upper_exclusive result must match for needle {label} ({needle:?})",
+                );
+                assert_eq!(
+                    lex_excl_landing, dyn_excl_landing,
+                    "seek_upper_exclusive landing must match for needle {label} ({needle:?})",
                 );
             }
             Ok(())
