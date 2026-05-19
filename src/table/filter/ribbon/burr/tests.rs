@@ -1,9 +1,13 @@
-//! Smoke + correctness tests for the BuRR filter MVP.
+//! Unit + correctness tests for the BuRR filter.
 //!
-//! Full FPR/bench/edge-case suite lands with task #19 (separate commit);
-//! this file covers the construction round-trip and basic membership
-//! invariants so the algorithm is exercised end-to-end as soon as the
-//! multi-layer builder + probe path go in.
+//! Covers: construction round-trip, membership invariants (FN-free for
+//! inserted keys), FPR envelope at multiple targets, wire-format
+//! encoder/decoder round-trips, wire-format rejection of bad magic /
+//! version / filter_type / truncated headers, build determinism for
+//! fixed seed, and scratch-reuse equivalence.
+//!
+//! End-to-end coverage through the table writer + reader path lives in
+//! `tests/burr_filter_end_to_end.rs`.
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::BuildHasherDefault;

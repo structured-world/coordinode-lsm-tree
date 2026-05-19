@@ -11,21 +11,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [4.5.0](https://github.com/structured-world/coordinode-lsm-tree/compare/v4.4.0...v4.5.0) - 2026-05-19
+### Changed
+
+- *(filter)* replace standard bloom with BuRR (Bumped Ribbon Retrieval) — math-optimal AMQ filter per Walzer & Dillinger 2022 (arXiv:2109.01892). ~30% smaller filter blocks at the same false-positive rate. Breaks the on-disk filter wire format (different magic + layered layout); fresh tables only. ([#269](https://github.com/structured-world/coordinode-lsm-tree/pull/269))
 
 ### Added
 
-- *(ci)* smart upstream-monitor with release intelligence + path-aware CodeRabbit profile ([#264](https://github.com/structured-world/coordinode-lsm-tree/pull/264))
-- *(vlog)* dictionary compression for blob files ([#233](https://github.com/structured-world/coordinode-lsm-tree/pull/233))
-
-### Fixed
-
-- *(encryption)* restore --features encryption build (aes-gcm 0.11.0-rc.3 + rand_chacha 0.10) ([#258](https://github.com/structured-world/coordinode-lsm-tree/pull/258))
-
-### Performance
-
-- devirtualize lexicographic comparator on block binary-search hot path ([#266](https://github.com/structured-world/coordinode-lsm-tree/pull/266))
-- *(util)* SIMD longest_shared_prefix_length() (Phase 2.1) ([#245](https://github.com/structured-world/coordinode-lsm-tree/pull/245))
+- *(hash)* `lsm_tree::hash::hash64` is now a public module entry point (was previously reachable only indirectly through the deleted `standard_bloom::Builder::get_hash`).
 
 ## [4.4.0](https://github.com/structured-world/coordinode-lsm-tree/compare/v4.3.1...v4.4.0) - 2026-04-09
 
