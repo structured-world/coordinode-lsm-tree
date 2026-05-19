@@ -124,6 +124,12 @@ impl BurrParams {
     /// to a multiple of `b`. For the final layer, the caller is expected
     /// to bump the overhead so that no keys spill over (handled by the
     /// builder, not by this helper).
+    ///
+    /// Floor: the result is always `>= b`. The vendored Ribbon solver
+    /// (`Params::new(m, w=64, ...)`) additionally requires `m >= w`, so
+    /// the floor is only sufficient when `b >= w`. `BurrBuilder::new`
+    /// rejects params with `b < w` up-front to guarantee that
+    /// invariant; this helper itself does not re-check.
     #[must_use]
     pub fn layer_m(&self, layer_input_keys: usize) -> usize {
         // BurrBuilder::new rejects params with b == 0; this assert pins
