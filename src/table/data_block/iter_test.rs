@@ -1488,12 +1488,18 @@ mod tests {
         ///   - linear scan after BS lands: 0-1 iterations (each restart head
         ///     IS an item, so the scan either returns immediately or steps once)
         ///
-        /// Discrimination math:
-        ///   - dyn path working correctly: count >= 7 (BS) + 0..1 (scan)
-        ///   - lex closure leaked into dyn BS: count = 0 (BS) + 0..1 (scan) ≤ 1
+        /// Discrimination math (paired with an above-max needle that bounds
+        /// the reverse linear-scan contribution to exactly 1 `compare_key`
+        /// call — see [`above_max_needle`]):
+        ///   - dyn path working correctly: 7 (BS) + 1 (scan) = 8
+        ///   - lex closure leaked into dyn BS: 0 (BS) + 1 (scan) = 1
         ///
-        /// `assert count >= 2` cleanly distinguishes the two cases, ruling out
-        /// the linear-scan-only false-positive that a naive `> 0` would miss.
+        /// `assert delta >= DYN_MIN_BS_PROBES` (= 7) cleanly distinguishes
+        /// the two cases. Earlier rounds of this test used `>= 2`, which
+        /// was matchable by a working linear scan alone for exact-key
+        /// needles (e.g. `seek_upper_exclusive` reverse scan: Equal-skip
+        /// then Less-return = 2 `compare_key` calls). The above-max needle
+        /// + 7-probe threshold rules out that false positive.
         fn build_block_bs_dominated() -> crate::Result<DataBlock> {
             let items: Vec<_> = (0_u64..128)
                 .map(|i| InternalValue::from_components(i.to_be_bytes(), "", 0, Value))

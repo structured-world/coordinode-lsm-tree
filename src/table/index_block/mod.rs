@@ -351,13 +351,16 @@ mod tests {
         /// Build an index block tuned to make BS probes dominate any potential
         /// linear-scan contribution:
         ///   - 128 handles with distinct sortable `end_key`s
-        ///   - `restart_interval=1` → each handle IS a restart head
-        ///   - binary search: log2(128) = 7 probes minimum
-        ///   - linear scan after BS lands: 0-1 iterations
+        ///   - `restart_interval=1` → each handle IS a restart head, AND
+        ///     the `advance_while` / `trim_back_to_upper_bound` linear-scan
+        ///     branches in `seek_with_cache_resets` / `seek_upper_impl` are
+        ///     bypassed entirely (those are gated on `restart_interval > 1`)
+        ///   - binary search: log2(128) = 7 probes
         ///
-        /// `assert count >= 2` then cleanly distinguishes the lex-leak case
-        /// (BS contributes 0, scan contributes at most 1) from a working
-        /// dyn path (BS contributes >= 7).
+        /// `assert delta >= DYN_MIN_BS_PROBES` (= 7) cleanly distinguishes
+        /// the lex-leak case (BS contributes 0, no linear scan to add to
+        /// the count) from a working dyn path (BS contributes exactly 7).
+        /// See [`DYN_MIN_BS_PROBES`] for the full discrimination math.
         fn build_index_block_bs_dominated() -> IndexBlock {
             use crate::Checksum;
             use crate::table::block::{BlockType, Header};
