@@ -148,6 +148,19 @@ where
     /// `BuildHasher::hash_one(key)` value. The on-disk LSM filter
     /// always uses the hash-based build + probe pair so the two stay
     /// consistent.
+    ///
+    /// Note on probe-mode tagging: a previous reviewer asked whether
+    /// the construction mode (keyed vs hashed) should be encoded in
+    /// the type so that mismatched pairs fail fast at runtime. The
+    /// trade-off was considered and rejected: the in-tree LSM caller
+    /// uses [`BurrBuilder::build_from_hashes`] + `contains_hash`
+    /// exclusively (see the table filter pipeline), so the keyed API
+    /// has a single, well-defined call site (this crate's own tests
+    /// plus external callers who explicitly opt in). Adding a runtime
+    /// mode tag would cost an extra branch on every probe; splitting
+    /// into two filter types would bifurcate every consumer (writer,
+    /// reader, builder, wire codec) for no in-tree benefit. The
+    /// doc-comment contract above is the canonical guarantee.
     #[inline]
     pub fn contains_hash(&self, hash: u64) -> bool {
         // BurrParams::with_fp_rate / with_bpk both clamp r to 1..=64, so

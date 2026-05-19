@@ -124,7 +124,9 @@ Originally created by Marvin Blum as part of [fjall-rs/lsm-tree](https://github.
 
 ## License
 
-All source code is licensed under Apache-2.0. Contributions are accepted under the same license.
+All source code is licensed under [Apache-2.0](LICENSE-APACHE). Each `.rs` file carries an `SPDX-License-Identifier: Apache-2.0` header alongside the original-author copyright and the maintainer copyright (Structured World Foundation). Contributions are accepted under the same license.
+
+The vendored Ribbon filter (`src/table/filter/ribbon/`) is one half of an upstream dual-licensed crate (`MIT OR Apache-2.0`); we redistribute only under the Apache-2.0 arm, and the upstream license texts are preserved verbatim in `src/table/filter/ribbon/_vendored/` per Apache-2.0 §4.
 
 Maintained by [Structured World Foundation](https://sw.foundation).
 
