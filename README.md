@@ -116,6 +116,10 @@ USDT (TRC-20): `TFDsezHa1cBkoeZT5q2T49Wp66K8t2DmdA`
 
 </div>
 
+## Credits
+
+Originally created by Marvin Blum as part of [fjall-rs/lsm-tree](https://github.com/fjall-rs/lsm-tree); this codebase carries the original copyright (`Copyright (c) 2024-present, fjall-rs`). The vendored Ribbon filter (`src/table/filter/ribbon/`) is by [William Rågstad](https://github.com/WilliamRagstad) — see [`src/table/filter/ribbon/_vendored/`](src/table/filter/ribbon/_vendored/) for the upstream license texts.
+
 ## License
 
 All source code is licensed under Apache-2.0. Contributions are accepted under the same license.
