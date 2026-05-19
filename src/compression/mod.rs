@@ -12,6 +12,9 @@ use std::io::{Read, Write};
 #[cfg(zstd_any)]
 use std::sync::Arc;
 
+#[cfg(feature = "zstd")]
+use once_cell::sync::OnceCell;
+
 /// Zstd compression backend operations.
 ///
 /// Abstracts the zstd implementation so callsites are independent of the
@@ -78,6 +81,16 @@ pub struct ZstdDictionary {
     /// the lower 32 bits for external consumers.
     id: u64,
     raw: Arc<[u8]>,
+    /// Lazily-parsed shared `DictionaryHandle` (Arc-backed inside structured-zstd).
+    /// Populated on first decompress call and reused across all subsequent calls
+    /// and all threads — eliminates the per-thread dictionary re-parse the TLS
+    /// `FrameDecoder` cache used to incur on every miss. `OnceCell::get_or_try_init`
+    /// guarantees exactly one successful parse across racing threads with no
+    /// auxiliary mutex: losers wait on the internal one-shot synchronisation
+    /// primitive and reuse the winner's `Arc` clone. This keeps the `new()`
+    /// constructor infallible AND preserves the single-parse contract.
+    #[cfg(feature = "zstd")]
+    prepared: Arc<OnceCell<structured_zstd::decoding::DictionaryHandle>>,
 }
 
 #[cfg(zstd_any)]
@@ -86,6 +99,8 @@ impl Clone for ZstdDictionary {
         Self {
             id: self.id,
             raw: Arc::clone(&self.raw),
+            #[cfg(feature = "zstd")]
+            prepared: Arc::clone(&self.prepared),
         }
     }
 }
@@ -130,7 +145,60 @@ impl ZstdDictionary {
         Self {
             id: compute_dict_id(raw),
             raw: Arc::from(raw),
+            #[cfg(feature = "zstd")]
+            prepared: Arc::new(OnceCell::new()),
         }
+    }
+
+    /// Returns the shared pre-parsed `DictionaryHandle`, parsing on first call
+    /// and reusing the cached handle on every subsequent call (across threads).
+    ///
+    /// The handle wraps an `Arc<Dictionary>` inside structured-zstd, so cloning
+    /// it is an atomic refcount bump — cheap enough to use on every decompress
+    /// call. Frame decoders register the dictionary via
+    /// `FrameDecoder::add_dict_handle`, which shares the same `Arc` rather than
+    /// cloning the underlying entropy tables.
+    ///
+    /// On the first call we attempt finalized-dict parsing (magic bytes
+    /// `37 A4 30 EC`); buffers without that prefix are treated as raw-content
+    /// dictionaries via `Dictionary::from_raw_content` with the same synthetic
+    /// 32-bit id formula the compressor uses (`xxh3(raw) as u32, clamped ≥ 1`).
+    /// Parse failures are NOT cached — the next caller will retry — but the
+    /// raw bytes are immutable for the dictionary's lifetime so a successful
+    /// parse on one thread is permanent.
+    #[cfg(feature = "zstd")]
+    pub(crate) fn prepared_handle(
+        &self,
+    ) -> crate::Result<structured_zstd::decoding::DictionaryHandle> {
+        use structured_zstd::decoding::{Dictionary, DictionaryHandle};
+        const DICT_MAGIC: [u8; 4] = [0x37, 0xA4, 0x30, 0xEC];
+
+        // `get_or_try_init` is the canonical single-init-across-racers
+        // primitive: the closure runs at most once globally regardless of
+        // contention; concurrent callers wait on the OnceCell's internal
+        // one-shot synchronisation and read the cached `Arc` afterwards.
+        // The fast path (cached value) is lock-free; the slow path runs
+        // exactly once per `ZstdDictionary` lifetime even under heavy
+        // cold-start contention. On a parse failure the OnceCell stays
+        // empty and the next caller retries from scratch — preserving
+        // the retry-on-failure contract pinned by the rejection test.
+        self.prepared
+            .get_or_try_init(|| -> crate::Result<DictionaryHandle> {
+                if self.raw.starts_with(&DICT_MAGIC) {
+                    DictionaryHandle::decode_dict(&self.raw)
+                        .map_err(|e| crate::Error::Io(std::io::Error::other(e)))
+                } else {
+                    #[expect(
+                        clippy::cast_possible_truncation,
+                        reason = "intentional: lower 32 bits of xxh3 as internal dict id (matches compressor)"
+                    )]
+                    let raw_content_id = (self.id as u32).max(1);
+                    let dict = Dictionary::from_raw_content(raw_content_id, self.raw.to_vec())
+                        .map_err(|e| crate::Error::Io(std::io::Error::other(e)))?;
+                    Ok(DictionaryHandle::from_dictionary(dict))
+                }
+            })
+            .cloned()
     }
 
     /// Returns a 32-bit fingerprint derived from the dictionary content.
@@ -561,6 +629,116 @@ mod tests {
             let debug = format!("{dict:?}");
             assert!(debug.contains("ZstdDictionary"));
             assert!(debug.contains("size: 4"));
+        }
+
+        // --- prepared_handle: pre-parsed `DictionaryHandle` cache ---
+        //
+        // The whole point of #232: parse the dictionary ONCE per
+        // `ZstdDictionary` instance and reuse the Arc-backed handle on every
+        // subsequent decompress call, across all threads. The tests below
+        // pin the contract: success / memoization / shared-OnceCell-across-
+        // clones / both finalized + raw-content paths / error surfacing.
+
+        #[cfg(feature = "zstd")]
+        #[test]
+        fn prepared_handle_raw_content_dict_parses_and_memoizes() {
+            // Raw-content path: no magic prefix. structured-zstd builds a
+            // `Dictionary` from the bytes treated as LZ77 history. First
+            // call parses; second call must hit the OnceCell cache and
+            // return a handle that compares-equal to the first.
+            let dict = ZstdDictionary::new(b"raw-content training bytes here");
+            let h1 = dict
+                .prepared_handle()
+                .expect("first call must parse raw-content dict");
+            let h2 = dict
+                .prepared_handle()
+                .expect("second call must hit the cache");
+            assert_eq!(
+                h1.id(),
+                h2.id(),
+                "cached handle must report the same dict id"
+            );
+        }
+
+        #[cfg(feature = "zstd")]
+        #[test]
+        fn prepared_handle_rejects_corrupted_finalized_magic() {
+            // Bytes that LOOK like a finalized dict (magic prefix matches)
+            // but are otherwise malformed must surface a parse error
+            // through `prepared_handle` rather than panicking. The OnceCell
+            // must NOT be populated with anything on failure — otherwise a
+            // future caller would skip the (now-deterministically-failing)
+            // parse and silently fall back to a stale cached value, breaking
+            // the retry-on-failure contract.
+            let mut bad = vec![0x37, 0xA4, 0x30, 0xEC]; // valid magic
+            bad.extend_from_slice(&[0xFF; 16]); // garbage payload
+            let dict = ZstdDictionary::new(&bad);
+            let result = dict.prepared_handle();
+            assert!(
+                result.is_err(),
+                "corrupted finalized dict must surface parse error",
+            );
+            assert!(
+                dict.prepared.get().is_none(),
+                "failed parse must NOT populate the OnceCell — retry-on-failure contract",
+            );
+        }
+
+        #[cfg(feature = "zstd")]
+        #[test]
+        fn prepared_handle_shared_across_clones() {
+            // `ZstdDictionary::clone` shares the inner `Arc<OnceCell<…>>`.
+            // Parsing through one clone must be visible to the other —
+            // otherwise each clone would re-parse independently, defeating
+            // the purpose of the cache when dictionaries are distributed
+            // across threads via clones.
+            let dict_a = ZstdDictionary::new(b"shared dict bytes for clone test");
+            let dict_b = dict_a.clone();
+
+            let _ = dict_a
+                .prepared_handle()
+                .expect("parse via dict_a must succeed");
+            // After dict_a parsed, dict_b's OnceCell (same Arc) must be
+            // populated. We cannot directly observe "did not re-parse"
+            // without instrumentation, but we can assert the cached
+            // handle round-trips through dict_b and reports the same id.
+            let h_b = dict_b
+                .prepared_handle()
+                .expect("dict_b must see cached handle");
+            assert_eq!(h_b.id(), dict_a.id());
+            // Cross-check OnceCell state directly: it is .get()-readable
+            // from both clones.
+            assert!(
+                dict_b.prepared.get().is_some(),
+                "OnceCell must be populated on dict_b after dict_a parsed",
+            );
+        }
+
+        #[cfg(feature = "zstd")]
+        #[test]
+        fn prepared_handle_is_lazy_and_populated_after_first_call() {
+            // The cache contract is lazy-init: `ZstdDictionary::new` must
+            // NOT eagerly parse, and the OnceCell must transition from
+            // `None` to `Some(_)` precisely on the first `prepared_handle`
+            // call. This pins both halves of the contract — a regression
+            // either way (eager parse OR no caching) lights up the assert.
+            //
+            // The end-to-end "real finalized dict parses successfully" path
+            // is exercised by the existing `zstd_backend` round-trip suite
+            // (which feeds real compressed frames through `decompress_with_dict`,
+            // implicitly going through `prepared_handle`); duplicating the
+            // dict-builder here would require linking the zstd dict trainer
+            // and adds no coverage over what the backend tests already give.
+            let dict = ZstdDictionary::new(b"laziness test bytes");
+            assert!(
+                dict.prepared.get().is_none(),
+                "ZstdDictionary::new must NOT eagerly parse the dictionary",
+            );
+            let _ = dict.prepared_handle().expect("explicit parse must succeed");
+            assert!(
+                dict.prepared.get().is_some(),
+                "OnceCell must be populated after first prepared_handle call",
+            );
         }
     }
 }

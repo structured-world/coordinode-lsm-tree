@@ -2,6 +2,15 @@
 // Copyright (c) 2024-present, fjall-rs
 // Copyright (c) 2026-present, Structured World Foundation
 
+// no-std foundation: when the `std` feature is OFF the crate root opts into
+// `no_std`. Default builds keep `std` enabled (file I/O, threading, system
+// clock all live in `std`), so existing consumers see no behaviour change.
+// The migration to a fully no-std-clean build is incremental — modules with
+// std-only dependencies stay gated behind `#[cfg(feature = "std")]` until
+// they are ported. The CI job `no-std-check` exercises `cargo check
+// --no-default-features --features alloc` and tracks remaining work.
+#![cfg_attr(not(feature = "std"), no_std)]
+
 //! Embedded LSM-tree storage engine.
 //!
 //! Provides keyed point reads, prefix and range scans, MVCC snapshots, block
@@ -64,6 +73,12 @@
 #![allow(clippy::option_if_let_else)]
 #![warn(clippy::redundant_feature_names)]
 #![cfg_attr(coverage_nightly, feature(coverage_attribute))]
+
+// `alloc` is the minimal hard dependency — the crate uses `Arc`, `Vec`,
+// `Box`, and other heap types throughout. `extern crate alloc` makes the
+// `alloc` crate root visible to `no_std` builds; under `std` it is a
+// no-op alias because the standard library re-exports the same types.
+extern crate alloc;
 
 #[doc(hidden)]
 pub type HashMap<K, V> = std::collections::HashMap<K, V, rustc_hash::FxBuildHasher>;

@@ -464,26 +464,22 @@ impl CompressionProvider for ZstdProvider {
         dict: &crate::compression::ZstdDictionary,
         capacity: usize,
     ) -> crate::Result<Vec<u8>> {
-        use structured_zstd::decoding::{Dictionary, FrameDecoder};
+        use structured_zstd::decoding::FrameDecoder;
 
         // Thread-local `FrameDecoder` with the dictionary pre-loaded.
         //
-        // Parsing a zstd dictionary involves building Huffman and FSE decoding
-        // tables — expensive relative to per-block decompression for the small
-        // 4–64 KiB blocks typical in LSM-trees. This single-entry cache
-        // amortises that cost: if the active dictionary (identified by its
-        // 64-bit xxh3 fingerprint) matches the stored entry the decoder is
-        // reused; otherwise the entry is replaced.
+        // `FrameDecoder` is not `Send`, so we keep one per thread. The cached
+        // entry is keyed by the full 64-bit xxh3 fingerprint (`dict.id64()`),
+        // not the truncated 32-bit public fingerprint, to avoid decoder reuse
+        // when two distinct dictionaries happen to share the same 32-bit
+        // prefix. A 64-bit collision is 2^32× less likely than a 32-bit one.
         //
-        // Thread-local storage is appropriate because `FrameDecoder` is not
-        // `Send` and each thread decompresses independently; no mutex is
-        // needed. If the active dictionary changes (e.g. different table),
-        // the decoder is re-initialised transparently.
+        // On miss we register the *pre-parsed* dictionary handle held by the
+        // `ZstdDictionary` itself (lazy-parsed once, shared via Arc inside
+        // structured-zstd). This eliminates the per-thread `Dictionary` re-parse
+        // the cache used to do on every miss — the dictionary's entropy tables
+        // are built once globally and the FrameDecoder just shares the Arc.
         thread_local! {
-            // Keyed by the full 64-bit xxh3 fingerprint (`dict.id64()`), not
-            // the truncated 32-bit public fingerprint, to avoid decoder reuse
-            // when two distinct dictionaries happen to share the same 32-bit
-            // prefix. A 64-bit collision is 2^32× less likely than a 32-bit one.
             static TLS_DECODER: std::cell::RefCell<Option<(u64, FrameDecoder)>> =
                 const { std::cell::RefCell::new(None) };
         }
@@ -505,29 +501,13 @@ impl CompressionProvider for ZstdProvider {
             // Re-initialise if this is the first call in this thread or if
             // the dictionary has changed (different id64 → different table).
             if !matches!(&*state, Some((id, _)) if *id == dict.id64()) {
-                // Mirror the format-detection logic in `compress_with_dict`:
-                // finalized dictionaries (magic bytes `37 A4 30 EC`) are parsed with
-                // `decode_dict`; raw content bytes use `from_raw_content` with
-                // the same synthetic id formula as `compress_with_dict` so that
-                // `force_dict` can locate the dict in the internal dicts map.
-                let parsed = if dict.raw().starts_with(&DICT_MAGIC) {
-                    Dictionary::decode_dict(dict.raw())
-                        .map_err(|e| crate::Error::Io(std::io::Error::other(e)))?
-                } else {
-                    #[expect(
-                        clippy::cast_possible_truncation,
-                        reason = "intentional: lower 32 bits of xxh3 as internal dict id"
-                    )]
-                    let raw_content_id = {
-                        let h = xxhash_rust::xxh3::xxh3_64(dict.raw()) as u32;
-                        h.max(1) // id=0 is rejected; used internally for force_dict keying
-                    };
-                    Dictionary::from_raw_content(raw_content_id, dict.raw().to_vec())
-                        .map_err(|e| crate::Error::Io(std::io::Error::other(e)))?
-                };
+                // Pull the shared pre-parsed handle from the dictionary. First
+                // caller across all threads parses; everyone after gets an Arc
+                // clone of the cached entropy tables.
+                let handle = dict.prepared_handle()?;
                 let mut decoder = FrameDecoder::new();
                 decoder
-                    .add_dict(parsed)
+                    .add_dict_handle(handle)
                     .map_err(|e| crate::Error::Io(std::io::Error::other(e)))?;
                 *state = Some((dict.id64(), decoder));
             }

@@ -28,9 +28,33 @@ name = "lsm_tree"
 path = "src/lib.rs"
 
 [features]
-default = []
-io-uring = ["dep:io-uring"]
-lz4 = ["dep:lz4_flex"]
+# `std` is the canonical platform feature. Default-on so every existing
+# downstream consumer keeps the current build profile (file I/O, threads,
+# `std::sync` primitives, system clock). Turning it OFF puts the crate
+# into no-std + alloc mode — currently in progress: only foundational
+# modules compile without `std`, the rest still imports `std::*` directly
+# and is gated to migrate incrementally. The `cargo check
+# --no-default-features --features alloc` CI job tracks migration progress
+# (expected to fail until each module is ported). New code added to this
+# crate MUST be no-std-friendly: prefer `core::*` / `alloc::*`, gate
+# std-only primitives behind `#[cfg(feature = "std")]`, and pick external
+# crates that support no-std.
+default = ["std"]
+std = []
+# `alloc` is the minimal hard requirement — the crate uses `Arc`,
+# `Vec`, `Box` everywhere. Listed explicitly so consumers can pick it up
+# without enabling `std` once the no-std migration completes per-module.
+alloc = []
+# Every feature below currently pulls in modules that use `std::*`
+# directly (file I/O, threading, system clock, etc.). Make each one
+# transitively depend on `std` so that `--no-default-features
+# --features <X>` is automatically coherent — without this, a consumer
+# would have to remember to spell `--features std,X` or hit a wall of
+# `unresolved module std` errors. As individual modules are ported to
+# no-std + alloc (tracked in the migration epic), the `std`
+# transitive dep can be lifted on a per-feature basis.
+io-uring = ["dep:io-uring", "std"]
+lz4 = ["dep:lz4_flex", "std"]
 # The previous `zstd-pure = ["zstd"]` alias was removed. It was
 # documented as deprecated when there were two candidate zstd backends
 # on the roadmap; only structured-zstd remains, so the alias serves no
@@ -39,8 +63,8 @@ lz4 = ["dep:lz4_flex"]
 # conventional `!` markers on this PR's breaking commits (BuRR filter
 # wire format, V5 manifest gate); release-plz raises the crate's major
 # version on the next release tag accordingly.
-zstd = ["dep:structured-zstd"]
-encryption = ["dep:aes-gcm", "dep:rand_chacha"]
+zstd = ["dep:structured-zstd", "dep:once_cell", "std"]
+encryption = ["dep:aes-gcm", "dep:rand_chacha", "std"]
 bytes_1 = ["dep:bytes"]
 metrics = []
 # Vendored Ribbon filter retains its `#[cfg(feature = "ribbon-serde")]`
@@ -61,6 +85,15 @@ interval-heap = "0.0.5"
 log = "0.4.27"
 lz4_flex = { version = "0.13.0", optional = true, default-features = false }
 structured-zstd = { version = "0.0.21", optional = true, default-features = false, features = ["std"] }
+# `once_cell::sync::OnceCell` has stable `get_or_try_init`; `std::sync::OnceLock`
+# does not until 1.86+ (still unstable on our 1.92 MSRV path via `once_cell_try`).
+# Use the external crate for the canonical single-parse-across-racers primitive
+# without an auxiliary `Mutex`. The `race` module from this same crate provides
+# the no-std + alloc variant (`OnceBox`) we'll swap to during the no-std
+# migration. Optional + gated by the `zstd` feature — only the zstd
+# `ZstdDictionary::prepared_handle` path uses it today, so non-zstd consumers
+# do not pull this crate.
+once_cell = { version = "1", optional = true }
 quick_cache = { version = "0.6.16", default-features = false, features = [] }
 rustc-hash = "2.1.1"
 self_cell = "1.2.0"
