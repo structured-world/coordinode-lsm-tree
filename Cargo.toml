@@ -45,8 +45,16 @@ std = []
 # `Vec`, `Box` everywhere. Listed explicitly so consumers can pick it up
 # without enabling `std` once the no-std migration completes per-module.
 alloc = []
+# Every feature below currently pulls in modules that use `std::*`
+# directly (file I/O, threading, system clock, etc.). Make each one
+# transitively depend on `std` so that `--no-default-features
+# --features <X>` is automatically coherent — without this, a consumer
+# would have to remember to spell `--features std,X` or hit a wall of
+# `unresolved module std` errors. As individual modules are ported to
+# no-std + alloc (tracked in the migration epic), the `std`
+# transitive dep can be lifted on a per-feature basis.
 io-uring = ["dep:io-uring", "std"]
-lz4 = ["dep:lz4_flex"]
+lz4 = ["dep:lz4_flex", "std"]
 # The previous `zstd-pure = ["zstd"]` alias was removed. It was
 # documented as deprecated when there were two candidate zstd backends
 # on the roadmap; only structured-zstd remains, so the alias serves no
@@ -55,8 +63,8 @@ lz4 = ["dep:lz4_flex"]
 # conventional `!` markers on this PR's breaking commits (BuRR filter
 # wire format, V5 manifest gate); release-plz raises the crate's major
 # version on the next release tag accordingly.
-zstd = ["dep:structured-zstd"]
-encryption = ["dep:aes-gcm", "dep:rand_chacha"]
+zstd = ["dep:structured-zstd", "dep:once_cell", "std"]
+encryption = ["dep:aes-gcm", "dep:rand_chacha", "std"]
 bytes_1 = ["dep:bytes"]
 metrics = []
 # Vendored Ribbon filter retains its `#[cfg(feature = "ribbon-serde")]`
@@ -82,8 +90,10 @@ structured-zstd = { version = "0.0.21", optional = true, default-features = fals
 # Use the external crate for the canonical single-parse-across-racers primitive
 # without an auxiliary `Mutex`. The `race` module from this same crate provides
 # the no-std + alloc variant (`OnceBox`) we'll swap to during the no-std
-# migration.
-once_cell = "1"
+# migration. Optional + gated by the `zstd` feature — only the zstd
+# `ZstdDictionary::prepared_handle` path uses it today, so non-zstd consumers
+# do not pull this crate.
+once_cell = { version = "1", optional = true }
 quick_cache = { version = "0.6.16", default-features = false, features = [] }
 rustc-hash = "2.1.1"
 self_cell = "1.2.0"
