@@ -46,8 +46,10 @@
 //!
 //! ## On-disk format
 //!
-//! Current version: **V4**. V3 databases are read-only; databases written here
-//! are not readable by V3 binaries.
+//! Current version: **V5**. V5 introduces a wire-format break for filter
+//! blocks (`BuRR` replaces Bloom); V3 and V4 databases are not readable by
+//! this version and vice versa. The manifest version gate rejects pre-V5
+//! databases at `Tree::open` time.
 #![deny(clippy::all, missing_docs, clippy::cargo)]
 #![deny(clippy::unwrap_used)]
 #![deny(clippy::indexing_slicing)]

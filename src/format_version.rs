@@ -18,11 +18,16 @@ pub enum FormatVersion {
     V4,
 
     /// `BuRR` (Bumped Ribbon Retrieval) filter wire format. Filter
-    /// blocks are no longer Bloom-encoded; the magic + `filter_type` +
+    /// blocks are no longer Bloom-encoded; the `filter_type` byte +
     /// per-layer header layout is documented in
-    /// `src/table/filter/ribbon/burr/wire.rs`. V4 binaries cannot read
-    /// V5 tables and vice versa — the filter block decoder rejects
-    /// the wrong magic at open time.
+    /// `src/table/filter/ribbon/burr/wire.rs`.
+    ///
+    /// V3/V4 ↔ V5 incompatibility is enforced primarily by the manifest
+    /// version gate at `Tree::open` (returns `InvalidVersion` for
+    /// anything other than V5). If the manifest is bypassed and a
+    /// pre-V5 filter block reaches the decoder, the `BuRR` magic + the
+    /// `filter_type=2` byte plus `format_version=1` inside the `BuRR`
+    /// header will reject the older Bloom-shaped payload.
     V5,
 }
 

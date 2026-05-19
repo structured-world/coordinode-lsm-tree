@@ -282,7 +282,7 @@ pub(crate) fn decode(bytes: &[u8]) -> crate::Result<DecodedFilter<'_>> {
 ///   fail-closed `true` path: a structurally invalid header is a real
 ///   error returned upstream so the table read path can surface it.
 #[inline]
-#[allow(
+#[expect(
     clippy::many_single_char_names,
     reason = "r/w/b/m are well-known params from the BuRR/Ribbon literature; single-letter naming matches the rest of the module."
 )]
