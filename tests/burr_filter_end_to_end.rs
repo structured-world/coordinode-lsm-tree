@@ -10,8 +10,6 @@
 //!     are acceptable — they trigger a wasted index lookup — but the
 //!     table read path must not return a value for a key we never
 //!     inserted)
-//!   - filter efficiency metric trends correctly when the metrics
-//!     feature is enabled
 //!
 //! The integration value is that the table writer's BuRR builder, the
 //! on-disk wire format, and the filter block reader all interoperate

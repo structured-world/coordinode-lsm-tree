@@ -180,8 +180,11 @@ fn burr_wire_rejects_bad_magic() {
     let filter = builder.build_from_hashes(&hashes).expect("build");
     let mut bytes = filter.to_wire_bytes();
     bytes[0] ^= 0xFF;
-    let result = BurrFilterReader::new(&bytes);
-    assert!(result.is_err(), "bad magic should fail decode");
+    let err = BurrFilterReader::new(&bytes).expect_err("bad magic should fail decode");
+    assert!(
+        matches!(err, crate::Error::InvalidHeader("BurrFilter")),
+        "expected InvalidHeader(\"BurrFilter\"), got: {err:?}",
+    );
 }
 
 #[test]
@@ -233,8 +236,11 @@ fn burr_wire_rejects_short_buffer() {
     // panic. Important for hardening against truncated on-disk blocks.
     use super::filter::BurrFilterReader;
     let short = vec![0_u8; 4];
-    let result = BurrFilterReader::new(&short);
-    assert!(result.is_err(), "short buffer must error");
+    let err = BurrFilterReader::new(&short).expect_err("short buffer must error");
+    assert!(
+        matches!(err, crate::Error::InvalidHeader("BurrFilter")),
+        "expected InvalidHeader(\"BurrFilter\"), got: {err:?}",
+    );
 }
 
 #[test]
@@ -251,8 +257,11 @@ fn burr_wire_rejects_unknown_version() {
     // version byte sits at offset MAGIC_LEN + 1 (after filter_type).
     let version_offset = crate::file::MAGIC_BYTES.len() + 1;
     bytes[version_offset] = 0xFE;
-    let result = BurrFilterReader::new(&bytes);
-    assert!(result.is_err(), "bad version must error");
+    let err = BurrFilterReader::new(&bytes).expect_err("bad version must error");
+    assert!(
+        matches!(err, crate::Error::InvalidHeader("BurrFilter version")),
+        "expected InvalidHeader(\"BurrFilter version\"), got: {err:?}",
+    );
 }
 
 #[test]
@@ -267,8 +276,11 @@ fn burr_wire_rejects_unknown_filter_type() {
     let mut bytes = filter.to_wire_bytes();
     let filter_type_offset = crate::file::MAGIC_BYTES.len();
     bytes[filter_type_offset] = 0xAA;
-    let result = BurrFilterReader::new(&bytes);
-    assert!(result.is_err(), "unknown filter_type must error");
+    let err = BurrFilterReader::new(&bytes).expect_err("unknown filter_type must error");
+    assert!(
+        matches!(err, crate::Error::InvalidTag(("FilterType", 0xAA))),
+        "expected InvalidTag((\"FilterType\", 0xAA)), got: {err:?}",
+    );
 }
 
 #[test]
@@ -335,8 +347,11 @@ fn burr_wire_rejects_zero_b() {
     // version + r + w, then b).
     let b_offset = crate::file::MAGIC_BYTES.len() + 4;
     bytes[b_offset] = 0;
-    let result = BurrFilterReader::new(&bytes);
-    assert!(result.is_err(), "b == 0 must error at decode time");
+    let err = BurrFilterReader::new(&bytes).expect_err("b == 0 must error");
+    assert!(
+        matches!(err, crate::Error::InvalidHeader("BurrFilter params")),
+        "expected InvalidHeader(\"BurrFilter params\"), got: {err:?}",
+    );
 }
 
 #[test]
@@ -352,8 +367,11 @@ fn burr_wire_rejects_zero_num_layers() {
     // num_layers byte: MAGIC_LEN + filter_type + version + r + w + b
     let num_layers_offset = crate::file::MAGIC_BYTES.len() + 5;
     bytes[num_layers_offset] = 0;
-    let result = BurrFilterReader::new(&bytes);
-    assert!(result.is_err(), "num_layers == 0 must error at decode time");
+    let err = BurrFilterReader::new(&bytes).expect_err("num_layers == 0 must error");
+    assert!(
+        matches!(err, crate::Error::InvalidHeader("BurrFilter params")),
+        "expected InvalidHeader(\"BurrFilter params\"), got: {err:?}",
+    );
 }
 
 #[test]
@@ -369,13 +387,19 @@ fn burr_wire_rejects_out_of_range_r() {
     // r byte: MAGIC_LEN + filter_type + version
     let r_offset = crate::file::MAGIC_BYTES.len() + 2;
     bytes[r_offset] = 0; // r==0 invalid
-    let result = BurrFilterReader::new(&bytes);
-    assert!(result.is_err(), "r == 0 must error at decode time");
+    let err = BurrFilterReader::new(&bytes).expect_err("r == 0 must error");
+    assert!(
+        matches!(err, crate::Error::InvalidHeader("BurrFilter params")),
+        "expected InvalidHeader(\"BurrFilter params\"), got: {err:?}",
+    );
 
     let mut bytes2 = filter.to_wire_bytes();
     bytes2[r_offset] = 65; // r>64 invalid
-    let result2 = BurrFilterReader::new(&bytes2);
-    assert!(result2.is_err(), "r == 65 must error at decode time");
+    let err2 = BurrFilterReader::new(&bytes2).expect_err("r == 65 must error");
+    assert!(
+        matches!(err2, crate::Error::InvalidHeader("BurrFilter params")),
+        "expected InvalidHeader(\"BurrFilter params\"), got: {err2:?}",
+    );
 }
 
 #[test]
@@ -394,10 +418,10 @@ fn burr_wire_rejects_corrupted_num_blocks() {
     let layer_header_start = crate::file::MAGIC_BYTES.len() + 6 + 8;
     let num_blocks_offset = layer_header_start + 4;
     bytes[num_blocks_offset] = bytes[num_blocks_offset].wrapping_add(1);
-    let result = BurrFilterReader::new(&bytes);
+    let err = BurrFilterReader::new(&bytes).expect_err("mismatched num_blocks must error");
     assert!(
-        result.is_err(),
-        "mismatched num_blocks must error at decode time",
+        matches!(err, crate::Error::InvalidHeader("BurrFilter layer payload")),
+        "expected InvalidHeader(\"BurrFilter layer payload\"), got: {err:?}",
     );
 }
 
@@ -415,10 +439,10 @@ fn burr_wire_rejects_corrupted_z_byte_len() {
     let layer_header_start = crate::file::MAGIC_BYTES.len() + 6 + 8;
     let z_byte_len_offset = layer_header_start + 8;
     bytes[z_byte_len_offset] = bytes[z_byte_len_offset].wrapping_add(8);
-    let result = BurrFilterReader::new(&bytes);
+    let err = BurrFilterReader::new(&bytes).expect_err("mismatched z_byte_len must error");
     assert!(
-        result.is_err(),
-        "mismatched z_byte_len must error at decode time",
+        matches!(err, crate::Error::InvalidHeader("BurrFilter layer payload")),
+        "expected InvalidHeader(\"BurrFilter layer payload\"), got: {err:?}",
     );
 }
 

@@ -130,7 +130,24 @@ where
 
             if grow_step < self.params.grow_limit {
                 let w = self.params.w;
-                current_m = (current_m * (w + 1)).div_ceil(w);
+                // Unchecked multiplication can wrap in release builds for
+                // caller-supplied `m` near usize::MAX, leaving `current_m`
+                // smaller than `w` and breaking later invariants. Fail
+                // construction explicitly when the grown size would
+                // overflow.
+                let Some(grown) = current_m.checked_mul(w + 1).map(|raw| raw.div_ceil(w)) else {
+                    return Err(BuildError::ConstructionFailed {
+                        final_m: current_m,
+                        attempts,
+                        last_failure: last_failure.unwrap_or(
+                            ConstructionFailure::InconsistentEquation {
+                                key_index: 0,
+                                row_index: 0,
+                            },
+                        ),
+                    });
+                };
+                current_m = grown;
                 debug_assert!(current_m >= self.params.w);
             }
         }

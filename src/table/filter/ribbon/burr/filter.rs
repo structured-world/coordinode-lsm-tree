@@ -273,6 +273,7 @@ impl<S> core::fmt::Debug for BurrFilter<S> {
 /// `contains_hash` lookups. Wire format documented in
 /// [`super::wire`] — intentionally distinct from the vendored
 /// `ribbon-serde` repr (that one is for in-memory snapshots).
+#[derive(Debug)]
 pub struct BurrFilterReader<'a> {
     decoded: super::wire::DecodedFilter<'a>,
 }

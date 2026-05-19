@@ -63,8 +63,22 @@ where
     }
 
     pub fn contains_in<Q: Hash + ?Sized>(&self, key: &Q, scratch: &mut Scratch) -> bool {
-        debug_assert_eq!(scratch.fingerprint.len(), self.stride_words);
-        debug_assert_eq!(scratch.acc.len(), self.stride_words);
+        // Hard runtime check, not debug_assert: a mismatched Scratch in
+        // release would silently truncate via `xor_words` (shorter slice
+        // wins the zip) and could produce false negatives. The caller
+        // contract is "Scratch came from RibbonFilter::new_scratch on
+        // this same filter" — violating it is a programmer error worth
+        // panicking on in production.
+        assert_eq!(
+            scratch.fingerprint.len(),
+            self.stride_words,
+            "scratch fingerprint width mismatch; use RibbonFilter::new_scratch() from this filter",
+        );
+        assert_eq!(
+            scratch.acc.len(),
+            self.stride_words,
+            "scratch accumulator width mismatch; use RibbonFilter::new_scratch() from this filter",
+        );
         scratch.reset();
 
         let equation = standard_equation_w64(

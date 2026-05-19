@@ -107,13 +107,34 @@ where
         // upstream so this is unreachable in practice; the asserts
         // make that explicit and turn any future regression into a
         // loud panic at write time rather than corruption at read.
+        #[expect(
+            clippy::expect_used,
+            reason = "programmer invariant: filter partitions are capped at \
+                      ~4 KB upstream; an overflow here means a regression \
+                      slipped past the partition-size policy"
+        )]
         let z_byte_len: usize = m
             .checked_mul(stride_words)
             .and_then(|v| v.checked_mul(8))
             .expect("BuRR layer z payload size overflows usize");
+        #[expect(
+            clippy::expect_used,
+            reason = "programmer invariant: m bounded by partition size; \
+                      fits u32 by construction"
+        )]
         let m_u32 = u32::try_from(m).expect("BuRR layer m exceeds u32::MAX");
+        #[expect(
+            clippy::expect_used,
+            reason = "programmer invariant: num_blocks = m.div_ceil(b) ≤ m, \
+                      fits u32 by construction"
+        )]
         let num_blocks_u32 =
             u32::try_from(num_blocks).expect("BuRR layer num_blocks exceeds u32::MAX");
+        #[expect(
+            clippy::expect_used,
+            reason = "programmer invariant: z_byte_len = m * stride * 8 ≤ \
+                      partition size in bytes; fits u32 by construction"
+        )]
         let z_byte_len_u32 =
             u32::try_from(z_byte_len).expect("BuRR layer z_byte_len exceeds u32::MAX");
         #[expect(clippy::expect_used, reason = "writing to a Vec<u8> cannot fail")]
@@ -145,6 +166,7 @@ where
 /// every point read and dominate the probe path. The trade-off is one
 /// 8-byte LE decode per matched row inside the probe loop; for `r <=
 /// 64` (stride = 1) that's a single `u64::from_le_bytes` per set bit.
+#[derive(Debug)]
 pub(crate) struct LayerView<'a> {
     pub(crate) m: usize,
     pub(crate) seed: u64,
@@ -155,6 +177,7 @@ pub(crate) struct LayerView<'a> {
 /// Decoded BuRR filter, holding borrowed slices into a wire-format
 /// buffer. Layer payloads are zero-copy; only the small header and the
 /// per-layer descriptors are eagerly parsed.
+#[derive(Debug)]
 pub(crate) struct DecodedFilter<'a> {
     pub(crate) r: u8,
     pub(crate) w: u8,
@@ -209,9 +232,17 @@ pub(crate) fn decode(bytes: &[u8]) -> crate::Result<DecodedFilter<'_>> {
         if bytes.len() < pos + LAYER_HEADER_LEN {
             return Err(crate::Error::InvalidHeader("BurrFilter layer header"));
         }
-        let m_bytes: [u8; 4] = bytes[pos..pos + 4].try_into().expect("4 bytes");
-        let num_blocks_bytes: [u8; 4] = bytes[pos + 4..pos + 8].try_into().expect("4 bytes");
-        let z_byte_len_bytes: [u8; 4] = bytes[pos + 8..pos + 12].try_into().expect("4 bytes");
+        #[expect(
+            clippy::expect_used,
+            reason = "programmer invariant: layer header slice is exactly \
+                      LAYER_HEADER_LEN (12) bytes from the bounds check \
+                      above; the three 4-byte windows always convert."
+        )]
+        let (m_bytes, num_blocks_bytes, z_byte_len_bytes): ([u8; 4], [u8; 4], [u8; 4]) = (
+            bytes[pos..pos + 4].try_into().expect("4 bytes"),
+            bytes[pos + 4..pos + 8].try_into().expect("4 bytes"),
+            bytes[pos + 8..pos + 12].try_into().expect("4 bytes"),
+        );
         let m = u32::from_le_bytes(m_bytes) as usize;
         let num_blocks = u32::from_le_bytes(num_blocks_bytes) as usize;
         let z_byte_len = u32::from_le_bytes(z_byte_len_bytes) as usize;
@@ -232,13 +263,24 @@ pub(crate) fn decode(bytes: &[u8]) -> crate::Result<DecodedFilter<'_>> {
             return Err(crate::Error::InvalidHeader("BurrFilter layer payload"));
         }
 
-        if bytes.len() < pos + num_blocks + z_byte_len {
+        // Checked endpoint arithmetic — on 32-bit targets a corrupted
+        // num_blocks/z_byte_len could overflow `pos + num_blocks + z_byte_len`
+        // and let the original `bytes.len() < pos + …` guard succeed by
+        // wraparound, then panic on the slice indexing below. Compute the
+        // endpoints with `checked_add` and bail to InvalidHeader on any
+        // overflow.
+        let thresholds_end = pos
+            .checked_add(num_blocks)
+            .ok_or(crate::Error::InvalidHeader("BurrFilter layer payload"))?;
+        let z_end = thresholds_end
+            .checked_add(z_byte_len)
+            .ok_or(crate::Error::InvalidHeader("BurrFilter layer payload"))?;
+        if bytes.len() < z_end {
             return Err(crate::Error::InvalidHeader("BurrFilter layer payload"));
         }
-        let thresholds = &bytes[pos..pos + num_blocks];
-        pos += num_blocks;
-        let z_bytes = &bytes[pos..pos + z_byte_len];
-        pos += z_byte_len;
+        let thresholds = &bytes[pos..thresholds_end];
+        let z_bytes = &bytes[thresholds_end..z_end];
+        pos = z_end;
 
         // Per-layer seed re-derived from root_seed + layer_idx to match
         // what the builder used. The wire format does NOT store layer
@@ -351,13 +393,21 @@ pub(crate) fn contains_hash_from_bytes(bytes: &[u8], hash: u64) -> crate::Result
         if num_blocks != expected_blocks || z_byte_len != expected_z_len {
             return Err(crate::Error::InvalidHeader("BurrFilter layer payload"));
         }
-        if bytes.len() < pos + num_blocks + z_byte_len {
+        // Checked endpoints — see the same pattern in `decode`. Avoids
+        // wraparound on 32-bit when `pos + num_blocks + z_byte_len`
+        // overflows usize.
+        let thresholds_end = pos
+            .checked_add(num_blocks)
+            .ok_or(crate::Error::InvalidHeader("BurrFilter layer payload"))?;
+        let z_end = thresholds_end
+            .checked_add(z_byte_len)
+            .ok_or(crate::Error::InvalidHeader("BurrFilter layer payload"))?;
+        if bytes.len() < z_end {
             return Err(crate::Error::InvalidHeader("BurrFilter layer payload"));
         }
-        let thresholds = &bytes[pos..pos + num_blocks];
-        pos += num_blocks;
-        let z = &bytes[pos..pos + z_byte_len];
-        pos += z_byte_len;
+        let thresholds = &bytes[pos..thresholds_end];
+        let z = &bytes[thresholds_end..z_end];
+        pos = z_end;
 
         let seed = derive_layer_seed(root_seed, layer_idx);
         let layer_params = match Params::new(m, usize::from(w), usize::from(r), Mode::Standard) {

@@ -1,11 +1,14 @@
-// Vendored from https://github.com/WilliamRagstad/ribbon-filter v0.2.0
-// Original work copyright (c) William Rågstad, dual-licensed MIT OR
-// Apache-2.0. Preserved license texts in `_vendored/`. This in-tree copy is
-// continued under this crate's existing Apache-2.0 OR MIT terms (same dual
-// license, so no incompatibility). Modifications made to the upstream source
-// — module layout, integration with the table::filter framework, removal of
-// the standalone `lib.rs` crate-level attributes, and any future BuRR
-// extensions — are this crate's own contribution and licensed as above.
+// Vendored from https://github.com/WilliamRagstad/ribbon-filter v0.2.0.
+// Original work copyright (c) William Rågstad, available upstream under
+// MIT OR Apache-2.0. Preserved upstream license texts in `_vendored/`.
+//
+// This in-tree copy and any modifications (module layout, integration with
+// the table::filter framework, removal of the standalone `lib.rs`
+// crate-level attributes, and BuRR extensions) are distributed under the
+// host crate's declared license: Apache-2.0. The dual-licensed upstream
+// permits this — Apache-2.0 alone is one of the two licenses upstream
+// offers. If the ribbon module is later extracted back into a standalone
+// crate the dual MIT/Apache-2.0 posture can be restored at that time.
 //
 // This module is the **algorithmic foundation** for the LSM filter
 // subsystem. Plan:
@@ -26,24 +29,24 @@
 
 // Vendored upstream code follows its own lint conventions; the in-tree
 // copy keeps them so a future extraction back into a standalone crate
-// produces a clean diff against the upstream. The BuRR submodule
-// (`super::ribbon::burr`) does NOT inherit these allows — it's first-
-// class crate code and follows the host crate's lint policy
-// (`#[expect(..., reason)]` over `#[allow]`, etc.).
+// produces a clean diff against the upstream. We deliberately use a
+// single crate-attribute `#![allow]` here rather than scattering
+// `#[expect]` per item: minimising the diff vs upstream is the priority,
+// and a future upstream refactor that removes one of the offending casts
+// would otherwise yield an `unfulfilled_lint_expectations` error on the
+// next sync.
 //
-// We deliberately use a single crate-attribute `#![allow]` here rather
-// than scattering `#[expect]` per item: vendored code minimisation of
-// diff vs upstream is the priority, and a future upstream refactor
-// that removes one of the offending casts would otherwise yield an
-// `unfulfilled_lint_expectations` error on the next sync.
-//
-// Note: this crate-attribute allow propagates into child modules,
-// including the first-party `burr/` submodule. Re-denying the safety-
-// critical lints (`expect_used`, `unwrap_used`, `indexing_slicing`)
-// inside burr/ would require migrating ~30 existing internal sites in
-// BuRR code to safe alternatives. That migration is tracked as a
-// follow-up; new BuRR code uses `#[expect(..., reason)]` per use
-// site for new suppressions.
+// Lint-scope propagation: a crate-attribute `#![allow]` propagates into
+// child modules, INCLUDING the first-party `burr/` submodule. That means
+// the safety-critical lints (`expect_used`, `unwrap_used`,
+// `indexing_slicing`) are currently relaxed inside `burr/` even though
+// it's first-party code that would normally follow the host crate's
+// stricter lint policy. Re-denying these inside `burr/` would require
+// migrating ~30 existing internal sites in BuRR code to safe
+// alternatives — that migration is tracked as a follow-up issue. In the
+// meantime, new BuRR code uses `#[expect(..., reason)]` per use site
+// for any new suppressions; the inherited blanket allow is for legacy
+// sites only.
 #![allow(
     clippy::indexing_slicing,
     clippy::cast_possible_truncation,
