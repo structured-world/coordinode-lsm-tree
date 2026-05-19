@@ -86,17 +86,37 @@ fn burr_filter_contains(c: &mut Criterion) {
         let filter = builder.build_from_hashes(&padded).expect("build");
         let filter_bytes = filter.to_wire_bytes();
 
+        // Long-lived reader matches the table read path (FilterBlock
+        // pins the parsed view); construct ONCE outside b.iter to
+        // measure steady-state probe latency, not parse+probe.
+        let reader = BurrFilterReader::new(&filter_bytes).unwrap();
         c.bench_function(
-            &format!("burr filter contains, true positive (FPR={}%)", fpr * 100.0),
+            &format!(
+                "burr filter contains (probe-only), true positive (FPR={}%)",
+                fpr * 100.0
+            ),
             |b| {
                 b.iter(|| {
                     use rand::seq::IndexedRandom;
+                    let sample = keys.choose(&mut rng).unwrap();
+                    let hash = hash64(sample);
+                    assert!(reader.contains_hash(hash));
+                });
+            },
+        );
 
-                    // Realistic cost: parse the wire bytes per probe (the
-                    // table reader keeps a long-lived reader, but parsing
-                    // is cheap — it's a header pass over a slice).
+        // Separate decode+probe bench so the cost of parsing the wire
+        // header is also visible — e.g. for callers that don't pin a
+        // long-lived reader.
+        c.bench_function(
+            &format!(
+                "burr filter contains (decode+probe), true positive (FPR={}%)",
+                fpr * 100.0
+            ),
+            |b| {
+                b.iter(|| {
+                    use rand::seq::IndexedRandom;
                     let reader = BurrFilterReader::new(&filter_bytes).unwrap();
-
                     let sample = keys.choose(&mut rng).unwrap();
                     let hash = hash64(sample);
                     assert!(reader.contains_hash(hash));

@@ -67,7 +67,11 @@ impl BurrParams {
                 "computed r out of supported range [1, 64]",
             ));
         }
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "r_f is validated to 1.0..=64.0 above"
+        )]
         let r = r_f as u8;
         Ok(Self {
             n,
@@ -90,7 +94,11 @@ impl BurrParams {
         if !(1.0..=64.0).contains(&bpk) {
             return Err(BurrBuildError::InvalidParams("bpk must be in [1.0, 64.0]"));
         }
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "bpk is validated to 1.0..=64.0 above, then clamped to the same range"
+        )]
         let r = bpk.round().clamp(1.0, 64.0) as u8;
         Ok(Self {
             n,
@@ -118,11 +126,17 @@ impl BurrParams {
     /// builder, not by this helper).
     #[must_use]
     pub fn layer_m(&self, layer_input_keys: usize) -> usize {
+        // BurrBuilder::new rejects params with b == 0; this assert pins
+        // the invariant so any future code path that constructs a
+        // BurrParams directly without going through the builder will
+        // panic loudly rather than divide by zero in the div_ceil below.
+        assert!(self.b > 0, "BurrParams.b must be > 0");
         let overhead = f64::from(self.per_layer_overhead);
-        #[allow(
+        #[expect(
             clippy::cast_possible_truncation,
             clippy::cast_sign_loss,
-            clippy::cast_precision_loss
+            clippy::cast_precision_loss,
+            reason = "layer_input_keys is bounded by the filter capacity; ceil result fits usize on supported platforms"
         )]
         let raw = ((layer_input_keys as f64) * (1.0 + overhead)).ceil() as usize;
         let raw = raw.max(usize::from(self.b)); // ≥ one block

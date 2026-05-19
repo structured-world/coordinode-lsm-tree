@@ -125,6 +125,14 @@ where
     /// always uses the hash-based build + probe pair so the two stay
     /// consistent.
     pub fn contains_hash(&self, hash: u64) -> bool {
+        // BurrParams::with_fp_rate / with_bpk both clamp r to 1..=64, so
+        // stride is always 1. We use stack-sized buffers to keep this
+        // hot path allocation-free. The debug_assert pins the invariant
+        // — if the format ever grows to r > 64 the probe path must be
+        // updated at the same time.
+        debug_assert!(self.params.r <= 64, "BuRR params pin r <= 64");
+        let stride: usize = 1;
+        let mut fingerprint = [0_u64; 1];
         for layer in &self.layers {
             let layer_params = match Params::new(
                 layer.m,
@@ -133,12 +141,12 @@ where
                 Mode::Standard,
             ) {
                 Ok(p) => p.with_seed(layer.seed),
-                Err(_) => continue,
+                // In-memory filter: layer params were valid at build
+                // time, so this is unreachable. Fail closed defensively.
+                Err(_) => return true,
             };
 
-            let stride = usize::from(self.params.r).div_ceil(64);
-            let mut fingerprint = vec![0_u64; stride];
-            let mut acc = vec![0_u64; stride];
+            fingerprint[0] = 0;
             let equation =
                 standard_equation_from_hash(hash, layer.seed, &layer_params, &mut fingerprint);
 
@@ -152,6 +160,7 @@ where
             // compute). Z is borrowed via the public accessor on the
             // vendored ribbon.
             let z_words = layer.ribbon.z_raw_words();
+            let mut acc = [0_u64; 1];
             let mut bumped_out_of_layer = false;
             super::super::hashing::for_each_set_bit_u128_parts(
                 equation.coeff_lo,
@@ -192,6 +201,11 @@ where
     /// (correctness first); a follow-up can expose a `contains_with_eq`
     /// path on `RibbonFilter` that reuses our pre-computed equation.
     pub fn contains_in<Q: Hash + ?Sized>(&self, key: &Q, scratch: &mut Scratch) -> bool {
+        // Stack-sized throwaway fingerprint buffer reused across layers.
+        // `BurrParams::with_*` clamp `r` to 1..=64 so `stride` is 1; the
+        // assert pins the invariant.
+        debug_assert!(self.params.r <= 64, "BuRR params pin r <= 64");
+        let mut fp_throwaway = [0_u64; 1];
         for layer in &self.layers {
             // Build a Params reflecting this layer's m/w/r/seed so the
             // equation-computation matches what the builder did.
@@ -202,17 +216,20 @@ where
                 Mode::Standard,
             ) {
                 Ok(p) => p.with_seed(layer.seed),
-                Err(_) => continue, // unreachable for built filters
+                // Unreachable for built filters; fail closed defensively
+                // so a future param-validation regression yields a
+                // false positive (caller does an index lookup) rather
+                // than a false negative.
+                Err(_) => return true,
             };
 
             // Re-hash to learn this layer's `start` and decide bump.
-            // Throwaway fingerprint buffer; the real probe uses
-            // `scratch` inside `ribbon.contains_in`. The hasher is the
-            // one BurrFilter holds — all layers' RibbonFilters were
-            // given clones of THIS hasher at build time, so hashes
-            // agree by construction (BuildHasher is deterministic).
-            let stride = usize::from(self.params.r).div_ceil(64);
-            let mut fp_throwaway = vec![0_u64; stride];
+            // Throwaway fingerprint; the real probe uses `scratch`
+            // inside `ribbon.contains_in`. The hasher is the one
+            // BurrFilter holds — all layers' RibbonFilters were given
+            // clones of THIS hasher at build time, so hashes agree by
+            // construction (BuildHasher is deterministic).
+            fp_throwaway[0] = 0;
             let equation = standard_equation_w64(
                 &self.hasher,
                 key,

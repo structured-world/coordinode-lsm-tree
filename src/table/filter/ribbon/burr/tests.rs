@@ -304,6 +304,107 @@ fn burr_contains_in_matches_contains_with_external_scratch() {
 }
 
 #[test]
+fn burr_wire_rejects_zero_b() {
+    use super::filter::BurrFilterReader;
+    let params = BurrParams::with_fp_rate(50, 0.01).expect("params");
+    let builder = BurrBuilder::new(params, DefaultBuildHasher::default()).expect("builder");
+    let hashes: Vec<u64> = (0..50_u64)
+        .map(|i| crate::hash::hash64(&[i as u8]))
+        .collect();
+    let filter = builder.build_from_hashes(&hashes).expect("build");
+    let mut bytes = filter.to_wire_bytes();
+    // b byte sits at offset MAGIC_LEN + 2 + 2 (magic + filter_type +
+    // version + r + w, then b).
+    let b_offset = crate::file::MAGIC_BYTES.len() + 4;
+    bytes[b_offset] = 0;
+    let result = BurrFilterReader::new(&bytes);
+    assert!(result.is_err(), "b == 0 must error at decode time");
+}
+
+#[test]
+fn burr_wire_rejects_zero_num_layers() {
+    use super::filter::BurrFilterReader;
+    let params = BurrParams::with_fp_rate(50, 0.01).expect("params");
+    let builder = BurrBuilder::new(params, DefaultBuildHasher::default()).expect("builder");
+    let hashes: Vec<u64> = (0..50_u64)
+        .map(|i| crate::hash::hash64(&[i as u8]))
+        .collect();
+    let filter = builder.build_from_hashes(&hashes).expect("build");
+    let mut bytes = filter.to_wire_bytes();
+    // num_layers byte: MAGIC_LEN + filter_type + version + r + w + b
+    let num_layers_offset = crate::file::MAGIC_BYTES.len() + 5;
+    bytes[num_layers_offset] = 0;
+    let result = BurrFilterReader::new(&bytes);
+    assert!(result.is_err(), "num_layers == 0 must error at decode time");
+}
+
+#[test]
+fn burr_wire_rejects_out_of_range_r() {
+    use super::filter::BurrFilterReader;
+    let params = BurrParams::with_fp_rate(50, 0.01).expect("params");
+    let builder = BurrBuilder::new(params, DefaultBuildHasher::default()).expect("builder");
+    let hashes: Vec<u64> = (0..50_u64)
+        .map(|i| crate::hash::hash64(&[i as u8]))
+        .collect();
+    let filter = builder.build_from_hashes(&hashes).expect("build");
+    let mut bytes = filter.to_wire_bytes();
+    // r byte: MAGIC_LEN + filter_type + version
+    let r_offset = crate::file::MAGIC_BYTES.len() + 2;
+    bytes[r_offset] = 0; // r==0 invalid
+    let result = BurrFilterReader::new(&bytes);
+    assert!(result.is_err(), "r == 0 must error at decode time");
+
+    let mut bytes2 = filter.to_wire_bytes();
+    bytes2[r_offset] = 65; // r>64 invalid
+    let result2 = BurrFilterReader::new(&bytes2);
+    assert!(result2.is_err(), "r == 65 must error at decode time");
+}
+
+#[test]
+fn burr_wire_rejects_corrupted_num_blocks() {
+    use super::filter::BurrFilterReader;
+    let params = BurrParams::with_fp_rate(50, 0.01).expect("params");
+    let builder = BurrBuilder::new(params, DefaultBuildHasher::default()).expect("builder");
+    let hashes: Vec<u64> = (0..50_u64)
+        .map(|i| crate::hash::hash64(&[i as u8]))
+        .collect();
+    let filter = builder.build_from_hashes(&hashes).expect("build");
+    let mut bytes = filter.to_wire_bytes();
+    // First layer header begins at HEADER_LEN. num_blocks is the
+    // second u32 (offset +4 from layer header start). Tamper to a
+    // value that disagrees with `m`.
+    let layer_header_start = crate::file::MAGIC_BYTES.len() + 6 + 8;
+    let num_blocks_offset = layer_header_start + 4;
+    bytes[num_blocks_offset] = bytes[num_blocks_offset].wrapping_add(1);
+    let result = BurrFilterReader::new(&bytes);
+    assert!(
+        result.is_err(),
+        "mismatched num_blocks must error at decode time",
+    );
+}
+
+#[test]
+fn burr_wire_rejects_corrupted_z_byte_len() {
+    use super::filter::BurrFilterReader;
+    let params = BurrParams::with_fp_rate(50, 0.01).expect("params");
+    let builder = BurrBuilder::new(params, DefaultBuildHasher::default()).expect("builder");
+    let hashes: Vec<u64> = (0..50_u64)
+        .map(|i| crate::hash::hash64(&[i as u8]))
+        .collect();
+    let filter = builder.build_from_hashes(&hashes).expect("build");
+    let mut bytes = filter.to_wire_bytes();
+    // z_byte_len is the third u32 of the layer header.
+    let layer_header_start = crate::file::MAGIC_BYTES.len() + 6 + 8;
+    let z_byte_len_offset = layer_header_start + 8;
+    bytes[z_byte_len_offset] = bytes[z_byte_len_offset].wrapping_add(8);
+    let result = BurrFilterReader::new(&bytes);
+    assert!(
+        result.is_err(),
+        "mismatched z_byte_len must error at decode time",
+    );
+}
+
+#[test]
 fn burr_settles_in_few_layers() {
     let n = 5_000_usize;
     let params = BurrParams::with_fp_rate(n, 0.01).expect("valid params");

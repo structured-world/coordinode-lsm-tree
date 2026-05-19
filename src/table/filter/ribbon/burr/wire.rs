@@ -103,17 +103,27 @@ where
     for layer in layers {
         let m = layer.m;
         let num_blocks = layer.thresholds.len();
-        let z_byte_len = m * stride_words * 8;
+        // Checked multiplication: a layer larger than u32::MAX bytes
+        // would silently wrap with `as u32` and produce a self-
+        // corrupting wire format. Filter partitions are capped at ~4KB
+        // upstream so this is unreachable in practice; the asserts
+        // make that explicit and turn any future regression into a
+        // loud panic at write time rather than corruption at read.
+        let z_byte_len: usize = m
+            .checked_mul(stride_words)
+            .and_then(|v| v.checked_mul(8))
+            .expect("BuRR layer z payload size overflows usize");
+        let m_u32 = u32::try_from(m).expect("BuRR layer m exceeds u32::MAX");
+        let num_blocks_u32 =
+            u32::try_from(num_blocks).expect("BuRR layer num_blocks exceeds u32::MAX");
+        let z_byte_len_u32 =
+            u32::try_from(z_byte_len).expect("BuRR layer z_byte_len exceeds u32::MAX");
         #[allow(clippy::expect_used, reason = "writing to a Vec<u8> cannot fail")]
-        #[allow(
-            clippy::cast_possible_truncation,
-            reason = "m, num_blocks, z_byte_len bounded by max filter size — fit u32"
-        )]
         {
-            buf.write_u32::<LittleEndian>(m as u32).expect("vec write");
-            buf.write_u32::<LittleEndian>(num_blocks as u32)
+            buf.write_u32::<LittleEndian>(m_u32).expect("vec write");
+            buf.write_u32::<LittleEndian>(num_blocks_u32)
                 .expect("vec write");
-            buf.write_u32::<LittleEndian>(z_byte_len as u32)
+            buf.write_u32::<LittleEndian>(z_byte_len_u32)
                 .expect("vec write");
         }
         buf.extend_from_slice(&layer.thresholds);
@@ -197,6 +207,14 @@ pub(crate) fn decode(bytes: &[u8]) -> crate::Result<DecodedFilter<'_>> {
     let num_layers = cursor.read_u8()?;
     let root_seed = cursor.read_u64::<LittleEndian>()?;
 
+    // Header-field invariants. Without these checks a corrupted block
+    // can flow into Params::new (which would fail and silently skip the
+    // layer in contains_hash → false negative on read), or trigger
+    // divide-by-zero in is_bumped when b == 0. Fail closed at decode.
+    if !(1..=64).contains(&r) || w != 64 || b == 0 || num_layers == 0 {
+        return Err(crate::Error::InvalidHeader("BurrFilter params"));
+    }
+
     let stride_words = usize::from(r).div_ceil(64);
     let mut layers = Vec::with_capacity(usize::from(num_layers));
     let mut pos = HEADER_LEN;
@@ -213,6 +231,21 @@ pub(crate) fn decode(bytes: &[u8]) -> crate::Result<DecodedFilter<'_>> {
         let z_byte_len = u32::from_le_bytes(z_byte_len_bytes) as usize;
         pos += LAYER_HEADER_LEN;
 
+        // Cross-check num_blocks and z_byte_len against r/b/m before
+        // trusting the layer payload. Mismatches mean read_row would
+        // index out of bounds; we'd rather error now than panic later.
+        if m == 0 {
+            return Err(crate::Error::InvalidHeader("BurrFilter layer m"));
+        }
+        let expected_blocks = m.div_ceil(usize::from(b));
+        let expected_z_len = m
+            .checked_mul(stride_words)
+            .and_then(|n| n.checked_mul(8))
+            .ok_or(crate::Error::InvalidHeader("BurrFilter layer payload"))?;
+        if num_blocks != expected_blocks || z_byte_len != expected_z_len {
+            return Err(crate::Error::InvalidHeader("BurrFilter layer payload"));
+        }
+
         if bytes.len() < pos + num_blocks + z_byte_len {
             return Err(crate::Error::InvalidHeader("BurrFilter layer payload"));
         }
@@ -226,12 +259,6 @@ pub(crate) fn decode(bytes: &[u8]) -> crate::Result<DecodedFilter<'_>> {
         // seeds because they're a pure function of (root_seed,
         // layer_idx) — keeping it that way prevents drift.
         let seed = derive_layer_seed(root_seed, layer_idx);
-
-        debug_assert_eq!(
-            z_byte_len,
-            m * stride_words * 8,
-            "z payload length must equal m * stride_words * 8"
-        );
 
         layers.push(LayerView {
             m,
@@ -259,10 +286,16 @@ pub(crate) fn decode(bytes: &[u8]) -> crate::Result<DecodedFilter<'_>> {
 /// elsewhere; the filter consumes that same hash directly instead of
 /// re-hashing via a `BuildHasher`.
 pub(crate) fn contains_hash(decoded: &DecodedFilter<'_>, hash: u64) -> bool {
-    let stride_words = decoded.stride_words;
-    let mut fingerprint = vec![0_u64; stride_words];
-    let mut acc = vec![0_u64; stride_words];
-    let mut row_buf = vec![0_u64; stride_words];
+    // r is validated to 1..=64 in decode, so stride_words is always 1
+    // for the currently-deployed wire format. We use fixed-size stack
+    // arrays to keep this hot-path allocation-free. If the format ever
+    // grows to r > 64 the assertion below catches the mismatch — the
+    // probe path must be updated at the same time.
+    debug_assert_eq!(decoded.stride_words, 1, "BuRR wire format pins r <= 64");
+    let stride_words: usize = 1;
+    let mut fingerprint = [0_u64; 1];
+    let mut acc;
+    let mut row_buf = [0_u64; 1];
 
     for layer in &decoded.layers {
         let layer_params = match Params::new(
@@ -272,10 +305,14 @@ pub(crate) fn contains_hash(decoded: &DecodedFilter<'_>, hash: u64) -> bool {
             Mode::Standard,
         ) {
             Ok(p) => p.with_seed(layer.seed),
-            Err(_) => continue,
+            // Should be unreachable because decode validates r/w/b/m.
+            // Fail closed — return true to make the table read path
+            // fall through to a real index lookup rather than report a
+            // false negative.
+            Err(_) => return true,
         };
 
-        fingerprint.fill(0);
+        fingerprint[0] = 0;
         let equation: StandardEquation =
             standard_equation_from_hash(hash, layer.seed, &layer_params, &mut fingerprint);
 
@@ -285,7 +322,7 @@ pub(crate) fn contains_hash(decoded: &DecodedFilter<'_>, hash: u64) -> bool {
 
         // Kept at this layer — run the GF(2) XOR-reduce against the
         // stored solution and compare against the fingerprint.
-        acc.fill(0);
+        acc = [0_u64; 1];
         for_each_set_bit_u128_parts(equation.coeff_lo, equation.coeff_hi, |offset| {
             let row_index = equation.start + offset;
             if row_index < layer.m {

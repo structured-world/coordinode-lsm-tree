@@ -91,8 +91,6 @@ impl<W: std::io::Write + std::io::Seek> FilterWriter<W> for FullFilterWriter {
         if self.bloom_hash_buffer.is_empty() {
             log::trace!("Filter writer has no buffered hashes - not building filter");
         } else {
-            file_writer.start("filter")?;
-
             let n = self.bloom_hash_buffer.len();
 
             log::trace!(
@@ -101,13 +99,19 @@ impl<W: std::io::Write + std::io::Seek> FilterWriter<W> for FullFilterWriter {
             );
 
             let start = std::time::Instant::now();
-
+            // Build BEFORE opening the archive section. An invalid
+            // policy can produce empty bytes; opening start("filter")
+            // and then bailing out would leave an empty unfinished
+            // section in the output and desynchronise the reported
+            // block count from what was actually written.
             let filter_bytes = build_burr_filter_bytes(self.bloom_policy, &self.bloom_hash_buffer)?;
 
             if filter_bytes.is_empty() {
                 log::trace!("BuRR policy produced empty filter — skipping block write");
                 return Ok(0);
             }
+
+            file_writer.start("filter")?;
 
             log::trace!(
                 "Built BuRR filter ({}B) in {:?}",

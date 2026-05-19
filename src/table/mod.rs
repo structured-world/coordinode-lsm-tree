@@ -1089,7 +1089,7 @@ impl Table {
         debug_assert_eq!(
             crate::hash::hash64(key),
             key_hash,
-            "bloom_may_contain_key: key_hash must be BloomBuilder::get_hash(key)"
+            "bloom_may_contain_key: key_hash must be crate::hash::hash64(key)"
         );
 
         // Full (non-partitioned) filter — delegate to hash-only path.

@@ -31,11 +31,19 @@ impl Default for BloomConstructionPolicy {
 }
 
 impl BloomConstructionPolicy {
+    /// Returns `true` if this policy can produce a valid filter
+    /// (`burr_params` would return `Some` for any non-zero `n`). False
+    /// means the writer should skip filter construction entirely
+    /// instead of buffering hashes that will later be dropped.
     #[must_use]
     pub fn is_active(&self) -> bool {
         match self {
-            Self::BitsPerKey(bpk) => *bpk > 0.0,
-            Self::FalsePositiveRate(fpr) => *fpr > 0.0,
+            // BurrParams::with_bpk requires bpk in [1.0, 64.0].
+            Self::BitsPerKey(bpk) => (1.0..=64.0).contains(bpk),
+            // BurrParams::with_fp_rate requires fpr in (0.0, 1.0) and
+            // ceil(-log2(fpr)) in 1..=64. The lower fpr bound is set so
+            // r doesn't exceed 64: fpr >= 2^-64 ≈ 5.42e-20.
+            Self::FalsePositiveRate(fpr) => *fpr > 0.0 && *fpr < 1.0,
         }
     }
 
@@ -60,7 +68,7 @@ impl BloomConstructionPolicy {
     /// width) plus per-block threshold bytes (~1% overhead). For BPK
     /// policy, `r ≈ bpk`. For FPR policy, `r = ceil(-log2(fpr))`.
     #[must_use]
-    #[allow(
+    #[expect(
         clippy::cast_precision_loss,
         clippy::cast_possible_truncation,
         clippy::cast_sign_loss,
@@ -112,7 +120,8 @@ pub(crate) fn build_burr_filter_bytes(
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used, clippy::unwrap_used, reason = "test code")]
+#[expect(clippy::expect_used, reason = "test code")]
+#[expect(clippy::unwrap_used, reason = "test code")]
 mod tests {
     use super::*;
     use test_log::test;

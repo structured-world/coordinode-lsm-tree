@@ -18,11 +18,11 @@
 //! `start % b`), so a threshold of `b` means "accept everything" and `0`
 //! means "bump everything".
 //!
-//! Functions in this module become live once the per-block threshold
-//! integration lands in `builder.rs` (task #14) and `filter.rs` probe
-//! path (task #15). They're already test-covered here so the algorithm
-//! is verified before being plugged in.
-#![allow(dead_code)]
+//! Every public item in this module is consumed by the BuRR builder
+//! (`builder.rs`) and the probe path (`filter.rs`); the previous
+//! crate-level `#![allow(dead_code)]` blanket suppression has been
+//! removed so any future genuinely-dead code in here surfaces a
+//! warning.
 
 use super::super::hashing::StandardEquation;
 

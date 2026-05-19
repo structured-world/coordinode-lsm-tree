@@ -25,13 +25,14 @@ zstd-pure = ["zstd"]
 encryption = ["dep:aes-gcm", "dep:rand_chacha"]
 bytes_1 = ["dep:bytes"]
 metrics = []
-# Declared (but not currently enabled) so the vendored Ribbon filter's
-# upstream-style `#[cfg(feature = "serde")]` guards compile without a
-# `unexpected_cfgs` warning. We do not consume the serde repr from inside
-# this crate (our on-disk filter format is byteorder-encoded), but the gate
-# is preserved verbatim so a future extraction into a standalone crate keeps
-# upstream's API surface intact.
-ribbon-serde = []
+# Vendored Ribbon filter retains its `#[cfg(feature = "ribbon-serde")]`
+# guards (renamed from upstream's bare `serde` feature to avoid clashing
+# with any future top-level serde feature in this crate). We do not
+# consume the serde repr from inside this crate — the BuRR on-disk
+# format is byteorder-encoded — but the feature wires `serde` as an
+# optional dep so `--all-features` builds and a future extraction back
+# into a standalone crate compile cleanly.
+ribbon-serde = ["dep:serde", "bitvec/serde"]
 
 [dependencies]
 bytes = { version = "1", optional = true }
@@ -50,6 +51,9 @@ structured-zstd = { version = "0.0.21", optional = true, default-features = fals
 quick_cache = { version = "0.6.16", default-features = false, features = [] }
 rustc-hash = "2.1.1"
 self_cell = "1.2.0"
+# Optional — only pulled in by the vendored Ribbon filter under the
+# `ribbon-serde` feature flag (off by default).
+serde = { version = "1", optional = true, features = ["derive"] }
 sfa = "~1.0.0"
 tempfile = "3.20.0"
 varint-rs = "2.2.0"
