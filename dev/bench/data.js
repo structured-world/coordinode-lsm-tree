@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779178273203,
+  "lastUpdate": 1779216470933,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -6864,6 +6864,84 @@ window.BENCHMARK_DATA = {
             "value": 264726.89902541734,
             "unit": "ops/sec (normalized)",
             "extra": "raw: 407912 ops/sec | factor: 0.649 | P50: 2.3us | P99: 5.0us | P99.9: 14.1us\nthreads: 1 | elapsed: 0.49s | num: 200000 | iterations: 3 | runner: seq_wr=224265 rand_rd=682325 cpu=109 composite=35440.2"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "4239a3dce2552543a240f5e6d1bf5a126561c726",
+          "message": "feat(filter): replace standard bloom with BuRR (#269)\n\n## Summary\n\nReplaces the standard bloom filter in the LSM filter framework with\n**BuRR** (Bumped Ribbon Retrieval), the math-optimal\napproximate-membership filter (Walzer & Dillinger 2022,\narXiv:2109.01892). BuRR storage is ≈ r bits per key + ~1% overhead vs\nthe information-theoretic minimum — substantially tighter than the ~10\nbpk Bloom needs for the same FPR, with comparable probe cost.\n\nCloses #268.\n\n## Disk format\n\nManifest version bumped to **V5**. V3/V4 databases are rejected at\n\\`Tree::open\\` with \\`InvalidVersion\\`; tables written by this version\nare not readable by pre-V5 binaries. No migration shim — fresh tables\nonly.\n\n## Breaking changes (semver major)\n\n- BuRR filter wire format replaces the legacy bloom filter blocks.\nFilter block reader rejects pre-V5 magic.\n- \\`FormatVersion::V5\\` is the only accepted manifest version.\n- \\`zstd-pure\\` feature flag removed (it was a deprecated alias for\n\\`zstd\\`; only one zstd backend remains).\n- \\`Cargo.toml\\` description, keywords, categories rewritten; no longer\nclaims to be a fork derivative.\n\nBoth major-trigger commits in this PR carry the conventional \\`!\\`\nmarker so release-plz will major-bump.\n\n## Implementation\n\n- **Vendored**\n[ribbon-filter](https://github.com/WilliamRagstad/ribbon-filter) v0.2.0\nunder \\`src/table/filter/ribbon/\\` as the GF(2) banded-solver primitive\n(MIT/Apache-2.0 → in-tree copy under Apache-2.0). Plan to extract later\nas a standalone crate alongside BuRR.\n- **New** \\`src/table/filter/ribbon/burr/\\` module: per-block threshold\nscheme (~90% load), multi-layer construction over bumped keys,\nhash-based build + probe API, byteorder-stable wire format\nencoder/decoder.\n- **Single-pass parse + probe** entry point\n(\\`contains_hash_from_bytes\\`) used by\n\\`FilterBlock::maybe_contains_hash\\` — no per-call \\`Vec<LayerView>\\`\nallocation on the table-read hot path.\n- **Deleted** \\`src/table/filter/standard_bloom/\\` and\n\\`src/table/filter/bit_array/\\`.\n- **Rewired** filter writers (\\`full.rs\\`, \\`partitioned.rs\\`) and the\nfilter block reader.\n- **Replaced** ~30 \\`standard_bloom::Builder::get_hash(key)\\` callsites\nwith \\`crate::hash::hash64(key)\\`. Made \\`hash\\` module \\`pub\\` for\nstable hash entry point.\n- **Cross-arch portability**: dropped \\`bitvec\\` dep (\\`u64: BitStore\\`\nhard-gated on \\`target_has_atomic = \"64\"\\` — fails on\ni686/riscv32/etc.). The Ribbon body now stores a plain \\`Vec<u64>\\`\ndirectly.\n- **Endian portability**: default \\`Params::retry_limit\\` bumped from 1\nto 8 so the construction succeeds across architectures regardless of\n\\`DefaultHasher::write_u64\\`'s native-endian hashing.\n\n## Public API\n\n- \\`BurrBuilder::new(BurrParams, BuildHasher)\\`\n- \\`BurrBuilder::build(&[K])\\` / \\`build_from_hashes(&[u64])\\` /\n\\`build_from_hashes_owned(Vec<u64>)\\`\n- \\`BurrFilter::contains(&Q)\\` / \\`contains_in(&Q, &mut Scratch)\\` /\n\\`contains_hash(u64)\\` / \\`to_wire_bytes()\\`\n- \\`BurrFilterReader::new(&[u8])\\` / \\`contains_hash(u64)\\`\n- Standalone \\`contains_hash_from_bytes(&[u8], u64)\\` for single-pass\nparse + probe\n- \\`BurrParams::with_fp_rate(n, fpr)\\` / \\`with_bpk(n, bpk)\\` /\n\\`with_seed(u64)\\`\n\n\\`BloomConstructionPolicy\\` public config retained — same\n\\`BitsPerKey(f32)\\` / \\`FalsePositiveRate(f32)\\` variants, semantics now\nmapped to BuRR fingerprint-width \\`r\\`.\n\n## Pairing contract (probe APIs)\n\n- Filter built via \\`BurrBuilder::build(keys)\\` → probe with\n\\`contains\\`/\\`contains_in\\` (key path).\n- Filter built via \\`BurrBuilder::build_from_hashes\\` / \\`_owned\\` →\nprobe with \\`contains_hash\\` / \\`contains_hash_from_bytes\\` (hash path).\n\nMixing paths produces false negatives. Both API surfaces carry symmetric\ndocstring warnings.\n\n## Test plan\n\n- [x] nextest workspace: 1254 tests pass (was 1193 before BuRR)\n- [x] 44 BuRR unit tests (round-trip, FPR envelope, corruption rejection\nper-field with specific error variant)\n- [x] end-to-end integration test through table writer + reader\n- [x] doctests: 42 pass\n- [x] full-feature lint pass clean\n- [x] ribbon-serde feature build clean\n- [x] db_bench: BuRR >= bloom on 8 of 9 workloads, parity on mergerandom\n(read-heavy +5 to +228%, write +14 to +123%)\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n## Summary by CodeRabbit\n\n* **New Features**\n* BuRR (layered ribbon) AMQ filters with vendored ribbon filter and\noptional serde support; zstd provider selection updated.\n\n* **Removed**\n  * Legacy standard Bloom filter implementation removed.\n\n* **Documentation**\n  * Crate docs and README updated; on-disk format advanced to V5.\n\n* **Tests**\n* Extensive unit, benchmark, and integration suites covering BuRR/ribbon\nand wire-format round-trips.\n\n* **Chores**\n* Manifest/version tightened to V5, unified hashing usage, and\nstandardized SPDX license headers.\n\n<!-- review_stack_entry_start -->\n\n[![Review Change\nStack](https://storage.googleapis.com/coderabbit_public_assets/review-stack-in-coderabbit-ui.svg)](https://app.coderabbit.ai/change-stack/structured-world/coordinode-lsm-tree/pull/269?utm_source=github_walkthrough&utm_medium=github&utm_campaign=change_stack)\n\n<!-- review_stack_entry_end -->\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-05-19T21:46:32+03:00",
+          "tree_id": "40263ca762bfc5a2eac1815a45e29b65f2094fd6",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/4239a3dce2552543a240f5e6d1bf5a126561c726"
+        },
+        "date": 1779216469594,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 1152300.699604844,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 2029805 ops/sec | factor: 0.568 | P50: 0.3us | P99: 2.1us | P99.9: 5.1us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3 | runner: seq_wr=222906 rand_rd=874484 cpu=123 composite=40515.0"
+          },
+          {
+            "name": "fillrandom",
+            "value": 617517.9417044134,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 1087772 ops/sec | factor: 0.568 | P50: 0.7us | P99: 2.7us | P99.9: 6.1us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3 | runner: seq_wr=222906 rand_rd=874484 cpu=123 composite=40515.0"
+          },
+          {
+            "name": "readrandom",
+            "value": 258823.59321129863,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 455924 ops/sec | factor: 0.568 | P50: 2.0us | P99: 5.5us | P99.9: 14.2us\nthreads: 1 | elapsed: 0.44s | num: 200000 | iterations: 3 | runner: seq_wr=222906 rand_rd=874484 cpu=123 composite=40515.0"
+          },
+          {
+            "name": "readseq",
+            "value": 1437678.1171065918,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 2532504 ops/sec | factor: 0.568 | P50: 0.2us | P99: 3.8us | P99.9: 7.5us\nthreads: 1 | elapsed: 0.08s | num: 200000 | iterations: 3 | runner: seq_wr=222906 rand_rd=874484 cpu=123 composite=40515.0"
+          },
+          {
+            "name": "seekrandom",
+            "value": 194435.10241047922,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 342502 ops/sec | factor: 0.568 | P50: 2.5us | P99: 6.2us | P99.9: 14.8us\nthreads: 1 | elapsed: 0.58s | num: 200000 | iterations: 3 | runner: seq_wr=222906 rand_rd=874484 cpu=123 composite=40515.0"
+          },
+          {
+            "name": "prefixscan",
+            "value": 104469.80208836748,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 184026 ops/sec | factor: 0.568 | P50: 5.0us | P99: 7.1us | P99.9: 17.8us\nthreads: 1 | elapsed: 1.09s | num: 200000 | iterations: 3 | runner: seq_wr=222906 rand_rd=874484 cpu=123 composite=40515.0"
+          },
+          {
+            "name": "overwrite",
+            "value": 697770.034259179,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 1229138 ops/sec | factor: 0.568 | P50: 0.7us | P99: 2.5us | P99.9: 5.8us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3 | runner: seq_wr=222906 rand_rd=874484 cpu=123 composite=40515.0"
+          },
+          {
+            "name": "mergerandom",
+            "value": 402161.5392269485,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 708417 ops/sec | factor: 0.568 | P50: 0.3us | P99: 1.9us | P99.9: 3.3us\nthreads: 1 | elapsed: 0.28s | num: 200000 | iterations: 3 | runner: seq_wr=222906 rand_rd=874484 cpu=123 composite=40515.0"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 244794.0135365949,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 431210 ops/sec | factor: 0.568 | P50: 2.1us | P99: 4.7us | P99.9: 45.7us\nthreads: 1 | elapsed: 0.46s | num: 200000 | iterations: 3 | runner: seq_wr=222906 rand_rd=874484 cpu=123 composite=40515.0"
           }
         ]
       }
