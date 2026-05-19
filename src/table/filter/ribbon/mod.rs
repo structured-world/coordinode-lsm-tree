@@ -36,6 +36,14 @@
 // diff vs upstream is the priority, and a future upstream refactor
 // that removes one of the offending casts would otherwise yield an
 // `unfulfilled_lint_expectations` error on the next sync.
+//
+// Note: this crate-attribute allow propagates into child modules,
+// including the first-party `burr/` submodule. Re-denying the safety-
+// critical lints (`expect_used`, `unwrap_used`, `indexing_slicing`)
+// inside burr/ would require migrating ~30 existing internal sites in
+// BuRR code to safe alternatives. That migration is tracked as a
+// follow-up; new BuRR code uses `#[expect(..., reason)]` per use
+// site for new suppressions.
 #![allow(
     clippy::indexing_slicing,
     clippy::cast_possible_truncation,
