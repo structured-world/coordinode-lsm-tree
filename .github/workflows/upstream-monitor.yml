@@ -667,7 +667,7 @@ jobs:
             --description "Automated upstream synchronization — merge conflicts, release tracking" \
             --force >/dev/null
 
-          # Our branch convention (per CLAUDE.md) is `<type>/#<issue_id>[-slug]`,
+          # Our branch convention is `<type>/#<issue_id>[-slug]`,
           # so the literal `#` is part of every feature/fix branch name. Branches
           # without the leading `#` (e.g., `feat/foo` or `feat/123-foo`) are not
           # produced by our workflow and are intentionally skipped. If the

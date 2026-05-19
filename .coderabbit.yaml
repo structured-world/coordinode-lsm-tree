@@ -23,12 +23,12 @@ reviews:
     enabled: true
     auto_incremental_review: true
     drafts: false
-    # Single `main` base: feat/#NNN and fix/#NNN are PR source branches per
-    # our convention (CLAUDE.md), not long-lived integration targets — there
-    # are no release/* branches in this repo. The `upstream-monitor.yml`
-    # workflow also creates `chore/upstream-sync-*` sync PRs, and those
-    # ALWAYS target `main` (see the `--base main` flag on `gh pr create`).
-    # Widen this list if either convention ever changes.
+    # Single `main` base: feat/#NNN and fix/#NNN are PR source branches,
+    # not long-lived integration targets — there are no release/* branches
+    # in this repo. The `upstream-monitor.yml` workflow also creates
+    # `chore/upstream-sync-*` sync PRs, and those ALWAYS target `main`
+    # (see the `--base main` flag on `gh pr create`). Widen this list if
+    # either convention ever changes.
     base_branches: ["main"]
     ignore_title_keywords: ["WIP", "DO NOT MERGE"]
   path_instructions:
