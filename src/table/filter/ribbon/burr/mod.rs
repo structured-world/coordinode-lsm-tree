@@ -60,6 +60,7 @@ pub mod builder;
 pub mod error;
 pub mod filter;
 pub mod params;
+pub(crate) mod threshold;
 
 pub use builder::BurrBuilder;
 pub use error::{BurrBuildError, BurrConstructionFailure};

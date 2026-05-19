@@ -1,4 +1,4 @@
-use crate::{BuildError, Mode, ParamError, Params, RibbonBuilder};
+use super::{BuildError, Mode, ParamError, Params, RibbonBuilder};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::BuildHasherDefault;
 
@@ -160,7 +160,7 @@ fn standard_builder_reports_inconsistent_equation_failure() {
         Err(BuildError::ConstructionFailed { last_failure, .. }) => {
             assert!(matches!(
                 last_failure,
-                crate::ConstructionFailure::InconsistentEquation { .. }
+                super::ConstructionFailure::InconsistentEquation { .. }
             ));
         }
         Err(other) => panic!("expected construction failure, got {other}"),
@@ -271,7 +271,7 @@ fn retry_path_is_exercised_and_eventually_succeeds() {
             assert_eq!(attempts, 3);
             assert!(matches!(
                 last_failure,
-                crate::ConstructionFailure::InconsistentEquation { .. }
+                super::ConstructionFailure::InconsistentEquation { .. }
             ));
         }
         other => panic!("expected retry-exhausted failure, got {other:?}"),
@@ -299,7 +299,7 @@ fn growth_path_is_exercised_and_reports_grown_m() {
             assert_eq!(final_m, 19);
             assert!(matches!(
                 last_failure,
-                crate::ConstructionFailure::InconsistentEquation { .. }
+                super::ConstructionFailure::InconsistentEquation { .. }
             ));
         }
         other => panic!("expected growth-exhausted failure, got {other:?}"),
@@ -327,7 +327,7 @@ fn terminal_failure_reports_attempts_and_final_m() {
             assert_eq!(final_m, 19);
             assert!(matches!(
                 last_failure,
-                crate::ConstructionFailure::InconsistentEquation { .. }
+                super::ConstructionFailure::InconsistentEquation { .. }
             ));
         }
         other => panic!("expected terminal construction failure, got {other:?}"),
@@ -422,7 +422,7 @@ fn homogeneous_mode_false_positive_rate_is_sane_across_seeds_and_sizes() {
 
 #[test]
 fn construction_failure_out_of_bounds_display_contains_context() {
-    let err = crate::ConstructionFailure::OutOfBounds {
+    let err = super::ConstructionFailure::OutOfBounds {
         key_index: Some(12),
         row_index: 99,
         m: 80,
