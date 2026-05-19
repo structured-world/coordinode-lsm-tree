@@ -141,7 +141,12 @@ pub(crate) fn partition_keys_by_threshold<K: Clone>(
 
 /// Predicate variant: does a single equation get bumped under the given
 /// thresholds? Used by the probe path to decide which layer holds a key.
-#[inline]
+#[expect(
+    clippy::inline_always,
+    reason = "called per layer on the filter probe hot path; the function is ~5 instructions and \
+              inlining lets LLVM fold the threshold-table indexing into the caller's layer loop"
+)]
+#[inline(always)]
 #[must_use]
 pub(crate) fn is_bumped(eq: &StandardEquation, thresholds: &[u8], b: u8) -> bool {
     let b_usize = usize::from(b);

@@ -124,15 +124,15 @@ where
     /// `BuildHasher::hash_one(key)` value. The on-disk LSM filter
     /// always uses the hash-based build + probe pair so the two stay
     /// consistent.
+    #[inline]
     pub fn contains_hash(&self, hash: u64) -> bool {
         // BurrParams::with_fp_rate / with_bpk both clamp r to 1..=64, so
-        // stride is always 1. We use stack-sized buffers to keep this
-        // hot path allocation-free. The debug_assert pins the invariant
-        // — if the format ever grows to r > 64 the probe path must be
-        // updated at the same time.
+        // stride is always 1. Single u64 buffer for fingerprint, scalar
+        // u64 accumulator. The debug_assert pins the invariant — if the
+        // format ever grows to r > 64 the probe path must be updated
+        // at the same time.
         debug_assert!(self.params.r <= 64, "BuRR params pin r <= 64");
-        let stride: usize = 1;
-        let mut fingerprint = [0_u64; 1];
+        let mut fingerprint_buf = [0_u64; 1];
         for layer in &self.layers {
             let layer_params = match Params::new(
                 layer.m,
@@ -146,42 +146,31 @@ where
                 Err(_) => return true,
             };
 
-            fingerprint[0] = 0;
+            fingerprint_buf[0] = 0;
             let equation =
-                standard_equation_from_hash(hash, layer.seed, &layer_params, &mut fingerprint);
+                standard_equation_from_hash(hash, layer.seed, &layer_params, &mut fingerprint_buf);
+            let fingerprint = fingerprint_buf[0];
 
             if is_bumped(&equation, &layer.thresholds, self.params.b) {
                 continue;
             }
 
-            // Inline the same GF(2) XOR-reduce that
-            // `RibbonFilter::contains_in` does, but using our already-
-            // computed equation + fingerprint (no second equation
-            // compute). Z is borrowed via the public accessor on the
-            // vendored ribbon.
+            // GF(2) XOR-reduce. start ∈ [0, m-w] and every set bit offset
+            // ∈ [0, w-1], so row_index ∈ [0, m-1] is always in-bounds
+            // (proven; no per-row bounds check in the inner loop).
             let z_words = layer.ribbon.z_raw_words();
-            let mut acc = [0_u64; 1];
-            let mut bumped_out_of_layer = false;
-            super::super::hashing::for_each_set_bit_u128_parts(
-                equation.coeff_lo,
-                equation.coeff_hi,
-                |offset| {
-                    if bumped_out_of_layer {
-                        return;
-                    }
-                    let row_index = equation.start + offset;
-                    if row_index < layer.m {
-                        let row_start = row_index * stride;
-                        let row = &z_words[row_start..row_start + stride];
-                        super::super::hashing::xor_words(&mut acc, row);
-                    } else {
-                        bumped_out_of_layer = true;
-                    }
-                },
-            );
-            if bumped_out_of_layer {
-                continue;
+            let mut acc: u64 = 0;
+            let mut lo = equation.coeff_lo;
+            while lo != 0 {
+                let offset = lo.trailing_zeros() as usize;
+                acc ^= z_words[equation.start + offset];
+                lo &= lo - 1;
             }
+            debug_assert_eq!(
+                equation.coeff_hi, 0,
+                "BuRR builds with w <= 64; coeff_hi must be 0",
+            );
+
             return acc == fingerprint;
         }
         false
@@ -294,6 +283,7 @@ impl<'a> BurrFilterReader<'a> {
     /// framework's `block::FilterBlock` — the table read path already
     /// computes a u64 hash for block indexing, and the filter consumes
     /// that same hash directly (no re-hash via `BuildHasher`).
+    #[inline]
     #[must_use]
     pub fn contains_hash(&self, hash: u64) -> bool {
         super::wire::contains_hash(&self.decoded, hash)

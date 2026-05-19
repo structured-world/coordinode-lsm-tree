@@ -86,6 +86,12 @@ pub(crate) fn standard_equation_w64<S: BuildHasher, Q: Hash + ?Sized>(
 /// the BuRR wire-format probe path (which consumes pre-hashed inputs from
 /// the LSM filter framework) can skip the `build_hasher.hash_one(key)`
 /// step entirely.
+#[expect(
+    clippy::inline_always,
+    reason = "called per layer on the BuRR filter probe hot path; inlining lets LLVM fold the \
+              SplitMix stream into the caller and eliminate the &mut [u64] fingerprint pointer"
+)]
+#[inline(always)]
 pub(crate) fn standard_equation_from_hash(
     base_hash: u64,
     seed: u64,

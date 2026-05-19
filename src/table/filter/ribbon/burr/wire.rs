@@ -38,9 +38,7 @@ use std::hash::BuildHasher;
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use std::io::{Cursor, Read};
 
-use super::super::hashing::{
-    StandardEquation, for_each_set_bit_u128_parts, standard_equation_from_hash, xor_words,
-};
+use super::super::hashing::{StandardEquation, standard_equation_from_hash};
 use super::super::params::{Mode, Params};
 use super::builder::derive_layer_seed;
 use super::filter::BurrFilter;
@@ -139,31 +137,20 @@ where
 }
 
 /// Borrowed-slice view of one decoded layer.
+///
+/// `z_words` is the band-solution matrix pre-decoded from the on-disk
+/// little-endian bytes into native `u64`s. This happens once per layer
+/// at [`decode`] time so the per-probe hot path is a single u64 slice
+/// index instead of a `read 8 LE bytes → from_le_bytes` per row touched.
+///
+/// The owned `Vec<u64>` is the only heap allocation in a `BurrFilterReader`;
+/// for a long-lived reader (the LSM table filter block) the cost is
+/// amortised over many probes.
 pub(crate) struct LayerView<'a> {
     pub(crate) m: usize,
     pub(crate) seed: u64,
     pub(crate) thresholds: &'a [u8],
-    pub(crate) z_bytes: &'a [u8],
-}
-
-impl<'a> LayerView<'a> {
-    /// Read one row (`stride_words` u64s) at the given row index. Each
-    /// word is reconstructed from 8 bytes of `z_bytes` in little-endian
-    /// order — portable across host endianness.
-    pub(crate) fn read_row(&self, row_index: usize, stride_words: usize, out: &mut [u64]) {
-        debug_assert_eq!(out.len(), stride_words);
-        let start_byte = row_index * stride_words * 8;
-        for (i, word) in out.iter_mut().enumerate() {
-            let offset = start_byte + i * 8;
-            #[allow(clippy::expect_used, reason = "row_index pre-validated against m")]
-            let chunk: [u8; 8] = self
-                .z_bytes
-                .get(offset..offset + 8)
-                .and_then(|s| s.try_into().ok())
-                .expect("z_bytes layer slice must cover m * stride_words * 8 bytes");
-            *word = u64::from_le_bytes(chunk);
-        }
-    }
+    pub(crate) z_words: Vec<u64>,
 }
 
 /// Decoded BuRR filter, holding borrowed slices into a wire-format
@@ -254,6 +241,21 @@ pub(crate) fn decode(bytes: &[u8]) -> crate::Result<DecodedFilter<'_>> {
         let z_bytes = &bytes[pos..pos + z_byte_len];
         pos += z_byte_len;
 
+        // Pre-decode the band-solution words once at decode time. The
+        // hot probe path then becomes a single u64 slice index per
+        // matched row instead of an LE-byte decode per probe.
+        let z_word_count = m * stride_words;
+        let mut z_words = Vec::with_capacity(z_word_count);
+        for chunk in z_bytes.chunks_exact(8) {
+            // `chunks_exact(8)` over a slice whose length we already
+            // validated as `m * stride_words * 8` yields exactly
+            // `z_word_count` chunks of 8 bytes each.
+            #[allow(clippy::expect_used, reason = "len pre-validated by header check")]
+            let arr: [u8; 8] = chunk.try_into().expect("chunks_exact yields 8-byte slices");
+            z_words.push(u64::from_le_bytes(arr));
+        }
+        debug_assert_eq!(z_words.len(), z_word_count);
+
         // Per-layer seed re-derived from root_seed + layer_idx to match
         // what the builder used. The wire format does NOT store layer
         // seeds because they're a pure function of (root_seed,
@@ -264,7 +266,7 @@ pub(crate) fn decode(bytes: &[u8]) -> crate::Result<DecodedFilter<'_>> {
             m,
             seed,
             thresholds,
-            z_bytes,
+            z_words,
         });
     }
 
@@ -285,17 +287,16 @@ pub(crate) fn decode(bytes: &[u8]) -> crate::Result<DecodedFilter<'_>> {
 /// path already computes the key's u64 hash for hash-table indexing
 /// elsewhere; the filter consumes that same hash directly instead of
 /// re-hashing via a `BuildHasher`.
+#[inline]
 pub(crate) fn contains_hash(decoded: &DecodedFilter<'_>, hash: u64) -> bool {
     // r is validated to 1..=64 in decode, so stride_words is always 1
-    // for the currently-deployed wire format. We use fixed-size stack
-    // arrays to keep this hot-path allocation-free. If the format ever
-    // grows to r > 64 the assertion below catches the mismatch — the
-    // probe path must be updated at the same time.
+    // for the currently-deployed wire format. We use a single stack u64
+    // for both fingerprint and acc to keep this hot path allocation-
+    // free. If the format ever grows to r > 64 the assertion below
+    // catches the mismatch — the probe path must be updated at the
+    // same time.
     debug_assert_eq!(decoded.stride_words, 1, "BuRR wire format pins r <= 64");
-    let stride_words: usize = 1;
-    let mut fingerprint = [0_u64; 1];
-    let mut acc;
-    let mut row_buf = [0_u64; 1];
+    let mut fingerprint_buf = [0_u64; 1];
 
     for layer in &decoded.layers {
         let layer_params = match Params::new(
@@ -312,24 +313,32 @@ pub(crate) fn contains_hash(decoded: &DecodedFilter<'_>, hash: u64) -> bool {
             Err(_) => return true,
         };
 
-        fingerprint[0] = 0;
+        fingerprint_buf[0] = 0;
         let equation: StandardEquation =
-            standard_equation_from_hash(hash, layer.seed, &layer_params, &mut fingerprint);
+            standard_equation_from_hash(hash, layer.seed, &layer_params, &mut fingerprint_buf);
+        let fingerprint = fingerprint_buf[0];
 
         if is_bumped(&equation, layer.thresholds, decoded.b) {
             continue;
         }
 
-        // Kept at this layer — run the GF(2) XOR-reduce against the
-        // stored solution and compare against the fingerprint.
-        acc = [0_u64; 1];
-        for_each_set_bit_u128_parts(equation.coeff_lo, equation.coeff_hi, |offset| {
-            let row_index = equation.start + offset;
-            if row_index < layer.m {
-                layer.read_row(row_index, stride_words, &mut row_buf);
-                xor_words(&mut acc, &row_buf);
-            }
-        });
+        // Kept at this layer — XOR-reduce the band-rows whose coeff bit
+        // is set, compare against the fingerprint. start ∈ [0, m-w] and
+        // every set bit offset ∈ [0, w-1], so row_index ∈ [0, m-1] is
+        // always in-bounds (proven; no per-row bounds check in the
+        // loop). z_words is pre-decoded; the loop body is one slice
+        // index + one XOR per matched row.
+        let z = layer.z_words.as_slice();
+        let mut acc: u64 = 0;
+        let mut lo = equation.coeff_lo;
+        while lo != 0 {
+            let offset = lo.trailing_zeros() as usize;
+            acc ^= z[equation.start + offset];
+            lo &= lo - 1;
+        }
+        // coeff_hi is always 0 for w <= 64 (the case we deploy); a
+        // future w > 64 build path would need to extend the loop here.
+        debug_assert_eq!(equation.coeff_hi, 0, "w <= 64 keeps coeff_hi == 0");
 
         return acc == fingerprint;
     }

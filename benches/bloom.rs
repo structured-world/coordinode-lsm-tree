@@ -126,10 +126,49 @@ fn burr_filter_contains(c: &mut Criterion) {
     }
 }
 
+/// Standard (single-layer) Ribbon contains_in bench — apples-to-apples
+/// against BuRR's contains_hash so the BuRR multi-layer overhead vs
+/// pure Ribbon stays visible.
+fn ribbon_filter_contains(c: &mut Criterion) {
+    use lsm_tree::table::filter::ribbon::{Mode, Params, RibbonBuilder};
+
+    let keys: Vec<u64> = (0..100_000_u64).collect();
+
+    for fpr in [0.01_f32, 0.001, 0.0001] {
+        let n = 1_000_000_usize;
+        // r = ceil(-log2(fpr)) — matches what BuRR picks internally.
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let r = (-fpr.log2()).ceil() as usize;
+        let params = Params::new(n, 64, r, Mode::Standard)
+            .expect("ribbon params")
+            .with_seed(0);
+        let builder = RibbonBuilder::new(params, Hasher::default()).expect("builder");
+        let filter = builder.build(&keys).expect("build");
+        let mut scratch = filter.new_scratch();
+
+        let mut rng = rand::rng();
+
+        c.bench_function(
+            &format!(
+                "standard ribbon contains, true positive (FPR={}%)",
+                fpr * 100.0
+            ),
+            |b| {
+                b.iter(|| {
+                    use rand::seq::IndexedRandom;
+                    let sample = keys.choose(&mut rng).unwrap();
+                    assert!(filter.contains_in(sample, &mut scratch));
+                });
+            },
+        );
+    }
+}
+
 criterion_group!(
     benches,
     fast_block_index,
     burr_filter_construction,
     burr_filter_contains,
+    ribbon_filter_contains,
 );
 criterion_main!(benches);
