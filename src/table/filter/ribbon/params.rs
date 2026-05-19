@@ -45,7 +45,22 @@ impl Params {
             r,
             mode,
             seed: 0,
-            retry_limit: 1,
+            // 8 attempts: Standard Ribbon's GF(2) elimination can hit
+            // InconsistentEquation on the first seed/key combination
+            // for some inputs. The Rust std `DefaultHasher` hashes
+            // `u64` keys via `to_ne_bytes`, so the equation system is
+            // host-endianness-sensitive — a single-attempt build that
+            // succeeds on x86_64 (LE) may fail on powerpc64 (BE). 8
+            // attempts via derived seeds makes the construction
+            // platform-invariant in practice without changing the
+            // seed-determinism contract (consumers can still pin a
+            // seed; the retry just iterates derived seeds within that
+            // seed family).
+            //
+            // BuRR's own build path bypasses retry entirely via
+            // `build_with_seed_verbatim`, so this default only affects
+            // direct `RibbonBuilder::build` consumers.
+            retry_limit: 8,
             grow_limit: 0,
         };
         params.validate()?;
