@@ -46,7 +46,15 @@ impl ParsedItem<KeyedBlockHandle> for IndexBlockParsedItem {
             compare_prefixed_slice(prefix, rest_key, needle, cmp)
         } else {
             let key = unsafe { bytes.get_unchecked(self.end_key.0..self.end_key.1) };
-            cmp.compare(key, needle)
+            // Lex fast path: avoid the `dyn UserComparator::compare` vtable
+            // on the binary-search hot path (restart heads probed every
+            // iteration). The prefix branch above already short-circuits
+            // through `compare_prefixed_slice_lexicographic`.
+            if cmp.is_lexicographic() {
+                key.cmp(needle)
+            } else {
+                cmp.compare(key, needle)
+            }
         }
     }
 

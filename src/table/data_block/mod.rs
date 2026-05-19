@@ -335,7 +335,16 @@ impl ParsedItem<InternalValue> for DataBlockParsedItem {
             compare_prefixed_slice(prefix, rest_key, needle, cmp)
         } else {
             let key = unsafe { bytes.get_unchecked(self.key.0..self.key.1) };
-            cmp.compare(key, needle)
+            // Lex fast path mirrors the prefix branch (which already
+            // short-circuits through `compare_prefixed_slice_lexicographic`):
+            // skip the `dyn UserComparator::compare` vtable call when the
+            // default comparator is in use. Restart-head probes during binary
+            // search land here every iteration.
+            if cmp.is_lexicographic() {
+                key.cmp(needle)
+            } else {
+                cmp.compare(key, needle)
+            }
         }
     }
 
