@@ -860,3 +860,84 @@ fn burr_builder_rejects_empty_input_via_build_keys() {
         "expected non-empty mention: {msg}"
     );
 }
+
+#[test]
+fn burr_builder_new_rejects_zero_n() {
+    let mut params = BurrParams::with_fp_rate(100, 0.01).expect("params");
+    params.n = 0;
+    let err = BurrBuilder::new(params, DefaultBuildHasher::default()).expect_err("n=0 must reject");
+    assert!(format!("{err}").contains("n must be > 0"));
+}
+
+#[test]
+fn burr_builder_new_rejects_r_out_of_range() {
+    let mut params = BurrParams::with_fp_rate(100, 0.01).expect("params");
+    params.r = 0;
+    let err = BurrBuilder::new(params, DefaultBuildHasher::default()).expect_err("r=0 must reject");
+    assert!(format!("{err}").contains("r must be in 1..=64"));
+
+    let mut params = BurrParams::with_fp_rate(100, 0.01).expect("params");
+    params.r = 65;
+    let err =
+        BurrBuilder::new(params, DefaultBuildHasher::default()).expect_err("r=65 must reject");
+    assert!(format!("{err}").contains("r must be in 1..=64"));
+}
+
+#[test]
+fn burr_builder_new_rejects_non_64_w() {
+    let mut params = BurrParams::with_fp_rate(100, 0.01).expect("params");
+    params.w = 32;
+    let err =
+        BurrBuilder::new(params, DefaultBuildHasher::default()).expect_err("w=32 must reject");
+    assert!(format!("{err}").contains("w must be exactly 64"));
+}
+
+#[test]
+fn burr_builder_new_rejects_zero_b() {
+    let mut params = BurrParams::with_fp_rate(100, 0.01).expect("params");
+    params.b = 0;
+    let err = BurrBuilder::new(params, DefaultBuildHasher::default()).expect_err("b=0 must reject");
+    assert!(format!("{err}").contains("b must be > 0"));
+}
+
+#[test]
+fn burr_builder_new_rejects_b_below_w() {
+    // b < w lets layer_m hand Ribbon an undersized m. Reviewer-flagged
+    // invariant: the builder must reject hand-built params with b < w.
+    let mut params = BurrParams::with_fp_rate(100, 0.01).expect("params");
+    params.b = 32; // < w (= 64)
+    let err = BurrBuilder::new(params, DefaultBuildHasher::default()).expect_err("b<w must reject");
+    let msg = format!("{err}");
+    assert!(msg.contains("b must be >= w"), "got: {msg}");
+}
+
+#[test]
+fn burr_builder_new_rejects_zero_max_layers() {
+    let mut params = BurrParams::with_fp_rate(100, 0.01).expect("params");
+    params.max_layers = 0;
+    let err = BurrBuilder::new(params, DefaultBuildHasher::default())
+        .expect_err("max_layers=0 must reject");
+    assert!(format!("{err}").contains("max_layers must be > 0"));
+}
+
+#[test]
+fn burr_builder_debug_includes_params() {
+    let params = BurrParams::with_fp_rate(100, 0.01).expect("params");
+    let builder = BurrBuilder::new(params, DefaultBuildHasher::default()).expect("builder");
+    let debug = format!("{builder:?}");
+    assert!(debug.contains("BurrBuilder"), "got: {debug}");
+    assert!(debug.contains("params"), "got: {debug}");
+}
+
+#[test]
+fn burr_filter_debug_includes_layer_count() {
+    let params = BurrParams::with_fp_rate(100, 0.01).expect("params");
+    let builder = BurrBuilder::new(params, DefaultBuildHasher::default()).expect("builder");
+    let hashes: Vec<u64> = (0..100_u64)
+        .map(|i| crate::hash::hash64(&i.to_le_bytes()))
+        .collect();
+    let filter = builder.build_from_hashes(&hashes).expect("build");
+    let debug = format!("{filter:?}");
+    assert!(debug.contains("BurrFilter"), "got: {debug}");
+    assert!(debug.contains("layer_count"), "got: {debug}");
+}
