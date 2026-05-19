@@ -138,19 +138,18 @@ where
 
 /// Borrowed-slice view of one decoded layer.
 ///
-/// `z_words` is the band-solution matrix pre-decoded from the on-disk
-/// little-endian bytes into native `u64`s. This happens once per layer
-/// at [`decode`] time so the per-probe hot path is a single u64 slice
-/// index instead of a `read 8 LE bytes → from_le_bytes` per row touched.
-///
-/// The owned `Vec<u64>` is the only heap allocation in a `BurrFilterReader`;
-/// for a long-lived reader (the LSM table filter block) the cost is
-/// amortised over many probes.
+/// `z_bytes` stays as a borrowed slice of the wire buffer — the LSM
+/// filter block is constructed afresh per `maybe_contains_hash` call
+/// (the underlying `Block` is cached, but `FilterBlock` wraps it
+/// freshly), so any per-layer `Vec` allocation here would happen on
+/// every point read and dominate the probe path. The trade-off is one
+/// 8-byte LE decode per matched row inside the probe loop; for `r <=
+/// 64` (stride = 1) that's a single `u64::from_le_bytes` per set bit.
 pub(crate) struct LayerView<'a> {
     pub(crate) m: usize,
     pub(crate) seed: u64,
     pub(crate) thresholds: &'a [u8],
-    pub(crate) z_words: Vec<u64>,
+    pub(crate) z_bytes: &'a [u8],
 }
 
 /// Decoded BuRR filter, holding borrowed slices into a wire-format
@@ -241,21 +240,6 @@ pub(crate) fn decode(bytes: &[u8]) -> crate::Result<DecodedFilter<'_>> {
         let z_bytes = &bytes[pos..pos + z_byte_len];
         pos += z_byte_len;
 
-        // Pre-decode the band-solution words once at decode time. The
-        // hot probe path then becomes a single u64 slice index per
-        // matched row instead of an LE-byte decode per probe.
-        let z_word_count = m * stride_words;
-        let mut z_words = Vec::with_capacity(z_word_count);
-        for chunk in z_bytes.chunks_exact(8) {
-            // `chunks_exact(8)` over a slice whose length we already
-            // validated as `m * stride_words * 8` yields exactly
-            // `z_word_count` chunks of 8 bytes each.
-            #[allow(clippy::expect_used, reason = "len pre-validated by header check")]
-            let arr: [u8; 8] = chunk.try_into().expect("chunks_exact yields 8-byte slices");
-            z_words.push(u64::from_le_bytes(arr));
-        }
-        debug_assert_eq!(z_words.len(), z_word_count);
-
         // Per-layer seed re-derived from root_seed + layer_idx to match
         // what the builder used. The wire format does NOT store layer
         // seeds because they're a pure function of (root_seed,
@@ -266,7 +250,7 @@ pub(crate) fn decode(bytes: &[u8]) -> crate::Result<DecodedFilter<'_>> {
             m,
             seed,
             thresholds,
-            z_words,
+            z_bytes,
         });
     }
 
@@ -326,14 +310,25 @@ pub(crate) fn contains_hash(decoded: &DecodedFilter<'_>, hash: u64) -> bool {
         // is set, compare against the fingerprint. start ∈ [0, m-w] and
         // every set bit offset ∈ [0, w-1], so row_index ∈ [0, m-1] is
         // always in-bounds (proven; no per-row bounds check in the
-        // loop). z_words is pre-decoded; the loop body is one slice
-        // index + one XOR per matched row.
-        let z = layer.z_words.as_slice();
+        // loop). z_bytes is borrowed wire bytes; we decode 8 LE bytes
+        // → u64 per matched row inline (no per-call allocation, vs
+        // pre-decoding into Vec<u64> which would happen on every
+        // FilterBlock construction during the LSM read path).
+        let z = layer.z_bytes;
         let mut acc: u64 = 0;
         let mut lo = equation.coeff_lo;
         while lo != 0 {
             let offset = lo.trailing_zeros() as usize;
-            acc ^= z[equation.start + offset];
+            let row_byte = (equation.start + offset) * 8;
+            // SAFETY: row_byte..row_byte+8 ⊂ z (proven by start+offset
+            // < m and len validated == m * 8 in decode). The
+            // try_into is infallible here; using unwrap_or(0) keeps
+            // panic-freedom on the hot path without an unwrap.
+            let arr: [u8; 8] = z
+                .get(row_byte..row_byte + 8)
+                .and_then(|s| s.try_into().ok())
+                .unwrap_or([0; 8]);
+            acc ^= u64::from_le_bytes(arr);
             lo &= lo - 1;
         }
         // coeff_hi is always 0 for w <= 64 (the case we deploy); a
