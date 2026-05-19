@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779216470933,
+  "lastUpdate": 1779222230533,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -6942,6 +6942,84 @@ window.BENCHMARK_DATA = {
             "value": 244794.0135365949,
             "unit": "ops/sec (normalized)",
             "extra": "raw: 431210 ops/sec | factor: 0.568 | P50: 2.1us | P99: 4.7us | P99.9: 45.7us\nthreads: 1 | elapsed: 0.46s | num: 200000 | iterations: 3 | runner: seq_wr=222906 rand_rd=874484 cpu=123 composite=40515.0"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "413a2960411052e17152849508d37d06492bc3f1",
+          "message": "perf(compression): pre-parse zstd dict once via OnceCell + no-std foundation (#273)\n\n## Summary\n\nCloses #232. Supersedes #231. Lays the foundation for #274 (full no-std\nmigration).\n\nTwo related changes in this PR:\n\n1. **#232 win** — `ZstdDictionary` carries a lazily-populated\n`Arc<OnceCell<DictionaryHandle>>`. First decompress parses the\ndictionary once globally via `OnceCell::get_or_try_init`; every\nsubsequent decompress on every thread bumps the Arc refcount and\nregisters the shared handle via `FrameDecoder::add_dict_handle`.\nEliminates the per-thread `Dictionary` re-parse the TLS `FrameDecoder`\ncache used to do on every miss. Single-parse contract across all racers\nis guaranteed by `OnceCell`'s internal one-shot synchronisation — no\nexplicit `Mutex` needed, no extra struct field.\n\n2. **no-std foundation** — `Cargo.toml` now has `std` (default-on) and\n`alloc` features; `lib.rs` carries `#![cfg_attr(not(feature = \"std\"),\nno_std)]` and `extern crate alloc`. Default builds keep `std` enabled,\nso existing consumers see no behavior change. A new CI job\n`no-std-check` runs `cargo check --target thumbv7em-none-eabihf\n--no-default-features --features alloc` and tracks migration progress\n(currently `continue-on-error: true` until the full migration in #274\ncompletes). Per-module migration is tracked in #274.\n\n## Changes\n\n- `src/compression/mod.rs` — `ZstdDictionary.prepared:\nArc<OnceCell<DictionaryHandle>>`; `prepared_handle()` uses\n`get_or_try_init`. New unit tests pin: memoization, corrupted-magic\nreturns Err and leaves the cell empty, `Clone` shares the cell,\nlazy-init contract (`new()` does not parse).\n- `src/compression/zstd_backend.rs` — TLS-miss arm calls\n`dict.prepared_handle()?` plus `FrameDecoder::add_dict_handle`,\nreplacing the inline `Dictionary::decode_dict` / `from_raw_content`\nblock.\n- `Cargo.toml` — `default = [\"std\"]`, new `std` and `alloc` features,\n`io-uring` gated on `std`. `once_cell` dep added (replaces\n`std::sync::OnceLock` which lacks stable `get_or_try_init` on our MSRV).\n- `src/lib.rs` — `#![cfg_attr(not(feature = \"std\"), no_std)]` and\n`extern crate alloc`.\n- `.github/workflows/coordinode-ci.yml` — new `no-std-check` job\n(cross-checks on `thumbv7em-none-eabihf`, currently `continue-on-error:\ntrue`).\n\n## Why this also closes #231\n\n#231 proposed a multi-entry TLS-keyed map to amortise per-thread\nre-parse when a thread handled multiple distinct dictionaries. With\npre-parsed handles each `ZstdDictionary` carries its own parsed entropy\ntables — the re-parse the multi-entry cache was supposed to amortise no\nlonger happens. A multi-entry TLS map would amortise nothing and just\nadd lookup cost.\n\n## Why no Mutex\n\nThe first commit on this branch introduced an explicit `Mutex` for the\nsingle-parse guarantee. Replaced with\n`once_cell::sync::OnceCell::get_or_try_init` — same guarantee (winner\nparses, losers wait on the cell's internal one-shot sync, then read the\ncached Arc clone), no auxiliary field, cleaner code, and aligns with the\nproject's no-std-first design rule (Mutex specifically blocks no-std\nbuilds; this primitive has a no-std-compatible\n`once_cell::race::OnceBox` variant we can swap to during #274).\n\n## Testing\n\n- 1447 lib tests pass (4 new for `prepared_handle`)\n- 42 doc tests pass\n- `cargo clippy --all-features --all-targets -- -D warnings` clean\n- Default-feature build (`cargo check --features zstd`) compiles\n- `cargo check --no-default-features --features alloc` correctly\nactivates no_std (currently ~1075 compile errors; that is the migration\nbacklog — see #274)\n\n## Related\n\n- #232 — primary objective (pre-parsed dict handle)\n- #231 — superseded\n- #274 — tracking issue for full no-std + alloc migration (this PR is\nits foundation)\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n## Summary by CodeRabbit\n\n* **New Features**\n* Added no-std support infrastructure for embedded and\nresource-constrained environments.\n\n* **Performance Improvements**\n* Improved zstd decompression by introducing a lazily-initialized,\nshared dictionary cache to avoid repetitive parsing and speed repeated\ndecompression.\n\n* **Robustness**\n* Dictionary parsing failures now surface as errors without polluting\nthe cache; clones share cache state and memoization is strictly lazy.\n\n* **Testing & CI**\n* Added an expected-to-fail no-std compatibility CI job to track\nmigration progress.\n\n<!-- review_stack_entry_start -->\n\n[![Review Change\nStack](https://storage.googleapis.com/coderabbit_public_assets/review-stack-in-coderabbit-ui.svg)](https://app.coderabbit.ai/change-stack/structured-world/coordinode-lsm-tree/pull/273?utm_source=github_walkthrough&utm_medium=github&utm_campaign=change_stack)\n\n<!-- review_stack_entry_end -->\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-05-19T23:22:34+03:00",
+          "tree_id": "3d948a94ddcb5e69de7c0bd808ccca6ebead8f73",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/413a2960411052e17152849508d37d06492bc3f1"
+        },
+        "date": 1779222229408,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 1205048.7339888797,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 1898456 ops/sec | factor: 0.635 | P50: 0.4us | P99: 2.5us | P99.9: 5.9us\nthreads: 1 | elapsed: 0.11s | num: 200000 | iterations: 3 | runner: seq_wr=222755 rand_rd=724934 cpu=109 composite=36234.6"
+          },
+          {
+            "name": "fillrandom",
+            "value": 703041.9163221844,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 1107585 ops/sec | factor: 0.635 | P50: 0.7us | P99: 3.1us | P99.9: 8.2us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3 | runner: seq_wr=222755 rand_rd=724934 cpu=109 composite=36234.6"
+          },
+          {
+            "name": "readrandom",
+            "value": 285426.0262975333,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 449665 ops/sec | factor: 0.635 | P50: 2.0us | P99: 6.5us | P99.9: 13.6us\nthreads: 1 | elapsed: 0.44s | num: 200000 | iterations: 3 | runner: seq_wr=222755 rand_rd=724934 cpu=109 composite=36234.6"
+          },
+          {
+            "name": "readseq",
+            "value": 1410100.2907017982,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 2221498 ops/sec | factor: 0.635 | P50: 0.3us | P99: 4.7us | P99.9: 9.5us\nthreads: 1 | elapsed: 0.09s | num: 200000 | iterations: 3 | runner: seq_wr=222755 rand_rd=724934 cpu=109 composite=36234.6"
+          },
+          {
+            "name": "seekrandom",
+            "value": 214339.92359748707,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 337675 ops/sec | factor: 0.635 | P50: 2.6us | P99: 7.2us | P99.9: 14.2us\nthreads: 1 | elapsed: 0.59s | num: 200000 | iterations: 3 | runner: seq_wr=222755 rand_rd=724934 cpu=109 composite=36234.6"
+          },
+          {
+            "name": "prefixscan",
+            "value": 110843.19262236473,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 174624 ops/sec | factor: 0.635 | P50: 5.4us | P99: 7.2us | P99.9: 17.1us\nthreads: 1 | elapsed: 1.15s | num: 200000 | iterations: 3 | runner: seq_wr=222755 rand_rd=724934 cpu=109 composite=36234.6"
+          },
+          {
+            "name": "overwrite",
+            "value": 736104.9811003722,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 1159673 ops/sec | factor: 0.635 | P50: 0.7us | P99: 3.1us | P99.9: 6.9us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3 | runner: seq_wr=222755 rand_rd=724934 cpu=109 composite=36234.6"
+          },
+          {
+            "name": "mergerandom",
+            "value": 470343.5799479985,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 740988 ops/sec | factor: 0.635 | P50: 0.4us | P99: 0.6us | P99.9: 3.1us\nthreads: 1 | elapsed: 0.27s | num: 200000 | iterations: 3 | runner: seq_wr=222755 rand_rd=724934 cpu=109 composite=36234.6"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 264777.3455276085,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 417135 ops/sec | factor: 0.635 | P50: 2.2us | P99: 4.9us | P99.9: 13.8us\nthreads: 1 | elapsed: 0.48s | num: 200000 | iterations: 3 | runner: seq_wr=222755 rand_rd=724934 cpu=109 composite=36234.6"
           }
         ]
       }
