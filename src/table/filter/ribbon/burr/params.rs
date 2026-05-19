@@ -147,7 +147,17 @@ impl BurrParams {
         let raw = ((layer_input_keys as f64) * (1.0 + overhead)).ceil() as usize;
         let raw = raw.max(usize::from(self.b)); // ≥ one block
         // Round UP to a multiple of b (so block_count = m / b is exact).
+        // `raw.div_ceil(b) * b` can wrap on extreme inputs in release builds,
+        // yielding a SMALLER `m` that violates the caller's invariant. Saturate
+        // to the largest multiple of `b` that fits in `usize` instead — the
+        // caller will then fail allocation explicitly via
+        // `ConstructionFailure::StorageLengthOverflow` rather than silently
+        // building an undersized filter.
         let b = usize::from(self.b);
-        raw.div_ceil(b) * b
+        let blocks = raw.div_ceil(b);
+        match blocks.checked_mul(b) {
+            Some(m) => m,
+            None => usize::MAX - (usize::MAX % b),
+        }
     }
 }

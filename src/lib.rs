@@ -26,7 +26,8 @@
 //! - **MVCC**: snapshot reads at a chosen `SeqNo`, custom `UserComparator`.
 //! - **Concurrency**: thread-safe `BTreeMap`-like API.
 //!
-//! Keys: up to 65 536 bytes. Values: up to 2³² bytes. Larger keys and values
+//! Keys: up to 65,535 bytes (`u16` length field). Values: up to 4,294,967,295
+//! bytes (`u32` length field, `2³² − 1`). Larger keys and values
 //! carry a proportional performance cost.
 //!
 //! ## Quick start

@@ -68,8 +68,8 @@ On-disk format version **V5**. V5 introduces a wire-format break for filter bloc
 
 ## Limits
 
-- Keys: up to 65 536 bytes.
-- Values: up to 2³² bytes.
+- Keys: up to 65,535 bytes (the on-disk encoding caps the key-length field at `u16`).
+- Values: up to 4,294,967,295 bytes (`2³² − 1`; the encoding caps the value-length field at `u32`).
 - Larger keys and values carry a proportional performance cost.
 
 ## Feature flags

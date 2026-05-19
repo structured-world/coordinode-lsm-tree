@@ -313,6 +313,40 @@ fn burr_negative_keys_obey_fpr_envelope_at_low_target() {
 }
 
 #[test]
+fn burr_negative_keys_obey_fpr_envelope_at_very_low_target() {
+    // Tightest FPR target documented in the issue acceptance criteria
+    // (0.0001). At r ≈ 14 the realised FPR over a 50k disjoint-probe
+    // sample should be well below the 1‰ ceiling we accept here.
+    let n = 5_000_usize;
+    let params = BurrParams::with_fp_rate(n, 0.0001).expect("params");
+    let builder = BurrBuilder::new(params, DefaultBuildHasher::default()).expect("builder");
+    let hashes: Vec<u64> = (0..n as u64)
+        .map(|i| crate::hash::hash64(&i.to_le_bytes()))
+        .collect();
+    let filter = builder.build_from_hashes(&hashes).expect("build");
+
+    let probe_count = 50_000_usize;
+    let mut false_positives = 0_usize;
+    for i in (n as u64)..(n as u64 + probe_count as u64) {
+        let h = crate::hash::hash64(&i.to_le_bytes());
+        if filter.contains_hash(h) {
+            false_positives += 1;
+        }
+    }
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "test code: precision loss acceptable in rate calculations"
+    )]
+    let fpr = false_positives as f64 / probe_count as f64;
+    // BuRR at FPR=0.0001 typically realises ≤ 0.05%. Allow 1‰ envelope
+    // (10× slack) so the test isn't a coin-flip on small probe samples.
+    assert!(
+        fpr < 0.001,
+        "realised FPR {fpr} > 0.1% envelope around 0.01% target",
+    );
+}
+
+#[test]
 fn burr_contains_in_matches_contains_with_external_scratch() {
     // The allocation-free probe path (contains_in with caller scratch)
     // must agree with the convenience contains for every key in the set.
@@ -654,6 +688,19 @@ fn contains_hash_from_bytes_round_trips_against_decoded() {
         assert_eq!(single, decoded, "single-pass and decoded disagree on {h}");
         assert!(single, "inserted hash {h} not present in single-pass probe");
     }
+
+    // Also check the absent-hash path: a mismatch on negative answers
+    // would still pass the loop above, so iterate a disjoint probe
+    // corpus and assert exact equality on every probe (true OR false).
+    for i in (n as u64)..(n as u64 + 2_000_u64) {
+        let h = crate::hash::hash64(&i.to_le_bytes());
+        let single = contains_hash_from_bytes(&bytes, h).expect("ok");
+        let decoded = reader.contains_hash(h);
+        assert_eq!(
+            single, decoded,
+            "single-pass and decoded disagree on absent hash {h}",
+        );
+    }
 }
 
 #[test]
@@ -768,8 +815,14 @@ fn contains_hash_from_bytes_rejects_corrupted_layer_payload() {
 #[test]
 fn contains_hash_from_bytes_returns_false_for_non_inserted() {
     // Smoke for the not-present branch — exercises the per-set-bit
-    // loop's normal exit path (where acc != fingerprint).
+    // loop's normal exit path (where acc != fingerprint). Also
+    // cross-validates the single-pass entry point against the decoded
+    // reader: `contains_hash_from_bytes` and
+    // `BurrFilterReader::contains_hash` are separate implementations,
+    // so a mismatch on the absent-path would silently pass an
+    // absent-only sanity check.
     use super::contains_hash_from_bytes;
+    use super::filter::BurrFilterReader;
     let n = 200_usize;
     let params = BurrParams::with_fp_rate(n, 0.001).expect("params");
     let builder = BurrBuilder::new(params, DefaultBuildHasher::default()).expect("builder");
@@ -778,11 +831,18 @@ fn contains_hash_from_bytes_returns_false_for_non_inserted() {
         .collect();
     let filter = builder.build_from_hashes(&hashes).expect("build");
     let bytes = filter.to_wire_bytes();
+    let reader = BurrFilterReader::new(&bytes).expect("decoder");
 
     let mut absent_count = 0_u32;
     for i in 10_000..11_000_u64 {
         let h = crate::hash::hash64(&i.to_le_bytes());
-        if !contains_hash_from_bytes(&bytes, h).expect("ok") {
+        let single = contains_hash_from_bytes(&bytes, h).expect("ok");
+        let decoded = reader.contains_hash(h);
+        assert_eq!(
+            single, decoded,
+            "single-pass and decoded disagree on absent hash {h}",
+        );
+        if !single {
             absent_count += 1;
         }
     }
