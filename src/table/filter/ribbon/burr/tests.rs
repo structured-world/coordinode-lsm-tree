@@ -94,6 +94,68 @@ fn burr_wire_format_round_trips() {
 }
 
 #[test]
+fn burr_build_from_hashes_and_contains_hash_round_trip() {
+    // The hash-based build + probe pair is what the LSM filter writer
+    // and reader use. Insert n xxh3-hashed u64s and verify
+    // contains_hash reports each as present.
+    let n = 500_usize;
+    let params = BurrParams::with_fp_rate(n, 0.01).expect("valid params");
+    let builder = BurrBuilder::new(params, DefaultBuildHasher::default()).expect("builder");
+
+    let hashes: Vec<u64> = (0..n as u64)
+        .map(|i| crate::hash::hash64(&i.to_le_bytes()))
+        .collect();
+    let filter = builder
+        .build_from_hashes(&hashes)
+        .expect("build_from_hashes");
+
+    for h in &hashes {
+        assert!(
+            filter.contains_hash(*h),
+            "inserted hash {h} reported absent",
+        );
+    }
+
+    // FPR sanity: probe disjoint non-key hashes, must be ≤ 5%.
+    let probe_count = 10_000_usize;
+    let mut false_positives = 0_usize;
+    for i in (n as u64)..(n as u64 + probe_count as u64) {
+        let h = crate::hash::hash64(&i.to_le_bytes());
+        if filter.contains_hash(h) {
+            false_positives += 1;
+        }
+    }
+    #[allow(clippy::cast_precision_loss)]
+    let fpr = false_positives as f64 / probe_count as f64;
+    assert!(fpr < 0.05, "realised FPR {fpr} too high");
+}
+
+#[test]
+fn burr_hash_build_wire_format_round_trips() {
+    // Build via build_from_hashes, serialize, decode via reader,
+    // contains_hash must match.
+    use super::filter::BurrFilterReader;
+
+    let n = 500_usize;
+    let params = BurrParams::with_fp_rate(n, 0.01).expect("valid params");
+    let builder = BurrBuilder::new(params, DefaultBuildHasher::default()).expect("builder");
+    let hashes: Vec<u64> = (0..n as u64)
+        .map(|i| crate::hash::hash64(&i.to_le_bytes()))
+        .collect();
+    let filter = builder.build_from_hashes(&hashes).expect("build");
+
+    let bytes = filter.to_wire_bytes();
+    let reader = BurrFilterReader::new(&bytes).expect("decode");
+
+    for h in &hashes {
+        assert!(
+            reader.contains_hash(*h),
+            "inserted hash {h} not found via wire-format reader",
+        );
+    }
+}
+
+#[test]
 fn burr_wire_rejects_bad_magic() {
     use super::filter::BurrFilterReader;
     let mut bytes = vec![0_u8; 32];

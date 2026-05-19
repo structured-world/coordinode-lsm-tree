@@ -2,7 +2,7 @@ use std::hash::{BuildHasher, Hash};
 
 use super::super::builder::Scratch;
 use super::super::filter::RibbonFilter;
-use super::super::hashing::standard_equation_w64;
+use super::super::hashing::{standard_equation_from_hash, standard_equation_w64};
 use super::super::params::{Mode, Params};
 use super::params::BurrParams;
 use super::threshold::is_bumped;
@@ -111,6 +111,71 @@ where
     pub fn contains<Q: Hash + ?Sized>(&self, key: &Q) -> bool {
         let mut scratch = self.new_scratch();
         self.contains_in(key, &mut scratch)
+    }
+
+    /// Probe with a pre-computed u64 hash (e.g. xxh3 output from
+    /// `crate::hash::hash64`). Equivalent to `contains` when the caller
+    /// has already hashed the key — avoids re-running the
+    /// `BuildHasher` on the hot path.
+    ///
+    /// MUST be paired with [`BurrBuilder::build_from_hashes`]: a filter
+    /// built via `build(keys)` (which hashes with `BuildHasher`) is NOT
+    /// queryable by `contains_hash(h)` unless `h` is the
+    /// `BuildHasher::hash_one(key)` value. The on-disk LSM filter
+    /// always uses the hash-based build + probe pair so the two stay
+    /// consistent.
+    pub fn contains_hash(&self, hash: u64) -> bool {
+        for layer in &self.layers {
+            let layer_params = match Params::new(
+                layer.m,
+                usize::from(self.params.w),
+                usize::from(self.params.r),
+                Mode::Standard,
+            ) {
+                Ok(p) => p.with_seed(layer.seed),
+                Err(_) => continue,
+            };
+
+            let stride = usize::from(self.params.r).div_ceil(64);
+            let mut fingerprint = vec![0_u64; stride];
+            let mut acc = vec![0_u64; stride];
+            let equation =
+                standard_equation_from_hash(hash, layer.seed, &layer_params, &mut fingerprint);
+
+            if is_bumped(&equation, &layer.thresholds, self.params.b) {
+                continue;
+            }
+
+            // Inline the same GF(2) XOR-reduce that
+            // `RibbonFilter::contains_in` does, but using our already-
+            // computed equation + fingerprint (no second equation
+            // compute). Z is borrowed via the public accessor on the
+            // vendored ribbon.
+            let z_words = layer.ribbon.z_raw_words();
+            let mut bumped_out_of_layer = false;
+            super::super::hashing::for_each_set_bit_u128_parts(
+                equation.coeff_lo,
+                equation.coeff_hi,
+                |offset| {
+                    if bumped_out_of_layer {
+                        return;
+                    }
+                    let row_index = equation.start + offset;
+                    if row_index < layer.m {
+                        let row_start = row_index * stride;
+                        let row = &z_words[row_start..row_start + stride];
+                        super::super::hashing::xor_words(&mut acc, row);
+                    } else {
+                        bumped_out_of_layer = true;
+                    }
+                },
+            );
+            if bumped_out_of_layer {
+                continue;
+            }
+            return acc == fingerprint;
+        }
+        false
     }
 
     /// Allocation-free probe using a caller-provided scratch.

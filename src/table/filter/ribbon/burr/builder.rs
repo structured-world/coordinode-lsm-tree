@@ -56,6 +56,107 @@ where
         Ok(Self { params, hasher })
     }
 
+    /// Build from pre-computed u64 key hashes (e.g. xxh3 outputs from
+    /// `crate::hash::hash64`). Bypasses `BuildHasher::hash_one` — the
+    /// `S` parameter is only used as the type slot for the eventual
+    /// `BurrFilter<S>` return value (which carries it for API
+    /// compatibility with the key-based `contains_in`); no key →
+    /// hash work happens here.
+    ///
+    /// This is the entry point the LSM filter writer uses: it has
+    /// already hashed every key with xxh3 for filter-block indexing
+    /// and pipes those u64s directly into BuRR.
+    pub fn build_from_hashes(&self, hashes: &[u64]) -> Result<BurrFilter<S>, BurrBuildError> {
+        let mut remaining: Vec<u64> = hashes.to_vec();
+        let mut layers: Vec<BurrLayer<S>> = Vec::with_capacity(usize::from(self.params.max_layers));
+
+        for layer_idx in 0..self.params.max_layers {
+            if remaining.is_empty() {
+                break;
+            }
+
+            let is_last_layer = layer_idx + 1 == self.params.max_layers;
+            let layer_seed = derive_layer_seed(self.params.seed, layer_idx);
+            let layer_input = remaining.len();
+
+            let m_target = self.params.layer_m(layer_input);
+            let m = if is_last_layer {
+                let doubled = m_target.saturating_mul(2);
+                doubled.max(usize::from(self.params.b) * 4)
+            } else {
+                m_target
+            };
+
+            let layer_w = usize::from(self.params.w);
+            let layer_r = usize::from(self.params.r);
+            let equation_params = Params::new(m, layer_w, layer_r, Mode::Standard)
+                .map_err(static_param_err)?
+                .with_seed(layer_seed);
+
+            // Compute equations directly from hashes — skip hash_one.
+            let stride = layer_r.div_ceil(64);
+            let mut fp_throwaway = vec![0_u64; stride];
+            let mut equations: Vec<StandardEquation> = Vec::with_capacity(remaining.len());
+            for hash in &remaining {
+                fp_throwaway.fill(0);
+                let eq = super::super::hashing::standard_equation_from_hash(
+                    *hash,
+                    layer_seed,
+                    &equation_params,
+                    &mut fp_throwaway,
+                );
+                equations.push(eq);
+            }
+
+            let thresholds = if is_last_layer {
+                let block_count = m.div_ceil(usize::from(self.params.b));
+                vec![self.params.b; block_count]
+            } else {
+                compute_thresholds(&equations, m, self.params.b)
+            };
+
+            let (kept, bumped) =
+                partition_keys_by_threshold(&remaining, &equations, &thresholds, self.params.b);
+
+            let ribbon_builder =
+                RibbonBuilder::new(equation_params, self.hasher.clone()).map_err(|e| {
+                    BurrBuildError::RibbonLayerFailed {
+                        layer_index: usize::from(layer_idx),
+                        ribbon_error: e,
+                    }
+                })?;
+
+            let ribbon = ribbon_builder
+                .build_with_seed_verbatim_from_hashes(&kept, layer_seed, m)
+                .map_err(|e| BurrBuildError::RibbonLayerFailed {
+                    layer_index: usize::from(layer_idx),
+                    ribbon_error: e,
+                })?;
+
+            layers.push(BurrLayer {
+                m,
+                seed: layer_seed,
+                thresholds,
+                ribbon,
+            });
+
+            remaining = bumped;
+        }
+
+        if !remaining.is_empty() {
+            return Err(BurrBuildError::LayerExhaustion {
+                layers_attempted: usize::from(self.params.max_layers),
+                remaining_keys: remaining.len(),
+            });
+        }
+
+        Ok(BurrFilter::from_layers(
+            self.params,
+            self.hasher.clone(),
+            layers,
+        ))
+    }
+
     pub fn build<K: Hash + Clone>(&self, keys: &[K]) -> Result<BurrFilter<S>, BurrBuildError> {
         let mut remaining: Vec<K> = keys.to_vec();
         let mut layers: Vec<BurrLayer<S>> = Vec::with_capacity(usize::from(self.params.max_layers));
