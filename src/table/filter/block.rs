@@ -14,6 +14,17 @@ impl FilterBlock {
     }
 
     pub fn maybe_contains_hash(&self, hash: u64) -> crate::Result<bool> {
+        // Empty payload is the "no filter installed" sentinel produced
+        // by build_burr_filter_bytes for empty key sets and by
+        // BurrFilter::to_wire_bytes for zero-layer filters. Probing
+        // such a buffer must report Ok(true) (permissive) so the
+        // caller falls through to the data block lookup; forwarding
+        // it to contains_hash_from_bytes would fail the magic check
+        // and surface InvalidHeader on every read of a filter-less
+        // partition.
+        if self.0.data.is_empty() {
+            return Ok(true);
+        }
         // Single-pass parse + probe — no per-call heap allocation. The
         // alternative `BurrFilterReader::new(bytes)?.contains_hash(hash)`
         // builds a `Vec<LayerView>` inside `wire::decode`; we are on
