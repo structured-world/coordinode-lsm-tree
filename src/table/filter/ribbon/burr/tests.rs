@@ -56,6 +56,54 @@ fn burr_fpr_at_one_percent_is_within_envelope() {
 }
 
 #[test]
+fn burr_wire_format_round_trips() {
+    // Build a BuRR, serialize to wire bytes, parse via
+    // BurrFilterReader, and verify contains_hash answers match
+    // BurrFilter::contains for every inserted key.
+    use super::filter::BurrFilterReader;
+    use std::hash::BuildHasher;
+
+    let n = 500_usize;
+    let params = BurrParams::with_fp_rate(n, 0.01).expect("valid params");
+    let hasher = DefaultBuildHasher::default();
+    let builder = BurrBuilder::new(params, hasher.clone()).expect("builder");
+    let keys: Vec<u64> = (0..n as u64).collect();
+    let filter = builder.build(&keys).expect("build");
+
+    let bytes = filter.to_wire_bytes();
+    assert!(bytes.len() > 20, "wire buffer too small ({})", bytes.len());
+
+    let reader = BurrFilterReader::new(&bytes).expect("parse");
+    assert_eq!(
+        reader.layer_count(),
+        filter.layer_count(),
+        "decoded layer count must match",
+    );
+
+    // The reader's contains_hash takes a pre-computed u64. We must
+    // use the SAME hasher state the BurrFilter was built with so the
+    // base_hash matches. BuildHasher::hash_one is the convention used
+    // by both sides.
+    for key in &keys {
+        let h = hasher.hash_one(key);
+        assert!(
+            reader.contains_hash(h),
+            "inserted key {key} not found in decoded reader (hash {h})",
+        );
+    }
+}
+
+#[test]
+fn burr_wire_rejects_bad_magic() {
+    use super::filter::BurrFilterReader;
+    let mut bytes = vec![0_u8; 32];
+    bytes[0] = 0xDE;
+    bytes[1] = 0xAD;
+    let result = BurrFilterReader::new(&bytes);
+    assert!(result.is_err(), "bad magic should fail decode");
+}
+
+#[test]
 fn burr_settles_in_few_layers() {
     let n = 5_000_usize;
     let params = BurrParams::with_fp_rate(n, 0.01).expect("valid params");

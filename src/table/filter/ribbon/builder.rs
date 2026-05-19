@@ -53,6 +53,31 @@ where
         &self.build_hasher
     }
 
+    /// Build a Ribbon filter using a CALLER-PROVIDED seed verbatim — no
+    /// `derive_attempt_seed` mixing on top. This is the entry point BuRR
+    /// uses to keep the threshold-decision seed and the actual
+    /// construction seed identical, so the per-block bump decisions made
+    /// from precomputed equations agree with the equations the ribbon
+    /// stores for its kept keys.
+    ///
+    /// No retry budget: a single attempt with the given seed. Caller is
+    /// responsible for sizing `m` (via `Params::m`) generously enough that
+    /// the banded solver succeeds with the keys provided.
+    pub(crate) fn build_with_seed_verbatim<K: std::hash::Hash>(
+        &self,
+        keys: &[K],
+        seed: u64,
+        m: usize,
+    ) -> Result<RibbonFilter<S>, BuildError> {
+        self.params.validate().map_err(BuildError::InvalidParams)?;
+        self.build_once(keys, m, seed)
+            .map_err(|failure| BuildError::ConstructionFailed {
+                final_m: m,
+                attempts: 1,
+                last_failure: failure,
+            })
+    }
+
     pub fn build<K: std::hash::Hash>(&self, keys: &[K]) -> Result<RibbonFilter<S>, BuildError> {
         self.params.validate().map_err(BuildError::InvalidParams)?;
 

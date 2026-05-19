@@ -84,6 +84,16 @@ where
         &self.z.as_raw_slice()[start..end]
     }
 
+    /// Borrowed access to the raw solution-matrix words.
+    ///
+    /// Length is `m * stride_words`. Each chunk of `stride_words` u64s
+    /// is one row's fingerprint bits in LSB-first order. Used by the
+    /// BuRR wire-format serializer to write the matrix without going
+    /// through the `bitvec` Lsb0 abstraction.
+    pub(crate) fn z_raw_words(&self) -> &[u64] {
+        self.z.as_raw_slice()
+    }
+
     #[cfg(feature = "ribbon-serde")]
     pub fn to_repr(&self) -> RibbonFilterRepr {
         RibbonFilterRepr {

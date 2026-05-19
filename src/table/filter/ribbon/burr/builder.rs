@@ -106,31 +106,34 @@ where
             let (kept, bumped) =
                 partition_keys_by_threshold(&remaining, &equations, &thresholds, self.params.b);
 
-            // (4) Build Ribbon for kept. Use a generous retry budget on
-            // the last layer; non-last layers should rarely need retries
-            // thanks to the threshold cap.
-            let ribbon_params = equation_params
-                .with_retry_policy(
-                    if is_last_layer { 8 } else { 3 },
-                    if is_last_layer { 4 } else { 0 },
-                )
-                .map_err(static_param_err)?;
-
+            // (4) Build Ribbon for kept. Use `build_with_seed_verbatim`
+            // so the construction seed matches `layer_seed` exactly —
+            // otherwise the vendored `RibbonBuilder.build` would mix it
+            // through `derive_attempt_seed`, which would make the
+            // ribbon's internal `start` values disagree with the start
+            // values we used for threshold decisions (= correctness bug
+            // surfaced as wire-format probe misses).
+            //
+            // No retry budget: the threshold scheme caps per-block load
+            // at ~90%, so single-attempt construction succeeds in
+            // practice. If it doesn't (parameter mistuning), the
+            // resulting `RibbonLayerFailed` is the diagnostic — we
+            // don't silently retry with a different seed because that
+            // would invalidate the thresholds we just computed.
             let ribbon_builder =
-                RibbonBuilder::new(ribbon_params, self.hasher.clone()).map_err(|e| {
+                RibbonBuilder::new(equation_params, self.hasher.clone()).map_err(|e| {
                     BurrBuildError::RibbonLayerFailed {
                         layer_index: usize::from(layer_idx),
                         ribbon_error: e,
                     }
                 })?;
 
-            let ribbon =
-                ribbon_builder
-                    .build(&kept)
-                    .map_err(|e| BurrBuildError::RibbonLayerFailed {
-                        layer_index: usize::from(layer_idx),
-                        ribbon_error: e,
-                    })?;
+            let ribbon = ribbon_builder
+                .build_with_seed_verbatim(&kept, layer_seed, m)
+                .map_err(|e| BurrBuildError::RibbonLayerFailed {
+                    layer_index: usize::from(layer_idx),
+                    ribbon_error: e,
+                })?;
 
             layers.push(BurrLayer {
                 m,

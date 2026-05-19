@@ -75,6 +75,21 @@ where
         self.layers.len()
     }
 
+    /// Borrowed access to the underlying layer descriptors. Used by the
+    /// wire-format encoder; `pub(crate)` so it doesn't leak into the
+    /// public API.
+    #[must_use]
+    pub(crate) fn layers_inner(&self) -> &[BurrLayer<S>] {
+        &self.layers
+    }
+
+    /// Serialize this filter into the BuRR wire format. The result can
+    /// be later parsed by [`BurrFilterReader::new`].
+    #[must_use]
+    pub fn to_wire_bytes(&self) -> Vec<u8> {
+        super::wire::encode(self)
+    }
+
     /// Returns the parameters this filter was built with.
     #[must_use]
     pub fn params(&self) -> BurrParams {
@@ -171,34 +186,34 @@ impl<S> core::fmt::Debug for BurrFilter<S> {
 ///
 /// This is the type the LSM filter framework consumes: it owns a borrowed
 /// slice of the on-disk filter block, parses the BuRR header, and answers
-/// `contains_hash` lookups. The wire format is documented in
-/// `super::mod` and is intentionally NOT identical to the vendored
+/// `contains_hash` lookups. Wire format documented in
+/// [`super::wire`] — intentionally distinct from the vendored
 /// `ribbon-serde` repr (that one is for in-memory snapshots).
-///
-/// Implementation TODO (next task in the BuRR rollout): wire-format
-/// encode/decode. The Reader type is declared here so `mod.rs` can re-
-/// export it; the body is filled in by the next commit in this branch.
 pub struct BurrFilterReader<'a> {
-    _bytes: &'a [u8],
+    decoded: super::wire::DecodedFilter<'a>,
 }
 
 impl<'a> BurrFilterReader<'a> {
-    /// Parse a serialized BuRR filter. Returns an error if the buffer is
-    /// truncated or the header bytes are unrecognised.
-    ///
-    /// TODO: implement wire format in the next commit (task #16).
+    /// Parse a serialized BuRR filter slice. Returns an error if the
+    /// magic bytes don't match, the version is unrecognised, or the
+    /// buffer is truncated.
     pub fn new(bytes: &'a [u8]) -> crate::Result<Self> {
-        Ok(Self { _bytes: bytes })
+        let decoded = super::wire::decode(bytes)?;
+        Ok(Self { decoded })
     }
 
-    /// Probe path consumed by the LSM filter framework's `block::FilterBlock`.
-    ///
-    /// TODO: implement once the wire-format decode is in place.
+    /// Number of layers in the decoded filter.
     #[must_use]
-    pub fn contains_hash(&self, _hash: u64) -> bool {
-        // Conservative placeholder: returning `true` is safe (it means
-        // "may be present", which falls back to the actual block lookup).
-        // Returning false would be a correctness bug (false negative).
-        true
+    pub fn layer_count(&self) -> usize {
+        self.decoded.layers.len()
+    }
+
+    /// Probe with a pre-computed key hash. Used by the LSM filter
+    /// framework's `block::FilterBlock` — the table read path already
+    /// computes a u64 hash for block indexing, and the filter consumes
+    /// that same hash directly (no re-hash via `BuildHasher`).
+    #[must_use]
+    pub fn contains_hash(&self, hash: u64) -> bool {
+        super::wire::contains_hash(&self.decoded, hash)
     }
 }

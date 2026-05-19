@@ -24,6 +24,37 @@
 //      (`coordinode-ribbon` or similar) bundling Standard + Homogeneous +
 //      BuRR variants and publish to crates.io.
 
+// Vendored upstream code follows its own lint conventions; the in-tree
+// copy keeps them so a future extraction back into a standalone crate
+// produces a clean diff against the upstream. The BuRR submodule
+// (`super::ribbon::burr`) does NOT inherit these allows — it's first-
+// class crate code and follows the host crate's lint policy.
+#![allow(
+    clippy::indexing_slicing,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss,
+    clippy::cast_possible_wrap,
+    clippy::cast_lossless,
+    clippy::doc_markdown,
+    clippy::unreadable_literal,
+    clippy::too_many_lines,
+    clippy::redundant_pub_crate,
+    clippy::missing_panics_doc,
+    clippy::missing_errors_doc,
+    clippy::module_name_repetitions,
+    clippy::missing_const_for_fn,
+    clippy::must_use_candidate,
+    clippy::return_self_not_must_use,
+    clippy::manual_range_contains,
+    clippy::use_self,
+    clippy::elidable_lifetime_names,
+    clippy::missing_fields_in_debug,
+    clippy::expect_used,
+    clippy::unwrap_used,
+    missing_docs
+)]
+
 //! Ribbon filter (static approximate-membership filter over GF(2)).
 //!
 //! Guarantees in the currently-vendored modes (`w <= 64`):

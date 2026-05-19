@@ -77,6 +77,21 @@ pub(crate) fn standard_equation_w64<S: BuildHasher, Q: Hash + ?Sized>(
     fingerprint: &mut [u64],
 ) -> StandardEquation {
     let base_hash = build_hasher.hash_one(key);
+    standard_equation_from_hash(base_hash, seed, params, fingerprint)
+}
+
+/// Compute the equation directly from a pre-computed key hash.
+///
+/// This is the inner loop of [`standard_equation_w64`], factored out so
+/// the BuRR wire-format probe path (which consumes pre-hashed inputs from
+/// the LSM filter framework) can skip the `build_hasher.hash_one(key)`
+/// step entirely.
+pub(crate) fn standard_equation_from_hash(
+    base_hash: u64,
+    seed: u64,
+    params: &Params,
+    fingerprint: &mut [u64],
+) -> StandardEquation {
     let stream_seed = (base_hash ^ seed).wrapping_mul(MIX_CONST);
     let mut stream = SplitMix64::new(stream_seed);
 
