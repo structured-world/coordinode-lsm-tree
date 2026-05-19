@@ -45,20 +45,18 @@ impl ParsedItem<KeyedBlockHandle> for IndexBlockParsedItem {
             let rest_key = unsafe { bytes.get_unchecked(self.end_key.0..self.end_key.1) };
             compare_prefixed_slice(prefix, rest_key, needle, cmp)
         } else {
+            // No allocation to avoid for a contiguous key — `compare()` is
+            // already optimal for any comparator here. The lex fast path is
+            // kept only on the prefix branch above (where
+            // `compare_prefixed_slice_lexicographic` avoids the prefix+suffix
+            // concatenation) and at the binary-search predicate construction
+            // sites in `iter.rs` (where one `is_lexicographic()` is hoisted
+            // to amortise across all BS probes). An extra `is_lexicographic()`
+            // call per linear-scan step would cost custom comparators a
+            // second vtable dispatch without any matching saving on the
+            // default path.
             let key = unsafe { bytes.get_unchecked(self.end_key.0..self.end_key.1) };
-            // Lex fast path: avoid the `dyn UserComparator::compare` vtable
-            // on the linear-scan and trim paths that iterate parsed items
-            // (e.g. `advance_while`, `trim_back_to_upper_bound`, and the
-            // linear-scan loops in `iter.rs`). The binary-search predicates
-            // themselves are devirtualized independently at their construction
-            // sites in `iter.rs` and never reach `compare_key`. The prefix
-            // branch above already short-circuits through
-            // `compare_prefixed_slice_lexicographic`.
-            if cmp.is_lexicographic() {
-                key.cmp(needle)
-            } else {
-                cmp.compare(key, needle)
-            }
+            cmp.compare(key, needle)
         }
     }
 
@@ -326,16 +324,17 @@ mod tests {
             /// successfully bypasses the `dyn UserComparator::compare` vtable.
             count: Arc<AtomicUsize>,
             /// Counts `is_lexicographic()` invocations. Sanity counter:
-            /// asserts the comparator was consulted at all, guarding the
-            /// false-negative where `count == 0` trivially because no
-            /// comparator-touching code ran (empty block, early bail-out).
+            /// asserts the BS predicate factory in iter.rs actually
+            /// consulted `is_lexicographic()` to pick a closure.
             ///
-            /// NOTE: `is_lex_count > 0` does NOT prove the BS predicate
-            /// factory selected the lex branch — the no-prefix `compare_key`
-            /// in `index_block/mod.rs` also calls `is_lexicographic()` per
-            /// item, so this counter can be incremented from either source.
-            /// The TRUE proof that the lex BS predicate ran is `count == 0`
-            /// (no `compare()` vtable invocations).
+            /// After the review-driven revert of the `compare_key`
+            /// no-prefix lex fast path, the only `is_lex` call site touched
+            /// by these tests is the BS predicate factory itself (one call
+            /// per seek entry point, hoisted out of the BS loop). So
+            /// `is_lex_count > 0` reliably proves the factory ran. The
+            /// TRUE proof that it selected the lex closure is
+            /// `count <= LEX_PATH_LINEAR_SCAN_BOUND` (a dyn closure would
+            /// produce >= `DYN_MIN_BS_PROBES` from BS probes alone).
             is_lex_count: Arc<AtomicUsize>,
             lex: bool,
         }
@@ -414,11 +413,24 @@ mod tests {
             v
         }
 
+        /// Upper bound on `compare()` calls a lex-path index seek can produce
+        /// from non-BS sources. With `restart_interval == 1`, the index-block
+        /// `advance_while` / `trim_back_to_upper_bound` linear branches are
+        /// bypassed entirely, so this bound is effectively 0 — but we allow
+        /// a small slack for any auxiliary lookups the iterator may perform.
+        const LEX_PATH_LINEAR_SCAN_BOUND: usize = 2;
+
         #[test]
         fn index_block_seek_lex_path_skips_vtable() {
             // Both devirtualized entry points (seek, seek_upper) must route
             // through static-dispatch closures when is_lexicographic() == true.
             // Per-entry-point snapshot localises any regression.
+            // Above-max needle (paired with restart_interval=1) bounds the
+            // post-BS contribution to <= LEX_PATH_LINEAR_SCAN_BOUND across
+            // both public `seek` / `seek_upper` and the pub(crate)
+            // `seek_upper_bound_cursor` path. A regression where any of
+            // these BS predicates fell back to the dyn closure would produce
+            // >= DYN_MIN_BS_PROBES (= 7) calls — well above the bound.
             let index_block = build_index_block_bs_dominated();
             let count = Arc::new(AtomicUsize::new(0));
             let is_lex_count = Arc::new(AtomicUsize::new(0));
@@ -427,7 +439,7 @@ mod tests {
                 is_lex_count: is_lex_count.clone(),
                 lex: true,
             });
-            let needle = 64_u64.to_be_bytes();
+            let needle = above_max_needle();
 
             let before = count.load(AtomicOrdering::Relaxed);
             let before_lex = is_lex_count.load(AtomicOrdering::Relaxed);
@@ -437,11 +449,10 @@ mod tests {
             }
             let after_seek = count.load(AtomicOrdering::Relaxed);
             let after_seek_lex = is_lex_count.load(AtomicOrdering::Relaxed);
-            assert_eq!(
-                after_seek - before,
-                0,
-                "index seek lex path leaked into dyn: {} compare() calls",
-                after_seek - before,
+            let seek_delta = after_seek - before;
+            assert!(
+                seek_delta <= LEX_PATH_LINEAR_SCAN_BOUND,
+                "index seek lex path leaked into dyn BS: {seek_delta} compare() calls (expected <= {LEX_PATH_LINEAR_SCAN_BOUND})",
             );
             assert!(
                 after_seek_lex - before_lex >= 1,
@@ -450,21 +461,42 @@ mod tests {
             );
 
             {
-                let mut iter = index_block.iter(cmp);
+                let mut iter = index_block.iter(cmp.clone());
                 let _ = iter.seek_upper(&needle, crate::SeqNo::MAX);
             }
             let after_upper = count.load(AtomicOrdering::Relaxed);
             let after_upper_lex = is_lex_count.load(AtomicOrdering::Relaxed);
-            assert_eq!(
-                after_upper - after_seek,
-                0,
-                "index seek_upper lex path leaked into dyn: {} compare() calls",
-                after_upper - after_seek,
+            let upper_delta = after_upper - after_seek;
+            assert!(
+                upper_delta <= LEX_PATH_LINEAR_SCAN_BOUND,
+                "index seek_upper lex path leaked into dyn BS: {upper_delta} compare() calls (expected <= {LEX_PATH_LINEAR_SCAN_BOUND})",
             );
             assert!(
                 after_upper_lex - after_seek_lex >= 1,
                 "index seek_upper lex path must consult is_lexicographic(), got {} calls",
                 after_upper_lex - after_seek_lex,
+            );
+
+            // seek_upper_bound_cursor takes the OTHER branch inside
+            // seek_upper_impl at restart_interval == 1 (`check_back_cache=false`,
+            // predicate `<=` instead of `<`). The public seek_upper above only
+            // exercises check_back_cache=true; this call covers the forward-limit
+            // path used by block-index upper-bound cursors.
+            {
+                let mut iter = index_block.iter(cmp);
+                let _ = iter.seek_upper_bound_cursor(&needle, crate::SeqNo::MAX);
+            }
+            let after_cursor = count.load(AtomicOrdering::Relaxed);
+            let after_cursor_lex = is_lex_count.load(AtomicOrdering::Relaxed);
+            let cursor_delta = after_cursor - after_upper;
+            assert!(
+                cursor_delta <= LEX_PATH_LINEAR_SCAN_BOUND,
+                "index seek_upper_bound_cursor lex path leaked into dyn BS: {cursor_delta} compare() calls (expected <= {LEX_PATH_LINEAR_SCAN_BOUND})",
+            );
+            assert!(
+                after_cursor_lex - after_upper_lex >= 1,
+                "index seek_upper_bound_cursor lex path must consult is_lexicographic(), got {} calls",
+                after_cursor_lex - after_upper_lex,
             );
         }
 
@@ -519,6 +551,40 @@ mod tests {
         }
 
         #[test]
+        fn index_block_seek_upper_bound_cursor_dyn_path_invokes_compare() {
+            // The `check_back_cache == false` branch in `seek_upper_impl`
+            // uses a DIFFERENT BS predicate (`<= needle` instead of `< needle`
+            // at restart_interval == 1) than the public seek_upper. Reached
+            // only via this pub(crate) entry point — public seek_upper
+            // doesn't cover it. Verify the dyn closure for THIS predicate
+            // also invokes compare().
+            let index_block = build_index_block_bs_dominated();
+            let count = Arc::new(AtomicUsize::new(0));
+            let cmp: Arc<dyn UserComparator> = Arc::new(CountingComparator {
+                count: count.clone(),
+                is_lex_count: Arc::new(AtomicUsize::new(0)),
+                lex: false,
+            });
+            let needle = above_max_needle();
+
+            let before = count.load(AtomicOrdering::Relaxed);
+            {
+                let mut iter = index_block.iter(cmp);
+                let _ = iter.seek_upper_bound_cursor(&needle, crate::SeqNo::MAX);
+            }
+            let delta = count.load(AtomicOrdering::Relaxed) - before;
+            assert!(
+                delta >= DYN_MIN_BS_PROBES,
+                "index seek_upper_bound_cursor dyn BS must call compare() at least {DYN_MIN_BS_PROBES} times, \
+                 got {delta} — lex closure leaked into dyn BS of the check_back_cache=false predicate?",
+            );
+        }
+
+        #[test]
+        #[expect(
+            clippy::too_many_lines,
+            reason = "exhaustive equivalence matrix: 6 boundary needles × 3 entry points × (call + assert + landing-read + assert) is the actual coverage surface this test is meant to provide"
+        )]
         fn index_block_seek_lex_and_dyn_agree_on_landing_position() {
             use crate::Checksum;
             use crate::table::block::{BlockType, Header};
@@ -615,7 +681,7 @@ mod tests {
                 );
 
                 // seek_upper (reverse upper-bound — exercises seek_upper_impl
-                // which has different `<` vs `<=` predicate logic at
+                // with check_back_cache=true, strict-`<` predicate at
                 // restart_interval == 1).
                 let mut lex_iter = index_block.iter(lex.clone());
                 let lex_upper = lex_iter.seek_upper(needle, crate::SeqNo::MAX);
@@ -635,6 +701,35 @@ mod tests {
                     lex_upper_landing.as_ref().map(|s| s.as_ref().to_vec()),
                     dyn_upper_landing.as_ref().map(|s| s.as_ref().to_vec()),
                     "index seek_upper landing must match for needle {label} ({needle:?})",
+                );
+
+                // seek_upper_bound_cursor — same seek_upper_impl but with
+                // check_back_cache=false, which selects a `<=` predicate at
+                // restart_interval == 1 instead of `<`. A wrong operator in
+                // the lex closure of THIS branch would not be caught by the
+                // public seek_upper test above.
+                let mut lex_iter = index_block.iter(lex.clone());
+                let lex_cursor = lex_iter
+                    .seek_upper_bound_cursor(needle, crate::SeqNo::MAX)
+                    .unwrap();
+                let mut dyn_iter = index_block.iter(dyn_cmp.clone());
+                let dyn_cursor = dyn_iter
+                    .seek_upper_bound_cursor(needle, crate::SeqNo::MAX)
+                    .unwrap();
+                assert_eq!(
+                    lex_cursor, dyn_cursor,
+                    "index seek_upper_bound_cursor result must match for needle {label} ({needle:?})",
+                );
+                let lex_cursor_landing = lex_iter
+                    .next_back()
+                    .map(|h| h.materialize(index_block.as_slice()).end_key().clone());
+                let dyn_cursor_landing = dyn_iter
+                    .next_back()
+                    .map(|h| h.materialize(index_block.as_slice()).end_key().clone());
+                assert_eq!(
+                    lex_cursor_landing.as_ref().map(|s| s.as_ref().to_vec()),
+                    dyn_cursor_landing.as_ref().map(|s| s.as_ref().to_vec()),
+                    "index seek_upper_bound_cursor landing must match for needle {label} ({needle:?})",
                 );
             }
         }

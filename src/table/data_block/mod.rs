@@ -334,20 +334,20 @@ impl ParsedItem<InternalValue> for DataBlockParsedItem {
             let rest_key = unsafe { bytes.get_unchecked(self.key.0..self.key.1) };
             compare_prefixed_slice(prefix, rest_key, needle, cmp)
         } else {
+            // The no-prefix branch has no allocation to avoid — `compare()` on
+            // a contiguous slice is already optimal for any comparator. Adding
+            // an `is_lexicographic()` short-circuit here costs custom
+            // comparators an extra `dyn` vtable call per linear-scan step
+            // without any matching saving on the default path (where `<[u8]>::cmp`
+            // and `DefaultUserComparator::compare` lower to the same memcmp).
+            // The lex fast path is intentionally kept ONLY on the prefix branch
+            // above (where `compare_prefixed_slice_lexicographic` avoids the
+            // prefix+suffix concatenation allocation) and at the binary-search
+            // predicate construction sites in `iter.rs` (where one
+            // `is_lexicographic()` call is hoisted to amortise across all
+            // O(log restarts) BS probes).
             let key = unsafe { bytes.get_unchecked(self.key.0..self.key.1) };
-            // Lex fast path mirrors the prefix branch (which already
-            // short-circuits through `compare_prefixed_slice_lexicographic`):
-            // skip the `dyn UserComparator::compare` vtable call when the
-            // default comparator is in use. This branch is on the linear-scan
-            // and trim paths (e.g. `advance_while`, `trim_back_to_upper_bound`,
-            // and the linear-scan loops in `iter.rs`) — the binary-search
-            // predicates themselves are devirtualized independently at their
-            // construction sites in `iter.rs` and never reach `compare_key`.
-            if cmp.is_lexicographic() {
-                key.cmp(needle)
-            } else {
-                cmp.compare(key, needle)
-            }
+            cmp.compare(key, needle)
         }
     }
 

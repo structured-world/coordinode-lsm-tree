@@ -1456,20 +1456,26 @@ mod tests {
             /// Counts `compare()` invocations — proves the lex devirt path
             /// successfully bypasses the `dyn UserComparator::compare` vtable.
             count: Arc<AtomicUsize>,
-            /// Counts `is_lexicographic()` invocations. This is a sanity
-            /// counter — it asserts the comparator was actually consulted,
-            /// guarding against the false-negative where `count == 0`
-            /// trivially because the seek never reached any branch that
-            /// touches the comparator (empty block, early bail-out, etc.).
+            /// Counts `is_lexicographic()` invocations. Sanity counter that
+            /// asserts the BS predicate factories in `iter.rs` actually
+            /// consulted `is_lexicographic()` to select a closure — guards
+            /// the false-negative where the lex test's `count <=
+            /// LEX_PATH_LINEAR_SCAN_BOUND` assertion passes trivially
+            /// because no seeks ran at all.
             ///
-            /// NOTE: `is_lex_count > 0` does NOT prove the BS predicate
-            /// factory took the lex branch — the no-prefix `compare_key`
-            /// fast path in `data_block/mod.rs` ALSO calls
-            /// `is_lexicographic()` once per linear-scan step, so this
-            /// counter can be incremented by either source. The TRUE proof
-            /// that the lex BS predicate ran is `count == 0` (no
-            /// `compare()` vtable invocations — a regression that selected
-            /// the dyn branch would call `compare()` and increment `count`).
+            /// After the review-driven revert of the `compare_key`
+            /// no-prefix lex fast path, the ONLY remaining `is_lex` call
+            /// sites are:
+            ///   - BS predicate construction sites in iter.rs (one call per
+            ///     seek entry point, hoisted out of the BS loop)
+            ///   - `compare_prefixed_slice` in util.rs (per-item, prefix
+            ///     branch only — not exercised by our tests' simple keys)
+            ///
+            /// So `is_lex_count > 0` reliably indicates a BS predicate
+            /// factory ran. The TRUE proof that it selected the LEX
+            /// closure is `count <= LEX_PATH_LINEAR_SCAN_BOUND` (a dyn
+            /// closure would produce >= `DYN_MIN_BS_PROBES` calls from BS
+            /// probes alone).
             is_lex_count: Arc<AtomicUsize>,
             lex: bool,
         }
@@ -1496,8 +1502,12 @@ mod tests {
         ///     IS an item, so the scan either returns immediately or steps once)
         ///
         /// Discrimination math (paired with an above-max needle that bounds
-        /// the reverse linear-scan contribution to exactly 1 `compare_key`
-        /// call — see [`above_max_needle`]):
+        /// the linear-scan contribution to <= 1 `compare_key` call — see
+        /// [`above_max_needle`]). Note: after a review-driven revert, the
+        /// no-prefix `compare_key` branch in `data_block/mod.rs` no longer
+        /// has a lex fast path, so each linear-scan step calls
+        /// `cmp.compare()` regardless of `is_lexicographic()`. This makes
+        /// the discrimination explicit:
         ///   - dyn path working correctly: 7 (BS) + 1 (scan) = 8
         ///   - lex closure leaked into dyn BS: 0 (BS) + 1 (scan) = 1
         ///
@@ -1553,13 +1563,26 @@ mod tests {
             v
         }
 
+        /// Upper bound on `compare()` calls a lex-path seek can produce from
+        /// the LINEAR-SCAN `compare_key` calls alone (BS predicate makes 0
+        /// calls when lex closure is correctly selected). With above-max
+        /// needle on a 128-key block (`restart_interval=1`), each entry point's
+        /// linear scan visits exactly 1 item before returning. A regression
+        /// where BS fell back to the dyn closure would produce
+        /// `>= DYN_MIN_BS_PROBES` (= 7) calls — far above this bound.
+        const LEX_PATH_LINEAR_SCAN_BOUND: usize = 2;
+
         #[test]
         fn data_block_seek_lex_path_skips_vtable() -> crate::Result<()> {
-            // is_lexicographic() == true must route ALL 3 devirtualized entry
-            // points through the static-dispatch closures. Snapshotting count
-            // per-entry-point (instead of a single end-of-test check) localises
-            // a regression to the offending entry point and catches the case
-            // where only one closure accidentally falls back to the dyn path.
+            // is_lexicographic() == true must route ALL 3 devirtualized BS
+            // predicates through the static-dispatch closures. Per-entry-point
+            // snapshot localises a regression to the offending entry point.
+            //
+            // Above-max needle bounds each entry point's linear-scan compare_key
+            // contribution to <= 1 call. A working lex path produces
+            // count <= LEX_PATH_LINEAR_SCAN_BOUND; a regression where the dyn
+            // closure leaked into the BS predicate would produce
+            // >= DYN_MIN_BS_PROBES (= 7) calls — orders-of-magnitude separation.
             let data_block = build_block_bs_dominated()?;
             let count = Arc::new(AtomicUsize::new(0));
             let is_lex_count = Arc::new(AtomicUsize::new(0));
@@ -1568,7 +1591,7 @@ mod tests {
                 is_lex_count: is_lex_count.clone(),
                 lex: true,
             });
-            let needle = 64_u64.to_be_bytes();
+            let needle = above_max_needle();
 
             let before = count.load(AtomicOrdering::Relaxed);
             let before_lex = is_lex_count.load(AtomicOrdering::Relaxed);
@@ -1578,11 +1601,10 @@ mod tests {
             }
             let after_seek = count.load(AtomicOrdering::Relaxed);
             let after_seek_lex = is_lex_count.load(AtomicOrdering::Relaxed);
-            assert_eq!(
-                after_seek - before,
-                0,
-                "seek (forward seqno-aware) lex path leaked into dyn: {} compare() calls",
-                after_seek - before,
+            let seek_delta = after_seek - before;
+            assert!(
+                seek_delta <= LEX_PATH_LINEAR_SCAN_BOUND,
+                "seek (forward seqno-aware) lex path leaked into dyn BS: {seek_delta} compare() calls (expected <= {LEX_PATH_LINEAR_SCAN_BOUND}, only linear-scan contribution)",
             );
             assert!(
                 after_seek_lex - before_lex >= 1,
@@ -1596,11 +1618,10 @@ mod tests {
             }
             let after_upper = count.load(AtomicOrdering::Relaxed);
             let after_upper_lex = is_lex_count.load(AtomicOrdering::Relaxed);
-            assert_eq!(
-                after_upper - after_seek,
-                0,
-                "seek_upper lex path leaked into dyn: {} compare() calls",
-                after_upper - after_seek,
+            let upper_delta = after_upper - after_seek;
+            assert!(
+                upper_delta <= LEX_PATH_LINEAR_SCAN_BOUND,
+                "seek_upper lex path leaked into dyn BS: {upper_delta} compare() calls (expected <= {LEX_PATH_LINEAR_SCAN_BOUND})",
             );
             assert!(
                 after_upper_lex - after_seek_lex >= 1,
@@ -1614,11 +1635,10 @@ mod tests {
             }
             let after_excl = count.load(AtomicOrdering::Relaxed);
             let after_excl_lex = is_lex_count.load(AtomicOrdering::Relaxed);
-            assert_eq!(
-                after_excl - after_upper,
-                0,
-                "seek_upper_exclusive lex path leaked into dyn: {} compare() calls",
-                after_excl - after_upper,
+            let excl_delta = after_excl - after_upper;
+            assert!(
+                excl_delta <= LEX_PATH_LINEAR_SCAN_BOUND,
+                "seek_upper_exclusive lex path leaked into dyn BS: {excl_delta} compare() calls (expected <= {LEX_PATH_LINEAR_SCAN_BOUND})",
             );
             assert!(
                 after_excl_lex - after_upper_lex >= 1,
@@ -1850,16 +1870,21 @@ mod tests {
                     "seek_upper landing must match for needle {label} ({needle:?})",
                 );
 
-                // seek_upper_exclusive (reverse, exclusive — last key < needle)
+                // seek_upper_exclusive (reverse, exclusive — last key < needle).
+                // The method positions the REVERSE cursor (its internal loop
+                // uses peek_back/next_back), so the landed item must be read
+                // via next_back() — calling next() would observe the unchanged
+                // FORWARD cursor and miss a wrong-operator regression in the
+                // lex closure of this entry point.
                 let mut lex_iter = data_block.iter(lex.clone());
                 let lex_excl = lex_iter.seek_upper_exclusive(needle, SeqNo::MAX);
                 let lex_excl_landing = lex_iter
-                    .next()
+                    .next_back()
                     .map(|e| e.materialize(data_block.as_slice()).key.user_key);
                 let mut dyn_iter = data_block.iter(dyn_cmp.clone());
                 let dyn_excl = dyn_iter.seek_upper_exclusive(needle, SeqNo::MAX);
                 let dyn_excl_landing = dyn_iter
-                    .next()
+                    .next_back()
                     .map(|e| e.materialize(data_block.as_slice()).key.user_key);
                 assert_eq!(
                     lex_excl, dyn_excl,
