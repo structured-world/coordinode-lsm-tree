@@ -18,7 +18,8 @@
 //!   per-table and per-level policy.
 //! - **Encryption at rest**: AES-256-GCM block encryption with a caller-supplied
 //!   key.
-//! - **Range tombstones**: `delete_range` / `delete_prefix` with V4 disk format.
+//! - **Range tombstones**: `delete_range` / `delete_prefix` (encoded on disk via
+//!   the V5 format introduced for the `BuRR` filter).
 //! - **Merge operators**: commutative-merge LSM operations with lazy resolution.
 //! - **K/V separation (`BlobTree`)**: large-value workloads with automatic GC.
 //! - **Pluggable `Fs`**: standard, in-memory, `io_uring`, or custom backends.

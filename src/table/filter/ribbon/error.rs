@@ -181,14 +181,14 @@ mod tests {
     fn param_error_display_covers_every_variant() {
         // Each variant must have an actionable Display message — no
         // bare debug formatting, no missing context.
-        assert!(ParamError::ZeroN.to_string().contains("n"));
-        assert!(ParamError::ZeroWidth.to_string().contains("w"));
+        assert!(ParamError::ZeroN.to_string().contains('n'));
+        assert!(ParamError::ZeroWidth.to_string().contains('w'));
         assert!(
             ParamError::WidthTooLarge { w: 65, max: 64 }
                 .to_string()
                 .contains("65")
         );
-        assert!(ParamError::ZeroFingerprintBits.to_string().contains("r"));
+        assert!(ParamError::ZeroFingerprintBits.to_string().contains('r'));
         assert!(
             ParamError::ZeroRetryLimit
                 .to_string()

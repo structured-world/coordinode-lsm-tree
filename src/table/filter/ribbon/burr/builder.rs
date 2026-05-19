@@ -69,6 +69,17 @@ where
         if params.b == 0 {
             return Err(BurrBuildError::InvalidParams("b must be > 0"));
         }
+        // `BurrParams::layer_m` rounds the per-layer slot count up to a
+        // multiple of `b` and floors at `b`, so its result is always
+        // `>= b`. But the vendored Ribbon `Params::new(m, w=64, ...)`
+        // also requires `m >= w`. If `b < w` (= 64), `layer_m` can hand
+        // Ribbon an `m` between `b` and `w-1`, which Ribbon rejects
+        // with a "vendored ribbon param error" that hides the real
+        // invariant. Enforce `b >= w` here so the floor on `layer_m`
+        // is at least `w` and Ribbon never sees an undersized layer.
+        if params.b < params.w {
+            return Err(BurrBuildError::InvalidParams("b must be >= w"));
+        }
         if params.max_layers == 0 {
             return Err(BurrBuildError::InvalidParams("max_layers must be > 0"));
         }
