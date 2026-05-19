@@ -109,7 +109,7 @@ impl TreeInner {
             major_compaction_lock: RwLock::default(),
             flush_lock: Mutex::default(),
             compaction_state: Arc::new(Mutex::new(CompactionState::default())),
-            deletion_pause: DeletionPause::new(),
+            deletion_pause: DeletionPause::new_shared(),
 
             #[cfg(feature = "metrics")]
             metrics: Metrics::default().into(),

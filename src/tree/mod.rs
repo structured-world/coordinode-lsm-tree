@@ -1908,7 +1908,7 @@ impl Tree {
 
         let comparator = config.comparator.clone();
 
-        let deletion_pause = crate::deletion_pause::DeletionPause::new();
+        let deletion_pause = crate::deletion_pause::DeletionPause::new_shared();
 
         let inner = TreeInner {
             id: tree_id,

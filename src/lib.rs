@@ -104,8 +104,13 @@ mod abstract_tree;
 
 pub(crate) mod deletion_pause;
 
-#[doc(hidden)]
-pub mod checkpoint;
+// `checkpoint` is `pub(crate)`: it contains internal helpers
+// (`link_or_copy_cross_fs`, `prepare_target`, `run_checkpoint`) used by
+// `Tree::create_checkpoint` and `BlobTree::create_checkpoint`. Exposing
+// it via `pub` (even with `#[doc(hidden)]`) would lock the helpers into
+// the stable surface; tests that need to exercise them live inline as
+// unit tests inside `src/checkpoint.rs`.
+pub(crate) mod checkpoint;
 
 #[doc(hidden)]
 pub mod blob_tree;

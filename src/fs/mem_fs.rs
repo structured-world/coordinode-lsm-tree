@@ -440,16 +440,11 @@ impl Fs for MemFs {
             ));
         }
 
-        // Parent must exist; we do not recurse.
-        if let Some(parent) = path.parent()
-            && !parent.as_os_str().is_empty()
-            && !state.dirs.contains(parent)
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("parent directory does not exist: {}", parent.display()),
-            ));
-        }
+        // Parent must exist AND be a directory. Delegating to
+        // `ensure_parent_dir` gives the caller a `NotFound` vs
+        // `parent-is-a-file` diagnostic (matching POSIX `ENOTDIR`),
+        // instead of a single ambiguous `NotFound` for both cases.
+        ensure_parent_dir(path, &state)?;
 
         state.dirs.insert(path.to_path_buf());
         Ok(())

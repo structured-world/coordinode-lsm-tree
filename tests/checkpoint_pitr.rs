@@ -459,58 +459,9 @@ fn second_checkpoint_into_same_target_rejected() -> lsm_tree::Result<()> {
     Ok(())
 }
 
-/// 6e. Cross-`Fs` link fall-back: when the source tree's `Fs` differs
-///     from the checkpoint target's `Fs` (here: `StdFs` source vs.
-///     `MemFs` target), the checkpoint code must transparently stream
-///     bytes through both trait objects instead of attempting a real
-///     hard link.
-#[test_log::test]
-fn cross_fs_link_or_copy_streams_through_trait() -> lsm_tree::Result<()> {
-    use lsm_tree::checkpoint::link_or_copy_cross_fs;
-    use lsm_tree::fs::{Fs, FsOpenOptions, MemFs, StdFs};
-    use std::io::Write;
-
-    let dir = tempfile::tempdir()?;
-    let src = dir.path().join("payload.bin");
-    std::fs::write(&src, b"cross-fs-payload")?;
-
-    let std_fs: Arc<dyn Fs> = Arc::new(StdFs);
-    let mem_fs: Arc<dyn Fs> = Arc::new(MemFs::new());
-    mem_fs.create_dir_all(std::path::Path::new("/dst"))?;
-
-    let dst = std::path::Path::new("/dst/payload.bin");
-    let bytes = link_or_copy_cross_fs(&std_fs, &src, &mem_fs, dst)?;
-    assert_eq!(bytes, b"cross-fs-payload".len() as u64);
-
-    // Read back through MemFs to confirm the bytes landed.
-    let mut buf = String::new();
-    use std::io::Read;
-    mem_fs
-        .open(dst, &FsOpenOptions::new().read(true))?
-        .read_to_string(&mut buf)?;
-    assert_eq!(buf, "cross-fs-payload");
-
-    // And: overwriting `dst` itself through MemFs must NOT affect the
-    // source on StdFs. The original test mutated a different file
-    // (`payload.bin.2`) which doesn't actually verify backing-buffer
-    // independence between the two backends.
-    let mut writer = mem_fs.open(dst, &FsOpenOptions::new().write(true).truncate(true))?;
-    writer.write_all(b"mutated-via-mem-fs")?;
-    drop(writer);
-
-    // Source on StdFs is untouched.
-    assert_eq!(std::fs::read(&src)?, b"cross-fs-payload");
-
-    // MemFs `dst` reflects the mutation, confirming the two filesystems
-    // really are independent (this is the symmetric assertion missing
-    // from the previous version of this test).
-    let mut after = String::new();
-    mem_fs
-        .open(dst, &FsOpenOptions::new().read(true))?
-        .read_to_string(&mut after)?;
-    assert_eq!(after, "mutated-via-mem-fs");
-    Ok(())
-}
+// 6e. Cross-`Fs` link fall-back is covered by the inline unit test
+// `cross_fs_link_or_copy_streams_through_trait` in `src/checkpoint.rs`
+// (the helper is `pub(crate)`, so the test lives next to it).
 
 /// 7. Crash safety: aborting mid-checkpoint must leave the SOURCE tree
 ///    fully intact and reopenable. We force the failure by pre-creating

@@ -197,7 +197,12 @@ impl Fs for StdFs {
         match std::fs::hard_link(src, dst) {
             Ok(()) => Ok(()),
             Err(e) if is_cross_device(&e) => {
-                log::warn!(
+                // `debug!`, not `warn!`: a tier-misconfigured checkpoint
+                // can hit this path once per SST + once per blob (potentially
+                // thousands of times). The checkpoint driver is responsible
+                // for emitting a single summary warning if the fallback rate
+                // is excessive; per-file noise here would drown real logs.
+                log::debug!(
                     "hard_link({}, {}) crossed filesystems — falling back to copy",
                     src.display(),
                     dst.display(),
@@ -227,8 +232,15 @@ impl Fs for StdFs {
 fn is_cross_device(err: &io::Error) -> bool {
     #[cfg(unix)]
     {
-        // EXDEV = 18 on Linux/macOS/*BSD.
-        if err.raw_os_error() == Some(18) {
+        // POSIX `EXDEV` ("invalid cross-device link"). The raw value is
+        // 18 on every supported Unix target (Linux, macOS, FreeBSD,
+        // OpenBSD, NetBSD, Android — see `errno.h` on each platform).
+        // We declare it as a named constant rather than depending on
+        // `libc`: the crate deliberately avoids a `libc` dependency
+        // (see the `flock` extern in this file for the same pattern),
+        // and EXDEV's value is locked by ABI compatibility.
+        const EXDEV: i32 = 18;
+        if err.raw_os_error() == Some(EXDEV) {
             return true;
         }
     }
@@ -819,7 +831,9 @@ mod tests {
         // non-Unix targets.
         #[cfg(unix)]
         {
-            let exdev = io::Error::from_raw_os_error(18);
+            // Matches the `EXDEV` constant inside `is_cross_device`.
+            const EXDEV: i32 = 18;
+            let exdev = io::Error::from_raw_os_error(EXDEV);
             assert!(is_cross_device(&exdev), "raw EXDEV must be recognised");
         }
 

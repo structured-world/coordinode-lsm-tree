@@ -62,9 +62,21 @@ impl core::fmt::Debug for DeletionPause {
 
 impl DeletionPause {
     /// Creates a new pause controller in the inactive state.
+    ///
+    /// This is the plain constructor — owns the value, no allocation
+    /// decision baked in. Use [`Self::new_shared`] when you specifically
+    /// want an `Arc`-wrapped controller (the common case for tree
+    /// installation where every table / blob file holds a clone).
     #[must_use]
-    pub fn new() -> Arc<Self> {
-        Arc::new(Self::default())
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Convenience: creates a new pause controller and wraps it in an
+    /// [`Arc`]. Equivalent to `Arc::new(DeletionPause::new())`.
+    #[must_use]
+    pub fn new_shared() -> Arc<Self> {
+        Arc::new(Self::new())
     }
 
     /// Returns `true` if there is at least one active [`Pause`] guard and
@@ -194,7 +206,7 @@ mod tests {
         write_file(&fs, &path, b"sst");
         let dyn_fs: Arc<dyn Fs> = Arc::new(fs.clone());
 
-        let pause = DeletionPause::new();
+        let pause = DeletionPause::new_shared();
         let guard = pause.acquire();
 
         assert!(pause.try_enqueue(dyn_fs.clone(), path.clone()));
@@ -218,7 +230,7 @@ mod tests {
         write_file(&fs, &path, b"x");
         let dyn_fs: Arc<dyn Fs> = Arc::new(fs.clone());
 
-        let pause = DeletionPause::new();
+        let pause = DeletionPause::new_shared();
         assert!(!pause.try_enqueue(dyn_fs, path.clone()));
         assert!(fs.exists(&path).unwrap());
     }
@@ -255,7 +267,7 @@ mod tests {
         write_file(&fs, &path, b"keep-me");
         let dyn_fs: Arc<dyn Fs> = Arc::new(fs.clone());
 
-        let pause = DeletionPause::new();
+        let pause = DeletionPause::new_shared();
         let a = pause.acquire();
 
         let (ready_tx, ready_rx) = mpsc::channel::<()>();
@@ -314,7 +326,7 @@ mod tests {
         write_file(&fs, &path, b"x");
         let dyn_fs: Arc<dyn Fs> = Arc::new(fs.clone());
 
-        let pause = DeletionPause::new();
+        let pause = DeletionPause::new_shared();
         let outer = pause.acquire();
         let inner = pause.acquire();
 
