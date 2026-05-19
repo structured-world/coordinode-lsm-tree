@@ -2,13 +2,27 @@ use std::hash::{BuildHasher, Hash};
 
 use super::super::builder::Scratch;
 use super::super::filter::RibbonFilter;
+use super::super::hashing::standard_equation_w64;
+use super::super::params::{Mode, Params};
 use super::params::BurrParams;
+use super::threshold::is_bumped;
 
 /// One layer of a built BuRR filter.
 pub(crate) struct BurrLayer<S> {
-    /// Slot count for this layer (== ribbon's m).
+    /// Slot count for this layer (== ribbon's m). Kept here so we don't
+    /// have to reach into ribbon.params() on every probe.
     pub(crate) m: usize,
-    /// The vendored Ribbon filter holding this layer's keys.
+    /// Per-layer hash seed (derived from `BurrParams::seed` via the
+    /// builder's layer-seed function). Stored so the probe path can
+    /// recompute the equation under the same seed used at build time.
+    pub(crate) seed: u64,
+    /// Per-block thresholds for this layer: `thresholds[block_idx]` is
+    /// the largest `offset_in_block` value that is KEPT at this layer.
+    /// A key whose `offset_in_block >= thresholds[block_idx]` is BUMPED
+    /// to the next layer at probe time (same decision the builder made).
+    /// Length = `m.div_ceil(b)`.
+    pub(crate) thresholds: Vec<u8>,
+    /// The vendored Ribbon filter holding this layer's KEPT keys.
     pub(crate) ribbon: RibbonFilter<S>,
 }
 
@@ -33,12 +47,11 @@ impl<S> core::fmt::Debug for BurrLayer<S> {
 /// used).
 pub struct BurrFilter<S> {
     params: BurrParams,
-    // `hasher` is held so a future per-key bumping path can re-hash bumped
-    // keys with a layer-specific seed using THIS instance's hasher (rather
-    // than cloning one from each ribbon). Currently unused in the MVP
-    // probe path because each layer's RibbonFilter owns its own hasher
-    // clone; suppress dead-field until that path lands.
-    #[allow(dead_code)]
+    /// Hasher used by the probe-time equation re-compute for the per-
+    /// layer bump-check. All `BurrLayer::ribbon`s were given clones of
+    /// this same hasher at build time, so hashes agree at the boundary
+    /// (`BuildHasher::hash_one` is deterministic for a given hasher
+    /// state).
     hasher: S,
     layers: Vec<BurrLayer<S>>,
 }
@@ -86,22 +99,61 @@ where
     }
 
     /// Allocation-free probe using a caller-provided scratch.
+    ///
+    /// Walks layers descend-only: for each layer, recompute the equation
+    /// under that layer's seed+m and check the per-block threshold. If
+    /// the key would have been BUMPED at construction time
+    /// (`offset >= thresholds[block]`), continue to the next layer. Else
+    /// delegate to the layer's `RibbonFilter::contains_in` — which
+    /// re-derives the same equation internally and runs the GF(2) XOR-
+    /// reduce against the stored solution.
+    ///
+    /// The double equation work per kept-layer is the MVP cost
+    /// (correctness first); a follow-up can expose a `contains_with_eq`
+    /// path on `RibbonFilter` that reuses our pre-computed equation.
     pub fn contains_in<Q: Hash + ?Sized>(&self, key: &Q, scratch: &mut Scratch) -> bool {
-        // MVP probe semantics: each layer absorbed its entire input
-        // (failed layers were skipped and their input bumped to the next
-        // layer), so a key is present iff EXACTLY ONE layer reports it.
-        // Iterating until first hit is correct because builds inserted
-        // each key in the first layer that successfully accepted it; all
-        // earlier layers (that this key was bumped from) cannot have a
-        // fingerprint match for this key's hash. False-positive layers
-        // are independent so the union FPR adds — bounded by the per-
-        // layer FPR times layer count (typically 1-2× the configured
-        // per-layer FPR).
         for layer in &self.layers {
-            if layer.ribbon.contains_in(key, scratch) {
-                return true;
+            // Build a Params reflecting this layer's m/w/r/seed so the
+            // equation-computation matches what the builder did.
+            let layer_params = match Params::new(
+                layer.m,
+                usize::from(self.params.w),
+                usize::from(self.params.r),
+                Mode::Standard,
+            ) {
+                Ok(p) => p.with_seed(layer.seed),
+                Err(_) => continue, // unreachable for built filters
+            };
+
+            // Re-hash to learn this layer's `start` and decide bump.
+            // Throwaway fingerprint buffer; the real probe uses
+            // `scratch` inside `ribbon.contains_in`. The hasher is the
+            // one BurrFilter holds — all layers' RibbonFilters were
+            // given clones of THIS hasher at build time, so hashes
+            // agree by construction (BuildHasher is deterministic).
+            let stride = usize::from(self.params.r).div_ceil(64);
+            let mut fp_throwaway = vec![0_u64; stride];
+            let equation = standard_equation_w64(
+                &self.hasher,
+                key,
+                layer.seed,
+                &layer_params,
+                &mut fp_throwaway,
+            );
+
+            if is_bumped(&equation, &layer.thresholds, self.params.b) {
+                // Bumped at build time → not in this layer's ribbon;
+                // continue to the next layer.
+                continue;
             }
+
+            // Kept at this layer → ribbon authoritatively decides.
+            return layer.ribbon.contains_in(key, scratch);
         }
+        // Walked all layers without finding a non-bumped layer — would
+        // only happen if the input was never inserted in any layer
+        // (i.e. a non-member key whose hash always lands at a bumped
+        // offset). Definite-not-present.
         false
     }
 }
