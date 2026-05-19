@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779152476431,
+  "lastUpdate": 1779175650226,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -6708,6 +6708,84 @@ window.BENCHMARK_DATA = {
             "value": 272680.0870996466,
             "unit": "ops/sec (normalized)",
             "extra": "raw: 502273 ops/sec | factor: 0.543 | P50: 1.8us | P99: 4.2us | P99.9: 12.8us\nthreads: 1 | elapsed: 0.40s | num: 200000 | iterations: 3 | runner: seq_wr=230711 rand_rd=952696 cpu=123 composite=42365.7"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "5a50dfbe9098d5db56c6c46d436cf27ada837daf",
+          "message": "perf: devirtualize lexicographic comparator on block binary-search hot path (#266)\n\n## Summary\n\nBlock-level binary search in `partition_point` probes restart heads via\na predicate that calls `dyn UserComparator::compare` — a vtable dispatch\non every `O(log restarts)` step. The `is_lexicographic()` opt-in already\nexists on the trait and is honored in `compare_prefixed_slice` (the\nprefix branch of `compare_key`, where the lex path avoids a\nprefix+suffix concatenation allocation), but the binary search itself\nrouted every probe through vtable.\n\nThis PR branches once on `is_lexicographic()` at each predicate\nconstruction site and selects a closure that does direct slice\ncomparison (`<[u8]>::cmp`) on the lex path. Each closure is a distinct\ntype, so the generic `partition_point` / `seek` / `seek_upper`\nmonomorphize per shape — the inner binary-search loop is\nvirtual-call-free on the lex path. The custom-comparator branch is\npreserved verbatim.\n\n## Sites devirtualized\n\n| File | Functions | Predicates |\n|---|---|---|\n| `src/table/data_block/iter.rs` | `seek_to_key_seqno`, `seek_upper`,\n`seek_upper_exclusive` | 3 × 2 monomorphizations |\n| `src/table/index_block/iter.rs` | `seek_with_cache_resets`,\n`seek_upper_impl` (covers both public `seek_upper` and\n`seek_upper_bound_cursor`) | 4 × 2 monomorphizations |\n\nEach predicate construction site hoists ONE `is_lexicographic()` call\nout of the BS loop, amortising it across all `O(log restarts)` probes.\nThe lex closure does direct `<[u8]>::cmp`; the dyn closure preserves the\noriginal `cmp.compare(...)` call.\n\n## Out of scope (deliberate)\n\n- **`partition_point` itself** already uses the canonical 2-way\nlower-bound shape (`if pred { left = mid+1 } else { right = mid }`) —\nLLVM emits cmov. No 3-way branch to remove.\n- **3-way `Ordering` match in the linear-scan loops** inside restart\nintervals stays — `Equal`/`Greater` early-exit beats branchless\nscan-to-end-and-post-check for typical `restart_interval=8-16` scans.\n- **`ParsedItem::compare_key` no-prefix branch** intentionally NOT\ndevirtualized. An earlier revision added a lex fast path there too;\nreview feedback correctly identified that the no-prefix branch has no\nallocation to avoid (the key is already contiguous), so an\n`is_lexicographic()` check before `compare()` would cost custom\ncomparators a second vtable per linear-scan step without any matching\nsaving on the default path (`<[u8]>::cmp` and\n`DefaultUserComparator::compare` both lower to memcmp). The lex fast\npath is kept only where it saves real work:\n`compare_prefixed_slice_lexicographic` (skips an allocation on the\nprefix branch) and the iter.rs BS predicate factories above.\n\n## Test plan\n\n- [x] `cargo nextest run` — **666 / 666 lib tests pass** + **10 devirt\nregression tests**\n- [x] `cargo clippy --all-targets --lib --tests -- -D warnings` — clean\n- [x] **Direct devirt verification** via counting-comparator wrapper\nthat tracks `compare()` AND `is_lexicographic()` calls separately:\n- **Lex-path tests** (data_block × 3 entry points; index_block × 3 entry\npoints incl. `seek_upper_bound_cursor`) — assert `count <=\nLEX_PATH_LINEAR_SCAN_BOUND` (≈ 2, only linear-scan compare_key\ncontribution) AND `is_lex_count >= 1` (the BS predicate factory\nconsulted is_lex). A regression where the dyn closure leaked into the BS\npredicate would produce `>= DYN_MIN_BS_PROBES` (= 7, = log₂(128)) calls\n— orders-of-magnitude separation from the bound.\n- **Dyn-path tests** (one per entry point) — assert `delta >=\nDYN_MIN_BS_PROBES` (= 7) on the BS-dominated block (128 keys ×\nrestart_interval=1 + above-max needle bounds linear-scan to 1 call).\nDistinguishes a working dyn BS (≥ 7 + 1) from a lex-leak (0 + 1).\n- **Equivalence tests** (data_block: seek + seek_upper +\nseek_upper_exclusive; index_block: seek + seek_upper +\nseek_upper_bound_cursor) across 6 boundary needles (empty slice =\nbelow-min, exact-min, between-keys 9-byte, exact-mid, exact-tail,\nabove-max 9-byte) — proves lex and dyn paths produce identical landing\npositions for every `partition_point` boundary case (`left==0`,\n`left==len`, exact-hit), and surfaces a wrong-operator regression in any\nlex closure as a landing mismatch.\n- [x] 41 existing `custom_comparator*` integration tests exercise the\ndyn path — all pass unchanged\n\n## Benchmarks\n\n`tools/db_bench --num 200000`, 5 runs per workload per branch (medians +\nranges), measured on the initial devirtualization commit:\n\n| Workload | main (med) | this PR (med) | Δ | main range | this PR range\n| Read |\n|---|---:|---:|---:|---:|---:|---|\n| fillseq | 1,717,606 | 1,675,953 | **-2.4%** | 1.57M-1.77M |\n1.60M-1.73M | noise (write path, not on devirt) |\n| readseq | 2,497,713 | 2,546,882 | **+2.0%** | 2.34M-2.90M |\n2.12M-2.59M | noise (readseq does not binary-search per op) |\n| readrandom | 370,160 | 373,223 | **+0.8%** | 362k-392k | 355k-380k |\ntiny win, inside noise |\n| seekrandom | 276,825 | 284,261 | **+2.7%** | 271k-287k | 276k-303k |\nborderline positive signal |\n| prefixscan | 160,785 | 148,139 | **-7.9%** | 154k-164k | 147k-172k |\nwide range — one this-PR run at 172k > all main runs |\n\n**Honest read**: on a 200k-op macOS bench, expected win from saving\n`N-1` vtable calls per seek (`N = log2(restart_heads) ≈ 2-3`) is\n**0.5-2%** in absolute best case — below the noise floor of single-run\ndb_bench on shared hardware. The signal is consistent with the\ntheoretical prediction.\n\n**The devirtualization itself is verified directly by test, not inferred\nfrom bench numbers** — the lex-path / dyn-path counting assertions\n(above) deterministically prove the right closure runs at each entry\npoint. Real workloads with hot point-read paths and warm caches should\nsee a larger relative benefit than this small synthetic bench.\n\nCloses #220\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n## Summary by CodeRabbit\n\n* **Performance**\n* Added lexicographic fast paths to iterator seek operations in table\ndata and index blocks, reducing runtime overhead during binary-search\nprobes.\n\n* **Tests**\n* Added a suite of regression and devirtualization tests that count\ncomparator usage and validate seek behavior across multiple boundary\ncases.\n\n* **Documentation**\n* Clarified comments around comparator fast-path responsibilities to\nexplain where lexicographic optimizations are applied.\n\n<!-- review_stack_entry_start -->\n\n[![Review Change\nStack](https://storage.googleapis.com/coderabbit_public_assets/review-stack-in-coderabbit-ui.svg)](https://app.coderabbit.ai/change-stack/structured-world/coordinode-lsm-tree/pull/266?utm_source=github_walkthrough&utm_medium=github&utm_campaign=change_stack)\n\n<!-- review_stack_entry_end -->\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-05-19T10:26:00+03:00",
+          "tree_id": "b7a1db63530d724ba307051f6b49640fad98966b",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/5a50dfbe9098d5db56c6c46d436cf27ada837daf"
+        },
+        "date": 1779175648440,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 2782791.0270244074,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 2577320 ops/sec | factor: 1.080 | P50: 0.3us | P99: 2.0us | P99.9: 4.5us\nthreads: 1 | elapsed: 0.08s | num: 200000 | iterations: 3 | runner: seq_wr=24619 rand_rd=828473 cpu=140 composite=21301.8"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1488957.7061868538,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 1379019 ops/sec | factor: 1.080 | P50: 0.6us | P99: 2.5us | P99.9: 5.5us\nthreads: 1 | elapsed: 0.15s | num: 200000 | iterations: 3 | runner: seq_wr=24619 rand_rd=828473 cpu=140 composite=21301.8"
+          },
+          {
+            "name": "readrandom",
+            "value": 611023.0866625836,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 565907 ops/sec | factor: 1.080 | P50: 1.6us | P99: 5.2us | P99.9: 10.8us\nthreads: 1 | elapsed: 0.35s | num: 200000 | iterations: 3 | runner: seq_wr=24619 rand_rd=828473 cpu=140 composite=21301.8"
+          },
+          {
+            "name": "readseq",
+            "value": 2984539.0906310906,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 2764172 ops/sec | factor: 1.080 | P50: 0.2us | P99: 3.9us | P99.9: 7.3us\nthreads: 1 | elapsed: 0.07s | num: 200000 | iterations: 3 | runner: seq_wr=24619 rand_rd=828473 cpu=140 composite=21301.8"
+          },
+          {
+            "name": "seekrandom",
+            "value": 425929.5249634098,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 394480 ops/sec | factor: 1.080 | P50: 2.2us | P99: 5.9us | P99.9: 12.0us\nthreads: 1 | elapsed: 0.51s | num: 200000 | iterations: 3 | runner: seq_wr=24619 rand_rd=828473 cpu=140 composite=21301.8"
+          },
+          {
+            "name": "prefixscan",
+            "value": 242779.07010036538,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 224853 ops/sec | factor: 1.080 | P50: 4.2us | P99: 5.3us | P99.9: 13.2us\nthreads: 1 | elapsed: 0.89s | num: 200000 | iterations: 3 | runner: seq_wr=24619 rand_rd=828473 cpu=140 composite=21301.8"
+          },
+          {
+            "name": "overwrite",
+            "value": 1564459.177462705,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 1448945 ops/sec | factor: 1.080 | P50: 0.5us | P99: 2.5us | P99.9: 5.2us\nthreads: 1 | elapsed: 0.14s | num: 200000 | iterations: 3 | runner: seq_wr=24619 rand_rd=828473 cpu=140 composite=21301.8"
+          },
+          {
+            "name": "mergerandom",
+            "value": 458750.51500031195,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 424878 ops/sec | factor: 1.080 | P50: 0.3us | P99: 1.8us | P99.9: 2.4us\nthreads: 1 | elapsed: 0.47s | num: 200000 | iterations: 3 | runner: seq_wr=24619 rand_rd=828473 cpu=140 composite=21301.8"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 573315.5215625536,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 530984 ops/sec | factor: 1.080 | P50: 1.7us | P99: 4.0us | P99.9: 10.8us\nthreads: 1 | elapsed: 0.38s | num: 200000 | iterations: 3 | runner: seq_wr=24619 rand_rd=828473 cpu=140 composite=21301.8"
           }
         ]
       }
