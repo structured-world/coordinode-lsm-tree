@@ -299,4 +299,232 @@ mod tests {
             "zero restart_interval must return InvalidTrailer",
         );
     }
+
+    // Regression tests for binary-search-predicate devirtualization on the
+    // lexicographic fast path. Mirrors `data_block::iter_test::devirt`:
+    // index-block `seek` / `seek_upper` apply the same `is_lexicographic()`
+    // branching to skip `dyn UserComparator::compare` vtable dispatch on the
+    // BS probe loop. These tests use a counting-comparator wrapper to assert:
+    //   1. lex path makes ZERO compare() calls (no vtable in the BS loop)
+    //   2. dyn path makes >= log2(restart_heads) compare() calls (BS predicate
+    //      actually invokes vtable — guards against lex closure leaking)
+    //   3. lex and dyn paths produce identical landing positions on boundary
+    //      needles
+    mod devirt {
+        use super::*;
+        use crate::comparator::UserComparator;
+        use crate::table::BlockHandle;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+        struct CountingComparator {
+            count: Arc<AtomicUsize>,
+            lex: bool,
+        }
+
+        impl UserComparator for CountingComparator {
+            fn name(&self) -> &'static str {
+                "counting"
+            }
+            fn compare(&self, a: &[u8], b: &[u8]) -> std::cmp::Ordering {
+                self.count.fetch_add(1, AtomicOrdering::Relaxed);
+                a.cmp(b)
+            }
+            fn is_lexicographic(&self) -> bool {
+                self.lex
+            }
+        }
+
+        /// Build an index block tuned to make BS probes dominate any potential
+        /// linear-scan contribution:
+        ///   - 128 handles with distinct sortable `end_key`s
+        ///   - `restart_interval=1` → each handle IS a restart head
+        ///   - binary search: log2(128) = 7 probes minimum
+        ///   - linear scan after BS lands: 0-1 iterations
+        ///
+        /// `assert count >= 2` then cleanly distinguishes the lex-leak case
+        /// (BS contributes 0, scan contributes at most 1) from a working
+        /// dyn path (BS contributes >= 7).
+        fn build_index_block_bs_dominated() -> IndexBlock {
+            use crate::Checksum;
+            use crate::table::block::{BlockType, Header};
+
+            let handles: Vec<_> = (0_u64..128)
+                .map(|i| {
+                    KeyedBlockHandle::new(
+                        i.to_be_bytes().to_vec().into(),
+                        i,
+                        BlockHandle::new(BlockOffset(i * 4096), 4096),
+                    )
+                })
+                .collect();
+            let bytes = IndexBlock::encode_into_vec_with_restart_interval(&handles, 1).unwrap();
+            IndexBlock::new(Block {
+                data: bytes.into(),
+                header: Header {
+                    block_type: BlockType::Index,
+                    checksum: Checksum::from_raw(0),
+                    data_length: 0,
+                    uncompressed_length: 0,
+                },
+            })
+        }
+
+        const DYN_MIN_PROBES: usize = 2;
+
+        #[test]
+        fn index_block_seek_lex_path_skips_vtable() {
+            // Both devirtualized entry points (seek, seek_upper) must route
+            // through static-dispatch closures when is_lexicographic() == true.
+            // Per-entry-point snapshot localises any regression.
+            let index_block = build_index_block_bs_dominated();
+            let count = Arc::new(AtomicUsize::new(0));
+            let cmp: Arc<dyn UserComparator> = Arc::new(CountingComparator {
+                count: count.clone(),
+                lex: true,
+            });
+            let needle = 64_u64.to_be_bytes();
+
+            let before = count.load(AtomicOrdering::Relaxed);
+            {
+                let mut iter = index_block.iter(cmp.clone());
+                let _ = iter.seek(&needle, crate::SeqNo::MAX);
+            }
+            let after_seek = count.load(AtomicOrdering::Relaxed);
+            assert_eq!(
+                after_seek - before,
+                0,
+                "index seek lex path leaked into dyn: {} compare() calls",
+                after_seek - before,
+            );
+
+            {
+                let mut iter = index_block.iter(cmp);
+                let _ = iter.seek_upper(&needle, crate::SeqNo::MAX);
+            }
+            let after_upper = count.load(AtomicOrdering::Relaxed);
+            assert_eq!(
+                after_upper - after_seek,
+                0,
+                "index seek_upper lex path leaked into dyn: {} compare() calls",
+                after_upper - after_seek,
+            );
+        }
+
+        #[test]
+        fn index_block_seek_dyn_path_invokes_compare() {
+            // BS-dominated block: a working dyn BS makes >= log2(128) = 7 calls.
+            // Lex closure leak would yield at most 1 call (linear scan only).
+            let index_block = build_index_block_bs_dominated();
+            let count = Arc::new(AtomicUsize::new(0));
+            let cmp: Arc<dyn UserComparator> = Arc::new(CountingComparator {
+                count: count.clone(),
+                lex: false,
+            });
+            let needle = 64_u64.to_be_bytes();
+
+            let before = count.load(AtomicOrdering::Relaxed);
+            {
+                let mut iter = index_block.iter(cmp);
+                let _ = iter.seek(&needle, crate::SeqNo::MAX);
+            }
+            let delta = count.load(AtomicOrdering::Relaxed) - before;
+            assert!(
+                delta >= DYN_MIN_PROBES,
+                "index seek dyn BS must call compare() at least {DYN_MIN_PROBES} times \
+                 (log2(128 restart heads) probes), got {delta} — lex closure leaked into dyn BS?",
+            );
+        }
+
+        #[test]
+        fn index_block_seek_upper_dyn_path_invokes_compare() {
+            let index_block = build_index_block_bs_dominated();
+            let count = Arc::new(AtomicUsize::new(0));
+            let cmp: Arc<dyn UserComparator> = Arc::new(CountingComparator {
+                count: count.clone(),
+                lex: false,
+            });
+            let needle = 64_u64.to_be_bytes();
+
+            let before = count.load(AtomicOrdering::Relaxed);
+            {
+                let mut iter = index_block.iter(cmp);
+                let _ = iter.seek_upper(&needle, crate::SeqNo::MAX);
+            }
+            let delta = count.load(AtomicOrdering::Relaxed) - before;
+            assert!(
+                delta >= DYN_MIN_PROBES,
+                "index seek_upper dyn BS must call compare() at least {DYN_MIN_PROBES} times \
+                 (log2(128 restart heads) probes), got {delta} — lex closure leaked into dyn BS?",
+            );
+        }
+
+        #[test]
+        fn index_block_seek_lex_and_dyn_agree_on_landing_position() {
+            use crate::Checksum;
+            use crate::table::block::{BlockType, Header};
+
+            // Smaller block where boundary needle behaviour is what we care
+            // about (rather than BS-vs-scan call-count discrimination).
+            let handles: Vec<_> = (0_u64..32)
+                .map(|i| {
+                    KeyedBlockHandle::new(
+                        i.to_be_bytes().to_vec().into(),
+                        i,
+                        BlockHandle::new(BlockOffset(i * 4096), 4096),
+                    )
+                })
+                .collect();
+            let bytes = IndexBlock::encode_into_vec_with_restart_interval(&handles, 4).unwrap();
+            let index_block = IndexBlock::new(Block {
+                data: bytes.into(),
+                header: Header {
+                    block_type: BlockType::Index,
+                    checksum: Checksum::from_raw(0),
+                    data_length: 0,
+                    uncompressed_length: 0,
+                },
+            });
+
+            let lex: Arc<dyn UserComparator> = Arc::new(CountingComparator {
+                count: Arc::new(AtomicUsize::new(0)),
+                lex: true,
+            });
+            let dyn_cmp: Arc<dyn UserComparator> = Arc::new(CountingComparator {
+                count: Arc::new(AtomicUsize::new(0)),
+                lex: false,
+            });
+
+            // Boundary needles: below-min, low-exact, mid-exact, high-exact,
+            // exact-tail, above-max — covers partition_point left==0,
+            // left==len, and exact-hit cases.
+            for needle_val in &[0_u64, 1, 16, 24, 31, 100] {
+                let needle = needle_val.to_be_bytes();
+
+                let mut lex_iter = index_block.iter(lex.clone());
+                let lex_seek = lex_iter.seek(&needle, crate::SeqNo::MAX);
+
+                let mut dyn_iter = index_block.iter(dyn_cmp.clone());
+                let dyn_seek = dyn_iter.seek(&needle, crate::SeqNo::MAX);
+
+                assert_eq!(
+                    lex_seek, dyn_seek,
+                    "index seek result must match for needle {needle_val}",
+                );
+
+                // Compare landing end_key bytes (handles' materialized end_key).
+                let lex_landing = lex_iter
+                    .next()
+                    .map(|h| h.materialize(index_block.as_slice()).end_key().clone());
+                let dyn_landing = dyn_iter
+                    .next()
+                    .map(|h| h.materialize(index_block.as_slice()).end_key().clone());
+                assert_eq!(
+                    lex_landing.as_ref().map(|s| s.as_ref().to_vec()),
+                    dyn_landing.as_ref().map(|s| s.as_ref().to_vec()),
+                    "index landing end_key must match for needle {needle_val}",
+                );
+            }
+        }
+    }
 }

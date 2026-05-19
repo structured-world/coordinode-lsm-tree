@@ -1470,10 +1470,181 @@ mod tests {
             }
         }
 
-        fn build_block() -> crate::Result<DataBlock> {
-            // 64 keys → forces multiple restart intervals at any reasonable
-            // restart_interval, guaranteeing the binary-search probe loop
-            // runs at least 2 iterations (log2(8 restarts) = 3 probes).
+        /// Block tuned to make BINARY-SEARCH PROBES dominate any potential
+        /// linear-scan contribution to the call count:
+        ///   - 128 keys, `restart_interval=1` → 128 restart heads
+        ///   - binary search: log2(128) = 7 probes minimum
+        ///   - linear scan after BS lands: 0-1 iterations (each restart head
+        ///     IS an item, so the scan either returns immediately or steps once)
+        ///
+        /// Discrimination math:
+        ///   - dyn path working correctly: count >= 7 (BS) + 0..1 (scan)
+        ///   - lex closure leaked into dyn BS: count = 0 (BS) + 0..1 (scan) ≤ 1
+        ///
+        /// `assert count >= 2` cleanly distinguishes the two cases, ruling out
+        /// the linear-scan-only false-positive that a naive `> 0` would miss.
+        fn build_block_bs_dominated() -> crate::Result<DataBlock> {
+            let items: Vec<_> = (0_u64..128)
+                .map(|i| InternalValue::from_components(i.to_be_bytes(), "", 0, Value))
+                .collect();
+            let bytes = DataBlock::encode_into_vec(&items, 1, 1.33)?;
+            Ok(DataBlock::new(Block {
+                data: bytes.into(),
+                header: Header {
+                    block_type: BlockType::Data,
+                    checksum: Checksum::from_raw(0),
+                    data_length: 0,
+                    uncompressed_length: 0,
+                },
+            }))
+        }
+
+        /// Minimum number of `compare()` calls a working dyn path is expected
+        /// to make for any single seek on the BS-dominated block. See
+        /// [`build_block_bs_dominated`] for the math.
+        const DYN_MIN_PROBES: usize = 2;
+
+        #[test]
+        fn data_block_seek_lex_path_skips_vtable() -> crate::Result<()> {
+            // is_lexicographic() == true must route ALL 3 devirtualized entry
+            // points through the static-dispatch closures. Snapshotting count
+            // per-entry-point (instead of a single end-of-test check) localises
+            // a regression to the offending entry point and catches the case
+            // where only one closure accidentally falls back to the dyn path.
+            let data_block = build_block_bs_dominated()?;
+            let count = Arc::new(AtomicUsize::new(0));
+            let cmp: Arc<dyn UserComparator> = Arc::new(CountingComparator {
+                count: count.clone(),
+                lex: true,
+            });
+            let needle = 64_u64.to_be_bytes();
+
+            let before = count.load(AtomicOrdering::Relaxed);
+            {
+                let mut iter = data_block.iter(cmp.clone());
+                let _ = iter.seek(&needle, SeqNo::MAX);
+            }
+            let after_seek = count.load(AtomicOrdering::Relaxed);
+            assert_eq!(
+                after_seek - before,
+                0,
+                "seek (forward seqno-aware) lex path leaked into dyn: {} compare() calls",
+                after_seek - before,
+            );
+
+            {
+                let mut iter = data_block.iter(cmp.clone());
+                let _ = iter.seek_upper(&needle, SeqNo::MAX);
+            }
+            let after_upper = count.load(AtomicOrdering::Relaxed);
+            assert_eq!(
+                after_upper - after_seek,
+                0,
+                "seek_upper lex path leaked into dyn: {} compare() calls",
+                after_upper - after_seek,
+            );
+
+            {
+                let mut iter = data_block.iter(cmp);
+                let _ = iter.seek_upper_exclusive(&needle, SeqNo::MAX);
+            }
+            let after_excl = count.load(AtomicOrdering::Relaxed);
+            assert_eq!(
+                after_excl - after_upper,
+                0,
+                "seek_upper_exclusive lex path leaked into dyn: {} compare() calls",
+                after_excl - after_upper,
+            );
+            Ok(())
+        }
+
+        #[test]
+        fn data_block_seek_to_key_seqno_dyn_path_invokes_compare() -> crate::Result<()> {
+            // `seek_to_key_seqno` is the FORWARD seqno-aware binary search
+            // exposed without an attached linear scan — perfect isolation for
+            // the BS predicate. Any non-zero `compare()` call here proves the
+            // dyn closure ran for the forward BS predicate.
+            let data_block = build_block_bs_dominated()?;
+            let count = Arc::new(AtomicUsize::new(0));
+            let cmp: Arc<dyn UserComparator> = Arc::new(CountingComparator {
+                count: count.clone(),
+                lex: false,
+            });
+            let needle = 64_u64.to_be_bytes();
+
+            let before = count.load(AtomicOrdering::Relaxed);
+            {
+                let mut iter = data_block.iter(cmp);
+                let _ = iter.seek_to_key_seqno(&needle, SeqNo::MAX);
+            }
+            let delta = count.load(AtomicOrdering::Relaxed) - before;
+            assert!(
+                delta >= 1,
+                "seek_to_key_seqno dyn BS must call compare(), got {delta} (lex closure leaked into dyn path?)",
+            );
+            Ok(())
+        }
+
+        #[test]
+        fn data_block_seek_upper_dyn_path_invokes_compare() -> crate::Result<()> {
+            // `seek_upper` does binary search + linear scan. In dyn path the
+            // linear scan also calls `compare_key` (which then calls
+            // `cmp.compare()` via its own dyn branch). To rule out the
+            // false-positive "lex closure leaked into BS but linear scan still
+            // calls compare()", we use the BS-dominated block (see
+            // `build_block_bs_dominated`) and assert count >= DYN_MIN_PROBES,
+            // which is impossible to reach from linear-scan calls alone.
+            let data_block = build_block_bs_dominated()?;
+            let count = Arc::new(AtomicUsize::new(0));
+            let cmp: Arc<dyn UserComparator> = Arc::new(CountingComparator {
+                count: count.clone(),
+                lex: false,
+            });
+            let needle = 64_u64.to_be_bytes();
+
+            let before = count.load(AtomicOrdering::Relaxed);
+            {
+                let mut iter = data_block.iter(cmp);
+                let _ = iter.seek_upper(&needle, SeqNo::MAX);
+            }
+            let delta = count.load(AtomicOrdering::Relaxed) - before;
+            assert!(
+                delta >= DYN_MIN_PROBES,
+                "seek_upper dyn BS must call compare() at least {DYN_MIN_PROBES} times \
+                 (log2(128 restart heads) probes), got {delta} — lex closure leaked into dyn BS?",
+            );
+            Ok(())
+        }
+
+        #[test]
+        fn data_block_seek_upper_exclusive_dyn_path_invokes_compare() -> crate::Result<()> {
+            // Same isolation strategy as `seek_upper`: BS-dominated block makes
+            // BS predicate count impossible to fake from linear-scan-only calls.
+            let data_block = build_block_bs_dominated()?;
+            let count = Arc::new(AtomicUsize::new(0));
+            let cmp: Arc<dyn UserComparator> = Arc::new(CountingComparator {
+                count: count.clone(),
+                lex: false,
+            });
+            let needle = 64_u64.to_be_bytes();
+
+            let before = count.load(AtomicOrdering::Relaxed);
+            {
+                let mut iter = data_block.iter(cmp);
+                let _ = iter.seek_upper_exclusive(&needle, SeqNo::MAX);
+            }
+            let delta = count.load(AtomicOrdering::Relaxed) - before;
+            assert!(
+                delta >= DYN_MIN_PROBES,
+                "seek_upper_exclusive dyn BS must call compare() at least {DYN_MIN_PROBES} times \
+                 (log2(128 restart heads) probes), got {delta} — lex closure leaked into dyn BS?",
+            );
+            Ok(())
+        }
+
+        // Smaller block reused by the equivalence test where boundary needles
+        // matter more than BS-vs-scan call-count discrimination.
+        fn build_block_for_equivalence() -> crate::Result<DataBlock> {
             let items: Vec<_> = (0_u64..64)
                 .map(|i| InternalValue::from_components(i.to_be_bytes(), "", 0, Value))
                 .collect();
@@ -1489,73 +1660,13 @@ mod tests {
             }))
         }
 
-        fn run_seeks(data_block: &DataBlock, cmp: Arc<dyn UserComparator>) {
-            // Exercise all three devirtualized entry points:
-            //   - seek_to_key_seqno via seek()
-            //   - seek_upper
-            //   - seek_upper_exclusive
-            let needle = 32_u64.to_be_bytes();
-            {
-                let mut iter = data_block.iter(cmp.clone());
-                let _ = iter.seek(&needle, SeqNo::MAX);
-            }
-            {
-                let mut iter = data_block.iter(cmp.clone());
-                let _ = iter.seek_upper(&needle, SeqNo::MAX);
-            }
-            {
-                let mut iter = data_block.iter(cmp);
-                let _ = iter.seek_upper_exclusive(&needle, SeqNo::MAX);
-            }
-        }
-
-        #[test]
-        fn data_block_seek_lex_path_skips_vtable() -> crate::Result<()> {
-            // is_lexicographic() == true should route all 3 seek entry points
-            // through the static-dispatch closures — comparator.compare() must
-            // never be invoked.
-            let data_block = build_block()?;
-            let count = Arc::new(AtomicUsize::new(0));
-            let cmp: Arc<dyn UserComparator> = Arc::new(CountingComparator {
-                count: count.clone(),
-                lex: true,
-            });
-            run_seeks(&data_block, cmp);
-            assert_eq!(
-                count.load(AtomicOrdering::Relaxed),
-                0,
-                "lex path must skip vtable: no compare() calls expected, got {}",
-                count.load(AtomicOrdering::Relaxed),
-            );
-            Ok(())
-        }
-
-        #[test]
-        fn data_block_seek_dyn_path_invokes_compare() -> crate::Result<()> {
-            // is_lexicographic() == false must keep using the dynamic path —
-            // compare() invocations must be > 0 for any non-trivial seek.
-            let data_block = build_block()?;
-            let count = Arc::new(AtomicUsize::new(0));
-            let cmp: Arc<dyn UserComparator> = Arc::new(CountingComparator {
-                count: count.clone(),
-                lex: false,
-            });
-            run_seeks(&data_block, cmp);
-            let n = count.load(AtomicOrdering::Relaxed);
-            assert!(
-                n > 0,
-                "dyn path must call compare() during binary search, got {n}",
-            );
-            Ok(())
-        }
-
         #[test]
         fn data_block_seek_lex_and_dyn_agree_on_landing_position() -> crate::Result<()> {
             // Equivalence check: lex and dyn paths must produce IDENTICAL
             // landing positions for every probe. If the lex closure ever
             // disagrees with `compare() != Greater` semantics (e.g. wrong
             // operator), this test catches it before integration suites do.
-            let data_block = build_block()?;
+            let data_block = build_block_for_equivalence()?;
             let lex: Arc<dyn UserComparator> = Arc::new(CountingComparator {
                 count: Arc::new(AtomicUsize::new(0)),
                 lex: true,
