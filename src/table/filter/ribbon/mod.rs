@@ -39,6 +39,7 @@
 //! the construction call.
 
 pub mod builder;
+pub mod burr;
 pub mod error;
 pub mod filter;
 pub mod hashing;
