@@ -102,6 +102,15 @@ where
         &self,
         hashes: Vec<u64>,
     ) -> Result<BurrFilter<S>, BurrBuildError> {
+        // Empty input would produce a zero-layer filter that
+        // `to_wire_bytes` correctly serialises as an empty Vec, but
+        // `BurrFilterReader::new` rejects num_layers == 0 — so the
+        // build → to_wire_bytes → read round-trip breaks for empty
+        // input. Reject up front so callers see the error at build
+        // time rather than at the first read.
+        if hashes.is_empty() {
+            return Err(BurrBuildError::InvalidParams("key set must be non-empty"));
+        }
         let mut remaining: Vec<u64> = hashes;
         let mut layers: Vec<BurrLayer<S>> = Vec::with_capacity(usize::from(self.params.max_layers));
 
@@ -193,6 +202,12 @@ where
     }
 
     pub fn build<K: Hash + Clone>(&self, keys: &[K]) -> Result<BurrFilter<S>, BurrBuildError> {
+        // Same empty-input rejection as `build_from_hashes_owned` —
+        // builder is the right place to surface "no keys, no filter"
+        // rather than letting the read path fail later.
+        if keys.is_empty() {
+            return Err(BurrBuildError::InvalidParams("key set must be non-empty"));
+        }
         let mut remaining: Vec<K> = keys.to_vec();
         let mut layers: Vec<BurrLayer<S>> = Vec::with_capacity(usize::from(self.params.max_layers));
 

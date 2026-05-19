@@ -50,6 +50,14 @@ pub enum ConstructionFailure {
         row_index: usize,
         m: usize,
     },
+    /// `m * stride_words` overflowed `usize`. Caller passed an
+    /// unreasonably large `m` (or `r` is mistuned). Returned before any
+    /// storage is allocated, so this is a clean error rather than a
+    /// panic on the `vec!` line.
+    StorageLengthOverflow {
+        m: usize,
+        stride_words: usize,
+    },
 }
 
 impl fmt::Display for ConstructionFailure {
@@ -79,6 +87,10 @@ impl fmt::Display for ConstructionFailure {
                     )
                 }
             }
+            ConstructionFailure::StorageLengthOverflow { m, stride_words } => write!(
+                f,
+                "m * stride_words overflows usize: m={m} stride_words={stride_words}",
+            ),
         }
     }
 }

@@ -566,13 +566,18 @@ fn burr_builder_rejects_zero_max_layers() {
 }
 
 #[test]
-fn burr_layer_count_grows_with_input_size() {
-    // Empty input → 0 layers.
+fn burr_layer_count_for_tiny_input_is_at_most_one() {
+    // Tiny inputs settle in a single layer — the last-layer
+    // enlargement absorbs the residual without bumping. (Empty input
+    // is now rejected by the builder; see
+    // burr_builder_rejects_empty_input_via_build_from_hashes.)
     let params = BurrParams::with_fp_rate(100, 0.01).unwrap();
     let builder = BurrBuilder::new(params, DefaultBuildHasher::default()).unwrap();
-    let empty: Vec<u64> = vec![];
-    let filter = builder.build_from_hashes(&empty).unwrap();
-    assert_eq!(filter.layer_count(), 0);
+    let hashes: Vec<u64> = (0..4_u64)
+        .map(|i| crate::hash::hash64(&i.to_le_bytes()))
+        .collect();
+    let filter = builder.build_from_hashes(&hashes).unwrap();
+    assert!(filter.layer_count() <= 1, "tiny input should fit one layer");
 }
 
 #[test]
@@ -784,5 +789,74 @@ fn contains_hash_from_bytes_returns_false_for_non_inserted() {
     assert!(
         absent_count > 950,
         "expected most non-inserted hashes to report absent, got absent_count={absent_count}",
+    );
+}
+
+#[test]
+fn burr_wire_rejects_corrupted_m_below_w() {
+    // Corruption test for the Params::new gate added to decode: a
+    // tampered `m` that drops below `w` (64) must be rejected at
+    // decode time with InvalidHeader("BurrFilter layer params"),
+    // NOT silently fail-close in the probe path later.
+    use super::filter::BurrFilterReader;
+    // Build a single-layer filter (n = 50 → one layer).
+    let params = BurrParams::with_fp_rate(50, 0.01).expect("params");
+    let builder = BurrBuilder::new(params, DefaultBuildHasher::default()).expect("builder");
+    let hashes: Vec<u64> = (0..50_u64)
+        .map(|i| crate::hash::hash64(&[i as u8]))
+        .collect();
+    let filter = builder.build_from_hashes(&hashes).expect("build");
+    let mut bytes = filter.to_wire_bytes();
+    // m is the first u32 of the first layer header (at HEADER_LEN).
+    let layer_header_start = crate::file::MAGIC_BYTES.len() + 6 + 8;
+    // Read original m to size the corrupted_z payload such that the
+    // num_blocks/z_byte_len cross-checks still succeed (so the test
+    // exercises specifically the Params::new gate, not the earlier
+    // length checks).
+    let m_corrupt: u32 = 32; // w == 64, so m=32 fails m >= w.
+    bytes[layer_header_start..layer_header_start + 4].copy_from_slice(&m_corrupt.to_le_bytes());
+    // Recompute the cross-check fields so the test reaches Params::new.
+    // num_blocks = m.div_ceil(b); b defaults to 64 → num_blocks=1
+    let num_blocks_corrupt: u32 = 1;
+    bytes[layer_header_start + 4..layer_header_start + 8]
+        .copy_from_slice(&num_blocks_corrupt.to_le_bytes());
+    // z_byte_len = m * stride * 8; stride=1 (r=7 for fpr=0.01) → 256
+    let z_byte_len_corrupt: u32 = 32 * 8;
+    bytes[layer_header_start + 8..layer_header_start + 12]
+        .copy_from_slice(&z_byte_len_corrupt.to_le_bytes());
+
+    let err = BurrFilterReader::new(&bytes).expect_err("m < w must reject");
+    assert!(
+        matches!(err, crate::Error::InvalidHeader("BurrFilter layer params")),
+        "expected InvalidHeader(\"BurrFilter layer params\"), got: {err:?}",
+    );
+}
+
+#[test]
+fn burr_builder_rejects_empty_input_via_build_from_hashes() {
+    let params = BurrParams::with_fp_rate(100, 0.01).expect("params");
+    let builder = BurrBuilder::new(params, DefaultBuildHasher::default()).expect("builder");
+    let err = builder
+        .build_from_hashes(&[])
+        .expect_err("empty hash input must error");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("non-empty"),
+        "expected non-empty mention: {msg}"
+    );
+}
+
+#[test]
+fn burr_builder_rejects_empty_input_via_build_keys() {
+    let params = BurrParams::with_fp_rate(100, 0.01).expect("params");
+    let builder = BurrBuilder::new(params, DefaultBuildHasher::default()).expect("builder");
+    let keys: [u64; 0] = [];
+    let err = builder
+        .build(&keys)
+        .expect_err("empty key input must error");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("non-empty"),
+        "expected non-empty mention: {msg}"
     );
 }

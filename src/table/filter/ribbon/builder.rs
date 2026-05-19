@@ -171,11 +171,17 @@ where
         debug_assert!(m >= self.params.w);
 
         let stride_words = self.params.fingerprint_words();
+        // `m * stride_words` would overflow `usize` if `m` is set
+        // unreasonably large; allocate via the checked product and bail
+        // before the vec! call panics.
+        let total_words = m
+            .checked_mul(stride_words)
+            .ok_or(ConstructionFailure::StorageLengthOverflow { m, stride_words })?;
         let fp_last_mask = self.params.fingerprint_last_word_mask();
         let mut occupied = vec![false; m];
         let mut coeff_lo = vec![0u64; m];
         let mut coeff_hi = vec![0u64; m];
-        let mut rhs = vec![0u64; m * stride_words];
+        let mut rhs = vec![0u64; total_words];
 
         let mut key_fp = vec![0u64; stride_words];
 
@@ -248,7 +254,7 @@ where
             }
         }
 
-        let mut z = vec![0u64; m * stride_words];
+        let mut z = vec![0u64; total_words];
         if matches!(self.params.mode, Mode::Homogeneous) {
             let mut rng = SplitMix64::new(seed ^ 0xD1B5_4A32_D192_ED03);
             for (i, is_occupied) in occupied.iter().enumerate().take(m) {
@@ -327,11 +333,14 @@ where
         debug_assert!(m >= self.params.w);
 
         let stride_words = self.params.fingerprint_words();
+        let total_words = m
+            .checked_mul(stride_words)
+            .ok_or(ConstructionFailure::StorageLengthOverflow { m, stride_words })?;
         let fp_last_mask = self.params.fingerprint_last_word_mask();
         let mut occupied = vec![false; m];
         let mut coeff_lo = vec![0u64; m];
         let mut coeff_hi = vec![0u64; m];
-        let mut rhs = vec![0u64; m * stride_words];
+        let mut rhs = vec![0u64; total_words];
 
         let mut key_fp = vec![0u64; stride_words];
         let layer_params = Params { m, ..self.params };
@@ -400,7 +409,7 @@ where
             }
         }
 
-        let mut z = vec![0u64; m * stride_words];
+        let mut z = vec![0u64; total_words];
         if matches!(self.params.mode, Mode::Homogeneous) {
             let mut rng = SplitMix64::new(seed ^ 0xD1B5_4A32_D192_ED03);
             for (i, is_occupied) in occupied.iter().enumerate().take(m) {

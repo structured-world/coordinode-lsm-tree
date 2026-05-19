@@ -263,6 +263,12 @@ pub(crate) fn decode(bytes: &[u8]) -> crate::Result<DecodedFilter<'_>> {
             return Err(crate::Error::InvalidHeader("BurrFilter layer payload"));
         }
 
+        // Validate the per-layer params via Params::new — catches
+        // m < w and other Ribbon-side rejections at decode time so
+        // the probe path never has to fail-close on the same input.
+        Params::new(m, usize::from(w), usize::from(r), Mode::Standard)
+            .map_err(|_| crate::Error::InvalidHeader("BurrFilter layer params"))?;
+
         // Checked endpoint arithmetic — on 32-bit targets a corrupted
         // num_blocks/z_byte_len could overflow `pos + num_blocks + z_byte_len`
         // and let the original `bytes.len() < pos + …` guard succeed by
@@ -393,6 +399,10 @@ pub(crate) fn contains_hash_from_bytes(bytes: &[u8], hash: u64) -> crate::Result
         if num_blocks != expected_blocks || z_byte_len != expected_z_len {
             return Err(crate::Error::InvalidHeader("BurrFilter layer payload"));
         }
+        // Validate per-layer Ribbon params (m vs w etc.) at parse time
+        // instead of fail-closing inside the probe loop.
+        let layer_params_base = Params::new(m, usize::from(w), usize::from(r), Mode::Standard)
+            .map_err(|_| crate::Error::InvalidHeader("BurrFilter layer params"))?;
         // Checked endpoints — see the same pattern in `decode`. Avoids
         // wraparound on 32-bit when `pos + num_blocks + z_byte_len`
         // overflows usize.
@@ -410,11 +420,7 @@ pub(crate) fn contains_hash_from_bytes(bytes: &[u8], hash: u64) -> crate::Result
         pos = z_end;
 
         let seed = derive_layer_seed(root_seed, layer_idx);
-        let layer_params = match Params::new(m, usize::from(w), usize::from(r), Mode::Standard) {
-            Ok(p) => p.with_seed(seed),
-            // Unreachable given the param validation above; fail closed.
-            Err(_) => return Ok(true),
-        };
+        let layer_params = layer_params_base.with_seed(seed);
 
         fingerprint_buf[0] = 0;
         let equation: StandardEquation =
