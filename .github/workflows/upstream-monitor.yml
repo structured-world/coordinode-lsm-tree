@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       force:
-        description: "Bypass the 'already-considered tag' skip and open a fresh sync PR even if upstream HEAD was previously surfaced."
+        description: "Bypass the skip-when-already-surfaced check (which queries existing sync PRs/issues by title) and open a fresh sync artifact even if the current upstream HEAD was previously surfaced."
         type: boolean
         default: false
 
