@@ -88,41 +88,48 @@ fn tree_writes_v5_manifest_and_recovers_it() -> lsm_tree::Result<()> {
 fn tree_rejects_pre_v5_manifest() -> lsm_tree::Result<()> {
     // V5 introduced a wire-format break for filter blocks (BuRR replaces
     // Bloom). V3/V4 tables on disk cannot be read by this version and
-    // vice versa — opening a V4-tagged manifest must fail with
-    // InvalidVersion at recovery time rather than silently misreading
-    // filter bytes later.
-    let folder = get_tmp_folder();
-    let path = folder.path();
+    // vice versa — opening a manifest tagged with either pre-V5 version
+    // must fail with InvalidVersion at recovery time rather than
+    // silently misreading filter bytes later. We assert BOTH V3 and V4
+    // explicitly so the boundary stays exact and a future "accept V4 if
+    // …" relaxation lights up the test rather than passing quietly.
+    for pre_v5 in [3_u8, 4_u8] {
+        let folder = get_tmp_folder();
+        let path = folder.path();
 
-    {
-        let tree = Config::new(
+        {
+            let tree = Config::new(
+                path,
+                SequenceNumberCounter::default(),
+                SequenceNumberCounter::default(),
+            )
+            .open()?;
+
+            tree.insert("a", "a", 0);
+            tree.flush_active_memtable(0)?;
+
+            assert_eq!(5, read_manifest_format_version(path)?);
+            rewrite_manifest_format_version(path, pre_v5)?;
+            assert_eq!(pre_v5, read_manifest_format_version(path)?);
+        }
+
+        let reopened = Config::new(
             path,
             SequenceNumberCounter::default(),
             SequenceNumberCounter::default(),
         )
-        .open()?;
+        .open();
 
-        tree.insert("a", "a", 0);
-        tree.flush_active_memtable(0)?;
-
-        assert_eq!(5, read_manifest_format_version(path)?);
-        rewrite_manifest_format_version(path, 4)?;
-        assert_eq!(4, read_manifest_format_version(path)?);
-    }
-
-    let reopened = Config::new(
-        path,
-        SequenceNumberCounter::default(),
-        SequenceNumberCounter::default(),
-    )
-    .open();
-
-    match reopened {
-        Err(lsm_tree::Error::InvalidVersion(v)) => {
-            assert_eq!(v, 4, "V4 manifest must be rejected with the right version");
+        match reopened {
+            Err(lsm_tree::Error::InvalidVersion(v)) => {
+                assert_eq!(
+                    v, pre_v5,
+                    "V{pre_v5} manifest must be rejected with the right version",
+                );
+            }
+            Err(other) => panic!("expected InvalidVersion({pre_v5}), got: {other:?}"),
+            Ok(_) => panic!("V{pre_v5} manifest must be rejected by V5 binary"),
         }
-        Err(other) => panic!("expected InvalidVersion(4), got: {other:?}"),
-        Ok(_) => panic!("V4 manifest must be rejected by V5 binary"),
     }
 
     Ok(())
