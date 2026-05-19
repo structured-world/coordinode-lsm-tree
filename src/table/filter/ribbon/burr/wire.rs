@@ -320,14 +320,18 @@ pub(crate) fn contains_hash(decoded: &DecodedFilter<'_>, hash: u64) -> bool {
         while lo != 0 {
             let offset = lo.trailing_zeros() as usize;
             let row_byte = (equation.start + offset) * 8;
-            // SAFETY: row_byte..row_byte+8 ⊂ z (proven by start+offset
-            // < m and len validated == m * 8 in decode). The
-            // try_into is infallible here; using unwrap_or(0) keeps
-            // panic-freedom on the hot path without an unwrap.
-            let arr: [u8; 8] = z
-                .get(row_byte..row_byte + 8)
-                .and_then(|s| s.try_into().ok())
-                .unwrap_or([0; 8]);
+            // row_byte..row_byte+8 ⊂ z is proven by start+offset < m
+            // and the decode-time check that z len == m * 8. If the
+            // invariant ever drifts (corruption, future format change
+            // missed here), fail closed → return true so the table
+            // read path falls through to a real index lookup rather
+            // than producing a false negative on substituted zeros.
+            let Some(slice) = z.get(row_byte..row_byte + 8) else {
+                return true;
+            };
+            let Ok(arr) = <[u8; 8]>::try_from(slice) else {
+                return true;
+            };
             acc ^= u64::from_le_bytes(arr);
             lo &= lo - 1;
         }

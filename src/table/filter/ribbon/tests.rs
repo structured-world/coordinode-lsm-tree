@@ -745,9 +745,9 @@ fn serde_roundtrip_preserves_membership_behavior() {
 
     let repr = filter.to_repr();
     let encoded = serde_json::to_string(&repr).expect("serialize should succeed");
-    let decoded_repr: crate::RibbonFilterRepr =
+    let decoded_repr: super::RibbonFilterRepr =
         serde_json::from_str(&encoded).expect("deserialize should succeed");
-    let decoded = crate::RibbonFilter::from_repr(decoded_repr, DefaultBuildHasher::default())
+    let decoded = super::RibbonFilter::from_repr(decoded_repr, DefaultBuildHasher::default())
         .expect("reconstructing filter should succeed");
 
     let mut scratch_original = filter.new_scratch();
@@ -775,9 +775,9 @@ fn serde_rejects_unknown_filter_version() {
     let mut value = serde_json::to_value(filter.to_repr()).expect("serialize should succeed");
     value["version"] = serde_json::Value::from(99u64);
 
-    let repr = serde_json::from_value::<crate::RibbonFilterRepr>(value)
+    let repr = serde_json::from_value::<super::RibbonFilterRepr>(value)
         .expect("deserializing repr should succeed");
-    let err = crate::RibbonFilter::from_repr(repr, DefaultBuildHasher::default())
+    let err = super::RibbonFilter::from_repr(repr, DefaultBuildHasher::default())
         .expect_err("reconstructing unknown version should fail");
     assert!(err.to_string().contains("unsupported RibbonFilter version"));
 }
@@ -798,7 +798,7 @@ fn serde_rejects_incorrect_storage_word_length() {
     let wrong_words = expected_words - 1;
     repr.z = bitvec::prelude::BitVec::<u64, bitvec::prelude::Lsb0>::from_vec(vec![0; wrong_words]);
 
-    let err = crate::RibbonFilter::from_repr(repr, DefaultBuildHasher::default())
+    let err = super::RibbonFilter::from_repr(repr, DefaultBuildHasher::default())
         .expect_err("reconstructing invalid storage should fail");
     assert!(
         err.to_string()
