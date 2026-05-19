@@ -229,7 +229,13 @@ pub(crate) fn decode(bytes: &[u8]) -> crate::Result<DecodedFilter<'_>> {
     let mut pos = HEADER_LEN;
 
     for layer_idx in 0..num_layers {
-        if bytes.len() < pos + LAYER_HEADER_LEN {
+        // On 32-bit targets `pos + LAYER_HEADER_LEN` can wrap if pos was
+        // advanced past a corrupted layer; compute the endpoint with
+        // checked_add so the bounds guard cannot succeed by wraparound.
+        let header_end = pos
+            .checked_add(LAYER_HEADER_LEN)
+            .ok_or(crate::Error::InvalidHeader("BurrFilter layer header"))?;
+        if bytes.len() < header_end {
             return Err(crate::Error::InvalidHeader("BurrFilter layer header"));
         }
         #[expect(
@@ -246,7 +252,7 @@ pub(crate) fn decode(bytes: &[u8]) -> crate::Result<DecodedFilter<'_>> {
         let m = u32::from_le_bytes(m_bytes) as usize;
         let num_blocks = u32::from_le_bytes(num_blocks_bytes) as usize;
         let z_byte_len = u32::from_le_bytes(z_byte_len_bytes) as usize;
-        pos += LAYER_HEADER_LEN;
+        pos = header_end;
 
         // Cross-check num_blocks and z_byte_len against r/b/m before
         // trusting the layer payload. Mismatches mean read_row would
@@ -372,7 +378,13 @@ pub(crate) fn contains_hash_from_bytes(bytes: &[u8], hash: u64) -> crate::Result
     let mut pos = HEADER_LEN;
 
     for layer_idx in 0..num_layers {
-        if bytes.len() < pos + LAYER_HEADER_LEN {
+        // Same checked-add guard as `decode`; on 32-bit a corrupted pos
+        // could let unchecked `pos + LAYER_HEADER_LEN` wrap past
+        // `bytes.len()` and panic at the slice indexing below.
+        let header_end = pos
+            .checked_add(LAYER_HEADER_LEN)
+            .ok_or(crate::Error::InvalidHeader("BurrFilter layer header"))?;
+        if bytes.len() < header_end {
             return Err(crate::Error::InvalidHeader("BurrFilter layer header"));
         }
         let m_bytes: [u8; 4] = bytes[pos..pos + 4]
@@ -387,7 +399,7 @@ pub(crate) fn contains_hash_from_bytes(bytes: &[u8], hash: u64) -> crate::Result
         let m = u32::from_le_bytes(m_bytes) as usize;
         let num_blocks = u32::from_le_bytes(num_blocks_bytes) as usize;
         let z_byte_len = u32::from_le_bytes(z_byte_len_bytes) as usize;
-        pos += LAYER_HEADER_LEN;
+        pos = header_end;
 
         if m == 0 {
             return Err(crate::Error::InvalidHeader("BurrFilter layer m"));

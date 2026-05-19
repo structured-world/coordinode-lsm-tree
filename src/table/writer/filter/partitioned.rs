@@ -73,11 +73,15 @@ impl PartitionedFilterWriter {
     fn spill_filter_partition(&mut self, key: &UserKey) -> crate::Result<()> {
         let hash_count = self.bloom_hash_buffer.len();
         let partition_index = self.tli_handles.len();
-        // mem::take moves the accumulated hash buffer into the BuRR
-        // builder so it can be consumed during the per-layer
-        // recursion, avoiding a to_vec() clone of the entire buffer
-        // for every partition spill.
-        let hashes = std::mem::take(&mut self.bloom_hash_buffer);
+        // mem::replace (rather than mem::take) preserves the buffer's
+        // grown capacity for the next partition. `take` leaves a
+        // capacity-0 Vec behind, which would force a reallocation on
+        // every register_key call following a spill. Tables with many
+        // partitions can spill thousands of times during a single
+        // flush/compaction, so the saved reallocations matter on the
+        // write hot path.
+        let old_cap = self.bloom_hash_buffer.capacity();
+        let hashes = std::mem::replace(&mut self.bloom_hash_buffer, Vec::with_capacity(old_cap));
         let filter_bytes = build_burr_filter_bytes(self.bloom_policy, hashes)?;
 
         // An empty BuRR build result means the policy is inactive for
