@@ -813,9 +813,15 @@ mod tests {
     fn is_cross_device_detects_exdev_and_kind_variants() {
         // Synthesise a raw EXDEV error — what Linux/macOS/BSDs return when
         // hard_link spans devices. `is_cross_device` must accept it so the
-        // fallback copy path kicks in.
-        let exdev = io::Error::from_raw_os_error(18);
-        assert!(is_cross_device(&exdev), "raw EXDEV must be recognised");
+        // fallback copy path kicks in. Gated to Unix because errno 18 has
+        // a different meaning on Windows (ERROR_NO_MORE_FILES) and the
+        // `#[cfg(unix)]` branch in `is_cross_device` is never compiled on
+        // non-Unix targets.
+        #[cfg(unix)]
+        {
+            let exdev = io::Error::from_raw_os_error(18);
+            assert!(is_cross_device(&exdev), "raw EXDEV must be recognised");
+        }
 
         // ErrorKind::CrossesDevices is the modern stable variant (Rust 1.85+).
         let crosses = io::Error::from(io::ErrorKind::CrossesDevices);

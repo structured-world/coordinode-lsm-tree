@@ -35,12 +35,12 @@ pub struct CheckpointInfo {
     /// Lower-bound visible-seqno watermark for the snapshot.
     ///
     /// Captured BEFORE [`AbstractTree::current_version`] so it is
-    /// guaranteed to be ≤ every seqno reflected in the checkpointed
-    /// SSTs. PITR consumers can safely use this value as an **inclusive
-    /// lower bound** for replay cutoffs: every record with
-    /// `seqno <= info.seqno` is included in the snapshot, but later
-    /// seqnos may also be present (writers can advance the counter
-    /// between sample and version snapshot).
+    /// guaranteed to be ≤ the *maximum* seqno reflected in the
+    /// checkpointed SSTs. PITR consumers can safely use this value as
+    /// an **inclusive lower bound** for replay cutoffs: every record
+    /// with `seqno <= info.seqno` is included in the snapshot, but
+    /// later seqnos may also be present (writers can advance the
+    /// counter between sample and version snapshot).
     ///
     /// Treating this as the maximum visible seqno would be incorrect
     /// and could move a recovery cutoff past data still needed from
