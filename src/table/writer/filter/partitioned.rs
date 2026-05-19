@@ -74,18 +74,26 @@ impl PartitionedFilterWriter {
         let filter_bytes = build_burr_filter_bytes(self.bloom_policy, &self.bloom_hash_buffer)?;
         self.bloom_hash_buffer.clear();
 
-        // An invalid policy (e.g. fpr <= 0 or bpk out of [1, 64]) makes
-        // the BuRR builder return an empty Vec. Persisting an empty
-        // filter block would cause BurrFilterReader::new to error at
-        // read time. Skip the partition; the TLI entry is also
-        // skipped so the reader sees no filter for this range.
+        // An empty BuRR build result means the policy is inactive for
+        // this key population (e.g. fpr <= 0 or bpk out of [1, 64]).
+        // For PARTITIONED filters, silently skipping a partition AND
+        // its TLI entry causes false negatives at read time: keys in
+        // this range would binary-search to a later partition's
+        // filter, which doesn't contain them, and Table::check_bloom
+        // would report "definitely not present" → false negative on a
+        // live key.
+        //
+        // Fail closed: return Unrecoverable so the writer aborts table
+        // creation rather than persisting a partially-filtered table.
+        // In practice this path is unreachable — BloomConstructionPolicy::
+        // is_active() is checked upstream before any keys are buffered.
         if filter_bytes.is_empty() {
-            log::trace!(
-                "BuRR policy produced empty filter partition — skipping write at +{:#X?}",
-                self.relative_file_pos,
+            log::error!(
+                "BuRR partitioned writer received empty filter bytes for {} hashes — \
+                 policy likely inactive (silent skip would cause false negatives)",
+                self.tli_handles.len() + 1,
             );
-            self.approx_filter_size = 0;
-            return Ok(());
+            return Err(crate::Error::Unrecoverable);
         }
 
         let header = Block::write_into(

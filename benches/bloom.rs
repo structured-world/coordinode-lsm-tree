@@ -150,10 +150,17 @@ fn ribbon_filter_contains(c: &mut Criterion) {
             .expect("ribbon params")
             .with_seed(0);
         let builder = RibbonBuilder::new(params, Hasher::default()).expect("builder");
-        let filter = builder.build(&keys).expect("build");
-        let mut scratch = filter.new_scratch();
-
+        // Pad the key set to n with random fillers so the Ribbon load
+        // factor matches the BuRR bench above. Without padding the
+        // Ribbon body would be ~10% loaded vs BuRR's ~70-90%, skewing
+        // probe-latency conclusions.
         let mut rng = rand::rng();
+        let mut padded = keys.clone();
+        while padded.len() < n {
+            padded.push(rng.random::<u64>());
+        }
+        let filter = builder.build(&padded).expect("build");
+        let mut scratch = filter.new_scratch();
 
         c.bench_function(
             &format!(

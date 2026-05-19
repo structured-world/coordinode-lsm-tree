@@ -3,9 +3,13 @@
 //!
 //! Writes a table, flushes to disk, reopens via the same Config, and
 //! verifies:
-//!   - every inserted key resolves via `tree.get`
-//!   - probe of unknown keys does not produce false negatives (no
-//!     inserted key reports absent)
+//!   - every inserted key resolves via `tree.get` (no false negatives —
+//!     the filter must never report "definitely absent" for an
+//!     inserted key)
+//!   - unknown keys never resolve to `Some` (filter false positives
+//!     are acceptable — they trigger a wasted index lookup — but the
+//!     table read path must not return a value for a key we never
+//!     inserted)
 //!   - filter efficiency metric trends correctly when the metrics
 //!     feature is enabled
 //!

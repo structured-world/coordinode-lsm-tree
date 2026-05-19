@@ -168,9 +168,18 @@ fn burr_hash_build_wire_format_round_trips() {
 #[test]
 fn burr_wire_rejects_bad_magic() {
     use super::filter::BurrFilterReader;
-    let mut bytes = vec![0_u8; 32];
-    bytes[0] = 0xDE;
-    bytes[1] = 0xAD;
+    // Build a valid wire payload first, then flip the first magic byte.
+    // This asserts the magic check actually triggers — a buffer of
+    // arbitrary zeros could also fail later in decode (e.g. on the
+    // version byte) and mask whether the magic check fires at all.
+    let params = BurrParams::with_fp_rate(50, 0.01).expect("params");
+    let builder = BurrBuilder::new(params, DefaultBuildHasher::default()).expect("builder");
+    let hashes: Vec<u64> = (0..50_u64)
+        .map(|i| crate::hash::hash64(&[i as u8]))
+        .collect();
+    let filter = builder.build_from_hashes(&hashes).expect("build");
+    let mut bytes = filter.to_wire_bytes();
+    bytes[0] ^= 0xFF;
     let result = BurrFilterReader::new(&bytes);
     assert!(result.is_err(), "bad magic should fail decode");
 }
@@ -429,5 +438,165 @@ fn burr_settles_in_few_layers() {
     assert!(
         (1..=4).contains(&layer_count),
         "layer count {layer_count} outside expected 1..=4 range",
+    );
+}
+
+#[test]
+fn burr_params_with_fp_rate_rejects_n_zero() {
+    let err = BurrParams::with_fp_rate(0, 0.01).expect_err("n=0 must error");
+    let msg = format!("{err}");
+    assert!(msg.contains("n must be > 0"), "got: {msg}");
+}
+
+#[test]
+fn burr_params_with_fp_rate_rejects_zero_fpr() {
+    let err = BurrParams::with_fp_rate(100, 0.0).expect_err("fpr=0 must error");
+    let msg = format!("{err}");
+    assert!(msg.contains("fpr"), "got: {msg}");
+}
+
+#[test]
+fn burr_params_with_fp_rate_rejects_one_fpr() {
+    let err = BurrParams::with_fp_rate(100, 1.0).expect_err("fpr=1 must error");
+    let msg = format!("{err}");
+    assert!(msg.contains("fpr"), "got: {msg}");
+}
+
+#[test]
+fn burr_params_with_fp_rate_rejects_negative_fpr() {
+    let err = BurrParams::with_fp_rate(100, -0.1).expect_err("negative fpr must error");
+    let _ = format!("{err}");
+}
+
+#[test]
+fn burr_params_with_fp_rate_rejects_too_tight_fpr() {
+    // fpr <= 2^-64 → r > 64 → reject. Use 1e-25 (well past 2^-64).
+    let err = BurrParams::with_fp_rate(100, 1.0e-25_f32).expect_err("too tight must error");
+    let _ = format!("{err}");
+}
+
+#[test]
+fn burr_params_with_bpk_rejects_n_zero() {
+    let err = BurrParams::with_bpk(0, 10.0).expect_err("n=0 must error");
+    let _ = format!("{err}");
+}
+
+#[test]
+fn burr_params_with_bpk_rejects_below_one() {
+    let err = BurrParams::with_bpk(100, 0.5).expect_err("bpk < 1 must error");
+    let _ = format!("{err}");
+}
+
+#[test]
+fn burr_params_with_bpk_rejects_above_64() {
+    let err = BurrParams::with_bpk(100, 70.0).expect_err("bpk > 64 must error");
+    let _ = format!("{err}");
+}
+
+#[test]
+fn burr_params_with_seed_sets_seed_field() {
+    let params = BurrParams::with_fp_rate(100, 0.01)
+        .unwrap()
+        .with_seed(0xDEAD_BEEF);
+    assert_eq!(params.seed, 0xDEAD_BEEF);
+}
+
+#[test]
+fn burr_builder_rejects_n_zero() {
+    let mut params = BurrParams::with_fp_rate(100, 0.01).unwrap();
+    params.n = 0;
+    let err = BurrBuilder::new(params, DefaultBuildHasher::default())
+        .expect_err("builder must reject n=0");
+    let msg = format!("{err}");
+    assert!(msg.contains("n must be > 0"), "got: {msg}");
+}
+
+#[test]
+fn burr_builder_rejects_zero_r() {
+    let mut params = BurrParams::with_fp_rate(100, 0.01).unwrap();
+    params.r = 0;
+    let err = BurrBuilder::new(params, DefaultBuildHasher::default())
+        .expect_err("builder must reject r=0");
+    let msg = format!("{err}");
+    assert!(msg.contains("r must be in 1..=64"), "got: {msg}");
+}
+
+#[test]
+fn burr_builder_rejects_zero_b() {
+    let mut params = BurrParams::with_fp_rate(100, 0.01).unwrap();
+    params.b = 0;
+    let err = BurrBuilder::new(params, DefaultBuildHasher::default())
+        .expect_err("builder must reject b=0");
+    let msg = format!("{err}");
+    assert!(msg.contains("b must be > 0"), "got: {msg}");
+}
+
+#[test]
+fn burr_builder_rejects_zero_max_layers() {
+    let mut params = BurrParams::with_fp_rate(100, 0.01).unwrap();
+    params.max_layers = 0;
+    let err = BurrBuilder::new(params, DefaultBuildHasher::default())
+        .expect_err("builder must reject max_layers=0");
+    let msg = format!("{err}");
+    assert!(msg.contains("max_layers"), "got: {msg}");
+}
+
+#[test]
+fn burr_layer_count_grows_with_input_size() {
+    // Empty input → 0 layers.
+    let params = BurrParams::with_fp_rate(100, 0.01).unwrap();
+    let builder = BurrBuilder::new(params, DefaultBuildHasher::default()).unwrap();
+    let empty: Vec<u64> = vec![];
+    let filter = builder.build_from_hashes(&empty).unwrap();
+    assert_eq!(filter.layer_count(), 0);
+}
+
+#[test]
+fn burr_filter_debug_format_includes_layer_count() {
+    let params = BurrParams::with_fp_rate(100, 0.01).unwrap();
+    let builder = BurrBuilder::new(params, DefaultBuildHasher::default()).unwrap();
+    let hashes: Vec<u64> = (0..100_u64)
+        .map(|i| crate::hash::hash64(&i.to_le_bytes()))
+        .collect();
+    let filter = builder.build_from_hashes(&hashes).unwrap();
+    let debug = format!("{filter:?}");
+    assert!(debug.contains("BurrFilter"), "got: {debug}");
+    assert!(debug.contains("layer_count"), "got: {debug}");
+}
+
+#[test]
+fn burr_filter_params_accessor() {
+    let params = BurrParams::with_fp_rate(500, 0.01).unwrap();
+    let builder = BurrBuilder::new(params, DefaultBuildHasher::default()).unwrap();
+    let hashes: Vec<u64> = (0..500_u64)
+        .map(|i| crate::hash::hash64(&i.to_le_bytes()))
+        .collect();
+    let filter = builder.build_from_hashes(&hashes).unwrap();
+    assert_eq!(filter.params().n, 500);
+    assert_eq!(filter.params().r, params.r);
+}
+
+#[test]
+fn burr_filter_contains_returns_false_for_definitely_absent() {
+    // n=64 small set, probe with hashes that almost certainly map outside.
+    // Just verify the absent path returns false sometimes (no false-negative
+    // for inserted; some false-positive is expected for non-inserted).
+    let n = 64_usize;
+    let params = BurrParams::with_fp_rate(n, 0.001).unwrap();
+    let builder = BurrBuilder::new(params, DefaultBuildHasher::default()).unwrap();
+    let hashes: Vec<u64> = (0..n as u64)
+        .map(|i| crate::hash::hash64(&i.to_le_bytes()))
+        .collect();
+    let filter = builder.build_from_hashes(&hashes).unwrap();
+    let mut false_count = 0_u32;
+    for i in 1000..2000_u64 {
+        let h = crate::hash::hash64(&i.to_le_bytes());
+        if !filter.contains_hash(h) {
+            false_count += 1;
+        }
+    }
+    assert!(
+        false_count > 800,
+        "expected most non-inserted keys to report absent, got false_count={false_count}"
     );
 }

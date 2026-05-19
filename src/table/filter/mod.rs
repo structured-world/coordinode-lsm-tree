@@ -61,9 +61,11 @@ impl BloomConstructionPolicy {
 
     /// Returns the estimated filter size in bytes.
     ///
-    /// `BuRR`'s storage is essentially `r` bits per key (the fingerprint
-    /// width) plus per-block threshold bytes (~1% overhead). For BPK
-    /// policy, `r ≈ bpk`. For FPR policy, `r = ceil(-log2(fpr))`.
+    /// Returns `0` if the policy is inactive for the given `n`
+    /// (`burr_params` would return `None`). Otherwise estimates the
+    /// `BuRR` body size as `n * r * 1.05 / 8` — `r` is the fingerprint
+    /// width chosen by the params constructor, `1.05` is a flat 5%
+    /// overhead for layer thresholds + last-layer enlargement.
     #[must_use]
     #[expect(
         clippy::cast_precision_loss,
@@ -72,17 +74,13 @@ impl BloomConstructionPolicy {
         reason = "estimation, precision loss is acceptable"
     )]
     pub fn estimated_filter_size(&self, n: usize) -> usize {
-        if n == 0 {
+        // Delegate to burr_params so the estimate is 0 exactly when the
+        // builder would also return empty — keeps memory accounting in
+        // sync with build behavior.
+        let Some(params) = self.burr_params(n) else {
             return 0;
-        }
-
-        let r_bits: f32 = match self {
-            Self::BitsPerKey(bpk) => bpk.clamp(1.0, 64.0),
-            Self::FalsePositiveRate(fpr) => (-fpr.log2()).ceil().clamp(1.0, 64.0),
         };
-
-        // ribbon body ≈ n * r bits; +5% layer overhead absorbs threshold
-        // metadata and last-layer enlargement. Divide by 8 for bytes.
+        let r_bits = f32::from(params.r);
         ((n as f32) * r_bits * 1.05 / 8.0) as usize
     }
 }
@@ -163,5 +161,96 @@ mod tests {
         for h in &hashes {
             assert!(reader.contains_hash(*h), "inserted hash {h} not found");
         }
+    }
+}
+
+#[cfg(test)]
+#[expect(clippy::expect_used, reason = "test code")]
+#[expect(clippy::unwrap_used, reason = "test code")]
+mod extra_tests {
+    use super::*;
+    use test_log::test;
+
+    #[test]
+    fn policy_default_is_bits_per_key_10() {
+        let policy = BloomConstructionPolicy::default();
+        assert_eq!(policy, BloomConstructionPolicy::BitsPerKey(10.0));
+    }
+
+    #[test]
+    fn is_active_false_for_bpk_below_one() {
+        assert!(!BloomConstructionPolicy::BitsPerKey(0.5).is_active());
+        assert!(!BloomConstructionPolicy::BitsPerKey(0.0).is_active());
+    }
+
+    #[test]
+    fn is_active_false_for_bpk_above_64() {
+        assert!(!BloomConstructionPolicy::BitsPerKey(70.0).is_active());
+    }
+
+    #[test]
+    fn is_active_true_for_valid_bpk() {
+        assert!(BloomConstructionPolicy::BitsPerKey(10.0).is_active());
+        assert!(BloomConstructionPolicy::BitsPerKey(1.0).is_active());
+        assert!(BloomConstructionPolicy::BitsPerKey(64.0).is_active());
+    }
+
+    #[test]
+    fn is_active_false_for_fpr_out_of_range() {
+        assert!(!BloomConstructionPolicy::FalsePositiveRate(0.0).is_active());
+        assert!(!BloomConstructionPolicy::FalsePositiveRate(-0.1).is_active());
+        assert!(!BloomConstructionPolicy::FalsePositiveRate(1.0).is_active());
+        assert!(!BloomConstructionPolicy::FalsePositiveRate(1.5).is_active());
+        // Too tight — would map to r > 64.
+        assert!(!BloomConstructionPolicy::FalsePositiveRate(1.0e-25_f32).is_active());
+    }
+
+    #[test]
+    fn is_active_true_for_valid_fpr() {
+        assert!(BloomConstructionPolicy::FalsePositiveRate(0.01).is_active());
+        assert!(BloomConstructionPolicy::FalsePositiveRate(0.0001).is_active());
+        assert!(BloomConstructionPolicy::FalsePositiveRate(0.5).is_active());
+    }
+
+    #[test]
+    fn estimated_size_zero_n_returns_zero() {
+        let policy = BloomConstructionPolicy::BitsPerKey(10.0);
+        assert_eq!(policy.estimated_filter_size(0), 0);
+        let policy_fpr = BloomConstructionPolicy::FalsePositiveRate(0.01);
+        assert_eq!(policy_fpr.estimated_filter_size(0), 0);
+    }
+
+    #[test]
+    fn burr_params_returns_none_for_n_zero() {
+        let policy = BloomConstructionPolicy::BitsPerKey(10.0);
+        assert!(policy.burr_params(0).is_none());
+    }
+
+    #[test]
+    fn burr_params_returns_some_for_valid_inputs() {
+        let policy = BloomConstructionPolicy::BitsPerKey(10.0);
+        let params = policy.burr_params(100).expect("valid");
+        assert_eq!(params.n, 100);
+        assert_eq!(params.r, 10);
+    }
+
+    #[test]
+    fn burr_params_fpr_variant() {
+        let policy = BloomConstructionPolicy::FalsePositiveRate(0.01);
+        let params = policy.burr_params(100).expect("valid");
+        assert_eq!(params.n, 100);
+        // r = ceil(-log2(0.01)) = 7
+        assert_eq!(params.r, 7);
+    }
+
+    #[test]
+    fn build_burr_filter_bytes_invalid_policy_returns_empty() {
+        // Policy too tight → burr_params returns None → empty bytes.
+        let policy = BloomConstructionPolicy::FalsePositiveRate(1.0e-25_f32);
+        let hashes: Vec<u64> = (0..10)
+            .map(|i: u64| crate::hash::hash64(&i.to_le_bytes()))
+            .collect();
+        let bytes = build_burr_filter_bytes(policy, &hashes).unwrap();
+        assert!(bytes.is_empty());
     }
 }

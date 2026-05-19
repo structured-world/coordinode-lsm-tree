@@ -36,6 +36,14 @@ pub struct BurrBuilder<S> {
     hasher: S,
 }
 
+impl<S> core::fmt::Debug for BurrBuilder<S> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("BurrBuilder")
+            .field("params", &self.params)
+            .finish()
+    }
+}
+
 impl<S> BurrBuilder<S>
 where
     S: BuildHasher + Clone,
