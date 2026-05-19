@@ -681,8 +681,13 @@ mod tests {
                 );
 
                 // seek_upper (reverse upper-bound — exercises seek_upper_impl
-                // with check_back_cache=true, strict-`<` predicate at
-                // restart_interval == 1).
+                // with check_back_cache=true). This test block uses
+                // restart_interval = 4, so both check_back_cache branches
+                // land in the `restart_interval > 1` arm of seek_upper_impl
+                // which uses the same `<=` predicate. The `restart_interval
+                // == 1` branches where `<` vs `<=` predicates diverge are
+                // separately covered by the BS-dominated lex/dyn tests above
+                // (which build the index block with restart_interval = 1).
                 let mut lex_iter = index_block.iter(lex.clone());
                 let lex_upper = lex_iter.seek_upper(needle, crate::SeqNo::MAX);
                 let mut dyn_iter = index_block.iter(dyn_cmp.clone());
@@ -703,11 +708,17 @@ mod tests {
                     "index seek_upper landing must match for needle {label} ({needle:?})",
                 );
 
-                // seek_upper_bound_cursor — same seek_upper_impl but with
-                // check_back_cache=false, which selects a `<=` predicate at
-                // restart_interval == 1 instead of `<`. A wrong operator in
-                // the lex closure of THIS branch would not be caught by the
-                // public seek_upper test above.
+                // seek_upper_bound_cursor — same seek_upper_impl with
+                // check_back_cache=false. With this test block's
+                // restart_interval = 4 it shares the `restart_interval > 1`
+                // arm with the public seek_upper above. The divergent
+                // `restart_interval == 1` paths (where check_back_cache=false
+                // uses `<=` and check_back_cache=true uses strict `<`) are
+                // covered by the dedicated dyn-path and lex-path tests above
+                // that build the index block with restart_interval = 1.
+                // This arm still verifies that the lex/dyn closures agree
+                // on landing position when both seek_upper variants are
+                // routed through the shared restart_interval>1 predicate.
                 let mut lex_iter = index_block.iter(lex.clone());
                 let lex_cursor = lex_iter
                     .seek_upper_bound_cursor(needle, crate::SeqNo::MAX)
