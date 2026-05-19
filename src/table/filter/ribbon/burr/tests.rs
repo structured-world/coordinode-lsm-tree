@@ -166,6 +166,140 @@ fn burr_wire_rejects_bad_magic() {
 }
 
 #[test]
+fn burr_single_key_round_trips() {
+    // Smallest possible filter. Last-layer enlargement must accommodate
+    // n=1 without LayerExhaustion. Hash-based + key-based both work.
+    let params = BurrParams::with_fp_rate(1, 0.01).expect("params");
+    let builder = BurrBuilder::new(params, DefaultBuildHasher::default()).expect("builder");
+    let key_hash = crate::hash::hash64(b"only-one");
+    let filter = builder
+        .build_from_hashes(&[key_hash])
+        .expect("build_from_hashes for n=1");
+    assert!(filter.contains_hash(key_hash));
+    let bytes = filter.to_wire_bytes();
+    let reader = super::filter::BurrFilterReader::new(&bytes).expect("decode");
+    assert!(reader.contains_hash(key_hash));
+}
+
+#[test]
+fn burr_build_is_deterministic_for_fixed_seed() {
+    // Same params + same input → same wire bytes. Wire format must not
+    // depend on hash-map iteration order or any other non-deterministic
+    // source. Anyone shipping BuRR filter blocks across hosts relies on
+    // this.
+    let params = BurrParams::with_fp_rate(200, 0.01).expect("params");
+    let hashes: Vec<u64> = (0..200_u64)
+        .map(|i| crate::hash::hash64(&i.to_le_bytes()))
+        .collect();
+    let bytes_a = {
+        let builder = BurrBuilder::new(params, DefaultBuildHasher::default()).expect("builder");
+        builder
+            .build_from_hashes(&hashes)
+            .expect("build")
+            .to_wire_bytes()
+    };
+    let bytes_b = {
+        let builder = BurrBuilder::new(params, DefaultBuildHasher::default()).expect("builder");
+        builder
+            .build_from_hashes(&hashes)
+            .expect("build")
+            .to_wire_bytes()
+    };
+    assert_eq!(bytes_a, bytes_b);
+}
+
+#[test]
+fn burr_wire_rejects_short_buffer() {
+    // Anything below the fixed header length must be rejected without
+    // panic. Important for hardening against truncated on-disk blocks.
+    use super::filter::BurrFilterReader;
+    let short = vec![0_u8; 4];
+    let result = BurrFilterReader::new(&short);
+    assert!(result.is_err(), "short buffer must error");
+}
+
+#[test]
+fn burr_wire_rejects_unknown_version() {
+    // Build a real filter, mutate the version byte, decode must fail.
+    use super::filter::BurrFilterReader;
+    let params = BurrParams::with_fp_rate(50, 0.01).expect("params");
+    let builder = BurrBuilder::new(params, DefaultBuildHasher::default()).expect("builder");
+    let hashes: Vec<u64> = (0..50_u64)
+        .map(|i| crate::hash::hash64(&[i as u8]))
+        .collect();
+    let filter = builder.build_from_hashes(&hashes).expect("build");
+    let mut bytes = filter.to_wire_bytes();
+    // version byte sits at offset MAGIC_LEN + 1 (after filter_type).
+    let version_offset = crate::file::MAGIC_BYTES.len() + 1;
+    bytes[version_offset] = 0xFE;
+    let result = BurrFilterReader::new(&bytes);
+    assert!(result.is_err(), "bad version must error");
+}
+
+#[test]
+fn burr_wire_rejects_unknown_filter_type() {
+    use super::filter::BurrFilterReader;
+    let params = BurrParams::with_fp_rate(50, 0.01).expect("params");
+    let builder = BurrBuilder::new(params, DefaultBuildHasher::default()).expect("builder");
+    let hashes: Vec<u64> = (0..50_u64)
+        .map(|i| crate::hash::hash64(&[i as u8]))
+        .collect();
+    let filter = builder.build_from_hashes(&hashes).expect("build");
+    let mut bytes = filter.to_wire_bytes();
+    let filter_type_offset = crate::file::MAGIC_BYTES.len();
+    bytes[filter_type_offset] = 0xAA;
+    let result = BurrFilterReader::new(&bytes);
+    assert!(result.is_err(), "unknown filter_type must error");
+}
+
+#[test]
+fn burr_negative_keys_obey_fpr_envelope_at_low_target() {
+    // Tight FPR (0.001) over moderate n. Realised FPR over disjoint
+    // probes must stay within a safety envelope around the target.
+    let n = 2_000_usize;
+    let params = BurrParams::with_fp_rate(n, 0.001).expect("params");
+    let builder = BurrBuilder::new(params, DefaultBuildHasher::default()).expect("builder");
+    let hashes: Vec<u64> = (0..n as u64)
+        .map(|i| crate::hash::hash64(&i.to_le_bytes()))
+        .collect();
+    let filter = builder.build_from_hashes(&hashes).expect("build");
+
+    let probe_count = 20_000_usize;
+    let mut false_positives = 0_usize;
+    for i in (n as u64)..(n as u64 + probe_count as u64) {
+        let h = crate::hash::hash64(&i.to_le_bytes());
+        if filter.contains_hash(h) {
+            false_positives += 1;
+        }
+    }
+    #[allow(clippy::cast_precision_loss)]
+    let fpr = false_positives as f64 / probe_count as f64;
+    // BuRR at FPR=0.001 typically realises ≤ 0.5%. Allow envelope.
+    assert!(fpr < 0.01, "realised FPR {fpr} > 1% envelope around 0.1%");
+}
+
+#[test]
+fn burr_contains_in_matches_contains_with_external_scratch() {
+    // The allocation-free probe path (contains_in with caller scratch)
+    // must agree with the convenience contains for every key in the set.
+    let n = 300_usize;
+    let params = BurrParams::with_fp_rate(n, 0.01).expect("params");
+    let builder = BurrBuilder::new(params, DefaultBuildHasher::default()).expect("builder");
+    let keys: Vec<u64> = (0..n as u64).collect();
+    let filter = builder.build(&keys).expect("build");
+    let mut scratch = filter.new_scratch();
+    for key in &keys {
+        let via_contains = filter.contains(key);
+        let via_contains_in = filter.contains_in(key, &mut scratch);
+        assert_eq!(
+            via_contains, via_contains_in,
+            "probe paths disagree on {key}"
+        );
+        assert!(via_contains, "inserted key {key} not present");
+    }
+}
+
+#[test]
 fn burr_settles_in_few_layers() {
     let n = 5_000_usize;
     let params = BurrParams::with_fp_rate(n, 0.01).expect("valid params");
