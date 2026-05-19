@@ -1,6 +1,141 @@
 # yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
 
+language: "en-US"
+# Stable channel — early-access features change between releases without
+# notice, which makes review output non-reproducible across runs.
+# Re-enable explicitly only when an early-access feature is needed.
+early_access: false
+
 reviews:
-  auto_label:
+  profile: "assertive"
+  request_changes_workflow: false
+  high_level_summary: true
+  high_level_summary_placeholder: "@coderabbitai summary"
+  poem: false
+  review_status: true
+  collapse_walkthrough: true
+  commit_status: true
+  assess_linked_issues: true
+  related_issues: true
+  related_prs: true
+  suggested_labels: true
+  auto_review:
     enabled: true
-  profile: assertive
+    auto_incremental_review: true
+    drafts: false
+    # Single `main` base: feat/#NNN and fix/#NNN are PR source branches,
+    # not long-lived integration targets — there are no release/* branches
+    # in this repo. The `upstream-monitor.yml` workflow also creates
+    # `chore/upstream-sync-*` sync PRs, and those ALWAYS target `main`
+    # (see the `--base main` flag on `gh pr create`). Widen this list if
+    # either convention ever changes.
+    base_branches: ["main"]
+    ignore_title_keywords: ["WIP", "DO NOT MERGE"]
+  path_instructions:
+    - path: "src/**/*.rs"
+      instructions: |
+        Review for memory safety, ownership correctness, and panic-free error handling.
+        No unwrap() on I/O or user-input paths. Prefer Result<T, E> everywhere.
+        No Box<dyn Any> as type bypass. No global mutable state (lazy_static Mutex<HashMap>).
+        Check multi-instance safety: no in-memory-only mutable state that breaks with N replicas.
+    - path: "tests/**"
+      instructions: |
+        Verify test coverage of edge cases and error paths.
+        No unwrap() on paths that test error handling.
+        Tests must have descriptive names and comments explaining WHAT is being tested.
+    - path: "benches/**"
+      instructions: |
+        Check benchmark methodology. Use criterion properly.
+        Measure P99/P999 latency, not just throughput.
+    - path: "src/compaction/**"
+      instructions: |
+        Compaction is crash-safety critical. Every state mutation must be atomic.
+        Verify no partial writes can corrupt on-disk state.
+    # Two near-identical blocks (single-file and module-directory layouts)
+    # so the rule survives a module-vs-single-file refactor — covers the
+    # current `src/encryption.rs`, any future `src/encryption_*.rs` split,
+    # and a `src/encryption/` directory.
+    #
+    # Why duplicate instead of consolidate:
+    #   - YAML anchors (&enc-review / *enc-review): CodeRabbit's
+    #     path_instructions schema doesn't document anchor support
+    #     reliably across versions.
+    #   - Brace expansion (`src/encryption{*.rs,/**}`): no schema
+    #     guarantee that CodeRabbit's glob engine supports brace
+    #     expansion — silently no-matching is the failure mode.
+    #   - Single broader glob (`src/encryption*`): may not cross `/`
+    #     in CodeRabbit's matcher → nested files lose context.
+    #
+    # The duplication is intentional given those uncertainties. The
+    # mirrored `⚠️ Keep this block in sync` trailers below remind
+    # editors to update both. Collapse if/when the schema clearly
+    # supports one of the above patterns.
+    - path: "src/encryption*.rs"
+      instructions: |
+        Security-critical code. Review for timing attacks, nonce reuse, key handling.
+        RNG must be CSPRNG. No hardcoded keys or IVs. AEAD nonces must never repeat
+        under the same key. Fork-aware reseed must be preserved.
+        ⚠️ Keep this block in sync with the `src/encryption/**` rule below.
+    - path: "src/encryption/**"
+      instructions: |
+        Security-critical code. Review for timing attacks, nonce reuse, key handling.
+        RNG must be CSPRNG. No hardcoded keys or IVs. AEAD nonces must never repeat
+        under the same key. Fork-aware reseed must be preserved.
+        ⚠️ Keep this block in sync with the `src/encryption*.rs` rule above.
+  tools:
+    shellcheck:
+      enabled: true
+    markdownlint:
+      enabled: true
+    github-checks:
+      enabled: true
+      timeout_ms: 120000
+
+chat:
+  auto_reply: true
+
+knowledge_base:
+  learnings:
+    scope: auto
+  issues:
+    scope: auto
+  pull_requests:
+    scope: auto
+  code_guidelines:
+    enabled: true
+    filePatterns:
+      - ".github/copilot-instructions.md"
+      - ".github/instructions/*.instructions.md"
+
+issue_enrichment:
+  labeling:
+    auto_apply_labels: true
+    labeling_instructions:
+      - label: "bug"
+        instructions: "Code defect, incorrect behavior, crash, data corruption, wrong results"
+      - label: "enhancement"
+        instructions: "New feature, new API, new capability not previously available"
+      - label: "performance"
+        instructions: "Optimization, reduced allocations, faster path, benchmark improvement"
+      - label: "refactor"
+        instructions: "Code restructuring without behavior change — renames, extractions, trait threading"
+      - label: "test"
+        instructions: "New tests, test infrastructure, test helpers, flaky test fixes"
+      - label: "ci"
+        instructions: "CI/CD workflows, GitHub Actions, benchmarks pipeline, release automation"
+      - label: "documentation"
+        instructions: "Documentation only — README, doc comments, arch docs, no code changes"
+      - label: "comparator"
+        instructions: "UserComparator threading, custom key ordering, lexicographic vs comparator-aware"
+      - label: "compaction"
+        instructions: "LSM compaction logic, leveled/tiered strategy, L0/L1/L2 overlap, compaction picker"
+      - label: "crash-safety"
+        instructions: "Crash recovery, fsync ordering, atomic writes, WAL correctness, data durability"
+      - label: "encryption"
+        instructions: "Block encryption, AES-GCM, key management, nonce handling"
+      - label: "fs-trait"
+        instructions: "Filesystem abstraction, Fs trait, io_uring, per-level routing, StdFs"
+      - label: "upstream-candidate"
+        instructions: "Fix or feature that could be contributed back to fjall-rs upstream"
+      - label: "fork-only"
+        instructions: "Feature specific to CoordiNode fork — range tombstones, merge operators, prefix bloom, V4 format"
