@@ -1420,4 +1420,482 @@ mod tests {
 
         Ok(())
     }
+
+    // Regression tests for binary-search-predicate devirtualization on the
+    // lexicographic fast path.
+    //
+    // The implementation branches once on `cmp.is_lexicographic()` per seek
+    // entry point and picks a closure that does direct slice comparison on
+    // the lex path (no vtable). These tests use a counting comparator
+    // wrapper to ASSERT that:
+    //   1. when `is_lexicographic() == true`, the comparator's `compare()`
+    //      is never invoked during the binary-search probe loop (lex closure
+    //      bypasses it)
+    //   2. when `is_lexicographic() == false`, `compare()` IS invoked
+    //      (preserves correctness for custom orderings)
+    //
+    // Behavioural-equivalence between lex and dyn paths is already exercised
+    // by the broader `custom_comparator*` integration tests; these tests
+    // specifically guard against accidental fallback into the dyn path on
+    // the default comparator (which would silently regress performance
+    // without any observable test failure).
+    mod devirt {
+        use crate::comparator::UserComparator;
+        use crate::{
+            Checksum, InternalValue, SeqNo,
+            ValueType::Value,
+            table::{
+                Block, DataBlock,
+                block::{BlockType, Header, ParsedItem},
+            },
+        };
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+        struct CountingComparator {
+            /// Counts `compare()` invocations — proves the lex devirt path
+            /// successfully bypasses the `dyn UserComparator::compare` vtable.
+            count: Arc<AtomicUsize>,
+            /// Counts `is_lexicographic()` invocations. Sanity counter that
+            /// asserts the BS predicate factories in `iter.rs` actually
+            /// consulted `is_lexicographic()` to select a closure — guards
+            /// the false-negative where the lex test's `count <=
+            /// LEX_PATH_LINEAR_SCAN_BOUND` assertion passes trivially
+            /// because no seeks ran at all.
+            ///
+            /// After the review-driven revert of the `compare_key`
+            /// no-prefix lex fast path, the ONLY remaining `is_lex` call
+            /// sites are:
+            ///   - BS predicate construction sites in iter.rs (one call per
+            ///     seek entry point, hoisted out of the BS loop)
+            ///   - `compare_prefixed_slice` in util.rs (per-item, prefix
+            ///     branch only — not exercised by our tests' simple keys)
+            ///
+            /// So `is_lex_count > 0` reliably indicates a BS predicate
+            /// factory ran. The TRUE proof that it selected the LEX
+            /// closure is `count <= LEX_PATH_LINEAR_SCAN_BOUND` (a dyn
+            /// closure would produce >= `DYN_MIN_BS_PROBES` calls from BS
+            /// probes alone).
+            is_lex_count: Arc<AtomicUsize>,
+            lex: bool,
+        }
+
+        impl UserComparator for CountingComparator {
+            fn name(&self) -> &'static str {
+                "counting"
+            }
+            fn compare(&self, a: &[u8], b: &[u8]) -> std::cmp::Ordering {
+                self.count.fetch_add(1, AtomicOrdering::Relaxed);
+                a.cmp(b)
+            }
+            fn is_lexicographic(&self) -> bool {
+                self.is_lex_count.fetch_add(1, AtomicOrdering::Relaxed);
+                self.lex
+            }
+        }
+
+        /// Block tuned to make BINARY-SEARCH PROBES dominate any potential
+        /// linear-scan contribution to the call count:
+        ///   - 128 keys, `restart_interval=1` → 128 restart heads
+        ///   - binary search: log2(128) = 7 probes minimum
+        ///   - linear scan after BS lands: 0-1 iterations (each restart head
+        ///     IS an item, so the scan either returns immediately or steps once)
+        ///
+        /// Discrimination math (paired with an above-max needle that bounds
+        /// the linear-scan contribution to <= 1 `compare_key` call — see
+        /// [`above_max_needle`]). Note: after a review-driven revert, the
+        /// no-prefix `compare_key` branch in `data_block/mod.rs` no longer
+        /// has a lex fast path, so each linear-scan step calls
+        /// `cmp.compare()` regardless of `is_lexicographic()`. This makes
+        /// the discrimination explicit:
+        ///   - dyn path working correctly: 7 (BS) + 1 (scan) = 8
+        ///   - lex closure leaked into dyn BS: 0 (BS) + 1 (scan) = 1
+        ///
+        /// `assert delta >= DYN_MIN_BS_PROBES` (= 7) cleanly distinguishes
+        /// the two cases. Earlier rounds of this test used `>= 2`, which
+        /// was matchable by a working linear scan alone for exact-key
+        /// needles (e.g. `seek_upper_exclusive` reverse scan: Equal-skip
+        /// then Less-return = 2 `compare_key` calls). The above-max needle
+        /// + 7-probe threshold rules out that false positive.
+        fn build_block_bs_dominated() -> crate::Result<DataBlock> {
+            let items: Vec<_> = (0_u64..128)
+                .map(|i| InternalValue::from_components(i.to_be_bytes(), "", 0, Value))
+                .collect();
+            let bytes = DataBlock::encode_into_vec(&items, 1, 1.33)?;
+            Ok(DataBlock::new(Block {
+                data: bytes.into(),
+                header: Header {
+                    block_type: BlockType::Data,
+                    checksum: Checksum::from_raw(0),
+                    data_length: 0,
+                    uncompressed_length: 0,
+                },
+            }))
+        }
+
+        /// Minimum number of `compare()` calls a working dyn binary-search
+        /// is expected to make on the BS-dominated block: `⌈log2(128)⌉ = 7`
+        /// probes against restart heads.
+        ///
+        /// Discrimination math (paired with an ABOVE-MAX needle in the
+        /// dyn tests for `seek_upper` / `seek_upper_exclusive`):
+        ///   - working dyn path:  7 BS probes + 1 linear-scan `compare_key` = 8
+        ///   - lex closure leak:  0 BS probes + 1 linear-scan `compare_key` = 1
+        ///
+        /// `assert delta >= 7` cleanly catches the lex-leak even after
+        /// accounting for the bounded linear-scan contribution. A weaker
+        /// threshold (e.g. `>= 2`) would fail to discriminate for needles
+        /// that produce 2+ linear-scan calls — for example an exact-key
+        /// needle hits in `seek_upper_exclusive` reverse scan
+        /// (Equal-skip then Less-return), which can satisfy `>= 2` even
+        /// when the BS predicate accidentally took the lex path.
+        const DYN_MIN_BS_PROBES: usize = 7;
+
+        /// Builds a needle that sorts strictly above the maximum encoded
+        /// key (key 127 in [`build_block_bs_dominated`]). Choosing this
+        /// needle bounds the reverse linear-scan contribution to exactly
+        /// 1 `compare_key` call (`peek_back` lands on key 127 → Less →
+        /// returns immediately), keeping the dyn / lex-leak discrimination
+        /// math above clean.
+        fn above_max_needle() -> Vec<u8> {
+            let mut v = 127_u64.to_be_bytes().to_vec();
+            v.push(0xFF);
+            v
+        }
+
+        /// Upper bound on `compare()` calls a lex-path seek can produce from
+        /// the LINEAR-SCAN `compare_key` calls alone (BS predicate makes 0
+        /// calls when lex closure is correctly selected). With above-max
+        /// needle on a 128-key block (`restart_interval=1`), each entry point's
+        /// linear scan visits exactly 1 item before returning. A regression
+        /// where BS fell back to the dyn closure would produce
+        /// `>= DYN_MIN_BS_PROBES` (= 7) calls — far above this bound.
+        const LEX_PATH_LINEAR_SCAN_BOUND: usize = 2;
+
+        #[test]
+        fn data_block_seek_lex_path_skips_vtable() -> crate::Result<()> {
+            // is_lexicographic() == true must route ALL 3 devirtualized BS
+            // predicates through the static-dispatch closures. Per-entry-point
+            // snapshot localises a regression to the offending entry point.
+            //
+            // Above-max needle bounds each entry point's linear-scan compare_key
+            // contribution to <= 1 call. A working lex path produces
+            // count <= LEX_PATH_LINEAR_SCAN_BOUND; a regression where the dyn
+            // closure leaked into the BS predicate would produce
+            // >= DYN_MIN_BS_PROBES (= 7) calls — orders-of-magnitude separation.
+            let data_block = build_block_bs_dominated()?;
+            let count = Arc::new(AtomicUsize::new(0));
+            let is_lex_count = Arc::new(AtomicUsize::new(0));
+            let cmp: Arc<dyn UserComparator> = Arc::new(CountingComparator {
+                count: count.clone(),
+                is_lex_count: is_lex_count.clone(),
+                lex: true,
+            });
+            let needle = above_max_needle();
+
+            let before = count.load(AtomicOrdering::Relaxed);
+            let before_lex = is_lex_count.load(AtomicOrdering::Relaxed);
+            {
+                let mut iter = data_block.iter(cmp.clone());
+                let _ = iter.seek(&needle, SeqNo::MAX);
+            }
+            let after_seek = count.load(AtomicOrdering::Relaxed);
+            let after_seek_lex = is_lex_count.load(AtomicOrdering::Relaxed);
+            let seek_delta = after_seek - before;
+            assert!(
+                seek_delta <= LEX_PATH_LINEAR_SCAN_BOUND,
+                "seek (forward seqno-aware) lex path leaked into dyn BS: {seek_delta} compare() calls (expected <= {LEX_PATH_LINEAR_SCAN_BOUND}, only linear-scan contribution)",
+            );
+            assert!(
+                after_seek_lex - before_lex >= 1,
+                "seek lex path must consult is_lexicographic() to select the lex closure, got {} calls — branch may have been hardcoded?",
+                after_seek_lex - before_lex,
+            );
+
+            {
+                let mut iter = data_block.iter(cmp.clone());
+                let _ = iter.seek_upper(&needle, SeqNo::MAX);
+            }
+            let after_upper = count.load(AtomicOrdering::Relaxed);
+            let after_upper_lex = is_lex_count.load(AtomicOrdering::Relaxed);
+            let upper_delta = after_upper - after_seek;
+            assert!(
+                upper_delta <= LEX_PATH_LINEAR_SCAN_BOUND,
+                "seek_upper lex path leaked into dyn BS: {upper_delta} compare() calls (expected <= {LEX_PATH_LINEAR_SCAN_BOUND})",
+            );
+            assert!(
+                after_upper_lex - after_seek_lex >= 1,
+                "seek_upper lex path must consult is_lexicographic(), got {} calls",
+                after_upper_lex - after_seek_lex,
+            );
+
+            {
+                let mut iter = data_block.iter(cmp);
+                let _ = iter.seek_upper_exclusive(&needle, SeqNo::MAX);
+            }
+            let after_excl = count.load(AtomicOrdering::Relaxed);
+            let after_excl_lex = is_lex_count.load(AtomicOrdering::Relaxed);
+            let excl_delta = after_excl - after_upper;
+            assert!(
+                excl_delta <= LEX_PATH_LINEAR_SCAN_BOUND,
+                "seek_upper_exclusive lex path leaked into dyn BS: {excl_delta} compare() calls (expected <= {LEX_PATH_LINEAR_SCAN_BOUND})",
+            );
+            assert!(
+                after_excl_lex - after_upper_lex >= 1,
+                "seek_upper_exclusive lex path must consult is_lexicographic(), got {} calls",
+                after_excl_lex - after_upper_lex,
+            );
+            Ok(())
+        }
+
+        #[test]
+        fn data_block_seek_to_key_seqno_dyn_path_invokes_compare() -> crate::Result<()> {
+            // `seek_to_key_seqno` is the FORWARD seqno-aware binary search
+            // exposed WITHOUT an attached linear scan — perfect isolation
+            // for the BS predicate. Working dyn path → exactly 7 BS probes.
+            // Lex closure leak → 0 calls.
+            let data_block = build_block_bs_dominated()?;
+            let count = Arc::new(AtomicUsize::new(0));
+            let cmp: Arc<dyn UserComparator> = Arc::new(CountingComparator {
+                count: count.clone(),
+                is_lex_count: Arc::new(AtomicUsize::new(0)),
+                lex: false,
+            });
+            let needle = 64_u64.to_be_bytes();
+
+            let before = count.load(AtomicOrdering::Relaxed);
+            {
+                let mut iter = data_block.iter(cmp);
+                let _ = iter.seek_to_key_seqno(&needle, SeqNo::MAX);
+            }
+            let delta = count.load(AtomicOrdering::Relaxed) - before;
+            assert!(
+                delta >= DYN_MIN_BS_PROBES,
+                "seek_to_key_seqno dyn BS must call compare() at least {DYN_MIN_BS_PROBES} times \
+                 (log2(128 restart heads) probes, no linear scan), got {delta} — lex closure leaked into dyn BS?",
+            );
+            Ok(())
+        }
+
+        #[test]
+        fn data_block_seek_upper_dyn_path_invokes_compare() -> crate::Result<()> {
+            // `seek_upper` does binary search + reverse linear scan. In dyn
+            // path the linear scan also calls `compare_key` (which goes
+            // through `cmp.compare()` via its own dyn branch). To prevent
+            // the linear scan from inflating the count to a value that a
+            // lex-BS-leak could also reach via scan-only contribution, we
+            // use an ABOVE-MAX needle (see `above_max_needle`): BS lands on
+            // key 127, peek_back returns key 127, compare_key → Less → loop
+            // exits → exactly 1 linear-scan call.
+            //
+            //   working dyn:  7 BS probes + 1 linear = 8  ✓ delta >= 7
+            //   lex-leak:     0 BS probes + 1 linear = 1  ✗ delta >= 7
+            let data_block = build_block_bs_dominated()?;
+            let count = Arc::new(AtomicUsize::new(0));
+            let cmp: Arc<dyn UserComparator> = Arc::new(CountingComparator {
+                count: count.clone(),
+                is_lex_count: Arc::new(AtomicUsize::new(0)),
+                lex: false,
+            });
+            let needle = above_max_needle();
+
+            let before = count.load(AtomicOrdering::Relaxed);
+            {
+                let mut iter = data_block.iter(cmp);
+                let _ = iter.seek_upper(&needle, SeqNo::MAX);
+            }
+            let delta = count.load(AtomicOrdering::Relaxed) - before;
+            assert!(
+                delta >= DYN_MIN_BS_PROBES,
+                "seek_upper dyn BS must call compare() at least {DYN_MIN_BS_PROBES} times \
+                 (log2(128 restart heads) probes), got {delta} — lex closure leaked into dyn BS?",
+            );
+            Ok(())
+        }
+
+        #[test]
+        fn data_block_seek_upper_exclusive_dyn_path_invokes_compare() -> crate::Result<()> {
+            // Same above-max-needle strategy as `seek_upper`. For
+            // `seek_upper_exclusive` (last key < needle) with needle
+            // above-max: BS lands on key 127, peek_back returns key 127,
+            // compare_key → Less → return true. Exactly 1 linear-scan call.
+            //
+            // The earlier version used `needle = 64` (exact-key match),
+            // which caused the reverse scan to consume Equal (key 64) THEN
+            // continue to key 63 (Less, return) — 2 linear calls. With the
+            // old `>= 2` threshold, a leaked-lex BS would still pass
+            // (0 + 2 = 2). The above-max needle bounds linear contribution
+            // to 1, restoring the discrimination math.
+            let data_block = build_block_bs_dominated()?;
+            let count = Arc::new(AtomicUsize::new(0));
+            let cmp: Arc<dyn UserComparator> = Arc::new(CountingComparator {
+                count: count.clone(),
+                is_lex_count: Arc::new(AtomicUsize::new(0)),
+                lex: false,
+            });
+            let needle = above_max_needle();
+
+            let before = count.load(AtomicOrdering::Relaxed);
+            {
+                let mut iter = data_block.iter(cmp);
+                let _ = iter.seek_upper_exclusive(&needle, SeqNo::MAX);
+            }
+            let delta = count.load(AtomicOrdering::Relaxed) - before;
+            assert!(
+                delta >= DYN_MIN_BS_PROBES,
+                "seek_upper_exclusive dyn BS must call compare() at least {DYN_MIN_BS_PROBES} times \
+                 (log2(128 restart heads) probes), got {delta} — lex closure leaked into dyn BS?",
+            );
+            Ok(())
+        }
+
+        // Smaller block reused by the equivalence test where boundary needles
+        // matter more than BS-vs-scan call-count discrimination.
+        fn build_block_for_equivalence() -> crate::Result<DataBlock> {
+            let items: Vec<_> = (0_u64..64)
+                .map(|i| InternalValue::from_components(i.to_be_bytes(), "", 0, Value))
+                .collect();
+            let bytes = DataBlock::encode_into_vec(&items, 8, 1.33)?;
+            Ok(DataBlock::new(Block {
+                data: bytes.into(),
+                header: Header {
+                    block_type: BlockType::Data,
+                    checksum: Checksum::from_raw(0),
+                    data_length: 0,
+                    uncompressed_length: 0,
+                },
+            }))
+        }
+
+        #[test]
+        fn data_block_seek_lex_and_dyn_agree_on_landing_position() -> crate::Result<()> {
+            // Equivalence check: lex and dyn paths must produce IDENTICAL
+            // landing positions for every probe. If the lex closure ever
+            // disagrees with `compare() != Greater` semantics (e.g. wrong
+            // operator), this test catches it before integration suites do.
+            //
+            // Encoded keys are 64 entries of `u64::to_be_bytes()` (8-byte
+            // fixed-width). Needles are raw byte slices that cover the full
+            // `partition_point` boundary table:
+            //   - empty slice                              → BELOW the minimum
+            //     (sorts before any non-empty byte sequence) → left == 0
+            //   - 8 zero bytes (== key 0)                  → exact-min hit
+            //   - between-key needle (9 bytes, prefix of key 17 + 0x00) →
+            //     sorts strictly between [0…0,17] and [0…0,18] → predicate
+            //     transition mid-range
+            //   - 8-byte key 32                            → exact mid-hit
+            //   - 8-byte key 63                            → exact-tail hit
+            //     (last key, left == len exercise)
+            //   - 9-byte above-key-63 needle               → above max, no match
+            //
+            // The earlier version of this test used only `u64::to_be_bytes()`
+            // values; all were exact-keys plus one above-max, missing the
+            // genuine below-min and between-key partition_point boundary
+            // cases that this test now claims to cover.
+            let data_block = build_block_for_equivalence()?;
+            let lex: Arc<dyn UserComparator> = Arc::new(CountingComparator {
+                count: Arc::new(AtomicUsize::new(0)),
+                is_lex_count: Arc::new(AtomicUsize::new(0)),
+                lex: true,
+            });
+            let dyn_cmp: Arc<dyn UserComparator> = Arc::new(CountingComparator {
+                count: Arc::new(AtomicUsize::new(0)),
+                is_lex_count: Arc::new(AtomicUsize::new(0)),
+                lex: false,
+            });
+
+            // (label, needle_bytes)
+            let between_17_and_18: Vec<u8> = {
+                let mut v = 17_u64.to_be_bytes().to_vec();
+                v.push(0); // 9 bytes: > 17, < 18 lexicographically
+                v
+            };
+            let above_max: Vec<u8> = {
+                let mut v = 63_u64.to_be_bytes().to_vec();
+                v.push(0xFF); // 9 bytes after the largest 8-byte key
+                v
+            };
+            let needles: Vec<(&str, Vec<u8>)> = vec![
+                ("below-min (empty slice)", vec![]),
+                ("exact-min (key 0)", 0_u64.to_be_bytes().to_vec()),
+                ("between keys 17 and 18", between_17_and_18),
+                ("exact-mid (key 32)", 32_u64.to_be_bytes().to_vec()),
+                ("exact-tail (key 63)", 63_u64.to_be_bytes().to_vec()),
+                ("above-max (key 63 + 0xFF)", above_max),
+            ];
+
+            // Exercise all three devirtualized entry points against the
+            // same boundary needle table. Each entry point has a distinct
+            // predicate shape (forward seqno-aware 3-way, reverse `<=`,
+            // reverse `<`), so call-count assertions alone wouldn't catch
+            // a `<` vs `<=` landing mismatch.
+            for (label, needle) in &needles {
+                // seek (forward seqno-aware, inclusive)
+                let mut lex_iter = data_block.iter(lex.clone());
+                let lex_seek = lex_iter.seek(needle, SeqNo::MAX);
+                let lex_landing = lex_iter
+                    .next()
+                    .map(|e| e.materialize(data_block.as_slice()).key.user_key);
+                let mut dyn_iter = data_block.iter(dyn_cmp.clone());
+                let dyn_seek = dyn_iter.seek(needle, SeqNo::MAX);
+                let dyn_landing = dyn_iter
+                    .next()
+                    .map(|e| e.materialize(data_block.as_slice()).key.user_key);
+                assert_eq!(
+                    lex_seek, dyn_seek,
+                    "seek result must match for needle {label} ({needle:?})",
+                );
+                assert_eq!(
+                    lex_landing, dyn_landing,
+                    "seek landing must match for needle {label} ({needle:?})",
+                );
+
+                // seek_upper (reverse, inclusive — last key <= needle)
+                let mut lex_iter = data_block.iter(lex.clone());
+                let lex_upper = lex_iter.seek_upper(needle, SeqNo::MAX);
+                let lex_upper_landing = lex_iter
+                    .next_back()
+                    .map(|e| e.materialize(data_block.as_slice()).key.user_key);
+                let mut dyn_iter = data_block.iter(dyn_cmp.clone());
+                let dyn_upper = dyn_iter.seek_upper(needle, SeqNo::MAX);
+                let dyn_upper_landing = dyn_iter
+                    .next_back()
+                    .map(|e| e.materialize(data_block.as_slice()).key.user_key);
+                assert_eq!(
+                    lex_upper, dyn_upper,
+                    "seek_upper result must match for needle {label} ({needle:?})",
+                );
+                assert_eq!(
+                    lex_upper_landing, dyn_upper_landing,
+                    "seek_upper landing must match for needle {label} ({needle:?})",
+                );
+
+                // seek_upper_exclusive (reverse, exclusive — last key < needle).
+                // The method positions the REVERSE cursor (its internal loop
+                // uses peek_back/next_back), so the landed item must be read
+                // via next_back() — calling next() would observe the unchanged
+                // FORWARD cursor and miss a wrong-operator regression in the
+                // lex closure of this entry point.
+                let mut lex_iter = data_block.iter(lex.clone());
+                let lex_excl = lex_iter.seek_upper_exclusive(needle, SeqNo::MAX);
+                let lex_excl_landing = lex_iter
+                    .next_back()
+                    .map(|e| e.materialize(data_block.as_slice()).key.user_key);
+                let mut dyn_iter = data_block.iter(dyn_cmp.clone());
+                let dyn_excl = dyn_iter.seek_upper_exclusive(needle, SeqNo::MAX);
+                let dyn_excl_landing = dyn_iter
+                    .next_back()
+                    .map(|e| e.materialize(data_block.as_slice()).key.user_key);
+                assert_eq!(
+                    lex_excl, dyn_excl,
+                    "seek_upper_exclusive result must match for needle {label} ({needle:?})",
+                );
+                assert_eq!(
+                    lex_excl_landing, dyn_excl_landing,
+                    "seek_upper_exclusive landing must match for needle {label} ({needle:?})",
+                );
+            }
+            Ok(())
+        }
+    }
 }

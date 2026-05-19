@@ -334,6 +334,18 @@ impl ParsedItem<InternalValue> for DataBlockParsedItem {
             let rest_key = unsafe { bytes.get_unchecked(self.key.0..self.key.1) };
             compare_prefixed_slice(prefix, rest_key, needle, cmp)
         } else {
+            // The no-prefix branch has no allocation to avoid — `compare()` on
+            // a contiguous slice is already optimal for any comparator. Adding
+            // an `is_lexicographic()` short-circuit here costs custom
+            // comparators an extra `dyn` vtable call per linear-scan step
+            // without any matching saving on the default path (where `<[u8]>::cmp`
+            // and `DefaultUserComparator::compare` lower to the same memcmp).
+            // The lex fast path is intentionally kept ONLY on the prefix branch
+            // above (where `compare_prefixed_slice_lexicographic` avoids the
+            // prefix+suffix concatenation allocation) and at the binary-search
+            // predicate construction sites in `iter.rs` (where one
+            // `is_lexicographic()` call is hoisted to amortise across all
+            // O(log restarts) BS probes).
             let key = unsafe { bytes.get_unchecked(self.key.0..self.key.1) };
             cmp.compare(key, needle)
         }

@@ -55,15 +55,31 @@ impl<'a> Iter<'a> {
     /// `needle` will be found within roughly one restart interval of the
     /// resulting position.
     pub fn seek_to_key_seqno(&mut self, needle: &[u8], seqno: SeqNo) -> bool {
+        // Lex fast path: `<[u8]>::cmp` is statically dispatched and inlinable
+        // — no vtable lookup per probe. The custom-comparator branch retains
+        // the existing `dyn UserComparator::compare` call. Each closure has a
+        // distinct type, so `Decoder::seek` monomorphizes both shapes and the
+        // inner binary-search loop is virtual-call-free on the lex path.
         let cmp = &self.comparator;
-        self.decoder.inner_mut().seek(
-            |head_key, head_seqno| match cmp.compare(head_key, needle) {
-                std::cmp::Ordering::Less => true,
-                std::cmp::Ordering::Equal => head_seqno >= seqno,
-                std::cmp::Ordering::Greater => false,
-            },
-            false,
-        )
+        if cmp.is_lexicographic() {
+            self.decoder.inner_mut().seek(
+                |head_key, head_seqno| match head_key.cmp(needle) {
+                    std::cmp::Ordering::Less => true,
+                    std::cmp::Ordering::Equal => head_seqno >= seqno,
+                    std::cmp::Ordering::Greater => false,
+                },
+                false,
+            )
+        } else {
+            self.decoder.inner_mut().seek(
+                |head_key, head_seqno| match cmp.compare(head_key, needle) {
+                    std::cmp::Ordering::Less => true,
+                    std::cmp::Ordering::Equal => head_seqno >= seqno,
+                    std::cmp::Ordering::Greater => false,
+                },
+                false,
+            )
+        }
     }
 
     pub fn seek(&mut self, needle: &[u8], seqno: SeqNo) -> bool {
@@ -111,10 +127,17 @@ impl<'a> Iter<'a> {
     /// would skip intervals that may contain the visible version.
     pub fn seek_upper(&mut self, needle: &[u8], _seqno: SeqNo) -> bool {
         let cmp = &self.comparator;
-        if !self.decoder.inner_mut().seek_upper(
-            |head_key, _| cmp.compare(head_key, needle) != std::cmp::Ordering::Greater,
-            false,
-        ) {
+        let landed = if cmp.is_lexicographic() {
+            self.decoder
+                .inner_mut()
+                .seek_upper(|head_key, _| head_key <= needle, false)
+        } else {
+            self.decoder.inner_mut().seek_upper(
+                |head_key, _| cmp.compare(head_key, needle) != std::cmp::Ordering::Greater,
+                false,
+            )
+        };
+        if !landed {
             return false;
         }
 
@@ -177,10 +200,17 @@ impl<'a> Iter<'a> {
     /// seeks.
     pub fn seek_upper_exclusive(&mut self, needle: &[u8], _seqno: SeqNo) -> bool {
         let cmp = &self.comparator;
-        if !self.decoder.inner_mut().seek_upper(
-            |head_key, _| cmp.compare(head_key, needle) != std::cmp::Ordering::Greater,
-            false,
-        ) {
+        let landed = if cmp.is_lexicographic() {
+            self.decoder
+                .inner_mut()
+                .seek_upper(|head_key, _| head_key <= needle, false)
+        } else {
+            self.decoder.inner_mut().seek_upper(
+                |head_key, _| cmp.compare(head_key, needle) != std::cmp::Ordering::Greater,
+                false,
+            )
+        };
+        if !landed {
             return false;
         }
 

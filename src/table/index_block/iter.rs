@@ -49,14 +49,30 @@ impl<'a> Iter<'a> {
             self.decoder.reset_back_peeked();
             self.decoder.inner_mut().reset_back_cursor();
         }
-        if !self.decoder.inner_mut().seek(
-            |end_key, s| match cmp.compare(end_key, needle) {
-                std::cmp::Ordering::Greater => false,
-                std::cmp::Ordering::Less => true,
-                std::cmp::Ordering::Equal => s >= seqno,
-            },
-            true,
-        ) {
+        // Lex fast path skips the `dyn UserComparator::compare` vtable in the
+        // binary-search probe loop. Each closure is a distinct type, so
+        // `Decoder::seek` monomorphizes per-shape and the inner loop is
+        // virtual-call-free when the default lexicographic comparator is in use.
+        let landed = if cmp.is_lexicographic() {
+            self.decoder.inner_mut().seek(
+                |end_key, s| match end_key.cmp(needle) {
+                    std::cmp::Ordering::Greater => false,
+                    std::cmp::Ordering::Less => true,
+                    std::cmp::Ordering::Equal => s >= seqno,
+                },
+                true,
+            )
+        } else {
+            self.decoder.inner_mut().seek(
+                |end_key, s| match cmp.compare(end_key, needle) {
+                    std::cmp::Ordering::Greater => false,
+                    std::cmp::Ordering::Less => true,
+                    std::cmp::Ordering::Equal => s >= seqno,
+                },
+                true,
+            )
+        };
+        if !landed {
             return false;
         }
 
@@ -105,15 +121,26 @@ impl<'a> Iter<'a> {
             self.decoder.reset_back_peeked();
         }
         let restart_interval = self.decoder.inner_mut().restart_interval();
+        // Same devirtualization strategy as `seek_with_cache_resets`: split on
+        // `is_lexicographic()` so the inner binary-search predicate is a static
+        // slice comparison on the lex path. The three predicate shapes (strict <,
+        // ≤, ≤) each get their own pair of monomorphizations.
+        let lex = cmp.is_lexicographic();
         let found = if restart_interval == 1 {
             if check_back_cache {
                 // BACK CURSOR (reverse iteration): find the first block whose
                 // end_key ≥ needle.  Using strict-less here together with
                 // partition_point_2 lands exactly on that block.
-                self.decoder.inner_mut().seek_upper(
-                    |end_key, _s| cmp.compare(end_key, needle) == std::cmp::Ordering::Less,
-                    true,
-                )
+                if lex {
+                    self.decoder
+                        .inner_mut()
+                        .seek_upper(|end_key, _s| end_key < needle, true)
+                } else {
+                    self.decoder.inner_mut().seek_upper(
+                        |end_key, _s| cmp.compare(end_key, needle) == std::cmp::Ordering::Less,
+                        true,
+                    )
+                }
             } else {
                 // FORWARD LIMIT (upper-bound for forward scan): we must include
                 // *all* blocks whose end_key ≤ needle (they may contain entries
@@ -125,11 +152,21 @@ impl<'a> Iter<'a> {
                 // pure-merge scenario with 4 000 operands for one user_key),
                 // the predicate is true for every entry so partition_point_2
                 // returns the last entry — allowing all blocks to be visited.
-                self.decoder.inner_mut().seek_upper(
-                    |end_key, _s| cmp.compare(end_key, needle) != std::cmp::Ordering::Greater,
-                    true,
-                )
+                if lex {
+                    self.decoder
+                        .inner_mut()
+                        .seek_upper(|end_key, _s| end_key <= needle, true)
+                } else {
+                    self.decoder.inner_mut().seek_upper(
+                        |end_key, _s| cmp.compare(end_key, needle) != std::cmp::Ordering::Greater,
+                        true,
+                    )
+                }
             }
+        } else if lex {
+            self.decoder
+                .inner_mut()
+                .seek_upper(|end_key, _s| end_key <= needle, true)
         } else {
             self.decoder.inner_mut().seek_upper(
                 |end_key, _s| cmp.compare(end_key, needle) != std::cmp::Ordering::Greater,
