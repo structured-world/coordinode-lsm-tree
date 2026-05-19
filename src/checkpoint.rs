@@ -58,8 +58,13 @@ fn blob_link_name(id: crate::vlog::BlobFileId) -> String {
 /// that had a TOCTOU window between the two calls.
 ///
 /// Once the leaf directory is ours, the `tables/` and (optionally)
-/// `blobs/` subdirectories are created. The caller's parent path must
-/// exist; this function does not recurse.
+/// `blobs/` subdirectories are created. If any of those secondary
+/// creates fails, the freshly-claimed root directory is removed before
+/// the error is returned so the caller can retry against the same path
+/// — leaving `target` behind would lock out the next attempt with
+/// `AlreadyExists` and contradict the "partial cleanup" contract.
+///
+/// The caller's parent path must exist; this function does not recurse.
 pub fn prepare_target(target: &Path, include_blobs: bool, target_fs: &dyn Fs) -> crate::Result<()> {
     // Atomic claim — fails with AlreadyExists if any other process /
     // thread / prior checkpoint already created the directory.
@@ -77,37 +82,92 @@ pub fn prepare_target(target: &Path, include_blobs: bool, target_fs: &dyn Fs) ->
         }
     })?;
 
+    // From this point on, the root directory is ours — any failure must
+    // undo it so retries against the same path work. Local RAII guard
+    // (defined at module scope to avoid `items_after_statements`).
+    let mut cleanup = RootCleanup {
+        target,
+        fs: target_fs,
+        armed: true,
+    };
+
     target_fs.create_dir(&target.join(TABLES_FOLDER))?;
     if include_blobs {
         target_fs.create_dir(&target.join(BLOBS_FOLDER))?;
     }
+
+    cleanup.armed = false;
     Ok(())
+}
+
+/// Internal RAII guard used by [`prepare_target`] to undo a successful
+/// `create_dir(target)` when a subsequent subdirectory create fails.
+struct RootCleanup<'a> {
+    target: &'a Path,
+    fs: &'a dyn Fs,
+    armed: bool,
+}
+
+impl Drop for RootCleanup<'_> {
+    fn drop(&mut self) {
+        if self.armed
+            && let Err(e) = self.fs.remove_dir_all(self.target)
+        {
+            log::warn!(
+                "Failed to clean up partial checkpoint target {}: {e:?}",
+                self.target.display(),
+            );
+        }
+    }
 }
 
 /// Links (or copies) one file across [`Fs`] backends.
 ///
-/// When `src_fs` and `dst_fs` refer to the same backend instance
-/// (`Arc::ptr_eq`), this delegates to [`Fs::hard_link`], which transparently
-/// falls back to a byte copy if the link would cross physical filesystems
-/// (Unix `EXDEV`). When the two backends differ — e.g. an SST that lives
-/// on a tiered-storage route backed by [`MemFs`](crate::fs::MemFs) while
-/// the checkpoint target is on [`StdFs`](crate::fs::StdFs) — the function
-/// streams the bytes through both trait objects so the link semantics
-/// degrade to a normal file copy.
+/// Strategy:
+///
+/// 1. **Try `dst_fs.hard_link(src, dst)` first.** A real filesystem
+///    backend that can see `src` (same kernel filesystem, just a
+///    different `Arc<dyn Fs>` handle — common when `level_routes`
+///    builds `Arc::new(StdFs)` independently from `config.fs`) will
+///    succeed in O(1) without doubling disk usage. `StdFs::hard_link`
+///    handles its own `EXDEV` → byte-copy fallback transparently.
+/// 2. **On `NotFound`** (the dst backend doesn't see `src` at all —
+///    e.g. `MemFs` target with `StdFs` source) **or `Unsupported`**
+///    (in-memory backends that don't implement linking), stream bytes
+///    through both trait objects. This is the only path that doubles
+///    storage; logged via [`log::warn`] in the [`StdFs`] fallback so
+///    operators can spot tier-misconfigurations.
+///
+/// Using `Arc::ptr_eq` as the discriminator would be too strict: two
+/// `Arc::new(StdFs)` values produced independently (e.g. one in the
+/// tree's primary `config.fs`, one in a `LevelRoute`) are not pointer-
+/// equal but back the same kernel filesystem, so they CAN hard-link.
+/// The "try first, fall back on demand" pattern catches both cases
+/// without exposing a backend-identity API on the `Fs` trait.
 pub fn link_or_copy_cross_fs(
     src_fs: &Arc<dyn Fs>,
     src: &Path,
     dst_fs: &Arc<dyn Fs>,
     dst: &Path,
 ) -> std::io::Result<u64> {
-    if Arc::ptr_eq(src_fs, dst_fs) {
-        dst_fs.hard_link(src, dst)?;
-        return Ok(dst_fs.metadata(dst)?.len);
+    match dst_fs.hard_link(src, dst) {
+        Ok(()) => return Ok(dst_fs.metadata(dst)?.len),
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::Unsupported
+            ) =>
+        {
+            // dst_fs cannot see src (cross-backend) or does not support
+            // hard links at all → fall through to streamed copy.
+        }
+        Err(e) => return Err(e),
     }
 
-    // Different Fs backends — stream bytes through the trait. The buffer
-    // is heap-allocated to avoid bloating the stack frame; checkpoint is a
-    // cold-path operation so the extra allocation is negligible.
+    // Cross-backend / no-hardlink path — stream bytes through the trait.
+    // The buffer is heap-allocated to avoid bloating the stack frame;
+    // checkpoint is a cold-path operation so the extra allocation is
+    // negligible.
     let mut src_file = src_fs.open(src, &FsOpenOptions::new().read(true))?;
     let mut dst_file = dst_fs.open(dst, &FsOpenOptions::new().write(true).create_new(true))?;
 
@@ -187,24 +247,56 @@ pub fn link_blob_files(
     Ok((count, bytes))
 }
 
+/// Whether a metadata file is required for the checkpoint to be openable.
+#[derive(Clone, Copy)]
+enum MetaRequirement {
+    /// File must exist on the source; absence is an error.
+    ///
+    /// Used for the `v<id>` snapshot whose disappearance between
+    /// `current_version()` and metadata copy would otherwise produce a
+    /// checkpoint that points (via `current`) at a version file that
+    /// does not exist in the checkpoint directory.
+    Required,
+    /// File may legitimately be absent (treated as a freshly-initialised
+    /// tree by recovery). Used for `manifest` on never-written trees.
+    Optional,
+}
+
 /// Copies one of the small metadata files (manifest, `v<id>`, or
-/// `current`) from `src_root` to `target_root` if it exists. Missing files
-/// are silently ignored — recovery treats the absence of these files as a
-/// freshly-initialised tree.
+/// `current`) from `src_root` to `target_root`.
+///
+/// Opens the source directly instead of `exists()` + `open()` to avoid
+/// the TOCTOU window where the file disappears between the two calls.
+/// `NotFound` is the only ignorable error and only when
+/// `requirement == Optional`; for `Required` files a missing source is
+/// surfaced as the original `NotFound` so the checkpoint fails-fast
+/// instead of producing an unopenable snapshot.
 fn copy_metadata_file(
     src_fs: &dyn Fs,
     src_root: &Path,
     target_fs: &dyn Fs,
     target_root: &Path,
     file_name: &str,
+    requirement: MetaRequirement,
 ) -> crate::Result<()> {
     let src = src_root.join(file_name);
-    if !src_fs.exists(&src)? {
-        return Ok(());
-    }
+    let mut src_file = match src_fs.open(&src, &FsOpenOptions::new().read(true)) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return match requirement {
+                MetaRequirement::Optional => Ok(()),
+                MetaRequirement::Required => Err(crate::Error::from(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!(
+                        "checkpoint required metadata file {} missing from source",
+                        src.display(),
+                    ),
+                ))),
+            };
+        }
+        Err(e) => return Err(e.into()),
+    };
     let dst = target_root.join(file_name);
-
-    let mut src_file = src_fs.open(&src, &FsOpenOptions::new().read(true))?;
     let mut dst_file = target_fs.open(&dst, &FsOpenOptions::new().write(true).create_new(true))?;
 
     std::io::copy(&mut src_file, &mut dst_file)?;
@@ -263,17 +355,31 @@ pub fn copy_metadata(
     target_root: &Path,
     version_id: u64,
 ) -> crate::Result<()> {
-    // Manifest stores level count + comparator name; required on open.
-    copy_metadata_file(src_fs, src_root, target_fs, target_root, "manifest")?;
-    // Active version snapshot — `v<id>` is immutable once published,
-    // so copying it verbatim is race-free regardless of concurrent
-    // version transitions.
+    // Manifest stores level count + comparator name. On a never-written
+    // tree the manifest may legitimately be absent (recovery treats
+    // missing manifest as a freshly-initialised tree), so this is Optional.
+    copy_metadata_file(
+        src_fs,
+        src_root,
+        target_fs,
+        target_root,
+        "manifest",
+        MetaRequirement::Optional,
+    )?;
+    // Active version snapshot — `v<id>` is immutable once published, so
+    // copying it verbatim is race-free against concurrent version
+    // transitions. But version-GC can DELETE older `v<id>` files; if the
+    // file we captured disappears between `current_version()` and this
+    // copy, the resulting checkpoint would have `current` pointing at a
+    // missing file and fail to open. Treat as Required so checkpoint
+    // fails-fast in that race instead of producing a corrupt snapshot.
     copy_metadata_file(
         src_fs,
         src_root,
         target_fs,
         target_root,
         &format!("v{version_id}"),
+        MetaRequirement::Required,
     )?;
     // CURRENT pointer is generated fresh for the captured `version_id`
     // (NOT copied from source) so a concurrent publish to `v<N+1>` on

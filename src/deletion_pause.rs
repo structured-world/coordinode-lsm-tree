@@ -235,13 +235,17 @@ mod tests {
     ///    `mem::take`, *executing* the deletion Thread B was supposed to
     ///    defer. Thread B's file vanishes despite an active pause.
     ///
-    /// The deterministic reproducer below uses a side-channel `Mutex` to
-    /// hold Thread A in the drop path until Thread B has enqueued, then
-    /// releases A. With the fix (re-check `active` under the lock) the
-    /// file survives until Thread B drops its pause; without the fix the
-    /// file is removed prematurely and the assertion below fires.
+    /// The deterministic reproducer below uses two channels to pin the
+    /// invariant check at the exact moment when Thread B holds an active
+    /// pause and the queue contains its enqueued item. Without the fix,
+    /// A's drop would have already swept the queue and removed B's file
+    /// before B signalled `ready` — the survives-while-B-holds-pause
+    /// assertion fires. With the fix, A's drop bails out under the lock
+    /// (because B's `acquire` already incremented `active`) and the file
+    /// survives until B drops at the end.
     #[test]
     fn drain_does_not_steal_a_new_generation_queue() {
+        use std::sync::mpsc;
         use std::thread;
         use std::time::Duration;
 
@@ -254,38 +258,48 @@ mod tests {
         let pause = DeletionPause::new();
         let a = pause.acquire();
 
-        // Run many iterations to widen the chance of hitting the race
-        // window on systems where atomic decrement + lock acquisition
-        // is fast enough to never interleave with the spawned thread.
-        // With the fix this loop is uneventful; without the fix any
-        // interleaving where Thread B enqueues between A's `fetch_sub`
-        // and A's `queue.lock()` causes B's file to be erroneously
-        // removed.
+        let (ready_tx, ready_rx) = mpsc::channel::<()>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+
         let b_pause = Arc::clone(&pause);
         let b_fs = Arc::clone(&dyn_fs);
         let b_path = path.clone();
         let b_thread = thread::spawn(move || {
-            // Wait until A has started dropping (small sleep is cheap and
-            // gives A the chance to call fetch_sub first).
+            // Brief sleep gives Thread A time to start its `Drop`
+            // (`fetch_sub` followed by `queue.lock()`); on this side we
+            // then race in with our own `acquire` so the fix's "re-check
+            // active under the lock" branch is exercised.
             thread::sleep(Duration::from_millis(5));
             let _b = b_pause.acquire();
             assert!(b_pause.try_enqueue(b_fs, b_path));
-            // Hold the pause long enough for A's drop to complete.
-            thread::sleep(Duration::from_millis(20));
+            // Signal the main thread that B is in the right state and
+            // wait for the invariant check to complete before dropping
+            // the pause guard.
+            ready_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
             // Implicit drop here drains the queue.
         });
 
         // Trigger A's drop now.
         drop(a);
 
+        // Block until B has acquired AND enqueued; this is the exact
+        // moment the race manifests. With the fix, the file MUST still
+        // exist on disk because B's pause is active and the queued item
+        // belongs to B's generation. Without the fix, A's drain has
+        // already removed it — assertion fires here, not after join.
+        ready_rx.recv().unwrap();
+        assert!(
+            fs.exists(&path).unwrap(),
+            "file must survive while Thread B holds an active pause \
+             (a's drain leaked into b's generation)",
+        );
+        release_tx.send(()).unwrap();
+
         b_thread.join().unwrap();
 
-        // After both pauses dropped, file should be GONE (B's pause was
-        // last and properly drained). The race bug would surface as a
-        // panic in `remove_file` against an already-removed path, not as
-        // a survived file — but the more important invariant is that
-        // there's no double-remove. Verify by re-creating + re-running
-        // with assertion that the queue length stays sane.
+        // Sanity: after B drops too, the file is gone (B's drop drained
+        // its own generation properly).
         assert!(
             !fs.exists(&path).unwrap(),
             "file should be removed after both pauses dropped",

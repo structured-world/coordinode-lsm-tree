@@ -93,18 +93,32 @@ fn checkpoint_survives_concurrent_writes() -> lsm_tree::Result<()> {
         Ok(())
     });
 
-    let _info = tree.create_checkpoint(&dst_path)?;
+    let info = tree.create_checkpoint(&dst_path)?;
     writer.join().expect("writer thread panicked")?;
 
     // Reopening must succeed regardless of what the writer did.
     let restored = open_tree(&dst_path)?;
-    // Keys 0..50 were flushed before the checkpoint started — their SSTs
-    // must be present in the snapshot. Use SeqNo::MAX since checkpoint
-    // captures the storage state, not the visible-seqno watermark.
-    for i in 0u32..50 {
+
+    // PITR watermark contract: every key with `seqno <= info.seqno` MUST
+    // be present in the checkpoint. The lower-bound watermark guarantee
+    // is what callers rely on for replay cutoffs — verify it explicitly
+    // rather than just checking the pre-flushed 0..50 range.
+    //
+    // Keys are inserted with `seqno = i`, so any key index `i` such that
+    // `i as u64 <= info.seqno` must be readable. We make NO claim about
+    // keys with `i > info.seqno` — those may or may not be in the
+    // snapshot depending on whether the writer thread reached them
+    // before checkpoint sampled the version.
+    for i in 0u32..200 {
         let key = format!("k{i:03}");
-        let val = restored.get(key.as_bytes(), lsm_tree::SeqNo::MAX)?;
-        assert!(val.is_some(), "checkpoint missing pre-existing key {key}");
+        let got = restored.get(key.as_bytes(), lsm_tree::SeqNo::MAX)?;
+        if u64::from(i) <= info.seqno {
+            assert!(
+                got.is_some(),
+                "PITR watermark violated: key {key} (seqno {i}) <= info.seqno ({}) but missing from checkpoint",
+                info.seqno,
+            );
+        }
     }
     Ok(())
 }
@@ -285,6 +299,18 @@ fn compaction_during_checkpoint_preserves_source_ssts() -> lsm_tree::Result<()> 
     // RAII guard that stops + joins the compactor thread on every exit
     // path. Without this, an early-returning `?` would detach the thread
     // and let it keep mutating the tree behind concurrent tests.
+    //
+    // The Drop impl propagates BOTH panics and Err results:
+    //
+    // - `Err(Box<dyn Any>)` from `join()` means the worker thread
+    //   panicked. We `resume_unwind` so the panic surfaces as a test
+    //   failure instead of being silently dropped.
+    // - `Ok(Err(e))` means the worker returned an error from
+    //   `major_compact` — we `panic!` to fail the test loudly.
+    //
+    // Both branches check `thread::panicking()` first: if the test body
+    // is already unwinding from its own failure, re-panicking would
+    // abort the process instead of letting the original panic propagate.
     struct CompactorGuard {
         stop: Arc<AtomicBool>,
         handle: Option<thread::JoinHandle<lsm_tree::Result<()>>>,
@@ -292,10 +318,21 @@ fn compaction_during_checkpoint_preserves_source_ssts() -> lsm_tree::Result<()> 
     impl Drop for CompactorGuard {
         fn drop(&mut self) {
             self.stop.store(true, Ordering::Release);
-            if let Some(h) = self.handle.take() {
-                // Best-effort join; panics from the worker thread are
-                // re-raised so test failures are visible.
-                let _ = h.join();
+            let Some(h) = self.handle.take() else {
+                return;
+            };
+            match h.join() {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => {
+                    if !thread::panicking() {
+                        panic!("compactor thread returned error: {err:?}");
+                    }
+                }
+                Err(payload) => {
+                    if !thread::panicking() {
+                        std::panic::resume_unwind(payload);
+                    }
+                }
             }
         }
     }
@@ -305,7 +342,10 @@ fn compaction_during_checkpoint_preserves_source_ssts() -> lsm_tree::Result<()> 
     let compactor_stop = Arc::clone(&stop);
     let handle = thread::spawn(move || -> lsm_tree::Result<()> {
         while !compactor_stop.load(Ordering::Acquire) {
-            let _ = compactor_tree.major_compact(u64::MAX, lsm_tree::SeqNo::MAX);
+            // Errors from major_compact MUST surface — silently
+            // discarding them would let a checkpoint race that
+            // corrupted compaction state pass the test as green.
+            compactor_tree.major_compact(u64::MAX, lsm_tree::SeqNo::MAX)?;
             thread::sleep(Duration::from_millis(5));
         }
         Ok(())
@@ -504,41 +544,72 @@ fn checkpoint_failure_leaves_source_intact() -> lsm_tree::Result<()> {
         "early reject must leave the pre-existing target alone",
     );
 
-    // ── (b) Post-prepare failure path ────────────────────────────────
-    // Plant a directory at `<target>/tables/<id>` that collides with the
-    // upcoming hard-link target, forcing `link_tables` to error out
-    // AFTER `prepare_target` succeeded. The `PartialCheckpointGuard`
-    // must then remove the entire partial checkpoint so a retry on the
-    // same path can succeed.
-    let post_dst = dst_dir.path().join("post");
-    // Identify the SST id we just flushed so we can plant a collider.
-    let src_tables_entries =
-        std::fs::read_dir(src_dir.path().join("tables"))?.collect::<std::io::Result<Vec<_>>>()?;
-    let first_sst_name = src_tables_entries
-        .first()
-        .expect("flush should have produced at least one SST")
-        .file_name();
-    // Create just enough scaffolding to trip link_tables. We cannot
-    // pre-create `post_dst` itself because `prepare_target` uses atomic
-    // create_dir — instead we plant a collider INSIDE the eventual
-    // tables/ path using a parent symlink trick: prepare a sibling dir
-    // first and rename it into place between calls.
-    //
-    // Simpler/portable: do NOT pre-create anything. Run the first
-    // checkpoint successfully, then re-run into the same path → it
-    // fails on AlreadyExists. The PartialCheckpointGuard does not fire
-    // here (the failure is in prepare_target, before the guard is
-    // armed) but `remove_dir_all` lets the next attempt work, which
-    // proves the success-side cleanup chain is sound.
-    let _ = first_sst_name; // documents the alternative collider strategy
-    let info1 = tree.create_checkpoint(&post_dst)?;
-    assert!(info1.sst_files >= 1);
-    std::fs::remove_dir_all(&post_dst)?;
-    // Retry into the now-empty path must succeed — proves no stale state
-    // leaked between checkpoints.
-    let info2 = tree.create_checkpoint(&post_dst)?;
-    assert_eq!(info1.sst_files, info2.sst_files);
-    assert_eq!(info1.version_id, info2.version_id);
+    // ── (b) Post-prepare failure path (Unix-only) ───────────────────
+    // Force `link_tables` to fail by chmod-ing the source SST to 000
+    // AFTER `prepare_target` would normally have succeeded. The outer
+    // `PartialCheckpointGuard` (armed right after prepare_target returns)
+    // must remove the entire partial checkpoint so a retry on the same
+    // path succeeds. Restricted to Unix because Windows has no portable
+    // way to make an open file unreadable from another process.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let post_dst = dst_dir.path().join("post");
+        let src_tables = src_dir.path().join("tables");
+        let orig_perm = std::fs::metadata(&src_tables)?.permissions();
+
+        // Strip read+execute on the SOURCE tables/ directory. We strip
+        // the *directory* not the SST file because `link(2)` does NOT
+        // require read permission on the source file (it just bumps the
+        // inode's link count) — but it DOES require search (x) permission
+        // on every directory component of the source path. Without `x`
+        // on `tables/`, the kernel cannot resolve `tables/<id>` and
+        // `link()` fails with `EACCES`.
+        std::fs::set_permissions(&src_tables, std::fs::Permissions::from_mode(0o000))?;
+
+        let result = tree.create_checkpoint(&post_dst);
+        // Restore perms BEFORE assertions so source remains usable even
+        // if a later assertion fails.
+        std::fs::set_permissions(&src_tables, orig_perm)?;
+
+        let err = result.expect_err("create_checkpoint should fail when src tables/ is unreadable");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("Permission")
+                || msg.contains("denied")
+                || msg.contains("Os")
+                || msg.contains("error"),
+            "expected post-prepare I/O error, got {msg}",
+        );
+
+        // PartialCheckpointGuard must have removed the partial checkpoint.
+        assert!(
+            !post_dst.exists(),
+            "PartialCheckpointGuard must remove partial checkpoint after \
+             post-prepare failure; {} still present",
+            post_dst.display(),
+        );
+
+        // And a retry against the same path now succeeds, proving no
+        // stale state leaked.
+        let info = tree.create_checkpoint(&post_dst)?;
+        assert!(info.sst_files >= 1);
+    }
+
+    // Portable fallback (non-Unix): exercise just the success-then-
+    // cleanup-then-retry chain to verify run_checkpoint is idempotent
+    // against a freshly cleaned target.
+    #[cfg(not(unix))]
+    {
+        let post_dst = dst_dir.path().join("post");
+        let info1 = tree.create_checkpoint(&post_dst)?;
+        assert!(info1.sst_files >= 1);
+        std::fs::remove_dir_all(&post_dst)?;
+        let info2 = tree.create_checkpoint(&post_dst)?;
+        assert_eq!(info1.sst_files, info2.sst_files);
+        assert_eq!(info1.version_id, info2.version_id);
+    }
 
     // ── Source intact across both failure modes ──────────────────────
     for i in 0u32..50 {
