@@ -28,7 +28,14 @@
 // copy keeps them so a future extraction back into a standalone crate
 // produces a clean diff against the upstream. The BuRR submodule
 // (`super::ribbon::burr`) does NOT inherit these allows — it's first-
-// class crate code and follows the host crate's lint policy.
+// class crate code and follows the host crate's lint policy
+// (`#[expect(..., reason)]` over `#[allow]`, etc.).
+//
+// We deliberately use a single crate-attribute `#![allow]` here rather
+// than scattering `#[expect]` per item: vendored code minimisation of
+// diff vs upstream is the priority, and a future upstream refactor
+// that removes one of the offending casts would otherwise yield an
+// `unfulfilled_lint_expectations` error on the next sync.
 #![allow(
     clippy::indexing_slicing,
     clippy::cast_possible_truncation,
