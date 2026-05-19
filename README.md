@@ -74,15 +74,28 @@ On-disk format version **V5**. V5 introduces a wire-format break for filter bloc
 
 ## Feature flags
 
-| Flag | Default | Effect |
-|---|---|---|
-| `lz4` | off | LZ4 block compression via [`lz4_flex`](https://github.com/PSeitz/lz4_flex). |
-| `zstd` | off | Zstd block compression via [`structured-zstd`](https://github.com/structured-world/structured-zstd). Supports `CompressionType::Zstd` and dictionary-mode `CompressionType::ZstdDict`. Decompression throughput is currently ~2–3.5× slower than the C reference implementation. |
-| `encryption` | off | AES-256-GCM block encryption (`aes-gcm`). |
-| `io-uring` | off (linux only) | `io_uring`-backed `Fs` implementation. |
-| `bytes_1` | off | Use [`bytes`](https://github.com/tokio-rs/bytes) as the underlying `Slice` type. |
-| `metrics` | off | Counters and timers exposed via the `Metrics` accessor. |
-| `ribbon-serde` | off | Serde derives on the internal Ribbon filter representation. Not used by the on-disk format. |
+All optional. The default build is the minimal core (no compression, no encryption, std filesystem). Every flag below is opt-in because it pulls in extra dependencies or runtime overhead that not every consumer needs.
+
+### `lz4` — LZ4 block compression
+Pulls in [`lz4_flex`](https://github.com/PSeitz/lz4_flex). Enable when block compression is wanted but decompression latency matters more than compression ratio (LZ4 decompresses several × faster than zstd at the cost of ratio). Exposed as a separate flag so the LZ4 codec isn't compiled into builds that want zstd-only or no-compression.
+
+### `zstd` — Zstd block compression
+Pulls in [`structured-zstd`](https://github.com/structured-world/structured-zstd) — pure-Rust zstd via the structured-world fork of ruzstd. Supports `CompressionType::Zstd` and the dictionary-mode `CompressionType::ZstdDict` for small (4-64 KiB) blocks and blob files. Decompression throughput is currently ~2-3.5× slower than the C reference implementation; the trade-off is no C compiler, no system libzstd, no FFI. Enable when ratio matters more than absolute decompression speed.
+
+### `encryption` — AES-256-GCM block encryption at rest
+Pulls in `aes-gcm` and `rand_chacha`. Block-level encryption with a caller-supplied key — the engine does not manage keys, store them, or persist them; that's the caller's responsibility. Adds AEAD compute on every block I/O. Off by default because most embedded workloads don't need it and the dependency footprint isn't free.
+
+### `io-uring` — Linux `io_uring` `Fs` backend
+Linux-only. Pulls in [`io-uring`](https://github.com/tokio-rs/io-uring). Adds a `Fs` implementation that submits reads/writes through `io_uring` for high-throughput I/O on modern kernels. Plain `StdFs` is the default; opt in when the workload is I/O-bound on Linux and the kernel is new enough.
+
+### `bytes_1` — `bytes::Bytes` integration
+Switches the internal `Slice` type to [`bytes`](https://github.com/tokio-rs/bytes). Off by default to avoid pulling tokio-ecosystem types into projects that don't otherwise use them. Enable when the consumer code already speaks `bytes::Bytes` and wants zero-copy interop with the engine's slices.
+
+### `metrics` — `Metrics` counters and timers
+Compiles in atomic counters and timing instrumentation around block I/O, filter probes, compaction, and cache hit rates, exposed via the `Metrics` accessor (`tree.metrics()`). Off by default because every counter is an atomic op on the hot path; the cost is small per op but non-zero. Enable for production observability or profiling.
+
+### `ribbon-serde` — Serde derives on the internal Ribbon filter repr
+Pulls in `serde`. Adds `Serialize`/`Deserialize` derives on `RibbonFilterRepr` (an in-memory snapshot type for the vendored Ribbon filter). Not used by the on-disk format — the BuRR wire layout is hand-encoded byteorder, independent of serde. Exposed only so consumers that want to ship a filter as JSON / bincode / etc. for inspection or transport can do so. Off by default — no production code path uses it.
 
 ## Benchmarks
 
