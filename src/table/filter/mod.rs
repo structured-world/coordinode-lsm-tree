@@ -4,6 +4,7 @@
 
 pub mod bit_array;
 pub mod block;
+pub mod ribbon;
 pub mod standard_bloom;
 
 use standard_bloom::Builder as StandardBloomFilterBuilder;
