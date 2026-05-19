@@ -71,6 +71,8 @@ impl PartitionedFilterWriter {
     }
 
     fn spill_filter_partition(&mut self, key: &UserKey) -> crate::Result<()> {
+        let hash_count = self.bloom_hash_buffer.len();
+        let partition_index = self.tli_handles.len();
         let filter_bytes = build_burr_filter_bytes(self.bloom_policy, &self.bloom_hash_buffer)?;
         self.bloom_hash_buffer.clear();
 
@@ -89,9 +91,8 @@ impl PartitionedFilterWriter {
         // is_active() is checked upstream before any keys are buffered.
         if filter_bytes.is_empty() {
             log::error!(
-                "BuRR partitioned writer received empty filter bytes for {} hashes — \
-                 policy likely inactive (silent skip would cause false negatives)",
-                self.tli_handles.len() + 1,
+                "BuRR partitioned writer received empty filter bytes for partition {partition_index} \
+                 ({hash_count} hashes) — policy likely inactive (silent skip would cause false negatives)",
             );
             return Err(crate::Error::Unrecoverable);
         }

@@ -796,7 +796,7 @@ fn serde_rejects_incorrect_storage_word_length() {
     let mut repr = filter.to_repr();
     let expected_words = repr.params.m * repr.params.fingerprint_words();
     let wrong_words = expected_words - 1;
-    repr.z = bitvec::prelude::BitVec::<u64, bitvec::prelude::Lsb0>::from_vec(vec![0; wrong_words]);
+    repr.z = vec![0_u64; wrong_words];
 
     let err = super::RibbonFilter::from_repr(repr, DefaultBuildHasher::default())
         .expect_err("reconstructing invalid storage should fail");

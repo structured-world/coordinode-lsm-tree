@@ -85,8 +85,21 @@ where
 
     /// Serialize this filter into the BuRR wire format. The result can
     /// be later parsed by [`BurrFilterReader::new`].
+    ///
+    /// Returns an empty `Vec` for a filter with zero layers (e.g.
+    /// `BurrBuilder::build_from_hashes(&[])`). The decoder rejects
+    /// `num_layers == 0` as a malformed header (correctly — a zero-
+    /// layer filter cannot answer any membership query), so emitting
+    /// the header anyway would yield a wire payload that no reader
+    /// can ingest. Empty wire bytes are the canonical "no filter for
+    /// this block" signal, identical to what
+    /// `build_burr_filter_bytes(_, &[])` returns up at the writer
+    /// boundary.
     #[must_use]
     pub fn to_wire_bytes(&self) -> Vec<u8> {
+        if self.layers.is_empty() {
+            return Vec::new();
+        }
         super::wire::encode(self)
     }
 

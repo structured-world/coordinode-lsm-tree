@@ -1,4 +1,3 @@
-use bitvec::prelude::{BitVec, Lsb0};
 use std::hash::{BuildHasher, Hash};
 
 use super::builder::Scratch;
@@ -10,19 +9,29 @@ use super::params::Params;
 #[cfg(feature = "ribbon-serde")]
 const RIBBON_FILTER_FORMAT_VERSION: u8 = 1;
 
+/// On-the-wire / in-memory snapshot of a built `RibbonFilter`.
+///
+/// `z` is the band-solution matrix as a flat `Vec<u64>`. Length is
+/// `params.m * params.fingerprint_words()` and the on-disk byte length
+/// is `z.len() * 8`. We use a plain `Vec<u64>` rather than `BitVec<u64>`
+/// because `bitvec`'s `u64: BitStore` impl is gated on
+/// `target_has_atomic = "64"` — on 32-bit targets (i686, riscv32, etc.)
+/// the bound fails and the crate doesn't build. Ribbon's algorithm
+/// stores full `u64` words anyway; the `BitVec` wrapper was upstream
+/// flavour, not a load-bearing component.
 #[cfg(feature = "ribbon-serde")]
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct RibbonFilterRepr {
     pub version: u8,
     pub params: Params,
-    pub z: BitVec<u64, Lsb0>,
+    pub z: Vec<u64>,
 }
 
 #[derive(Debug, Clone)]
 pub struct RibbonFilter<S> {
     params: Params,
     build_hasher: S,
-    z: BitVec<u64, Lsb0>,
+    z: Vec<u64>,
     stride_words: usize,
 }
 
@@ -32,7 +41,6 @@ where
 {
     pub(crate) fn new(params: Params, build_hasher: S, z: Vec<u64>) -> Self {
         let stride_words = params.fingerprint_words();
-        let z = BitVec::<u64, Lsb0>::from_vec(z);
         Self {
             params,
             build_hasher,
@@ -81,17 +89,17 @@ where
     fn z_row(&self, row: usize) -> &[u64] {
         let start = row * self.stride_words;
         let end = start + self.stride_words;
-        &self.z.as_raw_slice()[start..end]
+        &self.z[start..end]
     }
 
     /// Borrowed access to the raw solution-matrix words.
     ///
     /// Length is `m * stride_words`. Each chunk of `stride_words` u64s
     /// is one row's fingerprint bits in LSB-first order. Used by the
-    /// BuRR wire-format serializer to write the matrix without going
-    /// through the `bitvec` Lsb0 abstraction.
+    /// BuRR wire-format serializer to write the matrix as packed
+    /// little-endian bytes.
     pub(crate) fn z_raw_words(&self) -> &[u64] {
-        self.z.as_raw_slice()
+        &self.z
     }
 
     #[cfg(feature = "ribbon-serde")]
@@ -122,21 +130,11 @@ where
             .m
             .checked_mul(stride_words)
             .ok_or(FilterReprError::StorageLengthOverflow)?;
-        let expected_bits = expected_words
-            .checked_mul(64)
-            .ok_or(FilterReprError::StorageLengthOverflow)?;
 
-        if repr.z.as_raw_slice().len() != expected_words {
+        if repr.z.len() != expected_words {
             return Err(FilterReprError::InvalidStorageWords {
-                found: repr.z.as_raw_slice().len(),
-                expected: expected_words,
-            });
-        }
-
-        if repr.z.len() != expected_bits {
-            return Err(FilterReprError::InvalidStorageBits {
                 found: repr.z.len(),
-                expected: expected_bits,
+                expected: expected_words,
             });
         }
 

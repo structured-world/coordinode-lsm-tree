@@ -32,23 +32,12 @@ metrics = []
 # format is byteorder-encoded — but the feature wires `serde` as an
 # optional dep so `--all-features` builds and a future extraction back
 # into a standalone crate compile cleanly.
-ribbon-serde = ["dep:serde", "bitvec/serde"]
+ribbon-serde = ["dep:serde"]
 
 [dependencies]
 bytes = { version = "1", optional = true }
 byteorder = { package = "byteorder-lite", version = "0.1.0" }
 byteview = "~0.10.1"
-# bitvec: required by the vendored Ribbon filter (src/table/filter/ribbon/).
-# Used for the bit-packed GF(2) solution matrix in the banded solver. Pinned
-# to the 1.x line — see upstream ribbon-filter v0.2.0 for the original
-# dependency choice.
-#
-# default-features = false drops the `atomic` feature so `BitVec<u64>`
-# compiles on 32-bit targets (i686, powerpc, riscv32, etc.) where 64-bit
-# atomics aren't available natively. The ribbon code uses BitVec for
-# single-threaded local storage only, so atomic shared access is not
-# needed. "alloc" stays on for heap-allocated BitVec.
-bitvec = { version = "1", default-features = false, features = ["alloc"] }
 enum_dispatch = "0.3.13"
 interval-heap = "0.0.5"
 log = "0.4.27"

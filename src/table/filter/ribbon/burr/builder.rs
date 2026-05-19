@@ -55,6 +55,17 @@ where
         if !(1..=64).contains(&params.r) {
             return Err(BurrBuildError::InvalidParams("r must be in 1..=64"));
         }
+        // w == 64 is a hard invariant: the BuRR probe path
+        // (BurrFilter::contains_hash, wire::contains_hash) iterates set
+        // bits of coeff_lo (u64) ONLY and asserts coeff_hi == 0 via
+        // debug_assert. A w > 64 build would silently produce filters
+        // that the probe path misses bits on → false negatives. The
+        // BurrParams constructors (with_fp_rate, with_bpk) pin w to
+        // 64; this check defends against callers that build params by
+        // hand or via deserialisation.
+        if params.w != 64 {
+            return Err(BurrBuildError::InvalidParams("w must be exactly 64"));
+        }
         if params.b == 0 {
             return Err(BurrBuildError::InvalidParams("b must be > 0"));
         }
