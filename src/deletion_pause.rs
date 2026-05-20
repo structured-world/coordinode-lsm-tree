@@ -144,6 +144,17 @@ impl Drop for Pause {
             return;
         }
 
+        // Test-only deterministic interleave point: the
+        // `drain_does_not_steal_a_new_generation_queue` regression test
+        // exercises the exact window between `fetch_sub(1)` above and
+        // the queue lock below. Without a hook the window is microseconds
+        // wide and unobservable from outside; the hook lets the test
+        // suspend this drop until thread B has run `acquire() + try_enqueue()`.
+        // Production builds compile this out (the symbol exists only
+        // under `#[cfg(test)]`).
+        #[cfg(test)]
+        tests::drain_barrier::wait();
+
         // We were the last pause holder — drain and execute pending
         // deletions. Generation race: between the `fetch_sub` above and
         // acquiring the queue lock below, another thread can call
@@ -191,6 +202,45 @@ mod tests {
         let opts = crate::fs::FsOpenOptions::new().write(true).create(true);
         let mut f = fs.open(path, &opts).unwrap();
         f.write_all(bytes).unwrap();
+    }
+
+    /// Test-only barrier that lets a regression test suspend the
+    /// `Drop for Pause` exactly between `active.fetch_sub(1)` and
+    /// `self.inner.queue.lock()`. Production builds never reach
+    /// `wait()` because the call site is `#[cfg(test)]`-gated.
+    ///
+    /// The barrier is single-shot per `arm()`: `arm()` installs a
+    /// receiver, the next `wait()` call blocks until `release()` sends
+    /// on the matching sender, then the receiver is consumed. Tests
+    /// that don't `arm()` get a no-op `wait()`.
+    pub(super) mod drain_barrier {
+        use std::sync::Mutex;
+        use std::sync::mpsc;
+
+        static CHANNEL: Mutex<Option<mpsc::Receiver<()>>> = Mutex::new(None);
+
+        /// Install a receiver. Returns the sender end; calling `send(())`
+        /// (or letting the sender drop) lets the next `wait()` proceed.
+        pub fn arm() -> mpsc::Sender<()> {
+            let (tx, rx) = mpsc::channel();
+            *CHANNEL.lock().unwrap() = Some(rx);
+            tx
+        }
+
+        /// Block until the armed sender releases us, or return
+        /// immediately if no sender is armed.
+        pub fn wait() {
+            // Hold the lock only long enough to TAKE the receiver, so
+            // the spinning Drop holds nothing while it waits on the
+            // channel — otherwise a deadlock with `arm()` is possible.
+            let rx = CHANNEL.lock().unwrap().take();
+            if let Some(rx) = rx {
+                // Wait for the test thread's signal. Drop-send is also a
+                // valid release (the recv() returns RecvError, which we
+                // ignore — releasing on disarm is intentional).
+                let _ = rx.recv();
+            }
+        }
     }
 
     #[test]
@@ -250,6 +300,16 @@ mod tests {
     /// assertion fires. With the fix, A's drop bails out under the lock
     /// (because B's `acquire` already incremented `active`) and the file
     /// survives until B drops at the end.
+    /// The deterministic reproducer drives A's drop on its own thread
+    /// and uses the test-only `drain_barrier` to suspend A INSIDE Drop
+    /// — exactly between `active.fetch_sub(1)` and `queue.lock()`. B
+    /// then runs `acquire() + try_enqueue()` in that window, which is
+    /// the precise race CodeRabbit/Copilot called out. After B's work
+    /// is observable, the test releases the barrier so A's drain step
+    /// runs against `active > 0` and bails out — leaving B's file
+    /// intact for the assertion. Without the fix (no `active`-recheck
+    /// under the lock) A would drain B's enqueue and the file would
+    /// disappear before the assert.
     #[test]
     fn drain_does_not_steal_a_new_generation_queue() {
         use std::sync::mpsc;
@@ -264,62 +324,87 @@ mod tests {
         let pause = DeletionPause::new_shared();
         let a = pause.acquire();
 
-        // Deterministic handshake: `a_dropped_tx` signals that A's
-        // `fetch_sub(1)` has executed (so `active == 0` from A's
-        // perspective and A is committed to the drain branch); B then
-        // races in with `acquire()`+`try_enqueue()` to exercise the
-        // generation-race protection. Spin-wait on `active == 0` instead
-        // of using a fixed sleep so the test is robust under any
-        // scheduler / CI load.
-        let (a_dropped_tx, a_dropped_rx) = mpsc::channel::<()>();
-        let (ready_tx, ready_rx) = mpsc::channel::<()>();
-        let (release_tx, release_rx) = mpsc::channel::<()>();
+        // Arm the in-Drop barrier. The next Pause::drop on the last
+        // guard will block at the barrier wait point AFTER fetch_sub
+        // and BEFORE the queue lock. The sender we get back is what
+        // releases that block when we say so.
+        let release_a_tx = drain_barrier::arm();
 
+        // (in_window_tx, in_window_rx): A signals it has entered the
+        // barrier wait — i.e. fetch_sub is done, active is 0, drain
+        // step is suspended. B should NOT touch the pause until then.
+        let (in_window_tx, in_window_rx) = mpsc::channel::<()>();
+        // (b_ready_tx, b_ready_rx): B signals it has acquired the new
+        // generation and enqueued its file; main thread can now check
+        // the survives-the-race invariant.
+        let (b_ready_tx, b_ready_rx) = mpsc::channel::<()>();
+        // (release_b_tx, release_b_rx): main thread tells B to drop
+        // its pause guard after the invariant has been verified.
+        let (release_b_tx, release_b_rx) = mpsc::channel::<()>();
+
+        // Thread A: drives drop(a) directly. Drop hits the barrier
+        // wait, blocks, and we send `in_window_tx` to advertise that
+        // we're suspended in the exact race window.
+        let a_pause = Arc::clone(&pause);
+        let a_thread = thread::spawn(move || {
+            // We have to announce we're about to suspend BEFORE the
+            // drop runs — the drop itself can't signal because it
+            // blocks. The main thread spin-waits on the active
+            // counter (below) to confirm A's fetch_sub really executed.
+            in_window_tx.send(()).unwrap();
+            drop(a);
+            // After release the drain step runs and Drop returns.
+            // We keep `a_pause` alive for the spin-wait above; it
+            // doesn't influence the race.
+            drop(a_pause);
+        });
+
+        // Wait until A is about to drop. Spin-wait until A's fetch_sub
+        // has actually decremented `active` to 0 — that's how we know
+        // A is now suspended INSIDE the barrier wait, having passed
+        // step 1 and not yet reached step 4 (queue lock + recheck).
+        in_window_rx.recv().unwrap();
+        while pause.active.load(Ordering::Acquire) != 0 {
+            core::hint::spin_loop();
+        }
+
+        // Thread B: now run acquire + try_enqueue while A is suspended.
+        // Without the in-Drop barrier, this would race A by microseconds
+        // and the test would be flaky / pass on broken code (the old
+        // bug). With the barrier we're DETERMINISTICALLY between A's
+        // fetch_sub and A's queue.lock().
         let b_pause = Arc::clone(&pause);
         let b_fs = Arc::clone(&dyn_fs);
         let b_path = path.clone();
         let b_thread = thread::spawn(move || {
-            // Block until A has begun its drop. We then spin until
-            // A's `fetch_sub` has visibly reduced `active` to 0 —
-            // that's the exact window where A is about to lock the
-            // queue and the fix MUST notice our subsequent `acquire`
-            // under the lock.
-            a_dropped_rx.recv().unwrap();
-            while b_pause.active.load(Ordering::Acquire) != 0 {
-                core::hint::spin_loop();
-            }
             let _b = b_pause.acquire();
             assert!(b_pause.try_enqueue(b_fs, b_path));
-            // Signal the main thread that B is in the right state and
-            // wait for the invariant check to complete before dropping
-            // the pause guard.
-            ready_tx.send(()).unwrap();
-            release_rx.recv().unwrap();
+            b_ready_tx.send(()).unwrap();
+            release_b_rx.recv().unwrap();
             // Implicit drop here drains the queue.
         });
 
-        // Trigger A's drop now. Send the handshake AFTER drop returns
-        // so B observes A's `fetch_sub`-decremented `active` value.
-        drop(a);
-        a_dropped_tx.send(()).unwrap();
+        // Wait until B has acquired + enqueued. Now release A's drop
+        // so the drain step runs. Under the fix A sees `active > 0`
+        // under the lock and returns without taking B's enqueue.
+        b_ready_rx.recv().unwrap();
+        release_a_tx.send(()).unwrap();
+        a_thread.join().unwrap();
 
-        // Block until B has acquired AND enqueued; this is the exact
-        // moment the race manifests. With the fix, the file MUST still
-        // exist on disk because B's pause is active and the queued item
-        // belongs to B's generation. Without the fix, A's drain has
-        // already removed it — assertion fires here, not after join.
-        ready_rx.recv().unwrap();
+        // Invariant: B still holds an active pause and the file is
+        // still in B's queue. The fix MUST have prevented A's drain
+        // from removing it. Without the fix this assertion fires.
         assert!(
             fs.exists(&path).unwrap(),
             "file must survive while Thread B holds an active pause \
              (a's drain leaked into b's generation)",
         );
-        release_tx.send(()).unwrap();
+        release_b_tx.send(()).unwrap();
 
         b_thread.join().unwrap();
 
-        // Sanity: after B drops too, the file is gone (B's drop drained
-        // its own generation properly).
+        // Sanity: after B drops too, the file is gone (B's drop
+        // drained its own generation properly).
         assert!(
             !fs.exists(&path).unwrap(),
             "file should be removed after both pauses dropped",
