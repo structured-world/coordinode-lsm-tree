@@ -302,3 +302,31 @@ fn memfs_create_checkpoint_with_relative_leaf_target() -> lsm_tree::Result<()> {
     assert!(info.sst_files >= 1);
     Ok(())
 }
+
+/// Regression: `./checkpoint` must skip parent fsync the same way
+/// `checkpoint` does. `Path::new("./checkpoint").parent()` returns
+/// `Some(".")` — non-empty, so the empty-string guard alone doesn't
+/// catch it. On MemFs that still hits `sync_directory(".") -> NotFound`,
+/// making equivalent relative targets behave differently.
+#[test]
+fn memfs_create_checkpoint_with_dot_prefixed_relative_target() -> lsm_tree::Result<()> {
+    let (_dir, src_path) = test_path("source_dot");
+    let mem_fs: Arc<dyn lsm_tree::fs::Fs> = Arc::new(MemFs::new());
+    let tree = Config::new(
+        src_path,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(Arc::clone(&mem_fs))
+    .open()?;
+
+    for i in 0u32..5 {
+        tree.insert(format!("k{i:02}"), format!("v{i}"), u64::from(i));
+    }
+    tree.flush_active_memtable(0)?;
+
+    // `./checkpoint-dot` — `target.parent()` is `Some(".")`, non-empty.
+    let info = tree.create_checkpoint(std::path::Path::new("./checkpoint-dot"))?;
+    assert!(info.sst_files >= 1);
+    Ok(())
+}
