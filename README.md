@@ -58,6 +58,11 @@ On-disk format version **V5**. V5 introduces a wire-format break for filter bloc
 - `SequenceNumberGenerator` trait — pluggable seqno source.
 - Custom `UserComparator` for non-lexicographic ordering.
 - MVCC: snapshot reads at a chosen `SeqNo`.
+- Point-in-time recovery snapshots via `Tree::create_checkpoint` — hard-link
+  every live SST + blob file into a fresh directory in O(1) per file, zero
+  extra disk until the source files compact away. Compaction continues
+  during the checkpoint (deletions are deferred), and the resulting
+  directory opens as an independent tree.
 
 ### Internals
 
