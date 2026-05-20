@@ -577,10 +577,17 @@ fn checkpoint_failure_leaves_source_intact() -> lsm_tree::Result<()> {
     let early_dst = dst_dir.path().join("early");
     std::fs::create_dir_all(&early_dst)?;
     let err = tree.create_checkpoint(&early_dst).unwrap_err();
-    let msg = format!("{err:?}");
+    // Assert structurally — the Debug format of std::io::Error varies
+    // by OS and rustc release. Pattern-match on the variant + ErrorKind
+    // so the test guards the programmatic contract (Io(AlreadyExists))
+    // that callers actually rely on for early-reject detection.
     assert!(
-        msg.contains("already exists") || msg.contains("AlreadyExists"),
-        "expected AlreadyExists on early reject, got {msg}",
+        matches!(
+            &err,
+            lsm_tree::Error::Io(io_err)
+                if io_err.kind() == std::io::ErrorKind::AlreadyExists,
+        ),
+        "expected Io(AlreadyExists) on early reject, got {err:?}",
     );
     // Early reject must NOT damage the pre-existing target (it isn't
     // ours to clean up).
