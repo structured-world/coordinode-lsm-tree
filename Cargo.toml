@@ -63,7 +63,7 @@ lz4 = ["dep:lz4_flex", "std"]
 # conventional `!` markers on this PR's breaking commits (BuRR filter
 # wire format, V5 manifest gate); release-plz raises the crate's major
 # version on the next release tag accordingly.
-zstd = ["dep:structured-zstd", "dep:once_cell", "std"]
+zstd = ["dep:structured-zstd", "std"]
 encryption = ["dep:aes-gcm", "dep:rand_chacha", "std"]
 bytes_1 = ["dep:bytes"]
 metrics = []
@@ -81,19 +81,26 @@ bytes = { version = "1", optional = true }
 byteorder = { package = "byteorder-lite", version = "0.1.0" }
 byteview = "~0.10.1"
 enum_dispatch = "0.3.13"
-interval-heap = "0.0.5"
 log = "0.4.27"
+# `spin = "0.9"` provides a no_std-compatible Mutex. Used by
+# `deletion_pause` so that module's only std footprint comes from the
+# `Fs` trait it interacts with, not from its own synchronisation.
+spin = { version = "0.9", default-features = false, features = ["mutex", "spin_mutex"] }
 lz4_flex = { version = "0.13.0", optional = true, default-features = false }
 structured-zstd = { version = "0.0.21", optional = true, default-features = false, features = ["std"] }
-# `once_cell::sync::OnceCell` has stable `get_or_try_init`; `std::sync::OnceLock`
-# does not until 1.86+ (still unstable on our 1.92 MSRV path via `once_cell_try`).
-# Use the external crate for the canonical single-parse-across-racers primitive
-# without an auxiliary `Mutex`. The `race` module from this same crate provides
-# the no-std + alloc variant (`OnceBox`) we'll swap to during the no-std
-# migration. Optional + gated by the `zstd` feature — only the zstd
-# `ZstdDictionary::prepared_handle` path uses it today, so non-zstd consumers
-# do not pull this crate.
-once_cell = { version = "1", optional = true }
+# `once_cell::race::OnceBox` — the no-std + alloc one-shot primitive.
+# We pick it over `std::sync::OnceLock` (which has both `set` and the
+# stabilised `get_or_try_init` on our 1.92 MSRV) because OnceLock is
+# std-only: it can't compile on the `cargo check
+# --no-default-features --features alloc` CI target, and the crate's
+# direction is no-std-friendly. Unconditional dep with
+# `default-features = false, features = ["race"]` so the crate stays
+# no-std-friendly even with `--no-default-features`. Used by:
+#   - zstd `ZstdDictionary::prepared_handle` (canonical single-parse
+#     across racers, no auxiliary `Mutex`)
+#   - `deletion_pause` slot on tables / blob files (one-shot install of
+#     the shared `Arc<DeletionPause>` after recovery / compaction).
+once_cell = { version = "1", default-features = false, features = ["race"] }
 quick_cache = { version = "0.6.16", default-features = false, features = [] }
 rustc-hash = "2.1.1"
 self_cell = "1.2.0"

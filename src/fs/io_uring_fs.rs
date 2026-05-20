@@ -144,6 +144,10 @@ impl Fs for IoUringFs {
         std::fs::create_dir_all(path)
     }
 
+    fn create_dir(&self, path: &Path) -> io::Result<()> {
+        std::fs::create_dir(path)
+    }
+
     fn read_dir(&self, path: &Path) -> io::Result<Vec<FsDirEntry>> {
         // Delegate to std::fs — directory listing doesn't benefit from io_uring.
         std::fs::read_dir(path)?
@@ -203,6 +207,21 @@ impl Fs for IoUringFs {
 
     fn exists(&self, path: &Path) -> io::Result<bool> {
         path.try_exists()
+    }
+
+    fn hard_link(&self, src: &Path, dst: &Path) -> io::Result<()> {
+        // Hard linking is a metadata-only operation; io_uring offers no
+        // throughput benefit, so delegate to [`StdFs`] for the EXDEV
+        // fallback logic.
+        super::StdFs.hard_link(src, dst)
+    }
+
+    fn backend_id(&self) -> Option<u64> {
+        // `IoUringFs` resolves paths through the host kernel just like
+        // `StdFs`, so it MUST report the same namespace ID — otherwise
+        // the checkpoint driver would needlessly stream-copy between the
+        // two backends.
+        super::StdFs.backend_id()
     }
 }
 

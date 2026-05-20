@@ -118,6 +118,10 @@ impl Fs for StdFs {
         std::fs::create_dir_all(path)
     }
 
+    fn create_dir(&self, path: &Path) -> io::Result<()> {
+        std::fs::create_dir(path)
+    }
+
     fn read_dir(&self, path: &Path) -> io::Result<Vec<FsDirEntry>> {
         // Fail-fast on bad entries is intentional: non-UTF-8 filenames in an
         // lsm-tree data directory indicate filesystem corruption (see FsDirEntry docs).
@@ -188,6 +192,118 @@ impl Fs for StdFs {
     fn exists(&self, path: &Path) -> io::Result<bool> {
         path.try_exists()
     }
+
+    fn hard_link(&self, src: &Path, dst: &Path) -> io::Result<()> {
+        match std::fs::hard_link(src, dst) {
+            Ok(()) => Ok(()),
+            Err(e) if is_cross_device(&e) => {
+                // `debug!`, not `warn!`: a tier-misconfigured checkpoint
+                // can hit this path once per SST + once per blob (potentially
+                // thousands of times). The checkpoint driver is responsible
+                // for emitting a single summary warning if the fallback rate
+                // is excessive; per-file noise here would drown real logs.
+                log::debug!(
+                    "hard_link({}, {}) crossed filesystems — falling back to copy",
+                    src.display(),
+                    dst.display(),
+                );
+                copy_fallback(src, dst)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    fn backend_id(&self) -> Option<u64> {
+        Some(KERNEL_BACKEND_ID)
+    }
+}
+
+/// Shared by every backend that resolves paths against the host kernel's
+/// filesystem table — currently `StdFs` and `IoUringFs`. Two such backends
+/// can hard-link across instances because `std::fs::hard_link(src, dst)`
+/// resolves both paths through the same kernel namespace.
+pub const KERNEL_BACKEND_ID: u64 = 0x4b45_524e_454c_5f46; // "KERNEL_F"
+
+/// Detects `EXDEV` (cross-device link) errors across platforms.
+///
+/// Unix exposes the raw `EXDEV` (errno 18 on Linux/macOS/BSDs); we also
+/// accept [`io::ErrorKind::CrossesDevices`] (stable since Rust 1.85) and
+/// [`io::ErrorKind::Unsupported`] which Windows surfaces when a volume
+/// configuration disallows hard links altogether.
+///
+/// We deliberately do NOT treat [`io::ErrorKind::PermissionDenied`] as a
+/// cross-device signal even though Windows can sometimes surface
+/// cross-volume link failures that way. Misclassifying genuine ACL /
+/// permission errors as "different filesystem" would silently turn a
+/// "you can't read this" into a full byte copy, hiding real security
+/// misconfigurations. Operators hitting that edge case on Windows can
+/// fix it explicitly (move the target volume, adjust ACLs); the
+/// fall-back is opt-out by design.
+fn is_cross_device(err: &io::Error) -> bool {
+    #[cfg(unix)]
+    {
+        // POSIX `EXDEV` ("invalid cross-device link"). The raw value is
+        // 18 on every supported Unix target (Linux, macOS, FreeBSD,
+        // OpenBSD, NetBSD, Android — see `errno.h` on each platform).
+        // We declare it as a named constant rather than depending on
+        // `libc`: the crate deliberately avoids a `libc` dependency
+        // (see the `flock` extern in this file for the same pattern),
+        // and EXDEV's value is locked by ABI compatibility.
+        const EXDEV: i32 = 18;
+        if err.raw_os_error() == Some(EXDEV) {
+            return true;
+        }
+    }
+    matches!(
+        err.kind(),
+        io::ErrorKind::CrossesDevices | io::ErrorKind::Unsupported
+    )
+}
+
+/// Byte-copy fallback used when [`hard_link`](Fs::hard_link) cannot create
+/// a true link (cross-device or in-memory FS without inode semantics).
+///
+/// Uses `create_new` semantics so an accidental clobber surfaces as
+/// [`io::ErrorKind::AlreadyExists`] — matching real `hard_link` behaviour.
+fn copy_fallback(src: &Path, dst: &Path) -> io::Result<()> {
+    use std::io::{Read, Write};
+
+    // Wrap the copy in an inner closure so any post-`create_new` error
+    // (ENOSPC, EIO, write_all failure, sync_all failure) triggers a
+    // best-effort unlink of the partially-written destination. Without
+    // this, a failed `copy_fallback` leaves a truncated file behind and
+    // the next retry surfaces as `AlreadyExists` — callers would then
+    // see a corrupt file from an operation that already reported error.
+    let res: io::Result<()> = (|| {
+        let mut src_file = File::open(src)?;
+        let mut dst_file = OpenOptions::new().write(true).create_new(true).open(dst)?;
+
+        // Heap-allocated buffer — checkpoint is cold-path I/O, so a
+        // 64 KiB Vec is cheaper than blowing past clippy's stack-array budget.
+        let mut buf = vec![0u8; 64 * 1024].into_boxed_slice();
+        loop {
+            let n = match src_file.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            };
+            #[expect(
+                clippy::indexing_slicing,
+                reason = "n was just produced by read() and bounded by buf.len()"
+            )]
+            dst_file.write_all(&buf[..n])?;
+        }
+        dst_file.sync_all()
+    })();
+
+    if res.is_err() {
+        // Best-effort: if cleanup itself fails (permission denied,
+        // already removed by another process), there's nothing more we
+        // can do — the original error is what the caller needs to see.
+        let _ = std::fs::remove_file(dst);
+    }
+    res
 }
 
 // ---------------------------------------------------------------------------
@@ -647,6 +763,130 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let bogus = dir.path().join("nonexistent");
         assert!(!fs.exists(&bogus)?);
+        Ok(())
+    }
+
+    #[test]
+    fn hard_link_creates_second_path_to_same_inode() -> io::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let fs = StdFs;
+
+        let src = dir.path().join("src.bin");
+        let dst = dir.path().join("dst.bin");
+        std::fs::write(&src, b"checkpoint payload")?;
+
+        fs.hard_link(&src, &dst)?;
+
+        // Both paths exist and have the same content.
+        assert_eq!(std::fs::read(&dst)?, b"checkpoint payload");
+
+        // Mutating the link changes both views (same inode), proving this
+        // was a true hard link, not a copy. We only check this on Unix —
+        // Windows hard links share content but inode equality is not
+        // exposed through std.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let src_meta = std::fs::metadata(&src)?;
+            let dst_meta = std::fs::metadata(&dst)?;
+            assert_eq!(src_meta.ino(), dst_meta.ino());
+            assert_eq!(src_meta.dev(), dst_meta.dev());
+            assert_eq!(dst_meta.nlink(), 2);
+        }
+
+        // Removing the source leaves the link intact.
+        fs.remove_file(&src)?;
+        assert_eq!(std::fs::read(&dst)?, b"checkpoint payload");
+        Ok(())
+    }
+
+    #[test]
+    fn hard_link_rejects_existing_destination() -> io::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let fs = StdFs;
+
+        let src = dir.path().join("src");
+        let dst = dir.path().join("dst");
+        std::fs::write(&src, b"src")?;
+        std::fs::write(&dst, b"dst")?;
+
+        let err = fs.hard_link(&src, &dst).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+        Ok(())
+    }
+
+    #[test]
+    fn hard_link_rejects_missing_source() -> io::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let fs = StdFs;
+
+        let err = fs
+            .hard_link(&dir.path().join("missing"), &dir.path().join("dst"))
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+        Ok(())
+    }
+
+    /// Forces the EXDEV fallback by calling [`copy_fallback`] directly.
+    /// A real cross-device scenario needs two mounted filesystems which is
+    /// impractical in unit tests, but the fallback path itself is exercised.
+    #[test]
+    fn copy_fallback_copies_bytes_independently() -> io::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let src = dir.path().join("src");
+        let dst = dir.path().join("dst");
+        std::fs::write(&src, b"payload-for-fallback")?;
+
+        copy_fallback(&src, &dst)?;
+        assert_eq!(std::fs::read(&dst)?, b"payload-for-fallback");
+
+        // Writing to dst must NOT affect src (independent file).
+        std::fs::write(&dst, b"modified")?;
+        assert_eq!(std::fs::read(&src)?, b"payload-for-fallback");
+        Ok(())
+    }
+
+    #[test]
+    fn is_cross_device_detects_exdev_and_kind_variants() {
+        // Synthesise a raw EXDEV error — what Linux/macOS/BSDs return when
+        // hard_link spans devices. `is_cross_device` must accept it so the
+        // fallback copy path kicks in. Gated to Unix because errno 18 has
+        // a different meaning on Windows (ERROR_NO_MORE_FILES) and the
+        // `#[cfg(unix)]` branch in `is_cross_device` is never compiled on
+        // non-Unix targets.
+        #[cfg(unix)]
+        {
+            // Matches the `EXDEV` constant inside `is_cross_device`.
+            const EXDEV: i32 = 18;
+            let exdev = io::Error::from_raw_os_error(EXDEV);
+            assert!(is_cross_device(&exdev), "raw EXDEV must be recognised");
+        }
+
+        // ErrorKind::CrossesDevices is the modern stable variant (Rust 1.85+).
+        let crosses = io::Error::from(io::ErrorKind::CrossesDevices);
+        assert!(is_cross_device(&crosses));
+
+        // ErrorKind::Unsupported covers Windows / exotic filesystems where
+        // hard links are simply not implemented — also a cue to fall back.
+        let unsupported = io::Error::from(io::ErrorKind::Unsupported);
+        assert!(is_cross_device(&unsupported));
+
+        // A garden-variety NotFound must NOT be misclassified — the caller
+        // needs to surface that error verbatim, not silently copy.
+        let notfound = io::Error::from(io::ErrorKind::NotFound);
+        assert!(!is_cross_device(&notfound));
+    }
+
+    #[test]
+    fn copy_fallback_refuses_to_overwrite() -> io::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let src = dir.path().join("src");
+        let dst = dir.path().join("dst");
+        std::fs::write(&src, b"src")?;
+        std::fs::write(&dst, b"dst")?;
+
+        let err = copy_fallback(&src, &dst).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
         Ok(())
     }
 }

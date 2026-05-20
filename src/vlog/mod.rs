@@ -135,6 +135,8 @@ pub fn recover_blob_files(
                 checksum,
                 file_accessor,
                 tree_id,
+                fs: fs.clone(),
+                deletion_pause: once_cell::race::OnceBox::new(),
             })));
 
             if idx % progress_mod == 0 {

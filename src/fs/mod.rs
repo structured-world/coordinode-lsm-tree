@@ -247,6 +247,36 @@ pub trait Fs: Send + Sync + 'static {
     /// Returns an I/O error if directory creation fails.
     fn create_dir_all(&self, path: &Path) -> io::Result<()>;
 
+    /// Atomically creates a single directory at `path`.
+    ///
+    /// Unlike [`create_dir_all`](Self::create_dir_all), this method must
+    /// FAIL with [`io::ErrorKind::AlreadyExists`] when `path` already
+    /// exists — it is the POSIX `mkdir(2)` primitive used by
+    /// [`Tree::create_checkpoint`](crate::Tree::create_checkpoint) to
+    /// claim its target directory without a TOCTOU window.
+    ///
+    /// The parent directory must already exist; this method does not
+    /// recurse.
+    ///
+    /// # Default implementation
+    ///
+    /// Returns [`io::ErrorKind::Unsupported`]. Backends that want to be
+    /// usable as a checkpoint target MUST override this method.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::ErrorKind::AlreadyExists`] if `path` already exists,
+    /// [`io::ErrorKind::NotFound`] if the parent directory does not
+    /// exist, or another I/O error if creation fails for backend-specific
+    /// reasons.
+    fn create_dir(&self, path: &Path) -> io::Result<()> {
+        let _ = path;
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Fs::create_dir is not implemented for this backend",
+        ))
+    }
+
     /// Returns all entries in a directory (order is unspecified).
     ///
     /// Returns a `Vec` rather than a streaming iterator because
@@ -316,6 +346,88 @@ pub trait Fs: Send + Sync + 'static {
     /// Returns an I/O error if the existence of `path` cannot be determined
     /// (for example, due to permission issues or transient backend failures).
     fn exists(&self, path: &Path) -> io::Result<bool>;
+
+    /// Creates a hard link `dst` that refers to the same inode as `src`.
+    ///
+    /// Used by [`Tree::create_checkpoint`](crate::Tree::create_checkpoint)
+    /// to snapshot SST and blob files in O(1) per file without duplicating
+    /// data on disk. After the link is created, deleting either path leaves
+    /// the other intact; the inode is reclaimed only after the last link
+    /// is removed.
+    ///
+    /// # Cross-filesystem fallback
+    ///
+    /// Hard links cannot span filesystems. Implementations that detect a
+    /// cross-device situation (Unix `EXDEV`) MUST fall back to a byte copy
+    /// so that callers can treat `hard_link` as always-succeeding when the
+    /// destination filesystem is writable. The fallback emits a [`log::debug`]
+    /// trace per call (deliberately not `warn`: a tier-misconfigured
+    /// checkpoint can hit this path thousands of times per snapshot, and
+    /// per-file warnings would drown real signal). Callers that need
+    /// operator-visible notification of unexpected copies are expected
+    /// to aggregate per-checkpoint and emit a single summary warning.
+    ///
+    /// In-memory backends ([`MemFs`](crate::fs::MemFs)) do not have inodes;
+    /// they implement this as a byte copy that produces an independent file
+    /// with the same contents.
+    ///
+    /// # Default implementation
+    ///
+    /// Returns [`io::ErrorKind::Unsupported`]. Backends are free to leave
+    /// this default in place: the checkpoint driver's
+    /// `link_or_copy_cross_fs` helper treats `Unsupported` (and `NotFound`)
+    /// as a signal to fall back to a streamed byte copy, so snapshots
+    /// still succeed — they just lose the O(1) hard-link optimisation
+    /// and pay full-bytes worth of disk on the target volume. Backends
+    /// that DO support real hard links (most kernel filesystems) should
+    /// override this for the inode-sharing benefit.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if `src` does not exist, `dst` already exists,
+    /// the destination's parent directory is missing, or the fallback copy
+    /// fails.
+    fn hard_link(&self, src: &Path, dst: &Path) -> io::Result<()> {
+        let _ = (src, dst);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Fs::hard_link is not implemented for this backend",
+        ))
+    }
+
+    /// Identifies the **path namespace** this backend resolves against.
+    ///
+    /// Two `Fs` values may safely participate in a cross-backend
+    /// [`Fs::hard_link`] call only if their `backend_id()` values are
+    /// both `Some` and equal: that contract states "we resolve paths
+    /// against the same underlying inode table, so a hard link from
+    /// `src` here to `dst` there links the SAME file we'd see by
+    /// reading `src` through `Self`."
+    ///
+    /// Examples of equal backend IDs:
+    /// - All [`crate::fs::StdFs`] instances on the same host (one
+    ///   shared kernel filesystem).
+    /// - A [`crate::fs::IoUringFs`] and a [`crate::fs::StdFs`] on the
+    ///   same host (the uring backend delegates path resolution to the
+    ///   kernel).
+    ///
+    /// Examples of distinct backend IDs:
+    /// - Two independent [`crate::fs::MemFs`] instances (each has its
+    ///   own in-memory tree).
+    /// - A [`crate::fs::MemFs`] vs any kernel-backed backend (a
+    ///   hard-link attempt would resolve `src` against the host
+    ///   filesystem and silently capture an unrelated file if one
+    ///   happens to exist at the same path — a checkpoint correctness
+    ///   bug).
+    ///
+    /// The default returns `None`, meaning "no shared-namespace
+    /// guarantee" — safe-by-default for third-party backends that have
+    /// not opted in. Callers MUST treat `None` as a veto on
+    /// cross-backend [`Fs::hard_link`] and stream-copy instead, even
+    /// when both sides return `None`.
+    fn backend_id(&self) -> Option<u64> {
+        None
+    }
 }
 
 /// Opens a section of an sfa archive for buffered reading via the [`Fs`] trait.

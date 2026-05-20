@@ -41,6 +41,12 @@ use std::sync::{Arc, Mutex, RwLock};
 #[derive(Clone, Debug)]
 pub struct MemFs {
     state: Arc<RwLock<State>>,
+    /// Per-instance namespace ID used by [`Fs::backend_id`]. Cloned
+    /// `MemFs` values share the same `state` Arc AND the same ID — they
+    /// are the same backend by all observable behaviour. Independently
+    /// constructed `MemFs::new()` values get DIFFERENT IDs because they
+    /// have disjoint file trees.
+    namespace_id: u64,
 }
 
 #[derive(Debug, Default)]
@@ -58,8 +64,20 @@ impl MemFs {
         state.dirs.insert(PathBuf::from("/"));
         Self {
             state: Arc::new(RwLock::new(state)),
+            namespace_id: next_mem_fs_namespace_id(),
         }
     }
+}
+
+/// Allocates the next per-instance `MemFs` namespace ID. Values are
+/// process-unique (monotonic atomic counter) so two `MemFs::new()`
+/// values never collide; cloned `MemFs` instances reuse the same ID
+/// because `MemFs` derives `Clone`.
+fn next_mem_fs_namespace_id() -> u64 {
+    use core::sync::atomic::{AtomicU64, Ordering};
+    // Start at 1 so a future `0` sentinel stays available if needed.
+    static COUNTER: AtomicU64 = AtomicU64::new(1);
+    COUNTER.fetch_add(1, Ordering::Relaxed)
 }
 
 impl Default for MemFs {
@@ -427,6 +445,29 @@ impl Fs for MemFs {
         Ok(())
     }
 
+    fn create_dir(&self, path: &Path) -> io::Result<()> {
+        ensure_non_empty_path(path)?;
+        let mut state = write_state(&self.state)?;
+
+        // Atomic single-leaf create: reject if anything (file OR dir)
+        // already occupies the path. Mirrors POSIX `mkdir(2)` semantics.
+        if state.dirs.contains(path) || state.files.contains_key(path) {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("path already exists: {}", path.display()),
+            ));
+        }
+
+        // Parent must exist AND be a directory. Delegating to
+        // `ensure_parent_dir` gives the caller a `NotFound` vs
+        // `parent-is-a-file` diagnostic (matching POSIX `ENOTDIR`),
+        // instead of a single ambiguous `NotFound` for both cases.
+        ensure_parent_dir(path, &state)?;
+
+        state.dirs.insert(path.to_path_buf());
+        Ok(())
+    }
+
     fn read_dir(&self, path: &Path) -> io::Result<Vec<FsDirEntry>> {
         let state = read_state(&self.state)?;
 
@@ -619,6 +660,51 @@ impl Fs for MemFs {
     fn exists(&self, path: &Path) -> io::Result<bool> {
         let state = read_state(&self.state)?;
         Ok(state.files.contains_key(path) || state.dirs.contains(path))
+    }
+
+    fn hard_link(&self, src: &Path, dst: &Path) -> io::Result<()> {
+        ensure_non_empty_path(src)?;
+        ensure_non_empty_path(dst)?;
+        let mut state = write_state(&self.state)?;
+
+        ensure_parent_dir(dst, &state)?;
+
+        if state.dirs.contains(dst) {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("destination is a directory: {}", dst.display()),
+            ));
+        }
+        if state.files.contains_key(dst) {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("destination already exists: {}", dst.display()),
+            ));
+        }
+
+        // MemFs has no inode concept — produce an independent copy so the
+        // destination has the same byte contents but its own backing buffer.
+        // This matches the documented [`Fs::hard_link`] semantics for
+        // in-memory backends.
+        let bytes = {
+            let src_data = state.files.get(src).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("source file not found: {}", src.display()),
+                )
+            })?;
+            let guard = lock(src_data)?;
+            guard.clone()
+        };
+
+        state
+            .files
+            .insert(dst.to_path_buf(), Arc::new(Mutex::new(bytes)));
+        Ok(())
+    }
+
+    fn backend_id(&self) -> Option<u64> {
+        Some(self.namespace_id)
     }
 }
 
@@ -1238,6 +1324,80 @@ mod tests {
             .rename(Path::new("/dir/file"), Path::new(""))
             .unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        Ok(())
+    }
+
+    #[test]
+    fn hard_link_creates_independent_copy() -> io::Result<()> {
+        let fs = MemFs::new();
+        fs.create_dir_all(Path::new("/dir"))?;
+
+        let src = Path::new("/dir/src.bin");
+        let dst = Path::new("/dir/dst.bin");
+        let opts = FsOpenOptions::new().write(true).create(true);
+        let mut file = fs.open(src, &opts)?;
+        file.write_all(b"checkpoint")?;
+        drop(file);
+
+        fs.hard_link(src, dst)?;
+
+        // Both exist and contain the same bytes.
+        let opts = FsOpenOptions::new().read(true);
+        let mut buf = String::new();
+        fs.open(src, &opts)?.read_to_string(&mut buf)?;
+        assert_eq!(buf, "checkpoint");
+        let mut buf = String::new();
+        fs.open(dst, &opts)?.read_to_string(&mut buf)?;
+        assert_eq!(buf, "checkpoint");
+
+        // Critical invariant: `MemFs::hard_link` returns an *independent*
+        // copy (no `Arc<Mutex<Vec<u8>>>` aliasing). Mutate the source and
+        // verify the destination is unaffected — if the test only relied
+        // on `remove_file` it would pass even with an aliased buffer.
+        let mut writer = fs.open(src, &FsOpenOptions::new().write(true).truncate(true))?;
+        writer.write_all(b"mutated")?;
+        drop(writer);
+
+        let mut after = String::new();
+        fs.open(dst, &FsOpenOptions::new().read(true))?
+            .read_to_string(&mut after)?;
+        assert_eq!(
+            after, "checkpoint",
+            "dst must not see writes to src — buffers must be independent",
+        );
+
+        // Removing the source leaves the destination intact.
+        fs.remove_file(src)?;
+        assert!(!fs.exists(src)?);
+        assert!(fs.exists(dst)?);
+        Ok(())
+    }
+
+    #[test]
+    fn hard_link_rejects_existing_destination() -> io::Result<()> {
+        let fs = MemFs::new();
+        fs.create_dir_all(Path::new("/dir"))?;
+
+        let opts = FsOpenOptions::new().write(true).create(true);
+        fs.open(Path::new("/dir/a"), &opts)?;
+        fs.open(Path::new("/dir/b"), &opts)?;
+
+        let err = fs
+            .hard_link(Path::new("/dir/a"), Path::new("/dir/b"))
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+        Ok(())
+    }
+
+    #[test]
+    fn hard_link_rejects_missing_source() -> io::Result<()> {
+        let fs = MemFs::new();
+        fs.create_dir_all(Path::new("/dir"))?;
+
+        let err = fs
+            .hard_link(Path::new("/dir/missing"), Path::new("/dir/dst"))
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
         Ok(())
     }
 }

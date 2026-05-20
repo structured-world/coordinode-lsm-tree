@@ -6,6 +6,7 @@
 use crate::metrics::Metrics;
 
 use super::{block_index::BlockIndexImpl, meta::ParsedMeta, regions::ParsedRegions};
+use crate::deletion_pause::DeletionPause;
 use crate::{
     Checksum, GlobalTableId, SeqNo,
     cache::Cache,
@@ -84,6 +85,19 @@ pub struct Inner {
     /// Pre-trained zstd dictionary for dictionary decompression.
     #[cfg(zstd_any)]
     pub(crate) zstd_dictionary: Option<Arc<crate::compression::ZstdDictionary>>,
+
+    /// Tree-wide file-deletion gate. Installed once by
+    /// [`Table::install_deletion_pause`](super::Table::install_deletion_pause)
+    /// after the table is registered with a tree. When `Some` and active,
+    /// the [`Drop`] impl defers the underlying `remove_file` call so that
+    /// an in-progress [`Tree::create_checkpoint`](crate::Tree::create_checkpoint)
+    /// can hard-link the file before it disappears.
+    // `once_cell::race::OnceBox` rather than `std::sync::OnceLock` so
+    // this field doesn't pin the type to `std` — OnceBox is no-std +
+    // alloc by construction. The slot is set once after recovery /
+    // compaction and read on every Drop; CAS-based race semantics are
+    // fine for this single-publisher, many-reader pattern.
+    pub(crate) deletion_pause: once_cell::race::OnceBox<Arc<DeletionPause>>,
 }
 
 impl Inner {
@@ -117,6 +131,27 @@ impl Drop for Inner {
             // Drop the accessor and block index (releases all Arc<dyn FsFile>).
             drop(file_accessor);
             drop(block_index);
+
+            // If a checkpoint is active, defer the physical deletion so the
+            // file remains hard-linkable until the checkpoint releases its
+            // pause. Falls through to immediate removal when no pause is
+            // installed or the pause is inactive.
+            // Short-circuit on the common no-checkpoint path: skip
+            // the Arc<dyn Fs> bump and PathBuf clone unless a pause is
+            // both installed AND currently active. `try_enqueue` still
+            // re-checks `is_active()` under the queue lock to close
+            // the publish-then-release race, so the outer check is a
+            // pure perf gate, not a correctness one.
+            if let Some(pause) = self.deletion_pause.get()
+                && pause.is_active()
+                && pause.try_enqueue(Arc::clone(&self.fs), (*self.path).clone())
+            {
+                log::trace!(
+                    "Deferred deletion of table {global_id:?} at {:?} (checkpoint active)",
+                    self.path,
+                );
+                return;
+            }
 
             if let Err(e) = self.fs.remove_file(&self.path) {
                 log::warn!(

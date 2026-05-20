@@ -204,6 +204,8 @@ impl MultiWriter {
                         passthrough_compression
                     },
                 },
+                fs: fs.clone(),
+                deletion_pause: once_cell::race::OnceBox::new(),
             }));
 
             Ok(Some(blob_file))

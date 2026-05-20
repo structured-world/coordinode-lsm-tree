@@ -10,8 +10,8 @@ pub mod scanner;
 pub mod writer;
 
 use crate::{
-    Checksum, GlobalTableId, TreeId, blob_tree::FragmentationMap, file_accessor::FileAccessor,
-    vlog::BlobFileId,
+    Checksum, GlobalTableId, TreeId, blob_tree::FragmentationMap, deletion_pause::DeletionPause,
+    file_accessor::FileAccessor, fs::Fs, vlog::BlobFileId,
 };
 pub use meta::Metadata;
 use std::{
@@ -20,7 +20,13 @@ use std::{
 };
 
 /// A blob file is an immutable, sorted, contiguous file that contains large key-value pairs (blobs)
-#[derive(Debug)]
+//
+// `#[derive(Debug)]` cannot be used because [`Fs`] is not `Debug` (trait
+// objects without an explicit `Debug` bound would require boxing through
+// `dyn Debug`). A manual impl that prints stable identifiers gives the
+// same operational ergonomics as the previous derived `Debug` without
+// pulling `Debug` into the `Fs` trait bound (which would cascade through
+// every backend).
 pub struct Inner {
     /// Blob file ID
     pub id: BlobFileId,
@@ -39,11 +45,41 @@ pub struct Inner {
     pub checksum: Checksum,
 
     pub(crate) file_accessor: FileAccessor,
+
+    /// Filesystem backend used by [`Drop`] for the physical removal.
+    /// Carries the same `Fs` instance the file was opened through so that
+    /// in-memory and routed-tier backends behave consistently with the
+    /// rest of the tree.
+    pub(crate) fs: Arc<dyn Fs>,
+
+    /// Tree-wide file-deletion gate. Installed once by
+    /// [`BlobFile::install_deletion_pause`] after the file is registered
+    /// with a tree. When `Some` and active, the [`Drop`] impl defers the
+    /// underlying `remove_file` so an in-progress checkpoint can hard-link
+    /// the file before it disappears.
+    // `once_cell::race::OnceBox` — see Table::Inner::deletion_pause
+    // for the rationale (no-std-friendly one-shot slot).
+    pub(crate) deletion_pause: once_cell::race::OnceBox<Arc<DeletionPause>>,
 }
 
 impl Inner {
     fn global_id(&self) -> GlobalTableId {
         GlobalTableId::from((self.tree_id, self.id))
+    }
+}
+
+impl core::fmt::Debug for Inner {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("blob_file::Inner")
+            .field("id", &self.id)
+            .field("tree_id", &self.tree_id)
+            .field("path", &self.path)
+            .field(
+                "is_deleted",
+                &self.is_deleted.load(std::sync::atomic::Ordering::Relaxed),
+            )
+            .field("meta", &self.meta)
+            .finish_non_exhaustive()
     }
 }
 
@@ -56,17 +92,48 @@ impl Drop for Inner {
                 self.path.display(),
             );
 
-            if let Err(e) = std::fs::remove_file(&*self.path) {
+            // Move the accessor out and drop it FIRST so every pinned
+            // Arc<dyn FsFile> the file_accessor holds is released before
+            // we try to unlink. On Windows (and any other platform where
+            // an open handle blocks unlink) a live handle here would
+            // make remove_file fail silently, leaking the blob file's
+            // disk space — the same hazard already handled in
+            // table::Inner::drop. Eviction from the descriptor table
+            // happens through the same accessor before the drop.
+            let global_id = self.global_id();
+            let file_accessor = std::mem::replace(&mut self.file_accessor, FileAccessor::Closed);
+            file_accessor
+                .as_descriptor_table()
+                .inspect(|d| d.remove_for_blob_file(&global_id));
+            drop(file_accessor);
+
+            // If a checkpoint is active, defer the physical deletion so the
+            // file remains hard-linkable until the checkpoint releases its
+            // pause. Short-circuit on the common no-checkpoint path: skip
+            // the Arc<dyn Fs> bump and PathBuf clone unless a pause is
+            // both installed AND currently active. `try_enqueue` still
+            // re-checks `is_active()` under the queue lock to close the
+            // publish-then-release race, so the outer check is pure perf.
+            let deferred = match self.deletion_pause.get() {
+                Some(pause) if pause.is_active() => {
+                    pause.try_enqueue(Arc::clone(&self.fs), self.path.clone())
+                }
+                _ => false,
+            };
+
+            if deferred {
+                log::trace!(
+                    "Deferred deletion of blob file {:?} at {} (checkpoint active)",
+                    self.id,
+                    self.path.display(),
+                );
+            } else if let Err(e) = self.fs.remove_file(&self.path) {
                 log::warn!(
                     "Failed to cleanup deleted blob file {:?} at {}: {e:?}",
                     self.id,
                     self.path.display(),
                 );
             }
-
-            self.file_accessor
-                .as_descriptor_table()
-                .inspect(|d| d.remove_for_blob_file(&self.global_id()));
         }
     }
 }
@@ -94,6 +161,12 @@ impl BlobFile {
         self.0
             .is_deleted
             .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Installs the tree-wide deletion pause used by checkpoints.
+    /// Idempotent: a second call is a no-op.
+    pub(crate) fn install_deletion_pause(&self, pause: Arc<DeletionPause>) {
+        let _ = self.0.deletion_pause.set(Box::new(pause));
     }
 
     /// Returns the blob file ID.

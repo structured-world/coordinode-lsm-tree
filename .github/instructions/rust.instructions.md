@@ -84,3 +84,37 @@ These are not actionable review findings. Do not raise them:
 - Integration tests that require specific disk layout or large data use `#[ignore = "reason"]`
 - Prefer `assert_eq!` with message over bare `assert!` for better failure output
 - Hardcoded values in tests are fine when accompanied by explanatory comments or assertion messages
+## no_std + alloc Compatibility (Direction, Not Hard Mandate)
+
+This crate is moving toward a `no_std + alloc` build. The CI `no-std-check` job builds against `thumbv7em-none-eabihf` with `--no-default-features --features alloc` and is **the direction we're heading**, not a hard mandate yet. Per-crate tier tables are NOT a required artifact — the rules below describe what reviewers should SUGGEST (not block) for changes that move in the right direction, and what they should ACTIVELY FLAG when changes regress no-std readiness.
+
+When in doubt, suggest — don't gatekeep.
+
+### Direction rules (suggest)
+
+1. **No-std capability is the target.** Every library crate SHOULD in principle support `no_std + alloc` builds. Existing code that uses `std` is grandfathered until someone migrates it.
+2. **Primitive selection order for NEW code**: `core::*` → `alloc::*` → external `no_std + alloc` crate → `std::*` behind `#[cfg(feature = "std")]` → unconditional `std::*` (last resort). Reviewers SHOULD suggest higher-tier alternatives.
+3. **Cargo.toml shape**: a crate that already declares `default = ["std"]`, `std = []`, `alloc = []` should keep them coherent. `src/lib.rs` should open with `#![cfg_attr(not(feature = "std"), no_std)]` + `extern crate alloc;` once the migration is underway.
+5. **Public API surface** SHOULD prefer `core` / `alloc` types where the crate's tier permits. Suggest, don't block.
+13. **Prefer `core::*` over `std::*` re-exports** whenever the type is available there (e.g. `core::sync::atomic::AtomicU64`, `core::cmp::Ordering`). One-line suggestion — `std::*` re-exports of `core` types break the build under `no_std` even when binary-identical for `std`.
+14. **The std-vs-no_std choice is per-primitive, NOT per-crate.** A crate tiered `std-only` is still encouraged to prefer the faster no_std-ready primitive when one exists (e.g. `hashbrown`, `parking_lot`, `smallvec`, `rustc_hash`, `bytes`) — these are normally faster than their `std::*` counterparts on hot paths.
+18. **Tier reclassification suggestions** (e.g. `alloc` → `std-bound, leaf-isolated`) are welcome in the PR description. Reviewers MUST NOT block on a missing tier table — soft expectation only.
+
+### Active flags (reject if introduced)
+
+4. **CI gate**: the `no-std-check` job MUST run against a no-std-only target (e.g. `thumbv7em-none-eabihf`) with `--no-default-features --features alloc`. Host targets with available `std` MUST NOT be used — they silently pull `std` in via transitive features and hide real failures. PRs disabling or weakening this job's target/flags are rejected.
+6. **NEW `std::collections::HashMap` / `HashSet` uses in alloc-tier modules** — prefer `hashbrown::HashMap` / `HashSet` (no_std + alloc), or `rustc_hash::FxHashMap` for internal-ID keys. Suggest in std-tier modules; reject in alloc-tier.
+7. **`std::sync::Mutex` / `RwLock` in NEW code on hot paths.** Prefer `parking_lot::Mutex` / `RwLock`. `spin::Mutex` only in genuinely no-std contexts and only for very short critical sections. Existing usage is grandfathered.
+8. **NEW `std::sync::OnceLock` for fallible init.** Use `once_cell::sync::OnceCell::get_or_try_init` or `once_cell::race::OnceBox`.
+9. **NEW `thread_local!` in alloc-tier modules.** Replace with caller-managed scratch parameters or atomic-pointer patterns.
+10. **NEW `std::io::Error` in public APIs of alloc-tier modules.** Define a crate-local error enum; `From<std::io::Error>` impls live behind `#[cfg(feature = "std")]`. Tolerate in `std-only` tier.
+11. **NEW `std::time::Instant` / `std::time::SystemTime` in public APIs of alloc-tier modules.** Use a caller-provided clock trait or a `#[cfg(feature = "std")]`-gated convenience wrapper. Tolerate in `std-only` tier.
+12. **NEW `std::thread::*` in alloc-tier modules.** Threading must be hoisted to a higher-tier crate.
+15. **Adding `use std::*` to an alloc-tier module that was previously no-std-clean — without justification — is a regression.** Suggest a no_std alternative first; only reject if the PR's stated direction is no-std cleanup and this addition undoes that progress. No per-crate tier table is required to make this judgement.
+16. **`no-std-check` compile-error count MUST NOT increase per PR.** While a crate is in transition, the job MAY run `continue-on-error: true` and the count tracked as a metric — but it MUST decrease or stay equal, never increase.
+20. **Adding a transitive dependency that pulls `std` into an otherwise no-std-clean module — without justification — regresses no-std readiness.** Suggest alternatives first; reject only if the PR's stated direction is no-std cleanup and the addition undoes it.
+
+### Always-applies
+
+17. **Test code (`#[cfg(test)]`), benches (`benches/`), and binaries (`src/bin/`) are NOT subject to no-std rules** — they MAY use `std::*` freely. Only library code in `src/lib.rs` and its submodules is governed.
+19. **Doc comments and rustdoc `# Examples` blocks** on no-std-capable APIs SHOULD NOT depend on `std::*` types if the API itself does not. Doctest examples requiring `std` should be gated `#[cfg(feature = "std")]`. Reject only when the API is documented as alloc-only and the doctest contradicts that.

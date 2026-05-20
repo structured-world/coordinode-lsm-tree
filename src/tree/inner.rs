@@ -6,6 +6,7 @@ use crate::{
     SequenceNumberCounter, TableId,
     compaction::state::CompactionState,
     config::Config,
+    deletion_pause::DeletionPause,
     stop_signal::StopSignal,
     version::{SuperVersions, Version, persist_version},
 };
@@ -65,6 +66,14 @@ pub struct TreeInner {
 
     /// Serializes flush operations.
     pub(crate) flush_lock: Mutex<()>,
+
+    /// Tree-wide gate that defers SST / blob-file deletions while a
+    /// [`Tree::create_checkpoint`](crate::Tree::create_checkpoint) is in
+    /// flight. Acquired by checkpoint code via
+    /// [`DeletionPause::acquire`]; consulted by [`Drop`] impls on
+    /// [`Table`](crate::Table) and [`BlobFile`](crate::BlobFile).
+    pub(crate) deletion_pause: Arc<DeletionPause>,
+
     #[doc(hidden)]
     #[cfg(feature = "metrics")]
     pub metrics: Arc<Metrics>,
@@ -100,6 +109,7 @@ impl TreeInner {
             major_compaction_lock: RwLock::default(),
             flush_lock: Mutex::default(),
             compaction_state: Arc::new(Mutex::new(CompactionState::default())),
+            deletion_pause: DeletionPause::new_shared(),
 
             #[cfg(feature = "metrics")]
             metrics: Metrics::default().into(),

@@ -13,7 +13,7 @@ use std::io::{Read, Write};
 use std::sync::Arc;
 
 #[cfg(feature = "zstd")]
-use once_cell::sync::OnceCell;
+use once_cell::race::OnceBox;
 
 /// Zstd compression backend operations.
 ///
@@ -84,13 +84,17 @@ pub struct ZstdDictionary {
     /// Lazily-parsed shared `DictionaryHandle` (Arc-backed inside structured-zstd).
     /// Populated on first decompress call and reused across all subsequent calls
     /// and all threads — eliminates the per-thread dictionary re-parse the TLS
-    /// `FrameDecoder` cache used to incur on every miss. `OnceCell::get_or_try_init`
-    /// guarantees exactly one successful parse across racing threads with no
-    /// auxiliary mutex: losers wait on the internal one-shot synchronisation
-    /// primitive and reuse the winner's `Arc` clone. This keeps the `new()`
-    /// constructor infallible AND preserves the single-parse contract.
+    /// `FrameDecoder` cache used to incur on every miss.
+    /// `OnceBox::get_or_try_init` guarantees one successful parse across
+    /// racing threads via a single CAS on the slot pointer: the winner's
+    /// `Box<DictionaryHandle>` becomes the stable `&T`, racing losers drop
+    /// their unused `Box` allocations and read the winner's value on the
+    /// next iteration. No auxiliary mutex is needed because the slot is
+    /// lock-free; the only contention is the brief CAS window during the
+    /// cold-start race. This keeps the `new()` constructor infallible AND
+    /// preserves the single-parse contract.
     #[cfg(feature = "zstd")]
-    prepared: Arc<OnceCell<structured_zstd::decoding::DictionaryHandle>>,
+    prepared: Arc<OnceBox<structured_zstd::decoding::DictionaryHandle>>,
 }
 
 #[cfg(zstd_any)]
@@ -146,7 +150,7 @@ impl ZstdDictionary {
             id: compute_dict_id(raw),
             raw: Arc::from(raw),
             #[cfg(feature = "zstd")]
-            prepared: Arc::new(OnceCell::new()),
+            prepared: Arc::new(OnceBox::new()),
         }
     }
 
@@ -173,20 +177,24 @@ impl ZstdDictionary {
         use structured_zstd::decoding::{Dictionary, DictionaryHandle};
         const DICT_MAGIC: [u8; 4] = [0x37, 0xA4, 0x30, 0xEC];
 
-        // `get_or_try_init` is the canonical single-init-across-racers
-        // primitive: the closure runs at most once globally regardless of
-        // contention; concurrent callers wait on the OnceCell's internal
-        // one-shot synchronisation and read the cached `Arc` afterwards.
-        // The fast path (cached value) is lock-free; the slow path runs
-        // exactly once per `ZstdDictionary` lifetime even under heavy
-        // cold-start contention. On a parse failure the OnceCell stays
-        // empty and the next caller retries from scratch — preserving
-        // the retry-on-failure contract pinned by the rejection test.
+        // `OnceBox::get_or_try_init` is the canonical single-init-
+        // across-racers primitive: the closure runs at most once
+        // globally regardless of contention; concurrent callers race on
+        // a single CAS and the losers drop their unused `Box` while the
+        // winners' value becomes the stable `&T`. The fast path (cached
+        // value) is lock-free; the slow path runs exactly once per
+        // `ZstdDictionary` lifetime even under heavy cold-start
+        // contention. On a parse failure the OnceBox stays empty and
+        // the next caller retries from scratch — preserving the
+        // retry-on-failure contract pinned by the rejection test.
+        // `Box::new(handle)` is the OnceBox API requirement: the slot
+        // owns a heap allocation rather than the value inline, which
+        // is what lets the type stay no-std + alloc compatible.
         self.prepared
-            .get_or_try_init(|| -> crate::Result<DictionaryHandle> {
-                if self.raw.starts_with(&DICT_MAGIC) {
+            .get_or_try_init(|| -> crate::Result<Box<DictionaryHandle>> {
+                let handle = if self.raw.starts_with(&DICT_MAGIC) {
                     DictionaryHandle::decode_dict(&self.raw)
-                        .map_err(|e| crate::Error::Io(std::io::Error::other(e)))
+                        .map_err(|e| crate::Error::Io(std::io::Error::other(e)))?
                 } else {
                     #[expect(
                         clippy::cast_possible_truncation,
@@ -195,8 +203,9 @@ impl ZstdDictionary {
                     let raw_content_id = (self.id as u32).max(1);
                     let dict = Dictionary::from_raw_content(raw_content_id, self.raw.to_vec())
                         .map_err(|e| crate::Error::Io(std::io::Error::other(e)))?;
-                    Ok(DictionaryHandle::from_dictionary(dict))
-                }
+                    DictionaryHandle::from_dictionary(dict)
+                };
+                Ok(Box::new(handle))
             })
             .cloned()
     }

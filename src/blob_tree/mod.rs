@@ -225,6 +225,24 @@ impl BlobTree {
 impl crate::abstract_tree::sealed::Sealed for BlobTree {}
 
 impl AbstractTree for BlobTree {
+    fn create_checkpoint(
+        &self,
+        target_path: &std::path::Path,
+    ) -> crate::Result<crate::CheckpointInfo> {
+        crate::checkpoint::run_checkpoint(
+            self,
+            &crate::checkpoint::CheckpointParams {
+                target_root: target_path,
+                target_fs: &self.index.config.fs,
+                src_root: &self.index.config.path,
+                src_fs: &self.index.config.fs,
+                deletion_pause: &self.index.deletion_pause,
+                visible_seqno: &self.index.config.visible_seqno,
+                include_blobs: true,
+            },
+        )
+    }
+
     fn print_trace(&self, key: &[u8]) -> crate::Result<()> {
         self.index.print_trace(key)
     }

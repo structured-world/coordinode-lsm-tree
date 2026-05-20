@@ -12,6 +12,7 @@ use crate::{
     compaction::{CompactionStrategy, drop_range::OwnedBounds, state::CompactionState},
     config::Config,
     format_version::FormatVersion,
+    fs::Fs,
     iter_guard::{IterGuard, IterGuardImpl},
     key::InternalKey,
     manifest::Manifest,
@@ -170,6 +171,24 @@ impl AbstractTree for Tree {
 
     fn blob_file_count(&self) -> usize {
         0
+    }
+
+    fn create_checkpoint(
+        &self,
+        target_path: &std::path::Path,
+    ) -> crate::Result<crate::CheckpointInfo> {
+        crate::checkpoint::run_checkpoint(
+            self,
+            &crate::checkpoint::CheckpointParams {
+                target_root: target_path,
+                target_fs: &self.config.fs,
+                src_root: &self.config.path,
+                src_fs: &self.config.fs,
+                deletion_pause: &self.deletion_pause,
+                visible_seqno: &self.config.visible_seqno,
+                include_blobs: false,
+            },
+        )
     }
 
     fn print_trace(&self, key: &[u8]) -> crate::Result<()> {
@@ -546,6 +565,18 @@ impl AbstractTree for Tree {
             tables.len(),
             blob_files.map(<[BlobFile]>::len).unwrap_or_default(),
         );
+
+        // Wire the tree-wide deletion pause into every fresh table / blob
+        // file so an in-flight checkpoint defers their cleanup if they
+        // later get marked `is_deleted` by compaction.
+        for table in tables {
+            table.install_deletion_pause(Arc::clone(&self.deletion_pause));
+        }
+        if let Some(bfs) = blob_files {
+            for bf in bfs {
+                bf.install_deletion_pause(Arc::clone(&self.deletion_pause));
+            }
+        }
 
         #[expect(clippy::expect_used, reason = "lock is expected to not be poisoned")]
         let mut _compaction_state = self.compaction_state.lock().expect("lock is poisoned");
@@ -1640,6 +1671,36 @@ impl Tree {
         let tree = match crate::version::recovery::get_current_version(&config.path, &*config.fs) {
             Ok(_) => Self::recover(config),
             Err(crate::Error::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+                // Missing CURRENT MUST coincide with a directory that
+                // has no version artifacts; otherwise we are looking at
+                // a half-written checkpoint (or other interrupted
+                // sealing). Silently calling `create_new` in that case
+                // would overwrite the partial state with an empty tree,
+                // turning a recoverable failure into data loss.
+                if has_existing_version_state(&config.path, &*config.fs)? {
+                    // Return Error::Io(InvalidData, ...) rather than
+                    // Error::Unrecoverable so callers that don't read
+                    // logs still get a programmatic surface with the
+                    // path and remediation hint embedded. `log::error!`
+                    // stays for human ops who DO watch logs and want
+                    // the full context at the moment of failure (the
+                    // structured error is what propagates up the call
+                    // chain; the log line records the diagnosis next
+                    // to the timestamp).
+                    let msg = format!(
+                        "Tree::open: refusing to recover {} — `current` pointer is missing \
+                         but the directory still holds version artifacts (tables/, blobs/, \
+                         or vN). This is the on-disk signature of a half-written checkpoint \
+                         or interrupted sealing. Remove the partial directory and retry the \
+                         checkpoint, or restore `current` from a backup before reopening.",
+                        config.path.display(),
+                    );
+                    log::error!("{msg}");
+                    return Err(crate::Error::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        msg,
+                    )));
+                }
                 Self::create_new(config)
             }
             Err(e) => Err(e),
@@ -1878,6 +1939,8 @@ impl Tree {
 
         let comparator = config.comparator.clone();
 
+        let deletion_pause = crate::deletion_pause::DeletionPause::new_shared();
+
         let inner = TreeInner {
             id: tree_id,
             memtable_id_counter: SequenceNumberCounter::new(1),
@@ -1889,10 +1952,35 @@ impl Tree {
             major_compaction_lock: RwLock::default(),
             flush_lock: Mutex::default(),
             compaction_state: Arc::new(Mutex::new(CompactionState::default())),
+            deletion_pause: Arc::clone(&deletion_pause),
 
             #[cfg(feature = "metrics")]
             metrics,
         };
+
+        // Install the pause on every recovered table / blob file so their
+        // Drop impls consult it when a checkpoint is in flight. Snapshot
+        // the Arc handles into owned collections so the read lock is
+        // released before iterating (avoids `significant_drop_tightening`).
+        #[expect(clippy::expect_used, reason = "lock is expected to not be poisoned")]
+        let (recovered_tables, recovered_blobs): (Vec<Table>, Vec<BlobFile>) = inner
+            .version_history
+            .read()
+            .map(|lock| {
+                let version = &lock.latest_version().version;
+                (
+                    version.iter_tables().cloned().collect(),
+                    version.blob_files.iter().cloned().collect(),
+                )
+            })
+            .expect("lock is poisoned");
+
+        for table in &recovered_tables {
+            table.install_deletion_pause(Arc::clone(&deletion_pause));
+        }
+        for blob_file in &recovered_blobs {
+            blob_file.install_deletion_pause(Arc::clone(&deletion_pause));
+        }
 
         Ok(Self(Arc::new(inner)))
     }
@@ -2192,4 +2280,35 @@ impl Tree {
 
         Ok(())
     }
+}
+
+/// Returns `true` if the directory contains version-related artifacts
+/// (a `tables/` subdir, a `blobs/` subdir, or any `vN` manifest file).
+///
+/// Used by [`Tree::open`] to distinguish a genuinely fresh directory
+/// (safe to `create_new`) from a half-written checkpoint or other
+/// interrupted sealing (must error rather than silently overwrite).
+///
+/// A missing parent directory is treated as "no state" — `create_new`
+/// is what creates the directory in the first place, so callers may
+/// invoke `Tree::open` against a path that does not exist yet.
+fn has_existing_version_state(folder: &Path, fs: &dyn Fs) -> crate::Result<bool> {
+    if fs.exists(&folder.join(crate::file::TABLES_FOLDER))?
+        || fs.exists(&folder.join(crate::file::BLOBS_FOLDER))?
+    {
+        return Ok(true);
+    }
+    let entries = match fs.read_dir(folder) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e.into()),
+    };
+    for entry in entries {
+        let name = &entry.file_name;
+        if name.starts_with('v') && name.len() > 1 && name[1..].bytes().all(|c| c.is_ascii_digit())
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
