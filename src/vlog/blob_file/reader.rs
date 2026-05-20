@@ -1050,7 +1050,7 @@ mod tests {
             checksum: crate::Checksum::from_raw(0),
             file_accessor: FileAccessor::File(Arc::new(file2)),
             fs: Arc::new(crate::fs::StdFs),
-            deletion_pause: once_cell::sync::OnceCell::new(),
+            deletion_pause: once_cell::race::OnceBox::new(),
         }));
 
         let reader = Reader::new(&blob_file, &file);

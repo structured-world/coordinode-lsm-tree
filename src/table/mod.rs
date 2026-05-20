@@ -845,7 +845,7 @@ impl Table {
             #[cfg(zstd_any)]
             zstd_dictionary,
 
-            deletion_pause: once_cell::sync::OnceCell::new(),
+            deletion_pause: once_cell::race::OnceBox::new(),
         })))
     }
 
@@ -854,7 +854,7 @@ impl Table {
     /// Idempotent: a second call is a no-op. Called by the owning tree
     /// after recovery and after compaction registers freshly-built tables.
     pub(crate) fn install_deletion_pause(&self, pause: Arc<crate::deletion_pause::DeletionPause>) {
-        let _ = self.0.deletion_pause.set(pause);
+        let _ = self.0.deletion_pause.set(Box::new(pause));
     }
 
     #[must_use]

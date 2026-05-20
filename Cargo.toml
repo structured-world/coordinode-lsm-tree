@@ -88,15 +88,16 @@ log = "0.4.27"
 spin = { version = "0.9", default-features = false, features = ["mutex", "spin_mutex"] }
 lz4_flex = { version = "0.13.0", optional = true, default-features = false }
 structured-zstd = { version = "0.0.21", optional = true, default-features = false, features = ["std"] }
-# `once_cell::sync::OnceCell` has stable `get_or_try_init`; `std::sync::OnceLock`
-# does not until 1.86+ (still unstable on our 1.92 MSRV path via `once_cell_try`).
-# Use the external crate for the canonical single-parse-across-racers primitive
-# without an auxiliary `Mutex`. The `race` module from this same crate provides
-# the no-std + alloc variant (`OnceBox`) we'll swap to during the no-std
-# migration. Optional + gated by the `zstd` feature — only the zstd
-# `ZstdDictionary::prepared_handle` path uses it today, so non-zstd consumers
-# do not pull this crate.
-once_cell = { version = "1", default-features = false, features = ["std"] }
+# `once_cell::race::OnceBox` — the no-std + alloc variant. Provides
+# `get_or_try_init` (which `std::sync::OnceLock` lacks until 1.86, above
+# our 1.92 MSRV path) without pulling `std`. Unconditional dep with
+# `default-features = false, features = ["race"]` so the crate stays
+# no-std-friendly even with `--no-default-features`. Used by:
+#   - zstd `ZstdDictionary::prepared_handle` (canonical single-parse
+#     across racers, no auxiliary `Mutex`)
+#   - `deletion_pause` slot on tables / blob files (one-shot install of
+#     the shared `Arc<DeletionPause>` after recovery / compaction).
+once_cell = { version = "1", default-features = false, features = ["race"] }
 quick_cache = { version = "0.6.16", default-features = false, features = [] }
 rustc-hash = "2.1.1"
 self_cell = "1.2.0"

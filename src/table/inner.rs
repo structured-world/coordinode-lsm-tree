@@ -92,13 +92,12 @@ pub struct Inner {
     /// the [`Drop`] impl defers the underlying `remove_file` call so that
     /// an in-progress [`Tree::create_checkpoint`](crate::Tree::create_checkpoint)
     /// can hard-link the file before it disappears.
-    // `once_cell::sync::OnceCell` rather than `std::sync::OnceLock`
-    // because once_cell's `get_or_try_init` is stable on our MSRV
-    // (std::sync::OnceLock::get_or_try_init landed in 1.86) and the
-    // dep is already pulled in by other call sites — keeping a single
-    // alloc-friendly primitive across the crate matches the no-std
-    // direction without changing this field's API surface.
-    pub(crate) deletion_pause: once_cell::sync::OnceCell<Arc<DeletionPause>>,
+    // `once_cell::race::OnceBox` rather than `std::sync::OnceLock` so
+    // this field doesn't pin the type to `std` — OnceBox is no-std +
+    // alloc by construction. The slot is set once after recovery /
+    // compaction and read on every Drop; CAS-based race semantics are
+    // fine for this single-publisher, many-reader pattern.
+    pub(crate) deletion_pause: once_cell::race::OnceBox<Arc<DeletionPause>>,
 }
 
 impl Inner {

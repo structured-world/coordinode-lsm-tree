@@ -57,9 +57,9 @@ pub struct Inner {
     /// with a tree. When `Some` and active, the [`Drop`] impl defers the
     /// underlying `remove_file` so an in-progress checkpoint can hard-link
     /// the file before it disappears.
-    // `once_cell::sync::OnceCell` rather than `std::sync::OnceLock` —
-    // see analogous reasoning on `Table::Inner::deletion_pause`.
-    pub(crate) deletion_pause: once_cell::sync::OnceCell<Arc<DeletionPause>>,
+    // `once_cell::race::OnceBox` — see Table::Inner::deletion_pause
+    // for the rationale (no-std-friendly one-shot slot).
+    pub(crate) deletion_pause: once_cell::race::OnceBox<Arc<DeletionPause>>,
 }
 
 impl Inner {
@@ -166,7 +166,7 @@ impl BlobFile {
     /// Installs the tree-wide deletion pause used by checkpoints.
     /// Idempotent: a second call is a no-op.
     pub(crate) fn install_deletion_pause(&self, pause: Arc<DeletionPause>) {
-        let _ = self.0.deletion_pause.set(pause);
+        let _ = self.0.deletion_pause.set(Box::new(pause));
     }
 
     /// Returns the blob file ID.
