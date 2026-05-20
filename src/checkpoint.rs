@@ -141,11 +141,11 @@ impl Drop for RootCleanup<'_> {
 ///    responsibility — a per-file warning would drown real signal on
 ///    a misconfigured tier with thousands of SSTs.
 ///
-/// The hard_link path is gated on a positive [`Fs::backend_id`]
+/// The `hard_link` path is gated on a positive [`Fs::backend_id`]
 /// match. `Arc::ptr_eq` would have been too strict (two independent
 /// `Arc::new(StdFs)` values back the same kernel filesystem but are
 /// not pointer-equal); a "try first, fall back on `NotFound`" pattern
-/// would have been too loose (a MemFs source paired with a StdFs
+/// would have been too loose (a `MemFs` source paired with a `StdFs`
 /// destination could let the kernel resolve `src` against the host
 /// filesystem and silently link an unrelated file). `Fs::backend_id`
 /// is the explicit capability check that catches both cases safely.

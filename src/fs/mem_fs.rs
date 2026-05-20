@@ -69,7 +69,7 @@ impl MemFs {
     }
 }
 
-/// Allocates the next per-instance MemFs namespace ID. Values are
+/// Allocates the next per-instance `MemFs` namespace ID. Values are
 /// process-unique (monotonic atomic counter) so two `MemFs::new()`
 /// values never collide; cloned `MemFs` instances reuse the same ID
 /// because `MemFs` derives `Clone`.

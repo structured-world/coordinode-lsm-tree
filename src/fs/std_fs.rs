@@ -222,7 +222,7 @@ impl Fs for StdFs {
 /// filesystem table — currently `StdFs` and `IoUringFs`. Two such backends
 /// can hard-link across instances because `std::fs::hard_link(src, dst)`
 /// resolves both paths through the same kernel namespace.
-pub(crate) const KERNEL_BACKEND_ID: u64 = 0x4b45_524e_454c_5f46; // "KERNEL_F"
+pub const KERNEL_BACKEND_ID: u64 = 0x4b45_524e_454c_5f46; // "KERNEL_F"
 
 /// Detects `EXDEV` (cross-device link) errors across platforms.
 ///

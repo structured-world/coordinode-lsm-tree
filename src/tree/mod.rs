@@ -12,6 +12,7 @@ use crate::{
     compaction::{CompactionStrategy, drop_range::OwnedBounds, state::CompactionState},
     config::Config,
     format_version::FormatVersion,
+    fs::Fs,
     iter_guard::{IterGuard, IterGuardImpl},
     key::InternalKey,
     manifest::Manifest,
@@ -1670,6 +1671,15 @@ impl Tree {
         let tree = match crate::version::recovery::get_current_version(&config.path, &*config.fs) {
             Ok(_) => Self::recover(config),
             Err(crate::Error::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+                // Missing CURRENT MUST coincide with a directory that
+                // has no version artifacts; otherwise we are looking at
+                // a half-written checkpoint (or other interrupted
+                // sealing). Silently calling `create_new` in that case
+                // would overwrite the partial state with an empty tree,
+                // turning a recoverable failure into data loss.
+                if has_existing_version_state(&config.path, &*config.fs)? {
+                    return Err(crate::Error::Unrecoverable);
+                }
                 Self::create_new(config)
             }
             Err(e) => Err(e),
@@ -2249,4 +2259,26 @@ impl Tree {
 
         Ok(())
     }
+}
+
+/// Returns `true` if the directory contains version-related artifacts
+/// (a `tables/` subdir, a `blobs/` subdir, or any `vN` manifest file).
+///
+/// Used by [`Tree::open`] to distinguish a genuinely fresh directory
+/// (safe to `create_new`) from a half-written checkpoint or other
+/// interrupted sealing (must error rather than silently overwrite).
+fn has_existing_version_state(folder: &Path, fs: &dyn Fs) -> crate::Result<bool> {
+    if fs.exists(&folder.join(crate::file::TABLES_FOLDER))?
+        || fs.exists(&folder.join(crate::file::BLOBS_FOLDER))?
+    {
+        return Ok(true);
+    }
+    for entry in fs.read_dir(folder)? {
+        let name = &entry.file_name;
+        if name.starts_with('v') && name.len() > 1 && name[1..].bytes().all(|c| c.is_ascii_digit())
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
