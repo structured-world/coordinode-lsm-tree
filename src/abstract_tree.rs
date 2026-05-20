@@ -34,17 +34,22 @@ pub struct CheckpointInfo {
     pub version_id: u64,
     /// Lower-bound visible-seqno watermark for the snapshot.
     ///
-    /// Captured BEFORE [`AbstractTree::current_version`] so it is
-    /// guaranteed to be ≤ the *maximum* seqno reflected in the
-    /// checkpointed SSTs. PITR consumers can safely use this value as
-    /// an **inclusive lower bound** for replay cutoffs: every record
-    /// with `seqno <= info.seqno` is included in the snapshot, but
-    /// later seqnos may also be present (writers can advance the
-    /// counter between sample and version snapshot).
+    /// Captured from the tree's `visible_seqno` generator BEFORE
+    /// [`AbstractTree::current_version`]. Following the standard
+    /// "lowest-excluded" watermark convention, `info.seqno = N` means
+    /// every record with `seqno < N` was committed at sample time and
+    /// is therefore guaranteed to be present in the snapshot. Records
+    /// with `seqno == N` may or may not be included (writers can hold
+    /// a record in the memtable for an instant before publishing the
+    /// next watermark); records with `seqno > N` may also be present
+    /// (writers can advance the counter between sample and version
+    /// snapshot, and those keys still land in the captured memtable).
     ///
-    /// Treating this as the maximum visible seqno would be incorrect
-    /// and could move a recovery cutoff past data still needed from
-    /// WAL or replication; the field is a watermark, not a ceiling.
+    /// PITR consumers MUST use `seqno < info.seqno` as the inclusion
+    /// gate. Using `<=` (treating this as a max-included ceiling)
+    /// could move a recovery cutoff past data still needed from WAL
+    /// or replication; the field is a strict lower-exclusive watermark,
+    /// not a max-included ceiling.
     pub seqno: SeqNo,
 }
 
