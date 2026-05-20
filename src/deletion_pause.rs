@@ -254,7 +254,6 @@ mod tests {
     fn drain_does_not_steal_a_new_generation_queue() {
         use std::sync::mpsc;
         use std::thread;
-        use std::time::Duration;
 
         let fs = MemFs::new();
         fs.create_dir_all(Path::new("/d")).unwrap();
@@ -265,6 +264,14 @@ mod tests {
         let pause = DeletionPause::new_shared();
         let a = pause.acquire();
 
+        // Deterministic handshake: `a_dropped_tx` signals that A's
+        // `fetch_sub(1)` has executed (so `active == 0` from A's
+        // perspective and A is committed to the drain branch); B then
+        // races in with `acquire()`+`try_enqueue()` to exercise the
+        // generation-race protection. Spin-wait on `active == 0` instead
+        // of using a fixed sleep so the test is robust under any
+        // scheduler / CI load.
+        let (a_dropped_tx, a_dropped_rx) = mpsc::channel::<()>();
         let (ready_tx, ready_rx) = mpsc::channel::<()>();
         let (release_tx, release_rx) = mpsc::channel::<()>();
 
@@ -272,11 +279,15 @@ mod tests {
         let b_fs = Arc::clone(&dyn_fs);
         let b_path = path.clone();
         let b_thread = thread::spawn(move || {
-            // Brief sleep gives Thread A time to start its `Drop`
-            // (`fetch_sub` followed by `queue.lock()`); on this side we
-            // then race in with our own `acquire` so the fix's "re-check
-            // active under the lock" branch is exercised.
-            thread::sleep(Duration::from_millis(5));
+            // Block until A has begun its drop. We then spin until
+            // A's `fetch_sub` has visibly reduced `active` to 0 —
+            // that's the exact window where A is about to lock the
+            // queue and the fix MUST notice our subsequent `acquire`
+            // under the lock.
+            a_dropped_rx.recv().unwrap();
+            while b_pause.active.load(Ordering::Acquire) != 0 {
+                core::hint::spin_loop();
+            }
             let _b = b_pause.acquire();
             assert!(b_pause.try_enqueue(b_fs, b_path));
             // Signal the main thread that B is in the right state and
@@ -287,8 +298,10 @@ mod tests {
             // Implicit drop here drains the queue.
         });
 
-        // Trigger A's drop now.
+        // Trigger A's drop now. Send the handshake AFTER drop returns
+        // so B observes A's `fetch_sub`-decremented `active` value.
         drop(a);
+        a_dropped_tx.send(()).unwrap();
 
         // Block until B has acquired AND enqueued; this is the exact
         // moment the race manifests. With the fix, the file MUST still
