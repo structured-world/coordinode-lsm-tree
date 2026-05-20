@@ -845,7 +845,7 @@ impl Table {
             #[cfg(zstd_any)]
             zstd_dictionary,
 
-            deletion_pause: std::sync::OnceLock::new(),
+            deletion_pause: once_cell::sync::OnceCell::new(),
         })))
     }
 

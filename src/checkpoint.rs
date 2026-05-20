@@ -227,28 +227,52 @@ pub fn link_or_copy_cross_fs(
     let mut src_file = src_fs.open(src, &FsOpenOptions::new().read(true))?;
     let mut dst_file = dst_fs.open(dst, &FsOpenOptions::new().write(true).create_new(true))?;
 
-    let mut buf = vec![0u8; 64 * 1024].into_boxed_slice();
-    let mut total: u64 = 0;
-    loop {
-        // Retry on EINTR — matches `StdFs::copy_fallback` and avoids
-        // spurious checkpoint failures when a signal arrives during the
-        // copy (common under shell-managed Ctrl-C handlers).
-        let n = match src_file.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => n,
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(e) => return Err(e),
-        };
-        #[expect(
-            clippy::indexing_slicing,
-            reason = "n was just produced by read() and is bounded by buf.len()"
-        )]
-        dst_file.write_all(&buf[..n])?;
-        total = total.saturating_add(n as u64);
+    // Run the copy in an inner closure so any failure (read, write,
+    // flush, fsync) leaves us with the original error AND lets us
+    // best-effort `remove_file(dst)` before propagating. Without this,
+    // a mid-copy ENOSPC/EIO leaves a partial `dst` file on the
+    // destination FS; a subsequent retry hits `create_new`'s
+    // AlreadyExists check and fails for a wholly different reason,
+    // hiding the real cause. `PartialCheckpointGuard` cleans up the
+    // whole target dir on the normal failure path, but this helper is
+    // also called from cross-Fs tests and from any future caller that
+    // doesn't sit inside that guard — so the local best-effort
+    // cleanup is the safer invariant.
+    let result: std::io::Result<u64> = (|| {
+        let mut buf = vec![0u8; 64 * 1024].into_boxed_slice();
+        let mut total: u64 = 0;
+        loop {
+            // Retry on EINTR — matches `StdFs::copy_fallback` and avoids
+            // spurious checkpoint failures when a signal arrives during the
+            // copy (common under shell-managed Ctrl-C handlers).
+            let n = match src_file.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            };
+            #[expect(
+                clippy::indexing_slicing,
+                reason = "n was just produced by read() and is bounded by buf.len()"
+            )]
+            dst_file.write_all(&buf[..n])?;
+            total = total.saturating_add(n as u64);
+        }
+        dst_file.flush()?;
+        FsFile::sync_all(&*dst_file)?;
+        Ok(total)
+    })();
+
+    match result {
+        Ok(total) => Ok(total),
+        Err(e) => {
+            // Release the dst handle before unlink so backends that
+            // block unlink while a handle is open (Windows) can succeed.
+            drop(dst_file);
+            let _ = dst_fs.remove_file(dst);
+            Err(e)
+        }
     }
-    dst_file.flush()?;
-    FsFile::sync_all(&*dst_file)?;
-    Ok(total)
 }
 
 /// Hard-links every live SST in `version` into `target/tables/`.

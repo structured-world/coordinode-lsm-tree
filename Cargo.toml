@@ -63,7 +63,7 @@ lz4 = ["dep:lz4_flex", "std"]
 # conventional `!` markers on this PR's breaking commits (BuRR filter
 # wire format, V5 manifest gate); release-plz raises the crate's major
 # version on the next release tag accordingly.
-zstd = ["dep:structured-zstd", "dep:once_cell", "std"]
+zstd = ["dep:structured-zstd", "std"]
 encryption = ["dep:aes-gcm", "dep:rand_chacha", "std"]
 bytes_1 = ["dep:bytes"]
 metrics = []
@@ -96,7 +96,7 @@ structured-zstd = { version = "0.0.21", optional = true, default-features = fals
 # migration. Optional + gated by the `zstd` feature — only the zstd
 # `ZstdDictionary::prepared_handle` path uses it today, so non-zstd consumers
 # do not pull this crate.
-once_cell = { version = "1", optional = true }
+once_cell = { version = "1", default-features = false, features = ["std"] }
 quick_cache = { version = "0.6.16", default-features = false, features = [] }
 rustc-hash = "2.1.1"
 self_cell = "1.2.0"

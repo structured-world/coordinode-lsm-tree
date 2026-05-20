@@ -136,7 +136,7 @@ pub fn recover_blob_files(
                 file_accessor,
                 tree_id,
                 fs: fs.clone(),
-                deletion_pause: std::sync::OnceLock::new(),
+                deletion_pause: once_cell::sync::OnceCell::new(),
             })));
 
             if idx % progress_mod == 0 {

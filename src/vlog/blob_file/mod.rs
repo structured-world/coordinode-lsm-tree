@@ -16,7 +16,7 @@ use crate::{
 pub use meta::Metadata;
 use std::{
     path::{Path, PathBuf},
-    sync::{Arc, OnceLock, atomic::AtomicBool},
+    sync::{Arc, atomic::AtomicBool},
 };
 
 /// A blob file is an immutable, sorted, contiguous file that contains large key-value pairs (blobs)
@@ -57,7 +57,9 @@ pub struct Inner {
     /// with a tree. When `Some` and active, the [`Drop`] impl defers the
     /// underlying `remove_file` so an in-progress checkpoint can hard-link
     /// the file before it disappears.
-    pub(crate) deletion_pause: OnceLock<Arc<DeletionPause>>,
+    // `once_cell::sync::OnceCell` rather than `std::sync::OnceLock` —
+    // see analogous reasoning on `Table::Inner::deletion_pause`.
+    pub(crate) deletion_pause: once_cell::sync::OnceCell<Arc<DeletionPause>>,
 }
 
 impl Inner {
@@ -107,12 +109,16 @@ impl Drop for Inner {
 
             // If a checkpoint is active, defer the physical deletion so the
             // file remains hard-linkable until the checkpoint releases its
-            // pause. Falls through to immediate removal when no pause is
-            // installed or the pause is inactive.
-            let deferred = if let Some(pause) = self.deletion_pause.get() {
-                pause.try_enqueue(Arc::clone(&self.fs), self.path.clone())
-            } else {
-                false
+            // pause. Short-circuit on the common no-checkpoint path: skip
+            // the Arc<dyn Fs> bump and PathBuf clone unless a pause is
+            // both installed AND currently active. `try_enqueue` still
+            // re-checks `is_active()` under the queue lock to close the
+            // publish-then-release race, so the outer check is pure perf.
+            let deferred = match self.deletion_pause.get() {
+                Some(pause) if pause.is_active() => {
+                    pause.try_enqueue(Arc::clone(&self.fs), self.path.clone())
+                }
+                _ => false,
             };
 
             if deferred {
