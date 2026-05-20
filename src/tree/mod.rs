@@ -2267,13 +2267,22 @@ impl Tree {
 /// Used by [`Tree::open`] to distinguish a genuinely fresh directory
 /// (safe to `create_new`) from a half-written checkpoint or other
 /// interrupted sealing (must error rather than silently overwrite).
+///
+/// A missing parent directory is treated as "no state" — `create_new`
+/// is what creates the directory in the first place, so callers may
+/// invoke `Tree::open` against a path that does not exist yet.
 fn has_existing_version_state(folder: &Path, fs: &dyn Fs) -> crate::Result<bool> {
     if fs.exists(&folder.join(crate::file::TABLES_FOLDER))?
         || fs.exists(&folder.join(crate::file::BLOBS_FOLDER))?
     {
         return Ok(true);
     }
-    for entry in fs.read_dir(folder)? {
+    let entries = match fs.read_dir(folder) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e.into()),
+    };
+    for entry in entries {
         let name = &entry.file_name;
         if name.starts_with('v') && name.len() > 1 && name[1..].bytes().all(|c| c.is_ascii_digit())
         {
