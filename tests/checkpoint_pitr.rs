@@ -671,3 +671,69 @@ fn checkpoint_failure_leaves_source_intact() -> lsm_tree::Result<()> {
     assert_eq!(&*val, b"v42");
     Ok(())
 }
+
+/// A checkpoint whose `current` pointer is missing (the crash-recovery
+/// hole described in `write_current_for_version`) MUST be rejected by
+/// `Tree::open` rather than silently treated as fresh-tree state. This
+/// regression test removes the file after a successful checkpoint and
+/// asserts open returns an error.
+#[test_log::test]
+fn checkpoint_open_rejects_missing_current_pointer() -> lsm_tree::Result<()> {
+    let src_dir = tempfile::tempdir()?;
+    let dst_dir = tempfile::tempdir()?;
+    let dst_path = dst_dir.path().join("checkpoint");
+
+    let tree = open_tree(src_dir.path())?;
+    for i in 0u32..10 {
+        tree.insert(format!("k{i:03}"), format!("v{i}"), u64::from(i));
+    }
+    tree.flush_active_memtable(0)?;
+    tree.create_checkpoint(&dst_path)?;
+    drop(tree);
+
+    // Tamper: delete the `current` pointer that
+    // `write_current_for_version` writes last during checkpoint sealing.
+    let current = dst_path.join("current");
+    assert!(
+        current.exists(),
+        "checkpoint sealing must have produced a `current` pointer",
+    );
+    std::fs::remove_file(&current)?;
+
+    // Open MUST fail (no fresh-tree fallback) so callers detect the
+    // half-written checkpoint instead of mistaking it for empty data.
+    let open_result = open_tree(&dst_path);
+    assert!(
+        open_result.is_err(),
+        "open_tree on a checkpoint with no `current` must error, got Ok",
+    );
+    Ok(())
+}
+
+/// Same crash-recovery contract as above, but for a `current` file that
+/// exists yet contains garbage instead of a valid version pointer.
+/// `Tree::open` MUST refuse to interpret the directory as a fresh tree.
+#[test_log::test]
+fn checkpoint_open_rejects_corrupt_current_pointer() -> lsm_tree::Result<()> {
+    let src_dir = tempfile::tempdir()?;
+    let dst_dir = tempfile::tempdir()?;
+    let dst_path = dst_dir.path().join("checkpoint");
+
+    let tree = open_tree(src_dir.path())?;
+    for i in 0u32..10 {
+        tree.insert(format!("k{i:03}"), format!("v{i}"), u64::from(i));
+    }
+    tree.flush_active_memtable(0)?;
+    tree.create_checkpoint(&dst_path)?;
+    drop(tree);
+
+    let current = dst_path.join("current");
+    std::fs::write(&current, b"this is not a valid version pointer")?;
+
+    let open_result = open_tree(&dst_path);
+    assert!(
+        open_result.is_err(),
+        "open_tree on a checkpoint with corrupt `current` must error, got Ok",
+    );
+    Ok(())
+}
