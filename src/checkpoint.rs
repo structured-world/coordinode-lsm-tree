@@ -599,24 +599,19 @@ pub fn run_checkpoint<T: AbstractTree>(
 
     fsync_directory(target_root, &**target_fs)?;
 
-    // Finally, fsync the directory that CONTAINS `target_root`. Without
-    // this the checkpoint's own directory entry can disappear after a
-    // power loss even though the children we just synced would still be
-    // intact on the underlying inodes. Required by the same fsync-
-    // ordering rule that drove the child-directory syncs above.
-    // `Path::parent()` returns `Some("")` for a bare leaf like `"checkpoint"`,
-    // which `fsync_directory` would reject as an invalid input. For a relative
-    // leaf the containing directory IS the process CWD, so resolve to `.`
-    // explicitly — otherwise we'd silently skip the fsync that guarantees the
-    // checkpoint's own directory entry survives a power loss.
-    // Only fsync a NAMED parent. `Path::parent()` returns `Some("")`
-    // for a single-component relative target like `"checkpoint"` —
-    // substituting `Path::new(".")` would lean on the host OS's CWD,
-    // which works for StdFs but is meaningless for backends without a
-    // notion of current working directory (e.g. MemFs's
-    // `sync_directory(".")` returns NotFound). Skip the fsync in the
-    // empty-parent case; callers needing the parent-directory-entry-
-    // survives-power-loss guarantee pass an absolute path.
+    // Finally, fsync the directory that CONTAINS `target_root` so the
+    // checkpoint's own directory entry survives a power loss even
+    // though the children we just synced would otherwise stay intact
+    // on the underlying inodes. Required by the same fsync-ordering
+    // rule that drove the child-directory syncs above.
+    //
+    // Only fsync a NAMED parent. After the CurDir-stripping
+    // normalisation at the top of run_checkpoint, a single-component
+    // target like `"checkpoint"` has an empty parent — there is no
+    // backend-portable directory to fsync (in particular, MemFs has
+    // no CWD, so `sync_directory(".")` returns NotFound). Skip the
+    // fsync in that case; callers needing the parent-dir-entry-
+    // survives-power-loss guarantee pass an absolute target path.
     if let Some(parent) = target_root.parent()
         && !parent.as_os_str().is_empty()
     {

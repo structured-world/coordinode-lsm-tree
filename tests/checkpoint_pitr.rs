@@ -75,10 +75,26 @@ fn checkpoint_survives_concurrent_writes() -> lsm_tree::Result<()> {
     let dst_dir = tempfile::tempdir()?;
     let dst_path = dst_dir.path().join("checkpoint");
 
-    let tree = Arc::new(open_tree(src_dir.path())?);
+    // Use a SHARED visible_seqno generator and fetch_max it past every
+    // inserted record's seqno. Without this, info.seqno (captured from
+    // the visible_seqno generator) stays at whatever value internal
+    // version transitions bumped it to — small, unrelated to the
+    // 0..200 record seqnos this test uses — and the watermark assertion
+    // below becomes vacuous (the `i as u64 <= info.seqno` guard rarely
+    // fires, so checkpoint regressions silently pass).
+    let visible_seqno = SequenceNumberCounter::default();
+    let tree = Arc::new(
+        Config::new(
+            src_dir.path(),
+            SequenceNumberCounter::default(),
+            visible_seqno.clone(),
+        )
+        .open()?,
+    );
 
     for i in 0u32..50 {
         tree.insert(format!("k{i:03}"), format!("v{i}"), u64::from(i));
+        visible_seqno.fetch_max(u64::from(i) + 1);
     }
     tree.flush_active_memtable(0)?;
 
@@ -89,9 +105,11 @@ fn checkpoint_survives_concurrent_writes() -> lsm_tree::Result<()> {
     // smoke test that does not exercise the concurrency invariant.
     let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
     let writer_tree = Arc::clone(&tree);
+    let writer_seqno = visible_seqno.clone();
     let writer = thread::spawn(move || -> lsm_tree::Result<()> {
         for i in 50u32..200 {
             writer_tree.insert(format!("k{i:03}"), format!("v{i}"), u64::from(i));
+            writer_seqno.fetch_max(u64::from(i) + 1);
             if i == 50 {
                 started_tx
                     .send(())
