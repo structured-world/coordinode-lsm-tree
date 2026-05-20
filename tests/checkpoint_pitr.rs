@@ -751,11 +751,25 @@ fn checkpoint_open_rejects_corrupt_current_pointer() -> lsm_tree::Result<()> {
     let current = dst_path.join("current");
     std::fs::write(&current, b"this is not a valid version pointer")?;
 
-    let open_result = open_tree(&dst_path);
-    assert!(
-        open_result.is_err(),
-        "open_tree on a checkpoint with corrupt `current` must error, got Ok",
-    );
+    // Assert the specific failure mode the parser catches.
+    // `get_current_version` reads `u64 version_id | u128 checksum |
+    // u8 checksum_type` and rejects any checksum_type byte that
+    // isn't 0 (xxh3) with `Error::InvalidTag(("ChecksumType", _))`.
+    // Writing 36 bytes of junk guarantees we hit that branch — checking
+    // for InvalidTag instead of just `is_err()` ensures a future refactor
+    // that masks the corruption behind a different error path fails the
+    // test instead of silently passing.
+    let err = match open_tree(&dst_path) {
+        Ok(_) => panic!("open_tree on a checkpoint with corrupt `current` must error, got Ok"),
+        Err(e) => e,
+    };
+    match err {
+        lsm_tree::Error::InvalidTag((field, _)) => assert_eq!(
+            field, "ChecksumType",
+            "expected ChecksumType InvalidTag from corrupt `current`, got field {field}",
+        ),
+        other => panic!("expected Error::InvalidTag(ChecksumType, _), got {other:?}"),
+    }
     Ok(())
 }
 
@@ -785,15 +799,23 @@ fn checkpoint_survives_concurrent_manifest_gc_of_captured_version() -> lsm_tree:
     }
     tree.flush_active_memtable(0)?;
 
-    // Identify the live version file on disk so we can remove it
-    // without going through the maintenance API (which would also
-    // evict the in-memory entry — defeating the race-reproduction).
-    let live_v = std::fs::read_dir(src_dir.path())?
-        .filter_map(Result::ok)
-        .map(|e| e.file_name())
-        .filter_map(|n| n.into_string().ok())
-        .find(|n| n.starts_with('v') && n.len() > 1 && n[1..].bytes().all(|c| c.is_ascii_digit()))
-        .expect("source tree should have at least one vN file after flush");
+    // Identify the live version file the same way recovery does — read
+    // the version id out of `current` rather than picking the first
+    // matching `vN` from `read_dir`. read_dir's order is unspecified and
+    // multiple vN files may coexist (the previous flush leaves the prior
+    // version around for snapshot readers until manifest GC runs), so a
+    // naive .find() could remove a STALE file and silently turn the
+    // test into a no-op that passes even when the race fix regresses.
+    //
+    // The `current` wire format is `u64 version_id | u128 checksum |
+    // u8 checksum_type` — the first 8 LE bytes give us the live id.
+    let current_bytes = std::fs::read(src_dir.path().join("current"))?;
+    let version_id = u64::from_le_bytes(
+        current_bytes[..8]
+            .try_into()
+            .expect("`current` stores the version id in the first 8 bytes"),
+    );
+    let live_v = format!("v{version_id}");
     std::fs::remove_file(src_dir.path().join(&live_v))?;
 
     // With the fix, the checkpoint serialises the in-memory Version

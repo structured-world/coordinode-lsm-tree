@@ -380,15 +380,22 @@ fn write_current_for_version(
 
 /// Replicates manifest + `v<id>` + writes a fresh `current` pointer.
 ///
-/// Pulls the manifest and the active version snapshot (`v<id>`) from
-/// the source tree into the checkpoint, then writes a fresh `current`
-/// pointer for the captured version (see [`write_current_for_version`]
-/// for why we don't copy the live file).
+/// Best-effort-copies the manifest from the source tree, then writes
+/// `v<id>` and `current` into the checkpoint directory from the
+/// captured in-memory `Version` rather than copying the source file.
 ///
-/// `version_id` is the ID of the version captured at checkpoint time; the
-/// corresponding `v<id>` file MUST exist on the source because checkpoint
-/// is called after a flush that publishes a new version through
-/// [`crate::version::persist_version`].
+/// `version` is the captured snapshot held by the checkpoint driver
+/// from `tree.current_version()`. Writing it through
+/// [`crate::version::persist_version`] removes the dependency on the
+/// source `v<id>` file's lifetime: a concurrent
+/// [`crate::version::SuperVersions::maintenance`] call may delete the
+/// source file between capture and this function, but the snapshot is
+/// fully reconstructible from memory, so checkpoint creation does not
+/// fail under that race. `comparator_name` is required to encode the
+/// version through the same wire-format path the live tree uses (see
+/// [`crate::version::persist_version`]'s signature). `current` is
+/// then written via [`write_current_for_version`] referencing the
+/// freshly-persisted `version.id()`.
 pub fn copy_metadata(
     src_fs: &dyn Fs,
     src_root: &Path,
