@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779222230533,
+  "lastUpdate": 1779303442652,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -7020,6 +7020,84 @@ window.BENCHMARK_DATA = {
             "value": 264777.3455276085,
             "unit": "ops/sec (normalized)",
             "extra": "raw: 417135 ops/sec | factor: 0.635 | P50: 2.2us | P99: 4.9us | P99.9: 13.8us\nthreads: 1 | elapsed: 0.48s | num: 200000 | iterations: 3 | runner: seq_wr=222755 rand_rd=724934 cpu=109 composite=36234.6"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "9dc90bf88a3bdaafe2cf598a39648bca1eec6171",
+          "message": "feat(checkpoint)!: hard-link snapshot for PITR backup (V5 storage) (#276)\n\n## Summary\n\nImplements\n[#210](https://github.com/structured-world/coordinode-lsm-tree/issues/210)\n— the consistent hard-link checkpoint primitive that unblocks\npoint-in-time recovery (PITR) backup for CoordiNode and any other\nconsumer that needs an O(1)-per-file snapshot of an open LSM-tree.\n\n- New trait method `Fs::hard_link(src, dst)` with a default\n`Unsupported` impl (non-breaking for downstream backends). `StdFs`\nperforms a real `hard_link(2)` with an EXDEV→copy fallback; `MemFs`\nproduces an independent copy; `IoUringFs` delegates to `StdFs` since\nlinking is a metadata-only syscall.\n- New trait method `Fs::backend_id() -> Option<u64>` — explicit\nshared-namespace capability check that gates cross-`Fs` hard-link\nattempts. `StdFs`/`IoUringFs` return a common `KERNEL_BACKEND_ID`; each\n`MemFs::new()` allocates a unique per-instance id; default impl returns\n`None` for safe-by-default third-party backends.\n- `DeletionPause` — a tree-wide refcount-gated deferred-delete queue\ninstalled into each `Table::Inner` / `BlobFile::Inner`. While at least\none `Pause` guard is alive, both `Drop` impls queue removals instead of\nexecuting them; the queue drains when the last guard is dropped. Mirrors\nRocksDB's `DisableFileDeletions`/`EnableFileDeletions` pattern.\nSynchronisation uses `spin::Mutex` so the type is `no_std`-compatible.\n- `AbstractTree::create_checkpoint(target) -> CheckpointInfo` —\nimplemented on `Tree`, `BlobTree`, and (via `enum_dispatch`) `AnyTree`.\nThe driver captures `visible_seqno` first, flushes the active memtable\n(eviction seqno `0` — never expands MVCC GC beyond what would have\nhappened anyway), snapshots the current version, hard-links every live\nSST + blob into `target/{tables,blobs}/`, copies manifest / `v<id>` /\n`current`, and fsyncs the target root.\n- `level_routes` (tiered storage) is honoured automatically — each\n`Table::Inner` already carries its own routed `Fs`, so the link is\nperformed through the right backend. Cross-`Fs` situations (e.g. `MemFs`\nsource vs. `StdFs` target) transparently fall back to a streamed byte\ncopy after the `backend_id` namespace check declines the hard-link path.\n- `Tree::open` now rejects a directory that has version artifacts\n(`tables/`, `blobs/`, `vN`) but no `current` pointer — the on-disk\nsignature of a half-written checkpoint. Previously the code silently\ncalled `create_new`, which would have overwritten the partial state with\nan empty tree.\n\n## Test plan\n\n`cargo nextest run --all-features` — **1327/1327 passed** (6\nenvironment-skipped), including 14 integration scenarios in\n`tests/checkpoint_pitr.rs`:\n\n- [x] Round-trip — checkpoint + reopen as standalone tree reads every\nkey back\n- [x] Concurrent writes during checkpoint do not corrupt the snapshot\n- [x] Deferred-delete invariant: concurrent `major_compact` cannot\nremove an SST captured by an in-flight checkpoint\n- [x] BlobTree checkpoint captures both index SSTs and blob files\n- [x] `level_routes` SSTs land in the flattened `target/tables/`\ndirectory\n- [x] Source vs. checkpoint isolation — writes on either side do not\nbleed across\n- [x] Crash-safety — failed checkpoint leaves the source tree fully\nreopenable (chmod-driven `link_tables` failure)\n- [x] Empty tree checkpoint succeeds with `sst_files == 0`\n- [x] `CheckpointInfo.total_bytes` matches the on-disk sum\n- [x] Re-running a checkpoint into the same target is rejected with\n`AlreadyExists`\n- [x] MVCC regression — checkpoint-triggered flush must NOT drop history\nneeded by source-tree snapshot readers (eviction seqno = 0, not\n`SeqNo::MAX`)\n- [x] Half-written-checkpoint detection — missing `current` pointer\nrejected by `Tree::open`\n- [x] Half-written-checkpoint detection — corrupt `current` pointer\nrejected by `Tree::open`\n- [x] Cross-`Fs` (`StdFs`↔`MemFs`) link-or-copy streams through both\ntrait objects (inline in `src/checkpoint.rs`)\n\nPlus unit coverage for:\n- `DeletionPause` — defer / inactive-passthrough / nested-pauses /\ngeneration-race-under-lock\n- `StdFs::is_cross_device` — raw EXDEV + `ErrorKind` variants\n- `Fs::hard_link` — round-trip + duplicate / missing-source rejection\n(both `StdFs` and `MemFs`)\n- `copy_fallback` — independence + create-new semantics\n\n- [x] `cargo clippy --lib --tests` clean\n- [x] `cargo test --doc` passes for all touched modules\n\nCloses #210\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n## Summary by CodeRabbit\n\n* **New Features**\n* Point-in-time checkpoint snapshots (optional blob inclusion) reporting\nfile counts, total bytes, version id and visibility seqno; checkpoints\ncan be opened as independent trees.\n\n* **Reliability / Bug Fixes**\n* Atomic, durable checkpoint creation with hard-link-first and\nstreamed-copy fallback (debug-logged); best-effort cleanup on failure;\nopening rejects half-written or corrupt checkpoints with clearer\ndiagnostics.\n\n* **Utilities**\n* Checkpoint-aware gate to defer physical file removals during snapshot\nlifetimes.\n\n* **Filesystem compatibility**\n* Improved create-dir/hard-link handling with cross-filesystem copy\nfallback and namespace signaling.\n\n* **Tests / Documentation**\n* Extensive end-to-end, isolation and crash-safety checkpoint suite;\nREADME updated to document PITR checkpoints.\n\n<!-- review_stack_entry_start -->\n\n[![Review Change\nStack](https://storage.googleapis.com/coderabbit_public_assets/review-stack-in-coderabbit-ui.svg)](https://app.coderabbit.ai/change-stack/structured-world/coordinode-lsm-tree/pull/276?utm_source=github_walkthrough&utm_medium=github&utm_campaign=change_stack)\n\n<!-- review_stack_entry_end -->\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->\n\n---\n\nBREAKING CHANGE: on-disk format V5. V3/V4 databases are NOT readable by\nthis version and vice versa. V5 ships the BuRR filter wire-format change\n(replaces standard bloom, #269) plus the PITR hard-link checkpoint\nprimitive (this PR, #210). The major bump goes through release-plz on\nsquash.",
+          "timestamp": "2026-05-20T21:56:03+03:00",
+          "tree_id": "c3c9b6792fbec41efc99a1e1ebdc84adda6c5916",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/9dc90bf88a3bdaafe2cf598a39648bca1eec6171"
+        },
+        "date": 1779303441252,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 1222041.4287578363,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 1932906 ops/sec | factor: 0.632 | P50: 0.4us | P99: 2.3us | P99.9: 5.7us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3 | runner: seq_wr=218602 rand_rd=743113 cpu=108 composite=36379.2"
+          },
+          {
+            "name": "fillrandom",
+            "value": 686167.2988424663,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 1085313 ops/sec | factor: 0.632 | P50: 0.7us | P99: 3.0us | P99.9: 7.1us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3 | runner: seq_wr=218602 rand_rd=743113 cpu=108 composite=36379.2"
+          },
+          {
+            "name": "readrandom",
+            "value": 298212.3806673218,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 471683 ops/sec | factor: 0.632 | P50: 1.9us | P99: 6.4us | P99.9: 13.6us\nthreads: 1 | elapsed: 0.42s | num: 200000 | iterations: 3 | runner: seq_wr=218602 rand_rd=743113 cpu=108 composite=36379.2"
+          },
+          {
+            "name": "readseq",
+            "value": 1437577.259911624,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 2273820 ops/sec | factor: 0.632 | P50: 0.3us | P99: 4.5us | P99.9: 9.2us\nthreads: 1 | elapsed: 0.09s | num: 200000 | iterations: 3 | runner: seq_wr=218602 rand_rd=743113 cpu=108 composite=36379.2"
+          },
+          {
+            "name": "seekrandom",
+            "value": 221958.39433793884,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 351072 ops/sec | factor: 0.632 | P50: 2.5us | P99: 7.0us | P99.9: 14.5us\nthreads: 1 | elapsed: 0.57s | num: 200000 | iterations: 3 | runner: seq_wr=218602 rand_rd=743113 cpu=108 composite=36379.2"
+          },
+          {
+            "name": "prefixscan",
+            "value": 114082.71635577615,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 180445 ops/sec | factor: 0.632 | P50: 5.2us | P99: 6.7us | P99.9: 17.2us\nthreads: 1 | elapsed: 1.11s | num: 200000 | iterations: 3 | runner: seq_wr=218602 rand_rd=743113 cpu=108 composite=36379.2"
+          },
+          {
+            "name": "overwrite",
+            "value": 729422.3149552316,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 1153729 ops/sec | factor: 0.632 | P50: 0.7us | P99: 2.9us | P99.9: 6.8us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3 | runner: seq_wr=218602 rand_rd=743113 cpu=108 composite=36379.2"
+          },
+          {
+            "name": "mergerandom",
+            "value": 475701.63827356516,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 752419 ops/sec | factor: 0.632 | P50: 0.4us | P99: 2.1us | P99.9: 4.5us\nthreads: 1 | elapsed: 0.27s | num: 200000 | iterations: 3 | runner: seq_wr=218602 rand_rd=743113 cpu=108 composite=36379.2"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 281010.58058227407,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 444475 ops/sec | factor: 0.632 | P50: 2.1us | P99: 4.8us | P99.9: 14.2us\nthreads: 1 | elapsed: 0.45s | num: 200000 | iterations: 3 | runner: seq_wr=218602 rand_rd=743113 cpu=108 composite=36379.2"
           }
         ]
       }
