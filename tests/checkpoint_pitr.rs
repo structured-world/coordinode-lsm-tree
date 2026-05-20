@@ -228,6 +228,60 @@ fn checkpoint_flattens_level_routes() -> lsm_tree::Result<()> {
     Ok(())
 }
 
+/// 4b. Regression for MVCC GC leak through checkpoint flush.
+///
+/// `run_checkpoint` calls `flush_active_memtable(threshold)` to make sure
+/// the active memtable is in SSTs before linking. The threshold value
+/// drives `CompactionStream`'s `gc_seqno_threshold` — anything below it
+/// can be dropped from older versions of the same key. Passing
+/// `SeqNo::MAX` would mean "no caller cares about any historical seqno",
+/// which silently destroys MVCC history that the SOURCE tree's readers
+/// rely on.
+///
+/// Scenario:
+///   - Two versions of "k": seqno 1 ("v1") and seqno 2 ("v2")
+///   - Both live in the active memtable
+///   - Take a checkpoint (triggers the internal flush)
+///   - Read "k" at seqno 1 on the source — must return "v1"
+///
+/// With the bug (threshold = SeqNo::MAX) the flush merges the two
+/// versions and drops "v1" because 1 < MAX, so the read returns "v2"
+/// (or None) — a snapshot-visibility violation caused entirely by
+/// taking a checkpoint.
+#[test_log::test]
+fn checkpoint_flush_must_not_drop_source_mvcc_history() -> lsm_tree::Result<()> {
+    let src_dir = tempfile::tempdir()?;
+    let dst_dir = tempfile::tempdir()?;
+    let dst_path = dst_dir.path().join("checkpoint");
+
+    let tree = open_tree(src_dir.path())?;
+    tree.insert("k", "v1", 1);
+    tree.insert("k", "v2", 2);
+
+    // Sanity: the older version is visible to a seqno-1 reader BEFORE
+    // the checkpoint (both versions still in the active memtable).
+    let pre = tree.get(b"k", 2)?;
+    assert_eq!(
+        pre.as_deref(),
+        Some(&b"v1"[..]),
+        "pre-checkpoint sanity: seqno-2 read sees seqno-1 version of k",
+    );
+
+    tree.create_checkpoint(&dst_path)?;
+
+    // Post-checkpoint: the source tree's reader at the same seqno MUST
+    // still see "v1". Without the fix the checkpoint-triggered flush
+    // uses `SeqNo::MAX` as its GC threshold and discards every older
+    // version of every key.
+    let post = tree.get(b"k", 2)?;
+    assert_eq!(
+        post.as_deref(),
+        Some(&b"v1"[..]),
+        "checkpoint flush must not drop MVCC history needed by source readers",
+    );
+    Ok(())
+}
+
 /// 5. Reopen-then-mutate isolation: writes against the checkpoint must
 ///    NOT bleed back into the source tree (proves hard links share inode
 ///    data but the tree state diverges from the checkpoint moment forward).
