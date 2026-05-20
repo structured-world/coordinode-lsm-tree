@@ -542,11 +542,14 @@ fn second_checkpoint_into_same_target_rejected() -> lsm_tree::Result<()> {
 
     tree.create_checkpoint(&dst_path)?;
     let err = tree.create_checkpoint(&dst_path).unwrap_err();
-    let msg = format!("{err:?}");
-    assert!(
-        msg.contains("already exists") || msg.contains("AlreadyExists"),
-        "expected AlreadyExists on second checkpoint, got {msg}",
-    );
+    // Assert on the structural variant rather than the Debug string,
+    // which is OS-/std-formatter-specific. The second checkpoint must
+    // surface `Io(NotFound | AlreadyExists)`-class refusal so callers
+    // can detect double-target programmatically.
+    match err {
+        lsm_tree::Error::Io(ref io_err) if io_err.kind() == std::io::ErrorKind::AlreadyExists => {}
+        other => panic!("expected Io(AlreadyExists) on second checkpoint, got {other:?}"),
+    }
     Ok(())
 }
 
