@@ -589,14 +589,17 @@ pub fn run_checkpoint<T: AbstractTree>(
     // leaf the containing directory IS the process CWD, so resolve to `.`
     // explicitly — otherwise we'd silently skip the fsync that guarantees the
     // checkpoint's own directory entry survives a power loss.
-    let parent_to_fsync = target_root.parent().map(|p| {
-        if p.as_os_str().is_empty() {
-            Path::new(".")
-        } else {
-            p
-        }
-    });
-    if let Some(parent) = parent_to_fsync {
+    // Only fsync a NAMED parent. `Path::parent()` returns `Some("")`
+    // for a single-component relative target like `"checkpoint"` —
+    // substituting `Path::new(".")` would lean on the host OS's CWD,
+    // which works for StdFs but is meaningless for backends without a
+    // notion of current working directory (e.g. MemFs's
+    // `sync_directory(".")` returns NotFound). Skip the fsync in the
+    // empty-parent case; callers needing the parent-directory-entry-
+    // survives-power-loss guarantee pass an absolute path.
+    if let Some(parent) = target_root.parent()
+        && !parent.as_os_str().is_empty()
+    {
         fsync_directory(parent, &**target_fs)?;
     }
 
