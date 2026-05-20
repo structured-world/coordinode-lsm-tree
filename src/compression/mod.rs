@@ -84,11 +84,15 @@ pub struct ZstdDictionary {
     /// Lazily-parsed shared `DictionaryHandle` (Arc-backed inside structured-zstd).
     /// Populated on first decompress call and reused across all subsequent calls
     /// and all threads — eliminates the per-thread dictionary re-parse the TLS
-    /// `FrameDecoder` cache used to incur on every miss. `OnceCell::get_or_try_init`
-    /// guarantees exactly one successful parse across racing threads with no
-    /// auxiliary mutex: losers wait on the internal one-shot synchronisation
-    /// primitive and reuse the winner's `Arc` clone. This keeps the `new()`
-    /// constructor infallible AND preserves the single-parse contract.
+    /// `FrameDecoder` cache used to incur on every miss.
+    /// `OnceBox::get_or_try_init` guarantees one successful parse across
+    /// racing threads via a single CAS on the slot pointer: the winner's
+    /// `Box<DictionaryHandle>` becomes the stable `&T`, racing losers drop
+    /// their unused `Box` allocations and read the winner's value on the
+    /// next iteration. No auxiliary mutex is needed because the slot is
+    /// lock-free; the only contention is the brief CAS window during the
+    /// cold-start race. This keeps the `new()` constructor infallible AND
+    /// preserves the single-parse contract.
     #[cfg(feature = "zstd")]
     prepared: Arc<OnceBox<structured_zstd::decoding::DictionaryHandle>>,
 }
