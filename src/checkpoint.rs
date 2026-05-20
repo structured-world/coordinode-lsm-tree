@@ -303,53 +303,27 @@ pub fn link_blob_files(
     Ok((count, bytes))
 }
 
-/// Whether a metadata file is required for the checkpoint to be openable.
-#[derive(Clone, Copy)]
-enum MetaRequirement {
-    /// File must exist on the source; absence is an error.
-    ///
-    /// Used for the `v<id>` snapshot whose disappearance between
-    /// `current_version()` and metadata copy would otherwise produce a
-    /// checkpoint that points (via `current`) at a version file that
-    /// does not exist in the checkpoint directory.
-    Required,
-    /// File may legitimately be absent (treated as a freshly-initialised
-    /// tree by recovery). Used for `manifest` on never-written trees.
-    Optional,
-}
-
-/// Copies one of the small metadata files (manifest, `v<id>`, or
-/// `current`) from `src_root` to `target_root`.
+/// Copies an OPTIONAL metadata file from `src_root` to `target_root`.
+///
+/// "Optional" = the source file may legitimately be absent (recovery
+/// treats a missing manifest as a freshly-initialised tree). Required
+/// metadata is no longer copied through this path — `v<id>` is now
+/// serialised directly from the captured in-memory Version (see
+/// [`copy_metadata`]) so its source-file lifetime no longer matters.
 ///
 /// Opens the source directly instead of `exists()` + `open()` to avoid
 /// the TOCTOU window where the file disappears between the two calls.
-/// `NotFound` is the only ignorable error and only when
-/// `requirement == Optional`; for `Required` files a missing source is
-/// surfaced as the original `NotFound` so the checkpoint fails-fast
-/// instead of producing an unopenable snapshot.
-fn copy_metadata_file(
+fn copy_metadata_file_optional(
     src_fs: &dyn Fs,
     src_root: &Path,
     target_fs: &dyn Fs,
     target_root: &Path,
     file_name: &str,
-    requirement: MetaRequirement,
 ) -> crate::Result<()> {
     let src = src_root.join(file_name);
     let mut src_file = match src_fs.open(&src, &FsOpenOptions::new().read(true)) {
         Ok(f) => f,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return match requirement {
-                MetaRequirement::Optional => Ok(()),
-                MetaRequirement::Required => Err(crate::Error::from(std::io::Error::new(
-                    std::io::ErrorKind::NotFound,
-                    format!(
-                        "checkpoint required metadata file {} missing from source",
-                        src.display(),
-                    ),
-                ))),
-            };
-        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(e) => return Err(e.into()),
     };
     let dst = target_root.join(file_name);
@@ -420,34 +394,23 @@ pub fn copy_metadata(
     src_root: &Path,
     target_fs: &dyn Fs,
     target_root: &Path,
-    version_id: u64,
+    version: &crate::version::Version,
+    comparator_name: &str,
 ) -> crate::Result<()> {
     // Manifest stores level count + comparator name. On a never-written
     // tree the manifest may legitimately be absent (recovery treats
-    // missing manifest as a freshly-initialised tree), so this is Optional.
-    copy_metadata_file(
-        src_fs,
-        src_root,
-        target_fs,
-        target_root,
-        "manifest",
-        MetaRequirement::Optional,
-    )?;
-    // Active version snapshot — `v<id>` is immutable once published, so
-    // copying it verbatim is race-free against concurrent version
-    // transitions. But version-GC can DELETE older `v<id>` files; if the
-    // file we captured disappears between `current_version()` and this
-    // copy, the resulting checkpoint would have `current` pointing at a
-    // missing file and fail to open. Treat as Required so checkpoint
-    // fails-fast in that race instead of producing a corrupt snapshot.
-    copy_metadata_file(
-        src_fs,
-        src_root,
-        target_fs,
-        target_root,
-        &format!("v{version_id}"),
-        MetaRequirement::Required,
-    )?;
+    // missing manifest as a freshly-initialised tree), so this is optional.
+    copy_metadata_file_optional(src_fs, src_root, target_fs, target_root, "manifest")?;
+    // Re-serialise the captured Version into target/v<id> rather than
+    // copying the source file. Reason: SuperVersions::maintenance can
+    // physically remove the source v<id> between current_version() and
+    // this point (manifest GC fires when seqno < mvcc_gc_watermark for
+    // a version older than the active one). The captured `version` is
+    // an in-memory snapshot held by the checkpoint driver and is the
+    // authoritative source for the snapshot we just hard-linked SSTs
+    // for, so writing it from memory eliminates the race entirely —
+    // the source file's lifetime no longer matters.
+    crate::version::persist_version(target_root, version, comparator_name, target_fs)?;
     // CURRENT pointer is generated fresh for the captured `version_id`
     // (NOT copied from source) so a concurrent publish to `v<N+1>` on
     // the source can never leave the checkpoint pointing at a version
@@ -458,7 +421,7 @@ pub fn copy_metadata(
     // checkpoint retried. `PartialCheckpointGuard` performs that
     // removal on the normal error path; an unclean crash (no Drop) is
     // the only case the operator must clean up manually.
-    write_current_for_version(target_fs, target_root, version_id)?;
+    write_current_for_version(target_fs, target_root, version.id())?;
     Ok(())
 }
 
@@ -588,7 +551,14 @@ pub fn run_checkpoint<T: AbstractTree>(
         (0, 0)
     };
 
-    copy_metadata(&**src_fs, src_root, &**target_fs, target_root, version.id())?;
+    copy_metadata(
+        &**src_fs,
+        src_root,
+        &**target_fs,
+        target_root,
+        &version,
+        tree.tree_config().comparator.name(),
+    )?;
 
     // fsync each populated child directory BEFORE the root so the
     // directory entries we just created (`tables/<id>`, `blobs/<id>`,
