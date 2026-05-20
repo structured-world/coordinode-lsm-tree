@@ -81,7 +81,6 @@ bytes = { version = "1", optional = true }
 byteorder = { package = "byteorder-lite", version = "0.1.0" }
 byteview = "~0.10.1"
 enum_dispatch = "0.3.13"
-interval-heap = "0.0.5"
 log = "0.4.27"
 # `spin = "0.9"` provides a no_std-compatible Mutex. Used by
 # `deletion_pause` so that module's only std footprint comes from the

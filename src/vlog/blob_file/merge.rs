@@ -4,8 +4,9 @@
 
 use super::scanner::Scanner as BlobFileScanner;
 use crate::vlog::{BlobFileId, blob_file::scanner::ScanEntry};
-use interval_heap::IntervalHeap;
-use std::cmp::Reverse;
+use alloc::collections::BinaryHeap;
+use alloc::vec::Vec;
+use core::cmp::Reverse;
 
 type IteratorIndex = usize;
 
@@ -24,28 +25,33 @@ impl PartialEq for IteratorValue {
 impl Eq for IteratorValue {}
 
 impl PartialOrd for IteratorValue {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
         Some(self.cmp(other))
     }
 }
 
 impl Ord for IteratorValue {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
         (&self.scan_entry.key, Reverse(&self.scan_entry.seqno))
             .cmp(&(&other.scan_entry.key, Reverse(&other.scan_entry.seqno)))
     }
 }
 
-/// Interleaves multiple blob file readers into a single, sorted stream
+/// Interleaves multiple blob file readers into a single, sorted stream.
+///
+/// Uses `BinaryHeap<Reverse<_>>` for a min-heap. The merger only needs
+/// pop-min + push semantics — the previous `IntervalHeap` (double-ended)
+/// was overkill, and its `compare` transitive dep doesn't declare
+/// `#![no_std]`, blocking the crate's no-std-check job.
 pub struct MergeScanner {
     readers: Vec<BlobFileScanner>,
-    heap: IntervalHeap<IteratorValue>,
+    heap: BinaryHeap<Reverse<IteratorValue>>,
 }
 
 impl MergeScanner {
     /// Initializes a new merging reader
     pub fn new(readers: Vec<BlobFileScanner>) -> Self {
-        let heap = IntervalHeap::with_capacity(readers.len());
+        let heap = BinaryHeap::with_capacity(readers.len());
         Self { readers, heap }
     }
 
@@ -57,11 +63,11 @@ impl MergeScanner {
             let scan_entry = value?;
             let blob_file_id = reader.blob_file_id;
 
-            self.heap.push(IteratorValue {
+            self.heap.push(Reverse(IteratorValue {
                 index: idx,
                 blob_file_id,
                 scan_entry,
-            });
+            }));
         }
 
         Ok(())
@@ -84,7 +90,7 @@ impl Iterator for MergeScanner {
             fail_iter!(self.push_next());
         }
 
-        if let Some(head) = self.heap.pop_min() {
+        if let Some(Reverse(head)) = self.heap.pop() {
             fail_iter!(self.advance_reader(head.index));
             return Some(Ok((head.scan_entry, head.blob_file_id)));
         }

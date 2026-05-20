@@ -131,23 +131,28 @@ fn checkpoint_survives_concurrent_writes() -> lsm_tree::Result<()> {
     // Reopening must succeed regardless of what the writer did.
     let restored = open_tree(&dst_path)?;
 
-    // PITR watermark contract: every key with `seqno <= info.seqno` MUST
-    // be present in the checkpoint. The lower-bound watermark guarantee
-    // is what callers rely on for replay cutoffs — verify it explicitly
-    // rather than just checking the pre-flushed 0..50 range.
+    // PITR watermark contract: every key with `seqno < info.seqno` MUST
+    // be present in the checkpoint. visible_seqno is "lowest excluded"
+    // (the next-seqno-to-allocate) — a record with `seqno = N` is
+    // committed/visible iff `visible_seqno >= N + 1`, equivalently
+    // `seqno < visible_seqno`. The strict `<` matters under concurrent
+    // scheduling: writer's `insert(seqno=i)` and `fetch_max(i + 1)` are
+    // NOT atomic, so main can observe `visible_seqno = i` between
+    // those two steps. At that moment record-i may or may not be in
+    // the flushed memtable; only records with seqno strictly less than
+    // the captured watermark are guaranteed committed.
     //
-    // Keys are inserted with `seqno = i`, so any key index `i` such that
-    // `i as u64 <= info.seqno` must be readable. We make NO claim about
-    // keys with `i > info.seqno` — those may or may not be in the
-    // snapshot depending on whether the writer thread reached them
-    // before checkpoint sampled the version.
+    // We make NO claim about keys with `i >= info.seqno` — those may
+    // or may not be in the snapshot depending on whether the writer
+    // had advanced its watermark past `i` before checkpoint sampled
+    // visible_seqno.
     for i in 0u32..200 {
         let key = format!("k{i:03}");
         let got = restored.get(key.as_bytes(), lsm_tree::SeqNo::MAX)?;
-        if u64::from(i) <= info.seqno {
+        if u64::from(i) < info.seqno {
             assert!(
                 got.is_some(),
-                "PITR watermark violated: key {key} (seqno {i}) <= info.seqno ({}) but missing from checkpoint",
+                "PITR watermark violated: key {key} (seqno {i}) < info.seqno ({}) but missing from checkpoint",
                 info.seqno,
             );
         }
