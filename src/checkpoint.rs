@@ -381,13 +381,24 @@ fn write_current_for_version(
     target_root: &Path,
     version_id: u64,
 ) -> crate::Result<()> {
+    use crate::checksum::ChecksumType;
     use crate::file::rewrite_atomic;
     use byteorder::{LittleEndian, WriteBytesExt};
 
+    // The `current` wire format is `version_id: u64 | checksum: u128 |
+    // checksum_type: u8`. The checksum field is reserved for future
+    // verification — recovery reads it but does not validate it against
+    // the `v<id>` contents — so a zero literal is the documented "no
+    // digest carried" sentinel, not a forged digest. The checksum type
+    // MUST come from `ChecksumType` so any future format evolution
+    // (e.g. a real checksum) shifts this writer and the recovery
+    // checker in lockstep through one shared enum.
+    const RESERVED_CHECKSUM: u128 = 0;
+
     let mut content = vec![];
     content.write_u64::<LittleEndian>(version_id)?;
-    content.write_u128::<LittleEndian>(0)?; // checksum (not validated on read)
-    content.write_u8(0)?; // checksum_type = 0 (xxh3)
+    content.write_u128::<LittleEndian>(RESERVED_CHECKSUM)?;
+    content.write_u8(u8::from(ChecksumType::Xxh3))?;
 
     rewrite_atomic(&target_root.join(CURRENT_VERSION_FILE), &content, target_fs)?;
     Ok(())
@@ -596,7 +607,19 @@ pub fn run_checkpoint<T: AbstractTree>(
     // power loss even though the children we just synced would still be
     // intact on the underlying inodes. Required by the same fsync-
     // ordering rule that drove the child-directory syncs above.
-    if let Some(parent) = target_root.parent().filter(|p| !p.as_os_str().is_empty()) {
+    // `Path::parent()` returns `Some("")` for a bare leaf like `"checkpoint"`,
+    // which `fsync_directory` would reject as an invalid input. For a relative
+    // leaf the containing directory IS the process CWD, so resolve to `.`
+    // explicitly — otherwise we'd silently skip the fsync that guarantees the
+    // checkpoint's own directory entry survives a power loss.
+    let parent_to_fsync = target_root.parent().map(|p| {
+        if p.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            p
+        }
+    });
+    if let Some(parent) = parent_to_fsync {
         fsync_directory(parent, &**target_fs)?;
     }
 
