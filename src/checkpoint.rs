@@ -399,8 +399,12 @@ pub fn copy_metadata(
     // (NOT copied from source) so a concurrent publish to `v<N+1>` on
     // the source can never leave the checkpoint pointing at a version
     // we did not link. Written LAST so a crash before this point leaves
-    // the checkpoint in a "version present, no pointer" state, which
-    // recovery treats as a freshly-initialised tree.
+    // the checkpoint with a version file but no CURRENT pointer:
+    // `Tree::open` on such a directory will fail to recover (no valid
+    // pointer to load) — the partial dir must be removed and the
+    // checkpoint retried. `PartialCheckpointGuard` performs that
+    // removal on the normal error path; an unclean crash (no Drop) is
+    // the only case the operator must clean up manually.
     write_current_for_version(target_fs, target_root, version_id)?;
     Ok(())
 }
