@@ -22,15 +22,25 @@
 //! blob-file `Inner`, the [`Drop`] check is O(1) and lock-free in the
 //! common case (no checkpoint in progress).
 
-// Prefer `alloc`/`core` for primitives that exist there. `Mutex` and
-// `PathBuf` have no alloc-only equivalent in the standard library and
-// stay on `std::*` — they carry the same std dependency that the
-// underlying `Fs` trait already pulls in, so this module's no-std
-// posture matches `crate::fs` exactly.
+// Synchronisation comes from `spin::Mutex` (no_std-compatible) rather
+// than `std::sync::Mutex`. The queue is only contended during
+// checkpoint setup/teardown — never on the read path — so spin
+// contention is irrelevant in practice; the benefit is that this
+// module's std footprint is bounded by what the `Fs` trait already
+// requires (path types + I/O) with no extra std-only synchronisation
+// primitive layered on top. `spin::Mutex` also cannot poison, which
+// removes the `PoisonError::into_inner` recovery branches that the
+// std variant required.
+//
+// `PathBuf` has no alloc-only counterpart in the standard library
+// (path types live in `std::path`, not `alloc::path`), so it stays
+// here — the value is unavoidably std-coupled the moment we call
+// `Fs::remove_file(&Path)` anyway.
 use crate::fs::Fs;
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU32, Ordering};
-use std::{path::PathBuf, sync::Mutex};
+use spin::Mutex;
+use std::path::PathBuf;
 
 /// Shared state controlling whether file deletions are deferred.
 ///
@@ -55,7 +65,7 @@ impl core::fmt::Debug for DeletionPause {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("DeletionPause")
             .field("active", &self.active.load(Ordering::Relaxed))
-            .field("queued", &self.queue.lock().map(|q| q.len()).unwrap_or(0))
+            .field("queued", &self.queue.lock().len())
             .finish()
     }
 }
@@ -97,15 +107,8 @@ impl DeletionPause {
         // Lock the queue then re-check under the lock — if the pause was
         // released between the atomic load above and acquiring the lock,
         // the queue would never be drained and the file would leak.
-        //
-        // On poisoning we recover with `into_inner()` rather than
-        // refusing the enqueue: dropping the file unconditionally would
-        // race a still-active checkpoint. Best-effort enqueue keeps the
-        // invariant ("file survives while a pause is held") intact.
-        let mut queue = self
-            .queue
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // `spin::Mutex` cannot poison, so no recovery branch is needed.
+        let mut queue = self.queue.lock();
         if !self.is_active() {
             return false;
         }
@@ -142,33 +145,25 @@ impl Drop for Pause {
         }
 
         // We were the last pause holder — drain and execute pending
-        // deletions. Two correctness concerns:
+        // deletions. Generation race: between the `fetch_sub` above and
+        // acquiring the queue lock below, another thread can call
+        // `acquire()` and `try_enqueue()`. Items pushed in that new
+        // generation belong to the new pause, not to us. Re-check
+        // `active` under the lock and bail out if a new pause is now
+        // in flight; the new pause's eventual `Drop` will drain those
+        // items at the correct generation boundary.
         //
-        // 1. **Generation race.** Between the `fetch_sub` above and
-        //    acquiring the queue lock below, another thread can call
-        //    `acquire()` and `try_enqueue()`. Items pushed in that new
-        //    generation belong to the new pause, not to us. We re-check
-        //    `active` under the lock and bail out if a new pause is now
-        //    in flight; the new pause's eventual `Drop` will drain those
-        //    items at the correct generation boundary.
-        //
-        // 2. **Mutex poisoning.** If another thread panicked while
-        //    holding the queue, `lock()` returns `PoisonError`. We
-        //    recover via `into_inner()` and drain best-effort —
-        //    abandoning the queue would leak the queued files until
-        //    process exit, defeating the entire point of this type.
+        // `spin::Mutex` cannot poison, so there is no
+        // `PoisonError`-recovery branch here — `lock()` always returns
+        // a guard.
         let drained = {
-            let mut queue = self
-                .inner
-                .queue
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut queue = self.inner.queue.lock();
             if self.inner.active.load(Ordering::Acquire) > 0 {
                 // A new pause has taken responsibility for the queue.
                 // Leave its items alone; its drop will handle them.
                 return;
             }
-            std::mem::take(&mut *queue)
+            core::mem::take(&mut *queue)
         };
 
         for item in drained {
