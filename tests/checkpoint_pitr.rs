@@ -705,11 +705,22 @@ fn checkpoint_open_rejects_missing_current_pointer() -> lsm_tree::Result<()> {
 
     // Open MUST fail (no fresh-tree fallback) so callers detect the
     // half-written checkpoint instead of mistaking it for empty data.
-    let open_result = open_tree(&dst_path);
-    assert!(
-        open_result.is_err(),
-        "open_tree on a checkpoint with no `current` must error, got Ok",
-    );
+    // The error carries the path + remediation hint so a programmatic
+    // caller can surface it without reading logs.
+    let err = match open_tree(&dst_path) {
+        Ok(_) => panic!("open_tree on a checkpoint with no `current` must error, got Ok"),
+        Err(e) => e,
+    };
+    match err {
+        lsm_tree::Error::Io(ref io_err) if io_err.kind() == std::io::ErrorKind::InvalidData => {
+            let msg = io_err.to_string();
+            assert!(
+                msg.contains("current") && msg.contains("version artifacts"),
+                "error must explain the half-written-checkpoint condition, got: {msg}",
+            );
+        }
+        other => panic!("expected Io(InvalidData) with diagnostic message, got {other:?}"),
+    }
     Ok(())
 }
 

@@ -1678,17 +1678,28 @@ impl Tree {
                 // would overwrite the partial state with an empty tree,
                 // turning a recoverable failure into data loss.
                 if has_existing_version_state(&config.path, &*config.fs)? {
-                    log::error!(
-                        "Tree::open: refusing to recover {} — `current` \
-                         pointer is missing but the directory still holds \
-                         version artifacts (tables/, blobs/, or vN). This \
-                         is the on-disk signature of a half-written \
-                         checkpoint or interrupted sealing. Remove the \
-                         partial directory and retry the checkpoint, or \
-                         restore `current` from a backup before reopening.",
+                    // Return Error::Io(InvalidData, ...) rather than
+                    // Error::Unrecoverable so callers that don't read
+                    // logs still get a programmatic surface with the
+                    // path and remediation hint embedded. `log::error!`
+                    // stays for human ops who DO watch logs and want
+                    // the full context at the moment of failure (the
+                    // structured error is what propagates up the call
+                    // chain; the log line records the diagnosis next
+                    // to the timestamp).
+                    let msg = format!(
+                        "Tree::open: refusing to recover {} — `current` pointer is missing \
+                         but the directory still holds version artifacts (tables/, blobs/, \
+                         or vN). This is the on-disk signature of a half-written checkpoint \
+                         or interrupted sealing. Remove the partial directory and retry the \
+                         checkpoint, or restore `current` from a backup before reopening.",
                         config.path.display(),
                     );
-                    return Err(crate::Error::Unrecoverable);
+                    log::error!("{msg}");
+                    return Err(crate::Error::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        msg,
+                    )));
                 }
                 Self::create_new(config)
             }
