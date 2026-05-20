@@ -1678,6 +1678,16 @@ impl Tree {
                 // would overwrite the partial state with an empty tree,
                 // turning a recoverable failure into data loss.
                 if has_existing_version_state(&config.path, &*config.fs)? {
+                    log::error!(
+                        "Tree::open: refusing to recover {} — `current` \
+                         pointer is missing but the directory still holds \
+                         version artifacts (tables/, blobs/, or vN). This \
+                         is the on-disk signature of a half-written \
+                         checkpoint or interrupted sealing. Remove the \
+                         partial directory and retry the checkpoint, or \
+                         restore `current` from a backup before reopening.",
+                        config.path.display(),
+                    );
                     return Err(crate::Error::Unrecoverable);
                 }
                 Self::create_new(config)
