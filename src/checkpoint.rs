@@ -141,52 +141,83 @@ impl Drop for RootCleanup<'_> {
 ///    responsibility — a per-file warning would drown real signal on
 ///    a misconfigured tier with thousands of SSTs.
 ///
-/// Using `Arc::ptr_eq` as the discriminator would be too strict: two
-/// `Arc::new(StdFs)` values produced independently (e.g. one in the
-/// tree's primary `config.fs`, one in a `LevelRoute`) are not pointer-
-/// equal but back the same kernel filesystem, so they CAN hard-link.
-/// The "try first, fall back on demand" pattern catches both cases
-/// without exposing a backend-identity API on the `Fs` trait.
+/// The hard_link path is gated on a positive [`Fs::backend_id`]
+/// match. `Arc::ptr_eq` would have been too strict (two independent
+/// `Arc::new(StdFs)` values back the same kernel filesystem but are
+/// not pointer-equal); a "try first, fall back on `NotFound`" pattern
+/// would have been too loose (a MemFs source paired with a StdFs
+/// destination could let the kernel resolve `src` against the host
+/// filesystem and silently link an unrelated file). `Fs::backend_id`
+/// is the explicit capability check that catches both cases safely.
 pub fn link_or_copy_cross_fs(
     src_fs: &Arc<dyn Fs>,
     src: &Path,
     dst_fs: &Arc<dyn Fs>,
     dst: &Path,
 ) -> std::io::Result<u64> {
-    match dst_fs.hard_link(src, dst) {
-        // The dst stat syscall here is intentional — do NOT replace it
-        // with a caller-supplied "known size" from `Table::file_size()`
-        // or `BlobFileMetadata::total_compressed_bytes`. Those values
-        // record the writer's `file_pos` BEFORE the metadata block and
-        // footer were appended, so they undercount the on-disk file by
-        // hundreds to thousands of bytes per table. The streamed-copy
-        // fallback below counts the actual bytes it writes, so the two
-        // branches must agree on physical bytes for `CheckpointInfo
-        // ::total_bytes` to match on-disk reality (asserted by
-        // `checkpoint_info_total_bytes_matches_disk`). One extra stat
-        // per linked file is cheap relative to the link itself.
-        Ok(()) => return Ok(dst_fs.metadata(dst)?.len),
-        Err(e)
-            if matches!(
-                e.kind(),
-                std::io::ErrorKind::NotFound | std::io::ErrorKind::Unsupported
-            ) =>
-        {
-            // dst_fs cannot see src (cross-backend) or does not support
-            // hard links at all → fall through to streamed copy.
-            // Log at `debug` for symmetry with `StdFs::hard_link`'s
-            // EXDEV fallback — operators wanting visibility of
-            // unexpected full copies should grep the `fs` /
-            // `checkpoint` modules at debug level. `warn` would drown
-            // real signal on a misconfigured tier with thousands of SSTs.
-            log::debug!(
-                "link_or_copy_cross_fs({}, {}) falling back to streamed copy ({})",
-                src.display(),
-                dst.display(),
-                e.kind(),
-            );
+    // Refuse to attempt `hard_link` unless both backends positively
+    // assert (via `Fs::backend_id`) that they resolve paths against
+    // the same namespace. Without this gate a MemFs source paired with
+    // a StdFs destination would let the kernel resolve `src` against
+    // the HOST filesystem; if a real file happens to live at the same
+    // spelling the checkpoint would silently capture THAT file instead
+    // of the in-memory source. See `Fs::backend_id` for the contract.
+    let shared_namespace = match (src_fs.backend_id(), dst_fs.backend_id()) {
+        (Some(a), Some(b)) => a == b,
+        _ => false,
+    };
+
+    if shared_namespace {
+        match dst_fs.hard_link(src, dst) {
+            // The dst stat syscall here is intentional — do NOT replace
+            // it with a caller-supplied "known size" from
+            // `Table::file_size()` or
+            // `BlobFileMetadata::total_compressed_bytes`. Those values
+            // record the writer's `file_pos` BEFORE the metadata block
+            // and footer were appended, so they undercount the on-disk
+            // file by hundreds to thousands of bytes per table. The
+            // streamed-copy fallback below counts the actual bytes it
+            // writes, so the two branches must agree on physical bytes
+            // for `CheckpointInfo::total_bytes` to match on-disk reality
+            // (asserted by `checkpoint_info_total_bytes_matches_disk`).
+            // One extra stat per linked file is cheap relative to the
+            // link itself.
+            Ok(()) => return Ok(dst_fs.metadata(dst)?.len),
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::Unsupported
+                ) =>
+            {
+                // Same kernel namespace but the link didn't take —
+                // either dst_fs's backend doesn't support hard_link at
+                // all, or the file moved out from under us before the
+                // syscall. Either way, fall through to the streamed
+                // copy below. Log at `debug` for symmetry with
+                // `StdFs::hard_link`'s EXDEV fallback — operators
+                // wanting visibility of unexpected full copies grep the
+                // `fs` / `checkpoint` modules at debug level. `warn`
+                // would drown real signal on a misconfigured tier with
+                // thousands of SSTs.
+                log::debug!(
+                    "link_or_copy_cross_fs({}, {}) falling back to streamed copy ({})",
+                    src.display(),
+                    dst.display(),
+                    e.kind(),
+                );
+            }
+            Err(e) => return Err(e),
         }
-        Err(e) => return Err(e),
+    } else {
+        // Backends do not share a namespace (e.g. MemFs source vs
+        // StdFs destination). A hard_link attempt here would resolve
+        // `src` against the WRONG namespace and could silently link an
+        // unrelated file; skip straight to the streamed copy.
+        log::debug!(
+            "link_or_copy_cross_fs({}, {}) crossing namespaces — streaming copy",
+            src.display(),
+            dst.display(),
+        );
     }
 
     // Cross-backend / no-hardlink path — stream bytes through the trait.

@@ -215,6 +215,14 @@ impl Fs for IoUringFs {
         // fallback logic.
         super::StdFs.hard_link(src, dst)
     }
+
+    fn backend_id(&self) -> Option<u64> {
+        // `IoUringFs` resolves paths through the host kernel just like
+        // `StdFs`, so it MUST report the same namespace ID — otherwise
+        // the checkpoint driver would needlessly stream-copy between the
+        // two backends.
+        super::StdFs.backend_id()
+    }
 }
 
 // ---------------------------------------------------------------------------

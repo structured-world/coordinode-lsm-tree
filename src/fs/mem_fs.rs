@@ -41,6 +41,12 @@ use std::sync::{Arc, Mutex, RwLock};
 #[derive(Clone, Debug)]
 pub struct MemFs {
     state: Arc<RwLock<State>>,
+    /// Per-instance namespace ID used by [`Fs::backend_id`]. Cloned
+    /// `MemFs` values share the same `state` Arc AND the same ID — they
+    /// are the same backend by all observable behaviour. Independently
+    /// constructed `MemFs::new()` values get DIFFERENT IDs because they
+    /// have disjoint file trees.
+    namespace_id: u64,
 }
 
 #[derive(Debug, Default)]
@@ -58,8 +64,20 @@ impl MemFs {
         state.dirs.insert(PathBuf::from("/"));
         Self {
             state: Arc::new(RwLock::new(state)),
+            namespace_id: next_mem_fs_namespace_id(),
         }
     }
+}
+
+/// Allocates the next per-instance MemFs namespace ID. Values are
+/// process-unique (monotonic atomic counter) so two `MemFs::new()`
+/// values never collide; cloned `MemFs` instances reuse the same ID
+/// because `MemFs` derives `Clone`.
+fn next_mem_fs_namespace_id() -> u64 {
+    use core::sync::atomic::{AtomicU64, Ordering};
+    // Start at 1 so a future `0` sentinel stays available if needed.
+    static COUNTER: AtomicU64 = AtomicU64::new(1);
+    COUNTER.fetch_add(1, Ordering::Relaxed)
 }
 
 impl Default for MemFs {
@@ -683,6 +701,10 @@ impl Fs for MemFs {
             .files
             .insert(dst.to_path_buf(), Arc::new(Mutex::new(bytes)));
         Ok(())
+    }
+
+    fn backend_id(&self) -> Option<u64> {
+        Some(self.namespace_id)
     }
 }
 

@@ -394,6 +394,40 @@ pub trait Fs: Send + Sync + 'static {
             "Fs::hard_link is not implemented for this backend",
         ))
     }
+
+    /// Identifies the **path namespace** this backend resolves against.
+    ///
+    /// Two `Fs` values may safely participate in a cross-backend
+    /// [`Fs::hard_link`] call only if their `backend_id()` values are
+    /// both `Some` and equal: that contract states "we resolve paths
+    /// against the same underlying inode table, so a hard link from
+    /// `src` here to `dst` there links the SAME file we'd see by
+    /// reading `src` through `Self`."
+    ///
+    /// Examples of equal backend IDs:
+    /// - All [`crate::fs::StdFs`] instances on the same host (one
+    ///   shared kernel filesystem).
+    /// - A [`crate::fs::IoUringFs`] and a [`crate::fs::StdFs`] on the
+    ///   same host (the uring backend delegates path resolution to the
+    ///   kernel).
+    ///
+    /// Examples of distinct backend IDs:
+    /// - Two independent [`crate::fs::MemFs`] instances (each has its
+    ///   own in-memory tree).
+    /// - A [`crate::fs::MemFs`] vs any kernel-backed backend (a
+    ///   hard-link attempt would resolve `src` against the host
+    ///   filesystem and silently capture an unrelated file if one
+    ///   happens to exist at the same path — a checkpoint correctness
+    ///   bug).
+    ///
+    /// The default returns `None`, meaning "no shared-namespace
+    /// guarantee" — safe-by-default for third-party backends that have
+    /// not opted in. Callers MUST treat `None` as a veto on
+    /// cross-backend [`Fs::hard_link`] and stream-copy instead, even
+    /// when both sides return `None`.
+    fn backend_id(&self) -> Option<u64> {
+        None
+    }
 }
 
 /// Opens a section of an sfa archive for buffered reading via the [`Fs`] trait.
