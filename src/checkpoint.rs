@@ -154,6 +154,17 @@ pub fn link_or_copy_cross_fs(
     dst: &Path,
 ) -> std::io::Result<u64> {
     match dst_fs.hard_link(src, dst) {
+        // The dst stat syscall here is intentional — do NOT replace it
+        // with a caller-supplied "known size" from `Table::file_size()`
+        // or `BlobFileMetadata::total_compressed_bytes`. Those values
+        // record the writer's `file_pos` BEFORE the metadata block and
+        // footer were appended, so they undercount the on-disk file by
+        // hundreds to thousands of bytes per table. The streamed-copy
+        // fallback below counts the actual bytes it writes, so the two
+        // branches must agree on physical bytes for `CheckpointInfo
+        // ::total_bytes` to match on-disk reality (asserted by
+        // `checkpoint_info_total_bytes_matches_disk`). One extra stat
+        // per linked file is cheap relative to the link itself.
         Ok(()) => return Ok(dst_fs.metadata(dst)?.len),
         Err(e)
             if matches!(
