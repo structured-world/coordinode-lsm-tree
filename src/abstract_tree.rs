@@ -119,9 +119,14 @@ pub trait AbstractTree: sealed::Sealed {
     /// - consumes disk space equal to the copied bytes on the target
     ///   volume (no inode sharing across filesystems).
     ///
-    /// The fall-back is logged via [`log::warn`] so operators using
-    /// tiered storage or detached backup volumes can spot it. Same applies
-    /// when the source and target use entirely different [`Fs`](crate::fs::Fs)
+    /// Each fall-back call emits one [`log::debug`] line (deliberately not
+    /// `warn`: a misconfigured tier could trigger this path once per SST
+    /// and per blob — thousands of times per snapshot — and per-file
+    /// warnings would drown real signal). Operators wanting hard-visibility
+    /// of unexpected full copies should enable debug logging on the `fs`
+    /// module or watch the `CheckpointInfo.total_bytes` figure (≫ inode
+    /// link cost means the fallback fired). The same `debug` policy applies
+    /// when source and target use entirely different [`Fs`](crate::fs::Fs)
     /// backends (e.g. [`MemFs`](crate::fs::MemFs) → [`StdFs`](crate::fs::StdFs)
     /// in tests).
     ///

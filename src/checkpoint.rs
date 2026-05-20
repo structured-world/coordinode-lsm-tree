@@ -135,8 +135,11 @@ impl Drop for RootCleanup<'_> {
 ///    e.g. `MemFs` target with `StdFs` source) **or `Unsupported`**
 ///    (in-memory backends that don't implement linking), stream bytes
 ///    through both trait objects. This is the only path that doubles
-///    storage; logged via [`log::warn`] in the [`StdFs`] fallback so
-///    operators can spot tier-misconfigurations.
+///    storage. The fallback itself is silent here (the [`StdFs`] EXDEV
+///    fallback emits one [`log::debug`] per file); operator-visible
+///    notification of unexpected copies is the checkpoint driver's
+///    responsibility — a per-file warning would drown real signal on
+///    a misconfigured tier with thousands of SSTs.
 ///
 /// Using `Arc::ptr_eq` as the discriminator would be too strict: two
 /// `Arc::new(StdFs)` values produced independently (e.g. one in the
@@ -479,20 +482,25 @@ pub fn run_checkpoint<T: AbstractTree>(
     // tables / blob files that compaction marks as deleted are held back.
     let _pause = deletion_pause.acquire();
 
+    // Capture the seqno BEFORE the flush. Sampling later (between flush
+    // and `current_version()`) is unsafe: a concurrent writer can land
+    // in the freshly-rotated active memtable, advance `visible_seqno`,
+    // and bump the captured value above what the snapshot actually
+    // contains — those writes are in the new memtable, NOT in the SSTs
+    // we're about to link. With the "before flush" ordering the
+    // captured seqno is a strict lower bound on the snapshot's
+    // contents: every record visible at sample time has reached the
+    // memtable, the flush forces it into SSTs, and the version snapshot
+    // sees the resulting on-disk state. Later writes can advance the
+    // live counter but cannot pull our `captured_seqno` upward.
+    let captured_seqno = visible_seqno.get();
+
     // Force a flush so the captured version reflects all data that has
     // reached the active memtable. Using a sentinel eviction seqno
     // (`SeqNo::MAX`) lets `flush_active_memtable` flush regardless of
     // current visible seqno — the data is durable in either case.
     tree.flush_active_memtable(SeqNo::MAX)?;
 
-    // Capture the seqno BEFORE the version snapshot. Reading
-    // `visible_seqno` after `current_version()` would let concurrent
-    // writers advance the counter past data that never made it into the
-    // checkpoint, so PITR consumers could move the recovery cutoff past
-    // records they still need from WAL / replication. The "before"
-    // ordering means `CheckpointInfo::seqno` is a lower bound on the
-    // seqno reflected in the version snapshot — safe for cutoffs.
-    let captured_seqno = visible_seqno.get();
     let version = tree.current_version();
 
     let (sst_files, sst_bytes) = link_tables(&version, target_root, target_fs)?;

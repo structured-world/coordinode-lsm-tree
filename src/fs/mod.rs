@@ -360,8 +360,12 @@ pub trait Fs: Send + Sync + 'static {
     /// Hard links cannot span filesystems. Implementations that detect a
     /// cross-device situation (Unix `EXDEV`) MUST fall back to a byte copy
     /// so that callers can treat `hard_link` as always-succeeding when the
-    /// destination filesystem is writable. The fallback emits a warning
-    /// via [`log::warn`] so operators can notice unexpected copies.
+    /// destination filesystem is writable. The fallback emits a [`log::debug`]
+    /// trace per call (deliberately not `warn`: a tier-misconfigured
+    /// checkpoint can hit this path thousands of times per snapshot, and
+    /// per-file warnings would drown real signal). Callers that need
+    /// operator-visible notification of unexpected copies are expected
+    /// to aggregate per-checkpoint and emit a single summary warning.
     ///
     /// In-memory backends ([`MemFs`](crate::fs::MemFs)) do not have inodes;
     /// they implement this as a byte copy that produces an independent file
