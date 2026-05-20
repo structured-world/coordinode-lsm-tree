@@ -758,3 +758,60 @@ fn checkpoint_open_rejects_corrupt_current_pointer() -> lsm_tree::Result<()> {
     );
     Ok(())
 }
+
+/// Regression test for the manifest-GC race: a concurrent compaction
+/// can run `SuperVersions::maintenance` between `current_version()`
+/// inside the checkpoint driver and the time `copy_metadata` reaches
+/// the source `v<id>` file. The captured Version still lives in
+/// memory, but the on-disk `v<id>` is gone — the source-file copy
+/// path would fail. The fix serialises the captured Version from
+/// memory into the checkpoint dir, so the race cannot fail the
+/// checkpoint.
+///
+/// We simulate the race by deleting the source `v<id>` AFTER
+/// `current_version()` would have captured it. In this test there is
+/// no concurrent maintenance because we drive the deletion directly;
+/// the in-memory SuperVersions still references the deleted file's
+/// id, exactly as it would mid-race.
+#[test_log::test]
+fn checkpoint_survives_concurrent_manifest_gc_of_captured_version() -> lsm_tree::Result<()> {
+    let src_dir = tempfile::tempdir()?;
+    let dst_dir = tempfile::tempdir()?;
+    let dst_path = dst_dir.path().join("checkpoint");
+
+    let tree = open_tree(src_dir.path())?;
+    for i in 0u32..5 {
+        tree.insert(format!("k{i:02}"), format!("v{i}"), u64::from(i));
+    }
+    tree.flush_active_memtable(0)?;
+
+    // Identify the live version file on disk so we can remove it
+    // without going through the maintenance API (which would also
+    // evict the in-memory entry — defeating the race-reproduction).
+    let live_v = std::fs::read_dir(src_dir.path())?
+        .filter_map(Result::ok)
+        .map(|e| e.file_name())
+        .filter_map(|n| n.into_string().ok())
+        .find(|n| n.starts_with('v') && n.len() > 1 && n[1..].bytes().all(|c| c.is_ascii_digit()))
+        .expect("source tree should have at least one vN file after flush");
+    std::fs::remove_file(src_dir.path().join(&live_v))?;
+
+    // With the fix, the checkpoint serialises the in-memory Version
+    // into target/v<id> and succeeds. Without the fix, the copy of
+    // the (now missing) source v<id> file fails with NotFound.
+    let info = tree.create_checkpoint(&dst_path)?;
+    assert!(info.sst_files >= 1);
+
+    // The reopened checkpoint must read every pre-deletion key back
+    // — proving the captured version was written into the snapshot
+    // independently of the deleted source file.
+    let restored = open_tree(&dst_path)?;
+    for i in 0u32..5 {
+        let key = format!("k{i:02}");
+        let val = restored
+            .get(key.as_bytes(), lsm_tree::SeqNo::MAX)?
+            .unwrap_or_else(|| panic!("missing key {key} in checkpoint"));
+        assert_eq!(&*val, format!("v{i}").as_bytes());
+    }
+    Ok(())
+}
