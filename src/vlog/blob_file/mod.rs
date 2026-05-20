@@ -90,6 +90,21 @@ impl Drop for Inner {
                 self.path.display(),
             );
 
+            // Move the accessor out and drop it FIRST so every pinned
+            // Arc<dyn FsFile> the file_accessor holds is released before
+            // we try to unlink. On Windows (and any other platform where
+            // an open handle blocks unlink) a live handle here would
+            // make remove_file fail silently, leaking the blob file's
+            // disk space — the same hazard already handled in
+            // table::Inner::drop. Eviction from the descriptor table
+            // happens through the same accessor before the drop.
+            let global_id = self.global_id();
+            let file_accessor = std::mem::replace(&mut self.file_accessor, FileAccessor::Closed);
+            file_accessor
+                .as_descriptor_table()
+                .inspect(|d| d.remove_for_blob_file(&global_id));
+            drop(file_accessor);
+
             // If a checkpoint is active, defer the physical deletion so the
             // file remains hard-linkable until the checkpoint releases its
             // pause. Falls through to immediate removal when no pause is
@@ -113,10 +128,6 @@ impl Drop for Inner {
                     self.path.display(),
                 );
             }
-
-            self.file_accessor
-                .as_descriptor_table()
-                .inspect(|d| d.remove_for_blob_file(&self.global_id()));
         }
     }
 }
