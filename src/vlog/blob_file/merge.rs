@@ -17,9 +17,16 @@ struct IteratorValue {
     blob_file_id: BlobFileId,
 }
 
+// PartialEq / Eq are derived from Ord so they STAY consistent: the
+// `Ord` contract requires `a == b` ⇔ `a.cmp(b) == Equal`. Defining
+// Eq on just `key` (the previous impl) violated that, because two
+// entries with the same key + different seqno would test equal but
+// `cmp` would order them. BinaryHeap doesn't call Eq today, but
+// breaking the contract is a latent footgun the moment any caller
+// puts these in a HashSet, BTreeSet, dedup() pass, etc.
 impl PartialEq for IteratorValue {
     fn eq(&self, other: &Self) -> bool {
-        self.scan_entry.key == other.scan_entry.key
+        self.cmp(other) == core::cmp::Ordering::Equal
     }
 }
 impl Eq for IteratorValue {}
