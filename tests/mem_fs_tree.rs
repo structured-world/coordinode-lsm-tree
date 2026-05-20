@@ -1,6 +1,7 @@
 use lsm_tree::fs::MemFs;
 // Guard trait import required for IterGuardImpl::into_inner() method dispatch.
 use lsm_tree::{AbstractTree, Config, Guard, SeqNo, SequenceNumberCounter};
+use std::sync::Arc;
 use test_log::test;
 
 /// Returns a unique virtual path for each test to avoid host-path collisions.
@@ -265,3 +266,39 @@ fn memfs_reopen_recovers_flushed_data() -> lsm_tree::Result<()> {
 // There are remaining `std::fs` bypass points in the compaction
 // finalization path that produce ENOENT when running fully in-memory.
 // Tracked as a known limitation — see mem_fs.rs module docs.
+
+/// Regression: `create_checkpoint` on a MemFs-backed tree must not
+/// rely on `Path::new(".")` to fsync the parent of a single-component
+/// relative target. `MemFs::sync_directory(".")` returns `NotFound`
+/// because `.` is never inserted into the in-memory directory set —
+/// the previous code substituted `.` when `target.parent()` resolved
+/// to an empty path, which only happens to work on `StdFs` (where
+/// `.` resolves through the host OS's CWD). Skipping the fsync when
+/// the parent is empty fixes both backends: relative leaves get no
+/// parent fsync (caller's responsibility), absolute paths still get
+/// their real parent fsync.
+#[test]
+fn memfs_create_checkpoint_with_relative_leaf_target() -> lsm_tree::Result<()> {
+    let (_dir, src_path) = test_path("source");
+    let mem_fs: Arc<dyn lsm_tree::fs::Fs> = Arc::new(MemFs::new());
+    let tree = Config::new(
+        src_path,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(Arc::clone(&mem_fs))
+    .open()?;
+
+    for i in 0u32..5 {
+        tree.insert(format!("k{i:02}"), format!("v{i}"), u64::from(i));
+    }
+    tree.flush_active_memtable(0)?;
+
+    // RELATIVE single-component path — `target_root.parent()` is `""`.
+    // On broken code this triggers fsync_directory(".") on MemFs and
+    // fails with NotFound. After the fix the empty-parent case skips
+    // the fsync entirely and the checkpoint succeeds.
+    let info = tree.create_checkpoint(std::path::Path::new("checkpoint-rel"))?;
+    assert!(info.sst_files >= 1);
+    Ok(())
+}
