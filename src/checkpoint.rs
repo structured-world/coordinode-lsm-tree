@@ -500,13 +500,33 @@ pub fn run_checkpoint<T: AbstractTree>(
     tree: &T,
     params: &CheckpointParams<'_>,
 ) -> crate::Result<CheckpointInfo> {
-    let target_root = params.target_root;
     let target_fs = params.target_fs;
     let src_root = params.src_root;
     let src_fs = params.src_fs;
     let deletion_pause = params.deletion_pause;
     let visible_seqno = params.visible_seqno;
     let include_blobs = params.include_blobs;
+
+    // Normalise the target by dropping all CurDir (`.`) components so
+    // every downstream call sees the same canonical form regardless of
+    // how the caller spelled the path. Without this, `"./checkpoint"`
+    // and `"checkpoint"` behave differently on backends that don't
+    // resolve `.` against a host-wide CWD (e.g. MemFs's `create_dir`
+    // and `sync_directory` reject `.` as not-found because the in-memory
+    // directory set never inserts it). ParentDir (`..`) is preserved —
+    // it's a semantic component that affects the resulting path.
+    let normalized_target: std::path::PathBuf = params
+        .target_root
+        .components()
+        .filter(|c| !matches!(c, std::path::Component::CurDir))
+        .collect();
+    if normalized_target.as_os_str().is_empty() {
+        return Err(crate::Error::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "checkpoint target_root must name at least one path component",
+        )));
+    }
+    let target_root = normalized_target.as_path();
 
     prepare_target(target_root, include_blobs, &**target_fs)?;
 
