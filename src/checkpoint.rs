@@ -163,6 +163,17 @@ pub fn link_or_copy_cross_fs(
         {
             // dst_fs cannot see src (cross-backend) or does not support
             // hard links at all → fall through to streamed copy.
+            // Log at `debug` for symmetry with `StdFs::hard_link`'s
+            // EXDEV fallback — operators wanting visibility of
+            // unexpected full copies should grep the `fs` /
+            // `checkpoint` modules at debug level. `warn` would drown
+            // real signal on a misconfigured tier with thousands of SSTs.
+            log::debug!(
+                "link_or_copy_cross_fs({}, {}) falling back to streamed copy ({})",
+                src.display(),
+                dst.display(),
+                e.kind(),
+            );
         }
         Err(e) => return Err(e),
     }

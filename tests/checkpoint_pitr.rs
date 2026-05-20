@@ -363,16 +363,21 @@ fn compaction_during_checkpoint_preserves_source_ssts() -> lsm_tree::Result<()> 
     let handle = thread::spawn(move || -> lsm_tree::Result<()> {
         let mut announced = false;
         while !compactor_stop.load(Ordering::Acquire) {
+            // Errors from major_compact MUST surface — silently
+            // discarding them would let a checkpoint race that
+            // corrupted compaction state pass the test as green.
+            compactor_tree.major_compact(u64::MAX, lsm_tree::SeqNo::MAX)?;
+            // Announce AFTER the first compaction completes so the
+            // main thread blocks on `recv()` until the worker has
+            // actually mutated tree state. Signalling before the call
+            // would let a fast scheduler run the checkpoint before
+            // any compaction work began, defeating the race coverage.
             if !announced {
                 started_tx
                     .send(())
                     .expect("checkpoint thread dropped compactor-start receiver");
                 announced = true;
             }
-            // Errors from major_compact MUST surface — silently
-            // discarding them would let a checkpoint race that
-            // corrupted compaction state pass the test as green.
-            compactor_tree.major_compact(u64::MAX, lsm_tree::SeqNo::MAX)?;
             thread::sleep(Duration::from_millis(5));
         }
         Ok(())

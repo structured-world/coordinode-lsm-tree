@@ -373,10 +373,14 @@ pub trait Fs: Send + Sync + 'static {
     ///
     /// # Default implementation
     ///
-    /// Returns [`io::ErrorKind::Unsupported`]. Backends that want to
-    /// participate in [`Tree::create_checkpoint`](crate::Tree::create_checkpoint)
-    /// MUST override this method; otherwise checkpoint will surface
-    /// `Unsupported` and refuse to snapshot.
+    /// Returns [`io::ErrorKind::Unsupported`]. Backends are free to leave
+    /// this default in place: the checkpoint driver's
+    /// `link_or_copy_cross_fs` helper treats `Unsupported` (and `NotFound`)
+    /// as a signal to fall back to a streamed byte copy, so snapshots
+    /// still succeed — they just lose the O(1) hard-link optimisation
+    /// and pay full-bytes worth of disk on the target volume. Backends
+    /// that DO support real hard links (most kernel filesystems) should
+    /// override this for the inode-sharing benefit.
     ///
     /// # Errors
     ///
