@@ -517,6 +517,15 @@ pub fn run_checkpoint<T: AbstractTree>(
 
     fsync_directory(target_root, &**target_fs)?;
 
+    // Finally, fsync the directory that CONTAINS `target_root`. Without
+    // this the checkpoint's own directory entry can disappear after a
+    // power loss even though the children we just synced would still be
+    // intact on the underlying inodes. Required by the same fsync-
+    // ordering rule that drove the child-directory syncs above.
+    if let Some(parent) = target_root.parent().filter(|p| !p.as_os_str().is_empty()) {
+        fsync_directory(parent, &**target_fs)?;
+    }
+
     cleanup.commit();
 
     Ok(CheckpointInfo {

@@ -258,27 +258,42 @@ fn is_cross_device(err: &io::Error) -> bool {
 fn copy_fallback(src: &Path, dst: &Path) -> io::Result<()> {
     use std::io::{Read, Write};
 
-    let mut src_file = File::open(src)?;
-    let mut dst_file = OpenOptions::new().write(true).create_new(true).open(dst)?;
+    // Wrap the copy in an inner closure so any post-`create_new` error
+    // (ENOSPC, EIO, write_all failure, sync_all failure) triggers a
+    // best-effort unlink of the partially-written destination. Without
+    // this, a failed `copy_fallback` leaves a truncated file behind and
+    // the next retry surfaces as `AlreadyExists` — callers would then
+    // see a corrupt file from an operation that already reported error.
+    let res: io::Result<()> = (|| {
+        let mut src_file = File::open(src)?;
+        let mut dst_file = OpenOptions::new().write(true).create_new(true).open(dst)?;
 
-    // Heap-allocate the scratch buffer — checkpoint is cold-path I/O, so a
-    // 64 KiB Vec is cheaper than blowing past clippy's stack-array budget.
-    let mut buf = vec![0u8; 64 * 1024].into_boxed_slice();
-    loop {
-        let n = match src_file.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => n,
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-            Err(e) => return Err(e),
-        };
-        #[expect(
-            clippy::indexing_slicing,
-            reason = "n was just produced by read() and bounded by buf.len()"
-        )]
-        dst_file.write_all(&buf[..n])?;
+        // Heap-allocated buffer — checkpoint is cold-path I/O, so a
+        // 64 KiB Vec is cheaper than blowing past clippy's stack-array budget.
+        let mut buf = vec![0u8; 64 * 1024].into_boxed_slice();
+        loop {
+            let n = match src_file.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            };
+            #[expect(
+                clippy::indexing_slicing,
+                reason = "n was just produced by read() and bounded by buf.len()"
+            )]
+            dst_file.write_all(&buf[..n])?;
+        }
+        dst_file.sync_all()
+    })();
+
+    if res.is_err() {
+        // Best-effort: if cleanup itself fails (permission denied,
+        // already removed by another process), there's nothing more we
+        // can do — the original error is what the caller needs to see.
+        let _ = std::fs::remove_file(dst);
     }
-    dst_file.sync_all()?;
-    Ok(())
+    res
 }
 
 // ---------------------------------------------------------------------------

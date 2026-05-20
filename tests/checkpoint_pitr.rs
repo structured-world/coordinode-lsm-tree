@@ -82,10 +82,21 @@ fn checkpoint_survives_concurrent_writes() -> lsm_tree::Result<()> {
     }
     tree.flush_active_memtable(0)?;
 
+    // mpsc handshake guarantees the writer has performed at least one
+    // post-flush insert BEFORE create_checkpoint runs. Without it, a
+    // fast scheduler can finish create_checkpoint before the worker
+    // touches the tree, collapsing the test into a single-threaded
+    // smoke test that does not exercise the concurrency invariant.
+    let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
     let writer_tree = Arc::clone(&tree);
     let writer = thread::spawn(move || -> lsm_tree::Result<()> {
         for i in 50u32..200 {
             writer_tree.insert(format!("k{i:03}"), format!("v{i}"), u64::from(i));
+            if i == 50 {
+                started_tx
+                    .send(())
+                    .expect("checkpoint thread dropped writer-start receiver");
+            }
             if i.is_multiple_of(10) {
                 writer_tree.flush_active_memtable(0)?;
             }
@@ -93,6 +104,9 @@ fn checkpoint_survives_concurrent_writes() -> lsm_tree::Result<()> {
         Ok(())
     });
 
+    started_rx
+        .recv()
+        .expect("writer thread exited before issuing a concurrent write");
     let info = tree.create_checkpoint(&dst_path)?;
     writer.join().expect("writer thread panicked")?;
 
@@ -337,11 +351,24 @@ fn compaction_during_checkpoint_preserves_source_ssts() -> lsm_tree::Result<()> 
         }
     }
 
+    // mpsc handshake guarantees the compactor has entered its loop
+    // BEFORE create_checkpoint runs. Without it, a fast scheduler can
+    // finish create_checkpoint before the worker calls major_compact
+    // even once, making the test pass without exercising the
+    // deletion-pause race it is named for.
+    let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
     let stop = Arc::new(AtomicBool::new(false));
     let compactor_tree = Arc::clone(&tree);
     let compactor_stop = Arc::clone(&stop);
     let handle = thread::spawn(move || -> lsm_tree::Result<()> {
+        let mut announced = false;
         while !compactor_stop.load(Ordering::Acquire) {
+            if !announced {
+                started_tx
+                    .send(())
+                    .expect("checkpoint thread dropped compactor-start receiver");
+                announced = true;
+            }
             // Errors from major_compact MUST surface — silently
             // discarding them would let a checkpoint race that
             // corrupted compaction state pass the test as green.
@@ -354,6 +381,10 @@ fn compaction_during_checkpoint_preserves_source_ssts() -> lsm_tree::Result<()> 
         stop: Arc::clone(&stop),
         handle: Some(handle),
     };
+
+    started_rx
+        .recv()
+        .expect("compactor thread exited before reaching its loop");
 
     // Run the checkpoint while compaction is racing. The pause must hold
     // back any compaction-driven removals until our hard-link loop has
