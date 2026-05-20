@@ -25,7 +25,7 @@
 // the underlying `Fs` trait operates on, so this module inherits its
 // host `fs` module's std dependency rather than introducing a new one.
 use crate::{
-    AbstractTree, CheckpointInfo, SeqNo,
+    AbstractTree, CheckpointInfo,
     file::{BLOBS_FOLDER, CURRENT_VERSION_FILE, TABLES_FOLDER, fsync_directory},
     fs::{Fs, FsFile, FsOpenOptions},
     version::Version,
@@ -507,10 +507,19 @@ pub fn run_checkpoint<T: AbstractTree>(
     let captured_seqno = visible_seqno.get();
 
     // Force a flush so the captured version reflects all data that has
-    // reached the active memtable. Using a sentinel eviction seqno
-    // (`SeqNo::MAX`) lets `flush_active_memtable` flush regardless of
-    // current visible seqno — the data is durable in either case.
-    tree.flush_active_memtable(SeqNo::MAX)?;
+    // reached the active memtable. The eviction seqno parameter doubles
+    // as `CompactionStream::gc_seqno_threshold` — any older version of
+    // a key with `seqno < threshold` is dropped during the flush-time
+    // merge, and snapshot readers on the SOURCE tree lose that history.
+    //
+    // We pass `0` so the checkpoint-triggered flush never expands GC
+    // beyond what would have happened anyway: a checkpoint must NOT
+    // change the source's MVCC visibility semantics. Using a tighter
+    // threshold (e.g. `captured_seqno`) would still wrongly drop
+    // history readers below that watermark might need; using
+    // `SeqNo::MAX` (a previous oversight) wiped every older version
+    // of every key.
+    tree.flush_active_memtable(0)?;
 
     let version = tree.current_version();
 
