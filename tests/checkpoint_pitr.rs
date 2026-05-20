@@ -242,7 +242,8 @@ fn checkpoint_flattens_level_routes() -> lsm_tree::Result<()> {
 ///   - Two versions of "k": seqno 1 ("v1") and seqno 2 ("v2")
 ///   - Both live in the active memtable
 ///   - Take a checkpoint (triggers the internal flush)
-///   - Read "k" at seqno 1 on the source — must return "v1"
+///   - Read "k" at seqno 2 on the source — must return "v1" (the
+///     version visible to a snapshot reading below seqno 2)
 ///
 /// With the bug (threshold = SeqNo::MAX) the flush merges the two
 /// versions and drops "v1" because 1 < MAX, so the read returns "v2"
