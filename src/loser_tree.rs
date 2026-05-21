@@ -39,22 +39,25 @@
 //! Each leaf is logically `Option<E>` — present or sentinel. The
 //! physical representation uses two parallel arrays:
 //! `leaves: Vec<MaybeUninit<E>>` for the values and
-//! `present: Vec<bool>` for the discriminants. This eliminates the
-//! `Option` discriminant branch that LLVM emits inside `cmp_indices`
-//! on every game (called O(log cap) times per merger step); the
-//! present-bit fetch is a single byte load (in Rust's stdlib
-//! `Vec<bool>` is NOT bit-packed — each `bool` occupies one byte
-//! with valid bit-pattern `0u8`/`1u8`, so `present[i]` lowers to a
-//! single-byte read + zero-compare, not a bit-test) that
-//! branch-predicts perfectly under steady-state merging (where
-//! leaves stay present until exhaustion). `cmp_indices` treats
-//! absent leaves as strictly greater than any present value, so
+//! `present: Vec<u8>` for the discriminants (one byte per slot,
+//! `1` = present, `0` = absent). `Vec<u8>` is used over `Vec<bool>`
+//! to make the byte-per-element layout self-evident from the type
+//! and avoid any ambiguity about discriminant packing — the array
+//! is a flat byte map by design.
+//!
+//! This eliminates the `Option` discriminant branch that LLVM
+//! emits inside `cmp_indices` on every game (called O(log cap)
+//! times per merger step); the present-byte fetch is a single
+//! contiguous load + zero-compare that branch-predicts perfectly
+//! under steady-state merging (where leaves stay present until
+//! exhaustion). `cmp_indices` treats absent leaves (`present[i]
+//! == 0`) as strictly greater than any present value, so
 //! exhausted sources naturally lose every game.
 //!
-//! All `MaybeUninit::assume_init_*` calls are guarded by a check on
-//! the corresponding `present[i]` bit and never widen the unsafe
-//! contract beyond what the bitmap already guarantees. `Drop`
-//! walks the bitmap and drops in place.
+//! All `MaybeUninit::assume_init_*` calls are guarded by a check
+//! on the corresponding `present[i]` byte and never widen the
+//! unsafe contract beyond what the byte-map already guarantees.
+//! `Drop` walks the byte-map and drops in place.
 
 use alloc::vec::Vec;
 use core::cmp::Ordering;
@@ -66,17 +69,19 @@ use core::mem::MaybeUninit;
 /// is `Ordering::Less` than every other leaf wins. To get max-semantics,
 /// pass a reversed comparator (`|a, b| cmp(a, b).reverse()`).
 pub struct LoserTree<E, F> {
-    /// Current value per source slot, untagged. Only meaningful when
-    /// the matching `present[i]` bit is `true`. Length is `cap`
-    /// (padded to the next power of two ≥ 2); the trailing
+    /// Current value per source slot, untagged. Only meaningful
+    /// when the matching `present[i]` byte is non-zero. Length is
+    /// `cap` (padded to the next power of two ≥ 2); the trailing
     /// `cap - n_sources` slots are permanent sentinels with
-    /// `present[i] == false`.
+    /// `present[i] == 0`.
     leaves: Vec<MaybeUninit<E>>,
-    /// Discriminant for `leaves[i]`. `true` ⇒ initialised; `false` ⇒
-    /// uninit (exhausted or padding sentinel). Walking this bitmap
-    /// alongside `leaves` replaces the `Option` discriminant the
-    /// previous layout carried inline.
-    present: Vec<bool>,
+    /// Discriminant byte for `leaves[i]`. `1` ⇒ initialised; `0` ⇒
+    /// uninit (exhausted or padding sentinel). Walking this
+    /// contiguous byte-map alongside `leaves` replaces the
+    /// `Option` discriminant the previous layout carried inline.
+    /// `u8` (not `bool`) is chosen so the byte-per-slot layout
+    /// is unambiguous from the type itself.
+    present: Vec<u8>,
     /// Tree of size `cap`. `tree[0]` = winner leaf index; `tree[1..cap]`
     /// = loser leaf index at each internal node.
     tree: Vec<usize>,
@@ -92,8 +97,12 @@ pub struct LoserTree<E, F> {
 
 impl<E: core::fmt::Debug, F> core::fmt::Debug for LoserTree<E, F> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        // Reconstitute the conceptual Vec<Option<&E>> view for Debug
-        // — never expose a MaybeUninit through Debug output.
+        // Print only the structural shape — never expose leaf
+        // bytes through Debug, since they sit behind MaybeUninit
+        // and may be uninitialised at any given moment. The
+        // `E: Debug` bound stays on the impl so this type can be
+        // nested inside other `#[derive(Debug)]` structs without
+        // breaking their derive expansion; we just don't use it.
         f.debug_struct("LoserTree")
             .field("n_sources", &self.n_sources)
             .field("active", &self.active)
@@ -113,8 +122,8 @@ impl<E, F> Drop for LoserTree<E, F> {
             reason = "leaves.len() == present.len() by construction (set in build())"
         )]
         for i in 0..self.leaves.len() {
-            if self.present[i] {
-                // SAFETY: `present[i] == true` is the LoserTree
+            if self.present[i] != 0 {
+                // SAFETY: `present[i] != 0` is the LoserTree
                 // invariant for `leaves[i]` being initialised.
                 unsafe { self.leaves[i].assume_init_drop() };
             }
@@ -141,21 +150,21 @@ where
         // Split the Option<E> input into parallel (MaybeUninit, bool)
         // arrays. Trailing padding past `n` is uninit + absent.
         let mut leaves: Vec<MaybeUninit<E>> = Vec::with_capacity(cap);
-        let mut present: Vec<bool> = Vec::with_capacity(cap);
+        let mut present: Vec<u8> = Vec::with_capacity(cap);
         let mut active = 0_usize;
         for item in initial {
             if let Some(v) = item {
                 leaves.push(MaybeUninit::new(v));
-                present.push(true);
+                present.push(1);
                 active += 1;
             } else {
                 leaves.push(MaybeUninit::uninit());
-                present.push(false);
+                present.push(0);
             }
         }
         while leaves.len() < cap {
             leaves.push(MaybeUninit::uninit());
-            present.push(false);
+            present.push(0);
         }
         let tree = alloc::vec![0; cap];
 
@@ -247,10 +256,10 @@ where
     )]
     pub fn peek_min(&self) -> Option<&E> {
         let idx = self.winner_slot()?;
-        if !self.present[idx] {
+        if self.present[idx] == 0 {
             return None;
         }
-        // SAFETY: `present[idx] == true` is the LoserTree invariant
+        // SAFETY: `present[idx] != 0` is the LoserTree invariant
         // for `leaves[idx]` being initialised.
         Some(unsafe { self.leaves[idx].assume_init_ref() })
     }
@@ -281,13 +290,14 @@ where
             .winner_slot()
             .expect("replace_min called on empty LoserTree");
         debug_assert!(
-            self.present[slot],
+            self.present[slot] != 0,
             "LoserTree winner slot must be present when winner_slot() returns Some"
         );
-        // SAFETY: `present[slot] == true` (asserted by winner_slot
+        // SAFETY: `present[slot] != 0` (asserted by winner_slot
         // returning Some plus the LoserTree invariant). The old
         // value is read out and the new is written in its place;
-        // `present[slot]` stays `true` so no bitmap update needed.
+        // `present[slot]` stays non-zero so no byte-map update
+        // needed.
         let old = unsafe {
             core::mem::replace(&mut self.leaves[slot], MaybeUninit::new(new)).assume_init()
         };
@@ -305,18 +315,19 @@ where
     pub fn pop_min(&mut self) -> Option<E> {
         let slot = self.winner_slot()?;
         debug_assert!(
-            self.present[slot],
+            self.present[slot] != 0,
             "LoserTree winner slot must be present when winner_slot() returns Some"
         );
-        // SAFETY: present[slot] == true (LoserTree invariant for the
-        // winner slot). Reading via `replace(_, uninit)` returns the
-        // initialised value and leaves the slot as MaybeUninit::uninit;
-        // we then flip the bitmap so subsequent code (cmp_indices,
-        // peek_min, Drop) sees it as absent.
+        // SAFETY: present[slot] != 0 (LoserTree invariant for the
+        // winner slot). Reading via `replace(_, uninit)` returns
+        // the initialised value and leaves the slot as
+        // MaybeUninit::uninit; we then flip the byte-map so
+        // subsequent code (cmp_indices, peek_min, Drop) sees it
+        // as absent.
         let old = unsafe {
             core::mem::replace(&mut self.leaves[slot], MaybeUninit::uninit()).assume_init()
         };
-        self.present[slot] = false;
+        self.present[slot] = 0;
         self.active -= 1;
         self.replay(slot);
         Some(old)
@@ -337,14 +348,14 @@ where
         reason = "slot is checked < self.leaves.len() before indexing"
     )]
     pub fn take_slot(&mut self, slot: usize) -> Option<E> {
-        if slot >= self.leaves.len() || !self.present[slot] {
+        if slot >= self.leaves.len() || self.present[slot] == 0 {
             return None;
         }
-        // SAFETY: present[slot] == true (just checked above).
+        // SAFETY: present[slot] != 0 (just checked above).
         let taken = unsafe {
             core::mem::replace(&mut self.leaves[slot], MaybeUninit::uninit()).assume_init()
         };
-        self.present[slot] = false;
+        self.present[slot] = 0;
         self.active -= 1;
         self.replay(slot);
         Some(taken)
@@ -441,11 +452,11 @@ where
                   present.len() == leaves.len() == cap by construction"
     )]
     fn cmp_indices(&self, a: usize, b: usize) -> Ordering {
-        match (self.present[a], self.present[b]) {
+        match (self.present[a] != 0, self.present[b] != 0) {
             (true, true) => {
-                // SAFETY: both bits set ⇒ both leaves initialised
-                // (LoserTree invariant maintained by build/replace/
-                // pop/take_slot).
+                // SAFETY: both bytes non-zero ⇒ both leaves
+                // initialised (LoserTree invariant maintained by
+                // build/replace/pop/take_slot).
                 let va = unsafe { self.leaves[a].assume_init_ref() };
                 let vb = unsafe { self.leaves[b].assume_init_ref() };
                 (self.cmp)(va, vb)
