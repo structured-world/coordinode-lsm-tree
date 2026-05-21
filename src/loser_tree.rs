@@ -67,10 +67,11 @@ use core::mem::MaybeUninit;
 ///
 /// This trait exists instead of a plain `Fn(&E, &E) -> Ordering`
 /// bound so callers can pass a concrete struct (e.g.
-/// `SeekingMerger`'s `MergerCmp`) that monomorphises through the
-/// type system. A blanket impl forwards every `Fn` closure to
-/// this trait, so test code and internal helpers that already use
-/// `|a, b| ...` closures keep working without change.
+/// `SeekingMerger`'s `MinCmp<C>` / `MaxCmp<C>`) that
+/// monomorphises through the type system. A blanket impl
+/// forwards every `Fn` closure to this trait, so test code and
+/// internal helpers that already use `|a, b| ...` closures
+/// keep working without change.
 ///
 /// **Why not just `Fn`:** wrapping the closure in `Box<dyn Fn>`
 /// to satisfy a non-generic field type adds one indirect call per
