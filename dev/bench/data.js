@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779303442652,
+  "lastUpdate": 1779345682802,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -7098,6 +7098,84 @@ window.BENCHMARK_DATA = {
             "value": 281010.58058227407,
             "unit": "ops/sec (normalized)",
             "extra": "raw: 444475 ops/sec | factor: 0.632 | P50: 2.1us | P99: 4.8us | P99.9: 14.2us\nthreads: 1 | elapsed: 0.45s | num: 200000 | iterations: 3 | runner: seq_wr=218602 rand_rd=743113 cpu=108 composite=36379.2"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "4e917e0121e2e27fc8f9fc970acdd2a694a82efe",
+          "message": "refactor(filter/burr): re-deny indexing/expect/unwrap with per-site justifications (#270) (#282)\n\n## Summary\n\nMigrates BuRR-submodule `expect()` / `unwrap()` / direct-indexing sites\nthat were silently allowed by the vendored-ribbon parent module's\n`#![allow(...)]`. Adds `#![deny(clippy::indexing_slicing,\nclippy::expect_used, clippy::unwrap_used)]` at `burr/mod.rs` so\nfirst-party BuRR code holds itself to the same bar as the rest of the\ncrate.\n\nCloses #270.\n\n## What changed\n\n| File | Migration |\n|---|---|\n| `burr/mod.rs` | Added `#![deny(indexing_slicing, expect_used,\nunwrap_used)]`; replaced the deferred-work doc comment with the new\nstrict policy description |\n| `burr/threshold.rs` | `compute_thresholds()`: function-level\n`#[expect(indexing_slicing, reason = ...)]` documenting bounds-safety of\nthree sites (block_idx range check, enumerate over same-sized vec,\n`cap_per_block` early-continue gate). `tests` submodule gated too |\n| `burr/filter.rs` | `contains_hash()`: function-level\n`#[expect(indexing_slicing)]` for the `z_words[equation.start + offset]`\nprobe-loop access (invariant documented in pre-existing doc comment at\nlines 195-197; per-row `.get()` would add a branch on the probe hot\npath) |\n| `burr/wire.rs` | `decode()` + `contains_hash_from_bytes()`:\nfunction-level `#[expect(indexing_slicing)]`. Every slice is preceded by\nan explicit length-check that returns `InvalidHeader` on truncation.\nReplacing with `.get(..).ok_or(...)` would multiply error-return paths\nwithout improving safety |\n| `burr/tests.rs` | `#![expect]` at file scope for `unwrap_used` /\n`expect_used` / `indexing_slicing`; test code uses panic-on-error freely\nfor assertion ergonomics, scoped to `#[cfg(test)]` only |\n\nThe vendored ribbon code (`src/table/filter/ribbon/*` excluding `burr/`)\nis **untouched** — the parent module's `#![allow]` still covers upstream\nfor diff-minimisation. Only the first-party BuRR submodule re-denies.\n\n## Acceptance (per issue)\n\n- [x] All BuRR-submodule code passes clippy with the deny added\n  - `cargo clippy --lib --tests` clean\n- [x] No correctness regression\n- 73/73 BuRR tests pass (`table::filter::ribbon::burr::*` +\n`burr_filter_end_to_end`)\n  - 1330/1330 full workspace tests pass\n- [x] No probe-bench regression expected\n- Function-level `#[expect]` attributes don't change codegen vs the\nprevious module-scope `#![allow]`\n\n## Bench check\n\nNot run — `#[expect]` attributes are pure lint suppressions, identical\ncodegen. The existing `benches/bloom.rs` smoke run still emits expected\ntimings. If reviewer wants a side-by-side P50/P99 confirmation, happy to\nrun.\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n## Summary by CodeRabbit\n\n* **Chores**\n* Improved lint management and documentation across an internal\nfiltering component to explicitly allow or deny specific static-analysis\nchecks where justified.\n* Added localized, reasoned exceptions in implementation and test code\nto document safe indexing and avoid noisy warnings.\n* No functional behavior or public APIs were changed; this is\nmaintenance-only.\n\n<!-- review_stack_entry_start -->\n\n[![Review Change\nStack](https://storage.googleapis.com/coderabbit_public_assets/review-stack-in-coderabbit-ui.svg)](https://app.coderabbit.ai/change-stack/structured-world/coordinode-lsm-tree/pull/282?utm_source=github_walkthrough&utm_medium=github&utm_campaign=change_stack)\n\n<!-- review_stack_entry_end -->\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-05-21T09:40:07+03:00",
+          "tree_id": "d297a92896ac75f763ed89389e5d4650731753c8",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/4e917e0121e2e27fc8f9fc970acdd2a694a82efe"
+        },
+        "date": 1779345681768,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 1200348.2683401073,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 1883214 ops/sec | factor: 0.637 | P50: 0.4us | P99: 2.5us | P99.9: 5.8us\nthreads: 1 | elapsed: 0.11s | num: 200000 | iterations: 3 | runner: seq_wr=223279 rand_rd=716078 cpu=109 composite=36084.5"
+          },
+          {
+            "name": "fillrandom",
+            "value": 701677.7963828146,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 1100855 ops/sec | factor: 0.637 | P50: 0.7us | P99: 3.0us | P99.9: 8.2us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3 | runner: seq_wr=223279 rand_rd=716078 cpu=109 composite=36084.5"
+          },
+          {
+            "name": "readrandom",
+            "value": 297574.9330374687,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 466862 ops/sec | factor: 0.637 | P50: 1.9us | P99: 6.5us | P99.9: 13.7us\nthreads: 1 | elapsed: 0.43s | num: 200000 | iterations: 3 | runner: seq_wr=223279 rand_rd=716078 cpu=109 composite=36084.5"
+          },
+          {
+            "name": "readseq",
+            "value": 1367103.726750658,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 2144835 ops/sec | factor: 0.637 | P50: 0.3us | P99: 4.7us | P99.9: 9.2us\nthreads: 1 | elapsed: 0.09s | num: 200000 | iterations: 3 | runner: seq_wr=223279 rand_rd=716078 cpu=109 composite=36084.5"
+          },
+          {
+            "name": "seekrandom",
+            "value": 214708.69091864993,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 336854 ops/sec | factor: 0.637 | P50: 2.6us | P99: 7.0us | P99.9: 14.3us\nthreads: 1 | elapsed: 0.59s | num: 200000 | iterations: 3 | runner: seq_wr=223279 rand_rd=716078 cpu=109 composite=36084.5"
+          },
+          {
+            "name": "prefixscan",
+            "value": 104292.01355384181,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 163623 ops/sec | factor: 0.637 | P50: 5.8us | P99: 7.5us | P99.9: 17.8us\nthreads: 1 | elapsed: 1.22s | num: 200000 | iterations: 3 | runner: seq_wr=223279 rand_rd=716078 cpu=109 composite=36084.5"
+          },
+          {
+            "name": "overwrite",
+            "value": 708443.6295208771,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 1111470 ops/sec | factor: 0.637 | P50: 0.7us | P99: 3.1us | P99.9: 7.0us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3 | runner: seq_wr=223279 rand_rd=716078 cpu=109 composite=36084.5"
+          },
+          {
+            "name": "mergerandom",
+            "value": 457170.17210718966,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 717250 ops/sec | factor: 0.637 | P50: 0.4us | P99: 2.1us | P99.9: 3.6us\nthreads: 1 | elapsed: 0.28s | num: 200000 | iterations: 3 | runner: seq_wr=223279 rand_rd=716078 cpu=109 composite=36084.5"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 276205.6366731072,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 433336 ops/sec | factor: 0.637 | P50: 2.1us | P99: 5.7us | P99.9: 14.4us\nthreads: 1 | elapsed: 0.46s | num: 200000 | iterations: 3 | runner: seq_wr=223279 rand_rd=716078 cpu=109 composite=36084.5"
           }
         ]
       }
