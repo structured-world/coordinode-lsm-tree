@@ -36,38 +36,99 @@
 //!
 //! # Sentinel handling
 //!
-//! Each leaf is `Option<E>`. `None` means "this source is exhausted".
-//! `cmp_indices` treats `None` as strictly greater than any `Some`, so
-//! exhausted sources naturally lose every game and drop out of the
-//! tournament. Once every leaf is `None`, `peek_min` returns `None` and
-//! the tree is empty.
+//! Each leaf is logically `Option<E>` — present or sentinel. The
+//! physical representation uses two parallel arrays:
+//! `leaves: Vec<MaybeUninit<E>>` for the values and
+//! `present: Vec<u8>` for the discriminants (one byte per slot,
+//! `1` = present, `0` = absent). `Vec<u8>` is used over `Vec<bool>`
+//! to make the byte-per-element layout self-evident from the type
+//! and avoid any ambiguity about discriminant packing — the array
+//! is a flat byte map by design.
+//!
+//! This eliminates the `Option` discriminant branch that LLVM
+//! emits inside `cmp_indices` on every game (called O(log cap)
+//! times per merger step); the present-byte fetch is a single
+//! contiguous load + zero-compare that branch-predicts perfectly
+//! under steady-state merging (where leaves stay present until
+//! exhaustion). `cmp_indices` treats absent leaves (`present[i]
+//! == 0`) as strictly greater than any present value, so
+//! exhausted sources naturally lose every game.
+//!
+//! All `MaybeUninit::assume_init_*` calls are guarded by a check
+//! on the corresponding `present[i]` byte and never widen the
+//! unsafe contract beyond what the byte-map already guarantees.
+//! `Drop` walks the byte-map and drops in place.
 
 use alloc::vec::Vec;
 use core::cmp::Ordering;
+use core::mem::MaybeUninit;
 
 /// A min-tournament tree over `n` input slots.
 ///
 /// The "min" comes from how `cmp` is interpreted: the leaf whose value
 /// is `Ordering::Less` than every other leaf wins. To get max-semantics,
 /// pass a reversed comparator (`|a, b| cmp(a, b).reverse()`).
-#[derive(Debug)]
 pub struct LoserTree<E, F> {
-    /// Current value per source slot. `None` = exhausted / sentinel.
-    /// Length is `cap` (padded to the next power of two ≥ 2); the
-    /// trailing `cap - n_sources` slots are permanent `None`
-    /// sentinels and never carry a value.
-    leaves: Vec<Option<E>>,
+    /// Current value per source slot, untagged. Only meaningful
+    /// when the matching `present[i]` byte is non-zero. Length is
+    /// `cap` (padded to the next power of two ≥ 2); the trailing
+    /// `cap - n_sources` slots are permanent sentinels with
+    /// `present[i] == 0`.
+    leaves: Vec<MaybeUninit<E>>,
+    /// Discriminant byte for `leaves[i]`. `1` ⇒ initialised; `0` ⇒
+    /// uninit (exhausted or padding sentinel). Walking this
+    /// contiguous byte-map alongside `leaves` replaces the
+    /// `Option` discriminant the previous layout carried inline.
+    /// `u8` (not `bool`) is chosen so the byte-per-slot layout
+    /// is unambiguous from the type itself.
+    present: Vec<u8>,
     /// Tree of size `cap`. `tree[0]` = winner leaf index; `tree[1..cap]`
     /// = loser leaf index at each internal node.
     tree: Vec<usize>,
     /// Number of source slots originally supplied. Less than or equal
     /// to `leaves.len()` (= `cap`). Exposed via [`Self::slots`].
     n_sources: usize,
-    /// Number of `Some` leaves. When zero the tree is empty.
+    /// Count of present leaves. When zero the tree is empty.
     active: usize,
     /// Comparator. Captures source-order tie-break and any other
     /// merge-precedence rules the caller wants.
     cmp: F,
+}
+
+impl<E: core::fmt::Debug, F> core::fmt::Debug for LoserTree<E, F> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        // Print only the structural shape — never expose leaf
+        // bytes through Debug, since they sit behind MaybeUninit
+        // and may be uninitialised at any given moment. The
+        // `E: Debug` bound stays on the impl so this type can be
+        // nested inside other `#[derive(Debug)]` structs without
+        // breaking their derive expansion; we just don't use it.
+        f.debug_struct("LoserTree")
+            .field("n_sources", &self.n_sources)
+            .field("active", &self.active)
+            .field("cap", &self.leaves.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl<E, F> Drop for LoserTree<E, F> {
+    fn drop(&mut self) {
+        // Drop each present leaf in place. The MaybeUninit storage
+        // doesn't drop on its own; without this loop, owned values
+        // (Strings, Boxes, Arcs, ...) inside present leaves would
+        // leak when the tree itself is dropped.
+        #[expect(
+            clippy::indexing_slicing,
+            reason = "leaves.len() == present.len() by construction (set in build())"
+        )]
+        for i in 0..self.leaves.len() {
+            if self.present[i] != 0 {
+                // SAFETY: `present[i] != 0` is the LoserTree
+                // invariant for `leaves[i]` being initialised.
+                unsafe { self.leaves[i].assume_init_drop() };
+            }
+        }
+    }
 }
 
 impl<E, F> LoserTree<E, F>
@@ -85,14 +146,31 @@ where
     pub fn build(initial: Vec<Option<E>>, cmp: F) -> Self {
         let n = initial.len();
         let cap = n.next_power_of_two().max(2);
-        let mut leaves = initial;
-        leaves.resize_with(cap, || None);
 
-        let active = leaves.iter().filter(|x| x.is_some()).count();
+        // Split the Option<E> input into parallel (MaybeUninit, bool)
+        // arrays. Trailing padding past `n` is uninit + absent.
+        let mut leaves: Vec<MaybeUninit<E>> = Vec::with_capacity(cap);
+        let mut present: Vec<u8> = Vec::with_capacity(cap);
+        let mut active = 0_usize;
+        for item in initial {
+            if let Some(v) = item {
+                leaves.push(MaybeUninit::new(v));
+                present.push(1);
+                active += 1;
+            } else {
+                leaves.push(MaybeUninit::uninit());
+                present.push(0);
+            }
+        }
+        while leaves.len() < cap {
+            leaves.push(MaybeUninit::uninit());
+            present.push(0);
+        }
         let tree = alloc::vec![0; cap];
 
         let mut t = Self {
             leaves,
+            present,
             tree,
             n_sources: n,
             active,
@@ -115,8 +193,13 @@ where
         self.n_sources
     }
 
-    /// Whether every slot is exhausted (`None`).
-    #[inline]
+    /// Whether every slot is exhausted (no present leaves).
+    #[expect(
+        clippy::inline_always,
+        reason = "called from winner_slot() on every merger step; forcing cross-crate inlining \
+                  for the bench compilation unit measurably tightens the hot loop"
+    )]
+    #[inline(always)]
     pub fn is_empty(&self) -> bool {
         self.active == 0
     }
@@ -139,7 +222,11 @@ where
     /// Useful for callers (like the LSM merger) that need to know
     /// *which* source produced the current minimum, so the next item
     /// from that source can be pulled in.
-    #[inline]
+    #[expect(
+        clippy::inline_always,
+        reason = "hot per-step routine; cross-crate inlining for benches"
+    )]
+    #[inline(always)]
     #[expect(
         clippy::indexing_slicing,
         reason = "tree[0] always exists: cap >= 2 by construction"
@@ -169,7 +256,12 @@ where
     )]
     pub fn peek_min(&self) -> Option<&E> {
         let idx = self.winner_slot()?;
-        self.leaves[idx].as_ref()
+        if self.present[idx] == 0 {
+            return None;
+        }
+        // SAFETY: `present[idx] != 0` is the LoserTree invariant
+        // for `leaves[idx]` being initialised.
+        Some(unsafe { self.leaves[idx].assume_init_ref() })
     }
 
     /// Replace the value at the winning slot with `new` and return the
@@ -197,9 +289,18 @@ where
         let slot = self
             .winner_slot()
             .expect("replace_min called on empty LoserTree");
-        let old = self.leaves[slot]
-            .replace(new)
-            .expect("LoserTree winner slot must hold Some");
+        debug_assert!(
+            self.present[slot] != 0,
+            "LoserTree winner slot must be present when winner_slot() returns Some"
+        );
+        // SAFETY: `present[slot] != 0` (asserted by winner_slot
+        // returning Some plus the LoserTree invariant). The old
+        // value is read out and the new is written in its place;
+        // `present[slot]` stays non-zero so no byte-map update
+        // needed.
+        let old = unsafe {
+            core::mem::replace(&mut self.leaves[slot], MaybeUninit::new(new)).assume_init()
+        };
         self.replay(slot);
         old
     }
@@ -213,14 +314,23 @@ where
     )]
     pub fn pop_min(&mut self) -> Option<E> {
         let slot = self.winner_slot()?;
-        let old = self.leaves[slot].take();
         debug_assert!(
-            old.is_some(),
-            "LoserTree winner slot must hold Some when winner_slot() returns Some"
+            self.present[slot] != 0,
+            "LoserTree winner slot must be present when winner_slot() returns Some"
         );
+        // SAFETY: present[slot] != 0 (LoserTree invariant for the
+        // winner slot). Reading via `replace(_, uninit)` returns
+        // the initialised value and leaves the slot as
+        // MaybeUninit::uninit; we then flip the byte-map so
+        // subsequent code (cmp_indices, peek_min, Drop) sees it
+        // as absent.
+        let old = unsafe {
+            core::mem::replace(&mut self.leaves[slot], MaybeUninit::uninit()).assume_init()
+        };
+        self.present[slot] = 0;
         self.active -= 1;
         self.replay(slot);
-        old
+        Some(old)
     }
 
     /// Take the value at a specific slot (regardless of winner status)
@@ -238,10 +348,14 @@ where
         reason = "slot is checked < self.leaves.len() before indexing"
     )]
     pub fn take_slot(&mut self, slot: usize) -> Option<E> {
-        if slot >= self.leaves.len() {
+        if slot >= self.leaves.len() || self.present[slot] == 0 {
             return None;
         }
-        let taken = self.leaves[slot].take()?;
+        // SAFETY: present[slot] != 0 (just checked above).
+        let taken = unsafe {
+            core::mem::replace(&mut self.leaves[slot], MaybeUninit::uninit()).assume_init()
+        };
+        self.present[slot] = 0;
         self.active -= 1;
         self.replay(slot);
         Some(taken)
@@ -282,6 +396,19 @@ where
 
     /// Replay the tournament path from `leaf`'s position back up to the
     /// root, updating `tree[0]` with the new overall winner. O(log cap).
+    ///
+    /// `#[inline(always)]` — this is the single hot per-step routine
+    /// called from `replace_min` / `pop_min` / `take_slot` on every
+    /// merger step. Forcing inlining lets the caller hoist
+    /// `self.tree.as_ptr()` / `self.cmp` out of the loop and avoids
+    /// the call-site branch-predictor cost; default `#[inline]` is
+    /// only a hint and stops at crate boundaries (benches live in a
+    /// separate compilation unit).
+    #[expect(
+        clippy::inline_always,
+        reason = "the single hot per-merger-step routine; cross-crate inlining for benches"
+    )]
+    #[inline(always)]
     #[expect(
         clippy::indexing_slicing,
         reason = "node traverses 1..cap by construction; tree[0] always exists"
@@ -305,18 +432,38 @@ where
         self.tree[0] = winner;
     }
 
-    /// Compare leaves by slot index, treating `None` as `+∞`. `None`
-    /// always loses to `Some`; `None` vs `None` returns `Equal`.
+    /// Compare leaves by slot index, treating absent slots as `+∞`.
+    /// Absent always loses to present; absent vs absent returns
+    /// `Equal`.
+    ///
+    /// `#[inline(always)]` — called O(log cap) times per `replay()`
+    /// step, which is itself the hot per-merger-step routine. The
+    /// present-bit branch is a single byte load + predictable
+    /// compare; inlining lets LLVM fuse consecutive checks across
+    /// the replay loop.
+    #[expect(
+        clippy::inline_always,
+        reason = "called O(log cap) per replay; cross-crate inlining for benches"
+    )]
+    #[inline(always)]
     #[expect(
         clippy::indexing_slicing,
-        reason = "callers (build_subtree, replay) only pass slot indices < cap"
+        reason = "callers (build_subtree, replay) only pass slot indices < cap; \
+                  present.len() == leaves.len() == cap by construction"
     )]
     fn cmp_indices(&self, a: usize, b: usize) -> Ordering {
-        match (&self.leaves[a], &self.leaves[b]) {
-            (Some(x), Some(y)) => (self.cmp)(x, y),
-            (Some(_), None) => Ordering::Less,
-            (None, Some(_)) => Ordering::Greater,
-            (None, None) => Ordering::Equal,
+        match (self.present[a] != 0, self.present[b] != 0) {
+            (true, true) => {
+                // SAFETY: both bytes non-zero ⇒ both leaves
+                // initialised (LoserTree invariant maintained by
+                // build/replace/pop/take_slot).
+                let va = unsafe { self.leaves[a].assume_init_ref() };
+                let vb = unsafe { self.leaves[b].assume_init_ref() };
+                (self.cmp)(va, vb)
+            }
+            (true, false) => Ordering::Less,
+            (false, true) => Ordering::Greater,
+            (false, false) => Ordering::Equal,
         }
     }
 }
