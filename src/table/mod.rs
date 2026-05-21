@@ -470,6 +470,189 @@ impl Table {
             .map(|opt| opt.map(|(iv, db)| (iv, db.inner)))
     }
 
+    /// Batch point-read variant of [`Table::get`].
+    ///
+    /// Each input pair is `(key, key_hash)`. The slice **must be
+    /// sorted ascending by `key` under this table's comparator**.
+    /// Returns one `Option<InternalValue>` per input pair in input
+    /// order: `Some(_)` for found values (including tombstones —
+    /// callers distinguish via [`InternalValue`]'s value type),
+    /// `None` for absent keys.
+    ///
+    /// # Why this exists vs. calling [`Table::get`] in a loop
+    ///
+    /// Sequential per-key calls each pay:
+    ///
+    /// 1. Bloom-filter dereference + N hash probes — duplicated
+    ///    across calls.
+    /// 2. Block-index seek from scratch — every call walks
+    ///    `forward_reader(key, seqno)` and re-pays the index
+    ///    binary search even when the previous call already
+    ///    landed inside the same data block.
+    /// 3. Block load — every call re-fetches the data block
+    ///    from cache, so cache hits still pay a hashmap lookup
+    ///    + Arc clone per call.
+    ///
+    /// `batch_get` collapses all three:
+    ///
+    /// 1. Filter pointer fetched once; the loop just checks N
+    ///    hashes against it.
+    /// 2. Block-index seek runs once at the smallest passing
+    ///    key, then the iterator walks forward across the
+    ///    sorted input — no re-seek per key.
+    /// 3. Each data block is loaded at most once for the entire
+    ///    batch. Multiple input keys that fall in the same block
+    ///    share a single load.
+    ///
+    /// The wire-format is identical to N independent `get()`
+    /// calls; the savings are purely call-overhead.
+    ///
+    /// # Sort requirement
+    ///
+    /// Sorting is the caller's responsibility because the
+    /// `batch_get_from_tables` driver already maintains the
+    /// remaining-keys list in comparator order between L1+ runs
+    /// (re-sorted after each `covered_miss` split). Re-sorting
+    /// inside `batch_get` would be redundant work; passing
+    /// pre-sorted input lets the implementation rely on a
+    /// monotone two-pointer walk between input keys and block
+    /// boundaries.
+    ///
+    /// # Errors
+    ///
+    /// Propagates any I/O / corruption error from the filter
+    /// fetch, block-index read, or data-block load. On error
+    /// the partial `results` vector is discarded — callers
+    /// observe an all-or-nothing outcome per call.
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "every index access in this routine is bounded by construction: \
+                  `passing` indices are produced from enumerate(sorted_keys) so they're \
+                  < sorted_keys.len() == results.len(); `passing[p]` is guarded by \
+                  `p < passing.len()` on every loop iteration; `passing[0]` is read \
+                  only after an explicit emptiness check above."
+    )]
+    pub fn batch_get(
+        &self,
+        sorted_keys: &[(&[u8], u64)],
+        seqno: SeqNo,
+    ) -> crate::Result<Vec<Option<InternalValue>>> {
+        let mut results: Vec<Option<InternalValue>> = vec![None; sorted_keys.len()];
+
+        if sorted_keys.is_empty() {
+            return Ok(results);
+        }
+
+        let global_seqno = self.global_seqno();
+        let table_seqno = seqno.saturating_sub(global_seqno);
+
+        // Table is entirely above the snapshot — no key is visible.
+        if self.metadata.seqnos.0 >= table_seqno {
+            return Ok(results);
+        }
+
+        // Filter the input through the bloom filter once. The
+        // filter resource (mmap / Arc) is fetched lazily by
+        // check_bloom on the first call; subsequent calls reuse
+        // it through the table-internal cache.
+        let mut passing: Vec<usize> = Vec::with_capacity(sorted_keys.len());
+        #[cfg(feature = "metrics")]
+        let mut had_filter = false;
+        for (i, (key, hash)) in sorted_keys.iter().enumerate() {
+            let bloom = self.check_bloom(key, *hash)?;
+            if !bloom.should_skip() {
+                passing.push(i);
+                #[cfg(feature = "metrics")]
+                if bloom.has_filter() {
+                    had_filter = true;
+                }
+            }
+        }
+        if passing.is_empty() {
+            return Ok(results);
+        }
+
+        // Seek the block index once at the smallest passing key.
+        // forward_reader returns the first block whose end_key
+        // can cover that key; everything past it walks forward.
+        let first_key = sorted_keys[passing[0]].0;
+        let Some(mut block_iter) = self.block_index.forward_reader(first_key, table_seqno) else {
+            return Ok(results);
+        };
+
+        // Two-pointer walk: outer loop advances block_iter, inner
+        // loop drains passing keys that fall inside the current
+        // block's range. Both sides are monotone (sorted by the
+        // same comparator), so each side advances at most once
+        // per pair.
+        let mut p = 0_usize;
+        while p < passing.len() {
+            let Some(handle_result) = block_iter.next() else {
+                break;
+            };
+            let block_handle = handle_result?;
+            let end_key = block_handle.end_key();
+
+            // Lazy load: only fetch the data block if at least
+            // one passing key falls into this block's range.
+            // Most blocks will contain at least one key (we
+            // seeked here precisely because the first key did),
+            // but bloom may have skipped enough later keys that
+            // the next passing one is in a later block — in
+            // which case we skip the load.
+            let first_in_block = sorted_keys[passing[p]].0;
+            if self.comparator.compare(first_in_block, end_key) == std::cmp::Ordering::Greater {
+                // The next passing key is BEYOND this block's
+                // range. Skip the load and advance to the next
+                // block in the index.
+                continue;
+            }
+
+            let data_block = self.load_data_block(block_handle.as_ref())?;
+
+            // Drain passing keys that are <= end_key.
+            while p < passing.len() {
+                let key_idx = passing[p];
+                let key = sorted_keys[key_idx].0;
+                if self.comparator.compare(key, end_key) == std::cmp::Ordering::Greater {
+                    // Belongs to a later block.
+                    break;
+                }
+                if let Some(mut item) = data_block.point_read(key, table_seqno, &self.comparator)? {
+                    // Translate table-local seqno back to the
+                    // global coordinate so callers can compare
+                    // results across tables/memtables (matches
+                    // Table::get's contract).
+                    item.key.seqno = item.key.seqno.saturating_add(global_seqno);
+                    results[key_idx] = Some(item);
+                }
+                p += 1;
+            }
+        }
+
+        #[cfg(feature = "metrics")]
+        {
+            use std::sync::atomic::Ordering::Relaxed;
+            // Mirror Table::get's accounting: count negative
+            // point lookups that reached storage despite a
+            // filter being present. Only keys that passed bloom
+            // AND came back empty count.
+            if had_filter {
+                let negative_with_filter =
+                    passing.iter().filter(|&&i| results[i].is_none()).count();
+                if negative_with_filter > 0 {
+                    // filter_queries is AtomicUsize; the count is
+                    // already a usize, no conversion needed.
+                    self.metrics
+                        .filter_queries
+                        .fetch_add(negative_with_filter, Relaxed);
+                }
+            }
+        }
+
+        Ok(results)
+    }
+
     /// Creates a scanner over the `Table`.
     ///
     /// The scanner is ĺogically the same as a normal iter(),
