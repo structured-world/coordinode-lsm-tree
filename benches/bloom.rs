@@ -87,11 +87,14 @@ fn measure_with_percentiles<F: FnMut()>(label: &str, iters: u64, mut body: F) ->
     samples.sort_unstable();
     let n = samples.len().max(1);
     // Integer percentile indices — avoids f64 cast lint trips and
-    // float-rounding edge cases. p99 = floor(n * 99 / 100),
-    // p999 = floor(n * 999 / 1000), both clamped to n-1.
+    // float-rounding edge cases. Base the math on `last = n - 1`
+    // (last valid index) so the indices never saturate at the
+    // maximum for exact-boundary sample counts (e.g., for n=100 we
+    // must not pick samples[99] for p99 — that's p100, not p99).
     let p50 = samples[n / 2];
-    let p99_idx = (n.saturating_mul(99) / 100).min(n - 1);
-    let p999_idx = (n.saturating_mul(999) / 1000).min(n - 1);
+    let last = n - 1;
+    let p99_idx = last.saturating_mul(99) / 100;
+    let p999_idx = last.saturating_mul(999) / 1000;
     let p99 = samples[p99_idx];
     let p999 = samples[p999_idx];
     eprintln!(
