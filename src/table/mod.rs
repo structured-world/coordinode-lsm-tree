@@ -483,10 +483,9 @@ impl Table {
     ///
     /// `key_hash` **must** equal `crate::hash::hash64(key)` — the
     /// same function the writer used when populating the bloom
-    /// filter. Bloom decisions inside [`Self::check_bloom`] are
-    /// driven by the hash, not the key bytes, and the
-    /// key↔hash agreement check is a `debug_assert!` only:
-    /// release builds trust the caller. Passing a wrong hash in
+    /// filter. The internal bloom check is driven by the hash,
+    /// not the key bytes, and the key↔hash agreement check is
+    /// a `debug_assert!` only: release builds trust the caller. Passing a wrong hash in
     /// release produces false-negative skips — keys are silently
     /// dropped from the result vector as if they weren't in the
     /// table. Callers should derive both values from the same
@@ -509,8 +508,17 @@ impl Table {
     ///
     /// `batch_get` collapses all three:
     ///
-    /// 1. Filter pointer fetched once; the loop just checks N
-    ///    hashes against it.
+    /// 1. Filter probed once per key in a tight loop. For
+    ///    monolithic filters (the default) the filter block is
+    ///    fetched once and the loop just checks N hashes
+    ///    against it. For partitioned filters
+    ///    (`pinned_filter_index` / `filter_tli`), each probe
+    ///    still seeks the partition index and may load the
+    ///    relevant partition block lazily — so "one filter
+    ///    fetch total" only holds in the monolithic case;
+    ///    partitioned filters amortise loads across keys that
+    ///    land in the same partition rather than across the
+    ///    whole batch.
     /// 2. Block-index seek runs once at the smallest passing
     ///    key, then the iterator walks forward across the
     ///    sorted input — no re-seek per key.
@@ -640,23 +648,61 @@ impl Table {
 
             let data_block = self.load_data_block(block_handle.as_ref())?;
 
-            // Drain passing keys that are <= end_key.
+            // Drain passing keys that fall inside [..end_key].
+            //
+            // Three-way handling mirrors Table::point_read_inner's
+            // end-key boundary check:
+            //   - Greater (key > end_key): key belongs to a later
+            //     block. Break inner loop, advance outer.
+            //   - Less    (key < end_key): key is strictly inside
+            //     this block. point_read decides; either way the
+            //     key cannot continue into the next block (block
+            //     keys are sorted, and a later block's first key
+            //     is > this block's end_key), so we always advance
+            //     p — set Some on hit, leave None on miss.
+            //   - Equal   (key == end_key): block end_key matches
+            //     the query exactly. point_read may return None
+            //     even when a visible version of THIS user key
+            //     exists in the NEXT block (same-key spans block
+            //     boundary — common with MVCC versions of a hot
+            //     key). On None, do NOT advance p — break out so
+            //     the next outer iteration loads the next block
+            //     and retries the same key.
             while p < passing.len() {
                 let key_idx = passing[p];
                 let key = sorted_keys[key_idx].0;
-                if self.comparator.compare(key, end_key) == std::cmp::Ordering::Greater {
-                    // Belongs to a later block.
-                    break;
+                match self.comparator.compare(key, end_key) {
+                    std::cmp::Ordering::Greater => break,
+                    std::cmp::Ordering::Less => {
+                        if let Some(mut item) =
+                            data_block.point_read(key, table_seqno, &self.comparator)?
+                        {
+                            // Translate table-local seqno back to
+                            // the global coordinate so callers can
+                            // compare results across tables /
+                            // memtables (matches Table::get's
+                            // contract).
+                            item.key.seqno = item.key.seqno.saturating_add(global_seqno);
+                            results[key_idx] = Some(item);
+                        }
+                        p += 1;
+                    }
+                    std::cmp::Ordering::Equal => {
+                        if let Some(mut item) =
+                            data_block.point_read(key, table_seqno, &self.comparator)?
+                        {
+                            item.key.seqno = item.key.seqno.saturating_add(global_seqno);
+                            results[key_idx] = Some(item);
+                            p += 1;
+                        } else {
+                            // Same user key may continue in the
+                            // next block — leave p in place so the
+                            // outer loop's next iteration retries
+                            // this key against the next block.
+                            break;
+                        }
+                    }
                 }
-                if let Some(mut item) = data_block.point_read(key, table_seqno, &self.comparator)? {
-                    // Translate table-local seqno back to the
-                    // global coordinate so callers can compare
-                    // results across tables/memtables (matches
-                    // Table::get's contract).
-                    item.key.seqno = item.key.seqno.saturating_add(global_seqno);
-                    results[key_idx] = Some(item);
-                }
-                p += 1;
             }
         }
 
