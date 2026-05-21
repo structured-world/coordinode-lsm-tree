@@ -2286,6 +2286,7 @@ fn batch_get_empty_input_returns_empty_results() -> crate::Result<()> {
 }
 
 #[test]
+#[expect(clippy::unwrap_used)]
 fn batch_get_single_block_multiple_keys_returns_in_input_order() -> crate::Result<()> {
     // Three keys, all fall in the same data block (default block
     // size is much larger than the few bytes here).
@@ -2323,6 +2324,7 @@ fn batch_get_single_block_multiple_keys_returns_in_input_order() -> crate::Resul
 }
 
 #[test]
+#[expect(clippy::unwrap_used)]
 fn batch_get_keys_spread_across_blocks_return_correct_values() -> crate::Result<()> {
     // Force one item per data block via tiny block size +
     // rotate_every=1. Then a batch covering keys from different
@@ -2371,6 +2373,7 @@ fn batch_get_keys_spread_across_blocks_return_correct_values() -> crate::Result<
 }
 
 #[test]
+#[expect(clippy::unwrap_used)]
 fn batch_get_missing_keys_return_none_present_keys_return_some() -> crate::Result<()> {
     let items: Vec<_> = ["b", "d", "f"]
         .iter()
