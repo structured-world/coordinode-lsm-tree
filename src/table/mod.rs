@@ -473,11 +473,15 @@ impl Table {
     /// Batch point-read variant of [`Table::get`].
     ///
     /// Each input pair is `(key, key_hash)`. The slice **must be
-    /// sorted ascending by `key` under this table's comparator**.
-    /// Returns one `Option<InternalValue>` per input pair in input
-    /// order: `Some(_)` for found values (including tombstones —
-    /// callers distinguish via [`InternalValue`]'s value type),
-    /// `None` for absent keys.
+    /// strictly sorted ascending by `key` under this table's
+    /// comparator** — duplicate adjacent keys are a caller bug
+    /// (callers should dedup before batching; a duplicate
+    /// suggests a logic error in the query construction) and
+    /// are rejected by a `debug_assert!` in debug builds.
+    /// Returns one `Option<InternalValue>` per input pair in
+    /// input order: `Some(_)` for found values (including
+    /// tombstones — callers distinguish via [`InternalValue`]'s
+    /// value type), `None` for absent keys.
     ///
     /// # Hash contract
     ///
