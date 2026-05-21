@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779382246260,
+  "lastUpdate": 1779383503877,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -7410,6 +7410,84 @@ window.BENCHMARK_DATA = {
             "value": 276736.444202928,
             "unit": "ops/sec (normalized)",
             "extra": "raw: 440786 ops/sec | factor: 0.628 | P50: 2.1us | P99: 4.9us | P99.9: 13.8us\nthreads: 1 | elapsed: 0.45s | num: 200000 | iterations: 3 | runner: seq_wr=225322 rand_rd=738905 cpu=108 composite=36634.4"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "e71ba8f8002045387c11c8947826d919378b34ea",
+          "message": "ci(security): pin all GitHub Actions to commit SHAs (#275) (#285)\n\n## Summary\n\nPins **every** `uses:` reference across **all** active workflow files to\na full commit SHA, then layers explicit zizmor-driven hardening on top\nof the same workflows (`persist-credentials: false` everywhere it's\nsafe, explicit `permission-*` scoping on\n`actions/create-github-app-token`, explicit `contents: read` on the OIDC\nrelease job). One PR, two coordinated layers of CI supply-chain\nhardening.\n\nCloses #275.\n\n## Scope\n\nThe original issue (#275) asked for SHA pinning only. Reviewer feedback\nduring the PR (CodeRabbit, zizmor audit findings) flagged that pinning\nalone leaves two adjacent attack surfaces open on the same workflows:\n\n- **artipacked** — `actions/checkout` defaults to writing `GITHUB_TOKEN`\ninto `.git/config`, which can leak through any later\n`actions/upload-artifact` step that captures the working tree.\n- **excessive-permissions** — `actions/create-github-app-token` inherits\nthe App's full installation scope by default.\n\nRather than ship the SHA pinning, then re-open the same files in a\nsecond PR for the hardening, both layers are batched here. The PR diff\nis still bounded to workflow YAML only — no source code or behavioural\nchange to the project itself.\n\n## Why all workflows (not only `coordinode-ci.yml`)\n\nThe issue scoped to `coordinode-ci.yml`, but the threat model is\nidentical for every workflow that uses third-party actions. Doing them\ntogether matches how dependabot will batch-propose updates and avoids\nthe \"one CI hardened, the rest not\" half-state.\n\n## SHA freshness\n\nEvery pin resolves to the SHA of the **latest release** at time of\nwriting — not the SHA that the floating major-tag currently points to. A\nfew floating tags lag behind their own latest patch (e.g.\n`Swatinem/rust-cache@v2` resolved to v2.5.1 when v2.9.1 had been out for\nweeks). Comments alongside each SHA spell out the exact version so\nfuture readers — and dependabot — can compare.\n\n## Pin format\n\n```yaml\n- uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2\n```\n\nBoth the SHA and the version comment live on the same line so the\ndependabot `github-actions` ecosystem can still parse and propose\nminor/patch bumps automatically.\n\n## Hardening details\n\n**persist-credentials: false** is applied on every checkout step in\nworkflows where no later step needs the persisted `GITHUB_TOKEN`\n(`coordinode-ci.yml` lint/test/cross/codecov/no-std, `benchmark.yml`,\n`flamegraph.yml`, `release.yml`, `dependabot-auto-merge.yml`).\n\n**persist-credentials: true** is set **explicitly** on\n`upstream-monitor.yml` and `coordinode-release.yml`, because those\nworkflows do legitimately run `git push origin <branch>` later and need\nthe credential. The explicit `true` (not relying on the default) locks\nthe intent and survives a future \"harden every workflow\" sweep.\n\n**permission-* scoping** on every `actions/create-github-app-token` step\nlists the minimum the workflow actually exercises:\n\n- `benchmark.yml`: contents:write (gh-pages push) + pull-requests:write\n(comment-on-alert)\n- `coordinode-release.yml`: contents:write (release-plz version commits\n+ GH Releases) + pull-requests:write (release PR)\n- `dependabot-auto-merge.yml`: contents:write (squash-merge) +\npull-requests:write (approve + auto-merge)\n\n**explicit contents: read** on `release.yml` job-level permissions,\nsince the job already declared `id-token: write` — declaring any\npermission at job level demotes all others to `none`, which would have\nsilently broken the checkout fetch under any future default-token policy\ntightening.\n\n## Action inventory (unique refs, all pinned to latest SHA)\n\n| Action | Pinned to | Version |\n|---|---|---|\n| `actions/checkout` | `de0fac2e…` | v6.0.2 |\n| `actions/github-script` | `3a2844b7…` | v9.0.0 |\n| `actions/create-github-app-token` | `bcd2ba49…` | v3.2.0 |\n| `dtolnay/rust-toolchain` (stable) | `29eef336…` | stable channel tip |\n| `dtolnay/rust-toolchain` (nightly) | `5b842231…` | nightly channel tip\n|\n| `Swatinem/rust-cache` | `c1937114…` | v2.9.1 |\n| `taiki-e/install-action` (nextest) | `1ef5c5f5…` | sub-action tip |\n| `taiki-e/install-action` (cargo-llvm-cov) | `6bd9352a…` | sub-action\ntip |\n| `codecov/codecov-action` | `e79a6962…` | v6.0.1 |\n| `benchmark-action/github-action-benchmark` | `52576c92…` | v1.22.1 |\n| `peaceiris/actions-gh-pages` | `84c30a85…` | v4.1.0 |\n| `release-plz/action` | `064f4d1e…` | v0.5.129 |\n| `rust-lang/crates-io-auth-action` | `bbd81622…` | v1.0.4 |\n| `dependabot/fetch-metadata` | `25dd0e34…` | v3.1.0 |\n\n## Disabled / reference workflows\n\n`test.yml.disabled` (the upstream-test-matrix reference, kept for future\nmerges from fjall-rs/lsm-tree) was moved out of `.github/workflows/` to\n`.github/disabled/test.yml` — GitHub already ignored it (no\n`.yml`/`.yaml` extension after the disable), but security scanners scan\nevery file in `.github/workflows/` regardless of extension and would\nstill flag its unpinned refs against this repo. Out of the workflows dir\n→ out of the scanner's default scope.\n\n## Files touched\n\nNine active workflow files + one moved reference:\n\n```\n.github/workflows/benchmark.yml\n.github/workflows/cleanup-branches.yml\n.github/workflows/coordinode-ci.yml\n.github/workflows/coordinode-release.yml\n.github/workflows/dependabot-auto-merge.yml\n.github/workflows/flamegraph.yml\n.github/workflows/issue-labeler.yml\n.github/workflows/release.yml\n.github/workflows/upstream-monitor.yml\n.github/disabled/test.yml  (renamed from .github/workflows/test.yml.disabled)\n```\n\n## Test plan\n\n- [x] Every active `uses:` reference resolves to a 40-hex SHA: `grep -rE\n\"uses:\\s+\\S+@[a-zA-Z0-9._/-]+\" .github/workflows/ | grep -vE\n\"@[0-9a-f]{40}\\s\"` returns empty\n- [x] No workflow file behaviorally changed in a way that breaks its\nexisting job — every `persist-credentials: false` site is matched to \"no\nlater git push from default identity\"; every `persist-credentials: true`\nsite is matched to \"later step needs `git push`\"\n- [x] Every `actions/create-github-app-token` step lists only the\npermissions its workflow exercises (no defaults inherited)\n- [x] Comments preserve human-readable version + inline rationale so\ndependabot can update minor/patch and future readers can audit the scope\ndecisions\n- [ ] CI workflows succeed on this PR (the actual proof — they execute\nthe pinned SHAs)\n- [ ] Dependabot opens a follow-up bump when any action publishes a new\npatch (automatic)\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n\n## Summary by CodeRabbit\n\n* **Chores**\n* Hardened CI/CD workflows by pinning GitHub Actions to specific commit\nSHAs instead of floating version tags for improved security and supply\nchain stability.\n\n<!-- review_stack_entry_start -->\n\n[![Review Change\nStack](https://storage.googleapis.com/coderabbit_public_assets/review-stack-in-coderabbit-ui.svg)](https://app.coderabbit.ai/change-stack/structured-world/coordinode-lsm-tree/pull/285?utm_source=github_walkthrough&utm_medium=github&utm_campaign=change_stack)\n\n<!-- review_stack_entry_end -->\n\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-05-21T17:08:12Z",
+          "tree_id": "8269a834805810b1159ed3a2938e6ce4ca0f3220",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/e71ba8f8002045387c11c8947826d919378b34ea"
+        },
+        "date": 1779383502268,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 853180.5423952123,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 1869786 ops/sec | factor: 0.456 | P50: 0.4us | P99: 1.7us | P99.9: 3.7us\nthreads: 1 | elapsed: 0.11s | num: 200000 | iterations: 3 | runner: seq_wr=348913 rand_rd=1115977 cpu=117 composite=50405.6"
+          },
+          {
+            "name": "fillrandom",
+            "value": 477100.19943380484,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 1045588 ops/sec | factor: 0.456 | P50: 0.8us | P99: 2.4us | P99.9: 5.8us\nthreads: 1 | elapsed: 0.19s | num: 200000 | iterations: 3 | runner: seq_wr=348913 rand_rd=1115977 cpu=117 composite=50405.6"
+          },
+          {
+            "name": "readrandom",
+            "value": 226583.83278904043,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 496569 ops/sec | factor: 0.456 | P50: 1.8us | P99: 5.0us | P99.9: 10.1us\nthreads: 1 | elapsed: 0.40s | num: 200000 | iterations: 3 | runner: seq_wr=348913 rand_rd=1115977 cpu=117 composite=50405.6"
+          },
+          {
+            "name": "readseq",
+            "value": 1462611.614388171,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 3205383 ops/sec | factor: 0.456 | P50: 0.2us | P99: 3.2us | P99.9: 5.8us\nthreads: 1 | elapsed: 0.06s | num: 200000 | iterations: 3 | runner: seq_wr=348913 rand_rd=1115977 cpu=117 composite=50405.6"
+          },
+          {
+            "name": "seekrandom",
+            "value": 169973.17485509915,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 372504 ops/sec | factor: 0.456 | P50: 2.3us | P99: 5.3us | P99.9: 9.9us\nthreads: 1 | elapsed: 0.54s | num: 200000 | iterations: 3 | runner: seq_wr=348913 rand_rd=1115977 cpu=117 composite=50405.6"
+          },
+          {
+            "name": "prefixscan",
+            "value": 96270.09176472563,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 210980 ops/sec | factor: 0.456 | P50: 4.4us | P99: 5.5us | P99.9: 11.4us\nthreads: 1 | elapsed: 0.95s | num: 200000 | iterations: 3 | runner: seq_wr=348913 rand_rd=1115977 cpu=117 composite=50405.6"
+          },
+          {
+            "name": "overwrite",
+            "value": 493294.76748051157,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 1081079 ops/sec | factor: 0.456 | P50: 0.8us | P99: 2.3us | P99.9: 5.2us\nthreads: 1 | elapsed: 0.19s | num: 200000 | iterations: 3 | runner: seq_wr=348913 rand_rd=1115977 cpu=117 composite=50405.6"
+          },
+          {
+            "name": "mergerandom",
+            "value": 357963.21609752026,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 784493 ops/sec | factor: 0.456 | P50: 0.4us | P99: 0.6us | P99.9: 3.3us\nthreads: 1 | elapsed: 0.25s | num: 200000 | iterations: 3 | runner: seq_wr=348913 rand_rd=1115977 cpu=117 composite=50405.6"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 211092.96031016385,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 462620 ops/sec | factor: 0.456 | P50: 2.0us | P99: 4.3us | P99.9: 9.6us\nthreads: 1 | elapsed: 0.43s | num: 200000 | iterations: 3 | runner: seq_wr=348913 rand_rd=1115977 cpu=117 composite=50405.6"
           }
         ]
       }
