@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779345682802,
+  "lastUpdate": 1779371758597,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -7176,6 +7176,84 @@ window.BENCHMARK_DATA = {
             "value": 276205.6366731072,
             "unit": "ops/sec (normalized)",
             "extra": "raw: 433336 ops/sec | factor: 0.637 | P50: 2.1us | P99: 5.7us | P99.9: 14.4us\nthreads: 1 | elapsed: 0.46s | num: 200000 | iterations: 3 | runner: seq_wr=223279 rand_rd=716078 cpu=109 composite=36084.5"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "e6ef1d4564e119899868a3d7d1eab020bc04a3ba",
+          "message": "test(bench): P99/P999 tail-latency reporting for BuRR/ribbon probes (#271) (#281)\n\n## Summary\n\nAdds P99/P999 tail-latency reporting to the BuRR and standard-Ribbon\nprobe benches in `benches/bloom.rs`. Criterion's default analysis\nsurfaces only mean+CI and hides tail regressions — the percentile output\nmakes those visible across runs.\n\nCloses #271.\n\n## How it works\n\nReplaces `b.iter` with `b.iter_custom` on the three probe paths (each ×\n3 FPR levels — 9 bench functions total):\n\n- `burr filter contains (probe-only)`\n- `burr filter contains (decode+probe)`\n- `standard ribbon contains`\n\nEach closure routes through a new `measure_with_percentiles` helper\nthat:\n\n1. Records every iteration's `Duration` into a fixed-size reservoir\n(Vitter's Algorithm R, `MAX_SAMPLES = 10_000`, ~160 KB worst-case memory\ncap regardless of how many iters criterion picks).\n2. Sorts the samples and prints `[<label>] P50=X P99=Y P999=Z\n(n=samples/iters)` to stderr alongside criterion's own report.\n3. Returns outer wall-clock duration to criterion (NOT sum of per-iter\n`elapsed`) — captures `Instant::now()` overhead and reservoir\nbookkeeping so the mean estimate isn't under-reported.\n\nReplacement RNG is a deterministic LCG (results don't depend on system\nRNG availability or quality).\n\n## Quality fixes applied during review\n\n| # | Fix |\n|---|---|\n| 32-bit safety | Reservoir index math stays in `u64` until after the `<\nMAX_SAMPLES as u64` bounds check (avoids\n`usize::try_from(...).unwrap_or(MAX_SAMPLES)` mapping out-of-range to\nin-range on 32-bit). |\n| `iters as usize` truncation | `cap =\nusize::try_from(iters.min(MAX_SAMPLES as u64))` — lossless on 32-bit. |\n| Percentile index math | Pure integer: `let last = n - 1; let p99 =\nlast * 99 / 100;`. Avoids `f64` cast lint trips AND the off-by-one where\n`n=100` would pick `samples[99]` (= p100) instead of p99. |\n| Hot-loop modulo | Probe body uses `probe_idx += 1; if probe_idx == len\n{ probe_idx = 0; }` instead of `idx % len` — modulo compiles to a div\nand skews sub-microbench timings + tails. |\n| Probe-vs-RNG isolation | Probe hashes / keys precomputed outside the\ntimed body so percentiles reflect ONLY probe work, not RNG sampling +\n`hash64()` overhead. Smoke run before/after shows P50 dropped from 458\nns (mixed cost) to 125-167 ns (clean probe cost). |\n| Clone elimination | Probe arrays borrow from the existing `hashes` /\n`keys` vecs directly (`&hashes[..keys.len()]`, `&keys`) — no full-vec\nclone per FPR level. |\n| Reset early-warmup panic | `if iters == 0 { return Duration::ZERO; }`\nguard at top of helper — criterion legitimately probes with `iters=0`\nduring warmup, otherwise the empty samples vec would OOB on percentile\nindexing. |\n\n## Why not hdrhistogram\n\nThe issue suggested HDR histogram. Equivalent percentile accuracy is\nachievable via reservoir + sort with zero added dependencies, matching\nthe pattern shipping in `benches/merge.rs` (PR #279). If\nprecision-sensitive callers need fixed-precision tail accounting later,\n`hdrhistogram` can be swapped in transparently behind the same helper\nsignature.\n\n## Smoke run output\n\nP99/P999 reporting catches what mean+CI hides (sample, current code):\n\n```\n[burr filter contains (probe-only), true positive (FPR=1%)] P50=125.00ns P99=875.00ns  P999=875.00ns  (n=16/16)\n[burr filter contains (probe-only), true positive (FPR=1%)] P50=167.00ns P99=291.00ns  P999=291.00ns  (n=4/4)\n```\n\nP50 settles at ~125-167 ns. P99 spikes captured for tail diff across\nruns.\n\n## Test plan\n\n- [x] `cargo check --bench bloom` — clean\n- [x] `cargo clippy --bench bloom -- -D warnings` — clean\n- [x] Smoke `cargo bench --bench bloom -- --quick` — percentile lines\nemit as expected\n- [x] No production code changed — benches only",
+          "timestamp": "2026-05-21T16:54:33+03:00",
+          "tree_id": "33c274b6974e7c789db51a3e164d3f6f16826964",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/e6ef1d4564e119899868a3d7d1eab020bc04a3ba"
+        },
+        "date": 1779371756636,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 1140611.3390462352,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 1992172 ops/sec | factor: 0.573 | P50: 0.4us | P99: 2.1us | P99.9: 5.1us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3 | runner: seq_wr=228283 rand_rd=841011 cpu=123 composite=40171.4"
+          },
+          {
+            "name": "fillrandom",
+            "value": 547223.6699730112,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 955771 ops/sec | factor: 0.573 | P50: 0.8us | P99: 3.0us | P99.9: 11.5us\nthreads: 1 | elapsed: 0.21s | num: 200000 | iterations: 3 | runner: seq_wr=228283 rand_rd=841011 cpu=123 composite=40171.4"
+          },
+          {
+            "name": "readrandom",
+            "value": 241037.70495008994,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 420992 ops/sec | factor: 0.573 | P50: 2.2us | P99: 5.8us | P99.9: 15.6us\nthreads: 1 | elapsed: 0.48s | num: 200000 | iterations: 3 | runner: seq_wr=228283 rand_rd=841011 cpu=123 composite=40171.4"
+          },
+          {
+            "name": "readseq",
+            "value": 1404790.4645852381,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 2453583 ops/sec | factor: 0.573 | P50: 0.2us | P99: 3.9us | P99.9: 7.6us\nthreads: 1 | elapsed: 0.08s | num: 200000 | iterations: 3 | runner: seq_wr=228283 rand_rd=841011 cpu=123 composite=40171.4"
+          },
+          {
+            "name": "seekrandom",
+            "value": 181365.3359886335,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 316770 ops/sec | factor: 0.573 | P50: 2.8us | P99: 6.4us | P99.9: 16.5us\nthreads: 1 | elapsed: 0.63s | num: 200000 | iterations: 3 | runner: seq_wr=228283 rand_rd=841011 cpu=123 composite=40171.4"
+          },
+          {
+            "name": "prefixscan",
+            "value": 100875.80555704111,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 176188 ops/sec | factor: 0.573 | P50: 5.3us | P99: 7.1us | P99.9: 19.1us\nthreads: 1 | elapsed: 1.14s | num: 200000 | iterations: 3 | runner: seq_wr=228283 rand_rd=841011 cpu=123 composite=40171.4"
+          },
+          {
+            "name": "overwrite",
+            "value": 580611.9410274102,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 1014087 ops/sec | factor: 0.573 | P50: 0.8us | P99: 2.9us | P99.9: 6.9us\nthreads: 1 | elapsed: 0.20s | num: 200000 | iterations: 3 | runner: seq_wr=228283 rand_rd=841011 cpu=123 composite=40171.4"
+          },
+          {
+            "name": "mergerandom",
+            "value": 419316.9792774326,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 732372 ops/sec | factor: 0.573 | P50: 0.3us | P99: 1.9us | P99.9: 3.4us\nthreads: 1 | elapsed: 0.27s | num: 200000 | iterations: 3 | runner: seq_wr=228283 rand_rd=841011 cpu=123 composite=40171.4"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 228569.34080954164,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 399215 ops/sec | factor: 0.573 | P50: 2.3us | P99: 4.6us | P99.9: 16.2us\nthreads: 1 | elapsed: 0.50s | num: 200000 | iterations: 3 | runner: seq_wr=228283 rand_rd=841011 cpu=123 composite=40171.4"
           }
         ]
       }
