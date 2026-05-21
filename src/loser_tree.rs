@@ -42,11 +42,14 @@
 //! `present: Vec<bool>` for the discriminants. This eliminates the
 //! `Option` discriminant branch that LLVM emits inside `cmp_indices`
 //! on every game (called O(log cap) times per merger step); the
-//! present-bit fetch is a single byte load that branch-predicts
-//! perfectly under steady-state merging (where leaves stay present
-//! until exhaustion). `cmp_indices` treats absent leaves as
-//! strictly greater than any present value, so exhausted sources
-//! naturally lose every game.
+//! present-bit fetch is a single byte load (in Rust's stdlib
+//! `Vec<bool>` is NOT bit-packed — each `bool` occupies one byte
+//! with valid bit-pattern `0u8`/`1u8`, so `present[i]` lowers to a
+//! single-byte read + zero-compare, not a bit-test) that
+//! branch-predicts perfectly under steady-state merging (where
+//! leaves stay present until exhaustion). `cmp_indices` treats
+//! absent leaves as strictly greater than any present value, so
+//! exhausted sources naturally lose every game.
 //!
 //! All `MaybeUninit::assume_init_*` calls are guarded by a check on
 //! the corresponding `present[i]` bit and never widen the unsafe
