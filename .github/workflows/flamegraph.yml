@@ -45,7 +45,7 @@ jobs:
         run: |
           cargo run --release --manifest-path tools/db_bench/Cargo.toml \
             --features flamegraph -- \
-            --benchmark all --num 100000 --flamegraph --skip-calibration
+            --benchmark all --num 100000 --flamegraph
 
       - name: Generate flamegraph SVG
         run: |
