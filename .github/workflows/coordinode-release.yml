@@ -15,11 +15,22 @@ jobs:
         with:
           app-id: ${{ secrets.RELEASER_APP_ID }}
           private-key: ${{ secrets.RELEASER_APP_PRIVATE_KEY }}
+          # Least-privilege scope: release-plz needs to push version-bump
+          # commits + release-PR branches (contents:write), open the
+          # release PR (pull-requests:write), and create GitHub Releases
+          # (releases is part of contents:write).
+          permission-contents: write
+          permission-pull-requests: write
 
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
         with:
           fetch-depth: 0
+          # persist-credentials: false — release-plz reads the token via
+          # the explicit GITHUB_TOKEN env var on its own steps, NOT via
+          # .git/config. Disabling default credential persistence closes
+          # the artipacked attack surface.
+          persist-credentials: false
           token: ${{ steps.app-token.outputs.token }}
 
       - name: Install Rust toolchain

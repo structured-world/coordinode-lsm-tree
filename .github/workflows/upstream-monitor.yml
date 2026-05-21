@@ -38,6 +38,9 @@ jobs:
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
         with:
           fetch-depth: 0
+          # upstream-monitor only fetches the upstream remote (read-only
+          # git ops); no write operations needed via the persisted token.
+          persist-credentials: false
 
       - name: Add upstream remote
         run: git remote add "$UPSTREAM_REMOTE" "$UPSTREAM_URL"

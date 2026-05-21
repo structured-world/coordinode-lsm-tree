@@ -16,6 +16,10 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          # gh CLI authenticates via the GH_TOKEN env var on the merge
+          # step; no git config credentials are needed here.
+          persist-credentials: false
 
       - name: Dependabot metadata
         id: metadata
@@ -30,6 +34,12 @@ jobs:
         with:
           app-id: ${{ secrets.RELEASER_APP_ID }}
           private-key: ${{ secrets.RELEASER_APP_PRIVATE_KEY }}
+          # Least-privilege: approve PR + enable auto-merge.
+          # pull-requests:write covers approve + enable-auto-merge;
+          # contents:write is required for the actual merge step
+          # (squash-merge writes to the default branch).
+          permission-contents: write
+          permission-pull-requests: write
 
       - name: Approve and enable auto-merge for minor/patch updates
         if: steps.metadata.outputs.update-type == 'version-update:semver-minor' || steps.metadata.outputs.update-type == 'version-update:semver-patch'
