@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779371758597,
+  "lastUpdate": 1779373185124,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -7254,6 +7254,84 @@ window.BENCHMARK_DATA = {
             "value": 228569.34080954164,
             "unit": "ops/sec (normalized)",
             "extra": "raw: 399215 ops/sec | factor: 0.573 | P50: 2.3us | P99: 4.6us | P99.9: 16.2us\nthreads: 1 | elapsed: 0.50s | num: 200000 | iterations: 3 | runner: seq_wr=228283 rand_rd=841011 cpu=123 composite=40171.4"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "9dc97d470f48e3bf4f0d181287ba0814f26c69d4",
+          "message": "feat(merge): SeekingMerger — RocksDB-style dual loser trees (#222) (#284)\n\n## Summary\n\nImplements RocksDB-style merging iterator (**Option A** from #222 design\nexploration). Two independent `LoserTree` instances (forward min +\nbackward max) over `MergeSource` — a new seekable-iter trait — for\nbidirectional iteration with init-time cross-direction migration. Refs\n#222.\n\nThis PR ships the **primitive layer**. Wiring `seek()` into the\ndirection-switch path for sources with independent front/back cursors\n(LSM SST scanners, run readers) is the follow-up #280. Closing the\nsmall-fan-in perf regression vs `BinaryHeap` is the follow-up #283.\n\n## Architecture\n\n```\nSeekingMerger<S: MergeSource>\n  ├── forward_tree:  LoserTree<MergerEntry, EntryCmp>   (min, lazy-init)\n  ├── backward_tree: LoserTree<MergerEntry, EntryCmp>   (max via reversed cmp, lazy-init)\n  ├── sources: Vec<S>\n  └── pending_forward_error / pending_backward_error: Option<Error>\n\nMergeSource trait\n  ├── fn next(&mut self) -> Option<IterItem>\n  ├── fn next_back(&mut self) -> Option<IterItem>\n  └── fn seek(&mut self, target: &InternalKey) -> Result<()>\n\nCoherentMergeSource: MergeSource {}   // marker for shared-cursor sources\n```\n\n### Contracts that ship\n\n| Surface | Semantic |\n|---|---|\n| `MergeSource::seek` | Independent-cursor sources MUST reposition both\ncursors per the per-method doc. Coherent-cursor sources\n(`CoherentMergeSource` marker) MAY no-op — their shared front/back\ncursor already enforces \"no item yielded twice\". |\n| `DoubleEndedIterator for SeekingMerger<S>` | Type-bounded on `S:\nCoherentMergeSource`. Independent-cursor sources are\ntype-system-rejected from `next_back()` calls at compile time until #280\nwires seek into the switch path. |\n| Init data preservation | If a source errors during init, sources that\nsuccessfully prefetched earlier are NOT lost — their values stay in the\ntournament. The error is queued and surfaces on the next call. |\n| Init cross-direction migration | If one direction's init pulls `None`\nfrom an already-exhausted source while the OPPOSITE tree still holds a\nbuffered leaf for that source, the leaf is migrated (via\n`LoserTree::take_slot`) into the init-vec. Prevents silent data loss for\ncases like single source `[a, z]` (`next` yields `a` and prefetches `z`;\n`next_back` would otherwise return `None`). |\n| Error-first contract | Queued errors (from init OR refill, either\ndirection) surface at the top of the very next `next()` / `next_back()`\ncall — they're not buried behind unrelated yields from other sources. |\n| First-error-wins | `pending_*_error` is single-slot (`get_or_insert`).\nMultiple errors collapse to the first; the rest are discarded. |\n| Cross-direction surfacing | A forward refill error surfaces on the\nnext `next_back()` call too (and vice versa) so a caller can't sidestep\nit by switching direction. |\n\n## Bench (criterion --quick, release)\n\n```\nN    MergeHeap   SeekingMerger    Δ\n─────────────────────────────────────────\n 2   17.7 µs     21.0 µs          +18% slower\n 4   42.4 µs     49.5 µs          +17% slower\n 8   99.2 µs     114.2 µs         +15% slower\n16   247.4 µs    262.3 µs         +6%  slower\n30   610.0 µs    569.0 µs         -7%  FASTER\n```\n\nCrossover at N≈20. SeekingMerger wins on large fan-in (compaction, level\nmerges); BinaryHeap wins on small fan-in (typical L0 read). The\nremaining small-N gap is structural (LoserTree per-step constants >\nBinaryHeap on tight loops) and tracked as **#283** with concrete avenues\n(aggressive inlining, drop `Option` wrap via parallel `present` bitmap,\nSoA leaf layout, SIMD comparator).\n\nBench now reports P50/P99/P999 tail latency via `b.iter_custom`\nalongside criterion's mean+CI report.\n\n## What ships\n\n- `src/loser_tree.rs` — generic `LoserTree<E, F>` (Knuth tournament\ntree) with `build` / `peek_min` / `replace_min` / `pop_min` /\n`take_slot` / `winner_slot` / `slots` / `active_count` / `is_empty`. 11\nunit tests. `take_slot(i)` is the migration primitive — O(log cap)\nremoval of an arbitrary leaf with tournament replay.\n- `src/merge_source.rs` — `MergeSource` trait + `CoherentMergeSource:\nMergeSource` marker + `Box<dyn>` blanket impl + `CoherentIterSource`\nadapter (no-op seek for `alloc::vec::IntoIter`, `VecDeque`,\n`BTreeMap::range`). 5 unit tests.\n- `src/seeking_merger.rs` — `SeekingMerger<S: MergeSource>` with 16 unit\ntests covering forward / backward / mixed / empty / single-source /\ninit-error / refill-error / cross-direction-error / init-migration /\nerror-first-ordering scenarios.\n- `benches/merge.rs` — side-by-side `Merge {N} (MergeHeap)` vs `Merge\n{N} (SeekingMerger)` for `N ∈ {2, 4, 8, 16, 30}` with P50/P99/P999\nreporting and zero-based percentile math.\n\n`src/merge.rs` (`Merger` / `MergeHeap`-based) ships unchanged.\nSeekingMerger is an opt-in alternative until production callers migrate.\n\n## Test plan\n\n- [x] 16/16 SeekingMerger unit tests pass\n- [x] 11/11 LoserTree unit tests pass\n- [x] 5/5 MergeSource unit tests pass\n- [x] Full workspace `cargo nextest run` clean — no regression to\nexisting `Merger`\n- [x] `cargo clippy --lib --tests --benches -- -D warnings` clean\n- [x] Bench: SeekingMerger faster at N=30 (compaction), regression on\nN≤16 tracked separately as #283\n\n## Follow-up work for #222 closure\n\nMigrating production callers (`range.rs`, compaction, mvcc_stream) needs\n`MergeSource` impls for:\n\n- `table::iter::Iter` (SST scanner — already has `seek_lower_inclusive`\n/ `seek_upper_inclusive`)\n- `RunReader` (multi-table run iterator)\n- Memtable `range_internal().filter().map(Ok)` chain (needs a seekable\nfilter adapter or push the filter into the source)\n\nPlus closing #283 perf regression so SeekingMerger can be the\nunconditional default. Each piece is bounded; the algorithmic primitives\nare all there. Next PR.\n\n## Related\n\n- #222 — design exploration that selected this approach\n- #280 — wire `MergeSource::seek` into SeekingMerger's direction-switch\npath\n- #283 — close the small-N perf regression vs `BinaryHeap`\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n## Summary by CodeRabbit\n\n* **New Features**\n* Added bidirectional merge iteration and an alternative merge strategy\nvariant for more flexible merging behavior.\n\n* **Performance**\n* Benchmarks enhanced to report tail-latency percentiles (P50/P99/P999)\nfor better visibility into merge performance.\n\n* **Tests**\n* Comprehensive unit tests added to validate merge behavior, edge cases,\nand error handling.\n\n<!-- review_stack_entry_start -->\n\n[![Review Change\nStack](https://storage.googleapis.com/coderabbit_public_assets/review-stack-in-coderabbit-ui.svg)](https://app.coderabbit.ai/change-stack/structured-world/coordinode-lsm-tree/pull/284?utm_source=github_walkthrough&utm_medium=github&utm_campaign=change_stack)\n\n<!-- review_stack_entry_end -->\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-05-21T17:18:23+03:00",
+          "tree_id": "0e4555756769334a67b53fa3909416998cb772c5",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/9dc97d470f48e3bf4f0d181287ba0814f26c69d4"
+        },
+        "date": 1779373183972,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 1137278.0689614706,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 2031598 ops/sec | factor: 0.560 | P50: 0.4us | P99: 2.0us | P99.9: 5.1us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3 | runner: seq_wr=220089 rand_rd=914160 cpu=123 composite=41086.5"
+          },
+          {
+            "name": "fillrandom",
+            "value": 671466.7906580319,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 1199487 ops/sec | factor: 0.560 | P50: 0.7us | P99: 2.5us | P99.9: 5.8us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3 | runner: seq_wr=220089 rand_rd=914160 cpu=123 composite=41086.5"
+          },
+          {
+            "name": "readrandom",
+            "value": 276830.25157677644,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 494521 ops/sec | factor: 0.560 | P50: 1.8us | P99: 5.4us | P99.9: 13.4us\nthreads: 1 | elapsed: 0.40s | num: 200000 | iterations: 3 | runner: seq_wr=220089 rand_rd=914160 cpu=123 composite=41086.5"
+          },
+          {
+            "name": "readseq",
+            "value": 1406513.9324762162,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 2512553 ops/sec | factor: 0.560 | P50: 0.2us | P99: 3.9us | P99.9: 8.1us\nthreads: 1 | elapsed: 0.08s | num: 200000 | iterations: 3 | runner: seq_wr=220089 rand_rd=914160 cpu=123 composite=41086.5"
+          },
+          {
+            "name": "seekrandom",
+            "value": 196554.54890509063,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 351119 ops/sec | factor: 0.560 | P50: 2.5us | P99: 6.1us | P99.9: 14.3us\nthreads: 1 | elapsed: 0.57s | num: 200000 | iterations: 3 | runner: seq_wr=220089 rand_rd=914160 cpu=123 composite=41086.5"
+          },
+          {
+            "name": "prefixscan",
+            "value": 102326.33346077577,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 182793 ops/sec | factor: 0.560 | P50: 5.1us | P99: 6.6us | P99.9: 17.6us\nthreads: 1 | elapsed: 1.09s | num: 200000 | iterations: 3 | runner: seq_wr=220089 rand_rd=914160 cpu=123 composite=41086.5"
+          },
+          {
+            "name": "overwrite",
+            "value": 711298.3943909489,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 1270641 ops/sec | factor: 0.560 | P50: 0.6us | P99: 2.5us | P99.9: 5.7us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3 | runner: seq_wr=220089 rand_rd=914160 cpu=123 composite=41086.5"
+          },
+          {
+            "name": "mergerandom",
+            "value": 403107.17692210415,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 720098 ops/sec | factor: 0.560 | P50: 0.3us | P99: 0.6us | P99.9: 3.4us\nthreads: 1 | elapsed: 0.28s | num: 200000 | iterations: 3 | runner: seq_wr=220089 rand_rd=914160 cpu=123 composite=41086.5"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 247291.63708361433,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 441754 ops/sec | factor: 0.560 | P50: 1.9us | P99: 8.8us | P99.9: 18.2us\nthreads: 1 | elapsed: 0.45s | num: 200000 | iterations: 3 | runner: seq_wr=220089 rand_rd=914160 cpu=123 composite=41086.5"
           }
         ]
       }
