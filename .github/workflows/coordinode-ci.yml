@@ -1,3 +1,9 @@
+# Hardening policy: every `uses:` ref is pinned to a full commit
+# SHA with an inline `# vX.Y.Z` comment; every `actions/checkout`
+# step sets `persist-credentials: false` unless a later step in
+# the same job legitimately runs `git push`. Disabled/reference
+# workflows live in `.github/disabled/`, not here, so audit
+# scanners stay clean.
 name: CoordiNode CI
 
 on:

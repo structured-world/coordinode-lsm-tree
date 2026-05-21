@@ -1,3 +1,9 @@
+# Hardening policy: every `uses:` ref is pinned to a full commit
+# SHA; `actions/checkout` runs with `persist-credentials: false`
+# (this workflow does not push from the default identity — gh-pages
+# results use the App-token-scoped benchmark-action input);
+# `actions/create-github-app-token` lists explicit `permission-*`
+# scopes for the minimum the workflow actually exercises.
 name: Benchmark
 
 on:
