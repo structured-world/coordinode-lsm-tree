@@ -16,6 +16,14 @@ use std::time::{Duration, Instant};
 /// memory budget (~16 bytes × cap = ~160 KB at the default cap),
 /// which is independent of the criterion iteration count.
 const MAX_SAMPLES: usize = 10_000;
+/// `MAX_SAMPLES` re-typed as `u64` so reservoir math can stay
+/// fully in `u64` and only narrow to `usize` after a bounds check
+/// via `usize::try_from`. Declared as a raw literal (not `as u64`
+/// from MAX_SAMPLES) to avoid the boundary cast entirely. A
+/// `const_assert!` would be ideal but adds a dev-dep; the values
+/// must stay equal — keep both lines in sync if MAX_SAMPLES
+/// changes.
+const MAX_SAMPLES_U64: u64 = 10_000;
 
 /// Run `body` repeatedly under criterion, recording per-iteration
 /// durations into a fixed-size reservoir (Vitter's Algorithm R) to
@@ -29,16 +37,20 @@ fn measure_with_percentiles<F: FnMut()>(label: &str, iters: u64, mut body: F) ->
         // samples vec (n.max(1) returns 1 but samples[0] would OOB).
         return Duration::ZERO;
     }
-    // Lossless clamp: bound `iters` by MAX_SAMPLES as u64 first,
-    // then convert via try_from — avoids `iters as usize`
-    // truncation on 32-bit targets, lint-clean.
-    let cap = usize::try_from(iters.min(MAX_SAMPLES as u64)).unwrap_or(MAX_SAMPLES);
+    // Lossless clamp: bound `iters` by MAX_SAMPLES_U64 first, then
+    // convert via try_from — avoids `iters as usize` truncation on
+    // 32-bit targets, lint-clean.
+    let cap = usize::try_from(iters.min(MAX_SAMPLES_U64)).unwrap_or(MAX_SAMPLES);
     let mut samples: Vec<Duration> = Vec::with_capacity(cap);
     // Deterministic LCG for reservoir replacement — perf benches
     // should not depend on system RNG availability/quality.
+    // label.len() → u64 via try_from per the project conversion
+    // rule. saturating_add(1) keeps the multiplier non-zero even
+    // for the impossible case of label.len() == u64::MAX.
+    let label_len_u64 = u64::try_from(label.len()).unwrap_or(u64::MAX);
     let mut rng_state: u64 = 0xCAFE_F00D_DEAD_BEEF_u64
         .wrapping_add(iters)
-        .wrapping_mul(label.len() as u64 + 1);
+        .wrapping_mul(label_len_u64.saturating_add(1));
     let next_rand = |state: &mut u64| -> u64 {
         *state = state
             .wrapping_mul(6364136223846793005)
@@ -155,7 +167,7 @@ fn mvcc_stream(c: &mut Criterion) {
                     table.insert(InternalValue::from_components(
                         key.to_string(),
                         vec![],
-                        num as u64,
+                        u64::try_from(num).unwrap_or(u64::MAX),
                         lsm_tree::ValueType::Value,
                     ));
                 }

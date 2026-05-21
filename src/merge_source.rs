@@ -88,10 +88,15 @@ pub trait MergeSource: Send {
     /// remaining range from both ends — MAY treat seek as a no-op.
     /// Their cursor discipline already guarantees "no item yielded
     /// twice" under mixed-direction consumption without any
-    /// explicit reposition. `SeekingMerger` only invokes seek on
-    /// the direction-switch path that needs it (i.e., on sources
-    /// without the marker), so coherent sources pay nothing for
-    /// the no-op.
+    /// explicit reposition.
+    ///
+    /// The current MVP `SeekingMerger` does NOT actually invoke
+    /// `seek()` at all — `DoubleEndedIterator` is type-gated on
+    /// `CoherentMergeSource` and relies on the marker's coherence
+    /// promise. Once the seek-aware direction-switch path (issue
+    /// #280) lands, `SeekingMerger` WILL invoke `seek()` on
+    /// non-coherent sources at the direction-switch boundary;
+    /// coherent sources will still pay nothing for the no-op.
     ///
     /// Returns `Err` if seek requires I/O (SST scanner reseek, run
     /// header re-read) and that I/O fails. Corruption errors
