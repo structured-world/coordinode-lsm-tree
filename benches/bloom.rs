@@ -40,6 +40,13 @@ const MAX_SAMPLES: usize = 10_000;
 /// percentile summary to stderr so cross-run diffs can spot tail
 /// regressions that the mean+CI report would hide.
 fn measure_with_percentiles<F: FnMut()>(label: &str, iters: u64, mut body: F) -> Duration {
+    if iters == 0 {
+        // Criterion can legitimately call iter_custom with iters == 0
+        // during early-warmup probing. Without this guard the
+        // percentile indexing below would underflow on an empty
+        // samples vec (n.max(1) returns 1 but samples[0] would OOB).
+        return Duration::ZERO;
+    }
     let cap = MAX_SAMPLES.min(iters as usize);
     let mut samples: Vec<Duration> = Vec::with_capacity(cap);
     let mut total = Duration::ZERO;
