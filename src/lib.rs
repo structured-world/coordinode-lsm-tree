@@ -157,6 +157,7 @@ mod ingestion;
 mod iter_guard;
 mod key;
 mod key_range;
+mod loser_tree;
 mod manifest;
 mod memtable;
 mod merge_operator;
@@ -165,6 +166,11 @@ mod run_scanner;
 
 #[doc(hidden)]
 pub mod merge;
+
+#[doc(hidden)]
+pub mod merge_source;
+#[doc(hidden)]
+pub mod seeking_merger;
 
 #[cfg(feature = "metrics")]
 pub(crate) mod metrics;
