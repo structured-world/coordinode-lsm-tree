@@ -7,18 +7,61 @@
 name: Benchmark
 
 on:
+  # Auto-triggered ONLY on merges/pushes to main; also runnable
+  # manually from any branch via workflow_dispatch (see below).
+  # `pull_request` is deliberately omitted: the self-hosted bench
+  # host is shared with future cross-engine benches (issue #244)
+  # and other perf workloads — every PR pushing a commit would
+  # queue behind the host's serial concurrency group and hold up
+  # every subsequent PR, even when the change can't affect the
+  # bench (CI, docs, comment-only fixes). Restricting the
+  # AUTO-trigger to main keeps the bench timeline a clean "one
+  # entry per merged change" series, which is what the gh-pages
+  # dashboard is meant to show. Manual runs through
+  # workflow_dispatch don't update the dashboard's main-branch
+  # series (auto-push gating below is push+main only), so they
+  # can't contaminate the trend.
   push:
     branches: [main]
-  pull_request:
-    branches: [main]
+  # Manual dispatch from any branch when a contributor explicitly
+  # wants to measure their PR against main before merging.
+  # workflow_dispatch requires actions:write on the repo, so only
+  # owner / maintainers can fire it — fork PR authors cannot.
+  workflow_dispatch:
+
+# Strict serialisation across the entire repo: the self-hosted
+# bench host is shared with future cross-engine benches (RocksDB
+# vs lsm-tree per issue #244) and any other perf workload. Two
+# benches running simultaneously contaminate each other's CPU /
+# disk / cache state and the published numbers become unreadable.
+# `cancel-in-progress: false` makes queued runs wait their turn
+# instead of clobbering the in-flight bench — every measurement
+# completes on a quiet host.
+concurrency:
+  group: bench-self-hosted
+  cancel-in-progress: false
 
 jobs:
   benchmark:
     name: Performance regression check
-    runs-on: ubuntu-latest
+    # Self-hosted bare-metal runner. Shared GitHub-hosted runners
+    # have ±15-20% noise on every db_bench workload — large enough
+    # to hide every win below ~20% and produce false-positive
+    # regression alerts. The self-hosted host has stable thermal
+    # state, no CPU contention from other jobs, and consistent
+    # disk I/O — bench delta becomes interpretable per merged
+    # commit on main instead of needing 20+ iteration medians to
+    # escape the noise floor. (Per-PR comparison is available via
+    # the `workflow_dispatch` manual trigger above; routine PR
+    # pushes do not auto-queue against this runner.) Label
+    # `gpu-private-systems` targets that specific host; other
+    # self-hosted runners (if added later) without the label
+    # won't pick the job up.
+    runs-on: [self-hosted, gpu-private-systems]
     timeout-minutes: 30
     steps:
-      # v6 requires runner ≥2.327.1 (node24 runtime) — github-hosted ubuntu-latest satisfies this.
+      # v6 requires runner ≥2.327.1 (node24 runtime) — the self-hosted
+      # runner has a current runner agent that satisfies this.
       # persist-credentials: false — git pushes from this workflow use the
       # explicit App token generated below, NOT the runner's GITHUB_TOKEN
       # written to .git/config. Disabling the default credential persistence
@@ -33,7 +76,21 @@ jobs:
 
       - name: Generate bot token
         id: bot-token
-        if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
+        # `push` and `workflow_dispatch` are both trusted contexts on
+        # this repo (workflow_dispatch requires actions:write, which
+        # only owner/maintainers hold — fork PRs can't trigger it).
+        # The `pull_request` clause exists for paranoia: if the
+        # trigger list is ever expanded to include `pull_request`,
+        # only same-repo PRs get the token (fork PRs would still be
+        # blocked). On `workflow_dispatch` the `github.event.pull_request`
+        # context is absent, so the `pull_request` branch is gated by
+        # `github.event_name == 'pull_request'` to avoid evaluating
+        # a missing context.
+        if: >
+          github.event_name == 'push' ||
+          github.event_name == 'workflow_dispatch' ||
+          (github.event_name == 'pull_request' &&
+           github.event.pull_request.head.repo.full_name == github.repository)
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1  # v3.2.0
         with:
           app-id: ${{ secrets.RELEASER_APP_ID }}
