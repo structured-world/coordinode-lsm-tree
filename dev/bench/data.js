@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779391017014,
+  "lastUpdate": 1779394603632,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -7566,6 +7566,84 @@ window.BENCHMARK_DATA = {
             "value": 231179.69431320584,
             "unit": "ops/sec (normalized)",
             "extra": "raw: 356623 ops/sec | factor: 0.648 | P50: 2.5us | P99: 9.1us | P99.9: 16.9us\nthreads: 1 | elapsed: 0.56s | num: 200000 | iterations: 3 | runner: seq_wr=223428 rand_rd=687898 cpu=108 composite=35480.4"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "c5a35be3cc7fc36b436ac9c740098263ae9e7187",
+          "message": "feat(range): wire SeekingMerger into Tree::range read path (#222) (#288)\n\n## Summary\n\nCloses #222.\n\nPRs #284 / #286 / #287 built and optimised `SeekingMerger`\n(loser-tree-based merging iterator) end-to-end. The bench delta against\n`MergeHeap`-backed `Merger`:\n\n| N | MergeHeap (prev prod) | SeekingMerger (now prod) | Δ |\n|---:|---:|---:|---:|\n| 2 | 16.4 µs | **15.3 µs** | **-6.7%** |\n| 4 | 39.1 µs | **37.6 µs** | **-3.8%** |\n| 8 | 91.7 µs | **89.2 µs** | **-2.7%** |\n| 16 | 241.4 µs | **213.8 µs** | **-11.4%** |\n| 30 | 570.7 µs | **455.7 µs** | **-20.2%** |\n\nUntil now those wins lived only in the bench — production read paths in\n`range.rs` were still going through `Merger::new(...)`. This PR replaces\nboth call sites with a new `build_seeking(...)` helper that wraps each\n`Vec<BoxedIterator<'a>>` (boxed double-ended source iters from memtables\n/ runs / tables) into a `SeekingMerger<Box<dyn CoherentMergeSource +\n'a>, SharedComparator>` via the `CoherentIterSource` adapter. The\nadapter's coherent-cursor contract is satisfied by every iterator we\nfeed in (each shares a single front/back cursor over its remaining range\n— std vec/btree style).\n\n## Scope\n\n**Switched to SeekingMerger:**\n\n- `range.rs:395` — point-read range merge (single-key range, used by\n`Tree::get`-via-range pipeline + MVCC + RT suppression)\n- `range.rs:756` — `create_range` path (the main `Tree::range` iterator)\n\n**Left on legacy `Merger` (out of scope):**\n\n- `abstract_tree.rs:213` — flush merger. Output goes to\n`CompactionStream` which only needs forward `Iterator`; flush is not a\nread-path hotspot, and switching it would require additional\nverification of the write path.\n- `compaction/worker.rs:202` — compaction merger. Compaction `Scanner`s\nare forward-only (`CompactionReader = Box<dyn Iterator<...>>`), and\n`MergeSource` requires `next_back`. Replacing compaction's merger is a\nseparate refactor (either drop `next_back` from `MergeSource`, or build\na forward-only `SeekingMerger` variant).\n\n## Why the helper\n\nThe conversion `Vec<BoxedIterator<'a>>` → `Vec<Box<dyn\nCoherentMergeSource + 'a>>` is identical at both call sites, and the\ntrait-object cast (`as Box<dyn CoherentMergeSource + 'a>`) is annoyingly\nverbose inline. Factoring into `build_seeking` keeps the call sites a\nsingle line each and centralises the \"we promise these iterators are\ncoherent\" rationale in one place (the helper's doc comment).\n\nThe helper signature deliberately fixes `C = SharedComparator` (=\n`Arc<dyn UserComparator>`): `range.rs` already holds the canonical\nshared comparator, and the blanket `impl UserComparator for Arc<T>` from\nPR #287 makes it satisfy `C: UserComparator + Clone` without any API\nchange. Production callers don't get the full monomorphisation win that\nthe bench shows for `DefaultUserComparator` (the Arc indirection stays),\nbut they DO get:\n\n- Loser-tree's K-1-comparison structural advantage\n- Closure-in-a-box dispatch removed\n- Per-cmp direction branch removed (`MinCmp` vs `MaxCmp`)\n- `MaybeUninit + present byte-map` cache-friendly leaf layout\n\n— i.e. everything from the #283 work series except the\ninner-`UserComparator`-vtable removal.\n\n## Test plan\n\n- [x] `cargo nextest run --workspace` — **1362/1362 pass.** Tree::range\n/ point-read range / RT suppression all exercise the new merger; no\nregression to any existing behaviour\n- [x] `cargo clippy --lib --tests --benches` — clean\n- [x] `cargo bench --bench merge` micro-bench (PR #287) continues to\ngate any regression on the `SeekingMerger` itself; wiring it in surfaces\nthe bench delta to the production read path without re-running the same\nmicro-bench\n\nCloses #222.\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n## Summary by CodeRabbit\n\n* **Refactor**\n* Internal refactor of range iteration and merging used in read\noperations, replacing prior merging implementation with an updated\nmerging pathway.\n* No changes to exported/public interfaces; end-user behavior remains\nunchanged.\n\n<!-- review_stack_entry_start -->\n\n[![Review Change\nStack](https://storage.googleapis.com/coderabbit_public_assets/review-stack-in-coderabbit-ui.svg)](https://app.coderabbit.ai/change-stack/structured-world/coordinode-lsm-tree/pull/288?utm_source=github_walkthrough&utm_medium=github&utm_campaign=change_stack)\n\n<!-- review_stack_entry_end -->\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-05-21T23:15:25+03:00",
+          "tree_id": "b45fc7576e3ff799545c21873a655040cadabda3",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/c5a35be3cc7fc36b436ac9c740098263ae9e7187"
+        },
+        "date": 1779394602470,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 1238888.9550704053,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 1931178 ops/sec | factor: 0.642 | P50: 0.4us | P99: 2.5us | P99.9: 5.8us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3 | runner: seq_wr=227515 rand_rd=694982 cpu=108 composite=35852.4"
+          },
+          {
+            "name": "fillrandom",
+            "value": 654823.8014774164,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 1020738 ops/sec | factor: 0.642 | P50: 0.8us | P99: 3.1us | P99.9: 7.4us\nthreads: 1 | elapsed: 0.20s | num: 200000 | iterations: 3 | runner: seq_wr=227515 rand_rd=694982 cpu=108 composite=35852.4"
+          },
+          {
+            "name": "readrandom",
+            "value": 264298.4969670384,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 411988 ops/sec | factor: 0.642 | P50: 2.2us | P99: 6.5us | P99.9: 14.4us\nthreads: 1 | elapsed: 0.49s | num: 200000 | iterations: 3 | runner: seq_wr=227515 rand_rd=694982 cpu=108 composite=35852.4"
+          },
+          {
+            "name": "readseq",
+            "value": 1426995.968884007,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 2224399 ops/sec | factor: 0.642 | P50: 0.3us | P99: 4.5us | P99.9: 9.3us\nthreads: 1 | elapsed: 0.09s | num: 200000 | iterations: 3 | runner: seq_wr=227515 rand_rd=694982 cpu=108 composite=35852.4"
+          },
+          {
+            "name": "seekrandom",
+            "value": 194693.01648539508,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 303487 ops/sec | factor: 0.642 | P50: 2.9us | P99: 7.6us | P99.9: 14.8us\nthreads: 1 | elapsed: 0.66s | num: 200000 | iterations: 3 | runner: seq_wr=227515 rand_rd=694982 cpu=108 composite=35852.4"
+          },
+          {
+            "name": "prefixscan",
+            "value": 105370.14489329148,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 164251 ops/sec | factor: 0.642 | P50: 5.7us | P99: 7.6us | P99.9: 17.4us\nthreads: 1 | elapsed: 1.22s | num: 200000 | iterations: 3 | runner: seq_wr=227515 rand_rd=694982 cpu=108 composite=35852.4"
+          },
+          {
+            "name": "overwrite",
+            "value": 687083.5855900832,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 1071025 ops/sec | factor: 0.642 | P50: 0.7us | P99: 3.1us | P99.9: 7.2us\nthreads: 1 | elapsed: 0.19s | num: 200000 | iterations: 3 | runner: seq_wr=227515 rand_rd=694982 cpu=108 composite=35852.4"
+          },
+          {
+            "name": "mergerandom",
+            "value": 471240.1031432174,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 734568 ops/sec | factor: 0.642 | P50: 0.4us | P99: 2.2us | P99.9: 4.9us\nthreads: 1 | elapsed: 0.27s | num: 200000 | iterations: 3 | runner: seq_wr=227515 rand_rd=694982 cpu=108 composite=35852.4"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 241088.89416834374,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 375809 ops/sec | factor: 0.642 | P50: 2.5us | P99: 5.2us | P99.9: 14.1us\nthreads: 1 | elapsed: 0.53s | num: 200000 | iterations: 3 | runner: seq_wr=227515 rand_rd=694982 cpu=108 composite=35852.4"
           }
         ]
       }
