@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779394603632,
+  "lastUpdate": 1779405473698,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -7644,6 +7644,84 @@ window.BENCHMARK_DATA = {
             "value": 241088.89416834374,
             "unit": "ops/sec (normalized)",
             "extra": "raw: 375809 ops/sec | factor: 0.642 | P50: 2.5us | P99: 5.2us | P99.9: 14.1us\nthreads: 1 | elapsed: 0.53s | num: 200000 | iterations: 3 | runner: seq_wr=227515 rand_rd=694982 cpu=108 composite=35852.4"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "f963a4715275e357f30e6e7c0f82bcef2d974550",
+          "message": "ci(bench): self-hosted runner + raw numbers (drop calibration smoothing) (#289)\n\n## Summary\n\nTwo coordinated changes that together make the published bench numbers\nactually interpretable on a per-PR basis.\n\n### 1. Self-hosted runner for the bench job\n\nShared GitHub-hosted runners have ±15-20% noise on every db_bench\nworkload. Verified against the last 98 entries on gh-pages —\n`fillrandom` alone spans **956k → 1,437k ops/sec** across consecutive\ncommits that don't touch the write path. Wins below ~20% drown in the\nnoise floor, and every PR gets sporadic false-positive regression\nalerts.\n\nSwitched the bench job to the self-hosted runner labelled\n`gpu-private-systems` (the org-level bare-metal host at 192.168.1.200).\nStable thermal state, no CPU contention from other tenants, consistent\ndisk I/O — bench delta becomes readable on a per-PR basis instead of\nneeding 20+ iteration medians to escape the noise floor.\n\nAdded a `concurrency: { group: bench-self-hosted, cancel-in-progress:\nfalse }` block so the host runs **one bench at a time** across all\nbranches / PRs / future cross-engine comparisons (issue #244's RocksDB\nvs lsm-tree harness will share the same host). `cancel-in-progress:\nfalse` makes queued runs wait their turn instead of clobbering the\nin-flight bench.\n\n### 2. Raw ops/sec, no calibration smoothing\n\nThe previous `db_bench` design ran a 5-second calibration workload at\nstartup, computed a per-runner `calibration_factor`, and multiplied\nevery result by it. The intent was cross-runner comparability on\nephemeral cloud runners; the effect was hiding genuine perf changes\ninside the smoothing factor's own measurement noise (the factor itself\nwas noisy because the calibration workload ran on the same noisy\nrunner).\n\nNow the bench is pinned to a stable host, the right answer is \"report\nwhat the host actually delivered\". The dashboard shows the absolute\ntrend; the \"relative\" comparison we actually want is **lsm-tree vs\nRocksDB on the same host** (issue #244), NOT \"lsm-tree on runner A vs\nlsm-tree on runner B normalized through some calibration\".\n\nRemoved:\n\n- `tools/db_bench/src/calibrate.rs` — entire calibration workload\n- `--skip-calibration` CLI flag — no calibration to skip\n- `calibration_factor` parameter from `Reporter::print_human` /\n`to_json`\n- `raw_ops_per_sec` / `calibration_factor` fields in the JSON schema\n(they collapsed into the same number)\n- \"ops/sec (normalized)\" vs \"ops/sec\" unit branching in the\ngithub-action-benchmark entry — always \"ops/sec\" now\n\n`flamegraph.yml` also dropped its `--skip-calibration` arg (unrecognised\nafter the flag's removal).\n\n## Files touched\n\n| File | Change |\n|---|---|\n| `.github/workflows/benchmark.yml` | `runs-on` → self-hosted runner +\nrepo-wide `concurrency: bench-self-hosted` |\n| `.github/workflows/flamegraph.yml` | Drop `--skip-calibration` arg |\n| `tools/db_bench/src/calibrate.rs` | **Deleted** (entire 275-line\nmodule) |\n| `tools/db_bench/src/main.rs` | Drop calibration module + CLI flag +\nrun loop + run_single param |\n| `tools/db_bench/src/reporter.rs` | `print_human`/`to_json` no longer\ntake `calibration_factor`; JSON schema slimmer |\n\n## Test plan\n\n- [x] `cargo clippy --all-features --all-targets --manifest-path\ntools/db_bench/Cargo.toml` — clean\n- [x] db_bench compiles end-to-end; CLI parses without\n`--skip-calibration`; CLI parses without `--iterations` (defaults to 3\nfor `--github-json`, 1 otherwise — unchanged)\n- [x] github-action-benchmark JSON entries now report `value: <raw\nops/sec>` directly, no smoothing\n- [ ] First main-branch run on the self-hosted runner publishes to\ngh-pages (visible on next push to main)\n- [ ] Queued bench runs wait their turn (verified once two PRs touch the\nbench in parallel)\n\n## Follow-up\n\nAfter this lands, the existing 98 gh-pages history entries become\nincomparable to new entries (raw numbers vs normalized numbers,\ndifferent runner). That's expected — the dashboard will show a one-time\ndiscontinuity at this commit. New numbers are the trustworthy baseline\ngoing forward.",
+          "timestamp": "2026-05-22T01:45:00+03:00",
+          "tree_id": "35d20886077d1d870fff9195ba781c7dc36b547a",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/f963a4715275e357f30e6e7c0f82bcef2d974550"
+        },
+        "date": 1779405472270,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 1973392.51195422,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.6us | P99.9: 3.7us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1220595.5629959807,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.2us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 636498.4782769419,
+            "unit": "ops/sec",
+            "extra": "P50: 1.4us | P99: 4.6us | P99.9: 7.0us\nthreads: 1 | elapsed: 0.31s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3629476.342056949,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 3.0us | P99.9: 5.4us\nthreads: 1 | elapsed: 0.06s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 452717.98432061967,
+            "unit": "ops/sec",
+            "extra": "P50: 1.9us | P99: 5.2us | P99.9: 7.9us\nthreads: 1 | elapsed: 0.44s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 224689.22477803432,
+            "unit": "ops/sec",
+            "extra": "P50: 4.2us | P99: 5.2us | P99.9: 7.5us\nthreads: 1 | elapsed: 0.89s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1227751.7343328428,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.3us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1153803.574056565,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 1.5us | P99.9: 2.0us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 548748.0358833036,
+            "unit": "ops/sec",
+            "extra": "P50: 1.7us | P99: 5.1us | P99.9: 7.5us\nthreads: 1 | elapsed: 0.36s | num: 200000 | iterations: 3"
           }
         ]
       }
