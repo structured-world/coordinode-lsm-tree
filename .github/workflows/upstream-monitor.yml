@@ -35,9 +35,31 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
         with:
           fetch-depth: 0
+          # Persisted credentials are LEGITIMATELY required here:
+          # the "Try merge and create PR or conflict issue" step
+          # below runs `git push origin "$SYNC_BRANCH"` to publish
+          # the upstream-sync branch. Without the default
+          # GITHUB_TOKEN written to the local auth config by
+          # actions/checkout, that push would fail with
+          # "could not read Username for 'https://github.com'".
+          # The token is scoped by the top-level `permissions:`
+          # block (contents:write, pull-requests:write,
+          # issues:write — only what this single-purpose workflow
+          # needs); the credential-persistence attack surface
+          # (zizmor's `artipacked` lint — ARTIfact-PACKED token
+          # leakage via actions/upload-artifact) is limited
+          # because this workflow does NOT publish artifacts via
+          # actions/upload-artifact, so the .git/config token
+          # never leaves the runner.
+          #
+          # Set persist-credentials EXPLICITLY (not relying on the
+          # default) so the requirement is grep-visible and survives
+          # future "harden every workflow" sweeps that might
+          # otherwise blanket-set persist-credentials: false here.
+          persist-credentials: true
 
       - name: Add upstream remote
         run: git remote add "$UPSTREAM_REMOTE" "$UPSTREAM_URL"
