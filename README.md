@@ -108,7 +108,7 @@ Local flamegraphs:
 ```bash
 cd tools/db_bench
 cargo run --release --features flamegraph -- \
-  --benchmark all --num 100000 --flamegraph --skip-calibration
+  --benchmark all --num 100000 --flamegraph
 # Folded stacks: target/flamegraphs/all.folded
 # Render: cargo install inferno && inferno-flamegraph target/flamegraphs/all.folded > flame.svg
 ```

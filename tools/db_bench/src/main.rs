@@ -243,10 +243,14 @@ fn run_single(
         let _tmpdir;
         let db_path = match &cli.db {
             Some(p) if iterations > 1 => {
-                let sub = p.join(format!("iter-{iter}"));
+                // Nest under a tool-specific `.db_bench/` directory so
+                // `remove_dir_all` here can never clobber user data
+                // that happened to live under `<db>/iter-N`. The
+                // dot-prefix + tool name makes the namespace
+                // collision-impossible: a real workload would never
+                // pick this exact path by accident.
+                let sub = p.join(".db_bench").join(format!("iter-{iter}"));
                 // Clean previous iteration data so each run starts fresh.
-                // Safe: these are `iter-0`, `iter-1`, … subdirs created by
-                // this tool — the naming scheme cannot collide with user data.
                 if let Err(e) = std::fs::remove_dir_all(&sub)
                     && e.kind() != std::io::ErrorKind::NotFound
                 {

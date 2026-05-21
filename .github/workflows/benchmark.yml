@@ -43,11 +43,14 @@ jobs:
     # to hide every win below ~20% and produce false-positive
     # regression alerts. The self-hosted host has stable thermal
     # state, no CPU contention from other jobs, and consistent
-    # disk I/O — bench delta becomes interpretable on a per-PR
-    # basis instead of needing 20+ iteration medians to escape
-    # the noise floor. Label `gpu-private-systems` targets that
-    # specific host; other self-hosted runners (if added later)
-    # without the label won't pick the job up.
+    # disk I/O — bench delta becomes interpretable per merged
+    # commit on main instead of needing 20+ iteration medians to
+    # escape the noise floor. (Per-PR comparison is available via
+    # the `workflow_dispatch` manual trigger above; routine PR
+    # pushes do not auto-queue against this runner.) Label
+    # `gpu-private-systems` targets that specific host; other
+    # self-hosted runners (if added later) without the label
+    # won't pick the job up.
     runs-on: [self-hosted, gpu-private-systems]
     timeout-minutes: 30
     steps:
