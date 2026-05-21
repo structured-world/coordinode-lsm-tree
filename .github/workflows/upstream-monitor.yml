@@ -48,7 +48,9 @@ jobs:
           # The token is scoped by the top-level `permissions:`
           # block (contents:write, pull-requests:write,
           # issues:write — only what this single-purpose workflow
-          # needs); the artipacked attack surface is limited
+          # needs); the credential-persistence attack surface
+          # (zizmor's `artipacked` lint — ARTIfact-PACKED token
+          # leakage via actions/upload-artifact) is limited
           # because this workflow does NOT publish artifacts via
           # actions/upload-artifact, so the .git/config token
           # never leaves the runner.
