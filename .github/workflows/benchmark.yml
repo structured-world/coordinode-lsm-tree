@@ -12,13 +12,36 @@ on:
   pull_request:
     branches: [main]
 
+# Strict serialisation across the entire repo: the self-hosted
+# bench host is shared with future cross-engine benches (RocksDB
+# vs lsm-tree per issue #244) and any other perf workload. Two
+# benches running simultaneously contaminate each other's CPU /
+# disk / cache state and the published numbers become unreadable.
+# `cancel-in-progress: false` makes queued runs wait their turn
+# instead of clobbering the in-flight bench — every measurement
+# completes on a quiet host.
+concurrency:
+  group: bench-self-hosted
+  cancel-in-progress: false
+
 jobs:
   benchmark:
     name: Performance regression check
-    runs-on: ubuntu-latest
+    # Self-hosted bare-metal runner. Shared GitHub-hosted runners
+    # have ±15-20% noise on every db_bench workload — large enough
+    # to hide every win below ~20% and produce false-positive
+    # regression alerts. The self-hosted host has stable thermal
+    # state, no CPU contention from other jobs, and consistent
+    # disk I/O — bench delta becomes interpretable on a per-PR
+    # basis instead of needing 20+ iteration medians to escape
+    # the noise floor. Label `gpu-private-systems` targets that
+    # specific host; other self-hosted runners (if added later)
+    # without the label won't pick the job up.
+    runs-on: [self-hosted, gpu-private-systems]
     timeout-minutes: 30
     steps:
-      # v6 requires runner ≥2.327.1 (node24 runtime) — github-hosted ubuntu-latest satisfies this.
+      # v6 requires runner ≥2.327.1 (node24 runtime) — the self-hosted
+      # runner has a current runner agent that satisfies this.
       # persist-credentials: false — git pushes from this workflow use the
       # explicit App token generated below, NOT the runner's GITHUB_TOKEN
       # written to .git/config. Disabling the default credential persistence

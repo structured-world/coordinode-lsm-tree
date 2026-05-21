@@ -1,4 +1,3 @@
-mod calibrate;
 mod config;
 mod db;
 #[cfg(feature = "flamegraph")]
@@ -6,7 +5,6 @@ mod flame;
 mod reporter;
 mod workloads;
 
-use crate::calibrate::CalibrationScore;
 use crate::config::{BenchConfig, Compression};
 use crate::reporter::{JsonConfig, Reporter};
 use crate::workloads::{available_benchmarks, create_workload};
@@ -77,10 +75,6 @@ struct Cli {
     /// Default: 3 when --github-json is set, 1 otherwise.
     #[arg(long)]
     iterations: Option<u32>,
-
-    /// Skip runner calibration (report raw ops/sec without normalization).
-    #[arg(long)]
-    skip_calibration: bool,
 
     /// Enable flamegraph profiling. Writes folded stacks to target/flamegraphs/.
     /// Requires building with `--features flamegraph`.
@@ -157,19 +151,6 @@ fn main() {
         std::process::exit(1);
     }
 
-    // Run calibration unless explicitly skipped.
-    let calibration = if cli.skip_calibration {
-        None
-    } else {
-        match calibrate::run_calibration() {
-            Ok(score) => Some(score),
-            Err(e) => {
-                eprintln!("Warning: calibration failed ({e}), reporting raw results");
-                None
-            }
-        }
-    };
-
     // Set up flamegraph tracing if requested.
     #[cfg(feature = "flamegraph")]
     let _flame_guard = if cli.flamegraph {
@@ -206,7 +187,6 @@ fn main() {
             &bench_config,
             &cli,
             iterations,
-            calibration.as_ref(),
             &mut github_entries,
         ) {
             eprintln!("Error: {benchmark_name} failed: {e}");
@@ -242,7 +222,6 @@ fn run_single(
     bench_config: &BenchConfig,
     cli: &Cli,
     iterations: u32,
-    calibration: Option<&CalibrationScore>,
     github_entries: &mut Vec<serde_json::Value>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("=== db_bench: {benchmark_name} ===");
@@ -268,10 +247,10 @@ fn run_single(
                 // Clean previous iteration data so each run starts fresh.
                 // Safe: these are `iter-0`, `iter-1`, … subdirs created by
                 // this tool — the naming scheme cannot collide with user data.
-                if let Err(e) = std::fs::remove_dir_all(&sub) {
-                    if e.kind() != std::io::ErrorKind::NotFound {
-                        return Err(e.into());
-                    }
+                if let Err(e) = std::fs::remove_dir_all(&sub)
+                    && e.kind() != std::io::ErrorKind::NotFound
+                {
+                    return Err(e.into());
                 }
                 std::fs::create_dir_all(&sub)?;
                 sub
@@ -313,38 +292,26 @@ fn run_single(
     let median_idx = (results.len() - 1) / 2;
     let median = &results[median_idx];
 
-    let factor = calibration.map_or(1.0, CalibrationScore::factor);
-
     if cli.github_json {
         let s = median.reporter.summary(entry_size);
-        let normalized_ops = s.ops_per_sec * factor;
-
-        let (unit, extra) = if calibration.is_some() {
-            (
-                "ops/sec (normalized)",
-                format!(
-                    "raw: {:.0} ops/sec | factor: {:.3} | P50: {:.1}us | P99: {:.1}us | P99.9: {:.1}us\n\
-                     threads: {} | elapsed: {:.2}s | num: {} | iterations: {} | runner: {}",
-                    s.ops_per_sec, factor, s.p50, s.p99, s.p999,
-                    cli.threads, s.secs, cli.num, iterations,
-                    calibration.map_or_else(String::new, |c| c.to_string()),
-                ),
-            )
-        } else {
-            (
-                "ops/sec",
-                format!(
-                    "P50: {:.1}us | P99: {:.1}us | P99.9: {:.1}us\nthreads: {} | elapsed: {:.2}s | num: {} | iterations: {}",
-                    s.p50, s.p99, s.p999, cli.threads, s.secs, cli.num, iterations,
-                ),
-            )
-        };
-
+        // Raw ops/sec, no normalization. The previous design ran a
+        // calibration workload at startup to "normalize" results
+        // against runner hardware variance — that smoothed out
+        // genuine perf changes alongside the variance and made
+        // small wins (a few %) impossible to read against the
+        // smoothing factor's own noise. With a stable
+        // self-hosted runner the right answer is to report what
+        // the host actually delivered and let the dashboard show
+        // the absolute trend.
         github_entries.push(serde_json::json!({
             "name": benchmark_name,
-            "value": normalized_ops,
-            "unit": unit,
-            "extra": extra,
+            "value": s.ops_per_sec,
+            "unit": "ops/sec",
+            "extra": format!(
+                "P50: {:.1}us | P99: {:.1}us | P99.9: {:.1}us\n\
+                 threads: {} | elapsed: {:.2}s | num: {} | iterations: {}",
+                s.p50, s.p99, s.p999, cli.threads, s.secs, cli.num, iterations,
+            ),
         }));
     } else if cli.json {
         let json_config = JsonConfig {
@@ -355,16 +322,9 @@ fn run_single(
             threads: cli.threads,
             compression: cli.compression.to_string(),
         };
-        println!(
-            "{}",
-            median
-                .reporter
-                .to_json(benchmark_name, &json_config, factor)
-        );
+        println!("{}", median.reporter.to_json(benchmark_name, &json_config));
     } else {
-        median
-            .reporter
-            .print_human(benchmark_name, entry_size, factor);
+        median.reporter.print_human(benchmark_name, entry_size);
     }
 
     Ok(())
