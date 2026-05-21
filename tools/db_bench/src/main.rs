@@ -249,7 +249,25 @@ fn run_single(
                 // dot-prefix + tool name makes the namespace
                 // collision-impossible: a real workload would never
                 // pick this exact path by accident.
-                let sub = p.join(".db_bench").join(format!("iter-{iter}"));
+                //
+                // Reject symlinks at the `.db_bench` component to
+                // prevent `<db>/.db_bench` being (maliciously or
+                // accidentally) a symlink that escapes the intended
+                // subtree — without this check, `remove_dir_all`
+                // would resolve through the symlink and could delete
+                // unrelated paths the user pointed it at.
+                let bench_root = p.join(".db_bench");
+                if let Ok(md) = std::fs::symlink_metadata(&bench_root)
+                    && md.file_type().is_symlink()
+                {
+                    return Err(format!(
+                        "refusing to clean iteration data: {} is a symlink. \
+                         Remove or replace it with a real directory before re-running.",
+                        bench_root.display()
+                    )
+                    .into());
+                }
+                let sub = bench_root.join(format!("iter-{iter}"));
                 // Clean previous iteration data so each run starts fresh.
                 if let Err(e) = std::fs::remove_dir_all(&sub)
                     && e.kind() != std::io::ErrorKind::NotFound
