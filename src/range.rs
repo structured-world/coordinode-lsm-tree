@@ -4,14 +4,16 @@
 
 use crate::{
     BoxedIterator, InternalValue,
+    comparator::SharedComparator,
     key::InternalKey,
     memtable::Memtable,
-    merge::Merger,
     merge_operator::MergeOperator,
+    merge_source::CoherentIterSource,
     mvcc_stream::MvccStream,
     range_tombstone::RangeTombstone,
     range_tombstone_filter::RangeTombstoneFilter,
     run_reader::RunReader,
+    seeking_merger::SeekingMerger,
     value::{SeqNo, UserKey},
     version::{Run, SuperVersion},
 };
@@ -24,6 +26,37 @@ use std::{
 #[must_use]
 pub fn seqno_filter(item_seqno: SeqNo, seqno: SeqNo) -> bool {
     item_seqno < seqno
+}
+
+/// Wrap a vector of boxed double-ended source iterators into a
+/// `SeekingMerger`, the loser-tree-based merging iterator that
+/// replaces the legacy `Merger` (sorted-vector heap) on the read
+/// path. The `BoxedIterator`s become `MergeSource`s via the
+/// `CoherentIterSource` adapter — its coherent-cursor contract
+/// is satisfied by every memtable / run / table iter we feed in
+/// here (they all share a single front/back cursor over the
+/// remaining range).
+///
+/// The source type stays concrete (`CoherentIterSource<BoxedIterator<'a>>`)
+/// rather than being re-boxed behind a `dyn MergeSource` trait
+/// object: `BoxedIterator` is itself already a heap-allocated
+/// trait object, so wrapping it in another `Box<dyn ...>` would
+/// cost an extra allocation per source AND an extra vtable
+/// dispatch on every `next`/`next_back`. With the concrete
+/// adapter type, only the inner `BoxedIterator`'s vtable
+/// remains — exactly one indirect call per per-step source pull.
+///
+/// The compaction merge path still uses the legacy `Merger`
+/// because compaction `Scanner`s are forward-only (`Iterator`,
+/// not `DoubleEndedIterator`) and `MergeSource` requires
+/// `next_back`. That swap is a separate refactor.
+fn build_seeking<'a>(
+    iters: Vec<BoxedIterator<'a>>,
+    comparator: SharedComparator,
+) -> SeekingMerger<CoherentIterSource<BoxedIterator<'a>>, SharedComparator> {
+    let sources: Vec<CoherentIterSource<BoxedIterator<'a>>> =
+        iters.into_iter().map(CoherentIterSource::new).collect();
+    SeekingMerger::new(sources, comparator)
 }
 
 /// Calculates the prefix's upper range.
@@ -392,7 +425,7 @@ impl TreeIter {
                 ));
             }
 
-            let merged = Merger::new(iters, lock.comparator.clone());
+            let merged = build_seeking(iters, lock.comparator.clone());
             // Clone is cheap: point-read RT sets are typically 0-2 entries.
             // An Arc would add indirection overhead that exceeds the clone cost.
             let iter = MvccStream::new_with_comparator(
@@ -753,7 +786,7 @@ impl TreeIter {
                 iters.push(iter);
             }
 
-            let merged = Merger::new(iters, lock.comparator.clone());
+            let merged = build_seeking(iters, lock.comparator.clone());
             // Clone needed: MvccStream uses the RT set for merge suppression,
             // while RangeTombstoneFilter below consumes it for post-merge
             // filtering. An Arc<[_]> could avoid the copy if RT sets grow large.
