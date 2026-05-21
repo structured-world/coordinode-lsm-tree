@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779373185124,
+  "lastUpdate": 1779382246260,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -7332,6 +7332,84 @@ window.BENCHMARK_DATA = {
             "value": 247291.63708361433,
             "unit": "ops/sec (normalized)",
             "extra": "raw: 441754 ops/sec | factor: 0.560 | P50: 1.9us | P99: 8.8us | P99.9: 18.2us\nthreads: 1 | elapsed: 0.45s | num: 200000 | iterations: 3 | runner: seq_wr=220089 rand_rd=914160 cpu=123 composite=41086.5"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "ff12a9d76f59bfac8c83465e35cd62215a320581",
+          "message": "perf(loser_tree): close N≥16 regression, reduce small-N gap (#283 partial) (#286)\n\n## Summary\n\nCloses #283 partially — the N ≥ 16 regression is **fully closed**, and\nthe small-N gap is **substantially reduced** but not yet inside the +5%\nhard requirement at N=2. Two commits land independent, bisectable wins\nper the issue's methodology.\n\n| N | MergeHeap | SeekingMerger (before) | SeekingMerger (now) | Δ\nbefore | Δ now |\n|--:|--:|--:|--:|--:|--:|\n| 2 | 15.6 µs | ~19.9 µs | **17.3 µs** | +19% | **+11%** |\n| 4 | 37.5 µs | ~46.6 µs | **40.0 µs** | +17% | **+6.7%** |\n| 8 | 88.0 µs | ~107.5 µs | **92.7 µs** | +11% | **+5.3%** |\n| 16 | 228.2 µs | ~262 µs | **228.3 µs** | +5% | **~0%** ✓ |\n| 30 | 583.2 µs | ~569 µs | **491.6 µs** | -7% | **-15.7%** ✓ |\n\n(`cargo bench --bench merge`, release, full sample collection. The\nearlier `--quick` numbers in issue #283 had high run-to-run variance;\nthe table above is from non-quick runs that converged.)\n\n## Commits\n\n### 1. `perf(loser_tree): force inline replay / winner_slot /\ncmp_indices / is_empty`\n\nPromoted the hot per-step helpers to `#[inline(always)]`. The bench\n(`benches/merge.rs`) lives in a separate compilation unit from\n`src/loser_tree.rs`; without explicit force-inlining, cross-crate\ninlining was not happening reliably and the merger's tight per-step loop\nate a real function-call cost. **Inlining alone did not close the gap**\n(initial `--quick` reading suggested otherwise but was sample-count\nnoise) — it stays as a baseline hardening that the next step can build\non without re-fighting the inlining variable.\n\n### 2. `perf(loser_tree): drop Option wrapping — MaybeUninit + present\nbitmap`\n\nReplaced `Vec<Option<E>>` leaf storage with parallel\n`Vec<MaybeUninit<E>>` + `Vec<bool>` arrays. The previous layout paid two\ncosts on every `cmp_indices` call:\n\n1. The `Option` discriminant byte sat inline with every leaf, bloating\nthe array and reducing how many leaves fit per cache line.\n2. `match (&Option, &Option)` four-arm dispatch couldn't be fused by\nLLVM across the O(log cap) replay loop because the discriminant lived\ninside each leaf.\n\nSplitting moves discriminants into a contiguous bitmap\n(branch-predictor-friendly under steady-state merging) and lets the\nleaves array stay densely packed. Every `assume_init_*` is guarded by a\ncheck on the matching `present[i]` bit; the unsafe contract doesn't\nwiden beyond what the bitmap already guarantees. `Drop` walks the bitmap\nand `assume_init_drop`s each present leaf so owned values inside\n`InternalValue` don't leak. Manual `core::fmt::Debug` impl replaces the\nderive (which `MaybeUninit` deliberately doesn't support).\n\n**This is the bulk of the win** — closed +19% → +11% at N=2, +17% →\n+6.7% at N=4, +5% → ~0% at N=16, and flipped N=30 from -7% to **-15.7%\nfaster**.\n\n## Acceptance status\n\n| N | Hard requirement (≤+5%) | Goal (≤ MergeHeap) | Status |\n|--:|:-:|:-:|---|\n| 2 | ❌ (+11%) | ❌ | needs more work |\n| 4 | ❌ (+6.7%) | ❌ | needs more work |\n| 8 | ❌ (+5.3%) | ❌ | right at the bar |\n| 16 | ✓ (~0%) | ✓ | **meets goal** |\n| 30 | ✓ (-15.7%) | ✓ | **meets goal** |\n\n## What's left for the remaining N≤8 gap\n\nThe remaining ~5-11% is concentrated in `cmp_indices` comparator\ndispatch: `EntryCmp = Box<dyn Fn(&MergerEntry, &MergerEntry) ->\nOrdering>` is one indirect call, and inside that closure\n`SharedComparator = Arc<dyn UserComparator>` is a second indirect call.\nTwo dispatch layers on the merger's hottest path.\n\nClosing that requires either:\n\n- monomorphizing `SeekingMerger` over the comparator's concrete type\n(infects the struct's type signature — every caller has to thread the\ntype or use `impl Trait`), or\n- replacing the `Fn` bound on `LoserTree` with a domain-specific\n`LeafCmp` trait that lets `SeekingMerger` pass a concrete callable\nstruct (defines a new trait, changes the `LoserTree` generic surface).\n\nBoth are more invasive than what this PR took on. I think they're best\nas a separate follow-up (own scope, own bench delta) rather than\nabsorbed here. Happy to do that next.\n\n## Test plan\n\n- [x] 27/27 `loser_tree::tests::` + `seeking_merger::tests::` pass\n- [x] 1362/1362 full workspace `cargo nextest run` pass — no regression\nto existing callers (`Slice`-backed `InternalValue` drops cleanly\nthrough the new `Drop` impl; existing `Tree` / `BlobTree` / `Merger`\npaths untouched)\n- [x] `cargo clippy --lib --tests --benches` — clean\n- [x] Bench runs as documented above\n\n## Related\n\n- #222 — the original SeekingMerger PR whose small-N regression this\naddresses\n- #283 — this issue, partial close (large-N done, small-N reduced)\n- Possible follow-up: comparator-dispatch optimization for the remaining\nN≤8 gap (see \"What's left\" above)\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n## Summary by CodeRabbit\n\n* **Performance Optimization**\n* Reduced memory overhead and faster hot-path comparisons in core\nmerging/selection, improving throughput on large inputs.\n* **Reliability / Bug Fixes**\n* More predictable and robust handling of missing or absent inputs\nduring selection, replacement, and removal.\n* Safer cleanup and debug output to reduce edge-case failures and\nimprove diagnostics.\n\n<!-- review_stack_entry_start -->\n\n[![Review Change\nStack](https://storage.googleapis.com/coderabbit_public_assets/review-stack-in-coderabbit-ui.svg)](https://app.coderabbit.ai/change-stack/structured-world/coordinode-lsm-tree/pull/286?utm_source=github_walkthrough&utm_medium=github&utm_campaign=change_stack)\n\n<!-- review_stack_entry_end -->\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-05-21T19:49:29+03:00",
+          "tree_id": "c84d19eb045bac15abaa4261d121d0d1452254c9",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/ff12a9d76f59bfac8c83465e35cd62215a320581"
+        },
+        "date": 1779382245205,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 1225064.0570440085,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 1951283 ops/sec | factor: 0.628 | P50: 0.4us | P99: 2.5us | P99.9: 5.8us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3 | runner: seq_wr=225322 rand_rd=738905 cpu=108 composite=36634.4"
+          },
+          {
+            "name": "fillrandom",
+            "value": 688799.6126770263,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 1097121 ops/sec | factor: 0.628 | P50: 0.7us | P99: 3.2us | P99.9: 7.0us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3 | runner: seq_wr=225322 rand_rd=738905 cpu=108 composite=36634.4"
+          },
+          {
+            "name": "readrandom",
+            "value": 297319.8439447561,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 473571 ops/sec | factor: 0.628 | P50: 1.9us | P99: 6.5us | P99.9: 13.7us\nthreads: 1 | elapsed: 0.42s | num: 200000 | iterations: 3 | runner: seq_wr=225322 rand_rd=738905 cpu=108 composite=36634.4"
+          },
+          {
+            "name": "readseq",
+            "value": 1450812.4189125414,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 2310856 ops/sec | factor: 0.628 | P50: 0.2us | P99: 4.8us | P99.9: 9.4us\nthreads: 1 | elapsed: 0.09s | num: 200000 | iterations: 3 | runner: seq_wr=225322 rand_rd=738905 cpu=108 composite=36634.4"
+          },
+          {
+            "name": "seekrandom",
+            "value": 219221.0044914693,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 349175 ops/sec | factor: 0.628 | P50: 2.5us | P99: 7.2us | P99.9: 14.5us\nthreads: 1 | elapsed: 0.57s | num: 200000 | iterations: 3 | runner: seq_wr=225322 rand_rd=738905 cpu=108 composite=36634.4"
+          },
+          {
+            "name": "prefixscan",
+            "value": 112093.27570487034,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 178542 ops/sec | factor: 0.628 | P50: 5.3us | P99: 6.8us | P99.9: 17.2us\nthreads: 1 | elapsed: 1.12s | num: 200000 | iterations: 3 | runner: seq_wr=225322 rand_rd=738905 cpu=108 composite=36634.4"
+          },
+          {
+            "name": "overwrite",
+            "value": 720360.4668983087,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 1147391 ops/sec | factor: 0.628 | P50: 0.7us | P99: 3.1us | P99.9: 6.9us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3 | runner: seq_wr=225322 rand_rd=738905 cpu=108 composite=36634.4"
+          },
+          {
+            "name": "mergerandom",
+            "value": 468011.3866864538,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 745449 ops/sec | factor: 0.628 | P50: 0.4us | P99: 2.2us | P99.9: 3.4us\nthreads: 1 | elapsed: 0.27s | num: 200000 | iterations: 3 | runner: seq_wr=225322 rand_rd=738905 cpu=108 composite=36634.4"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 276736.444202928,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 440786 ops/sec | factor: 0.628 | P50: 2.1us | P99: 4.9us | P99.9: 13.8us\nthreads: 1 | elapsed: 0.45s | num: 200000 | iterations: 3 | runner: seq_wr=225322 rand_rd=738905 cpu=108 composite=36634.4"
           }
         ]
       }
