@@ -62,10 +62,18 @@ impl InternalKey {
     /// User keys are compared via the given comparator; ties are broken
     /// by sequence number in descending order (higher seqno = "smaller"
     /// in sort order), matching the invariant of [`Ord for InternalKey`].
-    pub(crate) fn compare_with(
+    // Generic over the comparator type so concrete-typed callers
+    // (e.g. SeekingMerger<_, DefaultUserComparator>) get monomorphised
+    // dispatch instead of going through `&dyn UserComparator` vtables
+    // on every key compare. `?Sized` keeps the older
+    // `&dyn UserComparator` callers source-compatible — pass
+    // `&*shared_comparator` (deref Arc<dyn> to `dyn UserComparator`)
+    // and it matches `C = dyn UserComparator`. No behaviour change for
+    // existing dyn paths.
+    pub(crate) fn compare_with<C: UserComparator + ?Sized>(
         &self,
         other: &Self,
-        cmp: &dyn UserComparator,
+        cmp: &C,
     ) -> std::cmp::Ordering {
         cmp.compare(&self.user_key, &other.user_key)
             .then_with(|| Reverse(self.seqno).cmp(&Reverse(other.seqno)))

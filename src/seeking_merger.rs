@@ -26,7 +26,7 @@
 //! per direction, independent of the other (mirrors the legacy
 //! `MergeHeap` `init_lo` / `init_hi` pattern).
 
-use crate::comparator::SharedComparator;
+use crate::comparator::UserComparator;
 use crate::loser_tree::LoserTree;
 use crate::merge_source::{CoherentMergeSource, IterItem, MergeSource};
 use alloc::vec::Vec;
@@ -42,22 +42,27 @@ struct MergerEntry {
 
 /// Forward-direction comparator passed to the min-tree.
 ///
-/// Concrete struct (not a closure-in-a-box) so the
+/// Generic over the concrete `UserComparator` type `C` so the
 /// `EntryComparator<MergerEntry>` impl monomorphises through
-/// `LoserTree<MergerEntry, MinCmp>` at every use site — no
-/// vtable dispatch, no runtime direction branch. The previous
-/// single-`MergerCmp` design carried a `Forward`/`Backward`
-/// enum discriminant on every comparator call; splitting into
-/// `MinCmp` / `MaxCmp` removes that per-cmp branch entirely
+/// `LoserTree<MergerEntry, MinCmp<C>>` at every use site — no
+/// `Arc<dyn UserComparator>` vtable lookup on the per-cmp path
+/// inside `InternalKey::compare_with`. `C: Clone` is required
+/// because each direction's tree owns its own copy of the
+/// comparator (cheap for the common cases:
+/// `DefaultUserComparator` is a unit struct, custom user
+/// comparators are typically wrapper types over a few fields).
+///
+/// Splitting `MinCmp` / `MaxCmp` removes the per-cmp direction
+/// branch a single combined struct would have carried
 /// (direction is a compile-time fact, not a runtime field).
 ///
 /// Smaller key wins; ties broken by lower source index.
 #[derive(Clone)]
-struct MinCmp {
-    comparator: SharedComparator,
+struct MinCmp<C: UserComparator + Clone> {
+    comparator: C,
 }
 
-impl crate::loser_tree::EntryComparator<MergerEntry> for MinCmp {
+impl<C: UserComparator + Clone> crate::loser_tree::EntryComparator<MergerEntry> for MinCmp<C> {
     #[expect(
         clippy::inline_always,
         reason = "called O(log cap) per replay step on the merger's hot path; \
@@ -68,7 +73,7 @@ impl crate::loser_tree::EntryComparator<MergerEntry> for MinCmp {
     fn compare(&self, a: &MergerEntry, b: &MergerEntry) -> Ordering {
         a.value
             .key
-            .compare_with(&b.value.key, self.comparator.as_ref())
+            .compare_with(&b.value.key, &self.comparator)
             .then_with(|| a.source.cmp(&b.source))
     }
 }
@@ -81,11 +86,11 @@ impl crate::loser_tree::EntryComparator<MergerEntry> for MinCmp {
 /// reversal keeps `next_back()`'s tie-break opposite of
 /// `next()`'s, matching the legacy `MergeHeap` behaviour.
 #[derive(Clone)]
-struct MaxCmp {
-    comparator: SharedComparator,
+struct MaxCmp<C: UserComparator + Clone> {
+    comparator: C,
 }
 
-impl crate::loser_tree::EntryComparator<MergerEntry> for MaxCmp {
+impl<C: UserComparator + Clone> crate::loser_tree::EntryComparator<MergerEntry> for MaxCmp<C> {
     #[expect(
         clippy::inline_always,
         reason = "called O(log cap) per replay step on the merger's hot path"
@@ -94,16 +99,16 @@ impl crate::loser_tree::EntryComparator<MergerEntry> for MaxCmp {
     fn compare(&self, a: &MergerEntry, b: &MergerEntry) -> Ordering {
         b.value
             .key
-            .compare_with(&a.value.key, self.comparator.as_ref())
+            .compare_with(&a.value.key, &self.comparator)
             .then_with(|| b.source.cmp(&a.source))
     }
 }
 
-fn build_min_cmp(comparator: SharedComparator) -> MinCmp {
+fn build_min_cmp<C: UserComparator + Clone>(comparator: C) -> MinCmp<C> {
     MinCmp { comparator }
 }
 
-fn build_max_cmp(comparator: SharedComparator) -> MaxCmp {
+fn build_max_cmp<C: UserComparator + Clone>(comparator: C) -> MaxCmp<C> {
     MaxCmp { comparator }
 }
 
@@ -141,12 +146,12 @@ fn build_max_cmp(comparator: SharedComparator) -> MaxCmp {
 /// the seek-aware direction-switch path lands (issue #280) the bound
 /// can relax back to `MergeSource` and backward iteration becomes
 /// available for those sources too.
-pub struct SeekingMerger<S: MergeSource> {
+pub struct SeekingMerger<S: MergeSource, C: UserComparator + Clone> {
     sources: Vec<S>,
     n_sources: usize,
-    comparator: SharedComparator,
-    forward_tree: Option<LoserTree<MergerEntry, MinCmp>>,
-    backward_tree: Option<LoserTree<MergerEntry, MaxCmp>>,
+    comparator: C,
+    forward_tree: Option<LoserTree<MergerEntry, MinCmp<C>>>,
+    backward_tree: Option<LoserTree<MergerEntry, MaxCmp<C>>>,
     /// Refill error queued during the previous forward step. When
     /// a source's `.next()` fails AFTER a value was already buffered
     /// in the tournament, we yield the buffered value first and stash
@@ -157,12 +162,12 @@ pub struct SeekingMerger<S: MergeSource> {
     pending_backward_error: Option<crate::Error>,
 }
 
-impl<S: MergeSource> SeekingMerger<S> {
+impl<S: MergeSource, C: UserComparator + Clone> SeekingMerger<S, C> {
     /// Construct an empty merger ready to consume from `sources`.
     /// Tournaments are not built yet; both directions populate
     /// lazily on first use.
     #[must_use]
-    pub fn new(sources: Vec<S>, comparator: SharedComparator) -> Self {
+    pub fn new(sources: Vec<S>, comparator: C) -> Self {
         let n = sources.len();
         Self {
             sources,
@@ -246,7 +251,7 @@ impl<S: MergeSource> SeekingMerger<S> {
     }
 }
 
-impl<S: MergeSource> Iterator for SeekingMerger<S> {
+impl<S: MergeSource, C: UserComparator + Clone> Iterator for SeekingMerger<S, C> {
     type Item = IterItem;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -320,7 +325,9 @@ impl<S: MergeSource> Iterator for SeekingMerger<S> {
 // source's cursors share state, so the merger doesn't have to call
 // `seek` to reconcile". When the seek-aware direction switch lands
 // (issue #280), the bound can be relaxed back to `MergeSource`.
-impl<S: CoherentMergeSource> DoubleEndedIterator for SeekingMerger<S> {
+impl<S: CoherentMergeSource, C: UserComparator + Clone> DoubleEndedIterator
+    for SeekingMerger<S, C>
+{
     fn next_back(&mut self) -> Option<Self::Item> {
         // Same error-first contract as next().
         if let Some(e) = self.pending_backward_error.take() {
@@ -485,7 +492,7 @@ mod tests {
     #[test]
     fn empty_sources() {
         let cmp = comparator::default_comparator();
-        let mut m: SeekingMerger<VecSource> = SeekingMerger::new(alloc::vec![], cmp);
+        let mut m: SeekingMerger<VecSource, _> = SeekingMerger::new(alloc::vec![], cmp);
         assert!(Iterator::next(&mut m).is_none());
         assert!(m.next_back().is_none());
     }

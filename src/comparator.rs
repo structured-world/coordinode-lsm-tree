@@ -116,6 +116,28 @@ impl UserComparator for DefaultUserComparator {
 /// Shared reference to a [`UserComparator`].
 pub type SharedComparator = Arc<dyn UserComparator>;
 
+/// Blanket impl so `Arc<T: UserComparator + ?Sized>` itself
+/// satisfies the trait — used by callers that hold the
+/// canonical [`SharedComparator`] (= `Arc<dyn UserComparator>`)
+/// and want to pass it to generic APIs that take
+/// `C: UserComparator + Clone`. The shared / dyn-dispatch cost
+/// stays the same as before for those callers; the blanket only
+/// removes a `.as_ref()` ceremony at every call site.
+impl<T: UserComparator + ?Sized> UserComparator for Arc<T> {
+    #[inline]
+    fn name(&self) -> &'static str {
+        (**self).name()
+    }
+    #[inline]
+    fn compare(&self, a: &[u8], b: &[u8]) -> std::cmp::Ordering {
+        (**self).compare(a, b)
+    }
+    #[inline]
+    fn is_lexicographic(&self) -> bool {
+        (**self).is_lexicographic()
+    }
+}
+
 /// Maximum byte length for a comparator name.
 ///
 /// Enforced on write (`persist_version`) and read (`Manifest::decode_from`).

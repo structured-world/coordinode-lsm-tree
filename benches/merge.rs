@@ -148,7 +148,14 @@ fn merger(c: &mut Criterion) {
                             Box::new(CoherentIterSource::new(iter)) as Box<dyn MergeSource + '_>
                         })
                         .collect();
-                    let merger = SeekingMerger::new(sources, cmp.clone());
+                    // Pass the CONCRETE DefaultUserComparator (not the
+                    // Arc<dyn> SharedComparator) so SeekingMerger's
+                    // generic C parameter monomorphises to a unit
+                    // struct — InternalKey::compare_with's inner
+                    // `cmp.compare(...)` call then inlines flat
+                    // instead of going through the dyn UserComparator
+                    // vtable on every key compare.
+                    let merger = SeekingMerger::new(sources, DefaultUserComparator);
                     assert_eq!(num * 100, merger.count());
                 })
             })
