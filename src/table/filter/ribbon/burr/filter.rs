@@ -162,6 +162,15 @@ where
     /// reader, builder, wire codec) for no in-tree benefit. The
     /// doc-comment contract above is the canonical guarantee.
     #[inline]
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "z_words[equation.start + offset] is bounds-safe by construction: \
+                  start ∈ [0, m-w] and offset ∈ [0, w-1] (set-bit position in coeff_lo, \
+                  which has at most w bits), so the sum is < m = z_words.len(). The doc \
+                  comment above (lines 195-197) states this invariant explicitly; \
+                  per-row .get() would add a branch on the probe hot path and dominate \
+                  the per-iter cost"
+    )]
     pub fn contains_hash(&self, hash: u64) -> bool {
         // BurrParams::with_fp_rate / with_bpk both clamp r to 1..=64, so
         // stride is always 1. Single u64 buffer for fingerprint, scalar
