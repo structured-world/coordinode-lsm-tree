@@ -47,9 +47,11 @@ fn measure_with_percentiles<F: FnMut()>(label: &str, iters: u64, mut body: F) ->
         // samples vec (n.max(1) returns 1 but samples[0] would OOB).
         return Duration::ZERO;
     }
-    let cap = MAX_SAMPLES.min(iters as usize);
+    // Lossless clamp: bound `iters` by MAX_SAMPLES as u64 first, then
+    // convert via try_from. Avoids `iters as usize` truncation on
+    // 32-bit targets and keeps the cast infallible + lint-clean.
+    let cap = usize::try_from(iters.min(MAX_SAMPLES as u64)).unwrap_or(MAX_SAMPLES);
     let mut samples: Vec<Duration> = Vec::with_capacity(cap);
-    let mut total = Duration::ZERO;
     // Deterministic LCG for reservoir replacement — perf benches
     // should not depend on system RNG availability or quality.
     let mut rng_state: u64 = 0xCAFE_F00D_DEAD_BEEF_u64
@@ -61,6 +63,11 @@ fn measure_with_percentiles<F: FnMut()>(label: &str, iters: u64, mut body: F) ->
             .wrapping_add(1_442_695_040_888_963_407);
         *state
     };
+    // Outer wall-clock for the criterion-returned value — captures
+    // per-iteration Instant::now overhead AND reservoir bookkeeping.
+    // Returning the sum of `elapsed` would under-report (criterion
+    // divides by iters for the mean estimate).
+    let outer_start = Instant::now();
     for i in 0..iters {
         let start = Instant::now();
         body();
@@ -70,18 +77,21 @@ fn measure_with_percentiles<F: FnMut()>(label: &str, iters: u64, mut body: F) ->
         } else {
             // Reservoir replacement: pick a random index in [0, i].
             // If that index falls within the reservoir, replace.
-            let idx = (next_rand(&mut rng_state) % (i + 1)) as usize;
+            let idx = usize::try_from(next_rand(&mut rng_state) % (i + 1)).unwrap_or(MAX_SAMPLES);
             if idx < MAX_SAMPLES {
                 samples[idx] = elapsed;
             }
         }
-        total += elapsed;
     }
+    let total = outer_start.elapsed();
     samples.sort_unstable();
     let n = samples.len().max(1);
+    // Integer percentile indices — avoids f64 cast lint trips and
+    // float-rounding edge cases. p99 = floor(n * 99 / 100),
+    // p999 = floor(n * 999 / 1000), both clamped to n-1.
     let p50 = samples[n / 2];
-    let p99_idx = ((n as f64 * 0.99) as usize).min(n - 1);
-    let p999_idx = ((n as f64 * 0.999) as usize).min(n - 1);
+    let p99_idx = (n.saturating_mul(99) / 100).min(n - 1);
+    let p999_idx = (n.saturating_mul(999) / 1000).min(n - 1);
     let p99 = samples[p99_idx];
     let p999 = samples[p999_idx];
     eprintln!(
@@ -181,7 +191,12 @@ fn burr_filter_contains(c: &mut Criterion) {
             b.iter_custom(|iters| {
                 measure_with_percentiles(&probe_label, iters, || {
                     let hash = probe_hashes[probe_idx];
-                    probe_idx = (probe_idx + 1) % probe_hashes.len();
+                    // Branch wrap, not `%` — modulo compiles to a div
+                    // and would skew sub-microbench timings / tails.
+                    probe_idx += 1;
+                    if probe_idx == probe_hashes.len() {
+                        probe_idx = 0;
+                    }
                     assert!(reader.contains_hash(hash));
                 })
             });
@@ -200,7 +215,10 @@ fn burr_filter_contains(c: &mut Criterion) {
                 measure_with_percentiles(&decode_label, iters, || {
                     let reader = BurrFilterReader::new(&filter_bytes).unwrap();
                     let hash = probe_hashes[decode_idx];
-                    decode_idx = (decode_idx + 1) % probe_hashes.len();
+                    decode_idx += 1;
+                    if decode_idx == probe_hashes.len() {
+                        decode_idx = 0;
+                    }
                     assert!(reader.contains_hash(hash));
                 })
             });
@@ -259,7 +277,10 @@ fn ribbon_filter_contains(c: &mut Criterion) {
             b.iter_custom(|iters| {
                 measure_with_percentiles(&label, iters, || {
                     let sample = probe_keys[probe_idx];
-                    probe_idx = (probe_idx + 1) % probe_keys.len();
+                    probe_idx += 1;
+                    if probe_idx == probe_keys.len() {
+                        probe_idx = 0;
+                    }
                     assert!(filter.contains_in(&sample, &mut scratch));
                 })
             });
