@@ -16,7 +16,9 @@
 
 use criterion::{Criterion, criterion_group, criterion_main};
 use lsm_tree::hash::hash64;
-use lsm_tree::table::filter::ribbon::burr::{BurrBuilder, BurrFilterReader, BurrParams};
+use lsm_tree::table::filter::ribbon::burr::{
+    BurrBuilder, BurrFilter, BurrFilterReader, BurrParams,
+};
 use rand::RngExt;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::BuildHasherDefault;
@@ -94,29 +96,38 @@ fn fast_block_index(c: &mut Criterion) {
     c.bench_function("block index - mod", |b| {
         b.iter(|| {
             let h: u64 = rng.random();
-            h as usize % num_blocks
+            std::hint::black_box(h % (num_blocks as u64))
         });
     });
 
     c.bench_function("block index - fast", |b| {
         b.iter(|| {
             let h: u64 = rng.random();
-            fast_impl(h, num_blocks)
+            std::hint::black_box(fast_impl(h, num_blocks))
         });
     });
 }
 
 fn burr_filter_construction(c: &mut Criterion) {
-    let keys: Vec<u64> = (0..100_000_u64).collect();
+    let mut rng = rand::rng();
 
-    for fpr in [0.01_f32, 0.001, 0.0001] {
-        let label = format!("burr filter construction (FPR={}%)", fpr * 100.0);
+    for n in [100_000_usize, 1_000_000] {
+        let label = format!("burr filter build, {n} keys @ FPR=1%");
         c.bench_function(&label, |b| {
+            // Pre-hash a key universe so the bench measures BuRR build cost,
+            // not RNG.
+            let mut keys = Vec::with_capacity(n);
+            for _ in 0..n {
+                let mut key = [0_u8; 16];
+                rng.fill(&mut key[..]);
+                keys.push(hash64(&key));
+            }
+
             b.iter(|| {
-                let params = BurrParams::with_fp_rate(keys.len(), fpr).expect("params");
+                let params = BurrParams::with_fp_rate(n, 0.01).expect("params");
                 let builder = BurrBuilder::new(params, Hasher::default()).expect("builder");
-                let filter = builder.build_from_hashes(&keys).expect("build");
-                let _ = filter.to_wire_bytes();
+                let filter: BurrFilter<Hasher> = builder.build_from_hashes(&keys).expect("build");
+                std::hint::black_box(filter.layer_count());
             });
         });
     }
@@ -147,16 +158,23 @@ fn burr_filter_contains(c: &mut Criterion) {
         // pins the parsed view); construct ONCE outside b.iter to
         // measure steady-state probe latency, not parse+probe.
         let reader = BurrFilterReader::new(&filter_bytes).unwrap();
+
+        // Precompute hashes outside the timed body so percentiles
+        // reflect ONLY the probe work, not RNG sampling + hash64
+        // overhead. Round-robin index gives deterministic, cache-
+        // friendly access without rng/hash cost per iteration.
+        let probe_hashes: Vec<u64> = hashes.iter().take(keys.len()).copied().collect();
+
         let probe_label = format!(
             "burr filter contains (probe-only), true positive (FPR={}%)",
             fpr * 100.0
         );
+        let mut probe_idx = 0_usize;
         c.bench_function(&probe_label, |b| {
             b.iter_custom(|iters| {
                 measure_with_percentiles(&probe_label, iters, || {
-                    use rand::seq::IndexedRandom;
-                    let sample = keys.choose(&mut rng).unwrap();
-                    let hash = hash64(sample);
+                    let hash = probe_hashes[probe_idx];
+                    probe_idx = (probe_idx + 1) % probe_hashes.len();
                     assert!(reader.contains_hash(hash));
                 })
             });
@@ -169,13 +187,13 @@ fn burr_filter_contains(c: &mut Criterion) {
             "burr filter contains (decode+probe), true positive (FPR={}%)",
             fpr * 100.0
         );
+        let mut decode_idx = 0_usize;
         c.bench_function(&decode_label, |b| {
             b.iter_custom(|iters| {
                 measure_with_percentiles(&decode_label, iters, || {
-                    use rand::seq::IndexedRandom;
                     let reader = BurrFilterReader::new(&filter_bytes).unwrap();
-                    let sample = keys.choose(&mut rng).unwrap();
-                    let hash = hash64(sample);
+                    let hash = probe_hashes[decode_idx];
+                    decode_idx = (decode_idx + 1) % probe_hashes.len();
                     assert!(reader.contains_hash(hash));
                 })
             });
@@ -219,6 +237,13 @@ fn ribbon_filter_contains(c: &mut Criterion) {
         let filter = builder.build(&padded).expect("build");
         let mut scratch = filter.new_scratch();
 
+        // Precompute the probe order outside the timed body. Round-
+        // robin over the key universe — same rationale as the BuRR
+        // probe benches above (keep RNG cost out of the percentile
+        // measurement).
+        let probe_keys: Vec<u64> = keys.clone();
+        let mut probe_idx = 0_usize;
+
         let label = format!(
             "standard ribbon contains, true positive (FPR={}%)",
             fpr * 100.0
@@ -226,9 +251,9 @@ fn ribbon_filter_contains(c: &mut Criterion) {
         c.bench_function(&label, |b| {
             b.iter_custom(|iters| {
                 measure_with_percentiles(&label, iters, || {
-                    use rand::seq::IndexedRandom;
-                    let sample = keys.choose(&mut rng).unwrap();
-                    assert!(filter.contains_in(sample, &mut scratch));
+                    let sample = probe_keys[probe_idx];
+                    probe_idx = (probe_idx + 1) % probe_keys.len();
+                    assert!(filter.contains_in(&sample, &mut scratch));
                 })
             });
         });
