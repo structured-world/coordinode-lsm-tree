@@ -483,14 +483,24 @@ impl Table {
     ///
     /// `key_hash` **must** equal `crate::hash::hash64(key)` — the
     /// same function the writer used when populating the bloom
-    /// filter. The internal bloom check is driven by the hash,
-    /// not the key bytes, and the key↔hash agreement check is
-    /// a `debug_assert!` only: release builds trust the caller. Passing a wrong hash in
-    /// release produces false-negative skips — keys are silently
-    /// dropped from the result vector as if they weren't in the
-    /// table. Callers should derive both values from the same
+    /// filter. The bloom probe consumes the hash; the
+    /// key↔hash agreement check is a `debug_assert!` only, so
+    /// release builds trust the caller. Passing a wrong hash in
+    /// release produces false-negative skips: the corresponding
+    /// `results[i]` slot stays `None` as if the key weren't in
+    /// the table (the result vector itself is always
+    /// `sorted_keys.len()` long — nothing is dropped from it).
+    /// Callers should derive both values from the same
     /// `(&[u8], u64) = (key, hash64(key))` expression at the
     /// same scope to make the agreement trivially auditable.
+    ///
+    /// In partitioned-filter mode (`pinned_filter_index` /
+    /// `filter_tli`), `check_bloom` ALSO uses the raw `key`
+    /// bytes — not the hash — to select which filter partition
+    /// to probe. The hash drives the bit probes inside the
+    /// selected partition. Bottom line: BOTH inputs are
+    /// load-bearing in the partitioned case; only the
+    /// monolithic-filter case is "hash-only".
     ///
     /// # Why this exists vs. calling [`Table::get`] in a loop
     ///
@@ -565,6 +575,23 @@ impl Table {
             return Ok(results);
         }
 
+        // Debug-time guard for the sorted-input contract.
+        // Unsorted input would silently return wrong Nones
+        // (the two-pointer walk between block_iter and the
+        // input slice assumes monotone keys); catch the
+        // accidental misuse before it ships to a release
+        // benchmark. Strict-monotone is the contract — equal
+        // adjacent keys would be a duplicate query, also a
+        // caller bug.
+        debug_assert!(
+            sorted_keys
+                .windows(2)
+                .all(|w| self.comparator.compare(w[0].0, w[1].0) == std::cmp::Ordering::Less),
+            "batch_get input must be strictly sorted ascending by key under \
+             the table's comparator; unsorted/duplicate input produces silent \
+             None misses because the two-pointer walk assumes monotone keys"
+        );
+
         let global_seqno = self.global_seqno();
         let table_seqno = seqno.saturating_sub(global_seqno);
 
@@ -608,7 +635,13 @@ impl Table {
             // doesn't under-report compared to N independent get()s.
             #[cfg(feature = "metrics")]
             {
-                use std::sync::atomic::Ordering::Relaxed;
+                // Use core::* rather than std::* re-exports: the
+                // `metrics` feature isn't std-gated in Cargo.toml,
+                // and `Ordering` lives in `core::sync::atomic`
+                // unchanged — keeps this hot-path import no-std
+                // friendly without any runtime impact (the std
+                // path is just a re-export of the core symbol).
+                use core::sync::atomic::Ordering::Relaxed;
                 if had_filter && !passing.is_empty() {
                     self.metrics
                         .filter_queries
@@ -708,7 +741,9 @@ impl Table {
 
         #[cfg(feature = "metrics")]
         {
-            use std::sync::atomic::Ordering::Relaxed;
+            // core::* (vs the std re-export) for no-std friendliness;
+            // see the comment on the matching import above.
+            use core::sync::atomic::Ordering::Relaxed;
             // Mirror Table::get's accounting: count negative
             // point lookups that reached storage despite a
             // filter being present. Only keys that passed bloom
