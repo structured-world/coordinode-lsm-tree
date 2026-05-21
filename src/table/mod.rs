@@ -479,6 +479,20 @@ impl Table {
     /// callers distinguish via [`InternalValue`]'s value type),
     /// `None` for absent keys.
     ///
+    /// # Hash contract
+    ///
+    /// `key_hash` **must** equal `crate::hash::hash64(key)` — the
+    /// same function the writer used when populating the bloom
+    /// filter. Bloom decisions inside [`Self::check_bloom`] are
+    /// driven by the hash, not the key bytes, and the
+    /// key↔hash agreement check is a `debug_assert!` only:
+    /// release builds trust the caller. Passing a wrong hash in
+    /// release produces false-negative skips — keys are silently
+    /// dropped from the result vector as if they weren't in the
+    /// table. Callers should derive both values from the same
+    /// `(&[u8], u64) = (key, hash64(key))` expression at the
+    /// same scope to make the agreement trivially auditable.
+    ///
     /// # Why this exists vs. calling [`Table::get`] in a loop
     ///
     /// Sequential per-key calls each pay:
@@ -577,6 +591,22 @@ impl Table {
         // can cover that key; everything past it walks forward.
         let first_key = sorted_keys[passing[0]].0;
         let Some(mut block_iter) = self.block_index.forward_reader(first_key, table_seqno) else {
+            // No block can contain the smallest passing key — every
+            // passing key is "negative with filter present" for
+            // metrics accounting purposes, mirroring Table::get
+            // where a bloom-passing key that point_read can't find
+            // increments filter_queries. Falling through to the
+            // shared metrics block below ensures the batch path
+            // doesn't under-report compared to N independent get()s.
+            #[cfg(feature = "metrics")]
+            {
+                use std::sync::atomic::Ordering::Relaxed;
+                if had_filter && !passing.is_empty() {
+                    self.metrics
+                        .filter_queries
+                        .fetch_add(passing.len(), Relaxed);
+                }
+            }
             return Ok(results);
         };
 

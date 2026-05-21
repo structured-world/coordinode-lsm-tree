@@ -2323,13 +2323,17 @@ fn batch_get_single_block_multiple_keys_returns_in_input_order() -> crate::Resul
 }
 
 #[test]
-fn batch_get_across_blocks_loads_each_block_once() -> crate::Result<()> {
-    // Force one item per data block via tiny block size + rotate_every=1.
-    // Then a batch covering multiple keys must walk forward through
-    // blocks without re-seeking the index per key. The behavioural
-    // assertion is correctness; the "loaded once" property is the
-    // perf claim verified by the cache-hit-rate of load_data_block
-    // under instrumentation, not by this unit test.
+fn batch_get_keys_spread_across_blocks_return_correct_values() -> crate::Result<()> {
+    // Force one item per data block via tiny block size +
+    // rotate_every=1. Then a batch covering keys from different
+    // blocks must produce the correct value for each key. This
+    // test asserts CORRECTNESS only — the "block loaded at most
+    // once for the entire batch" perf claim is a property of the
+    // implementation, verifiable through the block cache's
+    // hit-rate counters under metrics instrumentation, but
+    // deliberately not asserted here (the test would need to
+    // hook the cache to count loads, which would couple to
+    // internal cache mechanics).
     let items: Vec<_> = (0u32..8)
         .map(|i| {
             let key = format!("key-{i:04}");
@@ -2386,12 +2390,12 @@ fn batch_get_missing_keys_return_none_present_keys_return_some() -> crate::Resul
         |table| {
             // Mix present and absent keys, sorted ascending.
             let batch: Vec<(&[u8], u64)> = vec![
-                (b"a" as &[u8], hash64(b"a")),  // absent (before any key)
-                (b"b" as &[u8], hash64(b"b")),  // present
-                (b"c" as &[u8], hash64(b"c")),  // absent (between b and d)
-                (b"d" as &[u8], hash64(b"d")),  // present
-                (b"f" as &[u8], hash64(b"f")),  // present (last key)
-                (b"g" as &[u8], hash64(b"g")),  // absent (after last key)
+                (b"a" as &[u8], hash64(b"a")), // absent (before any key)
+                (b"b" as &[u8], hash64(b"b")), // present
+                (b"c" as &[u8], hash64(b"c")), // absent (between b and d)
+                (b"d" as &[u8], hash64(b"d")), // present
+                (b"f" as &[u8], hash64(b"f")), // present (last key)
+                (b"g" as &[u8], hash64(b"g")), // absent (after last key)
             ];
             let results = table.batch_get(&batch, SeqNo::MAX)?;
             assert_eq!(results.len(), 6);
@@ -2434,8 +2438,7 @@ fn batch_get_matches_per_key_get() -> crate::Result<()> {
             // Build a query batch with a mix of present, absent,
             // and out-of-range keys.
             let keys: Vec<Vec<u8>> = (0..25).map(|i| format!("k-{i:03}").into_bytes()).collect();
-            let batch: Vec<(&[u8], u64)> =
-                keys.iter().map(|k| (k.as_slice(), hash64(k))).collect();
+            let batch: Vec<(&[u8], u64)> = keys.iter().map(|k| (k.as_slice(), hash64(k))).collect();
 
             let batch_results = table.batch_get(&batch, SeqNo::MAX)?;
             let single_results: Vec<_> = batch
@@ -2446,7 +2449,8 @@ fn batch_get_matches_per_key_get() -> crate::Result<()> {
             assert_eq!(batch_results.len(), single_results.len());
             for (i, (b, s)) in batch_results.iter().zip(&single_results).enumerate() {
                 assert_eq!(
-                    b, s,
+                    b,
+                    s,
                     "batch/single divergence at index {i} (key={})",
                     String::from_utf8_lossy(&keys[i]),
                 );
