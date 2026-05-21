@@ -54,6 +54,12 @@ jobs:
           # because this workflow does NOT publish artifacts via
           # actions/upload-artifact, so the .git/config token
           # never leaves the runner.
+          #
+          # Set persist-credentials EXPLICITLY (not relying on the
+          # default) so the requirement is grep-visible and survives
+          # future "harden every workflow" sweeps that might
+          # otherwise blanket-set persist-credentials: false here.
+          persist-credentials: true
 
       - name: Add upstream remote
         run: git remote add "$UPSTREAM_REMOTE" "$UPSTREAM_URL"
