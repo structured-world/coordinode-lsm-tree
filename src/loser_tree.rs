@@ -63,6 +63,57 @@ use alloc::vec::Vec;
 use core::cmp::Ordering;
 use core::mem::MaybeUninit;
 
+/// Comparator strategy used by the tournament.
+///
+/// This trait exists instead of a plain `Fn(&E, &E) -> Ordering`
+/// bound so callers can pass a concrete struct (e.g.
+/// `SeekingMerger`'s `MergerCmp`) that monomorphises through the
+/// type system. A blanket impl forwards every `Fn` closure to
+/// this trait, so test code and internal helpers that already use
+/// `|a, b| ...` closures keep working without change.
+///
+/// **Why not just `Fn`:** wrapping the closure in `Box<dyn Fn>`
+/// to satisfy a non-generic field type adds one indirect call per
+/// `cmp_indices` invocation — and `cmp_indices` runs O(log cap)
+/// times per `replace_min` / `pop_min` step, on the merger's
+/// hottest path. With this trait, the comparator's concrete
+/// type stays visible to LLVM, so the call inlines flat.
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` is not a comparator for `LoserTree<{E}, _>`",
+    label = "missing `EntryComparator<{E}>` impl",
+    note = "implement `EntryComparator<{E}>` directly, or pass a closure of \
+            type `Fn(&{E}, &{E}) -> core::cmp::Ordering` — a blanket impl \
+            forwards every such closure to this trait automatically"
+)]
+pub trait EntryComparator<E> {
+    /// Compare two leaf values. Smaller wins in the tournament;
+    /// to get max-semantics pass a reversed comparator.
+    fn compare(&self, a: &E, b: &E) -> Ordering;
+}
+
+/// Blanket impl so existing `Fn(&E, &E) -> Ordering` closures
+/// (tests, ad-hoc callers) satisfy the trait without rewriting.
+/// `#[inline(always)]` propagates the closure's body into the
+/// call site at the same cost as a direct call — the indirection
+/// only existed when the closure was hidden behind `Box<dyn Fn>`,
+/// which this trait specifically avoids by keeping the comparator
+/// type concrete at every monomorphisation.
+#[diagnostic::do_not_recommend]
+impl<E, F> EntryComparator<E> for F
+where
+    F: Fn(&E, &E) -> Ordering,
+{
+    #[expect(
+        clippy::inline_always,
+        reason = "blanket forwarder must inline or the indirection this trait \
+                  eliminates comes back; verified flat in disassembly"
+    )]
+    #[inline(always)]
+    fn compare(&self, a: &E, b: &E) -> Ordering {
+        (self)(a, b)
+    }
+}
+
 /// A min-tournament tree over `n` input slots.
 ///
 /// The "min" comes from how `cmp` is interpreted: the leaf whose value
@@ -133,7 +184,7 @@ impl<E, F> Drop for LoserTree<E, F> {
 
 impl<E, F> LoserTree<E, F>
 where
-    F: Fn(&E, &E) -> Ordering,
+    F: EntryComparator<E>,
 {
     /// Build a tournament over `initial` (one entry per source slot).
     ///
@@ -459,7 +510,7 @@ where
                 // build/replace/pop/take_slot).
                 let va = unsafe { self.leaves[a].assume_init_ref() };
                 let vb = unsafe { self.leaves[b].assume_init_ref() };
-                (self.cmp)(va, vb)
+                self.cmp.compare(va, vb)
             }
             (true, false) => Ordering::Less,
             (false, true) => Ordering::Greater,

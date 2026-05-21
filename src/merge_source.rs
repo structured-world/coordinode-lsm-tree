@@ -177,12 +177,20 @@ impl<I> MergeSource for CoherentIterSource<I>
 where
     I: DoubleEndedIterator<Item = IterItem> + Send,
 {
+    // `#[inline]` on the per-step forwards — when this adapter is
+    // used through a concrete type (not boxed behind `dyn`), the
+    // hot merger loop sees through to `I::next` / `I::next_back`
+    // and the wrapper compiles away. Doesn't help the boxed path
+    // (vtable call is intrinsic there) but is free to add.
+    #[inline]
     fn next(&mut self) -> Option<IterItem> {
         Iterator::next(&mut self.iter)
     }
+    #[inline]
     fn next_back(&mut self) -> Option<IterItem> {
         DoubleEndedIterator::next_back(&mut self.iter)
     }
+    #[inline]
     fn seek(&mut self, _target: &InternalKey) -> crate::Result<()> {
         // No-op: callers using this adapter promise the iterator's
         // cursors are coherent (e.g., std vec/btree iters). Direction

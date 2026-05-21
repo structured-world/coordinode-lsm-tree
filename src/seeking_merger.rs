@@ -29,7 +29,6 @@
 use crate::comparator::SharedComparator;
 use crate::loser_tree::LoserTree;
 use crate::merge_source::{CoherentMergeSource, IterItem, MergeSource};
-use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::cmp::Ordering;
 
@@ -41,37 +40,73 @@ struct MergerEntry {
     value: crate::InternalValue,
 }
 
-/// Boxed comparator. `Box<dyn Fn>` keeps `SeekingMerger`'s type
-/// signature simple at the cost of one indirect call per
-/// comparison. If profiling shows this dominates (the old
-/// `MergeHeap` had identical dispatch through `Arc<dyn
-/// UserComparator>`, so it's a wash relative to the prior baseline),
-/// the comparator can later be parameterised generically through
-/// the merger.
-type EntryCmp = Box<dyn Fn(&MergerEntry, &MergerEntry) -> Ordering + Send + Sync>;
-
-fn build_min_cmp(comparator: SharedComparator) -> EntryCmp {
-    Box::new(move |a, b| {
-        a.value
-            .key
-            .compare_with(&b.value.key, comparator.as_ref())
-            .then_with(|| a.source.cmp(&b.source))
-    })
+/// Tournament direction the comparator dispatches on.
+///
+/// One discriminant byte; lets a single `MergerCmp` struct cover
+/// both the forward (min-tree, lower source index wins on tie)
+/// and backward (max-tree, higher source index wins on tie)
+/// orderings without a second type.
+#[derive(Clone, Copy)]
+enum MergerCmpDir {
+    /// Smaller key wins; ties broken by lower source index.
+    Forward,
+    /// Larger key wins (reversed key comparison + reversed
+    /// source-order tiebreak); matches the legacy `MergeHeap`
+    /// backward semantics.
+    Backward,
 }
 
-fn build_max_cmp(comparator: SharedComparator) -> EntryCmp {
-    // Reversed key comparison + reversed source-order tiebreak. The
-    // key reversal elects the LARGEST key as winner under the loser
-    // tree's "smaller wins" semantics. The source-index reversal
-    // keeps next_back()'s tie-break opposite of next()'s, matching
-    // the legacy MergeHeap behaviour (forward picks lower source
-    // index on key+seqno tie; backward picks higher source index).
-    Box::new(move |a, b| {
-        b.value
-            .key
-            .compare_with(&a.value.key, comparator.as_ref())
-            .then_with(|| b.source.cmp(&a.source))
-    })
+/// Concrete comparator passed to `LoserTree<MergerEntry, _>`.
+///
+/// Replaces the previous `Box<dyn Fn(...) -> Ordering>` wrapper.
+/// The loser-tree generic bound is `EntryComparator<MergerEntry>`,
+/// which `MergerCmp` implements directly — so `cmp_indices` calls
+/// `self.cmp.compare(va, vb)` and LLVM sees the concrete struct
+/// at every monomorphisation. The closure-in-a-box that the MVP
+/// used cost one indirect dispatch per comparison; this path
+/// removes it.
+#[derive(Clone)]
+struct MergerCmp {
+    comparator: SharedComparator,
+    direction: MergerCmpDir,
+}
+
+impl crate::loser_tree::EntryComparator<MergerEntry> for MergerCmp {
+    #[expect(
+        clippy::inline_always,
+        reason = "called O(log cap) per replay step on the merger's hot path; \
+                  matching the loser-tree's own #[inline(always)] on cmp_indices \
+                  is what makes the dispatch flatten — verified in disassembly"
+    )]
+    #[inline(always)]
+    fn compare(&self, a: &MergerEntry, b: &MergerEntry) -> Ordering {
+        match self.direction {
+            MergerCmpDir::Forward => a
+                .value
+                .key
+                .compare_with(&b.value.key, self.comparator.as_ref())
+                .then_with(|| a.source.cmp(&b.source)),
+            MergerCmpDir::Backward => b
+                .value
+                .key
+                .compare_with(&a.value.key, self.comparator.as_ref())
+                .then_with(|| b.source.cmp(&a.source)),
+        }
+    }
+}
+
+fn build_min_cmp(comparator: SharedComparator) -> MergerCmp {
+    MergerCmp {
+        comparator,
+        direction: MergerCmpDir::Forward,
+    }
+}
+
+fn build_max_cmp(comparator: SharedComparator) -> MergerCmp {
+    MergerCmp {
+        comparator,
+        direction: MergerCmpDir::Backward,
+    }
 }
 
 /// Merging iterator over `MergeSource`s, backed by two independent
@@ -112,8 +147,8 @@ pub struct SeekingMerger<S: MergeSource> {
     sources: Vec<S>,
     n_sources: usize,
     comparator: SharedComparator,
-    forward_tree: Option<LoserTree<MergerEntry, EntryCmp>>,
-    backward_tree: Option<LoserTree<MergerEntry, EntryCmp>>,
+    forward_tree: Option<LoserTree<MergerEntry, MergerCmp>>,
+    backward_tree: Option<LoserTree<MergerEntry, MergerCmp>>,
     /// Refill error queued during the previous forward step. When
     /// a source's `.next()` fails AFTER a value was already buffered
     /// in the tournament, we yield the buffered value first and stash
