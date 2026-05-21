@@ -164,12 +164,15 @@ where
     #[inline]
     #[expect(
         clippy::indexing_slicing,
-        reason = "z_words[equation.start + offset] is bounds-safe by construction: \
-                  start ∈ [0, m-w] and offset ∈ [0, w-1] (set-bit position in coeff_lo, \
-                  which has at most w bits), so the sum is < m = z_words.len(). The doc \
-                  comment above (lines 195-197) states this invariant explicitly; \
-                  per-row .get() would add a branch on the probe hot path and dominate \
-                  the per-iter cost"
+        reason = "All indexing in this function is bounds-safe by construction. \
+                  `fingerprint_buf[0]` is a fixed-size [u64; 1] array — index 0 \
+                  is always in bounds. `z_words[equation.start + offset]` in the \
+                  probe loop is gated by the algorithmic invariant `start ∈ [0, m-w]` \
+                  and `offset ∈ [0, w-1]` (set-bit position in coeff_lo, which has \
+                  at most w bits), so the sum is `< m = z_words.len()`. The inline \
+                  GF(2) XOR-reduce block has a `// start ∈ [0, m-w] ...` comment \
+                  restating this invariant near the access. Per-row `.get()` would \
+                  add a branch on the probe hot path and dominate per-iter cost."
     )]
     pub fn contains_hash(&self, hash: u64) -> bool {
         // BurrParams::with_fp_rate / with_bpk both clamp r to 1..=64, so
