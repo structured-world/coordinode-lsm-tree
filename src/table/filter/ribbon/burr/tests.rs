@@ -9,6 +9,24 @@
 //! End-to-end coverage through the table writer + reader path lives in
 //! `tests/burr_filter_end_to_end.rs`.
 
+// Test code uses panic-on-error patterns (expect / unwrap) and direct
+// indexing freely for assertion ergonomics. Re-expecting the lints
+// here lifts the module-level `#![deny]` in burr/mod.rs for this
+// `#[cfg(test)]` scope only — production paths in builder.rs /
+// wire.rs / threshold.rs / filter.rs still hold the strict bar.
+#![expect(
+    clippy::unwrap_used,
+    reason = "test assertions over known-good fixtures; failure surfaces via panic"
+)]
+#![expect(
+    clippy::expect_used,
+    reason = "test assertions over known-good fixtures; failure surfaces via panic"
+)]
+#![expect(
+    clippy::indexing_slicing,
+    reason = "test code indexes into fixture buffers with known sizes"
+)]
+
 use std::collections::hash_map::DefaultHasher;
 use std::hash::BuildHasherDefault;
 

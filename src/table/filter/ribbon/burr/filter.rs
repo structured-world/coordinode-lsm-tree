@@ -162,6 +162,18 @@ where
     /// reader, builder, wire codec) for no in-tree benefit. The
     /// doc-comment contract above is the canonical guarantee.
     #[inline]
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "All indexing in this function is bounds-safe by construction. \
+                  `fingerprint_buf[0]` is a fixed-size [u64; 1] array — index 0 \
+                  is always in bounds. `z_words[equation.start + offset]` in the \
+                  probe loop is gated by the algorithmic invariant `start ∈ [0, m-w]` \
+                  and `offset ∈ [0, w-1]` (set-bit position in coeff_lo, which has \
+                  at most w bits), so the sum is `< m = z_words.len()`. The inline \
+                  GF(2) XOR-reduce block has a `// start ∈ [0, m-w] ...` comment \
+                  restating this invariant near the access. Per-row `.get()` would \
+                  add a branch on the probe hot path and dominate per-iter cost."
+    )]
     pub fn contains_hash(&self, hash: u64) -> bool {
         // BurrParams::with_fp_rate / with_bpk both clamp r to 1..=64, so
         // stride is always 1. Single u64 buffer for fingerprint, scalar

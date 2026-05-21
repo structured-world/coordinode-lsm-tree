@@ -58,15 +58,19 @@
 
 // The parent `ribbon::` module-level `#![allow(...)]` covers vendored
 // upstream code (clippy::indexing_slicing, clippy::expect_used,
-// clippy::unwrap_used, etc.) and currently leaks into this BuRR
-// submodule because crate-attribute allow propagates to children.
-// Re-denying here would require migrating ~30 internal indexing /
-// expect sites in builder.rs / wire.rs / threshold.rs / filter.rs to
-// `.get(...).ok_or(...)?` or `#[expect(..., reason)]` per use site —
-// a sizeable but tractable refactor that's tracked as a follow-up
-// rather than bundled into this PR. New BuRR code added in this PR
-// uses `#[expect(..., reason)]` per use site for any new
-// suppressions (see params.rs / wire.rs).
+// clippy::unwrap_used, etc.) and previously leaked into this BuRR
+// submodule. We re-deny those three lints here so first-party BuRR
+// code holds itself to the same bar as the rest of the crate. Each
+// remaining `expect()` / `unwrap()` / direct index inside BuRR is
+// either:
+//
+//   * justified by a `#[expect(..., reason = "<invariant>")]`
+//     attribute documenting why the panic can't happen (per-call-site
+//     for hot paths, function-scoped where multiple sites share the
+//     same invariant), OR
+//   * inside the `#[cfg(test)]` test module which has its own broader
+//     suppression for test ergonomics.
+#![deny(clippy::indexing_slicing, clippy::expect_used, clippy::unwrap_used)]
 
 pub mod builder;
 pub mod error;

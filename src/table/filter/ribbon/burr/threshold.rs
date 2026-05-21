@@ -59,6 +59,13 @@ const CAP_DEN: usize = 10;
 /// extra key bumps. Tolerable for the MVP; the analytic per-block
 /// variant from the paper handles this exactly.
 #[must_use]
+#[expect(
+    clippy::indexing_slicing,
+    reason = "block_idx is bounds-checked by `if block_idx < block_count`; \
+              thresholds[i] uses `i` from `block_offsets.iter().enumerate()` \
+              over a vec we just sized to block_count; offsets[cap_per_block] \
+              is gated by the earlier `if offsets.len() <= cap_per_block` early-continue"
+)]
 pub(crate) fn compute_thresholds(equations: &[StandardEquation], m: usize, b: u8) -> Vec<u8> {
     debug_assert!(m > 0, "compute_thresholds requires m > 0");
     debug_assert!(b > 0, "compute_thresholds requires b > 0");
@@ -157,6 +164,10 @@ pub(crate) fn is_bumped(eq: &StandardEquation, thresholds: &[u8], b: u8) -> bool
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::indexing_slicing,
+    reason = "tests index into known-sized fixture vectors; bounds are part of the assertion"
+)]
 mod tests {
     use super::super::super::hashing::StandardEquation;
     use super::*;

@@ -189,6 +189,18 @@ pub(crate) struct DecodedFilter<'a> {
 /// Parse a wire-format BuRR filter slice. Returns an error if the magic
 /// bytes don't match, the version is unrecognised, or the buffer is
 /// truncated.
+#[expect(
+    clippy::indexing_slicing,
+    reason = "every slice in this function is preceded by an explicit length \
+              check that returns InvalidHeader on truncation: \
+              bytes[pos..pos+4]/[pos+4..pos+8]/[pos+8..pos+12] are gated by the \
+              `bytes.len() < header_end` (LAYER_HEADER_LEN = 12) check on \
+              the line above; bytes[pos..thresholds_end] and \
+              bytes[thresholds_end..z_end] are gated by checked_add + \
+              `bytes.len() < z_end`. Replacing with .get(..).ok_or(...) \
+              would multiply the function's error-return paths without \
+              improving safety."
+)]
 pub(crate) fn decode(bytes: &[u8]) -> crate::Result<DecodedFilter<'_>> {
     if bytes.len() < HEADER_LEN {
         return Err(crate::Error::InvalidHeader("BurrFilter"));
@@ -339,6 +351,18 @@ pub(crate) fn decode(bytes: &[u8]) -> crate::Result<DecodedFilter<'_>> {
 #[expect(
     clippy::many_single_char_names,
     reason = "r/w/b/m are well-known params from the BuRR/Ribbon literature; single-letter naming matches the rest of the module."
+)]
+#[expect(
+    clippy::indexing_slicing,
+    reason = "every slice/index in this function is preceded by an explicit \
+              length check: bytes[..MAGIC_BYTES.len()] and the per-byte \
+              MAGIC_BYTES.len() + N reads are gated by `bytes.len() < HEADER_LEN` \
+              on the line above (HEADER_LEN >= MAGIC_BYTES.len() + 6 + 8); \
+              the bytes[seed_off..seed_off+8] window is bounded by HEADER_LEN. \
+              Replacing with .get(..).ok_or(...) would multiply the function's \
+              error-return paths without improving safety — and this function \
+              is on the read-path hot loop, so the explicit pre-check + raw \
+              indexing avoids per-field Option unwrapping."
 )]
 pub(crate) fn contains_hash_from_bytes(bytes: &[u8], hash: u64) -> crate::Result<bool> {
     if bytes.len() < HEADER_LEN {
