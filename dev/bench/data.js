@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779383503877,
+  "lastUpdate": 1779391017014,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -7488,6 +7488,84 @@ window.BENCHMARK_DATA = {
             "value": 211092.96031016385,
             "unit": "ops/sec (normalized)",
             "extra": "raw: 462620 ops/sec | factor: 0.456 | P50: 2.0us | P99: 4.3us | P99.9: 9.6us\nthreads: 1 | elapsed: 0.43s | num: 200000 | iterations: 3 | runner: seq_wr=348913 rand_rd=1115977 cpu=117 composite=50405.6"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "ce61479a0d559b24a9c38f97b5a44bc02c9ff216",
+          "message": "perf(loser_tree): eliminate comparator dispatch, close #283 fully (#287)\n\n## Summary\n\nCloses #283 end-to-end. PR #286 (merged) closed the large-N regression\nby switching the leaf storage to `MaybeUninit` + present byte-map. The\nremaining small-N gap was dominated by THREE layered indirections on the\nmerger's per-cmp hot path:\n\n1. **Boxed-closure vtable** — `EntryCmp = Box<dyn Fn(...)>` on every\n`cmp_indices`.\n2. **Direction branch inside `MergerCmp`** — a `match self.direction` on\nevery `compare()`.\n3. **`Arc<dyn UserComparator>` vtable** — the inner key compare went\nthrough dyn-dispatch.\n\nThis PR removes all three.\n\n## Approach\n\n**Step 1 — domain trait on the loser tree.** `pub trait\nEntryComparator<E>` replaces `Fn(&E, &E) -> Ordering` as `LoserTree`'s\ngeneric bound. Blanket impl forwards every `Fn` closure with\n`#[inline(always)]`, so existing test code (closures) keeps working. The\ntrait carries `#[diagnostic::on_unimplemented]` (`{Self}`-templated,\npoints at the blanket impl); the blanket `Fn` forwarder carries\n`#[diagnostic::do_not_recommend]`.\n\n**Step 2 — concrete callable struct.** `SeekingMerger`'s `Box<dyn Fn>`\ntype alias is gone. Replaced with concrete callable types implementing\n`EntryComparator<MergerEntry>` directly. No boxed-closure vtable.\n\n**Step 3 — split direction into two types.** samply showed `MergerCmp {\ndirection: enum }` still carried a one-byte `match` branch inside every\ncomparator call. Split into `MinCmp` (forward) and `MaxCmp` (backward).\n`forward_tree: LoserTree<MergerEntry, MinCmp<C>>`, `backward_tree:\nLoserTree<MergerEntry, MaxCmp<C>>`. LLVM never emits the per-cmp branch.\n\n**Step 4 — monomorphise over `UserComparator`.**\n`InternalKey::compare_with` is now generic `<C: UserComparator +\n?Sized>` instead of taking `&dyn UserComparator`. `?Sized` keeps old\n`&dyn` callers source-compatible (pass `&*shared` and `C` resolves to\n`dyn UserComparator` — same dynamic dispatch). `SeekingMerger<S, C:\nUserComparator + Clone>` carries `comparator: C` directly; `MinCmp<C>` /\n`MaxCmp<C>` thread the concrete type. A blanket `impl<T: UserComparator\n+ ?Sized> UserComparator for Arc<T>` lets callers that already hold the\ncanonical `SharedComparator` pass it as a valid `C` (they keep the\ndyn-dispatch cost; the fast path is concrete-typed callers).\n\nAlso added `#[inline]` on `CoherentIterSource` per-step methods.\n\n## Profile evidence (samply, release + line-tables-only, 8-sec record\nper scale)\n\nAfter the full sequence, samply on `SeekingMerger`:\n\n| N | top symbols (descending) |\n|---:|---|\n| 2 | `CoherentIterSource::next` 1356, `SeekingMerger::next` (inlined\nLoserTree::replace_min) 605+383, `Arena::get_bytes` 201 |\n| 4 | `CoherentIterSource::next` 1333, `SeekingMerger::next` 811+721,\n`UserComparator::compare` 110 |\n| 30 | `CoherentIterSource::next` 1311, `SeekingMerger::next` 1148+1003,\n`skiplist::Entry::key` 310, `UserComparator::compare` 146 |\n\n`<closure as Fn>::call` / `Arc<dyn UserComparator>` vtable shims no\nlonger appear in the hot list. Remaining hot frames are intrinsic to the\nbench setup: the boxed-source `dyn MergeSource` vtable\n(`CoherentIterSource::next` ~1300 samples across all N — required\nbecause the bench passes `Vec<Box<dyn MergeSource>>` to match expected\nproduction usage of heterogeneous SST scanners), the inlined\n`LoserTree::replace_min` body, and the memtable iterator's\narena/skiplist intrinsics.\n\n## Bench delta — relative (same machine, same run)\n\n`cargo bench --bench merge` (release, full sample collection):\n\n| N | MergeHeap | SeekingMerger | Δ |\n|---:|---:|---:|---:|\n| 2 | 16.4 µs | **15.3 µs** | **-6.7% faster** |\n| 4 | 39.1 µs | **37.6 µs** | **-3.8% faster** |\n| 8 | 91.7 µs | **89.2 µs** | **-2.7% faster** |\n| 16 | 241.4 µs | **213.8 µs** | **-11.4% faster** |\n| 30 | 570.7 µs | **455.7 µs** | **-20.2% faster** |\n\n**Every N now meets BOTH the hard requirement (≤+5%) AND the goal (≤\nMergeHeap).**\n\nThe N=16 jump (vs the split-only round at -4.7%) is the clearest mono\nwin: cap=16 means ~4 cmps per replay × hundreds of steps, and every\ncmp's saved vtable cost compounds.\n\n## Bench delta — absolute (vs v4.5.0 baseline, pre-SeekingMerger)\n\nSame machine, separate runs (checked out the v4.5.0 tag and re-benched):\n\n| N | v4.5.0 Merger | SeekingMerger | Δ vs v4.5.0 |\n|---:|---:|---:|---:|\n| 2 | 17.1 µs | **15.3 µs** | **-10.5% faster** |\n| 4 | 38.2 µs | 37.6 µs | **-1.6%** (parity) |\n| 8 | 90.5 µs | 89.2 µs | **-1.4%** (parity) |\n| 16 | 227.7 µs | **213.8 µs** | **-6.1% faster** |\n| 30 | 727.1 µs | **455.7 µs** | **-37.3% faster** |\n\n`SeekingMerger` is now at parity-or-better with the v4.5.0 `Merger` at\nevery N, and dramatically faster at the scales loser-tree's\nK-1-comparison advantage was designed for.\n\n## Cumulative swing across the #283 work\n\n| N | Before #283 | After this PR | Total swing |\n|---:|---:|---:|---:|\n| 2 | +19% slower | **-6.7% faster** | **25.7 pp** |\n| 4 | +17% slower | **-3.8% faster** | **20.8 pp** |\n| 8 | +11% slower | **-2.7% faster** | **13.7 pp** |\n| 16 | +5% slower | **-11.4% faster** | **16.4 pp** |\n| 30 | -7% faster | **-20.2% faster** | **13.2 pp** |\n\n## API impact\n\n- `LoserTree<E, F>` bound widened from `F: Fn(&E, &E) -> Ordering` to\n`F: EntryComparator<E>`. Blanket impl forwards all `Fn` closures\nunchanged — fully source-compatible with existing internal callers (the\nmodule is private, so no external break).\n- `SeekingMerger<S>` becomes `SeekingMerger<S, C: UserComparator +\nClone>`. New callers must thread the concrete comparator type or use `_`\nto let inference handle it. The blanket `impl UserComparator for Arc<T>`\ncovers callers that already hold `SharedComparator`.\n- `InternalKey::compare_with` is now generic `<C: UserComparator +\n?Sized>`. Source-compatible with `&dyn UserComparator` callers via the\n`?Sized` bound. `pub(crate)` — no external surface.\n\n## Test plan\n\n- [x] 27/27 `loser_tree::tests::` + `seeking_merger::tests::` pass\n- [x] `cargo nextest run --workspace` — full suite green (full-workspace\nre-run after the mono change)\n- [x] `cargo clippy --lib --tests --benches` — clean\n- [x] Bench delta as documented above (relative + absolute)\n- [x] samply profile confirms `<closure as Fn>::call` and `Arc<dyn\nUserComparator>` vtables are gone from the hot list\n\nCloses #283.\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n\n## Summary by CodeRabbit\n\n## Release Notes\n\n* **New Features**\n* Added trait implementation enabling `Arc`-wrapped comparators to work\nseamlessly in generic APIs.\n\n* **Refactor**\n* Updated `SeekingMerger` API to accept concrete comparator types\ninstead of shared/boxed comparators.\n  * Refactored comparator abstraction in loser tree operations.\n  * Enhanced inline handling in merge source iteration.\n\n<!-- review_stack_entry_start -->\n\n[![Review Change\nStack](https://storage.googleapis.com/coderabbit_public_assets/review-stack-in-coderabbit-ui.svg)](https://app.coderabbit.ai/change-stack/structured-world/coordinode-lsm-tree/pull/287?utm_source=github_walkthrough&utm_medium=github&utm_campaign=change_stack)\n\n<!-- review_stack_entry_end -->\n\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-05-21T22:15:38+03:00",
+          "tree_id": "9cb16ee5fed414a36063d2354bc44cda498300ae",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/ce61479a0d559b24a9c38f97b5a44bc02c9ff216"
+        },
+        "date": 1779391015943,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 1203358.892593456,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 1856331 ops/sec | factor: 0.648 | P50: 0.4us | P99: 2.4us | P99.9: 5.8us\nthreads: 1 | elapsed: 0.11s | num: 200000 | iterations: 3 | runner: seq_wr=223428 rand_rd=687898 cpu=108 composite=35480.4"
+          },
+          {
+            "name": "fillrandom",
+            "value": 684004.055959021,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 1055161 ops/sec | factor: 0.648 | P50: 0.7us | P99: 3.2us | P99.9: 7.7us\nthreads: 1 | elapsed: 0.19s | num: 200000 | iterations: 3 | runner: seq_wr=223428 rand_rd=687898 cpu=108 composite=35480.4"
+          },
+          {
+            "name": "readrandom",
+            "value": 293185.8790669865,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 452276 ops/sec | factor: 0.648 | P50: 2.0us | P99: 6.3us | P99.9: 13.9us\nthreads: 1 | elapsed: 0.44s | num: 200000 | iterations: 3 | runner: seq_wr=223428 rand_rd=687898 cpu=108 composite=35480.4"
+          },
+          {
+            "name": "readseq",
+            "value": 1444693.686339127,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 2228620 ops/sec | factor: 0.648 | P50: 0.3us | P99: 4.7us | P99.9: 9.8us\nthreads: 1 | elapsed: 0.09s | num: 200000 | iterations: 3 | runner: seq_wr=223428 rand_rd=687898 cpu=108 composite=35480.4"
+          },
+          {
+            "name": "seekrandom",
+            "value": 203768.84865363364,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 314339 ops/sec | factor: 0.648 | P50: 2.8us | P99: 7.3us | P99.9: 14.5us\nthreads: 1 | elapsed: 0.64s | num: 200000 | iterations: 3 | runner: seq_wr=223428 rand_rd=687898 cpu=108 composite=35480.4"
+          },
+          {
+            "name": "prefixscan",
+            "value": 115571.60546738876,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 178284 ops/sec | factor: 0.648 | P50: 5.2us | P99: 7.6us | P99.9: 20.9us\nthreads: 1 | elapsed: 1.12s | num: 200000 | iterations: 3 | runner: seq_wr=223428 rand_rd=687898 cpu=108 composite=35480.4"
+          },
+          {
+            "name": "overwrite",
+            "value": 651165.60047447,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 1004504 ops/sec | factor: 0.648 | P50: 0.8us | P99: 3.2us | P99.9: 9.8us\nthreads: 1 | elapsed: 0.20s | num: 200000 | iterations: 3 | runner: seq_wr=223428 rand_rd=687898 cpu=108 composite=35480.4"
+          },
+          {
+            "name": "mergerandom",
+            "value": 466073.7463258474,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 718977 ops/sec | factor: 0.648 | P50: 0.4us | P99: 0.6us | P99.9: 3.3us\nthreads: 1 | elapsed: 0.28s | num: 200000 | iterations: 3 | runner: seq_wr=223428 rand_rd=687898 cpu=108 composite=35480.4"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 231179.69431320584,
+            "unit": "ops/sec (normalized)",
+            "extra": "raw: 356623 ops/sec | factor: 0.648 | P50: 2.5us | P99: 9.1us | P99.9: 16.9us\nthreads: 1 | elapsed: 0.56s | num: 200000 | iterations: 3 | runner: seq_wr=223428 rand_rd=687898 cpu=108 composite=35480.4"
           }
         ]
       }
