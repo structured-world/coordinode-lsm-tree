@@ -2461,3 +2461,102 @@ fn batch_get_matches_per_key_get() -> crate::Result<()> {
         Some(|writer: Writer| writer.use_data_block_size(96)),
     )
 }
+
+#[test]
+fn batch_get_same_user_key_across_block_boundary_finds_older_visible_version() -> crate::Result<()>
+{
+    // Regression for the multi-block MVCC walk bug in batch_get.
+    //
+    // The bug: when batch_get's inner loop hits a key with
+    // `key == block.end_key` AND `point_read` returns None
+    // (no visible entry in this block), the loop advanced `p`
+    // unconditionally — so the walk skipped to the NEXT batch
+    // key without checking whether the SAME user key continues
+    // into the NEXT block. `Table::get` handles this case via
+    // `point_read_inner`'s end-key boundary check; the batch
+    // path must mirror it.
+    //
+    // To trigger the bug we need:
+    //   1. `forward_reader` lands at a block whose end_key
+    //      equals some batched key K, and
+    //   2. that block has no visible version of K at the query
+    //      seqno, and
+    //   3. the next block contains the visible version of K.
+    //
+    // Single-key fixtures don't reproduce: `forward_reader` is
+    // seqno-aware enough to seek past a block that has no
+    // visible entries for the lone passing key, so the iter
+    // lands at block 1 directly. We need a SECOND batched key
+    // earlier in the order to force the seek to land at
+    // block 0 (which IS the block for that earlier key), so
+    // the later batched key then exercises the equal-end-key /
+    // None-point_read / "look in next block" path.
+    //
+    // Fixture: user keys "0" (one version at seqno=1) +
+    // five versions of "a" (seqno 5 → 1), `rotate_every=3`.
+    // Internal-key sort puts "0" before any "a"; the resulting
+    // blocks are:
+    //   block 0: [0@1, a@5, a@4]   end_key="a"
+    //   block 1: [a@3, a@2, a@1]   end_key="a"
+    //
+    // Query batch = [("0", h0), ("a", ha)] at snapshot seqno=3.
+    // forward_reader seeks to block 0 to satisfy "0".
+    // The "a" then sees end_key="a" with no visible version
+    // in block 0 (all seqnos ≥ 3) — the fix must keep the
+    // walk going into block 1 where a@2 is visible.
+    let items = [
+        crate::InternalValue::from_components(b"0", b"zero", 1, crate::ValueType::Value),
+        crate::InternalValue::from_components(b"a", b"5", 5, crate::ValueType::Value),
+        crate::InternalValue::from_components(b"a", b"4", 4, crate::ValueType::Value),
+        crate::InternalValue::from_components(b"a", b"3", 3, crate::ValueType::Value),
+        crate::InternalValue::from_components(b"a", b"2", 2, crate::ValueType::Value),
+        crate::InternalValue::from_components(b"a", b"1", 1, crate::ValueType::Value),
+    ];
+
+    test_with_table(
+        &items,
+        |table| {
+            assert_eq!(2, table.metadata.data_block_count);
+
+            let batch: Vec<(&[u8], u64)> = vec![(b"0", hash64(b"0")), (b"a", hash64(b"a"))];
+
+            // snapshot seqno=3: visible seqnos < 3.
+            //   "0" → 0@1 (only version, visible)
+            //   "a" → a@2 (largest visible; a@5/4/3 are not)
+            let results = table.batch_get(&batch, 3)?;
+            assert_eq!(results.len(), 2);
+            assert_eq!(
+                &*results[0]
+                    .as_ref()
+                    .expect("0@1 must be found in block 0")
+                    .value,
+                b"zero",
+            );
+            assert_eq!(
+                &*results[1]
+                    .as_ref()
+                    .expect("a@2 must be found via block 1")
+                    .value,
+                b"2",
+                "batch_get must walk past block 0 (end_key=a, but all a-seqnos ≥3) \
+                 into block 1 (end_key=a, seqnos 2 and 1) to find the visible version \
+                 at snapshot 3",
+            );
+
+            // Sanity: cross-check against Table::get for both keys.
+            let single_zero = table.get(b"0", 3, hash64(b"0"))?;
+            let single_a = table.get(b"a", 3, hash64(b"a"))?;
+            assert_eq!(
+                results[0], single_zero,
+                "batch_get must match Table::get for '0'"
+            );
+            assert_eq!(
+                results[1], single_a,
+                "batch_get must match Table::get for 'a'"
+            );
+            Ok(())
+        },
+        Some(3),
+        Some(|x| x),
+    )
+}
