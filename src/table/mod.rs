@@ -590,7 +590,7 @@ impl Table {
         debug_assert!(
             sorted_keys
                 .windows(2)
-                .all(|w| self.comparator.compare(w[0].0, w[1].0) == std::cmp::Ordering::Less),
+                .all(|w| self.comparator.compare(w[0].0, w[1].0) == core::cmp::Ordering::Less),
             "batch_get input must be strictly sorted ascending by key under \
              the table's comparator; unsorted/duplicate input produces silent \
              None misses because the two-pointer walk assumes monotone keys"
@@ -676,7 +676,7 @@ impl Table {
             // the next passing one is in a later block — in
             // which case we skip the load.
             let first_in_block = sorted_keys[passing[p]].0;
-            if self.comparator.compare(first_in_block, end_key) == std::cmp::Ordering::Greater {
+            if self.comparator.compare(first_in_block, end_key) == core::cmp::Ordering::Greater {
                 // The next passing key is BEYOND this block's
                 // range. Skip the load and advance to the next
                 // block in the index.
@@ -709,8 +709,8 @@ impl Table {
                 let key_idx = passing[p];
                 let key = sorted_keys[key_idx].0;
                 match self.comparator.compare(key, end_key) {
-                    std::cmp::Ordering::Greater => break,
-                    std::cmp::Ordering::Less => {
+                    core::cmp::Ordering::Greater => break,
+                    core::cmp::Ordering::Less => {
                         if let Some(mut item) =
                             data_block.point_read(key, table_seqno, &self.comparator)?
                         {
@@ -724,7 +724,7 @@ impl Table {
                         }
                         p += 1;
                     }
-                    std::cmp::Ordering::Equal => {
+                    core::cmp::Ordering::Equal => {
                         if let Some(mut item) =
                             data_block.point_read(key, table_seqno, &self.comparator)?
                         {
