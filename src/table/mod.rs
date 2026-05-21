@@ -443,7 +443,8 @@ impl Table {
 
             // NOTE: If the last block key is higher than ours,
             // our key cannot be in the next block
-            if self.comparator.compare(block_handle.end_key(), key) == std::cmp::Ordering::Greater {
+            if self.comparator.compare(block_handle.end_key(), key) == core::cmp::Ordering::Greater
+            {
                 return Ok(None);
             }
         }
@@ -1281,7 +1282,7 @@ impl Table {
 
             // Validate invariant: start < end using the tree's comparator
             // (reject corrupted or misordered intervals)
-            if comparator.compare(&start, &end) != std::cmp::Ordering::Less {
+            if comparator.compare(&start, &end) != core::cmp::Ordering::Less {
                 log::error!("Range tombstone block: invalid interval (start >= end)");
                 return Err(crate::Error::RangeTombstoneDecode {
                     field: "interval",
