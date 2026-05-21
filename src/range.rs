@@ -8,7 +8,7 @@ use crate::{
     key::InternalKey,
     memtable::Memtable,
     merge_operator::MergeOperator,
-    merge_source::{CoherentIterSource, CoherentMergeSource},
+    merge_source::CoherentIterSource,
     mvcc_stream::MvccStream,
     range_tombstone::RangeTombstone,
     range_tombstone_filter::RangeTombstoneFilter,
@@ -37,6 +37,15 @@ pub fn seqno_filter(item_seqno: SeqNo, seqno: SeqNo) -> bool {
 /// here (they all share a single front/back cursor over the
 /// remaining range).
 ///
+/// The source type stays concrete (`CoherentIterSource<BoxedIterator<'a>>`)
+/// rather than being re-boxed behind a `dyn MergeSource` trait
+/// object: `BoxedIterator` is itself already a heap-allocated
+/// trait object, so wrapping it in another `Box<dyn ...>` would
+/// cost an extra allocation per source AND an extra vtable
+/// dispatch on every `next`/`next_back`. With the concrete
+/// adapter type, only the inner `BoxedIterator`'s vtable
+/// remains — exactly one indirect call per per-step source pull.
+///
 /// The compaction merge path still uses the legacy `Merger`
 /// because compaction `Scanner`s are forward-only (`Iterator`,
 /// not `DoubleEndedIterator`) and `MergeSource` requires
@@ -44,11 +53,9 @@ pub fn seqno_filter(item_seqno: SeqNo, seqno: SeqNo) -> bool {
 fn build_seeking<'a>(
     iters: Vec<BoxedIterator<'a>>,
     comparator: SharedComparator,
-) -> SeekingMerger<Box<dyn CoherentMergeSource + 'a>, SharedComparator> {
-    let sources: Vec<Box<dyn CoherentMergeSource + 'a>> = iters
-        .into_iter()
-        .map(|it| Box::new(CoherentIterSource::new(it)) as Box<dyn CoherentMergeSource + 'a>)
-        .collect();
+) -> SeekingMerger<CoherentIterSource<BoxedIterator<'a>>, SharedComparator> {
+    let sources: Vec<CoherentIterSource<BoxedIterator<'a>>> =
+        iters.into_iter().map(CoherentIterSource::new).collect();
     SeekingMerger::new(sources, comparator)
 }
 
