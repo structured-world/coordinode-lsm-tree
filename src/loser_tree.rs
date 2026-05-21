@@ -116,7 +116,7 @@ where
     }
 
     /// Whether every slot is exhausted (`None`).
-    #[inline]
+    #[inline(always)]
     pub fn is_empty(&self) -> bool {
         self.active == 0
     }
@@ -139,7 +139,7 @@ where
     /// Useful for callers (like the LSM merger) that need to know
     /// *which* source produced the current minimum, so the next item
     /// from that source can be pulled in.
-    #[inline]
+    #[inline(always)]
     #[expect(
         clippy::indexing_slicing,
         reason = "tree[0] always exists: cap >= 2 by construction"
@@ -282,6 +282,15 @@ where
 
     /// Replay the tournament path from `leaf`'s position back up to the
     /// root, updating `tree[0]` with the new overall winner. O(log cap).
+    ///
+    /// `#[inline(always)]` — this is the single hot per-step routine
+    /// called from `replace_min` / `pop_min` / `take_slot` on every
+    /// merger step. Forcing inlining lets the caller hoist
+    /// `self.tree.as_ptr()` / `self.cmp` out of the loop and avoids
+    /// the call-site branch-predictor cost; default `#[inline]` is
+    /// only a hint and stops at crate boundaries (benches live in a
+    /// separate compilation unit).
+    #[inline(always)]
     #[expect(
         clippy::indexing_slicing,
         reason = "node traverses 1..cap by construction; tree[0] always exists"
@@ -307,6 +316,12 @@ where
 
     /// Compare leaves by slot index, treating `None` as `+∞`. `None`
     /// always loses to `Some`; `None` vs `None` returns `Equal`.
+    ///
+    /// `#[inline(always)]` — called O(log cap) times per `replay()`
+    /// step, which is itself the hot per-merger-step routine. The
+    /// match-on-Options-tuple is small enough that inlining lets
+    /// LLVM fuse the discriminant checks across consecutive calls.
+    #[inline(always)]
     #[expect(
         clippy::indexing_slicing,
         reason = "callers (build_subtree, replay) only pass slot indices < cap"
