@@ -7,10 +7,21 @@
 name: Benchmark
 
 on:
+  # Triggered ONLY on merges/pushes to main. Pull-request runs
+  # are deliberately omitted: the self-hosted bench host is
+  # shared with future cross-engine benches (issue #244) and
+  # other perf workloads — every PR pushing a commit would queue
+  # behind the host's serial concurrency group and hold up every
+  # subsequent PR, even when the change can't affect the bench
+  # (CI, docs, comment-only fixes). Letting only main runs into
+  # the queue keeps the bench timeline a clean "one entry per
+  # merged change" series, which is what the gh-pages dashboard
+  # is meant to show.
   push:
     branches: [main]
-  pull_request:
-    branches: [main]
+  # Manual dispatch from any branch when a contributor explicitly
+  # wants to measure their PR against main before merging.
+  workflow_dispatch:
 
 # Strict serialisation across the entire repo: the self-hosted
 # bench host is shared with future cross-engine benches (RocksDB
