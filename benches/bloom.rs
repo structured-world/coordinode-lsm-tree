@@ -77,15 +77,32 @@ fn measure_with_percentiles<F: FnMut()>(label: &str, iters: u64, mut body: F) ->
         } else {
             // Reservoir replacement: pick a random index in [0, i].
             // If that index falls within the reservoir, replace.
-            let idx = usize::try_from(next_rand(&mut rng_state) % (i + 1)).unwrap_or(MAX_SAMPLES);
-            if idx < MAX_SAMPLES {
-                samples[idx] = elapsed;
+            // Keep math in u64 and only cast to usize AFTER the
+            // bounds check. Earlier `usize::try_from(...).unwrap_or(MAX_SAMPLES)`
+            // would map any out-of-range index to MAX_SAMPLES on
+            // 32-bit (when `i + 1 > usize::MAX`), making the
+            // `idx < MAX_SAMPLES` branch never fire and skewing
+            // sampling toward early iterations.
+            let idx_u64 = next_rand(&mut rng_state) % (i + 1);
+            if idx_u64 < MAX_SAMPLES as u64 {
+                // Lossless: idx_u64 < MAX_SAMPLES <= usize::MAX on
+                // any target we care about (MAX_SAMPLES = 10_000).
+                samples[idx_u64 as usize] = elapsed;
             }
         }
     }
     let total = outer_start.elapsed();
     samples.sort_unstable();
-    let n = samples.len().max(1);
+    // `iters == 0` early-returned above, so the loop ran at least
+    // once and pushed at least one sample. The `.max(1)` was
+    // misleading — it doesn't make the indexing safe (an empty
+    // vec would still panic on samples[n/2]). A debug_assert
+    // documents the invariant for future readers.
+    debug_assert!(
+        !samples.is_empty(),
+        "iters > 0 guarantees at least one sample"
+    );
+    let n = samples.len();
     // Integer percentile indices — avoids f64 cast lint trips and
     // float-rounding edge cases. Base the math on `last = n - 1`
     // (last valid index) so the indices never saturate at the
@@ -179,11 +196,11 @@ fn burr_filter_contains(c: &mut Criterion) {
         // measure steady-state probe latency, not parse+probe.
         let reader = BurrFilterReader::new(&filter_bytes).unwrap();
 
-        // Precompute hashes outside the timed body so percentiles
-        // reflect ONLY the probe work, not RNG sampling + hash64
-        // overhead. Round-robin index gives deterministic, cache-
-        // friendly access without rng/hash cost per iteration.
-        let probe_hashes: Vec<u64> = hashes.iter().take(keys.len()).copied().collect();
+        // Probe hashes are exactly the prefix of `hashes` covering
+        // the real keys (the padding past keys.len() is random
+        // fillers we don't want to probe). Slice into `hashes`
+        // directly — no need to clone.
+        let probe_hashes: &[u64] = &hashes[..keys.len()];
 
         let probe_label = format!(
             "burr filter contains (probe-only), true positive (FPR={}%)",
@@ -268,8 +285,9 @@ fn ribbon_filter_contains(c: &mut Criterion) {
         // Precompute the probe order outside the timed body. Round-
         // robin over the key universe — same rationale as the BuRR
         // probe benches above (keep RNG cost out of the percentile
-        // measurement).
-        let probe_keys: Vec<u64> = keys.clone();
+        // measurement). Borrow `keys` directly — no clone needed,
+        // it's not mutated.
+        let probe_keys: &[u64] = &keys;
         let mut probe_idx = 0_usize;
 
         let label = format!(
