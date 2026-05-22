@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779405473698,
+  "lastUpdate": 1779425107716,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -7722,6 +7722,84 @@ window.BENCHMARK_DATA = {
             "value": 548748.0358833036,
             "unit": "ops/sec",
             "extra": "P50: 1.7us | P99: 5.1us | P99.9: 7.5us\nthreads: 1 | elapsed: 0.36s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "9b12cd51f31ed4c03cb2baed6877432825145e19",
+          "message": "perf(table): add Table::batch_get for sorted multi-key point reads (#223 phase 1) (#290)\n\n## Summary\n\nAdds `Table::batch_get` for sorted multi-key point reads. **Phase 1 of\n2** — the wiring into `batch_get_from_tables` is a follow-up PR\n(deliberately scoped to keep this PR focused on the new primitive + its\ncontract).\n\nCloses #223 (partial).\n\n## Why\n\n`Table::get(key, seqno, hash)` called N times for N keys that all land\nin the same SST pays:\n\n1. **Bloom-filter dereference + N hash probes** — duplicated across the\nN calls; the filter is cached internally but each call still goes\nthrough the lookup.\n2. **Block-index seek from scratch** — every call runs\n`forward_reader(key, seqno)` and re-pays the index binary search even\nwhen the previous call already landed inside the same data block.\n3. **Block load** — every call re-fetches the data block from the block\ncache, so cache hits still pay a hashmap lookup + Arc clone per call.\n\n`batch_get_from_tables` calls `Table::get` in a loop, so every read-path\nquery that touches more than one key in the same SST pays the duplicated\ncost.\n\n## What\n\n```rust\npub fn batch_get(\n    &self,\n    sorted_keys: &[(&[u8], u64)],\n    seqno: SeqNo,\n) -> crate::Result<Vec<Option<InternalValue>>>\n```\n\n- **Sorted-keys input contract** — `batch_get_from_tables` already keeps\nthe remaining-keys list in comparator order between L1+ runs; re-sorting\ninside `batch_get` would be redundant.\n- **One bloom-filter pass** — walk inputs once, collect indices that\npassed.\n- **Block-index seek runs ONCE** at the smallest passing key; the\niterator walks forward from there.\n- **Each data block loaded at most once** for the entire batch. Multiple\ninput keys that fall in the same block share the single load — a tight\ninner loop drains all passing keys with `key <= block.end_key` before\nadvancing.\n- **Lazy block load** — if bloom skipped enough later keys that the next\npassing one is beyond the current block's end_key, the outer loop skips\nthe load entirely.\n- Output is one `Option<InternalValue>` per input pair in **input\norder**; seqno is translated back to the global coordinate just like\n`Table::get`.\n\nSame metrics accounting as the single-key path: negative point lookups\nthat reached storage despite a bloom filter being present are counted in\n`filter_queries`.\n\n## Test coverage (6 new tests, all passing)\n\n| Test | What it guards |\n|---|---|\n| `batch_get_empty_input_returns_empty_results` | Boundary: empty input\n→ empty Vec, no I/O |\n| `batch_get_single_block_multiple_keys_returns_in_input_order` | Keys\ncolocated in one block — input order preserved |\n| `batch_get_keys_spread_across_blocks_return_correct_values` | Keys\nspread across 8 single-key blocks (`rotate_every=1`, `block_size=64`) —\nmulti-block walk correctness (asserts result values; the \"single load\nper block\" perf property is verifiable via cache metrics, not asserted\nin unit test) |\n| `batch_get_missing_keys_return_none_present_keys_return_some` | Mixed\npresent + absent keys (before / between / after the table's key range) |\n| `batch_get_matches_per_key_get` | **Cross-check vs per-key\n`Table::get` loop** for 25 mixed-coverage keys. Regression guard against\nthe batch path diverging from the single-key path on any edge case\n(bloom misses, seqno skew, block boundaries) |\n|\n`batch_get_same_user_key_across_block_boundary_finds_older_visible_version`\n| **Regression for the MVCC walk bug** fixed by [`fix(table): batch_get\nmirrors point_read end-key boundary handling`]. Same user key spans\nblock boundary; query at a snapshot seqno where the visible version\nlives in the next block. Pre-fix: `batch_get` returned None. Post-fix:\nmatches `Table::get` |\n\n## What's not in this PR (follow-up)\n\nThe two-line swap in `src/tree/mod.rs::batch_get_from_tables` to call\n`Table::batch_get` per Table (grouping consecutive sorted keys that land\non the same table) is the next PR. Splitting keeps THIS PR scoped to the\nnew primitive + its contract; the wiring is then a single isolated\nchange against a method that already has its own test coverage.\n\n## Test plan\n\n- [x] 6 new `table::tests::batch_get_*` tests pass\n- [x] Full workspace `cargo nextest run --workspace` — 1368/1368\n(baseline 1362 + 6 new)\n- [x] `cargo clippy --lib --tests --benches --all-features` — clean\n- [ ] Follow-up PR with wiring + end-to-end perf delta on the\nself-hosted runner (will use the same bench infrastructure from PR #289)\n\nRelated: #289 (self-hosted bench runner + raw numbers) — once both land,\nthe wiring follow-up will have stable measurements to claim the actual\nend-to-end delta.\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n## Summary by CodeRabbit\n\n* **New Features**\n* Batched multi-key reads against table snapshots: preserves input\norder, returns empty results for empty or out-of-range batches, and\ncorrectly finds visible versions that span block boundaries (handles\nMVCC). Minimizes block reads via lightweight pre-checks and records\nnegative lookups in metrics.\n\n* **Tests**\n* Added comprehensive tests for empty batches, single/multi-block\nbatches, mixed present/absent keys, cross-checks vs single-key reads,\nand an MVCC regression.\n\n<!-- review_stack_entry_start -->\n\n[![Review Change\nStack](https://storage.googleapis.com/coderabbit_public_assets/review-stack-in-coderabbit-ui.svg)](https://app.coderabbit.ai/change-stack/structured-world/coordinode-lsm-tree/pull/290?utm_source=github_walkthrough&utm_medium=github&utm_campaign=change_stack)\n\n<!-- review_stack_entry_end -->\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-05-22T07:44:14+03:00",
+          "tree_id": "5c6d603c590d914bae49fabed5b5277b997e0931",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/9b12cd51f31ed4c03cb2baed6877432825145e19"
+        },
+        "date": 1779425106834,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 2045311.922135466,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.6us | P99.9: 3.7us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1128910.352133894,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.2us | P99.9: 4.4us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 625952.5354464088,
+            "unit": "ops/sec",
+            "extra": "P50: 1.4us | P99: 4.7us | P99.9: 7.3us\nthreads: 1 | elapsed: 0.32s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3655841.828687179,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 3.0us | P99.9: 5.4us\nthreads: 1 | elapsed: 0.05s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 444524.41735062195,
+            "unit": "ops/sec",
+            "extra": "P50: 2.0us | P99: 5.3us | P99.9: 8.3us\nthreads: 1 | elapsed: 0.45s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 224457.76016164443,
+            "unit": "ops/sec",
+            "extra": "P50: 4.2us | P99: 5.2us | P99.9: 8.4us\nthreads: 1 | elapsed: 0.89s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1123966.0671272436,
+            "unit": "ops/sec",
+            "extra": "P50: 0.8us | P99: 2.3us | P99.9: 4.5us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1141758.269028699,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 1.5us | P99.9: 2.1us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 541808.9357600334,
+            "unit": "ops/sec",
+            "extra": "P50: 1.6us | P99: 6.2us | P99.9: 9.1us\nthreads: 1 | elapsed: 0.37s | num: 200000 | iterations: 3"
           }
         ]
       }
