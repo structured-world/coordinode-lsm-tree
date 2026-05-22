@@ -738,20 +738,39 @@ mod tests {
     use super::*;
     use test_log::test;
 
-    #[test]
-    fn block_from_file_roundtrip_uncompressed() -> crate::Result<()> {
+    /// Shared scaffold for `Block::from_file` roundtrip tests: writes
+    /// `data` through `Block::write_into` into a fresh tempdir-backed
+    /// file, reopens it read-only, and returns the FD + handle + header
+    /// the caller needs to invoke `Block::from_file`. The `TempDir` is
+    /// returned so the caller can keep it bound for the test lifetime —
+    /// once it drops, the directory (and the file inside it) is
+    /// reclaimed.
+    ///
+    /// Centralises the ~10× write/sync/reopen/handle boilerplate that
+    /// the `from_file` tests below would otherwise duplicate.
+    fn write_block_to_tempfile(
+        data: &[u8],
+        block_type: BlockType,
+        compression: CompressionType,
+        encryption: Option<&dyn crate::encryption::EncryptionProvider>,
+        #[cfg(zstd_any)] zstd_dict: Option<&crate::compression::ZstdDictionary>,
+    ) -> crate::Result<(
+        tempfile::TempDir,
+        std::fs::File,
+        crate::table::BlockHandle,
+        Header,
+    )> {
         use std::io::Write;
 
-        let data = b"abcdefabcdefabcdef";
         let mut buf = vec![];
         let header = Block::write_into(
             &mut buf,
             data,
-            BlockType::Data,
-            CompressionType::None,
-            None,
+            block_type,
+            compression,
+            encryption,
             #[cfg(zstd_any)]
-            None,
+            zstd_dict,
         )?;
 
         let dir = tempfile::tempdir()?;
@@ -766,6 +785,20 @@ mod tests {
             BlockOffset(0),
             header.data_length + Header::serialized_len() as u32,
         );
+        Ok((dir, file, handle, header))
+    }
+
+    #[test]
+    fn block_from_file_roundtrip_uncompressed() -> crate::Result<()> {
+        let data = b"abcdefabcdefabcdef";
+        let (_dir, file, handle, _) = write_block_to_tempfile(
+            data,
+            BlockType::Data,
+            CompressionType::None,
+            None,
+            #[cfg(zstd_any)]
+            None,
+        )?;
         let block = Block::from_file(
             &file,
             handle,
@@ -775,19 +808,14 @@ mod tests {
             None,
         )?;
         assert_eq!(data, &*block.data);
-
         Ok(())
     }
 
     #[test]
     #[cfg(feature = "lz4")]
     fn block_from_file_roundtrip_lz4() -> crate::Result<()> {
-        use std::io::Write;
-
         let data = b"abcdefabcdefabcdef";
-        let mut buf = vec![];
-        let header = Block::write_into(
-            &mut buf,
+        let (_dir, file, handle, _) = write_block_to_tempfile(
             data,
             BlockType::Data,
             CompressionType::Lz4,
@@ -795,19 +823,6 @@ mod tests {
             #[cfg(zstd_any)]
             None,
         )?;
-
-        let dir = tempfile::tempdir()?;
-        let path = dir.path().join("block");
-        let mut file = std::fs::File::create(&path)?;
-        file.write_all(&buf)?;
-        file.sync_all()?;
-        drop(file);
-
-        let file = std::fs::File::open(&path)?;
-        let handle = crate::table::BlockHandle::new(
-            BlockOffset(0),
-            header.data_length + Header::serialized_len() as u32,
-        );
         let block = Block::from_file(
             &file,
             handle,
@@ -817,41 +832,17 @@ mod tests {
             None,
         )?;
         assert_eq!(data, &*block.data);
-
         Ok(())
     }
 
     #[test]
     #[cfg(zstd_any)]
     fn block_from_file_roundtrip_zstd() -> crate::Result<()> {
-        use std::io::Write;
-
         let data = b"abcdefabcdefabcdef";
-        let mut buf = vec![];
-        let header = Block::write_into(
-            &mut buf,
-            data,
-            BlockType::Data,
-            CompressionType::Zstd(3),
-            None,
-            None,
-        )?;
-
-        let dir = tempfile::tempdir()?;
-        let path = dir.path().join("block");
-        let mut file = std::fs::File::create(&path)?;
-        file.write_all(&buf)?;
-        file.sync_all()?;
-        drop(file);
-
-        let file = std::fs::File::open(&path)?;
-        let handle = crate::table::BlockHandle::new(
-            BlockOffset(0),
-            header.data_length + Header::serialized_len() as u32,
-        );
+        let (_dir, file, handle, _) =
+            write_block_to_tempfile(data, BlockType::Data, CompressionType::Zstd(3), None, None)?;
         let block = Block::from_file(&file, handle, CompressionType::Zstd(3), None, None)?;
         assert_eq!(data, &*block.data);
-
         Ok(())
     }
 
@@ -1468,13 +1459,9 @@ mod tests {
 
         #[test]
         fn block_from_file_encrypted_uncompressed() -> crate::Result<()> {
-            use std::io::Write;
-
             let enc = test_provider();
             let data = b"plaintext block data for from_file encryption test";
-            let mut buf = vec![];
-            let header = Block::write_into(
-                &mut buf,
+            let (_dir, file, handle, _) = super::write_block_to_tempfile(
                 data,
                 BlockType::Data,
                 CompressionType::None,
@@ -1482,19 +1469,6 @@ mod tests {
                 #[cfg(zstd_any)]
                 None,
             )?;
-
-            let dir = tempfile::tempdir()?;
-            let path = dir.path().join("block");
-            let mut file = std::fs::File::create(&path)?;
-            file.write_all(&buf)?;
-            file.sync_all()?;
-            drop(file);
-
-            let file = std::fs::File::open(&path)?;
-            let handle = crate::table::BlockHandle::new(
-                BlockOffset(0),
-                header.data_length + Header::serialized_len() as u32,
-            );
             let block = Block::from_file(
                 &file,
                 handle,
@@ -1510,13 +1484,9 @@ mod tests {
         #[test]
         #[cfg(feature = "lz4")]
         fn block_from_file_encrypted_lz4() -> crate::Result<()> {
-            use std::io::Write;
-
             let enc = test_provider();
             let data = b"abcdefabcdefabcdef";
-            let mut buf = vec![];
-            let header = Block::write_into(
-                &mut buf,
+            let (_dir, file, handle, _) = super::write_block_to_tempfile(
                 data,
                 BlockType::Data,
                 CompressionType::Lz4,
@@ -1524,19 +1494,6 @@ mod tests {
                 #[cfg(zstd_any)]
                 None,
             )?;
-
-            let dir = tempfile::tempdir()?;
-            let path = dir.path().join("block");
-            let mut file = std::fs::File::create(&path)?;
-            file.write_all(&buf)?;
-            file.sync_all()?;
-            drop(file);
-
-            let file = std::fs::File::open(&path)?;
-            let handle = crate::table::BlockHandle::new(
-                BlockOffset(0),
-                header.data_length + Header::serialized_len() as u32,
-            );
             let block = Block::from_file(
                 &file,
                 handle,
@@ -1552,55 +1509,27 @@ mod tests {
         #[test]
         #[cfg(zstd_any)]
         fn block_from_file_encrypted_zstd() -> crate::Result<()> {
-            use std::io::Write;
-
             let enc = test_provider();
             let data = b"abcdefabcdefabcdef";
-            let mut buf = vec![];
-            let header = Block::write_into(
-                &mut buf,
+            let (_dir, file, handle, _) = super::write_block_to_tempfile(
                 data,
                 BlockType::Data,
                 CompressionType::Zstd(3),
                 Some(&enc),
-                #[cfg(zstd_any)]
                 None,
             )?;
-
-            let dir = tempfile::tempdir()?;
-            let path = dir.path().join("block");
-            let mut file = std::fs::File::create(&path)?;
-            file.write_all(&buf)?;
-            file.sync_all()?;
-            drop(file);
-
-            let file = std::fs::File::open(&path)?;
-            let handle = crate::table::BlockHandle::new(
-                BlockOffset(0),
-                header.data_length + Header::serialized_len() as u32,
-            );
-            let block = Block::from_file(
-                &file,
-                handle,
-                CompressionType::Zstd(3),
-                Some(&enc),
-                #[cfg(zstd_any)]
-                None,
-            )?;
+            let block =
+                Block::from_file(&file, handle, CompressionType::Zstd(3), Some(&enc), None)?;
             assert_eq!(data, &*block.data);
             Ok(())
         }
 
         #[test]
         fn block_from_file_encrypted_wrong_key_fails() -> crate::Result<()> {
-            use std::io::Write;
-
             let enc_write = test_provider();
             let enc_read = crate::encryption::Aes256GcmProvider::new(&[0x99; 32]);
             let data = b"encrypted block data";
-            let mut buf = vec![];
-            let header = Block::write_into(
-                &mut buf,
+            let (_dir, file, handle, _) = super::write_block_to_tempfile(
                 data,
                 BlockType::Data,
                 CompressionType::None,
@@ -1608,19 +1537,6 @@ mod tests {
                 #[cfg(zstd_any)]
                 None,
             )?;
-
-            let dir = tempfile::tempdir()?;
-            let path = dir.path().join("block");
-            let mut file = std::fs::File::create(&path)?;
-            file.write_all(&buf)?;
-            file.sync_all()?;
-            drop(file);
-
-            let file = std::fs::File::open(&path)?;
-            let handle = crate::table::BlockHandle::new(
-                BlockOffset(0),
-                header.data_length + Header::serialized_len() as u32,
-            );
             let result = Block::from_file(
                 &file,
                 handle,
@@ -1758,13 +1674,9 @@ mod tests {
 
         #[test]
         fn block_from_file_encrypted_uncompressed_large_payload() -> crate::Result<()> {
-            use std::io::Write;
-
             let enc = test_provider();
             let data = vec![0xBB_u8; 32 * 1024]; // 32 KiB
-            let mut buf = vec![];
-            let header = Block::write_into(
-                &mut buf,
+            let (_dir, file, handle, _) = super::write_block_to_tempfile(
                 &data,
                 BlockType::Data,
                 CompressionType::None,
@@ -1772,19 +1684,6 @@ mod tests {
                 #[cfg(zstd_any)]
                 None,
             )?;
-
-            let dir = tempfile::tempdir()?;
-            let path = dir.path().join("block");
-            let mut file = std::fs::File::create(&path)?;
-            file.write_all(&buf)?;
-            file.sync_all()?;
-            drop(file);
-
-            let file = std::fs::File::open(&path)?;
-            let handle = crate::table::BlockHandle::new(
-                BlockOffset(0),
-                header.data_length + Header::serialized_len() as u32,
-            );
             let block = Block::from_file(
                 &file,
                 handle,
