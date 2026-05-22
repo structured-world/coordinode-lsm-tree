@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779453317540,
+  "lastUpdate": 1779465278960,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -7878,6 +7878,84 @@ window.BENCHMARK_DATA = {
             "value": 536693.5141782955,
             "unit": "ops/sec",
             "extra": "P50: 1.7us | P99: 5.0us | P99.9: 7.6us\nthreads: 1 | elapsed: 0.37s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "4fc4fe441226624d58e58db4071d73593fdcb3d2",
+          "message": "ci(cross): conditional cross-compile matrix (#158 item 1) (#292)\n\n## Summary\n\nSplits the cross-compile matrix by trigger: full 5-target sweep on push\nto main, reduced 2-target subset on PR / manual dispatch.\n\nAddresses item 1 of #158.\n\n## Why\n\nCross-compile previously ran all 5 targets on every PR:\n- aarch64-unknown-linux-gnu\n- aarch64-unknown-linux-musl\n- i686-unknown-linux-gnu\n- powerpc64-unknown-linux-gnu  ← qemu-emulated, slow\n- riscv64gc-unknown-linux-gnu  ← qemu-emulated, slow\n\nThe two qemu-emulated targets dominate PR feedback time (~5 min\nsequentially across the matrix). PRs rarely need that coverage —\nwire-format / ABI regressions on those exotic targets are best caught on\nmerge, not on every push.\n\n## What\n\nAdded a small `cross-matrix` prep job (~10s) that emits a JSON target\nlist to a job output:\n\n```yaml\ncross-matrix:\n  outputs:\n    targets: ${{ steps.set.outputs.targets }}\n  steps:\n    - id: set\n      env:\n        IS_MAIN: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}\n      run: |\n        if [ \"$IS_MAIN\" = \"true\" ]; then\n          echo 'targets=[<full 5>]' >> \"$GITHUB_OUTPUT\"\n        else\n          echo 'targets=[<reduced 2>]' >> \"$GITHUB_OUTPUT\"\n        fi\n```\n\nThe `cross` job then consumes it:\n\n```yaml\ncross:\n  needs: [lint, cross-matrix]\n  strategy:\n    matrix:\n      target: ${{ fromJSON(needs.cross-matrix.outputs.targets) }}\n```\n\n## Trade-off\n\n- **PR feedback** drops from ~8 min → ~5 min (no qemu emulation penalty)\n- **Main coverage** unchanged — full 5-target sweep still runs on every\nmerge\n- **Reduced subset** covers the two canonical mistake classes: 64-bit\naarch64 ABI quirks + 32-bit x86 pointer-width / endian sensitivity.\nmusl, powerpc64 (BE), riscv64 regressions are caught at merge time\nbefore they ship to users.\n\n## Out of scope (separate follow-up PRs from #158)\n\n- `PROPTEST_MAX_SHRINK` env var support (item 2)\n- Codecov `PROPTEST_CASES=32` verification (item 3 — already verified:\ncodecov job relies on the hardcoded 32 default in `ProptestConfig`, same\nas test job; comments in the workflow already note this)\n- Top-10 slowest-tests profiling (item 4)\n- Nextest slow-timeout audit (item 5)\n\n## Test plan\n\n- [x] YAML parses (`python3 -c \"import yaml; yaml.safe_load(...)\"`\nclean)\n- [ ] First push to a non-main branch should trigger the reduced matrix\n— visible on this PR's first CI run (only 2 cross targets in the matrix)\n- [ ] Next push to main after merge will trigger the full 5-target\nmatrix\n\nPart of #158.\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n## Summary by CodeRabbit\n\n* **Chores**\n* Enabled manual triggering of CI workflows with inline guidance on when\nto use manual runs.\n* Added an opt-in input to enable a full cross-compile target sweep for\nmanual runs.\n* CI now selects the full target set for main-branch pushes and opted-in\nmanual runs, otherwise uses a reduced set to speed feedback.\n\n<!-- review_stack_entry_start -->\n\n[![Review Change\nStack](https://storage.googleapis.com/coderabbit_public_assets/review-stack-in-coderabbit-ui.svg)](https://app.coderabbit.ai/change-stack/structured-world/coordinode-lsm-tree/pull/292?utm_source=github_walkthrough&utm_medium=github&utm_campaign=change_stack)\n\n<!-- review_stack_entry_end -->\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-05-22T18:53:43+03:00",
+          "tree_id": "62078bc7cecc0df457336c83525c787ab28938bd",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/4fc4fe441226624d58e58db4071d73593fdcb3d2"
+        },
+        "date": 1779465277408,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 2098298.331461494,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.7us | P99.9: 4.0us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 931894.6333949344,
+            "unit": "ops/sec",
+            "extra": "P50: 0.9us | P99: 2.8us | P99.9: 5.1us\nthreads: 1 | elapsed: 0.21s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 499892.1645120019,
+            "unit": "ops/sec",
+            "extra": "P50: 1.9us | P99: 5.2us | P99.9: 8.1us\nthreads: 1 | elapsed: 0.40s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3452118.605750743,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 3.4us | P99.9: 6.2us\nthreads: 1 | elapsed: 0.06s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 371822.13336466457,
+            "unit": "ops/sec",
+            "extra": "P50: 2.4us | P99: 5.8us | P99.9: 9.0us\nthreads: 1 | elapsed: 0.54s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 212026.4320334393,
+            "unit": "ops/sec",
+            "extra": "P50: 4.4us | P99: 6.0us | P99.9: 8.6us\nthreads: 1 | elapsed: 0.94s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 947129.9332369531,
+            "unit": "ops/sec",
+            "extra": "P50: 0.9us | P99: 2.7us | P99.9: 5.2us\nthreads: 1 | elapsed: 0.21s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1116845.6232151864,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 1.5us | P99.9: 2.1us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 448531.82928530517,
+            "unit": "ops/sec",
+            "extra": "P50: 2.0us | P99: 5.8us | P99.9: 9.1us\nthreads: 1 | elapsed: 0.45s | num: 200000 | iterations: 3"
           }
         ]
       }
