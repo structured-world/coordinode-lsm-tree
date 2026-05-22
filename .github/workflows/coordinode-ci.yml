@@ -13,6 +13,29 @@ on:
   pull_request:
     branches:
       - main
+  # Manual re-run from any branch. Two use cases:
+  #   (a) re-trigger a flaky cross-compile target after qemu
+  #       hiccup — needs `full_cross_matrix: true` because the
+  #       flaky ones (powerpc64, riscv64) live ONLY in the full
+  #       matrix, not the PR/dispatch default;
+  #   (b) maintainer wants a full CI cycle on a draft branch
+  #       without opening a PR — also `full_cross_matrix: true`
+  #       to mirror main-branch coverage.
+  # Without the input set (default), manual dispatch runs the
+  # same reduced 2-target cross matrix that PRs do (aarch64-gnu
+  # + i686-gnu) — useful for quick sanity-check re-runs.
+  # Triggering workflow_dispatch from the UI / API requires
+  # repository write access (not the workflow-token `actions:write`
+  # scope, which is a different thing). Fork PR authors don't
+  # have write on the upstream repo, so they can't fire this —
+  # full_cross_matrix has no fork-side attack surface.
+  workflow_dispatch:
+    inputs:
+      full_cross_matrix:
+        description: "Run the full 5-target cross-compile matrix (aarch64-gnu/musl, i686-gnu, powerpc64-gnu, riscv64gc-gnu) instead of the reduced 2-target subset"
+        type: boolean
+        default: false
+        required: false
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -134,18 +157,55 @@ jobs:
       - name: Check (no_std + alloc)
         run: cargo check --target thumbv7em-none-eabihf --no-default-features --features alloc
 
+  # Generates the cross-compile target matrix. The full 5-target
+  # sweep runs in either of two cases:
+  #   - push to main (regression coverage on every merged change)
+  #   - workflow_dispatch with `full_cross_matrix: true` (manual
+  #     opt-in for re-testing flaky targets or for full coverage
+  #     on a draft branch)
+  # Everything else — PR builds + default manual dispatches —
+  # uses the reduced 2-target subset (aarch64-gnu + i686-gnu)
+  # that covers the two canonical pointer-width / ABI mistakes:
+  # 64-bit aarch64 ABI quirks and 32-bit x86 pointer-width.
+  # Both targets are little-endian — endianness coverage (the
+  # big-endian powerpc64 target) is deferred to the full sweep
+  # on main, alongside musl libc differences and the qemu-
+  # emulated riscv64 path. The reduced run is ~30% of the
+  # full-sweep cost and keeps PR feedback under 5 min.
+  cross-matrix:
+    # No `needs: lint` — this job only inspects github.event_name
+    # / github.ref / inputs to emit a JSON target list. It doesn't
+    # touch source, doesn't compile, doesn't run lint-sensitive
+    # tooling. Running it in parallel with lint shaves ~10s off
+    # the PR critical path: the matrix is ready when lint
+    # finishes, and `cross` (which `needs: [lint, cross-matrix]`)
+    # starts immediately rather than waiting for serial chain.
+    runs-on: ubuntu-latest
+    outputs:
+      targets: ${{ steps.set.outputs.targets }}
+    steps:
+      - id: set
+        env:
+          IS_FULL: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'workflow_dispatch' && inputs.full_cross_matrix) }}
+        run: |
+          if [ "$IS_FULL" = "true" ]; then
+            echo 'targets=["aarch64-unknown-linux-gnu","aarch64-unknown-linux-musl","i686-unknown-linux-gnu","powerpc64-unknown-linux-gnu","riscv64gc-unknown-linux-gnu"]' >> "$GITHUB_OUTPUT"
+          else
+            echo 'targets=["aarch64-unknown-linux-gnu","i686-unknown-linux-gnu"]' >> "$GITHUB_OUTPUT"
+          fi
+
   cross:
-    needs: lint
+    needs: [lint, cross-matrix]
     timeout-minutes: 15
     strategy:
       fail-fast: true
       matrix:
-        target:
-          - aarch64-unknown-linux-gnu
-          - aarch64-unknown-linux-musl
-          - i686-unknown-linux-gnu
-          - powerpc64-unknown-linux-gnu
-          - riscv64gc-unknown-linux-gnu
+        # Bracket notation REQUIRED on the needs context key here:
+        # the job id `cross-matrix` contains a hyphen, so dot
+        # notation (`needs.cross-matrix.outputs.targets`) is parsed
+        # by the GitHub Actions expression engine as `needs.cross`
+        # minus `matrix.outputs.targets`, breaking the lookup.
+        target: ${{ fromJSON(needs['cross-matrix'].outputs.targets) }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
