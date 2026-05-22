@@ -103,10 +103,11 @@ impl<W: std::io::Write + std::io::Seek> BlockIndexWriter<W> for FullIndexWriter 
                 // sfa::Writer doesn't expose its position cursor;
                 // outer table Writer tracks meta.file_pos but the
                 // BlockIndexWriter trait doesn't surface it here.
-                // Leaving offset=0 — CI canary accepts this as
-                // long as table_id is real. Future: extend
-                // BlockIndexWriter::finish to accept a block_offset
-                // alongside file_writer.
+                // Leaving offset=0 intentionally — extending
+                // BlockIndexWriter::finish to thread block_offset
+                // alongside file_writer is a planned follow-up
+                // (alongside the canary check that would refuse
+                // this combination once both fields can be real).
                 block_offset: 0,
                 block_type: crate::table::block::BlockType::Index,
                 dict_id: 0,

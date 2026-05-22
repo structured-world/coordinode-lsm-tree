@@ -693,6 +693,15 @@ mod tests {
     /// in the SIMD-stride-boundary set, flip the byte at `mismatch_at` (or none,
     /// at `mismatch_at == total_len`) and assert the kernel under test agrees
     /// with the byte-by-byte reference, both at full and asymmetric lengths.
+    //
+    // cfg-gated to mirror the union of its callers (SSE2/AVX2 on x86_64,
+    // NEON on LE aarch64). On other targets (riscv64, i686, powerpc64,
+    // BE aarch64) no per-kernel test fires, so the helper would trip
+    // dead_code without the cfg.
+    #[cfg(any(
+        target_arch = "x86_64",
+        all(target_arch = "aarch64", target_endian = "little")
+    ))]
     fn assert_kernel_matches_reference<F: Fn(&[u8], &[u8]) -> usize>(label: &str, kernel: F) {
         for total_len in [
             0_usize, 1, 7, 8, 9, 15, 16, 17, 31, 32, 33, 63, 64, 127, 128, 255, 256,
