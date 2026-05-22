@@ -739,18 +739,42 @@ mod tests {
     use test_log::test;
 
     /// Result of [`write_block_to_tempfile`]. Named struct (not a
-    /// 4-tuple) so call-site destructuring is self-documenting
-    /// and order-independent — tests that only care about `file`
-    /// and `handle` skip `dir` by name instead of by position.
+    /// 4-tuple) so call-site destructuring is self-documenting —
+    /// tests that only care about `file` and `handle` skip `dir`
+    /// by name instead of by position.
     ///
-    /// **Field order matters for `Drop`.** Rust drops struct
-    /// fields in declaration order, so `file` and `handle` are
-    /// listed first and `dir` LAST: when the whole `TempBlock`
-    /// goes out of scope as a unit (rather than being
-    /// destructured), the open file handle closes before the
-    /// `TempDir` removes the directory. Windows rejects
-    /// directory removal while a file inside it is still open;
-    /// the order makes the helper portable.
+    /// **Two separate drop-order constraints apply; both matter
+    /// for Windows portability:**
+    ///
+    /// 1. **Struct field order.** Rust drops struct fields in
+    ///    declaration order, so `file` and `handle` are listed
+    ///    first and `dir` LAST. When a `TempBlock` value goes
+    ///    out of scope as a unit (e.g., bubbled via `?`, returned
+    ///    from a helper, or stored in a `Vec`), the open file
+    ///    handle closes before the `TempDir` removes the
+    ///    directory.
+    ///
+    /// 2. **Local-binding order in destructuring patterns.**
+    ///    Local bindings drop in REVERSE declaration order. So
+    ///    a call site MUST bind `dir` FIRST in its pattern so
+    ///    that the `dir` binding drops LAST:
+    ///
+    ///    ```ignore
+    ///    // CORRECT: dir bound first → drops last
+    ///    let TempBlock { dir: _dir, file, handle } = ...?;
+    ///    ```
+    ///
+    ///    The opposite order would close the directory before
+    ///    the file:
+    ///
+    ///    ```ignore
+    ///    // WRONG on Windows: dir bound last → drops first,
+    ///    // removes directory while `file` is still open.
+    ///    let TempBlock { file, handle, dir: _dir } = ...?;
+    ///    ```
+    ///
+    /// Existing call sites in this module follow constraint #2.
+    /// New callers MUST do the same.
     struct TempBlock {
         /// Open read-only handle on the persisted block.
         /// Declared first so it drops before `dir`.
