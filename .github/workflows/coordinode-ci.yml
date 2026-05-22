@@ -134,18 +134,37 @@ jobs:
       - name: Check (no_std + alloc)
         run: cargo check --target thumbv7em-none-eabihf --no-default-features --features alloc
 
-  cross:
+  # Generates the cross-compile target matrix. Full 5-target sweep
+  # only on push to main; PR / manual-dispatch runs use a reduced
+  # 2-target subset (aarch64-gnu + i686-gnu) that covers the two
+  # canonical mistake-finders — 64-bit aarch64 ABI quirks and 32-bit
+  # x86 pointer-width / endian sensitivity — at ~30% of the CI time
+  # the full sweep costs. The full sweep on main still catches
+  # musl, powerpc64 (BE), and riscv64 (qemu-emulated) regressions
+  # before they ship to users; PR feedback stays under 5 min.
+  cross-matrix:
     needs: lint
+    runs-on: ubuntu-latest
+    outputs:
+      targets: ${{ steps.set.outputs.targets }}
+    steps:
+      - id: set
+        env:
+          IS_MAIN: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+        run: |
+          if [ "$IS_MAIN" = "true" ]; then
+            echo 'targets=["aarch64-unknown-linux-gnu","aarch64-unknown-linux-musl","i686-unknown-linux-gnu","powerpc64-unknown-linux-gnu","riscv64gc-unknown-linux-gnu"]' >> "$GITHUB_OUTPUT"
+          else
+            echo 'targets=["aarch64-unknown-linux-gnu","i686-unknown-linux-gnu"]' >> "$GITHUB_OUTPUT"
+          fi
+
+  cross:
+    needs: [lint, cross-matrix]
     timeout-minutes: 15
     strategy:
       fail-fast: true
       matrix:
-        target:
-          - aarch64-unknown-linux-gnu
-          - aarch64-unknown-linux-musl
-          - i686-unknown-linux-gnu
-          - powerpc64-unknown-linux-gnu
-          - riscv64gc-unknown-linux-gnu
+        target: ${{ fromJSON(needs.cross-matrix.outputs.targets) }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
