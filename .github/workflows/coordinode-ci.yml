@@ -13,12 +13,27 @@ on:
   pull_request:
     branches:
       - main
-  # Manual re-run from any branch. Useful for re-triggering after
-  # a flaky cross-compile target, or for maintainers who want a
-  # full CI cycle on a draft branch without opening a PR.
-  # workflow_dispatch requires actions:write on the repo, so only
-  # owner / maintainers can fire it — fork PR authors cannot.
+  # Manual re-run from any branch. Two use cases:
+  #   (a) re-trigger a flaky cross-compile target after qemu
+  #       hiccup — needs `full_cross_matrix: true` because the
+  #       flaky ones (powerpc64, riscv64) live ONLY in the full
+  #       matrix, not the PR/dispatch default;
+  #   (b) maintainer wants a full CI cycle on a draft branch
+  #       without opening a PR — also `full_cross_matrix: true`
+  #       to mirror main-branch coverage.
+  # Without the input set (default), manual dispatch runs the
+  # same reduced 2-target cross matrix that PRs do (aarch64-gnu
+  # + i686-gnu) — useful for quick sanity-check re-runs.
+  # workflow_dispatch requires actions:write on the repo, so
+  # only owner / maintainers can fire it — fork PR authors
+  # cannot, full_cross_matrix has no fork-side attack surface.
   workflow_dispatch:
+    inputs:
+      full_cross_matrix:
+        description: "Run the full 5-target cross-compile matrix (aarch64-gnu/musl, i686-gnu, powerpc64-gnu, riscv64gc-gnu) instead of the reduced 2-target subset"
+        type: boolean
+        default: false
+        required: false
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -140,14 +155,21 @@ jobs:
       - name: Check (no_std + alloc)
         run: cargo check --target thumbv7em-none-eabihf --no-default-features --features alloc
 
-  # Generates the cross-compile target matrix. Full 5-target sweep
-  # only on push to main; PR / manual-dispatch runs use a reduced
-  # 2-target subset (aarch64-gnu + i686-gnu) that covers the two
-  # canonical mistake-finders — 64-bit aarch64 ABI quirks and 32-bit
-  # x86 pointer-width / endian sensitivity — at ~30% of the CI time
-  # the full sweep costs. The full sweep on main still catches
-  # musl, powerpc64 (BE), and riscv64 (qemu-emulated) regressions
-  # before they ship to users; PR feedback stays under 5 min.
+  # Generates the cross-compile target matrix. The full 5-target
+  # sweep runs in either of two cases:
+  #   - push to main (regression coverage on every merged change)
+  #   - workflow_dispatch with `full_cross_matrix: true` (manual
+  #     opt-in for re-testing flaky targets or for full coverage
+  #     on a draft branch)
+  # Everything else — PR builds + default manual dispatches —
+  # uses the reduced 2-target subset (aarch64-gnu + i686-gnu)
+  # that covers the two canonical mistake-finders: 64-bit
+  # aarch64 ABI quirks and 32-bit x86 pointer-width / endian
+  # sensitivity. The reduced run is ~30% of the full-sweep cost
+  # and keeps PR feedback under 5 min while still catching the
+  # majority of cross-platform regressions; musl, powerpc64
+  # (BE), and riscv64 (qemu-emulated) coverage runs on main
+  # before reaching users.
   cross-matrix:
     needs: lint
     runs-on: ubuntu-latest
@@ -156,9 +178,9 @@ jobs:
     steps:
       - id: set
         env:
-          IS_MAIN: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+          IS_FULL: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'workflow_dispatch' && inputs.full_cross_matrix) }}
         run: |
-          if [ "$IS_MAIN" = "true" ]; then
+          if [ "$IS_FULL" = "true" ]; then
             echo 'targets=["aarch64-unknown-linux-gnu","aarch64-unknown-linux-musl","i686-unknown-linux-gnu","powerpc64-unknown-linux-gnu","riscv64gc-unknown-linux-gnu"]' >> "$GITHUB_OUTPUT"
           else
             echo 'targets=["aarch64-unknown-linux-gnu","i686-unknown-linux-gnu"]' >> "$GITHUB_OUTPUT"
