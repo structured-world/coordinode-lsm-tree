@@ -156,8 +156,16 @@ impl Writer {
 
             path,
 
-            index_writer: Box::new(FullIndexWriter::new()),
-            filter_writer: Box::new(FullFilterWriter::new(BloomConstructionPolicy::default())),
+            // Construct as concrete first, then promote to dyn
+            // via use_table_id so the resulting trait object
+            // already carries the owning table_id for AAD-aware
+            // block writes.
+            index_writer: (Box::new(FullIndexWriter::new())
+                as Box<dyn BlockIndexWriter<BufWriter<Box<dyn FsFile>>>>)
+                .use_table_id(table_id),
+            filter_writer: (Box::new(FullFilterWriter::new(BloomConstructionPolicy::default()))
+                as Box<dyn FilterWriter<BufWriter<Box<dyn FsFile>>>>)
+                .use_table_id(table_id),
 
             block_buffer: Vec::new(),
             file_writer: writer,
@@ -214,7 +222,8 @@ impl Writer {
             .use_tli_compression(self.index_block_compression)
             .use_partition_size(self.meta_partition_size)
             .set_prefix_extractor(self.prefix_extractor.clone())
-            .use_encryption(self.encryption.clone());
+            .use_encryption(self.encryption.clone())
+            .use_table_id(self.table_id);
         self
     }
 
@@ -225,7 +234,8 @@ impl Writer {
             .use_compression(self.index_block_compression)
             .use_partition_size(self.meta_partition_size)
             .use_restart_interval(self.index_block_restart_interval)
-            .use_encryption(self.encryption.clone());
+            .use_encryption(self.encryption.clone())
+            .use_table_id(self.table_id);
         self
     }
 
@@ -437,7 +447,13 @@ impl Writer {
         let header = Block::write_into(
             &mut self.file_writer,
             &self.block_buffer,
-            super::block::BlockType::Data,
+            super::block::BlockIdentity {
+                table_id: self.table_id,
+                block_offset: *self.meta.file_pos,
+                block_type: super::block::BlockType::Data,
+                dict_id: 0,
+                window_log: 0,
+            },
             self.data_block_compression,
             self.encryption.as_deref(),
             #[cfg(zstd_any)]
@@ -615,7 +631,13 @@ impl Writer {
             Block::write_into(
                 &mut self.file_writer,
                 &self.block_buffer,
-                crate::table::block::BlockType::RangeTombstone,
+                crate::table::block::BlockIdentity {
+                    table_id: self.table_id,
+                    block_offset: *self.meta.file_pos,
+                    block_type: crate::table::block::BlockType::RangeTombstone,
+                    dict_id: 0,
+                    window_log: 0,
+                },
                 CompressionType::None,
                 self.encryption.as_deref(),
                 #[cfg(zstd_any)]
@@ -749,7 +771,13 @@ impl Writer {
             Block::write_into(
                 &mut self.file_writer,
                 &self.block_buffer,
-                crate::table::block::BlockType::Meta,
+                crate::table::block::BlockIdentity {
+                    table_id: self.table_id,
+                    block_offset: *self.meta.file_pos,
+                    block_type: crate::table::block::BlockType::Meta,
+                    dict_id: 0,
+                    window_log: 0,
+                },
                 CompressionType::None,
                 self.encryption.as_deref(),
                 #[cfg(zstd_any)]

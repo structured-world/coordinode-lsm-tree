@@ -22,6 +22,10 @@ pub struct FullFilterWriter {
     prefix_extractor: Option<Arc<dyn PrefixExtractor>>,
 
     encryption: Option<Arc<dyn EncryptionProvider>>,
+
+    /// Owning SST's table id. Set by the outer Writer via
+    /// `use_table_id` before `finish` runs.
+    table_id: crate::TableId,
 }
 
 impl FullFilterWriter {
@@ -31,6 +35,7 @@ impl FullFilterWriter {
             bloom_policy,
             prefix_extractor: None,
             encryption: None,
+            table_id: 0,
         }
     }
 }
@@ -65,6 +70,11 @@ impl<W: std::io::Write + std::io::Seek> FilterWriter<W> for FullFilterWriter {
         encryption: Option<Arc<dyn EncryptionProvider>>,
     ) -> Box<dyn FilterWriter<W>> {
         self.encryption = encryption;
+        self
+    }
+
+    fn use_table_id(mut self: Box<Self>, table_id: crate::TableId) -> Box<dyn FilterWriter<W>> {
+        self.table_id = table_id;
         self
     }
 
@@ -126,7 +136,13 @@ impl<W: std::io::Write + std::io::Seek> FilterWriter<W> for FullFilterWriter {
         Block::write_into(
             file_writer,
             &filter_bytes,
-            crate::table::block::BlockType::Filter,
+            crate::table::block::BlockIdentity {
+                table_id: self.table_id,
+                block_offset: 0,
+                block_type: crate::table::block::BlockType::Filter,
+                dict_id: 0,
+                window_log: 0,
+            },
             CompressionType::None,
             self.encryption.as_deref(),
             #[cfg(zstd_any)]

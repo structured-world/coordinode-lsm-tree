@@ -110,7 +110,20 @@ impl Metadata {
         Block::write_into(
             writer,
             &buf,
-            crate::table::block::BlockType::Meta,
+            crate::table::block::BlockIdentity {
+                // BlobFileId is the natural AAD discriminator for
+                // blob-file meta blocks; reuse it as table_id so
+                // the canonical "non-zero table_id ⇒ identified"
+                // invariant holds for blob meta as well as SST
+                // meta. BlobFileId and TableId both alias u64 so
+                // the value space doesn't collide in practice
+                // (different write paths, different sections).
+                table_id: self.id,
+                block_offset: 0,
+                block_type: crate::table::block::BlockType::Meta,
+                dict_id: 0,
+                window_log: 0,
+            },
             CompressionType::None,
             None,
             #[cfg(zstd_any)]
@@ -134,6 +147,19 @@ impl Metadata {
         // TODO: Block::from_slice
         let block = Block::from_reader(
             reader,
+            crate::table::block::BlockIdentity {
+                // from_slice constructs Self by parsing the blob
+                // meta — self.id is what THIS read produces, not
+                // available beforehand. table_id=0 here mirrors
+                // the table-meta parse path: cross-blob swap
+                // detection still relies on the meta payload's
+                // own id field being part of the verified body.
+                table_id: 0,
+                block_offset: 0,
+                block_type: crate::table::block::BlockType::Meta,
+                dict_id: 0,
+                window_log: 0,
+            },
             CompressionType::None,
             None,
             #[cfg(zstd_any)]
@@ -248,7 +274,7 @@ mod tests {
         Block::write_into(
             &mut buf,
             &encoded,
-            BlockType::Meta,
+            crate::table::block::BlockIdentity::for_test(0, 0, BlockType::Meta),
             CompressionType::None,
             None,
             #[cfg(zstd_any)]

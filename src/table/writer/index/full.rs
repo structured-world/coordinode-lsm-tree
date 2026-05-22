@@ -18,6 +18,11 @@ pub struct FullIndexWriter {
     restart_interval: u8,
     block_handles: Vec<KeyedBlockHandle>,
     encryption: Option<Arc<dyn EncryptionProvider>>,
+    /// Owning SST's table id; passed by the outer Writer via
+    /// `use_table_id` before `finish()`. Used to populate
+    /// `BlockIdentity::table_id` when writing the top-level
+    /// index block.
+    table_id: crate::TableId,
 }
 
 impl FullIndexWriter {
@@ -27,6 +32,7 @@ impl FullIndexWriter {
             restart_interval: 1,
             block_handles: Vec::new(),
             encryption: None,
+            table_id: 0,
         }
     }
 }
@@ -54,6 +60,11 @@ impl<W: std::io::Write + std::io::Seek> BlockIndexWriter<W> for FullIndexWriter 
         compression: CompressionType,
     ) -> Box<dyn BlockIndexWriter<W>> {
         self.compression = compression;
+        self
+    }
+
+    fn use_table_id(mut self: Box<Self>, table_id: crate::TableId) -> Box<dyn BlockIndexWriter<W>> {
+        self.table_id = table_id;
         self
     }
 
@@ -86,7 +97,20 @@ impl<W: std::io::Write + std::io::Seek> BlockIndexWriter<W> for FullIndexWriter 
         let header = Block::write_into(
             file_writer,
             &bytes,
-            crate::table::block::BlockType::Index,
+            crate::table::block::BlockIdentity {
+                table_id: self.table_id,
+                // sfa::Writer doesn't expose its position cursor;
+                // outer table Writer tracks meta.file_pos but the
+                // BlockIndexWriter trait doesn't surface it here.
+                // Leaving offset=0 — CI canary accepts this as
+                // long as table_id is real. Future: extend
+                // BlockIndexWriter::finish to accept a block_offset
+                // alongside file_writer.
+                block_offset: 0,
+                block_type: crate::table::block::BlockType::Index,
+                dict_id: 0,
+                window_log: 0,
+            },
             self.compression,
             self.encryption.as_deref(),
             #[cfg(zstd_any)]

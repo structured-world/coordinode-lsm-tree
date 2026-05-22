@@ -52,4 +52,11 @@ pub trait FilterWriter<W: std::io::Write + std::io::Seek> {
         self: Box<Self>,
         encryption: Option<Arc<dyn EncryptionProvider>>,
     ) -> Box<dyn FilterWriter<W>>;
+
+    /// Sets the owning table id. Used by `finish()` to populate
+    /// `BlockIdentity::table_id` when writing filter blocks via
+    /// the Block I/O API. MUST be called by the Writer that owns
+    /// this filter writer before `finish()`, otherwise the
+    /// written blocks bind to `table_id = 0`.
+    fn use_table_id(self: Box<Self>, table_id: crate::TableId) -> Box<dyn FilterWriter<W>>;
 }

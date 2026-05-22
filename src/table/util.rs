@@ -101,6 +101,13 @@ pub fn load_block(
     let block = Block::from_file(
         fd.as_ref(),
         *handle,
+        crate::table::block::BlockIdentity {
+            table_id: table_id.table_id(),
+            block_offset: *handle.offset(),
+            block_type,
+            dict_id: 0,
+            window_log: 0,
+        },
         compression,
         encryption,
         #[cfg(zstd_any)]

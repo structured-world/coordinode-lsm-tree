@@ -801,6 +801,7 @@ impl Table {
             #[cfg(zstd_any)]
             self.zstd_dictionary.clone(),
             self.comparator.clone(),
+            self.metadata.id,
         )
     }
 
@@ -862,6 +863,7 @@ impl Table {
     fn read_tli(
         regions: &ParsedRegions,
         file: &dyn FsFile,
+        table_id: TableId,
         compression: CompressionType,
         encryption: Option<&dyn crate::encryption::EncryptionProvider>,
     ) -> crate::Result<IndexBlock> {
@@ -870,6 +872,13 @@ impl Table {
         let block = Block::from_file(
             file,
             regions.tli,
+            crate::table::block::BlockIdentity {
+                table_id,
+                block_offset: *regions.tli.offset(),
+                block_type: BlockType::Index,
+                dict_id: 0,
+                window_log: 0,
+            },
             compression,
             encryption,
             #[cfg(zstd_any)]
@@ -962,6 +971,7 @@ impl Table {
             let block = Self::read_tli(
                 &regions,
                 file_handle.as_ref(),
+                metadata.id,
                 metadata.index_block_compression,
                 encryption.as_deref(),
             )?;
@@ -988,6 +998,7 @@ impl Table {
             let block = Self::read_tli(
                 &regions,
                 file_handle.as_ref(),
+                metadata.id,
                 metadata.index_block_compression,
                 encryption.as_deref(),
             )?;
@@ -1014,6 +1025,13 @@ impl Table {
             let block = Block::from_file(
                 file_handle.as_ref(),
                 filter_tli_handle,
+                crate::table::block::BlockIdentity {
+                    table_id: metadata.id,
+                    block_offset: *filter_tli_handle.offset(),
+                    block_type: BlockType::Index,
+                    dict_id: 0,
+                    window_log: 0,
+                },
                 metadata.index_block_compression,
                 encryption.as_deref(),
                 #[cfg(zstd_any)]
@@ -1046,6 +1064,13 @@ impl Table {
                     let block = Block::from_file(
                         file_handle.as_ref(),
                         filter_handle,
+                        crate::table::block::BlockIdentity {
+                            table_id: metadata.id,
+                            block_offset: *filter_handle.offset(),
+                            block_type: BlockType::Filter,
+                            dict_id: 0,
+                            window_log: 0,
+                        },
                         crate::CompressionType::None, // NOTE: We never write a filter block with compression
                         encryption.as_deref(),
                         #[cfg(zstd_any)]
@@ -1075,6 +1100,13 @@ impl Table {
             let block = Block::from_file(
                 file_handle.as_ref(),
                 rt_handle,
+                crate::table::block::BlockIdentity {
+                    table_id: metadata.id,
+                    block_offset: *rt_handle.offset(),
+                    block_type: BlockType::RangeTombstone,
+                    dict_id: 0,
+                    window_log: 0,
+                },
                 crate::CompressionType::None,
                 encryption.as_deref(),
                 #[cfg(zstd_any)]

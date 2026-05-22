@@ -42,4 +42,12 @@ pub trait BlockIndexWriter<W: std::io::Write + std::io::Seek> {
         self: Box<Self>,
         encryption: Option<Arc<dyn EncryptionProvider>>,
     ) -> Box<dyn BlockIndexWriter<W>>;
+
+    /// Sets the owning table id. Used by `finish()` to populate
+    /// `BlockIdentity::table_id` when writing index blocks via the
+    /// Block I/O API. MUST be called by the Writer that owns this
+    /// index writer before `finish()`, otherwise the written
+    /// blocks bind to `table_id = 0` and the block-swap defence
+    /// degrades to "any table can substitute".
+    fn use_table_id(self: Box<Self>, table_id: crate::TableId) -> Box<dyn BlockIndexWriter<W>>;
 }
