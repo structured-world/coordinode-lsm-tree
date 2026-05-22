@@ -22,6 +22,10 @@ use lsm_tree::{
     AbstractTree, Aes256GcmProvider, AnyTree, CompressionType, Config, Guard,
     SequenceNumberCounter, config::CompressionPolicy,
 };
+// `Guard` looks unused at first glance but is required: `tree.range()`
+// yields `IterGuardImpl`, and `.into_inner()` is a method on the
+// `IterGuard` trait (re-exported as `Guard`). Without the import,
+// the trait isn't in scope and compilation fails with E0599.
 use std::{
     sync::{
         Arc,
@@ -170,9 +174,9 @@ fn stress_cell(compression: CompressionType, encrypt: bool) -> lsm_tree::Result<
 }
 
 /// Shared invariant chain used both pre- and post-reopen. Asserts the
-/// expected read results for every key range + the expected
-/// snapshot-style behaviour at seqno=999 + the expected range-scan
-/// content.
+/// expected MAX_SEQNO read results for every key range and the
+/// expected range-scan content. Snapshot-seqno (MVCC) reads are
+/// intentionally out of scope — see module-level comment.
 fn verify_invariants(tree: &AnyTree, label: &str, phase: &str) -> lsm_tree::Result<()> {
     // Step 6: MAX_SEQNO reads — sees all updates and tombstones
     for i in 0u32..100 {
