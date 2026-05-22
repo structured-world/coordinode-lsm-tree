@@ -29,7 +29,7 @@ use lsm_tree::{
 use std::{
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -396,6 +396,11 @@ fn concurrent_encrypted_no_corruption() -> lsm_tree::Result<()> {
     // Surface any I/O / encryption error from worker threads. Without this
     // a failed flush or get under contention would be silently swallowed.
     let worker_errors = Arc::new(AtomicU64::new(0));
+    // Per-writer max index reached — drives post-reopen probing without
+    // assuming the four writer threads made balanced progress. A scheduler
+    // that gives one writer 10× more CPU than the others is fine; we
+    // probe each writer's individual range exactly.
+    let writer_max_idx: Arc<Vec<AtomicU32>> = Arc::new((0..4).map(|_| AtomicU32::new(0)).collect());
 
     let mut handles = Vec::new();
 
@@ -407,6 +412,7 @@ fn concurrent_encrypted_no_corruption() -> lsm_tree::Result<()> {
         let seqno_gen = Arc::clone(&seqno_gen);
         let writes = Arc::clone(&writes_committed);
         let errors = Arc::clone(&worker_errors);
+        let max_idx = Arc::clone(&writer_max_idx);
         handles.push(std::thread::spawn(move || {
             let mut i = 0u32;
             while !stop.load(Ordering::Relaxed) {
@@ -415,6 +421,13 @@ fn concurrent_encrypted_no_corruption() -> lsm_tree::Result<()> {
                 let seqno = seqno_gen.fetch_add(1, Ordering::Relaxed);
                 tree.insert(key.as_bytes(), val.as_bytes(), seqno);
                 writes.fetch_add(1, Ordering::Relaxed);
+                #[expect(
+                    clippy::indexing_slicing,
+                    reason = "writer_id < 4 by loop bound; max_idx has 4 slots"
+                )]
+                // Record the highest index this writer has committed so far
+                // so the post-reopen probe can cover its exact range.
+                max_idx[writer_id as usize].store(i + 1, Ordering::Relaxed);
                 i += 1;
                 if i.is_multiple_of(100) {
                     // Periodic flush to exercise memtable→SST transition
@@ -492,22 +505,25 @@ fn concurrent_encrypted_no_corruption() -> lsm_tree::Result<()> {
     );
 
     // Reopen and confirm a meaningful fraction of the writes survived
-    // round-trip through encrypted SST decode. Probe the full per-writer
-    // index range and count every Some — tolerates internal gaps (so a
-    // single missing key doesn't truncate the count) but enforces a real
-    // recovery fraction against the writer-side tally, not just `> 0`.
+    // round-trip through encrypted SST decode. Probe each writer's
+    // EXACT committed index range (recorded as the writers ran) and
+    // count every Some — tolerates internal gaps (so a single missing
+    // key doesn't truncate the count) but enforces a real recovery
+    // fraction against the writer-side tally, not just `> 0`. Per-writer
+    // ranges avoid the "balanced progress" assumption that an
+    // average-based probe (total_written / 4) would impose — a scheduler
+    // that gives one writer 10× more CPU than the others is still
+    // covered exactly.
     drop(tree);
     let tree = open_tree(dir.path(), CompressionType::None, true)?;
-    // Per-writer max index is roughly ceil(total_written / 4). Probe a
-    // little beyond that to absorb rounding from interleaved fetch_add.
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "total_written from a 2s test fits in u32 comfortably"
-    )]
-    let probe_upper = ((total_written / 4) + 32) as u32;
     let mut found = 0u64;
     for writer_id in 0u32..4 {
-        for i in 0u32..probe_upper {
+        #[expect(
+            clippy::indexing_slicing,
+            reason = "writer_id < 4 by loop bound; writer_max_idx has 4 slots"
+        )]
+        let upper = writer_max_idx[writer_id as usize].load(Ordering::Relaxed);
+        for i in 0u32..upper {
             let key = format!("w{writer_id}_k{i:06}");
             if tree.get(key.as_bytes(), lsm_tree::MAX_SEQNO)?.is_some() {
                 found += 1;
