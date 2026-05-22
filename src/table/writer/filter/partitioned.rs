@@ -44,6 +44,10 @@ pub struct PartitionedFilterWriter {
     prefix_extractor: Option<Arc<dyn PrefixExtractor>>,
 
     encryption: Option<Arc<dyn EncryptionProvider>>,
+
+    /// Owning SST's table id. Set by the outer Writer via
+    /// `use_table_id` before `spill_filter_partition` / `finish`.
+    table_id: crate::TableId,
 }
 
 impl PartitionedFilterWriter {
@@ -67,6 +71,7 @@ impl PartitionedFilterWriter {
             prefix_extractor: None,
 
             encryption: None,
+            table_id: 0,
         }
     }
 
@@ -108,7 +113,14 @@ impl PartitionedFilterWriter {
         let header = Block::write_into(
             &mut self.final_filter_buffer,
             &filter_bytes,
-            crate::table::block::BlockType::Filter,
+            crate::table::block::BlockIdentity {
+                tree_id: 0,
+                table_id: self.table_id,
+                block_offset: 0,
+                block_type: crate::table::block::BlockType::Filter,
+                dict_id: 0,
+                window_log: 0,
+            },
             CompressionType::None,
             self.encryption.as_deref(),
             #[cfg(zstd_any)]
@@ -156,7 +168,14 @@ impl PartitionedFilterWriter {
         let header = Block::write_into(
             file_writer,
             &bytes,
-            crate::table::block::BlockType::Index,
+            crate::table::block::BlockIdentity {
+                tree_id: 0,
+                table_id: self.table_id,
+                block_offset: 0,
+                block_type: crate::table::block::BlockType::Index,
+                dict_id: 0,
+                window_log: 0,
+            },
             self.compression,
             self.encryption.as_deref(),
             #[cfg(zstd_any)]
@@ -186,6 +205,11 @@ impl<W: std::io::Write + std::io::Seek> FilterWriter<W> for PartitionedFilterWri
         encryption: Option<Arc<dyn EncryptionProvider>>,
     ) -> Box<dyn FilterWriter<W>> {
         self.encryption = encryption;
+        self
+    }
+
+    fn use_table_id(mut self: Box<Self>, table_id: crate::TableId) -> Box<dyn FilterWriter<W>> {
+        self.table_id = table_id;
         self
     }
 

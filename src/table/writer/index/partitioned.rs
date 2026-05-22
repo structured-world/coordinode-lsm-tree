@@ -35,6 +35,10 @@ pub struct PartitionedIndexWriter {
     final_write_buffer: Vec<u8>,
 
     encryption: Option<Arc<dyn EncryptionProvider>>,
+
+    /// Owning SST's table id. Set by the outer Writer via
+    /// `use_table_id` before `cut_index_block` / `finish` runs.
+    table_id: crate::TableId,
 }
 
 impl PartitionedIndexWriter {
@@ -55,6 +59,7 @@ impl PartitionedIndexWriter {
             final_write_buffer: Vec::new(),
 
             encryption: None,
+            table_id: 0,
         }
     }
 
@@ -69,7 +74,18 @@ impl PartitionedIndexWriter {
         let header = Block::write_into(
             &mut self.block_buffer,
             &bytes,
-            crate::table::block::BlockType::Index,
+            crate::table::block::BlockIdentity {
+                tree_id: 0,
+                table_id: self.table_id,
+                // Index partition writes into an internal buffer
+                // before being flushed; the buffer position isn't
+                // the file offset. Real per-block file offset is
+                // not available here without trait-surface changes.
+                block_offset: 0,
+                block_type: crate::table::block::BlockType::Index,
+                dict_id: 0,
+                window_log: 0,
+            },
             self.compression,
             self.encryption.as_deref(),
             #[cfg(zstd_any)]
@@ -138,7 +154,14 @@ impl PartitionedIndexWriter {
         let header = Block::write_into(
             file_writer,
             &bytes,
-            crate::table::block::BlockType::Index,
+            crate::table::block::BlockIdentity {
+                tree_id: 0,
+                table_id: self.table_id,
+                block_offset: 0,
+                block_type: crate::table::block::BlockType::Index,
+                dict_id: 0,
+                window_log: 0,
+            },
             self.compression,
             self.encryption.as_deref(),
             #[cfg(zstd_any)]
@@ -178,6 +201,11 @@ impl<W: std::io::Write + std::io::Seek> BlockIndexWriter<W> for PartitionedIndex
 
     fn use_restart_interval(mut self: Box<Self>, interval: u8) -> Box<dyn BlockIndexWriter<W>> {
         self.restart_interval = interval;
+        self
+    }
+
+    fn use_table_id(mut self: Box<Self>, table_id: crate::TableId) -> Box<dyn BlockIndexWriter<W>> {
+        self.table_id = table_id;
         self
     }
 

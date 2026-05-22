@@ -117,6 +117,21 @@ impl ParsedMeta {
         let block = Block::from_file(
             file,
             *handle,
+            crate::table::block::BlockIdentity {
+                // Meta is the FIRST block read during table open;
+                // table_id is what meta itself carries (chicken-and-
+                // egg). Binding the meta block's AAD to its own
+                // file offset still gives block-swap resistance
+                // within a single file; cross-file substitution is
+                // prevented by the meta block's own table_id field
+                // being part of the verified payload.
+                tree_id: 0,
+                table_id: 0,
+                block_offset: *handle.offset(),
+                block_type: BlockType::Meta,
+                dict_id: 0,
+                window_log: 0,
+            },
             CompressionType::None,
             encryption,
             #[cfg(zstd_any)]
@@ -379,7 +394,7 @@ mod tests {
         let _header = Block::write_into(
             &mut buf,
             &encoded,
-            BlockType::Meta,
+            crate::table::block::BlockIdentity::for_test(0, 0, BlockType::Meta),
             CompressionType::None,
             None,
             #[cfg(zstd_any)]

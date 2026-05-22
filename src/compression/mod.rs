@@ -322,6 +322,20 @@ pub enum CompressionType {
 }
 
 impl CompressionType {
+    /// Returns the zstd dictionary id encoded in this compression
+    /// configuration, or `0` when no dictionary applies. Used to
+    /// populate [`crate::table::block::BlockIdentity::dict_id`]
+    /// from a `CompressionType` at the call site without each
+    /// caller re-doing the `ZstdDict { dict_id, .. }` destructure.
+    #[must_use]
+    pub fn dict_id(&self) -> u32 {
+        #[cfg(zstd_any)]
+        if let Self::ZstdDict { dict_id, .. } = self {
+            return *dict_id;
+        }
+        0
+    }
+
     /// Validate a zstd compression level.
     ///
     /// Accepts levels in the range 1..=22 and returns an error otherwise.

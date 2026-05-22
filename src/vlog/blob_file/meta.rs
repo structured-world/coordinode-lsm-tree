@@ -110,7 +110,30 @@ impl Metadata {
         Block::write_into(
             writer,
             &buf,
-            crate::table::block::BlockType::Meta,
+            crate::table::block::BlockIdentity {
+                // Mirror the table-meta bootstrapping exception:
+                // blob meta is read via from_slice BEFORE the
+                // reader knows the BlobFileId (the id is what
+                // from_slice produces). For write/read AAD to
+                // match once #251 wires AAD, the writer must
+                // use the same table_id=0 the reader uses.
+                // Pre-#251 the value is accepted-but-not-consumed,
+                // but choosing the asymmetric `self.id` here would
+                // bake a permanent decrypt-mismatch into any
+                // encrypted blob meta we ever write.
+                tree_id: 0,
+                table_id: 0,
+                // The block is written immediately after the
+                // METADATA_HEADER_MAGIC prefix; the block's byte
+                // offset within the file/slice is the magic
+                // length. Using a real offset (vs 0) keeps AAD
+                // discriminator distinct from blocks that might
+                // appear at file start in other contexts.
+                block_offset: METADATA_HEADER_MAGIC.len() as u64,
+                block_type: crate::table::block::BlockType::Meta,
+                dict_id: 0,
+                window_log: 0,
+            },
             CompressionType::None,
             None,
             #[cfg(zstd_any)]
@@ -134,6 +157,23 @@ impl Metadata {
         // TODO: Block::from_slice
         let block = Block::from_reader(
             reader,
+            crate::table::block::BlockIdentity {
+                // from_slice constructs Self by parsing the blob
+                // meta — self.id is what THIS read produces, not
+                // available beforehand. table_id=0 here mirrors
+                // the table-meta parse path: cross-blob swap
+                // detection still relies on the meta payload's
+                // own id field being part of the verified body.
+                tree_id: 0,
+                table_id: 0,
+                // Symmetric with the writer: block sits after the
+                // magic prefix; this offset matches what the
+                // writer used at encode_into time.
+                block_offset: METADATA_HEADER_MAGIC.len() as u64,
+                block_type: crate::table::block::BlockType::Meta,
+                dict_id: 0,
+                window_log: 0,
+            },
             CompressionType::None,
             None,
             #[cfg(zstd_any)]
@@ -248,7 +288,7 @@ mod tests {
         Block::write_into(
             &mut buf,
             &encoded,
-            BlockType::Meta,
+            crate::table::block::BlockIdentity::for_test(0, 0, BlockType::Meta),
             CompressionType::None,
             None,
             #[cfg(zstd_any)]
