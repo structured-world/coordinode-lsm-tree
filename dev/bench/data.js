@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779425107716,
+  "lastUpdate": 1779453317540,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -7800,6 +7800,84 @@ window.BENCHMARK_DATA = {
             "value": 541808.9357600334,
             "unit": "ops/sec",
             "extra": "P50: 1.6us | P99: 6.2us | P99.9: 9.1us\nthreads: 1 | elapsed: 0.37s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "2816b569d8aaaa87d1cbee57b64334218996415c",
+          "message": "refactor(table/block/tests): extract write_block_to_tempfile helper (#128 part 1) (#293)\n\n## Summary\n\nPart 1 of #128. Centralises the duplicated tempfile / write / sync /\nreopen / handle-construct scaffold that the `Block::from_file` roundtrip\ntests in this module would otherwise carry verbatim ~10 times.\n\n(Resubmitted from closed #291 as a single squashed commit; same diff.)\n\n## Helper\n\n```rust\nstruct TempBlock {\n    file: std::fs::File,\n    handle: crate::table::BlockHandle,\n    dir: tempfile::TempDir, // declared LAST → drops after `file`\n}\n\nfn write_block_to_tempfile(\n    data: &[u8],\n    block_type: BlockType,\n    compression: CompressionType,\n    encryption: Option<&dyn EncryptionProvider>,\n    #[cfg(zstd_any)] zstd_dict: Option<&ZstdDictionary>,\n) -> crate::Result<TempBlock>\n```\n\n- **Streaming write** — `Block::write_into(&mut file, ...)` writes\ndirectly into the tempfile, no intermediate `Vec<u8>` buffer. Relevant\nfor the 32 KiB large-payload encryption test.\n- **Drop-order safety** — struct field order is `file, handle, dir` so\nthe open file handle closes before `TempDir` removes the directory\n(Windows rejects in-use removal otherwise).\n- **No destructure foot-gun** — callers hold the result as a single\nlocal (`let tmp = ...?;`) and access via `&tmp.file` + `tmp.handle`\n(`BlockHandle` is `Copy`). Struct field order is the SOLE source of\ntruth for drop order; no destructuring pattern can break it.\n- **`dir` field** carries `#[expect(dead_code)]` with a reason — it's\nheld purely for its `Drop` side-effect.\n\n## Refactored sites (8)\n\n| Test | cfg |\n|---|---|\n| `block_from_file_roundtrip_uncompressed` | — |\n| `block_from_file_roundtrip_lz4` | lz4 |\n| `block_from_file_roundtrip_zstd` | zstd_any |\n| `block_from_file_encrypted_uncompressed` | encryption |\n| `block_from_file_encrypted_lz4` | encryption + lz4 |\n| `block_from_file_encrypted_zstd` | encryption + zstd_any |\n| `block_from_file_encrypted_wrong_key_fails` | encryption |\n| `block_from_file_encrypted_uncompressed_large_payload` | encryption |\n\n## Intentionally NOT refactored\n\nTwo `from_file` tests need pre-write byte manipulation that doesn't fit\nthe helper:\n\n- `block_from_file_encrypted_checksum_tamper_detected` — XORs a byte in\nthe encoded buffer before persisting; the helper would have to expose\nthe intermediate buffer.\n- `block_from_file_encrypted_undersized_handle_rejected` — writes raw\n`\"tiny\"` bytes (not a `Block`-encoded payload) to test undersized-handle\nrejection; the helper is specifically a `Block`-encoded scaffold.\n\n## Test plan\n\n- [x] `cargo clippy --lib --tests --all-features` — clean\n- [x] `cargo nextest run --workspace --all-features` — all pass\n- [x] `cargo test --doc` — 42 passed\n- [x] Diff: net -91 lines, single file (`src/table/block/mod.rs`)\n\n## Out of scope\n\nPart 2 of #128 — the mixed-load encryption stress test — stays open as a\nseparate follow-up.\n\nPart of #128.",
+          "timestamp": "2026-05-22T15:34:24+03:00",
+          "tree_id": "b31b5caf25c74ee21a00c6406a917b25a7b9b0da",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/2816b569d8aaaa87d1cbee57b64334218996415c"
+        },
+        "date": 1779453316009,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 2025686.8025269145,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.6us | P99.9: 3.7us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1204780.7023528132,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.3us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 640269.9869992539,
+            "unit": "ops/sec",
+            "extra": "P50: 1.4us | P99: 4.6us | P99.9: 7.0us\nthreads: 1 | elapsed: 0.31s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3654833.7039700192,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 3.0us | P99.9: 5.5us\nthreads: 1 | elapsed: 0.05s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 443188.12429556635,
+            "unit": "ops/sec",
+            "extra": "P50: 2.0us | P99: 5.2us | P99.9: 7.9us\nthreads: 1 | elapsed: 0.45s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 224774.523954756,
+            "unit": "ops/sec",
+            "extra": "P50: 4.2us | P99: 5.2us | P99.9: 7.7us\nthreads: 1 | elapsed: 0.89s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1255533.1266420295,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.3us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1154023.3008613873,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 1.5us | P99.9: 1.9us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 536693.5141782955,
+            "unit": "ops/sec",
+            "extra": "P50: 1.7us | P99: 5.0us | P99.9: 7.6us\nthreads: 1 | elapsed: 0.37s | num: 200000 | iterations: 3"
           }
         ]
       }
