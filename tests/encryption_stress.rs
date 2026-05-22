@@ -2,10 +2,12 @@
 //
 // Exercises the encryption-at-rest path across the full combination matrix
 // of compression backends, write/update/delete operations, point + range
-// reads, MVCC-style seqno-scoped reads, memtable flush, major compaction,
-// and tree-reopen recovery. The single-threaded matrix sweeps every
-// (compression × encryption) cell; the concurrent variant adds writer /
-// reader contention on top of the most-stressing cell.
+// reads at MAX_SEQNO, memtable flush, major compaction, and tree-reopen
+// recovery. The single-threaded matrix sweeps every (compression ×
+// encryption) cell; the concurrent variant adds writer / reader
+// contention on top of the most-stressing cell. Snapshot-seqno (MVCC)
+// reads are deliberately out of scope here — they depend on flush-GC
+// thresholds and are covered separately.
 //
 // Each cell asserts: every inserted key reads back with the expected
 // value at its expected seqno; deletes shadow earlier inserts; range
@@ -78,7 +80,7 @@ fn cell_label(compression: CompressionType, encrypt: bool) -> String {
         // CompressionType is #[non_exhaustive] — future variants get a
         // generic label so a new compression type doesn't break this
         // helper at compile time. Tests still exercise specific cells
-        // via explicit `stress_*` test functions below.
+        // via explicit `cell_*` test functions below.
         _ => "other",
     };
     format!("{comp}{}", if encrypt { "+enc" } else { "" })
@@ -102,8 +104,8 @@ fn cell_label(compression: CompressionType, encrypt: bool) -> String {
 ///      - k00100..k00149: returns None (tombstoned)
 ///      - k00150..k00999: returns original value
 ///      - k01000..k01499: returns original value
-///   7. (Snapshot-seqno read intentionally omitted — depends on flush
-///      GC threshold; see verify_invariants for the deferred comment.)
+///   7. (Snapshot-seqno read intentionally omitted — MVCC is out of
+///      scope for this suite; see module-level comment.)
 ///   8. Range scan over [k00500, k00700): exactly 200 entries, all
 ///      original values
 ///   9. Drop the tree, reopen from disk with the SAME encryption provider
@@ -210,12 +212,9 @@ fn verify_invariants(tree: &AnyTree, label: &str, phase: &str) -> lsm_tree::Resu
         assert_eq!(got.as_ref(), expected.as_bytes(), "{label} {phase}: {key}");
     }
 
-    // (Snapshot-seqno read intentionally omitted: it depends on flush GC
-    // threshold semantics — `flush_active_memtable(eviction_seqno)` will
-    // consolidate versions older than `eviction_seqno` when a newer
-    // version exists. That MVCC interaction is its own thing and is
-    // tested elsewhere; this suite focuses on encryption + decompression
-    // correctness, where MAX_SEQNO reads suffice.)
+    // Snapshot-seqno reads intentionally omitted — see module-level
+    // comment. This suite covers encryption + decompression correctness
+    // at MAX_SEQNO; MVCC interactions are tested elsewhere.
 
     // Step 8: range scan [k00500, k00700) at MAX_SEQNO — exactly 200 entries
     // with their original values (none of this range was updated or
@@ -248,48 +247,48 @@ fn verify_invariants(tree: &AnyTree, label: &str, phase: &str) -> lsm_tree::Resu
 // ────────────────────────────────────────────────────────────────────────
 
 #[test]
-fn stress_none_plaintext() -> lsm_tree::Result<()> {
+fn cell_none_plaintext_round_trips() -> lsm_tree::Result<()> {
     stress_cell(CompressionType::None, false)
 }
 
 #[test]
-fn stress_none_encrypted() -> lsm_tree::Result<()> {
+fn cell_none_encrypted_round_trips() -> lsm_tree::Result<()> {
     stress_cell(CompressionType::None, true)
 }
 
 #[test]
 #[cfg(feature = "lz4")]
-fn stress_lz4_plaintext() -> lsm_tree::Result<()> {
+fn cell_lz4_plaintext_round_trips() -> lsm_tree::Result<()> {
     stress_cell(CompressionType::Lz4, false)
 }
 
 #[test]
 #[cfg(feature = "lz4")]
-fn stress_lz4_encrypted() -> lsm_tree::Result<()> {
+fn cell_lz4_encrypted_round_trips() -> lsm_tree::Result<()> {
     stress_cell(CompressionType::Lz4, true)
 }
 
 #[test]
 #[cfg(zstd_any)]
-fn stress_zstd1_plaintext() -> lsm_tree::Result<()> {
+fn cell_zstd1_plaintext_round_trips() -> lsm_tree::Result<()> {
     stress_cell(CompressionType::Zstd(1), false)
 }
 
 #[test]
 #[cfg(zstd_any)]
-fn stress_zstd1_encrypted() -> lsm_tree::Result<()> {
+fn cell_zstd1_encrypted_round_trips() -> lsm_tree::Result<()> {
     stress_cell(CompressionType::Zstd(1), true)
 }
 
 #[test]
 #[cfg(zstd_any)]
-fn stress_zstd3_plaintext() -> lsm_tree::Result<()> {
+fn cell_zstd3_plaintext_round_trips() -> lsm_tree::Result<()> {
     stress_cell(CompressionType::Zstd(3), false)
 }
 
 #[test]
 #[cfg(zstd_any)]
-fn stress_zstd3_encrypted() -> lsm_tree::Result<()> {
+fn cell_zstd3_encrypted_round_trips() -> lsm_tree::Result<()> {
     stress_cell(CompressionType::Zstd(3), true)
 }
 
@@ -302,7 +301,7 @@ fn stress_zstd3_encrypted() -> lsm_tree::Result<()> {
 // ────────────────────────────────────────────────────────────────────────
 
 #[test]
-fn stress_encrypted_with_major_compaction() -> lsm_tree::Result<()> {
+fn major_compaction_encrypted_round_trips() -> lsm_tree::Result<()> {
     let compression = CompressionType::None;
     let label = "none+enc+major-compact";
     let dir = tempfile::tempdir()?;
@@ -316,10 +315,13 @@ fn stress_encrypted_with_major_compaction() -> lsm_tree::Result<()> {
             for i in 0u32..200 {
                 let key = format!("b{batch}k{i:05}");
                 let val = format!("b{batch}v{i:05}");
-                let seqno = u64::from(batch) * 1000 + u64::from(i);
+                // seqno=0 is the engine's compacted-final sentinel; start at 1
+                // so the first write (batch=0, i=0) exercises the same MVCC
+                // path as user writes.
+                let seqno = 1 + u64::from(batch) * 1000 + u64::from(i);
                 tree.insert(key.as_bytes(), val.as_bytes(), seqno);
             }
-            tree.flush_active_memtable(u64::from(batch) * 1000 + 999)?;
+            tree.flush_active_memtable(1 + u64::from(batch) * 1000 + 999)?;
         }
 
         // Major compaction rewrites every SST into one merged file per
@@ -378,13 +380,18 @@ fn stress_encrypted_with_major_compaction() -> lsm_tree::Result<()> {
 // ────────────────────────────────────────────────────────────────────────
 
 #[test]
-fn stress_concurrent_encrypted() -> lsm_tree::Result<()> {
+fn concurrent_encrypted_no_corruption() -> lsm_tree::Result<()> {
     let dir = tempfile::tempdir()?;
     let tree = Arc::new(open_tree(dir.path(), CompressionType::None, true)?);
 
     let stop = Arc::new(AtomicBool::new(false));
-    let seqno_gen = Arc::new(AtomicU64::new(0));
+    // Start at 1 so the first concurrent write doesn't hit the engine's
+    // seqno=0 compacted-final sentinel.
+    let seqno_gen = Arc::new(AtomicU64::new(1));
     let writes_committed = Arc::new(AtomicU64::new(0));
+    // Surface any I/O / encryption error from worker threads. Without this
+    // a failed flush or get under contention would be silently swallowed.
+    let worker_errors = Arc::new(AtomicU64::new(0));
 
     let mut handles = Vec::new();
 
@@ -395,6 +402,7 @@ fn stress_concurrent_encrypted() -> lsm_tree::Result<()> {
         let stop = Arc::clone(&stop);
         let seqno_gen = Arc::clone(&seqno_gen);
         let writes = Arc::clone(&writes_committed);
+        let errors = Arc::clone(&worker_errors);
         handles.push(std::thread::spawn(move || {
             let mut i = 0u32;
             while !stop.load(Ordering::Relaxed) {
@@ -406,8 +414,13 @@ fn stress_concurrent_encrypted() -> lsm_tree::Result<()> {
                 i += 1;
                 if i.is_multiple_of(100) {
                     // Periodic flush to exercise memtable→SST transition
-                    // under concurrent reads.
-                    let _ = tree.flush_active_memtable(seqno);
+                    // under concurrent reads. Flush failure under contention
+                    // would mask SST-write bugs, so propagate to the main
+                    // thread instead of swallowing.
+                    if tree.flush_active_memtable(seqno).is_err() {
+                        errors.fetch_add(1, Ordering::Relaxed);
+                        return;
+                    }
                 }
             }
         }));
@@ -420,19 +433,31 @@ fn stress_concurrent_encrypted() -> lsm_tree::Result<()> {
     for _ in 0..2 {
         let tree = Arc::clone(&tree);
         let stop = Arc::clone(&stop);
+        let errors = Arc::clone(&worker_errors);
         handles.push(std::thread::spawn(move || {
             let mut i = 0u32;
             while !stop.load(Ordering::Relaxed) {
                 let writer_id = i % 4;
                 let key_idx = i / 4;
                 let key = format!("w{writer_id}_k{key_idx:06}");
-                if let Ok(Some(got)) = tree.get(key.as_bytes(), lsm_tree::MAX_SEQNO) {
-                    let val_str = std::str::from_utf8(&got).expect("valid utf8 from decrypt");
-                    let expected_prefix = format!("w{writer_id}_v");
-                    assert!(
-                        val_str.starts_with(&expected_prefix),
-                        "concurrent read got garbage {val_str} for {key}"
-                    );
+                match tree.get(key.as_bytes(), lsm_tree::MAX_SEQNO) {
+                    Ok(Some(got)) => {
+                        let val_str = std::str::from_utf8(&got).expect("valid utf8 from decrypt");
+                        let expected_prefix = format!("w{writer_id}_v");
+                        assert!(
+                            val_str.starts_with(&expected_prefix),
+                            "concurrent read got garbage {val_str} for {key}"
+                        );
+                    }
+                    Ok(None) => {
+                        // key not yet written by its writer — fine
+                    }
+                    Err(_) => {
+                        // Encrypted read failed under contention. Should
+                        // never happen — surface to the main thread.
+                        errors.fetch_add(1, Ordering::Relaxed);
+                        return;
+                    }
                 }
                 i = i.wrapping_add(1);
             }
@@ -445,6 +470,12 @@ fn stress_concurrent_encrypted() -> lsm_tree::Result<()> {
     for h in handles {
         h.join().expect("worker panic");
     }
+    let errors_seen = worker_errors.load(Ordering::Relaxed);
+    assert_eq!(
+        errors_seen, 0,
+        "concurrent workers reported {errors_seen} flush/read errors — \
+         encrypted I/O under contention must not return Err"
+    );
 
     // Final verification — flush remaining memtable then sample-read
     // every 50th key written and confirm presence.
@@ -456,29 +487,37 @@ fn stress_concurrent_encrypted() -> lsm_tree::Result<()> {
         "no writes committed in 2s contention window"
     );
 
-    // Reopen and confirm a meaningful chunk of the writes survived
-    // round-trip through encrypted SST decode.
+    // Reopen and confirm a meaningful fraction of the writes survived
+    // round-trip through encrypted SST decode. Probe the full per-writer
+    // index range and count every Some — tolerates internal gaps (so a
+    // single missing key doesn't truncate the count) but enforces a real
+    // recovery fraction against the writer-side tally, not just `> 0`.
     drop(tree);
     let tree = open_tree(dir.path(), CompressionType::None, true)?;
+    // Per-writer max index is roughly ceil(total_written / 4). Probe a
+    // little beyond that to absorb rounding from interleaved fetch_add.
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "total_written from a 2s test fits in u32 comfortably"
+    )]
+    let probe_upper = ((total_written / 4) + 32) as u32;
     let mut found = 0u64;
     for writer_id in 0u32..4 {
-        let mut i = 0u32;
-        loop {
+        for i in 0u32..probe_upper {
             let key = format!("w{writer_id}_k{i:06}");
-            let res = tree.get(key.as_bytes(), lsm_tree::MAX_SEQNO)?;
-            if res.is_none() {
-                break;
-            }
-            found += 1;
-            i += 1;
-            if i > 10_000 {
-                break;
+            if tree.get(key.as_bytes(), lsm_tree::MAX_SEQNO)?.is_some() {
+                found += 1;
             }
         }
     }
+    // Demand at least half the writer-side tally survives reopen. Anything
+    // lower means encrypted SST flush + recovery dropped a significant
+    // portion of committed writes, which is a real bug.
+    let min_expected = total_written / 2;
     assert!(
-        found > 0,
-        "post-reopen sample found 0 keys; concurrent writes failed to persist"
+        found >= min_expected,
+        "post-reopen found only {found} of {total_written} committed writes \
+         (expected >= {min_expected}); encrypted concurrent writes failed to persist"
     );
 
     Ok(())
@@ -493,7 +532,7 @@ fn stress_concurrent_encrypted() -> lsm_tree::Result<()> {
 // ────────────────────────────────────────────────────────────────────────
 
 #[test]
-fn stress_wrong_key_does_not_silently_corrupt() -> lsm_tree::Result<()> {
+fn wrong_key_reopen_reads_error() -> lsm_tree::Result<()> {
     let dir = tempfile::tempdir()?;
 
     // Write with key A
@@ -511,9 +550,10 @@ fn stress_wrong_key_does_not_silently_corrupt() -> lsm_tree::Result<()> {
         for i in 0u32..100 {
             let key = format!("k{i:05}");
             let val = format!("v{i:05}");
-            tree.insert(key.as_bytes(), val.as_bytes(), u64::from(i));
+            // seqno=0 is the engine's compacted-final sentinel; start at 1.
+            tree.insert(key.as_bytes(), val.as_bytes(), 1 + u64::from(i));
         }
-        tree.flush_active_memtable(99)?;
+        tree.flush_active_memtable(100)?;
     }
 
     // Reopen with key B — different bytes
@@ -539,41 +579,19 @@ fn stress_wrong_key_does_not_silently_corrupt() -> lsm_tree::Result<()> {
             // (a) — open failed loudly, satisfies the property.
         }
         Ok(tree) => {
-            // (b) — verify EVERY read either errors or returns a value
-            // whose bytes do NOT happen to coincide with a plausible
-            // plaintext (i.e., decoder rejects rather than returns garbage).
-            let mut got_any_value = false;
+            // (b) — every read must fail with a block-validation error.
+            // The documented contract (`src/config/mod.rs`, `src/table/block/mod.rs`)
+            // is "AEAD rejects → Err, never silent None or garbage". Accepting
+            // Ok(None) / Ok(Some(_)) here would let a regression that strips
+            // AEAD checks pass undetected.
             for i in 0u32..100 {
                 let key = format!("k{i:05}");
-                let result = tree.get(key.as_bytes(), lsm_tree::MAX_SEQNO);
-                match result {
-                    Err(_) => {
-                        // expected — AEAD rejected
-                    }
-                    Ok(None) => {
-                        // also acceptable — meta decoded but data unreadable
-                    }
-                    Ok(Some(value)) => {
-                        // Worst case: got a value. Check it's NOT the
-                        // original plaintext (which would mean the key
-                        // mismatch wasn't enforced).
-                        let expected = format!("v{i:05}");
-                        assert_ne!(
-                            value.as_ref(),
-                            expected.as_bytes(),
-                            "wrong-key open returned ORIGINAL plaintext for {key} \
-                             — encryption is not enforced on read path"
-                        );
-                        got_any_value = true;
-                    }
-                }
+                assert!(
+                    tree.get(key.as_bytes(), lsm_tree::MAX_SEQNO).is_err(),
+                    "wrong-key read for {key} must error — encryption is \
+                     not enforced on the read path"
+                );
             }
-            // If we got any value, the test is permissive (garbage but
-            // not original plaintext). Stricter behaviour (always Err
-            // or None) is preferred but the current contract allows
-            // (b)-with-garbage as long as it's clearly not the
-            // original plaintext.
-            let _ = got_any_value;
         }
     }
 
@@ -587,7 +605,7 @@ fn stress_wrong_key_does_not_silently_corrupt() -> lsm_tree::Result<()> {
 // ────────────────────────────────────────────────────────────────────────
 
 #[test]
-fn stress_suite_smoke_check_under_budget() -> lsm_tree::Result<()> {
+fn single_cell_smoke_under_30s() -> lsm_tree::Result<()> {
     let start = Instant::now();
     stress_cell(CompressionType::None, false)?;
     let elapsed = start.elapsed();
