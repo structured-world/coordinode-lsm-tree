@@ -4,14 +4,30 @@
 //! Merging iterator over `MergeSource`s, backed by two independent
 //! `LoserTree` tournaments (forward min, backward max).
 //!
-//! `DoubleEndedIterator` is bounded on `MergeSource` — both
-//! coherent (std `vec::IntoIter`, `VecDeque`, `BTreeMap::range`,
-//! wrapped via `CoherentIterSource`) and independent-cursor
-//! sources (LSM SST scanners, future `RunReader` impls) are
-//! supported. Coherent sources maintain "no item yielded twice"
-//! through their shared front/back cursor discipline; independent
-//! sources rely on `MergeSource::seek` being invoked at direction
-//! switches to reposition cursors past already-consumed items.
+//! `DoubleEndedIterator` is bounded on `MergeSource`. The merger
+//! does NOT call `MergeSource::seek` on direction switches — its
+//! two-tree architecture relies on each source's `next` and
+//! `next_back` self-coordinating so that they together shrink a
+//! single remaining range from both ends. Two source families
+//! satisfy this:
+//!
+//! - **Coherent sources** (std `vec::IntoIter`, `VecDeque`,
+//!   `BTreeMap::range`, wrapped via `CoherentIterSource`) where
+//!   the cursor state is literally shared between the two methods.
+//! - **Self-coordinating independent-cursor sources** that track
+//!   a `(front_idx, back_idx)` window internally and refuse to
+//!   yield once `front_idx >= back_idx`. LSM SST scanners and
+//!   future `RunReader` impls fit here.
+//!
+//! Sources with two truly independent cursors and no shared state
+//! would emit duplicates under mixed direction — they are not
+//! supported. `MergeSource::seek` exists in the trait for
+//! user-initiated repositioning (e.g., starting a range scan at a
+//! specific key); wiring it into the merger's direction-switch
+//! path would defeat the buffered-value migration in
+//! `initialize_forward` / `initialize_backward` and pre-emptively
+//! shift cursors before the destination tournament populates its
+//! edge leaves.
 //!
 //! The eager per-direction init below builds each tournament from
 //! a pre-populated `Vec<Option<MergerEntry>>` on first use, lazy
@@ -114,17 +130,15 @@ fn build_max_cmp<C: UserComparator + Clone>(comparator: C) -> MaxCmp<C> {
 ///
 /// # Direction-switching
 ///
-/// `DoubleEndedIterator` is bounded on `MergeSource` — both coherent
-/// and independent-cursor sources can use mixed `next()` /
-/// `next_back()`. Coherent sources (std `vec::IntoIter`,
-/// `VecDeque`, `BTreeMap::range`, wrapped via `CoherentIterSource`)
-/// maintain "no item yielded twice" through their shared
-/// front/back cursor discipline. Independent-cursor sources (LSM
-/// SST scanners, future `RunReader` impls) need a real
-/// `MergeSource::seek` that repositions cursors per the contract
-/// in [`MergeSource::seek`] documentation — at the direction
-/// switch the merger relies on that repositioning to avoid
-/// re-yielding items the opposite direction already consumed.
+/// `DoubleEndedIterator` is bounded on `MergeSource`. Mixed
+/// `next()` / `next_back()` is safe only when each source
+/// self-coordinates between its forward and backward halves —
+/// either through shared cursor state (coherent sources, wrapped
+/// via `CoherentIterSource`) or through an internal
+/// `(front_idx, back_idx)` window that refuses to yield once the
+/// remaining range is empty. The merger does NOT invoke
+/// `MergeSource::seek` on direction switches (see module-level
+/// docs for rationale).
 pub struct SeekingMerger<S: MergeSource, C: UserComparator + Clone> {
     sources: Vec<S>,
     n_sources: usize,
@@ -297,12 +311,13 @@ impl<S: MergeSource, C: UserComparator + Clone> Iterator for SeekingMerger<S, C>
     }
 }
 
-// `DoubleEndedIterator` is bounded on `MergeSource` — independent
-// cursor sources are now supported via the direction-switch path
-// (see `next` / `next_back` below). The bound was previously
-// `CoherentMergeSource` while mixed direction relied entirely on
-// source cursor coherence; the seek-aware switch makes that
-// restriction unnecessary.
+// `DoubleEndedIterator` is bounded on `MergeSource`. The previous
+// `CoherentMergeSource` bound was relaxed because self-coordinating
+// independent-cursor sources (e.g., LSM SST scanners that maintain
+// a `(front_idx, back_idx)` window internally) satisfy the
+// merger's "no duplicates under mixed direction" requirement
+// without implementing the `CoherentMergeSource` marker. See
+// module-level docs for the full source-shape contract.
 impl<S: MergeSource, C: UserComparator + Clone> DoubleEndedIterator for SeekingMerger<S, C> {
     fn next_back(&mut self) -> Option<Self::Item> {
         // Same error-first contract as next().
