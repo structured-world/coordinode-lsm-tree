@@ -36,17 +36,11 @@
 //!   **Coherent-cursor sources** (those marked [`CoherentMergeSource`]
 //!   — `alloc::vec::IntoIter`, `alloc::collections::VecDeque`, range
 //!   iterators from `alloc::collections::BTreeMap`, and our
-//!   `CoherentIterSource` wrapper) — seek
-//!   MAY be a no-op. The shared front/back cursor discipline
-//!   already maintains the "no item yielded twice" invariant for
-//!   mixed-direction consumption without any explicit reposition;
-//!   the no-op satisfies the contract trivially. The current MVP
-//!   `SeekingMerger` does NOT actually invoke `seek()` — its
-//!   `DoubleEndedIterator` impl is type-gated on
-//!   `CoherentMergeSource` and relies on the marker's coherence
-//!   promise. The seek-aware direction-switch path that would
-//!   exercise `seek()` for independent-cursor sources is the
-//!   follow-up tracked as issue #280.
+//!   `CoherentIterSource` wrapper) — seek MAY be a no-op. The shared
+//!   front/back cursor discipline already maintains the "no item
+//!   yielded twice" invariant for mixed-direction consumption
+//!   without any explicit reposition; the no-op satisfies the
+//!   contract trivially.
 //!
 //! # Why a custom trait, not just `DoubleEndedIterator + Seek`
 //!
@@ -109,8 +103,9 @@ pub trait MergeSource: Send {
     fn seek(&mut self, target: &InternalKey) -> crate::Result<()>;
 }
 
-/// Marker for `MergeSource` impls whose `next()` and `next_back()`
-/// share cursor state.
+/// Marker documenting that a `MergeSource` impl's `next()` and
+/// `next_back()` share cursor state literally (not just by index
+/// arithmetic on a single backing buffer).
 ///
 /// Such sources guarantee that mixed forward/backward consumption
 /// never yields the same item twice. Iterators backed by
@@ -119,16 +114,14 @@ pub trait MergeSource: Send {
 /// (their `DoubleEndedIterator` impls shrink a single remaining
 /// range from both ends).
 ///
-/// **Why a marker trait:** `SeekingMerger` can skip seek-based
-/// reseeks for sources whose front/back cursors already shrink a
-/// single shared remaining range. Sources with independent cursors
-/// (LSM SST scanners, run readers — the intended follow-up impls)
-/// should implement `MergeSource` with a real `seek`, but MUST NOT
-/// implement `CoherentMergeSource` unless mixed forward/backward
-/// consumption already guarantees no item is yielded twice. The
-/// marker is the type-system encoding of that promise — without
-/// it, `SeekingMerger`'s `DoubleEndedIterator` impl is unavailable
-/// at compile time.
+/// **Status:** documentation-only marker. Earlier versions of
+/// `SeekingMerger` gated `DoubleEndedIterator` on this trait, but
+/// the bound was relaxed to `MergeSource` so self-coordinating
+/// independent-cursor sources (LSM SST scanners with a
+/// `(front_idx, back_idx)` window) work too. The marker remains
+/// because it cleanly identifies the literally-shared-state
+/// flavour for `CoherentIterSource` and is a place to anchor the
+/// "no item yielded twice" promise in the type system.
 pub trait CoherentMergeSource: MergeSource {}
 
 /// Pass-through impl so callers can build `Vec<Box<dyn MergeSource +

@@ -772,12 +772,24 @@ mod tests {
     /// the merger — is what makes mixed direction safe for
     /// `SeekingMerger` (see module-level docs).
     ///
-    /// `seek(target)` is exposed per the [`MergeSource::seek`]
-    /// trait contract for user-initiated repositioning (range scan
-    /// starting key, etc.) and clamps so it can only RESTRICT the
-    /// live range, never re-expose already-consumed items:
-    ///   - `front_idx` becomes `max(front_idx, partition_point<target)`;
-    ///   - `back_idx` becomes `min(back_idx, partition_point<target)`.
+    /// `seek(target)` is implemented for trait conformance but is
+    /// **not** a usable repositioning primitive on this test double:
+    /// the clamp keeps the self-coordination invariant by collapsing
+    /// the window to empty after any call:
+    ///   - `front_idx` becomes `max(front_idx, partition_point<target)`
+    ///     — forced past or to the target;
+    ///   - `back_idx` becomes `min(back_idx, partition_point<target)`
+    ///     — forced at or before the target;
+    ///   - combined: `front_idx >= back_idx`, so subsequent
+    ///     `next()` / `next_back()` both return `None`.
+    ///
+    /// This is correct for the merger's no-duplicates contract on
+    /// self-coordinating sources but is **not** the contract
+    /// [`MergeSource::seek`] documents for a general independent-
+    /// cursor implementation (real LSM scanners would hard-reset
+    /// the cursor at `target`). Production impls should treat
+    /// `MergeSource::seek` as a true reposition; this test double
+    /// is a self-coordinating shape only.
     ///
     /// Unlike `VecSource` this does NOT implement
     /// [`CoherentMergeSource`] — cursors aren't literally shared,
@@ -842,15 +854,15 @@ mod tests {
         }
 
         fn seek(&mut self, target: &InternalKey) -> crate::Result<()> {
-            // First idx where items[i].key >= target. items[..idx]
-            // satisfy `< target`; items[idx..] satisfy `>=`.
+            // Clamping seek: enforces the self-coordination invariant
+            // by collapsing the window to empty (see struct docs).
+            // A production source would hard-reset cursors to `target`;
+            // this test double cannot, without risking already-emitted
+            // items being re-yielded — which would break the no-
+            // duplicates property under mixed direction.
             let idx = self.items.partition_point(|v| {
                 v.key.compare_with(target, self.comparator.as_ref()) == Ordering::Less
             });
-            // Clamp so seek only RESTRICTS the live range. Without
-            // the clamp, calling seek(small_key) after some forward
-            // emissions would rewind the front cursor and re-emit
-            // already-yielded items.
             self.front_idx = self.front_idx.max(idx);
             self.back_idx = self.back_idx.min(idx);
             Ok(())
