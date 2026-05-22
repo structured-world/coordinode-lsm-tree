@@ -766,19 +766,23 @@ mod tests {
     /// shape). Backed by a sorted `Vec` plus `front_idx` / `back_idx`
     /// pointers that shrink independently from each end.
     ///
-    /// `seek(target)` repositions both pointers per the
-    /// [`MergeSource::seek`] contract:
-    ///   - `front_idx` becomes the smallest index `i` with
-    ///     `items[i].key >= target` (clamped so seek can only
-    ///     RESTRICT the remaining range, never re-expose already-
-    ///     consumed items);
-    ///   - `back_idx` becomes that same index (clamped similarly).
+    /// **Self-coordinates** via the `front_idx >= back_idx` guard:
+    /// once the two pointers meet, both `next()` and `next_back()`
+    /// return `None`. That guarantee — not any seek invocation from
+    /// the merger — is what makes mixed direction safe for
+    /// `SeekingMerger` (see module-level docs).
+    ///
+    /// `seek(target)` is exposed per the [`MergeSource::seek`]
+    /// trait contract for user-initiated repositioning (range scan
+    /// starting key, etc.) and clamps so it can only RESTRICT the
+    /// live range, never re-expose already-consumed items:
+    ///   - `front_idx` becomes `max(front_idx, partition_point<target)`;
+    ///   - `back_idx` becomes `min(back_idx, partition_point<target)`.
     ///
     /// Unlike `VecSource` this does NOT implement
-    /// [`CoherentMergeSource`] — front and back cursors are
-    /// independent. Only the seek-aware direction-switch path keeps
-    /// mixed `next()` / `next_back()` from re-emitting items the
-    /// other direction already consumed.
+    /// [`CoherentMergeSource`] — cursors aren't literally shared,
+    /// they're coordinated by index arithmetic on a single backing
+    /// `Vec`.
     struct IndependentCursorSource {
         items: Vec<crate::InternalValue>,
         front_idx: usize,
@@ -792,6 +796,14 @@ mod tests {
             comparator: SharedComparator,
         ) -> Self {
             let items: Vec<_> = items.into_iter().collect();
+            // partition_point in seek() assumes ascending key order;
+            // enforce it in debug builds to catch test misuse early.
+            debug_assert!(
+                items.is_sorted_by(|a, b| {
+                    a.key.compare_with(&b.key, comparator.as_ref()) != Ordering::Greater
+                }),
+                "IndependentCursorSource items must be sorted ascending by key",
+            );
             let n = items.len();
             Self {
                 items,
@@ -850,15 +862,16 @@ mod tests {
         // Inverted regression for the deleted
         // `mvp_emits_duplicates_with_independent_cursor_source`.
         //
-        // MVP (no seek wiring) would emit a,b,c,d forward AND
-        // d,c,b,a backward — 8 emissions for 4 unique items.
+        // Old buggy version (separate forward/backward queues with
+        // no shared state) would emit a,b,c,d forward AND d,c,b,a
+        // backward — 8 emissions for 4 unique items.
         //
-        // With the seek-aware direction switch: backward switch
-        // after full forward drain calls source.seek('d'), which
-        // clamps back_idx down to the index of items < 'd' (= 3).
-        // front_idx is already at 4 from the drain, so the source
-        // is exhausted backward. Total 4 emissions for 4 unique
-        // items — each yielded exactly once.
+        // Current `IndependentCursorSource` self-coordinates via
+        // the `front_idx >= back_idx` guard: after full forward
+        // drain both pointers equal 4, so `next_back()` returns
+        // `None` immediately. Total 4 emissions for 4 unique
+        // items — each yielded exactly once, no merger-side seek
+        // needed.
         let cmp = comparator::default_comparator();
         let src = IndependentCursorSource::new(
             [
@@ -878,15 +891,49 @@ mod tests {
         assert_eq!(k(&m.next().unwrap().unwrap()), "d");
         assert!(m.next().is_none(), "source exhausted forward");
 
-        // Switch to backward. Seek-aware direction switch must
-        // reposition the source so backward yields only items the
-        // forward direction didn't consume. With all items already
-        // emitted forward, backward yields nothing.
+        // Switch to backward. Source's `(front_idx, back_idx)`
+        // window is now (4, 4); next_back's guard returns None
+        // without yielding anything — no duplicates of the
+        // forward emissions.
         assert!(
             m.next_back().is_none(),
             "backward must not re-emit forward-consumed items",
         );
         assert!(m.next_back().is_none(), "stays exhausted");
+    }
+
+    #[test]
+    fn mid_stream_alternation_emits_no_duplicates_independent_cursor() {
+        // Stronger property than the drain-then-switch test: switch
+        // direction MID-stream and verify the (front_idx, back_idx)
+        // window keeps the two halves disjoint. Source [a..f], six
+        // items. Forward consumes 'a','b','c' from the front;
+        // backward consumes 'f','e','d' from the back. They meet
+        // at the middle with no overlap.
+        let cmp = comparator::default_comparator();
+        let src = IndependentCursorSource::new(
+            [
+                make_iv(b"a", 0),
+                make_iv(b"b", 0),
+                make_iv(b"c", 0),
+                make_iv(b"d", 0),
+                make_iv(b"e", 0),
+                make_iv(b"f", 0),
+            ],
+            cmp.clone(),
+        );
+        let mut m = SeekingMerger::new(alloc::vec![src], cmp);
+
+        assert_eq!(k(&m.next().unwrap().unwrap()), "a");
+        assert_eq!(k(&m.next_back().unwrap().unwrap()), "f");
+        assert_eq!(k(&m.next().unwrap().unwrap()), "b");
+        assert_eq!(k(&m.next_back().unwrap().unwrap()), "e");
+        assert_eq!(k(&m.next().unwrap().unwrap()), "c");
+        assert_eq!(k(&m.next_back().unwrap().unwrap()), "d");
+        // All six unique items yielded exactly once across the
+        // alternation. Both ends now exhausted.
+        assert!(m.next().is_none());
+        assert!(m.next_back().is_none());
     }
 
     #[test]

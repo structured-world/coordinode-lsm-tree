@@ -26,9 +26,12 @@
 //!     * the next `next_back()` yields the first item with `key < target`
 //!
 //!     If no such item exists in a direction, that direction returns
-//!     `None` on the next call. Repositioning is the only way for
-//!     `SeekingMerger` to guarantee the no-overlap invariant when
-//!     direction switches.
+//!     `None` on the next call. NOTE: `SeekingMerger` does NOT call
+//!     `seek` on direction switches — its two-tree architecture
+//!     relies on the source's own `(front_idx, back_idx)` window
+//!     (or equivalent self-coordination) to keep mixed direction
+//!     duplicate-free. `seek` is exposed here for user-initiated
+//!     repositioning (range scan starting key, etc.).
 //!
 //!   **Coherent-cursor sources** (those marked [`CoherentMergeSource`]
 //!   — `alloc::vec::IntoIter`, `alloc::collections::VecDeque`, range
@@ -90,13 +93,13 @@ pub trait MergeSource: Send {
     /// twice" under mixed-direction consumption without any
     /// explicit reposition.
     ///
-    /// The current MVP `SeekingMerger` does NOT actually invoke
-    /// `seek()` at all — `DoubleEndedIterator` is type-gated on
-    /// `CoherentMergeSource` and relies on the marker's coherence
-    /// promise. Once the seek-aware direction-switch path (issue
-    /// #280) lands, `SeekingMerger` WILL invoke `seek()` on
-    /// non-coherent sources at the direction-switch boundary;
-    /// coherent sources will still pay nothing for the no-op.
+    /// `SeekingMerger` does NOT invoke `seek()` on direction
+    /// switches — its two-tree architecture relies on the source's
+    /// own self-coordination (shared cursor state for coherent
+    /// sources, internal `(front_idx, back_idx)` window for
+    /// independent ones). `seek` is exposed for user-initiated
+    /// repositioning before iteration begins (e.g., starting a
+    /// range scan at a specific key).
     ///
     /// Returns `Err` if seek requires I/O (SST scanner reseek, run
     /// header re-read) and that I/O fails. Corruption errors
