@@ -738,43 +738,28 @@ mod tests {
     use super::*;
     use test_log::test;
 
-    /// Result of [`write_block_to_tempfile`]. Named struct (not a
-    /// 4-tuple) so call-site destructuring is self-documenting —
-    /// tests that only care about `file` and `handle` skip `dir`
-    /// by name instead of by position.
+    /// Result of [`write_block_to_tempfile`]. Bundles the open
+    /// file, the pre-computed [`crate::table::BlockHandle`], and
+    /// the owning [`tempfile::TempDir`].
     ///
-    /// **Two separate drop-order constraints apply; both matter
-    /// for Windows portability:**
+    /// **Drop-order safety lives entirely in the struct field
+    /// order** (Windows portability constraint). Rust drops
+    /// struct fields in declaration order, so `file` is first
+    /// and `dir` LAST: when a `TempBlock` value goes out of
+    /// scope, the open file handle closes before the `TempDir`
+    /// removes the directory. Windows rejects directory
+    /// removal while a file inside it is still open.
     ///
-    /// 1. **Struct field order.** Rust drops struct fields in
-    ///    declaration order, so `file` and `handle` are listed
-    ///    first and `dir` LAST. When a `TempBlock` value goes
-    ///    out of scope as a unit (e.g., bubbled via `?`, returned
-    ///    from a helper, or stored in a `Vec`), the open file
-    ///    handle closes before the `TempDir` removes the
-    ///    directory.
-    ///
-    /// 2. **Local-binding order in destructuring patterns.**
-    ///    Local bindings drop in REVERSE declaration order. So
-    ///    a call site MUST bind `dir` FIRST in its pattern so
-    ///    that the `dir` binding drops LAST:
-    ///
-    ///    ```ignore
-    ///    // CORRECT: dir bound first → drops last
-    ///    let TempBlock { dir: _dir, file, handle } = ...?;
-    ///    ```
-    ///
-    ///    The opposite order would close the directory before
-    ///    the file:
-    ///
-    ///    ```ignore
-    ///    // WRONG on Windows: dir bound last → drops first,
-    ///    // removes directory while `file` is still open.
-    ///    let TempBlock { file, handle, dir: _dir } = ...?;
-    ///    ```
-    ///
-    /// Existing call sites in this module follow constraint #2.
-    /// New callers MUST do the same.
+    /// **Callers SHOULD keep the result as a single binding**
+    /// — borrow `&tmp.file` and copy `tmp.handle` (it's `Copy`)
+    /// instead of destructuring. Destructuring opens a
+    /// foot-gun: local bindings drop in REVERSE declaration
+    /// order, so a pattern like
+    /// `let TempBlock { file, handle, dir: _dir } = ...?;`
+    /// would close `dir` before `file` and break the
+    /// invariant. Holding the whole struct as one local
+    /// (`let tmp = ...?;`) makes the struct field order the
+    /// SOLE source of truth — no pattern can break it.
     struct TempBlock {
         /// Open read-only handle on the persisted block.
         /// Declared first so it drops before `dir`.
@@ -785,7 +770,15 @@ mod tests {
         /// Keep bound for the test lifetime — drop reclaims the
         /// directory and the file inside it. Declared LAST so
         /// the file handle above closes before this removes the
-        /// directory.
+        /// directory. The field is never READ — its only purpose
+        /// is its `Drop` side-effect — so the dead-code lint
+        /// would flag it without this `expect`.
+        #[expect(
+            dead_code,
+            reason = "Drop guard for the tempdir; held purely for the \
+                      destructor's side-effect of cleaning up the \
+                      directory + the file inside it"
+        )]
         dir: tempfile::TempDir,
     }
 
@@ -837,11 +830,7 @@ mod tests {
     #[test]
     fn block_from_file_roundtrip_uncompressed() -> crate::Result<()> {
         let data = b"abcdefabcdefabcdef";
-        let TempBlock {
-            dir: _dir,
-            file,
-            handle,
-        } = write_block_to_tempfile(
+        let tmp = write_block_to_tempfile(
             data,
             BlockType::Data,
             CompressionType::None,
@@ -850,8 +839,8 @@ mod tests {
             None,
         )?;
         let block = Block::from_file(
-            &file,
-            handle,
+            &tmp.file,
+            tmp.handle,
             CompressionType::None,
             None,
             #[cfg(zstd_any)]
@@ -865,11 +854,7 @@ mod tests {
     #[cfg(feature = "lz4")]
     fn block_from_file_roundtrip_lz4() -> crate::Result<()> {
         let data = b"abcdefabcdefabcdef";
-        let TempBlock {
-            dir: _dir,
-            file,
-            handle,
-        } = write_block_to_tempfile(
+        let tmp = write_block_to_tempfile(
             data,
             BlockType::Data,
             CompressionType::Lz4,
@@ -878,8 +863,8 @@ mod tests {
             None,
         )?;
         let block = Block::from_file(
-            &file,
-            handle,
+            &tmp.file,
+            tmp.handle,
             CompressionType::Lz4,
             None,
             #[cfg(zstd_any)]
@@ -893,12 +878,9 @@ mod tests {
     #[cfg(zstd_any)]
     fn block_from_file_roundtrip_zstd() -> crate::Result<()> {
         let data = b"abcdefabcdefabcdef";
-        let TempBlock {
-            dir: _dir,
-            file,
-            handle,
-        } = write_block_to_tempfile(data, BlockType::Data, CompressionType::Zstd(3), None, None)?;
-        let block = Block::from_file(&file, handle, CompressionType::Zstd(3), None, None)?;
+        let tmp =
+            write_block_to_tempfile(data, BlockType::Data, CompressionType::Zstd(3), None, None)?;
+        let block = Block::from_file(&tmp.file, tmp.handle, CompressionType::Zstd(3), None, None)?;
         assert_eq!(data, &*block.data);
         Ok(())
     }
@@ -1518,11 +1500,7 @@ mod tests {
         fn block_from_file_encrypted_uncompressed() -> crate::Result<()> {
             let enc = test_provider();
             let data = b"plaintext block data for from_file encryption test";
-            let super::TempBlock {
-                dir: _dir,
-                file,
-                handle,
-            } = super::write_block_to_tempfile(
+            let tmp = super::write_block_to_tempfile(
                 data,
                 BlockType::Data,
                 CompressionType::None,
@@ -1531,8 +1509,8 @@ mod tests {
                 None,
             )?;
             let block = Block::from_file(
-                &file,
-                handle,
+                &tmp.file,
+                tmp.handle,
                 CompressionType::None,
                 Some(&enc),
                 #[cfg(zstd_any)]
@@ -1547,11 +1525,7 @@ mod tests {
         fn block_from_file_encrypted_lz4() -> crate::Result<()> {
             let enc = test_provider();
             let data = b"abcdefabcdefabcdef";
-            let super::TempBlock {
-                dir: _dir,
-                file,
-                handle,
-            } = super::write_block_to_tempfile(
+            let tmp = super::write_block_to_tempfile(
                 data,
                 BlockType::Data,
                 CompressionType::Lz4,
@@ -1560,8 +1534,8 @@ mod tests {
                 None,
             )?;
             let block = Block::from_file(
-                &file,
-                handle,
+                &tmp.file,
+                tmp.handle,
                 CompressionType::Lz4,
                 Some(&enc),
                 #[cfg(zstd_any)]
@@ -1576,19 +1550,20 @@ mod tests {
         fn block_from_file_encrypted_zstd() -> crate::Result<()> {
             let enc = test_provider();
             let data = b"abcdefabcdefabcdef";
-            let super::TempBlock {
-                dir: _dir,
-                file,
-                handle,
-            } = super::write_block_to_tempfile(
+            let tmp = super::write_block_to_tempfile(
                 data,
                 BlockType::Data,
                 CompressionType::Zstd(3),
                 Some(&enc),
                 None,
             )?;
-            let block =
-                Block::from_file(&file, handle, CompressionType::Zstd(3), Some(&enc), None)?;
+            let block = Block::from_file(
+                &tmp.file,
+                tmp.handle,
+                CompressionType::Zstd(3),
+                Some(&enc),
+                None,
+            )?;
             assert_eq!(data, &*block.data);
             Ok(())
         }
@@ -1598,11 +1573,7 @@ mod tests {
             let enc_write = test_provider();
             let enc_read = crate::encryption::Aes256GcmProvider::new(&[0x99; 32]);
             let data = b"encrypted block data";
-            let super::TempBlock {
-                dir: _dir,
-                file,
-                handle,
-            } = super::write_block_to_tempfile(
+            let tmp = super::write_block_to_tempfile(
                 data,
                 BlockType::Data,
                 CompressionType::None,
@@ -1611,8 +1582,8 @@ mod tests {
                 None,
             )?;
             let result = Block::from_file(
-                &file,
-                handle,
+                &tmp.file,
+                tmp.handle,
                 CompressionType::None,
                 Some(&enc_read),
                 #[cfg(zstd_any)]
@@ -1749,11 +1720,7 @@ mod tests {
         fn block_from_file_encrypted_uncompressed_large_payload() -> crate::Result<()> {
             let enc = test_provider();
             let data = vec![0xBB_u8; 32 * 1024]; // 32 KiB
-            let super::TempBlock {
-                dir: _dir,
-                file,
-                handle,
-            } = super::write_block_to_tempfile(
+            let tmp = super::write_block_to_tempfile(
                 &data,
                 BlockType::Data,
                 CompressionType::None,
@@ -1762,8 +1729,8 @@ mod tests {
                 None,
             )?;
             let block = Block::from_file(
-                &file,
-                handle,
+                &tmp.file,
+                tmp.handle,
                 CompressionType::None,
                 Some(&enc),
                 #[cfg(zstd_any)]
