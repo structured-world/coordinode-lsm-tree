@@ -170,7 +170,12 @@ jobs:
     strategy:
       fail-fast: true
       matrix:
-        target: ${{ fromJSON(needs.cross-matrix.outputs.targets) }}
+        # Bracket notation REQUIRED on the needs context key here:
+        # the job id `cross-matrix` contains a hyphen, so dot
+        # notation (`needs.cross-matrix.outputs.targets`) is parsed
+        # by the GitHub Actions expression engine as `needs.cross`
+        # minus `matrix.outputs.targets`, breaking the lookup.
+        target: ${{ fromJSON(needs['cross-matrix'].outputs.targets) }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
