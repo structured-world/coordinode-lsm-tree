@@ -738,13 +738,32 @@ mod tests {
     use super::*;
     use test_log::test;
 
+    /// Result of [`write_block_to_tempfile`]. Named struct (not a
+    /// 4-tuple) so call-site destructuring is self-documenting
+    /// and order-independent — tests that only care about `file`
+    /// and `handle` skip `dir` by name instead of by position.
+    /// The internal header is consumed by the helper itself to
+    /// build `handle`; tests don't need it.
+    struct TempBlock {
+        /// Keep bound for the test lifetime — drop reclaims the
+        /// directory and the file inside it. Leading underscore
+        /// at the binding site (`dir: _dir`) is the convention
+        /// for call sites that only need the drop-side effect.
+        dir: tempfile::TempDir,
+        /// Open read-only handle on the persisted block.
+        file: std::fs::File,
+        /// Pre-computed handle: offset 0, length = header +
+        /// payload, ready to pass straight into `Block::from_file`.
+        handle: crate::table::BlockHandle,
+    }
+
     /// Shared scaffold for `Block::from_file` roundtrip tests: writes
-    /// `data` through `Block::write_into` into a fresh tempdir-backed
-    /// file, reopens it read-only, and returns the FD + handle + header
-    /// the caller needs to invoke `Block::from_file`. The `TempDir` is
-    /// returned so the caller can keep it bound for the test lifetime —
-    /// once it drops, the directory (and the file inside it) is
-    /// reclaimed.
+    /// `data` through `Block::write_into` directly into a fresh
+    /// tempdir-backed file, reopens it read-only, and returns the
+    /// FD + handle + header the caller needs to invoke
+    /// `Block::from_file`. The streaming write avoids an
+    /// intermediate `Vec<u8>` — relevant for the 32 KiB
+    /// large-payload encryption test.
     ///
     /// Centralises the ~10× write/sync/reopen/handle boilerplate that
     /// the `from_file` tests below would otherwise duplicate.
@@ -754,44 +773,42 @@ mod tests {
         compression: CompressionType,
         encryption: Option<&dyn crate::encryption::EncryptionProvider>,
         #[cfg(zstd_any)] zstd_dict: Option<&crate::compression::ZstdDictionary>,
-    ) -> crate::Result<(
-        tempfile::TempDir,
-        std::fs::File,
-        crate::table::BlockHandle,
-        Header,
-    )> {
-        use std::io::Write;
-
-        let mut buf = vec![];
-        let header = Block::write_into(
-            &mut buf,
-            data,
-            block_type,
-            compression,
-            encryption,
-            #[cfg(zstd_any)]
-            zstd_dict,
-        )?;
-
+    ) -> crate::Result<TempBlock> {
         let dir = tempfile::tempdir()?;
         let path = dir.path().join("block");
-        let mut file = std::fs::File::create(&path)?;
-        file.write_all(&buf)?;
-        file.sync_all()?;
-        drop(file);
-
+        // Scope the write-side file handle so the read-side
+        // `File::open` below sees a fully-flushed file. Dropping
+        // closes; sync_all flushes before close.
+        let header = {
+            let mut file = std::fs::File::create(&path)?;
+            let header = Block::write_into(
+                &mut file,
+                data,
+                block_type,
+                compression,
+                encryption,
+                #[cfg(zstd_any)]
+                zstd_dict,
+            )?;
+            file.sync_all()?;
+            header
+        };
         let file = std::fs::File::open(&path)?;
         let handle = crate::table::BlockHandle::new(
             BlockOffset(0),
             header.data_length + Header::serialized_len() as u32,
         );
-        Ok((dir, file, handle, header))
+        Ok(TempBlock { dir, file, handle })
     }
 
     #[test]
     fn block_from_file_roundtrip_uncompressed() -> crate::Result<()> {
         let data = b"abcdefabcdefabcdef";
-        let (_dir, file, handle, _) = write_block_to_tempfile(
+        let TempBlock {
+            dir: _dir,
+            file,
+            handle,
+        } = write_block_to_tempfile(
             data,
             BlockType::Data,
             CompressionType::None,
@@ -815,7 +832,11 @@ mod tests {
     #[cfg(feature = "lz4")]
     fn block_from_file_roundtrip_lz4() -> crate::Result<()> {
         let data = b"abcdefabcdefabcdef";
-        let (_dir, file, handle, _) = write_block_to_tempfile(
+        let TempBlock {
+            dir: _dir,
+            file,
+            handle,
+        } = write_block_to_tempfile(
             data,
             BlockType::Data,
             CompressionType::Lz4,
@@ -839,8 +860,11 @@ mod tests {
     #[cfg(zstd_any)]
     fn block_from_file_roundtrip_zstd() -> crate::Result<()> {
         let data = b"abcdefabcdefabcdef";
-        let (_dir, file, handle, _) =
-            write_block_to_tempfile(data, BlockType::Data, CompressionType::Zstd(3), None, None)?;
+        let TempBlock {
+            dir: _dir,
+            file,
+            handle,
+        } = write_block_to_tempfile(data, BlockType::Data, CompressionType::Zstd(3), None, None)?;
         let block = Block::from_file(&file, handle, CompressionType::Zstd(3), None, None)?;
         assert_eq!(data, &*block.data);
         Ok(())
@@ -1461,7 +1485,11 @@ mod tests {
         fn block_from_file_encrypted_uncompressed() -> crate::Result<()> {
             let enc = test_provider();
             let data = b"plaintext block data for from_file encryption test";
-            let (_dir, file, handle, _) = super::write_block_to_tempfile(
+            let super::TempBlock {
+                dir: _dir,
+                file,
+                handle,
+            } = super::write_block_to_tempfile(
                 data,
                 BlockType::Data,
                 CompressionType::None,
@@ -1486,7 +1514,11 @@ mod tests {
         fn block_from_file_encrypted_lz4() -> crate::Result<()> {
             let enc = test_provider();
             let data = b"abcdefabcdefabcdef";
-            let (_dir, file, handle, _) = super::write_block_to_tempfile(
+            let super::TempBlock {
+                dir: _dir,
+                file,
+                handle,
+            } = super::write_block_to_tempfile(
                 data,
                 BlockType::Data,
                 CompressionType::Lz4,
@@ -1511,7 +1543,11 @@ mod tests {
         fn block_from_file_encrypted_zstd() -> crate::Result<()> {
             let enc = test_provider();
             let data = b"abcdefabcdefabcdef";
-            let (_dir, file, handle, _) = super::write_block_to_tempfile(
+            let super::TempBlock {
+                dir: _dir,
+                file,
+                handle,
+            } = super::write_block_to_tempfile(
                 data,
                 BlockType::Data,
                 CompressionType::Zstd(3),
@@ -1529,7 +1565,11 @@ mod tests {
             let enc_write = test_provider();
             let enc_read = crate::encryption::Aes256GcmProvider::new(&[0x99; 32]);
             let data = b"encrypted block data";
-            let (_dir, file, handle, _) = super::write_block_to_tempfile(
+            let super::TempBlock {
+                dir: _dir,
+                file,
+                handle,
+            } = super::write_block_to_tempfile(
                 data,
                 BlockType::Data,
                 CompressionType::None,
@@ -1676,7 +1716,11 @@ mod tests {
         fn block_from_file_encrypted_uncompressed_large_payload() -> crate::Result<()> {
             let enc = test_provider();
             let data = vec![0xBB_u8; 32 * 1024]; // 32 KiB
-            let (_dir, file, handle, _) = super::write_block_to_tempfile(
+            let super::TempBlock {
+                dir: _dir,
+                file,
+                handle,
+            } = super::write_block_to_tempfile(
                 &data,
                 BlockType::Data,
                 CompressionType::None,
