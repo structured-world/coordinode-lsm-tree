@@ -13,6 +13,12 @@ on:
   pull_request:
     branches:
       - main
+  # Manual re-run from any branch. Useful for re-triggering after
+  # a flaky cross-compile target, or for maintainers who want a
+  # full CI cycle on a draft branch without opening a PR.
+  # workflow_dispatch requires actions:write on the repo, so only
+  # owner / maintainers can fire it — fork PR authors cannot.
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
