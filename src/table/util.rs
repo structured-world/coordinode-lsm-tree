@@ -110,7 +110,7 @@ pub fn load_block(
             table_id: table_id.table_id(),
             block_offset: *handle.offset(),
             block_type,
-            dict_id: 0,
+            dict_id: compression.dict_id(),
             window_log: 0,
         },
         compression,

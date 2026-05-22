@@ -452,7 +452,7 @@ impl Writer {
                 table_id: self.table_id,
                 block_offset: *self.meta.file_pos,
                 block_type: super::block::BlockType::Data,
-                dict_id: 0,
+                dict_id: self.data_block_compression.dict_id(),
                 window_log: 0,
             },
             self.data_block_compression,

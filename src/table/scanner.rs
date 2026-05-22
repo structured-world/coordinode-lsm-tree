@@ -104,7 +104,7 @@ impl Scanner {
                 // or accept offset=0 for the scan path.
                 block_offset: 0,
                 block_type: BlockType::Data,
-                dict_id: 0,
+                dict_id: compression.dict_id(),
                 window_log: 0,
             },
             compression,

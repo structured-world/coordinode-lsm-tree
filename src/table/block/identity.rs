@@ -3,8 +3,10 @@
 
 //! Identity context threaded through the Block I/O API.
 //!
-//! Every call to [`Block::write_into`] / [`Block::from_reader`] /
-//! [`Block::from_file`] carries a `BlockIdentity` describing which
+//! Every call to [`crate::table::block::Block::write_into`] /
+//! [`crate::table::block::Block::from_reader`] /
+//! [`crate::table::block::Block::from_file`] carries a
+//! `BlockIdentity` describing which
 //! block, of which table, with which compression context. The
 //! Block layer uses this to construct AAD (Additional
 //! Authenticated Data) for AEAD encryption — see the AAD-bound
