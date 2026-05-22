@@ -742,27 +742,36 @@ mod tests {
     /// 4-tuple) so call-site destructuring is self-documenting
     /// and order-independent — tests that only care about `file`
     /// and `handle` skip `dir` by name instead of by position.
-    /// The internal header is consumed by the helper itself to
-    /// build `handle`; tests don't need it.
+    ///
+    /// **Field order matters for `Drop`.** Rust drops struct
+    /// fields in declaration order, so `file` and `handle` are
+    /// listed first and `dir` LAST: when the whole `TempBlock`
+    /// goes out of scope as a unit (rather than being
+    /// destructured), the open file handle closes before the
+    /// `TempDir` removes the directory. Windows rejects
+    /// directory removal while a file inside it is still open;
+    /// the order makes the helper portable.
     struct TempBlock {
-        /// Keep bound for the test lifetime — drop reclaims the
-        /// directory and the file inside it. Leading underscore
-        /// at the binding site (`dir: _dir`) is the convention
-        /// for call sites that only need the drop-side effect.
-        dir: tempfile::TempDir,
         /// Open read-only handle on the persisted block.
+        /// Declared first so it drops before `dir`.
         file: std::fs::File,
         /// Pre-computed handle: offset 0, length = header +
         /// payload, ready to pass straight into `Block::from_file`.
         handle: crate::table::BlockHandle,
+        /// Keep bound for the test lifetime — drop reclaims the
+        /// directory and the file inside it. Declared LAST so
+        /// the file handle above closes before this removes the
+        /// directory.
+        dir: tempfile::TempDir,
     }
 
     /// Shared scaffold for `Block::from_file` roundtrip tests: writes
     /// `data` through `Block::write_into` directly into a fresh
-    /// tempdir-backed file, reopens it read-only, and returns the
-    /// FD + handle + header the caller needs to invoke
-    /// `Block::from_file`. The streaming write avoids an
-    /// intermediate `Vec<u8>` — relevant for the 32 KiB
+    /// tempdir-backed file, reopens it read-only, and returns a
+    /// [`TempBlock`] bundling the open file, the pre-computed
+    /// [`crate::table::BlockHandle`], and the owning [`tempfile::TempDir`]
+    /// (kept bound for the test's lifetime). The streaming write
+    /// avoids an intermediate `Vec<u8>` — relevant for the 32 KiB
     /// large-payload encryption test.
     ///
     /// Centralises the ~10× write/sync/reopen/handle boilerplate that
@@ -798,7 +807,7 @@ mod tests {
             BlockOffset(0),
             header.data_length + Header::serialized_len() as u32,
         );
-        Ok(TempBlock { dir, file, handle })
+        Ok(TempBlock { file, handle, dir })
     }
 
     #[test]
