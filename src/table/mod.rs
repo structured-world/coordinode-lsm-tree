@@ -443,7 +443,8 @@ impl Table {
 
             // NOTE: If the last block key is higher than ours,
             // our key cannot be in the next block
-            if self.comparator.compare(block_handle.end_key(), key) == std::cmp::Ordering::Greater {
+            if self.comparator.compare(block_handle.end_key(), key) == core::cmp::Ordering::Greater
+            {
                 return Ok(None);
             }
         }
@@ -468,6 +469,304 @@ impl Table {
     ) -> crate::Result<Option<(InternalValue, Block)>> {
         self.point_read_inner(key, seqno)
             .map(|opt| opt.map(|(iv, db)| (iv, db.inner)))
+    }
+
+    /// Batch point-read variant of [`Table::get`].
+    ///
+    /// Each input pair is `(key, key_hash)`. The slice **must be
+    /// strictly sorted ascending by `key` under this table's
+    /// comparator** — duplicate adjacent keys are a caller bug
+    /// (callers should dedup before batching; a duplicate
+    /// suggests a logic error in the query construction) and
+    /// are rejected by a `debug_assert!` in debug builds.
+    /// Returns one `Option<InternalValue>` per input pair in
+    /// input order: `Some(_)` for found values (including
+    /// tombstones — callers distinguish via [`InternalValue`]'s
+    /// value type), `None` for absent keys.
+    ///
+    /// # Hash contract
+    ///
+    /// `key_hash` **must** equal `crate::hash::hash64(key)` — the
+    /// same function the writer used when populating the bloom
+    /// filter. The bloom probe consumes the hash; the
+    /// key↔hash agreement check is a `debug_assert!` only, so
+    /// release builds trust the caller. Passing a wrong hash in
+    /// release produces false-negative skips: the corresponding
+    /// `results[i]` slot stays `None` as if the key weren't in
+    /// the table (the result vector itself is always
+    /// `sorted_keys.len()` long — nothing is dropped from it).
+    /// Callers should derive both values from the same
+    /// `(&[u8], u64) = (key, hash64(key))` expression at the
+    /// same scope to make the agreement trivially auditable.
+    ///
+    /// In partitioned-filter mode (`pinned_filter_index` /
+    /// `filter_tli`), `check_bloom` ALSO uses the raw `key`
+    /// bytes — not the hash — to select which filter partition
+    /// to probe. The hash drives the bit probes inside the
+    /// selected partition. Bottom line: BOTH inputs are
+    /// load-bearing in the partitioned case; only the
+    /// monolithic-filter case is "hash-only".
+    ///
+    /// # Why this exists vs. calling [`Table::get`] in a loop
+    ///
+    /// Sequential per-key calls each pay:
+    ///
+    /// 1. Bloom-filter dereference + N hash probes — duplicated
+    ///    across calls.
+    /// 2. Block-index seek from scratch — every call walks
+    ///    `forward_reader(key, seqno)` and re-pays the index
+    ///    binary search even when the previous call already
+    ///    landed inside the same data block.
+    /// 3. Block load — every call re-fetches the data block
+    ///    from cache, so cache hits still pay a hashmap lookup
+    ///    + Arc clone per call.
+    ///
+    /// `batch_get` collapses all three:
+    ///
+    /// 1. Filter probed once per key in a tight loop. For
+    ///    monolithic filters (the default) the filter block is
+    ///    fetched once and the loop just checks N hashes
+    ///    against it. For partitioned filters
+    ///    (`pinned_filter_index` / `filter_tli`), each probe
+    ///    still seeks the partition index and may load the
+    ///    relevant partition block lazily — so "one filter
+    ///    fetch total" only holds in the monolithic case;
+    ///    partitioned filters amortise loads across keys that
+    ///    land in the same partition rather than across the
+    ///    whole batch.
+    /// 2. Block-index seek runs once at the smallest passing
+    ///    key, then the iterator walks forward across the
+    ///    sorted input — no re-seek per key.
+    /// 3. Each data block is loaded at most once for the entire
+    ///    batch. Multiple input keys that fall in the same block
+    ///    share a single load.
+    ///
+    /// The wire-format is identical to N independent `get()`
+    /// calls; the savings are purely call-overhead.
+    ///
+    /// # Sort requirement
+    ///
+    /// Sorting is the caller's responsibility because the
+    /// `batch_get_from_tables` driver already maintains the
+    /// remaining-keys list in comparator order between L1+ runs
+    /// (re-sorted after each `covered_miss` split). Re-sorting
+    /// inside `batch_get` would be redundant work; passing
+    /// pre-sorted input lets the implementation rely on a
+    /// monotone two-pointer walk between input keys and block
+    /// boundaries.
+    ///
+    /// # Errors
+    ///
+    /// Propagates any I/O / corruption error from the filter
+    /// fetch, block-index read, or data-block load. On error
+    /// the partial `results` vector is discarded — callers
+    /// observe an all-or-nothing outcome per call.
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "every index access in this routine is bounded by construction: \
+                  `passing` indices are produced from enumerate(sorted_keys) so they're \
+                  < sorted_keys.len() == results.len(); `passing[p]` is guarded by \
+                  `p < passing.len()` on every loop iteration; `passing[0]` is read \
+                  only after an explicit emptiness check above."
+    )]
+    pub fn batch_get(
+        &self,
+        sorted_keys: &[(&[u8], u64)],
+        seqno: SeqNo,
+    ) -> crate::Result<Vec<Option<InternalValue>>> {
+        let mut results: Vec<Option<InternalValue>> = vec![None; sorted_keys.len()];
+
+        if sorted_keys.is_empty() {
+            return Ok(results);
+        }
+
+        // Debug-time guard for the sorted-input contract.
+        // Unsorted input would silently return wrong Nones
+        // (the two-pointer walk between block_iter and the
+        // input slice assumes monotone keys); catch the
+        // accidental misuse before it ships to a release
+        // benchmark. Strict-monotone is the contract — equal
+        // adjacent keys would be a duplicate query, also a
+        // caller bug.
+        debug_assert!(
+            sorted_keys
+                .windows(2)
+                .all(|w| self.comparator.compare(w[0].0, w[1].0) == core::cmp::Ordering::Less),
+            "batch_get input must be strictly sorted ascending by key under \
+             the table's comparator; unsorted/duplicate input produces silent \
+             None misses because the two-pointer walk assumes monotone keys"
+        );
+
+        let global_seqno = self.global_seqno();
+        let table_seqno = seqno.saturating_sub(global_seqno);
+
+        // Table is entirely above the snapshot — no key is visible.
+        if self.metadata.seqnos.0 >= table_seqno {
+            return Ok(results);
+        }
+
+        // Filter the input through the bloom filter once. The
+        // filter resource (mmap / Arc) is fetched lazily by
+        // check_bloom on the first call; subsequent calls reuse
+        // it through the table-internal cache.
+        let mut passing: Vec<usize> = Vec::with_capacity(sorted_keys.len());
+        #[cfg(feature = "metrics")]
+        let mut had_filter = false;
+        for (i, (key, hash)) in sorted_keys.iter().enumerate() {
+            let bloom = self.check_bloom(key, *hash)?;
+            if !bloom.should_skip() {
+                passing.push(i);
+                #[cfg(feature = "metrics")]
+                if bloom.has_filter() {
+                    had_filter = true;
+                }
+            }
+        }
+        if passing.is_empty() {
+            return Ok(results);
+        }
+
+        // Seek the block index once at the smallest passing key.
+        // forward_reader returns the first block whose end_key
+        // can cover that key; everything past it walks forward.
+        let first_key = sorted_keys[passing[0]].0;
+        let Some(mut block_iter) = self.block_index.forward_reader(first_key, table_seqno) else {
+            // No block can contain the smallest passing key — every
+            // passing key is "negative with filter present" for
+            // metrics accounting purposes, mirroring Table::get
+            // where a bloom-passing key that point_read can't find
+            // increments filter_queries. Falling through to the
+            // shared metrics block below ensures the batch path
+            // doesn't under-report compared to N independent get()s.
+            #[cfg(feature = "metrics")]
+            {
+                // Use core::* rather than std::* re-exports: the
+                // `metrics` feature isn't std-gated in Cargo.toml,
+                // and `Ordering` lives in `core::sync::atomic`
+                // unchanged — keeps this hot-path import no-std
+                // friendly without any runtime impact (the std
+                // path is just a re-export of the core symbol).
+                use core::sync::atomic::Ordering::Relaxed;
+                if had_filter && !passing.is_empty() {
+                    self.metrics
+                        .filter_queries
+                        .fetch_add(passing.len(), Relaxed);
+                }
+            }
+            return Ok(results);
+        };
+
+        // Two-pointer walk: outer loop advances block_iter, inner
+        // loop drains passing keys that fall inside the current
+        // block's range. Both sides are monotone (sorted by the
+        // same comparator), so each side advances at most once
+        // per pair.
+        let mut p = 0_usize;
+        while p < passing.len() {
+            let Some(handle_result) = block_iter.next() else {
+                break;
+            };
+            let block_handle = handle_result?;
+            let end_key = block_handle.end_key();
+
+            // Lazy load: only fetch the data block if at least
+            // one passing key falls into this block's range.
+            // Most blocks will contain at least one key (we
+            // seeked here precisely because the first key did),
+            // but bloom may have skipped enough later keys that
+            // the next passing one is in a later block — in
+            // which case we skip the load.
+            let first_in_block = sorted_keys[passing[p]].0;
+            if self.comparator.compare(first_in_block, end_key) == core::cmp::Ordering::Greater {
+                // The next passing key is BEYOND this block's
+                // range. Skip the load and advance to the next
+                // block in the index.
+                continue;
+            }
+
+            let data_block = self.load_data_block(block_handle.as_ref())?;
+
+            // Drain passing keys that fall inside [..end_key].
+            //
+            // Three-way handling mirrors Table::point_read_inner's
+            // end-key boundary check:
+            //   - Greater (key > end_key): key belongs to a later
+            //     block. Break inner loop, advance outer.
+            //   - Less    (key < end_key): key is strictly inside
+            //     this block. point_read decides; either way the
+            //     key cannot continue into the next block (block
+            //     keys are sorted, and a later block's first key
+            //     is > this block's end_key), so we always advance
+            //     p — set Some on hit, leave None on miss.
+            //   - Equal   (key == end_key): block end_key matches
+            //     the query exactly. point_read may return None
+            //     even when a visible version of THIS user key
+            //     exists in the NEXT block (same-key spans block
+            //     boundary — common with MVCC versions of a hot
+            //     key). On None, do NOT advance p — break out so
+            //     the next outer iteration loads the next block
+            //     and retries the same key.
+            while p < passing.len() {
+                let key_idx = passing[p];
+                let key = sorted_keys[key_idx].0;
+                match self.comparator.compare(key, end_key) {
+                    core::cmp::Ordering::Greater => break,
+                    core::cmp::Ordering::Less => {
+                        if let Some(mut item) =
+                            data_block.point_read(key, table_seqno, &self.comparator)?
+                        {
+                            // Translate table-local seqno back to
+                            // the global coordinate so callers can
+                            // compare results across tables /
+                            // memtables (matches Table::get's
+                            // contract).
+                            item.key.seqno = item.key.seqno.saturating_add(global_seqno);
+                            results[key_idx] = Some(item);
+                        }
+                        p += 1;
+                    }
+                    core::cmp::Ordering::Equal => {
+                        if let Some(mut item) =
+                            data_block.point_read(key, table_seqno, &self.comparator)?
+                        {
+                            item.key.seqno = item.key.seqno.saturating_add(global_seqno);
+                            results[key_idx] = Some(item);
+                            p += 1;
+                        } else {
+                            // Same user key may continue in the
+                            // next block — leave p in place so the
+                            // outer loop's next iteration retries
+                            // this key against the next block.
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        #[cfg(feature = "metrics")]
+        {
+            // core::* (vs the std re-export) for no-std friendliness;
+            // see the comment on the matching import above.
+            use core::sync::atomic::Ordering::Relaxed;
+            // Mirror Table::get's accounting: count negative
+            // point lookups that reached storage despite a
+            // filter being present. Only keys that passed bloom
+            // AND came back empty count.
+            if had_filter {
+                let negative_with_filter =
+                    passing.iter().filter(|&&i| results[i].is_none()).count();
+                if negative_with_filter > 0 {
+                    // filter_queries is AtomicUsize; the count is
+                    // already a usize, no conversion needed.
+                    self.metrics
+                        .filter_queries
+                        .fetch_add(negative_with_filter, Relaxed);
+                }
+            }
+        }
+
+        Ok(results)
     }
 
     /// Creates a scanner over the `Table`.
@@ -983,7 +1282,7 @@ impl Table {
 
             // Validate invariant: start < end using the tree's comparator
             // (reject corrupted or misordered intervals)
-            if comparator.compare(&start, &end) != std::cmp::Ordering::Less {
+            if comparator.compare(&start, &end) != core::cmp::Ordering::Less {
                 log::error!("Range tombstone block: invalid interval (start >= end)");
                 return Err(crate::Error::RangeTombstoneDecode {
                     field: "interval",

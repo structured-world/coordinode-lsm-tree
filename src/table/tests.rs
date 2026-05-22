@@ -2264,3 +2264,302 @@ fn two_level_index_scan_skips_empty_child_partition() -> crate::Result<()> {
 
     Ok(())
 }
+
+#[test]
+fn batch_get_empty_input_returns_empty_results() -> crate::Result<()> {
+    let items = [crate::InternalValue::from_components(
+        b"a",
+        b"v",
+        0,
+        crate::ValueType::Value,
+    )];
+    test_with_table(
+        &items,
+        |table| {
+            let r = table.batch_get(&[], SeqNo::MAX)?;
+            assert!(r.is_empty(), "empty input must yield empty result vec");
+            Ok(())
+        },
+        None,
+        Some(|x| x),
+    )
+}
+
+#[test]
+#[expect(clippy::unwrap_used)]
+fn batch_get_single_block_multiple_keys_returns_in_input_order() -> crate::Result<()> {
+    // Three keys, all fall in the same data block (default block
+    // size is much larger than the few bytes here).
+    let items: Vec<_> = ["a", "b", "c"]
+        .iter()
+        .enumerate()
+        .map(|(i, k)| {
+            crate::InternalValue::from_components(
+                k.as_bytes(),
+                format!("val-{k}").as_bytes(),
+                u64::try_from(i).expect("test fixture index fits in u64"),
+                crate::ValueType::Value,
+            )
+        })
+        .collect();
+
+    test_with_table(
+        &items,
+        |table| {
+            let batch: Vec<(&[u8], u64)> = vec![
+                (b"a", hash64(b"a")),
+                (b"b", hash64(b"b")),
+                (b"c", hash64(b"c")),
+            ];
+            let results = table.batch_get(&batch, SeqNo::MAX)?;
+            assert_eq!(results.len(), 3, "one result slot per input key");
+            assert_eq!(&*results[0].as_ref().unwrap().value, b"val-a");
+            assert_eq!(&*results[1].as_ref().unwrap().value, b"val-b");
+            assert_eq!(&*results[2].as_ref().unwrap().value, b"val-c");
+            Ok(())
+        },
+        None,
+        Some(|x| x),
+    )
+}
+
+#[test]
+#[expect(clippy::unwrap_used)]
+fn batch_get_keys_spread_across_blocks_return_correct_values() -> crate::Result<()> {
+    // Force one item per data block via tiny block size +
+    // rotate_every=1. Then a batch covering keys from different
+    // blocks must produce the correct value for each key. This
+    // test asserts CORRECTNESS only — the "block loaded at most
+    // once for the entire batch" perf claim is a property of the
+    // implementation, verifiable through the block cache's
+    // hit-rate counters under metrics instrumentation, but
+    // deliberately not asserted here (the test would need to
+    // hook the cache to count loads, which would couple to
+    // internal cache mechanics).
+    let items: Vec<_> = (0u32..8)
+        .map(|i| {
+            let key = format!("key-{i:04}");
+            let value = format!("val-{i:04}");
+            crate::InternalValue::from_components(
+                key.as_bytes(),
+                value.as_bytes(),
+                u64::from(i),
+                crate::ValueType::Value,
+            )
+        })
+        .collect();
+
+    test_with_table(
+        &items,
+        |table| {
+            // Pick 4 keys spread across the 8 blocks.
+            let queries: Vec<(&[u8], u64)> = vec![
+                (b"key-0000" as &[u8], hash64(b"key-0000")),
+                (b"key-0002" as &[u8], hash64(b"key-0002")),
+                (b"key-0005" as &[u8], hash64(b"key-0005")),
+                (b"key-0007" as &[u8], hash64(b"key-0007")),
+            ];
+            let results = table.batch_get(&queries, SeqNo::MAX)?;
+            assert_eq!(results.len(), 4);
+            assert_eq!(&*results[0].as_ref().unwrap().value, b"val-0000");
+            assert_eq!(&*results[1].as_ref().unwrap().value, b"val-0002");
+            assert_eq!(&*results[2].as_ref().unwrap().value, b"val-0005");
+            assert_eq!(&*results[3].as_ref().unwrap().value, b"val-0007");
+            Ok(())
+        },
+        Some(1),
+        Some(|writer: Writer| writer.use_data_block_size(64)),
+    )
+}
+
+#[test]
+#[expect(clippy::unwrap_used)]
+fn batch_get_missing_keys_return_none_present_keys_return_some() -> crate::Result<()> {
+    let items: Vec<_> = ["b", "d", "f"]
+        .iter()
+        .enumerate()
+        .map(|(i, k)| {
+            crate::InternalValue::from_components(
+                k.as_bytes(),
+                format!("val-{k}").as_bytes(),
+                u64::try_from(i).expect("test fixture index fits in u64"),
+                crate::ValueType::Value,
+            )
+        })
+        .collect();
+
+    test_with_table(
+        &items,
+        |table| {
+            // Mix present and absent keys, sorted ascending.
+            let batch: Vec<(&[u8], u64)> = vec![
+                (b"a" as &[u8], hash64(b"a")), // absent (before any key)
+                (b"b" as &[u8], hash64(b"b")), // present
+                (b"c" as &[u8], hash64(b"c")), // absent (between b and d)
+                (b"d" as &[u8], hash64(b"d")), // present
+                (b"f" as &[u8], hash64(b"f")), // present (last key)
+                (b"g" as &[u8], hash64(b"g")), // absent (after last key)
+            ];
+            let results = table.batch_get(&batch, SeqNo::MAX)?;
+            assert_eq!(results.len(), 6);
+            assert!(results[0].is_none(), "key 'a' is absent");
+            assert_eq!(&*results[1].as_ref().unwrap().value, b"val-b");
+            assert!(results[2].is_none(), "key 'c' is absent");
+            assert_eq!(&*results[3].as_ref().unwrap().value, b"val-d");
+            assert_eq!(&*results[4].as_ref().unwrap().value, b"val-f");
+            assert!(results[5].is_none(), "key 'g' is absent");
+            Ok(())
+        },
+        None,
+        Some(|x| x),
+    )
+}
+
+#[test]
+fn batch_get_matches_per_key_get() -> crate::Result<()> {
+    // Cross-check: for every input key, `batch_get` and a per-key
+    // `get` loop must produce identical results. This is the
+    // regression guard against the batch path diverging from the
+    // single-key path on any edge case (bloom misses, seqno
+    // skew, block boundaries).
+    let items: Vec<_> = (0u32..20)
+        .map(|i| {
+            let key = format!("k-{i:03}");
+            let value = format!("v-{i:03}");
+            crate::InternalValue::from_components(
+                key.as_bytes(),
+                value.as_bytes(),
+                u64::from(i),
+                crate::ValueType::Value,
+            )
+        })
+        .collect();
+
+    test_with_table(
+        &items,
+        |table| {
+            // Build a query batch with a mix of present, absent,
+            // and out-of-range keys.
+            let keys: Vec<Vec<u8>> = (0..25).map(|i| format!("k-{i:03}").into_bytes()).collect();
+            let batch: Vec<(&[u8], u64)> = keys.iter().map(|k| (k.as_slice(), hash64(k))).collect();
+
+            let batch_results = table.batch_get(&batch, SeqNo::MAX)?;
+            let single_results: Vec<_> = batch
+                .iter()
+                .map(|&(k, h)| table.get(k, SeqNo::MAX, h))
+                .collect::<crate::Result<Vec<_>>>()?;
+
+            assert_eq!(batch_results.len(), single_results.len());
+            for (i, (b, s)) in batch_results.iter().zip(&single_results).enumerate() {
+                assert_eq!(
+                    b,
+                    s,
+                    "batch/single divergence at index {i} (key={})",
+                    String::from_utf8_lossy(&keys[i]),
+                );
+            }
+            Ok(())
+        },
+        Some(2),
+        Some(|writer: Writer| writer.use_data_block_size(96)),
+    )
+}
+
+#[test]
+fn batch_get_same_user_key_across_block_boundary_finds_older_visible_version() -> crate::Result<()>
+{
+    // Regression for the multi-block MVCC walk bug in batch_get.
+    //
+    // The bug: when batch_get's inner loop hits a key with
+    // `key == block.end_key` AND `point_read` returns None
+    // (no visible entry in this block), the loop advanced `p`
+    // unconditionally — so the walk skipped to the NEXT batch
+    // key without checking whether the SAME user key continues
+    // into the NEXT block. `Table::get` handles this case via
+    // `point_read_inner`'s end-key boundary check; the batch
+    // path must mirror it.
+    //
+    // To trigger the bug we need:
+    //   1. `forward_reader` lands at a block whose end_key
+    //      equals some batched key K, and
+    //   2. that block has no visible version of K at the query
+    //      seqno, and
+    //   3. the next block contains the visible version of K.
+    //
+    // Single-key fixtures don't reproduce: `forward_reader` is
+    // seqno-aware enough to seek past a block that has no
+    // visible entries for the lone passing key, so the iter
+    // lands at block 1 directly. We need a SECOND batched key
+    // earlier in the order to force the seek to land at
+    // block 0 (which IS the block for that earlier key), so
+    // the later batched key then exercises the equal-end-key /
+    // None-point_read / "look in next block" path.
+    //
+    // Fixture: user keys "0" (one version at seqno=1) +
+    // five versions of "a" (seqno 5 → 1), `rotate_every=3`.
+    // Internal-key sort puts "0" before any "a"; the resulting
+    // blocks are:
+    //   block 0: [0@1, a@5, a@4]   end_key="a"
+    //   block 1: [a@3, a@2, a@1]   end_key="a"
+    //
+    // Query batch = [("0", h0), ("a", ha)] at snapshot seqno=3.
+    // forward_reader seeks to block 0 to satisfy "0".
+    // The "a" then sees end_key="a" with no visible version
+    // in block 0 (all seqnos ≥ 3) — the fix must keep the
+    // walk going into block 1 where a@2 is visible.
+    let items = [
+        crate::InternalValue::from_components(b"0", b"zero", 1, crate::ValueType::Value),
+        crate::InternalValue::from_components(b"a", b"5", 5, crate::ValueType::Value),
+        crate::InternalValue::from_components(b"a", b"4", 4, crate::ValueType::Value),
+        crate::InternalValue::from_components(b"a", b"3", 3, crate::ValueType::Value),
+        crate::InternalValue::from_components(b"a", b"2", 2, crate::ValueType::Value),
+        crate::InternalValue::from_components(b"a", b"1", 1, crate::ValueType::Value),
+    ];
+
+    test_with_table(
+        &items,
+        |table| {
+            assert_eq!(2, table.metadata.data_block_count);
+
+            let batch: Vec<(&[u8], u64)> = vec![(b"0", hash64(b"0")), (b"a", hash64(b"a"))];
+
+            // snapshot seqno=3: visible seqnos < 3.
+            //   "0" → 0@1 (only version, visible)
+            //   "a" → a@2 (largest visible; a@5/4/3 are not)
+            let results = table.batch_get(&batch, 3)?;
+            assert_eq!(results.len(), 2);
+            assert_eq!(
+                &*results[0]
+                    .as_ref()
+                    .expect("0@1 must be found in block 0")
+                    .value,
+                b"zero",
+            );
+            assert_eq!(
+                &*results[1]
+                    .as_ref()
+                    .expect("a@2 must be found via block 1")
+                    .value,
+                b"2",
+                "batch_get must walk past block 0 (end_key=a, but all a-seqnos ≥3) \
+                 into block 1 (end_key=a, seqnos 2 and 1) to find the visible version \
+                 at snapshot 3",
+            );
+
+            // Sanity: cross-check against Table::get for both keys.
+            let single_zero = table.get(b"0", 3, hash64(b"0"))?;
+            let single_a = table.get(b"a", 3, hash64(b"a"))?;
+            assert_eq!(
+                results[0], single_zero,
+                "batch_get must match Table::get for '0'"
+            );
+            assert_eq!(
+                results[1], single_a,
+                "batch_get must match Table::get for 'a'"
+            );
+            Ok(())
+        },
+        Some(3),
+        Some(|x| x),
+    )
+}
