@@ -74,16 +74,21 @@ use crate::table::block::BlockType;
 /// docstring for the rationale.
 #[derive(Clone, Copy, Debug)]
 pub struct BlockIdentity {
-    /// Identifier of the owning tree (database). `0` for blob-file
-    /// metadata (which is keyed by [`Self::table_id`] alone — the
-    /// blob-file id is globally unique per process). Combined with
-    /// [`Self::table_id`] this gives the [`crate::table::GlobalTableId`]
-    /// shape: `TableId` alone is a per-tree counter that CAN
-    /// collide across different trees, so AAD that binds only
-    /// `(table_id, block_offset)` would permit cross-tree block
-    /// substitution if the same encryption key were ever reused
-    /// across trees. Including `tree_id` closes that gap at the
-    /// AAD layer regardless of key isolation.
+    /// Identifier of the owning tree (database). `0` is the
+    /// allowed-zero default for sites that don't yet have the
+    /// owning Tree's id plumbed to them (see the module
+    /// docstring's exception list — most current writer / reader
+    /// paths fall here, including blob-file metadata: `BlobFileId`
+    /// is itself a per-tree counter that can collide across
+    /// trees, so it can't substitute for a real `tree_id`).
+    /// Combined with [`Self::table_id`] this gives the
+    /// [`crate::table::GlobalTableId`] shape: `TableId` alone is
+    /// a per-tree counter that CAN collide across different
+    /// trees, so AAD that binds only `(table_id, block_offset)`
+    /// would permit cross-tree block substitution if the same
+    /// encryption key were ever reused across trees. Including
+    /// `tree_id` closes that gap at the AAD layer regardless of
+    /// key isolation.
     ///
     /// Callers that don't have `tree_id` plumbed yet pass `0` and
     /// rely on per-tree encryption-provider isolation as the

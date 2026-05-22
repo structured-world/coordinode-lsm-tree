@@ -113,11 +113,16 @@ impl Metadata {
             crate::table::block::BlockIdentity {
                 // BlobFileId is the natural AAD discriminator for
                 // blob-file meta blocks; reuse it as table_id so
-                // the canonical "non-zero table_id ⇒ identified"
-                // invariant holds for blob meta as well as SST
-                // meta. BlobFileId and TableId both alias u64 so
-                // the value space doesn't collide in practice
-                // (different write paths, different sections).
+                // the "non-zero table_id ⇒ identified" invariant
+                // holds for blob meta as well as SST meta. Both
+                // BlobFileId and TableId are u64 per-tree
+                // counters — values WILL collide across trees and
+                // CAN collide with table ids inside the same tree.
+                // The disambiguation that prevents misreading is
+                // per-tree encryption-provider isolation (each
+                // tree's keys decrypt only its own blocks); real
+                // tree_id plumbing is a follow-up that would
+                // close the AAD-layer ambiguity as well.
                 tree_id: 0,
                 table_id: self.id,
                 // The block is written immediately after the
