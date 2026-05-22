@@ -163,13 +163,13 @@ jobs:
   #     on a draft branch)
   # Everything else — PR builds + default manual dispatches —
   # uses the reduced 2-target subset (aarch64-gnu + i686-gnu)
-  # that covers the two canonical mistake-finders: 64-bit
-  # aarch64 ABI quirks and 32-bit x86 pointer-width / endian
-  # sensitivity. The reduced run is ~30% of the full-sweep cost
-  # and keeps PR feedback under 5 min while still catching the
-  # majority of cross-platform regressions; musl, powerpc64
-  # (BE), and riscv64 (qemu-emulated) coverage runs on main
-  # before reaching users.
+  # that covers the two canonical pointer-width / ABI mistakes:
+  # 64-bit aarch64 ABI quirks and 32-bit x86 pointer-width.
+  # Both targets are little-endian — endianness coverage (the
+  # big-endian powerpc64 target) is deferred to the full sweep
+  # on main, alongside musl libc differences and the qemu-
+  # emulated riscv64 path. The reduced run is ~30% of the
+  # full-sweep cost and keeps PR feedback under 5 min.
   cross-matrix:
     # No `needs: lint` — this job only inspects github.event_name
     # / github.ref / inputs to emit a JSON target list. It doesn't
