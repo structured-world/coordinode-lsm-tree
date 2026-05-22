@@ -107,9 +107,15 @@ pub struct BlockIdentity {
     /// rejects any block whose declared origin doesn't match.
     pub table_id: u64,
 
-    /// Byte offset of the block's start within the SST file.
-    /// Combined with `table_id`, gives the AAD a globally unique
-    /// per-block discriminator.
+    /// Byte offset of the block's start within its underlying
+    /// container — SST file, blob-file slice, or in-memory buffer
+    /// — depending on which caller constructs the identity.
+    /// Combined with `table_id`, gives the AAD a per-block
+    /// discriminator that prevents block-swap within the same
+    /// container. `0` is the allowed-zero default for callers
+    /// whose container doesn't surface a usable position cursor
+    /// (sfa-wrapped index/filter writers, BufReader-based
+    /// scanners — see the module docstring for the full list).
     pub block_offset: u64,
 
     /// Whether this is a Data, Filter, Index, or Meta block.
