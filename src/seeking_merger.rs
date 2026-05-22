@@ -4,30 +4,33 @@
 //! Merging iterator over `MergeSource`s, backed by two independent
 //! `LoserTree` tournaments (forward min, backward max).
 //!
-//! `DoubleEndedIterator` is bounded on `MergeSource`. The merger
-//! does NOT call `MergeSource::seek` on direction switches — its
-//! two-tree architecture relies on each source's `next` and
-//! `next_back` self-coordinating so that they together shrink a
-//! single remaining range from both ends. Two source families
-//! satisfy this:
+//! `DoubleEndedIterator` is gated on the [`CoherentMergeSource`]
+//! marker — only sources that promise "no item yielded twice"
+//! under mixed forward/backward consumption can call `next_back`.
+//! The merger does NOT call `MergeSource::seek` on direction
+//! switches; the marker's promise is what keeps mixed direction
+//! safe. Two source families satisfy the marker:
 //!
 //! - **Coherent sources** (std `vec::IntoIter`, `VecDeque`,
 //!   `BTreeMap::range`, wrapped via `CoherentIterSource`) where
 //!   the cursor state is literally shared between the two methods.
-//! - **Self-coordinating independent-cursor sources** that track
-//!   a `(front_idx, back_idx)` window internally and refuse to
+//! - **Self-coordinating index-window sources** that track a
+//!   `(front_idx, back_idx)` window internally and refuse to
 //!   yield once `front_idx >= back_idx`. LSM SST scanners and
 //!   future `RunReader` impls fit here.
 //!
-//! Sources with two truly independent cursors and no shared state
-//! would emit duplicates under mixed direction — they are not
-//! supported. `MergeSource::seek` exists in the trait for
-//! user-initiated repositioning (e.g., starting a range scan at a
-//! specific key); wiring it into the merger's direction-switch
-//! path would defeat the buffered-value migration in
-//! `initialize_forward` / `initialize_backward` and pre-emptively
-//! shift cursors before the destination tournament populates its
-//! edge leaves.
+//! Sources whose mixed direction would yield duplicates (truly
+//! independent cursors with no shared state and no window guard)
+//! must NOT implement [`CoherentMergeSource`]; the marker bound
+//! keeps them out of `next_back` at compile time. Such sources
+//! are still usable through `Iterator::next` only.
+//!
+//! `MergeSource::seek` is exposed for user-initiated
+//! repositioning, not as a direction-switch reconciliation
+//! primitive. Wiring it into the merger's switch path would
+//! defeat the buffered-value migration in `initialize_forward` /
+//! `initialize_backward` and pre-emptively shift cursors before
+//! the destination tournament populates its edge leaves.
 //!
 //! The eager per-direction init below builds each tournament from
 //! a pre-populated `Vec<Option<MergerEntry>>` on first use, lazy
@@ -36,7 +39,7 @@
 
 use crate::comparator::UserComparator;
 use crate::loser_tree::LoserTree;
-use crate::merge_source::{IterItem, MergeSource};
+use crate::merge_source::{CoherentMergeSource, IterItem, MergeSource};
 use alloc::vec::Vec;
 use core::cmp::Ordering;
 
@@ -130,15 +133,13 @@ fn build_max_cmp<C: UserComparator + Clone>(comparator: C) -> MaxCmp<C> {
 ///
 /// # Direction-switching
 ///
-/// `DoubleEndedIterator` is bounded on `MergeSource`. Mixed
-/// `next()` / `next_back()` is safe only when each source
-/// self-coordinates between its forward and backward halves —
-/// either through shared cursor state (coherent sources, wrapped
-/// via `CoherentIterSource`) or through an internal
-/// `(front_idx, back_idx)` window that refuses to yield once the
-/// remaining range is empty. The merger does NOT invoke
-/// `MergeSource::seek` on direction switches (see module-level
-/// docs for rationale).
+/// `DoubleEndedIterator` is gated on the [`CoherentMergeSource`]
+/// marker, which promises "no duplicates under mixed direction".
+/// Both literally-shared-cursor sources (`CoherentIterSource`)
+/// and self-coordinating index-window sources qualify. The merger
+/// does NOT invoke `MergeSource::seek` on direction switches —
+/// the marker's promise is what keeps mixed direction safe (see
+/// module-level docs for rationale).
 pub struct SeekingMerger<S: MergeSource, C: UserComparator + Clone> {
     sources: Vec<S>,
     n_sources: usize,
@@ -311,14 +312,18 @@ impl<S: MergeSource, C: UserComparator + Clone> Iterator for SeekingMerger<S, C>
     }
 }
 
-// `DoubleEndedIterator` is bounded on `MergeSource`. The previous
-// `CoherentMergeSource` bound was relaxed because self-coordinating
-// independent-cursor sources (e.g., LSM SST scanners that maintain
-// a `(front_idx, back_idx)` window internally) satisfy the
-// merger's "no duplicates under mixed direction" requirement
-// without implementing the `CoherentMergeSource` marker. See
-// module-level docs for the full source-shape contract.
-impl<S: MergeSource, C: UserComparator + Clone> DoubleEndedIterator for SeekingMerger<S, C> {
+// `DoubleEndedIterator` is gated on `CoherentMergeSource`. The
+// marker's no-duplicates-under-mixed-direction promise is what
+// makes backward iteration safe given that the merger does NOT
+// invoke `MergeSource::seek` at direction switches. The marker
+// now spans both literally-shared-cursor sources
+// (`CoherentIterSource`) and self-coordinating index-window
+// sources (LSM SST scanners maintaining `(front_idx, back_idx)`).
+// Sources that don't satisfy the promise can still be used via
+// `Iterator::next()` only.
+impl<S: CoherentMergeSource, C: UserComparator + Clone> DoubleEndedIterator
+    for SeekingMerger<S, C>
+{
     fn next_back(&mut self) -> Option<Self::Item> {
         // Same error-first contract as next().
         if let Some(e) = self.pending_backward_error.take() {
@@ -868,6 +873,12 @@ mod tests {
             Ok(())
         }
     }
+
+    // IndependentCursorSource satisfies CoherentMergeSource's
+    // no-duplicates-under-mixed-direction promise via the
+    // self-coordinating (front_idx, back_idx) window guard. The
+    // clamp on `seek` preserves the invariant — see struct docs.
+    impl CoherentMergeSource for IndependentCursorSource {}
 
     #[test]
     fn switch_to_backward_after_drain_emits_no_duplicates() {
