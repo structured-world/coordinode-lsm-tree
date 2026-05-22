@@ -171,7 +171,13 @@ jobs:
   # (BE), and riscv64 (qemu-emulated) coverage runs on main
   # before reaching users.
   cross-matrix:
-    needs: lint
+    # No `needs: lint` — this job only inspects github.event_name
+    # / github.ref / inputs to emit a JSON target list. It doesn't
+    # touch source, doesn't compile, doesn't run lint-sensitive
+    # tooling. Running it in parallel with lint shaves ~10s off
+    # the PR critical path: the matrix is ready when lint
+    # finishes, and `cross` (which `needs: [lint, cross-matrix]`)
+    # starts immediately rather than waiting for serial chain.
     runs-on: ubuntu-latest
     outputs:
       targets: ${{ steps.set.outputs.targets }}
