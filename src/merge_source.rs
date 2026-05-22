@@ -5,11 +5,15 @@
 //!
 //! `MergeSource` is what `SeekingMerger` consumes: a stream that
 //! can be advanced in either direction AND repositioned to a
-//! specific key. The seek primitive is what makes RocksDB-style
-//! direction switching possible — without it, a backward-only path
-//! cannot recover from prior forward consumption on iterators whose
-//! front and back cursors don't share state (LSM SST scanners
-//! empirically don't).
+//! specific key. `SeekingMerger` itself does NOT invoke
+//! [`MergeSource::seek`] on direction switches — its two-tree
+//! architecture relies on each source's own
+//! `(front_idx, back_idx)` window (or equivalent self-coordination
+//! between `next` and `next_back`) to keep mixed direction
+//! duplicate-free. The seek primitive is exposed on the trait for
+//! user-initiated repositioning (range scan starting key, jump to
+//! a known key, etc.), not as a direction-switch reconciliation
+//! mechanism.
 //!
 //! # Contract
 //!
