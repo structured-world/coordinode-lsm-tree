@@ -96,12 +96,19 @@ impl Scanner {
             crate::table::block::BlockIdentity {
                 tree_id: 0,
                 table_id,
-                // Sequential scan via from_reader: byte offset
-                // isn't surfaced by BufReader, and the scanner
-                // walks blocks in order so per-block offset
-                // matters less than for random reads. AAD wiring
-                // (#251) can either track running position here
-                // or accept offset=0 for the scan path.
+                // Sequential scan via from_reader: BufReader<File>
+                // does implement Seek (and could report position
+                // via stream_position()), but querying it
+                // invalidates the prefetched buffer and turns the
+                // sequential scan into a series of seek+refill
+                // cycles. The scan walks blocks in order so the
+                // per-block offset isn't load-bearing for AAD
+                // matching with the writer's per-block_offset
+                // values — write/read agreement happens through
+                // the file's structural layout, not per-block
+                // identity. AAD wiring (#251) will either thread
+                // a running offset accumulator here or accept
+                // offset=0 for the scan path explicitly.
                 block_offset: 0,
                 block_type: BlockType::Data,
                 dict_id: compression.dict_id(),

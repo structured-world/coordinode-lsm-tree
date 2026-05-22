@@ -156,15 +156,13 @@ impl Writer {
 
             path,
 
-            // Construct as concrete first, then promote to dyn
-            // via use_table_id so the resulting trait object
-            // already carries the owning table_id for AAD-aware
-            // block writes.
-            index_writer: (Box::new(FullIndexWriter::new())
-                as Box<dyn BlockIndexWriter<BufWriter<Box<dyn FsFile>>>>)
-                .use_table_id(table_id),
-            filter_writer: (Box::new(FullFilterWriter::new(BloomConstructionPolicy::default()))
-                as Box<dyn FilterWriter<BufWriter<Box<dyn FsFile>>>>)
+            // Promote to trait object via the use_table_id call —
+            // the field type forces the W coercion, no inline cast
+            // needed (mirrors the use_partitioned_* pattern below).
+            // The trait method returns Box<dyn …<W>> with W inferred
+            // from the assignment context.
+            index_writer: Box::new(FullIndexWriter::new()).use_table_id(table_id),
+            filter_writer: Box::new(FullFilterWriter::new(BloomConstructionPolicy::default()))
                 .use_table_id(table_id),
 
             block_buffer: Vec::new(),
@@ -775,7 +773,15 @@ impl Writer {
                 &self.block_buffer,
                 crate::table::block::BlockIdentity {
                     tree_id: 0,
-                    table_id: self.table_id,
+                    // Meta is read via ParsedMeta::load_with_handle
+                    // BEFORE the reader knows the table id — the
+                    // table id IS what meta itself carries.
+                    // Writer mirrors that with table_id: 0 so write
+                    // and read sides agree on the AAD discriminator
+                    // once #251 wires AAD; otherwise table-open
+                    // would fail AEAD verification on the very
+                    // first block read.
+                    table_id: 0,
                     block_offset: *self.meta.file_pos,
                     block_type: crate::table::block::BlockType::Meta,
                     dict_id: 0,
