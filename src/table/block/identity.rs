@@ -22,15 +22,40 @@
 //! later means adding it to `BlockIdentity` rather than chasing
 //! down 90+ call sites.
 //!
-//! **Field requirements.** Production call sites MUST populate
+//! **Field requirements.** Production call sites SHOULD populate
 //! every field with the real value from their local context. Test
 //! call sites that don't exercise AAD-sensitive paths may use
 //! [`BlockIdentity::for_test`] which defaults `dict_id` and
-//! `window_log` to zero. Defaulting `table_id` or `block_offset`
-//! to zero in non-test code is a bug: it makes blocks from
-//! different tables / offsets bind to the same AAD, breaking the
-//! block-swap resistance guarantee the wire format is designed
-//! around.
+//! `window_log` to zero.
+//!
+//! **Allowed zero exceptions in production code** (each individually
+//! documented at the call site):
+//!
+//! - `table_id = 0` is allowed when reading a META block that
+//!   itself CARRIES the `table_id` field — there's no way to
+//!   know the id before the block is parsed (chicken-and-egg).
+//!   Cross-store substitution is still prevented because the
+//!   meta payload's own id field is part of the verified body.
+//! - `block_offset = 0` is allowed in two cases until AAD
+//!   wiring lands:
+//!   - Index / filter writers that hand their blocks to
+//!     `sfa::Writer` (the sectioned-file-archive wrapper):
+//!     the wrapper doesn't expose a byte-position cursor, and
+//!     the [`crate::table::writer::index::BlockIndexWriter`] /
+//!     [`crate::table::writer::filter::FilterWriter`] traits
+//!     don't surface `block_offset` to `finish()`. Extending
+//!     those signatures is a follow-up.
+//!   - Sequential scanners reading via `BufReader`: the buffer
+//!     doesn't expose its own byte offset, and the scan path
+//!     walks blocks in order so per-block offset bookkeeping
+//!     isn't load-bearing for the scan itself.
+//!
+//! `table_id = 0` AND `block_offset = 0` together — both zero
+//! at the same call site — is reserved for tests; a CI canary
+//! to enforce that is tracked as a follow-up. Outside the
+//! exceptions listed above, defaulting either to zero in
+//! production weakens block-swap resistance and should be
+//! avoided.
 
 use crate::table::block::BlockType;
 
@@ -41,11 +66,18 @@ use crate::table::block::BlockType;
 /// docstring for the rationale.
 #[derive(Clone, Copy, Debug)]
 pub struct BlockIdentity {
-    /// Global table identifier (`(tree_id, table_id)` packed) of
-    /// the SST that owns this block. Binds the block to its
-    /// table: AAD constructed from this prevents a block from
-    /// table A being substituted for a block at the same offset
-    /// in table B (block-swap attack).
+    /// Identifier of the owning store unit — for SST blocks this is
+    /// the per-tree [`crate::TableId`] (a `u64` alias); for blob
+    /// files it is the [`crate::vlog::BlobFileId`] (also a `u64`
+    /// alias). Binds the block to its store unit: AAD constructed
+    /// from this prevents a block from store A being substituted
+    /// for a block at the same offset in store B (block-swap
+    /// attack).
+    ///
+    /// **Not** the same as [`crate::table::GlobalTableId`], which
+    /// packs `(tree_id, table_id)` for cross-tree disambiguation;
+    /// at the Block-I/O boundary the AAD discriminator only needs
+    /// per-store uniqueness within the running process.
     pub table_id: u64,
 
     /// Byte offset of the block's start within the SST file.

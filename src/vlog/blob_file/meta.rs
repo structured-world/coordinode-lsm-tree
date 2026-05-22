@@ -119,7 +119,13 @@ impl Metadata {
                 // the value space doesn't collide in practice
                 // (different write paths, different sections).
                 table_id: self.id,
-                block_offset: 0,
+                // The block is written immediately after the
+                // METADATA_HEADER_MAGIC prefix; the block's byte
+                // offset within the file/slice is the magic
+                // length. Using a real offset (vs 0) keeps AAD
+                // discriminator distinct from blocks that might
+                // appear at file start in other contexts.
+                block_offset: METADATA_HEADER_MAGIC.len() as u64,
                 block_type: crate::table::block::BlockType::Meta,
                 dict_id: 0,
                 window_log: 0,
@@ -155,7 +161,10 @@ impl Metadata {
                 // detection still relies on the meta payload's
                 // own id field being part of the verified body.
                 table_id: 0,
-                block_offset: 0,
+                // Symmetric with the writer: block sits after the
+                // magic prefix; this offset matches what the
+                // writer used at encode_into time.
+                block_offset: METADATA_HEADER_MAGIC.len() as u64,
                 block_type: crate::table::block::BlockType::Meta,
                 dict_id: 0,
                 window_log: 0,
