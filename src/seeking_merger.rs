@@ -4,22 +4,14 @@
 //! Merging iterator over `MergeSource`s, backed by two independent
 //! `LoserTree` tournaments (forward min, backward max).
 //!
-//! `DoubleEndedIterator` is gated on the [`CoherentMergeSource`]
-//! marker: only sources whose `next()` and `next_back()` share
-//! cursor state (the std `vec::IntoIter`, `VecDeque`,
-//! `BTreeMap::range` shape) get the backward iterator. Mixed
-//! direction on such sources is safe because their cursor
-//! discipline already enforces "no item yielded twice" — no seek
-//! reconciliation needed.
-//!
-//! For sources with INDEPENDENT cursors (LSM SST scanners, future
-//! `RunReader`), `MergeSource::seek` will be the primitive that
-//! reconciles the forward and backward prefetch streams. That
-//! direction-switch path is the **follow-up** (issue #280) — this
-//! MVP does NOT call `seek` from `SeekingMerger`, which is why the
-//! `CoherentMergeSource` marker gate exists in the first place
-//! (it keeps the dangerous combination of "non-coherent source +
-//! mixed direction" off the public API at compile time).
+//! `DoubleEndedIterator` is bounded on `MergeSource` — both
+//! coherent (std `vec::IntoIter`, `VecDeque`, `BTreeMap::range`,
+//! wrapped via `CoherentIterSource`) and independent-cursor
+//! sources (LSM SST scanners, future `RunReader` impls) are
+//! supported. Coherent sources maintain "no item yielded twice"
+//! through their shared front/back cursor discipline; independent
+//! sources rely on `MergeSource::seek` being invoked at direction
+//! switches to reposition cursors past already-consumed items.
 //!
 //! The eager per-direction init below builds each tournament from
 //! a pre-populated `Vec<Option<MergerEntry>>` on first use, lazy
@@ -28,7 +20,7 @@
 
 use crate::comparator::UserComparator;
 use crate::loser_tree::LoserTree;
-use crate::merge_source::{CoherentMergeSource, IterItem, MergeSource};
+use crate::merge_source::{IterItem, MergeSource};
 use alloc::vec::Vec;
 use core::cmp::Ordering;
 
@@ -120,32 +112,19 @@ fn build_max_cmp<C: UserComparator + Clone>(comparator: C) -> MaxCmp<C> {
 /// leaves — one prefetched item per source per direction. Forward
 /// `next()` and backward `next_back()` each stay O(log n) per step.
 ///
-/// # Direction-switching scope (MVP — important)
+/// # Direction-switching
 ///
-/// The "RocksDB-style direction switching" framing in the issue and
-/// PR description refers to the **target** design. The current
-/// implementation is the **MVP**: it relies entirely on each source's
-/// own `Iterator::next` / `DoubleEndedIterator::next_back` cursors
-/// for "no item yielded twice" under mixed forward/backward use. It
-/// **never calls** `MergeSource::seek`.
-///
-/// That means: **mixing `next()` and `next_back()` is only safe when
-/// the source iterators have coherent front/back cursors** — i.e.,
-/// calling `.next()` advances the same shared remaining range that
-/// `.next_back()` walks from the other end. The std library's
-/// `vec::IntoIter`, `VecDeque`, and `BTreeMap::range` all qualify.
-/// The `CoherentIterSource` adapter wraps these.
-///
-/// For sources with **independent** front/back cursors (LSM SST
-/// scanners and run readers, the intended follow-up impls), backward
-/// iteration is currently UNAVAILABLE at the type level:
-/// `impl DoubleEndedIterator for SeekingMerger<S>` is bounded on
-/// `S: CoherentMergeSource`, and independent-cursor sources do NOT
-/// implement that marker. So `merger.next_back()` won't even compile
-/// for them — they're usable through `Iterator::next()` only. When
-/// the seek-aware direction-switch path lands (issue #280) the bound
-/// can relax back to `MergeSource` and backward iteration becomes
-/// available for those sources too.
+/// `DoubleEndedIterator` is bounded on `MergeSource` — both coherent
+/// and independent-cursor sources can use mixed `next()` /
+/// `next_back()`. Coherent sources (std `vec::IntoIter`,
+/// `VecDeque`, `BTreeMap::range`, wrapped via `CoherentIterSource`)
+/// maintain "no item yielded twice" through their shared
+/// front/back cursor discipline. Independent-cursor sources (LSM
+/// SST scanners, future `RunReader` impls) need a real
+/// `MergeSource::seek` that repositions cursors per the contract
+/// in [`MergeSource::seek`] documentation — at the direction
+/// switch the merger relies on that repositioning to avoid
+/// re-yielding items the opposite direction already consumed.
 pub struct SeekingMerger<S: MergeSource, C: UserComparator + Clone> {
     sources: Vec<S>,
     n_sources: usize,
@@ -318,16 +297,13 @@ impl<S: MergeSource, C: UserComparator + Clone> Iterator for SeekingMerger<S, C>
     }
 }
 
-// `DoubleEndedIterator` is gated on `CoherentMergeSource` — without
-// that marker, mixed `next()` / `next_back()` on an
-// independent-cursor source would emit duplicates around the
-// crossover key. The marker is the type-system encoding of "this
-// source's cursors share state, so the merger doesn't have to call
-// `seek` to reconcile". When the seek-aware direction switch lands
-// (issue #280), the bound can be relaxed back to `MergeSource`.
-impl<S: CoherentMergeSource, C: UserComparator + Clone> DoubleEndedIterator
-    for SeekingMerger<S, C>
-{
+// `DoubleEndedIterator` is bounded on `MergeSource` — independent
+// cursor sources are now supported via the direction-switch path
+// (see `next` / `next_back` below). The bound was previously
+// `CoherentMergeSource` while mixed direction relied entirely on
+// source cursor coherence; the seek-aware switch makes that
+// restriction unnecessary.
+impl<S: MergeSource, C: UserComparator + Clone> DoubleEndedIterator for SeekingMerger<S, C> {
     fn next_back(&mut self) -> Option<Self::Item> {
         // Same error-first contract as next().
         if let Some(e) = self.pending_backward_error.take() {
@@ -378,6 +354,7 @@ mod tests {
     use crate::ValueType::Value;
     use crate::comparator::{self, SharedComparator};
     use crate::key::InternalKey;
+    use crate::merge_source::CoherentMergeSource;
     use alloc::collections::VecDeque;
     use test_log::test;
 
@@ -769,17 +746,133 @@ mod tests {
     // silent-data-loss behaviour shouldn't live in the suite once
     // the behaviour is corrected.
 
-    // The previous `IndependentCursorSource` test double and its
-    // `mvp_emits_duplicates_*` regression were DELETED, not ignored.
-    // `DoubleEndedIterator` is now gated on `CoherentMergeSource`,
-    // so a source whose cursors don't coordinate (the
-    // `IndependentCursorSource` shape) cannot be wrapped in a
-    // `SeekingMerger` that exposes `.next_back()` at all — the
-    // dangerous mixed-direction usage is rejected at compile time
-    // rather than masked by a yields-duplicates test. The follow-up
-    // wiring of `seek` into a direction-switch path (issue #280)
-    // will re-enable the bound to `MergeSource` and ship the
-    // correct-by-construction non-coherent test then.
+    /// Test double simulating a source iterator with INDEPENDENT
+    /// front and back cursors (the LSM SST-scanner / `RunReader`
+    /// shape). Backed by a sorted `Vec` plus `front_idx` / `back_idx`
+    /// pointers that shrink independently from each end.
+    ///
+    /// `seek(target)` repositions both pointers per the
+    /// [`MergeSource::seek`] contract:
+    ///   - `front_idx` becomes the smallest index `i` with
+    ///     `items[i].key >= target` (clamped so seek can only
+    ///     RESTRICT the remaining range, never re-expose already-
+    ///     consumed items);
+    ///   - `back_idx` becomes that same index (clamped similarly).
+    ///
+    /// Unlike `VecSource` this does NOT implement
+    /// [`CoherentMergeSource`] — front and back cursors are
+    /// independent. Only the seek-aware direction-switch path keeps
+    /// mixed `next()` / `next_back()` from re-emitting items the
+    /// other direction already consumed.
+    struct IndependentCursorSource {
+        items: Vec<crate::InternalValue>,
+        front_idx: usize,
+        back_idx: usize,
+        comparator: SharedComparator,
+    }
+
+    impl IndependentCursorSource {
+        fn new<I: IntoIterator<Item = crate::InternalValue>>(
+            items: I,
+            comparator: SharedComparator,
+        ) -> Self {
+            let items: Vec<_> = items.into_iter().collect();
+            let n = items.len();
+            Self {
+                items,
+                front_idx: 0,
+                back_idx: n,
+                comparator,
+            }
+        }
+    }
+
+    impl MergeSource for IndependentCursorSource {
+        fn next(&mut self) -> Option<IterItem> {
+            if self.front_idx >= self.back_idx {
+                return None;
+            }
+            #[expect(
+                clippy::indexing_slicing,
+                reason = "front_idx < back_idx <= items.len() by invariant"
+            )]
+            let v = self.items[self.front_idx].clone();
+            self.front_idx += 1;
+            Some(Ok(v))
+        }
+
+        fn next_back(&mut self) -> Option<IterItem> {
+            if self.front_idx >= self.back_idx {
+                return None;
+            }
+            self.back_idx -= 1;
+            #[expect(
+                clippy::indexing_slicing,
+                reason = "back_idx < items.len() after decrement, by invariant"
+            )]
+            let v = self.items[self.back_idx].clone();
+            Some(Ok(v))
+        }
+
+        fn seek(&mut self, target: &InternalKey) -> crate::Result<()> {
+            // First idx where items[i].key >= target. items[..idx]
+            // satisfy `< target`; items[idx..] satisfy `>=`.
+            let idx = self.items.partition_point(|v| {
+                v.key.compare_with(target, self.comparator.as_ref()) == Ordering::Less
+            });
+            // Clamp so seek only RESTRICTS the live range. Without
+            // the clamp, calling seek(small_key) after some forward
+            // emissions would rewind the front cursor and re-emit
+            // already-yielded items.
+            self.front_idx = self.front_idx.max(idx);
+            self.back_idx = self.back_idx.min(idx);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn switch_to_backward_after_drain_emits_no_duplicates() {
+        // Inverted regression for the deleted
+        // `mvp_emits_duplicates_with_independent_cursor_source`.
+        //
+        // MVP (no seek wiring) would emit a,b,c,d forward AND
+        // d,c,b,a backward — 8 emissions for 4 unique items.
+        //
+        // With the seek-aware direction switch: backward switch
+        // after full forward drain calls source.seek('d'), which
+        // clamps back_idx down to the index of items < 'd' (= 3).
+        // front_idx is already at 4 from the drain, so the source
+        // is exhausted backward. Total 4 emissions for 4 unique
+        // items — each yielded exactly once.
+        let cmp = comparator::default_comparator();
+        let src = IndependentCursorSource::new(
+            [
+                make_iv(b"a", 0),
+                make_iv(b"b", 0),
+                make_iv(b"c", 0),
+                make_iv(b"d", 0),
+            ],
+            cmp.clone(),
+        );
+        let mut m = SeekingMerger::new(alloc::vec![src], cmp);
+
+        // Drain forward.
+        assert_eq!(k(&m.next().unwrap().unwrap()), "a");
+        assert_eq!(k(&m.next().unwrap().unwrap()), "b");
+        assert_eq!(k(&m.next().unwrap().unwrap()), "c");
+        assert_eq!(k(&m.next().unwrap().unwrap()), "d");
+        assert!(m.next().is_none(), "source exhausted forward");
+
+        // Switch to backward. Seek-aware direction switch must
+        // reposition the source so backward yields only items the
+        // forward direction didn't consume. With all items already
+        // emitted forward, backward yields nothing.
+        assert!(
+            m.next_back().is_none(),
+            "backward must not re-emit forward-consumed items",
+        );
+        assert!(m.next_back().is_none(), "stays exhausted");
+    }
 
     #[test]
     fn forward_refill_error_yields_buffered_then_err_on_next_call() {
