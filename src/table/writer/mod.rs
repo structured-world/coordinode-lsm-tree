@@ -448,6 +448,7 @@ impl Writer {
             &mut self.file_writer,
             &self.block_buffer,
             super::block::BlockIdentity {
+                tree_id: 0,
                 table_id: self.table_id,
                 block_offset: *self.meta.file_pos,
                 block_type: super::block::BlockType::Data,
@@ -632,6 +633,7 @@ impl Writer {
                 &mut self.file_writer,
                 &self.block_buffer,
                 crate::table::block::BlockIdentity {
+                    tree_id: 0,
                     table_id: self.table_id,
                     block_offset: *self.meta.file_pos,
                     block_type: crate::table::block::BlockType::RangeTombstone,
@@ -772,6 +774,7 @@ impl Writer {
                 &mut self.file_writer,
                 &self.block_buffer,
                 crate::table::block::BlockIdentity {
+                    tree_id: 0,
                     table_id: self.table_id,
                     block_offset: *self.meta.file_pos,
                     block_type: crate::table::block::BlockType::Meta,

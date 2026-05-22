@@ -98,6 +98,7 @@ impl<W: std::io::Write + std::io::Seek> BlockIndexWriter<W> for FullIndexWriter 
             file_writer,
             &bytes,
             crate::table::block::BlockIdentity {
+                tree_id: 0,
                 table_id: self.table_id,
                 // sfa::Writer doesn't expose its position cursor;
                 // outer table Writer tracks meta.file_pos but the

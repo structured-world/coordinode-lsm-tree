@@ -125,6 +125,7 @@ impl ParsedMeta {
                 // within a single file; cross-file substitution is
                 // prevented by the meta block's own table_id field
                 // being part of the verified payload.
+                tree_id: 0,
                 table_id: 0,
                 block_offset: *handle.offset(),
                 block_type: BlockType::Meta,

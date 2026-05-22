@@ -137,6 +137,7 @@ impl<W: std::io::Write + std::io::Seek> FilterWriter<W> for FullFilterWriter {
             file_writer,
             &filter_bytes,
             crate::table::block::BlockIdentity {
+                tree_id: 0,
                 table_id: self.table_id,
                 block_offset: 0,
                 block_type: crate::table::block::BlockType::Filter,

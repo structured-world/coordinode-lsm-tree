@@ -873,6 +873,7 @@ impl Table {
             file,
             regions.tli,
             crate::table::block::BlockIdentity {
+                tree_id: 0,
                 table_id,
                 block_offset: *regions.tli.offset(),
                 block_type: BlockType::Index,
@@ -1026,6 +1027,7 @@ impl Table {
                 file_handle.as_ref(),
                 filter_tli_handle,
                 crate::table::block::BlockIdentity {
+                    tree_id: 0,
                     table_id: metadata.id,
                     block_offset: *filter_tli_handle.offset(),
                     block_type: BlockType::Index,
@@ -1065,6 +1067,7 @@ impl Table {
                         file_handle.as_ref(),
                         filter_handle,
                         crate::table::block::BlockIdentity {
+                            tree_id: 0,
                             table_id: metadata.id,
                             block_offset: *filter_handle.offset(),
                             block_type: BlockType::Filter,
@@ -1101,6 +1104,7 @@ impl Table {
                 file_handle.as_ref(),
                 rt_handle,
                 crate::table::block::BlockIdentity {
+                    tree_id: 0,
                     table_id: metadata.id,
                     block_offset: *rt_handle.offset(),
                     block_type: BlockType::RangeTombstone,

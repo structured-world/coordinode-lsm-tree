@@ -31,6 +31,14 @@
 //! **Allowed zero exceptions in production code** (each individually
 //! documented at the call site):
 //!
+//! - `tree_id = 0` is allowed at any site that doesn't yet have
+//!   the owning Tree's id threaded through to it (most current
+//!   call sites — Writer / Table / Scanner predate `tree_id`
+//!   plumbing). The substitute defence is per-tree encryption-
+//!   provider isolation: a tree's keys decrypt only its own
+//!   blocks, so cross-tree substitution fails at the key layer.
+//!   Plumbing real `tree_id` is a follow-up that strengthens the
+//!   guarantee at the AAD layer regardless of key isolation.
 //! - `table_id = 0` is allowed when reading a META block that
 //!   itself CARRIES the `table_id` field — there's no way to
 //!   know the id before the block is parsed (chicken-and-egg).
@@ -66,18 +74,30 @@ use crate::table::block::BlockType;
 /// docstring for the rationale.
 #[derive(Clone, Copy, Debug)]
 pub struct BlockIdentity {
+    /// Identifier of the owning tree (database). `0` for blob-file
+    /// metadata (which is keyed by [`Self::table_id`] alone — the
+    /// blob-file id is globally unique per process). Combined with
+    /// [`Self::table_id`] this gives the [`crate::table::GlobalTableId`]
+    /// shape: `TableId` alone is a per-tree counter that CAN
+    /// collide across different trees, so AAD that binds only
+    /// `(table_id, block_offset)` would permit cross-tree block
+    /// substitution if the same encryption key were ever reused
+    /// across trees. Including `tree_id` closes that gap at the
+    /// AAD layer regardless of key isolation.
+    ///
+    /// Callers that don't have `tree_id` plumbed yet pass `0` and
+    /// rely on per-tree encryption-provider isolation as the
+    /// substitute defence; see the module docstring for the list
+    /// of allowed-zero exceptions.
+    pub tree_id: u64,
+
     /// Identifier of the owning store unit — for SST blocks this is
     /// the per-tree [`crate::TableId`] (a `u64` alias); for blob
     /// files it is the [`crate::vlog::BlobFileId`] (also a `u64`
-    /// alias). Binds the block to its store unit: AAD constructed
-    /// from this prevents a block from store A being substituted
-    /// for a block at the same offset in store B (block-swap
-    /// attack).
-    ///
-    /// **Not** the same as [`crate::table::GlobalTableId`], which
-    /// packs `(tree_id, table_id)` for cross-tree disambiguation;
-    /// at the Block-I/O boundary the AAD discriminator only needs
-    /// per-store uniqueness within the running process.
+    /// alias). Combined with [`Self::tree_id`], gives the
+    /// per-process unique discriminator that prevents block-swap
+    /// attacks: AAD built from `(tree_id, table_id, block_offset)`
+    /// rejects any block whose declared origin doesn't match.
     pub table_id: u64,
 
     /// Byte offset of the block's start within the SST file.
@@ -117,6 +137,7 @@ impl BlockIdentity {
     #[must_use]
     pub(crate) const fn for_test(table_id: u64, block_offset: u64, block_type: BlockType) -> Self {
         Self {
+            tree_id: 0,
             table_id,
             block_offset,
             block_type,

@@ -94,6 +94,7 @@ impl Scanner {
         let block = Block::from_reader(
             reader,
             crate::table::block::BlockIdentity {
+                tree_id: 0,
                 table_id,
                 // Sequential scan via from_reader: byte offset
                 // isn't surfaced by BufReader, and the scanner

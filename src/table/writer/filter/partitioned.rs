@@ -114,6 +114,7 @@ impl PartitionedFilterWriter {
             &mut self.final_filter_buffer,
             &filter_bytes,
             crate::table::block::BlockIdentity {
+                tree_id: 0,
                 table_id: self.table_id,
                 block_offset: 0,
                 block_type: crate::table::block::BlockType::Filter,
@@ -168,6 +169,7 @@ impl PartitionedFilterWriter {
             file_writer,
             &bytes,
             crate::table::block::BlockIdentity {
+                tree_id: 0,
                 table_id: self.table_id,
                 block_offset: 0,
                 block_type: crate::table::block::BlockType::Index,

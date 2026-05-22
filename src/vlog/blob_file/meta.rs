@@ -118,6 +118,7 @@ impl Metadata {
                 // meta. BlobFileId and TableId both alias u64 so
                 // the value space doesn't collide in practice
                 // (different write paths, different sections).
+                tree_id: 0,
                 table_id: self.id,
                 // The block is written immediately after the
                 // METADATA_HEADER_MAGIC prefix; the block's byte
@@ -160,6 +161,7 @@ impl Metadata {
                 // the table-meta parse path: cross-blob swap
                 // detection still relies on the meta payload's
                 // own id field being part of the verified body.
+                tree_id: 0,
                 table_id: 0,
                 // Symmetric with the writer: block sits after the
                 // magic prefix; this offset matches what the
