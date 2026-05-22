@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779465278960,
+  "lastUpdate": 1779472950343,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -7956,6 +7956,84 @@ window.BENCHMARK_DATA = {
             "value": 448531.82928530517,
             "unit": "ops/sec",
             "extra": "P50: 2.0us | P99: 5.8us | P99.9: 9.1us\nthreads: 1 | elapsed: 0.45s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "5ecca9d498ad0603aa2cf99fb56d84e06087b613",
+          "message": "refactor(block)!: thread BlockIdentity through Block I/O API (#252) (#294)\n\n## Summary\n\nThreads a new `BlockIdentity` struct through `Block::write_into` /\n`Block::from_reader` / `Block::from_file`, replacing the separate\n`block_type` argument. The identity is the context the Block layer needs\nto construct AAD for AEAD encryption — actual AAD construction is #251.\nThis PR is the type-surface plumbing only; identity fields are\naccepted-but-not-consumed today, so #251 can wire AAD without touching\nevery Block call site again.\n\nCloses #252.\n\n## Design\n\n```rust\npub struct BlockIdentity {\n    pub tree_id: u64,\n    pub table_id: u64,\n    pub block_offset: u64,\n    pub block_type: BlockType,\n    pub dict_id: u32,\n    pub window_log: u8,\n}\n```\n\n`tree_id` was added after the first review pass — `TableId` and\n`BlobFileId` are both per-tree counters that can collide across trees,\nso AAD that binds only `(table_id, block_offset)` would permit\ncross-tree block substitution. Most current sites pass `tree_id: 0` and\nrely on per-tree encryption-provider isolation as the substitute defence\n(a tree's keys decrypt only its own blocks). The one site with full info\n— `load_block` — uses `table_id.tree_id()` from `GlobalTableId`.\nPlumbing real `tree_id` through Writer / Scanner / Table read paths is\ntracked as a follow-up; the AAD layer guarantee strengthens once #251\nwires AAD.\n\nThe natural alternative — passing `aad: &[u8]` directly — got a previous\nattempt into trouble because callers wrote `aad: &[]` everywhere. With\n`BlockIdentity`, every call site contributes its OWN local context\n(writer/scanner/reader already knows its table id, block offset, etc.)\nand the Block layer computes AAD once, internally.\n\n## Site coverage (all 94 Block call sites)\n\n### Production sites (18)\n\n| Site | `table_id` | `block_offset` |\n|---|---|---|\n| `Writer` (data, range_tombstone, meta) | `self.table_id` |\n`*self.meta.file_pos` |\n| `FullIndexWriter` / `PartitionedIndexWriter` | plumbed via new\n`use_table_id` builder | 0 (see note) |\n| `FullFilterWriter` / `PartitionedFilterWriter` | plumbed via new\n`use_table_id` builder | 0 (see note) |\n| `Table::read_tli` / `pinned_filter_index` / `pinned_filter` /\nrange_tombstones | `metadata.id` | `*handle.offset()` |\n| `util::load_block` | `GlobalTableId.table_id()` | `*handle.offset()` |\n| `Scanner` | new ctor arg threads `table_id` | 0 (BufReader scan) |\n| `meta::load_with_handle` | 0 (parses table_id itself) |\n`*handle.offset()` |\n| `vlog::blob_file::meta::encode_into` | `self.id` (BlobFileId) | 0 |\n| `vlog::blob_file::meta::from_slice` | 0 (parses id itself) | 0 |\n\n**Note on `block_offset = 0` in index/filter writers**: `sfa::Writer`\ndoesn't expose its position cursor, and the `BlockIndexWriter::finish` /\n`FilterWriter::finish` trait methods don't surface `block_offset`\neither. Extending those signatures is a separate follow-up — for now the\ncanonical \"non-zero `table_id` ⇒ identified\" invariant holds, and the\noffset zero is documented at each site.\n\n**Note on `table_id = 0` in meta-parse paths**: meta blocks are the\nfirst thing read during table/blob-file open. The `table_id` is what the\nmeta payload itself carries (chicken-and-egg). Cross-file substitution\nis still prevented by the meta block's own id field being part of the\nverified body, so the AAD discriminator's zero `table_id` is documented\nas the correct value here.\n\n### Test sites (76)\n\nAll use `BlockIdentity::for_test(0, 0, BlockType::*)` helper;\nbulk-patched with per-site verification (single-line + multi-line call\nforms handled separately).\n\n## Trait surface changes\n\n- `BlockIndexWriter::use_table_id(table_id) -> Box<dyn\nBlockIndexWriter<W>>` — new method, declared on the trait. All impls\n(`FullIndexWriter`, `PartitionedIndexWriter`) implement it.\n- `FilterWriter::use_table_id(table_id) -> Box<dyn FilterWriter<W>>` —\nsymmetric.\n- `Scanner::new(..., table_id: TableId)` — added a parameter (one caller\nin `Table::scan`, updated).\n- `Table::read_tli(.., table_id: TableId, ..)` — added a parameter (two\ncallers in same file, updated).\n\n## Out of scope (separate follow-ups)\n\n- AAD construction inside the Block layer — #251\n- CI canary that fails on `table_id=0 AND block_offset=0` outside tests\n— no production site currently fails it (meta-parse bootstraps are\ndocumented exceptions; `block_offset=0` with non-zero `table_id` passes)\n- `block_offset` plumbing through `BlockIndexWriter::finish` /\n`FilterWriter::finish` — needs trait-surface extension; defer to #251\nwhich will clarify exactly which fields AAD requires\n\n## Test plan\n\n- [x] `cargo clippy --lib --tests --all-features` — clean\n- [x] `cargo nextest run --workspace --all-features` — **1515/1515\npass**\n- [x] All 94 `Block::write_into` / `from_reader` / `from_file` call\nsites compile and exercise the new API\n\n## History\n\nSquashed from a WIP scaffold commit (initial scaffold pushed early per\nrequest to avoid losing work across sessions). Single clean commit lands\nthe full refactor.\n\n## Breaking changes (semver major)\n\nThis PR is **intentionally semver-breaking** for the public surface.\nDownstream consumers of the crate WILL need to update call sites. Marked\nwith `!` in the title and the `BREAKING CHANGE:` footer below so\nrelease-plz / conventional-changelog tooling bumps the next release as a\nmajor version.\n\nBreaking changes in the public surface:\n\n- `Block::write_into` / `Block::from_reader` / `Block::from_file` —\nsignature changed: a `BlockIdentity` parameter is now required (replaces\nthe previous separate `block_type: BlockType` argument on `write_into`;\nadded as a new arg on `from_reader` / `from_file`). All callers must\nconstruct a real `BlockIdentity` from their local context\n(`Writer::table_id`, `Table::metadata.id`, `GlobalTableId.tree_id()`,\netc.) or — in tests — use `BlockIdentity::for_test(table_id, offset,\nBlockType::*)`.\n- `Scanner::new` — added a required `table_id: TableId` parameter. The\nprevious arity-7 constructor is replaced; there is no compat shim\nbecause passing `0` defeats the AAD discriminator the field is for.\n- `BlockIndexWriter::use_table_id` / `FilterWriter::use_table_id` — new\nrequired trait methods. External implementors of these traits (reachable\nvia `lsm_tree::table::writer::index::BlockIndexWriter` /\n`lsm_tree::table::writer::filter::FilterWriter`) must add the\nimplementation. A default no-op was considered and rejected: returning\n`self` from `Box<Self> → Box<dyn Trait>` requires `where Self: Sized`,\nwhich makes the method object-unsafe and breaks every in-tree `Box<dyn\n…>` caller that chains `use_table_id` on the builder.\n\nNo deprecated shims for any of the above — `BlockIdentity` exists\nprecisely to force every call site to think about identity, and the\nprevious shim pattern (`aad: &[]` everywhere) is what `BlockIdentity` is\ndesigned to prevent.\n\nBREAKING CHANGE: BlockIdentity replaces the standalone `block_type`\nargument on Block::write_into / from_reader / from_file; Scanner::new\ngains a required table_id parameter; BlockIndexWriter and FilterWriter\ntrait surfaces gain a new required `use_table_id` method.\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n## Summary by CodeRabbit\n\n* **New Features**\n* Introduced a block identity context to bind ownership, block type and\ncompression metadata to on-disk blocks\n  * Exposed compression dictionary identifier for zstd-dictionary blocks\n\n* **Refactor**\n* Updated block read/write APIs and writers to propagate identity\nthroughout storage operations\n* Wired table IDs into scanners, writers, and block writers for stronger\nvalidation and auditability\n\n<!-- review_stack_entry_start -->\n\n[![Review Change\nStack](https://storage.googleapis.com/coderabbit_public_assets/review-stack-in-coderabbit-ui.svg)](https://app.coderabbit.ai/change-stack/structured-world/coordinode-lsm-tree/pull/294?utm_source=github_walkthrough&utm_medium=github&utm_campaign=change_stack)\n\n<!-- review_stack_entry_end -->\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-05-22T21:01:35+03:00",
+          "tree_id": "0c4337c1e9c8b2cf5a5ccea0a28ae5a0f8b6def0",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/5ecca9d498ad0603aa2cf99fb56d84e06087b613"
+        },
+        "date": 1779472948755,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 2003036.5433085593,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.7us | P99.9: 3.9us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1036679.1761533394,
+            "unit": "ops/sec",
+            "extra": "P50: 0.8us | P99: 2.5us | P99.9: 4.8us\nthreads: 1 | elapsed: 0.19s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 526479.3984886529,
+            "unit": "ops/sec",
+            "extra": "P50: 1.7us | P99: 5.0us | P99.9: 7.7us\nthreads: 1 | elapsed: 0.38s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3583610.415104287,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 3.3us | P99.9: 6.0us\nthreads: 1 | elapsed: 0.06s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 381907.26113133924,
+            "unit": "ops/sec",
+            "extra": "P50: 2.3us | P99: 5.8us | P99.9: 9.0us\nthreads: 1 | elapsed: 0.52s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 217494.77938037526,
+            "unit": "ops/sec",
+            "extra": "P50: 4.3us | P99: 5.3us | P99.9: 7.6us\nthreads: 1 | elapsed: 0.92s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1184711.9462940693,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.3us | P99.9: 4.5us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1146887.4561116993,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 1.5us | P99.9: 1.9us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 492432.83509742346,
+            "unit": "ops/sec",
+            "extra": "P50: 1.8us | P99: 5.4us | P99.9: 8.2us\nthreads: 1 | elapsed: 0.41s | num: 200000 | iterations: 3"
           }
         ]
       }
