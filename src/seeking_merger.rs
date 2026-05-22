@@ -139,6 +139,30 @@ pub struct SeekingMerger<S: MergeSource, C: UserComparator + Clone> {
     pending_forward_error: Option<crate::Error>,
     /// Mirror of `pending_forward_error` for the backward direction.
     pending_backward_error: Option<crate::Error>,
+    /// Tracks which direction yielded the last item so the next call
+    /// can detect a direction switch and call `MergeSource::seek` on
+    /// each source to reposition the opposite tournament.
+    last_direction: LastDirection,
+    /// User key of the most recent item yielded via `Iterator::next`.
+    /// Used as the boundary when switching from forward to backward —
+    /// the seek call repositions backward cursors to yield items <
+    /// this key.
+    last_emitted_forward_key: Option<crate::key::InternalKey>,
+    /// Mirror of `last_emitted_forward_key` for backward emissions.
+    /// Used as boundary when switching from backward to forward.
+    last_emitted_backward_key: Option<crate::key::InternalKey>,
+}
+
+/// Which direction yielded the most recent item, if any.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum LastDirection {
+    /// Neither direction has yielded yet — no direction switch on the
+    /// next call.
+    None,
+    /// Last item came from `Iterator::next`.
+    Forward,
+    /// Last item came from `DoubleEndedIterator::next_back`.
+    Backward,
 }
 
 impl<S: MergeSource, C: UserComparator + Clone> SeekingMerger<S, C> {
@@ -156,6 +180,49 @@ impl<S: MergeSource, C: UserComparator + Clone> SeekingMerger<S, C> {
             backward_tree: None,
             pending_forward_error: None,
             pending_backward_error: None,
+            last_direction: LastDirection::None,
+            last_emitted_forward_key: None,
+            last_emitted_backward_key: None,
+        }
+    }
+
+    /// Reposition every source for forward iteration past the last
+    /// item emitted backward.
+    ///
+    /// Called only when the previous yielded item came from
+    /// `next_back`. Tournaments are intentionally NOT dropped here:
+    ///
+    /// - For coherent sources (no-op seek), keeping `forward_tree`
+    ///   alive preserves prefetched values that the buffered-value
+    ///   migration in [`initialize_backward`] is designed to rescue.
+    /// - For independent-cursor sources where `seek` repositions the
+    ///   source past its already-emitted range (the contract in
+    ///   [`MergeSource::seek`]'s docs), the existing prefetches stay
+    ///   semantically valid — they're items the source produced
+    ///   before the seek, still meaningful in their original
+    ///   direction.
+    ///
+    /// `Iterator::next` will lazily build `forward_tree` from the
+    /// repositioned sources if it is currently `None`; if it already
+    /// holds prefetched leaves, those leaves continue to be merged
+    /// alongside freshly pulled items.
+    fn switch_to_forward(&mut self, boundary: &crate::key::InternalKey) {
+        for src in &mut self.sources {
+            if let Err(e) = src.seek(boundary) {
+                // Queue under the destination direction so it
+                // surfaces via the next `next()` call's error gate.
+                self.pending_forward_error.get_or_insert(e);
+            }
+        }
+    }
+
+    /// Mirror of [`switch_to_forward`] — reposition sources for
+    /// backward iteration past the last forward-emitted item.
+    fn switch_to_backward(&mut self, boundary: &crate::key::InternalKey) {
+        for src in &mut self.sources {
+            if let Err(e) = src.seek(boundary) {
+                self.pending_backward_error.get_or_insert(e);
+            }
         }
     }
 
@@ -246,6 +313,20 @@ impl<S: MergeSource, C: UserComparator + Clone> Iterator for SeekingMerger<S, C>
         if let Some(e) = self.pending_backward_error.take() {
             return Some(Err(e));
         }
+        // Direction-switch reconciliation: if the last yielded item
+        // came from backward, every source's forward cursor may be
+        // stale relative to what backward consumed. Seek each source
+        // past the backward boundary so the new forward step yields
+        // only items the backward direction did not already produce.
+        if self.last_direction == LastDirection::Backward
+            && let Some(boundary) = self.last_emitted_backward_key.clone()
+        {
+            self.switch_to_forward(&boundary);
+            if let Some(e) = self.pending_forward_error.take() {
+                return Some(Err(e));
+            }
+        }
+        self.last_direction = LastDirection::Forward;
         if self.forward_tree.is_none() {
             self.initialize_forward();
             // Init may have queued an error; surface it immediately
@@ -273,6 +354,7 @@ impl<S: MergeSource, C: UserComparator + Clone> Iterator for SeekingMerger<S, C>
                     source,
                     value: next_value,
                 });
+                self.last_emitted_forward_key = Some(old.value.key.clone());
                 Some(Ok(old.value))
             }
             Some(Err(e)) => {
@@ -283,6 +365,7 @@ impl<S: MergeSource, C: UserComparator + Clone> Iterator for SeekingMerger<S, C>
                 // (matches the init-path semantic).
                 let old = tree.pop_min()?;
                 self.pending_forward_error.get_or_insert(e);
+                self.last_emitted_forward_key = Some(old.value.key.clone());
                 Some(Ok(old.value))
             }
             None => {
@@ -291,6 +374,7 @@ impl<S: MergeSource, C: UserComparator + Clone> Iterator for SeekingMerger<S, C>
                 // still legitimately belongs to backward direction.
                 // Migration only happens at INIT.
                 let old = tree.pop_min()?;
+                self.last_emitted_forward_key = Some(old.value.key.clone());
                 Some(Ok(old.value))
             }
         }
@@ -312,6 +396,16 @@ impl<S: MergeSource, C: UserComparator + Clone> DoubleEndedIterator for SeekingM
         if let Some(e) = self.pending_forward_error.take() {
             return Some(Err(e));
         }
+        // Mirror of the forward-step's direction-switch reconciliation.
+        if self.last_direction == LastDirection::Forward
+            && let Some(boundary) = self.last_emitted_forward_key.clone()
+        {
+            self.switch_to_backward(&boundary);
+            if let Some(e) = self.pending_backward_error.take() {
+                return Some(Err(e));
+            }
+        }
+        self.last_direction = LastDirection::Backward;
         if self.backward_tree.is_none() {
             self.initialize_backward();
             if let Some(e) = self.pending_backward_error.take() {
@@ -331,15 +425,18 @@ impl<S: MergeSource, C: UserComparator + Clone> DoubleEndedIterator for SeekingM
                     source,
                     value: next_value,
                 });
+                self.last_emitted_backward_key = Some(old.value.key.clone());
                 Some(Ok(old.value))
             }
             Some(Err(e)) => {
                 let old = tree.pop_min()?;
                 self.pending_backward_error.get_or_insert(e);
+                self.last_emitted_backward_key = Some(old.value.key.clone());
                 Some(Ok(old.value))
             }
             None => {
                 let old = tree.pop_min()?;
+                self.last_emitted_backward_key = Some(old.value.key.clone());
                 Some(Ok(old.value))
             }
         }
@@ -777,6 +874,15 @@ mod tests {
             comparator: SharedComparator,
         ) -> Self {
             let items: Vec<_> = items.into_iter().collect();
+            // partition_point in seek() assumes ascending key order;
+            // enforce it in debug builds to catch test misuse early.
+            debug_assert!(
+                items
+                    .windows(2)
+                    .all(|w| w[0].key.compare_with(&w[1].key, comparator.as_ref())
+                        != Ordering::Greater),
+                "IndependentCursorSource items must be sorted ascending by key",
+            );
             let n = items.len();
             Self {
                 items,
@@ -828,6 +934,86 @@ mod tests {
             self.back_idx = self.back_idx.min(idx);
             Ok(())
         }
+    }
+
+    /// Source that records every `seek()` invocation. Wraps the
+    /// same `(front_idx, back_idx)` semantics as
+    /// [`IndependentCursorSource`] so we can assert that the merger
+    /// **does** call seek on direction switches without relying on
+    /// the source's internal coordination to make the test pass.
+    struct SeekCountingSource {
+        inner: IndependentCursorSource,
+        seek_count: alloc::sync::Arc<core::sync::atomic::AtomicUsize>,
+    }
+
+    impl MergeSource for SeekCountingSource {
+        fn next(&mut self) -> Option<IterItem> {
+            self.inner.next()
+        }
+        fn next_back(&mut self) -> Option<IterItem> {
+            self.inner.next_back()
+        }
+        fn seek(&mut self, target: &InternalKey) -> crate::Result<()> {
+            self.seek_count
+                .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            self.inner.seek(target)
+        }
+    }
+
+    #[test]
+    fn direction_switch_invokes_source_seek() {
+        // The merger MUST call source.seek() on every direction
+        // switch — without this, independent-cursor sources have no
+        // way to reconcile prefetched values between forward and
+        // backward streams. Test asserts the bookkeeping fires.
+        let cmp = comparator::default_comparator();
+        let seek_count = alloc::sync::Arc::new(core::sync::atomic::AtomicUsize::new(0));
+        let src = SeekCountingSource {
+            inner: IndependentCursorSource::new(
+                [
+                    make_iv(b"a", 0),
+                    make_iv(b"b", 0),
+                    make_iv(b"c", 0),
+                    make_iv(b"d", 0),
+                ],
+                cmp.clone(),
+            ),
+            seek_count: alloc::sync::Arc::clone(&seek_count),
+        };
+        let mut m = SeekingMerger::new(alloc::vec![src], cmp);
+
+        // Pre-switch: no seek calls expected (pure forward).
+        assert_eq!(k(&m.next().unwrap().unwrap()), "a");
+        assert_eq!(k(&m.next().unwrap().unwrap()), "b");
+        assert_eq!(
+            seek_count.load(core::sync::atomic::Ordering::Relaxed),
+            0,
+            "no seek before direction switch",
+        );
+
+        // Switch forward → backward: merger must seek every source.
+        let _ = m.next_back();
+        assert_eq!(
+            seek_count.load(core::sync::atomic::Ordering::Relaxed),
+            1,
+            "seek fired exactly once on forward → backward switch",
+        );
+
+        // Switch backward → forward: another seek call expected.
+        let _ = m.next();
+        assert_eq!(
+            seek_count.load(core::sync::atomic::Ordering::Relaxed),
+            2,
+            "seek fired again on backward → forward switch",
+        );
+
+        // Same-direction calls do NOT re-seek.
+        let _ = m.next();
+        assert_eq!(
+            seek_count.load(core::sync::atomic::Ordering::Relaxed),
+            2,
+            "consecutive same-direction calls do not re-seek",
+        );
     }
 
     #[test]
