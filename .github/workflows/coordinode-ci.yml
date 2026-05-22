@@ -24,9 +24,11 @@ on:
   # Without the input set (default), manual dispatch runs the
   # same reduced 2-target cross matrix that PRs do (aarch64-gnu
   # + i686-gnu) — useful for quick sanity-check re-runs.
-  # workflow_dispatch requires actions:write on the repo, so
-  # only owner / maintainers can fire it — fork PR authors
-  # cannot, full_cross_matrix has no fork-side attack surface.
+  # Triggering workflow_dispatch from the UI / API requires
+  # repository write access (not the workflow-token `actions:write`
+  # scope, which is a different thing). Fork PR authors don't
+  # have write on the upstream repo, so they can't fire this —
+  # full_cross_matrix has no fork-side attack surface.
   workflow_dispatch:
     inputs:
       full_cross_matrix:
