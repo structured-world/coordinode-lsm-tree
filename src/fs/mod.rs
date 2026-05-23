@@ -256,10 +256,10 @@ pub trait FsFile: Read + Write + Seek + Send + Sync {
     /// Advise the kernel about the expected access pattern for this file.
     ///
     /// Implementations translate the [`FileHint`] to the platform's
-    /// closest primitive (`posix_fadvise` on Linux, `fcntl(F_RDADVISE)`
-    /// on macOS, no-op on Windows / in-memory backends). The default
-    /// trait impl is a no-op so backends that have nothing useful to do
-    /// here don't need to override it.
+    /// closest primitive (`posix_fadvise` on Linux, no-op on macOS /
+    /// Windows / in-memory backends for now). The default trait impl
+    /// is a no-op so backends that have nothing useful to do here
+    /// don't need to override it.
     ///
     /// The hint is advisory — backends may ignore it — and only
     /// influences kernel readahead / page-cache eviction heuristics, not
