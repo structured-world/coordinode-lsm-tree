@@ -25,11 +25,15 @@
 
 mod aligned_buf;
 // `direct_io` is std-only (touches `std::fs::OpenOptions`). It is
-// intentionally not feature-gated here: its sole consumers `std_fs`
-// and `io_uring_fs` are themselves unconditionally std-bound, so the
-// effective unit of gating is the whole `fs::*` backend (tracked
-// under the no-std migration epic, issue #274). See the module
-// header in `direct_io.rs` for the full rationale.
+// gated behind the `std` feature so a `no_std + alloc` build of
+// this crate does not even attempt to compile it. The wider
+// `fs::*` backend (Fs / FsFile traits, std_fs, io_uring_fs)
+// still depends on `std::io::{Read, Write, Seek}` + `std::path::Path`
+// — those have no `core::*` equivalents, so feature-gating just
+// this submodule does not yet make a no-std build work end-to-end.
+// The full backend split is tracked under no-std migration epic
+// (issue #274); this gate is the first step.
+#[cfg(feature = "std")]
 mod direct_io;
 mod mem_fs;
 mod std_fs;
