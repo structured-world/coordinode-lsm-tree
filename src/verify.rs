@@ -808,37 +808,38 @@ mod block_verify_tests {
         );
     }
 
+    /// Returns the on-disk path of the first SST registered with the
+    /// tree's current version. Drops the tree before returning so the
+    /// caller can mutate the file safely (no descriptor cache, no
+    /// file lock). Going through `current_version().iter_tables()`
+    /// instead of a filesystem walk keeps the test coupled to the
+    /// verifier's actual input set — a new on-disk file under the
+    /// tree directory cannot accidentally become the corruption
+    /// target.
+    fn pick_first_sst_path(dir: &std::path::Path) -> std::path::PathBuf {
+        let tree = reopen_tree(dir);
+        let path = tree
+            .current_version()
+            .iter_tables()
+            .next()
+            .map(|table| (*table.path).clone())
+            .expect("at least one populated SST file");
+        drop(tree);
+        path
+    }
+
     #[test]
     fn verify_block_checksums_detects_flipped_byte_in_data_block() {
         use crate::table::block::Header;
         let dir = tempfile::tempdir().unwrap();
         populate_tree(dir.path(), 1_000);
 
-        // Find any SST file. The flip target is the first byte AFTER
-        // the first block's Header — that lands squarely inside the
-        // data segment of the first data block, so the header's own
-        // XXH3 stays valid (no HeaderCorrupted) but the data XXH3
-        // will now mismatch.
-        let mut sst_path: Option<std::path::PathBuf> = None;
-        for level_dir in std::fs::read_dir(dir.path()).unwrap().flatten() {
-            let p = level_dir.path();
-            if p.is_dir() {
-                for entry in std::fs::read_dir(&p).unwrap().flatten() {
-                    let ep = entry.path();
-                    if ep.is_file()
-                        && ep.metadata().unwrap().len() > Header::serialized_len() as u64 + 16
-                    {
-                        sst_path = Some(ep);
-                        break;
-                    }
-                }
-            }
-            if sst_path.is_some() {
-                break;
-            }
-        }
-        let sst_path = sst_path.expect("at least one populated SST file");
+        let sst_path = pick_first_sst_path(dir.path());
 
+        // The flip target is the first byte AFTER the first block's
+        // Header — that lands squarely inside the data segment of the
+        // first data block, so the header's own XXH3 stays valid (no
+        // HeaderCorrupted) but the data XXH3 will now mismatch.
         let flip_offset = Header::serialized_len() as u64;
         {
             let mut f = std::fs::OpenOptions::new()
