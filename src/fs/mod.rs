@@ -67,15 +67,27 @@ pub struct FsOpenOptions {
     /// When set, the caller is responsible for issuing reads and writes
     /// at offsets aligned to the filesystem's logical block size, with
     /// userspace buffers aligned to the same boundary and lengths that
-    /// are a multiple of that block size. See [`AlignedBuf`] for an
-    /// aligned heap buffer suitable for `O_DIRECT` I/O.
+    /// are a multiple of that block size.
     ///
-    /// Platforms other than Linux/Android treat this as a no-op: macOS
-    /// has no equivalent flag (use `F_NOCACHE` on the open file descriptor
-    /// instead, which is not yet wired here), and Windows requires
-    /// `FILE_FLAG_NO_BUFFERING` at `CreateFile` time (also not wired).
-    /// Callers should treat `direct_io` as a hint that may be silently
-    /// ignored — correctness must not depend on it.
+    /// `direct_io` is a HINT, not a guarantee. The flag is honoured only
+    /// on Linux and Android, and only on architectures where the
+    /// `asm-generic/fcntl.h` value `O_DIRECT = 0o40000` is authoritative
+    /// — `x86`, `x86_64`, `aarch64`, `riscv32`/`riscv64`, `loongarch64`,
+    /// `s390x`. On Linux
+    /// architectures with a divergent `O_DIRECT` bit (arm `0o200000`,
+    /// mips `0o100000`, parisc, sparc) the flag is silently dropped to
+    /// avoid passing the wrong bit to `open(2)`. Other platforms — macOS
+    /// (would need `F_NOCACHE` post-open via `fcntl`, not wired here),
+    /// Windows (would need `FILE_FLAG_NO_BUFFERING` at `CreateFile` time,
+    /// not wired here), other Unixes — also silently drop the flag.
+    ///
+    /// Callers must therefore treat `direct_io` as best-effort:
+    /// correctness must not depend on cache bypass being in effect, and
+    /// any alignment requirements imposed by the kernel only apply when
+    /// the flag is actually honoured (you cannot tell from this API
+    /// alone whether it was). See [`AlignedBuf`] for an aligned heap
+    /// buffer suitable for `O_DIRECT` reads and writes when the flag is
+    /// honoured.
     pub direct_io: bool,
 }
 

@@ -35,8 +35,10 @@ use core::slice;
 /// - `len <= capacity`.
 /// - `alignment` is a power of two ≥ 1 and ≤ `isize::MAX as usize`
 ///   (enforced at construction).
-/// - `capacity` is a power-of-two multiple of `alignment` (rounded
-///   up at construction).
+/// - `capacity` is an integer multiple of `alignment` (rounded up
+///   at construction from the caller's requested size). The
+///   multiplier itself is NOT required to be a power of two — e.g.
+///   `new_zeroed(9000, 4096)` yields `capacity = 12288 = 3 × 4096`.
 ///
 /// # `Send` + `Sync`
 ///
@@ -88,8 +90,7 @@ impl AlignedBuf {
     ///
     /// # Examples
     ///
-    /// ```ignore
-    /// # // ignored: AlignedBuf is pub(crate), not exposed publicly.
+    /// ```
     /// use lsm_tree::fs::AlignedBuf;
     /// let buf = AlignedBuf::new_zeroed(8192, 4096).unwrap();
     /// assert_eq!(buf.capacity(), 8192);
