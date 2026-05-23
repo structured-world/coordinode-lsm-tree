@@ -76,7 +76,13 @@ pub trait MergeSource: Send {
     /// cursor, or `None` if exhausted in the backward direction.
     fn next_back(&mut self) -> Option<IterItem>;
 
-    /// Reposition cursors for a subsequent direction switch.
+    /// User-initiated cursor reposition to a target key.
+    ///
+    /// `seek` is a public reposition primitive — typically called
+    /// once at the start of a range scan, but valid at any point
+    /// during iteration as an explicit jump. It is NOT the hook
+    /// `SeekingMerger` uses to handle direction switches (see the
+    /// paragraph on direction-switch handling below).
     ///
     /// Implementations with INDEPENDENT front/back cursors (LSM SST
     /// scanners, `RunReader`s) MUST reposition so that:
