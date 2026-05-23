@@ -666,7 +666,13 @@ impl Writer {
             section_name: "meta_mid",
             index_block_count,
             filter_block_count,
-            file_size: 0, // sentinel; reader recovers actual size from fs metadata
+            // MID and TAIL must encode the SAME file_size — recovery
+            // falls back transparently and downstream consumers
+            // (compaction window picking, etc.) read it as if it were
+            // authoritative. `self.meta.file_pos` is only ever bumped
+            // inside spill_block, so its value is identical at MID
+            // and TAIL write time.
+            file_size: *self.meta.file_pos,
             table_id: self.table_id,
             data_block_count: self.meta.data_block_count as u64,
             item_count: self.meta.item_count as u64,
