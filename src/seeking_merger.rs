@@ -374,7 +374,6 @@ mod tests {
     use crate::ValueType::Value;
     use crate::comparator::{self, SharedComparator};
     use crate::key::InternalKey;
-    use crate::merge_source::CoherentMergeSource;
     use alloc::collections::VecDeque;
     use test_log::test;
 
@@ -777,29 +776,29 @@ mod tests {
     /// the merger — is what makes mixed direction safe for
     /// `SeekingMerger` (see module-level docs).
     ///
-    /// `seek(target)` is implemented for trait conformance but is
-    /// **not** a usable repositioning primitive on this test double:
-    /// the clamp keeps the self-coordination invariant by collapsing
-    /// the window to empty after any call:
-    ///   - `front_idx` becomes `max(front_idx, partition_point<target)`
-    ///     — forced past or to the target;
-    ///   - `back_idx` becomes `min(back_idx, partition_point<target)`
-    ///     — forced at or before the target;
+    /// `seek(target)` is a deliberately conservative test-double
+    /// implementation: the clamp collapses the live window so the
+    /// source behaves as if exhausted after any seek. We pick this
+    /// over a hard cursor reset because the test suite never needs
+    /// real repositioning, and the conservative behaviour makes
+    /// reasoning about test outcomes simpler.
+    ///   - `front_idx` becomes `max(front_idx, partition_point<target)`;
+    ///   - `back_idx` becomes `min(back_idx, partition_point<target)`;
     ///   - combined: `front_idx >= back_idx`, so subsequent
     ///     `next()` / `next_back()` both return `None`.
     ///
-    /// This is correct for the merger's no-duplicates contract on
-    /// self-coordinating sources but is **not** the contract
-    /// [`MergeSource::seek`] documents for a general independent-
-    /// cursor implementation (real LSM scanners would hard-reset
-    /// the cursor at `target`). Production impls should treat
-    /// `MergeSource::seek` as a true reposition; this test double
-    /// is a self-coordinating shape only.
+    /// Production LSM scanners that implement
+    /// [`CoherentMergeSource`] are free to hard-reset their cursors
+    /// on `seek` — the marker's no-duplicates promise covers mixed
+    /// direction *without* an intervening user seek (see the trait
+    /// docs).
     ///
-    /// Unlike `VecSource` this does NOT implement
-    /// [`CoherentMergeSource`] — cursors aren't literally shared,
-    /// they're coordinated by index arithmetic on a single backing
-    /// `Vec`.
+    /// Implements [`CoherentMergeSource`] (impl below) via the
+    /// self-coordinating `(front_idx, back_idx)` window — cursors
+    /// aren't literally shared (as in `VecSource` / std `VecDeque`),
+    /// but the index arithmetic on a single backing `Vec` provides
+    /// the same no-duplicates-under-mixed-direction guarantee the
+    /// marker promises.
     struct IndependentCursorSource {
         items: Vec<crate::InternalValue>,
         front_idx: usize,

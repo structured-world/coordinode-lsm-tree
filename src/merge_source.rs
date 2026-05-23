@@ -98,10 +98,14 @@ pub trait MergeSource: Send {
     /// independent ones). `seek` is exposed for user-initiated
     /// repositioning — typically at the start of a range scan, but
     /// also valid mid-iteration as an explicit jump to a known
-    /// key. Note that calling `seek` on a source marked
-    /// [`CoherentMergeSource`] must preserve that marker's
-    /// no-duplicates promise (impls usually do this with a no-op
-    /// or a window-collapse rather than a hard cursor reset).
+    /// key.
+    ///
+    /// The [`CoherentMergeSource`] marker's no-duplicates promise
+    /// covers mixed `next` / `next_back` consumption WITHOUT an
+    /// intervening user-initiated `seek`. A user `seek` is an
+    /// explicit reposition, so observing previously-yielded items
+    /// after a seek is expected behaviour, not a contract
+    /// violation. Impls are free to hard-reset their cursors.
     ///
     /// Returns `Err` if seek requires I/O (SST scanner reseek, run
     /// header re-read) and that I/O fails. Corruption errors
@@ -136,13 +140,14 @@ pub trait MergeSource: Send {
 /// without the promise cannot use mixed direction through the
 /// merger.
 ///
-/// **What this marker says about `seek`:** the promise must hold
-/// even after `seek` is called. Impls typically satisfy this with
-/// a no-op `seek` (`CoherentIterSource`) or a clamp that
-/// collapses the live window (`IndependentCursorSource`-style).
-/// A truly position-resetting `seek` would break the marker's
-/// promise on the next mixed-direction step and so cannot
-/// coexist with `CoherentMergeSource`.
+/// **What this marker says about `seek`:** the no-duplicates
+/// promise covers mixed `next` / `next_back` consumption WITHOUT
+/// an intervening user-initiated `seek`. A user `seek` is an
+/// explicit reposition: observing previously-yielded items after
+/// a seek is expected behaviour, not a contract violation. Impls
+/// are free to hard-reset their cursors on `seek` — a production
+/// independent-cursor source typically will. The marker promise
+/// re-engages on the next forward / backward step pair.
 pub trait CoherentMergeSource: MergeSource {}
 
 /// Pass-through impl so callers can build `Vec<Box<dyn MergeSource +
