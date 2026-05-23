@@ -415,8 +415,12 @@ pub fn verify_block_checksums(tree: &impl crate::AbstractTree) -> BlockVerifyRep
 
         // Use each Table's own `Fs` handle (StdFs, MemFs, IoUring, …).
         // `std::fs::File::open` is wrong here: it skips the pluggable
-        // backend and produces NotFound on MemFs-only trees.
-        match scan_sst_blocks(&*table.fs, path, table_id) {
+        // backend and produces NotFound on MemFs-only trees. Encryption
+        // overhead is also per-table (different keys / AEAD suites can
+        // attach to different SSTs once #251 lands), so feed each
+        // table's `max_overhead()` separately.
+        let max_enc_overhead = table.encryption.as_ref().map_or(0u32, |e| e.max_overhead());
+        match scan_sst_blocks(&*table.fs, path, table_id, max_enc_overhead) {
             Ok(per_file) => {
                 report.blocks_scanned += per_file.blocks_scanned;
                 report.errors.extend(per_file.errors);
@@ -450,6 +454,7 @@ fn scan_sst_blocks(
     fs: &dyn crate::fs::Fs,
     path: &Path,
     table_id: TableId,
+    max_enc_overhead: u32,
 ) -> std::io::Result<PerFileScan> {
     use std::io::{BufReader, Seek, SeekFrom};
 
@@ -553,6 +558,7 @@ fn scan_sst_blocks(
             data_buf: &mut data_buf,
             blocks_scanned: &mut blocks_scanned,
             errors: &mut errors,
+            max_data_length: block_data_length_cap(max_enc_overhead),
         };
         walk_block_region(&mut ctx, start, end);
     }
@@ -573,15 +579,22 @@ fn scan_sst_blocks(
 /// and the writer-side source of truth.
 const RAW_FORMAT_SECTIONS: &[&[u8]] = &[b"linked_blob_files", b"table_version"];
 
-/// Hard upper bound on a single block's on-disk data segment length.
-/// Mirrors `table::block::MAX_DECOMPRESSION_SIZE` (256 MiB) — the
-/// scrub doesn't need to know the per-block encryption / compression
-/// overhead, so it uses the same cap as the read path as a single
-/// no-larger-than-256-MiB rule. A value above this is treated as
-/// `HeaderCorrupted` regardless of TOC bounds, defending against
-/// DoS-by-allocation if both the block header and the enclosing TOC
-/// entry are simultaneously corrupted / forged.
+/// Plaintext upper bound on a single block's on-disk data segment
+/// length, mirroring `table::block::MAX_DECOMPRESSION_SIZE` (256 MiB).
+/// Encrypted blocks legitimately exceed this by up to the AEAD
+/// provider's `max_overhead()`; see `block_data_length_cap` for the
+/// effective per-walk cap that adds that overhead in.
 const MAX_BLOCK_DATA_LENGTH: u64 = 256 * 1024 * 1024;
+
+/// Effective `data_length` cap for one scan, mirroring the size
+/// validation in `Block::from_file`: plaintext cap + the table's AEAD
+/// `max_overhead()` (0 when encryption is disabled). A value above
+/// this is treated as `HeaderCorrupted` regardless of TOC bounds,
+/// defending against DoS-by-allocation if both the block header and
+/// the enclosing TOC entry are simultaneously corrupted / forged.
+fn block_data_length_cap(max_enc_overhead: u32) -> u64 {
+    MAX_BLOCK_DATA_LENGTH + u64::from(max_enc_overhead)
+}
 
 /// Walks the contiguous block range `[start_offset, end_offset)`,
 /// decoding each block's header (which validates the header's own
@@ -601,6 +614,11 @@ struct WalkCtx<'a> {
     data_buf: &'a mut Vec<u8>,
     blocks_scanned: &'a mut usize,
     errors: &'a mut Vec<BlockVerifyError>,
+    /// Effective `data_length` cap (plaintext limit + AEAD overhead).
+    /// Matches the bound `Block::from_file` applies on the read path,
+    /// so the scrub does not false-flag legitimate encrypted blocks
+    /// near the 256 MiB plaintext limit as `HeaderCorrupted`.
+    max_data_length: u64,
 }
 
 fn walk_block_region(ctx: &mut WalkCtx<'_>, start_offset: u64, end_offset: u64) {
@@ -653,13 +671,14 @@ fn walk_block_region(ctx: &mut WalkCtx<'_>, start_offset: u64, end_offset: u64) 
         // Both bounds are reported as HeaderCorrupted — the header
         // was technically parseable but its length field is invalid.
         let data_length_u64 = u64::from(header.data_length);
-        if data_length_u64 > MAX_BLOCK_DATA_LENGTH {
+        if data_length_u64 > ctx.max_data_length {
             ctx.errors.push(BlockVerifyError::HeaderCorrupted {
                 table_id: ctx.table_id,
                 path: ctx.path.to_path_buf(),
                 offset,
                 reason: format!(
-                    "header data_length {data_length_u64} exceeds hard cap {MAX_BLOCK_DATA_LENGTH}",
+                    "header data_length {data_length_u64} exceeds hard cap {}",
+                    ctx.max_data_length,
                 ),
             });
             return;
