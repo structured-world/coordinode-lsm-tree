@@ -50,6 +50,11 @@ pub struct ParsedRegions {
     pub range_tombstones: Option<BlockHandle>,
     pub linked_blob_files: Option<BlockHandle>,
     pub metadata: BlockHandle,
+    /// Mid-file backup of the meta block, written between the filter
+    /// region and `linked_blob_files`. Absent on tables written before
+    /// the meta-mirror change; defends against torn-write at the file
+    /// tail because it lives at ~95% of the eventual file position.
+    pub metadata_mid: Option<BlockHandle>,
 }
 
 impl ParsedRegions {
@@ -74,6 +79,7 @@ impl ParsedRegions {
                     log::error!("Metadata should exist");
                     crate::Error::Unrecoverable
                 })?,
+            metadata_mid: toc.section(b"meta_mid").map(toc_entry_to_handle),
         })
     }
 }

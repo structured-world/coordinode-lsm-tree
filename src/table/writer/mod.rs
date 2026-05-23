@@ -802,6 +802,10 @@ struct MetaSectionParams<'a> {
     block_offset: u64,
 }
 
+fn meta_kv(key: &str, value: &[u8]) -> InternalValue {
+    InternalValue::from_components(key, value, 0, crate::ValueType::Value)
+}
+
 fn write_meta_section<W: std::io::Write + std::io::Seek>(
     file_writer: &mut sfa::Writer<ChecksummedWriter<W>>,
     block_buffer: &mut Vec<u8>,
@@ -810,10 +814,7 @@ fn write_meta_section<W: std::io::Write + std::io::Seek>(
 ) -> crate::Result<()> {
     file_writer.start(p.section_name)?;
 
-    fn meta(key: &str, value: &[u8]) -> InternalValue {
-        InternalValue::from_components(key, value, 0, crate::ValueType::Value)
-    }
-
+    let meta = meta_kv;
     let meta_items = [
         meta("block_count#data", &p.data_block_count.to_le_bytes()),
         meta(

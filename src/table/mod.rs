@@ -934,8 +934,37 @@ impl Table {
         let regions = ParsedRegions::parse_from_toc(trailer.toc())?;
 
         log::trace!("Reading meta block, with meta_ptr={:?}", regions.metadata);
-        let metadata =
-            ParsedMeta::load_with_handle(&*file, &regions.metadata, encryption.as_deref())?;
+        // TAIL first (authoritative copy with the real file_size).
+        // On any decode/decrypt/checksum failure fall back to the MID
+        // copy if present — it contains the same fields except a
+        // sentinel file_size==0, which the load path patches up from
+        // the on-disk file length.
+        let metadata = match ParsedMeta::load_with_handle(
+            &*file,
+            &regions.metadata,
+            encryption.as_deref(),
+        ) {
+            Ok(m) => m,
+            Err(tail_err) => {
+                if let Some(mid_handle) = regions.metadata_mid {
+                    log::warn!(
+                        "TAIL meta block unreadable for {} ({tail_err}); falling back to MID copy",
+                        file_path.display(),
+                    );
+                    let mut mid =
+                        ParsedMeta::load_with_handle(&*file, &mid_handle, encryption.as_deref())?;
+                    // MID writes file_size as a 0 sentinel because the
+                    // file isn't done growing when the section is
+                    // emitted. Recover the real on-disk size now.
+                    if mid.file_size == 0 {
+                        mid.file_size = std::fs::metadata(&*file_path)?.len();
+                    }
+                    mid
+                } else {
+                    return Err(tail_err);
+                }
+            }
+        };
 
         // Fail-fast: if this table was written with dictionary compression,
         // verify the caller provided the matching dictionary. Without this
