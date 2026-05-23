@@ -425,7 +425,13 @@ fn concurrent_encrypted_no_corruption() -> lsm_tree::Result<()> {
         let max_idx = Arc::clone(&writer_max_idx);
         handles.push(std::thread::spawn(move || {
             let mut i = 0u32;
-            while !stop.load(Ordering::Relaxed) {
+            // Acquire pairs with the main thread's Release store on
+            // stop — guarantees the worker eventually observes the
+            // termination signal. Relaxed would compile to the same
+            // load on x86 but allows the formal memory model to delay
+            // observation indefinitely, risking a join() hang on
+            // weaker targets (aarch64 / riscv).
+            while !stop.load(Ordering::Acquire) {
                 let key = format!("w{writer_id}_k{i:06}");
                 let val = format!("w{writer_id}_v{i:06}");
                 let seqno = seqno_gen.fetch_add(1, Ordering::Relaxed);
@@ -470,7 +476,9 @@ fn concurrent_encrypted_no_corruption() -> lsm_tree::Result<()> {
         let errors = Arc::clone(&worker_errors);
         handles.push(std::thread::spawn(move || {
             let mut i = 0u32;
-            while !stop.load(Ordering::Relaxed) {
+            // Acquire-load pairs with main's Release-store on stop
+            // (same rationale as the writer threads above).
+            while !stop.load(Ordering::Acquire) {
                 let writer_id = i % 4;
                 let key_idx = i / 4;
                 let key = format!("w{writer_id}_k{key_idx:06}");
@@ -500,7 +508,10 @@ fn concurrent_encrypted_no_corruption() -> lsm_tree::Result<()> {
 
     // Run for 2 seconds of mixed contention.
     std::thread::sleep(Duration::from_secs(2));
-    stop.store(true, Ordering::Relaxed);
+    // Release-store paired with Acquire-loads on every worker's stop
+    // check — establishes the happens-before edge that guarantees
+    // termination on weak-memory targets.
+    stop.store(true, Ordering::Release);
     for h in handles {
         h.join().expect("worker panic");
     }
@@ -547,14 +558,18 @@ fn concurrent_encrypted_no_corruption() -> lsm_tree::Result<()> {
             }
         }
     }
-    // Demand at least half the writer-side tally survives reopen. Anything
-    // lower means encrypted SST flush + recovery dropped a significant
-    // portion of committed writes, which is a real bug.
-    let min_expected = total_written / 2;
-    assert!(
-        found >= min_expected,
-        "post-reopen found only {found} of {total_written} committed writes \
-         (expected >= {min_expected}); encrypted concurrent writes failed to persist"
+    // After workers joined AND we called flush_active_memtable above,
+    // every counted insert must be readable post-reopen: workers only
+    // ever bump `writes_committed` AFTER a successful insert into the
+    // active memtable, the stop signal happens-before the main flush
+    // (via the Release/Acquire pair on `stop`), and the final flush
+    // seals every still-live memtable cell into an SST. Anything less
+    // than exact equality means encrypted SST flush + recovery dropped
+    // committed bytes, which is a real bug.
+    assert_eq!(
+        found, total_written,
+        "post-reopen found {found} of {total_written} committed writes \
+         (expected exact match); encrypted concurrent writes failed to persist"
     );
 
     Ok(())
