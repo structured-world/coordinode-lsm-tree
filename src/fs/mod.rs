@@ -163,6 +163,7 @@ pub struct FsDirEntry {
 /// on cold-path compaction reads and prevents readahead waste on
 /// point-read SST files.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum FileHint {
     /// No hint — leave the kernel's default caching / readahead policy in
     /// place. Use when the access pattern is unknown or genuinely mixed.
