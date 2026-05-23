@@ -269,6 +269,28 @@ pub enum BlockVerifyError {
         /// Checksum computed from the on-disk bytes.
         got: Checksum,
     },
+
+    /// The block header was successfully decoded (its own XXH3
+    /// matched) but the subsequent fixed-length read of the data
+    /// segment failed at the filesystem layer — truncated file,
+    /// unexpected EOF, transient I/O error. Distinct from
+    /// `HeaderCorrupted` because the header itself was clean: the
+    /// failure is on the bytes that should follow it.
+    DataReadError {
+        /// Table ID.
+        table_id: TableId,
+        /// Path to the SST file.
+        path: PathBuf,
+        /// File offset where the (clean) header sits; the read for
+        /// its data segment started at `offset + Header::serialized_len()`.
+        offset: u64,
+        /// Length the (clean) header advertised for the data segment.
+        data_length: u32,
+        /// String form of the underlying I/O error (the error type is
+        /// not preserved across the variant boundary to keep this
+        /// enum no-std-friendly down the line).
+        error: String,
+    },
 }
 
 impl std::fmt::Display for BlockVerifyError {
@@ -304,6 +326,18 @@ impl std::fmt::Display for BlockVerifyError {
                 f,
                 "SST table {table_id} at {}: block at offset {offset} ({data_length} bytes) data \
                  checksum mismatch, expected {expected}, got {got}",
+                path.display(),
+            ),
+            Self::DataReadError {
+                table_id,
+                path,
+                offset,
+                data_length,
+                error,
+            } => write!(
+                f,
+                "SST table {table_id} at {}: failed to read {data_length}-byte data segment for \
+                 block at offset {offset}: {error}",
                 path.display(),
             ),
         }
@@ -544,11 +578,19 @@ fn walk_block_region(ctx: &mut WalkCtx<'_>, start_offset: u64, end_offset: u64) 
         // bytes after the resize above) — full-slice access dodges
         // the crate-wide `#[deny(clippy::indexing_slicing)]`.
         if let Err(e) = ctx.reader.read_exact(ctx.data_buf.as_mut_slice()) {
-            ctx.errors.push(BlockVerifyError::HeaderCorrupted {
+            // Header was clean (XXH3 matched) but the data segment
+            // that should follow it could not be read in full —
+            // truncated SST, unexpected EOF, transient I/O.
+            // Semantically distinct from HeaderCorrupted; reported
+            // under its own variant so callers pattern-matching on
+            // the error kind aren't surprised to find post-header
+            // I/O failures bucketed with header-parse failures.
+            ctx.errors.push(BlockVerifyError::DataReadError {
                 table_id: ctx.table_id,
                 path: ctx.path.to_path_buf(),
                 offset,
-                reason: format!("data segment read failed: {e}"),
+                data_length: header.data_length,
+                error: format!("{e}"),
             });
             return;
         }
