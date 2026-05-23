@@ -2052,6 +2052,74 @@ fn meta_mid_and_tail_have_identical_created_at() -> crate::Result<()> {
     Ok(())
 }
 
+/// `meta_mid` and `meta` (TAIL) must encode the SAME `file_size`. The
+/// writer was stamping MID with a 0 sentinel and the reader was
+/// patching the value with `std::fs::metadata(path).len()` on MID
+/// fallback — that path (a) bypasses the pluggable `Fs` backend (so
+/// `Table::recover` would fail on MemFs / io_uring trees the moment it
+/// touched the MID fallback branch), and (b) reported the entire
+/// physical file length (including TOC, trailer, and the TAIL meta
+/// block itself), while TAIL stores `self.meta.file_pos` taken before
+/// any of those tail sections were written. Recovered tables therefore
+/// reported wildly different sizes depending on which meta copy survived.
+///
+/// `self.meta.file_pos` is only ever incremented inside `spill_block()`
+/// (data-block writes). The index/tli/filter/range-tombstone writes,
+/// the MID meta block itself, the linked_blob_files / table_version /
+/// meta_separator raw sections, and the TAIL meta block all leave it
+/// unchanged. So the value is identical at MID and TAIL write time —
+/// MID can encode it directly, no recovery-time patching, no
+/// `std::fs::metadata` call.
+#[test]
+fn meta_mid_and_tail_have_identical_file_size() -> crate::Result<()> {
+    use super::meta::ParsedMeta;
+    use super::regions::ParsedRegions;
+
+    let dir = tempfile::tempdir()?;
+    let file = dir.path().join("table");
+
+    let mut writer = Writer::new(file.clone(), 0, 0, Arc::new(StdFs))?;
+    for (i, key) in (b'a'..=b'e').enumerate() {
+        writer.write(InternalValue::from_components(
+            [key],
+            b"val",
+            (i as u64) + 1,
+            crate::ValueType::Value,
+        ))?;
+    }
+    #[expect(
+        clippy::unwrap_used,
+        reason = "finish() returns Some after writing data items"
+    )]
+    let _ = writer.finish()?.unwrap();
+
+    let mut f = std::fs::File::open(&file)?;
+    let trailer = sfa::Reader::from_reader(&mut f)?;
+    let regions = ParsedRegions::parse_from_toc(trailer.toc())?;
+
+    let tail = ParsedMeta::load_with_handle(&f, &regions.metadata, None)?;
+    let mid_handle = regions
+        .metadata_mid
+        .expect("writer must emit meta_mid alongside meta");
+    let mid = ParsedMeta::load_with_handle(&f, &mid_handle, None)?;
+
+    assert_eq!(
+        tail.file_size, mid.file_size,
+        "MID and TAIL meta copies must store an identical file_size \
+         (both observe the same `self.meta.file_pos` because no \
+         post-data section bumps it); observed tail={} mid={}",
+        tail.file_size, mid.file_size,
+    );
+    assert_ne!(
+        mid.file_size, 0,
+        "MID file_size must not be the legacy 0 sentinel — that pushed \
+         the recovery path through std::fs::metadata, which bypasses \
+         the pluggable Fs backend"
+    );
+
+    Ok(())
+}
+
 /// `bloom_may_contain_key` with full (non-partitioned) filter delegates to
 /// `bloom_may_contain_hash`. Both methods agree for full filters.
 #[test]
