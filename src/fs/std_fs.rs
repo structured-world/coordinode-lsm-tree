@@ -368,28 +368,47 @@ mod sys {
     #[cfg(not(target_os = "macos"))]
     const EINVAL: c_int = 22;
 
-    // Use posix_fadvise64 on Linux + Android to keep the off_t-sized
-    // arguments ABI-stable on 32-bit targets (where bare posix_fadvise
-    // uses a 32-bit off_t unless the caller opted into
-    // _FILE_OFFSET_BITS=64 — Rust FFI declarations don't get that
-    // define, so we'd pass 64-bit ints into a 32-bit-off_t syscall
-    // wrapper and corrupt the stack). posix_fadvise64 always takes
-    // int64_t arguments regardless of target pointer width.
+    // libc symbol selection (the 32-bit glibc trap):
     //
-    // BSD targets (freebsd / netbsd / dragonfly) don't ship a *64
-    // variant, but their off_t is unconditionally 64-bit, so the
-    // plain posix_fadvise is ABI-correct there.
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    // SAFETY: matches glibc / musl / bionic posix_fadvise64 ABI.
+    // Plain `posix_fadvise` on 32-bit glibc takes a 32-bit off_t
+    // unless the caller opts into `_FILE_OFFSET_BITS=64` — and Rust
+    // FFI declarations don't get that define. Passing i64 args into
+    // a 32-bit-off_t syscall wrapper corrupts the stack.
+    //
+    // `posix_fadvise64` always takes int64_t but is a glibc-only
+    // symbol; musl doesn't export it (the kernel sees the same
+    // syscall, but musl has no userspace wrapper). bionic (Android)
+    // does export it.
+    //
+    // Resolution by target:
+    // - 32-bit glibc Linux + 32-bit Android: posix_fadvise64
+    //   (otherwise stack corruption)
+    // - musl on any pointer width: posix_fadvise (musl is sane on
+    //   32-bit too — its plain wrapper takes 64-bit off_t)
+    // - 64-bit Linux/Android: posix_fadvise (off_t is always 64-bit)
+    // - BSDs (freebsd/netbsd/dragonfly): posix_fadvise (off_t is
+    //   always 64-bit, no *64 variant exists)
+    #[cfg(all(
+        any(target_os = "linux", target_os = "android"),
+        target_pointer_width = "32",
+        any(target_env = "gnu", target_env = "")
+    ))]
+    // SAFETY: matches glibc / bionic posix_fadvise64 ABI on 32-bit.
     unsafe extern "C" {
         fn posix_fadvise64(fd: c_int, offset: i64, len: i64, advice: c_int) -> c_int;
     }
 
     #[cfg(all(
         not(target_os = "macos"),
-        not(any(target_os = "linux", target_os = "android"))
+        not(all(
+            any(target_os = "linux", target_os = "android"),
+            target_pointer_width = "32",
+            any(target_env = "gnu", target_env = "")
+        ))
     ))]
-    // SAFETY: matches BSD posix_fadvise ABI (off_t is always 64-bit).
+    // SAFETY: matches POSIX posix_fadvise ABI (off_t is 64-bit on
+    // 64-bit Linux/Android, BSD, and on musl regardless of pointer
+    // width).
     unsafe extern "C" {
         fn posix_fadvise(fd: c_int, offset: i64, len: i64, advice: c_int) -> c_int;
     }
@@ -411,11 +430,19 @@ mod sys {
         // offset / len / advice are all valid inputs.
         #[expect(unsafe_code, reason = "posix_fadvise FFI call with valid fd")]
         let ret = unsafe {
-            #[cfg(any(target_os = "linux", target_os = "android"))]
+            #[cfg(all(
+                any(target_os = "linux", target_os = "android"),
+                target_pointer_width = "32",
+                any(target_env = "gnu", target_env = "")
+            ))]
             {
                 posix_fadvise64(fd, 0, 0, advice)
             }
-            #[cfg(not(any(target_os = "linux", target_os = "android")))]
+            #[cfg(not(all(
+                any(target_os = "linux", target_os = "android"),
+                target_pointer_width = "32",
+                any(target_env = "gnu", target_env = "")
+            )))]
             {
                 posix_fadvise(fd, 0, 0, advice)
             }
