@@ -116,6 +116,15 @@ impl Fs for StdFs {
             .truncate(opts.truncate)
             .append(opts.append);
 
+        // Gate matches the `mod direct_io;` declaration in `fs/mod.rs`
+        // — the submodule only exists when `feature = "std"` is on.
+        // Without the gate this site would fail to compile under
+        // `--no-default-features --features alloc` even before the
+        // wider std-bound surface of `StdFs` itself hits the trait
+        // signatures; keeping the cfg in sync prevents adding a
+        // resolution-time error on top of the type-checking ones
+        // already tracked under the no-std migration epic.
+        #[cfg(feature = "std")]
         super::direct_io::apply_direct_io_flag(&mut builder, opts.direct_io);
 
         let file = builder.open(path)?;
