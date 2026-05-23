@@ -107,14 +107,27 @@ impl FsFile for File {
 
 impl Fs for StdFs {
     fn open(&self, path: &Path, opts: &FsOpenOptions) -> io::Result<Box<dyn FsFile>> {
-        let file = OpenOptions::new()
+        let mut builder = OpenOptions::new();
+        builder
             .read(opts.read)
             .write(opts.write)
             .create(opts.create)
             .create_new(opts.create_new)
             .truncate(opts.truncate)
-            .append(opts.append)
-            .open(path)?;
+            .append(opts.append);
+
+        // Gate matches the `mod direct_io;` declaration in `fs/mod.rs`
+        // — the submodule only exists when `feature = "std"` is on.
+        // Without the gate this site would fail to compile under
+        // `--no-default-features --features alloc` even before the
+        // wider std-bound surface of `StdFs` itself hits the trait
+        // signatures; keeping the cfg in sync prevents adding a
+        // resolution-time error on top of the type-checking ones
+        // already tracked under the no-std migration epic.
+        #[cfg(feature = "std")]
+        super::direct_io::apply_direct_io_flag(&mut builder, opts.direct_io);
+
+        let file = builder.open(path)?;
         Ok(Box::new(file))
     }
 
@@ -771,6 +784,7 @@ mod tests {
         assert!(!opts.create_new);
         assert!(!opts.truncate);
         assert!(!opts.append);
+        assert!(!opts.direct_io);
     }
 
     #[test]
@@ -781,13 +795,15 @@ mod tests {
             .create(true)
             .create_new(false)
             .truncate(true)
-            .append(false);
+            .append(false)
+            .direct_io(true);
         assert!(opts.read);
         assert!(opts.write);
         assert!(opts.create);
         assert!(!opts.create_new);
         assert!(opts.truncate);
         assert!(!opts.append);
+        assert!(opts.direct_io);
     }
 
     #[test]
