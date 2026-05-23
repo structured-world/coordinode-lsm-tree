@@ -385,12 +385,15 @@ fn major_compaction_encrypted_round_trips() -> lsm_tree::Result<()> {
 //     committed value (`w{id}_v...` prefix) or `None`, never as garbage
 //     bytes (which would indicate AAD mismatch surfacing as silent
 //     wrong-data instead of a decrypt error)
-//   • after flush + reopen, AT LEAST 50% of each writer's committed
-//     range survives the round-trip through encrypted SST decoding.
-//     We assert a survival fraction rather than the exact writer tally
-//     because some final-burst inserts may not yet have been flushed
-//     to SST at the stop signal — they live in the dropped active
-//     memtable and are gone after reopen by design.
+//   • after the final flush + reopen, EVERY committed write survives
+//     the round-trip through encrypted SST decoding (exact-equality
+//     assertion against the writer-side tally). Workers only bump
+//     the writes_committed counter AFTER a successful insert into
+//     the active memtable, the stop signal happens-before the main
+//     flush via the Release/Acquire pair on `stop`, and the final
+//     flush_active_memtable seals every still-live memtable cell —
+//     so any post-reopen shortfall indicates real flush/recovery
+//     data loss, not a benign in-flight race.
 // ────────────────────────────────────────────────────────────────────────
 
 #[test]
