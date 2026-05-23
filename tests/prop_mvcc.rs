@@ -249,13 +249,10 @@ fn run_mvcc_test(ops: Vec<MvccOp>) -> Result<(), TestCaseError> {
 }
 
 proptest! {
-    // 32 cases (edit cases field below to increase for thorough local runs).
-    #![proptest_config(ProptestConfig {
-        cases: 32,
-        fork: false,
-        max_shrink_iters: 1000,
-        .. ProptestConfig::default()
-    })]
+    // Defaults: 32 cases + 1000 shrink iters.
+    // Override at run time via `PROPTEST_CASES` / `PROPTEST_MAX_SHRINK`
+    // env vars — see `common::proptest_config`.
+    #![proptest_config(common::proptest_config())]
 
     #[test]
     fn prop_mvcc_snapshot_consistency(ops in mvcc_ops_strategy()) {
