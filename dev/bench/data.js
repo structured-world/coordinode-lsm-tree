@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779558242672,
+  "lastUpdate": 1779559540960,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -8346,6 +8346,84 @@ window.BENCHMARK_DATA = {
             "value": 539603.8189370285,
             "unit": "ops/sec",
             "extra": "P50: 1.6us | P99: 6.2us | P99.9: 9.1us\nthreads: 1 | elapsed: 0.37s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "48408f822f65915e3afeebce4088a2af5748c341",
+          "message": "feat(fs): FileHint enum + FsFile::hint() primitive for posix_fadvise (#133 Phase 1a) (#307)\n\n## Summary\n\nPhases 1a + 1b of #133 (I/O performance epic). Adds the access-pattern\nhint primitive on the `FsFile` trait AND the first call site that uses\nit.\n\n## Scope\n\n#133 is split into 4 phases per the issue body (FileHint +\nposix_fadvise, O_DIRECT + AlignedBuf, adaptive block prefetching,\ncompaction I/O rate limiter). Phase 1 was further split during\nimplementation:\n\n- **Phase 1a — primitive** (commit `55de003b`): `FileHint` enum +\n`FsFile::hint()` trait method + platform glue (Linux/BSD route through\n`posix_fadvise`, macOS/Windows no-op for now).\n- **Phase 1a follow-up — ABI safety** (commits `363bb065`, `feda0611`):\n32-bit `posix_fadvise` ABI fix (route to `posix_fadvise64` on 32-bit\nglibc only — musl doesn't export the `64` symbol), `EINVAL → Ok(())`\nmapping per trait contract.\n- **Phase 1b — Scanner call site** (commit `b14324e`, merged here as\nnested PR #309): `Scanner::new` calls `hint(FileHint::Sequential)` on\nthe underlying file handle when opening a table for a forward iteration.\nCompaction inputs and flush outputs are not yet wired (deferred to Phase\n1b-cont).\n- **Phase 1c (separate PR #308)** — compaction readahead buffer bump\nfrom 32 KiB → 2 MiB default.\n\nOriginal split intent was \"Phase 1a primitive-only PR, Phase 1b call\nsites separate\". The Scanner site is small enough (one `hint()` call at\ntable open) that it landed on top of 1a rather than going through a\nsecond 5-line PR. Compaction sites are still pending and will land\nseparately because they touch the writer path more substantially.\n\n## Changes\n\n- `src/fs/mod.rs` — new `FileHint` enum (`Default` / `Sequential` /\n`Random` / `WriteOnce`) + `FsFile::hint()` trait method with default\n`Ok(())` impl so backends that have nothing useful to do here don't need\nto override it.\n- `src/fs/std_fs.rs` — Linux / BSD route through `posix_fadvise` (no\n`libc` dep added — declared the syscall directly, matches the existing\n`flock` pattern); 32-bit glibc routes through `posix_fadvise64` so the\noff_t / len arguments match the kernel ABI; macOS is a no-op (no\n`posix_fadvise`; `fcntl(F_RDADVISE)` needs a byte range and isn't a good\nfit for whole-file hints); Windows is a no-op (the equivalent\n`FILE_FLAG_SEQUENTIAL_SCAN` / `_RANDOM_ACCESS` flags must be set at\n`CreateFile` time, so we'd need to thread the hint through\n`FsOpenOptions` instead — deferred until Windows performance becomes a\nconcern).\n- `src/table/scanner.rs` — `Scanner::new` issues `FileHint::Sequential`\nto the kernel after opening the SST for read. Failures are non-fatal\n(the hint is best-effort; a kernel that returns `EINVAL` for the advice\nvalue falls through to default caching behaviour).\n- Smoke test exercising every `FileHint` variant against a real 64-KiB\nfile — catches any platform-specific glue regression.\n\n## Testing\n\n- `cargo nextest run --lib --all-features fs::std_fs` — pass (incl.\n`fadvise_accepts_every_hint_variant`).\n- `cargo nextest run --workspace` — full pass.\n- `cargo clippy --all-features --all-targets -- -D warnings` — clean.\n\nRefs #133.",
+          "timestamp": "2026-05-23T21:04:49+03:00",
+          "tree_id": "e6d8705fa89a6face15b67221752f36610a84cec",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/48408f822f65915e3afeebce4088a2af5748c341"
+        },
+        "date": 1779559539419,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 2082310.9837125486,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.6us | P99.9: 3.7us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1169879.3024409818,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.2us | P99.9: 4.4us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 642186.112496699,
+            "unit": "ops/sec",
+            "extra": "P50: 1.4us | P99: 4.7us | P99.9: 7.1us\nthreads: 1 | elapsed: 0.31s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3622884.1360352417,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 3.1us | P99.9: 5.5us\nthreads: 1 | elapsed: 0.06s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 445218.423034164,
+            "unit": "ops/sec",
+            "extra": "P50: 2.0us | P99: 5.4us | P99.9: 8.1us\nthreads: 1 | elapsed: 0.45s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 221151.51250567185,
+            "unit": "ops/sec",
+            "extra": "P50: 4.2us | P99: 5.4us | P99.9: 7.8us\nthreads: 1 | elapsed: 0.90s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1249138.5160082036,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.3us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1125040.8101522378,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.5us | P99.9: 1.9us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 532200.5041130902,
+            "unit": "ops/sec",
+            "extra": "P50: 1.7us | P99: 5.2us | P99.9: 7.7us\nthreads: 1 | elapsed: 0.38s | num: 200000 | iterations: 3"
           }
         ]
       }
