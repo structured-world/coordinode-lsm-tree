@@ -98,13 +98,19 @@ pub trait MergeSource: Send {
     /// explicit reposition.
     ///
     /// `SeekingMerger` does NOT invoke `seek()` on direction
-    /// switches — its two-tree architecture relies on the source's
-    /// own self-coordination (shared cursor state for coherent
-    /// sources, internal `(front_idx, back_idx)` window for
-    /// independent ones). `seek` is exposed for user-initiated
-    /// repositioning — typically at the start of a range scan, but
-    /// also valid mid-iteration as an explicit jump to a known
-    /// key.
+    /// switches — its two-tree architecture relies on the source
+    /// being [`CoherentMergeSource`] (either literally-shared
+    /// cursor state, or a self-coordinating index window — see
+    /// that marker's docs for the two flavours). Sources with
+    /// genuinely independent front/back cursors (no shared state,
+    /// no window guard — currently no in-tree impl, but a
+    /// straight-line file scanner with separate read offsets would
+    /// be the canonical example) must NOT implement
+    /// [`CoherentMergeSource`] and therefore cannot be used through
+    /// `SeekingMerger`'s `DoubleEndedIterator` impl. `seek` is
+    /// exposed for user-initiated repositioning — typically at the
+    /// start of a range scan, but also valid mid-iteration as an
+    /// explicit jump to a known key.
     ///
     /// The [`CoherentMergeSource`] marker's no-duplicates promise
     /// covers mixed `next` / `next_back` consumption WITHOUT an
@@ -136,10 +142,15 @@ pub trait MergeSource: Send {
 ///
 /// - **Self-coordinating index window**: an impl backed by a
 ///   sorted buffer plus `(front_idx, back_idx)` pointers that
-///   refuses to yield once `front_idx >= back_idx`. LSM SST
-///   scanners and future `RunReader` impls fit here. They're not
-///   literally sharing cursor state, but the index arithmetic
-///   gives the same no-duplicates guarantee.
+///   refuses to yield once `front_idx >= back_idx`. SST scanners
+///   and `RunReader`-style impls qualify ONLY IF they actually
+///   enforce a single shrinking window — i.e. `next()` advances
+///   `front_idx` and `next_back()` retreats `back_idx`, and either
+///   refuses to yield when the indices cross. An impl with two
+///   genuinely independent cursors (each side has its own offset
+///   that the other never reads) is NOT coherent and MUST NOT
+///   implement this marker, even though it might happen to behave
+///   correctly under a specific consumption pattern.
 ///
 /// **What this marker gates:** `SeekingMerger`'s
 /// `DoubleEndedIterator` impl is bounded on this trait — sources

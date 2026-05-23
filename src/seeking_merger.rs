@@ -11,13 +11,18 @@
 //! switches; the marker's promise is what keeps mixed direction
 //! safe. Two source families satisfy the marker:
 //!
-//! - **Coherent sources** (std `vec::IntoIter`, `VecDeque`,
-//!   `BTreeMap::range`, wrapped via `CoherentIterSource`) where
-//!   the cursor state is literally shared between the two methods.
+//! - **Coherent sources** (`alloc::vec::IntoIter`,
+//!   `alloc::collections::VecDeque`, range iterators from
+//!   `alloc::collections::BTreeMap`, wrapped via
+//!   `CoherentIterSource`) where the cursor state is literally
+//!   shared between the two methods.
 //! - **Self-coordinating index-window sources** that track a
 //!   `(front_idx, back_idx)` window internally and refuse to
-//!   yield once `front_idx >= back_idx`. LSM SST scanners and
-//!   future `RunReader` impls fit here.
+//!   yield once `front_idx >= back_idx`. SST scanners and
+//!   `RunReader`-style impls qualify ONLY when they actually
+//!   enforce that single shrinking window — an impl with two
+//!   genuinely independent cursors must NOT mark itself coherent
+//!   even if it happens to behave correctly on some workloads.
 //!
 //! Sources whose mixed direction would yield duplicates (truly
 //! independent cursors with no shared state and no window guard)
@@ -858,12 +863,19 @@ mod tests {
         }
 
         fn seek(&mut self, target: &InternalKey) -> crate::Result<()> {
-            // Clamping seek: enforces the self-coordination invariant
-            // by collapsing the window to empty (see struct docs).
-            // A production source would hard-reset cursors to `target`;
-            // this test double cannot, without risking already-emitted
-            // items being re-yielded — which would break the no-
-            // duplicates property under mixed direction.
+            // Clamping seek: nudges the existing window toward
+            // `target` without ever expanding it. A production
+            // independent-cursor source would hard-reset its cursors
+            // to `target` (the no-duplicates promise on
+            // [`CoherentMergeSource`] is scoped to direction switches
+            // *without* an intervening user `seek`, so re-yielding
+            // previously-emitted items here would be allowed). This
+            // test double sticks with clamping because the seeking
+            // merger tests it backs do not exercise post-seek
+            // direction switches — there's no behaviour to verify
+            // that hard-reset would express, and clamping keeps the
+            // assertion footprint smaller (the window's invariant
+            // never changes across the seek call).
             let idx = self.items.partition_point(|v| {
                 v.key.compare_with(target, self.comparator.as_ref()) == Ordering::Less
             });
