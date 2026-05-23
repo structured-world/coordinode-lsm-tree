@@ -122,7 +122,7 @@ fn stress_cell(compression: CompressionType, encrypt: bool) -> lsm_tree::Result<
     {
         let tree = open_tree(dir.path(), compression, encrypt)?;
 
-        // Step 1: initial inserts at seqno=1+i (1..1001). seqno=0 is a
+        // Step 1: initial inserts at seqno=1+i (1..=1000). seqno=0 is a
         // sentinel meaning "compacted final" in the engine, so writes
         // start at 1.
         for i in 0u32..1000 {
