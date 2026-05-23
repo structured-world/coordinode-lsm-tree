@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779539695847,
+  "lastUpdate": 1779554683537,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -8190,6 +8190,84 @@ window.BENCHMARK_DATA = {
             "value": 507668.1922425828,
             "unit": "ops/sec",
             "extra": "P50: 1.7us | P99: 5.1us | P99.9: 7.5us\nthreads: 1 | elapsed: 0.39s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "b6bee99ed43bfcd89910d9311dae38467a2983ca",
+          "message": "feat(seeking-merger): allow self-coordinating independent-cursor sources via broadened CoherentMergeSource (#280) (#305)\n\n## Summary\n\nCloses #280. Broadens the [`CoherentMergeSource`] marker's semantics so\nthe `DoubleEndedIterator` bound on `SeekingMerger` covers both\nliterally-shared-cursor sources (`CoherentIterSource`) and\nself-coordinating index-window sources (LSM SST scanners with\n`(front_idx, back_idx)` arithmetic).\n\n## Note on the bound\n\nEarlier rounds of this PR experimented with relaxing the bound to `S:\nMergeSource`. That turned out structurally incompatible with the\ntwo-tree merger (the migration logic in `initialize_*` would lose\nbuffered prefetches). The final design KEEPS the `S:\nCoherentMergeSource` bound and broadens what the marker means:\n\n- **Before this PR**: marker = \"literally shared cursor state\" — only\nstd iterators and `CoherentIterSource` qualified.\n- **After this PR**: marker = \"no item yielded twice under mixed\ndirection (without an intervening user seek)\" — qualifies on cursor\ncoherence OR self-coordinating window arithmetic.\n\nLSM SST scanners and future `RunReader` impls implement the marker via\nthe window-arithmetic flavour. The merger does NOT invoke\n`MergeSource::seek` on direction switches; `seek` is exposed for\nuser-initiated repositioning.\n\n## What this PR does NOT do\n\nThe original issue described wiring `MergeSource::seek` into the\ndirection-switch path RocksDB-style. Initial implementation revealed a\nstructural incompatibility with the two-tree merger architecture\n(pre-emptive seek clamps the destination tree's source cursor before the\ntournament can populate edge leaves). Reverted in 89da2349. Documented\nin module-level docs as a deliberate non-choice.\n\n## Changes\n\n- `src/seeking_merger.rs`\n- New `IndependentCursorSource` test double (sorted `Vec` + `front_idx`\n/ `back_idx` window + clamping `seek` + sorted-order `debug_assert`)\n- `IndependentCursorSource: CoherentMergeSource` impl — satisfies the\nbroadened marker promise via window arithmetic\n- New regression tests:\n`switch_to_backward_after_drain_emits_no_duplicates`,\n`mid_stream_alternation_emits_no_duplicates_independent_cursor`,\n`direction_switch_invokes_source_seek` (removed in revert) — final set\nasserts the no-duplicates property on the new source shape\n- Module-level + struct-level docs rewritten to describe the two\nsupported source families and document why seek-on-switch was rejected\n\n- `src/merge_source.rs`\n- `CoherentMergeSource` doc rewritten: marker promise spans both\nshared-state and window-coordinated sources; explicitly scopes the\nno-duplicates guarantee to mixed direction WITHOUT an intervening user\nseek\n- `MergeSource::seek` doc clarifies that a user seek is an explicit\nreposition; observing previously-yielded items after a seek is expected,\nnot a contract violation\n\n## Testing\n\n- 18/18 `seeking_merger` tests pass\n- 1370/1370 workspace tests pass\n- Clippy clean (`--all-features --all-targets -- -D warnings`)\n\nCloses #280.\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n## Summary by CodeRabbit\n\n* **Documentation**\n* Clarified mixed-direction iterator safety: specified which source\nbehaviors guarantee no-duplicates, distinguished two coherence models\n(shared cursor state vs. self-coordinating shrinking window), and\nexplained how user-initiated repositioning affects the guarantee and\nmarker semantics.\n\n* **Tests**\n* Added a test double modeling independent front/back cursors plus two\nregression tests verifying mixed forward/back iteration emits each item\nexactly once.\n\n<!-- review_stack_entry_start -->\n\n[![Review Change\nStack](https://storage.googleapis.com/coderabbit_public_assets/review-stack-in-coderabbit-ui.svg)](https://app.coderabbit.ai/change-stack/structured-world/coordinode-lsm-tree/pull/305?utm_source=github_walkthrough&utm_medium=github&utm_campaign=change_stack)\n\n<!-- review_stack_entry_end -->\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-05-23T19:43:46+03:00",
+          "tree_id": "35acba1c6ccc5aa668ebf56e555ad27782e452d1",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/b6bee99ed43bfcd89910d9311dae38467a2983ca"
+        },
+        "date": 1779554682040,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 2018997.5963631715,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.6us | P99.9: 3.7us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1139492.6508108126,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.3us | P99.9: 4.4us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 638970.104917837,
+            "unit": "ops/sec",
+            "extra": "P50: 1.4us | P99: 4.6us | P99.9: 7.0us\nthreads: 1 | elapsed: 0.31s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3665711.0524524027,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 3.0us | P99.9: 5.4us\nthreads: 1 | elapsed: 0.05s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 441565.8618720386,
+            "unit": "ops/sec",
+            "extra": "P50: 2.0us | P99: 5.4us | P99.9: 8.2us\nthreads: 1 | elapsed: 0.45s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 222145.86328414935,
+            "unit": "ops/sec",
+            "extra": "P50: 4.2us | P99: 5.2us | P99.9: 7.7us\nthreads: 1 | elapsed: 0.90s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1201954.5632207997,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.2us | P99.9: 4.3us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1150281.2023438497,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 1.5us | P99.9: 1.9us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 534535.2493831309,
+            "unit": "ops/sec",
+            "extra": "P50: 1.7us | P99: 5.1us | P99.9: 7.6us\nthreads: 1 | elapsed: 0.37s | num: 200000 | iterations: 3"
           }
         ]
       }
