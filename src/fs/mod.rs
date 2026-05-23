@@ -56,6 +56,7 @@ use std::path::{Path, PathBuf};
     reason = "mirrors std::fs::OpenOptions which uses bool flags for each mode"
 )]
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct FsOpenOptions {
     /// Open for reading.
     pub read: bool,

@@ -2,7 +2,7 @@
 // Copyright (c) 2026-present, Structured World Foundation
 
 //! `O_DIRECT` flag application shared between [`StdFs`] and
-//! [`IoUringFs`] backends.
+//! `IoUringFs` backends.
 //!
 //! Lives here (rather than inline in each backend's `open()`) so the
 //! arch-gating list and the `O_DIRECT` bit value are defined in
@@ -19,7 +19,7 @@
 //!
 //! This module touches `std::fs::OpenOptions` directly, so it is
 //! std-only. No `#[cfg(feature = "std")]` gate is added here on
-//! purpose: its sole consumers — [`StdFs`] and [`IoUringFs`] —
+//! purpose: its sole consumers — [`StdFs`] and `IoUringFs` —
 //! are themselves unconditionally std-bound today (the entire
 //! `fs::*` backend builds on `std::fs`). Gating *only* this module
 //! while leaving the consumers ungated would be a no-op — the std
@@ -31,7 +31,6 @@
 //! (and `io_uring_fs`) and this module follows automatically.
 //!
 //! [`StdFs`]: super::StdFs
-//! [`IoUringFs`]: super::IoUringFs
 
 #[cfg(all(
     any(target_os = "linux", target_os = "android"),

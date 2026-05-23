@@ -125,13 +125,18 @@ impl AlignedBuf {
         // never dereferenced — every read/write path is bounded by
         // `len`, which is 0 here.
         if rounded == 0 {
-            // SAFETY: alignment is a power of two ≥ 1, so casting it
-            // to a pointer is well-defined and the pointer is non-
-            // null. We never deref past `len = 0`.
+            // SAFETY: alignment is a power of two ≥ 1, so the
+            // resulting pointer is non-null and properly aligned.
+            // `without_provenance_mut` constructs an address-only
+            // pointer (no provenance, no associated allocation) —
+            // exactly right for a sentinel that must never be
+            // dereferenced. We never deref past `len = 0`. Strict-
+            // provenance-friendly: avoids the integer-to-pointer
+            // cast lint by using the canonical exposed-address API.
             let dangling = {
                 #[expect(unsafe_code, reason = "non-null dangling for 0-cap buffer")]
                 unsafe {
-                    NonNull::new_unchecked(alignment as *mut u8)
+                    NonNull::new_unchecked(core::ptr::without_provenance_mut::<u8>(alignment))
                 }
             };
             return Some(Self {
