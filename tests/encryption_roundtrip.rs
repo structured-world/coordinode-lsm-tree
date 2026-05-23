@@ -171,8 +171,10 @@ mod encrypted {
 
         // Flip bytes inside the first data block. The SFA writer puts
         // the data section as the very first section at file offset 0;
-        // a data block starts with a 16-byte `Header`, then encrypted
-        // payload. Offset 64 lands well inside the payload of the
+        // a data block starts with a `Header` (33 bytes, exposed as
+        // `Header::serialized_len()`: magic[4] + type[1] + checksum[16]
+        // + lengths[8] + CRC[4]), then encrypted payload. Offset 64
+        // lands well inside the payload of the
         // first (and for this tiny one-KV table, only) data block,
         // regardless of meta-block layout near the tail. Picking a
         // layout-independent offset avoids re-introducing this test

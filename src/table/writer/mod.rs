@@ -658,6 +658,10 @@ impl Writer {
         #[expect(clippy::expect_used, reason = "non-empty table guaranteed earlier")]
         let last_key = self.meta.last_key.as_ref().expect("last_key should exist");
         let range_tombstone_count = self.range_tombstones.len() as u64;
+        // Snapshot the wall-clock once — both MID and TAIL copies
+        // must report the SAME created_at so MID-fallback recovery
+        // produces the same timestamp as a clean TAIL recovery.
+        let created_at_nanos = unix_timestamp().as_nanos();
         let mut meta_params = MetaSectionParams {
             section_name: "meta_mid",
             index_block_count,
@@ -684,6 +688,7 @@ impl Writer {
             initial_level: self.initial_level,
             range_tombstone_count,
             block_offset: *self.meta.file_pos,
+            created_at_nanos,
         };
 
         // MID meta copy — defends against torn-write at the file tail
@@ -800,6 +805,12 @@ struct MetaSectionParams<'a> {
     initial_level: u8,
     range_tombstone_count: u64,
     block_offset: u64,
+    /// `created_at` snapshot taken once in `finish()`. Both MID and
+    /// TAIL writes consume this same value; generating it inside
+    /// `write_meta_section` per call would stamp the two copies with
+    /// different wall-clock readings and shift TTL/FIFO ordering on
+    /// MID-fallback recovery.
+    created_at_nanos: u128,
 }
 
 fn meta_kv(key: &str, value: &[u8]) -> InternalValue {
@@ -835,7 +846,7 @@ fn write_meta_section<W: std::io::Write + std::io::Seek>(
             &p.index_block_compression.encode_into_vec(),
         ),
         meta("crate_version", env!("CARGO_PKG_VERSION").as_bytes()),
-        meta("created_at", &unix_timestamp().as_nanos().to_le_bytes()),
+        meta("created_at", &p.created_at_nanos.to_le_bytes()),
         meta(
             "data_block_hash_ratio",
             &p.data_block_hash_ratio.to_le_bytes(),
