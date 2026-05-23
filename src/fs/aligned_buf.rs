@@ -207,11 +207,20 @@ impl AlignedBuf {
         }
     }
 
-    /// Mut slice over the full `capacity` (NOT just `len`). Caller
-    /// is responsible for updating `len` via [`Self::set_len`]
-    /// after writing.
+    /// Mut slice over the FULL `capacity` — including bytes already
+    /// in the `0..len` written region.
+    ///
+    /// Named `as_capacity_mut` (not `spare_capacity_mut`) because
+    /// `spare_capacity` in `Vec` / `BytesMut` means the tail
+    /// `len..capacity` only. This method intentionally exposes the
+    /// entire allocation: `O_DIRECT` kernel reads need to overwrite
+    /// already-buffered bytes when refilling a recycled buffer, so
+    /// the right primitive is "full buffer", not "tail beyond len".
+    ///
+    /// Caller is responsible for updating `len` via
+    /// [`Self::set_len`] after writing.
     #[must_use]
-    pub const fn spare_capacity_mut(&mut self) -> &mut [u8] {
+    pub const fn as_capacity_mut(&mut self) -> &mut [u8] {
         // SAFETY: `ptr` is valid for writes of `capacity` bytes by
         // invariant; the lifetime is tied to `&mut self`.
         #[expect(unsafe_code, reason = "mut slice over owned aligned allocation")]
@@ -294,10 +303,11 @@ mod tests {
 
     #[test]
     fn new_zeroed_returns_zeroed_memory() {
-        let buf = AlignedBuf::new_zeroed(4096, 4096).unwrap();
-        // Spare slice covers the full capacity; every byte must be zero.
-        let slice = unsafe { slice::from_raw_parts(buf.as_ptr(), buf.capacity()) };
-        assert!(slice.iter().all(|&b| b == 0));
+        let mut buf = AlignedBuf::new_zeroed(4096, 4096).unwrap();
+        // `as_capacity_mut` covers the full capacity — safe API,
+        // no need for raw-pointer slicing in tests.
+        let cap = buf.as_capacity_mut();
+        assert!(cap.iter().all(|&b| b == 0));
     }
 
     #[test]
@@ -350,12 +360,12 @@ mod tests {
     }
 
     #[test]
-    fn spare_capacity_mut_covers_full_capacity() {
+    fn as_capacity_mut_covers_full_capacity() {
         let mut buf = AlignedBuf::new_zeroed(4096, 4096).unwrap();
-        let spare = buf.spare_capacity_mut();
-        assert_eq!(spare.len(), 4096);
-        *spare.first_mut().unwrap() = 0xAB;
-        *spare.last_mut().unwrap() = 0xCD;
+        let cap = buf.as_capacity_mut();
+        assert_eq!(cap.len(), 4096);
+        *cap.first_mut().unwrap() = 0xAB;
+        *cap.last_mut().unwrap() = 0xCD;
         buf.set_len(4096);
         let slice = buf.as_slice();
         assert_eq!(slice.first().copied(), Some(0xAB));
@@ -374,7 +384,7 @@ mod tests {
         let initial = buf.as_ptr();
         // Write some content + set_len; pointer must not move
         // (no reallocation: AlignedBuf has no growth API).
-        *buf.spare_capacity_mut().first_mut().unwrap() = 1;
+        *buf.as_capacity_mut().first_mut().unwrap() = 1;
         buf.set_len(1);
         assert_eq!(buf.as_ptr(), initial);
     }
