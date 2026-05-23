@@ -330,3 +330,43 @@ fn memfs_create_checkpoint_with_dot_prefixed_relative_target() -> lsm_tree::Resu
     assert!(info.sst_files >= 1);
     Ok(())
 }
+
+/// Regression: `verify::verify_block_checksums` must use each Table's
+/// pluggable [`Fs`] backend, not `std::fs::File::open` directly.
+/// Before the fix, the scrub opened SSTs through `std::fs` which has
+/// no view of `MemFs` and so reported every table as `SstFileUnreadable`
+/// (zero blocks scanned).
+#[test]
+fn memfs_verify_block_checksums_scans_via_fs_backend() -> lsm_tree::Result<()> {
+    use lsm_tree::verify::verify_block_checksums;
+
+    let (_dir, src_path) = test_path("verify_block_memfs");
+    let mem_fs: Arc<dyn lsm_tree::fs::Fs> = Arc::new(MemFs::new());
+    let tree = Config::new(
+        src_path,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(Arc::clone(&mem_fs))
+    .open()?;
+
+    for i in 0u32..32 {
+        tree.insert(format!("k{i:03}"), b"v", u64::from(i));
+    }
+    tree.flush_active_memtable(0)?;
+
+    let report = verify_block_checksums(&tree);
+
+    assert_eq!(report.sst_files_scanned, 1, "exactly one SST was flushed");
+    assert!(
+        report.blocks_scanned > 0,
+        "blocks_scanned must be > 0 — if zero, scan_sst_blocks is still \
+         bypassing the Fs backend with std::fs::File::open",
+    );
+    assert!(
+        report.is_ok(),
+        "freshly written MemFs SST must be checksum-clean; got errors: {:?}",
+        report.errors,
+    );
+    Ok(())
+}
