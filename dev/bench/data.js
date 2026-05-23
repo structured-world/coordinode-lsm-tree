@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779520906441,
+  "lastUpdate": 1779539695847,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -8112,6 +8112,84 @@ window.BENCHMARK_DATA = {
             "value": 534536.1094255925,
             "unit": "ops/sec",
             "extra": "P50: 1.7us | P99: 5.2us | P99.9: 7.6us\nthreads: 1 | elapsed: 0.37s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "aa695382ad2e4a6c3c89e0480da61ea3dfc05f5b",
+          "message": "perf(table/scanner): bump compaction readahead 32 KiB → 2 MiB (#133 Phase 1c) (#308)\n\n## Summary\n\nPhase 1c of #133 (I/O performance epic). One-line bump of the\nsequential-scan `BufReader` capacity in `Scanner::new`.\n\n## Context\n\nThe original fjall default was 32 KiB (`8 * 4_096`), causing one read\nsyscall every ~8 typical 4 KiB data blocks during full-table scans\n(compaction input, range scans spanning whole SSTs).\n\n2 MiB matches RocksDB's default `compaction_readahead_size` and is large\nenough that the kernel folds the sequential-scan readahead heuristic\ninto a single big userspace fill per ~500 blocks instead of one syscall\nevery 8.\n\n## Trade-offs\n\n- **Memory**: +~2 MB per concurrent `Scanner`. Compaction concurrency is\nbounded by the scheduler, so the working-set cost is small and\npredictable.\n- **HDD tuning**: 2 MiB is a reasonable middle ground for SSD/NVMe. A\nconfigurable knob for HDD-heavy workloads is tracked as a follow-up\nunder #133 (alongside other I/O knobs in the epic).\n- **Phase 1a primitive interaction**: This is orthogonal to the\n`FileHint` primitive added in #307. That one is the *kernel* readahead\nhint via `posix_fadvise`; this is the *userspace* prefetch buffer. They\ncompose — Phase 1b (call-site wiring) will apply `Sequential` hints to\nthe same Scanner-opened files.\n\n## Testing\n\n- `cargo nextest run --workspace` — 1368/1368 pass.\n- `cargo clippy --all-features --all-targets -- -D warnings` — clean.\n\nRefs #133.\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n\n## Summary by CodeRabbit\n\n* **Chores**\n* Optimized readahead buffer configuration for table scanning operations\nto improve data reading performance.\n\n<!-- review_stack_entry_start -->\n\n[![Review Change\nStack](https://storage.googleapis.com/coderabbit_public_assets/review-stack-in-coderabbit-ui.svg)](https://app.coderabbit.ai/change-stack/structured-world/coordinode-lsm-tree/pull/308?utm_source=github_walkthrough&utm_medium=github&utm_campaign=change_stack)\n\n<!-- review_stack_entry_end -->\n\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-05-23T15:34:04+03:00",
+          "tree_id": "cab9f6359c6a03ef785c1ecf7d2d1ae60bb8a93a",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/aa695382ad2e4a6c3c89e0480da61ea3dfc05f5b"
+        },
+        "date": 1779539694440,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 1940008.4211885545,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.6us | P99.9: 3.8us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1119044.0516950455,
+            "unit": "ops/sec",
+            "extra": "P50: 0.8us | P99: 2.3us | P99.9: 4.4us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 630423.8635303306,
+            "unit": "ops/sec",
+            "extra": "P50: 1.4us | P99: 4.6us | P99.9: 6.9us\nthreads: 1 | elapsed: 0.32s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3640593.41017279,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 2.9us | P99.9: 5.3us\nthreads: 1 | elapsed: 0.05s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 437836.09283617313,
+            "unit": "ops/sec",
+            "extra": "P50: 2.0us | P99: 5.2us | P99.9: 7.9us\nthreads: 1 | elapsed: 0.46s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 223637.8388084744,
+            "unit": "ops/sec",
+            "extra": "P50: 4.2us | P99: 5.2us | P99.9: 7.5us\nthreads: 1 | elapsed: 0.89s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1165950.8379510865,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.2us | P99.9: 4.2us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1117866.4338642748,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.5us | P99.9: 2.0us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 507668.1922425828,
+            "unit": "ops/sec",
+            "extra": "P50: 1.7us | P99: 5.1us | P99.9: 7.5us\nthreads: 1 | elapsed: 0.39s | num: 200000 | iterations: 3"
           }
         ]
       }
