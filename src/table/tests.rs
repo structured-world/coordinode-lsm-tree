@@ -2001,6 +2001,57 @@ fn meta_seqno_kv_max_corruption_returns_invalid_data() -> crate::Result<()> {
     Ok(())
 }
 
+/// `meta_mid` and `meta` (TAIL) must encode the SAME `created_at`. The
+/// writer was generating `unix_timestamp()` independently inside each
+/// `write_meta_section` call, so MID and TAIL would observe slightly
+/// different wall-clock values. After recovery via MID the table would
+/// report a different creation time than after recovery via TAIL,
+/// which silently shifts TTL / FIFO ordering depending on which copy
+/// the reader fell back to.
+#[test]
+fn meta_mid_and_tail_have_identical_created_at() -> crate::Result<()> {
+    use super::meta::ParsedMeta;
+    use super::regions::ParsedRegions;
+
+    let dir = tempfile::tempdir()?;
+    let file = dir.path().join("table");
+
+    let mut writer = Writer::new(file.clone(), 0, 0, Arc::new(StdFs))?;
+    for (i, key) in (b'a'..=b'e').enumerate() {
+        writer.write(InternalValue::from_components(
+            [key],
+            b"val",
+            (i as u64) + 1,
+            crate::ValueType::Value,
+        ))?;
+    }
+    #[expect(
+        clippy::unwrap_used,
+        reason = "finish() returns Some after writing data items"
+    )]
+    let _ = writer.finish()?.unwrap();
+
+    let mut f = std::fs::File::open(&file)?;
+    let trailer = sfa::Reader::from_reader(&mut f)?;
+    let regions = ParsedRegions::parse_from_toc(trailer.toc())?;
+
+    let tail = ParsedMeta::load_with_handle(&f, &regions.metadata, None)?;
+    let mid_handle = regions
+        .metadata_mid
+        .expect("writer must emit meta_mid alongside meta");
+    let mid = ParsedMeta::load_with_handle(&f, &mid_handle, None)?;
+
+    assert_eq!(
+        tail.created_at, mid.created_at,
+        "MID and TAIL meta copies must share an identical created_at \
+         (writer must snapshot the timestamp once and pass it to both \
+         write_meta_section calls; observed tail={:?} mid={:?})",
+        tail.created_at, mid.created_at,
+    );
+
+    Ok(())
+}
+
 /// `bloom_may_contain_key` with full (non-partitioned) filter delegates to
 /// `bloom_may_contain_hash`. Both methods agree for full filters.
 #[test]
