@@ -450,19 +450,32 @@ fn scan_sst_blocks(path: &Path, table_id: TableId) -> std::io::Result<PerFileSca
         )
     })?;
     let toc = sfa_reader.toc();
-    // SFA TOC layout: the first call to `sfa::Writer::start()` for a
-    // named section flushes everything written before it as an
-    // UNNAMED TOC entry (name == b"", pos == 0, len == data_block
-    // region size) — that's how the data blocks (which are written
-    // before any named section starts) appear in the TOC. Subsequent
-    // entries are named (`index`, `filter`, `range_tombstones`,
-    // `meta`, `linked_blob_files`, `table_version`).
+    // SFA TOC layout for an SST. The writer opens the file and
+    // immediately calls `sfa::Writer::start("data")`, so the first
+    // TOC entry is named (not unnamed) and covers the data-block
+    // region. Other named sections, in writer order:
     //
-    // Block-formatted sections that the per-block walk understands:
-    // empty (data blocks), `index`, `filter`, `range_tombstones`,
-    // `meta`. Raw-format sections (`linked_blob_files`, the 1-byte
-    // `table_version`) are skipped — their integrity is covered by
-    // the SFA-trailer checksum verified at table-open time.
+    //   - `data`              : block-format (data blocks)
+    //   - `tli`               : block-format (top-level index, both
+    //                           full and partitioned variants)
+    //   - `index`             : block-format (partitioned index leaf
+    //                           blocks; absent for full-index tables)
+    //   - `filter_tli`        : block-format (top-level filter for
+    //                           partitioned filters; absent for full
+    //                           filters)
+    //   - `filter`            : block-format (filter blocks)
+    //   - `range_tombstones`  : block-format (optional)
+    //   - `linked_blob_files` : RAW length-prefixed list of u64s
+    //   - `table_version`     : RAW single byte
+    //   - `meta`              : block-format (metadata)
+    //
+    // Block-format sections are walked block-by-block (each block
+    // prefixed with the standard `Header`). Raw-format sections are
+    // skipped — their integrity is covered by the SFA-trailer
+    // checksum verified at table-open time. New section names default
+    // to "walk" (must be added to `RAW_FORMAT_SECTIONS` if they're
+    // raw), so a forgotten-to-handle section fails loud rather than
+    // silently passing a corruption.
 
     let mut reader = BufReader::with_capacity(64 * 1024, file);
     let mut blocks_scanned: usize = 0;
@@ -501,11 +514,22 @@ fn scan_sst_blocks(path: &Path, table_id: TableId) -> std::io::Result<PerFileSca
 /// SFA TOC section names whose payload is NOT a sequence of `Block`s
 /// (i.e. NOT prefixed with the standard `Header`). The scrub skips
 /// these sections — their integrity is covered by the SFA-trailer
-/// checksum verified at table-open time. Every other section (the
-/// unnamed leading data-block region, plus `index`, `filter`,
-/// `range_tombstones`, `meta`) is a `Header`-prefixed block run and
-/// gets walked.
+/// checksum verified at table-open time. Every other section
+/// (`data` / `tli` / `index` / `filter_tli` / `filter` /
+/// `range_tombstones` / `meta`) is a `Header`-prefixed block run and
+/// gets walked. See `scan_sst_blocks` for the full section catalogue
+/// and the writer-side source of truth.
 const RAW_FORMAT_SECTIONS: &[&[u8]] = &[b"linked_blob_files", b"table_version"];
+
+/// Hard upper bound on a single block's on-disk data segment length.
+/// Mirrors `table::block::MAX_DECOMPRESSION_SIZE` (256 MiB) — the
+/// scrub doesn't need to know the per-block encryption / compression
+/// overhead, so it uses the same cap as the read path as a single
+/// no-larger-than-256-MiB rule. A value above this is treated as
+/// `HeaderCorrupted` regardless of TOC bounds, defending against
+/// DoS-by-allocation if both the block header and the enclosing TOC
+/// entry are simultaneously corrupted / forged.
+const MAX_BLOCK_DATA_LENGTH: u64 = 256 * 1024 * 1024;
 
 /// Walks the contiguous block range `[start_offset, end_offset)`,
 /// decoding each block's header (which validates the header's own
@@ -547,18 +571,47 @@ fn walk_block_region(ctx: &mut WalkCtx<'_>, start_offset: u64, end_offset: u64) 
             }
         };
 
-        // Validate data_length against the remaining bytes in this
-        // section BEFORE allocating / reading. Header::decode_from
-        // already verified the header's own XXH3, so a data_length
-        // value that overruns the section bounds is either (a) genuine
-        // corruption that flipped bits past the XXH3-covered prefix
-        // *and* happened to still produce a valid header digest (rare
-        // but possible), or (b) a deliberate fuzz input. Either way,
-        // honouring it would read past `end_offset` into the next
-        // section and could trigger a multi-GB allocation if the
-        // length field is junk. Stop the region with HeaderCorrupted
-        // instead.
+        // Count the block as "header-read" immediately on successful
+        // decode — matches the BlockVerifyReport.blocks_scanned docs
+        // ("includes blocks where the data checksum subsequently
+        // failed"). Without this early increment, blocks that emit
+        // DataReadError / data-length-bounds HeaderCorrupted would
+        // be silently uncounted, contradicting the documented
+        // semantics.
+        *ctx.blocks_scanned = ctx.blocks_scanned.saturating_add(1);
+
+        // Validate data_length against TWO bounds before allocating
+        // / reading:
+        //
+        // 1. Hard cap (MAX_BLOCK_DATA_LENGTH = 256 MiB, mirroring
+        //    table::block::MAX_DECOMPRESSION_SIZE). Catches the case
+        //    where BOTH the block header AND the enclosing TOC entry
+        //    are simultaneously corrupted/forged so that `remaining`
+        //    becomes arbitrarily large. Without this, a forged TOC
+        //    entry with len=u64::MAX could let the section-bounds
+        //    check pass and trigger a multi-GB Vec::resize.
+        //
+        // 2. Remaining bytes in this TOC section. Header::decode_from
+        //    already verified the header's own XXH3, so a data_length
+        //    that overruns the section bounds is either bit-flip
+        //    corruption that happened to keep the header digest
+        //    valid (rare but possible), or fuzz input. Honouring it
+        //    would read past `end_offset` into the next section.
+        //
+        // Both bounds are reported as HeaderCorrupted — the header
+        // was technically parseable but its length field is invalid.
         let data_length_u64 = u64::from(header.data_length);
+        if data_length_u64 > MAX_BLOCK_DATA_LENGTH {
+            ctx.errors.push(BlockVerifyError::HeaderCorrupted {
+                table_id: ctx.table_id,
+                path: ctx.path.to_path_buf(),
+                offset,
+                reason: format!(
+                    "header data_length {data_length_u64} exceeds hard cap {MAX_BLOCK_DATA_LENGTH}",
+                ),
+            });
+            return;
+        }
         let remaining = end_offset.saturating_sub(offset).saturating_sub(header_len);
         if data_length_u64 > remaining {
             ctx.errors.push(BlockVerifyError::HeaderCorrupted {
@@ -607,7 +660,9 @@ fn walk_block_region(ctx: &mut WalkCtx<'_>, start_offset: u64, end_offset: u64) 
             });
         }
 
-        *ctx.blocks_scanned = ctx.blocks_scanned.saturating_add(1);
+        // blocks_scanned was already incremented right after a
+        // successful Header::decode_from above — do not double-count
+        // here.
         offset = offset
             .saturating_add(header_len)
             .saturating_add(data_length_u64);
