@@ -18,17 +18,19 @@
 //! # `std` dependency
 //!
 //! This module touches `std::fs::OpenOptions` directly, so it is
-//! std-only. No `#[cfg(feature = "std")]` gate is added here on
-//! purpose: its sole consumers — [`StdFs`] and `IoUringFs` —
-//! are themselves unconditionally std-bound today (the entire
-//! `fs::*` backend builds on `std::fs`). Gating *only* this module
-//! while leaving the consumers ungated would be a no-op — the std
-//! backend would still compile and drag this module in
-//! transitively, then fail. The unit of gating is the whole
-//! `fs::*` std backend; that move is tracked under the no-std
-//! migration epic (issue `#274`), where the
-//! `#[cfg(feature = "std")]` gate will land on `pub mod fs::std_fs`
-//! (and `io_uring_fs`) and this module follows automatically.
+//! std-only and the parent `mod direct_io;` declaration in
+//! `fs/mod.rs` is gated behind `#[cfg(feature = "std")]`. That gate
+//! is the first concrete honest step toward the no-std backend
+//! split, but it does NOT by itself unblock a `no_std + alloc`
+//! build: the wider `Fs` / `FsFile` trait surface (`std::io::{Read,
+//! Write, Seek}`, `std::path::Path`) is std-bound at the trait
+//! definition level, so even `MemFs` (alloc-only in its body) can't
+//! compile under `--no-default-features --features alloc`. Porting
+//! the traits off `std::io` / `std::path` is tracked separately
+//! (issue `#311`), as a prerequisite for the rest of `fs::*` to
+//! become honestly feature-gateable. When that lands, this module's
+//! gate becomes load-bearing; until then it's a forward-looking
+//! marker that keeps new std-side helpers honest with the policy.
 //!
 //! [`StdFs`]: super::StdFs
 

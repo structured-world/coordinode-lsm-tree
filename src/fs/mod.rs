@@ -31,8 +31,9 @@ mod aligned_buf;
 // still depends on `std::io::{Read, Write, Seek}` + `std::path::Path`
 // — those have no `core::*` equivalents, so feature-gating just
 // this submodule does not yet make a no-std build work end-to-end.
-// The full backend split is tracked under no-std migration epic
-// (issue #274); this gate is the first step.
+// Porting the traits off std::io / std::path is tracked as #311
+// (prerequisite); the wider no-std migration epic is #274. This
+// gate is the first concrete step.
 #[cfg(feature = "std")]
 mod direct_io;
 mod mem_fs;
