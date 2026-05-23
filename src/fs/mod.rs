@@ -23,8 +23,11 @@
 //! - **macOS / BSD**: no batched I/O API exists (`dispatch_io` and `kqueue`
 //!   do not help for storage I/O patterns); [`StdFs`] is the correct choice
 
+pub mod aligned_buf;
 mod mem_fs;
 mod std_fs;
+
+pub use aligned_buf::AlignedBuf;
 
 #[cfg(all(target_os = "linux", feature = "io-uring"))]
 mod io_uring_fs;
