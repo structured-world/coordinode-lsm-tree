@@ -4,12 +4,24 @@
 //! Seekable source iterator trait for the merge-iterator path.
 //!
 //! `MergeSource` is what `SeekingMerger` consumes: a stream that
-//! can be advanced in either direction AND repositioned to a
-//! specific key. The seek primitive is what makes RocksDB-style
-//! direction switching possible — without it, a backward-only path
-//! cannot recover from prior forward consumption on iterators whose
-//! front and back cursors don't share state (LSM SST scanners
-//! empirically don't).
+//! can be advanced in either direction, AND that exposes a key-
+//! addressed [`MergeSource::seek`] primitive whose strength varies
+//! by source flavour. Independent-cursor sources MUST treat `seek`
+//! as a real reposition (the only way they can maintain the
+//! no-duplicates invariant under mixed direction); coherent-cursor
+//! sources (see [`CoherentMergeSource`]) MAY treat it as a no-op
+//! because their shared `next`/`next_back` cursor discipline
+//! already enforces no-duplicates without external reseek (the
+//! `CoherentIterSource` adapter ships such a no-op `seek`).
+//!
+//! `SeekingMerger` itself does NOT invoke [`MergeSource::seek`] on
+//! direction switches — its two-tree architecture relies on each
+//! source's own `(front_idx, back_idx)` window (or equivalent
+//! self-coordination between `next` and `next_back`) to keep mixed
+//! direction duplicate-free. The seek primitive is exposed on the
+//! trait for user-initiated repositioning (range scan starting
+//! key, jump to a known key, etc.), not as a direction-switch
+//! reconciliation mechanism.
 //!
 //! # Contract
 //!
@@ -26,24 +38,21 @@
 //!     * the next `next_back()` yields the first item with `key < target`
 //!
 //!     If no such item exists in a direction, that direction returns
-//!     `None` on the next call. Repositioning is the only way for
-//!     `SeekingMerger` to guarantee the no-overlap invariant when
-//!     direction switches.
+//!     `None` on the next call. NOTE: `SeekingMerger` does NOT call
+//!     `seek` on direction switches — its two-tree architecture
+//!     relies on the source's own `(front_idx, back_idx)` window
+//!     (or equivalent self-coordination) to keep mixed direction
+//!     duplicate-free. `seek` is exposed here for user-initiated
+//!     repositioning (range scan starting key, etc.).
 //!
 //!   **Coherent-cursor sources** (those marked [`CoherentMergeSource`]
 //!   — `alloc::vec::IntoIter`, `alloc::collections::VecDeque`, range
 //!   iterators from `alloc::collections::BTreeMap`, and our
-//!   `CoherentIterSource` wrapper) — seek
-//!   MAY be a no-op. The shared front/back cursor discipline
-//!   already maintains the "no item yielded twice" invariant for
-//!   mixed-direction consumption without any explicit reposition;
-//!   the no-op satisfies the contract trivially. The current MVP
-//!   `SeekingMerger` does NOT actually invoke `seek()` — its
-//!   `DoubleEndedIterator` impl is type-gated on
-//!   `CoherentMergeSource` and relies on the marker's coherence
-//!   promise. The seek-aware direction-switch path that would
-//!   exercise `seek()` for independent-cursor sources is the
-//!   follow-up tracked as issue #280.
+//!   `CoherentIterSource` wrapper) — seek MAY be a no-op. The shared
+//!   front/back cursor discipline already maintains the "no item
+//!   yielded twice" invariant for mixed-direction consumption
+//!   without any explicit reposition; the no-op satisfies the
+//!   contract trivially.
 //!
 //! # Why a custom trait, not just `DoubleEndedIterator + Seek`
 //!
@@ -75,7 +84,13 @@ pub trait MergeSource: Send {
     /// cursor, or `None` if exhausted in the backward direction.
     fn next_back(&mut self) -> Option<IterItem>;
 
-    /// Reposition cursors for a subsequent direction switch.
+    /// User-initiated cursor reposition to a target key.
+    ///
+    /// `seek` is a public reposition primitive — typically called
+    /// once at the start of a range scan, but valid at any point
+    /// during iteration as an explicit jump. It is NOT the hook
+    /// `SeekingMerger` uses to handle direction switches (see the
+    /// paragraph on direction-switch handling below).
     ///
     /// Implementations with INDEPENDENT front/back cursors (LSM SST
     /// scanners, `RunReader`s) MUST reposition so that:
@@ -90,13 +105,27 @@ pub trait MergeSource: Send {
     /// twice" under mixed-direction consumption without any
     /// explicit reposition.
     ///
-    /// The current MVP `SeekingMerger` does NOT actually invoke
-    /// `seek()` at all — `DoubleEndedIterator` is type-gated on
-    /// `CoherentMergeSource` and relies on the marker's coherence
-    /// promise. Once the seek-aware direction-switch path (issue
-    /// #280) lands, `SeekingMerger` WILL invoke `seek()` on
-    /// non-coherent sources at the direction-switch boundary;
-    /// coherent sources will still pay nothing for the no-op.
+    /// `SeekingMerger` does NOT invoke `seek()` on direction
+    /// switches — its two-tree architecture relies on the source
+    /// being [`CoherentMergeSource`] (either literally-shared
+    /// cursor state, or a self-coordinating index window — see
+    /// that marker's docs for the two flavours). Sources with
+    /// genuinely independent front/back cursors (no shared state,
+    /// no window guard — currently no in-tree impl, but a
+    /// straight-line file scanner with separate read offsets would
+    /// be the canonical example) must NOT implement
+    /// [`CoherentMergeSource`] and therefore cannot be used through
+    /// `SeekingMerger`'s `DoubleEndedIterator` impl. `seek` is
+    /// exposed for user-initiated repositioning — typically at the
+    /// start of a range scan, but also valid mid-iteration as an
+    /// explicit jump to a known key.
+    ///
+    /// The [`CoherentMergeSource`] marker's no-duplicates promise
+    /// covers mixed `next` / `next_back` consumption WITHOUT an
+    /// intervening user-initiated `seek`. A user `seek` is an
+    /// explicit reposition, so observing previously-yielded items
+    /// after a seek is expected behaviour, not a contract
+    /// violation. Impls are free to hard-reset their cursors.
     ///
     /// Returns `Err` if seek requires I/O (SST scanner reseek, run
     /// header re-read) and that I/O fails. Corruption errors
@@ -106,26 +135,44 @@ pub trait MergeSource: Send {
     fn seek(&mut self, target: &InternalKey) -> crate::Result<()>;
 }
 
-/// Marker for `MergeSource` impls whose `next()` and `next_back()`
-/// share cursor state.
+/// Marker that promises a `MergeSource` impl's `next()` and
+/// `next_back()` will never yield the same item twice under mixed
+/// forward/backward consumption — regardless of HOW the impl
+/// achieves that.
 ///
-/// Such sources guarantee that mixed forward/backward consumption
-/// never yields the same item twice. Iterators backed by
-/// `alloc::vec::IntoIter`, `alloc::collections::VecDeque`, or
-/// range iterators from `alloc::collections::BTreeMap` qualify
-/// (their `DoubleEndedIterator` impls shrink a single remaining
-/// range from both ends).
+/// Two flavours qualify:
 ///
-/// **Why a marker trait:** `SeekingMerger` can skip seek-based
-/// reseeks for sources whose front/back cursors already shrink a
-/// single shared remaining range. Sources with independent cursors
-/// (LSM SST scanners, run readers — the intended follow-up impls)
-/// should implement `MergeSource` with a real `seek`, but MUST NOT
-/// implement `CoherentMergeSource` unless mixed forward/backward
-/// consumption already guarantees no item is yielded twice. The
-/// marker is the type-system encoding of that promise — without
-/// it, `SeekingMerger`'s `DoubleEndedIterator` impl is unavailable
-/// at compile time.
+/// - **Literally shared cursor state**: `alloc::vec::IntoIter`,
+///   `alloc::collections::VecDeque`, range iterators from
+///   `alloc::collections::BTreeMap`. Their `DoubleEndedIterator`
+///   impls shrink a single remaining range from both ends.
+///   `CoherentIterSource` wraps these.
+///
+/// - **Self-coordinating index window**: an impl backed by a
+///   sorted buffer plus `(front_idx, back_idx)` pointers that
+///   refuses to yield once `front_idx >= back_idx`. SST scanners
+///   and `RunReader`-style impls qualify ONLY IF they actually
+///   enforce a single shrinking window — i.e. `next()` advances
+///   `front_idx` and `next_back()` retreats `back_idx`, and either
+///   refuses to yield when the indices cross. An impl with two
+///   genuinely independent cursors (each side has its own offset
+///   that the other never reads) is NOT coherent and MUST NOT
+///   implement this marker, even though it might happen to behave
+///   correctly under a specific consumption pattern.
+///
+/// **What this marker gates:** `SeekingMerger`'s
+/// `DoubleEndedIterator` impl is bounded on this trait — sources
+/// without the promise cannot use mixed direction through the
+/// merger.
+///
+/// **What this marker says about `seek`:** the no-duplicates
+/// promise covers mixed `next` / `next_back` consumption WITHOUT
+/// an intervening user-initiated `seek`. A user `seek` is an
+/// explicit reposition: observing previously-yielded items after
+/// a seek is expected behaviour, not a contract violation. Impls
+/// are free to hard-reset their cursors on `seek` — a production
+/// independent-cursor source typically will. The marker promise
+/// re-engages on the next forward / backward step pair.
 pub trait CoherentMergeSource: MergeSource {}
 
 /// Pass-through impl so callers can build `Vec<Box<dyn MergeSource +
