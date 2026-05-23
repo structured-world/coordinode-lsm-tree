@@ -35,12 +35,15 @@ pub struct Scanner {
 }
 
 impl Scanner {
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "scanner ctor takes one local per piece of state it needs to thread \
-                  through fetch_next_block; collapsing them into a config struct would \
-                  add an indirection without removing any per-call decision the caller \
-                  makes about the values"
+    #[cfg_attr(
+        zstd_any,
+        expect(
+            clippy::too_many_arguments,
+            reason = "scanner ctor takes one local per piece of state it needs to thread \
+                      through fetch_next_block; collapsing them into a config struct would \
+                      add an indirection without removing any per-call decision the caller \
+                      makes about the values"
+        )
     )]
     pub fn new(
         path: &Path,
