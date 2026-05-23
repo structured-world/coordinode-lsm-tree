@@ -7,6 +7,7 @@ use crate::{
     CompressionType, InternalValue, SeqNo,
     comparator::SharedComparator,
     encryption::EncryptionProvider,
+    fs::{FileHint, FsFile},
     table::{block::BlockType, iter::OwnedDataBlockIter},
 };
 use std::{fs::File, io::BufReader, path::Path, sync::Arc};
@@ -62,7 +63,15 @@ impl Scanner {
         // tuning beyond this would benefit from a configurable knob,
         // tracked as the configurable-readahead follow-up under #133.
         const SCANNER_READAHEAD_BYTES: usize = 2 * 1024 * 1024;
-        let mut reader = BufReader::with_capacity(SCANNER_READAHEAD_BYTES, File::open(path)?);
+        let file = File::open(path)?;
+        // The scanner walks every block in order — tell the kernel so
+        // it can ramp readahead aggressively and evict already-read
+        // pages instead of pinning them. Best-effort: hint() is
+        // advisory and any failure here would just leave the kernel
+        // on the default heuristic, so drop the error rather than
+        // failing the open.
+        let _ = file.hint(FileHint::Sequential);
+        let mut reader = BufReader::with_capacity(SCANNER_READAHEAD_BYTES, file);
 
         let block = Self::fetch_next_block(
             &mut reader,
