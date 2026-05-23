@@ -55,6 +55,13 @@ use std::path::{Path, PathBuf};
     clippy::struct_excessive_bools,
     reason = "mirrors std::fs::OpenOptions which uses bool flags for each mode"
 )]
+// `non_exhaustive` paired with the `direct_io` field landing in the
+// same release. The new field already breaks struct-literal
+// callers; bundling `non_exhaustive` in the same semver-major bump
+// confines the break to one release and lets every future field
+// land as semver-minor. Builder methods (`.read()`, `.write()`, …,
+// `.direct_io()`) cover every field, so callers using the builder
+// API are unaffected.
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub struct FsOpenOptions {
