@@ -15,6 +15,21 @@
 //! the flag is best-effort, may be silently dropped, and correctness
 //! must not depend on it.
 //!
+//! # `std` dependency
+//!
+//! This module touches `std::fs::OpenOptions` directly, so it is
+//! std-only. No `#[cfg(feature = "std")]` gate is added here on
+//! purpose: its sole consumers — [`StdFs`] and [`IoUringFs`] —
+//! are themselves unconditionally std-bound today (the entire
+//! `fs::*` backend builds on `std::fs`). Gating *only* this module
+//! while leaving the consumers ungated would be a no-op — the std
+//! backend would still compile and drag this module in
+//! transitively, then fail. The unit of gating is the whole
+//! `fs::*` std backend; that move is tracked under the no-std
+//! migration epic (issue `#274`), where the
+//! `#[cfg(feature = "std")]` gate will land on `pub mod fs::std_fs`
+//! (and `io_uring_fs`) and this module follows automatically.
+//!
 //! [`StdFs`]: super::StdFs
 //! [`IoUringFs`]: super::IoUringFs
 
