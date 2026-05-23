@@ -23,8 +23,23 @@
 //! - **macOS / BSD**: no batched I/O API exists (`dispatch_io` and `kqueue`
 //!   do not help for storage I/O patterns); [`StdFs`] is the correct choice
 
+mod aligned_buf;
+// `direct_io` is std-only (touches `std::fs::OpenOptions`). It is
+// gated behind the `std` feature so a `no_std + alloc` build of
+// this crate does not even attempt to compile it. The wider
+// `fs::*` backend (Fs / FsFile traits, std_fs, io_uring_fs)
+// still depends on `std::io::{Read, Write, Seek}` + `std::path::Path`
+// — those have no `core::*` equivalents, so feature-gating just
+// this submodule does not yet make a no-std build work end-to-end.
+// Porting the traits off std::io / std::path is tracked as #311
+// (prerequisite); the wider no-std migration epic is #274. This
+// gate is the first concrete step.
+#[cfg(feature = "std")]
+mod direct_io;
 mod mem_fs;
 mod std_fs;
+
+pub use aligned_buf::AlignedBuf;
 
 #[cfg(all(target_os = "linux", feature = "io-uring"))]
 mod io_uring_fs;
@@ -45,7 +60,15 @@ use std::path::{Path, PathBuf};
     clippy::struct_excessive_bools,
     reason = "mirrors std::fs::OpenOptions which uses bool flags for each mode"
 )]
+// `non_exhaustive` paired with the `direct_io` field landing in the
+// same release. The new field already breaks struct-literal
+// callers; bundling `non_exhaustive` in the same semver-major bump
+// confines the break to one release and lets every future field
+// land as semver-minor. Builder methods (`.read()`, `.write()`, …,
+// `.direct_io()`) cover every field, so callers using the builder
+// API are unaffected.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct FsOpenOptions {
     /// Open for reading.
     pub read: bool,
@@ -59,6 +82,33 @@ pub struct FsOpenOptions {
     pub truncate: bool,
     /// Open in append mode, so writes go to the end of the file.
     pub append: bool,
+    /// Bypass the kernel page cache for this file (`O_DIRECT` on Linux).
+    ///
+    /// When set, the caller is responsible for issuing reads and writes
+    /// at offsets aligned to the filesystem's logical block size, with
+    /// userspace buffers aligned to the same boundary and lengths that
+    /// are a multiple of that block size.
+    ///
+    /// `direct_io` is a HINT, not a guarantee. The flag is honoured only
+    /// on Linux and Android, and only on architectures where the
+    /// `asm-generic/fcntl.h` value `O_DIRECT = 0o40000` is authoritative
+    /// — `x86`, `x86_64`, `aarch64`, `riscv32`/`riscv64`, `loongarch64`,
+    /// `s390x`. On Linux
+    /// architectures with a divergent `O_DIRECT` bit (arm `0o200000`,
+    /// mips `0o100000`, parisc, sparc) the flag is silently dropped to
+    /// avoid passing the wrong bit to `open(2)`. Other platforms — macOS
+    /// (would need `F_NOCACHE` post-open via `fcntl`, not wired here),
+    /// Windows (would need `FILE_FLAG_NO_BUFFERING` at `CreateFile` time,
+    /// not wired here), other Unixes — also silently drop the flag.
+    ///
+    /// Callers must therefore treat `direct_io` as best-effort:
+    /// correctness must not depend on cache bypass being in effect, and
+    /// any alignment requirements imposed by the kernel only apply when
+    /// the flag is actually honoured (you cannot tell from this API
+    /// alone whether it was). See [`AlignedBuf`] for an aligned heap
+    /// buffer suitable for `O_DIRECT` reads and writes when the flag is
+    /// honoured.
+    pub direct_io: bool,
 }
 
 impl Default for FsOpenOptions {
@@ -78,6 +128,7 @@ impl FsOpenOptions {
             create_new: false,
             truncate: false,
             append: false,
+            direct_io: false,
         }
     }
 
@@ -120,6 +171,13 @@ impl FsOpenOptions {
     #[must_use]
     pub const fn append(mut self, append: bool) -> Self {
         self.append = append;
+        self
+    }
+
+    /// Sets the `direct_io` flag.
+    #[must_use]
+    pub const fn direct_io(mut self, direct_io: bool) -> Self {
+        self.direct_io = direct_io;
         self
     }
 }

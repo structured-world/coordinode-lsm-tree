@@ -111,14 +111,30 @@ impl std::fmt::Debug for IoUringFs {
 
 impl Fs for IoUringFs {
     fn open(&self, path: &Path, opts: &FsOpenOptions) -> io::Result<Box<dyn FsFile>> {
-        let file = OpenOptions::new()
+        let mut builder = OpenOptions::new();
+        builder
             .read(opts.read)
             .write(opts.write)
             .create(opts.create)
             .create_new(opts.create_new)
             .truncate(opts.truncate)
-            .append(opts.append)
-            .open(path)?;
+            .append(opts.append);
+
+        // Gate matches the `mod direct_io;` declaration in `fs/mod.rs`
+        // — the submodule only exists when `feature = "std"` is on.
+        // The whole `io_uring_fs` module is already gated by
+        // `cfg(all(target_os = "linux", feature = "io-uring"))`, and
+        // the `io-uring` feature transitively enables `std` (see the
+        // feature declaration in Cargo.toml), so this extra
+        // `feature = "std"` predicate is logically redundant here.
+        // Kept for consistency with `StdFs::open` and to make the
+        // dependency on direct_io's gate explicit at the call site,
+        // so feature-gate audits don't have to chase the implication
+        // through Cargo.toml.
+        #[cfg(feature = "std")]
+        super::direct_io::apply_direct_io_flag(&mut builder, opts.direct_io);
+
+        let file = builder.open(path)?;
 
         // When opened in append mode, io_uring writes use an explicit offset
         // so the kernel's O_APPEND semantics don't apply. Initialize the
