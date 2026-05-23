@@ -413,7 +413,10 @@ pub fn verify_block_checksums(tree: &impl crate::AbstractTree) -> BlockVerifyRep
         let table_id = table.id();
         report.sst_files_scanned += 1;
 
-        match scan_sst_blocks(path, table_id) {
+        // Use each Table's own `Fs` handle (StdFs, MemFs, IoUring, …).
+        // `std::fs::File::open` is wrong here: it skips the pluggable
+        // backend and produces NotFound on MemFs-only trees.
+        match scan_sst_blocks(&*table.fs, path, table_id) {
             Ok(per_file) => {
                 report.blocks_scanned += per_file.blocks_scanned;
                 report.errors.extend(per_file.errors);
@@ -436,17 +439,21 @@ struct PerFileScan {
     errors: Vec<BlockVerifyError>,
 }
 
-/// Walks every block of one SST. Returns `Err` on any file-level
-/// I/O or trailer-parse failure that makes the whole walk impossible
-/// — file open, SFA trailer parse, or a `seek` to a TOC section's
-/// start offset that fails before any block is read. Per-block errors
-/// (corrupt headers, mismatched data checksums, post-header read
-/// failures) come back inside `PerFileScan::errors` and never cause
-/// an early return.
-fn scan_sst_blocks(path: &Path, table_id: TableId) -> std::io::Result<PerFileScan> {
+/// Walks every block of one SST. Returns `Err` only on file-open or
+/// SFA trailer-parse failure (those make the whole walk impossible).
+/// Per-block AND per-section errors — corrupt block headers, mismatched
+/// data checksums, post-header data-read failures, and TOC sections we
+/// cannot seek to — all land inside `PerFileScan::errors` and never
+/// cause an early return; the walker proceeds to the next section so
+/// one bad TOC entry cannot mask corruption in the others.
+fn scan_sst_blocks(
+    fs: &dyn crate::fs::Fs,
+    path: &Path,
+    table_id: TableId,
+) -> std::io::Result<PerFileScan> {
     use std::io::{BufReader, Seek, SeekFrom};
 
-    let mut file = std::fs::File::open(path)?;
+    let mut file = fs.open(path, &crate::fs::FsOpenOptions::new().read(true))?;
 
     // The SFA trailer + TOC live at the tail of the file.
     // sfa::Reader::from_reader leaves the cursor at an undefined
@@ -522,7 +529,23 @@ fn scan_sst_blocks(path: &Path, table_id: TableId) -> std::io::Result<PerFileSca
             });
             continue;
         };
-        reader.seek(SeekFrom::Start(start))?;
+        // Mid-walk seek failure: don't propagate as a file-level Err
+        // (that would discard everything already scanned and report
+        // the whole SST as unreadable, which contradicts the
+        // function's contract). Surface as a per-section error and
+        // skip walking this section; subsequent sections still run.
+        if let Err(e) = reader.seek(SeekFrom::Start(start)) {
+            errors.push(BlockVerifyError::HeaderCorrupted {
+                table_id,
+                path: path.to_path_buf(),
+                offset: start,
+                reason: format!(
+                    "seek to TOC section {:?} at offset {start} failed: {e}",
+                    entry.name(),
+                ),
+            });
+            continue;
+        }
         let mut ctx = WalkCtx {
             reader: &mut reader,
             table_id,
@@ -572,7 +595,7 @@ const MAX_BLOCK_DATA_LENGTH: u64 = 256 * 1024 * 1024;
 /// buffer, counters, error sink) into one borrow so the function
 /// signature stays under clippy's argument-count cap.
 struct WalkCtx<'a> {
-    reader: &'a mut std::io::BufReader<std::fs::File>,
+    reader: &'a mut std::io::BufReader<Box<dyn crate::fs::FsFile>>,
     table_id: TableId,
     path: &'a Path,
     data_buf: &'a mut Vec<u8>,
