@@ -24,6 +24,12 @@
 //!   do not help for storage I/O patterns); [`StdFs`] is the correct choice
 
 pub mod aligned_buf;
+// `direct_io` is std-only (touches `std::fs::OpenOptions`). It is
+// intentionally not feature-gated here: its sole consumers `std_fs`
+// and `io_uring_fs` are themselves unconditionally std-bound, so the
+// effective unit of gating is the whole `fs::*` backend (tracked
+// under the no-std migration epic, issue #274). See the module
+// header in `direct_io.rs` for the full rationale.
 mod direct_io;
 mod mem_fs;
 mod std_fs;
