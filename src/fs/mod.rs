@@ -195,6 +195,48 @@ pub struct FsDirEntry {
     pub is_dir: bool,
 }
 
+/// Access-pattern hint passed to [`FsFile::hint`].
+///
+/// Backends translate it to the platform's nearest equivalent
+/// (`posix_fadvise` on Linux, no-op on macOS / Windows for now). The
+/// hint is advisory — backends are free to ignore it — and only
+/// influences kernel readahead / page-cache eviction heuristics, not
+/// correctness.
+///
+/// Used at SST/blob open sites to tell the OS what we're about to do
+/// with the file (sequential scan, random point read, write-once-and-
+/// evict, …). Picking the right hint cuts page-cache double-buffering
+/// on cold-path compaction reads and prevents readahead waste on
+/// point-read SST files.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum FileHint {
+    /// No hint — leave the kernel's default caching / readahead policy in
+    /// place. Use when the access pattern is unknown or genuinely mixed.
+    #[default]
+    Default,
+
+    /// File will be read mostly forward, in order
+    /// (`POSIX_FADV_SEQUENTIAL`). Tells the kernel to ramp up readahead
+    /// and evict already-read pages aggressively. Use for compaction
+    /// input files and full-range scans.
+    Sequential,
+
+    /// File will be read at scattered offsets with no useful prefetch
+    /// pattern (`POSIX_FADV_RANDOM`). Tells the kernel to disable
+    /// readahead so it doesn't waste bandwidth speculatively loading
+    /// pages we won't touch. Use for SST files opened for point-read
+    /// service.
+    Random,
+
+    /// File is being written and we won't need it cached afterwards —
+    /// drop pages from the page cache when the write completes
+    /// (`POSIX_FADV_DONTNEED`). Use for compaction output and memtable
+    /// flush output to keep them from evicting hot pages of files we're
+    /// still reading from.
+    WriteOnce,
+}
+
 /// Filesystem operations on an open file handle.
 ///
 /// Extends [`Read`] + [`Write`] + [`Seek`] with persistence and
@@ -257,6 +299,29 @@ pub trait FsFile: Read + Write + Seek + Send + Sync {
     ///
     /// Returns an I/O error if locking fails or is unsupported.
     fn lock_exclusive(&self) -> io::Result<()>;
+
+    /// Advise the kernel about the expected access pattern for this file.
+    ///
+    /// Implementations translate the [`FileHint`] to the platform's
+    /// closest primitive (`posix_fadvise` on Linux, no-op on macOS /
+    /// Windows / in-memory backends for now). The default trait impl
+    /// is a no-op so backends that have nothing useful to do here
+    /// don't need to override it.
+    ///
+    /// The hint is advisory — backends may ignore it — and only
+    /// influences kernel readahead / page-cache eviction heuristics, not
+    /// correctness.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error only if the underlying syscall fails with a
+    /// non-`EINVAL` error. A backend that doesn't support the requested
+    /// hint should treat the call as a no-op and return `Ok(())` rather
+    /// than fail — the hint is a performance lever, not a correctness
+    /// requirement.
+    fn hint(&self, _hint: FileHint) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 /// Pluggable filesystem abstraction.
