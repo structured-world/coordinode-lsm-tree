@@ -54,8 +54,18 @@ impl Scanner {
         comparator: SharedComparator,
         table_id: crate::TableId,
     ) -> crate::Result<Self> {
-        // TODO: a larger buffer size may be better for HDD, maybe make this configurable
-        let mut reader = BufReader::with_capacity(8 * 4_096, File::open(path)?);
+        // 2 MiB buffer matches RocksDB's `compaction_readahead_size`
+        // default and is large enough that the kernel can fold the
+        // sequential-scan readahead heuristic into a single big
+        // userspace fill per ~500 typical (4 KiB) data blocks instead
+        // of one syscall every 8 blocks. Picked to dominate any
+        // pre-#133-Phase1c micro-cost: the loss is at most a few MB
+        // of allocator overhead per concurrent compaction, and
+        // compaction concurrency is bounded by the scheduler. HDD-
+        // tuning beyond this would benefit from a configurable knob,
+        // tracked as the configurable-readahead follow-up under #133.
+        const SCANNER_READAHEAD_BYTES: usize = 2 * 1024 * 1024;
+        let mut reader = BufReader::with_capacity(SCANNER_READAHEAD_BYTES, File::open(path)?);
 
         let block = Self::fetch_next_block(
             &mut reader,
