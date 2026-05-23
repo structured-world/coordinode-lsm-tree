@@ -2,7 +2,7 @@
 // Copyright (c) 2024-present, fjall-rs
 // Copyright (c) 2026-present, Structured World Foundation
 
-use super::{Fs, FsDirEntry, FsFile, FsMetadata, FsOpenOptions};
+use super::{FileHint, Fs, FsDirEntry, FsFile, FsMetadata, FsOpenOptions};
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::path::Path;
@@ -94,6 +94,10 @@ impl FsFile for File {
 
     fn lock_exclusive(&self) -> io::Result<()> {
         sys::lock_exclusive(self)
+    }
+
+    fn hint(&self, hint: FileHint) -> io::Result<()> {
+        sys::fadvise(self, hint)
     }
 }
 
@@ -312,6 +316,7 @@ fn copy_fallback(src: &Path, dst: &Path) -> io::Result<()> {
 
 #[cfg(unix)]
 mod sys {
+    use super::FileHint;
     use std::ffi::c_int;
     use std::fs::File;
     use std::io;
@@ -344,13 +349,152 @@ mod sys {
             return Err(err);
         }
     }
+
+    // POSIX_FADV_* values are stable across glibc / musl / *BSD libc.
+    // macOS has no posix_fadvise — routed to a no-op `fadvise` below.
+    #[cfg(not(target_os = "macos"))]
+    const POSIX_FADV_NORMAL: c_int = 0;
+    #[cfg(not(target_os = "macos"))]
+    const POSIX_FADV_RANDOM: c_int = 1;
+    #[cfg(not(target_os = "macos"))]
+    const POSIX_FADV_SEQUENTIAL: c_int = 2;
+    #[cfg(not(target_os = "macos"))]
+    const POSIX_FADV_DONTNEED: c_int = 4;
+
+    // EINVAL == 22 on every Linux / *BSD target we ship to. Used to
+    // map "kernel rejected this hint" to Ok(()) per the FsFile::hint
+    // contract — hints are advisory, EINVAL means "the kernel didn't
+    // like this advice code", not "the file is broken".
+    #[cfg(not(target_os = "macos"))]
+    const EINVAL: c_int = 22;
+
+    // libc symbol selection (the 32-bit glibc trap):
+    //
+    // Plain `posix_fadvise` on 32-bit glibc takes a 32-bit off_t
+    // unless the caller opts into `_FILE_OFFSET_BITS=64` — and Rust
+    // FFI declarations don't get that define. Passing i64 args into
+    // a 32-bit-off_t syscall wrapper corrupts the stack.
+    //
+    // `posix_fadvise64` always takes int64_t but is a glibc-only
+    // symbol; musl doesn't export it (the kernel sees the same
+    // syscall, but musl has no userspace wrapper). bionic (Android)
+    // does export it.
+    //
+    // Resolution by target:
+    // - 32-bit glibc Linux + 32-bit Android: posix_fadvise64
+    //   (otherwise stack corruption)
+    // - musl on any pointer width: posix_fadvise (musl is sane on
+    //   32-bit too — its plain wrapper takes 64-bit off_t)
+    // - 64-bit Linux/Android: posix_fadvise (off_t is always 64-bit)
+    // - BSDs (freebsd/netbsd/dragonfly): posix_fadvise (off_t is
+    //   always 64-bit, no *64 variant exists)
+    #[cfg(all(
+        any(target_os = "linux", target_os = "android"),
+        target_pointer_width = "32",
+        any(target_env = "gnu", target_env = "")
+    ))]
+    // SAFETY: matches glibc / bionic posix_fadvise64 ABI on 32-bit.
+    unsafe extern "C" {
+        fn posix_fadvise64(fd: c_int, offset: i64, len: i64, advice: c_int) -> c_int;
+    }
+
+    #[cfg(all(
+        not(target_os = "macos"),
+        not(all(
+            any(target_os = "linux", target_os = "android"),
+            target_pointer_width = "32",
+            any(target_env = "gnu", target_env = "")
+        ))
+    ))]
+    // SAFETY: matches POSIX posix_fadvise ABI (off_t is 64-bit on
+    // 64-bit Linux/Android, BSD, and on musl regardless of pointer
+    // width).
+    unsafe extern "C" {
+        fn posix_fadvise(fd: c_int, offset: i64, len: i64, advice: c_int) -> c_int;
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    pub(super) fn fadvise(file: &File, hint: FileHint) -> io::Result<()> {
+        let advice = match hint {
+            FileHint::Default => POSIX_FADV_NORMAL,
+            FileHint::Sequential => POSIX_FADV_SEQUENTIAL,
+            FileHint::Random => POSIX_FADV_RANDOM,
+            FileHint::WriteOnce => POSIX_FADV_DONTNEED,
+        };
+        // offset=0 + len=0 = "apply to the whole file" per
+        // posix_fadvise(2). posix_fadvise{,64} returns the errno
+        // DIRECTLY (not via errno; 0 on success, positive errno on
+        // failure).
+        let fd = file.as_raw_fd();
+        // SAFETY: fd is a valid file descriptor owned by `file`;
+        // offset / len / advice are all valid inputs.
+        #[expect(unsafe_code, reason = "posix_fadvise FFI call with valid fd")]
+        let ret = unsafe {
+            #[cfg(all(
+                any(target_os = "linux", target_os = "android"),
+                target_pointer_width = "32",
+                any(target_env = "gnu", target_env = "")
+            ))]
+            {
+                posix_fadvise64(fd, 0, 0, advice)
+            }
+            #[cfg(not(all(
+                any(target_os = "linux", target_os = "android"),
+                target_pointer_width = "32",
+                any(target_env = "gnu", target_env = "")
+            )))]
+            {
+                posix_fadvise(fd, 0, 0, advice)
+            }
+        };
+        // EINVAL = kernel doesn't recognise this advice code (or the
+        // fd isn't a regular file — e.g. pipe / socket / character
+        // device). Hints are advisory; treat as a no-op per the
+        // FsFile::hint contract.
+        if ret == 0 || ret == EINVAL {
+            Ok(())
+        } else {
+            Err(io::Error::from_raw_os_error(ret))
+        }
+    }
+
+    // macOS has no posix_fadvise. The closest primitives are
+    // `fcntl(F_RDADVISE)` (sequential prefetch hint, requires a byte
+    // range — not useful for the whole-file hints we want) and
+    // `fcntl(F_NOCACHE)` (toggle uncached I/O — too blunt for our use
+    // case). Treat as a no-op for now; the performance benefit on
+    // macOS is small enough that wiring a half-equivalent isn't worth
+    // the complexity.
+    #[cfg(target_os = "macos")]
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "FsFile::hint signature requires io::Result<()>; macOS branch is a no-op until we wire fcntl(F_RDADVISE)"
+    )]
+    pub(super) fn fadvise(_file: &File, _hint: FileHint) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 #[cfg(windows)]
 mod sys {
+    use super::FileHint;
     use std::fs::File;
     use std::io;
     use std::os::windows::io::AsRawHandle;
+
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "FsFile::hint signature requires io::Result<()>; Windows branch is a no-op until we thread the hint through FsOpenOptions for CreateFile flags"
+    )]
+    pub(super) fn fadvise(_file: &File, _hint: FileHint) -> io::Result<()> {
+        // Windows has no direct posix_fadvise equivalent. The closest
+        // primitive (`FILE_FLAG_SEQUENTIAL_SCAN` / `_RANDOM_ACCESS`)
+        // must be set at CreateFile time and can't be changed for an
+        // already-open handle. Treat as a no-op — if Windows
+        // performance becomes a concern we'd thread the hint through
+        // FsOpenOptions instead and set the flag at open time.
+        Ok(())
+    }
 
     pub(super) fn lock_exclusive(file: &File) -> io::Result<()> {
         use std::ptr;
@@ -411,6 +555,7 @@ mod sys {
 
 #[cfg(not(any(unix, windows)))]
 mod sys {
+    use super::FileHint;
     use std::fs::File;
     use std::io;
 
@@ -419,6 +564,15 @@ mod sys {
             io::ErrorKind::Unsupported,
             "file locking is not supported on this platform",
         ))
+    }
+
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "FsFile::hint signature requires io::Result<()>; unsupported platforms have no fallible path"
+    )]
+    pub(super) fn fadvise(_file: &File, _hint: FileHint) -> io::Result<()> {
+        // Unsupported platform — silently ignore. Hints are advisory.
+        Ok(())
     }
 }
 
@@ -887,6 +1041,41 @@ mod tests {
 
         let err = copy_fallback(&src, &dst).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+        Ok(())
+    }
+
+    #[test]
+    fn fadvise_accepts_every_hint_variant() -> io::Result<()> {
+        // Smoke test: every FileHint variant produces Ok on every
+        // platform our CI builds for. Linux exercises the real
+        // posix_fadvise syscall; macOS / Windows fall through the
+        // no-op branches. Failure of any variant is a regression in
+        // the platform-specific glue, not in the hint contract
+        // itself (which is advisory).
+        let dir = tempfile::tempdir()?;
+        let fs = StdFs;
+        let path = dir.path().join("hint_smoke.bin");
+
+        // Write some content so posix_fadvise has a non-empty file
+        // to act on (POSIX_FADV_DONTNEED is a no-op on 0-byte files
+        // on every kernel I've tested, but checking with content
+        // catches more potential regressions).
+        let opts = FsOpenOptions::new().write(true).create_new(true);
+        let mut file = fs.open(&path, &opts)?;
+        file.write_all(&vec![0u8; 64 * 1024])?;
+        file.sync_all()?;
+        drop(file);
+
+        let opts = FsOpenOptions::new().read(true);
+        let file = fs.open(&path, &opts)?;
+        for hint in [
+            FileHint::Default,
+            FileHint::Sequential,
+            FileHint::Random,
+            FileHint::WriteOnce,
+        ] {
+            file.hint(hint)?;
+        }
         Ok(())
     }
 }
