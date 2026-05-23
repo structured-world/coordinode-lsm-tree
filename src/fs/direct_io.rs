@@ -10,9 +10,10 @@
 //! diverge if one was updated to support a new arch and the other
 //! wasn't.
 //!
-//! Doc-contract for `direct_io` is on
-//! [`FsOpenOptions::direct_io`](super::FsOpenOptions::direct_io):
-//! the flag is best-effort, may be silently dropped, and correctness
+//! Doc-contract for the `direct_io` flag is on the
+//! [`FsOpenOptions::direct_io`](field@super::FsOpenOptions::direct_io)
+//! field (disambiguated against the same-named builder method): the
+//! flag is best-effort, may be silently dropped, and correctness
 //! must not depend on it.
 //!
 //! # `std` dependency
@@ -82,7 +83,9 @@ mod apply {
     /// need `F_NOCACHE` via `fcntl` post-open, Windows would need
     /// `FILE_FLAG_NO_BUFFERING` at `CreateFile` time, divergent Linux
     /// arches need a different `O_DIRECT` bit — all out of scope per
-    /// the [`super::FsOpenOptions::direct_io`] best-effort contract.
+    /// the [`FsOpenOptions::direct_io`](field@crate::fs::FsOpenOptions::direct_io)
+    /// best-effort contract (disambiguated against the same-named
+    /// builder method).
     pub fn apply_direct_io_flag(_builder: &mut std::fs::OpenOptions, _direct_io: bool) {}
 }
 
