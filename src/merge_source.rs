@@ -4,16 +4,24 @@
 //! Seekable source iterator trait for the merge-iterator path.
 //!
 //! `MergeSource` is what `SeekingMerger` consumes: a stream that
-//! can be advanced in either direction AND repositioned to a
-//! specific key. `SeekingMerger` itself does NOT invoke
-//! [`MergeSource::seek`] on direction switches — its two-tree
-//! architecture relies on each source's own
-//! `(front_idx, back_idx)` window (or equivalent self-coordination
-//! between `next` and `next_back`) to keep mixed direction
-//! duplicate-free. The seek primitive is exposed on the trait for
-//! user-initiated repositioning (range scan starting key, jump to
-//! a known key, etc.), not as a direction-switch reconciliation
-//! mechanism.
+//! can be advanced in either direction, AND that exposes a key-
+//! addressed [`MergeSource::seek`] primitive whose strength varies
+//! by source flavour. Independent-cursor sources MUST treat `seek`
+//! as a real reposition (the only way they can maintain the
+//! no-duplicates invariant under mixed direction); coherent-cursor
+//! sources (see [`CoherentMergeSource`]) MAY treat it as a no-op
+//! because their shared `next`/`next_back` cursor discipline
+//! already enforces no-duplicates without external reseek (the
+//! `CoherentIterSource` adapter ships such a no-op `seek`).
+//!
+//! `SeekingMerger` itself does NOT invoke [`MergeSource::seek`] on
+//! direction switches — its two-tree architecture relies on each
+//! source's own `(front_idx, back_idx)` window (or equivalent
+//! self-coordination between `next` and `next_back`) to keep mixed
+//! direction duplicate-free. The seek primitive is exposed on the
+//! trait for user-initiated repositioning (range scan starting
+//! key, jump to a known key, etc.), not as a direction-switch
+//! reconciliation mechanism.
 //!
 //! # Contract
 //!
