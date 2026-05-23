@@ -1,13 +1,36 @@
 [store]
 dir = "target/nextest"
 
+# Slow-timeout audit (last measured against perf/#158-ci-optim,
+# all-features, `--profile ci`, on a 10-core M3 Pro, proptests
+# excluded). No regular test breaks the 10s default-profile threshold;
+# the slowest 10 land between 4.3s and 8.9s, all well under
+# `terminate-after = 6` (60s wall). Top of the distribution:
+#
+#   8.91s  tree_bulk_ingest::blob_tree_copy
+#   7.48s  compaction::leveled::test::dynamic_leveling_multiple_levels
+#   6.79s  compaction::leveled::test::leveled_sequential_inserts
+#   6.00s  compaction::leveled::test::multi_level_with_both_flags
+#   5.75s  compaction::leveled::test::multi_level_data_integrity
+#   5.38s  tree_bulk_ingest::blob_tree_bulk_ingest
+#   5.34s  blob_fifo_limit::blob_tree_fifo_limit
+#   5.11s  tree_bulk_ingest::tree_copy
+#   4.69s  model_6
+#   4.30s  compaction::leveled::test::multi_level_sparse_keyspace_data_integrity
+#
+# If a regular test starts exceeding 10s consistently, optimise the
+# test (smaller input set, fewer iterations) rather than relaxing the
+# slow-timeout — the 10s ceiling exists to catch accidental
+# performance regressions in test setup.
 [profile.default]
 slow-timeout = { period = "10s", terminate-after = 6 }
 fail-fast = true
 
-# Property tests default to 32 cases via ProptestConfig.
-# Edit `cases` field in test files to increase for thorough local runs.
-# Budget: 30s × 4 = 120s — enough for 32 cases with I/O.
+# Property tests default to 32 cases via the shared
+# `common::proptest_config()` helper (PROPTEST_CASES /
+# PROPTEST_MAX_SHRINK env vars override at run time). Budget:
+# 30s × 4 = 120s — enough for 32 cases with I/O, generous for
+# CI's higher-variance runners.
 [[profile.default.overrides]]
 filter = "test(prop_)"
 slow-timeout = { period = "30s", terminate-after = 4 }
