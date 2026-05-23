@@ -23,7 +23,7 @@
 //! - **macOS / BSD**: no batched I/O API exists (`dispatch_io` and `kqueue`
 //!   do not help for storage I/O patterns); [`StdFs`] is the correct choice
 
-pub mod aligned_buf;
+mod aligned_buf;
 // `direct_io` is std-only (touches `std::fs::OpenOptions`). It is
 // intentionally not feature-gated here: its sole consumers `std_fs`
 // and `io_uring_fs` are themselves unconditionally std-bound, so the
