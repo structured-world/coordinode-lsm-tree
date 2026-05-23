@@ -350,11 +350,8 @@ mod sys {
         }
     }
 
-    // POSIX_FADV_* values are stable across glibc / musl / *BSD libc on
-    // every Linux + Android target we ship to. macOS routes through a
-    // separate `fcntl(F_RDADVISE)` path below — declared `not(target_os
-    // = "macos")` so we don't accidentally call posix_fadvise64 on a
-    // libc that doesn't export it.
+    // POSIX_FADV_* values are stable across glibc / musl / *BSD libc.
+    // macOS has no posix_fadvise — routed to a no-op `fadvise` below.
     #[cfg(not(target_os = "macos"))]
     const POSIX_FADV_NORMAL: c_int = 0;
     #[cfg(not(target_os = "macos"))]
@@ -364,11 +361,35 @@ mod sys {
     #[cfg(not(target_os = "macos"))]
     const POSIX_FADV_DONTNEED: c_int = 4;
 
+    // EINVAL == 22 on every Linux / *BSD target we ship to. Used to
+    // map "kernel rejected this hint" to Ok(()) per the FsFile::hint
+    // contract — hints are advisory, EINVAL means "the kernel didn't
+    // like this advice code", not "the file is broken".
     #[cfg(not(target_os = "macos"))]
-    // SAFETY: declaration matches the POSIX `posix_fadvise` ABI on Linux
-    // and BSD targets (off_t is i64 on all 64-bit Linux + BSD targets
-    // and on 32-bit targets via _FILE_OFFSET_BITS=64 which glibc / musl
-    // both default to for new code).
+    const EINVAL: c_int = 22;
+
+    // Use posix_fadvise64 on Linux + Android to keep the off_t-sized
+    // arguments ABI-stable on 32-bit targets (where bare posix_fadvise
+    // uses a 32-bit off_t unless the caller opted into
+    // _FILE_OFFSET_BITS=64 — Rust FFI declarations don't get that
+    // define, so we'd pass 64-bit ints into a 32-bit-off_t syscall
+    // wrapper and corrupt the stack). posix_fadvise64 always takes
+    // int64_t arguments regardless of target pointer width.
+    //
+    // BSD targets (freebsd / netbsd / dragonfly) don't ship a *64
+    // variant, but their off_t is unconditionally 64-bit, so the
+    // plain posix_fadvise is ABI-correct there.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    // SAFETY: matches glibc / musl / bionic posix_fadvise64 ABI.
+    unsafe extern "C" {
+        fn posix_fadvise64(fd: c_int, offset: i64, len: i64, advice: c_int) -> c_int;
+    }
+
+    #[cfg(all(
+        not(target_os = "macos"),
+        not(any(target_os = "linux", target_os = "android"))
+    ))]
+    // SAFETY: matches BSD posix_fadvise ABI (off_t is always 64-bit).
     unsafe extern "C" {
         fn posix_fadvise(fd: c_int, offset: i64, len: i64, advice: c_int) -> c_int;
     }
@@ -381,15 +402,29 @@ mod sys {
             FileHint::Random => POSIX_FADV_RANDOM,
             FileHint::WriteOnce => POSIX_FADV_DONTNEED,
         };
-        // offset=0 + len=0 = "apply to the whole file" per posix_fadvise(2).
-        // posix_fadvise returns the errno DIRECTLY (not via errno; 0 on
-        // success, positive errno on failure).
+        // offset=0 + len=0 = "apply to the whole file" per
+        // posix_fadvise(2). posix_fadvise{,64} returns the errno
+        // DIRECTLY (not via errno; 0 on success, positive errno on
+        // failure).
         let fd = file.as_raw_fd();
         // SAFETY: fd is a valid file descriptor owned by `file`;
-        // offset/len/advice are all valid posix_fadvise inputs.
+        // offset / len / advice are all valid inputs.
         #[expect(unsafe_code, reason = "posix_fadvise FFI call with valid fd")]
-        let ret = unsafe { posix_fadvise(fd, 0, 0, advice) };
-        if ret == 0 {
+        let ret = unsafe {
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            {
+                posix_fadvise64(fd, 0, 0, advice)
+            }
+            #[cfg(not(any(target_os = "linux", target_os = "android")))]
+            {
+                posix_fadvise(fd, 0, 0, advice)
+            }
+        };
+        // EINVAL = kernel doesn't recognise this advice code (or the
+        // fd isn't a regular file — e.g. pipe / socket / character
+        // device). Hints are advisory; treat as a no-op per the
+        // FsFile::hint contract.
+        if ret == 0 || ret == EINVAL {
             Ok(())
         } else {
             Err(io::Error::from_raw_os_error(ret))
