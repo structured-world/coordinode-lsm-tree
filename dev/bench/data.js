@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779554683537,
+  "lastUpdate": 1779558242672,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -8268,6 +8268,84 @@ window.BENCHMARK_DATA = {
             "value": 534535.2493831309,
             "unit": "ops/sec",
             "extra": "P50: 1.7us | P99: 5.1us | P99.9: 7.6us\nthreads: 1 | elapsed: 0.37s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "7e8533ee809e44474b8e8a6cf6fa41745f45747c",
+          "message": "test(encryption): mixed-load stress test across encryption × compression matrix (#128 part 2) (#304)\n\n## Summary\n\nPart 2 of #128 (part 1 was the tempfile helper extracted in PR #293).\nAdds `tests/encryption_stress.rs` with 12 integration tests covering\nencryption under realistic mixed-workload conditions: cell matrix sweep,\nmajor compaction, concurrent contention, wrong-key recovery, and runtime\nbudget.\n\nCloses #128.\n\n## Test inventory (12 new tests, 1527/1527 workspace pass)\n\n### Cell matrix (8 tests)\nCombinations: (None | AES-256-GCM) × (None | lz4 | Zstd(1) | Zstd(3)).\nEach cell runs the identical stress sequence so a regression in any\nspecific cell is isolated to one test failure.\n\nPer-cell sequence:\n1. 1000 initial inserts at seqno 1..1000\n2. 100 updates on first range at seqno 2001+i\n3. 50 tombstones in middle range at seqno 3001+i\n4. Flush memtable → encrypted/compressed SST on disk\n5. 500 late inserts at seqno 4001+i (read path spans memtable + SST)\n6. Verify pre-reopen: updates shadow originals, tombstones suppress\nreads, range scan returns expected 200 entries with correct values\n7. Flush late inserts, drop tree, reopen from disk\n8. Re-verify post-reopen: decryption + decode + filter paths from cold\nSST files\n\n### Major-compaction cell (1 test)\n3 flush groups (600 keys total) → `major_compact` merges SSTs → verify\nall keys readable both pre- and post-reopen. Exercises encrypted-block\nREAD + re-encrypted-block WRITE on the compaction worker.\n\n### Concurrent cell (1 test)\n4 writers + 2 readers contend for 2 seconds on a single encrypted tree.\nAsserts:\n- No panics\n- Readers never see garbage (every value matches its writer namespace\n`w{id}_v...`)\n- After flush + reopen, meaningful chunk of writes survives encrypted\nSST round-trip\n\n### Wrong-key recovery (1 test)\nWrites with key A (`[0xAA; 32]`), reopens with key B (`[0xBB; 32]`).\nAsserts opening fails OR every `get` returns `Err`. Tightened beyond\n\"never returns original plaintext\" because AES-GCM with bound AAD is\ndeterministic — a wrong-key decrypt always fails AEAD verification,\nnever silently produces `Ok(None)` or `Ok(Some(garbage))`. Accepting\n`Ok(None)` as a valid outcome would let a regression that strips AEAD\nchecks pass undetected. This is the core AAD threat-model property: **no\nkey, no data, no silent corruption**.\n\n### Smoke-check (1 test)\nSingle-cell stress must complete in <30s. Surfaces regressions in flush\n/ compaction / encrypt-path throughput before they reach prod.\n\n## Design notes\n\n- **Snapshot-seqno reads intentionally omitted**: depend on flush GC\nthreshold semantics (`flush_active_memtable(eviction_seqno)`\nconsolidates older versions when newer exists, dropping originals). MVCC\nsnapshot behaviour is its own thing — this suite stays focused on\nencryption + decompression correctness.\n- **All seqnos start at 1**: seqno=0 is the engine's compacted-final\nsentinel and is rejected by `Memtable::get`.\n- **CompressionType is `#[non_exhaustive]`** so `cell_label` has a\ngeneric `_` arm for future variants.\n\n## Test plan\n\n- [x] `cargo clippy --tests --all-features` — clean\n- [x] `cargo nextest run --test encryption_stress --all-features` —\n12/12 pass\n- [x] `cargo nextest run --workspace --all-features` — 1527/1527 pass\n(12 new tests, 0 regressions)\n\nCloses #128.\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n## Summary by CodeRabbit\n\n* **Tests**\n* Added a comprehensive encryption stress test suite that validates\nencrypted vs plaintext storage round-trips, recovery after restart,\nmajor compaction, concurrent multi-threaded access, wrong-key detection,\nand a fast smoke run to guard performance.\n\n<!-- review_stack_entry_start -->\n\n[![Review Change\nStack](https://storage.googleapis.com/coderabbit_public_assets/review-stack-in-coderabbit-ui.svg)](https://app.coderabbit.ai/change-stack/structured-world/coordinode-lsm-tree/pull/304?utm_source=github_walkthrough&utm_medium=github&utm_campaign=change_stack)\n\n<!-- review_stack_entry_end -->\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-05-23T20:43:11+03:00",
+          "tree_id": "73d921cb55de2e317e02d2fe7acda3829340c976",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/7e8533ee809e44474b8e8a6cf6fa41745f45747c"
+        },
+        "date": 1779558241169,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 2042600.9761835178,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.6us | P99.9: 3.7us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1205205.53822316,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.2us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 637380.9841991629,
+            "unit": "ops/sec",
+            "extra": "P50: 1.4us | P99: 4.6us | P99.9: 7.1us\nthreads: 1 | elapsed: 0.31s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3644486.7998601464,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 3.0us | P99.9: 5.5us\nthreads: 1 | elapsed: 0.05s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 444294.0272205488,
+            "unit": "ops/sec",
+            "extra": "P50: 2.0us | P99: 5.3us | P99.9: 8.1us\nthreads: 1 | elapsed: 0.45s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 223635.58295503928,
+            "unit": "ops/sec",
+            "extra": "P50: 4.2us | P99: 5.2us | P99.9: 8.4us\nthreads: 1 | elapsed: 0.89s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1253262.3672682361,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.2us | P99.9: 4.2us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1137788.3283625257,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.5us | P99.9: 2.1us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 539603.8189370285,
+            "unit": "ops/sec",
+            "extra": "P50: 1.6us | P99: 6.2us | P99.9: 9.1us\nthreads: 1 | elapsed: 0.37s | num: 200000 | iterations: 3"
           }
         ]
       }
