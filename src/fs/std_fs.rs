@@ -103,14 +103,47 @@ impl FsFile for File {
 
 impl Fs for StdFs {
     fn open(&self, path: &Path, opts: &FsOpenOptions) -> io::Result<Box<dyn FsFile>> {
-        let file = OpenOptions::new()
+        let mut builder = OpenOptions::new();
+        builder
             .read(opts.read)
             .write(opts.write)
             .create(opts.create)
             .create_new(opts.create_new)
             .truncate(opts.truncate)
-            .append(opts.append)
-            .open(path)?;
+            .append(opts.append);
+
+        // O_DIRECT on Linux/Android (architectures with `asm-generic/fcntl.h`
+        // value 0o40000: x86, x86_64, aarch64, riscv32/64, loongarch64,
+        // s390x — i.e. every Linux arch we plausibly run on). Architectures
+        // with a divergent O_DIRECT (arm 0o200000, mips 0o100000, parisc,
+        // sparc) are not gated here on purpose: misencoding the flag would
+        // silently pass the wrong bit to open(2). The FsOpenOptions doc
+        // contract permits `direct_io` to be ignored, so divergent archs
+        // simply fall through to a cached open — correctness preserved.
+        //
+        // macOS / Windows / other Unixes: same "may be silently ignored"
+        // contract. macOS has no O_DIRECT (F_NOCACHE via fcntl post-open
+        // is the closest equivalent and is out of scope here).
+        #[cfg(all(
+            any(target_os = "linux", target_os = "android"),
+            any(
+                target_arch = "x86",
+                target_arch = "x86_64",
+                target_arch = "aarch64",
+                target_arch = "riscv32",
+                target_arch = "riscv64",
+                target_arch = "loongarch64",
+                target_arch = "s390x",
+            ),
+        ))]
+        if opts.direct_io {
+            use std::os::unix::fs::OpenOptionsExt;
+            // asm-generic/fcntl.h: #define O_DIRECT 00040000
+            const O_DIRECT: i32 = 0o0_040_000;
+            builder.custom_flags(O_DIRECT);
+        }
+
+        let file = builder.open(path)?;
         Ok(Box::new(file))
     }
 
@@ -617,6 +650,7 @@ mod tests {
         assert!(!opts.create_new);
         assert!(!opts.truncate);
         assert!(!opts.append);
+        assert!(!opts.direct_io);
     }
 
     #[test]
@@ -627,13 +661,15 @@ mod tests {
             .create(true)
             .create_new(false)
             .truncate(true)
-            .append(false);
+            .append(false)
+            .direct_io(true);
         assert!(opts.read);
         assert!(opts.write);
         assert!(opts.create);
         assert!(!opts.create_new);
         assert!(opts.truncate);
         assert!(!opts.append);
+        assert!(opts.direct_io);
     }
 
     #[test]

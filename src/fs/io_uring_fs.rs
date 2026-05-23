@@ -111,14 +111,35 @@ impl std::fmt::Debug for IoUringFs {
 
 impl Fs for IoUringFs {
     fn open(&self, path: &Path, opts: &FsOpenOptions) -> io::Result<Box<dyn FsFile>> {
-        let file = OpenOptions::new()
+        let mut builder = OpenOptions::new();
+        builder
             .read(opts.read)
             .write(opts.write)
             .create(opts.create)
             .create_new(opts.create_new)
             .truncate(opts.truncate)
-            .append(opts.append)
-            .open(path)?;
+            .append(opts.append);
+
+        // O_DIRECT: identical arch gating to StdFs::open (see the comment
+        // there for rationale). io_uring is Linux-only, so the os-gate is
+        // implicit, but the arch gate still matters: O_DIRECT's bit value
+        // diverges on arm/mips/parisc/sparc.
+        #[cfg(any(
+            target_arch = "x86",
+            target_arch = "x86_64",
+            target_arch = "aarch64",
+            target_arch = "riscv32",
+            target_arch = "riscv64",
+            target_arch = "loongarch64",
+            target_arch = "s390x",
+        ))]
+        if opts.direct_io {
+            use std::os::unix::fs::OpenOptionsExt;
+            const O_DIRECT: i32 = 0o0_040_000;
+            builder.custom_flags(O_DIRECT);
+        }
+
+        let file = builder.open(path)?;
 
         // When opened in append mode, io_uring writes use an explicit offset
         // so the kernel's O_APPEND semantics don't apply. Initialize the

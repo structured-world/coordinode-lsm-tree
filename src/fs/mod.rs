@@ -62,6 +62,21 @@ pub struct FsOpenOptions {
     pub truncate: bool,
     /// Open in append mode, so writes go to the end of the file.
     pub append: bool,
+    /// Bypass the kernel page cache for this file (`O_DIRECT` on Linux).
+    ///
+    /// When set, the caller is responsible for issuing reads and writes
+    /// at offsets aligned to the filesystem's logical block size, with
+    /// userspace buffers aligned to the same boundary and lengths that
+    /// are a multiple of that block size. See [`AlignedBuf`] for an
+    /// aligned heap buffer suitable for `O_DIRECT` I/O.
+    ///
+    /// Platforms other than Linux/Android treat this as a no-op: macOS
+    /// has no equivalent flag (use `F_NOCACHE` on the open file descriptor
+    /// instead, which is not yet wired here), and Windows requires
+    /// `FILE_FLAG_NO_BUFFERING` at `CreateFile` time (also not wired).
+    /// Callers should treat `direct_io` as a hint that may be silently
+    /// ignored — correctness must not depend on it.
+    pub direct_io: bool,
 }
 
 impl Default for FsOpenOptions {
@@ -81,6 +96,7 @@ impl FsOpenOptions {
             create_new: false,
             truncate: false,
             append: false,
+            direct_io: false,
         }
     }
 
@@ -123,6 +139,13 @@ impl FsOpenOptions {
     #[must_use]
     pub const fn append(mut self, append: bool) -> Self {
         self.append = append;
+        self
+    }
+
+    /// Sets the `direct_io` flag.
+    #[must_use]
+    pub const fn direct_io(mut self, direct_io: bool) -> Self {
+        self.direct_io = direct_io;
         self
     }
 }
