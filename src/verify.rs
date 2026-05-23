@@ -404,11 +404,11 @@ fn scan_sst_blocks(path: &Path, table_id: TableId) -> std::io::Result<PerFileSca
 
     let mut file = std::fs::File::open(path)?;
 
-    // The SFA trailer + TOC live at the tail of the file. The block
-    // region runs from offset 0 to the start of the first TOC entry's
-    // post-payload byte — equivalently `max(pos + len)` across the TOC.
-    // sfa::Reader::from_reader leaves the cursor at an undefined offset,
-    // so we explicitly seek back to 0 before the walk.
+    // The SFA trailer + TOC live at the tail of the file.
+    // sfa::Reader::from_reader leaves the cursor at an undefined
+    // offset; each per-section walk below explicitly seeks to the
+    // section's `pos()` first so the unknown post-trailer position
+    // doesn't matter.
     let sfa_reader = sfa::Reader::from_reader(&mut file).map_err(|e| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -433,6 +433,12 @@ fn scan_sst_blocks(path: &Path, table_id: TableId) -> std::io::Result<PerFileSca
     let mut reader = BufReader::with_capacity(64 * 1024, file);
     let mut blocks_scanned: usize = 0;
     let mut errors: Vec<BlockVerifyError> = Vec::new();
+    // One reusable data buffer across the whole SST — sized up via
+    // `resize` per block instead of a fresh `vec![0u8; N]` allocation
+    // each iteration. On large trees this turns thousands of malloc
+    // calls into a single growing allocation that settles at the
+    // largest block size seen.
+    let mut data_buf: Vec<u8> = Vec::new();
 
     for entry in toc.iter() {
         if RAW_FORMAT_SECTIONS.contains(&entry.name()) {
@@ -441,15 +447,15 @@ fn scan_sst_blocks(path: &Path, table_id: TableId) -> std::io::Result<PerFileSca
         let start = entry.pos();
         let end = start.saturating_add(entry.len());
         reader.seek(SeekFrom::Start(start))?;
-        walk_block_region(
-            &mut reader,
+        let mut ctx = WalkCtx {
+            reader: &mut reader,
             table_id,
             path,
-            start,
-            end,
-            &mut blocks_scanned,
-            &mut errors,
-        );
+            data_buf: &mut data_buf,
+            blocks_scanned: &mut blocks_scanned,
+            errors: &mut errors,
+        };
+        walk_block_region(&mut ctx, start, end);
     }
 
     Ok(PerFileScan {
@@ -474,27 +480,32 @@ const RAW_FORMAT_SECTIONS: &[&[u8]] = &[b"linked_blob_files", b"table_version"];
 /// the range — that block is reported as `HeaderCorrupted` and the
 /// rest of the range is skipped because subsequent offsets become
 /// unrecoverable without a valid length field.
-fn walk_block_region(
-    reader: &mut std::io::BufReader<std::fs::File>,
+/// Mutable cursor + scratch state threaded through `walk_block_region`.
+/// Bundles the per-walk accumulators (file cursor, reused data
+/// buffer, counters, error sink) into one borrow so the function
+/// signature stays under clippy's argument-count cap.
+struct WalkCtx<'a> {
+    reader: &'a mut std::io::BufReader<std::fs::File>,
     table_id: TableId,
-    path: &Path,
-    start_offset: u64,
-    end_offset: u64,
-    blocks_scanned: &mut usize,
-    errors: &mut Vec<BlockVerifyError>,
-) {
+    path: &'a Path,
+    data_buf: &'a mut Vec<u8>,
+    blocks_scanned: &'a mut usize,
+    errors: &'a mut Vec<BlockVerifyError>,
+}
+
+fn walk_block_region(ctx: &mut WalkCtx<'_>, start_offset: u64, end_offset: u64) {
     use std::io::Read;
 
     let header_len = Header::serialized_len() as u64;
     let mut offset = start_offset;
 
     while offset < end_offset {
-        let header = match Header::decode_from(reader) {
+        let header = match Header::decode_from(ctx.reader) {
             Ok(h) => h,
             Err(e) => {
-                errors.push(BlockVerifyError::HeaderCorrupted {
-                    table_id,
-                    path: path.to_path_buf(),
+                ctx.errors.push(BlockVerifyError::HeaderCorrupted {
+                    table_id: ctx.table_id,
+                    path: ctx.path.to_path_buf(),
                     offset,
                     reason: format!("{e:?}"),
                 });
@@ -502,22 +513,51 @@ fn walk_block_region(
             }
         };
 
-        let mut data = vec![0u8; header.data_length as usize];
-        if let Err(e) = reader.read_exact(&mut data) {
-            errors.push(BlockVerifyError::HeaderCorrupted {
-                table_id,
-                path: path.to_path_buf(),
+        // Validate data_length against the remaining bytes in this
+        // section BEFORE allocating / reading. Header::decode_from
+        // already verified the header's own XXH3, so a data_length
+        // value that overruns the section bounds is either (a) genuine
+        // corruption that flipped bits past the XXH3-covered prefix
+        // *and* happened to still produce a valid header digest (rare
+        // but possible), or (b) a deliberate fuzz input. Either way,
+        // honouring it would read past `end_offset` into the next
+        // section and could trigger a multi-GB allocation if the
+        // length field is junk. Stop the region with HeaderCorrupted
+        // instead.
+        let data_length_u64 = u64::from(header.data_length);
+        let remaining = end_offset.saturating_sub(offset).saturating_sub(header_len);
+        if data_length_u64 > remaining {
+            ctx.errors.push(BlockVerifyError::HeaderCorrupted {
+                table_id: ctx.table_id,
+                path: ctx.path.to_path_buf(),
+                offset,
+                reason: format!(
+                    "header data_length {data_length_u64} exceeds remaining section bytes {remaining}",
+                ),
+            });
+            return;
+        }
+
+        let data_length = header.data_length as usize;
+        ctx.data_buf.resize(data_length, 0);
+        // `as_mut_slice` returns the whole `Vec` (exactly `data_length`
+        // bytes after the resize above) — full-slice access dodges
+        // the crate-wide `#[deny(clippy::indexing_slicing)]`.
+        if let Err(e) = ctx.reader.read_exact(ctx.data_buf.as_mut_slice()) {
+            ctx.errors.push(BlockVerifyError::HeaderCorrupted {
+                table_id: ctx.table_id,
+                path: ctx.path.to_path_buf(),
                 offset,
                 reason: format!("data segment read failed: {e}"),
             });
             return;
         }
 
-        let computed = Checksum::from_raw(crate::hash::hash128(&data));
+        let computed = Checksum::from_raw(crate::hash::hash128(ctx.data_buf));
         if computed != header.checksum {
-            errors.push(BlockVerifyError::DataCorrupted {
-                table_id,
-                path: path.to_path_buf(),
+            ctx.errors.push(BlockVerifyError::DataCorrupted {
+                table_id: ctx.table_id,
+                path: ctx.path.to_path_buf(),
                 offset,
                 data_length: header.data_length,
                 expected: header.checksum,
@@ -525,10 +565,10 @@ fn walk_block_region(
             });
         }
 
-        *blocks_scanned = blocks_scanned.saturating_add(1);
+        *ctx.blocks_scanned = ctx.blocks_scanned.saturating_add(1);
         offset = offset
             .saturating_add(header_len)
-            .saturating_add(u64::from(header.data_length));
+            .saturating_add(data_length_u64);
     }
 }
 
