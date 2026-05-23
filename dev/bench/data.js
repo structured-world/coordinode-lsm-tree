@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779472950343,
+  "lastUpdate": 1779520906441,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -8034,6 +8034,84 @@ window.BENCHMARK_DATA = {
             "value": 492432.83509742346,
             "unit": "ops/sec",
             "extra": "P50: 1.8us | P99: 5.4us | P99.9: 8.2us\nthreads: 1 | elapsed: 0.41s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "970a979190fdbca74ddc7b6b60622923ca422752",
+          "message": "perf(ci): proptest env-var budgets + slow-timeout audit (#158 items 2-5) (#306)\n\n## Summary\n\nCloses the remaining items of #158 — item 1 (conditional cross-compile\nmatrix) landed earlier as #292.\n\n### Items 2 + 3 — Proptest budget env vars\n\nAll three proptest suites (\\`prop_btreemap_oracle\\`, \\`prop_mvcc\\`,\n\\`prop_range_tombstone\\`) used to hardcode \\`cases: 32\\` +\n\\`max_shrink_iters: 1000\\` inline. They now read their config from a\nshared \\`common::proptest_config()\\` helper that honours:\n\n- \\`PROPTEST_CASES\\` (proptest already supports this natively, but the\nhelper sets the field explicitly so the default is 32, not proptest's\nbuilt-in 256).\n- \\`PROPTEST_MAX_SHRINK\\` (new — proptest does NOT honour an env var for\n\\`max_shrink_iters\\`).\n\n\\`coordinode-ci.yml\\` sets \\`PROPTEST_CASES=32 PROPTEST_MAX_SHRINK=100\\`\non every nextest invocation (test job, test-zstd job, codecov\nall-features, codecov zstd). The codecov side closes a gap (item 3)\nwhere coverage was previously running at the helper's default if the env\nvar wasn't applied.\n\n### Items 4 + 5 — Slow-test profile + slow-timeout audit\n\nTop-10 slowest non-proptest tests identified by running \\`cargo nextest\nrun --profile ci --all-features -E 'not test(prop_)'\\` on a 10-core M3\nPro. Slowest is 8.9s (\\`tree_bulk_ingest::blob_tree_copy\\`); nothing\nexceeds the 10s default-profile \\`slow-timeout\\` or the\n\\`terminate-after = 6\\` (60s wall) budget. CI profile is 120s × 3 — even\nmore headroom.\n\nDocumented the top-10 in \\`nextest.toml\\`'s header comment so the audit\nbaseline travels with the config.\n\n## Changes\n\n- \\`tests/common/mod.rs\\` — added \\`proptest_config()\\` helper with\nenv-var lookup.\n- \\`tests/prop_btreemap_oracle.rs\\`, \\`tests/prop_mvcc.rs\\`,\n\\`tests/prop_range_tombstone.rs\\` — replaced inline \\`ProptestConfig {\n... }\\` with \\`#![proptest_config(common::proptest_config())]\\`.\n- \\`.github/workflows/coordinode-ci.yml\\` — set \\`PROPTEST_CASES=32\nPROPTEST_MAX_SHRINK=100\\` on 4 nextest invocations (test, test-zstd,\ncodecov all-features, codecov zstd).\n- \\`.config/nextest.toml\\` — recorded top-10 slowest tests as a header\ncomment; clarified the proptest override now points at the shared\nhelper.\n\n## Testing\n\n- All proptest suites pass with the new helper.\n- \\`cargo nextest run --profile ci --all-features\\` passes (1515 tests,\n1 leaky).\n- \\`cargo clippy --all-features --tests -- -D warnings\\` clean.\n\nCloses #158.\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n\n## Summary by CodeRabbit\n\n* **Chores**\n* Updated CI workflows and test configuration files to standardize\nproperty-based testing parameters.\n\n* **Tests**\n* Centralized property-based test configuration with environment\nvariable support for runtime customization.\n* Refactored test cases to use shared configuration, improving\nconsistency across test suites and simplifying configuration management.\n\n<!-- review_stack_entry_start -->\n\n[![Review Change\nStack](https://storage.googleapis.com/coderabbit_public_assets/review-stack-in-coderabbit-ui.svg)](https://app.coderabbit.ai/change-stack/structured-world/coordinode-lsm-tree/pull/306?utm_source=github_walkthrough&utm_medium=github&utm_campaign=change_stack)\n\n<!-- review_stack_entry_end -->\n\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-05-23T10:20:56+03:00",
+          "tree_id": "7b2868c68e1d29216299121cca87b1f7f0478a08",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/970a979190fdbca74ddc7b6b60622923ca422752"
+        },
+        "date": 1779520904875,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 2017621.0956005368,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.6us | P99.9: 3.7us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1242497.9603930044,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.2us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 638917.2938206944,
+            "unit": "ops/sec",
+            "extra": "P50: 1.4us | P99: 4.7us | P99.9: 7.1us\nthreads: 1 | elapsed: 0.31s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3617875.3722974653,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 3.0us | P99.9: 5.4us\nthreads: 1 | elapsed: 0.06s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 441809.1032154626,
+            "unit": "ops/sec",
+            "extra": "P50: 2.0us | P99: 5.2us | P99.9: 8.0us\nthreads: 1 | elapsed: 0.45s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 224327.85117042295,
+            "unit": "ops/sec",
+            "extra": "P50: 4.2us | P99: 5.2us | P99.9: 7.7us\nthreads: 1 | elapsed: 0.89s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1130560.8529240498,
+            "unit": "ops/sec",
+            "extra": "P50: 0.8us | P99: 2.3us | P99.9: 4.3us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1141376.5426838219,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.5us | P99.9: 1.9us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 534536.1094255925,
+            "unit": "ops/sec",
+            "extra": "P50: 1.7us | P99: 5.2us | P99.9: 7.6us\nthreads: 1 | elapsed: 0.37s | num: 200000 | iterations: 3"
           }
         ]
       }
