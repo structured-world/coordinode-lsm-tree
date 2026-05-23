@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779563009403,
+  "lastUpdate": 1779570910330,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -8502,6 +8502,84 @@ window.BENCHMARK_DATA = {
             "value": 543898.7714751768,
             "unit": "ops/sec",
             "extra": "P50: 1.7us | P99: 5.0us | P99.9: 7.6us\nthreads: 1 | elapsed: 0.37s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "b54390c6667f31225140da58b71c38a37d2657d6",
+          "message": "perf(fs): O_DIRECT foundation — AlignedBuf + FsOpenOptions::direct_io (#133 phase 2) (#310)\n\n## Summary\n\nFoundation layer for `O_DIRECT` cache-bypass I/O. Two pieces:\n\n1. **`AlignedBuf`** (`src/fs/aligned_buf.rs`) — heap-allocated byte\nbuffer with caller-specified alignment. `Vec<u8>` defaults to\n`align_of::<u8>() = 1`, which violates `O_DIRECT`'s typical 4 KiB\nuserspace-buffer alignment (EINVAL on unaligned write/read).\n`AlignedBuf` allocates via `Layout::from_size_align`, rounds capacity up\nto a multiple of alignment, and exposes a `Vec`-like surface\n(`len`/`capacity`/`as_slice`/`as_capacity_mut`/`set_len`/`clear`) + raw\nptr accessors for kernel handoff.\n\n2. **`FsOpenOptions::direct_io`** — new `bool` field + builder method.\nOn Linux/Android (arches where `asm-generic/fcntl.h`'s `O_DIRECT =\n0o40000` is the authoritative value: x86, x86_64, aarch64, riscv32/64,\nloongarch64, s390x) the flag becomes a `custom_flags(O_DIRECT)` on the\nstd `OpenOptions` builder, in both `StdFs::open` and `IoUringFs::open`.\n\n`O_DIRECT` is declared as a named constant rather than pulling in `libc`\n— matches the existing `EXDEV` / `flock` pattern in `std_fs.rs`.\nArchitectures with a divergent `O_DIRECT` bit (arm `0o200000`, mips\n`0o100000`, parisc, sparc) are not gated on purpose: emitting the wrong\nbit silently would be worse than honouring the documented \"`direct_io`\nmay be ignored\" contract. macOS / Windows / other Unix targets fall\nthrough to a cached open for the same reason — `F_NOCACHE` /\n`FILE_FLAG_NO_BUFFERING` each need their own opt-in plumbing.\n\n## Design choices (explicit so review does not re-raise)\n\n- **`FsOpenOptions` is `#[non_exhaustive]`.** This is breaking\n(struct-literal callers + exhaustive pattern matches stop compiling) but\nonly relative to the same release that introduces the new `direct_io`\nfield — which is already breaking for the same callers. Bundling both\nchanges in one release confines the break to a single semver-major bump\n(v5.0.0, queued in PR #272) and lets every future field land as\nsemver-minor. Builder methods (`.read()`, `.write()`, … `.direct_io()`)\ncover every field, so non-struct-literal callers are unaffected.\n\n- **`fs::direct_io` submodule IS gated behind `#[cfg(feature =\n\"std\")]`.** It uses `std::fs::OpenOptions` and is therefore std-only.\nThe gate is the first concrete step toward honestly feature-gating the\nstd backend per crate policy. However, it does NOT by itself unblock a\n`no_std + alloc` build: the rest of the `fs::*` backend — the\n`Fs`/`FsFile` trait *definitions* and all impls (`std_fs`,\n`io_uring_fs`, even `MemFs`) — still references `std::io::{Read, Write,\nSeek}` + `std::path::Path` directly, and those have no `core::*`\nequivalents. Porting the trait surface off `std::io` / `std::path` is a\nstructural prerequisite tracked as a separate prerequisite issue (#311),\nitself part of the no-std migration epic (#274). The `no-std-check` CI\njob is `continue-on-error` for exactly this reason — net error count is\nnot changed by this PR.\n\n## What's NOT in this PR\n\nThe Tree-level `Config::direct_io` knob and compaction-writer\nintegration are deferred to a follow-up. The current SST writer uses\n`Vec<u8>` buffers and unaligned block sizes; wiring `direct_io` into\n`Config` without an alignment-aware writer would EINVAL on first write.\nFoundation lands here so the writer refactor can build on it.\n\n## Test plan\n\n- [x] 12 unit tests for `AlignedBuf` (alignment verification, capacity\nrounding, zero init, rejects non-power-of-two / excessive alignment,\nzero-capacity dangling sentinel, `set_len` growth + panic, `clear`,\n`as_capacity_mut` writes, `Send`/`Sync` compile check, pointer\nstability)\n- [x] `fs_open_options_default` + `fs_open_options_builders` updated to\ncover the new field\n- [x] Full nextest suite: 1542 tests pass (1 slow), 6 skipped\n- [x] cargo clippy all-features all-targets with -D warnings — clean\n- [x] Doctest for `AlignedBuf::new_zeroed` example compiles and passes\n\n## Related\n\n- #311 — port `Fs`/`FsFile` traits off `std::io` + `std::path`\n(prerequisite for the rest of `fs::*` to become honestly\nfeature-gateable)\n- #274 — no-std migration epic (parent)\n- #272 — release-plz v5.0.0 (semver-major bump that ships the breaking\nchanges here)\n\nPart of #133",
+          "timestamp": "2026-05-24T00:14:15+03:00",
+          "tree_id": "f8f1a6a2373721975950949207527971bbeec057",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/b54390c6667f31225140da58b71c38a37d2657d6"
+        },
+        "date": 1779570908802,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 1906962.557715056,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.7us | P99.9: 3.9us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1067131.059338228,
+            "unit": "ops/sec",
+            "extra": "P50: 0.8us | P99: 2.4us | P99.9: 4.8us\nthreads: 1 | elapsed: 0.19s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 547048.3998117672,
+            "unit": "ops/sec",
+            "extra": "P50: 1.7us | P99: 4.8us | P99.9: 7.6us\nthreads: 1 | elapsed: 0.37s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3570161.4191363077,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 3.1us | P99.9: 5.8us\nthreads: 1 | elapsed: 0.06s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 398730.91843534214,
+            "unit": "ops/sec",
+            "extra": "P50: 2.2us | P99: 5.4us | P99.9: 8.6us\nthreads: 1 | elapsed: 0.50s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 212830.09900468856,
+            "unit": "ops/sec",
+            "extra": "P50: 4.4us | P99: 5.7us | P99.9: 7.9us\nthreads: 1 | elapsed: 0.94s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1093823.6895346844,
+            "unit": "ops/sec",
+            "extra": "P50: 0.8us | P99: 2.4us | P99.9: 4.6us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1110399.0492141517,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.5us | P99.9: 2.0us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 469482.69743819017,
+            "unit": "ops/sec",
+            "extra": "P50: 2.0us | P99: 5.3us | P99.9: 8.0us\nthreads: 1 | elapsed: 0.43s | num: 200000 | iterations: 3"
           }
         ]
       }
