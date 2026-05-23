@@ -286,10 +286,11 @@ pub enum BlockVerifyError {
         offset: u64,
         /// Length the (clean) header advertised for the data segment.
         data_length: u32,
-        /// String form of the underlying I/O error (the error type is
-        /// not preserved across the variant boundary to keep this
-        /// enum no-std-friendly down the line).
-        error: String,
+        /// Underlying I/O error from the failed data-segment read.
+        /// Kept as `std::io::Error` (matching `SstFileUnreadable`) so
+        /// `ErrorKind` / OS code stay available to callers and so
+        /// `Error::source()` produces a coherent chain.
+        error: std::io::Error,
     },
 }
 
@@ -347,7 +348,9 @@ impl std::fmt::Display for BlockVerifyError {
 impl std::error::Error for BlockVerifyError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::SstFileUnreadable { error, .. } => Some(error),
+            Self::SstFileUnreadable { error, .. } | Self::DataReadError { error, .. } => {
+                Some(error)
+            }
             _ => None,
         }
     }
@@ -381,14 +384,18 @@ impl BlockVerifyReport {
 ///
 /// Pipeline per SST:
 ///
-/// 1. Open the file, parse the SFA trailer to find the end of the
-///    block region (everything before the SFA TOC + trailer footer).
-/// 2. From offset 0, decode each block's `Header` (which validates
-///    the header's own XXH3), read the data segment, and compare a
-///    fresh XXH3 over the data against `header.checksum`.
-/// 3. Advance the offset by `Header::serialized_len() + data_length`
-///    until the offset reaches the block-region end. A corrupt header
-///    inside the region stops that SST's walk and is reported.
+/// 1. Open the file and parse the SFA trailer to obtain the TOC.
+/// 2. For each TOC section, skip if its name is in `RAW_FORMAT_SECTIONS`
+///    (those payloads are not `Header`-prefixed and are covered by the
+///    SFA-trailer checksum). Otherwise seek to the section's start
+///    offset and walk it as a contiguous block region in
+///    `[start, start + length)`.
+/// 3. Inside each block region, decode each block's `Header` (which
+///    validates the header's own XXH3), read the data segment, and
+///    compare a fresh XXH3 over the data against `header.checksum`.
+///    Advance by `Header::serialized_len() + data_length` until the
+///    section end. A corrupt header inside a section stops that
+///    section's walk and is reported; the next section is still walked.
 ///
 /// This is the read-side scrub primitive: it catches the same bit-rot
 /// signal a live read would surface, ahead of time, with per-block
@@ -429,10 +436,13 @@ struct PerFileScan {
     errors: Vec<BlockVerifyError>,
 }
 
-/// Walks every block of one SST. Returns `Err` only when the file
-/// can't be opened at all or its SFA trailer fails to parse (which
-/// makes the whole walk impossible). Per-block errors come back via
-/// `PerFileScan::errors`.
+/// Walks every block of one SST. Returns `Err` on any file-level
+/// I/O or trailer-parse failure that makes the whole walk impossible
+/// — file open, SFA trailer parse, or a `seek` to a TOC section's
+/// start offset that fails before any block is read. Per-block errors
+/// (corrupt headers, mismatched data checksums, post-header read
+/// failures) come back inside `PerFileScan::errors` and never cause
+/// an early return.
 fn scan_sst_blocks(path: &Path, table_id: TableId) -> std::io::Result<PerFileScan> {
     use std::io::{BufReader, Seek, SeekFrom};
 
@@ -492,7 +502,26 @@ fn scan_sst_blocks(path: &Path, table_id: TableId) -> std::io::Result<PerFileSca
             continue;
         }
         let start = entry.pos();
-        let end = start.saturating_add(entry.len());
+        // `checked_add` (not `saturating_add`) so a corrupted or
+        // forged TOC length cannot silently collapse to `u64::MAX`
+        // and let the walk treat the whole address space as one
+        // section. On overflow we surface the section as a
+        // file-level `HeaderCorrupted` and skip walking it — the
+        // other (still-walkable) sections of the same SST are
+        // honoured.
+        let Some(end) = start.checked_add(entry.len()) else {
+            errors.push(BlockVerifyError::HeaderCorrupted {
+                table_id,
+                path: path.to_path_buf(),
+                offset: start,
+                reason: format!(
+                    "TOC section {:?} length {} overflows u64 when added to start offset {start}",
+                    entry.name(),
+                    entry.len(),
+                ),
+            });
+            continue;
+        };
         reader.seek(SeekFrom::Start(start))?;
         let mut ctx = WalkCtx {
             reader: &mut reader,
@@ -643,7 +672,7 @@ fn walk_block_region(ctx: &mut WalkCtx<'_>, start_offset: u64, end_offset: u64) 
                 path: ctx.path.to_path_buf(),
                 offset,
                 data_length: header.data_length,
-                error: format!("{e}"),
+                error: e,
             });
             return;
         }
@@ -678,6 +707,11 @@ mod block_verify_tests {
         config::CompressionPolicy,
     };
     use std::io::{Read, Seek, SeekFrom, Write};
+    // Shadows the built-in `#[test]` so `#[test]`-annotated functions
+    // below resolve to `test_log::test` (which wires up logging for
+    // failing tests). This matches every other test module in the
+    // crate — the import looks unused at a glance but the proc-macro
+    // attribute name resolution consumes it.
     use test_log::test;
 
     fn populate_tree(dir: &std::path::Path, items: usize) {
