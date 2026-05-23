@@ -29,9 +29,13 @@ use core::slice;
 ///
 /// # Invariants
 ///
-/// - `ptr` is always non-null and points to a region of at least
-///   `capacity` bytes allocated via the global allocator with
-///   `Layout::from_size_align(capacity, alignment)`.
+/// - `ptr` is always non-null. When `capacity > 0`, it points to a
+///   region of at least `capacity` bytes allocated via the global
+///   allocator with `Layout::from_size_align(capacity, alignment)`.
+///   When `capacity == 0`, it is a non-dereferenceable dangling
+///   sentinel synthesised from the requested alignment (see
+///   `new_zeroed` for the special-case path) — `len == 0` always
+///   holds in that case, so the sentinel is never dereferenced.
 /// - `len <= capacity`.
 /// - `alignment` is a power of two ≥ 1 and ≤ `isize::MAX as usize`
 ///   (enforced at construction).
@@ -110,10 +114,16 @@ impl AlignedBuf {
         if rounded > (isize::MAX as usize) {
             return None;
         }
-        // 0-byte allocation is undefined for the global allocator;
-        // synthesise a non-null dangling pointer with the requested
-        // alignment instead. Reads / writes through it are bounded
-        // by `len == 0`, so they never touch the dangling address.
+        // `alloc::alloc::alloc(layout)` requires `layout.size() > 0`
+        // — calling it with a zero-size layout is UB per the trait
+        // docs (Layout itself accepts size==0, but the allocator
+        // call does not). Std handles this for `Vec<T>` etc. by
+        // using `NonNull::dangling()` internally; we do the same
+        // here but synthesise the sentinel from the caller's
+        // requested alignment so `as_ptr().addr() % alignment == 0`
+        // still holds for zero-capacity buffers. The sentinel is
+        // never dereferenced — every read/write path is bounded by
+        // `len`, which is 0 here.
         if rounded == 0 {
             // SAFETY: alignment is a power of two ≥ 1, so casting it
             // to a pointer is well-defined and the pointer is non-

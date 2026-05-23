@@ -24,6 +24,7 @@
 //!   do not help for storage I/O patterns); [`StdFs`] is the correct choice
 
 pub mod aligned_buf;
+mod direct_io;
 mod mem_fs;
 mod std_fs;
 
