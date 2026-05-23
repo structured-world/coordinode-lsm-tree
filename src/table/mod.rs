@@ -951,15 +951,31 @@ impl Table {
                         "TAIL meta block unreadable for {} ({tail_err}); falling back to MID copy",
                         file_path.display(),
                     );
-                    let mut mid =
-                        ParsedMeta::load_with_handle(&*file, &mid_handle, encryption.as_deref())?;
-                    // MID writes file_size as a 0 sentinel because the
-                    // file isn't done growing when the section is
-                    // emitted. Recover the real on-disk size now.
-                    if mid.file_size == 0 {
-                        mid.file_size = std::fs::metadata(&*file_path)?.len();
+                    // Match the PR contract: when BOTH copies fail,
+                    // surface the original TAIL error (callers care
+                    // about the authoritative copy's failure mode).
+                    // The MID failure goes to the log so it's not
+                    // silently dropped from diagnostics.
+                    match ParsedMeta::load_with_handle(&*file, &mid_handle, encryption.as_deref()) {
+                        Ok(mut mid) => {
+                            // MID writes file_size as a 0 sentinel because
+                            // the file isn't done growing when the section
+                            // is emitted. Recover the real on-disk size
+                            // now.
+                            if mid.file_size == 0 {
+                                mid.file_size = std::fs::metadata(&*file_path)?.len();
+                            }
+                            mid
+                        }
+                        Err(mid_err) => {
+                            log::warn!(
+                                "MID meta block also unreadable for {}: {mid_err}; \
+                                 returning original TAIL error",
+                                file_path.display(),
+                            );
+                            return Err(tail_err);
+                        }
                     }
-                    mid
                 } else {
                     return Err(tail_err);
                 }

@@ -75,26 +75,56 @@ fn meta_mirror_writer_emits_both_copies() {
 
     let tail = locate_section(&sst, b"meta");
     let mid = locate_section(&sst, b"meta_mid");
+    let sep = locate_section(&sst, b"meta_separator");
 
     assert!(tail.is_some(), "TAIL meta section must be present");
     assert!(
         mid.is_some(),
         "MID meta_mid section must be present (mirror)"
     );
+    assert!(
+        sep.is_some(),
+        "meta_separator section must be present (sector isolation)"
+    );
 
-    let (tail_off, _) = tail.unwrap();
-    let (mid_off, _) = mid.unwrap();
-    // MID is written before TAIL — its offset must be smaller, and
-    // there must be at least one 4 KiB filesystem sector between
-    // them (meta_separator section enforces this).
+    let (tail_off, _tail_len) = tail.unwrap();
+    let (mid_off, mid_len) = mid.unwrap();
+    let (sep_off, sep_len) = sep.unwrap();
+
+    // MID is written before TAIL — its offset must be smaller.
     assert!(
         mid_off < tail_off,
         "MID at offset {mid_off} should come before TAIL at {tail_off}"
     );
+
+    // The intended invariant is that MID and TAIL cannot share a
+    // 4 KiB filesystem sector. Measure the actual byte gap from the
+    // END of MID to the START of TAIL (start-to-start would be
+    // inflated by mid_len and could pass even when the real gap is
+    // < 4 KiB).
+    let mid_end = mid_off + mid_len;
     assert!(
-        tail_off - mid_off >= 4096,
-        "MID..TAIL gap of {} bytes is below 4 KiB sector separation",
-        tail_off - mid_off,
+        mid_end <= tail_off,
+        "MID ends at {mid_end} but TAIL starts at {tail_off} (overlap)"
+    );
+    let real_gap = tail_off - mid_end;
+    assert!(
+        real_gap >= 4096,
+        "real MID-end..TAIL-start gap is {real_gap} bytes, below 4 KiB sector separation",
+    );
+
+    // The separator itself must be the documented 4 KiB and must
+    // actually sit between MID and TAIL — not somewhere harmless
+    // like before MID or after TAIL where it would not isolate them.
+    assert_eq!(
+        sep_len, 4096,
+        "meta_separator must be exactly 4096 bytes; got {sep_len}"
+    );
+    assert!(
+        sep_off >= mid_end && sep_off + sep_len <= tail_off,
+        "meta_separator at {sep_off}..{} must lie strictly between \
+         MID end {mid_end} and TAIL start {tail_off}",
+        sep_off + sep_len,
     );
 }
 
