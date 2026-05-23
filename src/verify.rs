@@ -2,8 +2,8 @@
 // Copyright (c) 2024-present, fjall-rs
 // Copyright (c) 2026-present, Structured World Foundation
 
-use crate::{checksum::Checksum, table::TableId};
-use std::path::PathBuf;
+use crate::{checksum::Checksum, coding::Decode, table::TableId, table::block::Header};
+use std::path::{Path, PathBuf};
 
 /// Describes a single integrity error found during verification.
 #[derive(Debug)]
@@ -214,4 +214,451 @@ pub fn verify_integrity(tree: &impl crate::AbstractTree) -> IntegrityReport {
     }
 
     report
+}
+
+// ── Block-level scrub ─────────────────────────────────────────────────────
+// `verify_integrity` above hashes each SST as one opaque byte stream and
+// compares the digest to the per-file checksum stored in the manifest. That
+// catches whole-file corruption but identifies the bad region only at file
+// granularity. The functions below walk every block inside every SST and
+// verify per-block XXH3 against the value embedded in each block's own
+// header, so a corrupt block can be reported with its exact `(file, offset)`
+// without re-running the manifest-level scan.
+
+/// Per-block verification error.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum BlockVerifyError {
+    /// SST file could not be opened or its trailer parsed.
+    SstFileUnreadable {
+        /// Table ID.
+        table_id: TableId,
+        /// Path to the SST file.
+        path: PathBuf,
+        /// Underlying I/O / format error.
+        error: std::io::Error,
+    },
+
+    /// A block header at the given offset failed to parse — either
+    /// XXH3 mismatch on the header itself, or invalid magic bytes /
+    /// length fields that point at on-disk corruption.
+    HeaderCorrupted {
+        /// Table ID.
+        table_id: TableId,
+        /// Path to the SST file.
+        path: PathBuf,
+        /// File offset where the corrupt header was read from.
+        offset: u64,
+        /// Short description of the failure surfaced by header decoding.
+        reason: String,
+    },
+
+    /// A block's data XXH3 did not match the value stored in its header.
+    /// Indicates bit-rot or torn write on the block payload.
+    DataCorrupted {
+        /// Table ID.
+        table_id: TableId,
+        /// Path to the SST file.
+        path: PathBuf,
+        /// File offset where the block header sits (the data follows it).
+        offset: u64,
+        /// Length of the on-disk data segment, in bytes.
+        data_length: u32,
+        /// Checksum stored in the block header.
+        expected: Checksum,
+        /// Checksum computed from the on-disk bytes.
+        got: Checksum,
+    },
+}
+
+impl std::fmt::Display for BlockVerifyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SstFileUnreadable {
+                table_id,
+                path,
+                error,
+            } => write!(
+                f,
+                "SST table {table_id} at {} could not be opened/parsed: {error}",
+                path.display(),
+            ),
+            Self::HeaderCorrupted {
+                table_id,
+                path,
+                offset,
+                reason,
+            } => write!(
+                f,
+                "SST table {table_id} at {}: block header at offset {offset} is corrupt ({reason})",
+                path.display(),
+            ),
+            Self::DataCorrupted {
+                table_id,
+                path,
+                offset,
+                data_length,
+                expected,
+                got,
+            } => write!(
+                f,
+                "SST table {table_id} at {}: block at offset {offset} ({data_length} bytes) data \
+                 checksum mismatch, expected {expected}, got {got}",
+                path.display(),
+            ),
+        }
+    }
+}
+
+impl std::error::Error for BlockVerifyError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::SstFileUnreadable { error, .. } => Some(error),
+            _ => None,
+        }
+    }
+}
+
+/// Aggregated result of a per-block scrub run.
+#[derive(Debug, Default)]
+#[non_exhaustive]
+pub struct BlockVerifyReport {
+    /// Number of SST table files visited (one per scan).
+    pub sst_files_scanned: usize,
+    /// Total blocks successfully header-read across all SSTs. Includes
+    /// blocks where the data checksum subsequently failed.
+    pub blocks_scanned: usize,
+    /// Per-block errors collected during the scan. The scan always
+    /// runs to completion across all SSTs even if individual blocks
+    /// or whole files are corrupt.
+    pub errors: Vec<BlockVerifyError>,
+}
+
+impl BlockVerifyReport {
+    /// `true` if every block in every SST verified clean.
+    #[must_use]
+    pub fn is_ok(&self) -> bool {
+        self.errors.is_empty()
+    }
+}
+
+/// Walks every block in every SST referenced by the tree's current
+/// version and verifies each block's XXH3 checksum.
+///
+/// Pipeline per SST:
+///
+/// 1. Open the file, parse the SFA trailer to find the end of the
+///    block region (everything before the SFA TOC + trailer footer).
+/// 2. From offset 0, decode each block's `Header` (which validates
+///    the header's own XXH3), read the data segment, and compare a
+///    fresh XXH3 over the data against `header.checksum`.
+/// 3. Advance the offset by `Header::serialized_len() + data_length`
+///    until the offset reaches the block-region end. A corrupt header
+///    inside the region stops that SST's walk and is reported.
+///
+/// This is the read-side scrub primitive: it catches the same bit-rot
+/// signal a live read would surface, ahead of time, with per-block
+/// `(file, offset)` granularity. Decompression and decryption errors
+/// are out of scope here — those depend on per-level/per-block context
+/// (compression policy, encryption key, dictionary) that the scrub
+/// path does not need to reach checksum-level corruption.
+#[must_use]
+pub fn verify_block_checksums(tree: &impl crate::AbstractTree) -> BlockVerifyReport {
+    let version = tree.current_version();
+    let mut report = BlockVerifyReport::default();
+
+    for table in version.iter_tables() {
+        let path: &Path = &table.path;
+        let table_id = table.id();
+        report.sst_files_scanned += 1;
+
+        match scan_sst_blocks(path, table_id) {
+            Ok(per_file) => {
+                report.blocks_scanned += per_file.blocks_scanned;
+                report.errors.extend(per_file.errors);
+            }
+            Err(error) => {
+                report.errors.push(BlockVerifyError::SstFileUnreadable {
+                    table_id,
+                    path: path.to_path_buf(),
+                    error,
+                });
+            }
+        }
+    }
+
+    report
+}
+
+struct PerFileScan {
+    blocks_scanned: usize,
+    errors: Vec<BlockVerifyError>,
+}
+
+/// Walks every block of one SST. Returns `Err` only when the file
+/// can't be opened at all or its SFA trailer fails to parse (which
+/// makes the whole walk impossible). Per-block errors come back via
+/// `PerFileScan::errors`.
+fn scan_sst_blocks(path: &Path, table_id: TableId) -> std::io::Result<PerFileScan> {
+    use std::io::{BufReader, Seek, SeekFrom};
+
+    let mut file = std::fs::File::open(path)?;
+
+    // The SFA trailer + TOC live at the tail of the file. The block
+    // region runs from offset 0 to the start of the first TOC entry's
+    // post-payload byte — equivalently `max(pos + len)` across the TOC.
+    // sfa::Reader::from_reader leaves the cursor at an undefined offset,
+    // so we explicitly seek back to 0 before the walk.
+    let sfa_reader = sfa::Reader::from_reader(&mut file).map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("SFA trailer parse: {e:?}"),
+        )
+    })?;
+    let toc = sfa_reader.toc();
+    // SFA TOC layout: the first call to `sfa::Writer::start()` for a
+    // named section flushes everything written before it as an
+    // UNNAMED TOC entry (name == b"", pos == 0, len == data_block
+    // region size) — that's how the data blocks (which are written
+    // before any named section starts) appear in the TOC. Subsequent
+    // entries are named (`index`, `filter`, `range_tombstones`,
+    // `meta`, `linked_blob_files`, `table_version`).
+    //
+    // Block-formatted sections that the per-block walk understands:
+    // empty (data blocks), `index`, `filter`, `range_tombstones`,
+    // `meta`. Raw-format sections (`linked_blob_files`, the 1-byte
+    // `table_version`) are skipped — their integrity is covered by
+    // the SFA-trailer checksum verified at table-open time.
+
+    let mut reader = BufReader::with_capacity(64 * 1024, file);
+    let mut blocks_scanned: usize = 0;
+    let mut errors: Vec<BlockVerifyError> = Vec::new();
+
+    for entry in toc.iter() {
+        if RAW_FORMAT_SECTIONS.contains(&entry.name()) {
+            continue;
+        }
+        let start = entry.pos();
+        let end = start.saturating_add(entry.len());
+        reader.seek(SeekFrom::Start(start))?;
+        walk_block_region(
+            &mut reader,
+            table_id,
+            path,
+            start,
+            end,
+            &mut blocks_scanned,
+            &mut errors,
+        );
+    }
+
+    Ok(PerFileScan {
+        blocks_scanned,
+        errors,
+    })
+}
+
+/// SFA TOC section names whose payload is NOT a sequence of `Block`s
+/// (i.e. NOT prefixed with the standard `Header`). The scrub skips
+/// these sections — their integrity is covered by the SFA-trailer
+/// checksum verified at table-open time. Every other section (the
+/// unnamed leading data-block region, plus `index`, `filter`,
+/// `range_tombstones`, `meta`) is a `Header`-prefixed block run and
+/// gets walked.
+const RAW_FORMAT_SECTIONS: &[&[u8]] = &[b"linked_blob_files", b"table_version"];
+
+/// Walks the contiguous block range `[start_offset, end_offset)`,
+/// decoding each block's header (which validates the header's own
+/// XXH3) and then re-hashing the data segment against
+/// `header.checksum`. Stops at the first un-parseable header inside
+/// the range — that block is reported as `HeaderCorrupted` and the
+/// rest of the range is skipped because subsequent offsets become
+/// unrecoverable without a valid length field.
+fn walk_block_region(
+    reader: &mut std::io::BufReader<std::fs::File>,
+    table_id: TableId,
+    path: &Path,
+    start_offset: u64,
+    end_offset: u64,
+    blocks_scanned: &mut usize,
+    errors: &mut Vec<BlockVerifyError>,
+) {
+    use std::io::Read;
+
+    let header_len = Header::serialized_len() as u64;
+    let mut offset = start_offset;
+
+    while offset < end_offset {
+        let header = match Header::decode_from(reader) {
+            Ok(h) => h,
+            Err(e) => {
+                errors.push(BlockVerifyError::HeaderCorrupted {
+                    table_id,
+                    path: path.to_path_buf(),
+                    offset,
+                    reason: format!("{e:?}"),
+                });
+                return;
+            }
+        };
+
+        let mut data = vec![0u8; header.data_length as usize];
+        if let Err(e) = reader.read_exact(&mut data) {
+            errors.push(BlockVerifyError::HeaderCorrupted {
+                table_id,
+                path: path.to_path_buf(),
+                offset,
+                reason: format!("data segment read failed: {e}"),
+            });
+            return;
+        }
+
+        let computed = Checksum::from_raw(crate::hash::hash128(&data));
+        if computed != header.checksum {
+            errors.push(BlockVerifyError::DataCorrupted {
+                table_id,
+                path: path.to_path_buf(),
+                offset,
+                data_length: header.data_length,
+                expected: header.checksum,
+                got: computed,
+            });
+        }
+
+        *blocks_scanned = blocks_scanned.saturating_add(1);
+        offset = offset
+            .saturating_add(header_len)
+            .saturating_add(u64::from(header.data_length));
+    }
+}
+
+#[cfg(test)]
+#[expect(clippy::unwrap_used, clippy::expect_used, reason = "test assertions")]
+mod block_verify_tests {
+    use super::*;
+    use crate::{
+        AbstractTree, Config, SequenceNumberCounter, compression::CompressionType,
+        config::CompressionPolicy,
+    };
+    use std::io::{Read, Seek, SeekFrom, Write};
+    use test_log::test;
+
+    fn populate_tree(dir: &std::path::Path, items: usize) {
+        let cfg = Config::new(
+            dir,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .data_block_compression_policy(CompressionPolicy::all(CompressionType::None));
+        let tree = cfg.open().unwrap();
+        for i in 0u64..items as u64 {
+            let key = format!("k{i:08}");
+            let val = format!("v{i:08}");
+            tree.insert(key.as_bytes(), val.as_bytes(), 1 + i);
+        }
+        tree.flush_active_memtable(1 + items as u64).unwrap();
+        // Drop the tree so all files are closed before the test that
+        // mutates SST bytes on disk reopens them via Verify.
+        drop(tree);
+    }
+
+    fn reopen_tree(dir: &std::path::Path) -> crate::AnyTree {
+        Config::new(
+            dir,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .data_block_compression_policy(CompressionPolicy::all(CompressionType::None))
+        .open()
+        .unwrap()
+    }
+
+    #[test]
+    fn verify_block_checksums_clean_tree_has_no_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        populate_tree(dir.path(), 1_000);
+
+        let tree = reopen_tree(dir.path());
+        let report = verify_block_checksums(&tree);
+        assert!(
+            report.is_ok(),
+            "expected clean tree to verify with zero errors, got {:?}",
+            report.errors
+        );
+        assert!(
+            report.blocks_scanned > 0,
+            "expected at least one block scanned",
+        );
+        assert!(
+            report.sst_files_scanned >= 1,
+            "expected at least one SST scanned",
+        );
+    }
+
+    #[test]
+    fn verify_block_checksums_detects_flipped_byte_in_data_block() {
+        use crate::table::block::Header;
+        let dir = tempfile::tempdir().unwrap();
+        populate_tree(dir.path(), 1_000);
+
+        // Find any SST file. The flip target is the first byte AFTER
+        // the first block's Header — that lands squarely inside the
+        // data segment of the first data block, so the header's own
+        // XXH3 stays valid (no HeaderCorrupted) but the data XXH3
+        // will now mismatch.
+        let mut sst_path: Option<std::path::PathBuf> = None;
+        for level_dir in std::fs::read_dir(dir.path()).unwrap().flatten() {
+            let p = level_dir.path();
+            if p.is_dir() {
+                for entry in std::fs::read_dir(&p).unwrap().flatten() {
+                    let ep = entry.path();
+                    if ep.is_file()
+                        && ep.metadata().unwrap().len() > Header::serialized_len() as u64 + 16
+                    {
+                        sst_path = Some(ep);
+                        break;
+                    }
+                }
+            }
+            if sst_path.is_some() {
+                break;
+            }
+        }
+        let sst_path = sst_path.expect("at least one populated SST file");
+
+        let flip_offset = Header::serialized_len() as u64;
+        {
+            let mut f = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&sst_path)
+                .unwrap();
+            f.seek(SeekFrom::Start(flip_offset)).unwrap();
+            let mut byte = [0u8; 1];
+            f.read_exact(&mut byte).unwrap();
+            byte[0] ^= 0xFF;
+            f.seek(SeekFrom::Start(flip_offset)).unwrap();
+            f.write_all(&byte).unwrap();
+            f.sync_all().unwrap();
+        }
+
+        let tree = reopen_tree(dir.path());
+        let report = verify_block_checksums(&tree);
+        assert!(
+            !report.is_ok(),
+            "expected corruption to surface as report errors, got {report:?}",
+        );
+        let has_data_corruption = report.errors.iter().any(|e| {
+            matches!(
+                e,
+                BlockVerifyError::DataCorrupted { path, .. } if path == &sst_path,
+            )
+        });
+        assert!(
+            has_data_corruption,
+            "expected a DataCorrupted error for {}, got {:?}",
+            sst_path.display(),
+            report.errors,
+        );
+    }
 }
