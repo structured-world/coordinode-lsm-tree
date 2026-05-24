@@ -81,11 +81,21 @@ fn verify_tampered_sst_exits_nonzero_with_corrupt() {
     let (_dir, sst) = build_one_sst();
 
     // Flip a byte inside the first data block's payload. Offset 64
-    // lands inside the encrypted/plain payload (past the 33-byte
-    // Header), so the header's own XXH3 still verifies but the
-    // payload XXH3 mismatches → DataCorrupted.
+    // lands inside the plain payload (past the 33-byte Header), so
+    // the header's own XXH3 still verifies but the payload XXH3
+    // mismatches → DataCorrupted. Bounds-check via `get_mut` so a
+    // future writer-layout change that produces a sub-65-byte SST
+    // fails the test with a clear message instead of an index panic.
+    const TAMPER_OFFSET: usize = 64;
     let mut bytes = std::fs::read(&sst).expect("read sst");
-    bytes[64] ^= 0xFF;
+    let len = bytes.len();
+    let byte = bytes.get_mut(TAMPER_OFFSET).unwrap_or_else(|| {
+        panic!(
+            "SST file is {len} bytes long, smaller than tamper offset {TAMPER_OFFSET} — \
+             writer layout changed or fixture is too small",
+        )
+    });
+    *byte ^= 0xFF;
     std::fs::write(&sst, &bytes).expect("write tampered sst");
 
     let out = Command::new(SST_DUMP_BIN)
