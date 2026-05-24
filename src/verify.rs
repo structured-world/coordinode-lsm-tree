@@ -292,6 +292,32 @@ pub enum BlockVerifyError {
         /// `Error::source()` produces a coherent chain.
         error: std::io::Error,
     },
+
+    /// SFA TOC-level corruption: a named section's length / position
+    /// fields are inconsistent (overflow on addition), or seeking to
+    /// its declared start offset fails before any block is read.
+    /// Distinct from `HeaderCorrupted` (which is per-block) so
+    /// callers can tell "the section catalogue itself is bad" apart
+    /// from "block N inside an otherwise-walkable section is bad" —
+    /// e.g. a `TocCorrupted` makes the whole section unreachable,
+    /// while a `HeaderCorrupted` only stops that section's walk.
+    TocCorrupted {
+        /// Table ID.
+        table_id: TableId,
+        /// Path to the SST file.
+        path: PathBuf,
+        /// Section name from the TOC entry (e.g. `b"data"`,
+        /// `b"tli"`). Stored verbatim, not lossy-decoded, because
+        /// SFA section names are byte strings.
+        section_name: Vec<u8>,
+        /// File offset where the section *would* start per the TOC
+        /// entry. Useful for forensics even when the start is
+        /// unreachable.
+        section_offset: u64,
+        /// Short description of the failure (overflow on
+        /// start+length, seek error, etc.).
+        reason: String,
+    },
 }
 
 impl std::fmt::Display for BlockVerifyError {
@@ -340,6 +366,19 @@ impl std::fmt::Display for BlockVerifyError {
                 "SST table {table_id} at {}: failed to read {data_length}-byte data segment for \
                  block at offset {offset}: {error}",
                 path.display(),
+            ),
+            Self::TocCorrupted {
+                table_id,
+                path,
+                section_name,
+                section_offset,
+                reason,
+            } => write!(
+                f,
+                "SST table {table_id} at {}: TOC section {:?} at offset {section_offset} is \
+                 unreachable ({reason})",
+                path.display(),
+                String::from_utf8_lossy(section_name),
             ),
         }
     }
@@ -465,12 +504,13 @@ fn scan_sst_blocks(
     // offset; each per-section walk below explicitly seeks to the
     // section's `pos()` first so the unknown post-trailer position
     // doesn't matter.
-    let sfa_reader = sfa::Reader::from_reader(&mut file).map_err(|e| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("SFA trailer parse: {e:?}"),
-        )
-    })?;
+    // Wrap the sfa error as the inner cause of the io::Error rather
+    // than format!-stringifying it, so the original variant
+    // (InvalidHeader / InvalidVersion / ChecksumMismatch / underlying
+    // Io) stays reachable via `Error::source()` for downstream
+    // diagnostics. sfa::Error implements `std::error::Error`.
+    let sfa_reader = sfa::Reader::from_reader(&mut file)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     let toc = sfa_reader.toc();
     // SFA TOC layout for an SST. The writer opens the file and
     // immediately calls `sfa::Writer::start("data")`, so the first
@@ -518,17 +558,19 @@ fn scan_sst_blocks(
         // forged TOC length cannot silently collapse to `u64::MAX`
         // and let the walk treat the whole address space as one
         // section. On overflow we surface the section as a
-        // file-level `HeaderCorrupted` and skip walking it — the
-        // other (still-walkable) sections of the same SST are
-        // honoured.
+        // file-level `TocCorrupted` and skip walking it — the other
+        // (still-walkable) sections of the same SST are honoured.
+        // `TocCorrupted` rather than `HeaderCorrupted` because the
+        // failure is at the section-catalogue layer, not inside any
+        // individual block.
         let Some(end) = start.checked_add(entry.len()) else {
-            errors.push(BlockVerifyError::HeaderCorrupted {
+            errors.push(BlockVerifyError::TocCorrupted {
                 table_id,
                 path: path.to_path_buf(),
-                offset: start,
+                section_name: entry.name().to_vec(),
+                section_offset: start,
                 reason: format!(
-                    "TOC section {:?} length {} overflows u64 when added to start offset {start}",
-                    entry.name(),
+                    "section length {} overflows u64 when added to start offset {start}",
                     entry.len(),
                 ),
             });
@@ -537,17 +579,17 @@ fn scan_sst_blocks(
         // Mid-walk seek failure: don't propagate as a file-level Err
         // (that would discard everything already scanned and report
         // the whole SST as unreadable, which contradicts the
-        // function's contract). Surface as a per-section error and
-        // skip walking this section; subsequent sections still run.
+        // function's contract). Surface as a `TocCorrupted` for this
+        // section and skip walking it; subsequent sections still run.
+        // Again `TocCorrupted` (not `HeaderCorrupted`): we never even
+        // reached a block to decode its header.
         if let Err(e) = reader.seek(SeekFrom::Start(start)) {
-            errors.push(BlockVerifyError::HeaderCorrupted {
+            errors.push(BlockVerifyError::TocCorrupted {
                 table_id,
                 path: path.to_path_buf(),
-                offset: start,
-                reason: format!(
-                    "seek to TOC section {:?} at offset {start} failed: {e}",
-                    entry.name(),
-                ),
+                section_name: entry.name().to_vec(),
+                section_offset: start,
+                reason: format!("seek to section start failed: {e}"),
             });
             continue;
         }
@@ -628,6 +670,30 @@ fn walk_block_region(ctx: &mut WalkCtx<'_>, start_offset: u64, end_offset: u64) 
     let mut offset = start_offset;
 
     while offset < end_offset {
+        // Confine reads to the declared section before touching
+        // Header::decode_from. Without this pre-check, a TOC entry
+        // whose `len` puts `end_offset` inside the first block's
+        // header region would let `decode_from` consume up to
+        // `header_len` bytes — reading past the section boundary
+        // into the next section's payload, where random bytes might
+        // happen to parse as a "valid" header and silently corrupt
+        // the walk. Treat the under-sized tail as `HeaderCorrupted`
+        // and stop this section's walk; subsequent sections still
+        // run because `walk_block_region` returns rather than
+        // bubbling the error up.
+        let remaining_in_section = end_offset - offset;
+        if remaining_in_section < header_len {
+            ctx.errors.push(BlockVerifyError::HeaderCorrupted {
+                table_id: ctx.table_id,
+                path: ctx.path.to_path_buf(),
+                offset,
+                reason: format!(
+                    "section has only {remaining_in_section} bytes left at this offset, \
+                     less than Header::serialized_len() = {header_len}",
+                ),
+            });
+            return;
+        }
         let header = match Header::decode_from(ctx.reader) {
             Ok(h) => h,
             Err(e) => {
@@ -744,6 +810,12 @@ fn walk_block_region(ctx: &mut WalkCtx<'_>, start_offset: u64, end_offset: u64) 
 #[expect(clippy::unwrap_used, clippy::expect_used, reason = "test assertions")]
 mod block_verify_tests {
     use super::*;
+    // `AbstractTree` looks unused at a glance but the test bodies below
+    // call `.insert()`, `.flush_active_memtable()`, and
+    // `.current_version()` on `AnyTree` values — those are trait
+    // methods, not inherent ones, so the trait MUST be in scope for
+    // method resolution. Removing the import is a compile error, not
+    // a clippy nit.
     use crate::{
         AbstractTree, Config, SequenceNumberCounter, compression::CompressionType,
         config::CompressionPolicy,
