@@ -11,6 +11,7 @@
 
 use clap::{Parser, Subcommand};
 use lsm_tree::coding::Decode;
+use lsm_tree::inspect::read_table_properties;
 use lsm_tree::table::block::Header;
 use lsm_tree::verify::{BlockVerifyError, verify_sst_file};
 use std::fs::File;
@@ -80,6 +81,13 @@ enum Command {
         #[arg(long)]
         no_header: bool,
     },
+
+    /// Print the SST's stored metadata: table id, key range, KV /
+    /// tombstone counts, data / index block counts, compression
+    /// codecs, and creation timestamp. Reads the on-disk meta block
+    /// directly (with MID-mirror fallback per #295); does not open a
+    /// live `Tree` or touch the manifest.
+    Properties,
 }
 
 fn main() -> ExitCode {
@@ -92,6 +100,7 @@ fn main() -> ExitCode {
             len,
             no_header,
         } => run_hex(&cli.file, offset, len, no_header),
+        Command::Properties => run_properties(&cli.file),
     }
 }
 
@@ -288,4 +297,61 @@ fn hex_dump(base_offset: u64, buf: &[u8]) {
         }
         println!("|");
     }
+}
+
+fn run_properties(path: &std::path::Path) -> ExitCode {
+    let props = match read_table_properties(path) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("error: read properties of {}: {e}", path.display());
+            return ExitCode::FAILURE;
+        }
+    };
+
+    println!("file:                {}", path.display());
+    println!("table_id:            {}", props.id);
+    println!("file_size:           {} bytes", props.file_size);
+    println!(
+        "created_at:          {} ns since Unix epoch",
+        props.created_at_nanos
+    );
+    println!(
+        "key_range:           min={} max={}",
+        format_key(props.key_range.min()),
+        format_key(props.key_range.max()),
+    );
+    println!("item_count:          {}", props.item_count);
+    println!("tombstone_count:     {}", props.tombstone_count);
+    println!("weak_tombstones:     {}", props.weak_tombstone_count);
+    println!("weak_reclaimable:    {}", props.weak_tombstone_reclaimable,);
+    println!("data_block_count:    {}", props.data_block_count);
+    println!("index_block_count:   {}", props.index_block_count);
+    println!("data_compression:    {:?}", props.data_block_compression,);
+    println!("index_compression:   {:?}", props.index_block_compression,);
+
+    ExitCode::SUCCESS
+}
+
+/// Renders a user key as a single line, escaping non-printable bytes.
+/// Pure ASCII keys are printed verbatim so the common "user-set
+/// alphanumeric prefix" stays readable; bytes outside 0x20..0x7e are
+/// rendered as `\xNN` escapes; backslashes are doubled. This is the
+/// same format `xxd`'s ASCII gutter uses minus the dot-replacement,
+/// preserving every byte unambiguously for round-trip diagnostic use.
+fn format_key(key: &[u8]) -> String {
+    let mut out = String::with_capacity(key.len() + 2);
+    out.push('"');
+    for &b in key {
+        match b {
+            b'\\' => out.push_str("\\\\"),
+            b'"' => out.push_str("\\\""),
+            0x20..=0x7e => out.push(b as char),
+            _ => {
+                use std::fmt::Write;
+                let _ = write!(out, "\\x{b:02x}");
+            }
+        }
+    }
+    out.push('"');
+    out
 }
