@@ -222,6 +222,16 @@ mod write_batch;
 #[cfg(feature = "std")]
 pub mod verify;
 
+/// Out-of-band inspection of a single SST file.
+///
+/// Public read-only view of stored metadata (table id, key range,
+/// counts, compression, timestamp) without spinning up a `Tree`.
+/// Used by `sst-dump properties` and similar diagnostic tools. See
+/// the module docs for the recovery semantics (mirrors
+/// `Table::recover`'s TAIL-first / MID-fallback path from #295).
+#[cfg(feature = "std")]
+pub mod inspect;
+
 mod version;
 mod vlog;
 
