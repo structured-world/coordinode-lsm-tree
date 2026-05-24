@@ -627,4 +627,158 @@ mod tests {
         );
         Ok(())
     }
+
+    /// Writes a `vN` archive with two runs in one level:
+    /// run #0 is a complete entry (declared = actual = 1),
+    /// run #1 declares 3 entries but the section is cut so the
+    /// `table_count` u32 of run #1 reads partially → EOF.
+    /// Exercises the tail-tolerant case where the cut happens mid-RUN
+    /// inside an otherwise-valid level. The consistent prefix (run #0
+    /// of level #0) MUST survive in the recovered Version.
+    fn write_truncated_at_second_run(folder: &Path, id: u64, fs: &dyn Fs) -> crate::Result<()> {
+        let path = folder.join(format!("v{id}"));
+        let file = fs.open(
+            &path,
+            &FsOpenOptions::new().write(true).create(true).truncate(true),
+        )?;
+        let mut w = sfa::Writer::from_writer(std::io::BufWriter::new(file));
+        w.start("tree_type")?;
+        w.write_u8(0)?;
+        w.start("tables")?;
+        w.write_u8(1)?; // 1 level
+        w.write_u8(2)?; // 2 runs in that level
+        // run #0: declared=1, actual=1 — the consistent prefix.
+        w.write_u32::<LittleEndian>(1)?;
+        w.write_u64::<LittleEndian>(42)?; // id
+        w.write_u8(0)?; // checksum_type
+        w.write_u128::<LittleEndian>(0)?;
+        w.write_u64::<LittleEndian>(0)?;
+        // run #1: only 2 of the 4 bytes of `table_count` are written.
+        // The reader gets `UnexpectedEof` on the u32 read.
+        w.write_u8(0xAA)?;
+        w.write_u8(0xBB)?;
+        w.start("blob_files")?;
+        w.write_u32::<LittleEndian>(0)?;
+        w.start("blob_gc_stats")?;
+        w.write_u32::<LittleEndian>(0)?;
+        w.finish().map_err(|e| match e {
+            sfa::Error::Io(e) => crate::Error::from(e),
+            _ => crate::Error::Unrecoverable,
+        })?;
+        Ok(())
+    }
+
+    #[test]
+    fn recover_tolerate_tail_keeps_consistent_prefix_within_a_level() -> crate::Result<()> {
+        // Regression: when the EOF cut happens between two runs of
+        // the same level, the tail-tolerant break must push the
+        // partial level into `levels` so the consistent prefix
+        // (run #0 with 1 entry) survives. Earlier behaviour broke
+        // out of `'levels` without pushing, silently dropping the
+        // already-decoded run.
+        let fs = MemFs::new();
+        let folder = Path::new("/tolerate/midlevel");
+        fs.create_dir_all(folder)?;
+
+        write_current(folder, 1, &fs)?;
+        write_truncated_at_second_run(folder, 1, &fs)?;
+
+        let recovery = recover(
+            folder,
+            &fs,
+            ManifestRecoveryMode::TolerateCorruptedTailRecords,
+        )?;
+        assert_eq!(
+            recovery.table_ids.len(),
+            1,
+            "expected the partially-decoded level to be present, got {} levels",
+            recovery.table_ids.len(),
+        );
+        let level = &recovery.table_ids[0];
+        assert_eq!(
+            level.len(),
+            1,
+            "expected 1 surviving run (the consistent prefix), got {}",
+            level.len(),
+        );
+        assert_eq!(
+            level[0].len(),
+            1,
+            "expected the run to contain its 1 fully-decoded entry",
+        );
+        assert_eq!(level[0][0].id, 42, "wrong entry id recovered");
+        Ok(())
+    }
+
+    /// Writes a `vN` archive whose `blob_files` section declares
+    /// `declared` entries but only writes `actual` complete 25-byte
+    /// records, cutting mid-stream after that. Mirrors the analogous
+    /// `tables` fixture for the blob-files surface.
+    fn write_truncated_blob_tail(
+        folder: &Path,
+        id: u64,
+        declared: u32,
+        actual: u32,
+        fs: &dyn Fs,
+    ) -> crate::Result<()> {
+        assert!(
+            actual < declared,
+            "actual must be < declared for truncation"
+        );
+        let path = folder.join(format!("v{id}"));
+        let file = fs.open(
+            &path,
+            &FsOpenOptions::new().write(true).create(true).truncate(true),
+        )?;
+        let mut w = sfa::Writer::from_writer(std::io::BufWriter::new(file));
+        w.start("tree_type")?;
+        w.write_u8(0)?;
+        w.start("tables")?;
+        w.write_u8(0)?; // 0 levels
+        w.start("blob_files")?;
+        w.write_u32::<LittleEndian>(declared)?;
+        for entry_id in 0..actual {
+            w.write_u64::<LittleEndian>(u64::from(entry_id))?;
+            w.write_u8(0)?; // checksum_type
+            w.write_u128::<LittleEndian>(0)?; // checksum
+        }
+        w.start("blob_gc_stats")?;
+        w.write_u32::<LittleEndian>(0)?;
+        w.finish().map_err(|e| match e {
+            sfa::Error::Io(e) => crate::Error::from(e),
+            _ => crate::Error::Unrecoverable,
+        })?;
+        Ok(())
+    }
+
+    #[test]
+    fn recover_tolerate_tail_keeps_consistent_prefix_of_blob_files() -> crate::Result<()> {
+        // Companion to `recover_tolerate_tail_keeps_consistent_prefix_of_tables`
+        // for the blob_files surface. Without this test, a regression
+        // in the blob-files tail-tolerant path would slip through
+        // because the tables-only test already passes.
+        let fs = MemFs::new();
+        let folder = Path::new("/tolerate/blob_tail");
+        fs.create_dir_all(folder)?;
+
+        write_current(folder, 1, &fs)?;
+        write_truncated_blob_tail(folder, 1, 5, 1, &fs)?;
+
+        let recovery = recover(
+            folder,
+            &fs,
+            ManifestRecoveryMode::TolerateCorruptedTailRecords,
+        )?;
+        assert_eq!(
+            recovery.blob_file_ids.len(),
+            1,
+            "expected 1 surviving blob_file entry (the consistent prefix), got {}",
+            recovery.blob_file_ids.len(),
+        );
+        assert_eq!(
+            recovery.blob_file_ids[0].0, 0,
+            "wrong blob_file id recovered",
+        );
+        Ok(())
+    }
 }
