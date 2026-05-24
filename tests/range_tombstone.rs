@@ -1001,7 +1001,7 @@ fn range_tombstone_disjoint_survives_multiple_compactions() -> lsm_tree::Result<
 }
 
 #[test]
-#[ignore = "allocates ~68 MiB to force MultiWriter rotation — run with --ignored"]
+#[ignore = "heavy: allocates ~68 MiB to force MultiWriter rotation; run with `cargo nextest run --run-ignored only`"]
 fn range_tombstone_multi_table_flush_keeps_newer_values_reachable() -> lsm_tree::Result<()> {
     use lsm_tree::CompressionType;
     use lsm_tree::config::CompressionPolicy;

@@ -175,7 +175,6 @@ fn tree_rejects_unsupported_manifest_version() -> lsm_tree::Result<()> {
 }
 
 #[test]
-#[ignore = "restore Version history maintenance"]
 fn tree_recovery_version_free_list() -> lsm_tree::Result<()> {
     let folder = get_tmp_folder();
 
