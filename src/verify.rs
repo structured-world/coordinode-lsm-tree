@@ -582,9 +582,12 @@ fn scan_sst_blocks(
     //                           filters)
     //   - `filter`            : block-format (filter blocks)
     //   - `range_tombstones`  : block-format (optional)
+    //   - `meta_mid`          : block-format (early mirror of `meta`)
     //   - `linked_blob_files` : RAW length-prefixed list of u64s
     //   - `table_version`     : RAW single byte
-    //   - `meta`              : block-format (metadata)
+    //   - `meta_separator`    : RAW 4 KiB zero padding
+    //   - `tli_tail`          : block-format (tail mirror of `tli`)
+    //   - `meta`              : block-format (metadata, authoritative)
     //
     // Block-format sections are walked block-by-block (each block
     // prefixed with the standard `Header`). Raw-format sections are
@@ -670,7 +673,7 @@ fn scan_sst_blocks(
 /// (i.e. NOT prefixed with the standard `Header`). The scrub skips
 /// these sections — their integrity is covered by the SFA-trailer
 /// checksum verified at table-open time. Every other section
-/// (`data` / `tli` / `index` / `filter_tli` / `filter` /
+/// (`data` / `tli` / `tli_tail` / `index` / `filter_tli` / `filter` /
 /// `range_tombstones` / `meta` / `meta_mid`) is a `Header`-prefixed
 /// block run and gets walked. See `scan_sst_blocks` for the full
 /// section catalogue and the writer-side source of truth.

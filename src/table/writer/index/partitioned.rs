@@ -137,7 +137,7 @@ impl PartitionedIndexWriter {
         &mut self,
         file_writer: &mut sfa::Writer<ChecksummedWriter<WR>>,
         index_base_offset: BlockOffset,
-    ) -> crate::Result<()> {
+    ) -> crate::Result<Vec<u8>> {
         file_writer.start("tli")?;
 
         for item in &mut self.tli_handles {
@@ -181,7 +181,7 @@ impl PartitionedIndexWriter {
             self.tli_handles.len(),
         );
 
-        Ok(())
+        Ok(bytes)
     }
 }
 
@@ -246,7 +246,7 @@ impl<W: std::io::Write + std::io::Seek> BlockIndexWriter<W> for PartitionedIndex
     fn finish(
         mut self: Box<Self>,
         file_writer: &mut sfa::Writer<ChecksummedWriter<W>>,
-    ) -> crate::Result<usize> {
+    ) -> crate::Result<(usize, Vec<u8>)> {
         if self.buffer_size > 0 {
             self.cut_index_block()?;
         }
@@ -257,8 +257,8 @@ impl<W: std::io::Write + std::io::Seek> BlockIndexWriter<W> for PartitionedIndex
         file_writer.write_all(&self.final_write_buffer)?;
         log::trace!("Concatted index partitions onto blocks file");
 
-        self.write_top_level_index(file_writer, index_base_offset)?;
+        let tli_bytes = self.write_top_level_index(file_writer, index_base_offset)?;
 
-        Ok(self.index_block_count)
+        Ok((self.index_block_count, tli_bytes))
     }
 }

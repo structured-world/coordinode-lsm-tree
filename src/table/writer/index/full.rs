@@ -84,7 +84,7 @@ impl<W: std::io::Write + std::io::Seek> BlockIndexWriter<W> for FullIndexWriter 
     fn finish(
         self: Box<Self>,
         file_writer: &mut sfa::Writer<ChecksummedWriter<W>>,
-    ) -> crate::Result<usize> {
+    ) -> crate::Result<(usize, Vec<u8>)> {
         file_writer.start("tli")?;
 
         let mut bytes = vec![];
@@ -132,6 +132,6 @@ impl<W: std::io::Write + std::io::Seek> BlockIndexWriter<W> for FullIndexWriter 
             self.block_handles.len(),
         );
 
-        Ok(1)
+        Ok((1, bytes))
     }
 }

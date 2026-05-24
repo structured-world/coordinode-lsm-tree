@@ -592,7 +592,7 @@ impl Writer {
 
         // Write index
         log::trace!("Finishing index writer");
-        let index_block_count = self.index_writer.finish(&mut self.file_writer)?;
+        let (index_block_count, tli_bytes) = self.index_writer.finish(&mut self.file_writer)?;
 
         // Write filter
         log::trace!("Finishing filter writer");
@@ -759,6 +759,39 @@ impl Writer {
         // sections between them).
         self.file_writer.start("meta_separator")?;
         self.file_writer.write_all(&[0u8; 4096])?;
+
+        // TLI mirror near the file tail. Head copy lives in the `tli`
+        // section near the file start, ~MB earlier (the data section
+        // is between them, so head and tail are always on different
+        // filesystem sectors). A torn-write or bad sector at either
+        // end leaves the other copy intact. Reader prefers the tail
+        // copy on open and transparently falls back to the head copy
+        // on decode/checksum/decrypt failure. Re-encodes the same
+        // `tli_bytes` returned by `index_writer.finish()` so the two
+        // sections decode to the same logical TLI; compression /
+        // encryption nonce can differ per-section, but content matches.
+        // `block_offset` is held at 0 to match the head copy's
+        // BlockIdentity (`partitioned::write_top_level_index` /
+        // `full::finish` both encode with offset=0); once #251 wires
+        // real offsets into AAD this needs to thread the tail SFA
+        // section offset alongside the head one.
+        self.file_writer.start("tli_tail")?;
+        Block::write_into(
+            &mut self.file_writer,
+            &tli_bytes,
+            crate::table::block::BlockIdentity {
+                tree_id: 0,
+                table_id: self.table_id,
+                block_offset: 0,
+                block_type: crate::table::block::BlockType::Index,
+                dict_id: 0,
+                window_log: 0,
+            },
+            self.index_block_compression,
+            self.encryption.as_deref(),
+            #[cfg(zstd_any)]
+            None,
+        )?;
 
         // TAIL meta — the canonical, authoritative copy. `file_size`
         // is the LOGICAL size up to the end of the data blocks

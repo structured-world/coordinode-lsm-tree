@@ -867,15 +867,50 @@ impl Table {
         compression: CompressionType,
         encryption: Option<&dyn crate::encryption::EncryptionProvider>,
     ) -> crate::Result<IndexBlock> {
-        log::trace!("Reading TLI block, with tli_ptr={:?}", regions.tli);
+        // Tail copy first (preferred — if a fresh `tli_tail` exists it
+        // landed after the head `tli`, so it's the most-recently
+        // fsynced copy). On any decode / decrypt / checksum failure
+        // fall back to the head `tli` if present.
+        //
+        // Both copies encode the same handles list (the writer hands
+        // a single `tli_bytes` buffer to both sites), so the resulting
+        // IndexBlock content is identical regardless of which side
+        // wins. Compression / encryption nonce differ per-section,
+        // but the decoded handles match.
+        //
+        // Tables written before the TLI-mirror change have no
+        // `tli_tail`; reader falls straight through to the head copy.
+        if let Some(tail_handle) = regions.tli_tail {
+            log::trace!("Reading TLI tail mirror, with tli_tail_ptr={tail_handle:?}");
+            match Self::read_tli_at(file, tail_handle, table_id, compression, encryption) {
+                Ok(idx) => return Ok(idx),
+                Err(tail_err) => {
+                    log::warn!(
+                        "TLI tail mirror unreadable ({tail_err}); falling back to TLI head copy at {:?}",
+                        regions.tli,
+                    );
+                }
+            }
+        }
 
+        log::trace!("Reading TLI head copy, with tli_ptr={:?}", regions.tli);
+        Self::read_tli_at(file, regions.tli, table_id, compression, encryption)
+    }
+
+    fn read_tli_at(
+        file: &dyn FsFile,
+        handle: BlockHandle,
+        table_id: TableId,
+        compression: CompressionType,
+        encryption: Option<&dyn crate::encryption::EncryptionProvider>,
+    ) -> crate::Result<IndexBlock> {
         let block = Block::from_file(
             file,
-            regions.tli,
+            handle,
             crate::table::block::BlockIdentity {
                 tree_id: 0,
                 table_id,
-                block_offset: *regions.tli.offset(),
+                block_offset: *handle.offset(),
                 block_type: BlockType::Index,
                 dict_id: 0,
                 window_log: 0,

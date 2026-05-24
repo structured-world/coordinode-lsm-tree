@@ -25,15 +25,23 @@ fn toc_entry_to_handle(entry: &TocEntry) -> BlockHandle {
 /// ----------------
 /// |     data     | <- implicitly start at 0
 /// |--------------|
-/// |      tli     |
+/// |      tli     | <- head copy
 /// |--------------|
 /// |     index    | <- may not exist (if full block index is used, TLI will be dense)
 /// |--------------|
 /// |    filter    | <- may not exist
 /// |--------------|
-/// |  range_tomb  | <- may not exist
+/// |  `range_tomb`  | <- may not exist
+/// |--------------|
+/// |   `meta_mid`   | <- mirror of meta
 /// |--------------|
 /// | linked blobs | <- may not exist
+/// |--------------|
+/// |table_version |
+/// |--------------|
+/// |meta_separator| <- 4 KiB zero padding
+/// |--------------|
+/// |   tli_tail   | <- mirror of tli
 /// |--------------|
 /// |     meta     |
 /// |--------------|
@@ -44,6 +52,15 @@ fn toc_entry_to_handle(entry: &TocEntry) -> BlockHandle {
 #[derive(Copy, Clone, Debug, Default)]
 pub struct ParsedRegions {
     pub tli: BlockHandle,
+    /// Tail-side mirror of the TLI block. Head copy lives in the
+    /// `tli` section near the file start (after the data section);
+    /// this copy lives near the file tail, after `meta_separator`
+    /// and before `meta`. A torn-write or bad sector at either
+    /// position leaves the other copy intact. Reader prefers the
+    /// tail copy on open and transparently falls back to the head
+    /// copy on decode/checksum/decrypt failure. Absent on tables
+    /// written before the TLI-mirror change.
+    pub tli_tail: Option<BlockHandle>,
     pub index: Option<BlockHandle>,
     pub filter_tli: Option<BlockHandle>,
     pub filter: Option<BlockHandle>,
@@ -73,6 +90,7 @@ impl ParsedRegions {
                     log::error!("TLI should exist");
                     crate::Error::Unrecoverable
                 })?,
+            tli_tail: toc.section(b"tli_tail").map(toc_entry_to_handle),
             index: toc.section(b"index").map(toc_entry_to_handle),
             filter: toc.section(b"filter").map(toc_entry_to_handle),
             range_tombstones: toc.section(b"range_tombstones").map(toc_entry_to_handle),

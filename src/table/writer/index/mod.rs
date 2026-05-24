@@ -20,11 +20,18 @@ pub trait BlockIndexWriter<W: std::io::Write + std::io::Seek> {
 
     /// Writes the block index to a file.
     ///
-    /// Returns the number of index blocks written.
+    /// Returns the number of index blocks written and the raw
+    /// IndexBlock-encoded top-level-index bytes (uncompressed,
+    /// unencrypted). The outer table writer re-encodes these bytes
+    /// into a `tli_tail` mirror section near the file tail so that a
+    /// torn-write or bad sector at the head TLI position is
+    /// recoverable. The buffer reflects post-shift handles (matching
+    /// what `tli` head section encodes), so head and tail decode to
+    /// the same logical TLI.
     fn finish(
         self: Box<Self>,
         file_writer: &mut sfa::Writer<ChecksummedWriter<W>>,
-    ) -> crate::Result<usize>;
+    ) -> crate::Result<(usize, Vec<u8>)>;
 
     fn use_compression(
         self: Box<Self>,
