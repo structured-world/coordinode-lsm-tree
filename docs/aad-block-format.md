@@ -14,7 +14,7 @@
 - **Block-context binding** via AEAD's Additional Authenticated Data (AAD): the AAD includes the file's `table_id`, the block's `block_offset`, its `block_type`, the compression dictionary id, and the AEAD `suite_id` + `key_epoch`. Swapping a block from a different file, a different offset within the same file, a different block type, or under a different key/suite fails AEAD verification.
 - **Crypto-agility:** the on-disk record carries an explicit `suite_id` byte so a deployment can rotate to a new AEAD without rewriting old data, and so a future suite can be added by registry update alone.
 - **Key rotation without rewrite:** the `key_epoch` byte indexes into a caller-managed key chain. Old blocks under epoch `N` stay readable as long as the corresponding key is still in the chain; new writes pick the latest epoch.
-- **Single-pass decode:** all metadata needed to reconstruct the AAD lives at known fixed offsets inside the on-disk record. Decode reads the metadata frame once, computes AAD, then verifies + decrypts the body frame.
+- **Single-pass decode:** all *on-disk* metadata that feeds the AAD lives at known fixed offsets inside the MetadataFrame. The remaining AAD fields (`TreeID`, `TableID`, `BlockOffset`) are caller-supplied from the read context (the process knows which tree / table / file offset it is reading) and are deliberately NOT on disk; see §4.5 and the "Why not store them on disk" rationale in §5.2. Decode reads the metadata frame once, combines the on-disk fields with the caller-supplied context fields to form AAD, then verifies + decrypts the body frame.
 - **Zstd-skippable framing:** the on-disk record uses the [Zstandard skippable frame](https://datatracker.ietf.org/doc/html/rfc8878#section-3.1.1) magic range `0x184D2A50..0x184D2A5F`. A reader that doesn't understand encrypted blocks (e.g. a plain `zstd` CLI on the payload region) skips over them cleanly instead of corrupting on parse.
 
 ## 2. Non-goals
@@ -199,14 +199,41 @@ Offset  Size  Field             Source
                                 Tree's id (`AbstractTree::id()`, the
                                 accessor method on the trait that both
                                 `Tree` and `BlobTree` implement).
-                                NOT on disk:
-                                a process knows which tree it opened. `0`
-                                is the allowed-zero default at call sites
-                                that haven't plumbed tree_id yet, falling
-                                back to per-tree encryption-provider key
-                                isolation as the substitute defence (see
-                                `BlockIdentity` module docs in
-                                `src/table/block/identity.rs`).
+                                NOT on disk: a process knows which tree
+                                it opened.
+
+                                **Required for the cross-tree
+                                substitution defence in §3.** The
+                                `(TreeID, TableID)` pair is what makes
+                                block identity globally unique; with all
+                                callers feeding a real TreeID a swapped
+                                block from another tree fails AEAD
+                                verification.
+
+                                **Placeholder zero (`0`) weakens
+                                this defence.** Call sites that have
+                                not yet plumbed a real tree id are
+                                permitted to pass `0` so that the
+                                migration to AAD-bound blocks is not
+                                blocked, but for those call sites the
+                                cross-tree substitution row in §3 is
+                                NOT defended by AAD: any two trees
+                                feeding TreeID=0 collapse the pair to
+                                just `(0, TableID)`, and `TableID` is
+                                only unique within a tree. The
+                                substitute defence at those call sites
+                                is per-tree encryption-provider key
+                                isolation (a different encryption key
+                                per tree, so AEAD fails on
+                                cross-tree-substituted blocks even
+                                when the AAD-bound TreeID collides).
+                                Callers MUST either (a) supply a real
+                                TreeID, or (b) ensure per-tree key
+                                isolation; sharing a key across trees
+                                while feeding TreeID=0 leaves the
+                                cross-tree row of §3 undefended.
+                                See `BlockIdentity` module docs in
+                                `src/table/block/identity.rs`.
 16      8     TableID           u64 BE, caller-supplied from the SST
                                 file's per-tree `TableId` (derived from
                                 the file path / table metadata). NOT on
