@@ -131,15 +131,20 @@ cargo run --release --features flamegraph -- \
 | `PointInTimeRecovery` | Reserved for the upcoming "roll back to the last fully-consistent record group" semantic (RocksDB's `kPointInTimeRecovery`). Currently behaves identically to `AbsoluteConsistency`. | Not yet wired; design and impl tracked in [#323](https://github.com/structured-world/coordinode-lsm-tree/issues/323). |
 | `SkipAnyCorruptedRecords` | Reserved for the upcoming "skip individual bad record, keep all others" semantic (RocksDB's `kSkipAnyCorruptedRecords`). Currently behaves identically to `AbsoluteConsistency`. Intended companion to the `repair_db` tooling tracked in [#303](https://github.com/structured-world/coordinode-lsm-tree/issues/303). | Not yet wired; lossy maximum-availability mode for forensic recovery, pairs with manifest reconstruction. |
 
-When a non-default mode drops records, the recovery path logs `warn!` lines describing what was tolerated. Individual table-IDs / blob-file-IDs are NOT enumerated because they were never decoded. Warnings come in two flavors:
+When a non-default mode drops records, the recovery path logs `warn!` lines describing what was tolerated. Individual table-IDs / blob-file-IDs are NOT enumerated because they were never decoded. Warnings fall into two categories:
 
-**Per-condition** (one warn for each malformed shape encountered): truncated `level_count` byte (no levels recovered), truncated level/run header (a level or run is missing entirely), a declared `table_count` / `blob_file_count` exceeding remaining section payload (count header is forged or the entries are truncated), the `tables` section truncated before its `level_count` header lands, the `blob_files` section truncated before its count header lands.
+**Per-condition warns** (one warn for each malformed shape encountered, at the point of detection):
 
-**Per-section summary** (one warn at end of section processing with aggregate counters):
+- `tables` section truncated before the `level_count` byte → tail-tolerant mode produces 0 levels.
+- `tables` declared `table_count` exceeds remaining section payload (count header forged or entries truncated) → loop walks bytes-actually-present and stops at the first EOF.
+- `blob_files` section truncated before its count header → 0 blob files.
+- `blob_files` declared count exceeds remaining section capacity → same forged-or-truncated shape, same walk-and-stop fallback.
+- `blob_gc_stats` payload truncated (power-loss between the `blob_files` commit and the `blob_gc_stats` payload landing) → tail-tolerant mode produces an empty `FragmentationMap`. GC stats are advisory (fragmentation re-accrues on the next compaction pass), so this is a "rebuild on next pass" outcome, not data loss. This is a single in-place warn with no later summary.
 
-- **`tables` section**: declared-but-missing table records (count header said N, only K < N records read before EOF → N-K dropped) AND a separate counter for level / run / count-header bytes cut mid-byte (no records were supposed to be present yet for those levels / runs, so no record loss, but the levels / runs themselves are absent).
-- **`blob_files` section**: declared-but-missing blob-file records, analogous to the tables-section record-drop counter.
-- **`blob_gc_stats` section**: truncated payload (a power-loss between the `blob_files` commit and the `blob_gc_stats` payload landing); tail-tolerant mode produces an empty `FragmentationMap`. GC stats are advisory (fragmentation re-accrues on the next compaction pass), so this is a "rebuild on next pass" outcome, not data loss.
+**Per-section summary warns** (at end of section processing, only if the section actually lost records):
+
+- `tables` section, emitted only when `tables_dropped_to_tail > 0` OR `tables_truncated_headers > 0`. Reports two counters in one line: declared-but-missing table records (count header said N, only K < N records read before EOF → N-K dropped) and the separate counter for level / run / `table_count` headers cut mid-byte (no records were supposed to be present yet for those levels / runs, so the headers contribute zero to record loss but the levels / runs themselves are absent).
+- `blob_files` section, emitted only when `blob_dropped_to_tail > 0`. Reports the declared-but-missing blob-file records count, analogous to the tables-section record-drop counter. A `blob_files` section whose only damage was a missing count header surfaces the per-condition warn above but does NOT add a summary line.
 
 Operators wanting a per-record audit trail should pair a tail-tolerant open with an out-of-band integrity scan (see `verify::verify_integrity` / `tools/sst-dump verify`).
 
