@@ -20,7 +20,10 @@ use std::process::ExitCode;
 
 /// Default number of bytes the `hex` subcommand prints when the
 /// caller does not supply `--len`. Chosen to cover one `Header`
-/// (currently 25 bytes) plus a few payload lines worth of context.
+/// (currently 33 bytes: 4 B magic + 1 B block_type + 16 B
+/// XXH3-128 checksum + 4 B data_length + 4 B uncompressed_length +
+/// 4 B trailing checksum tag — see `Header::serialized_len()`)
+/// plus a few payload lines worth of context.
 const HEX_DEFAULT_LEN: u64 = 256;
 /// Hard ceiling on the user-requestable `hex` length so a typo
 /// (`--len 4294967295`) can't allocate a 4 GiB buffer. 1 MiB
@@ -185,9 +188,14 @@ fn run_hex(path: &std::path::Path, offset: u64, len: u64, no_header: bool) -> Ex
     }
 
     // `read_len` is bounded by `HEX_MAX_LEN` (1 MiB) above, so the
-    // `usize` cast is safe on any platform we target. Pre-allocate
-    // the exact size instead of `read_to_end` so a truncated read
-    // still produces a well-sized buffer for the dump.
+    // `usize` cast is safe on any platform we target. `read_exact`
+    // is strict: a short read fails the call, and we exit non-zero
+    // without dumping anything. Short reads are not possible on the
+    // happy path because `read_len = min(len, file_size - offset)`
+    // is already bounded by bytes-actually-on-disk above, so the
+    // only way `read_exact` can short-read is mid-call truncation
+    // of the file by another process or a real I/O error — both
+    // are reportable failures, not partial-dump scenarios.
     let mut buf = vec![0u8; read_len as usize];
     if let Err(e) = file.read_exact(&mut buf) {
         eprintln!("error: read {read_len} bytes at {offset}: {e}");
