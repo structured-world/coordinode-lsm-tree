@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779645557571,
+  "lastUpdate": 1779646754951,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -9282,6 +9282,84 @@ window.BENCHMARK_DATA = {
             "value": 530590.256696303,
             "unit": "ops/sec",
             "extra": "P50: 1.7us | P99: 6.2us | P99.9: 9.7us\nthreads: 1 | elapsed: 0.38s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "1286d6230310dfd343bcbdf9bea444ccc6f83af3",
+          "message": "feat(table): mirror TLI block near file tail for torn-write safety (#325)\n\n## Summary\n\nAdd a tail-side mirror of the top-level index (TLI) block, analogous to\nthe meta-block mirror landed in #295. A torn-write or bad-sector at the\nhead TLI position is now recoverable from the tail copy and vice versa.\n\n## Wire format\n\nNew `tli_tail` SFA section written after `meta_separator` and before the\nauthoritative `meta`:\n\n```\n... → meta_mid → linked_blob_files → table_version → meta_separator → tli_tail → meta\n```\n\nThe head `tli` section (near the file start, after `data`) stays where\nit is. `tli_tail` re-encodes the same `IndexBlock` bytes via a second\n`Block::write_into` call; both copies are written under the same\n`CompressionType` (`metadata.index_block_compression`) since the block\nheader does not encode a compression tag and the reader supplies a\nsingle value when decoding either copy. Only the encryption nonce\ndiffers between the two copies (fresh per `Block::write_into`), so the\nresulting ciphertext is byte-different but the decoded handles match.\nTables written before this change omit `tli_tail` and the reader falls\nstraight through to the head copy (backward compatible).\n\n## Reader fallback (tail-first / head-fallback)\n\n`Table::read_tli` tries `tli_tail` first when present and transparently\nfalls back to `tli` on any decode / checksum / decrypt failure. Both\ncopies decode to the same logical TLI.\n\nThe recovery path goes through `read_tli` for the partitioned and\npinned-full index branches. The volatile-full branch (small unpinned\nfull-index tables) continues to read head-only on demand; adding\nfallback there needs handle threading through `VolatileBlockIndex` and\nis left out of this PR.\n\n## Internal refactor\n\n`BlockIndexWriter::finish` now returns `(usize, Vec<u8>)` so the outer\ntable writer can re-emit the encoded TLI bytes at the tail position\nwithout re-shifting handles (which `write_top_level_index` mutates in\nplace). Both `FullIndexWriter` and `PartitionedIndexWriter`\nimplementations updated. The trait module is `pub(crate)` from outside\nthe crate's perspective (parent module `index` is private), so this is\nnot a public API change.\n\n## Tests\n\n`tests/tli_mirror.rs` (5 new tests, all pass):\n\n- writer emits both `tli` and `tli_tail` sections\n- `tli_tail` sits after `meta_separator` and before `meta`\n- open recovers when tail TLI is zeroed (head fallback)\n- open recovers when head TLI is zeroed (tail wins)\n- open fails when both copies are zeroed\n\nForces partitioned-index for all levels so the recovery path takes\n`read_tli` rather than the volatile-full bypass.\n\n## Test plan\n\n- [x] `cargo nextest run` (1407 tests pass)\n- [x] `cargo clippy --all-targets -- -D warnings` (clean)\n- [x] New mirror tests cover writer emission, ordering, head/tail\ncorruption, and double-corruption\n\nCloses #296",
+          "timestamp": "2026-05-24T21:18:22+03:00",
+          "tree_id": "9b104d5b57ba2b8582ba0ae7bb534f713abc5922",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/1286d6230310dfd343bcbdf9bea444ccc6f83af3"
+        },
+        "date": 1779646753407,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 2095250.7924578974,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.6us | P99.9: 3.7us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1195754.7573237543,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.2us | P99.9: 4.3us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 634360.5107004296,
+            "unit": "ops/sec",
+            "extra": "P50: 1.4us | P99: 4.7us | P99.9: 7.3us\nthreads: 1 | elapsed: 0.32s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3586008.899398286,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 3.0us | P99.9: 5.4us\nthreads: 1 | elapsed: 0.06s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 449740.02429347194,
+            "unit": "ops/sec",
+            "extra": "P50: 1.9us | P99: 5.3us | P99.9: 8.0us\nthreads: 1 | elapsed: 0.44s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 218752.79965985427,
+            "unit": "ops/sec",
+            "extra": "P50: 4.3us | P99: 5.4us | P99.9: 8.1us\nthreads: 1 | elapsed: 0.91s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1225904.0363423664,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.2us | P99.9: 4.3us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1140287.8657857464,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 1.5us | P99.9: 2.0us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 535905.9677952668,
+            "unit": "ops/sec",
+            "extra": "P50: 1.7us | P99: 5.1us | P99.9: 7.4us\nthreads: 1 | elapsed: 0.37s | num: 200000 | iterations: 3"
           }
         ]
       }
