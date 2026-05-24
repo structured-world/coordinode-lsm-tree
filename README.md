@@ -131,7 +131,13 @@ cargo run --release --features flamegraph -- \
 | `PointInTimeRecovery` | Reserved for the upcoming "roll back to the last fully-consistent record group" semantic (RocksDB's `kPointInTimeRecovery`). Currently behaves identically to `AbsoluteConsistency`. | Not yet wired; design and impl tracked in [#323](https://github.com/structured-world/coordinode-lsm-tree/issues/323). |
 | `SkipAnyCorruptedRecords` | Reserved for the upcoming "skip individual bad record, keep all others" semantic (RocksDB's `kSkipAnyCorruptedRecords`). Currently behaves identically to `AbsoluteConsistency`. Intended companion to the `repair_db` tooling tracked in [#303](https://github.com/structured-world/coordinode-lsm-tree/issues/303). | Not yet wired; lossy maximum-availability mode for forensic recovery, pairs with manifest reconstruction. |
 
-When a non-default mode drops records, the aggregate dropped count is logged per section (`tables` / `blob_files`); individual table-IDs / blob-file-IDs are NOT enumerated because they were never decoded. Operators wanting a per-record audit trail should pair a tail-tolerant open with an out-of-band integrity scan (see `verify::verify_integrity` / `tools/sst-dump verify`).
+When a non-default mode drops records, the recovery path logs aggregate counters per section; individual table-IDs / blob-file-IDs are NOT enumerated because they were never decoded. Three operator-visible warnings can fire under `TolerateCorruptedTailRecords`:
+
+- **`tables` section**, dropped records: count of fully-decoded-but-truncated table records (count header said N, only K < N complete entries on disk → N-K dropped).
+- **`tables` section**, truncated headers: count of level / run / table-count headers that were cut mid-byte (no records were supposed to be present yet for those levels / runs → no record loss, but the levels / runs themselves are missing).
+- **`blob_gc_stats` section**, truncated payload: a power-loss between the `blob_files` commit and the `blob_gc_stats` payload landing surfaces here; tail-tolerant mode warns and produces an empty `FragmentationMap`. GC stats are advisory (fragmentation re-accrues on the next compaction pass), so this is a "rebuild on next pass" outcome, not data loss.
+
+Operators wanting a per-record audit trail should pair a tail-tolerant open with an out-of-band integrity scan (see `verify::verify_integrity` / `tools/sst-dump verify`).
 
 For workflows where the MANIFEST is unrecoverable even under the lossy modes, the planned `repair_db` tool ([#303](https://github.com/structured-world/coordinode-lsm-tree/issues/303)) will rebuild the MANIFEST from the SST files themselves.
 
