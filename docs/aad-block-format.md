@@ -92,9 +92,14 @@ Offset  Size  Field             Description
                                 Also determines the on-disk Nonce length
                                 read at offset 18.
 12      1     CompressionType   Compression codec applied to the block's
-                                plaintext BEFORE encryption. Tag values
-                                match the in-crate `CompressionType` enum
-                                encoding (the `impl Encode for CompressionType` block in `src/compression/mod.rs`):
+                                plaintext BEFORE encryption. Stores ONLY
+                                the leading 1-byte codec discriminator
+                                (the first tag byte emitted by the
+                                `impl Encode for CompressionType` block
+                                in `src/compression/mod.rs`); the rest of
+                                that on-disk encoding (level for Zstd,
+                                level + dict_id LE for ZstdDict) is NOT
+                                serialized here. Tag values:
                                   0 = None
                                   1 = Lz4
                                   3 = Zstd (no dict)
@@ -165,10 +170,11 @@ Offset  Size  Field             Description
 ══════  ════  ═══════════════   ═══════════════════════════════════════════════
 0       4     MagicBody         0x51 0x2A 0x4D 0x18  (LE for 0x184D2A51)
 4       4     PayloadLen        u32 LE, length of EncryptedBody in bytes
-8       N     EncryptedBody     N = PayloadLen. The AEAD ciphertext of:
-                                <whatever-the-block-was-before-encryption,
-                                 i.e. the same byte sequence the plaintext
-                                 path would have written>
+8       N     EncryptedBody     N = PayloadLen. The AEAD ciphertext of the
+                                block's data segment / payload bytes only
+                                (after optional compression, if any). It
+                                does NOT include any legacy plaintext
+                                `Header` envelope bytes.
 ═════════
 Total  8 + N bytes on disk
 ```
@@ -235,7 +241,7 @@ The `MagicBody` and `PayloadLen` from BodyFrame are also **not** part of the AAD
 - MetadataFrame `MagicMetadata` equals `0x184D2A50` (LE bytes `50 2A 4D 18`). If not, treat as a non-AAD-bound block and refuse to decrypt.
 - MetadataFrame `PayloadLen` equals `26 + NONCE_LEN`, where `NONCE_LEN` is the nonce length registered for the suite byte at offset 11 (v1 suites: 38 = 26 + 12). Any other value is malformed and MUST be rejected without reading the body frame (no AAD can be constructed, so AEAD cannot bind context). The decoder MUST validate `PayloadLen` against the suite's registered nonce length BEFORE reading the rest of the payload.
 - BodyFrame `MagicBody` equals `0x184D2A51` (LE bytes `51 2A 4D 18`). If not, reject.
-- BodyFrame `PayloadLen` is in the range `[1, 256 MiB + max_overhead]`, where `256 MiB` is the plaintext upper bound on a single block's on-disk data segment (mirrors the public constant the LSM scrub path enforces) and `max_overhead` is the value reported by the active `EncryptionProvider::max_overhead()` (zero when encryption is disabled or for plaintext blocks). A larger value means either a forged TOC or a header bit-flip and MUST be rejected before allocating the read buffer.
+- BodyFrame `PayloadLen` is in the range `[1, 256 MiB]` for the v1 suites. `256 MiB` is the plaintext upper bound on a single block's on-disk data segment (mirrors the public constant the LSM scrub path enforces). In this wire format, the nonce and authentication tag live in `MetadataFrame`, and for the v1 suites `ciphertext_len == plaintext_len`, so `EncryptionProvider::max_overhead()` does **not** apply to BodyFrame sizing. A larger value means either a forged TOC or a header bit-flip and MUST be rejected before allocating the read buffer. If a future suite permits ciphertext expansion in BodyFrame, that expansion MUST be defined explicitly as a suite-specific ciphertext expansion term in the suite registry/spec, and decoders MUST validate against that term rather than a provider-generic `max_overhead()`.
 
 These checks are not AEAD-authenticated, but they bound the attack surface so that any bypass attempt either (a) fails the structural check above, or (b) reaches the AEAD and fails AAD verification on the metadata-mirror fields.
 
