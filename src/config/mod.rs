@@ -1140,10 +1140,13 @@ impl Config {
     /// only choice that's safe for live production: any corrupt record
     /// in the on-disk manifest aborts the open. Switching to a more
     /// permissive mode trades strict correctness for partial
-    /// availability after a disaster — every dropped record is logged
-    /// as `warn!`, but the recovered tree may be missing tables / blob
-    /// files relative to what the operator last fsynced. Always
-    /// pair the non-default modes with an out-of-band integrity scan
+    /// availability after a disaster. The recovery path emits a
+    /// `warn!` summary per affected section (aggregate counts: total
+    /// table records dropped, total blob-file records dropped,
+    /// header truncations) rather than one log line per dropped
+    /// record — the dropped records were never decoded in the first
+    /// place, so no per-record IDs are available. Always pair the
+    /// non-default modes with an out-of-band integrity scan
     /// ([`verify_integrity`](crate::verify::verify_integrity) for
     /// whole-file XXH3 over every SST + blob file, or
     /// [`verify_block_checksums`](crate::verify::verify_block_checksums)

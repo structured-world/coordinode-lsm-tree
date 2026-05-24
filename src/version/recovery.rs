@@ -156,8 +156,24 @@ pub fn recover(folder: &Path, fs: &dyn Fs, mode: ManifestRecoveryMode) -> crate:
         // hits EOF here. Under `TolerateCorruptedTailRecords` that's
         // legitimate "no tables present" — under `AbsoluteConsistency`
         // it's still a hard fail.
+        // Track bytes consumed inside this section so the
+        // overflow guard below can compare against bytes ACTUALLY
+        // remaining at the moment of the check, not the loose
+        // section-total bound. With the total bound, a count
+        // forgery that's still <= section_total/entry_size slips
+        // past the guard, enters the loop, hits EOF after the real
+        // records, and gets reclassified as a clean tail truncation
+        // under tolerant mode — operators see no signal that the
+        // count header was corrupt. The tight bound surfaces the
+        // forgery as an explicit "count exceeds remaining" warn
+        // before the loop runs.
+        let mut tables_bytes_consumed: u64 = 0;
+
         let level_count = match reader.read_u8() {
-            Ok(n) => n,
+            Ok(n) => {
+                tables_bytes_consumed += 1;
+                n
+            }
             Err(e) if tolerate_tail && e.kind() == std::io::ErrorKind::UnexpectedEof => {
                 log::warn!(
                     "tables section truncated before level_count byte in version \
@@ -171,18 +187,18 @@ pub fn recover(folder: &Path, fs: &dyn Fs, mode: ManifestRecoveryMode) -> crate:
         'levels: for _ in 0..level_count {
             let mut level = vec![];
             let run_count = match reader.read_u8() {
-                Ok(n) => n,
+                Ok(n) => {
+                    tables_bytes_consumed += 1;
+                    n
+                }
                 Err(e) if tolerate_tail && e.kind() == std::io::ErrorKind::UnexpectedEof => {
                     // No runs in this level had a chance to start;
-                    // pushing the empty `level` would be a "zero
-                    // runs at level N" marker which downstream code
-                    // tolerates. Stay consistent with the cut-mid-run
-                    // path below (which DOES push) instead of silently
-                    // dropping the level slot. This is a HEADER
-                    // truncation (the run_count byte didn't land),
-                    // not a record-data loss — count it separately
-                    // so the summary doesn't report nonexistent
-                    // record drops.
+                    // pushing the empty `level` keeps the level slot
+                    // visible to downstream code (instead of silently
+                    // dropping it) and matches the cut-mid-run path
+                    // below. HEADER truncation — no records were
+                    // dropped (none were supposed to be present yet)
+                    // so count separately from record-drops.
                     tables_truncated_headers += 1;
                     levels.push(level);
                     break 'levels;
@@ -193,18 +209,18 @@ pub fn recover(folder: &Path, fs: &dyn Fs, mode: ManifestRecoveryMode) -> crate:
             for _ in 0..run_count {
                 let mut run = vec![];
                 let table_count = match reader.read_u32::<LittleEndian>() {
-                    Ok(n) => n,
+                    Ok(n) => {
+                        tables_bytes_consumed += 4;
+                        n
+                    }
                     Err(e) if tolerate_tail && e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                        // Push the partial `level` so any runs that
-                        // were fully decoded earlier in this level
-                        // survive — breaking out of `'levels` without
-                        // this push silently drops the consistent
-                        // prefix, contradicting the tail-tolerant
-                        // contract. The current `run` is empty (we
-                        // failed at the very first byte of its
-                        // record header), so nothing to push for it.
-                        // HEADER truncation — no records were
-                        // supposed to be there yet, count separately.
+                        // Push the partial `level` so any fully
+                        // decoded runs earlier in this level survive
+                        // — breaking out of `'levels` without this
+                        // push silently drops the consistent prefix.
+                        // The current `run` is empty (failed at the
+                        // very first byte of its header), nothing to
+                        // push for it. HEADER truncation.
                         tables_truncated_headers += 1;
                         levels.push(level);
                         break 'levels;
@@ -212,27 +228,30 @@ pub fn recover(folder: &Path, fs: &dyn Fs, mode: ManifestRecoveryMode) -> crate:
                     Err(e) => return Err(e.into()),
                 };
 
-                // Bound by total section length (33 bytes per entry). Uses
-                // section.len() because BufReader buffering makes
-                // Take::limit() unreliable for remaining-byte checks.
+                // Tight-bound check: count * entry_size against
+                // bytes_remaining at the current cursor, NOT against
+                // section.len(). The loose bound would let an
+                // in-section forgery (count > remaining but still
+                // <= section_total/entry_size) slip past unnoticed
+                // and get reclassified as a clean tail truncation by
+                // the per-entry EOF arm below. The tight bound
+                // surfaces the same shape as an explicit "count
+                // exceeds remaining" warn before the loop runs.
                 //
-                // Under `AbsoluteConsistency` this is a hard "the count
-                // header was forged / bit-flipped — abort" check. Under
-                // `TolerateCorruptedTailRecords` the same condition
-                // legitimately fires when the writer was interrupted
-                // mid-run (count was committed but the trailing entries
-                // weren't), so it must drop to tail-truncation instead
-                // of aborting. The per-entry decode loop below then
-                // surfaces an `UnexpectedEof` for each missing entry,
-                // which the tail-tolerant match arm catches normally.
-                if u64::from(table_count) > section.len() / 33 {
+                // Under `AbsoluteConsistency` this is a hard "the
+                // count header is forged" abort. Under
+                // `TolerateCorruptedTailRecords` it warns and lets
+                // the loop walk bytes-actually-present.
+                let bytes_remaining = section.len().saturating_sub(tables_bytes_consumed);
+                if u64::from(table_count).saturating_mul(33) > bytes_remaining {
                     if tolerate_tail {
                         log::warn!(
-                            "tables: declared table_count={table_count} exceeds section \
-                             capacity (~{} entries) in version #{curr_version_id}; \
-                             tail-tolerant mode walks bytes-actually-present and stops \
-                             at the first EOF",
-                            section.len() / 33,
+                            "tables: declared table_count={table_count} exceeds \
+                             remaining section payload ({bytes_remaining} bytes, \
+                             ~{} entries) in version #{curr_version_id}; \
+                             tail-tolerant mode walks bytes-actually-present and \
+                             stops at the first EOF",
+                            bytes_remaining / 33,
                         );
                     } else {
                         return Err(crate::Error::Unrecoverable);
@@ -242,15 +261,14 @@ pub fn recover(folder: &Path, fs: &dyn Fs, mode: ManifestRecoveryMode) -> crate:
                 for _ in 0..table_count {
                     let entry = read_one_table_entry(&mut reader);
                     match entry {
-                        Ok(t) => run.push(t),
+                        Ok(t) => {
+                            tables_bytes_consumed += 33;
+                            run.push(t);
+                        }
                         Err(e) if tolerate_tail && is_clean_tail_truncation(&e) => {
                             // run.len() is bounded by table_count
-                            // (which we read above as u32), so the
-                            // cast cannot truncate in practice. Use
-                            // try_from with a saturating fallback
-                            // anyway to keep clippy happy and to
-                            // avoid an unrelated panic if the bound
-                            // is ever loosened.
+                            // (u32); cast can't truncate in practice
+                            // but try_from for clippy.
                             let recovered = u32::try_from(run.len()).unwrap_or(u32::MAX);
                             tables_dropped_to_tail = tables_dropped_to_tail
                                 .saturating_add(table_count.saturating_sub(recovered));
@@ -307,6 +325,13 @@ pub fn recover(folder: &Path, fs: &dyn Fs, mode: ManifestRecoveryMode) -> crate:
         // count then truncated the entries produces exactly this
         // shape, so tolerant mode must warn and let the per-entry
         // loop walk bytes-actually-present until the first EOF.
+        //
+        // `section.len().saturating_sub(4)` IS the tight
+        // bytes-remaining bound here — unlike the `tables` section
+        // there are no intermediate header bytes between the count
+        // and the first entry (just the 4-byte count u32 itself),
+        // so this is already the correct "bytes left after the
+        // cursor read" value. No bytes-consumed counter needed.
         if u64::from(blob_file_count) > section.len().saturating_sub(4) / 25 {
             if tolerate_tail {
                 log::warn!(
