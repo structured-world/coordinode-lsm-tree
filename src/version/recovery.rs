@@ -818,4 +818,70 @@ mod tests {
         );
         Ok(())
     }
+
+    /// Writes a `vN` archive whose `blob_gc_stats` section is
+    /// truncated to zero bytes. Mimics a power-loss right after the
+    /// `blob_files` section was committed but before the
+    /// `blob_gc_stats` payload landed — `FragmentationMap::decode_from`
+    /// hits `UnexpectedEof` on the first byte.
+    fn write_truncated_blob_gc_stats(folder: &Path, id: u64, fs: &dyn Fs) -> crate::Result<()> {
+        let path = folder.join(format!("v{id}"));
+        let file = fs.open(
+            &path,
+            &FsOpenOptions::new().write(true).create(true).truncate(true),
+        )?;
+        let mut w = sfa::Writer::from_writer(std::io::BufWriter::new(file));
+        w.start("tree_type")?;
+        w.write_u8(0)?;
+        w.start("tables")?;
+        w.write_u8(0)?; // 0 levels
+        w.start("blob_files")?;
+        w.write_u32::<LittleEndian>(0)?;
+        // blob_gc_stats section started but no payload written —
+        // section.len() == 0, FragmentationMap::decode_from will
+        // surface UnexpectedEof on its first read.
+        w.start("blob_gc_stats")?;
+        w.finish().map_err(|e| match e {
+            sfa::Error::Io(e) => crate::Error::from(e),
+            _ => crate::Error::Unrecoverable,
+        })?;
+        Ok(())
+    }
+
+    #[test]
+    fn recover_tolerate_tail_handles_truncated_blob_gc_stats() -> crate::Result<()> {
+        // Tail-tolerant mode must extend beyond the record-list
+        // sections (tables / blob_files): a power-loss between the
+        // blob_files commit and the blob_gc_stats payload is the
+        // exact "writer never finished" shape this mode is meant to
+        // salvage. Strict mode still aborts; tolerant mode emits a
+        // warn and uses a default (empty) FragmentationMap.
+        let fs = MemFs::new();
+        let folder = Path::new("/tolerate/gc_stats");
+        fs.create_dir_all(folder)?;
+        write_current(folder, 1, &fs)?;
+        write_truncated_blob_gc_stats(folder, 1, &fs)?;
+
+        // Strict mode: hard fail.
+        let strict = recover(folder, &fs, ManifestRecoveryMode::AbsoluteConsistency);
+        assert!(
+            strict.is_err(),
+            "strict mode must abort on truncated blob_gc_stats; got Ok",
+        );
+
+        // Tolerant mode: succeeds with empty gc_stats. Compare via
+        // `Default` (FragmentationMap implements PartialEq) — the
+        // type does not expose an `is_empty()` accessor.
+        let lenient = recover(
+            folder,
+            &fs,
+            ManifestRecoveryMode::TolerateCorruptedTailRecords,
+        )?;
+        assert_eq!(
+            lenient.gc_stats,
+            crate::blob_tree::FragmentationMap::default(),
+            "tolerant mode must produce default (empty) gc_stats on truncated section",
+        );
+        Ok(())
+    }
 }
