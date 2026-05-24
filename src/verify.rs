@@ -1045,9 +1045,20 @@ mod block_verify_tests {
     /// pinning the variant routing.
     #[test]
     fn verify_sst_file_missing_file_reports_unreadable() {
-        let missing_path = std::path::Path::new("/this/path/does/not/exist/sst-12345.sst");
+        // Build the missing-file path under a fresh tempdir so it
+        // resolves the same way on Linux / macOS / Windows runners.
+        // A hardcoded Unix-style absolute path would either skip the
+        // test on Windows (no `/this/...` semantics) or risk a flaky
+        // pass if the path happened to exist.
+        let dir = tempfile::tempdir().unwrap();
+        let missing_path = dir.path().join("does-not-exist-sst-12345.sst");
+        // Sanity: tempdir() guarantees the directory is empty.
+        assert!(
+            !missing_path.exists(),
+            "tempdir entry must be absent for this test to exercise the missing-file branch",
+        );
 
-        let report = verify_sst_file(missing_path);
+        let report = verify_sst_file(&missing_path);
         assert_eq!(
             report.sst_files_scanned, 1,
             "wrapper stamps sst_files_scanned = 1 even on file-open failure \
@@ -1068,7 +1079,7 @@ mod block_verify_tests {
             matches!(
                 err,
                 BlockVerifyError::SstFileUnreadable { table_id: 0, path, .. }
-                    if path == missing_path,
+                    if path == &missing_path,
             ),
             "expected SstFileUnreadable for {}, got {err:?}",
             missing_path.display(),
