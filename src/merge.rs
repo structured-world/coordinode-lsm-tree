@@ -170,33 +170,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "maybe not needed"]
-    #[expect(clippy::unwrap_used, reason = "test assertions")]
-    fn merge_dup() -> crate::Result<()> {
-        #[rustfmt::skip]
-        let a = vec![
-            Ok(InternalValue::from_components("a", b"", 0, Value)),
-        ];
-        #[rustfmt::skip]
-        let b = vec![
-            Ok(InternalValue::from_components("a", b"", 0, Value)),
-        ];
-
-        let mut iter = Merger::new(
-            vec![a.into_iter(), b.into_iter()],
-            comparator::default_comparator(),
-        );
-
-        assert_eq!(
-            iter.next().unwrap()?,
-            InternalValue::from_components("a", b"", 0, Value),
-        );
-        assert!(iter.next().is_none(), "iter should be closed");
-
-        Ok(())
-    }
-
-    #[test]
     #[expect(clippy::unwrap_used, reason = "test assertions")]
     fn merge_interleaved() -> crate::Result<()> {
         let a = vec![

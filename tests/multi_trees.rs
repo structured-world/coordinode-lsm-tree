@@ -1,8 +1,16 @@
 use lsm_tree::{AbstractTree, Config, SequenceNumberCounter, get_tmp_folder};
 use test_log::test;
 
+/// Two trees opened in the same process must keep INDEPENDENT
+/// `table_id` counters: each tree's table ids start at 0 and grow
+/// independently of any other tree the process has opened.
+///
+/// Tree ids themselves are drawn from a process-global counter
+/// (`TREE_ID_COUNTER` in `src/tree/inner.rs`), so the absolute tree
+/// id values depend on test execution order. This test only asserts
+/// the property that matters here — `tree0.id() != tree1.id()` — and
+/// makes no claim about which specific values they hold.
 #[test]
-#[ignore]
 fn tree_multi_table_ids() -> lsm_tree::Result<()> {
     let folder0 = get_tmp_folder();
     let folder1 = get_tmp_folder();
@@ -13,17 +21,16 @@ fn tree_multi_table_ids() -> lsm_tree::Result<()> {
         SequenceNumberCounter::default(),
     )
     .open()?;
-    assert_eq!(tree0.id(), 0);
 
     assert_eq!(0, tree0.next_table_id());
 
     tree0.insert("a", "a", 0);
     tree0.flush_active_memtable(0)?;
 
-    assert_eq!(2, tree0.next_table_id());
+    assert_eq!(1, tree0.next_table_id());
 
     assert_eq!(
-        1,
+        0,
         tree0
             .current_version()
             .level(0)
@@ -42,17 +49,21 @@ fn tree_multi_table_ids() -> lsm_tree::Result<()> {
         SequenceNumberCounter::default(),
     )
     .open()?;
-    assert_eq!(tree1.id(), 1);
+    assert_ne!(
+        tree0.id(),
+        tree1.id(),
+        "tree ids must be unique across the process",
+    );
 
     assert_eq!(0, tree1.next_table_id());
 
     tree1.insert("a", "a", 0);
     tree1.flush_active_memtable(0)?;
 
-    assert_eq!(2, tree1.next_table_id());
+    assert_eq!(1, tree1.next_table_id());
 
     assert_eq!(
-        1,
+        0,
         tree1
             .current_version()
             .level(0)

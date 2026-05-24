@@ -4,7 +4,6 @@ use lsm_tree::{
 use test_log::test;
 
 #[test]
-#[ignore]
 fn snapshot_404() -> lsm_tree::Result<()> {
     let folder = get_tmp_folder();
 
