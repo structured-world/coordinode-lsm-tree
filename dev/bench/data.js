@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779570910330,
+  "lastUpdate": 1779581971324,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -8580,6 +8580,84 @@ window.BENCHMARK_DATA = {
             "value": 469482.69743819017,
             "unit": "ops/sec",
             "extra": "P50: 2.0us | P99: 5.3us | P99.9: 8.0us\nthreads: 1 | elapsed: 0.43s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "63a9927e8ad70d4d601fa48cdc8241ca7554e10f",
+          "message": "feat(verify): per-block XXH3 scrub for proactive bit-rot detection (#300 part 1) (#313)\n\n## Summary\n\nAdds `verify_block_checksums(tree) -> BlockVerifyReport` — walks every\nblock in every SST in the tree's current version and verifies each\nblock's XXH3 against the value stored in its own header. Surfaces silent\nbit-rot ahead of read-time errors with **per-block `(file, offset)`\ngranularity**.\n\nThe existing `verify_integrity` hashes each SST as one opaque byte\nstream against the manifest-level file checksum: catches whole-file\ncorruption but only at file granularity. The block-level scrub closes\nthe granularity gap.\n\n## API\n\n```rust\npub fn verify_block_checksums(tree: &impl AbstractTree) -> BlockVerifyReport;\n\n#[non_exhaustive]\npub struct BlockVerifyReport {\n    pub sst_files_scanned: usize,\n    pub blocks_scanned: usize,\n    pub errors: Vec<BlockVerifyError>,\n}\n\n#[non_exhaustive]\npub enum BlockVerifyError {\n    SstFileUnreadable { table_id, path, error },\n    HeaderCorrupted   { table_id, path, offset, reason },\n    DataCorrupted     { table_id, path, offset, data_length, expected, got },\n    DataReadError     { table_id, path, offset, data_length, error },\n}\n```\n\n`BlockVerifyError` implements `Display` + `std::error::Error`. Variant\nfields are accessible via match / `if let` (enum variant fields are\nalways part of the variant's public shape — there is no per-field\nvisibility in Rust enums; the `non_exhaustive` enum attribute is what\nforces downstream `match`es to include a wildcard arm).\n\n### Variant semantics\n\n| Variant | When it fires |\n|---------|---------------|\n| `SstFileUnreadable` | File open failed, or SFA trailer parse failed\n(whole walk impossible) |\n| `HeaderCorrupted` | `Header::decode_from` returned error (header XXH3\nmismatch), OR header decoded but `data_length` exceeds the 256 MiB hard\ncap, OR `data_length` overruns the enclosing SFA section bounds |\n| `DataReadError` | Header decoded cleanly but `read_exact` on the data\nsegment failed (truncated SST, unexpected EOF, transient I/O) |\n| `DataCorrupted` | Header + data read both fine, but recomputed XXH3\nover the data doesn't match `header.checksum` |\n\n## SST layout traversal\n\nPer-SST walk uses the SFA TOC to enumerate sections. The writer opens\nwith `sfa::Writer::start(\"data\")`, so the data section is named — no\nunnamed leading entry. Sections in writer order:\n\n- `data` → block-format (data blocks)\n- `tli` → block-format (top-level index, full + partitioned)\n- `index` → block-format (partitioned-index leaf blocks; absent for\nfull)\n- `filter_tli` → block-format (top-level filter for partitioned filters;\nabsent for full)\n- `filter` → block-format\n- `range_tombstones` → block-format (optional)\n- `linked_blob_files` → **raw** length-prefixed u64 list (skipped)\n- `table_version` → **raw** single byte (skipped)\n- `meta` → block-format\n\nRaw-format sections are skipped — their integrity is covered by the\nSFA-trailer checksum verified at table-open time. A corrupt header\ninside a block-format region stops that region's walk (the offset\narithmetic becomes unrecoverable without a valid length field) and is\nreported as `HeaderCorrupted`. Sibling regions in the same SST and other\nSSTs continue.\n\n## DoS hardening\n\n`data_length` is validated against TWO bounds before any `Vec::resize`:\n\n1. **Hard cap** — `MAX_BLOCK_DATA_LENGTH = 256 MiB`, mirroring\n`table::block::MAX_DECOMPRESSION_SIZE`. Catches the case where both the\nblock header AND the enclosing SFA TOC entry are simultaneously\ncorrupted/forged so the section-bounds check passes.\n2. **Section bounds** — `end_offset - offset - header_len`. Catches\nin-section header tampering that managed to keep the header XXH3 valid.\n\nEither failure is reported as `HeaderCorrupted` with a descriptive\nreason. Without this, a forged TOC `len` of `u64::MAX` could trigger a\nmulti-GB allocation.\n\n## Out of scope (intentional)\n\n- **Decompression / decryption errors.** Those depend on per-block\ncontext (compression policy, encryption key, zstd dictionary) that the\nscrub path doesn't need to surface raw bit-rot. They get caught on\nactual reads, where the context is already in hand.\n- **File-level `verify_file_checksums` variant** (the second half of\n#300) — depends on #302 (file-level checksum stored in MANIFEST), which\nhasn't landed yet. Will land in a follow-up PR once #302 is merged.\n- **Parallelism + throttle knobs** listed in #300's acceptance — not\nadded in this PR; the sequential walk works against\nsingle-digit-µs/block XXH3, so a 100 GB dataset scrubs in well under a\nminute single-threaded. Parallel + rate-limited variants are easy\nfollow-ups when an operator hits the bandwidth wall.\n\n## Test plan\n\n- [x] `verify_block_checksums_clean_tree_has_no_errors`: populate 1k\nentries → flush → reopen → scrub. Asserts `report.is_ok()`,\n`blocks_scanned > 0`, `sst_files_scanned >= 1`. On a 31 KB SST the walk\nfinds 8 blocks across all sections.\n- [x] `verify_block_checksums_detects_flipped_byte_in_data_block`: same\nsetup, then flip the first byte AFTER the first block's `Header` on disk\n(lands in the first data block's payload, header XXH3 stays valid → no\n`HeaderCorrupted`, data XXH3 now mismatches → `DataCorrupted`). Asserts\nthe report contains a `DataCorrupted` error pinned to the corrupted SST\npath.\n- [x] `cargo clippy --all-features --all-targets -- -D warnings`: clean\n- [x] `cargo nextest run --all-features`: 1532 tests pass (1 slow), 6\nskipped\n\n## Related\n\nPart of #300. File-level half blocked on #302.\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n\n## Summary by CodeRabbit\n\n## Release Notes\n\n* **New Features**\n* Added block-level integrity verification that scans all database files\nto detect data corruption by validating checksums and data integrity,\nwith detailed error reporting for identified issues.\n\n* **Tests**\n* Added regression tests ensuring the integrity verification feature\noperates correctly across storage backends.\n\n<!-- review_stack_entry_start -->\n\n[![Review Change\nStack](https://storage.googleapis.com/coderabbit_public_assets/review-stack-in-coderabbit-ui.svg)](https://app.coderabbit.ai/change-stack/structured-world/coordinode-lsm-tree/pull/313?utm_source=github_walkthrough&utm_medium=github&utm_campaign=change_stack)\n\n<!-- review_stack_entry_end -->\n\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->\n\n## Related\n\n- #315 — `DataReadError` regression test (deferred; truncation approach\ndestroys SFA trailer, needs trailer-preserving surgery or a\nsynthetic-reader unit test)",
+          "timestamp": "2026-05-24T03:18:38+03:00",
+          "tree_id": "d84d6616f8368aa9beed802b9d05a4dce9bee824",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/63a9927e8ad70d4d601fa48cdc8241ca7554e10f"
+        },
+        "date": 1779581969662,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 1840196.1347287456,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.7us | P99.9: 3.9us\nthreads: 1 | elapsed: 0.11s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1119795.0783964894,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.3us | P99.9: 4.6us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 560610.9174502498,
+            "unit": "ops/sec",
+            "extra": "P50: 1.6us | P99: 4.7us | P99.9: 7.5us\nthreads: 1 | elapsed: 0.36s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3574649.5860377047,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 3.1us | P99.9: 5.7us\nthreads: 1 | elapsed: 0.06s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 402014.0679677305,
+            "unit": "ops/sec",
+            "extra": "P50: 2.2us | P99: 5.4us | P99.9: 8.5us\nthreads: 1 | elapsed: 0.50s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 219283.92772003522,
+            "unit": "ops/sec",
+            "extra": "P50: 4.3us | P99: 5.3us | P99.9: 7.4us\nthreads: 1 | elapsed: 0.91s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1164551.8250250635,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.3us | P99.9: 4.6us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1113909.9894228121,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.5us | P99.9: 2.0us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 493757.7332799084,
+            "unit": "ops/sec",
+            "extra": "P50: 1.9us | P99: 5.2us | P99.9: 7.9us\nthreads: 1 | elapsed: 0.41s | num: 200000 | iterations: 3"
           }
         ]
       }
