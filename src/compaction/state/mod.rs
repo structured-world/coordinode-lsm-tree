@@ -31,8 +31,23 @@ mod tests {
     use crate::{AbstractTree, SequenceNumberCounter};
     use test_log::test;
 
+    /// Verifies that a failed `major_compact` leaves no compaction
+    /// state behind: `hidden_set` empties, `table_count` is unchanged,
+    /// no level manifest update lands. The test needs a way to make
+    /// the level-manifest write fail mid-compaction; the original
+    /// approach (mutating a `folder` field on `CompactionState` to
+    /// point at an invalid path, see the commented-out block below)
+    /// no longer compiles against the current `CompactionState` shape.
+    ///
+    /// Re-enabling requires fault injection at the `Fs` trait layer
+    /// (a `Fs` impl that fails specific writes by predicate). Until
+    /// that infrastructure lands the test stays ignored; tracked
+    /// alongside the broader fault-injection / integrity work in
+    /// issues #300 (online `VerifyChecksum` APIs) and #303 (`repair_db`),
+    /// either of which is the natural place to land a per-test
+    /// failing-`Fs` helper.
     #[test]
-    #[ignore = "wip"]
+    #[ignore = "needs Fs-layer fault injection helper; blocked on #300 / #303 infrastructure"]
     fn level_manifest_atomicity() -> crate::Result<()> {
         let folder = tempfile::tempdir()?;
 
