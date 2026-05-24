@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779659515208,
+  "lastUpdate": 1779663409588,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -9438,6 +9438,84 @@ window.BENCHMARK_DATA = {
             "value": 478019.88560812053,
             "unit": "ops/sec",
             "extra": "P50: 1.9us | P99: 6.5us | P99.9: 9.6us\nthreads: 1 | elapsed: 0.42s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "fd65b89efcfc0fa8409b0e61742fa28a2fa38da0",
+          "message": "feat(sst-dump): properties subcommand + public inspect facade (#328)\n\n## Summary\n\nAdds `sst-dump <file> properties` — another subcommand from the\nremaining-five list in #324. Prints the SST's stored metadata without\nopening a live \\`Tree\\`.\n\n## Library API\n\nNew public module \\`lsm_tree::inspect\\`:\n\n\\`\\`\\`rust\npub struct TableProperties {\n    pub id: u64,\n    pub file_size: u64,\n    pub min_key: Vec<u8>,\n    pub max_key: Vec<u8>,\n    pub item_count: u64,\n    pub tombstone_count: u64,\n    pub weak_tombstone_count: u64,\n    pub weak_tombstone_reclaimable: u64,\n    pub data_block_count: u64,\n    pub index_block_count: u64,\n    pub data_block_compression: CompressionType,\n    pub index_block_compression: CompressionType,\n    pub created_at_nanos: u128,\n}\n\npub fn read_table_properties(path: &Path) -> Result<TableProperties>;\n\\`\\`\\`\n\nThe facade returns its own struct rather than a leaked \\`ParsedMeta\\` so\nthe on-disk meta block stays an implementation detail and field\nadditions / renames are non-breaking.\n\nRecovery mirrors \\`Table::recover\\` (PR #295): tail \\`meta\\` first, MID\n\\`meta_mid\\` on decode failure, original tail error if both fail. Tables\nwritten before the meta-mirror change have no \\`meta_mid\\` and fall\nstraight through.\n\nInternal change: \\`table::meta\\` and \\`table::regions\\` widened from\n\\`mod\\` to \\`pub(crate) mod\\` so \\`inspect\\` can use the parsers. The\nmodules themselves remain crate-private — only the new\n\\`TableProperties\\` type is part of the public API.\n\n## CLI output\n\n\\`\\`\\`\n$ sst-dump table-0 properties\nfile:                table-0\ntable_id:            0\nfile_size:           3288 bytes\ncreated_at:          1748102347123456789 ns since Unix epoch\nkey_range:           min=\\\"key-000000\\\" max=\\\"key-000199\\\"\nitem_count:          200\ntombstone_count:     0\nweak_tombstones:     0\nweak_reclaimable:    0\ndata_block_count:    1\nindex_block_count:   1\ndata_compression:    None\nindex_compression:   None\n\\`\\`\\`\n\nUser keys are rendered with a small escape helper: printable ASCII\nverbatim, backslashes doubled, every other byte as \\`\\\\xNN\\`. Preserves\nevery byte unambiguously for round-trip diagnostic use while keeping the\ncommon alphanumeric-prefix case readable.\n\n## Tests\n\n\\`tools/sst-dump/tests/properties_smoke.rs\\` (2 new CLI smoke tests):\n\n- \\`properties_prints_expected_counts_and_key_range\\` — builds a\n200-item SST, asserts \\`item_count=200\\`, \\`tombstone_count=0\\`,\n\\`data_compression=None\\`, key-range endpoints\n\\`key-000000\\`/\\`key-000199\\`, non-zero block counts, and that the\nreported data-region \\`file_size\\` is strictly less than the on-disk\nsize (the meta + trailer sections always add bytes).\n- \\`properties_fails_on_missing_file\\` — exits non-zero with an\n\\`error:\\` line in stderr.\n\n\\`tests/inspect.rs\\` (3 new library-API regression tests for\n\\`read_table_properties\\`\\'s TAIL-first / MID-fallback recovery, mirrors\nthe matrix in \\`tests/meta_mirror.rs\\`):\n\n- \\`read_table_properties_uses_tail_when_mid_corrupted\\` — wiping MID is\na no-op when TAIL is intact (TAIL is tried first).\n- \\`read_table_properties_falls_back_to_mid_when_tail_corrupted\\` —\nzeroing the TAIL \\`meta\\` region forces the reader through the MID\nbranch; returned properties match the clean read (writer contract: MID\nand TAIL share the same in-memory snapshot).\n- \\`read_table_properties_errors_when_both_meta_copies_zeroed\\` — both\ncopies corrupted surfaces a hard error.\n\n## Test plan\n\n- [x] \\`cargo nextest run\\` in \\`tools/sst-dump/\\` (8 tests pass: 2 new\n\\`properties_smoke\\` + 4 \\`hex_smoke\\` + 2 \\`verify_smoke\\`)\n- [x] \\`cargo nextest run\\` main suite (1413 pass; 3 new\n\\`tests/inspect.rs\\`)\n- [x] \\`cargo clippy --all-targets -- -D warnings\\` clean on both crates\n- [x] README \\`Operational tools\\` row updated\n\nPart of #324.\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n## Summary by CodeRabbit\n\n* **New Features**\n* Added a new \"properties\" command to inspect SST file metadata (id,\nsize, key range, counts, compression, timestamps) without opening the\nlive tree.\n* Exposed a public, read-only inspection API for out-of-band SST\nmetadata retrieval.\n\n* **Documentation**\n* Updated README to document the inspection tool and the new\nsubcommands.\n\n* **Tests**\n* Added end-to-end and regression tests covering the properties command\nand inspection fallback/recovery behavior.\n\n<!-- review_stack_entry_start -->\n\n[![Review Change\nStack](https://storage.googleapis.com/coderabbit_public_assets/review-stack-in-coderabbit-ui.svg)](https://app.coderabbit.ai/change-stack/structured-world/coordinode-lsm-tree/pull/328?utm_source=github_walkthrough&utm_medium=github&utm_campaign=change_stack)\n\n<!-- review_stack_entry_end -->\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-05-25T01:55:55+03:00",
+          "tree_id": "47f62fdcf1fd2884d3f94d1b0a82fbd2fe1182fa",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/fd65b89efcfc0fa8409b0e61742fa28a2fa38da0"
+        },
+        "date": 1779663408719,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 2023008.5665511556,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.6us | P99.9: 3.8us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1162005.1686687104,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.2us | P99.9: 4.5us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 574365.9313147718,
+            "unit": "ops/sec",
+            "extra": "P50: 1.6us | P99: 4.8us | P99.9: 7.6us\nthreads: 1 | elapsed: 0.35s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3598738.4334522462,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 3.1us | P99.9: 5.7us\nthreads: 1 | elapsed: 0.06s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 406453.4764530811,
+            "unit": "ops/sec",
+            "extra": "P50: 2.2us | P99: 5.3us | P99.9: 8.4us\nthreads: 1 | elapsed: 0.49s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 218540.835078951,
+            "unit": "ops/sec",
+            "extra": "P50: 4.3us | P99: 5.4us | P99.9: 8.0us\nthreads: 1 | elapsed: 0.92s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1177802.3917538945,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.2us | P99.9: 4.5us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1109846.6320141843,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.5us | P99.9: 1.9us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 488802.2145888207,
+            "unit": "ops/sec",
+            "extra": "P50: 1.9us | P99: 5.3us | P99.9: 8.1us\nthreads: 1 | elapsed: 0.41s | num: 200000 | iterations: 3"
           }
         ]
       }
