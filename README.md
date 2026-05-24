@@ -120,6 +120,21 @@ cargo run --release --features flamegraph -- \
 | [`tools/db_bench`](tools/db_bench) | RocksDB-compatible benchmark suite, also drives the CI perf dashboard. |
 | [`tools/sst-dump`](tools/sst-dump) | Inspect / verify a single SST file out-of-band. Subcommands: `verify` (walk every block, check per-block XXH3, exit non-zero on corruption), `hex <offset>` (raw hex dump of a region with optional `Header` decode; useful for inspecting a specific offset flagged by `verify --verbose`). |
 
+## Manifest recovery modes
+
+`Config::manifest_recovery_mode` controls how the engine reacts to a malformed MANIFEST record at `Tree::open` time. Each mode trades a different point on the **strictness ↔ availability** axis; pick the one whose contract matches the deployment.
+
+| Mode | Behaviour on corruption | When to use |
+|------|-------------------------|-------------|
+| `AbsoluteConsistency` (default) | Any per-record decode mismatch (bad XXH3, invalid tag, truncated TOC entry, declared-count overrun) aborts the open with the original error. No data is silently dropped. | **Production default.** Surfaces every byte of corruption before the tree comes back online; matches what most workloads actually want. |
+| `TolerateCorruptedTailRecords` | If the iteration over `tables` / `blob_files` runs out of bytes before the declared count is reached (truncated tail), keep everything that decoded cleanly before the cut and emit a `warn!` listing the dropped count. Any mid-record error that is NOT a clean tail truncation (bad checksum, etc.) still aborts. | **Power-loss-at-write-tail salvage.** Use when a crash mid-fsync left the MANIFEST tail incomplete and you'd rather come up with the last consistent prefix than refuse to open. Not a general bit-rot tolerance, only "the writer never finished". |
+| `PointInTimeRecovery` | Reserved for the upcoming "roll back to the last fully-consistent record group" semantic (RocksDB's `kPointInTimeRecovery`). Currently behaves identically to `AbsoluteConsistency`. | Not yet wired; design and impl tracked in [#323](https://github.com/structured-world/coordinode-lsm-tree/issues/323). |
+| `SkipAnyCorruptedRecords` | Reserved for the upcoming "skip individual bad record, keep all others" semantic (RocksDB's `kSkipAnyCorruptedRecords`). Currently behaves identically to `AbsoluteConsistency`. Intended companion to the `repair_db` tooling tracked in [#303](https://github.com/structured-world/coordinode-lsm-tree/issues/303). | Not yet wired; lossy maximum-availability mode for forensic recovery, pairs with manifest reconstruction. |
+
+When a non-default mode drops records, the aggregate dropped count is logged per section (`tables` / `blob_files`); individual table-IDs / blob-file-IDs are NOT enumerated because they were never decoded. Operators wanting a per-record audit trail should pair a tail-tolerant open with an out-of-band integrity scan (see `verify::verify_integrity` / `tools/sst-dump verify`).
+
+For workflows where the MANIFEST is unrecoverable even under the lossy modes, the planned `repair_db` tool ([#303](https://github.com/structured-world/coordinode-lsm-tree/issues/303)) will rebuild the MANIFEST from the SST files themselves.
+
 ## Support the project
 
 <div align="center">
