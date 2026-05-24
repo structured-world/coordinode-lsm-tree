@@ -31,9 +31,16 @@ mod tests {
     use crate::{AbstractTree, SequenceNumberCounter};
     use test_log::test;
 
-    /// Verifies that a failed `major_compact` leaves no compaction
-    /// state behind: `hidden_set` empties, `table_count` is unchanged,
-    /// no level manifest update lands. The test needs a way to make
+    /// Verifies that a failed `major_compact` leaves no observable
+    /// compaction state behind. Concretely the test asserts only the
+    /// two properties its body actually exercises: `hidden_set`
+    /// (tables temporarily marked under-compaction) drains empty
+    /// after the failure, and the externally-visible `table_count`
+    /// matches the pre-compaction snapshot — i.e. no half-applied
+    /// table addition leaks. The deeper invariant — that no level
+    /// manifest update lands on disk — is not asserted here because
+    /// the test cannot induce the failure today; see the next
+    /// paragraph. The test needs a way to make
     /// the level-manifest write fail mid-compaction; the original
     /// approach (mutating a `folder` field on `CompactionState` to
     /// point at an invalid path, see the commented-out block below)
