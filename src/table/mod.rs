@@ -893,6 +893,28 @@ impl Table {
                         "TLI tail mirror unreadable ({tail_err}); falling back to TLI head copy at {:?}",
                         regions.tli,
                     );
+                    // Match the meta-mirror pattern: when BOTH
+                    // copies fail, surface the original `tail_err`
+                    // (callers care about the authoritative /
+                    // preferred copy's failure mode). The head
+                    // failure goes to the log so it's not silently
+                    // dropped from diagnostics.
+                    log::trace!("Reading TLI head copy, with tli_ptr={:?}", regions.tli);
+                    return match Self::read_tli_at(
+                        file,
+                        regions.tli,
+                        table_id,
+                        compression,
+                        encryption,
+                    ) {
+                        Ok(idx) => Ok(idx),
+                        Err(head_err) => {
+                            log::warn!(
+                                "TLI head copy also unreadable ({head_err}); returning original tail error",
+                            );
+                            Err(tail_err)
+                        }
+                    };
                 }
             }
         }
