@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779611526624,
+  "lastUpdate": 1779612406567,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -8892,6 +8892,84 @@ window.BENCHMARK_DATA = {
             "value": 522197.70538808603,
             "unit": "ops/sec",
             "extra": "P50: 1.7us | P99: 5.1us | P99.9: 7.6us\nthreads: 1 | elapsed: 0.38s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "69052232bf4755d5520a62f92a7af1d7395b4d2e",
+          "message": "feat(tooling): sst-dump CLI scaffold + verify subcommand (#301) (#316)\n\n## Summary\n\nNew `tools/sst-dump` standalone binary modeled on RocksDB's `sst_dump`.\nFirst subcommand `verify` walks every block in the SST, checks per-block\nXXH3, and exits 0 on a clean file / 1 on corruption. Lays the\nscaffolding for the remaining subcommands listed in #301 (properties,\ndump, index-dump, filter-stats, hex), which can be added incrementally\nwithout restructuring the binary or the test harness.\n\n## What lands\n\n- `tools/sst-dump/` standalone Cargo crate (path dep on the main lib,\nmirrors the `tools/db_bench` layout).\n- New public API `lsm_tree::verify::verify_sst_file(&Path) ->\nBlockVerifyReport`. Wraps the existing internal `scan_sst_blocks` with\n`StdFs`, `table_id=0` and `max_enc_overhead=0`. Std-feature-gated,\n`#[must_use]`. Doc comment spells out the encryption-overhead caveat\n(encrypted blocks near the 256 MiB plaintext ceiling may false-flag —\nencryption-aware verification still goes through\n`verify_block_checksums` on a live tree).\n- `sst-dump <file> verify [--verbose]` CLI:\n- Prints file path, block count, error count, status (`OK` / `CORRUPT`).\n  - Shows the first 3 errors by default; `--verbose` shows all.\n- Each error line is prefixed with its variant tag (`SstFileUnreadable`\n/ `HeaderCorrupted` / `DataCorrupted` / `DataReadError` /\n`TocCorrupted`) for stable log scraping.\n  - Exit code: 0 on clean, 1 on any per-block or file-level error.\n- Two integration smoke tests in `tools/sst-dump/tests/verify_smoke.rs`:\n  - Clean SST → exit 0, output contains `status: OK` + `errors: 0`.\n- Single-byte tamper inside first data block payload → exit 1, output\ncontains `status: CORRUPT` + `DataCorrupted` (or `HeaderCorrupted`)\nerror line.\n- README ``Operational tools`` table covering both `db_bench` and\n`sst-dump`.\n\n## Compatibility\n\n- Pure additive: no changes to existing API or on-disk format.\n- New `verify_sst_file` is std-only (gated behind the `std` feature,\nsame as the rest of `verify::*`).\n\n## Test plan\n\n- [x] Standalone build: `cargo build` in `tools/sst-dump` finishes\nclean.\n- [x] Manual smoke: `sst-dump /tmp/nonexistent verify` → exit 1, output\n`SstFileUnreadable: ... No such file or directory`.\n- [x] Manual smoke: `sst-dump --help` shows usage + subcommand summary.\n- [x] Integration tests: 2/2 pass via `cargo nextest run`.\n- [x] Full lsm-tree suite: 1545/1545 pass after the new `pub fn` is\nadded.\n- [x] Lint clean on both crates: `cargo clippy --all-targets\n--all-features -- -D warnings` in lib root and in `tools/sst-dump`.\n\n## Follow-up (not in this PR)\n\nRemaining subcommands from #301 — `properties` (meta-block dump), `dump\n--from/--to/--keys-only/--max=N` (KV iteration), `index-dump` (TLI\nstructure), `filter-stats` (Bloom / Ribbon FPR estimate), `hex` (raw\nblock dump). Each requires exposing more of the internal table machinery\n(`ParsedMeta`, `ParsedRegions`, `DataBlock` decode); held back here to\nkeep the API-surface change minimal and reviewable.\n\nPart of #301.",
+          "timestamp": "2026-05-24T11:45:54+03:00",
+          "tree_id": "42d349f2fb5b2fa60c17882c5589394cd217c744",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/69052232bf4755d5520a62f92a7af1d7395b4d2e"
+        },
+        "date": 1779612405123,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 2012829.5744244237,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.7us | P99.9: 3.8us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1106897.2332865673,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.3us | P99.9: 4.6us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 559179.8080305523,
+            "unit": "ops/sec",
+            "extra": "P50: 1.6us | P99: 4.8us | P99.9: 7.6us\nthreads: 1 | elapsed: 0.36s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3686303.5318547864,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 3.1us | P99.9: 5.7us\nthreads: 1 | elapsed: 0.05s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 407139.6522412996,
+            "unit": "ops/sec",
+            "extra": "P50: 2.2us | P99: 5.4us | P99.9: 8.4us\nthreads: 1 | elapsed: 0.49s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 220226.6918868806,
+            "unit": "ops/sec",
+            "extra": "P50: 4.3us | P99: 5.4us | P99.9: 7.6us\nthreads: 1 | elapsed: 0.91s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1195735.969660113,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.2us | P99.9: 4.3us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1121267.6028922247,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 1.5us | P99.9: 1.9us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 492198.81853481557,
+            "unit": "ops/sec",
+            "extra": "P50: 1.9us | P99: 5.2us | P99.9: 7.9us\nthreads: 1 | elapsed: 0.41s | num: 200000 | iterations: 3"
           }
         ]
       }
