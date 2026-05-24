@@ -94,7 +94,7 @@ Offset  Size  Field             Description
 12      1     CompressionType   Compression codec applied to the block's
                                 plaintext BEFORE encryption. Tag values
                                 match the in-crate `CompressionType` enum
-                                encoding (`src/compression/mod.rs:405`):
+                                encoding (the `impl Encode for CompressionType` block in `src/compression/mod.rs`):
                                   0 = None
                                   1 = Lz4
                                   3 = Zstd (no dict)
@@ -244,6 +244,15 @@ These checks are not AEAD-authenticated, but they bound the attack surface so th
 [RFC 5234](https://datatracker.ietf.org/doc/html/rfc5234) syntax:
 
 ```abnf
+;; ABNF: v1 wire format with v1 suites (AES-256-GCM, ChaCha20-Poly1305),
+;; both of which declare NONCE_LEN = 12 in the §7 registry. Terminal
+;; constants (`metadata-payload-len`, `nonce` width) are hardcoded
+;; below for the v1-with-v1-suites concrete bytes that appear on disk
+;; today. Future suites with different NONCE_LEN (or a future spec
+;; revision that adds / removes payload fields) get their own ABNF
+;; revision; the abstract framing contract is `PayloadLen == 22 +
+;; NONCE_LEN` and the per-field structure described in §5.1.
+;;
 ;; A single AAD-bound encrypted block on disk begins with the
 ;; required pair (metadata-frame, body-frame) and may carry zero or
 ;; more optional trailing skippable frames (e.g. an ECC parity frame
@@ -301,7 +310,7 @@ block-type        = %x00 / %x01 / %x02 / %x03 / %x04
                                                    ; Data / Index / Filter / Meta / RangeTombstone
 suite-id          = %x02 / %x03                    ; AES-256-GCM / ChaCha20-Poly1305 in v1
 compression-type  = %x00 / %x01 / %x03 / %x04      ; None / Lz4 / Zstd / ZstdDict
-                                                   ; (tags match src/compression/mod.rs:405)
+                                                   ; (tags match `impl Encode for CompressionType` in src/compression/mod.rs)
 dict-id           = 4OCTET                         ; u32 BE
 window-log        = %x00 / %x0A-1F                 ; 0 = no zstd, 10..=31 = raw log2 window
 nonce             = 12OCTET                       ; v1 suites only. Length is suite-defined
@@ -323,7 +332,7 @@ OCTET             = %x00-FF                        ; any 8-bit byte
 2. Read **exactly** that many bytes for `optional-payload`.
 3. Stop consuming bytes for this optional-frame at that point; the next byte is either the start of another optional-frame's magic or end-of-block.
 
-A reader that consumes more or fewer bytes than the declared length MUST treat the file as malformed. The same applies to `metadata-payload` (length 49) and `encrypted-body` (length declared by `body-payload-len`): these are also `*OCTET` in the grammar but constrained by their preceding length fields in the same way.
+A reader that consumes more or fewer bytes than the declared length MUST treat the file as malformed. The same applies to `metadata-payload` (length 38 for v1 suites with 12-byte nonces; in general `22 + NONCE_LEN`) and `encrypted-body` (length declared by `body-payload-len`): these are also `*OCTET` in the grammar but constrained by their preceding length fields in the same way.
 
 ## 6. Magic allocation
 
@@ -400,7 +409,7 @@ All `key` / `value` / `nonce` byte sequences are shown hex, big-endian to small-
 | SuiteID | `02` (AES-256-GCM) |
 | CompressionType | `00` (None) |
 | DictID (BE) | `00000000` (= 0, no dict) |
-| WindowLog | `15` (= 21, 2 MiB window) |
+| WindowLog | `00` (CompressionType=None → no zstd, window enforcement disabled per §5.1) |
 | Nonce (12 B; v1 suite length) | `000102030405060708090a0b` |
 | AEADTag (16 B) | produced by the AEAD library at encrypt time; stored on disk |
 
@@ -424,7 +433,7 @@ All `key` / `value` / `nonce` byte sequences are shown hex, big-endian to small-
 | TableID (BE) | `00000000 00002a30` (= 10800) | The SST file's per-tree TableId |
 | BlockOffset (BE) | `00000000 00000000` (= 0) | The block's offset in the file (first block) |
 
-**AAD (38 B, NEVER on disk):** `502a4d18 10 01 00 02 00 0000000000000007 0000000000002a30 0000000000000000 00000000 15` (MagicMetadata | HeaderByte=0x10 [v1, low nibble reserved] | KeyEpoch=0x01 | BlockType=0x00 | SuiteID=0x02 | CompressionType=0x00 [None] | TreeID BE | TableID BE | BlockOffset BE | DictID BE | WindowLog=0x15)
+**AAD (38 B, NEVER on disk):** `502a4d18 10 01 00 02 0000000000000007 0000000000002a30 0000000000000000 00 00000000 00` (canonical order per §5.3: MagicMetadata | HeaderByte=0x10 [v1, low nibble reserved] | KeyEpoch=0x01 | BlockType=0x00 | SuiteID=0x02 | TreeID BE | TableID BE | BlockOffset BE | CompressionType=0x00 [None] | DictID BE | WindowLog=0x00 [no zstd])
 
 **Expected on-disk size:** 67 B total = 46 (MetadataFrame = 8 framing + 38 payload for v1 suite) + 8 (BodyFrame framing header) + 13 (EncryptedBody). For AES-256-GCM and ChaCha20-Poly1305, `ciphertext_len == plaintext_len` because the tag is stored in MetadataFrame, not appended to the ciphertext.
 
@@ -448,7 +457,7 @@ Encrypt a block under KeyEpoch=`01`. Tamper the on-disk `KeyEpoch` byte to `02`.
 
 ## 10. Worked hex-dump example
 
-A minimum-size Data block (single-byte plaintext = `41`, "A") encrypted under AES-256-GCM with all-zero key, KeyEpoch=`01`, CompressionType=0 (None), DictID=0, WindowLog=`15`, Nonce = first 12 bytes `00..0b`. Caller context (NOT on disk): TreeID=0, TableID=0, BlockOffset=0.
+A minimum-size Data block (single-byte plaintext = `41`, "A") encrypted under AES-256-GCM with all-zero key, KeyEpoch=`01`, CompressionType=0 (None), DictID=0, WindowLog=`0` (no zstd, no window enforcement), Nonce = first 12 bytes `00..0b`. Caller context (NOT on disk): TreeID=0, TableID=0, BlockOffset=0.
 
 ```text
 ;; MetadataFrame (46 bytes = 8-byte framing + 38-byte payload)
@@ -458,9 +467,9 @@ A minimum-size Data block (single-byte plaintext = `41`, "A") encrypted under AE
 0009: 01                  ; KeyEpoch
 000a: 00                  ; BlockType = Data
 000b: 02                  ; SuiteID = AES-256-GCM (NONCE_LEN = 12 per §7)
-000c: 00                  ; CompressionType = None (tag 0 per src/compression/mod.rs:405)
+000c: 00                  ; CompressionType = None (tag 0 per `impl Encode for CompressionType` in src/compression/mod.rs)
 000d: 00 00 00 00         ; DictID = 0 (u32 BE)
-0011: 15                  ; WindowLog = 21
+0011: 00                  ; WindowLog = 0 (CompressionType=None → no zstd, no window enforcement)
 0012: 00 01 02 03 04 05 06 07   ; Nonce bytes 0..7
 001a: 08 09 0a 0b         ; Nonce bytes 8..11 (12-byte AES-GCM nonce, no padding)
 001e: <16 bytes AEADTag>  ; depends on the AEAD library output, not literal
@@ -471,17 +480,21 @@ A minimum-size Data block (single-byte plaintext = `41`, "A") encrypted under AE
 0036: <1 byte ciphertext> ; AES-GCM ciphertext of "A" under the AAD below
 
 ;; AAD (38 bytes; NEVER written to disk, input to AEAD only)
+;; Canonical byte sequence per §5.3:
+;;   MagicMetadata | HeaderByte | KeyEpoch | BlockType | SuiteID
+;;     | TreeID (caller) | TableID (caller) | BlockOffset (caller)
+;;     | CompressionType | DictID | WindowLog
      50 2a 4d 18          ; MagicMetadata
      10                   ; HeaderByte         (mirror of disk byte 0008)
      01                   ; KeyEpoch           (mirror of disk byte 0009)
      00                   ; BlockType          (mirror of disk byte 000a)
      02                   ; SuiteID            (mirror of disk byte 000b)
-     00                   ; CompressionType    (mirror of disk byte 000c)
      00 00 00 00 00 00 00 00   ; TreeID BE      (caller-supplied, not on disk)
      00 00 00 00 00 00 00 00   ; TableID BE     (caller-supplied, not on disk)
      00 00 00 00 00 00 00 00   ; BlockOffset BE (caller-supplied, not on disk)
+     00                   ; CompressionType    (mirror of disk byte 000c)
      00 00 00 00          ; DictID BE          (mirror of disk bytes 000d-0010)
-     15                   ; WindowLog          (mirror of disk byte 0011)
+     00                   ; WindowLog          (mirror of disk byte 0011)
 ```
 
 Total on-disk size: 55 bytes (46 metadata + 9 body). The AEADTag and ciphertext bytes are generated by the AEAD library and not literal in this example, the conformance harness in #253 computes them and asserts exact byte equality.
