@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779612406567,
+  "lastUpdate": 1779617783227,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -8970,6 +8970,84 @@ window.BENCHMARK_DATA = {
             "value": 492198.81853481557,
             "unit": "ops/sec",
             "extra": "P50: 1.9us | P99: 5.2us | P99.9: 7.9us\nthreads: 1 | elapsed: 0.41s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "1aabac01d1be78d7cd327a1212e0b0d954404b05",
+          "message": "test(table): pin global-seqno translation on Table::get return path (#321) (#322)\n\n## Summary\n\nIssue #321 reported an upstream-sync delta (18 new commits in\nfjall-rs/lsm-tree since the last sync). Audit of the two bug fixes among\nthem:\n\n- **`db394880` fix: `clear()` corrupting blob trees (upstream #286)** —\nalready fixed in our fork (commit `07b26588`, regression test in\n`tests/blob_tree_clear_reopen.rs` from `a485c3cf`). Our\n`BlobTree::clear` at `src/blob_tree/mod.rs:368-388` does the full\nversion-history upgrade with the correct `tree_type()` derived from\n`kv_separation_opts`. No action needed.\n- **`bad4fe0a` fix: seqno of ingested items on point-read** — fix is\n**already in our code** (commit `431e9759`), but our fix is structurally\ndifferent from upstream's, and we have no regression test pinning it.\nThis PR adds that test.\n\n## What this PR does\n\nAdds `table_return_global_seqno` to `src/table/tests.rs` (1561/1561\ntests pass). The test:\n\n1. Writes a single item with on-disk `seqno = 0`.\n2. Recovers the table with `global_seqno = SEQNO` (= 15).\n3. Calls `Table::get` with snapshot `2 * SEQNO`.\n4. Asserts the returned `InternalValue` has `seqno == SEQNO` (the\neffective global seqno), NOT `seqno == 0` (the on-disk table-local\nseqno).\n\nThis mirrors the upstream `table_return_global_seqno` test from\nfjall-rs/lsm-tree (the regression test attached to fix `bad4fe0a`),\nadapted to our `Table::recover` signature.\n\n## Why our fix is in a different place than upstream\n\nUpstream put the `seqno += self.global_seqno()` adjustment **inside\n`Table::point_read`**, after each `block.point_read()` hit. Our fork\nputs the same adjustment at the public-API boundary: `Table::get` /\n`get_with_block` / `batch_get` each apply it via `saturating_add` after\nthe table-local `point_read` returns. Both designs produce the same\ncaller-observable contract (returned items carry effective global\nseqno). Our placement covers more entry points (`get_with_block`,\n`batch_get`); upstream covers only what flows through their\n`point_read`.\n\nThe test is design-agnostic, asserting the public contract rather than\nthe implementation location, so it pins our fork's correctness\nregardless of where future refactors put the adjustment.\n\n## Test plan\n\n- All checks green locally: new test passes in 0.023 s; full suite\n1561/1561 pass; clippy with -D warnings clean across all targets and\nfeatures\n- Code audit confirms our existing fix at `src/table/mod.rs:362` (where\n`iv.key.seqno = iv.key.seqno.saturating_add(global_seqno)`) is exercised\nby this test path\n\nCloses #321",
+          "timestamp": "2026-05-24T13:15:31+03:00",
+          "tree_id": "b760662518387ce453b8820a09e1a986b998415d",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/1aabac01d1be78d7cd327a1212e0b0d954404b05"
+        },
+        "date": 1779617781763,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 1914429.0787686869,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.7us | P99.9: 3.9us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1109048.7487035496,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.3us | P99.9: 4.7us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 560928.2415550865,
+            "unit": "ops/sec",
+            "extra": "P50: 1.6us | P99: 4.8us | P99.9: 7.7us\nthreads: 1 | elapsed: 0.36s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3637822.270809785,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 3.1us | P99.9: 5.7us\nthreads: 1 | elapsed: 0.05s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 405963.8566927694,
+            "unit": "ops/sec",
+            "extra": "P50: 2.2us | P99: 5.4us | P99.9: 8.5us\nthreads: 1 | elapsed: 0.49s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 220288.36136412964,
+            "unit": "ops/sec",
+            "extra": "P50: 4.2us | P99: 5.3us | P99.9: 8.1us\nthreads: 1 | elapsed: 0.91s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1213323.895533856,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.2us | P99.9: 4.3us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1122200.5472927182,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.5us | P99.9: 2.0us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 497260.12901105743,
+            "unit": "ops/sec",
+            "extra": "P50: 1.8us | P99: 5.3us | P99.9: 8.0us\nthreads: 1 | elapsed: 0.40s | num: 200000 | iterations: 3"
           }
         ]
       }
