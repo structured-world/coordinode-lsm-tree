@@ -1074,4 +1074,141 @@ mod block_verify_tests {
             missing_path.display(),
         );
     }
+
+    /// Pins the routing of post-header short-read failures to
+    /// `BlockVerifyError::DataReadError`. Regression guard for #315:
+    /// a refactor that collapses the `read_exact` failure branch back
+    /// into `HeaderCorrupted` (which is what a naive "any read error
+    /// inside the walker is a header problem" cleanup would do) loses
+    /// the distinction between "the file's TOC lies about where the
+    /// section ends" and "the header itself fails its own XXH3", and
+    /// downstream tooling (`sst-dump`, `repair_db`, lazy block repair)
+    /// pattern-matches on the variant to decide whether the block is
+    /// recoverable. Demoting truncated-data to `HeaderCorrupted` would
+    /// make those tools fall back to whole-section discard instead of
+    /// per-block surgery.
+    ///
+    /// Setup forges an SFA archive whose `data` TOC entry claims a
+    /// section length large enough for one full block (header + N
+    /// bytes), but the underlying file contains only the header.
+    /// Result: `Header::decode_from` succeeds (the header's XXH3
+    /// matches its own bytes), the bounds check passes (`data_length`
+    /// fits within the lied section length), and the data-segment
+    /// `read_exact` hits EOF after consuming a handful of trailing
+    /// TOC + trailer bytes. The only valid landing variant is
+    /// `DataReadError`.
+    #[test]
+    #[expect(
+        clippy::indexing_slicing,
+        clippy::cast_possible_truncation,
+        reason = "synthetic SFA forgery — offsets are all in-bounds by \
+                  construction (we just wrote the bytes ourselves), and \
+                  the u64 -> usize cast cannot overflow on any target \
+                  the test runs on (the forged archive is < 1 KiB)"
+    )]
+    fn walk_block_region_reports_data_read_error_on_truncated_data_segment() {
+        use crate::coding::Encode;
+        use crate::fs::{Fs, FsOpenOptions, MemFs};
+        use crate::table::block::{BlockType, Header};
+
+        // Trailer layout (38 bytes at the tail of an SFA archive):
+        //   MAGIC(4) | version(1) | csum_type(1) | toc_checksum(16) | toc_pos(8) | toc_len(8)
+        const TRAILER_LEN: usize = 4 + 1 + 1 + 16 + 8 + 8;
+        const DATA_LENGTH: u32 = 4096;
+        const HEADER_LEN: u64 = Header::serialized_len() as u64;
+
+        let header = Header {
+            block_type: BlockType::Data,
+            // Arbitrary sentinel; the walker reaches `read_exact` and
+            // bails BEFORE any data-segment XXH3 comparison, so this
+            // value is never checked.
+            checksum: Checksum::from_raw(0xDEAD_BEEF_DEAD_BEEF),
+            data_length: DATA_LENGTH,
+            uncompressed_length: DATA_LENGTH,
+        };
+
+        // Build a minimal SFA archive: one section "data" containing
+        // exactly one Header (33 bytes) and zero following data bytes.
+        let mut archive_bytes: Vec<u8> = Vec::new();
+        {
+            let mut writer = sfa::Writer::from_writer(std::io::Cursor::new(&mut archive_bytes));
+            writer.start("data").unwrap();
+            writer.write_all(&header.encode_into_vec()).unwrap();
+            writer.finish().unwrap();
+        }
+
+        // Parse the trailer at the file tail.
+        let trailer_start = archive_bytes.len() - TRAILER_LEN;
+        let toc_pos_bytes: [u8; 8] = archive_bytes[trailer_start + 22..trailer_start + 30]
+            .try_into()
+            .unwrap();
+        let toc_len_bytes: [u8; 8] = archive_bytes[trailer_start + 30..trailer_start + 38]
+            .try_into()
+            .unwrap();
+        let toc_pos = u64::from_le_bytes(toc_pos_bytes) as usize;
+        let toc_len = u64::from_le_bytes(toc_len_bytes) as usize;
+
+        // TOC payload layout: `TOC!`(4) | entry_count(4 LE) | entries.
+        // Each entry: pos(8 LE) | len(8 LE) | name_len(2 LE) | name.
+        // The first (only) entry begins at toc_pos + 8.
+        let first_entry_offset = toc_pos + 4 + 4;
+        let len_field_offset = first_entry_offset + 8;
+
+        // Inflate the section length so end_offset = HEADER_LEN +
+        // DATA_LENGTH. The walker then computes remaining = DATA_LENGTH
+        // (passes the bounds check), tries to `read_exact(DATA_LENGTH)`,
+        // and hits EOF after the few trailing TOC + trailer bytes.
+        let lied_len: u64 = HEADER_LEN + u64::from(DATA_LENGTH);
+        archive_bytes[len_field_offset..len_field_offset + 8]
+            .copy_from_slice(&lied_len.to_le_bytes());
+
+        // Recompute the TOC checksum (xxh3_128 over the TOC payload)
+        // and patch the trailer's stored checksum so sfa::Reader still
+        // accepts the file.
+        let new_toc_checksum = crate::hash::hash128(&archive_bytes[toc_pos..toc_pos + toc_len]);
+        let csum_field_offset = trailer_start + 4 + 1 + 1;
+        archive_bytes[csum_field_offset..csum_field_offset + 16]
+            .copy_from_slice(&new_toc_checksum.to_le_bytes());
+
+        // Materialize the forged archive in MemFs and run the scanner.
+        let fs = MemFs::new();
+        let path = std::path::Path::new("/forged.sst");
+        {
+            let mut f = fs
+                .open(
+                    path,
+                    &FsOpenOptions::new().write(true).create(true).truncate(true),
+                )
+                .unwrap();
+            f.write_all(&archive_bytes).unwrap();
+        }
+
+        let table_id: TableId = 42;
+        let scan = scan_sst_blocks(&fs, path, table_id, 0).expect("forged SFA must parse cleanly");
+        assert_eq!(
+            scan.errors.len(),
+            1,
+            "expected exactly one error, got {:?}",
+            scan.errors,
+        );
+        let err = scan.errors.first().unwrap();
+        assert!(
+            matches!(
+                err,
+                BlockVerifyError::DataReadError {
+                    table_id: t,
+                    offset: 0,
+                    data_length: d,
+                    ..
+                } if *t == table_id && *d == DATA_LENGTH,
+            ),
+            "expected DataReadError {{ table_id: {table_id}, offset: 0, \
+             data_length: {DATA_LENGTH}, .. }}; got {err:?}",
+        );
+        assert_eq!(
+            scan.blocks_scanned, 1,
+            "header decoded successfully, so blocks_scanned must count this block \
+             even though the data segment read failed",
+        );
+    }
 }
