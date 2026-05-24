@@ -693,6 +693,16 @@ impl Writer {
             index_block_restart_interval: self.index_block_restart_interval,
             initial_level: self.initial_level,
             range_tombstone_count,
+            // `block_offset` here feeds `BlockIdentity` which today is
+            // unused (`let _ = identity;` in `Block::write_into` /
+            // `Block::from_file`). Once AAD is wired in #251 the read
+            // side will derive this from `*handle.offset()` (the SFA
+            // TOC section offset, distinct for MID vs TAIL), so this
+            // shared `*self.meta.file_pos` value will need to be
+            // replaced with each section's actual file position at
+            // write time. Tracked as part of the #251 AAD-wiring
+            // surface — the writer here will need to query the SFA
+            // writer's current file position per section.
             block_offset: *self.meta.file_pos,
             created_at_nanos,
         };
@@ -700,8 +710,9 @@ impl Writer {
         // MID meta copy — defends against torn-write at the file tail
         // (incomplete fsync). MID sits at ~95% of the eventual file
         // position, far from the tail's last-write region. `file_size`
-        // is 0 because the file isn't done growing yet; reader treats
-        // 0 as "use std::fs::metadata().len() instead".
+        // is `*self.meta.file_pos` so MID and TAIL encode identical
+        // values: `file_pos` is only ever bumped inside `spill_block`,
+        // so it doesn't change between the two writes.
         write_meta_section(
             &mut self.file_writer,
             &mut self.block_buffer,
@@ -740,11 +751,22 @@ impl Writer {
         self.file_writer.start("meta_separator")?;
         self.file_writer.write_all(&[0u8; 4096])?;
 
-        // TAIL meta — the canonical, authoritative copy. Contains the
-        // real `file_size` (= `self.meta.file_pos` snapshot taken just
-        // before this block is written, i.e. the offset where this
-        // block itself starts).
+        // TAIL meta — the canonical, authoritative copy. `file_size`
+        // is the LOGICAL size up to the end of the data blocks
+        // (`self.meta.file_pos`), NOT the on-disk offset of this
+        // block. `file_pos` is bumped only inside `spill_block`, so
+        // it does not track the absolute file cursor here; the value
+        // is the same one MID encoded above, which is the contract
+        // downstream consumers (`Table::file_size`, compaction window
+        // picking, checkpoint sizing — see the comment in
+        // `checkpoint.rs:170-185`) read.
         meta_params.section_name = "meta";
+        // file_size and block_offset already carry `*self.meta.file_pos`
+        // from the MID write; `file_pos` hasn't moved since (no
+        // intermediate write touches it), so re-assigning is a
+        // no-op. Kept explicit for readability — if someone later
+        // adds a Block::write_into call before TAIL that DOES bump
+        // file_pos, this line will need to re-snapshot.
         meta_params.file_size = *self.meta.file_pos;
         meta_params.block_offset = *self.meta.file_pos;
         write_meta_section(

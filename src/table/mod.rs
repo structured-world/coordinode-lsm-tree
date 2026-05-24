@@ -934,11 +934,11 @@ impl Table {
         let regions = ParsedRegions::parse_from_toc(trailer.toc())?;
 
         log::trace!("Reading meta block, with meta_ptr={:?}", regions.metadata);
-        // TAIL first (authoritative copy with the real file_size).
-        // On any decode/decrypt/checksum failure fall back to the MID
-        // copy if present — it contains the same fields except a
-        // sentinel file_size==0, which the load path patches up from
-        // the on-disk file length.
+        // TAIL first (authoritative copy by convention; physically
+        // identical content to MID — same `file_size`, same
+        // `created_at`, same KV map — the only difference is which
+        // SFA section is loaded). On any decode/decrypt/checksum
+        // failure fall back to the MID copy if present.
         let metadata = match ParsedMeta::load_with_handle(
             &*file,
             &regions.metadata,
