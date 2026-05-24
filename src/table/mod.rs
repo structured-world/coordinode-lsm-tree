@@ -867,16 +867,20 @@ impl Table {
         compression: CompressionType,
         encryption: Option<&dyn crate::encryption::EncryptionProvider>,
     ) -> crate::Result<IndexBlock> {
-        // Tail copy first (preferred — if a fresh `tli_tail` exists it
+        // Tail copy first (preferred): if a fresh `tli_tail` exists it
         // landed after the head `tli`, so it's the most-recently
-        // fsynced copy). On any decode / decrypt / checksum failure
+        // fsynced copy. On any decode / decrypt / checksum failure
         // fall back to the head `tli` if present.
         //
         // Both copies encode the same handles list (the writer hands
-        // a single `tli_bytes` buffer to both sites), so the resulting
-        // IndexBlock content is identical regardless of which side
-        // wins. Compression / encryption nonce differ per-section,
-        // but the decoded handles match.
+        // a single `tli_bytes` buffer to both sites) and both are
+        // written under the same `CompressionType`
+        // (`metadata.index_block_compression`); the block header does
+        // not record a compression tag, so this single value decodes
+        // either copy. Encryption nonce differs per copy (fresh per
+        // `Block::write_into`) and the ciphertext therefore differs
+        // byte-for-byte, but both decrypt to the same plaintext
+        // IndexBlock.
         //
         // Tables written before the TLI-mirror change have no
         // `tli_tail`; reader falls straight through to the head copy.

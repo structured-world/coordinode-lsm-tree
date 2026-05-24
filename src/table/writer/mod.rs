@@ -768,8 +768,18 @@ impl Writer {
         // copy on open and transparently falls back to the head copy
         // on decode/checksum/decrypt failure. Re-encodes the same
         // `tli_bytes` returned by `index_writer.finish()` so the two
-        // sections decode to the same logical TLI; compression /
-        // encryption nonce can differ per-section, but content matches.
+        // sections decode to the same logical TLI. Both copies MUST
+        // be written with the same `CompressionType` (this call uses
+        // `self.index_block_compression`, identical to what the
+        // partitioned/full index writer used for the head): the block
+        // header does not record the compression tag, so the reader
+        // supplies a single `CompressionType` from table metadata
+        // when decoding either copy. If the two were written under
+        // different codecs, at least one copy would be undecodable.
+        // The encryption nonce differs per `Block::write_into` call,
+        // so the resulting ciphertext differs byte-for-byte across
+        // the two copies, but both decrypt to the same plaintext
+        // IndexBlock.
         // `block_offset` is held at 0 to match the head copy's
         // BlockIdentity (`partitioned::write_top_level_index` /
         // `full::finish` both encode with offset=0); once #251 wires
