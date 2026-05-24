@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779581971324,
+  "lastUpdate": 1779585992186,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -8658,6 +8658,84 @@ window.BENCHMARK_DATA = {
             "value": 493757.7332799084,
             "unit": "ops/sec",
             "extra": "P50: 1.9us | P99: 5.2us | P99.9: 7.9us\nthreads: 1 | elapsed: 0.41s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "5da47f5e57b4afbb5dc36042a5bcb321c183a0e3",
+          "message": "fix(table): mirror meta block at mid-file for tail-corruption resilience (#295) (#314)\n\n## Summary\n\nImplements the mid-file half of #295: a second copy of the meta block\nlives several KiB before the file tail so that **a torn-write at the\nfile tail (incomplete fsync) or a bit-flip / bad sector that takes out\nthe TAIL meta** does not make the SST unopenable.\n\nThe HEAD-prefix half of the originally-proposed design (option D) was\ndescoped after a deeper trade-off analysis: `table_id` is already\nencoded in the SST filename (`tables/<id>`), `table_version` is\ncurrently a constant, and `created_at` was the only marginal field a\nHEAD section would surface. The protections HEAD would add (table-id\ndiagnostics when both body copies are dead) are already available via\nfilename inspection. The Writer-side restructure required to write the\nHEAD section after `use_encryption(...)` plumbing was not justified by\nthat marginal value. May be revisited as a follow-up if real-world\nincident analysis surfaces a torn-write-plus-MID-loss scenario.\n\n## What lands\n\n- New SFA section `meta_mid` written after `range_tombstones` and before\n`linked_blob_files` / `table_version` / `meta_separator` / `meta`.\n**Same byte-identical content as TAIL**: same `file_size` (=\n`*self.meta.file_pos`, which is only bumped inside `spill_block`, so it\ndoesn't change between the two writes), same `created_at` (snapshotted\nonce in `finish()`), same KV map.\n- New SFA section `meta_separator` (4 KiB of zeros) between\n`table_version` and TAIL meta, so a single bad filesystem sector cannot\ncover both MID and TAIL. The block-level scrub\n(`verify::verify_block_checksums`) skips `meta_separator` the same way\nit skips `linked_blob_files` / `table_version`.\n- `ParsedRegions::parse_from_toc` reads the optional `meta_mid` entry.\nOld tables without the mirror leave the field `None` and behave exactly\nas before.\n- `Table::recover` tries TAIL first (authoritative by convention;\nphysically identical to MID), falls back to MID on any decode / decrypt\n/ checksum failure. No `std::fs::metadata` call, no on-disk size\npatching — MID is loaded as-is. If MID is also unreadable, the original\nTAIL error is surfaced so callers see the actual failure mode.\n- Encoding refactor: meta-KV encoding moved out of `finish()` into a\nfree `write_meta_section` function (free function rather than method\nbecause `finish()` runs after `index_writer`/`filter_writer.finish()`\nconsume those fields by-value, leaving `self` partially-moved and unable\nto dispatch through `&mut self` methods).\n\n## Compatibility\n\n- Format-compatible: old SSTs lack `meta_mid` / `meta_separator` — read\npath treats both as optional and runs through the existing TAIL path\nunchanged.\n- No disk format version bump. Wire-format only adds new optional named\nTOC sections.\n\n## Test plan\n\n- [x] Writer emits both `meta` and `meta_mid`, with end-to-start gap ≥ 4\nKiB (enforced by `meta_separator`, asserted by inspecting the TOC).\n- [x] Internal regression test\n(`meta_mid_and_tail_have_identical_file_size`) loads both copies via\n`ParsedMeta::load_with_handle` and asserts byte-for-byte equality of\n`file_size`.\n- [x] Internal regression test\n(`meta_mid_and_tail_have_identical_created_at`) does the same for the\ntimestamp.\n- [x] Zero TAIL meta region: table reopens via MID, `get()` returns\ncorrect value.\n- [x] Zero MID region: no observable change (TAIL still authoritative).\n- [x] Zero both copies: open fails as expected.\n- [x] Existing `encrypted_data_tamper_fails` updated to tamper at a\nlayout-independent offset inside the first data block; previous\n`file.len() / 2` heuristic now lands inside the zero-filled separator\nand would no-op silently — a fragility surfaced by this change rather\nthan caused by it.\n- [x] `verify::verify_block_checksums` updated to skip `meta_separator`\n(it isn't a `Header`-prefixed block run).\n- [x] Full test suite: 1551/1551 pass (6 skipped, 1 slow).\n- [x] Lint clean on all-targets all-features with deny-warnings.\n\nCloses #295.\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n\n## Summary by CodeRabbit\n\n* **Bug Fixes**\n* Enhanced table recovery with redundant metadata storage, enabling\nautomatic fallback when primary metadata is corrupted.\n* Improved table opening and reopen resilience through dual metadata\ncopies with protective sector isolation.\n\n<!-- review_stack_entry_start -->\n\n[![Review Change\nStack](https://storage.googleapis.com/coderabbit_public_assets/review-stack-in-coderabbit-ui.svg)](https://app.coderabbit.ai/change-stack/structured-world/coordinode-lsm-tree/pull/314?utm_source=github_walkthrough&utm_medium=github&utm_campaign=change_stack)\n\n<!-- review_stack_entry_end -->\n\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-05-24T04:25:39+03:00",
+          "tree_id": "41964d64d957af820d7e95d33c36d6f3e367feac",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/5da47f5e57b4afbb5dc36042a5bcb321c183a0e3"
+        },
+        "date": 1779585990765,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 2100067.0834928816,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.6us | P99.9: 3.7us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1190734.5515230484,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.2us | P99.9: 4.3us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 593004.8038488954,
+            "unit": "ops/sec",
+            "extra": "P50: 1.5us | P99: 4.6us | P99.9: 7.2us\nthreads: 1 | elapsed: 0.34s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3629034.109164576,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 3.0us | P99.9: 5.5us\nthreads: 1 | elapsed: 0.06s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 407419.1466619825,
+            "unit": "ops/sec",
+            "extra": "P50: 2.1us | P99: 5.8us | P99.9: 9.5us\nthreads: 1 | elapsed: 0.49s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 223694.48312150018,
+            "unit": "ops/sec",
+            "extra": "P50: 4.2us | P99: 5.3us | P99.9: 7.6us\nthreads: 1 | elapsed: 0.89s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1238348.8248088227,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.2us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1130563.7032455239,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 1.5us | P99.9: 1.9us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 506613.74106687994,
+            "unit": "ops/sec",
+            "extra": "P50: 1.8us | P99: 5.0us | P99.9: 7.4us\nthreads: 1 | elapsed: 0.39s | num: 200000 | iterations: 3"
           }
         ]
       }
