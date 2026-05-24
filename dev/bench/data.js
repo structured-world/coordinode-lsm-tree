@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779646754951,
+  "lastUpdate": 1779659515208,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -9360,6 +9360,84 @@ window.BENCHMARK_DATA = {
             "value": 535905.9677952668,
             "unit": "ops/sec",
             "extra": "P50: 1.7us | P99: 5.1us | P99.9: 7.4us\nthreads: 1 | elapsed: 0.37s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "ca2f9130077021ff8d01ada96e920fefb8dda144",
+          "message": "build(deps): bump structured-zstd 0.0.23 → 0.0.25, spin 0.9 → 0.12 (#331)\n\n## Summary\n\nTwo dependency bumps:\n\n- **structured-zstd 0.0.23 → 0.0.25** — lands the two API surfaces #251\n(AAD-bound block encoder/decoder, CP1 in roadmap #215) was blocked on:\n- typed `SkippableFrame` API behind the `lsm` feature (tracked as\n`structured-zstd#171`)\n- `expect_dict_id` + `expect_window_descriptor` setters on\n`FrameDecoder` (tracked as `structured-zstd#177`)\n\nv0.0.24 (also in this bump) shipped decode-path performance work (HUF\ntable layout as u16, 4-stream burst-gate collapse, lazy-band\n`target_len` alignment with donor `clevels.h` table[0]). Picked up for\nfree.\n\n- **spin 0.9 → 0.12** — major bump. The only surface we use (`Mutex` /\n`spin_mutex` in `src/deletion_pause.rs`) is mechanically identical\nbetween the two versions: full test suite and clippy pass without any\nsource changes.\n\n## Roadmap impact\n\n#251 (CP1 — AAD wire-format encoder/decoder) moves from \"blocked by\nstructured-zstd#171, #177\" to \"unblocked\". After this PR merges the\nroadmap #215 should be updated to reflect that.\n\n## Test plan\n\n- [x] `cargo build` clean on the lsm-tree crate\n- [x] `cargo build` clean on `tools/sst-dump/`\n- [x] `cargo nextest run` — 1410 main tests + 6 sst-dump tests green\n- [x] `cargo clippy --all-features -- -D warnings` clean on both crates\n- [x] `Cargo.toml` updated; comment that hardcoded `\"0.9\"` literal\ncleaned up so it doesn't bitrot\n\nCloses #330",
+          "timestamp": "2026-05-25T00:15:12+03:00",
+          "tree_id": "580df9c54365a91e3ae7bd85ca3825ec635c17b7",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/ca2f9130077021ff8d01ada96e920fefb8dda144"
+        },
+        "date": 1779659513728,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 2100675.7905528345,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.7us | P99.9: 3.8us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1082821.30954655,
+            "unit": "ops/sec",
+            "extra": "P50: 0.8us | P99: 2.4us | P99.9: 4.6us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 546045.7203644825,
+            "unit": "ops/sec",
+            "extra": "P50: 1.7us | P99: 4.9us | P99.9: 7.7us\nthreads: 1 | elapsed: 0.37s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3564132.410512922,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 3.2us | P99.9: 5.9us\nthreads: 1 | elapsed: 0.06s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 394965.5487251728,
+            "unit": "ops/sec",
+            "extra": "P50: 2.2us | P99: 5.5us | P99.9: 8.5us\nthreads: 1 | elapsed: 0.51s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 215561.30206299483,
+            "unit": "ops/sec",
+            "extra": "P50: 4.3us | P99: 5.7us | P99.9: 7.8us\nthreads: 1 | elapsed: 0.93s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1132274.0939378522,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.3us | P99.9: 4.6us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1132956.3859035708,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 1.5us | P99.9: 2.0us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 478019.88560812053,
+            "unit": "ops/sec",
+            "extra": "P50: 1.9us | P99: 6.5us | P99.9: 9.6us\nthreads: 1 | elapsed: 0.42s | num: 200000 | iterations: 3"
           }
         ]
       }
