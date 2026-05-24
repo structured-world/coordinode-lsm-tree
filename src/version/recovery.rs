@@ -161,7 +161,14 @@ pub fn recover(folder: &Path, fs: &dyn Fs, mode: ManifestRecoveryMode) -> crate:
             let run_count = match reader.read_u8() {
                 Ok(n) => n,
                 Err(e) if tolerate_tail && e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                    // No runs in this level had a chance to start;
+                    // pushing the empty `level` would be a "zero
+                    // runs at level N" marker which downstream code
+                    // tolerates. Stay consistent with the cut-mid-run
+                    // path below (which DOES push) instead of silently
+                    // dropping the level slot.
                     tables_dropped_to_tail += 1;
+                    levels.push(level);
                     break 'levels;
                 }
                 Err(e) => return Err(e.into()),
@@ -172,7 +179,16 @@ pub fn recover(folder: &Path, fs: &dyn Fs, mode: ManifestRecoveryMode) -> crate:
                 let table_count = match reader.read_u32::<LittleEndian>() {
                     Ok(n) => n,
                     Err(e) if tolerate_tail && e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                        // Push the partial `level` so any runs that
+                        // were fully decoded earlier in this level
+                        // survive — breaking out of `'levels` without
+                        // this push silently drops the consistent
+                        // prefix, contradicting the tail-tolerant
+                        // contract. The current `run` is empty (we
+                        // failed at the very first byte of its
+                        // record header), so nothing to push for it.
                         tables_dropped_to_tail += 1;
+                        levels.push(level);
                         break 'levels;
                     }
                     Err(e) => return Err(e.into()),
@@ -265,13 +281,34 @@ pub fn recover(folder: &Path, fs: &dyn Fs, mode: ManifestRecoveryMode) -> crate:
             Err(e) => return Err(e.into()),
         };
 
-        // Same as the `table_count` check: count > section payload means
-        // the count header itself is forged; aborts regardless of mode.
+        // Same as the `table_count` check: count > section payload
+        // is a hard fail under strict mode (the count header is
+        // forged), but a power-loss-during-write that committed the
+        // count then truncated the entries produces exactly this
+        // shape, so tolerant mode must warn and let the per-entry
+        // loop walk bytes-actually-present until the first EOF.
         if u64::from(blob_file_count) > section.len().saturating_sub(4) / 25 {
-            return Err(crate::Error::Unrecoverable);
+            if tolerate_tail {
+                log::warn!(
+                    "blob_files: declared count={blob_file_count} exceeds section \
+                     capacity (~{} entries) in version #{curr_version_id}; \
+                     tail-tolerant mode walks bytes-actually-present and stops at \
+                     the first EOF",
+                    section.len().saturating_sub(4) / 25,
+                );
+            } else {
+                return Err(crate::Error::Unrecoverable);
+            }
         }
 
-        let mut blob_file_ids = Vec::with_capacity(blob_file_count as usize);
+        // Don't allocate full `blob_file_count` capacity when the
+        // count overflows the section — that's a several-GB
+        // Vec::with_capacity allocation on the forged-count branch.
+        // Cap at the section-derived upper bound.
+        let cap_hint =
+            usize::try_from(u64::from(blob_file_count).min(section.len().saturating_sub(4) / 25))
+                .unwrap_or(0);
+        let mut blob_file_ids = Vec::with_capacity(cap_hint);
 
         for _ in 0..blob_file_count {
             match read_one_blob_entry(&mut reader) {
@@ -334,7 +371,7 @@ pub fn recover(folder: &Path, fs: &dyn Fs, mode: ManifestRecoveryMode) -> crate:
 }
 
 #[cfg(test)]
-#[allow(
+#[expect(
     clippy::expect_used,
     clippy::indexing_slicing,
     reason = "test assertions"

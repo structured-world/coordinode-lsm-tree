@@ -98,8 +98,14 @@ impl std::fmt::Debug for LevelRoute {
 /// any corrupt record fails the open. Switching to a more permissive
 /// mode is an explicit, informed operator decision: you are trading
 /// "the tree might silently come up with missing tables / blob files"
-/// for "the tree comes up at all". Logged warnings on every dropped
-/// record document exactly what was lost.
+/// for "the tree comes up at all". When a non-default mode drops
+/// records, the recovery path emits a `warn!` summary with the
+/// AGGREGATE dropped count per section (`tables` / `blob_files`) —
+/// individual table IDs / blob-file IDs are NOT enumerated, because
+/// they were never decoded in the first place. Operators wanting a
+/// per-record audit trail should pair tail-tolerant recovery with an
+/// out-of-band integrity scan ([`verify_integrity`](crate::verify::verify_integrity))
+/// of the recovered tree.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
 pub enum ManifestRecoveryMode {
     /// Production-safe default. Any per-record decode mismatch (bad
@@ -113,11 +119,20 @@ pub enum ManifestRecoveryMode {
     /// over the `tables` / `blob_files` records runs out of bytes
     /// before the declared count is reached (truncated tail), keep
     /// everything that decoded cleanly before the cut and emit a
-    /// `warn!` listing the dropped record counts. Any decode error
-    /// that is NOT a clean tail truncation (bad checksum-type tag,
-    /// declared-count overflow vs section length, etc.) still aborts
-    /// the open — this mode is specifically for "the writer never
-    /// finished" scenarios, not for arbitrary bit-rot.
+    /// `warn!` listing the dropped record counts.
+    ///
+    /// A declared count that exceeds the section's payload capacity
+    /// (e.g. `table_count` claims more entries than the section has
+    /// bytes for) is treated as the same "writer committed a count
+    /// header then truncated the entries" shape — the recovery
+    /// downgrades the original hard fail to a `warn!` and lets the
+    /// per-entry decode loop walk bytes-actually-present until the
+    /// first `UnexpectedEof`.
+    ///
+    /// Any decode error that is NOT a clean tail truncation (bad
+    /// `checksum_type` tag, etc.) still aborts the open — this mode
+    /// is specifically for "the writer never finished" scenarios,
+    /// not for arbitrary bit-rot in already-committed bytes.
     TolerateCorruptedTailRecords,
 
     /// Recover up to the last fully-consistent record group, discard
