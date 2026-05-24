@@ -956,12 +956,14 @@ impl Table {
                     // about the authoritative copy's failure mode).
                     // The MID failure goes to the log so it's not
                     // silently dropped from diagnostics.
-                    // MID encodes the same `file_size` value as TAIL
-                    // (the writer takes one snapshot of
-                    // `self.meta.file_pos` and stamps both copies with
-                    // it), so the MID payload is usable directly — no
-                    // patching, no `std::fs::metadata` (which would
-                    // also bypass the pluggable `Fs` backend).
+                    // MID and TAIL are byte-identical: same `file_size`
+                    // (= `*self.meta.file_pos`, only bumped inside
+                    // `spill_block`, unchanged between the two writes),
+                    // same `created_at` (snapshotted once in
+                    // `finish()`), same KV map. MID payload is usable
+                    // directly — no sentinel patching, no
+                    // `std::fs::metadata` (which would also bypass the
+                    // pluggable `Fs` backend).
                     match ParsedMeta::load_with_handle(&*file, &mid_handle, encryption.as_deref()) {
                         Ok(mid) => mid,
                         Err(mid_err) => {
