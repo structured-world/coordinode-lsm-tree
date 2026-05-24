@@ -22,7 +22,7 @@
 - **Confidentiality of the file's existence or size.** A passive observer of the SST file on disk still learns: the file's existence, total size, byte distribution (high entropy), and the count + sizes of blocks. AEAD protects per-block content, not file-level metadata.
 - **Key-disclosure recovery.** If an attacker obtains the AEAD key for an epoch, every block written under that epoch is decipherable. Key management (rotation cadence, HSM integration, KMS plumbing) is the caller's responsibility; this spec defines only how block-level encryption uses the supplied key.
 - **Side-channel resistance** in the AEAD primitives beyond what the chosen suite already provides. Constant-time AES-GCM requires AES-NI / NEON hardware acceleration on the deployment platform; ChaCha20-Poly1305 is constant-time on all platforms.
-- **Authentication of the surrounding file structure.** The SFA TOC and the per-file XXH3 in the manifest cover that surface; this spec only addresses per-block integrity for encrypted blocks. Plaintext / unencrypted blocks continue to use the existing `Header` envelope (`src/table/block/header.rs`) with `Header.checksum` = XXH3-128 over the on-disk data-segment bytes (post-compression for compressed blocks; raw payload for uncompressed). Encrypted blocks under this v1 format **replace** the `Header` envelope entirely with MetadataFrame + BodyFrame; an encrypted block is NOT wrapped in `Header`. The integrity that `Header.checksum` provided for the unencrypted path is provided for encrypted blocks by (a) AEAD-tag in MetadataFrame for transport-layer integrity (catches at-rest corruption and tampering of the ciphertext) and (b) the codec's built-in content checksum inside the encrypted body for plaintext-layer integrity for compressed blocks (catches codec-internal bugs and library drift, see §4.11).
+- **Authentication of the surrounding file structure.** The SFA TOC and the per-file XXH3 in the manifest cover that surface; this spec only addresses per-block integrity for encrypted blocks. Plaintext / unencrypted blocks continue to use the existing `Header` envelope (`src/table/block/header.rs`) with `Header.checksum` = XXH3-128 over the on-disk data-segment bytes (post-compression for compressed blocks; raw payload for uncompressed). Encrypted blocks under this v1 format **replace** the `Header` envelope entirely with MetadataFrame + BodyFrame; an encrypted block is NOT wrapped in `Header`. **Migration note:** today's codebase still writes encrypted blocks via the legacy `Header`-wrapped path (`Block::write_into` / `Block::from_reader` in `src/table/block/mod.rs`) with the encryption provider operating over the payload bytes. That is a transitional layout, not the format described here. #251 cuts over to the skippable-frame v1 layout defined in this spec; until then the on-disk reality lags the spec, and readers MUST NOT assume an arbitrary `coordinode-lsm-tree` SST on disk is already in the v1 format. The integrity that `Header.checksum` provided for the unencrypted path is provided for encrypted blocks by (a) AEAD-tag in MetadataFrame for transport-layer integrity (catches at-rest corruption and tampering of the ciphertext) and (b) the codec's built-in content checksum inside the encrypted body for plaintext-layer integrity for compressed blocks (catches codec-internal bugs and library drift, see §4.11).
 - **Block-level forward secrecy.** Compromise of the current epoch's key reveals all blocks under that epoch. Rotation gives forward secrecy for *future* writes, not past ones.
 
 ## 3. Threat model
@@ -106,10 +106,13 @@ Offset  Size  Field             Description
                                   4 = ZstdDict
                                   others = reserved
                                 Level / dict-fingerprint do NOT live here:
-                                level is encoded inside the codec's own
-                                frame header (zstd / lz4 frames are
-                                self-describing for level), and the dict
-                                fingerprint is `DictID` at offset 13.
+                                compression level is an encoder-side
+                                parameter only and is not persisted
+                                anywhere on disk (the decoder does not
+                                need it — zstd / lz4 frames decode
+                                without knowing the level the encoder
+                                used), and the dict fingerprint is
+                                `DictID` at offset 13.
                                 On disk so the decoder picks the right
                                 decompressor per block (enables per-block
                                 codec rotation: old blocks under old
