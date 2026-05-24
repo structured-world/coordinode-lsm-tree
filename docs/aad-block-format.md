@@ -109,7 +109,7 @@ Offset  Size  Field             Description
                                 compression level is an encoder-side
                                 parameter only and is not persisted
                                 anywhere on disk (the decoder does not
-                                need it — zstd / lz4 frames decode
+                                need it: zstd / lz4 frames decode
                                 without knowing the level the encoder
                                 used), and the dict fingerprint is
                                 `DictID` at offset 13.
