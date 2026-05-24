@@ -910,7 +910,17 @@ impl Table {
             crate::table::block::BlockIdentity {
                 tree_id: 0,
                 table_id,
-                block_offset: *handle.offset(),
+                // Match the writer: both `tli` and `tli_tail` are
+                // emitted with `block_offset: 0` (the partitioned /
+                // full index writers do not currently thread their
+                // SFA section offset through `BlockIndexWriter`).
+                // BlockIdentity is ignored by `Block::from_file`
+                // today, but once #251 wires it into AEAD AAD,
+                // reader and writer MUST encode the same value or
+                // encrypted tables fail to reopen. Threading real
+                // section offsets through is tracked alongside the
+                // BlockIndexWriter::finish surface in #251.
+                block_offset: 0,
                 block_type: BlockType::Index,
                 dict_id: 0,
                 window_log: 0,
