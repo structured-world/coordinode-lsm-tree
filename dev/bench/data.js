@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779617783227,
+  "lastUpdate": 1779640287129,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -9048,6 +9048,84 @@ window.BENCHMARK_DATA = {
             "value": 497260.12901105743,
             "unit": "ops/sec",
             "extra": "P50: 1.8us | P99: 5.3us | P99.9: 8.0us\nthreads: 1 | elapsed: 0.40s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "64ec6668ed79e56b38807fc1e0d9d4237a413702",
+          "message": "test: triage all #[ignore] annotations across the crate (#326)\n\n## Summary\n\nAudit pass per #320: every remaining `#[ignore]` now names a concrete\nblocker or operational rationale. No bare `#[ignore]` remains.\n\n| File | Test | Action |\n|------|------|--------|\n| `tests/snapshot_point_read.rs` | `snapshot_404` | **Wired up** —\npasses against current code; bare `#[ignore]` was leftover from an\nunrelated upstream commit. |\n| `tests/tree_recovery_versions.rs` | `tree_recovery_version_free_list`\n| **Wired up** — Version history maintenance restored, test passes. |\n| `tests/multi_trees.rs` | `tree_multi_table_ids` | **Wired up** —\nassertions fixed to current id-allocation behaviour (table ids start at\n0 and bump by 1; absolute tree-id values dropped from assertions since\n`TREE_ID_COUNTER` is process-global). |\n| `src/merge.rs` | `merge_dup` | **Deleted** — author's \"maybe not\nneeded\" was correct: no invariant requires Merger to dedup adjacent\nidentical `(key, seqno, value_type)` entries, and partitioned-seqno\nsources mean the case cannot occur in practice. |\n| `src/compaction/state/mod.rs` | `level_manifest_atomicity` | **Kept\nignored, reason now precise** — was `#[ignore = \"wip\"]`. Original\nfault-injection mechanism (mutating a `folder` field on\n`CompactionState`) doesn't compile against the current shape; needs an\n`Fs`-trait fault-injection helper. Reason now names the blocker, tied to\n#300 / #303 infrastructure. |\n| `tests/range_tombstone.rs` | `..._keeps_newer_values_reachable` |\n**Kept ignored, reason now precise** — heavy-memory test gated to\n`--ignored`; reason rewritten to spell out the invocation and the\noperational rationale (allocates ~68 MiB to force MultiWriter rotation).\n|\n\n## Verification\n\n- `grep -rn '#\\[ignore\\]'` (bare, no `=` reason) returns zero matches.\n- `cargo nextest run` — 1405 passed, 2 skipped (the two\nintentionally-ignored heavy / blocked tests above).\n- `cargo clippy --all-targets -- -D warnings` clean.\n\n## Test plan\n\n- [x] All `#[ignore]` annotations carry a reason explaining either the\nblocker or the operational rationale.\n- [x] Tests wired up run green in the default suite.\n- [x] Deleted test removed (`merge_dup`).\n- [x] Full suite green.\n\nCloses #320",
+          "timestamp": "2026-05-24T19:30:27+03:00",
+          "tree_id": "82f814ce8a4f857207539b0029d496e6466863c3",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/64ec6668ed79e56b38807fc1e0d9d4237a413702"
+        },
+        "date": 1779640285643,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 2093857.5411776453,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.6us | P99.9: 3.7us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1164241.7354699576,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.2us | P99.9: 4.5us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 578844.9110438665,
+            "unit": "ops/sec",
+            "extra": "P50: 1.6us | P99: 4.7us | P99.9: 7.3us\nthreads: 1 | elapsed: 0.35s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3663222.248682898,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 3.0us | P99.9: 5.7us\nthreads: 1 | elapsed: 0.05s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 409917.4257828411,
+            "unit": "ops/sec",
+            "extra": "P50: 2.2us | P99: 5.3us | P99.9: 8.1us\nthreads: 1 | elapsed: 0.49s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 221082.25749741695,
+            "unit": "ops/sec",
+            "extra": "P50: 4.2us | P99: 5.3us | P99.9: 7.9us\nthreads: 1 | elapsed: 0.90s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1182386.8066820744,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.2us | P99.9: 4.4us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1126324.507640335,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 1.5us | P99.9: 2.0us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 474936.624278755,
+            "unit": "ops/sec",
+            "extra": "P50: 1.9us | P99: 5.4us | P99.9: 8.1us\nthreads: 1 | elapsed: 0.42s | num: 200000 | iterations: 3"
           }
         ]
       }
