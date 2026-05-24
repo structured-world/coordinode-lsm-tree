@@ -83,7 +83,7 @@ Offset  Size  Field             Description
                                 future suites with longer or shorter
                                 nonces (see §4.6 / §7), PayloadLen
                                 tracks the actual on-disk size:
-                                `PayloadLen = 22 + NONCE_LEN`.
+                                `PayloadLen = 26 + NONCE_LEN`.
 8       1     HeaderByte        High nibble = version (0b0001 for v1),
                                 low nibble = 0 (reserved, MUST be zero)
 9       1     KeyEpoch          Index into the caller's key chain
@@ -151,7 +151,7 @@ Offset  Size  Field             Description
 ═════════
 Total  for v1 suites: 46 bytes on disk
        (8-byte framing header + 38-byte payload).
-       For other suites: 8 + (22 + NONCE_LEN) bytes.
+       For other suites: 8 + (26 + NONCE_LEN) bytes.
 ```
 
 **On-disk minimalism.** The MetadataFrame on disk carries ONLY the fields the decoder needs *before* it can construct the AAD: the version byte, the key epoch (so the right key is selected), the block type (mirrors the existing `Header` pattern), the AEAD suite id (so the right primitive is selected), the compression-context fields (`DictID` + `WindowLog`, which can vary per block and which the decoder must know to bind the AAD before any decompression / decryption work), the nonce, and the AEAD tag. Three further identifiers (`TreeID`, `TableID`, `BlockOffset`) participate in the AAD but are **NOT** stored on disk: they are caller-supplied from the read context (the owning `Tree`, the SST file's per-tree `TableId`, and the read cursor's byte position). See §5.3.
@@ -233,7 +233,7 @@ The `Nonce` and `AEADTag` fields are **not** part of the AAD, they're the AEAD's
 The `MagicBody` and `PayloadLen` from BodyFrame are also **not** part of the AAD. RFC 8878 skippable framing carries no integrity check (a non-conformant reader is expected to *skip* unknown frames, not validate them), so a decoder MUST NOT rely on framing for authentication. Instead the decoder MUST enforce these structural invariants explicitly before doing any further work:
 
 - MetadataFrame `MagicMetadata` equals `0x184D2A50` (LE bytes `50 2A 4D 18`). If not, treat as a non-AAD-bound block and refuse to decrypt.
-- MetadataFrame `PayloadLen` equals `22 + NONCE_LEN`, where `NONCE_LEN` is the nonce length registered for the suite byte at offset 11 (v1 suites: 38 = 22 + 12). Any other value is malformed and MUST be rejected without reading the body frame (no AAD can be constructed, so AEAD cannot bind context). The decoder MUST validate `PayloadLen` against the suite's registered nonce length BEFORE reading the rest of the payload.
+- MetadataFrame `PayloadLen` equals `26 + NONCE_LEN`, where `NONCE_LEN` is the nonce length registered for the suite byte at offset 11 (v1 suites: 38 = 26 + 12). Any other value is malformed and MUST be rejected without reading the body frame (no AAD can be constructed, so AEAD cannot bind context). The decoder MUST validate `PayloadLen` against the suite's registered nonce length BEFORE reading the rest of the payload.
 - BodyFrame `MagicBody` equals `0x184D2A51` (LE bytes `51 2A 4D 18`). If not, reject.
 - BodyFrame `PayloadLen` is in the range `[1, 256 MiB + max_overhead]`, where `256 MiB` is the plaintext upper bound on a single block's on-disk data segment (mirrors the public constant the LSM scrub path enforces) and `max_overhead` is the value reported by the active `EncryptionProvider::max_overhead()` (zero when encryption is disabled or for plaintext blocks). A larger value means either a forged TOC or a header bit-flip and MUST be rejected before allocating the read buffer.
 
@@ -250,8 +250,11 @@ These checks are not AEAD-authenticated, but they bound the attack surface so th
 ;; below for the v1-with-v1-suites concrete bytes that appear on disk
 ;; today. Future suites with different NONCE_LEN (or a future spec
 ;; revision that adds / removes payload fields) get their own ABNF
-;; revision; the abstract framing contract is `PayloadLen == 22 +
-;; NONCE_LEN` and the per-field structure described in §5.1.
+;; revision; the abstract framing contract is `PayloadLen == 26 +
+;; NONCE_LEN` (10 fixed pre-nonce bytes: HeaderByte + KeyEpoch +
+;; BlockType + SuiteID + CompressionType + 4-byte DictID + WindowLog;
+;; plus the suite-defined NONCE_LEN bytes; plus 16 bytes of AEADTag)
+;; and the per-field structure described in §5.1.
 ;;
 ;; A single AAD-bound encrypted block on disk begins with the
 ;; required pair (metadata-frame, body-frame) and may carry zero or
@@ -279,8 +282,8 @@ optional-payload  = *OCTET                          ; opaque bytes, length
 
 metadata-frame    = metadata-magic metadata-payload-len metadata-payload
 metadata-magic    = %x50.2A.4D.18                  ; 0x184D2A50 LE
-metadata-payload-len = %x26.00.00.00               ; u32 LE = 38 (v1 suites: 22 + 12-byte nonce)
-                                                   ; For other suites: u32 LE = 22 + suite's NONCE_LEN.
+metadata-payload-len = %x26.00.00.00               ; u32 LE = 38 (v1 suites: 26 + 12-byte nonce)
+                                                   ; For other suites: u32 LE = 26 + suite's NONCE_LEN.
                                                    ; Decoder MUST resolve NONCE_LEN from SuiteID
                                                    ; via the §7 registry before reading the payload.
 metadata-payload  = header-byte                    ; 1B
@@ -332,7 +335,7 @@ OCTET             = %x00-FF                        ; any 8-bit byte
 2. Read **exactly** that many bytes for `optional-payload`.
 3. Stop consuming bytes for this optional-frame at that point; the next byte is either the start of another optional-frame's magic or end-of-block.
 
-A reader that consumes more or fewer bytes than the declared length MUST treat the file as malformed. The same applies to `metadata-payload` (length 38 for v1 suites with 12-byte nonces; in general `22 + NONCE_LEN`) and `encrypted-body` (length declared by `body-payload-len`): these are also `*OCTET` in the grammar but constrained by their preceding length fields in the same way.
+A reader that consumes more or fewer bytes than the declared length MUST treat the file as malformed. The same applies to `metadata-payload` (length 38 for v1 suites with 12-byte nonces; in general `26 + NONCE_LEN`) and `encrypted-body` (length declared by `body-payload-len`): these are also `*OCTET` in the grammar but constrained by their preceding length fields in the same way.
 
 ## 6. Magic allocation
 
