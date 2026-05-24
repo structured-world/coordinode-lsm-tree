@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779642825003,
+  "lastUpdate": 1779645557571,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -9204,6 +9204,84 @@ window.BENCHMARK_DATA = {
             "value": 489170.8686097784,
             "unit": "ops/sec",
             "extra": "P50: 1.8us | P99: 6.4us | P99.9: 9.6us\nthreads: 1 | elapsed: 0.41s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "9d35a7f7f9013b2aea1f89a8ba53da7282124134",
+          "message": "feat(sst-dump): hex subcommand for raw block-region dump with header decode (#327)\n\n## Summary\n\nAdds `sst-dump <file> hex <offset> [--len N] [--no-header]` — one of the\nfive subcommands still missing from #324 after the `verify` scaffold\nlanded in #316.\n\n## Behaviour\n\n- Reads `--len` bytes (default 256, max 1 MiB; the ceiling guards\nagainst typos like `--len 4294967295` rather than clamping silently).\n- Offset past EOF: exits non-zero with a precise error. Region extending\npast EOF: clamped to bytes-available; the actual read length is reported\nalongside the requested length.\n- Header decode: if the buffer is at least `Header::serialized_len()`\nbytes and `--no-header` is not passed, runs `Header::decode_from` at the\nrequested offset and prints decoded `block_type` / `data_length` /\n`uncompressed_length` / `checksum`. Decode failure is informational, hex\nbody still prints.\n- Hex body: `xxd`-style — 8-digit absolute-offset prefix, 16 bytes per\nline in two 8-byte groups, ASCII gutter for printable bytes.\n\n## Example\n\n```\n$ sst-dump table-0 hex 0\nfile:           table-0\nfile size:      8729 bytes\noffset:         0 (0x00000000)\ndumped:         256 bytes (requested 256)\nheader:\n  block_type:          Data\n  data_length:         1834 bytes\n  uncompressed_length: 1834 bytes\n  checksum (XXH3):     Checksum(...)\n\n00000000  ff ff ff ff fc fb fd fe  00 4a 07 00 00 4a 07 00  |.........J...J..|\n00000010  00 5c d7 9c 09 6c 0d 0f  3c c8 c3 ac 6f 4d ae a6  |.\\...l..<...oM..|\n...\n```\n\n## Tests\n\n`tools/sst-dump/tests/hex_smoke.rs` (4 new tests):\n\n- `hex_at_first_block_decodes_header_and_prints_dump` — happy path:\nbuild a real SST through the public API, dump offset 0, assert both\ndecoded header section AND xxd-style line for offset 0.\n- `hex_with_no_header_flag_skips_decode_section` — `--no-header`\nsuppresses the decode attempt.\n- `hex_past_eof_exits_nonzero` — offset past file size errors out\ncleanly.\n- `hex_oversized_len_is_rejected` — `--len > 1 MiB` is refused, not\nsilently clamped.\n\n## Test plan\n\n- [x] `cargo nextest run` in `tools/sst-dump/` (6 tests pass: 4 new + 2\nexisting `verify_smoke`)\n- [x] `cargo clippy --all-targets -- -D warnings` clean\n- [x] Main crate `cargo nextest run` (1405 pass)\n- [x] README `Operational tools` table row updated to list the new\nsubcommand\n\nPart of #324.",
+          "timestamp": "2026-05-24T20:58:27+03:00",
+          "tree_id": "1e07652c9e21d97c8f6cb9eaffc80d5891f7da3e",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/9d35a7f7f9013b2aea1f89a8ba53da7282124134"
+        },
+        "date": 1779645555984,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 2090447.7585450893,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.6us | P99.9: 3.7us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1236090.0087369932,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.2us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 642987.2529352425,
+            "unit": "ops/sec",
+            "extra": "P50: 1.4us | P99: 4.5us | P99.9: 6.8us\nthreads: 1 | elapsed: 0.31s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3690213.581259103,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 2.9us | P99.9: 5.3us\nthreads: 1 | elapsed: 0.05s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 450613.5999758201,
+            "unit": "ops/sec",
+            "extra": "P50: 1.9us | P99: 5.1us | P99.9: 7.8us\nthreads: 1 | elapsed: 0.44s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 222654.85297125945,
+            "unit": "ops/sec",
+            "extra": "P50: 4.2us | P99: 5.3us | P99.9: 8.2us\nthreads: 1 | elapsed: 0.90s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1265387.15525998,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.2us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1129994.639870426,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.5us | P99.9: 1.9us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 530590.256696303,
+            "unit": "ops/sec",
+            "extra": "P50: 1.7us | P99: 6.2us | P99.9: 9.7us\nthreads: 1 | elapsed: 0.38s | num: 200000 | iterations: 3"
           }
         ]
       }
