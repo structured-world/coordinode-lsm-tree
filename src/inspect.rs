@@ -17,7 +17,15 @@
 //! unreadable does the call return an error.
 
 use crate::CompressionType;
-use crate::fs::{Fs, FsOpenOptions, StdFs};
+// `Fs` is brought in for the trait import, NOT named directly: the
+// `fs.open(path, ...)` call below resolves through the `Fs` trait,
+// so the trait must be in scope. Removing it breaks the build with
+// `method `open` not found for this struct` (rustc E0599). Marked
+// `#[allow(unused_imports)]` for the same reason and to defuse the
+// recurring static-analysis false positive that wants this dropped.
+#[allow(unused_imports)]
+use crate::fs::Fs;
+use crate::fs::{FsOpenOptions, StdFs};
 use crate::table::meta::ParsedMeta;
 use crate::table::regions::ParsedRegions;
 use std::path::Path;
