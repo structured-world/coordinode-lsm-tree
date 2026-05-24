@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779585992186,
+  "lastUpdate": 1779609359971,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -8736,6 +8736,84 @@ window.BENCHMARK_DATA = {
             "value": 506613.74106687994,
             "unit": "ops/sec",
             "extra": "P50: 1.8us | P99: 5.0us | P99.9: 7.4us\nthreads: 1 | elapsed: 0.39s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "e6610d38d39a47a77ff8ef220a7b4b9d04aa508f",
+          "message": "test(verify): pin DataReadError routing for truncated data segment (#315) (#319)\n\n## Summary\n\nAdds the missing regression test pinning\n`BlockVerifyError::DataReadError`. Before this PR, only the clean path\nand the data-checksum-mismatch path were covered for\n`walk_block_region`; the post-header short-read branch (header decodes\ncleanly, then `read_exact` of the data segment hits EOF) had no test.\n\nCodeRabbit's `set_len()` suggestion (truncate the SST file end) doesn't\nwork end-to-end because shortening the file destroys the SFA trailer, so\n`Config::open()` fails before the block walker ever runs. This test\ntakes the alternative path from issue #315: forge a synthetic SFA\narchive whose `data` TOC entry claims a larger section than what the\nfile actually contains, then drive `scan_sst_blocks` directly (bypassing\n`Tree::open` entirely).\n\nThe forged file shape:\n\n- Section `data` contains exactly one valid `Header` (33 bytes),\n`data_length = 4096`, no data bytes following.\n- TOC entry's `len` field patched in place from 33 to 4129 (= header +\nclaimed data).\n- TOC `xxh3_128` recomputed and the trailer's checksum field rewritten\nso `sfa::Reader` still accepts the file.\n\nWalk path through the test:\n\n1. `Header::decode_from` succeeds (header's own XXH3 covers the bytes\nthe test wrote).\n2. Section-bounds check passes: `data_length (4096) <= remaining\n(4096)`.\n3. `read_exact(4096)` consumes a handful of trailing TOC + trailer bytes\nand then hits EOF.\n4. `BlockVerifyError::DataReadError { table_id: 42, offset: 0,\ndata_length: 4096, .. }` is recorded.\n\nA regression that re-routes the short-read branch back through\n`HeaderCorrupted` (the obvious cleanup of \\\"any read error inside the\nwalker is a header problem\\\") makes the test fail on the variant match,\nwhich is the regression #315 is guarding against.\n\n## Test plan\n\n- [x] `cargo nextest run -p coordinode-lsm-tree --lib\nwalk_block_region_reports_data_read_error_on_truncated_data_segment`\npasses in 11 ms\n- [x] Full suite: 1552 tests pass\n- [x] `cargo clippy --all-targets --all-features -- -D warnings` clean\n- [x] Test runs in under 1 s (no full-tree open, no real filesystem)\n\nCloses #315",
+          "timestamp": "2026-05-24T10:54:40+03:00",
+          "tree_id": "a64f20dbf0d1cb3f16927b1f7493bf0ed9da2e26",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/e6610d38d39a47a77ff8ef220a7b4b9d04aa508f"
+        },
+        "date": 1779609358516,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 1972620.8899999917,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.7us | P99.9: 3.8us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1181012.6098960282,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.2us | P99.9: 4.4us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 590541.5656209448,
+            "unit": "ops/sec",
+            "extra": "P50: 1.6us | P99: 4.7us | P99.9: 7.3us\nthreads: 1 | elapsed: 0.34s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3645421.1159487064,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 3.0us | P99.9: 5.4us\nthreads: 1 | elapsed: 0.05s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 397880.8024951806,
+            "unit": "ops/sec",
+            "extra": "P50: 2.1us | P99: 6.2us | P99.9: 11.3us\nthreads: 1 | elapsed: 0.50s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 222449.57928639388,
+            "unit": "ops/sec",
+            "extra": "P50: 4.2us | P99: 5.4us | P99.9: 7.5us\nthreads: 1 | elapsed: 0.90s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1237978.302201893,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.3us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1095162.8627644847,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.5us | P99.9: 1.9us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 531961.0129390951,
+            "unit": "ops/sec",
+            "extra": "P50: 1.7us | P99: 5.0us | P99.9: 7.3us\nthreads: 1 | elapsed: 0.38s | num: 200000 | iterations: 3"
           }
         ]
       }
