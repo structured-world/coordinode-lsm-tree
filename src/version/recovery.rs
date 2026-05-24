@@ -126,7 +126,19 @@ pub fn recover(folder: &Path, fs: &dyn Fs, mode: ManifestRecoveryMode) -> crate:
 
     // // TODO: vvv move into Version::decode vvv
     let mut levels = vec![];
+    // Separate counters for the two distinct tail-truncation shapes
+    // so the summary warnings can report them honestly. Header
+    // truncation = "the writer didn't even finish writing the
+    // count/length byte for this level/run/section"; no per-entry
+    // bytes are missing because no entry was supposed to be there
+    // yet. Record truncation = "the count says N, only K < N
+    // complete entries are present", so N-K entries are actually
+    // missing. Conflating them under one counter (the previous
+    // behaviour) overcounted: a manifest cut between two runs
+    // would log "1 table record dropped" when zero records were
+    // lost — only a header byte.
     let mut tables_dropped_to_tail: u32 = 0;
+    let mut tables_truncated_headers: u32 = 0;
 
     {
         let section = toc
@@ -166,8 +178,12 @@ pub fn recover(folder: &Path, fs: &dyn Fs, mode: ManifestRecoveryMode) -> crate:
                     // runs at level N" marker which downstream code
                     // tolerates. Stay consistent with the cut-mid-run
                     // path below (which DOES push) instead of silently
-                    // dropping the level slot.
-                    tables_dropped_to_tail += 1;
+                    // dropping the level slot. This is a HEADER
+                    // truncation (the run_count byte didn't land),
+                    // not a record-data loss — count it separately
+                    // so the summary doesn't report nonexistent
+                    // record drops.
+                    tables_truncated_headers += 1;
                     levels.push(level);
                     break 'levels;
                 }
@@ -187,7 +203,9 @@ pub fn recover(folder: &Path, fs: &dyn Fs, mode: ManifestRecoveryMode) -> crate:
                         // contract. The current `run` is empty (we
                         // failed at the very first byte of its
                         // record header), so nothing to push for it.
-                        tables_dropped_to_tail += 1;
+                        // HEADER truncation — no records were
+                        // supposed to be there yet, count separately.
+                        tables_truncated_headers += 1;
                         levels.push(level);
                         break 'levels;
                     }
@@ -251,10 +269,12 @@ pub fn recover(folder: &Path, fs: &dyn Fs, mode: ManifestRecoveryMode) -> crate:
         }
     }
 
-    if tables_dropped_to_tail > 0 {
+    if tables_dropped_to_tail > 0 || tables_truncated_headers > 0 {
         log::warn!(
-            "manifest tail truncation dropped {tables_dropped_to_tail} table record(s) \
-             from version #{curr_version_id}; recovered tree may be missing SSTs",
+            "manifest tail truncation in version #{curr_version_id}: \
+             {tables_dropped_to_tail} table record(s) dropped, \
+             {tables_truncated_headers} level/run header(s) truncated; \
+             recovered tree may be missing SSTs",
         );
     }
 
@@ -348,7 +368,26 @@ pub fn recover(folder: &Path, fs: &dyn Fs, mode: ManifestRecoveryMode) -> crate:
 
         let mut reader = open_section_reader(fs, &version_file_path, section)?;
 
-        crate::blob_tree::FragmentationMap::decode_from(&mut reader)?
+        // Same tail-tolerance contract as the record-list sections:
+        // a power-loss between the `blob_files` commit and the
+        // `blob_gc_stats` payload landing surfaces as
+        // `UnexpectedEof` inside `FragmentationMap::decode_from`.
+        // Strict mode aborts; tolerant mode warns and uses an empty
+        // FragmentationMap (the GC stats are advisory — fragmentation
+        // re-accrues on subsequent compactions, so dropping them is
+        // a "rebuild on next pass" outcome rather than data loss).
+        match crate::blob_tree::FragmentationMap::decode_from(&mut reader) {
+            Ok(m) => m,
+            Err(e) if tolerate_tail && is_clean_tail_truncation(&e) => {
+                log::warn!(
+                    "blob_gc_stats section truncated in version #{curr_version_id}; \
+                     tail-tolerant mode produces an empty FragmentationMap (GC stats \
+                     will rebuild on the next compaction pass)"
+                );
+                crate::blob_tree::FragmentationMap::default()
+            }
+            Err(e) => return Err(e),
+        }
     };
 
     Ok(Recovery {

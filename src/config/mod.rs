@@ -1144,9 +1144,11 @@ impl Config {
     /// as `warn!`, but the recovered tree may be missing tables / blob
     /// files relative to what the operator last fsynced. Always
     /// pair the non-default modes with an out-of-band integrity scan
-    /// ([`verify_integrity`](crate::verify::verify_integrity) and/or
-    /// [`verify_sst_file`](crate::verify::verify_sst_file)) before
-    /// trusting the recovered tree for writes.
+    /// ([`verify_integrity`](crate::verify::verify_integrity) for
+    /// whole-file XXH3 over every SST + blob file, or
+    /// [`verify_block_checksums`](crate::verify::verify_block_checksums)
+    /// for per-block granularity) before trusting the recovered tree
+    /// for writes.
     ///
     /// See the [`ManifestRecoveryMode`] doc for per-variant semantics.
     #[must_use]
