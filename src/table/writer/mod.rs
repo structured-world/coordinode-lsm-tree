@@ -760,11 +760,19 @@ impl Writer {
         self.file_writer.start("meta_separator")?;
         self.file_writer.write_all(&[0u8; 4096])?;
 
-        // TLI mirror near the file tail. Head copy lives in the `tli`
-        // section near the file start, ~MB earlier (the data section
-        // is between them, so head and tail are always on different
-        // filesystem sectors). A torn-write or bad sector at either
-        // end leaves the other copy intact. Reader prefers the tail
+        // TLI mirror near the file tail. The head `tli` section was
+        // emitted earlier in `finish()` by `index_writer.finish()` —
+        // after `data` and the partitioned `index` sub-blocks (if any)
+        // but before `filter` / `filter_tli` / `range_tombstones` /
+        // `meta_mid` / `linked_blob_files` / `table_version` /
+        // `meta_separator`. So the head copy lives in the middle of
+        // the file, and `tli_tail` lives after `meta_separator` and
+        // before the canonical `meta` section. Several KiB of
+        // unrelated sections plus the 4 KiB `meta_separator`
+        // guarantee the two copies land in different 4 KiB
+        // filesystem sectors (for any typical table they are
+        // hundreds of KiB to MiB apart). A torn-write or bad sector
+        // at either end leaves the other copy intact. Reader prefers the tail
         // copy on open and transparently falls back to the head copy
         // on decode/checksum/decrypt failure. Re-encodes the same
         // `tli_bytes` returned by `index_writer.finish()` so the two

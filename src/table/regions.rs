@@ -26,11 +26,14 @@ fn toc_entry_to_handle(entry: &TocEntry) -> BlockHandle {
 /// --------------------
 /// |       data       | <- implicitly start at 0
 /// |------------------|
-/// |        tli       | <- head copy
+/// |       index      | <- partitioned only: sub-index blocks
+/// |                  |    (full-index tables emit only `tli` below)
 /// |------------------|
-/// |       index      | <- may not exist (if full block index is used, TLI will be dense)
+/// |        tli       | <- head copy (top-level index)
 /// |------------------|
 /// |      filter      | <- may not exist
+/// |------------------|
+/// |    filter_tli    | <- partitioned filter only
 /// |------------------|
 /// | range_tombstones | <- may not exist
 /// |------------------|
@@ -51,6 +54,13 @@ fn toc_entry_to_handle(entry: &TocEntry) -> BlockHandle {
 /// |      trailer     | <- fixed size
 /// |------------------|
 /// ```
+///
+/// Writer emission order matches the diagram top-to-bottom. For the
+/// partitioned index path (`PartitionedIndexWriter::finish`) the
+/// `index` section is written first, then `tli`; the full-index
+/// path (`FullIndexWriter::finish`) skips `index` and emits only
+/// `tli`. Same pattern for filters: partitioned writes `filter`
+/// then `filter_tli`, full writes only `filter`.
 #[derive(Copy, Clone, Debug, Default)]
 pub struct ParsedRegions {
     pub tli: BlockHandle,
