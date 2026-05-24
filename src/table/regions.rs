@@ -22,33 +22,35 @@ fn toc_entry_to_handle(entry: &TocEntry) -> BlockHandle {
 
 /// The regions block stores offsets to the different table file "regions"
 ///
-/// ----------------
-/// |     data     | <- implicitly start at 0
-/// |--------------|
-/// |      tli     | <- head copy
-/// |--------------|
-/// |     index    | <- may not exist (if full block index is used, TLI will be dense)
-/// |--------------|
-/// |    filter    | <- may not exist
-/// |--------------|
-/// |  `range_tomb`  | <- may not exist
-/// |--------------|
-/// |   `meta_mid`   | <- mirror of meta
-/// |--------------|
-/// | linked blobs | <- may not exist
-/// |--------------|
-/// |table_version |
-/// |--------------|
-/// |meta_separator| <- 4 KiB zero padding
-/// |--------------|
-/// |   tli_tail   | <- mirror of tli
-/// |--------------|
-/// |     meta     |
-/// |--------------|
-/// |     toc      |
-/// |--------------|
-/// |   trailer    | <- fixed size
-/// |--------------|
+/// ```text
+/// --------------------
+/// |       data       | <- implicitly start at 0
+/// |------------------|
+/// |        tli       | <- head copy
+/// |------------------|
+/// |       index      | <- may not exist (if full block index is used, TLI will be dense)
+/// |------------------|
+/// |      filter      | <- may not exist
+/// |------------------|
+/// | range_tombstones | <- may not exist
+/// |------------------|
+/// |     meta_mid     | <- mirror of meta
+/// |------------------|
+/// | linked_blob_files| <- may not exist
+/// |------------------|
+/// |   table_version  |
+/// |------------------|
+/// |  meta_separator  | <- 4 KiB zero padding
+/// |------------------|
+/// |     tli_tail     | <- mirror of tli
+/// |------------------|
+/// |       meta       |
+/// |------------------|
+/// |        toc       |
+/// |------------------|
+/// |      trailer     | <- fixed size
+/// |------------------|
+/// ```
 #[derive(Copy, Clone, Debug, Default)]
 pub struct ParsedRegions {
     pub tli: BlockHandle,
