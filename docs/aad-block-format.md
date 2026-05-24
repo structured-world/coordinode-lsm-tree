@@ -337,22 +337,31 @@ All `key` / `value` / `nonce` byte sequences are shown hex, big-endian to small-
 
 ### Vector 1: Data block, AES-256-GCM, no dict
 
-| Field | Value |
-|---|---|
-**Disk-side inputs (encoded into MetadataFrame on disk):**
+**MetadataFrame fields (stored on disk, plaintext, alongside the encrypted body):**
 
 | Field | Value |
 |---|---|
-| Key (32 B) | `00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000` |
 | KeyEpoch | `01` |
 | BlockType | `00` (Data) |
 | SuiteID | `02` (AES-256-GCM) |
 | DictID (BE) | `00000000` (= 0, no dict) |
 | WindowLog | `15` (= 21, 2 MiB window) |
-| Nonce (24 B) | `000102030405060708090a0b 0000000000000000 00000000` (first 12 used) |
+| Nonce (24 B) | `000102030405060708090a0b 0000000000000000 00000000` (first 12 used; remaining 12 MUST be zero) |
+| AEADTag (16 B) | produced by the AEAD library at encrypt time; stored on disk |
+
+**BodyFrame contents (the plaintext that gets encrypted into the on-disk ciphertext; NOT itself on disk):**
+
+| Field | Value |
+|---|---|
 | Plaintext body | `48656c6c 6f2c2057 6f726c64 21` ("Hello, World!", 13 bytes) |
 
-**Caller-supplied inputs (NOT on disk; fed into AAD construction at encrypt/decrypt time from read context):**
+**AEAD key material (NEVER on disk; resolved by the caller from `KeyEpoch` via the per-tree encryption-provider key chain):**
+
+| Field | Value |
+|---|---|
+| Key (32 B) | `00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000` |
+
+**Caller-supplied AAD context (NEVER on disk; fed into AAD construction at encrypt/decrypt time from read context):**
 
 | Field | Value | Source in the conformance harness |
 |---|---|---|
