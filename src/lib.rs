@@ -213,6 +213,13 @@ mod value_type;
 mod write_batch;
 
 /// Integrity verification for SST and blob files.
+///
+/// Gated behind `std` because the verify pipeline uses `std::fs`,
+/// `std::path::Path`, `std::io::{Read, Seek}` everywhere — full-file
+/// hashing and per-block walking both need real filesystem I/O. Once
+/// the `Fs`/`FsFile` trait surface is no-std-friendly (tracked under
+/// the no-std migration), the gate can be relaxed.
+#[cfg(feature = "std")]
 pub mod verify;
 
 mod version;
