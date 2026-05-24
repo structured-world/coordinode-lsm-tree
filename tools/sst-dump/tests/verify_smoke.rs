@@ -66,14 +66,32 @@ fn verify_clean_sst_exits_zero_with_ok() {
         out.status,
         String::from_utf8_lossy(&out.stderr),
     );
-    assert!(
-        stdout.contains("status:         OK"),
-        "expected OK status in output; got:\n{stdout}",
+    // Parse `<label>: <value>` lines by trimming around the colon
+    // rather than hard-coding column alignment. Robust against
+    // future formatting tweaks in sst-dump's output (column-width
+    // changes, switching to tab-separated, etc.).
+    assert_eq!(
+        line_value(&stdout, "status"),
+        Some("OK".to_owned()),
+        "expected status=OK in output; got:\n{stdout}",
     );
-    assert!(
-        stdout.contains("errors:         0"),
-        "expected zero errors line; got:\n{stdout}",
+    assert_eq!(
+        line_value(&stdout, "errors"),
+        Some("0".to_owned()),
+        "expected errors=0 in output; got:\n{stdout}",
     );
+}
+
+/// Returns the trimmed value after the first `<label>:` line in
+/// `text`, or `None` if no such line exists. Whitespace around the
+/// value is normalised so callers don't have to encode the exact
+/// column alignment sst-dump uses (which is implementation detail).
+fn line_value(text: &str, label: &str) -> Option<String> {
+    let prefix = format!("{label}:");
+    text.lines().find_map(|line| {
+        line.strip_prefix(&prefix)
+            .map(|rest| rest.trim().to_owned())
+    })
 }
 
 #[test]
@@ -109,12 +127,28 @@ fn verify_tampered_sst_exits_nonzero_with_corrupt() {
         !out.status.success(),
         "expected non-zero exit on corruption; stdout:\n{stdout}",
     );
-    assert!(
-        stdout.contains("status:         CORRUPT"),
-        "expected CORRUPT status in output; got:\n{stdout}",
+    assert_eq!(
+        line_value(&stdout, "status"),
+        Some("CORRUPT".to_owned()),
+        "expected status=CORRUPT in output; got:\n{stdout}",
     );
+    // The behaviour under test is "corruption is detected and
+    // reported", not the specific variant. A future writer-layout
+    // change could move the byte-flipped region from a data block
+    // into the TOC region or end up surfacing as SstFileUnreadable
+    // / TocCorrupted / DataReadError instead — all of those are
+    // valid "corruption detected" outcomes. Accept any of the five
+    // variant tags sst-dump prints.
+    const VARIANT_TAGS: &[&str] = &[
+        "SstFileUnreadable",
+        "HeaderCorrupted",
+        "DataCorrupted",
+        "DataReadError",
+        "TocCorrupted",
+    ];
+    let saw_variant = VARIANT_TAGS.iter().any(|tag| stdout.contains(tag));
     assert!(
-        stdout.contains("DataCorrupted") || stdout.contains("HeaderCorrupted"),
-        "expected DataCorrupted or HeaderCorrupted in output; got:\n{stdout}",
+        saw_variant,
+        "expected one of {VARIANT_TAGS:?} in output; got:\n{stdout}",
     );
 }
