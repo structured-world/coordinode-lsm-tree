@@ -18,8 +18,6 @@
 
 use crate::CompressionType;
 use crate::fs::{Fs, FsOpenOptions, StdFs};
-use crate::key_range::KeyRange;
-use crate::table::TableId;
 use crate::table::meta::ParsedMeta;
 use crate::table::regions::ParsedRegions;
 use std::path::Path;
@@ -40,7 +38,9 @@ use std::path::Path;
 #[non_exhaustive]
 pub struct TableProperties {
     /// Per-tree unique table id (the SST file's logical identifier).
-    pub id: TableId,
+    /// Plain `u64` rather than the crate-internal `TableId` alias so
+    /// the public API does not couple to a `#[doc(hidden)]` type.
+    pub id: u64,
     /// Logical size of the data-blocks region as recorded by the
     /// writer. This is `*self.meta.file_pos` at the moment the meta
     /// section was flushed — i.e. the byte offset just past the last
@@ -50,8 +50,13 @@ pub struct TableProperties {
     /// file directly. See `write_meta_section`'s `file_size` field
     /// for the writer-side definition.
     pub file_size: u64,
-    /// Smallest and largest user keys present in the table.
-    pub key_range: KeyRange,
+    /// Smallest user key present in the table. Owned `Vec<u8>` rather
+    /// than the crate-internal `KeyRange` / `UserKey` types so the
+    /// public API does not couple to `#[doc(hidden)]` re-exports.
+    pub min_key: Vec<u8>,
+    /// Largest user key present in the table. See [`Self::min_key`]
+    /// for the rationale on the owned-bytes representation.
+    pub max_key: Vec<u8>,
     /// Number of live (non-tombstone) KV entries.
     pub item_count: u64,
     /// Number of strong tombstone entries (delete markers that
@@ -155,7 +160,8 @@ pub fn read_table_properties(path: &Path) -> crate::Result<TableProperties> {
     Ok(TableProperties {
         id: meta.id,
         file_size: meta.file_size,
-        key_range: meta.key_range,
+        min_key: meta.key_range.min().to_vec(),
+        max_key: meta.key_range.max().to_vec(),
         item_count: meta.item_count,
         tombstone_count: meta.tombstone_count,
         weak_tombstone_count: meta.weak_tombstone_count,

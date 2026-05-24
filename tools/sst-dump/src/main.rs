@@ -317,8 +317,8 @@ fn run_properties(path: &std::path::Path) -> ExitCode {
     );
     println!(
         "key_range:           min={} max={}",
-        format_key(props.key_range.min()),
-        format_key(props.key_range.max()),
+        format_key(&props.min_key),
+        format_key(&props.max_key),
     );
     println!("item_count:          {}", props.item_count);
     println!("tombstone_count:     {}", props.tombstone_count);
@@ -340,6 +340,8 @@ fn run_properties(path: &std::path::Path) -> ExitCode {
 /// form round-trips unambiguously. Every other byte (control chars,
 /// high-bit-set bytes) is rendered as a `\xNN` hex escape.
 fn format_key(key: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+
     let mut out = String::with_capacity(key.len() + 2);
     out.push('"');
     for &b in key {
@@ -348,8 +350,16 @@ fn format_key(key: &[u8]) -> String {
             b'"' => out.push_str("\\\""),
             0x20..=0x7e => out.push(b as char),
             _ => {
-                use std::fmt::Write;
-                let _ = write!(out, "\\x{b:02x}");
+                // Manual two-hex-char emit avoids `write!`'s `Result`
+                // entirely. `String` writes are infallible but the
+                // `write!` macro still returns `fmt::Result`, which
+                // we previously discarded with `let _ = ...`; pushing
+                // the chars directly is both clearer and slightly
+                // faster (no formatter machinery).
+                out.push('\\');
+                out.push('x');
+                out.push(HEX[(b >> 4) as usize] as char);
+                out.push(HEX[(b & 0x0f) as usize] as char);
             }
         }
     }
