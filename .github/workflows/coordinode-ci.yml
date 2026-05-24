@@ -97,6 +97,16 @@ jobs:
       - name: Check db_bench crate
         working-directory: tools/db_bench
         run: cargo check --all-features
+      - name: Build + test sst-dump crate
+        # Standalone crate (not in workspace), exercise both the bin
+        # build and the integration smoke tests so any drift in the
+        # public verify::verify_sst_file API or the SST writer layout
+        # surfaces here instead of in production. No `--profile ci`:
+        # sst-dump has no .config/nextest.toml of its own and the
+        # parent crate's profile config is not visible from a
+        # non-workspace child.
+        working-directory: tools/sst-dump
+        run: cargo nextest run
 
   test-zstd:
     needs: lint
