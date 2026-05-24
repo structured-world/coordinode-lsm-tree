@@ -573,14 +573,17 @@ fn scan_sst_blocks(
     // region. Other named sections, in writer order:
     //
     //   - `data`              : block-format (data blocks)
+    //   - `index`             : block-format (partitioned index leaf
+    //                           blocks; absent for full-index tables,
+    //                           emitted before `tli` by
+    //                           `PartitionedIndexWriter::finish`)
     //   - `tli`               : block-format (top-level index, both
     //                           full and partitioned variants)
-    //   - `index`             : block-format (partitioned index leaf
-    //                           blocks; absent for full-index tables)
+    //   - `filter`            : block-format (filter blocks)
     //   - `filter_tli`        : block-format (top-level filter for
     //                           partitioned filters; absent for full
-    //                           filters)
-    //   - `filter`            : block-format (filter blocks)
+    //                           filters, emitted after `filter` by
+    //                           `PartitionedFilterWriter::finish`)
     //   - `range_tombstones`  : block-format (optional)
     //   - `meta_mid`          : block-format (early mirror of `meta`)
     //   - `linked_blob_files` : RAW length-prefixed list of u64s
