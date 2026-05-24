@@ -1,0 +1,34 @@
+# Standalone diagnostic tool for inspecting / verifying a single SST
+# file out-of-band. Not part of the main coordinode-lsm-tree crate.
+# Build with: cd tools/sst-dump && cargo build --release
+#
+# Use cases:
+#   - Verify a single SST's per-block XXH3 checksums (corruption forensics)
+#   - Future subcommands: dump KV entries, dump TLI structure, filter stats
+#
+# Modeled after RocksDB's sst_dump utility; follows the tools/db_bench
+# layout convention (separate Cargo crate, path dep on the main lib).
+[package]
+name = "sst-dump"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "sst-dump"
+path = "src/main.rs"
+
+[dependencies]
+# Path dep on the main lib so the binary picks up the public API
+# (verify_sst_file, ParsedMeta-style helpers as they are added).
+# `lz4` + `zstd` features enabled because real production SSTs are
+# usually compressed; without them the tool refuses to walk
+# compressed blocks.
+lsm-tree = { package = "coordinode-lsm-tree", path = "../..", features = ["lz4", "zstd"] }
+clap = { version = "4", features = ["derive"] }
+
+[dev-dependencies]
+# Integration smoke tests in tests/ build a real SST through the
+# lsm-tree public API, then drive the compiled sst-dump binary
+# against it.
+tempfile = "3"

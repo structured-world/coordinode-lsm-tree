@@ -2035,7 +2035,7 @@ impl Tree {
 
         let tree_path = tree_path.as_ref();
 
-        let recovery = recover(tree_path, &*config.fs)?;
+        let recovery = recover(tree_path, &*config.fs, config.manifest_recovery_mode)?;
 
         let mut table_map = {
             let mut result: crate::HashMap<TableId, (u8 /* Level index */, Checksum, SeqNo)> =

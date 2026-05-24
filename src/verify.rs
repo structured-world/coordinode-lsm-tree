@@ -477,6 +477,61 @@ pub fn verify_block_checksums(tree: &impl crate::AbstractTree) -> BlockVerifyRep
     report
 }
 
+/// Out-of-band variant of [`verify_block_checksums`].
+///
+/// Walks one SST file directly from a filesystem path, without
+/// needing a live `Tree` or the version manifest. Intended for
+/// offline diagnostic tools (`tools/sst-dump verify`, `repair_db`,
+/// forensics CLIs) that operate on a single file in isolation — for
+/// example when the manifest itself is corrupt or the surrounding
+/// tree directory has been moved.
+///
+/// Uses [`StdFs`](crate::fs::StdFs) (the only `Fs` backend that
+/// makes sense for an out-of-band tool — `MemFs` / `IoUring` trees
+/// never produce files at real filesystem paths) and stamps
+/// `table_id = 0` in error reports. The caller's downstream
+/// filtering / logging should refer to the file by path, not by
+/// table id.
+///
+/// AEAD overhead is conservatively assumed to be zero: out-of-band
+/// tools don't carry the per-table encryption provider that would let
+/// them recover the real `max_overhead()`. Encrypted SSTs near the
+/// 256 MiB plaintext ceiling may therefore false-flag as
+/// [`BlockVerifyError::HeaderCorrupted`]. In practice block sizes are
+/// typically a few KiB, so this only matters on artificially-
+/// constructed huge blocks; encrypted-aware verification should go
+/// through [`verify_block_checksums`] on a live tree.
+///
+/// The returned [`BlockVerifyReport`] has `sst_files_scanned == 1`
+/// (always) plus per-block errors collected during the walk.
+#[cfg(feature = "std")]
+#[must_use]
+pub fn verify_sst_file(path: &std::path::Path) -> BlockVerifyReport {
+    use crate::fs::StdFs;
+
+    let fs = StdFs;
+    let mut report = BlockVerifyReport {
+        sst_files_scanned: 1,
+        ..BlockVerifyReport::default()
+    };
+
+    match scan_sst_blocks(&fs, path, 0, 0) {
+        Ok(per_file) => {
+            report.blocks_scanned = per_file.blocks_scanned;
+            report.errors = per_file.errors;
+        }
+        Err(error) => {
+            report.errors.push(BlockVerifyError::SstFileUnreadable {
+                table_id: 0,
+                path: path.to_path_buf(),
+                error,
+            });
+        }
+    }
+
+    report
+}
+
 struct PerFileScan {
     blocks_scanned: usize,
     errors: Vec<BlockVerifyError>,
@@ -952,6 +1007,82 @@ mod block_verify_tests {
             "expected a DataCorrupted error for {}, got {:?}",
             sst_path.display(),
             report.errors,
+        );
+    }
+
+    /// Exercises the out-of-band wrapper on a real clean SST file.
+    /// `verify_sst_file` is the entry point sst-dump calls; this pins
+    /// that it stamps `sst_files_scanned = 1`, reports no errors on a
+    /// healthy file, and propagates the block count through the
+    /// `StdFs` -> `scan_sst_blocks` -> `BlockVerifyReport` path.
+    #[test]
+    fn verify_sst_file_clean_file_has_no_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        populate_tree(dir.path(), 1_000);
+        let sst_path = pick_first_sst_path(dir.path());
+
+        let report = verify_sst_file(&sst_path);
+        assert!(
+            report.is_ok(),
+            "expected clean SST to verify with zero errors, got {:?}",
+            report.errors,
+        );
+        assert_eq!(
+            report.sst_files_scanned, 1,
+            "wrapper must always stamp sst_files_scanned = 1",
+        );
+        assert!(
+            report.blocks_scanned > 0,
+            "expected at least one block scanned in a populated SST",
+        );
+    }
+
+    /// Exercises the file-open failure branch (the only path through
+    /// `verify_sst_file` that converts an underlying `io::Error` into
+    /// a `BlockVerifyError::SstFileUnreadable`). A missing file is the
+    /// simplest trigger; an unreadable-due-to-permissions trigger
+    /// would require root or chmod-induced state and is overkill for
+    /// pinning the variant routing.
+    #[test]
+    fn verify_sst_file_missing_file_reports_unreadable() {
+        // Build the missing-file path under a fresh tempdir so it
+        // resolves the same way on Linux / macOS / Windows runners.
+        // A hardcoded Unix-style absolute path would either skip the
+        // test on Windows (no `/this/...` semantics) or risk a flaky
+        // pass if the path happened to exist.
+        let dir = tempfile::tempdir().unwrap();
+        let missing_path = dir.path().join("does-not-exist-sst-12345.sst");
+        // Sanity: tempdir() guarantees the directory is empty.
+        assert!(
+            !missing_path.exists(),
+            "tempdir entry must be absent for this test to exercise the missing-file branch",
+        );
+
+        let report = verify_sst_file(&missing_path);
+        assert_eq!(
+            report.sst_files_scanned, 1,
+            "wrapper stamps sst_files_scanned = 1 even on file-open failure \
+             so callers see the attempt was made",
+        );
+        assert_eq!(
+            report.blocks_scanned, 0,
+            "no blocks could be walked because the file couldn't be opened",
+        );
+        assert_eq!(
+            report.errors.len(),
+            1,
+            "expected exactly one error, got {:?}",
+            report.errors,
+        );
+        let err = report.errors.first().unwrap();
+        assert!(
+            matches!(
+                err,
+                BlockVerifyError::SstFileUnreadable { table_id: 0, path, .. }
+                    if path == &missing_path,
+            ),
+            "expected SstFileUnreadable for {}, got {err:?}",
+            missing_path.display(),
         );
     }
 
