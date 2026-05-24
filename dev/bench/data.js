@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779609359971,
+  "lastUpdate": 1779611526624,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -8814,6 +8814,84 @@ window.BENCHMARK_DATA = {
             "value": 531961.0129390951,
             "unit": "ops/sec",
             "extra": "P50: 1.7us | P99: 5.0us | P99.9: 7.3us\nthreads: 1 | elapsed: 0.38s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "b2b5fd1a57be4b3287310ccf70d41fe098f80f85",
+          "message": "feat(config): ManifestRecoveryMode + TolerateCorruptedTailRecords (#299) (#317)\n\n## Summary\n\nAdds a per-tree policy knob governing what \\`Tree::open\\` does when the\non-disk MANIFEST contains corrupt records. Default\n\\`AbsoluteConsistency\\` preserves the current strict behaviour — any\ncorruption aborts the open. New \\`TolerateCorruptedTailRecords\\` mode\nsalvages a power-loss-during-write scenario: keep everything that\ndecoded cleanly, log warn, drop the truncated tail. Mirrors RocksDB's\nWALRecoveryMode applied to lsm-tree's manifest layer (lsm-tree itself\nhas no WAL — that lives in the parent fjall crate's Journal).\n\n## Scope\n\nThis PR ships the API surface (all 4 variants of the enum) and wires\n\\`AbsoluteConsistency\\` + \\`TolerateCorruptedTailRecords\\` fully. The\nother two — \\`PointInTimeRecovery\\`, \\`SkipAnyCorruptedRecords\\` — are\ndocumented as reserved and currently fall through to\n\\`AbsoluteConsistency\\` behaviour. They land in follow-up PRs so the\nrecovery semantics for each can be reviewed in isolation (and so\n\\`SkipAnyCorruptedRecords\\` can be reviewed alongside the \\`repair_db\\`\ntooling in #303).\n\n## What lands\n\n- \\`ManifestRecoveryMode\\` enum in \\`src/config/mod.rs\\`\n(\\`#[derive(Default)]\\` picks \\`AbsoluteConsistency\\` so existing\nconsumers see zero behaviour change).\n- \\`Config::manifest_recovery_mode(mode)\\` builder + \\`pub(crate)\\`\nfield.\n- \\`recover()\\` in \\`src/version/recovery.rs\\` now takes a \\`mode\\`\nparameter. Per-record reads match on \\`UnexpectedEof\\` and either abort\n(strict) or drop-to-tail (tolerant). The declared-count >\nsection-capacity guard stays a hard fail under strict, downgrades to a\n\\`warn!\\` under tolerant so the per-entry loop can walk what's actually\npresent. Non-tail corruption (bad \\`checksum_type\\` byte) still aborts\nunder tolerant — the mode is for write-incomplete scenarios, not\narbitrary bit-rot. Two top-level \\`warn!\\` summaries log total dropped\nrecord counts.\n- \\`Tree::open\\` plumbs \\`config.manifest_recovery_mode\\` through to\n\\`recover()\\`.\n- Three new unit tests in \\`src/version/recovery.rs#tests\\`:\n- \\`recover_absolute_consistency_rejects_truncated_tables_tail\\` —\nstrict mode still aborts on the new fixture.\n- \\`recover_tolerate_tail_keeps_consistent_prefix_of_tables\\` — tolerant\nmode recovers the consistent prefix (1 entry from a declared-5).\n- \\`recover_tolerate_tail_does_not_swallow_invalid_tag\\` — tolerant mode\nstill aborts on a corrupt \\`checksum_type\\` byte.\n- \\`RecoveredTable\\` and \\`Recovery\\` gain \\`#[derive(Debug)]\\` (needed\nby the new \\`expect_err\\` test assertions).\n\n## Compatibility\n\n- Default behaviour preserved — no on-disk format change, no public API\nremoved. Existing consumers see the same error on the same inputs.\n- New mode is fully opt-in via \\`Config::manifest_recovery_mode(...)\\`.\n\n## Test plan\n\n- [x] Full lsm-tree suite: 1554/1554 pass (1 slow, 1 leaky\npre-existing).\n- [x] Lint clean: \\`cargo clippy --all-targets --all-features -- -D\nwarnings\\`.\n- [x] Three new recovery tests cover the strict-mode preservation,\ntail-tolerant happy path, and the not-a-tail-truncation guard.\n\n## Follow-ups (not in this PR)\n\n- Wire \\`PointInTimeRecovery\\` — recover up to the last fully-consistent\nrecord group.\n- Wire \\`SkipAnyCorruptedRecords\\` — skip each corrupt record\nindividually. Best landed alongside #303 (\\`repair_db\\`) so the two\nsurfaces can be reviewed together.\n- README \\`recovery\\` section describing which mode fits which\ndeployment style.\n\nPart of #299.\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n\n## Summary by CodeRabbit\n\n* **New Features**\n* Added configurable manifest recovery mode to handle corrupt manifest\nfiles during database recovery. Users can now choose between strict\n(default) and tolerant recovery strategies with configurable tradeoffs.\n\n* **Tests**\n* Updated test suite to validate both strict and tolerant manifest\nrecovery behaviors.\n\n<!-- review_stack_entry_start -->\n\n[![Review Change\nStack](https://storage.googleapis.com/coderabbit_public_assets/review-stack-in-coderabbit-ui.svg)](https://app.coderabbit.ai/change-stack/structured-world/coordinode-lsm-tree/pull/317?utm_source=github_walkthrough&utm_medium=github&utm_campaign=change_stack)\n\n<!-- review_stack_entry_end -->\n\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-05-24T11:31:15+03:00",
+          "tree_id": "42cc1ca0cc6f7dd763b02d68a22498fd299cdcf0",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/b2b5fd1a57be4b3287310ccf70d41fe098f80f85"
+        },
+        "date": 1779611525750,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 1756257.087375476,
+            "unit": "ops/sec",
+            "extra": "P50: 0.5us | P99: 1.7us | P99.9: 3.8us\nthreads: 1 | elapsed: 0.11s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1217511.2673210534,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.2us | P99.9: 4.3us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 616121.5023887476,
+            "unit": "ops/sec",
+            "extra": "P50: 1.5us | P99: 4.6us | P99.9: 7.0us\nthreads: 1 | elapsed: 0.32s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3697630.619310051,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 3.0us | P99.9: 5.5us\nthreads: 1 | elapsed: 0.05s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 439279.5719257471,
+            "unit": "ops/sec",
+            "extra": "P50: 2.0us | P99: 5.2us | P99.9: 7.9us\nthreads: 1 | elapsed: 0.46s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 220168.9626818144,
+            "unit": "ops/sec",
+            "extra": "P50: 4.2us | P99: 5.3us | P99.9: 7.4us\nthreads: 1 | elapsed: 0.91s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1249545.368536975,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.3us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1123517.8187791375,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 1.5us | P99.9: 1.9us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 522197.70538808603,
+            "unit": "ops/sec",
+            "extra": "P50: 1.7us | P99: 5.1us | P99.9: 7.6us\nthreads: 1 | elapsed: 0.38s | num: 200000 | iterations: 3"
           }
         ]
       }
