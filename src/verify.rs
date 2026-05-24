@@ -1009,4 +1009,69 @@ mod block_verify_tests {
             report.errors,
         );
     }
+
+    /// Exercises the out-of-band wrapper on a real clean SST file.
+    /// `verify_sst_file` is the entry point sst-dump calls; this pins
+    /// that it stamps `sst_files_scanned = 1`, reports no errors on a
+    /// healthy file, and propagates the block count through the
+    /// `StdFs` -> `scan_sst_blocks` -> `BlockVerifyReport` path.
+    #[test]
+    fn verify_sst_file_clean_file_has_no_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        populate_tree(dir.path(), 1_000);
+        let sst_path = pick_first_sst_path(dir.path());
+
+        let report = verify_sst_file(&sst_path);
+        assert!(
+            report.is_ok(),
+            "expected clean SST to verify with zero errors, got {:?}",
+            report.errors,
+        );
+        assert_eq!(
+            report.sst_files_scanned, 1,
+            "wrapper must always stamp sst_files_scanned = 1",
+        );
+        assert!(
+            report.blocks_scanned > 0,
+            "expected at least one block scanned in a populated SST",
+        );
+    }
+
+    /// Exercises the file-open failure branch (the only path through
+    /// `verify_sst_file` that converts an underlying `io::Error` into
+    /// a `BlockVerifyError::SstFileUnreadable`). A missing file is the
+    /// simplest trigger; an unreadable-due-to-permissions trigger
+    /// would require root or chmod-induced state and is overkill for
+    /// pinning the variant routing.
+    #[test]
+    fn verify_sst_file_missing_file_reports_unreadable() {
+        let missing_path = std::path::Path::new("/this/path/does/not/exist/sst-12345.sst");
+
+        let report = verify_sst_file(missing_path);
+        assert_eq!(
+            report.sst_files_scanned, 1,
+            "wrapper stamps sst_files_scanned = 1 even on file-open failure \
+             so callers see the attempt was made",
+        );
+        assert_eq!(
+            report.blocks_scanned, 0,
+            "no blocks could be walked because the file couldn't be opened",
+        );
+        assert_eq!(
+            report.errors.len(),
+            1,
+            "expected exactly one error, got {:?}",
+            report.errors,
+        );
+        let err = report.errors.first().unwrap();
+        assert!(
+            matches!(
+                err,
+                BlockVerifyError::SstFileUnreadable { table_id: 0, path, .. }
+                    if path == missing_path,
+            ),
+            "expected SstFileUnreadable for {}, got {err:?}",
+            missing_path.display(),
+        );
+    }
 }
