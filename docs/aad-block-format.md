@@ -14,7 +14,7 @@
 - **Block-context binding** via AEAD's Additional Authenticated Data (AAD): the AAD includes the file's `table_id`, the block's `block_offset`, its `block_type`, the compression dictionary id, and the AEAD `suite_id` + `key_epoch`. Swapping a block from a different file, a different offset within the same file, a different block type, or under a different key/suite fails AEAD verification.
 - **Crypto-agility:** the on-disk record carries an explicit `suite_id` byte so a deployment can rotate to a new AEAD without rewriting old data, and so a future suite can be added by registry update alone.
 - **Key rotation without rewrite:** the `key_epoch` byte indexes into a caller-managed key chain. Old blocks under epoch `N` stay readable as long as the corresponding key is still in the chain; new writes pick the latest epoch.
-- **Single-pass decode:** all *on-disk* metadata that feeds the AAD lives at known fixed offsets inside the MetadataFrame. The remaining AAD fields (`TreeID`, `TableID`, `BlockOffset`) are caller-supplied from the read context (the process knows which tree / table / file offset it is reading) and are deliberately NOT on disk; see §4.5 and the "Why not store them on disk" rationale in §5.2. Decode reads the metadata frame once, combines the on-disk fields with the caller-supplied context fields to form AAD, then verifies + decrypts the body frame.
+- **Single-pass decode:** all *on-disk* metadata that feeds the AAD lives at known fixed offsets inside the MetadataFrame. The remaining AAD fields (`TreeID`, `TableID`, `BlockOffset`) are caller-supplied from the read context (the process knows which tree / table / file offset it is reading) and are deliberately NOT on disk; see §5.3 (the caller-supplied vs on-disk contract) and the "Why not store them on disk" rationale in §5.1. Decode reads the metadata frame once, combines the on-disk fields with the caller-supplied context fields to form AAD, then verifies + decrypts the body frame.
 - **Zstd-skippable framing:** the on-disk record uses the [Zstandard skippable frame](https://datatracker.ietf.org/doc/html/rfc8878#section-3.1.1) magic range `0x184D2A50..0x184D2A5F`. A reader that doesn't understand encrypted blocks (e.g. a plain `zstd` CLI on the payload region) skips over them cleanly instead of corrupting on parse.
 
 ## 2. Non-goals
@@ -402,10 +402,10 @@ The on-disk Nonce field length is **determined by SuiteID via this registry**. D
 
 Adding a new suite requires:
 1. Allocating a SuiteID byte in the registry (above table).
-2. Specifying key size, effective nonce length, and tag length.
+2. Specifying key size and effective nonce length. **The on-disk authentication tag is locked at 16 bytes per §4.7**; the registry's tag column documents the suite's natural tag width for cross-reference, but the on-disk field is fixed-width and a new suite MUST emit a 16-byte tag on disk. A suite whose primitive cannot produce (or be safely truncated to) 16 bytes is not eligible under the v1 format and would require a format version revision before it could be registered here.
 3. Updating the conformance test suite (#253) with at least one test vector per block type.
 
-A new suite does NOT require a format version bump, readers select the suite from the `SuiteID` byte at decode time. Old blocks under the old suite remain readable as long as the implementation links the corresponding AEAD primitive.
+A new suite does NOT require a format version bump (provided the 16-byte-tag constraint above is met), readers select the suite from the `SuiteID` byte at decode time. Old blocks under the old suite remain readable as long as the implementation links the corresponding AEAD primitive.
 
 ## 8. Security properties
 
