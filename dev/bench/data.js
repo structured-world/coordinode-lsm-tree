@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779640287129,
+  "lastUpdate": 1779642825003,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -9126,6 +9126,84 @@ window.BENCHMARK_DATA = {
             "value": 474936.624278755,
             "unit": "ops/sec",
             "extra": "P50: 1.9us | P99: 5.4us | P99.9: 8.1us\nthreads: 1 | elapsed: 0.42s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "1e8f4123d673214369f9104e3b63d757c6f24f89",
+          "message": "docs(encryption): AAD-bound encrypted block wire format spec (#250) (#318)\n\n## Summary\n\nWrites the v1 wire-format spec for AAD-bound encrypted SST blocks at\n`docs/aad-block-format.md`. Pure documentation — no code changes.\nUnblocks the implementation issues (#251 encoder/decoder, #253\nconformance tests, #254 ECC parity, #255 lazy repair, #256 forensics\nCLI, #257 partial decode).\n\nThe spec locks:\n\n- **Outer framing:** two zstd-skippable frames per block (metadata +\nbody), magics `0x184D2A50` / `0x184D2A51` from the RFC 8878 user-defined\nrange. Unknown-to-reader frames skip cleanly.\n- **AAD layout:** 38 bytes binding `magic_metadata`, `header_byte`,\n`key_epoch`, `block_type`, `suite_id`, `compression_type`, `tree_id`,\n`table_id`, `block_offset`, `dict_id`, `window_log`. `tree_id` /\n`table_id` / `block_offset` are caller-supplied from read context\n(owning Tree, SST file path, seek cursor) and NOT stored on disk; the\non-disk MetadataFrame payload is 38 bytes (HeaderByte, KeyEpoch,\nBlockType, SuiteID, CompressionType, DictID, WindowLog, Nonce [12 B for\nv1 suites; suite-defined via §7 registry], AEADTag). Defeats bit-flip,\nblock swap (intra-file via `block_offset`, inter-file via `table_id`,\ncross-tree via `tree_id`), block-type relabel, codec relabel (e.g. zstd\nto lz4 swap), codec / library / version-drift bugs (via codec built-in\ncontent checksum, §4.11), dict substitution, decompression bomb,\nkey-epoch downgrade, suite downgrade, AAD format substitution.\n- **Suite registry:** `0x02 = AES-256-GCM`, `0x03 = ChaCha20-Poly1305`.\nNew suites slot in without a format bump.\n- **Inner-frame integrity:** `dict_id` / `window_log` enforcement\ndelegated to structured-zstd's `FrameDecoder::expect_dict_id` /\n`expect_window_log`.\n- **Endianness:** outer framing LE (RFC 8878 mandate); AAD payload BE\n(TLS/AEAD convention).\n- **Forward-compat:** `HeaderByte` reserves a low nibble; magic range\n`0x184D2A54..5F` reserved for spec v2 / ECC / future frames.\n\nAcceptance criteria from #250:\n\n- [x] Spec published under `docs/` (lsm-tree has no `arch/`; `docs/` is\nthe convention for crate-level reference)\n- [x] ABNF grammar per RFC 5234\n- [x] 5 attack scenarios documented with the defending AAD field for\neach\n- [x] 5 reference test vectors (3 positive, 2 negative)\n- [x] Hex-dump worked example for a minimum-size Data block\n- [x] Magic allocation table for `0x184D2A50..0x184D2A5F`\n- [x] Suite registry with extension procedure\n- [x] Open questions section (replay defence, nonce policy, suite\ngrowth, header-only verify)\n\nKnown gaps documented in spec §3 and §12:\n\n- **Per-block replay within a single SST is not defended at the AEAD\nlayer** (same tuple, same content). Manifest XXH3 + SFA TOC catch\nfile-level / section-level swaps. Per-block generation counter deferred\nto spec v2 (4 bytes in AAD).\n- **Key-disclosure recovery** is a non-goal (caller-managed key chain).\n\n## Test plan\n\n- [x] Em-dash check: `grep -c '—' docs/aad-block-format.md` returns 0\n- [x] Leak check: `grep -nE 'CLAUDE\\.md|R[0-9]{3,}|G[0-9]{3,}'\ndocs/aad-block-format.md` returns no matches\n- [x] No code changes - no build / test impact\n- [ ] Reviewer: confirm magic range allocation does not collide with any\ncurrent or planned skippable-frame usage in the codebase (`grep -r\n'0x184D2A5' src/`)\n- [ ] Reviewer: confirm §5.1 wording — `WindowLog` stores the RAW base-2\nwindow log (u8 log2, range 10..=31), NOT the encoded RFC 8878 §3.1.1.1.2\n`Window_Descriptor` byte. structured-zstd 's `expect_window_log` decodes\nthe descriptor byte and compares the decoded log against the AAD-bound\nlimit (S-ZSTD-T7 + #251).\n- [ ] Reviewer: confirm structured-zstd hooks (`expect_dict_id`,\n`expect_window_log`) referenced in §4.9 / §8 exist or are tracked in\nstructured-zstd S-ZSTD-T7\n\nCloses #250\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n\n## Summary by CodeRabbit\n\n* **Documentation**\n* Added comprehensive specification document detailing the AAD-bound\nencrypted block wire format, including on-disk layout structure,\nvalidation rules, AEAD suite registry, test vectors, and implementation\nguidance.\n\n<!-- review_stack_entry_start -->\n\n[![Review Change\nStack](https://storage.googleapis.com/coderabbit_public_assets/review-stack-in-coderabbit-ui.svg)](https://app.coderabbit.ai/change-stack/structured-world/coordinode-lsm-tree/pull/318?utm_source=github_walkthrough&utm_medium=github&utm_campaign=change_stack)\n\n<!-- review_stack_entry_end -->\n\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-05-24T20:12:52+03:00",
+          "tree_id": "7c06751e5f35ebf38f914a039bccd961ec0b4f01",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/1e8f4123d673214369f9104e3b63d757c6f24f89"
+        },
+        "date": 1779642823507,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 1960963.2227818745,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.7us | P99.9: 3.8us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1161758.974651976,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.2us | P99.9: 4.5us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 577332.1706132839,
+            "unit": "ops/sec",
+            "extra": "P50: 1.6us | P99: 4.8us | P99.9: 7.4us\nthreads: 1 | elapsed: 0.35s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3675239.1804312184,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 3.1us | P99.9: 5.8us\nthreads: 1 | elapsed: 0.05s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 414162.39062980784,
+            "unit": "ops/sec",
+            "extra": "P50: 2.1us | P99: 5.4us | P99.9: 8.2us\nthreads: 1 | elapsed: 0.48s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 222181.7999467519,
+            "unit": "ops/sec",
+            "extra": "P50: 4.2us | P99: 5.3us | P99.9: 7.8us\nthreads: 1 | elapsed: 0.90s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1197557.5621909904,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.2us | P99.9: 4.5us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1112728.3319232562,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 1.5us | P99.9: 1.9us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 489170.8686097784,
+            "unit": "ops/sec",
+            "extra": "P50: 1.8us | P99: 6.4us | P99.9: 9.6us\nthreads: 1 | elapsed: 0.41s | num: 200000 | iterations: 3"
           }
         ]
       }
