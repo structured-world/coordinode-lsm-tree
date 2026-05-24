@@ -592,7 +592,7 @@ impl Writer {
 
         // Write index
         log::trace!("Finishing index writer");
-        let index_block_count = self.index_writer.finish(&mut self.file_writer)?;
+        let (index_block_count, tli_bytes) = self.index_writer.finish(&mut self.file_writer)?;
 
         // Write filter
         log::trace!("Finishing filter writer");
@@ -759,6 +759,57 @@ impl Writer {
         // sections between them).
         self.file_writer.start("meta_separator")?;
         self.file_writer.write_all(&[0u8; 4096])?;
+
+        // TLI mirror near the file tail. The head `tli` section was
+        // emitted earlier in `finish()` by `index_writer.finish()` —
+        // after `data` and the partitioned `index` sub-blocks (if any)
+        // but before `filter` / `filter_tli` / `range_tombstones` /
+        // `meta_mid` / `linked_blob_files` / `table_version` /
+        // `meta_separator`. So the head copy lives in the middle of
+        // the file, and `tli_tail` lives after `meta_separator` and
+        // before the canonical `meta` section. Several KiB of
+        // unrelated sections plus the 4 KiB `meta_separator`
+        // guarantee the two copies land in different 4 KiB
+        // filesystem sectors (for any typical table they are
+        // hundreds of KiB to MiB apart). A torn-write or bad sector
+        // at either end leaves the other copy intact. Reader prefers the tail
+        // copy on open and transparently falls back to the head copy
+        // on decode/checksum/decrypt failure. Re-encodes the same
+        // `tli_bytes` returned by `index_writer.finish()` so the two
+        // sections decode to the same logical TLI. Both copies MUST
+        // be written with the same `CompressionType` (this call uses
+        // `self.index_block_compression`, identical to what the
+        // partitioned/full index writer used for the head): the block
+        // header does not record the compression tag, so the reader
+        // supplies a single `CompressionType` from table metadata
+        // when decoding either copy. If the two were written under
+        // different codecs, at least one copy would be undecodable.
+        // The encryption nonce differs per `Block::write_into` call,
+        // so the resulting ciphertext differs byte-for-byte across
+        // the two copies, but both decrypt to the same plaintext
+        // IndexBlock.
+        // `block_offset` is held at 0 to match the head copy's
+        // BlockIdentity (`partitioned::write_top_level_index` /
+        // `full::finish` both encode with offset=0); once #251 wires
+        // real offsets into AAD this needs to thread the tail SFA
+        // section offset alongside the head one.
+        self.file_writer.start("tli_tail")?;
+        Block::write_into(
+            &mut self.file_writer,
+            &tli_bytes,
+            crate::table::block::BlockIdentity {
+                tree_id: 0,
+                table_id: self.table_id,
+                block_offset: 0,
+                block_type: crate::table::block::BlockType::Index,
+                dict_id: 0,
+                window_log: 0,
+            },
+            self.index_block_compression,
+            self.encryption.as_deref(),
+            #[cfg(zstd_any)]
+            None,
+        )?;
 
         // TAIL meta — the canonical, authoritative copy. `file_size`
         // is the LOGICAL size up to the end of the data blocks

@@ -22,28 +22,59 @@ fn toc_entry_to_handle(entry: &TocEntry) -> BlockHandle {
 
 /// The regions block stores offsets to the different table file "regions"
 ///
-/// ----------------
-/// |     data     | <- implicitly start at 0
-/// |--------------|
-/// |      tli     |
-/// |--------------|
-/// |     index    | <- may not exist (if full block index is used, TLI will be dense)
-/// |--------------|
-/// |    filter    | <- may not exist
-/// |--------------|
-/// |  range_tomb  | <- may not exist
-/// |--------------|
-/// | linked blobs | <- may not exist
-/// |--------------|
-/// |     meta     |
-/// |--------------|
-/// |     toc      |
-/// |--------------|
-/// |   trailer    | <- fixed size
-/// |--------------|
+/// ```text
+/// --------------------
+/// |       data       | <- implicitly start at 0
+/// |------------------|
+/// |       index      | <- partitioned only: sub-index blocks
+/// |                  |    (full-index tables emit only `tli` below)
+/// |------------------|
+/// |        tli       | <- head copy (top-level index)
+/// |------------------|
+/// |      filter      | <- may not exist
+/// |------------------|
+/// |    filter_tli    | <- partitioned filter only
+/// |------------------|
+/// | range_tombstones | <- may not exist
+/// |------------------|
+/// |     meta_mid     | <- mirror of meta
+/// |------------------|
+/// | linked_blob_files| <- may not exist
+/// |------------------|
+/// |   table_version  |
+/// |------------------|
+/// |  meta_separator  | <- 4 KiB zero padding
+/// |------------------|
+/// |     tli_tail     | <- mirror of tli
+/// |------------------|
+/// |       meta       |
+/// |------------------|
+/// |        toc       |
+/// |------------------|
+/// |      trailer     | <- fixed size
+/// |------------------|
+/// ```
+///
+/// Writer emission order matches the diagram top-to-bottom. For the
+/// partitioned index path (`PartitionedIndexWriter::finish`) the
+/// `index` section is written first, then `tli`; the full-index
+/// path (`FullIndexWriter::finish`) skips `index` and emits only
+/// `tli`. Same pattern for filters: partitioned writes `filter`
+/// then `filter_tli`, full writes only `filter`.
 #[derive(Copy, Clone, Debug, Default)]
 pub struct ParsedRegions {
     pub tli: BlockHandle,
+    /// Tail-side mirror of the TLI block. Head copy lives in the
+    /// `tli` section earlier in the file (after `data` and the
+    /// partitioned `index` sub-blocks if any, before `filter` /
+    /// `filter_tli` / `range_tombstones`); this copy lives near the
+    /// file tail, after `meta_separator`
+    /// and before `meta`. A torn-write or bad sector at either
+    /// position leaves the other copy intact. Reader prefers the
+    /// tail copy on open and transparently falls back to the head
+    /// copy on decode/checksum/decrypt failure. Absent on tables
+    /// written before the TLI-mirror change.
+    pub tli_tail: Option<BlockHandle>,
     pub index: Option<BlockHandle>,
     pub filter_tli: Option<BlockHandle>,
     pub filter: Option<BlockHandle>,
@@ -51,10 +82,11 @@ pub struct ParsedRegions {
     pub linked_blob_files: Option<BlockHandle>,
     pub metadata: BlockHandle,
     /// Mid-file backup of the meta block. Writer order:
-    /// `data` → `tli` → `index?` → `filter_tli?` → `filter?` →
+    /// `data` → `index?` → `tli` → `filter?` → `filter_tli?` →
     /// `range_tombstones?` → **`meta_mid`** →
     /// `linked_blob_files?` → `table_version` → `meta_separator` →
-    /// `meta`. Absent on tables written before the meta-mirror change.
+    /// `tli_tail` → `meta`. Absent on tables written before the
+    /// meta-mirror change.
     /// Defends against torn-write at the file tail (incomplete fsync):
     /// MID lives several KiB before TAIL, with a 4 KiB
     /// `meta_separator` section between them to guarantee a fresh
@@ -73,6 +105,7 @@ impl ParsedRegions {
                     log::error!("TLI should exist");
                     crate::Error::Unrecoverable
                 })?,
+            tli_tail: toc.section(b"tli_tail").map(toc_entry_to_handle),
             index: toc.section(b"index").map(toc_entry_to_handle),
             filter: toc.section(b"filter").map(toc_entry_to_handle),
             range_tombstones: toc.section(b"range_tombstones").map(toc_entry_to_handle),
