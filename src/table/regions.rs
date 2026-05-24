@@ -50,10 +50,15 @@ pub struct ParsedRegions {
     pub range_tombstones: Option<BlockHandle>,
     pub linked_blob_files: Option<BlockHandle>,
     pub metadata: BlockHandle,
-    /// Mid-file backup of the meta block, written between the filter
-    /// region and `linked_blob_files`. Absent on tables written before
-    /// the meta-mirror change; defends against torn-write at the file
-    /// tail because it lives at ~95% of the eventual file position.
+    /// Mid-file backup of the meta block. Writer order:
+    /// `data` → `tli` → `index?` → `filter_tli?` → `filter?` →
+    /// `range_tombstones?` → **`meta_mid`** →
+    /// `linked_blob_files?` → `table_version` → `meta_separator` →
+    /// `meta`. Absent on tables written before the meta-mirror change.
+    /// Defends against torn-write at the file tail (incomplete fsync):
+    /// MID lives several KiB before TAIL, with a 4 KiB
+    /// `meta_separator` section between them to guarantee a fresh
+    /// filesystem sector boundary.
     pub metadata_mid: Option<BlockHandle>,
 }
 

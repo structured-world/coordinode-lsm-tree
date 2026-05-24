@@ -646,9 +646,14 @@ impl Writer {
         }
 
         // Snapshot all meta fields once — reused for both MID and TAIL
-        // copies. Borrowing the keys from `self.meta` here is fine
-        // because `self.range_tombstones` is the only field consumed
-        // before the TAIL write, and we capture only its `.len()`.
+        // copies. Borrowing `first_key` / `last_key` from `self.meta`
+        // here is fine because neither the MID write nor any of the
+        // intermediate tail sections (`linked_blob_files`,
+        // `table_version`, `meta_separator`) touch `self.meta`'s key
+        // buffers — those stay owned by `self` through to the TAIL
+        // write. Note that `self.index_writer` and `self.filter_writer`
+        // are already moved by the `.finish()` calls above; we don't
+        // touch them again here.
         #[expect(clippy::expect_used, reason = "non-empty table guaranteed earlier")]
         let first_key = self
             .meta
@@ -708,11 +713,15 @@ impl Writer {
         };
 
         // MID meta copy — defends against torn-write at the file tail
-        // (incomplete fsync). MID sits at ~95% of the eventual file
-        // position, far from the tail's last-write region. `file_size`
-        // is `*self.meta.file_pos` so MID and TAIL encode identical
-        // values: `file_pos` is only ever bumped inside `spill_block`,
-        // so it doesn't change between the two writes.
+        // (incomplete fsync). Written at the current writer cursor,
+        // after `range_tombstones` and before
+        // `linked_blob_files` / `table_version` / `meta_separator` /
+        // `meta`. The 4 KiB `meta_separator` between MID and TAIL
+        // guarantees the two copies land on different filesystem
+        // sectors. `file_size` is `*self.meta.file_pos` so MID and
+        // TAIL encode identical values: `file_pos` is only ever bumped
+        // inside `spill_block`, so it doesn't change between the two
+        // writes.
         write_meta_section(
             &mut self.file_writer,
             &mut self.block_buffer,
