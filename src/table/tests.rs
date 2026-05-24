@@ -1535,6 +1535,72 @@ fn table_global_seqno() -> crate::Result<()> {
     Ok(())
 }
 
+/// Pins `Table::get` returning items with **global** seqno coordinates
+/// even when the on-disk block carries `seqno = 0`. Mirrors the upstream
+/// regression test for the equivalent fix in fjall-rs/lsm-tree (commit
+/// bad4fe0a). Our fork's structural fix lives at the `Table::get` /
+/// `get_with_block` / `batch_get` boundary (each call site adds
+/// `global_seqno` back via `saturating_add` after the table-local
+/// `point_read`), rather than inside `point_read` itself, but the
+/// caller-observable contract is the same: a recovered ingested item
+/// is returned with its effective global seqno, not the on-disk
+/// table-local seqno.
+///
+/// A regression that drops the `saturating_add(global_seqno)` step
+/// (e.g. a refactor that flattens `point_read` directly into `get`
+/// without re-applying the offset) would fail this test by returning
+/// `seqno = 0` instead of `seqno = SEQNO`.
+#[test]
+#[expect(clippy::unwrap_used, reason = "test assertions")]
+fn table_return_global_seqno() -> crate::Result<()> {
+    use crate::ValueType::Value;
+    use crate::fs::StdFs;
+
+    const SEQNO: SeqNo = 15;
+
+    let items = [InternalValue::from_components("abc", "abc", 0, Value)];
+
+    let dir = tempfile::tempdir()?;
+    let file = dir.path().join("table_fuzz");
+
+    let mut writer = crate::table::Writer::new(file.clone(), 0, 0, Arc::new(StdFs))?;
+
+    for item in items {
+        writer.write(item)?;
+    }
+
+    let _trailer = writer.finish()?;
+
+    let table = crate::Table::recover(
+        file,
+        crate::Checksum::from_raw(0),
+        SEQNO,
+        0,
+        Arc::new(crate::Cache::with_capacity_bytes(0)),
+        Some(Arc::new(crate::DescriptorTable::new(10))),
+        Arc::new(StdFs),
+        true,
+        true,
+        None,
+        #[cfg(zstd_any)]
+        None,
+        crate::comparator::default_comparator(),
+        #[cfg(feature = "metrics")]
+        Arc::default(),
+    )?;
+
+    // On disk: seqno = 0. Effective global seqno: 0 + SEQNO = SEQNO.
+    // Snapshot = 2 * SEQNO is above the effective seqno, so the read sees the item.
+    // Returned value MUST carry the effective global seqno (= SEQNO),
+    // not the table-local seqno (= 0) it has on disk.
+    assert_eq!(
+        InternalValue::from_components("abc", "abc", SEQNO, Value),
+        table.get(b"abc", 2 * SEQNO, hash64(b"abc"))?.unwrap(),
+    );
+
+    Ok(())
+}
+
 /// Build a [`Block`] from raw bytes for `decode_range_tombstones` tests.
 #[expect(
     clippy::expect_used,
