@@ -477,6 +477,61 @@ pub fn verify_block_checksums(tree: &impl crate::AbstractTree) -> BlockVerifyRep
     report
 }
 
+/// Out-of-band variant of [`verify_block_checksums`].
+///
+/// Walks one SST file directly from a filesystem path, without
+/// needing a live `Tree` or the version manifest. Intended for
+/// offline diagnostic tools (`tools/sst-dump verify`, `repair_db`,
+/// forensics CLIs) that operate on a single file in isolation — for
+/// example when the manifest itself is corrupt or the surrounding
+/// tree directory has been moved.
+///
+/// Uses [`StdFs`](crate::fs::StdFs) (the only `Fs` backend that
+/// makes sense for an out-of-band tool — `MemFs` / `IoUring` trees
+/// never produce files at real filesystem paths) and stamps
+/// `table_id = 0` in error reports. The caller's downstream
+/// filtering / logging should refer to the file by path, not by
+/// table id.
+///
+/// AEAD overhead is conservatively assumed to be zero: out-of-band
+/// tools don't carry the per-table encryption provider that would let
+/// them recover the real `max_overhead()`. Encrypted SSTs near the
+/// 256 MiB plaintext ceiling may therefore false-flag as
+/// [`BlockVerifyError::HeaderCorrupted`]. In practice block sizes are
+/// typically a few KiB, so this only matters on artificially-
+/// constructed huge blocks; encrypted-aware verification should go
+/// through [`verify_block_checksums`] on a live tree.
+///
+/// The returned [`BlockVerifyReport`] has `sst_files_scanned == 1`
+/// (always) plus per-block errors collected during the walk.
+#[cfg(feature = "std")]
+#[must_use]
+pub fn verify_sst_file(path: &std::path::Path) -> BlockVerifyReport {
+    use crate::fs::StdFs;
+
+    let fs = StdFs;
+    let mut report = BlockVerifyReport {
+        sst_files_scanned: 1,
+        ..BlockVerifyReport::default()
+    };
+
+    match scan_sst_blocks(&fs, path, 0, 0) {
+        Ok(per_file) => {
+            report.blocks_scanned = per_file.blocks_scanned;
+            report.errors = per_file.errors;
+        }
+        Err(error) => {
+            report.errors.push(BlockVerifyError::SstFileUnreadable {
+                table_id: 0,
+                path: path.to_path_buf(),
+                error,
+            });
+        }
+    }
+
+    report
+}
+
 struct PerFileScan {
     blocks_scanned: usize,
     errors: Vec<BlockVerifyError>,
