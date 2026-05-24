@@ -333,11 +333,12 @@ fn run_properties(path: &std::path::Path) -> ExitCode {
 }
 
 /// Renders a user key as a single line, escaping non-printable bytes.
-/// Pure ASCII keys are printed verbatim so the common "user-set
-/// alphanumeric prefix" stays readable; bytes outside 0x20..0x7e are
-/// rendered as `\xNN` escapes; backslashes are doubled. This is the
-/// same format `xxd`'s ASCII gutter uses minus the dot-replacement,
-/// preserving every byte unambiguously for round-trip diagnostic use.
+/// Output is always wrapped in double quotes. Printable ASCII
+/// bytes (0x20..=0x7e) other than `"` and `\` are passed through
+/// verbatim so the common "user-set alphanumeric prefix" stays
+/// readable. `"` and `\` are escaped as `\"` and `\\` so the quoted
+/// form round-trips unambiguously. Every other byte (control chars,
+/// high-bit-set bytes) is rendered as a `\xNN` hex escape.
 fn format_key(key: &[u8]) -> String {
     let mut out = String::with_capacity(key.len() + 2);
     out.push('"');

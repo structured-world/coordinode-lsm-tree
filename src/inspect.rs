@@ -27,9 +27,15 @@ use std::path::Path;
 /// Read-only snapshot of an SST file's stored metadata.
 ///
 /// Constructed by [`read_table_properties`]; not directly creatable by
-/// external callers. Fields mirror the on-disk meta block (see
-/// `src/table/writer/mod.rs::write_meta_section`). `#[non_exhaustive]`
-/// so new fields can be added in a minor version bump.
+/// external callers. Fields are a stable, documented subset of the
+/// on-disk meta block (see
+/// `src/table/writer/mod.rs::write_meta_section` for the full set of
+/// emitted entries). The internal `ParsedMeta` parser carries
+/// additional fields — notably the seqno range — that are not yet
+/// exposed here; those are tracked as a separate API surface to keep
+/// the public contract small while the meta layout still evolves.
+/// `#[non_exhaustive]` so new fields can be added in a minor version
+/// bump.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct TableProperties {
@@ -78,11 +84,16 @@ pub struct TableProperties {
 /// Reads `path` and returns its on-disk metadata as
 /// [`TableProperties`].
 ///
-/// Opens the file through [`StdFs`] (sst-dump is a real-filesystem
-/// tool; `MemFs` / `IoUring` trees never have a real path), parses the
-/// SFA trailer to locate the `meta` and optional `meta_mid` sections,
-/// then decodes the meta block via the same `ParsedMeta` machinery
-/// `Table::recover` uses on a live tree open.
+/// Always opens through [`StdFs`]: this is a path-based out-of-band
+/// helper, not tied to a live `Tree`'s configured `Fs` backend.
+/// `IoUringFs` also operates on real on-disk paths and would work
+/// here mechanically; the reason for not threading the backend
+/// through is that the caller (typically a diagnostic CLI) starts
+/// from a filesystem path with no `Tree` in scope, so `StdFs` is
+/// always the right default. Parses the SFA trailer to locate the
+/// `meta` and optional `meta_mid` sections, then decodes the meta
+/// block via the same `ParsedMeta` machinery `Table::recover` uses
+/// on a live tree open.
 ///
 /// Recovery semantics mirror [`Table::recover`](crate::Table):
 /// the canonical tail `meta` section is tried first; on
@@ -96,6 +107,23 @@ pub struct TableProperties {
 /// SSTs will fail to decode their meta block here. Encrypted-aware
 /// property inspection is tracked under #251 / #256 once the
 /// AAD-bound wire format lands.
+///
+/// # Errors
+///
+/// Returns an error if:
+/// - the file cannot be opened or read (`std::io::Error`),
+/// - the SFA trailer is missing / malformed and cannot be parsed to
+///   locate the `meta` / `meta_mid` sections,
+/// - the canonical tail `meta` block fails to decode AND either the
+///   `meta_mid` section is absent or the mid copy also fails to
+///   decode (block header / XXH3 / structural mismatch). In the
+///   both-copies-fail case the original tail error is returned and
+///   the mid failure is dropped on the floor (no diagnostic logging
+///   here — callers wanting per-copy attribution should walk the
+///   meta sections themselves),
+/// - the table is encrypted: this function does not take an
+///   encryption provider, so the AEAD-protected meta block fails to
+///   decode and the failure surfaces as a regular decrypt error.
 #[cfg(feature = "std")]
 pub fn read_table_properties(path: &Path) -> crate::Result<TableProperties> {
     let fs = StdFs;
