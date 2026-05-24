@@ -30,7 +30,7 @@
 | Threat | Defended? | Defending mechanism |
 |---|---|---|
 | Random bit flip in encrypted payload (bit-rot, bad sector) | Yes | AEAD tag mismatch on decrypt → `crate::Error::Decrypt(&'static str)` |
-| Random bit flip in AAD-bound disk bytes (suite_id, key_epoch, block_type, dict_id, window_log) | Yes | AAD mismatch on decrypt, same `Error::Decrypt` surface, distinguishable by the static reason string in the per-block error context. (The caller-supplied AAD fields `tree_id`, `table_id`, `block_offset` are not on disk, so they cannot be bit-flipped at rest; they can only fail to match if the reader supplies wrong context.) |
+| Random bit flip in AAD-bound disk bytes (suite_id, key_epoch, block_type, dict_id, window_log) | Yes | AAD mismatch on decrypt. AEAD verification fails as a single opaque tag-mismatch event under `crate::Error::Decrypt`, NOT a per-field diagnostic: the cipher cannot tell whether the flipped byte was in the ciphertext or in one of the AAD-mirrored disk bytes. Per-field attribution would require typed decrypt errors, which is a follow-up tracked in #251. (The caller-supplied AAD fields `tree_id`, `table_id`, `block_offset` are not on disk, so they cannot be bit-flipped at rest; they can only fail to match if the reader supplies wrong context.) |
 | **Block swap** within the same file (move block N's bytes to offset M, M ≠ N) | Yes | AAD carries caller-supplied `block_offset`; decrypt at the wrong offset fails because the reader's seek position doesn't match what the writer used. |
 | **Block swap** across files in the same tree (move a block from file A to file B) | Yes | AAD carries caller-supplied `table_id` (derived from the SST file's path / table metadata); decrypt under the wrong table_id fails. |
 | **Block swap** across trees (same encryption key reused, colliding per-tree `table_id` values) | Yes | AAD carries caller-supplied `tree_id` paired with `table_id`. `table_id` alone is per-tree in this codebase, so the pair `(tree_id, table_id)` gives the globally unique block identity. Substitution under the wrong tree_id fails. |
@@ -117,7 +117,7 @@ Total  57 bytes on disk (8-byte framing header + 49-byte payload)
 
 **On-disk minimalism.** The MetadataFrame on disk carries ONLY the fields the decoder needs *before* it can construct the AAD: the version byte, the key epoch (so the right key is selected), the block type (mirrors the existing `Header` pattern), the AEAD suite id (so the right primitive is selected), the compression-context fields (`DictID` + `WindowLog`, which can vary per block and which the decoder must know to bind the AAD before any decompression / decryption work), the nonce, and the AEAD tag. Three further identifiers (`TreeID`, `TableID`, `BlockOffset`) participate in the AAD but are **NOT** stored on disk: they are caller-supplied from the read context (the owning `Tree`, the SST file's per-tree `TableId`, and the read cursor's byte position). See §5.3.
 
-**Why not store them on disk.** Industry-standard LSMs (RocksDB / LevelDB / Pebble) put zero identity bytes in per-block headers: a per-block trailer is 5 bytes total (1 byte compression + 4 byte checksum). Block identity is purely positional , the SST footer points at the index, the index gives `BlockHandle { offset, size }`, and the file's path/manifest gives the table id. The same model applies here: spending 24 bytes per block on `TreeID + TableID + BlockOffset` would duplicate context the caller already has at decrypt time, and it would be cryptographically *weaker* than the AAD binding it would replace (a tamperer could just patch the on-disk bytes; tampering with the AAD-bound values is infeasible). Orphan-block forensics is addressed at the per-file layer (the META blocks introduced in #295 carry the file-level identity), not by fattening every block header.
+**Why not store them on disk.** Industry-standard LSMs (RocksDB / LevelDB / Pebble) put zero identity bytes in per-block headers: a per-block trailer is 5 bytes total (1 byte compression + 4 byte checksum). Block identity is purely positional: the SST footer points at the index, the index gives `BlockHandle { offset, size }`, and the file's path/manifest gives the table id. The same model applies here: spending 24 bytes per block on `TreeID + TableID + BlockOffset` would duplicate context the caller already has at decrypt time, and it would be cryptographically *weaker* than the AAD binding it would replace (a tamperer could just patch the on-disk bytes; tampering with the AAD-bound values is infeasible). Orphan-block forensics is addressed at the per-file layer (the META blocks introduced in #295 carry the file-level identity), not by fattening every block header.
 
 ### 5.2 BodyFrame
 
@@ -136,7 +136,7 @@ Total  8 + N bytes on disk
 
 ### 5.3 AAD construction
 
-The AEAD's Additional Authenticated Data is constructed by the writer immediately before encrypting the body, and reconstructed by the reader immediately before decrypting. AAD is **NEVER** written to disk , both sides construct it from a mix of disk-mirrored fields (which the decoder has just read from the MetadataFrame) and caller-supplied fields (which the decoder knows from its read context: the owning `Tree`, the SST file's path-derived `TableId`, the seek offset):
+The AEAD's Additional Authenticated Data is constructed by the writer immediately before encrypting the body, and reconstructed by the reader immediately before decrypting. AAD is **NEVER** written to disk; both sides construct it from a mix of disk-mirrored fields (which the decoder has just read from the MetadataFrame) and caller-supplied fields (which the decoder knows from its read context: the owning `Tree`, the SST file's path-derived `TableId`, the seek offset):
 
 ```text
 Offset  Size  Field             Source
@@ -151,7 +151,10 @@ Offset  Size  Field             Source
 6       1     BlockType         Mirror of MetadataFrame offset 10 (disk)
 7       1     SuiteID           Mirror of MetadataFrame offset 11 (disk)
 8       8     TreeID            u64 BE, caller-supplied from the owning
-                                Tree's id (`Tree.inner.id`). NOT on disk:
+                                Tree's id (`AbstractTree::id()`, the
+                                accessor method on the trait that both
+                                `Tree` and `BlobTree` implement).
+                                NOT on disk:
                                 a process knows which tree it opened. `0`
                                 is the allowed-zero default at call sites
                                 that haven't plumbed tree_id yet, falling
@@ -179,7 +182,7 @@ Offset  Size  Field             Source
 Total  37 bytes (NEVER written to disk, passed to AEAD as AAD only)
 ```
 
-**Disk vs caller-supplied , the contract.** Fields marked "mirror of MetadataFrame offset X (disk)" are read from the on-disk MetadataFrame the decoder has just parsed. Fields marked "caller-supplied" are passed in by the calling code from its own context (`BlockIdentity` struct in `src/table/block/identity.rs`). The writer feeds *the same values* from its own context into AAD construction. The AEAD's authentication tag binds all 37 bytes together: an attacker who modifies any disk byte, or who relocates a block to a different file / different offset, produces an AAD that doesn't match the one the AEAD was sealed under, and decryption fails.
+**Disk vs caller-supplied: the contract.** Fields marked "mirror of MetadataFrame offset X (disk)" are read from the on-disk MetadataFrame the decoder has just parsed. Fields marked "caller-supplied" are passed in by the calling code from its own context (`BlockIdentity` struct in `src/table/block/identity.rs`). The writer feeds *the same values* from its own context into AAD construction. The AEAD's authentication tag binds all 37 bytes together: an attacker who modifies any disk byte, or who relocates a block to a different file / different offset, produces an AAD that doesn't match the one the AEAD was sealed under, and decryption fails.
 
 The `Nonce` and `AEADTag` fields are **not** part of the AAD, they're the AEAD's nonce and tag inputs, respectively.
 
@@ -205,7 +208,7 @@ These checks are not AEAD-authenticated, but they bound the attack surface so th
 ;; semantics) and MUST NOT reject the block on their presence.
 encrypted-block   = metadata-frame body-frame *optional-frame
 
-optional-frame    = optional-magic optional-payload-len *OCTET
+optional-frame    = optional-magic optional-payload-len optional-payload
 optional-magic    = %x52.2A.4D.18                  ; 0x184D2A52 (EccFrame, #254)
                   / %x53.2A.4D.18                  ; 0x184D2A53 (reserved, future)
                   / %x54.2A.4D.18                  ; 0x184D2A54 (reserved, future)
@@ -216,6 +219,10 @@ optional-magic    = %x52.2A.4D.18                  ; 0x184D2A52 (EccFrame, #254)
                   / %x5D.2A.4D.18 / %x5E.2A.4D.18
                   / %x5F.2A.4D.18
 optional-payload-len = 4OCTET                       ; u32 LE
+optional-payload  = *OCTET                          ; opaque bytes, length
+                                                   ; constraint enforced
+                                                   ; outside the grammar
+                                                   ; (see prose below)
 
 metadata-frame    = metadata-magic metadata-payload-len metadata-payload
 metadata-magic    = %x50.2A.4D.18                  ; 0x184D2A50 LE
@@ -229,9 +236,9 @@ metadata-payload  = header-byte                    ; 1B
                     nonce                          ; 24B
                     aead-tag                       ; 16B
 
-;; Note: tree-id, table-id, block-offset are AAD-bound (see §5.3) but
-;; NOT part of metadata-payload , they are caller-supplied from read
-;; context (owning Tree, SST file path, seek cursor) and never
+;; Note: tree-id, table-id, block-offset are AAD-bound (see §5.3)
+;; but NOT part of metadata-payload. They are caller-supplied from
+;; read context (owning Tree, SST file path, seek cursor) and never
 ;; transmitted on the wire.
 
 body-frame        = body-magic body-payload-len encrypted-body
@@ -257,6 +264,14 @@ aead-tag          = 16OCTET
 ;; of OCTET" per RFC 5234 §3.6.
 OCTET             = %x00-FF                        ; any 8-bit byte
 ```
+
+**Length constraint on `optional-payload` (cannot be expressed in ABNF).** ABNF's `*OCTET` matches an unbounded run of bytes, which doesn't capture the contract that the payload is **exactly** the number of bytes declared by the preceding `optional-payload-len` u32 LE. Decoders MUST:
+
+1. Read the 4-byte `optional-payload-len` field into a `u32` (LE).
+2. Read **exactly** that many bytes for `optional-payload`.
+3. Stop consuming bytes for this optional-frame at that point; the next byte is either the start of another optional-frame's magic or end-of-block.
+
+A reader that consumes more or fewer bytes than the declared length MUST treat the file as malformed. The same applies to `metadata-payload` (length 49) and `encrypted-body` (length declared by `body-payload-len`): these are also `*OCTET` in the grammar but constrained by their preceding length fields in the same way.
 
 ## 6. Magic allocation
 
@@ -337,7 +352,7 @@ All `key` / `value` / `nonce` byte sequences are shown hex, big-endian to small-
 | Nonce (24 B) | `000102030405060708090a0b 0000000000000000 00000000` (first 12 used) |
 | Plaintext body | `48656c6c 6f2c2057 6f726c64 21` ("Hello, World!", 13 bytes) |
 
-**Caller-supplied inputs (NOT on disk , fed into AAD construction at encrypt/decrypt time from read context):**
+**Caller-supplied inputs (NOT on disk; fed into AAD construction at encrypt/decrypt time from read context):**
 
 | Field | Value | Source in the conformance harness |
 |---|---|---|
