@@ -118,7 +118,7 @@ cargo run --release --features flamegraph -- \
 | Tool | Use |
 |------|-----|
 | [`tools/db_bench`](tools/db_bench) | RocksDB-compatible benchmark suite, also drives the CI perf dashboard. |
-| [`tools/sst-dump`](tools/sst-dump) | Inspect / verify a single SST file out-of-band (per-block XXH3 walk). `sst-dump <file> verify` exits non-zero on corruption — usable as a one-shot health check. |
+| [`tools/sst-dump`](tools/sst-dump) | Inspect / verify a single SST file out-of-band. Subcommands: `verify` (walk every block, check per-block XXH3, exit non-zero on corruption), `hex <offset>` (raw hex dump of a region with optional `Header` decode; useful for inspecting a specific offset flagged by `verify --verbose`). |
 
 ## Support the project
 
