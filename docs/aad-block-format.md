@@ -38,7 +38,7 @@
 | **Decompression bomb** (forged compressed payload that expands to TBs of plaintext) | Yes | AAD carries raw `window_log` (base-2 log of max window size, not the encoded RFC 8878 `Window_Descriptor` byte); structured-zstd's `FrameDecoder::expect_window_log` rejects frames whose decoded window exceeds the AAD-declared value |
 | **Key epoch downgrade** (replay a block encrypted under epoch N as if it were epoch M ≠ N) | Yes | AAD carries `key_epoch`; the wrong key is selected and AEAD verification fails |
 | **Suite downgrade** (relabel an AES-256-GCM block as ChaCha20-Poly1305 to coerce a different decrypt path) | Yes | AAD carries `suite_id`; the wrong primitive is selected and AEAD verification fails |
-| **Replay across versions** (re-introduce an old block at its same offset after compaction has logically deleted it) | **Partial.** AAD does not include a per-block version / generation counter. The same `(table_id, block_offset, block_type, dict_id, key_epoch, suite_id)` tuple is valid for the same block content. Detection lives one layer up: the manifest's per-table XXH3 + per-file checksum catch a swap of an entire SST file, and the SFA TOC catches reorder within a file. Per-block replay within a single SST is **not defended at the AEAD layer.** |
+| **Replay across versions** (re-introduce an old block at its same offset after compaction has logically deleted it) | **Partial** | AAD does not include a per-block version / generation counter. The same `(table_id, block_offset, block_type, dict_id, key_epoch, suite_id)` tuple is valid for the same block content. Detection lives one layer up: the manifest's per-table XXH3 + per-file checksum catch a swap of an entire SST file, and the SFA TOC catches reorder within a file. Per-block replay within a single SST is **not defended at the AEAD layer.** |
 | Key disclosure | **No** (non-goal, §2) | n/a |
 | Brute-force AEAD key search | **No** (assumed infeasible for 256-bit keys with the chosen suites) | n/a |
 
@@ -61,7 +61,7 @@
 
 The on-disk layout for an AAD-bound encrypted block is exactly two consecutive [Zstandard skippable frames](https://datatracker.ietf.org/doc/html/rfc8878#section-3.1.1):
 
-```
+```text
 MetadataFrame  (8-byte framing header + 65-byte payload   = 73 bytes total)
 BodyFrame      (8-byte framing header + N-byte payload    = 8 + N bytes total)
 ```
@@ -70,7 +70,7 @@ Both framing headers are little-endian per RFC 8878 §3.1.1; both payloads are A
 
 ### 5.1 MetadataFrame
 
-```
+```text
 Offset  Size  Field             Description
 ══════  ════  ═══════════════   ═══════════════════════════════════════════════
 0       4     MagicMetadata     0x50 0x2A 0x4D 0x18  (LE for 0x184D2A50)
@@ -111,7 +111,7 @@ Total  73 bytes on disk
 
 ### 5.2 BodyFrame
 
-```
+```text
 Offset  Size  Field             Description
 ══════  ════  ═══════════════   ═══════════════════════════════════════════════
 0       4     MagicBody         0x51 0x2A 0x4D 0x18  (LE for 0x184D2A51)
@@ -128,7 +128,7 @@ Total  8 + N bytes on disk
 
 The AEAD's Additional Authenticated Data is constructed by the writer immediately before encrypting the body, and reconstructed by the reader immediately before decrypting:
 
-```
+```text
 Offset  Size  Field             Source
 ══════  ════  ═══════════════   ═══════════════════════════════════════════════
 0       4     MagicMetadata     The literal four bytes 0x50 0x2A 0x4D 0x18
@@ -274,7 +274,7 @@ All `key` / `value` / `nonce` byte sequences are shown hex, big-endian to small-
 | Nonce (24 B) | `000102030405060708090a0b 0000000000000000 00000000` (first 12 used) |
 | Plaintext body | `48656c6c 6f2c2057 6f726c64 21` ("Hello, World!", 13 bytes) |
 
-**AAD (29 B):** `502a4d18 01 01 00 02 0000000000002a30 0000000000000000 00000000 15`
+**AAD (29 B):** `502a4d18 10 01 00 02 0000000000002a30 0000000000000000 00000000 15` (MagicMetadata | HeaderByte=0x10 [v1, low nibble reserved] | KeyEpoch=0x01 | BlockType=0x00 | SuiteID=0x02 | TableID BE | BlockOffset BE | DictID BE | WindowLog=0x15)
 
 **Expected on-disk size:** 94 B total = 73 (MetadataFrame) + 8 (BodyFrame framing header) + 13 (EncryptedBody). For AES-256-GCM and ChaCha20-Poly1305, `ciphertext_len == plaintext_len` because the tag is stored in MetadataFrame, not appended to the ciphertext.
 
@@ -300,7 +300,7 @@ Encrypt a block under KeyEpoch=`01`. Tamper the on-disk `KeyEpoch` byte to `02`.
 
 A minimum-size Data block (single-byte plaintext = `41`, "A") encrypted under AES-256-GCM with all-zero key, all-zero TableID, BlockOffset=0, DictID=0, WindowLog=`15`, KeyEpoch=`01`, Nonce = first 12 bytes `00..0b`:
 
-```
+```text
 ;; MetadataFrame (73 bytes)
 0000: 50 2a 4d 18         ; MagicMetadata (0x184D2A50 LE)
 0004: 41 00 00 00         ; PayloadLen = 65 (u32 LE)
