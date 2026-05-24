@@ -34,7 +34,7 @@
 | **Block swap** within the same file (move block N's bytes to offset M, M ≠ N) | Yes | AAD carries `block_offset`; decrypt at the wrong offset fails |
 | **Block swap** across files (move a block from file A to file B) | Yes | AAD carries `table_id`; decrypt under the wrong table_id fails |
 | **Block type swap** (relabel a Filter block as Data, e.g. to confuse a partial-decode path) | Yes | AAD carries `block_type`; decrypt under the wrong type fails |
-| **Compression dictionary substitution** (decode under a different zstd dictionary to manipulate decompressed output) | Yes | AAD carries `dict_id`; structured-zstd's `FrameDecoder::expect_dict_id` cross-checks during inner-frame decode (delegated; see #251 / S-ZSTD-T7) |
+| **Compression dictionary substitution** (decode under a different zstd dictionary to manipulate decompressed output) | Yes | AAD carries `dict_id`; structured-zstd's `FrameDecoder::expect_dict_id` cross-checks during inner-frame decode. Wiring lives in this repo's encoder/decoder issue #251; the matching enforcement on the structured-zstd side is tracked there as `S-ZSTD-T7`. |
 | **Decompression bomb** (forged compressed payload that expands to TBs of plaintext) | Yes | AAD carries raw `window_log` (base-2 log of max window size, not the encoded RFC 8878 `Window_Descriptor` byte); structured-zstd's `FrameDecoder::expect_window_log` rejects frames whose decoded window exceeds the AAD-declared value |
 | **Key epoch downgrade** (replay a block encrypted under epoch N as if it were epoch M ≠ N) | Yes | AAD carries `key_epoch`; the wrong key is selected and AEAD verification fails |
 | **Suite downgrade** (relabel an AES-256-GCM block as ChaCha20-Poly1305 to coerce a different decrypt path) | Yes | AAD carries `suite_id`; the wrong primitive is selected and AEAD verification fails |
@@ -55,11 +55,11 @@
 | 4.7 | Authentication tag field width | Fixed 16 bytes | Both initial suites (AES-256-GCM, ChaCha20-Poly1305) emit a 128-bit tag. Reserving 16 bytes covers any plausible future tag-truncation policy and keeps the metadata frame size constant. |
 | 4.8 | `HeaderByte` layout | High nibble = format version (`0b0001` = v1 in this spec), low nibble reserved (MUST be zero on write, ignored on read until a future spec assigns it) | Single byte covers version + future spare. Forward extension can promote low-nibble bits to typed fields without breaking v1 readers. |
 | 4.9 | Inner-frame integrity (dict / window) | Delegated to [structured-zstd](https://github.com/structured-world/structured-zstd) `FrameDecoder::expect_dict_id` / `expect_window_log` (the call-out is structured-zstd PR-F; this spec describes the contract, the implementation lives in S-ZSTD-T7). | Avoids re-validating zstd internals at the LSM layer. The AAD carries `dict_id` + `window_log` so the LSM decoder can pass them through. |
-| 4.10 | Number of frames per block | Always **two**: one metadata frame (fixed 65 bytes payload) immediately followed by one body frame (variable payload). | Splitting metadata out keeps it known-size and parseable without first probing the body. A future format revision can introduce a third frame (e.g. ECC parity) without breaking v1, readers check `HeaderByte` version first and refuse unrecognised versions. |
+| 4.10 | Number of frames per block | Exactly **two required** frames: one MetadataFrame (magic `0x184D2A50`, fixed 65-byte payload) immediately followed by one BodyFrame (magic `0x184D2A51`, variable payload). Optionally followed by **zero or more** ECC parity frames (magic `0x184D2A52`, owned by #254) and other reserved-range frames. v1 readers MUST accept MetadataFrame + BodyFrame and MUST skip any trailing skippable frame in the reserved range `0x184D2A52..0x184D2A5F` without rejecting the block (RFC 8878 skippable-frame semantics). v1 readers MUST reject if MetadataFrame or BodyFrame is missing or out of order. | Splitting metadata out keeps it known-size and parseable without first probing the body. ECC and future extensions ride alongside as additional skippable frames; v1 readers ignore what they don't recognise and recover the block from the MetadataFrame + BodyFrame pair alone, so a v1 reader on an ECC-augmented block still works (it just doesn't get the parity-based repair path). |
 
 ## 5. Wire format
 
-The on-disk layout for an AAD-bound encrypted block is exactly two consecutive [Zstandard skippable frames](https://datatracker.ietf.org/doc/html/rfc8878#section-3.1.1):
+The on-disk layout for an AAD-bound encrypted block begins with two required consecutive [Zstandard skippable frames](https://datatracker.ietf.org/doc/html/rfc8878#section-3.1.1) and MAY be followed by zero or more optional skippable frames (e.g. an `EccFrame` owned by #254 at magic `0x184D2A52`). Per §4.10, v1 readers MUST accept and skip any trailing skippable frame in the reserved range `0x184D2A52..0x184D2A5F` without rejecting the block:
 
 ```text
 MetadataFrame  (8-byte framing header + 65-byte payload   = 73 bytes total)
@@ -155,7 +155,7 @@ The `MagicBody` and `PayloadLen` from BodyFrame are also **not** part of the AAD
 - MetadataFrame `MagicMetadata` equals `0x184D2A50` (LE bytes `50 2A 4D 18`). If not, treat as a non-AAD-bound block and refuse to decrypt.
 - MetadataFrame `PayloadLen` equals 65 exactly. Any other value is malformed and MUST be rejected without reading the body frame (no AAD can be constructed, so AEAD cannot bind context).
 - BodyFrame `MagicBody` equals `0x184D2A51` (LE bytes `51 2A 4D 18`). If not, reject.
-- BodyFrame `PayloadLen` is in the range `[1, MAX_BLOCK_DATA_LENGTH + max_aead_overhead]` (the same cap `Block::from_file` and `scan_sst_blocks` apply). A larger value means either a forged TOC or a header bit-flip and MUST be rejected before allocating the read buffer.
+- BodyFrame `PayloadLen` is in the range `[1, 256 MiB + max_overhead]`, where `256 MiB` is the plaintext upper bound on a single block's on-disk data segment (mirrors the public constant the LSM scrub path enforces) and `max_overhead` is the value reported by the active `EncryptionProvider::max_overhead()` (zero when encryption is disabled or for plaintext blocks). A larger value means either a forged TOC or a header bit-flip and MUST be rejected before allocating the read buffer.
 
 These checks are not AEAD-authenticated, but they bound the attack surface so that any bypass attempt either (a) fails the structural check above, or (b) reaches the AEAD and fails AAD verification on the metadata-mirror fields.
 
@@ -164,8 +164,25 @@ These checks are not AEAD-authenticated, but they bound the attack surface so th
 [RFC 5234](https://datatracker.ietf.org/doc/html/rfc5234) syntax:
 
 ```abnf
-;; A single AAD-bound encrypted block on disk is exactly:
-encrypted-block   = metadata-frame body-frame
+;; A single AAD-bound encrypted block on disk begins with the
+;; required pair (metadata-frame, body-frame) and may carry zero or
+;; more optional trailing skippable frames (e.g. an ECC parity frame
+;; per #254 at magic 0x184D2A52). v1 readers MUST skip optional
+;; frames they don't recognise (per RFC 8878 skippable-frame
+;; semantics) and MUST NOT reject the block on their presence.
+encrypted-block   = metadata-frame body-frame *optional-frame
+
+optional-frame    = optional-magic optional-payload-len *OCTET
+optional-magic    = %x52.2A.4D.18                  ; 0x184D2A52 (EccFrame, #254)
+                  / %x53.2A.4D.18                  ; 0x184D2A53 (reserved, future)
+                  / %x54.2A.4D.18                  ; 0x184D2A54 (reserved, future)
+                  / %x55.2A.4D.18 / %x56.2A.4D.18  ; 0x184D2A55..0x184D2A5F (reserved)
+                  / %x57.2A.4D.18 / %x58.2A.4D.18
+                  / %x59.2A.4D.18 / %x5A.2A.4D.18
+                  / %x5B.2A.4D.18 / %x5C.2A.4D.18
+                  / %x5D.2A.4D.18 / %x5E.2A.4D.18
+                  / %x5F.2A.4D.18
+optional-payload-len = 4OCTET                       ; u32 LE
 
 metadata-frame    = metadata-magic metadata-payload-len metadata-payload
 metadata-magic    = %x50.2A.4D.18                  ; 0x184D2A50 LE
@@ -247,8 +264,8 @@ Per-attack mapping of which AAD-bound field defeats which threat:
 | Block swap within the same file | `BlockOffset` | The block's bytes are valid but at a different offset; AAD mismatch → fails. |
 | Block swap across files | `TableID` | Same as above but for cross-file moves. |
 | Block type relabel (Filter → Data) | `BlockType` | The bytes are valid but the type byte differs → AAD mismatch. |
-| Compression dict substitution | `DictID` + (S-ZSTD #251 / S-ZSTD-T7 enforcement) | LSM-side: AAD binds dict_id, so reading under a different dict fails AAD. Inside-frame: structured-zstd's `expect_dict_id` re-checks the dict id encoded in the zstd frame header. |
-| Decompression bomb (forged window) | `WindowLog` + (S-ZSTD #251 / S-ZSTD-T7 enforcement) | AAD binds raw `window_log` (base-2 log of max window in bytes). structured-zstd's `expect_window_log` decodes each frame's `Window_Descriptor` byte to its raw log equivalent and rejects frames whose decoded value exceeds the AAD-bound limit. |
+| Compression dict substitution | `DictID` (lsm-tree wiring: #251; structured-zstd enforcement: S-ZSTD-T7) | LSM-side: AAD binds dict_id, so reading under a different dict fails AAD. Inside-frame: structured-zstd's `expect_dict_id` re-checks the dict id encoded in the zstd frame header. |
+| Decompression bomb (forged window) | `WindowLog` (lsm-tree wiring: #251; structured-zstd enforcement: S-ZSTD-T7) | AAD binds raw `window_log` (base-2 log of max window in bytes). structured-zstd's `expect_window_log` decodes each frame's `Window_Descriptor` byte to its raw log equivalent and rejects frames whose decoded value exceeds the AAD-bound limit. |
 | Key epoch downgrade | `KeyEpoch` | Selecting the wrong key (because the wrong epoch is declared) yields the wrong AEAD primitive instance → fails. |
 | Suite downgrade | `SuiteID` | Selecting the wrong primitive yields the wrong tag → fails. |
 | AAD format substitution (lifting metadata bytes into a future format with a different magic) | `MagicMetadata` (first 4 bytes of AAD) | The literal magic bytes are part of the AAD; a different format with a different magic produces a different AAD → fails. |
@@ -290,7 +307,7 @@ Key as above, KeyEpoch=01, BlockType=`00`, SuiteID=`02`, TableID=`00000000 00002
 
 ### Vector 4: Negative, window-bomb (rejection)
 
-Construct a block whose inner zstd frame's `Window_Descriptor` byte (encoded per RFC 8878 §3.1.1.1.2) decodes to a 1 GiB window, but the AAD-bound `WindowLog` field declares 21 (raw log2, = 2 MiB). A conformant decoder MUST reject this block; structured-zstd's `expect_window_log` is responsible (per #251 / S-ZSTD-T7) for decoding the frame's descriptor byte and comparing the decoded log against the AAD-bound limit. Error variant: `crate::Error::Decrypt("window log exceeds AAD-bound limit")` (or equivalent reason string) - the inner-validator rejection surfaces through the same `Decrypt` enum variant as an AEAD tag mismatch, with the reason string distinguishing inner-frame rejection from AAD/tag failure.
+Construct a block whose inner zstd frame's `Window_Descriptor` byte (encoded per RFC 8878 §3.1.1.1.2) decodes to a 1 GiB window, but the AAD-bound `WindowLog` field declares 21 (raw log2, = 2 MiB). A conformant decoder MUST reject this block. The reject path is split across two issues by repo: this repo's encoder/decoder (issue #251) wires the AAD-bound `WindowLog` into the inner-validator call, and the structured-zstd side (tracked as `S-ZSTD-T7` in [structured-world/structured-zstd](https://github.com/structured-world/structured-zstd)) implements `FrameDecoder::expect_window_log` to decode the frame's descriptor byte and compare the decoded log against the AAD-bound limit. Error variant: `crate::Error::Decrypt("window log exceeds AAD-bound limit")` (or equivalent reason string) - the inner-validator rejection surfaces through the same `Decrypt` enum variant as an AEAD tag mismatch, with the reason string distinguishing inner-frame rejection from AAD/tag failure.
 
 ### Vector 5: Negative, key-epoch mismatch (rejection)
 
@@ -341,10 +358,10 @@ Total on-disk size: 82 bytes (73 metadata + 9 body). The AEADTag and ciphertext 
 | Component | Tracking issue | Notes |
 |---|---|---|
 | Encoder / decoder | #251 | Reads SuiteID, selects primitive, builds AAD per §5.3. AES-256-GCM goes through the existing [`aes-gcm`](https://crates.io/crates/aes-gcm) dependency. ChaCha20-Poly1305 lands behind its own SuiteID (`0x03`) when #251 adds the [`chacha20poly1305`](https://crates.io/crates/chacha20poly1305) crate as a new dependency; until then the encoder rejects writes with SuiteID `0x03`. |
-| Inner-frame validation | #251 (S-ZSTD-T7) | Calls structured-zstd's `FrameDecoder::expect_dict_id(dict_id)` and `expect_window_log(window_log)` with the AAD-bound values before letting decompression proceed. |
+| Inner-frame validation | lsm-tree wiring: #251 (this repo). Structured-zstd enforcement: `S-ZSTD-T7` in [structured-world/structured-zstd](https://github.com/structured-world/structured-zstd). | This repo's encoder/decoder (#251) passes the AAD-bound `dict_id` / `window_log` into `FrameDecoder::expect_dict_id` / `expect_window_log` before letting decompression proceed. Those `expect_*` hooks are implemented on the structured-zstd side under tracker `S-ZSTD-T7`. |
 | Conformance test suite | #253 | One test per row in §9 (vectors 1-5) plus regressions for each row in §8 (attack → defending field). |
 | ECC layer (outer Reed-Solomon parity) | #254 | Uses frame magic `0x184D2A52` (locked here in §6, matching #254's `EccFrame` ABNF) for parity blocks; spec extension lands with that PR. |
-| Lazy block-precise repair | #255 | Uses the inner-validator error categories from S-ZSTD-T7 to attempt single-block repair before reporting whole-SST corruption. |
+| Lazy block-precise repair | #255 (this repo) | Uses the inner-validator error categories produced by the structured-zstd `S-ZSTD-T7` work to attempt single-block repair before reporting whole-SST corruption. |
 | Forensics CLI | #256 | Reads MetadataFrame in isolation to dump per-block structure (table_id, offset, type, suite, epoch, dict, window) without requiring the key. |
 | Partial decode for range queries | #257 | Uses structured-zstd's block-subset API to decode only the matching key range of a compressed block; the AEAD verification covers the entire body, so partial-decode only saves decompression work, not verification work. |
 
