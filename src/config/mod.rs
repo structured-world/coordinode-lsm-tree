@@ -85,6 +85,60 @@ impl std::fmt::Debug for LevelRoute {
     }
 }
 
+/// Policy governing what `Tree::open` does when the on-disk MANIFEST
+/// contains corrupt records.
+///
+/// Mirrors `RocksDB`'s `WALRecoveryMode` semantics, but applied to the
+/// manifest layer (`src/version/recovery.rs`) — lsm-tree itself has no
+/// WAL (durability lives one layer up in the parent fjall/keyspace
+/// crate's `Journal`). The MANIFEST is the equivalent surface where
+/// "loss-tolerance vs strict-consistency" matters at open time.
+///
+/// The default is [`AbsoluteConsistency`](Self::AbsoluteConsistency) —
+/// any corrupt record fails the open. Switching to a more permissive
+/// mode is an explicit, informed operator decision: you are trading
+/// "the tree might silently come up with missing tables / blob files"
+/// for "the tree comes up at all". Logged warnings on every dropped
+/// record document exactly what was lost.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
+pub enum ManifestRecoveryMode {
+    /// Production-safe default. Any per-record decode mismatch (bad
+    /// XXH3, invalid tag, truncated TOC entry, declared-count overrun)
+    /// aborts the open with the original error. Surfaces every byte
+    /// of corruption; never silently drops data.
+    #[default]
+    AbsoluteConsistency,
+
+    /// Power-loss-at-write-tail salvage. If the per-section iteration
+    /// over the `tables` / `blob_files` records runs out of bytes
+    /// before the declared count is reached (truncated tail), keep
+    /// everything that decoded cleanly before the cut and emit a
+    /// `warn!` listing the dropped record counts. Any decode error
+    /// that is NOT a clean tail truncation (bad checksum-type tag,
+    /// declared-count overflow vs section length, etc.) still aborts
+    /// the open — this mode is specifically for "the writer never
+    /// finished" scenarios, not for arbitrary bit-rot.
+    TolerateCorruptedTailRecords,
+
+    /// Recover up to the last fully-consistent record group, discard
+    /// anything later. Reserved variant: matches `RocksDB`'s
+    /// `kPointInTimeRecovery` semantic, but not yet wired — selecting
+    /// it currently falls back to
+    /// [`AbsoluteConsistency`](Self::AbsoluteConsistency) behaviour.
+    /// Tracked as a follow-up to this issue's first wave.
+    PointInTimeRecovery,
+
+    /// Skip each corrupt record individually, keep all others.
+    /// Maximum-availability, lossy. Reserved variant: matches
+    /// `RocksDB`'s `kSkipAnyCorruptedRecords` semantic, but not yet
+    /// wired — currently falls back to
+    /// [`AbsoluteConsistency`](Self::AbsoluteConsistency) behaviour.
+    /// Intended companion to the `repair_db` tooling tracked as
+    /// `#303`; wiring waits on that PR landing so the two surfaces
+    /// can be reviewed together.
+    SkipAnyCorruptedRecords,
+}
+
 /// LSM-tree type
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum TreeType {
@@ -365,6 +419,15 @@ pub struct Config {
     /// using this provider after compression and before checksumming.
     pub(crate) encryption: Option<Arc<dyn EncryptionProvider>>,
 
+    /// Policy governing what `Tree::open` does when the on-disk
+    /// MANIFEST contains corrupt records. Defaults to
+    /// [`ManifestRecoveryMode::AbsoluteConsistency`], the only
+    /// production-safe choice — any corruption aborts the open. Other
+    /// modes trade strict correctness for partial-availability after a
+    /// disaster; see the enum doc for the operational scenarios that
+    /// motivate each mode.
+    pub(crate) manifest_recovery_mode: ManifestRecoveryMode,
+
     /// Pre-trained zstd dictionary for dictionary compression.
     ///
     /// When set together with a [`CompressionType::ZstdDict`] compression
@@ -452,6 +515,7 @@ impl Default for Config {
 
             comparator: comparator::default_comparator(),
             encryption: None,
+            manifest_recovery_mode: ManifestRecoveryMode::AbsoluteConsistency,
         }
     }
 }
@@ -1052,6 +1116,27 @@ impl Config {
     #[must_use]
     pub fn with_encryption(mut self, encryption: Option<Arc<dyn EncryptionProvider>>) -> Self {
         self.encryption = encryption;
+        self
+    }
+
+    /// Sets the MANIFEST recovery policy for `Tree::open`.
+    ///
+    /// The default ([`ManifestRecoveryMode::AbsoluteConsistency`]) is the
+    /// only choice that's safe for live production: any corrupt record
+    /// in the on-disk manifest aborts the open. Switching to a more
+    /// permissive mode trades strict correctness for partial
+    /// availability after a disaster — every dropped record is logged
+    /// as `warn!`, but the recovered tree may be missing tables / blob
+    /// files relative to what the operator last fsynced. Always
+    /// pair the non-default modes with an out-of-band integrity scan
+    /// ([`verify_integrity`](crate::verify::verify_integrity) and/or
+    /// [`verify_sst_file`](crate::verify::verify_sst_file)) before
+    /// trusting the recovered tree for writes.
+    ///
+    /// See the [`ManifestRecoveryMode`] doc for per-variant semantics.
+    #[must_use]
+    pub fn manifest_recovery_mode(mut self, mode: ManifestRecoveryMode) -> Self {
+        self.manifest_recovery_mode = mode;
         self
     }
 
