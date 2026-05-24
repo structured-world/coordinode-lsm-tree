@@ -65,8 +65,10 @@ fn toc_entry_to_handle(entry: &TocEntry) -> BlockHandle {
 pub struct ParsedRegions {
     pub tli: BlockHandle,
     /// Tail-side mirror of the TLI block. Head copy lives in the
-    /// `tli` section near the file start (after the data section);
-    /// this copy lives near the file tail, after `meta_separator`
+    /// `tli` section earlier in the file (after `data` and the
+    /// partitioned `index` sub-blocks if any, before `filter` /
+    /// `filter_tli` / `range_tombstones`); this copy lives near the
+    /// file tail, after `meta_separator`
     /// and before `meta`. A torn-write or bad sector at either
     /// position leaves the other copy intact. Reader prefers the
     /// tail copy on open and transparently falls back to the head
@@ -80,10 +82,11 @@ pub struct ParsedRegions {
     pub linked_blob_files: Option<BlockHandle>,
     pub metadata: BlockHandle,
     /// Mid-file backup of the meta block. Writer order:
-    /// `data` → `tli` → `index?` → `filter_tli?` → `filter?` →
+    /// `data` → `index?` → `tli` → `filter?` → `filter_tli?` →
     /// `range_tombstones?` → **`meta_mid`** →
     /// `linked_blob_files?` → `table_version` → `meta_separator` →
-    /// `meta`. Absent on tables written before the meta-mirror change.
+    /// `tli_tail` → `meta`. Absent on tables written before the
+    /// meta-mirror change.
     /// Defends against torn-write at the file tail (incomplete fsync):
     /// MID lives several KiB before TAIL, with a 4 KiB
     /// `meta_separator` section between them to guarantee a fresh
