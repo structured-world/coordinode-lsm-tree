@@ -671,10 +671,17 @@ fn scan_sst_blocks(
 /// these sections — their integrity is covered by the SFA-trailer
 /// checksum verified at table-open time. Every other section
 /// (`data` / `tli` / `index` / `filter_tli` / `filter` /
-/// `range_tombstones` / `meta`) is a `Header`-prefixed block run and
-/// gets walked. See `scan_sst_blocks` for the full section catalogue
-/// and the writer-side source of truth.
-const RAW_FORMAT_SECTIONS: &[&[u8]] = &[b"linked_blob_files", b"table_version"];
+/// `range_tombstones` / `meta` / `meta_mid`) is a `Header`-prefixed
+/// block run and gets walked. See `scan_sst_blocks` for the full
+/// section catalogue and the writer-side source of truth.
+///
+/// `meta_separator` is the 4 KiB zero-padding section the writer
+/// emits between the MID and TAIL meta blocks so a single bad
+/// filesystem sector cannot take out both copies — it carries no
+/// blocks and must be skipped here, otherwise the walker would try
+/// to decode zeros as a `Header` and report a spurious
+/// `HeaderCorrupted` on every clean SST.
+const RAW_FORMAT_SECTIONS: &[&[u8]] = &[b"linked_blob_files", b"table_version", b"meta_separator"];
 
 /// Plaintext upper bound on a single block's on-disk data segment
 /// length, mirroring `table::block::MAX_DECOMPRESSION_SIZE` (256 MiB).

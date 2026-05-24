@@ -645,6 +645,90 @@ impl Writer {
             )?;
         }
 
+        // Snapshot all meta fields once — reused for both MID and TAIL
+        // copies. Borrowing `first_key` / `last_key` from `self.meta`
+        // here is fine because neither the MID write nor any of the
+        // intermediate tail sections (`linked_blob_files`,
+        // `table_version`, `meta_separator`) touch `self.meta`'s key
+        // buffers — those stay owned by `self` through to the TAIL
+        // write. Note that `self.index_writer` and `self.filter_writer`
+        // are already moved by the `.finish()` calls above; we don't
+        // touch them again here.
+        #[expect(clippy::expect_used, reason = "non-empty table guaranteed earlier")]
+        let first_key = self
+            .meta
+            .first_key
+            .as_ref()
+            .expect("first_key should exist");
+        #[expect(clippy::expect_used, reason = "non-empty table guaranteed earlier")]
+        let last_key = self.meta.last_key.as_ref().expect("last_key should exist");
+        let range_tombstone_count = self.range_tombstones.len() as u64;
+        // Snapshot the wall-clock once — both MID and TAIL copies
+        // must report the SAME created_at so MID-fallback recovery
+        // produces the same timestamp as a clean TAIL recovery.
+        let created_at_nanos = unix_timestamp().as_nanos();
+        let mut meta_params = MetaSectionParams {
+            section_name: "meta_mid",
+            index_block_count,
+            filter_block_count,
+            // MID and TAIL must encode the SAME file_size — recovery
+            // falls back transparently and downstream consumers
+            // (compaction window picking, etc.) read it as if it were
+            // authoritative. `self.meta.file_pos` is only ever bumped
+            // inside spill_block, so its value is identical at MID
+            // and TAIL write time.
+            file_size: *self.meta.file_pos,
+            table_id: self.table_id,
+            data_block_count: self.meta.data_block_count as u64,
+            item_count: self.meta.item_count as u64,
+            tombstone_count: self.meta.tombstone_count as u64,
+            weak_tombstone_count: self.meta.weak_tombstone_count as u64,
+            weak_tombstone_reclaimable: self.meta.weak_tombstone_reclaimable_count as u64,
+            key_count: self.meta.key_count as u64,
+            uncompressed_size: self.meta.uncompressed_size,
+            first_key,
+            last_key,
+            lowest_seqno: self.meta.lowest_seqno,
+            highest_seqno: self.meta.highest_seqno,
+            highest_kv_seqno: self.meta.highest_kv_seqno,
+            data_block_compression: self.data_block_compression,
+            index_block_compression: self.index_block_compression,
+            data_block_hash_ratio: self.data_block_hash_ratio,
+            data_block_restart_interval: self.data_block_restart_interval,
+            index_block_restart_interval: self.index_block_restart_interval,
+            initial_level: self.initial_level,
+            range_tombstone_count,
+            // `block_offset` here feeds `BlockIdentity` which today is
+            // unused (`let _ = identity;` in `Block::write_into` /
+            // `Block::from_file`). Once AAD is wired in #251 the read
+            // side will derive this from `*handle.offset()` (the SFA
+            // TOC section offset, distinct for MID vs TAIL), so this
+            // shared `*self.meta.file_pos` value will need to be
+            // replaced with each section's actual file position at
+            // write time. Tracked as part of the #251 AAD-wiring
+            // surface — the writer here will need to query the SFA
+            // writer's current file position per section.
+            block_offset: *self.meta.file_pos,
+            created_at_nanos,
+        };
+
+        // MID meta copy — defends against torn-write at the file tail
+        // (incomplete fsync). Written at the current writer cursor,
+        // after `range_tombstones` and before
+        // `linked_blob_files` / `table_version` / `meta_separator` /
+        // `meta`. The 4 KiB `meta_separator` between MID and TAIL
+        // guarantees the two copies land on different filesystem
+        // sectors. `file_size` is `*self.meta.file_pos` so MID and
+        // TAIL encode identical values: `file_pos` is only ever bumped
+        // inside `spill_block`, so it doesn't change between the two
+        // writes.
+        write_meta_section(
+            &mut self.file_writer,
+            &mut self.block_buffer,
+            self.encryption.as_deref(),
+            &meta_params,
+        )?;
+
         if !self.linked_blob_files.is_empty() {
             use byteorder::{LE, WriteBytesExt};
 
@@ -657,7 +741,7 @@ impl Writer {
             self.file_writer
                 .write_u32::<LE>(self.linked_blob_files.len() as u32)?;
 
-            for file in self.linked_blob_files {
+            for file in &self.linked_blob_files {
                 self.file_writer.write_u64::<LE>(file.blob_file_id)?;
                 self.file_writer.write_u64::<LE>(file.len as u64)?;
                 self.file_writer.write_u64::<LE>(file.bytes)?;
@@ -668,131 +752,38 @@ impl Writer {
         self.file_writer.start("table_version")?;
         self.file_writer.write_all(&[0x3])?;
 
-        // Write metadata
-        self.file_writer.start("meta")?;
+        // 4 KiB padding section so MID copy and TAIL copy live on
+        // different 4 KiB filesystem sectors. Without this, a single
+        // bad sector at the tail could take out both copies (only
+        // ~tens of bytes separate the linked_blob_files / table_version
+        // sections between them).
+        self.file_writer.start("meta_separator")?;
+        self.file_writer.write_all(&[0u8; 4096])?;
 
-        {
-            fn meta(key: &str, value: &[u8]) -> InternalValue {
-                InternalValue::from_components(key, value, 0, crate::ValueType::Value)
-            }
-
-            let meta_items = [
-                meta(
-                    "block_count#data",
-                    &(self.meta.data_block_count as u64).to_le_bytes(),
-                ),
-                meta(
-                    "block_count#filter",
-                    &(filter_block_count as u64).to_le_bytes(),
-                ),
-                meta(
-                    "block_count#index",
-                    &(index_block_count as u64).to_le_bytes(),
-                ),
-                meta("checksum_type", &[u8::from(ChecksumType::Xxh3)]),
-                meta(
-                    "compression#data",
-                    &self.data_block_compression.encode_into_vec(),
-                ),
-                meta(
-                    "compression#index",
-                    &self.index_block_compression.encode_into_vec(),
-                ),
-                meta("crate_version", env!("CARGO_PKG_VERSION").as_bytes()),
-                meta("created_at", &unix_timestamp().as_nanos().to_le_bytes()),
-                meta(
-                    "data_block_hash_ratio",
-                    &self.data_block_hash_ratio.to_le_bytes(),
-                ),
-                meta("file_size", &self.meta.file_pos.to_le_bytes()),
-                meta("filter_hash_type", &[u8::from(ChecksumType::Xxh3)]),
-                meta("index_keys_have_seqno", &[0x1]),
-                meta("initial_level", &self.initial_level.to_le_bytes()),
-                meta("item_count", &(self.meta.item_count as u64).to_le_bytes()),
-                meta(
-                    "key#max",
-                    // NOTE: At the beginning we check that we have written at least 1 item, so last_key must exist
-                    #[expect(clippy::expect_used)]
-                    self.meta.last_key.as_ref().expect("should exist"),
-                ),
-                meta(
-                    "key#min",
-                    // NOTE: At the beginning we check that we have written at least 1 item, so first_key must exist
-                    #[expect(clippy::expect_used)]
-                    self.meta.first_key.as_ref().expect("should exist"),
-                ),
-                meta("key_count", &(self.meta.key_count as u64).to_le_bytes()),
-                meta("prefix_truncation#data", &[1]), // NOTE: currently prefix truncation can not be disabled
-                meta("prefix_truncation#index", &[1]), // NOTE: currently prefix truncation can not be disabled
-                meta(
-                    "range_tombstone_count",
-                    &(self.range_tombstones.len() as u64).to_le_bytes(),
-                ),
-                meta(
-                    "restart_interval#data",
-                    &self.data_block_restart_interval.to_le_bytes(),
-                ),
-                meta(
-                    "restart_interval#index",
-                    &self.index_block_restart_interval.to_le_bytes(),
-                ),
-                meta("seqno#kv_max", &self.meta.highest_kv_seqno.to_le_bytes()),
-                meta("seqno#max", &self.meta.highest_seqno.to_le_bytes()),
-                meta("seqno#min", &self.meta.lowest_seqno.to_le_bytes()),
-                meta("table_id", &self.table_id.to_le_bytes()),
-                meta("table_version", &[3u8]),
-                meta(
-                    "tombstone_count",
-                    &(self.meta.tombstone_count as u64).to_le_bytes(),
-                ),
-                meta("user_data_size", &self.meta.uncompressed_size.to_le_bytes()),
-                meta(
-                    "weak_tombstone_count",
-                    &(self.meta.weak_tombstone_count as u64).to_le_bytes(),
-                ),
-                meta(
-                    "weak_tombstone_reclaimable",
-                    &(self.meta.weak_tombstone_reclaimable_count as u64).to_le_bytes(),
-                ),
-            ];
-
-            // NOTE: Just to make sure the items are definitely sorted
-            #[cfg(debug_assertions)]
-            {
-                let is_sorted = meta_items.iter().is_sorted_by_key(|kv| &kv.key);
-                assert!(is_sorted, "meta items not sorted correctly");
-            }
-
-            self.block_buffer.clear();
-
-            // TODO: disable binary index: https://github.com/fjall-rs/lsm-tree/issues/185
-            DataBlock::encode_into(&mut self.block_buffer, &meta_items, 1, 0.0)?;
-
-            Block::write_into(
-                &mut self.file_writer,
-                &self.block_buffer,
-                crate::table::block::BlockIdentity {
-                    tree_id: 0,
-                    // Meta is read via ParsedMeta::load_with_handle
-                    // BEFORE the reader knows the table id — the
-                    // table id IS what meta itself carries.
-                    // Writer mirrors that with table_id: 0 so write
-                    // and read sides agree on the AAD discriminator
-                    // once #251 wires AAD; otherwise table-open
-                    // would fail AEAD verification on the very
-                    // first block read.
-                    table_id: 0,
-                    block_offset: *self.meta.file_pos,
-                    block_type: crate::table::block::BlockType::Meta,
-                    dict_id: 0,
-                    window_log: 0,
-                },
-                CompressionType::None,
-                self.encryption.as_deref(),
-                #[cfg(zstd_any)]
-                None,
-            )?;
-        };
+        // TAIL meta — the canonical, authoritative copy. `file_size`
+        // is the LOGICAL size up to the end of the data blocks
+        // (`self.meta.file_pos`), NOT the on-disk offset of this
+        // block. `file_pos` is bumped only inside `spill_block`, so
+        // it does not track the absolute file cursor here; the value
+        // is the same one MID encoded above, which is the contract
+        // downstream consumers (`Table::file_size`, compaction window
+        // picking, checkpoint sizing — see the comment in
+        // `checkpoint.rs:170-185`) read.
+        meta_params.section_name = "meta";
+        // file_size and block_offset already carry `*self.meta.file_pos`
+        // from the MID write; `file_pos` hasn't moved since (no
+        // intermediate write touches it), so re-assigning is a
+        // no-op. Kept explicit for readability — if someone later
+        // adds a Block::write_into call before TAIL that DOES bump
+        // file_pos, this line will need to re-snapshot.
+        meta_params.file_size = *self.meta.file_pos;
+        meta_params.block_offset = *self.meta.file_pos;
+        write_meta_section(
+            &mut self.file_writer,
+            &mut self.block_buffer,
+            self.encryption.as_deref(),
+            &meta_params,
+        )?;
 
         // Write fixed-size trailer
         // and flush & fsync the table file
@@ -818,6 +809,156 @@ impl Writer {
 
         Ok(Some((self.table_id, checksum)))
     }
+}
+
+/// Parameters bundle for [`write_meta_section`]. Free-standing struct
+/// (not a `Writer` method) because `finish()` calls this AFTER
+/// `index_writer.finish()` / `filter_writer.finish()` have consumed
+/// those two fields by-value, leaving `self` partially-moved and so
+/// unable to dispatch through `&mut self` methods.
+struct MetaSectionParams<'a> {
+    section_name: &'static str,
+    index_block_count: usize,
+    filter_block_count: usize,
+    file_size: u64,
+    table_id: TableId,
+    data_block_count: u64,
+    item_count: u64,
+    tombstone_count: u64,
+    weak_tombstone_count: u64,
+    weak_tombstone_reclaimable: u64,
+    key_count: u64,
+    uncompressed_size: u64,
+    first_key: &'a [u8],
+    last_key: &'a [u8],
+    lowest_seqno: crate::SeqNo,
+    highest_seqno: crate::SeqNo,
+    highest_kv_seqno: crate::SeqNo,
+    data_block_compression: CompressionType,
+    index_block_compression: CompressionType,
+    data_block_hash_ratio: f32,
+    data_block_restart_interval: u8,
+    index_block_restart_interval: u8,
+    initial_level: u8,
+    range_tombstone_count: u64,
+    block_offset: u64,
+    /// `created_at` snapshot taken once in `finish()`. Both MID and
+    /// TAIL writes consume this same value; generating it inside
+    /// `write_meta_section` per call would stamp the two copies with
+    /// different wall-clock readings and shift TTL/FIFO ordering on
+    /// MID-fallback recovery.
+    created_at_nanos: u128,
+}
+
+fn meta_kv(key: &str, value: &[u8]) -> InternalValue {
+    InternalValue::from_components(key, value, 0, crate::ValueType::Value)
+}
+
+fn write_meta_section<W: std::io::Write + std::io::Seek>(
+    file_writer: &mut sfa::Writer<ChecksummedWriter<W>>,
+    block_buffer: &mut Vec<u8>,
+    encryption: Option<&dyn EncryptionProvider>,
+    p: &MetaSectionParams<'_>,
+) -> crate::Result<()> {
+    file_writer.start(p.section_name)?;
+
+    let meta = meta_kv;
+    let meta_items = [
+        meta("block_count#data", &p.data_block_count.to_le_bytes()),
+        meta(
+            "block_count#filter",
+            &(p.filter_block_count as u64).to_le_bytes(),
+        ),
+        meta(
+            "block_count#index",
+            &(p.index_block_count as u64).to_le_bytes(),
+        ),
+        meta("checksum_type", &[u8::from(ChecksumType::Xxh3)]),
+        meta(
+            "compression#data",
+            &p.data_block_compression.encode_into_vec(),
+        ),
+        meta(
+            "compression#index",
+            &p.index_block_compression.encode_into_vec(),
+        ),
+        meta("crate_version", env!("CARGO_PKG_VERSION").as_bytes()),
+        meta("created_at", &p.created_at_nanos.to_le_bytes()),
+        meta(
+            "data_block_hash_ratio",
+            &p.data_block_hash_ratio.to_le_bytes(),
+        ),
+        meta("file_size", &p.file_size.to_le_bytes()),
+        meta("filter_hash_type", &[u8::from(ChecksumType::Xxh3)]),
+        meta("index_keys_have_seqno", &[0x1]),
+        meta("initial_level", &p.initial_level.to_le_bytes()),
+        meta("item_count", &p.item_count.to_le_bytes()),
+        meta("key#max", p.last_key),
+        meta("key#min", p.first_key),
+        meta("key_count", &p.key_count.to_le_bytes()),
+        meta("prefix_truncation#data", &[1]),
+        meta("prefix_truncation#index", &[1]),
+        meta(
+            "range_tombstone_count",
+            &p.range_tombstone_count.to_le_bytes(),
+        ),
+        meta(
+            "restart_interval#data",
+            &p.data_block_restart_interval.to_le_bytes(),
+        ),
+        meta(
+            "restart_interval#index",
+            &p.index_block_restart_interval.to_le_bytes(),
+        ),
+        meta("seqno#kv_max", &p.highest_kv_seqno.to_le_bytes()),
+        meta("seqno#max", &p.highest_seqno.to_le_bytes()),
+        meta("seqno#min", &p.lowest_seqno.to_le_bytes()),
+        meta("table_id", &p.table_id.to_le_bytes()),
+        meta("table_version", &[3u8]),
+        meta("tombstone_count", &p.tombstone_count.to_le_bytes()),
+        meta("user_data_size", &p.uncompressed_size.to_le_bytes()),
+        meta(
+            "weak_tombstone_count",
+            &p.weak_tombstone_count.to_le_bytes(),
+        ),
+        meta(
+            "weak_tombstone_reclaimable",
+            &p.weak_tombstone_reclaimable.to_le_bytes(),
+        ),
+    ];
+
+    #[cfg(debug_assertions)]
+    {
+        let is_sorted = meta_items.iter().is_sorted_by_key(|kv| &kv.key);
+        assert!(is_sorted, "meta items not sorted correctly");
+    }
+
+    block_buffer.clear();
+    DataBlock::encode_into(block_buffer, &meta_items, 1, 0.0)?;
+
+    Block::write_into(
+        file_writer,
+        block_buffer,
+        crate::table::block::BlockIdentity {
+            tree_id: 0,
+            // Meta is read FIRST during table open, BEFORE the reader
+            // knows the table_id (the table_id is what meta itself
+            // carries). Writer mirrors that with table_id=0 so write
+            // and read sides agree on the AAD discriminator once
+            // #251 wires AAD.
+            table_id: 0,
+            block_offset: p.block_offset,
+            block_type: crate::table::block::BlockType::Meta,
+            dict_id: 0,
+            window_log: 0,
+        },
+        CompressionType::None,
+        encryption,
+        #[cfg(zstd_any)]
+        None,
+    )?;
+
+    Ok(())
 }
 
 #[cfg(test)]

@@ -169,14 +169,25 @@ mod encrypted {
         let sst_path = find_table_file(dir.path());
         let mut sst_bytes = std::fs::read(&sst_path)?;
 
-        // Flip bytes in the middle of the data section (after the header)
-        let tamper_offset = sst_bytes.len() / 2;
+        // Flip bytes inside the first data block. The SFA writer puts
+        // the data section as the very first section at file offset 0;
+        // a data block starts with a `Header` (33 bytes, exposed as
+        // `Header::serialized_len()`: magic[4] + type[1] + checksum[16]
+        // + lengths[8] + CRC[4]), then encrypted payload. Offset 64
+        // lands well inside the payload of the
+        // first (and for this tiny one-KV table, only) data block,
+        // regardless of meta-block layout near the tail. Picking a
+        // layout-independent offset avoids re-introducing this test
+        // every time the writer grows a new tail section.
+        let tamper_offset: usize = 64;
+        assert!(
+            tamper_offset + 8 < sst_bytes.len(),
+            "SST too small for tamper test"
+        );
         for i in 0..8 {
-            if tamper_offset + i < sst_bytes.len() {
-                #[expect(clippy::indexing_slicing, reason = "bounds checked")]
-                {
-                    sst_bytes[tamper_offset + i] ^= 0xFF;
-                }
+            #[expect(clippy::indexing_slicing, reason = "bounds checked above")]
+            {
+                sst_bytes[tamper_offset + i] ^= 0xFF;
             }
         }
         std::fs::write(&sst_path, &sst_bytes)?;
