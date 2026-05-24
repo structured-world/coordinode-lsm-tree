@@ -934,8 +934,52 @@ impl Table {
         let regions = ParsedRegions::parse_from_toc(trailer.toc())?;
 
         log::trace!("Reading meta block, with meta_ptr={:?}", regions.metadata);
-        let metadata =
-            ParsedMeta::load_with_handle(&*file, &regions.metadata, encryption.as_deref())?;
+        // TAIL first (authoritative copy by convention; physically
+        // identical content to MID — same `file_size`, same
+        // `created_at`, same KV map — the only difference is which
+        // SFA section is loaded). On any decode/decrypt/checksum
+        // failure fall back to the MID copy if present.
+        let metadata = match ParsedMeta::load_with_handle(
+            &*file,
+            &regions.metadata,
+            encryption.as_deref(),
+        ) {
+            Ok(m) => m,
+            Err(tail_err) => {
+                if let Some(mid_handle) = regions.metadata_mid {
+                    log::warn!(
+                        "TAIL meta block unreadable for {} ({tail_err}); falling back to MID copy",
+                        file_path.display(),
+                    );
+                    // Match the PR contract: when BOTH copies fail,
+                    // surface the original TAIL error (callers care
+                    // about the authoritative copy's failure mode).
+                    // The MID failure goes to the log so it's not
+                    // silently dropped from diagnostics.
+                    // MID and TAIL are byte-identical: same `file_size`
+                    // (= `*self.meta.file_pos`, only bumped inside
+                    // `spill_block`, unchanged between the two writes),
+                    // same `created_at` (snapshotted once in
+                    // `finish()`), same KV map. MID payload is usable
+                    // directly — no sentinel patching, no
+                    // `std::fs::metadata` (which would also bypass the
+                    // pluggable `Fs` backend).
+                    match ParsedMeta::load_with_handle(&*file, &mid_handle, encryption.as_deref()) {
+                        Ok(mid) => mid,
+                        Err(mid_err) => {
+                            log::warn!(
+                                "MID meta block also unreadable for {}: {mid_err}; \
+                                 returning original TAIL error",
+                                file_path.display(),
+                            );
+                            return Err(tail_err);
+                        }
+                    }
+                } else {
+                    return Err(tail_err);
+                }
+            }
+        };
 
         // Fail-fast: if this table was written with dictionary compression,
         // verify the caller provided the matching dictionary. Without this
