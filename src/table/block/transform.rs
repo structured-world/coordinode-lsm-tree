@@ -119,9 +119,10 @@ impl<'a> CompressionContext<'a> {
     /// `dict.id()` is taken as the on-disk `dict_id`, so a mismatch
     /// is unreachable by construction. `level` is the zstd
     /// compression level the writer should use; readers don't
-    /// consume it (zstd decompression doesn't need the encoder
-    /// level — the frame header advertises everything the decoder
-    /// needs) but it's stored here to keep the on-disk
+    /// consume it (zstd decompression simply doesn't need the
+    /// encoder's chosen level — the level controls only the
+    /// encoder's CPU / ratio tradeoff and isn't carried in the zstd
+    /// frame at all). It's stored here only to keep the on-disk
     /// [`CompressionType::ZstdDict`] discriminator round-trippable
     /// for writers and metadata that DO need to remember the level
     /// (e.g. the per-table compression policy table).
