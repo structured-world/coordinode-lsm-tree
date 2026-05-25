@@ -362,6 +362,399 @@ fn load_index_block(
     Ok(block)
 }
 
+/// One KV entry materialised from an SST data block.
+///
+/// `#[non_exhaustive]` so new fields can be added in a minor version
+/// bump.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct DataEntry {
+    /// The user key bytes (no internal-key suffix, no seqno).
+    pub key: Vec<u8>,
+    /// The value bytes.
+    ///
+    /// Three reasons this can be empty:
+    /// 1. The entry is a tombstone (see [`Self::is_tombstone`]).
+    /// 2. The iterator was put into keys-only mode via
+    ///    [`DataBlockEntryIter::keys_only`]; in that mode `Value`
+    ///    entries also yield `value: Vec::new()` because the
+    ///    underlying `Slice::to_vec()` allocation is deliberately
+    ///    skipped. The caller asked not to pay it.
+    /// 3. The on-disk value is a zero-length payload (legal for
+    ///    `Value` entries: an empty byte-string is distinct from
+    ///    a tombstone).
+    ///
+    /// Use [`Self::value_type`] to disambiguate (1) from the
+    /// other two, and the iterator construction site to know
+    /// whether (2) applies; this field cannot tell them apart on
+    /// its own.
+    ///
+    /// For [`crate::ValueType::Indirection`] entries the bytes
+    /// are the encoded blob handle, NOT the resolved blob payload.
+    pub value: Vec<u8>,
+    /// Per-entry sequence number as stored in the internal key on
+    /// disk. This is the **table-local** (or "local") seqno: the
+    /// `Table::get` / `Iter` read path adds the table's `global_seqno`
+    /// offset on top of this for ingested SSTs (see
+    /// `src/table/mod.rs` for the translation), so the value the
+    /// running tree sees can be higher than the byte here. For an
+    /// SST written by the normal writer path `global_seqno == 0`
+    /// and the local seqno IS the visible seqno; for an ingested
+    /// SST the visible seqno is `global_seqno + local_seqno` and
+    /// this field gives the local component only.
+    ///
+    /// Diagnostic surface: this facade deliberately exposes the
+    /// on-disk byte, not the translated value, because operators
+    /// using `sst-dump` are usually trying to correlate against the
+    /// raw on-disk state. If you need the live-tree-visible seqno,
+    /// pair this with the `global_seqno` stored in the table's meta
+    /// block (currently not exposed on [`TableProperties`]; tracked
+    /// for a future API addition).
+    pub seqno: u64,
+    /// Underlying internal-key value type. Data blocks can contain
+    /// `Value`, `Tombstone`, `WeakTombstone`, `MergeOperand`, and
+    /// `Indirection` (blob pointer) entries; the convenience predicate
+    /// [`Self::is_tombstone`] folds the two tombstone variants into a
+    /// single boolean, but callers that need to distinguish merge
+    /// operands or blob pointers from regular values must read this
+    /// field directly. Going through the underlying enum keeps the
+    /// facade aligned with the crate's own tombstone predicate
+    /// ([`crate::ValueType::is_tombstone`]) as a single source of
+    /// truth so a future variant addition does not silently start
+    /// flagging unrelated entries as tombstones.
+    pub value_type: crate::ValueType,
+}
+
+impl DataEntry {
+    /// `true` iff [`Self::value_type`] is `Tombstone` or `WeakTombstone`.
+    ///
+    /// Convenience wrapper that delegates to
+    /// [`crate::ValueType::is_tombstone`]; `MergeOperand` and
+    /// `Indirection` entries return `false` here even though their
+    /// `value` bytes do not represent a regular plaintext value.
+    #[must_use]
+    pub fn is_tombstone(&self) -> bool {
+        self.value_type.is_tombstone()
+    }
+}
+
+/// Streaming iterator over every KV entry in an SST's data section.
+///
+/// Returned by [`iter_data_block_entries`]. Owns the underlying file
+/// handle and the list of pending data-block handles; loads exactly
+/// one data block at a time and drops it before moving to the next.
+///
+/// Memory cost is **`O(N_data_blocks) * 16 B + largest_data_block +
+/// key.len + value.len`**, where the first term is the upfront
+/// `Vec<BlockHandle>` collected from the TLI at construction time
+/// (one 16-byte handle per data block). For typical SSTs this is
+/// negligible: a 64 MiB SST with 4 KiB data blocks has ~16 K
+/// handles ≈ 256 KiB — small compared to a single decompressed
+/// data block. A 1 GiB SST gives ~4 MiB of handles. The trade-off
+/// buys constant-time `next()` per block lookup; truly streaming
+/// the TLI through the iterator would require nested self-cells
+/// (the `OwnedIndexBlockIter` already self-references its
+/// `IndexBlock`) which is structurally awkward for the rare case
+/// where the handle vec actually matters in absolute terms.
+///
+/// Encrypted SSTs and partitioned-index SSTs both return an error
+/// at construction time — see [`iter_data_block_entries`] for the
+/// full contract.
+#[cfg(feature = "std")]
+pub struct DataBlockEntryIter {
+    file: Box<dyn crate::fs::FsFile>,
+    table_id: crate::table::TableId,
+    data_block_compression: CompressionType,
+    /// Remaining data-block handles (FIFO). Drained as blocks are
+    /// loaded. Held as a `Vec` rather than a `VecDeque` because the
+    /// TLI walks the handles in sorted order already, and `Vec::pop`
+    /// from the tail with reversed input is cheaper than the
+    /// double-ended queue overhead.
+    ///
+    /// Stores plain `BlockHandle` (offset + size) rather than
+    /// `KeyedBlockHandle`. `KeyedBlockHandle` carries `end_key:
+    /// Slice` which is a view into the TLI block buffer; collecting
+    /// the keyed variant would keep the entire TLI block alive for
+    /// the iterator's lifetime. Stripping to the bare handle lets
+    /// the TLI block drop after enumeration completes, leaving only
+    /// the 16-byte-per-block `Vec` here. See the struct-level
+    /// docstring for the memory-cost analysis.
+    remaining_handles: Vec<crate::table::BlockHandle>,
+    /// Iterator over the currently-loaded block, or `None` when we
+    /// haven't loaded a block yet or just finished one.
+    current: Option<crate::table::iter::OwnedDataBlockIter>,
+    /// When `true`, skip materialising `DataEntry.value` — leave it
+    /// as an empty `Vec`. Toggled via [`Self::keys_only`]. Saves the
+    /// `Slice::to_vec()` allocation per entry for callers (e.g.
+    /// `sst-dump dump --keys-only`) that don't need the value bytes.
+    keys_only: bool,
+}
+
+#[cfg(feature = "std")]
+impl DataBlockEntryIter {
+    /// Suppress value materialisation: yielded `DataEntry` values
+    /// have `value: Vec::new()` instead of the per-entry
+    /// `to_vec()`-copy of the on-disk bytes. Use for keys-only
+    /// walks (the entire SST data section can be processed without
+    /// allocating any value bytes; only the key copy plus the
+    /// constant-size struct fields stay).
+    ///
+    /// Builder-style — chain off the constructor:
+    ///
+    /// ```ignore
+    /// let iter = iter_data_block_entries(path)?.keys_only();
+    /// ```
+    #[must_use]
+    pub const fn keys_only(mut self) -> Self {
+        self.keys_only = true;
+        self
+    }
+}
+
+#[cfg(feature = "std")]
+impl Iterator for DataBlockEntryIter {
+    type Item = crate::Result<DataEntry>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            // Drain the current block before considering the next one.
+            if let Some(iter) = self.current.as_mut() {
+                if let Some(internal) = iter.next() {
+                    let value = if self.keys_only {
+                        // Skip the `Slice::to_vec()` allocation; the
+                        // caller has opted out of value bytes for
+                        // this walk. An empty `Vec` is cheap (no
+                        // heap allocation in current `Vec::new()`
+                        // implementations on stable Rust).
+                        Vec::new()
+                    } else {
+                        internal.value.to_vec()
+                    };
+                    let entry = DataEntry {
+                        key: internal.key.user_key.to_vec(),
+                        value,
+                        seqno: internal.key.seqno,
+                        value_type: internal.key.value_type,
+                    };
+                    return Some(Ok(entry));
+                }
+                self.current = None;
+            }
+
+            // Advance to the next data block.
+            let handle = self.remaining_handles.pop()?;
+            match load_data_block_iter(
+                &*self.file,
+                &handle,
+                self.table_id,
+                self.data_block_compression,
+            ) {
+                Ok(iter) => {
+                    self.current = Some(iter);
+                }
+                Err(e) => {
+                    // Surface the block-load failure but stop the
+                    // walk: subsequent blocks would likely fail the
+                    // same way and the operator only needs the first
+                    // diagnostic.
+                    self.remaining_handles.clear();
+                    return Some(Err(e));
+                }
+            }
+        }
+    }
+}
+
+/// Reads `path` and returns a streaming iterator over every KV entry
+/// in the SST's data blocks.
+///
+/// Same out-of-band path-based open semantics as
+/// [`read_table_properties`] etc.: uses [`StdFs`], no encryption
+/// provider. Walks the top-level index (TLI) to enumerate data-block
+/// handles, then yields entries one block at a time so memory cost
+/// stays bounded.
+///
+/// # Scope
+///
+/// Only **full-index** SSTs are supported by this facade. SSTs with
+/// a separate `index` SFA section (partitioned index) point their
+/// TLI entries at sub-index leaves rather than data blocks; walking
+/// the leaves to enumerate individual data blocks is a separate
+/// operation not yet wired here. Partitioned-index SSTs return an
+/// `Io(ErrorKind::Unsupported)` error.
+///
+/// **Custom user comparator: forward iteration works, but bounds /
+/// seek operations do not.** Forward iteration over the data section
+/// is positional — the index walks blocks in their on-disk file
+/// order and the block iterator yields entries in their on-disk
+/// encoded order, neither of which depends on the comparator. So a
+/// bounds-free walk of a custom-comparator SST through this facade
+/// streams entries in the SST's own sort order correctly. What this
+/// facade can't do is run [`crate::comparator::default_comparator`]
+/// for seek / point-read / range-bounded operations layered on top
+/// (e.g. `sst-dump dump --from/--to` applies bytewise bounds and
+/// breaks early on the upper bound, which only makes sense for the
+/// default lexicographic comparator). Callers that need
+/// comparator-correct range queries on a custom-comparator SST
+/// should use the owning `Tree`'s regular read APIs.
+///
+/// **Zstd-dictionary blocks: not supported.** This facade calls
+/// [`crate::table::Block::from_file`] with no
+/// [`crate::compression::ZstdDictionary`] attached (it has no way to
+/// fetch one without a live `Tree`), so blocks compressed with
+/// [`crate::CompressionType::ZstdDict`] fail with
+/// [`crate::Error::ZstdDictMismatch`] even though they are otherwise
+/// valid. Inspect such SSTs through the owning `Tree` instead.
+///
+/// # Errors
+///
+/// Returns an error if:
+/// - the file cannot be opened or read,
+/// - the SFA trailer is missing / malformed,
+/// - the `meta` block fails to decode (needed for
+///   `data_block_compression`),
+/// - the SST has a partitioned-index layout (`index` SFA section
+///   present),
+/// - the TLI block cannot be loaded or its trailer is malformed,
+/// - the table is encrypted: this function does not take an
+///   encryption provider, so AEAD-protected blocks fail to decode.
+///
+/// Per-entry errors are surfaced by the returned iterator's
+/// `Item = Result<DataEntry>` shape: a single block failing to load
+/// yields one `Err` and ends the walk.
+#[cfg(feature = "std")]
+pub fn iter_data_block_entries(path: &Path) -> crate::Result<DataBlockEntryIter> {
+    use crate::table::IndexBlock;
+    use crate::table::block_index::iter::OwnedIndexBlockIter;
+
+    let fs = StdFs;
+    let mut file = fs.open(path, &FsOpenOptions::new().read(true))?;
+
+    let sfa_reader = sfa::Reader::from_reader(&mut file)?;
+    let toc = sfa_reader.toc();
+    let regions = ParsedRegions::parse_from_toc(toc)?;
+
+    if regions.index.is_some() {
+        return Err(crate::Error::Io(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "partitioned-index SST (separate `index` section present) is not yet supported \
+             by iter_data_block_entries; walking sub-index leaves to enumerate data blocks \
+             is a follow-up surface",
+        )));
+    }
+
+    let meta = match ParsedMeta::load_with_handle(&*file, &regions.metadata, None) {
+        Ok(m) => m,
+        Err(tail_err) => {
+            if let Some(mid_handle) = regions.metadata_mid {
+                match ParsedMeta::load_with_handle(&*file, &mid_handle, None) {
+                    Ok(mid) => mid,
+                    Err(_) => return Err(tail_err),
+                }
+            } else {
+                return Err(tail_err);
+            }
+        }
+    };
+    let table_id = meta.id;
+    let data_block_compression = meta.data_block_compression;
+    let index_compression = meta.index_block_compression;
+
+    // Load TLI (with tail-mirror fallback). For full-index tables
+    // each TLI entry IS a data-block handle, so this list is what
+    // we stream over.
+    let tli_block = if let Some(tail_handle) = regions.tli_tail {
+        match load_index_block(&*file, tail_handle, table_id, index_compression) {
+            Ok(b) => b,
+            Err(tail_err) => {
+                match load_index_block(&*file, regions.tli, table_id, index_compression) {
+                    Ok(b) => b,
+                    Err(_) => return Err(tail_err),
+                }
+            }
+        }
+    } else {
+        load_index_block(&*file, regions.tli, table_id, index_compression)?
+    };
+
+    let block = IndexBlock::new(tli_block);
+    let iter = OwnedIndexBlockIter::from_block(block, crate::comparator::default_comparator())?;
+    // Materialise each handle to the bare `BlockHandle` (offset +
+    // size) right here, so the surrounding `IndexBlock` and its
+    // backing `Slice` can drop as soon as this collect finishes.
+    // `KeyedBlockHandle.end_key` is a view into the TLI block bytes;
+    // holding `KeyedBlockHandle` in the iterator struct would keep
+    // the entire TLI block alive for the iterator's lifetime, which
+    // contradicts the "memory bounded to one data block" guarantee.
+    // `BlockHandle` is `Copy`, so `into_inner()` is cheap and
+    // releases the `Slice` view at the same time.
+    let mut handles: Vec<crate::table::BlockHandle> = iter
+        .map(crate::table::KeyedBlockHandle::into_inner)
+        .collect();
+    // Reverse so `pop` from the tail yields the smallest end_key
+    // first — matches the natural left-to-right read order
+    // operators expect from `dump`.
+    handles.reverse();
+
+    Ok(DataBlockEntryIter {
+        file,
+        table_id,
+        data_block_compression,
+        remaining_handles: handles,
+        current: None,
+        keys_only: false,
+    })
+}
+
+#[cfg(feature = "std")]
+fn load_data_block_iter(
+    file: &dyn crate::fs::FsFile,
+    handle: &crate::table::BlockHandle,
+    table_id: crate::table::TableId,
+    compression: CompressionType,
+) -> crate::Result<crate::table::iter::OwnedDataBlockIter> {
+    use crate::table::DataBlock;
+    use crate::table::block::{Block, BlockIdentity, BlockType};
+    use crate::table::iter::OwnedDataBlockIter;
+
+    let block = Block::from_file(
+        file,
+        *handle,
+        BlockIdentity {
+            tree_id: 0,
+            table_id,
+            // Same writer / reader agreement as TLI / filter: writer
+            // emits data blocks with `block_offset` set to a
+            // running cursor that we don't have exposed here; the
+            // BlockIdentity is ignored by `Block::from_file` today
+            // and only becomes load-bearing when #251 wires it into
+            // AEAD AAD. Holding at 0 keeps this facade consistent
+            // with how it loads the meta / TLI / filter blocks
+            // above. Once real offsets are threaded, all three
+            // load sites need updating together.
+            block_offset: 0,
+            block_type: BlockType::Data,
+            dict_id: 0,
+            window_log: 0,
+        },
+        compression,
+        None,
+        #[cfg(zstd_any)]
+        None,
+    )?;
+
+    if block.header.block_type != BlockType::Data {
+        return Err(crate::Error::InvalidTag((
+            "BlockType",
+            block.header.block_type.into(),
+        )));
+    }
+
+    let data_block = DataBlock::new(block);
+    OwnedDataBlockIter::try_new(data_block, |b| {
+        b.try_iter(crate::comparator::default_comparator())
+    })
+}
 /// Read-only stats for a single-block (full) `BuRR` / Ribbon filter
 /// section.
 ///
@@ -402,7 +795,6 @@ pub struct FilterStats {
     /// upper bound on the actual ribbon parameter `bits_per_key`.
     pub bits_per_key: f64,
 }
-
 /// Reads `path` and returns `BuRR` filter sizing stats for the SST's
 /// `filter` section, or `Ok(None)` if the SST has no filter section
 /// at all (filter-less table).
