@@ -106,9 +106,11 @@ enum Command {
     /// Honours `--from` / `--to` key bounds (inclusive lower,
     /// exclusive upper, matching standard Rust range semantics) and
     /// caps output at `--max=N` entries when set. With `--keys-only`,
-    /// skips the value column entirely. Only single-block
-    /// (full-index) SSTs are supported; partitioned-index SSTs exit
-    /// non-zero (see `index-dump` for the layout signal). Reads
+    /// skips the value column entirely. Only full-index SSTs are
+    /// supported (the index is a single block; the data section
+    /// itself can have any number of data blocks); partitioned-index
+    /// SSTs exit non-zero (see `index-dump` for the layout signal).
+    /// Reads
     /// blocks streamingly: memory cost stays at one data block
     /// regardless of SST size.
     ///
