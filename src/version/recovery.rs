@@ -158,7 +158,17 @@ pub fn recover(folder: &Path, fs: &dyn Fs, mode: ManifestRecoveryMode) -> crate:
     // behaviour) overcounted: a manifest cut between two runs
     // would log "1 table record dropped" when zero records were
     // lost — only a header byte.
+    // Two separate counters per section: "tail-tolerant"-class
+    // drops vs "skip_any / pit"-class drops. The tail counter
+    // covers the established power-loss-at-write-tail shape;
+    // the corruption counter covers checksum mismatches and
+    // bad framing headers under the new PIT / SkipAny modes.
+    // The post-section summary log surfaces them separately so
+    // operators can tell "writer crashed before fsync" (tail)
+    // apart from "real bit-rot inside a written record"
+    // (corruption).
     let mut tables_dropped_to_tail: u32 = 0;
+    let mut tables_dropped_to_corruption: u32 = 0;
     let mut tables_truncated_headers: u32 = 0;
 
     {
@@ -294,7 +304,9 @@ pub fn recover(folder: &Path, fs: &dyn Fs, mode: ManifestRecoveryMode) -> crate:
                             levels.push(level);
                             break 'levels;
                         }
-                        FramedRecordOutcome::ChecksumMismatch { bytes_consumed } if skip_any => {
+                        FramedRecordOutcome::ChecksumMismatch { bytes_consumed, .. }
+                            if skip_any =>
+                        {
                             // Single bad record under SkipAny: log
                             // it and continue with the next record.
                             // The 12-byte header was internally
@@ -309,33 +321,38 @@ pub fn recover(folder: &Path, fs: &dyn Fs, mode: ManifestRecoveryMode) -> crate:
                                  #{curr_version_id}, skipping"
                             );
                             tables_bytes_consumed += bytes_consumed;
-                            tables_dropped_to_tail = tables_dropped_to_tail.saturating_add(1);
+                            tables_dropped_to_corruption =
+                                tables_dropped_to_corruption.saturating_add(1);
                         }
                         FramedRecordOutcome::ChecksumMismatch { .. } if pit_prefix => {
-                            // PIT: corruption is the boundary; drop
-                            // the in-progress run + level + all
-                            // higher (not-yet-read) levels. The
-                            // tables_dropped_to_tail counter reports
-                            // how many records this level's surviving
-                            // tail loses; deeper levels are absent
-                            // entirely from `levels`.
+                            // PIT: corruption is the boundary. Keep
+                            // the consistent prefix collected so far
+                            // (records before this one in the run +
+                            // any complete earlier runs in this
+                            // level + every earlier level), drop
+                            // everything that follows (the corrupt
+                            // record, the remaining records of this
+                            // run, and every level not yet read).
+                            // Adapts RocksDB kPointInTimeRecovery's
+                            // "accept the consistent prefix" rule
+                            // to the level/run/table nesting.
                             log::warn!(
                                 "pit: tables record checksum mismatch in version \
-                                 #{curr_version_id}; truncating to last consistent \
-                                 record-group boundary (dropping current run + level + \
-                                 unread levels)"
+                                 #{curr_version_id}; accepting consistent prefix and \
+                                 dropping the rest of this run + unread levels"
                             );
                             let recovered = u32::try_from(run.len()).unwrap_or(u32::MAX);
-                            tables_dropped_to_tail = tables_dropped_to_tail
+                            tables_dropped_to_corruption = tables_dropped_to_corruption
                                 .saturating_add(table_count.saturating_sub(recovered));
                             level.push(run);
                             levels.push(level);
                             break 'levels;
                         }
-                        FramedRecordOutcome::ChecksumMismatch { .. } => {
-                            return Err(crate::Error::ChecksumMismatch {
-                                got: Checksum::from_raw(0),
-                                expected: Checksum::from_raw(0),
+                        FramedRecordOutcome::ChecksumMismatch { expected, got, .. } => {
+                            return Err(crate::Error::ManifestFrameChecksumMismatch {
+                                section: "tables",
+                                expected,
+                                got,
                             });
                         }
                         FramedRecordOutcome::BadHeader if skip_any || pit_prefix => {
@@ -349,7 +366,7 @@ pub fn recover(folder: &Path, fs: &dyn Fs, mode: ManifestRecoveryMode) -> crate:
                                  section are unrecoverable"
                             );
                             let recovered = u32::try_from(run.len()).unwrap_or(u32::MAX);
-                            tables_dropped_to_tail = tables_dropped_to_tail
+                            tables_dropped_to_corruption = tables_dropped_to_corruption
                                 .saturating_add(table_count.saturating_sub(recovered));
                             level.push(run);
                             levels.push(level);
@@ -372,16 +389,22 @@ pub fn recover(folder: &Path, fs: &dyn Fs, mode: ManifestRecoveryMode) -> crate:
         }
     }
 
-    if tables_dropped_to_tail > 0 || tables_truncated_headers > 0 {
+    if tables_dropped_to_tail > 0
+        || tables_dropped_to_corruption > 0
+        || tables_truncated_headers > 0
+    {
         log::warn!(
-            "manifest tail truncation in version #{curr_version_id}: \
-             {tables_dropped_to_tail} table record(s) dropped, \
+            "manifest recovery summary for version #{curr_version_id}: \
+             {tables_dropped_to_tail} table record(s) dropped to tail-truncation, \
+             {tables_dropped_to_corruption} dropped to per-record corruption \
+             (skip_any/pit modes), \
              {tables_truncated_headers} level/run header(s) truncated; \
              recovered tree may be missing SSTs",
         );
     }
 
     let mut blob_dropped_to_tail: u32 = 0;
+    let mut blob_dropped_to_corruption: u32 = 0;
     let blob_file_ids = {
         let section = toc
             .section(b"blob_files")
@@ -441,28 +464,30 @@ pub fn recover(folder: &Path, fs: &dyn Fs, mode: ManifestRecoveryMode) -> crate:
                     blob_dropped_to_tail = blob_file_count.saturating_sub(recovered);
                     break;
                 }
-                FramedRecordOutcome::ChecksumMismatch { bytes_consumed } if skip_any => {
+                FramedRecordOutcome::ChecksumMismatch { bytes_consumed, .. } if skip_any => {
                     log::warn!(
                         "skip_any: blob_files record checksum mismatch \
                          ({bytes_consumed} bytes) in version \
                          #{curr_version_id}, skipping"
                     );
                     blob_bytes_consumed += bytes_consumed;
-                    blob_dropped_to_tail = blob_dropped_to_tail.saturating_add(1);
+                    blob_dropped_to_corruption = blob_dropped_to_corruption.saturating_add(1);
                 }
                 FramedRecordOutcome::ChecksumMismatch { .. } if pit_prefix => {
                     log::warn!(
                         "pit: blob_files record checksum mismatch in version \
-                         #{curr_version_id}; truncating remaining blob records"
+                         #{curr_version_id}; accepting consistent prefix and \
+                         dropping the rest of the blob_files section"
                     );
                     let recovered = u32::try_from(blob_file_ids.len()).unwrap_or(u32::MAX);
-                    blob_dropped_to_tail = blob_file_count.saturating_sub(recovered);
+                    blob_dropped_to_corruption = blob_file_count.saturating_sub(recovered);
                     break;
                 }
-                FramedRecordOutcome::ChecksumMismatch { .. } => {
-                    return Err(crate::Error::ChecksumMismatch {
-                        got: Checksum::from_raw(0),
-                        expected: Checksum::from_raw(0),
+                FramedRecordOutcome::ChecksumMismatch { expected, got, .. } => {
+                    return Err(crate::Error::ManifestFrameChecksumMismatch {
+                        section: "blob_files",
+                        expected,
+                        got,
                     });
                 }
                 FramedRecordOutcome::BadHeader if skip_any || pit_prefix => {
@@ -471,7 +496,7 @@ pub fn recover(folder: &Path, fs: &dyn Fs, mode: ManifestRecoveryMode) -> crate:
                          #{curr_version_id}; remaining records unrecoverable"
                     );
                     let recovered = u32::try_from(blob_file_ids.len()).unwrap_or(u32::MAX);
-                    blob_dropped_to_tail = blob_file_count.saturating_sub(recovered);
+                    blob_dropped_to_corruption = blob_file_count.saturating_sub(recovered);
                     break;
                 }
                 // Strict mode: merged Tail / BadHeader → Unrecoverable.
@@ -485,10 +510,12 @@ pub fn recover(folder: &Path, fs: &dyn Fs, mode: ManifestRecoveryMode) -> crate:
         blob_file_ids
     };
 
-    if blob_dropped_to_tail > 0 {
+    if blob_dropped_to_tail > 0 || blob_dropped_to_corruption > 0 {
         log::warn!(
-            "manifest tail truncation dropped {blob_dropped_to_tail} blob-file record(s) \
-             from version #{curr_version_id}; recovered tree may be missing blob files",
+            "manifest blob_files recovery summary for version #{curr_version_id}: \
+             {blob_dropped_to_tail} blob-file record(s) dropped to tail-truncation, \
+             {blob_dropped_to_corruption} dropped to per-record corruption \
+             (skip_any/pit modes); recovered tree may be missing blob files",
         );
     }
 
@@ -1191,8 +1218,14 @@ mod tests {
         let err = recover(folder, &fs, ManifestRecoveryMode::AbsoluteConsistency)
             .expect_err("corrupt record must abort AbsoluteConsistency");
         assert!(
-            matches!(err, crate::Error::ChecksumMismatch { .. }),
-            "expected ChecksumMismatch, got: {err:?}",
+            matches!(
+                err,
+                crate::Error::ManifestFrameChecksumMismatch {
+                    section: "tables",
+                    ..
+                }
+            ),
+            "expected ManifestFrameChecksumMismatch on the tables section, got: {err:?}",
         );
         Ok(())
     }

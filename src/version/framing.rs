@@ -72,21 +72,23 @@ pub const FRAME_HEADER_LEN: usize = 4 + 8;
 /// trigger a multi-megabyte allocation on a corrupt header.
 pub const MAX_FRAME_PAYLOAD: u32 = 64 * 1024;
 
-/// Writes a framed record: writes the 12-byte header, then the
-/// closure-provided payload, then patches the header with the
-/// actual payload length and XXH3-64 digest.
-///
-/// `payload_fn` is invoked once with a temporary buffer; on
-/// return, the buffer's contents become the record body. This
-/// keeps the call site readable (no manual buf-then-len bookkeeping)
-/// while still allowing the writer to compute `len` + checksum
-/// from the actual emitted bytes rather than a caller-declared
-/// size.
+/// Writes a framed record. The closure-provided payload is
+/// assembled in a temporary `Vec<u8>` first so the `len` and
+/// XXH3-64 digest can be computed from the actual emitted bytes;
+/// the 12-byte header is then written in a single pass before
+/// the payload (no seek/backpatch is involved — both header
+/// fields are known by the time the first byte of the header
+/// reaches `writer`).
 ///
 /// # Errors
 ///
-/// Returns the I/O error from `writer` if any write fails, or
-/// surfaces any error returned by `payload_fn`.
+/// Returns the I/O error from `writer` if any write fails,
+/// surfaces any error returned by `payload_fn`, or returns
+/// [`crate::Error::Unrecoverable`] when the payload exceeds
+/// [`MAX_FRAME_PAYLOAD`] — emitting an oversized record would
+/// produce a frame the reader always rejects as
+/// [`FramedRecordOutcome::BadHeader`], silently bricking
+/// recovery for that section.
 pub fn write_framed_record<W, F>(writer: &mut W, payload_fn: F) -> crate::Result<()>
 where
     W: Write,
@@ -95,9 +97,19 @@ where
     let mut payload: Vec<u8> = Vec::new();
     payload_fn(&mut payload)?;
 
+    if payload.len() > MAX_FRAME_PAYLOAD as usize {
+        log::error!(
+            "write_framed_record refusing to emit oversized payload \
+             ({} bytes; MAX_FRAME_PAYLOAD = {})",
+            payload.len(),
+            MAX_FRAME_PAYLOAD,
+        );
+        return Err(crate::Error::Unrecoverable);
+    }
+
     #[expect(
         clippy::cast_possible_truncation,
-        reason = "manifest records are bounded by MAX_FRAME_PAYLOAD = 64 KiB, which fits in u32"
+        reason = "the explicit MAX_FRAME_PAYLOAD guard above ensures payload.len() fits in u32"
     )]
     let len = payload.len() as u32;
     let digest = xxhash_rust::xxh3::xxh3_64(&payload);
@@ -125,8 +137,15 @@ pub enum FramedRecordOutcome {
     /// consistent (len fits the section), so callers operating in
     /// `SkipAny` mode know how many bytes were consumed and can
     /// continue reading after the skip. The `bytes_consumed` field
-    /// is `FRAME_HEADER_LEN + len`.
-    ChecksumMismatch { bytes_consumed: u64 },
+    /// is `FRAME_HEADER_LEN + len`. The `expected` / `got` digest
+    /// fields carry the actual XXH3-64 values so strict-mode
+    /// callers can surface them in the error path instead of
+    /// reporting zeros.
+    ChecksumMismatch {
+        bytes_consumed: u64,
+        expected: u64,
+        got: u64,
+    },
 
     /// The header's `len` field cannot be trusted (it exceeds
     /// [`MAX_FRAME_PAYLOAD`] or the section's remaining bytes). The
@@ -172,16 +191,25 @@ pub fn read_framed_record<R: Read>(
         Err(e) => return Err(e.into()),
     };
 
-    if len > MAX_FRAME_PAYLOAD || u64::from(len) + 8 > remaining_in_section {
-        // The header `len` is implausible: it would either point
-        // past the end of the section, or claim a payload larger
-        // than any legitimate manifest record. We cannot trust it
-        // to skip — anything that follows might or might not be
-        // the next record header. The caller is told to fall
-        // back to section-level recovery; we have only consumed
-        // the 4 bytes of `len` so far, but advancing the reader
-        // further on a forged header would compound the damage.
+    if len > MAX_FRAME_PAYLOAD {
+        // `len` exceeds the sanity bound (64 KiB). This is a truly
+        // implausible value — no legitimate record approaches it, so
+        // the header itself is forged. We cannot trust `len` to skip
+        // past this record; the caller is told to fall back to
+        // section-level recovery. Only the 4 bytes of `len` have
+        // been consumed.
         return Ok(FramedRecordOutcome::BadHeader);
+    }
+
+    // `len` is plausible but doesn't fit in the remaining section
+    // bytes: this is a clean tail truncation, not a forged header.
+    // A power-loss between the writer committing `len` and the
+    // payload landing produces exactly this shape; calling it
+    // `BadHeader` would make `TolerateCorruptedTailRecords`
+    // wrongly abort. Surface as `TailTruncation` instead — only
+    // truly implausible `len` (above) gets the `BadHeader` tag.
+    if u64::from(len) + 8 > remaining_in_section {
+        return Ok(FramedRecordOutcome::TailTruncation);
     }
 
     let digest_expected = match reader.read_u64::<LittleEndian>() {
@@ -206,7 +234,11 @@ pub fn read_framed_record<R: Read>(
         Ok(FramedRecordOutcome::Ok(payload))
     } else {
         let bytes_consumed = FRAME_HEADER_LEN as u64 + u64::from(len);
-        Ok(FramedRecordOutcome::ChecksumMismatch { bytes_consumed })
+        Ok(FramedRecordOutcome::ChecksumMismatch {
+            bytes_consumed,
+            expected: digest_expected,
+            got: digest_actual,
+        })
     }
 }
 
@@ -220,6 +252,12 @@ pub fn read_framed_record<R: Read>(
 mod tests {
     use super::*;
     use std::io::Cursor;
+    // `use test_log::test;` SHADOWS the built-in `#[test]` attribute
+    // — every `#[test]` in this module is rewritten to
+    // `#[test_log::test]` by the macro re-export, which wires
+    // `env_logger` so a failing test prints the per-test log lines.
+    // This is the same idiom every other test module in the crate
+    // uses; rustc does NOT flag it as unused.
     use test_log::test;
 
     fn roundtrip(payload: &[u8]) -> Vec<u8> {
@@ -256,8 +294,17 @@ mod tests {
         let mut cursor = Cursor::new(&bytes);
         let outcome = read_framed_record(&mut cursor, u64::MAX).expect("read");
         match outcome {
-            FramedRecordOutcome::ChecksumMismatch { bytes_consumed } => {
+            FramedRecordOutcome::ChecksumMismatch {
+                bytes_consumed,
+                expected,
+                got,
+            } => {
                 assert_eq!(bytes_consumed, (FRAME_HEADER_LEN + payload.len()) as u64);
+                // The header carried the digest of the un-flipped
+                // payload; the reader recomputed over the flipped
+                // bytes. They must differ — that's the whole point
+                // of the test — and the variant must surface both.
+                assert_ne!(expected, got);
             }
             other => panic!("expected ChecksumMismatch, got {other:?}"),
         }
@@ -279,21 +326,22 @@ mod tests {
     }
 
     #[test]
-    fn framed_record_len_exceeding_section_bound_rejected_as_bad_header() {
+    fn framed_record_len_exceeding_section_bound_classified_as_tail_truncation() {
         // Header claims a 100-byte payload, but the section says only
-        // 8 bytes remain after `len`. The header should be flagged
-        // before the reader advances to the digest field.
+        // 8 bytes + 1 remain after `len`. That's "len plausible but
+        // payload doesn't fit" — a clean tail truncation, NOT a
+        // forged header. The reader should report TailTruncation so
+        // tolerant modes can keep the prefix; only truly implausible
+        // `len` (above MAX_FRAME_PAYLOAD) earns the BadHeader tag.
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&100u32.to_le_bytes());
         bytes.extend_from_slice(&0u64.to_le_bytes());
 
         let mut cursor = Cursor::new(&bytes);
-        // Remaining section bound = 8 (the digest) + 1, so a
-        // 100-byte payload definitely doesn't fit.
         let outcome = read_framed_record(&mut cursor, 8 + 1).expect("read");
         assert!(
-            matches!(outcome, FramedRecordOutcome::BadHeader),
-            "expected BadHeader for len > remaining, got {outcome:?}",
+            matches!(outcome, FramedRecordOutcome::TailTruncation),
+            "expected TailTruncation for len > remaining, got {outcome:?}",
         );
     }
 
