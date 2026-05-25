@@ -80,10 +80,10 @@ fn filter_stats_prints_expected_fields() {
         String::from_utf8_lossy(&out.stderr),
     );
 
-    // Default Config builds a full BuRR filter for this fixture
-    // (filter policy is on by default; we did not call any
-    // filter-disabling builder). So all four fields must be
-    // populated with non-zero values.
+    // The fixture pins `filter_policy = Bloom(BitsPerKey(10.0))`
+    // at every level explicitly (see `build_one_sst`), so the
+    // writer emits a full BuRR filter section. All four printed
+    // fields must therefore be populated with non-zero values.
     assert_eq!(
         line_value(&stdout, "item_count"),
         Some(ITEM_COUNT.to_string()),
