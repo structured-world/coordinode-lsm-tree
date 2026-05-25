@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779691446346,
+  "lastUpdate": 1779691972528,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -9594,6 +9594,84 @@ window.BENCHMARK_DATA = {
             "value": 551907.2554296263,
             "unit": "ops/sec",
             "extra": "P50: 1.6us | P99: 5.0us | P99.9: 7.5us\nthreads: 1 | elapsed: 0.36s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "edd09ad2012c5affad2980c1c680f81204b2b28a",
+          "message": "docs: add Manifest recovery modes section to README (#332)\n\n## Summary\n\nCloses the \"README recovery modes section\" acceptance item from #323.\nAdds a new \"Manifest recovery modes\" section to README listing the four\n`ManifestRecoveryMode` variants with a deployment-fit guide.\n\n## What's documented\n\n| Mode | Status | Description |\n|------|--------|-------------|\n| `AbsoluteConsistency` (default) | ✅ shipped | Production-safe, aborts\non any record corruption. |\n| `TolerateCorruptedTailRecords` | ✅ shipped | Power-loss-at-write-tail\nsalvage; keeps everything decoded before a clean tail truncation. |\n| `PointInTimeRecovery` | reserved (currently falls back to\n`AbsoluteConsistency`) | Cross-references #323 for the wire-up. |\n| `SkipAnyCorruptedRecords` | reserved (currently falls back to\n`AbsoluteConsistency`) | Cross-references #323 + #303 (repair_db\ncompanion). |\n\nThe section spells out the per-section aggregate-warn-only logging\ncontract (no per-record audit trail; operators wanting per-record\nvisibility should pair tail-tolerant open with\n`verify::verify_integrity` / `tools/sst-dump verify`) and the planned\n`repair_db`\n([#303](https://github.com/structured-world/coordinode-lsm-tree/issues/303))\nescape hatch for completely-unrecoverable MANIFESTs.\n\n## Scope\n\nThis PR ships the README docs acceptance item from #323 only. The other\ntwo acceptance items (wire `PointInTimeRecovery`, wire\n`SkipAnyCorruptedRecords`) stay open under #323 because their semantics\nhave unresolved design questions (record-group boundary granularity,\ncascade-drop vs leave-orphan policy on blob references) that need a\ndecision before code lands. Once those decisions are made, the\nimplementing PR can land alongside an update to this README section that\npromotes the two reserved rows from \"reserved\" to \"shipped\".\n\n## Test plan\n\n- [x] No code changes, no test impact\n- [x] No new em-dashes introduced (`git diff README.md | grep '^+' |\ngrep -c '—'` returns 0)\n- [x] Section placed between \"Operational tools\" and \"Support the\nproject\" — logical adjacency to other operator-facing docs\n\nCloses #323 (partial — README docs section; mode implementations stay\nopen)\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n\n## Summary by CodeRabbit\n\n* **Documentation**\n* Added detailed documentation on manifest recovery modes, explaining\nhow the system configuration affects handling of malformed MANIFEST\nrecords. Includes information on available recovery strategies,\ncorruption handling semantics, and logging behavior when records are\ndropped during recovery.\n\n<!-- review_stack_entry_start -->\n\n[![Review Change\nStack](https://storage.googleapis.com/coderabbit_public_assets/review-stack-in-coderabbit-ui.svg)](https://app.coderabbit.ai/change-stack/structured-world/coordinode-lsm-tree/pull/332?utm_source=github_walkthrough&utm_medium=github&utm_campaign=change_stack)\n\n<!-- review_stack_entry_end -->\n\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-05-25T09:52:00+03:00",
+          "tree_id": "fdbbe6f1cbc41b652eb06b14d3c5989e7863359c",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/edd09ad2012c5affad2980c1c680f81204b2b28a"
+        },
+        "date": 1779691970980,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 2120543.324338236,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.6us | P99.9: 3.7us\nthreads: 1 | elapsed: 0.09s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1247128.3777864138,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.2us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 627538.4243032278,
+            "unit": "ops/sec",
+            "extra": "P50: 1.4us | P99: 4.7us | P99.9: 7.2us\nthreads: 1 | elapsed: 0.32s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3607676.0523365564,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 3.1us | P99.9: 5.7us\nthreads: 1 | elapsed: 0.06s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 446456.5467146861,
+            "unit": "ops/sec",
+            "extra": "P50: 2.0us | P99: 5.3us | P99.9: 8.1us\nthreads: 1 | elapsed: 0.45s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 220354.75751964716,
+            "unit": "ops/sec",
+            "extra": "P50: 4.3us | P99: 5.4us | P99.9: 8.5us\nthreads: 1 | elapsed: 0.91s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1255313.7903488136,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.3us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1127992.5282226128,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 1.5us | P99.9: 2.0us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 537658.2173220805,
+            "unit": "ops/sec",
+            "extra": "P50: 1.7us | P99: 5.2us | P99.9: 7.6us\nthreads: 1 | elapsed: 0.37s | num: 200000 | iterations: 3"
           }
         ]
       }
