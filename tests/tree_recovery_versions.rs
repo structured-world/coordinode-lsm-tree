@@ -51,7 +51,7 @@ fn rewrite_manifest_format_version(path: &Path, version: u8) -> lsm_tree::Result
 }
 
 #[test]
-fn tree_writes_v5_manifest_and_recovers_it() -> lsm_tree::Result<()> {
+fn tree_writes_v6_manifest_and_recovers_it() -> lsm_tree::Result<()> {
     let folder = get_tmp_folder();
     let path = folder.path();
 
@@ -66,7 +66,7 @@ fn tree_writes_v5_manifest_and_recovers_it() -> lsm_tree::Result<()> {
         tree.insert("a", "a", 0);
         tree.flush_active_memtable(0)?;
 
-        assert_eq!(5, read_manifest_format_version(path)?);
+        assert_eq!(6, read_manifest_format_version(path)?);
     }
 
     {
@@ -78,22 +78,24 @@ fn tree_writes_v5_manifest_and_recovers_it() -> lsm_tree::Result<()> {
         .open()?;
 
         assert_eq!(Some("a".as_bytes().into()), tree.get("a", 1)?);
-        assert_eq!(5, read_manifest_format_version(path)?);
+        assert_eq!(6, read_manifest_format_version(path)?);
     }
 
     Ok(())
 }
 
 #[test]
-fn tree_rejects_pre_v5_manifest() -> lsm_tree::Result<()> {
-    // V5 introduced a wire-format break for filter blocks (BuRR replaces
-    // Bloom). V3/V4 tables on disk cannot be read by this version and
-    // vice versa — opening a manifest tagged with either pre-V5 version
-    // must fail with InvalidVersion at recovery time rather than
-    // silently misreading filter bytes later. We assert BOTH V3 and V4
-    // explicitly so the boundary stays exact and a future "accept V4 if
-    // …" relaxation lights up the test rather than passing quietly.
-    for pre_v5 in [3_u8, 4_u8] {
+fn tree_rejects_pre_v6_manifest() -> lsm_tree::Result<()> {
+    // V6 introduces per-block Reed-Solomon Page ECC: the block header
+    // gains an `ecc_length` field and the block magic is bumped so a
+    // pre-V6 reader rejects V6 blocks immediately at header decode.
+    // Pre-V6 tables on disk cannot be read by this version and vice
+    // versa — opening a manifest tagged with any pre-V6 version must
+    // fail with InvalidVersion at recovery time rather than silently
+    // misreading block bytes later. We assert V3, V4 AND V5 explicitly
+    // so the boundary stays exact and a future "accept V5 if …"
+    // relaxation lights up the test rather than passing quietly.
+    for pre_v6 in [3_u8, 4_u8, 5_u8] {
         let folder = get_tmp_folder();
         let path = folder.path();
 
@@ -108,9 +110,9 @@ fn tree_rejects_pre_v5_manifest() -> lsm_tree::Result<()> {
             tree.insert("a", "a", 0);
             tree.flush_active_memtable(0)?;
 
-            assert_eq!(5, read_manifest_format_version(path)?);
-            rewrite_manifest_format_version(path, pre_v5)?;
-            assert_eq!(pre_v5, read_manifest_format_version(path)?);
+            assert_eq!(6, read_manifest_format_version(path)?);
+            rewrite_manifest_format_version(path, pre_v6)?;
+            assert_eq!(pre_v6, read_manifest_format_version(path)?);
         }
 
         let reopened = Config::new(
@@ -123,12 +125,12 @@ fn tree_rejects_pre_v5_manifest() -> lsm_tree::Result<()> {
         match reopened {
             Err(lsm_tree::Error::InvalidVersion(v)) => {
                 assert_eq!(
-                    v, pre_v5,
-                    "V{pre_v5} manifest must be rejected with the right version",
+                    v, pre_v6,
+                    "V{pre_v6} manifest must be rejected with the right version",
                 );
             }
-            Err(other) => panic!("expected InvalidVersion({pre_v5}), got: {other:?}"),
-            Ok(_) => panic!("V{pre_v5} manifest must be rejected by V5 binary"),
+            Err(other) => panic!("expected InvalidVersion({pre_v6}), got: {other:?}"),
+            Ok(_) => panic!("V{pre_v6} manifest must be rejected by V6 binary"),
         }
     }
 
@@ -151,7 +153,7 @@ fn tree_rejects_unsupported_manifest_version() -> lsm_tree::Result<()> {
         tree.insert("a", "a", 0);
         tree.flush_active_memtable(0)?;
 
-        assert_eq!(5, read_manifest_format_version(path)?);
+        assert_eq!(6, read_manifest_format_version(path)?);
         rewrite_manifest_format_version(path, 99)?;
         assert_eq!(99, read_manifest_format_version(path)?);
     }

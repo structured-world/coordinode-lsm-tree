@@ -101,6 +101,12 @@ impl Block {
 
             #[expect(clippy::cast_possible_truncation, reason = "blocks are limited to u32")]
             uncompressed_length: data.len() as u32,
+
+            // Set in the ECC-emit step below when page_ecc is enabled
+            // for this writer (writer integration in a follow-up
+            // step). Zero means "no parity trailer follows", which is
+            // the V6-default-off layout.
+            ecc_length: 0,
         };
 
         // Compression step — produces an owned Vec when a compressor is active.

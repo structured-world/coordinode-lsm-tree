@@ -57,6 +57,16 @@ pub struct Header {
 
     /// Uncompressed size of data segment
     pub uncompressed_length: u32,
+
+    /// Length in bytes of the Reed-Solomon parity trailer that follows
+    /// the `data_length` payload bytes on disk. `0` when the block was
+    /// written without Page ECC (`Config::page_ecc(false)`, the
+    /// default), in which case no parity bytes follow and the V6
+    /// layout is indistinguishable from V5 on the wire other than the
+    /// presence of this header field. Non-zero when ECC is enabled —
+    /// the reader uses it to read the parity bytes and attempt
+    /// Reed-Solomon recovery on `data` XXH3 mismatch.
+    pub ecc_length: u32,
 }
 
 impl Header {
@@ -70,6 +80,8 @@ impl Header {
             // On-disk size
             + std::mem::size_of::<u32>()
             // Uncompressed data length
+            + std::mem::size_of::<u32>()
+            // Reed-Solomon parity trailer length (0 when ECC off)
             + std::mem::size_of::<u32>()
             // Checksum
             + std::mem::size_of::<u32>()
@@ -97,6 +109,10 @@ impl Encode for Header {
 
             // Write uncompressed data length
             writer.write_u32::<LE>(self.uncompressed_length)?;
+
+            // Write Reed-Solomon parity trailer length (V6+); 0 when
+            // Page ECC is disabled.
+            writer.write_u32::<LE>(self.ecc_length)?;
 
             writer.checksum()
         };
@@ -139,6 +155,9 @@ impl Decode for Header {
         // Read data length
         let uncompressed_length = protected_reader.read_u32::<LE>()?;
 
+        // Read Reed-Solomon parity trailer length (V6+)
+        let ecc_length = protected_reader.read_u32::<LE>()?;
+
         #[expect(
             clippy::cast_possible_truncation,
             reason = "we purposefully only use the lower 4 bytes as checksum"
@@ -165,6 +184,7 @@ impl Decode for Header {
             checksum: Checksum::from_raw(checksum),
             data_length,
             uncompressed_length,
+            ecc_length,
         })
     }
 }
@@ -181,6 +201,7 @@ mod tests {
             checksum: Checksum::from_raw(5),
             data_length: 252_356,
             uncompressed_length: 124_124_124,
+            ecc_length: 0,
         };
 
         let bytes = header.encode_into_vec();
@@ -199,6 +220,7 @@ mod tests {
             checksum: Checksum::from_raw(5),
             data_length: 252_356,
             uncompressed_length: 124_124_124,
+            ecc_length: 0,
         };
 
         let mut bytes = header.encode_into_vec();

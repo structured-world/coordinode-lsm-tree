@@ -397,6 +397,20 @@ pub struct Config {
     /// by ~90% typically
     pub(crate) expect_point_read_hits: bool,
 
+    /// Per-block Reed-Solomon Page ECC. When `true`, every block on
+    /// disk carries a Reed-Solomon parity trailer; on read, if the
+    /// block's XXH3 disagrees with the on-disk bytes, the reader
+    /// attempts RS recovery before surfacing the corruption. Requires
+    /// the `page_ecc` cargo feature — opening a tree with
+    /// `page_ecc = true` on a build without the feature returns
+    /// [`crate::Error::PageEccUnsupported`].
+    ///
+    /// Off by default. RocksDB ships per-block ECC as an operator-
+    /// chosen knob (typically off on RAID-protected media, on on
+    /// single-drive) and the cost is non-trivial on the write path,
+    /// so the default keeps the existing behaviour.
+    pub(crate) page_ecc: bool,
+
     /// Filter construction policy
     pub filter_policy: FilterPolicy,
 
@@ -538,6 +552,8 @@ impl Default for Config {
             prefix_extractor: None,
 
             expect_point_read_hits: false,
+
+            page_ecc: false,
 
             kv_separation_opts: None,
 
@@ -947,6 +963,24 @@ impl Config {
     #[must_use]
     pub fn expect_point_read_hits(mut self, b: bool) -> Self {
         self.expect_point_read_hits = b;
+        self
+    }
+
+    /// Enables per-block Reed-Solomon Page ECC.
+    ///
+    /// When enabled, every block written by this tree carries a
+    /// Reed-Solomon parity trailer; on read, if the block's XXH3
+    /// disagrees with the on-disk bytes, the reader attempts RS
+    /// recovery before surfacing the corruption.
+    ///
+    /// Opening a tree with `page_ecc = true` on a build that does not
+    /// have the `page_ecc` cargo feature enabled returns
+    /// [`crate::Error::PageEccUnsupported`] at `Tree::open` — the
+    /// reader has no way to honour the parity trailer without the
+    /// codec, so silently downgrading integrity is not an option.
+    #[must_use]
+    pub fn page_ecc(mut self, enabled: bool) -> Self {
+        self.page_ecc = enabled;
         self
     }
 

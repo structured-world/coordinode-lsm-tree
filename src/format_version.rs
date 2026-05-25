@@ -21,14 +21,22 @@ pub enum FormatVersion {
     /// blocks are no longer Bloom-encoded; the `filter_type` byte +
     /// per-layer header layout is documented in
     /// `src/table/filter/ribbon/burr/wire.rs`.
-    ///
-    /// V3/V4 ↔ V5 incompatibility is enforced primarily by the manifest
-    /// version gate at `Tree::open` (returns `InvalidVersion` for
-    /// anything other than V5). If the manifest is bypassed and a
-    /// pre-V5 filter block reaches the decoder, the `BuRR` magic + the
-    /// `filter_type=2` byte plus `format_version=1` inside the `BuRR`
-    /// header will reject the older Bloom-shaped payload.
     V5,
+
+    /// Per-block Reed-Solomon Page ECC: the block header gains a
+    /// `ecc_length: u32` field and the on-disk block can carry a
+    /// Reed-Solomon parity trailer immediately after the XXH3-covered
+    /// payload bytes. When `Config::page_ecc(false)` (the default),
+    /// `ecc_length = 0` and no parity bytes follow — V6 layout is
+    /// indistinguishable from V5 on the wire other than the extra
+    /// header field. The block magic is bumped from `[L,S,M,3]` to
+    /// `[L,S,M,4]` so a pre-V6 reader that bypasses the manifest gate
+    /// still rejects V6 blocks immediately at header decode.
+    ///
+    /// V3/V4/V5 ↔ V6 incompatibility is enforced primarily by the
+    /// manifest version gate at `Tree::open` (returns `InvalidVersion`
+    /// for anything other than V6).
+    V6,
 }
 
 impl std::fmt::Display for FormatVersion {
@@ -45,6 +53,7 @@ impl From<FormatVersion> for u8 {
             FormatVersion::V3 => 3,
             FormatVersion::V4 => 4,
             FormatVersion::V5 => 5,
+            FormatVersion::V6 => 6,
         }
     }
 }
@@ -59,6 +68,7 @@ impl TryFrom<u8> for FormatVersion {
             3 => Ok(Self::V3),
             4 => Ok(Self::V4),
             5 => Ok(Self::V5),
+            6 => Ok(Self::V6),
             _ => Err(()),
         }
     }

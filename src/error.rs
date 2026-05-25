@@ -118,6 +118,24 @@ pub enum Error {
     /// semantics.
     MixedOperationBatch,
 
+    /// Tree was opened with `Config::page_ecc(true)` but this build of
+    /// the crate does not have the `page_ecc` cargo feature enabled.
+    /// The reader has no way to verify or recover Reed-Solomon parity
+    /// without the codec, so opening such a tree would silently
+    /// downgrade integrity guarantees — return this error instead.
+    PageEccUnsupported,
+
+    /// Block payload failed the XXH3 integrity check and Reed-Solomon
+    /// recovery could not reconstruct it. Either the block was written
+    /// without parity (`Config::page_ecc(false)`), or more shards are
+    /// corrupted than the configured RS scheme can recover.
+    PageEccUnrecoverable {
+        /// XXH3 checksum recomputed from the on-disk bytes.
+        got: Checksum,
+        /// XXH3 checksum stored in the block header.
+        expected: Checksum,
+    },
+
     /// Route-compatibility mismatch on reopen.
     ///
     /// Recovery found fewer tables on disk than the manifest expects, and all
