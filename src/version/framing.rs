@@ -147,13 +147,21 @@ pub enum FramedRecordOutcome {
         got: u64,
     },
 
-    /// The header's `len` field cannot be trusted (it exceeds
-    /// [`MAX_FRAME_PAYLOAD`] or the section's remaining bytes). The
-    /// reader has NOT advanced past the header; callers must
-    /// surrender per-record granularity for the rest of the
-    /// section and fall back to a section-level recovery strategy
-    /// (typically: drop the rest of the section under `SkipAny`,
-    /// abort under stricter modes).
+    /// The header's `len` field is truly implausible — exceeds
+    /// [`MAX_FRAME_PAYLOAD`] (64 KiB). By the time this variant is
+    /// returned the reader HAS consumed the 4-byte `len` field; the
+    /// digest and payload have not been read. The cursor position
+    /// is therefore unaligned with both this record and the next,
+    /// so callers must surrender per-record granularity for the
+    /// rest of the section and fall back to a section-level
+    /// recovery strategy (typically: drop the rest of the section
+    /// under `SkipAny`, abort under stricter modes).
+    ///
+    /// `len` plausible but exceeding the section's remaining bytes
+    /// is NOT a `BadHeader` — it's a clean tail truncation and is
+    /// surfaced as [`Self::TailTruncation`] instead, so
+    /// [`crate::config::ManifestRecoveryMode::TolerateCorruptedTailRecords`]
+    /// recovers from a power-loss-mid-record without aborting.
     BadHeader,
 
     /// EOF was hit before the header or payload could be read in
@@ -196,8 +204,10 @@ pub fn read_framed_record<R: Read>(
         // implausible value — no legitimate record approaches it, so
         // the header itself is forged. We cannot trust `len` to skip
         // past this record; the caller is told to fall back to
-        // section-level recovery. Only the 4 bytes of `len` have
-        // been consumed.
+        // section-level recovery. By this point we have already
+        // consumed the 4 bytes of `len`, but that is acceptable
+        // because a BadHeader signal tells the caller to surrender
+        // per-record granularity for the rest of the section.
         return Ok(FramedRecordOutcome::BadHeader);
     }
 
@@ -208,7 +218,12 @@ pub fn read_framed_record<R: Read>(
     // `BadHeader` would make `TolerateCorruptedTailRecords`
     // wrongly abort. Surface as `TailTruncation` instead — only
     // truly implausible `len` (above) gets the `BadHeader` tag.
-    if u64::from(len) + 8 > remaining_in_section {
+    //
+    // `remaining_in_section` is the caller's "bytes available
+    // starting at the record's first byte", inclusive of the
+    // 4-byte `len` we just read. So the full record needs
+    // `FRAME_HEADER_LEN (12) + len` bytes to fit, not `8 + len`.
+    if u64::from(len) + FRAME_HEADER_LEN as u64 > remaining_in_section {
         return Ok(FramedRecordOutcome::TailTruncation);
     }
 

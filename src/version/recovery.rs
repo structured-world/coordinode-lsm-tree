@@ -14,12 +14,31 @@ use crate::{
 use byteorder::{LittleEndian, ReadBytesExt};
 use std::path::Path;
 
+/// Exact on-disk size of a `tables`-section record payload (post-framing):
+/// `id: u64 (8) | checksum_type: u8 (1) | checksum: u128 (16) | global_seqno: u64 (8)`.
+const TABLE_ENTRY_PAYLOAD_LEN: usize = 8 + 1 + 16 + 8;
+
+/// Exact on-disk size of a `blob_files`-section record payload (post-framing):
+/// `id: u64 (8) | checksum_type: u8 (1) | checksum: u128 (16)`.
+const BLOB_ENTRY_PAYLOAD_LEN: usize = 8 + 1 + 16;
+
 /// Decodes a 33-byte table-record payload (post-framing): `id: u64 |
 /// checksum_type: u8 | checksum: u128 | global_seqno: u64`. The
 /// surrounding framing header (length + XXH3-64) is handled by
 /// [`crate::version::framing::read_framed_record`] before this is
 /// called.
+///
+/// Rejects payloads whose length is not exactly
+/// [`TABLE_ENTRY_PAYLOAD_LEN`]. The framing layer guarantees the
+/// XXH3-64 over the payload matched the header digest, so any
+/// length mismatch here means the writer / reader disagree on the
+/// fixed record shape — surface that as `Error::InvalidHeader` to
+/// abort the open under strict mode and fall through to PIT / `SkipAny`
+/// recovery under the tolerant modes.
 fn decode_table_entry_payload(payload: &[u8]) -> crate::Result<RecoveredTable> {
+    if payload.len() != TABLE_ENTRY_PAYLOAD_LEN {
+        return Err(crate::Error::InvalidHeader("tables record payload length"));
+    }
     let mut cursor = std::io::Cursor::new(payload);
     let id = cursor.read_u64::<LittleEndian>()?;
     let checksum_type = cursor.read_u8()?;
@@ -36,9 +55,14 @@ fn decode_table_entry_payload(payload: &[u8]) -> crate::Result<RecoveredTable> {
 }
 
 /// Decodes a 25-byte blob-record payload (post-framing): `id: u64 |
-/// checksum_type: u8 | checksum: u128`. Same contract as
+/// checksum_type: u8 | checksum: u128`. Same length-check contract as
 /// [`decode_table_entry_payload`].
 fn decode_blob_entry_payload(payload: &[u8]) -> crate::Result<(BlobFileId, Checksum)> {
+    if payload.len() != BLOB_ENTRY_PAYLOAD_LEN {
+        return Err(crate::Error::InvalidHeader(
+            "blob_files record payload length",
+        ));
+    }
     let mut cursor = std::io::Cursor::new(payload);
     let id = cursor.read_u64::<LittleEndian>()?;
     let checksum_type = cursor.read_u8()?;
