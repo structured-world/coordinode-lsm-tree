@@ -228,12 +228,20 @@ fn dump_rejects_partitioned_index_sst_with_unsupported_error() {
         stderr.contains("error:"),
         "expected `error:` prefix in stderr; got:\n{stderr}",
     );
-    // The Unsupported message references the SFA `index` section so
-    // an operator can confirm the layout via the TOC; pin that here
-    // too so the wording cannot drift away from the contract.
+    // Pin BOTH the "not supported" wording AND the `index` SFA
+    // section hint so an operator reading the error can identify
+    // the on-disk layout signal via the TOC. The CLI emits
+    // `dump not supported for ...: partitioned-index SST (separate
+    // `index` section present) is not yet supported ... (look for
+    // an `index` section in the SFA TOC to confirm)`, so both
+    // substrings must appear.
     assert!(
-        stderr.contains("not supported") || stderr.contains("partitioned"),
-        "expected the Unsupported / partitioned message; got:\n{stderr}",
+        stderr.contains("not supported"),
+        "expected `not supported` in stderr; got:\n{stderr}",
+    );
+    assert!(
+        stderr.contains("index"),
+        "expected `index` (SFA section name hint) in stderr; got:\n{stderr}",
     );
 }
 
