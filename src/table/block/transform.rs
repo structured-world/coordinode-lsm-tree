@@ -18,12 +18,22 @@
 //! over the previous "`(compression, encryption, zstd_dict)` triple"
 //! argument shape:
 //!
-//! 1. **Invalid combinations are rejected at the type level.** The
+//! 1. **Invalid combinations are unreachable by construction.** The
 //!    old API let `ZstdDict { dict_id }` ship without `zstd_dict:
 //!    Some(_)`, which only failed at runtime as
-//!    `Error::ZstdDictMismatch`. With [`CompressionContext`] the
-//!    dict bundle travels with the codec discriminator, so missing
-//!    it is a *compile error*, not a runtime check.
+//!    `Error::ZstdDictMismatch` deep inside `Block::write_into`.
+//!    `CompressionContext`'s fields are now private; the only way
+//!    to construct a `ZstdDict` context is via
+//!    [`CompressionContext::with_dict`], which takes the dictionary
+//!    handle directly and derives the on-disk `dict_id` from
+//!    `dict.id()`. The previous "construct a ZstdDict-kind context
+//!    without a dict" mistake therefore can't be expressed in the
+//!    public API at all; the runtime mismatch check on the
+//!    `Block::write_into` happy path is gone. (The legacy-triple
+//!    helper [`BlockTransform::from_parts`] still has one runtime
+//!    `ZstdDictMismatch` check for callers that haven't yet
+//!    migrated; that path is the only place the error can still
+//!    fire.)
 //! 2. **Shrinks the public surface.** `Block::write_into` /
 //!    `from_reader` / `from_file` each previously took three
 //!    transform-related args; they now take one
@@ -35,74 +45,103 @@ use crate::{CompressionType, encryption::EncryptionProvider};
 
 /// Codec configuration for the compression step of a block payload.
 ///
-/// Bundles the codec discriminator together with the zstd dictionary
-/// reference so the call site can't accidentally pass
-/// [`CompressionType::ZstdDict`] without the matching dictionary
-/// (and vice versa, for non-dict codecs the dict reference simply
-/// isn't there to be misused). Carrying the lifetime parameter
-/// even on builds without `zstd_any` keeps the API shape stable
-/// across feature configurations; the `PhantomData<&'a ()>` field
-/// is the canonical "I do use the lifetime, just not as a real
-/// reference" marker.
+/// Fields are private; the only way to construct a value is via
+/// [`Self::new`] (non-dict codecs) or [`Self::with_dict`]
+/// (dict-required codec, takes the dictionary handle directly). Two
+/// invariants the previous open-fields shape relied on are now
+/// enforced by the constructors:
+///
+/// 1. The kind is never [`CompressionType::None`]: "plain payload"
+///    is its own [`BlockTransform::Plain`] / [`BlockTransform::Encrypted`]
+///    variant; carrying it as a `CompressionContext` would
+///    double-encode the same state. `new()` panics on `None`.
+/// 2. `kind == ZstdDict` is unreachable without an attached
+///    dictionary: the `new()` constructor panics on `ZstdDict`
+///    (forcing callers through [`Self::with_dict`]), and `with_dict`
+///    takes the dictionary by reference and derives `dict_id` from
+///    `dict.id()` itself. There is therefore no construction path
+///    that yields a `ZstdDict` context without a matching dict, and
+///    the runtime `ZstdDictMismatch` check that used to live on the
+///    `Block::write_into` happy path is gone.
 pub struct CompressionContext<'a> {
-    /// Codec discriminator. The [`CompressionType::None`] variant
-    /// is rejected by the constructor (see [`Self::new`]) because
-    /// "plain payload" is already a distinct [`BlockTransform`]
-    /// variant; carrying it as a `CompressionContext` would
-    /// double-encode the same state.
-    pub kind: CompressionType,
+    kind: CompressionType,
 
-    /// Raw zstd dictionary handle, required when `kind` is
-    /// [`CompressionType::ZstdDict`]; ignored otherwise.
     #[cfg(zstd_any)]
-    pub zstd_dict: Option<&'a ZstdDictionary>,
+    zstd_dict: Option<&'a ZstdDictionary>,
 
-    /// Consumes the `'a` lifetime when the `zstd_any` feature is
-    /// off so the public type shape stays stable. Without this
-    /// marker the type would have an unused lifetime parameter on
-    /// no-zstd builds.
     #[cfg(not(zstd_any))]
     _lifetime: core::marker::PhantomData<&'a ()>,
 }
 
 impl<'a> CompressionContext<'a> {
-    /// Constructs a [`CompressionContext`] for a non-zstd-dict codec.
+    /// Constructs a [`CompressionContext`] for a non-dict codec
+    /// (`Lz4`, `Zstd(level)`).
     ///
-    /// # Errors
+    /// # Panics
     ///
-    /// Returns [`crate::Error::InvalidTag`] if `kind` is
-    /// [`CompressionType::None`]: "plain payload" is represented
-    /// by [`BlockTransform::Plain`] / [`BlockTransform::Encrypted`],
-    /// not a `Compressed(_)` variant with `kind = None`.
-    pub fn new(kind: CompressionType) -> crate::Result<Self> {
-        if kind == CompressionType::None {
-            return Err(crate::Error::InvalidTag((
-                "CompressionContext::new called with CompressionType::None; \
-                 use BlockTransform::Plain or BlockTransform::Encrypted instead",
-                0,
-            )));
-        }
-        Ok(Self {
+    /// Panics if `kind` is [`CompressionType::None`] (use
+    /// [`BlockTransform::Plain`] / [`BlockTransform::Encrypted`]
+    /// instead) or [`CompressionType::ZstdDict`] (use
+    /// [`Self::with_dict`] instead). Both are programmer errors,
+    /// not runtime failure modes; they cannot happen via any code
+    /// path that flows through the public API correctly.
+    #[must_use]
+    pub fn new(kind: CompressionType) -> Self {
+        assert!(
+            kind != CompressionType::None,
+            "CompressionContext::new called with CompressionType::None; \
+             use BlockTransform::Plain or BlockTransform::Encrypted",
+        );
+        #[cfg(zstd_any)]
+        assert!(
+            !matches!(kind, CompressionType::ZstdDict { .. }),
+            "CompressionContext::new called with CompressionType::ZstdDict; \
+             use CompressionContext::with_dict(level, dict) so the dictionary \
+             travels with the codec discriminator",
+        );
+        Self {
             kind,
             #[cfg(zstd_any)]
             zstd_dict: None,
             #[cfg(not(zstd_any))]
             _lifetime: core::marker::PhantomData,
-        })
+        }
     }
 
-    /// Attaches a zstd dictionary to this context.
+    /// Constructs a `ZstdDict` context with the matching dictionary
+    /// handle attached.
     ///
-    /// Required when `kind == CompressionType::ZstdDict { dict_id }`,
-    /// where the dictionary's `id()` must equal `dict_id`. Required by
-    /// the writer to actually pin the dictionary against the on-disk
-    /// `dict_id`; the matching read path takes the same dict via this
-    /// builder so encoder and decoder share one source of truth.
+    /// `dict.id()` is taken as the on-disk `dict_id`, so a mismatch
+    /// is unreachable by construction. `level` is the zstd
+    /// compression level the writer should use; readers don't
+    /// consume it (the zstd frame header advertises the level
+    /// itself) but it's stored to keep the on-disk
+    /// [`CompressionType::ZstdDict`] discriminator round-trip-able.
     #[cfg(zstd_any)]
     #[must_use]
-    pub fn with_zstd_dict(mut self, dict: &'a ZstdDictionary) -> Self {
-        self.zstd_dict = Some(dict);
-        self
+    pub fn with_dict(level: i32, dict: &'a ZstdDictionary) -> Self {
+        Self {
+            kind: CompressionType::ZstdDict {
+                level,
+                dict_id: dict.id(),
+            },
+            zstd_dict: Some(dict),
+        }
+    }
+
+    /// On-disk codec discriminator.
+    #[must_use]
+    pub fn kind(&self) -> CompressionType {
+        self.kind
+    }
+
+    /// Attached zstd dictionary, if any. Always `Some` for
+    /// `kind == ZstdDict` (enforced by the constructors), `None`
+    /// for non-dict codecs.
+    #[cfg(zstd_any)]
+    #[must_use]
+    pub fn zstd_dict(&self) -> Option<&ZstdDictionary> {
+        self.zstd_dict
     }
 }
 
@@ -151,7 +190,7 @@ impl BlockTransform<'_> {
     pub fn compression(&self) -> CompressionType {
         match self {
             Self::Plain | Self::Encrypted(_) => CompressionType::None,
-            Self::Compressed(ctx) | Self::CompressedAndEncrypted(ctx, _) => ctx.kind,
+            Self::Compressed(ctx) | Self::CompressedAndEncrypted(ctx, _) => ctx.kind(),
         }
     }
 
@@ -164,7 +203,7 @@ impl BlockTransform<'_> {
     pub fn zstd_dict(&self) -> Option<&ZstdDictionary> {
         match self {
             Self::Plain | Self::Encrypted(_) => None,
-            Self::Compressed(ctx) | Self::CompressedAndEncrypted(ctx, _) => ctx.zstd_dict,
+            Self::Compressed(ctx) | Self::CompressedAndEncrypted(ctx, _) => ctx.zstd_dict(),
         }
     }
 
@@ -216,12 +255,13 @@ impl<'a> BlockTransform<'a> {
             });
         }
 
-        // Compressed path: build the CompressionContext with the
-        // codec discriminator and (if applicable) the zstd dict.
-        // ZstdDict requires the dict; centralise the mismatch check
-        // here so every entry point produces the same error.
+        // Compressed path. The legacy triple may pass `ZstdDict` with
+        // a separate `zstd_dict` argument; that's the only runtime
+        // check `from_parts` needs to do (downstream `with_dict`
+        // can't fail by construction). Non-dict codecs go through
+        // `new()` which is total.
         #[cfg(zstd_any)]
-        let ctx = if let CompressionType::ZstdDict { dict_id, .. } = compression {
+        let ctx = if let CompressionType::ZstdDict { level, dict_id } = compression {
             let dict = zstd_dict.ok_or(crate::Error::ZstdDictMismatch {
                 expected: dict_id,
                 got: None,
@@ -232,18 +272,16 @@ impl<'a> BlockTransform<'a> {
                     got: Some(dict.id()),
                 });
             }
-            CompressionContext::new(compression)?.with_zstd_dict(dict)
+            CompressionContext::with_dict(level, dict)
         } else {
             // Non-dict codecs ignore the zstd_dict slot, matching the
-            // previous API. We intentionally don't reject a stray dict
-            // here: keeping the constructor lenient matches the loose
-            // contract callers used to rely on.
+            // previous API.
             let _ = zstd_dict;
-            CompressionContext::new(compression)?
+            CompressionContext::new(compression)
         };
 
         #[cfg(not(zstd_any))]
-        let ctx = CompressionContext::new(compression)?;
+        let ctx = CompressionContext::new(compression);
 
         Ok(match encryption {
             Some(enc) => Self::CompressedAndEncrypted(ctx, enc),

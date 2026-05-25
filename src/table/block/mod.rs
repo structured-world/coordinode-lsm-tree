@@ -67,11 +67,16 @@ impl Block {
     ///
     /// Pipeline: raw data → compress → encrypt → checksum → write. The
     /// concrete pipeline shape (which steps run) is encoded by the
-    /// [`BlockTransform`] variant — see its docs for the four valid
-    /// combinations. The previous separate `(compression, encryption,
+    /// [`BlockTransform`] variant (see its docs for the four valid
+    /// combinations). The previous separate `(compression, encryption,
     /// zstd_dict)` argument triple has been collapsed into this single
-    /// transform argument so invalid combinations (e.g. `ZstdDict`
-    /// without a dict bundle) are rejected at the type level.
+    /// transform argument; `CompressionContext`'s constructors enforce
+    /// that the dict bundle travels with the `ZstdDict` codec
+    /// discriminator (see [`BlockTransform`] module docs), so the
+    /// runtime `ZstdDictMismatch` guard inside this function is dead
+    /// code on the public API path and only fires for callers that
+    /// reach `write_into` via [`BlockTransform::from_parts`] with a
+    /// mismatched legacy triple.
     pub fn write_into<W: std::io::Write>(
         mut writer: &mut W,
         data: &[u8],
