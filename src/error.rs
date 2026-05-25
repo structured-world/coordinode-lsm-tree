@@ -156,14 +156,18 @@ pub enum Error {
         found: usize,
     },
 
-    /// Valid on-disk layout that this build does not yet know how to
-    /// process. Distinct from [`Error::Unrecoverable`] (which signals
-    /// corruption) and from [`Error::Io`] with `ErrorKind::Unsupported`
-    /// (which can also surface from platform / backend limits); the
-    /// `&'static str` payload names the specific layout marker that
-    /// triggered the rejection (e.g. `"filter_tli"` for a partitioned
-    /// filter SFA section) so the caller can route the diagnostic
-    /// without parsing message strings.
+    /// Valid configuration / on-disk layout that this build does not
+    /// yet know how to process, or constructor input that violates a
+    /// documented invariant (e.g. `CompressionType::None` passed to
+    /// [`crate::table::block::CompressionContext::new`]). Distinct
+    /// from [`Error::Unrecoverable`] (signals corruption) and from
+    /// [`Error::Io`] with `ErrorKind::Unsupported` (which can also
+    /// surface from platform / backend limits); the `&'static str`
+    /// payload names the specific marker that triggered the rejection
+    /// (e.g. `"filter_tli"` for a partitioned filter SFA section,
+    /// `"compression-context-none"` for the constructor invariant) so
+    /// the caller can route the diagnostic without parsing message
+    /// strings.
     FeatureUnsupported(&'static str),
 }
 

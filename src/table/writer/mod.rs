@@ -453,10 +453,14 @@ impl Writer {
                 dict_id: self.data_block_compression.dict_id(),
                 window_log: 0,
             },
-            self.data_block_compression,
-            self.encryption.as_deref(),
-            #[cfg(zstd_any)]
-            self.zstd_dictionary.as_deref(),
+            // Data blocks use the configured codec and may carry a
+            // zstd dict; encryption is optional.
+            &crate::table::block::BlockTransform::from_parts(
+                self.data_block_compression,
+                self.encryption.as_deref(),
+                #[cfg(zstd_any)]
+                self.zstd_dictionary.as_deref(),
+            )?,
         )?;
 
         self.meta.uncompressed_size += u64::from(header.uncompressed_length);
@@ -638,10 +642,13 @@ impl Writer {
                     dict_id: 0,
                     window_log: 0,
                 },
-                CompressionType::None,
-                self.encryption.as_deref(),
-                #[cfg(zstd_any)]
-                None,
+                // Range-tombstone blocks are always uncompressed; the
+                // transform is Plain or Encrypted depending on the
+                // configured provider.
+                &match self.encryption.as_deref() {
+                    Some(enc) => crate::table::block::BlockTransform::Encrypted(enc),
+                    None => crate::table::block::BlockTransform::PLAIN,
+                },
             )?;
         }
 
@@ -805,10 +812,14 @@ impl Writer {
                 dict_id: 0,
                 window_log: 0,
             },
-            self.index_block_compression,
-            self.encryption.as_deref(),
-            #[cfg(zstd_any)]
-            None,
+            // TLI tail mirror uses the same codec as the head and
+            // never carries a zstd dict.
+            &crate::table::block::BlockTransform::from_parts(
+                self.index_block_compression,
+                self.encryption.as_deref(),
+                #[cfg(zstd_any)]
+                None,
+            )?,
         )?;
 
         // TAIL meta — the canonical, authoritative copy. `file_size`
@@ -1003,10 +1014,13 @@ fn write_meta_section<W: std::io::Write + std::io::Seek>(
             dict_id: 0,
             window_log: 0,
         },
-        CompressionType::None,
-        encryption,
-        #[cfg(zstd_any)]
-        None,
+        // Meta blocks are always written uncompressed; the transform
+        // is Plain or Encrypted depending on whether the table is
+        // keyed.
+        &match encryption {
+            Some(enc) => crate::table::block::BlockTransform::Encrypted(enc),
+            None => crate::table::block::BlockTransform::PLAIN,
+        },
     )?;
 
     Ok(())

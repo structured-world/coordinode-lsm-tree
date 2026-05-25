@@ -86,10 +86,15 @@ impl PartitionedIndexWriter {
                 dict_id: 0,
                 window_log: 0,
             },
-            self.compression,
-            self.encryption.as_deref(),
-            #[cfg(zstd_any)]
-            None, // index blocks don't use dictionary compression (dict trained on data, not index structures)
+            // Index blocks (sub-blocks and TLI) use the configured
+            // codec but never a zstd dict (dicts are trained on
+            // data, not index structures).
+            &crate::table::block::BlockTransform::from_parts(
+                self.compression,
+                self.encryption.as_deref(),
+                #[cfg(zstd_any)]
+                None,
+            )?,
         )?;
 
         #[expect(
@@ -162,10 +167,15 @@ impl PartitionedIndexWriter {
                 dict_id: 0,
                 window_log: 0,
             },
-            self.compression,
-            self.encryption.as_deref(),
-            #[cfg(zstd_any)]
-            None, // index blocks don't use dictionary compression (dict trained on data, not index structures)
+            // Index blocks (sub-blocks and TLI) use the configured
+            // codec but never a zstd dict (dicts are trained on
+            // data, not index structures).
+            &crate::table::block::BlockTransform::from_parts(
+                self.compression,
+                self.encryption.as_deref(),
+                #[cfg(zstd_any)]
+                None,
+            )?,
         )?;
 
         #[expect(

@@ -144,10 +144,13 @@ impl<W: std::io::Write + std::io::Seek> FilterWriter<W> for FullFilterWriter {
                 dict_id: 0,
                 window_log: 0,
             },
-            CompressionType::None,
-            self.encryption.as_deref(),
-            #[cfg(zstd_any)]
-            None,
+            // Filter blocks are always written uncompressed; the
+            // transform is Plain or Encrypted depending on the
+            // configured provider.
+            &match self.encryption.as_deref() {
+                Some(enc) => crate::table::block::BlockTransform::Encrypted(enc),
+                None => crate::table::block::BlockTransform::PLAIN,
+            },
         )?;
 
         Ok(1)

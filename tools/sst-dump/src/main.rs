@@ -11,7 +11,9 @@
 
 use clap::{Parser, Subcommand};
 use lsm_tree::coding::Decode;
-use lsm_tree::inspect::{read_filter_stats, read_table_properties, read_top_level_index_entries};
+use lsm_tree::inspect::{
+    iter_data_block_entries, read_filter_stats, read_table_properties, read_top_level_index_entries,
+};
 use lsm_tree::table::block::Header;
 use lsm_tree::verify::{BlockVerifyError, verify_sst_file};
 use std::fs::File;
@@ -100,6 +102,58 @@ enum Command {
     /// tail-mirror fallback per #296); does not open a live `Tree`.
     IndexDump,
 
+    /// Stream every KV entry from the SST to stdout, one per line.
+    /// Honours `--from` / `--to` key bounds (inclusive lower,
+    /// exclusive upper, matching standard Rust range semantics) and
+    /// caps output at `--max=N` entries when set. With `--keys-only`,
+    /// skips the value column entirely. Only full-index SSTs are
+    /// supported (the index is a single block; the data section
+    /// itself can have any number of data blocks); partitioned-index
+    /// SSTs exit non-zero (see `index-dump` for the layout signal).
+    /// Reads blocks streamingly: memory cost stays at one data block
+    /// regardless of SST size.
+    ///
+    /// **Comparator caveat (only when `--from` / `--to` is set).**
+    /// A bounds-free `dump` walks every entry sequentially in
+    /// on-disk order and works for any comparator — the iteration
+    /// itself is positional, not comparator-driven. The
+    /// `--from` / `--to` filters, however, compare keys bytewise
+    /// against the supplied bounds and the upper bound break-out
+    /// assumes on-disk order matches bytewise order. That holds for
+    /// the default lexicographic comparator but not for arbitrary
+    /// custom user comparators: with a custom comparator and
+    /// `--from` / `--to` set, the early break can stop before all
+    /// qualifying entries are emitted, and the bounds themselves
+    /// won't filter to the semantic range the caller had in mind.
+    /// Use the owning tree's regular read APIs for range-bounded
+    /// reads on custom-comparator SSTs.
+    Dump {
+        /// Lower key bound (inclusive). Entries with `key >= --from`
+        /// are emitted. Without this flag, the walk starts from the
+        /// smallest key in the SST.
+        #[arg(long)]
+        from: Option<String>,
+
+        /// Upper key bound (exclusive). Entries with `key < --to` are
+        /// emitted. Without this flag, the walk ends at the largest
+        /// key in the SST.
+        #[arg(long)]
+        to: Option<String>,
+
+        /// Cap on entries emitted. The walk stops after `--max=N`
+        /// entries pass the `--from` / `--to` filters even if more
+        /// would otherwise have qualified.
+        #[arg(long)]
+        max: Option<u64>,
+
+        /// Omit the value column from the output, printing only the
+        /// keys (one per line, still wrapped in `format_key`'s
+        /// escape rules). Useful when only key enumeration is
+        /// needed and values are large.
+        #[arg(long)]
+        keys_only: bool,
+    },
+
     /// Print sizing stats for the SST's BuRR filter: on-disk filter
     /// section bytes, BuRR layer count, item count from meta, and
     /// approximate bits-per-key. Only single-block (full) filters
@@ -122,6 +176,12 @@ fn main() -> ExitCode {
         } => run_hex(&cli.file, offset, len, no_header),
         Command::Properties => run_properties(&cli.file),
         Command::IndexDump => run_index_dump(&cli.file),
+        Command::Dump {
+            from,
+            to,
+            max,
+            keys_only,
+        } => run_dump(&cli.file, from.as_deref(), to.as_deref(), max, keys_only),
         Command::FilterStats => run_filter_stats(&cli.file),
     }
 }
@@ -390,6 +450,188 @@ fn run_index_dump(path: &std::path::Path) -> ExitCode {
             e.seqno,
             format_key(&e.end_key),
         );
+    }
+
+    ExitCode::SUCCESS
+}
+
+fn run_dump(
+    path: &std::path::Path,
+    from: Option<&str>,
+    to: Option<&str>,
+    max: Option<u64>,
+    keys_only: bool,
+) -> ExitCode {
+    let iter = match iter_data_block_entries(path) {
+        // Propagate `--keys-only` into the iterator itself: it then
+        // yields entries with `value: Vec::new()` and skips the
+        // per-entry `Slice::to_vec()` allocation entirely. Net
+        // saving on a values-heavy SST is the full data-section
+        // value byte count.
+        Ok(it) if keys_only => it.keys_only(),
+        Ok(it) => it,
+        Err(lsm_tree::Error::Io(io_err)) if io_err.kind() == std::io::ErrorKind::Unsupported => {
+            // Partitioned-index SSTs surface here. Same pattern as
+            // `filter-stats` for partitioned filters: print a
+            // user-facing "not supported" message that names the
+            // distinguishing on-disk signal so an operator can
+            // confirm via `index-dump` or a hex dump of the SFA TOC.
+            eprintln!(
+                "error: dump not supported for {}: {io_err} \
+                 (look for an `index` section in the SFA TOC to confirm)",
+                path.display(),
+            );
+            return ExitCode::FAILURE;
+        }
+        Err(e) => {
+            // `iter_data_block_entries` covers more than just the
+            // initial file-open: it also walks the SFA trailer, the
+            // meta block, the TLI, and validates the data-block
+            // layout. Any of those can fail here, so the generic
+            // bucket message uses "iter entries" instead of "open"
+            // to avoid suggesting the failure was at File::open
+            // when it might have been an SFA trailer mismatch or a
+            // meta-block decode error.
+            eprintln!("error: iter entries from {}: {e}", path.display());
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // Bounds as byte slices for direct comparison against entry
+    // keys (which are `Vec<u8>`). The CLI takes them as &str so the
+    // common alphanumeric case is ergonomic; non-UTF-8 keys can't be
+    // expressed on the command line without an escape mechanism,
+    // which we deliberately don't ship in this first pass — point
+    // users at a follow-up if they need it.
+    let from_bytes = from.map(str::as_bytes);
+    let to_bytes = to.map(str::as_bytes);
+
+    // If the bounds collapse to an empty range bytewise (`--from >=
+    // --to` with both set), the walk would scan up to `from` only to
+    // immediately break on the upper bound: a forged-empty range
+    // could trigger a full-SST scan with zero output. Short-circuit
+    // up front and exit 0 with no output. The match condition stays
+    // a bytewise comparison for parity with the in-loop checks; the
+    // comparator caveat in the subcommand docstring covers
+    // custom-comparator SSTs.
+    if let (Some(lo), Some(hi)) = (from_bytes, to_bytes)
+        && lo >= hi
+    {
+        return ExitCode::SUCCESS;
+    }
+
+    let mut emitted: u64 = 0;
+    let cap = max.unwrap_or(u64::MAX);
+
+    // `--max 0` is a "no output ever" request. The iterator
+    // construction above already paid for the SFA trailer / meta /
+    // TLI reads (those are needed regardless to know whether the
+    // layout is even supported), but the in-loop `emitted >= cap`
+    // check would still pull the FIRST data block off disk before
+    // breaking. Short-circuit here so a `--max 0` invocation costs
+    // zero data-block I/O on top of the unavoidable index reads.
+    if cap == 0 {
+        return ExitCode::SUCCESS;
+    }
+
+    // Pull the iterator manually instead of `for item in iter` so the
+    // `emitted < cap` check can gate the `iter.next()` call itself.
+    // With the `for` form, the cap check ran AFTER pulling and decoding
+    // the next entry; in the worst case (cap falls on a block boundary)
+    // that triggered an extra data-block read + decompression after the
+    // cap was already reached. The while-let form short-circuits before
+    // pulling.
+    //
+    // Output is buffered through a single locked stdout BufWriter and
+    // each entry emits exactly one `writeln!` so a million-entry SST
+    // dump doesn't pay one stdout lock + one syscall per print call.
+    // Write errors can surface in two places: per-line `writeln!`
+    // calls (handled below via `line_result`) and the explicit
+    // `out.flush()` at the end (which surfaces errors buffered
+    // inside the BufWriter that would otherwise be swallowed by
+    // BufWriter's Drop implementation).
+    use std::io::Write as _;
+    let stdout = std::io::stdout();
+    let stdout_lock = stdout.lock();
+    let mut out = std::io::BufWriter::new(stdout_lock);
+
+    let mut iter = iter;
+    while emitted < cap {
+        let Some(item) = iter.next() else {
+            break;
+        };
+        let entry = match item {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!("error: read entry from {}: {e}", path.display());
+                return ExitCode::FAILURE;
+            }
+        };
+
+        // Lower bound check first because it's the more common
+        // trim direction (operators usually want "from key X
+        // onwards" rather than "everything below key Y").
+        if let Some(lo) = from_bytes
+            && entry.key.as_slice() < lo
+        {
+            continue;
+        }
+        if let Some(hi) = to_bytes
+            && entry.key.as_slice() >= hi
+        {
+            // Keys are sorted in the SST; once we pass the upper
+            // bound we're done. Break instead of continuing to
+            // avoid walking the rest of the (potentially huge)
+            // data section.
+            break;
+        }
+
+        // One writeln! per emitted entry: BufWriter accumulates and
+        // releases the bytes in larger flushes, and stdout is locked
+        // once (above) for the whole walk instead of per-line.
+        let line_result = if keys_only {
+            writeln!(out, "{}", format_key(&entry.key))
+        } else {
+            // `key=value` separator-style — matches what most
+            // RocksDB / LevelDB sst-dump variants emit and is the
+            // easiest format for downstream `awk -F=` consumers.
+            // Non-`Value` entries are annotated with a per-variant
+            // suffix tag so operators can tell a real value from a
+            // tombstone / merge operand / blob-pointer indirection
+            // without separately inspecting the value bytes;
+            // regular Value entries get the bare `=value` line so
+            // the happy path stays grep-friendly.
+            let suffix = match entry.value_type {
+                lsm_tree::ValueType::Value => "",
+                lsm_tree::ValueType::Tombstone => "\t# tombstone",
+                lsm_tree::ValueType::WeakTombstone => "\t# weak-tombstone",
+                lsm_tree::ValueType::MergeOperand => "\t# merge-operand",
+                lsm_tree::ValueType::Indirection => "\t# indirection",
+            };
+            writeln!(
+                out,
+                "{}={}{}",
+                format_key(&entry.key),
+                format_key(&entry.value),
+                suffix,
+            )
+        };
+        if let Err(e) = line_result {
+            // Broken pipe (e.g. consumer piped through `head -n N`)
+            // is the common case; report and exit cleanly rather
+            // than panic-on-flush at function tail.
+            eprintln!("error: write to stdout for {}: {e}", path.display());
+            return ExitCode::FAILURE;
+        }
+
+        emitted = emitted.saturating_add(1);
+    }
+
+    // Surface a buffered-flush error to the operator instead of
+    // letting BufWriter's Drop swallow it on the way out.
+    if let Err(e) = out.flush() {
+        eprintln!("error: flush stdout for {}: {e}", path.display());
+        return ExitCode::FAILURE;
     }
 
     ExitCode::SUCCESS
