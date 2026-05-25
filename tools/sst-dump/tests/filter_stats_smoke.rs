@@ -189,6 +189,60 @@ fn filter_stats_rejects_partitioned_filter_with_not_supported_message() {
 }
 
 #[test]
+fn filter_stats_filter_less_sst_prints_no_filter_section_installed_notice() {
+    // SST written with FilterPolicy::disabled() produces no `filter`
+    // SFA section at all (or a zero-byte one), which `read_filter_stats`
+    // collapses to `Ok(None)`. The CLI surface for that is the
+    // "no filter section installed" notice + exit 0. Pin both so a
+    // future regression that flips the `Ok(None)` branch to
+    // `Some(FilterStats { layer_count: 0, ... })` (printing
+    // bytes/bits-per-key for what is effectively no filter) is
+    // caught here.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let tree = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .data_block_compression_policy(CompressionPolicy::all(CompressionType::None))
+    .filter_policy(FilterPolicy::disabled())
+    .open()
+    .expect("open tree");
+
+    for i in 0..50u64 {
+        tree.insert(format!("key-{i:06}"), format!("value-{i}"), 1 + i);
+    }
+    tree.flush_active_memtable(0).expect("flush");
+    drop(tree);
+
+    let tables = dir.path().join("tables");
+    let sst = std::fs::read_dir(&tables)
+        .expect("tables dir")
+        .filter_map(Result::ok)
+        .find(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
+        .expect("at least one SST")
+        .path();
+
+    let out = Command::new(SST_DUMP_BIN)
+        .arg(&sst)
+        .arg("filter-stats")
+        .output()
+        .expect("spawn sst-dump");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "expected exit 0 on filter-less SST; got {:?}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+        out.status,
+    );
+    assert!(
+        stdout.contains("no filter section installed"),
+        "expected `no filter section installed` notice on stdout; got:\n{stdout}",
+    );
+}
+
+#[test]
 fn filter_stats_fails_on_missing_file() {
     let bogus = tempfile::tempdir().expect("tempdir");
     let nonexistent = bogus.path().join("does-not-exist");
