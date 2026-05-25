@@ -6,19 +6,30 @@
 //!
 //! AAD is the 38-byte buffer that is fed to the AEAD primitive alongside the
 //! ciphertext and nonce, but is **never** written to disk. It mixes
-//! disk-mirrored fields (`HeaderByte`, `KeyEpoch`, `BlockType`, `SuiteID`,
-//! `CompressionType`, `DictID`, `WindowLog`) with caller-supplied identity
-//! fields (`TreeID`, `TableID`, `BlockOffset`) so that the AEAD tag binds the
+//! disk-mirrored fields (header byte, key epoch, block type, suite id,
+//! compression type, dict id, window log) with caller-supplied identity
+//! fields (tree id, table id, block offset) so that the AEAD tag binds the
 //! ciphertext to its exact block-identity, codec context, and key epoch.
 //!
 //! ## Why a separate module
 //!
 //! The AAD construction is pure-byte arithmetic with no dependency on a
 //! specific AEAD primitive or on `structured-zstd`'s skippable-frame envelope.
-//! Keeping it isolated lets the per-suite encrypt/decrypt path and the
+//! Keeping it isolated lets the per-suite encrypt / decrypt path and the
 //! on-disk wire encoder share one source of truth for the AAD layout, and
 //! lets the unit tests check the byte layout against the spec without
 //! pulling in any crypto deps.
+//!
+//! ## Type-reuse contract
+//!
+//! [`BlockType`] (block discriminator) and [`BlockIdentity`] (tree id /
+//! table id / block offset + per-block codec context) are re-exported
+//! straight from [`crate::table::block`]; we deliberately do NOT define
+//! second copies in this module to avoid drift between the Block I/O
+//! API and the AAD constructor. The AAD-specific bits that don't fit on
+//! the existing identity type (header byte, key epoch, suite id, codec
+//! discriminator) live on [`EncryptionContext`], the small per-block
+//! struct passed alongside `BlockIdentity` into [`build`].
 //!
 //! ## Layout (38 bytes, big-endian for u64 identity fields)
 //!
@@ -41,6 +52,8 @@
 //! ```
 
 use core::convert::TryFrom;
+
+pub use crate::table::block::{BlockIdentity, BlockType};
 
 /// Length of the AAD buffer in bytes. Spec-locked: see
 /// `docs/aad-block-format.md` §5.3.
@@ -102,190 +115,6 @@ impl SuiteId {
     }
 }
 
-/// Block type discriminator, mirrored into both the on-disk `MetadataPayload`
-/// at offset 10 and the AAD at offset 6.
-///
-/// Tags match the spec §5.1 registry. New variants get a fresh tag and
-/// extend both the spec and [`Self::from_byte`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[repr(u8)]
-pub enum BlockType {
-    /// Data block (user KV entries). Tag `0`.
-    Data = 0,
-    /// Index block (top-level or partitioned index). Tag `1`.
-    Index = 1,
-    /// Filter block (Bloom / `BuRR` membership filter). Tag `2`.
-    Filter = 2,
-    /// Meta block (table-level metadata). Tag `3`.
-    Meta = 3,
-    /// Range-tombstone block. Tag `4`.
-    RangeTombstone = 4,
-}
-
-impl BlockType {
-    /// On-disk byte for this block type.
-    #[must_use]
-    pub const fn as_byte(self) -> u8 {
-        self as u8
-    }
-}
-
-/// Caller-supplied block identity used to bind the AEAD AAD to a specific
-/// position in a specific SST file in a specific tree.
-///
-/// **NEVER written to disk.** All three fields are reconstructed at decrypt
-/// time from the reader's context (`AbstractTree::id()`, the SST file's
-/// `TableId`, the read cursor's byte position). The writer must feed the
-/// same values from its own context into AAD construction; an attacker who
-/// relocates a block to a different file / different offset gets a
-/// non-matching AAD and decryption fails.
-///
-/// ## `tree_id = 0` placeholder
-///
-/// Call sites that have not yet plumbed a real tree id are permitted to
-/// pass `0` so that the migration to AAD-bound blocks is not blocked. The
-/// cross-tree substitution defence from `docs/aad-block-format.md` §3 is
-/// then NOT covered by AAD for those call sites: any two trees feeding
-/// `tree_id = 0` collapse the pair to just `(0, table_id)`, and `table_id`
-/// is only unique within a tree. Such callers MUST instead provide
-/// per-tree encryption-provider key isolation (a different encryption key
-/// per tree) so that AEAD verification fails on cross-tree-substituted
-/// blocks even when the AAD-bound `TreeID` collides.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct BlockIdentity {
-    /// Owning tree id. Source: `AbstractTree::id()` on read, the same
-    /// tree's id on write. See "`tree_id = 0` placeholder" above for
-    /// the per-tree key-isolation caveat.
-    pub tree_id: u64,
-    /// SST file's per-tree `TableId` (derived from the file path /
-    /// table metadata). Pair with `tree_id` gives the globally-unique
-    /// block identity that defeats cross-tree substitution.
-    pub table_id: u64,
-    /// Read or write cursor's byte position within the SST file. Binds
-    /// the block to its position to defeat same-file relocations.
-    pub block_offset: u64,
-}
-
-impl BlockIdentity {
-    /// Construct a `BlockIdentity` from the three identity fields.
-    #[must_use]
-    pub const fn new(tree_id: u64, table_id: u64, block_offset: u64) -> Self {
-        Self {
-            tree_id,
-            table_id,
-            block_offset,
-        }
-    }
-}
-
-/// Disk-mirrored metadata fields, condensed into a struct.
-///
-/// The writer commits these to disk; the reader parses them out of the
-/// `MetadataFrame` and passes them, together with the caller-supplied
-/// `BlockIdentity`, into AAD construction (and, later, into the
-/// wire-format encoder / decoder).
-///
-/// Excludes the variable-length `Nonce` and the `AEADTag`: those are
-/// AEAD inputs, not AAD inputs (see spec §5.3 closing paragraph).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct MetadataHeader {
-    /// `HeaderByte` at `MetadataPayload` offset 0 / AAD offset 4. For v1
-    /// blocks this is [`HEADER_BYTE_V1`]; a decoder that sees any other
-    /// value MUST reject the block as `UnsupportedFormatVersion`.
-    pub header_byte: u8,
-    /// `KeyEpoch` index into the caller's key chain.
-    pub key_epoch: u8,
-    /// Block type discriminator; mirrors disk byte at `MetadataPayload`
-    /// offset 10.
-    pub block_type: BlockType,
-    /// AEAD suite selector; mirrors disk byte at `MetadataPayload`
-    /// offset 11 and drives the variable-length `Nonce` field width.
-    pub suite_id: SuiteId,
-    /// `CompressionType` codec discriminator (matches the leading byte of
-    /// `impl Encode for compression::CompressionType`). v1 spec-defined
-    /// tags: 0 = None, 1 = Lz4, 3 = Zstd, 4 = `ZstdDict`.
-    pub compression_type: u8,
-    /// `DictID`: zstd dictionary fingerprint (0 if no dict).
-    pub dict_id: u32,
-    /// Raw zstd window log (NOT the encoded `Window_Descriptor` byte). 0
-    /// when no zstd / no window enforcement, otherwise `10..=31` per
-    /// RFC 8878 §3.1.1.1.2.
-    pub window_log: u8,
-}
-
-impl MetadataHeader {
-    /// Construct a v1 header. The `header_byte` field is pinned to
-    /// [`HEADER_BYTE_V1`]; callers that need to round-trip a different
-    /// version byte (e.g. negative tests) build the struct directly.
-    #[must_use]
-    pub const fn v1(
-        key_epoch: u8,
-        block_type: BlockType,
-        suite_id: SuiteId,
-        compression_type: u8,
-        dict_id: u32,
-        window_log: u8,
-    ) -> Self {
-        Self {
-            header_byte: HEADER_BYTE_V1,
-            key_epoch,
-            block_type,
-            suite_id,
-            compression_type,
-            dict_id,
-            window_log,
-        }
-    }
-}
-
-/// Build the 38-byte AAD buffer from the disk-mirrored header and the
-/// caller-supplied block identity.
-///
-/// The returned array is the exact buffer to pass to the AEAD primitive
-/// as `associated_data` for both `encrypt_in_place_detached` and
-/// `decrypt_in_place_detached`. Both writer and reader call this with the
-/// same inputs; a mismatch in any single byte causes the AEAD tag to
-/// fail verification.
-///
-/// Layout matches `docs/aad-block-format.md` §5.3 byte-for-byte.
-#[must_use]
-pub fn build(header: &MetadataHeader, identity: &BlockIdentity) -> [u8; AAD_LEN] {
-    // Stack-allocated; the compiler emits a sequence of direct writes,
-    // no heap and no zero-init beyond the initial `[0; 38]`.
-    let mut buf = [0u8; AAD_LEN];
-
-    // Offset 0..4: MagicMetadata (literal, format-identity binding).
-    buf[0..4].copy_from_slice(&MAGIC_METADATA_LE);
-
-    // Offset 4..8: disk-mirrored 4-byte preamble.
-    buf[4] = header.header_byte;
-    buf[5] = header.key_epoch;
-    buf[6] = header.block_type.as_byte();
-    buf[7] = header.suite_id.as_byte();
-
-    // Offset 8..32: three u64 BE identity fields (NEVER on disk).
-    buf[8..16].copy_from_slice(&identity.tree_id.to_be_bytes());
-    buf[16..24].copy_from_slice(&identity.table_id.to_be_bytes());
-    buf[24..32].copy_from_slice(&identity.block_offset.to_be_bytes());
-
-    // Offset 32..38: disk-mirrored codec context.
-    buf[32] = header.compression_type;
-    buf[33..37].copy_from_slice(&header.dict_id.to_be_bytes());
-    buf[37] = header.window_log;
-
-    buf
-}
-
-/// Parse a `SuiteId` from its on-disk byte. Used by the wire-format
-/// decoder before AAD construction (the AAD is built only after the
-/// decoder has resolved `NONCE_LEN` from the suite byte).
-///
-/// # Errors
-///
-/// Returns the offending byte if it does not match any registered suite
-/// in the §7 registry. The caller is expected to surface this as
-/// `DecryptError::UnsupportedSuite { suite_id: byte }` once that error
-/// type lands (see [`super::error`]).
 impl TryFrom<u8> for SuiteId {
     type Error = u8;
     fn try_from(value: u8) -> Result<Self, u8> {
@@ -297,23 +126,104 @@ impl TryFrom<u8> for SuiteId {
     }
 }
 
-impl TryFrom<u8> for BlockType {
-    type Error = u8;
-    fn try_from(value: u8) -> Result<Self, u8> {
-        match value {
-            0 => Ok(Self::Data),
-            1 => Ok(Self::Index),
-            2 => Ok(Self::Filter),
-            3 => Ok(Self::Meta),
-            4 => Ok(Self::RangeTombstone),
-            other => Err(other),
+/// AAD-specific per-block context.
+///
+/// Holds the four fields the spec embeds into AAD that do NOT live on
+/// [`BlockIdentity`] (which already carries the block-physical context:
+/// block type, dict id, window log, plus the three identity fields).
+/// Bundled into a single struct so the constructor takes two arguments
+/// instead of six and so the field order matches the AAD byte layout
+/// from `docs/aad-block-format.md` §5.3.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EncryptionContext {
+    /// `HeaderByte` at `MetadataPayload` offset 0 / AAD offset 4. For v1
+    /// blocks this is [`HEADER_BYTE_V1`]; a decoder that sees any other
+    /// value MUST reject the block as
+    /// [`super::error::DecryptError::UnsupportedFormatVersion`].
+    pub header_byte: u8,
+    /// `KeyEpoch` index into the caller's key chain.
+    pub key_epoch: u8,
+    /// AEAD suite selector; mirrors disk byte at `MetadataPayload`
+    /// offset 11 and drives the variable-length `Nonce` field width
+    /// (see [`SuiteId::nonce_len`]).
+    pub suite_id: SuiteId,
+    /// `CompressionType` codec discriminator (matches the leading byte
+    /// of `impl Encode for compression::CompressionType`). v1
+    /// spec-defined tags: 0 = None, 1 = Lz4, 3 = Zstd, 4 = `ZstdDict`.
+    /// Stored as a raw `u8` here because only the leading discriminator
+    /// byte participates in AAD; level (for Zstd) and dict-fingerprint
+    /// (already carried on [`BlockIdentity::dict_id`]) live elsewhere.
+    pub compression_type: u8,
+}
+
+impl EncryptionContext {
+    /// Construct a v1 encryption context. The `header_byte` field is
+    /// pinned to [`HEADER_BYTE_V1`]; callers that need to round-trip a
+    /// different version byte (e.g. negative tests) build the struct
+    /// directly.
+    #[must_use]
+    pub const fn v1(key_epoch: u8, suite_id: SuiteId, compression_type: u8) -> Self {
+        Self {
+            header_byte: HEADER_BYTE_V1,
+            key_epoch,
+            suite_id,
+            compression_type,
         }
     }
+}
+
+/// Build the 38-byte AAD buffer from the encryption context and the
+/// per-block identity.
+///
+/// The returned array is the exact buffer to pass to the AEAD primitive
+/// as `associated_data` for both `encrypt_in_place_detached` and
+/// `decrypt_in_place_detached`. Both writer and reader call this with
+/// the same inputs; a mismatch in any single byte causes the AEAD tag
+/// to fail verification.
+///
+/// Layout matches `docs/aad-block-format.md` §5.3 byte-for-byte.
+#[must_use]
+pub fn build(ctx: &EncryptionContext, identity: &BlockIdentity) -> [u8; AAD_LEN] {
+    // Stack-allocated; the compiler emits a sequence of direct writes,
+    // no heap and no zero-init beyond the initial `[0; 38]`.
+    let mut buf = [0u8; AAD_LEN];
+
+    // Offset 0..4: MagicMetadata (literal, format-identity binding).
+    buf[0..4].copy_from_slice(&MAGIC_METADATA_LE);
+
+    // Offset 4..8: disk-mirrored 4-byte preamble.
+    buf[4] = ctx.header_byte;
+    buf[5] = ctx.key_epoch;
+    buf[6] = u8::from(identity.block_type);
+    buf[7] = ctx.suite_id.as_byte();
+
+    // Offset 8..32: three u64 BE identity fields (NEVER on disk).
+    buf[8..16].copy_from_slice(&identity.tree_id.to_be_bytes());
+    buf[16..24].copy_from_slice(&identity.table_id.to_be_bytes());
+    buf[24..32].copy_from_slice(&identity.block_offset.to_be_bytes());
+
+    // Offset 32..38: disk-mirrored codec context.
+    buf[32] = ctx.compression_type;
+    buf[33..37].copy_from_slice(&identity.dict_id.to_be_bytes());
+    buf[37] = identity.window_log;
+
+    buf
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn identity(tree_id: u64, table_id: u64, block_offset: u64, bt: BlockType) -> BlockIdentity {
+        BlockIdentity {
+            tree_id,
+            table_id,
+            block_offset,
+            block_type: bt,
+            dict_id: 0,
+            window_log: 0,
+        }
+    }
 
     #[test]
     fn aad_len_matches_spec() {
@@ -366,47 +276,27 @@ mod tests {
     }
 
     #[test]
-    fn block_type_byte_round_trip() {
-        for bt in [
-            BlockType::Data,
-            BlockType::Index,
-            BlockType::Filter,
-            BlockType::Meta,
-            BlockType::RangeTombstone,
-        ] {
-            assert_eq!(BlockType::try_from(bt.as_byte()), Ok(bt));
-        }
-    }
-
-    #[test]
-    fn block_type_rejects_unknown_byte() {
-        for byte in [5u8, 0x10, 0xFF] {
-            assert_eq!(BlockType::try_from(byte), Err(byte));
-        }
-    }
-
-    #[test]
     fn aad_layout_is_byte_exact_for_a_concrete_block() {
         // Synthesise a concrete AAD payload and check every offset
         // matches the spec. The values picked here are non-degenerate:
         // each field uses a recognisable bit pattern so a layout mistake
         // (e.g. swapping table_id and block_offset) is immediately
         // visible in the diff.
-        let header = MetadataHeader::v1(
-            0x55,             // key_epoch
-            BlockType::Index, // 1
+        let ctx = EncryptionContext::v1(
+            0x55, // key_epoch
             SuiteId::ChaCha20Poly1305,
-            3,           // CompressionType::Zstd
-            0xDEAD_BEEF, // dict_id
-            21,          // window_log
+            3, // CompressionType::Zstd
         );
-        let identity = BlockIdentity::new(
-            0x0102_0304_0506_0708, // tree_id
-            0x1112_1314_1516_1718, // table_id
-            0x2122_2324_2526_2728, // block_offset
-        );
+        let identity = BlockIdentity {
+            tree_id: 0x0102_0304_0506_0708,
+            table_id: 0x1112_1314_1516_1718,
+            block_offset: 0x2122_2324_2526_2728,
+            block_type: BlockType::Index, // 1
+            dict_id: 0xDEAD_BEEF,
+            window_log: 21,
+        };
 
-        let aad = build(&header, &identity);
+        let aad = build(&ctx, &identity);
 
         // MagicMetadata (LE): 50 2A 4D 18
         assert_eq!(&aad[0..4], &[0x50, 0x2A, 0x4D, 0x18]);
@@ -436,17 +326,13 @@ mod tests {
     fn aad_for_zero_identity_is_well_formed() {
         // The `tree_id = 0` placeholder path still produces a valid
         // 38-byte AAD; the cross-tree defence in that case relies on
-        // per-tree key isolation, not on AAD bytes. Tested here so a
-        // future panic-on-zero check in `BlockIdentity::new` would be
-        // caught immediately.
-        let header = MetadataHeader::v1(0, BlockType::Data, SuiteId::Aes256Gcm, 0, 0, 0);
-        let identity = BlockIdentity::new(0, 0, 0);
-        let aad = build(&header, &identity);
+        // per-tree key isolation, not on AAD bytes. The fixture also
+        // pins the AES-256-GCM byte at the SuiteID offset for the
+        // zero-codec / zero-block-type happy path.
+        let ctx = EncryptionContext::v1(0, SuiteId::Aes256Gcm, 0);
+        let id = identity(0, 0, 0, BlockType::Data);
+        let aad = build(&ctx, &id);
         assert_eq!(aad.len(), AAD_LEN);
-        // Magic at the front, HeaderByte=0x10 at offset 4, SuiteID=0x02
-        // at offset 7. The remaining 30 bytes are zero (KeyEpoch,
-        // BlockType, TreeID/TableID/BlockOffset, CompressionType,
-        // DictID, WindowLog).
         assert_eq!(&aad[0..4], &MAGIC_METADATA_LE);
         assert_eq!(aad[4], HEADER_BYTE_V1);
         assert_eq!(aad[5], 0); // KeyEpoch
@@ -457,15 +343,30 @@ mod tests {
 
     #[test]
     fn aad_changes_when_block_offset_changes() {
-        // The cross-block-relocation defence: same identity except
-        // for `block_offset` must produce a different AAD, so the same
-        // AEAD ciphertext+tag will not verify after a relocation.
-        let header = MetadataHeader::v1(1, BlockType::Data, SuiteId::Aes256Gcm, 0, 0, 0);
-        let a = build(&header, &BlockIdentity::new(1, 2, 100));
-        let b = build(&header, &BlockIdentity::new(1, 2, 101));
+        // Cross-block-relocation defence: same identity except for
+        // `block_offset` must produce a different AAD, so the same
+        // AEAD ciphertext + tag will not verify after a relocation.
+        let ctx = EncryptionContext::v1(1, SuiteId::Aes256Gcm, 0);
+        let a = build(&ctx, &identity(1, 2, 100, BlockType::Data));
+        let b = build(&ctx, &identity(1, 2, 101, BlockType::Data));
         assert_ne!(a, b);
-        // Only the block_offset bytes (24..32) should differ.
+        // Only the block_offset bytes (24..32) differ.
         assert_eq!(&a[..24], &b[..24]);
         assert_eq!(&a[32..], &b[32..]);
+    }
+
+    #[test]
+    fn aad_changes_when_block_type_changes() {
+        // Block-type-relabel defence: same identity except for
+        // `block_type` must produce a different AAD, so an attacker
+        // cannot relabel a Data block as an Index block to bypass
+        // type-specific decode paths.
+        let ctx = EncryptionContext::v1(1, SuiteId::Aes256Gcm, 0);
+        let a = build(&ctx, &identity(1, 2, 100, BlockType::Data));
+        let b = build(&ctx, &identity(1, 2, 100, BlockType::Index));
+        assert_ne!(a, b);
+        // Only the block_type byte (offset 6) differs.
+        assert_eq!(&a[..6], &b[..6]);
+        assert_eq!(&a[7..], &b[7..]);
     }
 }

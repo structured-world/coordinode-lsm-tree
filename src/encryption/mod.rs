@@ -22,8 +22,10 @@
 //! `docs/aad-block-format.md` is being introduced incrementally. The
 //! foundation pieces shipped so far live in submodules:
 //!
-//! - [`aad`]: pure-byte AAD construction, suite / block-type tags,
-//!   `BlockIdentity` for the caller-supplied identity inputs.
+//! - [`aad`]: pure-byte AAD construction, [`aad::SuiteId`] /
+//!   [`aad::EncryptionContext`], plus re-exports of the existing
+//!   `crate::table::block::BlockType` / `crate::table::block::BlockIdentity`
+//!   so the AAD path and the Block I/O path share one identity type.
 //! - [`error`]: `DecryptError` enum with one variant per decode-time
 //!   failure mode.
 //!
