@@ -1010,6 +1010,7 @@ mod tests {
                 checksum: Checksum::from_raw(0),
                 data_length: 0,
                 uncompressed_length: 0,
+                ecc_length: 0,
             },
         });
         let trailer_offset = Trailer::new(&trailer_probe.inner).trailer_offset();
@@ -1024,6 +1025,7 @@ mod tests {
                 checksum: Checksum::from_raw(0),
                 data_length: 0,
                 uncompressed_length: 0,
+                ecc_length: 0,
             },
         });
         let trailer_offset = Trailer::new(&trailer_probe.inner).trailer_offset();
@@ -1038,6 +1040,7 @@ mod tests {
                 checksum: Checksum::from_raw(0),
                 data_length: 0,
                 uncompressed_length: 0,
+                ecc_length: 0,
             },
         });
         let trailer_offset = Trailer::new(&trailer_probe.inner).trailer_offset();
@@ -1052,6 +1055,7 @@ mod tests {
                 checksum: Checksum::from_raw(0),
                 data_length: 0,
                 uncompressed_length: 0,
+                ecc_length: 0,
             },
         });
         let trailer_offset = Trailer::new(&trailer_probe.inner).trailer_offset();
@@ -1164,6 +1168,7 @@ mod tests {
                 checksum: Checksum::from_raw(0),
                 data_length: 0,
                 uncompressed_length: 0,
+                ecc_length: 0,
             },
         };
         assert!(
@@ -1193,6 +1198,7 @@ mod tests {
                 checksum: Checksum::from_raw(0),
                 data_length: 0,
                 uncompressed_length: 0,
+                ecc_length: 0,
             },
         };
         assert!(
@@ -1221,6 +1227,7 @@ mod tests {
                 checksum: Checksum::from_raw(0),
                 data_length: 0,
                 uncompressed_length: 0,
+                ecc_length: 0,
             },
         };
         assert!(
@@ -1253,6 +1260,7 @@ mod tests {
                 checksum: Checksum::from_raw(0),
                 data_length: 0,
                 uncompressed_length: 0,
+                ecc_length: 0,
             },
         };
         assert!(
@@ -1278,6 +1286,7 @@ mod tests {
                 checksum: Checksum::from_raw(0),
                 data_length: 0,
                 uncompressed_length: 0,
+                ecc_length: 0,
             },
         });
         let trailer_offset = Trailer::new(&trailer_probe.inner).trailer_offset();
@@ -1301,6 +1310,7 @@ mod tests {
                 checksum: Checksum::from_raw(0),
                 data_length: 0,
                 uncompressed_length: 0,
+                ecc_length: 0,
             },
         };
         assert!(
@@ -1333,6 +1343,7 @@ mod tests {
                 checksum: Checksum::from_raw(0),
                 data_length: 0,
                 uncompressed_length: 0,
+                ecc_length: 0,
             },
         };
         assert!(
@@ -1368,6 +1379,7 @@ mod tests {
                 checksum: Checksum::from_raw(0),
                 data_length: 0,
                 uncompressed_length: 0,
+                ecc_length: 0,
             },
         };
         let mut decoder = Decoder::<KeyedBlockHandle, IndexBlockParsedItem>::new(&block);
@@ -1386,6 +1398,7 @@ mod tests {
                 checksum: Checksum::from_raw(0),
                 data_length: 0,
                 uncompressed_length: 0,
+                ecc_length: 0,
             },
         };
         let mut decoder = Decoder::<KeyedBlockHandle, IndexBlockParsedItem>::new(&block);
@@ -1418,6 +1431,7 @@ mod tests {
                 checksum: Checksum::from_raw(0),
                 data_length: 0,
                 uncompressed_length: 0,
+                ecc_length: 0,
             },
         };
         let mut decoder = Decoder::<KeyedBlockHandle, IndexBlockParsedItem>::new(&block);
@@ -1454,6 +1468,7 @@ mod tests {
                 checksum: Checksum::from_raw(0),
                 data_length: 0,
                 uncompressed_length: 0,
+                ecc_length: 0,
             },
         };
         let mut decoder = Decoder::<KeyedBlockHandle, IndexBlockParsedItem>::new(&block);
@@ -1524,6 +1539,7 @@ mod tests {
                 checksum: Checksum::from_raw(0),
                 data_length: 0,
                 uncompressed_length: 0,
+                ecc_length: 0,
             },
         };
         let mut decoder = Decoder::<KeyedBlockHandle, IndexBlockParsedItem>::new(&block);
@@ -1593,6 +1609,7 @@ mod tests {
                 checksum: Checksum::from_raw(0),
                 data_length: 0,
                 uncompressed_length: 0,
+                ecc_length: 0,
             },
         };
         let mut decoder = Decoder::<KeyedBlockHandle, IndexBlockParsedItem>::new(&block);
@@ -1629,6 +1646,7 @@ mod tests {
                 checksum: Checksum::from_raw(0),
                 data_length: 0,
                 uncompressed_length: 0,
+                ecc_length: 0,
             },
         };
         let mut decoder = Decoder::<KeyedBlockHandle, IndexBlockParsedItem>::new(&block);
@@ -1681,6 +1699,7 @@ mod tests {
                 checksum: Checksum::from_raw(0),
                 data_length: 0,
                 uncompressed_length: 0,
+                ecc_length: 0,
             },
         };
         let mut decoder = Decoder::<KeyedBlockHandle, IndexBlockParsedItem>::new(&block);
@@ -1725,6 +1744,7 @@ mod tests {
                 checksum: Checksum::from_raw(0),
                 data_length: 0,
                 uncompressed_length: 0,
+                ecc_length: 0,
             },
         };
 
@@ -1769,6 +1789,7 @@ mod tests {
                 checksum: Checksum::from_raw(0),
                 data_length: 0,
                 uncompressed_length: 0,
+                ecc_length: 0,
             },
         };
         assert!(
@@ -1809,6 +1830,7 @@ mod tests {
                 checksum: Checksum::from_raw(0),
                 data_length: 0,
                 uncompressed_length: 0,
+                ecc_length: 0,
             },
         };
         assert!(
@@ -1839,6 +1861,7 @@ mod tests {
                 checksum: Checksum::from_raw(0),
                 data_length: 0,
                 uncompressed_length: 0,
+                ecc_length: 0,
             },
         };
         assert!(
@@ -1893,6 +1916,7 @@ mod tests {
                 checksum: Checksum::from_raw(0),
                 data_length: 0,
                 uncompressed_length: 0,
+                ecc_length: 0,
             },
         };
         let mut decoder = Decoder::<KeyedBlockHandle, IndexBlockParsedItem>::new(&block);
@@ -1921,6 +1945,7 @@ mod tests {
                 checksum: Checksum::from_raw(0),
                 data_length: 0,
                 uncompressed_length: 0,
+                ecc_length: 0,
             },
         };
         let trailer_offset = Trailer::new(&block).trailer_offset();
@@ -1933,6 +1958,7 @@ mod tests {
                 checksum: Checksum::from_raw(0),
                 data_length: 0,
                 uncompressed_length: 0,
+                ecc_length: 0,
             },
         };
 
@@ -1957,6 +1983,7 @@ mod tests {
                 checksum: Checksum::from_raw(0),
                 data_length: 0,
                 uncompressed_length: 0,
+                ecc_length: 0,
             },
         };
         let trailer_offset = Trailer::new(&block).trailer_offset();
@@ -1970,6 +1997,7 @@ mod tests {
                 checksum: Checksum::from_raw(0),
                 data_length: 0,
                 uncompressed_length: 0,
+                ecc_length: 0,
             },
         };
 
@@ -1995,6 +2023,7 @@ mod tests {
                 checksum: Checksum::from_raw(0),
                 data_length: 0,
                 uncompressed_length: 0,
+                ecc_length: 0,
             },
         };
         let trailer_offset = Trailer::new(&block).trailer_offset();
@@ -2007,6 +2036,7 @@ mod tests {
                 checksum: Checksum::from_raw(0),
                 data_length: 0,
                 uncompressed_length: 0,
+                ecc_length: 0,
             },
         };
 

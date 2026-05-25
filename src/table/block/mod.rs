@@ -1129,6 +1129,7 @@ mod tests {
             uncompressed_length: uncompressed_length_corrupted,
             checksum,
             block_type: BlockType::Data,
+            ecc_length: 0,
         };
 
         let mut buf = header.encode_into_vec();
@@ -1366,6 +1367,7 @@ mod tests {
             uncompressed_length: uncompressed_length_corrupted,
             checksum,
             block_type: BlockType::Data,
+            ecc_length: 0,
         };
 
         let mut buf = header.encode_into_vec();
@@ -1415,6 +1417,7 @@ mod tests {
             uncompressed_length: uncompressed_length_too_small,
             checksum,
             block_type: BlockType::Data,
+            ecc_length: 0,
         };
 
         let mut buf = header.encode_into_vec();
