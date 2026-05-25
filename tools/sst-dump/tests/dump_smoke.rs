@@ -207,10 +207,13 @@ fn dump_partitioned_index_sst_returns_unsupported_error() {
     // SSTs into the full-index code path is caught here instead of
     // producing wrong dumps.
     //
-    // 256 entries is enough to push past the default index-block size
-    // budget at every level so the partitioned-index writer actually
-    // emits a partitioned index. (A handful of keys would land in a
-    // single block even with `partitioning_policy = all-true`.)
+    // The partitioned-index writer always emits a separate `index`
+    // SFA section even with a tiny key count (the section starts on
+    // the first call to `write_top_level_index`, before any
+    // splitting decision); 256 entries is a comfortable count that
+    // also actually exercises a multi-partition layout so the test
+    // covers the same writer path real workloads use, not a
+    // degenerate single-partition shape.
     let (_dir, sst) = build_partitioned_index_sst(256);
 
     let out = Command::new(SST_DUMP_BIN)
