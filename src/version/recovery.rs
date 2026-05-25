@@ -1585,9 +1585,16 @@ mod tests {
     /// time the branch fires — `Recovery::table_ids` then carries an
     /// empty inner vec, which `Version::from_recovery` later panics on
     /// via `Run::new(...).expect("persisted runs should not be empty")`.
-    /// Invariant under test: `recover()` must never produce empty runs
-    /// or empty levels in `table_ids` — the recovery shape must be
-    /// usable by `Version::from_recovery` without further validation.
+    /// Invariants under test:
+    /// 1. `recover()` must never produce empty runs in `table_ids`.
+    /// 2. Empty inner levels (no runs) must not appear — they pass
+    ///    `Level::from_runs(vec![])` cleanly downstream but offer no
+    ///    information; truncated levels are represented by the slot,
+    ///    not by a placeholder run.
+    /// 3. The number of level SLOTS in `table_ids` must equal the
+    ///    persisted `level_count` — downstream code (compaction/leveled
+    ///    asserts `version.level_count() == 7`) reads `levels.len()`
+    ///    directly and shrinking it crashes the tree.
     #[test]
     fn recover_pit_drops_empty_run_when_corruption_hits_first_record() -> crate::Result<()> {
         let fs = MemFs::new();
@@ -1598,17 +1605,19 @@ mod tests {
 
         let recovery = recover(folder, &fs, ManifestRecoveryMode::PointInTimeRecovery)?;
 
-        // Level 0 survived intact with its one good record.
-        // Level 1 hit corruption on its first record → must be
-        // dropped entirely, NOT preserved as an empty level
-        // containing an empty run.
+        // The persisted manifest declared 2 levels. The recovered
+        // shape must keep that count — level 1 just has no
+        // surviving runs after PIT dropped its only (corrupt) record.
+        assert_eq!(
+            recovery.table_ids.len(),
+            2,
+            "expected the recovered shape to preserve the persisted \
+             level_count (2); got {} levels",
+            recovery.table_ids.len(),
+        );
+
+        // No empty runs anywhere in the recovered shape.
         for (level_idx, level) in recovery.table_ids.iter().enumerate() {
-            assert!(
-                !level.is_empty(),
-                "level {level_idx} is empty in recovered Recovery — \
-                 Version::from_recovery will produce a Level with no \
-                 runs (or attempt Run::new on an empty vec downstream)",
-            );
             for (run_idx, run) in level.iter().enumerate() {
                 assert!(
                     !run.is_empty(),
@@ -1620,14 +1629,94 @@ mod tests {
             }
         }
 
-        // Specific prefix shape: only the level-0 record survives.
-        assert_eq!(
-            recovery.table_ids.len(),
-            1,
-            "expected only level 0 in the recovered shape; got {} levels",
-            recovery.table_ids.len(),
-        );
+        // Level 0 survived intact with its one good record.
+        assert_eq!(recovery.table_ids[0].len(), 1, "level 0 should have 1 run");
         assert_eq!(recovery.table_ids[0][0][0].id, 100);
+        // Level 1 had its only record dropped → 0 runs (the slot
+        // survives empty, not as a placeholder containing an empty run).
+        assert!(
+            recovery.table_ids[1].is_empty(),
+            "level 1 should have no runs after PIT dropped its corrupt-only run",
+        );
+        Ok(())
+    }
+
+    /// Builds a manifest where level 0 has ONE run of ONE corrupt
+    /// record. Under SkipAnyCorruptedRecords the single record is
+    /// skipped → the run is empty when the per-run record loop
+    /// completes → the unconditional `level.push(run)` at line 498
+    /// produces an empty run in Recovery::table_ids.
+    fn write_manifest_with_all_records_in_run_corrupt(
+        folder: &Path,
+        id: u64,
+        fs: &dyn Fs,
+    ) -> crate::Result<()> {
+        let path = folder.join(format!("v{id}"));
+        let file = fs.open(
+            &path,
+            &FsOpenOptions::new().write(true).create(true).truncate(true),
+        )?;
+        let mut w = sfa::Writer::from_writer(std::io::BufWriter::new(file));
+
+        w.start("tree_type")?;
+        w.write_u8(0)?;
+
+        w.start("tables")?;
+        w.write_u8(2)?; // 2 levels persisted
+        // Level 0: 1 run, 1 record, all corrupt.
+        w.write_u8(1)?;
+        w.write_u32::<LittleEndian>(1)?;
+        write_bad_table_record(&mut w, 100)?;
+        // Level 1: 1 run, 1 good record (so the recovered shape
+        // still has surviving content + a non-trivial level slot).
+        w.write_u8(1)?;
+        w.write_u32::<LittleEndian>(1)?;
+        write_good_table_record(&mut w, 200)?;
+
+        w.start("blob_files")?;
+        w.write_u32::<LittleEndian>(0)?;
+        w.start("blob_gc_stats")?;
+        w.write_u32::<LittleEndian>(0)?;
+        w.finish().map_err(|e| match e {
+            sfa::Error::Io(e) => crate::Error::from(e),
+            _ => crate::Error::Unrecoverable,
+        })?;
+        Ok(())
+    }
+
+    /// Regression test for the second review finding on PR #342:
+    /// after the per-run record loop, `level.push(run)` runs
+    /// unconditionally. Under SkipAnyCorruptedRecords every record
+    /// in a run can be ChecksumMismatched → run stays empty → the
+    /// unconditional push produces an empty run in Recovery.
+    /// Same downstream panic as the first finding: from_recovery's
+    /// Run::new(empty).expect() aborts the tolerant path.
+    #[test]
+    fn recover_skip_any_drops_run_when_all_records_corrupt() -> crate::Result<()> {
+        let fs = MemFs::new();
+        let folder = Path::new("/skip_any/all_corrupt_run");
+        fs.create_dir_all(folder)?;
+        write_current(folder, 1, &fs)?;
+        write_manifest_with_all_records_in_run_corrupt(folder, 1, &fs)?;
+
+        let recovery = recover(folder, &fs, ManifestRecoveryMode::SkipAnyCorruptedRecords)?;
+
+        // 2 levels persisted, both survive as slots.
+        assert_eq!(recovery.table_ids.len(), 2);
+        // Level 0's only run had its only record skipped → no
+        // surviving runs (the empty-run placeholder must not be
+        // pushed; the level slot itself stays as the structural
+        // record that "the writer persisted a level here").
+        for (run_idx, run) in recovery.table_ids[0].iter().enumerate() {
+            assert!(
+                !run.is_empty(),
+                "level 0 run {run_idx} is empty in Recovery — \
+                 Version::from_recovery's Run::new(empty).expect() panics here",
+            );
+        }
+        // Level 1 survived with its one good record.
+        assert_eq!(recovery.table_ids[1].len(), 1);
+        assert_eq!(recovery.table_ids[1][0][0].id, 200);
         Ok(())
     }
 
