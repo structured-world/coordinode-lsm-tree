@@ -153,23 +153,19 @@ fn partitioned_index_corrupting_one_sub_block_only_affects_its_keys() {
 
     // The read that routes through the corrupted sub-index partition
     // must surface the corruption as an error, NOT silently return
-    // None / wrong data. The block-header decode produces one of two
-    // specific Error variants for a zeroed sub-index block — both
-    // are checked in the `matches!` arm below.
+    // None / wrong data. With the corruption method we use (the whole
+    // sub-index block zeroed, header + payload), `Header::decode_from`
+    // hits the `MAGIC_BYTES` check first and returns
+    // `Error::InvalidHeader("Block")` deterministically — the
+    // following XXH3 header-checksum comparison never runs because
+    // magic mismatch short-circuits the decode. So the test pins the
+    // single expected variant; a generic `is_err()` would also accept
+    // unrelated failures (I/O error mid-test, an unrelated
+    // `Unrecoverable`, etc.) and weaken the blast-radius assertion.
     let v_victim = tree.get(&victim_last_key, lsm_tree::MAX_SEQNO);
-    // A zeroed sub-index block fails block-header validation: either
-    // the header's stored XXH3 disagrees with XXH3(zeros)
-    // (`ChecksumMismatch`), or the all-zero header fails structural
-    // checks first (`InvalidHeader`). Both are corruption signals — a
-    // generic `is_err()` would also accept unrelated failures (I/O
-    // error mid-test, an unrelated `Unrecoverable`, etc.) and weaken
-    // the blast-radius assertion.
     assert!(
-        matches!(
-            v_victim,
-            Err(lsm_tree::Error::ChecksumMismatch { .. }) | Err(lsm_tree::Error::InvalidHeader(_))
-        ),
-        "read against corrupted sub-index partition must surface as block-header corruption (ChecksumMismatch or InvalidHeader); got {v_victim:?}"
+        matches!(v_victim, Err(lsm_tree::Error::InvalidHeader(_))),
+        "read against corrupted sub-index partition must surface as block-header InvalidHeader (zeroed magic short-circuits before XXH3 check); got {v_victim:?}"
     );
 
     // Sanity: very-early and very-late keys (covered by partitions
