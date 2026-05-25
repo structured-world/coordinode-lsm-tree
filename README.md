@@ -120,6 +120,36 @@ cargo run --release --features flamegraph -- \
 | [`tools/db_bench`](tools/db_bench) | RocksDB-compatible benchmark suite, also drives the CI perf dashboard. |
 | [`tools/sst-dump`](tools/sst-dump) | Inspect / verify a single SST file out-of-band. Subcommands: `verify` (walk every block, check per-block XXH3, exit non-zero on corruption), `properties` (print the SST's stored metadata: id, key range, KV / tombstone counts, block counts, compression, timestamp), `hex <offset>` (raw hex dump of a region with optional `Header` decode; useful for inspecting a specific offset flagged by `verify --verbose`), `index-dump` (print TLI entries: end_key + offset + size + seqno per pointed-at block; useful for diagnosing range-read fan-out). |
 
+## Manifest recovery modes
+
+`Config::manifest_recovery_mode` controls how the engine reacts to a malformed MANIFEST record at `Tree::open` time. Each mode trades a different point on the **strictness ↔ availability** axis; pick the one whose contract matches the deployment.
+
+| Mode | Behaviour on corruption | When to use |
+|------|-------------------------|-------------|
+| `AbsoluteConsistency` (default) | Any per-record decode mismatch (bad XXH3, invalid tag, truncated TOC entry, declared-count overrun) aborts the open with the original error. No data is silently dropped. | **Production default.** Surfaces every byte of corruption before the tree comes back online; matches what most workloads actually want. |
+| `TolerateCorruptedTailRecords` | If the iteration over `tables` / `blob_files` runs out of bytes before the declared count is reached (truncated tail), keep everything that decoded cleanly before the cut and emit a `warn!` listing the dropped count. Any mid-record error that is NOT a clean tail truncation (bad checksum, etc.) still aborts. | **Power-loss-at-write-tail salvage.** Use when a crash mid-fsync left the MANIFEST tail incomplete and you'd rather come up with the last consistent prefix than refuse to open. Not a general bit-rot tolerance, only "the writer never finished". |
+| `PointInTimeRecovery` | Reserved for the upcoming "roll back to the last fully-consistent record group" semantic (RocksDB's `kPointInTimeRecovery`). Currently behaves identically to `AbsoluteConsistency`. | Not yet wired; design and impl tracked in [#323](https://github.com/structured-world/coordinode-lsm-tree/issues/323). |
+| `SkipAnyCorruptedRecords` | Reserved for the upcoming "skip individual bad record, keep all others" semantic (RocksDB's `kSkipAnyCorruptedRecords`). Currently behaves identically to `AbsoluteConsistency`. Intended companion to the `repair_db` tooling tracked in [#303](https://github.com/structured-world/coordinode-lsm-tree/issues/303). | Not yet wired; lossy maximum-availability mode for forensic recovery, pairs with manifest reconstruction. |
+
+When a non-default mode drops records, the recovery path logs `warn!` lines describing what was tolerated. Individual table-IDs / blob-file-IDs are NOT enumerated because they were never decoded. Warnings fall into two categories:
+
+**Per-condition warns** (one warn for each malformed shape encountered, at the point of detection):
+
+- `tables` section truncated before the `level_count` byte → tail-tolerant mode produces 0 levels.
+- `tables` declared `table_count` exceeds remaining section payload (count header forged or entries truncated) → loop walks bytes-actually-present and stops at the first EOF.
+- `blob_files` section truncated before its count header → 0 blob files.
+- `blob_files` declared count exceeds remaining section capacity → same forged-or-truncated shape, same walk-and-stop fallback.
+- `blob_gc_stats` payload truncated (power-loss between the `blob_files` commit and the `blob_gc_stats` payload landing) → tail-tolerant mode produces an empty `FragmentationMap`. GC stats are advisory (fragmentation re-accrues on the next compaction pass), so this is a "rebuild on next pass" outcome, not data loss. This is a single in-place warn with no later summary.
+
+**Per-section summary warns** (at end of section processing, only if the section actually lost records):
+
+- `tables` section, emitted only when `tables_dropped_to_tail > 0` OR `tables_truncated_headers > 0`. Reports two counters in one line: declared-but-missing table records (count header said N, only K < N records read before EOF → N-K dropped) and the separate counter for level / run / `table_count` headers cut mid-byte (no records were supposed to be present yet for those levels / runs, so the headers contribute zero to record loss but the levels / runs themselves are absent).
+- `blob_files` section, emitted only when `blob_dropped_to_tail > 0`. Reports the declared-but-missing blob-file records count, analogous to the tables-section record-drop counter. A `blob_files` section whose only damage was a missing count header surfaces the per-condition warn above but does NOT add a summary line.
+
+Operators wanting a per-record audit trail should pair a tail-tolerant open with an out-of-band integrity scan (see `verify::verify_integrity` / `tools/sst-dump verify`).
+
+For workflows where the MANIFEST is unrecoverable even under the lossy modes, the planned `repair_db` tool ([#303](https://github.com/structured-world/coordinode-lsm-tree/issues/303)) will rebuild the MANIFEST from the SST files themselves.
+
 ## Support the project
 
 <div align="center">
