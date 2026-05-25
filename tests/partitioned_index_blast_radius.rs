@@ -153,8 +153,9 @@ fn partitioned_index_corrupting_one_sub_block_only_affects_its_keys() {
 
     // The read that routes through the corrupted sub-index partition
     // must surface the corruption as an error, NOT silently return
-    // None / wrong data. Either a block-header XXH3 failure or a
-    // ChecksumMismatch is acceptable.
+    // None / wrong data. The block-header decode produces one of two
+    // specific Error variants for a zeroed sub-index block — both
+    // are checked in the `matches!` arm below.
     let v_victim = tree.get(&victim_last_key, lsm_tree::MAX_SEQNO);
     // A zeroed sub-index block fails block-header validation: either
     // the header's stored XXH3 disagrees with XXH3(zeros)
