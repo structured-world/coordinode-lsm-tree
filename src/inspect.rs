@@ -529,22 +529,25 @@ pub fn read_filter_stats(path: &Path) -> crate::Result<Option<FilterStats>> {
         )));
     }
 
-    // Empty data slice is the "no filter installed" sentinel
-    // (see `FilterBlock::maybe_contains_hash`); `BurrFilterReader::new`
-    // would reject it with `InvalidHeader` (magic mismatch on the
-    // empty buffer), so route around it. `layer_count` is 0 in
-    // that case; `bits_per_key` still follows the documented
-    // formula below (block header bytes / item_count), so the
-    // field semantics stay consistent with `FilterStats`'s doc.
-    let layer_count: u64 = if block.data.is_empty() {
-        0
-    } else {
-        // BurrFilterReader::layer_count returns usize; widen to u64 at
-        // the public-API boundary. usize -> u64 is lossless on every
-        // target Rust supports (u64 is at least as wide as usize on
-        // 32-bit and identical on 64-bit).
-        BurrFilterReader::new(&block.data)?.layer_count() as u64
-    };
+    // Empty data slice is the "no filter installed" sentinel (see
+    // `FilterBlock::maybe_contains_hash`). The on-disk shape of "no
+    // filter present" can be either the section absent entirely
+    // OR the section present with a zero-byte payload; both mean
+    // the same thing semantically. Collapse the empty-payload case
+    // to the same `Ok(None)` result the section-absent branch
+    // above returns, so the CLI prints the documented
+    // "no filter section installed" line for either shape and the
+    // public API stays consistent with the FilterBlock sentinel
+    // contract.
+    if block.data.is_empty() {
+        return Ok(None);
+    }
+
+    // BurrFilterReader::layer_count returns usize; widen to u64 at
+    // the public-API boundary. usize -> u64 is lossless on every
+    // target Rust supports (u64 is at least as wide as usize on
+    // 32-bit and identical on 64-bit).
+    let layer_count: u64 = BurrFilterReader::new(&block.data)?.layer_count() as u64;
 
     // `item_count` is `u64`; cast to `f64` is lossy for values above
     // 2^53 (~9 quadrillion), which is well past anything a real SST
