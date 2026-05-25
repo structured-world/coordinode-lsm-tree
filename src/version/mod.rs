@@ -3,6 +3,13 @@
 // Copyright (c) 2026-present, Structured World Foundation
 
 mod blob_file_list;
+// `framing` uses `std::io::{Read, Write}` and is therefore gated
+// behind the `std` feature. The whole `version` module (recovery,
+// persist, super_version) is also std-bound today and will be
+// gated together in a future no-std migration pass; gating just
+// `framing` now keeps it ready when its callers gate. See the
+// no-std-check job in `.github/workflows/coordinode-ci.yml`.
+#[cfg(feature = "std")]
 mod framing;
 mod optimize;
 mod persist;

@@ -29,12 +29,15 @@ const BLOB_ENTRY_PAYLOAD_LEN: usize = 8 + 1 + 16;
 /// called.
 ///
 /// Rejects payloads whose length is not exactly
-/// [`TABLE_ENTRY_PAYLOAD_LEN`]. The framing layer guarantees the
-/// XXH3-64 over the payload matched the header digest, so any
-/// length mismatch here means the writer / reader disagree on the
-/// fixed record shape — surface that as `Error::InvalidHeader` to
-/// abort the open under strict mode and fall through to PIT / `SkipAny`
-/// recovery under the tolerant modes.
+/// [`TABLE_ENTRY_PAYLOAD_LEN`]. The framing layer already verified
+/// the XXH3-64 over the payload matched the header digest, so any
+/// length mismatch at this point is writer / reader format drift,
+/// not on-disk bit-rot. That makes it categorically different from
+/// the per-record corruption shapes PIT / `SkipAny` route around:
+/// `Error::InvalidHeader` is propagated unconditionally and aborts
+/// recovery in ALL modes, including the tolerant ones — a code
+/// bug surfacing as silently-skipped records would be worse than
+/// a hard fail at open time.
 fn decode_table_entry_payload(payload: &[u8]) -> crate::Result<RecoveredTable> {
     if payload.len() != TABLE_ENTRY_PAYLOAD_LEN {
         return Err(crate::Error::InvalidHeader("tables record payload length"));
@@ -125,11 +128,14 @@ pub fn recover(folder: &Path, fs: &dyn Fs, mode: ManifestRecoveryMode) -> crate:
     // Per-record framing constants used by both the tables and
     // blob_files sections. Each on-disk record is a
     // FRAME_HEADER_LEN (12-byte) header followed by a fixed-size
-    // payload — 33 bytes for tables, 25 bytes for blob_files —
-    // for a total of FRAMED_TABLE_ENTRY_LEN / FRAMED_BLOB_ENTRY_LEN
-    // bytes respectively.
-    const FRAMED_TABLE_ENTRY_LEN: u64 = crate::version::framing::FRAME_HEADER_LEN as u64 + 33;
-    const FRAMED_BLOB_ENTRY_LEN: u64 = crate::version::framing::FRAME_HEADER_LEN as u64 + 25;
+    // payload (TABLE_ENTRY_PAYLOAD_LEN / BLOB_ENTRY_PAYLOAD_LEN).
+    // Wiring the totals through the existing payload-length
+    // constants keeps the two sites in sync — if a future PR
+    // changes a record's payload shape, only one constant moves.
+    const FRAMED_TABLE_ENTRY_LEN: u64 =
+        crate::version::framing::FRAME_HEADER_LEN as u64 + TABLE_ENTRY_PAYLOAD_LEN as u64;
+    const FRAMED_BLOB_ENTRY_LEN: u64 =
+        crate::version::framing::FRAME_HEADER_LEN as u64 + BLOB_ENTRY_PAYLOAD_LEN as u64;
     use crate::version::framing::FramedRecordOutcome;
 
     let curr_version_id = get_current_version(folder, fs)?;
@@ -403,11 +409,21 @@ pub fn recover(folder: &Path, fs: &dyn Fs, mode: ManifestRecoveryMode) -> crate:
                             levels.push(level);
                             break 'levels;
                         }
-                        // Strict mode: both shapes of "we ran out of
-                        // intact bytes" abort the open. Merged into a
-                        // single arm so clippy::match_same_arms stays
-                        // happy.
-                        FramedRecordOutcome::TailTruncation | FramedRecordOutcome::BadHeader => {
+                        // Strict mode: distinguish "writer crashed
+                        // mid-record" (TailTruncation → surface as
+                        // the original Io(UnexpectedEof) so
+                        // diagnostics match pre-framing recovery)
+                        // from "header was structurally implausible"
+                        // (BadHeader → Unrecoverable, this is real
+                        // corruption that the operator needs to know
+                        // about as such).
+                        FramedRecordOutcome::TailTruncation => {
+                            return Err(crate::Error::Io(std::io::Error::new(
+                                std::io::ErrorKind::UnexpectedEof,
+                                "manifest tables record truncated mid-frame",
+                            )));
+                        }
+                        FramedRecordOutcome::BadHeader => {
                             return Err(crate::Error::Unrecoverable);
                         }
                     }
@@ -530,8 +546,19 @@ pub fn recover(folder: &Path, fs: &dyn Fs, mode: ManifestRecoveryMode) -> crate:
                     blob_dropped_to_corruption = blob_file_count.saturating_sub(recovered);
                     break;
                 }
-                // Strict mode: merged Tail / BadHeader → Unrecoverable.
-                FramedRecordOutcome::TailTruncation | FramedRecordOutcome::BadHeader => {
+                // Strict mode: same Tail vs BadHeader split as the
+                // tables section above. TailTruncation surfaces as
+                // Io(UnexpectedEof) for diagnostic parity with the
+                // pre-framing reader; BadHeader stays Unrecoverable
+                // because the writer never produces a header above
+                // MAX_FRAME_PAYLOAD on its own.
+                FramedRecordOutcome::TailTruncation => {
+                    return Err(crate::Error::Io(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "manifest blob_files record truncated mid-frame",
+                    )));
+                }
+                FramedRecordOutcome::BadHeader => {
                     return Err(crate::Error::Unrecoverable);
                 }
             }
