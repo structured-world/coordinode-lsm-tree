@@ -114,18 +114,20 @@ enum Command {
     /// blocks streamingly: memory cost stays at one data block
     /// regardless of SST size.
     ///
-    /// **Comparator caveat.** `--from` / `--to` are applied as raw
-    /// bytewise comparisons against the on-disk key bytes, and the
-    /// walk breaks early once a key reaches the upper bound. This
-    /// is correct for SSTs written with the default lexicographic
-    /// comparator (the on-disk sort order matches bytewise order),
-    /// but for SSTs written with a custom user comparator the
-    /// early break can stop before all qualifying entries are
-    /// emitted. The underlying `lsm_tree::inspect::iter_data_block_entries`
-    /// facade also walks blocks via the default comparator, so
-    /// custom-comparator SSTs are not safe to inspect through this
-    /// subcommand even without `--from` / `--to`; use the
-    /// owning tree's regular read APIs instead.
+    /// **Comparator caveat (only when `--from` / `--to` is set).**
+    /// A bounds-free `dump` walks every entry sequentially in
+    /// on-disk order and works for any comparator — the iteration
+    /// itself is positional, not comparator-driven. The
+    /// `--from` / `--to` filters, however, compare keys bytewise
+    /// against the supplied bounds and the upper bound break-out
+    /// assumes on-disk order matches bytewise order. That holds for
+    /// the default lexicographic comparator but not for arbitrary
+    /// custom user comparators: with a custom comparator and
+    /// `--from` / `--to` set, the early break can stop before all
+    /// qualifying entries are emitted, and the bounds themselves
+    /// won't filter to the semantic range the caller had in mind.
+    /// Use the owning tree's regular read APIs for
+    /// range-bounded reads on custom-comparator SSTs.
     Dump {
         /// Lower key bound (inclusive). Entries with `key >= --from`
         /// are emitted. Without this flag, the walk starts from the
@@ -528,6 +530,19 @@ fn run_dump(
     // that triggered an extra data-block read + decompression after the
     // cap was already reached. The while-let form short-circuits before
     // pulling.
+    //
+    // Output is buffered through a single locked stdout BufWriter and
+    // each entry emits exactly one `writeln!` so a million-entry SST
+    // dump doesn't pay one stdout lock + one syscall per print call.
+    // BufWriter is flushed implicitly when it goes out of scope at the
+    // end of the function; that flush is the only place a write error
+    // can surface, and we report it as a generic stdout error so the
+    // operator sees something instead of swallowing it silently.
+    use std::io::Write as _;
+    let stdout = std::io::stdout();
+    let stdout_lock = stdout.lock();
+    let mut out = std::io::BufWriter::new(stdout_lock);
+
     let mut iter = iter;
     while emitted < cap {
         let Some(item) = iter.next() else {
@@ -559,33 +574,52 @@ fn run_dump(
             break;
         }
 
-        if keys_only {
-            println!("{}", format_key(&entry.key));
+        // One writeln! per emitted entry: BufWriter accumulates and
+        // releases the bytes in larger flushes, and stdout is locked
+        // once (above) for the whole walk instead of per-line.
+        let line_result = if keys_only {
+            writeln!(out, "{}", format_key(&entry.key))
         } else {
             // `key=value` separator-style — matches what most
             // RocksDB / LevelDB sst-dump variants emit and is the
             // easiest format for downstream `awk -F=` consumers.
-            // Tombstone marker is appended as a suffix so a value
-            // grep doesn't confuse a key whose value happens to
-            // contain "tombstone".
-            print!("{}={}", format_key(&entry.key), format_key(&entry.value));
-            // Surface non-`Value` entries by their `ValueType` tag so
-            // operators reading the dump can tell a real value from a
+            // Non-`Value` entries are annotated with a per-variant
+            // suffix tag so operators can tell a real value from a
             // tombstone / merge operand / blob-pointer indirection
-            // without separately inspecting the value bytes. Regular
-            // `Value` entries emit no annotation (the bare `=value`
-            // line is then the easy-to-grep happy path).
-            match entry.value_type {
-                lsm_tree::ValueType::Value => {}
-                lsm_tree::ValueType::Tombstone => print!("\t# tombstone"),
-                lsm_tree::ValueType::WeakTombstone => print!("\t# weak-tombstone"),
-                lsm_tree::ValueType::MergeOperand => print!("\t# merge-operand"),
-                lsm_tree::ValueType::Indirection => print!("\t# indirection"),
-            }
-            println!();
+            // without separately inspecting the value bytes;
+            // regular Value entries get the bare `=value` line so
+            // the happy path stays grep-friendly.
+            let suffix = match entry.value_type {
+                lsm_tree::ValueType::Value => "",
+                lsm_tree::ValueType::Tombstone => "\t# tombstone",
+                lsm_tree::ValueType::WeakTombstone => "\t# weak-tombstone",
+                lsm_tree::ValueType::MergeOperand => "\t# merge-operand",
+                lsm_tree::ValueType::Indirection => "\t# indirection",
+            };
+            writeln!(
+                out,
+                "{}={}{}",
+                format_key(&entry.key),
+                format_key(&entry.value),
+                suffix,
+            )
+        };
+        if let Err(e) = line_result {
+            // Broken pipe (e.g. consumer piped through `head -n N`)
+            // is the common case; report and exit cleanly rather
+            // than panic-on-flush at function tail.
+            eprintln!("error: write to stdout for {}: {e}", path.display());
+            return ExitCode::FAILURE;
         }
 
         emitted = emitted.saturating_add(1);
+    }
+
+    // Surface a buffered-flush error to the operator instead of
+    // letting BufWriter's Drop swallow it on the way out.
+    if let Err(e) = out.flush() {
+        eprintln!("error: flush stdout for {}: {e}", path.display());
+        return ExitCode::FAILURE;
     }
 
     ExitCode::SUCCESS
