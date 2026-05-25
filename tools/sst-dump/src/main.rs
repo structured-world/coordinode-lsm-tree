@@ -398,14 +398,20 @@ fn run_index_dump(path: &std::path::Path) -> ExitCode {
 fn run_filter_stats(path: &std::path::Path) -> ExitCode {
     let stats = match read_filter_stats(path) {
         Ok(s) => s,
-        Err(lsm_tree::Error::Io(io_err)) if io_err.kind() == std::io::ErrorKind::Unsupported => {
-            // Partitioned-filter SSTs surface here. Match the inner
-            // `io::ErrorKind::Unsupported` so the CLI prints a
-            // user-facing "not supported" line instead of the
-            // bare-Display of the inner error; mention the
-            // distinguishing on-disk signal (`filter_tli` SFA section)
-            // so an operator can confirm the diagnosis with `verify
-            // --verbose` or a hex dump of the SFA TOC.
+        Err(lsm_tree::Error::Io(io_err))
+            if io_err.kind() == std::io::ErrorKind::Unsupported
+                && io_err.to_string().contains("filter_tli") =>
+        {
+            // Partitioned-filter SSTs surface here. Match BOTH the
+            // `io::ErrorKind::Unsupported` discriminant AND the
+            // `filter_tli` substring in the message so an unrelated
+            // platform-level Unsupported (e.g. an `FsFile::read_at`
+            // backend that doesn't implement positional reads on a
+            // non-mainstream target) doesn't get mis-attributed as
+            // a partitioned-filter layout. The substring is what
+            // `read_filter_stats` writes deliberately when it detects
+            // a `filter_tli` SFA section; the kind alone is too
+            // coarse to be a reliable discriminator.
             eprintln!(
                 "error: filter-stats not supported for {}: {io_err} \
                  (look for a `filter_tli` section in the SFA TOC to confirm)",
