@@ -135,22 +135,31 @@ pub enum ManifestRecoveryMode {
     /// not for arbitrary bit-rot in already-committed bytes.
     TolerateCorruptedTailRecords,
 
-    /// Recover up to the last fully-consistent record group, discard
-    /// anything later. Reserved variant: matches `RocksDB`'s
-    /// `kPointInTimeRecovery` semantic, but not yet wired — selecting
-    /// it currently falls back to
-    /// [`AbsoluteConsistency`](Self::AbsoluteConsistency) behaviour.
-    /// Tracked as a follow-up to this issue's first wave.
+    /// Recover up to the last fully-consistent record-group
+    /// boundary, discard everything later. Adapts `RocksDB`'s
+    /// `kPointInTimeRecovery` semantic to the level/run/table
+    /// nesting: on the first record-decode mismatch inside the
+    /// `tables` section (bad XXH3 or unparseable framing header),
+    /// the in-progress run, its enclosing level, and every level
+    /// not yet read are dropped. The same rule applies to the
+    /// `blob_files` section. This preserves the LSM seqno-monotone
+    /// invariant across surviving levels — finer granularities
+    /// (per-run, per-table) would risk reordering seqnos. Clean
+    /// tail-truncation is still tolerated, same as
+    /// [`TolerateCorruptedTailRecords`](Self::TolerateCorruptedTailRecords).
     PointInTimeRecovery,
 
     /// Skip each corrupt record individually, keep all others.
-    /// Maximum-availability, lossy. Reserved variant: matches
-    /// `RocksDB`'s `kSkipAnyCorruptedRecords` semantic, but not yet
-    /// wired — currently falls back to
-    /// [`AbsoluteConsistency`](Self::AbsoluteConsistency) behaviour.
-    /// Intended companion to the `repair_db` tooling tracked as
-    /// `#303`; wiring waits on that PR landing so the two surfaces
-    /// can be reviewed together.
+    /// Maximum-availability, lossy. On a per-record checksum
+    /// mismatch, the reader logs the skip and advances exactly
+    /// past the bad record using the framing-supplied length
+    /// field. If the length itself is suspect
+    /// (`FramedRecordOutcome::BadHeader` — header parse failed,
+    /// next-record boundary unknown), the rest of that section is
+    /// dropped. Intended companion to the `repair_db` tooling
+    /// tracked as `#303`: this mode recovers what it can in-place;
+    /// `repair_db` rebuilds the manifest from the SST files
+    /// themselves when even this mode can't reach a usable state.
     SkipAnyCorruptedRecords,
 }
 
