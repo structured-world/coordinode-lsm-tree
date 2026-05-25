@@ -17,12 +17,20 @@ const SST_DUMP_BIN: &str = env!("CARGO_BIN_EXE_sst-dump");
 
 fn build_one_sst(item_count: u64) -> (tempfile::TempDir, std::path::PathBuf) {
     let dir = tempfile::tempdir().expect("tempdir");
+    // Force a full (non-partitioned) index at every level. The
+    // upstream `Config::default()` flip to partitioned-by-default
+    // (#329 / PR #340) routes all SSTs into the
+    // `iter_data_block_entries` "not supported for partitioned-index"
+    // path, but the `dump` subcommand is by design exercised here on
+    // the full-index shape it can walk. The partitioned-index "not
+    // supported" path has its own dedicated test below.
     let tree = Config::new(
         dir.path(),
         SequenceNumberCounter::default(),
         SequenceNumberCounter::default(),
     )
     .data_block_compression_policy(CompressionPolicy::all(CompressionType::None))
+    .index_block_partitioning_policy(PinningPolicy::new([false, false, false, true]))
     .open()
     .expect("open tree");
 
@@ -242,9 +250,12 @@ fn dump_partitioned_index_sst_returns_unsupported_error() {
         stderr.contains("not supported"),
         "expected `not supported` in stderr; got:\n{stderr}",
     );
+    // Pin the exact SFA-TOC-hint phrase the binary emits, not a bare
+    // `"index"` substring (which would also match unrelated tokens
+    // like "partitioned-index" or any prose containing the word).
     assert!(
-        stderr.contains("index"),
-        "expected `index` (SFA section name hint) in stderr; got:\n{stderr}",
+        stderr.contains("`index` section in the SFA TOC"),
+        "expected the SFA `index`-section hint in stderr; got:\n{stderr}",
     );
 }
 
@@ -255,12 +266,16 @@ fn dump_tombstone_entries_include_suffix() {
     // tombstone lines (and only those). Catches regressions where
     // the per-variant ValueType branch loses the suffix annotation.
     let dir = tempfile::tempdir().expect("tempdir");
+    // Same full-index pin as `build_one_sst` — keep the tombstone
+    // test on a layout `iter_data_block_entries` can walk after the
+    // #329 partitioned-default flip.
     let tree = Config::new(
         dir.path(),
         SequenceNumberCounter::default(),
         SequenceNumberCounter::default(),
     )
     .data_block_compression_policy(CompressionPolicy::all(CompressionType::None))
+    .index_block_partitioning_policy(PinningPolicy::new([false, false, false, true]))
     .open()
     .expect("open tree");
 

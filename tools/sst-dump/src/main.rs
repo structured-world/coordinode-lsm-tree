@@ -514,11 +514,13 @@ fn run_dump(
     let mut emitted: u64 = 0;
     let cap = max.unwrap_or(u64::MAX);
 
-    // `--max 0` is a "no output ever" request. The in-loop
-    // `emitted >= cap` check would still scan the SST until the
-    // first entry passes the bounds filters before breaking;
-    // short-circuit here so a `--max 0` invocation costs zero
-    // block I/O.
+    // `--max 0` is a "no output ever" request. The iterator
+    // construction above already paid for the SFA trailer / meta /
+    // TLI reads (those are needed regardless to know whether the
+    // layout is even supported), but the in-loop `emitted >= cap`
+    // check would still pull the FIRST data block off disk before
+    // breaking. Short-circuit here so a `--max 0` invocation costs
+    // zero data-block I/O on top of the unavoidable index reads.
     if cap == 0 {
         return ExitCode::SUCCESS;
     }
