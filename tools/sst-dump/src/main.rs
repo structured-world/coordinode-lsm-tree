@@ -111,6 +111,19 @@ enum Command {
     /// non-zero (see `index-dump` for the layout signal). Reads
     /// blocks streamingly: memory cost stays at one data block
     /// regardless of SST size.
+    ///
+    /// **Comparator caveat.** `--from` / `--to` are applied as raw
+    /// bytewise comparisons against the on-disk key bytes, and the
+    /// walk breaks early once a key reaches the upper bound. This
+    /// is correct for SSTs written with the default lexicographic
+    /// comparator (the on-disk sort order matches bytewise order),
+    /// but for SSTs written with a custom user comparator the
+    /// early break can stop before all qualifying entries are
+    /// emitted. The underlying `lsm_tree::inspect::iter_data_block_entries`
+    /// facade also walks blocks via the default comparator, so
+    /// custom-comparator SSTs are not safe to inspect through this
+    /// subcommand even without `--from` / `--to`; use the
+    /// owning tree's regular read APIs instead.
     Dump {
         /// Lower key bound (inclusive). Entries with `key >= --from`
         /// are emitted. Without this flag, the walk starts from the
