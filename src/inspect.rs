@@ -583,16 +583,20 @@ impl Iterator for DataBlockEntryIter {
 /// operation not yet wired here. Partitioned-index SSTs return an
 /// `Io(ErrorKind::Unsupported)` error.
 ///
-/// **Custom user comparator: not supported.** Internally the
-/// facade walks index and data blocks via
-/// [`crate::comparator::default_comparator`]. SSTs written with a
-/// custom comparator are sorted on disk by that comparator's order,
-/// not by lexicographic byte order; iterating them through this
-/// facade yields entries in the wrong order and breaks any
-/// early-termination assumption a caller might layer on top
-/// (`sst-dump dump --from / --to` for example). Such SSTs MUST be
-/// inspected via the owning `Tree`'s regular read APIs, not through
-/// this facade.
+/// **Custom user comparator: forward iteration works, but bounds /
+/// seek operations do not.** Forward iteration over the data section
+/// is positional — the index walks blocks in their on-disk file
+/// order and the block iterator yields entries in their on-disk
+/// encoded order, neither of which depends on the comparator. So a
+/// bounds-free walk of a custom-comparator SST through this facade
+/// streams entries in the SST's own sort order correctly. What this
+/// facade can't do is run [`crate::comparator::default_comparator`]
+/// for seek / point-read / range-bounded operations layered on top
+/// (e.g. `sst-dump dump --from/--to` applies bytewise bounds and
+/// breaks early on the upper bound, which only makes sense for the
+/// default lexicographic comparator). Callers that need
+/// comparator-correct range queries on a custom-comparator SST
+/// should use the owning `Tree`'s regular read APIs.
 ///
 /// **Zstd-dictionary blocks: not supported.** This facade calls
 /// [`crate::table::Block::from_file`] with no
