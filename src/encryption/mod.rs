@@ -15,6 +15,25 @@
 //!
 //! Checksums protect the encrypted (on-disk) bytes so that corruption is
 //! detected cheaply before any decryption attempt.
+//!
+//! ## AAD-bound block format (in progress)
+//!
+//! The AAD-bound on-disk block format specified in
+//! `docs/aad-block-format.md` is being introduced incrementally. The
+//! foundation pieces shipped so far live in submodules:
+//!
+//! - [`aad`]: pure-byte AAD construction, suite / block-type tags,
+//!   `BlockIdentity` for the caller-supplied identity inputs.
+//! - [`error`]: `DecryptError` enum with one variant per decode-time
+//!   failure mode.
+//!
+//! The AEAD-suite dispatch and the wire-format encoder / decoder land in
+//! separate follow-up changes; the legacy [`Aes256GcmProvider`] below
+//! stays in place until those land and the existing call sites switch
+//! over.
+
+pub mod aad;
+pub mod error;
 
 /// Block encryption provider.
 ///
