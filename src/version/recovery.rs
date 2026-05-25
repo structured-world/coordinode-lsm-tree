@@ -557,6 +557,7 @@ mod tests {
     use super::*;
     use crate::fs::{FsOpenOptions, MemFs};
     use byteorder::{LittleEndian, WriteBytesExt};
+    use std::io::Write;
 
     /// Write a CURRENT pointer so `recover()` can find the version file.
     fn write_current(folder: &Path, version_id: u64, fs: &dyn Fs) -> crate::Result<()> {
@@ -1076,6 +1077,295 @@ mod tests {
             lenient.gc_stats,
             crate::blob_tree::FragmentationMap::default(),
             "tolerant mode must produce default (empty) gc_stats on truncated section",
+        );
+        Ok(())
+    }
+
+    // ====================================================================
+    // PointInTimeRecovery + SkipAnyCorruptedRecords corruption-matrix tests
+    // ====================================================================
+    //
+    // The fixtures below write a complete framed manifest, then pick one
+    // specific framed record and emit it with a deliberately-wrong XXH3
+    // digest. That gives the reader a `FramedRecordOutcome::ChecksumMismatch`
+    // at a known position so each mode's per-record dispatch is exercised
+    // end-to-end, not just at the framing-helper unit level.
+
+    /// Writes one framed table record with a CORRECT XXH3 digest.
+    fn write_good_table_record<W: std::io::Write>(w: &mut W, id: u64) -> crate::Result<()> {
+        crate::version::framing::write_framed_record(w, |payload| {
+            payload.write_u64::<LittleEndian>(id)?;
+            payload.write_u8(0)?; // checksum_type
+            payload.write_u128::<LittleEndian>(0)?;
+            payload.write_u64::<LittleEndian>(0)?;
+            Ok(())
+        })
+    }
+
+    /// Writes one framed table record but with an INTENTIONALLY WRONG
+    /// XXH3 digest in the framing header — emulates payload bit-rot
+    /// inside an otherwise structurally-valid record. The `len` field
+    /// of the header is correct (so the reader's `BadHeader` path does
+    /// NOT trigger), which means the `ChecksumMismatch` arm is the one
+    /// being exercised.
+    fn write_bad_table_record<W: std::io::Write>(w: &mut W, id: u64) -> crate::Result<()> {
+        let mut payload: Vec<u8> = Vec::new();
+        payload.write_u64::<LittleEndian>(id)?;
+        payload.write_u8(0)?;
+        payload.write_u128::<LittleEndian>(0)?;
+        payload.write_u64::<LittleEndian>(0)?;
+
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "payload is 33 bytes — fits in u32"
+        )]
+        let len = payload.len() as u32;
+        w.write_u32::<LittleEndian>(len)?;
+        // INTENTIONALLY WRONG digest. Real one would be
+        // `xxh3_64(&payload)`; using `0xDEAD_BEEF_DEAD_BEEF` instead
+        // so the reader's mismatch arm fires deterministically.
+        w.write_u64::<LittleEndian>(0xDEAD_BEEF_DEAD_BEEF)?;
+        w.write_all(&payload)?;
+        Ok(())
+    }
+
+    /// Builds a manifest with two levels: level 0 has one run with three
+    /// table records, where the MIDDLE record carries a corrupt XXH3
+    /// digest. Level 1 has one run with two good records.
+    ///
+    /// The shape lets a test observe three distinct recovery outcomes
+    /// from the same on-disk bytes:
+    /// - `AbsoluteConsistency` aborts on the corrupt record
+    /// - `PointInTimeRecovery` keeps level 0 record #0 only (dropping
+    ///   #1 and #2 of the current run, and dropping level 1 entirely)
+    /// - `SkipAnyCorruptedRecords` keeps level 0 records #0 and #2
+    ///   (skipping #1) AND keeps level 1
+    fn write_manifest_with_mid_record_corruption(
+        folder: &Path,
+        id: u64,
+        fs: &dyn Fs,
+    ) -> crate::Result<()> {
+        let path = folder.join(format!("v{id}"));
+        let file = fs.open(
+            &path,
+            &FsOpenOptions::new().write(true).create(true).truncate(true),
+        )?;
+        let mut w = sfa::Writer::from_writer(std::io::BufWriter::new(file));
+
+        w.start("tree_type")?;
+        w.write_u8(0)?;
+
+        w.start("tables")?;
+        w.write_u8(2)?; // 2 levels
+        // Level 0: 1 run, 3 records, middle one is corrupt.
+        w.write_u8(1)?;
+        w.write_u32::<LittleEndian>(3)?;
+        write_good_table_record(&mut w, 100)?;
+        write_bad_table_record(&mut w, 101)?;
+        write_good_table_record(&mut w, 102)?;
+        // Level 1: 1 run, 2 records, both good.
+        w.write_u8(1)?;
+        w.write_u32::<LittleEndian>(2)?;
+        write_good_table_record(&mut w, 200)?;
+        write_good_table_record(&mut w, 201)?;
+
+        w.start("blob_files")?;
+        w.write_u32::<LittleEndian>(0)?;
+        w.start("blob_gc_stats")?;
+        w.write_u32::<LittleEndian>(0)?;
+        w.finish().map_err(|e| match e {
+            sfa::Error::Io(e) => crate::Error::from(e),
+            _ => crate::Error::Unrecoverable,
+        })?;
+        Ok(())
+    }
+
+    #[test]
+    fn recover_absolute_consistency_rejects_mid_record_corruption() -> crate::Result<()> {
+        let fs = MemFs::new();
+        let folder = Path::new("/absolute/mid_corrupt");
+        fs.create_dir_all(folder)?;
+        write_current(folder, 1, &fs)?;
+        write_manifest_with_mid_record_corruption(folder, 1, &fs)?;
+
+        let err = recover(folder, &fs, ManifestRecoveryMode::AbsoluteConsistency)
+            .expect_err("corrupt record must abort AbsoluteConsistency");
+        assert!(
+            matches!(err, crate::Error::ChecksumMismatch { .. }),
+            "expected ChecksumMismatch, got: {err:?}",
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn recover_pit_truncates_at_corrupt_record() -> crate::Result<()> {
+        let fs = MemFs::new();
+        let folder = Path::new("/pit/mid_corrupt");
+        fs.create_dir_all(folder)?;
+        write_current(folder, 1, &fs)?;
+        write_manifest_with_mid_record_corruption(folder, 1, &fs)?;
+
+        let recovery = recover(folder, &fs, ManifestRecoveryMode::PointInTimeRecovery)?;
+
+        // PIT contract: drop in-progress run + level + all subsequent
+        // levels. The recovered prefix is level 0 with run 0
+        // containing only the consistent prefix record (id=100). The
+        // implementation pushes the partial run into the partial
+        // level, so the level slot survives even though its run is
+        // truncated; level 1 was never reached.
+        assert_eq!(
+            recovery.table_ids.len(),
+            1,
+            "expected only level 0 to survive (level 1 truncated by PIT); got {}",
+            recovery.table_ids.len(),
+        );
+        let level = &recovery.table_ids[0];
+        assert_eq!(level.len(), 1, "expected 1 run in level 0");
+        let run = &level[0];
+        assert_eq!(
+            run.len(),
+            1,
+            "expected only the pre-corruption record to survive in run 0; got {} records",
+            run.len(),
+        );
+        assert_eq!(run[0].id, 100, "expected id=100 (the good prefix record)");
+        Ok(())
+    }
+
+    #[test]
+    fn recover_skip_any_skips_corrupt_record_and_keeps_neighbours() -> crate::Result<()> {
+        let fs = MemFs::new();
+        let folder = Path::new("/skip_any/mid_corrupt");
+        fs.create_dir_all(folder)?;
+        write_current(folder, 1, &fs)?;
+        write_manifest_with_mid_record_corruption(folder, 1, &fs)?;
+
+        let recovery = recover(folder, &fs, ManifestRecoveryMode::SkipAnyCorruptedRecords)?;
+
+        // SkipAny contract: log the single bad record, advance past
+        // it via the framing length header, keep going. Both
+        // surrounding records and the entire next level survive.
+        assert_eq!(
+            recovery.table_ids.len(),
+            2,
+            "expected both levels to survive under SkipAny",
+        );
+        let l0_run = &recovery.table_ids[0][0];
+        assert_eq!(
+            l0_run.len(),
+            2,
+            "expected 2 records in level-0 run 0 (id=100 + id=102, skipping the corrupt id=101); got {}",
+            l0_run.len(),
+        );
+        assert_eq!(l0_run[0].id, 100);
+        assert_eq!(l0_run[1].id, 102);
+
+        let l1_run = &recovery.table_ids[1][0];
+        assert_eq!(
+            l1_run.len(),
+            2,
+            "expected level 1 to recover its full 2 records under SkipAny",
+        );
+        assert_eq!(l1_run[0].id, 200);
+        assert_eq!(l1_run[1].id, 201);
+        Ok(())
+    }
+
+    /// Builds a manifest where a `blob_files` record (not a table
+    /// record) carries the corrupt XXH3 digest. Exercises the same
+    /// per-mode dispatch on the `blob_files` section to confirm the
+    /// reader's PIT / `SkipAny` logic was wired through symmetrically.
+    fn write_manifest_with_corrupt_blob_record(
+        folder: &Path,
+        id: u64,
+        fs: &dyn Fs,
+    ) -> crate::Result<()> {
+        let path = folder.join(format!("v{id}"));
+        let file = fs.open(
+            &path,
+            &FsOpenOptions::new().write(true).create(true).truncate(true),
+        )?;
+        let mut w = sfa::Writer::from_writer(std::io::BufWriter::new(file));
+
+        w.start("tree_type")?;
+        w.write_u8(0)?;
+
+        w.start("tables")?;
+        w.write_u8(0)?; // 0 levels (focus is on blob_files section)
+
+        w.start("blob_files")?;
+        w.write_u32::<LittleEndian>(3)?;
+        // good, bad, good
+        crate::version::framing::write_framed_record(&mut w, |payload| {
+            payload.write_u64::<LittleEndian>(10)?;
+            payload.write_u8(0)?;
+            payload.write_u128::<LittleEndian>(0)?;
+            Ok(())
+        })?;
+        // Corrupt the middle blob record: write a framed header with
+        // a wrong digest but a correct length, so the reader treats
+        // it as ChecksumMismatch.
+        let mut payload: Vec<u8> = Vec::new();
+        payload.write_u64::<LittleEndian>(11)?;
+        payload.write_u8(0)?;
+        payload.write_u128::<LittleEndian>(0)?;
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "payload is 25 bytes — fits in u32"
+        )]
+        let len = payload.len() as u32;
+        w.write_u32::<LittleEndian>(len)?;
+        w.write_u64::<LittleEndian>(0xDEAD_BEEF_DEAD_BEEF)?;
+        w.write_all(&payload)?;
+        crate::version::framing::write_framed_record(&mut w, |payload| {
+            payload.write_u64::<LittleEndian>(12)?;
+            payload.write_u8(0)?;
+            payload.write_u128::<LittleEndian>(0)?;
+            Ok(())
+        })?;
+
+        w.start("blob_gc_stats")?;
+        w.write_u32::<LittleEndian>(0)?;
+        w.finish().map_err(|e| match e {
+            sfa::Error::Io(e) => crate::Error::from(e),
+            _ => crate::Error::Unrecoverable,
+        })?;
+        Ok(())
+    }
+
+    #[test]
+    fn recover_skip_any_skips_corrupt_blob_record() -> crate::Result<()> {
+        let fs = MemFs::new();
+        let folder = Path::new("/skip_any/blob_mid_corrupt");
+        fs.create_dir_all(folder)?;
+        write_current(folder, 1, &fs)?;
+        write_manifest_with_corrupt_blob_record(folder, 1, &fs)?;
+
+        let recovery = recover(folder, &fs, ManifestRecoveryMode::SkipAnyCorruptedRecords)?;
+        let ids: Vec<u64> = recovery.blob_file_ids.iter().map(|(id, _)| *id).collect();
+        assert_eq!(
+            ids,
+            vec![10, 12],
+            "expected SkipAny to keep ids 10 and 12 while skipping the corrupt id 11",
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn recover_pit_truncates_remaining_blob_records_on_corruption() -> crate::Result<()> {
+        let fs = MemFs::new();
+        let folder = Path::new("/pit/blob_mid_corrupt");
+        fs.create_dir_all(folder)?;
+        write_current(folder, 1, &fs)?;
+        write_manifest_with_corrupt_blob_record(folder, 1, &fs)?;
+
+        let recovery = recover(folder, &fs, ManifestRecoveryMode::PointInTimeRecovery)?;
+        let ids: Vec<u64> = recovery.blob_file_ids.iter().map(|(id, _)| *id).collect();
+        assert_eq!(
+            ids,
+            vec![10],
+            "PIT must drop the corrupt blob record AND every blob record after it; \
+             expected only id=10 (the good prefix), got {ids:?}",
         );
         Ok(())
     }
