@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779663409588,
+  "lastUpdate": 1779691446346,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -9516,6 +9516,84 @@ window.BENCHMARK_DATA = {
             "value": 488802.2145888207,
             "unit": "ops/sec",
             "extra": "P50: 1.9us | P99: 5.3us | P99.9: 8.1us\nthreads: 1 | elapsed: 0.41s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "117da4d8c2662b8983c2e2275fb154c227194305",
+          "message": "feat(sst-dump): index-dump subcommand + public inspect facade extension (#333)\n\n## Summary\n\nThird subcommand from the remaining-three list in #324. `sst-dump <file>\nindex-dump` prints the SST's top-level-index (TLI) entries: one row per\npointed-at block.\n\nFor full-index tables each row corresponds to a data block; for\npartitioned-index tables each row corresponds to a sub-index leaf block\n(one further indirection from data blocks).\n\n## Library API\n\nExtends `lsm_tree::inspect`:\n\n\\`\\`\\`rust\n#[non_exhaustive]\npub struct IndexEntry {\n    pub end_key: Vec<u8>,\n    pub seqno: u64,\n    pub offset: u64,\n    pub size: u32,\n}\n\npub fn read_top_level_index_entries(path: &Path) ->\nResult<Vec<IndexEntry>>;\n\\`\\`\\`\n\nOwned `end_key: Vec<u8>` decouples the public API from the\ncrate-internal `KeyedBlockHandle` / `UserKey` aliases under\n`#[doc(hidden)]`, same pattern as `TableProperties`'s `min_key` /\n`max_key`.\n\nRecovery mirrors \\`Table::read_tli\\` (PR #296): tail \\`tli_tail\\` mirror\nfirst, head \\`tli\\` fallback on decode failure, original tail error\nreturned if both copies fail. Tables without \\`tli_tail\\` (pre-mirror\nSSTs) fall straight through to the head copy.\n\nThe meta block load uses the same TAIL-first / MID-fallback as\n\\`read_table_properties\\` — needed because \\`index_block_compression\\`\nlives in the meta block and is required to decode the TLI's compressed\nbytes.\n\n## CLI output\n\n\\`\\`\\`\n$ sst-dump table-0 index-dump\nfile:                table-0\ntli_entry_count:     1\n\n    #                offset        size                 seqno  end_key\n0 0 4115 200 \\\"key-000199\\\"\n\\`\\`\\`\n\nNumeric columns are right-aligned; \\`end_key\\` is last so a long key\ndoesn't mis-align the offset / size columns. Keys rendered via the\nexisting \\`format_key\\` helper (printable ASCII verbatim, \\`\\\"\\` /\n\\`\\\\\\` escaped, others as \\`\\\\xNN\\`).\n\n## Tests\n\n\\`tools/sst-dump/tests/index_dump_smoke.rs\\` (2 new):\n\n- \\`index_dump_prints_header_row_and_entries\\` — builds a 200-item SST,\nasserts \\`tli_entry_count >= 1\\`, header row contains the \\`end_key\\`\ncolumn label, and the last entry's \\`end_key\\` equals the largest\ninserted key (\\`key-000199\\`).\n- \\`index_dump_fails_on_missing_file\\` — exits non-zero with \\`error:\\`\nin stderr.\n\n## Test plan\n\n- [x] \\`cargo nextest run\\` in \\`tools/sst-dump/\\` (10 tests pass: 2 new\n\\`index_dump_smoke\\` + 4 \\`hex_smoke\\` + 2 \\`properties_smoke\\` + 2\n\\`verify_smoke\\`)\n- [x] \\`cargo nextest run\\` main suite (1413 pass)\n- [x] \\`cargo clippy --all-features --all-targets -- -D warnings\\` clean\non both crates\n- [x] README \\`Operational tools\\` row updated\n\nPart of #324. Remaining subcommands after this: \\`dump\\` (streaming KV\nentries) and \\`filter-stats\\` (BuRR/Ribbon sizing + FPR).\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n## Summary by CodeRabbit\n\n* **New Features**\n* Added `index-dump` subcommand to `sst-dump` to print top-level index\nentries from an SST file as a formatted table (offset, size, seqno, end\nkey) and report total entry count.\n\n* **Documentation**\n* Updated README to document the `index-dump` subcommand and its\ndiagnostic behavior.\n\n* **Tests**\n* Added end-to-end smoke tests covering successful output and\nfailure-on-missing-file.\n\n<!-- review_stack_entry_start -->\n\n[![Review Change\nStack](https://storage.googleapis.com/coderabbit_public_assets/review-stack-in-coderabbit-ui.svg)](https://app.coderabbit.ai/change-stack/structured-world/coordinode-lsm-tree/pull/333?utm_source=github_walkthrough&utm_medium=github&utm_campaign=change_stack)\n\n<!-- review_stack_entry_end -->\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-05-25T09:43:10+03:00",
+          "tree_id": "891b73ca8ceb72344f5fa56aadd1a33d1b202364",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/117da4d8c2662b8983c2e2275fb154c227194305"
+        },
+        "date": 1779691444741,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 2060724.56600677,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.6us | P99.9: 3.7us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1210386.2151776804,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.2us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 626442.8819747845,
+            "unit": "ops/sec",
+            "extra": "P50: 1.5us | P99: 4.6us | P99.9: 7.0us\nthreads: 1 | elapsed: 0.32s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3691351.212097621,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 3.0us | P99.9: 5.5us\nthreads: 1 | elapsed: 0.05s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 444154.4520546584,
+            "unit": "ops/sec",
+            "extra": "P50: 2.0us | P99: 5.3us | P99.9: 7.9us\nthreads: 1 | elapsed: 0.45s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 223548.20410778612,
+            "unit": "ops/sec",
+            "extra": "P50: 4.2us | P99: 5.3us | P99.9: 7.6us\nthreads: 1 | elapsed: 0.89s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1233733.448100976,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.2us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1150798.0571628783,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 1.5us | P99.9: 1.9us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 551907.2554296263,
+            "unit": "ops/sec",
+            "extra": "P50: 1.6us | P99: 5.0us | P99.9: 7.5us\nthreads: 1 | elapsed: 0.36s | num: 200000 | iterations: 3"
           }
         ]
       }
