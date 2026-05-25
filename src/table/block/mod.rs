@@ -2329,27 +2329,6 @@ mod tests {
         }
 
         #[test]
-        fn block_zstd_dict_missing_returns_error() {
-            // The runtime dict-presence check that used to live inside
-            // Block::write_into / from_reader for the ZstdDict codec is
-            // now centralised in `BlockTransform::from_parts`. The error
-            // therefore surfaces at transform-construction time instead
-            // of at the Block I/O call; the test assertion follows.
-            let dict = test_dict();
-            let compression = test_compression(&dict);
-
-            // Try to build the read-side transform without a dict.
-            let result = crate::table::block::BlockTransform::from_parts(compression, None, None);
-            assert!(
-                matches!(
-                    result,
-                    Err(crate::Error::ZstdDictMismatch { got: None, .. })
-                ),
-                "expected ZstdDictMismatch with got=None",
-            );
-        }
-
-        #[test]
         fn block_zstd_dict_wrong_dict_returns_error() {
             // As with the dict-missing test above, the wrong-dict check
             // now lives in BlockTransform::from_parts (it cross-checks
@@ -2377,19 +2356,21 @@ mod tests {
 
         #[test]
         fn block_transform_from_parts_zstd_dict_missing_returns_error() {
+            // The runtime dict-presence check that used to live inside
+            // Block::write_into / from_reader for the ZstdDict codec
+            // is now centralised in BlockTransform::from_parts. The
+            // error therefore surfaces at transform-construction time
+            // instead of at the Block I/O call; this test verifies
+            // that earlier surface — it no longer exercises
+            // Block::write_into / from_reader at all, hence the test
+            // name describes from_parts rather than block_write_*.
+            // (See block_zstd_dict_wrong_dict_returns_error above for
+            // the matching "wrong dict id" path.)
             let dict = test_dict();
             let compression = test_compression(&dict);
 
-            // Try to construct the transform without providing the
-            // dict the codec needs. The runtime ZstdDictMismatch
-            // check that used to live inside Block::write_into now
-            // lives in BlockTransform::from_parts, so the error
-            // surfaces one layer earlier (before any block write
-            // attempt). This test verifies that earlier surface —
-            // it no longer exercises Block::write_into at all;
-            // hence the rename from block_write_* to
-            // block_transform_from_parts_* to match what's actually
-            // asserted.
+            // Try to construct the read-side transform without
+            // providing the dict the codec needs.
             let result = crate::table::block::BlockTransform::from_parts(compression, None, None);
             // BlockTransform holds `&dyn EncryptionProvider` which
             // doesn't impl Debug, so we can't print the whole result;
