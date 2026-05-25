@@ -179,3 +179,185 @@ pub fn read_table_properties(path: &Path) -> crate::Result<TableProperties> {
         created_at_nanos: *meta.created_at,
     })
 }
+
+/// One entry parsed from an SST's top-level index (TLI) block.
+///
+/// What this points at depends on the SST's index layout:
+///
+/// - **Full-index tables**: the SST has no separate `index` SFA
+///   section. The TLI directly carries data-block handles, so each
+///   `IndexEntry` corresponds to one data block in the SST.
+/// - **Partitioned-index tables**: the SST has an `index` SFA section
+///   containing sub-index leaf blocks. The TLI carries handles
+///   pointing at those leaves, so each `IndexEntry` corresponds to
+///   one leaf, NOT a data block; walking the leaves to enumerate
+///   individual data blocks is a separate operation.
+///
+/// The distinction is not derivable from `TableProperties` fields
+/// alone — in particular `TableProperties.index_block_count == 1`
+/// can mean either a full-index table OR a partitioned-index table
+/// with a single leaf partition. The authoritative signal is the
+/// presence of an `index` SFA section in the SFA TOC; this facade
+/// does not currently expose that signal. Callers needing to
+/// classify the layout should consult the SST file's TOC directly.
+///
+/// `#[non_exhaustive]` so new fields can be added in a minor version
+/// bump.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct IndexEntry {
+    /// Last user-key covered by the pointed-at block. For binary
+    /// search the TLI is searched on `end_key`, so this is the
+    /// authoritative sort key for the entry.
+    pub end_key: Vec<u8>,
+    /// Highest seqno of any item in the pointed-at block. Used by
+    /// the read path to decide whether a snapshot can skip the
+    /// block entirely.
+    pub seqno: u64,
+    /// On-disk byte offset of the pointed-at block (data-block start
+    /// for full-index tables, sub-index-block start for partitioned).
+    pub offset: u64,
+    /// On-disk size of the pointed-at block in bytes, including the
+    /// block `Header` prefix.
+    pub size: u32,
+}
+
+/// Reads `path` and returns the parsed entries of its top-level index
+/// (TLI) block.
+///
+/// Same out-of-band path-based open semantics as
+/// [`read_table_properties`] (uses [`StdFs`], no encryption provider).
+/// Recovery semantics mirror [`Table::read_tli`](crate::Table)'s
+/// TAIL-first / HEAD-fallback path from #296: the tail `tli_tail`
+/// mirror section is attempted first when present; on
+/// decode / decrypt / checksum failure the canonical head `tli`
+/// section is tried; both copies failing returns the original tail
+/// error. Tables written before the TLI-mirror change have no
+/// `tli_tail` section and fall straight through to the head copy.
+///
+/// The function returns owned `IndexEntry` records — the inner
+/// `IndexBlock` and its underlying `Slice` are dropped on return, so
+/// the caller does not need to keep the file mapping alive. Memory
+/// cost is `O(entries × end_key.len())`.
+///
+/// # Errors
+///
+/// Returns an error if:
+/// - the file cannot be opened or read (`std::io::Error`),
+/// - the SFA trailer is missing / malformed and cannot be parsed,
+/// - the `meta` block fails to decode (needed to determine
+///   `index_block_compression`),
+/// - both the head `tli` and the tail `tli_tail` (if present) fail
+///   to decode (block header / XXH3 / structural mismatch). In the
+///   both-copies-fail case the original tail error is returned,
+/// - the TLI block trailer is malformed (e.g. `restart_interval == 0`),
+/// - the table is encrypted: this function does not take an
+///   encryption provider, so the AEAD-protected blocks fail to
+///   decode and the failure surfaces as a regular decrypt error.
+#[cfg(feature = "std")]
+pub fn read_top_level_index_entries(path: &Path) -> crate::Result<Vec<IndexEntry>> {
+    use crate::table::block_index::iter::OwnedIndexBlockIter;
+    use crate::table::{IndexBlock, KeyedBlockHandle};
+
+    let fs = StdFs;
+    let mut file = fs.open(path, &FsOpenOptions::new().read(true))?;
+
+    let sfa_reader = sfa::Reader::from_reader(&mut file)?;
+    let toc = sfa_reader.toc();
+    let regions = ParsedRegions::parse_from_toc(toc)?;
+
+    // Load meta to know the index block's compression codec. Same
+    // TAIL-first / MID-fallback as `read_table_properties` above —
+    // factored together so this function gives identical recovery
+    // behaviour on a meta-corrupted SST.
+    let meta = match ParsedMeta::load_with_handle(&*file, &regions.metadata, None) {
+        Ok(m) => m,
+        Err(tail_err) => {
+            if let Some(mid_handle) = regions.metadata_mid {
+                match ParsedMeta::load_with_handle(&*file, &mid_handle, None) {
+                    Ok(mid) => mid,
+                    Err(_) => return Err(tail_err),
+                }
+            } else {
+                return Err(tail_err);
+            }
+        }
+    };
+    let index_compression = meta.index_block_compression;
+    let table_id = meta.id;
+
+    // TLI tail mirror tried first when present (most-recently fsynced
+    // copy); on failure fall back to the head copy. Mirrors
+    // `Table::read_tli` so a partially-corrupted TLI behaves the
+    // same here as in a live open.
+    let tli_block = if let Some(tail_handle) = regions.tli_tail {
+        match load_index_block(&*file, tail_handle, table_id, index_compression) {
+            Ok(b) => b,
+            Err(tail_err) => {
+                match load_index_block(&*file, regions.tli, table_id, index_compression) {
+                    Ok(b) => b,
+                    Err(_) => return Err(tail_err),
+                }
+            }
+        }
+    } else {
+        load_index_block(&*file, regions.tli, table_id, index_compression)?
+    };
+
+    let block = IndexBlock::new(tli_block);
+    let iter = OwnedIndexBlockIter::from_block(block, crate::comparator::default_comparator())?;
+
+    let entries = iter
+        .map(|h: KeyedBlockHandle| IndexEntry {
+            end_key: h.end_key().to_vec(),
+            seqno: h.seqno(),
+            offset: *h.offset(),
+            size: h.size(),
+        })
+        .collect();
+
+    Ok(entries)
+}
+
+/// Helper: load and validate a single index block from disk. Shared
+/// between the tail and head TLI load sites so both paths produce the
+/// same error shape on a malformed block.
+#[cfg(feature = "std")]
+fn load_index_block(
+    file: &dyn crate::fs::FsFile,
+    handle: crate::table::BlockHandle,
+    table_id: crate::table::TableId,
+    compression: CompressionType,
+) -> crate::Result<crate::table::Block> {
+    use crate::table::block::{Block, BlockIdentity, BlockType};
+
+    let block = Block::from_file(
+        file,
+        handle,
+        BlockIdentity {
+            tree_id: 0,
+            table_id,
+            // Match the writer: index blocks are emitted with
+            // `block_offset: 0` (see `Table::read_tli`'s comment for
+            // the writer-side rationale). When #251 wires real
+            // offsets into AAD this needs the SFA section offset.
+            block_offset: 0,
+            block_type: BlockType::Index,
+            dict_id: 0,
+            window_log: 0,
+        },
+        compression,
+        None,
+        #[cfg(zstd_any)]
+        None,
+    )?;
+
+    if block.header.block_type != BlockType::Index {
+        return Err(crate::Error::InvalidTag((
+            "BlockType",
+            block.header.block_type.into(),
+        )));
+    }
+
+    Ok(block)
+}

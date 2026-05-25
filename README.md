@@ -118,7 +118,7 @@ cargo run --release --features flamegraph -- \
 | Tool | Use |
 |------|-----|
 | [`tools/db_bench`](tools/db_bench) | RocksDB-compatible benchmark suite, also drives the CI perf dashboard. |
-| [`tools/sst-dump`](tools/sst-dump) | Inspect / verify a single SST file out-of-band. Subcommands: `verify` (walk every block, check per-block XXH3, exit non-zero on corruption), `properties` (print the SST's stored metadata: id, key range, KV / tombstone counts, block counts, compression, timestamp), `hex <offset>` (raw hex dump of a region with optional `Header` decode; useful for inspecting a specific offset flagged by `verify --verbose`). |
+| [`tools/sst-dump`](tools/sst-dump) | Inspect / verify a single SST file out-of-band. Subcommands: `verify` (walk every block, check per-block XXH3, exit non-zero on corruption), `properties` (print the SST's stored metadata: id, key range, KV / tombstone counts, block counts, compression, timestamp), `hex <offset>` (raw hex dump of a region with optional `Header` decode; useful for inspecting a specific offset flagged by `verify --verbose`), `index-dump` (print TLI entries: end_key + offset + size + seqno per pointed-at block; useful for diagnosing range-read fan-out). |
 
 ## Support the project
 
