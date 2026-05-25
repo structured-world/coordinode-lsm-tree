@@ -3,6 +3,7 @@
 // Copyright (c) 2026-present, Structured World Foundation
 
 mod blob_file_list;
+pub(crate) mod framing;
 mod optimize;
 mod persist;
 pub mod recovery;
