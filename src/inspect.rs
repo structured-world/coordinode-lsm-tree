@@ -916,19 +916,20 @@ pub fn read_filter_stats(path: &Path) -> crate::Result<Option<FilterStats>> {
 
     // Inspect-side filter loader. Two design choices here:
     //
-    // 1. **Transform is `Plain`.** `FullFilterWriter::finish` emits
-    //    the filter block with the `Plain` `BlockTransform` variant
-    //    (no compression, no encryption). The reader-side
-    //    transform must match — using anything else would either
-    //    try to decompress raw filter bytes or expect an AEAD tag
-    //    that isn't there. For SSTs whose filter block was written
-    //    encrypted, this facade cannot decode it at all (no
-    //    provider is plumbed through): `Block::from_file` with
-    //    `Plain` verifies the XXH3 over the ciphertext bytes and
-    //    then fails downstream — typically `InvalidHeader` from the
-    //    `uncompressed_length` field disagreeing with the ciphertext
-    //    length, not a clean `Error::Decrypt`. Encrypted-aware filter
-    //    inspection is tracked alongside #251 / #256.
+    // 1. **Transform is `Plain` — chosen here, not dictated by the
+    //    writer.** `FullFilterWriter::finish` does NOT always emit
+    //    filter blocks as `Plain`: when the tree has an encryption
+    //    provider configured, it emits `Encrypted` instead (no
+    //    compression in either case — filter blocks aren't worth
+    //    compressing). This facade chooses `Plain` because it has
+    //    no encryption provider plumbed through (out-of-band path,
+    //    no live `Tree`), so for SSTs whose filter block was
+    //    written encrypted, `Block::from_file` here verifies the
+    //    XXH3 over the ciphertext bytes and then fails downstream —
+    //    typically `InvalidHeader` from `uncompressed_length`
+    //    disagreeing with the ciphertext length, not a clean
+    //    `Error::Decrypt`. Encrypted-aware filter inspection is
+    //    tracked alongside #251 / #256.
     //
     // 2. **`block_offset` held at 0.** `filter_handle.offset()`
     //    carries the real on-disk position, but the writer emits
