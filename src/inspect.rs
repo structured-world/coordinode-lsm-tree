@@ -427,6 +427,32 @@ pub struct DataBlockEntryIter {
     /// Iterator over the currently-loaded block, or `None` when we
     /// haven't loaded a block yet or just finished one.
     current: Option<crate::table::iter::OwnedDataBlockIter>,
+    /// When `true`, skip materialising `DataEntry.value` — leave it
+    /// as an empty `Vec`. Toggled via [`Self::keys_only`]. Saves the
+    /// `Slice::to_vec()` allocation per entry for callers (e.g.
+    /// `sst-dump dump --keys-only`) that don't need the value bytes.
+    keys_only: bool,
+}
+
+#[cfg(feature = "std")]
+impl DataBlockEntryIter {
+    /// Suppress value materialisation: yielded `DataEntry` values
+    /// have `value: Vec::new()` instead of the per-entry
+    /// `to_vec()`-copy of the on-disk bytes. Use for keys-only
+    /// walks (the entire SST data section can be processed without
+    /// allocating any value bytes; only the key copy plus the
+    /// constant-size struct fields stay).
+    ///
+    /// Builder-style — chain off the constructor:
+    ///
+    /// ```ignore
+    /// let iter = iter_data_block_entries(path)?.keys_only();
+    /// ```
+    #[must_use]
+    pub const fn keys_only(mut self) -> Self {
+        self.keys_only = true;
+        self
+    }
 }
 
 #[cfg(feature = "std")]
@@ -438,9 +464,19 @@ impl Iterator for DataBlockEntryIter {
             // Drain the current block before considering the next one.
             if let Some(iter) = self.current.as_mut() {
                 if let Some(internal) = iter.next() {
+                    let value = if self.keys_only {
+                        // Skip the `Slice::to_vec()` allocation; the
+                        // caller has opted out of value bytes for
+                        // this walk. An empty `Vec` is cheap (no
+                        // heap allocation in current `Vec::new()`
+                        // implementations on stable Rust).
+                        Vec::new()
+                    } else {
+                        internal.value.to_vec()
+                    };
                     let entry = DataEntry {
                         key: internal.key.user_key.to_vec(),
-                        value: internal.value.to_vec(),
+                        value,
                         seqno: internal.key.seqno,
                         // `is_tombstone` must be true ONLY for the
                         // two tombstone variants — `MergeOperand`
@@ -597,6 +633,7 @@ pub fn iter_data_block_entries(path: &Path) -> crate::Result<DataBlockEntryIter>
         data_block_compression,
         remaining_handles: handles,
         current: None,
+        keys_only: false,
     })
 }
 

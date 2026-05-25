@@ -437,6 +437,12 @@ fn run_dump(
     keys_only: bool,
 ) -> ExitCode {
     let iter = match iter_data_block_entries(path) {
+        // Propagate `--keys-only` into the iterator itself: it then
+        // yields entries with `value: Vec::new()` and skips the
+        // per-entry `Slice::to_vec()` allocation entirely. Net
+        // saving on a values-heavy SST is the full data-section
+        // value byte count.
+        Ok(it) if keys_only => it.keys_only(),
         Ok(it) => it,
         Err(lsm_tree::Error::Io(io_err)) if io_err.kind() == std::io::ErrorKind::Unsupported => {
             // Partitioned-index SSTs surface here. Same pattern as
@@ -481,19 +487,19 @@ fn run_dump(
         // Lower bound check first because it's the more common
         // trim direction (operators usually want "from key X
         // onwards" rather than "everything below key Y").
-        if let Some(lo) = from_bytes {
-            if entry.key.as_slice() < lo {
-                continue;
-            }
+        if let Some(lo) = from_bytes
+            && entry.key.as_slice() < lo
+        {
+            continue;
         }
-        if let Some(hi) = to_bytes {
-            if entry.key.as_slice() >= hi {
-                // Keys are sorted in the SST; once we pass the
-                // upper bound we're done. Break instead of
-                // continuing to avoid walking the rest of the
-                // (potentially huge) data section.
-                break;
-            }
+        if let Some(hi) = to_bytes
+            && entry.key.as_slice() >= hi
+        {
+            // Keys are sorted in the SST; once we pass the upper
+            // bound we're done. Break instead of continuing to
+            // avoid walking the rest of the (potentially huge)
+            // data section.
+            break;
         }
 
         if emitted >= cap {
