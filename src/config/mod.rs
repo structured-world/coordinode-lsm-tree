@@ -135,17 +135,18 @@ pub enum ManifestRecoveryMode {
     /// not for arbitrary bit-rot in already-committed bytes.
     TolerateCorruptedTailRecords,
 
-    /// Recover up to the last fully-consistent record-group
-    /// boundary, discard everything later. Adapts `RocksDB`'s
-    /// `kPointInTimeRecovery` semantic to the level/run/table
-    /// nesting: on the first record-decode mismatch inside the
-    /// `tables` section (bad XXH3 or unparseable framing header),
-    /// the in-progress run, its enclosing level, and every level
-    /// not yet read are dropped. The same rule applies to the
-    /// `blob_files` section. This preserves the LSM seqno-monotone
-    /// invariant across surviving levels — finer granularities
-    /// (per-run, per-table) would risk reordering seqnos. Clean
-    /// tail-truncation is still tolerated, same as
+    /// Recover the largest consistent prefix and discard the rest.
+    /// Adapts `RocksDB`'s `kPointInTimeRecovery` accept-the-prefix
+    /// rule to the level/run/table nesting: on the first
+    /// record-decode mismatch inside the `tables` section (bad
+    /// XXH3 or unparseable framing header), the recovery keeps the
+    /// records that decoded cleanly *before* the corrupt one in
+    /// the current run, plus every complete earlier run in the
+    /// same level, plus every complete earlier level. It drops the
+    /// corrupt record itself, the remaining records of that run,
+    /// and every level not yet read. The same rule applies to the
+    /// `blob_files` section. Clean tail-truncation is still
+    /// tolerated, same as
     /// [`TolerateCorruptedTailRecords`](Self::TolerateCorruptedTailRecords).
     PointInTimeRecovery,
 
