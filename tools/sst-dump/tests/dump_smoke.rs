@@ -301,6 +301,38 @@ fn dump_annotates_tombstone_entries_with_suffix() {
 }
 
 #[test]
+fn dump_empty_range_exits_zero_without_scanning() {
+    // `--from >= --to` collapses the range to empty. The CLI must
+    // short-circuit and exit 0 with no output instead of scanning
+    // every block up to `--from` only to immediately hit the upper
+    // bound break. Catches a regression where a forged-empty range
+    // would silently cost a full-SST scan.
+    let (_dir, sst) = build_one_sst(100);
+
+    let out = Command::new(SST_DUMP_BIN)
+        .arg(&sst)
+        .arg("dump")
+        .arg("--from")
+        .arg("key-000020")
+        .arg("--to")
+        .arg("key-000010")
+        .output()
+        .expect("spawn sst-dump");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "expected exit 0 on empty range; got {:?}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+        out.status,
+    );
+    assert!(
+        stdout.is_empty(),
+        "expected no output on empty range; got:\n{stdout}",
+    );
+}
+
+#[test]
 fn dump_fails_on_missing_file() {
     let bogus = tempfile::tempdir().expect("tempdir");
     let nonexistent = bogus.path().join("does-not-exist");

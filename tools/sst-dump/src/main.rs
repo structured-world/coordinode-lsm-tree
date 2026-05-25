@@ -485,6 +485,20 @@ fn run_dump(
     let from_bytes = from.map(str::as_bytes);
     let to_bytes = to.map(str::as_bytes);
 
+    // If the bounds collapse to an empty range bytewise (`--from >=
+    // --to` with both set), the walk would scan up to `from` only to
+    // immediately break on the upper bound: a forged-empty range
+    // could trigger a full-SST scan with zero output. Short-circuit
+    // up front and exit 0 with no output. The match condition stays
+    // a bytewise comparison for parity with the in-loop checks; the
+    // comparator caveat in the subcommand docstring covers
+    // custom-comparator SSTs.
+    if let (Some(lo), Some(hi)) = (from_bytes, to_bytes)
+        && lo >= hi
+    {
+        return ExitCode::SUCCESS;
+    }
+
     let mut emitted: u64 = 0;
     let cap = max.unwrap_or(u64::MAX);
 
