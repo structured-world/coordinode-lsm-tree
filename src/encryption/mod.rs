@@ -28,11 +28,17 @@
 //!   so the AAD path and the Block I/O path share one identity type.
 //! - [`error`]: `DecryptError` enum with one variant per decode-time
 //!   failure mode.
+//! - [`aead`] (feature `encryption`): per-suite AEAD dispatch
+//!   (AES-256-GCM, ChaCha20-Poly1305) that takes the 38-byte AAD
+//!   from [`aad::build`] and produces / verifies the
+//!   `(nonce, ciphertext, tag)` triple. Pure crypto layer; not yet
+//!   wired into the on-disk wire envelope.
 //!
-//! The AEAD-suite dispatch and the wire-format encoder / decoder land in
-//! separate follow-up changes; the legacy [`Aes256GcmProvider`] below
-//! stays in place until those land and the existing call sites switch
-//! over.
+//! Still pending: the on-disk skippable-frame wire format
+//! (MetadataFrame + BodyFrame), the `KeyChain` (KeyEpoch -> key
+//! mapping), and the Block I/O integration that replaces the legacy
+//! [`Aes256GcmProvider`] code path below. Those land in subsequent
+//! slices of #251.
 
 pub mod aad;
 #[cfg(feature = "encryption")]

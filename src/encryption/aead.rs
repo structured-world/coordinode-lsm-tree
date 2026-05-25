@@ -28,7 +28,7 @@
 
 #![cfg(feature = "encryption")]
 
-use super::aad::SuiteId;
+use super::aad::{AAD_LEN, SuiteId};
 use super::error::DecryptError;
 
 /// Fixed AEAD tag length for every v1 suite in the registry (16 bytes).
@@ -59,7 +59,7 @@ pub fn encrypt_in_place(
     suite: SuiteId,
     key: &[u8; 32],
     nonce: &[u8],
-    aad: &[u8],
+    aad: &[u8; AAD_LEN],
     plaintext: &mut [u8],
 ) -> crate::Result<[u8; TAG_LEN]> {
     use aes_gcm::aead::{AeadInOut, KeyInit, Nonce};
@@ -109,7 +109,7 @@ pub fn decrypt_in_place(
     suite: SuiteId,
     key: &[u8; 32],
     nonce: &[u8],
-    aad: &[u8],
+    aad: &[u8; AAD_LEN],
     tag: &[u8; TAG_LEN],
     ciphertext: &mut [u8],
 ) -> Result<(), DecryptError> {
@@ -140,7 +140,7 @@ pub fn decrypt_in_place(
 }
 
 #[cfg(test)]
-#[allow(
+#[expect(
     clippy::unwrap_used,
     clippy::expect_used,
     clippy::indexing_slicing,
@@ -168,8 +168,20 @@ mod tests {
         build(&ctx, &identity)
     }
 
+    // SAFETY: hard-coded test-only nonce. CodeQL flags this as a
+    // "hard-coded cryptographic value" because reusing a nonce with
+    // the same key in production AES-GCM / ChaCha20-Poly1305
+    // collapses both ciphertexts' confidentiality. That's true and
+    // important — but in unit tests we WANT a deterministic input
+    // so the assertion is reproducible across runs. Each test
+    // either uses the nonce against a single encrypt/decrypt pair
+    // (no key+nonce reuse) or pairs it with an intentionally
+    // tampered AAD / key / ciphertext to assert tag failure (where
+    // recovery of the plaintext is exactly the property we DON'T
+    // want). Production callers must NEVER reuse this pattern;
+    // [`crate::encryption::thread_local_rng`] / the AAD-bound wire
+    // encoder is the right path for live writes.
     fn test_nonce() -> [u8; 12] {
-        // Deterministic non-zero pattern; production code uses a CSPRNG.
         [
             0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C,
         ]
@@ -279,7 +291,11 @@ mod tests {
     fn wrong_nonce_length_returns_malformed_body_frame_error() {
         let aad = test_aad(SuiteId::Aes256Gcm);
         let mut buf = b"abc".to_vec();
-        // 11 bytes instead of the suite's 12.
+        // 11 bytes instead of the suite's 12. CodeQL flags this as
+        // a hard-coded nonce; that's intentional for this test: the
+        // value is never used as a real cryptographic nonce because
+        // `decrypt_in_place` short-circuits with `MalformedBodyFrame`
+        // before reaching the AEAD primitive (length mismatch).
         let short_nonce = [0u8; 11];
         let bogus_tag = [0u8; TAG_LEN];
 
