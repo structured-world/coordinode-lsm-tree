@@ -54,14 +54,16 @@ use crate::{CompressionType, encryption::EncryptionProvider};
 /// 1. The kind is never [`CompressionType::None`]: "plain payload"
 ///    is its own [`BlockTransform::Plain`] / [`BlockTransform::Encrypted`]
 ///    variant; carrying it as a `CompressionContext` would
-///    double-encode the same state. `new()` panics on `None`.
+///    double-encode the same state. `new()` returns
+///    [`crate::Error::FeatureUnsupported`] on `None`.
 /// 2. `kind == ZstdDict` is unreachable without an attached
-///    dictionary: the `new()` constructor panics on `ZstdDict`
-///    (forcing callers through [`Self::with_dict`]), and `with_dict`
-///    takes the dictionary by reference and derives `dict_id` from
-///    `dict.id()` itself. There is therefore no construction path
-///    that yields a `ZstdDict` context without a matching dict, and
-///    the runtime `ZstdDictMismatch` check that used to live on the
+///    dictionary: the `new()` constructor refuses `ZstdDict` (returns
+///    [`crate::Error::FeatureUnsupported`], forcing callers through
+///    [`Self::with_dict`]), and `with_dict` takes the dictionary by
+///    reference and derives `dict_id` from `dict.id()` itself. There
+///    is therefore no construction path that yields a `ZstdDict`
+///    context without a matching dict, and the runtime
+///    `ZstdDictMismatch` check that used to live on the
 ///    `Block::write_into` happy path is gone.
 pub struct CompressionContext<'a> {
     kind: CompressionType,
@@ -77,35 +79,38 @@ impl<'a> CompressionContext<'a> {
     /// Constructs a [`CompressionContext`] for a non-dict codec
     /// (`Lz4`, `Zstd(level)`).
     ///
-    /// # Panics
+    /// Reports invalid `kind`s as [`crate::Error::FeatureUnsupported`]
+    /// so a caller that builds a [`CompressionType`] from runtime
+    /// config (e.g. parsing a table-config file) sees a typed error
+    /// rather than a process panic. Use [`BlockTransform::Plain`] /
+    /// [`BlockTransform::Encrypted`] for the no-compression case and
+    /// [`Self::with_dict`] for `ZstdDict`.
     ///
-    /// Panics if `kind` is [`CompressionType::None`] (use
-    /// [`BlockTransform::Plain`] / [`BlockTransform::Encrypted`]
-    /// instead) or [`CompressionType::ZstdDict`] (use
-    /// [`Self::with_dict`] instead). Both are programmer errors,
-    /// not runtime failure modes; they cannot happen via any code
-    /// path that flows through the public API correctly.
-    #[must_use]
-    pub fn new(kind: CompressionType) -> Self {
-        assert!(
-            kind != CompressionType::None,
-            "CompressionContext::new called with CompressionType::None; \
-             use BlockTransform::Plain or BlockTransform::Encrypted",
-        );
+    /// # Errors
+    ///
+    /// - `Error::FeatureUnsupported("compression-context-none")` when
+    ///   `kind == CompressionType::None`
+    /// - `Error::FeatureUnsupported("compression-context-zstd-dict-via-new")`
+    ///   when `kind == CompressionType::ZstdDict { .. }`
+    ///
+    /// See [`crate::Error::FeatureUnsupported`] for the typed variant.
+    pub fn new(kind: CompressionType) -> crate::Result<Self> {
+        if kind == CompressionType::None {
+            return Err(crate::Error::FeatureUnsupported("compression-context-none"));
+        }
         #[cfg(zstd_any)]
-        assert!(
-            !matches!(kind, CompressionType::ZstdDict { .. }),
-            "CompressionContext::new called with CompressionType::ZstdDict; \
-             use CompressionContext::with_dict(level, dict) so the dictionary \
-             travels with the codec discriminator",
-        );
-        Self {
+        if matches!(kind, CompressionType::ZstdDict { .. }) {
+            return Err(crate::Error::FeatureUnsupported(
+                "compression-context-zstd-dict-via-new",
+            ));
+        }
+        Ok(Self {
             kind,
             #[cfg(zstd_any)]
             zstd_dict: None,
             #[cfg(not(zstd_any))]
             _lifetime: core::marker::PhantomData,
-        }
+        })
     }
 
     /// Constructs a `ZstdDict` context with the matching dictionary
@@ -114,9 +119,12 @@ impl<'a> CompressionContext<'a> {
     /// `dict.id()` is taken as the on-disk `dict_id`, so a mismatch
     /// is unreachable by construction. `level` is the zstd
     /// compression level the writer should use; readers don't
-    /// consume it (the zstd frame header advertises the level
-    /// itself) but it's stored to keep the on-disk
-    /// [`CompressionType::ZstdDict`] discriminator round-trip-able.
+    /// consume it (zstd decompression doesn't need the encoder
+    /// level — the frame header advertises everything the decoder
+    /// needs) but it's stored here to keep the on-disk
+    /// [`CompressionType::ZstdDict`] discriminator round-trippable
+    /// for writers and metadata that DO need to remember the level
+    /// (e.g. the per-table compression policy table).
     #[cfg(zstd_any)]
     #[must_use]
     pub fn with_dict(level: i32, dict: &'a ZstdDictionary) -> Self {
@@ -277,7 +285,7 @@ impl<'a> BlockTransform<'a> {
             // Non-dict codecs ignore the zstd_dict slot, matching the
             // previous API.
             let _ = zstd_dict;
-            CompressionContext::new(compression)
+            CompressionContext::new(compression)?
         };
 
         #[cfg(not(zstd_any))]

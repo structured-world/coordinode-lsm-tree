@@ -73,10 +73,13 @@ impl Block {
     /// transform argument; `CompressionContext`'s constructors enforce
     /// that the dict bundle travels with the `ZstdDict` codec
     /// discriminator (see [`BlockTransform`] module docs), so the
-    /// runtime `ZstdDictMismatch` guard inside this function is dead
-    /// code on the public API path and only fires for callers that
-    /// reach `write_into` via [`BlockTransform::from_parts`] with a
-    /// mismatched legacy triple.
+    /// runtime `ZstdDictMismatch` guard inside this function is
+    /// defensive only: every public construction path (direct
+    /// `BlockTransform::Compressed(CompressionContext::with_dict(..))`
+    /// and the [`BlockTransform::from_parts`] legacy helper) catches
+    /// the mismatch before the call reaches `write_into`, so the
+    /// guard is unreachable from any in-tree caller and exists purely
+    /// as a "should-never-fire" assertion.
     pub fn write_into<W: std::io::Write>(
         mut writer: &mut W,
         data: &[u8],
