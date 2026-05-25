@@ -344,6 +344,13 @@ pub fn recover(folder: &Path, fs: &dyn Fs, mode: ManifestRecoveryMode) -> crate:
                             let recovered = u32::try_from(run.len()).unwrap_or(u32::MAX);
                             tables_dropped_to_corruption = tables_dropped_to_corruption
                                 .saturating_add(table_count.saturating_sub(recovered));
+                            // Push the partial run + level so the
+                            // pre-corruption prefix survives in the
+                            // recovered Version. This is the
+                            // accept-the-prefix half of the PIT
+                            // contract — see the ManifestRecoveryMode
+                            // docstring and README for the
+                            // user-visible description.
                             level.push(run);
                             levels.push(level);
                             break 'levels;
