@@ -976,14 +976,15 @@ mod tests {
         /// Keep bound for the test lifetime — drop reclaims the
         /// directory and the file inside it. Declared LAST so
         /// the file handle above closes before this removes the
-        /// directory. The field is never READ — its only purpose
-        /// is its `Drop` side-effect — so the dead-code lint
-        /// would flag it without this `expect`.
-        #[expect(
+        /// directory. Some tests also read `.path()` directly to
+        /// re-open the on-disk bytes; others rely purely on the
+        /// `Drop` side-effect. `allow(dead_code)` covers both
+        /// shapes — `expect` would be unfulfilled in the
+        /// "actually read" cases.
+        #[allow(
             dead_code,
-            reason = "Drop guard for the tempdir; held purely for the \
-                      destructor's side-effect of cleaning up the \
-                      directory + the file inside it"
+            reason = "Drop guard for the tempdir; some tests also use \
+                      `.path()` directly to re-open the on-disk bytes"
         )]
         dir: tempfile::TempDir,
     }
@@ -1016,10 +1017,7 @@ mod tests {
             header
         };
         let file = std::fs::File::open(&path)?;
-        let handle = crate::table::BlockHandle::new(
-            BlockOffset(0),
-            header.data_length + Header::serialized_len() as u32,
-        );
+        let handle = crate::table::BlockHandle::new(BlockOffset(0), header.on_disk_size());
         Ok(TempBlock { file, handle, dir })
     }
 
@@ -2647,6 +2645,115 @@ mod tests {
                 )?,
             )?;
             assert_eq!(&*block.data, &data[..]);
+            Ok(())
+        }
+    }
+
+    /// Page ECC integration tests — write a block with the
+    /// `BlockTransform::*Ecc` variant, verify the on-disk layout
+    /// round-trips through `Block::from_reader`, and verify that
+    /// Reed-Solomon recovery kicks in when the payload bytes are
+    /// corrupted between write and read.
+    #[cfg(feature = "page_ecc")]
+    mod page_ecc {
+        use super::*;
+        use test_log::test;
+
+        const PAYLOAD: &[u8] = b"the quick brown fox jumps over the lazy dog \
+                                 0123456789 the quick brown fox jumps over \
+                                 the lazy dog 0123456789";
+
+        #[test]
+        fn block_roundtrip_plain_ecc_clean_read() -> crate::Result<()> {
+            let mut writer = vec![];
+            let header = Block::write_into(
+                &mut writer,
+                PAYLOAD,
+                BlockIdentity::for_test(0, 0, BlockType::Data),
+                &BlockTransform::PlainEcc,
+            )?;
+
+            assert!(
+                header.ecc_length > 0,
+                "PlainEcc writer must emit non-zero ecc_length; got {}",
+                header.ecc_length,
+            );
+            assert_eq!(
+                writer.len(),
+                Header::serialized_len() + header.data_length as usize + header.ecc_length as usize,
+                "on-disk size must equal header + payload + parity",
+            );
+
+            let mut reader = &writer[..];
+            let block = Block::from_reader(
+                &mut reader,
+                BlockIdentity::for_test(0, 0, BlockType::Data),
+                &BlockTransform::PLAIN,
+            )?;
+            assert_eq!(&*block.data, PAYLOAD);
+            Ok(())
+        }
+
+        #[test]
+        fn block_roundtrip_plain_ecc_recovers_from_single_byte_flip() -> crate::Result<()> {
+            let mut writer = vec![];
+            let header = Block::write_into(
+                &mut writer,
+                PAYLOAD,
+                BlockIdentity::for_test(0, 0, BlockType::Data),
+                &BlockTransform::PlainEcc,
+            )?;
+
+            // Flip a single byte inside the payload region (after
+            // the header, before the parity trailer) so the on-disk
+            // bytes' XXH3 no longer matches header.checksum but the
+            // recoverable shape (1 of 6 shards corrupted) holds.
+            let header_len = Header::serialized_len();
+            let flip_at = header_len + (header.data_length as usize) / 2;
+            writer[flip_at] ^= 0xFF;
+
+            let mut reader = &writer[..];
+            let block = Block::from_reader(
+                &mut reader,
+                BlockIdentity::for_test(0, 0, BlockType::Data),
+                &BlockTransform::PLAIN,
+            )?;
+            // ECC recovery reconstructs the original payload despite
+            // the in-flight bit-flip.
+            assert_eq!(
+                &*block.data, PAYLOAD,
+                "Reed-Solomon recovery must reconstruct the original \
+                 payload from a single-byte data-shard flip",
+            );
+            Ok(())
+        }
+
+        #[test]
+        fn block_from_file_plain_ecc_recovers_from_single_byte_flip() -> crate::Result<()> {
+            let tmp = super::write_block_to_tempfile(
+                PAYLOAD,
+                BlockIdentity::for_test(0, 0, BlockType::Data),
+                &BlockTransform::PlainEcc,
+            )?;
+            let path = tmp.dir.path().join("block");
+
+            // Flip one byte inside the payload region (after the
+            // header, before the parity trailer).
+            let mut bytes = std::fs::read(&path)?;
+            let payload_start = Header::serialized_len();
+            bytes[payload_start + 3] ^= 0x80;
+            std::fs::write(&path, &bytes)?;
+
+            // Re-open and read via from_file. ECC recovery should
+            // reconstruct the original payload.
+            let file = std::fs::File::open(&path)?;
+            let block = Block::from_file(
+                &file,
+                tmp.handle,
+                BlockIdentity::for_test(0, 0, BlockType::Data),
+                &BlockTransform::PLAIN,
+            )?;
+            assert_eq!(&*block.data, PAYLOAD);
             Ok(())
         }
     }
