@@ -513,7 +513,18 @@ fn run_dump(
         return ExitCode::SUCCESS;
     }
 
-    for item in iter {
+    // Pull the iterator manually instead of `for item in iter` so the
+    // `emitted < cap` check can gate the `iter.next()` call itself.
+    // With the `for` form, the cap check ran AFTER pulling and decoding
+    // the next entry; in the worst case (cap falls on a block boundary)
+    // that triggered an extra data-block read + decompression after the
+    // cap was already reached. The while-let form short-circuits before
+    // pulling.
+    let mut iter = iter;
+    while emitted < cap {
+        let Some(item) = iter.next() else {
+            break;
+        };
         let entry = match item {
             Ok(e) => e,
             Err(e) => {
@@ -537,10 +548,6 @@ fn run_dump(
             // bound we're done. Break instead of continuing to
             // avoid walking the rest of the (potentially huge)
             // data section.
-            break;
-        }
-
-        if emitted >= cap {
             break;
         }
 
