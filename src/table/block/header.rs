@@ -190,6 +190,40 @@ impl Decode for Header {
 }
 
 #[cfg(test)]
+impl Header {
+    /// Test-only constructor for placeholder Header values used in
+    /// unit tests that don't care about checksum / lengths. All
+    /// numeric fields are zero. Callers that need specific lengths
+    /// or a non-zero checksum override via struct-update syntax:
+    ///
+    /// ```ignore
+    /// // All fields zero, just the block_type:
+    /// Header::test_dummy(BlockType::Data)
+    ///
+    /// // Override only the data_length / uncompressed_length:
+    /// Header {
+    ///     data_length: 42,
+    ///     uncompressed_length: 42,
+    ///     ..Header::test_dummy(BlockType::Index)
+    /// }
+    /// ```
+    ///
+    /// The whole point of this helper is to keep test sites
+    /// future-proof: adding a new field to `Header` only needs the
+    /// new default wired in here, not at every test literal across
+    /// the crate.
+    pub(crate) fn test_dummy(block_type: BlockType) -> Self {
+        Self {
+            block_type,
+            checksum: Checksum::from_raw(0),
+            data_length: 0,
+            uncompressed_length: 0,
+            ecc_length: 0,
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use test_log::test;

@@ -405,7 +405,7 @@ pub struct Config {
     /// `page_ecc = true` on a build without the feature returns
     /// [`crate::Error::PageEccUnsupported`].
     ///
-    /// Off by default. RocksDB ships per-block ECC as an operator-
+    /// Off by default. `RocksDB` ships per-block ECC as an operator-
     /// chosen knob (typically off on RAID-protected media, on on
     /// single-drive) and the cost is non-trivial on the write path,
     /// so the default keeps the existing behaviour.

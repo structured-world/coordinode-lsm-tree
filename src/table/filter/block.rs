@@ -44,7 +44,6 @@ impl FilterBlock {
 mod tests {
     use super::*;
     use crate::Slice;
-    use crate::checksum::Checksum;
     use crate::table::Block;
     use crate::table::block::{BlockType, Header};
 
@@ -53,12 +52,7 @@ mod tests {
         // build_burr_filter_bytes returns for an empty key set and what
         // BurrFilter::to_wire_bytes returns for a zero-layer filter.
         let block = Block {
-            header: Header {
-                block_type: BlockType::Filter,
-                checksum: Checksum::from_raw(0),
-                data_length: 0,
-                uncompressed_length: 0,
-            },
+            header: Header::test_dummy(BlockType::Filter),
             data: Slice::empty(),
         };
         FilterBlock::new(block)

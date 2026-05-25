@@ -979,7 +979,7 @@ impl<Item: Decodable<Parsed>, Parsed: ParsedItem<Item>> DoubleEndedIterator
 mod tests {
     use super::Decoder;
     use crate::{
-        Checksum, InternalValue,
+        InternalValue,
         table::{
             Block, BlockHandle, BlockOffset, DataBlock, IndexBlock, KeyedBlockHandle,
             block::{BlockType, Header, Trailer},
@@ -1005,13 +1005,7 @@ mod tests {
     fn binary_index_offset_field_pos(bytes: &[u8]) -> usize {
         let trailer_probe = IndexBlock::new(Block {
             data: bytes.to_vec().into(),
-            header: Header {
-                block_type: BlockType::Index,
-                checksum: Checksum::from_raw(0),
-                data_length: 0,
-                uncompressed_length: 0,
-                ecc_length: 0,
-            },
+            header: Header::test_dummy(BlockType::Index),
         });
         let trailer_offset = Trailer::new(&trailer_probe.inner).trailer_offset();
         trailer_offset + 1 + 1 + std::mem::size_of::<u32>()
@@ -1020,13 +1014,7 @@ mod tests {
     fn binary_index_len_field_pos(bytes: &[u8]) -> usize {
         let trailer_probe = IndexBlock::new(Block {
             data: bytes.to_vec().into(),
-            header: Header {
-                block_type: BlockType::Index,
-                checksum: Checksum::from_raw(0),
-                data_length: 0,
-                uncompressed_length: 0,
-                ecc_length: 0,
-            },
+            header: Header::test_dummy(BlockType::Index),
         });
         let trailer_offset = Trailer::new(&trailer_probe.inner).trailer_offset();
         trailer_offset + 1 + 1
@@ -1035,13 +1023,7 @@ mod tests {
     fn binary_index_step_size_field_pos(bytes: &[u8]) -> usize {
         let trailer_probe = IndexBlock::new(Block {
             data: bytes.to_vec().into(),
-            header: Header {
-                block_type: BlockType::Index,
-                checksum: Checksum::from_raw(0),
-                data_length: 0,
-                uncompressed_length: 0,
-                ecc_length: 0,
-            },
+            header: Header::test_dummy(BlockType::Index),
         });
         let trailer_offset = Trailer::new(&trailer_probe.inner).trailer_offset();
         trailer_offset + 1
@@ -1050,13 +1032,7 @@ mod tests {
     fn hash_index_len_field_pos(bytes: &[u8]) -> usize {
         let trailer_probe = IndexBlock::new(Block {
             data: bytes.to_vec().into(),
-            header: Header {
-                block_type: BlockType::Index,
-                checksum: Checksum::from_raw(0),
-                data_length: 0,
-                uncompressed_length: 0,
-                ecc_length: 0,
-            },
+            header: Header::test_dummy(BlockType::Index),
         });
         let trailer_offset = Trailer::new(&trailer_probe.inner).trailer_offset();
         trailer_offset + 1 + 1 + (2 * std::mem::size_of::<u32>())
@@ -1163,13 +1139,7 @@ mod tests {
 
         let block = Block {
             data: bytes.into(),
-            header: Header {
-                block_type: BlockType::Index,
-                checksum: Checksum::from_raw(0),
-                data_length: 0,
-                uncompressed_length: 0,
-                ecc_length: 0,
-            },
+            header: Header::test_dummy(BlockType::Index),
         };
         assert!(
             matches!(
@@ -1193,13 +1163,7 @@ mod tests {
 
         let block = Block {
             data: bytes.into(),
-            header: Header {
-                block_type: BlockType::Index,
-                checksum: Checksum::from_raw(0),
-                data_length: 0,
-                uncompressed_length: 0,
-                ecc_length: 0,
-            },
+            header: Header::test_dummy(BlockType::Index),
         };
         assert!(
             matches!(
@@ -1222,13 +1186,7 @@ mod tests {
 
         let block = Block {
             data: bytes.into(),
-            header: Header {
-                block_type: BlockType::Index,
-                checksum: Checksum::from_raw(0),
-                data_length: 0,
-                uncompressed_length: 0,
-                ecc_length: 0,
-            },
+            header: Header::test_dummy(BlockType::Index),
         };
         assert!(
             matches!(
@@ -1255,13 +1213,7 @@ mod tests {
 
         let block = Block {
             data: bytes.into(),
-            header: Header {
-                block_type: BlockType::Index,
-                checksum: Checksum::from_raw(0),
-                data_length: 0,
-                uncompressed_length: 0,
-                ecc_length: 0,
-            },
+            header: Header::test_dummy(BlockType::Index),
         };
         assert!(
             matches!(
@@ -1281,13 +1233,7 @@ mod tests {
         let binary_index_step_size_pos = binary_index_step_size_field_pos(&bytes);
         let trailer_probe = IndexBlock::new(Block {
             data: bytes.clone().into(),
-            header: Header {
-                block_type: BlockType::Index,
-                checksum: Checksum::from_raw(0),
-                data_length: 0,
-                uncompressed_length: 0,
-                ecc_length: 0,
-            },
+            header: Header::test_dummy(BlockType::Index),
         });
         let trailer_offset = Trailer::new(&trailer_probe.inner).trailer_offset();
 
@@ -1305,13 +1251,7 @@ mod tests {
 
         let block = Block {
             data: bytes.into(),
-            header: Header {
-                block_type: BlockType::Index,
-                checksum: Checksum::from_raw(0),
-                data_length: 0,
-                uncompressed_length: 0,
-                ecc_length: 0,
-            },
+            header: Header::test_dummy(BlockType::Index),
         };
         assert!(
             matches!(
@@ -1338,13 +1278,7 @@ mod tests {
 
         let block = Block {
             data: bytes.into(),
-            header: Header {
-                block_type: BlockType::Index,
-                checksum: Checksum::from_raw(0),
-                data_length: 0,
-                uncompressed_length: 0,
-                ecc_length: 0,
-            },
+            header: Header::test_dummy(BlockType::Index),
         };
         assert!(
             matches!(
@@ -1374,13 +1308,7 @@ mod tests {
 
         let block = Block {
             data: bytes.into(),
-            header: Header {
-                block_type: BlockType::Index,
-                checksum: Checksum::from_raw(0),
-                data_length: 0,
-                uncompressed_length: 0,
-                ecc_length: 0,
-            },
+            header: Header::test_dummy(BlockType::Index),
         };
         let mut decoder = Decoder::<KeyedBlockHandle, IndexBlockParsedItem>::new(&block);
 
@@ -1393,13 +1321,7 @@ mod tests {
         let bytes = IndexBlock::encode_into_vec_with_restart_interval(&handles, 4).unwrap();
         let block = Block {
             data: bytes.into(),
-            header: Header {
-                block_type: BlockType::Index,
-                checksum: Checksum::from_raw(0),
-                data_length: 0,
-                uncompressed_length: 0,
-                ecc_length: 0,
-            },
+            header: Header::test_dummy(BlockType::Index),
         };
         let mut decoder = Decoder::<KeyedBlockHandle, IndexBlockParsedItem>::new(&block);
         decoder.hi_scanner.offset = 1;
@@ -1426,13 +1348,7 @@ mod tests {
 
         let block = Block {
             data: bytes.into(),
-            header: Header {
-                block_type: BlockType::Index,
-                checksum: Checksum::from_raw(0),
-                data_length: 0,
-                uncompressed_length: 0,
-                ecc_length: 0,
-            },
+            header: Header::test_dummy(BlockType::Index),
         };
         let mut decoder = Decoder::<KeyedBlockHandle, IndexBlockParsedItem>::new(&block);
         decoder.hi_scanner.ptr_idx = 0;
@@ -1463,13 +1379,7 @@ mod tests {
 
         let block = Block {
             data: bytes.into(),
-            header: Header {
-                block_type: BlockType::Index,
-                checksum: Checksum::from_raw(0),
-                data_length: 0,
-                uncompressed_length: 0,
-                ecc_length: 0,
-            },
+            header: Header::test_dummy(BlockType::Index),
         };
         let mut decoder = Decoder::<KeyedBlockHandle, IndexBlockParsedItem>::new(&block);
 
@@ -1534,13 +1444,7 @@ mod tests {
 
         let block = Block {
             data: bytes.into(),
-            header: Header {
-                block_type: BlockType::Index,
-                checksum: Checksum::from_raw(0),
-                data_length: 0,
-                uncompressed_length: 0,
-                ecc_length: 0,
-            },
+            header: Header::test_dummy(BlockType::Index),
         };
         let mut decoder = Decoder::<KeyedBlockHandle, IndexBlockParsedItem>::new(&block);
 
@@ -1604,13 +1508,7 @@ mod tests {
 
         let block = Block {
             data: bytes.into(),
-            header: Header {
-                block_type: BlockType::Index,
-                checksum: Checksum::from_raw(0),
-                data_length: 0,
-                uncompressed_length: 0,
-                ecc_length: 0,
-            },
+            header: Header::test_dummy(BlockType::Index),
         };
         let mut decoder = Decoder::<KeyedBlockHandle, IndexBlockParsedItem>::new(&block);
 
@@ -1641,13 +1539,7 @@ mod tests {
 
         let block = Block {
             data: bytes.into(),
-            header: Header {
-                block_type: BlockType::Index,
-                checksum: Checksum::from_raw(0),
-                data_length: 0,
-                uncompressed_length: 0,
-                ecc_length: 0,
-            },
+            header: Header::test_dummy(BlockType::Index),
         };
         let mut decoder = Decoder::<KeyedBlockHandle, IndexBlockParsedItem>::new(&block);
         decoder.hi_scanner.ptr_idx = 0;
@@ -1694,13 +1586,7 @@ mod tests {
 
         let block = Block {
             data: bytes.into(),
-            header: Header {
-                block_type: BlockType::Index,
-                checksum: Checksum::from_raw(0),
-                data_length: 0,
-                uncompressed_length: 0,
-                ecc_length: 0,
-            },
+            header: Header::test_dummy(BlockType::Index),
         };
         let mut decoder = Decoder::<KeyedBlockHandle, IndexBlockParsedItem>::new(&block);
 
@@ -1739,13 +1625,7 @@ mod tests {
         let bytes = DataBlock::encode_into_vec(&items, 1, 1.33).expect("encode data block");
         let block = Block {
             data: bytes.into(),
-            header: Header {
-                block_type: BlockType::Data,
-                checksum: Checksum::from_raw(0),
-                data_length: 0,
-                uncompressed_length: 0,
-                ecc_length: 0,
-            },
+            header: Header::test_dummy(BlockType::Data),
         };
 
         let trailer_offset = Trailer::new(&block).trailer_offset();
@@ -1784,13 +1664,7 @@ mod tests {
 
         let block = Block {
             data: bytes.into(),
-            header: Header {
-                block_type: BlockType::Data,
-                checksum: Checksum::from_raw(0),
-                data_length: 0,
-                uncompressed_length: 0,
-                ecc_length: 0,
-            },
+            header: Header::test_dummy(BlockType::Data),
         };
         assert!(
             matches!(
@@ -1825,13 +1699,7 @@ mod tests {
 
         let block = Block {
             data: bytes.into(),
-            header: Header {
-                block_type: BlockType::Data,
-                checksum: Checksum::from_raw(0),
-                data_length: 0,
-                uncompressed_length: 0,
-                ecc_length: 0,
-            },
+            header: Header::test_dummy(BlockType::Data),
         };
         assert!(
             matches!(
@@ -1856,13 +1724,7 @@ mod tests {
 
         let block = Block {
             data: bytes.into(),
-            header: Header {
-                block_type: BlockType::Index,
-                checksum: Checksum::from_raw(0),
-                data_length: 0,
-                uncompressed_length: 0,
-                ecc_length: 0,
-            },
+            header: Header::test_dummy(BlockType::Index),
         };
         assert!(
             matches!(
@@ -1911,13 +1773,7 @@ mod tests {
 
         let block = Block {
             data: bytes.into(),
-            header: Header {
-                block_type: BlockType::Index,
-                checksum: Checksum::from_raw(0),
-                data_length: 0,
-                uncompressed_length: 0,
-                ecc_length: 0,
-            },
+            header: Header::test_dummy(BlockType::Index),
         };
         let mut decoder = Decoder::<KeyedBlockHandle, IndexBlockParsedItem>::new(&block);
 
@@ -1940,26 +1796,14 @@ mod tests {
         // Locate trailer and zero out restart_interval (first trailer byte).
         let block = Block {
             data: bytes.clone().into(),
-            header: Header {
-                block_type: BlockType::Index,
-                checksum: Checksum::from_raw(0),
-                data_length: 0,
-                uncompressed_length: 0,
-                ecc_length: 0,
-            },
+            header: Header::test_dummy(BlockType::Index),
         };
         let trailer_offset = Trailer::new(&block).trailer_offset();
         bytes[trailer_offset] = 0;
 
         let corrupt_block = Block {
             data: bytes.into(),
-            header: Header {
-                block_type: BlockType::Index,
-                checksum: Checksum::from_raw(0),
-                data_length: 0,
-                uncompressed_length: 0,
-                ecc_length: 0,
-            },
+            header: Header::test_dummy(BlockType::Index),
         };
 
         assert!(
@@ -1978,13 +1822,7 @@ mod tests {
 
         let block = Block {
             data: bytes.clone().into(),
-            header: Header {
-                block_type: BlockType::Index,
-                checksum: Checksum::from_raw(0),
-                data_length: 0,
-                uncompressed_length: 0,
-                ecc_length: 0,
-            },
+            header: Header::test_dummy(BlockType::Index),
         };
         let trailer_offset = Trailer::new(&block).trailer_offset();
         // Corrupt binary_index_step_size (second trailer byte) to an invalid value.
@@ -1992,13 +1830,7 @@ mod tests {
 
         let corrupt_block = Block {
             data: bytes.into(),
-            header: Header {
-                block_type: BlockType::Index,
-                checksum: Checksum::from_raw(0),
-                data_length: 0,
-                uncompressed_length: 0,
-                ecc_length: 0,
-            },
+            header: Header::test_dummy(BlockType::Index),
         };
 
         assert!(
@@ -2018,26 +1850,14 @@ mod tests {
 
         let block = Block {
             data: bytes.clone().into(),
-            header: Header {
-                block_type: BlockType::Index,
-                checksum: Checksum::from_raw(0),
-                data_length: 0,
-                uncompressed_length: 0,
-                ecc_length: 0,
-            },
+            header: Header::test_dummy(BlockType::Index),
         };
         let trailer_offset = Trailer::new(&block).trailer_offset();
         bytes[trailer_offset] = 0;
 
         let corrupt_block = Block {
             data: bytes.into(),
-            header: Header {
-                block_type: BlockType::Index,
-                checksum: Checksum::from_raw(0),
-                data_length: 0,
-                uncompressed_length: 0,
-                ecc_length: 0,
-            },
+            header: Header::test_dummy(BlockType::Index),
         };
 
         // Must panic, not silently succeed.

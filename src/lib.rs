@@ -64,7 +64,7 @@
 //! bumped so a pre-V6 reader rejects V6 blocks immediately at header
 //! decode. V3-V5 databases are not readable by this version and vice
 //! versa. The manifest version gate rejects pre-V6 databases at
-//! `Tree::open` time. V5 introduced the BuRR filter wire format (still
+//! `Tree::open` time. V5 introduced the `BuRR` filter wire format (still
 //! the current filter encoding); V4 introduced range tombstones (still
 //! supported).
 #![deny(clippy::all, missing_docs, clippy::cargo)]

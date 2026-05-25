@@ -1610,10 +1610,9 @@ fn rt_block(data: Vec<u8>) -> Block {
     let data_length = u32::try_from(data.len()).expect("test buffer fits in u32");
     Block {
         header: block::Header {
-            block_type: block::BlockType::RangeTombstone,
-            checksum: crate::Checksum::from_raw(0),
             data_length,
             uncompressed_length: data_length,
+            ..block::Header::test_dummy(block::BlockType::RangeTombstone)
         },
         data: data.into(),
     }
