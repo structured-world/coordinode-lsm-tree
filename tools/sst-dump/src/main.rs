@@ -534,10 +534,11 @@ fn run_dump(
     // Output is buffered through a single locked stdout BufWriter and
     // each entry emits exactly one `writeln!` so a million-entry SST
     // dump doesn't pay one stdout lock + one syscall per print call.
-    // BufWriter is flushed implicitly when it goes out of scope at the
-    // end of the function; that flush is the only place a write error
-    // can surface, and we report it as a generic stdout error so the
-    // operator sees something instead of swallowing it silently.
+    // Write errors can surface in two places: per-line `writeln!`
+    // calls (handled below via `line_result`) and the explicit
+    // `out.flush()` at the end (which surfaces errors buffered
+    // inside the BufWriter that would otherwise be swallowed by
+    // BufWriter's Drop implementation).
     use std::io::Write as _;
     let stdout = std::io::stdout();
     let stdout_lock = stdout.lock();
