@@ -13,6 +13,7 @@ mod header;
 mod identity;
 mod offset;
 mod trailer;
+mod transform;
 mod r#type;
 
 pub(crate) use decoder::{Decodable, Decoder, ParsedItem};
@@ -21,6 +22,7 @@ pub use header::Header;
 pub use identity::BlockIdentity;
 pub use offset::BlockOffset;
 pub(crate) use trailer::{TRAILER_START_MARKER, Trailer};
+pub use transform::{BlockTransform, CompressionContext};
 pub use r#type::BlockType;
 
 #[cfg(zstd_any)]
@@ -29,7 +31,6 @@ use crate::compression::CompressionProvider as _;
 use crate::{
     Checksum, CompressionType, Slice,
     coding::{Decode, Encode},
-    encryption::EncryptionProvider,
     fs::FsFile,
     table::BlockHandle,
 };
@@ -64,21 +65,36 @@ impl Block {
 
     /// Encodes a block into a writer.
     ///
-    /// Pipeline: raw data → compress → encrypt → checksum → write.
-    /// When `encryption` is `None`, the encrypt step is skipped.
-    ///
-    /// When `compression` is [`CompressionType::ZstdDict`], `zstd_dict` must
-    /// contain the raw dictionary bytes matching the `dict_id` in the
-    /// compression type. For all other compression types, `zstd_dict` is
-    /// ignored.
+    /// Pipeline: raw data → compress → encrypt → checksum → write. The
+    /// concrete pipeline shape (which steps run) is encoded by the
+    /// [`BlockTransform`] variant (see its docs for the four valid
+    /// combinations). The previous separate `(compression, encryption,
+    /// zstd_dict)` argument triple has been collapsed into this single
+    /// transform argument; `CompressionContext`'s constructors enforce
+    /// that the dict bundle travels with the `ZstdDict` codec
+    /// discriminator (see [`BlockTransform`] module docs), so the
+    /// runtime `ZstdDictMismatch` guard inside this function is
+    /// defensive only: every public construction path (direct
+    /// `BlockTransform::Compressed(CompressionContext::with_dict(..))`
+    /// and the [`BlockTransform::from_parts`] legacy helper) catches
+    /// the mismatch before the call reaches `write_into`, so the
+    /// guard is unreachable from any in-tree caller and exists purely
+    /// as a "should-never-fire" assertion.
     pub fn write_into<W: std::io::Write>(
         mut writer: &mut W,
         data: &[u8],
         identity: BlockIdentity,
-        compression: CompressionType,
-        encryption: Option<&dyn EncryptionProvider>,
-        #[cfg(zstd_any)] zstd_dict: Option<&crate::compression::ZstdDictionary>,
+        transform: &BlockTransform<'_>,
     ) -> crate::Result<Header> {
+        // Unpack the transform back to the (compression, encryption,
+        // zstd_dict) triple the implementation below was written
+        // against. The transform's accessor methods carry the
+        // pattern-match cost; the rest of the function keeps the same
+        // shape as before the API collapse.
+        let compression = transform.compression();
+        let encryption = transform.encryption();
+        #[cfg(zstd_any)]
+        let zstd_dict = transform.zstd_dict();
         // Pull block_type out of identity so the rest of the
         // function reads exactly like the pre-identity version.
         // table_id / block_offset / dict_id / window_log are
@@ -241,10 +257,12 @@ impl Block {
     pub fn from_reader<R: std::io::Read>(
         reader: &mut R,
         identity: BlockIdentity,
-        compression: CompressionType,
-        encryption: Option<&dyn EncryptionProvider>,
-        #[cfg(zstd_any)] zstd_dict: Option<&crate::compression::ZstdDictionary>,
+        transform: &BlockTransform<'_>,
     ) -> crate::Result<Self> {
+        let compression = transform.compression();
+        let encryption = transform.encryption();
+        #[cfg(zstd_any)]
+        let zstd_dict = transform.zstd_dict();
         // identity carries table_id / offset / dict_id / window_log
         // for AAD construction once AEAD wiring lands; unused on the
         // read path today (block_type is derived from the parsed
@@ -467,10 +485,12 @@ impl Block {
         file: &dyn FsFile,
         handle: BlockHandle,
         identity: BlockIdentity,
-        compression: CompressionType,
-        encryption: Option<&dyn EncryptionProvider>,
-        #[cfg(zstd_any)] zstd_dict: Option<&crate::compression::ZstdDictionary>,
+        transform: &BlockTransform<'_>,
     ) -> crate::Result<Self> {
+        let compression = transform.compression();
+        let encryption = transform.encryption();
+        #[cfg(zstd_any)]
+        let zstd_dict = transform.zstd_dict();
         // identity carries AAD context; unused today. handle gives
         // the byte offset (caller already computed it), identity
         // packages it alongside the table_id + compression-context
@@ -820,9 +840,7 @@ mod tests {
     fn write_block_to_tempfile(
         data: &[u8],
         identity: BlockIdentity,
-        compression: CompressionType,
-        encryption: Option<&dyn crate::encryption::EncryptionProvider>,
-        #[cfg(zstd_any)] zstd_dict: Option<&crate::compression::ZstdDictionary>,
+        transform: &BlockTransform<'_>,
     ) -> crate::Result<TempBlock> {
         let dir = tempfile::tempdir()?;
         let path = dir.path().join("block");
@@ -831,15 +849,7 @@ mod tests {
         // closes; sync_all flushes before close.
         let header = {
             let mut file = std::fs::File::create(&path)?;
-            let header = Block::write_into(
-                &mut file,
-                data,
-                identity,
-                compression,
-                encryption,
-                #[cfg(zstd_any)]
-                zstd_dict,
-            )?;
+            let header = Block::write_into(&mut file, data, identity, transform)?;
             file.sync_all()?;
             header
         };
@@ -857,10 +867,12 @@ mod tests {
         let tmp = write_block_to_tempfile(
             data,
             crate::table::block::BlockIdentity::for_test(0, 0, BlockType::Data),
-            CompressionType::None,
-            None,
-            #[cfg(zstd_any)]
-            None,
+            &crate::table::block::BlockTransform::from_parts(
+                CompressionType::None,
+                None,
+                #[cfg(zstd_any)]
+                None,
+            )?,
         )?;
         let block = Block::from_file(
             &tmp.file,
@@ -870,10 +882,12 @@ mod tests {
                 0,
                 crate::table::block::BlockType::Data,
             ),
-            CompressionType::None,
-            None,
-            #[cfg(zstd_any)]
-            None,
+            &crate::table::block::BlockTransform::from_parts(
+                CompressionType::None,
+                None,
+                #[cfg(zstd_any)]
+                None,
+            )?,
         )?;
         assert_eq!(data, &*block.data);
         Ok(())
@@ -886,10 +900,12 @@ mod tests {
         let tmp = write_block_to_tempfile(
             data,
             crate::table::block::BlockIdentity::for_test(0, 0, BlockType::Data),
-            CompressionType::Lz4,
-            None,
-            #[cfg(zstd_any)]
-            None,
+            &crate::table::block::BlockTransform::from_parts(
+                CompressionType::Lz4,
+                None,
+                #[cfg(zstd_any)]
+                None,
+            )?,
         )?;
         let block = Block::from_file(
             &tmp.file,
@@ -899,10 +915,12 @@ mod tests {
                 0,
                 crate::table::block::BlockType::Data,
             ),
-            CompressionType::Lz4,
-            None,
-            #[cfg(zstd_any)]
-            None,
+            &crate::table::block::BlockTransform::from_parts(
+                CompressionType::Lz4,
+                None,
+                #[cfg(zstd_any)]
+                None,
+            )?,
         )?;
         assert_eq!(data, &*block.data);
         Ok(())
@@ -915,17 +933,23 @@ mod tests {
         let tmp = write_block_to_tempfile(
             data,
             BlockIdentity::for_test(0, 0, BlockType::Data),
-            CompressionType::Zstd(3),
-            None,
-            None,
+            &crate::table::block::BlockTransform::from_parts(
+                CompressionType::Zstd(3),
+                None,
+                #[cfg(zstd_any)]
+                None,
+            )?,
         )?;
         let block = Block::from_file(
             &tmp.file,
             tmp.handle,
             BlockIdentity::for_test(0, 0, BlockType::Data),
-            CompressionType::Zstd(3),
-            None,
-            None,
+            &crate::table::block::BlockTransform::from_parts(
+                CompressionType::Zstd(3),
+                None,
+                #[cfg(zstd_any)]
+                None,
+            )?,
         )?;
         assert_eq!(data, &*block.data);
         Ok(())
@@ -939,10 +963,12 @@ mod tests {
             &mut writer,
             b"abcdefabcdefabcdef",
             crate::table::block::BlockIdentity::for_test(0, 0, BlockType::Data),
-            CompressionType::None,
-            None,
-            #[cfg(zstd_any)]
-            None,
+            &crate::table::block::BlockTransform::from_parts(
+                CompressionType::None,
+                None,
+                #[cfg(zstd_any)]
+                None,
+            )?,
         )?;
 
         {
@@ -954,10 +980,12 @@ mod tests {
                     0,
                     crate::table::block::BlockType::Data,
                 ),
-                CompressionType::None,
-                None,
-                #[cfg(zstd_any)]
-                None,
+                &crate::table::block::BlockTransform::from_parts(
+                    CompressionType::None,
+                    None,
+                    #[cfg(zstd_any)]
+                    None,
+                )?,
             )?;
             assert_eq!(b"abcdefabcdefabcdef", &*block.data);
         }
@@ -973,10 +1001,12 @@ mod tests {
             &mut writer,
             b"abcdefabcdefabcdef",
             crate::table::block::BlockIdentity::for_test(0, 0, BlockType::Data),
-            CompressionType::Lz4,
-            None,
-            #[cfg(zstd_any)]
-            None,
+            &crate::table::block::BlockTransform::from_parts(
+                CompressionType::Lz4,
+                None,
+                #[cfg(zstd_any)]
+                None,
+            )?,
         )?;
 
         {
@@ -988,10 +1018,12 @@ mod tests {
                     0,
                     crate::table::block::BlockType::Data,
                 ),
-                CompressionType::Lz4,
-                None,
-                #[cfg(zstd_any)]
-                None,
+                &crate::table::block::BlockTransform::from_parts(
+                    CompressionType::Lz4,
+                    None,
+                    #[cfg(zstd_any)]
+                    None,
+                )?,
             )?;
             assert_eq!(b"abcdefabcdefabcdef", &*block.data);
         }
@@ -1010,10 +1042,13 @@ mod tests {
             &mut buf,
             b"hello",
             crate::table::block::BlockIdentity::for_test(0, 0, BlockType::Data),
-            CompressionType::Lz4,
-            None,
-            #[cfg(zstd_any)]
-            None,
+            &crate::table::block::BlockTransform::from_parts(
+                CompressionType::Lz4,
+                None,
+                #[cfg(zstd_any)]
+                None,
+            )
+            .unwrap(),
         )
         .unwrap();
 
@@ -1038,10 +1073,13 @@ mod tests {
                 0,
                 crate::table::block::BlockType::Data,
             ),
-            CompressionType::Lz4,
-            None,
-            #[cfg(zstd_any)]
-            None,
+            &crate::table::block::BlockTransform::from_parts(
+                CompressionType::Lz4,
+                None,
+                #[cfg(zstd_any)]
+                None,
+            )
+            .unwrap(),
         );
 
         assert!(
@@ -1064,10 +1102,13 @@ mod tests {
             &mut buf,
             b"hello",
             crate::table::block::BlockIdentity::for_test(0, 0, BlockType::Data),
-            CompressionType::Lz4,
-            None,
-            #[cfg(zstd_any)]
-            None,
+            &crate::table::block::BlockTransform::from_parts(
+                CompressionType::Lz4,
+                None,
+                #[cfg(zstd_any)]
+                None,
+            )
+            .unwrap(),
         )
         .unwrap();
 
@@ -1087,10 +1128,13 @@ mod tests {
                 0,
                 crate::table::block::BlockType::Data,
             ),
-            CompressionType::Lz4,
-            None,
-            #[cfg(zstd_any)]
-            None,
+            &crate::table::block::BlockTransform::from_parts(
+                CompressionType::Lz4,
+                None,
+                #[cfg(zstd_any)]
+                None,
+            )
+            .unwrap(),
         );
 
         assert!(
@@ -1136,10 +1180,13 @@ mod tests {
                 0,
                 crate::table::block::BlockType::Data,
             ),
-            CompressionType::Lz4,
-            None,
-            #[cfg(zstd_any)]
-            None,
+            &crate::table::block::BlockTransform::from_parts(
+                CompressionType::Lz4,
+                None,
+                #[cfg(zstd_any)]
+                None,
+            )
+            .unwrap(),
         );
 
         match result {
@@ -1160,10 +1207,13 @@ mod tests {
             &mut buf,
             b"hello",
             crate::table::block::BlockIdentity::for_test(0, 0, BlockType::Data),
-            CompressionType::Lz4,
-            None,
-            #[cfg(zstd_any)]
-            None,
+            &crate::table::block::BlockTransform::from_parts(
+                CompressionType::Lz4,
+                None,
+                #[cfg(zstd_any)]
+                None,
+            )
+            .unwrap(),
         )
         .unwrap();
 
@@ -1194,10 +1244,13 @@ mod tests {
                 0,
                 crate::table::block::BlockType::Data,
             ),
-            CompressionType::Lz4,
-            None,
-            #[cfg(zstd_any)]
-            None,
+            &crate::table::block::BlockTransform::from_parts(
+                CompressionType::Lz4,
+                None,
+                #[cfg(zstd_any)]
+                None,
+            )
+            .unwrap(),
         );
 
         assert!(
@@ -1218,10 +1271,13 @@ mod tests {
             &mut buf,
             b"hello",
             crate::table::block::BlockIdentity::for_test(0, 0, BlockType::Data),
-            CompressionType::Lz4,
-            None,
-            #[cfg(zstd_any)]
-            None,
+            &crate::table::block::BlockTransform::from_parts(
+                CompressionType::Lz4,
+                None,
+                #[cfg(zstd_any)]
+                None,
+            )
+            .unwrap(),
         )
         .unwrap();
 
@@ -1247,10 +1303,13 @@ mod tests {
                 0,
                 crate::table::block::BlockType::Data,
             ),
-            CompressionType::Lz4,
-            None,
-            #[cfg(zstd_any)]
-            None,
+            &crate::table::block::BlockTransform::from_parts(
+                CompressionType::Lz4,
+                None,
+                #[cfg(zstd_any)]
+                None,
+            )
+            .unwrap(),
         );
 
         assert!(
@@ -1269,10 +1328,13 @@ mod tests {
             &mut buf,
             b"hello",
             crate::table::block::BlockIdentity::for_test(0, 0, BlockType::Data),
-            CompressionType::None,
-            None,
-            #[cfg(zstd_any)]
-            None,
+            &crate::table::block::BlockTransform::from_parts(
+                CompressionType::None,
+                None,
+                #[cfg(zstd_any)]
+                None,
+            )
+            .unwrap(),
         )
         .unwrap();
 
@@ -1293,10 +1355,13 @@ mod tests {
                 0,
                 crate::table::block::BlockType::Data,
             ),
-            CompressionType::None,
-            None,
-            #[cfg(zstd_any)]
-            None,
+            &crate::table::block::BlockTransform::from_parts(
+                CompressionType::None,
+                None,
+                #[cfg(zstd_any)]
+                None,
+            )
+            .unwrap(),
         );
 
         assert!(
@@ -1324,10 +1389,13 @@ mod tests {
                 0,
                 crate::table::block::BlockType::Data,
             ),
-            CompressionType::None,
-            None,
-            #[cfg(zstd_any)]
-            None,
+            &crate::table::block::BlockTransform::from_parts(
+                CompressionType::None,
+                None,
+                #[cfg(zstd_any)]
+                None,
+            )
+            .unwrap(),
         );
 
         assert!(
@@ -1373,9 +1441,13 @@ mod tests {
                 0,
                 crate::table::block::BlockType::Data,
             ),
-            CompressionType::Zstd(3),
-            None,
-            None,
+            &crate::table::block::BlockTransform::from_parts(
+                CompressionType::Zstd(3),
+                None,
+                #[cfg(zstd_any)]
+                None,
+            )
+            .unwrap(),
         );
 
         match result {
@@ -1422,9 +1494,13 @@ mod tests {
                 0,
                 crate::table::block::BlockType::Data,
             ),
-            CompressionType::Zstd(3),
-            None,
-            None,
+            &crate::table::block::BlockTransform::from_parts(
+                CompressionType::Zstd(3),
+                None,
+                #[cfg(zstd_any)]
+                None,
+            )
+            .unwrap(),
         );
 
         match result {
@@ -1443,9 +1519,12 @@ mod tests {
             &mut writer,
             b"abcdefabcdefabcdef",
             crate::table::block::BlockIdentity::for_test(0, 0, BlockType::Data),
-            CompressionType::Zstd(3),
-            None,
-            None,
+            &crate::table::block::BlockTransform::from_parts(
+                CompressionType::Zstd(3),
+                None,
+                #[cfg(zstd_any)]
+                None,
+            )?,
         )?;
 
         {
@@ -1457,9 +1536,12 @@ mod tests {
                     0,
                     crate::table::block::BlockType::Data,
                 ),
-                CompressionType::Zstd(3),
-                None,
-                None,
+                &crate::table::block::BlockTransform::from_parts(
+                    CompressionType::Zstd(3),
+                    None,
+                    #[cfg(zstd_any)]
+                    None,
+                )?,
             )?;
             assert_eq!(b"abcdefabcdefabcdef", &*block.data);
         }
@@ -1475,10 +1557,13 @@ mod tests {
             &mut sink,
             &oversized,
             crate::table::block::BlockIdentity::for_test(0, 0, BlockType::Data),
-            CompressionType::None,
-            None,
-            #[cfg(zstd_any)]
-            None,
+            &crate::table::block::BlockTransform::from_parts(
+                CompressionType::None,
+                None,
+                #[cfg(zstd_any)]
+                None,
+            )
+            .unwrap(),
         );
         assert!(
             matches!(result, Err(crate::Error::DecompressedSizeTooLarge { .. })),
@@ -1496,9 +1581,12 @@ mod tests {
             &mut writer,
             &data,
             crate::table::block::BlockIdentity::for_test(0, 0, BlockType::Data),
-            CompressionType::Zstd(3),
-            None,
-            None,
+            &crate::table::block::BlockTransform::from_parts(
+                CompressionType::Zstd(3),
+                None,
+                #[cfg(zstd_any)]
+                None,
+            )?,
         )?;
 
         // Verify compression actually reduced size
@@ -1516,9 +1604,12 @@ mod tests {
                     0,
                     crate::table::block::BlockType::Data,
                 ),
-                CompressionType::Zstd(3),
-                None,
-                None,
+                &crate::table::block::BlockTransform::from_parts(
+                    CompressionType::Zstd(3),
+                    None,
+                    #[cfg(zstd_any)]
+                    None,
+                )?,
             )?;
             assert_eq!(&*block.data, &data[..]);
         }
@@ -1551,10 +1642,12 @@ mod tests {
                 &mut writer,
                 data,
                 crate::table::block::BlockIdentity::for_test(0, 0, BlockType::Data),
-                CompressionType::None,
-                Some(&enc),
-                #[cfg(zstd_any)]
-                None,
+                &crate::table::block::BlockTransform::from_parts(
+                    CompressionType::None,
+                    Some(&enc),
+                    #[cfg(zstd_any)]
+                    None,
+                )?,
             )?;
 
             let mut reader = &writer[..];
@@ -1565,10 +1658,12 @@ mod tests {
                     0,
                     crate::table::block::BlockType::Data,
                 ),
-                CompressionType::None,
-                Some(&enc),
-                #[cfg(zstd_any)]
-                None,
+                &crate::table::block::BlockTransform::from_parts(
+                    CompressionType::None,
+                    Some(&enc),
+                    #[cfg(zstd_any)]
+                    None,
+                )?,
             )?;
             assert_eq!(data, &*block.data);
             Ok(())
@@ -1585,10 +1680,12 @@ mod tests {
                 &mut writer,
                 data,
                 crate::table::block::BlockIdentity::for_test(0, 0, BlockType::Data),
-                CompressionType::Lz4,
-                Some(&enc),
-                #[cfg(zstd_any)]
-                None,
+                &crate::table::block::BlockTransform::from_parts(
+                    CompressionType::Lz4,
+                    Some(&enc),
+                    #[cfg(zstd_any)]
+                    None,
+                )?,
             )?;
 
             let mut reader = &writer[..];
@@ -1599,10 +1696,12 @@ mod tests {
                     0,
                     crate::table::block::BlockType::Data,
                 ),
-                CompressionType::Lz4,
-                Some(&enc),
-                #[cfg(zstd_any)]
-                None,
+                &crate::table::block::BlockTransform::from_parts(
+                    CompressionType::Lz4,
+                    Some(&enc),
+                    #[cfg(zstd_any)]
+                    None,
+                )?,
             )?;
             assert_eq!(data, &*block.data);
             Ok(())
@@ -1619,10 +1718,12 @@ mod tests {
                 &mut writer,
                 data,
                 crate::table::block::BlockIdentity::for_test(0, 0, BlockType::Data),
-                CompressionType::Zstd(3),
-                Some(&enc),
-                #[cfg(zstd_any)]
-                None,
+                &crate::table::block::BlockTransform::from_parts(
+                    CompressionType::Zstd(3),
+                    Some(&enc),
+                    #[cfg(zstd_any)]
+                    None,
+                )?,
             )?;
 
             let mut reader = &writer[..];
@@ -1633,10 +1734,12 @@ mod tests {
                     0,
                     crate::table::block::BlockType::Data,
                 ),
-                CompressionType::Zstd(3),
-                Some(&enc),
-                #[cfg(zstd_any)]
-                None,
+                &crate::table::block::BlockTransform::from_parts(
+                    CompressionType::Zstd(3),
+                    Some(&enc),
+                    #[cfg(zstd_any)]
+                    None,
+                )?,
             )?;
             assert_eq!(data, &*block.data);
             Ok(())
@@ -1649,10 +1752,12 @@ mod tests {
             let tmp = super::write_block_to_tempfile(
                 data,
                 crate::table::block::BlockIdentity::for_test(0, 0, BlockType::Data),
-                CompressionType::None,
-                Some(&enc),
-                #[cfg(zstd_any)]
-                None,
+                &crate::table::block::BlockTransform::from_parts(
+                    CompressionType::None,
+                    Some(&enc),
+                    #[cfg(zstd_any)]
+                    None,
+                )?,
             )?;
             let block = Block::from_file(
                 &tmp.file,
@@ -1662,10 +1767,12 @@ mod tests {
                     0,
                     crate::table::block::BlockType::Data,
                 ),
-                CompressionType::None,
-                Some(&enc),
-                #[cfg(zstd_any)]
-                None,
+                &crate::table::block::BlockTransform::from_parts(
+                    CompressionType::None,
+                    Some(&enc),
+                    #[cfg(zstd_any)]
+                    None,
+                )?,
             )?;
             assert_eq!(data, &*block.data);
             Ok(())
@@ -1679,10 +1786,12 @@ mod tests {
             let tmp = super::write_block_to_tempfile(
                 data,
                 crate::table::block::BlockIdentity::for_test(0, 0, BlockType::Data),
-                CompressionType::Lz4,
-                Some(&enc),
-                #[cfg(zstd_any)]
-                None,
+                &crate::table::block::BlockTransform::from_parts(
+                    CompressionType::Lz4,
+                    Some(&enc),
+                    #[cfg(zstd_any)]
+                    None,
+                )?,
             )?;
             let block = Block::from_file(
                 &tmp.file,
@@ -1692,10 +1801,12 @@ mod tests {
                     0,
                     crate::table::block::BlockType::Data,
                 ),
-                CompressionType::Lz4,
-                Some(&enc),
-                #[cfg(zstd_any)]
-                None,
+                &crate::table::block::BlockTransform::from_parts(
+                    CompressionType::Lz4,
+                    Some(&enc),
+                    #[cfg(zstd_any)]
+                    None,
+                )?,
             )?;
             assert_eq!(data, &*block.data);
             Ok(())
@@ -1709,9 +1820,12 @@ mod tests {
             let tmp = super::write_block_to_tempfile(
                 data,
                 crate::table::block::BlockIdentity::for_test(0, 0, BlockType::Data),
-                CompressionType::Zstd(3),
-                Some(&enc),
-                None,
+                &crate::table::block::BlockTransform::from_parts(
+                    CompressionType::Zstd(3),
+                    Some(&enc),
+                    #[cfg(zstd_any)]
+                    None,
+                )?,
             )?;
             let block = Block::from_file(
                 &tmp.file,
@@ -1721,9 +1835,12 @@ mod tests {
                     0,
                     crate::table::block::BlockType::Data,
                 ),
-                CompressionType::Zstd(3),
-                Some(&enc),
-                None,
+                &crate::table::block::BlockTransform::from_parts(
+                    CompressionType::Zstd(3),
+                    Some(&enc),
+                    #[cfg(zstd_any)]
+                    None,
+                )?,
             )?;
             assert_eq!(data, &*block.data);
             Ok(())
@@ -1737,10 +1854,12 @@ mod tests {
             let tmp = super::write_block_to_tempfile(
                 data,
                 crate::table::block::BlockIdentity::for_test(0, 0, BlockType::Data),
-                CompressionType::None,
-                Some(&enc_write),
-                #[cfg(zstd_any)]
-                None,
+                &crate::table::block::BlockTransform::from_parts(
+                    CompressionType::None,
+                    Some(&enc_write),
+                    #[cfg(zstd_any)]
+                    None,
+                )?,
             )?;
             let result = Block::from_file(
                 &tmp.file,
@@ -1750,10 +1869,12 @@ mod tests {
                     0,
                     crate::table::block::BlockType::Data,
                 ),
-                CompressionType::None,
-                Some(&enc_read),
-                #[cfg(zstd_any)]
-                None,
+                &crate::table::block::BlockTransform::from_parts(
+                    CompressionType::None,
+                    Some(&enc_read),
+                    #[cfg(zstd_any)]
+                    None,
+                )?,
             );
             assert!(
                 matches!(result, Err(crate::Error::Decrypt(_))),
@@ -1774,10 +1895,12 @@ mod tests {
                 &mut writer,
                 data,
                 crate::table::block::BlockIdentity::for_test(0, 0, BlockType::Data),
-                CompressionType::None,
-                Some(&enc_write),
-                #[cfg(zstd_any)]
-                None,
+                &crate::table::block::BlockTransform::from_parts(
+                    CompressionType::None,
+                    Some(&enc_write),
+                    #[cfg(zstd_any)]
+                    None,
+                )?,
             )?;
 
             let mut reader = &writer[..];
@@ -1788,10 +1911,12 @@ mod tests {
                     0,
                     crate::table::block::BlockType::Data,
                 ),
-                CompressionType::None,
-                Some(&enc_read),
-                #[cfg(zstd_any)]
-                None,
+                &crate::table::block::BlockTransform::from_parts(
+                    CompressionType::None,
+                    Some(&enc_read),
+                    #[cfg(zstd_any)]
+                    None,
+                )?,
             );
             assert!(
                 matches!(result, Err(crate::Error::Decrypt(_))),
@@ -1812,10 +1937,12 @@ mod tests {
                 &mut buf,
                 data,
                 crate::table::block::BlockIdentity::for_test(0, 0, BlockType::Data),
-                CompressionType::None,
-                Some(&enc),
-                #[cfg(zstd_any)]
-                None,
+                &crate::table::block::BlockTransform::from_parts(
+                    CompressionType::None,
+                    Some(&enc),
+                    #[cfg(zstd_any)]
+                    None,
+                )?,
             )?;
 
             // Tamper a byte in the encrypted payload (after header)
@@ -1847,10 +1974,12 @@ mod tests {
                     0,
                     crate::table::block::BlockType::Data,
                 ),
-                CompressionType::None,
-                Some(&enc),
-                #[cfg(zstd_any)]
-                None,
+                &crate::table::block::BlockTransform::from_parts(
+                    CompressionType::None,
+                    Some(&enc),
+                    #[cfg(zstd_any)]
+                    None,
+                )?,
             );
             assert!(
                 matches!(result, Err(crate::Error::ChecksumMismatch { .. })),
@@ -1883,10 +2012,12 @@ mod tests {
                     0,
                     crate::table::block::BlockType::Data,
                 ),
-                CompressionType::None,
-                Some(&enc),
-                #[cfg(zstd_any)]
-                None,
+                &crate::table::block::BlockTransform::from_parts(
+                    CompressionType::None,
+                    Some(&enc),
+                    #[cfg(zstd_any)]
+                    None,
+                )?,
             );
 
             assert!(
@@ -1904,10 +2035,12 @@ mod tests {
             let tmp = super::write_block_to_tempfile(
                 &data,
                 crate::table::block::BlockIdentity::for_test(0, 0, BlockType::Data),
-                CompressionType::None,
-                Some(&enc),
-                #[cfg(zstd_any)]
-                None,
+                &crate::table::block::BlockTransform::from_parts(
+                    CompressionType::None,
+                    Some(&enc),
+                    #[cfg(zstd_any)]
+                    None,
+                )?,
             )?;
             let block = Block::from_file(
                 &tmp.file,
@@ -1917,10 +2050,12 @@ mod tests {
                     0,
                     crate::table::block::BlockType::Data,
                 ),
-                CompressionType::None,
-                Some(&enc),
-                #[cfg(zstd_any)]
-                None,
+                &crate::table::block::BlockTransform::from_parts(
+                    CompressionType::None,
+                    Some(&enc),
+                    #[cfg(zstd_any)]
+                    None,
+                )?,
             )?;
             assert_eq!(&*block.data, &data[..]);
             Ok(())
@@ -1936,10 +2071,12 @@ mod tests {
                 &mut writer,
                 &data,
                 crate::table::block::BlockIdentity::for_test(0, 0, BlockType::Data),
-                CompressionType::None,
-                Some(&enc),
-                #[cfg(zstd_any)]
-                None,
+                &crate::table::block::BlockTransform::from_parts(
+                    CompressionType::None,
+                    Some(&enc),
+                    #[cfg(zstd_any)]
+                    None,
+                )?,
             )?;
 
             let mut reader = &writer[..];
@@ -1950,10 +2087,12 @@ mod tests {
                     0,
                     crate::table::block::BlockType::Data,
                 ),
-                CompressionType::None,
-                Some(&enc),
-                #[cfg(zstd_any)]
-                None,
+                &crate::table::block::BlockTransform::from_parts(
+                    CompressionType::None,
+                    Some(&enc),
+                    #[cfg(zstd_any)]
+                    None,
+                )?,
             )?;
             assert_eq!(&*block.data, &data[..]);
             Ok(())
@@ -1970,10 +2109,12 @@ mod tests {
                 &mut writer,
                 &data,
                 crate::table::block::BlockIdentity::for_test(0, 0, BlockType::Data),
-                CompressionType::Lz4,
-                Some(&enc),
-                #[cfg(zstd_any)]
-                None,
+                &crate::table::block::BlockTransform::from_parts(
+                    CompressionType::Lz4,
+                    Some(&enc),
+                    #[cfg(zstd_any)]
+                    None,
+                )?,
             )?;
 
             let mut reader = &writer[..];
@@ -1984,10 +2125,12 @@ mod tests {
                     0,
                     crate::table::block::BlockType::Data,
                 ),
-                CompressionType::Lz4,
-                Some(&enc),
-                #[cfg(zstd_any)]
-                None,
+                &crate::table::block::BlockTransform::from_parts(
+                    CompressionType::Lz4,
+                    Some(&enc),
+                    #[cfg(zstd_any)]
+                    None,
+                )?,
             )?;
             assert_eq!(&*block.data, &data[..]);
             Ok(())
@@ -2004,10 +2147,12 @@ mod tests {
                 &mut writer,
                 &data,
                 crate::table::block::BlockIdentity::for_test(0, 0, BlockType::Data),
-                CompressionType::Zstd(3),
-                Some(&enc),
-                #[cfg(zstd_any)]
-                None,
+                &crate::table::block::BlockTransform::from_parts(
+                    CompressionType::Zstd(3),
+                    Some(&enc),
+                    #[cfg(zstd_any)]
+                    None,
+                )?,
             )?;
 
             let mut reader = &writer[..];
@@ -2018,10 +2163,12 @@ mod tests {
                     0,
                     crate::table::block::BlockType::Data,
                 ),
-                CompressionType::Zstd(3),
-                Some(&enc),
-                #[cfg(zstd_any)]
-                None,
+                &crate::table::block::BlockTransform::from_parts(
+                    CompressionType::Zstd(3),
+                    Some(&enc),
+                    #[cfg(zstd_any)]
+                    None,
+                )?,
             )?;
             assert_eq!(&*block.data, &data[..]);
             Ok(())
@@ -2060,9 +2207,12 @@ mod tests {
                 &mut writer,
                 data,
                 crate::table::block::BlockIdentity::for_test(0, 0, BlockType::Data),
-                compression,
-                None,
-                Some(&dict),
+                &crate::table::block::BlockTransform::from_parts(
+                    compression,
+                    None,
+                    #[cfg(zstd_any)]
+                    Some(&dict),
+                )?,
             )?;
 
             let mut reader = &writer[..];
@@ -2073,9 +2223,12 @@ mod tests {
                     0,
                     crate::table::block::BlockType::Data,
                 ),
-                compression,
-                None,
-                Some(&dict),
+                &crate::table::block::BlockTransform::from_parts(
+                    compression,
+                    None,
+                    #[cfg(zstd_any)]
+                    Some(&dict),
+                )?,
             )?;
             assert_eq!(data, &*block.data);
             Ok(())
@@ -2093,9 +2246,12 @@ mod tests {
                 &mut buf,
                 data,
                 crate::table::block::BlockIdentity::for_test(0, 0, BlockType::Data),
-                compression,
-                None,
-                Some(&dict),
+                &crate::table::block::BlockTransform::from_parts(
+                    compression,
+                    None,
+                    #[cfg(zstd_any)]
+                    Some(&dict),
+                )?,
             )?;
 
             let dir = tempfile::tempdir()?;
@@ -2118,9 +2274,12 @@ mod tests {
                     0,
                     crate::table::block::BlockType::Data,
                 ),
-                compression,
-                None,
-                Some(&dict),
+                &crate::table::block::BlockTransform::from_parts(
+                    compression,
+                    None,
+                    #[cfg(zstd_any)]
+                    Some(&dict),
+                )?,
             )?;
             assert_eq!(data, &*block.data);
             Ok(())
@@ -2137,9 +2296,12 @@ mod tests {
                 &mut writer,
                 &data,
                 crate::table::block::BlockIdentity::for_test(0, 0, BlockType::Data),
-                compression,
-                None,
-                Some(&dict),
+                &crate::table::block::BlockTransform::from_parts(
+                    compression,
+                    None,
+                    #[cfg(zstd_any)]
+                    Some(&dict),
+                )?,
             )?;
 
             assert!(
@@ -2155,78 +2317,36 @@ mod tests {
                     0,
                     crate::table::block::BlockType::Data,
                 ),
-                compression,
-                None,
-                Some(&dict),
+                &crate::table::block::BlockTransform::from_parts(
+                    compression,
+                    None,
+                    #[cfg(zstd_any)]
+                    Some(&dict),
+                )?,
             )?;
             assert_eq!(&*block.data, &data[..]);
             Ok(())
         }
 
         #[test]
-        fn block_zstd_dict_missing_returns_error() -> crate::Result<()> {
-            let dict = test_dict();
-            let compression = test_compression(&dict);
-            let mut sink = vec![];
-
-            // Write with dict
-            Block::write_into(
-                &mut sink,
-                b"hello",
-                crate::table::block::BlockIdentity::for_test(0, 0, BlockType::Data),
-                compression,
-                None,
-                Some(&dict),
-            )?;
-
-            // Read without dict → ZstdDictMismatch
-            let mut reader = &sink[..];
-            let result = Block::from_reader(
-                &mut reader,
-                crate::table::block::BlockIdentity::for_test(
-                    0,
-                    0,
-                    crate::table::block::BlockType::Data,
-                ),
-                compression,
-                None,
-                None,
-            );
-            assert!(
-                matches!(
-                    result,
-                    Err(crate::Error::ZstdDictMismatch { got: None, .. })
-                ),
-                "expected ZstdDictMismatch with got=None",
-            );
-            Ok(())
-        }
-
-        #[test]
-        fn block_zstd_dict_wrong_dict_returns_error() -> crate::Result<()> {
+        fn block_zstd_dict_wrong_dict_returns_error() {
+            // Companion test to
+            // `block_transform_from_parts_zstd_dict_missing_returns_error`
+            // (below): both assert the BlockTransform::from_parts
+            // check that used to live inside Block::write_into /
+            // from_reader for the ZstdDict codec. The dict-missing
+            // case exercises the `None` half of the dict argument;
+            // this one exercises the cross-check between the
+            // supplied dictionary id and the
+            // ZstdDict { dict_id } discriminator. Both assert
+            // directly on the transform-construction result; no
+            // Block I/O call is needed to exercise the mismatch
+            // path.
             let dict = test_dict();
             let compression = test_compression(&dict);
             let wrong_dict = ZstdDictionary::new(b"completely different dictionary bytes");
-            let mut sink = vec![];
 
-            // Write expects dict.id(), but we'll try reading with wrong_dict
-            Block::write_into(
-                &mut sink,
-                b"hello",
-                crate::table::block::BlockIdentity::for_test(0, 0, BlockType::Data),
-                compression,
-                None,
-                Some(&dict),
-            )?;
-
-            let mut reader = &sink[..];
-            let result = Block::from_reader(
-                &mut reader,
-                crate::table::block::BlockIdentity::for_test(
-                    0,
-                    0,
-                    crate::table::block::BlockType::Data,
-                ),
+            let result = crate::table::block::BlockTransform::from_parts(
                 compression,
                 None,
                 Some(&wrong_dict),
@@ -2238,30 +2358,40 @@ mod tests {
                 ),
                 "expected ZstdDictMismatch with got=Some",
             );
-            Ok(())
         }
 
         #[test]
-        fn block_write_zstd_dict_missing_returns_error() {
+        fn block_transform_from_parts_zstd_dict_missing_returns_error() {
+            // The runtime dict-presence check that used to live inside
+            // Block::write_into / from_reader for the ZstdDict codec
+            // is now centralised in BlockTransform::from_parts. The
+            // error therefore surfaces at transform-construction time
+            // instead of at the Block I/O call; this test verifies
+            // that earlier surface — it no longer exercises
+            // Block::write_into / from_reader at all, hence the test
+            // name describes from_parts rather than block_write_*.
+            // (See block_zstd_dict_wrong_dict_returns_error above for
+            // the matching "wrong dict id" path.)
             let dict = test_dict();
             let compression = test_compression(&dict);
-            let mut sink = std::io::sink();
 
-            // Write without providing dict → ZstdDictMismatch
-            let result = Block::write_into(
-                &mut sink,
-                b"hello",
-                crate::table::block::BlockIdentity::for_test(0, 0, BlockType::Data),
-                compression,
-                None,
-                None, // no dict
-            );
+            // Try to construct the read-side transform without
+            // providing the dict the codec needs.
+            let result = crate::table::block::BlockTransform::from_parts(compression, None, None);
+            // BlockTransform holds `&dyn EncryptionProvider` which
+            // doesn't impl Debug, so we can't print the whole result;
+            // surface just the Err side (which IS Debug) on mismatch.
+            // Match on `&result` + `.as_ref().err()` so the variant
+            // check and the formatter borrow the same value — no
+            // need to reason about whether the matches! patterns
+            // bind by value.
             assert!(
                 matches!(
-                    result,
+                    &result,
                     Err(crate::Error::ZstdDictMismatch { got: None, .. })
                 ),
-                "expected ZstdDictMismatch, got: {result:?}",
+                "expected ZstdDictMismatch, got: {:?}",
+                result.as_ref().err(),
             );
         }
 
@@ -2278,9 +2408,12 @@ mod tests {
                 &mut writer,
                 data,
                 crate::table::block::BlockIdentity::for_test(0, 0, BlockType::Data),
-                compression,
-                Some(&enc),
-                Some(&dict),
+                &crate::table::block::BlockTransform::from_parts(
+                    compression,
+                    Some(&enc),
+                    #[cfg(zstd_any)]
+                    Some(&dict),
+                )?,
             )?;
 
             let mut reader = &writer[..];
@@ -2291,9 +2424,12 @@ mod tests {
                     0,
                     crate::table::block::BlockType::Data,
                 ),
-                compression,
-                Some(&enc),
-                Some(&dict),
+                &crate::table::block::BlockTransform::from_parts(
+                    compression,
+                    Some(&enc),
+                    #[cfg(zstd_any)]
+                    Some(&dict),
+                )?,
             )?;
             assert_eq!(data, &*block.data);
             Ok(())
@@ -2313,9 +2449,12 @@ mod tests {
                 &mut buf,
                 &data,
                 crate::table::block::BlockIdentity::for_test(0, 0, BlockType::Data),
-                compression,
-                Some(&enc),
-                Some(&dict),
+                &crate::table::block::BlockTransform::from_parts(
+                    compression,
+                    Some(&enc),
+                    #[cfg(zstd_any)]
+                    Some(&dict),
+                )?,
             )?;
 
             let dir = tempfile::tempdir()?;
@@ -2338,9 +2477,12 @@ mod tests {
                     0,
                     crate::table::block::BlockType::Data,
                 ),
-                compression,
-                Some(&enc),
-                Some(&dict),
+                &crate::table::block::BlockTransform::from_parts(
+                    compression,
+                    Some(&enc),
+                    #[cfg(zstd_any)]
+                    Some(&dict),
+                )?,
             )?;
             assert_eq!(&*block.data, &data[..]);
             Ok(())

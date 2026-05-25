@@ -951,10 +951,12 @@ impl Table {
                 dict_id: 0,
                 window_log: 0,
             },
-            compression,
-            encryption,
-            #[cfg(zstd_any)]
-            None,
+            &crate::table::block::BlockTransform::from_parts(
+                compression,
+                encryption,
+                #[cfg(zstd_any)]
+                None,
+            )?,
         )?;
 
         if block.header.block_type != BlockType::Index {
@@ -1149,10 +1151,12 @@ impl Table {
                     dict_id: 0,
                     window_log: 0,
                 },
-                metadata.index_block_compression,
-                encryption.as_deref(),
-                #[cfg(zstd_any)]
-                None,
+                &crate::table::block::BlockTransform::from_parts(
+                    metadata.index_block_compression,
+                    encryption.as_deref(),
+                    #[cfg(zstd_any)]
+                    None,
+                )?,
             )?;
             if block.header.block_type != BlockType::Index {
                 return Err(crate::Error::InvalidTag((
@@ -1189,10 +1193,13 @@ impl Table {
                             dict_id: 0,
                             window_log: 0,
                         },
-                        crate::CompressionType::None, // NOTE: We never write a filter block with compression
-                        encryption.as_deref(),
-                        #[cfg(zstd_any)]
-                        None,
+                        // Filter blocks are never written compressed,
+                        // so the transform is Plain or Encrypted
+                        // depending on whether the table is keyed.
+                        &match encryption.as_deref() {
+                            Some(enc) => crate::table::block::BlockTransform::Encrypted(enc),
+                            None => crate::table::block::BlockTransform::PLAIN,
+                        },
                     )
                     .and_then(|block| {
                         if block.header.block_type == BlockType::Filter {
@@ -1226,10 +1233,13 @@ impl Table {
                     dict_id: 0,
                     window_log: 0,
                 },
-                crate::CompressionType::None,
-                encryption.as_deref(),
-                #[cfg(zstd_any)]
-                None,
+                // Range-tombstone blocks are always uncompressed; the
+                // transform is Plain or Encrypted depending on whether
+                // the table is keyed.
+                &match encryption.as_deref() {
+                    Some(enc) => crate::table::block::BlockTransform::Encrypted(enc),
+                    None => crate::table::block::BlockTransform::PLAIN,
+                },
             )?;
 
             if block.header.block_type != BlockType::RangeTombstone {
