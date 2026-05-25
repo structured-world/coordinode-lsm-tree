@@ -6,8 +6,11 @@
 //! filter-stats` against it and check the printed metrics.
 
 use lsm_tree::{
-    AbstractTree, Config, SequenceNumberCounter, compression::CompressionType,
-    config::CompressionPolicy,
+    AbstractTree, Config, SequenceNumberCounter,
+    compression::CompressionType,
+    config::{
+        BloomConstructionPolicy, CompressionPolicy, FilterPolicy, FilterPolicyEntry, PinningPolicy,
+    },
 };
 use std::process::Command;
 
@@ -15,12 +18,22 @@ const SST_DUMP_BIN: &str = env!("CARGO_BIN_EXE_sst-dump");
 
 fn build_one_sst(item_count: u64) -> (tempfile::TempDir, std::path::PathBuf) {
     let dir = tempfile::tempdir().expect("tempdir");
+    // Pin the filter policy explicitly instead of relying on the
+    // crate's default. The default ships with BuRR-on-every-level
+    // today, but a future refactor (default tweak, level-0 carve-out,
+    // dynamic policy) could turn filters off for the level our
+    // single-flush SST lands in, and this test would then fail for
+    // reasons unrelated to filter-stats itself. Explicit pin keeps
+    // the smoke test stable.
     let tree = Config::new(
         dir.path(),
         SequenceNumberCounter::default(),
         SequenceNumberCounter::default(),
     )
     .data_block_compression_policy(CompressionPolicy::all(CompressionType::None))
+    .filter_policy(FilterPolicy::all(FilterPolicyEntry::Bloom(
+        BloomConstructionPolicy::BitsPerKey(10.0),
+    )))
     .open()
     .expect("open tree");
 
@@ -97,6 +110,82 @@ fn filter_stats_prints_expected_fields() {
         .and_then(|s| s.parse().ok())
         .expect("bits_per_key parses as float");
     assert!(bpk > 0.0, "expected bits_per_key > 0; got {bpk}");
+}
+
+#[test]
+fn filter_stats_rejects_partitioned_filter_with_not_supported_message() {
+    // Build an SST with the filter partitioning policy turned on for
+    // every level. The writer emits both `filter` and `filter_tli`
+    // SFA sections, which is exactly the layout this subcommand
+    // refuses to handle today (the partitioned `filter` section is a
+    // concatenation of per-partition BuRR payloads, not a single
+    // parseable wire buffer).
+    let dir = tempfile::tempdir().expect("tempdir");
+    let tree = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .data_block_compression_policy(CompressionPolicy::all(CompressionType::None))
+    .filter_policy(FilterPolicy::all(FilterPolicyEntry::Bloom(
+        BloomConstructionPolicy::BitsPerKey(10.0),
+    )))
+    .filter_block_partitioning_policy(PinningPolicy::all(true))
+    .open()
+    .expect("open tree");
+
+    // Enough keys to actually produce multiple filter partitions:
+    // a tiny SST with one partition collapses back to the full case
+    // on some configurations.
+    for i in 0..2048u64 {
+        tree.insert(format!("key-{i:06}"), format!("value-{i}"), 1 + i);
+    }
+    tree.flush_active_memtable(0).expect("flush");
+    drop(tree);
+
+    let tables = dir.path().join("tables");
+    let sst = std::fs::read_dir(&tables)
+        .expect("tables dir")
+        .filter_map(Result::ok)
+        .find(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
+        .expect("at least one SST")
+        .path();
+
+    // Sanity-check the on-disk shape before driving the CLI: if the
+    // writer didn't actually emit `filter_tli` for this fixture
+    // (e.g. because the keyset shrank below the partitioning
+    // threshold on some platform), the assertions below would test
+    // the wrong code path.
+    let has_filter_tli = {
+        let mut file = std::fs::File::open(&sst).expect("open sst for toc inspection");
+        let reader = sfa::Reader::from_reader(&mut file).expect("sfa trailer parse");
+        reader.toc().section(b"filter_tli").is_some()
+    };
+    assert!(
+        has_filter_tli,
+        "test fixture must produce a `filter_tli` section; \
+         filter partitioning policy may have failed to take effect",
+    );
+
+    let out = Command::new(SST_DUMP_BIN)
+        .arg(&sst)
+        .arg("filter-stats")
+        .output()
+        .expect("spawn sst-dump");
+
+    assert!(
+        !out.status.success(),
+        "expected non-zero exit on partitioned-filter SST; got success",
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("not supported"),
+        "expected `not supported` in stderr; got:\n{stderr}",
+    );
+    assert!(
+        stderr.contains("filter_tli"),
+        "expected error message to name `filter_tli` so operators can confirm; got:\n{stderr}",
+    );
 }
 
 #[test]
