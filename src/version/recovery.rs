@@ -357,8 +357,16 @@ pub fn recover(folder: &Path, fs: &dyn Fs, mode: ManifestRecoveryMode) -> crate:
                             let recovered = u32::try_from(run.len()).unwrap_or(u32::MAX);
                             tables_dropped_to_tail = tables_dropped_to_tail
                                 .saturating_add(table_count.saturating_sub(recovered));
-                            level.push(run);
-                            levels.push(level);
+                            // Skip empty run / empty level: Version::from_recovery
+                            // requires non-empty runs (Run::new returns None on empty
+                            // input and downstream .expect() panics). When corruption
+                            // hits the FIRST record of a run, `run` is empty here.
+                            if !run.is_empty() {
+                                level.push(run);
+                            }
+                            if !level.is_empty() {
+                                levels.push(level);
+                            }
                             break 'levels;
                         }
                         FramedRecordOutcome::ChecksumMismatch { bytes_consumed, .. }
@@ -407,9 +415,17 @@ pub fn recover(folder: &Path, fs: &dyn Fs, mode: ManifestRecoveryMode) -> crate:
                             // accept-the-prefix half of the PIT
                             // contract — see the ManifestRecoveryMode
                             // docstring and README for the
-                            // user-visible description.
-                            level.push(run);
-                            levels.push(level);
+                            // user-visible description. Skip if empty:
+                            // when the corrupt record is the FIRST of
+                            // the run, the pre-corruption prefix here
+                            // is the empty set, and Version::from_recovery
+                            // would panic on Run::new(empty).
+                            if !run.is_empty() {
+                                level.push(run);
+                            }
+                            if !level.is_empty() {
+                                levels.push(level);
+                            }
                             break 'levels;
                         }
                         FramedRecordOutcome::ChecksumMismatch { expected, got, .. } => {
@@ -432,8 +448,15 @@ pub fn recover(folder: &Path, fs: &dyn Fs, mode: ManifestRecoveryMode) -> crate:
                             let recovered = u32::try_from(run.len()).unwrap_or(u32::MAX);
                             tables_dropped_to_corruption = tables_dropped_to_corruption
                                 .saturating_add(table_count.saturating_sub(recovered));
-                            level.push(run);
-                            levels.push(level);
+                            // Skip empty run / level for the same reason
+                            // as the other early-exit arms — see comment
+                            // above on the TailTruncation arm.
+                            if !run.is_empty() {
+                                level.push(run);
+                            }
+                            if !level.is_empty() {
+                                levels.push(level);
+                            }
                             break 'levels;
                         }
                         // Strict mode: distinguish "writer crashed
@@ -1506,7 +1529,7 @@ mod tests {
 
     /// Builds a manifest where level 0 has one good record but level 1's
     /// FIRST table record carries a corrupt XXH3 digest. With PIT or
-    /// SkipAny + BadHeader handling, the early-exit branches push the
+    /// `SkipAny` + `BadHeader` handling, the early-exit branches push the
     /// (empty) in-progress run into the level — and the (empty) level
     /// into the levels vec — before breaking out. The recovered
     /// `Recovery` then carries an empty run, which `Version::from_recovery`
@@ -1554,7 +1577,7 @@ mod tests {
         Ok(())
     }
 
-    /// Regression test for CodeRabbit finding on PR #342: tolerant/PIT
+    /// Regression test for review finding on PR #342: tolerant/PIT
     /// early-exit branches push the in-progress `run` into the current
     /// `level` regardless of whether the run is empty, and push the
     /// `level` regardless of whether it has any runs. When the FIRST
