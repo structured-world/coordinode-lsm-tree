@@ -235,6 +235,69 @@ fn dump_rejects_partitioned_index_sst_with_unsupported_error() {
 }
 
 #[test]
+fn dump_annotates_tombstone_entries_with_suffix() {
+    // Build an SST with a mix of regular values and tombstones, then
+    // confirm `sst-dump dump` emits the `# tombstone` suffix on the
+    // tombstone lines (and only those). Catches regressions where
+    // the per-variant ValueType branch loses the suffix annotation.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let tree = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .data_block_compression_policy(CompressionPolicy::all(CompressionType::None))
+    .open()
+    .expect("open tree");
+
+    tree.insert("alive", "live-value", 1);
+    // `remove` writes a strong tombstone (ValueType::Tombstone).
+    tree.remove("dead", 2);
+    tree.flush_active_memtable(0).expect("flush");
+    drop(tree);
+
+    let tables = dir.path().join("tables");
+    let sst = std::fs::read_dir(&tables)
+        .expect("tables dir")
+        .filter_map(Result::ok)
+        .find(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
+        .expect("at least one SST")
+        .path();
+
+    let out = Command::new(SST_DUMP_BIN)
+        .arg(&sst)
+        .arg("dump")
+        .output()
+        .expect("spawn sst-dump");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "expected exit 0; stdout:\n{stdout}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stderr),
+    );
+
+    let lines: Vec<&str> = stdout.lines().collect();
+    let alive_line = lines
+        .iter()
+        .find(|l| l.starts_with(r#""alive""#))
+        .expect("alive entry");
+    let dead_line = lines
+        .iter()
+        .find(|l| l.starts_with(r#""dead""#))
+        .expect("dead entry");
+
+    assert!(
+        !alive_line.contains("# tombstone"),
+        "non-tombstone entry must NOT carry a tombstone suffix; got: {alive_line}",
+    );
+    assert!(
+        dead_line.contains("# tombstone"),
+        "tombstone entry MUST carry a `# tombstone` suffix; got: {dead_line}",
+    );
+}
+
+#[test]
 fn dump_fails_on_missing_file() {
     let bogus = tempfile::tempdir().expect("tempdir");
     let nonexistent = bogus.path().join("does-not-exist");
