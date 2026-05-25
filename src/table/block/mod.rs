@@ -2391,6 +2391,15 @@ mod tests {
             // BlockTransform holds `&dyn EncryptionProvider` which
             // doesn't impl Debug, so we can't print the whole result;
             // surface just the Err side (which IS Debug) on mismatch.
+            //
+            // Re `matches!(result, ...)` then `result.err()`: the
+            // patterns inside the `matches!` arm destructure but
+            // bind nothing (`got: None, ..`), and the `_` arm binds
+            // nothing either. A `match` whose patterns bind no
+            // variables by value does not move the scrutinee, so
+            // `result` is still owned afterwards and `result.err()`
+            // moves into `.err()` as usual. Verified by `cargo check
+            // --tests --all-features` on this branch.
             assert!(
                 matches!(
                     result,
