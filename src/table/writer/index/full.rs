@@ -6,10 +6,7 @@ use crate::{
     CompressionType,
     checksum::ChecksummedWriter,
     encryption::EncryptionProvider,
-    table::{
-        Block, IndexBlock, block::Header as BlockHeader, index_block::KeyedBlockHandle,
-        writer::index::BlockIndexWriter,
-    },
+    table::{Block, IndexBlock, index_block::KeyedBlockHandle, writer::index::BlockIndexWriter},
 };
 use std::sync::Arc;
 
@@ -124,11 +121,7 @@ impl<W: std::io::Write + std::io::Seek> BlockIndexWriter<W> for FullIndexWriter 
             )?,
         )?;
 
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "blocks never even approach u32 size"
-        )]
-        let bytes_written = BlockHeader::serialized_len() as u32 + header.data_length;
+        let bytes_written = header.on_disk_size();
 
         debug_assert!(bytes_written > 0, "Block index should never be empty");
 

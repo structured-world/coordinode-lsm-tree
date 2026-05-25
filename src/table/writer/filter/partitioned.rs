@@ -11,7 +11,7 @@ use crate::{
     prefix::PrefixExtractor,
     table::{
         Block, BlockHandle, BlockOffset, IndexBlock, KeyedBlockHandle,
-        block::Header as BlockHeader, filter::build_burr_filter_bytes,
+        filter::build_burr_filter_bytes,
     },
 };
 use std::{
@@ -128,11 +128,7 @@ impl PartitionedFilterWriter {
             },
         )?;
 
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "data length never gets even close to 4 GiB"
-        )]
-        let bytes_written = (header.data_length as usize + BlockHeader::serialized_len()) as u32;
+        let bytes_written = header.on_disk_size();
 
         self.tli_handles.push(KeyedBlockHandle::new(
             key.clone(),
@@ -188,11 +184,7 @@ impl PartitionedFilterWriter {
             )?,
         )?;
 
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "blocks never even approach u32 size"
-        )]
-        let bytes_written = BlockHeader::serialized_len() as u32 + header.data_length;
+        let bytes_written = header.on_disk_size();
 
         debug_assert!(bytes_written > 0, "Top level index should never be empty");
 

@@ -86,6 +86,27 @@ impl Header {
             // Checksum
             + std::mem::size_of::<u32>()
     }
+
+    /// Total bytes this block occupies on disk: header + payload +
+    /// optional ECC parity trailer. Use this when computing block
+    /// handles instead of manually summing `serialized_len() +
+    /// data_length` — that older form silently underflows the
+    /// on-disk size when `ecc_length > 0`.
+    #[must_use]
+    pub fn on_disk_size(&self) -> u32 {
+        // serialized_len is a small constant (28 bytes); cast to
+        // u32 is safe by construction. data_length + ecc_length
+        // is already bounded by the writer's MAX_DECOMPRESSION_SIZE
+        // checks, well within u32.
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "Header::serialized_len() is a small const"
+        )]
+        let header = Self::serialized_len() as u32;
+        header
+            .saturating_add(self.data_length)
+            .saturating_add(self.ecc_length)
+    }
 }
 
 impl Encode for Header {

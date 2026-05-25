@@ -6,10 +6,7 @@ mod filter;
 mod index;
 mod meta;
 
-use super::{
-    Block, BlockOffset, DataBlock, KeyedBlockHandle, block::Header as BlockHeader,
-    filter::BloomConstructionPolicy,
-};
+use super::{Block, BlockOffset, DataBlock, KeyedBlockHandle, filter::BloomConstructionPolicy};
 use crate::{
     Checksum, CompressionType, InternalValue, TableId, UserKey, ValueType,
     checksum::{ChecksumType, ChecksummedWriter},
@@ -465,11 +462,7 @@ impl Writer {
 
         self.meta.uncompressed_size += u64::from(header.uncompressed_length);
 
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "block header is a couple of bytes only, so cast is fine"
-        )]
-        let bytes_written = BlockHeader::serialized_len() as u32 + header.data_length;
+        let bytes_written = header.on_disk_size();
 
         self.index_writer
             .register_data_block(KeyedBlockHandle::new(

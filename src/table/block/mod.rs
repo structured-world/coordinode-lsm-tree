@@ -63,6 +63,88 @@ impl Block {
         self.data.len()
     }
 
+    /// Reads `data_length` payload bytes, then `ecc_length` parity
+    /// bytes (when non-zero), verifies the payload checksum against
+    /// `expected`, and on mismatch attempts Reed-Solomon recovery
+    /// from the parity trailer. Returns the validated payload bytes
+    /// (recovered if needed).
+    ///
+    /// Always consumes exactly `data_length + ecc_length` bytes from
+    /// the reader, so callers don't have to track the trailer
+    /// independently. When ECC recovery succeeds, the original
+    /// checksum-mismatch is logged at WARN level — the block is
+    /// returned to the caller as if no corruption ever happened.
+    fn read_payload_and_verify<R: std::io::Read>(
+        reader: &mut R,
+        data_length: u32,
+        ecc_length: u32,
+        expected: Checksum,
+    ) -> crate::Result<Vec<u8>> {
+        let mut data = vec![0u8; data_length as usize];
+        reader.read_exact(&mut data)?;
+
+        let computed = Checksum::from_raw(crate::hash::hash128(&data));
+
+        if ecc_length == 0 {
+            computed.check(expected).inspect_err(|_| {
+                log::error!(
+                    "Checksum mismatch for block payload, got={computed}, expected={expected}",
+                );
+            })?;
+            return Ok(data);
+        }
+
+        // ECC trailer present — always consume the parity bytes so
+        // the reader cursor lands on the next block's header even
+        // when the happy path doesn't need them.
+        let mut parity = vec![0u8; ecc_length as usize];
+        reader.read_exact(&mut parity)?;
+
+        if computed == expected {
+            return Ok(data);
+        }
+
+        // Mismatch — try Reed-Solomon recovery before failing.
+        #[cfg(feature = "page_ecc")]
+        {
+            let expected_raw = expected.into_u128();
+            if let Some(recovered) = crate::ecc::try_recover(&data, &parity, data.len(), |buf| {
+                crate::hash::hash128(buf) == expected_raw
+            })? {
+                log::warn!(
+                    "recovered block from RS parity after checksum mismatch \
+                     (data_len={}, ecc_len={ecc_length})",
+                    data.len(),
+                );
+                return Ok(recovered);
+            }
+            log::error!(
+                "Checksum mismatch on ECC-protected block, recovery failed, \
+                 got={computed}, expected={expected}",
+            );
+            Err(crate::Error::PageEccUnrecoverable {
+                got: computed,
+                expected,
+            })
+        }
+
+        #[cfg(not(feature = "page_ecc"))]
+        {
+            // Block has an ECC trailer but this build can't use it.
+            // Discard the parity buffer explicitly so the compiler
+            // sees the use.
+            let _ = parity;
+            log::error!(
+                "block has ECC trailer (ecc_length={ecc_length}) but this \
+                 build lacks the page_ecc feature — cannot attempt recovery; \
+                 got={computed}, expected={expected}",
+            );
+            computed.check(expected)?;
+            // checksum.check returns Err on mismatch — unreachable.
+            Err(crate::Error::Unrecoverable)
+        }
+    }
+
     /// Encodes a block into a writer.
     ///
     /// Pipeline: raw data → compress → encrypt → checksum → write. The
@@ -80,6 +162,12 @@ impl Block {
     /// the mismatch before the call reaches `write_into`, so the
     /// guard is unreachable from any in-tree caller and exists purely
     /// as a "should-never-fire" assertion.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "linear writer pipeline: compress → encrypt → checksum → ecc; \
+                  each step is small but they share state (header, payload, owned buffers) \
+                  so factoring would just hide the data flow"
+    )]
     pub fn write_into<W: std::io::Write>(
         mut writer: &mut W,
         data: &[u8],
@@ -226,13 +314,44 @@ impl Block {
         header.data_length = payload_len;
         header.checksum = Checksum::from_raw(crate::hash::hash128(payload));
 
+        // Optional Reed-Solomon parity trailer. Computed BEFORE
+        // encode_into so header.ecc_length lands in the header
+        // bytes the reader parses. On builds without the page_ecc
+        // feature, transform.page_ecc() is a constant `false`
+        // (the Ecc variants of BlockTransform don't exist), so the
+        // entire branch is dead and the compiler folds it out.
+        #[cfg(feature = "page_ecc")]
+        let parity_buf: Option<Vec<u8>> = if transform.page_ecc() {
+            let p = crate::ecc::encode_parity(payload)?;
+            // parity_len is shard_bytes * RS_PARITY_SHARDS where
+            // shard_bytes <= payload.len(). payload_len fits in
+            // u32 (checked above), so parity_len fits in u32 too,
+            // but the explicit try_from keeps the truncation
+            // path typed rather than implicit.
+            let p_len =
+                u32::try_from(p.len()).map_err(|_| crate::Error::DecompressedSizeTooLarge {
+                    declared: p.len() as u64,
+                    limit: u64::from(u32::MAX),
+                })?;
+            header.ecc_length = p_len;
+            Some(p)
+        } else {
+            None
+        };
+        #[cfg(not(feature = "page_ecc"))]
+        let parity_buf: Option<Vec<u8>> = None;
+
         header.encode_into(&mut writer)?;
         writer.write_all(payload)?;
+        if let Some(parity) = &parity_buf {
+            writer.write_all(parity)?;
+        }
 
         log::trace!(
-            "Writing block with size {}B (on-disk: {}B) (excluding header of {}B)",
+            "Writing block with size {}B (on-disk: {}B, ecc: {}B) (excluding header of {}B)",
             header.uncompressed_length,
             header.data_length,
+            header.ecc_length,
             Header::serialized_len(),
         );
 
@@ -304,17 +423,14 @@ impl Block {
         // When no encryption, read into a Slice which may use optimized
         // reference-counted storage.
         let data = if let Some(enc) = encryption {
-            let mut raw_vec = vec![0u8; header.data_length as usize];
-            reader.read_exact(&mut raw_vec)?;
-
-            let checksum = Checksum::from_raw(crate::hash::hash128(&raw_vec));
-            checksum.check(header.checksum).inspect_err(|_| {
-                log::error!(
-                    "Checksum mismatch for <bufreader>, got={}, expected={}",
-                    checksum,
-                    header.checksum,
-                );
-            })?;
+            // Read payload + optional ECC trailer, verify checksum
+            // (with recovery on mismatch when parity is present).
+            let raw_vec = Self::read_payload_and_verify(
+                reader,
+                header.data_length,
+                header.ecc_length,
+                header.checksum,
+            )?;
 
             // Decrypt in-place, reusing the read buffer.
             let decrypted = enc.decrypt_vec(raw_vec)?;
@@ -391,16 +507,28 @@ impl Block {
                 }
             }
         } else {
-            let raw_data = Slice::from_reader(reader, header.data_length as usize)?;
-
-            let checksum = Checksum::from_raw(crate::hash::hash128(&raw_data));
-            checksum.check(header.checksum).inspect_err(|_| {
-                log::error!(
-                    "Checksum mismatch for <bufreader>, got={}, expected={}",
-                    checksum,
+            // Zero-copy fast path for non-ECC blocks (the v0..v5
+            // legacy shape); ECC blocks go through the Vec-allocating
+            // recovery-capable helper instead.
+            let raw_data = if header.ecc_length == 0 {
+                let s = Slice::from_reader(reader, header.data_length as usize)?;
+                let checksum = Checksum::from_raw(crate::hash::hash128(&s));
+                checksum.check(header.checksum).inspect_err(|_| {
+                    log::error!(
+                        "Checksum mismatch for <bufreader>, got={}, expected={}",
+                        checksum,
+                        header.checksum,
+                    );
+                })?;
+                s
+            } else {
+                Slice::from(Self::read_payload_and_verify(
+                    reader,
+                    header.data_length,
+                    header.ecc_length,
                     header.checksum,
-                );
-            })?;
+                )?)
+            };
 
             match compression {
                 CompressionType::None => {
@@ -552,10 +680,13 @@ impl Block {
             )]
             let parsed_header = Header::decode_from(&mut &buf[..header_len])?;
 
-            let actual_data_len = block_size.saturating_sub(header_len);
-            if parsed_header.data_length as usize != actual_data_len {
+            let actual_payload_plus_ecc = block_size.saturating_sub(header_len);
+            let expected_payload_plus_ecc =
+                parsed_header.data_length as usize + parsed_header.ecc_length as usize;
+            if expected_payload_plus_ecc != actual_payload_plus_ecc {
                 return Err(crate::Error::InvalidHeader("Block"));
             }
+            let actual_data_len = parsed_header.data_length as usize;
 
             if parsed_header.uncompressed_length > MAX_DECOMPRESSION_SIZE {
                 return Err(crate::Error::DecompressedSizeTooLarge {
@@ -564,20 +695,34 @@ impl Block {
                 });
             }
 
-            // Checksum covers the on-disk payload (after header).
-            #[expect(clippy::indexing_slicing, reason = "header was decoded from buf")]
-            let checksum = Checksum::from_raw(crate::hash::hash128(&buf[header_len..]));
-            checksum.check(parsed_header.checksum).inspect_err(|_| {
-                log::error!(
-                    "Checksum mismatch for block {handle:?}, got={}, expected={}",
-                    checksum,
+            // ECC fast path: no parity trailer → existing in-buffer
+            // checksum check + decrypt_vec. With parity, run the
+            // shared helper against a cursor over the post-header
+            // bytes so recovery is available on mismatch.
+            let buf = if parsed_header.ecc_length == 0 {
+                #[expect(clippy::indexing_slicing, reason = "header was decoded from buf")]
+                let checksum = Checksum::from_raw(crate::hash::hash128(&buf[header_len..]));
+                checksum.check(parsed_header.checksum).inspect_err(|_| {
+                    log::error!(
+                        "Checksum mismatch for block {handle:?}, got={}, expected={}",
+                        checksum,
+                        parsed_header.checksum,
+                    );
+                })?;
+                // Strip header prefix so buf contains only the payload.
+                buf.copy_within(header_len.., 0);
+                buf.truncate(actual_data_len);
+                buf
+            } else {
+                #[expect(clippy::indexing_slicing, reason = "header was decoded from buf")]
+                let mut cursor = std::io::Cursor::new(&buf[header_len..]);
+                Self::read_payload_and_verify(
+                    &mut cursor,
+                    parsed_header.data_length,
+                    parsed_header.ecc_length,
                     parsed_header.checksum,
-                );
-            })?;
-
-            // Strip header prefix so buf contains only the payload.
-            buf.copy_within(header_len.., 0);
-            buf.truncate(actual_data_len);
+                )?
+            };
 
             let decrypted = enc.decrypt_vec(buf)?;
 
@@ -660,8 +805,10 @@ impl Block {
 
             let parsed_header = Header::decode_from(&mut &buf[..])?;
 
-            let actual_data_len = buf.len().saturating_sub(Header::serialized_len());
-            if parsed_header.data_length as usize != actual_data_len {
+            let actual_payload_plus_ecc = buf.len().saturating_sub(Header::serialized_len());
+            let expected_payload_plus_ecc =
+                parsed_header.data_length as usize + parsed_header.ecc_length as usize;
+            if expected_payload_plus_ecc != actual_payload_plus_ecc {
                 return Err(crate::Error::InvalidHeader("Block"));
             }
 
@@ -672,39 +819,50 @@ impl Block {
                 });
             }
 
-            #[expect(clippy::indexing_slicing, reason = "header was decoded from buf")]
-            let checksum =
-                Checksum::from_raw(crate::hash::hash128(&buf[Header::serialized_len()..]));
-
-            checksum.check(parsed_header.checksum).inspect_err(|_| {
-                log::error!(
-                    "Checksum mismatch for block {handle:?}, got={}, expected={}",
-                    checksum,
+            // Zero-copy fast path for non-ECC blocks; ECC blocks go
+            // through the recovery-capable helper (which copies the
+            // verified bytes out of `buf`).
+            let payload_slice: Slice = if parsed_header.ecc_length == 0 {
+                #[expect(clippy::indexing_slicing, reason = "header was decoded from buf")]
+                let checksum =
+                    Checksum::from_raw(crate::hash::hash128(&buf[Header::serialized_len()..]));
+                checksum.check(parsed_header.checksum).inspect_err(|_| {
+                    log::error!(
+                        "Checksum mismatch for block {handle:?}, got={}, expected={}",
+                        checksum,
+                        parsed_header.checksum,
+                    );
+                })?;
+                buf.slice(Header::serialized_len()..)
+            } else {
+                #[expect(clippy::indexing_slicing, reason = "header was decoded from buf")]
+                let mut cursor = std::io::Cursor::new(&buf[Header::serialized_len()..]);
+                Slice::from(Self::read_payload_and_verify(
+                    &mut cursor,
+                    parsed_header.data_length,
+                    parsed_header.ecc_length,
                     parsed_header.checksum,
-                );
-            })?;
+                )?)
+            };
 
             let data = match compression {
                 CompressionType::None => {
-                    let value = buf.slice(Header::serialized_len()..);
-
                     #[expect(
                         clippy::cast_possible_truncation,
                         reason = "values are u32 length max"
                     )]
-                    let actual_len = value.len() as u32;
+                    let actual_len = payload_slice.len() as u32;
 
                     if parsed_header.uncompressed_length != actual_len {
                         return Err(crate::Error::InvalidHeader("Block"));
                     }
 
-                    value
+                    payload_slice
                 }
 
                 #[cfg(feature = "lz4")]
                 CompressionType::Lz4 => {
-                    #[expect(clippy::indexing_slicing, reason = "header was decoded from buf")]
-                    let compressed_data = &buf[Header::serialized_len()..];
+                    let compressed_data: &[u8] = &payload_slice;
 
                     let mut decompressed = vec![0u8; parsed_header.uncompressed_length as usize];
 
@@ -721,8 +879,7 @@ impl Block {
 
                 #[cfg(zstd_any)]
                 CompressionType::Zstd(_) => {
-                    #[expect(clippy::indexing_slicing, reason = "header was decoded from buf")]
-                    let compressed_data = &buf[Header::serialized_len()..];
+                    let compressed_data: &[u8] = &payload_slice;
 
                     let decompressed = crate::compression::ZstdBackend::decompress(
                         compressed_data,
@@ -739,8 +896,7 @@ impl Block {
 
                 #[cfg(zstd_any)]
                 CompressionType::ZstdDict { dict_id, .. } => {
-                    #[expect(clippy::indexing_slicing, reason = "header was decoded from buf")]
-                    let compressed_data = &buf[Header::serialized_len()..];
+                    let compressed_data: &[u8] = &payload_slice;
 
                     let dict = zstd_dict.ok_or(crate::Error::ZstdDictMismatch {
                         expected: dict_id,

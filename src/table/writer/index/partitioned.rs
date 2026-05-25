@@ -7,8 +7,8 @@ use crate::{
     checksum::ChecksummedWriter,
     encryption::EncryptionProvider,
     table::{
-        Block, BlockHandle, BlockOffset, IndexBlock, block::Header as BlockHeader,
-        index_block::KeyedBlockHandle, writer::index::BlockIndexWriter,
+        Block, BlockHandle, BlockOffset, IndexBlock, index_block::KeyedBlockHandle,
+        writer::index::BlockIndexWriter,
     },
 };
 use std::{
@@ -97,11 +97,7 @@ impl PartitionedIndexWriter {
             )?,
         )?;
 
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "blocks never even approach size of 4 GiB"
-        )]
-        let bytes_written = BlockHeader::serialized_len() as u32 + header.data_length;
+        let bytes_written = header.on_disk_size();
 
         // Also, we are allowed to remove the last item
         // to get ownership of it, because the chunk is cleared after
@@ -178,11 +174,7 @@ impl PartitionedIndexWriter {
             )?,
         )?;
 
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "blocks never even approach 4 GiB in size"
-        )]
-        let bytes_written = BlockHeader::serialized_len() as u32 + header.data_length;
+        let bytes_written = header.on_disk_size();
 
         debug_assert!(bytes_written > 0, "Top level index should never be empty");
 
