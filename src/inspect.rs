@@ -386,9 +386,24 @@ pub struct DataEntry {
 ///
 /// Returned by [`iter_data_block_entries`]. Owns the underlying file
 /// handle and the list of pending data-block handles; loads exactly
-/// one data block at a time and drops it before moving to the next,
-/// so memory cost is `O(largest_data_block + key.len + value.len)`
-/// even for SSTs holding tens of millions of entries.
+/// one data block at a time and drops it before moving to the next.
+///
+/// Memory cost is **`O(N_data_blocks) * 16 B + largest_data_block +
+/// key.len + value.len`**, where the first term is the upfront
+/// `Vec<BlockHandle>` collected from the TLI at construction time
+/// (one 16-byte handle per data block). For typical SSTs this is
+/// negligible: a 64 MiB SST with 4 KiB data blocks has ~16 K
+/// handles ≈ 256 KiB — small compared to a single decompressed
+/// data block. A 1 GiB SST gives ~4 MiB of handles. The trade-off
+/// buys constant-time `next()` per block lookup; truly streaming
+/// the TLI through the iterator would require nested self-cells
+/// (the `OwnedIndexBlockIter` already self-references its
+/// `IndexBlock`) which is structurally awkward for the rare case
+/// where the handle vec actually matters in absolute terms.
+///
+/// Encrypted SSTs and partitioned-index SSTs both return an error
+/// at construction time — see [`iter_data_block_entries`] for the
+/// full contract.
 ///
 /// Encrypted SSTs and partitioned-index SSTs both return an error
 /// at construction time — see [`iter_data_block_entries`] for the
@@ -408,9 +423,10 @@ pub struct DataBlockEntryIter {
     /// `KeyedBlockHandle`. `KeyedBlockHandle` carries `end_key:
     /// Slice` which is a view into the TLI block buffer; collecting
     /// the keyed variant would keep the entire TLI block alive for
-    /// the iterator's lifetime and undermine the "memory bounded to
-    /// one data block" guarantee. Stripping to the bare handle lets
-    /// the TLI block drop after enumeration completes.
+    /// the iterator's lifetime. Stripping to the bare handle lets
+    /// the TLI block drop after enumeration completes, leaving only
+    /// the 16-byte-per-block `Vec` here. See the struct-level
+    /// docstring for the memory-cost analysis.
     remaining_handles: Vec<crate::table::BlockHandle>,
     /// Iterator over the currently-loaded block, or `None` when we
     /// haven't loaded a block yet or just finished one.
