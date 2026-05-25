@@ -164,8 +164,8 @@ fn partitioned_index_corrupting_one_sub_block_only_affects_its_keys() {
     // `Unrecoverable`, etc.) and weaken the blast-radius assertion.
     let v_victim = tree.get(&victim_last_key, lsm_tree::MAX_SEQNO);
     assert!(
-        matches!(v_victim, Err(lsm_tree::Error::InvalidHeader(_))),
-        "read against corrupted sub-index partition must surface as block-header InvalidHeader (zeroed magic short-circuits before XXH3 check); got {v_victim:?}"
+        matches!(v_victim, Err(lsm_tree::Error::InvalidHeader("Block"))),
+        "read against corrupted sub-index partition must surface as block-header InvalidHeader(\"Block\") (zeroed magic short-circuits before XXH3 check); got {v_victim:?}"
     );
 
     // Sanity: very-early and very-late keys (covered by partitions
