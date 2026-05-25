@@ -800,7 +800,7 @@ mod tests {
         // truncation surfaces inside the per-entry decode loop, not
         // at the SFA layer.
         for entry_id in 0..actual {
-            crate::version::framing::write_framed_record(&mut w, |payload| {
+            crate::version::framing::write_framed_record(&mut w, &mut Vec::new(), |payload| {
                 payload.write_u64::<LittleEndian>(u64::from(entry_id))?;
                 payload.write_u8(0)?; // checksum_type
                 payload.write_u128::<LittleEndian>(0)?; // checksum
@@ -910,7 +910,7 @@ mod tests {
         // surfaces from `decode_table_entry_payload` and aborts even
         // under tolerant modes (the contract: tail-tolerance is for
         // write-incomplete scenarios, not arbitrary corruption).
-        crate::version::framing::write_framed_record(&mut w, |payload| {
+        crate::version::framing::write_framed_record(&mut w, &mut Vec::new(), |payload| {
             payload.write_u64::<LittleEndian>(0)?; // id
             payload.write_u8(0xFF)?; // corrupt checksum_type
             payload.write_u128::<LittleEndian>(0)?;
@@ -961,7 +961,7 @@ mod tests {
         w.write_u8(2)?; // 2 runs in that level
         // run #0: declared=1, actual=1 — the consistent prefix.
         w.write_u32::<LittleEndian>(1)?;
-        crate::version::framing::write_framed_record(&mut w, |payload| {
+        crate::version::framing::write_framed_record(&mut w, &mut Vec::new(), |payload| {
             payload.write_u64::<LittleEndian>(42)?; // id
             payload.write_u8(0)?; // checksum_type
             payload.write_u128::<LittleEndian>(0)?;
@@ -1053,7 +1053,7 @@ mod tests {
         w.start("blob_files")?;
         w.write_u32::<LittleEndian>(declared)?;
         for entry_id in 0..actual {
-            crate::version::framing::write_framed_record(&mut w, |payload| {
+            crate::version::framing::write_framed_record(&mut w, &mut Vec::new(), |payload| {
                 payload.write_u64::<LittleEndian>(u64::from(entry_id))?;
                 payload.write_u8(0)?; // checksum_type
                 payload.write_u128::<LittleEndian>(0)?; // checksum
@@ -1178,7 +1178,7 @@ mod tests {
 
     /// Writes one framed table record with a CORRECT XXH3 digest.
     fn write_good_table_record<W: std::io::Write>(w: &mut W, id: u64) -> crate::Result<()> {
-        crate::version::framing::write_framed_record(w, |payload| {
+        crate::version::framing::write_framed_record(w, &mut Vec::new(), |payload| {
             payload.write_u64::<LittleEndian>(id)?;
             payload.write_u8(0)?; // checksum_type
             payload.write_u128::<LittleEndian>(0)?;
@@ -1387,7 +1387,7 @@ mod tests {
         w.start("blob_files")?;
         w.write_u32::<LittleEndian>(3)?;
         // good, bad, good
-        crate::version::framing::write_framed_record(&mut w, |payload| {
+        crate::version::framing::write_framed_record(&mut w, &mut Vec::new(), |payload| {
             payload.write_u64::<LittleEndian>(10)?;
             payload.write_u8(0)?;
             payload.write_u128::<LittleEndian>(0)?;
@@ -1408,7 +1408,7 @@ mod tests {
         w.write_u32::<LittleEndian>(len)?;
         w.write_u64::<LittleEndian>(0xDEAD_BEEF_DEAD_BEEF)?;
         w.write_all(&payload)?;
-        crate::version::framing::write_framed_record(&mut w, |payload| {
+        crate::version::framing::write_framed_record(&mut w, &mut Vec::new(), |payload| {
             payload.write_u64::<LittleEndian>(12)?;
             payload.write_u8(0)?;
             payload.write_u128::<LittleEndian>(0)?;

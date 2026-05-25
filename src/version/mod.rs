@@ -3,13 +3,15 @@
 // Copyright (c) 2026-present, Structured World Foundation
 
 mod blob_file_list;
-// `framing` uses `std::io::{Read, Write}` and is therefore gated
-// behind the `std` feature. The whole `version` module (recovery,
-// persist, super_version) is also std-bound today and will be
-// gated together in a future no-std migration pass; gating just
-// `framing` now keeps it ready when its callers gate. See the
-// no-std-check job in `.github/workflows/coordinode-ci.yml`.
-#[cfg(feature = "std")]
+// `framing` uses `std::io::{Read, Write}`. The whole `version`
+// module (recovery, persist, super_version, this file's
+// Version::encode_into) is also std-bound today and consumes the
+// framing helpers unconditionally; gating `framing` alone while
+// leaving its callers ungated would make `--no-default-features`
+// fail on an unresolved-module error — a net loss for the
+// no-std-check job. Leaving framing ungated until the whole
+// `version` module is migrated together in a future pass. See
+// `.github/workflows/coordinode-ci.yml` no-std-check job.
 mod framing;
 mod optimize;
 mod persist;
@@ -747,6 +749,14 @@ impl Version {
 
         writer.start("tables")?;
 
+        // Shared scratch buffer for per-record framing payloads.
+        // Reused across every table + blob record in this version,
+        // so the framing helper grows the buffer once and reuses it
+        // — no per-record heap allocation. The records are all
+        // <= 33 bytes today; pre-sized to cover the larger of the
+        // two so the first iteration doesn't trigger a realloc.
+        let mut framing_scratch: Vec<u8> = Vec::with_capacity(64);
+
         // Per-record framing details live in src/version/framing.rs.
         // Top-level shape inside the `tables` section after framing:
         //   level_count: u8
@@ -791,7 +801,7 @@ impl Version {
 
                 // Tables — each one framed.
                 for table in run.iter() {
-                    framing::write_framed_record(writer, |payload| {
+                    framing::write_framed_record(writer, &mut framing_scratch, |payload| {
                         payload.write_u64::<LittleEndian>(table.id())?;
                         payload.write_u8(0)?; // Checksum type, 0 = XXH3
                         payload.write_u128::<LittleEndian>(table.checksum().into_u128())?;
@@ -812,8 +822,10 @@ impl Version {
         writer.write_u32::<LittleEndian>(self.blob_files.len() as u32)?;
 
         for file in self.blob_files.iter() {
-            // Per-blob record framed, same rationale as tables above.
-            framing::write_framed_record(writer, |payload| {
+            // Per-blob record framed, same rationale as tables
+            // above; same scratch buffer keeps allocations at zero
+            // across the section boundary.
+            framing::write_framed_record(writer, &mut framing_scratch, |payload| {
                 payload.write_u64::<LittleEndian>(file.id())?;
                 payload.write_u8(0)?; // Checksum type, 0 = XXH3
                 payload.write_u128::<LittleEndian>(file.0.checksum.into_u128())?;

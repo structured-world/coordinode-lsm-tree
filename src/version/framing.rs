@@ -89,19 +89,31 @@ pub const MAX_FRAME_PAYLOAD: u32 = 64 * 1024;
 /// produce a frame the reader always rejects as
 /// [`FramedRecordOutcome::BadHeader`], silently bricking
 /// recovery for that section.
-pub fn write_framed_record<W, F>(writer: &mut W, payload_fn: F) -> crate::Result<()>
+pub fn write_framed_record<W, F>(
+    writer: &mut W,
+    scratch: &mut Vec<u8>,
+    payload_fn: F,
+) -> crate::Result<()>
 where
     W: Write,
     F: FnOnce(&mut Vec<u8>) -> crate::Result<()>,
 {
-    let mut payload: Vec<u8> = Vec::new();
-    payload_fn(&mut payload)?;
+    // Reuse the caller-provided scratch buffer instead of allocating
+    // a fresh `Vec` per record. For a manifest with thousands of
+    // tables the previous Vec::new() pattern produced one small heap
+    // allocation per record on the hot write path; threading a
+    // single scratch through the level/run/table loop drops that to
+    // one allocation (the buffer's initial growth) for the entire
+    // section. Callers create one Vec at the top of the section
+    // and pass the same `&mut` reference to every framed write.
+    scratch.clear();
+    payload_fn(scratch)?;
 
-    if payload.len() > MAX_FRAME_PAYLOAD as usize {
+    if scratch.len() > MAX_FRAME_PAYLOAD as usize {
         log::error!(
             "write_framed_record refusing to emit oversized payload \
              ({} bytes; MAX_FRAME_PAYLOAD = {})",
-            payload.len(),
+            scratch.len(),
             MAX_FRAME_PAYLOAD,
         );
         return Err(crate::Error::Unrecoverable);
@@ -109,14 +121,14 @@ where
 
     #[expect(
         clippy::cast_possible_truncation,
-        reason = "the explicit MAX_FRAME_PAYLOAD guard above ensures payload.len() fits in u32"
+        reason = "the explicit MAX_FRAME_PAYLOAD guard above ensures scratch.len() fits in u32"
     )]
-    let len = payload.len() as u32;
-    let digest = xxhash_rust::xxh3::xxh3_64(&payload);
+    let len = scratch.len() as u32;
+    let digest = xxhash_rust::xxh3::xxh3_64(scratch);
 
     writer.write_u32::<LittleEndian>(len)?;
     writer.write_u64::<LittleEndian>(digest)?;
-    writer.write_all(&payload)?;
+    writer.write_all(scratch)?;
 
     Ok(())
 }
@@ -277,7 +289,8 @@ mod tests {
 
     fn roundtrip(payload: &[u8]) -> Vec<u8> {
         let mut buf = Vec::new();
-        write_framed_record(&mut buf, |out| {
+        let mut scratch = Vec::new();
+        write_framed_record(&mut buf, &mut scratch, |out| {
             out.extend_from_slice(payload);
             Ok(())
         })
