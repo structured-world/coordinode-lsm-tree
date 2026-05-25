@@ -502,6 +502,15 @@ fn run_dump(
     let mut emitted: u64 = 0;
     let cap = max.unwrap_or(u64::MAX);
 
+    // `--max 0` is a "no output ever" request. The in-loop
+    // `emitted >= cap` check would still scan the SST until the
+    // first entry passes the bounds filters before breaking;
+    // short-circuit here so a `--max 0` invocation costs zero
+    // block I/O.
+    if cap == 0 {
+        return ExitCode::SUCCESS;
+    }
+
     for item in iter {
         let entry = match item {
             Ok(e) => e,
