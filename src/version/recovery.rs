@@ -207,6 +207,14 @@ pub fn recover(folder: &Path, fs: &dyn Fs, mode: ManifestRecoveryMode) -> crate:
     let mut tables_dropped_to_corruption: u32 = 0;
     let mut tables_truncated_headers: u32 = 0;
 
+    // Scratch buffer threaded through every `read_framed_record`
+    // call across both the `tables` and `blob_files` sections.
+    // Grows once to the largest record's payload size (33 bytes
+    // for tables, 25 for blob_files) and is reused thereafter, so
+    // per-record heap allocations during recovery are zero after
+    // the initial growth.
+    let mut read_scratch: Vec<u8> = Vec::with_capacity(64);
+
     {
         let section = toc
             .section(b"tables")
@@ -328,18 +336,21 @@ pub fn recover(folder: &Path, fs: &dyn Fs, mode: ManifestRecoveryMode) -> crate:
                     // next record under SkipAny — read_framed_record
                     // returns BadHeader for `len != expected`,
                     // which the section-drop fallback below
-                    // handles safely.
+                    // handles safely. The scratch buffer is reused
+                    // across every record in this section to keep
+                    // per-record heap allocations at zero.
                     let outcome = crate::version::framing::read_framed_record(
                         &mut reader,
                         remaining,
                         Some(TABLE_ENTRY_PAYLOAD_LEN),
+                        &mut read_scratch,
                     )?;
                     match outcome {
-                        FramedRecordOutcome::Ok(payload) => {
+                        FramedRecordOutcome::Ok => {
                             tables_bytes_consumed += crate::version::framing::FRAME_HEADER_LEN
                                 as u64
-                                + payload.len() as u64;
-                            let t = decode_table_entry_payload(&payload)?;
+                                + read_scratch.len() as u64;
+                            let t = decode_table_entry_payload(&read_scratch)?;
                             run.push(t);
                         }
                         FramedRecordOutcome::TailTruncation if tolerate_tail => {
@@ -440,7 +451,23 @@ pub fn recover(folder: &Path, fs: &dyn Fs, mode: ManifestRecoveryMode) -> crate:
                             )));
                         }
                         FramedRecordOutcome::BadHeader => {
-                            return Err(crate::Error::Unrecoverable);
+                            // Strict mode: the framing header was
+                            // structurally implausible (either `len`
+                            // above MAX_FRAME_PAYLOAD or `len` did
+                            // not match the fixed table-record
+                            // size). Surface as InvalidHeader with
+                            // a section-tagged static string so
+                            // operators can route on the variant
+                            // payload instead of parsing the
+                            // Display message.
+                            log::error!(
+                                "manifest tables frame header rejected in version \
+                                 #{curr_version_id}: len out of bounds or != \
+                                 TABLE_ENTRY_PAYLOAD_LEN"
+                            );
+                            return Err(crate::Error::InvalidHeader(
+                                "manifest tables frame header",
+                            ));
                         }
                     }
                 }
@@ -520,12 +547,13 @@ pub fn recover(folder: &Path, fs: &dyn Fs, mode: ManifestRecoveryMode) -> crate:
                 &mut reader,
                 remaining,
                 Some(BLOB_ENTRY_PAYLOAD_LEN),
+                &mut read_scratch,
             )?;
             match outcome {
-                FramedRecordOutcome::Ok(payload) => {
-                    blob_bytes_consumed +=
-                        crate::version::framing::FRAME_HEADER_LEN as u64 + payload.len() as u64;
-                    let entry = decode_blob_entry_payload(&payload)?;
+                FramedRecordOutcome::Ok => {
+                    blob_bytes_consumed += crate::version::framing::FRAME_HEADER_LEN as u64
+                        + read_scratch.len() as u64;
+                    let entry = decode_blob_entry_payload(&read_scratch)?;
                     blob_file_ids.push(entry);
                 }
                 FramedRecordOutcome::TailTruncation if tolerate_tail => {
@@ -581,7 +609,19 @@ pub fn recover(folder: &Path, fs: &dyn Fs, mode: ManifestRecoveryMode) -> crate:
                     )));
                 }
                 FramedRecordOutcome::BadHeader => {
-                    return Err(crate::Error::Unrecoverable);
+                    // Strict mode: same shape as the tables section
+                    // — surface a section-tagged InvalidHeader so
+                    // operators can distinguish a `blob_files`
+                    // frame-header failure from a `tables` one
+                    // without parsing the Display message.
+                    log::error!(
+                        "manifest blob_files frame header rejected in version \
+                         #{curr_version_id}: len out of bounds or != \
+                         BLOB_ENTRY_PAYLOAD_LEN"
+                    );
+                    return Err(crate::Error::InvalidHeader(
+                        "manifest blob_files frame header",
+                    ));
                 }
             }
         }

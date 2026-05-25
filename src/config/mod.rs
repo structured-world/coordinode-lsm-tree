@@ -154,10 +154,10 @@ pub enum ManifestRecoveryMode {
     /// Maximum-availability, lossy. On a per-record checksum
     /// mismatch, the reader logs the skip and advances exactly
     /// past the bad record using the framing-supplied length
-    /// field. If the length itself is suspect
-    /// (`FramedRecordOutcome::BadHeader` — header parse failed,
-    /// next-record boundary unknown), the rest of that section is
-    /// dropped. Intended companion to the `repair_db` tooling
+    /// field. If the length field itself is unusable (the
+    /// recorded length is outside the legal range, so the
+    /// next-record boundary is unknown), the rest of that section
+    /// is dropped. Intended companion to the `repair_db` tooling
     /// tracked as `#303`: this mode recovers what it can in-place;
     /// `repair_db` rebuilds the manifest from the SST files
     /// themselves when even this mode can't reach a usable state.

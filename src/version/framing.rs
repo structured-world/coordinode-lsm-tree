@@ -137,11 +137,14 @@ where
 /// outcome so the caller can apply mode-specific recovery policy.
 #[derive(Debug)]
 pub enum FramedRecordOutcome {
-    /// The header decoded, payload was read in full, and the
-    /// XXH3-64 digest matched. The contained `Vec<u8>` is the
-    /// record's payload bytes — caller decodes it into its
-    /// per-section type.
-    Ok(Vec<u8>),
+    /// The header decoded, payload was read in full into the
+    /// caller-provided `payload_scratch`, and the XXH3-64 digest
+    /// matched. The caller reads the payload bytes by slicing
+    /// the scratch buffer they passed in (its length is the
+    /// payload length). The scratch buffer is reused across
+    /// iterations of the recovery loop, so per-record heap
+    /// allocations are zero after its initial growth.
+    Ok,
 
     /// The header decoded with a plausible `len`, the payload was
     /// read in full, but the XXH3-64 digest disagreed with
@@ -223,6 +226,7 @@ pub fn read_framed_record<R: Read>(
     reader: &mut R,
     remaining_in_section: u64,
     expected_payload_len: Option<u32>,
+    payload_scratch: &mut Vec<u8>,
 ) -> crate::Result<FramedRecordOutcome> {
     let len = match reader.read_u32::<LittleEndian>() {
         Ok(n) => n,
@@ -281,8 +285,13 @@ pub fn read_framed_record<R: Read>(
         Err(e) => return Err(e.into()),
     };
 
-    let mut payload = vec![0u8; len as usize];
-    match reader.read_exact(&mut payload) {
+    // Resize the caller's scratch buffer to `len` bytes and read
+    // the payload directly into it. Avoids the per-record
+    // Vec::new() allocation that the previous shape paid — for a
+    // recovery of N records this drops from N allocs to one
+    // (the scratch buffer's initial growth).
+    payload_scratch.resize(len as usize, 0);
+    match reader.read_exact(payload_scratch) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
             return Ok(FramedRecordOutcome::TailTruncation);
@@ -290,9 +299,9 @@ pub fn read_framed_record<R: Read>(
         Err(e) => return Err(e.into()),
     }
 
-    let digest_actual = xxhash_rust::xxh3::xxh3_64(&payload);
+    let digest_actual = xxhash_rust::xxh3::xxh3_64(payload_scratch);
     if digest_actual == digest_expected {
-        Ok(FramedRecordOutcome::Ok(payload))
+        Ok(FramedRecordOutcome::Ok)
     } else {
         let bytes_consumed = FRAME_HEADER_LEN as u64 + u64::from(len);
         Ok(FramedRecordOutcome::ChecksumMismatch {
@@ -338,9 +347,10 @@ mod tests {
         let bytes = roundtrip(payload);
 
         let mut cursor = Cursor::new(&bytes);
-        let outcome = read_framed_record(&mut cursor, u64::MAX, None).expect("read");
+        let mut scratch = Vec::new();
+        let outcome = read_framed_record(&mut cursor, u64::MAX, None, &mut scratch).expect("read");
         match outcome {
-            FramedRecordOutcome::Ok(decoded) => assert_eq!(decoded, payload),
+            FramedRecordOutcome::Ok => assert_eq!(scratch.as_slice(), payload),
             other => panic!("expected Ok, got {other:?}"),
         }
     }
@@ -354,7 +364,8 @@ mod tests {
         bytes[FRAME_HEADER_LEN] ^= 0x01;
 
         let mut cursor = Cursor::new(&bytes);
-        let outcome = read_framed_record(&mut cursor, u64::MAX, None).expect("read");
+        let outcome =
+            read_framed_record(&mut cursor, u64::MAX, None, &mut Vec::new()).expect("read");
         match outcome {
             FramedRecordOutcome::ChecksumMismatch {
                 bytes_consumed,
@@ -380,7 +391,8 @@ mod tests {
         bytes.extend_from_slice(&0u64.to_le_bytes());
 
         let mut cursor = Cursor::new(&bytes);
-        let outcome = read_framed_record(&mut cursor, u64::MAX, None).expect("read");
+        let outcome =
+            read_framed_record(&mut cursor, u64::MAX, None, &mut Vec::new()).expect("read");
         assert!(
             matches!(outcome, FramedRecordOutcome::BadHeader),
             "expected BadHeader for oversized len, got {outcome:?}",
@@ -400,7 +412,7 @@ mod tests {
         bytes.extend_from_slice(&0u64.to_le_bytes());
 
         let mut cursor = Cursor::new(&bytes);
-        let outcome = read_framed_record(&mut cursor, 8 + 1, None).expect("read");
+        let outcome = read_framed_record(&mut cursor, 8 + 1, None, &mut Vec::new()).expect("read");
         assert!(
             matches!(outcome, FramedRecordOutcome::TailTruncation),
             "expected TailTruncation for len > remaining, got {outcome:?}",
@@ -411,7 +423,8 @@ mod tests {
     fn framed_record_tail_truncation_at_header() {
         // Empty input → reading the `len` field hits EOF immediately.
         let mut cursor = Cursor::new(Vec::<u8>::new());
-        let outcome = read_framed_record(&mut cursor, u64::MAX, None).expect("read");
+        let outcome =
+            read_framed_record(&mut cursor, u64::MAX, None, &mut Vec::new()).expect("read");
         assert!(
             matches!(outcome, FramedRecordOutcome::TailTruncation),
             "expected TailTruncation, got {outcome:?}",
@@ -429,7 +442,8 @@ mod tests {
         bytes.truncate(FRAME_HEADER_LEN + payload.len() / 2);
 
         let mut cursor = Cursor::new(&bytes);
-        let outcome = read_framed_record(&mut cursor, u64::MAX, None).expect("read");
+        let outcome =
+            read_framed_record(&mut cursor, u64::MAX, None, &mut Vec::new()).expect("read");
         assert!(
             matches!(outcome, FramedRecordOutcome::TailTruncation),
             "expected TailTruncation, got {outcome:?}",
