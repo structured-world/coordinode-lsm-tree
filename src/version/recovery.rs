@@ -495,10 +495,28 @@ pub fn recover(folder: &Path, fs: &dyn Fs, mode: ManifestRecoveryMode) -> crate:
                     }
                 }
 
-                level.push(run);
+                // Guard against empty run: under SkipAnyCorruptedRecords
+                // every record in the run may be ChecksumMismatched and
+                // skipped, leaving run empty. Version::from_recovery
+                // calls Run::new(empty).expect() and panics; drop the
+                // empty run instead.
+                if !run.is_empty() {
+                    level.push(run);
+                }
             }
 
             levels.push(level);
+        }
+
+        // Preserve the persisted level_count even if PIT/SkipAny/tail
+        // early-exited before reading every level. Downstream code
+        // (notably compaction/leveled with 'assert! version.level_count()
+        // == 7') reads levels.len() directly; shrinking it would crash
+        // the tree after an otherwise-successful recovery. Pad with
+        // empty Vec<_> so each persisted slot survives as a structural
+        // record. Level::from_runs(empty) is legal.
+        while levels.len() < usize::from(level_count) {
+            levels.push(Vec::new());
         }
     }
 
@@ -1383,16 +1401,17 @@ mod tests {
 
         let recovery = recover(folder, &fs, ManifestRecoveryMode::PointInTimeRecovery)?;
 
-        // PIT contract: drop in-progress run + level + all subsequent
-        // levels. The recovered prefix is level 0 with run 0
-        // containing only the consistent prefix record (id=100). The
-        // implementation pushes the partial run into the partial
-        // level, so the level slot survives even though its run is
-        // truncated; level 1 was never reached.
+        // PIT contract: drop in-progress run contents + all
+        // subsequent records; the recovered prefix is level 0 with
+        // run 0 containing only the consistent prefix record (id=100).
+        // Level slots are preserved (persisted level_count is 2, so
+        // 2 level slots survive — level 1 padded empty to keep
+        // downstream level_count() invariants intact).
         assert_eq!(
             recovery.table_ids.len(),
-            1,
-            "expected only level 0 to survive (level 1 truncated by PIT); got {}",
+            2,
+            "expected both persisted level slots to survive (level 1 padded \
+             empty after PIT truncated its records); got {}",
             recovery.table_ids.len(),
         );
         let level = &recovery.table_ids[0];
@@ -1403,6 +1422,11 @@ mod tests {
             1,
             "expected only the pre-corruption record to survive in run 0; got {} records",
             run.len(),
+        );
+        assert!(
+            recovery.table_ids[1].is_empty(),
+            "expected level 1 to be empty (PIT dropped its records); got {} runs",
+            recovery.table_ids[1].len(),
         );
         assert_eq!(run[0].id, 100, "expected id=100 (the good prefix record)");
         Ok(())
@@ -1642,10 +1666,10 @@ mod tests {
     }
 
     /// Builds a manifest where level 0 has ONE run of ONE corrupt
-    /// record. Under SkipAnyCorruptedRecords the single record is
+    /// record. Under `SkipAnyCorruptedRecords` the single record is
     /// skipped → the run is empty when the per-run record loop
     /// completes → the unconditional `level.push(run)` at line 498
-    /// produces an empty run in Recovery::table_ids.
+    /// produces an empty run in `Recovery::table_ids`.
     fn write_manifest_with_all_records_in_run_corrupt(
         folder: &Path,
         id: u64,
@@ -1686,11 +1710,11 @@ mod tests {
 
     /// Regression test for the second review finding on PR #342:
     /// after the per-run record loop, `level.push(run)` runs
-    /// unconditionally. Under SkipAnyCorruptedRecords every record
-    /// in a run can be ChecksumMismatched → run stays empty → the
+    /// unconditionally. Under `SkipAnyCorruptedRecords` every record
+    /// in a run can be `ChecksumMismatched` → run stays empty → the
     /// unconditional push produces an empty run in Recovery.
-    /// Same downstream panic as the first finding: from_recovery's
-    /// Run::new(empty).expect() aborts the tolerant path.
+    /// Same downstream panic as the first finding: `from_recovery`'s
+    /// `Run::new(empty).expect()` aborts the tolerant path.
     #[test]
     fn recover_skip_any_drops_run_when_all_records_corrupt() -> crate::Result<()> {
         let fs = MemFs::new();
