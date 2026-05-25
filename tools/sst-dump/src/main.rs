@@ -473,7 +473,15 @@ fn run_dump(
             return ExitCode::FAILURE;
         }
         Err(e) => {
-            eprintln!("error: open {}: {e}", path.display());
+            // `iter_data_block_entries` covers more than just the
+            // initial file-open: it also walks the SFA trailer, the
+            // meta block, the TLI, and validates the data-block
+            // layout. Any of those can fail here, so the generic
+            // bucket message uses "iter entries" instead of "open"
+            // to avoid suggesting the failure was at File::open
+            // when it might have been an SFA trailer mismatch or a
+            // meta-block decode error.
+            eprintln!("error: iter entries from {}: {e}", path.display());
             return ExitCode::FAILURE;
         }
     };
