@@ -11,7 +11,7 @@
 
 use clap::{Parser, Subcommand};
 use lsm_tree::coding::Decode;
-use lsm_tree::inspect::{read_table_properties, read_top_level_index_entries};
+use lsm_tree::inspect::{read_filter_stats, read_table_properties, read_top_level_index_entries};
 use lsm_tree::table::block::Header;
 use lsm_tree::verify::{BlockVerifyError, verify_sst_file};
 use std::fs::File;
@@ -99,6 +99,15 @@ enum Command {
     /// matches what `verify` walked. Reads the TLI directly (with
     /// tail-mirror fallback per #296); does not open a live `Tree`.
     IndexDump,
+
+    /// Print sizing stats for the SST's BuRR filter: on-disk filter
+    /// section bytes, BuRR layer count, item count from meta, and
+    /// approximate bits-per-key. Only single-block (full) filters
+    /// are supported by this subcommand; partitioned-filter tables
+    /// (`filter_tli` SFA section present) exit non-zero with a
+    /// "not supported" error. Filter-less tables (no `filter`
+    /// section at all) exit 0 with a "no filter installed" notice.
+    FilterStats,
 }
 
 fn main() -> ExitCode {
@@ -113,6 +122,7 @@ fn main() -> ExitCode {
         } => run_hex(&cli.file, offset, len, no_header),
         Command::Properties => run_properties(&cli.file),
         Command::IndexDump => run_index_dump(&cli.file),
+        Command::FilterStats => run_filter_stats(&cli.file),
     }
 }
 
@@ -381,6 +391,48 @@ fn run_index_dump(path: &std::path::Path) -> ExitCode {
             format_key(&e.end_key),
         );
     }
+
+    ExitCode::SUCCESS
+}
+
+fn run_filter_stats(path: &std::path::Path) -> ExitCode {
+    let stats = match read_filter_stats(path) {
+        Ok(s) => s,
+        Err(lsm_tree::Error::Io(io_err)) if io_err.kind() == std::io::ErrorKind::Unsupported => {
+            // Partitioned-filter SSTs surface here. Match the inner
+            // `io::ErrorKind::Unsupported` so the CLI prints a
+            // user-facing "not supported" line instead of the
+            // bare-Display of the inner error; mention the
+            // distinguishing on-disk signal (`filter_tli` SFA section)
+            // so an operator can confirm the diagnosis with `verify
+            // --verbose` or a hex dump of the SFA TOC.
+            eprintln!(
+                "error: filter-stats not supported for {}: {io_err} \
+                 (look for a `filter_tli` section in the SFA TOC to confirm)",
+                path.display(),
+            );
+            return ExitCode::FAILURE;
+        }
+        Err(e) => {
+            eprintln!("error: read filter stats of {}: {e}", path.display());
+            return ExitCode::FAILURE;
+        }
+    };
+
+    println!("file:                {}", path.display());
+    let Some(stats) = stats else {
+        println!("filter:              no filter section installed");
+        return ExitCode::SUCCESS;
+    };
+
+    println!("filter_section_size: {} bytes", stats.filter_section_bytes);
+    println!("layer_count:         {}", stats.layer_count);
+    println!("item_count:          {}", stats.item_count);
+    // Three decimals is enough resolution for diagnostic use without
+    // implying false precision; bits-per-key for production filters
+    // is typically in the 5-15 range, occasionally up to ~30 with
+    // tight FPR targets, so the integer part is always small.
+    println!("bits_per_key:        {:.3}", stats.bits_per_key);
 
     ExitCode::SUCCESS
 }
