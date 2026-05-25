@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779718072722,
+  "lastUpdate": 1779718138366,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -9906,6 +9906,84 @@ window.BENCHMARK_DATA = {
             "value": 431690.03384674346,
             "unit": "ops/sec",
             "extra": "P50: 2.1us | P99: 5.6us | P99.9: 8.2us\nthreads: 1 | elapsed: 0.46s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "b26d6472a92cfbec29079955d39690e669a0e3e8",
+          "message": "feat(sst-dump): filter-stats subcommand + public inspect::read_filter_stats facade (#334)\n\n## Summary\n\nFourth subcommand from #324. `sst-dump <file> filter-stats` prints BuRR\nfilter sizing for the SST's `filter` SFA section.\n\nAfter this lands, only one subcommand remains in #324: `dump` (streaming\nKV entries).\n\n## Library API\n\nNew public surface in `lsm_tree::inspect`:\n\n\\`\\`\\`rust\n#[non_exhaustive]\npub struct FilterStats {\n    pub filter_section_bytes: u64,\n    pub layer_count: u64,\n    pub item_count: u64,\n    pub bits_per_key: f64,\n}\n\npub fn read_filter_stats(path: &Path) -> Result<Option<FilterStats>>;\n\\`\\`\\`\n\n`Ok(None)` when the SST has no `filter` SFA section (filter-less table,\nvalid layout under `FilterPolicy::Off`).\n\n`bits_per_key` is `filter_section_bytes * 8 / max(item_count, 1)` and is\ndocumented as an UPPER BOUND on the true theoretical BuRR overhead — it\nincludes the block `Header`, the BuRR wire-format header, per-layer\npayload framing, and any zero-padding bits, not just the ribbon storage\nproper.\n\n## Scope\n\nOnly single-block (full) filters are supported. SSTs with a\n\\`filter_tli\\` SFA section (partitioned filter) return an error:\nper-partition stats need a different surface that walks the TLI and\nreports either a \\`Vec<FilterStats>\\` or aggregate metrics, and that\npublic-API shape is not yet decided. Partitioned-filter support is left\nas a follow-up.\n\n## CLI output\n\n\\`\\`\\`\n$ sst-dump table-0 filter-stats\nfile:                table-0\nfilter_section_size: 195 bytes\nlayer_count:         2\nitem_count:          200\nbits_per_key:        7.800\n\\`\\`\\`\n\nFilter-less SSTs print \\\"filter: no filter section installed\\\" and exit\n0. Missing files exit non-zero with an \\`error:\\` stderr line.\nPartitioned-filter tables exit non-zero with a precise error.\n\n## Tests\n\n\\`tools/sst-dump/tests/filter_stats_smoke.rs\\` (2 new):\n\n- \\`filter_stats_prints_expected_fields\\` — builds a 200-item SST with\ndefault config (BuRR filter on), asserts \\`item_count=200\\`,\n\\`filter_section_size > 0\\`, \\`layer_count >= 1\\`, \\`bits_per_key > 0\\`.\n- \\`filter_stats_fails_on_missing_file\\` — exits non-zero with\n\\`error:\\` in stderr.\n\n## Test plan\n\n- [x] \\`cargo nextest run\\` in \\`tools/sst-dump/\\` (10 tests pass: 2 new\n\\`filter_stats_smoke\\` + 4 \\`hex_smoke\\` + 2 \\`properties_smoke\\` + 2\n\\`verify_smoke\\`)\n- [x] \\`cargo nextest run\\` main suite (1413 pass)\n- [x] \\`cargo clippy --all-features --all-targets -- -D warnings\\` clean\non both crates\n- [x] README \\`Operational tools\\` row updated\n\nPart of #324.\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n## Summary by CodeRabbit\n\n* **New Features**\n* Added a `filter-stats` subcommand to `sst-dump` to report BuRR filter\ndiagnostics: filter section size, layer count, item count, and\nbits-per-key (single-block filters only).\n* Emits a clear \"not supported\" message and non-zero exit for\npartitioned/unsupported filters.\n\n* **Documentation**\n* README updated to document the new `filter-stats` subcommand and its\nsingle-block limitation.\n\n* **Tests**\n* Added end-to-end smoke tests validating normal output,\npartitioned-filter rejection, absence-of-filter notice, and missing-file\nerror handling.\n\n* **Chores**\n  * Test dev-dependency added to support on-disk inspection.\n\n<!-- review_stack_entry_start -->\n\n[![Review Change\nStack](https://storage.googleapis.com/coderabbit_public_assets/review-stack-in-coderabbit-ui.svg)](https://app.coderabbit.ai/change-stack/structured-world/coordinode-lsm-tree/pull/334?utm_source=github_walkthrough&utm_medium=github&utm_campaign=change_stack)\n\n<!-- review_stack_entry_end -->\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-05-25T17:03:54+03:00",
+          "tree_id": "0535958df1de5a5b1296e920084d3810baec4a44",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/b26d6472a92cfbec29079955d39690e669a0e3e8"
+        },
+        "date": 1779718137419,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 1990473.7914813494,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.7us | P99.9: 3.8us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1181563.5301720104,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.3us | P99.9: 4.5us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 478860.5799815687,
+            "unit": "ops/sec",
+            "extra": "P50: 1.9us | P99: 5.2us | P99.9: 7.9us\nthreads: 1 | elapsed: 0.42s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3675058.5955936303,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 3.1us | P99.9: 5.8us\nthreads: 1 | elapsed: 0.05s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 360008.31763217057,
+            "unit": "ops/sec",
+            "extra": "P50: 2.4us | P99: 5.8us | P99.9: 8.7us\nthreads: 1 | elapsed: 0.56s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 201074.57045387078,
+            "unit": "ops/sec",
+            "extra": "P50: 4.6us | P99: 5.8us | P99.9: 8.2us\nthreads: 1 | elapsed: 0.99s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1218234.0150794224,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.2us | P99.9: 4.4us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1115464.3283961338,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.5us | P99.9: 2.0us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 433390.7066063189,
+            "unit": "ops/sec",
+            "extra": "P50: 2.1us | P99: 5.6us | P99.9: 8.4us\nthreads: 1 | elapsed: 0.46s | num: 200000 | iterations: 3"
           }
         ]
       }
