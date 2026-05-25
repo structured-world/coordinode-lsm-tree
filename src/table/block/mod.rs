@@ -2330,12 +2330,18 @@ mod tests {
 
         #[test]
         fn block_zstd_dict_wrong_dict_returns_error() {
-            // As with the dict-missing test above, the wrong-dict check
-            // now lives in BlockTransform::from_parts (it cross-checks
-            // the supplied dictionary id against the
-            // ZstdDict { dict_id } discriminator). Assert directly on
-            // the transform-construction result; no Block I/O call is
-            // needed to exercise the mismatch path.
+            // Companion test to
+            // `block_transform_from_parts_zstd_dict_missing_returns_error`
+            // (below): both assert the BlockTransform::from_parts
+            // check that used to live inside Block::write_into /
+            // from_reader for the ZstdDict codec. The dict-missing
+            // case exercises the `None` half of the dict argument;
+            // this one exercises the cross-check between the
+            // supplied dictionary id and the
+            // ZstdDict { dict_id } discriminator. Both assert
+            // directly on the transform-construction result; no
+            // Block I/O call is needed to exercise the mismatch
+            // path.
             let dict = test_dict();
             let compression = test_compression(&dict);
             let wrong_dict = ZstdDictionary::new(b"completely different dictionary bytes");

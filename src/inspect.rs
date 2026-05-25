@@ -728,6 +728,14 @@ fn load_data_block_iter(
     use crate::table::block::{Block, BlockIdentity, BlockType};
     use crate::table::iter::OwnedDataBlockIter;
 
+    // Inspect-side data-block loader: no encryption provider (out-
+    // of-band facade) and never a zstd dict. Same transform-
+    // resolution rule as load_index_block above:
+    //   - compression == None  →  BlockTransform::Plain
+    //   - compression == Lz4 / Zstd(level)  →  BlockTransform::Compressed
+    //   - compression == ZstdDict { .. }  →  rejected via
+    //     Error::ZstdDictMismatch (no dict can be threaded without a
+    //     live Tree).
     let block = Block::from_file(
         file,
         *handle,
@@ -748,10 +756,12 @@ fn load_data_block_iter(
             dict_id: 0,
             window_log: 0,
         },
-        compression,
-        None,
-        #[cfg(zstd_any)]
-        None,
+        &crate::table::block::BlockTransform::from_parts(
+            compression,
+            None,
+            #[cfg(zstd_any)]
+            None,
+        )?,
     )?;
 
     if block.header.block_type != BlockType::Data {
