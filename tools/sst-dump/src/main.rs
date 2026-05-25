@@ -398,23 +398,16 @@ fn run_index_dump(path: &std::path::Path) -> ExitCode {
 fn run_filter_stats(path: &std::path::Path) -> ExitCode {
     let stats = match read_filter_stats(path) {
         Ok(s) => s,
-        Err(lsm_tree::Error::Io(io_err))
-            if io_err.kind() == std::io::ErrorKind::Unsupported
-                && io_err.to_string().contains("filter_tli") =>
-        {
-            // Partitioned-filter SSTs surface here. Match BOTH the
-            // `io::ErrorKind::Unsupported` discriminant AND the
-            // `filter_tli` substring in the message so an unrelated
-            // platform-level Unsupported (e.g. an `FsFile::read_at`
-            // backend that doesn't implement positional reads on a
-            // non-mainstream target) doesn't get mis-attributed as
-            // a partitioned-filter layout. The substring is what
-            // `read_filter_stats` writes deliberately when it detects
-            // a `filter_tli` SFA section; the kind alone is too
-            // coarse to be a reliable discriminator.
+        Err(lsm_tree::Error::FeatureUnsupported(marker)) => {
+            // Partitioned-filter SSTs surface here. Match the typed
+            // `FeatureUnsupported` variant directly so control flow
+            // doesn't depend on a message-string substring; the
+            // `marker` payload is the SFA section name the operator
+            // can confirm via the TOC.
             eprintln!(
-                "error: filter-stats not supported for {}: {io_err} \
-                 (look for a `filter_tli` section in the SFA TOC to confirm)",
+                "error: filter-stats not supported for {}: \
+                 valid-but-unsupported layout (look for a `{marker}` \
+                 section in the SFA TOC to confirm)",
                 path.display(),
             );
             return ExitCode::FAILURE;

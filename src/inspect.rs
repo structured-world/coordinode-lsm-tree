@@ -429,7 +429,10 @@ pub struct FilterStats {
 /// - the SFA trailer is missing / malformed,
 /// - the `meta` block fails to decode (needed for `item_count`),
 /// - the table has a `filter_tli` SFA section (partitioned filter,
-///   not supported by this facade — see Scope above),
+///   not supported by this facade): returned as
+///   returned as `Error::FeatureUnsupported("filter_tli")` (see
+///   [`crate::Error::FeatureUnsupported`]) so callers can match the
+///   typed variant instead of parsing message strings,
 /// - the `filter` block header / payload is malformed,
 /// - the `BuRR` wire format cannot be parsed (magic mismatch,
 ///   unsupported version, structurally invalid header).
@@ -455,20 +458,13 @@ pub fn read_filter_stats(path: &Path) -> crate::Result<Option<FilterStats>> {
     if regions.filter_tli.is_some() {
         // Partitioned filter: a `filter_tli` SFA section is present
         // alongside `filter`, and the contents of `filter` are a
-        // concatenation of per-partition `BuRR` payloads — not a single
-        // parseable wire buffer. Surface this as
-        // `io::ErrorKind::Unsupported` (NOT `Unrecoverable`) so the
-        // caller can distinguish "valid but unsupported layout" from
-        // "corrupted SST" via `Error::source` / `kind()`. The message
-        // tells the operator how to identify the case ("filter_tli
-        // section present") so they can route to a partitioned-aware
-        // inspector once one exists.
-        return Err(crate::Error::Io(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "partitioned filter (filter_tli section present) is not yet supported \
-             by read_filter_stats; per-partition stats need a separate API surface \
-             that walks the TLI and reports aggregate or per-partition metrics",
-        )));
+        // concatenation of per-partition `BuRR` payloads, not a
+        // single parseable wire buffer. Surface this as the typed
+        // `Error::FeatureUnsupported("filter_tli")` so callers can
+        // match on the marker without parsing message strings; the
+        // payload literal is the SFA section name an operator can
+        // confirm via the TOC.
+        return Err(crate::Error::FeatureUnsupported("filter_tli"));
     }
 
     let Some(filter_handle) = regions.filter else {
