@@ -437,12 +437,22 @@ pub struct FilterStats {
 /// - the `BuRR` wire format cannot be parsed (magic mismatch,
 ///   unsupported version, structurally invalid header).
 ///
-/// Returns `Ok(None)` when the SST simply has no `filter` SFA
-/// section. That is a valid layout: a tree configured with
+/// Returns `Ok(None)` for both on-disk shapes of "no filter
+/// installed":
+///
+/// 1. the SST has no `filter` SFA section at all, or
+/// 2. the section is present but carries a zero-byte payload (the
+///    [`crate::table::filter::block::FilterBlock`] sentinel for "no
+///    filter"; the writer emits it when the filter policy resolves
+///    to no usable filter at flush time, which is structurally
+///    equivalent to the absent-section case).
+///
+/// A tree configured with
 /// [`FilterPolicy::disabled`](crate::config::FilterPolicy::disabled)
 /// (or any policy whose per-level entry is
 /// [`FilterPolicyEntry::None`](crate::config::FilterPolicyEntry::None))
-/// produces filter-less SSTs.
+/// produces filter-less SSTs that take one of these two shapes;
+/// either way callers see the same `Ok(None)` result.
 #[cfg(feature = "std")]
 pub fn read_filter_stats(path: &Path) -> crate::Result<Option<FilterStats>> {
     use crate::table::block::{Block, BlockIdentity, BlockType};
