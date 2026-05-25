@@ -9,7 +9,7 @@ pub mod filter;
 mod id;
 mod index_block;
 mod inner;
-mod iter;
+pub(crate) mod iter;
 pub(crate) mod meta;
 pub(crate) mod multi_writer;
 pub(crate) mod regions;
