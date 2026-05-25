@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779714569350,
+  "lastUpdate": 1779718072722,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -9826,6 +9826,84 @@ window.BENCHMARK_DATA = {
           {
             "name": "readwhilewriting",
             "value": 435409.77767212613,
+            "unit": "ops/sec",
+            "extra": "P50: 2.1us | P99: 5.6us | P99.9: 8.2us\nthreads: 1 | elapsed: 0.46s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "1582c4ba3b45526bb74af578db9adba230d49c9a",
+          "message": "feat(encryption): AEAD dispatch with AES-256-GCM + ChaCha20-Poly1305 (#251 PR2) (#338)\n\n## Summary\n\nSecond slice of #251 (AAD-bound encrypted block format). Builds on\n#336's foundation (AAD constructor, SuiteId, DecryptError) and ships the\nper-suite AEAD dispatch layer.\n\n## Public surface\n\nsrc/encryption/aead.rs:\n\n- pub const TAG_LEN: usize = 16 (v1 spec contract)\n- pub fn encrypt_in_place(suite, key, nonce, aad, plaintext) ->\nResult<[u8; 16]>\n- pub fn decrypt_in_place(suite, key, nonce, aad, tag, ciphertext) ->\nResult<(), DecryptError>\n\nBoth work on the 38-byte AAD produced by aad::build(); no provider\ntrait, no allocation beyond what the AEAD primitive itself does.\n\nSuite registry implemented:\n\n| Suite | Backend | Key | Nonce | Tag |\n|-------|---------|-----|-------|-----|\n| SuiteId::Aes256Gcm | aes-gcm 0.11.0-rc.3 (existing dep) | 32 B | 12 B\n| 16 B |\n| SuiteId::ChaCha20Poly1305 | chacha20poly1305 0.11.0-rc.3 (new dep) |\n32 B | 12 B | 16 B |\n\nBoth share the aead 0.6 trait surface, so dispatch is a thin match.\n\n## Cargo.toml\n\nencryption feature gains chacha20poly1305, pinned at exact 0.11.0-rc.3\nmatching aes-gcm's prerelease (same rationale as the existing aes-gcm\npin). TODO bump to stable 0.11.0 once released.\n\n## Tests (10)\n\n- AES-256-GCM round trip (encrypt then decrypt recovers plaintext)\n- ChaCha20-Poly1305 round trip\n- AES-256-GCM wrong key fails with AeadVerificationFailed\n- ChaCha20-Poly1305 wrong key fails\n- AES-256-GCM tampered AAD byte fails\n- ChaCha20-Poly1305 tampered AAD byte fails\n- AES-256-GCM tampered ciphertext fails\n- ChaCha20-Poly1305 tampered ciphertext fails\n- Wrong nonce length surfaces MalformedBodyFrame\n- Cross-suite decrypt (AES ciphertext + ChaCha primitive) fails\nverification\n\n## NOT in this slice\n\n- Skippable-frame wire format (MetadataFrame + BodyFrame via\nstructured-zstd::SkippableFrame)\n- KeyChain (KeyEpoch to key mapping)\n- Block I/O integration\n\nTracked in follow-up #251 slices.\n\n## Test plan\n\n- cargo nextest run --all-features: 1594 passed, 2 skipped\n- cargo clippy --all-features --all-targets -D warnings: clean\n- No on-disk format change\n\nPart of #251.",
+          "timestamp": "2026-05-25T16:37:58+03:00",
+          "tree_id": "5dfe91746237009fe4e0a1239669293f5cf6ecf3",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/1582c4ba3b45526bb74af578db9adba230d49c9a"
+        },
+        "date": 1779718071175,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 2065856.125949794,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.6us | P99.9: 3.8us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1066145.534729291,
+            "unit": "ops/sec",
+            "extra": "P50: 0.8us | P99: 2.4us | P99.9: 4.7us\nthreads: 1 | elapsed: 0.19s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 480069.6838428607,
+            "unit": "ops/sec",
+            "extra": "P50: 1.9us | P99: 5.2us | P99.9: 7.9us\nthreads: 1 | elapsed: 0.42s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3657575.8472417835,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 3.1us | P99.9: 5.8us\nthreads: 1 | elapsed: 0.05s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 361866.3863191274,
+            "unit": "ops/sec",
+            "extra": "P50: 2.4us | P99: 5.8us | P99.9: 8.8us\nthreads: 1 | elapsed: 0.55s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 200266.00271731126,
+            "unit": "ops/sec",
+            "extra": "P50: 4.7us | P99: 6.0us | P99.9: 8.9us\nthreads: 1 | elapsed: 1.00s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1081759.0106820567,
+            "unit": "ops/sec",
+            "extra": "P50: 0.8us | P99: 2.4us | P99.9: 4.6us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1131048.0511230554,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 1.5us | P99.9: 1.9us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 431690.03384674346,
             "unit": "ops/sec",
             "extra": "P50: 2.1us | P99: 5.6us | P99.9: 8.2us\nthreads: 1 | elapsed: 0.46s | num: 200000 | iterations: 3"
           }
