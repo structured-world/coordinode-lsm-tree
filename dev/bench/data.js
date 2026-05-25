@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779703692225,
+  "lastUpdate": 1779714569350,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -9750,6 +9750,84 @@ window.BENCHMARK_DATA = {
             "value": 502698.64846527576,
             "unit": "ops/sec",
             "extra": "P50: 1.8us | P99: 6.5us | P99.9: 9.6us\nthreads: 1 | elapsed: 0.40s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "b609cf2d86a160da18016b175524d724766b8fd6",
+          "message": "fix(table/index): default partitioned index ON at every level (#329) (#340)\n\n## Summary\n\nCloses #329 (the Part 1 follow-up to #296 — PR #325 shipped Part 2 / TLI\nhead+tail mirror; this is the within-index blast-radius half).\n\n- Flips `Config::default().index_block_partitioning_policy` from\n`PinningPolicy::new([false, false, false, true])` to\n`PinningPolicy::all(true)`. Every level now emits a partitioned index,\nso a bit flip inside one sub-index block only takes out the keys covered\nby that partition, not the entire SST.\n- Adds the integration test deferred from #296's acceptance matrix:\nwrite a partitioned-index SST, walk the TLI, zero one middle sub-index\nblock, verify intact partitions still read end-to-end and the corrupted\none surfaces as an `Err` (not a silent miss).\n- Leaves `filter_block_partitioning_policy` at the pre-#329 shape on\npurpose. A corrupt filter block produces a false negative (read\nshort-circuits, caller misses an existing key) — a different hazard\nclass from index corruption (which fails loudly). Flipping that default\nneeds its own filter blast-radius / false-negative analysis; symmetry\nwith index is not sufficient justification on its own. Rationale\nrecorded in the inline `Config::default()` docstring.\n\n## Bench result\n\n`cargo bench --bench index_block -- table_point_read_index_layout` on\nthe same data shape (4096 keys, 256 B data blocks, restart-interval 1):\n\n| Layout | Point-read time |\n|--------|-----------------|\n| full   | 6.6963 us / 6.7466 us / 6.8256 us |\n| partitioned | 3.8549 us / 3.8655 us / 3.8767 us |\n\nPartitioned is ~43% **faster**, not slower. The TLI is smaller (only\nhandles to partitions, not to every data block), and the sub-partition\nloaded for the actual lookup is smaller, so the two-stage binary search\nbeats the single-stage search over a large full index. Well within the\n<5% regression gate from #329.\n\n## Test plan\n\n- [x] `cargo nextest run --workspace` — 1426 / 1426 passing\n- [x] cargo clippy all-features all-targets -D warnings — clean\n- [x] `cargo test --doc` — 43 / 43 passing\n- [x] New `tests/partitioned_index_blast_radius.rs` exercises the\nwithin-SST isolation property the default flip relies on\n- [x] Bench captured above; default flip is an improvement, not a\nregression\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n\n## Summary by CodeRabbit\n\n* **Tests**\n* Added integration test to validate corruption isolation in partitioned\nindex blocks, ensuring failed reads are limited to affected partitions\nwhile adjacent partitions remain accessible.\n\n* **Chores**\n* Refactored benchmark code to support performance comparison across\ndifferent index block layouts.\n* Updated default index block partitioning configuration and expanded\nrelated documentation.\n\n<!-- review_stack_entry_start -->\n\n[![Review Change\nStack](https://storage.googleapis.com/coderabbit_public_assets/review-stack-in-coderabbit-ui.svg)](https://app.coderabbit.ai/change-stack/structured-world/coordinode-lsm-tree/pull/340?utm_source=github_walkthrough&utm_medium=github&utm_campaign=change_stack)\n\n<!-- review_stack_entry_end -->\n\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-05-25T16:08:35+03:00",
+          "tree_id": "84f84f8bb0dc8a5c2bc247d1be9c349562ad4afb",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/b609cf2d86a160da18016b175524d724766b8fd6"
+        },
+        "date": 1779714567772,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 2100873.9236356276,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.6us | P99.9: 3.8us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1176339.2741740823,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.2us | P99.9: 4.4us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 487403.0807808048,
+            "unit": "ops/sec",
+            "extra": "P50: 1.9us | P99: 5.0us | P99.9: 7.8us\nthreads: 1 | elapsed: 0.41s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3622623.48654036,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 3.1us | P99.9: 5.7us\nthreads: 1 | elapsed: 0.06s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 354866.06120803277,
+            "unit": "ops/sec",
+            "extra": "P50: 2.5us | P99: 5.6us | P99.9: 8.6us\nthreads: 1 | elapsed: 0.56s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 202548.20303913127,
+            "unit": "ops/sec",
+            "extra": "P50: 4.6us | P99: 5.9us | P99.9: 8.5us\nthreads: 1 | elapsed: 0.99s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1185559.5339508567,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.2us | P99.9: 4.4us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1128555.9273720994,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.5us | P99.9: 1.9us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 435409.77767212613,
+            "unit": "ops/sec",
+            "extra": "P50: 2.1us | P99: 5.6us | P99.9: 8.2us\nthreads: 1 | elapsed: 0.46s | num: 200000 | iterations: 3"
           }
         ]
       }
