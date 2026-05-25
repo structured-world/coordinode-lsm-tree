@@ -11,7 +11,9 @@
 
 use clap::{Parser, Subcommand};
 use lsm_tree::coding::Decode;
-use lsm_tree::inspect::{read_table_properties, read_top_level_index_entries};
+use lsm_tree::inspect::{
+    iter_data_block_entries, read_table_properties, read_top_level_index_entries,
+};
 use lsm_tree::table::block::Header;
 use lsm_tree::verify::{BlockVerifyError, verify_sst_file};
 use std::fs::File;
@@ -99,6 +101,42 @@ enum Command {
     /// matches what `verify` walked. Reads the TLI directly (with
     /// tail-mirror fallback per #296); does not open a live `Tree`.
     IndexDump,
+
+    /// Stream every KV entry from the SST to stdout, one per line.
+    /// Honours `--from` / `--to` key bounds (inclusive lower,
+    /// exclusive upper, matching standard Rust range semantics) and
+    /// caps output at `--max=N` entries when set. With `--keys-only`,
+    /// skips the value column entirely. Only single-block
+    /// (full-index) SSTs are supported; partitioned-index SSTs exit
+    /// non-zero (see `index-dump` for the layout signal). Reads
+    /// blocks streamingly: memory cost stays at one data block
+    /// regardless of SST size.
+    Dump {
+        /// Lower key bound (inclusive). Entries with `key >= --from`
+        /// are emitted. Without this flag, the walk starts from the
+        /// smallest key in the SST.
+        #[arg(long)]
+        from: Option<String>,
+
+        /// Upper key bound (exclusive). Entries with `key < --to` are
+        /// emitted. Without this flag, the walk ends at the largest
+        /// key in the SST.
+        #[arg(long)]
+        to: Option<String>,
+
+        /// Cap on entries emitted. The walk stops after `--max=N`
+        /// entries pass the `--from` / `--to` filters even if more
+        /// would otherwise have qualified.
+        #[arg(long)]
+        max: Option<u64>,
+
+        /// Omit the value column from the output, printing only the
+        /// keys (one per line, still wrapped in `format_key`'s
+        /// escape rules). Useful when only key enumeration is
+        /// needed and values are large.
+        #[arg(long)]
+        keys_only: bool,
+    },
 }
 
 fn main() -> ExitCode {
@@ -113,6 +151,12 @@ fn main() -> ExitCode {
         } => run_hex(&cli.file, offset, len, no_header),
         Command::Properties => run_properties(&cli.file),
         Command::IndexDump => run_index_dump(&cli.file),
+        Command::Dump {
+            from,
+            to,
+            max,
+            keys_only,
+        } => run_dump(&cli.file, from.as_deref(), to.as_deref(), max, keys_only),
     }
 }
 
@@ -380,6 +424,99 @@ fn run_index_dump(path: &std::path::Path) -> ExitCode {
             e.seqno,
             format_key(&e.end_key),
         );
+    }
+
+    ExitCode::SUCCESS
+}
+
+fn run_dump(
+    path: &std::path::Path,
+    from: Option<&str>,
+    to: Option<&str>,
+    max: Option<u64>,
+    keys_only: bool,
+) -> ExitCode {
+    let iter = match iter_data_block_entries(path) {
+        Ok(it) => it,
+        Err(lsm_tree::Error::Io(io_err)) if io_err.kind() == std::io::ErrorKind::Unsupported => {
+            // Partitioned-index SSTs surface here. Same pattern as
+            // `filter-stats` for partitioned filters: print a
+            // user-facing "not supported" message that names the
+            // distinguishing on-disk signal so an operator can
+            // confirm via `index-dump` or a hex dump of the SFA TOC.
+            eprintln!(
+                "error: dump not supported for {}: {io_err} \
+                 (look for an `index` section in the SFA TOC to confirm)",
+                path.display(),
+            );
+            return ExitCode::FAILURE;
+        }
+        Err(e) => {
+            eprintln!("error: open {}: {e}", path.display());
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // Bounds as byte slices for direct comparison against entry
+    // keys (which are `Vec<u8>`). The CLI takes them as &str so the
+    // common alphanumeric case is ergonomic; non-UTF-8 keys can't be
+    // expressed on the command line without an escape mechanism,
+    // which we deliberately don't ship in this first pass — point
+    // users at a follow-up if they need it.
+    let from_bytes = from.map(str::as_bytes);
+    let to_bytes = to.map(str::as_bytes);
+
+    let mut emitted: u64 = 0;
+    let cap = max.unwrap_or(u64::MAX);
+
+    for item in iter {
+        let entry = match item {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!("error: read entry from {}: {e}", path.display());
+                return ExitCode::FAILURE;
+            }
+        };
+
+        // Lower bound check first because it's the more common
+        // trim direction (operators usually want "from key X
+        // onwards" rather than "everything below key Y").
+        if let Some(lo) = from_bytes {
+            if entry.key.as_slice() < lo {
+                continue;
+            }
+        }
+        if let Some(hi) = to_bytes {
+            if entry.key.as_slice() >= hi {
+                // Keys are sorted in the SST; once we pass the
+                // upper bound we're done. Break instead of
+                // continuing to avoid walking the rest of the
+                // (potentially huge) data section.
+                break;
+            }
+        }
+
+        if emitted >= cap {
+            break;
+        }
+
+        if keys_only {
+            println!("{}", format_key(&entry.key));
+        } else {
+            // `key=value` separator-style — matches what most
+            // RocksDB / LevelDB sst-dump variants emit and is the
+            // easiest format for downstream `awk -F=` consumers.
+            // Tombstone marker is appended as a suffix so a value
+            // grep doesn't confuse a key whose value happens to
+            // contain "tombstone".
+            print!("{}={}", format_key(&entry.key), format_key(&entry.value));
+            if entry.is_tombstone {
+                print!("\t# tombstone");
+            }
+            println!();
+        }
+
+        emitted = emitted.saturating_add(1);
     }
 
     ExitCode::SUCCESS

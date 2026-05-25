@@ -361,3 +361,253 @@ fn load_index_block(
 
     Ok(block)
 }
+
+/// One KV entry materialised from an SST data block.
+///
+/// `#[non_exhaustive]` so new fields can be added in a minor version
+/// bump.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct DataEntry {
+    /// The user key bytes (no internal-key suffix, no seqno).
+    pub key: Vec<u8>,
+    /// The value bytes. Empty for tombstone entries (see
+    /// [`Self::is_tombstone`]).
+    pub value: Vec<u8>,
+    /// MVCC sequence number assigned to this entry by the writer.
+    pub seqno: u64,
+    /// Whether this entry is a tombstone (strong delete marker) or a
+    /// weak tombstone. Tombstones carry an empty `value` and exist
+    /// to suppress older versions of the same key during compaction.
+    pub is_tombstone: bool,
+}
+
+/// Streaming iterator over every KV entry in an SST's data section.
+///
+/// Returned by [`iter_data_block_entries`]. Owns the underlying file
+/// handle and the list of pending data-block handles; loads exactly
+/// one data block at a time and drops it before moving to the next,
+/// so memory cost is `O(largest_data_block + key.len + value.len)`
+/// even for SSTs holding tens of millions of entries.
+///
+/// Encrypted SSTs and partitioned-index SSTs both return an error
+/// at construction time — see [`iter_data_block_entries`] for the
+/// full contract.
+#[cfg(feature = "std")]
+pub struct DataBlockEntryIter {
+    file: Box<dyn crate::fs::FsFile>,
+    table_id: crate::table::TableId,
+    data_block_compression: CompressionType,
+    /// Remaining data-block handles (FIFO). Drained as blocks are
+    /// loaded. Held as a `Vec` rather than a `VecDeque` because the
+    /// TLI walks the handles in sorted order already, and `Vec::pop`
+    /// from the tail with reversed input is cheaper than the
+    /// double-ended queue overhead.
+    remaining_handles: Vec<crate::table::KeyedBlockHandle>,
+    /// Iterator over the currently-loaded block, or `None` when we
+    /// haven't loaded a block yet or just finished one.
+    current: Option<crate::table::iter::OwnedDataBlockIter>,
+}
+
+#[cfg(feature = "std")]
+impl Iterator for DataBlockEntryIter {
+    type Item = crate::Result<DataEntry>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            // Drain the current block before considering the next one.
+            if let Some(iter) = self.current.as_mut() {
+                if let Some(internal) = iter.next() {
+                    let value_type = internal.key.value_type;
+                    let entry = DataEntry {
+                        key: internal.key.user_key.to_vec(),
+                        value: internal.value.to_vec(),
+                        seqno: internal.key.seqno,
+                        is_tombstone: !matches!(value_type, crate::ValueType::Value),
+                    };
+                    return Some(Ok(entry));
+                }
+                self.current = None;
+            }
+
+            // Advance to the next data block.
+            let handle = self.remaining_handles.pop()?;
+            match load_data_block_iter(
+                &*self.file,
+                handle.as_ref(),
+                self.table_id,
+                self.data_block_compression,
+            ) {
+                Ok(iter) => {
+                    self.current = Some(iter);
+                }
+                Err(e) => {
+                    // Surface the block-load failure but stop the
+                    // walk: subsequent blocks would likely fail the
+                    // same way and the operator only needs the first
+                    // diagnostic.
+                    self.remaining_handles.clear();
+                    return Some(Err(e));
+                }
+            }
+        }
+    }
+}
+
+/// Reads `path` and returns a streaming iterator over every KV entry
+/// in the SST's data blocks.
+///
+/// Same out-of-band path-based open semantics as
+/// [`read_table_properties`] etc.: uses [`StdFs`], no encryption
+/// provider. Walks the top-level index (TLI) to enumerate data-block
+/// handles, then yields entries one block at a time so memory cost
+/// stays bounded.
+///
+/// # Scope
+///
+/// Only **full-index** SSTs are supported by this facade. SSTs with
+/// a separate `index` SFA section (partitioned index) point their
+/// TLI entries at sub-index leaves rather than data blocks; walking
+/// the leaves to enumerate individual data blocks is a separate
+/// operation not yet wired here. Partitioned-index SSTs return an
+/// `Io(ErrorKind::Unsupported)` error.
+///
+/// # Errors
+///
+/// Returns an error if:
+/// - the file cannot be opened or read,
+/// - the SFA trailer is missing / malformed,
+/// - the `meta` block fails to decode (needed for
+///   `data_block_compression`),
+/// - the SST has a partitioned-index layout (`index` SFA section
+///   present),
+/// - the TLI block cannot be loaded or its trailer is malformed,
+/// - the table is encrypted: this function does not take an
+///   encryption provider, so AEAD-protected blocks fail to decode.
+///
+/// Per-entry errors are surfaced by the returned iterator's
+/// `Item = Result<DataEntry>` shape: a single block failing to load
+/// yields one `Err` and ends the walk.
+#[cfg(feature = "std")]
+pub fn iter_data_block_entries(path: &Path) -> crate::Result<DataBlockEntryIter> {
+    use crate::table::block_index::iter::OwnedIndexBlockIter;
+    use crate::table::{IndexBlock, KeyedBlockHandle};
+
+    let fs = StdFs;
+    let mut file = fs.open(path, &FsOpenOptions::new().read(true))?;
+
+    let sfa_reader = sfa::Reader::from_reader(&mut file)?;
+    let toc = sfa_reader.toc();
+    let regions = ParsedRegions::parse_from_toc(toc)?;
+
+    if regions.index.is_some() {
+        return Err(crate::Error::Io(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "partitioned-index SST (separate `index` section present) is not yet supported \
+             by iter_data_block_entries; walking sub-index leaves to enumerate data blocks \
+             is a follow-up surface",
+        )));
+    }
+
+    let meta = match ParsedMeta::load_with_handle(&*file, &regions.metadata, None) {
+        Ok(m) => m,
+        Err(tail_err) => {
+            if let Some(mid_handle) = regions.metadata_mid {
+                match ParsedMeta::load_with_handle(&*file, &mid_handle, None) {
+                    Ok(mid) => mid,
+                    Err(_) => return Err(tail_err),
+                }
+            } else {
+                return Err(tail_err);
+            }
+        }
+    };
+    let table_id = meta.id;
+    let data_block_compression = meta.data_block_compression;
+    let index_compression = meta.index_block_compression;
+
+    // Load TLI (with tail-mirror fallback). For full-index tables
+    // each TLI entry IS a data-block handle, so this list is what
+    // we stream over.
+    let tli_block = if let Some(tail_handle) = regions.tli_tail {
+        match load_index_block(&*file, tail_handle, table_id, index_compression) {
+            Ok(b) => b,
+            Err(tail_err) => {
+                match load_index_block(&*file, regions.tli, table_id, index_compression) {
+                    Ok(b) => b,
+                    Err(_) => return Err(tail_err),
+                }
+            }
+        }
+    } else {
+        load_index_block(&*file, regions.tli, table_id, index_compression)?
+    };
+
+    let block = IndexBlock::new(tli_block);
+    let iter = OwnedIndexBlockIter::from_block(block, crate::comparator::default_comparator())?;
+    // Collect into a Vec so the next() loop can `pop` from the tail
+    // (cheap) while iterating in original sorted order. Reverse
+    // here so `pop` yields the smallest end_key first — matches the
+    // natural left-to-right read order operators expect from `dump`.
+    let mut handles: Vec<KeyedBlockHandle> = iter.collect();
+    handles.reverse();
+
+    Ok(DataBlockEntryIter {
+        file,
+        table_id,
+        data_block_compression,
+        remaining_handles: handles,
+        current: None,
+    })
+}
+
+#[cfg(feature = "std")]
+fn load_data_block_iter(
+    file: &dyn crate::fs::FsFile,
+    handle: &crate::table::BlockHandle,
+    table_id: crate::table::TableId,
+    compression: CompressionType,
+) -> crate::Result<crate::table::iter::OwnedDataBlockIter> {
+    use crate::table::DataBlock;
+    use crate::table::block::{Block, BlockIdentity, BlockType};
+    use crate::table::iter::OwnedDataBlockIter;
+
+    let block = Block::from_file(
+        file,
+        *handle,
+        BlockIdentity {
+            tree_id: 0,
+            table_id,
+            // Same writer / reader agreement as TLI / filter: writer
+            // emits data blocks with `block_offset` set to a
+            // running cursor that we don't have exposed here; the
+            // BlockIdentity is ignored by `Block::from_file` today
+            // and only becomes load-bearing when #251 wires it into
+            // AEAD AAD. Holding at 0 keeps this facade consistent
+            // with how it loads the meta / TLI / filter blocks
+            // above. Once real offsets are threaded, all three
+            // load sites need updating together.
+            block_offset: 0,
+            block_type: BlockType::Data,
+            dict_id: 0,
+            window_log: 0,
+        },
+        compression,
+        None,
+        #[cfg(zstd_any)]
+        None,
+    )?;
+
+    if block.header.block_type != BlockType::Data {
+        return Err(crate::Error::InvalidTag((
+            "BlockType",
+            block.header.block_type.into(),
+        )));
+    }
+
+    let data_block = DataBlock::new(block);
+    OwnedDataBlockIter::try_new(data_block, |b| {
+        b.try_iter(crate::comparator::default_comparator())
+    })
+    .map_err(|e: crate::Error| e)
+}
