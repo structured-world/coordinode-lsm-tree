@@ -583,6 +583,25 @@ impl Iterator for DataBlockEntryIter {
 /// operation not yet wired here. Partitioned-index SSTs return an
 /// `Io(ErrorKind::Unsupported)` error.
 ///
+/// **Custom user comparator: not supported.** Internally the
+/// facade walks index and data blocks via
+/// [`crate::comparator::default_comparator`]. SSTs written with a
+/// custom comparator are sorted on disk by that comparator's order,
+/// not by lexicographic byte order; iterating them through this
+/// facade yields entries in the wrong order and breaks any
+/// early-termination assumption a caller might layer on top
+/// (`sst-dump dump --from / --to` for example). Such SSTs MUST be
+/// inspected via the owning `Tree`'s regular read APIs, not through
+/// this facade.
+///
+/// **Zstd-dictionary blocks: not supported.** This facade calls
+/// [`crate::table::Block::from_file`] with no
+/// [`crate::compression::ZstdDictionary`] attached (it has no way to
+/// fetch one without a live `Tree`), so blocks compressed with
+/// [`crate::CompressionType::ZstdDict`] fail with
+/// [`crate::Error::ZstdDictMismatch`] even though they are otherwise
+/// valid. Inspect such SSTs through the owning `Tree` instead.
+///
 /// # Errors
 ///
 /// Returns an error if:
