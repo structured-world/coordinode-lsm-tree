@@ -372,14 +372,36 @@ pub struct DataEntry {
     /// The user key bytes (no internal-key suffix, no seqno).
     pub key: Vec<u8>,
     /// The value bytes. Empty for tombstone entries (see
-    /// [`Self::is_tombstone`]).
+    /// [`Self::is_tombstone`]); for `ValueType::Indirection`, the bytes
+    /// are the encoded blob handle, NOT the resolved blob payload.
     pub value: Vec<u8>,
     /// MVCC sequence number assigned to this entry by the writer.
     pub seqno: u64,
-    /// Whether this entry is a tombstone (strong delete marker) or a
-    /// weak tombstone. Tombstones carry an empty `value` and exist
-    /// to suppress older versions of the same key during compaction.
-    pub is_tombstone: bool,
+    /// Underlying internal-key value type. Data blocks can contain
+    /// `Value`, `Tombstone`, `WeakTombstone`, `MergeOperand`, and
+    /// `Indirection` (blob pointer) entries; the convenience predicate
+    /// [`Self::is_tombstone`] folds the two tombstone variants into a
+    /// single boolean, but callers that need to distinguish merge
+    /// operands or blob pointers from regular values must read this
+    /// field directly. Going through the underlying enum keeps the
+    /// facade aligned with the crate's own tombstone predicate
+    /// ([`crate::ValueType::is_tombstone`]) as a single source of
+    /// truth so a future variant addition does not silently start
+    /// flagging unrelated entries as tombstones.
+    pub value_type: crate::ValueType,
+}
+
+impl DataEntry {
+    /// `true` iff [`Self::value_type`] is `Tombstone` or `WeakTombstone`.
+    ///
+    /// Convenience wrapper that delegates to
+    /// [`crate::ValueType::is_tombstone`]; `MergeOperand` and
+    /// `Indirection` entries return `false` here even though their
+    /// `value` bytes do not represent a regular plaintext value.
+    #[must_use]
+    pub fn is_tombstone(&self) -> bool {
+        self.value_type.is_tombstone()
+    }
 }
 
 /// Streaming iterator over every KV entry in an SST's data section.
@@ -478,17 +500,7 @@ impl Iterator for DataBlockEntryIter {
                         key: internal.key.user_key.to_vec(),
                         value,
                         seqno: internal.key.seqno,
-                        // `is_tombstone` must be true ONLY for the
-                        // two tombstone variants — `MergeOperand`
-                        // and `Indirection` are non-`Value` entries
-                        // but emphatically NOT tombstones. Using
-                        // `ValueType::is_tombstone()` keeps the
-                        // facade aligned with the crate's own
-                        // tombstone predicate (single source of
-                        // truth), so a future variant addition
-                        // doesn't quietly start flagging unrelated
-                        // entries as tombstones.
-                        is_tombstone: internal.key.value_type.is_tombstone(),
+                        value_type: internal.key.value_type,
                     };
                     return Some(Ok(entry));
                 }

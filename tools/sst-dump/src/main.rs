@@ -516,8 +516,18 @@ fn run_dump(
             // grep doesn't confuse a key whose value happens to
             // contain "tombstone".
             print!("{}={}", format_key(&entry.key), format_key(&entry.value));
-            if entry.is_tombstone {
-                print!("\t# tombstone");
+            // Surface non-`Value` entries by their `ValueType` tag so
+            // operators reading the dump can tell a real value from a
+            // tombstone / merge operand / blob-pointer indirection
+            // without separately inspecting the value bytes. Regular
+            // `Value` entries emit no annotation (the bare `=value`
+            // line is then the easy-to-grep happy path).
+            match entry.value_type {
+                lsm_tree::ValueType::Value => {}
+                lsm_tree::ValueType::Tombstone => print!("\t# tombstone"),
+                lsm_tree::ValueType::WeakTombstone => print!("\t# weak-tombstone"),
+                lsm_tree::ValueType::MergeOperand => print!("\t# merge-operand"),
+                lsm_tree::ValueType::Indirection => print!("\t# indirection"),
             }
             println!();
         }
