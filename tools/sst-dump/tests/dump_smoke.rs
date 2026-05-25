@@ -61,8 +61,11 @@ fn dump_emits_one_line_per_entry_with_key_equals_value() {
         String::from_utf8_lossy(&out.stderr),
     );
 
-    // 50 lines, one per entry. Use `count` (not `len`) so a trailing
-    // empty line doesn't inflate the assertion.
+    // 50 lines, one per entry. `str::lines` already strips the final
+    // empty element produced by a trailing newline, so `.len()` on
+    // the collected `Vec` gives the same count as iterating without
+    // collecting; we collect so the `lines[0]` / `lines[49]` indexing
+    // below is cheap and obvious.
     let lines: Vec<&str> = stdout.lines().collect();
     assert_eq!(
         lines.len() as u64,
