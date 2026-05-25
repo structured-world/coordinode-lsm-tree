@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779726882901,
+  "lastUpdate": 1779734478179,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -10140,6 +10140,84 @@ window.BENCHMARK_DATA = {
             "value": 452952.50499924814,
             "unit": "ops/sec",
             "extra": "P50: 2.0us | P99: 6.8us | P99.9: 10.0us\nthreads: 1 | elapsed: 0.44s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "a3c4795d922660ff83f33fcca1e079696c9d05e5",
+          "message": "refactor(block): collapse 4 Block I/O paths into a single BlockTransform enum (#248) (#337)\n\n## Summary\n\nImplements CP2 #248: the four valid Block I/O payload pipelines (Plain /\nCompressed / Encrypted / Compressed+Encrypted) collapse into one\ndiscriminated union, so invalid combinations are rejected at the type\nlevel instead of as runtime ZstdDictMismatch errors.\n\n## What changes\n\n### New types (src/table/block/transform.rs)\n\n- BlockTransform<'a> with 4 variants: Plain /\nCompressed(CompressionContext) / Encrypted(&dyn EncryptionProvider) /\nCompressedAndEncrypted(..., ...)\n- CompressionContext<'a> { kind: CompressionType, zstd_dict:\nOption<&ZstdDictionary> }; constructor rejects CompressionType::None\n- BlockTransform::PLAIN const for tests / unencrypted call sites\n- BlockTransform::from_parts() helper for callers that still receive the\nlegacy triple; centralises ZstdDictMismatch\n\n### Block I/O API changes\n\nBlock::write_into / from_reader / from_file take transform:\n&BlockTransform<'_> instead of (compression, encryption, zstd_dict). API\nbreak for downstream consumers (none in-tree).\n\n### Migrations\n\n- 18 production call sites in table/{mod,util,scanner,meta},\nwriter/{mod,filter,index}/*, inspect, vlog/blob_file/meta\n- ~80 test call sites in block/mod.rs::tests\n- write_block_to_tempfile test helper takes &BlockTransform<'_>\n- block_zstd_dict_missing_returns_error and\nblock_zstd_dict_wrong_dict_returns_error now assert directly on\nfrom_parts (the runtime check moved one layer earlier; same\nError::ZstdDictMismatch flow)\n\n## Test plan\n\n- cargo check --all-features clean\n- cargo clippy --all-features --all-targets -- -D warnings clean\n- cargo nextest run --all-features: 1572 passed, 2 skipped\n- No on-disk format change\n\nCloses #248.\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n## Summary by CodeRabbit\n\n* **Documentation**\n* Clarified docs for the \"feature unsupported\" error to explain\napplicable scenarios and expanded examples.\n\n* **Refactor**\n* Unified compression/encryption/dictionary into a single\nblock-transform model across reads/writes.\n* Certain block types (filters, meta, index, range-tombstone) are\nexplicitly uncompressed; zstd-dictionary mismatches are validated\nearlier and may surface sooner.\n* Inspection paths now reject out-of-band encryption/dictionary\nrecovery.\n\n<!-- review_stack_entry_start -->\n\n[![Review Change\nStack](https://storage.googleapis.com/coderabbit_public_assets/review-stack-in-coderabbit-ui.svg)](https://app.coderabbit.ai/change-stack/structured-world/coordinode-lsm-tree/pull/337?utm_source=github_walkthrough&utm_medium=github&utm_campaign=change_stack)\n\n<!-- review_stack_entry_end -->\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-05-25T21:40:23+03:00",
+          "tree_id": "af8f60f4f5ea23d886b4d91471c0444256e6cbb0",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/a3c4795d922660ff83f33fcca1e079696c9d05e5"
+        },
+        "date": 1779734475457,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 2073251.521515235,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.6us | P99.9: 3.7us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1210940.669731808,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.2us | P99.9: 4.4us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 512626.1736092454,
+            "unit": "ops/sec",
+            "extra": "P50: 1.8us | P99: 5.1us | P99.9: 7.9us\nthreads: 1 | elapsed: 0.39s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3642879.422967899,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 3.0us | P99.9: 5.6us\nthreads: 1 | elapsed: 0.05s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 380810.26183731045,
+            "unit": "ops/sec",
+            "extra": "P50: 2.3us | P99: 5.6us | P99.9: 8.2us\nthreads: 1 | elapsed: 0.53s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 202298.3043599898,
+            "unit": "ops/sec",
+            "extra": "P50: 4.6us | P99: 5.8us | P99.9: 8.9us\nthreads: 1 | elapsed: 0.99s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1227681.4570280674,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.2us | P99.9: 4.3us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1139602.5811497038,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 1.5us | P99.9: 2.2us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 462656.59861753025,
+            "unit": "ops/sec",
+            "extra": "P50: 2.0us | P99: 5.4us | P99.9: 8.5us\nthreads: 1 | elapsed: 0.43s | num: 200000 | iterations: 3"
           }
         ]
       }
