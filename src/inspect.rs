@@ -346,10 +346,21 @@ fn load_index_block(
             dict_id: 0,
             window_log: 0,
         },
-        compression,
-        None,
-        #[cfg(zstd_any)]
-        None,
+        // Inspect-side index loader doesn't accept an encryption
+        // provider (out-of-band facade) and never threads a zstd
+        // dict. The transform therefore resolves to either:
+        //   - `Plain` when `compression == None`, or
+        //   - `Compressed` for `Lz4` / `Zstd(level)`.
+        // `CompressionType::ZstdDict { .. }` is rejected here with
+        // `Error::ZstdDictMismatch` because the dict can't be
+        // recovered without a live `Tree`; inspect such SSTs through
+        // the owning tree instead.
+        &crate::table::block::BlockTransform::from_parts(
+            compression,
+            None,
+            #[cfg(zstd_any)]
+            None,
+        )?,
     )?;
 
     if block.header.block_type != BlockType::Index {
@@ -717,6 +728,14 @@ fn load_data_block_iter(
     use crate::table::block::{Block, BlockIdentity, BlockType};
     use crate::table::iter::OwnedDataBlockIter;
 
+    // Inspect-side data-block loader: no encryption provider (out-
+    // of-band facade) and never a zstd dict. Same transform-
+    // resolution rule as load_index_block above:
+    //   - compression == None  →  BlockTransform::Plain
+    //   - compression == Lz4 / Zstd(level)  →  BlockTransform::Compressed
+    //   - compression == ZstdDict { .. }  →  rejected via
+    //     Error::ZstdDictMismatch (no dict can be threaded without a
+    //     live Tree).
     let block = Block::from_file(
         file,
         *handle,
@@ -737,10 +756,12 @@ fn load_data_block_iter(
             dict_id: 0,
             window_log: 0,
         },
-        compression,
-        None,
-        #[cfg(zstd_any)]
-        None,
+        &crate::table::block::BlockTransform::from_parts(
+            compression,
+            None,
+            #[cfg(zstd_any)]
+            None,
+        )?,
     )?;
 
     if block.header.block_type != BlockType::Data {
@@ -893,21 +914,32 @@ pub fn read_filter_stats(path: &Path) -> crate::Result<Option<FilterStats>> {
     let item_count = meta.item_count;
     let table_id = meta.id;
 
-    // Filter blocks are written uncompressed by `FullFilterWriter`
-    // (see `src/table/writer/filter/full.rs::finish` — it passes
-    // `CompressionType::None`). No compression-codec lookup needed
-    // on the read path.
+    // Inspect-side filter loader. Two design choices here:
     //
-    // `block_offset` is held at 0 here even though
-    // `filter_handle.offset()` carries the real on-disk position,
-    // because the writer
-    // (`src/table/writer/filter/full.rs::finish`) emits the filter
-    // block with `BlockIdentity { block_offset: 0, ... }`. Reader
-    // and writer must agree on BlockIdentity for AEAD verification
-    // once #251 wires it into AAD; switching only this side to
-    // `filter_handle.offset()` would break that agreement.
-    // Threading real offsets through both sides is a coordinated
-    // change tracked alongside #251.
+    // 1. **Transform is `Plain` — chosen here, not dictated by the
+    //    writer.** `FullFilterWriter::finish` does NOT always emit
+    //    filter blocks as `Plain`: when the tree has an encryption
+    //    provider configured, it emits `Encrypted` instead (no
+    //    compression in either case — filter blocks aren't worth
+    //    compressing). This facade chooses `Plain` because it has
+    //    no encryption provider plumbed through (out-of-band path,
+    //    no live `Tree`), so for SSTs whose filter block was
+    //    written encrypted, `Block::from_file` here verifies the
+    //    XXH3 over the ciphertext bytes and then fails downstream —
+    //    typically `InvalidHeader` from `uncompressed_length`
+    //    disagreeing with the ciphertext length, not a clean
+    //    `Error::Decrypt`. Encrypted-aware filter inspection is
+    //    tracked alongside #251 / #256.
+    //
+    // 2. **`block_offset` held at 0.** `filter_handle.offset()`
+    //    carries the real on-disk position, but the writer emits
+    //    the filter block with `BlockIdentity { block_offset: 0,
+    //    ... }`. Reader and writer must agree on `BlockIdentity`
+    //    for AEAD verification once #251 wires it into AAD;
+    //    switching only this side to `filter_handle.offset()`
+    //    would break that agreement. Threading real offsets
+    //    through both sides is a coordinated change tracked
+    //    alongside #251.
     let block = Block::from_file(
         &*file,
         filter_handle,
@@ -919,10 +951,7 @@ pub fn read_filter_stats(path: &Path) -> crate::Result<Option<FilterStats>> {
             dict_id: 0,
             window_log: 0,
         },
-        CompressionType::None,
-        None,
-        #[cfg(zstd_any)]
-        None,
+        &crate::table::block::BlockTransform::PLAIN,
     )?;
     if block.header.block_type != BlockType::Filter {
         return Err(crate::Error::InvalidTag((

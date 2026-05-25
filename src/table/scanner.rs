@@ -136,10 +136,12 @@ impl Scanner {
                 dict_id: compression.dict_id(),
                 window_log: 0,
             },
-            compression,
-            encryption,
-            #[cfg(zstd_any)]
-            zstd_dict,
+            &crate::table::block::BlockTransform::from_parts(
+                compression,
+                encryption,
+                #[cfg(zstd_any)]
+                zstd_dict,
+            )?,
         );
 
         match block {

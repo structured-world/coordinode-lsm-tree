@@ -134,10 +134,10 @@ impl Metadata {
                 dict_id: 0,
                 window_log: 0,
             },
-            CompressionType::None,
-            None,
-            #[cfg(zstd_any)]
-            None,
+            // Blob-meta blocks are always uncompressed and currently
+            // never encrypted (see TODO above on blob-level
+            // encryption). Plain transform here.
+            &crate::table::block::BlockTransform::PLAIN,
         )?;
 
         Ok(())
@@ -174,10 +174,10 @@ impl Metadata {
                 dict_id: 0,
                 window_log: 0,
             },
-            CompressionType::None,
-            None,
-            #[cfg(zstd_any)]
-            None,
+            // Blob-meta blocks are always uncompressed and currently
+            // never encrypted (see TODO above on blob-level
+            // encryption). Plain transform here.
+            &crate::table::block::BlockTransform::PLAIN,
         )?;
         let block = DataBlock::new(block);
 
@@ -289,10 +289,7 @@ mod tests {
             &mut buf,
             &encoded,
             crate::table::block::BlockIdentity::for_test(0, 0, BlockType::Meta),
-            CompressionType::None,
-            None,
-            #[cfg(zstd_any)]
-            None,
+            &crate::table::block::BlockTransform::PLAIN,
         )
         .unwrap();
 
