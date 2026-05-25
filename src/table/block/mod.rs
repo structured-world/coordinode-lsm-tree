@@ -2321,7 +2321,7 @@ mod tests {
         }
 
         #[test]
-        fn block_zstd_dict_missing_returns_error() -> crate::Result<()> {
+        fn block_zstd_dict_missing_returns_error() {
             // The runtime dict-presence check that used to live inside
             // Block::write_into / from_reader for the ZstdDict codec is
             // now centralised in `BlockTransform::from_parts`. The error
@@ -2339,11 +2339,10 @@ mod tests {
                 ),
                 "expected ZstdDictMismatch with got=None",
             );
-            Ok(())
         }
 
         #[test]
-        fn block_zstd_dict_wrong_dict_returns_error() -> crate::Result<()> {
+        fn block_zstd_dict_wrong_dict_returns_error() {
             // As with the dict-missing test above, the wrong-dict check
             // now lives in BlockTransform::from_parts (it cross-checks
             // the supplied dictionary id against the
@@ -2366,7 +2365,6 @@ mod tests {
                 ),
                 "expected ZstdDictMismatch with got=Some",
             );
-            Ok(())
         }
 
         #[test]

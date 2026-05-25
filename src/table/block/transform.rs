@@ -46,10 +46,10 @@ use crate::{CompressionType, encryption::EncryptionProvider};
 /// reference" marker.
 pub struct CompressionContext<'a> {
     /// Codec discriminator. The [`CompressionType::None`] variant
-    /// is rejected by the constructor — see [`Self::new`] —
-    /// because "plain payload" is already a distinct
-    /// [`BlockTransform`] variant; carrying it as a `CompressionContext`
-    /// would double-encode the same state.
+    /// is rejected by the constructor (see [`Self::new`]) because
+    /// "plain payload" is already a distinct [`BlockTransform`]
+    /// variant; carrying it as a `CompressionContext` would
+    /// double-encode the same state.
     pub kind: CompressionType,
 
     /// Raw zstd dictionary handle, required when `kind` is
@@ -71,7 +71,7 @@ impl<'a> CompressionContext<'a> {
     /// # Errors
     ///
     /// Returns [`crate::Error::InvalidTag`] if `kind` is
-    /// [`CompressionType::None`] — "plain payload" is represented
+    /// [`CompressionType::None`]: "plain payload" is represented
     /// by [`BlockTransform::Plain`] / [`BlockTransform::Encrypted`],
     /// not a `Compressed(_)` variant with `kind = None`.
     pub fn new(kind: CompressionType) -> crate::Result<Self> {
