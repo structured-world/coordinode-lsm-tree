@@ -404,10 +404,6 @@ pub struct DataEntry {
 /// Encrypted SSTs and partitioned-index SSTs both return an error
 /// at construction time — see [`iter_data_block_entries`] for the
 /// full contract.
-///
-/// Encrypted SSTs and partitioned-index SSTs both return an error
-/// at construction time — see [`iter_data_block_entries`] for the
-/// full contract.
 #[cfg(feature = "std")]
 pub struct DataBlockEntryIter {
     file: Box<dyn crate::fs::FsFile>,
