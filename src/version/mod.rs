@@ -3,7 +3,7 @@
 // Copyright (c) 2026-present, Structured World Foundation
 
 mod blob_file_list;
-pub(crate) mod framing;
+mod framing;
 mod optimize;
 mod persist;
 pub mod recovery;
@@ -740,6 +740,25 @@ impl Version {
 
         writer.start("tables")?;
 
+        // Per-record framing details live in src/version/framing.rs.
+        // Top-level shape inside the `tables` section after framing:
+        //   level_count: u8
+        //   for each level:
+        //     run_count: u8
+        //     for each run:
+        //       table_count: u32 LE
+        //       for each table:
+        //         FRAMED(table_record_payload)   // 12-byte header + payload
+        //
+        // The level / run / table_count counters stay unframed
+        // because they ARE the section's own structural shape — the
+        // pre-framing readers used them to walk the section and the
+        // framing-aware readers continue to use them the same way.
+        // Only the per-table record bytes (the 33-byte
+        // id+checksum_type+checksum+global_seqno payload) become
+        // framed so PointInTimeRecovery / SkipAnyCorruptedRecords
+        // have exact byte boundaries to skip on.
+
         // Level count
         #[expect(
             clippy::cast_possible_truncation,
@@ -763,12 +782,15 @@ impl Version {
                 )]
                 writer.write_u32::<LittleEndian>(run.len() as u32)?;
 
-                // Tables
+                // Tables — each one framed.
                 for table in run.iter() {
-                    writer.write_u64::<LittleEndian>(table.id())?;
-                    writer.write_u8(0)?; // Checksum type, 0 = XXH3
-                    writer.write_u128::<LittleEndian>(table.checksum().into_u128())?;
-                    writer.write_u64::<LittleEndian>(table.global_seqno())?;
+                    framing::write_framed_record(writer, |payload| {
+                        payload.write_u64::<LittleEndian>(table.id())?;
+                        payload.write_u8(0)?; // Checksum type, 0 = XXH3
+                        payload.write_u128::<LittleEndian>(table.checksum().into_u128())?;
+                        payload.write_u64::<LittleEndian>(table.global_seqno())?;
+                        Ok(())
+                    })?;
                 }
             }
         }
@@ -783,9 +805,13 @@ impl Version {
         writer.write_u32::<LittleEndian>(self.blob_files.len() as u32)?;
 
         for file in self.blob_files.iter() {
-            writer.write_u64::<LittleEndian>(file.id())?;
-            writer.write_u8(0)?; // Checksum type, 0 = XXH3
-            writer.write_u128::<LittleEndian>(file.0.checksum.into_u128())?;
+            // Per-blob record framed, same rationale as tables above.
+            framing::write_framed_record(writer, |payload| {
+                payload.write_u64::<LittleEndian>(file.id())?;
+                payload.write_u8(0)?; // Checksum type, 0 = XXH3
+                payload.write_u128::<LittleEndian>(file.0.checksum.into_u128())?;
+                Ok(())
+            })?;
         }
 
         writer.start("blob_gc_stats")?;

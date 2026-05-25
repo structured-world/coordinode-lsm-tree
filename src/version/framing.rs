@@ -16,7 +16,7 @@
 //! [`ManifestRecoveryMode::PointInTimeRecovery`] and
 //! [`ManifestRecoveryMode::SkipAnyCorruptedRecords`] both need to do
 //! more than that: PIT wants to stop at the last consistent
-//! record-group boundary and accept the prefix; SkipAny wants to
+//! record-group boundary and accept the prefix; `SkipAny` wants to
 //! skip one bad record and keep reading. Both modes need to know
 //! the exact byte length of each record so they can step past one
 //! without losing sync with the rest.
@@ -60,7 +60,7 @@ use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use std::io::{Read, Write};
 
 /// Size of the framing header in bytes (4 B `len` + 8 B `xxh3_64`).
-pub(crate) const FRAME_HEADER_LEN: usize = 4 + 8;
+pub const FRAME_HEADER_LEN: usize = 4 + 8;
 
 /// Hard cap on `len` — keeps an obviously-forged value from
 /// triggering an allocation that exceeds reasonable manifest
@@ -70,7 +70,7 @@ pub(crate) const FRAME_HEADER_LEN: usize = 4 + 8;
 /// `comparator_name` length cap upstream. 64 KiB is a generous
 /// ceiling that still cuts off any `len` that would otherwise
 /// trigger a multi-megabyte allocation on a corrupt header.
-pub(crate) const MAX_FRAME_PAYLOAD: u32 = 64 * 1024;
+pub const MAX_FRAME_PAYLOAD: u32 = 64 * 1024;
 
 /// Writes a framed record: writes the 12-byte header, then the
 /// closure-provided payload, then patches the header with the
@@ -87,7 +87,7 @@ pub(crate) const MAX_FRAME_PAYLOAD: u32 = 64 * 1024;
 ///
 /// Returns the I/O error from `writer` if any write fails, or
 /// surfaces any error returned by `payload_fn`.
-pub(crate) fn write_framed_record<W, F>(writer: &mut W, payload_fn: F) -> crate::Result<()>
+pub fn write_framed_record<W, F>(writer: &mut W, payload_fn: F) -> crate::Result<()>
 where
     W: Write,
     F: FnOnce(&mut Vec<u8>) -> crate::Result<()>,
@@ -112,7 +112,7 @@ where
 /// Result of [`read_framed_record`] — exposes the per-record
 /// outcome so the caller can apply mode-specific recovery policy.
 #[derive(Debug)]
-pub(crate) enum FramedRecordOutcome {
+pub enum FramedRecordOutcome {
     /// The header decoded, payload was read in full, and the
     /// XXH3-64 digest matched. The contained `Vec<u8>` is the
     /// record's payload bytes — caller decodes it into its
@@ -123,7 +123,7 @@ pub(crate) enum FramedRecordOutcome {
     /// read in full, but the XXH3-64 digest disagreed with
     /// `xxh3_64(payload)`. The header itself stays internally
     /// consistent (len fits the section), so callers operating in
-    /// SkipAny mode know how many bytes were consumed and can
+    /// `SkipAny` mode know how many bytes were consumed and can
     /// continue reading after the skip. The `bytes_consumed` field
     /// is `FRAME_HEADER_LEN + len`.
     ChecksumMismatch { bytes_consumed: u64 },
@@ -133,7 +133,7 @@ pub(crate) enum FramedRecordOutcome {
     /// reader has NOT advanced past the header; callers must
     /// surrender per-record granularity for the rest of the
     /// section and fall back to a section-level recovery strategy
-    /// (typically: drop the rest of the section under SkipAny,
+    /// (typically: drop the rest of the section under `SkipAny`,
     /// abort under stricter modes).
     BadHeader,
 
@@ -160,7 +160,7 @@ pub(crate) enum FramedRecordOutcome {
 /// [`FramedRecordOutcome::TailTruncation`]). Decode-time errors
 /// (checksum mismatch, oversized header) are surfaced via the
 /// returned [`FramedRecordOutcome`] variant rather than `Err`.
-pub(crate) fn read_framed_record<R: Read>(
+pub fn read_framed_record<R: Read>(
     reader: &mut R,
     remaining_in_section: u64,
 ) -> crate::Result<FramedRecordOutcome> {
@@ -205,16 +205,18 @@ pub(crate) fn read_framed_record<R: Read>(
     if digest_actual == digest_expected {
         Ok(FramedRecordOutcome::Ok(payload))
     } else {
-        #[expect(
-            clippy::cast_lossless,
-            reason = "FRAME_HEADER_LEN is a small const, the cast is a tag-along"
-        )]
         let bytes_consumed = FRAME_HEADER_LEN as u64 + u64::from(len);
         Ok(FramedRecordOutcome::ChecksumMismatch { bytes_consumed })
     }
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    reason = "test code: explicit panics and direct indexing keep test \
+              setup readable; values are inline-known"
+)]
 mod tests {
     use super::*;
     use std::io::Cursor;

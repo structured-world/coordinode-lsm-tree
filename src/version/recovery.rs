@@ -14,33 +14,20 @@ use crate::{
 use byteorder::{LittleEndian, ReadBytesExt};
 use std::path::Path;
 
-/// `io::Error::kind` values that we interpret as a clean tail truncation
-/// inside the per-record loop. `UnexpectedEof` is the canonical signal
-/// from `Read::read_exact` / `byteorder::ReadBytesExt` when the reader
-/// runs out of bytes mid-record; any other kind means a different
-/// failure and is not eligible for tail-tolerant recovery.
-fn is_clean_tail_truncation(e: &crate::Error) -> bool {
-    matches!(
-        e,
-        crate::Error::Io(io) if io.kind() == std::io::ErrorKind::UnexpectedEof
-    )
-}
-
-/// Reads one 33-byte table-run entry from a section reader. Each entry:
-/// `id: u64 | checksum_type: u8 | checksum: u128 | global_seqno: u64`.
-/// Tail-tolerance: a partial-read past the section bound surfaces as
-/// `Error::Io(UnexpectedEof)`, which `recover()` recognises as a clean
-/// tail-truncation signal under `TolerateCorruptedTailRecords`. A
-/// non-zero `checksum_type` byte is NOT a tail-truncation case — that's
-/// a forged/corrupt record and aborts regardless of mode.
-fn read_one_table_entry<R: std::io::Read>(reader: &mut R) -> crate::Result<RecoveredTable> {
-    let id = reader.read_u64::<LittleEndian>()?;
-    let checksum_type = reader.read_u8()?;
+/// Decodes a 33-byte table-record payload (post-framing): `id: u64 |
+/// checksum_type: u8 | checksum: u128 | global_seqno: u64`. The
+/// surrounding framing header (length + XXH3-64) is handled by
+/// [`crate::version::framing::read_framed_record`] before this is
+/// called.
+fn decode_table_entry_payload(payload: &[u8]) -> crate::Result<RecoveredTable> {
+    let mut cursor = std::io::Cursor::new(payload);
+    let id = cursor.read_u64::<LittleEndian>()?;
+    let checksum_type = cursor.read_u8()?;
     if checksum_type != 0 {
         return Err(crate::Error::InvalidTag(("ChecksumType", checksum_type)));
     }
-    let checksum = Checksum::from_raw(reader.read_u128::<LittleEndian>()?);
-    let global_seqno = reader.read_u64::<LittleEndian>()?;
+    let checksum = Checksum::from_raw(cursor.read_u128::<LittleEndian>()?);
+    let global_seqno = cursor.read_u64::<LittleEndian>()?;
     Ok(RecoveredTable {
         id,
         checksum,
@@ -48,16 +35,17 @@ fn read_one_table_entry<R: std::io::Read>(reader: &mut R) -> crate::Result<Recov
     })
 }
 
-/// Reads one 25-byte blob-file entry:
-/// `id: u64 | checksum_type: u8 | checksum: u128`. Same
-/// tail-truncation contract as [`read_one_table_entry`].
-fn read_one_blob_entry<R: std::io::Read>(reader: &mut R) -> crate::Result<(BlobFileId, Checksum)> {
-    let id = reader.read_u64::<LittleEndian>()?;
-    let checksum_type = reader.read_u8()?;
+/// Decodes a 25-byte blob-record payload (post-framing): `id: u64 |
+/// checksum_type: u8 | checksum: u128`. Same contract as
+/// [`decode_table_entry_payload`].
+fn decode_blob_entry_payload(payload: &[u8]) -> crate::Result<(BlobFileId, Checksum)> {
+    let mut cursor = std::io::Cursor::new(payload);
+    let id = cursor.read_u64::<LittleEndian>()?;
+    let checksum_type = cursor.read_u8()?;
     if checksum_type != 0 {
         return Err(crate::Error::InvalidTag(("ChecksumType", checksum_type)));
     }
-    let checksum = Checksum::from_raw(reader.read_u128::<LittleEndian>()?);
+    let checksum = Checksum::from_raw(cursor.read_u128::<LittleEndian>()?);
     Ok((id, checksum))
 }
 
@@ -110,6 +98,16 @@ pub struct Recovery {
               into helpers without clarifying the flow"
 )]
 pub fn recover(folder: &Path, fs: &dyn Fs, mode: ManifestRecoveryMode) -> crate::Result<Recovery> {
+    // Per-record framing constants used by both the tables and
+    // blob_files sections. Each on-disk record is a
+    // FRAME_HEADER_LEN (12-byte) header followed by a fixed-size
+    // payload — 33 bytes for tables, 25 bytes for blob_files —
+    // for a total of FRAMED_TABLE_ENTRY_LEN / FRAMED_BLOB_ENTRY_LEN
+    // bytes respectively.
+    const FRAMED_TABLE_ENTRY_LEN: u64 = crate::version::framing::FRAME_HEADER_LEN as u64 + 33;
+    const FRAMED_BLOB_ENTRY_LEN: u64 = crate::version::framing::FRAME_HEADER_LEN as u64 + 25;
+    use crate::version::framing::FramedRecordOutcome;
+
     let curr_version_id = get_current_version(folder, fs)?;
     let version_file_path = folder.join(format!("v{curr_version_id}"));
 
@@ -122,7 +120,30 @@ pub fn recover(folder: &Path, fs: &dyn Fs, mode: ManifestRecoveryMode) -> crate:
     let reader = sfa::Reader::from_reader(&mut file)?;
     let toc = reader.toc();
 
-    let tolerate_tail = matches!(mode, ManifestRecoveryMode::TolerateCorruptedTailRecords);
+    // Mode dispatch flags. The per-section loops below treat these
+    // four modes as three flag combinations:
+    //
+    //   AbsoluteConsistency: every flag false → first decode error
+    //     anywhere in the section aborts the open.
+    //   TolerateCorruptedTailRecords: tolerate_tail = true; the
+    //     ChecksumMismatch / BadHeader paths still abort, only
+    //     truncated tail (`FramedRecordOutcome::TailTruncation`) is
+    //     accepted.
+    //   PointInTimeRecovery: tolerate_tail = true AND pit_prefix = true.
+    //     On ChecksumMismatch / BadHeader, behaves like reaching EOF
+    //     for the current level — the in-progress run + level + all
+    //     subsequent levels are dropped. The recovered prefix is the
+    //     consistent state up to the last good record-group boundary.
+    //   SkipAnyCorruptedRecords: tolerate_tail = true AND skip_any = true.
+    //     ChecksumMismatch on a single record is logged and skipped;
+    //     reading continues with the next record. BadHeader can no
+    //     longer be skipped surgically (the length field itself is
+    //     suspect, so the byte boundary of the next record is
+    //     unknown) — the rest of the current section is abandoned
+    //     under this mode, same as PIT but scoped to one section.
+    let tolerate_tail = !matches!(mode, ManifestRecoveryMode::AbsoluteConsistency);
+    let pit_prefix = matches!(mode, ManifestRecoveryMode::PointInTimeRecovery);
+    let skip_any = matches!(mode, ManifestRecoveryMode::SkipAnyCorruptedRecords);
 
     // // TODO: vvv move into Version::decode vvv
     let mut levels = vec![];
@@ -228,22 +249,17 @@ pub fn recover(folder: &Path, fs: &dyn Fs, mode: ManifestRecoveryMode) -> crate:
                     Err(e) => return Err(e.into()),
                 };
 
-                // Tight-bound check: count * entry_size against
-                // bytes_remaining at the current cursor, NOT against
-                // section.len(). The loose bound would let an
-                // in-section forgery (count > remaining but still
-                // <= section_total/entry_size) slip past unnoticed
-                // and get reclassified as a clean tail truncation by
-                // the per-entry EOF arm below. The tight bound
-                // surfaces the same shape as an explicit "count
-                // exceeds remaining" warn before the loop runs.
+                // Tight-bound check: count * framed_entry_size against
+                // bytes_remaining at the current cursor. Each framed
+                // entry is FRAME_HEADER_LEN (12) + 33 bytes payload =
+                // 45 bytes.
                 //
-                // Under `AbsoluteConsistency` this is a hard "the
-                // count header is forged" abort. Under
-                // `TolerateCorruptedTailRecords` it warns and lets
-                // the loop walk bytes-actually-present.
+                // Under `AbsoluteConsistency` count > remaining is a
+                // hard "count header forged" abort. Under any of the
+                // tolerant modes it warns and lets the loop walk
+                // bytes-actually-present.
                 let bytes_remaining = section.len().saturating_sub(tables_bytes_consumed);
-                if u64::from(table_count).saturating_mul(33) > bytes_remaining {
+                if u64::from(table_count).saturating_mul(FRAMED_TABLE_ENTRY_LEN) > bytes_remaining {
                     if tolerate_tail {
                         log::warn!(
                             "tables: declared table_count={table_count} exceeds \
@@ -251,7 +267,7 @@ pub fn recover(folder: &Path, fs: &dyn Fs, mode: ManifestRecoveryMode) -> crate:
                              ~{} entries) in version #{curr_version_id}; \
                              tail-tolerant mode walks bytes-actually-present and \
                              stops at the first EOF",
-                            bytes_remaining / 33,
+                            bytes_remaining / FRAMED_TABLE_ENTRY_LEN,
                         );
                     } else {
                         return Err(crate::Error::Unrecoverable);
@@ -259,16 +275,18 @@ pub fn recover(folder: &Path, fs: &dyn Fs, mode: ManifestRecoveryMode) -> crate:
                 }
 
                 for _ in 0..table_count {
-                    let entry = read_one_table_entry(&mut reader);
-                    match entry {
-                        Ok(t) => {
-                            tables_bytes_consumed += 33;
+                    let remaining = section.len().saturating_sub(tables_bytes_consumed);
+                    let outcome =
+                        crate::version::framing::read_framed_record(&mut reader, remaining)?;
+                    match outcome {
+                        FramedRecordOutcome::Ok(payload) => {
+                            tables_bytes_consumed += crate::version::framing::FRAME_HEADER_LEN
+                                as u64
+                                + payload.len() as u64;
+                            let t = decode_table_entry_payload(&payload)?;
                             run.push(t);
                         }
-                        Err(e) if tolerate_tail && is_clean_tail_truncation(&e) => {
-                            // run.len() is bounded by table_count
-                            // (u32); cast can't truncate in practice
-                            // but try_from for clippy.
+                        FramedRecordOutcome::TailTruncation if tolerate_tail => {
                             let recovered = u32::try_from(run.len()).unwrap_or(u32::MAX);
                             tables_dropped_to_tail = tables_dropped_to_tail
                                 .saturating_add(table_count.saturating_sub(recovered));
@@ -276,7 +294,74 @@ pub fn recover(folder: &Path, fs: &dyn Fs, mode: ManifestRecoveryMode) -> crate:
                             levels.push(level);
                             break 'levels;
                         }
-                        Err(e) => return Err(e),
+                        FramedRecordOutcome::ChecksumMismatch { bytes_consumed } if skip_any => {
+                            // Single bad record under SkipAny: log
+                            // it and continue with the next record.
+                            // The 12-byte header was internally
+                            // consistent (len fits the section), so
+                            // the reader has cleanly advanced past
+                            // exactly this record and the next
+                            // iteration's read lines up on the next
+                            // record's header.
+                            log::warn!(
+                                "skip_any: tables record checksum mismatch \
+                                 ({bytes_consumed} bytes) in version \
+                                 #{curr_version_id}, skipping"
+                            );
+                            tables_bytes_consumed += bytes_consumed;
+                            tables_dropped_to_tail = tables_dropped_to_tail.saturating_add(1);
+                        }
+                        FramedRecordOutcome::ChecksumMismatch { .. } if pit_prefix => {
+                            // PIT: corruption is the boundary; drop
+                            // the in-progress run + level + all
+                            // higher (not-yet-read) levels. The
+                            // tables_dropped_to_tail counter reports
+                            // how many records this level's surviving
+                            // tail loses; deeper levels are absent
+                            // entirely from `levels`.
+                            log::warn!(
+                                "pit: tables record checksum mismatch in version \
+                                 #{curr_version_id}; truncating to last consistent \
+                                 record-group boundary (dropping current run + level + \
+                                 unread levels)"
+                            );
+                            let recovered = u32::try_from(run.len()).unwrap_or(u32::MAX);
+                            tables_dropped_to_tail = tables_dropped_to_tail
+                                .saturating_add(table_count.saturating_sub(recovered));
+                            level.push(run);
+                            levels.push(level);
+                            break 'levels;
+                        }
+                        FramedRecordOutcome::ChecksumMismatch { .. } => {
+                            return Err(crate::Error::ChecksumMismatch {
+                                got: Checksum::from_raw(0),
+                                expected: Checksum::from_raw(0),
+                            });
+                        }
+                        FramedRecordOutcome::BadHeader if skip_any || pit_prefix => {
+                            // Header itself is suspect — cannot find
+                            // the next record boundary. Same fallback
+                            // for both modes: drop the rest of this
+                            // section's records and call it done.
+                            log::warn!(
+                                "tables: corrupted framing header in version \
+                                 #{curr_version_id}; remaining records in this \
+                                 section are unrecoverable"
+                            );
+                            let recovered = u32::try_from(run.len()).unwrap_or(u32::MAX);
+                            tables_dropped_to_tail = tables_dropped_to_tail
+                                .saturating_add(table_count.saturating_sub(recovered));
+                            level.push(run);
+                            levels.push(level);
+                            break 'levels;
+                        }
+                        // Strict mode: both shapes of "we ran out of
+                        // intact bytes" abort the open. Merged into a
+                        // single arm so clippy::match_same_arms stays
+                        // happy.
+                        FramedRecordOutcome::TailTruncation | FramedRecordOutcome::BadHeader => {
+                            return Err(crate::Error::Unrecoverable);
+                        }
                     }
                 }
 
@@ -319,54 +404,80 @@ pub fn recover(folder: &Path, fs: &dyn Fs, mode: ManifestRecoveryMode) -> crate:
             Err(e) => return Err(e.into()),
         };
 
-        // Same as the `table_count` check: count > section payload
-        // is a hard fail under strict mode (the count header is
-        // forged), but a power-loss-during-write that committed the
-        // count then truncated the entries produces exactly this
-        // shape, so tolerant mode must warn and let the per-entry
-        // loop walk bytes-actually-present until the first EOF.
-        //
-        // `section.len().saturating_sub(4)` IS the tight
-        // bytes-remaining bound here — unlike the `tables` section
-        // there are no intermediate header bytes between the count
-        // and the first entry (just the 4-byte count u32 itself),
-        // so this is already the correct "bytes left after the
-        // cursor read" value. No bytes-consumed counter needed.
-        if u64::from(blob_file_count) > section.len().saturating_sub(4) / 25 {
+        // Each framed blob entry is FRAME_HEADER_LEN (12) + 25 bytes
+        // payload = 37 bytes. Same forged-vs-truncated dispatch as the
+        // tables-section count check.
+        let blob_section_capacity = section.len().saturating_sub(4) / FRAMED_BLOB_ENTRY_LEN;
+        if u64::from(blob_file_count) > blob_section_capacity {
             if tolerate_tail {
                 log::warn!(
                     "blob_files: declared count={blob_file_count} exceeds section \
-                     capacity (~{} entries) in version #{curr_version_id}; \
-                     tail-tolerant mode walks bytes-actually-present and stops at \
-                     the first EOF",
-                    section.len().saturating_sub(4) / 25,
+                     capacity (~{blob_section_capacity} entries) in version \
+                     #{curr_version_id}; tail-tolerant mode walks \
+                     bytes-actually-present and stops at the first EOF",
                 );
             } else {
                 return Err(crate::Error::Unrecoverable);
             }
         }
 
-        // Don't allocate full `blob_file_count` capacity when the
-        // count overflows the section — that's a several-GB
-        // Vec::with_capacity allocation on the forged-count branch.
-        // Cap at the section-derived upper bound.
         let cap_hint =
-            usize::try_from(u64::from(blob_file_count).min(section.len().saturating_sub(4) / 25))
-                .unwrap_or(0);
+            usize::try_from(u64::from(blob_file_count).min(blob_section_capacity)).unwrap_or(0);
         let mut blob_file_ids = Vec::with_capacity(cap_hint);
+        let mut blob_bytes_consumed: u64 = 4; // count u32 already read
 
         for _ in 0..blob_file_count {
-            match read_one_blob_entry(&mut reader) {
-                Ok(t) => blob_file_ids.push(t),
-                Err(e) if tolerate_tail && is_clean_tail_truncation(&e) => {
-                    // try_from over `as u32` for clippy; the cast is
-                    // safe in practice because blob_file_ids.len() is
-                    // bounded by blob_file_count (u32) via the loop.
+            let remaining = section.len().saturating_sub(blob_bytes_consumed);
+            let outcome = crate::version::framing::read_framed_record(&mut reader, remaining)?;
+            match outcome {
+                FramedRecordOutcome::Ok(payload) => {
+                    blob_bytes_consumed +=
+                        crate::version::framing::FRAME_HEADER_LEN as u64 + payload.len() as u64;
+                    let entry = decode_blob_entry_payload(&payload)?;
+                    blob_file_ids.push(entry);
+                }
+                FramedRecordOutcome::TailTruncation if tolerate_tail => {
                     let recovered = u32::try_from(blob_file_ids.len()).unwrap_or(u32::MAX);
                     blob_dropped_to_tail = blob_file_count.saturating_sub(recovered);
                     break;
                 }
-                Err(e) => return Err(e),
+                FramedRecordOutcome::ChecksumMismatch { bytes_consumed } if skip_any => {
+                    log::warn!(
+                        "skip_any: blob_files record checksum mismatch \
+                         ({bytes_consumed} bytes) in version \
+                         #{curr_version_id}, skipping"
+                    );
+                    blob_bytes_consumed += bytes_consumed;
+                    blob_dropped_to_tail = blob_dropped_to_tail.saturating_add(1);
+                }
+                FramedRecordOutcome::ChecksumMismatch { .. } if pit_prefix => {
+                    log::warn!(
+                        "pit: blob_files record checksum mismatch in version \
+                         #{curr_version_id}; truncating remaining blob records"
+                    );
+                    let recovered = u32::try_from(blob_file_ids.len()).unwrap_or(u32::MAX);
+                    blob_dropped_to_tail = blob_file_count.saturating_sub(recovered);
+                    break;
+                }
+                FramedRecordOutcome::ChecksumMismatch { .. } => {
+                    return Err(crate::Error::ChecksumMismatch {
+                        got: Checksum::from_raw(0),
+                        expected: Checksum::from_raw(0),
+                    });
+                }
+                FramedRecordOutcome::BadHeader if skip_any || pit_prefix => {
+                    log::warn!(
+                        "blob_files: corrupted framing header in version \
+                         #{curr_version_id}; remaining records unrecoverable"
+                    );
+                    let recovered = u32::try_from(blob_file_ids.len()).unwrap_or(u32::MAX);
+                    blob_dropped_to_tail = blob_file_count.saturating_sub(recovered);
+                    break;
+                }
+                // Strict mode: merged Tail / BadHeader → Unrecoverable.
+                FramedRecordOutcome::TailTruncation | FramedRecordOutcome::BadHeader => {
+                    return Err(crate::Error::Unrecoverable);
+                }
             }
         }
 
@@ -403,7 +514,9 @@ pub fn recover(folder: &Path, fs: &dyn Fs, mode: ManifestRecoveryMode) -> crate:
         // a "rebuild on next pass" outcome rather than data loss).
         match crate::blob_tree::FragmentationMap::decode_from(&mut reader) {
             Ok(m) => m,
-            Err(e) if tolerate_tail && is_clean_tail_truncation(&e) => {
+            Err(crate::Error::Io(e))
+                if tolerate_tail && e.kind() == std::io::ErrorKind::UnexpectedEof =>
+            {
                 log::warn!(
                     "blob_gc_stats section truncated in version #{curr_version_id}; \
                      tail-tolerant mode produces an empty FragmentationMap (GC stats \
@@ -596,15 +709,18 @@ mod tests {
         w.write_u8(1)?; // 1 level
         w.write_u8(1)?; // 1 run
         w.write_u32::<LittleEndian>(declared)?;
-        // Write `actual` complete 33-byte entries, then stop. SFA will
-        // pad the section length to whatever bytes we wrote — the
-        // truncation surfaces inside the per-entry decode loop, not at
-        // the SFA layer.
+        // Write `actual` complete framed entries, then stop. SFA pads
+        // the section length to whatever bytes we wrote — the
+        // truncation surfaces inside the per-entry decode loop, not
+        // at the SFA layer.
         for entry_id in 0..actual {
-            w.write_u64::<LittleEndian>(u64::from(entry_id))?;
-            w.write_u8(0)?; // checksum_type
-            w.write_u128::<LittleEndian>(0)?; // checksum
-            w.write_u64::<LittleEndian>(0)?; // global_seqno
+            crate::version::framing::write_framed_record(&mut w, |payload| {
+                payload.write_u64::<LittleEndian>(u64::from(entry_id))?;
+                payload.write_u8(0)?; // checksum_type
+                payload.write_u128::<LittleEndian>(0)?; // checksum
+                payload.write_u64::<LittleEndian>(0)?; // global_seqno
+                Ok(())
+            })?;
         }
 
         w.start("blob_files")?;
@@ -702,10 +818,19 @@ mod tests {
         w.write_u8(1)?; // 1 level
         w.write_u8(1)?; // 1 run
         w.write_u32::<LittleEndian>(1)?; // 1 entry
-        w.write_u64::<LittleEndian>(0)?; // id
-        w.write_u8(0xFF)?; // corrupt checksum_type — should abort
-        w.write_u128::<LittleEndian>(0)?;
-        w.write_u64::<LittleEndian>(0)?;
+        // Framed record with a corrupt `checksum_type` byte in the
+        // payload. The framing XXH3 still covers the payload, so the
+        // record decodes cleanly at the framing layer; the InvalidTag
+        // surfaces from `decode_table_entry_payload` and aborts even
+        // under tolerant modes (the contract: tail-tolerance is for
+        // write-incomplete scenarios, not arbitrary corruption).
+        crate::version::framing::write_framed_record(&mut w, |payload| {
+            payload.write_u64::<LittleEndian>(0)?; // id
+            payload.write_u8(0xFF)?; // corrupt checksum_type
+            payload.write_u128::<LittleEndian>(0)?;
+            payload.write_u64::<LittleEndian>(0)?;
+            Ok(())
+        })?;
         w.start("blob_files")?;
         w.write_u32::<LittleEndian>(0)?;
         w.start("blob_gc_stats")?;
@@ -750,10 +875,13 @@ mod tests {
         w.write_u8(2)?; // 2 runs in that level
         // run #0: declared=1, actual=1 — the consistent prefix.
         w.write_u32::<LittleEndian>(1)?;
-        w.write_u64::<LittleEndian>(42)?; // id
-        w.write_u8(0)?; // checksum_type
-        w.write_u128::<LittleEndian>(0)?;
-        w.write_u64::<LittleEndian>(0)?;
+        crate::version::framing::write_framed_record(&mut w, |payload| {
+            payload.write_u64::<LittleEndian>(42)?; // id
+            payload.write_u8(0)?; // checksum_type
+            payload.write_u128::<LittleEndian>(0)?;
+            payload.write_u64::<LittleEndian>(0)?;
+            Ok(())
+        })?;
         // run #1: only 2 of the 4 bytes of `table_count` are written.
         // The reader gets `UnexpectedEof` on the u32 read.
         w.write_u8(0xAA)?;
@@ -839,9 +967,12 @@ mod tests {
         w.start("blob_files")?;
         w.write_u32::<LittleEndian>(declared)?;
         for entry_id in 0..actual {
-            w.write_u64::<LittleEndian>(u64::from(entry_id))?;
-            w.write_u8(0)?; // checksum_type
-            w.write_u128::<LittleEndian>(0)?; // checksum
+            crate::version::framing::write_framed_record(&mut w, |payload| {
+                payload.write_u64::<LittleEndian>(u64::from(entry_id))?;
+                payload.write_u8(0)?; // checksum_type
+                payload.write_u128::<LittleEndian>(0)?; // checksum
+                Ok(())
+            })?;
         }
         w.start("blob_gc_stats")?;
         w.write_u32::<LittleEndian>(0)?;
