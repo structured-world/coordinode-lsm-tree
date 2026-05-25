@@ -290,7 +290,7 @@ impl<'a> BlockTransform<'a> {
         };
 
         #[cfg(not(zstd_any))]
-        let ctx = CompressionContext::new(compression);
+        let ctx = CompressionContext::new(compression)?;
 
         Ok(match encryption {
             Some(enc) => Self::CompressedAndEncrypted(ctx, enc),
