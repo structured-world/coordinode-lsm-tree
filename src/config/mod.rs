@@ -493,7 +493,23 @@ impl Default for Config {
             top_level_index_block_pinning_policy: PinningPolicy::all(true), // TODO: implement
             top_level_filter_block_pinning_policy: PinningPolicy::all(true), // TODO: implement
 
-            index_block_partitioning_policy: PinningPolicy::new([false, false, false, true]),
+            // Partitioned at every level so a bit-flip inside one
+            // sub-index block only takes out the keys covered by that
+            // partition, not the entire SST. A full-index SST has no
+            // within-block redundancy: one corrupt byte in the single
+            // index block makes every data block in the table
+            // unreachable. See tests/partitioned_index_blast_radius.rs
+            // for the isolation property this default relies on.
+            index_block_partitioning_policy: PinningPolicy::all(true),
+            // Filter-block default intentionally left at the pre-#329
+            // shape (L3+ only). A corrupt filter block can produce a
+            // false negative (filter says "not present" → read short-
+            // circuits → caller misses an existing key), which is a
+            // correctness hazard distinct from index corruption (where
+            // the read fails loudly). Flipping this default is tracked
+            // as a separate decision pending a filter blast-radius /
+            // false-negative analysis; symmetry with index is not
+            // sufficient justification on its own.
             filter_block_partitioning_policy: PinningPolicy::new([false, false, false, true]),
 
             index_block_partition_size_policy: BlockSizePolicy::all(4_096), // TODO: implement
