@@ -28,12 +28,18 @@
 //!    handle directly and derives the on-disk `dict_id` from
 //!    `dict.id()`. The previous "construct a ZstdDict-kind context
 //!    without a dict" mistake therefore can't be expressed in the
-//!    public API at all; the runtime mismatch check on the
-//!    `Block::write_into` happy path is gone. (The legacy-triple
-//!    helper [`BlockTransform::from_parts`] still has one runtime
-//!    `ZstdDictMismatch` check for callers that haven't yet
-//!    migrated; that path is the only place the error can still
-//!    fire.)
+//!    public API at all. The runtime `ZstdDictMismatch` guards
+//!    inside `Block::write_into` / `from_reader` / `from_file`
+//!    still execute on every block (they re-check that a dictionary
+//!    is attached and that its `id()` matches the on-disk
+//!    `dict_id`), but with `BlockTransform` constructed via the
+//!    safe API they are defense-in-depth only and cannot fire.
+//!    The one remaining path that can legitimately produce
+//!    `ZstdDictMismatch` is the legacy-triple helper
+//!    [`BlockTransform::from_parts`], which is checked at
+//!    construction time (so the error is raised before any
+//!    `Block` I/O is attempted) for callers that have not yet
+//!    migrated to the typed constructors.
 //! 2. **Shrinks the public surface.** `Block::write_into` /
 //!    `from_reader` / `from_file` each previously took three
 //!    transform-related args; they now take one
@@ -62,9 +68,11 @@ use crate::{CompressionType, encryption::EncryptionProvider};
 ///    [`Self::with_dict`]), and `with_dict` takes the dictionary by
 ///    reference and derives `dict_id` from `dict.id()` itself. There
 ///    is therefore no construction path that yields a `ZstdDict`
-///    context without a matching dict, and the runtime
-///    `ZstdDictMismatch` check that used to live on the
-///    `Block::write_into` happy path is gone.
+///    context without a matching dict. The runtime `ZstdDictMismatch`
+///    guards inside `Block::write_into` / `from_reader` / `from_file`
+///    still execute on every block, but with `CompressionContext`
+///    constructed via the safe API they are defense-in-depth only
+///    and cannot fire.
 pub struct CompressionContext<'a> {
     kind: CompressionType,
 
