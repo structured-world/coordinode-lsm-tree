@@ -115,6 +115,30 @@ pub struct RecoveredTable {
     pub global_seqno: SeqNo,
 }
 
+/// Per-section counters tracking how many records were dropped during
+/// tolerant / PIT / `SkipAny` recovery and why. Exposed as part of
+/// [`Recovery`] so operators (and integration tests) can verify the
+/// recovery outcome without parsing log output.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct RecoveryStats {
+    /// Table records dropped because the writer was cut mid-record /
+    /// mid-run-header / mid-level-header (tail truncation).
+    pub tables_dropped_to_tail: u32,
+    /// Table records dropped because their framing checksum or
+    /// header failed — i.e. real bit-rot inside an otherwise-written
+    /// region (only ever non-zero under `SkipAny` / PIT modes).
+    pub tables_dropped_to_corruption: u32,
+    /// Number of level / run header bytes that were truncated by
+    /// tail-cutting (no per-entry bytes lost — distinguished from
+    /// record-drop accounting so the summary log stays honest).
+    pub tables_truncated_headers: u32,
+    /// Blob-file records dropped to tail truncation (analogous to
+    /// [`Self::tables_dropped_to_tail`] for the `blob_files` section).
+    pub blob_dropped_to_tail: u32,
+    /// Blob-file records dropped to per-record corruption.
+    pub blob_dropped_to_corruption: u32,
+}
+
 #[derive(Debug)]
 pub struct Recovery {
     pub tree_type: TreeType,
@@ -122,6 +146,16 @@ pub struct Recovery {
     pub table_ids: Vec<Vec<Vec<RecoveredTable>>>,
     pub blob_file_ids: Vec<(BlobFileId, Checksum)>,
     pub gc_stats: crate::blob_tree::FragmentationMap,
+    /// Per-section counters describing how many records were dropped
+    /// during this recovery. Always zero under
+    /// [`ManifestRecoveryMode::AbsoluteConsistency`] (any corruption
+    /// or truncation aborts before returning a [`Recovery`]).
+    #[allow(
+        dead_code,
+        reason = "operator-facing telemetry surface; in-tree non-test \
+                  code reaches Recovery via public API only"
+    )]
+    pub stats: RecoveryStats,
 }
 
 #[expect(
@@ -283,6 +317,14 @@ pub fn recover(folder: &Path, fs: &dyn Fs, mode: ManifestRecoveryMode) -> crate:
 
             for _ in 0..run_count {
                 let mut run = vec![];
+                // Records lost to corruption in THIS run (SkipAny
+                // skips, PIT/SkipAny BadHeader drops). Used at
+                // tail-truncation to compute the tail-attributed
+                // miss-count honestly: tail = table_count -
+                // run.len() - corrupted_in_run. Without this, the
+                // already-corruption-counted records get
+                // re-attributed as tail drops in the summary log.
+                let mut corrupted_in_run: u32 = 0;
                 let table_count = match reader.read_u32::<LittleEndian>() {
                     Ok(n) => {
                         tables_bytes_consumed += 4;
@@ -354,9 +396,16 @@ pub fn recover(folder: &Path, fs: &dyn Fs, mode: ManifestRecoveryMode) -> crate:
                             run.push(t);
                         }
                         FramedRecordOutcome::TailTruncation if tolerate_tail => {
+                            // Subtract BOTH successfully decoded records
+                            // (run.len()) AND already-corrupted ones in
+                            // this run (corrupted_in_run, only ever
+                            // non-zero under SkipAny). Without that,
+                            // skipped records get double-counted as
+                            // tail drops in the summary log.
                             let recovered = u32::try_from(run.len()).unwrap_or(u32::MAX);
+                            let processed = recovered.saturating_add(corrupted_in_run);
                             tables_dropped_to_tail = tables_dropped_to_tail
-                                .saturating_add(table_count.saturating_sub(recovered));
+                                .saturating_add(table_count.saturating_sub(processed));
                             // Skip empty run / empty level: Version::from_recovery
                             // requires non-empty runs (Run::new returns None on empty
                             // input and downstream .expect() panics). When corruption
@@ -388,6 +437,7 @@ pub fn recover(folder: &Path, fs: &dyn Fs, mode: ManifestRecoveryMode) -> crate:
                             tables_bytes_consumed += bytes_consumed;
                             tables_dropped_to_corruption =
                                 tables_dropped_to_corruption.saturating_add(1);
+                            corrupted_in_run = corrupted_in_run.saturating_add(1);
                         }
                         FramedRecordOutcome::ChecksumMismatch { .. } if pit_prefix => {
                             // PIT: corruption is the boundary. Keep
@@ -579,6 +629,12 @@ pub fn recover(folder: &Path, fs: &dyn Fs, mode: ManifestRecoveryMode) -> crate:
             usize::try_from(u64::from(blob_file_count).min(blob_section_capacity)).unwrap_or(0);
         let mut blob_file_ids = Vec::with_capacity(cap_hint);
         let mut blob_bytes_consumed: u64 = 4; // count u32 already read
+        // Records lost to corruption in the blob_files section
+        // (SkipAny ChecksumMismatch / BadHeader). Used at
+        // TailTruncation to compute the tail-attributed miss-count
+        // honestly: tail = blob_file_count - blob_file_ids.len()
+        // - blob_corrupted. Same accounting fix as the tables section.
+        let mut blob_corrupted: u32 = 0;
 
         for _ in 0..blob_file_count {
             let remaining = section.len().saturating_sub(blob_bytes_consumed);
@@ -598,8 +654,13 @@ pub fn recover(folder: &Path, fs: &dyn Fs, mode: ManifestRecoveryMode) -> crate:
                     blob_file_ids.push(entry);
                 }
                 FramedRecordOutcome::TailTruncation if tolerate_tail => {
+                    // Subtract BOTH successfully decoded records AND
+                    // already-corrupted ones from the tail-attributed
+                    // count, otherwise skipped records get
+                    // double-counted as tail drops in the summary log.
                     let recovered = u32::try_from(blob_file_ids.len()).unwrap_or(u32::MAX);
-                    blob_dropped_to_tail = blob_file_count.saturating_sub(recovered);
+                    let processed = recovered.saturating_add(blob_corrupted);
+                    blob_dropped_to_tail = blob_file_count.saturating_sub(processed);
                     break;
                 }
                 FramedRecordOutcome::ChecksumMismatch { bytes_consumed, .. } if skip_any => {
@@ -610,6 +671,7 @@ pub fn recover(folder: &Path, fs: &dyn Fs, mode: ManifestRecoveryMode) -> crate:
                     );
                     blob_bytes_consumed += bytes_consumed;
                     blob_dropped_to_corruption = blob_dropped_to_corruption.saturating_add(1);
+                    blob_corrupted = blob_corrupted.saturating_add(1);
                 }
                 FramedRecordOutcome::ChecksumMismatch { .. } if pit_prefix => {
                     log::warn!(
@@ -732,6 +794,13 @@ pub fn recover(folder: &Path, fs: &dyn Fs, mode: ManifestRecoveryMode) -> crate:
         table_ids: levels,
         blob_file_ids,
         gc_stats,
+        stats: RecoveryStats {
+            tables_dropped_to_tail,
+            tables_dropped_to_corruption,
+            tables_truncated_headers,
+            blob_dropped_to_tail,
+            blob_dropped_to_corruption,
+        },
     })
 }
 
@@ -1759,6 +1828,83 @@ mod tests {
             vec![10],
             "PIT must drop the corrupt blob record AND every blob record after it; \
              expected only id=10 (the good prefix), got {ids:?}",
+        );
+        Ok(())
+    }
+
+    /// Builds a manifest where level 0 declares `table_count = 3` but
+    /// only writes 1 good record + 1 corrupt record before truncating
+    /// (the writer was killed mid-record). Used to exercise the
+    /// `SkipAny` + `TailTruncation` accounting fix: previously
+    /// `tables_dropped_to_tail` was computed from `run.len()` alone
+    /// (= 1), which re-counted the already-skipped corrupt record as
+    /// a tail drop; the correct math subtracts BOTH
+    /// successfully-decoded AND skipped-corrupt records.
+    fn write_manifest_skip_any_then_tail_truncated(
+        folder: &Path,
+        id: u64,
+        fs: &dyn Fs,
+    ) -> crate::Result<()> {
+        let path = folder.join(format!("v{id}"));
+        let file = fs.open(
+            &path,
+            &FsOpenOptions::new().write(true).create(true).truncate(true),
+        )?;
+        let mut w = sfa::Writer::from_writer(std::io::BufWriter::new(file));
+
+        w.start("tree_type")?;
+        w.write_u8(0)?;
+
+        w.start("tables")?;
+        w.write_u8(1)?; // 1 level
+        w.write_u8(1)?; // 1 run
+        w.write_u32::<LittleEndian>(3)?; // declared 3 records...
+        // ...but only 2 actually written (good + corrupt). The third
+        // is implicitly truncated — reader hits UnexpectedEof at the
+        // 3rd record's frame header.
+        write_good_table_record(&mut w, 100)?;
+        write_bad_table_record(&mut w, 101)?;
+
+        w.start("blob_files")?;
+        w.write_u32::<LittleEndian>(0)?;
+        w.start("blob_gc_stats")?;
+        w.write_u32::<LittleEndian>(0)?;
+        w.finish().map_err(|e| match e {
+            sfa::Error::Io(e) => crate::Error::from(e),
+            _ => crate::Error::Unrecoverable,
+        })?;
+        Ok(())
+    }
+
+    /// Regression test for review finding on PR #342:
+    /// `tables_dropped_to_tail` was being computed from `run.len()`
+    /// alone, but under `SkipAnyCorruptedRecords` previously-skipped
+    /// corrupt records are NOT in `run` — they were already counted
+    /// in `tables_dropped_to_corruption`. The pre-fix math would
+    /// double-count them at `TailTruncation`, reporting
+    /// `tail = table_count - run.len() = 3 - 1 = 2` when the correct
+    /// breakdown is `tail = 1, corruption = 1` (the corrupt record
+    /// goes to corruption, only the genuinely missing trailing
+    /// record goes to tail).
+    #[test]
+    fn recover_skip_any_then_tail_accounts_corruption_separately() -> crate::Result<()> {
+        let fs = MemFs::new();
+        let folder = Path::new("/skip_any/then_tail");
+        fs.create_dir_all(folder)?;
+        write_current(folder, 1, &fs)?;
+        write_manifest_skip_any_then_tail_truncated(folder, 1, &fs)?;
+
+        let recovery = recover(folder, &fs, ManifestRecoveryMode::SkipAnyCorruptedRecords)?;
+
+        assert_eq!(
+            recovery.stats.tables_dropped_to_corruption, 1,
+            "the corrupt record must land in the corruption counter",
+        );
+        assert_eq!(
+            recovery.stats.tables_dropped_to_tail, 1,
+            "exactly one trailing record was truncated; the previously-skipped \
+             corrupt record must NOT be re-counted here as tail (pre-fix value \
+             would be 2)",
         );
         Ok(())
     }
