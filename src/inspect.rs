@@ -392,7 +392,24 @@ pub struct DataEntry {
     /// For [`crate::ValueType::Indirection`] entries the bytes
     /// are the encoded blob handle, NOT the resolved blob payload.
     pub value: Vec<u8>,
-    /// MVCC sequence number assigned to this entry by the writer.
+    /// Per-entry sequence number as stored in the internal key on
+    /// disk. This is the **table-local** (or "local") seqno: the
+    /// `Table::get` / `Iter` read path adds the table's `global_seqno`
+    /// offset on top of this for ingested SSTs (see
+    /// `src/table/mod.rs` for the translation), so the value the
+    /// running tree sees can be higher than the byte here. For an
+    /// SST written by the normal writer path `global_seqno == 0`
+    /// and the local seqno IS the visible seqno; for an ingested
+    /// SST the visible seqno is `global_seqno + local_seqno` and
+    /// this field gives the local component only.
+    ///
+    /// Diagnostic surface: this facade deliberately exposes the
+    /// on-disk byte, not the translated value, because operators
+    /// using `sst-dump` are usually trying to correlate against the
+    /// raw on-disk state. If you need the live-tree-visible seqno,
+    /// pair this with the `global_seqno` stored in the table's meta
+    /// block (currently not exposed on [`TableProperties`]; tracked
+    /// for a future API addition).
     pub seqno: u64,
     /// Underlying internal-key value type. Data blocks can contain
     /// `Value`, `Tombstone`, `WeakTombstone`, `MergeOperand`, and
