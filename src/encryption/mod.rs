@@ -35,6 +35,8 @@
 //! over.
 
 pub mod aad;
+#[cfg(feature = "encryption")]
+pub mod aead;
 pub mod error;
 
 /// Block encryption provider.
