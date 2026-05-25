@@ -16,11 +16,17 @@ use std::path::Path;
 
 /// Exact on-disk size of a `tables`-section record payload (post-framing):
 /// `id: u64 (8) | checksum_type: u8 (1) | checksum: u128 (16) | global_seqno: u64 (8)`.
-const TABLE_ENTRY_PAYLOAD_LEN: usize = 8 + 1 + 16 + 8;
+///
+/// Stored as `u32` because the framing layer's `len` field is `u32`;
+/// pinning at this type avoids cast-truncation lints at every
+/// `read_framed_record` call site. Used as a `usize` length check
+/// inside `decode_table_entry_payload` via the implicit
+/// `u32 -> usize` widening.
+const TABLE_ENTRY_PAYLOAD_LEN: u32 = 8 + 1 + 16 + 8;
 
 /// Exact on-disk size of a `blob_files`-section record payload (post-framing):
 /// `id: u64 (8) | checksum_type: u8 (1) | checksum: u128 (16)`.
-const BLOB_ENTRY_PAYLOAD_LEN: usize = 8 + 1 + 16;
+const BLOB_ENTRY_PAYLOAD_LEN: u32 = 8 + 1 + 16;
 
 /// Decodes a 33-byte table-record payload (post-framing): `id: u64 |
 /// checksum_type: u8 | checksum: u128 | global_seqno: u64`. The
@@ -39,7 +45,7 @@ const BLOB_ENTRY_PAYLOAD_LEN: usize = 8 + 1 + 16;
 /// bug surfacing as silently-skipped records would be worse than
 /// a hard fail at open time.
 fn decode_table_entry_payload(payload: &[u8]) -> crate::Result<RecoveredTable> {
-    if payload.len() != TABLE_ENTRY_PAYLOAD_LEN {
+    if payload.len() != TABLE_ENTRY_PAYLOAD_LEN as usize {
         return Err(crate::Error::InvalidHeader("tables record payload length"));
     }
     let mut cursor = std::io::Cursor::new(payload);
@@ -61,7 +67,7 @@ fn decode_table_entry_payload(payload: &[u8]) -> crate::Result<RecoveredTable> {
 /// checksum_type: u8 | checksum: u128`. Same length-check contract as
 /// [`decode_table_entry_payload`].
 fn decode_blob_entry_payload(payload: &[u8]) -> crate::Result<(BlobFileId, Checksum)> {
-    if payload.len() != BLOB_ENTRY_PAYLOAD_LEN {
+    if payload.len() != BLOB_ENTRY_PAYLOAD_LEN as usize {
         return Err(crate::Error::InvalidHeader(
             "blob_files record payload length",
         ));
@@ -316,8 +322,18 @@ pub fn recover(folder: &Path, fs: &dyn Fs, mode: ManifestRecoveryMode) -> crate:
 
                 for _ in 0..table_count {
                     let remaining = section.len().saturating_sub(tables_bytes_consumed);
-                    let outcome =
-                        crate::version::framing::read_framed_record(&mut reader, remaining)?;
+                    // Pin the on-disk `len` to the fixed table-record
+                    // payload size so a corrupted-but-plausible
+                    // `len` cannot mis-align the cursor for the
+                    // next record under SkipAny — read_framed_record
+                    // returns BadHeader for `len != expected`,
+                    // which the section-drop fallback below
+                    // handles safely.
+                    let outcome = crate::version::framing::read_framed_record(
+                        &mut reader,
+                        remaining,
+                        Some(TABLE_ENTRY_PAYLOAD_LEN),
+                    )?;
                     match outcome {
                         FramedRecordOutcome::Ok(payload) => {
                             tables_bytes_consumed += crate::version::framing::FRAME_HEADER_LEN
@@ -498,7 +514,13 @@ pub fn recover(folder: &Path, fs: &dyn Fs, mode: ManifestRecoveryMode) -> crate:
 
         for _ in 0..blob_file_count {
             let remaining = section.len().saturating_sub(blob_bytes_consumed);
-            let outcome = crate::version::framing::read_framed_record(&mut reader, remaining)?;
+            // Fixed-length pin on the blob_files record (same
+            // SkipAny resync safety net as the tables section).
+            let outcome = crate::version::framing::read_framed_record(
+                &mut reader,
+                remaining,
+                Some(BLOB_ENTRY_PAYLOAD_LEN),
+            )?;
             match outcome {
                 FramedRecordOutcome::Ok(payload) => {
                     blob_bytes_consumed +=

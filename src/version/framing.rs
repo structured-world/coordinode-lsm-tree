@@ -192,6 +192,26 @@ pub enum FramedRecordOutcome {
 /// well past the legitimate end. Pass `u64::MAX` if the section
 /// boundary is not known.
 ///
+/// `expected_payload_len`, when `Some(n)`, pins the record to a
+/// fixed payload size: any `len != n` is treated as
+/// [`FramedRecordOutcome::BadHeader`] BEFORE the payload is
+/// consumed, so a corrupted-but-plausible `len` (still within
+/// `MAX_FRAME_PAYLOAD` and the section bound) cannot mis-align
+/// the cursor for the next record. This is the critical safety
+/// net for [`crate::config::ManifestRecoveryMode::SkipAnyCorruptedRecords`]:
+/// without the fixed-length pin, a corrupt `len` would consume
+/// the wrong number of payload bytes, fail the XXH3 check, then
+/// have the `SkipAny` arm "continue past the record" — but the
+/// cursor is now off by `(corrupt_len - real_len)` bytes and the
+/// next read decodes garbage as a new record. With the pin, the
+/// reader stops at `BadHeader` (cursor has consumed only the 4-byte
+/// `len`, no payload bytes), the caller drops the rest of the
+/// section, and downstream sections decode correctly.
+///
+/// Pass `None` for variable-size records (none currently exist
+/// in the manifest, but the parameter is kept open-ended for
+/// future record types).
+///
 /// # Errors
 ///
 /// Returns the underlying [`std::io::Error`] when a read fails for
@@ -202,6 +222,7 @@ pub enum FramedRecordOutcome {
 pub fn read_framed_record<R: Read>(
     reader: &mut R,
     remaining_in_section: u64,
+    expected_payload_len: Option<u32>,
 ) -> crate::Result<FramedRecordOutcome> {
     let len = match reader.read_u32::<LittleEndian>() {
         Ok(n) => n,
@@ -220,6 +241,19 @@ pub fn read_framed_record<R: Read>(
         // consumed the 4 bytes of `len`, but that is acceptable
         // because a BadHeader signal tells the caller to surrender
         // per-record granularity for the rest of the section.
+        return Ok(FramedRecordOutcome::BadHeader);
+    }
+
+    // Fixed-size record pin: caller said the payload MUST be
+    // exactly `expected` bytes, but the on-disk `len` says
+    // otherwise. Even if both fit MAX_FRAME_PAYLOAD and the
+    // section bound, trusting the on-disk value would mis-align
+    // the cursor — see the docstring for the SkipAny resync
+    // argument. Treat as BadHeader so the caller drops the rest
+    // of the section instead of trying to continue.
+    if let Some(expected) = expected_payload_len
+        && len != expected
+    {
         return Ok(FramedRecordOutcome::BadHeader);
     }
 
@@ -304,7 +338,7 @@ mod tests {
         let bytes = roundtrip(payload);
 
         let mut cursor = Cursor::new(&bytes);
-        let outcome = read_framed_record(&mut cursor, u64::MAX).expect("read");
+        let outcome = read_framed_record(&mut cursor, u64::MAX, None).expect("read");
         match outcome {
             FramedRecordOutcome::Ok(decoded) => assert_eq!(decoded, payload),
             other => panic!("expected Ok, got {other:?}"),
@@ -320,7 +354,7 @@ mod tests {
         bytes[FRAME_HEADER_LEN] ^= 0x01;
 
         let mut cursor = Cursor::new(&bytes);
-        let outcome = read_framed_record(&mut cursor, u64::MAX).expect("read");
+        let outcome = read_framed_record(&mut cursor, u64::MAX, None).expect("read");
         match outcome {
             FramedRecordOutcome::ChecksumMismatch {
                 bytes_consumed,
@@ -346,7 +380,7 @@ mod tests {
         bytes.extend_from_slice(&0u64.to_le_bytes());
 
         let mut cursor = Cursor::new(&bytes);
-        let outcome = read_framed_record(&mut cursor, u64::MAX).expect("read");
+        let outcome = read_framed_record(&mut cursor, u64::MAX, None).expect("read");
         assert!(
             matches!(outcome, FramedRecordOutcome::BadHeader),
             "expected BadHeader for oversized len, got {outcome:?}",
@@ -366,7 +400,7 @@ mod tests {
         bytes.extend_from_slice(&0u64.to_le_bytes());
 
         let mut cursor = Cursor::new(&bytes);
-        let outcome = read_framed_record(&mut cursor, 8 + 1).expect("read");
+        let outcome = read_framed_record(&mut cursor, 8 + 1, None).expect("read");
         assert!(
             matches!(outcome, FramedRecordOutcome::TailTruncation),
             "expected TailTruncation for len > remaining, got {outcome:?}",
@@ -377,7 +411,7 @@ mod tests {
     fn framed_record_tail_truncation_at_header() {
         // Empty input → reading the `len` field hits EOF immediately.
         let mut cursor = Cursor::new(Vec::<u8>::new());
-        let outcome = read_framed_record(&mut cursor, u64::MAX).expect("read");
+        let outcome = read_framed_record(&mut cursor, u64::MAX, None).expect("read");
         assert!(
             matches!(outcome, FramedRecordOutcome::TailTruncation),
             "expected TailTruncation, got {outcome:?}",
@@ -395,7 +429,7 @@ mod tests {
         bytes.truncate(FRAME_HEADER_LEN + payload.len() / 2);
 
         let mut cursor = Cursor::new(&bytes);
-        let outcome = read_framed_record(&mut cursor, u64::MAX).expect("read");
+        let outcome = read_framed_record(&mut cursor, u64::MAX, None).expect("read");
         assert!(
             matches!(outcome, FramedRecordOutcome::TailTruncation),
             "expected TailTruncation, got {outcome:?}",
