@@ -43,7 +43,7 @@ fn build_one_sst(item_count: u64) -> (tempfile::TempDir, std::path::PathBuf) {
 }
 
 #[test]
-fn dump_emits_one_line_per_entry_with_key_equals_value() {
+fn dump_emits_one_line_per_entry_in_sort_order_with_quoted_key_value_format() {
     const ITEM_COUNT: u64 = 50;
     let (_dir, sst) = build_one_sst(ITEM_COUNT);
 
