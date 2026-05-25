@@ -371,8 +371,25 @@ fn load_index_block(
 pub struct DataEntry {
     /// The user key bytes (no internal-key suffix, no seqno).
     pub key: Vec<u8>,
-    /// The value bytes. Empty for tombstone entries (see
-    /// [`Self::is_tombstone`]); for `ValueType::Indirection`, the bytes
+    /// The value bytes.
+    ///
+    /// Three reasons this can be empty:
+    /// 1. The entry is a tombstone (see [`Self::is_tombstone`]).
+    /// 2. The iterator was put into keys-only mode via
+    ///    [`DataBlockEntryIter::keys_only`]; in that mode `Value`
+    ///    entries also yield `value: Vec::new()` because the
+    ///    underlying `Slice::to_vec()` allocation is deliberately
+    ///    skipped. The caller asked not to pay it.
+    /// 3. The on-disk value is a zero-length payload (legal for
+    ///    `Value` entries: an empty byte-string is distinct from
+    ///    a tombstone).
+    ///
+    /// Use [`Self::value_type`] to disambiguate (1) from the
+    /// other two, and the iterator construction site to know
+    /// whether (2) applies; this field cannot tell them apart on
+    /// its own.
+    ///
+    /// For [`crate::ValueType::Indirection`] entries the bytes
     /// are the encoded blob handle, NOT the resolved blob payload.
     pub value: Vec<u8>,
     /// MVCC sequence number assigned to this entry by the writer.
