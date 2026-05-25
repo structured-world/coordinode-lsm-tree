@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779718138366,
+  "lastUpdate": 1779720947402,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -9984,6 +9984,84 @@ window.BENCHMARK_DATA = {
             "value": 433390.7066063189,
             "unit": "ops/sec",
             "extra": "P50: 2.1us | P99: 5.6us | P99.9: 8.4us\nthreads: 1 | elapsed: 0.46s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "9e3a0b0326ed366c66b8f774e08839f11635d045",
+          "message": "test(table/index): tighten blast-radius assertion to corruption variants (#341)\n\n## Summary\n\nFollow-up to PR #340 (merged). CodeRabbit flagged the new\n`partitioned_index_corrupting_one_sub_block_only_affects_its_keys` test\nas using a bare `v_victim.is_err()` for the corrupted-partition read,\nwhich is too permissive: any unrelated failure (an I/O error mid-test,\nan unrelated `Error::Unrecoverable`, etc.) would also satisfy the\nassertion and the test would silently stop validating the actual\nblast-radius property.\n\nTightened to the **single** variant the block-header decode\ndeterministically returns for the corruption method we apply (whole\nsub-index block zeroed, header + payload):\n\n- `Error::InvalidHeader(\"Block\")` — `Header::decode_from` runs the\n`MAGIC_BYTES` check first, and an all-zero header short-circuits there\nbefore the trailing XXH3 header-checksum comparison gets a chance to\nrun. So `ChecksumMismatch` cannot fire on this code path with this\ncorruption method.\n\nThe matches arm pins the literal tag (`\"Block\"`) so the assertion is\nbound to the exact decode site the corruption exercises. Inline comment\nrecords the short-circuit rationale; a future corruption method that\npreserves `MAGIC_BYTES` and bit-flips only the payload would exercise\nthe `ChecksumMismatch` path and would want its own dedicated test with\nits own pinning.\n\n## Test plan\n\n- [x] `cargo nextest run --test partitioned_index_blast_radius` — passes\nwith the tightened assertion",
+          "timestamp": "2026-05-25T17:54:55+03:00",
+          "tree_id": "ead59c5d2a91cf3846f5437fac06599f38830edf",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/9e3a0b0326ed366c66b8f774e08839f11635d045"
+        },
+        "date": 1779720946480,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 2069821.2170190678,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.6us | P99.9: 3.7us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1212704.33181201,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.2us | P99.9: 4.3us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 520188.27954684064,
+            "unit": "ops/sec",
+            "extra": "P50: 1.8us | P99: 5.1us | P99.9: 7.6us\nthreads: 1 | elapsed: 0.38s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3660039.8351415573,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 3.1us | P99.9: 5.5us\nthreads: 1 | elapsed: 0.05s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 388689.3460357141,
+            "unit": "ops/sec",
+            "extra": "P50: 2.2us | P99: 5.5us | P99.9: 8.3us\nthreads: 1 | elapsed: 0.51s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 201828.85440323572,
+            "unit": "ops/sec",
+            "extra": "P50: 4.6us | P99: 5.8us | P99.9: 8.4us\nthreads: 1 | elapsed: 0.99s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1237751.6582746897,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.2us | P99.9: 4.3us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1140655.9831572562,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 1.5us | P99.9: 1.9us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 463356.42765094124,
+            "unit": "ops/sec",
+            "extra": "P50: 2.0us | P99: 5.5us | P99.9: 8.6us\nthreads: 1 | elapsed: 0.43s | num: 200000 | iterations: 3"
           }
         ]
       }
