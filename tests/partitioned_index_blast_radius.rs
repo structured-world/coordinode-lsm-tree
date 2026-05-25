@@ -156,9 +156,19 @@ fn partitioned_index_corrupting_one_sub_block_only_affects_its_keys() {
     // None / wrong data. Either a block-header XXH3 failure or a
     // ChecksumMismatch is acceptable.
     let v_victim = tree.get(&victim_last_key, lsm_tree::MAX_SEQNO);
+    // A zeroed sub-index block fails block-header validation: either
+    // the header's stored XXH3 disagrees with XXH3(zeros)
+    // (`ChecksumMismatch`), or the all-zero header fails structural
+    // checks first (`InvalidHeader`). Both are corruption signals — a
+    // generic `is_err()` would also accept unrelated failures (I/O
+    // error mid-test, an unrelated `Unrecoverable`, etc.) and weaken
+    // the blast-radius assertion.
     assert!(
-        v_victim.is_err(),
-        "read against corrupted sub-index partition must return an Err (got {v_victim:?})"
+        matches!(
+            v_victim,
+            Err(lsm_tree::Error::ChecksumMismatch { .. }) | Err(lsm_tree::Error::InvalidHeader(_))
+        ),
+        "read against corrupted sub-index partition must surface as block-header corruption (ChecksumMismatch or InvalidHeader); got {v_victim:?}"
     );
 
     // Sanity: very-early and very-late keys (covered by partitions
