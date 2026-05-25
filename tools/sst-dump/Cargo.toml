@@ -32,3 +32,7 @@ clap = { version = "4", features = ["derive"] }
 # lsm-tree public API, then drive the compiled sst-dump binary
 # against it.
 tempfile = "3"
+# Tests inspect the SFA TOC directly to confirm on-disk shape
+# (e.g. `filter_tli` section presence) before driving the CLI.
+# Matches the version pinned by the main crate.
+sfa = "~1.0.0"

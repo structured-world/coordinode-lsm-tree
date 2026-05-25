@@ -361,3 +361,225 @@ fn load_index_block(
 
     Ok(block)
 }
+
+/// Read-only stats for a single-block (full) `BuRR` / Ribbon filter
+/// section.
+///
+/// Returned by [`read_filter_stats`]. For partitioned-filter tables
+/// (those with a `filter_tli` SFA section) this struct is not
+/// populated — see `read_filter_stats` for the contract. Stats are
+/// derived from the public
+/// [`BurrFilterReader`](crate::table::filter::ribbon::burr::BurrFilterReader)
+/// surface plus the SFA section size; no internal filter bits are
+/// exposed here.
+///
+/// `#[non_exhaustive]` so new fields can be added in a minor version
+/// bump.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct FilterStats {
+    /// On-disk size of the `filter` SFA section in bytes, including
+    /// the block `Header` prefix.
+    pub filter_section_bytes: u64,
+    /// Number of `BuRR` / Ribbon "layers" the writer emitted. Each
+    /// layer is a Bumped-Ribbon-Retrieval pass; more layers means a
+    /// larger filter at a given key count but tighter FPR. Fixed-width
+    /// `u64` so the public layout doesn't vary between 32-bit and
+    /// 64-bit targets, matching the rest of the inspect facade.
+    pub layer_count: u64,
+    /// Number of keys the meta block reports for the table. Used as
+    /// the denominator for `bits_per_key`; sourced from
+    /// `TableProperties.item_count` and copied here so callers can
+    /// compute the rate without a second `read_table_properties`
+    /// call.
+    pub item_count: u64,
+    /// Approximate average bits-per-key the filter consumes:
+    /// `filter_section_bytes * 8 / max(item_count, 1)`. This is a
+    /// SIZE metric, not the true theoretical `BuRR` overhead — it
+    /// includes the block `Header`, the `BuRR` wire-format header,
+    /// per-layer payload framing, and any zero-padding bits at the
+    /// end of each layer's storage word array. Treat it as an
+    /// upper bound on the actual ribbon parameter `bits_per_key`.
+    pub bits_per_key: f64,
+}
+
+/// Reads `path` and returns `BuRR` filter sizing stats for the SST's
+/// `filter` section, or `Ok(None)` if the SST has no filter section
+/// at all (filter-less table).
+///
+/// **Scope:** only the single-block (full) filter layout is
+/// supported by this facade. SSTs with a `filter_tli` SFA section
+/// (partitioned filter) return an error — per-partition stats need
+/// a different surface that walks the TLI and reports a
+/// `Vec<FilterStats>` or aggregate metrics, and that is a separate
+/// public-API decision not yet made.
+///
+/// Same out-of-band path-based open semantics as
+/// [`read_table_properties`]: uses [`StdFs`], no encryption provider.
+/// Recovery for the meta block (needed to source `item_count`)
+/// mirrors the TAIL-first / MID-fallback pattern from #295. The
+/// filter block itself is written uncompressed (see
+/// `FullFilterWriter::finish`), so no compression-codec dependency on
+/// the read path here.
+///
+/// # Errors
+///
+/// Returns an error if:
+/// - the file cannot be opened or read,
+/// - the SFA trailer is missing / malformed,
+/// - the `meta` block fails to decode (needed for `item_count`),
+/// - the table has a `filter_tli` SFA section (partitioned filter,
+///   not supported by this facade): returned as
+///   `Error::FeatureUnsupported("filter_tli")` (see
+///   [`crate::Error::FeatureUnsupported`]) so callers can match the
+///   typed variant instead of parsing message strings,
+/// - the `filter` block header / payload is malformed,
+/// - the `BuRR` wire format cannot be parsed (magic mismatch,
+///   unsupported version, structurally invalid header).
+///
+/// Returns `Ok(None)` for both on-disk shapes of "no filter
+/// installed":
+///
+/// 1. the SST has no `filter` SFA section at all, or
+/// 2. the section is present but carries a zero-byte payload (the
+///    [`crate::table::filter::block::FilterBlock`] sentinel for "no
+///    filter"; the writer emits it when the filter policy resolves
+///    to no usable filter at flush time, which is structurally
+///    equivalent to the absent-section case).
+///
+/// A tree configured with
+/// [`FilterPolicy::disabled`](crate::config::FilterPolicy::disabled)
+/// (or any policy whose per-level entry is
+/// [`FilterPolicyEntry::None`](crate::config::FilterPolicyEntry::None))
+/// produces filter-less SSTs that take one of these two shapes;
+/// either way callers see the same `Ok(None)` result.
+#[cfg(feature = "std")]
+pub fn read_filter_stats(path: &Path) -> crate::Result<Option<FilterStats>> {
+    use crate::table::block::{Block, BlockIdentity, BlockType};
+    use crate::table::filter::ribbon::burr::BurrFilterReader;
+
+    let fs = StdFs;
+    let mut file = fs.open(path, &FsOpenOptions::new().read(true))?;
+
+    let sfa_reader = sfa::Reader::from_reader(&mut file)?;
+    let toc = sfa_reader.toc();
+    let regions = ParsedRegions::parse_from_toc(toc)?;
+
+    if regions.filter_tli.is_some() {
+        // Partitioned filter: a `filter_tli` SFA section is present
+        // alongside `filter`, and the contents of `filter` are a
+        // concatenation of per-partition `BuRR` payloads, not a
+        // single parseable wire buffer. Surface this as the typed
+        // `Error::FeatureUnsupported("filter_tli")` so callers can
+        // match on the marker without parsing message strings; the
+        // payload literal is the SFA section name an operator can
+        // confirm via the TOC.
+        return Err(crate::Error::FeatureUnsupported("filter_tli"));
+    }
+
+    let Some(filter_handle) = regions.filter else {
+        return Ok(None);
+    };
+    let filter_section_bytes = u64::from(filter_handle.size());
+
+    // Meta block carries `item_count`. Same TAIL-first / MID-fallback
+    // as `read_table_properties` so a partially-corrupted meta still
+    // yields stats from the surviving copy.
+    let meta = match ParsedMeta::load_with_handle(&*file, &regions.metadata, None) {
+        Ok(m) => m,
+        Err(tail_err) => {
+            if let Some(mid_handle) = regions.metadata_mid {
+                match ParsedMeta::load_with_handle(&*file, &mid_handle, None) {
+                    Ok(mid) => mid,
+                    Err(_) => return Err(tail_err),
+                }
+            } else {
+                return Err(tail_err);
+            }
+        }
+    };
+    let item_count = meta.item_count;
+    let table_id = meta.id;
+
+    // Filter blocks are written uncompressed by `FullFilterWriter`
+    // (see `src/table/writer/filter/full.rs::finish` — it passes
+    // `CompressionType::None`). No compression-codec lookup needed
+    // on the read path.
+    //
+    // `block_offset` is held at 0 here even though
+    // `filter_handle.offset()` carries the real on-disk position,
+    // because the writer
+    // (`src/table/writer/filter/full.rs::finish`) emits the filter
+    // block with `BlockIdentity { block_offset: 0, ... }`. Reader
+    // and writer must agree on BlockIdentity for AEAD verification
+    // once #251 wires it into AAD; switching only this side to
+    // `filter_handle.offset()` would break that agreement.
+    // Threading real offsets through both sides is a coordinated
+    // change tracked alongside #251.
+    let block = Block::from_file(
+        &*file,
+        filter_handle,
+        BlockIdentity {
+            tree_id: 0,
+            table_id,
+            block_offset: 0,
+            block_type: BlockType::Filter,
+            dict_id: 0,
+            window_log: 0,
+        },
+        CompressionType::None,
+        None,
+        #[cfg(zstd_any)]
+        None,
+    )?;
+    if block.header.block_type != BlockType::Filter {
+        return Err(crate::Error::InvalidTag((
+            "BlockType",
+            block.header.block_type.into(),
+        )));
+    }
+
+    // Empty data slice is the "no filter installed" sentinel (see
+    // `FilterBlock::maybe_contains_hash`). The on-disk shape of "no
+    // filter present" can be either the section absent entirely
+    // OR the section present with a zero-byte payload; both mean
+    // the same thing semantically. Collapse the empty-payload case
+    // to the same `Ok(None)` result the section-absent branch
+    // above returns, so the CLI prints the documented
+    // "no filter section installed" line for either shape and the
+    // public API stays consistent with the FilterBlock sentinel
+    // contract.
+    if block.data.is_empty() {
+        return Ok(None);
+    }
+
+    // BurrFilterReader::layer_count returns usize; widen to u64 at
+    // the public-API boundary. usize -> u64 is lossless on every
+    // target Rust supports (u64 is at least as wide as usize on
+    // 32-bit and identical on 64-bit).
+    let layer_count: u64 = BurrFilterReader::new(&block.data)?.layer_count() as u64;
+
+    // `item_count` is `u64`; cast to `f64` is lossy for values above
+    // 2^53 (~9 quadrillion), which is well past anything a real SST
+    // holds. The lossy cast is the standard pattern for size
+    // statistics here — clippy's `cast_precision_loss` lint is
+    // already allowed crate-wide for this kind of arithmetic.
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "filter stats are diagnostic; precision loss above 2^53 keys is irrelevant"
+    )]
+    let denom = item_count.max(1) as f64;
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "filter stats are diagnostic; precision loss above 2^53 bytes is irrelevant"
+    )]
+    let bits = (filter_section_bytes * 8) as f64;
+    let bits_per_key = bits / denom;
+
+    Ok(Some(FilterStats {
+        filter_section_bytes,
+        layer_count,
+        item_count,
+        bits_per_key,
+    }))
+}
