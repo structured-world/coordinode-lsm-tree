@@ -12,7 +12,7 @@
 use clap::{Parser, Subcommand};
 use lsm_tree::coding::Decode;
 use lsm_tree::inspect::{
-    iter_data_block_entries, read_table_properties, read_top_level_index_entries,
+    iter_data_block_entries, read_filter_stats, read_table_properties, read_top_level_index_entries,
 };
 use lsm_tree::table::block::Header;
 use lsm_tree::verify::{BlockVerifyError, verify_sst_file};
@@ -110,8 +110,7 @@ enum Command {
     /// supported (the index is a single block; the data section
     /// itself can have any number of data blocks); partitioned-index
     /// SSTs exit non-zero (see `index-dump` for the layout signal).
-    /// Reads
-    /// blocks streamingly: memory cost stays at one data block
+    /// Reads blocks streamingly: memory cost stays at one data block
     /// regardless of SST size.
     ///
     /// **Comparator caveat (only when `--from` / `--to` is set).**
@@ -126,8 +125,8 @@ enum Command {
     /// `--from` / `--to` set, the early break can stop before all
     /// qualifying entries are emitted, and the bounds themselves
     /// won't filter to the semantic range the caller had in mind.
-    /// Use the owning tree's regular read APIs for
-    /// range-bounded reads on custom-comparator SSTs.
+    /// Use the owning tree's regular read APIs for range-bounded
+    /// reads on custom-comparator SSTs.
     Dump {
         /// Lower key bound (inclusive). Entries with `key >= --from`
         /// are emitted. Without this flag, the walk starts from the
@@ -154,6 +153,15 @@ enum Command {
         #[arg(long)]
         keys_only: bool,
     },
+
+    /// Print sizing stats for the SST's BuRR filter: on-disk filter
+    /// section bytes, BuRR layer count, item count from meta, and
+    /// approximate bits-per-key. Only single-block (full) filters
+    /// are supported by this subcommand; partitioned-filter tables
+    /// (`filter_tli` SFA section present) exit non-zero with a
+    /// "not supported" error. Filter-less tables (no `filter`
+    /// section at all) exit 0 with a "no filter installed" notice.
+    FilterStats,
 }
 
 fn main() -> ExitCode {
@@ -174,6 +182,7 @@ fn main() -> ExitCode {
             max,
             keys_only,
         } => run_dump(&cli.file, from.as_deref(), to.as_deref(), max, keys_only),
+        Command::FilterStats => run_filter_stats(&cli.file),
     }
 }
 
@@ -624,6 +633,47 @@ fn run_dump(
         eprintln!("error: flush stdout for {}: {e}", path.display());
         return ExitCode::FAILURE;
     }
+
+    ExitCode::SUCCESS
+}
+
+fn run_filter_stats(path: &std::path::Path) -> ExitCode {
+    let stats = match read_filter_stats(path) {
+        Ok(s) => s,
+        Err(lsm_tree::Error::FeatureUnsupported(marker)) => {
+            // Partitioned-filter SSTs surface here. Match the typed
+            // `FeatureUnsupported` variant directly so control flow
+            // doesn't depend on a message-string substring; the
+            // `marker` payload is the SFA section name the operator
+            // can confirm via the TOC.
+            eprintln!(
+                "error: filter-stats not supported for {}: \
+                 valid-but-unsupported layout (look for a `{marker}` \
+                 section in the SFA TOC to confirm)",
+                path.display(),
+            );
+            return ExitCode::FAILURE;
+        }
+        Err(e) => {
+            eprintln!("error: read filter stats of {}: {e}", path.display());
+            return ExitCode::FAILURE;
+        }
+    };
+
+    println!("file:                {}", path.display());
+    let Some(stats) = stats else {
+        println!("filter:              no filter section installed");
+        return ExitCode::SUCCESS;
+    };
+
+    println!("filter_section_size: {} bytes", stats.filter_section_bytes);
+    println!("layer_count:         {}", stats.layer_count);
+    println!("item_count:          {}", stats.item_count);
+    // Three decimals is enough resolution for diagnostic use without
+    // implying false precision; bits-per-key for production filters
+    // is typically in the 5-15 range, occasionally up to ~30 with
+    // tight FPR targets, so the integer part is always small.
+    println!("bits_per_key:        {:.3}", stats.bits_per_key);
 
     ExitCode::SUCCESS
 }
