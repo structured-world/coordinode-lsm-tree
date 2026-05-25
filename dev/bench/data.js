@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779691972528,
+  "lastUpdate": 1779703692225,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -9672,6 +9672,84 @@ window.BENCHMARK_DATA = {
             "value": 537658.2173220805,
             "unit": "ops/sec",
             "extra": "P50: 1.7us | P99: 5.2us | P99.9: 7.6us\nthreads: 1 | elapsed: 0.37s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "0042ba7a45bf79c3d03f79ea384d489e504b7eb9",
+          "message": "feat(encryption): AAD construction + decode-time error types (#251 foundation) (#336)\n\n## Summary\n\nFirst slice of the AAD-bound encrypted block format from\n`docs/aad-block-format.md`: the pure-byte primitives every subsequent\nlayer (AEAD dispatch, wire-format encoder/decoder, Block I/O hook) will\nbuild on.\n\n**No on-disk format change yet.** The legacy `Aes256GcmProvider` stays\nthe active write/read path; the new code is unreachable from production\nuntil the wire layer lands in a follow-up PR.\n\n## What's in this PR\n\n`src/encryption.rs` was promoted to a directory module so the new\nsubmodules have a home. The trait + `Aes256GcmProvider` surface is\nbit-for-bit identical to before.\n\n### New submodules\n\n- **`encryption::aad`** — pure-byte AAD construction:\n- `SuiteId` enum (`Aes256Gcm`, `ChaCha20Poly1305`) with `nonce_len()`\nlookup matching the §7 registry\n- `BlockType` enum (`Data` / `Index` / `Filter` / `Meta` /\n`RangeTombstone`)\n- `BlockIdentity { tree_id, table_id, block_offset }` — caller-supplied\nidentity, never on disk\n  - `MetadataHeader` — disk-mirrored 4-byte preamble + codec context\n- `build(header, identity) -> [u8; 38]` — single source of truth for AAD\nbytes, byte-exact match to §5.3\n\n- **`encryption::error`** — typed decode-time errors:\n- `MalformedMetadataFrame(&'static str)` / `MalformedBodyFrame(&'static\nstr)`\n  - `UnsupportedFormatVersion { header_byte }`\n  - `UnsupportedSuite { suite_id }`\n  - `UnknownKeyEpoch { key_epoch }`\n  - `SuiteMismatch { expected, actual }`\n  - `AeadVerificationFailed` (no payload, by design)\n\n### Tests\n\n13 new unit tests covering:\n\n- AAD layout byte-exact at every offset against a non-degenerate fixture\n(each field uses a recognisable bit pattern so a layout slip is visible\nin the diff)\n- Cross-block-relocation defence: same identity except `block_offset`\nproduces different AAD\n- `tree_id = 0` placeholder path produces well-formed AAD\n- `SuiteId` / `BlockType` byte round trips\n- Rejection of unknown suite / block-type bytes\n- Error `Display` hex formatting and the \"no payload\" property of\n`AeadVerificationFailed`\n\n## What's NOT in this PR (follow-ups)\n\n- AEAD suite dispatch (`encrypt_block` / `decrypt_block` per-suite)\n- Wire-format encoder/decoder (skippable-frame envelopes via\n`structured-zstd`'s `SkippableFrame` API)\n- `chacha20poly1305` dependency + second suite impl\n- Block I/O integration (LSM-T3 scope)\n- Test vectors from spec §9\n\n## Test plan\n\n- [x] `cargo nextest run --all-features` — 1585 passed (13 new + 1572\nexisting), 2 skipped, 0 failed\n- [x] `cargo test --all-features --doc` — 43 passed, 2 ignored\n- [x] `cargo clippy --all-features --all-targets -- -D warnings` — clean\n- [x] No em-dashes, no internal-tool leaks\n\nCloses part 1 of #251.\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n\n## Summary by CodeRabbit\n\n* **New Features**\n* Added support for Additional Authenticated Data (AAD)-bound encrypted\nblock format with configurable suite selection and block type\nidentification.\n* Introduced DecryptError enumeration for comprehensive encryption and\ndecryption error handling with specific variants for format version,\nsuite mismatch, key epoch validation, and AEAD verification failures.\n\n<!-- review_stack_entry_start -->\n\n[![Review Change\nStack](https://storage.googleapis.com/coderabbit_public_assets/review-stack-in-coderabbit-ui.svg)](https://app.coderabbit.ai/change-stack/structured-world/coordinode-lsm-tree/pull/336?utm_source=github_walkthrough&utm_medium=github&utm_campaign=change_stack)\n\n<!-- review_stack_entry_end -->\n\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-05-25T13:07:19+03:00",
+          "tree_id": "6ee3550922e74409e31c9617b8cad97a32da32f2",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/0042ba7a45bf79c3d03f79ea384d489e504b7eb9"
+        },
+        "date": 1779703690678,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 2122335.4476392786,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.7us | P99.9: 3.8us\nthreads: 1 | elapsed: 0.09s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1141469.8656093306,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.3us | P99.9: 4.6us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 591239.3132496413,
+            "unit": "ops/sec",
+            "extra": "P50: 1.6us | P99: 4.7us | P99.9: 7.3us\nthreads: 1 | elapsed: 0.34s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3562934.091188417,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 3.2us | P99.9: 5.7us\nthreads: 1 | elapsed: 0.06s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 419057.7402898036,
+            "unit": "ops/sec",
+            "extra": "P50: 2.1us | P99: 5.3us | P99.9: 8.2us\nthreads: 1 | elapsed: 0.48s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 220097.91467317336,
+            "unit": "ops/sec",
+            "extra": "P50: 4.3us | P99: 5.3us | P99.9: 7.6us\nthreads: 1 | elapsed: 0.91s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1168392.944848482,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.3us | P99.9: 4.6us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1135500.1530143232,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 1.5us | P99.9: 2.0us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 502698.64846527576,
+            "unit": "ops/sec",
+            "extra": "P50: 1.8us | P99: 6.5us | P99.9: 9.6us\nthreads: 1 | elapsed: 0.40s | num: 200000 | iterations: 3"
           }
         ]
       }
