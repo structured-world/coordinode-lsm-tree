@@ -64,7 +64,7 @@ lz4 = ["dep:lz4_flex", "std"]
 # wire format, V5 manifest gate); release-plz raises the crate's major
 # version on the next release tag accordingly.
 zstd = ["dep:structured-zstd", "std"]
-encryption = ["dep:aes-gcm", "dep:rand_chacha", "std"]
+encryption = ["dep:aes-gcm", "dep:chacha20poly1305", "dep:rand_chacha", "std"]
 # Per-block Reed-Solomon Page ECC. When enabled and `Config::page_ecc(true)`
 # is set on a tree, each block gets a Reed-Solomon parity trailer
 # computed over the on-disk payload (post-compression / post-encryption,
@@ -132,6 +132,12 @@ xxhash-rust = { version = "0.8.15", features = ["xxh3"] }
 # becomes a normal "^0.11" caret requirement and the API list above can be
 # treated as the public 0.11 surface, not a prerelease snapshot.
 aes-gcm = { version = "=0.11.0-rc.3", optional = true, features = ["aes", "rand_core"] }
+# Exact pin on the matching prerelease — chacha20poly1305 0.11.0-rc.3 lines
+# up with aes-gcm 0.11.0-rc.3 on the shared `aead` 0.6 surface, so both
+# suites can share the same AeadInOut / Nonce / Tag types in the
+# AEAD-dispatch module. Bumps in lockstep with aes-gcm when the stable
+# 0.11.0 lands.
+chacha20poly1305 = { version = "=0.11.0-rc.3", optional = true, features = ["rand_core"] }
 rand_chacha = { version = "0.10", optional = true }
 # Pure-Rust Reed-Solomon erasure coding, SIMD-accelerated on x86_64 / aarch64.
 # Used by the optional `page_ecc` feature for per-block parity. Apache-2.0 /
