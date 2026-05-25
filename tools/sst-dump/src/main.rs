@@ -11,7 +11,7 @@
 
 use clap::{Parser, Subcommand};
 use lsm_tree::coding::Decode;
-use lsm_tree::inspect::read_table_properties;
+use lsm_tree::inspect::{read_table_properties, read_top_level_index_entries};
 use lsm_tree::table::block::Header;
 use lsm_tree::verify::{BlockVerifyError, verify_sst_file};
 use std::fs::File;
@@ -88,6 +88,17 @@ enum Command {
     /// directly (with MID-mirror fallback per #295); does not open a
     /// live `Tree` or touch the manifest.
     Properties,
+
+    /// Print the SST's top-level index (TLI) entries: one row per
+    /// pointed-at block with its `end_key`, file `offset`, on-disk
+    /// `size`, and the highest `seqno` it covers. For full-index
+    /// tables each row corresponds to a data block; for
+    /// partitioned-index tables each row corresponds to a sub-index
+    /// leaf block (one further indirection from data blocks). Useful
+    /// for diagnosing range-read fan-out and verifying the TLI
+    /// matches what `verify` walked. Reads the TLI directly (with
+    /// tail-mirror fallback per #296); does not open a live `Tree`.
+    IndexDump,
 }
 
 fn main() -> ExitCode {
@@ -101,6 +112,7 @@ fn main() -> ExitCode {
             no_header,
         } => run_hex(&cli.file, offset, len, no_header),
         Command::Properties => run_properties(&cli.file),
+        Command::IndexDump => run_index_dump(&cli.file),
     }
 }
 
@@ -328,6 +340,46 @@ fn run_properties(path: &std::path::Path) -> ExitCode {
     println!("index_block_count:   {}", props.index_block_count);
     println!("data_compression:    {:?}", props.data_block_compression,);
     println!("index_compression:   {:?}", props.index_block_compression,);
+
+    ExitCode::SUCCESS
+}
+
+fn run_index_dump(path: &std::path::Path) -> ExitCode {
+    let entries = match read_top_level_index_entries(path) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("error: read TLI of {}: {e}", path.display());
+            return ExitCode::FAILURE;
+        }
+    };
+
+    println!("file:                {}", path.display());
+    println!("tli_entry_count:     {}", entries.len());
+    println!();
+
+    if entries.is_empty() {
+        return ExitCode::SUCCESS;
+    }
+
+    // Header row. Columns are left-aligned; widths chosen so a
+    // 64-bit offset (up to 20 digits) and u32 size (up to 10) line
+    // up against a typical key prefix without crowding. Keys can be
+    // arbitrarily long; place `end_key` last so wrap-around doesn't
+    // mis-align the numeric columns.
+    println!(
+        "{:>5}  {:>20}  {:>10}  {:>20}  end_key",
+        "#", "offset", "size", "seqno",
+    );
+    for (i, e) in entries.iter().enumerate() {
+        println!(
+            "{:>5}  {:>20}  {:>10}  {:>20}  {}",
+            i,
+            e.offset,
+            e.size,
+            e.seqno,
+            format_key(&e.end_key),
+        );
+    }
 
     ExitCode::SUCCESS
 }
