@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779720947402,
+  "lastUpdate": 1779726882901,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -10062,6 +10062,84 @@ window.BENCHMARK_DATA = {
             "value": 463356.42765094124,
             "unit": "ops/sec",
             "extra": "P50: 2.0us | P99: 5.5us | P99.9: 8.6us\nthreads: 1 | elapsed: 0.43s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "544a466ecf58d1932894d87e31817009601f0d45",
+          "message": "feat(sst-dump): dump subcommand + public inspect::iter_data_block_entries facade (#335)\n\n## Summary\n\nFifth and final subcommand from #324. \\`sst-dump <file> dump [--from K]\n[--to K] [--max N] [--keys-only]\\` streams every KV entry in the SST to\nstdout, one per line.\n\nAfter this PR and #334 (filter-stats, in review) both merge, all five\nsubcommands listed in #324 are shipped.\n\nThis PR builds on the \\`read_top_level_index_entries\\` facade from #333\n(currently in review). Branched off #333's branch so the diff stays\nminimal; rebases onto main cleanly once #333 merges.\n\n## Library API\n\nNew public surface in \\`lsm_tree::inspect\\`:\n\n\\`\\`\\`rust\n#[non_exhaustive]\npub struct DataEntry {\n    pub key: Vec<u8>,\n    pub value: Vec<u8>,\n    pub seqno: u64,\n    pub value_type: ValueType,\n}\n\nimpl DataEntry {\n    pub fn is_tombstone(&self) -> bool { /* delegates to ValueType */ }\n}\n\npub struct DataBlockEntryIter { /* opaque */ }\n\nimpl Iterator for DataBlockEntryIter {\n    type Item = Result<DataEntry>;\n    ...\n}\n\npub fn iter_data_block_entries(path: &Path) ->\nResult<DataBlockEntryIter>;\n\\`\\`\\`\n\nThe iterator loads one data block at a time and drops it before\nadvancing — memory stays bounded to one block regardless of SST size.\nPer-entry errors are surfaced via the \\`Result<DataEntry>\\` Item; a\nsingle block failing to load yields one \\`Err\\` and ends the walk.\n\n## Scope\n\n- **Full-index SSTs only.** Partitioned-index SSTs (separate \\`index\\`\nSFA section) return \\`Io(ErrorKind::Unsupported)\\` at construction time\nwith a message naming the distinguishing on-disk signal.\n- Encrypted SSTs unsupported (no provider parameter, matching the other\nfacades).\n\n## Internal change\n\nWidened \\`src/table/mod.rs::mod iter\\` from private to \\`pub(crate) mod\niter\\` so \\`inspect\\` can use \\`OwnedDataBlockIter\\`. The type was\nalready \\`pub\\` inside that module; only parent visibility moved up. No\nnew public API surface on \\`crate::table\\`.\n\n## CLI output\n\n\\`\\`\\`\n$ sst-dump table-0 dump --from key-000010 --to key-000020\n\\\"key-000010\\\"=\\\"value-10\\\"\n\\\"key-000011\\\"=\\\"value-11\\\"\n...\n\\\"key-000019\\\"=\\\"value-19\\\"\n\n$ sst-dump table-0 dump --keys-only --max 3\n\\\"key-000000\\\"\n\\\"key-000001\\\"\n\\\"key-000002\\\"\n\\`\\`\\`\n\nTombstones get a \\`\\\\t# tombstone\\` suffix so a value grep doesn't\nconfuse a key whose value happens to contain \\\"tombstone\\\". CLI takes\n\\`--from\\` / \\`--to\\` as \\`&str\\` — non-UTF-8 keys can't be expressed\ntoday (escape mechanism is a follow-up if anyone needs it).\n\n## Tests\n\n\\`tools/sst-dump/tests/dump_smoke.rs\\` (5 new):\n\n- \\`dump_emits_one_line_per_entry_with_key_equals_value\\` — 50-item SST,\nfull walk, asserts line shape and sort order.\n- \\`dump_honours_from_to_bounds\\` — 100-item SST with \\`--from\nkey-000010 --to key-000020\\`, asserts exactly 10 entries (inclusive\nlower, exclusive upper).\n- \\`dump_honours_max_cap\\` — \\`--max=7\\` caps output at 7 lines.\n- \\`dump_keys_only_omits_value_column\\` — no \\`=\\` anywhere under\n\\`--keys-only\\`.\n- \\`dump_fails_on_missing_file\\` — exits non-zero with \\`error:\\` in\nstderr.\n\n## Test plan\n\n- [x] \\`cargo nextest run\\` in \\`tools/sst-dump/\\` (15 tests pass: 5 new\n\\`dump_smoke\\` + 2 \\`index_dump_smoke\\` + 2 \\`properties_smoke\\` + 4\n\\`hex_smoke\\` + 2 \\`verify_smoke\\`)\n- [x] \\`cargo nextest run\\` main suite (1413 pass)\n- [x] \\`cargo clippy --all-features --all-targets -- -D warnings\\` clean\non both crates\n- [x] README \\`Operational tools\\` row updated\n\nPart of #324.\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n## Summary by CodeRabbit\n\n* **New Features**\n* Added `dump` subcommand to stream SST entries with byte-range\nfiltering (`--from`/`--to`), entry limits (`--max`), and `--keys-only`;\noutput annotates non-value entry types (e.g., tombstones).\n* Streaming inspection exposes per-entry metadata so tools can identify\ntombstones and other value types.\n* CLI reports a clear \"not supported\" message for partitioned-index SST\nlayouts.\n\n* **Documentation**\n  * Updated tool docs with `dump` and `index-dump` usage.\n\n* **Tests**\n* End-to-end tests added covering dump behavior, bounds, caps,\nkeys-only, tombstones, and error cases.\n\n<!-- review_stack_entry_start -->\n\n[![Review Change\nStack](https://storage.googleapis.com/coderabbit_public_assets/review-stack-in-coderabbit-ui.svg)](https://app.coderabbit.ai/change-stack/structured-world/coordinode-lsm-tree/pull/335?utm_source=github_walkthrough&utm_medium=github&utm_campaign=change_stack)\n\n<!-- review_stack_entry_end -->\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-05-25T19:33:50+03:00",
+          "tree_id": "1843a302cbd36332d4679b4a17559abc8d3300ee",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/544a466ecf58d1932894d87e31817009601f0d45"
+        },
+        "date": 1779726881274,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 2059340.3663033145,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.6us | P99.9: 3.7us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1187595.7476804147,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.2us | P99.9: 4.3us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 520959.9035265612,
+            "unit": "ops/sec",
+            "extra": "P50: 1.8us | P99: 5.0us | P99.9: 7.5us\nthreads: 1 | elapsed: 0.38s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3695657.5727867153,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 3.0us | P99.9: 5.4us\nthreads: 1 | elapsed: 0.05s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 387364.99296214944,
+            "unit": "ops/sec",
+            "extra": "P50: 2.3us | P99: 5.5us | P99.9: 8.4us\nthreads: 1 | elapsed: 0.52s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 199652.61642657474,
+            "unit": "ops/sec",
+            "extra": "P50: 4.7us | P99: 5.9us | P99.9: 8.2us\nthreads: 1 | elapsed: 1.00s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1221948.365264341,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.2us | P99.9: 4.3us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1133038.3298085928,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 1.5us | P99.9: 1.9us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 452952.50499924814,
+            "unit": "ops/sec",
+            "extra": "P50: 2.0us | P99: 6.8us | P99.9: 10.0us\nthreads: 1 | elapsed: 0.44s | num: 200000 | iterations: 3"
           }
         ]
       }
