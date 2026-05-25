@@ -64,7 +64,7 @@ lz4 = ["dep:lz4_flex", "std"]
 # wire format, V5 manifest gate); release-plz raises the crate's major
 # version on the next release tag accordingly.
 zstd = ["dep:structured-zstd", "std"]
-encryption = ["dep:aes-gcm", "dep:rand_chacha", "std"]
+encryption = ["dep:aes-gcm", "dep:chacha20poly1305", "dep:rand_chacha", "std"]
 bytes_1 = ["dep:bytes"]
 metrics = []
 # Vendored Ribbon filter retains its `#[cfg(feature = "ribbon-serde")]`
@@ -123,6 +123,12 @@ xxhash-rust = { version = "0.8.15", features = ["xxh3"] }
 # becomes a normal "^0.11" caret requirement and the API list above can be
 # treated as the public 0.11 surface, not a prerelease snapshot.
 aes-gcm = { version = "=0.11.0-rc.3", optional = true, features = ["aes", "rand_core"] }
+# Exact pin on the matching prerelease — chacha20poly1305 0.11.0-rc.3 lines
+# up with aes-gcm 0.11.0-rc.3 on the shared `aead` 0.6 surface, so both
+# suites can share the same AeadInOut / Nonce / Tag types in the
+# AEAD-dispatch module. Bumps in lockstep with aes-gcm when the stable
+# 0.11.0 lands.
+chacha20poly1305 = { version = "=0.11.0-rc.3", optional = true, features = ["rand_core"] }
 rand_chacha = { version = "0.10", optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
