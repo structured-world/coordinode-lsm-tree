@@ -398,10 +398,7 @@ mod tests {
             &mut buf,
             &encoded,
             crate::table::block::BlockIdentity::for_test(0, 0, BlockType::Meta),
-            CompressionType::None,
-            None,
-            #[cfg(zstd_any)]
-            None,
+            &crate::table::block::BlockTransform::PLAIN,
         )
         .unwrap();
 

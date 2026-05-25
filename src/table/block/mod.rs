@@ -1070,7 +1070,8 @@ mod tests {
                 None,
                 #[cfg(zstd_any)]
                 None,
-            )?,
+            )
+            .unwrap(),
         );
 
         assert!(
@@ -1124,7 +1125,8 @@ mod tests {
                 None,
                 #[cfg(zstd_any)]
                 None,
-            )?,
+            )
+            .unwrap(),
         );
 
         assert!(
@@ -1175,7 +1177,8 @@ mod tests {
                 None,
                 #[cfg(zstd_any)]
                 None,
-            )?,
+            )
+            .unwrap(),
         );
 
         match result {
@@ -1238,7 +1241,8 @@ mod tests {
                 None,
                 #[cfg(zstd_any)]
                 None,
-            )?,
+            )
+            .unwrap(),
         );
 
         assert!(
@@ -1296,7 +1300,8 @@ mod tests {
                 None,
                 #[cfg(zstd_any)]
                 None,
-            )?,
+            )
+            .unwrap(),
         );
 
         assert!(
@@ -1347,7 +1352,8 @@ mod tests {
                 None,
                 #[cfg(zstd_any)]
                 None,
-            )?,
+            )
+            .unwrap(),
         );
 
         assert!(
@@ -1380,7 +1386,8 @@ mod tests {
                 None,
                 #[cfg(zstd_any)]
                 None,
-            )?,
+            )
+            .unwrap(),
         );
 
         assert!(
@@ -1431,7 +1438,8 @@ mod tests {
                 None,
                 #[cfg(zstd_any)]
                 None,
-            )?,
+            )
+            .unwrap(),
         );
 
         match result {
@@ -1483,7 +1491,8 @@ mod tests {
                 None,
                 #[cfg(zstd_any)]
                 None,
-            )?,
+            )
+            .unwrap(),
         );
 
         match result {
@@ -1545,7 +1554,8 @@ mod tests {
                 None,
                 #[cfg(zstd_any)]
                 None,
-            )?,
+            )
+            .unwrap(),
         );
         assert!(
             matches!(result, Err(crate::Error::DecompressedSizeTooLarge { .. })),
@@ -2189,9 +2199,12 @@ mod tests {
                 &mut writer,
                 data,
                 crate::table::block::BlockIdentity::for_test(0, 0, BlockType::Data),
-                compression,
-                None,
-                Some(&dict),
+                &crate::table::block::BlockTransform::from_parts(
+                    compression,
+                    None,
+                    #[cfg(zstd_any)]
+                    Some(&dict),
+                )?,
             )?;
 
             let mut reader = &writer[..];
@@ -2202,9 +2215,12 @@ mod tests {
                     0,
                     crate::table::block::BlockType::Data,
                 ),
-                compression,
-                None,
-                Some(&dict),
+                &crate::table::block::BlockTransform::from_parts(
+                    compression,
+                    None,
+                    #[cfg(zstd_any)]
+                    Some(&dict),
+                )?,
             )?;
             assert_eq!(data, &*block.data);
             Ok(())
@@ -2222,9 +2238,12 @@ mod tests {
                 &mut buf,
                 data,
                 crate::table::block::BlockIdentity::for_test(0, 0, BlockType::Data),
-                compression,
-                None,
-                Some(&dict),
+                &crate::table::block::BlockTransform::from_parts(
+                    compression,
+                    None,
+                    #[cfg(zstd_any)]
+                    Some(&dict),
+                )?,
             )?;
 
             let dir = tempfile::tempdir()?;
@@ -2247,9 +2266,12 @@ mod tests {
                     0,
                     crate::table::block::BlockType::Data,
                 ),
-                compression,
-                None,
-                Some(&dict),
+                &crate::table::block::BlockTransform::from_parts(
+                    compression,
+                    None,
+                    #[cfg(zstd_any)]
+                    Some(&dict),
+                )?,
             )?;
             assert_eq!(data, &*block.data);
             Ok(())
@@ -2266,9 +2288,12 @@ mod tests {
                 &mut writer,
                 &data,
                 crate::table::block::BlockIdentity::for_test(0, 0, BlockType::Data),
-                compression,
-                None,
-                Some(&dict),
+                &crate::table::block::BlockTransform::from_parts(
+                    compression,
+                    None,
+                    #[cfg(zstd_any)]
+                    Some(&dict),
+                )?,
             )?;
 
             assert!(
@@ -2284,9 +2309,12 @@ mod tests {
                     0,
                     crate::table::block::BlockType::Data,
                 ),
-                compression,
-                None,
-                Some(&dict),
+                &crate::table::block::BlockTransform::from_parts(
+                    compression,
+                    None,
+                    #[cfg(zstd_any)]
+                    Some(&dict),
+                )?,
             )?;
             assert_eq!(&*block.data, &data[..]);
             Ok(())
@@ -2294,36 +2322,16 @@ mod tests {
 
         #[test]
         fn block_zstd_dict_missing_returns_error() -> crate::Result<()> {
+            // The runtime dict-presence check that used to live inside
+            // Block::write_into / from_reader for the ZstdDict codec is
+            // now centralised in `BlockTransform::from_parts`. The error
+            // therefore surfaces at transform-construction time instead
+            // of at the Block I/O call; the test assertion follows.
             let dict = test_dict();
             let compression = test_compression(&dict);
-            let mut sink = vec![];
 
-            // Write with dict
-            Block::write_into(
-                &mut sink,
-                b"hello",
-                crate::table::block::BlockIdentity::for_test(0, 0, BlockType::Data),
-                compression,
-                None,
-                Some(&dict),
-            )?;
-
-            // Read without dict → ZstdDictMismatch
-            let mut reader = &sink[..];
-            let result = Block::from_reader(
-                &mut reader,
-                crate::table::block::BlockIdentity::for_test(
-                    0,
-                    0,
-                    crate::table::block::BlockType::Data,
-                ),
-                &crate::table::block::BlockTransform::from_parts(
-                    compression,
-                    None,
-                    #[cfg(zstd_any)]
-                    None,
-                )?,
-            );
+            // Try to build the read-side transform without a dict.
+            let result = crate::table::block::BlockTransform::from_parts(compression, None, None);
             assert!(
                 matches!(
                     result,
@@ -2336,29 +2344,17 @@ mod tests {
 
         #[test]
         fn block_zstd_dict_wrong_dict_returns_error() -> crate::Result<()> {
+            // As with the dict-missing test above, the wrong-dict check
+            // now lives in BlockTransform::from_parts (it cross-checks
+            // the supplied dictionary id against the
+            // ZstdDict { dict_id } discriminator). Assert directly on
+            // the transform-construction result; no Block I/O call is
+            // needed to exercise the mismatch path.
             let dict = test_dict();
             let compression = test_compression(&dict);
             let wrong_dict = ZstdDictionary::new(b"completely different dictionary bytes");
-            let mut sink = vec![];
 
-            // Write expects dict.id(), but we'll try reading with wrong_dict
-            Block::write_into(
-                &mut sink,
-                b"hello",
-                crate::table::block::BlockIdentity::for_test(0, 0, BlockType::Data),
-                compression,
-                None,
-                Some(&dict),
-            )?;
-
-            let mut reader = &sink[..];
-            let result = Block::from_reader(
-                &mut reader,
-                crate::table::block::BlockIdentity::for_test(
-                    0,
-                    0,
-                    crate::table::block::BlockType::Data,
-                ),
+            let result = crate::table::block::BlockTransform::from_parts(
                 compression,
                 None,
                 Some(&wrong_dict),
@@ -2377,23 +2373,25 @@ mod tests {
         fn block_write_zstd_dict_missing_returns_error() {
             let dict = test_dict();
             let compression = test_compression(&dict);
-            let mut sink = std::io::sink();
 
-            // Write without providing dict → ZstdDictMismatch
-            let result = Block::write_into(
-                &mut sink,
-                b"hello",
-                crate::table::block::BlockIdentity::for_test(0, 0, BlockType::Data),
-                compression,
-                None,
-                None, // no dict
-            );
+            // Try to construct the transform without providing the
+            // dict the codec needs. The runtime ZstdDictMismatch
+            // check that used to live inside Block::write_into now
+            // lives in BlockTransform::from_parts, so the error
+            // surfaces one layer earlier (before any block write
+            // attempt). Verify the error variant still flows the
+            // same way to the caller.
+            let result = crate::table::block::BlockTransform::from_parts(compression, None, None);
+            // BlockTransform holds `&dyn EncryptionProvider` which
+            // doesn't impl Debug, so we can't print the whole result;
+            // surface just the Err side (which IS Debug) on mismatch.
             assert!(
                 matches!(
                     result,
                     Err(crate::Error::ZstdDictMismatch { got: None, .. })
                 ),
-                "expected ZstdDictMismatch, got: {result:?}",
+                "expected ZstdDictMismatch, got: {:?}",
+                result.err(),
             );
         }
 
@@ -2410,9 +2408,12 @@ mod tests {
                 &mut writer,
                 data,
                 crate::table::block::BlockIdentity::for_test(0, 0, BlockType::Data),
-                compression,
-                Some(&enc),
-                Some(&dict),
+                &crate::table::block::BlockTransform::from_parts(
+                    compression,
+                    Some(&enc),
+                    #[cfg(zstd_any)]
+                    Some(&dict),
+                )?,
             )?;
 
             let mut reader = &writer[..];
@@ -2423,9 +2424,12 @@ mod tests {
                     0,
                     crate::table::block::BlockType::Data,
                 ),
-                compression,
-                Some(&enc),
-                Some(&dict),
+                &crate::table::block::BlockTransform::from_parts(
+                    compression,
+                    Some(&enc),
+                    #[cfg(zstd_any)]
+                    Some(&dict),
+                )?,
             )?;
             assert_eq!(data, &*block.data);
             Ok(())
@@ -2445,9 +2449,12 @@ mod tests {
                 &mut buf,
                 &data,
                 crate::table::block::BlockIdentity::for_test(0, 0, BlockType::Data),
-                compression,
-                Some(&enc),
-                Some(&dict),
+                &crate::table::block::BlockTransform::from_parts(
+                    compression,
+                    Some(&enc),
+                    #[cfg(zstd_any)]
+                    Some(&dict),
+                )?,
             )?;
 
             let dir = tempfile::tempdir()?;
@@ -2470,9 +2477,12 @@ mod tests {
                     0,
                     crate::table::block::BlockType::Data,
                 ),
-                compression,
-                Some(&enc),
-                Some(&dict),
+                &crate::table::block::BlockTransform::from_parts(
+                    compression,
+                    Some(&enc),
+                    #[cfg(zstd_any)]
+                    Some(&dict),
+                )?,
             )?;
             assert_eq!(&*block.data, &data[..]);
             Ok(())
