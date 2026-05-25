@@ -13,11 +13,12 @@ use core::fmt;
 
 /// Errors raised by the AAD-bound block decoder.
 ///
-/// All variants are decode-side: encode-side failures are the caller's
-/// programmer error (wrong key length, suite without registered nonce
-/// length) and surface as panics or `crate::Error::Encrypt`. The
-/// decoder's job is to reject anything that doesn't match the on-disk
-/// wire format precisely, before any decryption work happens.
+/// All variants are decode-side: encode-side failures (AEAD failed
+/// to seal, caller-supplied buffer too small, etc.) surface through
+/// the existing `crate::Error::Encrypt` channel that the
+/// [`super::EncryptionProvider`] trait already uses. The decoder's
+/// job is to reject anything that doesn't match the on-disk wire
+/// format precisely, before any decryption work happens.
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum DecryptError {
