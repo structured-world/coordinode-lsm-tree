@@ -43,7 +43,7 @@ fn build_one_sst(item_count: u64) -> (tempfile::TempDir, std::path::PathBuf) {
 }
 
 #[test]
-fn dump_emits_one_line_per_entry_in_sort_order_with_quoted_key_value_format() {
+fn dump_all_entries_emits_sorted_quoted_format() {
     const ITEM_COUNT: u64 = 50;
     let (_dir, sst) = build_one_sst(ITEM_COUNT);
 
@@ -82,7 +82,7 @@ fn dump_emits_one_line_per_entry_in_sort_order_with_quoted_key_value_format() {
 }
 
 #[test]
-fn dump_honours_from_to_bounds() {
+fn dump_from_to_bounds_emits_inclusive_exclusive_range() {
     let (_dir, sst) = build_one_sst(100);
 
     let out = Command::new(SST_DUMP_BIN)
@@ -114,7 +114,7 @@ fn dump_honours_from_to_bounds() {
 }
 
 #[test]
-fn dump_honours_max_cap() {
+fn dump_with_max_cap_limits_output_count() {
     let (_dir, sst) = build_one_sst(100);
 
     let out = Command::new(SST_DUMP_BIN)
@@ -199,7 +199,7 @@ fn build_partitioned_index_sst(item_count: u64) -> (tempfile::TempDir, std::path
 }
 
 #[test]
-fn dump_rejects_partitioned_index_sst_with_unsupported_error() {
+fn dump_partitioned_index_sst_returns_unsupported_error() {
     // The `iter_data_block_entries` facade documents partitioned-index
     // tables as Unsupported; the regression test pins both the
     // non-zero exit code AND the user-facing error string so a future
@@ -246,7 +246,7 @@ fn dump_rejects_partitioned_index_sst_with_unsupported_error() {
 }
 
 #[test]
-fn dump_annotates_tombstone_entries_with_suffix() {
+fn dump_tombstone_entries_include_suffix() {
     // Build an SST with a mix of regular values and tombstones, then
     // confirm `sst-dump dump` emits the `# tombstone` suffix on the
     // tombstone lines (and only those). Catches regressions where
@@ -341,7 +341,7 @@ fn dump_empty_range_exits_zero_without_scanning() {
 }
 
 #[test]
-fn dump_fails_on_missing_file() {
+fn dump_missing_file_returns_error() {
     let bogus = tempfile::tempdir().expect("tempdir");
     let nonexistent = bogus.path().join("does-not-exist");
 
