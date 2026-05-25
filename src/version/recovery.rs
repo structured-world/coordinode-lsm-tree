@@ -1504,6 +1504,110 @@ mod tests {
         Ok(())
     }
 
+    /// Builds a manifest where level 0 has one good record but level 1's
+    /// FIRST table record carries a corrupt XXH3 digest. With PIT or
+    /// SkipAny + BadHeader handling, the early-exit branches push the
+    /// (empty) in-progress run into the level — and the (empty) level
+    /// into the levels vec — before breaking out. The recovered
+    /// `Recovery` then carries an empty run, which `Version::from_recovery`
+    /// later rejects via `Run::new(...).expect("persisted runs should not
+    /// be empty")` — a panic in code that was supposed to be the tolerant
+    /// path.
+    fn write_manifest_with_corrupt_first_record_of_second_level(
+        folder: &Path,
+        id: u64,
+        fs: &dyn Fs,
+    ) -> crate::Result<()> {
+        let path = folder.join(format!("v{id}"));
+        let file = fs.open(
+            &path,
+            &FsOpenOptions::new().write(true).create(true).truncate(true),
+        )?;
+        let mut w = sfa::Writer::from_writer(std::io::BufWriter::new(file));
+
+        w.start("tree_type")?;
+        w.write_u8(0)?;
+
+        w.start("tables")?;
+        w.write_u8(2)?; // 2 levels
+        // Level 0: 1 run, 1 good record (so the consistent prefix is
+        // non-empty and the PIT/SkipAny path will reach level 1).
+        w.write_u8(1)?;
+        w.write_u32::<LittleEndian>(1)?;
+        write_good_table_record(&mut w, 100)?;
+        // Level 1: 1 run, 1 corrupt record AS THE FIRST AND ONLY
+        // record. Under PIT this triggers the corruption-handling
+        // arm BEFORE any record has been pushed into the new run —
+        // run.len() == 0 when the branch pushes it into level.
+        w.write_u8(1)?;
+        w.write_u32::<LittleEndian>(1)?;
+        write_bad_table_record(&mut w, 200)?;
+
+        w.start("blob_files")?;
+        w.write_u32::<LittleEndian>(0)?;
+        w.start("blob_gc_stats")?;
+        w.write_u32::<LittleEndian>(0)?;
+        w.finish().map_err(|e| match e {
+            sfa::Error::Io(e) => crate::Error::from(e),
+            _ => crate::Error::Unrecoverable,
+        })?;
+        Ok(())
+    }
+
+    /// Regression test for CodeRabbit finding on PR #342: tolerant/PIT
+    /// early-exit branches push the in-progress `run` into the current
+    /// `level` regardless of whether the run is empty, and push the
+    /// `level` regardless of whether it has any runs. When the FIRST
+    /// record of a new run is the corrupt one, the run is empty at the
+    /// time the branch fires — `Recovery::table_ids` then carries an
+    /// empty inner vec, which `Version::from_recovery` later panics on
+    /// via `Run::new(...).expect("persisted runs should not be empty")`.
+    /// Invariant under test: `recover()` must never produce empty runs
+    /// or empty levels in `table_ids` — the recovery shape must be
+    /// usable by `Version::from_recovery` without further validation.
+    #[test]
+    fn recover_pit_drops_empty_run_when_corruption_hits_first_record() -> crate::Result<()> {
+        let fs = MemFs::new();
+        let folder = Path::new("/pit/empty_run");
+        fs.create_dir_all(folder)?;
+        write_current(folder, 1, &fs)?;
+        write_manifest_with_corrupt_first_record_of_second_level(folder, 1, &fs)?;
+
+        let recovery = recover(folder, &fs, ManifestRecoveryMode::PointInTimeRecovery)?;
+
+        // Level 0 survived intact with its one good record.
+        // Level 1 hit corruption on its first record → must be
+        // dropped entirely, NOT preserved as an empty level
+        // containing an empty run.
+        for (level_idx, level) in recovery.table_ids.iter().enumerate() {
+            assert!(
+                !level.is_empty(),
+                "level {level_idx} is empty in recovered Recovery — \
+                 Version::from_recovery will produce a Level with no \
+                 runs (or attempt Run::new on an empty vec downstream)",
+            );
+            for (run_idx, run) in level.iter().enumerate() {
+                assert!(
+                    !run.is_empty(),
+                    "level {level_idx} run {run_idx} is empty — \
+                     Version::from_recovery calls Run::new on this and \
+                     panics via the .expect(\"persisted runs should not \
+                     be empty\")",
+                );
+            }
+        }
+
+        // Specific prefix shape: only the level-0 record survives.
+        assert_eq!(
+            recovery.table_ids.len(),
+            1,
+            "expected only level 0 in the recovered shape; got {} levels",
+            recovery.table_ids.len(),
+        );
+        assert_eq!(recovery.table_ids[0][0][0].id, 100);
+        Ok(())
+    }
+
     #[test]
     fn recover_pit_truncates_remaining_blob_records_on_corruption() -> crate::Result<()> {
         let fs = MemFs::new();
