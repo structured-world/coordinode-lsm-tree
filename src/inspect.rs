@@ -182,16 +182,24 @@ pub fn read_table_properties(path: &Path) -> crate::Result<TableProperties> {
 
 /// One entry parsed from an SST's top-level index (TLI) block.
 ///
-/// What this points at depends on the index layout, recoverable from
-/// [`TableProperties`]:
-/// - **Full-index tables** (`TableProperties.index_block_count == 1`):
-///   the TLI directly contains data-block handles. Each `IndexEntry`
-///   here corresponds to one data block in the SST.
-/// - **Partitioned-index tables** (`index_block_count > 1`): the TLI
-///   contains handles pointing at the partitioned sub-index leaf
-///   blocks (the `index` SFA section). Each `IndexEntry` here points
-///   at one leaf, not a data block; walking the leaves to enumerate
+/// What this points at depends on the SST's index layout:
+///
+/// - **Full-index tables**: the SST has no separate `index` SFA
+///   section. The TLI directly carries data-block handles, so each
+///   `IndexEntry` corresponds to one data block in the SST.
+/// - **Partitioned-index tables**: the SST has an `index` SFA section
+///   containing sub-index leaf blocks. The TLI carries handles
+///   pointing at those leaves, so each `IndexEntry` corresponds to
+///   one leaf, NOT a data block; walking the leaves to enumerate
 ///   individual data blocks is a separate operation.
+///
+/// The distinction is not derivable from `TableProperties` fields
+/// alone — in particular `TableProperties.index_block_count == 1`
+/// can mean either a full-index table OR a partitioned-index table
+/// with a single leaf partition. The authoritative signal is the
+/// presence of an `index` SFA section in the SFA TOC; this facade
+/// does not currently expose that signal. Callers needing to
+/// classify the layout should consult the SST file's TOC directly.
 ///
 /// `#[non_exhaustive]` so new fields can be added in a minor version
 /// bump.

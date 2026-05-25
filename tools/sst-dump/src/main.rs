@@ -361,11 +361,12 @@ fn run_index_dump(path: &std::path::Path) -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
-    // Header row. Columns are left-aligned; widths chosen so a
-    // 64-bit offset (up to 20 digits) and u32 size (up to 10) line
-    // up against a typical key prefix without crowding. Keys can be
-    // arbitrarily long; place `end_key` last so wrap-around doesn't
-    // mis-align the numeric columns.
+    // Header row. Numeric columns are right-aligned (`{:>...}`) so
+    // u64 / u32 values stack cleanly under their headers; widths
+    // chosen so a 64-bit offset (up to 20 digits) and u32 size (up
+    // to 10) line up against a typical key prefix without crowding.
+    // Keys can be arbitrarily long; place `end_key` last so
+    // wrap-around doesn't mis-align the numeric columns.
     println!(
         "{:>5}  {:>20}  {:>10}  {:>20}  end_key",
         "#", "offset", "size", "seqno",
