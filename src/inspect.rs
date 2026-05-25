@@ -430,7 +430,7 @@ pub struct FilterStats {
 /// - the `meta` block fails to decode (needed for `item_count`),
 /// - the table has a `filter_tli` SFA section (partitioned filter,
 ///   not supported by this facade): returned as
-///   returned as `Error::FeatureUnsupported("filter_tli")` (see
+///   `Error::FeatureUnsupported("filter_tli")` (see
 ///   [`crate::Error::FeatureUnsupported`]) so callers can match the
 ///   typed variant instead of parsing message strings,
 /// - the `filter` block header / payload is malformed,
