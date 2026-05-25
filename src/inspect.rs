@@ -403,7 +403,15 @@ pub struct DataBlockEntryIter {
     /// TLI walks the handles in sorted order already, and `Vec::pop`
     /// from the tail with reversed input is cheaper than the
     /// double-ended queue overhead.
-    remaining_handles: Vec<crate::table::KeyedBlockHandle>,
+    ///
+    /// Stores plain `BlockHandle` (offset + size) rather than
+    /// `KeyedBlockHandle`. `KeyedBlockHandle` carries `end_key:
+    /// Slice` which is a view into the TLI block buffer; collecting
+    /// the keyed variant would keep the entire TLI block alive for
+    /// the iterator's lifetime and undermine the "memory bounded to
+    /// one data block" guarantee. Stripping to the bare handle lets
+    /// the TLI block drop after enumeration completes.
+    remaining_handles: Vec<crate::table::BlockHandle>,
     /// Iterator over the currently-loaded block, or `None` when we
     /// haven't loaded a block yet or just finished one.
     current: Option<crate::table::iter::OwnedDataBlockIter>,
@@ -418,12 +426,21 @@ impl Iterator for DataBlockEntryIter {
             // Drain the current block before considering the next one.
             if let Some(iter) = self.current.as_mut() {
                 if let Some(internal) = iter.next() {
-                    let value_type = internal.key.value_type;
                     let entry = DataEntry {
                         key: internal.key.user_key.to_vec(),
                         value: internal.value.to_vec(),
                         seqno: internal.key.seqno,
-                        is_tombstone: !matches!(value_type, crate::ValueType::Value),
+                        // `is_tombstone` must be true ONLY for the
+                        // two tombstone variants — `MergeOperand`
+                        // and `Indirection` are non-`Value` entries
+                        // but emphatically NOT tombstones. Using
+                        // `ValueType::is_tombstone()` keeps the
+                        // facade aligned with the crate's own
+                        // tombstone predicate (single source of
+                        // truth), so a future variant addition
+                        // doesn't quietly start flagging unrelated
+                        // entries as tombstones.
+                        is_tombstone: internal.key.value_type.is_tombstone(),
                     };
                     return Some(Ok(entry));
                 }
@@ -434,7 +451,7 @@ impl Iterator for DataBlockEntryIter {
             let handle = self.remaining_handles.pop()?;
             match load_data_block_iter(
                 &*self.file,
-                handle.as_ref(),
+                &handle,
                 self.table_id,
                 self.data_block_compression,
             ) {
@@ -490,8 +507,8 @@ impl Iterator for DataBlockEntryIter {
 /// yields one `Err` and ends the walk.
 #[cfg(feature = "std")]
 pub fn iter_data_block_entries(path: &Path) -> crate::Result<DataBlockEntryIter> {
+    use crate::table::IndexBlock;
     use crate::table::block_index::iter::OwnedIndexBlockIter;
-    use crate::table::{IndexBlock, KeyedBlockHandle};
 
     let fs = StdFs;
     let mut file = fs.open(path, &FsOpenOptions::new().read(true))?;
@@ -545,11 +562,21 @@ pub fn iter_data_block_entries(path: &Path) -> crate::Result<DataBlockEntryIter>
 
     let block = IndexBlock::new(tli_block);
     let iter = OwnedIndexBlockIter::from_block(block, crate::comparator::default_comparator())?;
-    // Collect into a Vec so the next() loop can `pop` from the tail
-    // (cheap) while iterating in original sorted order. Reverse
-    // here so `pop` yields the smallest end_key first — matches the
-    // natural left-to-right read order operators expect from `dump`.
-    let mut handles: Vec<KeyedBlockHandle> = iter.collect();
+    // Materialise each handle to the bare `BlockHandle` (offset +
+    // size) right here, so the surrounding `IndexBlock` and its
+    // backing `Slice` can drop as soon as this collect finishes.
+    // `KeyedBlockHandle.end_key` is a view into the TLI block bytes;
+    // holding `KeyedBlockHandle` in the iterator struct would keep
+    // the entire TLI block alive for the iterator's lifetime, which
+    // contradicts the "memory bounded to one data block" guarantee.
+    // `BlockHandle` is `Copy`, so `into_inner()` is cheap and
+    // releases the `Slice` view at the same time.
+    let mut handles: Vec<crate::table::BlockHandle> = iter
+        .map(crate::table::KeyedBlockHandle::into_inner)
+        .collect();
+    // Reverse so `pop` from the tail yields the smallest end_key
+    // first — matches the natural left-to-right read order
+    // operators expect from `dump`.
     handles.reverse();
 
     Ok(DataBlockEntryIter {
@@ -609,5 +636,4 @@ fn load_data_block_iter(
     OwnedDataBlockIter::try_new(data_block, |b| {
         b.try_iter(crate::comparator::default_comparator())
     })
-    .map_err(|e: crate::Error| e)
 }
