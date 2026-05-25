@@ -2376,7 +2376,7 @@ mod tests {
         }
 
         #[test]
-        fn block_write_zstd_dict_missing_returns_error() {
+        fn block_transform_from_parts_zstd_dict_missing_returns_error() {
             let dict = test_dict();
             let compression = test_compression(&dict);
 
@@ -2385,8 +2385,11 @@ mod tests {
             // check that used to live inside Block::write_into now
             // lives in BlockTransform::from_parts, so the error
             // surfaces one layer earlier (before any block write
-            // attempt). Verify the error variant still flows the
-            // same way to the caller.
+            // attempt). This test verifies that earlier surface —
+            // it no longer exercises Block::write_into at all;
+            // hence the rename from block_write_* to
+            // block_transform_from_parts_* to match what's actually
+            // asserted.
             let result = crate::table::block::BlockTransform::from_parts(compression, None, None);
             // BlockTransform holds `&dyn EncryptionProvider` which
             // doesn't impl Debug, so we can't print the whole result;

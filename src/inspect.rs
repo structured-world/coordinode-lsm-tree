@@ -519,9 +519,14 @@ pub fn read_filter_stats(path: &Path) -> crate::Result<Option<FilterStats>> {
     //    (no compression, no encryption). The reader-side
     //    transform must match — using anything else would either
     //    try to decompress raw filter bytes or expect an AEAD tag
-    //    that isn't there. This facade has no encryption provider
-    //    either way, so encrypted SSTs surface a decrypt error
-    //    upstream, not here.
+    //    that isn't there. For SSTs whose filter block was written
+    //    encrypted, this facade cannot decode it at all (no
+    //    provider is plumbed through): `Block::from_file` with
+    //    `Plain` verifies the XXH3 over the ciphertext bytes and
+    //    then fails downstream — typically `InvalidHeader` from the
+    //    `uncompressed_length` field disagreeing with the ciphertext
+    //    length, not a clean `Error::Decrypt`. Encrypted-aware filter
+    //    inspection is tracked alongside #251 / #256.
     //
     // 2. **`block_offset` held at 0.** `filter_handle.offset()`
     //    carries the real on-disk position, but the writer emits
