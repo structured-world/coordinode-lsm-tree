@@ -80,6 +80,10 @@ struct BenchTable {
 }
 
 fn build_table_for_point_read(restart_interval: u8) -> BenchTable {
+    build_table_for_point_read_inner(restart_interval, false)
+}
+
+fn build_table_for_point_read_inner(restart_interval: u8, partitioned: bool) -> BenchTable {
     let dir = tempfile::tempdir().expect("tempdir should be created");
     let path = dir.path().join("table.sst");
 
@@ -87,6 +91,9 @@ fn build_table_for_point_read(restart_interval: u8) -> BenchTable {
         .expect("writer should be created")
         .use_data_block_size(256)
         .use_index_block_restart_interval(restart_interval);
+    if partitioned {
+        writer = writer.use_partitioned_index();
+    }
 
     for i in 0..4096u32 {
         let key = format!("adj:out:vertex-0001:edge-{i:04}:target-0001");
@@ -158,5 +165,35 @@ fn bench_table_point_read(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_index_block_seek, bench_table_point_read);
+fn bench_table_point_read_index_layout(c: &mut Criterion) {
+    let mut group = c.benchmark_group("table_point_read_index_layout");
+
+    for &partitioned in &[false, true] {
+        let label = if partitioned { "partitioned" } else { "full" };
+        let bench_table = build_table_for_point_read_inner(1, partitioned);
+
+        group.bench_with_input(
+            BenchmarkId::from_parameter(label),
+            &bench_table,
+            |b, bench_table| {
+                b.iter(|| {
+                    let value = bench_table
+                        .table
+                        .get(&bench_table.key, SeqNo::MAX, bench_table.key_hash)
+                        .expect("point read should succeed");
+                    assert!(value.is_some());
+                });
+            },
+        );
+    }
+
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    bench_index_block_seek,
+    bench_table_point_read,
+    bench_table_point_read_index_layout
+);
 criterion_main!(benches);
