@@ -121,10 +121,11 @@ impl PartitionedFilterWriter {
                 dict_id: 0,
                 window_log: 0,
             },
-            CompressionType::None,
-            self.encryption.as_deref(),
-            #[cfg(zstd_any)]
-            None, // filter blocks don't use dictionary compression
+            // Per-partition filter bodies are uncompressed.
+            &match self.encryption.as_deref() {
+                Some(enc) => crate::table::block::BlockTransform::Encrypted(enc),
+                None => crate::table::block::BlockTransform::PLAIN,
+            },
         )?;
 
         #[expect(
@@ -176,10 +177,15 @@ impl PartitionedFilterWriter {
                 dict_id: 0,
                 window_log: 0,
             },
-            self.compression,
-            self.encryption.as_deref(),
-            #[cfg(zstd_any)]
-            None, // filter blocks don't use dictionary compression
+            // TLI for the partitioned filter uses the configured
+            // index codec; no zstd dict is ever attached at this
+            // writer level.
+            &crate::table::block::BlockTransform::from_parts(
+                self.compression,
+                self.encryption.as_deref(),
+                #[cfg(zstd_any)]
+                None,
+            )?,
         )?;
 
         #[expect(

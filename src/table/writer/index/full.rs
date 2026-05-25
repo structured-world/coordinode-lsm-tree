@@ -113,10 +113,15 @@ impl<W: std::io::Write + std::io::Seek> BlockIndexWriter<W> for FullIndexWriter 
                 dict_id: 0,
                 window_log: 0,
             },
-            self.compression,
-            self.encryption.as_deref(),
-            #[cfg(zstd_any)]
-            None, // index blocks don't use dictionary compression (dict trained on data, not index structures)
+            // Index blocks use the configured codec but never a
+            // zstd dict (dicts are trained on data, not index
+            // structures).
+            &crate::table::block::BlockTransform::from_parts(
+                self.compression,
+                self.encryption.as_deref(),
+                #[cfg(zstd_any)]
+                None,
+            )?,
         )?;
 
         #[expect(

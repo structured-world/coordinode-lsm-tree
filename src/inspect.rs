@@ -346,10 +346,16 @@ fn load_index_block(
             dict_id: 0,
             window_log: 0,
         },
-        compression,
-        None,
-        #[cfg(zstd_any)]
-        None,
+        // Inspect-side index loader doesn't accept an encryption
+        // provider (out-of-band facade) and never threads a zstd
+        // dict, so the transform collapses to Plain / Compressed
+        // depending on the codec the meta block reported.
+        &crate::table::block::BlockTransform::from_parts(
+            compression,
+            None,
+            #[cfg(zstd_any)]
+            None,
+        )?,
     )?;
 
     if block.header.block_type != BlockType::Index {

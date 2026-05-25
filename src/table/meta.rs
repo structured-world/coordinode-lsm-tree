@@ -132,10 +132,13 @@ impl ParsedMeta {
                 dict_id: 0,
                 window_log: 0,
             },
-            CompressionType::None,
-            encryption,
-            #[cfg(zstd_any)]
-            None,
+            // Meta blocks are always written uncompressed; the
+            // transform is therefore Plain (no encryption configured)
+            // or Encrypted (provider supplied by the caller).
+            &match encryption {
+                Some(enc) => crate::table::block::BlockTransform::Encrypted(enc),
+                None => crate::table::block::BlockTransform::PLAIN,
+            },
         )?;
 
         if block.header.block_type != BlockType::Meta {
