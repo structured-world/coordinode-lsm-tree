@@ -19,18 +19,26 @@ fn build_one_sst(item_count: u64) -> (tempfile::TempDir, std::path::PathBuf) {
     let dir = tempfile::tempdir().expect("tempdir");
     // Force a full (non-partitioned) index at every level. The
     // upstream `Config::default()` flip to partitioned-by-default
-    // (#329 / PR #340) routes all SSTs into the
+    // (#329 / PR #340) routes default-built SSTs into the
     // `iter_data_block_entries` "not supported for partitioned-index"
     // path, but the `dump` subcommand is by design exercised here on
     // the full-index shape it can walk. The partitioned-index "not
     // supported" path has its own dedicated test below.
+    //
+    // `PinningPolicy::all(false)` here — NOT the pre-#329
+    // `[false, false, false, true]` shape that still partitions
+    // L3+. These fixtures flush a single SST that lives at L0, so
+    // both shapes happen to behave identically for this test, but
+    // matching the comment's "every level" claim makes the policy
+    // self-evidently correct (and future-proof against the test
+    // gaining a multi-level compaction step).
     let tree = Config::new(
         dir.path(),
         SequenceNumberCounter::default(),
         SequenceNumberCounter::default(),
     )
     .data_block_compression_policy(CompressionPolicy::all(CompressionType::None))
-    .index_block_partitioning_policy(PinningPolicy::new([false, false, false, true]))
+    .index_block_partitioning_policy(PinningPolicy::all(false))
     .open()
     .expect("open tree");
 
@@ -275,7 +283,7 @@ fn dump_tombstone_entries_include_suffix() {
         SequenceNumberCounter::default(),
     )
     .data_block_compression_policy(CompressionPolicy::all(CompressionType::None))
-    .index_block_partitioning_policy(PinningPolicy::new([false, false, false, true]))
+    .index_block_partitioning_policy(PinningPolicy::all(false))
     .open()
     .expect("open tree");
 
