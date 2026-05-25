@@ -383,8 +383,10 @@ pub struct FilterStats {
     pub filter_section_bytes: u64,
     /// Number of `BuRR` / Ribbon "layers" the writer emitted. Each
     /// layer is a Bumped-Ribbon-Retrieval pass; more layers means a
-    /// larger filter at a given key count but tighter FPR.
-    pub layer_count: usize,
+    /// larger filter at a given key count but tighter FPR. Fixed-width
+    /// `u64` so the public layout doesn't vary between 32-bit and
+    /// 64-bit targets, matching the rest of the inspect facade.
+    pub layer_count: u64,
     /// Number of keys the meta block reports for the table. Used as
     /// the denominator for `bits_per_key`; sourced from
     /// `TableProperties.item_count` and copied here so callers can
@@ -538,10 +540,14 @@ pub fn read_filter_stats(path: &Path) -> crate::Result<Option<FilterStats>> {
     // that case; `bits_per_key` still follows the documented
     // formula below (block header bytes / item_count), so the
     // field semantics stay consistent with `FilterStats`'s doc.
-    let layer_count = if block.data.is_empty() {
+    let layer_count: u64 = if block.data.is_empty() {
         0
     } else {
-        BurrFilterReader::new(&block.data)?.layer_count()
+        // BurrFilterReader::layer_count returns usize; widen to u64 at
+        // the public-API boundary. usize -> u64 is lossless on every
+        // target Rust supports (u64 is at least as wide as usize on
+        // 32-bit and identical on 64-bit).
+        BurrFilterReader::new(&block.data)?.layer_count() as u64
     };
 
     // `item_count` is `u64`; cast to `f64` is lossy for values above
