@@ -85,14 +85,33 @@ impl ErrorKind {
 /// I/O error mirroring [`std::io::Error`].
 ///
 /// Carries an [`ErrorKind`] plus an optional message string for
-/// context. Under `feature = "std"` the `From<std::io::Error>`
-/// bridge below RETAINS the platform error's `Display` output as
-/// the message payload, so the original text (OS error string,
-/// path context, errno description) survives the conversion and
-/// appears in this error's `Display` after the kind prefix
-/// — the rendered form is `"<kind>: <std-display>"`, which is
-/// the same information as the original `std::io::Error` printed,
-/// just with an explicit kind tag prepended.
+/// context. The rendered `Display` form is `"<kind>"` when no
+/// message is attached, or `"<kind>: <message>"` when one is.
+///
+/// Under `feature = "std"`, the `From<std::io::Error>` bridge
+/// below applies a tri-state message-attachment policy so the
+/// rendered text matches the information density of the input
+/// without paying a heap allocation for plain kind-only inputs:
+///
+/// 1. **std error carries context** (`raw_os_error.is_some()` OR
+///    `get_ref().is_some()` — the canonical std discriminator
+///    for "more than just a kind") — the std `Display` output is
+///    captured as the message. The original OS / errno / path
+///    text survives the conversion and appears after the kind
+///    tag.
+/// 2. **std error is plain kind-only AND we mapped the kind**
+///    (`std::io::Error::from(ErrorKind::NotFound)` etc.) — no
+///    message is attached. The kind tag already conveys the
+///    information; capturing the std `Display` output would just
+///    repeat it (`"entity not found: entity not found"`) and burn
+///    a heap allocation on the hot path.
+/// 3. **std error is plain kind-only but we did NOT map the
+///    kind** (the `#[non_exhaustive]` `std::io::ErrorKind`
+///    catch-all branch — e.g. `OutOfMemory` mapping to our
+///    `ErrorKind::Other`) — the std `Display` output IS captured
+///    so the user-visible discriminant isn't lost in the
+///    `Other` bucket. Renders as `"other error: out of memory"`
+///    rather than just `"other error"`.
 pub struct Error {
     kind: ErrorKind,
     message: Option<Box<str>>,
