@@ -1246,11 +1246,20 @@ mod tests {
         w.write_u8(1)?; // 1 run
         w.write_u32::<LittleEndian>(1)?; // 1 entry
         // Framed record with a corrupt `checksum_type` byte in the
-        // payload. The framing XXH3 still covers the payload, so the
-        // record decodes cleanly at the framing layer; the InvalidTag
-        // surfaces from `decode_table_entry_payload` and aborts even
-        // under tolerant modes (the contract: tail-tolerance is for
-        // write-incomplete scenarios, not arbitrary corruption).
+        // payload. The framing XXH3 still covers the payload, so
+        // the record decodes cleanly at the framing layer; the
+        // InvalidTag surfaces from `decode_table_entry_payload`.
+        // Handling per mode:
+        //   - AbsoluteConsistency:           aborts (used by this test)
+        //   - TolerateCorruptedTailRecords:  also aborts — tail-
+        //     tolerance is for write-incomplete tail scenarios, not
+        //     arbitrary in-section corruption.
+        //   - PointInTimeRecovery:           truncates the
+        //     recovered tree at the corrupt record's level/run.
+        //   - SkipAnyCorruptedRecords:       skips this record,
+        //     continues with the rest of the section.
+        // This fixture exercises the first row; PIT/SkipAny
+        // behaviour is covered by separate test fixtures below.
         crate::version::framing::write_framed_record(&mut w, &mut Vec::new(), |payload| {
             payload.write_u64::<LittleEndian>(0)?; // id
             payload.write_u8(0xFF)?; // corrupt checksum_type
@@ -1848,15 +1857,22 @@ mod tests {
     /// empty inner vec, which `Version::from_recovery` later panics on
     /// via `Run::new(...).expect("persisted runs should not be empty")`.
     /// Invariants under test:
-    /// 1. `recover()` must never produce empty runs in `table_ids`.
-    /// 2. Empty inner levels (no runs) must not appear — they pass
-    ///    `Level::from_runs(vec![])` cleanly downstream but offer no
-    ///    information; truncated levels are represented by the slot,
-    ///    not by a placeholder run.
+    /// 1. `recover()` must never produce empty RUNS in
+    ///    `table_ids` — an empty inner-inner vec fails downstream
+    ///    at `Run::new(...).expect("persisted runs should not be
+    ///    empty")` inside `Version::from_recovery`.
+    /// 2. Empty LEVELS (an outer slot containing zero runs) ARE
+    ///    expected and permitted — they're the canonical
+    ///    representation for a level that PIT / `SkipAny` /
+    ///    tail-truncation cleared of all surviving records. The
+    ///    slot survives so the `level_count` stays preserved;
+    ///    the placeholder is "no runs in this slot", NOT "one
+    ///    placeholder run with no tables inside".
     /// 3. The number of level SLOTS in `table_ids` must equal the
-    ///    persisted `level_count` — downstream code (compaction/leveled
-    ///    asserts `version.level_count() == 7`) reads `levels.len()`
-    ///    directly and shrinking it crashes the tree.
+    ///    persisted `level_count` — downstream code
+    ///    (compaction/leveled asserts `version.level_count() == 7`)
+    ///    reads `levels.len()` directly and shrinking it crashes
+    ///    the tree.
     #[test]
     fn recover_pit_drops_empty_run_when_corruption_hits_first_record() -> crate::Result<()> {
         let fs = MemFs::new();
