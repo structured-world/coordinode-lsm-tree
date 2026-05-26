@@ -162,6 +162,27 @@ pub mod file;
 pub mod fs;
 
 pub mod hash;
+
+/// Local I/O trait surface mirroring `std::io::{Read, Write, Seek}`.
+///
+/// Provides `Error` / `ErrorKind` / `SeekFrom` plus the three trait
+/// definitions so the bounds on the [`fs`] traits no longer carry
+/// `std::io::*` directly. Under the `std` feature, supertrait
+/// aliases + blanket impls forward to `std::io` types so existing
+/// std-backed backends satisfy the trait surface automatically; the
+/// alias form also propagates BACK to `std::io`, so a `dyn FsFile`
+/// bounded on `crate::io::Read` still flows into `std::io::BufReader`,
+/// `byteorder`, and friends.
+///
+/// Scope: this prerequisite slice (per #311) lifts only
+/// `Read`/`Write`/`Seek` out of the [`fs`] trait bounds. The
+/// `io::Result<T>` return types and `&Path` argument types in
+/// `fs::Fs` / `fs::FsFile` still resolve to `std::io::Result<T>` and
+/// `std::path::Path` and migrate in follow-up commits; the full
+/// `--no-default-features --features alloc` build of the `fs::*`
+/// surface arrives once those two follow-ups land.
+pub mod io;
+
 mod heap;
 mod ingestion;
 mod iter_guard;
