@@ -60,7 +60,13 @@ jobs:
   # two required jobs.
   changes:
     runs-on: ubuntu-latest
-    timeout-minutes: 2
+    # Bumped from the original 2 min — generous timeout so a slow
+    # `/pulls/{N}/files` page on a large PR can't run us into a
+    # hard wall. The job is also designed to NEVER fail (every
+    # path below resolves to a `code` output, even on API errors)
+    # so a missed deadline is the only remaining failure mode and
+    # 10 min gives plenty of margin.
+    timeout-minutes: 10
     # Read-only token: we hit the GH REST API for the PR file list /
     # push compare, never push, never write. Explicit `permissions:`
     # block scopes the auto-provided GITHUB_TOKEN to exactly what
@@ -87,30 +93,51 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number }}
           PUSH_BEFORE: ${{ github.event.before }}
           PUSH_AFTER: ${{ github.sha }}
+        # Intentionally NOT `set -euo pipefail`. This job is a hard
+        # dependency of the required `lint` + `test (stable,
+        # ubuntu-latest)` checks (they `needs: changes`), so any
+        # failure here cascades to "required check never reports"
+        # and blocks merges. Instead, every failure path below
+        # explicitly emits `code=true` (safe default — runs the
+        # real pipeline) and exits 0. The job's exit status is
+        # always 0 unless GitHub Actions itself kills the runner.
         run: |
-          set -euo pipefail
+          set -u
+          # Helper: emit a `code` output, log a reason, and exit 0
+          # so dependent jobs always have a valid value to consume.
+          emit_and_exit() {
+            local code_value="$1"
+            local reason="$2"
+            echo "::notice::changes job: code=$code_value ($reason)"
+            echo "code=$code_value" >> "$GITHUB_OUTPUT"
+            exit 0
+          }
           if [ "$EVENT_NAME" = "pull_request" ]; then
             # GitHub's own PR file list is the merge-base diff —
             # exactly what we want, without resolving merge-base
             # ourselves. Paginated to handle PRs touching >100 files
             # (the API caps each page at 100, more pages auto-fetch).
             echo "Fetching PR #$PR_NUMBER file list via REST API..."
-            CHANGED=$(gh api --paginate "repos/$REPO/pulls/$PR_NUMBER/files" --jq '.[].filename')
+            if ! CHANGED=$(gh api --paginate "repos/$REPO/pulls/$PR_NUMBER/files" --jq '.[].filename' 2>&1); then
+              # API/auth/rate-limit failure: don't cascade. Default
+              # to `code=true` so the real lint/test runs anyway.
+              emit_and_exit "true" "REST /pulls/$PR_NUMBER/files failed, defaulting to full CI"
+            fi
           else
             # `push` event: list files between BEFORE and AFTER via
             # the compare endpoint. First push of a new branch reports
             # the all-zeros sentinel as `before` — no baseline to diff
             # against, assume code changed (safe default).
-            if [ -z "$PUSH_BEFORE" ] || [ "$PUSH_BEFORE" = "0000000000000000000000000000000000000000" ]; then
-              echo "No baseline commit available (new branch / first push) — assuming code changed."
-              echo "code=true" >> "$GITHUB_OUTPUT"
-              exit 0
+            if [ -z "${PUSH_BEFORE:-}" ] || [ "$PUSH_BEFORE" = "0000000000000000000000000000000000000000" ]; then
+              emit_and_exit "true" "new branch / first push, no baseline"
             fi
             echo "Fetching compare $PUSH_BEFORE...$PUSH_AFTER via REST API..."
-            CHANGED=$(gh api "repos/$REPO/compare/$PUSH_BEFORE...$PUSH_AFTER" --jq '.files[].filename')
+            if ! CHANGED=$(gh api "repos/$REPO/compare/$PUSH_BEFORE...$PUSH_AFTER" --jq '.files[].filename' 2>&1); then
+              emit_and_exit "true" "REST /compare failed, defaulting to full CI"
+            fi
           fi
           echo "Changed files:"
-          echo "$CHANGED" | sed 's/^/  /'
+          printf '%s\n' "$CHANGED" | sed 's/^/  /'
           # Predicate: anything that affects compile / lint / test
           # results counts as code. The workflow file is included so
           # changes to CI logic itself always trigger the full matrix
@@ -123,46 +150,58 @@ jobs:
           # touches only those files would defeat the purpose of the
           # required-check gate.
           CODE_RE='^(src/|tests/|benches/|examples/|test_fixture/|build\.rs$|Cargo\.toml$|Cargo\.lock$|tools/|\.github/workflows/coordinode-ci\.yml$|rust-toolchain(\.toml)?$|\.cargo/|\.config/nextest\.toml$|\.rustfmt\.toml$|clippy\.toml$)'
-          if echo "$CHANGED" | grep -qE "$CODE_RE"; then
-            echo "Result: code paths affected — running real CI."
-            echo "code=true" >> "$GITHUB_OUTPUT"
+          if printf '%s\n' "$CHANGED" | grep -qE "$CODE_RE"; then
+            emit_and_exit "true" "code paths affected — running real CI"
           else
-            echo "Result: no code paths affected — emitting fast success for required checks."
-            echo "code=false" >> "$GITHUB_OUTPUT"
+            emit_and_exit "false" "no code paths affected — fast success"
           fi
 
   lint:
     needs: changes
+    # `!cancelled()` so the required `lint` check still runs (and
+    # emits its name to the ruleset) even if `changes` errors out
+    # for an infra reason — empty `needs.changes.outputs.code` is
+    # caught below by the `!= 'false'` step guards, which default
+    # to running the real lint work (safe fallback).
+    if: ${{ !cancelled() }}
     timeout-minutes: 10
     runs-on: ubuntu-latest
     steps:
       # Surfaces a notice in the run log + summary so docs-only PRs
       # leave an obvious trail explaining why the check passed
-      # without doing real work.
+      # without doing real work. Only fires on the explicit
+      # `code=false` signal — empty/unset (changes job failed)
+      # falls through to the real lint work below.
       - name: Path-conditional skip notice
-        if: needs.changes.outputs.code != 'true'
+        if: needs.changes.outputs.code == 'false'
         run: |
           echo "::notice::No code paths changed — skipping format + clippy. Required-check name still emitted as success."
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
-        if: needs.changes.outputs.code == 'true'
+        if: needs.changes.outputs.code != 'false'
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
-        if: needs.changes.outputs.code == 'true'
+        if: needs.changes.outputs.code != 'false'
         with:
           toolchain: stable
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2.9.1
-        if: needs.changes.outputs.code == 'true'
+        if: needs.changes.outputs.code != 'false'
       - name: Format
-        if: needs.changes.outputs.code == 'true'
+        if: needs.changes.outputs.code != 'false'
         run: cargo fmt --all -- --check
       - name: Clippy (strict)
-        if: needs.changes.outputs.code == 'true'
+        if: needs.changes.outputs.code != 'false'
         run: cargo clippy --all-features -- -D warnings
 
   test:
     needs: [changes, lint]
+    # `!cancelled()` so the matrix entries (notably the required
+    # `test (stable, ubuntu-latest)`) still emit their names to the
+    # ruleset even if `changes` or `lint` fails for an infra reason.
+    # Empty `needs.changes.outputs.code` is treated as "run real
+    # tests" via the `!= 'false'` step guards.
+    if: ${{ !cancelled() }}
     timeout-minutes: 20
     strategy:
       fail-fast: true
@@ -176,27 +215,28 @@ jobs:
       # steps ran, so `test (stable, ubuntu-latest)` — the entry
       # listed in the branch ruleset as a required check — is
       # always satisfied on docs-only PRs without paying the full
-      # test cost.
+      # test cost. The skip notice only fires on the explicit
+      # `code=false` signal; empty/unset falls through to real work.
       - name: Path-conditional skip notice
-        if: needs.changes.outputs.code != 'true'
+        if: needs.changes.outputs.code == 'false'
         run: |
           echo "::notice::No code paths changed — skipping nextest + doc tests + tools/. Required-check name still emitted as success."
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
-        if: needs.changes.outputs.code == 'true'
+        if: needs.changes.outputs.code != 'false'
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
-        if: needs.changes.outputs.code == 'true'
+        if: needs.changes.outputs.code != 'false'
         with:
           toolchain: ${{ matrix.rust }}
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2.9.1
-        if: needs.changes.outputs.code == 'true'
+        if: needs.changes.outputs.code != 'false'
         with:
           prefix-key: ${{ runner.os }}-cargo
       - uses: taiki-e/install-action@1ef5c5f58e85d25baaaa1704478fdd6c2921f2b5  # nextest
-        if: needs.changes.outputs.code == 'true'
+        if: needs.changes.outputs.code != 'false'
       - name: Run tests
-        if: needs.changes.outputs.code == 'true'
+        if: needs.changes.outputs.code != 'false'
         # tools/db_bench is a standalone crate, not in workspace — built separately
         env:
           # 32 cases is plenty for CI; PROPTEST_MAX_SHRINK trims the
@@ -207,14 +247,14 @@ jobs:
           PROPTEST_MAX_SHRINK: "100"
         run: cargo nextest run --profile ci --all-features
       - name: Run doc tests
-        if: needs.changes.outputs.code == 'true'
+        if: needs.changes.outputs.code != 'false'
         run: cargo test --doc --features lz4
       - name: Check db_bench crate
-        if: needs.changes.outputs.code == 'true'
+        if: needs.changes.outputs.code != 'false'
         working-directory: tools/db_bench
         run: cargo check --all-features
       - name: Build + test sst-dump crate
-        if: needs.changes.outputs.code == 'true'
+        if: needs.changes.outputs.code != 'false'
         # Standalone crate (not in workspace), exercise both the bin
         # build and the integration smoke tests so any drift in the
         # public verify::verify_sst_file API or the SST writer layout
