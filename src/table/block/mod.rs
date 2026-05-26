@@ -753,6 +753,22 @@ impl Block {
             }
             let actual_data_len = parsed_header.data_length as usize;
 
+            // Payload-length safety cap. Mirrors the `from_reader`
+            // check (see `Block::from_reader` above): the on-disk
+            // size cap on `handle.size()` allows for ECC parity
+            // overhead, so a malformed non-ECC block could declare
+            // `data_length` ≈ `MAX_DECOMPRESSION_SIZE * 1.5`
+            // (ECC-inclusive bound) and pass the outer check.
+            // Reject those explicitly here, before any further work
+            // trusts the declared payload length.
+            let max_data_length = u64::from(MAX_DECOMPRESSION_SIZE) + enc_overhead;
+            if u64::from(parsed_header.data_length) > max_data_length {
+                return Err(crate::Error::DecompressedSizeTooLarge {
+                    declared: u64::from(parsed_header.data_length),
+                    limit: max_data_length,
+                });
+            }
+
             if parsed_header.uncompressed_length > MAX_DECOMPRESSION_SIZE {
                 return Err(crate::Error::DecompressedSizeTooLarge {
                     declared: u64::from(parsed_header.uncompressed_length),
