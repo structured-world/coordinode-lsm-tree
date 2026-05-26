@@ -140,7 +140,7 @@ xxhash-rust = { version = "0.8.15", features = ["xxh3"] }
 # TODO: bump to stable aes-gcm 0.11.0 once released — at that point this pin
 # becomes a normal "^0.11" caret requirement and the API list above can be
 # treated as the public 0.11 surface, not a prerelease snapshot.
-aes-gcm = { version = "=0.11.0-rc.3", optional = true, features = ["aes", "rand_core"] }
+aes-gcm = { version = "=0.11.0-rc.4", optional = true, features = ["aes", "rand_core"] }
 # Exact pin on the matching prerelease — chacha20poly1305 0.11.0-rc.3 lines
 # up with aes-gcm 0.11.0-rc.3 on the shared `aead` 0.6 surface, so both
 # suites can share the same AeadInOut / Nonce / Tag types in the
