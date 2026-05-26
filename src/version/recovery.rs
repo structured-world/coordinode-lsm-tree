@@ -150,10 +150,22 @@ pub struct Recovery {
     /// during this recovery. Always zero under
     /// [`ManifestRecoveryMode::AbsoluteConsistency`] (any corruption
     /// or truncation aborts before returning a [`Recovery`]).
-    #[allow(
-        dead_code,
-        reason = "operator-facing telemetry surface; in-tree non-test \
-                  code reaches Recovery via public API only"
+    ///
+    /// `#[expect]` would be unfulfilled in test builds (the
+    /// integration tests read this field), and `#[allow]` would be
+    /// noisy in builds where tests are off. Gate `#[expect]` to
+    /// non-test builds: under `cargo test` the field IS read so
+    /// the lint doesn't fire and the expectation isn't attached;
+    /// under `cargo build` the field is unread by in-tree code
+    /// (operator-facing telemetry surface only) and the
+    /// expectation is fulfilled.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "operator-facing telemetry surface; in-tree \
+                      consumers reach Recovery via the public API"
+        )
     )]
     pub stats: RecoveryStats,
 }
@@ -495,9 +507,17 @@ pub fn recover(folder: &Path, fs: &dyn Fs, mode: ManifestRecoveryMode) -> crate:
                                  #{curr_version_id}; remaining records in this \
                                  section are unrecoverable"
                             );
+                            // Same accounting fix as the TailTruncation
+                            // arm: subtract BOTH successfully decoded
+                            // (run.len()) AND already-corrupted records
+                            // in this run (corrupted_in_run, only ever
+                            // non-zero under SkipAny) from the
+                            // tail-attributed count, otherwise skipped
+                            // records get double-counted here.
                             let recovered = u32::try_from(run.len()).unwrap_or(u32::MAX);
+                            let processed = recovered.saturating_add(corrupted_in_run);
                             tables_dropped_to_corruption = tables_dropped_to_corruption
-                                .saturating_add(table_count.saturating_sub(recovered));
+                                .saturating_add(table_count.saturating_sub(processed));
                             // Skip empty run / level for the same reason
                             // as the other early-exit arms — see comment
                             // above on the TailTruncation arm.
@@ -695,8 +715,14 @@ pub fn recover(folder: &Path, fs: &dyn Fs, mode: ManifestRecoveryMode) -> crate:
                         "blob_files: corrupted framing header in version \
                          #{curr_version_id}; remaining records unrecoverable"
                     );
+                    // Same accounting fix as the TailTruncation arm in
+                    // this section: subtract BOTH recovered AND
+                    // already-corrupted records from the corruption
+                    // count, otherwise previously-skipped records get
+                    // re-attributed here.
                     let recovered = u32::try_from(blob_file_ids.len()).unwrap_or(u32::MAX);
-                    blob_dropped_to_corruption = blob_file_count.saturating_sub(recovered);
+                    let processed = recovered.saturating_add(blob_corrupted);
+                    blob_dropped_to_corruption = blob_file_count.saturating_sub(processed);
                     break;
                 }
                 // Strict mode: same Tail vs BadHeader split as the
