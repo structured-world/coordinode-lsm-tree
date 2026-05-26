@@ -249,11 +249,7 @@ jobs:
     # branch of `code` takes the first half via `!= 'false'`,
     # matching the same fail-safe-to-running posture as the
     # step-level guards.
-    if: >-
-      always() && !cancelled() && (
-        needs.changes.outputs.code != 'false'
-        || (matrix.rust == 'stable' && matrix.os == 'ubuntu-latest')
-      )
+    if: ${{ always() && !cancelled() && (needs.changes.outputs.code != 'false' || (matrix.rust == 'stable' && matrix.os == 'ubuntu-latest')) }}
     timeout-minutes: 20
     strategy:
       fail-fast: true
