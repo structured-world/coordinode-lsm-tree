@@ -124,16 +124,32 @@ impl WorkloadInputs {
 /// taken BEFORE the engine open and the elapsed capture is taken
 /// IMMEDIATELY AFTER the terminal flush — before the engine handle
 /// drops — so the measurement covers cold-start cost (engine open,
-/// first-write path through memtable / WAL / CF init) plus N
-/// writes plus the explicit flush, but NOT the close/drop time
-/// (which is dominated by background compaction finalisation and
-/// would otherwise contaminate "write throughput" numbers with
-/// shutdown work). Both engines pay the same shape of timed work,
-/// so the head-to-head comparison stays apples-to-apples; what
-/// this is NOT measuring is steady-state per-write throughput on
-/// an already-warm engine — that needs the engine kept open across
-/// iterations, which the harness deliberately doesn't do (each
-/// iteration starts from an empty database to keep results
+/// first-write path through memtable init) plus N writes plus the
+/// explicit flush, but NOT the close/drop time (which is dominated
+/// by background compaction finalisation and would otherwise
+/// contaminate "write throughput" numbers with shutdown work).
+///
+/// Apples-to-apples configuration:
+///
+///   - **Compression: None on both sides.** lsm-tree's default
+///     `data_block_compression_policy` writes L0 with `None`, so
+///     RocksDB is set to `DBCompressionType::None` too. A future
+///     `write_throughput_lz4` variant can flip both.
+///
+///   - **No WAL on either side.** lsm-tree has no WAL —
+///     durability is the caller's responsibility, and
+///     `flush_active_memtable` is the explicit barrier. RocksDB is
+///     given `WriteOptions::disable_wal(true)` so it does the
+///     same shape of work (memtable insert + terminal flush)
+///     rather than paying the per-`put` WAL fsync that our crate
+///     never does. A future `write_throughput_durable` variant
+///     can flip both back (lsm-tree consumers would layer their
+///     own journal; RocksDB would re-enable its WAL).
+///
+/// What this is NOT measuring: steady-state per-write throughput
+/// on an already-warm engine — that needs the engine kept open
+/// across iterations, which the harness deliberately doesn't do
+/// (each iteration starts from an empty database to keep results
 /// reproducible across criterion warmup vs measurement phases).
 /// Keys / values are precomputed in `inputs` so the timed body
 /// does NO per-key allocation.
@@ -160,9 +176,20 @@ fn run_write_throughput(engine: Engine, inputs: &WorkloadInputs) -> Duration {
         Engine::RocksDb => {
             let mut opts = rocksdb::Options::default();
             opts.create_if_missing(true);
+            // Match our engine's durability shape: lsm-tree has no
+            // WAL — durability is the caller's responsibility, and
+            // `flush_active_memtable` is the equivalent of an
+            // explicit fsync barrier. Configure RocksDB to NOT
+            // double-write the WAL on each `put` so the head-to-head
+            // measures the same kind of work (memtable insert +
+            // terminal flush) rather than penalising RocksDB for
+            // its built-in WAL.
+            opts.set_compression_type(rocksdb::DBCompressionType::None);
             let db = rocksdb::DB::open(&opts, dir.path()).expect("open rocksdb");
+            let mut write_opts = rocksdb::WriteOptions::default();
+            write_opts.disable_wal(true);
             for (key, value) in inputs.keys.iter().zip(inputs.values.iter()) {
-                db.put(key, value).expect("put rocksdb");
+                db.put_opt(key, value, &write_opts).expect("put rocksdb");
             }
             db.flush().expect("flush rocksdb");
             // Capture BEFORE `db` drops so close-time background
