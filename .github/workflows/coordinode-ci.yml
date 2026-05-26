@@ -124,17 +124,17 @@ jobs:
               emit_and_exit "true" "REST /pulls/$PR_NUMBER/files failed, defaulting to full CI"
             fi
           else
-            # `push` event: list files between BEFORE and AFTER via
-            # the compare endpoint. First push of a new branch reports
-            # the all-zeros sentinel as `before` — no baseline to diff
-            # against, assume code changed (safe default).
-            if [ -z "${PUSH_BEFORE:-}" ] || [ "$PUSH_BEFORE" = "0000000000000000000000000000000000000000" ]; then
-              emit_and_exit "true" "new branch / first push, no baseline"
-            fi
-            echo "Fetching compare $PUSH_BEFORE...$PUSH_AFTER via REST API..."
-            if ! CHANGED=$(gh api "repos/$REPO/compare/$PUSH_BEFORE...$PUSH_AFTER" --jq '.files[].filename' 2>&1); then
-              emit_and_exit "true" "REST /compare failed, defaulting to full CI"
-            fi
+            # `push` event: per the workflow trigger this only fires
+            # on push to `main`, which is the merge-commit landing
+            # surface. ALWAYS run full CI on merges to main — the
+            # path-filter optimisation exists for developer iteration
+            # on PR branches, not for post-merge validation of what
+            # actually ships. Skipping CI on a "docs-only" push to
+            # main would also be unsafe given the compare API's
+            # known 300-entry `.files` truncation cap on large
+            # diffs: a large code-changing merge could be misclassified
+            # as `code=false` and silently skip validation.
+            emit_and_exit "true" "push to main — always run full CI (no path filter on merges)"
           fi
           echo "Changed files:"
           printf '%s\n' "$CHANGED" | sed 's/^/  /'
