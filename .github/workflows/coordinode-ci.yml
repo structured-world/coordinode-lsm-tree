@@ -96,13 +96,39 @@ jobs:
             echo "code=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
+          # For `pull_request` events, GitHub's own PR diff is
+          # `merge-base(base, head)..head`, not `base..head` — diffing
+          # straight from the base tip pulls in any commits that landed
+          # on the base branch AFTER the PR branched, which falsely
+          # flips a docs-only PR to `code=true`. Resolve the merge-base
+          # first so the predicate sees only this PR's own changes.
+          # For `push` events `BASE` is already the previous tip on the
+          # same branch, so the merge-base equals `BASE` itself and the
+          # extra step is a no-op.
+          if MB=$(git merge-base "$BASE" "$HEAD" 2>/dev/null); then
+            DIFF_BASE="$MB"
+          else
+            # Shallow clone / unrelated histories: fall back to BASE
+            # rather than failing — the predicate stays safe because
+            # the `code=true` fallback below is the conservative
+            # default if anything goes wrong.
+            echo "Warning: merge-base($BASE, $HEAD) unavailable — falling back to BASE."
+            DIFF_BASE="$BASE"
+          fi
           # Predicate: anything that affects compile / lint / test
-          # results counts as code. The workflow file is included
-          # so changes to CI logic itself always trigger the full
-          # matrix (avoids self-skipping a CI refactor PR).
-          CODE_RE='^(src/|tests/|benches/|examples/|build\.rs$|Cargo\.toml$|Cargo\.lock$|tools/|\.github/workflows/coordinode-ci\.yml$|rust-toolchain(\.toml)?$|\.cargo/)'
-          CHANGED=$(git diff --name-only "$BASE" "$HEAD")
-          echo "Changed files between $BASE and $HEAD:"
+          # results counts as code. The workflow file is included so
+          # changes to CI logic itself always trigger the full matrix
+          # (avoids self-skipping a CI refactor PR). The lint/test
+          # config files (`.config/nextest.toml`, `.rustfmt.toml`,
+          # `clippy.toml`) and the in-repo test fixtures
+          # (`test_fixture/`) are included because changes to any of
+          # them can flip the lint/test outcome on otherwise-identical
+          # source code — skipping the real validation on a PR that
+          # touches only those files would defeat the purpose of the
+          # required-check gate.
+          CODE_RE='^(src/|tests/|benches/|examples/|test_fixture/|build\.rs$|Cargo\.toml$|Cargo\.lock$|tools/|\.github/workflows/coordinode-ci\.yml$|rust-toolchain(\.toml)?$|\.cargo/|\.config/nextest\.toml$|\.rustfmt\.toml$|clippy\.toml$)'
+          CHANGED=$(git diff --name-only "$DIFF_BASE" "$HEAD")
+          echo "Changed files between $DIFF_BASE and $HEAD (merge-base of $BASE and $HEAD):"
           echo "$CHANGED" | sed 's/^/  /'
           if echo "$CHANGED" | grep -qE "$CODE_RE"; then
             echo "Result: code paths affected — running real CI."
