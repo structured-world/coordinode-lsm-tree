@@ -13,7 +13,7 @@
 //! Run locally:
 //!
 //! ```text
-//! cargo bench --features compare-rocksdb --bench compare_rocksdb
+//! cd tools/compare-rocksdb && cargo bench
 //! ```
 //!
 //! On macOS, `librocksdb-sys`'s `bindgen` build script needs to
@@ -25,7 +25,7 @@
 //! ```text
 //! export LIBCLANG_PATH=/opt/homebrew/opt/llvm/lib
 //! export DYLD_FALLBACK_LIBRARY_PATH=/opt/homebrew/opt/llvm/lib
-//! cargo bench --features compare-rocksdb --bench compare_rocksdb
+//! cd tools/compare-rocksdb && cargo bench
 //! ```
 //!
 //! Linux CI uses the distro `libclang.so` which `bindgen` finds
@@ -46,8 +46,6 @@
 //!
 //! Follow-up commits expand to point reads, range scans, mixed
 //! YCSB-A/C, bloom-filter probes per [#244]'s workload list.
-
-#![cfg(feature = "compare-rocksdb")]
 
 use std::time::Duration;
 
@@ -122,24 +120,27 @@ impl WorkloadInputs {
 }
 
 /// Workload: bulk-insert `inputs.keys.len()` (key, value) pairs
-/// into a freshly-opened engine, returning total wall time
-/// (engine open + N writes + final flush). The `Instant::now()`
-/// snapshot is taken BEFORE the engine open so the measurement
-/// includes the cold-start cost — engine open, first-write path
-/// (memtable / WAL / CF init), and the terminal flush. Both
-/// engines pay the same shape, so the head-to-head comparison
-/// stays apples-to-apples; what this is NOT measuring is
-/// steady-state per-write throughput on an already-warm engine
-/// (that requires keeping the engine open across iterations, which
-/// the harness deliberately doesn't do — each iteration starts
-/// from an empty database to keep results reproducible across
-/// criterion warmup vs measurement phases). Keys / values are
-/// precomputed in `inputs` so the timed body does NO per-key
-/// allocation.
+/// into a freshly-opened engine. The `Instant::now()` snapshot is
+/// taken BEFORE the engine open and the elapsed capture is taken
+/// IMMEDIATELY AFTER the terminal flush — before the engine handle
+/// drops — so the measurement covers cold-start cost (engine open,
+/// first-write path through memtable / WAL / CF init) plus N
+/// writes plus the explicit flush, but NOT the close/drop time
+/// (which is dominated by background compaction finalisation and
+/// would otherwise contaminate "write throughput" numbers with
+/// shutdown work). Both engines pay the same shape of timed work,
+/// so the head-to-head comparison stays apples-to-apples; what
+/// this is NOT measuring is steady-state per-write throughput on
+/// an already-warm engine — that needs the engine kept open across
+/// iterations, which the harness deliberately doesn't do (each
+/// iteration starts from an empty database to keep results
+/// reproducible across criterion warmup vs measurement phases).
+/// Keys / values are precomputed in `inputs` so the timed body
+/// does NO per-key allocation.
 fn run_write_throughput(engine: Engine, inputs: &WorkloadInputs) -> Duration {
     let dir = tempfile::tempdir().expect("tempdir");
     let start = std::time::Instant::now();
-    match engine {
+    let elapsed = match engine {
         Engine::Ours => {
             let tree = Config::new(
                 dir.path(),
@@ -152,6 +153,9 @@ fn run_write_throughput(engine: Engine, inputs: &WorkloadInputs) -> Duration {
                 tree.insert(key, value, i as u64);
             }
             tree.flush_active_memtable(0).expect("flush ours");
+            // Capture BEFORE `tree` drops so close-time background
+            // work doesn't leak into the timed window.
+            start.elapsed()
         }
         Engine::RocksDb => {
             let mut opts = rocksdb::Options::default();
@@ -161,9 +165,11 @@ fn run_write_throughput(engine: Engine, inputs: &WorkloadInputs) -> Duration {
                 db.put(key, value).expect("put rocksdb");
             }
             db.flush().expect("flush rocksdb");
+            // Capture BEFORE `db` drops so close-time background
+            // work doesn't leak into the timed window.
+            start.elapsed()
         }
-    }
-    let elapsed = start.elapsed();
+    };
     drop(dir);
     elapsed
 }

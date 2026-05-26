@@ -75,19 +75,15 @@ metrics = []
 # optional dep so `--all-features` builds and a future extraction back
 # into a standalone crate compile cleanly.
 ribbon-serde = ["dep:serde"]
-# Bench-only optional dependency. Pulls in the `rocksdb` crate (a C
-# binding to librocksdb) so `benches/compare_rocksdb.rs` can run the
-# same workload through this crate and through RocksDB side-by-side
-# for the gh-pages dashboard. Declared under `[dependencies]` rather
-# than `[dev-dependencies]` because Cargo's `dep:rocksdb` feature-
-# gate wiring only resolves names from `[dependencies]`. Downstream
-# consumers that turn this feature on will pay the full RocksDB
-# compile cost; the production crate surface is unaffected (no
-# `rocksdb` type appears in any non-bench code path). Off by default
-# because the C dependency tree (libsnappy, liblz4, libbz2,
-# librocksdb itself) makes `cargo check` / `cargo test` measurably
-# slower; the default-features build pays nothing.
-compare-rocksdb = ["dep:rocksdb", "std"]
+# RocksDB head-to-head bench lives in a STANDALONE crate at
+# `tools/compare-rocksdb/` — NOT a feature here. Keeping `rocksdb`
+# out of the main crate's feature graph means `cargo build
+# --all-features` / `cargo clippy --all-features` / docs.rs
+# (`all-features = true`) do not have to pull in librocksdb's C
+# dependency tree (libsnappy, liblz4, libbz2, librocksdb itself)
+# nor bindgen + libclang. Build / run the comparison harness with:
+#
+#     cd tools/compare-rocksdb && cargo bench
 
 [dependencies]
 bytes = { version = "1", optional = true }
@@ -143,13 +139,6 @@ aes-gcm = { version = "=0.11.0-rc.3", optional = true, features = ["aes", "rand_
 # 0.11.0 lands.
 chacha20poly1305 = { version = "=0.11.0-rc.3", optional = true, features = ["rand_core"] }
 rand_chacha = { version = "0.10", optional = true }
-# Pulled in only by the `compare-rocksdb` feature, which the
-# `benches/compare_rocksdb.rs` head-to-head harness gates on via
-# `required-features` in [[bench]]. Off by default so regular
-# `cargo test` / CI `cargo check` does NOT pay the cost of
-# compiling rocksdb's C dependency tree (snappy, lz4, bz2, etc.).
-rocksdb = { version = "0.24", default-features = false, features = ["lz4"], optional = true }
-
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = { version = "0.7", optional = true }
 
@@ -216,8 +205,3 @@ harness = false
 path = "benches/lsp.rs"
 required-features = []
 
-[[bench]]
-name = "compare_rocksdb"
-harness = false
-path = "benches/compare_rocksdb.rs"
-required-features = ["compare-rocksdb"]
