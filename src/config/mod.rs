@@ -138,28 +138,48 @@ pub enum ManifestRecoveryMode {
     /// Recover the largest consistent prefix and discard the rest.
     /// Adapts `RocksDB`'s `kPointInTimeRecovery` accept-the-prefix
     /// rule to the level/run/table nesting: on the first
-    /// record-decode mismatch inside the `tables` section (bad
-    /// XXH3 or unparseable framing header), the recovery keeps the
-    /// records that decoded cleanly *before* the corrupt one in
-    /// the current run, plus every complete earlier run in the
-    /// same level, plus every complete earlier level. It drops the
-    /// corrupt record itself, the remaining records of that run,
-    /// and every level not yet read. The same rule applies to the
-    /// `blob_files` section. Clean tail-truncation is still
-    /// tolerated, same as
+    /// record-decode mismatch inside the `tables` section, the
+    /// recovery keeps the records that decoded cleanly *before*
+    /// the corrupt one in the current run, plus every complete
+    /// earlier run in the same level, plus every complete earlier
+    /// level. "Record-decode mismatch" covers ALL three failure
+    /// shapes the per-record loop can surface:
+    ///
+    /// 1. Framing-layer XXH3 mismatch (the 8-byte digest in the
+    ///    record header doesn't match `xxh3_64(payload)`).
+    /// 2. Framing-header structural failure (`len > MAX_FRAME_PAYLOAD`
+    ///    — surfaced as `BadHeader`; this is `LenMismatch` against a
+    ///    fixed-length-pin is a separate hard-abort case, not a
+    ///    record-decode mismatch for the purpose of this mode).
+    /// 3. Payload decode failure AFTER a clean framing pass —
+    ///    e.g. `Error::InvalidTag` from a corrupt `checksum_type`
+    ///    byte inside an otherwise-framed-OK record. The framing
+    ///    XXH3 happens to cover the corrupt byte too (it's a
+    ///    digest of the whole payload), so the bytes decode
+    ///    cleanly at the framing layer; the corruption only
+    ///    surfaces inside the per-entry decode helper.
+    ///
+    /// PIT drops the corrupt record itself, the remaining records
+    /// of that run, and every level not yet read. The same rule
+    /// applies to the `blob_files` section. Clean tail-truncation
+    /// is still tolerated, same as
     /// [`TolerateCorruptedTailRecords`](Self::TolerateCorruptedTailRecords).
     PointInTimeRecovery,
 
     /// Skip each corrupt record individually, keep all others.
-    /// Maximum-availability, lossy. On a per-record checksum
-    /// mismatch, the reader logs the skip and advances exactly
-    /// past the bad record using the framing-supplied length
-    /// field. If the length field itself is unusable (the
-    /// recorded length is outside the legal range, so the
-    /// next-record boundary is unknown), the rest of that section
-    /// is dropped. Intended companion to the `repair_db` tooling
-    /// tracked as `#303`: this mode recovers what it can in-place;
-    /// `repair_db` rebuilds the manifest from the SST files
+    /// Maximum-availability, lossy. On any per-record decode
+    /// mismatch — framing-layer XXH3 mismatch, payload-decode
+    /// failure inside an otherwise-framed-OK record (e.g.
+    /// `Error::InvalidTag` on a corrupt `checksum_type` byte), or
+    /// a framing-header `BadHeader` — the reader logs the skip
+    /// and advances exactly past the bad record using the
+    /// framing-supplied length field. If the length field itself
+    /// is unusable (the recorded length is outside the legal
+    /// range, so the next-record boundary is unknown), the rest
+    /// of that section is dropped. Intended companion to the
+    /// `repair_db` tooling tracked as `#303`: this mode recovers
+    /// what it can in-place; `repair_db` rebuilds the manifest
+    /// from the SST files
     /// themselves when even this mode can't reach a usable state.
     SkipAnyCorruptedRecords,
 }

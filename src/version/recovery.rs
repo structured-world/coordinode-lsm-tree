@@ -158,14 +158,19 @@ pub struct Recovery {
     /// [`ManifestRecoveryMode::AbsoluteConsistency`] (any corruption
     /// or truncation aborts before returning a [`Recovery`]).
     ///
-    /// `#[expect]` would be unfulfilled in test builds (the
-    /// integration tests read this field), and `#[allow]` would be
-    /// noisy in builds where tests are off. Gate `#[expect]` to
-    /// non-test builds: under `cargo test` the field IS read so
-    /// the lint doesn't fire and the expectation isn't attached;
-    /// under `cargo build` the field is unread by in-tree code
-    /// (operator-facing telemetry surface only) and the
-    /// expectation is fulfilled.
+    /// `#[expect]` would be unfulfilled under `cfg(test)` (the
+    /// in-crate unit tests in `src/version/recovery.rs::tests`
+    /// read this field to assert recovery-mode accounting), and
+    /// `#[allow]` would be noisy in builds where tests are off.
+    /// Gate `#[expect]` to non-test builds: under `cargo test`
+    /// the field IS read by the unit-test module so the lint
+    /// doesn't fire and the expectation isn't attached; under
+    /// `cargo build` the field is unread by in-tree code
+    /// (operator-facing telemetry surface only — external
+    /// consumers reach `Recovery` via the public API but the
+    /// module is `pub mod recovery` so the field IS reachable
+    /// from outside crate, just not exercised by anything in
+    /// this tree) and the expectation is fulfilled.
     #[cfg_attr(
         not(test),
         expect(
