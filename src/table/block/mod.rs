@@ -47,29 +47,36 @@ use crate::{
 /// independent storage formats that may diverge in the future.
 const MAX_DECOMPRESSION_SIZE: u32 = 256 * 1024 * 1024;
 
-/// Upper bound on the Reed-Solomon parity trailer size for a given
-/// data-length, computed per-block.
+/// Exact Reed-Solomon parity trailer size for a given data length
+/// under the (4, 2) scheme.
 ///
-/// `parity_len(N) = shard_bytes(N) * 2 = ceil(N/4 rounded to even) * 2`,
-/// which is at most `N/2 + 4` bytes. The reader rejects any header
-/// advertising `ecc_length > max_parity_len(data_length)` BEFORE
-/// allocating the parity buffer — without this guard a crafted
-/// header could trigger an unbounded `Vec` allocation on read.
+/// `parity_len(N) = shard_bytes(N) * 2` where
+/// `shard_bytes(N) = ceil(N / 4) rounded up to the nearest even`.
+/// Mirrors `crate::ecc::parity_len` byte-for-byte but is available
+/// without the `page_ecc` cargo feature — the read-side header
+/// validator below uses it to reject any non-zero `ecc_length`
+/// that doesn't EXACTLY match the value the writer would have
+/// emitted for this `data_length`. A bare upper-bound check ("is
+/// it ≤ N/2 + 4") would tolerate in-range-but-wrong `ecc_length`
+/// values; a streaming reader (e.g. `Scanner`) reading such a
+/// block would over-consume or under-consume bytes and
+/// desynchronize from the next block boundary.
 ///
-/// Computed per-block (not a static constant) because the legitimate
-/// `data_length` upper bound is itself data-dependent: encrypted
-/// blocks add AEAD overhead (12-byte nonce + 16-byte tag for v1
-/// suites), and that overhead pushes the on-disk `data_length`
-/// above the plaintext `MAX_DECOMPRESSION_SIZE` cap. A static
-/// `MAX_DECOMPRESSION_SIZE / 2`-based bound would reject legitimate
-/// near-limit ECC blocks that the encrypted-write path produces.
+/// Returns zero for `data_length == 0` to match
+/// `crate::ecc::encode_parity`'s empty-payload short-circuit.
 #[inline]
-fn max_parity_len(data_length: u32) -> u32 {
-    // `(N/2) + 4` is the rounded-up `parity_len(N)` per ecc.rs's
-    // shard-bytes-even-rounding rule. saturating_add covers the
-    // pathological data_length = u32::MAX case (defensive — caller
-    // already capped data_length elsewhere).
-    (data_length / 2).saturating_add(4)
+fn expected_parity_len(data_length: u32) -> u32 {
+    if data_length == 0 {
+        return 0;
+    }
+    // ceil(N / 4) — overflow-safe for u32 since `data_length` is
+    // already capped at MAX_DECOMPRESSION_SIZE + max overhead by
+    // the caller before this function fires.
+    let ceil_quarter = (data_length / 4).saturating_add(u32::from(!data_length.is_multiple_of(4)));
+    // Round up to even (the `reed-solomon-simd` engine requires
+    // shard sizes that are a multiple of two).
+    let shard_bytes = ceil_quarter.saturating_add(u32::from(!ceil_quarter.is_multiple_of(2)));
+    shard_bytes.saturating_mul(2)
 }
 
 /// A block on disk
@@ -450,17 +457,17 @@ impl Block {
             });
         }
 
-        // Reject impossibly-large ECC trailers before
-        // read_payload_and_verify allocates the parity buffer.
-        // Bound is per-block, derived from the just-validated
-        // header.data_length — a static MAX_DECOMPRESSION_SIZE-based
-        // cap would reject legitimate near-limit encrypted blocks
-        // whose data_length includes AEAD overhead.
-        let max_ecc = max_parity_len(header.data_length);
-        if header.ecc_length > max_ecc {
+        // Reject any non-zero `ecc_length` that doesn't match the
+        // RS(4, 2) parity-length function applied to the
+        // just-validated `data_length`. A bare upper-bound check
+        // would tolerate in-range-but-wrong values; the streaming
+        // reader would then over-consume or under-consume parity
+        // bytes and desynchronize from the next block boundary.
+        let expected_ecc = expected_parity_len(header.data_length);
+        if header.ecc_length != 0 && header.ecc_length != expected_ecc {
             return Err(crate::Error::DecompressedSizeTooLarge {
                 declared: u64::from(header.ecc_length),
-                limit: u64::from(max_ecc),
+                limit: u64::from(expected_ecc),
             });
         }
 
@@ -753,11 +760,11 @@ impl Block {
                 });
             }
 
-            let max_ecc = max_parity_len(parsed_header.data_length);
-            if parsed_header.ecc_length > max_ecc {
+            let expected_ecc = expected_parity_len(parsed_header.data_length);
+            if parsed_header.ecc_length != 0 && parsed_header.ecc_length != expected_ecc {
                 return Err(crate::Error::DecompressedSizeTooLarge {
                     declared: u64::from(parsed_header.ecc_length),
-                    limit: u64::from(max_ecc),
+                    limit: u64::from(expected_ecc),
                 });
             }
 
@@ -885,11 +892,11 @@ impl Block {
                 });
             }
 
-            let max_ecc = max_parity_len(parsed_header.data_length);
-            if parsed_header.ecc_length > max_ecc {
+            let expected_ecc = expected_parity_len(parsed_header.data_length);
+            if parsed_header.ecc_length != 0 && parsed_header.ecc_length != expected_ecc {
                 return Err(crate::Error::DecompressedSizeTooLarge {
                     declared: u64::from(parsed_header.ecc_length),
-                    limit: u64::from(max_ecc),
+                    limit: u64::from(expected_ecc),
                 });
             }
 
