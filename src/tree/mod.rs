@@ -499,6 +499,7 @@ impl AbstractTree for Tree {
 
         table_writer = table_writer.use_prefix_extractor(self.config.prefix_extractor.clone());
         table_writer = table_writer.use_encryption(self.config.encryption.clone());
+        table_writer = table_writer.use_page_ecc(self.config.page_ecc);
 
         #[cfg(zstd_any)]
         {

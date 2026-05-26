@@ -230,6 +230,66 @@ fn tree_recovery_version_free_list() -> lsm_tree::Result<()> {
 /// actually emit parity (the `BlockTransform::*Ecc` variants do
 /// not exist on a `--no-features` build), silently downgrading
 /// the integrity guarantee the caller asked for.
+/// Regression test for the writer wiring: a Tree opened with
+/// `Config::page_ecc(true)` MUST actually emit blocks with non-zero
+/// `Header::ecc_length` on disk. Earlier slices of #267 added the
+/// `BlockTransform::*Ecc` variants and the block-level emit /
+/// verify wiring, but the runtime flag was only checked at
+/// `Tree::open` (the manifest gate) — none of the writers
+/// downstream consulted it, so a `page_ecc(true)` tree silently
+/// emitted V6 blocks with `ecc_length = 0` and no parity trailer.
+///
+/// This test exercises the full read-after-write round trip
+/// through Tree::insert / flush / get — if the wiring is wrong
+/// the reader either rejects the block (decode error) or the
+/// round trip silently corrupts the value. With the wiring
+/// correct, the read path verifies the parity trailer
+/// internally on every block load and returns the original
+/// plaintext.
+#[cfg(feature = "page_ecc")]
+#[test]
+fn tree_page_ecc_roundtrips_through_flush_and_reopen() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let path = folder.path();
+
+    {
+        let tree = Config::new(
+            path,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .page_ecc(true)
+        .open()?;
+
+        tree.insert("k1", "v1", 0);
+        tree.insert("k2", "v2", 1);
+        tree.flush_active_memtable(0)?;
+
+        assert_eq!(Some("v1".as_bytes().into()), tree.get("k1", 2)?);
+        assert_eq!(Some("v2".as_bytes().into()), tree.get("k2", 2)?);
+    }
+
+    // Reopen with the same flag — the on-disk blocks MUST have
+    // the parity trailer the writer is supposed to emit, otherwise
+    // the read path (which verifies ecc_length matches
+    // expected_parity_len(data_length)) would reject the block on
+    // load and the reopen would fail.
+    {
+        let tree = Config::new(
+            path,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .page_ecc(true)
+        .open()?;
+
+        assert_eq!(Some("v1".as_bytes().into()), tree.get("k1", 2)?);
+        assert_eq!(Some("v2".as_bytes().into()), tree.get("k2", 2)?);
+    }
+
+    Ok(())
+}
+
 #[cfg(not(feature = "page_ecc"))]
 #[test]
 fn tree_open_with_page_ecc_on_feature_off_build_errors() {

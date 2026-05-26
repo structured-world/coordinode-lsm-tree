@@ -39,6 +39,12 @@ pub struct PartitionedIndexWriter {
     /// Owning SST's table id. Set by the outer Writer via
     /// `use_table_id` before `cut_index_block` / `finish` runs.
     table_id: crate::TableId,
+
+    /// `Config::page_ecc` threaded by the outer Writer via
+    /// `use_page_ecc`. When `true`, every `BlockTransform` this
+    /// index writer constructs for the sub-index + TLI blocks
+    /// upgrades to its matching `*Ecc` variant.
+    page_ecc: bool,
 }
 
 impl PartitionedIndexWriter {
@@ -60,6 +66,7 @@ impl PartitionedIndexWriter {
 
             encryption: None,
             table_id: 0,
+            page_ecc: false,
         }
     }
 
@@ -88,13 +95,19 @@ impl PartitionedIndexWriter {
             },
             // Index blocks (sub-blocks and TLI) use the configured
             // codec but never a zstd dict (dicts are trained on
-            // data, not index structures).
-            &crate::table::block::BlockTransform::from_parts(
-                self.compression,
-                self.encryption.as_deref(),
-                #[cfg(zstd_any)]
-                None,
-            )?,
+            // data, not index structures). page_ecc upgrades the
+            // transform to its matching `*Ecc` variant so index
+            // blocks get the same Reed-Solomon parity trailer
+            // that data blocks do (no-op without the feature).
+            &{
+                let t = crate::table::block::BlockTransform::from_parts(
+                    self.compression,
+                    self.encryption.as_deref(),
+                    #[cfg(zstd_any)]
+                    None,
+                )?;
+                if self.page_ecc { t.with_ecc() } else { t }
+            },
         )?;
 
         let bytes_written = header.on_disk_size();
@@ -165,13 +178,19 @@ impl PartitionedIndexWriter {
             },
             // Index blocks (sub-blocks and TLI) use the configured
             // codec but never a zstd dict (dicts are trained on
-            // data, not index structures).
-            &crate::table::block::BlockTransform::from_parts(
-                self.compression,
-                self.encryption.as_deref(),
-                #[cfg(zstd_any)]
-                None,
-            )?,
+            // data, not index structures). page_ecc upgrades the
+            // transform to its matching `*Ecc` variant so index
+            // blocks get the same Reed-Solomon parity trailer
+            // that data blocks do (no-op without the feature).
+            &{
+                let t = crate::table::block::BlockTransform::from_parts(
+                    self.compression,
+                    self.encryption.as_deref(),
+                    #[cfg(zstd_any)]
+                    None,
+                )?;
+                if self.page_ecc { t.with_ecc() } else { t }
+            },
         )?;
 
         let bytes_written = header.on_disk_size();
@@ -208,6 +227,11 @@ impl<W: std::io::Write + std::io::Seek> BlockIndexWriter<W> for PartitionedIndex
 
     fn use_table_id(mut self: Box<Self>, table_id: crate::TableId) -> Box<dyn BlockIndexWriter<W>> {
         self.table_id = table_id;
+        self
+    }
+
+    fn use_page_ecc(mut self: Box<Self>, page_ecc: bool) -> Box<dyn BlockIndexWriter<W>> {
+        self.page_ecc = page_ecc;
         self
     }
 

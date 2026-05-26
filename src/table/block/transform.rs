@@ -325,6 +325,44 @@ impl BlockTransform<'_> {
             | Self::CompressedAndEncryptedEcc(_, _) => true,
         }
     }
+
+    /// Returns the matching `*Ecc` variant of this transform when
+    /// the `page_ecc` cargo feature is enabled, or the transform
+    /// unchanged when the feature is off.
+    ///
+    /// Lets writer call sites stay compact when they need to
+    /// conditionally emit a parity trailer based on a runtime flag
+    /// (`Config::page_ecc(true)`):
+    ///
+    /// ```text
+    /// let transform = BlockTransform::from_parts(...)?;
+    /// let transform = if config.page_ecc {
+    ///     transform.with_ecc()
+    /// } else {
+    ///     transform
+    /// };
+    /// ```
+    ///
+    /// On builds without the `page_ecc` feature the Ecc variants
+    /// don't exist and this method becomes the identity function —
+    /// the compiler folds it out at the call site so the
+    /// runtime-flag branch is dead code.
+    #[must_use]
+    pub fn with_ecc(self) -> Self {
+        match self {
+            #[cfg(feature = "page_ecc")]
+            Self::Plain => Self::PlainEcc,
+            #[cfg(feature = "page_ecc")]
+            Self::Compressed(ctx) => Self::CompressedEcc(ctx),
+            #[cfg(feature = "page_ecc")]
+            Self::Encrypted(enc) => Self::EncryptedEcc(enc),
+            #[cfg(feature = "page_ecc")]
+            Self::CompressedAndEncrypted(ctx, enc) => Self::CompressedAndEncryptedEcc(ctx, enc),
+            // Already-Ecc variants pass through; on builds with
+            // the feature off, every variant lands here.
+            other => other,
+        }
+    }
 }
 
 impl<'a> BlockTransform<'a> {
