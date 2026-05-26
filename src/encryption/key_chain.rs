@@ -7,7 +7,13 @@
 //! every encrypted block records a 1-byte `KeyEpoch` in its
 //! `MetadataFrame`. On read the decoder uses the epoch to look up
 //! the right 32-byte key from the caller's key chain; on write the
-//! encoder selects the active epoch and writes it into the frame.
+//! caller chooses which epoch to use (by setting
+//! `EncryptionContext::key_epoch` before calling `encrypt_block`)
+//! and the encoder records that choice into the frame. The
+//! [`KeyChain`] trait itself has no "active epoch" concept — it is
+//! a passive lookup table from `KeyEpoch` to key bytes; epoch
+//! selection / rotation policy lives in the caller (typically a
+//! key-management service or a configuration loader).
 //!
 //! The chain is caller-managed (not stored in the LSM): different
 //! deployments have different key-rotation policies (hardware HSM,

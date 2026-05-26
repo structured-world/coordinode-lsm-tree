@@ -294,16 +294,33 @@ fn decode_metadata_payload(payload: &[u8]) -> Result<ParsedMetadata, DecryptErro
 ///
 /// # Errors
 ///
-/// - [`crate::Error::Unrecoverable`] if `ctx.key_epoch` is not in
-///   `key_chain` (encode side surfaces this as an opaque error —
-///   the symmetric decode-side variant
-///   [`DecryptError::UnknownKeyEpoch`] is distinguished from
-///   [`DecryptError::AeadVerificationFailed`] on the read path,
-///   but on the write path the caller controls the chain and a
-///   missing epoch is a programmer bug).
-/// - [`crate::Error::Encrypt`] if the AEAD primitive rejects the
-///   inputs (e.g. wrong nonce length for the suite — defensive,
-///   the caller's CSPRNG always produces 12 bytes for v1 suites).
+/// All failure paths surface as [`crate::Error::Encrypt`] carrying
+/// a `&'static str` description of which invariant or step failed:
+///
+/// - `"HeaderByte high nibble does not match FORMAT_VERSION_V1 ..."` /
+///   `"HeaderByte low nibble is reserved ..."` — `ctx.header_byte`
+///   does not match the v1 wire-format contract (spec §4.8).
+/// - `"KeyEpoch not present in caller's KeyChain"` — `ctx.key_epoch`
+///   is unknown to the supplied [`KeyChain`]. The encode path
+///   distinguishes this from the symmetric decode-side
+///   [`DecryptError::UnknownKeyEpoch`] only by error type
+///   (`Error::Encrypt` vs `DecryptError`); semantically both
+///   signal "epoch not in chain", but on the write path the
+///   caller controls the chain so a missing epoch is a caller
+///   configuration bug rather than the bit-rot / key-rotation
+///   drift signal the decode-side variant carries.
+/// - `"plaintext must be non-empty ..."` /
+///   `"plaintext exceeds 256 MiB body cap"` — payload outside the
+///   spec §5.3 `BodyFrame` range.
+/// - `"invalid CompressionType ..."` /
+///   `"non-zero DictID ..."` /
+///   `"non-zero WindowLog ..."` /
+///   `"WindowLog outside valid range ..."` — spec §5.1
+///   cross-field codec invariants violated.
+/// - AEAD primitive rejections (e.g. wrong nonce length for the
+///   suite — defensive; the caller's CSPRNG always produces 12
+///   bytes for v1 suites) propagate as `Error::Encrypt` with the
+///   message from the underlying AEAD crate.
 pub fn encrypt_block(
     plaintext: &[u8],
     identity: &BlockIdentity,
@@ -316,7 +333,7 @@ pub fn encrypt_block(
     // Readers ignore the low nibble for forward-compatibility, so
     // a caller setting reserved bits would silently produce output
     // that future suites might interpret differently — catch the
-    // shape violation at write time. `EncryptionContext::new_v1`
+    // shape violation at write time. `EncryptionContext::v1`
     // sets the correct byte automatically, but the struct's fields
     // are `pub` so a hand-rolled context could land here with a
     // wrong byte.
