@@ -209,3 +209,9 @@ name = "lsp"
 harness = false
 path = "benches/lsp.rs"
 required-features = []
+
+[[bench]]
+name = "ecc"
+harness = false
+path = "benches/ecc.rs"
+required-features = ["page_ecc"]
