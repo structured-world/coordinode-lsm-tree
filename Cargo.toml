@@ -75,14 +75,18 @@ metrics = []
 # optional dep so `--all-features` builds and a future extraction back
 # into a standalone crate compile cleanly.
 ribbon-serde = ["dep:serde"]
-# Pulls RocksDB into the dev-dependency graph (no effect on the
-# production crate surface — gated dev-only). Enables the
-# `benches/compare_rocksdb.rs` head-to-head harness: each criterion
-# group runs the same workload through both engines and produces
-# side-by-side timings for the gh-pages dashboard. Off by default
-# because rocksdb pulls in a sizeable C dependency tree (libsnappy,
-# liblz4, libbz2, librocksdb itself) — regular `cargo test` / CI
-# `cargo check` doesn't pay that compile cost.
+# Bench-only optional dependency. Pulls in the `rocksdb` crate (a C
+# binding to librocksdb) so `benches/compare_rocksdb.rs` can run the
+# same workload through this crate and through RocksDB side-by-side
+# for the gh-pages dashboard. Declared under `[dependencies]` rather
+# than `[dev-dependencies]` because Cargo's `dep:rocksdb` feature-
+# gate wiring only resolves names from `[dependencies]`. Downstream
+# consumers that turn this feature on will pay the full RocksDB
+# compile cost; the production crate surface is unaffected (no
+# `rocksdb` type appears in any non-bench code path). Off by default
+# because the C dependency tree (libsnappy, liblz4, libbz2,
+# librocksdb itself) makes `cargo check` / `cargo test` measurably
+# slower; the default-features build pays nothing.
 compare-rocksdb = ["dep:rocksdb", "std"]
 
 [dependencies]

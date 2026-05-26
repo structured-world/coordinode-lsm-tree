@@ -123,12 +123,19 @@ impl WorkloadInputs {
 
 /// Workload: bulk-insert `inputs.keys.len()` (key, value) pairs
 /// into a freshly-opened engine, returning total wall time
-/// including the final flush. Per-iteration setup (tempdir +
-/// engine open) lives inside the criterion `iter_custom` closure
-/// so the timing loop sees a cold engine on every iteration —
-/// measuring steady-state write throughput, not first-key path
-/// overhead. Keys / values are precomputed in `inputs` so the
-/// timed body does NO per-key allocation.
+/// (engine open + N writes + final flush). The `Instant::now()`
+/// snapshot is taken BEFORE the engine open so the measurement
+/// includes the cold-start cost — engine open, first-write path
+/// (memtable / WAL / CF init), and the terminal flush. Both
+/// engines pay the same shape, so the head-to-head comparison
+/// stays apples-to-apples; what this is NOT measuring is
+/// steady-state per-write throughput on an already-warm engine
+/// (that requires keeping the engine open across iterations, which
+/// the harness deliberately doesn't do — each iteration starts
+/// from an empty database to keep results reproducible across
+/// criterion warmup vs measurement phases). Keys / values are
+/// precomputed in `inputs` so the timed body does NO per-key
+/// allocation.
 fn run_write_throughput(engine: Engine, inputs: &WorkloadInputs) -> Duration {
     let dir = tempfile::tempdir().expect("tempdir");
     let start = std::time::Instant::now();
