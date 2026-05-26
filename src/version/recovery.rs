@@ -128,9 +128,16 @@ pub struct RecoveryStats {
     /// header failed — i.e. real bit-rot inside an otherwise-written
     /// region (only ever non-zero under `SkipAny` / PIT modes).
     pub tables_dropped_to_corruption: u32,
-    /// Number of level / run header bytes that were truncated by
-    /// tail-cutting (no per-entry bytes lost — distinguished from
-    /// record-drop accounting so the summary log stays honest).
+    /// Number of level / run / table-count header *fields* truncated
+    /// by tail-cutting (count of EVENTS, not bytes — incremented by
+    /// 1 per truncation regardless of whether the cut-mid field is
+    /// 1 byte (`run_count` u8) or 4 bytes (`table_count` u32)). No
+    /// per-entry bytes are lost when this counter is non-zero — the
+    /// writer didn't even finish writing the count header for the
+    /// level or run, so no records were supposed to be present
+    /// yet. Distinguished from record-drop accounting so the
+    /// summary log can report "K headers truncated" vs "M records
+    /// missing" honestly.
     pub tables_truncated_headers: u32,
     /// Blob-file records dropped to tail truncation (analogous to
     /// [`Self::tables_dropped_to_tail`] for the `blob_files` section).

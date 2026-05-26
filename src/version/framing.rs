@@ -33,8 +33,18 @@
 //!
 //! - `len` is the size of `payload` (does NOT include the 12-byte
 //!   header itself). A `len` value larger than the section's
-//!   remaining capacity is treated as corruption — the reader does
-//!   not trust it for skipping.
+//!   remaining capacity is treated as `TailTruncation`, not as
+//!   in-section corruption — under tolerant modes this lets a
+//!   power-loss-mid-record recovery accept the prefix instead of
+//!   aborting. The reader still does NOT trust the `len` for
+//!   skipping (the byte boundary of the next record cannot be
+//!   located from a partial trailing record), so the consumer
+//!   abandons the rest of the section regardless. Use the
+//!   `expected_payload_len` parameter on
+//!   [`read_framed_record`] when the record schema has a fixed
+//!   payload size (table / blob entries) to pin the `len`
+//!   structurally and rule out a "len happens to fit but is
+//!   wrong" alignment slide under `SkipAnyCorruptedRecords`.
 //! - `xxh3_64` is `xxh3_64(payload)`. The 64-bit variant gives a
 //!   ≈ 2⁻⁶⁴ false-positive collision rate per record, matching the
 //!   integrity bar of the rest of the on-disk format.
