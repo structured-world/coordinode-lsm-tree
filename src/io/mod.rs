@@ -1,16 +1,26 @@
-// Local I/O trait surface, mirroring `std::io::{Read, Write, Seek}` so the
-// `fs::Fs` / `fs::FsFile` trait definitions compile under
-// `--no-default-features --features alloc`. The signatures match
-// `std::io` exactly, so backends gated behind `#[cfg(feature = "std")]`
-// (such as `std_fs` and `io_uring_fs`) keep using `std::io::*`
-// internally — they just satisfy this crate's traits via the bridge
+// Local I/O trait surface, mirroring `std::io::{Read, Write, Seek}`
+// so that THE BOUNDS on `fs::Fs` / `fs::FsFile` no longer carry
+// `std::io::*` directly. The signatures match `std::io` exactly, so
+// backends gated behind `#[cfg(feature = "std")]` (such as `std_fs`
+// and `io_uring_fs`) keep using `std::io::*` internally — they just
+// satisfy this crate's traits via the supertrait alias + blanket
 // impls below.
 //
-// Why not pull in an external `core_io` / `core2` / `core3` / `embedded-io`
-// crate: those add a maintainer dependency for what is ultimately three
-// stable trait signatures plus an error type. The signatures here have
-// not meaningfully changed since Rust 1.0, so maintenance is near zero,
-// and we keep the no-std contract under our own control.
+// Scope of this module's contribution to the no-std epic (see #311):
+// it removes `std::io::{Read, Write, Seek}` from the trait BOUNDS.
+// The `fs` module still uses `std::io::Result` for return types and
+// `&std::path::Path` for path arguments in `Fs` / `FsFile` method
+// signatures — those migrate to `crate::io::Result<T>` and a
+// `crate::path` equivalent in follow-up commits. Until both follow-
+// ups land, `fs::*` does NOT yet compile under
+// `--no-default-features --features alloc`.
+//
+// Why not pull in an external `core_io` / `core2` / `core3` /
+// `embedded-io` crate: those add a maintainer dependency for what
+// is ultimately three stable trait signatures plus an error type.
+// The signatures here have not meaningfully changed since Rust 1.0,
+// so maintenance is near zero, and we keep the no-std contract
+// under our own control.
 
 use alloc::boxed::Box;
 use alloc::string::String;
@@ -365,4 +375,151 @@ pub trait Seek {
     ///
     /// Returns any I/O error from the underlying seeker.
     fn seek(&mut self, pos: SeekFrom) -> Result<u64>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Type-level check that a value satisfies the supertrait-alias
+    /// bound. Used by the alias-wiring tests to fail the build if a
+    /// future refactor breaks `&[u8]: crate::io::Read` /
+    /// `Vec<u8>: crate::io::Write` propagation.
+    #[cfg(feature = "std")]
+    fn assert_read_alias_bound<R: Read>(_: &R) {}
+
+    #[cfg(feature = "std")]
+    fn assert_write_alias_bound<W: Write>(_: &W) {}
+
+    #[test]
+    fn error_kind_strings_are_distinct() {
+        // Belt-and-suspenders that the `as_str` table stays in
+        // sync with the enum — a forgotten arm would either fail
+        // compilation (exhaustive match) or, if someone collapses
+        // arms into a wildcard later, produce a duplicate message
+        // that this assertion catches.
+        let all = [
+            ErrorKind::AlreadyExists,
+            ErrorKind::BrokenPipe,
+            ErrorKind::CrossesDevices,
+            ErrorKind::Interrupted,
+            ErrorKind::InvalidData,
+            ErrorKind::InvalidInput,
+            ErrorKind::NotFound,
+            ErrorKind::Other,
+            ErrorKind::PermissionDenied,
+            ErrorKind::UnexpectedEof,
+            ErrorKind::Unsupported,
+            ErrorKind::WriteZero,
+        ];
+        for (i, a) in all.iter().enumerate() {
+            for b in all.iter().skip(i + 1) {
+                assert_ne!(
+                    a.as_str(),
+                    b.as_str(),
+                    "duplicate description for {a:?} vs {b:?}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn error_carries_kind_and_optional_message() {
+        let e = Error::from_kind(ErrorKind::NotFound);
+        assert_eq!(e.kind(), ErrorKind::NotFound);
+        assert_eq!(alloc::format!("{e}"), "entity not found");
+
+        let e = Error::new(ErrorKind::InvalidData, "bad magic");
+        assert_eq!(e.kind(), ErrorKind::InvalidData);
+        assert_eq!(alloc::format!("{e}"), "invalid data: bad magic");
+    }
+
+    #[test]
+    fn error_kind_from_kind_is_const_friendly() {
+        // `Error::from_kind` is `const fn`; this test would fail
+        // to compile if the constness ever regressed.
+        const _E: Error = Error::from_kind(ErrorKind::Interrupted);
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn from_std_io_error_preserves_kind_and_message() {
+        let std_err = std::io::Error::new(std::io::ErrorKind::WriteZero, "ran out");
+        let crate_err: Error = std_err.into();
+        assert_eq!(crate_err.kind(), ErrorKind::WriteZero);
+        // Display must carry the original std error's message
+        // (the `From` impl uses `format!("{err}")` on the std side).
+        let rendered = alloc::format!("{crate_err}");
+        assert!(
+            rendered.contains("ran out"),
+            "expected std message to survive in {rendered:?}",
+        );
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn from_std_io_error_maps_unknown_to_other() {
+        // `std::io::ErrorKind` is `#[non_exhaustive]`; variants
+        // we don't map explicitly fall through to `Other` so the
+        // bridge stays total.
+        let std_err = std::io::Error::from(std::io::ErrorKind::OutOfMemory);
+        let crate_err: Error = std_err.into();
+        assert_eq!(crate_err.kind(), ErrorKind::Other);
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn round_trip_through_std_io_error_preserves_writezero() {
+        // The fix for the inverted From-mapping (PR #347): a
+        // `crate::io::Error { WriteZero }` must round-trip
+        // through `std::io::Error` back to `WriteZero`, NOT
+        // collapse to `Other`.
+        let original = Error::new(ErrorKind::WriteZero, "short write");
+        let as_std: std::io::Error = original.into();
+        assert_eq!(as_std.kind(), std::io::ErrorKind::WriteZero);
+        let back: Error = as_std.into();
+        assert_eq!(back.kind(), ErrorKind::WriteZero);
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn seek_from_round_trips_through_std() {
+        // Variant-by-variant round trip — catches a future
+        // refactor that drops or re-orders a discriminant.
+        for case in [SeekFrom::Start(42), SeekFrom::End(-7), SeekFrom::Current(0)] {
+            let std_form: std::io::SeekFrom = case.into();
+            let back: SeekFrom = std_form.into();
+            assert_eq!(case, back);
+        }
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn read_exact_via_blanket_impl_on_slice() -> std::io::Result<()> {
+        // `&[u8]` impls `std::io::Read`, and the std-mode supertrait
+        // alias + blanket make it satisfy `crate::io::Read`. Exercise
+        // the resulting `read_exact` path end-to-end so a future
+        // regression in the supertrait wiring fails here. The
+        // `assert_read_alias_bound` helper above enforces the alias
+        // bound at compile time; the runtime portion just checks the
+        // read produces the expected bytes.
+        let mut src: &[u8] = b"\x01\x02\x03\x04";
+        assert_read_alias_bound(&src);
+        let mut buf = [0u8; 4];
+        <&[u8] as std::io::Read>::read_exact(&mut src, &mut buf)?;
+        assert_eq!(buf, [1, 2, 3, 4]);
+        Ok(())
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn write_all_via_blanket_impl_on_vec() -> std::io::Result<()> {
+        // Same pattern for `Vec<u8>` — `std::io::Write` impl picks
+        // up the supertrait alias and `write_all` flows through.
+        let mut sink: Vec<u8> = Vec::new();
+        assert_write_alias_bound(&sink);
+        <Vec<u8> as std::io::Write>::write_all(&mut sink, b"hello")?;
+        assert_eq!(sink, b"hello");
+        Ok(())
+    }
 }
