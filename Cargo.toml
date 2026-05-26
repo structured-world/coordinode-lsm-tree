@@ -84,6 +84,15 @@ metrics = []
 # optional dep so `--all-features` builds and a future extraction back
 # into a standalone crate compile cleanly.
 ribbon-serde = ["dep:serde"]
+# RocksDB head-to-head bench lives in a STANDALONE crate at
+# `tools/compare-rocksdb/` — NOT a feature here. Keeping `rocksdb`
+# out of the main crate's feature graph means `cargo build
+# --all-features` / `cargo clippy --all-features` / docs.rs
+# (`all-features = true`) do not have to pull in librocksdb's C
+# dependency tree (libsnappy, liblz4, libbz2, librocksdb itself)
+# nor bindgen + libclang. Build / run the comparison harness with:
+#
+#     cd tools/compare-rocksdb && cargo bench
 
 [dependencies]
 bytes = { version = "1", optional = true }
