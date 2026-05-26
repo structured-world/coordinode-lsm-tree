@@ -16,34 +16,62 @@
 //! Checksums protect the encrypted (on-disk) bytes so that corruption is
 //! detected cheaply before any decryption attempt.
 //!
-//! ## AAD-bound block format (in progress)
+//! ## AAD-bound block format
 //!
-//! The AAD-bound on-disk block format specified in
-//! `docs/aad-block-format.md` is being introduced incrementally. The
-//! foundation pieces shipped so far live in submodules:
+//! The AAD-bound on-disk block format from
+//! `docs/aad-block-format.md` ships in the submodules:
 //!
 //! - [`aad`]: pure-byte AAD construction, [`aad::SuiteId`] /
 //!   [`aad::EncryptionContext`], plus re-exports of the existing
 //!   `crate::table::block::BlockType` / `crate::table::block::BlockIdentity`
 //!   so the AAD path and the Block I/O path share one identity type.
 //! - [`error`]: `DecryptError` enum with one variant per decode-time
-//!   failure mode.
+//!   failure mode (re-exported at the crate's encryption surface).
 //! - [`aead`] (feature `encryption`): per-suite AEAD dispatch
 //!   (AES-256-GCM, ChaCha20-Poly1305) that takes the 38-byte AAD
 //!   from [`aad::build`] and produces / verifies the
-//!   `(nonce, ciphertext, tag)` triple. Pure crypto layer; not yet
-//!   wired into the on-disk wire envelope.
+//!   `(nonce, ciphertext, tag)` triple.
+//! - [`key_chain`]: the `KeyChain` trait + in-memory
+//!   `StaticKeyChain` reference impl, decoupling KeyEpoch → key
+//!   lookup from the LSM crate.
+//! - [`block`] (features `encryption` + `zstd_any`): top-level
+//!   [`encrypt_block`] / [`decrypt_block`] entry points wrapping
+//!   the `MetadataFrame ‖ BodyFrame` skippable-frame wire format
+//!   and returning [`DecryptedBlock`] (plaintext + parsed codec
+//!   context for the caller to thread through
+//!   `structured_zstd::FrameDecoder` setters).
 //!
-//! Still pending: the on-disk skippable-frame wire format
-//! (MetadataFrame + BodyFrame), the `KeyChain` (KeyEpoch -> key
-//! mapping), and the Block I/O integration that replaces the legacy
-//! [`Aes256GcmProvider`] code path below. Those land in subsequent
-//! slices of #251.
+//! Still pending in a follow-up: replacing the legacy
+//! [`Aes256GcmProvider`] Block I/O code path below with the
+//! [`encrypt_block`] / [`decrypt_block`] entry points at every
+//! `Block::write_into` / `Block::from_reader` site.
 
 pub mod aad;
 #[cfg(feature = "encryption")]
 pub mod aead;
+// `block` depends on `structured_zstd::skippable::SkippableFrame`,
+// which is only in the dep graph when the `zstd` cargo feature is
+// enabled (the dep is `optional`, pulled in by `feature = "zstd"`).
+// `encryption` alone doesn't bring zstd, so gate the wire-format
+// module on both features. Without `zstd`, the AAD types + AEAD
+// primitives still compile; only the SkippableFrame-wrapped
+// encrypt_block / decrypt_block entry points are absent.
+#[cfg(all(feature = "encryption", zstd_any))]
+pub mod block;
 pub mod error;
+pub mod key_chain;
+
+// Top-level re-exports so callers can spell `crate::encryption::
+// encrypt_block` / `decrypt_block` / `DecryptedBlock` /
+// `KeyChain` / `DecryptError` directly, instead of paging
+// through the submodule path each time. Matches the surface
+// shape #251's design discussion settled on.
+#[cfg(all(feature = "encryption", zstd_any))]
+pub use block::{DecryptedBlock, decrypt_block, encrypt_block};
+pub use error::DecryptError;
+pub use key_chain::KeyChain;
+#[cfg(feature = "std")]
+pub use key_chain::StaticKeyChain;
 
 /// Block encryption provider.
 ///
