@@ -383,7 +383,17 @@ pub trait Read {
         while !buf.is_empty() {
             match self.read(buf) {
                 Ok(0) => break,
-                Ok(n) => buf = &mut buf[n..],
+                Ok(n) => {
+                    // `split_at_mut(n)` keeps the crate-level
+                    // `#![deny(clippy::indexing_slicing)]` happy
+                    // under `--no-default-features --features
+                    // alloc` clippy: indexing form `buf = &mut
+                    // buf[n..]` would lint-fail on the no-std
+                    // build even though `n` is bounded by the
+                    // `Ok(n)` return contract of `read()`.
+                    let (_, rest) = buf.split_at_mut(n);
+                    buf = rest;
+                }
                 Err(e) if e.kind() == ErrorKind::Interrupted => {}
                 Err(e) => return Err(e),
             }
@@ -439,7 +449,15 @@ pub trait Write {
                         "failed to write whole buffer",
                     ));
                 }
-                Ok(n) => buf = &buf[n..],
+                Ok(n) => {
+                    // `split_at(n)` keeps the crate-level
+                    // `#![deny(clippy::indexing_slicing)]` happy
+                    // under `--no-default-features --features
+                    // alloc` clippy: same reasoning as the
+                    // matching `read_exact` default impl above.
+                    let (_, rest) = buf.split_at(n);
+                    buf = rest;
+                }
                 Err(e) if e.kind() == ErrorKind::Interrupted => {}
                 Err(e) => return Err(e),
             }
