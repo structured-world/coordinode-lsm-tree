@@ -78,29 +78,34 @@ jobs:
       code: ${{ steps.filter.outputs.code }}
     steps:
       # No `actions/checkout` step on purpose: the change predicate
-      # uses GitHub's REST API to list affected files
-      # (`/pulls/{N}/files` for PRs, `/compare/{before}...{after}`
-      # for pushes). That avoids the `actions/checkout@v6 +
-      # fetch-depth: 0 + persist-credentials: false` 403 we hit on
-      # the first attempt, and skips the clone cost entirely for a
-      # job that only needs path names.
+      # uses GitHub's REST API to list affected files via
+      # `/pulls/{N}/files` for the `pull_request` event. That
+      # avoids the `actions/checkout@v6 + fetch-depth: 0 +
+      # persist-credentials: false` 403 we hit on the first
+      # attempt, and skips the clone cost entirely for a job that
+      # only needs path names. Non-PR events (`push` to main,
+      # `workflow_dispatch`) bypass the path filter entirely and
+      # always emit `code=true` — see the inline rationale below.
       - name: Detect code-touching changes
         id: filter
+        # Override the runner's default `bash -eo pipefail` shell.
+        # GitHub Actions invokes the default `bash` step with
+        # `bash --noprofile --norc -eo pipefail {0}`, so a script
+        # that just adds `set -u` STILL inherits `-e` + pipefail
+        # from the runner. This job is a hard dependency of the
+        # required `lint` + `test (stable, ubuntu-latest)` checks
+        # (they `needs: changes`); any non-zero exit cascades to
+        # "required check never reports" and blocks merges, which
+        # is exactly the failure mode we built the safe-default
+        # output for. Drop down to a plain `bash {0}` so the
+        # implicit `-e` / `-o pipefail` doesn't second-guess the
+        # explicit failure-path handling in the script body.
+        shell: bash {0}
         env:
           GH_TOKEN: ${{ github.token }}
           EVENT_NAME: ${{ github.event_name }}
           REPO: ${{ github.repository }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
-          PUSH_BEFORE: ${{ github.event.before }}
-          PUSH_AFTER: ${{ github.sha }}
-        # Intentionally NOT `set -euo pipefail`. This job is a hard
-        # dependency of the required `lint` + `test (stable,
-        # ubuntu-latest)` checks (they `needs: changes`), so any
-        # failure here cascades to "required check never reports"
-        # and blocks merges. Instead, every failure path below
-        # explicitly emits `code=true` (safe default — runs the
-        # real pipeline) and exits 0. The job's exit status is
-        # always 0 unless GitHub Actions itself kills the runner.
         run: |
           set -u
           # Helper: emit a `code` output, log a reason, and exit 0
@@ -117,24 +122,43 @@ jobs:
             # exactly what we want, without resolving merge-base
             # ourselves. Paginated to handle PRs touching >100 files
             # (the API caps each page at 100, more pages auto-fetch).
+            # stdout / stderr are captured into SEPARATE variables:
+            # stdout (filename list) goes into CHANGED, stderr (any
+            # warnings or rate-limit messages) is preserved in
+            # API_ERR for the error notice. Mixing the two streams
+            # would let stderr noise leak into the CODE_RE predicate
+            # below and possibly mis-classify the run.
             echo "Fetching PR #$PR_NUMBER file list via REST API..."
-            if ! CHANGED=$(gh api --paginate "repos/$REPO/pulls/$PR_NUMBER/files" --jq '.[].filename' 2>&1); then
+            API_ERR_FILE=$(mktemp)
+            if ! CHANGED=$(gh api --paginate "repos/$REPO/pulls/$PR_NUMBER/files" --jq '.[].filename' 2>"$API_ERR_FILE"); then
               # API/auth/rate-limit failure: don't cascade. Default
               # to `code=true` so the real lint/test runs anyway.
-              emit_and_exit "true" "REST /pulls/$PR_NUMBER/files failed, defaulting to full CI"
+              # Surface the underlying error message in the notice
+              # so an operator debugging a flake sees what GitHub
+              # actually returned.
+              api_err=$(cat "$API_ERR_FILE" | tr '\n' ' ' | head -c 200)
+              rm -f "$API_ERR_FILE"
+              emit_and_exit "true" "REST /pulls/$PR_NUMBER/files failed (${api_err:-no stderr}), defaulting to full CI"
             fi
+            rm -f "$API_ERR_FILE"
           else
-            # `push` event: per the workflow trigger this only fires
-            # on push to `main`, which is the merge-commit landing
-            # surface. ALWAYS run full CI on merges to main — the
-            # path-filter optimisation exists for developer iteration
-            # on PR branches, not for post-merge validation of what
-            # actually ships. Skipping CI on a "docs-only" push to
-            # main would also be unsafe given the compare API's
-            # known 300-entry `.files` truncation cap on large
-            # diffs: a large code-changing merge could be misclassified
-            # as `code=false` and silently skip validation.
-            emit_and_exit "true" "push to main — always run full CI (no path filter on merges)"
+            # Any non-`pull_request` event (push to main per the
+            # workflow trigger, plus `workflow_dispatch` for manual
+            # re-runs) bypasses the path filter and runs full CI.
+            #
+            # Rationale: the path-filter optimisation exists for
+            # developer iteration on PR branches (typical PR is
+            # N small commits, fast feedback matters). Merges to
+            # main are integration events validating what ships;
+            # manual workflow dispatches are operator-initiated and
+            # are by definition non-routine. Neither has an
+            # iteration loop to optimise. Skipping CI on a
+            # "docs-only" push to main would ALSO be structurally
+            # unsafe given the compare API's known 300-entry
+            # `.files` truncation cap — a large code-changing merge
+            # could be misclassified as `code=false` and silently
+            # skip validation.
+            emit_and_exit "true" "$EVENT_NAME event — always run full CI (no path filter outside PRs)"
           fi
           echo "Changed files:"
           printf '%s\n' "$CHANGED" | sed 's/^/  /'
