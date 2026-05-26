@@ -310,14 +310,39 @@ pub fn encrypt_block(
     ctx: &EncryptionContext,
     key_chain: &dyn KeyChain,
 ) -> crate::Result<Vec<u8>> {
+    // Spec `docs/aad-block-format.md` §4.8: the HeaderByte high
+    // nibble encodes the format version (must be V1 = 0x1 today)
+    // and the low nibble is RESERVED and MUST be zero on write.
+    // Readers ignore the low nibble for forward-compatibility, so
+    // a caller setting reserved bits would silently produce output
+    // that future suites might interpret differently — catch the
+    // shape violation at write time. `EncryptionContext::new_v1`
+    // sets the correct byte automatically, but the struct's fields
+    // are `pub` so a hand-rolled context could land here with a
+    // wrong byte.
+    if (ctx.header_byte >> 4) != FORMAT_VERSION_V1 {
+        return Err(crate::Error::Encrypt(
+            "HeaderByte high nibble does not match FORMAT_VERSION_V1 (spec §4.8)",
+        ));
+    }
+    if (ctx.header_byte & 0x0F) != 0 {
+        return Err(crate::Error::Encrypt(
+            "HeaderByte low nibble is reserved and must be zero on write (spec §4.8)",
+        ));
+    }
+
     // Look up the key for this epoch. Missing epoch on encode is a
-    // programmer bug — the caller owns the chain.
+    // CALLER configuration bug — the caller owns the chain — so
+    // surface it as `Error::Encrypt` rather than `Unrecoverable`
+    // (the latter is reserved for disk-corruption / missing-file
+    // conditions and would route through the wrong recovery
+    // / alerting paths in the consumer).
     let key = key_chain.key(ctx.key_epoch).ok_or_else(|| {
         log::error!(
             "encrypt_block: KeyEpoch {} not present in caller's KeyChain",
             ctx.key_epoch,
         );
-        crate::Error::Unrecoverable
+        crate::Error::Encrypt("KeyEpoch not present in caller's KeyChain")
     })?;
 
     // Spec `docs/aad-block-format.md` §5.3 row "BodyFrame
