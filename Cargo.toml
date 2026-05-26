@@ -75,6 +75,15 @@ metrics = []
 # optional dep so `--all-features` builds and a future extraction back
 # into a standalone crate compile cleanly.
 ribbon-serde = ["dep:serde"]
+# Pulls RocksDB into the dev-dependency graph (no effect on the
+# production crate surface — gated dev-only). Enables the
+# `benches/compare_rocksdb.rs` head-to-head harness: each criterion
+# group runs the same workload through both engines and produces
+# side-by-side timings for the gh-pages dashboard. Off by default
+# because rocksdb pulls in a sizeable C dependency tree (libsnappy,
+# liblz4, libbz2, librocksdb itself) — regular `cargo test` / CI
+# `cargo check` doesn't pay that compile cost.
+compare-rocksdb = ["dep:rocksdb"]
 
 [dependencies]
 bytes = { version = "1", optional = true }
@@ -130,6 +139,12 @@ aes-gcm = { version = "=0.11.0-rc.3", optional = true, features = ["aes", "rand_
 # 0.11.0 lands.
 chacha20poly1305 = { version = "=0.11.0-rc.3", optional = true, features = ["rand_core"] }
 rand_chacha = { version = "0.10", optional = true }
+# Pulled in only by the `compare-rocksdb` feature, which the
+# `benches/compare_rocksdb.rs` head-to-head harness gates on via
+# `required-features` in [[bench]]. Off by default so regular
+# `cargo test` / CI `cargo check` does NOT pay the cost of
+# compiling rocksdb's C dependency tree (snappy, lz4, bz2, etc.).
+rocksdb = { version = "0.24", default-features = false, features = ["lz4"], optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = { version = "0.7", optional = true }
@@ -196,3 +211,9 @@ name = "lsp"
 harness = false
 path = "benches/lsp.rs"
 required-features = []
+
+[[bench]]
+name = "compare_rocksdb"
+harness = false
+path = "benches/compare_rocksdb.rs"
+required-features = ["compare-rocksdb"]
