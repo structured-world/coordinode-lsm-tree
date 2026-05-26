@@ -76,6 +76,13 @@ use std::io;
 // `std::io::Read`. Bring the std trait into scope anonymously here
 // so `take` / `chain` / `bytes` resolve on receivers below.
 use std::io::Read as _;
+// Same supertrait-alias resolution rule applies to `Seek::seek`: the
+// provided method lives on `std::io::Seek`, and `crate::io::Seek` is
+// an empty supertrait alias under `feature = "std"`. Without this
+// import, `file.seek(...)` (e.g. in `open_section_reader`) fails to
+// resolve. Bring `std::io::Seek` into scope anonymously alongside
+// `Read` so receivers below find both provided methods.
+use std::io::Seek as _;
 use std::path::{Path, PathBuf};
 
 /// Options for opening a file through the [`Fs`] trait.
