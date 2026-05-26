@@ -981,19 +981,43 @@ impl Tree {
     /// Update the live [`crate::runtime_config::RuntimeConfig`].
     ///
     /// Mutator runs on a clone of the current snapshot; the new snapshot
-    /// is then atomically swapped in. Subsequent write paths (block write,
-    /// manifest commit, compaction) pick up the change on their next
-    /// `runtime_config()` load. Existing on-disk data remains in its
-    /// original format and reads transparently — every block / manifest
-    /// is self-describing via its own header.
+    /// is then atomically swapped in. Subsequent calls to
+    /// [`Self::runtime_config`] observe the new snapshot.
     ///
-    /// Compaction acts as the live-migration mechanism: once a feature
-    /// is toggled, compaction rewrites source blocks per the new snapshot
-    /// over subsequent cycles, so all data converges to the current
-    /// settings without stop-the-world coordination.
+    /// ## Current scope
     ///
-    /// Atomicity: concurrent readers observe either the old or the new
-    /// snapshot, never a torn one.
+    /// This API ships the snapshot + atomic-swap mechanism. No write
+    /// path in the current tree consults `runtime_config` yet — that
+    /// wiring lands with the V5-batch format features (manifest
+    /// hardening, per-KV protection, scan-since-seqno) which extend
+    /// [`RuntimeConfig`](crate::runtime_config::RuntimeConfig) with
+    /// their own fields and read it at block write / manifest commit /
+    /// compaction boundaries.
+    ///
+    /// ## Designed semantics (effective once wired by V5 features)
+    ///
+    /// - Subsequent write paths load the new snapshot lockless on their
+    ///   next operation.
+    /// - Existing on-disk data remains in its original format and reads
+    ///   transparently — every block / manifest is self-describing via
+    ///   its own header.
+    /// - Compaction acts as the live-migration mechanism: source blocks
+    ///   are rewritten per the current snapshot over subsequent cycles,
+    ///   so all data converges to the current settings without
+    ///   stop-the-world coordination.
+    ///
+    /// ## Concurrency
+    ///
+    /// **Reader atomicity:** concurrent readers observe either the old
+    /// or the new snapshot, never a torn intermediate state.
+    ///
+    /// **Writer semantics: last-writer-wins.** Two `update` calls racing
+    /// from the same starting snapshot will have the second `store`
+    /// overwrite the first — the first writer's mutation is lost. There
+    /// is no CAS / RCU merge. Callers that need lost-update avoidance
+    /// (e.g. two threads concurrently toggling different fields) MUST
+    /// serialize their `update_runtime_config` calls, typically via a
+    /// `Mutex` around the call site.
     pub fn update_runtime_config<F>(&self, mutator: F)
     where
         F: FnOnce(&mut crate::runtime_config::RuntimeConfig),

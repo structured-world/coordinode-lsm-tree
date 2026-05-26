@@ -25,12 +25,21 @@
 /// for per-entry checksums where space matters more than collision
 /// resistance.
 ///
-/// Live migration semantic: changing the configured algorithm
-/// affects subsequent writes only. Existing blocks self-describe
-/// via their own `checksum_type` byte (added by downstream PR
-/// landing the `BlockHeader` extension), so readers handle mixed
-/// algorithms in the same Tree transparently. Compaction rewrites
-/// source blocks per the current algorithm.
+/// **Intended live-migration semantic (effective once downstream
+/// format PRs wire this into block I/O):** changing the configured
+/// algorithm will affect subsequent writes only. Existing blocks
+/// will self-describe via their own `checksum_type` byte (the
+/// `BlockHeader` extension lands with the V5-batch per-KV /
+/// manifest hardening PRs), so readers will handle mixed
+/// algorithms in the same Tree transparently. Compaction will
+/// rewrite source blocks per the current algorithm.
+///
+/// In this PR the algorithm is purely a configuration value —
+/// existing block I/O still uses the current hardcoded path; no
+/// `checksum_type` byte is written to disk yet. The discriminator
+/// API ([`Self::wire_tag`] / [`Self::from_wire_tag`]) is provided
+/// here so downstream wire-format PRs can encode the choice
+/// without re-litigating the value assignment.
 //
 // no-std: pure data type — compiles under `--no-default-features --features alloc`.
 #[derive(Copy, Clone, Debug, Default, Eq, PartialEq, Hash)]
