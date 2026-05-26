@@ -84,11 +84,15 @@ impl ErrorKind {
 
 /// I/O error mirroring [`std::io::Error`].
 ///
-/// Carries an [`ErrorKind`] plus an optional message string for context.
-/// Under `feature = "std"` the `From<std::io::Error>` bridge below
-/// preserves the original error as the message payload via `Display`,
-/// so callers using `?` see the same human-readable text as the
-/// platform error.
+/// Carries an [`ErrorKind`] plus an optional message string for
+/// context. Under `feature = "std"` the `From<std::io::Error>`
+/// bridge below RETAINS the platform error's `Display` output as
+/// the message payload, so the original text (OS error string,
+/// path context, errno description) survives the conversion and
+/// appears in this error's `Display` after the kind prefix
+/// — the rendered form is `"<kind>: <std-display>"`, which is
+/// the same information as the original `std::io::Error` printed,
+/// just with an explicit kind tag prepended.
 pub struct Error {
     kind: ErrorKind,
     message: Option<Box<str>>,

@@ -56,13 +56,14 @@ pub use io_uring_fs::{IoUringFs, is_io_uring_available};
 // existing std-backed backends (`std_fs`, `io_uring_fs`) satisfy
 // these bounds without any change to their own impls.
 //
-// `io::{Result, Error, ErrorKind}` are still re-exported from
-// `std::io` here. The trait *bounds* are what blocked no-std for this
-// module; the surrounding `io::Result<T>` return type still uses
+// `io::{Result, Error, ErrorKind}` still come from `std::io` here
+// (no public re-export — `use std::io;` is a local module alias).
+// The trait *bounds* are what blocked no-std for this module; the
+// surrounding `io::Result<T>` return type still resolves to
 // `std::io::Result<T>` and will be migrated to `crate::io::Result<T>`
 // in a follow-up so we keep the diff scoped to what this issue
-// actually unblocks. `std::path::Path` likewise stays for now — the
-// path migration is the second blocker tracked separately.
+// actually unblocks. `std::path::Path` likewise stays for now —
+// the path migration is the second blocker tracked separately.
 use crate::io::{Read, Seek, Write};
 use std::io;
 // `Read::take` is a provided method on the `std::io::Read` trait,
