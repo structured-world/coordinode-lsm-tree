@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779810449069,
+  "lastUpdate": 1779814376269,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -10452,6 +10452,84 @@ window.BENCHMARK_DATA = {
             "value": 464395.9102937008,
             "unit": "ops/sec",
             "extra": "P50: 2.0us | P99: 5.4us | P99.9: 8.1us\nthreads: 1 | elapsed: 0.43s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "253be3e6a9724b69380482301ff214f6afc76b83",
+          "message": "ci: always-emit lint/test required checks via path-conditional skip (#348) (#349)\n\n## Summary\n\nThe branch ruleset on `main` (`main: require PR + Copilot review`)\nrequires two status checks before merge:\n\n- `lint`\n- `test (stable, ubuntu-latest)`\n\nBoth come from `.github/workflows/coordinode-ci.yml` and previously ran\nunconditionally on every PR. That created two failure modes — see #348\nfor the full analysis and the PR #344 incident that motivated the fix.\n\nThis PR keeps the workflow trigger unconditional, but introduces an\nin-job **path-conditional skip pattern** for the two required jobs so\nthe required check NAMES always surface to GitHub (satisfying the\nruleset) while heavy work is skipped on docs-only / repo-meta-only PRs\nand on PRs whose lint failed.\n\n## What changed\n\n1. **New `changes` job** — runs unconditionally, decides whether the PR\ndiff touches code-relevant paths, emits `code=true|false` via\n`$GITHUB_OUTPUT`. Path predicate (current `CODE_RE`):\n\n   ```\n   ^(src/|tests/|benches/|examples/|test_fixture/|build\\.rs$\n     |Cargo\\.toml$|Cargo\\.lock$|tools/\n     |\\.github/workflows/coordinode-ci\\.yml$\n     |rust-toolchain(\\.toml)?$|\\.cargo/\n     |\\.config/nextest\\.toml$|\\.rustfmt\\.toml$|clippy\\.toml$)\n   ```\n\nLint/test config files (`.config/nextest.toml`, `.rustfmt.toml`,\n`clippy.toml`) and the in-repo `test_fixture/` are included because\nchanges to any of them can flip lint/test outcomes on\notherwise-identical source. Edits to the CI workflow itself also count\nso a CI-refactor PR can never skip its own validation.\n\n   Event handling:\n- `pull_request` — calls `gh api --paginate repos/.../pulls/{N}/files`,\nsplits stdout (filename list) from stderr (surfaced only in the failure\nnotice), runs CODE_RE.\n- `push` to main / `workflow_dispatch` — bypasses the API entirely and\nemits `code=true` (these are integration / operator-initiated events\nwith no iteration loop to optimise; the compare API would also be unsafe\nhere due to its `.files` truncation cap).\n\nFail-safe behaviour: every error path (REST flake, unknown event, runner\nkill) defaults to `code=true` so the real pipeline still runs on\ninfrastructure flakes; the `changes` job's shell is explicitly `bash\n--noprofile --norc {0}` to override the runner's default `-eo pipefail`\nand let the script's explicit emit-and-exit-0 logic stay authoritative.\n\n2. **`lint` job** — `needs: changes`. `if: ${{ always() && !cancelled()\n}}` to override needs-gating skip on dependency failure. Every inner\nstep guarded by `if: needs.changes.outputs.code != 'false'`; on\ndocs-only PRs the job emits a `::notice::` and exits success in seconds.\n\n3. **`test` job** — `needs: [changes, lint]`. Same `always() &&\n!cancelled()` job-level condition. Three step-level cases for the inner\nwork:\n\n- `code == 'false'` → Path-conditional skip notice (docs-only PR)\n- `code != 'false' AND lint.result != 'success'` → Lint-failed skip\nnotice (don't add test noise to an already-failed PR)\n   - `code != 'false' AND lint.result == 'success'`   → real test work\n\nThe matrix is statically 2×3 (rust × os) — all 6 entries run their above\npattern. The matrix-conditional `if:` to skip non-required entries on\ndocs-only PRs was attempted earlier in this PR but reverted: the\n`matrix` context is NOT available at job-level expression evaluation,\nonly at step-level. A dynamic matrix via\n`fromJSON(needs.changes.outputs.matrix)` is the correct shape for that\noptimisation and is documented inline for the next attempt.\n\n4. **Non-required downstream jobs** (`test-zstd`, `no-std-check`,\n`cross`, `codecov`) — gate at the JOB level via `if: ${{ always() &&\n!cancelled() && needs.lint.result == 'success' &&\nneeds.changes.outputs.code != 'false' }}`. They run on code-touching PRs\nWHERE LINT PASSED (no point spinning up test-zstd if lint is broken),\nand skip on docs-only PRs OR lint-failed PRs. `always() && !cancelled()`\nis needed to override default needs-gating when `changes` itself fails\n(infra flake), keeping the fail-safe-to-running posture.\n\n`cross-matrix` is the one downstream job that legitimately does NOT\ndepend on lint (its rationale comment explicitly calls out the\nparallelism it gets from running alongside lint, shaving ~10s off the PR\ncritical path). It keeps the simpler `always() && !cancelled() &&\nneeds.changes.outputs.code != 'false'` condition.\n\n## What this does NOT fix\n\n- **Webhook glitch root cause** (failure mode (A) in #348). When GitHub\nActions doesn't fire the workflow at all for a particular push (PR\n#344's experience on 2026-05-26), no run is created and no required\ncheck ever appears. This PR doesn't address that — recovery still\nrequires a manual re-trigger via `workflow_dispatch`, an empty commit,\nor re-push.\n\n## Test plan\n\n- [ ] Open a docs-only PR (touching only `*.md` / `LICENSE`) — confirm\n`lint` and `test (stable, ubuntu-latest)` report success in seconds with\nthe skip notice; ruleset accepts the PR. All 6 test matrix entries still\nrun (they just exit early with the skip notice — runner allocation\noverhead remains; future fix via dynamic matrix).\n- [ ] Open a code-only PR — confirm both required jobs run the real work\nend to end.\n- [ ] Open a code PR with a broken lint — confirm `lint` reports\nfailure, `test` matrix entries emit the lint-failed notice without\nrunning real tests, non-required jobs skip entirely.\n- [ ] Re-run this PR's own CI on this branch and verify both required\njobs run (workflow file itself is in the code predicate, so the CI on\nthis very PR must run the full work).\n\nCloses #348.",
+          "timestamp": "2026-05-26T19:49:00+03:00",
+          "tree_id": "e04a6eee87b8648f6ed4ba24ef7725f84d16d0a3",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/253be3e6a9724b69380482301ff214f6afc76b83"
+        },
+        "date": 1779814374664,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 2092132.668994736,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.6us | P99.9: 3.7us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1218045.334319674,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.2us | P99.9: 4.3us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 527933.2951213454,
+            "unit": "ops/sec",
+            "extra": "P50: 1.7us | P99: 5.1us | P99.9: 7.8us\nthreads: 1 | elapsed: 0.38s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3613339.3069058754,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 3.1us | P99.9: 5.6us\nthreads: 1 | elapsed: 0.06s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 366558.1506695564,
+            "unit": "ops/sec",
+            "extra": "P50: 2.4us | P99: 5.9us | P99.9: 9.2us\nthreads: 1 | elapsed: 0.55s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 198822.8970719142,
+            "unit": "ops/sec",
+            "extra": "P50: 4.7us | P99: 5.9us | P99.9: 8.7us\nthreads: 1 | elapsed: 1.01s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1223744.6428207255,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.3us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1133001.473802652,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 1.5us | P99.9: 1.9us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 467138.1060246589,
+            "unit": "ops/sec",
+            "extra": "P50: 2.0us | P99: 5.5us | P99.9: 8.1us\nthreads: 1 | elapsed: 0.43s | num: 200000 | iterations: 3"
           }
         ]
       }
