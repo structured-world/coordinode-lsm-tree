@@ -61,60 +61,56 @@ jobs:
   changes:
     runs-on: ubuntu-latest
     timeout-minutes: 2
+    # Read-only token: we hit the GH REST API for the PR file list /
+    # push compare, never push, never write. Explicit `permissions:`
+    # block scopes the auto-provided GITHUB_TOKEN to exactly what
+    # this job needs, regardless of repo-default permission settings.
+    permissions:
+      contents: read
+      pull-requests: read
     outputs:
       code: ${{ steps.filter.outputs.code }}
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
-        with:
-          persist-credentials: false
-          # Full history so the diff against the PR base or the
-          # previous push commit always resolves, regardless of how
-          # many commits the push or PR contains.
-          fetch-depth: 0
+      # No `actions/checkout` step on purpose: the change predicate
+      # uses GitHub's REST API to list affected files
+      # (`/pulls/{N}/files` for PRs, `/compare/{before}...{after}`
+      # for pushes). That avoids the `actions/checkout@v6 +
+      # fetch-depth: 0 + persist-credentials: false` 403 we hit on
+      # the first attempt, and skips the clone cost entirely for a
+      # job that only needs path names.
       - name: Detect code-touching changes
         id: filter
         env:
+          GH_TOKEN: ${{ github.token }}
           EVENT_NAME: ${{ github.event_name }}
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
           PUSH_BEFORE: ${{ github.event.before }}
           PUSH_AFTER: ${{ github.sha }}
         run: |
           set -euo pipefail
           if [ "$EVENT_NAME" = "pull_request" ]; then
-            BASE="$BASE_SHA"
-            HEAD="$HEAD_SHA"
+            # GitHub's own PR file list is the merge-base diff —
+            # exactly what we want, without resolving merge-base
+            # ourselves. Paginated to handle PRs touching >100 files
+            # (the API caps each page at 100, more pages auto-fetch).
+            echo "Fetching PR #$PR_NUMBER file list via REST API..."
+            CHANGED=$(gh api --paginate "repos/$REPO/pulls/$PR_NUMBER/files" --jq '.[].filename')
           else
-            BASE="$PUSH_BEFORE"
-            HEAD="$PUSH_AFTER"
+            # `push` event: list files between BEFORE and AFTER via
+            # the compare endpoint. First push of a new branch reports
+            # the all-zeros sentinel as `before` — no baseline to diff
+            # against, assume code changed (safe default).
+            if [ -z "$PUSH_BEFORE" ] || [ "$PUSH_BEFORE" = "0000000000000000000000000000000000000000" ]; then
+              echo "No baseline commit available (new branch / first push) — assuming code changed."
+              echo "code=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            echo "Fetching compare $PUSH_BEFORE...$PUSH_AFTER via REST API..."
+            CHANGED=$(gh api "repos/$REPO/compare/$PUSH_BEFORE...$PUSH_AFTER" --jq '.files[].filename')
           fi
-          # First push of a new branch reports the all-zeros sentinel
-          # as `before`; with no base to diff against, assume code
-          # changed (safe default — runs the full pipeline).
-          if [ -z "$BASE" ] || [ "$BASE" = "0000000000000000000000000000000000000000" ]; then
-            echo "No baseline commit available (new branch / first push) — assuming code changed."
-            echo "code=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          # For `pull_request` events, GitHub's own PR diff is
-          # `merge-base(base, head)..head`, not `base..head` — diffing
-          # straight from the base tip pulls in any commits that landed
-          # on the base branch AFTER the PR branched, which falsely
-          # flips a docs-only PR to `code=true`. Resolve the merge-base
-          # first so the predicate sees only this PR's own changes.
-          # For `push` events `BASE` is already the previous tip on the
-          # same branch, so the merge-base equals `BASE` itself and the
-          # extra step is a no-op.
-          if MB=$(git merge-base "$BASE" "$HEAD" 2>/dev/null); then
-            DIFF_BASE="$MB"
-          else
-            # Shallow clone / unrelated histories: fall back to BASE
-            # rather than failing — the predicate stays safe because
-            # the `code=true` fallback below is the conservative
-            # default if anything goes wrong.
-            echo "Warning: merge-base($BASE, $HEAD) unavailable — falling back to BASE."
-            DIFF_BASE="$BASE"
-          fi
+          echo "Changed files:"
+          echo "$CHANGED" | sed 's/^/  /'
           # Predicate: anything that affects compile / lint / test
           # results counts as code. The workflow file is included so
           # changes to CI logic itself always trigger the full matrix
@@ -127,9 +123,6 @@ jobs:
           # touches only those files would defeat the purpose of the
           # required-check gate.
           CODE_RE='^(src/|tests/|benches/|examples/|test_fixture/|build\.rs$|Cargo\.toml$|Cargo\.lock$|tools/|\.github/workflows/coordinode-ci\.yml$|rust-toolchain(\.toml)?$|\.cargo/|\.config/nextest\.toml$|\.rustfmt\.toml$|clippy\.toml$)'
-          CHANGED=$(git diff --name-only "$DIFF_BASE" "$HEAD")
-          echo "Changed files between $DIFF_BASE and $HEAD (merge-base of $BASE and $HEAD):"
-          echo "$CHANGED" | sed 's/^/  /'
           if echo "$CHANGED" | grep -qE "$CODE_RE"; then
             echo "Result: code paths affected — running real CI."
             echo "code=true" >> "$GITHUB_OUTPUT"
