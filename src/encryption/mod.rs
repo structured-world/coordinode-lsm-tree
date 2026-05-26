@@ -43,7 +43,10 @@
 pub mod aad;
 #[cfg(feature = "encryption")]
 pub mod aead;
+#[cfg(feature = "encryption")]
+pub mod block;
 pub mod error;
+pub mod key_chain;
 
 /// Block encryption provider.
 ///
