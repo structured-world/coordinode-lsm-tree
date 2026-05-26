@@ -61,11 +61,14 @@ pub struct Header {
     /// Length in bytes of the Reed-Solomon parity trailer that follows
     /// the `data_length` payload bytes on disk. `0` when the block was
     /// written without Page ECC (`Config::page_ecc(false)`, the
-    /// default), in which case no parity bytes follow and the V6
-    /// layout is indistinguishable from V5 on the wire other than the
-    /// presence of this header field. Non-zero when ECC is enabled —
-    /// the reader uses it to read the parity bytes and attempt
-    /// Reed-Solomon recovery on `data` XXH3 mismatch.
+    /// default), in which case no parity bytes follow — the *payload
+    /// region* stays V5-shaped (header + payload, no trailer). The
+    /// *header* itself is always V6: 4 extra bytes for this field
+    /// plus the bumped magic `[L,S,M,4]` (V5 was `[L,S,M,3]`), so a
+    /// pre-V6 reader rejects every V6 block at header decode
+    /// regardless of `ecc_length`'s value. Non-zero when ECC is
+    /// enabled — the reader uses it to read the parity bytes and
+    /// attempt Reed-Solomon recovery on `data` XXH3 mismatch.
     pub ecc_length: u32,
 }
 

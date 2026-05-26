@@ -27,11 +27,15 @@ pub enum FormatVersion {
     /// `ecc_length: u32` field and the on-disk block can carry a
     /// Reed-Solomon parity trailer immediately after the XXH3-covered
     /// payload bytes. When `Config::page_ecc(false)` (the default),
-    /// `ecc_length = 0` and no parity bytes follow — V6 layout is
-    /// indistinguishable from V5 on the wire other than the extra
-    /// header field. The block magic is bumped from `[L,S,M,3]` to
-    /// `[L,S,M,4]` so a pre-V6 reader that bypasses the manifest gate
-    /// still rejects V6 blocks immediately at header decode.
+    /// `ecc_length = 0` and no parity bytes follow — the *payload /
+    /// trailer region* stays V5-shaped (zero parity bytes after the
+    /// payload, same as V5). The block *header* is still V6: it
+    /// always carries the extra `ecc_length` field and uses the
+    /// bumped magic `[L,S,M,4]` (V5 was `[L,S,M,3]`). A pre-V6
+    /// reader that bypasses the manifest gate rejects V6 blocks
+    /// immediately at header decode via the magic mismatch, so V6
+    /// blocks are NEVER indistinguishable from V5 to a reader — the
+    /// "V5-shaped" wording above refers to the payload region only.
     ///
     /// V3/V4/V5 ↔ V6 incompatibility is enforced primarily by the
     /// manifest version gate at `Tree::open` (returns `InvalidVersion`

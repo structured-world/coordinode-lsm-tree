@@ -47,6 +47,16 @@ use crate::{
 /// independent storage formats that may diverge in the future.
 const MAX_DECOMPRESSION_SIZE: u32 = 256 * 1024 * 1024;
 
+/// Upper bound on the Reed-Solomon parity trailer size. Parity for a
+/// payload of length `N` is `parity_len(N) = shard_bytes(N) * 2 =
+/// ceil(N/4 rounded to even) * 2`, which is at most `N/2 + 4` bytes.
+/// Capped at the maximum legitimate payload (the writer never emits
+/// more than this); a header advertising a larger `ecc_length` is
+/// definitionally corrupt and the reader rejects it before
+/// allocating the parity buffer — without this guard a crafted
+/// header could trigger an unbounded `Vec` allocation on read.
+const MAX_ECC_LENGTH: u32 = (MAX_DECOMPRESSION_SIZE / 2) + 4;
+
 /// A block on disk
 ///
 /// Consists of a fixed-size header and some bytes (the data/payload).
@@ -132,16 +142,23 @@ impl Block {
         {
             // Block has an ECC trailer but this build can't use it.
             // Discard the parity buffer explicitly so the compiler
-            // sees the use.
+            // sees the use, then surface the checksum-mismatch
+            // error directly. Earlier in this function we already
+            // confirmed `computed != expected` (the `if computed
+            // == expected` happy-path returned above), so
+            // `computed.check(expected)` is guaranteed to return
+            // Err here — return it directly instead of going
+            // through `?` followed by an unreachable fallback.
             let _ = parity;
             log::error!(
                 "block has ECC trailer (ecc_length={ecc_length}) but this \
                  build lacks the page_ecc feature — cannot attempt recovery; \
                  got={computed}, expected={expected}",
             );
-            computed.check(expected)?;
-            // checksum.check returns Err on mismatch — unreachable.
-            Err(crate::Error::Unrecoverable)
+            Err(crate::Error::ChecksumMismatch {
+                expected,
+                got: computed,
+            })
         }
     }
 
@@ -418,6 +435,18 @@ impl Block {
             });
         }
 
+        // Reject impossibly-large ECC trailers before
+        // read_payload_and_verify allocates the parity buffer.
+        // Without this check a header advertising
+        // `ecc_length = u32::MAX` would trigger a 4 GiB `Vec`
+        // allocation on every read.
+        if header.ecc_length > MAX_ECC_LENGTH {
+            return Err(crate::Error::DecompressedSizeTooLarge {
+                declared: u64::from(header.ecc_length),
+                limit: u64::from(MAX_ECC_LENGTH),
+            });
+        }
+
         // When encryption is active, read into a Vec so decrypt_vec can
         // reuse the buffer in-place (one allocation instead of two).
         // When no encryption, read into a Slice which may use optimized
@@ -631,11 +660,20 @@ impl Block {
         // fields so the read path's AEAD verification (#251) can
         // reconstruct the same AAD the writer used.
         let _ = identity;
-        // handle.size() includes Header::serialized_len(), so allow that overhead.
-        // Encrypted blocks add provider-specific overhead to the on-disk size.
+        // handle.size() includes Header::serialized_len() + payload +
+        // optional ECC parity trailer. Encrypted blocks add
+        // provider-specific overhead to the on-disk size. The ECC
+        // trailer is bounded at parity_len(MAX_DECOMPRESSION_SIZE)
+        // ≤ MAX_ECC_LENGTH (~128 MiB at the current 256 MiB payload
+        // cap); without including it here, a legitimately-large
+        // ECC-protected block written by this crate would be
+        // rejected at the budget check before the header even
+        // parsed.
         let enc_overhead = encryption.map_or(0u64, |e| u64::from(e.max_overhead()));
-        let max_on_disk_size =
-            u64::from(MAX_DECOMPRESSION_SIZE) + Header::serialized_len() as u64 + enc_overhead;
+        let max_on_disk_size = u64::from(MAX_DECOMPRESSION_SIZE)
+            + u64::from(MAX_ECC_LENGTH)
+            + Header::serialized_len() as u64
+            + enc_overhead;
 
         if u64::from(handle.size()) > max_on_disk_size {
             return Err(crate::Error::DecompressedSizeTooLarge {
@@ -692,6 +730,13 @@ impl Block {
                 return Err(crate::Error::DecompressedSizeTooLarge {
                     declared: u64::from(parsed_header.uncompressed_length),
                     limit: u64::from(MAX_DECOMPRESSION_SIZE),
+                });
+            }
+
+            if parsed_header.ecc_length > MAX_ECC_LENGTH {
+                return Err(crate::Error::DecompressedSizeTooLarge {
+                    declared: u64::from(parsed_header.ecc_length),
+                    limit: u64::from(MAX_ECC_LENGTH),
                 });
             }
 
@@ -816,6 +861,13 @@ impl Block {
                 return Err(crate::Error::DecompressedSizeTooLarge {
                     declared: u64::from(parsed_header.uncompressed_length),
                     limit: u64::from(MAX_DECOMPRESSION_SIZE),
+                });
+            }
+
+            if parsed_header.ecc_length > MAX_ECC_LENGTH {
+                return Err(crate::Error::DecompressedSizeTooLarge {
+                    declared: u64::from(parsed_header.ecc_length),
+                    limit: u64::from(MAX_ECC_LENGTH),
                 });
             }
 
@@ -973,18 +1025,24 @@ mod tests {
         /// Pre-computed handle: offset 0, length = header +
         /// payload, ready to pass straight into `Block::from_file`.
         handle: crate::table::BlockHandle,
-        /// Keep bound for the test lifetime — drop reclaims the
-        /// directory and the file inside it. Declared LAST so
-        /// the file handle above closes before this removes the
-        /// directory. Some tests also read `.path()` directly to
-        /// re-open the on-disk bytes; others rely purely on the
-        /// `Drop` side-effect. `allow(dead_code)` covers both
-        /// shapes — `expect` would be unfulfilled in the
-        /// "actually read" cases.
-        #[allow(
-            dead_code,
-            reason = "Drop guard for the tempdir; some tests also use \
-                      `.path()` directly to re-open the on-disk bytes"
+        /// Drop guard for the tempdir. Kept bound for the test
+        /// lifetime so the file inside the directory survives
+        /// long enough to be reopened by the test reader, then
+        /// dropped at end-of-scope to reclaim the directory.
+        /// Declared LAST so the file handle above closes before
+        /// this removes the directory.
+        ///
+        /// Feature-matrix-gated suppression: under `--all-features`
+        /// the ECC-corruption tests read `.path()` to flip on-disk
+        /// bytes, so the field IS used and an unconditional
+        /// `#[allow(dead_code)]` would clash with
+        /// `clippy::used_underscore_binding` if we tried to prefix
+        /// the field name with `_`. Under default features the
+        /// `page_ecc` tests are not compiled, the field genuinely
+        /// IS dead, and the suppression silences the warning.
+        #[cfg_attr(
+            not(feature = "page_ecc"),
+            allow(dead_code, reason = "drop guard; only read by page_ecc-gated tests")
         )]
         dir: tempfile::TempDir,
     }
@@ -2754,6 +2812,133 @@ mod tests {
                 &BlockTransform::PLAIN,
             )?;
             assert_eq!(&*block.data, PAYLOAD);
+            Ok(())
+        }
+
+        /// Same recovery story as `PlainEcc` but with lz4 compression
+        /// stacked on top: parity is computed over the
+        /// post-compression payload, recovery happens BEFORE
+        /// decompression. Catches a regression where the read path
+        /// would try to decompress corrupt bytes (lz4 would fail
+        /// before recovery had a chance to fire).
+        #[cfg(feature = "lz4")]
+        #[test]
+        fn block_roundtrip_compressed_ecc_recovers_from_byte_flip() -> crate::Result<()> {
+            let mut writer = vec![];
+            let header = Block::write_into(
+                &mut writer,
+                PAYLOAD,
+                BlockIdentity::for_test(0, 0, BlockType::Data),
+                &BlockTransform::CompressedEcc(CompressionContext::new(CompressionType::Lz4)?),
+            )?;
+            assert!(header.ecc_length > 0);
+
+            // Flip a byte in the compressed-payload region.
+            let header_len = Header::serialized_len();
+            let flip_at = header_len + (header.data_length as usize) / 2;
+            writer[flip_at] ^= 0x55;
+
+            let mut reader = &writer[..];
+            let block = Block::from_reader(
+                &mut reader,
+                BlockIdentity::for_test(0, 0, BlockType::Data),
+                &BlockTransform::Compressed(CompressionContext::new(CompressionType::Lz4)?),
+            )?;
+            assert_eq!(
+                &*block.data, PAYLOAD,
+                "ECC must recover the compressed bytes BEFORE lz4 \
+                 decompression, otherwise lz4 would fail on corrupt input",
+            );
+            Ok(())
+        }
+
+        /// ECC-protected encrypted roundtrip with a single-byte
+        /// ciphertext flip. Parity is computed over the ciphertext,
+        /// so recovery must produce byte-exact reconstruction —
+        /// AEAD authentication fails on even a one-bit mismatch.
+        /// This catches a regression where ECC recovery rebuilds an
+        /// arithmetically valid Reed-Solomon shard that doesn't
+        /// bit-identically reproduce the original ciphertext.
+        #[cfg(feature = "encryption")]
+        #[test]
+        fn block_roundtrip_encrypted_ecc_recovers_from_byte_flip() -> crate::Result<()> {
+            let enc = crate::encryption::Aes256GcmProvider::new(&[0x42; 32]);
+            let mut writer = vec![];
+            let header = Block::write_into(
+                &mut writer,
+                PAYLOAD,
+                BlockIdentity::for_test(0, 0, BlockType::Data),
+                &BlockTransform::EncryptedEcc(&enc),
+            )?;
+            assert!(header.ecc_length > 0);
+
+            // Flip one byte in the ciphertext region.
+            let header_len = Header::serialized_len();
+            let flip_at = header_len + (header.data_length as usize) / 2;
+            writer[flip_at] ^= 0x21;
+
+            let mut reader = &writer[..];
+            let block = Block::from_reader(
+                &mut reader,
+                BlockIdentity::for_test(0, 0, BlockType::Data),
+                &BlockTransform::Encrypted(&enc),
+            )?;
+            assert_eq!(
+                &*block.data, PAYLOAD,
+                "ECC must reconstruct ciphertext byte-exactly so AEAD \
+                 authentication succeeds on the recovered bytes",
+            );
+            Ok(())
+        }
+
+        /// Asserts the unrecoverable path surfaces
+        /// `Error::PageEccUnrecoverable`. Corrupts enough on-disk
+        /// bytes to take out more than the RS(4, 2) scheme can
+        /// recover (≥ 3 data shards damaged), so every C(6, 4)
+        /// subset trial decode fails the xxh3 oracle and
+        /// `try_recover` exhausts all 15 candidates.
+        #[test]
+        fn block_roundtrip_plain_ecc_unrecoverable_when_too_many_shards_corrupt()
+        -> crate::Result<()> {
+            let mut writer = vec![];
+            let header = Block::write_into(
+                &mut writer,
+                PAYLOAD,
+                BlockIdentity::for_test(0, 0, BlockType::Data),
+                &BlockTransform::PlainEcc,
+            )?;
+
+            // Shard size in bytes — same formula as crate::ecc::shard_bytes
+            // (ceil(payload_len / 4) rounded up to even).
+            let payload_len = header.data_length as usize;
+            let shard_bytes = ((payload_len.div_ceil(4)) + 1) & !1;
+
+            // Flip one byte in EACH of the first 3 data shards.
+            // RS(4, 2) recovers up to 2 missing shards; with 3
+            // corrupted data shards no subset of 4 intact shards
+            // reconstructs the original.
+            let payload_start = Header::serialized_len();
+            for shard_idx in 0..3 {
+                let pos = payload_start + shard_idx * shard_bytes;
+                if pos < writer.len() {
+                    writer[pos] ^= 0xFF;
+                }
+            }
+
+            let mut reader = &writer[..];
+            let result = Block::from_reader(
+                &mut reader,
+                BlockIdentity::for_test(0, 0, BlockType::Data),
+                &BlockTransform::PLAIN,
+            );
+            match result {
+                Ok(_) => panic!(
+                    "3-shard corruption must exceed RS(4,2) recovery capacity, \
+                     but from_reader returned Ok"
+                ),
+                Err(crate::Error::PageEccUnrecoverable { .. }) => {}
+                Err(e) => panic!("expected PageEccUnrecoverable, got {e:?}"),
+            }
             Ok(())
         }
     }

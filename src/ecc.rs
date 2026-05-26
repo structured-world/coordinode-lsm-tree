@@ -76,13 +76,21 @@ pub fn parity_len(payload_len: usize) -> usize {
 /// records `ecc_length = parity.len() as u32` in the block
 /// header.
 ///
+/// Empty input (`payload.len() == 0`) is handled by short-circuit
+/// returning `Ok(Vec::new())` — a zero-length block has nothing to
+/// protect, so emitting zero parity bytes is the correct shape.
+/// `ecc_length` then lands at `0` in the header, matching the
+/// no-ECC layout.
+///
 /// # Errors
 ///
 /// Returns [`crate::Error::Unrecoverable`] if the reed-solomon
-/// engine rejects the (4, 2, `shard_bytes`) configuration. This
-/// only happens for `payload.len() == 0`, which the caller is
-/// expected to filter (a zero-length block has nothing to
-/// protect anyway).
+/// engine rejects the (4, 2, `shard_bytes`) configuration. With
+/// `shard_bytes` computed from a non-zero payload length and
+/// rounded to the nearest even integer (the only constraint the
+/// engine has on the shard size), the engine has no remaining
+/// reason to reject; this branch is defensive and is expected to
+/// be unreachable from any in-tree caller.
 pub fn encode_parity(payload: &[u8]) -> crate::Result<Vec<u8>> {
     let sb = shard_bytes(payload.len());
     if sb == 0 {
@@ -277,6 +285,13 @@ fn try_decode_one(
 #[expect(clippy::expect_used, clippy::indexing_slicing, reason = "test code")]
 mod tests {
     use super::*;
+    // `test_log::test` shadows the std `test` attribute so every
+    // `#[test]` below routes through test-log — drives RUST_LOG
+    // capture for the ecc warnings emitted by `try_recover` /
+    // `encode_parity`. Looks unused at a glance because the
+    // `#[test]` syntax is identical to the std macro; clippy
+    // resolves the shadowing correctly and does NOT warn under
+    // `-D warnings`.
     use test_log::test;
 
     fn xxh3_oracle(expected: u128) -> impl FnMut(&[u8]) -> bool {
