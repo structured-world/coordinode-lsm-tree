@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779814376269,
+  "lastUpdate": 1779822815925,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -10530,6 +10530,84 @@ window.BENCHMARK_DATA = {
             "value": 467138.1060246589,
             "unit": "ops/sec",
             "extra": "P50: 2.0us | P99: 5.5us | P99.9: 8.1us\nthreads: 1 | elapsed: 0.43s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "f0b7aa5941503836e928e03e281da8b14adff1a7",
+          "message": "feat(io): local Read/Write/Seek trait surface to lift Fs off std::io (#311) (#347)\n\n## Summary\n\nIntroduce `lsm_tree::io` — a local mirror of `std::io::{Read, Write,\nSeek}` plus `Error`/`ErrorKind`/`SeekFrom` — and switch `Fs` / `FsFile`\ntrait bounds in `src/fs/mod.rs` to use it. This lifts the direct\n`std::io::*` dependency out of those trait signatures, which is the\nprerequisite called out in #311 for compiling `src/fs/` under\n`--no-default-features --features alloc`.\n\n## Design: dual-shape traits\n\nThe crux of the design is that under `feature = \\\"std\\\"`,\n`crate::io::{Read, Write, Seek}` are **supertrait aliases** over the\ncorresponding `std::io` traits:\n\n```rust\n#[cfg(feature = \\\"std\\\")]\npub trait Read: std::io::Read {}\n#[cfg(feature = \\\"std\\\")]\nimpl<R: std::io::Read + ?Sized> Read for R {}\n```\n\nThat gives us both directions for free:\n\n- Any `T: std::io::Read` automatically implements `crate::io::Read`\n(forward via blanket)\n- `T: crate::io::Read` implies `T: std::io::Read` (backward via\nsupertrait relationship)\n\nSo `dyn FsFile` bounded on `crate::io::Read` flows directly into\n`std::io::BufReader`, `byteorder`, and every other std-shaped consumer —\nzero adapter code at the backend boundary.\n\nUnder `--no-default-features --features alloc`, the traits are\nstandalone, with their own method bodies returning\n`crate::io::Result<T>` and a local `Error` type derived from `ErrorKind`\n+ optional message. Signatures match `std::io` so call sites compile in\nboth modes.\n\n## Why we own this module (vs. `core2` / `core3` / `embedded-io`)\n\n| Option | Problem |\n|--------|---------|\n| `core2` 0.4.x | Yanked, abandoned |\n| `core3` | Single low-trust maintainer, same yank risk as `core2` |\n| `embedded-io` | Doesn't allow std-mode trait to *be* `std::io::Read` —\ndesigned to replace, not bridge. Forces adapter shim in every backend |\n| Our own module | Three stable trait signatures (haven't moved since\nRust 1.0), full control of the bridge direction, zero external\nmaintainer dependency |\n\nMaintenance cost: near zero — these signatures have not meaningfully\nchanged since Rust 1.0. The contract is set by the OS, not by anything\nwe'd evolve.\n\n## Scope (intentionally narrow)\n\nThis commit migrates ONLY the trait *bounds*. Specifically:\n\n- ✅ `Fs` / `FsFile` no longer have `std::io::Read + std::io::Write +\nstd::io::Seek` directly in their bounds\n- ⏸ `io::Result<T>` return types in trait methods still resolve to\n`std::io::Result<T>` via `use std::io;` — migration deferred to a\nfollow-up so this diff stays scoped\n- ⏸ `&std::path::Path` arguments untouched — path migration is the\nsecond blocker called out in #311, deferred to a follow-up\n\nThe `StdFs` and `IoUringFs` backends are entirely unchanged. They keep\nusing `std::io::*` internally and satisfy the new trait bounds through\nthe supertrait alias.\n\n## Runtime backend selection: preserved\n\n`is_io_uring_available()` and caller-side fallback to `StdFs` continue\nto work as-is — there is no new compile-time gate on the runtime path.\n`IoUringFs` vs `StdFs` is still a runtime decision in the caller. Under\nno_std + alloc, both backends are unavailable (they require `std`); the\nconsumer brings their own `impl Fs`.\n\n## What's NOT covered by this PR\n\n- **no_std io_uring**: there is no no_std variant of the `io-uring`\ncrate, and we don't ship a raw-syscall driver. Tracked as roadmap issue\n#346 (P3/future).\n- **Backend migration** to use `crate::io::*` internally: backends still\nuse `std::io::*` — they don't need to migrate yet because supertrait\nalias makes them automatically satisfy our traits.\n\n## Test plan\n\n- [x] `cargo check --lib` (default features) — clean\n- [x] `cargo clippy --all-features --lib --tests -- -D warnings` — clean\n- [x] `cargo nextest run --lib --all-features` — 1042 passed, 1 skipped\n- [ ] CI to confirm across feature matrix\n\nCloses #311 (first slice — Read/Write/Seek bounds). Related: #274\n(broader no-std epic), #346 (no_std io_uring driver follow-up).\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n## Summary by CodeRabbit\n\n* **New Features**\n* Added a no_std + alloc-compatible I/O surface with Read/Write/Seek\ntraits, a Result alias, SeekFrom, and std-bridging when available.\n* Introduced Error and ErrorKind types for richer I/O error handling and\nconversion to/from std errors.\n\n* **Refactor**\n  * Filesystem interfaces updated to use the new crate-local I/O traits.\n\n* **Documentation**\n* Added module-level docs describing the new I/O API and migration\nscope.\n\n<!-- review_stack_entry_start -->\n\n[![Review Change\nStack](https://storage.googleapis.com/coderabbit_public_assets/review-stack-in-coderabbit-ui.svg)](https://app.coderabbit.ai/change-stack/structured-world/coordinode-lsm-tree/pull/347?utm_source=github_walkthrough&utm_medium=github&utm_campaign=change_stack)\n\n<!-- review_stack_entry_end -->\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-05-26T20:22:47+03:00",
+          "tree_id": "5212468571427eb8402df6d07f906ea3a38b61e6",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/f0b7aa5941503836e928e03e281da8b14adff1a7"
+        },
+        "date": 1779822814149,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 2015945.0975899366,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.6us | P99.9: 3.7us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1191266.4965244264,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.2us | P99.9: 4.4us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 527285.7705011568,
+            "unit": "ops/sec",
+            "extra": "P50: 1.8us | P99: 5.0us | P99.9: 7.5us\nthreads: 1 | elapsed: 0.38s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3630631.0020343694,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 3.1us | P99.9: 5.6us\nthreads: 1 | elapsed: 0.06s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 379048.5507633968,
+            "unit": "ops/sec",
+            "extra": "P50: 2.3us | P99: 5.8us | P99.9: 8.6us\nthreads: 1 | elapsed: 0.53s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 201379.03355281803,
+            "unit": "ops/sec",
+            "extra": "P50: 4.6us | P99: 5.9us | P99.9: 10.2us\nthreads: 1 | elapsed: 0.99s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1268047.0114988214,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.3us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1108545.100181881,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.5us | P99.9: 1.9us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 466166.46538764104,
+            "unit": "ops/sec",
+            "extra": "P50: 2.0us | P99: 5.5us | P99.9: 8.0us\nthreads: 1 | elapsed: 0.43s | num: 200000 | iterations: 3"
           }
         ]
       }
