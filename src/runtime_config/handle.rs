@@ -14,8 +14,13 @@
 //!   Cheap enough to call on every block write / manifest commit.
 //! - Update: `update(|cfg| ...)` clones the current snapshot,
 //!   applies the caller's mutator, and atomically swaps the new
-//!   snapshot in. Single-writer; concurrent readers may observe
-//!   either the old or the new snapshot, never a torn one.
+//!   snapshot in. Concurrent readers always observe either the old
+//!   or the new snapshot, never a torn one. Concurrent *writers*
+//!   are allowed but race **last-writer-wins** — two `update` calls
+//!   that load the same starting snapshot will see the second
+//!   `store` overwrite the first, losing the first writer's
+//!   mutation. Callers needing lost-update avoidance must serialize
+//!   at the call site (see [`RuntimeConfigHandle::update`]).
 
 use super::types::RuntimeConfig;
 use arc_swap::ArcSwap;
