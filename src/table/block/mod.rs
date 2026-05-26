@@ -1042,7 +1042,7 @@ mod tests {
         /// IS dead, and the suppression silences the warning.
         #[cfg_attr(
             not(feature = "page_ecc"),
-            allow(dead_code, reason = "drop guard; only read by page_ecc-gated tests")
+            expect(dead_code, reason = "drop guard; only read by page_ecc-gated tests")
         )]
         dir: tempfile::TempDir,
     }

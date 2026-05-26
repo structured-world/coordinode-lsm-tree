@@ -102,18 +102,19 @@ pub struct CompressionContext<'a> {
 // impl-level lifetime stays so method signatures stay valid across
 // the feature matrix without per-method `#[cfg]` gymnastics.
 //
-// `#[allow]` not `#[expect]` deliberately: under `--all-features`
-// `'a` IS used (by `with_dict`) so the lint does NOT fire and an
-// `#[expect]` would surface as unfulfilled-lint-expectation and
-// fail `-D warnings`. The lint only fires on `cargo build` /
-// `clippy` with the default feature set (no zstd backend), so
-// `#[allow]` is the cross-feature-matrix-stable choice — it
-// silences the lint when it would fire and is a no-op otherwise.
-#[allow(
-    clippy::elidable_lifetime_names,
-    reason = "lint fires under default features only (no zstd \
-              backend); under any zstd feature 'a is used by \
-              with_dict — #[expect] would be unfulfilled there"
+// Feature-gated `#[expect]` rather than blanket `#[allow]`: under
+// any zstd feature `'a` IS used by `with_dict` and the lint does
+// NOT fire — wrapping `#[expect]` in `cfg_attr(not(zstd_any), ..)`
+// keeps the stricter "lint expectation will self-expire if the
+// underlying code stops triggering" semantics, just feature-scoped
+// to the build where the lint actually fires.
+#[cfg_attr(
+    not(zstd_any),
+    expect(
+        clippy::elidable_lifetime_names,
+        reason = "'a kept for cross-feature-matrix signature stability; \
+                  used by with_dict under any zstd feature"
+    )
 )]
 impl<'a> CompressionContext<'a> {
     /// Constructs a [`CompressionContext`] for a non-dict codec

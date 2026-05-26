@@ -76,8 +76,12 @@ impl Header {
     #[must_use]
     pub const fn serialized_len() -> usize {
         MAGIC_BYTES.len()
-            // Block type
-            + std::mem::size_of::<BlockType>()
+            // Block type — encoded as a single u8 by encode_into,
+            // not as size_of::<BlockType>(). BlockType is a fieldless
+            // enum without `#[repr(u8)]`, so its in-memory size is
+            // implementation-defined; the wire format is the contract
+            // and that contract is 1 byte.
+            + 1
             // Data checksum
             + std::mem::size_of::<Checksum>()
             // On-disk size
@@ -97,9 +101,11 @@ impl Header {
     /// on-disk size when `ecc_length > 0`.
     #[must_use]
     pub fn on_disk_size(&self) -> u32 {
-        // serialized_len is a small constant (28 bytes); cast to
-        // u32 is safe by construction. data_length + ecc_length
-        // is already bounded by the writer's MAX_DECOMPRESSION_SIZE
+        // serialized_len is a small constant (37 bytes: 4 magic + 1
+        // block_type + 16 checksum + 4 data_length + 4 uncompressed +
+        // 4 ecc_length + 4 header checksum); cast to u32 is safe by
+        // construction. data_length + ecc_length is already bounded
+        // by the writer's MAX_DECOMPRESSION_SIZE / MAX_ECC_LENGTH
         // checks, well within u32.
         #[expect(
             clippy::cast_possible_truncation,
