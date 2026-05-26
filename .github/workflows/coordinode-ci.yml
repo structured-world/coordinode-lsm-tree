@@ -232,24 +232,26 @@ jobs:
     needs: [changes, lint]
     # `always() && !cancelled()` so the matrix entries still
     # emit their names to the ruleset even if `changes` or
-    # `lint` fails / is skipped — `!cancelled()` alone is NOT
+    # `lint` fails / is skipped. `!cancelled()` alone is NOT
     # enough because GitHub's default needs-gating skips this
-    # job when a dependency fails. `always()` overrides that
-    # gating; the `!cancelled()` half lets a user-cancelled
+    # job when a dependency fails; `always()` overrides that
+    # gating, the `!cancelled()` half lets a user-cancelled
     # workflow run still report cancellation honestly. Empty
     # `needs.changes.outputs.code` is treated as "run real
     # tests" via the `!= 'false'` step guards.
     #
-    # On `code == 'false'` (docs-only PR), the matrix collapses
-    # to ONLY the required entry `test (stable, ubuntu-latest)`
-    # — there's no point scheduling 6 runners just to emit 5
-    # non-required skip notices. The condition reads as: "run
-    # unless cancelled, AND (full matrix if code-touching) OR
-    # (only the required entry if docs-only)". The empty/unset
-    # branch of `code` takes the first half via `!= 'false'`,
-    # matching the same fail-safe-to-running posture as the
-    # step-level guards.
-    if: ${{ always() && !cancelled() && (needs.changes.outputs.code != 'false' || (matrix.rust == 'stable' && matrix.os == 'ubuntu-latest')) }}
+    # Matrix-aware skip (run only the required entry on docs-
+    # only PRs) was attempted via a job-level
+    # `matrix.rust == 'stable' && matrix.os == 'ubuntu-latest'`
+    # branch in this `if:`, but the `matrix` context is NOT
+    # available at job-level expression evaluation — only at
+    # step-level and in job names. All 6 matrix entries run on
+    # docs-only PRs and emit the skip notice from their own
+    # step-level guards; if optimising runner-minute waste is
+    # later required, the right shape is a dynamic matrix via
+    # `fromJSON(needs.changes.outputs.matrix)` (with `changes`
+    # emitting two pre-baked JSON values), not job-level `if:`.
+    if: ${{ always() && !cancelled() }}
     timeout-minutes: 20
     strategy:
       fail-fast: true
