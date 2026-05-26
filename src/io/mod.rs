@@ -216,6 +216,11 @@ impl From<std::io::Error> for Error {
             std::io::ErrorKind::UnexpectedEof => (ErrorKind::UnexpectedEof, true),
             std::io::ErrorKind::Unsupported => (ErrorKind::Unsupported, true),
             std::io::ErrorKind::WriteZero => (ErrorKind::WriteZero, true),
+            // `Other` is a mapped kind: a kind-only `Other` std error
+            // would otherwise fall through to the unmapped branch and
+            // attach Display ("other error"), producing
+            // "other error: other error" on render plus a heap alloc.
+            std::io::ErrorKind::Other => (ErrorKind::Other, true),
             _ => (ErrorKind::Other, false),
         };
         // Message-attachment policy:
@@ -581,6 +586,29 @@ mod tests {
         assert_eq!(as_std.kind(), std::io::ErrorKind::WriteZero);
         let back: Error = as_std.into();
         assert_eq!(back.kind(), ErrorKind::WriteZero);
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn kind_only_other_std_error_skips_message_attachment() {
+        // A kind-only `std::io::Error::from(ErrorKind::Other)` carries
+        // no `raw_os_error` and no `get_ref` payload. Without an
+        // explicit `Other => mapped=true` arm in the `From` impl, it
+        // would fall through to the unmapped branch and attach
+        // Display ("other error") as the message, producing the
+        // doubled render "other error: other error" plus a heap alloc.
+        let std_err = std::io::Error::from(std::io::ErrorKind::Other);
+        let ours: Error = std_err.into();
+        assert_eq!(ours.kind(), ErrorKind::Other);
+        // Display includes the message only when one is attached
+        // ("<kind>: <message>"); a kind-only error renders as just
+        // "<kind>". The doubled "other error: other error" rendering
+        // was the symptom the explicit Other arm fixes.
+        let rendered = alloc::format!("{ours}");
+        assert!(
+            !rendered.contains(':'),
+            "kind-only Other must not attach a message, got: {rendered:?}"
+        );
     }
 
     #[cfg(feature = "std")]
