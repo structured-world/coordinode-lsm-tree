@@ -319,7 +319,7 @@ jobs:
 
   test-zstd:
     needs: [changes, lint]
-    if: needs.changes.outputs.code != 'false'
+    if: ${{ always() && !cancelled() && needs.changes.outputs.code != 'false' }}
     timeout-minutes: 15
     strategy:
       fail-fast: true
@@ -363,7 +363,7 @@ jobs:
     # `#[cfg(feature = "std")]`); reviewers should request the error count
     # from this job and compare against main.
     needs: [changes, lint]
-    if: needs.changes.outputs.code != 'false'
+    if: ${{ always() && !cancelled() && needs.changes.outputs.code != 'false' }}
     continue-on-error: true
     timeout-minutes: 10
     runs-on: ubuntu-latest
@@ -412,7 +412,7 @@ jobs:
     # cross-matrix]`) starts immediately rather than waiting for
     # serial chain.
     needs: changes
-    if: needs.changes.outputs.code != 'false'
+    if: ${{ always() && !cancelled() && needs.changes.outputs.code != 'false' }}
     runs-on: ubuntu-latest
     outputs:
       targets: ${{ steps.set.outputs.targets }}
@@ -429,7 +429,7 @@ jobs:
 
   cross:
     needs: [changes, lint, cross-matrix]
-    if: needs.changes.outputs.code != 'false'
+    if: ${{ always() && !cancelled() && needs.changes.outputs.code != 'false' }}
     timeout-minutes: 15
     strategy:
       fail-fast: true
@@ -456,7 +456,7 @@ jobs:
 
   codecov:
     needs: [changes, lint]
-    if: needs.changes.outputs.code != 'false'
+    if: ${{ always() && !cancelled() && needs.changes.outputs.code != 'false' }}
     timeout-minutes: 20
     runs-on: ubuntu-latest
     steps:
