@@ -125,10 +125,14 @@ pub enum Error {
     /// downgrade integrity guarantees — return this error instead.
     PageEccUnsupported,
 
-    /// Block payload failed the XXH3 integrity check and Reed-Solomon
-    /// recovery could not reconstruct it. Either the block was written
-    /// without parity (`Config::page_ecc(false)`), or more shards are
-    /// corrupted than the configured RS scheme can recover.
+    /// Block payload failed the XXH3 integrity check and the
+    /// attached Reed-Solomon parity trailer could not reconstruct
+    /// it (more shards are corrupted than the (4, 2) RS scheme
+    /// can recover). Surfaced ONLY by ECC-protected blocks
+    /// (`header.ecc_length > 0`); a block written without parity
+    /// (`Config::page_ecc(false)`) on a checksum mismatch returns
+    /// [`Self::ChecksumMismatch`] instead, because there's no
+    /// parity to even attempt recovery from.
     PageEccUnrecoverable {
         /// XXH3 checksum recomputed from the on-disk bytes.
         got: Checksum,
