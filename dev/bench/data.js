@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779822815925,
+  "lastUpdate": 1779822873220,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -10608,6 +10608,84 @@ window.BENCHMARK_DATA = {
             "value": 466166.46538764104,
             "unit": "ops/sec",
             "extra": "P50: 2.0us | P99: 5.5us | P99.9: 8.0us\nthreads: 1 | elapsed: 0.43s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "b4ec24dd09907a7da6f8252e2d4fed9e680e706e",
+          "message": "feat(version): PointInTimeRecovery + SkipAnyCorruptedRecords + per-record framing (#323) (#342)\n\n## Summary\n\nCloses #323 (T3, ManifestRecoveryMode follow-up). Wires the two\nremaining variants of ManifestRecoveryMode end-to-end and adds the\nper-record framing they need to work safely. Pre-release V5 manifest\nlayout amended in place — no format-version bump because V5 has not yet\nshipped to crates.io. (Policy tracked in #351.)\n\n### Per-record framing\n\nEach table / blob record in the manifest is now wrapped in a 12-byte\nheader:\n\n```\n+----------------+-----------------+-------------------+\n| len: u32 LE    | xxh3_64: u64 LE | payload: [u8; len] |\n+----------------+-----------------+-------------------+\n```\n\nMAX_FRAME_PAYLOAD = 64 KiB caps the length field so a forged header\ncannot trigger an oversized allocation. The level / run / count headers\nstay unframed because they ARE the section structural shape — only the\nper-record payloads sit behind the framing.\n\n### Four-mode dispatch\n\n| Mode | On ChecksumMismatch | On BadHeader | On TailTruncation |\n|------|---------------------|--------------|-------------------|\n| AbsoluteConsistency | abort | abort | abort |\n| TolerateCorruptedTailRecords | abort | abort | tolerate |\n| PointInTimeRecovery | drop in-progress run + level + every level not\nyet read | same | tolerate |\n| SkipAnyCorruptedRecords | skip via framing length, continue | drop\nrest of section | tolerate |\n\nPIT semantic adapts RocksDB kPointInTimeRecovery to lsm-tree\nlevel/run/table nesting. Per-level granularity preserves the LSM\nseqno-monotone invariant — finer granularities risk reordering seqnos\nacross runs in the same level.\n\nSkipAny matches RocksDB / LevelDB / Cassandra industry convention\n(per-record length-prefix + checksum). False-positive collision rate is\napproximately 2^-64 per record (XXH3-64).\n\n### Test plan\n\n- 1437 of 1437 workspace tests passing (1 slow, 2 skipped) — including 5\nnew integration tests covering the corruption matrix.\n- Lint pass clean.\n- 43 of 43 doctests passing.\n- 6 framing unit tests in src/version/framing.rs cover the ok /\nchecksum-mismatch / oversized-len / len-exceeding-section /\nEOF-at-header / EOF-mid-payload outcomes.\n- README and ManifestRecoveryMode enum docstrings rewritten to describe\nthe actual wired behaviour for all 4 modes.\n\n### Commits in order\n\n1. framing helpers + 6 unit tests\n2. writer integration + reader 4-mode dispatch\n3. 5 corruption-matrix integration tests\n4. README + Config enum docs marked implemented\n\n### Out of scope\n\nCatastrophic corruption beyond what SkipAny can salvage is still handled\nby repair_db (#303); SkipAny BadHeader path explicitly drops the rest of\nthe section rather than trying a best-effort byte scan, because\nphantom-record false positives would silently corrupt recovery state.\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n## Summary by CodeRabbit\n\n* **Documentation**\n* Clarified recovery modes with concrete semantics for point-in-time\nprefix acceptance and per-record skipping, applied symmetrically to\ntable and blob sections.\n\n* **New Features**\n* Introduced length‑prefixed framed records for manifest entries to\nenable per-record validation and safe skipping.\n* Added recovery telemetry reporting counts for tail vs corruption drops\nfor tables and blobs.\n\n* **Bug Fixes**\n* Improved detection/reporting of per-record checksum mismatches and\nhandling of truncated or malformed records.\n\n* **Tests**\n* Added tests covering both recovery modes, framed records, and\nmid-record corruption scenarios.\n\n<!-- review_stack_entry_start -->\n\n[![Review Change\nStack](https://storage.googleapis.com/coderabbit_public_assets/review-stack-in-coderabbit-ui.svg)](https://app.coderabbit.ai/change-stack/structured-world/coordinode-lsm-tree/pull/342?utm_source=github_walkthrough&utm_medium=github&utm_campaign=change_stack)\n\n<!-- review_stack_entry_end -->\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-05-26T20:43:49+03:00",
+          "tree_id": "2c2f35d60588d25a206e049f6ebdd6a39590c006",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/b4ec24dd09907a7da6f8252e2d4fed9e680e706e"
+        },
+        "date": 1779822872285,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 1965949.7116747983,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.6us | P99.9: 3.7us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1160423.8715088177,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.2us | P99.9: 4.3us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 515372.8253788875,
+            "unit": "ops/sec",
+            "extra": "P50: 1.8us | P99: 5.1us | P99.9: 7.8us\nthreads: 1 | elapsed: 0.39s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3629209.0137140006,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 3.1us | P99.9: 5.5us\nthreads: 1 | elapsed: 0.06s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 380791.2163286152,
+            "unit": "ops/sec",
+            "extra": "P50: 2.3us | P99: 5.7us | P99.9: 8.6us\nthreads: 1 | elapsed: 0.53s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 199326.96890161824,
+            "unit": "ops/sec",
+            "extra": "P50: 4.7us | P99: 6.0us | P99.9: 9.4us\nthreads: 1 | elapsed: 1.00s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1225802.3926253032,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.2us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1121787.6628709487,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.5us | P99.9: 1.9us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 444739.24331095617,
+            "unit": "ops/sec",
+            "extra": "P50: 2.0us | P99: 6.5us | P99.9: 9.8us\nthreads: 1 | elapsed: 0.45s | num: 200000 | iterations: 3"
           }
         ]
       }
