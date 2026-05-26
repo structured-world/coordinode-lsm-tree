@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779803931272,
+  "lastUpdate": 1779807958061,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -10296,6 +10296,84 @@ window.BENCHMARK_DATA = {
             "value": 473548.953604915,
             "unit": "ops/sec",
             "extra": "P50: 1.9us | P99: 5.4us | P99.9: 8.0us\nthreads: 1 | elapsed: 0.42s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "f081c29dfa89f74e10356c3852b2c926d0c01c8f",
+          "message": "feat(encryption): top-level encrypt_block/decrypt_block + KeyChain + wire format (#251) (#344)\n\n## Summary\n\nCP1 #251 residual — top-level `encrypt_block` / `decrypt_block` +\n`KeyChain` trait + RFC 8878 skippable-frame wire format per\n[`docs/aad-block-format.md`](docs/aad-block-format.md).\n\nPR1 (AAD foundation: `SuiteId`, `EncryptionContext`, AAD constructor,\n`DecryptError` taxonomy) shipped via #336. PR2 (AEAD suite dispatch:\nAES-256-GCM + ChaCha20-Poly1305 in-place encrypt/decrypt) shipped via\n#338. This PR adds:\n\n## Changes\n\n- **`encryption::block`** — top-level encode/decode entry points\n- `encrypt_block(plaintext, identity, ctx, key_chain) ->\nResult<Vec<u8>>`\n- `decrypt_block(bytes, identity, key_chain) -> Result<DecryptedBlock,\nDecryptError>` where `DecryptedBlock { plaintext, compression_type,\ndict_id, window_log }` returns the recovered plaintext alongside the\ncodec discriminators parsed from the on-disk `MetadataPayload`. The\ncaller threads `dict_id` / `window_log` into\n`structured_zstd::decoding::FrameDecoder::expect_dict_id` /\n`expect_window_log` so a zstd frame whose inner header disagrees with\nthe AAD-bound codec context fails before any payload is materialised\n(defence against crafted-window-log DoS).\n- Both functions wire AAD construction (`aad::build`) ↔ AEAD primitive\n(`aead::encrypt_in_place` / `decrypt_in_place`) ↔\n`SkippableFrame::encode_into` / `decode_from` from `structured-zstd\n0.0.25`.\n\n- **`encryption::key_chain`** — `KeyChain` trait + `StaticKeyChain`\nreference impl\n  - `fn key(&self, epoch: u8) -> Option<&[u8; 32]>`\n- Decouples key lookup from the LSM crate; KMS-backed / file-backed /\nhot-rotation chains implement `KeyChain` outside the LSM.\n\n- **Wire format** (per `docs/aad-block-format.md` §5):\n- `MetadataFrame` (magic `0x184D2A50`, 38-byte payload for v1):\n`HeaderByte` / `KeyEpoch` / `BlockType` / `SuiteID` / `CompressionType`\n/ `DictID` (u32 BE) / `WindowLog` / 12-byte `Nonce` / 16-byte `AEADTag`.\n- `BodyFrame` (magic `0x184D2A51`, variable payload): AEAD ciphertext\nover the block's plaintext.\n\n- **Cargo.toml** — `structured-zstd` feature set adds `lsm` so the\nskippable-frame module is in scope.\n\n- **Encode-path validation** — `encrypt_block` enforces the spec §5.1\ncross-field invariants (`CompressionType` ∈ {0,1,3,4}; `DictID != 0` ⟹\n`CompressionType == 4`; `WindowLog != 0` ⟹ `CompressionType ∈ {3,4}`;\n`WindowLog == 0` or in `10..=31`) so the encoder cannot produce blocks\nthat `decrypt_block` would later reject as `MalformedMetadataFrame`.\n\n## Tests (6 new)\n\n1. `roundtrip_aes_recovers_plaintext` — happy path AES-256-GCM\n2. `roundtrip_chacha_recovers_plaintext` — happy path ChaCha20-Poly1305\n3. `wrong_key_in_chain_surfaces_aead_failure` — tampering / wrong-key\npath\n4. `missing_key_epoch_surfaces_unknown_key_epoch` — key rotation drift\n(distinct from AEAD failure)\n5. `cross_identity_substitution_surfaces_aead_failure` — AAD-bound\nidentity defence\n6. `truncated_input_surfaces_malformed_metadata` — DoS guard / partial\ninput\n\n## Test plan\n\n- [x] Full test suite green on \\`--all-features\\`\n- [x] Full test suite green on default features\n- [x] Clippy clean on \\`--all-features\\`\n- [x] Clippy clean on default features\n- [x] AES-256-GCM round-trip\n- [x] ChaCha20-Poly1305 round-trip\n- [x] Wrong-key + missing-epoch + identity-substitution all surface\ntyped errors\n- [x] Malformed input rejected before AEAD work\n\nBlock I/O integration (replacing \\`Aes256GcmProvider\\` with\n\\`encrypt_block\\` / \\`decrypt_block\\` at the \\`Block::write_into\\` /\n\\`Block::from_reader\\` sites) is a separate follow-up slice of the #251\nresidual.\n\nPart of #251.",
+          "timestamp": "2026-05-26T18:05:02+03:00",
+          "tree_id": "9e637927257c0cb2d4b52d4e2d9e50ff44457832",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/f081c29dfa89f74e10356c3852b2c926d0c01c8f"
+        },
+        "date": 1779807956111,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 2140981.696415625,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.6us | P99.9: 3.7us\nthreads: 1 | elapsed: 0.09s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1118432.188022051,
+            "unit": "ops/sec",
+            "extra": "P50: 0.8us | P99: 2.3us | P99.9: 4.4us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 533312.8441649444,
+            "unit": "ops/sec",
+            "extra": "P50: 1.7us | P99: 4.9us | P99.9: 7.4us\nthreads: 1 | elapsed: 0.38s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3638642.551272067,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 3.1us | P99.9: 5.5us\nthreads: 1 | elapsed: 0.05s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 383016.5850011471,
+            "unit": "ops/sec",
+            "extra": "P50: 2.3us | P99: 5.7us | P99.9: 8.4us\nthreads: 1 | elapsed: 0.52s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 202099.30920162288,
+            "unit": "ops/sec",
+            "extra": "P50: 4.6us | P99: 5.8us | P99.9: 8.1us\nthreads: 1 | elapsed: 0.99s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1199778.5232841587,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.2us | P99.9: 4.2us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1121606.8840103028,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 1.4us | P99.9: 1.8us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 466742.7821460935,
+            "unit": "ops/sec",
+            "extra": "P50: 2.0us | P99: 5.5us | P99.9: 8.0us\nthreads: 1 | elapsed: 0.43s | num: 200000 | iterations: 3"
           }
         ]
       }
