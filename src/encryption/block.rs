@@ -334,6 +334,46 @@ pub fn encrypt_block(
         return Err(crate::Error::Encrypt("plaintext exceeds 256 MiB body cap"));
     }
 
+    // Spec §5.1 cross-field invariants. The read path enforces
+    // these in `decode_metadata_payload`, so producing a block
+    // here with an invalid combination yields output that
+    // `decrypt_block` is guaranteed to reject as
+    // `MalformedMetadataFrame`. Mirror the checks on the encode
+    // path so the failure surfaces at write time (a caller bug)
+    // rather than as silent "unreadable later" data corruption.
+    //
+    // Valid `CompressionType` tags per spec: 0 = None, 1 = Lz4,
+    // 3 = Zstd, 4 = ZstdDict.
+    if !matches!(ctx.compression_type, 0 | 1 | 3 | 4) {
+        return Err(crate::Error::Encrypt(
+            "invalid CompressionType (spec §5.1: must be 0=None, 1=Lz4, 3=Zstd, or 4=ZstdDict)",
+        ));
+    }
+    // `DictID` is non-zero ONLY when `CompressionType == 4`
+    // (ZstdDict); other codecs must record `DictID = 0`.
+    if identity.dict_id != 0 && ctx.compression_type != 4 {
+        return Err(crate::Error::Encrypt(
+            "non-zero DictID with non-ZstdDict CompressionType (spec §5.1)",
+        ));
+    }
+    // `WindowLog` is non-zero ONLY when `CompressionType` is a
+    // zstd-family codec (tags 3 or 4); non-zstd codecs must
+    // record `WindowLog = 0`.
+    if identity.window_log != 0 && !matches!(ctx.compression_type, 3 | 4) {
+        return Err(crate::Error::Encrypt(
+            "non-zero WindowLog with non-zstd CompressionType (spec §5.1)",
+        ));
+    }
+    // Spec §5.1: WindowLog values are 0 (no zstd / no window
+    // enforcement) or 10..=31 (RFC 8878 §3.1.1.1.2 decoded
+    // window-descriptor range). Any other value is structurally
+    // invalid.
+    if identity.window_log != 0 && !(10..=31).contains(&identity.window_log) {
+        return Err(crate::Error::Encrypt(
+            "WindowLog outside valid range (spec §5.1: must be 0 or 10..=31)",
+        ));
+    }
+
     // CSPRNG-derived 12-byte nonce. `<[u8; 12]>::generate()`
     // pulls fresh entropy from getrandom's OS-backed `SysRng`
     // (same path the legacy `Aes256GcmProvider` uses to seed its
