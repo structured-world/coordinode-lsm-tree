@@ -185,9 +185,21 @@ impl fmt::Display for Error {
 #[cfg(feature = "std")]
 impl std::error::Error for Error {}
 
-/// Bridge from `std::io::Error`. Preserves the platform error's
-/// `ErrorKind` mapping and its `Display` message so `?` from std-backed
-/// backends propagates the original context.
+/// Bridge from `std::io::Error`. Maps the std `ErrorKind` to
+/// this crate's [`ErrorKind`] when a variant exists for it, and
+/// falls back to [`ErrorKind::Other`] for any std variant we
+/// don't track (the std type is `#[non_exhaustive]`, so the
+/// catch-all is required). The `Display` message is captured via
+/// the tri-state policy documented on [`Error`]: kept for
+/// contextful std errors and for unmapped kinds (so the
+/// discriminant is preserved even in the `Other` bucket),
+/// dropped for plain kind-only errors whose kind we DO map (to
+/// avoid the redundant `"<kind>: <kind>"` render and the heap
+/// allocation). Net effect: `?` from std-backed backends
+/// propagates the original context to operators, but callers
+/// inspecting `err.kind()` after the conversion should be aware
+/// that an unknown std kind now reads as
+/// `ErrorKind::Other` rather than the originating variant.
 #[cfg(feature = "std")]
 impl From<std::io::Error> for Error {
     fn from(err: std::io::Error) -> Self {
