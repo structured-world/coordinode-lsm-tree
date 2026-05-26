@@ -83,7 +83,7 @@ ribbon-serde = ["dep:serde"]
 # because rocksdb pulls in a sizeable C dependency tree (libsnappy,
 # liblz4, libbz2, librocksdb itself) — regular `cargo test` / CI
 # `cargo check` doesn't pay that compile cost.
-compare-rocksdb = ["dep:rocksdb"]
+compare-rocksdb = ["dep:rocksdb", "std"]
 
 [dependencies]
 bytes = { version = "1", optional = true }

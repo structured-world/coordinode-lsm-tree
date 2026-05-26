@@ -2,9 +2,13 @@
 //!
 //! Each criterion group runs the same workload through both engines
 //! and produces side-by-side timings for the gh-pages dashboard
-//! (see `docs/BENCHMARKS.md`). The harness intentionally mirrors
+//! (per [#244]). The harness intentionally mirrors
 //! `structured-zstd`'s `compare_ffi.rs` shape so the merge / chart
-//! scripts in `.github/scripts/` are byte-for-byte reusable.
+//! scripts in `.github/scripts/` are byte-for-byte reusable. The
+//! `docs/BENCHMARKS.md` operator guide lands in a follow-up commit
+//! on this branch alongside the gh-pages workflow port.
+//!
+//! [#244]: https://github.com/structured-world/coordinode-lsm-tree/issues/244
 //!
 //! Run locally:
 //!
@@ -41,11 +45,10 @@
 //!   values, random keys.
 //!
 //! Follow-up commits expand to point reads, range scans, mixed
-//! YCSB-A/C, bloom-filter probes per `docs/BENCHMARKS.md` §Workloads.
+//! YCSB-A/C, bloom-filter probes per [#244]'s workload list.
 
 #![cfg(feature = "compare-rocksdb")]
 
-use std::path::PathBuf;
 use std::time::Duration;
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
@@ -95,13 +98,38 @@ fn value_for(i: u64) -> Vec<u8> {
     v
 }
 
-/// Workload: bulk-insert `n_keys` (key, value) pairs into a
-/// freshly-opened engine, returning total wall time including the
-/// final flush. Per-iteration setup (tempdir + engine open) lives
-/// inside the criterion `iter_custom` closure so the timing loop
-/// sees a cold engine on every iteration — measuring steady-state
-/// write throughput, not first-key path overhead.
-fn run_write_throughput(engine: Engine, n_keys: u64) -> Duration {
+/// Precomputed (key, value) workload for a given `n_keys`. Built
+/// ONCE outside the timing loop so the bench measures engine
+/// write throughput, not the per-key
+/// `key_for(i)` / `value_for(i)` allocation + fill cost (which
+/// otherwise dominates at the 1k / 10k scale).
+struct WorkloadInputs {
+    keys: Vec<[u8; 16]>,
+    values: Vec<Vec<u8>>,
+}
+
+impl WorkloadInputs {
+    fn build(n_keys: u64) -> Self {
+        let n = usize::try_from(n_keys).expect("n_keys fits in usize");
+        let mut keys = Vec::with_capacity(n);
+        let mut values = Vec::with_capacity(n);
+        for i in 0..n_keys {
+            keys.push(key_for(i));
+            values.push(value_for(i));
+        }
+        Self { keys, values }
+    }
+}
+
+/// Workload: bulk-insert `inputs.keys.len()` (key, value) pairs
+/// into a freshly-opened engine, returning total wall time
+/// including the final flush. Per-iteration setup (tempdir +
+/// engine open) lives inside the criterion `iter_custom` closure
+/// so the timing loop sees a cold engine on every iteration —
+/// measuring steady-state write throughput, not first-key path
+/// overhead. Keys / values are precomputed in `inputs` so the
+/// timed body does NO per-key allocation.
+fn run_write_throughput(engine: Engine, inputs: &WorkloadInputs) -> Duration {
     let dir = tempfile::tempdir().expect("tempdir");
     let start = std::time::Instant::now();
     match engine {
@@ -113,8 +141,8 @@ fn run_write_throughput(engine: Engine, n_keys: u64) -> Duration {
             )
             .open()
             .expect("open ours");
-            for i in 0..n_keys {
-                tree.insert(key_for(i), value_for(i), i);
+            for (i, (key, value)) in inputs.keys.iter().zip(inputs.values.iter()).enumerate() {
+                tree.insert(key, value, i as u64);
             }
             tree.flush_active_memtable(0).expect("flush ours");
         }
@@ -122,8 +150,8 @@ fn run_write_throughput(engine: Engine, n_keys: u64) -> Duration {
             let mut opts = rocksdb::Options::default();
             opts.create_if_missing(true);
             let db = rocksdb::DB::open(&opts, dir.path()).expect("open rocksdb");
-            for i in 0..n_keys {
-                db.put(key_for(i), value_for(i)).expect("put rocksdb");
+            for (key, value) in inputs.keys.iter().zip(inputs.values.iter()) {
+                db.put(key, value).expect("put rocksdb");
             }
             db.flush().expect("flush rocksdb");
         }
@@ -136,13 +164,17 @@ fn run_write_throughput(engine: Engine, n_keys: u64) -> Duration {
 fn bench_write_throughput(c: &mut Criterion) {
     let mut group = c.benchmark_group("write_throughput");
     for &n in &[1_000_u64, 10_000_u64] {
+        // Precompute the keys + values ONCE per `n` (outside the
+        // criterion warmup / measurement loop), so the timed body
+        // does no per-iteration allocation.
+        let inputs = WorkloadInputs::build(n);
         group.throughput(Throughput::Elements(n));
         for engine in [Engine::Ours, Engine::RocksDb] {
-            group.bench_with_input(BenchmarkId::new(engine.label(), n), &n, |b, &n_keys| {
+            group.bench_with_input(BenchmarkId::new(engine.label(), n), &n, |b, _| {
                 b.iter_custom(|iters| {
                     let mut total = Duration::ZERO;
                     for _ in 0..iters {
-                        total += run_write_throughput(engine, n_keys);
+                        total += run_write_throughput(engine, &inputs);
                     }
                     total
                 });
@@ -154,11 +186,3 @@ fn bench_write_throughput(c: &mut Criterion) {
 
 criterion_group!(benches, bench_write_throughput);
 criterion_main!(benches);
-
-// Suppress "unused" on the path module — kept for follow-up
-// workloads that need to inspect on-disk artefacts (e.g. range
-// scan after explicit compaction file count check).
-#[allow(dead_code)]
-fn _unused_path_anchor() -> PathBuf {
-    PathBuf::new()
-}
