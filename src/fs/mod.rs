@@ -50,7 +50,28 @@ pub use std_fs::StdFs;
 #[cfg(all(target_os = "linux", feature = "io-uring"))]
 pub use io_uring_fs::{IoUringFs, is_io_uring_available};
 
-use std::io::{self, Read, Seek, Write};
+// `Read` / `Write` / `Seek` come from `crate::io`, the local mirror
+// of `std::io` that compiles under `no_std + alloc`. Under `feature =
+// "std"` the blanket impls in `crate::io` forward to `std::io::*`, so
+// existing std-backed backends (`std_fs`, `io_uring_fs`) satisfy
+// these bounds without any change to their own impls.
+//
+// `io::{Result, Error, ErrorKind}` are still re-exported from
+// `std::io` here. The trait *bounds* are what blocked no-std for this
+// module; the surrounding `io::Result<T>` return type still uses
+// `std::io::Result<T>` and will be migrated to `crate::io::Result<T>`
+// in a follow-up so we keep the diff scoped to what this issue
+// actually unblocks. `std::path::Path` likewise stays for now — the
+// path migration is the second blocker tracked separately.
+use crate::io::{Read, Seek, Write};
+use std::io;
+// `Read::take` is an inherent method on `std::io::Read`, not on our
+// supertrait alias. The supertrait relationship lets a value bounded
+// on `crate::io::Read` flow into APIs expecting `std::io::Read`, but
+// the std-specific helper methods (`take`, `chain`, `bytes`) are not
+// re-exported on the alias trait. Bring `std::io::Read` into scope
+// anonymously here so those helpers resolve on receivers below.
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
 
 /// Options for opening a file through the [`Fs`] trait.

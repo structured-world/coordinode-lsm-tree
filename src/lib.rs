@@ -152,6 +152,16 @@ pub mod file;
 pub mod fs;
 
 pub mod hash;
+
+/// Local I/O trait surface mirroring `std::io::{Read, Write, Seek}`.
+///
+/// Also re-exports `Error` / `ErrorKind` / `SeekFrom`, so traits in
+/// [`fs`] do not depend directly on `std::io` and compile under
+/// `--no-default-features --features alloc`. Under the `std` feature,
+/// blanket impls forward from `std::io` types so existing std-backed
+/// backends satisfy the trait surface automatically.
+pub mod io;
+
 mod heap;
 mod ingestion;
 mod iter_guard;
