@@ -1,0 +1,42 @@
+# Standalone head-to-head benchmark crate — NOT part of the main
+# `coordinode-lsm-tree` crate's workspace or feature graph. Lives
+# here so the main crate's `cargo build --all-features` /
+# `cargo clippy --all-features` / docs.rs build do NOT have to
+# pull in RocksDB's C dependency tree (libsnappy, liblz4, libbz2,
+# librocksdb itself, plus bindgen + libclang). Build / run with:
+#
+#     cd tools/compare-rocksdb && cargo bench
+#
+# Each criterion group runs the same workload through this crate
+# and through RocksDB side-by-side; results land in
+# `tools/compare-rocksdb/target/criterion/`. The gh-pages
+# dashboard pipeline consumes those JSON outputs (per #244).
+[package]
+name = "compare-rocksdb-bench"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+# Local path dep on the main crate. Default features only — the
+# initial workload (write_throughput) runs with
+# `DBCompressionType::None` on both engines, so no compression
+# codec is needed yet. Future `*_lz4` / `*_zstd` workload variants
+# will add the matching feature here AND set the matching
+# RocksDB compression type on the rocksdb side, so the two
+# engines stay aligned per-variant.
+lsm-tree = { package = "coordinode-lsm-tree", path = "../.." }
+# RocksDB binding — the whole reason this crate exists outside the
+# main `--all-features` graph. `default-features = false` strips
+# the upstream default compression codecs (snappy, lz4, bz2, zlib,
+# zstd); the matching `*_lz4` / `*_zstd` features land alongside
+# the corresponding workload variants so the C-toolchain compile
+# burden scales with the workloads that actually need each codec.
+rocksdb = { version = "0.24", default-features = false }
+criterion = { version = "0.8", features = ["html_reports"] }
+tempfile = "3"
+
+[[bench]]
+name = "compare"
+harness = false
+path = "benches/compare.rs"
