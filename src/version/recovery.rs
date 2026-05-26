@@ -715,14 +715,22 @@ pub fn recover(folder: &Path, fs: &dyn Fs, mode: ManifestRecoveryMode) -> crate:
                         "blob_files: corrupted framing header in version \
                          #{curr_version_id}; remaining records unrecoverable"
                     );
-                    // Same accounting fix as the TailTruncation arm in
-                    // this section: subtract BOTH recovered AND
-                    // already-corrupted records from the corruption
-                    // count, otherwise previously-skipped records get
-                    // re-attributed here.
+                    // Accumulator (saturating_add), NOT overwrite: the
+                    // ChecksumMismatch arm above has already counted
+                    // each skipped record in blob_dropped_to_corruption.
+                    // This branch adds the still-unread tail
+                    // (blob_file_count - processed where processed =
+                    // recovered + blob_corrupted) on top, so total
+                    // becomes (already-counted skips) + (unread tail)
+                    // = blob_file_count - recovered. Previous '='
+                    // assignment dropped the earlier skips' contribution
+                    // — under-reporting multi-corruption cases by K
+                    // when K records skipped earlier in the same
+                    // section before BadHeader fired.
                     let recovered = u32::try_from(blob_file_ids.len()).unwrap_or(u32::MAX);
                     let processed = recovered.saturating_add(blob_corrupted);
-                    blob_dropped_to_corruption = blob_file_count.saturating_sub(processed);
+                    blob_dropped_to_corruption = blob_dropped_to_corruption
+                        .saturating_add(blob_file_count.saturating_sub(processed));
                     break;
                 }
                 // Strict mode: same Tail vs BadHeader split as the
@@ -1929,6 +1937,97 @@ mod tests {
         assert_eq!(
             recovery.stats.tables_dropped_to_tail, 1,
             "exactly one trailing record was truncated; the previously-skipped \
+             corrupt record must NOT be re-counted here as tail (pre-fix value \
+             would be 2)",
+        );
+        Ok(())
+    }
+
+    /// Companion fixture for the blob-side accounting regression
+    /// test below. Mirrors `write_manifest_skip_any_then_tail_truncated`
+    /// (a good record + a corrupt record + truncated tail) but in
+    /// the `blob_files` section so the read path's `SkipAny` +
+    /// `TailTruncation` arm fires on blob counters instead of table
+    /// counters.
+    fn write_manifest_blob_skip_any_then_tail_truncated(
+        folder: &Path,
+        id: u64,
+        fs: &dyn Fs,
+    ) -> crate::Result<()> {
+        let path = folder.join(format!("v{id}"));
+        let file = fs.open(
+            &path,
+            &FsOpenOptions::new().write(true).create(true).truncate(true),
+        )?;
+        let mut w = sfa::Writer::from_writer(std::io::BufWriter::new(file));
+
+        w.start("tree_type")?;
+        w.write_u8(0)?;
+
+        w.start("tables")?;
+        w.write_u8(0)?; // 0 levels — focus is on blob_files
+
+        w.start("blob_files")?;
+        w.write_u32::<LittleEndian>(3)?; // declared 3...
+        // ...but only 2 written: good, bad. The third is implicitly
+        // truncated (reader hits UnexpectedEof at the 3rd frame
+        // header).
+        crate::version::framing::write_framed_record(&mut w, &mut Vec::new(), |payload| {
+            payload.write_u64::<LittleEndian>(10)?;
+            payload.write_u8(0)?;
+            payload.write_u128::<LittleEndian>(0)?;
+            Ok(())
+        })?;
+        // Corrupt second blob record (wrong xxh3, correct length).
+        let mut payload: Vec<u8> = Vec::new();
+        payload.write_u64::<LittleEndian>(11)?;
+        payload.write_u8(0)?;
+        payload.write_u128::<LittleEndian>(0)?;
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "payload is 25 bytes — fits in u32"
+        )]
+        let len = payload.len() as u32;
+        w.write_u32::<LittleEndian>(len)?;
+        w.write_u64::<LittleEndian>(0xDEAD_BEEF_DEAD_BEEF)?;
+        w.write_all(&payload)?;
+
+        w.start("blob_gc_stats")?;
+        w.write_u32::<LittleEndian>(0)?;
+        w.finish().map_err(|e| match e {
+            sfa::Error::Io(e) => crate::Error::from(e),
+            _ => crate::Error::Unrecoverable,
+        })?;
+        Ok(())
+    }
+
+    /// Regression test for the blob-side counterpart of the
+    /// accounting fix from `fd44c376` / 52db0ccd. Manifest declares
+    /// 3 blob records: 1 good (id=10) + 1 corrupt (id=11) +
+    /// 1 truncated (never written to disk). Under
+    /// `SkipAnyCorruptedRecords` the corrupt record skip-arm
+    /// increments `blob_dropped_to_corruption` and `blob_corrupted`
+    /// to 1 each; the `TailTruncation` arm then attributes the
+    /// remaining 1 unread record to `blob_dropped_to_tail`. Without
+    /// the `processed = recovered + blob_corrupted` accounting the
+    /// tail value would be 2 (overcount).
+    #[test]
+    fn recover_skip_any_then_tail_accounts_blob_corruption_separately() -> crate::Result<()> {
+        let fs = MemFs::new();
+        let folder = Path::new("/skip_any/blob_then_tail");
+        fs.create_dir_all(folder)?;
+        write_current(folder, 1, &fs)?;
+        write_manifest_blob_skip_any_then_tail_truncated(folder, 1, &fs)?;
+
+        let recovery = recover(folder, &fs, ManifestRecoveryMode::SkipAnyCorruptedRecords)?;
+
+        assert_eq!(
+            recovery.stats.blob_dropped_to_corruption, 1,
+            "the corrupt blob record must land in the corruption counter",
+        );
+        assert_eq!(
+            recovery.stats.blob_dropped_to_tail, 1,
+            "exactly one trailing blob record was truncated; the previously-skipped \
              corrupt record must NOT be re-counted here as tail (pre-fix value \
              would be 2)",
         );
