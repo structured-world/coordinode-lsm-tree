@@ -411,8 +411,49 @@ pub fn recover(folder: &Path, fs: &dyn Fs, mode: ManifestRecoveryMode) -> crate:
                             tables_bytes_consumed += crate::version::framing::FRAME_HEADER_LEN
                                 as u64
                                 + read_scratch.len() as u64;
-                            let t = decode_table_entry_payload(&read_scratch)?;
-                            run.push(t);
+                            // Per-record payload decode can fail even
+                            // when the framing checksum verified — a
+                            // writer-side bug or astronomically-rare
+                            // xxh3 collision could produce frame-
+                            // valid bytes that don't decode as a
+                            // valid record (e.g., InvalidTag on a
+                            // corrupt `checksum_type` byte). Under
+                            // SkipAny/PIT this is treated the same
+                            // as ChecksumMismatch — skip / stop
+                            // respectively — instead of aborting the
+                            // whole recovery via `?`. Under strict
+                            // mode the error propagates as before.
+                            match decode_table_entry_payload(&read_scratch) {
+                                Ok(t) => run.push(t),
+                                Err(e) if skip_any => {
+                                    log::warn!(
+                                        "skip_any: tables record decode failed in version \
+                                         #{curr_version_id}: {e:?}; skipping",
+                                    );
+                                    tables_dropped_to_corruption =
+                                        tables_dropped_to_corruption.saturating_add(1);
+                                    corrupted_in_run = corrupted_in_run.saturating_add(1);
+                                }
+                                Err(e) if pit_prefix => {
+                                    log::warn!(
+                                        "pit: tables record decode failed in version \
+                                         #{curr_version_id}: {e:?}; accepting consistent \
+                                         prefix and dropping the rest of this run + unread \
+                                         levels",
+                                    );
+                                    let recovered = u32::try_from(run.len()).unwrap_or(u32::MAX);
+                                    tables_dropped_to_corruption = tables_dropped_to_corruption
+                                        .saturating_add(table_count.saturating_sub(recovered));
+                                    if !run.is_empty() {
+                                        level.push(run);
+                                    }
+                                    if !level.is_empty() {
+                                        levels.push(level);
+                                    }
+                                    break 'levels;
+                                }
+                                Err(e) => return Err(e),
+                            }
                         }
                         FramedRecordOutcome::TailTruncation if tolerate_tail => {
                             // Subtract BOTH successfully decoded records
@@ -677,8 +718,32 @@ pub fn recover(folder: &Path, fs: &dyn Fs, mode: ManifestRecoveryMode) -> crate:
                 FramedRecordOutcome::Ok => {
                     blob_bytes_consumed += crate::version::framing::FRAME_HEADER_LEN as u64
                         + read_scratch.len() as u64;
-                    let entry = decode_blob_entry_payload(&read_scratch)?;
-                    blob_file_ids.push(entry);
+                    // Same SkipAny/PIT decode-error handling as the
+                    // tables section above — see comment there.
+                    match decode_blob_entry_payload(&read_scratch) {
+                        Ok(entry) => blob_file_ids.push(entry),
+                        Err(e) if skip_any => {
+                            log::warn!(
+                                "skip_any: blob_files record decode failed in version \
+                                 #{curr_version_id}: {e:?}; skipping",
+                            );
+                            blob_dropped_to_corruption =
+                                blob_dropped_to_corruption.saturating_add(1);
+                            blob_corrupted = blob_corrupted.saturating_add(1);
+                        }
+                        Err(e) if pit_prefix => {
+                            log::warn!(
+                                "pit: blob_files record decode failed in version \
+                                 #{curr_version_id}: {e:?}; accepting consistent prefix \
+                                 and dropping the rest of the blob_files section",
+                            );
+                            let recovered = u32::try_from(blob_file_ids.len()).unwrap_or(u32::MAX);
+                            blob_dropped_to_corruption = blob_dropped_to_corruption
+                                .saturating_add(blob_file_count.saturating_sub(recovered));
+                            break;
+                        }
+                        Err(e) => return Err(e),
+                    }
                 }
                 FramedRecordOutcome::TailTruncation if tolerate_tail => {
                     // Subtract BOTH successfully decoded records AND
