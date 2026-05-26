@@ -25,7 +25,6 @@
 //! the AEAD tag binds the ciphertext to the full block-identity +
 //! codec context + key-epoch tuple. AAD is never written to disk.
 
-use core::convert::TryFrom;
 use std::io::Cursor;
 
 use aes_gcm::aead::Generate;
@@ -197,11 +196,13 @@ fn decode_metadata_payload(payload: &[u8]) -> Result<ParsedMetadata, DecryptErro
             .map_err(|_| DecryptError::MalformedMetadataFrame("truncated MetadataPayload"))
     };
     let header_byte = read_u8(&mut cursor)?;
-    // Format version is the high nibble; v1 = 0b0001. Any other
-    // version, or any non-zero low nibble, lands as
-    // UnsupportedFormatVersion so the caller can tell "wrong
-    // version" apart from "corrupted header byte".
-    if (header_byte >> 4) != FORMAT_VERSION_V1 || (header_byte & 0x0F) != 0 {
+    // Format version is the high nibble; v1 = 0b0001. Per spec
+    // §4.8 (locked decisions): the low nibble is reserved and MUST
+    // be zero on write, but readers MUST IGNORE it on the read
+    // path so future suites can use those bits for forward-compatible
+    // extensions without requiring a wire-format bump. Validate ONLY
+    // the high nibble here.
+    if (header_byte >> 4) != FORMAT_VERSION_V1 {
         return Err(DecryptError::UnsupportedFormatVersion { header_byte });
     }
     let key_epoch = read_u8(&mut cursor)?;
@@ -381,7 +382,7 @@ pub fn encrypt_block(
 ///
 /// The caller must thread `dict_id` and `window_log` through
 /// `structured_zstd::decoding::FrameDecoder::expect_dict_id` /
-/// `expect_window_descriptor` (or equivalent) when feeding the
+/// `expect_window_log` (or equivalent) when feeding the
 /// plaintext into a zstd frame decoder — that's the spec's
 /// post-decrypt validation contract from
 /// `docs/aad-block-format.md` §5.3, preventing inner-frame header
@@ -392,7 +393,7 @@ pub struct DecryptedBlock {
     /// Recovered plaintext from the `BodyFrame`'s AEAD ciphertext.
     /// For zstd-compressed blocks this is the compressed inner
     /// frame; the caller decompresses with the
-    /// `expect_dict_id`/`expect_window_descriptor` setters
+    /// `expect_dict_id`/`expect_window_log` setters
     /// initialised from [`Self::dict_id`] / [`Self::window_log`].
     pub plaintext: Vec<u8>,
 
@@ -434,7 +435,7 @@ pub struct DecryptedBlock {
 /// The returned `compression_type` / `dict_id` / `window_log`
 /// fields on [`DecryptedBlock`] are the spec's post-decrypt
 /// validation contract: the caller MUST pass them through
-/// `FrameDecoder::expect_dict_id` / `expect_window_descriptor`
+/// `FrameDecoder::expect_dict_id` / `expect_window_log`
 /// before any zstd decode (per `docs/aad-block-format.md` §5.3).
 /// `decrypt_block` does not do the decompression itself — the
 /// crate's Block I/O layer owns that step.
@@ -493,21 +494,52 @@ pub fn decrypt_block(
         if pos >= total {
             break;
         }
-        // Read one more frame. Variant must be 2..=15 (anything
-        // else is malformed trailing data); payload bounded by
-        // MAX_BODY_LEN as a generic cap.
-        let (variant_byte, _) = read_framed_payload(
-            &mut cursor,
-            None,
-            0,
-            MAX_BODY_LEN,
-            DecryptError::MalformedBodyFrame,
-        )?;
+        // Read one more frame HEADER (no payload alloc). Variant
+        // must be 2..=15 (anything else is malformed trailing
+        // data); payload length bounded by MAX_BODY_LEN as a
+        // generic cap. The payload itself is then SKIPPED (cursor
+        // advanced) without allocating, since trailing frame
+        // contents are spec-defined per-variant and this layer
+        // ignores them — allocating MAX_BODY_LEN scratch for
+        // every skipped frame would let a crafted ECC-frame chain
+        // amplify peak memory unnecessarily.
+        let mut header = [0u8; 8];
+        std::io::Read::read_exact(&mut cursor, &mut header).map_err(|_| {
+            DecryptError::MalformedBodyFrame("truncated trailing skippable-frame header")
+        })?;
+        let magic = u32::from_le_bytes([header[0], header[1], header[2], header[3]]);
+        let variant = magic.wrapping_sub(SKIPPABLE_MAGIC_START);
+        if variant > 15 {
+            return Err(DecryptError::MalformedBodyFrame(
+                "trailing frame magic outside skippable-frame range",
+            ));
+        }
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "guarded by `variant > 15` immediately above"
+        )]
+        let variant_byte = variant as u8;
         if !(2..=15).contains(&variant_byte) {
             return Err(DecryptError::MalformedBodyFrame(
                 "trailing frame variant outside spec-permitted range 2..=15",
             ));
         }
+        let payload_len = u32::from_le_bytes([header[4], header[5], header[6], header[7]]);
+        if payload_len > MAX_BODY_LEN {
+            return Err(DecryptError::MalformedBodyFrame(
+                "trailing frame PayloadLen exceeds cap",
+            ));
+        }
+        // Skip payload bytes without allocating: advance the
+        // Cursor by the declared length, then verify the cursor
+        // didn't run past EOF (truncated trailing frame).
+        let skip_end = cursor.position().saturating_add(u64::from(payload_len));
+        if skip_end > total {
+            return Err(DecryptError::MalformedBodyFrame(
+                "truncated trailing skippable-frame payload",
+            ));
+        }
+        cursor.set_position(skip_end);
         // Frame contents are spec-defined per-variant (e.g. ECC
         // parity for variant 2). Beyond skipping, the contract
         // for this layer is "tolerate and ignore" — verification
@@ -596,7 +628,7 @@ mod tests {
         assert_eq!(&recovered.plaintext[..], plaintext);
         // Codec context echoes back from the MetadataPayload — the
         // caller is expected to thread these through structured-zstd's
-        // FrameDecoder::expect_dict_id / expect_window_descriptor
+        // FrameDecoder::expect_dict_id / expect_window_log
         // setters when feeding the plaintext into a zstd decode.
         assert_eq!(recovered.compression_type, 0);
         assert_eq!(recovered.dict_id, 0);
