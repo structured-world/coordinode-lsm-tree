@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779807958061,
+  "lastUpdate": 1779810449069,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -10374,6 +10374,84 @@ window.BENCHMARK_DATA = {
             "value": 466742.7821460935,
             "unit": "ops/sec",
             "extra": "P50: 2.0us | P99: 5.5us | P99.9: 8.0us\nthreads: 1 | elapsed: 0.43s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "6e58739154f91861f02dbc9920053483a129788f",
+          "message": "feat(bench): foundation for compare-rocksdb head-to-head harness (#244) (#345)\n\n## Summary\n\nFoundation for the head-to-head `coordinode-lsm-tree` vs RocksDB\nbenchmark dashboard (per #244). Adds a standalone bench crate at\n`tools/compare-rocksdb/` so the RocksDB binding never leaks into the\nmain crate's feature graph.\n\n## Changes\n\n- **`tools/compare-rocksdb/`** — new standalone bench crate (NOT in the\nmain workspace, mirroring `tools/db_bench/` and `tools/sst-dump/`):\n- `Cargo.toml`: depends on `coordinode-lsm-tree` via path + `rocksdb\n0.24` as a regular dependency.\n- `benches/compare.rs`: criterion harness, `Engine::{Ours, RocksDb}`\nparameterisation, `write_throughput/{1k,10k}` workloads.\n  - Run via: `cd tools/compare-rocksdb && cargo bench`.\n\n- **Main `Cargo.toml`** — UNCHANGED with respect to features and\ndependencies. No `compare-rocksdb` feature, no optional `rocksdb` dep,\nno in-crate `[[bench]]` entry. The whole point of the standalone-crate\nplacement is that the main crate's all-features build and docs.rs do not\nhave to compile librocksdb's C dependency tree (libsnappy, liblz4,\nlibbz2, librocksdb itself) nor bindgen + libclang.\n\n## Bench design\n\n`run_write_throughput`: bulk-insert N (key, value) pairs into a\nfreshly-opened engine, capture wall time covering engine open + N writes\n+ terminal flush. Elapsed is captured INSIDE each match arm before the\nengine handle drops, so close-time background work does not leak into\nthe measurement.\n\nApples-to-apples configuration:\n\n- **Compression: None on both sides.** lsm-tree default writes L0 with\n`None`, so RocksDB is set to `DBCompressionType::None` too.\n- **No WAL on either side.** lsm-tree has no WAL — durability is the\ncaller's responsibility. RocksDB is given\n`WriteOptions::disable_wal(true)` so it does the same shape of work\n(memtable insert + terminal flush) rather than paying the per-put WAL\nfsync the lsm-tree crate never does.\n\nFuture workload variants (point reads, range scans, mixed YCSB-A/C,\nbloom-filter probes per #244 workload list) reuse the same\nengine-parameterised closure.\n\n## Test plan\n\n- [x] Main crate lint passes after standalone-crate split\n- [x] Main crate tests pass after standalone-crate split\n- [ ] gh-pages dashboard pipeline (follow-up PR)\n\nCloses #244 (foundation slice; workload expansion in follow-up PRs).",
+          "timestamp": "2026-05-26T18:46:33+03:00",
+          "tree_id": "89f2c4deba71d8cab860bef3aecf9ede6b575ab8",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/6e58739154f91861f02dbc9920053483a129788f"
+        },
+        "date": 1779810447427,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 2102076.2112144735,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.6us | P99.9: 3.7us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1198288.8554972385,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.2us | P99.9: 4.4us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 530347.741430083,
+            "unit": "ops/sec",
+            "extra": "P50: 1.7us | P99: 5.0us | P99.9: 7.5us\nthreads: 1 | elapsed: 0.38s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3640676.779241065,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 3.0us | P99.9: 5.5us\nthreads: 1 | elapsed: 0.05s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 385460.86856865016,
+            "unit": "ops/sec",
+            "extra": "P50: 2.3us | P99: 5.5us | P99.9: 8.4us\nthreads: 1 | elapsed: 0.52s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 201280.45304945085,
+            "unit": "ops/sec",
+            "extra": "P50: 4.6us | P99: 5.9us | P99.9: 9.5us\nthreads: 1 | elapsed: 0.99s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1210962.8051018517,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.2us | P99.9: 4.3us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1110736.1327634463,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.5us | P99.9: 1.9us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 464395.9102937008,
+            "unit": "ops/sec",
+            "extra": "P50: 2.0us | P99: 5.4us | P99.9: 8.1us\nthreads: 1 | elapsed: 0.43s | num: 200000 | iterations: 3"
           }
         ]
       }
