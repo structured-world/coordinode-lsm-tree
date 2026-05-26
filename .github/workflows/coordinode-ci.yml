@@ -45,25 +45,105 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  lint:
-    timeout-minutes: 10
+  # Detect whether the change set touches code we want to validate.
+  # Used to gate the inner steps of `lint` and `test (stable,
+  # ubuntu-latest)` — both of which are REQUIRED checks in the
+  # branch ruleset — so their job names always surface to GitHub
+  # (satisfying the ruleset) while heavy work is skipped on
+  # docs-only / repo-meta-only PRs. Non-required downstream jobs
+  # (`test-zstd`, `no-std-check`, `cross-matrix`, `cross`,
+  # `codecov`) gate at the job level via `if:` and skip outright
+  # when no code changes — they aren't required so a "skipped"
+  # status is fine for them, but a required check that reports
+  # "skipped" is treated as "not yet satisfied" by the ruleset
+  # engine, hence the in-job conditional pattern below for the
+  # two required jobs.
+  changes:
     runs-on: ubuntu-latest
+    timeout-minutes: 2
+    outputs:
+      code: ${{ steps.filter.outputs.code }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
         with:
           persist-credentials: false
+          # Full history so the diff against the PR base or the
+          # previous push commit always resolves, regardless of how
+          # many commits the push or PR contains.
+          fetch-depth: 0
+      - name: Detect code-touching changes
+        id: filter
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          PUSH_AFTER: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            BASE="$BASE_SHA"
+            HEAD="$HEAD_SHA"
+          else
+            BASE="$PUSH_BEFORE"
+            HEAD="$PUSH_AFTER"
+          fi
+          # First push of a new branch reports the all-zeros sentinel
+          # as `before`; with no base to diff against, assume code
+          # changed (safe default — runs the full pipeline).
+          if [ -z "$BASE" ] || [ "$BASE" = "0000000000000000000000000000000000000000" ]; then
+            echo "No baseline commit available (new branch / first push) — assuming code changed."
+            echo "code=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # Predicate: anything that affects compile / lint / test
+          # results counts as code. The workflow file is included
+          # so changes to CI logic itself always trigger the full
+          # matrix (avoids self-skipping a CI refactor PR).
+          CODE_RE='^(src/|tests/|benches/|examples/|build\.rs$|Cargo\.toml$|Cargo\.lock$|tools/|\.github/workflows/coordinode-ci\.yml$|rust-toolchain(\.toml)?$|\.cargo/)'
+          CHANGED=$(git diff --name-only "$BASE" "$HEAD")
+          echo "Changed files between $BASE and $HEAD:"
+          echo "$CHANGED" | sed 's/^/  /'
+          if echo "$CHANGED" | grep -qE "$CODE_RE"; then
+            echo "Result: code paths affected — running real CI."
+            echo "code=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Result: no code paths affected — emitting fast success for required checks."
+            echo "code=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  lint:
+    needs: changes
+    timeout-minutes: 10
+    runs-on: ubuntu-latest
+    steps:
+      # Surfaces a notice in the run log + summary so docs-only PRs
+      # leave an obvious trail explaining why the check passed
+      # without doing real work.
+      - name: Path-conditional skip notice
+        if: needs.changes.outputs.code != 'true'
+        run: |
+          echo "::notice::No code paths changed — skipping format + clippy. Required-check name still emitted as success."
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        if: needs.changes.outputs.code == 'true'
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
+        if: needs.changes.outputs.code == 'true'
         with:
           toolchain: stable
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2.9.1
+        if: needs.changes.outputs.code == 'true'
       - name: Format
+        if: needs.changes.outputs.code == 'true'
         run: cargo fmt --all -- --check
       - name: Clippy (strict)
+        if: needs.changes.outputs.code == 'true'
         run: cargo clippy --all-features -- -D warnings
 
   test:
-    needs: lint
+    needs: [changes, lint]
     timeout-minutes: 20
     strategy:
       fail-fast: true
@@ -72,17 +152,32 @@ jobs:
         os: [ubuntu-latest, windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
+      # Same path-conditional skip pattern as `lint`. ALL matrix
+      # entries emit their job name regardless of whether the inner
+      # steps ran, so `test (stable, ubuntu-latest)` — the entry
+      # listed in the branch ruleset as a required check — is
+      # always satisfied on docs-only PRs without paying the full
+      # test cost.
+      - name: Path-conditional skip notice
+        if: needs.changes.outputs.code != 'true'
+        run: |
+          echo "::notice::No code paths changed — skipping nextest + doc tests + tools/. Required-check name still emitted as success."
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        if: needs.changes.outputs.code == 'true'
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
+        if: needs.changes.outputs.code == 'true'
         with:
           toolchain: ${{ matrix.rust }}
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2.9.1
+        if: needs.changes.outputs.code == 'true'
         with:
           prefix-key: ${{ runner.os }}-cargo
       - uses: taiki-e/install-action@1ef5c5f58e85d25baaaa1704478fdd6c2921f2b5  # nextest
+        if: needs.changes.outputs.code == 'true'
       - name: Run tests
+        if: needs.changes.outputs.code == 'true'
         # tools/db_bench is a standalone crate, not in workspace — built separately
         env:
           # 32 cases is plenty for CI; PROPTEST_MAX_SHRINK trims the
@@ -93,11 +188,14 @@ jobs:
           PROPTEST_MAX_SHRINK: "100"
         run: cargo nextest run --profile ci --all-features
       - name: Run doc tests
+        if: needs.changes.outputs.code == 'true'
         run: cargo test --doc --features lz4
       - name: Check db_bench crate
+        if: needs.changes.outputs.code == 'true'
         working-directory: tools/db_bench
         run: cargo check --all-features
       - name: Build + test sst-dump crate
+        if: needs.changes.outputs.code == 'true'
         # Standalone crate (not in workspace), exercise both the bin
         # build and the integration smoke tests so any drift in the
         # public verify::verify_sst_file API or the SST writer layout
@@ -109,7 +207,8 @@ jobs:
         run: cargo nextest run
 
   test-zstd:
-    needs: lint
+    needs: [changes, lint]
+    if: needs.changes.outputs.code == 'true'
     timeout-minutes: 15
     strategy:
       fail-fast: true
@@ -152,7 +251,8 @@ jobs:
     # no-std-friendly (prefer `core::*` / `alloc::*`, gate std-only behind
     # `#[cfg(feature = "std")]`); reviewers should request the error count
     # from this job and compare against main.
-    needs: lint
+    needs: [changes, lint]
+    if: needs.changes.outputs.code == 'true'
     continue-on-error: true
     timeout-minutes: 10
     runs-on: ubuntu-latest
@@ -199,6 +299,8 @@ jobs:
     # the PR critical path: the matrix is ready when lint
     # finishes, and `cross` (which `needs: [lint, cross-matrix]`)
     # starts immediately rather than waiting for serial chain.
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     outputs:
       targets: ${{ steps.set.outputs.targets }}
@@ -214,7 +316,8 @@ jobs:
           fi
 
   cross:
-    needs: [lint, cross-matrix]
+    needs: [changes, lint, cross-matrix]
+    if: needs.changes.outputs.code == 'true'
     timeout-minutes: 15
     strategy:
       fail-fast: true
@@ -240,7 +343,8 @@ jobs:
         run: cross test -r --features lz4 --target ${{ matrix.target }}
 
   codecov:
-    needs: lint
+    needs: [changes, lint]
+    if: needs.changes.outputs.code == 'true'
     timeout-minutes: 20
     runs-on: ubuntu-latest
     steps:
