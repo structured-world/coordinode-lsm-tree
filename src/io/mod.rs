@@ -167,7 +167,7 @@ impl fmt::Debug for Error {
         let mut dbg = f.debug_struct("Error");
         dbg.field("kind", &self.kind);
         if let Some(msg) = &self.message {
-            dbg.field("message", &msg);
+            dbg.field("message", msg);
         }
         dbg.finish()
     }
