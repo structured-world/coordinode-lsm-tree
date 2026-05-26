@@ -32,10 +32,7 @@ use aes_gcm::aead::Generate;
 use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 use structured_zstd::skippable::SkippableFrame;
 
-use super::aad::{
-    AAD_LEN, BlockIdentity, EncryptionContext, FORMAT_VERSION_V1, HEADER_BYTE_V1,
-    MAGIC_METADATA_LE, SuiteId, build,
-};
+use super::aad::{AAD_LEN, BlockIdentity, EncryptionContext, FORMAT_VERSION_V1, SuiteId, build};
 use super::aead::{TAG_LEN, decrypt_in_place, encrypt_in_place};
 use super::error::DecryptError;
 use super::key_chain::KeyChain;
@@ -45,6 +42,64 @@ use super::key_chain::KeyChain;
 const METADATA_VARIANT: u8 = 0;
 /// `BodyFrame` magic: `0x184D2A51` LE bytes. Variant 1.
 const BODY_VARIANT: u8 = 1;
+
+/// Base of the Zstandard skippable-frame magic range
+/// (RFC 8878 §3.1.2). Variants 0..=15 share this base; we use 0
+/// for `MetadataFrame` and 1 for `BodyFrame`.
+const SKIPPABLE_MAGIC_START: u32 = 0x184D_2A50;
+
+/// Decodes one skippable-frame header (8 bytes: 4-byte LE magic +
+/// 4-byte LE payload length), enforces the variant and the
+/// caller's payload-size cap BEFORE allocating, then reads
+/// exactly that many bytes into a `Vec<u8>`.
+///
+/// Replaces a direct [`SkippableFrame::decode_from`] call so the
+/// cap on `PayloadLen` is enforced ahead of the allocation — the
+/// upstream API allocates the full declared length first and only
+/// then surfaces caller-side caps, which means a forged
+/// `PayloadLen = u32::MAX` would burn a 4 GiB allocation attempt
+/// before the read even started. Decoding the header manually
+/// rejects oversized frames at the cost of 8 bytes of upfront
+/// I/O.
+fn read_framed_payload_with_cap<R: std::io::Read>(
+    reader: &mut R,
+    expected_variant: u8,
+    max_payload: u32,
+    err_ctor: fn(&'static str) -> DecryptError,
+) -> Result<Vec<u8>, DecryptError> {
+    let mut header = [0u8; 8];
+    reader
+        .read_exact(&mut header)
+        .map_err(|_| err_ctor("truncated skippable-frame header"))?;
+
+    // 4-byte LE magic. Within the skippable-frame range
+    // (variants 0..=15) this is `SKIPPABLE_MAGIC_START + variant`.
+    let magic = u32::from_le_bytes([header[0], header[1], header[2], header[3]]);
+    let variant = magic.wrapping_sub(SKIPPABLE_MAGIC_START);
+    // `variant > 15` already excludes any value outside u8 range,
+    // so the subsequent narrowing cast is exact — guarded above.
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "guarded by `variant > 15` immediately above"
+    )]
+    let variant_byte = variant as u8;
+    if variant > 15 || variant_byte != expected_variant {
+        return Err(err_ctor("wrong frame magic / variant"));
+    }
+
+    // 4-byte LE payload length. Cap BEFORE allocating so a
+    // crafted huge value rejects immediately.
+    let payload_len = u32::from_le_bytes([header[4], header[5], header[6], header[7]]);
+    if payload_len > max_payload {
+        return Err(err_ctor("PayloadLen exceeds cap"));
+    }
+
+    let mut payload = vec![0u8; payload_len as usize];
+    reader
+        .read_exact(&mut payload)
+        .map_err(|_| err_ctor("truncated frame payload"))?;
+    Ok(payload)
+}
 
 /// `MetadataPayload` size for v1 suites: 38 bytes
 /// (= `26 + NONCE_LEN` where v1 suites declare `NONCE_LEN` = 12).
@@ -149,6 +204,23 @@ fn decode_metadata_payload(payload: &[u8]) -> Result<ParsedMetadata, DecryptErro
         .read_u32::<BigEndian>()
         .map_err(|_| DecryptError::MalformedMetadataFrame("truncated DictID"))?;
     let window_log = read_u8(&mut cursor)?;
+    // Spec §5.1 row "WindowLog": valid values are 0 (no zstd /
+    // no window enforcement, used for CompressionType::None or
+    // non-zstd codecs) or 10..=31 (RFC 8878 §3.1.1.1.2 decoded
+    // window-descriptor range). Any other byte is malformed and
+    // must be rejected BEFORE any AEAD work.
+    if window_log != 0 && !(10..=31).contains(&window_log) {
+        return Err(DecryptError::MalformedMetadataFrame(
+            "WindowLog outside valid range (must be 0 or 10..=31)",
+        ));
+    }
+    // Zero-init scratch buffer that gets overwritten by the next
+    // `read_exact` from the on-disk `MetadataPayload`. NOT a
+    // hard-coded nonce: this is the read side, and the bytes that
+    // end up here are whatever the writer wrote — `[0u8; 12]` is
+    // just the initial fill before the read overwrites it.
+    // CodeQL's "hard-coded cryptographic value" heuristic flags
+    // the zero-init pattern; suppressing here with a comment.
     let mut nonce = [0u8; 12];
     std::io::Read::read_exact(&mut cursor, &mut nonce)
         .map_err(|_| DecryptError::MalformedMetadataFrame("truncated Nonce"))?;
@@ -268,14 +340,16 @@ pub fn encrypt_block(
 /// parsed `EncryptionContext`, looks up the matching key from
 /// `key_chain`, and runs [`decrypt_in_place`].
 ///
-/// `identity` MUST match the values the writer fed into
-/// [`encrypt_block`] (tree id, table id, block offset, block
-/// type, dict id, window log); any mismatch propagates through
-/// the AAD and surfaces as
-/// [`DecryptError::AeadVerificationFailed`]. The four fields the
-/// writer recorded on disk (header byte, key epoch, suite id,
-/// compression type) are read back from the `MetadataPayload`, NOT
-/// taken from caller-supplied identity.
+/// `identity` MUST supply the three AAD-bound fields that are
+/// NOT recorded on disk: `tree_id`, `table_id`, and `block_offset`.
+/// Any mismatch on any of those three propagates through the AAD
+/// and surfaces as [`DecryptError::AeadVerificationFailed`]. The
+/// six on-disk-recorded AAD fields (`HeaderByte`, `KeyEpoch`,
+/// `BlockType`, `SuiteID`, `CompressionType`, `DictID`, `WindowLog`)
+/// are read back from the `MetadataPayload` regardless of what the
+/// caller supplies on `identity.block_type` / `identity.dict_id` /
+/// `identity.window_log` — those three fields are IGNORED on the
+/// read path because the disk is the source of truth for them.
 ///
 /// # Errors
 ///
@@ -288,36 +362,33 @@ pub fn decrypt_block(
     let mut cursor = Cursor::new(bytes);
 
     // ── MetadataFrame ──────────────────────────────────────────
-    let metadata_frame = SkippableFrame::decode_from(&mut cursor)
-        .map_err(|_| DecryptError::MalformedMetadataFrame("MetadataFrame decode failed"))?;
-    if metadata_frame.magic_variant() != METADATA_VARIANT {
-        return Err(DecryptError::MalformedMetadataFrame(
-            "first frame must be MetadataFrame variant 0",
-        ));
-    }
-    let parsed = decode_metadata_payload(metadata_frame.payload())?;
+    // Cap MetadataPayload at exactly 38 bytes upfront — v1 suites
+    // are fixed-size. A wire `PayloadLen` other than 38 is
+    // malformed by spec and gets rejected before allocation.
+    let metadata_payload = read_framed_payload_with_cap(
+        &mut cursor,
+        METADATA_VARIANT,
+        METADATA_PAYLOAD_LEN_V1,
+        DecryptError::MalformedMetadataFrame,
+    )?;
+    let parsed = decode_metadata_payload(&metadata_payload)?;
 
     // ── BodyFrame ──────────────────────────────────────────────
-    let body_frame = SkippableFrame::decode_from(&mut cursor)
-        .map_err(|_| DecryptError::MalformedBodyFrame("BodyFrame decode failed"))?;
-    if body_frame.magic_variant() != BODY_VARIANT {
-        return Err(DecryptError::MalformedBodyFrame(
-            "second frame must be BodyFrame variant 1",
-        ));
-    }
-    let mut ciphertext = body_frame.into_payload();
-    if ciphertext.is_empty() {
-        return Err(DecryptError::MalformedBodyFrame("zero-length body payload"));
-    }
-    // BodyFrame's u32 PayloadLen field is already bounded by
-    // SkippableFrame::decode_from to representable usize; cap
-    // here too at the encode-side maximum so an attacker can't
-    // hand us a 4 GiB legitimately-framed but undecryptable body.
-    if ciphertext.len() > MAX_BODY_LEN as usize {
-        return Err(DecryptError::MalformedBodyFrame(
-            "body payload exceeds 256 MiB",
-        ));
-    }
+    // Cap BodyPayload at the 256 MiB encode-side maximum BEFORE
+    // allocating, so a crafted PayloadLen near u32::MAX cannot
+    // trigger a 4 GiB allocation attempt.
+    //
+    // Empty body payloads are LEGAL per RFC 8878 (skippable frames
+    // can carry zero bytes) AND per AEAD semantics (encrypting an
+    // empty plaintext yields a 0-byte ciphertext + 16-byte tag in
+    // the MetadataFrame). encrypt_block on `&[]` produces a valid
+    // such frame; the decoder must accept it.
+    let mut ciphertext = read_framed_payload_with_cap(
+        &mut cursor,
+        BODY_VARIANT,
+        MAX_BODY_LEN,
+        DecryptError::MalformedBodyFrame,
+    )?;
 
     // ── AAD reconstruction ──────────────────────────────────────
     // Reconstruct the BlockIdentity that participates in AAD using
@@ -338,8 +409,6 @@ pub fn decrypt_block(
     };
     let aad = build(&parsed.ctx, &aad_identity);
     debug_assert_eq!(aad.len(), AAD_LEN);
-    let _ = MAGIC_METADATA_LE; // doc anchor — referenced in aad::build internals.
-    let _ = HEADER_BYTE_V1; // doc anchor for the format-version constant.
 
     // ── Key lookup ──────────────────────────────────────────────
     let key = key_chain
@@ -454,5 +523,60 @@ mod tests {
         let truncated = &sealed[..6];
         let err = decrypt_block(truncated, &id(), &chain()).unwrap_err();
         assert!(matches!(err, DecryptError::MalformedMetadataFrame(_)));
+    }
+
+    #[test]
+    fn roundtrip_empty_plaintext_recovers_empty() {
+        // RFC 8878 skippable frames allow zero-length payloads,
+        // and AEAD over empty plaintext yields a 0-byte ciphertext
+        // + the 16-byte tag (which lives in MetadataPayload, not
+        // BodyFrame). The decoder must accept the resulting
+        // BodyFrame with PayloadLen=0.
+        let sealed = encrypt_block(&[], &id(), &ctx(), &chain()).unwrap();
+        let recovered = decrypt_block(&sealed, &id(), &chain()).unwrap();
+        assert!(recovered.is_empty());
+    }
+
+    #[test]
+    fn invalid_window_log_surfaces_malformed_metadata() {
+        // WindowLog spec: 0 (no enforcement) or 10..=31. Tamper a
+        // sealed block to put a forbidden value (9) in the
+        // WindowLog byte; the decoder must reject before any AEAD
+        // work even though the AEAD tag is over the AAD that
+        // includes window_log (so a subsequent tag-verify would
+        // ALSO fail, but the structural check fires first).
+        let plaintext = b"the quick brown fox";
+        let mut sealed = encrypt_block(plaintext, &id(), &ctx(), &chain()).unwrap();
+        // MetadataFrame layout: [4 magic][4 PayloadLen][1 HeaderByte]
+        // [1 KeyEpoch][1 BlockType][1 SuiteID][1 CompressionType]
+        // [4 DictID][1 WindowLog][...]. WindowLog is at offset 8 + 9
+        // = 17 from the start of the sealed bytes.
+        sealed[17] = 9; // invalid (< 10, not zero)
+        let err = decrypt_block(&sealed, &id(), &chain()).unwrap_err();
+        assert!(
+            matches!(err, DecryptError::MalformedMetadataFrame(_)),
+            "expected MalformedMetadataFrame for WindowLog=9, got {err:?}",
+        );
+    }
+
+    #[test]
+    fn oversized_body_payload_len_rejected_before_alloc() {
+        // Forge the BodyFrame's PayloadLen to advertise the maximum
+        // legal u32 — a naive decoder would try to allocate ~4 GiB
+        // before realising the underlying reader has no such data.
+        // The upfront cap rejects before any allocation.
+        let plaintext = b"the quick brown fox";
+        let mut sealed = encrypt_block(plaintext, &id(), &ctx(), &chain()).unwrap();
+        // MetadataFrame total size = 8 + 38 = 46 bytes. BodyFrame
+        // starts at offset 46; its PayloadLen is at frame offset 4
+        // → absolute offset 50..54.
+        let body_payload_len_at = 46 + 4;
+        sealed[body_payload_len_at..body_payload_len_at + 4]
+            .copy_from_slice(&u32::MAX.to_le_bytes());
+        let err = decrypt_block(&sealed, &id(), &chain()).unwrap_err();
+        assert!(
+            matches!(err, DecryptError::MalformedBodyFrame(_)),
+            "expected MalformedBodyFrame for oversized BodyFrame PayloadLen, got {err:?}",
+        );
     }
 }

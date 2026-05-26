@@ -43,7 +43,14 @@
 pub mod aad;
 #[cfg(feature = "encryption")]
 pub mod aead;
-#[cfg(feature = "encryption")]
+// `block` depends on `structured_zstd::skippable::SkippableFrame`,
+// which is only in the dep graph when the `zstd` cargo feature is
+// enabled (the dep is `optional`, pulled in by `feature = "zstd"`).
+// `encryption` alone doesn't bring zstd, so gate the wire-format
+// module on both features. Without `zstd`, the AAD types + AEAD
+// primitives still compile; only the SkippableFrame-wrapped
+// encrypt_block / decrypt_block entry points are absent.
+#[cfg(all(feature = "encryption", zstd_any))]
 pub mod block;
 pub mod error;
 pub mod key_chain;

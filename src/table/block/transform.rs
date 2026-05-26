@@ -83,6 +83,20 @@ pub struct CompressionContext<'a> {
     _lifetime: core::marker::PhantomData<&'a ()>,
 }
 
+// `'a` is borrowed by `with_dict` (gated behind `zstd_any`). On
+// builds with no zstd backend the borrow drops out, but the
+// impl-level lifetime stays so method signatures stay valid across
+// the feature matrix without per-method `#[cfg]` gymnastics.
+// Feature-gated `#[expect]` only attaches in the configuration
+// where the lint actually fires.
+#[cfg_attr(
+    not(zstd_any),
+    expect(
+        clippy::elidable_lifetime_names,
+        reason = "'a kept for cross-feature-matrix signature stability; \
+                  used by with_dict under any zstd feature"
+    )
+)]
 impl<'a> CompressionContext<'a> {
     /// Constructs a [`CompressionContext`] for a non-dict codec
     /// (`Lz4`, `Zstd(level)`).
