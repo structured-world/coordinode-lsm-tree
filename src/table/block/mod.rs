@@ -245,10 +245,12 @@ impl Block {
             #[expect(clippy::cast_possible_truncation, reason = "blocks are limited to u32")]
             uncompressed_length: data.len() as u32,
 
-            // Set in the ECC-emit step below when page_ecc is enabled
-            // for this writer (writer integration in a follow-up
-            // step). Zero means "no parity trailer follows", which is
-            // the V6-default-off layout.
+            // Updated in the ECC-emit step below when the active
+            // `BlockTransform` variant is one of the `*Ecc` arms,
+            // which `Writer::use_page_ecc(true)` wires through the
+            // emit path. Zero means "no parity trailer follows" —
+            // the V6-default-off layout that non-page-ecc trees
+            // produce.
             ecc_length: 0,
         };
 
@@ -465,10 +467,15 @@ impl Block {
         // bytes and desynchronize from the next block boundary.
         let expected_ecc = expected_parity_len(header.data_length);
         if header.ecc_length != 0 && header.ecc_length != expected_ecc {
-            return Err(crate::Error::DecompressedSizeTooLarge {
-                declared: u64::from(header.ecc_length),
-                limit: u64::from(expected_ecc),
-            });
+            // Mismatch — either smaller or larger than the parity
+            // trailer the writer is supposed to emit for this
+            // `data_length`. Both directions indicate a corrupted
+            // / forged header rather than an oversized payload, so
+            // surface this as `InvalidHeader` instead of the
+            // size-cap variant (the field can be UNDER-sized as
+            // well as over-sized, which the size-cap error
+            // semantically can't represent).
+            return Err(crate::Error::InvalidHeader("Block"));
         }
 
         // When encryption is active, read into a Vec so decrypt_vec can
@@ -778,10 +785,12 @@ impl Block {
 
             let expected_ecc = expected_parity_len(parsed_header.data_length);
             if parsed_header.ecc_length != 0 && parsed_header.ecc_length != expected_ecc {
-                return Err(crate::Error::DecompressedSizeTooLarge {
-                    declared: u64::from(parsed_header.ecc_length),
-                    limit: u64::from(expected_ecc),
-                });
+                // Mismatch — see the matching check in `from_reader`
+                // for the reasoning. Surfaced as `InvalidHeader`
+                // because the field can be under- or over-sized,
+                // either of which means the on-disk header doesn't
+                // match what the writer would have emitted.
+                return Err(crate::Error::InvalidHeader("Block"));
             }
 
             // ECC fast path: no parity trailer → existing in-buffer
@@ -910,10 +919,10 @@ impl Block {
 
             let expected_ecc = expected_parity_len(parsed_header.data_length);
             if parsed_header.ecc_length != 0 && parsed_header.ecc_length != expected_ecc {
-                return Err(crate::Error::DecompressedSizeTooLarge {
-                    declared: u64::from(parsed_header.ecc_length),
-                    limit: u64::from(expected_ecc),
-                });
+                // Mismatch (under- or over-sized) → corrupted /
+                // forged header. Same reasoning as the matching
+                // check in `from_reader`.
+                return Err(crate::Error::InvalidHeader("Block"));
             }
 
             // Zero-copy fast path for non-ECC blocks; ECC blocks go

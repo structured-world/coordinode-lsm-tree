@@ -104,9 +104,11 @@ impl Header {
         // serialized_len is a small constant (37 bytes: 4 magic + 1
         // block_type + 16 checksum + 4 data_length + 4 uncompressed +
         // 4 ecc_length + 4 header checksum); cast to u32 is safe by
-        // construction. data_length + ecc_length is already bounded
-        // by the writer's MAX_DECOMPRESSION_SIZE / MAX_ECC_LENGTH
-        // checks, well within u32.
+        // construction. `data_length` is bounded by the writer's
+        // `MAX_DECOMPRESSION_SIZE` cap, and `ecc_length` is bounded
+        // by the per-block `expected_parity_len(data_length)` invariant
+        // enforced on read (see `Block::from_reader` / `from_file`),
+        // so the sum stays well within u32.
         #[expect(
             clippy::cast_possible_truncation,
             reason = "Header::serialized_len() is a small const"

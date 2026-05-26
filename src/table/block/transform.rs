@@ -23,10 +23,17 @@
 //! The `Ecc` variants are only available when the `page_ecc` cargo
 //! feature is enabled; without it, the variant list collapses to
 //! the original four. ECC is orthogonal to compression / encryption:
-//! parity is computed over the integrity-protected on-disk payload
-//! (post-compression, post-encryption), so an attacker tampering
-//! with the parity bytes still loses authentication via AEAD —
-//! ECC protects only against bit-rot in the wire bytes.
+//! parity is computed over the on-disk payload after compression
+//! and after encryption, and lives in a trailer that is NOT
+//! covered by AEAD authentication and NOT included in the
+//! per-block XXH3 over the payload bytes. Tampering with the
+//! parity trailer therefore cannot be detected by AEAD or by the
+//! block checksum — it only impacts recoverability (a corrupted
+//! parity trailer means the codec can't repair payload bit-flips,
+//! but the payload itself is still authenticated by its own
+//! checksum / AEAD tag and tampering there fails the usual way).
+//! In other words: ECC is a best-effort recovery aid for bit-rot
+//! in the wire bytes, NOT an integrity primitive.
 //!
 //! Modelling the four paths as a single enum has two concrete wins
 //! over the previous "`(compression, encryption, zstd_dict)` triple"
@@ -232,10 +239,14 @@ pub enum BlockTransform<'a> {
     CompressedEcc(CompressionContext<'a>),
 
     /// `raw → encrypt → checksum → ecc parity → disk`. The parity is
-    /// computed over the encrypted ciphertext: an attacker tampering
-    /// with on-disk bytes still loses authentication via AEAD; ECC
-    /// only protects against bit-rot in the integrity-protected wire
-    /// bytes.
+    /// computed over the encrypted ciphertext and stored in a
+    /// trailer outside the AEAD-authenticated region. Tampering with
+    /// the ciphertext fails AEAD verification on read the usual way;
+    /// tampering with the parity trailer specifically is NOT detected
+    /// by AEAD (the trailer isn't part of the authenticated payload
+    /// and isn't covered by the per-block XXH3 either) — it only
+    /// impacts recoverability. ECC is a best-effort recovery aid for
+    /// bit-rot, not an integrity primitive on top of AEAD.
     #[cfg(feature = "page_ecc")]
     EncryptedEcc(&'a dyn EncryptionProvider),
 
