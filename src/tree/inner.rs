@@ -7,6 +7,7 @@ use crate::{
     compaction::state::CompactionState,
     config::Config,
     deletion_pause::DeletionPause,
+    runtime_config::{RuntimeConfig, RuntimeConfigHandle},
     stop_signal::StopSignal,
     version::{SuperVersions, Version, persist_version},
 };
@@ -74,6 +75,17 @@ pub struct TreeInner {
     /// [`Table`](crate::Table) and [`BlobFile`](crate::BlobFile).
     pub(crate) deletion_pause: Arc<DeletionPause>,
 
+    /// Runtime-toggleable configuration. Lockless atomic snapshot;
+    /// loaded by write paths (block write, manifest commit, compaction)
+    /// to pick up live config changes without coordination. Read paths
+    /// are config-independent — each block / manifest self-describes
+    /// via its own header.
+    //
+    // no-std: Tree itself is std-bound. For no_std consumers needing
+    // runtime-toggleable config, use spin::RwLock<RuntimeConfig> as
+    // alternative (slower hot path, but compiles under alloc-only).
+    pub(crate) runtime_config: RuntimeConfigHandle,
+
     #[doc(hidden)]
     #[cfg(feature = "metrics")]
     pub metrics: Arc<Metrics>,
@@ -110,6 +122,7 @@ impl TreeInner {
             flush_lock: Mutex::default(),
             compaction_state: Arc::new(Mutex::new(CompactionState::default())),
             deletion_pause: DeletionPause::new_shared(),
+            runtime_config: RuntimeConfigHandle::new(RuntimeConfig::default()),
 
             #[cfg(feature = "metrics")]
             metrics: Metrics::default().into(),

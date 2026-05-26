@@ -978,6 +978,36 @@ impl AbstractTree for Tree {
 }
 
 impl Tree {
+    /// Update the live [`crate::runtime_config::RuntimeConfig`].
+    ///
+    /// Mutator runs on a clone of the current snapshot; the new snapshot
+    /// is then atomically swapped in. Subsequent write paths (block write,
+    /// manifest commit, compaction) pick up the change on their next
+    /// `runtime_config()` load. Existing on-disk data remains in its
+    /// original format and reads transparently — every block / manifest
+    /// is self-describing via its own header.
+    ///
+    /// Compaction acts as the live-migration mechanism: once a feature
+    /// is toggled, compaction rewrites source blocks per the new snapshot
+    /// over subsequent cycles, so all data converges to the current
+    /// settings without stop-the-world coordination.
+    ///
+    /// Atomicity: concurrent readers observe either the old or the new
+    /// snapshot, never a torn one.
+    pub fn update_runtime_config<F>(&self, mutator: F)
+    where
+        F: FnOnce(&mut crate::runtime_config::RuntimeConfig),
+    {
+        self.0.runtime_config.update(mutator);
+    }
+
+    /// Snapshot of the current runtime config. Cheap atomic load —
+    /// safe to call on hot paths.
+    #[must_use]
+    pub fn runtime_config(&self) -> Arc<crate::runtime_config::RuntimeConfig> {
+        self.0.runtime_config.load_full()
+    }
+
     /// Shared point-read logic for `get()` and `multi_get()`: finds the newest
     /// entry, applies merge resolution or RT suppression, and returns the value.
     fn resolve_or_passthrough(
@@ -1962,6 +1992,9 @@ impl Tree {
             flush_lock: Mutex::default(),
             compaction_state: Arc::new(Mutex::new(CompactionState::default())),
             deletion_pause: Arc::clone(&deletion_pause),
+            runtime_config: crate::runtime_config::RuntimeConfigHandle::new(
+                crate::runtime_config::RuntimeConfig::default(),
+            ),
 
             #[cfg(feature = "metrics")]
             metrics,

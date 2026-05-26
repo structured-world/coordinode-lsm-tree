@@ -98,6 +98,12 @@ ribbon-serde = ["dep:serde"]
 bytes = { version = "1", optional = true }
 byteorder = { package = "byteorder-lite", version = "0.1.0" }
 byteview = "~0.10.1"
+# Lockless atomic snapshot for RuntimeConfig (see src/runtime_config/).
+# std-bound — the `RuntimeConfigHandle` wrapper is gated behind feature
+# `std`. Types in `runtime_config::types` stay alloc-friendly so
+# downstream no_std consumers (block decoders, format constants) can
+# reach them without pulling the handle.
+arc-swap = "1.9"
 enum_dispatch = "0.3.13"
 log = "0.4.27"
 # `spin` provides a no_std-compatible Mutex. Used by
