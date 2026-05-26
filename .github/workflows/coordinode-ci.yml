@@ -45,25 +45,213 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Detect whether the change set touches code we want to validate.
+  # Used to gate the inner steps of `lint` and `test (stable,
+  # ubuntu-latest)` — both of which are REQUIRED checks in the
+  # branch ruleset — so their job names always surface to GitHub
+  # (satisfying the ruleset) while heavy work is skipped on
+  # docs-only / repo-meta-only PRs. Non-required downstream jobs
+  # (`test-zstd`, `no-std-check`, `cross-matrix`, `cross`,
+  # `codecov`) gate at the job level via `if:` and skip outright
+  # when no code changes — they aren't required so a "skipped"
+  # status is fine for them, but a required check that reports
+  # "skipped" is treated as "not yet satisfied" by the ruleset
+  # engine, hence the in-job conditional pattern below for the
+  # two required jobs.
+  changes:
+    runs-on: ubuntu-latest
+    # Bumped from the original 2 min — generous timeout so a slow
+    # `/pulls/{N}/files` page on a large PR can't run us into a
+    # hard wall. The job is also designed to NEVER fail (every
+    # path below resolves to a `code` output, even on API errors)
+    # so a missed deadline is the only remaining failure mode and
+    # 10 min gives plenty of margin.
+    timeout-minutes: 10
+    # Read-only token: the `pull_request` branch of the script
+    # below hits `/pulls/{N}/files`; non-PR events
+    # (`push` to main, `workflow_dispatch`) bypass the API
+    # entirely and just emit `code=true`. Either way, we never
+    # push and never write. Explicit `permissions:` block scopes
+    # the auto-provided GITHUB_TOKEN to exactly what this job
+    # needs, regardless of repo-default permission settings.
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      code: ${{ steps.filter.outputs.code }}
+    steps:
+      # No `actions/checkout` step on purpose: the change predicate
+      # uses GitHub's REST API to list affected files via
+      # `/pulls/{N}/files` for the `pull_request` event. That
+      # avoids the `actions/checkout@v6 + fetch-depth: 0 +
+      # persist-credentials: false` 403 we hit on the first
+      # attempt, and skips the clone cost entirely for a job that
+      # only needs path names. Non-PR events (`push` to main,
+      # `workflow_dispatch`) bypass the path filter entirely and
+      # always emit `code=true` — see the inline rationale below.
+      - name: Detect code-touching changes
+        id: filter
+        # Override the runner's default `-eo pipefail` flags.
+        # GitHub Actions invokes the default `bash` step with
+        # `bash --noprofile --norc -eo pipefail {0}`, so a script
+        # that just adds `set -u` STILL inherits `-e` + pipefail
+        # from the runner. This job is a hard dependency of the
+        # required `lint` + `test (stable, ubuntu-latest)` checks
+        # (they `needs: changes`); any non-zero exit cascades to
+        # "required check never reports" and blocks merges, which
+        # is exactly the failure mode we built the safe-default
+        # output for. Keep `--noprofile --norc` so we still match
+        # the runner's clean-env defaults (no inherited dotfiles
+        # from a self-hosted runner with profile.d / bashrc) —
+        # we only drop the `-eo pipefail` half deliberately.
+        shell: bash --noprofile --norc {0}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -u
+          # Helper: emit a `code` output, log a reason, and exit 0
+          # so dependent jobs always have a valid value to consume.
+          emit_and_exit() {
+            local code_value="$1"
+            local reason="$2"
+            echo "::notice::changes job: code=$code_value ($reason)"
+            echo "code=$code_value" >> "$GITHUB_OUTPUT"
+            exit 0
+          }
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            # GitHub's own PR file list is the merge-base diff —
+            # exactly what we want, without resolving merge-base
+            # ourselves. Paginated to handle PRs touching >100 files
+            # (the API caps each page at 100, more pages auto-fetch).
+            # stdout / stderr are captured into SEPARATE variables:
+            # stdout (filename list) goes into CHANGED, stderr (any
+            # warnings or rate-limit messages) is preserved in
+            # API_ERR for the error notice. Mixing the two streams
+            # would let stderr noise leak into the CODE_RE predicate
+            # below and possibly mis-classify the run.
+            echo "Fetching PR #$PR_NUMBER file list via REST API..."
+            API_ERR_FILE=$(mktemp)
+            if ! CHANGED=$(gh api --paginate "repos/$REPO/pulls/$PR_NUMBER/files" --jq '.[].filename' 2>"$API_ERR_FILE"); then
+              # API/auth/rate-limit failure: don't cascade. Default
+              # to `code=true` so the real lint/test runs anyway.
+              # Surface the underlying error message in the notice
+              # so an operator debugging a flake sees what GitHub
+              # actually returned.
+              api_err=$(cat "$API_ERR_FILE" | tr '\n' ' ' | head -c 200)
+              rm -f "$API_ERR_FILE"
+              emit_and_exit "true" "REST /pulls/$PR_NUMBER/files failed (${api_err:-no stderr}), defaulting to full CI"
+            fi
+            rm -f "$API_ERR_FILE"
+          else
+            # Any non-`pull_request` event (push to main per the
+            # workflow trigger, plus `workflow_dispatch` for manual
+            # re-runs) bypasses the path filter and runs full CI.
+            #
+            # Rationale: the path-filter optimisation exists for
+            # developer iteration on PR branches (typical PR is
+            # N small commits, fast feedback matters). Merges to
+            # main are integration events validating what ships;
+            # manual workflow dispatches are operator-initiated and
+            # are by definition non-routine. Neither has an
+            # iteration loop to optimise. Skipping CI on a
+            # "docs-only" push to main would ALSO be structurally
+            # unsafe given the compare API's known 300-entry
+            # `.files` truncation cap — a large code-changing merge
+            # could be misclassified as `code=false` and silently
+            # skip validation.
+            emit_and_exit "true" "$EVENT_NAME event — always run full CI (no path filter outside PRs)"
+          fi
+          echo "Changed files:"
+          printf '%s\n' "$CHANGED" | sed 's/^/  /'
+          # Predicate: anything that affects compile / lint / test
+          # results counts as code. The workflow file is included so
+          # changes to CI logic itself always trigger the full matrix
+          # (avoids self-skipping a CI refactor PR). The lint/test
+          # config files (`.config/nextest.toml`, `.rustfmt.toml`,
+          # `clippy.toml`) and the in-repo test fixtures
+          # (`test_fixture/`) are included because changes to any of
+          # them can flip the lint/test outcome on otherwise-identical
+          # source code — skipping the real validation on a PR that
+          # touches only those files would defeat the purpose of the
+          # required-check gate.
+          CODE_RE='^(src/|tests/|benches/|examples/|test_fixture/|build\.rs$|Cargo\.toml$|Cargo\.lock$|tools/|\.github/workflows/coordinode-ci\.yml$|rust-toolchain(\.toml)?$|\.cargo/|\.config/nextest\.toml$|\.rustfmt\.toml$|clippy\.toml$)'
+          if printf '%s\n' "$CHANGED" | grep -qE "$CODE_RE"; then
+            emit_and_exit "true" "code paths affected — running real CI"
+          else
+            emit_and_exit "false" "no code paths affected — fast success"
+          fi
+
   lint:
+    needs: changes
+    # `always() && !cancelled()` so the required `lint` check
+    # still runs (and emits its name to the ruleset) even if
+    # `changes` itself fails / is skipped — `!cancelled()` alone
+    # is NOT enough because GitHub's default needs-gating skips
+    # this job when a dependency fails. `always()` overrides that
+    # gating; the `!cancelled()` half lets a user-cancelled
+    # workflow run still report cancellation honestly. Empty
+    # `needs.changes.outputs.code` (changes job failed before
+    # emitting output) is caught below by the `!= 'false'` step
+    # guards, which default to running the real lint work (safe
+    # fallback).
+    if: ${{ always() && !cancelled() }}
     timeout-minutes: 10
     runs-on: ubuntu-latest
     steps:
+      # Surfaces a notice in the run log + summary so docs-only PRs
+      # leave an obvious trail explaining why the check passed
+      # without doing real work. Only fires on the explicit
+      # `code=false` signal — empty/unset (changes job failed)
+      # falls through to the real lint work below.
+      - name: Path-conditional skip notice
+        if: needs.changes.outputs.code == 'false'
+        run: |
+          echo "::notice::No code paths changed — skipping format + clippy. Required-check name still emitted as success."
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        if: needs.changes.outputs.code != 'false'
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
+        if: needs.changes.outputs.code != 'false'
         with:
           toolchain: stable
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2.9.1
+        if: needs.changes.outputs.code != 'false'
       - name: Format
+        if: needs.changes.outputs.code != 'false'
         run: cargo fmt --all -- --check
       - name: Clippy (strict)
+        if: needs.changes.outputs.code != 'false'
         run: cargo clippy --all-features -- -D warnings
 
   test:
-    needs: lint
+    needs: [changes, lint]
+    # `always() && !cancelled()` so the matrix entries still
+    # emit their names to the ruleset even if `changes` or
+    # `lint` fails / is skipped. `!cancelled()` alone is NOT
+    # enough because GitHub's default needs-gating skips this
+    # job when a dependency fails; `always()` overrides that
+    # gating, the `!cancelled()` half lets a user-cancelled
+    # workflow run still report cancellation honestly. Empty
+    # `needs.changes.outputs.code` is treated as "run real
+    # tests" via the `!= 'false'` step guards.
+    #
+    # Matrix-aware skip (run only the required entry on docs-
+    # only PRs) was attempted via a job-level
+    # `matrix.rust == 'stable' && matrix.os == 'ubuntu-latest'`
+    # branch in this `if:`, but the `matrix` context is NOT
+    # available at job-level expression evaluation — only at
+    # step-level and in job names. All 6 matrix entries run on
+    # docs-only PRs and emit the skip notice from their own
+    # step-level guards; if optimising runner-minute waste is
+    # later required, the right shape is a dynamic matrix via
+    # `fromJSON(needs.changes.outputs.matrix)` (with `changes`
+    # emitting two pre-baked JSON values), not job-level `if:`.
+    if: ${{ always() && !cancelled() }}
     timeout-minutes: 20
     strategy:
       fail-fast: true
@@ -72,17 +260,43 @@ jobs:
         os: [ubuntu-latest, windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
+      # Same path-conditional skip pattern as `lint`. ALL matrix
+      # entries emit their job name regardless of whether the inner
+      # steps ran, so `test (stable, ubuntu-latest)` — the entry
+      # listed in the branch ruleset as a required check — is
+      # always satisfied on docs-only PRs / lint-failed PRs
+      # without paying the full test cost.
+      #
+      # Three step-level cases for the inner work:
+      #   - code == 'false'                            → skip notice (docs-only PR)
+      #   - lint.result != 'success'                   → skip notice (lint broken; running tests adds noise on an already-failed PR)
+      #   - code != 'false' AND lint.result == 'success' → real work
+      # The job-level `if: always() && !cancelled()` keeps the
+      # required check name surfacing in all three cases.
+      - name: Path-conditional skip notice
+        if: needs.changes.outputs.code == 'false'
+        run: |
+          echo "::notice::No code paths changed — skipping nextest + doc tests + tools/. Required-check name still emitted as success."
+      - name: Lint-failed skip notice
+        if: needs.changes.outputs.code != 'false' && needs.lint.result != 'success'
+        run: |
+          echo "::notice::Lint failed (result=${{ needs.lint.result }}) — skipping test work to avoid duplicate noise on an already-failed PR. Required-check name still emitted; fix the lint failure to unblock real test runs."
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        if: needs.changes.outputs.code != 'false' && needs.lint.result == 'success'
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
+        if: needs.changes.outputs.code != 'false' && needs.lint.result == 'success'
         with:
           toolchain: ${{ matrix.rust }}
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2.9.1
+        if: needs.changes.outputs.code != 'false' && needs.lint.result == 'success'
         with:
           prefix-key: ${{ runner.os }}-cargo
       - uses: taiki-e/install-action@1ef5c5f58e85d25baaaa1704478fdd6c2921f2b5  # nextest
+        if: needs.changes.outputs.code != 'false' && needs.lint.result == 'success'
       - name: Run tests
+        if: needs.changes.outputs.code != 'false' && needs.lint.result == 'success'
         # tools/db_bench is a standalone crate, not in workspace — built separately
         env:
           # 32 cases is plenty for CI; PROPTEST_MAX_SHRINK trims the
@@ -93,11 +307,14 @@ jobs:
           PROPTEST_MAX_SHRINK: "100"
         run: cargo nextest run --profile ci --all-features
       - name: Run doc tests
+        if: needs.changes.outputs.code != 'false' && needs.lint.result == 'success'
         run: cargo test --doc --features lz4
       - name: Check db_bench crate
+        if: needs.changes.outputs.code != 'false' && needs.lint.result == 'success'
         working-directory: tools/db_bench
         run: cargo check --all-features
       - name: Build + test sst-dump crate
+        if: needs.changes.outputs.code != 'false' && needs.lint.result == 'success'
         # Standalone crate (not in workspace), exercise both the bin
         # build and the integration smoke tests so any drift in the
         # public verify::verify_sst_file API or the SST writer layout
@@ -109,7 +326,8 @@ jobs:
         run: cargo nextest run
 
   test-zstd:
-    needs: lint
+    needs: [changes, lint]
+    if: ${{ always() && !cancelled() && needs.lint.result == 'success' && needs.changes.outputs.code != 'false' }}
     timeout-minutes: 15
     strategy:
       fail-fast: true
@@ -152,7 +370,8 @@ jobs:
     # no-std-friendly (prefer `core::*` / `alloc::*`, gate std-only behind
     # `#[cfg(feature = "std")]`); reviewers should request the error count
     # from this job and compare against main.
-    needs: lint
+    needs: [changes, lint]
+    if: ${{ always() && !cancelled() && needs.lint.result == 'success' && needs.changes.outputs.code != 'false' }}
     continue-on-error: true
     timeout-minutes: 10
     runs-on: ubuntu-latest
@@ -197,8 +416,20 @@ jobs:
     # touch source, doesn't compile, doesn't run lint-sensitive
     # tooling. Running it in parallel with lint shaves ~10s off
     # the PR critical path: the matrix is ready when lint
-    # finishes, and `cross` (which `needs: [lint, cross-matrix]`)
-    # starts immediately rather than waiting for serial chain.
+    # finishes, and `cross` (which `needs: [changes, lint,
+    # cross-matrix]`) starts immediately rather than waiting for
+    # serial chain.
+    needs: changes
+    # cross-matrix doesn't depend on `lint` (it's a pure
+    # github.event_name / inputs lookup that emits a JSON target
+    # list), so the `needs.lint.result` gate the other downstream
+    # jobs carry doesn't apply here — the matrix-generation work
+    # is cheap (~2 s) and independent of lint passing. The
+    # `always() && !cancelled()` half still applies so a `changes`
+    # infra-failure doesn't silently skip the matrix generator
+    # (which would cascade into `cross` skipping for the wrong
+    # reason).
+    if: ${{ always() && !cancelled() && needs.changes.outputs.code != 'false' }}
     runs-on: ubuntu-latest
     outputs:
       targets: ${{ steps.set.outputs.targets }}
@@ -214,7 +445,8 @@ jobs:
           fi
 
   cross:
-    needs: [lint, cross-matrix]
+    needs: [changes, lint, cross-matrix]
+    if: ${{ always() && !cancelled() && needs.lint.result == 'success' && needs.changes.outputs.code != 'false' }}
     timeout-minutes: 15
     strategy:
       fail-fast: true
@@ -240,7 +472,8 @@ jobs:
         run: cross test -r --features lz4 --target ${{ matrix.target }}
 
   codecov:
-    needs: lint
+    needs: [changes, lint]
+    if: ${{ always() && !cancelled() && needs.lint.result == 'success' && needs.changes.outputs.code != 'false' }}
     timeout-minutes: 20
     runs-on: ubuntu-latest
     steps:
