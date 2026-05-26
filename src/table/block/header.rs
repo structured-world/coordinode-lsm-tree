@@ -64,8 +64,9 @@ pub struct Header {
     /// default), in which case no parity bytes follow — the *payload
     /// region* stays V5-shaped (header + payload, no trailer). The
     /// *header* itself is always V5: 4 extra bytes for this field
-    /// plus the bumped magic `[L,S,M,4]` (V5 was `[L,S,M,3]`), so a
-    /// pre-V5 reader rejects every V5 block at header decode
+    /// plus the bumped magic `[L,S,M,4]` (pre-V5 V3/V4 used
+    /// `[L,S,M,3]`), so a pre-V5 reader rejects every V5 block at
+    /// header decode
     /// regardless of `ecc_length`'s value. Non-zero when ECC is
     /// enabled — the reader uses it to read the parity bytes and
     /// attempt Reed-Solomon recovery on `data` XXH3 mismatch.

@@ -147,10 +147,11 @@ pub enum ManifestRecoveryMode {
     ///
     /// 1. Framing-layer XXH3 mismatch (the 8-byte digest in the
     ///    record header doesn't match `xxh3_64(payload)`).
-    /// 2. Framing-header structural failure (`len > MAX_FRAME_PAYLOAD`
-    ///    — surfaced as `BadHeader`; this is `LenMismatch` against a
-    ///    fixed-length-pin is a separate hard-abort case, not a
-    ///    record-decode mismatch for the purpose of this mode).
+    /// 2. Framing-header structural failure (`len > MAX_FRAME_PAYLOAD`),
+    ///    surfaced as `BadHeader`. Note: `LenMismatch` (decoded `len`
+    ///    disagrees with a fixed-length pin) is a SEPARATE hard-abort
+    ///    case in every recovery mode, not a record-decode mismatch
+    ///    for the purpose of this mode.
     /// 3. Payload decode failure AFTER a clean framing pass —
     ///    e.g. `Error::InvalidTag` from a corrupt `checksum_type`
     ///    byte inside an otherwise-framed-OK record. The framing

@@ -231,9 +231,12 @@ pub fn recover(folder: &Path, fs: &dyn Fs, mode: ManifestRecoveryMode) -> crate:
     //     truncated tail (`FramedRecordOutcome::TailTruncation`) is
     //     accepted.
     //   PointInTimeRecovery: tolerate_tail = true AND pit_prefix = true.
-    //     On ChecksumMismatch / BadHeader, behaves like reaching EOF
-    //     for the current level — the in-progress run + level + all
-    //     subsequent levels are dropped. The recovered prefix is the
+    //     On ChecksumMismatch / BadHeader, behaves like reaching EOF:
+    //     the in-progress record is dropped, the already-decoded
+    //     records inside the current run / level are preserved (pushed
+    //     before the break), and the rest of the manifest (this run's
+    //     remaining records, subsequent runs in this level, and all
+    //     subsequent levels) is abandoned. The recovered prefix is the
     //     consistent state up to the last good record-group boundary.
     //   SkipAnyCorruptedRecords: tolerate_tail = true AND skip_any = true.
     //     ChecksumMismatch on a single record is logged and skipped;
