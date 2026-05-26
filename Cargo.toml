@@ -65,6 +65,15 @@ lz4 = ["dep:lz4_flex", "std"]
 # version on the next release tag accordingly.
 zstd = ["dep:structured-zstd", "std"]
 encryption = ["dep:aes-gcm", "dep:chacha20poly1305", "dep:rand_chacha", "std"]
+# Per-block Reed-Solomon Page ECC. When enabled and `Config::page_ecc(true)`
+# is set on a tree, each block gets a Reed-Solomon parity trailer
+# computed over the on-disk payload (post-compression / post-encryption,
+# the same bytes XXH3 covers). On read, if the block-level XXH3
+# disagrees with the on-disk bytes, the reader attempts RS recovery
+# before surfacing the corruption. Recovers up to two corrupted shards
+# out of six (RS(4,2)). Disabled by default — pulls in the
+# `reed-solomon-simd` dep only when set.
+page_ecc = ["dep:reed-solomon-simd", "std"]
 bytes_1 = ["dep:bytes"]
 metrics = []
 # Vendored Ribbon filter retains its `#[cfg(feature = "ribbon-serde")]`
@@ -130,6 +139,10 @@ aes-gcm = { version = "=0.11.0-rc.3", optional = true, features = ["aes", "rand_
 # 0.11.0 lands.
 chacha20poly1305 = { version = "=0.11.0-rc.3", optional = true, features = ["rand_core"] }
 rand_chacha = { version = "0.10", optional = true }
+# Pure-Rust Reed-Solomon erasure coding, SIMD-accelerated on x86_64 / aarch64.
+# Used by the optional `page_ecc` feature for per-block parity. Apache-2.0 /
+# MIT, matches our license stance.
+reed-solomon-simd = { version = "3", optional = true, default-features = false }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = { version = "0.7", optional = true }
@@ -196,3 +209,9 @@ name = "lsp"
 harness = false
 path = "benches/lsp.rs"
 required-features = []
+
+[[bench]]
+name = "ecc"
+harness = false
+path = "benches/ecc.rs"
+required-features = ["page_ecc"]
