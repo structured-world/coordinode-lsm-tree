@@ -97,6 +97,32 @@ pub enum Error {
         got: Option<u32>,
     },
 
+    /// Per-record XXH3-64 mismatch inside a framed manifest section
+    /// (`tables` / `blob_files`). Distinct from
+    /// [`Error::ChecksumMismatch`] — same XXH3 family but a
+    /// different output width (XXH3-64 here vs XXH3-128 for
+    /// block-level payloads) on a different layer of the on-disk
+    /// format, with different recovery semantics (manifest framing
+    /// surfaces routed through `ManifestRecoveryMode`; block
+    /// checksums surface via `Error::ChecksumMismatch` for the
+    /// block I/O paths). Strict manifest recovery modes surface
+    /// this so an operator can see the exact 64-bit digests that
+    /// disagreed; `SkipAnyCorruptedRecords` and
+    /// `PointInTimeRecovery` route around the corruption without
+    /// raising it.
+    ManifestFrameChecksumMismatch {
+        /// SFA section the corrupt record was found in (e.g.
+        /// `"tables"`, `"blob_files"`). Static so this can be
+        /// compared without parsing message strings.
+        section: &'static str,
+        /// XXH3-64 digest the framing header claimed for the
+        /// record's payload.
+        expected: u64,
+        /// XXH3-64 digest the reader recomputed over the bytes
+        /// actually on disk.
+        got: u64,
+    },
+
     /// Range tombstone block decode failure.
     RangeTombstoneDecode {
         /// Which field or validation failed (e.g. `start_len`, `start`, `seqno`, `interval`)

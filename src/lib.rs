@@ -29,7 +29,7 @@
 //!   key.
 //! - **Range tombstones**: `delete_range` / `delete_prefix` (SST-encoded; the
 //!   feature was added in disk format V4 and remains supported in the current
-//!   V6 format — the V6 break extends the block header for per-block Reed-
+//!   V5 format — the V5 break extends the block header for per-block Reed-
 //!   Solomon Page ECC, not the tombstone encoding).
 //! - **Merge operators**: commutative-merge LSM operations with lazy resolution.
 //! - **K/V separation (`BlobTree`)**: large-value workloads with automatic GC.
@@ -59,14 +59,14 @@
 //!
 //! ## On-disk format
 //!
-//! Current version: **V6**. V6 introduces per-block Reed-Solomon Page ECC:
-//! the block header gains an `ecc_length` field and the block magic is
-//! bumped so a pre-V6 reader rejects V6 blocks immediately at header
-//! decode. V3-V5 databases are not readable by this version and vice
-//! versa. The manifest version gate rejects pre-V6 databases at
-//! `Tree::open` time. V5 introduced the `BuRR` filter wire format (still
-//! the current filter encoding); V4 introduced range tombstones (still
-//! supported).
+//! Current version: **V5**. V5 introduces the `BuRR` filter wire format
+//! and per-block Reed-Solomon Page ECC (collapsed into the same version
+//! because V5 had not shipped when both landed): the block header gains
+//! an `ecc_length` field and the block magic is bumped so a pre-V5
+//! reader rejects V5 blocks immediately at header decode. V3-V4
+//! databases are not readable by this version and vice versa. The
+//! manifest version gate rejects pre-V5 databases at `Tree::open` time.
+//! V4 introduced range tombstones (still supported).
 #![deny(clippy::all, missing_docs, clippy::cargo)]
 #![deny(clippy::unwrap_used)]
 #![deny(clippy::indexing_slicing)]

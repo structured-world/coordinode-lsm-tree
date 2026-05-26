@@ -3,6 +3,29 @@
 // Copyright (c) 2026-present, Structured World Foundation
 
 mod blob_file_list;
+// `framing` uses `std::io::{Read, Write}`. The whole `version`
+// module (recovery, persist, super_version, this file's
+// `Version::encode_into`) is also std-bound today and consumes
+// the framing helpers unconditionally. Gating only `framing`
+// behind `#[cfg(feature = "std")]` would NOT help the
+// no-std-check job at all — the callers (recovery, persist,
+// super_version) would then fail to resolve `framing` under
+// `--no-default-features --features alloc`, producing a
+// strictly-worse compile-error count than leaving it ungated
+// (one missing-module error per call site × N call sites vs the
+// existing std-only call sites failing to compile on their own
+// merits). The `no_std-check` job's metric is "error count must
+// not increase", and adding a feature gate here increases it.
+//
+// Migration plan: when the surrounding `version` submodules
+// (`recovery`, `persist`, `super_version`) are themselves ported
+// to `crate::io` traits + `crate::path` (tracked in the no-std
+// epic #274 with PR #311 / #347 as the first prerequisite),
+// `framing` gets migrated in the same pass so the whole
+// directory transitions to no-std together. See
+// `.github/workflows/coordinode-ci.yml` no-std-check job for the
+// progress meter.
+mod framing;
 mod optimize;
 mod persist;
 pub mod recovery;
@@ -712,7 +735,11 @@ impl Version {
         //
 
         writer.start("format_version")?;
-        writer.write_u8(FormatVersion::V6.into())?;
+        // V5 is currently pre-release (no published binary writes it yet),
+        // so the manifest layout under V5 may still be amended in-place.
+        // Once V5 ships, ANY on-disk byte change to the manifest under
+        // V5 must bump FormatVersion to V6. Policy tracked in #351.
+        writer.write_u8(FormatVersion::V5.into())?;
 
         writer.start("crate_version")?;
         writer.write_all(env!("CARGO_PKG_VERSION").as_bytes())?;
@@ -739,6 +766,33 @@ impl Version {
 
         writer.start("tables")?;
 
+        // Shared scratch buffer for per-record framing payloads.
+        // Reused across every table + blob record in this version,
+        // so the framing helper grows the buffer once and reuses it
+        // — no per-record heap allocation. The records are all
+        // <= 33 bytes today; pre-sized to cover the larger of the
+        // two so the first iteration doesn't trigger a realloc.
+        let mut framing_scratch: Vec<u8> = Vec::with_capacity(64);
+
+        // Per-record framing details live in src/version/framing.rs.
+        // Top-level shape inside the `tables` section after framing:
+        //   level_count: u8
+        //   for each level:
+        //     run_count: u8
+        //     for each run:
+        //       table_count: u32 LE
+        //       for each table:
+        //         FRAMED(table_record_payload)   // 12-byte header + payload
+        //
+        // The level / run / table_count counters stay unframed
+        // because they ARE the section's own structural shape — the
+        // pre-framing readers used them to walk the section and the
+        // framing-aware readers continue to use them the same way.
+        // Only the per-table record bytes (the 33-byte
+        // id+checksum_type+checksum+global_seqno payload) become
+        // framed so PointInTimeRecovery / SkipAnyCorruptedRecords
+        // have exact byte boundaries to skip on.
+
         // Level count
         #[expect(
             clippy::cast_possible_truncation,
@@ -762,12 +816,15 @@ impl Version {
                 )]
                 writer.write_u32::<LittleEndian>(run.len() as u32)?;
 
-                // Tables
+                // Tables — each one framed.
                 for table in run.iter() {
-                    writer.write_u64::<LittleEndian>(table.id())?;
-                    writer.write_u8(0)?; // Checksum type, 0 = XXH3
-                    writer.write_u128::<LittleEndian>(table.checksum().into_u128())?;
-                    writer.write_u64::<LittleEndian>(table.global_seqno())?;
+                    framing::write_framed_record(writer, &mut framing_scratch, |payload| {
+                        payload.write_u64::<LittleEndian>(table.id())?;
+                        payload.write_u8(0)?; // Checksum type, 0 = XXH3
+                        payload.write_u128::<LittleEndian>(table.checksum().into_u128())?;
+                        payload.write_u64::<LittleEndian>(table.global_seqno())?;
+                        Ok(())
+                    })?;
                 }
             }
         }
@@ -782,9 +839,15 @@ impl Version {
         writer.write_u32::<LittleEndian>(self.blob_files.len() as u32)?;
 
         for file in self.blob_files.iter() {
-            writer.write_u64::<LittleEndian>(file.id())?;
-            writer.write_u8(0)?; // Checksum type, 0 = XXH3
-            writer.write_u128::<LittleEndian>(file.0.checksum.into_u128())?;
+            // Per-blob record framed, same rationale as tables
+            // above; same scratch buffer keeps allocations at zero
+            // across the section boundary.
+            framing::write_framed_record(writer, &mut framing_scratch, |payload| {
+                payload.write_u64::<LittleEndian>(file.id())?;
+                payload.write_u8(0)?; // Checksum type, 0 = XXH3
+                payload.write_u128::<LittleEndian>(file.0.checksum.into_u128())?;
+                Ok(())
+            })?;
         }
 
         writer.start("blob_gc_stats")?;

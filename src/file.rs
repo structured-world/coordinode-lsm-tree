@@ -9,7 +9,7 @@ use crate::{
 use std::{io::Write, path::Path};
 
 // The trailing byte is bumped on every wire-format break of the block
-// header. Pre-V6 readers see `4` and reject the header immediately
+// header. Pre-V5 readers see `4` and reject the header immediately
 // (InvalidHeader) without trying to parse fields that have moved or
 // changed size. V5 used `3`. The manifest format-version gate is the
 // primary protection against version skew; this is the secondary

@@ -1891,7 +1891,7 @@ impl Tree {
             let reader = sfa::Reader::from_reader(&mut manifest_file)?;
             let manifest = Manifest::decode_from(&manifest_path, &reader, &*config.fs)?;
 
-            if !matches!(manifest.version, FormatVersion::V6) {
+            if !matches!(manifest.version, FormatVersion::V5) {
                 return Err(crate::Error::InvalidVersion(manifest.version.into()));
             }
 
