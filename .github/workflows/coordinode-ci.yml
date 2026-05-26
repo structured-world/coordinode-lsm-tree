@@ -91,7 +91,7 @@ jobs:
       # always emit `code=true` — see the inline rationale below.
       - name: Detect code-touching changes
         id: filter
-        # Override the runner's default `bash -eo pipefail` shell.
+        # Override the runner's default `-eo pipefail` flags.
         # GitHub Actions invokes the default `bash` step with
         # `bash --noprofile --norc -eo pipefail {0}`, so a script
         # that just adds `set -u` STILL inherits `-e` + pipefail
@@ -100,10 +100,11 @@ jobs:
         # (they `needs: changes`); any non-zero exit cascades to
         # "required check never reports" and blocks merges, which
         # is exactly the failure mode we built the safe-default
-        # output for. Drop down to a plain `bash {0}` so the
-        # implicit `-e` / `-o pipefail` doesn't second-guess the
-        # explicit failure-path handling in the script body.
-        shell: bash {0}
+        # output for. Keep `--noprofile --norc` so we still match
+        # the runner's clean-env defaults (no inherited dotfiles
+        # from a self-hosted runner with profile.d / bashrc) —
+        # we only drop the `-eo pipefail` half deliberately.
+        shell: bash --noprofile --norc {0}
         env:
           GH_TOKEN: ${{ github.token }}
           EVENT_NAME: ${{ github.event_name }}
