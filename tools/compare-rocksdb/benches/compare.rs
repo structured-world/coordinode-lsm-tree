@@ -167,12 +167,15 @@ fn run_write_throughput(
                 SequenceNumberCounter::default(),
             )
             .open()?;
-            for (i, (key, value)) in inputs.keys.iter().zip(inputs.values.iter()).enumerate() {
-                // `i` is bounded by `inputs.keys.len()` which is
-                // bounded by `WorkloadInputs::build(n_keys: u64)`;
-                // by construction `i < n_keys < u64::MAX`, so the
-                // cast is exact on every platform.
-                let seqno = u64::try_from(i)?;
+            // Zip the seqno counter as a native `u64` instead of
+            // enumerate()+try_from(usize). lsm-tree's `insert` takes
+            // SeqNo (= u64) directly; using `0u64..` avoids the
+            // per-iteration `usize -> u64` checked-cast that the
+            // RocksDB arm doesn't pay, keeping the timed inner loops
+            // structurally symmetric. The counter is bounded by
+            // `WorkloadInputs::build(n_keys: u64)` so it can never
+            // overflow within the iteration.
+            for ((key, value), seqno) in inputs.keys.iter().zip(inputs.values.iter()).zip(0u64..) {
                 tree.insert(key, value, seqno);
             }
             tree.flush_active_memtable(0)?;
