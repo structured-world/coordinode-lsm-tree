@@ -12,6 +12,21 @@
 //! cargo bench --features compare-rocksdb --bench compare_rocksdb
 //! ```
 //!
+//! On macOS, `librocksdb-sys`'s `bindgen` build script needs to
+//! find `libclang.dylib`. Brew's LLVM puts it under
+//! `/opt/homebrew/opt/llvm/lib`; export both
+//! `LIBCLANG_PATH` (bindgen) and `DYLD_FALLBACK_LIBRARY_PATH`
+//! (dyld for the build-script binary) before invoking cargo:
+//!
+//! ```text
+//! export LIBCLANG_PATH=/opt/homebrew/opt/llvm/lib
+//! export DYLD_FALLBACK_LIBRARY_PATH=/opt/homebrew/opt/llvm/lib
+//! cargo bench --features compare-rocksdb --bench compare_rocksdb
+//! ```
+//!
+//! Linux CI uses the distro `libclang.so` which `bindgen` finds
+//! without env-var help.
+//!
 //! ## Engine matrix
 //!
 //! The shared workload closure is parameterised over an [`Engine`]
