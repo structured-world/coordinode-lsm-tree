@@ -18,15 +18,21 @@ edition = "2024"
 publish = false
 
 [dependencies]
-# Local path dep on the main crate. `lz4` is the only feature we
-# need from lsm-tree for the harness today; if a future bench
-# scenario needs zstd dictionary or encryption, add features here
-# without disturbing the main crate's surface.
-lsm-tree = { package = "coordinode-lsm-tree", path = "../..", features = ["lz4"] }
+# Local path dep on the main crate. Default features only — the
+# initial workload (write_throughput) runs with
+# `DBCompressionType::None` on both engines, so no compression
+# codec is needed yet. Future `*_lz4` / `*_zstd` workload variants
+# will add the matching feature here AND set the matching
+# RocksDB compression type on the rocksdb side, so the two
+# engines stay aligned per-variant.
+lsm-tree = { package = "coordinode-lsm-tree", path = "../.." }
 # RocksDB binding — the whole reason this crate exists outside the
-# main `--all-features` graph. Pinned default-features=false +
-# explicit `lz4` to keep the C compile cost manageable.
-rocksdb = { version = "0.24", default-features = false, features = ["lz4"] }
+# main `--all-features` graph. `default-features = false` strips
+# the upstream default compression codecs (snappy, lz4, bz2, zlib,
+# zstd); the matching `*_lz4` / `*_zstd` features land alongside
+# the corresponding workload variants so the C-toolchain compile
+# burden scales with the workloads that actually need each codec.
+rocksdb = { version = "0.24", default-features = false }
 criterion = { version = "0.8", features = ["html_reports"] }
 tempfile = "3"
 
