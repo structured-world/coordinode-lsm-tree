@@ -6,10 +6,7 @@ mod filter;
 mod index;
 mod meta;
 
-use super::{
-    Block, BlockOffset, DataBlock, KeyedBlockHandle, block::Header as BlockHeader,
-    filter::BloomConstructionPolicy,
-};
+use super::{Block, BlockOffset, DataBlock, KeyedBlockHandle, filter::BloomConstructionPolicy};
 use crate::{
     Checksum, CompressionType, InternalValue, TableId, UserKey, ValueType,
     checksum::{ChecksumType, ChecksummedWriter},
@@ -112,6 +109,15 @@ pub struct Writer {
     /// Block encryption provider (if encryption at rest is enabled)
     encryption: Option<Arc<dyn EncryptionProvider>>,
 
+    /// Per-block Reed-Solomon Page ECC opt-in. When `true`, every
+    /// `Block::write_into` call this writer makes upgrades its
+    /// `BlockTransform` to the matching `*Ecc` variant so the
+    /// writer emits a parity trailer + records non-zero
+    /// `ecc_length` in the header. Default `false`. Caller wires
+    /// `Config::page_ecc` into this field via
+    /// [`Self::use_page_ecc`] before the first key is added.
+    page_ecc: bool,
+
     /// Pre-trained zstd dictionary for dictionary compression
     #[cfg(zstd_any)]
     zstd_dictionary: Option<Arc<crate::compression::ZstdDictionary>>,
@@ -185,6 +191,8 @@ impl Writer {
             range_tombstones: Vec::new(),
 
             encryption: None,
+
+            page_ecc: false,
 
             #[cfg(zstd_any)]
             zstd_dictionary: None,
@@ -334,6 +342,27 @@ impl Writer {
         self
     }
 
+    /// Wires the tree's `Config::page_ecc` flag into this writer.
+    /// When `true`, every block this writer emits upgrades its
+    /// `BlockTransform` to the matching `*Ecc` variant (so the
+    /// `Block::write_into` call emits a Reed-Solomon parity
+    /// trailer and records non-zero `ecc_length` in the header).
+    /// Must be called BEFORE the first key is added so all blocks
+    /// in the table use the same setting; the contract is
+    /// enforced by callers (`Tree::open` + compaction worker pass
+    /// the config once at writer construction).
+    ///
+    /// No-op on builds without the `page_ecc` cargo feature —
+    /// `BlockTransform::with_ecc` becomes the identity function
+    /// in that build and the flag is dead.
+    #[must_use]
+    pub fn use_page_ecc(mut self, page_ecc: bool) -> Self {
+        self.page_ecc = page_ecc;
+        self.index_writer = self.index_writer.use_page_ecc(page_ecc);
+        self.filter_writer = self.filter_writer.use_page_ecc(page_ecc);
+        self
+    }
+
     #[must_use]
     pub fn use_bloom_policy(mut self, bloom_policy: BloomConstructionPolicy) -> Self {
         self.bloom_policy = bloom_policy;
@@ -454,22 +483,23 @@ impl Writer {
                 window_log: 0,
             },
             // Data blocks use the configured codec and may carry a
-            // zstd dict; encryption is optional.
-            &crate::table::block::BlockTransform::from_parts(
-                self.data_block_compression,
-                self.encryption.as_deref(),
-                #[cfg(zstd_any)]
-                self.zstd_dictionary.as_deref(),
-            )?,
+            // zstd dict; encryption is optional. page_ecc upgrades
+            // the transform to its matching `*Ecc` variant when
+            // the tree was opened with `Config::page_ecc(true)`.
+            &{
+                let t = crate::table::block::BlockTransform::from_parts(
+                    self.data_block_compression,
+                    self.encryption.as_deref(),
+                    #[cfg(zstd_any)]
+                    self.zstd_dictionary.as_deref(),
+                )?;
+                if self.page_ecc { t.with_ecc() } else { t }
+            },
         )?;
 
         self.meta.uncompressed_size += u64::from(header.uncompressed_length);
 
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "block header is a couple of bytes only, so cast is fine"
-        )]
-        let bytes_written = BlockHeader::serialized_len() as u32 + header.data_length;
+        let bytes_written = header.on_disk_size();
 
         self.index_writer
             .register_data_block(KeyedBlockHandle::new(
@@ -644,10 +674,14 @@ impl Writer {
                 },
                 // Range-tombstone blocks are always uncompressed; the
                 // transform is Plain or Encrypted depending on the
-                // configured provider.
-                &match self.encryption.as_deref() {
-                    Some(enc) => crate::table::block::BlockTransform::Encrypted(enc),
-                    None => crate::table::block::BlockTransform::PLAIN,
+                // configured provider. page_ecc upgrades to the
+                // matching `*Ecc` variant when the tree opted in.
+                &{
+                    let t = match self.encryption.as_deref() {
+                        Some(enc) => crate::table::block::BlockTransform::Encrypted(enc),
+                        None => crate::table::block::BlockTransform::PLAIN,
+                    };
+                    if self.page_ecc { t.with_ecc() } else { t }
                 },
             )?;
         }
@@ -733,6 +767,7 @@ impl Writer {
             &mut self.file_writer,
             &mut self.block_buffer,
             self.encryption.as_deref(),
+            self.page_ecc,
             &meta_params,
         )?;
 
@@ -813,13 +848,17 @@ impl Writer {
                 window_log: 0,
             },
             // TLI tail mirror uses the same codec as the head and
-            // never carries a zstd dict.
-            &crate::table::block::BlockTransform::from_parts(
-                self.index_block_compression,
-                self.encryption.as_deref(),
-                #[cfg(zstd_any)]
-                None,
-            )?,
+            // never carries a zstd dict. page_ecc upgrades the
+            // transform when the tree opted in.
+            &{
+                let t = crate::table::block::BlockTransform::from_parts(
+                    self.index_block_compression,
+                    self.encryption.as_deref(),
+                    #[cfg(zstd_any)]
+                    None,
+                )?;
+                if self.page_ecc { t.with_ecc() } else { t }
+            },
         )?;
 
         // TAIL meta — the canonical, authoritative copy. `file_size`
@@ -844,6 +883,7 @@ impl Writer {
             &mut self.file_writer,
             &mut self.block_buffer,
             self.encryption.as_deref(),
+            self.page_ecc,
             &meta_params,
         )?;
 
@@ -920,6 +960,7 @@ fn write_meta_section<W: std::io::Write + std::io::Seek>(
     file_writer: &mut sfa::Writer<ChecksummedWriter<W>>,
     block_buffer: &mut Vec<u8>,
     encryption: Option<&dyn EncryptionProvider>,
+    page_ecc: bool,
     p: &MetaSectionParams<'_>,
 ) -> crate::Result<()> {
     file_writer.start(p.section_name)?;
@@ -1016,10 +1057,14 @@ fn write_meta_section<W: std::io::Write + std::io::Seek>(
         },
         // Meta blocks are always written uncompressed; the transform
         // is Plain or Encrypted depending on whether the table is
-        // keyed.
-        &match encryption {
-            Some(enc) => crate::table::block::BlockTransform::Encrypted(enc),
-            None => crate::table::block::BlockTransform::PLAIN,
+        // keyed. page_ecc upgrades to the matching `*Ecc` variant
+        // when the tree opted in.
+        &{
+            let t = match encryption {
+                Some(enc) => crate::table::block::BlockTransform::Encrypted(enc),
+                None => crate::table::block::BlockTransform::PLAIN,
+            };
+            if page_ecc { t.with_ecc() } else { t }
         },
     )?;
 

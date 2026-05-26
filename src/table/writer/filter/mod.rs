@@ -59,4 +59,11 @@ pub trait FilterWriter<W: std::io::Write + std::io::Seek> {
     /// this filter writer before `finish()`, otherwise the
     /// written blocks bind to `table_id = 0`.
     fn use_table_id(self: Box<Self>, table_id: crate::TableId) -> Box<dyn FilterWriter<W>>;
+
+    /// Wires the tree's `Config::page_ecc` flag through to every
+    /// `Block::write_into` call this filter writer makes. When
+    /// `true`, the `BlockTransform` passed to `write_into` gets
+    /// `.with_ecc()` applied so the matching `*Ecc` variant emits
+    /// a Reed-Solomon parity trailer.
+    fn use_page_ecc(self: Box<Self>, page_ecc: bool) -> Box<dyn FilterWriter<W>>;
 }

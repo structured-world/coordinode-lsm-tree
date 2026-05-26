@@ -264,7 +264,6 @@ mod tests {
 
     #[test]
     fn try_iter_zero_restart_interval_returns_invalid_trailer() {
-        use crate::Checksum;
         use crate::table::block::{BlockType, Header, Trailer};
 
         let handles = make_shared_prefix_handles(4);
@@ -272,24 +271,14 @@ mod tests {
 
         let block = Block {
             data: bytes.clone().into(),
-            header: Header {
-                block_type: BlockType::Index,
-                checksum: Checksum::from_raw(0),
-                data_length: 0,
-                uncompressed_length: 0,
-            },
+            header: Header::test_dummy(BlockType::Index),
         };
         let trailer_offset = Trailer::new(&block).trailer_offset();
         bytes[trailer_offset] = 0;
 
         let corrupt_index = IndexBlock::new(Block {
             data: bytes.into(),
-            header: Header {
-                block_type: BlockType::Index,
-                checksum: Checksum::from_raw(0),
-                data_length: 0,
-                uncompressed_length: 0,
-            },
+            header: Header::test_dummy(BlockType::Index),
         });
 
         let cmp = crate::comparator::default_comparator();
@@ -367,7 +356,6 @@ mod tests {
         /// the count) from a working dyn path (BS contributes exactly 7).
         /// See [`DYN_MIN_BS_PROBES`] for the full discrimination math.
         fn build_index_block_bs_dominated() -> IndexBlock {
-            use crate::Checksum;
             use crate::table::block::{BlockType, Header};
 
             let handles: Vec<_> = (0_u64..128)
@@ -382,12 +370,7 @@ mod tests {
             let bytes = IndexBlock::encode_into_vec_with_restart_interval(&handles, 1).unwrap();
             IndexBlock::new(Block {
                 data: bytes.into(),
-                header: Header {
-                    block_type: BlockType::Index,
-                    checksum: Checksum::from_raw(0),
-                    data_length: 0,
-                    uncompressed_length: 0,
-                },
+                header: Header::test_dummy(BlockType::Index),
             })
         }
 
@@ -586,7 +569,6 @@ mod tests {
             reason = "exhaustive equivalence matrix: 6 boundary needles × 3 entry points × (call + assert + landing-read + assert) is the actual coverage surface this test is meant to provide"
         )]
         fn index_block_seek_lex_and_dyn_agree_on_landing_position() {
-            use crate::Checksum;
             use crate::table::block::{BlockType, Header};
 
             // Smaller block where boundary needle behaviour is what we care
@@ -603,12 +585,7 @@ mod tests {
             let bytes = IndexBlock::encode_into_vec_with_restart_interval(&handles, 4).unwrap();
             let index_block = IndexBlock::new(Block {
                 data: bytes.into(),
-                header: Header {
-                    block_type: BlockType::Index,
-                    checksum: Checksum::from_raw(0),
-                    data_length: 0,
-                    uncompressed_length: 0,
-                },
+                header: Header::test_dummy(BlockType::Index),
             });
 
             let lex: Arc<dyn UserComparator> = Arc::new(CountingComparator {

@@ -4,15 +4,36 @@
 //! `BlockTransform`: discriminated union of the four valid Block I/O
 //! payload transforms.
 //!
-//! Block I/O has exactly four valid combinations of compression and
-//! encryption:
+//! Block I/O has eight valid combinations: four `(compression,
+//! encryption)` pipelines, each crossed with the optional
+//! Reed-Solomon parity trailer (enabled via the `page_ecc` cargo
+//! feature):
 //!
-//! | Variant                       | Pipeline                                       |
-//! |-------------------------------|-----------------------------------------------|
-//! | [`BlockTransform::Plain`]                     | raw → checksum → disk                     |
-//! | [`BlockTransform::Compressed`]                | raw → compress → checksum → disk          |
-//! | [`BlockTransform::Encrypted`]                 | raw → encrypt → checksum → disk           |
-//! | [`BlockTransform::CompressedAndEncrypted`]    | raw → compress → encrypt → checksum → disk |
+//! | Variant                                          | Pipeline                                               |
+//! |--------------------------------------------------|-------------------------------------------------------|
+//! | [`BlockTransform::Plain`]                        | raw → checksum → disk                                 |
+//! | [`BlockTransform::Compressed`]                   | raw → compress → checksum → disk                      |
+//! | [`BlockTransform::Encrypted`]                    | raw → encrypt → checksum → disk                       |
+//! | [`BlockTransform::CompressedAndEncrypted`]       | raw → compress → encrypt → checksum → disk            |
+//! | `BlockTransform::PlainEcc`                       | raw → checksum → ecc parity → disk                    |
+//! | `BlockTransform::CompressedEcc`                  | raw → compress → checksum → ecc parity → disk         |
+//! | `BlockTransform::EncryptedEcc`                   | raw → encrypt → checksum → ecc parity → disk          |
+//! | `BlockTransform::CompressedAndEncryptedEcc`      | raw → compress → encrypt → checksum → ecc parity → disk |
+//!
+//! The `Ecc` variants are only available when the `page_ecc` cargo
+//! feature is enabled; without it, the variant list collapses to
+//! the original four. ECC is orthogonal to compression / encryption:
+//! parity is computed over the on-disk payload after compression
+//! and after encryption, and lives in a trailer that is NOT
+//! covered by AEAD authentication and NOT included in the
+//! per-block XXH3 over the payload bytes. Tampering with the
+//! parity trailer therefore cannot be detected by AEAD or by the
+//! block checksum — it only impacts recoverability (a corrupted
+//! parity trailer means the codec can't repair payload bit-flips,
+//! but the payload itself is still authenticated by its own
+//! checksum / AEAD tag and tampering there fails the usual way).
+//! In other words: ECC is a best-effort recovery aid for bit-rot
+//! in the wire bytes, NOT an integrity primitive.
 //!
 //! Modelling the four paths as a single enum has two concrete wins
 //! over the previous "`(compression, encryption, zstd_dict)` triple"
@@ -85,10 +106,15 @@ pub struct CompressionContext<'a> {
 
 // `'a` is borrowed by `with_dict` (gated behind `zstd_any`). On
 // builds with no zstd backend the borrow drops out, but the
-// impl-level lifetime stays so method signatures stay valid
-// across the feature matrix without per-method `#[cfg]`
-// gymnastics. Feature-gated `#[expect]` only attaches in the
-// configuration where the lint actually fires.
+// impl-level lifetime stays so method signatures stay valid across
+// the feature matrix without per-method `#[cfg]` gymnastics.
+//
+// Feature-gated `#[expect]` rather than blanket `#[allow]`: under
+// any zstd feature `'a` IS used by `with_dict` and the lint does
+// NOT fire — wrapping `#[expect]` in `cfg_attr(not(zstd_any), ..)`
+// keeps the stricter "lint expectation will self-expire if the
+// underlying code stops triggering" semantics, just feature-scoped
+// to the build where the lint actually fires.
 #[cfg_attr(
     not(zstd_any),
     expect(
@@ -199,6 +225,34 @@ pub enum BlockTransform<'a> {
 
     /// `raw → compress → encrypt → checksum → disk`.
     CompressedAndEncrypted(CompressionContext<'a>, &'a dyn EncryptionProvider),
+
+    /// `raw → checksum → ecc parity → disk`. Same as [`Self::Plain`]
+    /// but emits a Reed-Solomon (4, 2) parity trailer after the
+    /// on-disk payload. Header's `ecc_length` records the parity
+    /// length so the reader can verify-and-recover from a single
+    /// data-shard loss without a separate sidecar.
+    #[cfg(feature = "page_ecc")]
+    PlainEcc,
+
+    /// `raw → compress → checksum → ecc parity → disk`.
+    #[cfg(feature = "page_ecc")]
+    CompressedEcc(CompressionContext<'a>),
+
+    /// `raw → encrypt → checksum → ecc parity → disk`. The parity is
+    /// computed over the encrypted ciphertext and stored in a
+    /// trailer outside the AEAD-authenticated region. Tampering with
+    /// the ciphertext fails AEAD verification on read the usual way;
+    /// tampering with the parity trailer specifically is NOT detected
+    /// by AEAD (the trailer isn't part of the authenticated payload
+    /// and isn't covered by the per-block XXH3 either) — it only
+    /// impacts recoverability. ECC is a best-effort recovery aid for
+    /// bit-rot, not an integrity primitive on top of AEAD.
+    #[cfg(feature = "page_ecc")]
+    EncryptedEcc(&'a dyn EncryptionProvider),
+
+    /// `raw → compress → encrypt → checksum → ecc parity → disk`.
+    #[cfg(feature = "page_ecc")]
+    CompressedAndEncryptedEcc(CompressionContext<'a>, &'a dyn EncryptionProvider),
 }
 
 impl BlockTransform<'_> {
@@ -214,39 +268,110 @@ impl BlockTransform<'_> {
 
     /// Codec discriminator for this transform.
     ///
-    /// `Plain` / `Encrypted` map to [`CompressionType::None`];
-    /// `Compressed` / `CompressedAndEncrypted` return the inner
-    /// codec.
+    /// `Plain` / `Encrypted` (and their `Ecc` siblings) map to
+    /// [`CompressionType::None`]; `Compressed` / `CompressedAndEncrypted`
+    /// (and their `Ecc` siblings) return the inner codec.
     #[must_use]
     pub fn compression(&self) -> CompressionType {
         match self {
             Self::Plain | Self::Encrypted(_) => CompressionType::None,
             Self::Compressed(ctx) | Self::CompressedAndEncrypted(ctx, _) => ctx.kind(),
+            #[cfg(feature = "page_ecc")]
+            Self::PlainEcc | Self::EncryptedEcc(_) => CompressionType::None,
+            #[cfg(feature = "page_ecc")]
+            Self::CompressedEcc(ctx) | Self::CompressedAndEncryptedEcc(ctx, _) => ctx.kind(),
         }
     }
 
     /// Optional zstd dictionary reference for this transform.
     ///
-    /// Only `Compressed` / `CompressedAndEncrypted` variants can
-    /// carry one; the other two variants return `None`.
+    /// Only `Compressed` / `CompressedAndEncrypted` (and their `Ecc`
+    /// siblings) variants can carry one; the other variants return
+    /// `None`.
     #[cfg(zstd_any)]
     #[must_use]
     pub fn zstd_dict(&self) -> Option<&ZstdDictionary> {
         match self {
             Self::Plain | Self::Encrypted(_) => None,
             Self::Compressed(ctx) | Self::CompressedAndEncrypted(ctx, _) => ctx.zstd_dict(),
+            #[cfg(feature = "page_ecc")]
+            Self::PlainEcc | Self::EncryptedEcc(_) => None,
+            #[cfg(feature = "page_ecc")]
+            Self::CompressedEcc(ctx) | Self::CompressedAndEncryptedEcc(ctx, _) => ctx.zstd_dict(),
         }
     }
 
     /// Optional encryption provider for this transform.
     ///
-    /// Only `Encrypted` / `CompressedAndEncrypted` variants carry
-    /// one; the other two return `None`.
+    /// Only `Encrypted` / `CompressedAndEncrypted` (and their `Ecc`
+    /// siblings) variants carry one; the other variants return `None`.
     #[must_use]
     pub fn encryption(&self) -> Option<&dyn EncryptionProvider> {
         match self {
             Self::Plain | Self::Compressed(_) => None,
             Self::Encrypted(enc) | Self::CompressedAndEncrypted(_, enc) => Some(*enc),
+            #[cfg(feature = "page_ecc")]
+            Self::PlainEcc | Self::CompressedEcc(_) => None,
+            #[cfg(feature = "page_ecc")]
+            Self::EncryptedEcc(enc) | Self::CompressedAndEncryptedEcc(_, enc) => Some(*enc),
+        }
+    }
+
+    /// Whether this transform emits a Reed-Solomon parity trailer
+    /// after the on-disk payload. Always `false` when the
+    /// `page_ecc` feature is disabled (the `Ecc` variants don't
+    /// exist in that build, so the match degenerates to a single
+    /// arm and the compiler folds the call to a constant).
+    #[must_use]
+    pub fn page_ecc(&self) -> bool {
+        match self {
+            Self::Plain
+            | Self::Compressed(_)
+            | Self::Encrypted(_)
+            | Self::CompressedAndEncrypted(_, _) => false,
+            #[cfg(feature = "page_ecc")]
+            Self::PlainEcc
+            | Self::CompressedEcc(_)
+            | Self::EncryptedEcc(_)
+            | Self::CompressedAndEncryptedEcc(_, _) => true,
+        }
+    }
+
+    /// Returns the matching `*Ecc` variant of this transform when
+    /// the `page_ecc` cargo feature is enabled, or the transform
+    /// unchanged when the feature is off.
+    ///
+    /// Lets writer call sites stay compact when they need to
+    /// conditionally emit a parity trailer based on a runtime flag
+    /// (`Config::page_ecc(true)`):
+    ///
+    /// ```text
+    /// let transform = BlockTransform::from_parts(...)?;
+    /// let transform = if config.page_ecc {
+    ///     transform.with_ecc()
+    /// } else {
+    ///     transform
+    /// };
+    /// ```
+    ///
+    /// On builds without the `page_ecc` feature the Ecc variants
+    /// don't exist and this method becomes the identity function —
+    /// the compiler folds it out at the call site so the
+    /// runtime-flag branch is dead code.
+    #[must_use]
+    pub fn with_ecc(self) -> Self {
+        match self {
+            #[cfg(feature = "page_ecc")]
+            Self::Plain => Self::PlainEcc,
+            #[cfg(feature = "page_ecc")]
+            Self::Compressed(ctx) => Self::CompressedEcc(ctx),
+            #[cfg(feature = "page_ecc")]
+            Self::Encrypted(enc) => Self::EncryptedEcc(enc),
+            #[cfg(feature = "page_ecc")]
+            Self::CompressedAndEncrypted(ctx, enc) => Self::CompressedAndEncryptedEcc(ctx, enc),
+            // Already-Ecc variants pass through; on builds with
+            // the feature off, every variant lands here.
+            other => other,
         }
     }
 }
@@ -318,5 +443,46 @@ impl<'a> BlockTransform<'a> {
             Some(enc) => Self::CompressedAndEncrypted(ctx, enc),
             None => Self::Compressed(ctx),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn plain_transform_reports_no_compression_no_encryption_no_ecc() {
+        let t = BlockTransform::Plain;
+        assert_eq!(t.compression(), CompressionType::None);
+        assert!(t.encryption().is_none());
+        assert!(!t.page_ecc());
+    }
+
+    #[test]
+    fn plain_constant_matches_plain_variant() {
+        let t = BlockTransform::PLAIN;
+        assert!(matches!(t, BlockTransform::Plain));
+        assert!(!t.page_ecc());
+    }
+
+    #[cfg(feature = "page_ecc")]
+    #[test]
+    fn plain_ecc_variant_reports_ecc_enabled_no_other_transform() {
+        let t = BlockTransform::PlainEcc;
+        assert_eq!(t.compression(), CompressionType::None);
+        assert!(t.encryption().is_none());
+        assert!(t.page_ecc());
+    }
+
+    #[cfg(all(feature = "page_ecc", feature = "lz4"))]
+    #[test]
+    fn compressed_ecc_carries_compression_kind_and_reports_ecc() {
+        let Ok(ctx) = CompressionContext::new(CompressionType::Lz4) else {
+            panic!("Lz4 ctx construction is total");
+        };
+        let t = BlockTransform::CompressedEcc(ctx);
+        assert_eq!(t.compression(), CompressionType::Lz4);
+        assert!(t.encryption().is_none());
+        assert!(t.page_ecc());
     }
 }

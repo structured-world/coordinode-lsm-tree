@@ -107,6 +107,7 @@ pub(super) fn prepare_table_writer(
         // replaces the writer entirely (handled above, lines 85-90).
         .use_prefix_extractor(opts.config.prefix_extractor.clone())
         .use_encryption(opts.config.encryption.clone())
+        .use_page_ecc(opts.config.page_ecc)
         .use_bloom_policy({
             use crate::config::FilterPolicyEntry::{Bloom, None};
             use crate::table::filter::BloomConstructionPolicy;
