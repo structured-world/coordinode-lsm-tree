@@ -367,8 +367,9 @@ jobs:
     # touch source, doesn't compile, doesn't run lint-sensitive
     # tooling. Running it in parallel with lint shaves ~10s off
     # the PR critical path: the matrix is ready when lint
-    # finishes, and `cross` (which `needs: [lint, cross-matrix]`)
-    # starts immediately rather than waiting for serial chain.
+    # finishes, and `cross` (which `needs: [changes, lint,
+    # cross-matrix]`) starts immediately rather than waiting for
+    # serial chain.
     needs: changes
     if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
