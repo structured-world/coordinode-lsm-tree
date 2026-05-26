@@ -8,7 +8,13 @@ use crate::{
 };
 use std::{io::Write, path::Path};
 
-pub const MAGIC_BYTES: [u8; 4] = [b'L', b'S', b'M', 3];
+// The trailing byte is bumped on every wire-format break of the block
+// header. Pre-V6 readers see `4` and reject the header immediately
+// (InvalidHeader) without trying to parse fields that have moved or
+// changed size. V5 used `3`. The manifest format-version gate is the
+// primary protection against version skew; this is the secondary
+// defense at the block layer.
+pub const MAGIC_BYTES: [u8; 4] = [b'L', b'S', b'M', 4];
 
 pub const TABLES_FOLDER: &str = "tables";
 pub const BLOBS_FOLDER: &str = "blobs";

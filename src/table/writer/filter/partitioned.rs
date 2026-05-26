@@ -11,7 +11,7 @@ use crate::{
     prefix::PrefixExtractor,
     table::{
         Block, BlockHandle, BlockOffset, IndexBlock, KeyedBlockHandle,
-        block::Header as BlockHeader, filter::build_burr_filter_bytes,
+        filter::build_burr_filter_bytes,
     },
 };
 use std::{
@@ -48,6 +48,12 @@ pub struct PartitionedFilterWriter {
     /// Owning SST's table id. Set by the outer Writer via
     /// `use_table_id` before `spill_filter_partition` / `finish`.
     table_id: crate::TableId,
+
+    /// `Config::page_ecc` threaded by the outer Writer via
+    /// `use_page_ecc`. When `true`, every `BlockTransform` this
+    /// writer constructs for partition + TLI blocks upgrades to
+    /// its matching `*Ecc` variant.
+    page_ecc: bool,
 }
 
 impl PartitionedFilterWriter {
@@ -72,6 +78,7 @@ impl PartitionedFilterWriter {
 
             encryption: None,
             table_id: 0,
+            page_ecc: false,
         }
     }
 
@@ -121,18 +128,19 @@ impl PartitionedFilterWriter {
                 dict_id: 0,
                 window_log: 0,
             },
-            // Per-partition filter bodies are uncompressed.
-            &match self.encryption.as_deref() {
-                Some(enc) => crate::table::block::BlockTransform::Encrypted(enc),
-                None => crate::table::block::BlockTransform::PLAIN,
+            // Per-partition filter bodies are uncompressed; layer
+            // ECC on top when the tree was opened with
+            // `Config::page_ecc(true)`.
+            &{
+                let t = match self.encryption.as_deref() {
+                    Some(enc) => crate::table::block::BlockTransform::Encrypted(enc),
+                    None => crate::table::block::BlockTransform::PLAIN,
+                };
+                if self.page_ecc { t.with_ecc() } else { t }
             },
         )?;
 
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "data length never gets even close to 4 GiB"
-        )]
-        let bytes_written = (header.data_length as usize + BlockHeader::serialized_len()) as u32;
+        let bytes_written = header.on_disk_size();
 
         self.tli_handles.push(KeyedBlockHandle::new(
             key.clone(),
@@ -179,20 +187,20 @@ impl PartitionedFilterWriter {
             },
             // TLI for the partitioned filter uses the configured
             // index codec; no zstd dict is ever attached at this
-            // writer level.
-            &crate::table::block::BlockTransform::from_parts(
-                self.compression,
-                self.encryption.as_deref(),
-                #[cfg(zstd_any)]
-                None,
-            )?,
+            // writer level. page_ecc upgrades to the matching
+            // `*Ecc` variant when the tree opted in.
+            &{
+                let t = crate::table::block::BlockTransform::from_parts(
+                    self.compression,
+                    self.encryption.as_deref(),
+                    #[cfg(zstd_any)]
+                    None,
+                )?;
+                if self.page_ecc { t.with_ecc() } else { t }
+            },
         )?;
 
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "blocks never even approach u32 size"
-        )]
-        let bytes_written = BlockHeader::serialized_len() as u32 + header.data_length;
+        let bytes_written = header.on_disk_size();
 
         debug_assert!(bytes_written > 0, "Top level index should never be empty");
 
@@ -216,6 +224,11 @@ impl<W: std::io::Write + std::io::Seek> FilterWriter<W> for PartitionedFilterWri
 
     fn use_table_id(mut self: Box<Self>, table_id: crate::TableId) -> Box<dyn FilterWriter<W>> {
         self.table_id = table_id;
+        self
+    }
+
+    fn use_page_ecc(mut self: Box<Self>, page_ecc: bool) -> Box<dyn FilterWriter<W>> {
+        self.page_ecc = page_ecc;
         self
     }
 

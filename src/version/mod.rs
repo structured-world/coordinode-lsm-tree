@@ -722,7 +722,7 @@ impl Version {
         //
 
         writer.start("format_version")?;
-        writer.write_u8(FormatVersion::V5.into())?;
+        writer.write_u8(FormatVersion::V6.into())?;
 
         writer.start("crate_version")?;
         writer.write_all(env!("CARGO_PKG_VERSION").as_bytes())?;
