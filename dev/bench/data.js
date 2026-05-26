@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779734478179,
+  "lastUpdate": 1779803931272,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -10218,6 +10218,84 @@ window.BENCHMARK_DATA = {
             "value": 462656.59861753025,
             "unit": "ops/sec",
             "extra": "P50: 2.0us | P99: 5.4us | P99.9: 8.5us\nthreads: 1 | elapsed: 0.43s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "941b8a0b1d22ce43844e658be1f00e031287b47f",
+          "message": "feat(ecc): per-block Reed-Solomon Page ECC (#267) (#343)\n\n## Summary\n\nImplements [CP3\n#267](https://github.com/structured-world/coordinode-lsm-tree/issues/267)\n— per-block Reed-Solomon (4, 2) Page ECC, gated behind the `page_ecc`\ncargo feature and the `Config::page_ecc(true)` runtime opt-in. V6\nformat-version foundation (Cargo feature + `Error::PageEccUnsupported` +\n`MAGIC` bump + `BlockHeader.ecc_length` field + `Config` builder +\n`Tree::open` gate + `ecc.rs` encode/recover helpers) landed previously\non this branch; this PR adds the actual block I/O integration.\n\n## Changes\n\n- **`BlockTransform` enum extended** (`src/table/block/transform.rs`):\nfour new variants (`PlainEcc`, `CompressedEcc`, `EncryptedEcc`,\n`CompressedAndEncryptedEcc`) gated behind the `page_ecc` cargo feature;\nnew `page_ecc()` accessor returns `true` only for `Ecc` variants. Builds\nwithout the feature see the original 4-variant enum.\n- **`Block::write_into`** emits the Reed-Solomon (4, 2) parity trailer\nover the on-disk payload (post-compression / post-encryption) when\n`transform.page_ecc()` is `true`. Header's `ecc_length` records the\ntrailer size.\n- **`Block::from_reader` / `from_file`** share a new\n`read_payload_and_verify` helper that reads the payload + optional\nparity trailer, verifies XXH3 against `header.checksum`, and on mismatch\ncalls `ecc::try_recover` with the stored checksum as the oracle.\nRecovery surfaces as `Ok` with a warning log; exhaustion of all 15\nC(6,4) subsets returns `Error::PageEccUnrecoverable`.\n- **`Header::on_disk_size()`** returns `header + payload + ecc` as a\nsingle `u32`, replacing 6 manual `serialized_len + data_length`\ncomputations in writers that would otherwise underflow handle sizes by\n`ecc_length` bytes.\n\n## Tests + benches\n\n- Full test suite green on `--all-features` (1607/1607, includes 3 new\nECC integration tests: clean roundtrip, `from_reader` recovery from\nsingle-byte flip, `from_file` recovery from single-byte flip).\n- Full test suite green on default features (1428/1428, no regressions\non the non-ECC code path).\n- Lint pass clean on both `--all-features` and default.\n- ECC bench (`cargo bench --bench ecc --features page_ecc`) smoke run\nsuccessful. `encode_parity`, `try_recover/first_subset`, and\n`try_recover/all_subsets_fail` cover the write-side and read-side (happy\n+ worst case) hot paths.\n\n## Test plan\n\n- [x] Full test suite green on `--all-features`\n- [x] Full test suite green on default features (no `page_ecc`)\n- [x] Lint pass clean on `--all-features`\n- [x] Lint pass clean on default features\n- [x] ECC bench runs end-to-end\n- [x] ECC parity trailer round-trips through `from_reader`\n- [x] ECC parity trailer round-trips through `from_file`\n- [x] Single-byte data-shard flip recovers on both read paths\n- [x] Block handles correctly account for the parity trailer (writers\nuse `header.on_disk_size()`)\n\nCloses #267\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n\n## Summary by CodeRabbit\n\n* **New Features**\n* Added per-block Reed-Solomon error-correcting code (ECC) support for\nimproved data integrity and automatic recovery from corruption.\n  * New `page_ecc` configuration option enables optional ECC protection.\n\n* **Format Changes**\n* On-disk format updated from V5 to V6; incompatible with older versions\ndue to block header changes supporting ECC trailers.\n\n<!-- review_stack_entry_start -->\n\n[![Review Change\nStack](https://storage.googleapis.com/coderabbit_public_assets/review-stack-in-coderabbit-ui.svg)](https://app.coderabbit.ai/change-stack/structured-world/coordinode-lsm-tree/pull/343?utm_source=github_walkthrough&utm_medium=github&utm_campaign=change_stack)\n\n<!-- review_stack_entry_end -->\n\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-05-26T16:57:46+03:00",
+          "tree_id": "e90cac79a22c38398585b666791ff85b58f9c892",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/941b8a0b1d22ce43844e658be1f00e031287b47f"
+        },
+        "date": 1779803929488,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 1886042.2528348465,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.7us | P99.9: 3.7us\nthreads: 1 | elapsed: 0.11s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1229796.616788924,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.2us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 533560.6814054374,
+            "unit": "ops/sec",
+            "extra": "P50: 1.7us | P99: 4.9us | P99.9: 7.4us\nthreads: 1 | elapsed: 0.37s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3656054.013225812,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 3.0us | P99.9: 5.4us\nthreads: 1 | elapsed: 0.05s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 391065.7119623761,
+            "unit": "ops/sec",
+            "extra": "P50: 2.2us | P99: 5.5us | P99.9: 8.3us\nthreads: 1 | elapsed: 0.51s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 205079.96337965023,
+            "unit": "ops/sec",
+            "extra": "P50: 4.5us | P99: 5.8us | P99.9: 8.9us\nthreads: 1 | elapsed: 0.98s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1269938.180234846,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.2us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1133125.2160019944,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 1.5us | P99.9: 1.9us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 473548.953604915,
+            "unit": "ops/sec",
+            "extra": "P50: 1.9us | P99: 5.4us | P99.9: 8.0us\nthreads: 1 | elapsed: 0.42s | num: 200000 | iterations: 3"
           }
         ]
       }
