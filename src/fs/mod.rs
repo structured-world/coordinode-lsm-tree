@@ -50,7 +50,39 @@ pub use std_fs::StdFs;
 #[cfg(all(target_os = "linux", feature = "io-uring"))]
 pub use io_uring_fs::{IoUringFs, is_io_uring_available};
 
-use std::io::{self, Read, Seek, Write};
+// `Read` / `Write` / `Seek` come from `crate::io`, the local mirror
+// of `std::io` that compiles under `no_std + alloc`. Under `feature =
+// "std"` the blanket impls in `crate::io` forward to `std::io::*`, so
+// existing std-backed backends (`std_fs`, `io_uring_fs`) satisfy
+// these bounds without any change to their own impls.
+//
+// `io::{Result, Error, ErrorKind}` still come from `std::io` here
+// (no public re-export — `use std::io;` is a local module alias).
+// The trait *bounds* are what blocked no-std for this module; the
+// surrounding `io::Result<T>` return type still resolves to
+// `std::io::Result<T>` and will be migrated to `crate::io::Result<T>`
+// in a follow-up so we keep the diff scoped to what this issue
+// actually unblocks. `std::path::Path` likewise stays for now —
+// the path migration is the second blocker tracked separately.
+use crate::io::{Read, Seek, Write};
+use std::io;
+// `Read::take` is a provided method on the `std::io::Read` trait,
+// not on our supertrait alias `crate::io::Read`. The supertrait
+// relationship lets a value bounded on `crate::io::Read` flow into
+// APIs expecting `std::io::Read`, but Rust's method-resolution only
+// considers methods from traits that are IN SCOPE at the call site
+// — so without an explicit import of `std::io::Read`, `file.take(N)`
+// fails to resolve even though the receiver does implement
+// `std::io::Read`. Bring the std trait into scope anonymously here
+// so `take` / `chain` / `bytes` resolve on receivers below.
+use std::io::Read as _;
+// Same supertrait-alias resolution rule applies to `Seek::seek`: the
+// provided method lives on `std::io::Seek`, and `crate::io::Seek` is
+// an empty supertrait alias under `feature = "std"`. Without this
+// import, `file.seek(...)` (e.g. in `open_section_reader`) fails to
+// resolve. Bring `std::io::Seek` into scope anonymously alongside
+// `Read` so receivers below find both provided methods.
+use std::io::Seek as _;
 use std::path::{Path, PathBuf};
 
 /// Options for opening a file through the [`Fs`] trait.
