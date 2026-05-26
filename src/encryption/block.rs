@@ -29,7 +29,7 @@ use core::convert::TryFrom;
 use std::io::Cursor;
 
 use aes_gcm::aead::Generate;
-use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
+use byteorder::{BigEndian, ReadBytesExt};
 use structured_zstd::skippable::SkippableFrame;
 
 use super::aad::{AAD_LEN, BlockIdentity, EncryptionContext, FORMAT_VERSION_V1, SuiteId, build};
@@ -50,23 +50,30 @@ const SKIPPABLE_MAGIC_START: u32 = 0x184D_2A50;
 
 /// Decodes one skippable-frame header (8 bytes: 4-byte LE magic +
 /// 4-byte LE payload length), enforces the variant and the
-/// caller's payload-size cap BEFORE allocating, then reads
-/// exactly that many bytes into a `Vec<u8>`.
+/// caller's `min..=max` `PayloadLen` window BEFORE allocating,
+/// then reads exactly that many bytes into a `Vec<u8>`.
 ///
 /// Replaces a direct [`SkippableFrame::decode_from`] call so the
-/// cap on `PayloadLen` is enforced ahead of the allocation — the
+/// `PayloadLen` validation happens ahead of the allocation — the
 /// upstream API allocates the full declared length first and only
 /// then surfaces caller-side caps, which means a forged
 /// `PayloadLen = u32::MAX` would burn a 4 GiB allocation attempt
 /// before the read even started. Decoding the header manually
-/// rejects oversized frames at the cost of 8 bytes of upfront
-/// I/O.
-fn read_framed_payload_with_cap<R: std::io::Read>(
+/// rejects oversized / undersized frames at the cost of 8 bytes
+/// of upfront I/O.
+///
+/// `expected_variant`:
+/// - `Some(v)`: only this exact variant is acceptable; any other
+///   value (including out-of-range bytes) is rejected.
+/// - `None`: any variant in 0..=15 is acceptable; the variant byte
+///   is returned alongside the payload so the caller can dispatch.
+fn read_framed_payload<R: std::io::Read>(
     reader: &mut R,
-    expected_variant: u8,
+    expected_variant: Option<u8>,
+    min_payload: u32,
     max_payload: u32,
     err_ctor: fn(&'static str) -> DecryptError,
-) -> Result<Vec<u8>, DecryptError> {
+) -> Result<(u8, Vec<u8>), DecryptError> {
     let mut header = [0u8; 8];
     reader
         .read_exact(&mut header)
@@ -76,6 +83,9 @@ fn read_framed_payload_with_cap<R: std::io::Read>(
     // (variants 0..=15) this is `SKIPPABLE_MAGIC_START + variant`.
     let magic = u32::from_le_bytes([header[0], header[1], header[2], header[3]]);
     let variant = magic.wrapping_sub(SKIPPABLE_MAGIC_START);
+    if variant > 15 {
+        return Err(err_ctor("magic outside skippable-frame range"));
+    }
     // `variant > 15` already excludes any value outside u8 range,
     // so the subsequent narrowing cast is exact — guarded above.
     #[expect(
@@ -83,13 +93,18 @@ fn read_framed_payload_with_cap<R: std::io::Read>(
         reason = "guarded by `variant > 15` immediately above"
     )]
     let variant_byte = variant as u8;
-    if variant > 15 || variant_byte != expected_variant {
+    if let Some(v) = expected_variant
+        && variant_byte != v
+    {
         return Err(err_ctor("wrong frame magic / variant"));
     }
 
-    // 4-byte LE payload length. Cap BEFORE allocating so a
-    // crafted huge value rejects immediately.
+    // 4-byte LE payload length. Reject outside the [min, max]
+    // window BEFORE allocating.
     let payload_len = u32::from_le_bytes([header[4], header[5], header[6], header[7]]);
+    if payload_len < min_payload {
+        return Err(err_ctor("PayloadLen below spec minimum"));
+    }
     if payload_len > max_payload {
         return Err(err_ctor("PayloadLen exceeds cap"));
     }
@@ -98,7 +113,7 @@ fn read_framed_payload_with_cap<R: std::io::Read>(
     reader
         .read_exact(&mut payload)
         .map_err(|_| err_ctor("truncated frame payload"))?;
-    Ok(payload)
+    Ok((variant_byte, payload))
 }
 
 /// `MetadataPayload` size for v1 suites: 38 bytes
@@ -140,18 +155,13 @@ fn encode_metadata_payload(
     out.push(u8::from(identity.block_type));
     out.push(ctx.suite_id.as_byte());
     out.push(ctx.compression_type);
-    // `Vec<u8>` as a `Write` impl is infallible (the docs guarantee
-    // `write_all` returns `Ok` and never short-writes), so this
-    // branch can't fire. Map to `Unrecoverable` defensively
-    // instead of `.expect`/`.unwrap`-ing so the storage crate's
-    // `#[deny(clippy::expect_used)]` /
-    // `#[deny(clippy::unwrap_used)]` invariants hold even on the
-    // dead path.
-    out.write_u32::<BigEndian>(identity.dict_id)
-        .map_err(|_| ())
-        .unwrap_or_else(|()| {
-            log::error!("encode_metadata_payload: Vec writer returned Err (impossible)");
-        });
+    // Use the infallible byte-array path — `Vec` extension by
+    // a fixed-size slice cannot fail, sidestepping the
+    // `.write_u32::<BigEndian>` ? / .expect / log-and-continue
+    // shape that fights the storage crate's
+    // `#[deny(clippy::expect_used)]` / `_unwrap_used)]` lints
+    // without any partial-write risk on a theoretical error path.
+    out.extend_from_slice(&identity.dict_id.to_be_bytes());
     out.push(identity.window_log);
     out.extend_from_slice(nonce);
     out.extend_from_slice(tag);
@@ -200,6 +210,14 @@ fn decode_metadata_payload(payload: &[u8]) -> Result<ParsedMetadata, DecryptErro
     let suite_id = SuiteId::try_from(suite_byte)
         .map_err(|s| DecryptError::UnsupportedSuite { suite_id: s })?;
     let compression_type = read_u8(&mut cursor)?;
+    // Spec §5.1 row "CompressionType": tag values are 0 = None,
+    // 1 = Lz4, 3 = Zstd, 4 = ZstdDict. Tag 2 and tags >= 5 are
+    // reserved / unallocated and must be rejected.
+    if !matches!(compression_type, 0 | 1 | 3 | 4) {
+        return Err(DecryptError::MalformedMetadataFrame(
+            "CompressionType byte not in spec registry (0, 1, 3, 4)",
+        ));
+    }
     let dict_id = cursor
         .read_u32::<BigEndian>()
         .map_err(|_| DecryptError::MalformedMetadataFrame("truncated DictID"))?;
@@ -212,6 +230,27 @@ fn decode_metadata_payload(payload: &[u8]) -> Result<ParsedMetadata, DecryptErro
     if window_log != 0 && !(10..=31).contains(&window_log) {
         return Err(DecryptError::MalformedMetadataFrame(
             "WindowLog outside valid range (must be 0 or 10..=31)",
+        ));
+    }
+    // Cross-field invariants per spec §5.1:
+    // - `DictID` is non-zero ONLY when `CompressionType == 4`
+    //   (`ZstdDict`); other codecs must record `DictID = 0`.
+    // - `WindowLog` is non-zero ONLY when `CompressionType` is a
+    //   zstd-family codec (tags 3 or 4); non-zstd codecs must
+    //   record `WindowLog = 0`.
+    // Rejecting impossible combinations here keeps the AAD-bound
+    // codec context structurally valid: an attacker that flips a
+    // single CompressionType byte to relabel zstd-encrypted data
+    // as plaintext-with-a-dictionary breaks at this gate before
+    // the AEAD even runs.
+    if compression_type != 4 && dict_id != 0 {
+        return Err(DecryptError::MalformedMetadataFrame(
+            "non-zero DictID with non-ZstdDict CompressionType",
+        ));
+    }
+    if !matches!(compression_type, 3 | 4) && window_log != 0 {
+        return Err(DecryptError::MalformedMetadataFrame(
+            "non-zero WindowLog with non-zstd CompressionType",
         ));
     }
     // Zero-init scratch buffer that gets overwritten by the next
@@ -280,11 +319,16 @@ pub fn encrypt_block(
         crate::Error::Unrecoverable
     })?;
 
-    // Cap the on-disk body payload at 256 MiB to keep the
-    // BodyFrame's u32 PayloadLen field within
-    // BodyFrame::PayloadLen ≤ MAX_BODY_LEN. Caller mistakes that
-    // would otherwise produce undecodable frames surface here at
-    // encode time rather than later on the read path.
+    // Spec `docs/aad-block-format.md` §5.3 row "BodyFrame
+    // PayloadLen": valid range `[1, 256 MiB]` for v1 suites.
+    // Both bounds are enforced on the write path so an empty or
+    // oversized plaintext fails at encode time rather than
+    // producing a sealed block the decoder would later reject.
+    if plaintext.is_empty() {
+        return Err(crate::Error::Encrypt(
+            "plaintext must be non-empty per AAD-bound spec (BodyFrame PayloadLen >= 1)",
+        ));
+    }
     if plaintext.len() > MAX_BODY_LEN as usize {
         return Err(crate::Error::Encrypt("plaintext exceeds 256 MiB body cap"));
     }
@@ -332,13 +376,49 @@ pub fn encrypt_block(
     Ok(out)
 }
 
-/// Recovers plaintext from the `MetadataFrame ‖ BodyFrame` byte
-/// sequence produced by [`encrypt_block`].
+/// Output of [`decrypt_block`]: the decrypted plaintext PLUS the
+/// on-disk-recorded codec context that participated in the AAD.
+///
+/// The caller must thread `dict_id` and `window_log` through
+/// `structured_zstd::decoding::FrameDecoder::expect_dict_id` /
+/// `expect_window_descriptor` (or equivalent) when feeding the
+/// plaintext into a zstd frame decoder — that's the spec's
+/// post-decrypt validation contract from
+/// `docs/aad-block-format.md` §5.3, preventing inner-frame header
+/// mismatch / `DoS` via crafted zstd frames.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct DecryptedBlock {
+    /// Recovered plaintext from the `BodyFrame`'s AEAD ciphertext.
+    /// For zstd-compressed blocks this is the compressed inner
+    /// frame; the caller decompresses with the
+    /// `expect_dict_id`/`expect_window_descriptor` setters
+    /// initialised from [`Self::dict_id`] / [`Self::window_log`].
+    pub plaintext: Vec<u8>,
+
+    /// Codec discriminator parsed from `MetadataPayload` offset 4.
+    /// Spec-defined tags: 0=None, 1=Lz4, 3=Zstd, 4=ZstdDict.
+    pub compression_type: u8,
+
+    /// `DictID` parsed from `MetadataPayload` offset 5 (u32 BE).
+    /// Zero when not using a zstd dictionary.
+    pub dict_id: u32,
+
+    /// `WindowLog` parsed from `MetadataPayload` offset 9. Zero
+    /// when not using zstd; `10..=31` per RFC 8878 otherwise.
+    pub window_log: u8,
+}
+
+/// Recovers plaintext from the `MetadataFrame ‖ BodyFrame ‖ *trailing`
+/// byte sequence produced by [`encrypt_block`].
 ///
 /// Reads the `MetadataFrame`, parses the 38-byte payload, decodes
 /// the `BodyFrame`, reconstructs the AAD from `identity` + the
 /// parsed `EncryptionContext`, looks up the matching key from
-/// `key_chain`, and runs [`decrypt_in_place`].
+/// `key_chain`, runs [`decrypt_in_place`], then consumes any
+/// trailing optional skippable frames (variants 2..=15, e.g. the
+/// `EccFrame` at variant 2 owned by #254) until either EOF or
+/// non-conformant trailing bytes.
 ///
 /// `identity` MUST supply the three AAD-bound fields that are
 /// NOT recorded on disk: `tree_id`, `table_id`, and `block_offset`.
@@ -351,6 +431,14 @@ pub fn encrypt_block(
 /// `identity.window_log` — those three fields are IGNORED on the
 /// read path because the disk is the source of truth for them.
 ///
+/// The returned `compression_type` / `dict_id` / `window_log`
+/// fields on [`DecryptedBlock`] are the spec's post-decrypt
+/// validation contract: the caller MUST pass them through
+/// `FrameDecoder::expect_dict_id` / `expect_window_descriptor`
+/// before any zstd decode (per `docs/aad-block-format.md` §5.3).
+/// `decrypt_block` does not do the decompression itself — the
+/// crate's Block I/O layer owns that step.
+///
 /// # Errors
 ///
 /// See [`DecryptError`] for the failure-mode taxonomy.
@@ -358,37 +446,74 @@ pub fn decrypt_block(
     bytes: &[u8],
     identity: &BlockIdentity,
     key_chain: &dyn KeyChain,
-) -> Result<Vec<u8>, DecryptError> {
+) -> Result<DecryptedBlock, DecryptError> {
     let mut cursor = Cursor::new(bytes);
 
     // ── MetadataFrame ──────────────────────────────────────────
-    // Cap MetadataPayload at exactly 38 bytes upfront — v1 suites
-    // are fixed-size. A wire `PayloadLen` other than 38 is
-    // malformed by spec and gets rejected before allocation.
-    let metadata_payload = read_framed_payload_with_cap(
+    // v1 MetadataPayload is fixed at exactly 38 bytes; reject any
+    // other declared length upfront so a forged `PayloadLen`
+    // can't allocate-and-then-discard.
+    let (_, metadata_payload) = read_framed_payload(
         &mut cursor,
-        METADATA_VARIANT,
+        Some(METADATA_VARIANT),
+        METADATA_PAYLOAD_LEN_V1,
         METADATA_PAYLOAD_LEN_V1,
         DecryptError::MalformedMetadataFrame,
     )?;
     let parsed = decode_metadata_payload(&metadata_payload)?;
 
     // ── BodyFrame ──────────────────────────────────────────────
-    // Cap BodyPayload at the 256 MiB encode-side maximum BEFORE
-    // allocating, so a crafted PayloadLen near u32::MAX cannot
-    // trigger a 4 GiB allocation attempt.
-    //
-    // Empty body payloads are LEGAL per RFC 8878 (skippable frames
-    // can carry zero bytes) AND per AEAD semantics (encrypting an
-    // empty plaintext yields a 0-byte ciphertext + 16-byte tag in
-    // the MetadataFrame). encrypt_block on `&[]` produces a valid
-    // such frame; the decoder must accept it.
-    let mut ciphertext = read_framed_payload_with_cap(
+    // Spec `docs/aad-block-format.md` §5.3 row "BodyFrame
+    // PayloadLen": valid range `[1, 256 MiB]` for v1 suites.
+    // Empty body is forbidden by spec — encrypt_block enforces
+    // the matching rule on the write side.
+    let (_, mut ciphertext) = read_framed_payload(
         &mut cursor,
-        BODY_VARIANT,
+        Some(BODY_VARIANT),
+        1,
         MAX_BODY_LEN,
         DecryptError::MalformedBodyFrame,
     )?;
+
+    // ── Optional trailing skippable frames ─────────────────────
+    // Spec §5 row "encrypted-block": MetadataFrame ‖ BodyFrame
+    // followed by *zero or more* optional skippable frames in
+    // variants 2..=15 (e.g. EccFrame at variant 2 owned by
+    // #254). v1 readers MUST accept and skip those. Any
+    // remaining bytes that don't parse as a well-formed
+    // skippable frame are rejected — silently ignoring them
+    // would mean malformed trailing data is accepted as a valid
+    // block.
+    loop {
+        // Peek one byte to detect EOF without consuming bytes
+        // we'd then have to put back. Cursor::position() lets us
+        // do this cheaply.
+        let pos = cursor.position();
+        let total = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+        if pos >= total {
+            break;
+        }
+        // Read one more frame. Variant must be 2..=15 (anything
+        // else is malformed trailing data); payload bounded by
+        // MAX_BODY_LEN as a generic cap.
+        let (variant_byte, _) = read_framed_payload(
+            &mut cursor,
+            None,
+            0,
+            MAX_BODY_LEN,
+            DecryptError::MalformedBodyFrame,
+        )?;
+        if !(2..=15).contains(&variant_byte) {
+            return Err(DecryptError::MalformedBodyFrame(
+                "trailing frame variant outside spec-permitted range 2..=15",
+            ));
+        }
+        // Frame contents are spec-defined per-variant (e.g. ECC
+        // parity for variant 2). Beyond skipping, the contract
+        // for this layer is "tolerate and ignore" — verification
+        // of those frames belongs to whichever component owns
+        // their definition.
+    }
 
     // ── AAD reconstruction ──────────────────────────────────────
     // Reconstruct the BlockIdentity that participates in AAD using
@@ -426,7 +551,12 @@ pub fn decrypt_block(
         &parsed.tag,
         &mut ciphertext,
     )?;
-    Ok(ciphertext)
+    Ok(DecryptedBlock {
+        plaintext: ciphertext,
+        compression_type: parsed.ctx.compression_type,
+        dict_id: parsed.dict_id,
+        window_log: parsed.window_log,
+    })
 }
 
 #[cfg(test)]
@@ -463,7 +593,14 @@ mod tests {
         let plaintext = b"the quick brown fox";
         let sealed = encrypt_block(plaintext, &id(), &ctx(), &chain()).unwrap();
         let recovered = decrypt_block(&sealed, &id(), &chain()).unwrap();
-        assert_eq!(&recovered[..], plaintext);
+        assert_eq!(&recovered.plaintext[..], plaintext);
+        // Codec context echoes back from the MetadataPayload — the
+        // caller is expected to thread these through structured-zstd's
+        // FrameDecoder::expect_dict_id / expect_window_descriptor
+        // setters when feeding the plaintext into a zstd decode.
+        assert_eq!(recovered.compression_type, 0);
+        assert_eq!(recovered.dict_id, 0);
+        assert_eq!(recovered.window_log, 0);
     }
 
     #[test]
@@ -472,7 +609,7 @@ mod tests {
         let chacha_ctx = EncryptionContext::v1(0, SuiteId::ChaCha20Poly1305, 0);
         let sealed = encrypt_block(plaintext, &id(), &chacha_ctx, &chain()).unwrap();
         let recovered = decrypt_block(&sealed, &id(), &chain()).unwrap();
-        assert_eq!(&recovered[..], plaintext);
+        assert_eq!(&recovered.plaintext[..], plaintext);
     }
 
     #[test]
@@ -526,15 +663,16 @@ mod tests {
     }
 
     #[test]
-    fn roundtrip_empty_plaintext_recovers_empty() {
-        // RFC 8878 skippable frames allow zero-length payloads,
-        // and AEAD over empty plaintext yields a 0-byte ciphertext
-        // + the 16-byte tag (which lives in MetadataPayload, not
-        // BodyFrame). The decoder must accept the resulting
-        // BodyFrame with PayloadLen=0.
-        let sealed = encrypt_block(&[], &id(), &ctx(), &chain()).unwrap();
-        let recovered = decrypt_block(&sealed, &id(), &chain()).unwrap();
-        assert!(recovered.is_empty());
+    fn encrypt_block_rejects_empty_plaintext() {
+        // Spec docs/aad-block-format.md §5.3 row "BodyFrame
+        // PayloadLen": valid range [1, 256 MiB] for v1 suites.
+        // encrypt_block enforces the >= 1 floor so an empty input
+        // can't produce a sealed block the decoder would reject.
+        let err = encrypt_block(&[], &id(), &ctx(), &chain()).unwrap_err();
+        assert!(
+            matches!(err, crate::Error::Encrypt(_)),
+            "expected Error::Encrypt for empty plaintext, got {err:?}",
+        );
     }
 
     #[test]

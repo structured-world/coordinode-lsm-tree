@@ -33,7 +33,7 @@ use std::collections::HashMap;
 /// [`crate::encryption::error::DecryptError::AeadVerificationFailed`]
 /// so operators can tell key-rotation drift apart from active
 /// tampering.
-pub trait KeyChain {
+pub trait KeyChain: Send + Sync {
     /// Returns the 32-byte key for `epoch`, or `None` if the chain
     /// does not know that epoch.
     fn key(&self, epoch: u8) -> Option<&[u8; 32]>;
