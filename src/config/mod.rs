@@ -978,6 +978,14 @@ impl Config {
     /// [`crate::Error::PageEccUnsupported`] at `Tree::open` — the
     /// reader has no way to honour the parity trailer without the
     /// codec, so silently downgrading integrity is not an option.
+    ///
+    /// Wired into the on-disk write path via `MultiWriter::use_page_ecc`
+    /// at every `Tree::open` / `Tree::ingestion` / compaction-worker
+    /// MultiWriter construction site. With this flag set, every
+    /// `Block::write_into` call those writers make upgrades its
+    /// `BlockTransform` to the matching `*Ecc` variant — emitting a
+    /// Reed-Solomon parity trailer and recording non-zero
+    /// `ecc_length` in each block header.
     #[must_use]
     pub fn page_ecc(mut self, enabled: bool) -> Self {
         self.page_ecc = enabled;
