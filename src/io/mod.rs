@@ -174,9 +174,23 @@ impl From<std::io::Error> for Error {
             std::io::ErrorKind::WriteZero => ErrorKind::WriteZero,
             _ => ErrorKind::Other,
         };
-        // Use Display on the std error so OS-level detail
-        // (errno text, path context) survives the conversion.
-        Self::new(kind, alloc::format!("{err}"))
+        // If the std error carries actual context (an `errno`, a
+        // path / OS message, or a custom payload), preserve that
+        // Display text as our message so the OS-level detail
+        // survives the conversion. If it's a plain kind-only
+        // error (`std::io::Error::from(ErrorKind::X)`), skip the
+        // message entirely — our `Display` already prefixes the
+        // kind tag, so storing "entity not found" as the message
+        // would produce "entity not found: entity not found" on
+        // render AND burn an unnecessary heap allocation. The
+        // `raw_os_error.is_some() || get_ref().is_some()` check
+        // is the canonical std-side discriminator for "this
+        // error carries more than just a kind".
+        if err.raw_os_error().is_some() || err.get_ref().is_some() {
+            Self::new(kind, alloc::format!("{err}"))
+        } else {
+            Self::from_kind(kind)
+        }
     }
 }
 
@@ -318,7 +332,14 @@ pub trait Read {
         if buf.is_empty() {
             Ok(())
         } else {
-            Err(Error::from_kind(ErrorKind::UnexpectedEof))
+            // Match the stable message text `std::io::Read::read_exact`
+            // emits on the same short-read condition — callers that
+            // grep diagnostics for "failed to fill whole buffer" keep
+            // working without a feature-conditional branch.
+            Err(Error::new(
+                ErrorKind::UnexpectedEof,
+                "failed to fill whole buffer",
+            ))
         }
     }
 }
