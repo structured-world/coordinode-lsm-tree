@@ -264,29 +264,39 @@ jobs:
       # entries emit their job name regardless of whether the inner
       # steps ran, so `test (stable, ubuntu-latest)` — the entry
       # listed in the branch ruleset as a required check — is
-      # always satisfied on docs-only PRs without paying the full
-      # test cost. The skip notice only fires on the explicit
-      # `code=false` signal; empty/unset falls through to real work.
+      # always satisfied on docs-only PRs / lint-failed PRs
+      # without paying the full test cost.
+      #
+      # Three step-level cases for the inner work:
+      #   - code == 'false'                            → skip notice (docs-only PR)
+      #   - lint.result != 'success'                   → skip notice (lint broken; running tests adds noise on an already-failed PR)
+      #   - code != 'false' AND lint.result == 'success' → real work
+      # The job-level `if: always() && !cancelled()` keeps the
+      # required check name surfacing in all three cases.
       - name: Path-conditional skip notice
         if: needs.changes.outputs.code == 'false'
         run: |
           echo "::notice::No code paths changed — skipping nextest + doc tests + tools/. Required-check name still emitted as success."
+      - name: Lint-failed skip notice
+        if: needs.changes.outputs.code != 'false' && needs.lint.result != 'success'
+        run: |
+          echo "::notice::Lint failed (result=${{ needs.lint.result }}) — skipping test work to avoid duplicate noise on an already-failed PR. Required-check name still emitted; fix the lint failure to unblock real test runs."
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
-        if: needs.changes.outputs.code != 'false'
+        if: needs.changes.outputs.code != 'false' && needs.lint.result == 'success'
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
-        if: needs.changes.outputs.code != 'false'
+        if: needs.changes.outputs.code != 'false' && needs.lint.result == 'success'
         with:
           toolchain: ${{ matrix.rust }}
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2.9.1
-        if: needs.changes.outputs.code != 'false'
+        if: needs.changes.outputs.code != 'false' && needs.lint.result == 'success'
         with:
           prefix-key: ${{ runner.os }}-cargo
       - uses: taiki-e/install-action@1ef5c5f58e85d25baaaa1704478fdd6c2921f2b5  # nextest
-        if: needs.changes.outputs.code != 'false'
+        if: needs.changes.outputs.code != 'false' && needs.lint.result == 'success'
       - name: Run tests
-        if: needs.changes.outputs.code != 'false'
+        if: needs.changes.outputs.code != 'false' && needs.lint.result == 'success'
         # tools/db_bench is a standalone crate, not in workspace — built separately
         env:
           # 32 cases is plenty for CI; PROPTEST_MAX_SHRINK trims the
@@ -297,14 +307,14 @@ jobs:
           PROPTEST_MAX_SHRINK: "100"
         run: cargo nextest run --profile ci --all-features
       - name: Run doc tests
-        if: needs.changes.outputs.code != 'false'
+        if: needs.changes.outputs.code != 'false' && needs.lint.result == 'success'
         run: cargo test --doc --features lz4
       - name: Check db_bench crate
-        if: needs.changes.outputs.code != 'false'
+        if: needs.changes.outputs.code != 'false' && needs.lint.result == 'success'
         working-directory: tools/db_bench
         run: cargo check --all-features
       - name: Build + test sst-dump crate
-        if: needs.changes.outputs.code != 'false'
+        if: needs.changes.outputs.code != 'false' && needs.lint.result == 'success'
         # Standalone crate (not in workspace), exercise both the bin
         # build and the integration smoke tests so any drift in the
         # public verify::verify_sst_file API or the SST writer layout
