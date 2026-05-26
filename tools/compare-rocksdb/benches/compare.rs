@@ -153,8 +153,11 @@ impl WorkloadInputs {
 /// reproducible across criterion warmup vs measurement phases).
 /// Keys / values are precomputed in `inputs` so the timed body
 /// does NO per-key allocation.
-fn run_write_throughput(engine: Engine, inputs: &WorkloadInputs) -> Duration {
-    let dir = tempfile::tempdir().expect("tempdir");
+fn run_write_throughput(
+    engine: Engine,
+    inputs: &WorkloadInputs,
+) -> Result<Duration, Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
     let start = std::time::Instant::now();
     let elapsed = match engine {
         Engine::Ours => {
@@ -163,12 +166,16 @@ fn run_write_throughput(engine: Engine, inputs: &WorkloadInputs) -> Duration {
                 SequenceNumberCounter::default(),
                 SequenceNumberCounter::default(),
             )
-            .open()
-            .expect("open ours");
+            .open()?;
             for (i, (key, value)) in inputs.keys.iter().zip(inputs.values.iter()).enumerate() {
-                tree.insert(key, value, i as u64);
+                // `i` is bounded by `inputs.keys.len()` which is
+                // bounded by `WorkloadInputs::build(n_keys: u64)`;
+                // by construction `i < n_keys < u64::MAX`, so the
+                // cast is exact on every platform.
+                let seqno = u64::try_from(i)?;
+                tree.insert(key, value, seqno);
             }
-            tree.flush_active_memtable(0).expect("flush ours");
+            tree.flush_active_memtable(0)?;
             // Capture BEFORE `tree` drops so close-time background
             // work doesn't leak into the timed window.
             start.elapsed()
@@ -185,20 +192,20 @@ fn run_write_throughput(engine: Engine, inputs: &WorkloadInputs) -> Duration {
             // terminal flush) rather than penalising RocksDB for
             // its built-in WAL.
             opts.set_compression_type(rocksdb::DBCompressionType::None);
-            let db = rocksdb::DB::open(&opts, dir.path()).expect("open rocksdb");
+            let db = rocksdb::DB::open(&opts, dir.path())?;
             let mut write_opts = rocksdb::WriteOptions::default();
             write_opts.disable_wal(true);
             for (key, value) in inputs.keys.iter().zip(inputs.values.iter()) {
-                db.put_opt(key, value, &write_opts).expect("put rocksdb");
+                db.put_opt(key, value, &write_opts)?;
             }
-            db.flush().expect("flush rocksdb");
+            db.flush()?;
             // Capture BEFORE `db` drops so close-time background
             // work doesn't leak into the timed window.
             start.elapsed()
         }
     };
     drop(dir);
-    elapsed
+    Ok(elapsed)
 }
 
 fn bench_write_throughput(c: &mut Criterion) {
@@ -214,7 +221,19 @@ fn bench_write_throughput(c: &mut Criterion) {
                 b.iter_custom(|iters| {
                     let mut total = Duration::ZERO;
                     for _ in 0..iters {
-                        total += run_write_throughput(engine, &inputs);
+                        // Criterion's `iter_custom` closure must
+                        // return a `Duration`, not a `Result`.
+                        // `run_write_throughput` returns
+                        // `Result<Duration, ...>` so the engine
+                        // helpers themselves use `?` propagation
+                        // throughout, but at this boundary an I/O
+                        // failure invalidates the run — there is
+                        // no meaningful Duration to report — so
+                        // surface it as a bench panic with the
+                        // engine label for diagnosis.
+                        total += run_write_throughput(engine, &inputs).unwrap_or_else(|e| {
+                            panic!("run_write_throughput failed for {}: {e}", engine.label())
+                        });
                     }
                     total
                 });
