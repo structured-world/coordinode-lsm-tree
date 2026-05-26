@@ -312,6 +312,26 @@ pub fn recover(folder: &Path, fs: &dyn Fs, mode: ManifestRecoveryMode) -> crate:
             Err(e) => return Err(e.into()),
         };
 
+        // NOTE: `level_count` is the only unframed byte in the
+        // section, so a single bit flip can silently transform it
+        // into any other u8 value, and tolerant recovery modes
+        // would still produce a `Version` whose `level_count()`
+        // disagrees with the downstream
+        // `assert!(version.level_count() == 7)` in
+        // `src/compaction/leveled/mod.rs`. The architectural fix
+        // is to teach `compaction/leveled` to honour the version's
+        // actual level_count rather than the hardcoded `== 7`;
+        // tracked as a follow-up to this PR's first wave.
+        //
+        // Gating recovery on `level_count == DEFAULT_LEVEL_COUNT`
+        // here would force every fixture that uses sub-default
+        // level counts for compact test manifests to pad to 7
+        // levels even when the test only cares about a single
+        // level's worth of records, which is strictly more
+        // brittleness for no production benefit — real trees
+        // ALWAYS use the default level count, so the hardcoded
+        // downstream assertion only fires on actual corruption.
+
         'levels: for _ in 0..level_count {
             let mut level = vec![];
             let run_count = match reader.read_u8() {
@@ -593,21 +613,42 @@ pub fn recover(folder: &Path, fs: &dyn Fs, mode: ManifestRecoveryMode) -> crate:
                         }
                         FramedRecordOutcome::BadHeader => {
                             // Strict mode: the framing header was
-                            // structurally implausible (either `len`
-                            // above MAX_FRAME_PAYLOAD or `len` did
-                            // not match the fixed table-record
-                            // size). Surface as InvalidHeader with
-                            // a section-tagged static string so
-                            // operators can route on the variant
-                            // payload instead of parsing the
-                            // Display message.
+                            // structurally implausible (`len` above
+                            // MAX_FRAME_PAYLOAD). Surface as
+                            // InvalidHeader with a section-tagged
+                            // static string so operators can route
+                            // on the variant payload instead of
+                            // parsing the Display message.
                             log::error!(
                                 "manifest tables frame header rejected in version \
-                                 #{curr_version_id}: len out of bounds or != \
-                                 TABLE_ENTRY_PAYLOAD_LEN"
+                                 #{curr_version_id}: len exceeds MAX_FRAME_PAYLOAD"
                             );
                             return Err(crate::Error::InvalidHeader(
                                 "manifest tables frame header",
+                            ));
+                        }
+                        FramedRecordOutcome::LenMismatch { got, expected } => {
+                            // Schema drift: `len` is within the
+                            // implausibility cap but disagrees with
+                            // the fixed-size table-record contract.
+                            // This is writer / reader format
+                            // disagreement, NOT bit-rot — the bytes
+                            // on disk are well-formed for SOME
+                            // schema, just not the one this binary
+                            // decodes. Hard-abort in EVERY mode
+                            // (including PIT / SkipAny / tail-
+                            // tolerant): tolerant modes are for
+                            // power-loss recovery from our own
+                            // format, NOT for silently accepting
+                            // an incompatible on-disk schema.
+                            log::error!(
+                                "manifest tables frame len mismatch in version \
+                                 #{curr_version_id}: declared len={got}, \
+                                 expected fixed-size TABLE_ENTRY_PAYLOAD_LEN={expected} \
+                                 — schema drift, aborting regardless of recovery mode"
+                            );
+                            return Err(crate::Error::InvalidHeader(
+                                "manifest tables frame len mismatch",
                             ));
                         }
                     }
@@ -825,11 +866,28 @@ pub fn recover(folder: &Path, fs: &dyn Fs, mode: ManifestRecoveryMode) -> crate:
                     // without parsing the Display message.
                     log::error!(
                         "manifest blob_files frame header rejected in version \
-                         #{curr_version_id}: len out of bounds or != \
-                         BLOB_ENTRY_PAYLOAD_LEN"
+                         #{curr_version_id}: len exceeds MAX_FRAME_PAYLOAD"
                     );
                     return Err(crate::Error::InvalidHeader(
                         "manifest blob_files frame header",
+                    ));
+                }
+                FramedRecordOutcome::LenMismatch { got, expected } => {
+                    // Schema drift on the blob_files section. Same
+                    // reasoning as the tables section above: the
+                    // bytes on disk are well-formed for SOME schema
+                    // but not the one this binary decodes, so
+                    // tolerant modes MUST NOT mask the mismatch —
+                    // hard-abort regardless of the configured
+                    // ManifestRecoveryMode.
+                    log::error!(
+                        "manifest blob_files frame len mismatch in version \
+                         #{curr_version_id}: declared len={got}, \
+                         expected fixed-size BLOB_ENTRY_PAYLOAD_LEN={expected} \
+                         — schema drift, aborting regardless of recovery mode"
+                    );
+                    return Err(crate::Error::InvalidHeader(
+                        "manifest blob_files frame len mismatch",
                     ));
                 }
             }

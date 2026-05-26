@@ -5,13 +5,26 @@
 mod blob_file_list;
 // `framing` uses `std::io::{Read, Write}`. The whole `version`
 // module (recovery, persist, super_version, this file's
-// Version::encode_into) is also std-bound today and consumes the
-// framing helpers unconditionally; gating `framing` alone while
-// leaving its callers ungated would make `--no-default-features`
-// fail on an unresolved-module error — a net loss for the
-// no-std-check job. Leaving framing ungated until the whole
-// `version` module is migrated together in a future pass. See
-// `.github/workflows/coordinode-ci.yml` no-std-check job.
+// `Version::encode_into`) is also std-bound today and consumes
+// the framing helpers unconditionally. Gating only `framing`
+// behind `#[cfg(feature = "std")]` would NOT help the
+// no-std-check job at all — the callers (recovery, persist,
+// super_version) would then fail to resolve `framing` under
+// `--no-default-features --features alloc`, producing a
+// strictly-worse compile-error count than leaving it ungated
+// (one missing-module error per call site × N call sites vs the
+// existing std-only call sites failing to compile on their own
+// merits). The `no_std-check` job's metric is "error count must
+// not increase", and adding a feature gate here increases it.
+//
+// Migration plan: when the surrounding `version` submodules
+// (`recovery`, `persist`, `super_version`) are themselves ported
+// to `crate::io` traits + `crate::path` (tracked in the no-std
+// epic #274 with PR #311 / #347 as the first prerequisite),
+// `framing` gets migrated in the same pass so the whole
+// directory transitions to no-std together. See
+// `.github/workflows/coordinode-ci.yml` no-std-check job for the
+// progress meter.
 mod framing;
 mod optimize;
 mod persist;
