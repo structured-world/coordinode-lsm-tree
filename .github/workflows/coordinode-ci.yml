@@ -67,10 +67,13 @@ jobs:
     # so a missed deadline is the only remaining failure mode and
     # 10 min gives plenty of margin.
     timeout-minutes: 10
-    # Read-only token: we hit the GH REST API for the PR file list /
-    # push compare, never push, never write. Explicit `permissions:`
-    # block scopes the auto-provided GITHUB_TOKEN to exactly what
-    # this job needs, regardless of repo-default permission settings.
+    # Read-only token: the `pull_request` branch of the script
+    # below hits `/pulls/{N}/files`; non-PR events
+    # (`push` to main, `workflow_dispatch`) bypass the API
+    # entirely and just emit `code=true`. Either way, we never
+    # push and never write. Explicit `permissions:` block scopes
+    # the auto-provided GITHUB_TOKEN to exactly what this job
+    # needs, regardless of repo-default permission settings.
     permissions:
       contents: read
       pull-requests: read
@@ -226,17 +229,30 @@ jobs:
 
   test:
     needs: [changes, lint]
-    # `always() && !cancelled()` so the matrix entries (notably
-    # the required `test (stable, ubuntu-latest)`) still emit
-    # their names to the ruleset even if `changes` or `lint`
-    # fails / is skipped — `!cancelled()` alone is NOT enough
-    # because GitHub's default needs-gating skips this job when
-    # a dependency fails. `always()` overrides that gating; the
-    # `!cancelled()` half lets a user-cancelled workflow run
-    # still report cancellation honestly. Empty
-    # `needs.changes.outputs.code` is treated as "run real tests"
-    # via the `!= 'false'` step guards.
-    if: ${{ always() && !cancelled() }}
+    # `always() && !cancelled()` so the matrix entries still
+    # emit their names to the ruleset even if `changes` or
+    # `lint` fails / is skipped — `!cancelled()` alone is NOT
+    # enough because GitHub's default needs-gating skips this
+    # job when a dependency fails. `always()` overrides that
+    # gating; the `!cancelled()` half lets a user-cancelled
+    # workflow run still report cancellation honestly. Empty
+    # `needs.changes.outputs.code` is treated as "run real
+    # tests" via the `!= 'false'` step guards.
+    #
+    # On `code == 'false'` (docs-only PR), the matrix collapses
+    # to ONLY the required entry `test (stable, ubuntu-latest)`
+    # — there's no point scheduling 6 runners just to emit 5
+    # non-required skip notices. The condition reads as: "run
+    # unless cancelled, AND (full matrix if code-touching) OR
+    # (only the required entry if docs-only)". The empty/unset
+    # branch of `code` takes the first half via `!= 'false'`,
+    # matching the same fail-safe-to-running posture as the
+    # step-level guards.
+    if: >-
+      always() && !cancelled() && (
+        needs.changes.outputs.code != 'false'
+        || (matrix.rust == 'stable' && matrix.os == 'ubuntu-latest')
+      )
     timeout-minutes: 20
     strategy:
       fail-fast: true
