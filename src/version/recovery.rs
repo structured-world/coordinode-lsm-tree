@@ -414,12 +414,17 @@ pub fn recover(folder: &Path, fs: &dyn Fs, mode: ManifestRecoveryMode) -> crate:
                     // Pin the on-disk `len` to the fixed table-record
                     // payload size so a corrupted-but-plausible
                     // `len` cannot mis-align the cursor for the
-                    // next record under SkipAny — read_framed_record
-                    // returns BadHeader for `len != expected`,
-                    // which the section-drop fallback below
-                    // handles safely. The scratch buffer is reused
-                    // across every record in this section to keep
-                    // per-record heap allocations at zero.
+                    // next record under SkipAny. read_framed_record
+                    // returns `LenMismatch { got, expected }` for
+                    // `len != expected` (schema drift), which the
+                    // match arm below hard-aborts in EVERY recovery
+                    // mode — distinct from `BadHeader` (truly
+                    // implausible `len > MAX_FRAME_PAYLOAD`) which
+                    // is treated as in-section corruption and
+                    // section-dropped under PIT/SkipAny. The
+                    // scratch buffer is reused across every record
+                    // in this section to keep per-record heap
+                    // allocations at zero.
                     let outcome = crate::version::framing::read_framed_record(
                         &mut reader,
                         remaining,

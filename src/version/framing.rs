@@ -228,7 +228,7 @@ pub enum FramedRecordOutcome {
 ///
 /// `expected_payload_len`, when `Some(n)`, pins the record to a
 /// fixed payload size: any `len != n` is treated as
-/// [`FramedRecordOutcome::BadHeader`] BEFORE the payload is
+/// [`FramedRecordOutcome::LenMismatch`] BEFORE the payload is
 /// consumed, so a corrupted-but-plausible `len` (still within
 /// `MAX_FRAME_PAYLOAD` and the section bound) cannot mis-align
 /// the cursor for the next record. This is the critical safety
@@ -238,9 +238,18 @@ pub enum FramedRecordOutcome {
 /// have the `SkipAny` arm "continue past the record" — but the
 /// cursor is now off by `(corrupt_len - real_len)` bytes and the
 /// next read decodes garbage as a new record. With the pin, the
-/// reader stops at `BadHeader` (cursor has consumed only the 4-byte
-/// `len`, no payload bytes), the caller drops the rest of the
-/// section, and downstream sections decode correctly.
+/// reader stops at `LenMismatch` (cursor has consumed only the
+/// 4-byte `len`, no payload bytes); the recovery callers (see
+/// `src/version/recovery.rs`) hard-abort on `LenMismatch` in
+/// EVERY mode rather than dropping the rest of the section.
+/// This is the deliberate distinction from
+/// [`FramedRecordOutcome::BadHeader`] (truly implausible
+/// `len > MAX_FRAME_PAYLOAD`, treated as in-section corruption
+/// the tolerant modes can absorb): a size disagreement with the
+/// caller's fixed-length pin is writer / reader format drift,
+/// NOT power-loss bit-rot, and silently masking it via a
+/// section-drop would let an incompatible on-disk schema slip
+/// through tolerant recovery undetected.
 ///
 /// Pass `None` for variable-size records (none currently exist
 /// in the manifest, but the parameter is kept open-ended for
