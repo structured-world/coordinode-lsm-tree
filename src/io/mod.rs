@@ -100,7 +100,19 @@ pub struct Error {
 
 impl Error {
     /// Construct an error with the given kind and a context message.
-    /// Matches [`std::io::Error::new`].
+    ///
+    /// Analogous to [`std::io::Error::new`] but intentionally
+    /// narrower: this constructor takes a `String`-coercible
+    /// message and stores it verbatim, where std's `new()`
+    /// accepts `E: Into<Box<dyn std::error::Error + Send + Sync>>`
+    /// and carries a chained source via `Error::source()`. This
+    /// crate's error type has no source-chaining surface (and
+    /// can't have one under `no_std + alloc` without an alloc
+    /// dyn-trait shim), so an analogous "wrap an inner error"
+    /// helper would be misleading; callers wanting the source
+    /// payload of a std error use the `From<std::io::Error>`
+    /// bridge below, which renders the std Display into the
+    /// message field.
     pub fn new<M: Into<String>>(kind: ErrorKind, message: M) -> Self {
         Self {
             kind,
@@ -160,36 +172,52 @@ impl std::error::Error for Error {}
 #[cfg(feature = "std")]
 impl From<std::io::Error> for Error {
     fn from(err: std::io::Error) -> Self {
-        let kind = match err.kind() {
-            std::io::ErrorKind::AlreadyExists => ErrorKind::AlreadyExists,
-            std::io::ErrorKind::BrokenPipe => ErrorKind::BrokenPipe,
-            std::io::ErrorKind::CrossesDevices => ErrorKind::CrossesDevices,
-            std::io::ErrorKind::Interrupted => ErrorKind::Interrupted,
-            std::io::ErrorKind::InvalidData => ErrorKind::InvalidData,
-            std::io::ErrorKind::InvalidInput => ErrorKind::InvalidInput,
-            std::io::ErrorKind::NotFound => ErrorKind::NotFound,
-            std::io::ErrorKind::PermissionDenied => ErrorKind::PermissionDenied,
-            std::io::ErrorKind::UnexpectedEof => ErrorKind::UnexpectedEof,
-            std::io::ErrorKind::Unsupported => ErrorKind::Unsupported,
-            std::io::ErrorKind::WriteZero => ErrorKind::WriteZero,
-            _ => ErrorKind::Other,
+        let std_kind = err.kind();
+        let (kind, kind_is_mapped) = match std_kind {
+            std::io::ErrorKind::AlreadyExists => (ErrorKind::AlreadyExists, true),
+            std::io::ErrorKind::BrokenPipe => (ErrorKind::BrokenPipe, true),
+            std::io::ErrorKind::CrossesDevices => (ErrorKind::CrossesDevices, true),
+            std::io::ErrorKind::Interrupted => (ErrorKind::Interrupted, true),
+            std::io::ErrorKind::InvalidData => (ErrorKind::InvalidData, true),
+            std::io::ErrorKind::InvalidInput => (ErrorKind::InvalidInput, true),
+            std::io::ErrorKind::NotFound => (ErrorKind::NotFound, true),
+            std::io::ErrorKind::PermissionDenied => (ErrorKind::PermissionDenied, true),
+            std::io::ErrorKind::UnexpectedEof => (ErrorKind::UnexpectedEof, true),
+            std::io::ErrorKind::Unsupported => (ErrorKind::Unsupported, true),
+            std::io::ErrorKind::WriteZero => (ErrorKind::WriteZero, true),
+            _ => (ErrorKind::Other, false),
         };
-        // If the std error carries actual context (an `errno`, a
-        // path / OS message, or a custom payload), preserve that
-        // Display text as our message so the OS-level detail
-        // survives the conversion. If it's a plain kind-only
-        // error (`std::io::Error::from(ErrorKind::X)`), skip the
-        // message entirely — our `Display` already prefixes the
-        // kind tag, so storing "entity not found" as the message
-        // would produce "entity not found: entity not found" on
-        // render AND burn an unnecessary heap allocation. The
-        // `raw_os_error.is_some() || get_ref().is_some()` check
-        // is the canonical std-side discriminator for "this
-        // error carries more than just a kind".
+        // Message-attachment policy:
+        //
+        // - If the std error carries actual context (an `errno`, a
+        //   path / OS message, or a custom payload, detected by
+        //   `raw_os_error.is_some() || get_ref().is_some()` — the
+        //   canonical std-side discriminator for "this error
+        //   carries more than just a kind"), preserve its Display
+        //   output as our message so the OS-level detail survives.
+        //
+        // - If the std error is a plain kind-only one
+        //   (`std::io::Error::from(ErrorKind::X)`) AND we mapped
+        //   the kind, skip the message — our `Display` already
+        //   prefixes the kind tag, so storing "entity not found"
+        //   as the message would produce
+        //   "entity not found: entity not found" on render AND
+        //   burn an unnecessary heap allocation.
+        //
+        // - If the std error is kind-only but we DIDN'T map the
+        //   kind (`std::io::ErrorKind` is `#[non_exhaustive]`, e.g.
+        //   `OutOfMemory` / `ResourceBusy`), the user-visible
+        //   discriminant is otherwise lost in our `Other` bucket.
+        //   Preserve the std `Display` text in that case so an
+        //   unmapped kind still renders something useful (e.g.
+        //   "other error: out of memory") instead of just
+        //   "other error".
         if err.raw_os_error().is_some() || err.get_ref().is_some() {
             Self::new(kind, alloc::format!("{err}"))
-        } else {
+        } else if kind_is_mapped {
             Self::from_kind(kind)
+        } else {
+            Self::new(kind, alloc::format!("{err}"))
         }
     }
 }
