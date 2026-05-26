@@ -53,6 +53,7 @@ fn bench_index_block_seek(c: &mut Criterion) {
                 checksum: Checksum::from_raw(0),
                 data_length: data_len,
                 uncompressed_length: data_len,
+                ecc_length: 0,
             },
         });
 

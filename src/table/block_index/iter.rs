@@ -169,7 +169,6 @@ impl DoubleEndedIterator for OwnedIndexBlockIter {
 mod tests {
     use super::*;
     use crate::{
-        Checksum,
         comparator::default_comparator,
         table::BlockHandle,
         table::block::{BlockOffset, BlockType, Decoder, Header},
@@ -195,10 +194,9 @@ mod tests {
         IndexBlock::new(crate::table::block::Block {
             data: bytes.into(),
             header: Header {
-                block_type: BlockType::Index,
-                checksum: Checksum::from_raw(0),
                 data_length: data_len,
                 uncompressed_length: data_len,
+                ..Header::test_dummy(BlockType::Index)
             },
         })
     }

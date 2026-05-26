@@ -2,7 +2,7 @@
 mod tests {
     use crate::comparator::default_comparator;
     use crate::{
-        Checksum, InternalValue, SeqNo, Slice,
+        InternalValue, SeqNo, Slice,
         ValueType::{Tombstone, Value},
         table::{
             Block, DataBlock,
@@ -62,12 +62,7 @@ mod tests {
 
             let data_block = DataBlock::new(Block {
                 data: bytes.into(),
-                header: Header {
-                    block_type: BlockType::Data,
-                    checksum: Checksum::from_raw(0),
-                    data_length: 0,
-                    uncompressed_length: 0,
-                },
+                header: Header::test_dummy(BlockType::Data),
             });
 
             {
@@ -137,12 +132,7 @@ mod tests {
 
             let data_block = DataBlock::new(Block {
                 data: bytes.into(),
-                header: Header {
-                    block_type: BlockType::Data,
-                    checksum: Checksum::from_raw(0),
-                    data_length: 0,
-                    uncompressed_length: 0,
-                },
+                header: Header::test_dummy(BlockType::Data),
             });
 
             {
@@ -212,12 +202,7 @@ mod tests {
 
             let data_block = DataBlock::new(Block {
                 data: bytes.into(),
-                header: Header {
-                    block_type: BlockType::Data,
-                    checksum: Checksum::from_raw(0),
-                    data_length: 0,
-                    uncompressed_length: 0,
-                },
+                header: Header::test_dummy(BlockType::Data),
             });
 
             let mut iter = data_block.iter(default_comparator());
@@ -264,12 +249,7 @@ mod tests {
 
             let data_block = DataBlock::new(Block {
                 data: bytes.into(),
-                header: Header {
-                    block_type: BlockType::Data,
-                    checksum: Checksum::from_raw(0),
-                    data_length: 0,
-                    uncompressed_length: 0,
-                },
+                header: Header::test_dummy(BlockType::Data),
             });
 
             let iter = data_block
@@ -299,12 +279,7 @@ mod tests {
 
             let data_block = DataBlock::new(Block {
                 data: bytes.into(),
-                header: Header {
-                    block_type: BlockType::Data,
-                    checksum: Checksum::from_raw(0),
-                    data_length: 0,
-                    uncompressed_length: 0,
-                },
+                header: Header::test_dummy(BlockType::Data),
             });
 
             let iter = data_block
@@ -338,12 +313,7 @@ mod tests {
 
             let data_block = DataBlock::new(Block {
                 data: bytes.into(),
-                header: Header {
-                    block_type: BlockType::Data,
-                    checksum: Checksum::from_raw(0),
-                    data_length: 0,
-                    uncompressed_length: 0,
-                },
+                header: Header::test_dummy(BlockType::Data),
             });
 
             let mut iter = data_block.iter(default_comparator());
@@ -378,12 +348,7 @@ mod tests {
 
             let data_block = DataBlock::new(Block {
                 data: bytes.into(),
-                header: Header {
-                    block_type: BlockType::Data,
-                    checksum: Checksum::from_raw(0),
-                    data_length: 0,
-                    uncompressed_length: 0,
-                },
+                header: Header::test_dummy(BlockType::Data),
             });
 
             {
@@ -459,12 +424,7 @@ mod tests {
 
             let data_block = DataBlock::new(Block {
                 data: bytes.into(),
-                header: Header {
-                    block_type: BlockType::Data,
-                    checksum: Checksum::from_raw(0),
-                    data_length: 0,
-                    uncompressed_length: 0,
-                },
+                header: Header::test_dummy(BlockType::Data),
             });
 
             let mut iter = data_block.iter(default_comparator());
@@ -500,12 +460,7 @@ mod tests {
 
             let data_block = DataBlock::new(Block {
                 data: bytes.into(),
-                header: Header {
-                    block_type: BlockType::Data,
-                    checksum: Checksum::from_raw(0),
-                    data_length: 0,
-                    uncompressed_length: 0,
-                },
+                header: Header::test_dummy(BlockType::Data),
             });
 
             let mut iter = data_block.iter(default_comparator());
@@ -540,12 +495,7 @@ mod tests {
 
             let data_block = DataBlock::new(Block {
                 data: bytes.into(),
-                header: Header {
-                    block_type: BlockType::Data,
-                    checksum: Checksum::from_raw(0),
-                    data_length: 0,
-                    uncompressed_length: 0,
-                },
+                header: Header::test_dummy(BlockType::Data),
             });
 
             {
@@ -643,12 +593,7 @@ mod tests {
 
             let data_block = DataBlock::new(Block {
                 data: bytes.into(),
-                header: Header {
-                    block_type: BlockType::Data,
-                    checksum: Checksum::from_raw(0),
-                    data_length: 0,
-                    uncompressed_length: 0,
-                },
+                header: Header::test_dummy(BlockType::Data),
             });
 
             {
@@ -714,12 +659,7 @@ mod tests {
 
             let data_block = DataBlock::new(Block {
                 data: bytes.into(),
-                header: Header {
-                    block_type: BlockType::Data,
-                    checksum: Checksum::from_raw(0),
-                    data_length: 0,
-                    uncompressed_length: 0,
-                },
+                header: Header::test_dummy(BlockType::Data),
             });
 
             let mut iter = data_block.iter(default_comparator());
@@ -751,12 +691,7 @@ mod tests {
 
             let data_block = DataBlock::new(Block {
                 data: bytes.into(),
-                header: Header {
-                    block_type: BlockType::Data,
-                    checksum: Checksum::from_raw(0),
-                    data_length: 0,
-                    uncompressed_length: 0,
-                },
+                header: Header::test_dummy(BlockType::Data),
             });
 
             let mut iter = data_block.iter(default_comparator());
@@ -791,12 +726,7 @@ mod tests {
 
             let data_block = DataBlock::new(Block {
                 data: bytes.into(),
-                header: Header {
-                    block_type: BlockType::Data,
-                    checksum: Checksum::from_raw(0),
-                    data_length: 0,
-                    uncompressed_length: 0,
-                },
+                header: Header::test_dummy(BlockType::Data),
             });
 
             let mut iter = data_block.iter(default_comparator());
@@ -831,12 +761,7 @@ mod tests {
 
             let data_block = DataBlock::new(Block {
                 data: bytes.into(),
-                header: Header {
-                    block_type: BlockType::Data,
-                    checksum: Checksum::from_raw(0),
-                    data_length: 0,
-                    uncompressed_length: 0,
-                },
+                header: Header::test_dummy(BlockType::Data),
             });
 
             let mut iter = data_block.iter(default_comparator());
@@ -868,12 +793,7 @@ mod tests {
 
             let data_block = DataBlock::new(Block {
                 data: bytes.into(),
-                header: Header {
-                    block_type: BlockType::Data,
-                    checksum: Checksum::from_raw(0),
-                    data_length: 0,
-                    uncompressed_length: 0,
-                },
+                header: Header::test_dummy(BlockType::Data),
             });
 
             let mut iter = data_block.iter(default_comparator());
@@ -901,12 +821,7 @@ mod tests {
 
             let data_block = DataBlock::new(Block {
                 data: bytes.into(),
-                header: Header {
-                    block_type: BlockType::Data,
-                    checksum: Checksum::from_raw(0),
-                    data_length: 0,
-                    uncompressed_length: 0,
-                },
+                header: Header::test_dummy(BlockType::Data),
             });
 
             assert_eq!(data_block.len(), items.len());
@@ -989,12 +904,7 @@ mod tests {
 
             let data_block = DataBlock::new(Block {
                 data: bytes.into(),
-                header: Header {
-                    block_type: BlockType::Data,
-                    checksum: Checksum::from_raw(0),
-                    data_length: 0,
-                    uncompressed_length: 0,
-                },
+                header: Header::test_dummy(BlockType::Data),
             });
 
             assert_eq!(data_block.len(), items.len());
@@ -1079,12 +989,7 @@ mod tests {
 
             let data_block = DataBlock::new(Block {
                 data: bytes.into(),
-                header: Header {
-                    block_type: BlockType::Data,
-                    checksum: Checksum::from_raw(0),
-                    data_length: 0,
-                    uncompressed_length: 0,
-                },
+                header: Header::test_dummy(BlockType::Data),
             });
 
             assert_eq!(data_block.len(), items.len());
@@ -1178,12 +1083,7 @@ mod tests {
 
         let data_block = DataBlock::new(Block {
             data: bytes.into(),
-            header: Header {
-                block_type: BlockType::Data,
-                checksum: Checksum::from_raw(0),
-                data_length: 0,
-                uncompressed_length: 0,
-            },
+            header: Header::test_dummy(BlockType::Data),
         });
 
         assert_eq!(data_block.len(), items.len());
@@ -1228,12 +1128,7 @@ mod tests {
 
         let data_block = DataBlock::new(Block {
             data: bytes.into(),
-            header: Header {
-                block_type: BlockType::Data,
-                checksum: Checksum::from_raw(0),
-                data_length: 0,
-                uncompressed_length: 0,
-            },
+            header: Header::test_dummy(BlockType::Data),
         });
 
         assert_eq!(data_block.len(), items.len());
@@ -1261,12 +1156,7 @@ mod tests {
 
         let data_block = DataBlock::new(Block {
             data: bytes.into(),
-            header: Header {
-                block_type: BlockType::Data,
-                checksum: Checksum::from_raw(0),
-                data_length: 0,
-                uncompressed_length: 0,
-            },
+            header: Header::test_dummy(BlockType::Data),
         });
 
         assert_eq!(data_block.len(), items.len());
@@ -1297,12 +1187,7 @@ mod tests {
             let bytes = DataBlock::encode_into_vec(&items, restart_interval, 0.0)?;
             let data_block = DataBlock::new(Block {
                 data: bytes.into(),
-                header: Header {
-                    block_type: BlockType::Data,
-                    checksum: Checksum::from_raw(0),
-                    data_length: 0,
-                    uncompressed_length: 0,
-                },
+                header: Header::test_dummy(BlockType::Data),
             });
 
             // With SeqNo::MAX, seek behaves like key-only (no seqno filtering).
@@ -1367,12 +1252,7 @@ mod tests {
             let bytes = DataBlock::encode_into_vec(&items, restart_interval, 0.0)?;
             let data_block = DataBlock::new(Block {
                 data: bytes.into(),
-                header: Header {
-                    block_type: BlockType::Data,
-                    checksum: Checksum::from_raw(0),
-                    data_length: 0,
-                    uncompressed_length: 0,
-                },
+                header: Header::test_dummy(BlockType::Data),
             });
 
             // Forward seek with seqno narrows restart interval selection.
@@ -1442,7 +1322,7 @@ mod tests {
     mod devirt {
         use crate::comparator::UserComparator;
         use crate::{
-            Checksum, InternalValue, SeqNo,
+            InternalValue, SeqNo,
             ValueType::Value,
             table::{
                 Block, DataBlock,
@@ -1524,12 +1404,7 @@ mod tests {
             let bytes = DataBlock::encode_into_vec(&items, 1, 1.33)?;
             Ok(DataBlock::new(Block {
                 data: bytes.into(),
-                header: Header {
-                    block_type: BlockType::Data,
-                    checksum: Checksum::from_raw(0),
-                    data_length: 0,
-                    uncompressed_length: 0,
-                },
+                header: Header::test_dummy(BlockType::Data),
             }))
         }
 
@@ -1758,12 +1633,7 @@ mod tests {
             let bytes = DataBlock::encode_into_vec(&items, 8, 1.33)?;
             Ok(DataBlock::new(Block {
                 data: bytes.into(),
-                header: Header {
-                    block_type: BlockType::Data,
-                    checksum: Checksum::from_raw(0),
-                    data_length: 0,
-                    uncompressed_length: 0,
-                },
+                header: Header::test_dummy(BlockType::Data),
             }))
         }
 
