@@ -40,7 +40,7 @@ path = "src/lib.rs"
 # std-only primitives behind `#[cfg(feature = "std")]`, and pick external
 # crates that support no-std.
 default = ["std"]
-std = []
+std = ["dep:arc-swap"]
 # `alloc` is the minimal hard requirement — the crate uses `Arc`,
 # `Vec`, `Box` everywhere. Listed explicitly so consumers can pick it up
 # without enabling `std` once the no-std migration completes per-module.
@@ -99,11 +99,12 @@ bytes = { version = "1", optional = true }
 byteorder = { package = "byteorder-lite", version = "0.1.0" }
 byteview = "~0.10.1"
 # Lockless atomic snapshot for RuntimeConfig (see src/runtime_config/).
-# std-bound — the `RuntimeConfigHandle` wrapper is gated behind feature
-# `std`. Types in `runtime_config::types` stay alloc-friendly so
-# downstream no_std consumers (block decoders, format constants) can
-# reach them without pulling the handle.
-arc-swap = "1.9"
+# std-bound — `RuntimeConfigHandle` is gated behind the `std` feature,
+# and so is this dep. Without `std`, only `runtime_config::types`
+# (alloc-friendly POD data) compiles, keeping the no-std-check job
+# from regressing on this crate's behalf. Types stay reachable from
+# downstream no_std consumers (block decoders, format constants).
+arc-swap = { version = "1.9", optional = true }
 enum_dispatch = "0.3.13"
 log = "0.4.27"
 # `spin` provides a no_std-compatible Mutex. Used by

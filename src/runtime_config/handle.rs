@@ -60,12 +60,16 @@ impl RuntimeConfigHandle {
     /// observe either the old or the new snapshot — never a torn
     /// intermediate state.
     ///
-    /// If multiple writers race, the final state is whichever
-    /// `store` won the race; intermediate updates are NOT lost
-    /// because each mutator operates on its own clone before the
-    /// swap, but cross-writer ordering is not preserved. Callers
-    /// that need ordered updates should serialize at the caller
-    /// layer.
+    /// Concurrent writers race **last-writer-wins**: each `update`
+    /// loads the current snapshot, mutates a clone, then `store`s
+    /// the new pointer. If two writers `load` the same starting
+    /// snapshot, the second `store` overwrites the first
+    /// outright — the first writer's mutation is lost. There is
+    /// no CAS / RCU merge here. Callers that need lost-update
+    /// avoidance (e.g. two threads concurrently toggling
+    /// different fields) MUST serialize their updates at the
+    /// caller layer, typically via a `Mutex` around the
+    /// `update` call site.
     pub fn update<F>(&self, mutator: F)
     where
         F: FnOnce(&mut RuntimeConfig),

@@ -82,7 +82,7 @@ fn tree_snapshot_outlives_update_with_pre_update_state() {
 }
 
 #[test]
-fn tree_runtime_config_survives_reopen_to_default() {
+fn tree_runtime_config_resets_to_default_on_reopen() {
     // The runtime config is process-state, not persisted. After Tree
     // close + reopen, the snapshot resets to defaults — caller is
     // responsible for re-applying their desired runtime overrides on
