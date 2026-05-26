@@ -46,6 +46,11 @@ pub enum ErrorKind {
     UnexpectedEof,
     /// Operation is not supported on this platform / backend / build.
     Unsupported,
+    /// `write` returned `Ok(0)` while bytes still needed to be
+    /// written. Mirrors [`std::io::ErrorKind::WriteZero`] so callers
+    /// can distinguish a stuck-writer short write from a generic
+    /// [`Other`](Self::Other) failure.
+    WriteZero,
 }
 
 impl ErrorKind {
@@ -62,6 +67,7 @@ impl ErrorKind {
             Self::PermissionDenied => "permission denied",
             Self::UnexpectedEof => "unexpected end of file",
             Self::Unsupported => "unsupported",
+            Self::WriteZero => "write returned 0 bytes",
         }
     }
 }
@@ -151,6 +157,7 @@ impl From<std::io::Error> for Error {
             std::io::ErrorKind::PermissionDenied => ErrorKind::PermissionDenied,
             std::io::ErrorKind::UnexpectedEof => ErrorKind::UnexpectedEof,
             std::io::ErrorKind::Unsupported => ErrorKind::Unsupported,
+            std::io::ErrorKind::WriteZero => ErrorKind::WriteZero,
             _ => ErrorKind::Other,
         };
         // Use Display on the std error so OS-level detail
@@ -177,6 +184,7 @@ impl From<Error> for std::io::Error {
             ErrorKind::PermissionDenied => std::io::ErrorKind::PermissionDenied,
             ErrorKind::UnexpectedEof => std::io::ErrorKind::UnexpectedEof,
             ErrorKind::Unsupported => std::io::ErrorKind::Unsupported,
+            ErrorKind::WriteZero => std::io::ErrorKind::WriteZero,
         };
         match err.message {
             Some(msg) => Self::new(kind, msg.into_string()),
@@ -320,18 +328,22 @@ pub trait Write {
     fn flush(&mut self) -> Result<()>;
 
     /// Write the entire `buf`, retrying on `Interrupted` and
-    /// returning [`ErrorKind::Other`] (matching std's `write_zero`)
-    /// if the writer stops accepting bytes early.
+    /// returning [`ErrorKind::WriteZero`] if the writer stops
+    /// accepting bytes early. Matches the semantics of
+    /// [`std::io::Write::write_all`].
     ///
     /// # Errors
     ///
-    /// Returns the underlying writer's error, or a synthesised
-    /// `WriteZero`-equivalent error on short write.
+    /// Returns the underlying writer's error, or
+    /// [`ErrorKind::WriteZero`] on short write.
     fn write_all(&mut self, mut buf: &[u8]) -> Result<()> {
         while !buf.is_empty() {
             match self.write(buf) {
                 Ok(0) => {
-                    return Err(Error::new(ErrorKind::Other, "failed to write whole buffer"));
+                    return Err(Error::new(
+                        ErrorKind::WriteZero,
+                        "failed to write whole buffer",
+                    ));
                 }
                 Ok(n) => buf = &buf[n..],
                 Err(e) if e.kind() == ErrorKind::Interrupted => {}

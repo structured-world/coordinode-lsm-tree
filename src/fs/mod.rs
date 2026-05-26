@@ -65,12 +65,15 @@ pub use io_uring_fs::{IoUringFs, is_io_uring_available};
 // path migration is the second blocker tracked separately.
 use crate::io::{Read, Seek, Write};
 use std::io;
-// `Read::take` is an inherent method on `std::io::Read`, not on our
-// supertrait alias. The supertrait relationship lets a value bounded
-// on `crate::io::Read` flow into APIs expecting `std::io::Read`, but
-// the std-specific helper methods (`take`, `chain`, `bytes`) are not
-// re-exported on the alias trait. Bring `std::io::Read` into scope
-// anonymously here so those helpers resolve on receivers below.
+// `Read::take` is a provided method on the `std::io::Read` trait,
+// not on our supertrait alias `crate::io::Read`. The supertrait
+// relationship lets a value bounded on `crate::io::Read` flow into
+// APIs expecting `std::io::Read`, but Rust's method-resolution only
+// considers methods from traits that are IN SCOPE at the call site
+// — so without an explicit import of `std::io::Read`, `file.take(N)`
+// fails to resolve even though the receiver does implement
+// `std::io::Read`. Bring the std trait into scope anonymously here
+// so `take` / `chain` / `bytes` resolve on receivers below.
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 
