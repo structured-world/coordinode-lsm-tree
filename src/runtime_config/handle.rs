@@ -24,8 +24,13 @@ use std::sync::Arc;
 /// Lockless atomic snapshot of [`RuntimeConfig`].
 ///
 /// Constructed once at `Tree::open()`, lives for the lifetime of
-/// the Tree. Cloned snapshots from `load()` outlive the handle if
-/// caller holds the returned `Arc` past handle drop.
+/// the Tree. For snapshots that must outlive the handle borrow,
+/// use [`Self::load_full`] — it returns an owned
+/// `Arc<RuntimeConfig>` that the caller can hold across the handle
+/// being dropped. [`Self::load`] returns a borrow-bound
+/// `arc_swap::Guard` and cannot outlive the handle; callers who
+/// need an owned reference from a `Guard` can clone the inner
+/// `Arc` out of it via `Arc::clone(&*guard)`.
 pub struct RuntimeConfigHandle {
     inner: ArcSwap<RuntimeConfig>,
 }

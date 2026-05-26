@@ -75,11 +75,16 @@ pub struct TreeInner {
     /// [`Table`](crate::Table) and [`BlobFile`](crate::BlobFile).
     pub(crate) deletion_pause: Arc<DeletionPause>,
 
-    /// Runtime-toggleable configuration. Lockless atomic snapshot;
-    /// loaded by write paths (block write, manifest commit, compaction)
-    /// to pick up live config changes without coordination. Read paths
-    /// are config-independent — each block / manifest self-describes
-    /// via its own header.
+    /// Runtime-toggleable configuration. Lockless atomic snapshot.
+    ///
+    /// In this crate it is only reachable through the public Tree API
+    /// ([`crate::Tree::runtime_config`] /
+    /// [`crate::Tree::update_runtime_config`]); no write path consults
+    /// it yet. Intended to be loaded by write paths (block write,
+    /// manifest commit, compaction) once the V5-batch format features
+    /// wire them in, so that live config changes are picked up without
+    /// coordination. Read paths remain config-independent — each block
+    /// / manifest self-describes via its own header.
     //
     // no-std: Tree itself is std-bound. For no_std consumers needing
     // runtime-toggleable config, use spin::RwLock<RuntimeConfig> as

@@ -22,17 +22,31 @@
 //! sst-dump-style tooling) can reach the type definitions without
 //! pulling the mutation machinery.
 //!
-//! ## Compaction-as-migration semantic
+//! ## Compaction-as-migration semantic (designed, wired by V5 features)
 //!
-//! Every write path (block write, manifest write, compaction
-//! output) loads the current snapshot via `RuntimeConfigHandle::load`
-//! at start. Reads are config-independent — each block / manifest
-//! is self-describing via its own header. So a toggle on a running
-//! Tree affects subsequent writes; existing on-disk data stays in
-//! its original format and reads transparently. Compaction acts as
-//! the live-migration mechanism: rewriting source blocks per the
-//! current snapshot, so over time all data converges to the
-//! current settings without stop-the-world coordination.
+//! This module ships the snapshot + atomic-swap mechanism only. No
+//! write/compaction/manifest code in the current crate consults
+//! `RuntimeConfigHandle` yet — only the public Tree API
+//! ([`crate::Tree::runtime_config`] /
+//! [`crate::Tree::update_runtime_config`]) reads and updates it.
+//! The wiring lands with the V5-batch format features (manifest
+//! hardening, per-KV protection, scan-since-seqno), which extend
+//! [`RuntimeConfig`] with their own fields and load the snapshot at
+//! block write / manifest commit / compaction boundaries.
+//!
+//! Once wired, the intended semantics are:
+//!
+//! - Every write path loads the current snapshot via
+//!   [`RuntimeConfigHandle::load`] at start. Reads are
+//!   config-independent — each block / manifest is self-describing
+//!   via its own header.
+//! - A toggle on a running Tree affects subsequent writes; existing
+//!   on-disk data stays in its original format and reads
+//!   transparently.
+//! - Compaction acts as the live-migration mechanism: rewriting
+//!   source blocks per the current snapshot, so over time all data
+//!   converges to the current settings without stop-the-world
+//!   coordination.
 
 pub mod types;
 
