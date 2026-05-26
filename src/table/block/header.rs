@@ -57,22 +57,66 @@ pub struct Header {
 
     /// Uncompressed size of data segment
     pub uncompressed_length: u32,
+
+    /// Length in bytes of the Reed-Solomon parity trailer that follows
+    /// the `data_length` payload bytes on disk. `0` when the block was
+    /// written without Page ECC (`Config::page_ecc(false)`, the
+    /// default), in which case no parity bytes follow — the *payload
+    /// region* stays V5-shaped (header + payload, no trailer). The
+    /// *header* itself is always V6: 4 extra bytes for this field
+    /// plus the bumped magic `[L,S,M,4]` (V5 was `[L,S,M,3]`), so a
+    /// pre-V6 reader rejects every V6 block at header decode
+    /// regardless of `ecc_length`'s value. Non-zero when ECC is
+    /// enabled — the reader uses it to read the parity bytes and
+    /// attempt Reed-Solomon recovery on `data` XXH3 mismatch.
+    pub ecc_length: u32,
 }
 
 impl Header {
     #[must_use]
     pub const fn serialized_len() -> usize {
         MAGIC_BYTES.len()
-            // Block type
-            + std::mem::size_of::<BlockType>()
+            // Block type — encoded as a single u8 by encode_into,
+            // not as size_of::<BlockType>(). BlockType is a fieldless
+            // enum without `#[repr(u8)]`, so its in-memory size is
+            // implementation-defined; the wire format is the contract
+            // and that contract is 1 byte.
+            + 1
             // Data checksum
             + std::mem::size_of::<Checksum>()
             // On-disk size
             + std::mem::size_of::<u32>()
             // Uncompressed data length
             + std::mem::size_of::<u32>()
+            // Reed-Solomon parity trailer length (0 when ECC off)
+            + std::mem::size_of::<u32>()
             // Checksum
             + std::mem::size_of::<u32>()
+    }
+
+    /// Total bytes this block occupies on disk: header + payload +
+    /// optional ECC parity trailer. Use this when computing block
+    /// handles instead of manually summing `serialized_len() +
+    /// data_length` — that older form silently underflows the
+    /// on-disk size when `ecc_length > 0`.
+    #[must_use]
+    pub fn on_disk_size(&self) -> u32 {
+        // serialized_len is a small constant (37 bytes: 4 magic + 1
+        // block_type + 16 checksum + 4 data_length + 4 uncompressed +
+        // 4 ecc_length + 4 header checksum); cast to u32 is safe by
+        // construction. `data_length` is bounded by the writer's
+        // `MAX_DECOMPRESSION_SIZE` cap, and `ecc_length` is bounded
+        // by the per-block `expected_parity_len(data_length)` invariant
+        // enforced on read (see `Block::from_reader` / `from_file`),
+        // so the sum stays well within u32.
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "Header::serialized_len() is a small const"
+        )]
+        let header = Self::serialized_len() as u32;
+        header
+            .saturating_add(self.data_length)
+            .saturating_add(self.ecc_length)
     }
 }
 
@@ -97,6 +141,10 @@ impl Encode for Header {
 
             // Write uncompressed data length
             writer.write_u32::<LE>(self.uncompressed_length)?;
+
+            // Write Reed-Solomon parity trailer length (V6+); 0 when
+            // Page ECC is disabled.
+            writer.write_u32::<LE>(self.ecc_length)?;
 
             writer.checksum()
         };
@@ -139,6 +187,9 @@ impl Decode for Header {
         // Read data length
         let uncompressed_length = protected_reader.read_u32::<LE>()?;
 
+        // Read Reed-Solomon parity trailer length (V6+)
+        let ecc_length = protected_reader.read_u32::<LE>()?;
+
         #[expect(
             clippy::cast_possible_truncation,
             reason = "we purposefully only use the lower 4 bytes as checksum"
@@ -165,7 +216,42 @@ impl Decode for Header {
             checksum: Checksum::from_raw(checksum),
             data_length,
             uncompressed_length,
+            ecc_length,
         })
+    }
+}
+
+#[cfg(test)]
+impl Header {
+    /// Test-only constructor for placeholder Header values used in
+    /// unit tests that don't care about checksum / lengths. All
+    /// numeric fields are zero. Callers that need specific lengths
+    /// or a non-zero checksum override via struct-update syntax:
+    ///
+    /// ```ignore
+    /// // All fields zero, just the block_type:
+    /// Header::test_dummy(BlockType::Data)
+    ///
+    /// // Override only the data_length / uncompressed_length:
+    /// Header {
+    ///     data_length: 42,
+    ///     uncompressed_length: 42,
+    ///     ..Header::test_dummy(BlockType::Index)
+    /// }
+    /// ```
+    ///
+    /// The whole point of this helper is to keep test sites
+    /// future-proof: adding a new field to `Header` only needs the
+    /// new default wired in here, not at every test literal across
+    /// the crate.
+    pub(crate) fn test_dummy(block_type: BlockType) -> Self {
+        Self {
+            block_type,
+            checksum: Checksum::from_raw(0),
+            data_length: 0,
+            uncompressed_length: 0,
+            ecc_length: 0,
+        }
     }
 }
 
@@ -181,6 +267,7 @@ mod tests {
             checksum: Checksum::from_raw(5),
             data_length: 252_356,
             uncompressed_length: 124_124_124,
+            ecc_length: 0,
         };
 
         let bytes = header.encode_into_vec();
@@ -199,6 +286,7 @@ mod tests {
             checksum: Checksum::from_raw(5),
             data_length: 252_356,
             uncompressed_length: 124_124_124,
+            ecc_length: 0,
         };
 
         let mut bytes = header.encode_into_vec();

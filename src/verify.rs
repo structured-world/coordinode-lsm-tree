@@ -1135,13 +1135,13 @@ mod block_verify_tests {
         const HEADER_LEN: u64 = Header::serialized_len() as u64;
 
         let header = Header {
-            block_type: BlockType::Data,
             // Arbitrary sentinel; the walker reaches `read_exact` and
             // bails BEFORE any data-segment XXH3 comparison, so this
             // value is never checked.
             checksum: Checksum::from_raw(0xDEAD_BEEF_DEAD_BEEF),
             data_length: DATA_LENGTH,
             uncompressed_length: DATA_LENGTH,
+            ..Header::test_dummy(BlockType::Data)
         };
 
         // Build a minimal SFA archive: one section "data" containing

@@ -26,6 +26,12 @@ pub struct FullFilterWriter {
     /// Owning SST's table id. Set by the outer Writer via
     /// `use_table_id` before `finish` runs.
     table_id: crate::TableId,
+
+    /// `Config::page_ecc` threaded by the outer Writer via
+    /// `use_page_ecc`. When `true`, the filter block this writer
+    /// emits upgrades its `BlockTransform` to the matching `*Ecc`
+    /// variant.
+    page_ecc: bool,
 }
 
 impl FullFilterWriter {
@@ -36,6 +42,7 @@ impl FullFilterWriter {
             prefix_extractor: None,
             encryption: None,
             table_id: 0,
+            page_ecc: false,
         }
     }
 }
@@ -75,6 +82,11 @@ impl<W: std::io::Write + std::io::Seek> FilterWriter<W> for FullFilterWriter {
 
     fn use_table_id(mut self: Box<Self>, table_id: crate::TableId) -> Box<dyn FilterWriter<W>> {
         self.table_id = table_id;
+        self
+    }
+
+    fn use_page_ecc(mut self: Box<Self>, page_ecc: bool) -> Box<dyn FilterWriter<W>> {
+        self.page_ecc = page_ecc;
         self
     }
 
@@ -146,10 +158,14 @@ impl<W: std::io::Write + std::io::Seek> FilterWriter<W> for FullFilterWriter {
             },
             // Filter blocks are always written uncompressed; the
             // transform is Plain or Encrypted depending on the
-            // configured provider.
-            &match self.encryption.as_deref() {
-                Some(enc) => crate::table::block::BlockTransform::Encrypted(enc),
-                None => crate::table::block::BlockTransform::PLAIN,
+            // configured provider, plus `with_ecc` when the tree
+            // was opened with `Config::page_ecc(true)`.
+            &{
+                let t = match self.encryption.as_deref() {
+                    Some(enc) => crate::table::block::BlockTransform::Encrypted(enc),
+                    None => crate::table::block::BlockTransform::PLAIN,
+                };
+                if self.page_ecc { t.with_ecc() } else { t }
             },
         )?;
 

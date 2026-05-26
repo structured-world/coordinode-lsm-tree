@@ -281,7 +281,6 @@ impl DoubleEndedIterator for Iter<'_> {
 mod tests {
     use super::*;
     use crate::{
-        Checksum,
         coding::Decode,
         comparator::default_comparator,
         table::{
@@ -312,12 +311,7 @@ mod tests {
             IndexBlock::encode_into_vec_with_restart_interval(&handles, restart_interval).unwrap();
         IndexBlock::new(Block {
             data: bytes.into(),
-            header: Header {
-                block_type: BlockType::Index,
-                checksum: Checksum::from_raw(0),
-                data_length: 0,
-                uncompressed_length: 0,
-            },
+            header: Header::test_dummy(BlockType::Index),
         })
     }
 
@@ -330,12 +324,7 @@ mod tests {
         bytes[key_len_offset + 2] = 0x03;
         IndexBlock::new(Block {
             data: bytes.into(),
-            header: Header {
-                block_type: BlockType::Index,
-                checksum: Checksum::from_raw(0),
-                data_length: 0,
-                uncompressed_length: 0,
-            },
+            header: Header::test_dummy(BlockType::Index),
         })
     }
 
@@ -354,12 +343,7 @@ mod tests {
 
         let trailer_probe = IndexBlock::new(Block {
             data: bytes.clone().into(),
-            header: Header {
-                block_type: BlockType::Index,
-                checksum: Checksum::from_raw(0),
-                data_length: 0,
-                uncompressed_length: 0,
-            },
+            header: Header::test_dummy(BlockType::Index),
         });
         let trailer_offset = Trailer::new(&trailer_probe.inner).trailer_offset();
         let binary_index_offset_pos = trailer_offset + 1 + 1 + std::mem::size_of::<u32>();
@@ -376,12 +360,7 @@ mod tests {
 
         IndexBlock::new(Block {
             data: bytes.into(),
-            header: Header {
-                block_type: BlockType::Index,
-                checksum: Checksum::from_raw(0),
-                data_length: 0,
-                uncompressed_length: 0,
-            },
+            header: Header::test_dummy(BlockType::Index),
         })
     }
 
@@ -648,12 +627,7 @@ mod tests {
     fn second_restart_head_byte_offset(bytes: &[u8]) -> usize {
         let probe = IndexBlock::new(Block {
             data: bytes.to_vec().into(),
-            header: Header {
-                block_type: BlockType::Index,
-                checksum: Checksum::from_raw(0),
-                data_length: 0,
-                uncompressed_length: 0,
-            },
+            header: Header::test_dummy(BlockType::Index),
         });
         let trailer_offset = Trailer::new(&probe.inner).trailer_offset();
         let trailer = &bytes[trailer_offset..];
@@ -703,12 +677,7 @@ mod tests {
         bytes[rest_key_len_pos + 2] = 0x03;
         IndexBlock::new(Block {
             data: bytes.into(),
-            header: Header {
-                block_type: BlockType::Index,
-                checksum: Checksum::from_raw(0),
-                data_length: 0,
-                uncompressed_length: 0,
-            },
+            header: Header::test_dummy(BlockType::Index),
         })
     }
 

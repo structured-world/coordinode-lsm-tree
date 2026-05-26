@@ -6,10 +6,7 @@ use crate::{
     CompressionType,
     checksum::ChecksummedWriter,
     encryption::EncryptionProvider,
-    table::{
-        Block, IndexBlock, block::Header as BlockHeader, index_block::KeyedBlockHandle,
-        writer::index::BlockIndexWriter,
-    },
+    table::{Block, IndexBlock, index_block::KeyedBlockHandle, writer::index::BlockIndexWriter},
 };
 use std::sync::Arc;
 
@@ -23,6 +20,12 @@ pub struct FullIndexWriter {
     /// `BlockIdentity::table_id` when writing the top-level
     /// index block.
     table_id: crate::TableId,
+    /// `Config::page_ecc` threaded by the outer Writer via
+    /// `use_page_ecc`. When `true`, the `BlockTransform` used for
+    /// the top-level-index block emit upgrades to its matching
+    /// `*Ecc` variant so the index block gets the same
+    /// Reed-Solomon parity trailer that data blocks do.
+    page_ecc: bool,
 }
 
 impl FullIndexWriter {
@@ -33,6 +36,7 @@ impl FullIndexWriter {
             block_handles: Vec::new(),
             encryption: None,
             table_id: 0,
+            page_ecc: false,
         }
     }
 }
@@ -65,6 +69,11 @@ impl<W: std::io::Write + std::io::Seek> BlockIndexWriter<W> for FullIndexWriter 
 
     fn use_table_id(mut self: Box<Self>, table_id: crate::TableId) -> Box<dyn BlockIndexWriter<W>> {
         self.table_id = table_id;
+        self
+    }
+
+    fn use_page_ecc(mut self: Box<Self>, page_ecc: bool) -> Box<dyn BlockIndexWriter<W>> {
+        self.page_ecc = page_ecc;
         self
     }
 
@@ -115,20 +124,24 @@ impl<W: std::io::Write + std::io::Seek> BlockIndexWriter<W> for FullIndexWriter 
             },
             // Index blocks use the configured codec but never a
             // zstd dict (dicts are trained on data, not index
-            // structures).
-            &crate::table::block::BlockTransform::from_parts(
-                self.compression,
-                self.encryption.as_deref(),
-                #[cfg(zstd_any)]
-                None,
-            )?,
+            // structures). When the tree was opened with
+            // `Config::page_ecc(true)`, upgrade the transform to
+            // its matching `*Ecc` variant so the TLI block gets
+            // a Reed-Solomon parity trailer alongside the data
+            // blocks (no-op on builds without the page_ecc cargo
+            // feature).
+            &{
+                let t = crate::table::block::BlockTransform::from_parts(
+                    self.compression,
+                    self.encryption.as_deref(),
+                    #[cfg(zstd_any)]
+                    None,
+                )?;
+                if self.page_ecc { t.with_ecc() } else { t }
+            },
         )?;
 
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "blocks never even approach u32 size"
-        )]
-        let bytes_written = BlockHeader::serialized_len() as u32 + header.data_length;
+        let bytes_written = header.on_disk_size();
 
         debug_assert!(bytes_written > 0, "Block index should never be empty");
 
