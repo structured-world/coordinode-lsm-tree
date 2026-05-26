@@ -735,11 +735,11 @@ impl Version {
         //
 
         writer.start("format_version")?;
-        // V6 is currently pre-release (no published binary writes it yet),
-        // so the manifest layout under V6 may still be amended in-place.
-        // Once V6 ships, ANY on-disk byte change to the manifest under
-        // V6 must bump FormatVersion to V7. Policy tracked in #351.
-        writer.write_u8(FormatVersion::V6.into())?;
+        // V5 is currently pre-release (no published binary writes it yet),
+        // so the manifest layout under V5 may still be amended in-place.
+        // Once V5 ships, ANY on-disk byte change to the manifest under
+        // V5 must bump FormatVersion to V6. Policy tracked in #351.
+        writer.write_u8(FormatVersion::V5.into())?;
 
         writer.start("crate_version")?;
         writer.write_all(env!("CARGO_PKG_VERSION").as_bytes())?;

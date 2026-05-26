@@ -63,9 +63,9 @@ pub struct Header {
     /// written without Page ECC (`Config::page_ecc(false)`, the
     /// default), in which case no parity bytes follow — the *payload
     /// region* stays V5-shaped (header + payload, no trailer). The
-    /// *header* itself is always V6: 4 extra bytes for this field
+    /// *header* itself is always V5: 4 extra bytes for this field
     /// plus the bumped magic `[L,S,M,4]` (V5 was `[L,S,M,3]`), so a
-    /// pre-V6 reader rejects every V6 block at header decode
+    /// pre-V5 reader rejects every V5 block at header decode
     /// regardless of `ecc_length`'s value. Non-zero when ECC is
     /// enabled — the reader uses it to read the parity bytes and
     /// attempt Reed-Solomon recovery on `data` XXH3 mismatch.
@@ -142,7 +142,7 @@ impl Encode for Header {
             // Write uncompressed data length
             writer.write_u32::<LE>(self.uncompressed_length)?;
 
-            // Write Reed-Solomon parity trailer length (V6+); 0 when
+            // Write Reed-Solomon parity trailer length (V5+); 0 when
             // Page ECC is disabled.
             writer.write_u32::<LE>(self.ecc_length)?;
 
@@ -187,7 +187,7 @@ impl Decode for Header {
         // Read data length
         let uncompressed_length = protected_reader.read_u32::<LE>()?;
 
-        // Read Reed-Solomon parity trailer length (V6+)
+        // Read Reed-Solomon parity trailer length (V5+)
         let ecc_length = protected_reader.read_u32::<LE>()?;
 
         #[expect(

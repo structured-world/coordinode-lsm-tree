@@ -127,6 +127,13 @@ pub struct RecoveryStats {
     /// Table records dropped because their framing checksum or
     /// header failed — i.e. real bit-rot inside an otherwise-written
     /// region (only ever non-zero under `SkipAny` / PIT modes).
+    ///
+    /// This counter is a LOWER BOUND on records actually discarded
+    /// under PIT: when PIT hits a corruption boundary it stops
+    /// reading the current level (and all subsequent levels) without
+    /// parsing their run / table counts, so the records inside those
+    /// abandoned levels are NOT included here. Use this counter as
+    /// "records dropped in parsed runs", not "total records lost".
     pub tables_dropped_to_corruption: u32,
     /// Number of level / run / table-count header *fields* truncated
     /// by tail-cutting (count of EVENTS, not bytes — incremented by
@@ -165,18 +172,18 @@ pub struct Recovery {
     /// Gate `#[expect]` to non-test builds: under `cargo test`
     /// the field IS read by the unit-test module so the lint
     /// doesn't fire and the expectation isn't attached; under
-    /// `cargo build` the field is unread by in-tree code
-    /// (operator-facing telemetry surface only — external
-    /// consumers reach `Recovery` via the public API but the
-    /// module is `pub mod recovery` so the field IS reachable
-    /// from outside crate, just not exercised by anything in
-    /// this tree) and the expectation is fulfilled.
+    /// `cargo build` the field is unread by in-tree code. The
+    /// `version` module is `mod version` (not pub) at the crate
+    /// root, so this field is not part of the published API
+    /// surface today; it's kept for in-tree telemetry assertions
+    /// and as the canonical site to plumb operator-visible
+    /// recovery counters once a public API is exposed.
     #[cfg_attr(
         not(test),
         expect(
             dead_code,
-            reason = "operator-facing telemetry surface; in-tree \
-                      consumers reach Recovery via the public API"
+            reason = "in-tree telemetry assertions only; not part \
+                      of the published API surface today"
         )
     )]
     pub stats: RecoveryStats,
@@ -638,19 +645,20 @@ pub fn recover(folder: &Path, fs: &dyn Fs, mode: ManifestRecoveryMode) -> crate:
                             ));
                         }
                         FramedRecordOutcome::LenMismatch { got, expected } => {
-                            // Schema drift: `len` is within the
-                            // implausibility cap but disagrees with
-                            // the fixed-size table-record contract.
-                            // This is writer / reader format
-                            // disagreement, NOT bit-rot — the bytes
-                            // on disk are well-formed for SOME
-                            // schema, just not the one this binary
-                            // decodes. Hard-abort in EVERY mode
-                            // (including PIT / SkipAny / tail-
-                            // tolerant): tolerant modes are for
-                            // power-loss recovery from our own
-                            // format, NOT for silently accepting
-                            // an incompatible on-disk schema.
+                            // `len` is within the implausibility cap
+                            // but disagrees with the fixed-size
+                            // table-record contract. Could be either
+                            // writer / reader format disagreement
+                            // (schema drift) or corruption of the
+                            // length field that happens to stay
+                            // within MAX_FRAME_PAYLOAD; the reader
+                            // cannot distinguish the two. Hard-abort
+                            // in EVERY mode (including PIT / SkipAny
+                            // / tail-tolerant): tolerant modes are
+                            // for power-loss recovery at the tail,
+                            // not for silently absorbing in-record
+                            // ambiguity, and either underlying cause
+                            // is unrecoverable from here.
                             log::error!(
                                 "manifest tables frame len mismatch in version \
                                  #{curr_version_id}: declared len={got}, \

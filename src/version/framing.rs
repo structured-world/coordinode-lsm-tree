@@ -192,16 +192,20 @@ pub enum FramedRecordOutcome {
     /// The header decoded with a `len` that fits
     /// [`MAX_FRAME_PAYLOAD`] but disagrees with the caller's
     /// fixed-length pin (`expected_payload_len = Some(n)` and
-    /// `len != n`). This is schema drift / writer-reader format
-    /// disagreement, NOT bit-rot — the bytes on disk are
-    /// well-formed for their own format, just not for ours.
-    /// Distinguished from [`Self::BadHeader`] so callers can
-    /// hard-abort on format drift regardless of recovery mode
-    /// (tolerant modes are for power-loss recovery, NOT for
-    /// silently accepting an incompatible on-disk schema). By
-    /// the time this variant is returned the reader has consumed
-    /// the 4-byte `len` field; the cursor is mid-record and the
-    /// caller cannot resume reading after the mismatch.
+    /// `len != n`). This indicates either writer / reader schema
+    /// drift OR corruption in the framed `len` field that happens
+    /// to stay within `MAX_FRAME_PAYLOAD`; the reader cannot
+    /// distinguish the two from the bytes alone. Either way callers
+    /// must hard-abort: silently dropping the section would let
+    /// genuine schema drift slip through, and the corrupt-len case
+    /// is unrecoverable mid-record anyway. Distinguished from
+    /// [`Self::BadHeader`] (truly implausible `len > MAX_FRAME_PAYLOAD`)
+    /// so callers can hard-abort here regardless of recovery mode
+    /// (tolerant modes are for power-loss recovery at the tail, not
+    /// for silently absorbing in-record ambiguity). By the time
+    /// this variant is returned the reader has consumed the 4-byte
+    /// `len` field; the cursor is mid-record and the caller cannot
+    /// resume reading after the mismatch.
     LenMismatch {
         /// The `len` value that was declared on disk.
         got: u32,
@@ -246,10 +250,12 @@ pub enum FramedRecordOutcome {
 /// [`FramedRecordOutcome::BadHeader`] (truly implausible
 /// `len > MAX_FRAME_PAYLOAD`, treated as in-section corruption
 /// the tolerant modes can absorb): a size disagreement with the
-/// caller's fixed-length pin is writer / reader format drift,
-/// NOT power-loss bit-rot, and silently masking it via a
-/// section-drop would let an incompatible on-disk schema slip
-/// through tolerant recovery undetected.
+/// caller's fixed-length pin can be either writer / reader
+/// format drift OR a corrupted length field that still fits
+/// `MAX_FRAME_PAYLOAD` — the reader cannot tell the two apart
+/// and either way silently masking it via a section-drop would
+/// either let an incompatible on-disk schema slip through
+/// tolerant recovery undetected or compound the in-record damage.
 ///
 /// Pass `None` for variable-size records (none currently exist
 /// in the manifest, but the parameter is kept open-ended for
@@ -290,14 +296,15 @@ pub fn read_framed_record<R: Read>(
 
     // Fixed-size record pin: caller said the payload MUST be
     // exactly `expected` bytes, but the on-disk `len` says
-    // otherwise. The bytes are well-formed for their own format
-    // (len fits MAX_FRAME_PAYLOAD and the section bound), they
-    // just don't match the schema we're decoding against. That's
-    // schema drift, not bit-rot — surfacing it as a distinct
-    // `LenMismatch` variant (rather than `BadHeader`) lets
-    // callers hard-abort on format drift regardless of recovery
-    // mode, while still treating truly forged headers per the
-    // tolerant-mode policy.
+    // otherwise. The on-disk `len` fits MAX_FRAME_PAYLOAD and the
+    // section bound, so it could be either schema drift (writer /
+    // reader format disagreement) or in-record corruption of the
+    // length field within plausible bounds — the reader cannot
+    // tell the two apart. Surface it as a distinct `LenMismatch`
+    // variant (rather than `BadHeader`) so callers hard-abort
+    // regardless of recovery mode, while truly forged headers
+    // (len > MAX_FRAME_PAYLOAD) still go through the tolerant-mode
+    // policy.
     if let Some(expected) = expected_payload_len
         && len != expected
     {
@@ -497,13 +504,14 @@ mod tests {
     fn framed_record_fixed_len_mismatch_surfaces_lenmismatch() {
         // Writer emitted a 10-byte payload; reader pins the
         // schema to a fixed 33-byte record. `len` is internally
-        // consistent (within MAX_FRAME_PAYLOAD, fits the section)
-        // and the payload bytes are valid for ITS format, but the
-        // sizes disagree — that is schema drift, not bit-rot.
+        // consistent (within MAX_FRAME_PAYLOAD, fits the section),
+        // but the sizes disagree — that could be either schema
+        // drift or a corrupted length field that still fits within
+        // plausible bounds; the reader cannot tell the two apart.
         // The reader must surface this as `LenMismatch` (carrying
         // both lengths for diagnostics) rather than the generic
-        // `BadHeader`, so the caller can hard-abort on format
-        // drift even in tolerant recovery modes.
+        // `BadHeader`, so the caller can hard-abort regardless of
+        // recovery mode.
         let payload = b"ten-byte!!"; // 10 bytes
         let bytes = roundtrip(payload);
 

@@ -249,7 +249,7 @@ impl Block {
             // `BlockTransform` variant is one of the `*Ecc` arms,
             // which `Writer::use_page_ecc(true)` wires through the
             // emit path. Zero means "no parity trailer follows" —
-            // the V6-default-off layout that non-page-ecc trees
+            // the V5-default-off layout that non-page-ecc trees
             // produce.
             ecc_length: 0,
         };
