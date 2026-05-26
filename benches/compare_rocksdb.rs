@@ -184,5 +184,15 @@ fn bench_write_throughput(c: &mut Criterion) {
     group.finish();
 }
 
+// P50 / P99 / P999 percentile capture is deferred to a follow-up
+// commit. Criterion's default reporter gives mean + CI only,
+// which hides tail-latency regressions; structured-zstd's
+// `benches/bloom.rs` ports Vitter's Algorithm R reservoir +
+// per-iteration `iter_custom` to expose percentiles to stderr,
+// and that same pattern wires here once the workload surface is
+// fleshed out (point reads, range scans, YCSB-A/C). Foundation
+// commit prioritises wiring up the cross-engine path; the
+// percentile harness lands alongside the dashboard JSON merger.
+
 criterion_group!(benches, bench_write_throughput);
 criterion_main!(benches);
