@@ -672,7 +672,7 @@ mod tests {
     use super::DataBlockParsedItem;
     use crate::comparator::default_comparator;
     use crate::{
-        Checksum, InternalValue, SeqNo, Slice,
+        InternalValue, SeqNo, Slice,
         ValueType::{Tombstone, Value},
         table::{
             Block, DataBlock,
@@ -1018,12 +1018,7 @@ mod tests {
 
         let data_block = DataBlock::new(Block {
             data: bytes.into(),
-            header: Header {
-                block_type: BlockType::Data,
-                checksum: Checksum::from_raw(0),
-                data_length: 0,
-                uncompressed_length: 0,
-            },
+            header: Header::test_dummy(BlockType::Data),
         });
 
         let expected_ping_ponged_items = {
@@ -1079,12 +1074,7 @@ mod tests {
 
             let data_block = DataBlock::new(Block {
                 data: bytes.into(),
-                header: Header {
-                    block_type: BlockType::Data,
-                    checksum: Checksum::from_raw(0),
-                    data_length: 0,
-                    uncompressed_length: 0,
-                },
+                header: Header::test_dummy(BlockType::Data),
             });
 
             assert!(
@@ -1126,12 +1116,7 @@ mod tests {
 
         let data_block = DataBlock::new(Block {
             data: bytes.into(),
-            header: Header {
-                block_type: BlockType::Data,
-                checksum: Checksum::from_raw(0),
-                data_length: 0,
-                uncompressed_length: 0,
-            },
+            header: Header::test_dummy(BlockType::Data),
         });
 
         assert_eq!(data_block.len(), items.len());
@@ -1168,12 +1153,7 @@ mod tests {
 
             let data_block = DataBlock::new(Block {
                 data: bytes.into(),
-                header: Header {
-                    block_type: BlockType::Data,
-                    checksum: Checksum::from_raw(0),
-                    data_length: 0,
-                    uncompressed_length: 0,
-                },
+                header: Header::test_dummy(BlockType::Data),
             });
 
             assert_eq!(data_block.len(), items.len());
@@ -1208,12 +1188,7 @@ mod tests {
 
             let data_block = DataBlock::new(Block {
                 data: bytes.into(),
-                header: Header {
-                    block_type: BlockType::Data,
-                    checksum: Checksum::from_raw(0),
-                    data_length: 0,
-                    uncompressed_length: 0,
-                },
+                header: Header::test_dummy(BlockType::Data),
             });
 
             assert_eq!(data_block.len(), items.len());
@@ -1239,12 +1214,7 @@ mod tests {
 
         let data_block = DataBlock::new(Block {
             data: bytes.into(),
-            header: Header {
-                block_type: BlockType::Data,
-                checksum: Checksum::from_raw(0),
-                data_length: 0,
-                uncompressed_length: 0,
-            },
+            header: Header::test_dummy(BlockType::Data),
         });
 
         assert_eq!(data_block.len(), items.len());
@@ -1287,12 +1257,7 @@ mod tests {
 
         let data_block = DataBlock::new(Block {
             data: bytes.into(),
-            header: Header {
-                block_type: BlockType::Data,
-                checksum: Checksum::from_raw(0),
-                data_length: 0,
-                uncompressed_length: 0,
-            },
+            header: Header::test_dummy(BlockType::Data),
         });
 
         assert_eq!(data_block.len(), items.len());
@@ -1330,12 +1295,7 @@ mod tests {
 
         let data_block = DataBlock::new(Block {
             data: bytes.into(),
-            header: Header {
-                block_type: BlockType::Data,
-                checksum: Checksum::from_raw(0),
-                data_length: 0,
-                uncompressed_length: 0,
-            },
+            header: Header::test_dummy(BlockType::Data),
         });
 
         assert_eq!(data_block.len(), items.len());
@@ -1369,12 +1329,7 @@ mod tests {
 
         let data_block = DataBlock::new(Block {
             data: bytes.into(),
-            header: Header {
-                block_type: BlockType::Data,
-                checksum: Checksum::from_raw(0),
-                data_length: 0,
-                uncompressed_length: 0,
-            },
+            header: Header::test_dummy(BlockType::Data),
         });
 
         assert_eq!(data_block.len(), items.len());
@@ -1422,12 +1377,7 @@ mod tests {
 
         let data_block = DataBlock::new(Block {
             data: bytes.into(),
-            header: Header {
-                block_type: BlockType::Data,
-                checksum: Checksum::from_raw(0),
-                data_length: 0,
-                uncompressed_length: 0,
-            },
+            header: Header::test_dummy(BlockType::Data),
         });
 
         assert_eq!(data_block.len(), items.len());
@@ -1471,12 +1421,7 @@ mod tests {
 
         let data_block = DataBlock::new(Block {
             data: bytes.into(),
-            header: Header {
-                block_type: BlockType::Data,
-                checksum: Checksum::from_raw(0),
-                data_length: 0,
-                uncompressed_length: 0,
-            },
+            header: Header::test_dummy(BlockType::Data),
         });
 
         assert_eq!(data_block.len(), items.len());
@@ -1523,12 +1468,7 @@ mod tests {
 
         let data_block = DataBlock::new(Block {
             data: bytes.into(),
-            header: Header {
-                block_type: BlockType::Data,
-                checksum: Checksum::from_raw(0),
-                data_length: 0,
-                uncompressed_length: 0,
-            },
+            header: Header::test_dummy(BlockType::Data),
         });
 
         assert_eq!(data_block.len(), items.len());
@@ -1575,12 +1515,7 @@ mod tests {
 
         let data_block = DataBlock::new(Block {
             data: bytes.into(),
-            header: Header {
-                block_type: BlockType::Data,
-                checksum: Checksum::from_raw(0),
-                data_length: 0,
-                uncompressed_length: 0,
-            },
+            header: Header::test_dummy(BlockType::Data),
         });
 
         assert_eq!(data_block.len(), items.len());
@@ -1614,12 +1549,7 @@ mod tests {
 
         let data_block = DataBlock::new(Block {
             data: bytes.into(),
-            header: Header {
-                block_type: BlockType::Data,
-                checksum: Checksum::from_raw(0),
-                data_length: 0,
-                uncompressed_length: 0,
-            },
+            header: Header::test_dummy(BlockType::Data),
         });
 
         assert_eq!(data_block.len(), items.len());
@@ -1658,12 +1588,7 @@ mod tests {
 
         let data_block = DataBlock::new(Block {
             data: bytes.into(),
-            header: Header {
-                block_type: BlockType::Data,
-                checksum: Checksum::from_raw(0),
-                data_length: 0,
-                uncompressed_length: 0,
-            },
+            header: Header::test_dummy(BlockType::Data),
         });
 
         assert_eq!(data_block.len(), items.len());
@@ -1703,12 +1628,7 @@ mod tests {
 
         let data_block = DataBlock::new(Block {
             data: bytes.into(),
-            header: Header {
-                block_type: BlockType::Data,
-                checksum: Checksum::from_raw(0),
-                data_length: 0,
-                uncompressed_length: 0,
-            },
+            header: Header::test_dummy(BlockType::Data),
         });
 
         assert_eq!(data_block.len(), items.len());
@@ -1758,12 +1678,7 @@ mod tests {
 
             let data_block = DataBlock::new(Block {
                 data: bytes.into(),
-                header: Header {
-                    block_type: BlockType::Data,
-                    checksum: Checksum::from_raw(0),
-                    data_length: 0,
-                    uncompressed_length: 0,
-                },
+                header: Header::test_dummy(BlockType::Data),
             });
 
             // seqno=4 → should see version with seqno=3 (first with seqno < 4)
@@ -1827,12 +1742,7 @@ mod tests {
 
             let data_block = DataBlock::new(Block {
                 data: bytes.into(),
-                header: Header {
-                    block_type: BlockType::Data,
-                    checksum: Checksum::from_raw(0),
-                    data_length: 0,
-                    uncompressed_length: 0,
-                },
+                header: Header::test_dummy(BlockType::Data),
             });
 
             // Read "b" at seqno=4 → should return version with seqno=3
@@ -1869,24 +1779,14 @@ mod tests {
 
         let block = Block {
             data: bytes.clone().into(),
-            header: Header {
-                block_type: BlockType::Data,
-                checksum: Checksum::from_raw(0),
-                data_length: 0,
-                uncompressed_length: 0,
-            },
+            header: Header::test_dummy(BlockType::Data),
         };
         let trailer_offset = Trailer::new(&block).trailer_offset();
         bytes[trailer_offset] = 0;
 
         let corrupt_block = DataBlock::new(Block {
             data: bytes.into(),
-            header: Header {
-                block_type: BlockType::Data,
-                checksum: Checksum::from_raw(0),
-                data_length: 0,
-                uncompressed_length: 0,
-            },
+            header: Header::test_dummy(BlockType::Data),
         });
 
         assert!(
@@ -1909,24 +1809,14 @@ mod tests {
 
         let block = Block {
             data: bytes.clone().into(),
-            header: Header {
-                block_type: BlockType::Data,
-                checksum: Checksum::from_raw(0),
-                data_length: 0,
-                uncompressed_length: 0,
-            },
+            header: Header::test_dummy(BlockType::Data),
         };
         let trailer_offset = Trailer::new(&block).trailer_offset();
         bytes[trailer_offset] = 0;
 
         let corrupt_block = DataBlock::new(Block {
             data: bytes.into(),
-            header: Header {
-                block_type: BlockType::Data,
-                checksum: Checksum::from_raw(0),
-                data_length: 0,
-                uncompressed_length: 0,
-            },
+            header: Header::test_dummy(BlockType::Data),
         });
 
         assert!(
@@ -1950,12 +1840,7 @@ mod tests {
 
         let original_block = DataBlock::new(Block {
             data: bytes.clone().into(),
-            header: Header {
-                block_type: BlockType::Data,
-                checksum: Checksum::from_raw(0),
-                data_length: 0,
-                uncompressed_length: 0,
-            },
+            header: Header::test_dummy(BlockType::Data),
         });
         assert!(
             original_block.hash_bucket_count().is_some(),
@@ -1966,12 +1851,7 @@ mod tests {
 
         let corrupt_block = DataBlock::new(Block {
             data: bytes.into(),
-            header: Header {
-                block_type: BlockType::Data,
-                checksum: Checksum::from_raw(0),
-                data_length: 0,
-                uncompressed_length: 0,
-            },
+            header: Header::test_dummy(BlockType::Data),
         });
 
         // The upfront Decoder::try_new guard must reject the block before

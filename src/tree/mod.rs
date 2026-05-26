@@ -499,6 +499,7 @@ impl AbstractTree for Tree {
 
         table_writer = table_writer.use_prefix_extractor(self.config.prefix_extractor.clone());
         table_writer = table_writer.use_encryption(self.config.encryption.clone());
+        table_writer = table_writer.use_page_ecc(self.config.page_ecc);
 
         #[cfg(zstd_any)]
         {
@@ -1657,6 +1658,14 @@ impl Tree {
     pub(crate) fn open(config: Config) -> crate::Result<Self> {
         log::debug!("Opening LSM-tree at {}", config.path.display());
 
+        // Gate on the `page_ecc` cargo feature: caller asked for ECC
+        // but the build does not link the Reed-Solomon codec. We have
+        // no way to verify or recover RS parity without the codec, so
+        // refuse to open rather than silently downgrade integrity.
+        if config.page_ecc && !cfg!(feature = "page_ecc") {
+            return Err(crate::Error::PageEccUnsupported);
+        }
+
         // Check for old version
         if config.fs.exists(&config.path.join("version"))? {
             log::error!(
@@ -1882,7 +1891,7 @@ impl Tree {
             let reader = sfa::Reader::from_reader(&mut manifest_file)?;
             let manifest = Manifest::decode_from(&manifest_path, &reader, &*config.fs)?;
 
-            if !matches!(manifest.version, FormatVersion::V5) {
+            if !matches!(manifest.version, FormatVersion::V6) {
                 return Err(crate::Error::InvalidVersion(manifest.version.into()));
             }
 

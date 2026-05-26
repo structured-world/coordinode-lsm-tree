@@ -14,6 +14,13 @@ use std::{path::PathBuf, sync::Arc};
 /// Like `Writer` but will rotate to a new table, once a table grows larger than `target_size`
 ///
 /// This results in a sorted "run" of tables
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "writer rotation needs to preserve every per-tree builder flag \
+              (clip_range_tombstones, page_ecc, ...) across successor Writers; \
+              a state-machine refactor would obscure the existing 'use_X' chain \
+              and not reduce the working set"
+)]
 pub struct MultiWriter {
     pub(crate) fs: Arc<dyn Fs>,
 
@@ -67,6 +74,10 @@ pub struct MultiWriter {
     prefix_extractor: Option<Arc<dyn PrefixExtractor>>,
 
     encryption: Option<Arc<dyn EncryptionProvider>>,
+
+    /// `Config::page_ecc` — preserved here so the rotation path
+    /// can stamp the same flag on every successor [`Writer`].
+    page_ecc: bool,
 
     #[cfg(zstd_any)]
     zstd_dictionary: Option<Arc<crate::compression::ZstdDictionary>>,
@@ -122,6 +133,8 @@ impl MultiWriter {
             prefix_extractor: None,
 
             encryption: None,
+
+            page_ecc: false,
 
             #[cfg(zstd_any)]
             zstd_dictionary: None,
@@ -395,6 +408,16 @@ impl MultiWriter {
         self
     }
 
+    /// Wires the tree's `Config::page_ecc` flag through to the
+    /// inner [`Writer`] and preserves it across rotations so every
+    /// successor writer stamps the same setting on its blocks.
+    #[must_use]
+    pub fn use_page_ecc(mut self, page_ecc: bool) -> Self {
+        self.page_ecc = page_ecc;
+        self.writer = self.writer.use_page_ecc(page_ecc);
+        self
+    }
+
     #[cfg(zstd_any)]
     #[must_use]
     pub fn use_zstd_dictionary(
@@ -431,6 +454,7 @@ impl MultiWriter {
 
         new_writer = new_writer.use_prefix_extractor(self.prefix_extractor.clone());
         new_writer = new_writer.use_encryption(self.encryption.clone());
+        new_writer = new_writer.use_page_ecc(self.page_ecc);
 
         #[cfg(zstd_any)]
         {

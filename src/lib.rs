@@ -29,8 +29,8 @@
 //!   key.
 //! - **Range tombstones**: `delete_range` / `delete_prefix` (SST-encoded; the
 //!   feature was added in disk format V4 and remains supported in the current
-//!   V5 format — V5's breaking change is the filter wire format, not the
-//!   tombstone encoding).
+//!   V6 format — the V6 break extends the block header for per-block Reed-
+//!   Solomon Page ECC, not the tombstone encoding).
 //! - **Merge operators**: commutative-merge LSM operations with lazy resolution.
 //! - **K/V separation (`BlobTree`)**: large-value workloads with automatic GC.
 //! - **Pluggable `Fs`**: standard, in-memory, `io_uring`, or custom backends.
@@ -59,10 +59,14 @@
 //!
 //! ## On-disk format
 //!
-//! Current version: **V5**. V5 introduces a wire-format break for filter
-//! blocks (`BuRR` replaces Bloom); V3 and V4 databases are not readable by
-//! this version and vice versa. The manifest version gate rejects pre-V5
-//! databases at `Tree::open` time.
+//! Current version: **V6**. V6 introduces per-block Reed-Solomon Page ECC:
+//! the block header gains an `ecc_length` field and the block magic is
+//! bumped so a pre-V6 reader rejects V6 blocks immediately at header
+//! decode. V3-V5 databases are not readable by this version and vice
+//! versa. The manifest version gate rejects pre-V6 databases at
+//! `Tree::open` time. V5 introduced the `BuRR` filter wire format (still
+//! the current filter encoding); V4 introduced range tombstones (still
+//! supported).
 #![deny(clippy::all, missing_docs, clippy::cargo)]
 #![deny(clippy::unwrap_used)]
 #![deny(clippy::indexing_slicing)]
@@ -138,6 +142,12 @@ pub mod config;
 
 #[doc(hidden)]
 pub mod descriptor_table;
+
+/// Per-block Reed-Solomon Page ECC. Gated behind the `page_ecc`
+/// cargo feature so the `reed-solomon-simd` dependency is only
+/// pulled in when the feature is enabled.
+#[cfg(feature = "page_ecc")]
+pub mod ecc;
 
 #[doc(hidden)]
 pub mod file_accessor;
