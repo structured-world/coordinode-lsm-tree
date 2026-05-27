@@ -202,16 +202,17 @@ mod key;
 mod key_range;
 mod loser_tree;
 mod manifest;
-// Unconditional: while writer/reader internally use `std::io::{Cursor,
-// Seek}` + `std::sync::Arc`, every consumer in the tree (manifest,
-// version, recovery, tree, checkpoint) references this module
-// unconditionally. Gating it on `feature = "std"` would cascade
-// `#[cfg]` onto every call site without unblocking the no-std build
-// (those consumers are std-bound for unrelated reasons — file I/O,
-// Box<dyn FsFile>, encryption provider). The crate-wide no-std
-// migration is tracked incrementally; this module's std dependency
-// is part of the same migration debt the `fs::*` and `version::*`
-// modules already carry.
+// Unconditional today. Gating behind `feature = "std"` requires
+// cascading `#[cfg]` onto every consumer that imports from this
+// module — `manifest`, `version::{persist,recovery}`, `tree::inner`,
+// `checkpoint`, plus their downstream re-exports — none of which are
+// themselves cfg-gated yet (they're std-bound through `fs::Fs` /
+// `Box<dyn FsFile>` for unrelated reasons). A naive gate here adds
+// hundreds of unresolved-module errors to the `no-std-check` job
+// before unblocking any of them. The cascade migration of this whole
+// std-bound layer (manifest + version + tree + checkpoint) is tracked
+// as a separate task; gating `manifest_blocks` in isolation is not
+// cheap and is the wrong sequencing.
 #[doc(hidden)]
 pub mod manifest_blocks;
 mod memtable;
@@ -219,12 +220,13 @@ mod merge_operator;
 mod run_reader;
 mod run_scanner;
 // Vendored sfa is std-only internally (`std::io` / `std::fs` /
-// `std::path` references throughout) but is not feature-gated:
-// gating cascades into every blob-file / table / inspect consumer
-// of sfa, all of which are std-bound for unrelated reasons (file
-// I/O, Box<dyn FsFile>, etc.). The crate-wide no-std migration is
-// tracked incrementally; gating just sfa would force gates onto
-// many call sites without unblocking the no-std build today.
+// `std::path`). Unconditional for the same cascading reason as
+// `manifest_blocks` above: ~20 consumers across the table /
+// blob-file / inspect / verify / checkpoint paths reference sfa
+// types in unconditional code. Gating sfa alone explodes the
+// `no-std-check` error count via unresolved-module failures on
+// every consumer that hasn't been gated yet. Migration is the
+// whole std-bound layer at once, not sfa in isolation.
 #[doc(hidden)]
 pub mod sfa;
 

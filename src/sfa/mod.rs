@@ -44,7 +44,14 @@ mod toc;
 mod trailer;
 mod writer;
 
-pub(crate) type Result<T> = std::result::Result<T, Error>;
+// `pub` (not `pub(crate)`) so the vendored `Reader::from_reader`,
+// `Writer::finish`, `Writer::into_inner`, `TrailerReader::from_reader`
+// signatures don't trip the `private_interfaces` lint: their pub fns
+// live inside `#[doc(hidden)] pub mod sfa` which is reachable from
+// outside the crate, so any type in their signatures must be at least
+// as visible as the fn. The alias stays doc-hidden via the parent
+// module's `#[doc(hidden)]`.
+pub type Result<T> = std::result::Result<T, Error>;
 
 pub use checksum::Checksum;
 pub use error::Error;
