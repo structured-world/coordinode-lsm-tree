@@ -31,6 +31,7 @@ use crate::{
     runtime_config::RuntimeConfig,
     table::block::{Block, BlockIdentity, BlockTransform, BlockType},
 };
+use byteorder::{LittleEndian, WriteBytesExt};
 use std::{
     collections::BTreeSet,
     io::{self, Seek, SeekFrom, Write},
@@ -219,6 +220,20 @@ impl ManifestArchiveWriter {
         // mirror copy still leaves a fully-valid file readable via
         // the tail path.
         self.file.write_all(&footer_block_bytes)?;
+
+        // Trailing footer-size pointer. The last 4 bytes of the
+        // file declare the footer Block's on-disk byte length so
+        // the reader can locate it without scanning: seek to
+        // `file_len - 4`, read u32, seek to `file_len - 4 - size`,
+        // call `Block::from_reader`. Header check at module level
+        // bounds footer_block_bytes.len() <= HEAD_FOOTER_RESERVED_SIZE
+        // = 4 KiB, well within u32 range.
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "footer_block_bytes.len() <= HEAD_FOOTER_RESERVED_SIZE = 4 KiB, fits u32"
+        )]
+        let footer_size_u32 = footer_block_bytes.len() as u32;
+        self.file.write_u32::<LittleEndian>(footer_size_u32)?;
 
         if mirror_enabled {
             // Seek back to offset 0, write the same Block bytes,

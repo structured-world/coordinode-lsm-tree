@@ -51,6 +51,7 @@
 //! [`Block::from_reader`]: crate::table::block::Block::from_reader
 
 pub mod footer;
+pub mod reader;
 pub mod writer;
 
 /// Manifest file layout version carried in the footer payload.
@@ -75,6 +76,15 @@ pub const HEAD_FOOTER_RESERVED_SIZE: u64 = 4 * 1024;
 /// offset 0 was populated by the writer. When clear, readers skip
 /// the head-fallback path on tail-verify failure.
 pub const FLAG_FOOTER_MIRROR_ENABLED: u8 = 1 << 0;
+
+/// Size in bytes of the trailing footer-size pointer written at the
+/// very end of every manifest file (a little-endian `u32`). The
+/// reader reads these last 4 bytes first to discover the footer
+/// Block's on-disk size, then seeks to `file_len - 4 - size` to
+/// position itself at the footer Block start. Without this hint
+/// the reader would have to scan backwards through the file
+/// looking for the footer's magic header.
+pub const TAIL_FOOTER_SIZE_HINT_BYTES: u64 = 4;
 
 /// Maximum length in bytes of a section name (the UTF-8 bytes
 /// stored in each TOC entry). Generous cap that holds every name
