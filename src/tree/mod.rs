@@ -978,6 +978,60 @@ impl AbstractTree for Tree {
 }
 
 impl Tree {
+    /// Update the live [`crate::runtime_config::RuntimeConfig`].
+    ///
+    /// Mutator runs on a clone of the current snapshot; the new snapshot
+    /// is then atomically swapped in. Subsequent calls to
+    /// [`Self::runtime_config`] observe the new snapshot.
+    ///
+    /// ## Current scope
+    ///
+    /// This API ships the snapshot + atomic-swap mechanism. No write
+    /// path in the current tree consults `runtime_config` yet — that
+    /// wiring lands with the V5-batch format features (manifest
+    /// hardening, per-KV protection, scan-since-seqno) which extend
+    /// [`RuntimeConfig`](crate::runtime_config::RuntimeConfig) with
+    /// their own fields and read it at block write / manifest commit /
+    /// compaction boundaries.
+    ///
+    /// ## Designed semantics (effective once wired by V5 features)
+    ///
+    /// - Subsequent write paths load the new snapshot lockless on their
+    ///   next operation.
+    /// - Existing on-disk data remains in its original format and reads
+    ///   transparently — every block / manifest is self-describing via
+    ///   its own header.
+    /// - Compaction acts as the live-migration mechanism: source blocks
+    ///   are rewritten per the current snapshot over subsequent cycles,
+    ///   so all data converges to the current settings without
+    ///   stop-the-world coordination.
+    ///
+    /// ## Concurrency
+    ///
+    /// **Reader atomicity:** concurrent readers observe either the old
+    /// or the new snapshot, never a torn intermediate state.
+    ///
+    /// **Writer semantics: last-writer-wins.** Two `update` calls racing
+    /// from the same starting snapshot will have the second `store`
+    /// overwrite the first — the first writer's mutation is lost. There
+    /// is no CAS / RCU merge. Callers that need lost-update avoidance
+    /// (e.g. two threads concurrently toggling different fields) MUST
+    /// serialize their `update_runtime_config` calls, typically via a
+    /// `Mutex` around the call site.
+    pub fn update_runtime_config<F>(&self, mutator: F)
+    where
+        F: FnOnce(&mut crate::runtime_config::RuntimeConfig),
+    {
+        self.0.runtime_config.update(mutator);
+    }
+
+    /// Snapshot of the current runtime config. Cheap atomic load —
+    /// safe to call on hot paths.
+    #[must_use]
+    pub fn runtime_config(&self) -> Arc<crate::runtime_config::RuntimeConfig> {
+        self.0.runtime_config.load_full()
+    }
+
     /// Shared point-read logic for `get()` and `multi_get()`: finds the newest
     /// entry, applies merge resolution or RT suppression, and returns the value.
     fn resolve_or_passthrough(
@@ -1962,6 +2016,9 @@ impl Tree {
             flush_lock: Mutex::default(),
             compaction_state: Arc::new(Mutex::new(CompactionState::default())),
             deletion_pause: Arc::clone(&deletion_pause),
+            runtime_config: crate::runtime_config::handle::RuntimeConfigHandle::new(
+                crate::runtime_config::RuntimeConfig::default(),
+            ),
 
             #[cfg(feature = "metrics")]
             metrics,

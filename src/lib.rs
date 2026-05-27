@@ -218,6 +218,9 @@ mod prefix;
 #[doc(hidden)]
 pub mod range;
 
+/// Runtime-toggleable configuration (`RuntimeConfig` + atomic-swap handle).
+pub mod runtime_config;
+
 pub(crate) mod active_tombstone_set;
 pub(crate) mod range_tombstone;
 pub(crate) mod range_tombstone_filter;
