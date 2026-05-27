@@ -254,15 +254,23 @@ impl ManifestArchiveReader {
     ///
     /// # Errors
     ///
-    /// - [`crate::Error::ManifestFooterInvalid`] when `name` is not
-    ///   in the TOC
+    /// - [`crate::Error::ManifestSectionInvalid`] when `name` is
+    ///   not in the TOC, when the section Block's inner header
+    ///   declares a payload larger than the TOC slot, or when
+    ///   the decoded Block carries a non-`Manifest` block type
+    /// - [`crate::Error::ManifestFooterInvalid`] when the TOC
+    ///   entry's `(block_offset, block_size)` is itself bogus
+    ///   (overflows `u64`, extends past EOF, exceeds
+    ///   `MAX_MANIFEST_BLOCK_SIZE`) — TOC bytes live in the
+    ///   footer payload, so a malformed entry is a footer-layer
+    ///   issue even though it surfaces in this method
     /// - propagates Block I/O / XXH3 / decryption errors when the
     ///   section Block fails verification
     pub fn read_section(&mut self, name: &str) -> crate::Result<Vec<u8>> {
         let entry = self
             .footer
             .section(name)
-            .ok_or(crate::Error::ManifestFooterInvalid(
+            .ok_or(crate::Error::ManifestSectionInvalid(
                 "requested section name not in TOC",
             ))?;
         let block_offset = entry.block_offset;
@@ -297,7 +305,7 @@ impl ManifestArchiveReader {
         let mut block_bytes = vec![0u8; block_size as usize];
         self.file.read_exact(&mut block_bytes)?;
 
-        validate_block_header_fits(&block_bytes)?;
+        validate_block_header_fits(&block_bytes, HeaderContext::Section)?;
         let identity = BlockIdentity {
             tree_id: MANIFEST_TREE_ID_SENTINEL,
             table_id: MANIFEST_TABLE_ID_SENTINEL,
@@ -325,12 +333,32 @@ impl ManifestArchiveReader {
         // `from_reader` rejects type mismatch internally, this check
         // becomes redundant defence-in-depth (cheap; keep it).
         if block.header.block_type != BlockType::Manifest {
-            return Err(crate::Error::ManifestFooterInvalid(
+            return Err(crate::Error::ManifestSectionInvalid(
                 "TOC entry points at non-Manifest block",
             ));
         }
         Ok(block.data.to_vec())
     }
+}
+
+/// Which manifest layer is asking [`validate_block_header_fits`]
+/// to peek the inner Block header. Drives error classification:
+/// footer/head-mirror failures stay in
+/// [`crate::Error::ManifestFooterInvalid`] (whole-manifest
+/// discovery is broken); section failures route through
+/// [`crate::Error::ManifestSectionInvalid`] so callers can
+/// distinguish "this one section is bad" from "the manifest
+/// is unreadable".
+#[derive(Copy, Clone)]
+enum HeaderContext {
+    /// Inner header lives in a section Block whose outer slot was
+    /// described by a TOC entry. Failures classify as
+    /// `ManifestSectionInvalid`.
+    Section,
+    /// Inner header lives in the tail-footer Block or its
+    /// head-mirror copy. Failures classify as
+    /// `ManifestFooterInvalid`.
+    Footer,
 }
 
 /// Peek the Block header from `buf` and refuse to delegate to
@@ -345,35 +373,38 @@ impl ManifestArchiveReader {
 /// claiming a much larger payload, and the Block layer will
 /// allocate a multi-MiB Vec before discovering the bounded buffer
 /// runs out. Pre-validating the header here turns that allocation
-/// surge into a typed `ManifestFooterInvalid` at the caller's
+/// surge into a typed manifest-layer error at the caller's
 /// existing budget, without changing the Block decoder.
 ///
 /// Uses [`crate::coding::Decode::decode_from`] on a borrowed slice
 /// so the cost is one fixed-size header parse (cheap; well under
 /// 50 bytes) before the main read path runs.
-fn validate_block_header_fits(buf: &[u8]) -> crate::Result<()> {
+fn validate_block_header_fits(buf: &[u8], ctx: HeaderContext) -> crate::Result<()> {
     use crate::coding::Decode;
+    let wrap = |msg: &'static str| -> crate::Error {
+        match ctx {
+            HeaderContext::Section => crate::Error::ManifestSectionInvalid(msg),
+            HeaderContext::Footer => crate::Error::ManifestFooterInvalid(msg),
+        }
+    };
     let header_len = Header::serialized_len();
     if buf.len() < header_len {
-        return Err(crate::Error::ManifestFooterInvalid(
-            "manifest Block buffer shorter than Block header",
-        ));
+        return Err(wrap("manifest Block buffer shorter than Block header"));
     }
     // Length guarded by the `buf.len() < header_len` check above —
     // the slice cannot panic. `get(..n)` would return Option that
     // we'd unwrap to the same effect.
-    let mut cursor = Cursor::new(buf.get(..header_len).ok_or(
-        crate::Error::ManifestFooterInvalid("manifest Block header slice unexpectedly short"),
-    )?);
+    let mut cursor = Cursor::new(
+        buf.get(..header_len)
+            .ok_or_else(|| wrap("manifest Block header slice unexpectedly short"))?,
+    );
     let header = Header::decode_from(&mut cursor)?;
     let declared = u64::from(header.data_length)
         .checked_add(u64::from(header.ecc_length))
         .and_then(|payload| payload.checked_add(header_len as u64))
-        .ok_or(crate::Error::ManifestFooterInvalid(
-            "manifest Block header lengths overflow u64",
-        ))?;
+        .ok_or_else(|| wrap("manifest Block header lengths overflow u64"))?;
     if declared > buf.len() as u64 {
-        return Err(crate::Error::ManifestFooterInvalid(
+        return Err(wrap(
             "manifest Block header declares on-disk size larger than buffer",
         ));
     }
@@ -457,7 +488,7 @@ fn read_tail_footer(
     )]
     let mut footer_buf = vec![0u8; footer_size as usize];
     file.read_exact(&mut footer_buf)?;
-    validate_block_header_fits(&footer_buf)?;
+    validate_block_header_fits(&footer_buf, HeaderContext::Footer)?;
     let identity = BlockIdentity {
         tree_id: MANIFEST_TREE_ID_SENTINEL,
         table_id: MANIFEST_TABLE_ID_SENTINEL,
@@ -499,7 +530,7 @@ fn read_head_footer(
         ));
     }
 
-    validate_block_header_fits(&head_buf)?;
+    validate_block_header_fits(&head_buf, HeaderContext::Footer)?;
     let identity = BlockIdentity {
         tree_id: MANIFEST_TREE_ID_SENTINEL,
         table_id: MANIFEST_TABLE_ID_SENTINEL,
@@ -695,8 +726,10 @@ mod tests {
     #[test]
     fn reader_rejects_request_for_missing_section() {
         // read_section on an unknown name returns
-        // ManifestFooterInvalid rather than Io or a panic. Locks
-        // the contract that callers can probe sections defensively.
+        // ManifestSectionInvalid rather than Io or a panic. Locks
+        // the contract that callers can probe sections defensively
+        // and distinguish per-section errors from footer-load
+        // failures.
         let fs = fresh_fs();
         let path = Path::new("/m/missing");
         write_manifest(&fs, path, RuntimeConfig::default(), &[("a", &[1])]);
@@ -711,7 +744,7 @@ mod tests {
         let err = reader
             .read_section("does_not_exist")
             .expect_err("missing section must error");
-        assert!(matches!(err, crate::Error::ManifestFooterInvalid(_)));
+        assert!(matches!(err, crate::Error::ManifestSectionInvalid(_)));
     }
 
     #[test]
