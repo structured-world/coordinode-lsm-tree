@@ -127,10 +127,9 @@ impl<W: Write + Seek> Writer<W> {
 }
 
 #[cfg(test)]
-#[allow(
-    clippy::unwrap_used,
+#[expect(
     clippy::indexing_slicing,
-    reason = "vendored upstream tests use .unwrap() / buf[..] freely; \
+    reason = "vendored upstream tests use `toc[i]` indexing freely; \
               keep verbatim so the upstream-sync diff stays mechanical"
 )]
 mod tests {

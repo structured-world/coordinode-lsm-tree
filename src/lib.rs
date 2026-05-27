@@ -190,13 +190,16 @@ mod key;
 mod key_range;
 mod loser_tree;
 mod manifest;
-// `std`-gated: writer/reader use `std::io::{Cursor, Seek}` and
-// `std::sync::Arc`, and the surrounding `fs::Fs` trait surface is
-// itself std-bound until #311's follow-ups land. Keeping the gate
-// in lockstep with the rest of the std-only modules unblocks the
-// `--no-default-features --features alloc` build the
-// `no-std-check` CI job exercises.
-#[cfg(feature = "std")]
+// Unconditional: while writer/reader internally use `std::io::{Cursor,
+// Seek}` + `std::sync::Arc`, every consumer in the tree (manifest,
+// version, recovery, tree, checkpoint) references this module
+// unconditionally. Gating it on `feature = "std"` would cascade
+// `#[cfg]` onto every call site without unblocking the no-std build
+// (those consumers are std-bound for unrelated reasons — file I/O,
+// Box<dyn FsFile>, encryption provider). The crate-wide no-std
+// migration is tracked incrementally; this module's std dependency
+// is part of the same migration debt the `fs::*` and `version::*`
+// modules already carry.
 #[doc(hidden)]
 pub mod manifest_blocks;
 mod memtable;

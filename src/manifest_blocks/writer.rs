@@ -26,7 +26,7 @@ use crate::{
     fs::{Fs, FsFile, FsOpenOptions},
     manifest_blocks::{
         FLAG_FOOTER_MIRROR_ENABLED, HEAD_FOOTER_RESERVED_SIZE, MANIFEST_TABLE_ID_SENTINEL,
-        MANIFEST_TREE_ID_SENTINEL, MAX_SECTION_NAME_BYTES,
+        MANIFEST_TREE_ID_SENTINEL, MAX_MANIFEST_BLOCK_SIZE, MAX_SECTION_NAME_BYTES,
         footer::{FooterPayload, TocEntry},
     },
     runtime_config::RuntimeConfig,
@@ -340,6 +340,17 @@ impl ManifestArchiveWriter {
             identity,
             &self.block_transform(),
         )?;
+
+        // Symmetric with the reader's `MAX_MANIFEST_BLOCK_SIZE`
+        // check (see ManifestArchiveReader::read_section): refuse
+        // to emit a section Block the same codebase's reader will
+        // later refuse to load. Surface a typed error here rather
+        // than after a wasted disk write.
+        if block_bytes.len() as u64 > u64::from(MAX_MANIFEST_BLOCK_SIZE) {
+            return Err(crate::Error::ManifestFooterInvalid(
+                "section Block exceeds MAX_MANIFEST_BLOCK_SIZE",
+            ));
+        }
 
         self.file.write_all(&block_bytes)?;
         let block_size_u64 = block_bytes.len() as u64;
