@@ -186,13 +186,23 @@ impl ManifestArchiveWriter {
                 "section name exceeds MAX_SECTION_NAME_BYTES",
             ));
         }
-        if !self.section_names.insert(name.to_string()) {
+        // Duplicate-name check before flush: cheap and lets us
+        // reject without spending I/O on the previous section.
+        if self.section_names.contains(name) {
             return Err(crate::Error::ManifestFooterInvalid(
                 "duplicate section name",
             ));
         }
 
+        // Flush the previously-open section BEFORE recording the new
+        // name in `section_names`. If flush_current_section() fails
+        // (block overflow, I/O error), the writer is left with no
+        // open section and the unflushed name never enters
+        // `section_names` — a caller that catches the error and
+        // retries start() with the same name doesn't trip a
+        // spurious duplicate check.
         self.flush_current_section()?;
+        self.section_names.insert(name.to_string());
         self.current_section = Some(CurrentSection {
             name: name.to_string(),
             buf: Vec::new(),
