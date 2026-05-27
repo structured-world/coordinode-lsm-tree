@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779822873220,
+  "lastUpdate": 1779866019498,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -10686,6 +10686,84 @@ window.BENCHMARK_DATA = {
             "value": 444739.24331095617,
             "unit": "ops/sec",
             "extra": "P50: 2.0us | P99: 6.5us | P99.9: 9.8us\nthreads: 1 | elapsed: 0.45s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "aacbca3c71e5b33706e4f037dacf089592095b60",
+          "message": "feat(config): runtime-toggleable RuntimeConfig foundation (#352) (#355)\n\n## Summary\n\nV5-1 of the V5 release batch — foundation for live-toggleable\nconfiguration that downstream V5 features (#297 manifest hardening, #298\nper-KV protection, #224 scan_since_seqno) build on. Caller updates\nsettings via `Tree::update_runtime_config`; subsequent write paths load\nthe new snapshot lockless. Existing on-disk data stays in its original\nformat and reads transparently via per-block self-description.\nCompaction acts as the live migration mechanism — source blocks\nrewritten per the current snapshot over subsequent cycles, all data\nconverges without stop-the-world coordination.\n\nCloses #352.\n\n## Layered tier separation (no_std-aware)\n\n| Module | Tier | Why |\n|--------|------|-----|\n| `runtime_config::types` | `alloc` (compiles on no_std + alloc) | Pure\ndata: `RuntimeConfig` + `ChecksumAlgorithm`. Reachable from no_std\nconsumers (block decoders, format constants). |\n| `runtime_config::handle` | std-bound (`#[cfg(feature = \"std\")]`) |\n`ArcSwap`-based snapshot. `load()` = single atomic load; `update(fn)` =\nclone, mutate, atomic swap. |\n\n## Public API\n\n```rust\nimpl Tree {\n    pub fn runtime_config(&self) -> Arc<RuntimeConfig>;\n    pub fn update_runtime_config<F: FnOnce(&mut RuntimeConfig)>(&self, mutator: F);\n}\n```\n\n## ChecksumAlgorithm\n\nUsed by downstream V5 features (#297, #298, #300) for block-level and\nper-KV checksums. Stable `wire_tag()` / `from_wire_tag()` for on-disk\nself-description so each block can dispatch verify per its own recorded\nalgorithm.\n\n| Variant | Bytes | Speed | Notes |\n|---------|-------|-------|-------|\n| `Xxh3_64` (default) | 8 | ~50-100 GB/s SIMD | Default — matches\ncrate-wide XXH3 convention |\n| `Xxh3Low32` | 4 | same as `Xxh3_64` | Per-entry use case where space\nmatters |\n| `Crc32c` | 4 | ~30 GB/s HW | Mathematically-proven burst-error\ndetection |\n\n## Tests\n\n- **10 unit tests** in `runtime_config::types` +\n`runtime_config::handle`:\n  - digest sizes, wire-tag roundtrip, atomic swap visibility\n- snapshot held during update is unchanged (compaction-as-migration\nprerequisite)\n- concurrent-reads-during-update consistent state (no torn reads under\nstress)\n  - multiple back-to-back updates: final-state observable\n- **4 integration tests** in `tests/runtime_config_integration.rs`:\n  - Tree starts at default\n  - update visible on next load\n  - snapshot outlives update with pre-update state\n- runtime config resets to default on reopen (by design — caller\nre-applies)\n\n**Workspace: 1664/1664 tests pass** (+24 new vs prior baseline). Lints\nclean across all-features lib + tests. Doc tests pass (43).\n\n## Test plan\n\n- [x] strict lints clean across all-features lib + tests\n- [x] full nextest workspace: 1664/1664 pass\n- [x] doc tests pass (43)\n- [x] runtime_config unit tests pass (10/10)\n- [x] runtime_config integration tests pass (4/4)\n- [x] concurrent torn-read stress test passes (8 readers × 5000 reads +\nwriter)\n\n## Dependency\n\n`arc-swap = \"1.9\"` (std-bound; the `experimental-thread-local` no_std\nmode is out of scope for now). Handle behind `#[cfg(feature = \"std\")]`;\nfuture no_std consumers can use `spin::RwLock<RuntimeConfig>` as\nalternative documented in code.\n\n## V5 batch coordination\n\nThis is V5-1. After merge, V5-2 (#297), V5-3 (#298), V5-4 (#224) can\nland in parallel worktrees consuming this foundation. release-plz PR\n#272 stays held until full V5 batch lands — then v5.0.0 ships with the\ncomplete integrity stack as one coherent release. See #215 ROADMAP for\nfull V5 plan.\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n## Summary by CodeRabbit\n\n* **New Features**\n* Added runtime-configurable checksum algorithms for block and key-value\nintegrity checks.\n* New lockless, live configuration API to update and read runtime\nsettings without restarts.\n* Configuration changes are isolated per tree session and reset to\ndefaults upon tree reopen.\n\n* **Tests**\n* Added integration and unit tests validating runtime configuration\nupdates, atomic snapshot semantics, and persistence behavior.\n\n<!-- review_stack_entry_start -->\n\n[![Review Change\nStack](https://storage.googleapis.com/coderabbit_public_assets/review-stack-in-coderabbit-ui.svg)](https://app.coderabbit.ai/change-stack/structured-world/coordinode-lsm-tree/pull/355?utm_source=github_walkthrough&utm_medium=github&utm_campaign=change_stack)\n\n<!-- review_stack_entry_end -->\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-05-27T10:11:52+03:00",
+          "tree_id": "4eb25a1d737e388e7403299dcbc4e637000e3a8b",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/aacbca3c71e5b33706e4f037dacf089592095b60"
+        },
+        "date": 1779866017806,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 2047440.6117072797,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.6us | P99.9: 3.7us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1223730.5585161336,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.2us | P99.9: 4.3us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 517687.30578362144,
+            "unit": "ops/sec",
+            "extra": "P50: 1.8us | P99: 5.2us | P99.9: 7.8us\nthreads: 1 | elapsed: 0.39s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3595749.644133152,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 3.1us | P99.9: 5.6us\nthreads: 1 | elapsed: 0.06s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 381504.14785806707,
+            "unit": "ops/sec",
+            "extra": "P50: 2.3us | P99: 5.7us | P99.9: 8.5us\nthreads: 1 | elapsed: 0.52s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 201691.0257641619,
+            "unit": "ops/sec",
+            "extra": "P50: 4.6us | P99: 5.9us | P99.9: 8.7us\nthreads: 1 | elapsed: 0.99s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1265983.3723971492,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.2us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1126443.870825432,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 1.5us | P99.9: 1.9us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 453785.140636308,
+            "unit": "ops/sec",
+            "extra": "P50: 2.0us | P99: 5.6us | P99.9: 8.1us\nthreads: 1 | elapsed: 0.44s | num: 200000 | iterations: 3"
           }
         ]
       }
