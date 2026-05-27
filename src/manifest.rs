@@ -5,8 +5,6 @@
 use crate::{
     FormatVersion, TreeType, checksum::ChecksumType, manifest_blocks::reader::ManifestArchiveReader,
 };
-use byteorder::ReadBytesExt;
-use std::io::Cursor;
 
 pub struct Manifest {
     pub version: FormatVersion,
@@ -67,8 +65,15 @@ impl Manifest {
         };
 
         let level_count_bytes = reader.read_section("level_count")?;
-        let mut level_count_cursor = Cursor::new(&level_count_bytes);
-        let level_count = level_count_cursor.read_u8()?;
+        // Mirror format_version / tree_type above: a truncated /
+        // empty section is structural corruption, not generic I/O.
+        // `Cursor::read_u8` would surface Io(UnexpectedEof) which
+        // is harder to route at the caller; the InvalidHeader
+        // variant carries the section name for diagnostics and
+        // matches the sibling sections' classification.
+        let level_count = *level_count_bytes
+            .first()
+            .ok_or(crate::Error::InvalidHeader("level_count"))?;
 
         // Currently level count is hard coded to 7. The byte comes
         // from disk, so a corrupted / forged manifest could carry

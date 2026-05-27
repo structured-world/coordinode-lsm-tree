@@ -155,7 +155,12 @@ mod tests {
         let trailer = TrailerReader::from_reader(&mut reader)?;
         assert_eq!(0, trailer.toc_pos);
 
-        let toc = TocReader::from_reader(&mut reader, trailer.toc_pos, trailer.toc_checksum)?;
+        let toc = TocReader::from_reader(
+            &mut reader,
+            trailer.toc_pos,
+            trailer.toc_len,
+            trailer.toc_checksum,
+        )?;
         assert_eq!(0, toc.len());
         assert!(toc.is_empty());
         assert!(toc.section(b"hello").is_none());
@@ -181,7 +186,12 @@ mod tests {
         let trailer = TrailerReader::from_reader(&mut reader)?;
         assert_eq!(data.len() as u64, trailer.toc_pos);
 
-        let toc = TocReader::from_reader(&mut reader, trailer.toc_pos, trailer.toc_checksum)?;
+        let toc = TocReader::from_reader(
+            &mut reader,
+            trailer.toc_pos,
+            trailer.toc_len,
+            trailer.toc_checksum,
+        )?;
         assert_eq!(1, toc.len());
         assert!(toc.section(b"hello").is_none());
         assert!(toc.section(b"").is_some());
@@ -220,7 +230,12 @@ mod tests {
             trailer.toc_pos,
         );
 
-        let toc = TocReader::from_reader(&mut reader, trailer.toc_pos, trailer.toc_checksum)?;
+        let toc = TocReader::from_reader(
+            &mut reader,
+            trailer.toc_pos,
+            trailer.toc_len,
+            trailer.toc_checksum,
+        )?;
         assert_eq!(3, toc.len());
         assert!(toc.section(b"hello").is_none());
         assert!(toc.section(b"").is_some());

@@ -11,9 +11,21 @@ use std::io::{Read, Seek, SeekFrom};
 const TRAILER_SIZE: i64 = TRAILER_MAGIC.len() as i64 + 1 + 1 + 16 + 8 + 8;
 
 #[derive(Debug, Eq, PartialEq)]
+#[expect(
+    clippy::struct_field_names,
+    reason = "all three fields describe TOC metadata recorded in the trailer; \
+              the `toc_` prefix is part of the upstream sfa format wording \
+              and keeps the diff vs vendored upstream mechanical"
+)]
 pub struct ParsedTrailer {
     pub toc_checksum: Checksum,
     pub toc_pos: u64,
+    /// On-disk byte length of the TOC region, copied from the
+    /// trailer. The `TocReader` uses this to bound its own reads
+    /// via `Read::take(toc_len)` so a forged TOC `len` prefix
+    /// can't force unbounded work / memory before the checksum
+    /// catches it.
+    pub toc_len: u64,
 }
 
 pub struct TrailerReader;
@@ -54,11 +66,12 @@ impl TrailerReader {
 
         let toc_checksum = Checksum::from_raw(reader.read_u128::<LE>()?);
         let toc_pos = reader.read_u64::<LE>()?;
-        // let _toc_len = reader.read_u64::<LE>()?;
+        let toc_len = reader.read_u64::<LE>()?;
 
         Ok(ParsedTrailer {
             toc_checksum,
             toc_pos,
+            toc_len,
         })
     }
 }

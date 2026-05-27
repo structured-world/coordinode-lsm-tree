@@ -1046,13 +1046,20 @@ impl Config {
     /// [`crate::Tree::runtime_config`].
     ///
     /// **Manifest-hardening toggles** in the supplied snapshot
-    /// (`manifest_footer_mirror`, `manifest_kv_checksums`,
-    /// `page_ecc` *as consumed by the manifest writer*) take
-    /// effect from byte zero of the on-disk manifest rather than
-    /// waiting for a post-open
+    /// that are currently wired through the writer
+    /// (`manifest_footer_mirror`, `page_ecc` *as consumed by
+    /// `manifest_blocks::writer` when picking the `BlockTransform`
+    /// variant*) take effect from byte zero of the on-disk
+    /// manifest rather than waiting for a post-open
     /// [`crate::Tree::update_runtime_config`] call. Subsequent
     /// updates still flow through the live handle and apply to
     /// the next manifest write.
+    ///
+    /// `manifest_kv_checksums` is plumbed in the snapshot but the
+    /// writer does NOT yet consult or persist it (per-entry
+    /// framing + footer-flag slot land in a follow-up). Setting
+    /// it here today has no on-disk effect; it is exposed for
+    /// forward-compat with no behaviour break.
     ///
     /// **Note on data-block ECC:** `RuntimeConfig::page_ecc`
     /// currently affects manifest Blocks only — data-block ECC is

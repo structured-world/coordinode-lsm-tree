@@ -173,12 +173,17 @@ pub struct RuntimeConfig {
     /// benchmarks don't pay for an opt-in).
     ///
     /// **Wiring status:** the toggle is plumbed through
-    /// `RuntimeConfig` and persisted into the manifest format, but
-    /// the per-entry checksum framing it controls lands in a
-    /// separate change that introduces the `DataKvChecked` Block
-    /// variant for manifest sections. Until then this flag is
-    /// recorded and surfaced for forward compatibility — changing
-    /// it does not affect on-disk bytes in the current release.
+    /// `RuntimeConfig` only. It is NOT yet persisted into the
+    /// manifest footer payload (footer carries
+    /// `manifest_layout_version`, `flags` for the mirror bit, and
+    /// the TOC; no slot for this flag yet). The per-entry checksum
+    /// framing this would control lands in a separate change that
+    /// introduces the `DataKvChecked` Block variant for manifest
+    /// sections AND extends the footer flags / payload to record
+    /// the toggle. Until then changing this flag has no on-disk
+    /// effect — the field is surfaced for forward-compat ergonomics
+    /// in the `RuntimeConfig` builder, not for any current
+    /// behaviour change.
     pub manifest_kv_checksums: bool,
 
     /// Global default for Page ECC (Reed-Solomon `(4, 2)` parity

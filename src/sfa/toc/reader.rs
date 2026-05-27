@@ -46,6 +46,7 @@ impl TocReader {
     pub fn from_reader<R: Read + Seek>(
         reader: &mut R,
         toc_pos: u64,
+        toc_len: u64,
         toc_checksum: Checksum,
     ) -> Result<Toc> {
         use byteorder::LE;
@@ -54,7 +55,17 @@ impl TocReader {
 
         reader.seek(SeekFrom::Start(toc_pos))?;
 
-        let mut reader = ChecksummedReader::new(reader);
+        // Bound every byte the TOC parser pulls from the underlying
+        // reader to `toc_len`, the on-disk TOC byte length recorded
+        // in the (already-magic-checked) trailer. Without this gate
+        // a forged `len` field inside the TOC could drive
+        // `TocEntry::read_from_file` to consume arbitrary bytes
+        // beyond the TOC region — wasting work / memory before the
+        // checksum mismatch is caught. The take wrapper turns any
+        // such over-read into UnexpectedEof, which surfaces as a
+        // structural error.
+        let bounded = reader.take(toc_len);
+        let mut reader = ChecksummedReader::new(bounded);
 
         {
             let mut buf = [0u8; TOC_MAGIC.len()];
@@ -72,7 +83,9 @@ impl TocReader {
         // been checksum-verified — a corrupted / forged TOC could
         // force a multi-GiB Vec allocation before the per-entry
         // reads fail. Grow the Vec amortized as entries are read;
-        // the per-entry I/O cost dwarfs the realloc cost.
+        // the per-entry I/O cost dwarfs the realloc cost. The
+        // `take(toc_len)` wrapper above bounds the total work even
+        // if `len` itself is forged.
         let mut entries = Vec::new();
 
         for _ in 0..len {

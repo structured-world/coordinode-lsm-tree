@@ -310,14 +310,19 @@ impl ManifestArchiveReader {
             identity,
             &build_transform(&self.runtime, self.encryption.as_deref()),
         )?;
-        // Defence in depth: `Block::from_reader` authenticates the
-        // header's `block_type` against the `identity.block_type` we
-        // passed (AAD-bound for encrypted, checksum-bound for plain),
-        // so a forged TOC pointing at a non-Manifest block can't slip
-        // past with matching crypto. The explicit assertion below
-        // turns "decode succeeded but block_type drifted" into a
-        // typed error rather than a confusing downstream parse
-        // failure on data that happens to look section-shaped.
+        // Defence in depth: `Block::from_reader` today does NOT bind
+        // `header.block_type` to the caller-supplied `identity.block_type`
+        // (the `identity` arg is plumbed for the AAD-bound encrypt
+        // path that's still landing — see `encryption::aad::build` and
+        // the wiring TODO in `encryption::mod.rs`). So a forged TOC
+        // entry pointing at a non-Manifest block whose XXH3 happens to
+        // verify would currently slip past `from_reader`. The explicit
+        // assertion below is what enforces the expected type; without
+        // it a TOC-redirect attack or a writer-side mix-up would
+        // surface as a confusing downstream parse failure on data that
+        // happens to look section-shaped. When AAD-binding lands and
+        // `from_reader` rejects type mismatch internally, this check
+        // becomes redundant defence-in-depth (cheap; keep it).
         if block.header.block_type != BlockType::Manifest {
             return Err(crate::Error::ManifestFooterInvalid(
                 "TOC entry points at non-Manifest block",

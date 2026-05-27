@@ -23,7 +23,12 @@ impl Reader {
         let file = std::fs::File::open(path)?;
         let mut file = BufReader::with_capacity(4_096, file);
         let trailer = TrailerReader::from_reader(&mut file)?;
-        let toc = TocReader::from_reader(&mut file, trailer.toc_pos, trailer.toc_checksum)?;
+        let toc = TocReader::from_reader(
+            &mut file,
+            trailer.toc_pos,
+            trailer.toc_len,
+            trailer.toc_checksum,
+        )?;
         Ok(Self { toc })
     }
 
@@ -34,7 +39,12 @@ impl Reader {
     /// Returns error, if an IO error occurred.
     pub fn from_reader<R: Read + Seek>(reader: &mut R) -> crate::sfa::Result<Self> {
         let trailer = TrailerReader::from_reader(reader)?;
-        let toc = TocReader::from_reader(reader, trailer.toc_pos, trailer.toc_checksum)?;
+        let toc = TocReader::from_reader(
+            reader,
+            trailer.toc_pos,
+            trailer.toc_len,
+            trailer.toc_checksum,
+        )?;
         Ok(Self { toc })
     }
 
