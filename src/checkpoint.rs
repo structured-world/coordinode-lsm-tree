@@ -773,4 +773,90 @@ mod tests {
             .unwrap();
         assert_eq!(after, "mutated-via-mem-fs");
     }
+
+    /// Regression: `write_current_for_version` used to trust the
+    /// trailing 4-byte footer-size hint without validating it. A
+    /// zero hint (corrupted file) makes section_end equal to
+    /// file_len - 4, sweeping the trailer area into the CURRENT
+    /// checksum — the resulting pointer then fails get_current_version
+    /// downstream and the failure mode is confusing (looks like
+    /// pointer corruption, not manifest corruption). Same class of
+    /// bug for an out-of-bounds hint (> 4 KiB). Real manifests cap
+    /// the footer at HEAD_FOOTER_RESERVED_SIZE = 4 KiB, so any
+    /// hint outside [1, 4 KiB] is corruption and must surface
+    /// loudly here.
+    #[test]
+    fn write_current_for_version_rejects_corrupt_footer_size_hint() {
+        use crate::manifest_blocks::{
+            HEAD_FOOTER_RESERVED_SIZE, TAIL_FOOTER_SIZE_HINT_BYTES, writer::ManifestArchiveWriter,
+        };
+        use crate::runtime_config::RuntimeConfig;
+        use byteorder::{LittleEndian, WriteBytesExt};
+        use std::io::Seek;
+
+        let dir = tempfile::tempdir().unwrap();
+        let target_root = dir.path().to_path_buf();
+        let std_fs: Arc<dyn Fs> = Arc::new(StdFs);
+        let version_id: u64 = 7;
+        let manifest_path = target_root.join(format!("v{version_id}"));
+
+        // Lay down a valid manifest the same way the production
+        // writer does, so the test exercises the bounds-check path
+        // and not some unrelated file-format issue.
+        let mut w = ManifestArchiveWriter::create(
+            &manifest_path,
+            &*std_fs,
+            Arc::new(RuntimeConfig::default()),
+            None,
+        )
+        .unwrap();
+        w.start("format_version").unwrap();
+        std::io::Write::write_all(&mut w, &[5u8]).unwrap();
+        w.finish().unwrap();
+
+        // Corrupt only the trailing 4-byte size hint to 0. The
+        // rest of the file (head reservation, sections, footer
+        // Block) stays bit-for-bit valid.
+        let file_len = std::fs::metadata(&manifest_path).unwrap().len();
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&manifest_path)
+            .unwrap();
+        f.seek(std::io::SeekFrom::Start(
+            file_len - TAIL_FOOTER_SIZE_HINT_BYTES,
+        ))
+        .unwrap();
+        f.write_u32::<LittleEndian>(0).unwrap();
+        drop(f);
+
+        let result = write_current_for_version(&*std_fs, &target_root, version_id);
+        assert!(
+            matches!(result, Err(crate::Error::Unrecoverable)),
+            "expected Unrecoverable on zero footer-size hint, got {result:?}"
+        );
+
+        // Same class of bug: out-of-bounds hint (> 4 KiB) must also
+        // be rejected before the checksum is computed.
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&manifest_path)
+            .unwrap();
+        f.seek(std::io::SeekFrom::Start(
+            file_len - TAIL_FOOTER_SIZE_HINT_BYTES,
+        ))
+        .unwrap();
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "test constant — HEAD_FOOTER_RESERVED_SIZE+1 fits in u32"
+        )]
+        let oversized = (HEAD_FOOTER_RESERVED_SIZE + 1) as u32;
+        f.write_u32::<LittleEndian>(oversized).unwrap();
+        drop(f);
+
+        let result = write_current_for_version(&*std_fs, &target_root, version_id);
+        assert!(
+            matches!(result, Err(crate::Error::Unrecoverable)),
+            "expected Unrecoverable on oversized footer-size hint, got {result:?}"
+        );
+    }
 }
