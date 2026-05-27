@@ -44,7 +44,7 @@ impl Scanner {
         let path = path.as_ref();
 
         let mut file = File::open(path)?;
-        let sfa_reader = sfa::Reader::from_reader(&mut file)?;
+        let sfa_reader = crate::sfa::Reader::from_reader(&mut file)?;
         let data_section = sfa_reader.toc().section(b"data").ok_or_else(|| {
             log::error!("BlobFile: SFA TOC has no \"data\" section");
             crate::Error::InvalidHeader("BlobFile")
@@ -338,7 +338,7 @@ mod tests {
         // Manually write V3 blob file using sfa framing
         {
             let file = std::fs::File::create(&blob_file_path)?;
-            let mut sfa_writer = sfa::Writer::from_writer(file);
+            let mut sfa_writer = crate::sfa::Writer::from_writer(file);
             sfa_writer.start("data")?;
 
             // V3 frame: BLOB magic, no header_crc
@@ -446,7 +446,7 @@ mod tests {
         // Get data section start from SFA TOC so the offset calculation
         // stays correct even if SFA ever places data at non-zero offset.
         let data_start = {
-            let sfa_reader = sfa::Reader::new(&blob_file_path)?;
+            let sfa_reader = crate::sfa::Reader::new(&blob_file_path)?;
             let section = sfa_reader.toc().section(b"data").unwrap();
             #[expect(
                 clippy::cast_possible_truncation,
@@ -495,7 +495,7 @@ mod tests {
         // Write an SFA file with only a "meta" section (no "data").
         {
             let file = std::fs::File::create(&blob_file_path)?;
-            let mut sfa_writer = sfa::Writer::from_writer(file);
+            let mut sfa_writer = crate::sfa::Writer::from_writer(file);
             sfa_writer.start("meta")?;
             sfa_writer.write_all(b"dummy")?;
             sfa_writer.finish()?;

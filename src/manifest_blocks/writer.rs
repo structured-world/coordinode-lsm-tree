@@ -4,7 +4,7 @@
 //! [`ManifestArchiveWriter`] — emits a Blocks-based manifest file
 //! that the V5-2 layout (`manifest_layout_version = 1`) describes.
 //!
-//! The writer mirrors the `sfa::Writer` start / write / finish API
+//! The writer mirrors the `crate::sfa::Writer` start / write / finish API
 //! so the call sites in [`crate::version::persist`] and the
 //! V5-2-aware version encoder can migrate with minimal churn: open
 //! the writer, [`start`] a section, write its bytes via the

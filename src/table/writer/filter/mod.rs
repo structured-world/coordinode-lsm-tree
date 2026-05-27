@@ -27,7 +27,7 @@ pub trait FilterWriter<W: std::io::Write + std::io::Seek> {
     /// Returns the number of filter blocks written (always 1 in case of full filter block).
     fn finish(
         self: Box<Self>,
-        file_writer: &mut sfa::Writer<ChecksummedWriter<W>>,
+        file_writer: &mut crate::sfa::Writer<ChecksummedWriter<W>>,
     ) -> crate::Result<usize>;
 
     fn set_filter_policy(

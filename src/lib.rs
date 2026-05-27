@@ -196,6 +196,8 @@ mod memtable;
 mod merge_operator;
 mod run_reader;
 mod run_scanner;
+#[doc(hidden)]
+pub mod sfa;
 
 #[doc(hidden)]
 pub mod merge;

@@ -362,7 +362,7 @@ fn tree_page_ecc_emits_nonzero_ecc_length_on_disk() -> lsm_tree::Result<()> {
     )]
     let sst_path = sst_path.expect("flush should produce at least one SST file");
 
-    let reader = sfa::Reader::new(&sst_path)?;
+    let reader = lsm_tree::sfa::Reader::new(&sst_path)?;
     #[expect(
         clippy::expect_used,
         reason = "every lsm-tree SST has a `data` section"

@@ -49,7 +49,7 @@
 //! - `block_offset = 0` is allowed in two cases until AAD
 //!   wiring lands:
 //!   - Index / filter writers that hand their blocks to
-//!     `sfa::Writer` (the sectioned-file-archive wrapper):
+//!     `crate::sfa::Writer` (the sectioned-file-archive wrapper):
 //!     the wrapper doesn't expose a byte-position cursor, and
 //!     the [`crate::table::writer::index::BlockIndexWriter`] /
 //!     [`crate::table::writer::filter::FilterWriter`] traits

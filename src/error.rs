@@ -230,26 +230,26 @@ impl std::error::Error for Error {
     }
 }
 
-impl From<sfa::Error> for Error {
-    fn from(value: sfa::Error) -> Self {
+impl From<crate::sfa::Error> for Error {
+    fn from(value: crate::sfa::Error) -> Self {
         match value {
-            sfa::Error::Io(e) => Self::from(e),
-            sfa::Error::ChecksumMismatch { got, expected } => {
+            crate::sfa::Error::Io(e) => Self::from(e),
+            crate::sfa::Error::ChecksumMismatch { got, expected } => {
                 log::error!("Archive ToC checksum mismatch");
                 Self::ChecksumMismatch {
                     got: got.into(),
                     expected: expected.into(),
                 }
             }
-            sfa::Error::InvalidHeader => {
+            crate::sfa::Error::InvalidHeader => {
                 log::error!("Invalid archive header");
                 Self::Unrecoverable
             }
-            sfa::Error::InvalidVersion => {
+            crate::sfa::Error::InvalidVersion => {
                 log::error!("Invalid archive version");
                 Self::Unrecoverable
             }
-            sfa::Error::UnsupportedChecksumType => {
+            crate::sfa::Error::UnsupportedChecksumType => {
                 log::error!("Invalid archive checksum type");
                 Self::Unrecoverable
             }

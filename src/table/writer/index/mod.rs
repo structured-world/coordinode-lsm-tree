@@ -30,7 +30,7 @@ pub trait BlockIndexWriter<W: std::io::Write + std::io::Seek> {
     /// the same logical TLI.
     fn finish(
         self: Box<Self>,
-        file_writer: &mut sfa::Writer<ChecksummedWriter<W>>,
+        file_writer: &mut crate::sfa::Writer<ChecksummedWriter<W>>,
     ) -> crate::Result<(usize, Vec<u8>)>;
 
     fn use_compression(

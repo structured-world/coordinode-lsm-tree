@@ -1997,7 +1997,7 @@ fn meta_seqno_kv_max_corruption_returns_invalid_data() -> crate::Result<()> {
     // the metadata validation layer (not caught by block checksum).
     {
         let mut f = std::fs::File::open(&file)?;
-        let trailer = sfa::Reader::from_reader(&mut f)?;
+        let trailer = crate::sfa::Reader::from_reader(&mut f)?;
         let regions = ParsedRegions::parse_from_toc(trailer.toc())?;
         let meta_handle = regions.metadata;
 
@@ -2051,7 +2051,7 @@ fn meta_seqno_kv_max_corruption_returns_invalid_data() -> crate::Result<()> {
     // Re-open the (now corrupted) file and attempt to load metadata.
     {
         let mut f = std::fs::File::open(&file)?;
-        let trailer = sfa::Reader::from_reader(&mut f)?;
+        let trailer = crate::sfa::Reader::from_reader(&mut f)?;
         let regions = ParsedRegions::parse_from_toc(trailer.toc())?;
 
         let result = ParsedMeta::load_with_handle(&f, &regions.metadata, None);
@@ -2097,7 +2097,7 @@ fn meta_mid_and_tail_have_identical_created_at() -> crate::Result<()> {
     let _ = writer.finish()?.unwrap();
 
     let mut f = std::fs::File::open(&file)?;
-    let trailer = sfa::Reader::from_reader(&mut f)?;
+    let trailer = crate::sfa::Reader::from_reader(&mut f)?;
     let regions = ParsedRegions::parse_from_toc(trailer.toc())?;
 
     let tail = ParsedMeta::load_with_handle(&f, &regions.metadata, None)?;
@@ -2159,7 +2159,7 @@ fn meta_mid_and_tail_have_identical_file_size() -> crate::Result<()> {
     let _ = writer.finish()?.unwrap();
 
     let mut f = std::fs::File::open(&file)?;
-    let trailer = sfa::Reader::from_reader(&mut f)?;
+    let trailer = crate::sfa::Reader::from_reader(&mut f)?;
     let regions = ParsedRegions::parse_from_toc(trailer.toc())?;
 
     let tail = ParsedMeta::load_with_handle(&f, &regions.metadata, None)?;

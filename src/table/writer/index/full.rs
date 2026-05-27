@@ -92,7 +92,7 @@ impl<W: std::io::Write + std::io::Seek> BlockIndexWriter<W> for FullIndexWriter 
 
     fn finish(
         self: Box<Self>,
-        file_writer: &mut sfa::Writer<ChecksummedWriter<W>>,
+        file_writer: &mut crate::sfa::Writer<ChecksummedWriter<W>>,
     ) -> crate::Result<(usize, Vec<u8>)> {
         file_writer.start("tli")?;
 
@@ -109,7 +109,7 @@ impl<W: std::io::Write + std::io::Seek> BlockIndexWriter<W> for FullIndexWriter 
             crate::table::block::BlockIdentity {
                 tree_id: 0,
                 table_id: self.table_id,
-                // sfa::Writer doesn't expose its position cursor;
+                // crate::sfa::Writer doesn't expose its position cursor;
                 // outer table Writer tracks meta.file_pos but the
                 // BlockIndexWriter trait doesn't surface it here.
                 // Leaving offset=0 intentionally — extending
