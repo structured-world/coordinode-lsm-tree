@@ -3,12 +3,11 @@
 // Copyright (c) 2026-present, Structured World Foundation
 
 use crate::{
-    FormatVersion, TreeType,
-    checksum::ChecksumType,
-    fs::{Fs, open_section_reader},
+    FormatVersion, TreeType, checksum::ChecksumType, fs::Fs,
+    manifest_blocks::reader::ManifestArchiveReader,
 };
 use byteorder::ReadBytesExt;
-use std::{io::Read, path::Path};
+use std::{io::Cursor, path::Path};
 
 pub struct Manifest {
     pub version: FormatVersion,
@@ -25,101 +24,82 @@ pub struct Manifest {
 }
 
 impl Manifest {
-    pub fn decode_from(
-        path: &Path,
-        reader: &sfa::Reader,
-        fs: &dyn Fs,
-    ) -> Result<Self, crate::Error> {
-        let toc = reader.toc();
-
+    /// Decode the `Manifest` metadata from a freshly-opened
+    /// [`ManifestArchiveReader`]. Reads the mandatory sections
+    /// (`format_version`, `tree_type`, `level_count`,
+    /// `filter_hash_type`) and the optional `comparator_name`.
+    ///
+    /// The reader's per-section Block reads already cover XXH3 /
+    /// optional ECC / optional AEAD; this function only parses the
+    /// payload bytes.
+    ///
+    /// # Errors
+    ///
+    /// - [`crate::Error::ManifestFooterInvalid`] when a mandatory
+    ///   section is missing from the TOC
+    /// - [`crate::Error::InvalidVersion`] when `format_version`
+    ///   carries an unknown discriminant
+    /// - [`crate::Error::InvalidTag`] for unknown `TreeType` /
+    ///   `ChecksumType` discriminants
+    /// - [`crate::Error::DecompressedSizeTooLarge`] when
+    ///   `comparator_name` exceeds the configured length cap
+    /// - [`crate::Error::Utf8`] when `comparator_name` bytes are
+    ///   not valid UTF-8
+    /// - propagates Block I/O / verification errors from the
+    ///   reader
+    pub fn decode_from(reader: &mut ManifestArchiveReader) -> Result<Self, crate::Error> {
+        let format_version_bytes = reader.read_section("format_version")?;
         let version = {
-            #[expect(
-                clippy::expect_used,
-                reason = "format_version section must exist in manifest"
-            )]
-            let section = toc
-                .section(b"format_version")
-                .expect("format_version section should exist in manifest");
-
-            let mut reader = open_section_reader(fs, path, section)?;
-            let version = reader.read_u8()?;
-            FormatVersion::try_from(version).map_err(|()| crate::Error::InvalidVersion(version))?
+            let v = format_version_bytes
+                .first()
+                .copied()
+                .ok_or(crate::Error::InvalidHeader("format_version"))?;
+            FormatVersion::try_from(v).map_err(|()| crate::Error::InvalidVersion(v))?
         };
 
+        let tree_type_bytes = reader.read_section("tree_type")?;
         let tree_type = {
-            #[expect(
-                clippy::expect_used,
-                reason = "tree_type section must exist in manifest"
-            )]
-            let section = toc
-                .section(b"tree_type")
-                .expect("tree_type section should exist in manifest");
-
-            let mut reader = open_section_reader(fs, path, section)?;
-            let tree_type = reader.read_u8()?;
-            tree_type
-                .try_into()
-                .map_err(|()| crate::Error::InvalidTag(("TreeType", tree_type)))?
+            let raw = tree_type_bytes
+                .first()
+                .copied()
+                .ok_or(crate::Error::InvalidHeader("tree_type"))?;
+            raw.try_into()
+                .map_err(|()| crate::Error::InvalidTag(("TreeType", raw)))?
         };
 
-        let level_count = {
-            #[expect(
-                clippy::expect_used,
-                reason = "level_count section must exist in manifest"
-            )]
-            let section = toc
-                .section(b"level_count")
-                .expect("level_count section should exist in manifest");
-
-            let mut reader = open_section_reader(fs, path, section)?;
-            reader.read_u8()?
-        };
+        let level_count_bytes = reader.read_section("level_count")?;
+        let mut level_count_cursor = Cursor::new(&level_count_bytes);
+        let level_count = level_count_cursor.read_u8()?;
 
         // Currently level count is hard coded to 7
         assert_eq!(7, level_count, "level count should be 7");
 
         {
-            let filter_hash_type = {
-                #[expect(
-                    clippy::expect_used,
-                    reason = "filter_hash_type section must exist in manifest"
-                )]
-                let section = toc
-                    .section(b"filter_hash_type")
-                    .expect("filter_hash_type section should exist in manifest");
-
-                open_section_reader(fs, path, section)?
-                    .bytes()
-                    .collect::<Result<Vec<_>, _>>()?
-            };
-
+            let filter_hash_type_bytes = reader.read_section("filter_hash_type")?;
             // Only one supported right now (and probably forever)
             assert_eq!(
                 &[u8::from(ChecksumType::Xxh3)],
-                &*filter_hash_type,
+                &filter_hash_type_bytes[..],
                 "filter_hash_type should be XXH3"
             );
         }
 
-        // Optional section — absent in manifests written before comparator
-        // identity persistence was added. The `UserComparator` trait was
-        // introduced in the same release cycle, so all pre-existing trees
-        // used `DefaultUserComparator` whose `name()` returns "default".
+        // Optional section — absent in manifests written before
+        // comparator identity persistence was added. The
+        // `UserComparator` trait was introduced in the same release
+        // cycle, so all pre-existing trees used
+        // `DefaultUserComparator` whose `name()` returns "default".
         // Custom comparators cannot exist in old manifests.
-        let comparator_name = match toc.section(b"comparator_name") {
-            Some(section) => {
+        let comparator_name = match reader.section("comparator_name") {
+            Some(_entry) => {
+                let bytes = reader.read_section("comparator_name")?;
                 let limit = crate::comparator::MAX_COMPARATOR_NAME_BYTES as u64;
-
-                if section.len() > limit {
+                if bytes.len() as u64 > limit {
                     return Err(crate::Error::DecompressedSizeTooLarge {
-                        declared: section.len(),
+                        declared: bytes.len() as u64,
                         limit,
                     });
                 }
-
-                let mut bytes = Vec::new();
-                open_section_reader(fs, path, section)?.read_to_end(&mut bytes)?;
-
                 String::from_utf8(bytes).map_err(|e| crate::Error::Utf8(e.utf8_error()))?
             }
             None => "default".to_owned(),
@@ -134,26 +114,45 @@ impl Manifest {
     }
 }
 
+// Convenience helper for callers that have a path + Fs but no open
+// reader yet — opens the archive, decodes the manifest metadata,
+// returns the parsed struct. Used by `Tree::open`.
+#[allow(
+    dead_code,
+    reason = "exposed as a future entry point; current Tree::open path opens the reader \
+              explicitly so it can hold it for the recover() call that follows"
+)]
+pub fn decode_from_path(path: &Path, fs: &dyn Fs) -> Result<Manifest, crate::Error> {
+    let mut reader = ManifestArchiveReader::open(path, fs)?;
+    Manifest::decode_from(&mut reader)
+}
+
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "tests panic on failure paths to surface bugs loudly"
+)]
 mod tests {
     use super::*;
-    use crate::fs::{Fs, FsOpenOptions, StdFs};
+    use crate::{
+        fs::{Fs, MemFs, StdFs},
+        manifest_blocks::writer::ManifestArchiveWriter,
+        runtime_config::RuntimeConfig,
+    };
     use byteorder::WriteBytesExt;
     use std::io::Write;
+    use std::sync::Arc;
 
-    /// Write the mandatory manifest sections (`format_version`, `tree_type`,
-    /// `level_count`, `filter_hash_type`) into an sfa archive via the [`Fs`]
-    /// trait. If `comparator_name` is `Some`, also writes that section.
+    /// Write a minimal valid Blocks-based manifest with all four
+    /// mandatory sections (and optionally a `comparator_name`).
     fn write_test_manifest(
-        path: &std::path::Path,
+        path: &Path,
         comparator_name: Option<&str>,
         fs: &dyn Fs,
     ) -> crate::Result<()> {
-        let file = fs.open(
-            path,
-            &FsOpenOptions::new().write(true).create(true).truncate(true),
-        )?;
-        let mut writer = sfa::Writer::from_writer(std::io::BufWriter::new(file));
+        let mut writer =
+            ManifestArchiveWriter::create(path, fs, Arc::new(RuntimeConfig::default()))?;
 
         writer.start("format_version")?;
         writer.write_u8(FormatVersion::V5.into())?;
@@ -176,11 +175,9 @@ mod tests {
         Ok(())
     }
 
-    /// Decode a manifest from `path` using the given [`Fs`] backend.
-    fn decode_manifest(path: &std::path::Path, fs: &dyn Fs) -> crate::Result<Manifest> {
-        let mut file = fs.open(path, &FsOpenOptions::new().read(true))?;
-        let reader = sfa::Reader::from_reader(&mut file)?;
-        Manifest::decode_from(path, &reader, fs)
+    fn decode_manifest(path: &Path, fs: &dyn Fs) -> crate::Result<Manifest> {
+        let mut reader = ManifestArchiveReader::open(path, fs)?;
+        Manifest::decode_from(&mut reader)
     }
 
     // ------------------------------------------------------------------
@@ -232,15 +229,11 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let path = dir.path().join("manifest");
 
-        // Write manifest with invalid UTF-8 bytes in comparator_name.
-        // This needs raw Write access — write_test_manifest only handles
-        // valid strings, so we inline the sfa construction here.
-        let file = StdFs.open(
-            &path,
-            &FsOpenOptions::new().write(true).create(true).truncate(true),
-        )?;
-        let mut writer = sfa::Writer::from_writer(std::io::BufWriter::new(file));
-
+        // Compose a manifest where the comparator_name section
+        // carries invalid UTF-8 bytes. Writer accepts arbitrary
+        // bytes via write_all; the Manifest decoder enforces UTF-8.
+        let mut writer =
+            ManifestArchiveWriter::create(&path, &StdFs, Arc::new(RuntimeConfig::default()))?;
         writer.start("format_version")?;
         writer.write_u8(FormatVersion::V5.into())?;
         writer.start("tree_type")?;
@@ -251,7 +244,6 @@ mod tests {
         writer.write_u8(u8::from(ChecksumType::Xxh3))?;
         writer.start("comparator_name")?;
         writer.write_all(&[0xFF, 0xFE])?;
-
         writer.finish()?;
 
         let result = decode_manifest(&path, &StdFs);
@@ -268,10 +260,8 @@ mod tests {
 
     #[test]
     fn manifest_memfs_default_comparator() -> crate::Result<()> {
-        use crate::fs::MemFs;
-
         let fs = MemFs::new();
-        let dir = std::path::Path::new("/memfs");
+        let dir = Path::new("/memfs");
         fs.create_dir_all(dir)?;
         let path = dir.join("manifest_default");
 
@@ -287,10 +277,8 @@ mod tests {
 
     #[test]
     fn manifest_memfs_custom_comparator_round_trips() -> crate::Result<()> {
-        use crate::fs::MemFs;
-
         let fs = MemFs::new();
-        let dir = std::path::Path::new("/memfs");
+        let dir = Path::new("/memfs");
         fs.create_dir_all(dir)?;
         let path = dir.join("manifest_custom");
 

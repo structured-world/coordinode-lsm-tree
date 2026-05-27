@@ -139,8 +139,9 @@ impl SuperVersions {
         seqno: &SharedSequenceNumberGenerator,
         visible_seqno: &SharedSequenceNumberGenerator,
         fs: &dyn Fs,
+        runtime: std::sync::Arc<crate::runtime_config::RuntimeConfig>,
     ) -> crate::Result<()> {
-        self.upgrade_version_with_seqno(tree_path, f, seqno.next(), visible_seqno, fs)
+        self.upgrade_version_with_seqno(tree_path, f, seqno.next(), visible_seqno, fs, runtime)
     }
 
     /// Like `upgrade_version`, but takes an already-allocated sequence number.
@@ -156,12 +157,19 @@ impl SuperVersions {
         seqno: SeqNo,
         visible_seqno: &SharedSequenceNumberGenerator,
         fs: &dyn Fs,
+        runtime: std::sync::Arc<crate::runtime_config::RuntimeConfig>,
     ) -> crate::Result<()> {
         let mut next_version = f(&self.latest_version())?;
         next_version.seqno = seqno;
         log::trace!("Next version seqno={}", next_version.seqno);
 
-        persist_version(tree_path, &next_version.version, &self.comparator_name, fs)?;
+        persist_version(
+            tree_path,
+            &next_version.version,
+            &self.comparator_name,
+            fs,
+            runtime,
+        )?;
         self.append_version(next_version);
 
         // Clamp to stay below the reserved MSB range.

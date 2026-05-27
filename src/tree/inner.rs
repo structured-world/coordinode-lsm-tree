@@ -89,7 +89,7 @@ pub struct TreeInner {
     // no-std: Tree itself is std-bound. For no_std consumers needing
     // runtime-toggleable config, use spin::RwLock<RuntimeConfig> as
     // alternative (slower hot path, but compiles under alloc-only).
-    pub(crate) runtime_config: RuntimeConfigHandle,
+    pub(crate) runtime_config: Arc<RuntimeConfigHandle>,
 
     #[doc(hidden)]
     #[cfg(feature = "metrics")]
@@ -106,11 +106,17 @@ impl TreeInner {
                 crate::TreeType::Standard
             },
         );
+        // Use the default runtime config for the first persist — the
+        // Tree isn't constructed yet so its runtime handle doesn't
+        // exist. Subsequent manifest writes go through paths that
+        // load the live RuntimeConfig snapshot from the Tree.
+        let initial_runtime = Arc::new(RuntimeConfig::default());
         persist_version(
             &config.path,
             &version,
             config.comparator.name(),
             &*config.fs,
+            initial_runtime,
         )?;
 
         let comparator = config.comparator.clone();
@@ -127,7 +133,7 @@ impl TreeInner {
             flush_lock: Mutex::default(),
             compaction_state: Arc::new(Mutex::new(CompactionState::default())),
             deletion_pause: DeletionPause::new_shared(),
-            runtime_config: RuntimeConfigHandle::new(RuntimeConfig::default()),
+            runtime_config: Arc::new(RuntimeConfigHandle::new(RuntimeConfig::default())),
 
             #[cfg(feature = "metrics")]
             metrics: Metrics::default().into(),

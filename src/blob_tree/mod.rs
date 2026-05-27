@@ -384,6 +384,7 @@ impl AbstractTree for BlobTree {
             &config.seqno,
             &config.visible_seqno,
             &*config.fs,
+            self.index.0.runtime_config.load_full(),
         )
     }
 

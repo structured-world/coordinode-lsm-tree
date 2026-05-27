@@ -190,7 +190,8 @@ mod key;
 mod key_range;
 mod loser_tree;
 mod manifest;
-mod manifest_blocks;
+#[doc(hidden)]
+pub mod manifest_blocks;
 mod memtable;
 mod merge_operator;
 mod run_reader;

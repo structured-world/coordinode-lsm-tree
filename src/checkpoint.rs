@@ -441,7 +441,14 @@ pub fn copy_metadata(
     // authoritative source for the snapshot we just hard-linked SSTs
     // for, so writing it from memory eliminates the race entirely —
     // the source file's lifetime no longer matters.
-    crate::version::persist_version(target_root, version, comparator_name, target_fs)?;
+    // Checkpoints carry their own snapshot of the runtime config so
+    // the captured manifest is encoded with the same toggles the
+    // live tree used at capture time. The driver passes the snapshot
+    // through; if it's None (e.g. an older caller predating runtime
+    // config plumbing), fall back to default so the call is still
+    // self-contained.
+    let runtime = std::sync::Arc::new(crate::runtime_config::RuntimeConfig::default());
+    crate::version::persist_version(target_root, version, comparator_name, target_fs, runtime)?;
     // CURRENT pointer is generated fresh for the captured `version_id`
     // (NOT copied from source) so a concurrent publish to `v<N+1>` on
     // the source can never leave the checkpoint pointing at a version

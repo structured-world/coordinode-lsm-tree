@@ -369,6 +369,7 @@ impl AbstractTree for Tree {
             &config.seqno,
             &config.visible_seqno,
             &*config.fs,
+            self.0.runtime_config.load_full(),
         )
     }
 
@@ -607,6 +608,7 @@ impl AbstractTree for Tree {
             &self.config.seqno,
             &self.config.visible_seqno,
             &*self.config.fs,
+            self.0.runtime_config.load_full(),
         )?;
 
         if let Err(e) = version_lock.maintenance(&self.config.path, gc_watermark, &*self.config.fs)
@@ -1939,11 +1941,11 @@ impl Tree {
             let version_id =
                 crate::version::recovery::get_current_version(&config.path, &*config.fs)?;
             let manifest_path = config.path.join(format!("v{version_id}"));
-            let mut manifest_file = config
-                .fs
-                .open(&manifest_path, &crate::fs::FsOpenOptions::new().read(true))?;
-            let reader = sfa::Reader::from_reader(&mut manifest_file)?;
-            let manifest = Manifest::decode_from(&manifest_path, &reader, &*config.fs)?;
+            let mut archive_reader = crate::manifest_blocks::reader::ManifestArchiveReader::open(
+                &manifest_path,
+                &*config.fs,
+            )?;
+            let manifest = Manifest::decode_from(&mut archive_reader)?;
 
             if !matches!(manifest.version, FormatVersion::V5) {
                 return Err(crate::Error::InvalidVersion(manifest.version.into()));
@@ -2016,9 +2018,9 @@ impl Tree {
             flush_lock: Mutex::default(),
             compaction_state: Arc::new(Mutex::new(CompactionState::default())),
             deletion_pause: Arc::clone(&deletion_pause),
-            runtime_config: crate::runtime_config::handle::RuntimeConfigHandle::new(
+            runtime_config: Arc::new(crate::runtime_config::handle::RuntimeConfigHandle::new(
                 crate::runtime_config::RuntimeConfig::default(),
-            ),
+            )),
 
             #[cfg(feature = "metrics")]
             metrics,

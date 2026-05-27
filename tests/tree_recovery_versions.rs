@@ -1,51 +1,71 @@
 use byteorder::{LittleEndian, ReadBytesExt};
 use lsm_tree::{AbstractTree, Config, SequenceNumberCounter, get_tmp_folder};
-use std::{
-    fs::File,
-    io::{Seek, SeekFrom, Write},
-    path::Path,
-};
+use std::{fs::File, path::Path};
 use test_log::test;
 
+/// Read the `format_version` byte from the current manifest by
+/// opening it through the (private) `ManifestArchiveReader` test
+/// entry point. The byte sits inside a `BlockType::Manifest` Block
+/// whose XXH3 covers it; the reader does the verification + payload
+/// extraction so the test cannot accidentally observe a corrupted
+/// byte that the Block layer would have rejected.
 fn read_manifest_format_version(path: &Path) -> lsm_tree::Result<u8> {
-    // read_u64 takes &mut self, but calling it on an owned File from `?` is
-    // valid Rust — the compiler auto-borrows &mut on the owned temporary.
     let curr_version_id = File::open(path.join("current"))?.read_u64::<LittleEndian>()?;
     let manifest_path = path.join(format!("v{curr_version_id}"));
-    let reader = sfa::Reader::new(&manifest_path)?;
-
+    let mut archive = lsm_tree::manifest_blocks::reader::ManifestArchiveReader::open(
+        &manifest_path,
+        &lsm_tree::fs::StdFs,
+    )?;
+    let bytes = archive.read_section("format_version")?;
     #[expect(
         clippy::expect_used,
         reason = "test fixture should contain format_version"
     )]
-    let section = reader
-        .toc()
-        .section(b"format_version")
-        .expect("format_version section should exist");
-
-    Ok(section.buf_reader(&manifest_path)?.read_u8()?)
+    Ok(*bytes.first().expect("format_version section is non-empty"))
 }
 
+/// Overwrite the `format_version` section of the current manifest by
+/// constructing a fresh Blocks-based manifest at the same path. Used
+/// by the version-rejection tests to land a manifest with an
+/// arbitrary `format_version` byte where the surrounding Block
+/// remains valid so the rejection surfaces at the version-policy
+/// layer rather than at the Block-XXH3 layer.
 fn rewrite_manifest_format_version(path: &Path, version: u8) -> lsm_tree::Result<()> {
+    use std::io::Write;
     let curr_version_id = File::open(path.join("current"))?.read_u64::<LittleEndian>()?;
     let manifest_path = path.join(format!("v{curr_version_id}"));
-    let reader = sfa::Reader::new(&manifest_path)?;
 
-    #[expect(
-        clippy::expect_used,
-        reason = "test fixture should contain format_version"
-    )]
-    let section = reader
-        .toc()
-        .section(b"format_version")
-        .expect("format_version section should exist");
+    // Reconstruct: read every existing section, drop the file, then
+    // rewrite with the same sections except `format_version` carries
+    // the requested byte. Keeps the on-disk surface valid (Block
+    // XXH3 over each section) while letting the test target the
+    // version-policy code path specifically.
+    let mut archive = lsm_tree::manifest_blocks::reader::ManifestArchiveReader::open(
+        &manifest_path,
+        &lsm_tree::fs::StdFs,
+    )?;
+    let mut sections: Vec<(String, Vec<u8>)> = Vec::new();
+    for entry in archive.footer().sections.clone() {
+        let payload = if entry.name == "format_version" {
+            vec![version]
+        } else {
+            archive.read_section(&entry.name)?
+        };
+        sections.push((entry.name, payload));
+    }
+    drop(archive);
+    std::fs::remove_file(&manifest_path)?;
 
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .open(&manifest_path)?;
-    file.seek(SeekFrom::Start(section.pos()))?;
-    file.write_all(&[version])?;
-    file.flush()?;
+    let mut w = lsm_tree::manifest_blocks::writer::ManifestArchiveWriter::create(
+        &manifest_path,
+        &lsm_tree::fs::StdFs,
+        std::sync::Arc::new(lsm_tree::runtime_config::RuntimeConfig::default()),
+    )?;
+    for (name, payload) in sections {
+        w.start(&name)?;
+        w.write_all(&payload)?;
+    }
+    w.finish()?;
 
     Ok(())
 }

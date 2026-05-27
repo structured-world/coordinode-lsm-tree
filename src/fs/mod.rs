@@ -66,23 +66,6 @@ pub use io_uring_fs::{IoUringFs, is_io_uring_available};
 // the path migration is the second blocker tracked separately.
 use crate::io::{Read, Seek, Write};
 use std::io;
-// `Read::take` is a provided method on the `std::io::Read` trait,
-// not on our supertrait alias `crate::io::Read`. The supertrait
-// relationship lets a value bounded on `crate::io::Read` flow into
-// APIs expecting `std::io::Read`, but Rust's method-resolution only
-// considers methods from traits that are IN SCOPE at the call site
-// — so without an explicit import of `std::io::Read`, `file.take(N)`
-// fails to resolve even though the receiver does implement
-// `std::io::Read`. Bring the std trait into scope anonymously here
-// so `take` / `chain` / `bytes` resolve on receivers below.
-use std::io::Read as _;
-// Same supertrait-alias resolution rule applies to `Seek::seek`: the
-// provided method lives on `std::io::Seek`, and `crate::io::Seek` is
-// an empty supertrait alias under `feature = "std"`. Without this
-// import, `file.seek(...)` (e.g. in `open_section_reader`) fails to
-// resolve. Bring `std::io::Seek` into scope anonymously alongside
-// `Read` so receivers below find both provided methods.
-use std::io::Seek as _;
 use std::path::{Path, PathBuf};
 
 /// Options for opening a file through the [`Fs`] trait.
@@ -583,18 +566,4 @@ pub trait Fs: Send + Sync + 'static {
     fn backend_id(&self) -> Option<u64> {
         None
     }
-}
-
-/// Opens a section of an sfa archive for buffered reading via the [`Fs`] trait.
-///
-/// Replaces [`sfa::TocEntry::buf_reader`] which opens files through
-/// [`std::fs`] directly, bypassing the pluggable filesystem.
-pub(crate) fn open_section_reader(
-    fs: &dyn Fs,
-    path: &Path,
-    section: &sfa::TocEntry,
-) -> io::Result<io::BufReader<io::Take<Box<dyn FsFile>>>> {
-    let mut file = fs.open(path, &FsOpenOptions::new().read(true))?;
-    file.seek(io::SeekFrom::Start(section.pos()))?;
-    Ok(io::BufReader::new(file.take(section.len())))
 }

@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026-present, Structured World Foundation
 
-//! Footer Block payload — the table-of-contents for the surrounding
-//! manifest section Blocks plus the manifest layout version and
-//! flags. The footer is itself a standard
-//! [`Block`](crate::table::block::Block) (so it inherits XXH3 / ECC
-//! / encryption from the same pipeline as the section Blocks); this
-//! module owns only the payload bytes that go inside the Block.
+//! Footer Block payload — table of contents + manifest layout
+//! version + flags.
+//!
+//! The footer is itself a standard [`Block`](crate::table::block::Block)
+//! (so it inherits XXH3 / ECC / encryption from the same pipeline
+//! as the section Blocks); this module owns only the payload bytes
+//! that go inside the Block.
 //!
 //! Wire format (little-endian throughout):
 //!
@@ -77,6 +78,7 @@ pub struct FooterPayload {
 impl FooterPayload {
     /// Build a fresh footer payload for the current writer (always
     /// stamps [`MANIFEST_LAYOUT_VERSION_V1`]).
+    #[must_use]
     pub fn new(flags: u8, sections: Vec<TocEntry>) -> Self {
         Self {
             layout_version: MANIFEST_LAYOUT_VERSION_V1,
@@ -87,6 +89,7 @@ impl FooterPayload {
 
     /// Look up a section by name. Returns the first matching entry
     /// — the writer rejects duplicates, so this matches at most one.
+    #[must_use]
     pub fn section(&self, name: &str) -> Option<&TocEntry> {
         self.sections.iter().find(|e| e.name == name)
     }

@@ -723,7 +723,7 @@ impl Version {
 impl Version {
     pub(crate) fn encode_into(
         &self,
-        writer: &mut sfa::Writer<impl std::io::Write + std::io::Seek>,
+        writer: &mut crate::manifest_blocks::writer::ManifestArchiveWriter,
         comparator_name: &str,
     ) -> Result<(), crate::Error> {
         use crate::FormatVersion;
