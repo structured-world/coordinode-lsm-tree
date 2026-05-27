@@ -741,17 +741,25 @@ mod tests {
         assert!(matches!(err, crate::Error::Unrecoverable));
     }
 
-    /// Regression: with `Config::encryption` set, the manifest
-    /// writer used to byte-copy the tail footer Block into the head
-    /// reservation. The footer Block carries an AEAD tag whose AAD
-    /// includes `BlockIdentity.block_offset`; the tail footer is
-    /// bound to the tail offset, the head slot uses offset 0.
-    /// Byte-copying meant the head-mirror fallback decryption failed
-    /// (tag/AAD mismatch) and the reader surfaced a decrypt error
-    /// disguised as `ManifestFooterInvalid` — losing the recovery
-    /// guarantee for encrypted manifests. The fix re-encodes a
-    /// fresh footer Block with `block_offset = 0` for the head
-    /// slot, so decryption succeeds against the correct AAD.
+    /// Future-regression guard: today the AEAD path in
+    /// `EncryptionProvider::{encrypt, decrypt}` consumes only
+    /// plaintext + nonce — AAD-binding to `BlockIdentity` (including
+    /// `block_offset`) exists in `encryption::aad::build` /
+    /// `encryption::block::{encrypt_block, decrypt_block}` but is
+    /// not yet wired into the `Block::write_into` path the manifest
+    /// writer uses. Because of that, byte-copying the tail footer
+    /// Block into the head reservation today works fine: same nonce
+    /// + same tag → head decrypts cleanly.
+    ///
+    /// This test asserts the head-mirror fallback round-trips with
+    /// encryption on, locking that behaviour today. The day
+    /// `Block::write_into` consumes the AAD-bound path (tracked
+    /// separately) the head-mirror byte-copy must change to a fresh
+    /// `Block::write_into` call at `block_offset = 0`, otherwise
+    /// the head-slot decrypt will fail against AAD bound to the
+    /// tail offset — and THIS TEST will be the one that catches it.
+    /// See the parallel writer comment in `manifest_blocks::writer`
+    /// for the exact code site to update.
     #[cfg(feature = "encryption")]
     #[test]
     fn reader_falls_back_to_head_mirror_for_encrypted_manifest() {

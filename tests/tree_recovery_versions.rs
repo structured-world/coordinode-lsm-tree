@@ -517,5 +517,16 @@ fn tree_open_with_missing_manifest_but_present_current_errors_not_recreates() ->
         Err(e) => panic!("expected ManifestFooterInvalid for missing manifest, got {e:?}"),
     }
 
+    // The whole point of the regression is preventing CURRENT
+    // clobber. Erroring is necessary but not sufficient — a future
+    // implementation could satisfy the error-variant check above
+    // and still rewrite the pointer on its way out. Re-read CURRENT
+    // and assert it still points at the original version.
+    let still_current = File::open(path.join("current"))?.read_u64::<LittleEndian>()?;
+    assert_eq!(
+        still_current, curr_version_id,
+        "failed Tree::open must not rewrite the CURRENT pointer"
+    );
+
     Ok(())
 }

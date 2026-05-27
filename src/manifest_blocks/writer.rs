@@ -418,13 +418,23 @@ impl Write for ManifestArchiveWriter {
             io::Error::other("write called with no active manifest section — call start() first")
         })?;
         // Fail fast if this write would push the buffered section
-        // past MAX_MANIFEST_BLOCK_SIZE. flush_current_section already
-        // rejects oversized sections, but doing the check only there
-        // means a buggy/adversarial caller can grow `section.buf` to
-        // gigabytes before the error surfaces — wasting allocator
-        // pressure and obscuring the offending caller's stack. The
-        // incremental check returns the failure at the exact write
-        // that crossed the line.
+        // *payload* past MAX_MANIFEST_BLOCK_SIZE. Note this is an
+        // approximate / conservative early-reject: the constant is
+        // the on-disk Block size cap (which includes the Block
+        // header, optional AEAD overhead, and optional ECC parity
+        // trailer), so the true on-disk Block can be slightly
+        // larger than the payload checked here. The authoritative
+        // on-disk size check lives in `flush_current_section` and
+        // runs against the fully-encoded Block bytes. The point of
+        // doing the cheap payload check here is to stop a
+        // buggy/adversarial caller from growing `section.buf` to
+        // gigabytes before the on-disk check sees it — wasting
+        // allocator pressure and obscuring the offending caller's
+        // stack. A payload that passes this check but trips the
+        // on-disk check after framing overhead is rare in practice
+        // (overhead is small relative to MAX_MANIFEST_BLOCK_SIZE =
+        // 16 MiB) and still surfaces an error before the bytes
+        // reach the file, just one step later.
         let projected = section
             .buf
             .len()
