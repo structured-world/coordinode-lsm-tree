@@ -127,11 +127,18 @@ impl ManifestArchiveReader {
     ///
     /// - [`crate::Error::Io`] on read / seek / open failure
     /// - [`crate::Error::ManifestFooterInvalid`] when both the tail
-    ///   and head paths fail to produce a valid footer payload
+    ///   and head paths fail to produce a valid footer payload. The
+    ///   underlying per-path failures (Block I/O, XXH3 mismatch,
+    ///   AEAD decryption failure, footer-payload structural error)
+    ///   are logged at `error` level with the path that produced
+    ///   them and then collapsed into this single variant; callers
+    ///   that need to distinguish decrypt-vs-checksum-vs-structural
+    ///   failure should consult the log. The collapse is
+    ///   intentional: callers above this layer treat any
+    ///   double-path failure as "manifest is unreadable, surface
+    ///   recovery options" rather than branching on per-path cause.
     /// - [`crate::Error::Unrecoverable`] when the file is too small
     ///   to contain even the trailing footer-size hint
-    /// - propagates Block I/O / XXH3 / decryption errors when both
-    ///   paths fail
     pub fn open(
         path: &Path,
         fs: &dyn Fs,

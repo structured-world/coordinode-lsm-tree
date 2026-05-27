@@ -1043,12 +1043,22 @@ impl Config {
     ///
     /// Seeds both the first manifest write and the live
     /// `RuntimeConfigHandle` exposed via
-    /// [`crate::Tree::runtime_config`] — toggles in the supplied
-    /// snapshot (footer mirror, ECC mode, per-KV checksums, etc.)
-    /// take effect from byte zero of the on-disk format rather
-    /// than waiting for a post-open
+    /// [`crate::Tree::runtime_config`].
+    ///
+    /// **Manifest-hardening toggles** in the supplied snapshot
+    /// (`manifest_footer_mirror`, `manifest_kv_checksums`,
+    /// `page_ecc` *as consumed by the manifest writer*) take
+    /// effect from byte zero of the on-disk manifest rather than
+    /// waiting for a post-open
     /// [`crate::Tree::update_runtime_config`] call. Subsequent
-    /// updates still flow through the live handle.
+    /// updates still flow through the live handle and apply to
+    /// the next manifest write.
+    ///
+    /// **Note on data-block ECC:** `RuntimeConfig::page_ecc`
+    /// currently affects manifest Blocks only — data-block ECC is
+    /// still gated by [`Config::page_ecc`] at tree-open time. The
+    /// SST writer path consumes the tree-static config, not the
+    /// runtime handle. Wiring through SST emission is a follow-up.
     #[must_use]
     pub fn with_runtime_config(mut self, runtime: crate::runtime_config::RuntimeConfig) -> Self {
         self.initial_runtime_config = runtime;

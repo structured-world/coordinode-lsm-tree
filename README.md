@@ -129,12 +129,12 @@ Five layers compose the manifest's integrity surface; each is independently togg
 | Layer | Defends against | Config knob | Default |
 |-------|-----------------|-------------|---------|
 | L1 — Block XXH3-64 | Bit-rot detection per section / footer Block | Always on (`Block` invariant) | always on |
-| L2 — Page ECC (Reed-Solomon (4, 2)) | Bit-rot recovery per Block | `RuntimeConfig::page_ecc` (compile-time `page_ecc` feature) | off (opt-in) |
+| L2 — Page ECC (Reed-Solomon (4, 2)) | Bit-rot recovery per Block | `RuntimeConfig::page_ecc` for **manifest Blocks** (current release) + `Config::page_ecc` for **SST data Blocks** (compile-time `page_ecc` feature gates both) | off (opt-in) |
 | L3 — AEAD encryption | Tampering detection + confidentiality | `Config::with_encryption(provider)` | off |
 | L4 — Footer Block tail hint | Reader locates footer without scanning | Always on (trailing `u32` size hint) | always on |
 | L5 — Head footer mirror | Partial-write / tail-bit-rot recovery via mirrored copy at offset 0 | `RuntimeConfig::manifest_footer_mirror` | on |
 
-ECC, encryption, and the head mirror are reachable through `Tree::update_runtime_config` (for L2 / L5) or through `Config::with_encryption` at open (for L3) — runtime toggles take effect on the next manifest write, and existing on-disk manifests stay readable in their original format because each Block self-describes via its header.
+Manifest-side ECC and the head mirror are reachable through `Tree::update_runtime_config` (for L2 *on manifest Blocks* and L5); SST data-block ECC is tree-static via `Config::page_ecc` at open time and not affected by runtime updates. AEAD is supplied at open via `Config::with_encryption` (L3). Runtime toggles take effect on the next manifest write, and existing on-disk manifests stay readable in their original format because each Block self-describes via its header.
 
 Failure-mode coverage with the defaults (mirror on, ECC off, AEAD off):
 

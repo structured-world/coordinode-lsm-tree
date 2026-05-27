@@ -171,18 +171,40 @@ pub struct RuntimeConfig {
     /// Default: `true` (Benchmark Symmetry Invariant: match the
     /// granularity `RocksDB` ships out-of-the-box, so apples-to-apples
     /// benchmarks don't pay for an opt-in).
+    ///
+    /// **Wiring status:** the toggle is plumbed through
+    /// `RuntimeConfig` and persisted into the manifest format, but
+    /// the per-entry checksum framing it controls lands in a
+    /// separate change that introduces the `DataKvChecked` Block
+    /// variant for manifest sections. Until then this flag is
+    /// recorded and surfaced for forward compatibility — changing
+    /// it does not affect on-disk bytes in the current release.
     pub manifest_kv_checksums: bool,
 
     /// Global default for Page ECC (Reed-Solomon `(4, 2)` parity
-    /// trailer) applied to ALL Blocks (data, index, filter, manifest).
-    /// Other `_ecc_override` fields fall back to this value when
-    /// `None`.
+    /// trailer). Intended to apply to ALL Blocks (data, index,
+    /// filter, manifest) once the data-block writer path consumes
+    /// `RuntimeConfig`. Other `_ecc_override` fields fall back to
+    /// this value when `None`.
+    ///
+    /// **Wiring status (current release):** consulted only by
+    /// `manifest_blocks::{writer, reader}` when picking the
+    /// `BlockTransform` variant for manifest sections / footer
+    /// Blocks. Data-block ECC is still gated by
+    /// [`crate::Config::page_ecc`] (compile-time tree config),
+    /// because the SST writer path doesn't yet thread a
+    /// `RuntimeConfigHandle` through every Block emission point.
+    /// Toggling this field via [`crate::Tree::update_runtime_config`]
+    /// affects the *next* manifest write only; data Blocks remain
+    /// on the Tree's static `Config::page_ecc`. The wiring through
+    /// SST writers lands in a follow-up that introduces
+    /// per-emission `RuntimeConfig` snapshots.
     ///
     /// Default: `false` (explicit opt-in; users pay nothing unless
-    /// they enable it). When `true`, every Block written carries
-    /// the parity trailer and gains single-block bit-flip recovery
-    /// on read at the cost of `≈ N/2 + small overhead` storage and
-    /// negligible compute.
+    /// they enable it). When `true`, every Block written through a
+    /// runtime-aware path carries the parity trailer and gains
+    /// single-block bit-flip recovery on read at the cost of
+    /// `≈ N/2 + small overhead` storage and negligible compute.
     pub page_ecc: bool,
 
     /// Per-scope override for data Blocks: `None` inherits

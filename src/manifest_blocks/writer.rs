@@ -401,6 +401,24 @@ impl Write for ManifestArchiveWriter {
         let section = self.current_section.as_mut().ok_or_else(|| {
             io::Error::other("write called with no active manifest section — call start() first")
         })?;
+        // Fail fast if this write would push the buffered section
+        // past MAX_MANIFEST_BLOCK_SIZE. flush_current_section already
+        // rejects oversized sections, but doing the check only there
+        // means a buggy/adversarial caller can grow `section.buf` to
+        // gigabytes before the error surfaces — wasting allocator
+        // pressure and obscuring the offending caller's stack. The
+        // incremental check returns the failure at the exact write
+        // that crossed the line.
+        let projected = section
+            .buf
+            .len()
+            .checked_add(buf.len())
+            .ok_or_else(|| io::Error::other("section buffer length would overflow usize"))?;
+        if u64::try_from(projected).unwrap_or(u64::MAX) > u64::from(MAX_MANIFEST_BLOCK_SIZE) {
+            return Err(io::Error::other(
+                "manifest section exceeds MAX_MANIFEST_BLOCK_SIZE",
+            ));
+        }
         section.buf.extend_from_slice(buf);
         Ok(buf.len())
     }

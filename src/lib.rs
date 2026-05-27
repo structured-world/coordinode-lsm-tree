@@ -5,10 +5,22 @@
 // no-std foundation: when the `std` feature is OFF the crate root opts into
 // `no_std`. Default builds keep `std` enabled (file I/O, threading, system
 // clock all live in `std`), so existing consumers see no behaviour change.
-// The migration to a fully no-std-clean build is incremental — modules with
-// std-only dependencies stay gated behind `#[cfg(feature = "std")]` until
-// they are ported. The CI job `no-std-check` exercises `cargo check
-// --no-default-features --features alloc` and tracks remaining work.
+// The migration to a fully no-std-clean build is incremental. Two patterns
+// coexist while the port is in progress:
+//   1. Modules with std-only dependencies that have no consumers above the
+//      `fs` / `version` / `tree` layer stay gated behind `#[cfg(feature =
+//      "std")]` and are ported in isolation.
+//   2. Modules whose std-only dependencies cascade through every consumer
+//      (`manifest_blocks`, vendored `sfa`, others noted at their `pub mod`
+//      site) remain UNCONDITIONAL today — gating them would require
+//      `#[cfg]` annotations on dozens of call sites without changing the
+//      no-std error count, because those call sites are themselves
+//      std-bound for unrelated reasons. They migrate in lockstep with the
+//      consumer layer rather than ahead of it.
+// The CI job `no-std-check` exercises `cargo check --no-default-features
+// --features alloc` against a real no-std target (`thumbv7em-none-eabihf`)
+// and tracks remaining work via the error count, which must monotonically
+// decrease across PRs.
 #![cfg_attr(not(feature = "std"), no_std)]
 
 //! Embedded LSM-tree storage engine.
