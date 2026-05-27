@@ -49,7 +49,7 @@ use crate::{
         footer::{FooterPayload, TocEntry},
     },
     runtime_config::RuntimeConfig,
-    table::block::{Block, BlockIdentity, BlockTransform, BlockType},
+    table::block::{Block, BlockIdentity, BlockTransform, BlockType, Header},
 };
 use byteorder::{LittleEndian, ReadBytesExt};
 use std::{
@@ -297,6 +297,7 @@ impl ManifestArchiveReader {
         let mut block_bytes = vec![0u8; block_size as usize];
         self.file.read_exact(&mut block_bytes)?;
 
+        validate_block_header_fits(&block_bytes)?;
         let identity = BlockIdentity {
             tree_id: MANIFEST_TREE_ID_SENTINEL,
             table_id: MANIFEST_TABLE_ID_SENTINEL,
@@ -330,6 +331,53 @@ impl ManifestArchiveReader {
         }
         Ok(block.data.to_vec())
     }
+}
+
+/// Peek the Block header from `buf` and refuse to delegate to
+/// [`Block::from_reader`] if the declared on-disk payload + parity
+/// trailer would exceed the buffer length.
+///
+/// Why: `Block::from_reader` itself trusts `header.data_length` /
+/// `header.ecc_length` up to its own 256 MiB ceiling. A manifest
+/// section / footer that was already capped by the caller (TOC
+/// `block_size`, tail size hint, or `HEAD_FOOTER_RESERVED_SIZE`)
+/// can still nest a forged header inside that smaller window
+/// claiming a much larger payload, and the Block layer will
+/// allocate a multi-MiB Vec before discovering the bounded buffer
+/// runs out. Pre-validating the header here turns that allocation
+/// surge into a typed `ManifestFooterInvalid` at the caller's
+/// existing budget, without changing the Block decoder.
+///
+/// Uses [`crate::coding::Decode::decode_from`] on a borrowed slice
+/// so the cost is one fixed-size header parse (cheap; well under
+/// 50 bytes) before the main read path runs.
+fn validate_block_header_fits(buf: &[u8]) -> crate::Result<()> {
+    use crate::coding::Decode;
+    let header_len = Header::serialized_len();
+    if buf.len() < header_len {
+        return Err(crate::Error::ManifestFooterInvalid(
+            "manifest Block buffer shorter than Block header",
+        ));
+    }
+    // Length guarded by the `buf.len() < header_len` check above —
+    // the slice cannot panic. `get(..n)` would return Option that
+    // we'd unwrap to the same effect.
+    let mut cursor = Cursor::new(buf.get(..header_len).ok_or(
+        crate::Error::ManifestFooterInvalid("manifest Block header slice unexpectedly short"),
+    )?);
+    let header = Header::decode_from(&mut cursor)?;
+    let declared = u64::from(header.data_length)
+        .checked_add(u64::from(header.ecc_length))
+        .and_then(|payload| payload.checked_add(header_len as u64))
+        .ok_or(crate::Error::ManifestFooterInvalid(
+            "manifest Block header lengths overflow u64",
+        ))?;
+    if declared > buf.len() as u64 {
+        return Err(crate::Error::ManifestFooterInvalid(
+            "manifest Block header declares on-disk size larger than buffer",
+        ));
+    }
+    Ok(())
 }
 
 /// Construct the per-Block transform a reader / open path should
@@ -409,6 +457,7 @@ fn read_tail_footer(
     )]
     let mut footer_buf = vec![0u8; footer_size as usize];
     file.read_exact(&mut footer_buf)?;
+    validate_block_header_fits(&footer_buf)?;
     let identity = BlockIdentity {
         tree_id: MANIFEST_TREE_ID_SENTINEL,
         table_id: MANIFEST_TABLE_ID_SENTINEL,
@@ -450,6 +499,7 @@ fn read_head_footer(
         ));
     }
 
+    validate_block_header_fits(&head_buf)?;
     let identity = BlockIdentity {
         tree_id: MANIFEST_TREE_ID_SENTINEL,
         table_id: MANIFEST_TABLE_ID_SENTINEL,
