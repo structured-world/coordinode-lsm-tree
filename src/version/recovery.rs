@@ -1264,7 +1264,8 @@ mod tests {
         write_truncated_tables_tail(folder, 1, 5, 1, &fs)?;
         write_current(folder, 1, &fs)?;
 
-        let recovery = recover(folder,
+        let recovery = recover(
+            folder,
             &fs,
             ManifestRecoveryMode::TolerateCorruptedTailRecords,
             None,
@@ -1333,7 +1334,8 @@ mod tests {
         w.finish()?;
         write_current(folder, 1, &fs)?;
 
-        let result = recover(folder,
+        let result = recover(
+            folder,
             &fs,
             ManifestRecoveryMode::TolerateCorruptedTailRecords,
             None,
@@ -1395,7 +1397,8 @@ mod tests {
         write_truncated_at_second_run(folder, 1, &fs)?;
         write_current(folder, 1, &fs)?;
 
-        let recovery = recover(folder,
+        let recovery = recover(
+            folder,
             &fs,
             ManifestRecoveryMode::TolerateCorruptedTailRecords,
             None,
@@ -1470,7 +1473,8 @@ mod tests {
         write_truncated_blob_tail(folder, 1, 5, 1, &fs)?;
         write_current(folder, 1, &fs)?;
 
-        let recovery = recover(folder,
+        let recovery = recover(
+            folder,
             &fs,
             ManifestRecoveryMode::TolerateCorruptedTailRecords,
             None,
@@ -1532,7 +1536,8 @@ mod tests {
         // Tolerant mode: succeeds with empty gc_stats. Compare via
         // `Default` (FragmentationMap implements PartialEq) — the
         // type does not expose an `is_empty()` accessor.
-        let lenient = recover(folder,
+        let lenient = recover(
+            folder,
             &fs,
             ManifestRecoveryMode::TolerateCorruptedTailRecords,
             None,
@@ -1705,7 +1710,12 @@ mod tests {
         write_manifest_with_mid_record_corruption(folder, 1, &fs)?;
         write_current(folder, 1, &fs)?;
 
-        let recovery = recover(folder, &fs, ManifestRecoveryMode::SkipAnyCorruptedRecords, None)?;
+        let recovery = recover(
+            folder,
+            &fs,
+            ManifestRecoveryMode::SkipAnyCorruptedRecords,
+            None,
+        )?;
 
         // SkipAny contract: log the single bad record, advance past
         // it via the framing length header, keep going. Both
@@ -1796,7 +1806,12 @@ mod tests {
         write_manifest_with_corrupt_blob_record(folder, 1, &fs)?;
         write_current(folder, 1, &fs)?;
 
-        let recovery = recover(folder, &fs, ManifestRecoveryMode::SkipAnyCorruptedRecords, None)?;
+        let recovery = recover(
+            folder,
+            &fs,
+            ManifestRecoveryMode::SkipAnyCorruptedRecords,
+            None,
+        )?;
         let ids: Vec<u64> = recovery.blob_file_ids.iter().map(|(id, _)| *id).collect();
         assert_eq!(
             ids,
@@ -1963,7 +1978,12 @@ mod tests {
         write_manifest_with_all_records_in_run_corrupt(folder, 1, &fs)?;
         write_current(folder, 1, &fs)?;
 
-        let recovery = recover(folder, &fs, ManifestRecoveryMode::SkipAnyCorruptedRecords, None)?;
+        let recovery = recover(
+            folder,
+            &fs,
+            ManifestRecoveryMode::SkipAnyCorruptedRecords,
+            None,
+        )?;
 
         // 2 levels persisted, both survive as slots.
         assert_eq!(recovery.table_ids.len(), 2);
@@ -2054,7 +2074,12 @@ mod tests {
         write_manifest_skip_any_then_tail_truncated(folder, 1, &fs)?;
         write_current(folder, 1, &fs)?;
 
-        let recovery = recover(folder, &fs, ManifestRecoveryMode::SkipAnyCorruptedRecords, None)?;
+        let recovery = recover(
+            folder,
+            &fs,
+            ManifestRecoveryMode::SkipAnyCorruptedRecords,
+            None,
+        )?;
 
         assert_eq!(
             recovery.stats.tables_dropped_to_corruption, 1,
@@ -2135,7 +2160,12 @@ mod tests {
         write_manifest_blob_skip_any_then_tail_truncated(folder, 1, &fs)?;
         write_current(folder, 1, &fs)?;
 
-        let recovery = recover(folder, &fs, ManifestRecoveryMode::SkipAnyCorruptedRecords, None)?;
+        let recovery = recover(
+            folder,
+            &fs,
+            ManifestRecoveryMode::SkipAnyCorruptedRecords,
+            None,
+        )?;
 
         assert_eq!(
             recovery.stats.blob_dropped_to_corruption, 1,

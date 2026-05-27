@@ -611,6 +611,70 @@ mod tests {
     }
 
     #[test]
+    fn reader_isolates_corruption_to_one_section_other_sections_readable() {
+        // Acceptance criterion (#297 corruption matrix): a bit-flip
+        // inside one section Block must fail verification for THAT
+        // section while leaving the other sections + footer readable.
+        // The TOC lives in the (separate) footer Block; per-section
+        // XXH3 isolates the failure radius to a single Block.
+        let fs = fresh_fs();
+        let path = Path::new("/m/isolated");
+        write_manifest(
+            &fs,
+            path,
+            RuntimeConfig::default(),
+            &[
+                ("a", &[1, 2, 3, 4]),
+                ("b", &[5, 6, 7, 8]),
+                ("c", &[9, 10, 11, 12]),
+            ],
+        );
+
+        // Reader before corruption: open + look up TOC entry for "b"
+        // so we know the on-disk offset to flip a byte at.
+        let b_offset = {
+            let reader =
+                ManifestArchiveReader::open(path, &fs, Arc::new(RuntimeConfig::default()), None)
+                    .unwrap();
+            let entry = reader.section("b").expect("b section is in TOC");
+            entry.block_offset
+        };
+
+        // Flip one byte inside section b's payload region. Offset
+        // well past the Block header so the bit is in the
+        // checksummed payload.
+        {
+            let mut file = fs
+                .open(path, &FsOpenOptions::new().write(true).read(true))
+                .unwrap();
+            file.seek(SeekFrom::Start(b_offset + 40)).unwrap();
+            let mut byte = [0u8; 1];
+            file.read_exact(&mut byte).unwrap();
+            file.seek(SeekFrom::Start(b_offset + 40)).unwrap();
+            file.write_all(&[byte[0] ^ 0xFF]).unwrap();
+            file.sync_all().unwrap();
+        }
+
+        // Reopen — footer + TOC still load (different Block), sections
+        // a and c still verify, only b fails.
+        let mut reader =
+            ManifestArchiveReader::open(path, &fs, Arc::new(RuntimeConfig::default()), None)
+                .unwrap();
+        let a_bytes = reader.read_section("a").unwrap();
+        assert_eq!(a_bytes, vec![1, 2, 3, 4], "section a survives");
+        let c_bytes = reader.read_section("c").unwrap();
+        assert_eq!(c_bytes, vec![9, 10, 11, 12], "section c survives");
+        let b_err = reader
+            .read_section("b")
+            .expect_err("section b decoded but should have failed XXH3");
+        // Don't pin the exact error variant — different bit positions
+        // surface as ChecksumMismatch, InvalidHeader, or Io depending
+        // on what got flipped. The contract is: SOMETHING surfaces
+        // and the other sections still work.
+        log::debug!("section b corruption surfaced as: {b_err:?}");
+    }
+
+    #[test]
     fn reader_rejects_files_smaller_than_head_plus_hint() {
         // A file that is structurally too small to even hold the
         // head reservation + 4-byte trailer hint is unrecoverable
