@@ -366,7 +366,16 @@ impl ManifestArchiveWriter {
                       optional ECC trailer (~N/2 + small) is well within u32 range"
         )]
         let block_size = block_size_u64 as u32;
-        self.write_cursor = self.write_cursor.saturating_add(block_size_u64);
+        // `checked_add` (not `saturating_add`): TOC offsets are
+        // correctness-critical metadata. A silently clamped cursor would
+        // emit a manifest whose TOC points at wrong offsets, which a
+        // reader cannot detect until decode failure deep in the
+        // recovery path. Fail fast with a typed error instead.
+        self.write_cursor = self.write_cursor.checked_add(block_size_u64).ok_or(
+            crate::Error::ManifestFooterInvalid(
+                "write cursor would overflow u64 — manifest file size implausible",
+            ),
+        )?;
 
         self.toc.push(TocEntry {
             name: section.name,

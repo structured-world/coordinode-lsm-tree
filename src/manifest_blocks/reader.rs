@@ -71,10 +71,17 @@ pub struct ManifestArchiveReader {
     source: FooterSource,
 
     /// Snapshot of the runtime config in effect when the reader
-    /// opened the file. Drives ECC awareness on per-section
-    /// `Block::from_reader` calls so a manifest written with
-    /// `page_ecc=true` decodes correctly even when the live tree
-    /// has since toggled the flag off.
+    /// opened the file. Used to pick which `BlockTransform`
+    /// variant to hand to `Block::from_reader` (`Plain` vs
+    /// `PlainEcc` vs `Encrypted` vs `EncryptedEcc`). The Block layer
+    /// itself parses ECC presence from the per-Block header's
+    /// `ecc_length` field — the runtime snapshot does NOT control
+    /// whether the decoder accepts ECC bytes, only which decoder
+    /// arm gets called. A manifest written with `page_ecc=true`
+    /// still decodes correctly if the live tree has since toggled
+    /// the flag off, because `BlockTransform::Plain` and
+    /// `BlockTransform::PlainEcc` both go through the same
+    /// header-driven verify path.
     runtime: Arc<RuntimeConfig>,
 
     /// Optional encryption provider — mirrors the writer's
@@ -286,6 +293,19 @@ impl ManifestArchiveReader {
             identity,
             &build_transform(&self.runtime, self.encryption.as_deref()),
         )?;
+        // Defence in depth: `Block::from_reader` authenticates the
+        // header's `block_type` against the `identity.block_type` we
+        // passed (AAD-bound for encrypted, checksum-bound for plain),
+        // so a forged TOC pointing at a non-Manifest block can't slip
+        // past with matching crypto. The explicit assertion below
+        // turns "decode succeeded but block_type drifted" into a
+        // typed error rather than a confusing downstream parse
+        // failure on data that happens to look section-shaped.
+        if block.header.block_type != BlockType::Manifest {
+            return Err(crate::Error::ManifestFooterInvalid(
+                "TOC entry points at non-Manifest block",
+            ));
+        }
         Ok(block.data.to_vec())
     }
 }
@@ -376,6 +396,11 @@ fn read_tail_footer(
         window_log: 0,
     };
     let block = Block::from_reader(&mut Cursor::new(&footer_buf), identity, transform)?;
+    if block.header.block_type != BlockType::ManifestFooter {
+        return Err(crate::Error::ManifestFooterInvalid(
+            "tail footer slot decoded as non-ManifestFooter block",
+        ));
+    }
     FooterPayload::decode(&block.data[..])
 }
 
@@ -412,6 +437,11 @@ fn read_head_footer(
         window_log: 0,
     };
     let block = Block::from_reader(&mut Cursor::new(&head_buf), identity, transform)?;
+    if block.header.block_type != BlockType::ManifestFooter {
+        return Err(crate::Error::ManifestFooterInvalid(
+            "head mirror slot decoded as non-ManifestFooter block",
+        ));
+    }
     FooterPayload::decode(&block.data[..])
 }
 
