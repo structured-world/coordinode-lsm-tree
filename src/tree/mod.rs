@@ -2016,7 +2016,7 @@ impl Tree {
             flush_lock: Mutex::default(),
             compaction_state: Arc::new(Mutex::new(CompactionState::default())),
             deletion_pause: Arc::clone(&deletion_pause),
-            runtime_config: crate::runtime_config::RuntimeConfigHandle::new(
+            runtime_config: crate::runtime_config::handle::RuntimeConfigHandle::new(
                 crate::runtime_config::RuntimeConfig::default(),
             ),
 

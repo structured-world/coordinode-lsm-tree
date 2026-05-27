@@ -7,7 +7,7 @@ use crate::{
     compaction::state::CompactionState,
     config::Config,
     deletion_pause::DeletionPause,
-    runtime_config::{RuntimeConfig, RuntimeConfigHandle},
+    runtime_config::{RuntimeConfig, handle::RuntimeConfigHandle},
     stop_signal::StopSignal,
     version::{SuperVersions, Version, persist_version},
 };
