@@ -304,6 +304,22 @@ impl ManifestArchiveWriter {
             // (they're outside the Block's `data_length`, so they
             // don't affect verification — the reader uses the
             // declared `data_length` to bound the payload read).
+            //
+            // Byte-copy (not re-encode at offset 0) is correct
+            // here because the current AEAD path
+            // (`Aes256GcmProvider::encrypt`) does NOT bind AAD to
+            // `BlockIdentity.block_offset` — the encrypt() trait
+            // method only consumes plaintext + nonce. AAD-bound
+            // framing is plumbed through `encryption::aad::build`
+            // but not yet wired through `encrypt()` / `decrypt()`;
+            // when it is, this byte-copy must change to a fresh
+            // `Block::write_into` call with `block_offset = 0` so
+            // the head slot decrypts against AAD that matches the
+            // reader's per-slot identity. The regression test
+            // `reader_falls_back_to_head_mirror_for_encrypted_manifest`
+            // locks this contract — it passes today (no AAD) and
+            // would catch a future change that adds AAD without
+            // updating this path.
             self.file.seek(SeekFrom::Start(0))?;
             self.file.write_all(&footer_block_bytes)?;
             let padding = HEAD_FOOTER_RESERVED_SIZE - footer_block_bytes.len() as u64;

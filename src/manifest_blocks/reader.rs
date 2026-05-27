@@ -740,4 +740,61 @@ mod tests {
         .expect_err("must reject");
         assert!(matches!(err, crate::Error::Unrecoverable));
     }
+
+    /// Regression: with `Config::encryption` set, the manifest
+    /// writer used to byte-copy the tail footer Block into the head
+    /// reservation. The footer Block carries an AEAD tag whose AAD
+    /// includes `BlockIdentity.block_offset`; the tail footer is
+    /// bound to the tail offset, the head slot uses offset 0.
+    /// Byte-copying meant the head-mirror fallback decryption failed
+    /// (tag/AAD mismatch) and the reader surfaced a decrypt error
+    /// disguised as `ManifestFooterInvalid` — losing the recovery
+    /// guarantee for encrypted manifests. The fix re-encodes a
+    /// fresh footer Block with `block_offset = 0` for the head
+    /// slot, so decryption succeeds against the correct AAD.
+    #[cfg(feature = "encryption")]
+    #[test]
+    fn reader_falls_back_to_head_mirror_for_encrypted_manifest() {
+        use crate::encryption::{Aes256GcmProvider, EncryptionProvider};
+
+        let fs = fresh_fs();
+        let path = Path::new("/m/enc_tail_corrupt");
+        let key = [42u8; 32];
+        let enc: Arc<dyn EncryptionProvider> = Arc::new(Aes256GcmProvider::new(&key));
+
+        let mut w = ManifestArchiveWriter::create(
+            path,
+            &fs,
+            Arc::new(RuntimeConfig::default()),
+            Some(Arc::clone(&enc)),
+        )
+        .unwrap();
+        w.start("format_version").unwrap();
+        use std::io::Write;
+        w.write_all(&[5u8]).unwrap();
+        w.finish().unwrap();
+
+        // Same tail-corruption pattern as the plaintext head-mirror
+        // test: clobber the trailing size hint so the tail path
+        // fails and the reader has no choice but to fall back to
+        // the head mirror.
+        let mut file = fs
+            .open(path, &FsOpenOptions::new().write(true).read(true))
+            .unwrap();
+        let size = file.metadata().unwrap().len;
+        file.seek(SeekFrom::Start(size - 4)).unwrap();
+        file.write_all(&[0xFF, 0xFF, 0xFF, 0xFF]).unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+
+        let reader =
+            ManifestArchiveReader::open(path, &fs, Arc::new(RuntimeConfig::default()), Some(enc))
+                .expect("encrypted head-mirror fallback must decrypt cleanly");
+        assert_eq!(
+            reader.source(),
+            FooterSource::Head,
+            "reader should have fallen back to the head mirror"
+        );
+        assert!(reader.section("format_version").is_some());
+    }
 }
