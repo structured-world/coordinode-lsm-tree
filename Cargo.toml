@@ -106,7 +106,7 @@ byteview = "~0.10.1"
 # downstream no_std consumers (block decoders, format constants).
 arc-swap = { version = "1.9", optional = true }
 enum_dispatch = "0.3.13"
-log = "0.4.27"
+log = "0.4.30"
 # `spin` provides a no_std-compatible Mutex. Used by
 # `deletion_pause` so that module's only std footprint comes from the
 # `Fs` trait it interacts with, not from its own synchronisation.
