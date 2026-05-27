@@ -408,10 +408,27 @@ fn write_current_for_version(
     f.seek(SeekFrom::Start(file_len - TAIL_FOOTER_SIZE_HINT_BYTES))?;
     let footer_size = u64::from(f.read_u32::<LittleEndian>()?);
     drop(f);
+    // Mirror ManifestArchiveReader's bounds checks: a zero hint
+    // points at no footer (would sweep the trailer area into the
+    // section range), and any value above HEAD_FOOTER_RESERVED_SIZE
+    // is impossible for a well-formed manifest (the writer caps the
+    // footer Block at the head-mirror's reservation size). Either
+    // case is corruption; surface it as Unrecoverable here BEFORE
+    // hashing the wrong byte range and stamping a CURRENT pointer
+    // that fails downstream get_current_version validation.
+    if footer_size == 0 || footer_size > HEAD_FOOTER_RESERVED_SIZE {
+        return Err(crate::Error::Unrecoverable);
+    }
     let section_end = file_len
         .checked_sub(TAIL_FOOTER_SIZE_HINT_BYTES)
         .and_then(|x| x.checked_sub(footer_size))
         .ok_or(crate::Error::Unrecoverable)?;
+    // section_end must clear the head reservation — otherwise the
+    // size hint is internally consistent but the manifest itself is
+    // malformed (no room for any section between head and footer).
+    if section_end < HEAD_FOOTER_RESERVED_SIZE {
+        return Err(crate::Error::Unrecoverable);
+    }
     let section_length = section_end.saturating_sub(HEAD_FOOTER_RESERVED_SIZE);
     let checksum = hash_file_range_xxh3(
         target_fs,
