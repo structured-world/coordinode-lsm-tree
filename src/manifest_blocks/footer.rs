@@ -109,6 +109,11 @@ impl FooterPayload {
             ));
         }
 
+        // Reject duplicate names on the encode side too — decode
+        // already rejects them, so allowing duplicates here would
+        // let the writer emit a manifest its own reader refuses.
+        // Symmetry matters; pre-empt the round-trip mismatch.
+        let mut seen: crate::HashSet<&str> = crate::HashSet::default();
         for entry in &self.sections {
             if entry.name.is_empty() {
                 return Err(crate::Error::ManifestFooterInvalid(
@@ -118,6 +123,11 @@ impl FooterPayload {
             if entry.name.len() > MAX_SECTION_NAME_BYTES {
                 return Err(crate::Error::ManifestFooterInvalid(
                     "section name exceeds MAX_SECTION_NAME_BYTES",
+                ));
+            }
+            if !seen.insert(entry.name.as_str()) {
+                return Err(crate::Error::ManifestFooterInvalid(
+                    "duplicate section name",
                 ));
             }
         }
@@ -211,7 +221,7 @@ impl FooterPayload {
 }
 
 #[cfg(test)]
-#[allow(
+#[expect(
     clippy::unwrap_used,
     clippy::expect_used,
     clippy::cast_possible_truncation,

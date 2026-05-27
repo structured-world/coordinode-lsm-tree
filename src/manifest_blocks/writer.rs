@@ -333,7 +333,7 @@ impl Write for ManifestArchiveWriter {
 }
 
 #[cfg(test)]
-#[allow(
+#[expect(
     clippy::unwrap_used,
     clippy::expect_used,
     clippy::items_after_statements,

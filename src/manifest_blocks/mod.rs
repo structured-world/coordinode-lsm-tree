@@ -1,19 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026-present, Structured World Foundation
 
-// Foundation code lands without callers — the cutover commit wires
-// `persist_version` and the version-file reader to use this module.
-// Until then, the constants / writer / footer types look "dead" to
-// the lint even though every public item is exercised by the in-file
-// unit tests. Dropping the gate once the cutover lands is the
-// follow-up so the lint catches genuinely unused additions.
-#![allow(
-    dead_code,
-    reason = "manifest_blocks foundation: writer + footer ship in their own commit; \
-              the cutover commit replaces sfa call sites with these types and lifts \
-              this gate. Tests in each submodule already exercise every public item."
-)]
-
 //! Blocks-based manifest framing (V5-2, #297).
 //!
 //! Replaces the upstream `sfa` sectioned-archive file format for the

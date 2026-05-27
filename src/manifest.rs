@@ -71,17 +71,23 @@ impl Manifest {
         let mut level_count_cursor = Cursor::new(&level_count_bytes);
         let level_count = level_count_cursor.read_u8()?;
 
-        // Currently level count is hard coded to 7
-        assert_eq!(7, level_count, "level count should be 7");
+        // Currently level count is hard coded to 7. The byte comes
+        // from disk, so a corrupted / forged manifest could carry
+        // any value here — return InvalidHeader instead of panicking
+        // so the caller (Tree::open) gets a routable error rather
+        // than a process abort.
+        if level_count != 7 {
+            return Err(crate::Error::InvalidHeader("level_count"));
+        }
 
         {
             let filter_hash_type_bytes = reader.read_section("filter_hash_type")?;
-            // Only one supported right now (and probably forever)
-            assert_eq!(
-                &[u8::from(ChecksumType::Xxh3)],
-                &filter_hash_type_bytes[..],
-                "filter_hash_type should be XXH3"
-            );
+            // Only one supported right now (and probably forever).
+            // Same disk-sourced rationale as `level_count` above —
+            // surface mismatch as InvalidHeader, not assert.
+            if filter_hash_type_bytes.as_slice() != [u8::from(ChecksumType::Xxh3)] {
+                return Err(crate::Error::InvalidHeader("filter_hash_type"));
+            }
         }
 
         // Optional section — absent in manifests written before
@@ -117,7 +123,7 @@ impl Manifest {
 // Convenience helper for callers that have a path + Fs but no open
 // reader yet — opens the archive, decodes the manifest metadata,
 // returns the parsed struct. Used by `Tree::open`.
-#[allow(
+#[expect(
     dead_code,
     reason = "exposed as a future entry point; current Tree::open path opens the reader \
               explicitly so it can hold it for the recover() call that follows"
@@ -128,11 +134,6 @@ pub fn decode_from_path(path: &Path, fs: &dyn Fs) -> Result<Manifest, crate::Err
 }
 
 #[cfg(test)]
-#[allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    reason = "tests panic on failure paths to surface bugs loudly"
-)]
 mod tests {
     use super::*;
     use crate::{

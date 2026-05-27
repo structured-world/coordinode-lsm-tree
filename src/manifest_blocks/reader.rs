@@ -209,6 +209,23 @@ impl ManifestArchiveReader {
         let block_offset = entry.block_offset;
         let block_size = entry.block_size;
 
+        // Bound `block_size` against the actual file length BEFORE
+        // allocating the buffer. The TOC lives inside a XXH3-verified
+        // footer Block so legitimate writers never put a forged
+        // size here, but a malicious manifest could; without this
+        // check `vec![0u8; block_size as usize]` would allocate up
+        // to 4 GiB on a single Block read and crash the process
+        // before any Block-level verification fires.
+        let file_len = self.file.metadata()?.len;
+        let end = block_offset.checked_add(u64::from(block_size)).ok_or(
+            crate::Error::ManifestFooterInvalid("TOC entry overflows u64 file offset"),
+        )?;
+        if end > file_len {
+            return Err(crate::Error::ManifestFooterInvalid(
+                "TOC entry extends past end of manifest file",
+            ));
+        }
+
         self.file.seek(SeekFrom::Start(block_offset))?;
         let mut block_bytes = vec![0u8; block_size as usize];
         self.file.read_exact(&mut block_bytes)?;
@@ -247,6 +264,17 @@ fn read_tail_footer(file: &mut Box<dyn FsFile>, file_len: u64) -> crate::Result<
     if footer_size == 0 || footer_size > max_footer {
         return Err(crate::Error::ManifestFooterInvalid(
             "trailing footer-size hint out of bounds",
+        ));
+    }
+    // Hard ceiling per design Q12: the footer Block is bounded at
+    // HEAD_FOOTER_RESERVED_SIZE (4 KiB). Realistic production
+    // manifests use ~5% of that space; any value above 4 KiB is a
+    // writer bug or a forged manifest. Reject it before the
+    // allocation below so a multi-MiB footer_size cannot bait the
+    // reader into a giant `vec![0u8; footer_size]`.
+    if footer_size > HEAD_FOOTER_RESERVED_SIZE {
+        return Err(crate::Error::ManifestFooterInvalid(
+            "footer-size hint exceeds HEAD_FOOTER_RESERVED_SIZE",
         ));
     }
 
@@ -327,7 +355,7 @@ fn file_size(fs: &dyn Fs, path: &Path) -> crate::Result<u64> {
 }
 
 #[cfg(test)]
-#[allow(
+#[expect(
     clippy::unwrap_used,
     clippy::expect_used,
     clippy::items_after_statements,

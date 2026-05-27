@@ -239,6 +239,7 @@ impl AbstractTree for BlobTree {
                 deletion_pause: &self.index.deletion_pause,
                 visible_seqno: &self.index.config.visible_seqno,
                 include_blobs: true,
+                runtime_config: self.index.0.runtime_config.load_full(),
             },
         )
     }

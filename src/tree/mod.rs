@@ -187,6 +187,7 @@ impl AbstractTree for Tree {
                 deletion_pause: &self.deletion_pause,
                 visible_seqno: &self.config.visible_seqno,
                 include_blobs: false,
+                runtime_config: self.0.runtime_config.load_full(),
             },
         )
     }

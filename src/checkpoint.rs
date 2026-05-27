@@ -427,6 +427,7 @@ pub fn copy_metadata(
     target_root: &Path,
     version: &crate::version::Version,
     comparator_name: &str,
+    runtime: std::sync::Arc<crate::runtime_config::RuntimeConfig>,
 ) -> crate::Result<()> {
     // Manifest stores level count + comparator name. On a never-written
     // tree the manifest may legitimately be absent (recovery treats
@@ -443,11 +444,10 @@ pub fn copy_metadata(
     // the source file's lifetime no longer matters.
     // Checkpoints carry their own snapshot of the runtime config so
     // the captured manifest is encoded with the same toggles the
-    // live tree used at capture time. The driver passes the snapshot
-    // through; if it's None (e.g. an older caller predating runtime
-    // config plumbing), fall back to default so the call is still
-    // self-contained.
-    let runtime = std::sync::Arc::new(crate::runtime_config::RuntimeConfig::default());
+    // live tree used at capture time. Receives the snapshot from the
+    // driver — Tree::create_checkpoint loads it via load_full() on
+    // the source tree's RuntimeConfigHandle so the checkpoint sees
+    // exactly the config in effect at capture.
     crate::version::persist_version(target_root, version, comparator_name, target_fs, runtime)?;
     // CURRENT pointer is generated fresh for the captured `version_id`
     // (NOT copied from source) so a concurrent publish to `v<N+1>` on
@@ -481,6 +481,14 @@ pub struct CheckpointParams<'a> {
     pub visible_seqno: &'a crate::seqno::SharedSequenceNumberGenerator,
     /// Whether to capture the value log under `target/blobs/`.
     pub include_blobs: bool,
+    /// Snapshot of the source tree's runtime config at capture time.
+    /// Forwarded to [`copy_metadata`] / [`crate::version::persist_version`]
+    /// so the checkpoint manifest is encoded with the same toggles
+    /// the live tree used when the checkpoint started — eliminates
+    /// drift between source-tree manifest and captured-tree manifest.
+    /// Callers obtain the snapshot via
+    /// `tree.0.runtime_config.load_full()` on the source `Tree`.
+    pub runtime_config: Arc<crate::runtime_config::RuntimeConfig>,
 }
 
 /// RAII guard that removes a partially-built checkpoint directory on
@@ -616,6 +624,7 @@ pub fn run_checkpoint<T: AbstractTree>(
         target_root,
         &version,
         tree.tree_config().comparator.name(),
+        Arc::clone(&params.runtime_config),
     )?;
 
     // fsync each populated child directory BEFORE the root so the
