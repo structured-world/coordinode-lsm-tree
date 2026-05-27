@@ -200,18 +200,54 @@ pub enum Error {
     /// strings.
     FeatureUnsupported(&'static str),
 
-    /// Manifest footer Block payload failed structural parsing.
+    /// Manifest file is unreadable or structurally invalid.
     ///
-    /// Carries a short static string identifying which invariant
-    /// failed (unknown layout version, oversized section count,
-    /// empty/oversized section name, invalid UTF-8, duplicate
-    /// section name, footer payload exceeds the 4 KiB reservation,
-    /// etc.). The Block-level XXH3 / AEAD already passed by the
-    /// time this surfaces — the footer bytes are intact but their
-    /// internal structure does not conform to the manifest layout
-    /// the reader supports. Either the writer is buggy, the
-    /// manifest is from a future binary, or the file has been
-    /// crafted / forged.
+    /// Used for the full class of manifest-open / manifest-parse
+    /// failures the reader can surface without panicking. Carries
+    /// a short static string naming the specific cause so the
+    /// caller can route the diagnostic without parsing the message.
+    /// Typical causes:
+    ///
+    /// - **Footer-payload structural failure:** unknown layout
+    ///   version, oversized section count, empty/oversized section
+    ///   name, invalid UTF-8, duplicate section name, footer
+    ///   payload exceeds the 4 KiB reservation. The Block-level
+    ///   XXH3 / AEAD already passed by the time this surfaces;
+    ///   the footer bytes are intact but their internal structure
+    ///   does not conform to the manifest layout.
+    /// - **Tail / head-mirror double failure:** both the
+    ///   tail-footer Block read and the head-mirror fallback
+    ///   failed verification (XXH3 mismatch, AEAD decryption,
+    ///   parse error). Per-path causes are logged at `error`
+    ///   level and collapsed into this variant — the manifest is
+    ///   unreadable through either path.
+    /// - **TOC-pointer corruption:** a TOC entry's
+    ///   `block_offset + block_size` overflows `u64` or extends
+    ///   past the end of the file, or a Block decoded at a TOC
+    ///   offset has the wrong `block_type` for what was expected
+    ///   (defence-in-depth against a forged TOC pointing at a
+    ///   non-Manifest block).
+    /// - **Trailing size-hint corruption:** the tail's 4-byte
+    ///   footer-size hint is zero or exceeds
+    ///   `HEAD_FOOTER_RESERVED_SIZE` (4 KiB), or the implied
+    ///   `section_end` lands inside the head reservation. Caught
+    ///   in both the reader and `checkpoint::write_current_for_version`.
+    /// - **Writer-side invariant breach:** `write_cursor` would
+    ///   overflow `u64`, an in-memory section would exceed the
+    ///   on-disk Block-size cap, etc.
+    /// - **CURRENT pointer points at a missing manifest:** when
+    ///   `version::get_current_version` opens the referenced
+    ///   `v{N}` file and gets `NotFound`, the error is rewrapped
+    ///   into this variant so `Tree::open`'s outer
+    ///   `Io(NotFound) => create_new` arm (which means "CURRENT
+    ///   file absent, fresh-init the tree") cannot mistake a
+    ///   half-applied recovery / corrupted state for a clean
+    ///   first-open.
+    ///
+    /// Root causes range from a buggy writer / future binary to
+    /// adversarial / mishandled files — the variant deliberately
+    /// does not distinguish, because all of them collapse to
+    /// "this manifest is unusable; surface recovery options."
     ManifestFooterInvalid(&'static str),
 }
 

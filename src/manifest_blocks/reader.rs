@@ -20,8 +20,18 @@
 //!    zero-padded by the writer; if the first bytes are all zero
 //!    the mirror was never populated (writer ran with
 //!    `manifest_footer_mirror = false`) and the fallback can't help.
-//! 3. **Unrecoverable.** Both paths failed → return
-//!    [`crate::Error::Unrecoverable`].
+//! 3. **Double failure.** Both paths failed → return
+//!    [`crate::Error::ManifestFooterInvalid`]. Per-path causes
+//!    (Block I/O, XXH3 mismatch, AEAD decryption, structural parse
+//!    error) are logged at `error` level with the path that
+//!    produced them and collapsed into this single variant so
+//!    callers above the manifest layer can route any
+//!    double-path failure as "manifest is unreadable" without
+//!    branching per cause. [`crate::Error::Unrecoverable`] is
+//!    reserved for the narrower case of a file too short to
+//!    contain even the trailing footer-size hint
+//!    (`< HEAD_FOOTER_RESERVED_SIZE + TAIL_FOOTER_SIZE_HINT_BYTES`),
+//!    detected before any Block read is attempted.
 //!
 //! Per-section reads use the TOC-recorded `(block_offset, block_size)`
 //! pair to read exactly one Block per call without scanning.
