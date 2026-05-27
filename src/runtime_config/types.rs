@@ -42,6 +42,13 @@
 /// without re-litigating the value assignment.
 //
 // no-std: pure data type — compiles under `--no-default-features --features alloc`.
+//
+// Naming: `Xxh3_64` keeps the underscore between the algorithm
+// family (`Xxh3`) and the digest-bit-width suffix (`64`). This
+// matches the upstream xxhash crate (`Xxh3_64Hasher`) and reads as
+// "XXH3-64" rather than "version 364". `non_camel_case_types`
+// allows underscores between digit groups, so this passes
+// `clippy ... -D warnings` cleanly.
 #[derive(Copy, Clone, Debug, Default, Eq, PartialEq, Hash)]
 pub enum ChecksumAlgorithm {
     /// XXH3-64. 8 bytes. ~50-100 GB/s on AVX2 / NEON. Default.
