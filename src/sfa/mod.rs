@@ -17,11 +17,15 @@
 //! does NOT use this module; manifest framing lives in
 //! `crate::manifest_blocks`.
 //!
-//! Crate-internal: `pub(crate)` re-exports below give the rest of
-//! the tree the same `Writer` / `Reader` / `TocEntry` / `Checksum`
-//! / `Error` surface that the external `sfa::*` namespace used to
-//! provide. No external API surface — consumers reach this through
-//! callers in `vlog::blob_file::*` only.
+//! Internal-use API: the module is exported via
+//! `#[doc(hidden)] pub mod sfa` from `crate::lib.rs` so integration
+//! tests (`tests/inspect.rs`, `tests/meta_mirror.rs`, etc.) can
+//! reach the inspection helpers, but it is NOT part of the crate's
+//! stable surface. The `pub use` re-exports below match this
+//! posture — technically reachable as `lsm_tree::sfa::*`, but
+//! doc-hidden and subject to change without notice. Production
+//! consumers reach these types through the blob-file (vlog) layer,
+//! not through `lsm_tree::sfa` directly.
 
 // Vendored sfa: most lints triggered by upstream's coding style
 // have been driven to zero by the per-site fixes (typed errors

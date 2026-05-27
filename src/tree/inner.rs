@@ -7,7 +7,7 @@ use crate::{
     compaction::state::CompactionState,
     config::Config,
     deletion_pause::DeletionPause,
-    runtime_config::{RuntimeConfig, handle::RuntimeConfigHandle},
+    runtime_config::handle::RuntimeConfigHandle,
     stop_signal::StopSignal,
     version::{SuperVersions, Version, persist_version},
 };
@@ -106,17 +106,19 @@ impl TreeInner {
                 crate::TreeType::Standard
             },
         );
-        // Use the default runtime config for the first persist — the
-        // Tree isn't constructed yet so its runtime handle doesn't
-        // exist. Subsequent manifest writes go through paths that
-        // load the live RuntimeConfig snapshot from the Tree.
-        let initial_runtime = std::sync::Arc::new(crate::runtime_config::RuntimeConfig::default());
+        // Seed the runtime snapshot for the first persist from the
+        // Config-supplied initial RuntimeConfig (defaults to
+        // `RuntimeConfig::default()` when the caller never touched
+        // `Config::with_runtime_config`). Reused below to initialize
+        // the Tree's `RuntimeConfigHandle` so the on-disk manifest
+        // bytes and the live runtime handle agree on byte zero.
+        let initial_runtime = std::sync::Arc::new(config.initial_runtime_config.clone());
         persist_version(
             &config.path,
             &version,
             config.comparator.name(),
             &*config.fs,
-            initial_runtime,
+            std::sync::Arc::clone(&initial_runtime),
             config.encryption.clone(),
         )?;
 
@@ -134,7 +136,7 @@ impl TreeInner {
             flush_lock: Mutex::default(),
             compaction_state: Arc::new(Mutex::new(CompactionState::default())),
             deletion_pause: DeletionPause::new_shared(),
-            runtime_config: Arc::new(RuntimeConfigHandle::new(RuntimeConfig::default())),
+            runtime_config: Arc::new(RuntimeConfigHandle::new((*initial_runtime).clone())),
 
             #[cfg(feature = "metrics")]
             metrics: Metrics::default().into(),

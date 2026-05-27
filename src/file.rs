@@ -69,7 +69,18 @@ pub fn hash_file_range_xxh3(
         )]
         let n = file.read(&mut buf[..want])?;
         if n == 0 {
-            break;
+            // Strict: an integrity check that silently hashed a
+            // shorter range than the caller asked for would let a
+            // truncated / sparse file produce a "valid" digest for
+            // the wrong byte span. Surface as UnexpectedEof so the
+            // caller (CURRENT-pointer validator) rejects the file.
+            return Err(crate::Error::Io(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                format!(
+                    "hash_file_range_xxh3: file ended {remaining} bytes early at {}",
+                    path.display(),
+                ),
+            )));
         }
         // Safe slice: `n <= want <= buf.len()` per std::io::Read::read.
         #[expect(

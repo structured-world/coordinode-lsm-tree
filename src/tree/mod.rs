@@ -2020,6 +2020,10 @@ impl Tree {
 
         let deletion_pause = crate::deletion_pause::DeletionPause::new_shared();
 
+        // Clone the seed snapshot BEFORE moving config into the Arc
+        // below — the runtime handle initializer needs it after the
+        // move.
+        let initial_runtime = config.initial_runtime_config.clone();
         let inner = TreeInner {
             id: tree_id,
             memtable_id_counter: SequenceNumberCounter::new(1),
@@ -2033,7 +2037,7 @@ impl Tree {
             compaction_state: Arc::new(Mutex::new(CompactionState::default())),
             deletion_pause: Arc::clone(&deletion_pause),
             runtime_config: Arc::new(crate::runtime_config::handle::RuntimeConfigHandle::new(
-                crate::runtime_config::RuntimeConfig::default(),
+                initial_runtime,
             )),
 
             #[cfg(feature = "metrics")]
