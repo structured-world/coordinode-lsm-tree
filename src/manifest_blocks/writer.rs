@@ -10,7 +10,7 @@
 //! the writer, [`start`] a section, write its bytes via the
 //! [`Write`] impl, repeat per section, then [`finish`] to emit the
 //! tail footer Block (and the head mirror when
-//! [`crate::RuntimeConfig::manifest_footer_mirror`] is on).
+//! [`crate::runtime_config::RuntimeConfig::manifest_footer_mirror`] is on).
 //!
 //! Each section's bytes are buffered in memory until [`start`] /
 //! [`finish`] flushes the section into a Block. Realistic sections

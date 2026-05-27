@@ -61,8 +61,8 @@ impl TocReader {
             reader.read_exact(&mut buf)?;
 
             if buf != TOC_MAGIC {
-                log::error!("Invalid version");
-                return Err(crate::sfa::Error::InvalidVersion);
+                log::error!("Invalid TOC magic header");
+                return Err(crate::sfa::Error::InvalidHeader);
             }
         }
 
