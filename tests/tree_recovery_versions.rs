@@ -15,6 +15,8 @@ fn read_manifest_format_version(path: &Path) -> lsm_tree::Result<u8> {
     let mut archive = lsm_tree::manifest_blocks::reader::ManifestArchiveReader::open(
         &manifest_path,
         &lsm_tree::fs::StdFs,
+        std::sync::Arc::new(lsm_tree::runtime_config::RuntimeConfig::default()),
+        None,
     )?;
     let bytes = archive.read_section("format_version")?;
     #[expect(
@@ -43,6 +45,8 @@ fn rewrite_manifest_format_version(path: &Path, version: u8) -> lsm_tree::Result
     let mut archive = lsm_tree::manifest_blocks::reader::ManifestArchiveReader::open(
         &manifest_path,
         &lsm_tree::fs::StdFs,
+        std::sync::Arc::new(lsm_tree::runtime_config::RuntimeConfig::default()),
+        None,
     )?;
     let mut sections: Vec<(String, Vec<u8>)> = Vec::new();
     for entry in archive.footer().sections.clone() {
@@ -60,6 +64,7 @@ fn rewrite_manifest_format_version(path: &Path, version: u8) -> lsm_tree::Result
         &manifest_path,
         &lsm_tree::fs::StdFs,
         std::sync::Arc::new(lsm_tree::runtime_config::RuntimeConfig::default()),
+        None,
     )?;
     for (name, payload) in sections {
         w.start(&name)?;

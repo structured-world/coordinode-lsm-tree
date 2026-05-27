@@ -338,6 +338,7 @@ impl CompactionFlavour for RelocatingCompaction {
             &opts.visible_seqno,
             &*opts.config.fs,
             opts.runtime_config.load_full(),
+            opts.encryption.clone(),
         )?;
 
         // NOTE: If the application were to crash >here< it's fine
@@ -483,6 +484,7 @@ impl CompactionFlavour for StandardCompaction {
             &opts.visible_seqno,
             &*opts.config.fs,
             opts.runtime_config.load_full(),
+            opts.encryption.clone(),
         )?;
 
         // NOTE: If the application were to crash >here< it's fine

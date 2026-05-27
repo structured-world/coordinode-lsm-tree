@@ -31,18 +31,21 @@
 //! [`HEAD_FOOTER_RESERVED_SIZE`]: crate::manifest_blocks::HEAD_FOOTER_RESERVED_SIZE
 
 use crate::{
+    encryption::EncryptionProvider,
     fs::{Fs, FsFile, FsOpenOptions},
     manifest_blocks::{
         HEAD_FOOTER_RESERVED_SIZE, MANIFEST_TABLE_ID_SENTINEL, MANIFEST_TREE_ID_SENTINEL,
         MAX_MANIFEST_BLOCK_SIZE, TAIL_FOOTER_SIZE_HINT_BYTES,
         footer::{FooterPayload, TocEntry},
     },
+    runtime_config::RuntimeConfig,
     table::block::{Block, BlockIdentity, BlockTransform, BlockType},
 };
 use byteorder::{LittleEndian, ReadBytesExt};
 use std::{
     io::{Cursor, Read, Seek, SeekFrom},
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 /// Reader over an already-validated manifest file: holds the parsed
@@ -66,6 +69,19 @@ pub struct ManifestArchiveReader {
     /// (recovered from the 4 KiB mirror). Surfaced for diagnostics
     /// and corruption-matrix tests.
     source: FooterSource,
+
+    /// Snapshot of the runtime config in effect when the reader
+    /// opened the file. Drives ECC awareness on per-section
+    /// `Block::from_reader` calls so a manifest written with
+    /// `page_ecc=true` decodes correctly even when the live tree
+    /// has since toggled the flag off.
+    runtime: Arc<RuntimeConfig>,
+
+    /// Optional encryption provider — mirrors the writer's
+    /// `Config::encryption` plumbing. When `Some`, per-section
+    /// `Block::from_reader` runs through the AEAD pipeline; when
+    /// `None`, plaintext.
+    encryption: Option<Arc<dyn EncryptionProvider>>,
 }
 
 // Manual `Debug` impl skips the `file` field because
@@ -109,7 +125,12 @@ impl ManifestArchiveReader {
     ///   to contain even the trailing footer-size hint
     /// - propagates Block I/O / XXH3 / decryption errors when both
     ///   paths fail
-    pub fn open(path: &Path, fs: &dyn Fs) -> crate::Result<Self> {
+    pub fn open(
+        path: &Path,
+        fs: &dyn Fs,
+        runtime: Arc<RuntimeConfig>,
+        encryption: Option<Arc<dyn EncryptionProvider>>,
+    ) -> crate::Result<Self> {
         let mut file = fs.open(path, &FsOpenOptions::new().read(true))?;
         let file_len = file_size(fs, path)?;
 
@@ -117,14 +138,24 @@ impl ManifestArchiveReader {
             return Err(crate::Error::Unrecoverable);
         }
 
+        // Compute the per-Block transform once — both the
+        // tail-footer and head-mirror reads use it, as do all
+        // subsequent `read_section` calls. The transform borrows
+        // the encryption provider through `as_deref()`, so it
+        // can't outlive `self.encryption`; we construct a local
+        // copy each time the borrow is needed.
+        let footer_transform = build_transform(&runtime, encryption.as_deref());
+
         // ---- Tail path (primary) ----------------------------------
-        let tail_result = read_tail_footer(&mut file, file_len);
+        let tail_result = read_tail_footer(&mut file, file_len, &footer_transform);
         if let Ok(footer) = tail_result {
             return Ok(Self {
                 path: path.to_path_buf(),
                 file,
                 footer,
                 source: FooterSource::Tail,
+                runtime,
+                encryption,
             });
         }
         let tail_err = tail_result.err();
@@ -139,12 +170,14 @@ impl ManifestArchiveReader {
         }
 
         // ---- Head mirror (fallback) ------------------------------
-        match read_head_footer(&mut file) {
+        match read_head_footer(&mut file, &footer_transform) {
             Ok(footer) => Ok(Self {
                 path: path.to_path_buf(),
                 file,
                 footer,
                 source: FooterSource::Head,
+                runtime,
+                encryption,
             }),
             Err(head_err) => {
                 log::error!(
@@ -249,14 +282,43 @@ impl ManifestArchiveReader {
         let block = Block::from_reader(
             &mut Cursor::new(&block_bytes),
             identity,
-            &BlockTransform::PLAIN,
+            &build_transform(&self.runtime, self.encryption.as_deref()),
         )?;
         Ok(block.data.to_vec())
     }
 }
 
+/// Construct the per-Block transform a reader / open path should
+/// use, given the captured runtime + optional encryption. Mirrors
+/// [`crate::manifest_blocks::writer::ManifestArchiveWriter::block_transform`]
+/// so writer and reader agree on the encryption / ECC matrix.
+fn build_transform<'a>(
+    runtime: &RuntimeConfig,
+    encryption: Option<&'a dyn EncryptionProvider>,
+) -> BlockTransform<'a> {
+    #[cfg(feature = "page_ecc")]
+    let ecc_on = runtime.manifest_ecc();
+    #[cfg(not(feature = "page_ecc"))]
+    let _ = runtime;
+    #[cfg(not(feature = "page_ecc"))]
+    let ecc_on = false;
+
+    match (ecc_on, encryption) {
+        #[cfg(feature = "page_ecc")]
+        (true, Some(enc)) => BlockTransform::EncryptedEcc(enc),
+        #[cfg(feature = "page_ecc")]
+        (true, None) => BlockTransform::PlainEcc,
+        (_, Some(enc)) => BlockTransform::Encrypted(enc),
+        (_, None) => BlockTransform::PLAIN,
+    }
+}
+
 /// Try to load the footer from the tail of the file.
-fn read_tail_footer(file: &mut Box<dyn FsFile>, file_len: u64) -> crate::Result<FooterPayload> {
+fn read_tail_footer(
+    file: &mut Box<dyn FsFile>,
+    file_len: u64,
+    transform: &BlockTransform<'_>,
+) -> crate::Result<FooterPayload> {
     // Read the trailing size hint (last 4 bytes).
     file.seek(SeekFrom::Start(file_len - TAIL_FOOTER_SIZE_HINT_BYTES))?;
     let footer_size = u64::from(file.read_u32::<LittleEndian>()?);
@@ -311,16 +373,15 @@ fn read_tail_footer(file: &mut Box<dyn FsFile>, file_len: u64) -> crate::Result<
         dict_id: 0,
         window_log: 0,
     };
-    let block = Block::from_reader(
-        &mut Cursor::new(&footer_buf),
-        identity,
-        &BlockTransform::PLAIN,
-    )?;
+    let block = Block::from_reader(&mut Cursor::new(&footer_buf), identity, transform)?;
     FooterPayload::decode(&block.data[..])
 }
 
 /// Try to load the footer from the head mirror at offset 0.
-fn read_head_footer(file: &mut Box<dyn FsFile>) -> crate::Result<FooterPayload> {
+fn read_head_footer(
+    file: &mut Box<dyn FsFile>,
+    transform: &BlockTransform<'_>,
+) -> crate::Result<FooterPayload> {
     file.seek(SeekFrom::Start(0))?;
     // Read the whole 4 KiB reservation. The Block decoder is
     // self-bounding via the header's declared length, so the
@@ -348,11 +409,7 @@ fn read_head_footer(file: &mut Box<dyn FsFile>) -> crate::Result<FooterPayload> 
         dict_id: 0,
         window_log: 0,
     };
-    let block = Block::from_reader(
-        &mut Cursor::new(&head_buf),
-        identity,
-        &BlockTransform::PLAIN,
-    )?;
+    let block = Block::from_reader(&mut Cursor::new(&head_buf), identity, transform)?;
     FooterPayload::decode(&block.data[..])
 }
 
@@ -384,7 +441,7 @@ mod tests {
     }
 
     fn write_manifest(fs: &MemFs, path: &Path, runtime: RuntimeConfig, sections: &[(&str, &[u8])]) {
-        let mut w = ManifestArchiveWriter::create(path, fs, Arc::new(runtime)).unwrap();
+        let mut w = ManifestArchiveWriter::create(path, fs, Arc::new(runtime), None).unwrap();
         for (name, data) in sections {
             w.start(name).unwrap();
             use std::io::Write;
@@ -407,7 +464,13 @@ mod tests {
             &[("format_version", &[5]), ("tree_type", &[0])],
         );
 
-        let reader = ManifestArchiveReader::open(path, &fs).unwrap();
+        let reader = ManifestArchiveReader::open(
+            path,
+            &fs,
+            std::sync::Arc::new(crate::runtime_config::RuntimeConfig::default()),
+            None,
+        )
+        .unwrap();
         assert_eq!(reader.source(), FooterSource::Tail);
         assert!(reader.section("format_version").is_some());
         assert!(reader.section("tree_type").is_some());
@@ -433,7 +496,13 @@ mod tests {
             ],
         );
 
-        let mut reader = ManifestArchiveReader::open(path, &fs).unwrap();
+        let mut reader = ManifestArchiveReader::open(
+            path,
+            &fs,
+            std::sync::Arc::new(crate::runtime_config::RuntimeConfig::default()),
+            None,
+        )
+        .unwrap();
         assert_eq!(reader.read_section("format_version").unwrap(), vec![5]);
         assert_eq!(
             reader.read_section("comparator_name").unwrap(),
@@ -469,7 +538,13 @@ mod tests {
         file.sync_all().unwrap();
         drop(file);
 
-        let reader = ManifestArchiveReader::open(path, &fs).unwrap();
+        let reader = ManifestArchiveReader::open(
+            path,
+            &fs,
+            std::sync::Arc::new(crate::runtime_config::RuntimeConfig::default()),
+            None,
+        )
+        .unwrap();
         assert_eq!(
             reader.source(),
             FooterSource::Head,
@@ -503,7 +578,13 @@ mod tests {
         file.sync_all().unwrap();
         drop(file);
 
-        let err = ManifestArchiveReader::open(path, &fs).expect_err("must reject");
+        let err = ManifestArchiveReader::open(
+            path,
+            &fs,
+            std::sync::Arc::new(crate::runtime_config::RuntimeConfig::default()),
+            None,
+        )
+        .expect_err("must reject");
         assert!(matches!(err, crate::Error::ManifestFooterInvalid(_)));
     }
 
@@ -516,7 +597,13 @@ mod tests {
         let path = Path::new("/m/missing");
         write_manifest(&fs, path, RuntimeConfig::default(), &[("a", &[1])]);
 
-        let mut reader = ManifestArchiveReader::open(path, &fs).unwrap();
+        let mut reader = ManifestArchiveReader::open(
+            path,
+            &fs,
+            std::sync::Arc::new(crate::runtime_config::RuntimeConfig::default()),
+            None,
+        )
+        .unwrap();
         let err = reader
             .read_section("does_not_exist")
             .expect_err("missing section must error");
@@ -541,7 +628,13 @@ mod tests {
         file.sync_all().unwrap();
         drop(file);
 
-        let err = ManifestArchiveReader::open(path, &fs).expect_err("must reject");
+        let err = ManifestArchiveReader::open(
+            path,
+            &fs,
+            std::sync::Arc::new(crate::runtime_config::RuntimeConfig::default()),
+            None,
+        )
+        .expect_err("must reject");
         assert!(matches!(err, crate::Error::Unrecoverable));
     }
 }

@@ -214,7 +214,12 @@ pub struct Recovery {
               sections; splitting the function would just move the per-mode branching \
               into helpers without clarifying the flow"
 )]
-pub fn recover(folder: &Path, fs: &dyn Fs, mode: ManifestRecoveryMode) -> crate::Result<Recovery> {
+pub fn recover(
+    folder: &Path,
+    fs: &dyn Fs,
+    mode: ManifestRecoveryMode,
+    encryption: Option<std::sync::Arc<dyn crate::encryption::EncryptionProvider>>,
+) -> crate::Result<Recovery> {
     // Per-record framing constants used by both the tables and
     // blob_files sections. Each on-disk record is a
     // FRAME_HEADER_LEN (12-byte) header followed by a fixed-size
@@ -236,8 +241,12 @@ pub fn recover(folder: &Path, fs: &dyn Fs, mode: ManifestRecoveryMode) -> crate:
         version_file_path.display(),
     );
 
-    let mut archive =
-        crate::manifest_blocks::reader::ManifestArchiveReader::open(&version_file_path, fs)?;
+    let mut archive = crate::manifest_blocks::reader::ManifestArchiveReader::open(
+        &version_file_path,
+        fs,
+        std::sync::Arc::new(crate::runtime_config::RuntimeConfig::default()),
+        encryption,
+    )?;
 
     // Mode dispatch flags. The per-section loops below treat these
     // four modes as three flag combinations:
@@ -1061,6 +1070,7 @@ mod tests {
             &path,
             fs,
             std::sync::Arc::new(crate::runtime_config::RuntimeConfig::default()),
+            None,
         )
     }
 
@@ -1141,7 +1151,7 @@ mod tests {
         write_corrupt_table_count(folder, 1, &fs)?;
         write_current(folder, 1, &fs)?;
 
-        let Err(err) = recover(folder, &fs, ManifestRecoveryMode::AbsoluteConsistency) else {
+        let Err(err) = recover(folder, &fs, ManifestRecoveryMode::AbsoluteConsistency, None) else {
             panic!("corrupt table_count should fail");
         };
         assert!(
@@ -1161,7 +1171,7 @@ mod tests {
         write_corrupt_blob_count(folder, 1, &fs)?;
         write_current(folder, 1, &fs)?;
 
-        let Err(err) = recover(folder, &fs, ManifestRecoveryMode::AbsoluteConsistency) else {
+        let Err(err) = recover(folder, &fs, ManifestRecoveryMode::AbsoluteConsistency, None) else {
             panic!("corrupt blob_file_count should fail");
         };
         assert!(
@@ -1230,7 +1240,7 @@ mod tests {
         write_truncated_tables_tail(folder, 1, 5, 1, &fs)?;
         write_current(folder, 1, &fs)?;
 
-        let result = recover(folder, &fs, ManifestRecoveryMode::AbsoluteConsistency);
+        let result = recover(folder, &fs, ManifestRecoveryMode::AbsoluteConsistency, None);
         let err = result.expect_err("truncated tail must abort under AbsoluteConsistency");
         // Either Io(UnexpectedEof) (from the byteorder read) — both are
         // acceptable strict-mode failures. The contract is: SOMETHING
@@ -1254,10 +1264,10 @@ mod tests {
         write_truncated_tables_tail(folder, 1, 5, 1, &fs)?;
         write_current(folder, 1, &fs)?;
 
-        let recovery = recover(
-            folder,
+        let recovery = recover(folder,
             &fs,
             ManifestRecoveryMode::TolerateCorruptedTailRecords,
+            None,
         )?;
         assert_eq!(
             recovery.table_ids.len(),
@@ -1323,10 +1333,10 @@ mod tests {
         w.finish()?;
         write_current(folder, 1, &fs)?;
 
-        let result = recover(
-            folder,
+        let result = recover(folder,
             &fs,
             ManifestRecoveryMode::TolerateCorruptedTailRecords,
+            None,
         );
         let err =
             result.expect_err("InvalidTag must still abort under TolerateCorruptedTailRecords");
@@ -1385,10 +1395,10 @@ mod tests {
         write_truncated_at_second_run(folder, 1, &fs)?;
         write_current(folder, 1, &fs)?;
 
-        let recovery = recover(
-            folder,
+        let recovery = recover(folder,
             &fs,
             ManifestRecoveryMode::TolerateCorruptedTailRecords,
+            None,
         )?;
         assert_eq!(
             recovery.table_ids.len(),
@@ -1460,10 +1470,10 @@ mod tests {
         write_truncated_blob_tail(folder, 1, 5, 1, &fs)?;
         write_current(folder, 1, &fs)?;
 
-        let recovery = recover(
-            folder,
+        let recovery = recover(folder,
             &fs,
             ManifestRecoveryMode::TolerateCorruptedTailRecords,
+            None,
         )?;
         assert_eq!(
             recovery.blob_file_ids.len(),
@@ -1513,7 +1523,7 @@ mod tests {
         write_current(folder, 1, &fs)?;
 
         // Strict mode: hard fail.
-        let strict = recover(folder, &fs, ManifestRecoveryMode::AbsoluteConsistency);
+        let strict = recover(folder, &fs, ManifestRecoveryMode::AbsoluteConsistency, None);
         assert!(
             strict.is_err(),
             "strict mode must abort on truncated blob_gc_stats; got Ok",
@@ -1522,10 +1532,10 @@ mod tests {
         // Tolerant mode: succeeds with empty gc_stats. Compare via
         // `Default` (FragmentationMap implements PartialEq) — the
         // type does not expose an `is_empty()` accessor.
-        let lenient = recover(
-            folder,
+        let lenient = recover(folder,
             &fs,
             ManifestRecoveryMode::TolerateCorruptedTailRecords,
+            None,
         )?;
         assert_eq!(
             lenient.gc_stats,
@@ -1631,7 +1641,7 @@ mod tests {
         write_manifest_with_mid_record_corruption(folder, 1, &fs)?;
         write_current(folder, 1, &fs)?;
 
-        let err = recover(folder, &fs, ManifestRecoveryMode::AbsoluteConsistency)
+        let err = recover(folder, &fs, ManifestRecoveryMode::AbsoluteConsistency, None)
             .expect_err("corrupt record must abort AbsoluteConsistency");
         assert!(
             matches!(
@@ -1654,7 +1664,7 @@ mod tests {
         write_manifest_with_mid_record_corruption(folder, 1, &fs)?;
         write_current(folder, 1, &fs)?;
 
-        let recovery = recover(folder, &fs, ManifestRecoveryMode::PointInTimeRecovery)?;
+        let recovery = recover(folder, &fs, ManifestRecoveryMode::PointInTimeRecovery, None)?;
 
         // PIT contract: drop in-progress run contents + all
         // subsequent records; the recovered prefix is level 0 with
@@ -1695,7 +1705,7 @@ mod tests {
         write_manifest_with_mid_record_corruption(folder, 1, &fs)?;
         write_current(folder, 1, &fs)?;
 
-        let recovery = recover(folder, &fs, ManifestRecoveryMode::SkipAnyCorruptedRecords)?;
+        let recovery = recover(folder, &fs, ManifestRecoveryMode::SkipAnyCorruptedRecords, None)?;
 
         // SkipAny contract: log the single bad record, advance past
         // it via the framing length header, keep going. Both
@@ -1786,7 +1796,7 @@ mod tests {
         write_manifest_with_corrupt_blob_record(folder, 1, &fs)?;
         write_current(folder, 1, &fs)?;
 
-        let recovery = recover(folder, &fs, ManifestRecoveryMode::SkipAnyCorruptedRecords)?;
+        let recovery = recover(folder, &fs, ManifestRecoveryMode::SkipAnyCorruptedRecords, None)?;
         let ids: Vec<u64> = recovery.blob_file_ids.iter().map(|(id, _)| *id).collect();
         assert_eq!(
             ids,
@@ -1868,7 +1878,7 @@ mod tests {
         write_manifest_with_corrupt_first_record_of_second_level(folder, 1, &fs)?;
         write_current(folder, 1, &fs)?;
 
-        let recovery = recover(folder, &fs, ManifestRecoveryMode::PointInTimeRecovery)?;
+        let recovery = recover(folder, &fs, ManifestRecoveryMode::PointInTimeRecovery, None)?;
 
         // The persisted manifest declared 2 levels. The recovered
         // shape must keep that count — level 1 just has no
@@ -1953,7 +1963,7 @@ mod tests {
         write_manifest_with_all_records_in_run_corrupt(folder, 1, &fs)?;
         write_current(folder, 1, &fs)?;
 
-        let recovery = recover(folder, &fs, ManifestRecoveryMode::SkipAnyCorruptedRecords)?;
+        let recovery = recover(folder, &fs, ManifestRecoveryMode::SkipAnyCorruptedRecords, None)?;
 
         // 2 levels persisted, both survive as slots.
         assert_eq!(recovery.table_ids.len(), 2);
@@ -1982,7 +1992,7 @@ mod tests {
         write_manifest_with_corrupt_blob_record(folder, 1, &fs)?;
         write_current(folder, 1, &fs)?;
 
-        let recovery = recover(folder, &fs, ManifestRecoveryMode::PointInTimeRecovery)?;
+        let recovery = recover(folder, &fs, ManifestRecoveryMode::PointInTimeRecovery, None)?;
         let ids: Vec<u64> = recovery.blob_file_ids.iter().map(|(id, _)| *id).collect();
         assert_eq!(
             ids,
@@ -2044,7 +2054,7 @@ mod tests {
         write_manifest_skip_any_then_tail_truncated(folder, 1, &fs)?;
         write_current(folder, 1, &fs)?;
 
-        let recovery = recover(folder, &fs, ManifestRecoveryMode::SkipAnyCorruptedRecords)?;
+        let recovery = recover(folder, &fs, ManifestRecoveryMode::SkipAnyCorruptedRecords, None)?;
 
         assert_eq!(
             recovery.stats.tables_dropped_to_corruption, 1,
@@ -2125,7 +2135,7 @@ mod tests {
         write_manifest_blob_skip_any_then_tail_truncated(folder, 1, &fs)?;
         write_current(folder, 1, &fs)?;
 
-        let recovery = recover(folder, &fs, ManifestRecoveryMode::SkipAnyCorruptedRecords)?;
+        let recovery = recover(folder, &fs, ManifestRecoveryMode::SkipAnyCorruptedRecords, None)?;
 
         assert_eq!(
             recovery.stats.blob_dropped_to_corruption, 1,

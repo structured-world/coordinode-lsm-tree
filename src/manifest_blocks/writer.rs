@@ -22,6 +22,7 @@
 //! [`finish`]: ManifestArchiveWriter::finish
 
 use crate::{
+    encryption::EncryptionProvider,
     fs::{Fs, FsFile, FsOpenOptions},
     manifest_blocks::{
         FLAG_FOOTER_MIRROR_ENABLED, HEAD_FOOTER_RESERVED_SIZE, MANIFEST_TABLE_ID_SENTINEL,
@@ -53,6 +54,15 @@ pub struct ManifestArchiveWriter {
     /// manifest write picks up the new snapshot per the V5-1
     /// compaction-as-migration semantic).
     runtime: Arc<RuntimeConfig>,
+
+    /// Optional per-tree encryption provider, plumbed in from
+    /// `Config::encryption`. When `Some`, every section Block and
+    /// the tail/head footer Block go through `BlockTransform::Encrypted`
+    /// (or `EncryptedEcc` when ECC is also on), inheriting the same
+    /// AEAD pipeline data blocks use. When `None`, manifest Blocks
+    /// stay plaintext — matches the data-side default for trees
+    /// opened without `Config::encryption`.
+    encryption: Option<Arc<dyn EncryptionProvider>>,
 
     /// Section currently open via [`start`]. Buffered in memory
     /// until the next `start` or `finish` flushes it into a Block.
@@ -90,7 +100,12 @@ impl ManifestArchiveWriter {
     ///
     /// Returns [`crate::Error::Io`] when the file cannot be created
     /// or the head reservation cannot be written.
-    pub fn create(path: &Path, fs: &dyn Fs, runtime: Arc<RuntimeConfig>) -> crate::Result<Self> {
+    pub fn create(
+        path: &Path,
+        fs: &dyn Fs,
+        runtime: Arc<RuntimeConfig>,
+        encryption: Option<Arc<dyn EncryptionProvider>>,
+    ) -> crate::Result<Self> {
         let mut file = fs.open(
             path,
             &FsOpenOptions::new().read(true).write(true).create_new(true),
@@ -112,11 +127,41 @@ impl ManifestArchiveWriter {
         Ok(Self {
             file,
             runtime,
+            encryption,
             current_section: None,
             toc: Vec::new(),
             section_names: BTreeSet::new(),
             write_cursor: HEAD_FOOTER_RESERVED_SIZE,
         })
+    }
+
+    /// Construct the [`BlockTransform`] every manifest Block in
+    /// this file should use, given the captured runtime + optional
+    /// encryption. Mirrors the logic in `Block::write_into`'s
+    /// caller surface: ECC and encryption are independent toggles
+    /// that compose into the four `(Plain | Encrypted) × (None | Ecc)`
+    /// variants.
+    ///
+    /// ECC arms are feature-gated behind `page_ecc` so the
+    /// `--no-default-features` build doesn't reference a variant
+    /// that doesn't exist in that cargo configuration.
+    fn block_transform(&self) -> BlockTransform<'_> {
+        // Single source of truth for the per-write ECC decision.
+        // Honors per-scope overrides (data_block_ecc_override etc.)
+        // via the `manifest_ecc()` helper on RuntimeConfig.
+        #[cfg(feature = "page_ecc")]
+        let ecc_on = self.runtime.manifest_ecc();
+        #[cfg(not(feature = "page_ecc"))]
+        let ecc_on = false;
+
+        match (ecc_on, self.encryption.as_deref()) {
+            #[cfg(feature = "page_ecc")]
+            (true, Some(enc)) => BlockTransform::EncryptedEcc(enc),
+            #[cfg(feature = "page_ecc")]
+            (true, None) => BlockTransform::PlainEcc,
+            (_, Some(enc)) => BlockTransform::Encrypted(enc),
+            (_, None) => BlockTransform::PLAIN,
+        }
     }
 
     /// Open a new section named `name`. Subsequent writes via the
@@ -197,7 +242,7 @@ impl ManifestArchiveWriter {
             &mut footer_block_bytes,
             &payload_bytes,
             identity,
-            &BlockTransform::PLAIN,
+            &self.block_transform(),
         )?;
 
         // Safety-net check per Q12: hard 4 KiB ceiling on footer
@@ -286,7 +331,7 @@ impl ManifestArchiveWriter {
             &mut block_bytes,
             &section.buf,
             identity,
-            &BlockTransform::PLAIN,
+            &self.block_transform(),
         )?;
 
         self.file.write_all(&block_bytes)?;
@@ -348,7 +393,7 @@ mod tests {
     use crate::runtime_config::RuntimeConfig;
 
     fn open_writer(fs: &dyn Fs, path: &Path, runtime: RuntimeConfig) -> ManifestArchiveWriter {
-        ManifestArchiveWriter::create(path, fs, Arc::new(runtime))
+        ManifestArchiveWriter::create(path, fs, Arc::new(runtime), None)
             .expect("manifest writer opens cleanly on a fresh path")
     }
 

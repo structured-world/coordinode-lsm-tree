@@ -240,6 +240,7 @@ impl AbstractTree for BlobTree {
                 visible_seqno: &self.index.config.visible_seqno,
                 include_blobs: true,
                 runtime_config: self.index.0.runtime_config.load_full(),
+                encryption: self.index.0.config.encryption.clone(),
             },
         )
     }
@@ -386,6 +387,7 @@ impl AbstractTree for BlobTree {
             &config.visible_seqno,
             &*config.fs,
             self.index.0.runtime_config.load_full(),
+            self.index.0.config.encryption.clone(),
         )
     }
 

@@ -1,4 +1,5 @@
 use crate::{
+    encryption::EncryptionProvider,
     file::{CURRENT_VERSION_FILE, fsync_directory, hash_file_xxh3, rewrite_atomic},
     fs::Fs,
     manifest_blocks::writer::ManifestArchiveWriter,
@@ -23,6 +24,7 @@ pub fn persist_version(
     comparator_name: &str,
     fs: &dyn Fs,
     runtime: Arc<RuntimeConfig>,
+    encryption: Option<Arc<dyn EncryptionProvider>>,
 ) -> crate::Result<()> {
     if comparator_name.len() > crate::comparator::MAX_COMPARATOR_NAME_BYTES {
         return Err(crate::Error::from(std::io::Error::new(
@@ -49,7 +51,7 @@ pub fn persist_version(
     // start() / finish()), and on finish() writes the tail footer
     // Block + size-hint trailer + optional head mirror per the
     // runtime config.
-    let mut writer = ManifestArchiveWriter::create(&path, fs, runtime)?;
+    let mut writer = ManifestArchiveWriter::create(&path, fs, runtime, encryption)?;
     version.encode_into(&mut writer, comparator_name)?;
     writer.finish()?;
 

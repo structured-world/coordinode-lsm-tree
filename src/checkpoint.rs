@@ -413,6 +413,12 @@ fn write_current_for_version(
 /// [`crate::version::persist_version`]'s signature). `current` is
 /// then written via [`write_current_for_version`] referencing the
 /// freshly-persisted `version.id()`.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "checkpoint metadata copy threads (src fs+root, target fs+root, version, \
+              comparator, runtime, encryption) — every parameter is load-bearing and \
+              wrapping into a struct would just move the count to the struct literal"
+)]
 pub fn copy_metadata(
     src_fs: &dyn Fs,
     src_root: &Path,
@@ -421,6 +427,7 @@ pub fn copy_metadata(
     version: &crate::version::Version,
     comparator_name: &str,
     runtime: std::sync::Arc<crate::runtime_config::RuntimeConfig>,
+    encryption: Option<std::sync::Arc<dyn crate::encryption::EncryptionProvider>>,
 ) -> crate::Result<()> {
     // Manifest stores level count + comparator name. On a never-written
     // tree the manifest may legitimately be absent (recovery treats
@@ -441,7 +448,14 @@ pub fn copy_metadata(
     // driver — Tree::create_checkpoint loads it via load_full() on
     // the source tree's RuntimeConfigHandle so the checkpoint sees
     // exactly the config in effect at capture.
-    crate::version::persist_version(target_root, version, comparator_name, target_fs, runtime)?;
+    crate::version::persist_version(
+        target_root,
+        version,
+        comparator_name,
+        target_fs,
+        runtime,
+        encryption,
+    )?;
     // CURRENT pointer is generated fresh for the captured `version_id`
     // (NOT copied from source) so a concurrent publish to `v<N+1>` on
     // the source can never leave the checkpoint pointing at a version
@@ -482,6 +496,12 @@ pub struct CheckpointParams<'a> {
     /// Callers obtain the snapshot via
     /// `tree.0.runtime_config.load_full()` on the source `Tree`.
     pub runtime_config: Arc<crate::runtime_config::RuntimeConfig>,
+    /// Encryption provider cloned from the source tree's
+    /// `Config::encryption`. Threaded through to the manifest writer
+    /// so the captured manifest is encrypted with the same key
+    /// chain the source tree uses — a checkpoint of an encrypted
+    /// tree is itself encrypted end-to-end.
+    pub encryption: Option<Arc<dyn crate::encryption::EncryptionProvider>>,
 }
 
 /// RAII guard that removes a partially-built checkpoint directory on
@@ -618,6 +638,7 @@ pub fn run_checkpoint<T: AbstractTree>(
         &version,
         tree.tree_config().comparator.name(),
         Arc::clone(&params.runtime_config),
+        params.encryption.clone(),
     )?;
 
     // fsync each populated child directory BEFORE the root so the

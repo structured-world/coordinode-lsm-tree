@@ -110,13 +110,14 @@ impl TreeInner {
         // Tree isn't constructed yet so its runtime handle doesn't
         // exist. Subsequent manifest writes go through paths that
         // load the live RuntimeConfig snapshot from the Tree.
-        let initial_runtime = Arc::new(RuntimeConfig::default());
+        let initial_runtime = std::sync::Arc::new(crate::runtime_config::RuntimeConfig::default());
         persist_version(
             &config.path,
             &version,
             config.comparator.name(),
             &*config.fs,
             initial_runtime,
+            config.encryption.clone(),
         )?;
 
         let comparator = config.comparator.clone();

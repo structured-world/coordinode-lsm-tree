@@ -188,6 +188,7 @@ impl AbstractTree for Tree {
                 visible_seqno: &self.config.visible_seqno,
                 include_blobs: false,
                 runtime_config: self.0.runtime_config.load_full(),
+                encryption: self.0.config.encryption.clone(),
             },
         )
     }
@@ -371,6 +372,7 @@ impl AbstractTree for Tree {
             &config.visible_seqno,
             &*config.fs,
             self.0.runtime_config.load_full(),
+            self.0.config.encryption.clone(),
         )
     }
 
@@ -610,6 +612,7 @@ impl AbstractTree for Tree {
             &self.config.visible_seqno,
             &*self.config.fs,
             self.0.runtime_config.load_full(),
+            self.0.config.encryption.clone(),
         )?;
 
         if let Err(e) = version_lock.maintenance(&self.config.path, gc_watermark, &*self.config.fs)
@@ -1942,9 +1945,19 @@ impl Tree {
             let version_id =
                 crate::version::recovery::get_current_version(&config.path, &*config.fs)?;
             let manifest_path = config.path.join(format!("v{version_id}"));
+            // Open the manifest with a default runtime snapshot:
+            // ECC awareness is captured per-Block via the header
+            // (`ecc_length` field) so the reader doesn't actually
+            // need to know which ECC mode the writer used. The
+            // captured runtime here is a placeholder; once we want
+            // runtime-driven decisions on the read path (e.g.
+            // checksum_algo dispatch per #298) we'll seed it from
+            // Config + persisted format-version fields.
             let mut archive_reader = crate::manifest_blocks::reader::ManifestArchiveReader::open(
                 &manifest_path,
                 &*config.fs,
+                std::sync::Arc::new(crate::runtime_config::RuntimeConfig::default()),
+                config.encryption.clone(),
             )?;
             let manifest = Manifest::decode_from(&mut archive_reader)?;
 
@@ -2104,7 +2117,12 @@ impl Tree {
 
         let tree_path = tree_path.as_ref();
 
-        let recovery = recover(tree_path, &*config.fs, config.manifest_recovery_mode)?;
+        let recovery = recover(
+            tree_path,
+            &*config.fs,
+            config.manifest_recovery_mode,
+            config.encryption.clone(),
+        )?;
 
         let mut table_map = {
             let mut result: crate::HashMap<TableId, (u8 /* Level index */, Checksum, SeqNo)> =

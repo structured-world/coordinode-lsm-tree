@@ -129,7 +129,12 @@ impl Manifest {
               explicitly so it can hold it for the recover() call that follows"
 )]
 pub fn decode_from_path(path: &Path, fs: &dyn Fs) -> Result<Manifest, crate::Error> {
-    let mut reader = ManifestArchiveReader::open(path, fs)?;
+    let mut reader = ManifestArchiveReader::open(
+        path,
+        fs,
+        std::sync::Arc::new(crate::runtime_config::RuntimeConfig::default()),
+        None,
+    )?;
     Manifest::decode_from(&mut reader)
 }
 
@@ -139,11 +144,9 @@ mod tests {
     use crate::{
         fs::{Fs, MemFs, StdFs},
         manifest_blocks::writer::ManifestArchiveWriter,
-        runtime_config::RuntimeConfig,
     };
     use byteorder::WriteBytesExt;
     use std::io::Write;
-    use std::sync::Arc;
 
     /// Write a minimal valid Blocks-based manifest with all four
     /// mandatory sections (and optionally a `comparator_name`).
@@ -152,8 +155,12 @@ mod tests {
         comparator_name: Option<&str>,
         fs: &dyn Fs,
     ) -> crate::Result<()> {
-        let mut writer =
-            ManifestArchiveWriter::create(path, fs, Arc::new(RuntimeConfig::default()))?;
+        let mut writer = ManifestArchiveWriter::create(
+            path,
+            fs,
+            std::sync::Arc::new(crate::runtime_config::RuntimeConfig::default()),
+            None,
+        )?;
 
         writer.start("format_version")?;
         writer.write_u8(FormatVersion::V5.into())?;
@@ -177,7 +184,12 @@ mod tests {
     }
 
     fn decode_manifest(path: &Path, fs: &dyn Fs) -> crate::Result<Manifest> {
-        let mut reader = ManifestArchiveReader::open(path, fs)?;
+        let mut reader = ManifestArchiveReader::open(
+            path,
+            fs,
+            std::sync::Arc::new(crate::runtime_config::RuntimeConfig::default()),
+            None,
+        )?;
         Manifest::decode_from(&mut reader)
     }
 
@@ -233,8 +245,12 @@ mod tests {
         // Compose a manifest where the comparator_name section
         // carries invalid UTF-8 bytes. Writer accepts arbitrary
         // bytes via write_all; the Manifest decoder enforces UTF-8.
-        let mut writer =
-            ManifestArchiveWriter::create(&path, &StdFs, Arc::new(RuntimeConfig::default()))?;
+        let mut writer = ManifestArchiveWriter::create(
+            &path,
+            &StdFs,
+            std::sync::Arc::new(crate::runtime_config::RuntimeConfig::default()),
+            None,
+        )?;
         writer.start("format_version")?;
         writer.write_u8(FormatVersion::V5.into())?;
         writer.start("tree_type")?;

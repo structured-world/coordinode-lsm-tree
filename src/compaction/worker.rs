@@ -68,6 +68,11 @@ pub struct Options {
     /// next compaction cycle without restart.
     pub runtime_config: Arc<crate::runtime_config::handle::RuntimeConfigHandle>,
 
+    /// Optional per-tree encryption provider, threaded into manifest
+    /// writes so compaction-driven version commits inherit the same
+    /// AEAD pipeline the data blocks use.
+    pub encryption: Option<Arc<dyn crate::encryption::EncryptionProvider>>,
+
     #[cfg(feature = "metrics")]
     pub metrics: Arc<Metrics>,
 }
@@ -88,6 +93,7 @@ impl Options {
 
             compaction_state: tree.compaction_state.clone(),
             runtime_config: tree.runtime_config.clone(),
+            encryption: tree.config.encryption.clone(),
 
             #[cfg(feature = "metrics")]
             metrics: tree.metrics.clone(),
@@ -258,6 +264,7 @@ fn move_tables(
         &opts.visible_seqno,
         &*opts.config.fs,
         opts.runtime_config.load_full(),
+        opts.encryption.clone(),
     )?;
 
     if let Err(e) = version_history_lock.maintenance(
@@ -710,6 +717,7 @@ fn drop_tables(
         &opts.visible_seqno,
         &*opts.config.fs,
         opts.runtime_config.load_full(),
+        opts.encryption.clone(),
     )?;
 
     if let Err(e) = version_history_lock.maintenance(

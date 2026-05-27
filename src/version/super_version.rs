@@ -132,6 +132,12 @@ impl SuperVersions {
     /// The function takes care of persisting the version changes on disk.
     // Takes &SharedSequenceNumberGenerator (not &dyn SequenceNumberGenerator)
     // because Config stores Arc<dyn ...> and all callers already have that type.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "version upgrade threads tree_path, mutator closure, two seqno gens, fs, \
+                  runtime, encryption — every parameter is load-bearing per the \
+                  manifest-persist contract"
+    )]
     pub(crate) fn upgrade_version<F: FnOnce(&SuperVersion) -> crate::Result<SuperVersion>>(
         &mut self,
         tree_path: &Path,
@@ -140,14 +146,29 @@ impl SuperVersions {
         visible_seqno: &SharedSequenceNumberGenerator,
         fs: &dyn Fs,
         runtime: std::sync::Arc<crate::runtime_config::RuntimeConfig>,
+        encryption: Option<std::sync::Arc<dyn crate::encryption::EncryptionProvider>>,
     ) -> crate::Result<()> {
-        self.upgrade_version_with_seqno(tree_path, f, seqno.next(), visible_seqno, fs, runtime)
+        self.upgrade_version_with_seqno(
+            tree_path,
+            f,
+            seqno.next(),
+            visible_seqno,
+            fs,
+            runtime,
+            encryption,
+        )
     }
 
     /// Like `upgrade_version`, but takes an already-allocated sequence number.
     ///
     /// This is useful when the seqno must be coordinated with other operations
     /// (e.g., bulk ingestion where tables are recovered with the same seqno).
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "version upgrade with pre-allocated seqno: tree_path, mutator, seqno, \
+                  visible_seqno, fs, runtime, encryption — same load-bearing surface as \
+                  the auto-allocating sibling above"
+    )]
     pub(crate) fn upgrade_version_with_seqno<
         F: FnOnce(&SuperVersion) -> crate::Result<SuperVersion>,
     >(
@@ -158,6 +179,7 @@ impl SuperVersions {
         visible_seqno: &SharedSequenceNumberGenerator,
         fs: &dyn Fs,
         runtime: std::sync::Arc<crate::runtime_config::RuntimeConfig>,
+        encryption: Option<std::sync::Arc<dyn crate::encryption::EncryptionProvider>>,
     ) -> crate::Result<()> {
         let mut next_version = f(&self.latest_version())?;
         next_version.seqno = seqno;
@@ -169,6 +191,7 @@ impl SuperVersions {
             &self.comparator_name,
             fs,
             runtime,
+            encryption,
         )?;
         self.append_version(next_version);
 
