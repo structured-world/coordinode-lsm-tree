@@ -389,12 +389,17 @@ fn write_current_for_version(
     use std::io::{Seek, SeekFrom};
 
     let manifest_path = target_root.join(format!("v{version_id}"));
-    // Derive section_end from the trailing 4-byte size hint, same
-    // as `get_current_version` does on the read side. Use a size
-    // floor + `checked_sub` for both arithmetic steps so a
-    // truncated / forged manifest surfaces as `Unrecoverable`
-    // rather than a wild underflow that operates on the wrong
-    // byte range.
+    // Derive section_end from the trailing 4-byte size hint
+    // directly — no head-mirror fallback. `get_current_version`
+    // uses ManifestArchiveReader::open (tail-first + head-mirror
+    // recovery + TOC inspection) because Tree::open must tolerate
+    // a torn tail on already-persisted state; the checkpoint
+    // sealing path here writes its own manifest right above and
+    // can trust that the tail it just wrote is intact, so the
+    // simpler size-hint read is sufficient. Use a size floor +
+    // `checked_sub` for both arithmetic steps so a truncated /
+    // forged manifest surfaces as `Unrecoverable` rather than a
+    // wild underflow that operates on the wrong byte range.
     let file_len = target_fs.metadata(&manifest_path)?.len;
     if file_len < HEAD_FOOTER_RESERVED_SIZE + TAIL_FOOTER_SIZE_HINT_BYTES {
         return Err(crate::Error::Unrecoverable);

@@ -81,10 +81,10 @@ impl<W: Write + Seek> Writer<W> {
         Ok(())
     }
 
-    fn append_trailer(mut writer: &mut W, toc: &[TocEntry]) -> crate::sfa::Result<()> {
+    fn append_trailer(writer: &mut W, toc: &[TocEntry]) -> crate::sfa::Result<()> {
         // Write ToC
         let toc_pos = writer.stream_position()?;
-        let toc_checksum = TocWriter::write_into(&mut writer, toc)?;
+        let toc_checksum = TocWriter::write_into(&mut *writer, toc)?;
 
         let after_toc_pos = writer.stream_position()?;
         let toc_len = after_toc_pos - toc_pos;

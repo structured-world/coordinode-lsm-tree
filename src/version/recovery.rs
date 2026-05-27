@@ -142,12 +142,26 @@ pub fn get_current_version(
     // before any Tree exists, and the reader's ECC decisions are
     // per-Block self-describing via the Block header (not driven by
     // the supplied runtime), so the placeholder is safe.
+    // Rewrap manifest NotFound so `Tree::open`'s outer `Err(Io(NotFound))`
+    // arm — which means "CURRENT file is absent, fresh-init the tree" —
+    // never absorbs a missing manifest. A missing manifest with CURRENT
+    // pointing at it is half-applied recovery / corruption, not a
+    // fresh-init signal; converting it to ManifestFooterInvalid surfaces
+    // that distinct failure mode loud and clear.
     let archive = crate::manifest_blocks::reader::ManifestArchiveReader::open(
         &manifest_path,
         fs,
         std::sync::Arc::new(crate::runtime_config::RuntimeConfig::default()),
         encryption,
-    )?;
+    )
+    .map_err(|e| match e {
+        crate::Error::Io(io) if io.kind() == std::io::ErrorKind::NotFound => {
+            crate::Error::ManifestFooterInvalid(
+                "manifest file referenced by CURRENT does not exist",
+            )
+        }
+        other => other,
+    })?;
 
     let section_end = archive
         .footer()

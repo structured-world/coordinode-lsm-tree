@@ -32,9 +32,9 @@ impl Reader {
     /// # Errors
     ///
     /// Returns error, if an IO error occurred.
-    pub fn from_reader<R: Read + Seek>(mut reader: &mut R) -> crate::sfa::Result<Self> {
-        let trailer = TrailerReader::from_reader(&mut reader)?;
-        let toc = TocReader::from_reader(&mut reader, trailer.toc_pos, trailer.toc_checksum)?;
+    pub fn from_reader<R: Read + Seek>(reader: &mut R) -> crate::sfa::Result<Self> {
+        let trailer = TrailerReader::from_reader(reader)?;
+        let toc = TocReader::from_reader(reader, trailer.toc_pos, trailer.toc_checksum)?;
         Ok(Self { toc })
     }
 
