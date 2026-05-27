@@ -190,12 +190,24 @@ mod key;
 mod key_range;
 mod loser_tree;
 mod manifest;
+// `std`-gated: writer/reader use `std::io::{Cursor, Seek}` and
+// `std::sync::Arc`, and the surrounding `fs::Fs` trait surface is
+// itself std-bound until #311's follow-ups land. Keeping the gate
+// in lockstep with the rest of the std-only modules unblocks the
+// `--no-default-features --features alloc` build the
+// `no-std-check` CI job exercises.
+#[cfg(feature = "std")]
 #[doc(hidden)]
 pub mod manifest_blocks;
 mod memtable;
 mod merge_operator;
 mod run_reader;
 mod run_scanner;
+// `std`-gated for the same reason: vendored sfa uses `std::io` /
+// `std::fs` / `std::path` directly. The blob-file consumers of sfa
+// are themselves std-only, so the gate is a no-op for every
+// existing caller.
+#[cfg(feature = "std")]
 #[doc(hidden)]
 pub mod sfa;
 

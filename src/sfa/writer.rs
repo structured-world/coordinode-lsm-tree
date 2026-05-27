@@ -12,7 +12,11 @@ use crate::sfa::{
 use std::io::{Seek, Write};
 
 /// Archive writer
-#[allow(clippy::struct_field_names)]
+#[expect(
+    clippy::struct_field_names,
+    reason = "upstream sfa struct: `writer` field matches struct name; \
+              kept verbatim so the upstream-sync diff stays mechanical"
+)]
 pub struct Writer<W: Write + Seek> {
     writer: W,
     last_section_pos: u64,

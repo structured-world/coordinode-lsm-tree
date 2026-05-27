@@ -68,6 +68,20 @@ pub const HEAD_FOOTER_RESERVED_SIZE: u64 = 4 * 1024;
 /// failure.
 pub const FLAG_FOOTER_MIRROR_ENABLED: u8 = 1 << 0;
 
+/// Hard cap on the on-disk size of a single manifest section Block.
+///
+/// Realistic production manifests carry KB-scale sections (table
+/// list, blob-file list, format metadata); the largest plausible
+/// section is the `tables` block on a heavily-populated tree, which
+/// still sits comfortably under 16 MiB even with thousands of
+/// tables. Capping here keeps the reader from ever allocating a
+/// multi-hundred-MiB buffer driven by a forged or corrupted TOC.
+///
+/// Bumped only when `manifest_layout_version` changes — increasing
+/// it is additive (older readers reject the bigger block as
+/// oversized, newer readers accept it).
+pub const MAX_MANIFEST_BLOCK_SIZE: u32 = 16 * 1024 * 1024;
+
 /// Size in bytes of the trailing footer-size pointer.
 ///
 /// Written at the very end of every manifest file (a little-endian

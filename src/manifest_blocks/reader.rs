@@ -34,7 +34,7 @@ use crate::{
     fs::{Fs, FsFile, FsOpenOptions},
     manifest_blocks::{
         HEAD_FOOTER_RESERVED_SIZE, MANIFEST_TABLE_ID_SENTINEL, MANIFEST_TREE_ID_SENTINEL,
-        TAIL_FOOTER_SIZE_HINT_BYTES,
+        MAX_MANIFEST_BLOCK_SIZE, TAIL_FOOTER_SIZE_HINT_BYTES,
         footer::{FooterPayload, TocEntry},
     },
     table::block::{Block, BlockIdentity, BlockTransform, BlockType},
@@ -209,13 +209,21 @@ impl ManifestArchiveReader {
         let block_offset = entry.block_offset;
         let block_size = entry.block_size;
 
-        // Bound `block_size` against the actual file length BEFORE
-        // allocating the buffer. The TOC lives inside a XXH3-verified
-        // footer Block so legitimate writers never put a forged
-        // size here, but a malicious manifest could; without this
-        // check `vec![0u8; block_size as usize]` would allocate up
-        // to 4 GiB on a single Block read and crash the process
-        // before any Block-level verification fires.
+        // Bound `block_size` against both an absolute cap and the
+        // actual file length BEFORE allocating the buffer. The TOC
+        // lives inside a XXH3-verified footer Block so legitimate
+        // writers never put a forged size here, but a malicious
+        // manifest could; without these checks `vec![0u8; block_size
+        // as usize]` would allocate up to 4 GiB on a single Block
+        // read and crash the process before any Block-level
+        // verification fires. The absolute cap fires first because
+        // the file-len check alone tolerates a 16-GiB v{N} file
+        // pre-sized via sparse holes.
+        if block_size > MAX_MANIFEST_BLOCK_SIZE {
+            return Err(crate::Error::ManifestFooterInvalid(
+                "TOC entry block_size exceeds MAX_MANIFEST_BLOCK_SIZE",
+            ));
+        }
         let file_len = self.file.metadata()?.len;
         let end = block_offset.checked_add(u64::from(block_size)).ok_or(
             crate::Error::ManifestFooterInvalid("TOC entry overflows u64 file offset"),

@@ -54,6 +54,16 @@ pub fn load_block(
 
     log::trace!("load {block_type:?} block {handle:?}");
 
+    // Invariant: manifest Blocks have their own reader path and
+    // never reach the SST block cache. Guard outside the metrics
+    // cfg so the contract holds on every build (the per-match
+    // `unreachable!()` arms below only fire when `metrics` is
+    // enabled, which would let the invariant silently disappear in
+    // non-metrics builds).
+    if matches!(block_type, BlockType::Manifest | BlockType::ManifestFooter) {
+        unreachable!("manifest blocks are not loaded via the SST block cache");
+    }
+
     if let Some(block) = cache.get_block(table_id, handle.offset()) {
         if block.header.block_type != block_type {
             return Err(crate::Error::InvalidTag((
@@ -78,12 +88,9 @@ pub fn load_block(
             BlockType::Data | BlockType::Meta => {
                 metrics.data_block_load_cached.fetch_add(1, Relaxed);
             }
-            // Manifest blocks live in the manifest file, are loaded
-            // by the manifest reader, and never go through this SST
-            // block cache — reaching this arm means a wiring bug.
-            BlockType::Manifest | BlockType::ManifestFooter => {
-                unreachable!("manifest blocks are not loaded via the SST block cache")
-            }
+            // Manifest variants are rejected by the function-level
+            // guard above; nothing to do here.
+            BlockType::Manifest | BlockType::ManifestFooter => {}
         }
 
         return Ok(block);
@@ -164,11 +171,9 @@ pub fn load_block(
                 .data_block_io_requested
                 .fetch_add(handle.size().into(), Relaxed);
         }
-        // See the cached-load arm above: manifest blocks have their
-        // own reader path and never reach this SST-cache loader.
-        BlockType::Manifest | BlockType::ManifestFooter => {
-            unreachable!("manifest blocks are not loaded via the SST block cache")
-        }
+        // Manifest variants are rejected by the function-level
+        // guard above; nothing to do here.
+        BlockType::Manifest | BlockType::ManifestFooter => {}
     }
 
     cache.insert_block(table_id, handle.offset(), block.clone());

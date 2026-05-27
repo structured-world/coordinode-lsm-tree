@@ -99,9 +99,10 @@ impl FooterPayload {
     ///
     /// # Errors
     ///
-    /// Returns [`crate::Error::FooterTooLarge`] if the serialized
-    /// payload would exceed the realistic safety cap, or
-    /// [`crate::Error::Io`] on writer failure.
+    /// Returns [`crate::Error::ManifestFooterInvalid`] for
+    /// structural violations (empty, oversized, or duplicate section
+    /// names; section count overflowing `u16`) and
+    /// [`crate::Error::Io`] on underlying writer failure.
     pub fn encode<W: Write>(&self, mut writer: W) -> crate::Result<()> {
         if self.sections.len() > usize::from(u16::MAX) {
             return Err(crate::Error::ManifestFooterInvalid(
