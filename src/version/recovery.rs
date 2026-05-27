@@ -87,12 +87,21 @@ fn decode_blob_entry_payload(payload: &[u8]) -> crate::Result<(BlobFileId, Check
 /// The file format is: `version_id: u64 | checksum: u128 | checksum_type: u8`
 /// (25 bytes total, written atomically by `rewrite_atomic`).
 ///
-/// Reads the version id, then re-hashes the referenced `v{id}` manifest
-/// file and compares the result against the stamped checksum. A mismatch
-/// surfaces as [`crate::Error::ChecksumMismatch`] — a file-level swap
-/// or roll-back (e.g., manually renaming `v0` over `v1`) is detected
-/// before any of the per-block XXH3 verification fires inside the
-/// manifest reader.
+/// Reads the version id, then re-hashes the SECTION bytes of the
+/// referenced `v{id}` manifest (the `[HEAD_FOOTER_RESERVED_SIZE,
+/// section_end)` range — excluding the head mirror, the tail footer
+/// Block, and the 4-byte size-hint trailer) and compares the result
+/// against the stamped checksum. Mismatch surfaces as
+/// [`crate::Error::ChecksumMismatch`].
+///
+/// The section-only range matters because a torn / bit-rotted tail
+/// footer can be recovered by [`crate::manifest_blocks::reader::
+/// ManifestArchiveReader`] through the head-mirror fallback;
+/// hashing the whole file would invalidate the CURRENT pointer
+/// before that fallback ever runs. Hashing only the section region
+/// keeps the substitution defence intact (a swapped `v{N}` file has
+/// different section bytes) while leaving the footer recovery path
+/// usable.
 pub fn get_current_version(folder: &Path, fs: &dyn Fs) -> crate::Result<VersionId> {
     use byteorder::{LittleEndian, ReadBytesExt};
 
@@ -109,14 +118,35 @@ pub fn get_current_version(folder: &Path, fs: &dyn Fs) -> crate::Result<VersionI
         return Err(crate::Error::InvalidTag(("ChecksumType", checksum_type)));
     }
 
-    // Re-hash the manifest file the pointer references and compare it
-    // against the stamped XXH3-128 from CURRENT. Closes the substitution
-    // window where an attacker (or accidental `mv v0 v1`) swaps the
-    // version file under us: per-Block XXH3 catches in-block bit-rot
-    // but cannot tell two-different-but-individually-valid manifests
-    // apart on its own.
     let manifest_path = folder.join(format!("v{version_id}"));
-    let computed = crate::file::hash_file_xxh3(fs, &manifest_path)?;
+
+    // Locate the end of the section region (= start of the tail
+    // footer Block) by reading the trailing 4-byte size hint. The
+    // hint is the last bytes of the file: file_len - 4 .. file_len.
+    // section_end = file_len - 4 - footer_size.
+    let file_len = fs.metadata(&manifest_path)?.len;
+    if file_len
+        < crate::manifest_blocks::HEAD_FOOTER_RESERVED_SIZE
+            + crate::manifest_blocks::TAIL_FOOTER_SIZE_HINT_BYTES
+    {
+        return Err(crate::Error::Unrecoverable);
+    }
+    let mut manifest_file = fs.open(&manifest_path, &FsOpenOptions::new().read(true))?;
+    manifest_file.seek(std::io::SeekFrom::Start(
+        file_len - crate::manifest_blocks::TAIL_FOOTER_SIZE_HINT_BYTES,
+    ))?;
+    let footer_size = u64::from(manifest_file.read_u32::<LittleEndian>()?);
+    drop(manifest_file);
+
+    let section_end = file_len
+        .checked_sub(crate::manifest_blocks::TAIL_FOOTER_SIZE_HINT_BYTES)
+        .and_then(|x| x.checked_sub(footer_size))
+        .ok_or(crate::Error::Unrecoverable)?;
+    let section_start = crate::manifest_blocks::HEAD_FOOTER_RESERVED_SIZE;
+    let section_length = section_end.saturating_sub(section_start);
+
+    let computed =
+        crate::file::hash_file_range_xxh3(fs, &manifest_path, section_start, section_length)?;
     if computed != stored_checksum {
         return Err(crate::Error::ChecksumMismatch {
             got: Checksum::from_raw(computed),
@@ -1037,7 +1067,8 @@ mod tests {
     ///
     /// Must be called AFTER the `v{id}` manifest file exists — the
     /// pointer's checksum field is computed from the manifest's
-    /// current bytes via [`crate::file::hash_file_xxh3`]. Fixtures
+    /// current bytes via [`crate::file::hash_file_range_xxh3`] over
+    /// the section region. Fixtures
     /// that test corruption-recovery typically write the corrupted
     /// manifest first, then call this to stamp the CURRENT pointer
     /// with the hash of the (intentionally) corrupted bytes — that
@@ -1045,8 +1076,22 @@ mod tests {
     /// is exposed by the manifest-decode path, not the pointer-
     /// validation path.
     fn write_current(folder: &Path, version_id: u64, fs: &dyn Fs) -> crate::Result<()> {
+        use crate::manifest_blocks::{HEAD_FOOTER_RESERVED_SIZE, TAIL_FOOTER_SIZE_HINT_BYTES};
+        use std::io::SeekFrom;
         let manifest_path = folder.join(format!("v{version_id}"));
-        let checksum = crate::file::hash_file_xxh3(fs, &manifest_path)?;
+        let file_len = fs.metadata(&manifest_path)?.len;
+        let mut f = fs.open(&manifest_path, &FsOpenOptions::new().read(true))?;
+        f.seek(SeekFrom::Start(file_len - TAIL_FOOTER_SIZE_HINT_BYTES))?;
+        let footer_size = u64::from(f.read_u32::<LittleEndian>()?);
+        drop(f);
+        let section_end = file_len - TAIL_FOOTER_SIZE_HINT_BYTES - footer_size;
+        let section_length = section_end.saturating_sub(HEAD_FOOTER_RESERVED_SIZE);
+        let checksum = crate::file::hash_file_range_xxh3(
+            fs,
+            &manifest_path,
+            HEAD_FOOTER_RESERVED_SIZE,
+            section_length,
+        )?;
         let path = folder.join(CURRENT_VERSION_FILE);
         let mut f = fs.open(
             &path,

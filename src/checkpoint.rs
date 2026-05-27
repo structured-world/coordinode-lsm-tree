@@ -369,22 +369,41 @@ fn copy_metadata_file_optional(
 /// wire format as [`crate::version::persist_version`]: `u64 version_id`
 /// + `u128 checksum` + `u8 checksum_type`.
 ///
-/// The checksum field is computed from the just-written `v<id>`
-/// manifest via [`crate::file::hash_file_xxh3`] so the checkpoint
-/// pointer survives the same `get_current_version` validation the
-/// live tree's pointer does — a swap of the captured manifest under
-/// the checkpoint is detected on next open.
+/// The checksum field is computed over the captured manifest's
+/// SECTION bytes only — `[HEAD_FOOTER_RESERVED_SIZE, section_end)`
+/// — so the checkpoint pointer survives the same
+/// `get_current_version` validation the live tree's pointer does
+/// (a section-byte swap is caught; a tail-only torn write is
+/// recoverable via the head mirror without invalidating the
+/// pointer first).
 fn write_current_for_version(
     target_fs: &dyn Fs,
     target_root: &Path,
     version_id: u64,
 ) -> crate::Result<()> {
     use crate::checksum::ChecksumType;
-    use crate::file::{hash_file_xxh3, rewrite_atomic};
-    use byteorder::{LittleEndian, WriteBytesExt};
+    use crate::file::{hash_file_range_xxh3, rewrite_atomic};
+    use crate::fs::FsOpenOptions;
+    use crate::manifest_blocks::{HEAD_FOOTER_RESERVED_SIZE, TAIL_FOOTER_SIZE_HINT_BYTES};
+    use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
+    use std::io::{Seek, SeekFrom};
 
     let manifest_path = target_root.join(format!("v{version_id}"));
-    let checksum = hash_file_xxh3(target_fs, &manifest_path)?;
+    // Derive section_end from the trailing 4-byte size hint, same
+    // as get_current_version does on the read side.
+    let file_len = target_fs.metadata(&manifest_path)?.len;
+    let mut f = target_fs.open(&manifest_path, &FsOpenOptions::new().read(true))?;
+    f.seek(SeekFrom::Start(file_len - TAIL_FOOTER_SIZE_HINT_BYTES))?;
+    let footer_size = u64::from(f.read_u32::<LittleEndian>()?);
+    drop(f);
+    let section_end = file_len - TAIL_FOOTER_SIZE_HINT_BYTES - footer_size;
+    let section_length = section_end.saturating_sub(HEAD_FOOTER_RESERVED_SIZE);
+    let checksum = hash_file_range_xxh3(
+        target_fs,
+        &manifest_path,
+        HEAD_FOOTER_RESERVED_SIZE,
+        section_length,
+    )?;
 
     let mut content = vec![];
     content.write_u64::<LittleEndian>(version_id)?;

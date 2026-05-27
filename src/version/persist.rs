@@ -1,8 +1,8 @@
 use crate::{
     encryption::EncryptionProvider,
-    file::{CURRENT_VERSION_FILE, fsync_directory, hash_file_xxh3, rewrite_atomic},
+    file::{CURRENT_VERSION_FILE, fsync_directory, hash_file_range_xxh3, rewrite_atomic},
     fs::Fs,
-    manifest_blocks::writer::ManifestArchiveWriter,
+    manifest_blocks::{HEAD_FOOTER_RESERVED_SIZE, writer::ManifestArchiveWriter},
     runtime_config::RuntimeConfig,
     version::Version,
 };
@@ -53,22 +53,24 @@ pub fn persist_version(
     // runtime config.
     let mut writer = ManifestArchiveWriter::create(&path, fs, runtime, encryption)?;
     version.encode_into(&mut writer, comparator_name)?;
-    writer.finish()?;
+    let section_end = writer.finish()?;
 
     // IMPORTANT: fsync folder on Unix
     fsync_directory(folder, fs)?;
 
-    // Compute the file-level XXH3-128 of the just-written manifest
-    // for the CURRENT pointer's integrity check. Per-Block XXH3
-    // already verifies content on read; this file-level hash
-    // additionally defends against substitution of the whole file
-    // between persist and the next open (e.g., an attacker
-    // renaming v0 → v1 to roll back state). Manifest is small
-    // (KB-MB scale at most) so a second pass to hash it is cheap
-    // relative to the durability-critical fsync just performed.
-    // Shares `hash_file_xxh3` with the recovery path so both sides
-    // of the persist / verify contract stay in lockstep.
-    let checksum = hash_file_xxh3(fs, &path)?;
+    // Stamp the CURRENT pointer with an XXH3-128 over the section
+    // bytes ONLY — the [HEAD_FOOTER_RESERVED_SIZE, section_end)
+    // range. Excluding the head mirror + tail footer + size-hint
+    // trailer means a torn or bit-rotted tail that
+    // ManifestArchiveReader recovers through the head-mirror
+    // fallback does NOT trip the CURRENT pointer's integrity check
+    // first. The section bytes are the load-bearing content
+    // (per-Block XXH3 still catches in-section bit-rot at read
+    // time); the digest's job is whole-file substitution defence
+    // (an attacker renaming v0 over v1 to roll back state — the
+    // sections differ, the digest differs, the pointer rejects).
+    let section_length = section_end.saturating_sub(HEAD_FOOTER_RESERVED_SIZE);
+    let checksum = hash_file_range_xxh3(fs, &path, HEAD_FOOTER_RESERVED_SIZE, section_length)?;
 
     let mut current_file_content = vec![];
     current_file_content.write_u64::<LittleEndian>(version.id())?;

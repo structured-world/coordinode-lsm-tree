@@ -215,8 +215,15 @@ impl ManifestArchiveWriter {
     ///   cap is never reachable by legitimate production writers).
     /// - [`crate::Error::Io`] on writer / seek / sync failure.
     /// - Propagates Block I/O errors from the tail / head writes.
-    pub fn finish(mut self) -> crate::Result<()> {
+    ///
+    /// On success returns the byte offset of the first byte AFTER
+    /// the last section Block — i.e. the start of the tail footer
+    /// Block. The caller uses this to compute a "section bytes
+    /// only" digest for the CURRENT pointer (excluding the
+    /// recoverable footer + size-hint trailer + head mirror).
+    pub fn finish(mut self) -> crate::Result<u64> {
         self.flush_current_section()?;
+        let section_end = self.write_cursor;
 
         let mirror_enabled = self.runtime.manifest_footer_mirror;
         let flags = if mirror_enabled {
@@ -305,7 +312,7 @@ impl ManifestArchiveWriter {
         }
 
         self.file.sync_all()?;
-        Ok(())
+        Ok(section_end)
     }
 
     /// Flush the currently buffered section (if any) into a

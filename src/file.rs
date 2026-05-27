@@ -20,36 +20,64 @@ pub const TABLES_FOLDER: &str = "tables";
 pub const BLOBS_FOLDER: &str = "blobs";
 pub const CURRENT_VERSION_FILE: &str = "current";
 
-/// Stream a file through an XXH3-128 hasher in 64 KiB chunks.
+/// Stream a half-open byte range of a file through an XXH3-128
+/// hasher in 64 KiB chunks.
 ///
-/// Used by both [`crate::version::persist_version`] (to stamp the
-/// CURRENT pointer with the manifest's content hash) and
-/// [`crate::version::recovery::get_current_version`] (to re-verify
-/// that hash on open). Sharing one implementation across both sides
-/// keeps the persist / recover contract symmetric — bumping the
-/// digest algorithm here changes both at once.
+/// Used by [`crate::version::persist_version`] /
+/// [`crate::version::recovery::get_current_version`] to stamp +
+/// re-verify the CURRENT pointer with a digest over the manifest's
+/// *section* bytes (excluding the recoverable footer Block + tail
+/// size-hint + head mirror). Limiting the digest to the section
+/// region means tail corruption that
+/// [`crate::manifest_blocks::reader::ManifestArchiveReader`] can
+/// recover through the head mirror does not invalidate the
+/// CURRENT pointer first.
+///
+/// `start` is the byte offset to seek to; the function reads bytes
+/// `[start, start + length)`. Both sides of the persist / recover
+/// contract share one implementation so bumping the digest
+/// algorithm changes both at once.
 ///
 /// # Errors
 ///
-/// Returns [`std::io::Error`] on open / read failure, propagated
-/// through `crate::Error::Io`.
-pub fn hash_file_xxh3(fs: &dyn Fs, path: &Path) -> crate::Result<u128> {
+/// Returns [`std::io::Error`] on open / seek / read failure,
+/// propagated through `crate::Error::Io`.
+pub fn hash_file_range_xxh3(
+    fs: &dyn Fs,
+    path: &Path,
+    start: u64,
+    length: u64,
+) -> crate::Result<u128> {
     use crate::fs::FsOpenOptions;
-    use std::io::Read;
+    use std::io::{Read, Seek, SeekFrom};
     let mut file = fs.open(path, &FsOpenOptions::new().read(true))?;
+    file.seek(SeekFrom::Start(start))?;
     let mut hasher = xxhash_rust::xxh3::Xxh3Default::new();
     let mut buf = vec![0u8; 64 * 1024];
-    loop {
-        let n = file.read(&mut buf)?;
+    let mut remaining = length;
+    while remaining > 0 {
+        // Cap the read at the smaller of buffer size and remaining bytes.
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "min(remaining, buf.len()) fits in usize on every supported target"
+        )]
+        let want = remaining.min(buf.len() as u64) as usize;
+        // Safe slice: `want <= buf.len()` by construction above.
+        #[expect(
+            clippy::indexing_slicing,
+            reason = "want bounded by buf.len() by construction"
+        )]
+        let n = file.read(&mut buf[..want])?;
         if n == 0 {
             break;
         }
-        // `n` is bounded by `buf.len()` per the std::io::Read contract.
+        // Safe slice: `n <= want <= buf.len()` per std::io::Read::read.
         #[expect(
             clippy::indexing_slicing,
             reason = "n bounded by buf.len() per std::io::Read::read contract"
         )]
         hasher.update(&buf[..n]);
+        remaining -= n as u64;
     }
     Ok(hasher.digest128())
 }
