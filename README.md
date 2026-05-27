@@ -141,7 +141,7 @@ Failure-mode coverage with the defaults (mirror on, ECC off, AEAD off):
 - **Bit-flip inside one section Block** → XXH3 surfaces it, other sections + the footer Block still read correctly (per-section isolation; see [`manifest_blocks::reader::tests::reader_isolates_corruption_to_one_section_other_sections_readable`](src/manifest_blocks/reader.rs)).
 - **Tail footer Block corruption** → reader falls back to the head mirror at offset 0 and continues.
 - **Partial write mid-update** → reader falls back to the head mirror, which still holds the prior version's TOC, so the on-disk state rolls back to the last fully-committed version rather than refusing to open.
-- **File-level swap / rollback** → the `CURRENT` pointer carries an XXH3-128 of the referenced `v{N}` file; `Tree::open` re-hashes on read and refuses to follow a mismatched pointer.
+- **Accidental file substitution / mislinking** → the `CURRENT` pointer carries an XXH3-128 of the referenced `v{N}` section bytes; `Tree::open` re-hashes on read and refuses to follow a mismatched pointer. This catches restore/copy mishaps and half-applied snapshots, but XXH3-128 is **not** a cryptographic MAC: an adversary with write access can craft matching content. Enable `Config::encryption` (AEAD per Block) for adversarial tamper resistance.
 
 Turning ECC on (`page_ecc = true`) upgrades the first three rows from "detect and refuse" to "detect and recover" without any change to call sites — the Block layer transparently emits / consumes the parity trailer per Block.
 

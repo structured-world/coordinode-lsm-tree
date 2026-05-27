@@ -101,9 +101,15 @@ fn decode_blob_entry_payload(payload: &[u8]) -> crate::Result<(BlobFileId, Check
 /// recovered through the head mirror without first tripping the
 /// CURRENT-pointer validation. The section bytes themselves are
 /// the load-bearing content (per-Block XXH3 still catches
-/// in-section bit-rot at read time); the digest's job is whole-file
-/// substitution defence — an attacker renaming `v0` over `v1`
-/// produces different section bytes and is rejected here.
+/// in-section bit-rot at read time); the digest's job is accidental
+/// substitution / mislinking detection — e.g., a sysadmin renaming
+/// `v0` over `v1`, a copy/restore that picks the wrong file, or
+/// half-applied snapshot recovery. XXH3-128 is NOT a cryptographic
+/// MAC: an attacker with write access to both CURRENT and the
+/// manifest file can substitute matching content without detection.
+/// Adversarial tamper resistance is provided separately by the
+/// AEAD layer when `Config::encryption` is on; this digest's job
+/// is integrity, not authentication.
 pub fn get_current_version(
     folder: &Path,
     fs: &dyn Fs,

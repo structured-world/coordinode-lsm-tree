@@ -66,9 +66,13 @@ pub fn persist_version(
     // fallback does NOT trip the CURRENT pointer's integrity check
     // first. The section bytes are the load-bearing content
     // (per-Block XXH3 still catches in-section bit-rot at read
-    // time); the digest's job is whole-file substitution defence
-    // (an attacker renaming v0 over v1 to roll back state — the
-    // sections differ, the digest differs, the pointer rejects).
+    // time); the digest's job is detecting accidental substitution
+    // or mislinking — e.g., a copy/restore picking the wrong
+    // manifest, a half-applied snapshot recovery, or a sysadmin
+    // renaming v0 over v1. XXH3-128 is NOT a cryptographic MAC: an
+    // adversary with write access can craft matching content and
+    // bypass this check. For adversarial tamper resistance enable
+    // `Config::encryption` (AEAD authenticates every Block).
     let section_length = section_end.saturating_sub(HEAD_FOOTER_RESERVED_SIZE);
     let checksum = hash_file_range_xxh3(fs, &path, HEAD_FOOTER_RESERVED_SIZE, section_length)?;
 
