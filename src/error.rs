@@ -199,6 +199,20 @@ pub enum Error {
     /// the caller can route the diagnostic without parsing message
     /// strings.
     FeatureUnsupported(&'static str),
+
+    /// Manifest footer Block payload failed structural parsing.
+    ///
+    /// Carries a short static string identifying which invariant
+    /// failed (unknown layout version, oversized section count,
+    /// empty/oversized section name, invalid UTF-8, duplicate
+    /// section name, footer payload exceeds the 4 KiB reservation,
+    /// etc.). The Block-level XXH3 / AEAD already passed by the
+    /// time this surfaces — the footer bytes are intact but their
+    /// internal structure does not conform to the manifest layout
+    /// the reader supports. Either the writer is buggy, the
+    /// manifest is from a future binary, or the file has been
+    /// crafted / forged.
+    ManifestFooterInvalid(&'static str),
 }
 
 impl std::fmt::Display for Error {

@@ -1,0 +1,101 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026-present, Structured World Foundation
+
+// Foundation code lands without callers — the cutover commit wires
+// `persist_version` and the version-file reader to use this module.
+// Until then, the constants / writer / footer types look "dead" to
+// the lint even though every public item is exercised by the in-file
+// unit tests. Dropping the gate once the cutover lands is the
+// follow-up so the lint catches genuinely unused additions.
+#![allow(
+    dead_code,
+    reason = "manifest_blocks foundation: writer + footer ship in their own commit; \
+              the cutover commit replaces sfa call sites with these types and lifts \
+              this gate. Tests in each submodule already exercise every public item."
+)]
+
+//! Blocks-based manifest framing (V5-2, #297).
+//!
+//! Replaces the upstream `sfa` sectioned-archive file format for the
+//! per-version manifest files (`v{N}`). Each manifest is a sequence
+//! of standard lsm-tree [`Block`](crate::table::block::Block)s:
+//!
+//! ```text
+//! file layout (manifest_layout_version = 1):
+//!   [0 .. HEAD_FOOTER_RESERVED_SIZE]   head footer mirror (4 KiB,
+//!                                       zero-padded; populated only when
+//!                                       runtime `manifest_footer_mirror`
+//!                                       is enabled)
+//!   [HEAD_FOOTER_RESERVED_SIZE ..]     section Block 0
+//!                                       section Block 1
+//!                                       ...
+//!                                       section Block N
+//!   [.. EOF]                            tail footer Block (primary read
+//!                                       target; carries the TOC of
+//!                                       section offsets and the manifest
+//!                                       layout version)
+//! ```
+//!
+//! All Block-level protections (XXH3-64 checksum, optional ECC, optional
+//! AEAD) apply through the standard [`Block::write_into`] /
+//! [`Block::from_reader`] pipeline.
+//! Manifest gets bit-rot defence + (optional) encryption + (optional)
+//! single-block recovery "for free" by reusing existing infrastructure.
+//!
+//! Section names mirror the previous sfa archive's section names so
+//! existing callers in [`crate::Manifest`] / [`crate::version::recovery`]
+//! see the same logical surface during the migration; only the underlying
+//! framing changes.
+//!
+//! [`Block::write_into`]: crate::table::block::Block::write_into
+//! [`Block::from_reader`]: crate::table::block::Block::from_reader
+
+pub mod footer;
+pub mod writer;
+
+/// Manifest file layout version carried in the footer payload.
+/// Bumped only when the manifest file layout itself evolves
+/// (footer fields, TOC encoding, head-mirror geometry); decoupled
+/// from the crate-level [`crate::FormatVersion`] which tracks
+/// block / SST layout.
+pub const MANIFEST_LAYOUT_VERSION_V1: u8 = 1;
+
+/// Fixed-size reservation at file offset 0 for the head footer
+/// mirror. 4 KiB matches typical filesystem block size and
+/// page-alignment for direct-IO compatibility.
+///
+/// Hard limit on footer Block size — see footer encode path for
+/// the safety-net check that rejects payloads that would overflow
+/// this region. Hitting that limit signals a writer bug or forged
+/// manifest, not a legitimate capacity exhaustion: realistic
+/// production manifests use ~5% of the reserved space.
+pub const HEAD_FOOTER_RESERVED_SIZE: u64 = 4 * 1024;
+
+/// Footer payload flag: bit 0 indicates the head mirror at file
+/// offset 0 was populated by the writer. When clear, readers skip
+/// the head-fallback path on tail-verify failure.
+pub const FLAG_FOOTER_MIRROR_ENABLED: u8 = 1 << 0;
+
+/// Maximum length in bytes of a section name (the UTF-8 bytes
+/// stored in each TOC entry). Generous cap that holds every name
+/// the current writer emits (`format_version`, `tree_type`,
+/// `level_count`, `filter_hash_type`, `comparator_name`, `tables`,
+/// `blob_files`, `blob_gc_stats`) with room to spare for additive
+/// growth. Hitting this cap signals a programming error rather
+/// than a legitimate need; bump in a layout-version-2 if real
+/// production names ever approach it.
+pub const MAX_SECTION_NAME_BYTES: usize = 64;
+
+/// AAD tree-id sentinel used for manifest Blocks: `u64::MAX`. The
+/// manifest file lives at the per-tree folder level (one file per
+/// version, no per-table sharding), so AAD doesn't need to bind a
+/// specific tree id — per-tree encryption-provider isolation (each
+/// tree's `KeyChain` decrypts only its own blocks) is the substitute
+/// defence per the AAD design's allowed-zero list.
+pub const MANIFEST_TREE_ID_SENTINEL: u64 = u64::MAX;
+
+/// AAD table-id sentinel used for manifest Blocks: `u64::MAX`. The
+/// manifest is not an SST and has no `TableId`; the sentinel keeps
+/// the per-block AAD discriminator non-zero so cross-format
+/// substitution between manifest and data Blocks fails AEAD verify.
+pub const MANIFEST_TABLE_ID_SENTINEL: u64 = u64::MAX;

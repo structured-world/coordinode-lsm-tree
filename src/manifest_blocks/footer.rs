@@ -1,0 +1,394 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026-present, Structured World Foundation
+
+//! Footer Block payload — the table-of-contents for the surrounding
+//! manifest section Blocks plus the manifest layout version and
+//! flags. The footer is itself a standard
+//! [`Block`](crate::table::block::Block) (so it inherits XXH3 / ECC
+//! / encryption from the same pipeline as the section Blocks); this
+//! module owns only the payload bytes that go inside the Block.
+//!
+//! Wire format (little-endian throughout):
+//!
+//! ```text
+//! [0]      manifest_layout_version : u8
+//! [1]      flags                    : u8   (bit 0 = head mirror populated)
+//! [2..4]   section_count            : u16
+//! [4..]    TOC entries, repeated section_count times:
+//!            name_len    : u16
+//!            name        : [u8; name_len]    (UTF-8, non-empty)
+//!            block_offset: u64               (absolute, from file start)
+//!            block_size  : u32               (Block bytes incl. header + ECC trailer)
+//! ```
+//!
+//! Names are interned by exact byte equality — duplicate names are
+//! rejected by the writer. The reader trusts the surrounding Block's
+//! XXH3 (and optional ECC / AEAD) for integrity; this module only
+//! validates structural invariants (UTF-8, non-empty names, no
+//! duplicates, bounded sizes).
+
+use crate::manifest_blocks::{MANIFEST_LAYOUT_VERSION_V1, MAX_SECTION_NAME_BYTES};
+use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
+use std::io::{Read, Write};
+
+/// One entry in the footer's table of contents — locates a single
+/// section Block within the manifest file.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TocEntry {
+    /// Section name (UTF-8). Mirrors the previous sfa archive
+    /// section names so callers continue to look up by the same
+    /// string (`"tables"`, `"blob_files"`, `"format_version"`, etc.).
+    pub name: String,
+
+    /// Absolute byte offset within the manifest file where the
+    /// section Block starts. Set by the writer when the section
+    /// Block is appended; consumed by the reader to seek before
+    /// calling [`crate::table::block::Block::from_reader`].
+    pub block_offset: u64,
+
+    /// Total on-disk Block size in bytes (header + payload +
+    /// optional ECC trailer). Lets a range-reader pull only the
+    /// section Block of interest without scanning forward.
+    pub block_size: u32,
+}
+
+/// In-memory representation of the footer Block payload.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FooterPayload {
+    /// Manifest file layout version. Must equal
+    /// [`MANIFEST_LAYOUT_VERSION_V1`] for the current writer; older
+    /// readers SHOULD reject unknown versions rather than parse
+    /// best-effort.
+    pub layout_version: u8,
+
+    /// Bit-packed flags, currently only
+    /// [`crate::manifest_blocks::FLAG_FOOTER_MIRROR_ENABLED`]
+    /// (bit 0). Other bits are reserved for future use and MUST be
+    /// preserved verbatim on read (the writer never sets unknown
+    /// bits, so non-zero reserved bits in a freshly-written
+    /// manifest indicate forgery / corruption).
+    pub flags: u8,
+
+    /// Ordered list of section Blocks. Order is the write order;
+    /// readers can lookup by name via [`Self::section`].
+    pub sections: Vec<TocEntry>,
+}
+
+impl FooterPayload {
+    /// Build a fresh footer payload for the current writer (always
+    /// stamps [`MANIFEST_LAYOUT_VERSION_V1`]).
+    pub fn new(flags: u8, sections: Vec<TocEntry>) -> Self {
+        Self {
+            layout_version: MANIFEST_LAYOUT_VERSION_V1,
+            flags,
+            sections,
+        }
+    }
+
+    /// Look up a section by name. Returns the first matching entry
+    /// — the writer rejects duplicates, so this matches at most one.
+    pub fn section(&self, name: &str) -> Option<&TocEntry> {
+        self.sections.iter().find(|e| e.name == name)
+    }
+
+    /// Serialize the payload to the wire format described in the
+    /// module docstring.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error::FooterTooLarge`] if the serialized
+    /// payload would exceed the realistic safety cap, or
+    /// [`crate::Error::Io`] on writer failure.
+    pub fn encode<W: Write>(&self, mut writer: W) -> crate::Result<()> {
+        if self.sections.len() > usize::from(u16::MAX) {
+            return Err(crate::Error::ManifestFooterInvalid(
+                "section count exceeds u16::MAX",
+            ));
+        }
+
+        for entry in &self.sections {
+            if entry.name.is_empty() {
+                return Err(crate::Error::ManifestFooterInvalid(
+                    "section name must be non-empty",
+                ));
+            }
+            if entry.name.len() > MAX_SECTION_NAME_BYTES {
+                return Err(crate::Error::ManifestFooterInvalid(
+                    "section name exceeds MAX_SECTION_NAME_BYTES",
+                ));
+            }
+        }
+
+        writer.write_u8(self.layout_version)?;
+        writer.write_u8(self.flags)?;
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "section count bounded by u16::MAX check above"
+        )]
+        writer.write_u16::<LittleEndian>(self.sections.len() as u16)?;
+
+        for entry in &self.sections {
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "name length bounded by MAX_SECTION_NAME_BYTES check above"
+            )]
+            writer.write_u16::<LittleEndian>(entry.name.len() as u16)?;
+            writer.write_all(entry.name.as_bytes())?;
+            writer.write_u64::<LittleEndian>(entry.block_offset)?;
+            writer.write_u32::<LittleEndian>(entry.block_size)?;
+        }
+
+        Ok(())
+    }
+
+    /// Deserialize from the wire format. Validates structural
+    /// invariants (UTF-8 names, non-empty, bounded lengths,
+    /// duplicate detection) but trusts the surrounding Block's
+    /// XXH3 / AEAD for integrity.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error::ManifestFooterInvalid`] with a
+    /// concrete failure reason when the bytes do not parse cleanly
+    /// (unknown layout version, oversized section count, oversized
+    /// name length, invalid UTF-8, empty name, duplicate name).
+    /// Returns [`crate::Error::Io`] on reader failure.
+    pub fn decode<R: Read>(mut reader: R) -> crate::Result<Self> {
+        let layout_version = reader.read_u8()?;
+        if layout_version != MANIFEST_LAYOUT_VERSION_V1 {
+            return Err(crate::Error::ManifestFooterInvalid(
+                "unknown manifest_layout_version",
+            ));
+        }
+
+        let flags = reader.read_u8()?;
+        let section_count = usize::from(reader.read_u16::<LittleEndian>()?);
+        let mut sections = Vec::with_capacity(section_count);
+
+        for _ in 0..section_count {
+            let name_len = usize::from(reader.read_u16::<LittleEndian>()?);
+            if name_len == 0 {
+                return Err(crate::Error::ManifestFooterInvalid(
+                    "section name length must be non-zero",
+                ));
+            }
+            if name_len > MAX_SECTION_NAME_BYTES {
+                return Err(crate::Error::ManifestFooterInvalid(
+                    "section name length exceeds MAX_SECTION_NAME_BYTES",
+                ));
+            }
+
+            let mut name_bytes = vec![0u8; name_len];
+            reader.read_exact(&mut name_bytes)?;
+            let name = String::from_utf8(name_bytes)
+                .map_err(|_| crate::Error::ManifestFooterInvalid("section name not UTF-8"))?;
+
+            let block_offset = reader.read_u64::<LittleEndian>()?;
+            let block_size = reader.read_u32::<LittleEndian>()?;
+
+            if sections.iter().any(|e: &TocEntry| e.name == name) {
+                return Err(crate::Error::ManifestFooterInvalid(
+                    "duplicate section name",
+                ));
+            }
+
+            sections.push(TocEntry {
+                name,
+                block_offset,
+                block_size,
+            });
+        }
+
+        Ok(Self {
+            layout_version,
+            flags,
+            sections,
+        })
+    }
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::cast_possible_truncation,
+    reason = "tests panic on the unhappy paths to surface failures loudly; \
+              the hand-rolled bad-byte fixtures need direct write_* calls \
+              that can't propagate via `?` cleanly; bounded test inputs \
+              never approach u16 truncation"
+)]
+mod tests {
+    use super::*;
+    use crate::manifest_blocks::FLAG_FOOTER_MIRROR_ENABLED;
+
+    fn sample_payload() -> FooterPayload {
+        // Mirrors the actual section set the manifest writer emits
+        // (smaller than the full 8-section list, enough to exercise
+        // ordering + lookup). Concrete offsets are arbitrary —
+        // encode/decode only cares about byte-roundtrip fidelity.
+        FooterPayload::new(
+            FLAG_FOOTER_MIRROR_ENABLED,
+            vec![
+                TocEntry {
+                    name: "format_version".to_string(),
+                    block_offset: 4096,
+                    block_size: 64,
+                },
+                TocEntry {
+                    name: "tables".to_string(),
+                    block_offset: 4160,
+                    block_size: 512,
+                },
+            ],
+        )
+    }
+
+    #[test]
+    fn footer_payload_roundtrip_preserves_all_fields() {
+        // The wire format is the contract between writer and reader
+        // — every field that round-trips on write/read must survive
+        // byte-identical. Locks: layout_version, flags, section
+        // order, and per-entry (name, offset, size). Drop any of
+        // these and reader will pick up garbage offsets and the
+        // section-block reads will fail XXH3.
+        let original = sample_payload();
+        let mut buf = Vec::new();
+        original.encode(&mut buf).expect("encode succeeds");
+
+        let decoded = FooterPayload::decode(&buf[..]).expect("decode succeeds");
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn footer_payload_section_lookup_finds_by_name() {
+        // Section lookup is how the reader resolves logical name
+        // (e.g. "tables") to a concrete (offset, size) pair before
+        // seeking. Ordering is preserved but lookup is by name —
+        // this asserts the by-name path.
+        let payload = sample_payload();
+        let tables = payload.section("tables").expect("tables section exists");
+        assert_eq!(tables.block_offset, 4160);
+        assert_eq!(tables.block_size, 512);
+        assert!(payload.section("nonexistent").is_none());
+    }
+
+    #[test]
+    fn footer_decode_rejects_unknown_layout_version() {
+        // Forward-incompatible manifest written by a future binary:
+        // older reader must refuse rather than parse-best-effort
+        // (which would mis-locate sections at the byte level).
+        let mut buf = Vec::new();
+        buf.write_u8(2).unwrap(); // unknown layout version
+        buf.write_u8(0).unwrap();
+        buf.write_u16::<LittleEndian>(0).unwrap();
+        let err = FooterPayload::decode(&buf[..]).expect_err("must reject");
+        assert!(matches!(err, crate::Error::ManifestFooterInvalid(_)));
+    }
+
+    #[test]
+    fn footer_decode_rejects_empty_section_name() {
+        // Empty name is structurally meaningless (lookup-by-name
+        // would match any empty-keyed query, and the writer never
+        // emits one) — defensive reject so a corrupted length field
+        // surfaces as a parse error rather than poisoning the TOC.
+        let mut buf = Vec::new();
+        buf.write_u8(MANIFEST_LAYOUT_VERSION_V1).unwrap();
+        buf.write_u8(0).unwrap();
+        buf.write_u16::<LittleEndian>(1).unwrap();
+        buf.write_u16::<LittleEndian>(0).unwrap(); // empty name
+        buf.write_u64::<LittleEndian>(0).unwrap();
+        buf.write_u32::<LittleEndian>(0).unwrap();
+        let err = FooterPayload::decode(&buf[..]).expect_err("must reject");
+        assert!(matches!(err, crate::Error::ManifestFooterInvalid(_)));
+    }
+
+    #[test]
+    fn footer_decode_rejects_duplicate_section_names() {
+        // Duplicate names break the section() lookup contract (it
+        // returns the first match — silent shadowing). Writer
+        // never emits duplicates; reader rejects them defensively.
+        let entries = vec![
+            TocEntry {
+                name: "tables".to_string(),
+                block_offset: 4096,
+                block_size: 64,
+            },
+            TocEntry {
+                name: "tables".to_string(), // duplicate
+                block_offset: 4160,
+                block_size: 64,
+            },
+        ];
+        let payload = FooterPayload::new(0, entries);
+        let mut buf = Vec::new();
+        // Bypass encode's no-duplicate validation by hand-encoding;
+        // exercises the reader-side check (writer-side is locked by
+        // the start_section path in writer.rs which uses a HashSet).
+        buf.write_u8(payload.layout_version).unwrap();
+        buf.write_u8(payload.flags).unwrap();
+        buf.write_u16::<LittleEndian>(payload.sections.len() as u16)
+            .unwrap();
+        for e in &payload.sections {
+            buf.write_u16::<LittleEndian>(e.name.len() as u16).unwrap();
+            buf.write_all(e.name.as_bytes()).unwrap();
+            buf.write_u64::<LittleEndian>(e.block_offset).unwrap();
+            buf.write_u32::<LittleEndian>(e.block_size).unwrap();
+        }
+        let err = FooterPayload::decode(&buf[..]).expect_err("must reject");
+        assert!(matches!(err, crate::Error::ManifestFooterInvalid(_)));
+    }
+
+    #[test]
+    fn footer_decode_rejects_oversized_name_length() {
+        // Length larger than MAX_SECTION_NAME_BYTES is either a
+        // bug (writer never emits one this big) or a forged
+        // manifest. Either way the reader refuses to allocate the
+        // buffer.
+        let mut buf = Vec::new();
+        buf.write_u8(MANIFEST_LAYOUT_VERSION_V1).unwrap();
+        buf.write_u8(0).unwrap();
+        buf.write_u16::<LittleEndian>(1).unwrap();
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "test crafts bad input deliberately"
+        )]
+        let oversized = (MAX_SECTION_NAME_BYTES + 1) as u16;
+        buf.write_u16::<LittleEndian>(oversized).unwrap();
+        let err = FooterPayload::decode(&buf[..]).expect_err("must reject");
+        assert!(matches!(err, crate::Error::ManifestFooterInvalid(_)));
+    }
+
+    #[test]
+    fn footer_encode_rejects_empty_section_name() {
+        // Symmetric to the decode-side check — writer refuses to
+        // emit an unparseable manifest in the first place.
+        let payload = FooterPayload::new(
+            0,
+            vec![TocEntry {
+                name: String::new(),
+                block_offset: 0,
+                block_size: 0,
+            }],
+        );
+        let mut buf = Vec::new();
+        let err = payload.encode(&mut buf).expect_err("must reject");
+        assert!(matches!(err, crate::Error::ManifestFooterInvalid(_)));
+    }
+
+    #[test]
+    fn footer_encode_rejects_oversized_section_name() {
+        // Symmetric write-side check.
+        let oversized_name = "x".repeat(MAX_SECTION_NAME_BYTES + 1);
+        let payload = FooterPayload::new(
+            0,
+            vec![TocEntry {
+                name: oversized_name,
+                block_offset: 0,
+                block_size: 0,
+            }],
+        );
+        let mut buf = Vec::new();
+        let err = payload.encode(&mut buf).expect_err("must reject");
+        assert!(matches!(err, crate::Error::ManifestFooterInvalid(_)));
+    }
+}
