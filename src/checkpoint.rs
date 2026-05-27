@@ -793,13 +793,13 @@ mod tests {
 
     /// Regression: `write_current_for_version` used to trust the
     /// trailing 4-byte footer-size hint without validating it. A
-    /// zero hint (corrupted file) makes section_end equal to
-    /// file_len - 4, sweeping the trailer area into the CURRENT
-    /// checksum — the resulting pointer then fails get_current_version
+    /// zero hint (corrupted file) makes `section_end` equal to
+    /// `file_len` - 4, sweeping the trailer area into the CURRENT
+    /// checksum — the resulting pointer then fails `get_current_version`
     /// downstream and the failure mode is confusing (looks like
     /// pointer corruption, not manifest corruption). Same class of
     /// bug for an out-of-bounds hint (> 4 KiB). Real manifests cap
-    /// the footer at HEAD_FOOTER_RESERVED_SIZE = 4 KiB, so any
+    /// the footer at `HEAD_FOOTER_RESERVED_SIZE` = 4 KiB, so any
     /// hint outside [1, 4 KiB] is corruption and must surface
     /// loudly here.
     #[test]
