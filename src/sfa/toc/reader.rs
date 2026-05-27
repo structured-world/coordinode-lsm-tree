@@ -68,7 +68,12 @@ impl TocReader {
 
         let len = reader.read_u32::<LE>()?;
 
-        let mut entries = Vec::with_capacity(len as usize);
+        // Don't pre-allocate from a length field that has not yet
+        // been checksum-verified — a corrupted / forged TOC could
+        // force a multi-GiB Vec allocation before the per-entry
+        // reads fail. Grow the Vec amortized as entries are read;
+        // the per-entry I/O cost dwarfs the realloc cost.
+        let mut entries = Vec::new();
 
         for _ in 0..len {
             entries.push(TocEntry::read_from_file(&mut reader)?);

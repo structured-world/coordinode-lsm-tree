@@ -203,11 +203,13 @@ mod memtable;
 mod merge_operator;
 mod run_reader;
 mod run_scanner;
-// `std`-gated for the same reason: vendored sfa uses `std::io` /
-// `std::fs` / `std::path` directly. The blob-file consumers of sfa
-// are themselves std-only, so the gate is a no-op for every
-// existing caller.
-#[cfg(feature = "std")]
+// Vendored sfa is std-only internally (`std::io` / `std::fs` /
+// `std::path` references throughout) but is not feature-gated:
+// gating cascades into every blob-file / table / inspect consumer
+// of sfa, all of which are std-bound for unrelated reasons (file
+// I/O, Box<dyn FsFile>, etc.). The crate-wide no-std migration is
+// tracked incrementally; gating just sfa would force gates onto
+// many call sites without unblocking the no-std build today.
 #[doc(hidden)]
 pub mod sfa;
 

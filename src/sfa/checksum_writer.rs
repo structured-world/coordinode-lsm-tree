@@ -24,7 +24,21 @@ impl<W: std::io::Write> std::io::Write for ChecksummedWriter<W> {
     }
 
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.hasher.update(buf);
-        self.inner.write(buf)
+        // Hash only the bytes the inner writer actually accepted.
+        // A short write (`n < buf.len()`) followed by a retry would
+        // otherwise hash the unwritten tail twice — once on this
+        // call (`buf`), once on the retry (`&buf[n..]`) — silently
+        // diverging the running digest from the on-disk content.
+        // `inner.write` first so a failed write does not corrupt
+        // the hasher state.
+        let n = self.inner.write(buf)?;
+        // Safe slice: `n <= buf.len()` per `std::io::Write::write`
+        // contract.
+        #[expect(
+            clippy::indexing_slicing,
+            reason = "n bounded by buf.len() per std::io::Write::write contract"
+        )]
+        self.hasher.update(&buf[..n]);
+        Ok(n)
     }
 }

@@ -147,27 +147,29 @@ impl ManifestArchiveReader {
         let footer_transform = build_transform(&runtime, encryption.as_deref());
 
         // ---- Tail path (primary) ----------------------------------
-        let tail_result = read_tail_footer(&mut file, file_len, &footer_transform);
-        if let Ok(footer) = tail_result {
-            return Ok(Self {
-                path: path.to_path_buf(),
-                file,
-                footer,
-                source: FooterSource::Tail,
-                runtime,
-                encryption,
-            });
-        }
-        let tail_err = tail_result.err();
-        // We are about to retry from the head mirror; do not return
-        // the tail error yet. Log it at debug so operators can
-        // correlate corruption-matrix events without crashing.
-        if let Some(ref err) = tail_err {
-            log::debug!(
-                "manifest tail footer read failed for {}: {err:?}; trying head mirror",
-                path.display(),
-            );
-        }
+        let tail_err = match read_tail_footer(&mut file, file_len, &footer_transform) {
+            Ok(footer) => {
+                return Ok(Self {
+                    path: path.to_path_buf(),
+                    file,
+                    footer,
+                    source: FooterSource::Tail,
+                    runtime,
+                    encryption,
+                });
+            }
+            Err(err) => {
+                // We are about to retry from the head mirror; do not
+                // return the tail error yet. Log it at debug so
+                // operators can correlate corruption-matrix events
+                // without crashing.
+                log::debug!(
+                    "manifest tail footer read failed for {}: {err:?}; trying head mirror",
+                    path.display(),
+                );
+                err
+            }
+        };
 
         // ---- Head mirror (fallback) ------------------------------
         match read_head_footer(&mut file, &footer_transform) {

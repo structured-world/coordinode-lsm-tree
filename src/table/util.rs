@@ -55,13 +55,13 @@ pub fn load_block(
     log::trace!("load {block_type:?} block {handle:?}");
 
     // Invariant: manifest Blocks have their own reader path and
-    // never reach the SST block cache. Guard outside the metrics
-    // cfg so the contract holds on every build (the per-match
-    // `unreachable!()` arms below only fire when `metrics` is
-    // enabled, which would let the invariant silently disappear in
-    // non-metrics builds).
+    // never reach the SST block cache. Surface a typed error
+    // (rather than panic) so a caller that wires up an SST loader
+    // with a manifest BlockType gets a routable failure instead
+    // of a process abort. The check stays outside the metrics
+    // cfg so the contract holds on every build.
     if matches!(block_type, BlockType::Manifest | BlockType::ManifestFooter) {
-        unreachable!("manifest blocks are not loaded via the SST block cache");
+        return Err(crate::Error::InvalidTag(("BlockType", block_type.into())));
     }
 
     if let Some(block) = cache.get_block(table_id, handle.offset()) {
