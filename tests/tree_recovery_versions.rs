@@ -464,3 +464,58 @@ fn tree_open_with_page_ecc_on_feature_off_build_errors() {
         Err(e) => panic!("expected PageEccUnsupported, got {e:?}"),
     }
 }
+
+#[test]
+fn tree_open_with_missing_manifest_but_present_current_errors_not_recreates() -> lsm_tree::Result<()>
+{
+    // Regression: CURRENT pointing at a missing v{N} manifest file
+    // is half-applied recovery / corruption, NOT a fresh-init
+    // signal. Tree::open used to silently fall through its
+    // `Err(Io(NotFound)) => create_new` arm in this state because
+    // the manifest open inside `get_current_version` surfaced the
+    // same NotFound the CURRENT-absent path uses — and the
+    // has_existing_version_state probe didn't catch the case
+    // because CURRENT itself was still present. Result: opening a
+    // tree with a deleted manifest would clobber CURRENT with a
+    // fresh v0 instead of erroring, turning a recoverable failure
+    // into silent data loss. The fix in `get_current_version`
+    // rewraps the manifest open's NotFound as
+    // ManifestFooterInvalid so the outer Tree::open match never
+    // mistakes it for "no CURRENT".
+    let folder = get_tmp_folder();
+    let path = folder.path();
+
+    {
+        let tree = Config::new(
+            path,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .open()?;
+        tree.insert("k", "v", 0);
+        tree.flush_active_memtable(0)?;
+    }
+
+    let curr_version_id = File::open(path.join("current"))?.read_u64::<LittleEndian>()?;
+    let manifest_path = path.join(format!("v{curr_version_id}"));
+    std::fs::remove_file(&manifest_path)?;
+
+    let result = Config::new(
+        path,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .open();
+
+    match result {
+        Ok(_) => panic!(
+            "Tree::open with CURRENT present but manifest v{curr_version_id} deleted \
+             MUST surface an error — silently re-creating from scratch would clobber \
+             the user's CURRENT pointer and lose the half-applied recovery signal"
+        ),
+        Err(lsm_tree::Error::ManifestFooterInvalid(_)) => {}
+        Err(e) => panic!("expected ManifestFooterInvalid for missing manifest, got {e:?}"),
+    }
+
+    Ok(())
+}
