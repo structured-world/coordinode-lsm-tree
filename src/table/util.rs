@@ -78,6 +78,12 @@ pub fn load_block(
             BlockType::Data | BlockType::Meta => {
                 metrics.data_block_load_cached.fetch_add(1, Relaxed);
             }
+            // Manifest blocks live in the manifest file, are loaded
+            // by the manifest reader, and never go through this SST
+            // block cache — reaching this arm means a wiring bug.
+            BlockType::Manifest | BlockType::ManifestFooter => {
+                unreachable!("manifest blocks are not loaded via the SST block cache")
+            }
         }
 
         return Ok(block);
@@ -157,6 +163,11 @@ pub fn load_block(
             metrics
                 .data_block_io_requested
                 .fetch_add(handle.size().into(), Relaxed);
+        }
+        // See the cached-load arm above: manifest blocks have their
+        // own reader path and never reach this SST-cache loader.
+        BlockType::Manifest | BlockType::ManifestFooter => {
+            unreachable!("manifest blocks are not loaded via the SST block cache")
         }
     }
 

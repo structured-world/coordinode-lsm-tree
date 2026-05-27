@@ -140,6 +140,65 @@ pub struct RuntimeConfig {
     /// Independent from [`Self::block_checksum_algo`]. Default:
     /// [`ChecksumAlgorithm::Xxh3_64`].
     pub kv_checksum_algo: ChecksumAlgorithm,
+
+    /// When `true`, every manifest write reserves a 4 KiB region at
+    /// file offset 0 and, after writing the tail footer Block,
+    /// copies the footer Block bytes into that head region. On read,
+    /// the reader tries the tail footer first; if XXH3 verification
+    /// fails (partial write / tail bit-rot), it falls back to the
+    /// head mirror. Disabling this leaves the head region as zeros
+    /// — readers detect the absence by the zero magic and skip the
+    /// fallback path.
+    ///
+    /// Default: `true`. Cost when on: 4 KiB per manifest file
+    /// (negligible — manifests are KB-MB scale). Cost when off: no
+    /// recovery from partial mid-update or tail bit-rot.
+    ///
+    /// Toggle takes effect on the next manifest write. Existing
+    /// manifests are read transparently regardless of current
+    /// setting (the head region's contents are self-describing).
+    pub manifest_footer_mirror: bool,
+
+    /// When `true`, the manifest's `tables` / `blob_files` /
+    /// `blob_gc_stats` section Blocks use [`crate::table::block::
+    /// BlockType::Manifest`] payloads that carry per-entry XXH3
+    /// checksums in addition to the Block-level checksum, matching
+    /// `RocksDB` MANIFEST's per-record CRC32 granularity. When `false`,
+    /// only the Block-level checksum is used — bit-rot in any byte
+    /// of a section corrupts the whole section's recovery rather
+    /// than a single entry.
+    ///
+    /// Default: `true` (Benchmark Symmetry Invariant: match the
+    /// granularity `RocksDB` ships out-of-the-box, so apples-to-apples
+    /// benchmarks don't pay for an opt-in).
+    pub manifest_kv_checksums: bool,
+
+    /// Global default for Page ECC (Reed-Solomon `(4, 2)` parity
+    /// trailer) applied to ALL Blocks (data, index, filter, manifest).
+    /// Other `_ecc_override` fields fall back to this value when
+    /// `None`.
+    ///
+    /// Default: `false` (explicit opt-in; users pay nothing unless
+    /// they enable it). When `true`, every Block written carries
+    /// the parity trailer and gains single-block bit-flip recovery
+    /// on read at the cost of `≈ N/2 + small overhead` storage and
+    /// negligible compute.
+    pub page_ecc: bool,
+
+    /// Per-scope override for data Blocks: `None` inherits
+    /// [`Self::page_ecc`]; `Some(false)` disables ECC on data Blocks
+    /// even when [`Self::page_ecc`] is `true` (useful when callers
+    /// want manifest ECC for critical metadata but not the data-block
+    /// overhead). `Some(true)` is the inverse.
+    pub data_block_ecc_override: Option<bool>,
+
+    /// Per-scope override for the per-KV checksum region within
+    /// `DataKvChecked` Blocks (#298). `None` inherits
+    /// [`Self::page_ecc`]; `Some(false)` keeps the kv-checksum
+    /// region outside the parity calculation even when global ECC
+    /// is enabled (useful when the per-KV checksums themselves are
+    /// considered sufficient and ECC is wanted only on value bytes).
+    pub kv_checksums_ecc_override: Option<bool>,
 }
 
 impl Default for RuntimeConfig {
@@ -147,7 +206,37 @@ impl Default for RuntimeConfig {
         Self {
             block_checksum_algo: ChecksumAlgorithm::Xxh3_64,
             kv_checksum_algo: ChecksumAlgorithm::Xxh3_64,
+            manifest_footer_mirror: true,
+            manifest_kv_checksums: true,
+            page_ecc: false,
+            data_block_ecc_override: None,
+            kv_checksums_ecc_override: None,
         }
+    }
+}
+
+impl RuntimeConfig {
+    /// Effective Page ECC setting for data Blocks: the per-scope
+    /// override when set, else the global [`Self::page_ecc`] default.
+    #[must_use]
+    pub fn data_block_ecc(&self) -> bool {
+        self.data_block_ecc_override.unwrap_or(self.page_ecc)
+    }
+
+    /// Effective Page ECC setting for the per-KV checksum region
+    /// within `DataKvChecked` Blocks (#298): the per-scope override
+    /// when set, else the global [`Self::page_ecc`] default.
+    #[must_use]
+    pub fn kv_checksums_ecc(&self) -> bool {
+        self.kv_checksums_ecc_override.unwrap_or(self.page_ecc)
+    }
+
+    /// Effective Page ECC setting for manifest Blocks. No per-scope
+    /// override — manifest is critical metadata and always tracks the
+    /// global [`Self::page_ecc`] (per Q3 decision in the V5-2 issue).
+    #[must_use]
+    pub const fn manifest_ecc(&self) -> bool {
+        self.page_ecc
     }
 }
 
@@ -201,12 +290,86 @@ mod tests {
 
     #[test]
     fn runtime_config_default_uses_xxh3_64_everywhere() {
-        // Default RuntimeConfig must match RocksDB-like baseline
+        // Default RuntimeConfig must match `RocksDB`-like baseline
         // for benchmark symmetry (#353): block-level checksum on,
         // no per-KV machinery configured yet (downstream PRs add
         // policy fields). Both algo slots default to Xxh3_64.
         let cfg = RuntimeConfig::default();
         assert_eq!(cfg.block_checksum_algo, ChecksumAlgorithm::Xxh3_64);
         assert_eq!(cfg.kv_checksum_algo, ChecksumAlgorithm::Xxh3_64);
+    }
+
+    #[test]
+    fn runtime_config_default_manifest_safety_on() {
+        // Per V5-2 Q-decisions: manifest footer mirror and per-KV
+        // checksums default ON. Footer mirror gives partial-write
+        // recovery for ~4 KiB cost; per-KV checksums match `RocksDB`
+        // MANIFEST per-record CRC granularity so apples-to-apples
+        // benchmarks aren't paying for an opt-in we don't ship.
+        // Both defaults are load-bearing — flipping them silently
+        // would regress durability for new users.
+        let cfg = RuntimeConfig::default();
+        assert!(cfg.manifest_footer_mirror);
+        assert!(cfg.manifest_kv_checksums);
+    }
+
+    #[test]
+    fn runtime_config_default_page_ecc_off_with_no_overrides() {
+        // ECC is explicit opt-in per Q3: zero cost unless enabled.
+        // Per-scope overrides default to None (inherit global).
+        let cfg = RuntimeConfig::default();
+        assert!(!cfg.page_ecc);
+        assert_eq!(cfg.data_block_ecc_override, None);
+        assert_eq!(cfg.kv_checksums_ecc_override, None);
+    }
+
+    #[test]
+    fn runtime_config_ecc_helpers_inherit_global_when_no_override() {
+        // Helper methods are the call-site API for "should I emit
+        // ECC parity here". With no override, every scope tracks
+        // the global page_ecc flag.
+        let on = RuntimeConfig {
+            page_ecc: true,
+            ..RuntimeConfig::default()
+        };
+        assert!(on.data_block_ecc());
+        assert!(on.kv_checksums_ecc());
+        assert!(on.manifest_ecc());
+
+        let off = RuntimeConfig::default();
+        assert!(!off.data_block_ecc());
+        assert!(!off.kv_checksums_ecc());
+        assert!(!off.manifest_ecc());
+    }
+
+    #[test]
+    fn runtime_config_ecc_overrides_take_precedence_over_global() {
+        // Per Q3 refinement: per-scope override beats global. This
+        // is what enables "manifest-only ECC" (global ON, data
+        // override Some(false)) and "data without kv-checksum-region
+        // ECC" (global ON, kv override Some(false)). Manifest has no
+        // override knob — that's also locked in here.
+        let suppressed = RuntimeConfig {
+            page_ecc: true,
+            data_block_ecc_override: Some(false),
+            kv_checksums_ecc_override: Some(false),
+            ..RuntimeConfig::default()
+        };
+        assert!(!suppressed.data_block_ecc());
+        assert!(!suppressed.kv_checksums_ecc());
+        // Manifest ignores per-scope overrides — always tracks global.
+        assert!(suppressed.manifest_ecc());
+
+        let forced = RuntimeConfig {
+            page_ecc: false,
+            data_block_ecc_override: Some(true),
+            kv_checksums_ecc_override: Some(true),
+            ..RuntimeConfig::default()
+        };
+        assert!(forced.data_block_ecc());
+        assert!(forced.kv_checksums_ecc());
+        // Same for the inverse: manifest stays at global, which is
+        // off here, even when data + kv overrides force ECC on.
+        assert!(!forced.manifest_ecc());
     }
 }

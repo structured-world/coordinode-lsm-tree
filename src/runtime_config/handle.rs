@@ -167,6 +167,7 @@ mod tests {
         let handle = Arc::new(RuntimeConfigHandle::new(RuntimeConfig {
             block_checksum_algo: ChecksumAlgorithm::Xxh3_64,
             kv_checksum_algo: ChecksumAlgorithm::Xxh3_64,
+            ..RuntimeConfig::default()
         }));
 
         let barrier = Arc::new(Barrier::new(STRESS_READERS + 1));
