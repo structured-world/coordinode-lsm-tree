@@ -98,7 +98,6 @@ impl<W: Write + Seek> Writer<W> {
     /// # Errors
     ///
     /// Returns error, if an IO error occurred.
-    #[allow(clippy::missing_panics_doc)]
     pub fn finish(mut self) -> crate::sfa::Result<()> {
         log::trace!("Finishing archive");
 
@@ -128,7 +127,12 @@ impl<W: Write + Seek> Writer<W> {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::indexing_slicing)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::indexing_slicing,
+    reason = "vendored upstream tests use .unwrap() / buf[..] freely; \
+              keep verbatim so the upstream-sync diff stays mechanical"
+)]
 mod tests {
     use super::*;
     use crate::sfa::toc::reader::TocReader;

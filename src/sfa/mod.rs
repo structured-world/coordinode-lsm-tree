@@ -23,19 +23,14 @@
 //! provide. No external API surface — consumers reach this through
 //! callers in `vlog::blob_file::*` only.
 
-#![allow(
-    dead_code,
-    missing_docs,
-    clippy::expect_used,
-    clippy::missing_errors_doc,
-    clippy::must_use_candidate,
-    clippy::redundant_pub_crate,
-    reason = "vendored upstream code: keep verbatim where reasonable so the diff against \
-              upstream stays mechanical; the crate's own lint defaults are deny-heavy and \
-              would force a rewrite of upstream code rather than a faithful inline copy. \
-              Some upstream methods (Writer::finish, Reader::new) are not exercised by our \
-              in-tree consumers but stay verbatim so the upstream sync diff is a clean copy."
-)]
+// Vendored sfa: most lints triggered by upstream's coding style
+// have been driven to zero by the per-site fixes (typed errors
+// instead of expect, fully-documented exports, bounded
+// allocations); the module-level suppression list that previously
+// shielded those sites is now empty. Per-line `#[expect(...)]`
+// attributes remain on the few sites that genuinely still need
+// them — `#[expect]` will fire if any of those goes stale, which
+// is the migration signal we want.
 
 mod checksum;
 mod checksum_writer;

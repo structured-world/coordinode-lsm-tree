@@ -7,7 +7,7 @@ use crate::sfa::{Result, checksum::Checksum};
 use byteorder::ReadBytesExt;
 use std::io::{Read, Seek, SeekFrom};
 
-#[allow(clippy::cast_possible_wrap)]
+#[expect(clippy::cast_possible_wrap)]
 const TRAILER_SIZE: i64 = TRAILER_MAGIC.len() as i64 + 1 + 1 + 16 + 8 + 8;
 
 #[derive(Debug, Eq, PartialEq)]

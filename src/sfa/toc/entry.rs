@@ -35,7 +35,7 @@ impl TocEntry {
 
     /// Returns the section length in bytes.
     #[must_use]
-    #[allow(clippy::len_without_is_empty)]
+    #[expect(clippy::len_without_is_empty)]
     pub fn len(&self) -> u64 {
         self.len
     }
@@ -61,7 +61,7 @@ impl TocEntry {
         writer.write_u64::<LE>(self.len())?;
 
         writer.write_u16::<LE>(
-            #[allow(clippy::expect_used)]
+            #[expect(clippy::expect_used)]
             u16::try_from(self.name().len()).expect("section name should not be longer than 65535"),
         )?;
         writer.write_all(self.name())?;
