@@ -94,15 +94,21 @@ fn decode_blob_entry_payload(payload: &[u8]) -> crate::Result<(BlobFileId, Check
 /// against the stamped checksum. Mismatch surfaces as
 /// [`crate::Error::ChecksumMismatch`].
 ///
-/// The section-only range matters because a torn / bit-rotted tail
-/// footer can be recovered by [`crate::manifest_blocks::reader::
-/// ManifestArchiveReader`] through the head-mirror fallback;
-/// hashing the whole file would invalidate the CURRENT pointer
-/// before that fallback ever runs. Hashing only the section region
-/// keeps the substitution defence intact (a swapped `v{N}` file has
-/// different section bytes) while leaving the footer recovery path
-/// usable.
-pub fn get_current_version(folder: &Path, fs: &dyn Fs) -> crate::Result<VersionId> {
+/// The `section_end` boundary is derived via
+/// [`ManifestArchiveReader::open`](crate::manifest_blocks::reader::ManifestArchiveReader::open)
+/// so the tail-first / head-mirror-fallback recovery path applies
+/// here too: a torn or corrupted trailing size-hint can be
+/// recovered through the head mirror without first tripping the
+/// CURRENT-pointer validation. The section bytes themselves are
+/// the load-bearing content (per-Block XXH3 still catches
+/// in-section bit-rot at read time); the digest's job is whole-file
+/// substitution defence — an attacker renaming `v0` over `v1`
+/// produces different section bytes and is rejected here.
+pub fn get_current_version(
+    folder: &Path,
+    fs: &dyn Fs,
+    encryption: Option<std::sync::Arc<dyn crate::encryption::EncryptionProvider>>,
+) -> crate::Result<VersionId> {
     use byteorder::{LittleEndian, ReadBytesExt};
 
     let path = folder.join(CURRENT_VERSION_FILE);
@@ -120,28 +126,36 @@ pub fn get_current_version(folder: &Path, fs: &dyn Fs) -> crate::Result<VersionI
 
     let manifest_path = folder.join(format!("v{version_id}"));
 
-    // Locate the end of the section region (= start of the tail
-    // footer Block) by reading the trailing 4-byte size hint. The
-    // hint is the last bytes of the file: file_len - 4 .. file_len.
-    // section_end = file_len - 4 - footer_size.
-    let file_len = fs.metadata(&manifest_path)?.len;
-    if file_len
-        < crate::manifest_blocks::HEAD_FOOTER_RESERVED_SIZE
-            + crate::manifest_blocks::TAIL_FOOTER_SIZE_HINT_BYTES
-    {
-        return Err(crate::Error::Unrecoverable);
-    }
-    let mut manifest_file = fs.open(&manifest_path, &FsOpenOptions::new().read(true))?;
-    manifest_file.seek(std::io::SeekFrom::Start(
-        file_len - crate::manifest_blocks::TAIL_FOOTER_SIZE_HINT_BYTES,
-    ))?;
-    let footer_size = u64::from(manifest_file.read_u32::<LittleEndian>()?);
-    drop(manifest_file);
+    // Open the manifest through the tail-first / head-mirror-fallback
+    // reader so a torn trailing size-hint that the reader can still
+    // recover does not invalidate the CURRENT pointer first. The
+    // parsed footer's TOC gives us every section's
+    // `(block_offset, block_size)`; `section_end` is the maximum of
+    // `block_offset + block_size` across the TOC. The runtime
+    // snapshot is a placeholder default — get_current_version runs
+    // before any Tree exists, and the reader's ECC decisions are
+    // per-Block self-describing via the Block header (not driven by
+    // the supplied runtime), so the placeholder is safe.
+    let archive = crate::manifest_blocks::reader::ManifestArchiveReader::open(
+        &manifest_path,
+        fs,
+        std::sync::Arc::new(crate::runtime_config::RuntimeConfig::default()),
+        encryption,
+    )?;
 
-    let section_end = file_len
-        .checked_sub(crate::manifest_blocks::TAIL_FOOTER_SIZE_HINT_BYTES)
-        .and_then(|x| x.checked_sub(footer_size))
-        .ok_or(crate::Error::Unrecoverable)?;
+    let section_end = archive
+        .footer()
+        .sections
+        .iter()
+        .try_fold(0_u64, |acc, e| {
+            e.block_offset
+                .checked_add(u64::from(e.block_size))
+                .ok_or(crate::Error::ManifestFooterInvalid(
+                    "TOC entry offset + size overflows u64",
+                ))
+                .map(|end| acc.max(end))
+        })?
+        .max(crate::manifest_blocks::HEAD_FOOTER_RESERVED_SIZE);
     let section_start = crate::manifest_blocks::HEAD_FOOTER_RESERVED_SIZE;
     let section_length = section_end.saturating_sub(section_start);
 
@@ -263,7 +277,7 @@ pub fn recover(
         crate::version::framing::FRAME_HEADER_LEN as u64 + BLOB_ENTRY_PAYLOAD_LEN as u64;
     use crate::version::framing::FramedRecordOutcome;
 
-    let curr_version_id = get_current_version(folder, fs)?;
+    let curr_version_id = get_current_version(folder, fs, encryption.clone())?;
     let version_file_path = folder.join(format!("v{curr_version_id}"));
 
     log::info!(

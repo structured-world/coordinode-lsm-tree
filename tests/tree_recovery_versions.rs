@@ -81,11 +81,17 @@ fn rewrite_manifest_format_version(path: &Path, version: u8) -> lsm_tree::Result
     use std::io::Seek as _;
     let file_len = std::fs::metadata(&manifest_path)?.len();
     let mut mf = std::fs::File::open(&manifest_path)?;
-    mf.seek(std::io::SeekFrom::Start(file_len - 4))?;
+    mf.seek(std::io::SeekFrom::Start(
+        file_len - lsm_tree::manifest_blocks::TAIL_FOOTER_SIZE_HINT_BYTES,
+    ))?;
     let footer_size = u64::from(mf.read_u32::<byteorder::LittleEndian>()?);
     drop(mf);
-    let head_reservation = 4096_u64;
-    let section_end = file_len - 4 - footer_size;
+    // Use the production constants so a future bump of the head
+    // reservation or size-hint width doesn't quietly desync this
+    // test fixture.
+    let head_reservation = lsm_tree::manifest_blocks::HEAD_FOOTER_RESERVED_SIZE;
+    let section_end =
+        file_len - lsm_tree::manifest_blocks::TAIL_FOOTER_SIZE_HINT_BYTES - footer_size;
     let section_length = section_end.saturating_sub(head_reservation);
     let checksum = lsm_tree::file::hash_file_range_xxh3(
         &lsm_tree::fs::StdFs,

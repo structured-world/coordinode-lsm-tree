@@ -1737,7 +1737,11 @@ impl Tree {
         // Decide between recovery and fresh creation atomically by attempting
         // to read the CURRENT version file. This avoids a TOCTOU race that
         // would occur if we probed with exists() first.
-        let tree = match crate::version::recovery::get_current_version(&config.path, &*config.fs) {
+        let tree = match crate::version::recovery::get_current_version(
+            &config.path,
+            &*config.fs,
+            config.encryption.clone(),
+        ) {
             Ok(_) => Self::recover(config),
             Err(crate::Error::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
                 // Missing CURRENT MUST coincide with a directory that
@@ -1928,6 +1932,13 @@ impl Tree {
     /// # Errors
     ///
     /// Returns error, if an IO error occurred.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "Tree::recover threads the whole open sequence (CURRENT validation, \
+                  Manifest decode, encryption + runtime plumbing, version recovery, \
+                  TreeInner assembly) — splitting it would create helper functions whose \
+                  only caller is this one site"
+    )]
     fn recover(mut config: Config) -> crate::Result<Self> {
         use crate::stop_signal::StopSignal;
         use inner::get_next_tree_id;
@@ -1942,8 +1953,11 @@ impl Tree {
         // recover_levels for table/blob data). This is intentional — metadata
         // validation must complete before any disk-mutating recovery work.
         {
-            let version_id =
-                crate::version::recovery::get_current_version(&config.path, &*config.fs)?;
+            let version_id = crate::version::recovery::get_current_version(
+                &config.path,
+                &*config.fs,
+                config.encryption.clone(),
+            )?;
             let manifest_path = config.path.join(format!("v{version_id}"));
             // Open the manifest with a default runtime snapshot:
             // ECC awareness is captured per-Block via the header
