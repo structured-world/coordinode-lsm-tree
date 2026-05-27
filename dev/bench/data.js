@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779866019498,
+  "lastUpdate": 1779866084129,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -10764,6 +10764,84 @@ window.BENCHMARK_DATA = {
             "value": 453785.140636308,
             "unit": "ops/sec",
             "extra": "P50: 2.0us | P99: 5.6us | P99.9: 8.1us\nthreads: 1 | elapsed: 0.44s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "49699333+dependabot[bot]@users.noreply.github.com",
+            "name": "dependabot[bot]",
+            "username": "dependabot[bot]"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "208cefcb2f6d966dd5d8a97bb6b1655371f811bd",
+          "message": "chore(deps): update aes-gcm requirement from =0.11.0-rc.3 to =0.11.0-rc.4 (#356)\n\nUpdates the requirements on\n[aes-gcm](https://github.com/RustCrypto/AEADs) to permit the latest\nversion.\n<details>\n<summary>Commits</summary>\n<ul>\n<li><a\nhref=\"https://github.com/RustCrypto/AEADs/commit/2ae7657cc4b10fafdd99434e53c7d5ac847a79c4\"><code>2ae7657</code></a>\naes-gcm v0.11.0-rc.4 (<a\nhref=\"https://redirect.github.com/RustCrypto/AEADs/issues/828\">#828</a>)</li>\n<li><a\nhref=\"https://github.com/RustCrypto/AEADs/commit/50a485ffd90d0e2de43b306366977dc0d9c182ff\"><code>50a485f</code></a>\nchacha20poly1305: bump <code>poly1305</code> dependency to v0.9 (<a\nhref=\"https://redirect.github.com/RustCrypto/AEADs/issues/823\">#823</a>)</li>\n<li><a\nhref=\"https://github.com/RustCrypto/AEADs/commit/9d05d810c81719a8859d960220a637da8a2cdcd1\"><code>9d05d81</code></a>\nUse release versions of dependencies (<a\nhref=\"https://redirect.github.com/RustCrypto/AEADs/issues/821\">#821</a>)</li>\n<li><a\nhref=\"https://github.com/RustCrypto/AEADs/commit/37bd4e2a0718f08a57c86b41079c574009bba9cb\"><code>37bd4e2</code></a>\nCargo.lock: bump dependencies (<a\nhref=\"https://redirect.github.com/RustCrypto/AEADs/issues/817\">#817</a>)</li>\n<li><a\nhref=\"https://github.com/RustCrypto/AEADs/commit/ed495db0ffff350654e3fbc47ee2a080c1bad164\"><code>ed495db</code></a>\neax: simplify tag computation (<a\nhref=\"https://redirect.github.com/RustCrypto/AEADs/issues/805\">#805</a>)</li>\n<li><a\nhref=\"https://github.com/RustCrypto/AEADs/commit/e6a9c31a8346e67d52e140c5cb028111b8ec7df4\"><code>e6a9c31</code></a>\nbuild(deps): bump poly1305 from 0.9.0-rc.5 to 0.9.0-rc.6 (<a\nhref=\"https://redirect.github.com/RustCrypto/AEADs/issues/800\">#800</a>)</li>\n<li><a\nhref=\"https://github.com/RustCrypto/AEADs/commit/090bd1b27b8745e039bfd1a817771af44d7cc31b\"><code>090bd1b</code></a>\nbuild(deps): bump ghash from 0.6.0-rc.5 to 0.6.0-rc.6 (<a\nhref=\"https://redirect.github.com/RustCrypto/AEADs/issues/801\">#801</a>)</li>\n<li><a\nhref=\"https://github.com/RustCrypto/AEADs/commit/291d34ddbfe5a2919f662d0b68650ebc9d479718\"><code>291d34d</code></a>\nbelt-dwp: remove use of <code>opaque-debug</code> (<a\nhref=\"https://redirect.github.com/RustCrypto/AEADs/issues/797\">#797</a>)</li>\n<li><a\nhref=\"https://github.com/RustCrypto/AEADs/commit/d50ba3beb39a50dfb5d0364e43546d346d35557e\"><code>d50ba3b</code></a>\nbuild(deps): bump chacha20 from 0.10.0-rc.10 to 0.10 (<a\nhref=\"https://redirect.github.com/RustCrypto/AEADs/issues/796\">#796</a>)</li>\n<li><a\nhref=\"https://github.com/RustCrypto/AEADs/commit/ff5d17903e46d230fd72505646b861e356f4eba2\"><code>ff5d179</code></a>\nBump <code>cipher</code> to v0.5 (<a\nhref=\"https://redirect.github.com/RustCrypto/AEADs/issues/793\">#793</a>)</li>\n<li>Additional commits viewable in <a\nhref=\"https://github.com/RustCrypto/AEADs/compare/aes-gcm-v0.11.0-rc.3...aes-gcm-v0.11.0-rc.4\">compare\nview</a></li>\n</ul>\n</details>\n<br />\n\n\nDependabot will resolve any conflicts with this PR as long as you don't\nalter it yourself. You can also trigger a rebase manually by commenting\n`@dependabot rebase`.\n\n[//]: # (dependabot-automerge-start)\n[//]: # (dependabot-automerge-end)\n\n---\n\n<details>\n<summary>Dependabot commands and options</summary>\n<br />\n\nYou can trigger Dependabot actions by commenting on this PR:\n- `@dependabot rebase` will rebase this PR\n- `@dependabot recreate` will recreate this PR, overwriting any edits\nthat have been made to it\n- `@dependabot show <dependency name> ignore conditions` will show all\nof the ignore conditions of the specified dependency\n- `@dependabot ignore this major version` will close this PR and stop\nDependabot creating any more for this major version (unless you reopen\nthe PR or upgrade to it yourself)\n- `@dependabot ignore this minor version` will close this PR and stop\nDependabot creating any more for this minor version (unless you reopen\nthe PR or upgrade to it yourself)\n- `@dependabot ignore this dependency` will close this PR and stop\nDependabot creating any more for this dependency (unless you reopen the\nPR or upgrade to it yourself)\n\n\n</details>\n\nSigned-off-by: dependabot[bot] <support@github.com>\nCo-authored-by: dependabot[bot] <49699333+dependabot[bot]@users.noreply.github.com>",
+          "timestamp": "2026-05-27T10:12:13+03:00",
+          "tree_id": "6623594331fe469217c98c88ec11cb550b1c560f",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/208cefcb2f6d966dd5d8a97bb6b1655371f811bd"
+        },
+        "date": 1779866083152,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 1929225.755113671,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.7us | P99.9: 3.7us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1225504.9967545872,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.2us | P99.9: 4.3us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 513095.78476214706,
+            "unit": "ops/sec",
+            "extra": "P50: 1.8us | P99: 5.3us | P99.9: 7.8us\nthreads: 1 | elapsed: 0.39s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3606596.68895309,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 3.2us | P99.9: 5.6us\nthreads: 1 | elapsed: 0.06s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 383563.7413513089,
+            "unit": "ops/sec",
+            "extra": "P50: 2.3us | P99: 5.7us | P99.9: 8.6us\nthreads: 1 | elapsed: 0.52s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 199727.15592792135,
+            "unit": "ops/sec",
+            "extra": "P50: 4.7us | P99: 6.0us | P99.9: 8.4us\nthreads: 1 | elapsed: 1.00s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1257717.5197767748,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.3us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1120586.5607258156,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 1.5us | P99.9: 2.2us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 452688.41862433945,
+            "unit": "ops/sec",
+            "extra": "P50: 2.0us | P99: 6.9us | P99.9: 10.0us\nthreads: 1 | elapsed: 0.44s | num: 200000 | iterations: 3"
           }
         ]
       }
