@@ -87,8 +87,12 @@ fn decode_blob_entry_payload(payload: &[u8]) -> crate::Result<(BlobFileId, Check
 /// The file format is: `version_id: u64 | checksum: u128 | checksum_type: u8`
 /// (25 bytes total, written atomically by `rewrite_atomic`).
 ///
-/// Returns the version ID after verifying the checksum type tag is valid.
-/// The checksum field is read from disk but is not validated here.
+/// Reads the version id, then re-hashes the referenced `v{id}` manifest
+/// file and compares the result against the stamped checksum. A mismatch
+/// surfaces as [`crate::Error::ChecksumMismatch`] — a file-level swap
+/// or roll-back (e.g., manually renaming `v0` over `v1`) is detected
+/// before any of the per-block XXH3 verification fires inside the
+/// manifest reader.
 pub fn get_current_version(folder: &Path, fs: &dyn Fs) -> crate::Result<VersionId> {
     use byteorder::{LittleEndian, ReadBytesExt};
 
@@ -96,13 +100,28 @@ pub fn get_current_version(folder: &Path, fs: &dyn Fs) -> crate::Result<VersionI
     let mut file = fs.open(&path, &FsOpenOptions::new().read(true))?;
 
     let version_id = file.read_u64::<LittleEndian>()?;
-    let _checksum = file.read_u128::<LittleEndian>()?;
+    let stored_checksum = file.read_u128::<LittleEndian>()?;
     let checksum_type = file.read_u8()?;
 
     // Validate checksum type tag — a non-zero value indicates corruption
     // or a file from an incompatible version (only xxh3 = 0 is supported).
     if checksum_type != 0 {
         return Err(crate::Error::InvalidTag(("ChecksumType", checksum_type)));
+    }
+
+    // Re-hash the manifest file the pointer references and compare it
+    // against the stamped XXH3-128 from CURRENT. Closes the substitution
+    // window where an attacker (or accidental `mv v0 v1`) swaps the
+    // version file under us: per-Block XXH3 catches in-block bit-rot
+    // but cannot tell two-different-but-individually-valid manifests
+    // apart on its own.
+    let manifest_path = folder.join(format!("v{version_id}"));
+    let computed = crate::file::hash_file_xxh3(fs, &manifest_path)?;
+    if computed != stored_checksum {
+        return Err(crate::Error::ChecksumMismatch {
+            got: Checksum::from_raw(computed),
+            expected: Checksum::from_raw(stored_checksum),
+        });
     }
 
     Ok(version_id)
@@ -1006,14 +1025,26 @@ mod tests {
     use std::io::Write;
 
     /// Write a CURRENT pointer so `recover()` can find the version file.
+    ///
+    /// Must be called AFTER the `v{id}` manifest file exists — the
+    /// pointer's checksum field is computed from the manifest's
+    /// current bytes via [`crate::file::hash_file_xxh3`]. Fixtures
+    /// that test corruption-recovery typically write the corrupted
+    /// manifest first, then call this to stamp the CURRENT pointer
+    /// with the hash of the (intentionally) corrupted bytes — that
+    /// way `get_current_version` accepts the pointer and corruption
+    /// is exposed by the manifest-decode path, not the pointer-
+    /// validation path.
     fn write_current(folder: &Path, version_id: u64, fs: &dyn Fs) -> crate::Result<()> {
+        let manifest_path = folder.join(format!("v{version_id}"));
+        let checksum = crate::file::hash_file_xxh3(fs, &manifest_path)?;
         let path = folder.join(CURRENT_VERSION_FILE);
         let mut f = fs.open(
             &path,
             &FsOpenOptions::new().write(true).create(true).truncate(true),
         )?;
         f.write_u64::<LittleEndian>(version_id)?;
-        f.write_u128::<LittleEndian>(0)?; // checksum placeholder
+        f.write_u128::<LittleEndian>(checksum)?;
         f.write_u8(0)?; // checksum type
         Ok(())
     }
@@ -1107,8 +1138,8 @@ mod tests {
         let folder = Path::new("/corrupt/tables");
         fs.create_dir_all(folder)?;
 
-        write_current(folder, 1, &fs)?;
         write_corrupt_table_count(folder, 1, &fs)?;
+        write_current(folder, 1, &fs)?;
 
         let Err(err) = recover(folder, &fs, ManifestRecoveryMode::AbsoluteConsistency) else {
             panic!("corrupt table_count should fail");
@@ -1127,8 +1158,8 @@ mod tests {
         let folder = Path::new("/corrupt/blobs");
         fs.create_dir_all(folder)?;
 
-        write_current(folder, 1, &fs)?;
         write_corrupt_blob_count(folder, 1, &fs)?;
+        write_current(folder, 1, &fs)?;
 
         let Err(err) = recover(folder, &fs, ManifestRecoveryMode::AbsoluteConsistency) else {
             panic!("corrupt blob_file_count should fail");
@@ -1195,9 +1226,9 @@ mod tests {
         let folder = Path::new("/absolute/tail");
         fs.create_dir_all(folder)?;
 
-        write_current(folder, 1, &fs)?;
         // Section declares 5 entries, only 1 actually written.
         write_truncated_tables_tail(folder, 1, 5, 1, &fs)?;
+        write_current(folder, 1, &fs)?;
 
         let result = recover(folder, &fs, ManifestRecoveryMode::AbsoluteConsistency);
         let err = result.expect_err("truncated tail must abort under AbsoluteConsistency");
@@ -1218,10 +1249,10 @@ mod tests {
         let folder = Path::new("/tolerate/tail");
         fs.create_dir_all(folder)?;
 
-        write_current(folder, 1, &fs)?;
         // Section declares 5 entries, only 1 actually written → expect
         // 1 entry recovered, 4 silently dropped + warn logged.
         write_truncated_tables_tail(folder, 1, 5, 1, &fs)?;
+        write_current(folder, 1, &fs)?;
 
         let recovery = recover(
             folder,
@@ -1258,7 +1289,6 @@ mod tests {
         let folder = Path::new("/tolerate/bad_tag");
         fs.create_dir_all(folder)?;
 
-        write_current(folder, 1, &fs)?;
         let mut w = open_fixture_writer(folder, 1, &fs)?;
         write_tree_type(&mut w)?;
         w.start("tables")?;
@@ -1291,6 +1321,7 @@ mod tests {
         w.start("blob_gc_stats")?;
         w.write_u32::<LittleEndian>(0)?;
         w.finish()?;
+        write_current(folder, 1, &fs)?;
 
         let result = recover(
             folder,
@@ -1351,8 +1382,8 @@ mod tests {
         let folder = Path::new("/tolerate/midlevel");
         fs.create_dir_all(folder)?;
 
-        write_current(folder, 1, &fs)?;
         write_truncated_at_second_run(folder, 1, &fs)?;
+        write_current(folder, 1, &fs)?;
 
         let recovery = recover(
             folder,
@@ -1426,8 +1457,8 @@ mod tests {
         let folder = Path::new("/tolerate/blob_tail");
         fs.create_dir_all(folder)?;
 
-        write_current(folder, 1, &fs)?;
         write_truncated_blob_tail(folder, 1, 5, 1, &fs)?;
+        write_current(folder, 1, &fs)?;
 
         let recovery = recover(
             folder,
@@ -1478,8 +1509,8 @@ mod tests {
         let fs = MemFs::new();
         let folder = Path::new("/tolerate/gc_stats");
         fs.create_dir_all(folder)?;
-        write_current(folder, 1, &fs)?;
         write_truncated_blob_gc_stats(folder, 1, &fs)?;
+        write_current(folder, 1, &fs)?;
 
         // Strict mode: hard fail.
         let strict = recover(folder, &fs, ManifestRecoveryMode::AbsoluteConsistency);
@@ -1597,8 +1628,8 @@ mod tests {
         let fs = MemFs::new();
         let folder = Path::new("/absolute/mid_corrupt");
         fs.create_dir_all(folder)?;
-        write_current(folder, 1, &fs)?;
         write_manifest_with_mid_record_corruption(folder, 1, &fs)?;
+        write_current(folder, 1, &fs)?;
 
         let err = recover(folder, &fs, ManifestRecoveryMode::AbsoluteConsistency)
             .expect_err("corrupt record must abort AbsoluteConsistency");
@@ -1620,8 +1651,8 @@ mod tests {
         let fs = MemFs::new();
         let folder = Path::new("/pit/mid_corrupt");
         fs.create_dir_all(folder)?;
-        write_current(folder, 1, &fs)?;
         write_manifest_with_mid_record_corruption(folder, 1, &fs)?;
+        write_current(folder, 1, &fs)?;
 
         let recovery = recover(folder, &fs, ManifestRecoveryMode::PointInTimeRecovery)?;
 
@@ -1661,8 +1692,8 @@ mod tests {
         let fs = MemFs::new();
         let folder = Path::new("/skip_any/mid_corrupt");
         fs.create_dir_all(folder)?;
-        write_current(folder, 1, &fs)?;
         write_manifest_with_mid_record_corruption(folder, 1, &fs)?;
+        write_current(folder, 1, &fs)?;
 
         let recovery = recover(folder, &fs, ManifestRecoveryMode::SkipAnyCorruptedRecords)?;
 
@@ -1752,8 +1783,8 @@ mod tests {
         let fs = MemFs::new();
         let folder = Path::new("/skip_any/blob_mid_corrupt");
         fs.create_dir_all(folder)?;
-        write_current(folder, 1, &fs)?;
         write_manifest_with_corrupt_blob_record(folder, 1, &fs)?;
+        write_current(folder, 1, &fs)?;
 
         let recovery = recover(folder, &fs, ManifestRecoveryMode::SkipAnyCorruptedRecords)?;
         let ids: Vec<u64> = recovery.blob_file_ids.iter().map(|(id, _)| *id).collect();
@@ -1834,8 +1865,8 @@ mod tests {
         let fs = MemFs::new();
         let folder = Path::new("/pit/empty_run");
         fs.create_dir_all(folder)?;
-        write_current(folder, 1, &fs)?;
         write_manifest_with_corrupt_first_record_of_second_level(folder, 1, &fs)?;
+        write_current(folder, 1, &fs)?;
 
         let recovery = recover(folder, &fs, ManifestRecoveryMode::PointInTimeRecovery)?;
 
@@ -1919,8 +1950,8 @@ mod tests {
         let fs = MemFs::new();
         let folder = Path::new("/skip_any/all_corrupt_run");
         fs.create_dir_all(folder)?;
-        write_current(folder, 1, &fs)?;
         write_manifest_with_all_records_in_run_corrupt(folder, 1, &fs)?;
+        write_current(folder, 1, &fs)?;
 
         let recovery = recover(folder, &fs, ManifestRecoveryMode::SkipAnyCorruptedRecords)?;
 
@@ -1948,8 +1979,8 @@ mod tests {
         let fs = MemFs::new();
         let folder = Path::new("/pit/blob_mid_corrupt");
         fs.create_dir_all(folder)?;
-        write_current(folder, 1, &fs)?;
         write_manifest_with_corrupt_blob_record(folder, 1, &fs)?;
+        write_current(folder, 1, &fs)?;
 
         let recovery = recover(folder, &fs, ManifestRecoveryMode::PointInTimeRecovery)?;
         let ids: Vec<u64> = recovery.blob_file_ids.iter().map(|(id, _)| *id).collect();
@@ -2010,8 +2041,8 @@ mod tests {
         let fs = MemFs::new();
         let folder = Path::new("/skip_any/then_tail");
         fs.create_dir_all(folder)?;
-        write_current(folder, 1, &fs)?;
         write_manifest_skip_any_then_tail_truncated(folder, 1, &fs)?;
+        write_current(folder, 1, &fs)?;
 
         let recovery = recover(folder, &fs, ManifestRecoveryMode::SkipAnyCorruptedRecords)?;
 
@@ -2091,8 +2122,8 @@ mod tests {
         let fs = MemFs::new();
         let folder = Path::new("/skip_any/blob_then_tail");
         fs.create_dir_all(folder)?;
-        write_current(folder, 1, &fs)?;
         write_manifest_blob_skip_any_then_tail_truncated(folder, 1, &fs)?;
+        write_current(folder, 1, &fs)?;
 
         let recovery = recover(folder, &fs, ManifestRecoveryMode::SkipAnyCorruptedRecords)?;
 

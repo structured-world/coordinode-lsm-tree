@@ -1,13 +1,12 @@
 use crate::{
-    Checksum,
-    file::{CURRENT_VERSION_FILE, fsync_directory, rewrite_atomic},
-    fs::{Fs, FsOpenOptions},
+    file::{CURRENT_VERSION_FILE, fsync_directory, hash_file_xxh3, rewrite_atomic},
+    fs::Fs,
     manifest_blocks::writer::ManifestArchiveWriter,
     runtime_config::RuntimeConfig,
     version::Version,
 };
 use byteorder::{LittleEndian, WriteBytesExt};
-use std::{io::Read, path::Path, sync::Arc};
+use std::{path::Path, sync::Arc};
 
 /// Crate-internal (version module is not exported).
 ///
@@ -65,11 +64,13 @@ pub fn persist_version(
     // renaming v0 → v1 to roll back state). Manifest is small
     // (KB-MB scale at most) so a second pass to hash it is cheap
     // relative to the durability-critical fsync just performed.
-    let checksum = hash_manifest_file(fs, &path)?;
+    // Shares `hash_file_xxh3` with the recovery path so both sides
+    // of the persist / verify contract stay in lockstep.
+    let checksum = hash_file_xxh3(fs, &path)?;
 
     let mut current_file_content = vec![];
     current_file_content.write_u64::<LittleEndian>(version.id())?;
-    current_file_content.write_u128::<LittleEndian>(checksum.into_u128())?;
+    current_file_content.write_u128::<LittleEndian>(checksum)?;
     current_file_content.write_u8(0)?; // 0 = xxh3
 
     rewrite_atomic(
@@ -79,28 +80,4 @@ pub fn persist_version(
     )?;
 
     Ok(())
-}
-
-/// Stream the file at `path` through an XXH3-128 hasher in 64 KiB
-/// chunks. Used by [`persist_version`] to stamp the CURRENT pointer
-/// with the manifest's content hash.
-fn hash_manifest_file(fs: &dyn Fs, path: &Path) -> crate::Result<Checksum> {
-    let mut file = fs.open(path, &FsOpenOptions::new().read(true))?;
-    let mut hasher = xxhash_rust::xxh3::Xxh3Default::new();
-    let mut buf = vec![0u8; 64 * 1024];
-    loop {
-        let n = file.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        // `n` is bounded by `buf.len()` (the read contract), so the
-        // slice never out-of-bounds. `.get(..n)` would be defensive
-        // but adds an Option unwrap that is itself a slice op.
-        #[expect(
-            clippy::indexing_slicing,
-            reason = "n is bounded by buf.len() per std::io::Read::read contract"
-        )]
-        hasher.update(&buf[..n]);
-    }
-    Ok(Checksum::from_raw(hasher.digest128()))
 }

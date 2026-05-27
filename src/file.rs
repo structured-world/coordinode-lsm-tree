@@ -20,6 +20,40 @@ pub const TABLES_FOLDER: &str = "tables";
 pub const BLOBS_FOLDER: &str = "blobs";
 pub const CURRENT_VERSION_FILE: &str = "current";
 
+/// Stream a file through an XXH3-128 hasher in 64 KiB chunks.
+///
+/// Used by both [`crate::version::persist_version`] (to stamp the
+/// CURRENT pointer with the manifest's content hash) and
+/// [`crate::version::recovery::get_current_version`] (to re-verify
+/// that hash on open). Sharing one implementation across both sides
+/// keeps the persist / recover contract symmetric — bumping the
+/// digest algorithm here changes both at once.
+///
+/// # Errors
+///
+/// Returns [`std::io::Error`] on open / read failure, propagated
+/// through `crate::Error::Io`.
+pub fn hash_file_xxh3(fs: &dyn Fs, path: &Path) -> crate::Result<u128> {
+    use crate::fs::FsOpenOptions;
+    use std::io::Read;
+    let mut file = fs.open(path, &FsOpenOptions::new().read(true))?;
+    let mut hasher = xxhash_rust::xxh3::Xxh3Default::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        // `n` is bounded by `buf.len()` per the std::io::Read contract.
+        #[expect(
+            clippy::indexing_slicing,
+            reason = "n bounded by buf.len() per std::io::Read::read contract"
+        )]
+        hasher.update(&buf[..n]);
+    }
+    Ok(hasher.digest128())
+}
+
 /// Reads bytes from a file at the given offset without changing the cursor.
 ///
 /// Uses [`FsFile::read_at`] (equivalent to `pread(2)`) so multiple threads

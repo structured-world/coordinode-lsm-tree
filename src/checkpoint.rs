@@ -369,33 +369,26 @@ fn copy_metadata_file_optional(
 /// wire format as [`crate::version::persist_version`]: `u64 version_id`
 /// + `u128 checksum` + `u8 checksum_type`.
 ///
-/// The checksum field is intentionally written as zero: recovery's
-/// [`crate::version::recovery`] reads it for forward-compatibility but
-/// does not validate it against the `v<id>` file's contents, so any
-/// value works. The zero is a deliberate "no checksum carried" sentinel,
-/// not an attempt to forge a real digest.
+/// The checksum field is computed from the just-written `v<id>`
+/// manifest via [`crate::file::hash_file_xxh3`] so the checkpoint
+/// pointer survives the same `get_current_version` validation the
+/// live tree's pointer does — a swap of the captured manifest under
+/// the checkpoint is detected on next open.
 fn write_current_for_version(
     target_fs: &dyn Fs,
     target_root: &Path,
     version_id: u64,
 ) -> crate::Result<()> {
     use crate::checksum::ChecksumType;
-    use crate::file::rewrite_atomic;
+    use crate::file::{hash_file_xxh3, rewrite_atomic};
     use byteorder::{LittleEndian, WriteBytesExt};
 
-    // The `current` wire format is `version_id: u64 | checksum: u128 |
-    // checksum_type: u8`. The checksum field is reserved for future
-    // verification — recovery reads it but does not validate it against
-    // the `v<id>` contents — so a zero literal is the documented "no
-    // digest carried" sentinel, not a forged digest. The checksum type
-    // MUST come from `ChecksumType` so any future format evolution
-    // (e.g. a real checksum) shifts this writer and the recovery
-    // checker in lockstep through one shared enum.
-    const RESERVED_CHECKSUM: u128 = 0;
+    let manifest_path = target_root.join(format!("v{version_id}"));
+    let checksum = hash_file_xxh3(target_fs, &manifest_path)?;
 
     let mut content = vec![];
     content.write_u64::<LittleEndian>(version_id)?;
-    content.write_u128::<LittleEndian>(RESERVED_CHECKSUM)?;
+    content.write_u128::<LittleEndian>(checksum)?;
     content.write_u8(u8::from(ChecksumType::Xxh3))?;
 
     rewrite_atomic(&target_root.join(CURRENT_VERSION_FILE), &content, target_fs)?;

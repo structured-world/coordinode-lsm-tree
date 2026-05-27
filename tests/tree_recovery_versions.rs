@@ -67,6 +67,26 @@ fn rewrite_manifest_format_version(path: &Path, version: u8) -> lsm_tree::Result
     }
     w.finish()?;
 
+    // CURRENT pointer carries the manifest's content hash —
+    // recompute it for the rewritten manifest so
+    // `get_current_version` lets the test reach the version-policy
+    // code path it actually wants to exercise (otherwise the hash
+    // mismatch surfaces first as ChecksumMismatch).
+    use byteorder::WriteBytesExt as _;
+    let checksum = lsm_tree::file::hash_file_xxh3(&lsm_tree::fs::StdFs, &manifest_path)?;
+    let mut content: Vec<u8> = Vec::new();
+    content.write_u64::<byteorder::LittleEndian>(curr_version_id)?;
+    content.write_u128::<byteorder::LittleEndian>(checksum)?;
+    content.write_u8(0)?; // xxh3
+    let current_path = path.join("current");
+    let mut current_file = std::fs::OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .create(true)
+        .open(&current_path)?;
+    current_file.write_all(&content)?;
+    current_file.sync_all()?;
+
     Ok(())
 }
 
