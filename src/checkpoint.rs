@@ -369,13 +369,18 @@ fn copy_metadata_file_optional(
 /// wire format as [`crate::version::persist_version`]: `u64 version_id`
 /// + `u128 checksum` + `u8 checksum_type`.
 ///
-/// The checksum field is computed over the captured manifest's
-/// SECTION bytes only — `[HEAD_FOOTER_RESERVED_SIZE, section_end)`
-/// — so the checkpoint pointer survives the same
-/// `get_current_version` validation the live tree's pointer does
-/// (a section-byte swap is caught; a tail-only torn write is
-/// recoverable via the head mirror without invalidating the
-/// pointer first).
+/// The checksum field is the canonical CURRENT digest produced by
+/// [`crate::manifest_blocks::current_digest::compute`]: an XXH3-128
+/// over (`version_id`, `layout_version`, flags, sorted TOC tuples
+/// with each section's own Block-level XXH3-128). Reusing the exact
+/// path `get_current_version` re-derives on `Tree::open` guarantees
+/// bit-identical digest computation between writer and reader. A
+/// section-byte swap is caught (changes the per-section checksum in
+/// the TOC), a tail-only torn write is recovered via the head mirror
+/// before the digest is computed, and a per-Block ECC repair on
+/// section read does not invalidate the digest (the TOC-bound
+/// section checksum was stamped at writer-time, not derived from
+/// on-disk bytes).
 fn write_current_for_version(
     target_fs: &dyn Fs,
     target_root: &Path,
