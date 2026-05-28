@@ -124,7 +124,7 @@ cargo run --release --features flamegraph -- \
 
 The per-version manifest file (`v{N}`) is stored as a sequence of standard lsm-tree `Block`s — one `BlockType::Manifest` Block per section, plus a `BlockType::ManifestFooter` Block at the tail carrying the table of contents and the manifest layout version. Every Block goes through the same XXH3-128 / optional ECC / optional AEAD pipeline data Blocks use, so every protection that applies to a data Block automatically applies to the manifest.
 
-Five layers compose the manifest's integrity surface; each is independently togglable:
+Five layers compose the manifest's integrity surface. L1 and L4 are always on as part of the on-disk format; L2, L3, and L5 are independently configurable (compile-time feature, encryption provider, or runtime config):
 
 | Layer | Defends against | Config knob | Default |
 |-------|-----------------|-------------|---------|
