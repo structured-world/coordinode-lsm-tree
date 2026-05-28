@@ -40,7 +40,12 @@ path = "src/lib.rs"
 # std-only primitives behind `#[cfg(feature = "std")]`, and pick external
 # crates that support no-std.
 default = ["std"]
-std = ["dep:arc-swap"]
+std = [
+    "dep:arc-swap",
+    "byteorder/std",
+    "rustc-hash/std",
+    "varint-rs/std",
+]
 # `alloc` is the minimal hard requirement — the crate uses `Arc`,
 # `Vec`, `Box` everywhere. Listed explicitly so consumers can pick it up
 # without enabling `std` once the no-std migration completes per-module.
@@ -96,7 +101,7 @@ ribbon-serde = ["dep:serde"]
 
 [dependencies]
 bytes = { version = "1", optional = true }
-byteorder = { package = "byteorder-lite", version = "0.1.0" }
+byteorder = { package = "byteorder-lite", version = "0.1.0", default-features = false }
 byteview = "~0.10.1"
 # Lockless atomic snapshot for RuntimeConfig (see src/runtime_config/).
 # std-bound — `RuntimeConfigHandle` is gated behind the `std` feature,
@@ -127,7 +132,7 @@ structured-zstd = { version = "0.0.25", optional = true, default-features = fals
 #     the shared `Arc<DeletionPause>` after recovery / compaction).
 once_cell = { version = "1", default-features = false, features = ["race"] }
 quick_cache = { version = "0.6.16", default-features = false, features = [] }
-rustc-hash = "2.1.1"
+rustc-hash = { version = "2.1.1", default-features = false }
 self_cell = "1.2.0"
 # Optional — only pulled in by the vendored Ribbon filter under the
 # `ribbon-serde` feature flag (off by default).
@@ -136,7 +141,7 @@ serde = { version = "1", optional = true, features = ["derive"] }
 # the format to in-tree code lets us evolve it locally without waiting
 # for a release we cannot influence). License files preserved alongside.
 tempfile = "3.20.0"
-varint-rs = "2.2.0"
+varint-rs = { version = "2.2.0", default-features = false, features = ["signed"] }
 xxhash-rust = { version = "0.8.15", features = ["xxh3"] }
 # Exact pin on a prerelease — RC API can churn between releases, so locking
 # the exact version is intentional. The 0.11 surface we depend on:
