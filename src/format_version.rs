@@ -2,7 +2,56 @@
 // Copyright (c) 2024-present, fjall-rs
 // Copyright (c) 2026-present, Structured World Foundation
 
-/// Disk format version
+/// Block / SST disk format version.
+///
+/// This enum tracks the on-disk layout of Blocks and SST files: block
+/// header layout, filter wire format, range-tombstone encoding, ECC
+/// trailer geometry. It is the version persisted in the manifest's
+/// `format_version` section and gated at `Tree::open`.
+///
+/// ## Relationship to the manifest layout version
+///
+/// `FormatVersion` and [`crate::manifest_blocks::MANIFEST_LAYOUT_VERSION_V1`]
+/// evolve at **independent cadences**:
+///
+/// | Concept | Type | Tracks |
+/// |---------|------|--------|
+/// | `FormatVersion` | This enum (V1..V5) | Block / SST on-disk layout |
+/// | `manifest_layout_version` | `u8` in manifest Footer Block | Manifest file structure (footer fields, TOC encoding, head-mirror geometry) |
+///
+/// A block format bump does NOT force a manifest layout bump and
+/// vice versa. The CURRENT pointer's canonical digest binds the
+/// manifest layout version (so a manifest-only break is detected
+/// at recovery), and the manifest's `format_version` section binds
+/// this enum (so a block-format-only break is detected at
+/// `Tree::open`).
+///
+/// ## Amendment policy
+///
+/// Once a value is **published to crates.io** (any released binary
+/// writes that value to disk), **any** subsequent change to the
+/// on-disk bytes under that value is a breaking change that MUST
+/// bump to a new variant. This applies regardless of whether the
+/// change is otherwise additive: a reader running the old code is
+/// not free to interpret unknown bytes.
+///
+/// The amendment window is the **pre-release period**: while a
+/// `FormatVersion` is being actively developed and no published
+/// binary writes it, the on-disk bytes under that version MAY be
+/// amended in place (no enum bump required). The release that
+/// crystallises the variant ends this window.
+///
+/// Same rule applies to `manifest_layout_version` independently:
+/// pre-publication amendments are free; post-publication changes
+/// require a new layout-version constant.
+///
+/// **Practical checklist for any PR that touches on-disk bytes:**
+///
+/// 1. Identify which layer the change touches (Block/SST → this
+///    enum; manifest framing → `manifest_layout_version`).
+/// 2. If that layer's current value has shipped to crates.io,
+///    add a new variant / constant instead of amending in place.
+/// 3. The OTHER layer's value stays unless its layer also changed.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum FormatVersion {
     /// Version for 1.x.x releases
