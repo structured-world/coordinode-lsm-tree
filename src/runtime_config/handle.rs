@@ -79,15 +79,37 @@ impl RuntimeConfigHandle {
     /// avoidance (e.g. two threads concurrently toggling
     /// different fields) MUST serialize their updates at the
     /// caller layer, typically via a `Mutex` around the
-    /// `update` call site.
-    pub fn update<F>(&self, mutator: F)
+    /// `try_update` call site.
+    ///
+    /// Validates the mutated snapshot against compile-time
+    /// feature gates before swapping it in. Returns the
+    /// validation error without applying the update, so the live
+    /// snapshot stays at the pre-mutation value.
+    ///
+    /// Currently the only check is the `page_ecc` cargo feature:
+    /// flipping `page_ecc = true` on a binary that doesn't link
+    /// the Reed-Solomon codec would silently no-op at the manifest
+    /// writer (the `PlainEcc` `BlockTransform` arm is feature-gated
+    /// out), so we reject the update instead of letting the caller
+    /// believe ECC is on.
+    ///
+    /// # Errors
+    ///
+    /// - [`crate::Error::PageEccUnsupported`] when the mutator
+    ///   leaves `page_ecc = true` on a build without the cargo
+    ///   feature.
+    pub fn try_update<F>(&self, mutator: F) -> crate::Result<()>
     where
         F: FnOnce(&mut RuntimeConfig),
     {
         let current = self.inner.load_full();
         let mut next = (*current).clone();
         mutator(&mut next);
+        if next.page_ecc && !cfg!(feature = "page_ecc") {
+            return Err(crate::Error::PageEccUnsupported);
+        }
         self.inner.store(Arc::new(next));
+        Ok(())
     }
 }
 
@@ -100,6 +122,10 @@ impl core::fmt::Debug for RuntimeConfigHandle {
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::unwrap_used,
+    reason = "tests panic on the unhappy paths to surface failures loudly"
+)]
 mod tests {
     use super::super::types::ChecksumAlgorithm;
     use super::*;
@@ -120,9 +146,11 @@ mod tests {
     #[test]
     fn update_applies_mutation_visible_on_next_load() {
         let handle = RuntimeConfigHandle::new(RuntimeConfig::default());
-        handle.update(|cfg| {
-            cfg.block_checksum_algo = ChecksumAlgorithm::Crc32c;
-        });
+        handle
+            .try_update(|cfg| {
+                cfg.block_checksum_algo = ChecksumAlgorithm::Crc32c;
+            })
+            .unwrap();
         let snap = handle.load();
         assert_eq!(snap.block_checksum_algo, ChecksumAlgorithm::Crc32c);
     }
@@ -139,9 +167,11 @@ mod tests {
         let handle = RuntimeConfigHandle::new(RuntimeConfig::default());
         let snap_before = handle.load_full();
 
-        handle.update(|cfg| {
-            cfg.block_checksum_algo = ChecksumAlgorithm::Crc32c;
-        });
+        handle
+            .try_update(|cfg| {
+                cfg.block_checksum_algo = ChecksumAlgorithm::Crc32c;
+            })
+            .unwrap();
 
         // The old snapshot still observes the original algo.
         assert_eq!(snap_before.block_checksum_algo, ChecksumAlgorithm::Xxh3_64);
@@ -197,10 +227,12 @@ mod tests {
         // Writer waits at the barrier with the readers, then
         // performs the swap once.
         barrier.wait();
-        handle.update(|cfg| {
-            cfg.block_checksum_algo = ChecksumAlgorithm::Crc32c;
-            cfg.kv_checksum_algo = ChecksumAlgorithm::Crc32c;
-        });
+        handle
+            .try_update(|cfg| {
+                cfg.block_checksum_algo = ChecksumAlgorithm::Crc32c;
+                cfg.kv_checksum_algo = ChecksumAlgorithm::Crc32c;
+            })
+            .unwrap();
 
         for h in reader_handles {
             // Propagate panics from reader threads as a join failure.
@@ -216,9 +248,15 @@ mod tests {
         // updates lost in the middle.
         let handle = RuntimeConfigHandle::new(RuntimeConfig::default());
 
-        handle.update(|cfg| cfg.block_checksum_algo = ChecksumAlgorithm::Crc32c);
-        handle.update(|cfg| cfg.kv_checksum_algo = ChecksumAlgorithm::Xxh3Low32);
-        handle.update(|cfg| cfg.block_checksum_algo = ChecksumAlgorithm::Xxh3Low32);
+        handle
+            .try_update(|cfg| cfg.block_checksum_algo = ChecksumAlgorithm::Crc32c)
+            .unwrap();
+        handle
+            .try_update(|cfg| cfg.kv_checksum_algo = ChecksumAlgorithm::Xxh3Low32)
+            .unwrap();
+        handle
+            .try_update(|cfg| cfg.block_checksum_algo = ChecksumAlgorithm::Xxh3Low32)
+            .unwrap();
 
         let snap = handle.load();
         assert_eq!(snap.block_checksum_algo, ChecksumAlgorithm::Xxh3Low32);

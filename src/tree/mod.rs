@@ -1024,11 +1024,21 @@ impl Tree {
     /// (e.g. two threads concurrently toggling different fields) MUST
     /// serialize their `update_runtime_config` calls, typically via a
     /// `Mutex` around the call site.
-    pub fn update_runtime_config<F>(&self, mutator: F)
+    /// # Errors
+    ///
+    /// Returns [`crate::Error::PageEccUnsupported`] when the mutator
+    /// leaves `page_ecc = true` on a binary built without the
+    /// `page_ecc` cargo feature. The live snapshot stays at its
+    /// pre-mutation value on error.
+    pub fn update_runtime_config<F>(&self, mutator: F) -> crate::Result<()>
     where
         F: FnOnce(&mut crate::runtime_config::RuntimeConfig),
     {
-        self.0.runtime_config.update(mutator);
+        // Route through the validating handle path so an invalid
+        // mutation (currently: `page_ecc = true` on a non-`page_ecc`
+        // build) is rejected at update time, not silently swallowed
+        // at the next manifest write.
+        self.0.runtime_config.try_update(mutator)
     }
 
     /// Snapshot of the current runtime config. Cheap atomic load —
@@ -1722,7 +1732,15 @@ impl Tree {
         // but the build does not link the Reed-Solomon codec. We have
         // no way to verify or recover RS parity without the codec, so
         // refuse to open rather than silently downgrade integrity.
-        if config.page_ecc && !cfg!(feature = "page_ecc") {
+        // Two surfaces to check:
+        //   - `Config::page_ecc(true)`  → SST data-block ECC
+        //   - `Config::with_runtime_config(RuntimeConfig { page_ecc: true, .. })`
+        //     → manifest-Block ECC (consumed by manifest_blocks::writer)
+        // Both silently no-op without the feature; refusing here is
+        // the only place callers see a typed error.
+        if (config.page_ecc || config.initial_runtime_config.page_ecc)
+            && !cfg!(feature = "page_ecc")
+        {
             return Err(crate::Error::PageEccUnsupported);
         }
 

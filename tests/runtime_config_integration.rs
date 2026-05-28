@@ -47,7 +47,8 @@ fn tree_update_runtime_config_visible_on_next_load() {
 
     tree.update_runtime_config(|cfg| {
         cfg.block_checksum_algo = ChecksumAlgorithm::Crc32c;
-    });
+    })
+    .unwrap();
 
     let after = tree.runtime_config();
     assert_eq!(after.block_checksum_algo, ChecksumAlgorithm::Crc32c);
@@ -68,7 +69,8 @@ fn tree_snapshot_outlives_update_with_pre_update_state() {
     tree.update_runtime_config(|cfg| {
         cfg.block_checksum_algo = ChecksumAlgorithm::Crc32c;
         cfg.kv_checksum_algo = ChecksumAlgorithm::Xxh3Low32;
-    });
+    })
+    .unwrap();
 
     // Pre-update snapshot still observes original values — the swap
     // doesn't reach into Arcs already in caller hands.
@@ -95,7 +97,8 @@ fn tree_runtime_config_resets_to_default_on_reopen() {
         let tree = open_tree(folder.path());
         tree.update_runtime_config(|cfg| {
             cfg.block_checksum_algo = ChecksumAlgorithm::Crc32c;
-        });
+        })
+        .unwrap();
         assert_eq!(
             tree.runtime_config().block_checksum_algo,
             ChecksumAlgorithm::Crc32c,
