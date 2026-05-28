@@ -37,6 +37,7 @@
 //! [`Block::write_into`]: crate::table::block::Block::write_into
 //! [`Block::from_reader`]: crate::table::block::Block::from_reader
 
+pub mod current_digest;
 pub mod footer;
 pub mod reader;
 pub mod writer;
