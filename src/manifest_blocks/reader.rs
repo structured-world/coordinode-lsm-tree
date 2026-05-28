@@ -927,4 +927,47 @@ mod tests {
         );
         assert!(reader.section("format_version").is_some());
     }
+
+    /// Regression: a manifest truncated to exactly
+    /// `HEAD_FOOTER_RESERVED_SIZE` (4 KiB) has no tail footer Block
+    /// and no trailing size hint, but the head mirror at offset 0
+    /// is fully populated by the writer when
+    /// `manifest_footer_mirror` is on. The reader should reach the
+    /// head fallback in that state and succeed; rejecting with
+    /// `Unrecoverable` at the front gate (because file is too short
+    /// for a tail hint) defeats the advertised partial-write
+    /// recovery contract. Only files shorter than the head
+    /// reservation itself should bypass the head fallback.
+    #[test]
+    fn reader_recovers_from_head_when_tail_hint_missing() {
+        let fs = fresh_fs();
+        let path = Path::new("/m/head_only");
+        write_manifest(
+            &fs,
+            path,
+            RuntimeConfig::default(),
+            &[("format_version", &[5])],
+        );
+
+        // Truncate the file back to exactly HEAD_FOOTER_RESERVED_SIZE.
+        // After this, the head mirror is intact but the tail footer
+        // Block + size hint are gone — the exact failure mode the
+        // recovery contract has to handle.
+        let mut file = fs
+            .open(path, &FsOpenOptions::new().write(true).read(true))
+            .unwrap();
+        file.set_len(HEAD_FOOTER_RESERVED_SIZE).unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+
+        let reader =
+            ManifestArchiveReader::open(path, &fs, Arc::new(RuntimeConfig::default()), None)
+                .expect("head-only manifest must recover via head fallback");
+        assert_eq!(
+            reader.source(),
+            FooterSource::Head,
+            "reader should have fallen back to the head mirror"
+        );
+        assert!(reader.section("format_version").is_some());
+    }
 }
