@@ -55,8 +55,10 @@ pub mod writer;
 /// writes this value, the on-disk bytes under it MAY be amended
 /// in place. Once the value ships to crates.io, **any** subsequent
 /// change to the on-disk manifest layout under it is breaking and
-/// MUST introduce a new `MANIFEST_LAYOUT_VERSION_V{N+1}` constant
-/// — even if the change is otherwise additive. The CURRENT
+/// MUST introduce a new `MANIFEST_LAYOUT_VERSION_V2` constant
+/// (and `_V3`, `_V4`, ... for each subsequent post-release break,
+/// incrementing the numeric suffix every time) — even if the change
+/// is otherwise additive. The CURRENT
 /// pointer's canonical digest binds this value, so a layout-only
 /// break is detected at recovery without requiring a
 /// [`crate::FormatVersion`] bump.
