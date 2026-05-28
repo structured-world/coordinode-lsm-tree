@@ -382,60 +382,30 @@ fn write_current_for_version(
     version_id: u64,
 ) -> crate::Result<()> {
     use crate::checksum::ChecksumType;
-    use crate::file::{hash_file_range_xxh3, rewrite_atomic};
-    use crate::fs::FsOpenOptions;
-    use crate::manifest_blocks::{HEAD_FOOTER_RESERVED_SIZE, TAIL_FOOTER_SIZE_HINT_BYTES};
-    use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
-    use std::io::{Seek, SeekFrom};
+    use crate::file::rewrite_atomic;
+    use crate::manifest_blocks::{current_digest, reader::ManifestArchiveReader};
+    use byteorder::{LittleEndian, WriteBytesExt};
 
     let manifest_path = target_root.join(format!("v{version_id}"));
-    // Derive section_end from the trailing 4-byte size hint
-    // directly — no head-mirror fallback. `get_current_version`
-    // uses ManifestArchiveReader::open (tail-first + head-mirror
-    // recovery + TOC inspection) because Tree::open must tolerate
-    // a torn tail on already-persisted state; the checkpoint
-    // sealing path here writes its own manifest right above and
-    // can trust that the tail it just wrote is intact, so the
-    // simpler size-hint read is sufficient. Use a size floor +
-    // `checked_sub` for both arithmetic steps so a truncated /
-    // forged manifest surfaces as `Unrecoverable` rather than a
-    // wild underflow that operates on the wrong byte range.
-    let file_len = target_fs.metadata(&manifest_path)?.len;
-    if file_len < HEAD_FOOTER_RESERVED_SIZE + TAIL_FOOTER_SIZE_HINT_BYTES {
-        return Err(crate::Error::Unrecoverable);
-    }
-    let mut f = target_fs.open(&manifest_path, &FsOpenOptions::new().read(true))?;
-    f.seek(SeekFrom::Start(file_len - TAIL_FOOTER_SIZE_HINT_BYTES))?;
-    let footer_size = u64::from(f.read_u32::<LittleEndian>()?);
-    drop(f);
-    // Mirror ManifestArchiveReader's bounds checks: a zero hint
-    // points at no footer (would sweep the trailer area into the
-    // section range), and any value above HEAD_FOOTER_RESERVED_SIZE
-    // is impossible for a well-formed manifest (the writer caps the
-    // footer Block at the head-mirror's reservation size). Either
-    // case is corruption; surface it as Unrecoverable here BEFORE
-    // hashing the wrong byte range and stamping a CURRENT pointer
-    // that fails downstream get_current_version validation.
-    if footer_size == 0 || footer_size > HEAD_FOOTER_RESERVED_SIZE {
-        return Err(crate::Error::Unrecoverable);
-    }
-    let section_end = file_len
-        .checked_sub(TAIL_FOOTER_SIZE_HINT_BYTES)
-        .and_then(|x| x.checked_sub(footer_size))
-        .ok_or(crate::Error::Unrecoverable)?;
-    // section_end must clear the head reservation — otherwise the
-    // size hint is internally consistent but the manifest itself is
-    // malformed (no room for any section between head and footer).
-    if section_end < HEAD_FOOTER_RESERVED_SIZE {
-        return Err(crate::Error::Unrecoverable);
-    }
-    let section_length = section_end.saturating_sub(HEAD_FOOTER_RESERVED_SIZE);
-    let checksum = hash_file_range_xxh3(
-        target_fs,
+    // Open the freshly-written manifest through the same reader
+    // `get_current_version` will use, derive the canonical CURRENT
+    // digest from its parsed footer, and stamp the pointer. Using
+    // the reader here (vs. re-reading raw bytes ourselves) guarantees
+    // bit-identical digest computation between writer and reader
+    // paths: any mismatch is a real bug, not a derivation drift.
+    //
+    // Runtime config / encryption are placeholder defaults: the
+    // reader's only use of them is picking the `BlockTransform`
+    // variant for the footer Block, which decodes regardless of
+    // ECC / AEAD presence since the per-Block header is
+    // self-describing.
+    let archive = ManifestArchiveReader::open(
         &manifest_path,
-        HEAD_FOOTER_RESERVED_SIZE,
-        section_length,
+        target_fs,
+        Arc::new(crate::runtime_config::RuntimeConfig::default()),
+        None,
     )?;
+    let checksum = current_digest::compute(version_id, archive.footer())?;
 
     let mut content = vec![];
     content.write_u64::<LittleEndian>(version_id)?;
@@ -791,89 +761,12 @@ mod tests {
         assert_eq!(after, "mutated-via-mem-fs");
     }
 
-    /// Regression: `write_current_for_version` used to trust the
-    /// trailing 4-byte footer-size hint without validating it. A
-    /// zero hint (corrupted file) makes `section_end` equal to
-    /// `file_len` - 4, sweeping the trailer area into the CURRENT
-    /// checksum — the resulting pointer then fails `get_current_version`
-    /// downstream and the failure mode is confusing (looks like
-    /// pointer corruption, not manifest corruption). Same class of
-    /// bug for an out-of-bounds hint (> 4 KiB). Real manifests cap
-    /// the footer at `HEAD_FOOTER_RESERVED_SIZE` = 4 KiB, so any
-    /// hint outside [1, 4 KiB] is corruption and must surface
-    /// loudly here.
-    #[test]
-    fn write_current_for_version_rejects_corrupt_footer_size_hint() {
-        use crate::manifest_blocks::{
-            HEAD_FOOTER_RESERVED_SIZE, TAIL_FOOTER_SIZE_HINT_BYTES, writer::ManifestArchiveWriter,
-        };
-        use crate::runtime_config::RuntimeConfig;
-        use byteorder::{LittleEndian, WriteBytesExt};
-        use std::io::Seek;
-
-        let dir = tempfile::tempdir().unwrap();
-        let target_root = dir.path().to_path_buf();
-        let std_fs: Arc<dyn Fs> = Arc::new(StdFs);
-        let version_id: u64 = 7;
-        let manifest_path = target_root.join(format!("v{version_id}"));
-
-        // Lay down a valid manifest the same way the production
-        // writer does, so the test exercises the bounds-check path
-        // and not some unrelated file-format issue.
-        let mut w = ManifestArchiveWriter::create(
-            &manifest_path,
-            &*std_fs,
-            Arc::new(RuntimeConfig::default()),
-            None,
-        )
-        .unwrap();
-        w.start("format_version").unwrap();
-        std::io::Write::write_all(&mut w, &[5u8]).unwrap();
-        w.finish().unwrap();
-
-        // Corrupt only the trailing 4-byte size hint to 0. The
-        // rest of the file (head reservation, sections, footer
-        // Block) stays bit-for-bit valid.
-        let file_len = std::fs::metadata(&manifest_path).unwrap().len();
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .open(&manifest_path)
-            .unwrap();
-        f.seek(std::io::SeekFrom::Start(
-            file_len - TAIL_FOOTER_SIZE_HINT_BYTES,
-        ))
-        .unwrap();
-        f.write_u32::<LittleEndian>(0).unwrap();
-        drop(f);
-
-        let result = write_current_for_version(&*std_fs, &target_root, version_id);
-        assert!(
-            matches!(result, Err(crate::Error::Unrecoverable)),
-            "expected Unrecoverable on zero footer-size hint, got {result:?}"
-        );
-
-        // Same class of bug: out-of-bounds hint (> 4 KiB) must also
-        // be rejected before the checksum is computed.
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .open(&manifest_path)
-            .unwrap();
-        f.seek(std::io::SeekFrom::Start(
-            file_len - TAIL_FOOTER_SIZE_HINT_BYTES,
-        ))
-        .unwrap();
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "test constant — HEAD_FOOTER_RESERVED_SIZE+1 fits in u32"
-        )]
-        let oversized = (HEAD_FOOTER_RESERVED_SIZE + 1) as u32;
-        f.write_u32::<LittleEndian>(oversized).unwrap();
-        drop(f);
-
-        let result = write_current_for_version(&*std_fs, &target_root, version_id);
-        assert!(
-            matches!(result, Err(crate::Error::Unrecoverable)),
-            "expected Unrecoverable on oversized footer-size hint, got {result:?}"
-        );
-    }
+    // Removed: `write_current_for_version_rejects_corrupt_footer_size_hint`.
+    // The checkpoint write path now goes through
+    // `ManifestArchiveReader::open` (canonical CURRENT digest path),
+    // which has head-mirror fallback for a torn tail size hint —
+    // recovery succeeds instead of erroring, which is the correct
+    // behaviour. Tail / head-mirror bounds checks are covered by
+    // `manifest_blocks::reader::tests::reader_fails_when_tail_corrupt_and_no_mirror`
+    // and siblings.
 }
