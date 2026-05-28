@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779993768332,
+  "lastUpdate": 1780008247493,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -11076,6 +11076,84 @@ window.BENCHMARK_DATA = {
             "value": 459620.0442433931,
             "unit": "ops/sec",
             "extra": "P50: 2.0us | P99: 5.7us | P99.9: 8.3us\nthreads: 1 | elapsed: 0.44s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "c0f307e34b1a3b45d0f22bdd081586fba539f728",
+          "message": "build(deps): trim no-std-check errors via default-features=false on three deps (#362)\n\n## Summary\n\nThree direct deps (`byteorder-lite`, `rustc-hash`, `varint-rs`)\ndefaulted to a `std` feature that pulled `extern crate std`\nunconditionally. Set `default-features = false` on each, route `std`\nback through the crate-level `std` feature so the std build is\nunchanged.\n\n## Impact on `no-std-check`\n\n`cargo check --target thumbv7em-none-eabihf --no-default-features\n--features alloc`:\n\n| Dep | Before | After |\n|-----|--------|-------|\n| byteorder-lite | 111 errors | 0 |\n| rustc-hash | 1 error | 0 |\n| varint-rs | 106 errors | 1 (upstream `zigzag.rs` uses\n`std::mem::size_of`; not fixable from Cargo.toml) |\n\n**Total no-std-check errors: 925 -> 787 (-138, -15%)**\n\n## Remaining failing transitive deps (out of scope)\n\nRequire source-level work to gate, vendor, or replace:\n\n| Dep | Errors | Why |\n|-----|--------|-----|\n| `quick_cache` | 582 | Std-only by source; cache module is the natural\ncut point |\n| `once_cell` | 245 | Feature unification overrides our explicit\n`default-features = false, features = [\"race\"]` config — some sibling\ndep forces std mode |\n| `byteview` | 65 | Std-only by source |\n| `fastrand` | 3 | Transitive via `tempfile` (which is unconditional in\nthis crate) |\n| `varint-rs` | 1 | Upstream bug — `std::mem::size_of` instead of\n`core::mem::size_of` in `zigzag.rs` |\n\n## Approach\n\nThe issue #358 originally targeted gating the\nmanifest+version+tree+checkpoint std-bound layer behind `feature =\n\"std\"`. Measurement shows the `no-std-check` failures come from\ntransitive deps that fail BEFORE lsm-tree source is compiled, so module\ngating cannot help until those deps are addressed.\n\nThis PR is the cheapest-possible cargo-side win. The deeper cascade\ngating remains scoped to follow-up PRs:\n\n1. Make `quick_cache` / `tempfile` optional, gated behind `std`\n2. Vendor or fork `byteview` to lift the std requirement\n3. Resolve `once_cell` feature unification (audit which sibling forces\nstd)\n4. File / fix upstream `varint-rs` zigzag bug\n\n## Testing\n\n- `cargo check --all-features` — passes\n- `cargo nextest run --workspace` — 1510 passed\n- `cargo clippy --all-features --all-targets -- -D warnings` — clean\n\nPart of #358\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n\n## Summary by CodeRabbit\n\n* **Chores**\n* Improved feature flag configuration to provide more explicit control\nover standard library support across dependencies.\n\n<!-- review_stack_entry_start -->\n\n[![Review Change\nStack](https://storage.googleapis.com/coderabbit_public_assets/review-stack-in-coderabbit-ui.svg)](https://app.coderabbit.ai/change-stack/structured-world/coordinode-lsm-tree/pull/362?utm_source=github_walkthrough&utm_medium=github&utm_campaign=change_stack)\n\n<!-- review_stack_entry_end -->\n\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-05-29T01:43:12+03:00",
+          "tree_id": "1bc60e4e62a174613f91cc905851ae74b77f7fd0",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/c0f307e34b1a3b45d0f22bdd081586fba539f728"
+        },
+        "date": 1780008245939,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 2001834.7015222923,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.7us | P99.9: 3.8us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1196547.0499919213,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.2us | P99.9: 4.3us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 515240.9045302425,
+            "unit": "ops/sec",
+            "extra": "P50: 1.8us | P99: 5.2us | P99.9: 7.8us\nthreads: 1 | elapsed: 0.39s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3610998.407838582,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 3.1us | P99.9: 5.6us\nthreads: 1 | elapsed: 0.06s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 380086.98298207286,
+            "unit": "ops/sec",
+            "extra": "P50: 2.3us | P99: 5.8us | P99.9: 8.7us\nthreads: 1 | elapsed: 0.53s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 200271.24737744802,
+            "unit": "ops/sec",
+            "extra": "P50: 4.6us | P99: 5.9us | P99.9: 8.7us\nthreads: 1 | elapsed: 1.00s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1227264.74419449,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.2us | P99.9: 4.3us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1122834.37530492,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 1.5us | P99.9: 1.9us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 459663.04198455584,
+            "unit": "ops/sec",
+            "extra": "P50: 2.0us | P99: 6.7us | P99.9: 10.0us\nthreads: 1 | elapsed: 0.44s | num: 200000 | iterations: 3"
           }
         ]
       }
