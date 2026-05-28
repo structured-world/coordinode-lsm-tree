@@ -275,6 +275,7 @@ impl ManifestArchiveReader {
             ))?;
         let block_offset = entry.block_offset;
         let block_size = entry.block_size;
+        let expected_section_checksum = entry.section_checksum;
 
         // Bound `block_size` against both an absolute cap and the
         // actual file length BEFORE allocating the buffer. The TOC
@@ -335,6 +336,20 @@ impl ManifestArchiveReader {
         if block.header.block_type != BlockType::Manifest {
             return Err(crate::Error::ManifestSectionInvalid(
                 "TOC entry points at non-Manifest block",
+            ));
+        }
+        // Cross-check the decoded Block's own XXH3-128 against the
+        // value the TOC entry committed at write time. Without this,
+        // CURRENT-pointer validation only proves the footer payload
+        // is self-consistent (TOC bytes intact) — a forged or
+        // mis-targeted TOC entry could still point at a Block whose
+        // content differs from what the writer recorded. The TOC's
+        // `section_checksum` is what we hash into the CURRENT
+        // pointer's canonical digest, so binding it here makes the
+        // chain CURRENT → TOC → section bytes airtight.
+        if block.header.checksum.into_u128() != expected_section_checksum {
+            return Err(crate::Error::ManifestSectionInvalid(
+                "section Block checksum does not match TOC entry section_checksum",
             ));
         }
         Ok(block.data.to_vec())
@@ -398,7 +413,16 @@ fn validate_block_header_fits(buf: &[u8], ctx: HeaderContext) -> crate::Result<(
         buf.get(..header_len)
             .ok_or_else(|| wrap("manifest Block header slice unexpectedly short"))?,
     );
-    let header = Header::decode_from(&mut cursor)?;
+    // Map header-decode failures (InvalidTag for unknown
+    // BlockType byte, Io for short reads, etc.) through the same
+    // `wrap` closure so the surrounding context (section / footer)
+    // owns the error variant. Without this remap, a malformed
+    // inner header could leak as a generic `Io` / `InvalidTag`
+    // and break the per-layer error classification CodeRabbit
+    // asked us to enforce earlier.
+    let header = Header::decode_from(&mut cursor).map_err(|_| {
+        wrap("manifest Block header decode failed (truncated, unknown type, or invalid magic)")
+    })?;
     let declared = u64::from(header.data_length)
         .checked_add(u64::from(header.ecc_length))
         .and_then(|payload| payload.checked_add(header_len as u64))
