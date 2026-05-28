@@ -128,7 +128,7 @@ Five layers compose the manifest's integrity surface; each is independently togg
 
 | Layer | Defends against | Config knob | Default |
 |-------|-----------------|-------------|---------|
-| L1 — Block XXH3-64 | Bit-rot detection per section / footer Block | Always on (`Block` invariant) | always on |
+| L1 — Block XXH3-128 | Bit-rot detection per section / footer Block | Always on (`Block` invariant) | always on |
 | L2 — Page ECC (Reed-Solomon (4, 2)) | Bit-rot recovery per Block | `RuntimeConfig::page_ecc` for **manifest Blocks** (current release) + `Config::page_ecc` for **SST data Blocks** (compile-time `page_ecc` feature gates both) | off (opt-in) |
 | L3 — AEAD encryption | Tampering detection + confidentiality | `Config::with_encryption(provider)` | off |
 | L4 — Footer Block tail hint | Reader locates footer without scanning | Always on (trailing `u32` size hint) | always on |

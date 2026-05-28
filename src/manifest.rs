@@ -32,8 +32,10 @@ impl Manifest {
     ///
     /// # Errors
     ///
-    /// - [`crate::Error::ManifestFooterInvalid`] when a mandatory
-    ///   section is missing from the TOC
+    /// - [`crate::Error::ManifestSectionInvalid`] when a mandatory
+    ///   section name is not present in the TOC (the per-section
+    ///   error variant surfaced by
+    ///   [`ManifestArchiveReader::read_section`])
     /// - [`crate::Error::InvalidVersion`] when `format_version`
     ///   carries an unknown discriminant
     /// - [`crate::Error::InvalidTag`] for unknown `TreeType` /
@@ -42,8 +44,12 @@ impl Manifest {
     ///   `comparator_name` exceeds the configured length cap
     /// - [`crate::Error::Utf8`] when `comparator_name` bytes are
     ///   not valid UTF-8
+    /// - [`crate::Error::InvalidHeader`] when a single-byte mandatory
+    ///   section is empty / truncated (`format_version`,
+    ///   `tree_type`, `level_count`, `filter_hash_type`)
     /// - propagates Block I/O / verification errors from the
-    ///   reader
+    ///   reader (including [`crate::Error::ManifestFooterInvalid`]
+    ///   for footer-level corruption)
     pub fn decode_from(reader: &mut ManifestArchiveReader) -> Result<Self, crate::Error> {
         let format_version_bytes = reader.read_section("format_version")?;
         let version = {

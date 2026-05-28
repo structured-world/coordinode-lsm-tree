@@ -77,14 +77,19 @@ pub struct TreeInner {
 
     /// Runtime-toggleable configuration. Lockless atomic snapshot.
     ///
-    /// In this crate it is only reachable through the public Tree API
+    /// Reachable through the public Tree API
     /// ([`crate::Tree::runtime_config`] /
-    /// [`crate::Tree::update_runtime_config`]); no write path consults
-    /// it yet. Intended to be loaded by write paths (block write,
-    /// manifest commit, compaction) once the V5-batch format features
-    /// wire them in, so that live config changes are picked up without
-    /// coordination. Read paths remain config-independent — each block
-    /// / manifest self-describes via its own header.
+    /// [`crate::Tree::update_runtime_config`]). Manifest-touching
+    /// write paths — `version::persist_version`,
+    /// `compaction::worker::Options`,
+    /// `checkpoint::write_current_for_version`, and the flush /
+    /// ingestion sites that drive them — load a snapshot of this
+    /// handle to pick the manifest writer's `BlockTransform`
+    /// variant (footer mirror on/off, `page_ecc`, encryption). SST
+    /// data-block write paths still consume the static
+    /// `Config::page_ecc` only — wiring through the SST writer
+    /// is a follow-up. Read paths stay config-independent: each
+    /// Block self-describes via its own header.
     //
     // no-std: Tree itself is std-bound. For no_std consumers needing
     // runtime-toggleable config, use spin::RwLock<RuntimeConfig> as

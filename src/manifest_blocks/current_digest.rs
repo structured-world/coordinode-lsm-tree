@@ -29,8 +29,12 @@
 //!   per TOC entry. Sort order makes the digest insensitive to TOC
 //!   reordering that doesn't change the logical manifest. Each
 //!   section's content is bound through its own
-//!   [`Block::header::checksum`] (XXH3-128 of the on-disk Block
-//!   bytes — computed at write time, copied verbatim into the TOC).
+//!   [`Block::header::checksum`] — XXH3-128 over the section
+//!   Block's payload bytes (post-compression / post-encryption
+//!   stream, same bytes the Block layer's own integrity check
+//!   covers); the Block header and optional ECC trailer are
+//!   outside the hash input. Computed at write time, copied
+//!   verbatim into the TOC.
 //!
 //! ## What this digest does NOT bind
 //!

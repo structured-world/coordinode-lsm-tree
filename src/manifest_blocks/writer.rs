@@ -307,10 +307,17 @@ impl ManifestArchiveWriter {
         if mirror_enabled {
             // Seek back to offset 0, write the same Block bytes,
             // then zero-pad the remainder of the reserved region.
-            // The padding bytes are covered by the Block's XXH3
-            // (they're outside the Block's `data_length`, so they
-            // don't affect verification — the reader uses the
-            // declared `data_length` to bound the payload read).
+            // The padding bytes are NOT covered by the Block's
+            // XXH3 — they live outside the Block's `data_length`,
+            // so the reader bounds its payload read by
+            // `data_length` and never feeds the padding through
+            // the verify path. The padding's only contract is
+            // "harmless to leave at zero"; non-zero padding
+            // wouldn't fail verification, it would just be
+            // ignored, so callers must not rely on tamper
+            // detection in this region (the AEAD / ECC story for
+            // the head mirror is the surrounding Block bytes,
+            // not the pad).
             //
             // Byte-copy (not re-encode at offset 0) is correct
             // here because the current AEAD path

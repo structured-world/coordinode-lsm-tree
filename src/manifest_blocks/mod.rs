@@ -23,7 +23,7 @@
 //!                                       layout version)
 //! ```
 //!
-//! All Block-level protections (XXH3-64 checksum, optional ECC, optional
+//! All Block-level protections (XXH3-128 checksum, optional ECC, optional
 //! AEAD) apply through the standard [`Block::write_into`] /
 //! [`Block::from_reader`] pipeline.
 //! Manifest gets bit-rot defence + (optional) encryption + (optional)
