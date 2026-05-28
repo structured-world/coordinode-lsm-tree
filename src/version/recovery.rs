@@ -99,17 +99,24 @@ fn decode_blob_entry_payload(payload: &[u8]) -> crate::Result<(BlobFileId, Check
 /// so the tail-first / head-mirror-fallback recovery path applies
 /// here too: a torn or corrupted trailing size-hint can be
 /// recovered through the head mirror without first tripping the
-/// CURRENT-pointer validation. The section bytes themselves are
-/// the load-bearing content (per-Block XXH3 still catches
-/// in-section bit-rot at read time); the digest's job is accidental
-/// substitution / mislinking detection — e.g., a sysadmin renaming
-/// `v0` over `v1`, a copy/restore that picks the wrong file, or
-/// half-applied snapshot recovery. XXH3-128 is NOT a cryptographic
-/// MAC: an attacker with write access to both CURRENT and the
-/// manifest file can substitute matching content without detection.
-/// Adversarial tamper resistance is provided separately by the
-/// AEAD layer when `Config::encryption` is on; this digest's job
-/// is integrity, not authentication.
+/// CURRENT-pointer validation.
+///
+/// The stored digest is the canonical XXH3-128 over (`version_id` +
+/// `layout_version` + flags + sorted TOC entries with each section's
+/// own XXH3-128). See [`crate::manifest_blocks::current_digest`]
+/// for the exact serialisation and threat model. Critically: this
+/// digest does NOT cover raw on-disk section bytes — per-Block
+/// XXH3 + Page ECC (when enabled) handle section corruption on
+/// `read_section`, and a section bit-flip that ECC heals at decode
+/// time does not invalidate the CURRENT pointer here. That's the
+/// point: the CURRENT layer binds logical identity, the Block
+/// layer handles bit-level integrity, and ECC recovery actually
+/// works for manifest sections.
+///
+/// XXH3-128 is NOT a cryptographic MAC: an attacker with write
+/// access can craft matching content. For adversarial tamper
+/// resistance enable `Config::with_encryption(...)` (AEAD per
+/// Block).
 pub fn get_current_version(
     folder: &Path,
     fs: &dyn Fs,
@@ -163,24 +170,14 @@ pub fn get_current_version(
         other => other,
     })?;
 
-    let section_end = archive
-        .footer()
-        .sections
-        .iter()
-        .try_fold(0_u64, |acc, e| {
-            e.block_offset
-                .checked_add(u64::from(e.block_size))
-                .ok_or(crate::Error::ManifestFooterInvalid(
-                    "TOC entry offset + size overflows u64",
-                ))
-                .map(|end| acc.max(end))
-        })?
-        .max(crate::manifest_blocks::HEAD_FOOTER_RESERVED_SIZE);
-    let section_start = crate::manifest_blocks::HEAD_FOOTER_RESERVED_SIZE;
-    let section_length = section_end.saturating_sub(section_start);
-
-    let computed =
-        crate::file::hash_file_range_xxh3(fs, &manifest_path, section_start, section_length)?;
+    // Recompute the CURRENT digest from the parsed footer payload
+    // and compare against the value stamped at write time. The
+    // footer arrived through `ManifestArchiveReader::open` — tail-
+    // first with head-mirror fallback — so a torn tail recoverable
+    // via the mirror still produces the right digest here. No raw
+    // section-byte hashing: per-Block ECC on `read_section` keeps
+    // its repair authority.
+    let computed = crate::manifest_blocks::current_digest::compute(version_id, archive.footer())?;
     if computed != stored_checksum {
         return Err(crate::Error::ChecksumMismatch {
             got: Checksum::from_raw(computed),
@@ -1100,32 +1097,25 @@ mod tests {
     /// Write a CURRENT pointer so `recover()` can find the version file.
     ///
     /// Must be called AFTER the `v{id}` manifest file exists — the
-    /// pointer's checksum field is computed from the manifest's
-    /// current bytes via [`crate::file::hash_file_range_xxh3`] over
-    /// the section region. Fixtures
+    /// pointer's checksum is the canonical digest derived from the
+    /// manifest's parsed footer (TOC + per-section XXH3-128s) via
+    /// [`crate::manifest_blocks::current_digest::compute`]. Fixtures
     /// that test corruption-recovery typically write the corrupted
     /// manifest first, then call this to stamp the CURRENT pointer
-    /// with the hash of the (intentionally) corrupted bytes — that
-    /// way `get_current_version` accepts the pointer and corruption
-    /// is exposed by the manifest-decode path, not the pointer-
-    /// validation path.
+    /// — the digest binds the TOC (which the corruption inside a
+    /// section payload doesn't touch), so `get_current_version`
+    /// accepts the pointer and the per-Block / per-record check
+    /// downstream is the one that surfaces the corruption.
     fn write_current(folder: &Path, version_id: u64, fs: &dyn Fs) -> crate::Result<()> {
-        use crate::manifest_blocks::{HEAD_FOOTER_RESERVED_SIZE, TAIL_FOOTER_SIZE_HINT_BYTES};
-        use std::io::SeekFrom;
         let manifest_path = folder.join(format!("v{version_id}"));
-        let file_len = fs.metadata(&manifest_path)?.len;
-        let mut f = fs.open(&manifest_path, &FsOpenOptions::new().read(true))?;
-        f.seek(SeekFrom::Start(file_len - TAIL_FOOTER_SIZE_HINT_BYTES))?;
-        let footer_size = u64::from(f.read_u32::<LittleEndian>()?);
-        drop(f);
-        let section_end = file_len - TAIL_FOOTER_SIZE_HINT_BYTES - footer_size;
-        let section_length = section_end.saturating_sub(HEAD_FOOTER_RESERVED_SIZE);
-        let checksum = crate::file::hash_file_range_xxh3(
-            fs,
+        let archive = crate::manifest_blocks::reader::ManifestArchiveReader::open(
             &manifest_path,
-            HEAD_FOOTER_RESERVED_SIZE,
-            section_length,
+            fs,
+            std::sync::Arc::new(crate::runtime_config::RuntimeConfig::default()),
+            None,
         )?;
+        let checksum =
+            crate::manifest_blocks::current_digest::compute(version_id, archive.footer())?;
         let path = folder.join(CURRENT_VERSION_FILE);
         let mut f = fs.open(
             &path,

@@ -1,8 +1,8 @@
 use crate::{
     encryption::EncryptionProvider,
-    file::{CURRENT_VERSION_FILE, fsync_directory, hash_file_range_xxh3, rewrite_atomic},
+    file::{CURRENT_VERSION_FILE, fsync_directory, rewrite_atomic},
     fs::Fs,
-    manifest_blocks::{HEAD_FOOTER_RESERVED_SIZE, writer::ManifestArchiveWriter},
+    manifest_blocks::{current_digest, writer::ManifestArchiveWriter},
     runtime_config::RuntimeConfig,
     version::Version,
 };
@@ -53,28 +53,31 @@ pub fn persist_version(
     // runtime config.
     let mut writer = ManifestArchiveWriter::create(&path, fs, runtime, encryption)?;
     version.encode_into(&mut writer, comparator_name)?;
-    let section_end = writer.finish()?;
+    let footer = writer.finish()?;
 
     // IMPORTANT: fsync folder on Unix
     fsync_directory(folder, fs)?;
 
-    // Stamp the CURRENT pointer with an XXH3-128 over the section
-    // bytes ONLY — the [HEAD_FOOTER_RESERVED_SIZE, section_end)
-    // range. Excluding the head mirror + tail footer + size-hint
-    // trailer means a torn or bit-rotted tail that
-    // ManifestArchiveReader recovers through the head-mirror
-    // fallback does NOT trip the CURRENT pointer's integrity check
-    // first. The section bytes are the load-bearing content
-    // (per-Block XXH3 still catches in-section bit-rot at read
-    // time); the digest's job is detecting accidental substitution
-    // or mislinking — e.g., a copy/restore picking the wrong
-    // manifest, a half-applied snapshot recovery, or a sysadmin
-    // renaming v0 over v1. XXH3-128 is NOT a cryptographic MAC: an
-    // adversary with write access can craft matching content and
-    // bypass this check. For adversarial tamper resistance enable
-    // `Config::encryption` (AEAD authenticates every Block).
-    let section_length = section_end.saturating_sub(HEAD_FOOTER_RESERVED_SIZE);
-    let checksum = hash_file_range_xxh3(fs, &path, HEAD_FOOTER_RESERVED_SIZE, section_length)?;
+    // CURRENT pointer carries a content-binding XXH3-128 over the
+    // canonical footer payload (version_id + layout_version + flags +
+    // sorted TOC entries that include each section's own XXH3-128
+    // from its Block header). Compared to the earlier raw-byte hash
+    // over `[HEAD_FOOTER_RESERVED_SIZE, section_end)`, this preserves
+    // per-Block Page ECC repair on read: a section bit-flip that
+    // ECC heals at decode time no longer trips this checksum,
+    // because the digest is computed from writer-time section
+    // checksums (which the section Block's own header carries on
+    // read regardless of disk corruption).
+    //
+    // Threat coverage:
+    //   T1 (mislinking) — version_id + TOC bind logical identity
+    //   T2 (half-recovery) — caught earlier by ManifestArchiveReader
+    //                        before the digest is computed
+    //   T3 (bit-rot)    — caught per-Block by XXH3; ECC repairs
+    //                     when enabled; CURRENT no longer interferes
+    //   T4 (adversarial) — out of scope; enable Config::with_encryption
+    //                      for per-Block AEAD authentication
+    let checksum = current_digest::compute(version.id(), &footer)?;
 
     let mut current_file_content = vec![];
     current_file_content.write_u64::<LittleEndian>(version.id())?;
