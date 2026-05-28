@@ -466,7 +466,18 @@ impl CompactionStrategy for Strategy {
 
     #[expect(clippy::too_many_lines)]
     fn choose(&self, version: &Version, config: &Config, state: &CompactionState) -> Choice {
-        assert!(version.level_count() == 7, "should have exactly 7 levels");
+        // Tie the invariant to the caller-supplied `Config::level_count`
+        // rather than a literal so a tree explicitly configured with a
+        // non-default level count does not panic here. The assertion still
+        // fires when a `Version` carries a different count than the
+        // `Config` driving this compactor invocation — that mismatch is a
+        // real bug (Version and Config disagree).
+        assert!(
+            version.level_count() == usize::from(config.level_count),
+            "leveled compaction requires version.level_count() == config.level_count (got version={}, config={})",
+            version.level_count(),
+            config.level_count,
+        );
         let cmp = config.comparator.as_ref();
 
         // Trivial move into Lmax
