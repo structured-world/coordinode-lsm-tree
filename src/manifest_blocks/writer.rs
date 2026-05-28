@@ -226,14 +226,21 @@ impl ManifestArchiveWriter {
     /// - [`crate::Error::Io`] on writer / seek / sync failure.
     /// - Propagates Block I/O errors from the tail / head writes.
     ///
-    /// On success returns the byte offset of the first byte AFTER
-    /// the last section Block — i.e. the start of the tail footer
-    /// Block. The caller uses this to compute a "section bytes
-    /// only" digest for the CURRENT pointer (excluding the
-    /// recoverable footer + size-hint trailer + head mirror).
-    pub fn finish(mut self) -> crate::Result<u64> {
+    /// On success returns the finalised [`FooterPayload`] (TOC +
+    /// layout version + flags) — the caller feeds this into
+    /// [`crate::manifest_blocks::current_digest::compute`] to derive
+    /// the CURRENT pointer's content-binding digest. The per-section
+    /// `section_checksum` values inside the payload were populated
+    /// from each section Block's own header during flush, so the
+    /// returned struct already binds section content into the
+    /// canonical digest input.
+    pub fn finish(mut self) -> crate::Result<FooterPayload> {
         self.flush_current_section()?;
         let section_end = self.write_cursor;
+        // section_end is needed for `MAX_MANIFEST_BLOCK_SIZE`-aware
+        // header bookkeeping but no longer surfaces to callers — the
+        // CURRENT digest is computed from the FooterPayload now.
+        let _ = section_end;
 
         let mirror_enabled = self.runtime.manifest_footer_mirror;
         let flags = if mirror_enabled {
@@ -338,7 +345,7 @@ impl ManifestArchiveWriter {
         }
 
         self.file.sync_all()?;
-        Ok(section_end)
+        Ok(payload)
     }
 
     /// Flush the currently buffered section (if any) into a
@@ -403,10 +410,27 @@ impl ManifestArchiveWriter {
             ),
         )?;
 
+        // Extract the section Block's XXH3-128 checksum from the
+        // just-written bytes by decoding the header (the body bytes
+        // we wrote — header_serialized_len() leading bytes of
+        // `block_bytes`). The TOC entry carries this checksum so
+        // the CURRENT pointer's content-binding digest is computed
+        // over the canonical TOC + per-section content hashes,
+        // letting `Block::from_reader` run its own ECC repair on
+        // section read without the CURRENT pointer short-circuiting
+        // the recovery (see issue #297, V5-2 manifest hardening).
+        let section_checksum = {
+            use crate::coding::Decode;
+            use crate::table::block::Header;
+            let mut cursor = std::io::Cursor::new(block_bytes.as_slice());
+            Header::decode_from(&mut cursor)?.checksum.into_u128()
+        };
+
         self.toc.push(TocEntry {
             name: section.name,
             block_offset,
             block_size,
+            section_checksum,
         });
         Ok(())
     }
