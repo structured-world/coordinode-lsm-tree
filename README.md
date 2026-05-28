@@ -122,7 +122,7 @@ cargo run --release --features flamegraph -- \
 
 ## Manifest hardening
 
-The per-version manifest file (`v{N}`) is stored as a sequence of standard lsm-tree `Block`s — one `BlockType::Manifest` Block per section, plus a `BlockType::ManifestFooter` Block at the tail carrying the table of contents and the manifest layout version. Every Block goes through the same XXH3-64 / optional ECC / optional AEAD pipeline data Blocks use, so every protection that applies to a data Block automatically applies to the manifest.
+The per-version manifest file (`v{N}`) is stored as a sequence of standard lsm-tree `Block`s — one `BlockType::Manifest` Block per section, plus a `BlockType::ManifestFooter` Block at the tail carrying the table of contents and the manifest layout version. Every Block goes through the same XXH3-128 / optional ECC / optional AEAD pipeline data Blocks use, so every protection that applies to a data Block automatically applies to the manifest.
 
 Five layers compose the manifest's integrity surface; each is independently togglable:
 

@@ -24,7 +24,10 @@ impl TocWriter {
 
         writer.write_all(TOC_MAGIC)?;
         writer.write_u32::<LE>(
-            #[expect(clippy::expect_used)]
+            #[expect(
+                clippy::expect_used,
+                reason = "expect message documents the invariant: a TOC with >=2^32 entries is impossible by construction; panicking on the unreachable overflow is preferred over silent truncation"
+            )]
             u32::try_from(entries.len())
                 .expect("table of contents should not have 4 billion or more entries"),
         )?;

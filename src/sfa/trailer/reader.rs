@@ -7,7 +7,10 @@ use crate::sfa::{Result, checksum::Checksum};
 use byteorder::ReadBytesExt;
 use std::io::{Read, Seek, SeekFrom};
 
-#[expect(clippy::cast_possible_wrap)]
+#[expect(
+    clippy::cast_possible_wrap,
+    reason = "TRAILER_MAGIC.len() is a fixed small constant from the upstream sfa format (well under i64::MAX); the cast to i64 here matches the SeekFrom::End(-TRAILER_SIZE) call site and cannot wrap"
+)]
 const TRAILER_SIZE: i64 = TRAILER_MAGIC.len() as i64 + 1 + 1 + 16 + 8 + 8;
 
 #[derive(Debug, Eq, PartialEq)]
