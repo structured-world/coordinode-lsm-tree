@@ -4,10 +4,29 @@
 //! AAD-bound encryption threat-model regression suite.
 //!
 //! Each scenario in this file exercises one documented attack against
-//! the AAD-bound block format and asserts that the per-block AEAD
-//! verification surfaces it as
-//! [`DecryptError::AeadVerificationFailed`] (NOT as a panic, NOT as
-//! a silent wrong-plaintext, NOT as a generic IO error).
+//! the AAD-bound block format and asserts that the call surfaces a
+//! TYPED [`DecryptError`] variant (NOT a panic, NOT a silent
+//! wrong-plaintext, NOT a generic IO error). The specific variant
+//! depends on which gate catches the tamper:
+//!
+//! - [`DecryptError::AeadVerificationFailed`] for scenarios that
+//!   reach AEAD tag verification (block swap, cross-table swap,
+//!   cross-tree swap, BlockType / CompressionType / supported-suite
+//!   relabel, ciphertext / nonce bit-flip).
+//! - [`DecryptError::MalformedMetadataFrame`] for tampers that
+//!   violate the codec-consistency gate before AAD is rebuilt
+//!   (WindowLog!=0 with non-zstd CompressionType, DictID!=0 with
+//!   non-ZstdDict CompressionType).
+//! - [`DecryptError::UnsupportedSuite`] for unregistered suite
+//!   byte (caught at the typed-byte gate).
+//! - [`DecryptError::UnsupportedFormatVersion`] for HeaderByte
+//!   high-nibble tamper.
+//! - [`DecryptError::UnknownKeyEpoch`] / `AeadVerificationFailed`
+//!   for KeyEpoch tamper (depends on whether the swapped epoch
+//!   happens to be in the chain).
+//!
+//! The contract pinned across all scenarios: NO silent
+//! wrong-plaintext.
 //!
 //! Reference: AAD-bound block wire format spec (locked layout, 38-byte
 //! AAD) — see `docs/aad-block-format.md` §5.3.
@@ -277,13 +296,18 @@ fn suite_id_unsupported_rejected_before_aead() {
     bytes[META_SUITE_ID] ^= 0x0F;
 
     let err = decrypt_block(&bytes, &id, &chain).expect_err("must fail");
-    // The unregistered-suite gate is documented as MalformedMetadataFrame
-    // or UnsupportedSuite (which DecryptError variant the impl uses).
-    // Either way it must NOT be AeadVerificationFailed (that would
-    // mean the suite byte passed the early gate).
+    // Pin the exact typed variants the early-suite-byte gate is allowed
+    // to return: UnsupportedSuite (current impl) or MalformedMetadataFrame
+    // (acceptable alternative if the decoder rolls the unknown-suite case
+    // into the generic malformed-payload variant). Broadening this to
+    // "any non-AeadVerificationFailed error" would silently accept
+    // unrelated regressions (UnknownKeyEpoch, MalformedBodyFrame, etc.).
     assert!(
-        !matches!(err, DecryptError::AeadVerificationFailed),
-        "unsupported suite byte must be caught before AEAD, got {err:?}"
+        matches!(
+            err,
+            DecryptError::UnsupportedSuite { .. } | DecryptError::MalformedMetadataFrame(_)
+        ),
+        "expected UnsupportedSuite or MalformedMetadataFrame, got {err:?}"
     );
 }
 
