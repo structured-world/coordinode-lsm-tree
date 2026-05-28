@@ -380,6 +380,8 @@ fn write_current_for_version(
     target_fs: &dyn Fs,
     target_root: &Path,
     version_id: u64,
+    runtime: Arc<crate::runtime_config::RuntimeConfig>,
+    encryption: Option<Arc<dyn crate::encryption::EncryptionProvider>>,
 ) -> crate::Result<()> {
     use crate::checksum::ChecksumType;
     use crate::file::rewrite_atomic;
@@ -394,17 +396,13 @@ fn write_current_for_version(
     // bit-identical digest computation between writer and reader
     // paths: any mismatch is a real bug, not a derivation drift.
     //
-    // Runtime config / encryption are placeholder defaults: the
-    // reader's only use of them is picking the `BlockTransform`
-    // variant for the footer Block, which decodes regardless of
-    // ECC / AEAD presence since the per-Block header is
-    // self-describing.
-    let archive = ManifestArchiveReader::open(
-        &manifest_path,
-        target_fs,
-        Arc::new(crate::runtime_config::RuntimeConfig::default()),
-        None,
-    )?;
+    // Runtime + encryption come from the checkpoint driver and
+    // mirror the snapshot used by the preceding `persist_version`
+    // call — otherwise the reader would try to decode an
+    // encryption-wrapped manifest without the provider and fail to
+    // produce the footer, leaving the checkpoint with a dangling
+    // (manifest written, no CURRENT) state.
+    let archive = ManifestArchiveReader::open(&manifest_path, target_fs, runtime, encryption)?;
     let checksum = current_digest::compute(version_id, archive.footer())?;
 
     let mut content = vec![];
@@ -474,8 +472,8 @@ pub fn copy_metadata(
         version,
         comparator_name,
         target_fs,
-        runtime,
-        encryption,
+        Arc::clone(&runtime),
+        encryption.clone(),
     )?;
     // CURRENT pointer is generated fresh for the captured `version_id`
     // (NOT copied from source) so a concurrent publish to `v<N+1>` on
@@ -487,7 +485,12 @@ pub fn copy_metadata(
     // checkpoint retried. `PartialCheckpointGuard` performs that
     // removal on the normal error path; an unclean crash (no Drop) is
     // the only case the operator must clean up manually.
-    write_current_for_version(target_fs, target_root, version.id())?;
+    //
+    // The runtime + encryption snapshot here MUST match what
+    // `persist_version` above used — the helper reopens the manifest
+    // via `ManifestArchiveReader`, and an encrypted manifest reopened
+    // without its provider would fail to decode the footer Block.
+    write_current_for_version(target_fs, target_root, version.id(), runtime, encryption)?;
     Ok(())
 }
 
