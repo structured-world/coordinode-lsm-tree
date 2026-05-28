@@ -196,10 +196,16 @@ fn window_log_tamper_on_disk_fails() {
     let chain = key_chain();
     let id = identity(7, 99, 0x1000);
     let mut bytes = encrypt_block(PLAINTEXT_A, &id, &ctx(), &chain).expect("encrypt");
-    // The original WindowLog is 0 (no zstd in test). Setting it to
-    // a non-zero value would normally fail the encoder's
-    // codec-consistency check, but on a sealed block it propagates
-    // straight into AAD reconstruction and the tag won't match.
+    // The original block was sealed with CompressionType=None and
+    // WindowLog=0. Setting WindowLog to a non-zero value on the
+    // sealed bytes makes the on-disk MetadataPayload internally
+    // inconsistent (WindowLog!=0 requires zstd codec). The decoder
+    // catches this at the metadata-consistency gate BEFORE
+    // rebuilding AAD, surfacing MalformedMetadataFrame — which is
+    // the early-rejection branch of the accept-list below. A future
+    // companion test that seals with zstd would exercise the
+    // AAD-verify branch; this test pins the rejection contract
+    // either way: no silent acceptance of a mismatched WindowLog.
     bytes[META_WINDOW_LOG] = 10;
 
     let err = decrypt_block(&bytes, &id, &chain).expect_err("must fail");
@@ -362,11 +368,13 @@ fn ciphertext_bit_flip_fails_aead_verify() {
 
 #[test]
 fn nonce_bit_flip_fails_aead_verify() {
-    // The 12-byte nonce sits at the start of the BodyFrame payload.
-    // Flipping a single bit re-derives the AEAD keystream and the
-    // tag mismatches. Pinned because nonce tampering is the easiest
-    // attack to misclassify as "garbled plaintext" if the verify
-    // step were ever weakened.
+    // The 12-byte nonce lives inside MetadataPayload at offsets
+    // 18-29 (see the MetadataPayload layout: HeaderByte ... DictID
+    // ... WindowLog ... Nonce ... Tag — the BodyFrame payload is
+    // pure ciphertext, no nonce inside it). Flipping a single bit
+    // re-derives the AEAD keystream and the tag mismatches. Pinned
+    // because nonce tampering is the easiest attack to misclassify
+    // as "garbled plaintext" if the verify step were ever weakened.
     let chain = key_chain();
     let id = identity(7, 99, 0x1000);
     let mut bytes = encrypt_block(PLAINTEXT_A, &id, &ctx(), &chain).expect("encrypt");
