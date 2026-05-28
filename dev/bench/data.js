@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779985124863,
+  "lastUpdate": 1779989999005,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -10920,6 +10920,84 @@ window.BENCHMARK_DATA = {
             "value": 455893.064081674,
             "unit": "ops/sec",
             "extra": "P50: 2.0us | P99: 5.6us | P99.9: 8.1us\nthreads: 1 | elapsed: 0.44s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "bd21aa705f7ef5a113e9f7b1e33e3d0add9de260",
+          "message": "feat(manifest): Blocks-based manifest hardening (#297) (#357)\n\n## Summary\n\nReplaces the sfa-based per-version manifest file (`v{N}`) with a\nsequence\nof standard lsm-tree `Block`s. Every section payload is wrapped in a\n`BlockType::Manifest` Block; the table-of-contents lives in a\n`BlockType::ManifestFooter` Block at the tail, mirrored into a 4 KiB\nreservation at file offset 0 for partial-write recovery.\n\nManifest inherits the standard Block pipeline (XXH3-64 checksum,\noptional Page ECC, optional AEAD encryption) — toggles flow from\n`RuntimeConfig` (footer mirror, page_ecc per-scope overrides) and\n`Config` (encryption provider, initial `RuntimeConfig` snapshot).\n\nCloses #297.\n\n## What lands in this PR\n\n### Core (manifest format + plumbing)\n\n- `src/manifest_blocks/` — `FooterPayload` codec,\n`ManifestArchiveWriter`,\n  `ManifestArchiveReader` (tail-first with head-mirror fallback)\n- `BlockType::Manifest` (wire tag 7) and `BlockType::ManifestFooter`\n  (wire tag 8). Wire tags 5 and 6 stay reserved for parallel V5-3\n  per-KV variants\n- `RuntimeConfig` extensions: `manifest_footer_mirror` (default on),\n  `manifest_kv_checksums` (plumbed for forward compat; on-disk wiring\n  lands with #298 `DataKvChecked` block variant), `page_ecc` +\n  per-scope ECC overrides (consumed by manifest writer / reader;\n  SST data-block ECC still gated by `Config::page_ecc` until SST\n  writers consume `RuntimeConfig`)\n- `Config::with_runtime_config` builder + `initial_runtime_config`\n  field seed both the first manifest write AND the live\n  `RuntimeConfigHandle`\n- `version::persist_version` uses the new writer with seeded runtime\n  + `Config::encryption`\n- `Manifest::decode_from` + `version::recovery::recover` use the new\n  reader with the same runtime + encryption\n- `Tree::runtime_config` is now `Arc<RuntimeConfigHandle>` so\n  compaction can clone the handle and `load_full()` at its own\n  manifest-write sites\n- `compaction::worker::Options` + `checkpoint::CheckpointParams` gain\n  runtime + encryption fields so every manifest-write call site\n  inherits the same provider\n\n### CURRENT pointer (Option D — canonical content digest)\n\n- `TocEntry` carries `section_checksum: u128` — XXH3-128 copied\n  verbatim from each section Block's own header at write time\n- New `manifest_blocks::current_digest::compute(version_id, footer)`\n  produces an XXH3-128 over a canonical serialisation of\n  `(version_id, layout_version, flags, sorted [(name, offset, size,\n  section_checksum)])`\n- `persist_version` and `checkpoint::write_current_for_version` stamp\n  CURRENT with this digest; `get_current_version` re-derives it from\n  the parsed footer on read. **No raw-byte hashing of the section\n  range any more.**\n- Per-Block Page ECC repair on `read_section` now actually works:\n  a section bit-flip that ECC heals at decode time does NOT trip\n  the CURRENT digest, because the bound value is the writer-time\n  section checksum (carried in the TOC), not the on-disk bytes.\n  README's L2 \"detect-and-recover\" claim is now correct for\n  manifest sections too.\n\n### Vendored sfa\n\n- sfa vendored under `src/sfa/` (MIT/Apache-2.0, v1.0.0);\n  external crates.io dep dropped\n- Vendored checksum_writer bug fix (hash only bytes the inner\n  writer actually accepted)\n- TOC reader: dropped pre-allocation from unverified length field;\n  TOC magic mismatch → `InvalidHeader` (was `InvalidVersion`);\n  `Read::take(toc_len)` bound on parser to cap DoS-shaped reads\n\n### Hardening (added during review)\n\n- Reader validates `block.header.block_type` against expected\n  (`Manifest` for section reads, `ManifestFooter` for tail/head)\n  as defence in depth above the AAD/checksum binding\n- Reader peeks each Block's inner header against the outer buffer\n  size BEFORE delegating to `Block::from_reader` (`validate_block_\n  header_fits` helper) so a forged inner `data_length` can't bait\n  the Block decoder into allocating multi-MiB before the bounded\n  cursor errors. Same helper used at all three sites (section,\n  tail footer, head mirror), with a `HeaderContext` enum to route\n  failures to either `ManifestFooterInvalid` or\n  `ManifestSectionInvalid`.\n- New error variant `ManifestSectionInvalid(&'static str)`\n  separates per-section errors (missing TOC entry, wrong block_type,\n  header doesn't fit slot) from footer / TOC discovery errors\n- Writer `Write::write` enforces incremental payload size cap so\n  an adversarial / buggy caller can't grow `section.buf` to\n  gigabytes before `flush_current_section` catches it\n- Writer `start()` defers `section_names` insert until after the\n  flush succeeds — failed flush no longer poisons the duplicate\n  check for retry\n- Writer uses `checked_add` (not `saturating_add`) on\n  `write_cursor`; overflow surfaces as `ManifestFooterInvalid`\n  instead of silently clamping TOC offsets\n- `version::get_current_version` distinguishes missing CURRENT\n  from missing manifest: a deleted `v{N}` file with CURRENT still\n  pointing at it now surfaces as `ManifestFooterInvalid` instead\n  of being absorbed by `Tree::open`'s `Io(NotFound)` →\n  `create_new` arm (regression test asserts CURRENT pointer stays\n  unchanged on failed open)\n- `manifest.rs` `level_count` empty / truncated section maps to\n  `InvalidHeader(\"level_count\")` instead of bubbling\n  `Io(UnexpectedEof)` from `Cursor::read_u8`\n- `sfa::Result` promoted to `pub` (was `pub(crate)`, leaked through\n  `pub mod sfa`'s `pub fn` returns; tripped `private_interfaces`)\n\n### Documentation\n\n- README **Manifest hardening** section with the 5-layer integrity\n  table, recovery-mode behaviour, and corrected description of\n  partial-write rollback (per-version atomic CURRENT rewrite, not\n  in-file head-mirror snapshot) and CURRENT-digest binding\n  (canonical footer content, not raw section bytes)\n\n## Format details\n\n- `manifest_layout_version = 1` (carried in footer payload;\n  decoupled from crate `FormatVersion`)\n- `TocEntry` wire format: `name_len: u16 | name: bytes | block_offset:\n  u64 | block_size: u32 | section_checksum: u128` per entry\n- `HEAD_FOOTER_RESERVED_SIZE` = 4 KiB (page-aligned, hard ceiling\n  on footer Block size per Q12)\n- `MAX_MANIFEST_BLOCK_SIZE` = 16 MiB per section Block (absolute\n  cap against forged TOC entries; production manifests use\n  KB-scale)\n- Tail footer-size hint: trailing 4-byte little-endian u32\n- V0 / pre-V5 / legacy sfa manifests not supported (Q10 decision)\n- CURRENT pointer carries XXH3-128 of canonical footer-content\n  digest (`current_digest::compute`), not raw section bytes\n\n## Test plan\n\n- [x] cargo nextest run --all-features — **1701 / 1701 passing**\n- [x] cargo clippy --all-features --all-targets -- -D warnings — clean\n- [x] cargo clippy --no-default-features --features zstd,lz4\n--all-targets -- -D warnings — clean (test-zstd CI job)\n- [x] Manifest write/read roundtrip (plaintext + encrypted)\n- [x] Head-mirror fallback when tail is corrupted (plaintext +\nencrypted, regression test guards future AAD wiring)\n- [x] No head fallback when mirror disabled\n- [x] Section-isolation: bit-flip in one section, others readable\n- [x] recover with all four ManifestRecoveryMode variants\n- [x] Pre-V5 / unsupported-version manifest rejection\n- [x] CURRENT pointer canonical-digest mismatch surfaces\nChecksumMismatch\n- [x] Missing-manifest with present CURRENT surfaces\nManifestFooterInvalid (not silent fresh-init); CURRENT pointer stays\nunchanged on failed open\n- [x] Encrypted tree round-trip (encryption_stress)\n- [x] Block-type identity mismatch surfaces ManifestSectionInvalid\n(sections) / ManifestFooterInvalid (footer)\n- [x] Inner Block header pre-validated against outer buffer cap at all\nthree read sites (section / tail footer / head mirror)\n- [x] sfa TOC reader bounded by toc_len (anti-DoS)\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n## Summary by CodeRabbit\n\n* **New Features**\n* New blocks-based manifest format with reader/writer, TOC/footer,\noptional head-mirror, and runtime-configurable manifest integrity\noptions (checksums, ECC, encryption).\n\n* **Bug Fixes**\n* Stronger detection and clearer errors for corrupted manifests and\nCURRENT checksum mismatches; opening fails when CURRENT points to a\nmissing/invalid manifest.\n\n* **Improvements**\n* Tail→head footer fallback, canonical CURRENT digest binding, and\nmanifest writes now use live runtime snapshots for consistent on-disk\nmetadata.\n\n* **Documentation**\n  * Added manifest hardening guidance and runtime-config usage notes.\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->\n\n## Known: cascade-gating deferred to #358\n\n`pub mod manifest_blocks` and `pub mod sfa` in `src/lib.rs` are\nintentionally NOT cfg-gated behind `feature = \"std\"`. Both modules are\nstd-bound today (`std::io`, `std::fs`, `std::path`, `std::sync`), but\ngating them in isolation explodes the `no-std-check` job error count to\n1219 via unresolved-module cascade through ~20 unconditional consumers\n(`manifest`, `version::{persist,recovery}`, `tree::{inner,mod}`,\n`checkpoint`, `verify`, `inspect`, `table::*`). The whole-layer\nmigration is tracked as #358. Detailed rationale lives in the comments\nat `src/lib.rs:205-215` (manifest_blocks) and `src/lib.rs:222-229`\n(sfa). Reviewers: please do not re-flag.",
+          "timestamp": "2026-05-28T20:39:03+03:00",
+          "tree_id": "366e11b68e59a37c86a177ff017046617d4add96",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/bd21aa705f7ef5a113e9f7b1e33e3d0add9de260"
+        },
+        "date": 1779989997355,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 2005260.7615025868,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.6us | P99.9: 3.7us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1249905.1478230946,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.2us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 510456.86846834543,
+            "unit": "ops/sec",
+            "extra": "P50: 1.8us | P99: 5.2us | P99.9: 7.8us\nthreads: 1 | elapsed: 0.39s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3654108.251787645,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 3.1us | P99.9: 5.5us\nthreads: 1 | elapsed: 0.05s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 380103.1660429044,
+            "unit": "ops/sec",
+            "extra": "P50: 2.3us | P99: 5.7us | P99.9: 8.6us\nthreads: 1 | elapsed: 0.53s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 200030.32299672373,
+            "unit": "ops/sec",
+            "extra": "P50: 4.7us | P99: 6.0us | P99.9: 8.4us\nthreads: 1 | elapsed: 1.00s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1137919.5668040346,
+            "unit": "ops/sec",
+            "extra": "P50: 0.8us | P99: 2.3us | P99.9: 4.4us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1123173.9115633303,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.5us | P99.9: 1.9us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 455083.76071462856,
+            "unit": "ops/sec",
+            "extra": "P50: 2.0us | P99: 6.6us | P99.9: 9.8us\nthreads: 1 | elapsed: 0.44s | num: 200000 | iterations: 3"
           }
         ]
       }
