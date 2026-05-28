@@ -60,10 +60,13 @@ impl TocEntry {
         writer.write_u64::<LE>(self.pos())?;
         writer.write_u64::<LE>(self.len())?;
 
-        writer.write_u16::<LE>(
-            #[expect(clippy::expect_used)]
-            u16::try_from(self.name().len()).expect("section name should not be longer than 65535"),
-        )?;
+        // Section names longer than u16::MAX cannot fit the on-disk length
+        // prefix. Return a structural error instead of panicking: the writer
+        // path is a Result and a forged / programmatically generated section
+        // name is a recoverable caller error, not an invariant violation.
+        let name_len =
+            u16::try_from(self.name().len()).map_err(|_| crate::sfa::Error::InvalidHeader)?;
+        writer.write_u16::<LE>(name_len)?;
         writer.write_all(self.name())?;
 
         Ok(())
