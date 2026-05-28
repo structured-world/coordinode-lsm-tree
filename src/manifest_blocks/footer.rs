@@ -16,10 +16,17 @@
 //! [1]      flags                    : u8   (bit 0 = head mirror populated)
 //! [2..4]   section_count            : u16
 //! [4..]    TOC entries, repeated section_count times:
-//!            name_len    : u16
-//!            name        : [u8; name_len]    (UTF-8, non-empty)
-//!            block_offset: u64               (absolute, from file start)
-//!            block_size  : u32               (Block bytes incl. header + ECC trailer)
+//!            name_len        : u16
+//!            name            : [u8; name_len]    (UTF-8, non-empty)
+//!            block_offset    : u64               (absolute, from file start)
+//!            block_size      : u32               (Block bytes incl. header + ECC trailer)
+//!            section_checksum: u128              (XXH3-128 copied verbatim
+//!                                                  from the section Block
+//!                                                  header at write time;
+//!                                                  binds section content
+//!                                                  into the CURRENT pointer
+//!                                                  digest path, preserving
+//!                                                  per-Block ECC recovery)
 //! ```
 //!
 //! Names are interned by exact byte equality — duplicate names are
@@ -51,6 +58,25 @@ pub struct TocEntry {
     /// optional ECC trailer). Lets a range-reader pull only the
     /// section Block of interest without scanning forward.
     pub block_size: u32,
+
+    /// XXH3-128 of the section Block, copied verbatim from
+    /// [`crate::table::block::Header::checksum`] at write time.
+    ///
+    /// **Why it lives in the TOC:** the CURRENT pointer's content-
+    /// binding digest is computed over the canonical TOC tuple
+    /// `(name, offset, size, section_checksum)`. Including the
+    /// section's own XXH3-128 here transitively binds the section's
+    /// decoded content into the CURRENT digest without requiring
+    /// `get_current_version` to re-hash the raw section byte range
+    /// (which would short-circuit per-Block ECC recovery on read).
+    /// The reader cross-checks this value against the section
+    /// Block's own header on `read_section` for belt-and-braces
+    /// defence against TOC entries that point at a different
+    /// section by offset.
+    ///
+    /// Set to zero only by tests that construct synthetic TOC
+    /// entries; production writers always carry the real checksum.
+    pub section_checksum: u128,
 }
 
 /// In-memory representation of the footer Block payload.
@@ -150,6 +176,7 @@ impl FooterPayload {
             writer.write_all(entry.name.as_bytes())?;
             writer.write_u64::<LittleEndian>(entry.block_offset)?;
             writer.write_u32::<LittleEndian>(entry.block_size)?;
+            writer.write_u128::<LittleEndian>(entry.section_checksum)?;
         }
 
         Ok(())
@@ -199,6 +226,7 @@ impl FooterPayload {
 
             let block_offset = reader.read_u64::<LittleEndian>()?;
             let block_size = reader.read_u32::<LittleEndian>()?;
+            let section_checksum = reader.read_u128::<LittleEndian>()?;
 
             if sections.iter().any(|e: &TocEntry| e.name == name) {
                 return Err(crate::Error::ManifestFooterInvalid(
@@ -210,6 +238,7 @@ impl FooterPayload {
                 name,
                 block_offset,
                 block_size,
+                section_checksum,
             });
         }
 
@@ -247,11 +276,13 @@ mod tests {
                     name: "format_version".to_string(),
                     block_offset: 4096,
                     block_size: 64,
+                    section_checksum: 0xDEAD_BEEF_DEAD_BEEF_DEAD_BEEF_DEAD_BEEF_u128,
                 },
                 TocEntry {
                     name: "tables".to_string(),
                     block_offset: 4160,
                     block_size: 512,
+                    section_checksum: 0xCAFE_BABE_CAFE_BABE_CAFE_BABE_CAFE_BABE_u128,
                 },
             ],
         )
@@ -326,11 +357,13 @@ mod tests {
                 name: "tables".to_string(),
                 block_offset: 4096,
                 block_size: 64,
+                section_checksum: 0,
             },
             TocEntry {
                 name: "tables".to_string(), // duplicate
                 block_offset: 4160,
                 block_size: 64,
+                section_checksum: 0,
             },
         ];
         let payload = FooterPayload::new(0, entries);
@@ -347,6 +380,7 @@ mod tests {
             buf.write_all(e.name.as_bytes()).unwrap();
             buf.write_u64::<LittleEndian>(e.block_offset).unwrap();
             buf.write_u32::<LittleEndian>(e.block_size).unwrap();
+            buf.write_u128::<LittleEndian>(e.section_checksum).unwrap();
         }
         let err = FooterPayload::decode(&buf[..]).expect_err("must reject");
         assert!(matches!(err, crate::Error::ManifestFooterInvalid(_)));
@@ -382,6 +416,7 @@ mod tests {
                 name: String::new(),
                 block_offset: 0,
                 block_size: 0,
+                section_checksum: 0,
             }],
         );
         let mut buf = Vec::new();
@@ -399,6 +434,7 @@ mod tests {
                 name: oversized_name,
                 block_offset: 0,
                 block_size: 0,
+                section_checksum: 0,
             }],
         );
         let mut buf = Vec::new();
