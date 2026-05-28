@@ -420,21 +420,17 @@ pub fn recover(
         // section, so a single bit flip can silently transform it
         // into any other u8 value, and tolerant recovery modes
         // would still produce a `Version` whose `level_count()`
-        // disagrees with the downstream
-        // `assert!(version.level_count() == 7)` in
-        // `src/compaction/leveled/mod.rs`. The architectural fix
-        // is to teach `compaction/leveled` to honour the version's
-        // actual level_count rather than the hardcoded `== 7`;
-        // tracked as a follow-up to this PR's first wave.
-        //
-        // Gating recovery on `level_count == DEFAULT_LEVEL_COUNT`
-        // here would force every fixture that uses sub-default
-        // level counts for compact test manifests to pad to 7
-        // levels even when the test only cares about a single
-        // level's worth of records, which is strictly more
-        // brittleness for no production benefit — real trees
-        // ALWAYS use the default level count, so the hardcoded
-        // downstream assertion only fires on actual corruption.
+        // disagrees with the downstream `assert!` in
+        // `src/compaction/leveled/mod.rs`, which now compares
+        // against `config.level_count` rather than the literal
+        // `7`. Recovery still does not validate the recovered
+        // byte against `DEFAULT_LEVEL_COUNT`: fixtures use sub-
+        // default level counts for compact test manifests, so a
+        // strict gate here would force them to pad to the default
+        // level count even when the test only cares about a single
+        // level's worth of records. The downstream assertion fires
+        // only when a real corruption produces a Version whose
+        // count disagrees with the Config the compactor receives.
 
         'levels: for _ in 0..level_count {
             let mut level = vec![];
@@ -1951,7 +1947,8 @@ mod tests {
     ///    placeholder run with no tables inside".
     /// 3. The number of level SLOTS in `table_ids` must equal the
     ///    persisted `level_count` — downstream code
-    ///    (compaction/leveled asserts `version.level_count() == 7`)
+    ///    (compaction/leveled asserts
+    ///    `version.level_count() == config.level_count`)
     ///    reads `levels.len()` directly and shrinking it crashes
     ///    the tree.
     #[test]
