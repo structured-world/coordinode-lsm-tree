@@ -233,20 +233,52 @@ fn compression_type_tamper_on_disk_fails_aead_verify() {
 }
 
 #[test]
-fn suite_id_tamper_on_disk_fails() {
-    // SuiteID is AAD-mirrored at MetadataPayload offset 3. Tampering
-    // it routes the decrypt path through either an unsupported-suite
-    // typed error OR through AAD verify (when the swapped suite is
-    // still supported). Either typed error is acceptable — what
-    // matters is no silent wrong-plaintext.
+fn suite_id_supported_relabel_fails_aead_verify() {
+    // SuiteID is AAD-mirrored at MetadataPayload offset 3. Swap
+    // AES-256-GCM (0x02) -> ChaCha20-Poly1305 (0x03) — both
+    // SUPPORTED suites, so decode_metadata_payload accepts the byte
+    // and the decrypt path proceeds to rebuild AAD and verify the
+    // tag. The AAD now disagrees on byte 7 (suite_id mirror), so
+    // AEAD verify must surface AeadVerificationFailed. This pins
+    // the contract that SuiteID is part of AAD — a regression that
+    // dropped it from AAD construction would let an attacker swap
+    // a block's declared suite freely between supported suites.
     let chain = key_chain();
     let id = identity(7, 99, 0x1000);
     let mut bytes = encrypt_block(PLAINTEXT_A, &id, &ctx(), &chain).expect("encrypt");
-    bytes[META_SUITE_ID] ^= 0x0F; // flip low nibble
+    // 0x02 ^ 0x01 = 0x03 (supported suite).
+    bytes[META_SUITE_ID] ^= 0x01;
 
     let err = decrypt_block(&bytes, &id, &chain).expect_err("must fail");
-    // Reject in any typed variant — assertion is that no plaintext leaks.
-    let _ = err;
+    assert!(
+        matches!(err, DecryptError::AeadVerificationFailed),
+        "expected AeadVerificationFailed, got {err:?}"
+    );
+}
+
+#[test]
+fn suite_id_unsupported_rejected_before_aead() {
+    // Companion to the supported-relabel case: flipping SuiteID to
+    // an unregistered value must fail at metadata-payload decode
+    // BEFORE the AEAD primitive runs. Documents the second valid
+    // failure mode (early rejection) so the suite-relabel coverage
+    // is complete: supported relabels go through AEAD verify,
+    // unsupported ones are caught at the typed-byte gate.
+    let chain = key_chain();
+    let id = identity(7, 99, 0x1000);
+    let mut bytes = encrypt_block(PLAINTEXT_A, &id, &ctx(), &chain).expect("encrypt");
+    // 0x02 ^ 0x0F = 0x0D (unregistered suite byte).
+    bytes[META_SUITE_ID] ^= 0x0F;
+
+    let err = decrypt_block(&bytes, &id, &chain).expect_err("must fail");
+    // The unregistered-suite gate is documented as MalformedMetadataFrame
+    // or UnsupportedSuite (which DecryptError variant the impl uses).
+    // Either way it must NOT be AeadVerificationFailed (that would
+    // mean the suite byte passed the early gate).
+    assert!(
+        !matches!(err, DecryptError::AeadVerificationFailed),
+        "unsupported suite byte must be caught before AEAD, got {err:?}"
+    );
 }
 
 #[test]
