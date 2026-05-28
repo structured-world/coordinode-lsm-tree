@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779866084129,
+  "lastUpdate": 1779985124863,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -10842,6 +10842,84 @@ window.BENCHMARK_DATA = {
             "value": 452688.41862433945,
             "unit": "ops/sec",
             "extra": "P50: 2.0us | P99: 6.9us | P99.9: 10.0us\nthreads: 1 | elapsed: 0.44s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "aa4892dff9c37d78b2dfe944bc909436c8085eef",
+          "message": "fix(compaction/leveled): tie level-count assertion to config (#359)\n\n## Summary\n\n- Replace the hardcoded `assert!(version.level_count() == 7, ...)` in\n`compaction/leveled` with `assert!(version.level_count() ==\nusize::from(config.level_count), ...)` so the invariant tracks the\ncaller-supplied `Config::level_count` instead of a literal.\n- Include both numbers in the panic message so a future Version/Config\nmismatch surfaces with each side visible.\n- Update the two doc-comment references in `version/recovery.rs` that\nquoted the old literal form.\n\n## Why\n\n`Config::level_count` (default `DEFAULT_LEVEL_COUNT = 7`) is respected\nthroughout the codebase except in the leveled compactor, which pinned\nthe check to `7`. Two consequences:\n\n1. A tree configured with a non-default `level_count` would have\npanicked at compaction time even though the rest of the codebase\naccepted the value.\n2. Manifest recovery cannot validate `level_count` against\n`DEFAULT_LEVEL_COUNT` without breaking tests that use sub-default level\ncounts for compact fixtures — that strict-mode validation is the\nfollow-up unlocked by this change.\n\n## Testing\n\n- Lint clean with -D warnings on all targets / all features.\n- Full workspace nextest run: 1472 passed, 0 failed.\n- Doc tests: 43 passed.\n- No new tests: this is a hygiene change to an invariant expression.\nProduction `Version::new` still constructs with `DEFAULT_LEVEL_COUNT`,\nso the default-config path remains exercised by the existing suite\n(which all 1472 tests now run against `config.level_count` instead of\n`7`).\n\nCloses #350",
+          "timestamp": "2026-05-28T19:17:48+03:00",
+          "tree_id": "4ff8aefcd0019823714c565ccbc08b581167e895",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/aa4892dff9c37d78b2dfe944bc909436c8085eef"
+        },
+        "date": 1779985123890,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 2111797.883034548,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.6us | P99.9: 3.7us\nthreads: 1 | elapsed: 0.09s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1210051.2544434974,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.2us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 520502.1001648152,
+            "unit": "ops/sec",
+            "extra": "P50: 1.8us | P99: 5.1us | P99.9: 7.5us\nthreads: 1 | elapsed: 0.38s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3613674.4911874044,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 3.1us | P99.9: 5.7us\nthreads: 1 | elapsed: 0.06s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 386944.1364648578,
+            "unit": "ops/sec",
+            "extra": "P50: 2.2us | P99: 5.8us | P99.9: 8.6us\nthreads: 1 | elapsed: 0.52s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 202825.9891097372,
+            "unit": "ops/sec",
+            "extra": "P50: 4.6us | P99: 5.8us | P99.9: 8.7us\nthreads: 1 | elapsed: 0.99s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1272734.0934249826,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.2us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1120851.214763135,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.5us | P99.9: 1.9us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 455893.064081674,
+            "unit": "ops/sec",
+            "extra": "P50: 2.0us | P99: 5.6us | P99.9: 8.1us\nthreads: 1 | elapsed: 0.44s | num: 200000 | iterations: 3"
           }
         ]
       }
