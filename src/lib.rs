@@ -211,8 +211,8 @@ mod manifest;
 // hundreds of unresolved-module errors to the `no-std-check` job
 // before unblocking any of them. The cascade migration of this whole
 // std-bound layer (manifest + version + tree + checkpoint) is tracked
-// as a separate task; gating `manifest_blocks` in isolation is not
-// cheap and is the wrong sequencing.
+// as issue #358; gating `manifest_blocks` in isolation is not cheap
+// and is the wrong sequencing.
 #[doc(hidden)]
 pub mod manifest_blocks;
 mod memtable;
@@ -226,7 +226,8 @@ mod run_scanner;
 // types in unconditional code. Gating sfa alone explodes the
 // `no-std-check` error count via unresolved-module failures on
 // every consumer that hasn't been gated yet. Migration is the
-// whole std-bound layer at once, not sfa in isolation.
+// whole std-bound layer at once (tracked as issue #358), not sfa
+// in isolation.
 #[doc(hidden)]
 pub mod sfa;
 
