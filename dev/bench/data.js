@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779989999005,
+  "lastUpdate": 1779993768332,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -10998,6 +10998,84 @@ window.BENCHMARK_DATA = {
             "value": 455083.76071462856,
             "unit": "ops/sec",
             "extra": "P50: 2.0us | P99: 6.6us | P99.9: 9.8us\nthreads: 1 | elapsed: 0.44s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "8f2481092d4fb38d30de63e53f83315a02df53b1",
+          "message": "docs(format_version): document on-disk version bump policy (#360)\n\n## Summary\n\nDocument the amendment policy for both on-disk version identifiers in\nthe crate:\n\n- `crate::FormatVersion` (Block / SST layout)\n- `MANIFEST_LAYOUT_VERSION_V1` (manifest framing — footer fields, TOC\nencoding, head-mirror geometry)\n\nBoth evolve at **independent cadences** and follow the same amendment\nrule: pre-release amendments are free; once a value ships to crates.io,\nANY subsequent on-disk byte change under it requires a new variant /\nconstant — even if otherwise additive.\n\n## Why\n\nPre-V5 the project tolerated in-place layout amendments under unreleased\n`FormatVersion` values. With V5 about to ship (release-plz PR #272 held\nfor the V5 batch), the amendment policy needs to be documented in code\nwhere future contributors will find it. The two-layer distinction\n(block/SST format vs manifest framing) also needs to be explicit so a\nmanifest-only break isn't conflated with a `FormatVersion` bump.\n\n## Changes\n\n- `src/format_version.rs` — extended docstring on `FormatVersion` enum:\namendment policy, relationship table to `manifest_layout_version`,\npractical checklist for PR authors touching on-disk bytes.\n- `src/manifest_blocks/mod.rs` — extended docstring on\n`MANIFEST_LAYOUT_VERSION_V1` with the same pre-release / post-release\namendment rule.\n\n## Testing\n\n- Lint clean (\\`--all-features --lib --tests -- -D warnings\\`)\n- Doc tests: 43 passed, 0 failed\n- No code changes — pure documentation.\n\nCloses #351",
+          "timestamp": "2026-05-28T21:41:44+03:00",
+          "tree_id": "8855bc84572aa94074eeae4c5a5429c615d951a7",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/8f2481092d4fb38d30de63e53f83315a02df53b1"
+        },
+        "date": 1779993766712,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 1884504.539870373,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.7us | P99.9: 3.8us\nthreads: 1 | elapsed: 0.11s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1239355.9694141075,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.3us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 514884.26533173514,
+            "unit": "ops/sec",
+            "extra": "P50: 1.8us | P99: 5.3us | P99.9: 8.1us\nthreads: 1 | elapsed: 0.39s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3563396.3578775264,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 3.2us | P99.9: 5.7us\nthreads: 1 | elapsed: 0.06s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 378710.7623743798,
+            "unit": "ops/sec",
+            "extra": "P50: 2.3us | P99: 5.9us | P99.9: 9.2us\nthreads: 1 | elapsed: 0.53s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 200554.2408701397,
+            "unit": "ops/sec",
+            "extra": "P50: 4.6us | P99: 6.0us | P99.9: 10.5us\nthreads: 1 | elapsed: 1.00s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1149364.113442215,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.2us | P99.9: 4.3us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1112500.4820603651,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.5us | P99.9: 1.9us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 459620.0442433931,
+            "unit": "ops/sec",
+            "extra": "P50: 2.0us | P99: 5.7us | P99.9: 8.3us\nthreads: 1 | elapsed: 0.44s | num: 200000 | iterations: 3"
           }
         ]
       }
