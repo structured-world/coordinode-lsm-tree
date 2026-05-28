@@ -28,10 +28,12 @@
 //!    callers above the manifest layer can route any
 //!    double-path failure as "manifest is unreadable" without
 //!    branching per cause. [`crate::Error::Unrecoverable`] is
-//!    reserved for the narrower case of a file too short to
-//!    contain even the trailing footer-size hint
-//!    (`< HEAD_FOOTER_RESERVED_SIZE + TAIL_FOOTER_SIZE_HINT_BYTES`),
-//!    detected before any Block read is attempted.
+//!    reserved for the narrower case of a file shorter than the
+//!    head reservation itself (`< HEAD_FOOTER_RESERVED_SIZE`) —
+//!    no head mirror exists in that state, so neither path can
+//!    run. A file between `HEAD_FOOTER_RESERVED_SIZE` and
+//!    `HEAD_FOOTER_RESERVED_SIZE + TAIL_FOOTER_SIZE_HINT_BYTES`
+//!    is valid for the head fallback (tail simply skipped).
 //!
 //! Per-section reads use the TOC-recorded `(block_offset, block_size)`
 //! pair to read exactly one Block per call without scanning.
@@ -147,8 +149,14 @@ impl ManifestArchiveReader {
     ///   intentional: callers above this layer treat any
     ///   double-path failure as "manifest is unreadable, surface
     ///   recovery options" rather than branching on per-path cause.
-    /// - [`crate::Error::Unrecoverable`] when the file is too small
-    ///   to contain even the trailing footer-size hint
+    /// - [`crate::Error::Unrecoverable`] when the file is shorter
+    ///   than [`HEAD_FOOTER_RESERVED_SIZE`]: with no head mirror to
+    ///   fall back to, neither recovery path can produce a footer.
+    ///   Files at or above the head reservation but below
+    ///   `HEAD + TAIL_FOOTER_SIZE_HINT_BYTES` are accepted and
+    ///   routed straight to the head-mirror fallback (no tail to
+    ///   try) — the partial-write recovery case where the tail was
+    ///   truncated back to the head reservation.
     pub fn open(
         path: &Path,
         fs: &dyn Fs,
@@ -158,7 +166,15 @@ impl ManifestArchiveReader {
         let mut file = fs.open(path, &FsOpenOptions::new().read(true))?;
         let file_len = file_size(fs, path)?;
 
-        if file_len < HEAD_FOOTER_RESERVED_SIZE + TAIL_FOOTER_SIZE_HINT_BYTES {
+        // Front gate: file must hold at least the head-mirror
+        // reservation. Anything shorter cannot recover via either
+        // path (no head mirror to fall back to). Files between
+        // HEAD_FOOTER_RESERVED_SIZE and HEAD + HINT are valid for
+        // the head-fallback path even though the tail size hint is
+        // missing — that's the partial-write recovery case
+        // (manifest truncated mid-tail-write but head mirror
+        // already populated from a prior successful seal).
+        if file_len < HEAD_FOOTER_RESERVED_SIZE {
             return Err(crate::Error::Unrecoverable);
         }
 
@@ -171,27 +187,42 @@ impl ManifestArchiveReader {
         let footer_transform = build_transform(&runtime, encryption.as_deref());
 
         // ---- Tail path (primary) ----------------------------------
-        let tail_err = match read_tail_footer(&mut file, file_len, &footer_transform) {
-            Ok(footer) => {
-                return Ok(Self {
-                    path: path.to_path_buf(),
-                    file,
-                    footer,
-                    source: FooterSource::Tail,
-                    runtime,
-                    encryption,
-                });
-            }
-            Err(err) => {
-                // We are about to retry from the head mirror; do not
-                // return the tail error yet. Log it at debug so
-                // operators can correlate corruption-matrix events
-                // without crashing.
-                log::debug!(
-                    "manifest tail footer read failed for {}: {err:?}; trying head mirror",
-                    path.display(),
-                );
-                err
+        // Only attempt the tail when the file has room for both the
+        // head reservation AND the trailing size hint. Without the
+        // hint, `read_tail_footer` would underflow / read garbage —
+        // skip straight to the head fallback in that case.
+        let tail_err = if file_len < HEAD_FOOTER_RESERVED_SIZE + TAIL_FOOTER_SIZE_HINT_BYTES {
+            log::debug!(
+                "manifest {} is too short for a tail size hint ({} bytes); skipping tail path, trying head mirror",
+                path.display(),
+                file_len,
+            );
+            crate::Error::ManifestFooterInvalid(
+                "tail size hint absent — file truncated to head reservation only",
+            )
+        } else {
+            match read_tail_footer(&mut file, file_len, &footer_transform) {
+                Ok(footer) => {
+                    return Ok(Self {
+                        path: path.to_path_buf(),
+                        file,
+                        footer,
+                        source: FooterSource::Tail,
+                        runtime,
+                        encryption,
+                    });
+                }
+                Err(err) => {
+                    // We are about to retry from the head mirror; do not
+                    // return the tail error yet. Log it at debug so
+                    // operators can correlate corruption-matrix events
+                    // without crashing.
+                    log::debug!(
+                        "manifest tail footer read failed for {}: {err:?}; trying head mirror",
+                        path.display(),
+                    );
+                    err
+                }
             }
         };
 
@@ -836,13 +867,16 @@ mod tests {
     }
 
     #[test]
-    fn reader_rejects_files_smaller_than_head_plus_hint() {
-        // A file that is structurally too small to even hold the
-        // head reservation + 4-byte trailer hint is unrecoverable
-        // — Unrecoverable rather than ManifestFooterInvalid so
-        // callers can route the "file is truncated / not a
-        // manifest" case differently from "file is a manifest but
-        // its structure is bad".
+    fn reader_rejects_files_smaller_than_head_reservation() {
+        // A file shorter than HEAD_FOOTER_RESERVED_SIZE (4 KiB)
+        // has no head mirror to fall back to, so neither recovery
+        // path can run — `Unrecoverable` rather than
+        // `ManifestFooterInvalid` so callers can route "file is
+        // truncated / not a manifest" differently from "file is a
+        // manifest but its structure is bad". Files between
+        // `HEAD_FOOTER_RESERVED_SIZE` and `HEAD + HINT` are NOT
+        // rejected here — they reach the head-mirror fallback per
+        // `reader_recovers_from_head_when_tail_hint_missing`.
         let fs = fresh_fs();
         let path = Path::new("/m/too_small");
         let mut file = fs
@@ -953,7 +987,7 @@ mod tests {
         // After this, the head mirror is intact but the tail footer
         // Block + size hint are gone — the exact failure mode the
         // recovery contract has to handle.
-        let mut file = fs
+        let file = fs
             .open(path, &FsOpenOptions::new().write(true).read(true))
             .unwrap();
         file.set_len(HEAD_FOOTER_RESERVED_SIZE).unwrap();
