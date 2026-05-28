@@ -1003,7 +1003,7 @@ impl Table {
             .table_file_opened_uncached
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-        let trailer = sfa::Reader::from_reader(&mut file)?;
+        let trailer = crate::sfa::Reader::from_reader(&mut file)?;
         let regions = ParsedRegions::parse_from_toc(trailer.toc())?;
 
         log::trace!("Reading meta block, with meta_ptr={:?}", regions.metadata);

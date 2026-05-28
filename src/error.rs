@@ -199,6 +199,78 @@ pub enum Error {
     /// the caller can route the diagnostic without parsing message
     /// strings.
     FeatureUnsupported(&'static str),
+
+    /// Manifest footer / TOC / file-level discovery failure.
+    ///
+    /// Scoped to errors detected at or before the TOC is parsed —
+    /// i.e. everything the reader needs *before* it can answer
+    /// "where is section X". Section-content failures (a specific
+    /// section's Block fails verification) go through
+    /// [`ManifestSectionInvalid`](Error::ManifestSectionInvalid)
+    /// instead so callers like `Tree::open` can distinguish a
+    /// totally unreadable manifest from a per-section problem.
+    ///
+    /// Typical causes:
+    ///
+    /// - **Footer-payload structural failure:** unknown layout
+    ///   version, oversized section count, empty/oversized section
+    ///   name, invalid UTF-8, duplicate section name, footer
+    ///   payload exceeds the 4 KiB reservation.
+    /// - **Tail / head-mirror double failure:** both the
+    ///   tail-footer Block read and the head-mirror fallback
+    ///   failed verification (XXH3 mismatch, AEAD decryption,
+    ///   parse error). Per-path causes are logged at `error`
+    ///   level and collapsed here.
+    /// - **TOC entry value corruption:** a TOC entry's
+    ///   `block_offset + block_size` overflows `u64` or extends
+    ///   past the end of the file. The TOC bytes are footer
+    ///   payload, so a malformed TOC entry is a footer-level
+    ///   issue even though it surfaces in
+    ///   `ManifestArchiveReader::read_section`.
+    /// - **Trailing size-hint corruption:** the tail's 4-byte
+    ///   footer-size hint is zero or exceeds
+    ///   `HEAD_FOOTER_RESERVED_SIZE` (4 KiB), or the implied
+    ///   `section_end` lands inside the head reservation. Caught
+    ///   in both the reader and `checkpoint::write_current_for_version`.
+    /// - **Writer-side invariant breach:** `write_cursor` would
+    ///   overflow `u64`, an in-memory section would exceed the
+    ///   on-disk Block-size cap, etc.
+    /// - **CURRENT pointer points at a missing manifest:** when
+    ///   `version::get_current_version` opens the referenced
+    ///   `v{N}` file and gets `NotFound`, the error is rewrapped
+    ///   here so `Tree::open`'s outer `Io(NotFound) => create_new`
+    ///   arm cannot mistake a half-applied recovery / corrupted
+    ///   state for a clean first-open.
+    ManifestFooterInvalid(&'static str),
+
+    /// Manifest section content failed verification or matched no
+    /// TOC entry.
+    ///
+    /// Surfaced by `ManifestArchiveReader::read_section` (and the
+    /// helper that validates the inner Block header before
+    /// delegating to `Block::from_reader`). Distinct from
+    /// [`ManifestFooterInvalid`](Error::ManifestFooterInvalid)
+    /// because the footer / TOC loaded fine — the bad bytes are
+    /// localised to one section Block and a caller MAY route
+    /// recovery differently (e.g. skip the section vs. refuse
+    /// the whole manifest).
+    ///
+    /// Causes:
+    ///
+    /// - **Requested section name not in TOC:** the caller asked
+    ///   for a section that the manifest doesn't declare.
+    /// - **Section Block header doesn't fit its outer buffer:**
+    ///   the inner `Header::data_length + ecc_length` exceeds the
+    ///   TOC-declared `block_size`. Defence-in-depth against a
+    ///   forged TOC pointing at a too-small slot.
+    /// - **Block decoded at the TOC offset has the wrong
+    ///   `block_type`:** TOC says "section here" but the bytes
+    ///   carry a non-`Manifest` Block. Defence-in-depth against
+    ///   TOC-redirect attacks; once AAD-binding lands in
+    ///   `encryption::block`, `Block::from_reader` will reject
+    ///   this internally and the check here becomes belt-and-
+    ///   braces.
+    ManifestSectionInvalid(&'static str),
 }
 
 impl std::fmt::Display for Error {
@@ -216,26 +288,26 @@ impl std::error::Error for Error {
     }
 }
 
-impl From<sfa::Error> for Error {
-    fn from(value: sfa::Error) -> Self {
+impl From<crate::sfa::Error> for Error {
+    fn from(value: crate::sfa::Error) -> Self {
         match value {
-            sfa::Error::Io(e) => Self::from(e),
-            sfa::Error::ChecksumMismatch { got, expected } => {
+            crate::sfa::Error::Io(e) => Self::from(e),
+            crate::sfa::Error::ChecksumMismatch { got, expected } => {
                 log::error!("Archive ToC checksum mismatch");
                 Self::ChecksumMismatch {
                     got: got.into(),
                     expected: expected.into(),
                 }
             }
-            sfa::Error::InvalidHeader => {
+            crate::sfa::Error::InvalidHeader => {
                 log::error!("Invalid archive header");
                 Self::Unrecoverable
             }
-            sfa::Error::InvalidVersion => {
+            crate::sfa::Error::InvalidVersion => {
                 log::error!("Invalid archive version");
                 Self::Unrecoverable
             }
-            sfa::Error::UnsupportedChecksumType => {
+            crate::sfa::Error::UnsupportedChecksumType => {
                 log::error!("Invalid archive checksum type");
                 Self::Unrecoverable
             }

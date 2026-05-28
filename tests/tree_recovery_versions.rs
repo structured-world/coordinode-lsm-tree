@@ -1,51 +1,104 @@
 use byteorder::{LittleEndian, ReadBytesExt};
 use lsm_tree::{AbstractTree, Config, SequenceNumberCounter, get_tmp_folder};
-use std::{
-    fs::File,
-    io::{Seek, SeekFrom, Write},
-    path::Path,
-};
+use std::{fs::File, path::Path};
 use test_log::test;
 
+/// Read the `format_version` byte from the current manifest by
+/// opening it through the (private) `ManifestArchiveReader` test
+/// entry point. The byte sits inside a `BlockType::Manifest` Block
+/// whose XXH3 covers it; the reader does the verification + payload
+/// extraction so the test cannot accidentally observe a corrupted
+/// byte that the Block layer would have rejected.
 fn read_manifest_format_version(path: &Path) -> lsm_tree::Result<u8> {
-    // read_u64 takes &mut self, but calling it on an owned File from `?` is
-    // valid Rust — the compiler auto-borrows &mut on the owned temporary.
     let curr_version_id = File::open(path.join("current"))?.read_u64::<LittleEndian>()?;
     let manifest_path = path.join(format!("v{curr_version_id}"));
-    let reader = sfa::Reader::new(&manifest_path)?;
-
+    let mut archive = lsm_tree::manifest_blocks::reader::ManifestArchiveReader::open(
+        &manifest_path,
+        &lsm_tree::fs::StdFs,
+        std::sync::Arc::new(lsm_tree::runtime_config::RuntimeConfig::default()),
+        None,
+    )?;
+    let bytes = archive.read_section("format_version")?;
     #[expect(
         clippy::expect_used,
         reason = "test fixture should contain format_version"
     )]
-    let section = reader
-        .toc()
-        .section(b"format_version")
-        .expect("format_version section should exist");
-
-    Ok(section.buf_reader(&manifest_path)?.read_u8()?)
+    Ok(*bytes.first().expect("format_version section is non-empty"))
 }
 
+/// Overwrite the `format_version` section of the current manifest by
+/// constructing a fresh Blocks-based manifest at the same path. Used
+/// by the version-rejection tests to land a manifest with an
+/// arbitrary `format_version` byte where the surrounding Block
+/// remains valid so the rejection surfaces at the version-policy
+/// layer rather than at the Block-XXH3 layer.
 fn rewrite_manifest_format_version(path: &Path, version: u8) -> lsm_tree::Result<()> {
+    use std::io::Write;
     let curr_version_id = File::open(path.join("current"))?.read_u64::<LittleEndian>()?;
     let manifest_path = path.join(format!("v{curr_version_id}"));
-    let reader = sfa::Reader::new(&manifest_path)?;
 
-    #[expect(
-        clippy::expect_used,
-        reason = "test fixture should contain format_version"
-    )]
-    let section = reader
-        .toc()
-        .section(b"format_version")
-        .expect("format_version section should exist");
+    // Reconstruct: read every existing section, drop the file, then
+    // rewrite with the same sections except `format_version` carries
+    // the requested byte. Keeps the on-disk surface valid (Block
+    // XXH3 over each section) while letting the test target the
+    // version-policy code path specifically.
+    let mut archive = lsm_tree::manifest_blocks::reader::ManifestArchiveReader::open(
+        &manifest_path,
+        &lsm_tree::fs::StdFs,
+        std::sync::Arc::new(lsm_tree::runtime_config::RuntimeConfig::default()),
+        None,
+    )?;
+    let mut sections: Vec<(String, Vec<u8>)> = Vec::new();
+    for entry in archive.footer().sections.clone() {
+        let payload = if entry.name == "format_version" {
+            vec![version]
+        } else {
+            archive.read_section(&entry.name)?
+        };
+        sections.push((entry.name, payload));
+    }
+    drop(archive);
+    std::fs::remove_file(&manifest_path)?;
 
-    let mut file = std::fs::OpenOptions::new()
+    let mut w = lsm_tree::manifest_blocks::writer::ManifestArchiveWriter::create(
+        &manifest_path,
+        &lsm_tree::fs::StdFs,
+        std::sync::Arc::new(lsm_tree::runtime_config::RuntimeConfig::default()),
+        None,
+    )?;
+    for (name, payload) in sections {
+        w.start(&name)?;
+        w.write_all(&payload)?;
+    }
+    w.finish()?;
+
+    // CURRENT pointer carries the canonical digest over the
+    // manifest's parsed footer (TOC + per-section XXH3-128s) —
+    // recompute it from the rewritten manifest so
+    // `get_current_version` lets the test reach the version-policy
+    // code path it actually wants to exercise (otherwise the digest
+    // mismatch surfaces first as ChecksumMismatch).
+    use byteorder::WriteBytesExt as _;
+    let archive = lsm_tree::manifest_blocks::reader::ManifestArchiveReader::open(
+        &manifest_path,
+        &lsm_tree::fs::StdFs,
+        std::sync::Arc::new(lsm_tree::runtime_config::RuntimeConfig::default()),
+        None,
+    )?;
+    let checksum =
+        lsm_tree::manifest_blocks::current_digest::compute(curr_version_id, archive.footer())?;
+    let mut content: Vec<u8> = Vec::new();
+    content.write_u64::<byteorder::LittleEndian>(curr_version_id)?;
+    content.write_u128::<byteorder::LittleEndian>(checksum)?;
+    content.write_u8(0)?; // xxh3
+    let current_path = path.join("current");
+    let mut current_file = std::fs::OpenOptions::new()
         .write(true)
-        .open(&manifest_path)?;
-    file.seek(SeekFrom::Start(section.pos()))?;
-    file.write_all(&[version])?;
-    file.flush()?;
+        .truncate(true)
+        .create(true)
+        .open(&current_path)?;
+    current_file.write_all(&content)?;
+    current_file.sync_all()?;
 
     Ok(())
 }
@@ -342,7 +395,7 @@ fn tree_page_ecc_emits_nonzero_ecc_length_on_disk() -> lsm_tree::Result<()> {
     )]
     let sst_path = sst_path.expect("flush should produce at least one SST file");
 
-    let reader = sfa::Reader::new(&sst_path)?;
+    let reader = lsm_tree::sfa::Reader::new(&sst_path)?;
     #[expect(
         clippy::expect_used,
         reason = "every lsm-tree SST has a `data` section"
@@ -398,4 +451,70 @@ fn tree_open_with_page_ecc_on_feature_off_build_errors() {
         Err(lsm_tree::Error::PageEccUnsupported) => {}
         Err(e) => panic!("expected PageEccUnsupported, got {e:?}"),
     }
+}
+
+#[test]
+fn tree_open_with_missing_manifest_but_present_current_errors_not_recreates() -> lsm_tree::Result<()>
+{
+    // Regression: CURRENT pointing at a missing v{N} manifest file
+    // is half-applied recovery / corruption, NOT a fresh-init
+    // signal. Tree::open used to silently fall through its
+    // `Err(Io(NotFound)) => create_new` arm in this state because
+    // the manifest open inside `get_current_version` surfaced the
+    // same NotFound the CURRENT-absent path uses — and the
+    // has_existing_version_state probe didn't catch the case
+    // because CURRENT itself was still present. Result: opening a
+    // tree with a deleted manifest would clobber CURRENT with a
+    // fresh v0 instead of erroring, turning a recoverable failure
+    // into silent data loss. The fix in `get_current_version`
+    // rewraps the manifest open's NotFound as
+    // ManifestFooterInvalid so the outer Tree::open match never
+    // mistakes it for "no CURRENT".
+    let folder = get_tmp_folder();
+    let path = folder.path();
+
+    {
+        let tree = Config::new(
+            path,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .open()?;
+        tree.insert("k", "v", 0);
+        tree.flush_active_memtable(0)?;
+    }
+
+    let curr_version_id = File::open(path.join("current"))?.read_u64::<LittleEndian>()?;
+    let manifest_path = path.join(format!("v{curr_version_id}"));
+    std::fs::remove_file(&manifest_path)?;
+
+    let result = Config::new(
+        path,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .open();
+
+    match result {
+        Ok(_) => panic!(
+            "Tree::open with CURRENT present but manifest v{curr_version_id} deleted \
+             MUST surface an error — silently re-creating from scratch would clobber \
+             the user's CURRENT pointer and lose the half-applied recovery signal"
+        ),
+        Err(lsm_tree::Error::ManifestFooterInvalid(_)) => {}
+        Err(e) => panic!("expected ManifestFooterInvalid for missing manifest, got {e:?}"),
+    }
+
+    // The whole point of the regression is preventing CURRENT
+    // clobber. Erroring is necessary but not sufficient — a future
+    // implementation could satisfy the error-variant check above
+    // and still rewrite the pointer on its way out. Re-read CURRENT
+    // and assert it still points at the original version.
+    let still_current = File::open(path.join("current"))?.read_u64::<LittleEndian>()?;
+    assert_eq!(
+        still_current, curr_version_id,
+        "failed Tree::open must not rewrite the CURRENT pointer"
+    );
+
+    Ok(())
 }

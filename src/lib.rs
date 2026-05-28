@@ -5,10 +5,22 @@
 // no-std foundation: when the `std` feature is OFF the crate root opts into
 // `no_std`. Default builds keep `std` enabled (file I/O, threading, system
 // clock all live in `std`), so existing consumers see no behaviour change.
-// The migration to a fully no-std-clean build is incremental — modules with
-// std-only dependencies stay gated behind `#[cfg(feature = "std")]` until
-// they are ported. The CI job `no-std-check` exercises `cargo check
-// --no-default-features --features alloc` and tracks remaining work.
+// The migration to a fully no-std-clean build is incremental. Two patterns
+// coexist while the port is in progress:
+//   1. Modules with std-only dependencies that have no consumers above the
+//      `fs` / `version` / `tree` layer stay gated behind `#[cfg(feature =
+//      "std")]` and are ported in isolation.
+//   2. Modules whose std-only dependencies cascade through every consumer
+//      (`manifest_blocks`, vendored `sfa`, others noted at their `pub mod`
+//      site) remain UNCONDITIONAL today — gating them would require
+//      `#[cfg]` annotations on dozens of call sites without changing the
+//      no-std error count, because those call sites are themselves
+//      std-bound for unrelated reasons. They migrate in lockstep with the
+//      consumer layer rather than ahead of it.
+// The CI job `no-std-check` exercises `cargo check --no-default-features
+// --features alloc` against a real no-std target (`thumbv7em-none-eabihf`)
+// and tracks remaining work via the error count, which must monotonically
+// decrease across PRs.
 #![cfg_attr(not(feature = "std"), no_std)]
 
 //! Embedded LSM-tree storage engine.
@@ -190,10 +202,34 @@ mod key;
 mod key_range;
 mod loser_tree;
 mod manifest;
+// Unconditional today. Gating behind `feature = "std"` requires
+// cascading `#[cfg]` onto every consumer that imports from this
+// module — `manifest`, `version::{persist,recovery}`, `tree::inner`,
+// `checkpoint`, plus their downstream re-exports — none of which are
+// themselves cfg-gated yet (they're std-bound through `fs::Fs` /
+// `Box<dyn FsFile>` for unrelated reasons). A naive gate here adds
+// hundreds of unresolved-module errors to the `no-std-check` job
+// before unblocking any of them. The cascade migration of this whole
+// std-bound layer (manifest + version + tree + checkpoint) is tracked
+// as issue #358; gating `manifest_blocks` in isolation is not cheap
+// and is the wrong sequencing.
+#[doc(hidden)]
+pub mod manifest_blocks;
 mod memtable;
 mod merge_operator;
 mod run_reader;
 mod run_scanner;
+// Vendored sfa is std-only internally (`std::io` / `std::fs` /
+// `std::path`). Unconditional for the same cascading reason as
+// `manifest_blocks` above: ~20 consumers across the table /
+// blob-file / inspect / verify / checkpoint paths reference sfa
+// types in unconditional code. Gating sfa alone explodes the
+// `no-std-check` error count via unresolved-module failures on
+// every consumer that hasn't been gated yet. Migration is the
+// whole std-bound layer at once (tracked as issue #358), not sfa
+// in isolation.
+#[doc(hidden)]
+pub mod sfa;
 
 #[doc(hidden)]
 pub mod merge;

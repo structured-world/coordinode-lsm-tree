@@ -19,8 +19,8 @@ impl From<ChecksumType> for u8 {
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct Checksum(u128);
 
-impl From<sfa::Checksum> for Checksum {
-    fn from(value: sfa::Checksum) -> Self {
+impl From<crate::sfa::Checksum> for Checksum {
+    fn from(value: crate::sfa::Checksum) -> Self {
         Self(value.into_u128())
     }
 }

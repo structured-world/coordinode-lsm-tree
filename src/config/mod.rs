@@ -442,6 +442,19 @@ pub struct Config {
     /// so the default keeps the existing behaviour.
     pub(crate) page_ecc: bool,
 
+    /// Initial [`crate::runtime_config::RuntimeConfig`] snapshot
+    /// the tree starts with. Seeds both the first
+    /// `persist_version` call and the Tree's
+    /// `RuntimeConfigHandle`, so a non-default value supplied via
+    /// [`Config::with_runtime_config`] is honoured from byte zero
+    /// of the manifest. Defaults to `RuntimeConfig::default()` —
+    /// matches the pre-existing implicit behaviour.
+    #[expect(
+        clippy::struct_field_names,
+        reason = "name mirrors the type for grep-ability across the persist + Tree handle init wiring"
+    )]
+    pub(crate) initial_runtime_config: crate::runtime_config::RuntimeConfig,
+
     /// Filter construction policy
     pub filter_policy: FilterPolicy,
 
@@ -585,6 +598,8 @@ impl Default for Config {
             expect_point_read_hits: false,
 
             page_ecc: false,
+
+            initial_runtime_config: crate::runtime_config::RuntimeConfig::default(),
 
             kv_separation_opts: None,
 
@@ -1020,6 +1035,40 @@ impl Config {
     #[must_use]
     pub fn page_ecc(mut self, enabled: bool) -> Self {
         self.page_ecc = enabled;
+        self
+    }
+
+    /// Sets the initial [`crate::runtime_config::RuntimeConfig`]
+    /// snapshot the tree will start with.
+    ///
+    /// Seeds both the first manifest write and the live
+    /// `RuntimeConfigHandle` exposed via
+    /// [`crate::Tree::runtime_config`].
+    ///
+    /// **Manifest-hardening toggles** in the supplied snapshot
+    /// that are currently wired through the writer
+    /// (`manifest_footer_mirror`, `page_ecc` *as consumed by
+    /// `manifest_blocks::writer` when picking the `BlockTransform`
+    /// variant*) take effect from byte zero of the on-disk
+    /// manifest rather than waiting for a post-open
+    /// [`crate::Tree::update_runtime_config`] call. Subsequent
+    /// updates still flow through the live handle and apply to
+    /// the next manifest write.
+    ///
+    /// `manifest_kv_checksums` is plumbed in the snapshot but the
+    /// writer does NOT yet consult or persist it (per-entry
+    /// framing + footer-flag slot land in a follow-up). Setting
+    /// it here today has no on-disk effect; it is exposed for
+    /// forward-compat with no behaviour break.
+    ///
+    /// **Note on data-block ECC:** `RuntimeConfig::page_ecc`
+    /// currently affects manifest Blocks only — data-block ECC is
+    /// still gated by [`Config::page_ecc`] at tree-open time. The
+    /// SST writer path consumes the tree-static config, not the
+    /// runtime handle. Wiring through SST emission is a follow-up.
+    #[must_use]
+    pub fn with_runtime_config(mut self, runtime: crate::runtime_config::RuntimeConfig) -> Self {
+        self.initial_runtime_config = runtime;
         self
     }
 

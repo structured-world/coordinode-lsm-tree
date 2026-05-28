@@ -7,7 +7,7 @@ use crate::{
     coding::Decode,
     config::ManifestRecoveryMode,
     file::CURRENT_VERSION_FILE,
-    fs::{Fs, FsOpenOptions, open_section_reader},
+    fs::{Fs, FsOpenOptions},
     version::VersionId,
     vlog::BlobFileId,
 };
@@ -87,22 +87,98 @@ fn decode_blob_entry_payload(payload: &[u8]) -> crate::Result<(BlobFileId, Check
 /// The file format is: `version_id: u64 | checksum: u128 | checksum_type: u8`
 /// (25 bytes total, written atomically by `rewrite_atomic`).
 ///
-/// Returns the version ID after verifying the checksum type tag is valid.
-/// The checksum field is read from disk but is not validated here.
-pub fn get_current_version(folder: &Path, fs: &dyn Fs) -> crate::Result<VersionId> {
+/// Reads the version id, opens the referenced `v{id}` manifest via
+/// [`ManifestArchiveReader::open`](crate::manifest_blocks::reader::ManifestArchiveReader::open)
+/// (so the tail-first / head-mirror-fallback recovery path applies
+/// here too — a torn or corrupted trailing size-hint can be
+/// recovered through the head mirror without first tripping the
+/// CURRENT-pointer validation), then recomputes the canonical
+/// footer digest via [`current_digest::compute`] over the parsed
+/// footer payload and compares it against the stamped checksum.
+/// Mismatch surfaces as [`crate::Error::ChecksumMismatch`].
+///
+/// The stored digest is the canonical XXH3-128 over (`version_id` +
+/// `layout_version` + flags + sorted TOC entries with each section's
+/// own XXH3-128). See [`crate::manifest_blocks::current_digest`]
+/// for the exact serialisation and threat model. Critically: this
+/// digest does NOT cover raw on-disk section bytes — per-Block
+/// XXH3 + Page ECC (when enabled) handle section corruption on
+/// `read_section`, and a section bit-flip that ECC heals at decode
+/// time does not invalidate the CURRENT pointer here. That's the
+/// point: the CURRENT layer binds logical identity, the Block
+/// layer handles bit-level integrity, and ECC recovery actually
+/// works for manifest sections.
+///
+/// XXH3-128 is NOT a cryptographic MAC: an attacker with write
+/// access can craft matching content. For adversarial tamper
+/// resistance enable `Config::with_encryption(...)` (AEAD per
+/// Block).
+pub fn get_current_version(
+    folder: &Path,
+    fs: &dyn Fs,
+    encryption: Option<std::sync::Arc<dyn crate::encryption::EncryptionProvider>>,
+) -> crate::Result<VersionId> {
     use byteorder::{LittleEndian, ReadBytesExt};
 
     let path = folder.join(CURRENT_VERSION_FILE);
     let mut file = fs.open(&path, &FsOpenOptions::new().read(true))?;
 
     let version_id = file.read_u64::<LittleEndian>()?;
-    let _checksum = file.read_u128::<LittleEndian>()?;
+    let stored_checksum = file.read_u128::<LittleEndian>()?;
     let checksum_type = file.read_u8()?;
 
     // Validate checksum type tag — a non-zero value indicates corruption
     // or a file from an incompatible version (only xxh3 = 0 is supported).
     if checksum_type != 0 {
         return Err(crate::Error::InvalidTag(("ChecksumType", checksum_type)));
+    }
+
+    let manifest_path = folder.join(format!("v{version_id}"));
+
+    // Open the manifest through the tail-first / head-mirror-fallback
+    // reader so a torn trailing size-hint that the reader can still
+    // recover does not invalidate the CURRENT pointer first. The
+    // parsed footer's TOC gives us every section's
+    // `(block_offset, block_size)`; `section_end` is the maximum of
+    // `block_offset + block_size` across the TOC. The runtime
+    // snapshot is a placeholder default — get_current_version runs
+    // before any Tree exists, and the reader's ECC decisions are
+    // per-Block self-describing via the Block header (not driven by
+    // the supplied runtime), so the placeholder is safe.
+    // Rewrap manifest NotFound so `Tree::open`'s outer `Err(Io(NotFound))`
+    // arm — which means "CURRENT file is absent, fresh-init the tree" —
+    // never absorbs a missing manifest. A missing manifest with CURRENT
+    // pointing at it is half-applied recovery / corruption, not a
+    // fresh-init signal; converting it to ManifestFooterInvalid surfaces
+    // that distinct failure mode loud and clear.
+    let archive = crate::manifest_blocks::reader::ManifestArchiveReader::open(
+        &manifest_path,
+        fs,
+        std::sync::Arc::new(crate::runtime_config::RuntimeConfig::default()),
+        encryption,
+    )
+    .map_err(|e| match e {
+        crate::Error::Io(io) if io.kind() == std::io::ErrorKind::NotFound => {
+            crate::Error::ManifestFooterInvalid(
+                "manifest file referenced by CURRENT does not exist",
+            )
+        }
+        other => other,
+    })?;
+
+    // Recompute the CURRENT digest from the parsed footer payload
+    // and compare against the value stamped at write time. The
+    // footer arrived through `ManifestArchiveReader::open` — tail-
+    // first with head-mirror fallback — so a torn tail recoverable
+    // via the mirror still produces the right digest here. No raw
+    // section-byte hashing: per-Block ECC on `read_section` keeps
+    // its repair authority.
+    let computed = crate::manifest_blocks::current_digest::compute(version_id, archive.footer())?;
+    if computed != stored_checksum {
+        return Err(crate::Error::ChecksumMismatch {
+            got: Checksum::from_raw(computed),
+            expected: Checksum::from_raw(stored_checksum),
+        });
     }
 
     Ok(version_id)
@@ -195,7 +271,12 @@ pub struct Recovery {
               sections; splitting the function would just move the per-mode branching \
               into helpers without clarifying the flow"
 )]
-pub fn recover(folder: &Path, fs: &dyn Fs, mode: ManifestRecoveryMode) -> crate::Result<Recovery> {
+pub fn recover(
+    folder: &Path,
+    fs: &dyn Fs,
+    mode: ManifestRecoveryMode,
+    encryption: Option<std::sync::Arc<dyn crate::encryption::EncryptionProvider>>,
+) -> crate::Result<Recovery> {
     // Per-record framing constants used by both the tables and
     // blob_files sections. Each on-disk record is a
     // FRAME_HEADER_LEN (12-byte) header followed by a fixed-size
@@ -209,7 +290,7 @@ pub fn recover(folder: &Path, fs: &dyn Fs, mode: ManifestRecoveryMode) -> crate:
         crate::version::framing::FRAME_HEADER_LEN as u64 + BLOB_ENTRY_PAYLOAD_LEN as u64;
     use crate::version::framing::FramedRecordOutcome;
 
-    let curr_version_id = get_current_version(folder, fs)?;
+    let curr_version_id = get_current_version(folder, fs, encryption.clone())?;
     let version_file_path = folder.join(format!("v{curr_version_id}"));
 
     log::info!(
@@ -217,9 +298,12 @@ pub fn recover(folder: &Path, fs: &dyn Fs, mode: ManifestRecoveryMode) -> crate:
         version_file_path.display(),
     );
 
-    let mut file = fs.open(&version_file_path, &FsOpenOptions::new().read(true))?;
-    let reader = sfa::Reader::from_reader(&mut file)?;
-    let toc = reader.toc();
+    let mut archive = crate::manifest_blocks::reader::ManifestArchiveReader::open(
+        &version_file_path,
+        fs,
+        std::sync::Arc::new(crate::runtime_config::RuntimeConfig::default()),
+        encryption,
+    )?;
 
     // Mode dispatch flags. The per-section loops below treat these
     // four modes as three flag combinations:
@@ -284,14 +368,15 @@ pub fn recover(folder: &Path, fs: &dyn Fs, mode: ManifestRecoveryMode) -> crate:
     let mut read_scratch: Vec<u8> = Vec::with_capacity(64);
 
     {
-        let section = toc
-            .section(b"tables")
-            .ok_or(crate::Error::Unrecoverable)
-            .inspect_err(|_| {
-                log::error!("tables section not found in version #{curr_version_id} - maybe the file is corrupted?");
-            })?;
-
-        let mut reader = open_section_reader(fs, &version_file_path, section)?;
+        if archive.section("tables").is_none() {
+            log::error!(
+                "tables section not found in version #{curr_version_id} - maybe the file is corrupted?"
+            );
+            return Err(crate::Error::Unrecoverable);
+        }
+        let section_bytes = archive.read_section("tables")?;
+        let section_len: u64 = section_bytes.len() as u64;
+        let mut reader = std::io::Cursor::new(section_bytes);
 
         // Wrap the level-count read in tail tolerance too: a manifest
         // truncated before the first byte of `tables` (or right after
@@ -404,7 +489,7 @@ pub fn recover(folder: &Path, fs: &dyn Fs, mode: ManifestRecoveryMode) -> crate:
                 // hard "count header forged" abort. Under any of the
                 // tolerant modes it warns and lets the loop walk
                 // bytes-actually-present.
-                let bytes_remaining = section.len().saturating_sub(tables_bytes_consumed);
+                let bytes_remaining = section_len.saturating_sub(tables_bytes_consumed);
                 if u64::from(table_count).saturating_mul(FRAMED_TABLE_ENTRY_LEN) > bytes_remaining {
                     if tolerate_tail {
                         log::warn!(
@@ -421,7 +506,7 @@ pub fn recover(folder: &Path, fs: &dyn Fs, mode: ManifestRecoveryMode) -> crate:
                 }
 
                 for _ in 0..table_count {
-                    let remaining = section.len().saturating_sub(tables_bytes_consumed);
+                    let remaining = section_len.saturating_sub(tables_bytes_consumed);
                     // Pin the on-disk `len` to the fixed table-record
                     // payload size so a corrupted-but-plausible
                     // `len` cannot mis-align the cursor for the
@@ -713,14 +798,15 @@ pub fn recover(folder: &Path, fs: &dyn Fs, mode: ManifestRecoveryMode) -> crate:
     let mut blob_dropped_to_tail: u32 = 0;
     let mut blob_dropped_to_corruption: u32 = 0;
     let blob_file_ids = {
-        let section = toc
-            .section(b"blob_files")
-            .ok_or(crate::Error::Unrecoverable)
-            .inspect_err(|_| {
-                log::error!("blob_files section not found in version #{curr_version_id} - maybe the file is corrupted?");
-            })?;
-
-        let mut reader = open_section_reader(fs, &version_file_path, section)?;
+        if archive.section("blob_files").is_none() {
+            log::error!(
+                "blob_files section not found in version #{curr_version_id} - maybe the file is corrupted?"
+            );
+            return Err(crate::Error::Unrecoverable);
+        }
+        let section_bytes = archive.read_section("blob_files")?;
+        let section_len: u64 = section_bytes.len() as u64;
+        let mut reader = std::io::Cursor::new(section_bytes);
 
         let blob_file_count = match reader.read_u32::<LittleEndian>() {
             Ok(n) => n,
@@ -737,7 +823,7 @@ pub fn recover(folder: &Path, fs: &dyn Fs, mode: ManifestRecoveryMode) -> crate:
         // Each framed blob entry is FRAME_HEADER_LEN (12) + 25 bytes
         // payload = 37 bytes. Same forged-vs-truncated dispatch as the
         // tables-section count check.
-        let blob_section_capacity = section.len().saturating_sub(4) / FRAMED_BLOB_ENTRY_LEN;
+        let blob_section_capacity = section_len.saturating_sub(4) / FRAMED_BLOB_ENTRY_LEN;
         if u64::from(blob_file_count) > blob_section_capacity {
             if tolerate_tail {
                 log::warn!(
@@ -763,7 +849,7 @@ pub fn recover(folder: &Path, fs: &dyn Fs, mode: ManifestRecoveryMode) -> crate:
         let mut blob_corrupted: u32 = 0;
 
         for _ in 0..blob_file_count {
-            let remaining = section.len().saturating_sub(blob_bytes_consumed);
+            let remaining = section_len.saturating_sub(blob_bytes_consumed);
             // Fixed-length pin on the blob_files record (same
             // SkipAny resync safety net as the tables section).
             let outcome = crate::version::framing::read_framed_record(
@@ -926,14 +1012,14 @@ pub fn recover(folder: &Path, fs: &dyn Fs, mode: ManifestRecoveryMode) -> crate:
     debug_assert!(blob_file_ids.is_sorted_by_key(|(id, _)| id));
 
     let gc_stats = {
-        let section = toc
-            .section(b"blob_gc_stats")
-            .ok_or(crate::Error::Unrecoverable)
-            .inspect_err(|_| {
-                log::error!("blob_gc_stats section not found in version #{curr_version_id} - maybe the file is corrupted?");
-            })?;
-
-        let mut reader = open_section_reader(fs, &version_file_path, section)?;
+        if archive.section("blob_gc_stats").is_none() {
+            log::error!(
+                "blob_gc_stats section not found in version #{curr_version_id} - maybe the file is corrupted?"
+            );
+            return Err(crate::Error::Unrecoverable);
+        }
+        let section_bytes = archive.read_section("blob_gc_stats")?;
+        let mut reader = std::io::Cursor::new(section_bytes);
 
         // Same tail-tolerance contract as the record-list sections:
         // a power-loss between the `blob_files` commit and the
@@ -961,14 +1047,17 @@ pub fn recover(folder: &Path, fs: &dyn Fs, mode: ManifestRecoveryMode) -> crate:
 
     Ok(Recovery {
         tree_type: {
-            let section = toc.section(b"tree_type").ok_or(crate::Error::Unrecoverable)
-            .inspect_err(|_|{
-                log::error!("tree_type section not found in version #{curr_version_id} - maybe the file is corrupted?");
-            })?;
-
-            let mut reader = open_section_reader(fs, &version_file_path, section)?;
-            let byte = reader.read_u8()?;
-
+            if archive.section("tree_type").is_none() {
+                log::error!(
+                    "tree_type section not found in version #{curr_version_id} - maybe the file is corrupted?"
+                );
+                return Err(crate::Error::Unrecoverable);
+            }
+            let section_bytes = archive.read_section("tree_type")?;
+            let byte = section_bytes
+                .first()
+                .copied()
+                .ok_or(crate::Error::InvalidHeader("TreeType"))?;
             TreeType::try_from(byte).map_err(|()| crate::Error::InvalidHeader("TreeType"))?
         },
         curr_version_id,
@@ -998,15 +1087,78 @@ mod tests {
     use std::io::Write;
 
     /// Write a CURRENT pointer so `recover()` can find the version file.
+    ///
+    /// Must be called AFTER the `v{id}` manifest file exists — the
+    /// pointer's checksum is the canonical digest derived from the
+    /// manifest's parsed footer (TOC + per-section XXH3-128s) via
+    /// [`crate::manifest_blocks::current_digest::compute`]. Fixtures
+    /// that test corruption-recovery typically write the corrupted
+    /// manifest first, then call this to stamp the CURRENT pointer
+    /// — the digest binds the TOC (which the corruption inside a
+    /// section payload doesn't touch), so `get_current_version`
+    /// accepts the pointer and the per-Block / per-record check
+    /// downstream is the one that surfaces the corruption.
     fn write_current(folder: &Path, version_id: u64, fs: &dyn Fs) -> crate::Result<()> {
+        let manifest_path = folder.join(format!("v{version_id}"));
+        let archive = crate::manifest_blocks::reader::ManifestArchiveReader::open(
+            &manifest_path,
+            fs,
+            std::sync::Arc::new(crate::runtime_config::RuntimeConfig::default()),
+            None,
+        )?;
+        let checksum =
+            crate::manifest_blocks::current_digest::compute(version_id, archive.footer())?;
         let path = folder.join(CURRENT_VERSION_FILE);
         let mut f = fs.open(
             &path,
             &FsOpenOptions::new().write(true).create(true).truncate(true),
         )?;
         f.write_u64::<LittleEndian>(version_id)?;
-        f.write_u128::<LittleEndian>(0)?; // checksum placeholder
+        f.write_u128::<LittleEndian>(checksum)?;
         f.write_u8(0)?; // checksum type
+        Ok(())
+    }
+
+    type FixtureWriter = crate::manifest_blocks::writer::ManifestArchiveWriter;
+
+    /// Open a Blocks-based manifest writer at `folder/v{id}` with
+    /// the default runtime config. Centralizes the create-new +
+    /// runtime-snapshot boilerplate every fixture would otherwise
+    /// repeat verbatim.
+    fn open_fixture_writer(folder: &Path, id: u64, fs: &dyn Fs) -> crate::Result<FixtureWriter> {
+        let path = folder.join(format!("v{id}"));
+        FixtureWriter::create(
+            &path,
+            fs,
+            std::sync::Arc::new(crate::runtime_config::RuntimeConfig::default()),
+            None,
+        )
+    }
+
+    /// Append the standard `tree_type` section (Standard = 0). Every
+    /// recovery fixture in this module needs one — varying the
+    /// `tree_type` byte itself is not what these tests exercise.
+    fn write_tree_type(w: &mut FixtureWriter) -> crate::Result<()> {
+        w.start("tree_type")?;
+        w.write_u8(0)?;
+        Ok(())
+    }
+
+    /// Append an empty `blob_files` section (count = 0). The tables-
+    /// corruption fixtures don't exercise blob recovery, so they
+    /// stamp this trivial payload to satisfy `recover()`'s
+    /// "section must exist" check.
+    fn write_empty_blob_files(w: &mut FixtureWriter) -> crate::Result<()> {
+        w.start("blob_files")?;
+        w.write_u32::<LittleEndian>(0)?;
+        Ok(())
+    }
+
+    /// Append an empty `blob_gc_stats` section (count = 0). Same
+    /// rationale as [`write_empty_blob_files`].
+    fn write_empty_blob_gc_stats(w: &mut FixtureWriter) -> crate::Result<()> {
+        w.start("blob_gc_stats")?;
+        w.write_u32::<LittleEndian>(0)?;
         Ok(())
     }
 
@@ -1015,31 +1167,18 @@ mod tests {
     /// All four sfa sections are written because `recover()` requires them
     /// all — only the tables section carries the corrupt payload.
     fn write_corrupt_table_count(folder: &Path, id: u64, fs: &dyn Fs) -> crate::Result<()> {
-        let path = folder.join(format!("v{id}"));
-        let file = fs.open(
-            &path,
-            &FsOpenOptions::new().write(true).create(true).truncate(true),
-        )?;
-        let mut w = sfa::Writer::from_writer(std::io::BufWriter::new(file));
-
-        w.start("tree_type")?;
-        w.write_u8(0)?;
+        let mut w = open_fixture_writer(folder, id, fs)?;
+        write_tree_type(&mut w)?;
 
         w.start("tables")?;
         w.write_u8(1)?; // 1 level
         w.write_u8(1)?; // 1 run
         w.write_u32::<LittleEndian>(u32::MAX)?; // corrupt: exceeds section length
 
-        w.start("blob_files")?;
-        w.write_u32::<LittleEndian>(0)?;
+        write_empty_blob_files(&mut w)?;
+        write_empty_blob_gc_stats(&mut w)?;
 
-        w.start("blob_gc_stats")?;
-        w.write_u32::<LittleEndian>(0)?;
-
-        w.finish().map_err(|e| match e {
-            sfa::Error::Io(e) => crate::Error::from(e),
-            _ => crate::Error::Unrecoverable,
-        })?;
+        w.finish()?;
         Ok(())
     }
 
@@ -1048,15 +1187,8 @@ mod tests {
     /// All four sfa sections required by `recover()` are present — only the
     /// `blob_files` section carries the corrupt payload.
     fn write_corrupt_blob_count(folder: &Path, id: u64, fs: &dyn Fs) -> crate::Result<()> {
-        let path = folder.join(format!("v{id}"));
-        let file = fs.open(
-            &path,
-            &FsOpenOptions::new().write(true).create(true).truncate(true),
-        )?;
-        let mut w = sfa::Writer::from_writer(std::io::BufWriter::new(file));
-
-        w.start("tree_type")?;
-        w.write_u8(0)?;
+        let mut w = open_fixture_writer(folder, id, fs)?;
+        write_tree_type(&mut w)?;
 
         w.start("tables")?;
         w.write_u8(0)?; // 0 levels
@@ -1067,10 +1199,7 @@ mod tests {
         w.start("blob_gc_stats")?;
         w.write_u32::<LittleEndian>(0)?;
 
-        w.finish().map_err(|e| match e {
-            sfa::Error::Io(e) => crate::Error::from(e),
-            _ => crate::Error::Unrecoverable,
-        })?;
+        w.finish()?;
         Ok(())
     }
 
@@ -1080,10 +1209,10 @@ mod tests {
         let folder = Path::new("/corrupt/tables");
         fs.create_dir_all(folder)?;
 
-        write_current(folder, 1, &fs)?;
         write_corrupt_table_count(folder, 1, &fs)?;
+        write_current(folder, 1, &fs)?;
 
-        let Err(err) = recover(folder, &fs, ManifestRecoveryMode::AbsoluteConsistency) else {
+        let Err(err) = recover(folder, &fs, ManifestRecoveryMode::AbsoluteConsistency, None) else {
             panic!("corrupt table_count should fail");
         };
         assert!(
@@ -1100,10 +1229,10 @@ mod tests {
         let folder = Path::new("/corrupt/blobs");
         fs.create_dir_all(folder)?;
 
-        write_current(folder, 1, &fs)?;
         write_corrupt_blob_count(folder, 1, &fs)?;
+        write_current(folder, 1, &fs)?;
 
-        let Err(err) = recover(folder, &fs, ManifestRecoveryMode::AbsoluteConsistency) else {
+        let Err(err) = recover(folder, &fs, ManifestRecoveryMode::AbsoluteConsistency, None) else {
             panic!("corrupt blob_file_count should fail");
         };
         assert!(
@@ -1134,15 +1263,8 @@ mod tests {
             actual < declared,
             "actual must be < declared for truncation"
         );
-        let path = folder.join(format!("v{id}"));
-        let file = fs.open(
-            &path,
-            &FsOpenOptions::new().write(true).create(true).truncate(true),
-        )?;
-        let mut w = sfa::Writer::from_writer(std::io::BufWriter::new(file));
-
-        w.start("tree_type")?;
-        w.write_u8(0)?;
+        let mut w = open_fixture_writer(folder, id, fs)?;
+        write_tree_type(&mut w)?;
 
         w.start("tables")?;
         w.write_u8(1)?; // 1 level
@@ -1162,16 +1284,10 @@ mod tests {
             })?;
         }
 
-        w.start("blob_files")?;
-        w.write_u32::<LittleEndian>(0)?;
+        write_empty_blob_files(&mut w)?;
+        write_empty_blob_gc_stats(&mut w)?;
 
-        w.start("blob_gc_stats")?;
-        w.write_u32::<LittleEndian>(0)?;
-
-        w.finish().map_err(|e| match e {
-            sfa::Error::Io(e) => crate::Error::from(e),
-            _ => crate::Error::Unrecoverable,
-        })?;
+        w.finish()?;
         Ok(())
     }
 
@@ -1181,11 +1297,11 @@ mod tests {
         let folder = Path::new("/absolute/tail");
         fs.create_dir_all(folder)?;
 
-        write_current(folder, 1, &fs)?;
         // Section declares 5 entries, only 1 actually written.
         write_truncated_tables_tail(folder, 1, 5, 1, &fs)?;
+        write_current(folder, 1, &fs)?;
 
-        let result = recover(folder, &fs, ManifestRecoveryMode::AbsoluteConsistency);
+        let result = recover(folder, &fs, ManifestRecoveryMode::AbsoluteConsistency, None);
         let err = result.expect_err("truncated tail must abort under AbsoluteConsistency");
         // Either Io(UnexpectedEof) (from the byteorder read) — both are
         // acceptable strict-mode failures. The contract is: SOMETHING
@@ -1204,15 +1320,16 @@ mod tests {
         let folder = Path::new("/tolerate/tail");
         fs.create_dir_all(folder)?;
 
-        write_current(folder, 1, &fs)?;
         // Section declares 5 entries, only 1 actually written → expect
         // 1 entry recovered, 4 silently dropped + warn logged.
         write_truncated_tables_tail(folder, 1, 5, 1, &fs)?;
+        write_current(folder, 1, &fs)?;
 
         let recovery = recover(
             folder,
             &fs,
             ManifestRecoveryMode::TolerateCorruptedTailRecords,
+            None,
         )?;
         assert_eq!(
             recovery.table_ids.len(),
@@ -1244,15 +1361,8 @@ mod tests {
         let folder = Path::new("/tolerate/bad_tag");
         fs.create_dir_all(folder)?;
 
-        write_current(folder, 1, &fs)?;
-        let path = folder.join("v1");
-        let file = fs.open(
-            &path,
-            &FsOpenOptions::new().write(true).create(true).truncate(true),
-        )?;
-        let mut w = sfa::Writer::from_writer(std::io::BufWriter::new(file));
-        w.start("tree_type")?;
-        w.write_u8(0)?;
+        let mut w = open_fixture_writer(folder, 1, &fs)?;
+        write_tree_type(&mut w)?;
         w.start("tables")?;
         w.write_u8(1)?; // 1 level
         w.write_u8(1)?; // 1 run
@@ -1279,19 +1389,17 @@ mod tests {
             payload.write_u64::<LittleEndian>(0)?;
             Ok(())
         })?;
-        w.start("blob_files")?;
-        w.write_u32::<LittleEndian>(0)?;
+        write_empty_blob_files(&mut w)?;
         w.start("blob_gc_stats")?;
         w.write_u32::<LittleEndian>(0)?;
-        w.finish().map_err(|e| match e {
-            sfa::Error::Io(e) => crate::Error::from(e),
-            _ => crate::Error::Unrecoverable,
-        })?;
+        w.finish()?;
+        write_current(folder, 1, &fs)?;
 
         let result = recover(
             folder,
             &fs,
             ManifestRecoveryMode::TolerateCorruptedTailRecords,
+            None,
         );
         let err =
             result.expect_err("InvalidTag must still abort under TolerateCorruptedTailRecords");
@@ -1310,14 +1418,8 @@ mod tests {
     /// inside an otherwise-valid level. The consistent prefix (run #0
     /// of level #0) MUST survive in the recovered Version.
     fn write_truncated_at_second_run(folder: &Path, id: u64, fs: &dyn Fs) -> crate::Result<()> {
-        let path = folder.join(format!("v{id}"));
-        let file = fs.open(
-            &path,
-            &FsOpenOptions::new().write(true).create(true).truncate(true),
-        )?;
-        let mut w = sfa::Writer::from_writer(std::io::BufWriter::new(file));
-        w.start("tree_type")?;
-        w.write_u8(0)?;
+        let mut w = open_fixture_writer(folder, id, fs)?;
+        write_tree_type(&mut w)?;
         w.start("tables")?;
         w.write_u8(1)?; // 1 level
         w.write_u8(2)?; // 2 runs in that level
@@ -1334,14 +1436,10 @@ mod tests {
         // The reader gets `UnexpectedEof` on the u32 read.
         w.write_u8(0xAA)?;
         w.write_u8(0xBB)?;
-        w.start("blob_files")?;
-        w.write_u32::<LittleEndian>(0)?;
+        write_empty_blob_files(&mut w)?;
         w.start("blob_gc_stats")?;
         w.write_u32::<LittleEndian>(0)?;
-        w.finish().map_err(|e| match e {
-            sfa::Error::Io(e) => crate::Error::from(e),
-            _ => crate::Error::Unrecoverable,
-        })?;
+        w.finish()?;
         Ok(())
     }
 
@@ -1357,13 +1455,14 @@ mod tests {
         let folder = Path::new("/tolerate/midlevel");
         fs.create_dir_all(folder)?;
 
-        write_current(folder, 1, &fs)?;
         write_truncated_at_second_run(folder, 1, &fs)?;
+        write_current(folder, 1, &fs)?;
 
         let recovery = recover(
             folder,
             &fs,
             ManifestRecoveryMode::TolerateCorruptedTailRecords,
+            None,
         )?;
         assert_eq!(
             recovery.table_ids.len(),
@@ -1402,14 +1501,8 @@ mod tests {
             actual < declared,
             "actual must be < declared for truncation"
         );
-        let path = folder.join(format!("v{id}"));
-        let file = fs.open(
-            &path,
-            &FsOpenOptions::new().write(true).create(true).truncate(true),
-        )?;
-        let mut w = sfa::Writer::from_writer(std::io::BufWriter::new(file));
-        w.start("tree_type")?;
-        w.write_u8(0)?;
+        let mut w = open_fixture_writer(folder, id, fs)?;
+        write_tree_type(&mut w)?;
         w.start("tables")?;
         w.write_u8(0)?; // 0 levels
         w.start("blob_files")?;
@@ -1424,10 +1517,7 @@ mod tests {
         }
         w.start("blob_gc_stats")?;
         w.write_u32::<LittleEndian>(0)?;
-        w.finish().map_err(|e| match e {
-            sfa::Error::Io(e) => crate::Error::from(e),
-            _ => crate::Error::Unrecoverable,
-        })?;
+        w.finish()?;
         Ok(())
     }
 
@@ -1441,13 +1531,14 @@ mod tests {
         let folder = Path::new("/tolerate/blob_tail");
         fs.create_dir_all(folder)?;
 
-        write_current(folder, 1, &fs)?;
         write_truncated_blob_tail(folder, 1, 5, 1, &fs)?;
+        write_current(folder, 1, &fs)?;
 
         let recovery = recover(
             folder,
             &fs,
             ManifestRecoveryMode::TolerateCorruptedTailRecords,
+            None,
         )?;
         assert_eq!(
             recovery.blob_file_ids.len(),
@@ -1468,14 +1559,8 @@ mod tests {
     /// `blob_gc_stats` payload landed — `FragmentationMap::decode_from`
     /// hits `UnexpectedEof` on the first byte.
     fn write_truncated_blob_gc_stats(folder: &Path, id: u64, fs: &dyn Fs) -> crate::Result<()> {
-        let path = folder.join(format!("v{id}"));
-        let file = fs.open(
-            &path,
-            &FsOpenOptions::new().write(true).create(true).truncate(true),
-        )?;
-        let mut w = sfa::Writer::from_writer(std::io::BufWriter::new(file));
-        w.start("tree_type")?;
-        w.write_u8(0)?;
+        let mut w = open_fixture_writer(folder, id, fs)?;
+        write_tree_type(&mut w)?;
         w.start("tables")?;
         w.write_u8(0)?; // 0 levels
         w.start("blob_files")?;
@@ -1484,10 +1569,7 @@ mod tests {
         // section.len() == 0, FragmentationMap::decode_from will
         // surface UnexpectedEof on its first read.
         w.start("blob_gc_stats")?;
-        w.finish().map_err(|e| match e {
-            sfa::Error::Io(e) => crate::Error::from(e),
-            _ => crate::Error::Unrecoverable,
-        })?;
+        w.finish()?;
         Ok(())
     }
 
@@ -1502,11 +1584,11 @@ mod tests {
         let fs = MemFs::new();
         let folder = Path::new("/tolerate/gc_stats");
         fs.create_dir_all(folder)?;
-        write_current(folder, 1, &fs)?;
         write_truncated_blob_gc_stats(folder, 1, &fs)?;
+        write_current(folder, 1, &fs)?;
 
         // Strict mode: hard fail.
-        let strict = recover(folder, &fs, ManifestRecoveryMode::AbsoluteConsistency);
+        let strict = recover(folder, &fs, ManifestRecoveryMode::AbsoluteConsistency, None);
         assert!(
             strict.is_err(),
             "strict mode must abort on truncated blob_gc_stats; got Ok",
@@ -1519,6 +1601,7 @@ mod tests {
             folder,
             &fs,
             ManifestRecoveryMode::TolerateCorruptedTailRecords,
+            None,
         )?;
         assert_eq!(
             lenient.gc_stats,
@@ -1592,15 +1675,8 @@ mod tests {
         id: u64,
         fs: &dyn Fs,
     ) -> crate::Result<()> {
-        let path = folder.join(format!("v{id}"));
-        let file = fs.open(
-            &path,
-            &FsOpenOptions::new().write(true).create(true).truncate(true),
-        )?;
-        let mut w = sfa::Writer::from_writer(std::io::BufWriter::new(file));
-
-        w.start("tree_type")?;
-        w.write_u8(0)?;
+        let mut w = open_fixture_writer(folder, id, fs)?;
+        write_tree_type(&mut w)?;
 
         w.start("tables")?;
         w.write_u8(2)?; // 2 levels
@@ -1616,14 +1692,10 @@ mod tests {
         write_good_table_record(&mut w, 200)?;
         write_good_table_record(&mut w, 201)?;
 
-        w.start("blob_files")?;
-        w.write_u32::<LittleEndian>(0)?;
+        write_empty_blob_files(&mut w)?;
         w.start("blob_gc_stats")?;
         w.write_u32::<LittleEndian>(0)?;
-        w.finish().map_err(|e| match e {
-            sfa::Error::Io(e) => crate::Error::from(e),
-            _ => crate::Error::Unrecoverable,
-        })?;
+        w.finish()?;
         Ok(())
     }
 
@@ -1632,10 +1704,10 @@ mod tests {
         let fs = MemFs::new();
         let folder = Path::new("/absolute/mid_corrupt");
         fs.create_dir_all(folder)?;
-        write_current(folder, 1, &fs)?;
         write_manifest_with_mid_record_corruption(folder, 1, &fs)?;
+        write_current(folder, 1, &fs)?;
 
-        let err = recover(folder, &fs, ManifestRecoveryMode::AbsoluteConsistency)
+        let err = recover(folder, &fs, ManifestRecoveryMode::AbsoluteConsistency, None)
             .expect_err("corrupt record must abort AbsoluteConsistency");
         assert!(
             matches!(
@@ -1655,10 +1727,10 @@ mod tests {
         let fs = MemFs::new();
         let folder = Path::new("/pit/mid_corrupt");
         fs.create_dir_all(folder)?;
-        write_current(folder, 1, &fs)?;
         write_manifest_with_mid_record_corruption(folder, 1, &fs)?;
+        write_current(folder, 1, &fs)?;
 
-        let recovery = recover(folder, &fs, ManifestRecoveryMode::PointInTimeRecovery)?;
+        let recovery = recover(folder, &fs, ManifestRecoveryMode::PointInTimeRecovery, None)?;
 
         // PIT contract: drop in-progress run contents + all
         // subsequent records; the recovered prefix is level 0 with
@@ -1696,10 +1768,15 @@ mod tests {
         let fs = MemFs::new();
         let folder = Path::new("/skip_any/mid_corrupt");
         fs.create_dir_all(folder)?;
-        write_current(folder, 1, &fs)?;
         write_manifest_with_mid_record_corruption(folder, 1, &fs)?;
+        write_current(folder, 1, &fs)?;
 
-        let recovery = recover(folder, &fs, ManifestRecoveryMode::SkipAnyCorruptedRecords)?;
+        let recovery = recover(
+            folder,
+            &fs,
+            ManifestRecoveryMode::SkipAnyCorruptedRecords,
+            None,
+        )?;
 
         // SkipAny contract: log the single bad record, advance past
         // it via the framing length header, keep going. Both
@@ -1739,15 +1816,8 @@ mod tests {
         id: u64,
         fs: &dyn Fs,
     ) -> crate::Result<()> {
-        let path = folder.join(format!("v{id}"));
-        let file = fs.open(
-            &path,
-            &FsOpenOptions::new().write(true).create(true).truncate(true),
-        )?;
-        let mut w = sfa::Writer::from_writer(std::io::BufWriter::new(file));
-
-        w.start("tree_type")?;
-        w.write_u8(0)?;
+        let mut w = open_fixture_writer(folder, id, fs)?;
+        write_tree_type(&mut w)?;
 
         w.start("tables")?;
         w.write_u8(0)?; // 0 levels (focus is on blob_files section)
@@ -1785,10 +1855,7 @@ mod tests {
 
         w.start("blob_gc_stats")?;
         w.write_u32::<LittleEndian>(0)?;
-        w.finish().map_err(|e| match e {
-            sfa::Error::Io(e) => crate::Error::from(e),
-            _ => crate::Error::Unrecoverable,
-        })?;
+        w.finish()?;
         Ok(())
     }
 
@@ -1797,10 +1864,15 @@ mod tests {
         let fs = MemFs::new();
         let folder = Path::new("/skip_any/blob_mid_corrupt");
         fs.create_dir_all(folder)?;
-        write_current(folder, 1, &fs)?;
         write_manifest_with_corrupt_blob_record(folder, 1, &fs)?;
+        write_current(folder, 1, &fs)?;
 
-        let recovery = recover(folder, &fs, ManifestRecoveryMode::SkipAnyCorruptedRecords)?;
+        let recovery = recover(
+            folder,
+            &fs,
+            ManifestRecoveryMode::SkipAnyCorruptedRecords,
+            None,
+        )?;
         let ids: Vec<u64> = recovery.blob_file_ids.iter().map(|(id, _)| *id).collect();
         assert_eq!(
             ids,
@@ -1824,15 +1896,8 @@ mod tests {
         id: u64,
         fs: &dyn Fs,
     ) -> crate::Result<()> {
-        let path = folder.join(format!("v{id}"));
-        let file = fs.open(
-            &path,
-            &FsOpenOptions::new().write(true).create(true).truncate(true),
-        )?;
-        let mut w = sfa::Writer::from_writer(std::io::BufWriter::new(file));
-
-        w.start("tree_type")?;
-        w.write_u8(0)?;
+        let mut w = open_fixture_writer(folder, id, fs)?;
+        write_tree_type(&mut w)?;
 
         w.start("tables")?;
         w.write_u8(2)?; // 2 levels
@@ -1849,14 +1914,10 @@ mod tests {
         w.write_u32::<LittleEndian>(1)?;
         write_bad_table_record(&mut w, 200)?;
 
-        w.start("blob_files")?;
-        w.write_u32::<LittleEndian>(0)?;
+        write_empty_blob_files(&mut w)?;
         w.start("blob_gc_stats")?;
         w.write_u32::<LittleEndian>(0)?;
-        w.finish().map_err(|e| match e {
-            sfa::Error::Io(e) => crate::Error::from(e),
-            _ => crate::Error::Unrecoverable,
-        })?;
+        w.finish()?;
         Ok(())
     }
 
@@ -1891,10 +1952,10 @@ mod tests {
         let fs = MemFs::new();
         let folder = Path::new("/pit/empty_run");
         fs.create_dir_all(folder)?;
-        write_current(folder, 1, &fs)?;
         write_manifest_with_corrupt_first_record_of_second_level(folder, 1, &fs)?;
+        write_current(folder, 1, &fs)?;
 
-        let recovery = recover(folder, &fs, ManifestRecoveryMode::PointInTimeRecovery)?;
+        let recovery = recover(folder, &fs, ManifestRecoveryMode::PointInTimeRecovery, None)?;
 
         // The persisted manifest declared 2 levels. The recovered
         // shape must keep that count — level 1 just has no
@@ -1942,15 +2003,8 @@ mod tests {
         id: u64,
         fs: &dyn Fs,
     ) -> crate::Result<()> {
-        let path = folder.join(format!("v{id}"));
-        let file = fs.open(
-            &path,
-            &FsOpenOptions::new().write(true).create(true).truncate(true),
-        )?;
-        let mut w = sfa::Writer::from_writer(std::io::BufWriter::new(file));
-
-        w.start("tree_type")?;
-        w.write_u8(0)?;
+        let mut w = open_fixture_writer(folder, id, fs)?;
+        write_tree_type(&mut w)?;
 
         w.start("tables")?;
         w.write_u8(2)?; // 2 levels persisted
@@ -1964,14 +2018,10 @@ mod tests {
         w.write_u32::<LittleEndian>(1)?;
         write_good_table_record(&mut w, 200)?;
 
-        w.start("blob_files")?;
-        w.write_u32::<LittleEndian>(0)?;
+        write_empty_blob_files(&mut w)?;
         w.start("blob_gc_stats")?;
         w.write_u32::<LittleEndian>(0)?;
-        w.finish().map_err(|e| match e {
-            sfa::Error::Io(e) => crate::Error::from(e),
-            _ => crate::Error::Unrecoverable,
-        })?;
+        w.finish()?;
         Ok(())
     }
 
@@ -1987,10 +2037,15 @@ mod tests {
         let fs = MemFs::new();
         let folder = Path::new("/skip_any/all_corrupt_run");
         fs.create_dir_all(folder)?;
-        write_current(folder, 1, &fs)?;
         write_manifest_with_all_records_in_run_corrupt(folder, 1, &fs)?;
+        write_current(folder, 1, &fs)?;
 
-        let recovery = recover(folder, &fs, ManifestRecoveryMode::SkipAnyCorruptedRecords)?;
+        let recovery = recover(
+            folder,
+            &fs,
+            ManifestRecoveryMode::SkipAnyCorruptedRecords,
+            None,
+        )?;
 
         // 2 levels persisted, both survive as slots.
         assert_eq!(recovery.table_ids.len(), 2);
@@ -2016,10 +2071,10 @@ mod tests {
         let fs = MemFs::new();
         let folder = Path::new("/pit/blob_mid_corrupt");
         fs.create_dir_all(folder)?;
-        write_current(folder, 1, &fs)?;
         write_manifest_with_corrupt_blob_record(folder, 1, &fs)?;
+        write_current(folder, 1, &fs)?;
 
-        let recovery = recover(folder, &fs, ManifestRecoveryMode::PointInTimeRecovery)?;
+        let recovery = recover(folder, &fs, ManifestRecoveryMode::PointInTimeRecovery, None)?;
         let ids: Vec<u64> = recovery.blob_file_ids.iter().map(|(id, _)| *id).collect();
         assert_eq!(
             ids,
@@ -2043,15 +2098,8 @@ mod tests {
         id: u64,
         fs: &dyn Fs,
     ) -> crate::Result<()> {
-        let path = folder.join(format!("v{id}"));
-        let file = fs.open(
-            &path,
-            &FsOpenOptions::new().write(true).create(true).truncate(true),
-        )?;
-        let mut w = sfa::Writer::from_writer(std::io::BufWriter::new(file));
-
-        w.start("tree_type")?;
-        w.write_u8(0)?;
+        let mut w = open_fixture_writer(folder, id, fs)?;
+        write_tree_type(&mut w)?;
 
         w.start("tables")?;
         w.write_u8(1)?; // 1 level
@@ -2063,14 +2111,10 @@ mod tests {
         write_good_table_record(&mut w, 100)?;
         write_bad_table_record(&mut w, 101)?;
 
-        w.start("blob_files")?;
-        w.write_u32::<LittleEndian>(0)?;
+        write_empty_blob_files(&mut w)?;
         w.start("blob_gc_stats")?;
         w.write_u32::<LittleEndian>(0)?;
-        w.finish().map_err(|e| match e {
-            sfa::Error::Io(e) => crate::Error::from(e),
-            _ => crate::Error::Unrecoverable,
-        })?;
+        w.finish()?;
         Ok(())
     }
 
@@ -2089,10 +2133,15 @@ mod tests {
         let fs = MemFs::new();
         let folder = Path::new("/skip_any/then_tail");
         fs.create_dir_all(folder)?;
-        write_current(folder, 1, &fs)?;
         write_manifest_skip_any_then_tail_truncated(folder, 1, &fs)?;
+        write_current(folder, 1, &fs)?;
 
-        let recovery = recover(folder, &fs, ManifestRecoveryMode::SkipAnyCorruptedRecords)?;
+        let recovery = recover(
+            folder,
+            &fs,
+            ManifestRecoveryMode::SkipAnyCorruptedRecords,
+            None,
+        )?;
 
         assert_eq!(
             recovery.stats.tables_dropped_to_corruption, 1,
@@ -2118,15 +2167,8 @@ mod tests {
         id: u64,
         fs: &dyn Fs,
     ) -> crate::Result<()> {
-        let path = folder.join(format!("v{id}"));
-        let file = fs.open(
-            &path,
-            &FsOpenOptions::new().write(true).create(true).truncate(true),
-        )?;
-        let mut w = sfa::Writer::from_writer(std::io::BufWriter::new(file));
-
-        w.start("tree_type")?;
-        w.write_u8(0)?;
+        let mut w = open_fixture_writer(folder, id, fs)?;
+        write_tree_type(&mut w)?;
 
         w.start("tables")?;
         w.write_u8(0)?; // 0 levels — focus is on blob_files
@@ -2158,10 +2200,7 @@ mod tests {
 
         w.start("blob_gc_stats")?;
         w.write_u32::<LittleEndian>(0)?;
-        w.finish().map_err(|e| match e {
-            sfa::Error::Io(e) => crate::Error::from(e),
-            _ => crate::Error::Unrecoverable,
-        })?;
+        w.finish()?;
         Ok(())
     }
 
@@ -2180,10 +2219,15 @@ mod tests {
         let fs = MemFs::new();
         let folder = Path::new("/skip_any/blob_then_tail");
         fs.create_dir_all(folder)?;
-        write_current(folder, 1, &fs)?;
         write_manifest_blob_skip_any_then_tail_truncated(folder, 1, &fs)?;
+        write_current(folder, 1, &fs)?;
 
-        let recovery = recover(folder, &fs, ManifestRecoveryMode::SkipAnyCorruptedRecords)?;
+        let recovery = recover(
+            folder,
+            &fs,
+            ManifestRecoveryMode::SkipAnyCorruptedRecords,
+            None,
+        )?;
 
         assert_eq!(
             recovery.stats.blob_dropped_to_corruption, 1,

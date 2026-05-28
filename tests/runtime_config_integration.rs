@@ -47,7 +47,8 @@ fn tree_update_runtime_config_visible_on_next_load() {
 
     tree.update_runtime_config(|cfg| {
         cfg.block_checksum_algo = ChecksumAlgorithm::Crc32c;
-    });
+    })
+    .unwrap();
 
     let after = tree.runtime_config();
     assert_eq!(after.block_checksum_algo, ChecksumAlgorithm::Crc32c);
@@ -68,7 +69,8 @@ fn tree_snapshot_outlives_update_with_pre_update_state() {
     tree.update_runtime_config(|cfg| {
         cfg.block_checksum_algo = ChecksumAlgorithm::Crc32c;
         cfg.kv_checksum_algo = ChecksumAlgorithm::Xxh3Low32;
-    });
+    })
+    .unwrap();
 
     // Pre-update snapshot still observes original values — the swap
     // doesn't reach into Arcs already in caller hands.
@@ -95,7 +97,8 @@ fn tree_runtime_config_resets_to_default_on_reopen() {
         let tree = open_tree(folder.path());
         tree.update_runtime_config(|cfg| {
             cfg.block_checksum_algo = ChecksumAlgorithm::Crc32c;
-        });
+        })
+        .unwrap();
         assert_eq!(
             tree.runtime_config().block_checksum_algo,
             ChecksumAlgorithm::Crc32c,
@@ -108,5 +111,41 @@ fn tree_runtime_config_resets_to_default_on_reopen() {
         ChecksumAlgorithm::Xxh3_64,
         "runtime config must reset to default on reopen — \
          not persisted to manifest by design"
+    );
+}
+
+/// Locks the public contract of `Tree::update_runtime_config` when
+/// the build does NOT enable the `page_ecc` cargo feature:
+/// flipping `page_ecc = true` must return the typed error AND
+/// leave the live snapshot unchanged. Without this guard the
+/// silent-downgrade path comes back the moment the validator is
+/// removed from `try_update`.
+#[cfg(not(feature = "page_ecc"))]
+#[test]
+fn tree_update_runtime_config_rejects_page_ecc_without_feature() {
+    let folder = get_tmp_folder();
+    let tree = open_tree(folder.path());
+
+    let before = tree.runtime_config();
+    let result = tree.update_runtime_config(|cfg| {
+        cfg.page_ecc = true;
+    });
+
+    match result {
+        Err(lsm_tree::Error::PageEccUnsupported) => {}
+        Err(other) => panic!("expected PageEccUnsupported, got {other:?}"),
+        Ok(()) => panic!(
+            "update_runtime_config(page_ecc=true) on a non-`page_ecc` \
+             build must return PageEccUnsupported, not silently apply"
+        ),
+    }
+
+    // Invariant: a rejected update leaves the live snapshot at its
+    // pre-call value. Same Arc identity is not guaranteed (the
+    // handle may have re-loaded), so compare by structural equality.
+    let after = tree.runtime_config();
+    assert_eq!(
+        before.page_ecc, after.page_ecc,
+        "rejected update must not mutate the live runtime config"
     );
 }

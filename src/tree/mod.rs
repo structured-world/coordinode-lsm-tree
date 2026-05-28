@@ -187,6 +187,8 @@ impl AbstractTree for Tree {
                 deletion_pause: &self.deletion_pause,
                 visible_seqno: &self.config.visible_seqno,
                 include_blobs: false,
+                runtime_config: self.0.runtime_config.load_full(),
+                encryption: self.0.config.encryption.clone(),
             },
         )
     }
@@ -369,6 +371,8 @@ impl AbstractTree for Tree {
             &config.seqno,
             &config.visible_seqno,
             &*config.fs,
+            self.0.runtime_config.load_full(),
+            self.0.config.encryption.clone(),
         )
     }
 
@@ -607,6 +611,8 @@ impl AbstractTree for Tree {
             &self.config.seqno,
             &self.config.visible_seqno,
             &*self.config.fs,
+            self.0.runtime_config.load_full(),
+            self.0.config.encryption.clone(),
         )?;
 
         if let Err(e) = version_lock.maintenance(&self.config.path, gc_watermark, &*self.config.fs)
@@ -1018,11 +1024,21 @@ impl Tree {
     /// (e.g. two threads concurrently toggling different fields) MUST
     /// serialize their `update_runtime_config` calls, typically via a
     /// `Mutex` around the call site.
-    pub fn update_runtime_config<F>(&self, mutator: F)
+    /// # Errors
+    ///
+    /// Returns [`crate::Error::PageEccUnsupported`] when the mutator
+    /// leaves `page_ecc = true` on a binary built without the
+    /// `page_ecc` cargo feature. The live snapshot stays at its
+    /// pre-mutation value on error.
+    pub fn update_runtime_config<F>(&self, mutator: F) -> crate::Result<()>
     where
         F: FnOnce(&mut crate::runtime_config::RuntimeConfig),
     {
-        self.0.runtime_config.update(mutator);
+        // Route through the validating handle path so an invalid
+        // mutation (currently: `page_ecc = true` on a non-`page_ecc`
+        // build) is rejected at update time, not silently swallowed
+        // at the next manifest write.
+        self.0.runtime_config.try_update(mutator)
     }
 
     /// Snapshot of the current runtime config. Cheap atomic load —
@@ -1716,7 +1732,15 @@ impl Tree {
         // but the build does not link the Reed-Solomon codec. We have
         // no way to verify or recover RS parity without the codec, so
         // refuse to open rather than silently downgrade integrity.
-        if config.page_ecc && !cfg!(feature = "page_ecc") {
+        // Two surfaces to check:
+        //   - `Config::page_ecc(true)`  → SST data-block ECC
+        //   - `Config::with_runtime_config(RuntimeConfig { page_ecc: true, .. })`
+        //     → manifest-Block ECC (consumed by manifest_blocks::writer)
+        // Both silently no-op without the feature; refusing here is
+        // the only place callers see a typed error.
+        if (config.page_ecc || config.initial_runtime_config.page_ecc)
+            && !cfg!(feature = "page_ecc")
+        {
             return Err(crate::Error::PageEccUnsupported);
         }
 
@@ -1731,7 +1755,11 @@ impl Tree {
         // Decide between recovery and fresh creation atomically by attempting
         // to read the CURRENT version file. This avoids a TOCTOU race that
         // would occur if we probed with exists() first.
-        let tree = match crate::version::recovery::get_current_version(&config.path, &*config.fs) {
+        let tree = match crate::version::recovery::get_current_version(
+            &config.path,
+            &*config.fs,
+            config.encryption.clone(),
+        ) {
             Ok(_) => Self::recover(config),
             Err(crate::Error::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
                 // Missing CURRENT MUST coincide with a directory that
@@ -1922,6 +1950,13 @@ impl Tree {
     /// # Errors
     ///
     /// Returns error, if an IO error occurred.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "Tree::recover threads the whole open sequence (CURRENT validation, \
+                  Manifest decode, encryption + runtime plumbing, version recovery, \
+                  TreeInner assembly) — splitting it would create helper functions whose \
+                  only caller is this one site"
+    )]
     fn recover(mut config: Config) -> crate::Result<Self> {
         use crate::stop_signal::StopSignal;
         use inner::get_next_tree_id;
@@ -1936,14 +1971,27 @@ impl Tree {
         // recover_levels for table/blob data). This is intentional — metadata
         // validation must complete before any disk-mutating recovery work.
         {
-            let version_id =
-                crate::version::recovery::get_current_version(&config.path, &*config.fs)?;
+            let version_id = crate::version::recovery::get_current_version(
+                &config.path,
+                &*config.fs,
+                config.encryption.clone(),
+            )?;
             let manifest_path = config.path.join(format!("v{version_id}"));
-            let mut manifest_file = config
-                .fs
-                .open(&manifest_path, &crate::fs::FsOpenOptions::new().read(true))?;
-            let reader = sfa::Reader::from_reader(&mut manifest_file)?;
-            let manifest = Manifest::decode_from(&manifest_path, &reader, &*config.fs)?;
+            // Open the manifest with a default runtime snapshot:
+            // ECC awareness is captured per-Block via the header
+            // (`ecc_length` field) so the reader doesn't actually
+            // need to know which ECC mode the writer used. The
+            // captured runtime here is a placeholder; once we want
+            // runtime-driven decisions on the read path (e.g.
+            // checksum_algo dispatch per #298) we'll seed it from
+            // Config + persisted format-version fields.
+            let mut archive_reader = crate::manifest_blocks::reader::ManifestArchiveReader::open(
+                &manifest_path,
+                &*config.fs,
+                std::sync::Arc::new(crate::runtime_config::RuntimeConfig::default()),
+                config.encryption.clone(),
+            )?;
+            let manifest = Manifest::decode_from(&mut archive_reader)?;
 
             if !matches!(manifest.version, FormatVersion::V5) {
                 return Err(crate::Error::InvalidVersion(manifest.version.into()));
@@ -2004,6 +2052,10 @@ impl Tree {
 
         let deletion_pause = crate::deletion_pause::DeletionPause::new_shared();
 
+        // Clone the seed snapshot BEFORE moving config into the Arc
+        // below — the runtime handle initializer needs it after the
+        // move.
+        let initial_runtime = config.initial_runtime_config.clone();
         let inner = TreeInner {
             id: tree_id,
             memtable_id_counter: SequenceNumberCounter::new(1),
@@ -2016,9 +2068,9 @@ impl Tree {
             flush_lock: Mutex::default(),
             compaction_state: Arc::new(Mutex::new(CompactionState::default())),
             deletion_pause: Arc::clone(&deletion_pause),
-            runtime_config: crate::runtime_config::handle::RuntimeConfigHandle::new(
-                crate::runtime_config::RuntimeConfig::default(),
-            ),
+            runtime_config: Arc::new(crate::runtime_config::handle::RuntimeConfigHandle::new(
+                initial_runtime,
+            )),
 
             #[cfg(feature = "metrics")]
             metrics,
@@ -2101,7 +2153,12 @@ impl Tree {
 
         let tree_path = tree_path.as_ref();
 
-        let recovery = recover(tree_path, &*config.fs, config.manifest_recovery_mode)?;
+        let recovery = recover(
+            tree_path,
+            &*config.fs,
+            config.manifest_recovery_mode,
+            config.encryption.clone(),
+        )?;
 
         let mut table_map = {
             let mut result: crate::HashMap<TableId, (u8 /* Level index */, Checksum, SeqNo)> =

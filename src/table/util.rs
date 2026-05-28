@@ -54,6 +54,16 @@ pub fn load_block(
 
     log::trace!("load {block_type:?} block {handle:?}");
 
+    // Invariant: manifest Blocks have their own reader path and
+    // never reach the SST block cache. Surface a typed error
+    // (rather than panic) so a caller that wires up an SST loader
+    // with a manifest BlockType gets a routable failure instead
+    // of a process abort. The check stays outside the metrics
+    // cfg so the contract holds on every build.
+    if matches!(block_type, BlockType::Manifest | BlockType::ManifestFooter) {
+        return Err(crate::Error::InvalidTag(("BlockType", block_type.into())));
+    }
+
     if let Some(block) = cache.get_block(table_id, handle.offset()) {
         if block.header.block_type != block_type {
             return Err(crate::Error::InvalidTag((
@@ -78,6 +88,9 @@ pub fn load_block(
             BlockType::Data | BlockType::Meta => {
                 metrics.data_block_load_cached.fetch_add(1, Relaxed);
             }
+            // Manifest variants are rejected by the function-level
+            // guard above; nothing to do here.
+            BlockType::Manifest | BlockType::ManifestFooter => {}
         }
 
         return Ok(block);
@@ -158,6 +171,9 @@ pub fn load_block(
                 .data_block_io_requested
                 .fetch_add(handle.size().into(), Relaxed);
         }
+        // Manifest variants are rejected by the function-level
+        // guard above; nothing to do here.
+        BlockType::Manifest | BlockType::ManifestFooter => {}
     }
 
     cache.insert_block(table_id, handle.offset(), block.clone());

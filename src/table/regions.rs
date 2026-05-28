@@ -3,9 +3,9 @@
 // Copyright (c) 2026-present, Structured World Foundation
 
 use super::{BlockHandle, BlockOffset};
-use sfa::TocEntry;
+use crate::sfa::TocEntry;
 
-/// Converts a [`sfa::TocEntry`] to our [`BlockHandle`] struct.
+/// Converts a [`crate::sfa::TocEntry`] to our [`BlockHandle`] struct.
 fn toc_entry_to_handle(entry: &TocEntry) -> BlockHandle {
     #[expect(
         clippy::expect_used,
@@ -95,7 +95,7 @@ pub struct ParsedRegions {
 }
 
 impl ParsedRegions {
-    pub fn parse_from_toc(toc: &sfa::Toc) -> crate::Result<Self> {
+    pub fn parse_from_toc(toc: &crate::sfa::Toc) -> crate::Result<Self> {
         Ok(Self {
             filter_tli: toc.section(b"filter_tli").map(toc_entry_to_handle),
             tli: toc

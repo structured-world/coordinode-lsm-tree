@@ -987,7 +987,7 @@ mod tests {
         // Write V3 blob file manually using sfa framing
         {
             let file = std::fs::File::create(&blob_file_path)?;
-            let mut sfa_writer = sfa::Writer::from_writer(file);
+            let mut sfa_writer = crate::sfa::Writer::from_writer(file);
             sfa_writer.start("data")?;
 
             // V3 frame: BLOB magic, no header_crc
@@ -1057,7 +1057,7 @@ mod tests {
 
         // V3 frame offset: sfa "data" segment header comes first.
         // Find actual data start via sfa reader.
-        let sfa_reader = sfa::Reader::new(&blob_file.0.path)?;
+        let sfa_reader = crate::sfa::Reader::new(&blob_file.0.path)?;
         let data_section = sfa_reader.toc().section(b"data").unwrap();
         let data_start = data_section.pos();
 

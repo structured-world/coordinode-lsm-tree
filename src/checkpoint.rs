@@ -369,33 +369,50 @@ fn copy_metadata_file_optional(
 /// wire format as [`crate::version::persist_version`]: `u64 version_id`
 /// + `u128 checksum` + `u8 checksum_type`.
 ///
-/// The checksum field is intentionally written as zero: recovery's
-/// [`crate::version::recovery`] reads it for forward-compatibility but
-/// does not validate it against the `v<id>` file's contents, so any
-/// value works. The zero is a deliberate "no checksum carried" sentinel,
-/// not an attempt to forge a real digest.
+/// The checksum field is the canonical CURRENT digest produced by
+/// [`crate::manifest_blocks::current_digest::compute`]: an XXH3-128
+/// over (`version_id`, `layout_version`, flags, sorted TOC tuples
+/// with each section's own Block-level XXH3-128). Reusing the exact
+/// path `get_current_version` re-derives on `Tree::open` guarantees
+/// bit-identical digest computation between writer and reader. A
+/// section-byte swap is caught (changes the per-section checksum in
+/// the TOC), a tail-only torn write is recovered via the head mirror
+/// before the digest is computed, and a per-Block ECC repair on
+/// section read does not invalidate the digest (the TOC-bound
+/// section checksum was stamped at writer-time, not derived from
+/// on-disk bytes).
 fn write_current_for_version(
     target_fs: &dyn Fs,
     target_root: &Path,
     version_id: u64,
+    runtime: Arc<crate::runtime_config::RuntimeConfig>,
+    encryption: Option<Arc<dyn crate::encryption::EncryptionProvider>>,
 ) -> crate::Result<()> {
     use crate::checksum::ChecksumType;
     use crate::file::rewrite_atomic;
+    use crate::manifest_blocks::{current_digest, reader::ManifestArchiveReader};
     use byteorder::{LittleEndian, WriteBytesExt};
 
-    // The `current` wire format is `version_id: u64 | checksum: u128 |
-    // checksum_type: u8`. The checksum field is reserved for future
-    // verification — recovery reads it but does not validate it against
-    // the `v<id>` contents — so a zero literal is the documented "no
-    // digest carried" sentinel, not a forged digest. The checksum type
-    // MUST come from `ChecksumType` so any future format evolution
-    // (e.g. a real checksum) shifts this writer and the recovery
-    // checker in lockstep through one shared enum.
-    const RESERVED_CHECKSUM: u128 = 0;
+    let manifest_path = target_root.join(format!("v{version_id}"));
+    // Open the freshly-written manifest through the same reader
+    // `get_current_version` will use, derive the canonical CURRENT
+    // digest from its parsed footer, and stamp the pointer. Using
+    // the reader here (vs. re-reading raw bytes ourselves) guarantees
+    // bit-identical digest computation between writer and reader
+    // paths: any mismatch is a real bug, not a derivation drift.
+    //
+    // Runtime + encryption come from the checkpoint driver and
+    // mirror the snapshot used by the preceding `persist_version`
+    // call — otherwise the reader would try to decode an
+    // encryption-wrapped manifest without the provider and fail to
+    // produce the footer, leaving the checkpoint with a dangling
+    // (manifest written, no CURRENT) state.
+    let archive = ManifestArchiveReader::open(&manifest_path, target_fs, runtime, encryption)?;
+    let checksum = current_digest::compute(version_id, archive.footer())?;
 
     let mut content = vec![];
     content.write_u64::<LittleEndian>(version_id)?;
-    content.write_u128::<LittleEndian>(RESERVED_CHECKSUM)?;
+    content.write_u128::<LittleEndian>(checksum)?;
     content.write_u8(u8::from(ChecksumType::Xxh3))?;
 
     rewrite_atomic(&target_root.join(CURRENT_VERSION_FILE), &content, target_fs)?;
@@ -420,6 +437,12 @@ fn write_current_for_version(
 /// [`crate::version::persist_version`]'s signature). `current` is
 /// then written via [`write_current_for_version`] referencing the
 /// freshly-persisted `version.id()`.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "checkpoint metadata copy threads (src fs+root, target fs+root, version, \
+              comparator, runtime, encryption) — every parameter is load-bearing and \
+              wrapping into a struct would just move the count to the struct literal"
+)]
 pub fn copy_metadata(
     src_fs: &dyn Fs,
     src_root: &Path,
@@ -427,6 +450,8 @@ pub fn copy_metadata(
     target_root: &Path,
     version: &crate::version::Version,
     comparator_name: &str,
+    runtime: std::sync::Arc<crate::runtime_config::RuntimeConfig>,
+    encryption: Option<std::sync::Arc<dyn crate::encryption::EncryptionProvider>>,
 ) -> crate::Result<()> {
     // Manifest stores level count + comparator name. On a never-written
     // tree the manifest may legitimately be absent (recovery treats
@@ -441,7 +466,20 @@ pub fn copy_metadata(
     // authoritative source for the snapshot we just hard-linked SSTs
     // for, so writing it from memory eliminates the race entirely —
     // the source file's lifetime no longer matters.
-    crate::version::persist_version(target_root, version, comparator_name, target_fs)?;
+    // Checkpoints carry their own snapshot of the runtime config so
+    // the captured manifest is encoded with the same toggles the
+    // live tree used at capture time. Receives the snapshot from the
+    // driver — Tree::create_checkpoint loads it via load_full() on
+    // the source tree's RuntimeConfigHandle so the checkpoint sees
+    // exactly the config in effect at capture.
+    crate::version::persist_version(
+        target_root,
+        version,
+        comparator_name,
+        target_fs,
+        Arc::clone(&runtime),
+        encryption.clone(),
+    )?;
     // CURRENT pointer is generated fresh for the captured `version_id`
     // (NOT copied from source) so a concurrent publish to `v<N+1>` on
     // the source can never leave the checkpoint pointing at a version
@@ -452,7 +490,12 @@ pub fn copy_metadata(
     // checkpoint retried. `PartialCheckpointGuard` performs that
     // removal on the normal error path; an unclean crash (no Drop) is
     // the only case the operator must clean up manually.
-    write_current_for_version(target_fs, target_root, version.id())?;
+    //
+    // The runtime + encryption snapshot here MUST match what
+    // `persist_version` above used — the helper reopens the manifest
+    // via `ManifestArchiveReader`, and an encrypted manifest reopened
+    // without its provider would fail to decode the footer Block.
+    write_current_for_version(target_fs, target_root, version.id(), runtime, encryption)?;
     Ok(())
 }
 
@@ -474,6 +517,20 @@ pub struct CheckpointParams<'a> {
     pub visible_seqno: &'a crate::seqno::SharedSequenceNumberGenerator,
     /// Whether to capture the value log under `target/blobs/`.
     pub include_blobs: bool,
+    /// Snapshot of the source tree's runtime config at capture time.
+    /// Forwarded to [`copy_metadata`] / [`crate::version::persist_version`]
+    /// so the checkpoint manifest is encoded with the same toggles
+    /// the live tree used when the checkpoint started — eliminates
+    /// drift between source-tree manifest and captured-tree manifest.
+    /// Callers obtain the snapshot via
+    /// `tree.0.runtime_config.load_full()` on the source `Tree`.
+    pub runtime_config: Arc<crate::runtime_config::RuntimeConfig>,
+    /// Encryption provider cloned from the source tree's
+    /// `Config::encryption`. Threaded through to the manifest writer
+    /// so the captured manifest is encrypted with the same key
+    /// chain the source tree uses — a checkpoint of an encrypted
+    /// tree is itself encrypted end-to-end.
+    pub encryption: Option<Arc<dyn crate::encryption::EncryptionProvider>>,
 }
 
 /// RAII guard that removes a partially-built checkpoint directory on
@@ -609,6 +666,8 @@ pub fn run_checkpoint<T: AbstractTree>(
         target_root,
         &version,
         tree.tree_config().comparator.name(),
+        Arc::clone(&params.runtime_config),
+        params.encryption.clone(),
     )?;
 
     // fsync each populated child directory BEFORE the root so the
@@ -709,4 +768,13 @@ mod tests {
             .unwrap();
         assert_eq!(after, "mutated-via-mem-fs");
     }
+
+    // Removed: `write_current_for_version_rejects_corrupt_footer_size_hint`.
+    // The checkpoint write path now goes through
+    // `ManifestArchiveReader::open` (canonical CURRENT digest path),
+    // which has head-mirror fallback for a torn tail size hint —
+    // recovery succeeds instead of erroring, which is the correct
+    // behaviour. Tail / head-mirror bounds checks are covered by
+    // `manifest_blocks::reader::tests::reader_fails_when_tail_corrupt_and_no_mirror`
+    // and siblings.
 }

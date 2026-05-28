@@ -262,6 +262,8 @@ impl<'a> BlobIngestion<'a> {
             global_seqno,
             &self.tree.index.config.visible_seqno,
             &*self.tree.index.config.fs,
+            self.tree.index.0.runtime_config.load_full(),
+            self.tree.index.0.config.encryption.clone(),
         )?;
 
         // Perform maintenance on the version history (e.g., clean up old versions).

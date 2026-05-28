@@ -61,6 +61,18 @@ pub struct Options {
 
     pub compaction_state: Arc<Mutex<CompactionState>>,
 
+    /// Shared handle to the live runtime config. Compaction loads
+    /// a fresh snapshot via [`crate::runtime_config::handle::RuntimeConfigHandle::load_full`]
+    /// each time it writes the manifest, so toggles applied via
+    /// [`crate::Tree::update_runtime_config`] take effect on the
+    /// next compaction cycle without restart.
+    pub runtime_config: Arc<crate::runtime_config::handle::RuntimeConfigHandle>,
+
+    /// Optional per-tree encryption provider, threaded into manifest
+    /// writes so compaction-driven version commits inherit the same
+    /// AEAD pipeline the data blocks use.
+    pub encryption: Option<Arc<dyn crate::encryption::EncryptionProvider>>,
+
     #[cfg(feature = "metrics")]
     pub metrics: Arc<Metrics>,
 }
@@ -80,6 +92,8 @@ impl Options {
             mvcc_gc_watermark: 0,
 
             compaction_state: tree.compaction_state.clone(),
+            runtime_config: tree.runtime_config.clone(),
+            encryption: tree.config.encryption.clone(),
 
             #[cfg(feature = "metrics")]
             metrics: tree.metrics.clone(),
@@ -249,6 +263,8 @@ fn move_tables(
         &opts.global_seqno,
         &opts.visible_seqno,
         &*opts.config.fs,
+        opts.runtime_config.load_full(),
+        opts.encryption.clone(),
     )?;
 
     if let Err(e) = version_history_lock.maintenance(
@@ -700,6 +716,8 @@ fn drop_tables(
         &opts.global_seqno,
         &opts.visible_seqno,
         &*opts.config.fs,
+        opts.runtime_config.load_full(),
+        opts.encryption.clone(),
     )?;
 
     if let Err(e) = version_history_lock.maintenance(

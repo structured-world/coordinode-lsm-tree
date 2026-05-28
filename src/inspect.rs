@@ -140,7 +140,7 @@ pub fn read_table_properties(path: &Path) -> crate::Result<TableProperties> {
     let fs = StdFs;
     let mut file = fs.open(path, &FsOpenOptions::new().read(true))?;
 
-    let sfa_reader = sfa::Reader::from_reader(&mut file)?;
+    let sfa_reader = crate::sfa::Reader::from_reader(&mut file)?;
     let toc = sfa_reader.toc();
     let regions = ParsedRegions::parse_from_toc(toc)?;
 
@@ -262,7 +262,7 @@ pub fn read_top_level_index_entries(path: &Path) -> crate::Result<Vec<IndexEntry
     let fs = StdFs;
     let mut file = fs.open(path, &FsOpenOptions::new().read(true))?;
 
-    let sfa_reader = sfa::Reader::from_reader(&mut file)?;
+    let sfa_reader = crate::sfa::Reader::from_reader(&mut file)?;
     let toc = sfa_reader.toc();
     let regions = ParsedRegions::parse_from_toc(toc)?;
 
@@ -641,7 +641,7 @@ pub fn iter_data_block_entries(path: &Path) -> crate::Result<DataBlockEntryIter>
     let fs = StdFs;
     let mut file = fs.open(path, &FsOpenOptions::new().read(true))?;
 
-    let sfa_reader = sfa::Reader::from_reader(&mut file)?;
+    let sfa_reader = crate::sfa::Reader::from_reader(&mut file)?;
     let toc = sfa_reader.toc();
     let regions = ParsedRegions::parse_from_toc(toc)?;
 
@@ -874,7 +874,7 @@ pub fn read_filter_stats(path: &Path) -> crate::Result<Option<FilterStats>> {
     let fs = StdFs;
     let mut file = fs.open(path, &FsOpenOptions::new().read(true))?;
 
-    let sfa_reader = sfa::Reader::from_reader(&mut file)?;
+    let sfa_reader = crate::sfa::Reader::from_reader(&mut file)?;
     let toc = sfa_reader.toc();
     let regions = ParsedRegions::parse_from_toc(toc)?;
 

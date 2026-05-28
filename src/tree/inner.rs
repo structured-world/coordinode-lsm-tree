@@ -7,7 +7,7 @@ use crate::{
     compaction::state::CompactionState,
     config::Config,
     deletion_pause::DeletionPause,
-    runtime_config::{RuntimeConfig, handle::RuntimeConfigHandle},
+    runtime_config::handle::RuntimeConfigHandle,
     stop_signal::StopSignal,
     version::{SuperVersions, Version, persist_version},
 };
@@ -77,19 +77,24 @@ pub struct TreeInner {
 
     /// Runtime-toggleable configuration. Lockless atomic snapshot.
     ///
-    /// In this crate it is only reachable through the public Tree API
+    /// Reachable through the public Tree API
     /// ([`crate::Tree::runtime_config`] /
-    /// [`crate::Tree::update_runtime_config`]); no write path consults
-    /// it yet. Intended to be loaded by write paths (block write,
-    /// manifest commit, compaction) once the V5-batch format features
-    /// wire them in, so that live config changes are picked up without
-    /// coordination. Read paths remain config-independent — each block
-    /// / manifest self-describes via its own header.
+    /// [`crate::Tree::update_runtime_config`]). Manifest-touching
+    /// write paths — `version::persist_version`,
+    /// `compaction::worker::Options`,
+    /// `checkpoint::write_current_for_version`, and the flush /
+    /// ingestion sites that drive them — load a snapshot of this
+    /// handle to pick the manifest writer's `BlockTransform`
+    /// variant (footer mirror on/off, `page_ecc`, encryption). SST
+    /// data-block write paths still consume the static
+    /// `Config::page_ecc` only — wiring through the SST writer
+    /// is a follow-up. Read paths stay config-independent: each
+    /// Block self-describes via its own header.
     //
     // no-std: Tree itself is std-bound. For no_std consumers needing
     // runtime-toggleable config, use spin::RwLock<RuntimeConfig> as
     // alternative (slower hot path, but compiles under alloc-only).
-    pub(crate) runtime_config: RuntimeConfigHandle,
+    pub(crate) runtime_config: Arc<RuntimeConfigHandle>,
 
     #[doc(hidden)]
     #[cfg(feature = "metrics")]
@@ -106,11 +111,20 @@ impl TreeInner {
                 crate::TreeType::Standard
             },
         );
+        // Seed the runtime snapshot for the first persist from the
+        // Config-supplied initial RuntimeConfig (defaults to
+        // `RuntimeConfig::default()` when the caller never touched
+        // `Config::with_runtime_config`). Reused below to initialize
+        // the Tree's `RuntimeConfigHandle` so the on-disk manifest
+        // bytes and the live runtime handle agree on byte zero.
+        let initial_runtime = std::sync::Arc::new(config.initial_runtime_config.clone());
         persist_version(
             &config.path,
             &version,
             config.comparator.name(),
             &*config.fs,
+            std::sync::Arc::clone(&initial_runtime),
+            config.encryption.clone(),
         )?;
 
         let comparator = config.comparator.clone();
@@ -127,7 +141,7 @@ impl TreeInner {
             flush_lock: Mutex::default(),
             compaction_state: Arc::new(Mutex::new(CompactionState::default())),
             deletion_pause: DeletionPause::new_shared(),
-            runtime_config: RuntimeConfigHandle::new(RuntimeConfig::default()),
+            runtime_config: Arc::new(RuntimeConfigHandle::new((*initial_runtime).clone())),
 
             #[cfg(feature = "metrics")]
             metrics: Metrics::default().into(),

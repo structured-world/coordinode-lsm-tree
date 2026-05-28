@@ -70,7 +70,7 @@ pub struct Writer {
 
     /// File writer
     #[expect(clippy::struct_field_names)]
-    file_writer: sfa::Writer<ChecksummedWriter<BufWriter<Box<dyn FsFile>>>>,
+    file_writer: crate::sfa::Writer<ChecksummedWriter<BufWriter<Box<dyn FsFile>>>>,
 
     /// Writer of index blocks
     #[expect(clippy::struct_field_names)]
@@ -137,7 +137,7 @@ impl Writer {
         let file = fs.open(&path, &FsOpenOptions::new().write(true).create_new(true))?;
         let writer = BufWriter::with_capacity(u16::MAX.into(), file);
         let writer = ChecksummedWriter::new(writer);
-        let mut writer = sfa::Writer::from_writer(writer);
+        let mut writer = crate::sfa::Writer::from_writer(writer);
         writer.start("data")?;
 
         Ok(Self {
@@ -957,7 +957,7 @@ fn meta_kv(key: &str, value: &[u8]) -> InternalValue {
 }
 
 fn write_meta_section<W: std::io::Write + std::io::Seek>(
-    file_writer: &mut sfa::Writer<ChecksummedWriter<W>>,
+    file_writer: &mut crate::sfa::Writer<ChecksummedWriter<W>>,
     block_buffer: &mut Vec<u8>,
     encryption: Option<&dyn EncryptionProvider>,
     page_ecc: bool,

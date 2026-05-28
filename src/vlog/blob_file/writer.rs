@@ -108,7 +108,7 @@ pub struct Writer {
     pub(crate) blob_file_id: BlobFileId,
 
     #[expect(clippy::struct_field_names)]
-    writer: sfa::Writer<ChecksummedWriter<BufWriter<Box<dyn FsFile>>>>,
+    writer: crate::sfa::Writer<ChecksummedWriter<BufWriter<Box<dyn FsFile>>>>,
 
     offset: u64,
 
@@ -149,7 +149,7 @@ impl Writer {
         let file = fs.open(path, &FsOpenOptions::new().write(true).create_new(true))?;
         let writer = BufWriter::new(file);
         let writer = ChecksummedWriter::new(writer);
-        let mut writer = sfa::Writer::from_writer(writer);
+        let mut writer = crate::sfa::Writer::from_writer(writer);
         writer.start("data")?;
 
         Ok(Self {

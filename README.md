@@ -120,6 +120,31 @@ cargo run --release --features flamegraph -- \
 | [`tools/db_bench`](tools/db_bench) | RocksDB-compatible benchmark suite, also drives the CI perf dashboard. |
 | [`tools/sst-dump`](tools/sst-dump) | Inspect / verify a single SST file out-of-band. Subcommands: `verify` (walk every block, check per-block XXH3, exit non-zero on corruption), `properties` (print the SST's stored metadata: id, key range, KV / tombstone counts, block counts, compression, timestamp), `hex <offset>` (raw hex dump of a region with optional `Header` decode; useful for inspecting a specific offset flagged by `verify --verbose`), `index-dump` (print TLI entries: end_key + offset + size + seqno per pointed-at block; useful for diagnosing range-read fan-out), `dump` (stream every KV entry to stdout with optional `--from` / `--to` / `--max=N` / `--keys-only` filters; full-index SSTs only), `filter-stats` (print BuRR filter sizing: section bytes, layer count, item count, approximate bits-per-key; single-block filters only, partitioned filters not yet supported). |
 
+## Manifest hardening
+
+The per-version manifest file (`v{N}`) is stored as a sequence of standard lsm-tree `Block`s — one `BlockType::Manifest` Block per section, plus a `BlockType::ManifestFooter` Block at the tail carrying the table of contents and the manifest layout version. Every Block goes through the same XXH3-128 / optional ECC / optional AEAD pipeline data Blocks use, so every protection that applies to a data Block automatically applies to the manifest.
+
+Five layers compose the manifest's integrity surface. L1 and L4 are always on as part of the on-disk format; L2, L3, and L5 are independently configurable (compile-time feature, encryption provider, or runtime config):
+
+| Layer | Defends against | Config knob | Default |
+|-------|-----------------|-------------|---------|
+| L1 — Block XXH3-128 | Bit-rot detection per section / footer Block | Always on (`Block` invariant) | always on |
+| L2 — Page ECC (Reed-Solomon (4, 2)) | Bit-rot recovery per Block | `RuntimeConfig::page_ecc` for **manifest Blocks** (current release) + `Config::page_ecc` for **SST data Blocks** (compile-time `page_ecc` feature gates both) | off (opt-in) |
+| L3 — AEAD encryption | Tampering detection + confidentiality | `Config::with_encryption(provider)` | off |
+| L4 — Footer Block tail hint | Reader locates footer without scanning | Always on (trailing `u32` size hint) | always on |
+| L5 — Head footer mirror | Partial-write / tail-bit-rot recovery via mirrored copy at offset 0 | `RuntimeConfig::manifest_footer_mirror` | on |
+
+Manifest-side ECC and the head mirror are reachable through `Tree::update_runtime_config` (for L2 *on manifest Blocks* and L5); SST data-block ECC is tree-static via `Config::page_ecc` at open time and not affected by runtime updates. AEAD is supplied at open via `Config::with_encryption` (L3). Runtime toggles take effect on the next manifest write, and existing on-disk manifests stay readable in their original format because each Block self-describes via its header.
+
+Failure-mode coverage with the defaults (mirror on, ECC off, AEAD off):
+
+- **Bit-flip inside one section Block** → XXH3 surfaces it, other sections + the footer Block still read correctly (per-section isolation; see [`manifest_blocks::reader::tests::reader_isolates_corruption_to_one_section_other_sections_readable`](src/manifest_blocks/reader.rs)).
+- **Tail footer Block corruption** → reader falls back to the head mirror at offset 0 and continues.
+- **Partial write mid-update on a fresh `v{N+1}`** → the prior version's manifest stays intact in its own `v{N}` file, and the atomic `CURRENT` rewrite either lands fully (pointing at `v{N+1}`) or stays at `v{N}`. A torn or truncated `v{N+1}` file is detected at open time: the reader's tail-footer + head-mirror probes both fail and `Tree::open` surfaces `ManifestFooterInvalid`. The head mirror inside each `v{N}` is a copy of THAT file's own tail footer Block (for tail-bit-rot recovery within one version), not a snapshot of a prior version's TOC.
+- **Accidental file substitution / mislinking** → the `CURRENT` pointer carries an XXH3-128 of the referenced `v{N}` manifest's canonical footer content (version_id + TOC entries + per-section XXH3-128 each section Block already carries in its own header); `Tree::open` recomputes this from the parsed footer on read and refuses to follow a mismatched pointer. The digest binds logical content, not raw bytes — a section bit-flip that per-Block Page ECC heals on read does NOT trip this check (the section's TOC checksum is unchanged), preserving recovery. XXH3-128 is **not** a cryptographic MAC: an adversary with write access can craft matching content. Enable `Config::with_encryption(...)` (AEAD per Block) for adversarial tamper resistance.
+
+Turning ECC on (`page_ecc = true`) upgrades the first three rows from "detect and refuse" to "detect and recover" without any change to call sites — the Block layer transparently emits / consumes the parity trailer per Block.
+
 ## Manifest recovery modes
 
 `Config::manifest_recovery_mode` controls how the engine reacts to a malformed MANIFEST record at `Tree::open` time. Each mode trades a different point on the **strictness ↔ availability** axis; pick the one whose contract matches the deployment.

@@ -30,7 +30,7 @@ fn find_table_file(dir: &Path) -> std::path::PathBuf {
 /// named section, or `None` if the section is absent.
 fn locate_section(path: &Path, name: &[u8]) -> Option<(u64, u64)> {
     let mut file = std::fs::File::open(path).unwrap();
-    let reader = sfa::Reader::from_reader(&mut file).unwrap();
+    let reader = lsm_tree::sfa::Reader::from_reader(&mut file).unwrap();
     reader
         .toc()
         .section(name)

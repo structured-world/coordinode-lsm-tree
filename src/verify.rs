@@ -555,7 +555,7 @@ fn scan_sst_blocks(
     let mut file = fs.open(path, &crate::fs::FsOpenOptions::new().read(true))?;
 
     // The SFA trailer + TOC live at the tail of the file.
-    // sfa::Reader::from_reader leaves the cursor at an undefined
+    // crate::sfa::Reader::from_reader leaves the cursor at an undefined
     // offset; each per-section walk below explicitly seeks to the
     // section's `pos()` first so the unknown post-trailer position
     // doesn't matter.
@@ -563,12 +563,12 @@ fn scan_sst_blocks(
     // than format!-stringifying it, so the original variant
     // (InvalidHeader / InvalidVersion / ChecksumMismatch / underlying
     // Io) stays reachable via `Error::source()` for downstream
-    // diagnostics. sfa::Error implements `std::error::Error`.
-    let sfa_reader = sfa::Reader::from_reader(&mut file)
+    // diagnostics. crate::sfa::Error implements `std::error::Error`.
+    let sfa_reader = crate::sfa::Reader::from_reader(&mut file)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     let toc = sfa_reader.toc();
     // SFA TOC layout for an SST. The writer opens the file and
-    // immediately calls `sfa::Writer::start("data")`, so the first
+    // immediately calls `crate::sfa::Writer::start("data")`, so the first
     // TOC entry is named (not unnamed) and covers the data-block
     // region. Other named sections, in writer order:
     //
@@ -1148,7 +1148,8 @@ mod block_verify_tests {
         // exactly one Header (33 bytes) and zero following data bytes.
         let mut archive_bytes: Vec<u8> = Vec::new();
         {
-            let mut writer = sfa::Writer::from_writer(std::io::Cursor::new(&mut archive_bytes));
+            let mut writer =
+                crate::sfa::Writer::from_writer(std::io::Cursor::new(&mut archive_bytes));
             writer.start("data").unwrap();
             writer.write_all(&header.encode_into_vec()).unwrap();
             writer.finish().unwrap();
@@ -1180,7 +1181,7 @@ mod block_verify_tests {
             .copy_from_slice(&lied_len.to_le_bytes());
 
         // Recompute the TOC checksum (xxh3_128 over the TOC payload)
-        // and patch the trailer's stored checksum so sfa::Reader still
+        // and patch the trailer's stored checksum so crate::sfa::Reader still
         // accepts the file.
         let new_toc_checksum = crate::hash::hash128(&archive_bytes[toc_pos..toc_pos + toc_len]);
         let csum_field_offset = trailer_start + 4 + 1 + 1;

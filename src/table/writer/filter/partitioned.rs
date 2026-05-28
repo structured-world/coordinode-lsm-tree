@@ -162,7 +162,7 @@ impl PartitionedFilterWriter {
 
     fn write_top_level_index<WR: Write + Seek>(
         &mut self,
-        file_writer: &mut sfa::Writer<ChecksummedWriter<WR>>,
+        file_writer: &mut crate::sfa::Writer<ChecksummedWriter<WR>>,
         index_base_offset: BlockOffset,
     ) -> crate::Result<()> {
         file_writer.start("filter_tli")?;
@@ -285,7 +285,7 @@ impl<W: std::io::Write + std::io::Seek> FilterWriter<W> for PartitionedFilterWri
 
     fn finish(
         mut self: Box<Self>,
-        file_writer: &mut sfa::Writer<ChecksummedWriter<W>>,
+        file_writer: &mut crate::sfa::Writer<ChecksummedWriter<W>>,
     ) -> crate::Result<usize> {
         if self.last_key.is_none() {
             log::trace!("Filter writer has not seen any writes - not building filter");
