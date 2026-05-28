@@ -141,7 +141,7 @@ serde = { version = "1", optional = true, features = ["derive"] }
 # the format to in-tree code lets us evolve it locally without waiting
 # for a release we cannot influence). License files preserved alongside.
 tempfile = "3.20.0"
-varint-rs = { version = "2.2.0", default-features = false, features = ["signed"] }
+varint-rs = { version = "2.2.0", default-features = false }
 xxhash-rust = { version = "0.8.15", features = ["xxh3"] }
 # Exact pin on a prerelease — RC API can churn between releases, so locking
 # the exact version is intentional. The 0.11 surface we depend on:
