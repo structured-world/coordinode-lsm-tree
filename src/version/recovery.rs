@@ -87,19 +87,15 @@ fn decode_blob_entry_payload(payload: &[u8]) -> crate::Result<(BlobFileId, Check
 /// The file format is: `version_id: u64 | checksum: u128 | checksum_type: u8`
 /// (25 bytes total, written atomically by `rewrite_atomic`).
 ///
-/// Reads the version id, then re-hashes the SECTION bytes of the
-/// referenced `v{id}` manifest (the `[HEAD_FOOTER_RESERVED_SIZE,
-/// section_end)` range — excluding the head mirror, the tail footer
-/// Block, and the 4-byte size-hint trailer) and compares the result
-/// against the stamped checksum. Mismatch surfaces as
-/// [`crate::Error::ChecksumMismatch`].
-///
-/// The `section_end` boundary is derived via
+/// Reads the version id, opens the referenced `v{id}` manifest via
 /// [`ManifestArchiveReader::open`](crate::manifest_blocks::reader::ManifestArchiveReader::open)
-/// so the tail-first / head-mirror-fallback recovery path applies
-/// here too: a torn or corrupted trailing size-hint can be
+/// (so the tail-first / head-mirror-fallback recovery path applies
+/// here too — a torn or corrupted trailing size-hint can be
 /// recovered through the head mirror without first tripping the
-/// CURRENT-pointer validation.
+/// CURRENT-pointer validation), then recomputes the canonical
+/// footer digest via [`current_digest::compute`] over the parsed
+/// footer payload and compares it against the stamped checksum.
+/// Mismatch surfaces as [`crate::Error::ChecksumMismatch`].
 ///
 /// The stored digest is the canonical XXH3-128 over (`version_id` +
 /// `layout_version` + flags + sorted TOC entries with each section's
