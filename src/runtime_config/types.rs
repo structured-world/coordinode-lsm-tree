@@ -150,9 +150,16 @@ pub struct RuntimeConfig {
     /// — readers detect the absence by the zero magic and skip the
     /// fallback path.
     ///
-    /// Default: `true`. Cost when on: 4 KiB per manifest file
-    /// (negligible — manifests are KB-MB scale). Cost when off: no
-    /// recovery from partial mid-update or tail bit-rot.
+    /// Default: `true`. The 4 KiB head region is reserved
+    /// unconditionally by the writer so the file layout stays
+    /// stable regardless of this setting; flipping the flag only
+    /// controls whether the writer copies the tail footer Block
+    /// into that region. Cost when on: 4 KiB of meaningful mirror
+    /// bytes per manifest file (negligible — manifests are KB-MB
+    /// scale). Cost when off: the same 4 KiB stays zero-padded,
+    /// and the reader has no fallback if the tail footer fails
+    /// verification (partial mid-update or tail bit-rot is
+    /// unrecoverable).
     ///
     /// Toggle takes effect on the next manifest write. Existing
     /// manifests are read transparently regardless of current

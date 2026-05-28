@@ -204,7 +204,16 @@ impl FooterPayload {
 
         let flags = reader.read_u8()?;
         let section_count = usize::from(reader.read_u16::<LittleEndian>()?);
-        let mut sections = Vec::with_capacity(section_count);
+        // Do NOT pre-allocate `Vec::with_capacity(section_count)`: the
+        // count comes from inside the (verified-only-as-bytes) footer
+        // payload and is an u16 (up to 65535). The footer Block is capped
+        // at HEAD_FOOTER_RESERVED_SIZE (4 KiB) on disk, so the real
+        // maximum is ~128 entries; trusting `section_count` here would
+        // let a malformed footer force a multi-MiB allocation before the
+        // parser ever reaches EOF. Grow the vector as entries decode
+        // successfully — push reallocation is amortized O(1) and bounded
+        // by the actual readable payload.
+        let mut sections: Vec<TocEntry> = Vec::new();
 
         for _ in 0..section_count {
             let name_len = usize::from(reader.read_u16::<LittleEndian>()?);
