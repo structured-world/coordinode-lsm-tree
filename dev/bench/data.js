@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1780008247493,
+  "lastUpdate": 1780025833083,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -11154,6 +11154,84 @@ window.BENCHMARK_DATA = {
             "value": 459663.04198455584,
             "unit": "ops/sec",
             "extra": "P50: 2.0us | P99: 6.7us | P99.9: 10.0us\nthreads: 1 | elapsed: 0.44s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "543bf46d12c7bd7db0d9311562d35f5d5b884976",
+          "message": "build(deps): gate tempfile behind std feature (#363)\n\n## Summary\n\n`tempfile` was unconditional in `[dependencies]` even though it pulls in\n`fastrand` (which contains `extern crate std` directly) and transitively\nforces `once_cell` through feature unification into a std-bound\nconfiguration. The only production use is `pub fn get_tmp_folder` which\nitself reads `std::env`, so cfg-gating both behind the `std` feature is\nmechanical with zero impact on default builds.\n\n## Impact on `no-std-check`\n\n**Error count: 786 -> 559 (-227, -29%)**\n\nThe drop is larger than the direct fastrand contribution because\nremoving the `tempfile -> fastrand -> once_cell` feature-unification\nchain releases `once_cell` from its forced std mode (245 errors)\nalongside `fastrand` itself (3 errors).\n\n| Dep | Before | After |\n|-----|--------|-------|\n| fastrand | 3 errors | gone (no longer in dep graph) |\n| once_cell | 245 errors | gone (feature unification released) |\n\n## Changes\n\n- `Cargo.toml`: `tempfile` becomes `optional = true`; `dep:tempfile`\nadded to the `std` feature.\n- `src/lib.rs`: `pub fn get_tmp_folder` now carries `#[cfg(feature =\n\"std\")]`.\n- Test modules and dev-deps continue to see tempfile unchanged — tests\nrun under default features which enable std.\n\n## Remaining `no-std-check` blockers (out of scope, follow-up PRs)\n\n- `quick_cache` (582 errors) — std-only by source; gating it cascades\ninto the `cache` module + every `Tree::open` consumer\n- `byteview` (65 errors) — std-only by source; needs vendor/fork\n\n## Testing\n\n- `cargo check --all-features` — passes\n- `cargo nextest run --workspace` — 1510 passed\n- `cargo clippy --all-features --all-targets -- -D warnings` — clean\n\nPart of #358",
+          "timestamp": "2026-05-29T06:36:19+03:00",
+          "tree_id": "05972e5fe82ad4232bc19cf60926759d7fa61486",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/543bf46d12c7bd7db0d9311562d35f5d5b884976"
+        },
+        "date": 1780025831469,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 2026655.3617128383,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.6us | P99.9: 3.7us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1178886.8277428073,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.2us | P99.9: 4.4us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 506288.22762487846,
+            "unit": "ops/sec",
+            "extra": "P50: 1.8us | P99: 5.1us | P99.9: 7.6us\nthreads: 1 | elapsed: 0.40s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3610477.041138967,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 3.1us | P99.9: 5.6us\nthreads: 1 | elapsed: 0.06s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 376264.71318255237,
+            "unit": "ops/sec",
+            "extra": "P50: 2.3us | P99: 5.7us | P99.9: 8.7us\nthreads: 1 | elapsed: 0.53s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 199235.95581090348,
+            "unit": "ops/sec",
+            "extra": "P50: 4.7us | P99: 5.9us | P99.9: 8.4us\nthreads: 1 | elapsed: 1.00s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1223135.6225315405,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.2us | P99.9: 4.3us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1119237.0707076676,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 1.5us | P99.9: 1.9us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 467216.1701946658,
+            "unit": "ops/sec",
+            "extra": "P50: 2.0us | P99: 5.5us | P99.9: 8.0us\nthreads: 1 | elapsed: 0.43s | num: 200000 | iterations: 3"
           }
         ]
       }
