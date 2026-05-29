@@ -222,23 +222,26 @@ fn dict_id_tamper_on_disk_fails() {
 
 #[test]
 fn window_log_tamper_on_disk_fails() {
-    // WindowLog is AAD-mirrored at MetadataPayload offset 9. Closes
-    // the decompression-bomb vector: substituting a larger
-    // WindowLog onto a smaller-window block must fail AAD verify
-    // BEFORE the decompressor allocates the window buffer.
+    // WindowLog is AAD-mirrored at MetadataPayload offset 9 and
+    // participates in the decompression-bomb defence. This fixture
+    // seals with CompressionType=None, so the tamper here surfaces
+    // a TYPED rejection at the metadata-consistency gate, not at
+    // AEAD verify (see the inner comment for why).
     let chain = key_chain();
     let id = identity(7, 99, 0x1000);
     let mut bytes = encrypt_block(PLAINTEXT_A, &id, &ctx(), &chain).expect("encrypt");
     // The original block was sealed with CompressionType=None and
     // WindowLog=0. Setting WindowLog to a non-zero value on the
     // sealed bytes makes the on-disk MetadataPayload internally
-    // inconsistent (WindowLog!=0 requires zstd codec). The decoder
+    // inconsistent (WindowLog!=0 requires a zstd codec). The decoder
     // catches this at the metadata-consistency gate BEFORE
-    // rebuilding AAD, surfacing MalformedMetadataFrame — which is
-    // the early-rejection branch of the accept-list below. A future
-    // companion test that seals with zstd would exercise the
-    // AAD-verify branch; this test pins the rejection contract
-    // either way: no silent acceptance of a mismatched WindowLog.
+    // rebuilding AAD, surfacing MalformedMetadataFrame — the
+    // early-rejection branch of the accept-list below. The
+    // AAD-verify branch (tamper on a block sealed with a valid zstd
+    // context) is covered by the companion test
+    // window_log_under_zstd_tamper_fails_aead_verify. This test pins
+    // the rejection contract either way: no silent acceptance of a
+    // mismatched WindowLog.
     bytes[META_WINDOW_LOG] = 10;
 
     let err = decrypt_block(&bytes, &id, &chain).expect_err("must fail");
@@ -330,13 +333,12 @@ fn key_epoch_downgrade_to_unknown_epoch_fails() {
     // The key chain has epoch=1 only. A block sealed at epoch=1 with
     // its on-disk MetadataPayload re-stamped to epoch=2 routes the
     // decrypt path through a key lookup that misses; the error
-    // variant differs from AeadVerificationFailed because the failure
-    // surfaces BEFORE the AEAD primitive runs. The block-decrypt API
-    // routes a missing-epoch lookup through a typed variant
-    // (KeyEpochNotInChain or similar). The test asserts the call
-    // fails — the exact variant is documented by the impl, not pinned
-    // here, so future variant renames don't fail the test for the
-    // wrong reason.
+    // surfaces BEFORE the AEAD primitive runs. The miss is pinned to
+    // the exact typed variant `UnknownKeyEpoch { key_epoch: 2 }`
+    // (the deterministic tamper rewrites the byte to 2), so a
+    // regression that started failing at an unrelated gate (AEAD
+    // verify, MalformedMetadataFrame) would be caught rather than
+    // silently accepted.
     let chain = key_chain();
     let id = identity(7, 99, 0x1000);
 
