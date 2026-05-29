@@ -62,7 +62,11 @@ fn key_chain() -> StaticKeyChain {
 }
 
 fn ctx() -> EncryptionContext {
-    EncryptionContext::v1(KEY_EPOCH, SuiteId::Aes256Gcm, 0)
+    ctx_with_suite(SuiteId::Aes256Gcm)
+}
+
+fn ctx_with_suite(suite: SuiteId) -> EncryptionContext {
+    EncryptionContext::v1(KEY_EPOCH, suite, 0)
 }
 
 fn identity(tree_id: u64, table_id: u64, block_offset: u64) -> BlockIdentity {
@@ -332,11 +336,17 @@ fn key_epoch_downgrade_to_unknown_epoch_fails() {
     bytes[META_KEY_EPOCH] = bytes[META_KEY_EPOCH].wrapping_add(1);
 
     let err = decrypt_block(&bytes, &id, &chain).expect_err("must fail");
-    // Accept either AEAD failure (epoch=2 happens to be in some
-    // future chain that contains another key) or the typed unknown-
-    // epoch variant. The contract: the call does NOT silently
-    // produce wrong plaintext — any typed DecryptError is fine.
-    let _ = err;
+    // Pin the exact expected variant: the local chain holds only
+    // epoch=1, the tamper deterministically rewrites the on-disk
+    // KeyEpoch to 2, so the lookup MUST miss and surface
+    // UnknownKeyEpoch with the tampered byte. Accepting any
+    // DecryptError would silently pass a regression where the
+    // tamper started failing at an unrelated gate (AEAD verify,
+    // MalformedMetadataFrame, etc.).
+    assert!(
+        matches!(err, DecryptError::UnknownKeyEpoch { key_epoch: 2 }),
+        "expected UnknownKeyEpoch {{ key_epoch: 2 }}, got {err:?}"
+    );
 }
 
 #[test]
@@ -425,4 +435,110 @@ fn round_trip_under_correct_identity_succeeds() {
     let bytes = encrypt_block(PLAINTEXT_A, &id, &ctx(), &chain).expect("encrypt");
     let decrypted = decrypt_block(&bytes, &id, &chain).expect("decrypt");
     assert_eq!(decrypted.plaintext, PLAINTEXT_A);
+}
+
+// ============================================================================
+// ChaCha20-Poly1305 cross-suite coverage.
+//
+// The AES-256-GCM matrix above covers the full AAD-bound threat model.
+// The ChaCha20-Poly1305 implementation walks the same AAD construction
+// path but uses a different AEAD primitive; a regression in the
+// ChaCha20-only branch (e.g., AAD field dropped from the chacha
+// keystream, nonce miswire on the chacha side) would slip past the
+// AES-only matrix. These tests pin the most consequential scenarios
+// under the other supported suite so a per-suite regression surfaces.
+// Not exhaustive (38 lines × 2 = noise); the AES matrix is the canonical
+// scenario set.
+// ============================================================================
+
+#[test]
+fn chacha_round_trip_succeeds() {
+    // Baseline guard: encrypt + decrypt under ChaCha20-Poly1305 round-trips
+    // bit-exact. Any breakage of the per-suite encrypt / decrypt wiring
+    // surfaces here first.
+    let chain = key_chain();
+    let id = identity(7, 99, 0x1000);
+    let bytes = encrypt_block(
+        PLAINTEXT_A,
+        &id,
+        &ctx_with_suite(SuiteId::ChaCha20Poly1305),
+        &chain,
+    )
+    .expect("encrypt");
+    let decrypted = decrypt_block(&bytes, &id, &chain).expect("decrypt");
+    assert_eq!(decrypted.plaintext, PLAINTEXT_A);
+}
+
+#[test]
+fn chacha_block_swap_at_same_offset_fails_aead_verify() {
+    // Most consequential AAD attack under ChaCha: substitute block B's
+    // ChaCha-sealed bytes at A's offset. AEAD verify must catch the
+    // block_offset mismatch on the chacha path the same way it does
+    // on the AES path.
+    let chain = key_chain();
+    let id_a = identity(7, 99, 0x1000);
+    let id_b = identity(7, 99, 0x2000);
+
+    let bytes_b = encrypt_block(
+        PLAINTEXT_B,
+        &id_b,
+        &ctx_with_suite(SuiteId::ChaCha20Poly1305),
+        &chain,
+    )
+    .expect("encrypt B");
+
+    let err = decrypt_block(&bytes_b, &id_a, &chain).expect_err("must fail");
+    assert!(
+        matches!(err, DecryptError::AeadVerificationFailed),
+        "expected AeadVerificationFailed, got {err:?}"
+    );
+}
+
+#[test]
+fn chacha_ciphertext_bit_flip_fails_aead_verify() {
+    // ChaCha20-Poly1305's keystream + Poly1305 tag must catch ciphertext
+    // bit-flips with the same guarantee as AES-GCM. A regression that
+    // weakened only the chacha verify step would slip past the AES
+    // matrix.
+    let chain = key_chain();
+    let id = identity(7, 99, 0x1000);
+    let mut bytes = encrypt_block(
+        PLAINTEXT_A,
+        &id,
+        &ctx_with_suite(SuiteId::ChaCha20Poly1305),
+        &chain,
+    )
+    .expect("encrypt");
+
+    let target_byte = BODY_FIRST_PAYLOAD_BYTE + (PLAINTEXT_A.len() / 2);
+    assert!(target_byte < bytes.len(), "test sanity");
+    bytes[target_byte] ^= 0x01;
+
+    let err = decrypt_block(&bytes, &id, &chain).expect_err("must fail");
+    assert!(
+        matches!(err, DecryptError::AeadVerificationFailed),
+        "expected AeadVerificationFailed, got {err:?}"
+    );
+}
+
+#[test]
+fn chacha_cross_tree_swap_fails_aead_verify() {
+    // AAD-bound tree_id must reject cross-tree substitution on the
+    // chacha path. Companion to the AES cross_tree_swap test.
+    let chain = key_chain();
+    let id_sealed = identity(10, 99, 0x1000);
+    let id_attempt = identity(20, 99, 0x1000);
+    let bytes = encrypt_block(
+        PLAINTEXT_A,
+        &id_sealed,
+        &ctx_with_suite(SuiteId::ChaCha20Poly1305),
+        &chain,
+    )
+    .expect("encrypt");
+
+    let err = decrypt_block(&bytes, &id_attempt, &chain).expect_err("must fail");
+    assert!(
+        matches!(err, DecryptError::AeadVerificationFailed),
+        "expected AeadVerificationFailed, got {err:?}"
+    );
 }
