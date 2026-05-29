@@ -58,6 +58,15 @@ pub mod aead;
 // encrypt_block / decrypt_block entry points are absent.
 #[cfg(all(feature = "encryption", zstd_any))]
 pub mod block;
+// Outer Reed-Solomon ECC layer (EccFrame, variant 2) over encrypted
+// block ciphertext. Needs `reed-solomon-simd` (pulled by `page_ecc`)
+// for the RS engine and `encryption` for the AAD-bound block types it
+// wraps. Independent of `zstd_any`: the wire codec + RS primitive
+// operate on raw ciphertext bytes; only the module's own test that
+// asserts the skippable-frame magic uses `SkippableFrame` and is
+// gated on `zstd_any` separately.
+#[cfg(all(feature = "encryption", feature = "page_ecc"))]
+pub mod ecc_frame;
 pub mod error;
 pub mod key_chain;
 
