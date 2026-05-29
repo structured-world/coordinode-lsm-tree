@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1780025833083,
+  "lastUpdate": 1780041809097,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -11232,6 +11232,84 @@ window.BENCHMARK_DATA = {
             "value": 467216.1701946658,
             "unit": "ops/sec",
             "extra": "P50: 2.0us | P99: 5.5us | P99.9: 8.0us\nthreads: 1 | elapsed: 0.43s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "8f6cac5a96331787267917b239a7b568190cfb0b",
+          "message": "test(encryption): AAD threat-model regression suite (first wave) (#361)\n\n## Summary\n\n13 regression tests under `tests/encryption_aad_threat_model.rs`\ncovering the documented attacks against the AAD-bound block format. Each\ntest asserts the call surfaces a typed `DecryptError` variant and never\nleaks wrong plaintext.\n\n## Scenarios covered\n\n| # | Scenario | Vector | Expected typed error |\n|---|----------|--------|----------------------|\n| 1 | Block swap | Substitute block B's bytes at A's `block_offset` |\n`AeadVerificationFailed` |\n| 2 | Cross-table swap | Same key, different `table_id` |\n`AeadVerificationFailed` |\n| 3 | Cross-tree swap | Same key chain, different `tree_id` |\n`AeadVerificationFailed` |\n| 4 | BlockType relabel | On-disk byte 2 (BlockType) flipped |\n`AeadVerificationFailed` |\n| 5 | DictID tamper | On-disk byte 5-8 (DictID u32 BE) flipped |\n`AeadVerificationFailed` or `MalformedMetadataFrame` |\n| 6 | WindowLog tamper | On-disk byte 9 (WindowLog) flipped |\n`AeadVerificationFailed` or `MalformedMetadataFrame` |\n| 7 | CompressionType relabel | On-disk byte 4 (CompressionType) flipped\n| `AeadVerificationFailed` |\n| 8 | SuiteID tamper | On-disk byte 3 (SuiteID) flipped | Any typed\n`DecryptError` |\n| 9 | KeyEpoch downgrade | On-disk byte 1 (KeyEpoch) flipped | Any typed\n`DecryptError` |\n| 10 | HeaderByte tamper | On-disk byte 0 (HeaderByte) bumped |\n`AeadVerificationFailed` or `UnsupportedFormatVersion` |\n| 11 | Ciphertext bit-flip | BodyFrame payload mid-byte XOR |\n`AeadVerificationFailed` |\n| 12 | Nonce bit-flip | MetadataPayload nonce byte XOR |\n`AeadVerificationFailed` |\n| 13 | Round-trip baseline | Correct identity, no tamper | `Ok` |\n\nThe round-trip baseline (#13) guards against the trap of\nall-tests-pass-because-everything-fails.\n\n## Out of first-wave scope\n\nRequire structured-zstd integration in the follow-up wave:\n- Dict-content substitution (needs `ZstdDict` frame inner-id check)\n- Decompression-bomb window swap via valid zstd-compressed blocks (needs\nzstd window-log inner check)\n- Codec-library version-drift content checksum (needs zstd\ncontent-checksum verify)\n- Suite downgrade beyond AAD coverage (needs key-chain suite metadata)\n\n## Testing\n\n- `cargo nextest run --features encryption,zstd --test\nencryption_aad_threat_model` — 13 passed, 0 failed\n- `cargo clippy --all-features --all-targets -- -D warnings` — clean\n- No production code touched. Test-only addition.\n\nPart of #253\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n## Summary by CodeRabbit\n\n* **Tests**\n* Added a feature-gated regression suite for AAD-bound block encryption\n(requires encryption + zstd). Covers AES-256-GCM and ChaCha20-Poly1305\nwith correct round-trip baselines, identity swaps, metadata mutations,\nkey/nonce/ciphertext corruption, and expected typed decryption failures.\n* Includes companion scenarios that force AEAD verification so tampering\nreliably produces verification or format errors rather than silent\nfailures.\n\n<!-- review_stack_entry_start -->\n\n[![Review Change\nStack](https://storage.googleapis.com/coderabbit_public_assets/review-stack-in-coderabbit-ui.svg)](https://app.coderabbit.ai/change-stack/structured-world/coordinode-lsm-tree/pull/361?utm_source=github_walkthrough&utm_medium=github&utm_campaign=change_stack)\n\n<!-- review_stack_entry_end -->\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-05-29T11:02:31+03:00",
+          "tree_id": "9bc8c22b5f53ca3f24288edbc7f9ca39fc0d2de9",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/8f6cac5a96331787267917b239a7b568190cfb0b"
+        },
+        "date": 1780041807334,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 2049788.4597811622,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.6us | P99.9: 3.7us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1198887.233631909,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.2us | P99.9: 4.3us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 509210.67655303946,
+            "unit": "ops/sec",
+            "extra": "P50: 1.8us | P99: 5.2us | P99.9: 7.8us\nthreads: 1 | elapsed: 0.39s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3624725.696617455,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 3.0us | P99.9: 5.5us\nthreads: 1 | elapsed: 0.06s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 377210.77126941644,
+            "unit": "ops/sec",
+            "extra": "P50: 2.3us | P99: 5.8us | P99.9: 8.7us\nthreads: 1 | elapsed: 0.53s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 199821.95024980552,
+            "unit": "ops/sec",
+            "extra": "P50: 4.7us | P99: 5.8us | P99.9: 8.5us\nthreads: 1 | elapsed: 1.00s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1233315.9180903593,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.2us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1127286.1645238083,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 1.5us | P99.9: 1.9us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 450604.12472471636,
+            "unit": "ops/sec",
+            "extra": "P50: 2.0us | P99: 6.9us | P99.9: 10.2us\nthreads: 1 | elapsed: 0.44s | num: 200000 | iterations: 3"
           }
         ]
       }
