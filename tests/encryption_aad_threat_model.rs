@@ -35,10 +35,18 @@
 //! 1. Block swap (same key, different block_offset)
 //! 2. Cross-table swap (same key, different table_id)
 //! 3. Cross-tree swap (same key, different tree_id)
-//! 4. Per-AAD-field modification (key_epoch, suite, header byte,
-//!    compression_type, block_type, dict_id, window_log) — exhaustive
-//!    over every field the AAD pulls from EncryptionContext + BlockIdentity
+//! 4. Per-AAD-field modification. Each field has at least one tamper
+//!    test that pins TYPED rejection; for the fields whose obvious
+//!    tamper hits an early gate (key_epoch -> UnknownKeyEpoch,
+//!    window_log / dict_id -> codec-consistency, header_byte high
+//!    nibble -> UnsupportedFormatVersion) there is an additional
+//!    AAD-verify-forcing companion that constructs a VALID metadata
+//!    config so the tamper propagates into AAD reconstruction and
+//!    AEAD verify catches the field's actual AAD binding.
 //! 5. Tampered ciphertext (single bit-flip in BodyFrame payload)
+//! 6. ChaCha20-Poly1305 cross-suite coverage of the most consequential
+//!    scenarios (round-trip, block-swap, ciphertext bit-flip,
+//!    cross-tree swap).
 //!
 //! Out of first-wave (require structured-zstd integration):
 //! - Dict substitution (needs ZstdDict frame inner-id check)
@@ -537,6 +545,110 @@ fn chacha_cross_tree_swap_fails_aead_verify() {
     .expect("encrypt");
 
     let err = decrypt_block(&bytes, &id_attempt, &chain).expect_err("must fail");
+    assert!(
+        matches!(err, DecryptError::AeadVerificationFailed),
+        "expected AeadVerificationFailed, got {err:?}"
+    );
+}
+
+// ============================================================================
+// AAD-verify-forcing companions.
+//
+// Several tamper tests above land on early-rejection gates (UnknownKeyEpoch,
+// MalformedMetadataFrame for codec-consistency, UnsupportedFormatVersion).
+// Those gates catch tampers BEFORE AAD is rebuilt, which means a regression
+// that drops the corresponding field from AAD construction would still pass
+// the tests above. The tests below construct VALID metadata configurations
+// that bypass the early gates and force the failure to reach AEAD verify,
+// pinning each field's actual AAD binding.
+// ============================================================================
+
+const KEY_EPOCH_2: u8 = 2;
+const KEY_BYTES_2: [u8; 32] = [0x99; 32];
+
+#[test]
+fn key_epoch_supported_relabel_fails_aead_verify() {
+    // Chain holds BOTH epoch=1 and epoch=2 (different keys). Block is
+    // sealed under epoch=1; tamper rewrites the on-disk KeyEpoch byte
+    // to 2. The key lookup now SUCCEEDS (epoch=2 is in the chain),
+    // metadata decodes cleanly, AAD is rebuilt with KeyEpoch=2, and
+    // AEAD verify catches the mismatch with the original AAD's
+    // KeyEpoch=1. A regression that dropped KeyEpoch from AAD
+    // construction would let the wrong-key decrypt produce garbage
+    // plaintext silently.
+    let chain = StaticKeyChain::new()
+        .with_key(KEY_EPOCH, KEY_BYTES)
+        .with_key(KEY_EPOCH_2, KEY_BYTES_2);
+    let id = identity(7, 99, 0x1000);
+    let mut bytes = encrypt_block(PLAINTEXT_A, &id, &ctx(), &chain).expect("encrypt");
+    bytes[META_KEY_EPOCH] = KEY_EPOCH_2;
+
+    let err = decrypt_block(&bytes, &id, &chain).expect_err("must fail");
+    assert!(
+        matches!(err, DecryptError::AeadVerificationFailed),
+        "expected AeadVerificationFailed, got {err:?}"
+    );
+}
+
+#[test]
+fn header_byte_low_nibble_tamper_fails_aead_verify() {
+    // HeaderByte = (FORMAT_VERSION_V1 << 4) | reserved_low_nibble.
+    // Writers MUST zero the low nibble (spec §4.8); readers MUST
+    // ignore it for forward compat. Flipping ONLY a low-nibble bit
+    // keeps the high nibble = V1 so the format-version gate passes,
+    // and the tampered byte propagates into AAD reconstruction —
+    // AEAD verify catches the mismatch.
+    let chain = key_chain();
+    let id = identity(7, 99, 0x1000);
+    let mut bytes = encrypt_block(PLAINTEXT_A, &id, &ctx(), &chain).expect("encrypt");
+    bytes[META_HEADER_BYTE] |= 0x01; // set lowest reserved bit
+
+    let err = decrypt_block(&bytes, &id, &chain).expect_err("must fail");
+    assert!(
+        matches!(err, DecryptError::AeadVerificationFailed),
+        "expected AeadVerificationFailed, got {err:?}"
+    );
+}
+
+#[test]
+fn window_log_under_zstd_tamper_fails_aead_verify() {
+    // Seal with a VALID zstd codec context (compression_type=3,
+    // window_log in [10, 31]). The on-disk metadata is internally
+    // consistent, so a WindowLog tamper at decode time does NOT hit
+    // the codec-consistency gate — it propagates into AAD
+    // reconstruction and AEAD verify catches the mismatch. Pins the
+    // AAD-binding of WindowLog beyond what the early-gate test
+    // verifies.
+    let chain = key_chain();
+    let mut id = identity(7, 99, 0x1000);
+    id.window_log = 15;
+    let zstd_ctx = EncryptionContext::v1(KEY_EPOCH, SuiteId::Aes256Gcm, 3);
+    let mut bytes = encrypt_block(PLAINTEXT_A, &id, &zstd_ctx, &chain).expect("encrypt");
+    bytes[META_WINDOW_LOG] = 20; // valid for zstd, different from sealed
+
+    let err = decrypt_block(&bytes, &id, &chain).expect_err("must fail");
+    assert!(
+        matches!(err, DecryptError::AeadVerificationFailed),
+        "expected AeadVerificationFailed, got {err:?}"
+    );
+}
+
+#[test]
+fn dict_id_under_zstd_dict_tamper_fails_aead_verify() {
+    // Seal with a VALID zstd-dict codec context (compression_type=4,
+    // non-zero dict_id). On-disk metadata is internally consistent,
+    // so a DictID tamper at decode time bypasses the codec-consistency
+    // gate and lands on AAD verify. Pins the AAD-binding of DictID.
+    let chain = key_chain();
+    let mut id = identity(7, 99, 0x1000);
+    id.dict_id = 0x1234_5678;
+    let zstd_dict_ctx = EncryptionContext::v1(KEY_EPOCH, SuiteId::Aes256Gcm, 4);
+    let mut bytes = encrypt_block(PLAINTEXT_A, &id, &zstd_dict_ctx, &chain).expect("encrypt");
+    // Flip a single byte of the u32 BE dict_id — same codec ctx,
+    // different dict identity.
+    bytes[META_DICT_ID_START + 3] ^= 0x01;
+
+    let err = decrypt_block(&bytes, &id, &chain).expect_err("must fail");
     assert!(
         matches!(err, DecryptError::AeadVerificationFailed),
         "expected AeadVerificationFailed, got {err:?}"
