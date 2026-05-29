@@ -275,16 +275,22 @@ fn compression_type_tamper_on_disk_fails_aead_verify() {
 }
 
 #[test]
-fn suite_id_supported_relabel_fails_aead_verify() {
-    // SuiteID is AAD-mirrored at MetadataPayload offset 3. Swap
-    // AES-256-GCM (0x02) -> ChaCha20-Poly1305 (0x03) — both
-    // SUPPORTED suites, so decode_metadata_payload accepts the byte
-    // and the decrypt path proceeds to rebuild AAD and verify the
-    // tag. The AAD now disagrees on byte 7 (suite_id mirror), so
-    // AEAD verify must surface AeadVerificationFailed. This pins
-    // the contract that SuiteID is part of AAD — a regression that
-    // dropped it from AAD construction would let an attacker swap
-    // a block's declared suite freely between supported suites.
+fn suite_id_supported_relabel_rejected() {
+    // Suite-swap REJECTION coverage (NOT a SuiteID-in-AAD proof).
+    //
+    // Swap AES-256-GCM (0x02) -> ChaCha20-Poly1305 (0x03) on the
+    // sealed bytes. Both are SUPPORTED suites so the metadata gate
+    // accepts the byte and the decrypt path runs.
+    //
+    // This does NOT isolate SuiteID's AAD binding: the suite byte
+    // ALSO selects the AEAD primitive at decrypt, so a ChaCha20
+    // keystream is run over AES-GCM ciphertext and the Poly1305 tag
+    // mismatches regardless of whether SuiteID is in aad::build.
+    // The standalone proof that SuiteID is part of AAD lives in
+    // suite_id_is_part_of_aad below (direct aad::build byte compare).
+    // What this test pins is the end-to-end contract: a block whose
+    // declared suite was swapped between two supported suites does
+    // NOT decrypt.
     let chain = key_chain();
     let id = identity(7, 99, 0x1000);
     let mut bytes = encrypt_block(PLAINTEXT_A, &id, &ctx(), &chain).expect("encrypt");
@@ -296,6 +302,46 @@ fn suite_id_supported_relabel_fails_aead_verify() {
         matches!(err, DecryptError::AeadVerificationFailed),
         "expected AeadVerificationFailed, got {err:?}"
     );
+}
+
+#[test]
+fn suite_id_is_part_of_aad() {
+    // Standalone proof that SuiteID participates in AAD construction,
+    // which the end-to-end suite_id_supported_relabel_rejected test
+    // CANNOT isolate (the suite byte there also switches the AEAD
+    // primitive, confounding the tag failure). Here we call the AAD
+    // constructor directly with two contexts that differ ONLY in
+    // suite_id and assert the produced AAD bytes differ. A
+    // regression that dropped SuiteID from aad::build would make the
+    // two buffers identical and fail this assertion.
+    use lsm_tree::encryption::aad::{EncryptionContext, build};
+
+    let id = identity(7, 99, 0x1000);
+    let aad_aes = build(
+        &EncryptionContext::v1(KEY_EPOCH, SuiteId::Aes256Gcm, 0),
+        &id,
+    );
+    let aad_chacha = build(
+        &EncryptionContext::v1(KEY_EPOCH, SuiteId::ChaCha20Poly1305, 0),
+        &id,
+    );
+
+    assert_ne!(
+        aad_aes, aad_chacha,
+        "AAD must differ when only suite_id changes — SuiteID dropped from aad::build?"
+    );
+    // The difference must be exactly the suite_id mirror byte (AAD
+    // offset 7 per docs/aad-block-format.md §5.3), nothing else.
+    for (i, (a, c)) in aad_aes.iter().zip(aad_chacha.iter()).enumerate() {
+        if i == 7 {
+            assert_ne!(a, c, "AAD offset 7 (suite_id) must differ");
+        } else {
+            assert_eq!(
+                a, c,
+                "AAD byte {i} must NOT change when only suite_id flips"
+            );
+        }
+    }
 }
 
 #[test]
