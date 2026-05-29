@@ -564,7 +564,14 @@ fn chacha_cross_tree_swap_fails_aead_verify() {
 // ============================================================================
 
 const KEY_EPOCH_2: u8 = 2;
-const KEY_BYTES_2: [u8; 32] = [0x99; 32];
+// MUST equal KEY_BYTES. If epoch 2 held different key material, the
+// key_epoch_supported_relabel test below would fail for the WRONG
+// reason — a regression that dropped KeyEpoch from AAD construction
+// would still fail tag verification because the AEAD key differed.
+// Same key on both epochs makes the AAD byte the ONLY input that
+// changes between encrypt and decrypt, so a green test proves the
+// KeyEpoch field really is AAD-bound.
+const KEY_BYTES_2: [u8; 32] = KEY_BYTES;
 
 #[test]
 fn key_epoch_supported_relabel_fails_aead_verify() {
