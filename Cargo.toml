@@ -42,6 +42,7 @@ path = "src/lib.rs"
 default = ["std"]
 std = [
     "dep:arc-swap",
+    "dep:tempfile",
     "byteorder/std",
     "rustc-hash/std",
     "varint-rs/std",
@@ -140,7 +141,11 @@ serde = { version = "1", optional = true, features = ["derive"] }
 # sfa is vendored under src/sfa/ (upstream does not accept PRs; pinning
 # the format to in-tree code lets us evolve it locally without waiting
 # for a release we cannot influence). License files preserved alongside.
-tempfile = "3.20.0"
+# Only used by std-bound test fixtures and the `get_tmp_folder` helper
+# (which itself uses `std::env`). Optional + gated behind the `std`
+# feature so the no-std build does not pull in `fastrand` (which
+# transitively does `extern crate std`).
+tempfile = { version = "3.20.0", optional = true }
 varint-rs = { version = "2.2.0", default-features = false }
 xxhash-rust = { version = "0.8.15", features = ["xxh3"] }
 # Exact pin on a prerelease — RC API can churn between releases, so locking

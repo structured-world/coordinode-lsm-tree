@@ -376,6 +376,7 @@ pub use compression::ZstdDictionary;
 #[cfg(feature = "metrics")]
 pub use metrics::Metrics;
 
+#[cfg(feature = "std")]
 #[doc(hidden)]
 #[must_use]
 #[allow(missing_docs, clippy::missing_errors_doc, clippy::unwrap_used)]
