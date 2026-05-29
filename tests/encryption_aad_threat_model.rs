@@ -195,20 +195,22 @@ fn block_type_tamper_on_disk_fails_aead_verify() {
 }
 
 #[test]
-fn dict_id_tamper_on_disk_fails_aead_verify() {
+fn dict_id_tamper_on_disk_fails() {
     // DictID is AAD-mirrored at MetadataPayload offset 5 (u32 BE).
-    // Flipping any of the 4 bytes must surface at AAD verify because
-    // the decoder rebuilds AAD from these on-disk bytes.
+    // In this fixture the sealed block uses CompressionType=None
+    // (dict_id=0), so flipping any of the 4 bytes to a non-zero
+    // value violates the codec-consistency invariant (dict_id!=0
+    // requires CompressionType=ZstdDict) and the decoder rejects
+    // at MalformedMetadataFrame BEFORE AAD verify runs. The
+    // companion test dict_id_under_zstd_dict_tamper_fails_aead_verify
+    // covers the AAD-verify branch by sealing with a valid
+    // ZstdDict context. Test pinned to typed rejection either way.
     let chain = key_chain();
     let id = identity(7, 99, 0x1000);
     let mut bytes = encrypt_block(PLAINTEXT_A, &id, &ctx(), &chain).expect("encrypt");
     bytes[META_DICT_ID_START + 3] ^= 0x01; // flip low bit of u32 BE
 
     let err = decrypt_block(&bytes, &id, &chain).expect_err("must fail");
-    // Accept either AAD verify failure OR the metadata-consistency
-    // gate that fires when the tampered dict_id implies a codec
-    // context the on-disk CompressionType doesn't agree with: both
-    // are typed errors, neither leaks plaintext.
     assert!(
         matches!(
             err,
@@ -575,14 +577,20 @@ const KEY_BYTES_2: [u8; 32] = KEY_BYTES;
 
 #[test]
 fn key_epoch_supported_relabel_fails_aead_verify() {
-    // Chain holds BOTH epoch=1 and epoch=2 (different keys). Block is
-    // sealed under epoch=1; tamper rewrites the on-disk KeyEpoch byte
-    // to 2. The key lookup now SUCCEEDS (epoch=2 is in the chain),
-    // metadata decodes cleanly, AAD is rebuilt with KeyEpoch=2, and
-    // AEAD verify catches the mismatch with the original AAD's
-    // KeyEpoch=1. A regression that dropped KeyEpoch from AAD
-    // construction would let the wrong-key decrypt produce garbage
-    // plaintext silently.
+    // Chain holds BOTH epoch=1 and epoch=2 with the SAME key bytes
+    // (see KEY_BYTES_2 = KEY_BYTES). Block is sealed under epoch=1;
+    // tamper rewrites the on-disk KeyEpoch byte to 2. The key lookup
+    // now SUCCEEDS (epoch=2 is in the chain), metadata decodes
+    // cleanly, AAD is rebuilt with KeyEpoch=2, and AEAD verify
+    // catches the mismatch with the original AAD's KeyEpoch=1.
+    //
+    // Same-key setup matters: if KeyEpoch were dropped from AAD,
+    // the AEAD primitive would see identical key + identical AAD
+    // and silently decrypt to the CORRECT original plaintext — a
+    // false-OK that this test would catch as a missing expect_err.
+    // Different-key setup would mask the regression because
+    // wrong-key decrypt would fail the tag regardless of AAD
+    // binding, so the test would still pass but for the wrong reason.
     let chain = StaticKeyChain::new()
         .with_key(KEY_EPOCH, KEY_BYTES)
         .with_key(KEY_EPOCH_2, KEY_BYTES_2);
