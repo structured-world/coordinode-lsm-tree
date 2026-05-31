@@ -100,7 +100,7 @@ pub struct BlockIdentity {
 
     /// Identifier of the owning store unit — for SST blocks this is
     /// the per-tree [`crate::TableId`] (a `u64` alias); for blob
-    /// files it is the [`crate::vlog::BlobFileId`] (also a `u64`
+    /// files it is the `crate::vlog::BlobFileId` (also a `u64`
     /// alias). Combined with [`Self::tree_id`], gives the
     /// per-process unique discriminator that prevents block-swap
     /// attacks: AAD built from `(tree_id, table_id, block_offset)`

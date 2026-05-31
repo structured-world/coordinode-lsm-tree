@@ -5,7 +5,7 @@
 //!
 //! Companion to [`crate::verify`]: while `verify_block_checksums` walks
 //! every block and checks per-block XXH3, this module exposes a public
-//! read-only view of an SST's stored metadata ([`TableProperties`]) for
+//! read-only view of an SST's stored metadata ([`TableProperties`](crate::inspect::TableProperties)) for
 //! diagnostic tooling like `sst-dump properties` that needs the
 //! metadata fields without spinning up a [`Tree`](crate::Tree) or
 //! recovering the manifest.
@@ -601,7 +601,7 @@ impl Iterator for DataBlockEntryIter {
 /// encoded order, neither of which depends on the comparator. So a
 /// bounds-free walk of a custom-comparator SST through this facade
 /// streams entries in the SST's own sort order correctly. What this
-/// facade can't do is run [`crate::comparator::default_comparator`]
+/// facade can't do is run `crate::comparator::default_comparator`
 /// for seek / point-read / range-bounded operations layered on top
 /// (e.g. `sst-dump dump --from/--to` applies bytewise bounds and
 /// breaks early on the upper bound, which only makes sense for the

@@ -141,8 +141,8 @@ impl ZstdDictionary {
     /// and [`CompressionProvider::decompress_with_dict`].
     ///
     /// The handle stores the full 64-bit xxh3 hash of `raw` internally.
-    /// [`ZstdDictionary::id`] returns the lower 32 bits for external consumers
-    /// (config validation, frame header); [`ZstdDictionary::id64`] exposes the
+    /// [`Self::id`] returns the lower 32 bits for external consumers
+    /// (config validation, frame header); `id64` (crate-internal) exposes the
     /// full fingerprint for use as a cache key.
     #[must_use]
     pub fn new(raw: &[u8]) -> Self {
@@ -310,7 +310,7 @@ pub enum CompressionType {
     ///
     /// `level` is the compression level (1–22), `dict_id` identifies the
     /// dictionary (truncated xxh3 hash of the dictionary bytes). The actual
-    /// dictionary must be provided via [`Config`] or the relevant writer/reader.
+    /// dictionary must be provided via [`Config`](crate::Config) or the relevant writer/reader.
     #[cfg(zstd_any)]
     ZstdDict {
         /// Compression level (1–22)

@@ -8,7 +8,7 @@ use crate::{
 };
 use std::cmp::Ordering;
 
-/// Bulk ingestion for [`BlobTree`]
+/// Bulk ingestion for [`BlobTree`](crate::BlobTree)
 ///
 /// Items NEED to be added in ascending key order.
 ///
