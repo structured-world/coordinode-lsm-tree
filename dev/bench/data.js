@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1780268447433,
+  "lastUpdate": 1780269060597,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -11544,6 +11544,84 @@ window.BENCHMARK_DATA = {
             "value": 460508.89082986733,
             "unit": "ops/sec",
             "extra": "P50: 2.0us | P99: 5.4us | P99.9: 7.8us\nthreads: 1 | elapsed: 0.43s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "47d3d33c55de3a042244fddd287d388098f94f5c",
+          "message": "feat(encryption): outer Reed-Solomon ECC frame codec over block ciphertext (#365)\n\n## Summary\n\nFirst slice of #254 (outer Reed-Solomon ECC over encrypted blocks): the\n`EccFrame` wire codec + RS primitive.\n\nAdds `src/encryption/ecc_frame.rs` — the outer ECC layer that protects\nthe AAD-bound `BodyFrame` ciphertext, distinct from the\nper-on-disk-block Page ECC in `src/ecc.rs`. The frame is skippable-frame\nvariant 2 (magic `0x184D2A52`), additive after `MetadataFrame ‖\nBodyFrame`. `decrypt_block` already tolerates and skips trailing\nvariant-2..15 frames, so the additive contract holds with no reader\nchange.\n\n## What's in this slice\n\n- `EccScheme { data_shards, parity_shards }` with `RS_14_10` default (10\ndata + 4 parity, recovers ≤4 corrupt stripes)\n- `encode_ecc_payload` — RS parity over the ciphertext as one stripe\nset; `EccHeader` (SchemeID / DataShards / ParityShards / Reserved) +\nparity bytes; `ChecksumList` emitted empty\n- `try_repair` — trial-decode over erasure subsets `1..=parity_shards`,\neach reconstruction validated through a caller oracle (the AEAD-tag\nverify in the integration layer); first verifying subset wins\n- `parse_ecc_payload` — rejects unknown `SchemeID`, non-zero `Reserved`,\ndegenerate schemes, parity-length inconsistency\n- `DecryptError::EccBudgetExhausted` (corruption beyond parity budget —\ndistinct from `AeadVerificationFailed`) + `MalformedEccFrame`\n\nGated on `encryption + page_ecc` (reed-solomon-simd).\n\n## Acceptance criteria coverage\n\n| # | Criterion | This slice |\n|---|-----------|------------|\n| 1 | `EccFrame` wire format, additive | ✅ codec + variant-2 magic test\n|\n| 2 | Fault injection within parity budget recovers | ✅ single +\n4-stripe recovery tests |\n| 3 | Beyond-budget → typed error, not silent wrong data | ✅ over-budget\nreturns `None`; integration maps to `EccBudgetExhausted` |\n| 5 | Encode overhead measurable at fixed RS(14,10) | ✅ parity =\n4·stripe_size, asserted |\n| 4 | Targeted per-zstd-block repair | follow-up (needs FrameEmitInfo\nthreading across the compress→encrypt boundary) |\n| 6 | Decode happy-path overhead | follow-up (lands with the integration\nentry points) |\n\n## Architecture note\n\nThe issue's encode pipeline describes an *integrated* compress+encrypt\nflow, but this engine separates those layers — `encrypt_block` receives\nthe already-compressed inner frame as opaque `plaintext` and has no\n`FrameEmitInfo`. This slice therefore implements the layer-agnostic ECC\nprimitive + wire codec; per-zstd-block targeted repair (criterion #4,\nneeds FrameEmitInfo stripe alignment) and the public\n`encrypt_block_with_ecc` / `decrypt_block_with_ecc` integration entry\npoints (criterion #6) are the next slice.\n\n## Testing\n\n- ecc_frame lib tests (`encryption,page_ecc,zstd`) — 10 passed\n- full suite (`--all-features`) — 1735 passed\n- clippy (`--all-features --all-targets -D warnings`) — clean\n\nPart of #254\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n## Summary by CodeRabbit\n\n* **New Features**\n* Added an outer Reed–Solomon ECC skippable frame to protect encrypted\npayloads and attempt recovery from single-region corruption within a\nconfigured parity budget; feature-gated module is included when ECC is\nenabled.\n* **Bug Fixes**\n* Enhanced decryption error handling with new variants for ECC budget\nexhaustion and malformed ECC frame validation failures.\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-05-31T23:10:06Z",
+          "tree_id": "b8fdbe14a611b6447e47478e7520278516afee43",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/47d3d33c55de3a042244fddd287d388098f94f5c"
+        },
+        "date": 1780269059090,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 2006679.3526259768,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.6us | P99.9: 3.7us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1197805.4407617084,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.2us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 518883.75598988053,
+            "unit": "ops/sec",
+            "extra": "P50: 1.8us | P99: 5.1us | P99.9: 7.5us\nthreads: 1 | elapsed: 0.39s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3613787.3213885617,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 3.1us | P99.9: 5.5us\nthreads: 1 | elapsed: 0.06s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 374057.56243900687,
+            "unit": "ops/sec",
+            "extra": "P50: 2.3us | P99: 5.7us | P99.9: 8.4us\nthreads: 1 | elapsed: 0.53s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 198536.84243668386,
+            "unit": "ops/sec",
+            "extra": "P50: 4.7us | P99: 5.9us | P99.9: 8.7us\nthreads: 1 | elapsed: 1.01s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1246385.7461930113,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.2us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1092314.311564372,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.4us | P99.9: 1.9us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 447360.6223208565,
+            "unit": "ops/sec",
+            "extra": "P50: 2.1us | P99: 5.5us | P99.9: 8.0us\nthreads: 1 | elapsed: 0.45s | num: 200000 | iterations: 3"
           }
         ]
       }
