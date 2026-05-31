@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1780041809097,
+  "lastUpdate": 1780249095931,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -11310,6 +11310,84 @@ window.BENCHMARK_DATA = {
             "value": 450604.12472471636,
             "unit": "ops/sec",
             "extra": "P50: 2.0us | P99: 6.9us | P99.9: 10.2us\nthreads: 1 | elapsed: 0.44s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "71140f3ba2c73f9def27cf596e66fa0c01b9095d",
+          "message": "perf(zstd): retain dictionary id in frame header (#366)\n\n## Summary\n\nStop stripping the dictionary id from dictionary-compressed zstd frames.\nThe id stays in the frame header, where the reader can later pin it\nagainst the expected dictionary to detect a block compressed under the\nwrong dictionary.\n\n## Background\n\n`compress_with_dict` injected a synthetic dictionary id (xxh3 of the\ndictionary content) into the frame header and then rewrote every emitted\nframe to strip it back out — a per-block header patch (descriptor\nrewrite + tail `copy_within` + `truncate`) on **every** dictionary\nwrite.\n\nThe stripping existed only to mimic a C-backend convention (\"raw-content\ndicts record dictID=0 so frames stay decodable by the C FFI backend\").\nThat convention does not apply here: this engine is pure Rust with no\nFFI decoder (ADR: no FFI anywhere). The comments asserting C-interop\nwere dead.\n\n## Change\n\n- Remove `strip_dict_id` (function + its 6 unit tests) and its single\ncall site.\n- `compress_with_dict` now returns the frame with the dictionary id its\nheader declares.\n- Rewrite the dead C-FFI comments to describe the actual pure-Rust\nbehaviour.\n\nDecompression is unchanged in behaviour: `decompress_with_dict`\nregisters the dictionary via `add_dict_handle` before `init`, and\n`force_dict` applies it regardless of whether the header carries the id\n— so **both** newer id-bearing frames and older stripped frames\n(dictID=0) decode through the same path. No version bump: the format\nchange is read-compatible in both directions.\n\n## Why\n\n1. **Perf:** drops the per-block header rewrite (descriptor patch +\n`copy_within` memmove + `truncate`) from the dictionary compression hot\npath.\n2. **Diagnostics groundwork:** with the id retained on disk, a follow-up\ncan pin the inner frame's `Dictionary_ID` via\n`FrameDecoder::expect_dict_id` to surface \"block compressed under the\nwrong dictionary\" as a typed error instead of silent wrong output.\n(Opt-in `VerifyOptions` lands in a follow-up; the content-checksum half\nof that is blocked on a structured-zstd opt-in setter — issue filed.)\n\n## Testing\n\n- `cargo clippy --all-features --all-targets -D warnings` — clean\n- `cargo nextest run --all-features` — 1719 passed\n- `cargo test --doc --features zstd` — ok\n- dictionary compress/decompress round-trip tests (raw-content +\nfinalized, all representative levels) pass against the id-bearing\nframes.\n\nPart of #253\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n\n## Summary by CodeRabbit\n\n* **Bug Fixes**\n* Dictionary IDs are now properly preserved in compressed frame headers\nfor both finalized and raw-content dictionaries, improving dictionary\nvalidation and match detection.\n* Dictionary mismatch scenarios now produce typed decode errors for more\nprecise error handling and reporting.\n\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-05-31T20:16:33+03:00",
+          "tree_id": "8086a1b31de2fd1f52a8ebdf60338182c35048a5",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/71140f3ba2c73f9def27cf596e66fa0c01b9095d"
+        },
+        "date": 1780249094367,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 2032388.529764142,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.6us | P99.9: 3.7us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1243014.1053511633,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.2us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 520229.0114697803,
+            "unit": "ops/sec",
+            "extra": "P50: 1.8us | P99: 5.1us | P99.9: 7.5us\nthreads: 1 | elapsed: 0.38s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3649758.249137973,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 3.0us | P99.9: 5.4us\nthreads: 1 | elapsed: 0.05s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 376335.0431557789,
+            "unit": "ops/sec",
+            "extra": "P50: 2.3us | P99: 5.6us | P99.9: 8.4us\nthreads: 1 | elapsed: 0.53s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 200017.36610777758,
+            "unit": "ops/sec",
+            "extra": "P50: 4.6us | P99: 8.0us | P99.9: 10.3us\nthreads: 1 | elapsed: 1.00s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1240428.389386845,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.2us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1109608.411590732,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.5us | P99.9: 1.9us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 461822.8708905191,
+            "unit": "ops/sec",
+            "extra": "P50: 2.0us | P99: 5.5us | P99.9: 8.1us\nthreads: 1 | elapsed: 0.43s | num: 200000 | iterations: 3"
           }
         ]
       }
