@@ -242,7 +242,7 @@ pub struct KvSeparationOptions {
     /// Pre-trained zstd dictionary for blob-file dictionary compression.
     ///
     /// Required when `compression` is [`CompressionType::ZstdDict`].
-    /// The `dict_id` in the compression type must match [`ZstdDictionary::id`].
+    /// The `dict_id` in the compression type must match [`ZstdDictionary::id`](crate::ZstdDictionary::id).
     #[cfg(zstd_any)]
     #[doc(hidden)]
     pub zstd_dictionary: Option<std::sync::Arc<crate::compression::ZstdDictionary>>,
@@ -329,7 +329,7 @@ impl KvSeparationOptions {
     ///
     /// Required when [`compression`](Self::compression) is set to
     /// [`CompressionType::ZstdDict`].  The `dict_id` encoded in the
-    /// compression type must equal [`ZstdDictionary::id()`] of the
+    /// compression type must equal [`ZstdDictionary::id()`](crate::ZstdDictionary::id) of the
     /// supplied dictionary; [`Config::open`] will return
     /// [`Error::ZstdDictMismatch`](crate::Error::ZstdDictMismatch) if
     /// they disagree.

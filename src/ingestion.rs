@@ -15,7 +15,7 @@ pub enum AnyIngestion<'a> {
     /// Ingestion for a standard LSM-tree
     Standard(Ingestion<'a>),
 
-    /// Ingestion for a [`BlobTree`] with KV separation
+    /// Ingestion for a [`BlobTree`](crate::BlobTree) with KV separation
     Blob(BlobIngestion<'a>),
 }
 

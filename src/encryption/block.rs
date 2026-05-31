@@ -21,7 +21,7 @@
 //! The `MetadataFrame` layout is byte-aligned with §5.1; the
 //! `BodyFrame` layout is §5.2; AAD construction follows §5.3.
 //! Both writer and
-//! reader hit the same [`aad::build`] call with the same inputs, so
+//! reader hit the same [`aad::build`](super::aad::build) call with the same inputs, so
 //! the AEAD tag binds the ciphertext to the full block-identity +
 //! codec context + key-epoch tuple. AAD is never written to disk.
 
@@ -289,7 +289,7 @@ fn decode_metadata_payload(payload: &[u8]) -> Result<ParsedMetadata, DecryptErro
 ///
 /// Reads the active key from `key_chain` at `ctx.key_epoch`, draws
 /// a fresh 12-byte nonce from a CSPRNG, builds the 38-byte AAD via
-/// [`aad::build`], encrypts the plaintext in place via
+/// [`aad::build`](super::aad::build), encrypts the plaintext in place via
 /// [`encrypt_in_place`], and serialises the result.
 ///
 /// # Errors

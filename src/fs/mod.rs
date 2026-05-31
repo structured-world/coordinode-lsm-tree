@@ -4,12 +4,12 @@
 
 //! Pluggable filesystem abstraction for I/O backends.
 //!
-//! The [`Fs`] trait is intended to abstract the filesystem operations
+//! The [`Fs`](crate::fs::Fs) trait is intended to abstract the filesystem operations
 //! that lsm-tree performs, allowing alternative backends such as
 //! `io_uring`, in-memory filesystems for deterministic testing, or cloud
 //! blob storage. Call-site migration is tracked in separate issues.
 //!
-//! The default implementation [`StdFs`] delegates to [`std::fs`] and
+//! The default implementation [`StdFs`](crate::fs::StdFs) delegates to [`std::fs`] and
 //! is a zero-sized type, so it adds no runtime overhead when used as a
 //! monomorphized generic parameter.
 //!
@@ -21,7 +21,7 @@
 //!   completion semantics — not yet implemented, tracked for when Windows
 //!   becomes a production target
 //! - **macOS / BSD**: no batched I/O API exists (`dispatch_io` and `kqueue`
-//!   do not help for storage I/O patterns); [`StdFs`] is the correct choice
+//!   do not help for storage I/O patterns); [`StdFs`](crate::fs::StdFs) is the correct choice
 
 mod aligned_buf;
 // `direct_io` is std-only (touches `std::fs::OpenOptions`). It is
@@ -390,7 +390,7 @@ pub trait Fs: Send + Sync + 'static {
     /// Unlike [`create_dir_all`](Self::create_dir_all), this method must
     /// FAIL with [`io::ErrorKind::AlreadyExists`] when `path` already
     /// exists — it is the POSIX `mkdir(2)` primitive used by
-    /// [`Tree::create_checkpoint`](crate::Tree::create_checkpoint) to
+    /// [`AbstractTree::create_checkpoint`](crate::AbstractTree::create_checkpoint) to
     /// claim its target directory without a TOCTOU window.
     ///
     /// The parent directory must already exist; this method does not
@@ -487,7 +487,7 @@ pub trait Fs: Send + Sync + 'static {
 
     /// Creates a hard link `dst` that refers to the same inode as `src`.
     ///
-    /// Used by [`Tree::create_checkpoint`](crate::Tree::create_checkpoint)
+    /// Used by [`AbstractTree::create_checkpoint`](crate::AbstractTree::create_checkpoint)
     /// to snapshot SST and blob files in O(1) per file without duplicating
     /// data on disk. After the link is created, deleting either path leaves
     /// the other intact; the inode is reclaimed only after the last link
@@ -505,7 +505,7 @@ pub trait Fs: Send + Sync + 'static {
     /// operator-visible notification of unexpected copies are expected
     /// to aggregate per-checkpoint and emit a single summary warning.
     ///
-    /// In-memory backends ([`MemFs`](crate::fs::MemFs)) do not have inodes;
+    /// In-memory backends ([`MemFs`]) do not have inodes;
     /// they implement this as a byte copy that produces an independent file
     /// with the same contents.
     ///
@@ -545,7 +545,7 @@ pub trait Fs: Send + Sync + 'static {
     /// Examples of equal backend IDs:
     /// - All [`crate::fs::StdFs`] instances on the same host (one
     ///   shared kernel filesystem).
-    /// - A [`crate::fs::IoUringFs`] and a [`crate::fs::StdFs`] on the
+    /// - An `IoUringFs` and a [`crate::fs::StdFs`] on the
     ///   same host (the uring backend delegates path resolution to the
     ///   kernel).
     ///

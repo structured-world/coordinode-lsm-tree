@@ -46,18 +46,18 @@ pub const MAX_SEQNO: SeqNo = 0x7FFF_FFFF_FFFF_FFFF;
 ///   unique for the lifetime of the generator (modulo wrap-around, which
 ///   must not occur within the reserved MSB range).
 ///
-/// Implementors are also responsible for ensuring that [`get`] does not
-/// return values that violate these invariants, and that [`set`] and
-/// [`fetch_max`] do not violate them (e.g., by setting the counter to a
+/// Implementors are also responsible for ensuring that [`Self::get`] does not
+/// return values that violate these invariants, and that [`Self::set`] and
+/// [`Self::fetch_max`] do not violate them (e.g., by setting the counter to a
 /// value at or above `0x8000_0000_0000_0000`, or by moving the counter
-/// backwards such that subsequent calls to [`next`] would observe
+/// backwards such that subsequent calls to [`Self::next`] would observe
 /// non-monotonic sequence numbers).
 ///
-/// The [`set`] method is a special-case escape hatch intended for use
+/// The [`Self::set`] method is a special-case escape hatch intended for use
 /// during initialization or recovery. It may move the counter forwards
 /// or backwards and therefore **may** cause subsequent calls to
-/// [`next`] to observe non-monotonic sequence numbers. This is
-/// permitted; callers are responsible for using [`fetch_max`] (or other
+/// [`Self::next`] to observe non-monotonic sequence numbers. This is
+/// permitted; callers are responsible for using [`Self::fetch_max`] (or other
 /// application-level logic) after `set` if they need to reestablish any
 /// monotonicity guarantees.
 ///
@@ -87,7 +87,7 @@ pub trait SequenceNumberGenerator:
     /// Gets the current sequence number without incrementing.
     ///
     /// This should be consistent with the value that will be used as the
-    /// basis for the next call to [`next`], and must not itself alter the
+    /// basis for the next call to [`Self::next`], and must not itself alter the
     /// monotonicity guarantees.
     #[must_use]
     fn get(&self) -> SeqNo;
@@ -100,11 +100,11 @@ pub trait SequenceNumberGenerator:
     /// This method is intended for direct overrides (e.g., during
     /// initialization or recovery) and is **not** required to preserve
     /// monotonicity with respect to values previously returned by
-    /// [`next`]. In particular, calling `set` with a value lower than a
+    /// [`Self::next`]. In particular, calling `set` with a value lower than a
     /// previously returned `next` value may cause subsequent calls to
-    /// [`next`] to observe non-monotonic sequence numbers. This is
+    /// [`Self::next`] to observe non-monotonic sequence numbers. This is
     /// allowed; callers that need to advance the sequence number in a
-    /// monotonic fashion should prefer [`fetch_max`] instead of `set`.
+    /// monotonic fashion should prefer [`Self::fetch_max`] instead of `set`.
     fn set(&self, value: SeqNo);
 
     /// Atomically updates the sequence number to the maximum of
@@ -112,7 +112,7 @@ pub trait SequenceNumberGenerator:
     ///
     /// The resulting stored value must:
     /// - Remain strictly less than `0x8000_0000_0000_0000`.
-    /// - Preserve the monotonicity guarantees expected by [`next`].
+    /// - Preserve the monotonicity guarantees expected by [`Self::next`].
     fn fetch_max(&self, value: SeqNo);
 }
 

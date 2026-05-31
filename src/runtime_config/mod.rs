@@ -12,7 +12,7 @@
 //!
 //! ## Layered tier separation
 //!
-//! [`RuntimeConfig`] and its companion enums are POD data with no
+//! [`RuntimeConfig`](crate::runtime_config::RuntimeConfig) and its companion enums are POD data with no
 //! I/O dependencies — they live in this module and compile under
 //! `no_std + alloc`. The mutable handle (crate-internal type
 //! `handle::RuntimeConfigHandle`) lives in a `pub(crate)` submodule
@@ -21,7 +21,7 @@
 //! re-exported: the stable public surface is
 //! [`crate::Tree::runtime_config`] /
 //! [`crate::Tree::update_runtime_config`], which return / accept
-//! [`RuntimeConfig`] only, so `arc-swap` stays an implementation
+//! [`RuntimeConfig`](crate::runtime_config::RuntimeConfig) only, so `arc-swap` stays an implementation
 //! detail and is not part of the crate's semver contract.
 //!
 //! Downstream no_std consumers (block decoders, format constants,
@@ -37,7 +37,7 @@
 //! [`crate::Tree::update_runtime_config`]) reads and updates it.
 //! The wiring lands with the V5-batch format features (manifest
 //! hardening, per-KV protection, scan-since-seqno), which extend
-//! [`RuntimeConfig`] with their own fields and load the snapshot at
+//! [`RuntimeConfig`](crate::runtime_config::RuntimeConfig) with their own fields and load the snapshot at
 //! block write / manifest commit / compaction boundaries.
 //!
 //! Once wired, the intended semantics are:

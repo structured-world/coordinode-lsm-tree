@@ -15,11 +15,11 @@ use super::threshold::{compute_thresholds, partition_keys_by_threshold};
 /// For each layer (0 to `max_layers - 1`):
 ///   1. Hash every input key with the layer's derived seed to produce a
 ///      `StandardEquation` (gives `start = block_idx * b + offset`).
-///   2. Run [`compute_thresholds`] over those equations to pick per-block
+///   2. Run `compute_thresholds` over those equations to pick per-block
 ///      threshold `τ_i`. A key with `offset < τ_i` is KEPT in this layer;
 ///      a key with `offset >= τ_i` is BUMPED to the next layer.
 ///   3. Partition keys into `kept` and `bumped` via
-///      [`partition_keys_by_threshold`].
+///      `partition_keys_by_threshold`.
 ///   4. Build a vendored Standard Ribbon over `kept` — the threshold
 ///      scheme caps per-block load to ~90%, so this build succeeds with
 ///      negligible probability of falling into Ribbon's

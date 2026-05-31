@@ -71,7 +71,7 @@ pub fn parity_len(payload_len: usize) -> usize {
 
 /// Encodes a Reed-Solomon parity trailer for `payload`.
 ///
-/// Returns `Vec<u8>` of length [`parity_len(payload.len())`].
+/// Returns `Vec<u8>` of length [`parity_len`]`(payload.len())`.
 /// The caller writes the bytes verbatim after the payload and
 /// records `ecc_length = parity.len() as u32` in the block
 /// header.

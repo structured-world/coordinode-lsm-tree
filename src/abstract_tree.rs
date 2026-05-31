@@ -653,12 +653,12 @@ pub trait AbstractTree: sealed::Sealed {
     /// Will return `Err` if an IO error occurs.
     fn get<K: AsRef<[u8]>>(&self, key: K, seqno: SeqNo) -> crate::Result<Option<UserValue>>;
 
-    /// Retrieves an item from the tree as a [`PinnableSlice`].
+    /// Retrieves an item from the tree as a [`PinnableSlice`](crate::PinnableSlice).
     ///
     /// When the value is backed by an on-disk data block, implementations
-    /// may return [`PinnableSlice::Pinned`] holding a reference to that block's
+    /// may return [`PinnableSlice::Pinned`](crate::PinnableSlice::Pinned) holding a reference to that block's
     /// decompressed buffer (avoiding a data copy). Memtable and blob-resolved
-    /// values use [`PinnableSlice::Owned`]. The default implementation always
+    /// values use [`PinnableSlice::Owned`](crate::PinnableSlice::Owned). The default implementation always
     /// returns `Owned`; only [`Tree`] overrides with the pinned path.
     ///
     /// The existing [`AbstractTree::get`] method is unaffected.
@@ -793,7 +793,7 @@ pub trait AbstractTree: sealed::Sealed {
         keys.into_iter().map(|key| self.get(key, seqno)).collect()
     }
 
-    /// Applies a [`WriteBatch`] with the given sequence number.
+    /// Applies a [`WriteBatch`](crate::WriteBatch) with the given sequence number.
     ///
     /// All entries share a single seqno. This is more efficient than individual
     /// writes because the version-history lock and memtable size accounting
