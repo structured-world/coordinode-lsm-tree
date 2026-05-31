@@ -359,10 +359,10 @@ where
     F: FnMut(&[u8]) -> bool,
 {
     if missing.len() == erasures {
-        // let-chain (stable since the 2024 edition): bind `candidate`
-        // from the decode, then in the same `if` test it through the
-        // AEAD oracle. The arm runs only when decode succeeds AND the
-        // candidate verifies; otherwise fall through to `Ok(None)`.
+        // let-chain: bind `candidate` from the decode, then in the same
+        // `if` test it through the AEAD oracle. The arm runs only when
+        // decode succeeds AND the candidate verifies; otherwise fall
+        // through to `Ok(None)`.
         if let Some(candidate) =
             decode_with_missing(shards, sb, data, parity, ciphertext_len, missing)?
             && verify(&candidate)
