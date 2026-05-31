@@ -117,14 +117,16 @@ fn stripe_size(len: usize, data_shards: usize) -> usize {
 ///
 /// # Errors
 ///
-/// - [`DecryptError::MalformedEccFrame`] if the scheme is degenerate
+/// - [`crate::Error::Encrypt`] if the scheme is degenerate
 ///   (`data_shards == 0` or `parity_shards == 0`) or the
 ///   `reed-solomon-simd` engine rejects the `(data, parity, stripe)`
-///   configuration.
-pub fn encode_ecc_payload(ciphertext: &[u8], scheme: EccScheme) -> Result<Vec<u8>, DecryptError> {
+///   configuration. This is an encode-side helper, so failures use the
+///   write-path error channel rather than the decode-side
+///   [`DecryptError`].
+pub fn encode_ecc_payload(ciphertext: &[u8], scheme: EccScheme) -> crate::Result<Vec<u8>> {
     if scheme.data_shards == 0 || scheme.parity_shards == 0 {
-        return Err(DecryptError::MalformedEccFrame(
-            "degenerate scheme: data_shards and parity_shards must be non-zero",
+        return Err(crate::Error::Encrypt(
+            "degenerate ECC scheme: data_shards and parity_shards must be non-zero",
         ));
     }
     let data = scheme.data_shards as usize;
@@ -138,7 +140,7 @@ pub fn encode_ecc_payload(ciphertext: &[u8], scheme: EccScheme) -> Result<Vec<u8
     out.push(0); // Reserved, MUST be zero in v1.
 
     let mut encoder = ReedSolomonEncoder::new(data, parity, sb)
-        .map_err(|_| DecryptError::MalformedEccFrame("reed-solomon encoder rejected scheme"))?;
+        .map_err(|_| crate::Error::Encrypt("reed-solomon encoder rejected ECC scheme"))?;
 
     // Feed `data` contiguous stripes of the ciphertext; the last stripe
     // runs past the end and is zero-padded.
@@ -155,13 +157,13 @@ pub fn encode_ecc_payload(ciphertext: &[u8], scheme: EccScheme) -> Result<Vec<u8
             stripe_buf[..end - start].copy_from_slice(&ciphertext[start..end]);
         }
         encoder.add_original_shard(&stripe_buf).map_err(|_| {
-            DecryptError::MalformedEccFrame("reed-solomon encoder rejected original shard")
+            crate::Error::Encrypt("reed-solomon encoder rejected ECC original shard")
         })?;
     }
 
     let result = encoder
         .encode()
-        .map_err(|_| DecryptError::MalformedEccFrame("reed-solomon encode failed"))?;
+        .map_err(|_| crate::Error::Encrypt("reed-solomon ECC encode failed"))?;
     for shard in result.recovery_iter() {
         out.extend_from_slice(shard);
     }
@@ -202,9 +204,12 @@ fn parse_ecc_payload(payload: &[u8]) -> Result<ParsedEcc<'_>, DecryptError> {
             "degenerate scheme in header",
         ));
     }
-    // Cap the wire-declared scheme at the one preset we encode
-    // (RS_14_10). Without this, a crafted header could drive the
-    // erasure-subset enumeration in `try_repair` into a DoS hang.
+    // Bound the wire-declared scheme to RS_14_10's shard budget:
+    // `parity_shards <= 4` and `data + parity <= 14`. This is a budget
+    // cap, not an exact-preset match — any scheme within those bounds
+    // (e.g. 13+1) is accepted, which is all the repair path can afford.
+    // Without it a crafted header could drive the erasure-subset
+    // enumeration in `try_repair` into a DoS hang.
     if parity_shards > EccScheme::RS_14_10.parity_shards
         || (data_shards as usize + parity_shards as usize) > EccScheme::RS_14_10.total_shards()
     {
@@ -478,7 +483,7 @@ mod tests {
                     parity_shards: 4
                 }
             ),
-            Err(DecryptError::MalformedEccFrame(_))
+            Err(crate::Error::Encrypt(_))
         ));
         assert!(matches!(
             encode_ecc_payload(
@@ -488,7 +493,7 @@ mod tests {
                     parity_shards: 0
                 }
             ),
-            Err(DecryptError::MalformedEccFrame(_))
+            Err(crate::Error::Encrypt(_))
         ));
     }
 
