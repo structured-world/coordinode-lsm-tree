@@ -600,4 +600,41 @@ mod tests {
             .expect("unaligned single-stripe corruption must recover");
         assert_eq!(recovered, ct);
     }
+
+    #[test]
+    fn parse_rejects_parity_shards_above_supported_budget() {
+        // A tampered/corrupt header can declare a huge parity-shard
+        // count in a tiny payload: the parity-length check bottoms out
+        // at `parity * stripe_size` with `stripe_size` as small as 2,
+        // so ~80 parity bytes satisfy `parity_shards = 40`. Left
+        // unbounded, `try_repair` would enumerate
+        // `Sum_{k=1..=40} C(50, k)` erasure subsets — billions of RS
+        // decodes, a guaranteed hang on the corruption path. The parser
+        // must reject any scheme beyond the supported shard budget.
+        let mut payload = vec![SCHEME_RS, 10, 40, 0];
+        payload.extend(core::iter::repeat_n(0u8, 80));
+        assert!(
+            matches!(
+                parse_ecc_payload(&payload),
+                Err(DecryptError::MalformedEccFrame(_))
+            ),
+            "parser must reject parity_shards beyond the supported budget"
+        );
+    }
+
+    #[test]
+    fn parse_rejects_total_shards_above_supported_budget() {
+        // Data shards alone can blow the total past the supported
+        // budget even with an in-range parity count, inflating the
+        // `data + parity` universe the subset walker ranges over.
+        let mut payload = vec![SCHEME_RS, 200, 4, 0];
+        payload.extend(core::iter::repeat_n(0u8, 8));
+        assert!(
+            matches!(
+                parse_ecc_payload(&payload),
+                Err(DecryptError::MalformedEccFrame(_))
+            ),
+            "parser must reject data+parity beyond the supported total"
+        );
+    }
 }
