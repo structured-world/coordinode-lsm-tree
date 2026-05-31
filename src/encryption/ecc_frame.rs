@@ -202,6 +202,16 @@ fn parse_ecc_payload(payload: &[u8]) -> Result<ParsedEcc<'_>, DecryptError> {
             "degenerate scheme in header",
         ));
     }
+    // Cap the wire-declared scheme at the one preset we encode
+    // (RS_14_10). Without this, a crafted header could drive the
+    // erasure-subset enumeration in `try_repair` into a DoS hang.
+    if parity_shards > EccScheme::RS_14_10.parity_shards
+        || (data_shards as usize + parity_shards as usize) > EccScheme::RS_14_10.total_shards()
+    {
+        return Err(DecryptError::MalformedEccFrame(
+            "scheme exceeds shard budget",
+        ));
+    }
     #[expect(
         clippy::indexing_slicing,
         reason = "len >= ECC_HEADER_LEN guarded above"
