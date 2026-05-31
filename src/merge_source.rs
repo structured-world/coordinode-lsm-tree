@@ -25,11 +25,11 @@
 //!
 //! # Contract
 //!
-//! - [`Self::next`] yields items in ascending `InternalKey` order
+//! - [`MergeSource::next`] yields items in ascending `InternalKey` order
 //!   from the source's "front" cursor.
-//! - [`Self::next_back`] yields items in descending order from the
+//! - [`MergeSource::next_back`] yields items in descending order from the
 //!   source's "back" cursor.
-//! - [`Self::seek`] guarantees depend on the source's cursor model:
+//! - [`MergeSource::seek`] guarantees depend on the source's cursor model:
 //!
 //!   **Independent-cursor sources** (LSM SST scanners, `RunReader`s,
 //!   where calling `next` repeatedly does NOT advance the back

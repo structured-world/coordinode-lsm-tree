@@ -21,29 +21,34 @@
 //! The AAD-bound on-disk block format from
 //! `docs/aad-block-format.md` ships in the submodules:
 //!
-//! - [`aad`]: pure-byte AAD construction, [`aad::SuiteId`] /
-//!   [`aad::EncryptionContext`], plus re-exports of the existing
+//! - `aad`: pure-byte AAD construction, `aad::SuiteId` /
+//!   `aad::EncryptionContext`, plus re-exports of the existing
 //!   `crate::table::block::BlockType` / `crate::table::block::BlockIdentity`
 //!   so the AAD path and the Block I/O path share one identity type.
-//! - [`error`]: `DecryptError` enum with one variant per decode-time
+//! - `error`: `DecryptError` enum with one variant per decode-time
 //!   failure mode (re-exported at the crate's encryption surface).
-//! - [`aead`] (feature `encryption`): per-suite AEAD dispatch
+//! - `aead` (feature `encryption`): per-suite AEAD dispatch
 //!   (AES-256-GCM, ChaCha20-Poly1305) that takes the 38-byte AAD
-//!   from [`aad::build`] and produces / verifies the
+//!   from `aad::build` and produces / verifies the
 //!   `(nonce, ciphertext, tag)` triple.
-//! - [`key_chain`]: the `KeyChain` trait + in-memory
+//! - `key_chain`: the `KeyChain` trait + in-memory
 //!   `StaticKeyChain` reference impl, decoupling KeyEpoch → key
 //!   lookup from the LSM crate.
-//! - [`block`] (features `encryption` + `zstd_any`): top-level
-//!   [`encrypt_block`] / [`decrypt_block`] entry points wrapping
+//! - `block` (features `encryption` + `zstd_any`): top-level
+//!   `encrypt_block` / `decrypt_block` entry points wrapping
 //!   the `MetadataFrame ‖ BodyFrame` skippable-frame wire format
-//!   and returning [`DecryptedBlock`] (plaintext + parsed codec
+//!   and returning `DecryptedBlock` (plaintext + parsed codec
 //!   context for the caller to thread through
 //!   `structured_zstd::FrameDecoder` setters).
 //!
+//! (Module and item names above are inline rather than intra-doc links
+//! because several — `aead`, `block`, `encrypt_block`, `decrypt_block`,
+//! `DecryptedBlock` — are feature-gated and absent from doc builds that
+//! omit those features, which would break the links.)
+//!
 //! Still pending in a follow-up: replacing the legacy
 //! [`Aes256GcmProvider`] Block I/O code path below with the
-//! [`encrypt_block`] / [`decrypt_block`] entry points at every
+//! `encrypt_block` / `decrypt_block` entry points at every
 //! `Block::write_into` / `Block::from_reader` site.
 
 pub mod aad;

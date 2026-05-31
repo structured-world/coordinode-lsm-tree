@@ -30,7 +30,7 @@
 //! single-block recovery "for free" by reusing existing infrastructure.
 //!
 //! Section names mirror the previous sfa archive's section names so
-//! existing callers in [`crate::Manifest`] / [`crate::version::recovery`]
+//! existing callers in `crate::Manifest` / `crate::version::recovery`
 //! see the same logical surface during the migration; only the underlying
 //! framing changes.
 //!

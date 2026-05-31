@@ -5,7 +5,7 @@
 //! that the V5-2 layout (`manifest_layout_version = 1`) describes.
 //!
 //! The writer mirrors the `crate::sfa::Writer` start / write / finish API
-//! so the call sites in [`crate::version::persist`] and the
+//! so the call sites in `crate::version::persist` and the
 //! V5-2-aware version encoder can migrate with minimal churn: open
 //! the writer, [`start`] a section, write its bytes via the
 //! [`Write`] impl, repeat per section, then [`finish`] to emit the

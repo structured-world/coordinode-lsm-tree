@@ -47,7 +47,7 @@ pub struct Metrics {
     pub(crate) io_skipped_by_filter: AtomicUsize,
 
     /// Number of segments skipped during prefix scans via
-    /// [`Tree::create_prefix`] where the per-table prefix bloom filter
+    /// [`Tree::create_prefix`](crate::Tree::create_prefix) where the per-table prefix bloom filter
     /// returned `Ok(false)`. Counted in both single-table and
     /// multi-table run paths of `TreeIter::create_range`.
     ///
@@ -238,7 +238,7 @@ impl Metrics {
         self.io_skipped_by_filter.load(Relaxed)
     }
 
-    /// Number of segments skipped during [`Tree::create_prefix`] scans
+    /// Number of segments skipped during [`Tree::create_prefix`](crate::Tree::create_prefix) scans
     /// by prefix bloom filters (single-table and multi-table run paths).
     ///
     /// Note: `BlobTree` prefix scans do not currently record this metric.

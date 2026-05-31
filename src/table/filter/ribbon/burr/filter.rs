@@ -313,7 +313,7 @@ impl<S> core::fmt::Debug for BurrFilter<S> {
 /// This is the type the LSM filter framework consumes: it owns a borrowed
 /// slice of the on-disk filter block, parses the BuRR header, and answers
 /// `contains_hash` lookups. Wire format documented in
-/// [`super::wire`] — intentionally distinct from the vendored
+/// `super::wire` — intentionally distinct from the vendored
 /// `ribbon-serde` repr (that one is for in-memory snapshots).
 #[derive(Debug)]
 pub struct BurrFilterReader<'a> {
