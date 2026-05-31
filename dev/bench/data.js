@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1780249095931,
+  "lastUpdate": 1780249782633,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -11388,6 +11388,84 @@ window.BENCHMARK_DATA = {
             "value": 461822.8708905191,
             "unit": "ops/sec",
             "extra": "P50: 2.0us | P99: 5.5us | P99.9: 8.1us\nthreads: 1 | elapsed: 0.43s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "03ee31d27bacae0fdbc31e74d23ec1881100b746",
+          "message": "ci: allow test-only pedantic lints tripped by test-log 0.2.21 (#367)\n\n## Summary\n\nRestores the `test-zstd` CI job to green. It was failing on every PR\n(and would have turned `main` red on the next run) with 172 clippy\nerrors that have nothing to do with the PRs that surfaced them.\n\n## Root cause\n\n`test-log` released 0.2.21. Its `#[test_log::test]` attribute macro\nexpands to a test body that places `use` items after statements. The\ncrate carries `#![warn(clippy::pedantic, clippy::nursery)]`, and the\n`test-zstd` job is the only one that runs clippy with `--all-targets`\n(i.e. lints test code). On the newer macro output that combination\ntrips:\n\n- `items_after_statements` — the macro's generated `use` placement\n- `similar_names` — closely-named test fixtures (`dict_a`/`dict_b`,\netc.)\n- `too_many_lines` — long fuzz / scenario test functions\n\nAll three fire only on generated code or test fixtures, never on a\nproduction path. The `lint` job (clippy `--all-features`, no\n`--all-targets`) was unaffected, which is why this only showed up under\n`test-zstd`.\n\n## Change\n\nThree crate-level `#![allow(...)]` in `src/lib.rs`, each with a comment\nexplaining why it is benign. No production code or behaviour changes.\n\n## Testing\n\n- `cargo clippy --no-default-features --features zstd,lz4 --all-targets\n-- -D warnings` (the failing CI command) — now clean (was 172 errors)\n- `cargo clippy --all-features -- -D warnings` (the `lint` job) — clean\n- `cargo nextest run --all-features` — 1738 passed",
+          "timestamp": "2026-05-31T20:46:31+03:00",
+          "tree_id": "83ee3fcc8a61ef1ed4e5bef4119bcfec85f74f35",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/03ee31d27bacae0fdbc31e74d23ec1881100b746"
+        },
+        "date": 1780249781127,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 1954457.8104385051,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.7us | P99.9: 3.7us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1199106.9339341724,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.2us | P99.9: 4.3us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 514368.6596122136,
+            "unit": "ops/sec",
+            "extra": "P50: 1.8us | P99: 5.0us | P99.9: 7.4us\nthreads: 1 | elapsed: 0.39s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3622541.8608258544,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 3.0us | P99.9: 5.5us\nthreads: 1 | elapsed: 0.06s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 384520.9056104863,
+            "unit": "ops/sec",
+            "extra": "P50: 2.3us | P99: 5.5us | P99.9: 8.3us\nthreads: 1 | elapsed: 0.52s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 204360.50299544883,
+            "unit": "ops/sec",
+            "extra": "P50: 4.6us | P99: 5.8us | P99.9: 8.4us\nthreads: 1 | elapsed: 0.98s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1232170.8269805687,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.2us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1095509.7378326883,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.5us | P99.9: 1.9us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 445846.7205591767,
+            "unit": "ops/sec",
+            "extra": "P50: 2.0us | P99: 6.8us | P99.9: 10.0us\nthreads: 1 | elapsed: 0.45s | num: 200000 | iterations: 3"
           }
         ]
       }
