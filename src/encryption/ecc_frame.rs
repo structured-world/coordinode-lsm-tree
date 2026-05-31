@@ -5,7 +5,10 @@
 //!
 //! Adds a third skippable frame — the `EccFrame` (variant 2, magic
 //! `0x184D2A52`) — after the `MetadataFrame ‖ BodyFrame` pair produced
-//! by [`super::block::encrypt_block`]. The frame carries Reed-Solomon
+//! by `super::block::encrypt_block` (inline rather than an intra-doc
+//! link: `block` is `zstd_any`-gated, while this module also compiles
+//! without zstd, so a link would break doc builds without that feature).
+//! The frame carries Reed-Solomon
 //! parity computed over the `BodyFrame` ciphertext so a reader can
 //! recover from single-region media corruption without re-fetching the
 //! whole block.
@@ -36,8 +39,11 @@
 //! ```
 //!
 //! The skippable-frame envelope (`MagicEcc` + `EccFrameSize`) is added
-//! by [`structured_zstd::skippable::SkippableFrame`]; this module
-//! produces / consumes the `EccPayload`. The trailing `ChecksumList` is
+//! by `structured_zstd::skippable::SkippableFrame` (inline rather than
+//! an intra-doc link: the `structured-zstd` dep is only in the graph
+//! under a zstd feature, so a link would break doc builds without it);
+//! this module produces / consumes the `EccPayload`. The trailing
+//! `ChecksumList` is
 //! the localisation channel for per-zstd-block targeted repair; this
 //! slice does not populate it (it is emitted empty), so the parity
 //! covers the ciphertext as a single stripe set.
