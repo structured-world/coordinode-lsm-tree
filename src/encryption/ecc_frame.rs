@@ -497,6 +497,44 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn encode_rejects_scheme_above_shard_budget() {
+        // The encoder must reject any scheme the reader would later
+        // refuse: `parse_ecc_payload` caps at RS_14_10's budget
+        // (parity <= 4, total <= 14). Without a matching cap here the
+        // encoder could emit a trailer this same build always rejects
+        // on read as `MalformedEccFrame`.
+        let ct = sample_ciphertext(256);
+        // Parity over budget (5 > 4).
+        assert!(
+            matches!(
+                encode_ecc_payload(
+                    &ct,
+                    EccScheme {
+                        data_shards: 10,
+                        parity_shards: 5,
+                    },
+                ),
+                Err(crate::Error::Encrypt(_))
+            ),
+            "encode must reject parity_shards beyond the RS_14_10 budget"
+        );
+        // Total over budget (200 + 4 > 14).
+        assert!(
+            matches!(
+                encode_ecc_payload(
+                    &ct,
+                    EccScheme {
+                        data_shards: 200,
+                        parity_shards: 4,
+                    },
+                ),
+                Err(crate::Error::Encrypt(_))
+            ),
+            "encode must reject data+parity beyond the RS_14_10 total"
+        );
+    }
+
     // Gated on `zstd_any`: `SkippableFrame` comes from the optional
     // `structured-zstd` dep, which is only in the graph when a zstd
     // feature is on. Without this gate, `cargo test --features
