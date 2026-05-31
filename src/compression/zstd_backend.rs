@@ -65,61 +65,6 @@ fn bounded_read(reader: &mut impl Read, capacity: usize) -> crate::Result<Vec<u8
     Ok(output)
 }
 
-/// Strips the `Dict_ID` field from a zstd frame header, modifying the frame
-/// in place.
-///
-/// `structured-zstd` rejects `id=0` for [`Dictionary::from_raw_content`], so
-/// the backend internally assigns a synthetic non-zero id derived from the dict
-/// content hash. That id is an implementation detail — compressed frames must not
-/// embed it, because the zstd standard treats a missing `dictID` (`Dict_ID_Flag
-/// == 0`) as a sentinel meaning "raw-content dict, id unknown, accept any".
-/// Embedding the synthetic id would cause a decompressor to require that exact id
-/// in the loaded `ZSTD_DDict`, breaking round-trips after serialisation.
-///
-/// Returns the frame unchanged if no dict id is present (`Dict_ID_Flag == 0`).
-fn strip_dict_id(mut frame: Vec<u8>) -> Vec<u8> {
-    // Minimum valid frame: magic (4 bytes) + Frame_Header_Descriptor (1 byte).
-    let Some(&fhd) = frame.get(4) else {
-        return frame; // Frame_Header_Descriptor absent — leave unchanged.
-    };
-
-    let dict_id_flag = fhd & 0x03; // bits [1:0]: Dict_ID_Flag
-    if dict_id_flag == 0 {
-        return frame; // No dict ID present.
-    }
-
-    // Dict_ID_Flag encodes the byte-width of the Dict_ID field:
-    //   1 → 1 byte, 2 → 2 bytes, 3 → 4 bytes.
-    let dict_id_len: usize = match dict_id_flag {
-        1 => 1,
-        2 => 2,
-        3 => 4,
-        // Invariant: dict_id_flag = fhd & 0x03 is always 0, 1, 2, or 3.
-        // 0 is handled by the early return above; 1, 2, 3 are matched above.
-        _ => unreachable!("dict_id_flag is a 2-bit field; 0 is handled, 1–3 matched"),
-    };
-
-    // Single_Segment_Flag (FHD bit 5): when set, no Window_Descriptor follows FHD.
-    let single_segment = (fhd >> 5) & 0x01 != 0;
-    let wd_len: usize = usize::from(!single_segment); // 1 if WD present, else 0
-
-    // Dict_ID immediately follows: magic(4) + FHD(1) + optional WD.
-    let dict_id_start = 5 + wd_len;
-    if frame.len() < dict_id_start + dict_id_len {
-        return frame; // Malformed frame — leave unchanged; decompressor will reject it.
-    }
-
-    // Patch FHD in-place (clear Dict_ID_Flag bits), then slide the tail left
-    // by dict_id_len bytes to close the gap. No allocation needed.
-    // `frame.get(4)` already returned `Some` above, so index 4 is valid.
-    if let Some(b) = frame.get_mut(4) {
-        *b = fhd & !0x03u8;
-    }
-    frame.copy_within(dict_id_start + dict_id_len.., dict_id_start);
-    frame.truncate(frame.len() - dict_id_len);
-    frame
-}
-
 /// Incrementally decodes `data` using the pre-initialised `decoder` and
 /// collects the output, enforcing a hard `capacity` limit even when the frame
 /// has no `Frame_Content_Size` field (FCS omitted → `content_size()` == 0).
@@ -223,18 +168,17 @@ fn do_decompress_with_dict(
     is_raw_content: bool,
 ) -> crate::Result<Vec<u8>> {
     if is_raw_content {
-        // Raw-content dict path: frames have no embedded dictID
-        // (C API and post-strip pure frames both produce dictID=0).
-        // `decode_all_to_vec` calls `init` internally, which would
-        // skip dict loading for dictID=0. Instead, use the manual
-        // flow: `init` → `force_dict` → `decode_blocks` → `collect`.
+        // Raw-content dict path. `FrameDecoder::init` does not
+        // auto-resolve a raw-content dictionary, so drive the decode
+        // manually: `init` → `force_dict` → `decode_blocks` → `collect`.
         //
-        // `force_dict` loads the dict unconditionally regardless of
-        // the frame's dictID field, handling both backends uniformly:
-        //   - Frame produced by C FFI backend (dictID=0 → no id): force_dict loads dict.
-        //   - Frame produced by new pure backend (dictID stripped → no id): same.
-        //   - Frame produced by old pure backend (dictID=synthetic): force_dict
-        //     re-loads same dict (idempotent, since init would already load it).
+        // `force_dict` applies the dictionary regardless of whether the
+        // frame header carries a dictID, so one path covers both on-disk
+        // shapes:
+        //   - newer frames that keep the synthetic xxh3 dictID in the
+        //     header, and
+        //   - older frames written before the id was retained (header
+        //     omits it).
         let mut cursor = std::io::Cursor::new(data);
         decoder
             .init(&mut cursor)
@@ -359,23 +303,20 @@ impl CompressionProvider for ZstdProvider {
         //    LZ77 history to improve match distances on repetitive data. No entropy
         //    table seeding. Parsed via `Dictionary::from_raw_content`.
         //
-        // The C backend's `Compressor::with_dictionary` transparently handles both
-        // formats. We replicate this behaviour here so that `ZstdDictionary` values
-        // created from raw training corpora (without a finalized header) also work.
+        // `set_dictionary` transparently handles both formats, so a
+        // `ZstdDictionary` created from a raw training corpus (without a
+        // finalized header) compresses just as one created from a
+        // finalized dictionary.
         //
-        // Whether the dictionary uses the finalized-dict format (magic header)
-        // or raw content. Only raw-content dict frames need post-processing
-        // to strip the embedded dictID (see below).
-        let is_raw_content = !dict_raw.starts_with(&DICT_MAGIC);
-
         // ID derivation for raw content dictionaries:
         //   - Use the lower 32 bits of the xxh3 hash of `dict_raw`, clamped
         //     to at least 1. (id=0 is rejected by `FrameCompressor::set_dictionary`
-        //     in structured-zstd.) This id is used INTERNALLY only — it is
-        //     stripped from the frame output before returning (see `strip_dict_id`).
-        //   - Stripping the id makes the frame format match the C API convention
-        //     (dictID=0 / absent for raw-content), enabling cross-backend
-        //     decompression (pure → C FFI and vice versa).
+        //     in structured-zstd.)
+        //   - The id is written into the frame header (Dict_ID field) and
+        //     kept there on disk, so the reader can optionally pin the
+        //     inner frame's `Dictionary_ID` against the expected
+        //     dictionary (`FrameDecoder::expect_dict_id`) to detect a
+        //     block that was compressed under the wrong dictionary.
         let dict_key = xxhash_rust::xxh3::xxh3_64(dict_raw);
 
         TLS_COMPRESSOR.with(|cell| {
@@ -445,17 +386,16 @@ impl CompressionProvider for ZstdProvider {
                 .take_drain()
                 .unwrap_or_else(|| unreachable!("drain is always set by set_drain() above"));
 
-            // For raw-content dicts the pure backend internally assigns a
-            // synthetic non-zero dictID (structured-zstd rejects id=0).
-            // That ID is an implementation detail: strip it from the frame
-            // header so the output matches the C API convention of recording
-            // dictID=0 for raw-content dicts. This makes frames produced here
-            // decompressible by the C FFI backend and vice versa.
-            Ok(if is_raw_content {
-                strip_dict_id(compressed)
-            } else {
-                compressed
-            })
+            // The frame keeps the dictionary id its header declares (the
+            // synthetic xxh3-derived id for raw-content dicts, the embedded
+            // id for finalized dicts). Retaining it on disk lets the reader
+            // pin the inner frame's `Dictionary_ID` against the expected
+            // dictionary via `FrameDecoder::expect_dict_id`, surfacing a
+            // block compressed under the wrong dictionary as a typed decode
+            // error instead of silent wrong output. It also drops the
+            // per-block header rewrite the old id-stripping step performed
+            // on every dictionary write.
+            Ok(compressed)
         })
     }
 
@@ -484,11 +424,11 @@ impl CompressionProvider for ZstdProvider {
                 const { std::cell::RefCell::new(None) };
         }
 
-        // For raw-content dicts the compressed frame has no embedded dictID
-        // (stripped by `compress_with_dict`; the C FFI backend also omits it).
-        // `FrameDecoder::init` treats a missing or zero dictID as "no dict
-        // required" and skips dict lookup. We use `force_dict` after `init`
-        // to load the dict unconditionally for raw-content frames.
+        // For raw-content dicts `FrameDecoder::init` does not auto-resolve
+        // the dictionary (it skips dict lookup whether the header carries
+        // the synthetic dictID or, in older frames, omits it), so the
+        // raw-content branch below uses `force_dict` after `init` to apply
+        // it explicitly.
         //
         // For finalized dicts the frame embeds the dictID from the dict header;
         // `init` loads the matching dict automatically. `decode_all_to_vec`
@@ -795,74 +735,6 @@ mod tests {
             matches!(result, Err(crate::Error::DecompressedSizeTooLarge { .. })),
             "capacity=0 with non-empty frame must return DecompressedSizeTooLarge; got {result:?}",
         );
-    }
-
-    // --- strip_dict_id unit tests ---
-    //
-    // These tests call `strip_dict_id` directly with crafted frame byte sequences
-    // to cover branches that are unreachable via normal compress_with_dict calls
-    // (e.g., frames that are too short, have no dict_id, or use narrow dict_id
-    // encodings). `strip_dict_id` only reads the header region, so the crafted
-    // frames do not need valid block data.
-
-    #[test]
-    fn strip_dict_id_unchanged_if_frame_too_short() {
-        // Frames shorter than 5 bytes cannot contain a Frame_Header_Descriptor —
-        // the function must return the input unchanged.
-        let short = vec![0x28_u8, 0xB5, 0x2F];
-        assert_eq!(strip_dict_id(short.clone()), short);
-    }
-
-    #[test]
-    fn strip_dict_id_unchanged_if_no_dict_id_flag() {
-        // FHD = 0x20: single_segment=1 (bit5), dict_id_flag=0 (bits[1:0]).
-        // No Dict_ID field present — frame must be returned unchanged.
-        let frame = vec![0x28_u8, 0xB5, 0x2F, 0xFD, 0x20, 0xAA];
-        assert_eq!(strip_dict_id(frame.clone()), frame);
-    }
-
-    #[test]
-    fn strip_dict_id_removes_1byte_dict_id() {
-        // FHD = 0x21: single_segment=1, dict_id_flag=1 → 1-byte Dict_ID.
-        // Frame layout: magic(4) + FHD(1) + dict_id(1) + rest(1) = 7 bytes.
-        let frame = vec![0x28_u8, 0xB5, 0x2F, 0xFD, 0x21, 0x42, 0xFF];
-        let stripped = strip_dict_id(frame);
-        // Expect: magic + FHD (bits[1:0] cleared) + rest; dict_id byte removed.
-        assert_eq!(stripped, vec![0x28_u8, 0xB5, 0x2F, 0xFD, 0x20, 0xFF]);
-    }
-
-    #[test]
-    fn strip_dict_id_removes_2byte_dict_id() {
-        // FHD = 0x22: single_segment=1, dict_id_flag=2 → 2-byte Dict_ID.
-        // Frame layout: magic(4) + FHD(1) + dict_id(2) + rest(1) = 8 bytes.
-        let frame = vec![0x28_u8, 0xB5, 0x2F, 0xFD, 0x22, 0x01, 0x02, 0xFF];
-        let stripped = strip_dict_id(frame);
-        // Expect: magic + FHD (bits[1:0] cleared) + rest; 2 dict_id bytes removed.
-        assert_eq!(stripped, vec![0x28_u8, 0xB5, 0x2F, 0xFD, 0x20, 0xFF]);
-    }
-
-    #[test]
-    fn strip_dict_id_unchanged_if_malformed_too_short_for_dict_id() {
-        // FHD = 0x21 claims a 1-byte dict_id at byte 5, but only 5 bytes total —
-        // frame is malformed and must be returned unchanged.
-        let frame = vec![0x28_u8, 0xB5, 0x2F, 0xFD, 0x21]; // only 5 bytes
-        assert_eq!(strip_dict_id(frame.clone()), frame);
-    }
-
-    #[test]
-    fn strip_dict_id_preserves_window_descriptor_in_multi_segment_frame() {
-        // FHD = 0x03: single_segment=0 (bit5 clear), dict_id_flag=3 → 4-byte Dict_ID.
-        // Frame layout: magic(4) + FHD(1) + WD(1) + dict_id(4) + rest(1) = 11 bytes.
-        let frame = vec![
-            0x28_u8, 0xB5, 0x2F, 0xFD, // magic
-            0x03, // FHD: single_segment=0, dict_id_flag=3
-            0x70, // Window_Descriptor
-            0x01, 0x02, 0x03, 0x04, // 4-byte Dict_ID
-            0xFF, // rest
-        ];
-        let stripped = strip_dict_id(frame);
-        // Expect: magic + FHD (bits[1:0] cleared to 0x00) + WD (preserved) + rest.
-        assert_eq!(stripped, vec![0x28_u8, 0xB5, 0x2F, 0xFD, 0x00, 0x70, 0xFF]);
     }
 
     // --- bounded_read error-path tests ---
