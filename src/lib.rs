@@ -88,6 +88,21 @@
 #![warn(clippy::multiple_crate_versions)]
 #![allow(clippy::option_if_let_else)]
 #![warn(clippy::redundant_feature_names)]
+// The `#[test_log::test]` attribute macro expands to a body that places
+// `use` items after statements, which trips `items_after_statements` in
+// the test build (`clippy --all-targets`). The lint fires only on the
+// macro's generated code, not on anything hand-written, so allow it
+// crate-wide rather than annotating every instrumented test.
+#![allow(clippy::items_after_statements)]
+// Test fixtures routinely bind closely-named locals (`dict_a` / `dict_b`,
+// `tree_1` / `tree_2`) where the similarity is the point; `similar_names`
+// is pedantic noise on that style.
+#![allow(clippy::similar_names)]
+// Long scenario tests (fuzz harnesses, multi-phase integration cases)
+// legitimately run past the `too_many_lines` ceiling; splitting them
+// would obscure the scenario. The lint is only reached under
+// `--all-targets`, which lints test bodies.
+#![allow(clippy::too_many_lines)]
 #![cfg_attr(coverage_nightly, feature(coverage_attribute))]
 
 // `alloc` is the minimal hard dependency — the crate uses `Arc`, `Vec`,
