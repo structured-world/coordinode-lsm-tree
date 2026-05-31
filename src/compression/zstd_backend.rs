@@ -168,18 +168,17 @@ fn do_decompress_with_dict(
     is_raw_content: bool,
 ) -> crate::Result<Vec<u8>> {
     if is_raw_content {
-        // Raw-content dict path: frames have no embedded dictID
-        // (C API and post-strip pure frames both produce dictID=0).
-        // `decode_all_to_vec` calls `init` internally, which would
-        // skip dict loading for dictID=0. Instead, use the manual
-        // flow: `init` → `force_dict` → `decode_blocks` → `collect`.
+        // Raw-content dict path. `FrameDecoder::init` does not
+        // auto-resolve a raw-content dictionary, so drive the decode
+        // manually: `init` → `force_dict` → `decode_blocks` → `collect`.
         //
-        // `force_dict` loads the dict unconditionally regardless of
-        // the frame's dictID field, handling both backends uniformly:
-        //   - Frame produced by C FFI backend (dictID=0 → no id): force_dict loads dict.
-        //   - Frame produced by new pure backend (dictID stripped → no id): same.
-        //   - Frame produced by old pure backend (dictID=synthetic): force_dict
-        //     re-loads same dict (idempotent, since init would already load it).
+        // `force_dict` applies the dictionary regardless of whether the
+        // frame header carries a dictID, so one path covers both on-disk
+        // shapes:
+        //   - newer frames that keep the synthetic xxh3 dictID in the
+        //     header, and
+        //   - older frames written before the id was retained (header
+        //     omits it).
         let mut cursor = std::io::Cursor::new(data);
         decoder
             .init(&mut cursor)
@@ -425,11 +424,11 @@ impl CompressionProvider for ZstdProvider {
                 const { std::cell::RefCell::new(None) };
         }
 
-        // For raw-content dicts the compressed frame has no embedded dictID
-        // (stripped by `compress_with_dict`; the C FFI backend also omits it).
-        // `FrameDecoder::init` treats a missing or zero dictID as "no dict
-        // required" and skips dict lookup. We use `force_dict` after `init`
-        // to load the dict unconditionally for raw-content frames.
+        // For raw-content dicts `FrameDecoder::init` does not auto-resolve
+        // the dictionary (it skips dict lookup whether the header carries
+        // the synthetic dictID or, in older frames, omits it), so the
+        // raw-content branch below uses `force_dict` after `init` to apply
+        // it explicitly.
         //
         // For finalized dicts the frame embeds the dictID from the dict header;
         // `init` loads the matching dict automatically. `decode_all_to_vec`
