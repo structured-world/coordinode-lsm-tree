@@ -419,7 +419,6 @@ fn decode_with_missing(
 )]
 mod tests {
     use super::*;
-    use structured_zstd::skippable::SkippableFrame;
 
     fn sample_ciphertext(len: usize) -> Vec<u8> {
         (0..len)
@@ -479,9 +478,15 @@ mod tests {
         ));
     }
 
+    // Gated on `zstd_any`: `SkippableFrame` comes from the optional
+    // `structured-zstd` dep, which is only in the graph when a zstd
+    // feature is on. Without this gate, `cargo test --features
+    // encryption,page_ecc` (no zstd) fails to compile.
+    #[cfg(zstd_any)]
     #[test]
     fn payload_wraps_in_variant_2_skippable_frame() {
         // Confirms the EccFrame magic lands at 0x184D2A52 (variant 2).
+        use structured_zstd::skippable::SkippableFrame;
         let ct = sample_ciphertext(512);
         let payload = encode_ecc_payload(&ct, EccScheme::RS_14_10).expect("encode");
         let frame = SkippableFrame::new(ECC_FRAME_VARIANT, payload).expect("frame");
