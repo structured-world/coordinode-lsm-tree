@@ -129,6 +129,17 @@ pub fn encode_ecc_payload(ciphertext: &[u8], scheme: EccScheme) -> crate::Result
             "degenerate ECC scheme: data_shards and parity_shards must be non-zero",
         ));
     }
+    // Mirror the reader-side cap in `parse_ecc_payload`: bound the scheme
+    // to RS_14_10's shard budget (parity <= 4, total <= 14). Without
+    // this, the encoder could emit a trailer the same build always
+    // rejects on read as `MalformedEccFrame`.
+    if scheme.parity_shards > EccScheme::RS_14_10.parity_shards
+        || scheme.total_shards() > EccScheme::RS_14_10.total_shards()
+    {
+        return Err(crate::Error::Encrypt(
+            "ECC scheme exceeds supported shard budget",
+        ));
+    }
     let data = scheme.data_shards as usize;
     let parity = scheme.parity_shards as usize;
     let sb = stripe_size(ciphertext.len(), data);
