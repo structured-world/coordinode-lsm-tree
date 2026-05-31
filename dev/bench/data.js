@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1780249782633,
+  "lastUpdate": 1780268447433,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -11466,6 +11466,84 @@ window.BENCHMARK_DATA = {
             "value": 445846.7205591767,
             "unit": "ops/sec",
             "extra": "P50: 2.0us | P99: 6.8us | P99.9: 10.0us\nthreads: 1 | elapsed: 0.45s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "f92bd12edaeb3f19094d77830f15a6a54af5dad7",
+          "message": "docs: fix broken and redundant intra-doc links across the crate (#368)\n\n## Summary\n\n`cargo doc --no-deps --all-features -D warnings` failed with **47\ndocumentation errors** across 20 files. This fixes every one; the strict\ndoc build is now clean.\n\nThe errors fell into three classes:\n\n1. **Broken intra-doc links (most of them)** — shorthand `[`name`]` refs\nthat rustdoc could not resolve:\n- trait methods referenced from the trait's own docs needed `Self::` /\n`Trait::` (e.g. `SequenceNumberGenerator::next`, `MergeSource::seek`)\n- crate types referenced from submodules needed `crate::` paths (e.g.\n`crate::PinnableSlice`, `crate::WriteBatch`, `crate::BlobTree`,\n`crate::Config`)\n2. **Public docs linking to private items** — `BurrBuilder` →\n`compute_thresholds`, `encryption` → `error`, `table_id` →\n`crate::vlog::BlobFileId`, etc. Rendered as inline code (cannot link a\npublic doc to a private item).\n3. **Redundant explicit link target** — `[`MemFs`](crate::fs::MemFs)`\nwhere the label already names the target.\n\n## Fix strategy\n\nEach link handled individually:\n- item is public → add the correct resolvable path\n- item is private or feature-gated (so absent from some doc builds) →\nrender as inline `code`\n\nNo code or behaviour changes — docs only.\n\n## Testing\n\n- `cargo doc --no-deps --all-features -D warnings` — **clean** (was 47\nerrors). This is the configuration docs.rs builds (`all-features = true`\nin `Cargo.toml`).\n- `cargo build --all-features` — clean.\n- `cargo test --doc --all-features` — 43 passed.\n\n## Note (out of scope)\n\nUnder the narrower `--no-default-features --features\nencryption,page_ecc` doc build there remain ~5 broken links in\nfeature-gated code (`pinnable_slice::Pinned`, `transform::with_dict`,\nzstd-dict refs in `inspect`). That combination is not built by docs.rs\n(which uses all-features) and is not gated by CI.\n`src/table/block/transform.rs` also carries some pre-existing duplicated\ndoc prose unrelated to links. Both are left for a separate follow-up to\nkeep this PR a clean all-features doc-lint fix.\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n\n## Summary by CodeRabbit\n\n* **Documentation**\n* Improved consistency and clarity of documentation comments and\nreferences throughout the codebase, including better formatting and\nfully-qualified paths for inline code references.\n\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-06-01T01:59:49+03:00",
+          "tree_id": "27baa5c6d1a334319f01ae6f630e3b01e254ba27",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/f92bd12edaeb3f19094d77830f15a6a54af5dad7"
+        },
+        "date": 1780268446533,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 2081236.617518472,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.6us | P99.9: 3.7us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1144702.5407170837,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.2us | P99.9: 4.3us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 525148.0909082704,
+            "unit": "ops/sec",
+            "extra": "P50: 1.8us | P99: 4.9us | P99.9: 7.4us\nthreads: 1 | elapsed: 0.38s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3655807.74779723,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 3.0us | P99.9: 5.3us\nthreads: 1 | elapsed: 0.05s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 381188.2268277926,
+            "unit": "ops/sec",
+            "extra": "P50: 2.3us | P99: 5.5us | P99.9: 8.1us\nthreads: 1 | elapsed: 0.52s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 205073.43579762615,
+            "unit": "ops/sec",
+            "extra": "P50: 4.5us | P99: 5.7us | P99.9: 7.9us\nthreads: 1 | elapsed: 0.98s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1234631.919185933,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.2us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1115140.696799902,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 1.4us | P99.9: 1.9us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 460508.89082986733,
+            "unit": "ops/sec",
+            "extra": "P50: 2.0us | P99: 5.4us | P99.9: 7.8us\nthreads: 1 | elapsed: 0.43s | num: 200000 | iterations: 3"
           }
         ]
       }
