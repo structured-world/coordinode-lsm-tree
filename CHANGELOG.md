@@ -11,6 +11,77 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [5.0.0](https://github.com/structured-world/coordinode-lsm-tree/compare/v4.5.0...v5.0.0) - 2026-05-31
+
+### Added
+
+- *(encryption)* outer Reed-Solomon ECC frame codec over block ciphertext ([#365](https://github.com/structured-world/coordinode-lsm-tree/pull/365))
+- *(manifest)* Blocks-based manifest hardening ([#297](https://github.com/structured-world/coordinode-lsm-tree/pull/297)) ([#357](https://github.com/structured-world/coordinode-lsm-tree/pull/357))
+- *(config)* runtime-toggleable RuntimeConfig foundation ([#352](https://github.com/structured-world/coordinode-lsm-tree/pull/352)) ([#355](https://github.com/structured-world/coordinode-lsm-tree/pull/355))
+- *(version)* PointInTimeRecovery + SkipAnyCorruptedRecords + per-record framing ([#323](https://github.com/structured-world/coordinode-lsm-tree/pull/323)) ([#342](https://github.com/structured-world/coordinode-lsm-tree/pull/342))
+- *(io)* local Read/Write/Seek trait surface to lift Fs off std::io ([#311](https://github.com/structured-world/coordinode-lsm-tree/pull/311)) ([#347](https://github.com/structured-world/coordinode-lsm-tree/pull/347))
+- *(bench)* foundation for compare-rocksdb head-to-head harness ([#244](https://github.com/structured-world/coordinode-lsm-tree/pull/244)) ([#345](https://github.com/structured-world/coordinode-lsm-tree/pull/345))
+- *(encryption)* top-level encrypt_block/decrypt_block + KeyChain + wire format ([#251](https://github.com/structured-world/coordinode-lsm-tree/pull/251)) ([#344](https://github.com/structured-world/coordinode-lsm-tree/pull/344))
+- *(ecc)* per-block Reed-Solomon Page ECC ([#267](https://github.com/structured-world/coordinode-lsm-tree/pull/267)) ([#343](https://github.com/structured-world/coordinode-lsm-tree/pull/343))
+- *(sst-dump)* dump subcommand + public inspect::iter_data_block_entries facade ([#335](https://github.com/structured-world/coordinode-lsm-tree/pull/335))
+- *(sst-dump)* filter-stats subcommand + public inspect::read_filter_stats facade ([#334](https://github.com/structured-world/coordinode-lsm-tree/pull/334))
+- *(encryption)* AEAD dispatch with AES-256-GCM + ChaCha20-Poly1305 (#251 PR2) ([#338](https://github.com/structured-world/coordinode-lsm-tree/pull/338))
+- *(encryption)* AAD construction + decode-time error types (#251 foundation) ([#336](https://github.com/structured-world/coordinode-lsm-tree/pull/336))
+- *(sst-dump)* index-dump subcommand + public inspect facade extension ([#333](https://github.com/structured-world/coordinode-lsm-tree/pull/333))
+- *(sst-dump)* properties subcommand + public inspect facade ([#328](https://github.com/structured-world/coordinode-lsm-tree/pull/328))
+- *(table)* mirror TLI block near file tail for torn-write safety ([#325](https://github.com/structured-world/coordinode-lsm-tree/pull/325))
+- *(sst-dump)* hex subcommand for raw block-region dump with header decode ([#327](https://github.com/structured-world/coordinode-lsm-tree/pull/327))
+- *(tooling)* sst-dump CLI scaffold + verify subcommand ([#301](https://github.com/structured-world/coordinode-lsm-tree/pull/301)) ([#316](https://github.com/structured-world/coordinode-lsm-tree/pull/316))
+- *(config)* ManifestRecoveryMode + TolerateCorruptedTailRecords ([#299](https://github.com/structured-world/coordinode-lsm-tree/pull/299)) ([#317](https://github.com/structured-world/coordinode-lsm-tree/pull/317))
+- *(verify)* per-block XXH3 scrub for proactive bit-rot detection (#300 part 1) ([#313](https://github.com/structured-world/coordinode-lsm-tree/pull/313))
+- *(fs)* FileHint enum + FsFile::hint() primitive for posix_fadvise (#133 Phase 1a) ([#307](https://github.com/structured-world/coordinode-lsm-tree/pull/307))
+- *(seeking-merger)* allow self-coordinating independent-cursor sources via broadened CoherentMergeSource ([#280](https://github.com/structured-world/coordinode-lsm-tree/pull/280)) ([#305](https://github.com/structured-world/coordinode-lsm-tree/pull/305))
+- *(range)* wire SeekingMerger into Tree::range read path ([#222](https://github.com/structured-world/coordinode-lsm-tree/pull/222)) ([#288](https://github.com/structured-world/coordinode-lsm-tree/pull/288))
+- *(merge)* SeekingMerger — RocksDB-style dual loser trees ([#222](https://github.com/structured-world/coordinode-lsm-tree/pull/222)) ([#284](https://github.com/structured-world/coordinode-lsm-tree/pull/284))
+- *(checkpoint)* [**breaking**] hard-link snapshot for PITR backup (V5 storage) ([#276](https://github.com/structured-world/coordinode-lsm-tree/pull/276))
+- *(filter)* replace standard bloom with BuRR ([#269](https://github.com/structured-world/coordinode-lsm-tree/pull/269))
+
+### Documentation
+
+- fix broken and redundant intra-doc links across the crate ([#368](https://github.com/structured-world/coordinode-lsm-tree/pull/368))
+- *(format_version)* document on-disk version bump policy ([#360](https://github.com/structured-world/coordinode-lsm-tree/pull/360))
+- add Manifest recovery modes section to README ([#332](https://github.com/structured-world/coordinode-lsm-tree/pull/332))
+- *(encryption)* AAD-bound encrypted block wire format spec ([#250](https://github.com/structured-world/coordinode-lsm-tree/pull/250)) ([#318](https://github.com/structured-world/coordinode-lsm-tree/pull/318))
+
+### Fixed
+
+- *(compaction/leveled)* tie level-count assertion to config ([#359](https://github.com/structured-world/coordinode-lsm-tree/pull/359))
+- *(table/index)* default partitioned index ON at every level ([#329](https://github.com/structured-world/coordinode-lsm-tree/pull/329)) ([#340](https://github.com/structured-world/coordinode-lsm-tree/pull/340))
+- *(table)* mirror meta block at mid-file for tail-corruption resilience ([#295](https://github.com/structured-world/coordinode-lsm-tree/pull/295)) ([#314](https://github.com/structured-world/coordinode-lsm-tree/pull/314))
+
+### Performance
+
+- *(zstd)* retain dictionary id in frame header ([#366](https://github.com/structured-world/coordinode-lsm-tree/pull/366))
+- *(fs)* O_DIRECT foundation — AlignedBuf + FsOpenOptions::direct_io (#133 phase 2) ([#310](https://github.com/structured-world/coordinode-lsm-tree/pull/310))
+- *(table/scanner)* bump compaction readahead 32 KiB → 2 MiB (#133 Phase 1c) ([#308](https://github.com/structured-world/coordinode-lsm-tree/pull/308))
+- *(ci)* proptest env-var budgets + slow-timeout audit (#158 items 2-5) ([#306](https://github.com/structured-world/coordinode-lsm-tree/pull/306))
+- *(table)* add Table::batch_get for sorted multi-key point reads (#223 phase 1) ([#290](https://github.com/structured-world/coordinode-lsm-tree/pull/290))
+- *(loser_tree)* eliminate comparator dispatch, close #283 fully ([#287](https://github.com/structured-world/coordinode-lsm-tree/pull/287))
+- *(loser_tree)* close N≥16 regression, reduce small-N gap (#283 partial) ([#286](https://github.com/structured-world/coordinode-lsm-tree/pull/286))
+- *(compression)* pre-parse zstd dict once via OnceCell + no-std foundation ([#273](https://github.com/structured-world/coordinode-lsm-tree/pull/273))
+
+### Refactored
+
+- *(block)* collapse 4 Block I/O paths into a single BlockTransform enum ([#248](https://github.com/structured-world/coordinode-lsm-tree/pull/248)) ([#337](https://github.com/structured-world/coordinode-lsm-tree/pull/337))
+- *(block)* [**breaking**] thread BlockIdentity through Block I/O API ([#252](https://github.com/structured-world/coordinode-lsm-tree/pull/252)) ([#294](https://github.com/structured-world/coordinode-lsm-tree/pull/294))
+- *(table/block/tests)* extract write_block_to_tempfile helper (#128 part 1) ([#293](https://github.com/structured-world/coordinode-lsm-tree/pull/293))
+- *(filter/burr)* re-deny indexing/expect/unwrap with per-site justifications ([#270](https://github.com/structured-world/coordinode-lsm-tree/pull/270)) ([#282](https://github.com/structured-world/coordinode-lsm-tree/pull/282))
+
+### Testing
+
+- *(encryption)* AAD threat-model regression suite (first wave) ([#361](https://github.com/structured-world/coordinode-lsm-tree/pull/361))
+- *(table/index)* tighten blast-radius assertion to corruption variants ([#341](https://github.com/structured-world/coordinode-lsm-tree/pull/341))
+- triage all #[ignore] annotations across the crate ([#326](https://github.com/structured-world/coordinode-lsm-tree/pull/326))
+- *(table)* pin global-seqno translation on Table::get return path ([#321](https://github.com/structured-world/coordinode-lsm-tree/pull/321)) ([#322](https://github.com/structured-world/coordinode-lsm-tree/pull/322))
+- *(verify)* pin DataReadError routing for truncated data segment ([#315](https://github.com/structured-world/coordinode-lsm-tree/pull/315)) ([#319](https://github.com/structured-world/coordinode-lsm-tree/pull/319))
+- *(encryption)* mixed-load stress test across encryption × compression matrix (#128 part 2) ([#304](https://github.com/structured-world/coordinode-lsm-tree/pull/304))
+- *(bench)* P99/P999 tail-latency reporting for BuRR/ribbon probes ([#271](https://github.com/structured-world/coordinode-lsm-tree/pull/271)) ([#281](https://github.com/structured-world/coordinode-lsm-tree/pull/281))
+
 ## [4.5.0](https://github.com/structured-world/coordinode-lsm-tree/compare/v4.4.0...v4.5.0) - 2026-05-19
 
 ### Added
