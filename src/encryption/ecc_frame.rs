@@ -118,7 +118,7 @@ fn stripe_size(len: usize, data_shards: usize) -> usize {
 /// `ciphertext` under `scheme`.
 ///
 /// The returned bytes are the skippable-frame *payload* — the caller
-/// wraps them in a [`structured_zstd::skippable::SkippableFrame`] at
+/// wraps them in a `structured_zstd::skippable::SkippableFrame` at
 /// [`ECC_FRAME_VARIANT`] and appends the result after the `BodyFrame`.
 ///
 /// # Errors
