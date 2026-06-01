@@ -1181,6 +1181,56 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "test footered block is tiny"
+    )]
+    fn from_loaded_shrinks_uncompressed_length_to_stripped_inner() -> crate::Result<()> {
+        use crate::runtime_config::ChecksumAlgorithm;
+        use crate::table::block::kv_checksum::kv_digest;
+
+        // from_loaded strips the per-KV footer from `data`; it must also
+        // shrink `uncompressed_length` to the stripped inner length.
+        // Leaving it at the footered length makes the in-memory Block
+        // internally inconsistent (header size > slice length) and makes
+        // cache weighing over-count footer bytes for kv-checked blocks.
+        let items = [
+            InternalValue::from_components(b"alpha".to_vec(), b"first".to_vec(), 30, Value),
+            InternalValue::from_components(b"bravo".to_vec(), b"second".to_vec(), 20, Value),
+        ];
+        let algo = ChecksumAlgorithm::Xxh3_64;
+        let digests: Vec<u64> = items
+            .iter()
+            .map(|it| kv_digest(it, algo).expect("xxh3 always available"))
+            .collect();
+
+        let mut bytes = Vec::new();
+        DataBlock::encode_kv_checked_into(&mut bytes, &items, &digests, algo, 2, 0.0)?;
+        let footered_len = bytes.len();
+
+        let loaded = DataBlock::from_loaded(Block {
+            data: bytes.into(),
+            header: Header {
+                block_flags: crate::table::block::header::block_flags::KV_CHECKSUM_FOOTER,
+                // Header size includes the footer, as the on-disk header does.
+                uncompressed_length: footered_len as u32,
+                ..Header::test_dummy(BlockType::Data)
+            },
+        })?;
+
+        let inner_len = loaded.as_slice().len();
+        assert!(
+            inner_len < footered_len,
+            "footer must have been stripped: inner {inner_len} vs footered {footered_len}",
+        );
+        assert_eq!(
+            loaded.inner.header.uncompressed_length as usize, inner_len,
+            "uncompressed_length must match the stripped inner slice length",
+        );
+        Ok(())
+    }
+
+    #[test]
     fn data_block_ping_pong_fuzz_1() -> crate::Result<()> {
         let items = [
             InternalValue::from_components(

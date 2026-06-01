@@ -3038,5 +3038,47 @@ mod tests {
             }
             Ok(())
         }
+
+        #[test]
+        fn ecc_parity_bit_agrees_with_emitted_parity_length() -> crate::Result<()> {
+            use crate::table::block::header::block_flags;
+
+            // Empty payload: the Reed-Solomon encoder short-circuits to a
+            // zero-length parity trailer even under PlainEcc, so the
+            // presence-authoritative ECC_PARITY bit must stay CLEAR and
+            // agree with ecc_length == 0. (Before the fix the bit was set
+            // straight from transform.page_ecc(), violating the
+            // "bit ⇔ ecc_length > 0" invariant for an empty payload.)
+            let mut empty_buf = vec![];
+            let empty = Block::write_into(
+                &mut empty_buf,
+                &[],
+                BlockIdentity::for_test(0, 0, BlockType::Data),
+                &BlockTransform::PlainEcc,
+            )?;
+            assert_eq!(empty.ecc_length, 0, "empty payload emits no parity");
+            assert_eq!(
+                empty.block_flags & block_flags::ECC_PARITY,
+                0,
+                "ECC_PARITY must be clear when no parity trailer is emitted",
+            );
+
+            // Non-empty payload: parity is emitted, so the bit is set and
+            // agrees with ecc_length > 0.
+            let mut full_buf = vec![];
+            let full = Block::write_into(
+                &mut full_buf,
+                PAYLOAD,
+                BlockIdentity::for_test(0, 0, BlockType::Data),
+                &BlockTransform::PlainEcc,
+            )?;
+            assert!(full.ecc_length > 0, "non-empty payload emits parity");
+            assert_ne!(
+                full.block_flags & block_flags::ECC_PARITY,
+                0,
+                "ECC_PARITY must be set when a parity trailer is emitted",
+            );
+            Ok(())
+        }
     }
 }
