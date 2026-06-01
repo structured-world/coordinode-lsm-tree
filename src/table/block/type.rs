@@ -40,6 +40,14 @@ pub enum BlockType {
     ManifestFooter,
 }
 
+// Wire tags are renumbered contiguously `0..=6` for V5. The previous
+// non-contiguous numbering (Manifest/ManifestFooter at 7/8, with holes left
+// by the removed `DataKvChecked` / `FilterKvChecked` variants) is NOT kept:
+// V5 is a pre-release on-disk format (block magic bumped to `[L,S,M,4]`, see
+// `crate::file::MAGIC_BYTES`), so any in-development V5 artifact is
+// regenerated rather than migrated, and released pre-V5 tables are already
+// rejected at the magic check before a BlockType byte is ever read. No
+// compatibility shim or format-discriminator bump is added for the renumber.
 impl From<BlockType> for u8 {
     fn from(val: BlockType) -> Self {
         match val {

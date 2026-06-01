@@ -127,8 +127,10 @@ impl<'a> Ingestion<'a> {
         writer = writer.use_page_ecc(tree.config.page_ecc);
 
         // Per-KV checksums follow the live runtime config snapshot (same as
-        // the flush / compaction write paths). `Off` (default) keeps
-        // ingested data blocks byte-identical to the pre-per-KV format.
+        // the flush / compaction write paths). `Off` (default) emits no
+        // per-KV footer and leaves the `KV_CHECKSUM_FOOTER` flag clear (the
+        // data-block payload encoding is unchanged; the V5 header/meta layout
+        // still differs from pre-V5 regardless).
         {
             let rc = tree.0.runtime_config.load_full();
             writer = writer.use_kv_checksums(rc.kv_checksums, rc.kv_checksum_algo);

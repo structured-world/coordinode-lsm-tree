@@ -431,7 +431,9 @@ impl MultiWriter {
     /// Wires the runtime `kv_checksums` policy + algorithm through to the
     /// inner [`Writer`] and preserves it across rotations so every
     /// successor writer applies the same per-KV checksum setting. `Off`
-    /// leaves data blocks byte-identical to the pre-per-KV format.
+    /// emits no per-KV footer and leaves the `KV_CHECKSUM_FOOTER` flag clear
+    /// (the data-block payload encoding is unchanged; the V5 header/meta
+    /// layout still differs from pre-V5 regardless).
     #[must_use]
     pub fn use_kv_checksums(
         mut self,
