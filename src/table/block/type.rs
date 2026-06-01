@@ -2,12 +2,27 @@
 // Copyright (c) 2025-present, fjall-rs
 // Copyright (c) 2026-present, Structured World Foundation
 
+/// The mutually-exclusive ROLE of a block within a table file.
+///
+/// `BlockType` answers "what is this block and which parser decodes
+/// its logical structure" — not "how was its payload post-processed".
+/// Orthogonal, composable transform layers (compression, encryption,
+/// Reed-Solomon ECC, per-KV checksum footer) are NOT roles: they
+/// stack on top of a block of any role and are recorded in the block
+/// header's `block_flags` bitfield, not here. A compressed, encrypted,
+/// per-KV-checked data block is still `BlockType::Data` with three
+/// transform bits set.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum BlockType {
+    /// User key/value entries (the SST data payload).
     Data,
+    /// Block handles (offset/size/key/seqno) pointing at data blocks.
     Index,
+    /// Bloom / Ribbon filter bit arrays.
     Filter,
+    /// Sorted key/value table properties (the SST metadata section).
     Meta,
+    /// Range tombstone entries, written as a separate block.
     RangeTombstone,
     /// One section of the Blocks-based manifest (e.g. `tables`,
     /// `blob_files`, `format_version`). Payload is the raw section
@@ -33,12 +48,8 @@ impl From<BlockType> for u8 {
             BlockType::Filter => 2,
             BlockType::Meta => 3,
             BlockType::RangeTombstone => 4,
-            // Wire tags 5 and 6 are reserved for the parallel V5-3
-            // per-KV protection feature (`DataKvChecked` /
-            // `FilterKvChecked`); manifest blocks take 7 and 8 to
-            // avoid collision in shipped V5 files.
-            BlockType::Manifest => 7,
-            BlockType::ManifestFooter => 8,
+            BlockType::Manifest => 5,
+            BlockType::ManifestFooter => 6,
         }
     }
 }
@@ -53,10 +64,54 @@ impl TryFrom<u8> for BlockType {
             2 => Ok(Self::Filter),
             3 => Ok(Self::Meta),
             4 => Ok(Self::RangeTombstone),
-            // 5, 6 reserved for V5-3 per-KV checked variants.
-            7 => Ok(Self::Manifest),
-            8 => Ok(Self::ManifestFooter),
+            5 => Ok(Self::Manifest),
+            6 => Ok(Self::ManifestFooter),
             _ => Err(crate::Error::InvalidTag(("BlockType", value))),
         }
+    }
+}
+
+#[expect(clippy::expect_used, reason = "test code")]
+#[cfg(test)]
+mod tests {
+    use super::BlockType;
+
+    #[test]
+    fn block_type_wire_tags_roundtrip_all_variants() {
+        // Every variant must survive a u8 -> BlockType -> u8 round-trip
+        // on its locked, contiguous wire tag. Per-KV checking is a
+        // transform flag (header block_flags), not a block role, so
+        // there is no checked-twin variant here — a checked data block
+        // is BlockType::Data with the KV_CHECKSUM_FOOTER bit set.
+        for (tag, variant) in [
+            (0u8, BlockType::Data),
+            (1, BlockType::Index),
+            (2, BlockType::Filter),
+            (3, BlockType::Meta),
+            (4, BlockType::RangeTombstone),
+            (5, BlockType::Manifest),
+            (6, BlockType::ManifestFooter),
+        ] {
+            assert_eq!(
+                u8::from(variant),
+                tag,
+                "{variant:?} must encode to wire tag {tag}"
+            );
+            assert_eq!(
+                BlockType::try_from(tag).expect("known tag must decode"),
+                variant,
+                "wire tag {tag} must decode to {variant:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn block_type_rejects_unknown_wire_tag() {
+        // Forward-incompatibility guard: a tag this build doesn't know
+        // (newer writer, older reader) must surface as a typed error,
+        // not a silent coercion to a known variant. 7 is the first
+        // unused tag past the contiguous range.
+        assert!(BlockType::try_from(7).is_err());
+        assert!(BlockType::try_from(255).is_err());
     }
 }

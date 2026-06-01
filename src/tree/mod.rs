@@ -505,6 +505,14 @@ impl AbstractTree for Tree {
         table_writer = table_writer.use_encryption(self.config.encryption.clone());
         table_writer = table_writer.use_page_ecc(self.config.page_ecc);
 
+        // Per-KV checksums follow the LIVE runtime config snapshot so a
+        // toggle via `update_runtime_config` takes effect on the next
+        // flush. `Off` (default) leaves data blocks byte-identical.
+        {
+            let rc = self.0.runtime_config.load_full();
+            table_writer = table_writer.use_kv_checksums(rc.kv_checksums, rc.kv_checksum_algo);
+        }
+
         #[cfg(zstd_any)]
         {
             table_writer = table_writer.use_zstd_dictionary(self.config.zstd_dictionary.clone());

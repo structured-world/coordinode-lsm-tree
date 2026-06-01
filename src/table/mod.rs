@@ -248,6 +248,10 @@ impl Table {
     }
 
     fn load_data_block(&self, handle: &BlockHandle) -> crate::Result<DataBlock> {
+        // `from_loaded` transparently strips the per-KV checksum footer when
+        // the block's KV_CHECKSUM_FOOTER header flag is set, so the rest of
+        // the read path is unchanged regardless of the kv-checksum policy
+        // the writer used.
         self.load_block(
             handle,
             BlockType::Data,
@@ -255,12 +259,51 @@ impl Table {
             #[cfg(zstd_any)]
             self.zstd_dictionary.as_deref(),
         )
-        .map(DataBlock::new)
+        .and_then(DataBlock::from_loaded)
     }
 
     /// Returns the (possibly compressed) file size.
     pub(crate) fn file_size(&self) -> u64 {
         self.metadata.file_size
+    }
+
+    /// Scrub: verifies the per-KV checksum footer of every footer-bearing
+    /// data block in this table (those with the `KV_CHECKSUM_FOOTER` header
+    /// flag set), decoding each block and recomputing each entry's
+    /// logical-content digest.
+    ///
+    /// Data blocks without the footer flag are skipped. This is the
+    /// paranoid / offline integrity path — the live read path does NOT
+    /// verify per-entry digests (the block-level checksum already covers
+    /// the on-disk bytes). Stops and returns on the first detected mismatch.
+    ///
+    /// # Errors
+    ///
+    /// - [`crate::Error::ChecksumMismatch`] if any entry's recomputed digest
+    ///   disagrees with the stored value (corruption of the entry bytes or
+    ///   the stored digest).
+    /// - Any I/O / decode error encountered while loading a block.
+    pub(crate) fn verify_kv_checksums(&self) -> crate::Result<()> {
+        for handle in self.block_index.iter() {
+            let handle = handle?;
+            let block_handle = BlockHandle::new(handle.offset(), handle.size());
+            // Load the RAW block (footer intact) — do NOT route through
+            // `load_data_block`, which strips the footer via `from_loaded`.
+            let block = self.load_block(
+                &block_handle,
+                BlockType::Data,
+                self.metadata.data_block_compression,
+                #[cfg(zstd_any)]
+                self.zstd_dictionary.as_deref(),
+            )?;
+            if block.header.block_flags
+                & crate::table::block::header::block_flags::KV_CHECKSUM_FOOTER
+                != 0
+            {
+                DataBlock::verify_kv_checked(&block.data, block.header, self.comparator.clone())?;
+            }
+        }
+        Ok(())
     }
 
     /// Loads the filter block (if any) and checks the bloom filter.

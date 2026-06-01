@@ -65,6 +65,9 @@ pub fn load_block(
     }
 
     if let Some(block) = cache.get_block(table_id, handle.offset()) {
+        // Per-KV checking is a header flag, not a block type, so a data
+        // block is always BlockType::Data on disk — an exact role match is
+        // the right swap-defence check here.
         if block.header.block_type != block_type {
             return Err(crate::Error::InvalidTag((
                 "BlockType",

@@ -75,6 +75,31 @@ impl ChecksumAlgorithm {
         }
     }
 
+    /// Compute the digest of `bytes` under this algorithm, returned as a
+    /// `u64` (the low [`Self::digest_size`] bytes are the meaningful
+    /// digest; wider algorithms fill more of the word).
+    ///
+    /// Returns `None` when the selected algorithm is not compiled into
+    /// this build: [`Self::Crc32c`] needs the `crc32c` cargo feature.
+    /// The default [`Self::Xxh3_64`] and [`Self::Xxh3Low32`] are always
+    /// available. Callers on a fallible path translate `None` into
+    /// [`crate::Error::FeatureUnsupported`]; the `Option` return keeps
+    /// this method `core`-clean (no dependency on the std-bound crate
+    /// error type) so no-std verify paths can call it.
+    #[must_use]
+    pub fn compute(self, bytes: &[u8]) -> Option<u64> {
+        match self {
+            Self::Xxh3_64 => Some(crate::hash::hash64(bytes)),
+            // Low 32 bits of the same XXH3-64 digest: identical compute,
+            // half the stored width (see `digest_size`).
+            Self::Xxh3Low32 => Some(crate::hash::hash64(bytes) & 0xFFFF_FFFF),
+            #[cfg(feature = "crc32c")]
+            Self::Crc32c => Some(u64::from(crc32c::crc32c(bytes))),
+            #[cfg(not(feature = "crc32c"))]
+            Self::Crc32c => None,
+        }
+    }
+
     /// On-disk discriminator byte. Stable across format versions —
     /// new variants take fresh values; existing variants never
     /// change. Downstream `BlockHeader` extension (per #297 / #298
@@ -100,6 +125,191 @@ impl ChecksumAlgorithm {
             2 => Some(Self::Crc32c),
             _ => None,
         }
+    }
+}
+
+/// Per-KV checksum policy: which data blocks get a per-entry checksum footer.
+///
+/// A footer-bearing block stays [`crate::table::block::BlockType::Data`] with
+/// the `KV_CHECKSUM_FOOTER` block-header flag set — per-KV checking is a
+/// transform layer, not a block role.
+///
+/// The block-level checksum covers the bytes as written to disk but
+/// only as one digest over the whole block; the per-entry footer lets
+/// a scrub localise which entry diverged. Catching a RAM bit-flip that
+/// corrupts an entry WHILE it sits in the memtable, before the block
+/// is compiled, additionally requires
+/// [`KvChecksumComputePoint::AtInsert`] (not yet implemented — see its
+/// docs); the digests in this implementation are computed when the
+/// block is compiled. Default [`Self::Off`] is wire-identical to the
+/// pre-per-KV format: no footer, the flag bit clear, zero overhead.
+///
+/// Selection granularity:
+/// - [`Self::Off`] / [`Self::AllLevels`] are unconditional.
+/// - [`Self::PerLevel`] gates on the LSM level via a [`LevelMask`]
+///   bitmask (hot tier L0/L1 typically), so cold archival levels
+///   skip the per-entry overhead.
+/// - [`Self::PerTable`] gates on an inclusive [`TableIdRange`], so a
+///   specific table-id span (e.g. a compliance-sensitive table) opts
+///   in independently of level.
+///
+/// Toggle takes effect on the next block compile; existing blocks
+/// keep their original footer flag and read transparently. Compaction
+/// rewrites source blocks per the current policy, so the choice
+/// migrates live without downtime.
+//
+// no-std: pure data — compiles under `--no-default-features --features alloc`.
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq, Hash)]
+pub enum KvChecksumPolicy {
+    /// No per-KV checksums. Blocks are wire-identical to the
+    /// pre-per-KV [`crate::table::block::BlockType::Data`] format.
+    /// Default — zero compute, zero storage, zero memtable overhead.
+    #[default]
+    Off,
+
+    /// Every data block on every level carries a per-entry checksum
+    /// footer (the `KV_CHECKSUM_FOOTER` header flag set).
+    AllLevels,
+
+    /// Only data blocks on levels selected by the [`LevelMask`] carry
+    /// the per-entry footer. Levels outside the mask emit a plain data
+    /// block with the flag clear.
+    PerLevel(LevelMask),
+
+    /// Only data blocks whose owning table id falls in the inclusive
+    /// [`TableIdRange`] carry the per-entry footer.
+    PerTable(TableIdRange),
+}
+
+impl KvChecksumPolicy {
+    /// Whether a data block written at `level` for table `table_id`
+    /// must emit the per-entry checksum trailer under this policy.
+    ///
+    /// Drives whether the writer sets the `KV_CHECKSUM_FOOTER` header
+    /// flag (and appends the footer) at block compile: `true` emits the
+    /// footer, `false` emits a plain data block.
+    #[must_use]
+    pub const fn applies(self, level: u8, table_id: u64) -> bool {
+        match self {
+            Self::Off => false,
+            Self::AllLevels => true,
+            Self::PerLevel(mask) => mask.contains(level),
+            Self::PerTable(range) => range.contains(table_id),
+        }
+    }
+}
+
+/// When the per-KV checksum digest is computed.
+///
+/// [`Self::AtBlockCompile`] (default) computes each entry's digest when the
+/// data block is built at flush / compaction. This is the Pebble-parity
+/// mode: no memtable overhead, but it does NOT cover a RAM bit-flip that
+/// corrupts an entry while it sits in the memtable before the block is
+/// compiled.
+///
+/// [`Self::AtInsert`] computes the digest at memtable insert and carries it
+/// to the block, closing the memtable-residence window (the entry's digest
+/// is fixed the moment it enters RAM) at the cost of storing the digest in
+/// the memtable node.
+///
+/// **Not yet implemented:** the memtable / writer carry path is not wired,
+/// so selecting `AtInsert` via `update_runtime_config` is rejected with a
+/// typed error rather than silently behaving as `AtBlockCompile`. When the
+/// carry path lands, `AtInsert` will additionally require a 4-byte algorithm
+/// ([`ChecksumAlgorithm::Xxh3Low32`] / [`ChecksumAlgorithm::Crc32c`]) so the
+/// digest fits the node's reserved slot.
+//
+// no-std: pure data — compiles under `--no-default-features --features alloc`.
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq, Hash)]
+pub enum KvChecksumComputePoint {
+    /// Compute at block compile (flush / compaction). Default. No memtable
+    /// overhead; does not cover the memtable-residence window.
+    #[default]
+    AtBlockCompile,
+
+    /// Compute at memtable insert and carry (covers the full RAM lifecycle).
+    /// Not yet implemented — rejected at config-validation time.
+    AtInsert,
+}
+
+/// Bitmask over LSM levels for [`KvChecksumPolicy::PerLevel`].
+///
+/// Bit `n` set means level `n` is selected. A `u8` covers levels
+/// `0..=7`; the engine's default level count is 7, so one byte is
+/// sufficient. Levels `>= 8` are never selected (their bit cannot be
+/// represented), which is the safe default for a config that only
+/// targets the hot tier.
+//
+// no-std: pure data — compiles under `--no-default-features --features alloc`.
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq, Hash)]
+pub struct LevelMask(u8);
+
+impl LevelMask {
+    /// Empty mask — selects no levels.
+    #[must_use]
+    pub const fn none() -> Self {
+        Self(0)
+    }
+
+    /// Build a mask from a raw bitmask byte (bit `n` = level `n`).
+    #[must_use]
+    pub const fn from_bits(bits: u8) -> Self {
+        Self(bits)
+    }
+
+    /// The raw bitmask byte.
+    #[must_use]
+    pub const fn bits(self) -> u8 {
+        self.0
+    }
+
+    /// Return a copy with `level` added to the selection. Levels
+    /// `>= 8` are out of range for the `u8` mask and are ignored
+    /// (the returned mask is unchanged).
+    #[must_use]
+    pub const fn with_level(self, level: u8) -> Self {
+        if level < 8 {
+            Self(self.0 | (1u8 << level))
+        } else {
+            self
+        }
+    }
+
+    /// Whether `level` is selected by this mask. Levels `>= 8` are
+    /// never selected.
+    #[must_use]
+    pub const fn contains(self, level: u8) -> bool {
+        level < 8 && (self.0 & (1u8 << level)) != 0
+    }
+}
+
+/// Inclusive table-id range for [`KvChecksumPolicy::PerTable`].
+///
+/// Both endpoints are inclusive: `TableIdRange { start, end }` selects
+/// every `table_id` with `start <= table_id <= end`. A range with
+/// `start > end` selects nothing.
+//
+// no-std: pure data — compiles under `--no-default-features --features alloc`.
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
+pub struct TableIdRange {
+    /// Inclusive lower bound.
+    pub start: u64,
+    /// Inclusive upper bound.
+    pub end: u64,
+}
+
+impl TableIdRange {
+    /// Build an inclusive range. `start > end` yields an empty range
+    /// (selects nothing) rather than panicking.
+    #[must_use]
+    pub const fn new(start: u64, end: u64) -> Self {
+        Self { start, end }
+    }
+
+    /// Whether `table_id` falls within `[start, end]` inclusive.
+    #[must_use]
+    pub const fn contains(self, table_id: u64) -> bool {
+        self.start <= table_id && table_id <= self.end
     }
 }
 
@@ -135,11 +345,34 @@ pub struct RuntimeConfig {
     /// Compaction rewrites source blocks per the current algorithm.
     pub block_checksum_algo: ChecksumAlgorithm,
 
-    /// Algorithm for per-KV checksums inside `DataKvChecked` /
-    /// `FilterKvChecked` blocks (added by #298 implementation).
-    /// Independent from [`Self::block_checksum_algo`]. Default:
+    /// Algorithm for the per-KV checksum footer carried by data blocks
+    /// with the `KV_CHECKSUM_FOOTER` header flag set. Independent from
+    /// [`Self::block_checksum_algo`]. Default:
     /// [`ChecksumAlgorithm::Xxh3_64`].
     pub kv_checksum_algo: ChecksumAlgorithm,
+
+    /// Which data blocks emit a per-entry checksum footer (recorded via
+    /// the `KV_CHECKSUM_FOOTER` header flag). Default
+    /// [`KvChecksumPolicy::Off`] keeps blocks wire-identical to the
+    /// pre-per-KV format (no footer, flag clear).
+    ///
+    /// Toggle takes effect on the next block compile; existing blocks
+    /// keep their original footer flag and read transparently.
+    /// Compaction migrates source blocks to the current policy over
+    /// time. See [`KvChecksumPolicy`] for selection granularity.
+    pub kv_checksums: KvChecksumPolicy,
+
+    /// When the per-KV digest is computed:
+    /// [`KvChecksumComputePoint::AtBlockCompile`] (default) at flush /
+    /// compaction, or [`KvChecksumComputePoint::AtInsert`] at memtable
+    /// insert (the future memtable-residence-window mode). `AtInsert` is
+    /// NOT yet implemented: `RuntimeConfigHandle::try_update` (behind
+    /// [`crate::Tree::update_runtime_config`]) currently rejects EVERY
+    /// `AtInsert` setting with a typed error, regardless of
+    /// [`Self::kv_checksum_algo`] (both `Xxh3_64` and `Xxh3Low32`), so it
+    /// cannot be applied today. Default `AtBlockCompile` is always
+    /// accepted.
+    pub kv_checksum_compute_point: KvChecksumComputePoint,
 
     /// When `true`, every manifest write reserves a 4 KiB region at
     /// file offset 0 and, after writing the tail footer Block,
@@ -185,8 +418,8 @@ pub struct RuntimeConfig {
     /// `manifest_layout_version`, `flags` for the mirror bit, and
     /// the TOC; no slot for this flag yet). The per-entry checksum
     /// framing this would control lands in a separate change that
-    /// introduces the `DataKvChecked` Block variant for manifest
-    /// sections AND extends the footer flags / payload to record
+    /// sets the `KV_CHECKSUM_FOOTER` header flag on manifest section
+    /// blocks AND extends the footer flags / payload to record
     /// the toggle. Until then changing this flag has no on-disk
     /// effect — the field is surfaced for forward-compat ergonomics
     /// in the `RuntimeConfig` builder, not for any current
@@ -226,8 +459,8 @@ pub struct RuntimeConfig {
     /// overhead). `Some(true)` is the inverse.
     pub data_block_ecc_override: Option<bool>,
 
-    /// Per-scope override for the per-KV checksum region within
-    /// `DataKvChecked` Blocks (#298). `None` inherits
+    /// Per-scope override for the per-KV checksum footer region within
+    /// footer-bearing data Blocks (#298). `None` inherits
     /// [`Self::page_ecc`]; `Some(false)` keeps the kv-checksum
     /// region outside the parity calculation even when global ECC
     /// is enabled (useful when the per-KV checksums themselves are
@@ -240,6 +473,8 @@ impl Default for RuntimeConfig {
         Self {
             block_checksum_algo: ChecksumAlgorithm::Xxh3_64,
             kv_checksum_algo: ChecksumAlgorithm::Xxh3_64,
+            kv_checksums: KvChecksumPolicy::Off,
+            kv_checksum_compute_point: KvChecksumComputePoint::AtBlockCompile,
             manifest_footer_mirror: true,
             manifest_kv_checksums: true,
             page_ecc: false,
@@ -257,8 +492,8 @@ impl RuntimeConfig {
         self.data_block_ecc_override.unwrap_or(self.page_ecc)
     }
 
-    /// Effective Page ECC setting for the per-KV checksum region
-    /// within `DataKvChecked` Blocks (#298): the per-scope override
+    /// Effective Page ECC setting for the per-KV checksum footer region
+    /// within footer-bearing data Blocks (#298): the per-scope override
     /// when set, else the global [`Self::page_ecc`] default.
     #[must_use]
     pub fn kv_checksums_ecc(&self) -> bool {
@@ -275,8 +510,114 @@ impl RuntimeConfig {
 }
 
 #[cfg(test)]
+#[expect(clippy::expect_used, reason = "test code")]
 mod tests {
     use super::*;
+
+    #[test]
+    fn kv_checksum_policy_default_is_off() {
+        // Off is the wire-identical, zero-overhead default: a tree that
+        // never opts in must produce BlockType::Data blocks and pay no
+        // per-entry cost. A regression flipping this default would
+        // silently change the on-disk format for every existing user.
+        assert_eq!(KvChecksumPolicy::default(), KvChecksumPolicy::Off);
+    }
+
+    #[test]
+    fn kv_checksum_compute_point_default_is_at_block_compile() {
+        // AtBlockCompile is the zero-memtable-overhead default. Flipping
+        // it to AtInsert would change the memtable hot path for everyone,
+        // so the default is pinned.
+        assert_eq!(
+            KvChecksumComputePoint::default(),
+            KvChecksumComputePoint::AtBlockCompile
+        );
+        assert_eq!(
+            RuntimeConfig::default().kv_checksum_compute_point,
+            KvChecksumComputePoint::AtBlockCompile
+        );
+    }
+
+    #[test]
+    fn kv_checksum_policy_off_never_applies() {
+        // Off must reject every (level, table) pair — no per-KV footer
+        // is ever emitted under the default policy.
+        let p = KvChecksumPolicy::Off;
+        assert!(!p.applies(0, 0));
+        assert!(!p.applies(7, u64::MAX));
+    }
+
+    #[test]
+    fn kv_checksum_policy_all_levels_always_applies() {
+        // AllLevels must select every (level, table) pair, including
+        // out-of-mask-range levels (>= 8) that PerLevel can't reach.
+        let p = KvChecksumPolicy::AllLevels;
+        assert!(p.applies(0, 0));
+        assert!(p.applies(9, 12345));
+    }
+
+    #[test]
+    fn kv_checksum_policy_per_level_gates_on_mask() {
+        // PerLevel applies only to levels whose bit is set. Hot-tier
+        // selection (L0 + L1) must include 0 and 1 and exclude the
+        // rest, regardless of table id.
+        let mask = LevelMask::none().with_level(0).with_level(1);
+        let p = KvChecksumPolicy::PerLevel(mask);
+        assert!(p.applies(0, 999));
+        assert!(p.applies(1, 999));
+        assert!(!p.applies(2, 999));
+        assert!(!p.applies(6, 999));
+    }
+
+    #[test]
+    fn level_mask_out_of_range_level_is_never_selected() {
+        // A u8 mask covers levels 0..=7. with_level on an out-of-range
+        // level must be a no-op (not wrap into bit 0 via shift overflow)
+        // and contains must report false for those levels.
+        let mask = LevelMask::none().with_level(8).with_level(255);
+        assert_eq!(mask.bits(), 0, "out-of-range levels must not set any bit");
+        assert!(!mask.contains(8));
+        assert!(!mask.contains(255));
+    }
+
+    #[test]
+    fn level_mask_bits_roundtrip() {
+        // Raw-bits constructor and accessor must round-trip so a
+        // persisted mask byte reconstructs the same selection.
+        let mask = LevelMask::none().with_level(0).with_level(3);
+        assert_eq!(mask.bits(), 0b0000_1001);
+        assert_eq!(LevelMask::from_bits(0b0000_1001), mask);
+    }
+
+    #[test]
+    fn kv_checksum_policy_per_table_gates_on_inclusive_range() {
+        // PerTable applies only inside the inclusive [start, end] span,
+        // independent of level. Both endpoints are members; one past
+        // each end is not.
+        let p = KvChecksumPolicy::PerTable(TableIdRange::new(10, 20));
+        assert!(p.applies(0, 10));
+        assert!(p.applies(5, 20));
+        assert!(!p.applies(0, 9));
+        assert!(!p.applies(0, 21));
+    }
+
+    #[test]
+    fn table_id_range_inverted_selects_nothing() {
+        // A range with start > end is empty rather than panicking, so a
+        // misconfigured range degrades to "no per-KV checksums" instead
+        // of a crash or an all-match.
+        let r = TableIdRange::new(20, 10);
+        assert!(!r.contains(10));
+        assert!(!r.contains(15));
+        assert!(!r.contains(20));
+    }
+
+    #[test]
+    fn runtime_config_default_kv_checksums_off() {
+        // The wired RuntimeConfig field must default Off so the struct
+        // default stays wire-compatible with pre-per-KV trees.
+        assert_eq!(RuntimeConfig::default().kv_checksums, KvChecksumPolicy::Off);
+    }
 
     #[test]
     fn checksum_algorithm_default_is_xxh3_64() {
@@ -285,6 +626,57 @@ mod tests {
         // Locked here so a regression switching the default to
         // something slower (e.g. CRC32C) lights up the test.
         assert_eq!(ChecksumAlgorithm::default(), ChecksumAlgorithm::Xxh3_64);
+    }
+
+    #[test]
+    fn checksum_algorithm_compute_xxh3_64_matches_canonical_hash() {
+        // Xxh3_64 must produce exactly the crate's canonical hash64 so a
+        // per-KV digest is byte-identical to every other XXH3 site (the
+        // reader recomputes with hash64 on verify).
+        let data = b"per-kv checksum payload bytes";
+        assert_eq!(
+            ChecksumAlgorithm::Xxh3_64.compute(data),
+            Some(crate::hash::hash64(data))
+        );
+    }
+
+    #[test]
+    fn checksum_algorithm_compute_xxh3low32_is_low_32_bits() {
+        // Xxh3Low32 is the low 32 bits of the same digest: same compute,
+        // half the stored width. The high bits must be zero so the
+        // stored 4 bytes round-trip without truncation surprises.
+        let data = b"per-kv checksum payload bytes";
+        let full = crate::hash::hash64(data);
+        let got = ChecksumAlgorithm::Xxh3Low32
+            .compute(data)
+            .expect("Xxh3Low32 is always available");
+        assert_eq!(got, full & 0xFFFF_FFFF);
+        assert_eq!(got >> 32, 0, "high 32 bits must be clear");
+    }
+
+    #[test]
+    #[cfg(feature = "crc32c")]
+    fn checksum_algorithm_compute_crc32c_when_feature_on() {
+        // With the crc32c feature, Crc32c computes a non-trivial digest
+        // that fits in 32 bits and is order-sensitive (a real checksum,
+        // not a stub returning a constant).
+        let a = ChecksumAlgorithm::Crc32c
+            .compute(b"abc")
+            .expect("crc32c feature enabled");
+        let b = ChecksumAlgorithm::Crc32c
+            .compute(b"acb")
+            .expect("crc32c feature enabled");
+        assert_eq!(a >> 32, 0, "CRC32C digest fits in 32 bits");
+        assert_ne!(a, b, "CRC32C must be order-sensitive");
+    }
+
+    #[test]
+    #[cfg(not(feature = "crc32c"))]
+    fn checksum_algorithm_compute_crc32c_none_when_feature_off() {
+        // Without the feature, selecting Crc32c must surface as None so a
+        // caller translates it into a typed "not compiled in" error
+        // rather than silently substituting another algorithm.
+        assert_eq!(ChecksumAlgorithm::Crc32c.compute(b"abc"), None);
     }
 
     #[test]

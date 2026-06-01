@@ -406,6 +406,42 @@ impl DataBlock {
         Self { inner }
     }
 
+    /// Builds a `DataBlock` from a freshly loaded block, transparently
+    /// stripping the per-KV checksum footer when the block carries one
+    /// (the [`block_flags::KV_CHECKSUM_FOOTER`] header bit is set).
+    ///
+    /// For a plain data block (bit clear) this is identical to
+    /// [`Self::new`]. When the footer is present it splits the footer off
+    /// and stores only the inner standard data-block slice (with the bit
+    /// cleared), so every downstream read path — `try_iter`, `point_read`,
+    /// seek, trailer — operates unchanged. The per-KV digests are NOT
+    /// verified here (that is the scrub / paranoid path, see
+    /// [`Self::verify_kv_checked`]); the block-level checksum already
+    /// validated the on-disk bytes at load time.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error::InvalidTrailer`] if a footer-bearing block's
+    /// footer is structurally malformed.
+    pub(crate) fn from_loaded(block: Block) -> crate::Result<Self> {
+        use crate::table::block::{header::block_flags, kv_checksum};
+
+        if block.header.block_flags & block_flags::KV_CHECKSUM_FOOTER == 0 {
+            return Ok(Self::new(block));
+        }
+
+        // Determine the inner-slice length by splitting the footer, then
+        // keep a zero-copy sub-slice of the original block bytes. Clear the
+        // footer bit so the stripped block reads as a plain data block.
+        let array_start = kv_checksum::split_inner(&block.data)?.len();
+        let mut header = block.header;
+        header.block_flags &= !block_flags::KV_CHECKSUM_FOOTER;
+        Ok(Self::new(Block {
+            header,
+            data: block.data.slice(..array_start),
+        }))
+    }
+
     /// Accesses the inner raw bytes
     #[must_use]
     pub fn as_slice(&self) -> &Slice {
@@ -663,6 +699,105 @@ impl DataBlock {
         }
 
         serializer.finish()
+    }
+
+    /// Builds a per-KV-checked data block: the standard data-block payload
+    /// followed by a per-KV checksum footer. The caller records the
+    /// presence of the footer by setting the `KV_CHECKSUM_FOOTER` header
+    /// flag (via `Block::write_into_with_flags`); the block role stays
+    /// `Data`.
+    ///
+    /// `digests` MUST be in the same order as `items` (digest `i` belongs to
+    /// entry `i` in scan order) and computed via
+    /// [`kv_checksum::kv_digest`](super::block::kv_checksum) over each entry's
+    /// logical content. The writer computes the digests when it compiles the
+    /// block; a `None` for an unavailable algorithm is the caller's
+    /// responsibility to reject before reaching this point.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `items` is empty (same contract as [`Self::encode_into`]).
+    pub(crate) fn encode_kv_checked_into(
+        writer: &mut Vec<u8>,
+        items: &[InternalValue],
+        digests: &[u64],
+        algo: crate::runtime_config::ChecksumAlgorithm,
+        restart_interval: u8,
+        hash_index_ratio: f32,
+    ) -> crate::Result<()> {
+        debug_assert_eq!(
+            items.len(),
+            digests.len(),
+            "one digest per entry, in scan order"
+        );
+        Self::encode_into(writer, items, restart_interval, hash_index_ratio)?;
+        super::block::kv_checksum::append_footer(writer, digests, algo);
+        Ok(())
+    }
+
+    /// Verifies every entry of a footer-bearing data block against its
+    /// stored per-KV digest (the scrub / paranoid path).
+    ///
+    /// `footer_wrapped` is the full on-disk data-block payload INCLUDING the
+    /// per-KV checksum footer (i.e. the bytes as loaded, before
+    /// [`Self::from_loaded`] strips them). This splits the footer, decodes the
+    /// inner standard data block, and for each entry in scan order recomputes
+    /// the logical-content digest and compares it to the stored value.
+    ///
+    /// # Errors
+    ///
+    /// - [`crate::Error::InvalidTrailer`] if the footer is malformed or its
+    ///   entry count disagrees with the decoded block.
+    /// - [`crate::Error::FeatureUnsupported`] if the footer's algorithm is not
+    ///   compiled into this build.
+    /// - [`crate::Error::ChecksumMismatch`] on the first entry whose recomputed
+    ///   logical-content digest disagrees with the stored one (corruption of
+    ///   the entry bytes or the stored digest).
+    pub(crate) fn verify_kv_checked(
+        footer_wrapped: &[u8],
+        header: super::block::Header,
+        comparator: crate::comparator::SharedComparator,
+    ) -> crate::Result<()> {
+        use super::block::{BlockType, ParsedItem, kv_checksum};
+
+        let split = kv_checksum::split_full(footer_wrapped)?;
+
+        // Decode the inner slice through the standard data-block path. Reuse
+        // the real header (Copy) but present the inner slice as plain Data so
+        // the type gate passes.
+        let mut inner_header = header;
+        inner_header.block_type = BlockType::Data;
+        let inner = Self::new(Block {
+            header: inner_header,
+            data: Slice::from(split.inner),
+        });
+        let inner_data = inner.inner.data.clone();
+
+        let mut idx = 0usize;
+        for parsed in inner.try_iter(comparator)? {
+            let item = parsed.materialize(&inner_data);
+            let stored = split
+                .digests
+                .get(idx)
+                .copied()
+                .ok_or(crate::Error::InvalidTrailer)?;
+            let recomputed = kv_checksum::kv_digest(&item, split.algo)
+                .ok_or(crate::Error::FeatureUnsupported("kv checksum algorithm"))?;
+            if recomputed != stored {
+                return Err(crate::Error::ChecksumMismatch {
+                    got: crate::Checksum::from_raw(u128::from(recomputed)),
+                    expected: crate::Checksum::from_raw(u128::from(stored)),
+                });
+            }
+            idx += 1;
+        }
+
+        if idx != split.digests.len() {
+            // Footer claims a different entry count than the inner block
+            // decoded — structural inconsistency, not a content mismatch.
+            return Err(crate::Error::InvalidTrailer);
+        }
+        Ok(())
     }
 }
 
@@ -993,6 +1128,56 @@ mod tests {
             entries_end,
         );
         assert!(parsed.is_none());
+    }
+
+    #[test]
+    fn kv_checked_block_round_trips_through_reader() -> crate::Result<()> {
+        use crate::runtime_config::ChecksumAlgorithm;
+        use crate::table::block::kv_checksum::kv_digest;
+
+        // The write path (encode_kv_checked_into) followed by the read path
+        // (from_loaded → try_iter) must recover the exact items: from_loaded
+        // strips the per-KV footer and the standard decoder reads the inner
+        // payload unchanged.
+        let items = [
+            InternalValue::from_components(b"alpha".to_vec(), b"first".to_vec(), 30, Value),
+            InternalValue::from_components(b"bravo".to_vec(), b"second".to_vec(), 20, Value),
+            InternalValue::from_components(b"delta".to_vec(), Slice::from([]), 10, Tombstone),
+        ];
+        let algo = ChecksumAlgorithm::Xxh3_64;
+        let digests: Vec<u64> = items
+            .iter()
+            .map(|it| kv_digest(it, algo).expect("xxh3 always available"))
+            .collect();
+
+        let mut bytes = Vec::new();
+        DataBlock::encode_kv_checked_into(&mut bytes, &items, &digests, algo, 2, 0.0)?;
+
+        // The reader receives a Data block with the KV_CHECKSUM_FOOTER bit
+        // set and must strip the footer.
+        let loaded = DataBlock::from_loaded(Block {
+            data: bytes.into(),
+            header: Header {
+                block_flags: crate::table::block::header::block_flags::KV_CHECKSUM_FOOTER,
+                ..Header::test_dummy(BlockType::Data)
+            },
+        })?;
+        // After stripping, the footer bit is cleared.
+        assert_eq!(loaded.inner.header.block_type, BlockType::Data);
+        assert_eq!(loaded.inner.header.block_flags, 0);
+
+        let recovered: Vec<InternalValue> = loaded
+            .try_iter(default_comparator())?
+            .map(|parsed| parsed.materialize(loaded.as_slice()))
+            .collect();
+        assert_eq!(recovered.len(), items.len());
+        for (got, want) in recovered.iter().zip(items.iter()) {
+            assert_eq!(got.key.user_key, want.key.user_key);
+            assert_eq!(got.key.seqno, want.key.seqno);
+            assert_eq!(got.key.value_type, want.key.value_type);
+            assert_eq!(got.value, want.value);
+        }
+        Ok(())
     }
 
     #[test]

@@ -146,6 +146,10 @@ impl Scanner {
 
         match block {
             Ok(block) => {
+                // Per-KV checking is a header flag, so a data block is always
+                // BlockType::Data; `from_loaded` strips the checksum footer
+                // when the KV_CHECKSUM_FOOTER bit is set so the scan path is
+                // unchanged.
                 if block.header.block_type != BlockType::Data {
                     return Err(crate::Error::InvalidTag((
                         "BlockType",
@@ -153,7 +157,7 @@ impl Scanner {
                     )));
                 }
 
-                Ok(DataBlock::new(block))
+                DataBlock::from_loaded(block)
             }
             Err(e) => Err(e),
         }

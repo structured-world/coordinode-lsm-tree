@@ -308,7 +308,10 @@ impl Iterator for Iter {
                 Ok(b) => b,
                 Err(e) => return self.poison(e),
             };
-            let block = DataBlock::new(block);
+            let block = match DataBlock::from_loaded(block) {
+                Ok(b) => b,
+                Err(e) => return self.poison(e),
+            };
 
             let mut reader = match create_data_block_reader(block, self.comparator.clone()) {
                 Ok(r) => r,
@@ -436,7 +439,10 @@ impl DoubleEndedIterator for Iter {
                 Ok(b) => b,
                 Err(e) => return self.poison(e),
             };
-            let block = DataBlock::new(block);
+            let block = match DataBlock::from_loaded(block) {
+                Ok(b) => b,
+                Err(e) => return self.poison(e),
+            };
 
             let mut reader = match create_data_block_reader(block, self.comparator.clone()) {
                 Ok(r) => r,

@@ -44,10 +44,63 @@ impl<R: std::io::Read> std::io::Read for ChecksummedReader<R> {
     }
 }
 
+/// Per-block transform-layer presence flags carried in the block
+/// header (`Header::block_flags`).
+///
+/// Each bit records that one orthogonal, composable transform layer
+/// was applied to the block payload. This is the single home for the
+/// "which layers are present" question; the per-layer PARAMETERS live
+/// in their own fields (the parity length in [`Header::ecc_length`],
+/// the per-KV footer's algorithm + count self-describe in the footer
+/// tail, the compression codec + zstd dict come from the owning SST's
+/// compression policy, the encryption scheme/key from its encryption
+/// config). A presence bit can't carry those parameters, so it
+/// doesn't try to — it answers presence, the parameter homes answer
+/// "how".
+///
+/// `BlockType` stays orthogonal to these flags: it is the block's
+/// mutually-exclusive ROLE (Data / Index / Filter / …), not a
+/// transform layer. A compressed, encrypted, per-KV-checked data
+/// block is still `BlockType::Data` with three bits set — the layers
+/// compose, the role does not.
+pub mod block_flags {
+    /// The payload is followed by a per-entry checksum footer
+    /// (per-KV integrity). The footer's algorithm + entry count
+    /// self-describe in its tail; this bit says only that it is
+    /// present and must be split off before the inner payload is
+    /// decoded as a plain block of its role.
+    pub const KV_CHECKSUM_FOOTER: u8 = 1 << 0;
+
+    /// The payload is followed by a Reed-Solomon parity trailer.
+    /// Its byte length is in [`super::Header::ecc_length`] (which
+    /// stays the parameter home); this bit is the canonical presence
+    /// signal and must agree with `ecc_length > 0`.
+    pub const ECC_PARITY: u8 = 1 << 1;
+
+    /// The payload was compressed. The codec (and any zstd dict) is
+    /// not stored per block — it comes from the owning SST's
+    /// compression policy, which the reader already supplies via the
+    /// `BlockTransform`. This bit is the self-describing presence
+    /// signal (and a cross-check against that caller-supplied
+    /// transform).
+    pub const COMPRESSED: u8 = 1 << 2;
+
+    /// The payload was encrypted. The scheme/key comes from the
+    /// owning SST's encryption config (caller-supplied via the
+    /// `BlockTransform`); this bit is the self-describing presence
+    /// signal and a cross-check.
+    pub const ENCRYPTED: u8 = 1 << 3;
+}
+
 /// Header of a disk-based block
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct Header {
     pub block_type: BlockType,
+
+    /// Transform-layer presence bitfield — see the `block_flags` module in
+    /// this file for the bit definitions. `0` means a plain block of its role
+    /// with no compression / encryption / ECC / per-KV footer.
+    pub block_flags: u8,
 
     /// Checksum value to verify integrity of data
     pub checksum: Checksum,
@@ -83,6 +136,8 @@ impl Header {
             // implementation-defined; the wire format is the contract
             // and that contract is 1 byte.
             + 1
+            // Transform-layer presence flags (block_flags) — 1 byte
+            + 1
             // Data checksum
             + std::mem::size_of::<Checksum>()
             // On-disk size
@@ -102,10 +157,10 @@ impl Header {
     /// on-disk size when `ecc_length > 0`.
     #[must_use]
     pub fn on_disk_size(&self) -> u32 {
-        // serialized_len is a small constant (37 bytes: 4 magic + 1
-        // block_type + 16 checksum + 4 data_length + 4 uncompressed +
-        // 4 ecc_length + 4 header checksum); cast to u32 is safe by
-        // construction. `data_length` is bounded by the writer's
+        // serialized_len is a small constant (38 bytes: 4 magic + 1
+        // block_type + 1 block_flags + 16 checksum + 4 data_length +
+        // 4 uncompressed + 4 ecc_length + 4 header checksum); cast to
+        // u32 is safe by construction. `data_length` is bounded by the writer's
         // `MAX_DECOMPRESSION_SIZE` cap, and `ecc_length` is bounded
         // by the per-block `expected_parity_len(data_length)` invariant
         // enforced on read (see `Block::from_reader` / `from_file`),
@@ -133,6 +188,9 @@ impl Encode for Header {
 
             // Write block type
             writer.write_u8(self.block_type.into())?;
+
+            // Write transform-layer presence flags
+            writer.write_u8(self.block_flags)?;
 
             // Write data checksum
             writer.write_u128::<LE>(self.checksum.into_u128())?;
@@ -179,6 +237,9 @@ impl Decode for Header {
         let block_type = protected_reader.read_u8()?;
         let block_type = BlockType::try_from(block_type)?;
 
+        // Read transform-layer presence flags
+        let block_flags = protected_reader.read_u8()?;
+
         // Read data checksum
         let checksum = protected_reader.read_u128::<LE>()?;
 
@@ -214,6 +275,7 @@ impl Decode for Header {
 
         Ok(Self {
             block_type,
+            block_flags,
             checksum: Checksum::from_raw(checksum),
             data_length,
             uncompressed_length,
@@ -248,6 +310,7 @@ impl Header {
     pub(crate) fn test_dummy(block_type: BlockType) -> Self {
         Self {
             block_type,
+            block_flags: 0,
             checksum: Checksum::from_raw(0),
             data_length: 0,
             uncompressed_length: 0,
@@ -265,6 +328,9 @@ mod tests {
     fn block_header_serde_roundtrip() -> crate::Result<()> {
         let header = Header {
             block_type: BlockType::Data,
+            // Exercise the block_flags byte with two bits set so the
+            // serde round-trip covers it, not just the zero default.
+            block_flags: block_flags::KV_CHECKSUM_FOOTER | block_flags::COMPRESSED,
             checksum: Checksum::from_raw(5),
             data_length: 252_356,
             uncompressed_length: 124_124_124,
@@ -284,6 +350,7 @@ mod tests {
     fn block_header_detect_corruption() {
         let header = Header {
             block_type: BlockType::Data,
+            block_flags: 0,
             checksum: Checksum::from_raw(5),
             data_length: 252_356,
             uncompressed_length: 124_124_124,
@@ -291,7 +358,7 @@ mod tests {
         };
 
         let mut bytes = header.encode_into_vec();
-        bytes[5] += 1; // mutate block type enum tag
+        bytes[5] += 1; // mutate the block_flags byte (any header byte flip must be caught)
 
         assert!(
             matches!(

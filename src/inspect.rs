@@ -771,7 +771,10 @@ fn load_data_block_iter(
         )));
     }
 
-    let data_block = DataBlock::new(block);
+    // `from_loaded` strips the per-KV checksum footer when the block's
+    // KV_CHECKSUM_FOOTER flag is set so the inspection iterator decodes the
+    // inner payload normally.
+    let data_block = DataBlock::from_loaded(block)?;
     OwnedDataBlockIter::try_new(data_block, |b| {
         b.try_iter(crate::comparator::default_comparator())
     })
