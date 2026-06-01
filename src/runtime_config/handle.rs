@@ -86,18 +86,23 @@ impl RuntimeConfigHandle {
     /// validation error without applying the update, so the live
     /// snapshot stays at the pre-mutation value.
     ///
-    /// Currently the only check is the `page_ecc` cargo feature:
-    /// flipping `page_ecc = true` on a binary that doesn't link
-    /// the Reed-Solomon codec would silently no-op at the manifest
-    /// writer (the `PlainEcc` `BlockTransform` arm is feature-gated
-    /// out), so we reject the update instead of letting the caller
-    /// believe ECC is on.
+    /// Checks: (1) the `page_ecc` cargo feature — flipping
+    /// `page_ecc = true` on a binary that doesn't link the
+    /// Reed-Solomon codec would silently no-op at the manifest writer
+    /// (the `PlainEcc` `BlockTransform` arm is feature-gated out), so
+    /// we reject the update instead of letting the caller believe ECC
+    /// is on; (2) `AtInsert` per-KV compute point requires a 4-byte
+    /// algorithm because the digest is stored in the memtable node's
+    /// reserved 4-byte slot.
     ///
     /// # Errors
     ///
     /// - [`crate::Error::PageEccUnsupported`] when the mutator
     ///   leaves `page_ecc = true` on a build without the cargo
     ///   feature.
+    /// - [`crate::Error::FeatureUnsupported`] when the mutator pairs
+    ///   `kv_checksum_compute_point = AtInsert` with an 8-byte
+    ///   algorithm (`Xxh3_64`).
     pub fn try_update<F>(&self, mutator: F) -> crate::Result<()>
     where
         F: FnOnce(&mut RuntimeConfig),
@@ -107,6 +112,20 @@ impl RuntimeConfigHandle {
         mutator(&mut next);
         if next.page_ecc && !cfg!(feature = "page_ecc") {
             return Err(crate::Error::PageEccUnsupported);
+        }
+        // AtInsert stores the per-KV digest in the memtable node's reserved
+        // 4-byte slot, so it cannot carry an 8-byte digest. Reject the
+        // AtInsert + 8-byte-algorithm combination instead of silently
+        // truncating or overflowing the node header.
+        if matches!(
+            next.kv_checksum_compute_point,
+            crate::runtime_config::KvChecksumComputePoint::AtInsert
+        ) && next.kv_checksum_algo.digest_size() != 4
+        {
+            return Err(crate::Error::FeatureUnsupported(
+                "kv_checksum_compute_point = AtInsert requires a 4-byte algorithm \
+                 (Xxh3Low32 or Crc32c)",
+            ));
         }
         self.inner.store(Arc::new(next));
         Ok(())
@@ -141,6 +160,47 @@ mod tests {
         let handle = RuntimeConfigHandle::new(RuntimeConfig::default());
         let snap = handle.load();
         assert_eq!(snap.block_checksum_algo, ChecksumAlgorithm::Xxh3_64);
+    }
+
+    #[test]
+    fn try_update_rejects_at_insert_with_8_byte_algorithm() {
+        use super::super::types::KvChecksumComputePoint;
+
+        // AtInsert stores the digest in a 4-byte node slot, so pairing it
+        // with the 8-byte Xxh3_64 must be rejected and the live snapshot
+        // must stay unchanged.
+        let handle = RuntimeConfigHandle::new(RuntimeConfig::default());
+        let result = handle.try_update(|c| {
+            c.kv_checksum_compute_point = KvChecksumComputePoint::AtInsert;
+            // kv_checksum_algo stays at the default 8-byte Xxh3_64.
+        });
+        assert!(
+            matches!(result, Err(crate::Error::FeatureUnsupported(_))),
+            "AtInsert + Xxh3_64 must be rejected, got {result:?}"
+        );
+        assert_eq!(
+            handle.load().kv_checksum_compute_point,
+            KvChecksumComputePoint::AtBlockCompile,
+            "rejected update must not mutate the live snapshot"
+        );
+    }
+
+    #[test]
+    fn try_update_accepts_at_insert_with_4_byte_algorithm() {
+        use super::super::types::KvChecksumComputePoint;
+
+        // AtInsert with a 4-byte algorithm fits the node slot and is valid.
+        let handle = RuntimeConfigHandle::new(RuntimeConfig::default());
+        handle
+            .try_update(|c| {
+                c.kv_checksum_algo = ChecksumAlgorithm::Xxh3Low32;
+                c.kv_checksum_compute_point = KvChecksumComputePoint::AtInsert;
+            })
+            .unwrap();
+        assert_eq!(
+            handle.load().kv_checksum_compute_point,
+            KvChecksumComputePoint::AtInsert
+        );
     }
 
     #[test]

@@ -193,6 +193,36 @@ impl KvChecksumPolicy {
     }
 }
 
+/// When the per-KV checksum digest is computed.
+///
+/// [`Self::AtBlockCompile`] (default) computes each entry's digest when the
+/// data block is built at flush / compaction. This is the Pebble-parity
+/// mode: no memtable overhead, but it does NOT cover a RAM bit-flip that
+/// corrupts an entry while it sits in the memtable before the block is
+/// compiled.
+///
+/// [`Self::AtInsert`] computes the digest at memtable insert and carries it
+/// to the block. This closes the memtable-residence window (the entry's
+/// digest is fixed the moment it enters RAM), at the cost of storing the
+/// digest in the memtable node. The digest must fit the node's reserved
+/// space, so `AtInsert` is only valid with a 4-byte algorithm
+/// ([`ChecksumAlgorithm::Xxh3Low32`] / [`ChecksumAlgorithm::Crc32c`]);
+/// pairing it with the 8-byte [`ChecksumAlgorithm::Xxh3_64`] is rejected at
+/// config-validation time.
+//
+// no-std: pure data — compiles under `--no-default-features --features alloc`.
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq, Hash)]
+pub enum KvChecksumComputePoint {
+    /// Compute at block compile (flush / compaction). Default. No memtable
+    /// overhead; does not cover the memtable-residence window.
+    #[default]
+    AtBlockCompile,
+
+    /// Compute at memtable insert and carry. Covers the full RAM lifecycle;
+    /// requires a 4-byte algorithm.
+    AtInsert,
+}
+
 /// Bitmask over LSM levels for [`KvChecksumPolicy::PerLevel`].
 ///
 /// Bit `n` set means level `n` is selected. A `u8` covers levels
@@ -323,6 +353,14 @@ pub struct RuntimeConfig {
     /// time. See [`KvChecksumPolicy`] for selection granularity.
     pub kv_checksums: KvChecksumPolicy,
 
+    /// When the per-KV digest is computed: [`KvChecksumComputePoint::
+    /// AtBlockCompile`] (default) at flush / compaction, or
+    /// [`KvChecksumComputePoint::AtInsert`] at memtable insert (covers the
+    /// memtable-residence window, requires a 4-byte
+    /// [`Self::kv_checksum_algo`]). `AtInsert` paired with the 8-byte
+    /// `Xxh3_64` is rejected by `update_runtime_config`.
+    pub kv_checksum_compute_point: KvChecksumComputePoint,
+
     /// When `true`, every manifest write reserves a 4 KiB region at
     /// file offset 0 and, after writing the tail footer Block,
     /// copies the footer Block bytes into that head region. On read,
@@ -423,6 +461,7 @@ impl Default for RuntimeConfig {
             block_checksum_algo: ChecksumAlgorithm::Xxh3_64,
             kv_checksum_algo: ChecksumAlgorithm::Xxh3_64,
             kv_checksums: KvChecksumPolicy::Off,
+            kv_checksum_compute_point: KvChecksumComputePoint::AtBlockCompile,
             manifest_footer_mirror: true,
             manifest_kv_checksums: true,
             page_ecc: false,
@@ -469,6 +508,21 @@ mod tests {
         // per-entry cost. A regression flipping this default would
         // silently change the on-disk format for every existing user.
         assert_eq!(KvChecksumPolicy::default(), KvChecksumPolicy::Off);
+    }
+
+    #[test]
+    fn kv_checksum_compute_point_default_is_at_block_compile() {
+        // AtBlockCompile is the zero-memtable-overhead default. Flipping
+        // it to AtInsert would change the memtable hot path for everyone,
+        // so the default is pinned.
+        assert_eq!(
+            KvChecksumComputePoint::default(),
+            KvChecksumComputePoint::AtBlockCompile
+        );
+        assert_eq!(
+            RuntimeConfig::default().kv_checksum_compute_point,
+            KvChecksumComputePoint::AtBlockCompile
+        );
     }
 
     #[test]
