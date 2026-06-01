@@ -123,9 +123,11 @@ impl RuntimeConfigHandle {
             next.kv_checksum_compute_point,
             crate::runtime_config::KvChecksumComputePoint::AtInsert
         ) {
+            // Short, machine-matchable marker per the FeatureUnsupported
+            // contract; the "not yet wired, use AtBlockCompile" rationale lives
+            // in the comment above rather than in the error payload.
             return Err(crate::Error::FeatureUnsupported(
-                "kv_checksum_compute_point = AtInsert is not yet implemented; \
-                 use AtBlockCompile (digests are computed at flush / compaction)",
+                "kv_checksum_compute_point=AtInsert",
             ));
         }
         self.inner.store(Arc::new(next));

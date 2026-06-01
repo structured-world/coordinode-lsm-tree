@@ -447,6 +447,12 @@ impl DataBlock {
         {
             header.uncompressed_length = array_start as u32;
         }
+        // Clear the footer flag so the in-memory block doesn't advertise a
+        // footer that has just been stripped. (SST data blocks already decode
+        // with block_flags == 0 since they omit the byte, so this is a no-op
+        // there; it keeps the stripped block honest if a flag was ever set —
+        // matching the same clear in `verify_kv_checked`.)
+        header.block_flags &= !crate::table::block::header::block_flags::KV_CHECKSUM_FOOTER;
         Ok(Self::new(Block {
             header,
             data: block.data.slice(..array_start),
