@@ -296,6 +296,23 @@ mod tests {
     }
 
     #[test]
+    fn kv_digest_is_injective_across_key_value_boundary() {
+        // Without length framing, `user_key ‖ value` is ambiguous: the pair
+        // (key="a", value="bc") and (key="ab", value="c") concatenate to the
+        // same bytes, so a structured corruption that shifts the key/value
+        // boundary would evade per-KV verification. The digest domain must be
+        // injective for (value_type, seqno, user_key, value).
+        let d = ChecksumAlgorithm::Xxh3_64;
+        let a = val(b"a", b"bc", 7, ValueType::Value);
+        let b = val(b"ab", b"c", 7, ValueType::Value);
+        assert_ne!(
+            kv_digest(&a, d),
+            kv_digest(&b, d),
+            "key/value boundary must be unambiguous in the digest domain",
+        );
+    }
+
+    #[test]
     fn footer_roundtrips_inner_payload() {
         // append_footer then split_inner must reproduce the inner bytes
         // exactly, for both digest widths (the footer occupies the tail).
