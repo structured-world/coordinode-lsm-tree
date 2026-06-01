@@ -812,6 +812,16 @@ impl Writer {
             highest_kv_seqno: self.meta.highest_kv_seqno,
             data_block_compression: self.data_block_compression,
             index_block_compression: self.index_block_compression,
+            // Evaluate the kv-checksum policy once for this table's
+            // (level, table_id). The result is constant across all the
+            // table's data blocks (homogeneous SST), so it doubles as
+            // the per-SST descriptor value — identical to the per-block
+            // decision `spill_block` makes via the same expression.
+            kv_checksum_algo: self.kv_checksum.and_then(|(policy, algo)| {
+                policy
+                    .applies(self.initial_level, self.table_id)
+                    .then_some(algo)
+            }),
             data_block_hash_ratio: self.data_block_hash_ratio,
             data_block_restart_interval: self.data_block_restart_interval,
             index_block_restart_interval: self.index_block_restart_interval,
@@ -1016,6 +1026,12 @@ struct MetaSectionParams<'a> {
     highest_kv_seqno: crate::SeqNo,
     data_block_compression: CompressionType,
     index_block_compression: CompressionType,
+    /// Effective per-SST per-KV-footer algorithm: `Some(algo)` when this
+    /// table's `(level, table_id)` satisfies the kv-checksum policy (so
+    /// every data block carries a footer under `algo`), `None` otherwise.
+    /// An SST is homogeneous, so this single value describes the whole
+    /// table. Recorded in meta as the `descriptor#kv_checksum` byte.
+    kv_checksum_algo: Option<crate::runtime_config::ChecksumAlgorithm>,
     data_block_hash_ratio: f32,
     data_block_restart_interval: u8,
     index_block_restart_interval: u8,
@@ -1068,6 +1084,16 @@ fn write_meta_section<W: std::io::Write + std::io::Seek>(
         meta(
             "data_block_hash_ratio",
             &p.data_block_hash_ratio.to_le_bytes(),
+        ),
+        // Per-SST transform descriptor: per-KV-footer presence + algorithm
+        // as one byte (0 = no footer, else 1 + algo wire tag). Lets the
+        // reader know the whole table's footer state without inspecting any
+        // data block — the foundation for descriptor-driven block layout.
+        meta(
+            "descriptor#kv_checksum",
+            &[crate::table::block::kv_checksum::descriptor_byte(
+                p.kv_checksum_algo,
+            )],
         ),
         meta("file_size", &p.file_size.to_le_bytes()),
         meta("filter_hash_type", &[u8::from(ChecksumType::Xxh3)]),

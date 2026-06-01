@@ -284,6 +284,14 @@ impl Table {
     ///   the stored digest).
     /// - Any I/O / decode error encountered while loading a block.
     pub(crate) fn verify_kv_checksums(&self) -> crate::Result<()> {
+        // Homogeneous SST: the per-SST descriptor records whether ANY data
+        // block carries a per-KV footer. When it says none do, there is
+        // nothing to verify — skip the whole block scan instead of loading
+        // every data block only to find the footer flag clear.
+        if self.metadata.kv_checksum_algo.is_none() {
+            return Ok(());
+        }
+
         for handle in self.block_index.iter() {
             let handle = handle?;
             let block_handle = BlockHandle::new(handle.offset(), handle.size());

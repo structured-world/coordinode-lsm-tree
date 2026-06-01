@@ -95,6 +95,44 @@ pub fn append_footer(payload: &mut Vec<u8>, digests: &[u64], algo: ChecksumAlgor
     payload.extend_from_slice(&(digests.len() as u32).to_le_bytes());
 }
 
+/// Encodes the per-SST per-KV-footer descriptor as a single byte for the
+/// table meta block.
+///
+/// `0` means the SST writes no per-KV footers; any other value is
+/// `1 + algo.wire_tag()`, so the algorithm is recoverable. Reserving `0`
+/// for "absent" keeps the present/absent distinction unambiguous: a bare
+/// `wire_tag` of `0` would otherwise collide with
+/// [`ChecksumAlgorithm::Xxh3_64`]. An SST is homogeneous (one writer, one
+/// config snapshot, one `(level, table_id)`), so a single per-SST byte
+/// fully describes whether every data block carries a footer and under
+/// which algorithm — no per-block inspection needed.
+#[must_use]
+pub fn descriptor_byte(algo: Option<ChecksumAlgorithm>) -> u8 {
+    match algo {
+        None => 0,
+        Some(a) => 1 + a.wire_tag(),
+    }
+}
+
+/// Decodes the per-SST per-KV-footer descriptor byte written by
+/// [`descriptor_byte`].
+///
+/// `0` decodes to `None` (no footer); any other byte decodes to the
+/// algorithm whose [`ChecksumAlgorithm::wire_tag`] is `byte - 1`.
+///
+/// # Errors
+///
+/// Returns [`crate::Error::InvalidTrailer`] for a non-zero byte that does
+/// not map to a known algorithm (forward-incompatible or corrupt meta).
+pub fn descriptor_from_byte(byte: u8) -> crate::Result<Option<ChecksumAlgorithm>> {
+    if byte == 0 {
+        return Ok(None);
+    }
+    ChecksumAlgorithm::from_wire_tag(byte - 1)
+        .map(Some)
+        .ok_or(crate::Error::InvalidTrailer)
+}
+
 /// Splits a footer-bearing data block, returning the inner standard
 /// data-block slice (byte-identical to a plain `BlockType::Data` block) with
 /// the per-KV checksum footer removed. Feed the returned slice straight to
@@ -328,5 +366,39 @@ mod tests {
                 "digests must round-trip (masked to width) for {algo:?}"
             );
         }
+    }
+
+    #[test]
+    fn descriptor_byte_roundtrips_none_and_every_algorithm() {
+        // The per-SST descriptor byte must round-trip "no footer" and each
+        // known algorithm, with `0` reserved for absent so it never aliases
+        // Xxh3_64 (wire tag 0).
+        assert_eq!(descriptor_byte(None), 0);
+        assert_eq!(
+            descriptor_from_byte(0).expect("zero decodes"),
+            None,
+            "0 must mean no footer"
+        );
+
+        for algo in [
+            ChecksumAlgorithm::Xxh3_64,
+            ChecksumAlgorithm::Xxh3Low32,
+            ChecksumAlgorithm::Crc32c,
+        ] {
+            let byte = descriptor_byte(Some(algo));
+            assert_ne!(byte, 0, "present footer must not encode as 0 for {algo:?}");
+            assert_eq!(
+                descriptor_from_byte(byte).expect("present byte decodes"),
+                Some(algo),
+                "algorithm must round-trip for {algo:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn descriptor_from_byte_rejects_unknown_nonzero_tag() {
+        // A non-zero byte that maps to no known algorithm is corrupt /
+        // forward-incompatible meta and must error, not silently decode.
+        assert!(descriptor_from_byte(0xFE).is_err());
     }
 }

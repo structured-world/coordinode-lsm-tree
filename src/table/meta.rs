@@ -6,7 +6,7 @@ use super::{Block, BlockHandle, DataBlock};
 use crate::fs::FsFile;
 use crate::{
     CompressionType, KeyRange, SeqNo, TableId, checksum::ChecksumType, coding::Decode,
-    comparator::default_comparator, table::block::BlockType,
+    comparator::default_comparator, runtime_config::ChecksumAlgorithm, table::block::BlockType,
 };
 use byteorder::{LittleEndian, ReadBytesExt};
 use std::ops::Deref;
@@ -57,6 +57,14 @@ pub struct ParsedMeta {
 
     pub data_block_compression: CompressionType,
     pub index_block_compression: CompressionType,
+
+    /// Per-SST per-KV-footer descriptor: `Some(algo)` when every data block
+    /// in this table carries a per-KV checksum footer under `algo`, `None`
+    /// when the table was written with no per-KV footers. Sourced from the
+    /// `descriptor#kv_checksum` meta byte. Because an SST is homogeneous,
+    /// this single value lets the read / scrub path know the footer state
+    /// of the whole table without inspecting any data block header.
+    pub kv_checksum_algo: Option<ChecksumAlgorithm>,
 }
 
 macro_rules! read_u8 {
@@ -274,6 +282,12 @@ impl ParsedMeta {
             CompressionType::decode_from(&mut bytes)?
         };
 
+        let kv_checksum_algo = crate::table::block::kv_checksum::descriptor_from_byte(read_u8!(
+            block,
+            b"descriptor#kv_checksum",
+            &cmp
+        ))?;
+
         Ok(Self {
             id,
             created_at,
@@ -289,6 +303,7 @@ impl ParsedMeta {
             weak_tombstone_reclaimable,
             data_block_compression,
             index_block_compression,
+            kv_checksum_algo,
         })
     }
 }
@@ -361,6 +376,7 @@ mod tests {
             meta("crate_version", env!("CARGO_PKG_VERSION").as_bytes()),
             meta("created_at", &1_000_000u128.to_le_bytes()),
             meta("data_block_hash_ratio", &0.0f64.to_le_bytes()),
+            meta("descriptor#kv_checksum", &[0u8]),
             meta("file_size", &4096u64.to_le_bytes()),
             meta("filter_hash_type", &[u8::from(ChecksumType::Xxh3)]),
             meta("index_keys_have_seqno", &[0x1]),
@@ -475,6 +491,47 @@ mod tests {
         let items: Vec<_> = valid_meta_items()
             .into_iter()
             .filter(|iv| &*iv.key.user_key != b"compression#data")
+            .collect();
+        let result = load_meta_from_items(&items);
+        assert!(
+            matches!(result, Err(crate::Error::InvalidHeader("TableMeta"))),
+            "expected InvalidHeader(\"TableMeta\"), got {result:?}",
+        );
+    }
+
+    /// A `descriptor#kv_checksum` byte of 0 parses as "no per-KV footer"
+    /// (`kv_checksum_algo == None`) — the common, footer-free table.
+    #[test]
+    fn load_with_handle_kv_descriptor_zero_parses_as_none() {
+        let parsed = load_meta_from_items(&valid_meta_items()).unwrap();
+        assert_eq!(parsed.kv_checksum_algo, None);
+    }
+
+    /// A non-zero `descriptor#kv_checksum` byte round-trips to the encoded
+    /// algorithm, so the read / scrub path learns the whole table's footer
+    /// state from this single per-SST byte.
+    #[test]
+    fn load_with_handle_kv_descriptor_nonzero_parses_algorithm() {
+        let mut items = valid_meta_items();
+        let byte =
+            crate::table::block::kv_checksum::descriptor_byte(Some(ChecksumAlgorithm::Xxh3Low32));
+        if let Some(item) = items
+            .iter_mut()
+            .find(|iv| &*iv.key.user_key == b"descriptor#kv_checksum")
+        {
+            *item = meta("descriptor#kv_checksum", &[byte]);
+        }
+        let parsed = load_meta_from_items(&items).unwrap();
+        assert_eq!(parsed.kv_checksum_algo, Some(ChecksumAlgorithm::Xxh3Low32));
+    }
+
+    /// Missing `descriptor#kv_checksum` must return `Err(InvalidHeader)`,
+    /// not panic — the descriptor is a required per-SST field.
+    #[test]
+    fn load_with_handle_missing_kv_descriptor_returns_err() {
+        let items: Vec<_> = valid_meta_items()
+            .into_iter()
+            .filter(|iv| &*iv.key.user_key != b"descriptor#kv_checksum")
             .collect();
         let result = load_meta_from_items(&items);
         assert!(
