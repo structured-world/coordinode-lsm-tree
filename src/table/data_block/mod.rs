@@ -789,8 +789,15 @@ impl DataBlock {
 
         let split = kv_checksum::split_full(footer_wrapped)?;
 
-        // TEMP: cross-check neutralized to prove the regression test fails.
-        let _ = expected_algo;
+        // Cross-check the footer's self-described algorithm against the
+        // per-SST descriptor when provided. A mismatch means the tag was
+        // flipped (writer bug / corruption); verifying under the wrong
+        // algorithm could otherwise pass against forged digests.
+        if let Some(expected) = expected_algo
+            && split.algo != expected
+        {
+            return Err(crate::Error::InvalidTrailer);
+        }
 
         // Decode the inner slice through the standard data-block path. Reuse
         // the real header (Copy) but present the inner slice as a consistent
