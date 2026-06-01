@@ -667,6 +667,36 @@ fn table_range_exclusive_bounds() -> crate::Result<()> {
 }
 
 #[test]
+fn writer_records_effective_page_ecc_descriptor() -> crate::Result<()> {
+    // descriptor#page_ecc must record the EFFECTIVE (compiled) setting, not
+    // the requested flag. Without the `page_ecc` cargo feature,
+    // use_page_ecc(true) is a no-op (with_ecc() is identity, no parity is
+    // emitted and no ECC_PARITY bit is set), so the persisted descriptor
+    // must read false to stay consistent with the actual on-disk blocks.
+    // With the feature it reads true. `cfg!(feature = "page_ecc")` is the
+    // effective value either way.
+    let items = [crate::InternalValue::from_components(
+        b"a",
+        b"v",
+        0,
+        crate::ValueType::Value,
+    )];
+    test_with_table(
+        &items,
+        |table| {
+            assert_eq!(
+                table.metadata.page_ecc,
+                cfg!(feature = "page_ecc"),
+                "descriptor#page_ecc must reflect the effective (compiled) page_ecc setting",
+            );
+            Ok(())
+        },
+        None,
+        Some(|w: Writer| w.use_page_ecc(true)),
+    )
+}
+
+#[test]
 #[expect(clippy::unwrap_used)]
 fn table_point_read_mvcc_block_boundary() -> crate::Result<()> {
     let items = [
