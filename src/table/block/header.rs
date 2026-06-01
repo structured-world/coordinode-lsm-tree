@@ -50,13 +50,13 @@ impl<R: std::io::Read> std::io::Read for ChecksummedReader<R> {
 /// Each bit records that one orthogonal, composable transform layer
 /// was applied to the block payload. This is the single home for the
 /// "which layers are present" question; the per-layer PARAMETERS live
-/// in their own fields (the parity length in [`Header::ecc_length`],
-/// the per-KV footer's algorithm + count self-describe in the footer
-/// tail, the compression codec + zstd dict come from the owning SST's
-/// compression policy, the encryption scheme/key from its encryption
-/// config). A presence bit can't carry those parameters, so it
-/// doesn't try to — it answers presence, the parameter homes answer
-/// "how".
+/// elsewhere (the parity length is DERIVED from `data_length` via the
+/// Reed-Solomon scheme, the per-KV footer's algorithm + count
+/// self-describe in the footer tail, the compression codec + zstd dict
+/// come from the owning SST's compression policy, the encryption
+/// scheme/key from its encryption config). A presence bit can't carry
+/// those parameters, so it doesn't try to — it answers presence, the
+/// parameter homes answer "how".
 ///
 /// `BlockType` stays orthogonal to these flags: it is the block's
 /// mutually-exclusive ROLE (Data / Index / Filter / …), not a
@@ -72,9 +72,11 @@ pub mod block_flags {
     pub const KV_CHECKSUM_FOOTER: u8 = 1 << 0;
 
     /// The payload is followed by a Reed-Solomon parity trailer.
-    /// Its byte length is in [`super::Header::ecc_length`] (which
-    /// stays the parameter home); this bit is the canonical presence
-    /// signal and must agree with `ecc_length > 0`.
+    /// Its byte length is NOT stored: the reader derives it as
+    /// `expected_parity_len(data_length)` (the RS(4, 2) scheme is
+    /// deterministic). This bit is the canonical, presence-authoritative
+    /// signal that a trailer follows; a block whose payload is empty
+    /// emits a zero-length trailer and leaves this bit clear.
     pub const ECC_PARITY: u8 = 1 << 1;
 
     /// The payload was compressed. The codec (and any zstd dict) is
@@ -118,20 +120,6 @@ pub struct Header {
 
     /// Uncompressed size of data segment
     pub uncompressed_length: u32,
-
-    /// Length in bytes of the Reed-Solomon parity trailer that follows
-    /// the `data_length` payload bytes on disk. `0` when the block was
-    /// written without Page ECC (`Config::page_ecc(false)`, the
-    /// default), in which case no parity bytes follow — the *payload
-    /// region* stays V5-shaped (header + payload, no trailer). The
-    /// *header* itself is always V5: 4 extra bytes for this field
-    /// plus the bumped magic `[L,S,M,4]` (pre-V5 V3/V4 used
-    /// `[L,S,M,3]`), so a pre-V5 reader rejects every V5 block at
-    /// header decode
-    /// regardless of `ecc_length`'s value. Non-zero when ECC is
-    /// enabled — the reader uses it to read the parity bytes and
-    /// attempt Reed-Solomon recovery on `data` XXH3 mismatch.
-    pub ecc_length: u32,
 }
 
 impl Header {
@@ -152,8 +140,6 @@ impl Header {
             + std::mem::size_of::<u32>()
             // Uncompressed data length
             + std::mem::size_of::<u32>()
-            // Reed-Solomon parity trailer length (0 when ECC off)
-            + std::mem::size_of::<u32>()
             // Checksum
             + std::mem::size_of::<u32>()
     }
@@ -162,25 +148,34 @@ impl Header {
     /// optional ECC parity trailer. Use this when computing block
     /// handles instead of manually summing `serialized_len() +
     /// data_length` — that older form silently underflows the
-    /// on-disk size when `ecc_length > 0`.
+    /// on-disk size when a parity trailer is present.
+    ///
+    /// The parity-trailer length is derived from `data_length` (the
+    /// Reed-Solomon scheme is deterministic) and the `ECC_PARITY`
+    /// presence bit, not stored: a block that set the bit at write time
+    /// carries `expected_parity_len(data_length)` parity bytes.
     #[must_use]
     pub fn on_disk_size(&self) -> u32 {
-        // serialized_len is a small constant (38 bytes: 4 magic + 1
+        // serialized_len is a small constant (34 bytes: 4 magic + 1
         // block_type + 1 block_flags + 16 checksum + 4 data_length +
-        // 4 uncompressed + 4 ecc_length + 4 header checksum); cast to
-        // u32 is safe by construction. `data_length` is bounded by the writer's
-        // `MAX_DECOMPRESSION_SIZE` cap, and `ecc_length` is bounded
-        // by the per-block `expected_parity_len(data_length)` invariant
-        // enforced on read (see `Block::from_reader` / `from_file`),
-        // so the sum stays well within u32.
+        // 4 uncompressed + 4 header checksum); cast to u32 is safe by
+        // construction. `data_length` is bounded by the writer's
+        // `MAX_DECOMPRESSION_SIZE` cap and the parity length is bounded
+        // by `expected_parity_len(data_length)`, so the sum stays well
+        // within u32.
         #[expect(
             clippy::cast_possible_truncation,
             reason = "Header::serialized_len() is a small const"
         )]
         let header = Self::serialized_len() as u32;
+        let parity = if self.block_flags & block_flags::ECC_PARITY != 0 {
+            super::expected_parity_len(self.data_length)
+        } else {
+            0
+        };
         header
             .saturating_add(self.data_length)
-            .saturating_add(self.ecc_length)
+            .saturating_add(parity)
     }
 }
 
@@ -208,10 +203,6 @@ impl Encode for Header {
 
             // Write uncompressed data length
             writer.write_u32::<LE>(self.uncompressed_length)?;
-
-            // Write Reed-Solomon parity trailer length (V5+); 0 when
-            // Page ECC is disabled.
-            writer.write_u32::<LE>(self.ecc_length)?;
 
             writer.checksum()
         };
@@ -265,9 +256,6 @@ impl Decode for Header {
         // Read data length
         let uncompressed_length = protected_reader.read_u32::<LE>()?;
 
-        // Read Reed-Solomon parity trailer length (V5+)
-        let ecc_length = protected_reader.read_u32::<LE>()?;
-
         #[expect(
             clippy::cast_possible_truncation,
             reason = "we purposefully only use the lower 4 bytes as checksum"
@@ -295,7 +283,6 @@ impl Decode for Header {
             checksum: Checksum::from_raw(checksum),
             data_length,
             uncompressed_length,
-            ecc_length,
         })
     }
 }
@@ -330,7 +317,6 @@ impl Header {
             checksum: Checksum::from_raw(0),
             data_length: 0,
             uncompressed_length: 0,
-            ecc_length: 0,
         }
     }
 }
@@ -350,7 +336,6 @@ mod tests {
             checksum: Checksum::from_raw(5),
             data_length: 252_356,
             uncompressed_length: 124_124_124,
-            ecc_length: 0,
         };
 
         let bytes = header.encode_into_vec();
@@ -374,7 +359,6 @@ mod tests {
             checksum: Checksum::from_raw(5),
             data_length: 10,
             uncompressed_length: 10,
-            ecc_length: 0,
         };
         let bytes = header.encode_into_vec();
         assert!(
@@ -395,7 +379,6 @@ mod tests {
             checksum: Checksum::from_raw(5),
             data_length: 252_356,
             uncompressed_length: 124_124_124,
-            ecc_length: 0,
         };
 
         let mut bytes = header.encode_into_vec();

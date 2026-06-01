@@ -87,13 +87,14 @@ pub struct ManifestArchiveReader {
     /// variant to hand to `Block::from_reader` (`Plain` vs
     /// `PlainEcc` vs `Encrypted` vs `EncryptedEcc`). The Block layer
     /// itself parses ECC presence from the per-Block header's
-    /// `ecc_length` field — the runtime snapshot does NOT control
-    /// whether the decoder accepts ECC bytes, only which decoder
-    /// arm gets called. A manifest written with `page_ecc=true`
-    /// still decodes correctly if the live tree has since toggled
-    /// the flag off, because `BlockTransform::Plain` and
-    /// `BlockTransform::PlainEcc` both go through the same
-    /// header-driven verify path.
+    /// `ECC_PARITY` flag (the parity length is then derived from
+    /// `data_length`) — the runtime snapshot does NOT control whether
+    /// the decoder accepts ECC bytes, only which decoder arm gets
+    /// called. A manifest written with `page_ecc=true` still decodes
+    /// correctly if the live tree has since toggled the flag off,
+    /// because the per-Block `ECC_PARITY` flag is self-describing and
+    /// both `BlockTransform::Plain` and `BlockTransform::PlainEcc` go
+    /// through the same header-driven verify path.
     runtime: Arc<RuntimeConfig>,
 
     /// Optional encryption provider — mirrors the writer's
@@ -411,8 +412,8 @@ enum HeaderContext {
 /// [`Block::from_reader`] if the declared on-disk payload + parity
 /// trailer would exceed the buffer length.
 ///
-/// Why: `Block::from_reader` itself trusts `header.data_length` /
-/// `header.ecc_length` up to its own 256 MiB ceiling. A manifest
+/// Why: `Block::from_reader` itself trusts `header.data_length` (and the
+/// parity length derived from it) up to its own 256 MiB ceiling. A manifest
 /// section / footer that was already capped by the caller (TOC
 /// `block_size`, tail size hint, or `HEAD_FOOTER_RESERVED_SIZE`)
 /// can still nest a forged header inside that smaller window
@@ -454,10 +455,12 @@ fn validate_block_header_fits(buf: &[u8], ctx: HeaderContext) -> crate::Result<(
     let header = Header::decode_from(&mut cursor).map_err(|_| {
         wrap("manifest Block header decode failed (truncated, unknown type, or invalid magic)")
     })?;
-    let declared = u64::from(header.data_length)
-        .checked_add(u64::from(header.ecc_length))
-        .and_then(|payload| payload.checked_add(header_len as u64))
-        .ok_or_else(|| wrap("manifest Block header lengths overflow u64"))?;
+    // `on_disk_size` derives the parity-trailer length from `data_length`
+    // plus the `ECC_PARITY` presence flag (there is no stored `ecc_length`);
+    // it saturates in u32 rather than overflowing, so a forged oversized
+    // `data_length` saturates to u32::MAX and is rejected by the bound check
+    // below against the (much smaller) buffer length.
+    let declared = u64::from(header.on_disk_size());
     if declared > buf.len() as u64 {
         return Err(wrap(
             "manifest Block header declares on-disk size larger than buffer",
@@ -832,17 +835,20 @@ mod tests {
             entry.block_offset
         };
 
-        // Flip one byte inside section b's payload region. Offset
-        // well past the Block header so the bit is in the
-        // checksummed payload.
+        // Flip the first byte of section b's payload region (right after
+        // the Block header) so the bit lands in the XXH3-checksummed
+        // payload, not the header or an adjacent section. Derived from
+        // `Header::serialized_len()` so it tracks the header size rather
+        // than a hard-coded offset.
+        let payload_off = b_offset + Header::serialized_len() as u64;
         {
             let mut file = fs
                 .open(path, &FsOpenOptions::new().write(true).read(true))
                 .unwrap();
-            file.seek(SeekFrom::Start(b_offset + 40)).unwrap();
+            file.seek(SeekFrom::Start(payload_off)).unwrap();
             let mut byte = [0u8; 1];
             file.read_exact(&mut byte).unwrap();
-            file.seek(SeekFrom::Start(b_offset + 40)).unwrap();
+            file.seek(SeekFrom::Start(payload_off)).unwrap();
             file.write_all(&[byte[0] ^ 0xFF]).unwrap();
             file.sync_all().unwrap();
         }

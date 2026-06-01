@@ -155,7 +155,7 @@ pub enum Error {
     /// attached Reed-Solomon parity trailer could not reconstruct
     /// it (more shards are corrupted than the (4, 2) RS scheme
     /// can recover). Surfaced ONLY by ECC-protected blocks
-    /// (`header.ecc_length > 0`); a block written without parity
+    /// (the `ECC_PARITY` header flag set); a block written without parity
     /// (`Config::page_ecc(false)`) on a checksum mismatch returns
     /// [`Self::ChecksumMismatch`] instead, because there's no
     /// parity to even attempt recovery from.
@@ -260,9 +260,10 @@ pub enum Error {
     /// - **Requested section name not in TOC:** the caller asked
     ///   for a section that the manifest doesn't declare.
     /// - **Section Block header doesn't fit its outer buffer:**
-    ///   the inner `Header::data_length + ecc_length` exceeds the
-    ///   TOC-declared `block_size`. Defence-in-depth against a
-    ///   forged TOC pointing at a too-small slot.
+    ///   the inner block's derived on-disk size (header + payload +
+    ///   parity-if-flagged) exceeds the TOC-declared `block_size`.
+    ///   Defence-in-depth against a forged TOC pointing at a too-small
+    ///   slot.
     /// - **Block decoded at the TOC offset has the wrong
     ///   `block_type`:** TOC says "section here" but the bytes
     ///   carry a non-`Manifest` Block. Defence-in-depth against

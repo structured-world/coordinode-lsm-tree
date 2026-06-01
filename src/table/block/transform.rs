@@ -228,9 +228,10 @@ pub enum BlockTransform<'a> {
 
     /// `raw → checksum → ecc parity → disk`. Same as [`Self::Plain`]
     /// but emits a Reed-Solomon (4, 2) parity trailer after the
-    /// on-disk payload. Header's `ecc_length` records the parity
-    /// length so the reader can verify-and-recover from a single
-    /// data-shard loss without a separate sidecar.
+    /// on-disk payload. The header's `ECC_PARITY` flag marks the
+    /// trailer's presence (its length is derived from `data_length`),
+    /// so the reader can verify-and-recover from a single data-shard
+    /// loss without a separate sidecar.
     #[cfg(feature = "page_ecc")]
     PlainEcc,
 

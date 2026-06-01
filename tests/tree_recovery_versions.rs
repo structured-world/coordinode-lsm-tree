@@ -140,9 +140,10 @@ fn tree_writes_v5_manifest_and_recovers_it() -> lsm_tree::Result<()> {
 #[test]
 fn tree_rejects_pre_v5_manifest() -> lsm_tree::Result<()> {
     // V5 introduces per-block Reed-Solomon Page ECC (alongside the
-    // BuRR filter format): the block header gains an `ecc_length`
-    // field and the block magic is bumped so a pre-V5 reader rejects
-    // V5 blocks immediately at header decode. Pre-V5 tables on disk
+    // BuRR filter format): the block header gains a `block_flags` byte
+    // (whose ECC_PARITY bit marks a parity trailer) and the block magic
+    // is bumped so a pre-V5 reader rejects V5 blocks immediately at
+    // header decode. Pre-V5 tables on disk
     // cannot be read by this version and vice versa — opening a
     // manifest tagged with any pre-V5 version must fail with
     // InvalidVersion at recovery time rather than silently
@@ -291,12 +292,12 @@ fn tree_recovery_version_free_list() -> lsm_tree::Result<()> {
 /// original plaintext.
 ///
 /// NOTE: this test alone is necessary but not sufficient — the
-/// reader path accepts `ecc_length = 0` blocks too (only validates
-/// parity length when `ecc_length != 0`), so a regression that
+/// reader path accepts blocks without a parity trailer too (the
+/// `ECC_PARITY` flag clear means none follows), so a regression that
 /// silently emitted non-ECC blocks would still pass the round
 /// trip. The strict on-disk check that locks down "writer MUST
-/// emit non-zero `ecc_length`" lives in
-/// [`tree_page_ecc_emits_nonzero_ecc_length_on_disk`] below.
+/// emit a parity trailer" lives in
+/// [`tree_page_ecc_emits_parity_trailer_on_disk`] below.
 #[cfg(feature = "page_ecc")]
 #[test]
 fn tree_page_ecc_roundtrips_through_flush_and_reopen() -> lsm_tree::Result<()> {
@@ -322,9 +323,9 @@ fn tree_page_ecc_roundtrips_through_flush_and_reopen() -> lsm_tree::Result<()> {
 
     // Reopen with the same flag — the on-disk blocks MUST have
     // the parity trailer the writer is supposed to emit, otherwise
-    // the read path (which verifies ecc_length matches
-    // expected_parity_len(data_length)) would reject the block on
-    // load and the reopen would fail.
+    // the read path (which derives the trailer length from
+    // expected_parity_len(data_length) whenever the ECC_PARITY flag is
+    // set) would mis-size the block on load and the reopen would fail.
     {
         let tree = Config::new(
             path,
@@ -342,20 +343,23 @@ fn tree_page_ecc_roundtrips_through_flush_and_reopen() -> lsm_tree::Result<()> {
 }
 
 /// Strict on-disk check that `Config::page_ecc(true)` produces
-/// SST data blocks with `Header::ecc_length > 0` (not just that
-/// the round trip succeeds).
+/// SST data blocks carrying a parity trailer (not just that the round
+/// trip succeeds).
 ///
 /// Locks down the writer wiring against silent regressions where
 /// the flag would be accepted at `Tree::open` but never propagate
 /// to the emit path — the round-trip test above would still pass
-/// in that case because the reader accepts `ecc_length = 0` blocks,
+/// in that case because the reader accepts blocks without parity,
 /// so by itself it isn't sufficient. Reads the first
 /// freshly-flushed SST file from disk, parses its SFA trailer to
 /// locate the `data` section, then decodes the first `Header` and
-/// asserts the parity trailer length is non-zero.
+/// asserts the derived on-disk size exceeds header + payload (i.e. a
+/// parity trailer is present). The parity LENGTH is not stored; it is
+/// derived from `data_length` + the `ECC_PARITY` flag, so
+/// `on_disk_size()` is the public way to observe the trailer.
 #[cfg(feature = "page_ecc")]
 #[test]
-fn tree_page_ecc_emits_nonzero_ecc_length_on_disk() -> lsm_tree::Result<()> {
+fn tree_page_ecc_emits_parity_trailer_on_disk() -> lsm_tree::Result<()> {
     use lsm_tree::coding::Decode;
     use lsm_tree::table::block::Header;
     use std::fs;
@@ -407,13 +411,13 @@ fn tree_page_ecc_emits_nonzero_ecc_length_on_disk() -> lsm_tree::Result<()> {
 
     let mut data_reader = data_section.buf_reader(&sst_path)?;
     // Decode the FIRST data block's header. With `page_ecc(true)`
-    // the writer must emit a non-zero `ecc_length` for every block
-    // it produces.
+    // the writer must emit a parity trailer for every block, so the
+    // derived on-disk size exceeds header + payload.
     let header = Header::decode_from(&mut data_reader)?;
     assert!(
-        header.ecc_length > 0,
-        "page_ecc(true) tree must emit blocks with parity trailer, \
-         got ecc_length=0 in first data block of {}",
+        (header.on_disk_size() as usize) > Header::serialized_len() + header.data_length as usize,
+        "page_ecc(true) tree must emit blocks with a parity trailer, \
+         got none in first data block of {}",
         sst_path.display(),
     );
     // Defensive: also sanity-check that data_length is non-trivial

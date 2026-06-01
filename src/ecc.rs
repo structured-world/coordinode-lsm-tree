@@ -61,9 +61,11 @@ pub fn shard_bytes(payload_len: usize) -> usize {
     raw.div_ceil(2) * 2
 }
 
-/// Total parity-trailer byte size for a block of `payload_len`
-/// bytes. This is what the writer emits after the payload and
-/// what `BlockHeader.ecc_length` records.
+/// Total parity-trailer byte size for a block of `payload_len` bytes.
+///
+/// This is what the writer emits after the payload, and what the reader
+/// re-derives from `data_length` (the length is not stored in the block
+/// header — only the `ECC_PARITY` presence flag is).
 #[must_use]
 pub fn parity_len(payload_len: usize) -> usize {
     shard_bytes(payload_len) * RS_PARITY_SHARDS
@@ -72,15 +74,14 @@ pub fn parity_len(payload_len: usize) -> usize {
 /// Encodes a Reed-Solomon parity trailer for `payload`.
 ///
 /// Returns a `Vec<u8>` of length [`parity_len`] for `payload.len()`.
-/// The caller writes the bytes verbatim after the payload and
-/// records `ecc_length = parity.len() as u32` in the block
-/// header.
+/// The caller writes the bytes verbatim after the payload and sets the
+/// `ECC_PARITY` flag in the block header (the trailer length is not
+/// stored; the reader re-derives it from `data_length`).
 ///
 /// Empty input (`payload.len() == 0`) is handled by short-circuit
 /// returning `Ok(Vec::new())` — a zero-length block has nothing to
-/// protect, so emitting zero parity bytes is the correct shape.
-/// `ecc_length` then lands at `0` in the header, matching the
-/// no-ECC layout.
+/// protect, so emitting zero parity bytes is the correct shape, and
+/// the writer leaves the `ECC_PARITY` flag clear to match.
 ///
 /// # Errors
 ///

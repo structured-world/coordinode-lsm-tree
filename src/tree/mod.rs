@@ -1990,7 +1990,7 @@ impl Tree {
             let manifest_path = config.path.join(format!("v{version_id}"));
             // Open the manifest with a default runtime snapshot:
             // ECC awareness is captured per-Block via the header
-            // (`ecc_length` field) so the reader doesn't actually
+            // (`ECC_PARITY` flag) so the reader doesn't actually
             // need to know which ECC mode the writer used. The
             // captured runtime here is a placeholder; once we want
             // runtime-driven decisions on the read path (e.g.

@@ -112,10 +112,10 @@ pub struct Writer {
     /// Per-block Reed-Solomon Page ECC opt-in. When `true`, every
     /// `Block::write_into` call this writer makes upgrades its
     /// `BlockTransform` to the matching `*Ecc` variant so the
-    /// writer emits a parity trailer + records non-zero
-    /// `ecc_length` in the header. Default `false`. Caller wires
-    /// `Config::page_ecc` into this field via
-    /// [`Self::use_page_ecc`] before the first key is added.
+    /// writer emits a parity trailer + sets the `ECC_PARITY` flag in
+    /// the header. Default `false`. Caller wires `Config::page_ecc`
+    /// into this field via [`Self::use_page_ecc`] before the first key
+    /// is added.
     page_ecc: bool,
 
     /// Per-KV checksum policy + algorithm for data blocks. `None` (default)
@@ -361,7 +361,7 @@ impl Writer {
     /// When `true`, every block this writer emits upgrades its
     /// `BlockTransform` to the matching `*Ecc` variant (so the
     /// `Block::write_into` call emits a Reed-Solomon parity
-    /// trailer and records non-zero `ecc_length` in the header).
+    /// trailer and sets the `ECC_PARITY` flag in the header).
     /// Must be called BEFORE the first key is added so all blocks
     /// in the table use the same setting; the contract is
     /// enforced by callers (`Tree::open` + compaction worker pass

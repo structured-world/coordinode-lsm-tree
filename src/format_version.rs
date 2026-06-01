@@ -76,15 +76,14 @@ pub enum FormatVersion {
     ///    `src/table/filter/ribbon/burr/wire.rs`.
     ///
     /// 2. Per-block Reed-Solomon Page ECC: the block header gains a
-    ///    `ecc_length: u32` field and the on-disk block can carry a
-    ///    Reed-Solomon parity trailer immediately after the
-    ///    XXH3-covered payload bytes. When `Config::page_ecc(false)`
-    ///    (the default), `ecc_length = 0` and no parity bytes
-    ///    follow. The block magic was bumped to `[L,S,M,4]`
-    ///    (was `[L,S,M,3]` on pre-V5 versions) so a pre-V5 reader
-    ///    that bypasses the manifest gate fails fast at block header
-    ///    decode rather than misreading the moved field as checksum
-    ///    bytes.
+    ///    `block_flags: u8` byte whose `ECC_PARITY` bit marks that a
+    ///    Reed-Solomon parity trailer follows the XXH3-covered payload
+    ///    bytes (its length is derived from `data_length`, not stored).
+    ///    When `Config::page_ecc(false)` (the default), the bit is clear
+    ///    and no parity bytes follow. The block magic was bumped to
+    ///    `[L,S,M,4]` (was `[L,S,M,3]` on pre-V5 versions) so a pre-V5
+    ///    reader that bypasses the manifest gate fails fast at block
+    ///    header decode rather than misreading the new layout.
     ///
     /// V3 / V4 ↔ V5 incompatibility is enforced primarily by the
     /// manifest version gate at `Tree::open` (returns
