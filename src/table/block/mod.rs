@@ -262,8 +262,14 @@ impl Block {
         }
 
         // Self-describe the transform stack in the header. Compression /
-        // encryption / ECC are derived from the active `transform`; the
-        // caller ORs in any bit it can't derive (the per-KV footer).
+        // encryption are derived from the active `transform`; the caller
+        // ORs in any bit it can't derive (the per-KV footer). The ECC_PARITY
+        // bit is NOT set here: it must agree with the parity length actually
+        // emitted, which is only known after the parity step below (the ECC
+        // encoder short-circuits to a zero-length trailer for an empty
+        // payload even when page_ecc is on). It is set after `ecc_length`
+        // is computed, gated on `ecc_length > 0`, so the bit stays
+        // presence-authoritative.
         let block_flags = {
             use crate::table::block::header::block_flags;
             let mut f = extra_flags;
@@ -272,9 +278,6 @@ impl Block {
             }
             if transform.encryption().is_some() {
                 f |= block_flags::ENCRYPTED;
-            }
-            if transform.page_ecc() {
-                f |= block_flags::ECC_PARITY;
             }
             f
         };
@@ -418,6 +421,14 @@ impl Block {
                     limit: u64::from(u32::MAX),
                 })?;
             header.ecc_length = p_len;
+            // Presence-authoritative ECC_PARITY bit: set only when a
+            // non-empty parity trailer was actually emitted. An empty
+            // payload yields a zero-length trailer (the encoder
+            // short-circuits), so the bit stays clear and agrees with
+            // `ecc_length == 0`.
+            if p_len > 0 {
+                header.block_flags |= crate::table::block::header::block_flags::ECC_PARITY;
+            }
             Some(p)
         } else {
             None

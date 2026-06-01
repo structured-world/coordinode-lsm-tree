@@ -436,6 +436,18 @@ impl DataBlock {
         let array_start = kv_checksum::split_inner(&block.data)?.len();
         let mut header = block.header;
         header.block_flags &= !block_flags::KV_CHECKSUM_FOOTER;
+        // The footer was part of the (decompressed) payload, so shrink
+        // `uncompressed_length` to the stripped inner length. Leaving it at
+        // the footered length makes the in-memory block inconsistent and
+        // makes cache weighing over-count footer bytes. `array_start` is a
+        // prefix of the original payload, so it fits the same u32.
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "array_start <= original uncompressed_length, which is u32"
+        )]
+        {
+            header.uncompressed_length = array_start as u32;
+        }
         Ok(Self::new(Block {
             header,
             data: block.data.slice(..array_start),
