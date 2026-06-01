@@ -409,29 +409,46 @@ fn tree_page_ecc_emits_parity_trailer_on_disk() -> lsm_tree::Result<()> {
         .section(b"data")
         .expect("data section must exist in a valid SST");
 
-    let mut data_reader = data_section.buf_reader(&sst_path)?;
+    use std::io::Read as _;
+    let mut section_bytes = Vec::new();
+    data_section
+        .buf_reader(&sst_path)?
+        .read_to_end(&mut section_bytes)?;
+
     // Decode the FIRST data block's header. SST data blocks omit the
     // `block_flags` byte, so the header alone no longer carries the
-    // ECC_PARITY bit — parity presence is a per-SST descriptor property.
-    // The parity trailer is therefore not derivable from the header in
-    // isolation; instead, confirm it landed on disk by comparing the
-    // actual data-section length against header + payload. The two
-    // tiny KVs above produce exactly one data block, so the section
-    // length equals `header_len + data_length + parity_len`; a parity
-    // trailer means that total exceeds `header_len + data_length`.
-    let header = Header::decode_from(&mut data_reader)?;
-    assert!(
-        data_section.len() as usize > Header::MIN_LEN + header.data_length as usize,
-        "page_ecc(true) tree must emit blocks with a parity trailer, \
-         got none in first data block of {}",
-        sst_path.display(),
-    );
-    // Defensive: also sanity-check that data_length is non-trivial
-    // so we know we actually decoded a real block header (not a
-    // zero-init buffer).
+    // ECC_PARITY bit — parity presence is a per-SST descriptor property and
+    // is not derivable from the header in isolation.
+    let mut cursor = &section_bytes[..];
+    let header = Header::decode_from(&mut cursor)?;
+    // Sanity-check that data_length is non-trivial so we know we decoded a
+    // real block header (not a zero-init buffer).
     assert!(
         header.data_length > 0,
         "first data block header should have non-zero data_length"
+    );
+
+    // A block written WITHOUT a parity trailer occupies exactly
+    // `MIN_LEN + data_length` bytes. With page_ecc(true) the writer appends a
+    // Reed-Solomon parity trailer, so the bytes immediately after the first
+    // block's payload are parity — and decoding a `Header` there MUST fail
+    // (parity is not a valid block). This is robust to a fixture that ever
+    // spills more than one data block: a second block WOULD decode as a valid
+    // header at this offset, so the failure also proves the single-block
+    // premise a bare section-length comparison would silently depend on.
+    let after_first_payload = Header::MIN_LEN + header.data_length as usize;
+    assert!(
+        section_bytes.len() > after_first_payload,
+        "page_ecc(true) tree must emit a parity trailer after the first data \
+         block, got none in {}",
+        sst_path.display(),
+    );
+    let mut trailing = section_bytes.get(after_first_payload..).unwrap_or(&[]);
+    assert!(
+        Header::decode_from(&mut trailing).is_err(),
+        "bytes after the first data block's payload must be a parity trailer, \
+         not a second block header — a successful decode means the fixture \
+         spilled multiple data blocks and this ECC assertion is invalid",
     );
 
     Ok(())
