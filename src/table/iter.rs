@@ -96,6 +96,12 @@ fn create_data_block_reader(
     OwnedDataBlockIter::try_new(block, |b| b.try_iter(comparator))
 }
 
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "independent per-SST/iterator state flags (page_ecc, has_kv_footer, \
+              index_initialized, poisoned); each is threaded or set independently, \
+              so a state-machine enum would conflate orthogonal concerns"
+)]
 pub struct Iter {
     table_id: GlobalTableId,
     path: Arc<PathBuf>,
@@ -112,6 +118,10 @@ pub struct Iter {
     /// Per-SST Page-ECC flag from table metadata; the block reader needs it
     /// to know whether data blocks carry a parity trailer.
     page_ecc: bool,
+    /// Per-SST per-KV-footer flag from table metadata
+    /// (`kv_checksum_algo.is_some()`); data blocks omit the `block_flags` byte,
+    /// so `from_loaded` is told here whether to strip a footer.
+    has_kv_footer: bool,
     #[cfg(zstd_any)]
     zstd_dictionary: Option<Arc<crate::compression::ZstdDictionary>>,
     comparator: SharedComparator,
@@ -150,6 +160,7 @@ impl Iter {
         compression: CompressionType,
         encryption: Option<Arc<dyn EncryptionProvider>>,
         page_ecc: bool,
+        has_kv_footer: bool,
         #[cfg(zstd_any)] zstd_dictionary: Option<Arc<crate::compression::ZstdDictionary>>,
         comparator: SharedComparator,
         #[cfg(feature = "metrics")] metrics: Arc<Metrics>,
@@ -166,6 +177,7 @@ impl Iter {
             compression,
             encryption,
             page_ecc,
+            has_kv_footer,
             #[cfg(zstd_any)]
             zstd_dictionary,
             comparator,
@@ -314,7 +326,7 @@ impl Iterator for Iter {
                 Ok(b) => b,
                 Err(e) => return self.poison(e),
             };
-            let block = match DataBlock::from_loaded(block) {
+            let block = match DataBlock::from_loaded(block, self.has_kv_footer) {
                 Ok(b) => b,
                 Err(e) => return self.poison(e),
             };
@@ -446,7 +458,7 @@ impl DoubleEndedIterator for Iter {
                 Ok(b) => b,
                 Err(e) => return self.poison(e),
             };
-            let block = match DataBlock::from_loaded(block) {
+            let block = match DataBlock::from_loaded(block, self.has_kv_footer) {
                 Ok(b) => b,
                 Err(e) => return self.poison(e),
             };

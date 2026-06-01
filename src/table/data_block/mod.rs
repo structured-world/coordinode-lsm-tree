@@ -407,35 +407,34 @@ impl DataBlock {
     }
 
     /// Builds a `DataBlock` from a freshly loaded block, transparently
-    /// stripping the per-KV checksum footer when the block carries one
-    /// (the [`block_flags::KV_CHECKSUM_FOOTER`] header bit is set).
+    /// stripping the per-KV checksum footer when the SST carries one.
     ///
-    /// For a plain data block (bit clear) this is identical to
-    /// [`Self::new`]. When the footer is present it splits the footer off
-    /// and stores only the inner standard data-block slice (with the bit
-    /// cleared), so every downstream read path — `try_iter`, `point_read`,
-    /// seek, trailer — operates unchanged. The per-KV digests are NOT
-    /// verified here (that is the scrub / paranoid path, see
-    /// [`Self::verify_kv_checked`]); the block-level checksum already
-    /// validated the on-disk bytes at load time.
+    /// `has_kv_footer` comes from the per-SST descriptor
+    /// (`ParsedMeta::kv_checksum_algo.is_some()`), NOT from a per-block header
+    /// flag: data blocks omit the `block_flags` byte (it lives in the
+    /// descriptor), so the caller supplies the table-wide footer state. When
+    /// `false` this is identical to [`Self::new`]; when `true` it splits the
+    /// footer off and stores only the inner standard data-block slice, so
+    /// every downstream read path — `try_iter`, `point_read`, seek, trailer —
+    /// operates unchanged. The per-KV digests are NOT verified here (that is
+    /// the scrub / paranoid path, see [`Self::verify_kv_checked`]); the
+    /// block-level checksum already validated the on-disk bytes at load time.
     ///
     /// # Errors
     ///
     /// Returns [`crate::Error::InvalidTrailer`] if a footer-bearing block's
     /// footer is structurally malformed.
-    pub(crate) fn from_loaded(block: Block) -> crate::Result<Self> {
-        use crate::table::block::{header::block_flags, kv_checksum};
+    pub(crate) fn from_loaded(block: Block, has_kv_footer: bool) -> crate::Result<Self> {
+        use crate::table::block::kv_checksum;
 
-        if block.header.block_flags & block_flags::KV_CHECKSUM_FOOTER == 0 {
+        if !has_kv_footer {
             return Ok(Self::new(block));
         }
 
         // Determine the inner-slice length by splitting the footer, then
-        // keep a zero-copy sub-slice of the original block bytes. Clear the
-        // footer bit so the stripped block reads as a plain data block.
+        // keep a zero-copy sub-slice of the original block bytes.
         let array_start = kv_checksum::split_inner(&block.data)?.len();
         let mut header = block.header;
-        header.block_flags &= !block_flags::KV_CHECKSUM_FOOTER;
         // The footer was part of the (decompressed) payload, so shrink
         // `uncompressed_length` to the stripped inner length. Leaving it at
         // the footered length makes the in-memory block inconsistent and
@@ -1198,16 +1197,16 @@ mod tests {
         let mut bytes = Vec::new();
         DataBlock::encode_kv_checked_into(&mut bytes, &items, &digests, algo, 2, 0.0)?;
 
-        // The reader receives a Data block with the KV_CHECKSUM_FOOTER bit
-        // set and must strip the footer.
-        let loaded = DataBlock::from_loaded(Block {
-            data: bytes.into(),
-            header: Header {
-                block_flags: crate::table::block::header::block_flags::KV_CHECKSUM_FOOTER,
-                ..Header::test_dummy(BlockType::Data)
+        // The SST carries per-KV footers (descriptor → has_kv_footer=true), so
+        // from_loaded strips the footer. Data block headers omit the
+        // block_flags byte; footer presence is supplied out-of-band.
+        let loaded = DataBlock::from_loaded(
+            Block {
+                data: bytes.into(),
+                header: Header::test_dummy(BlockType::Data),
             },
-        })?;
-        // After stripping, the footer bit is cleared.
+            true,
+        )?;
         assert_eq!(loaded.inner.header.block_type, BlockType::Data);
         assert_eq!(loaded.inner.header.block_flags, 0);
 
@@ -1253,15 +1252,17 @@ mod tests {
         DataBlock::encode_kv_checked_into(&mut bytes, &items, &digests, algo, 2, 0.0)?;
         let footered_len = bytes.len();
 
-        let loaded = DataBlock::from_loaded(Block {
-            data: bytes.into(),
-            header: Header {
-                block_flags: crate::table::block::header::block_flags::KV_CHECKSUM_FOOTER,
-                // Header size includes the footer, as the on-disk header does.
-                uncompressed_length: footered_len as u32,
-                ..Header::test_dummy(BlockType::Data)
+        let loaded = DataBlock::from_loaded(
+            Block {
+                data: bytes.into(),
+                header: Header {
+                    // uncompressed_length includes the footer, as on disk.
+                    uncompressed_length: footered_len as u32,
+                    ..Header::test_dummy(BlockType::Data)
+                },
             },
-        })?;
+            true,
+        )?;
 
         let inner_len = loaded.as_slice().len();
         assert!(

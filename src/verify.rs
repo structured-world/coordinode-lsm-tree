@@ -762,7 +762,6 @@ struct WalkCtx<'a> {
 fn walk_block_region(ctx: &mut WalkCtx<'_>, start_offset: u64, end_offset: u64) {
     use std::io::Read;
 
-    let header_len = Header::serialized_len() as u64;
     let mut offset = start_offset;
 
     while offset < end_offset {
@@ -778,14 +777,17 @@ fn walk_block_region(ctx: &mut WalkCtx<'_>, start_offset: u64, end_offset: u64) 
         // run because `walk_block_region` returns rather than
         // bubbling the error up.
         let remaining_in_section = end_offset - offset;
-        if remaining_in_section < header_len {
+        // Lower bound: the header is at least MIN_LEN (the exact length, with
+        // or without the block_flags byte, is known only after decode).
+        if remaining_in_section < Header::MIN_LEN as u64 {
             ctx.errors.push(BlockVerifyError::HeaderCorrupted {
                 table_id: ctx.table_id,
                 path: ctx.path.to_path_buf(),
                 offset,
                 reason: format!(
                     "section has only {remaining_in_section} bytes left at this offset, \
-                     less than Header::serialized_len() = {header_len}",
+                     less than Header::MIN_LEN = {}",
+                    Header::MIN_LEN,
                 ),
             });
             return;
@@ -811,6 +813,11 @@ fn walk_block_region(ctx: &mut WalkCtx<'_>, start_offset: u64, end_offset: u64) 
         // be silently uncounted, contradicting the documented
         // semantics.
         *ctx.blocks_scanned = ctx.blocks_scanned.saturating_add(1);
+
+        // Actual header length for this block (variable: SST blocks omit the
+        // block_flags byte). Used for the section-bounds math and the offset
+        // advance so the walk tracks what `decode_from` actually consumed.
+        let header_len = Header::header_len(header.block_type) as u64;
 
         // Validate data_length against TWO bounds before allocating
         // / reading:
@@ -1038,7 +1045,7 @@ mod block_verify_tests {
         // Header — that lands squarely inside the data segment of the
         // first data block, so the header's own XXH3 stays valid (no
         // HeaderCorrupted) but the data XXH3 will now mismatch.
-        let flip_offset = Header::serialized_len() as u64;
+        let flip_offset = Header::MIN_LEN as u64;
         {
             let mut f = std::fs::OpenOptions::new()
                 .read(true)
@@ -1124,6 +1131,10 @@ mod block_verify_tests {
         *payload.get_mut(inner_len).expect("digest array byte") ^= 0xFF;
 
         // Write with a VALID block-level checksum over the corrupted payload.
+        // Data blocks omit the `block_flags` byte (footer presence is a per-SST
+        // descriptor property), so the KV_CHECKSUM_FOOTER flag passed here is
+        // dropped on encode — the footer rides inside the payload structurally,
+        // and `verify_kv_checked` splits it without consulting the header bit.
         let id = BlockIdentity::for_test(0, 0, BlockType::Data);
         let mut buf = Vec::new();
         Block::write_into_with_flags(
@@ -1137,11 +1148,6 @@ mod block_verify_tests {
 
         // Block loads fine (block-level checksum matches the corrupted bytes).
         let block = Block::from_reader(&mut &buf[..], id, &BlockTransform::PLAIN).unwrap();
-        assert_ne!(
-            block.header.block_flags & block_flags::KV_CHECKSUM_FOOTER,
-            0,
-            "footer flag must survive the round-trip"
-        );
 
         // Only the per-KV verifier catches the bad digest. `None` skips the
         // algorithm cross-check — this test exercises the digest-mismatch path.
@@ -1270,7 +1276,7 @@ mod block_verify_tests {
         //   MAGIC(4) | version(1) | csum_type(1) | toc_checksum(16) | toc_pos(8) | toc_len(8)
         const TRAILER_LEN: usize = 4 + 1 + 1 + 16 + 8 + 8;
         const DATA_LENGTH: u32 = 4096;
-        const HEADER_LEN: u64 = Header::serialized_len() as u64;
+        const HEADER_LEN: u64 = Header::MIN_LEN as u64;
 
         let header = Header {
             // Arbitrary sentinel; the walker reaches `read_exact` and

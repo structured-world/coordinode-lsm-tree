@@ -462,7 +462,7 @@ fn range_tombstone_tampered_rt_block_fails_recovery() -> lsm_tree::Result<()> {
 
         let mut file = OpenOptions::new().write(true).open(&*rt_table.path)?;
         let payload_pos = *rt_handle.offset()
-            + u64::try_from(lsm_tree::table::block::Header::serialized_len())
+            + u64::try_from(lsm_tree::table::block::Header::MIN_LEN)
                 .expect("header size should fit in u64");
         file.seek(SeekFrom::Start(payload_pos))?;
         file.write_all(&u16::MAX.to_le_bytes())?;

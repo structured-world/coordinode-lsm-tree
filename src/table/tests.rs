@@ -2038,7 +2038,9 @@ fn meta_seqno_kv_max_corruption_returns_invalid_data() -> crate::Result<()> {
         let raw_block =
             crate::file::read_exact(&f, *meta_handle.offset(), meta_handle.size() as usize)?;
 
-        let header_len = Header::serialized_len();
+        // Meta blocks carry the block_flags byte, so their header is
+        // header_len(Meta), not the SST MIN_LEN.
+        let header_len = Header::header_len(crate::table::block::BlockType::Meta);
         let payload = &raw_block[header_len..];
 
         // Find the seqno#kv_max value bytes in the payload and replace

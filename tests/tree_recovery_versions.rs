@@ -410,12 +410,18 @@ fn tree_page_ecc_emits_parity_trailer_on_disk() -> lsm_tree::Result<()> {
         .expect("data section must exist in a valid SST");
 
     let mut data_reader = data_section.buf_reader(&sst_path)?;
-    // Decode the FIRST data block's header. With `page_ecc(true)`
-    // the writer must emit a parity trailer for every block, so the
-    // derived on-disk size exceeds header + payload.
+    // Decode the FIRST data block's header. SST data blocks omit the
+    // `block_flags` byte, so the header alone no longer carries the
+    // ECC_PARITY bit — parity presence is a per-SST descriptor property.
+    // The parity trailer is therefore not derivable from the header in
+    // isolation; instead, confirm it landed on disk by comparing the
+    // actual data-section length against header + payload. The two
+    // tiny KVs above produce exactly one data block, so the section
+    // length equals `header_len + data_length + parity_len`; a parity
+    // trailer means that total exceeds `header_len + data_length`.
     let header = Header::decode_from(&mut data_reader)?;
     assert!(
-        (header.on_disk_size() as usize) > Header::serialized_len() + header.data_length as usize,
+        data_section.len() as usize > Header::MIN_LEN + header.data_length as usize,
         "page_ecc(true) tree must emit blocks with a parity trailer, \
          got none in first data block of {}",
         sst_path.display(),

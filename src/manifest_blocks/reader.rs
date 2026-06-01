@@ -447,15 +447,16 @@ fn validate_block_header_fits(buf: &[u8], ctx: HeaderContext) -> crate::Result<(
             }
         }
     };
-    let header_len = Header::serialized_len();
-    if buf.len() < header_len {
+    // Lower bound: every header is at least MIN_LEN; the exact length (with
+    // or without the block_flags byte) is known only after the block_type is
+    // decoded. Bound the decode cursor at MAX_LEN — `decode_from` reads only
+    // the actual header for the parsed type and ignores any extra slot bytes.
+    if buf.len() < Header::MIN_LEN {
         return Err(wrap("manifest Block buffer shorter than Block header"));
     }
-    // Length guarded by the `buf.len() < header_len` check above —
-    // the slice cannot panic. `get(..n)` would return Option that
-    // we'd unwrap to the same effect.
+    let cursor_end = Header::MAX_LEN.min(buf.len());
     let mut cursor = Cursor::new(
-        buf.get(..header_len)
+        buf.get(..cursor_end)
             .ok_or_else(|| wrap("manifest Block header slice unexpectedly short"))?,
     );
     // Map header-decode failures (InvalidTag for unknown
@@ -906,10 +907,11 @@ mod tests {
 
         // Flip the first byte of section b's payload region (right after
         // the Block header) so the bit lands in the XXH3-checksummed
-        // payload, not the header or an adjacent section. Derived from
-        // `Header::serialized_len()` so it tracks the header size rather
-        // than a hard-coded offset.
-        let payload_off = b_offset + Header::serialized_len() as u64;
+        // payload, not the header or an adjacent section. Manifest section
+        // blocks are `BlockType::Manifest`, which carries the block_flags
+        // byte, so the header is `header_len(Manifest)` bytes.
+        let payload_off =
+            b_offset + Header::header_len(crate::table::block::BlockType::Manifest) as u64;
         {
             let mut file = fs
                 .open(path, &FsOpenOptions::new().write(true).read(true))

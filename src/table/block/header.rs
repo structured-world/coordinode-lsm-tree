@@ -123,25 +123,58 @@ pub struct Header {
 }
 
 impl Header {
+    /// Header size WITHOUT the optional `block_flags` byte: the fixed part
+    /// every block carries (magic + `block_type` + checksum + `data_length` +
+    /// `uncompressed_length` + header checksum). Pre-decode lower bound; the
+    /// actual size for a given block is [`Self::header_len`].
+    pub const MIN_LEN: usize = MAGIC_BYTES.len()
+        // Block type — encoded as a single u8 by encode_into, not as
+        // size_of::<BlockType>(). BlockType is a fieldless enum without
+        // `#[repr(u8)]`, so its in-memory size is implementation-defined;
+        // the wire format is the contract and that contract is 1 byte.
+        + 1
+        // Data checksum
+        + std::mem::size_of::<Checksum>()
+        // On-disk size
+        + std::mem::size_of::<u32>()
+        // Uncompressed data length
+        + std::mem::size_of::<u32>()
+        // Header checksum
+        + std::mem::size_of::<u32>();
+
+    /// Largest possible header size: [`Self::MIN_LEN`] plus the optional
+    /// `block_flags` byte. Used as a pre-decode upper bound where the
+    /// `block_type` (and thus exact header length) is not yet known.
+    pub const MAX_LEN: usize = Self::MIN_LEN + 1;
+
+    /// Whether a block of `block_type` carries the `block_flags` byte.
+    ///
+    /// Bootstrap / out-of-band blocks keep the self-describing byte:
+    /// `Meta` is read before its own per-SST descriptor exists (the
+    /// descriptor lives inside it); `Manifest` / `ManifestFooter` belong to
+    /// the manifest subsystem, which has no per-SST descriptor at all.
+    ///
+    /// Ordinary SST blocks (`Data` / `Index` / `Filter` / `RangeTombstone`)
+    /// are read AFTER their table's `ParsedMeta` descriptor is loaded, so
+    /// their transform presence is sourced from that descriptor and the byte
+    /// is omitted — saving one byte per block.
     #[must_use]
-    pub const fn serialized_len() -> usize {
-        MAGIC_BYTES.len()
-            // Block type — encoded as a single u8 by encode_into,
-            // not as size_of::<BlockType>(). BlockType is a fieldless
-            // enum without `#[repr(u8)]`, so its in-memory size is
-            // implementation-defined; the wire format is the contract
-            // and that contract is 1 byte.
-            + 1
-            // Transform-layer presence flags (block_flags) — 1 byte
-            + 1
-            // Data checksum
-            + std::mem::size_of::<Checksum>()
-            // On-disk size
-            + std::mem::size_of::<u32>()
-            // Uncompressed data length
-            + std::mem::size_of::<u32>()
-            // Checksum
-            + std::mem::size_of::<u32>()
+    pub const fn has_block_flags(block_type: BlockType) -> bool {
+        matches!(
+            block_type,
+            BlockType::Meta | BlockType::Manifest | BlockType::ManifestFooter
+        )
+    }
+
+    /// On-disk header length for `block_type`: [`Self::MIN_LEN`] plus the
+    /// `block_flags` byte when [`Self::has_block_flags`] is true.
+    #[must_use]
+    pub const fn header_len(block_type: BlockType) -> usize {
+        if Self::has_block_flags(block_type) {
+            Self::MIN_LEN + 1
+        } else {
+            Self::MIN_LEN
+        }
     }
 
     /// Total bytes this block occupies on disk: header + payload +
@@ -165,9 +198,9 @@ impl Header {
         // within u32.
         #[expect(
             clippy::cast_possible_truncation,
-            reason = "Header::serialized_len() is a small const"
+            reason = "Header::header_len() is a small const"
         )]
-        let header = Self::serialized_len() as u32;
+        let header = Self::header_len(self.block_type) as u32;
         let parity = if self.block_flags & block_flags::ECC_PARITY != 0 {
             super::expected_parity_len(self.data_length)
         } else {
@@ -192,8 +225,13 @@ impl Encode for Header {
             // Write block type
             writer.write_u8(self.block_type.into())?;
 
-            // Write transform-layer presence flags
-            writer.write_u8(self.block_flags)?;
+            // Write transform-layer presence flags — only for block types
+            // that carry the byte (Meta / Manifest / ManifestFooter). SST
+            // blocks omit it and derive transform presence from the per-SST
+            // descriptor on read.
+            if Self::has_block_flags(self.block_type) {
+                writer.write_u8(self.block_flags)?;
+            }
 
             // Write data checksum
             writer.write_u128::<LE>(self.checksum.into_u128())?;
@@ -236,16 +274,22 @@ impl Decode for Header {
         let block_type = protected_reader.read_u8()?;
         let block_type = BlockType::try_from(block_type)?;
 
-        // Read transform-layer presence flags. Reject any byte with a bit
-        // outside the defined set: a persisted transform field with an
-        // unknown high bit means a newer writer or a forged header is
-        // declaring a layer this build can't honor — fail fast rather than
-        // misread it as a partially-known block.
-        let flags = protected_reader.read_u8()?;
-        if flags & !block_flags::KNOWN != 0 {
-            return Err(crate::Error::InvalidTag(("block_flags", flags)));
-        }
-        let block_flags = flags;
+        // Read transform-layer presence flags — only for block types that
+        // carry the byte (Meta / Manifest / ManifestFooter). SST blocks omit
+        // it (transform presence comes from the per-SST descriptor), so their
+        // in-memory `block_flags` is 0 and callers consult the descriptor.
+        // Reject any byte with a bit outside the defined set: an unknown high
+        // bit means a newer writer or a forged header is declaring a layer
+        // this build can't honor.
+        let block_flags = if Self::has_block_flags(block_type) {
+            let flags = protected_reader.read_u8()?;
+            if flags & !block_flags::KNOWN != 0 {
+                return Err(crate::Error::InvalidTag(("block_flags", flags)));
+            }
+            flags
+        } else {
+            0
+        };
 
         // Read data checksum
         let checksum = protected_reader.read_u128::<LE>()?;
@@ -328,10 +372,10 @@ mod tests {
 
     #[test]
     fn block_header_serde_roundtrip() -> crate::Result<()> {
+        // Manifest carries the block_flags byte, so this exercises the
+        // round-trip of a non-zero flags byte (SST block types omit it).
         let header = Header {
-            block_type: BlockType::Data,
-            // Exercise the block_flags byte with two bits set so the
-            // serde round-trip covers it, not just the zero default.
+            block_type: BlockType::Manifest,
             block_flags: block_flags::KV_CHECKSUM_FOOTER | block_flags::COMPRESSED,
             checksum: Checksum::from_raw(5),
             data_length: 252_356,
@@ -340,9 +384,27 @@ mod tests {
 
         let bytes = header.encode_into_vec();
 
-        assert_eq!(bytes.len(), Header::serialized_len());
+        assert_eq!(bytes.len(), Header::header_len(BlockType::Manifest));
         assert_eq!(header, Header::decode_from(&mut &bytes[..])?);
 
+        Ok(())
+    }
+
+    #[test]
+    fn block_header_serde_roundtrip_sst_omits_flags_byte() -> crate::Result<()> {
+        // SST block types omit the block_flags byte: a Data header encodes to
+        // MIN_LEN bytes and decodes back with block_flags == 0 regardless of
+        // the in-memory value (which the writer leaves at 0 for SST blocks).
+        let header = Header {
+            block_type: BlockType::Data,
+            block_flags: 0,
+            checksum: Checksum::from_raw(7),
+            data_length: 42,
+            uncompressed_length: 42,
+        };
+        let bytes = header.encode_into_vec();
+        assert_eq!(bytes.len(), Header::MIN_LEN);
+        assert_eq!(header, Header::decode_from(&mut &bytes[..])?);
         Ok(())
     }
 
@@ -352,9 +414,10 @@ mod tests {
         // bit this build does not define (here the reserved 1 << 4) must be
         // rejected at decode, not silently accepted as a partially-known
         // block. The header + checksum are otherwise valid, so this isolates
-        // the flag-mask check from checksum validation.
+        // the flag-mask check from checksum validation. Uses Manifest, which
+        // carries the block_flags byte (SST types omit it entirely).
         let header = Header {
-            block_type: BlockType::Data,
+            block_type: BlockType::Manifest,
             block_flags: 1 << 4,
             checksum: Checksum::from_raw(5),
             data_length: 10,
@@ -382,7 +445,10 @@ mod tests {
         };
 
         let mut bytes = header.encode_into_vec();
-        bytes[5] += 1; // mutate the block_flags byte (any header byte flip must be caught)
+        // Mutate a header byte (offset 5 is the first checksum byte for a
+        // Data header, which omits the block_flags byte). Any header byte flip
+        // must be caught by the header checksum.
+        bytes[5] += 1;
 
         assert!(
             matches!(

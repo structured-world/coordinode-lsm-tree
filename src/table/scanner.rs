@@ -26,6 +26,14 @@ pub struct Scanner {
     encryption: Option<Arc<dyn EncryptionProvider>>,
     comparator: SharedComparator,
 
+    /// Per-SST Page-ECC flag from table metadata: data blocks omit the
+    /// `block_flags` byte, so the scanner's block-read transform is told here
+    /// whether each block carries a parity trailer.
+    page_ecc: bool,
+    /// Per-SST per-KV-footer flag (`kv_checksum_algo.is_some()`): supplied to
+    /// `from_loaded` so it strips the footer (data blocks omit the byte).
+    has_kv_footer: bool,
+
     #[cfg(zstd_any)]
     zstd_dictionary: Option<Arc<crate::compression::ZstdDictionary>>,
 
@@ -35,15 +43,12 @@ pub struct Scanner {
 }
 
 impl Scanner {
-    #[cfg_attr(
-        zstd_any,
-        expect(
-            clippy::too_many_arguments,
-            reason = "scanner ctor takes one local per piece of state it needs to thread \
-                      through fetch_next_block; collapsing them into a config struct would \
-                      add an indirection without removing any per-call decision the caller \
-                      makes about the values"
-        )
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "scanner ctor takes one local per piece of state it needs to thread \
+                  through fetch_next_block; collapsing them into a config struct would \
+                  add an indirection without removing any per-call decision the caller \
+                  makes about the values"
     )]
     pub fn new(
         path: &Path,
@@ -51,6 +56,8 @@ impl Scanner {
         compression: CompressionType,
         global_seqno: SeqNo,
         encryption: Option<Arc<dyn EncryptionProvider>>,
+        page_ecc: bool,
+        has_kv_footer: bool,
         #[cfg(zstd_any)] zstd_dictionary: Option<Arc<crate::compression::ZstdDictionary>>,
         comparator: SharedComparator,
         table_id: crate::TableId,
@@ -81,6 +88,8 @@ impl Scanner {
             table_id,
             compression,
             encryption.as_deref(),
+            page_ecc,
+            has_kv_footer,
             #[cfg(zstd_any)]
             zstd_dictionary.as_deref(),
         )?;
@@ -99,6 +108,9 @@ impl Scanner {
             encryption,
             comparator,
 
+            page_ecc,
+            has_kv_footer,
+
             #[cfg(zstd_any)]
             zstd_dictionary,
 
@@ -111,6 +123,8 @@ impl Scanner {
         table_id: crate::TableId,
         compression: CompressionType,
         encryption: Option<&dyn EncryptionProvider>,
+        page_ecc: bool,
+        has_kv_footer: bool,
         #[cfg(zstd_any)] zstd_dict: Option<&crate::compression::ZstdDictionary>,
     ) -> crate::Result<DataBlock> {
         let block = Block::from_reader(
@@ -136,20 +150,28 @@ impl Scanner {
                 dict_id: compression.dict_id(),
                 window_log: 0,
             },
-            &crate::table::block::BlockTransform::from_parts(
-                compression,
-                encryption,
-                #[cfg(zstd_any)]
-                zstd_dict,
-            )?,
+            &{
+                // SST blocks omit the block_flags byte, so ECC presence is a
+                // per-SST property: upgrade the transform to its `*Ecc`
+                // variant when this table was written with Page ECC, so the
+                // reader expects the parity trailer. Identity without the
+                // `page_ecc` feature.
+                let t = crate::table::block::BlockTransform::from_parts(
+                    compression,
+                    encryption,
+                    #[cfg(zstd_any)]
+                    zstd_dict,
+                )?;
+                if page_ecc { t.with_ecc() } else { t }
+            },
         );
 
         match block {
             Ok(block) => {
-                // Per-KV checking is a header flag, so a data block is always
-                // BlockType::Data; `from_loaded` strips the checksum footer
-                // when the KV_CHECKSUM_FOOTER bit is set so the scan path is
-                // unchanged.
+                // A data block is always BlockType::Data; `from_loaded`
+                // strips the per-KV checksum footer when this SST carries one
+                // (per-SST `has_kv_footer`, since data blocks omit the byte),
+                // so the scan path is unchanged.
                 if block.header.block_type != BlockType::Data {
                     return Err(crate::Error::InvalidTag((
                         "BlockType",
@@ -157,7 +179,7 @@ impl Scanner {
                     )));
                 }
 
-                DataBlock::from_loaded(block)
+                DataBlock::from_loaded(block, has_kv_footer)
             }
             Err(e) => Err(e),
         }
@@ -184,6 +206,8 @@ impl Iterator for Scanner {
                 self.table_id,
                 self.compression,
                 self.encryption.as_deref(),
+                self.page_ecc,
+                self.has_kv_footer,
                 #[cfg(zstd_any)]
                 self.zstd_dictionary.as_deref(),
             ) {
