@@ -393,6 +393,10 @@ impl Writer {
         policy: crate::runtime_config::KvChecksumPolicy,
         algo: crate::runtime_config::ChecksumAlgorithm,
     ) -> Self {
+        // Must be fixed before the first key: toggling mid-write would mix
+        // footer-bearing and plain data blocks in one table at an arbitrary
+        // boundary, which the per-SST policy contract does not allow.
+        self.assert_not_started("use_kv_checksums");
         self.kv_checksum = if matches!(policy, crate::runtime_config::KvChecksumPolicy::Off) {
             None
         } else {

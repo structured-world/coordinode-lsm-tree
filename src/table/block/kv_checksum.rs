@@ -73,6 +73,11 @@ pub fn kv_digest(item: &InternalValue, algo: ChecksumAlgorithm) -> Option<u64> {
 /// trailer.
 pub fn append_footer(payload: &mut Vec<u8>, digests: &[u64], algo: ChecksumAlgorithm) {
     let size = algo.digest_size();
+    // Every digest is stored from a `u64`'s LE bytes, so the width must fit
+    // in 8. A future algorithm with a wider digest would silently skip the
+    // `le.get(..size)` copy below and emit a malformed footer; catch that in
+    // debug builds rather than ship a footer the reader can't split.
+    debug_assert!(size <= 8, "digest_size must fit in u64 LE bytes");
     for &d in digests {
         let le = d.to_le_bytes();
         // `digest_size` is 4 or 8; the low `size` bytes are the meaningful
@@ -293,5 +298,35 @@ mod tests {
         payload.push(ChecksumAlgorithm::Xxh3_64.wire_tag());
         payload.extend_from_slice(&1000u32.to_le_bytes()); // 1000×8 ≫ payload
         assert!(split_inner(&payload).is_err());
+    }
+
+    #[test]
+    fn split_full_recovers_digests() {
+        // The scrub path relies on split_full to recover the inner slice,
+        // the per-entry digests in order, and the algorithm. Xxh3_64 keeps
+        // the full u64; Xxh3Low32 stores only the low 32 bits, so compare
+        // against the masked expectation.
+        for algo in [ChecksumAlgorithm::Xxh3_64, ChecksumAlgorithm::Xxh3Low32] {
+            let inner = b"standard data block payload bytes".to_vec();
+            let digests: Vec<u64> = (0..5u64).map(|i| 0x0102_0304_0506_0708 ^ i).collect();
+
+            let mut payload = inner.clone();
+            append_footer(&mut payload, &digests, algo);
+
+            let split = split_full(&payload).expect("well-formed footer must split");
+            assert_eq!(split.inner, &inner[..], "inner payload must round-trip");
+            assert_eq!(split.algo, algo, "algorithm tag must round-trip");
+
+            let mask = if algo.digest_size() == 8 {
+                u64::MAX
+            } else {
+                0xFFFF_FFFF
+            };
+            let expected: Vec<u64> = digests.iter().map(|d| d & mask).collect();
+            assert_eq!(
+                split.digests, expected,
+                "digests must round-trip (masked to width) for {algo:?}"
+            );
+        }
     }
 }
