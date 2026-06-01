@@ -77,14 +77,17 @@ pub fn append_footer(payload: &mut Vec<u8>, digests: &[u64], algo: ChecksumAlgor
     // in 8. A future algorithm with a wider digest would silently skip the
     // `le.get(..size)` copy below and emit a malformed footer; catch that in
     // debug builds rather than ship a footer the reader can't split.
-    debug_assert!(size <= 8, "digest_size must fit in u64 LE bytes");
+    assert!(size <= 8, "digest_size must fit in u64 LE bytes");
     for &d in digests {
         let le = d.to_le_bytes();
         // `digest_size` is 4 or 8; the low `size` bytes are the meaningful
         // digest (Xxh3Low32 / Crc32c already mask to 32 bits in `compute`).
-        if let Some(slice) = le.get(..size) {
-            payload.extend_from_slice(slice);
-        }
+        // Index rather than `get(..size)`: the assert above guarantees
+        // `size <= 8`, so this never panics for any real algorithm, and a
+        // future wider-digest algorithm fails loudly in release too instead
+        // of silently emitting a footer the reader can't split.
+        #[expect(clippy::indexing_slicing, reason = "size <= 8 enforced above")]
+        payload.extend_from_slice(&le[..size]);
     }
     payload.push(algo.wire_tag());
     // Entry count fits u32: data blocks never approach 4G entries.

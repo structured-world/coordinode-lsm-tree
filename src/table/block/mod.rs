@@ -224,13 +224,19 @@ impl Block {
     /// `transform` here, so every block self-describes its full transform
     /// stack in [`Header::block_flags`] regardless of which entry point is
     /// used.
+    ///
+    /// Crate-internal: the `extra_flags` bag is a raw `u8` whose only valid
+    /// bits live in the crate-private `block_flags` module, so an external
+    /// caller could only guess magic values and a wrong bit would serialize
+    /// a header claiming a transform the payload doesn't carry. External
+    /// code uses the safe [`Self::write_into`] wrapper instead.
     #[expect(
         clippy::too_many_lines,
         reason = "linear writer pipeline: compress → encrypt → checksum → ecc; \
                   each step is small but they share state (header, payload, owned buffers) \
                   so factoring would just hide the data flow"
     )]
-    pub fn write_into_with_flags<W: std::io::Write>(
+    pub(crate) fn write_into_with_flags<W: std::io::Write>(
         mut writer: &mut W,
         data: &[u8],
         identity: BlockIdentity,

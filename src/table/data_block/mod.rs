@@ -726,6 +726,14 @@ impl DataBlock {
     /// block; a `None` for an unavailable algorithm is the caller's
     /// responsibility to reject before reaching this point.
     ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error::InvalidTrailer`] if `digests.len()` does not
+    /// equal `items.len()`: the footer's `count` field would disagree with
+    /// the stored digest array, so the write is rejected rather than
+    /// producing structurally-corrupt on-disk data (validated at runtime,
+    /// not only via a debug assertion that vanishes in release builds).
+    ///
     /// # Panics
     ///
     /// Panics if `items` is empty (same contract as [`Self::encode_into`]).
@@ -737,11 +745,9 @@ impl DataBlock {
         restart_interval: u8,
         hash_index_ratio: f32,
     ) -> crate::Result<()> {
-        debug_assert_eq!(
-            items.len(),
-            digests.len(),
-            "one digest per entry, in scan order"
-        );
+        if items.len() != digests.len() {
+            return Err(crate::Error::InvalidTrailer);
+        }
         Self::encode_into(writer, items, restart_interval, hash_index_ratio)?;
         super::block::kv_checksum::append_footer(writer, digests, algo);
         Ok(())

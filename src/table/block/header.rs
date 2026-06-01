@@ -90,6 +90,14 @@ pub mod block_flags {
     /// `BlockTransform`); this bit is a presence-only self-describing
     /// signal, not validated against the transform on the read path.
     pub const ENCRYPTED: u8 = 1 << 3;
+
+    /// Mask of every defined transform-layer bit. The header decoder
+    /// rejects any byte with a bit set outside this mask: `block_flags`
+    /// is a persisted transform field, so an unknown high bit means a
+    /// newer writer or a forged header is trying to declare a layer this
+    /// build does not understand. Failing fast beats silently treating
+    /// it as a partially-known block.
+    pub const KNOWN: u8 = KV_CHECKSUM_FOOTER | ECC_PARITY | COMPRESSED | ENCRYPTED;
 }
 
 /// Header of a disk-based block
@@ -237,8 +245,16 @@ impl Decode for Header {
         let block_type = protected_reader.read_u8()?;
         let block_type = BlockType::try_from(block_type)?;
 
-        // Read transform-layer presence flags
-        let block_flags = protected_reader.read_u8()?;
+        // Read transform-layer presence flags. Reject any byte with a bit
+        // outside the defined set: a persisted transform field with an
+        // unknown high bit means a newer writer or a forged header is
+        // declaring a layer this build can't honor — fail fast rather than
+        // misread it as a partially-known block.
+        let flags = protected_reader.read_u8()?;
+        if flags & !block_flags::KNOWN != 0 {
+            return Err(crate::Error::InvalidTag(("block_flags", flags)));
+        }
+        let block_flags = flags;
 
         // Read data checksum
         let checksum = protected_reader.read_u128::<LE>()?;

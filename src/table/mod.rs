@@ -333,6 +333,13 @@ impl Table {
             )?;
             if block.header.block_flags & KV_CHECKSUM_FOOTER != 0 {
                 DataBlock::verify_kv_checked(&block.data, block.header, self.comparator.clone())?;
+            } else if self.metadata.kv_checksum_algo.is_some() {
+                // The descriptor declares this SST footer-bearing, and an SST
+                // is homogeneous, so every data block must carry the footer.
+                // A block without it is structural corruption — fail the
+                // scrub instead of silently returning Ok for a malformed
+                // table.
+                return Err(crate::Error::InvalidTrailer);
             }
         }
         Ok(())
