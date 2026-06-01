@@ -100,6 +100,54 @@ impl ChecksumAlgorithm {
         }
     }
 
+    /// Streaming variant of [`Self::compute`]: digests the concatenation of
+    /// `chunks` in order without the caller assembling a contiguous buffer.
+    /// The result is identical to `compute(&chunks.concat())` — XXH3's
+    /// incremental `update` and CRC32C's `crc32c_append` are both
+    /// order-preserving over the same byte sequence — so digests stay
+    /// stable whether computed one-shot or streamed.
+    ///
+    /// Used on the per-KV digest hot path (`kv_digest`) to avoid a fresh
+    /// per-entry allocation. Returns `None` under the same not-compiled-in
+    /// conditions as [`Self::compute`].
+    // With the `crc32c` feature on, every arm returns `Some`, so clippy sees
+    // the `Option` as superfluous — but in the no-`crc32c` build the `Crc32c`
+    // arm returns `None`, so the wrap is required. (The public `compute` is
+    // exempt via avoid-breaking-exported-api; this pub(crate) sibling is not.)
+    #[cfg_attr(
+        feature = "crc32c",
+        expect(
+            clippy::unnecessary_wraps,
+            reason = "the Crc32c arm returns None when the crc32c feature is off"
+        )
+    )]
+    pub(crate) fn compute_chunks(self, chunks: &[&[u8]]) -> Option<u64> {
+        match self {
+            Self::Xxh3_64 | Self::Xxh3Low32 => {
+                let mut hasher = xxhash_rust::xxh3::Xxh3::new();
+                for chunk in chunks {
+                    hasher.update(chunk);
+                }
+                let digest = hasher.digest();
+                Some(if matches!(self, Self::Xxh3Low32) {
+                    digest & 0xFFFF_FFFF
+                } else {
+                    digest
+                })
+            }
+            #[cfg(feature = "crc32c")]
+            Self::Crc32c => {
+                let mut crc = 0u32;
+                for chunk in chunks {
+                    crc = crc32c::crc32c_append(crc, chunk);
+                }
+                Some(u64::from(crc))
+            }
+            #[cfg(not(feature = "crc32c"))]
+            Self::Crc32c => None,
+        }
+    }
+
     /// On-disk discriminator byte. Stable across format versions —
     /// new variants take fresh values; existing variants never
     /// change. Downstream `BlockHeader` extension (per #297 / #298

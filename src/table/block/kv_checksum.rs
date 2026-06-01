@@ -61,23 +61,28 @@ pub const FOOTER_TAIL_LEN: usize = 1 + 4;
 /// not-compiled-in error.
 #[must_use]
 pub fn kv_digest(item: &InternalValue, algo: ChecksumAlgorithm) -> Option<u64> {
-    // Logical domain: assemble the same fields the writer/memtable hold,
-    // independent of on-disk prefix truncation. Order matches the on-disk
-    // field order for readability, but these are logical values, not their
-    // varint encodings.
-    let mut buf = Vec::with_capacity(1 + 8 + 4 + item.key.user_key.len() + item.value.len());
-    buf.push(u8::from(item.key.value_type));
-    buf.extend_from_slice(&item.key.seqno.to_le_bytes());
+    // Logical domain: the same fields the writer/memtable hold, independent of
+    // on-disk prefix truncation. The fixed-width prefix (value_type ‖ seqno ‖
+    // len(user_key)) lives in a 13-byte stack array; the two variable-length
+    // fields are fed as borrowed slices. Streaming the three chunks into the
+    // hasher avoids a fresh per-entry heap buffer on the write hot path while
+    // producing the identical digest a one-shot hash over the concatenation
+    // would (see `ChecksumAlgorithm::compute_chunks`).
+    //
     // Frame the user-key length so the key/value boundary is unambiguous.
     // A data block never holds a 4 GiB key, so u32 is sufficient.
     #[expect(
         clippy::cast_possible_truncation,
         reason = "user keys are bounded well below u32::MAX"
     )]
-    buf.extend_from_slice(&(item.key.user_key.len() as u32).to_le_bytes());
-    buf.extend_from_slice(&item.key.user_key);
-    buf.extend_from_slice(&item.value);
-    algo.compute(&buf)
+    let user_key_len = item.key.user_key.len() as u32;
+
+    let mut head = [0u8; 1 + 8 + 4];
+    head[0] = u8::from(item.key.value_type);
+    head[1..9].copy_from_slice(&item.key.seqno.to_le_bytes());
+    head[9..13].copy_from_slice(&user_key_len.to_le_bytes());
+
+    algo.compute_chunks(&[&head, &item.key.user_key, &item.value])
 }
 
 /// Appends the per-KV checksum footer to `payload` (which already holds the
