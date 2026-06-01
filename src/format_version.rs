@@ -75,15 +75,20 @@ pub enum FormatVersion {
     ///    per-layer header layout is documented in
     ///    `src/table/filter/ribbon/burr/wire.rs`.
     ///
-    /// 2. Per-block transform flags + Page ECC: the block header gains a
-    ///    `block_flags: u8` byte carrying the transform-presence bits.
+    /// 2. Per-block transform flags + Page ECC. The self-describing block
+    ///    types (`Meta` / `Manifest` / `ManifestFooter`) carry a
+    ///    `block_flags: u8` byte with the transform-presence bits;
     ///    `ECC_PARITY` marks that a Reed-Solomon parity trailer follows
     ///    the XXH3-covered payload (its length is derived from
-    ///    `data_length`, not stored); `KV_CHECKSUM_FOOTER` marks a
-    ///    per-entry checksum footer (the per-KV integrity feature).
-    ///    When `Config::page_ecc(false)` (the default) the `ECC_PARITY`
-    ///    bit is clear and no parity bytes follow; likewise the footer
-    ///    bit is clear unless per-KV checksums are enabled. The block
+    ///    `data_length`, not stored). SST block types (`Data` / `Index` /
+    ///    `Filter` / `RangeTombstone`) keep the compact header WITHOUT this
+    ///    byte: their parity / per-KV-footer presence is a per-SST property
+    ///    read from the table descriptor (`page_ecc` / `kv_checksum_algo`),
+    ///    not a serialized header flag. `KV_CHECKSUM_FOOTER` (set on the
+    ///    self-describing types) marks a per-entry checksum footer.
+    ///    When `Config::page_ecc(false)` (the default) no parity bytes
+    ///    follow; likewise no footer unless per-KV checksums are enabled.
+    ///    The block
     ///    magic was bumped to `[L,S,M,4]` (was `[L,S,M,3]` on pre-V5
     ///    versions) so a pre-V5 reader that bypasses the manifest gate
     ///    fails fast at block header decode rather than misreading the

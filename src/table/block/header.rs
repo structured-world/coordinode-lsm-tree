@@ -187,6 +187,21 @@ impl Header {
     /// Reed-Solomon scheme is deterministic) and the `ECC_PARITY`
     /// presence bit, not stored: a block that set the bit at write time
     /// carries `expected_parity_len(data_length)` parity bytes.
+    ///
+    /// # Parity accounting is only valid when `block_flags` is authoritative
+    ///
+    /// This reads parity presence from [`Self::block_flags`]. That field is
+    /// authoritative for headers freshly built by the writer (the on-disk-size
+    /// call sites that compute block handles) and for the block types that
+    /// serialize the byte (`Meta` / `Manifest` / `ManifestFooter` — see
+    /// [`Self::has_block_flags`]). It is NOT authoritative on a header obtained
+    /// from [`Decode::decode_from`] for an SST block type (`Data` / `Index` /
+    /// `Filter` / `RangeTombstone`): those omit the byte on disk, so it decodes
+    /// as `0` and this method UNDERCOUNTS an ECC-bearing SST block by its parity
+    /// trailer. A caller holding a decoded SST header must derive the trailer
+    /// from the per-SST `page_ecc` descriptor and
+    /// [`expected_parity_len`](super::expected_parity_len), as the block scrub
+    /// walker does — do not call `on_disk_size` for that.
     #[must_use]
     pub fn on_disk_size(&self) -> u32 {
         // header_len is a small constant (33 or 34 bytes: 4 magic + 1

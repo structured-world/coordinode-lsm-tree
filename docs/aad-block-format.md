@@ -91,7 +91,8 @@ Offset  Size  Field             Description
 10      1     BlockType         0=Data 1=Index 2=Filter 3=Meta 4=RangeTombstone
 11      1     SuiteID           AEAD primitive (see §4.5 / §7 registry).
                                 Also determines the on-disk Nonce length
-                                read at offset 18.
+                                read at offset 19 (after the BlockFlags
+                                byte at offset 18).
 12      1     CompressionType   Compression codec applied to the block's
                                 plaintext BEFORE encryption. Stores ONLY
                                 the leading 1-byte codec discriminator
@@ -429,7 +430,7 @@ Implementations MUST reject blocks whose first frame magic is not `0x184D2A50` (
 | `0x03` | ChaCha20-Poly1305 ([RFC 8439](https://datatracker.ietf.org/doc/html/rfc8439)) | 32 B | 12 B | 16 B |
 | `0x04..0xFF` | Reserved | n/a | n/a | n/a |
 
-The on-disk Nonce field length is **determined by SuiteID via this registry**. Decoders MUST read SuiteID at MetadataFrame offset 11, look up its registered nonce length, then read exactly that many bytes at offset 18. There is no padding: future suites with longer nonces (e.g. a hypothetical XChaCha20-Poly1305 with a 24-byte nonce) declare their own length here and pay exactly that cost; no v1 block carries bytes reserved "for future use".
+The on-disk Nonce field length is **determined by SuiteID via this registry**. Decoders MUST read SuiteID at MetadataFrame offset 11, look up its registered nonce length, then read exactly that many bytes at offset 19 (immediately after the BlockFlags byte at offset 18). There is no padding: future suites with longer nonces (e.g. a hypothetical XChaCha20-Poly1305 with a 24-byte nonce) declare their own length here and pay exactly that cost; no v1 block carries bytes reserved "for future use".
 
 Adding a new suite requires:
 1. Allocating a SuiteID byte in the registry (above table).
