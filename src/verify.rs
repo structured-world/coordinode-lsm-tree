@@ -477,20 +477,24 @@ pub fn verify_block_checksums(tree: &impl crate::AbstractTree) -> BlockVerifyRep
     report
 }
 
-/// Verifies the per-KV checksum footer of every footer-bearing data block
-/// (those with the `KV_CHECKSUM_FOOTER` header flag set) across all SST
+/// Verifies the per-KV checksum footer of every data block across all SST
 /// tables in the tree (the paranoid / scrub integrity path).
 ///
-/// This is stronger than [`verify_block_checksums`]: it decodes each
-/// footer-bearing block and recomputes every entry's logical-content
+/// Footer presence is a per-SST property read from each table's descriptor
+/// (`ParsedMeta::kv_checksum_algo`), not a per-block header flag — SST data
+/// blocks omit the `block_flags` byte. A table whose descriptor reports no
+/// footers is skipped wholesale.
+///
+/// This is stronger than [`verify_block_checksums`]: for footer-bearing
+/// tables it decodes each block and recomputes every entry's logical-content
 /// digest, localising which entry diverged rather than only flagging the
-/// block. Data blocks without the footer flag carry no per-KV digests and
+/// block. Tables written without per-KV footers carry no per-KV digests and
 /// are covered by [`verify_block_checksums`] only.
 ///
 /// Returns the first error encountered (`ChecksumMismatch` on a per-entry
 /// digest disagreement, or an I/O / decode error). `Ok(())` means every
-/// per-KV-checked block verified. A tree written entirely with
-/// `kv_checksums = Off` has no footer-bearing blocks, so this is a no-op
+/// per-KV-checked table verified. A tree written entirely with
+/// `kv_checksums = Off` has no footer-bearing tables, so this is a no-op
 /// returning `Ok(())`.
 ///
 /// # Errors
@@ -1157,6 +1161,58 @@ mod block_verify_tests {
         assert!(
             matches!(err, crate::Error::ChecksumMismatch { .. }),
             "expected ChecksumMismatch, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn verify_kv_checked_rejects_non_data_block_type() {
+        // The scrub verifies only Data blocks. A header whose block_type is
+        // not Data (corruption or a caller bug) must be rejected with
+        // InvalidTag, not silently coerced to Data and verified as if it were
+        // a data block — coercion would defeat the scrub's purpose.
+        use crate::InternalValue;
+        use crate::ValueType::Value;
+        use crate::comparator::default_comparator;
+        use crate::runtime_config::ChecksumAlgorithm;
+        use crate::table::block::header::block_flags;
+        use crate::table::block::{Block, BlockIdentity, BlockTransform, BlockType, kv_checksum};
+        use crate::table::data_block::DataBlock;
+
+        let algo = ChecksumAlgorithm::Xxh3_64;
+        let items = [
+            InternalValue::from_components(b"alpha".to_vec(), b"one".to_vec(), 3, Value),
+            InternalValue::from_components(b"bravo".to_vec(), b"two".to_vec(), 2, Value),
+        ];
+        let digests: Vec<u64> = items
+            .iter()
+            .map(|it| kv_checksum::kv_digest(it, algo).expect("xxh3 always available"))
+            .collect();
+
+        let mut payload = Vec::new();
+        DataBlock::encode_kv_checked_into(&mut payload, &items, &digests, algo, 2, 0.0).unwrap();
+
+        let id = BlockIdentity::for_test(0, 0, BlockType::Data);
+        let mut buf = Vec::new();
+        Block::write_into_with_flags(
+            &mut buf,
+            &payload,
+            id,
+            &BlockTransform::PLAIN,
+            block_flags::KV_CHECKSUM_FOOTER,
+        )
+        .unwrap();
+        let block = Block::from_reader(&mut &buf[..], id, &BlockTransform::PLAIN).unwrap();
+
+        // The footer + inner bytes form a valid data block, so only the
+        // block_type gate can catch a tampered type: flip it to a non-Data
+        // variant and require InvalidTag.
+        let mut bad_header = block.header;
+        bad_header.block_type = BlockType::Index;
+        let err = DataBlock::verify_kv_checked(&block.data, bad_header, default_comparator(), None)
+            .expect_err("non-Data block_type must be rejected, not coerced");
+        assert!(
+            matches!(err, crate::Error::InvalidTag(("BlockType", _))),
+            "expected InvalidTag(BlockType), got {err:?}"
         );
     }
 

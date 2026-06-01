@@ -269,15 +269,18 @@ impl Table {
         self.metadata.file_size
     }
 
-    /// Scrub: verifies the per-KV checksum footer of every footer-bearing
-    /// data block in this table (those with the `KV_CHECKSUM_FOOTER` header
-    /// flag set), decoding each block and recomputing each entry's
-    /// logical-content digest.
+    /// Scrub: verifies the per-KV checksum footer of every data block in this
+    /// table, decoding each block and recomputing each entry's logical-content
+    /// digest.
     ///
-    /// Data blocks without the footer flag are skipped. This is the
-    /// paranoid / offline integrity path — the live read path does NOT
-    /// verify per-entry digests (the block-level checksum already covers
-    /// the on-disk bytes). Stops and returns on the first detected mismatch.
+    /// Footer presence is a per-SST property read from the descriptor
+    /// (`metadata.kv_checksum_algo`), not a per-block header flag — SST data
+    /// blocks omit the `block_flags` byte. When the descriptor reports no
+    /// footers the whole scrub is a no-op; otherwise every data block is
+    /// verified under the descriptor's algorithm. This is the paranoid /
+    /// offline integrity path — the live read path does NOT verify per-entry
+    /// digests (the block-level checksum already covers the on-disk bytes).
+    /// Stops and returns on the first detected mismatch.
     ///
     /// # Errors
     ///

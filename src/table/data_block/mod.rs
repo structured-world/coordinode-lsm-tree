@@ -798,13 +798,23 @@ impl DataBlock {
             return Err(crate::Error::InvalidTrailer);
         }
 
+        // The scrub only verifies Data blocks. The caller loads raw Data
+        // blocks, so a non-Data header here is corruption or a caller bug:
+        // reject it rather than coerce `block_type = Data`, which would verify
+        // a non-Data payload as if it were Data and defeat the scrub.
+        if header.block_type != BlockType::Data {
+            return Err(crate::Error::InvalidTag((
+                "BlockType",
+                header.block_type.into(),
+            )));
+        }
+
         // Decode the inner slice through the standard data-block path. Reuse
         // the real header (Copy) but present the inner slice as a consistent
         // plain Data block: clear the per-KV footer flag and shrink
         // `uncompressed_length` to the stripped length so the in-memory block
         // matches its bytes (the type gate then passes and no field lies).
         let mut inner_header = header;
-        inner_header.block_type = BlockType::Data;
         inner_header.block_flags &= !super::block::header::block_flags::KV_CHECKSUM_FOOTER;
         #[expect(
             clippy::cast_possible_truncation,
