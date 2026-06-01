@@ -804,11 +804,9 @@ impl DataBlock {
         let mut idx = 0usize;
         for parsed in inner.try_iter(comparator)? {
             let item = parsed.materialize(&inner_data);
-            let stored = split
-                .digests
-                .get(idx)
-                .copied()
-                .ok_or(crate::Error::InvalidTrailer)?;
+            // Read the stored digest on demand from the borrowed footer bytes
+            // (no owned Vec<u64> materialization — see `SplitFull`).
+            let stored = split.digest(idx).ok_or(crate::Error::InvalidTrailer)?;
             let recomputed = kv_checksum::kv_digest(&item, split.algo)
                 .ok_or(crate::Error::FeatureUnsupported("kv checksum algorithm"))?;
             if recomputed != stored {
@@ -820,7 +818,7 @@ impl DataBlock {
             idx += 1;
         }
 
-        if idx != split.digests.len() {
+        if idx != split.count() {
             // Footer claims a different entry count than the inner block
             // decoded — structural inconsistency, not a content mismatch.
             return Err(crate::Error::InvalidTrailer);

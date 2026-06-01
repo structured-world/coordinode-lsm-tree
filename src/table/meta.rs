@@ -66,12 +66,16 @@ pub struct ParsedMeta {
     /// of the whole table without inspecting any data block header.
     pub kv_checksum_algo: Option<ChecksumAlgorithm>,
 
-    /// Per-SST Page-ECC descriptor: `true` when every block in this table
-    /// carries a Reed-Solomon parity trailer. Sourced from the
-    /// `descriptor#page_ecc` meta byte. The read path uses this (rather than
-    /// a per-block header field) to know whether a parity trailer follows
-    /// each block's payload — an SST is homogeneous, so one flag describes
-    /// the whole table.
+    /// Per-SST Page-ECC indicator: `true` when this table was written with
+    /// Page ECC enabled. Sourced from the `descriptor#page_ecc` meta byte.
+    ///
+    /// Note this is "ECC enabled for the table", not "every block carries a
+    /// parity trailer": a block with an empty payload emits a zero-length
+    /// trailer and leaves its `ECC_PARITY` flag clear even under `page_ecc`.
+    /// The per-block `ECC_PARITY` flag (self-describing) is the authoritative
+    /// per-block signal; this descriptor records the table-wide intent and is
+    /// the source for the SST read path once `block_flags` later moves off
+    /// the per-block header.
     pub page_ecc: bool,
 }
 

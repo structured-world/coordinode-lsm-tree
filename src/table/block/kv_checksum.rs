@@ -27,9 +27,12 @@
 //! ## Digest domain
 //!
 //! Each digest is computed over the entry's LOGICAL content, not its
-//! on-disk encoding: `value_type ‖ seqno (LE u64) ‖ user_key ‖ value`. This
-//! is invariant to restart-interval re-encoding (prefix truncation differs
-//! per block layout), so the same digest is reproduced every time a
+//! on-disk encoding:
+//! `value_type ‖ seqno (LE u64) ‖ len(user_key) (LE u32) ‖ user_key ‖ value`.
+//! The explicit `len(user_key)` frame keeps the domain injective (without it
+//! `user_key ‖ value` would be ambiguous across the key/value boundary).
+//! The domain is invariant to restart-interval re-encoding (prefix truncation
+//! differs per block layout), so the same digest is reproduced every time a
 //! compaction re-packs the entry. In this implementation the writer
 //! computes the digests when it compiles the block; because the domain is
 //! logical, a future memtable-insert path that carries a precomputed digest
@@ -195,21 +198,53 @@ pub fn split_inner(bytes: &[u8]) -> crate::Result<&[u8]> {
 }
 
 /// Full decomposition of a footer-bearing data block: the inner standard
-/// data-block slice plus the parsed per-entry digests and algorithm.
-/// Used by the scrub / paranoid verify path, which re-derives each
-/// entry's digest and compares it against the stored array.
+/// data-block slice plus a borrowed view over the per-entry digest array.
+/// Used by the scrub / paranoid verify path, which re-derives each entry's
+/// digest and compares it against the stored array.
+///
+/// The stored digests are NOT expanded into an owned `Vec<u64>`: they are
+/// read on demand from the borrowed on-disk bytes via [`Self::digest`]. For
+/// 4-byte algorithms (`Xxh3Low32` / `Crc32c`) an owned `Vec<u64>` would
+/// double the digest-array memory; reading on demand keeps the verify path's
+/// transient footprint at zero beyond the borrowed block buffer.
 pub struct SplitFull<'a> {
     /// Inner payload: byte-identical to a plain `BlockType::Data` block.
     pub inner: &'a [u8],
-    /// Per-entry digests in scan order, each masked to the algorithm width.
-    pub digests: Vec<u64>,
+    /// Raw on-disk per-entry digest array: `count × digest_size` bytes, in
+    /// scan order. Borrowed, not expanded.
+    digest_array: &'a [u8],
     /// Algorithm the digests were computed under.
     pub algo: ChecksumAlgorithm,
+    /// Number of per-entry digests in [`Self::digest_array`].
+    count: usize,
 }
 
-/// Splits a footer-bearing data block into its inner slice plus the parsed
-/// per-entry digests and algorithm. The verify path uses this to recompute
-/// each entry's logical-content digest and compare against the stored value.
+impl SplitFull<'_> {
+    /// Number of per-entry digests stored in the footer.
+    #[must_use]
+    pub fn count(&self) -> usize {
+        self.count
+    }
+
+    /// Stored digest for entry `index`, read directly from the borrowed
+    /// on-disk digest array (low `digest_size` bytes, little-endian, widened
+    /// to `u64`). Returns `None` if `index` is out of range.
+    #[must_use]
+    pub fn digest(&self, index: usize) -> Option<u64> {
+        let size = self.algo.digest_size();
+        let off = index.checked_mul(size)?;
+        let end = off.checked_add(size)?;
+        let chunk = self.digest_array.get(off..end)?;
+        let mut word = [0u8; 8];
+        word.get_mut(..size)?.copy_from_slice(chunk);
+        Some(u64::from_le_bytes(word))
+    }
+}
+
+/// Splits a footer-bearing data block into its inner slice plus a borrowed
+/// view over the per-entry digest array and algorithm. The verify path uses
+/// this to recompute each entry's logical-content digest and compare against
+/// the stored value, reading digests on demand (no owned `Vec`).
 ///
 /// # Errors
 ///
@@ -237,31 +272,25 @@ pub fn split_full(bytes: &[u8]) -> crate::Result<SplitFull<'_>> {
     let array_len = count
         .checked_mul(size)
         .ok_or(crate::Error::InvalidTrailer)?;
+    // Bounds-check `count` against the available bytes BEFORE borrowing the
+    // array. This caps `count` at `tail_start / digest_size`, so a forged
+    // count cannot make a downstream caller over-read or over-allocate.
     if array_len > tail_start {
         return Err(crate::Error::InvalidTrailer);
     }
     let array_start = tail_start - array_len;
 
-    let mut digests = Vec::with_capacity(count);
-    for i in 0..count {
-        let off = array_start + i * size;
-        let chunk = bytes
-            .get(off..off + size)
-            .ok_or(crate::Error::InvalidTrailer)?;
-        let mut word = [0u8; 8];
-        word.get_mut(..size)
-            .ok_or(crate::Error::InvalidTrailer)?
-            .copy_from_slice(chunk);
-        digests.push(u64::from_le_bytes(word));
-    }
-
+    let digest_array = bytes
+        .get(array_start..tail_start)
+        .ok_or(crate::Error::InvalidTrailer)?;
     let inner = bytes
         .get(..array_start)
         .ok_or(crate::Error::InvalidTrailer)?;
     Ok(SplitFull {
         inner,
-        digests,
+        digest_array,
         algo,
+        count,
     })
 }
 
@@ -395,7 +424,15 @@ mod tests {
             };
             let expected: Vec<u64> = digests.iter().map(|d| d & mask).collect();
             assert_eq!(
-                split.digests, expected,
+                split.count(),
+                expected.len(),
+                "digest count must round-trip"
+            );
+            let recovered: Vec<u64> = (0..split.count())
+                .map(|i| split.digest(i).expect("index < count is in range"))
+                .collect();
+            assert_eq!(
+                recovered, expected,
                 "digests must round-trip (masked to width) for {algo:?}"
             );
         }
