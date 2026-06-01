@@ -477,19 +477,20 @@ pub fn verify_block_checksums(tree: &impl crate::AbstractTree) -> BlockVerifyRep
     report
 }
 
-/// Verifies the per-KV checksum footer of every `DataKvChecked` data block
-/// across all SST tables in the tree (the paranoid / scrub integrity path).
+/// Verifies the per-KV checksum footer of every footer-bearing data block
+/// (those with the `KV_CHECKSUM_FOOTER` header flag set) across all SST
+/// tables in the tree (the paranoid / scrub integrity path).
 ///
 /// This is stronger than [`verify_block_checksums`]: it decodes each
-/// `DataKvChecked` block and recomputes every entry's logical-content
-/// digest, catching a RAM bit-flip that corrupted a value before the
-/// block-level checksum was computed at flush. Plain `Data` blocks carry no
-/// per-KV footer and are covered by [`verify_block_checksums`] only.
+/// footer-bearing block and recomputes every entry's logical-content
+/// digest, localising which entry diverged rather than only flagging the
+/// block. Data blocks without the footer flag carry no per-KV digests and
+/// are covered by [`verify_block_checksums`] only.
 ///
 /// Returns the first error encountered (`ChecksumMismatch` on a per-entry
 /// digest disagreement, or an I/O / decode error). `Ok(())` means every
 /// per-KV-checked block verified. A tree written entirely with
-/// `kv_checksums = Off` has no `DataKvChecked` blocks, so this is a no-op
+/// `kv_checksums = Off` has no footer-bearing blocks, so this is a no-op
 /// returning `Ok(())`.
 ///
 /// # Errors
@@ -954,8 +955,8 @@ mod block_verify_tests {
     }
 
     /// Populates a tree with per-KV checksums enabled (`AllLevels`) so the
-    /// flushed SST carries `DataKvChecked` data blocks with a per-entry
-    /// checksum footer.
+    /// flushed SST carries data blocks with the `KV_CHECKSUM_FOOTER` flag
+    /// set and a per-entry checksum footer.
     fn populate_tree_kv_checked(dir: &std::path::Path, items: usize) {
         use crate::AbstractTree;
         use crate::runtime_config::KvChecksumPolicy;
@@ -1090,7 +1091,7 @@ mod block_verify_tests {
     #[test]
     fn verify_kv_checksums_detects_flipped_value_byte() {
         // Corrupt a byte inside the first data block's data segment of a
-        // DataKvChecked SST. The per-KV scrub decodes the block and
+        // per-KV-checked SST. The per-KV scrub decodes the block and
         // recomputes each entry's logical digest, so the flip surfaces as
         // a ChecksumMismatch.
         use crate::table::block::Header;

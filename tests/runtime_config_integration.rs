@@ -117,9 +117,9 @@ fn tree_runtime_config_resets_to_default_on_reopen() {
 #[test]
 fn tree_kv_checksums_all_levels_round_trips_through_disk() {
     // End-to-end: with `kv_checksums = AllLevels`, the flush path emits
-    // DataKvChecked data blocks (per-KV checksum footer), and the read
-    // path transparently unwraps them. The values written must read back
-    // identically after flushing to disk — proving the writer-emit and
+    // data blocks with the KV_CHECKSUM_FOOTER flag + per-KV footer, and the
+    // read path transparently strips them. The values written must read
+    // back identically after flushing to disk — proving the writer-emit and
     // reader-accept wiring is correct through the live runtime config.
     let folder = get_tmp_folder();
     let tree = open_tree(folder.path());
@@ -139,7 +139,7 @@ fn tree_kv_checksums_all_levels_round_trips_through_disk() {
         tree.insert(*k, *v, i as u64);
     }
 
-    // Flush to disk: the on-disk data block is DataKvChecked.
+    // Flush to disk: the on-disk data block carries the KV_CHECKSUM_FOOTER flag.
     tree.flush_active_memtable(0)
         .expect("flush with per-KV checksums must succeed");
 
@@ -154,7 +154,7 @@ fn tree_kv_checksums_all_levels_round_trips_through_disk() {
         assert_eq!(item.key.seqno, i as u64);
         assert_eq!(
             &*item.value, *v,
-            "value must round-trip through DataKvChecked"
+            "value must round-trip through the per-KV checksum footer"
         );
     }
 

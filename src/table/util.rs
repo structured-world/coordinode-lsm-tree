@@ -30,26 +30,6 @@ pub fn aggregate_run_key_range(tables: &[Table]) -> KeyRange {
 #[derive(Debug)]
 pub struct SliceIndexes(pub usize, pub usize);
 
-/// Whether a block whose on-disk type is `actual` satisfies a load that
-/// asked for `expected`.
-///
-/// Exact match for every type EXCEPT the data family: a caller asking for
-/// [`BlockType::Data`] also accepts [`BlockType::DataKvChecked`] (and vice
-/// versa). The two are the same logical data block — the checked variant
-/// just carries a per-KV checksum footer — and the writer chooses between
-/// them per the runtime `kv_checksums` policy, which the reader does not
-/// know in advance. The `DataBlock` layer strips the footer transparently,
-/// so both decode through the same path.
-fn block_type_compatible(actual: BlockType, expected: BlockType) -> bool {
-    // The data family (Data / DataKvChecked) is mutually interchangeable;
-    // every other type requires an exact match.
-    let data_family = |t| matches!(t, BlockType::Data | BlockType::DataKvChecked);
-    if data_family(expected) && data_family(actual) {
-        return true;
-    }
-    actual == expected
-}
-
 /// Loads a block from disk or block cache, if cached.
 ///
 /// Also handles file descriptor opening and caching.
@@ -85,7 +65,10 @@ pub fn load_block(
     }
 
     if let Some(block) = cache.get_block(table_id, handle.offset()) {
-        if !block_type_compatible(block.header.block_type, block_type) {
+        // Per-KV checking is a header flag, not a block type, so a data
+        // block is always BlockType::Data on disk — an exact role match is
+        // the right swap-defence check here.
+        if block.header.block_type != block_type {
             return Err(crate::Error::InvalidTag((
                 "BlockType",
                 block.header.block_type.into(),
@@ -94,7 +77,7 @@ pub fn load_block(
 
         #[cfg(feature = "metrics")]
         match block_type {
-            BlockType::Filter | BlockType::FilterKvChecked => {
+            BlockType::Filter => {
                 metrics.filter_block_load_cached.fetch_add(1, Relaxed);
             }
             BlockType::Index => {
@@ -105,7 +88,7 @@ pub fn load_block(
                     .range_tombstone_block_load_cached
                     .fetch_add(1, Relaxed);
             }
-            BlockType::Data | BlockType::DataKvChecked | BlockType::Meta => {
+            BlockType::Data | BlockType::Meta => {
                 metrics.data_block_load_cached.fetch_add(1, Relaxed);
             }
             // Manifest variants are rejected by the function-level
@@ -154,7 +137,7 @@ pub fn load_block(
         )?,
     )?;
 
-    if !block_type_compatible(block.header.block_type, block_type) {
+    if block.header.block_type != block_type {
         return Err(crate::Error::InvalidTag((
             "BlockType",
             block.header.block_type.into(),
@@ -163,7 +146,7 @@ pub fn load_block(
 
     #[cfg(feature = "metrics")]
     match block_type {
-        BlockType::Filter | BlockType::FilterKvChecked => {
+        BlockType::Filter => {
             metrics.filter_block_load_io.fetch_add(1, Relaxed);
 
             metrics
@@ -184,7 +167,7 @@ pub fn load_block(
                 .range_tombstone_block_io_requested
                 .fetch_add(handle.size().into(), Relaxed);
         }
-        BlockType::Data | BlockType::DataKvChecked | BlockType::Meta => {
+        BlockType::Data | BlockType::Meta => {
             metrics.data_block_load_io.fetch_add(1, Relaxed);
 
             metrics

@@ -128,15 +128,21 @@ impl ChecksumAlgorithm {
     }
 }
 
-/// Per-KV checksum policy: which data blocks get a per-entry checksum
-/// trailer ([`crate::table::block::BlockType::DataKvChecked`]).
+/// Per-KV checksum policy: which data blocks get a per-entry checksum footer.
 ///
-/// The block-level checksum covers the bytes as written to disk; it
-/// does NOT catch a RAM bit-flip that corrupts a memtable entry
-/// BEFORE the block checksum is computed at flush. Per-KV checksums
-/// computed at memtable insert close that window. Default
-/// [`Self::Off`] is wire-identical to the pre-per-KV format: blocks
-/// stay [`crate::table::block::BlockType::Data`] with zero overhead.
+/// A footer-bearing block stays [`crate::table::block::BlockType::Data`] with
+/// the `KV_CHECKSUM_FOOTER` block-header flag set — per-KV checking is a
+/// transform layer, not a block role.
+///
+/// The block-level checksum covers the bytes as written to disk but
+/// only as one digest over the whole block; the per-entry footer lets
+/// a scrub localise which entry diverged. Catching a RAM bit-flip that
+/// corrupts an entry WHILE it sits in the memtable, before the block
+/// is compiled, additionally requires
+/// [`KvChecksumComputePoint::AtInsert`] (not yet implemented — see its
+/// docs); the digests in this implementation are computed when the
+/// block is compiled. Default [`Self::Off`] is wire-identical to the
+/// pre-per-KV format: no footer, the flag bit clear, zero overhead.
 ///
 /// Selection granularity:
 /// - [`Self::Off`] / [`Self::AllLevels`] are unconditional.
@@ -148,9 +154,9 @@ impl ChecksumAlgorithm {
 ///   in independently of level.
 ///
 /// Toggle takes effect on the next block compile; existing blocks
-/// keep their original `BlockType` and read transparently via
-/// per-block dispatch. Compaction rewrites source blocks per the
-/// current policy, so the choice migrates live without downtime.
+/// keep their original footer flag and read transparently. Compaction
+/// rewrites source blocks per the current policy, so the choice
+/// migrates live without downtime.
 //
 // no-std: pure data — compiles under `--no-default-features --features alloc`.
 #[derive(Copy, Clone, Debug, Default, Eq, PartialEq, Hash)]
@@ -162,16 +168,16 @@ pub enum KvChecksumPolicy {
     Off,
 
     /// Every data block on every level carries a per-entry checksum
-    /// trailer ([`crate::table::block::BlockType::DataKvChecked`]).
+    /// footer (the `KV_CHECKSUM_FOOTER` header flag set).
     AllLevels,
 
     /// Only data blocks on levels selected by the [`LevelMask`] carry
-    /// the per-entry trailer. Levels outside the mask emit plain
-    /// [`crate::table::block::BlockType::Data`].
+    /// the per-entry footer. Levels outside the mask emit a plain data
+    /// block with the flag clear.
     PerLevel(LevelMask),
 
     /// Only data blocks whose owning table id falls in the inclusive
-    /// [`TableIdRange`] carry the per-entry trailer.
+    /// [`TableIdRange`] carry the per-entry footer.
     PerTable(TableIdRange),
 }
 
@@ -179,9 +185,9 @@ impl KvChecksumPolicy {
     /// Whether a data block written at `level` for table `table_id`
     /// must emit the per-entry checksum trailer under this policy.
     ///
-    /// Drives the writer's [`crate::table::block::BlockType`] choice at
-    /// block compile: `true` selects `DataKvChecked`, `false` selects
-    /// the plain `Data` fast path.
+    /// Drives whether the writer sets the `KV_CHECKSUM_FOOTER` header
+    /// flag (and appends the footer) at block compile: `true` emits the
+    /// footer, `false` emits a plain data block.
     #[must_use]
     pub const fn applies(self, level: u8, table_id: u64) -> bool {
         match self {
@@ -339,29 +345,33 @@ pub struct RuntimeConfig {
     /// Compaction rewrites source blocks per the current algorithm.
     pub block_checksum_algo: ChecksumAlgorithm,
 
-    /// Algorithm for per-KV checksums inside `DataKvChecked` /
-    /// `FilterKvChecked` blocks (added by #298 implementation).
-    /// Independent from [`Self::block_checksum_algo`]. Default:
+    /// Algorithm for the per-KV checksum footer carried by data blocks
+    /// with the `KV_CHECKSUM_FOOTER` header flag set. Independent from
+    /// [`Self::block_checksum_algo`]. Default:
     /// [`ChecksumAlgorithm::Xxh3_64`].
     pub kv_checksum_algo: ChecksumAlgorithm,
 
-    /// Which data blocks emit a per-entry checksum trailer
-    /// ([`crate::table::block::BlockType::DataKvChecked`]). Default
+    /// Which data blocks emit a per-entry checksum footer (recorded via
+    /// the `KV_CHECKSUM_FOOTER` header flag). Default
     /// [`KvChecksumPolicy::Off`] keeps blocks wire-identical to the
-    /// pre-per-KV [`crate::table::block::BlockType::Data`] format.
+    /// pre-per-KV format (no footer, flag clear).
     ///
     /// Toggle takes effect on the next block compile; existing blocks
-    /// keep their original `BlockType` and read transparently.
+    /// keep their original footer flag and read transparently.
     /// Compaction migrates source blocks to the current policy over
     /// time. See [`KvChecksumPolicy`] for selection granularity.
     pub kv_checksums: KvChecksumPolicy,
 
-    /// When the per-KV digest is computed: [`KvChecksumComputePoint::
-    /// AtBlockCompile`] (default) at flush / compaction, or
-    /// [`KvChecksumComputePoint::AtInsert`] at memtable insert (covers the
-    /// memtable-residence window, requires a 4-byte
-    /// [`Self::kv_checksum_algo`]). `AtInsert` paired with the 8-byte
-    /// `Xxh3_64` is rejected by `update_runtime_config`.
+    /// When the per-KV digest is computed:
+    /// [`KvChecksumComputePoint::AtBlockCompile`] (default) at flush /
+    /// compaction, or [`KvChecksumComputePoint::AtInsert`] at memtable
+    /// insert (the future memtable-residence-window mode). `AtInsert` is
+    /// NOT yet implemented: `RuntimeConfigHandle::try_update` (behind
+    /// [`crate::Tree::update_runtime_config`]) currently rejects EVERY
+    /// `AtInsert` setting with a typed error, regardless of
+    /// [`Self::kv_checksum_algo`] (both `Xxh3_64` and `Xxh3Low32`), so it
+    /// cannot be applied today. Default `AtBlockCompile` is always
+    /// accepted.
     pub kv_checksum_compute_point: KvChecksumComputePoint,
 
     /// When `true`, every manifest write reserves a 4 KiB region at
@@ -408,8 +418,8 @@ pub struct RuntimeConfig {
     /// `manifest_layout_version`, `flags` for the mirror bit, and
     /// the TOC; no slot for this flag yet). The per-entry checksum
     /// framing this would control lands in a separate change that
-    /// introduces the `DataKvChecked` Block variant for manifest
-    /// sections AND extends the footer flags / payload to record
+    /// sets the `KV_CHECKSUM_FOOTER` header flag on manifest section
+    /// blocks AND extends the footer flags / payload to record
     /// the toggle. Until then changing this flag has no on-disk
     /// effect — the field is surfaced for forward-compat ergonomics
     /// in the `RuntimeConfig` builder, not for any current
@@ -449,8 +459,8 @@ pub struct RuntimeConfig {
     /// overhead). `Some(true)` is the inverse.
     pub data_block_ecc_override: Option<bool>,
 
-    /// Per-scope override for the per-KV checksum region within
-    /// `DataKvChecked` Blocks (#298). `None` inherits
+    /// Per-scope override for the per-KV checksum footer region within
+    /// footer-bearing data Blocks (#298). `None` inherits
     /// [`Self::page_ecc`]; `Some(false)` keeps the kv-checksum
     /// region outside the parity calculation even when global ECC
     /// is enabled (useful when the per-KV checksums themselves are
@@ -482,8 +492,8 @@ impl RuntimeConfig {
         self.data_block_ecc_override.unwrap_or(self.page_ecc)
     }
 
-    /// Effective Page ECC setting for the per-KV checksum region
-    /// within `DataKvChecked` Blocks (#298): the per-scope override
+    /// Effective Page ECC setting for the per-KV checksum footer region
+    /// within footer-bearing data Blocks (#298): the per-scope override
     /// when set, else the global [`Self::page_ecc`] default.
     #[must_use]
     pub fn kv_checksums_ecc(&self) -> bool {
@@ -530,8 +540,8 @@ mod tests {
 
     #[test]
     fn kv_checksum_policy_off_never_applies() {
-        // Off must reject every (level, table) pair — no DataKvChecked
-        // block is ever emitted under the default policy.
+        // Off must reject every (level, table) pair — no per-KV footer
+        // is ever emitted under the default policy.
         let p = KvChecksumPolicy::Off;
         assert!(!p.applies(0, 0));
         assert!(!p.applies(7, u64::MAX));

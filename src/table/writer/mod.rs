@@ -119,13 +119,13 @@ pub struct Writer {
     page_ecc: bool,
 
     /// Per-KV checksum policy + algorithm for data blocks. `None` (default)
-    /// means no per-KV checksums: data blocks are emitted as plain
-    /// [`BlockType::Data`], byte-identical to the pre-per-KV format. When
-    /// `Some((policy, algo))`, each data block whose `(level, table_id)`
-    /// satisfies `policy.applies` is emitted as
-    /// [`BlockType::DataKvChecked`] with a per-entry checksum footer under
-    /// `algo`. Wired from the tree's runtime `kv_checksums` config via
-    /// [`Self::use_kv_checksums`].
+    /// means no per-KV checksums: data blocks are byte-identical to the
+    /// pre-per-KV format with the `KV_CHECKSUM_FOOTER` header flag clear.
+    /// When `Some((policy, algo))`, each data block whose `(level,
+    /// table_id)` satisfies `policy.applies` is emitted with a per-entry
+    /// checksum footer under `algo` and the `KV_CHECKSUM_FOOTER` flag set
+    /// (the block role stays [`BlockType::Data`]). Wired from the tree's
+    /// runtime `kv_checksums` config via [`Self::use_kv_checksums`].
     kv_checksum: Option<(
         crate::runtime_config::KvChecksumPolicy,
         crate::runtime_config::ChecksumAlgorithm,
@@ -380,10 +380,9 @@ impl Writer {
 
     /// Wires the tree's runtime `kv_checksums` policy + algorithm into this
     /// writer. When `policy != Off`, every data block whose
-    /// `(level, table_id)` satisfies `policy.applies` is emitted as
-    /// [`crate::table::block::BlockType::DataKvChecked`] with a per-entry
-    /// checksum footer; all other data blocks stay plain
-    /// [`crate::table::block::BlockType::Data`]. `Off` (or never calling
+    /// `(level, table_id)` satisfies `policy.applies` gets a per-entry
+    /// checksum footer and the `KV_CHECKSUM_FOOTER` header flag set; all
+    /// other data blocks stay plain (flag clear). `Off` (or never calling
     /// this) leaves data blocks byte-identical to the pre-per-KV format.
     ///
     /// Must be called BEFORE the first key is added (same contract as
@@ -513,7 +512,11 @@ impl Writer {
                 .then_some(algo)
         });
 
-        let block_type = if let Some(algo) = kv_emit {
+        // A per-KV-checked block is a plain Data block plus a footer: the
+        // role stays Data, the footer is recorded as a header flag bit
+        // (KV_CHECKSUM_FOOTER), not as a distinct block type. Off-path is
+        // byte-identical to the pre-per-KV format with the bit clear.
+        let kv_flags = if let Some(algo) = kv_emit {
             // Compute one logical-content digest per entry, in scan order.
             let mut digests = Vec::with_capacity(self.chunk.len());
             for item in &self.chunk {
@@ -530,7 +533,7 @@ impl Writer {
                 self.data_block_restart_interval,
                 self.data_block_hash_ratio,
             )?;
-            super::block::BlockType::DataKvChecked
+            crate::table::block::header::block_flags::KV_CHECKSUM_FOOTER
         } else {
             DataBlock::encode_into(
                 &mut self.block_buffer,
@@ -538,17 +541,17 @@ impl Writer {
                 self.data_block_restart_interval,
                 self.data_block_hash_ratio,
             )?;
-            super::block::BlockType::Data
+            0
         };
 
-        let header = Block::write_into(
+        let header = Block::write_into_with_flags(
             &mut self.file_writer,
             &self.block_buffer,
             super::block::BlockIdentity {
                 tree_id: 0,
                 table_id: self.table_id,
                 block_offset: *self.meta.file_pos,
-                block_type,
+                block_type: super::block::BlockType::Data,
                 dict_id: self.data_block_compression.dict_id(),
                 window_log: 0,
             },
@@ -565,6 +568,7 @@ impl Writer {
                 )?;
                 if self.page_ecc { t.with_ecc() } else { t }
             },
+            kv_flags,
         )?;
 
         self.meta.uncompressed_size += u64::from(header.uncompressed_length);

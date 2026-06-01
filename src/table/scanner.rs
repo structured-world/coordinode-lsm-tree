@@ -146,13 +146,11 @@ impl Scanner {
 
         match block {
             Ok(block) => {
-                // The data family accepts both the plain and the per-KV-checked
-                // variant; `from_loaded` strips the checksum footer for the
-                // latter so the scan path is unchanged.
-                if !matches!(
-                    block.header.block_type,
-                    BlockType::Data | BlockType::DataKvChecked
-                ) {
+                // Per-KV checking is a header flag, so a data block is always
+                // BlockType::Data; `from_loaded` strips the checksum footer
+                // when the KV_CHECKSUM_FOOTER bit is set so the scan path is
+                // unchanged.
+                if block.header.block_type != BlockType::Data {
                     return Err(crate::Error::InvalidTag((
                         "BlockType",
                         block.header.block_type.into(),

@@ -9,7 +9,7 @@ pub(crate) mod binary_index;
 pub(crate) mod decoder;
 mod encoder;
 pub mod hash_index;
-mod header;
+pub(crate) mod header;
 mod identity;
 pub(crate) mod kv_checksum;
 mod offset;
@@ -202,17 +202,40 @@ impl Block {
     /// the mismatch before the call reaches `write_into`, so the
     /// guard is unreachable from any in-tree caller and exists purely
     /// as a "should-never-fire" assertion.
+    pub fn write_into<W: std::io::Write>(
+        writer: &mut W,
+        data: &[u8],
+        identity: BlockIdentity,
+        transform: &BlockTransform<'_>,
+    ) -> crate::Result<Header> {
+        // Most blocks carry no caller-supplied transform bits beyond what
+        // the `transform` itself implies (compression / encryption / ECC).
+        // The per-KV footer is the one bit `write_into` can't derive from
+        // the payload, so the data-block writer routes through
+        // `write_into_with_flags` to set it.
+        Self::write_into_with_flags(writer, data, identity, transform, 0)
+    }
+
+    /// Like [`Self::write_into`] but lets the caller OR in
+    /// transform-presence bits that aren't derivable from `transform`
+    /// (currently only [`super::header::block_flags::KV_CHECKSUM_FOOTER`],
+    /// since the footer lives in `data` and `write_into` can't see it).
+    /// The compression / encryption / ECC bits are still derived from
+    /// `transform` here, so every block self-describes its full transform
+    /// stack in [`Header::block_flags`] regardless of which entry point is
+    /// used.
     #[expect(
         clippy::too_many_lines,
         reason = "linear writer pipeline: compress → encrypt → checksum → ecc; \
                   each step is small but they share state (header, payload, owned buffers) \
                   so factoring would just hide the data flow"
     )]
-    pub fn write_into<W: std::io::Write>(
+    pub fn write_into_with_flags<W: std::io::Write>(
         mut writer: &mut W,
         data: &[u8],
         identity: BlockIdentity,
         transform: &BlockTransform<'_>,
+        extra_flags: u8,
     ) -> crate::Result<Header> {
         // Unpack the transform back to the (compression, encryption,
         // zstd_dict) triple the implementation below was written
@@ -238,8 +261,27 @@ impl Block {
             });
         }
 
+        // Self-describe the transform stack in the header. Compression /
+        // encryption / ECC are derived from the active `transform`; the
+        // caller ORs in any bit it can't derive (the per-KV footer).
+        let block_flags = {
+            use crate::table::block::header::block_flags;
+            let mut f = extra_flags;
+            if transform.compression() != CompressionType::None {
+                f |= block_flags::COMPRESSED;
+            }
+            if transform.encryption().is_some() {
+                f |= block_flags::ENCRYPTED;
+            }
+            if transform.page_ecc() {
+                f |= block_flags::ECC_PARITY;
+            }
+            f
+        };
+
         let mut header = Header {
             block_type,
+            block_flags,
             checksum: Checksum::from_raw(0), // <-- NOTE: Is set later on
             data_length: 0,                  // <-- NOTE: Is set later on
 

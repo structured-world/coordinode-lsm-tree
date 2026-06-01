@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026-present, Structured World Foundation
 
-//! Per-KV checksum footer for `DataKvChecked` blocks.
+//! Per-KV checksum footer for per-KV-checked data blocks.
 //!
-//! A `DataKvChecked` block is a standard data block payload, byte-for-byte
-//! identical to [`BlockType::Data`](super::BlockType::Data), followed by a
+//! A per-KV-checked block (one whose header carries the
+//! [`KV_CHECKSUM_FOOTER`](super::header::block_flags::KV_CHECKSUM_FOOTER)
+//! flag) is a standard data block payload, byte-for-byte identical to a
+//! plain [`BlockType::Data`](super::BlockType::Data) block, followed by a
 //! fixed trailing footer:
 //!
 //! ```text
@@ -27,9 +29,13 @@
 //! Each digest is computed over the entry's LOGICAL content, not its
 //! on-disk encoding: `value_type ‖ seqno (LE u64) ‖ user_key ‖ value`. This
 //! is invariant to restart-interval re-encoding (prefix truncation differs
-//! per block layout), so a digest computed once at memtable insert stays
-//! valid through every compaction that re-packs the same entry — recompute
-//! and carry yield the same value.
+//! per block layout), so the same digest is reproduced every time a
+//! compaction re-packs the entry. In this implementation the writer
+//! computes the digests when it compiles the block; because the domain is
+//! logical, a future memtable-insert path that carries a precomputed digest
+//! would yield the identical value (recompute and carry agree).
+
+use alloc::vec::Vec;
 
 use crate::InternalValue;
 use crate::runtime_config::ChecksumAlgorithm;
@@ -84,10 +90,10 @@ pub fn append_footer(payload: &mut Vec<u8>, digests: &[u64], algo: ChecksumAlgor
     payload.extend_from_slice(&(digests.len() as u32).to_le_bytes());
 }
 
-/// Splits a `DataKvChecked` block, returning the inner standard data-block
-/// slice (byte-identical to a plain `BlockType::Data` block) with the per-KV
-/// checksum footer removed. Feed the returned slice straight to the standard
-/// decoder.
+/// Splits a footer-bearing data block, returning the inner standard
+/// data-block slice (byte-identical to a plain `BlockType::Data` block) with
+/// the per-KV checksum footer removed. Feed the returned slice straight to
+/// the standard decoder.
 ///
 /// The footer's algorithm tag and entry count are validated to locate the
 /// inner/footer boundary, but the parsed digests are not returned here: the
@@ -129,7 +135,7 @@ pub fn split_inner(bytes: &[u8]) -> crate::Result<&[u8]> {
     bytes.get(..array_start).ok_or(crate::Error::InvalidTrailer)
 }
 
-/// Full decomposition of a `DataKvChecked` block: the inner standard
+/// Full decomposition of a footer-bearing data block: the inner standard
 /// data-block slice plus the parsed per-entry digests and algorithm.
 /// Used by the scrub / paranoid verify path, which re-derives each
 /// entry's digest and compares it against the stored array.
@@ -142,7 +148,7 @@ pub struct SplitFull<'a> {
     pub algo: ChecksumAlgorithm,
 }
 
-/// Splits a `DataKvChecked` block into its inner slice plus the parsed
+/// Splits a footer-bearing data block into its inner slice plus the parsed
 /// per-entry digests and algorithm. The verify path uses this to recompute
 /// each entry's logical-content digest and compare against the stored value.
 ///

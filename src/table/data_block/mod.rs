@@ -407,13 +407,13 @@ impl DataBlock {
     }
 
     /// Builds a `DataBlock` from a freshly loaded block, transparently
-    /// unwrapping the per-KV checksum footer when the block is
-    /// [`BlockType::DataKvChecked`].
+    /// stripping the per-KV checksum footer when the block carries one
+    /// (the [`block_flags::KV_CHECKSUM_FOOTER`] header bit is set).
     ///
-    /// For a plain [`BlockType::Data`] block this is identical to
-    /// [`Self::new`]. For a `DataKvChecked` block it splits off the footer
-    /// and stores only the inner standard data-block slice (re-typed as
-    /// `Data`), so every downstream read path — `try_iter`, `point_read`,
+    /// For a plain data block (bit clear) this is identical to
+    /// [`Self::new`]. When the footer is present it splits the footer off
+    /// and stores only the inner standard data-block slice (with the bit
+    /// cleared), so every downstream read path — `try_iter`, `point_read`,
     /// seek, trailer — operates unchanged. The per-KV digests are NOT
     /// verified here (that is the scrub / paranoid path, see
     /// [`Self::verify_kv_checked`]); the block-level checksum already
@@ -421,20 +421,21 @@ impl DataBlock {
     ///
     /// # Errors
     ///
-    /// Returns [`crate::Error::InvalidTrailer`] if a `DataKvChecked` block's
+    /// Returns [`crate::Error::InvalidTrailer`] if a footer-bearing block's
     /// footer is structurally malformed.
     pub(crate) fn from_loaded(block: Block) -> crate::Result<Self> {
-        use crate::table::block::{BlockType, kv_checksum};
+        use crate::table::block::{header::block_flags, kv_checksum};
 
-        if block.header.block_type != BlockType::DataKvChecked {
+        if block.header.block_flags & block_flags::KV_CHECKSUM_FOOTER == 0 {
             return Ok(Self::new(block));
         }
 
         // Determine the inner-slice length by splitting the footer, then
-        // keep a zero-copy sub-slice of the original block bytes.
+        // keep a zero-copy sub-slice of the original block bytes. Clear the
+        // footer bit so the stripped block reads as a plain data block.
         let array_start = kv_checksum::split_inner(&block.data)?.len();
         let mut header = block.header;
-        header.block_type = BlockType::Data;
+        header.block_flags &= !block_flags::KV_CHECKSUM_FOOTER;
         Ok(Self::new(Block {
             header,
             data: block.data.slice(..array_start),
@@ -700,15 +701,18 @@ impl DataBlock {
         serializer.finish()
     }
 
-    /// Builds a `DataKvChecked` data block: the standard data-block payload
-    /// followed by a per-KV checksum footer.
+    /// Builds a per-KV-checked data block: the standard data-block payload
+    /// followed by a per-KV checksum footer. The caller records the
+    /// presence of the footer by setting the `KV_CHECKSUM_FOOTER` header
+    /// flag (via `Block::write_into_with_flags`); the block role stays
+    /// `Data`.
     ///
     /// `digests` MUST be in the same order as `items` (digest `i` belongs to
     /// entry `i` in scan order) and computed via
     /// [`kv_checksum::kv_digest`](super::block::kv_checksum) over each entry's
-    /// logical content. The writer passes carried-at-insert digests here; a
-    /// `None` for an unavailable algorithm is the caller's responsibility to
-    /// reject before reaching this point.
+    /// logical content. The writer computes the digests when it compiles the
+    /// block; a `None` for an unavailable algorithm is the caller's
+    /// responsibility to reject before reaching this point.
     ///
     /// # Panics
     ///
@@ -731,8 +735,8 @@ impl DataBlock {
         Ok(())
     }
 
-    /// Verifies every entry of a `DataKvChecked` block against its stored
-    /// per-KV digest (the scrub / paranoid path).
+    /// Verifies every entry of a footer-bearing data block against its
+    /// stored per-KV digest (the scrub / paranoid path).
     ///
     /// `footer_wrapped` is the full on-disk data-block payload INCLUDING the
     /// per-KV checksum footer (i.e. the bytes as loaded, before
@@ -747,8 +751,8 @@ impl DataBlock {
     /// - [`crate::Error::FeatureUnsupported`] if the footer's algorithm is not
     ///   compiled into this build.
     /// - [`crate::Error::ChecksumMismatch`] on the first entry whose recomputed
-    ///   digest disagrees with the stored one (a RAM bit-flip that slipped past
-    ///   the block-level checksum).
+    ///   logical-content digest disagrees with the stored one (corruption of
+    ///   the entry bytes or the stored digest).
     pub(crate) fn verify_kv_checked(
         footer_wrapped: &[u8],
         header: super::block::Header,
@@ -1149,13 +1153,18 @@ mod tests {
         let mut bytes = Vec::new();
         DataBlock::encode_kv_checked_into(&mut bytes, &items, &digests, algo, 2, 0.0)?;
 
-        // The reader receives a DataKvChecked block and must unwrap it.
+        // The reader receives a Data block with the KV_CHECKSUM_FOOTER bit
+        // set and must strip the footer.
         let loaded = DataBlock::from_loaded(Block {
             data: bytes.into(),
-            header: Header::test_dummy(BlockType::DataKvChecked),
+            header: Header {
+                block_flags: crate::table::block::header::block_flags::KV_CHECKSUM_FOOTER,
+                ..Header::test_dummy(BlockType::Data)
+            },
         })?;
-        // After unwrapping, the block presents as plain Data.
+        // After stripping, the footer bit is cleared.
         assert_eq!(loaded.inner.header.block_type, BlockType::Data);
+        assert_eq!(loaded.inner.header.block_flags, 0);
 
         let recovered: Vec<InternalValue> = loaded
             .try_iter(default_comparator())?

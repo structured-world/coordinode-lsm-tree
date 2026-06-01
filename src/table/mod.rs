@@ -248,9 +248,10 @@ impl Table {
     }
 
     fn load_data_block(&self, handle: &BlockHandle) -> crate::Result<DataBlock> {
-        // `from_loaded` transparently unwraps the per-KV checksum footer when
-        // the on-disk block is `DataKvChecked`, so the rest of the read path
-        // is unchanged regardless of the kv-checksum policy the writer used.
+        // `from_loaded` transparently strips the per-KV checksum footer when
+        // the block's KV_CHECKSUM_FOOTER header flag is set, so the rest of
+        // the read path is unchanged regardless of the kv-checksum policy
+        // the writer used.
         self.load_block(
             handle,
             BlockType::Data,
@@ -266,20 +267,21 @@ impl Table {
         self.metadata.file_size
     }
 
-    /// Scrub: verifies the per-KV checksum footer of every `DataKvChecked`
-    /// data block in this table, decoding each block and recomputing each
-    /// entry's logical-content digest.
+    /// Scrub: verifies the per-KV checksum footer of every footer-bearing
+    /// data block in this table (those with the `KV_CHECKSUM_FOOTER` header
+    /// flag set), decoding each block and recomputing each entry's
+    /// logical-content digest.
     ///
-    /// Plain `BlockType::Data` blocks carry no footer and are skipped. This
-    /// is the paranoid / offline integrity path — the live read path does
-    /// NOT verify per-entry digests (the block-level checksum already covers
+    /// Data blocks without the footer flag are skipped. This is the
+    /// paranoid / offline integrity path — the live read path does NOT
+    /// verify per-entry digests (the block-level checksum already covers
     /// the on-disk bytes). Stops and returns on the first detected mismatch.
     ///
     /// # Errors
     ///
     /// - [`crate::Error::ChecksumMismatch`] if any entry's recomputed digest
-    ///   disagrees with the stored value (a RAM bit-flip that slipped past
-    ///   the block-level checksum).
+    ///   disagrees with the stored value (corruption of the entry bytes or
+    ///   the stored digest).
     /// - Any I/O / decode error encountered while loading a block.
     pub(crate) fn verify_kv_checksums(&self) -> crate::Result<()> {
         for handle in self.block_index.iter() {
@@ -294,7 +296,10 @@ impl Table {
                 #[cfg(zstd_any)]
                 self.zstd_dictionary.as_deref(),
             )?;
-            if block.header.block_type == BlockType::DataKvChecked {
+            if block.header.block_flags
+                & crate::table::block::header::block_flags::KV_CHECKSUM_FOOTER
+                != 0
+            {
                 DataBlock::verify_kv_checked(&block.data, block.header, self.comparator.clone())?;
             }
         }
