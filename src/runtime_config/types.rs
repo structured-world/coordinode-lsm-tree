@@ -383,6 +383,12 @@ impl TableIdRange {
 // no-std: pure data — compiles under `--no-default-features --features alloc`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "config POD: each bool is an independent on/off feature toggle \
+              (manifest mirror, manifest per-KV checksums, page ECC, seqno-in-index); \
+              folding them into enums would obscure the per-feature config contract"
+)]
 pub struct RuntimeConfig {
     /// Algorithm for Block-level integrity (the checksum in
     /// `BlockHeader`). Default: [`ChecksumAlgorithm::Xxh3_64`].
@@ -514,6 +520,24 @@ pub struct RuntimeConfig {
     /// is enabled (useful when the per-KV checksums themselves are
     /// considered sufficient and ECC is wanted only on value bytes).
     pub kv_checksums_ecc_override: Option<bool>,
+
+    /// Per-block seqno bounds in SST index entries (#224). When `true`,
+    /// SSTs written by the next flush / compaction record each data
+    /// block's `seqno_min` / `seqno_max` in its index entry
+    /// (`index_format = 1` in the table Properties), enabling fast
+    /// `scan_since_seqno` via block-skip: the scan skips any block whose
+    /// `seqno_max < target` without reading it.
+    ///
+    /// Default `false`: index blocks are byte-identical to the pre-#224
+    /// `index_format = 0` format, and `scan_since_seqno` falls back to a
+    /// per-entry filter. Read paths dispatch on each SST's own
+    /// `index_format` byte regardless of this setting, so mixed-format
+    /// trees (some SSTs migrated, some not) read correctly.
+    ///
+    /// Toggle takes effect on the next compaction / flush; existing SSTs
+    /// keep their original `index_format`. Compaction migrates source
+    /// SSTs to the current setting over time.
+    pub seqno_in_index: bool,
 }
 
 impl Default for RuntimeConfig {
@@ -528,6 +552,7 @@ impl Default for RuntimeConfig {
             page_ecc: false,
             data_block_ecc_override: None,
             kv_checksums_ecc_override: None,
+            seqno_in_index: false,
         }
     }
 }
@@ -826,6 +851,15 @@ mod tests {
         assert!(!cfg.page_ecc);
         assert_eq!(cfg.data_block_ecc_override, None);
         assert_eq!(cfg.kv_checksums_ecc_override, None);
+    }
+
+    #[test]
+    fn runtime_config_default_seqno_in_index_off() {
+        // seqno_in_index is explicit opt-in (#224): default false keeps
+        // index blocks byte-identical to the pre-#224 index_format=0
+        // format. A regression flipping this default would change the
+        // on-disk index layout for every existing tree.
+        assert!(!RuntimeConfig::default().seqno_in_index);
     }
 
     #[test]
