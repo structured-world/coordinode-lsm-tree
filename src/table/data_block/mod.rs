@@ -1243,6 +1243,35 @@ mod tests {
     }
 
     #[test]
+    fn encode_kv_checked_into_rejects_digest_count_mismatch() {
+        use crate::runtime_config::ChecksumAlgorithm;
+
+        // A digest array whose length disagrees with the item count would
+        // serialize a footer whose `count` field does not match the stored
+        // digests — structurally corrupt on-disk data. The writer must fail
+        // at write time, not defer the failure to a later read/scrub (and
+        // not rely on a debug_assert that vanishes in release builds).
+        let items = [
+            InternalValue::from_components(b"alpha".to_vec(), b"first".to_vec(), 30, Value),
+            InternalValue::from_components(b"bravo".to_vec(), b"second".to_vec(), 20, Value),
+        ];
+        let digests = [0u64]; // one digest for two items: mismatch
+        let mut buf = Vec::new();
+        let result = DataBlock::encode_kv_checked_into(
+            &mut buf,
+            &items,
+            &digests,
+            ChecksumAlgorithm::Xxh3_64,
+            2,
+            0.0,
+        );
+        assert!(
+            matches!(result, Err(crate::Error::InvalidTrailer)),
+            "digest/item count mismatch must fail the write, got {result:?}",
+        );
+    }
+
+    #[test]
     fn data_block_ping_pong_fuzz_1() -> crate::Result<()> {
         let items = [
             InternalValue::from_components(

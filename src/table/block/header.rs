@@ -346,6 +346,31 @@ mod tests {
     }
 
     #[test]
+    fn block_header_rejects_unknown_block_flags_bit() {
+        // `block_flags` is a persisted transform field. A header carrying a
+        // bit this build does not define (here the reserved 1 << 4) must be
+        // rejected at decode, not silently accepted as a partially-known
+        // block. The header + checksum are otherwise valid, so this isolates
+        // the flag-mask check from checksum validation.
+        let header = Header {
+            block_type: BlockType::Data,
+            block_flags: 1 << 4,
+            checksum: Checksum::from_raw(5),
+            data_length: 10,
+            uncompressed_length: 10,
+            ecc_length: 0,
+        };
+        let bytes = header.encode_into_vec();
+        assert!(
+            matches!(
+                Header::decode_from(&mut &bytes[..]),
+                Err(crate::Error::InvalidTag(("block_flags", _))),
+            ),
+            "decode must reject an unknown block_flags bit",
+        );
+    }
+
+    #[test]
     #[expect(clippy::indexing_slicing)]
     fn block_header_detect_corruption() {
         let header = Header {
