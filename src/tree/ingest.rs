@@ -51,12 +51,25 @@ impl<'a> Ingestion<'a> {
             .filter_block_partitioning_policy
             .get(INITIAL_CANONICAL_LEVEL);
 
+        // Ingested tables are an L0 run; their canonical config level is
+        // INITIAL_CANONICAL_LEVEL, the same level every per-level policy
+        // below is read at. The writer's level only feeds the per-block
+        // policy decisions (e.g. `PerLevel` kv-checksums) — `meta.initial_level`
+        // is write-only and placement is forced to L0 by `with_new_l0_run`
+        // regardless — so this keeps kv-checksum level-gating consistent with
+        // the compression / filter / restart policies applied to ingested
+        // tables.
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "INITIAL_CANONICAL_LEVEL is 1, well within u8"
+        )]
+        let ingest_level = INITIAL_CANONICAL_LEVEL as u8;
         // TODO: maybe create a PrepareMultiWriter that can be used by flush, ingest and compaction worker
         let mut writer = MultiWriter::new(
             folder.clone(),
             tree.table_id_counter.clone(),
             64 * 1_024 * 1_024,
-            6,
+            ingest_level,
             level_fs.clone(),
         )?
         .set_comparator(tree.config.comparator.clone())

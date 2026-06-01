@@ -1089,41 +1089,63 @@ mod block_verify_tests {
     }
 
     #[test]
-    fn verify_kv_checksums_detects_flipped_value_byte() {
-        // Corrupt a byte inside the first data block's data segment of a
-        // per-KV-checked SST. The per-KV scrub decodes the block and
-        // recomputes each entry's logical digest, so the flip surfaces as
-        // a ChecksumMismatch.
-        use crate::table::block::Header;
-        let dir = tempfile::tempdir().unwrap();
-        populate_tree_kv_checked(dir.path(), 500);
+    fn verify_kv_checked_detects_corrupted_digest_under_valid_block_checksum() {
+        // The per-KV verifier must catch a divergence that the block-level
+        // XXH3 does NOT: corrupt a stored digest, then write the block so its
+        // block-level checksum is computed over the already-corrupted bytes.
+        // The block therefore loads cleanly (block checksum valid) and only
+        // the per-KV recompute disagrees. (Flipping a payload byte in the
+        // file without recomputing the block checksum would be caught at
+        // load, never reaching the per-KV path — which would prove nothing.)
+        use crate::InternalValue;
+        use crate::ValueType::Value;
+        use crate::comparator::default_comparator;
+        use crate::runtime_config::ChecksumAlgorithm;
+        use crate::table::block::header::block_flags;
+        use crate::table::block::{Block, BlockIdentity, BlockTransform, BlockType, kv_checksum};
+        use crate::table::data_block::DataBlock;
 
-        let sst_path = pick_first_sst_path(dir.path());
+        let algo = ChecksumAlgorithm::Xxh3_64;
+        let items = [
+            InternalValue::from_components(b"alpha".to_vec(), b"one".to_vec(), 3, Value),
+            InternalValue::from_components(b"bravo".to_vec(), b"two".to_vec(), 2, Value),
+        ];
+        let digests: Vec<u64> = items
+            .iter()
+            .map(|it| kv_checksum::kv_digest(it, algo).expect("xxh3 always available"))
+            .collect();
 
-        // First byte after the first block's Header lands in that block's
-        // data segment (header XXH3 stays valid).
-        let flip_offset = Header::serialized_len() as u64;
-        {
-            let mut f = std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(&sst_path)
-                .unwrap();
-            f.seek(SeekFrom::Start(flip_offset)).unwrap();
-            let mut byte = [0u8; 1];
-            f.read_exact(&mut byte).unwrap();
-            byte[0] ^= 0xFF;
-            f.seek(SeekFrom::Start(flip_offset)).unwrap();
-            f.write_all(&byte).unwrap();
-            f.sync_all().unwrap();
-        }
+        let mut payload = Vec::new();
+        DataBlock::encode_kv_checked_into(&mut payload, &items, &digests, algo, 2, 0.0).unwrap();
 
-        let tree = reopen_tree(dir.path());
-        let crate::AnyTree::Standard(tree) = tree else {
-            panic!("expected Standard tree");
-        };
-        let err = verify_kv_checksums(&tree)
-            .expect_err("a flipped value byte must be caught by the per-KV scrub");
+        // Corrupt the first stored digest (its first byte sits right after the
+        // inner payload, where the digest array begins).
+        let inner_len = kv_checksum::split_inner(&payload).unwrap().len();
+        *payload.get_mut(inner_len).expect("digest array byte") ^= 0xFF;
+
+        // Write with a VALID block-level checksum over the corrupted payload.
+        let id = BlockIdentity::for_test(0, 0, BlockType::Data);
+        let mut buf = Vec::new();
+        Block::write_into_with_flags(
+            &mut buf,
+            &payload,
+            id,
+            &BlockTransform::PLAIN,
+            block_flags::KV_CHECKSUM_FOOTER,
+        )
+        .unwrap();
+
+        // Block loads fine (block-level checksum matches the corrupted bytes).
+        let block = Block::from_reader(&mut &buf[..], id, &BlockTransform::PLAIN).unwrap();
+        assert_ne!(
+            block.header.block_flags & block_flags::KV_CHECKSUM_FOOTER,
+            0,
+            "footer flag must survive the round-trip"
+        );
+
+        // Only the per-KV verifier catches the bad digest.
+        let err = DataBlock::verify_kv_checked(&block.data, block.header, default_comparator())
+            .expect_err("corrupted stored digest must fail the per-KV verifier");
         assert!(
             matches!(err, crate::Error::ChecksumMismatch { .. }),
             "expected ChecksumMismatch, got {err:?}"
