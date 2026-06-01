@@ -103,6 +103,152 @@ impl ChecksumAlgorithm {
     }
 }
 
+/// Per-KV checksum policy: which data blocks get a per-entry checksum
+/// trailer ([`crate::table::block::BlockType::DataKvChecked`]).
+///
+/// The block-level checksum covers the bytes as written to disk; it
+/// does NOT catch a RAM bit-flip that corrupts a memtable entry
+/// BEFORE the block checksum is computed at flush. Per-KV checksums
+/// computed at memtable insert close that window. Default
+/// [`Self::Off`] is wire-identical to the pre-per-KV format: blocks
+/// stay [`crate::table::block::BlockType::Data`] with zero overhead.
+///
+/// Selection granularity:
+/// - [`Self::Off`] / [`Self::AllLevels`] are unconditional.
+/// - [`Self::PerLevel`] gates on the LSM level via a [`LevelMask`]
+///   bitmask (hot tier L0/L1 typically), so cold archival levels
+///   skip the per-entry overhead.
+/// - [`Self::PerTable`] gates on an inclusive [`TableIdRange`], so a
+///   specific table-id span (e.g. a compliance-sensitive table) opts
+///   in independently of level.
+///
+/// Toggle takes effect on the next block compile; existing blocks
+/// keep their original `BlockType` and read transparently via
+/// per-block dispatch. Compaction rewrites source blocks per the
+/// current policy, so the choice migrates live without downtime.
+//
+// no-std: pure data — compiles under `--no-default-features --features alloc`.
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq, Hash)]
+pub enum KvChecksumPolicy {
+    /// No per-KV checksums. Blocks are wire-identical to the
+    /// pre-per-KV [`crate::table::block::BlockType::Data`] format.
+    /// Default — zero compute, zero storage, zero memtable overhead.
+    #[default]
+    Off,
+
+    /// Every data block on every level carries a per-entry checksum
+    /// trailer ([`crate::table::block::BlockType::DataKvChecked`]).
+    AllLevels,
+
+    /// Only data blocks on levels selected by the [`LevelMask`] carry
+    /// the per-entry trailer. Levels outside the mask emit plain
+    /// [`crate::table::block::BlockType::Data`].
+    PerLevel(LevelMask),
+
+    /// Only data blocks whose owning table id falls in the inclusive
+    /// [`TableIdRange`] carry the per-entry trailer.
+    PerTable(TableIdRange),
+}
+
+impl KvChecksumPolicy {
+    /// Whether a data block written at `level` for table `table_id`
+    /// must emit the per-entry checksum trailer under this policy.
+    ///
+    /// Drives the writer's [`crate::table::block::BlockType`] choice at
+    /// block compile: `true` selects `DataKvChecked`, `false` selects
+    /// the plain `Data` fast path.
+    #[must_use]
+    pub const fn applies(self, level: u8, table_id: u64) -> bool {
+        match self {
+            Self::Off => false,
+            Self::AllLevels => true,
+            Self::PerLevel(mask) => mask.contains(level),
+            Self::PerTable(range) => range.contains(table_id),
+        }
+    }
+}
+
+/// Bitmask over LSM levels for [`KvChecksumPolicy::PerLevel`].
+///
+/// Bit `n` set means level `n` is selected. A `u8` covers levels
+/// `0..=7`; the engine's default level count is 7, so one byte is
+/// sufficient. Levels `>= 8` are never selected (their bit cannot be
+/// represented), which is the safe default for a config that only
+/// targets the hot tier.
+//
+// no-std: pure data — compiles under `--no-default-features --features alloc`.
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq, Hash)]
+pub struct LevelMask(u8);
+
+impl LevelMask {
+    /// Empty mask — selects no levels.
+    #[must_use]
+    pub const fn none() -> Self {
+        Self(0)
+    }
+
+    /// Build a mask from a raw bitmask byte (bit `n` = level `n`).
+    #[must_use]
+    pub const fn from_bits(bits: u8) -> Self {
+        Self(bits)
+    }
+
+    /// The raw bitmask byte.
+    #[must_use]
+    pub const fn bits(self) -> u8 {
+        self.0
+    }
+
+    /// Return a copy with `level` added to the selection. Levels
+    /// `>= 8` are out of range for the `u8` mask and are ignored
+    /// (the returned mask is unchanged).
+    #[must_use]
+    pub const fn with_level(self, level: u8) -> Self {
+        if level < 8 {
+            Self(self.0 | (1u8 << level))
+        } else {
+            self
+        }
+    }
+
+    /// Whether `level` is selected by this mask. Levels `>= 8` are
+    /// never selected.
+    #[must_use]
+    pub const fn contains(self, level: u8) -> bool {
+        level < 8 && (self.0 & (1u8 << level)) != 0
+    }
+}
+
+/// Inclusive table-id range for [`KvChecksumPolicy::PerTable`].
+///
+/// Both endpoints are inclusive: `TableIdRange { start, end }` selects
+/// every `table_id` with `start <= table_id <= end`. A range with
+/// `start > end` selects nothing.
+//
+// no-std: pure data — compiles under `--no-default-features --features alloc`.
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
+pub struct TableIdRange {
+    /// Inclusive lower bound.
+    pub start: u64,
+    /// Inclusive upper bound.
+    pub end: u64,
+}
+
+impl TableIdRange {
+    /// Build an inclusive range. `start > end` yields an empty range
+    /// (selects nothing) rather than panicking.
+    #[must_use]
+    pub const fn new(start: u64, end: u64) -> Self {
+        Self { start, end }
+    }
+
+    /// Whether `table_id` falls within `[start, end]` inclusive.
+    #[must_use]
+    pub const fn contains(self, table_id: u64) -> bool {
+        self.start <= table_id && table_id <= self.end
+    }
+}
+
 /// Runtime-toggleable configuration.
 ///
 /// Fields here can change while the Tree is open via
@@ -140,6 +286,17 @@ pub struct RuntimeConfig {
     /// Independent from [`Self::block_checksum_algo`]. Default:
     /// [`ChecksumAlgorithm::Xxh3_64`].
     pub kv_checksum_algo: ChecksumAlgorithm,
+
+    /// Which data blocks emit a per-entry checksum trailer
+    /// ([`crate::table::block::BlockType::DataKvChecked`]). Default
+    /// [`KvChecksumPolicy::Off`] keeps blocks wire-identical to the
+    /// pre-per-KV [`crate::table::block::BlockType::Data`] format.
+    ///
+    /// Toggle takes effect on the next block compile; existing blocks
+    /// keep their original `BlockType` and read transparently.
+    /// Compaction migrates source blocks to the current policy over
+    /// time. See [`KvChecksumPolicy`] for selection granularity.
+    pub kv_checksums: KvChecksumPolicy,
 
     /// When `true`, every manifest write reserves a 4 KiB region at
     /// file offset 0 and, after writing the tail footer Block,
@@ -240,6 +397,7 @@ impl Default for RuntimeConfig {
         Self {
             block_checksum_algo: ChecksumAlgorithm::Xxh3_64,
             kv_checksum_algo: ChecksumAlgorithm::Xxh3_64,
+            kv_checksums: KvChecksumPolicy::Off,
             manifest_footer_mirror: true,
             manifest_kv_checksums: true,
             page_ecc: false,
@@ -277,6 +435,96 @@ impl RuntimeConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn kv_checksum_policy_default_is_off() {
+        // Off is the wire-identical, zero-overhead default: a tree that
+        // never opts in must produce BlockType::Data blocks and pay no
+        // per-entry cost. A regression flipping this default would
+        // silently change the on-disk format for every existing user.
+        assert_eq!(KvChecksumPolicy::default(), KvChecksumPolicy::Off);
+    }
+
+    #[test]
+    fn kv_checksum_policy_off_never_applies() {
+        // Off must reject every (level, table) pair — no DataKvChecked
+        // block is ever emitted under the default policy.
+        let p = KvChecksumPolicy::Off;
+        assert!(!p.applies(0, 0));
+        assert!(!p.applies(7, u64::MAX));
+    }
+
+    #[test]
+    fn kv_checksum_policy_all_levels_always_applies() {
+        // AllLevels must select every (level, table) pair, including
+        // out-of-mask-range levels (>= 8) that PerLevel can't reach.
+        let p = KvChecksumPolicy::AllLevels;
+        assert!(p.applies(0, 0));
+        assert!(p.applies(9, 12345));
+    }
+
+    #[test]
+    fn kv_checksum_policy_per_level_gates_on_mask() {
+        // PerLevel applies only to levels whose bit is set. Hot-tier
+        // selection (L0 + L1) must include 0 and 1 and exclude the
+        // rest, regardless of table id.
+        let mask = LevelMask::none().with_level(0).with_level(1);
+        let p = KvChecksumPolicy::PerLevel(mask);
+        assert!(p.applies(0, 999));
+        assert!(p.applies(1, 999));
+        assert!(!p.applies(2, 999));
+        assert!(!p.applies(6, 999));
+    }
+
+    #[test]
+    fn level_mask_out_of_range_level_is_never_selected() {
+        // A u8 mask covers levels 0..=7. with_level on an out-of-range
+        // level must be a no-op (not wrap into bit 0 via shift overflow)
+        // and contains must report false for those levels.
+        let mask = LevelMask::none().with_level(8).with_level(255);
+        assert_eq!(mask.bits(), 0, "out-of-range levels must not set any bit");
+        assert!(!mask.contains(8));
+        assert!(!mask.contains(255));
+    }
+
+    #[test]
+    fn level_mask_bits_roundtrip() {
+        // Raw-bits constructor and accessor must round-trip so a
+        // persisted mask byte reconstructs the same selection.
+        let mask = LevelMask::none().with_level(0).with_level(3);
+        assert_eq!(mask.bits(), 0b0000_1001);
+        assert_eq!(LevelMask::from_bits(0b0000_1001), mask);
+    }
+
+    #[test]
+    fn kv_checksum_policy_per_table_gates_on_inclusive_range() {
+        // PerTable applies only inside the inclusive [start, end] span,
+        // independent of level. Both endpoints are members; one past
+        // each end is not.
+        let p = KvChecksumPolicy::PerTable(TableIdRange::new(10, 20));
+        assert!(p.applies(0, 10));
+        assert!(p.applies(5, 20));
+        assert!(!p.applies(0, 9));
+        assert!(!p.applies(0, 21));
+    }
+
+    #[test]
+    fn table_id_range_inverted_selects_nothing() {
+        // A range with start > end is empty rather than panicking, so a
+        // misconfigured range degrades to "no per-KV checksums" instead
+        // of a crash or an all-match.
+        let r = TableIdRange::new(20, 10);
+        assert!(!r.contains(10));
+        assert!(!r.contains(15));
+        assert!(!r.contains(20));
+    }
+
+    #[test]
+    fn runtime_config_default_kv_checksums_off() {
+        // The wired RuntimeConfig field must default Off so the struct
+        // default stays wire-compatible with pre-per-KV trees.
+        assert_eq!(RuntimeConfig::default().kv_checksums, KvChecksumPolicy::Off);
+    }
 
     #[test]
     fn checksum_algorithm_default_is_xxh3_64() {
