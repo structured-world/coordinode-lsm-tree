@@ -474,11 +474,30 @@ fn validate_block_header_fits(buf: &[u8], ctx: HeaderContext) -> crate::Result<(
     // `data_length` saturates to u32::MAX and is rejected by the bound check
     // below against the (much smaller) buffer length.
     let declared = u64::from(header.on_disk_size());
-    let _ = ctx;
-    if declared > buf.len() as u64 {
-        return Err(wrap(
-            "manifest Block header declares on-disk size larger than buffer",
-        ));
+    let buf_len = buf.len() as u64;
+    match ctx {
+        // Exact-fit slots: the buffer IS the block (TOC `block_size` or the
+        // tail-footer size hint). An understated header would let
+        // `Block::from_reader` consume only `declared` bytes and silently
+        // drop the remainder, accepting a block `Block::from_file` rejects.
+        // Require an exact match in both directions.
+        HeaderContext::SectionExact | HeaderContext::FooterExact => {
+            if declared != buf_len {
+                return Err(wrap(
+                    "manifest Block header on-disk size does not match its exact slot",
+                ));
+            }
+        }
+        // Padded slot: the head-mirror reservation is intentionally larger
+        // than the footer Block and zero-padded, so a smaller declared size
+        // is expected; only reject an over-read past the buffer.
+        HeaderContext::FooterPadded => {
+            if declared > buf_len {
+                return Err(wrap(
+                    "manifest Block header declares on-disk size larger than buffer",
+                ));
+            }
+        }
     }
     Ok(())
 }
