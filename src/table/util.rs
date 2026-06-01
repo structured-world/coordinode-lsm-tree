@@ -74,7 +74,7 @@ pub fn load_block(
 
         #[cfg(feature = "metrics")]
         match block_type {
-            BlockType::Filter => {
+            BlockType::Filter | BlockType::FilterKvChecked => {
                 metrics.filter_block_load_cached.fetch_add(1, Relaxed);
             }
             BlockType::Index => {
@@ -85,7 +85,7 @@ pub fn load_block(
                     .range_tombstone_block_load_cached
                     .fetch_add(1, Relaxed);
             }
-            BlockType::Data | BlockType::Meta => {
+            BlockType::Data | BlockType::DataKvChecked | BlockType::Meta => {
                 metrics.data_block_load_cached.fetch_add(1, Relaxed);
             }
             // Manifest variants are rejected by the function-level
@@ -143,7 +143,7 @@ pub fn load_block(
 
     #[cfg(feature = "metrics")]
     match block_type {
-        BlockType::Filter => {
+        BlockType::Filter | BlockType::FilterKvChecked => {
             metrics.filter_block_load_io.fetch_add(1, Relaxed);
 
             metrics
@@ -164,7 +164,7 @@ pub fn load_block(
                 .range_tombstone_block_io_requested
                 .fetch_add(handle.size().into(), Relaxed);
         }
-        BlockType::Data | BlockType::Meta => {
+        BlockType::Data | BlockType::DataKvChecked | BlockType::Meta => {
             metrics.data_block_load_io.fetch_add(1, Relaxed);
 
             metrics
