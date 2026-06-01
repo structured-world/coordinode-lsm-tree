@@ -218,8 +218,8 @@ impl Block {
 
     /// Like [`Self::write_into`] but lets the caller OR in
     /// transform-presence bits that aren't derivable from `transform`
-    /// (currently only [`super::header::block_flags::KV_CHECKSUM_FOOTER`],
-    /// since the footer lives in `data` and `write_into` can't see it).
+    /// (currently only the `KV_CHECKSUM_FOOTER` flag from the `block_flags`
+    /// module, since the footer lives in `data` and `write_into` can't see it).
     /// The compression / encryption / ECC bits are still derived from
     /// `transform` here, so every block self-describes its full transform
     /// stack in [`Header::block_flags`] regardless of which entry point is
