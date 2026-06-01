@@ -477,6 +477,33 @@ pub fn verify_block_checksums(tree: &impl crate::AbstractTree) -> BlockVerifyRep
     report
 }
 
+/// Verifies the per-KV checksum footer of every `DataKvChecked` data block
+/// across all SST tables in the tree (the paranoid / scrub integrity path).
+///
+/// This is stronger than [`verify_block_checksums`]: it decodes each
+/// `DataKvChecked` block and recomputes every entry's logical-content
+/// digest, catching a RAM bit-flip that corrupted a value before the
+/// block-level checksum was computed at flush. Plain `Data` blocks carry no
+/// per-KV footer and are covered by [`verify_block_checksums`] only.
+///
+/// Returns the first error encountered (`ChecksumMismatch` on a per-entry
+/// digest disagreement, or an I/O / decode error). `Ok(())` means every
+/// per-KV-checked block verified. A tree written entirely with
+/// `kv_checksums = Off` has no `DataKvChecked` blocks, so this is a no-op
+/// returning `Ok(())`.
+///
+/// # Errors
+///
+/// Propagates [`crate::Error::ChecksumMismatch`] on a detected per-entry
+/// corruption, or any I/O / decode error from loading a block.
+pub fn verify_kv_checksums(tree: &impl crate::AbstractTree) -> crate::Result<()> {
+    let version = tree.current_version();
+    for table in version.iter_tables() {
+        table.verify_kv_checksums()?;
+    }
+    Ok(())
+}
+
 /// Out-of-band variant of [`verify_block_checksums`].
 ///
 /// Walks one SST file directly from a filesystem path, without
@@ -926,6 +953,36 @@ mod block_verify_tests {
         .unwrap()
     }
 
+    /// Populates a tree with per-KV checksums enabled (`AllLevels`) so the
+    /// flushed SST carries `DataKvChecked` data blocks with a per-entry
+    /// checksum footer.
+    fn populate_tree_kv_checked(dir: &std::path::Path, items: usize) {
+        use crate::AbstractTree;
+        use crate::runtime_config::KvChecksumPolicy;
+
+        let cfg = Config::new(
+            dir,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .data_block_compression_policy(CompressionPolicy::all(CompressionType::None));
+        let any = cfg.open().unwrap();
+        let crate::AnyTree::Standard(tree) = any else {
+            panic!("expected Standard tree");
+        };
+        tree.update_runtime_config(|c| {
+            c.kv_checksums = KvChecksumPolicy::AllLevels;
+        })
+        .unwrap();
+        for i in 0u64..items as u64 {
+            let key = format!("k{i:08}");
+            let val = format!("v{i:08}");
+            tree.insert(key.as_bytes(), val.as_bytes(), 1 + i);
+        }
+        tree.flush_active_memtable(1 + items as u64).unwrap();
+        drop(tree);
+    }
+
     #[test]
     fn verify_block_checksums_clean_tree_has_no_errors() {
         let dir = tempfile::tempdir().unwrap();
@@ -1013,6 +1070,62 @@ mod block_verify_tests {
             "expected a DataCorrupted error for {}, got {:?}",
             sst_path.display(),
             report.errors,
+        );
+    }
+
+    #[test]
+    fn verify_kv_checksums_clean_kv_checked_tree_passes() {
+        // A tree written with per-KV checksums enabled must pass the
+        // per-KV scrub with no error.
+        let dir = tempfile::tempdir().unwrap();
+        populate_tree_kv_checked(dir.path(), 500);
+
+        let tree = reopen_tree(dir.path());
+        let crate::AnyTree::Standard(tree) = tree else {
+            panic!("expected Standard tree");
+        };
+        verify_kv_checksums(&tree).expect("clean kv-checked tree must pass per-KV scrub");
+    }
+
+    #[test]
+    fn verify_kv_checksums_detects_flipped_value_byte() {
+        // Corrupt a byte inside the first data block's data segment of a
+        // DataKvChecked SST. The per-KV scrub decodes the block and
+        // recomputes each entry's logical digest, so the flip surfaces as
+        // a ChecksumMismatch.
+        use crate::table::block::Header;
+        let dir = tempfile::tempdir().unwrap();
+        populate_tree_kv_checked(dir.path(), 500);
+
+        let sst_path = pick_first_sst_path(dir.path());
+
+        // First byte after the first block's Header lands in that block's
+        // data segment (header XXH3 stays valid).
+        let flip_offset = Header::serialized_len() as u64;
+        {
+            let mut f = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&sst_path)
+                .unwrap();
+            f.seek(SeekFrom::Start(flip_offset)).unwrap();
+            let mut byte = [0u8; 1];
+            f.read_exact(&mut byte).unwrap();
+            byte[0] ^= 0xFF;
+            f.seek(SeekFrom::Start(flip_offset)).unwrap();
+            f.write_all(&byte).unwrap();
+            f.sync_all().unwrap();
+        }
+
+        let tree = reopen_tree(dir.path());
+        let crate::AnyTree::Standard(tree) = tree else {
+            panic!("expected Standard tree");
+        };
+        let err = verify_kv_checksums(&tree)
+            .expect_err("a flipped value byte must be caught by the per-KV scrub");
+        assert!(
+            matches!(err, crate::Error::ChecksumMismatch { .. }),
+            "expected ChecksumMismatch, got {err:?}"
         );
     }
 

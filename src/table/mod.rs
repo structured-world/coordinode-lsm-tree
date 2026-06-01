@@ -266,6 +266,41 @@ impl Table {
         self.metadata.file_size
     }
 
+    /// Scrub: verifies the per-KV checksum footer of every `DataKvChecked`
+    /// data block in this table, decoding each block and recomputing each
+    /// entry's logical-content digest.
+    ///
+    /// Plain `BlockType::Data` blocks carry no footer and are skipped. This
+    /// is the paranoid / offline integrity path — the live read path does
+    /// NOT verify per-entry digests (the block-level checksum already covers
+    /// the on-disk bytes). Stops and returns on the first detected mismatch.
+    ///
+    /// # Errors
+    ///
+    /// - [`crate::Error::ChecksumMismatch`] if any entry's recomputed digest
+    ///   disagrees with the stored value (a RAM bit-flip that slipped past
+    ///   the block-level checksum).
+    /// - Any I/O / decode error encountered while loading a block.
+    pub(crate) fn verify_kv_checksums(&self) -> crate::Result<()> {
+        for handle in self.block_index.iter() {
+            let handle = handle?;
+            let block_handle = BlockHandle::new(handle.offset(), handle.size());
+            // Load the RAW block (footer intact) — do NOT route through
+            // `load_data_block`, which strips the footer via `from_loaded`.
+            let block = self.load_block(
+                &block_handle,
+                BlockType::Data,
+                self.metadata.data_block_compression,
+                #[cfg(zstd_any)]
+                self.zstd_dictionary.as_deref(),
+            )?;
+            if block.header.block_type == BlockType::DataKvChecked {
+                DataBlock::verify_kv_checked(&block.data, block.header, self.comparator.clone())?;
+            }
+        }
+        Ok(())
+    }
+
     /// Loads the filter block (if any) and checks the bloom filter.
     ///
     /// Returns `Ok(BloomResult::Skip)` if the bloom filter says the key is definitely absent

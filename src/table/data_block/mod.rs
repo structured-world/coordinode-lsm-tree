@@ -730,6 +730,71 @@ impl DataBlock {
         super::block::kv_checksum::append_footer(writer, digests, algo);
         Ok(())
     }
+
+    /// Verifies every entry of a `DataKvChecked` block against its stored
+    /// per-KV digest (the scrub / paranoid path).
+    ///
+    /// `footer_wrapped` is the full on-disk data-block payload INCLUDING the
+    /// per-KV checksum footer (i.e. the bytes as loaded, before
+    /// [`Self::from_loaded`] strips them). This splits the footer, decodes the
+    /// inner standard data block, and for each entry in scan order recomputes
+    /// the logical-content digest and compares it to the stored value.
+    ///
+    /// # Errors
+    ///
+    /// - [`crate::Error::InvalidTrailer`] if the footer is malformed or its
+    ///   entry count disagrees with the decoded block.
+    /// - [`crate::Error::FeatureUnsupported`] if the footer's algorithm is not
+    ///   compiled into this build.
+    /// - [`crate::Error::ChecksumMismatch`] on the first entry whose recomputed
+    ///   digest disagrees with the stored one (a RAM bit-flip that slipped past
+    ///   the block-level checksum).
+    pub(crate) fn verify_kv_checked(
+        footer_wrapped: &[u8],
+        header: super::block::Header,
+        comparator: crate::comparator::SharedComparator,
+    ) -> crate::Result<()> {
+        use super::block::{BlockType, ParsedItem, kv_checksum};
+
+        let split = kv_checksum::split_full(footer_wrapped)?;
+
+        // Decode the inner slice through the standard data-block path. Reuse
+        // the real header (Copy) but present the inner slice as plain Data so
+        // the type gate passes.
+        let mut inner_header = header;
+        inner_header.block_type = BlockType::Data;
+        let inner = Self::new(Block {
+            header: inner_header,
+            data: Slice::from(split.inner),
+        });
+        let inner_data = inner.inner.data.clone();
+
+        let mut idx = 0usize;
+        for parsed in inner.try_iter(comparator)? {
+            let item = parsed.materialize(&inner_data);
+            let stored = split
+                .digests
+                .get(idx)
+                .copied()
+                .ok_or(crate::Error::InvalidTrailer)?;
+            let recomputed = kv_checksum::kv_digest(&item, split.algo)
+                .ok_or(crate::Error::FeatureUnsupported("kv checksum algorithm"))?;
+            if recomputed != stored {
+                return Err(crate::Error::ChecksumMismatch {
+                    got: crate::Checksum::from_raw(u128::from(recomputed)),
+                    expected: crate::Checksum::from_raw(u128::from(stored)),
+                });
+            }
+            idx += 1;
+        }
+
+        if idx != split.digests.len() {
+            // Footer claims a different entry count than the inner block
+            // decoded — structural inconsistency, not a content mismatch.
+            return Err(crate::Error::InvalidTrailer);
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]

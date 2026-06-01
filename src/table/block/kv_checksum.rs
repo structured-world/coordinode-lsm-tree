@@ -129,6 +129,77 @@ pub fn split_inner(bytes: &[u8]) -> crate::Result<&[u8]> {
     bytes.get(..array_start).ok_or(crate::Error::InvalidTrailer)
 }
 
+/// Full decomposition of a `DataKvChecked` block: the inner standard
+/// data-block slice plus the parsed per-entry digests and algorithm.
+/// Used by the scrub / paranoid verify path, which re-derives each
+/// entry's digest and compares it against the stored array.
+pub struct SplitFull<'a> {
+    /// Inner payload: byte-identical to a plain `BlockType::Data` block.
+    pub inner: &'a [u8],
+    /// Per-entry digests in scan order, each masked to the algorithm width.
+    pub digests: Vec<u64>,
+    /// Algorithm the digests were computed under.
+    pub algo: ChecksumAlgorithm,
+}
+
+/// Splits a `DataKvChecked` block into its inner slice plus the parsed
+/// per-entry digests and algorithm. The verify path uses this to recompute
+/// each entry's logical-content digest and compare against the stored value.
+///
+/// # Errors
+///
+/// Returns [`crate::Error::InvalidTrailer`] when the footer is structurally
+/// malformed (too short, unknown algorithm tag, or a `count` inconsistent
+/// with the available bytes).
+pub fn split_full(bytes: &[u8]) -> crate::Result<SplitFull<'_>> {
+    let total = bytes.len();
+    if total < FOOTER_TAIL_LEN {
+        return Err(crate::Error::InvalidTrailer);
+    }
+    let tail_start = total - FOOTER_TAIL_LEN;
+    let tail = bytes
+        .get(tail_start..total)
+        .ok_or(crate::Error::InvalidTrailer)?;
+    let algo_tag = *tail.first().ok_or(crate::Error::InvalidTrailer)?;
+    let algo = ChecksumAlgorithm::from_wire_tag(algo_tag).ok_or(crate::Error::InvalidTrailer)?;
+    let count = u32::from_le_bytes(
+        tail.get(1..)
+            .and_then(|s| s.try_into().ok())
+            .ok_or(crate::Error::InvalidTrailer)?,
+    ) as usize;
+
+    let size = algo.digest_size();
+    let array_len = count
+        .checked_mul(size)
+        .ok_or(crate::Error::InvalidTrailer)?;
+    if array_len > tail_start {
+        return Err(crate::Error::InvalidTrailer);
+    }
+    let array_start = tail_start - array_len;
+
+    let mut digests = Vec::with_capacity(count);
+    for i in 0..count {
+        let off = array_start + i * size;
+        let chunk = bytes
+            .get(off..off + size)
+            .ok_or(crate::Error::InvalidTrailer)?;
+        let mut word = [0u8; 8];
+        word.get_mut(..size)
+            .ok_or(crate::Error::InvalidTrailer)?
+            .copy_from_slice(chunk);
+        digests.push(u64::from_le_bytes(word));
+    }
+
+    let inner = bytes
+        .get(..array_start)
+        .ok_or(crate::Error::InvalidTrailer)?;
+    Ok(SplitFull {
+        inner,
+        digests,
+        algo,
+    })
+}
+
 #[cfg(test)]
 #[expect(clippy::expect_used, reason = "test code")]
 mod tests {
