@@ -46,6 +46,7 @@ pub fn load_block(
     block_type: BlockType,
     compression: CompressionType,
     encryption: Option<&dyn EncryptionProvider>,
+    page_ecc: bool,
     #[cfg(zstd_any)] zstd_dict: Option<&crate::compression::ZstdDictionary>,
     #[cfg(feature = "metrics")] metrics: &Metrics,
 ) -> crate::Result<Block> {
@@ -129,12 +130,20 @@ pub fn load_block(
             dict_id: compression.dict_id(),
             window_log: 0,
         },
-        &crate::table::block::BlockTransform::from_parts(
-            compression,
-            encryption,
-            #[cfg(zstd_any)]
-            zstd_dict,
-        )?,
+        &{
+            // ECC presence is a per-SST descriptor property (passed in by
+            // the caller from table metadata), not a per-block header field:
+            // upgrade the transform to its `*Ecc` variant when this SST was
+            // written with Page ECC. `with_ecc` is the identity function on
+            // builds without the `page_ecc` feature.
+            let t = crate::table::block::BlockTransform::from_parts(
+                compression,
+                encryption,
+                #[cfg(zstd_any)]
+                zstd_dict,
+            )?;
+            if page_ecc { t.with_ecc() } else { t }
+        },
     )?;
 
     if block.header.block_type != block_type {

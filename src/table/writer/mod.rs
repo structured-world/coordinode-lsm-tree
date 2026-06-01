@@ -1095,6 +1095,11 @@ fn write_meta_section<W: std::io::Write + std::io::Seek>(
                 p.kv_checksum_algo,
             )],
         ),
+        // Per-SST transform descriptor: whether every block in this table
+        // carries a Reed-Solomon parity trailer (Page ECC). One byte for the
+        // whole homogeneous SST, so the read path learns ECC presence from
+        // the descriptor instead of a per-block header field.
+        meta("descriptor#page_ecc", &[u8::from(page_ecc)]),
         meta("file_size", &p.file_size.to_le_bytes()),
         meta("filter_hash_type", &[u8::from(ChecksumType::Xxh3)]),
         meta("index_keys_have_seqno", &[0x1]),

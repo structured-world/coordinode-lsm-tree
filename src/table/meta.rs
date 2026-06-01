@@ -65,6 +65,14 @@ pub struct ParsedMeta {
     /// this single value lets the read / scrub path know the footer state
     /// of the whole table without inspecting any data block header.
     pub kv_checksum_algo: Option<ChecksumAlgorithm>,
+
+    /// Per-SST Page-ECC descriptor: `true` when every block in this table
+    /// carries a Reed-Solomon parity trailer. Sourced from the
+    /// `descriptor#page_ecc` meta byte. The read path uses this (rather than
+    /// a per-block header field) to know whether a parity trailer follows
+    /// each block's payload — an SST is homogeneous, so one flag describes
+    /// the whole table.
+    pub page_ecc: bool,
 }
 
 macro_rules! read_u8 {
@@ -288,6 +296,8 @@ impl ParsedMeta {
             &cmp
         ))?;
 
+        let page_ecc = read_u8!(block, b"descriptor#page_ecc", &cmp) != 0;
+
         Ok(Self {
             id,
             created_at,
@@ -304,6 +314,7 @@ impl ParsedMeta {
             data_block_compression,
             index_block_compression,
             kv_checksum_algo,
+            page_ecc,
         })
     }
 }
@@ -377,6 +388,7 @@ mod tests {
             meta("created_at", &1_000_000u128.to_le_bytes()),
             meta("data_block_hash_ratio", &0.0f64.to_le_bytes()),
             meta("descriptor#kv_checksum", &[0u8]),
+            meta("descriptor#page_ecc", &[0u8]),
             meta("file_size", &4096u64.to_le_bytes()),
             meta("filter_hash_type", &[u8::from(ChecksumType::Xxh3)]),
             meta("index_keys_have_seqno", &[0x1]),
@@ -532,6 +544,39 @@ mod tests {
         let items: Vec<_> = valid_meta_items()
             .into_iter()
             .filter(|iv| &*iv.key.user_key != b"descriptor#kv_checksum")
+            .collect();
+        let result = load_meta_from_items(&items);
+        assert!(
+            matches!(result, Err(crate::Error::InvalidHeader("TableMeta"))),
+            "expected InvalidHeader(\"TableMeta\"), got {result:?}",
+        );
+    }
+
+    /// `descriptor#page_ecc` round-trips: `0` → `false` (no parity trailer),
+    /// any non-zero → `true`.
+    #[test]
+    fn load_with_handle_page_ecc_descriptor_parses() {
+        let parsed = load_meta_from_items(&valid_meta_items()).unwrap();
+        assert!(!parsed.page_ecc, "0 byte means no Page ECC");
+
+        let mut items = valid_meta_items();
+        if let Some(item) = items
+            .iter_mut()
+            .find(|iv| &*iv.key.user_key == b"descriptor#page_ecc")
+        {
+            *item = meta("descriptor#page_ecc", &[1u8]);
+        }
+        let parsed = load_meta_from_items(&items).unwrap();
+        assert!(parsed.page_ecc, "non-zero byte means Page ECC is on");
+    }
+
+    /// Missing `descriptor#page_ecc` must return `Err(InvalidHeader)`, not
+    /// panic — it is a required per-SST field.
+    #[test]
+    fn load_with_handle_missing_page_ecc_descriptor_returns_err() {
+        let items: Vec<_> = valid_meta_items()
+            .into_iter()
+            .filter(|iv| &*iv.key.user_key != b"descriptor#page_ecc")
             .collect();
         let result = load_meta_from_items(&items);
         assert!(

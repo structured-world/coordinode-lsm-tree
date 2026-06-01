@@ -109,6 +109,9 @@ pub struct Iter {
     cache: Arc<Cache>,
     compression: CompressionType,
     encryption: Option<Arc<dyn EncryptionProvider>>,
+    /// Per-SST Page-ECC flag from table metadata; the block reader needs it
+    /// to know whether data blocks carry a parity trailer.
+    page_ecc: bool,
     #[cfg(zstd_any)]
     zstd_dictionary: Option<Arc<crate::compression::ZstdDictionary>>,
     comparator: SharedComparator,
@@ -146,6 +149,7 @@ impl Iter {
         cache: Arc<Cache>,
         compression: CompressionType,
         encryption: Option<Arc<dyn EncryptionProvider>>,
+        page_ecc: bool,
         #[cfg(zstd_any)] zstd_dictionary: Option<Arc<crate::compression::ZstdDictionary>>,
         comparator: SharedComparator,
         #[cfg(feature = "metrics")] metrics: Arc<Metrics>,
@@ -161,6 +165,7 @@ impl Iter {
             cache,
             compression,
             encryption,
+            page_ecc,
             #[cfg(zstd_any)]
             zstd_dictionary,
             comparator,
@@ -300,6 +305,7 @@ impl Iterator for Iter {
                 crate::table::block::BlockType::Data,
                 self.compression,
                 self.encryption.as_deref(),
+                self.page_ecc,
                 #[cfg(zstd_any)]
                 self.zstd_dictionary.as_deref(),
                 #[cfg(feature = "metrics")]
@@ -431,6 +437,7 @@ impl DoubleEndedIterator for Iter {
                 crate::table::block::BlockType::Data,
                 self.compression,
                 self.encryption.as_deref(),
+                self.page_ecc,
                 #[cfg(zstd_any)]
                 self.zstd_dictionary.as_deref(),
                 #[cfg(feature = "metrics")]

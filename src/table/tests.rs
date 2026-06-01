@@ -1816,6 +1816,7 @@ fn load_block_range_tombstone_metrics() -> crate::Result<()> {
         BlockType::RangeTombstone,
         CompressionType::None,
         None,
+        false,
         #[cfg(zstd_any)]
         None,
         #[cfg(feature = "metrics")]
@@ -1837,6 +1838,7 @@ fn load_block_range_tombstone_metrics() -> crate::Result<()> {
         BlockType::RangeTombstone,
         CompressionType::None,
         None,
+        false,
         #[cfg(zstd_any)]
         None,
         #[cfg(feature = "metrics")]
@@ -1918,6 +1920,7 @@ fn load_block_cache_hit_rejects_wrong_block_type() -> crate::Result<()> {
         BlockType::Index,
         CompressionType::None,
         None,
+        false,
         #[cfg(zstd_any)]
         None,
         #[cfg(feature = "metrics")]
@@ -1936,6 +1939,7 @@ fn load_block_cache_hit_rejects_wrong_block_type() -> crate::Result<()> {
         BlockType::Data,
         CompressionType::None,
         None,
+        false,
         #[cfg(zstd_any)]
         None,
         #[cfg(feature = "metrics")]

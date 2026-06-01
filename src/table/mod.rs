@@ -240,6 +240,7 @@ impl Table {
             block_type,
             compression,
             self.encryption.as_deref(),
+            self.metadata.page_ecc,
             #[cfg(zstd_any)]
             zstd_dict,
             #[cfg(feature = "metrics")]
@@ -920,6 +921,7 @@ impl Table {
             self.cache.clone(),
             self.metadata.data_block_compression,
             self.encryption.clone(),
+            self.metadata.page_ecc,
             #[cfg(zstd_any)]
             self.zstd_dictionary.clone(),
             self.comparator.clone(),
@@ -1184,6 +1186,7 @@ impl Table {
                 file_accessor: file_accessor.clone(),
                 table_id: (tree_id, metadata.id).into(),
                 encryption: encryption.clone(),
+                page_ecc: metadata.page_ecc,
                 comparator: comparator.clone(),
 
                 #[cfg(feature = "metrics")]
@@ -1214,6 +1217,7 @@ impl Table {
                 path: Arc::clone(&file_path),
                 table_id: (tree_id, metadata.id).into(),
                 encryption: encryption.clone(),
+                page_ecc: metadata.page_ecc,
                 comparator: comparator.clone(),
 
                 #[cfg(feature = "metrics")]
