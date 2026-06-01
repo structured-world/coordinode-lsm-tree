@@ -290,6 +290,15 @@ impl ParsedMeta {
             CompressionType::decode_from(&mut bytes)?
         };
 
+        // The per-SST transform descriptor keys are REQUIRED, not optional.
+        // They are new in the V5 on-disk format, which bumped the block magic
+        // to `[L,S,M,4]` (pre-V5 used `[L,S,M,3]`). A pre-V5 table's blocks —
+        // including this meta block — are already rejected at the magic check
+        // in `Header::decode_from` before this parse runs, so requiring the
+        // descriptor adds no incremental incompatibility: there is no
+        // readable older table that reaches this point lacking the key.
+        // (Treating it as optional-with-default would only mask a corrupt or
+        // truncated V5 meta block.)
         let kv_checksum_algo = crate::table::block::kv_checksum::descriptor_from_byte(read_u8!(
             block,
             b"descriptor#kv_checksum",

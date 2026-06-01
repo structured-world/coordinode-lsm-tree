@@ -45,7 +45,13 @@ use crate::runtime_config::ChecksumAlgorithm;
 pub const FOOTER_TAIL_LEN: usize = 1 + 4;
 
 /// Computes the per-KV digest of `item` under `algo` over the entry's
-/// logical content (`value_type ‖ seqno ‖ user_key ‖ value`).
+/// logical content (`value_type ‖ seqno ‖ len(user_key) ‖ user_key ‖ value`).
+///
+/// The user-key length is framed as a little-endian `u32` between the
+/// fixed-width header (`value_type`, `seqno`) and the two variable-length
+/// fields so the domain is injective: without it, `user_key ‖ value` is
+/// ambiguous (`key="a",value="bc"` and `key="ab",value="c"` would collide),
+/// letting a boundary-shifting corruption evade per-KV verification.
 ///
 /// Returns `None` when `algo` is not compiled into this build (mirrors
 /// [`ChecksumAlgorithm::compute`]); callers translate that into a typed
@@ -56,9 +62,16 @@ pub fn kv_digest(item: &InternalValue, algo: ChecksumAlgorithm) -> Option<u64> {
     // independent of on-disk prefix truncation. Order matches the on-disk
     // field order for readability, but these are logical values, not their
     // varint encodings.
-    let mut buf = Vec::with_capacity(1 + 8 + item.key.user_key.len() + item.value.len());
+    let mut buf = Vec::with_capacity(1 + 8 + 4 + item.key.user_key.len() + item.value.len());
     buf.push(u8::from(item.key.value_type));
     buf.extend_from_slice(&item.key.seqno.to_le_bytes());
+    // Frame the user-key length so the key/value boundary is unambiguous.
+    // A data block never holds a 4 GiB key, so u32 is sufficient.
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "user keys are bounded well below u32::MAX"
+    )]
+    buf.extend_from_slice(&(item.key.user_key.len() as u32).to_le_bytes());
     buf.extend_from_slice(&item.key.user_key);
     buf.extend_from_slice(&item.value);
     algo.compute(&buf)

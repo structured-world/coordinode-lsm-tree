@@ -781,10 +781,20 @@ impl DataBlock {
         let split = kv_checksum::split_full(footer_wrapped)?;
 
         // Decode the inner slice through the standard data-block path. Reuse
-        // the real header (Copy) but present the inner slice as plain Data so
-        // the type gate passes.
+        // the real header (Copy) but present the inner slice as a consistent
+        // plain Data block: clear the per-KV footer flag and shrink
+        // `uncompressed_length` to the stripped length so the in-memory block
+        // matches its bytes (the type gate then passes and no field lies).
         let mut inner_header = header;
         inner_header.block_type = BlockType::Data;
+        inner_header.block_flags &= !super::block::header::block_flags::KV_CHECKSUM_FOOTER;
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "split.inner is a prefix of the footered payload, which fits u32"
+        )]
+        {
+            inner_header.uncompressed_length = split.inner.len() as u32;
+        }
         let inner = Self::new(Block {
             header: inner_header,
             data: Slice::from(split.inner),

@@ -507,7 +507,10 @@ impl AbstractTree for Tree {
 
         // Per-KV checksums follow the LIVE runtime config snapshot so a
         // toggle via `update_runtime_config` takes effect on the next
-        // flush. `Off` (default) leaves data blocks byte-identical.
+        // flush. `Off` (default) emits no per-KV footer and leaves the
+        // data-block payload encoding unchanged (the V5 header carries a
+        // block_flags byte and the meta block a descriptor key regardless,
+        // so the on-disk bytes are not identical to a pre-V5 table).
         {
             let rc = self.0.runtime_config.load_full();
             table_writer = table_writer.use_kv_checksums(rc.kv_checksums, rc.kv_checksum_algo);

@@ -278,6 +278,14 @@ impl Block {
         // presence-authoritative.
         let block_flags = {
             use crate::table::block::header::block_flags;
+            // The header decoder rejects any bit outside `KNOWN`, so a caller
+            // that ORs in a reserved bit here would write a block this build
+            // can't read back. Catch that at the source in debug builds.
+            debug_assert_eq!(
+                extra_flags & !block_flags::KNOWN,
+                0,
+                "extra_flags must contain only defined block_flags bits",
+            );
             let mut f = extra_flags;
             if transform.compression() != CompressionType::None {
                 f |= block_flags::COMPRESSED;
