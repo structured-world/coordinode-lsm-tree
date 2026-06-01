@@ -835,10 +835,12 @@ mod tests {
         // The upfront cap rejects before any allocation.
         let plaintext = b"the quick brown fox";
         let mut sealed = encrypt_block(plaintext, &id(), &ctx(), &chain()).unwrap();
-        // MetadataFrame total size = 8 + 38 = 46 bytes. BodyFrame
-        // starts at offset 46; its PayloadLen is at frame offset 4
-        // → absolute offset 50..54.
-        let body_payload_len_at = 46 + 4;
+        // MetadataFrame total size = 8 (framing) + METADATA_PAYLOAD_LEN_V1.
+        // BodyFrame starts right after it; its PayloadLen is at frame offset 4.
+        // Derive from the constant so this keeps hitting PayloadLen (not the
+        // BodyFrame magic) if the payload length ever changes again.
+        let metadata_frame_len = 8 + METADATA_PAYLOAD_LEN_V1 as usize;
+        let body_payload_len_at = metadata_frame_len + 4;
         sealed[body_payload_len_at..body_payload_len_at + 4]
             .copy_from_slice(&u32::MAX.to_le_bytes());
         let err = decrypt_block(&sealed, &id(), &chain()).unwrap_err();

@@ -728,6 +728,37 @@ mod tests {
     }
 
     #[test]
+    fn checksum_algorithm_compute_chunks_matches_one_shot() {
+        // compute_chunks is the per-KV digest hot path; it MUST produce the
+        // identical digest to a one-shot compute over the concatenation, or
+        // on-disk per-KV digests would silently change. A multi-chunk split
+        // with an empty chunk exercises the streaming boundary handling and
+        // guards against a chunk-ordering or 32-bit-truncation regression.
+        let chunks: &[&[u8]] = &[b"alpha", b"", b"-bravo-", b"charlie"];
+        let mut concat = Vec::new();
+        for c in chunks {
+            concat.extend_from_slice(c);
+        }
+
+        for algo in [ChecksumAlgorithm::Xxh3_64, ChecksumAlgorithm::Xxh3Low32] {
+            assert_eq!(
+                algo.compute_chunks(chunks),
+                algo.compute(&concat),
+                "{algo:?}: streamed digest must equal one-shot over the concat",
+            );
+        }
+
+        #[cfg(feature = "crc32c")]
+        assert_eq!(
+            ChecksumAlgorithm::Crc32c.compute_chunks(chunks),
+            ChecksumAlgorithm::Crc32c.compute(&concat),
+            "Crc32c: streamed digest must equal one-shot over the concat",
+        );
+        #[cfg(not(feature = "crc32c"))]
+        assert_eq!(ChecksumAlgorithm::Crc32c.compute_chunks(chunks), None);
+    }
+
+    #[test]
     fn checksum_algorithm_digest_sizes_match_spec() {
         // Per design (#298 Q5): Xxh3_64 stores 8 bytes; Xxh3Low32
         // and Crc32c store 4 bytes. Wire format depends on this
