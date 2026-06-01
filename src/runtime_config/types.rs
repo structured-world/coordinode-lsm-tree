@@ -202,13 +202,16 @@ impl KvChecksumPolicy {
 /// compiled.
 ///
 /// [`Self::AtInsert`] computes the digest at memtable insert and carries it
-/// to the block. This closes the memtable-residence window (the entry's
-/// digest is fixed the moment it enters RAM), at the cost of storing the
-/// digest in the memtable node. The digest must fit the node's reserved
-/// space, so `AtInsert` is only valid with a 4-byte algorithm
-/// ([`ChecksumAlgorithm::Xxh3Low32`] / [`ChecksumAlgorithm::Crc32c`]);
-/// pairing it with the 8-byte [`ChecksumAlgorithm::Xxh3_64`] is rejected at
-/// config-validation time.
+/// to the block, closing the memtable-residence window (the entry's digest
+/// is fixed the moment it enters RAM) at the cost of storing the digest in
+/// the memtable node.
+///
+/// **Not yet implemented:** the memtable / writer carry path is not wired,
+/// so selecting `AtInsert` via `update_runtime_config` is rejected with a
+/// typed error rather than silently behaving as `AtBlockCompile`. When the
+/// carry path lands, `AtInsert` will additionally require a 4-byte algorithm
+/// ([`ChecksumAlgorithm::Xxh3Low32`] / [`ChecksumAlgorithm::Crc32c`]) so the
+/// digest fits the node's reserved slot.
 //
 // no-std: pure data — compiles under `--no-default-features --features alloc`.
 #[derive(Copy, Clone, Debug, Default, Eq, PartialEq, Hash)]
@@ -218,8 +221,8 @@ pub enum KvChecksumComputePoint {
     #[default]
     AtBlockCompile,
 
-    /// Compute at memtable insert and carry. Covers the full RAM lifecycle;
-    /// requires a 4-byte algorithm.
+    /// Compute at memtable insert and carry (covers the full RAM lifecycle).
+    /// Not yet implemented — rejected at config-validation time.
     AtInsert,
 }
 

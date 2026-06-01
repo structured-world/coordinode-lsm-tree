@@ -91,18 +91,17 @@ impl RuntimeConfigHandle {
     /// Reed-Solomon codec would silently no-op at the manifest writer
     /// (the `PlainEcc` `BlockTransform` arm is feature-gated out), so
     /// we reject the update instead of letting the caller believe ECC
-    /// is on; (2) `AtInsert` per-KV compute point requires a 4-byte
-    /// algorithm because the digest is stored in the memtable node's
-    /// reserved 4-byte slot.
+    /// is on; (2) `kv_checksum_compute_point = AtInsert`, which is not
+    /// yet wired into the memtable / writer path — accepting it would
+    /// silently behave as `AtBlockCompile`, so it is rejected.
     ///
     /// # Errors
     ///
     /// - [`crate::Error::PageEccUnsupported`] when the mutator
     ///   leaves `page_ecc = true` on a build without the cargo
     ///   feature.
-    /// - [`crate::Error::FeatureUnsupported`] when the mutator pairs
-    ///   `kv_checksum_compute_point = AtInsert` with an 8-byte
-    ///   algorithm (`Xxh3_64`).
+    /// - [`crate::Error::FeatureUnsupported`] when the mutator sets
+    ///   `kv_checksum_compute_point = AtInsert` (not yet implemented).
     pub fn try_update<F>(&self, mutator: F) -> crate::Result<()>
     where
         F: FnOnce(&mut RuntimeConfig),
@@ -113,18 +112,20 @@ impl RuntimeConfigHandle {
         if next.page_ecc && !cfg!(feature = "page_ecc") {
             return Err(crate::Error::PageEccUnsupported);
         }
-        // AtInsert stores the per-KV digest in the memtable node's reserved
-        // 4-byte slot, so it cannot carry an 8-byte digest. Reject the
-        // AtInsert + 8-byte-algorithm combination instead of silently
-        // truncating or overflowing the node header.
+        // AtInsert (compute the per-KV digest at memtable insert and carry
+        // it through flush) is not yet wired into the memtable / writer
+        // path: accepting it would silently behave as AtBlockCompile,
+        // downgrading the caller's intent without notice. Reject it with a
+        // typed error until the carry path lands. (When wired, AtInsert
+        // will additionally require a 4-byte algorithm so the digest fits
+        // the memtable node's reserved slot.)
         if matches!(
             next.kv_checksum_compute_point,
             crate::runtime_config::KvChecksumComputePoint::AtInsert
-        ) && next.kv_checksum_algo.digest_size() != 4
-        {
+        ) {
             return Err(crate::Error::FeatureUnsupported(
-                "kv_checksum_compute_point = AtInsert requires a 4-byte algorithm \
-                 (Xxh3Low32 or Crc32c)",
+                "kv_checksum_compute_point = AtInsert is not yet implemented; \
+                 use AtBlockCompile (digests are computed at flush / compaction)",
             ));
         }
         self.inner.store(Arc::new(next));
@@ -163,20 +164,20 @@ mod tests {
     }
 
     #[test]
-    fn try_update_rejects_at_insert_with_8_byte_algorithm() {
+    fn try_update_rejects_at_insert_as_not_implemented() {
         use super::super::types::KvChecksumComputePoint;
 
-        // AtInsert stores the digest in a 4-byte node slot, so pairing it
-        // with the 8-byte Xxh3_64 must be rejected and the live snapshot
-        // must stay unchanged.
+        // AtInsert is not yet wired into the memtable / writer path.
+        // Accepting it would silently behave as AtBlockCompile, so it must
+        // be rejected with a typed error and leave the live snapshot
+        // unchanged — regardless of the algorithm width.
         let handle = RuntimeConfigHandle::new(RuntimeConfig::default());
         let result = handle.try_update(|c| {
             c.kv_checksum_compute_point = KvChecksumComputePoint::AtInsert;
-            // kv_checksum_algo stays at the default 8-byte Xxh3_64.
         });
         assert!(
             matches!(result, Err(crate::Error::FeatureUnsupported(_))),
-            "AtInsert + Xxh3_64 must be rejected, got {result:?}"
+            "AtInsert must be rejected as not-yet-implemented, got {result:?}"
         );
         assert_eq!(
             handle.load().kv_checksum_compute_point,
@@ -186,20 +187,20 @@ mod tests {
     }
 
     #[test]
-    fn try_update_accepts_at_insert_with_4_byte_algorithm() {
+    fn try_update_rejects_at_insert_even_with_4_byte_algorithm() {
         use super::super::types::KvChecksumComputePoint;
 
-        // AtInsert with a 4-byte algorithm fits the node slot and is valid.
+        // Even with a 4-byte algorithm (the eventual requirement), AtInsert
+        // is rejected until the carry path is implemented — the not-yet-
+        // wired gate fires before the algorithm-width check.
         let handle = RuntimeConfigHandle::new(RuntimeConfig::default());
-        handle
-            .try_update(|c| {
-                c.kv_checksum_algo = ChecksumAlgorithm::Xxh3Low32;
-                c.kv_checksum_compute_point = KvChecksumComputePoint::AtInsert;
-            })
-            .unwrap();
-        assert_eq!(
-            handle.load().kv_checksum_compute_point,
-            KvChecksumComputePoint::AtInsert
+        let result = handle.try_update(|c| {
+            c.kv_checksum_algo = ChecksumAlgorithm::Xxh3Low32;
+            c.kv_checksum_compute_point = KvChecksumComputePoint::AtInsert;
+        });
+        assert!(
+            matches!(result, Err(crate::Error::FeatureUnsupported(_))),
+            "AtInsert must be rejected even with a 4-byte algorithm, got {result:?}"
         );
     }
 
