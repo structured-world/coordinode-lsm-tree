@@ -9,8 +9,8 @@
 //! relies on).
 
 use lsm_tree::{
-    AnyTree, Config, SequenceNumberCounter, get_tmp_folder,
-    runtime_config::{ChecksumAlgorithm, RuntimeConfig},
+    AbstractTree, AnyTree, Config, SeqNo, SequenceNumberCounter, get_tmp_folder,
+    runtime_config::{ChecksumAlgorithm, KvChecksumPolicy, RuntimeConfig},
 };
 use std::sync::Arc;
 use test_log::test;
@@ -112,6 +112,62 @@ fn tree_runtime_config_resets_to_default_on_reopen() {
         "runtime config must reset to default on reopen — \
          not persisted to manifest by design"
     );
+}
+
+#[test]
+fn tree_kv_checksums_all_levels_round_trips_through_disk() {
+    // End-to-end: with `kv_checksums = AllLevels`, the flush path emits
+    // DataKvChecked data blocks (per-KV checksum footer), and the read
+    // path transparently unwraps them. The values written must read back
+    // identically after flushing to disk — proving the writer-emit and
+    // reader-accept wiring is correct through the live runtime config.
+    let folder = get_tmp_folder();
+    let tree = open_tree(folder.path());
+
+    tree.update_runtime_config(|cfg| {
+        cfg.kv_checksums = KvChecksumPolicy::AllLevels;
+        cfg.kv_checksum_algo = ChecksumAlgorithm::Xxh3_64;
+    })
+    .expect("enabling per-KV checksums must succeed");
+
+    let pairs = [
+        (b"alpha".as_slice(), b"one".as_slice()),
+        (b"bravo".as_slice(), b"two".as_slice()),
+        (b"delta".as_slice(), b"three".as_slice()),
+    ];
+    for (i, (k, v)) in pairs.iter().enumerate() {
+        tree.insert(*k, *v, i as u64);
+    }
+
+    // Flush to disk: the on-disk data block is DataKvChecked.
+    tree.flush_active_memtable(0)
+        .expect("flush with per-KV checksums must succeed");
+
+    // Read back from disk through the standard read path, which routes
+    // through DataBlock::from_loaded and strips the footer.
+    for (i, (k, v)) in pairs.iter().enumerate() {
+        let item = tree
+            .get_internal_entry(k, SeqNo::MAX)
+            .expect("read must succeed")
+            .expect("key must be present after flush");
+        assert_eq!(&*item.key.user_key, *k);
+        assert_eq!(item.key.seqno, i as u64);
+        assert_eq!(
+            &*item.value, *v,
+            "value must round-trip through DataKvChecked"
+        );
+    }
+
+    // Reopen (fresh block cache) and re-read to exercise the cold disk
+    // read path, not just the post-flush cache.
+    let reopened = open_tree(folder.path());
+    for (k, v) in &pairs {
+        let item = reopened
+            .get_internal_entry(k, SeqNo::MAX)
+            .expect("read after reopen must succeed")
+            .expect("key must persist across reopen");
+        assert_eq!(&*item.value, *v);
+    }
 }
 
 /// Locks the public contract of `Tree::update_runtime_config` when
