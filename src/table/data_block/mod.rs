@@ -406,6 +406,41 @@ impl DataBlock {
         Self { inner }
     }
 
+    /// Builds a `DataBlock` from a freshly loaded block, transparently
+    /// unwrapping the per-KV checksum footer when the block is
+    /// [`BlockType::DataKvChecked`].
+    ///
+    /// For a plain [`BlockType::Data`] block this is identical to
+    /// [`Self::new`]. For a `DataKvChecked` block it splits off the footer
+    /// and stores only the inner standard data-block slice (re-typed as
+    /// `Data`), so every downstream read path — `try_iter`, `point_read`,
+    /// seek, trailer — operates unchanged. The per-KV digests are NOT
+    /// verified here (that is the scrub / paranoid path, see
+    /// [`Self::verify_kv_checked`]); the block-level checksum already
+    /// validated the on-disk bytes at load time.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error::InvalidTrailer`] if a `DataKvChecked` block's
+    /// footer is structurally malformed.
+    pub(crate) fn from_loaded(block: Block) -> crate::Result<Self> {
+        use crate::table::block::{BlockType, kv_checksum};
+
+        if block.header.block_type != BlockType::DataKvChecked {
+            return Ok(Self::new(block));
+        }
+
+        // Determine the inner-slice length by splitting the footer, then
+        // keep a zero-copy sub-slice of the original block bytes.
+        let array_start = kv_checksum::split_inner(&block.data)?.len();
+        let mut header = block.header;
+        header.block_type = BlockType::Data;
+        Ok(Self::new(Block {
+            header,
+            data: block.data.slice(..array_start),
+        }))
+    }
+
     /// Accesses the inner raw bytes
     #[must_use]
     pub fn as_slice(&self) -> &Slice {
@@ -663,6 +698,37 @@ impl DataBlock {
         }
 
         serializer.finish()
+    }
+
+    /// Builds a `DataKvChecked` data block: the standard data-block payload
+    /// followed by a per-KV checksum footer.
+    ///
+    /// `digests` MUST be in the same order as `items` (digest `i` belongs to
+    /// entry `i` in scan order) and computed via
+    /// [`kv_checksum::kv_digest`](super::block::kv_checksum) over each entry's
+    /// logical content. The writer passes carried-at-insert digests here; a
+    /// `None` for an unavailable algorithm is the caller's responsibility to
+    /// reject before reaching this point.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `items` is empty (same contract as [`Self::encode_into`]).
+    pub(crate) fn encode_kv_checked_into(
+        writer: &mut Vec<u8>,
+        items: &[InternalValue],
+        digests: &[u64],
+        algo: crate::runtime_config::ChecksumAlgorithm,
+        restart_interval: u8,
+        hash_index_ratio: f32,
+    ) -> crate::Result<()> {
+        debug_assert_eq!(
+            items.len(),
+            digests.len(),
+            "one digest per entry, in scan order"
+        );
+        Self::encode_into(writer, items, restart_interval, hash_index_ratio)?;
+        super::block::kv_checksum::append_footer(writer, digests, algo);
+        Ok(())
     }
 }
 
@@ -993,6 +1059,51 @@ mod tests {
             entries_end,
         );
         assert!(parsed.is_none());
+    }
+
+    #[test]
+    fn kv_checked_block_round_trips_through_reader() -> crate::Result<()> {
+        use crate::runtime_config::ChecksumAlgorithm;
+        use crate::table::block::kv_checksum::kv_digest;
+
+        // The write path (encode_kv_checked_into) followed by the read path
+        // (from_loaded → try_iter) must recover the exact items: from_loaded
+        // strips the per-KV footer and the standard decoder reads the inner
+        // payload unchanged.
+        let items = [
+            InternalValue::from_components(b"alpha".to_vec(), b"first".to_vec(), 30, Value),
+            InternalValue::from_components(b"bravo".to_vec(), b"second".to_vec(), 20, Value),
+            InternalValue::from_components(b"delta".to_vec(), Slice::from([]), 10, Tombstone),
+        ];
+        let algo = ChecksumAlgorithm::Xxh3_64;
+        let digests: Vec<u64> = items
+            .iter()
+            .map(|it| kv_digest(it, algo).expect("xxh3 always available"))
+            .collect();
+
+        let mut bytes = Vec::new();
+        DataBlock::encode_kv_checked_into(&mut bytes, &items, &digests, algo, 2, 0.0)?;
+
+        // The reader receives a DataKvChecked block and must unwrap it.
+        let loaded = DataBlock::from_loaded(Block {
+            data: bytes.into(),
+            header: Header::test_dummy(BlockType::DataKvChecked),
+        })?;
+        // After unwrapping, the block presents as plain Data.
+        assert_eq!(loaded.inner.header.block_type, BlockType::Data);
+
+        let recovered: Vec<InternalValue> = loaded
+            .try_iter(default_comparator())?
+            .map(|parsed| parsed.materialize(loaded.as_slice()))
+            .collect();
+        assert_eq!(recovered.len(), items.len());
+        for (got, want) in recovered.iter().zip(items.iter()) {
+            assert_eq!(got.key.user_key, want.key.user_key);
+            assert_eq!(got.key.seqno, want.key.seqno);
+            assert_eq!(got.key.value_type, want.key.value_type);
+            assert_eq!(got.value, want.value);
+        }
+        Ok(())
     }
 
     #[test]

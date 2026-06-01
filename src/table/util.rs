@@ -30,6 +30,26 @@ pub fn aggregate_run_key_range(tables: &[Table]) -> KeyRange {
 #[derive(Debug)]
 pub struct SliceIndexes(pub usize, pub usize);
 
+/// Whether a block whose on-disk type is `actual` satisfies a load that
+/// asked for `expected`.
+///
+/// Exact match for every type EXCEPT the data family: a caller asking for
+/// [`BlockType::Data`] also accepts [`BlockType::DataKvChecked`] (and vice
+/// versa). The two are the same logical data block — the checked variant
+/// just carries a per-KV checksum footer — and the writer chooses between
+/// them per the runtime `kv_checksums` policy, which the reader does not
+/// know in advance. The `DataBlock` layer strips the footer transparently,
+/// so both decode through the same path.
+fn block_type_compatible(actual: BlockType, expected: BlockType) -> bool {
+    // The data family (Data / DataKvChecked) is mutually interchangeable;
+    // every other type requires an exact match.
+    let data_family = |t| matches!(t, BlockType::Data | BlockType::DataKvChecked);
+    if data_family(expected) && data_family(actual) {
+        return true;
+    }
+    actual == expected
+}
+
 /// Loads a block from disk or block cache, if cached.
 ///
 /// Also handles file descriptor opening and caching.
@@ -65,7 +85,7 @@ pub fn load_block(
     }
 
     if let Some(block) = cache.get_block(table_id, handle.offset()) {
-        if block.header.block_type != block_type {
+        if !block_type_compatible(block.header.block_type, block_type) {
             return Err(crate::Error::InvalidTag((
                 "BlockType",
                 block.header.block_type.into(),
@@ -134,7 +154,7 @@ pub fn load_block(
         )?,
     )?;
 
-    if block.header.block_type != block_type {
+    if !block_type_compatible(block.header.block_type, block_type) {
         return Err(crate::Error::InvalidTag((
             "BlockType",
             block.header.block_type.into(),

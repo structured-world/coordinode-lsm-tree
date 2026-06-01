@@ -11,6 +11,7 @@ mod encoder;
 pub mod hash_index;
 mod header;
 mod identity;
+pub(crate) mod kv_checksum;
 mod offset;
 mod trailer;
 mod transform;

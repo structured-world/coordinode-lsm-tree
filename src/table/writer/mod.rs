@@ -118,6 +118,19 @@ pub struct Writer {
     /// [`Self::use_page_ecc`] before the first key is added.
     page_ecc: bool,
 
+    /// Per-KV checksum policy + algorithm for data blocks. `None` (default)
+    /// means no per-KV checksums: data blocks are emitted as plain
+    /// [`BlockType::Data`], byte-identical to the pre-per-KV format. When
+    /// `Some((policy, algo))`, each data block whose `(level, table_id)`
+    /// satisfies `policy.applies` is emitted as
+    /// [`BlockType::DataKvChecked`] with a per-entry checksum footer under
+    /// `algo`. Wired from the tree's runtime `kv_checksums` config via
+    /// [`Self::use_kv_checksums`].
+    kv_checksum: Option<(
+        crate::runtime_config::KvChecksumPolicy,
+        crate::runtime_config::ChecksumAlgorithm,
+    )>,
+
     /// Pre-trained zstd dictionary for dictionary compression
     #[cfg(zstd_any)]
     zstd_dictionary: Option<Arc<crate::compression::ZstdDictionary>>,
@@ -193,6 +206,8 @@ impl Writer {
             encryption: None,
 
             page_ecc: false,
+
+            kv_checksum: None,
 
             #[cfg(zstd_any)]
             zstd_dictionary: None,
@@ -363,6 +378,30 @@ impl Writer {
         self
     }
 
+    /// Wires the tree's runtime `kv_checksums` policy + algorithm into this
+    /// writer. When `policy != Off`, every data block whose
+    /// `(level, table_id)` satisfies `policy.applies` is emitted as
+    /// [`crate::table::block::BlockType::DataKvChecked`] with a per-entry
+    /// checksum footer; all other data blocks stay plain
+    /// [`crate::table::block::BlockType::Data`]. `Off` (or never calling
+    /// this) leaves data blocks byte-identical to the pre-per-KV format.
+    ///
+    /// Must be called BEFORE the first key is added (same contract as
+    /// [`Self::use_page_ecc`]).
+    #[must_use]
+    pub fn use_kv_checksums(
+        mut self,
+        policy: crate::runtime_config::KvChecksumPolicy,
+        algo: crate::runtime_config::ChecksumAlgorithm,
+    ) -> Self {
+        self.kv_checksum = if matches!(policy, crate::runtime_config::KvChecksumPolicy::Off) {
+            None
+        } else {
+            Some((policy, algo))
+        };
+        self
+    }
+
     #[must_use]
     pub fn use_bloom_policy(mut self, bloom_policy: BloomConstructionPolicy) -> Self {
         self.bloom_policy = bloom_policy;
@@ -464,12 +503,43 @@ impl Writer {
 
         self.block_buffer.clear();
 
-        DataBlock::encode_into(
-            &mut self.block_buffer,
-            &self.chunk,
-            self.data_block_restart_interval,
-            self.data_block_hash_ratio,
-        )?;
+        // Decide per-block whether to emit the per-KV checksum footer.
+        // `kv_checksum` is None unless the tree opted in; even then only
+        // blocks whose (level, table_id) satisfy the policy carry the
+        // footer. Off-path is byte-identical to the pre-per-KV format.
+        let kv_emit = self.kv_checksum.and_then(|(policy, algo)| {
+            policy
+                .applies(self.initial_level, self.table_id)
+                .then_some(algo)
+        });
+
+        let block_type = if let Some(algo) = kv_emit {
+            // Compute one logical-content digest per entry, in scan order.
+            let mut digests = Vec::with_capacity(self.chunk.len());
+            for item in &self.chunk {
+                let d = crate::table::block::kv_checksum::kv_digest(item, algo).ok_or(
+                    crate::Error::FeatureUnsupported("kv checksum algorithm not compiled in"),
+                )?;
+                digests.push(d);
+            }
+            DataBlock::encode_kv_checked_into(
+                &mut self.block_buffer,
+                &self.chunk,
+                &digests,
+                algo,
+                self.data_block_restart_interval,
+                self.data_block_hash_ratio,
+            )?;
+            super::block::BlockType::DataKvChecked
+        } else {
+            DataBlock::encode_into(
+                &mut self.block_buffer,
+                &self.chunk,
+                self.data_block_restart_interval,
+                self.data_block_hash_ratio,
+            )?;
+            super::block::BlockType::Data
+        };
 
         let header = Block::write_into(
             &mut self.file_writer,
@@ -478,7 +548,7 @@ impl Writer {
                 tree_id: 0,
                 table_id: self.table_id,
                 block_offset: *self.meta.file_pos,
-                block_type: super::block::BlockType::Data,
+                block_type,
                 dict_id: self.data_block_compression.dict_id(),
                 window_log: 0,
             },

@@ -764,14 +764,19 @@ fn load_data_block_iter(
         )?,
     )?;
 
-    if block.header.block_type != BlockType::Data {
+    if !matches!(
+        block.header.block_type,
+        BlockType::Data | BlockType::DataKvChecked
+    ) {
         return Err(crate::Error::InvalidTag((
             "BlockType",
             block.header.block_type.into(),
         )));
     }
 
-    let data_block = DataBlock::new(block);
+    // `from_loaded` strips the per-KV checksum footer for DataKvChecked
+    // blocks so the inspection iterator decodes the inner payload normally.
+    let data_block = DataBlock::from_loaded(block)?;
     OwnedDataBlockIter::try_new(data_block, |b| {
         b.try_iter(crate::comparator::default_comparator())
     })

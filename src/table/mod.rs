@@ -248,6 +248,9 @@ impl Table {
     }
 
     fn load_data_block(&self, handle: &BlockHandle) -> crate::Result<DataBlock> {
+        // `from_loaded` transparently unwraps the per-KV checksum footer when
+        // the on-disk block is `DataKvChecked`, so the rest of the read path
+        // is unchanged regardless of the kv-checksum policy the writer used.
         self.load_block(
             handle,
             BlockType::Data,
@@ -255,7 +258,7 @@ impl Table {
             #[cfg(zstd_any)]
             self.zstd_dictionary.as_deref(),
         )
-        .map(DataBlock::new)
+        .and_then(DataBlock::from_loaded)
     }
 
     /// Returns the (possibly compressed) file size.
