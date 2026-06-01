@@ -169,7 +169,7 @@ impl Encodable<BlockOffset> for KeyedBlockHandle {
 
         self.inner.encode_into(writer)?; // 2, 3
 
-        unwrap!(writer.write_u64_varint(self.seqno)); // 4
+        writer.write_u64_varint(self.seqno)?; // 4
 
         if let Some((seqno_min, seqno_max)) = self.seqno_bounds {
             writer.write_u64_varint(seqno_min)?; // 4a

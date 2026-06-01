@@ -611,22 +611,16 @@ impl Writer {
         if self.use_seqno_in_index {
             // Per-block seqno bounds let a seqno-scoped scan skip this whole
             // block when its `max` is below the target. The chunk is still
-            // intact here (popped further down), so min/max is a single pass
-            // over entries already in hand: zero extra tracking.
-            #[expect(clippy::expect_used, reason = "chunk is non-empty (last exists)")]
-            let seqno_min = self
+            // intact here (popped further down), so both bounds come from a
+            // single fold over entries already in hand: zero extra tracking,
+            // one pass. Seeds (MAX, MIN) are overwritten on the first entry
+            // because the chunk is non-empty (`last` exists above).
+            let (seqno_min, seqno_max) = self
                 .chunk
                 .iter()
-                .map(|e| e.key.seqno)
-                .min()
-                .expect("chunk is non-empty");
-            #[expect(clippy::expect_used, reason = "chunk is non-empty (last exists)")]
-            let seqno_max = self
-                .chunk
-                .iter()
-                .map(|e| e.key.seqno)
-                .max()
-                .expect("chunk is non-empty");
+                .fold((u64::MAX, u64::MIN), |(min, max), e| {
+                    (min.min(e.key.seqno), max.max(e.key.seqno))
+                });
             handle = handle.with_seqno_bounds(seqno_min, seqno_max);
         }
 
@@ -1088,8 +1082,9 @@ struct MetaSectionParams<'a> {
     index_block_restart_interval: u8,
     initial_level: u8,
     /// Index block format byte written to the SST Properties (#224).
-    /// `0` = legacy (no per-block seqno bounds). Currently always `0`
-    /// until the writer is wired to the runtime `seqno_in_index` config.
+    /// `0` = legacy (no per-block seqno bounds); `1` = each data-block
+    /// index entry carries `(seqno_min, seqno_max)`. Set from the writer's
+    /// `seqno_in_index` config (`u8::from(self.use_seqno_in_index)`).
     index_format: u8,
     range_tombstone_count: u64,
     block_offset: u64,
