@@ -74,7 +74,7 @@ fn ctx() -> EncryptionContext {
 }
 
 fn ctx_with_suite(suite: SuiteId) -> EncryptionContext {
-    EncryptionContext::v1(KEY_EPOCH, suite, 0)
+    EncryptionContext::v1(KEY_EPOCH, suite, 0, 0)
 }
 
 fn identity(tree_id: u64, table_id: u64, block_offset: u64) -> BlockIdentity {
@@ -171,10 +171,11 @@ const META_SUITE_ID: usize = 11;
 const META_COMPRESSION_TYPE: usize = 12;
 const META_DICT_ID_START: usize = 13; // 4 bytes BE
 const META_WINDOW_LOG: usize = 17;
-const META_NONCE_START: usize = 18; // 12 bytes
-// MetadataFrame total = 8 (sfa header) + 38 (payload) = 46.
-// BodyFrame at absolute offset 46: 8-byte sfa header + body bytes.
-const BODY_FIRST_PAYLOAD_BYTE: usize = 46 + 8;
+const META_BLOCK_FLAGS: usize = 18;
+const META_NONCE_START: usize = 19; // 12 bytes
+// MetadataFrame total = 8 (sfa header) + 39 (payload) = 47.
+// BodyFrame at absolute offset 47: 8-byte sfa header + body bytes.
+const BODY_FIRST_PAYLOAD_BYTE: usize = 47 + 8;
 
 #[test]
 fn block_type_tamper_on_disk_fails_aead_verify() {
@@ -275,6 +276,25 @@ fn compression_type_tamper_on_disk_fails_aead_verify() {
 }
 
 #[test]
+fn block_flags_tamper_on_disk_fails_aead_verify() {
+    // BlockFlags is AAD-mirrored at MetadataPayload offset 10. Defends
+    // the block's transform stack: an attacker cannot flip a transform
+    // bit (e.g. clear the per-KV checksum footer bit, or relabel a block
+    // as compressed/encrypted) under a forged non-cryptographic header
+    // checksum — the AAD binds the whole byte so any flip fails AEAD.
+    let chain = key_chain();
+    let id = identity(7, 99, 0x1000);
+    let mut bytes = encrypt_block(PLAINTEXT_A, &id, &ctx(), &chain).expect("encrypt");
+    bytes[META_BLOCK_FLAGS] ^= 0x01; // flip the KV_CHECKSUM_FOOTER bit (was 0)
+
+    let err = decrypt_block(&bytes, &id, &chain).expect_err("must fail");
+    assert!(
+        matches!(err, DecryptError::AeadVerificationFailed),
+        "expected AeadVerificationFailed, got {err:?}"
+    );
+}
+
+#[test]
 fn suite_id_supported_relabel_rejected() {
     // Suite-swap REJECTION coverage (NOT a SuiteID-in-AAD proof).
     //
@@ -318,11 +338,11 @@ fn suite_id_is_part_of_aad() {
 
     let id = identity(7, 99, 0x1000);
     let aad_aes = build(
-        &EncryptionContext::v1(KEY_EPOCH, SuiteId::Aes256Gcm, 0),
+        &EncryptionContext::v1(KEY_EPOCH, SuiteId::Aes256Gcm, 0, 0),
         &id,
     );
     let aad_chacha = build(
-        &EncryptionContext::v1(KEY_EPOCH, SuiteId::ChaCha20Poly1305, 0),
+        &EncryptionContext::v1(KEY_EPOCH, SuiteId::ChaCha20Poly1305, 0, 0),
         &id,
     );
 
@@ -685,7 +705,7 @@ fn window_log_under_zstd_tamper_fails_aead_verify() {
     let chain = key_chain();
     let mut id = identity(7, 99, 0x1000);
     id.window_log = 15;
-    let zstd_ctx = EncryptionContext::v1(KEY_EPOCH, SuiteId::Aes256Gcm, 3);
+    let zstd_ctx = EncryptionContext::v1(KEY_EPOCH, SuiteId::Aes256Gcm, 3, 0);
     let mut bytes = encrypt_block(PLAINTEXT_A, &id, &zstd_ctx, &chain).expect("encrypt");
     bytes[META_WINDOW_LOG] = 20; // valid for zstd, different from sealed
 
@@ -705,7 +725,7 @@ fn dict_id_under_zstd_dict_tamper_fails_aead_verify() {
     let chain = key_chain();
     let mut id = identity(7, 99, 0x1000);
     id.dict_id = 0x1234_5678;
-    let zstd_dict_ctx = EncryptionContext::v1(KEY_EPOCH, SuiteId::Aes256Gcm, 4);
+    let zstd_dict_ctx = EncryptionContext::v1(KEY_EPOCH, SuiteId::Aes256Gcm, 4, 0);
     let mut bytes = encrypt_block(PLAINTEXT_A, &id, &zstd_dict_ctx, &chain).expect("encrypt");
     // Flip a single byte of the u32 BE dict_id — same codec ctx,
     // different dict identity.
