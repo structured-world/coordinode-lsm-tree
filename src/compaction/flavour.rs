@@ -108,6 +108,11 @@ pub(super) fn prepare_table_writer(
         .use_prefix_extractor(opts.config.prefix_extractor.clone())
         .use_encryption(opts.config.encryption.clone())
         .use_page_ecc(opts.config.page_ecc)
+        // `seqno_in_index` is a live runtime config: read off the current
+        // snapshot so a compaction started after a toggle rewrites its
+        // output SSTs in the new index format (compaction is the migration
+        // mechanism for the on-disk index layout).
+        .use_seqno_in_index(opts.runtime_config.load_full().seqno_in_index)
         .use_bloom_policy({
             use crate::config::FilterPolicyEntry::{Bloom, None};
             use crate::table::filter::BloomConstructionPolicy;

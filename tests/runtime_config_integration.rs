@@ -173,6 +173,63 @@ fn tree_kv_checksums_all_levels_round_trips_through_disk() {
     }
 }
 
+#[test]
+fn seqno_in_index_round_trips_through_disk_and_reopen() -> lsm_tree::Result<()> {
+    // With `seqno_in_index` enabled, every data-block index entry is written
+    // in the seqno-bounded format (markers 2 / 3) and the SST is tagged
+    // index_format=1. The whole point of the format is that the data must
+    // read back identically: flush, point-read, reopen, point-read again.
+    // Reopen is the load-bearing step — it re-parses the on-disk index from
+    // scratch, so a broken seqno-bounded decode surfaces as a read failure.
+    let folder = get_tmp_folder();
+
+    {
+        let tree = open_tree(folder.path());
+        tree.update_runtime_config(|cfg| {
+            cfg.seqno_in_index = true;
+        })?;
+
+        // Enough keys (with rising seqnos) to spill multiple data blocks, so
+        // the index holds several entries with differing seqno bounds.
+        for i in 0..500u64 {
+            let key = format!("key{i:05}");
+            let value = format!("value{i:05}");
+            tree.insert(key.as_bytes(), value.as_bytes(), i);
+        }
+        tree.flush_active_memtable(0)?;
+
+        for i in 0..500u64 {
+            let key = format!("key{i:05}");
+            let got = tree.get(key.as_bytes(), SeqNo::MAX)?;
+            assert_eq!(
+                got.as_deref(),
+                Some(format!("value{i:05}").as_bytes()),
+                "post-flush read of {key} must return its value"
+            );
+        }
+    }
+
+    // Reopen: the index blocks are decoded fresh from disk. Runtime config
+    // resets to default on reopen (not persisted), but the on-disk
+    // index_format=1 entries must still decode via per-marker dispatch.
+    let tree = open_tree(folder.path());
+    for i in 0..500u64 {
+        let key = format!("key{i:05}");
+        let got = tree.get(key.as_bytes(), SeqNo::MAX)?;
+        assert_eq!(
+            got.as_deref(),
+            Some(format!("value{i:05}").as_bytes()),
+            "post-reopen read of {key} must return its value"
+        );
+    }
+
+    // A key never inserted must still be absent (index seek lands correctly
+    // on the seqno-bounded entries).
+    assert!(tree.get(b"key99999", SeqNo::MAX)?.is_none());
+
+    Ok(())
+}
+
 /// Locks the public contract of `Tree::update_runtime_config` when
 /// the build does NOT enable the `page_ecc` cargo feature:
 /// flipping `page_ecc = true` must return the typed error AND

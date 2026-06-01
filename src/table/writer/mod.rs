@@ -131,6 +131,16 @@ pub struct Writer {
         crate::runtime_config::ChecksumAlgorithm,
     )>,
 
+    /// Per-block seqno bounds opt-in (the `seqno_in_index` runtime config).
+    /// When `true`, every data-block index entry carries `(seqno_min,
+    /// seqno_max)` (wire markers 2 / 3) and the SST is tagged
+    /// `index_format = 1`, letting a seqno-scoped scan skip blocks below the
+    /// target without reading them. Default `false` (legacy `index_format =
+    /// 0`, byte-identical index entries). Caller wires the live runtime
+    /// config into this field via [`Self::use_seqno_in_index`] before the
+    /// first key is added.
+    use_seqno_in_index: bool,
+
     /// Pre-trained zstd dictionary for dictionary compression
     #[cfg(zstd_any)]
     zstd_dictionary: Option<Arc<crate::compression::ZstdDictionary>>,
@@ -208,6 +218,7 @@ impl Writer {
             page_ecc: false,
 
             kv_checksum: None,
+            use_seqno_in_index: false,
 
             #[cfg(zstd_any)]
             zstd_dictionary: None,
@@ -405,6 +416,19 @@ impl Writer {
         self
     }
 
+    /// Enables per-block seqno bounds in the data-block index (the
+    /// `seqno_in_index` runtime config). When `true`, each index entry
+    /// carries `(seqno_min, seqno_max)` and the SST is tagged
+    /// `index_format = 1`. Must be called BEFORE the first key is added so
+    /// every index entry in the table uses the same format; callers
+    /// (`Tree` flush + compaction worker) pass the live config once at
+    /// writer construction. Default `false` (legacy `index_format = 0`).
+    #[must_use]
+    pub fn use_seqno_in_index(mut self, seqno_in_index: bool) -> Self {
+        self.use_seqno_in_index = seqno_in_index;
+        self
+    }
+
     #[must_use]
     pub fn use_bloom_policy(mut self, bloom_policy: BloomConstructionPolicy) -> Self {
         self.bloom_policy = bloom_policy;
@@ -578,12 +602,35 @@ impl Writer {
 
         let bytes_written = header.on_disk_size();
 
-        self.index_writer
-            .register_data_block(KeyedBlockHandle::new(
-                last.key.user_key.clone(),
-                last.key.seqno,
-                BlockHandle::new(self.meta.file_pos, bytes_written),
-            ))?;
+        let mut handle = KeyedBlockHandle::new(
+            last.key.user_key.clone(),
+            last.key.seqno,
+            BlockHandle::new(self.meta.file_pos, bytes_written),
+        );
+
+        if self.use_seqno_in_index {
+            // Per-block seqno bounds let a seqno-scoped scan skip this whole
+            // block when its `max` is below the target. The chunk is still
+            // intact here (popped further down), so min/max is a single pass
+            // over entries already in hand: zero extra tracking.
+            #[expect(clippy::expect_used, reason = "chunk is non-empty (last exists)")]
+            let seqno_min = self
+                .chunk
+                .iter()
+                .map(|e| e.key.seqno)
+                .min()
+                .expect("chunk is non-empty");
+            #[expect(clippy::expect_used, reason = "chunk is non-empty (last exists)")]
+            let seqno_max = self
+                .chunk
+                .iter()
+                .map(|e| e.key.seqno)
+                .max()
+                .expect("chunk is non-empty");
+            handle = handle.with_seqno_bounds(seqno_min, seqno_max);
+        }
+
+        self.index_writer.register_data_block(handle)?;
 
         // Adjust metadata
         self.meta.file_pos += u64::from(bytes_written);
@@ -825,10 +872,11 @@ impl Writer {
             data_block_restart_interval: self.data_block_restart_interval,
             index_block_restart_interval: self.index_block_restart_interval,
             initial_level: self.initial_level,
-            // Always 0 for now: the writer is not yet wired to the runtime
-            // `seqno_in_index` config, so every SST uses the legacy index
-            // format (byte-identical to the pre-#224 layout).
-            index_format: 0,
+            // `1` when the writer was built with `use_seqno_in_index(true)`:
+            // every data-block index entry carries `(seqno_min, seqno_max)`
+            // (wire markers 2 / 3) for seqno-scoped block-skip. `0` is the
+            // legacy format, byte-identical to the pre-seqno-bounds layout.
+            index_format: u8::from(self.use_seqno_in_index),
             range_tombstone_count,
             // `block_offset` here feeds `BlockIdentity` which today is
             // unused (`let _ = identity;` in `Block::write_into` /
@@ -1116,11 +1164,11 @@ fn write_meta_section<W: std::io::Write + std::io::Seek>(
         meta("descriptor#page_ecc", &[u8::from(effective_page_ecc)]),
         meta("file_size", &p.file_size.to_le_bytes()),
         meta("filter_hash_type", &[u8::from(ChecksumType::Xxh3)]),
-        // Index block format (#224): 0 = legacy (no per-block seqno
-        // bounds in index entries). The seqno-bounded format (1) is
-        // emitted once the writer is wired to the runtime
-        // `seqno_in_index` config; until then every SST is index_format=0,
-        // byte-identical to the pre-#224 layout.
+        // Index block format: 0 = legacy (no per-block seqno bounds in
+        // index entries, byte-identical to the prior layout); 1 = each
+        // data-block index entry carries `(seqno_min, seqno_max)` for
+        // seqno-scoped block-skip. Set from the writer's `seqno_in_index`
+        // config at build time.
         meta("index_format", &[p.index_format]),
         meta("index_keys_have_seqno", &[0x1]),
         meta("initial_level", &p.initial_level.to_le_bytes()),

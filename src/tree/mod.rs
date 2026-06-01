@@ -504,6 +504,12 @@ impl AbstractTree for Tree {
         table_writer = table_writer.use_prefix_extractor(self.config.prefix_extractor.clone());
         table_writer = table_writer.use_encryption(self.config.encryption.clone());
         table_writer = table_writer.use_page_ecc(self.config.page_ecc);
+        // `seqno_in_index` is a live runtime config (toggleable via
+        // `update_runtime_config`), read once per flush off the current
+        // snapshot so the resulting SST's index format matches the policy
+        // in force at flush time.
+        table_writer =
+            table_writer.use_seqno_in_index(self.0.runtime_config.load_full().seqno_in_index);
 
         // Per-KV checksums follow the LIVE runtime config snapshot so a
         // toggle via `update_runtime_config` takes effect on the next

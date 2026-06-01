@@ -125,6 +125,9 @@ impl<'a> Ingestion<'a> {
         writer = writer.use_prefix_extractor(tree.config.prefix_extractor.clone());
         writer = writer.use_encryption(tree.config.encryption.clone());
         writer = writer.use_page_ecc(tree.config.page_ecc);
+        // `seqno_in_index` is a live runtime config; read off the current
+        // snapshot so ingested SSTs match the index format in force.
+        writer = writer.use_seqno_in_index(tree.0.runtime_config.load_full().seqno_in_index);
 
         // Per-KV checksums follow the live runtime config snapshot (same as
         // the flush / compaction write paths). `Off` (default) emits no

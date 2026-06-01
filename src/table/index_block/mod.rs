@@ -29,6 +29,9 @@ pub struct IndexBlockParsedItem {
     pub prefix: Option<SliceIndexes>,
     pub end_key: SliceIndexes,
     pub seqno: SeqNo,
+    /// Per-block seqno bounds `(min, max)`, present only for seqno-bounded
+    /// index entries (markers 2 / 3); `None` for legacy entries.
+    pub seqno_bounds: Option<(SeqNo, SeqNo)>,
 }
 
 impl ParsedItem<KeyedBlockHandle> for IndexBlockParsedItem {
@@ -83,7 +86,12 @@ impl ParsedItem<KeyedBlockHandle> for IndexBlockParsedItem {
             bytes.slice(self.end_key.0..self.end_key.1)
         };
 
-        KeyedBlockHandle::new(key, self.seqno, BlockHandle::new(self.offset, self.size))
+        let handle =
+            KeyedBlockHandle::new(key, self.seqno, BlockHandle::new(self.offset, self.size));
+        match self.seqno_bounds {
+            Some((seqno_min, seqno_max)) => handle.with_seqno_bounds(seqno_min, seqno_max),
+            None => handle,
+        }
     }
 }
 
