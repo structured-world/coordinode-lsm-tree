@@ -338,7 +338,7 @@ impl ManifestArchiveReader {
         let mut block_bytes = vec![0u8; block_size as usize];
         self.file.read_exact(&mut block_bytes)?;
 
-        validate_block_header_fits(&block_bytes, HeaderContext::Section)?;
+        validate_block_header_fits(&block_bytes, HeaderContext::SectionExact)?;
         let identity = BlockIdentity {
             tree_id: MANIFEST_TREE_ID_SENTINEL,
             table_id: MANIFEST_TABLE_ID_SENTINEL,
@@ -398,14 +398,25 @@ impl ManifestArchiveReader {
 /// is unreadable".
 #[derive(Copy, Clone)]
 enum HeaderContext {
-    /// Inner header lives in a section Block whose outer slot was
-    /// described by a TOC entry. Failures classify as
+    /// Inner header lives in a section Block whose outer slot is sized
+    /// EXACTLY by its TOC entry. The declared on-disk size must equal the
+    /// slot length — an understated header would let `Block::from_reader`
+    /// consume only the declared bytes and silently ignore the trailing
+    /// remainder (e.g. a stripped `ECC_PARITY` trailer), which
+    /// `Block::from_file` rejects. Failures classify as
     /// `ManifestSectionInvalid`.
-    Section,
-    /// Inner header lives in the tail-footer Block or its
-    /// head-mirror copy. Failures classify as
+    SectionExact,
+    /// Inner header lives in the tail-footer Block, read into a buffer
+    /// sized EXACTLY by the trailing size hint. Same exact-fit contract as
+    /// [`Self::SectionExact`]. Failures classify as `ManifestFooterInvalid`.
+    FooterExact,
+    /// Inner header lives in the head-mirror footer, read into the fixed
+    /// `HEAD_FOOTER_RESERVED_SIZE` reservation that is intentionally larger
+    /// than the footer Block and zero-padded. Here the declared size may be
+    /// smaller than the buffer (the trailing pad is expected), so only the
+    /// over-read direction is rejected. Failures classify as
     /// `ManifestFooterInvalid`.
-    Footer,
+    FooterPadded,
 }
 
 /// Peek the Block header from `buf` and refuse to delegate to
@@ -430,8 +441,10 @@ fn validate_block_header_fits(buf: &[u8], ctx: HeaderContext) -> crate::Result<(
     use crate::coding::Decode;
     let wrap = |msg: &'static str| -> crate::Error {
         match ctx {
-            HeaderContext::Section => crate::Error::ManifestSectionInvalid(msg),
-            HeaderContext::Footer => crate::Error::ManifestFooterInvalid(msg),
+            HeaderContext::SectionExact => crate::Error::ManifestSectionInvalid(msg),
+            HeaderContext::FooterExact | HeaderContext::FooterPadded => {
+                crate::Error::ManifestFooterInvalid(msg)
+            }
         }
     };
     let header_len = Header::serialized_len();
@@ -461,6 +474,7 @@ fn validate_block_header_fits(buf: &[u8], ctx: HeaderContext) -> crate::Result<(
     // `data_length` saturates to u32::MAX and is rejected by the bound check
     // below against the (much smaller) buffer length.
     let declared = u64::from(header.on_disk_size());
+    let _ = ctx;
     if declared > buf.len() as u64 {
         return Err(wrap(
             "manifest Block header declares on-disk size larger than buffer",
@@ -546,7 +560,7 @@ fn read_tail_footer(
     )]
     let mut footer_buf = vec![0u8; footer_size as usize];
     file.read_exact(&mut footer_buf)?;
-    validate_block_header_fits(&footer_buf, HeaderContext::Footer)?;
+    validate_block_header_fits(&footer_buf, HeaderContext::FooterExact)?;
     let identity = BlockIdentity {
         tree_id: MANIFEST_TREE_ID_SENTINEL,
         table_id: MANIFEST_TABLE_ID_SENTINEL,
@@ -588,7 +602,7 @@ fn read_head_footer(
         ));
     }
 
-    validate_block_header_fits(&head_buf, HeaderContext::Footer)?;
+    validate_block_header_fits(&head_buf, HeaderContext::FooterPadded)?;
     let identity = BlockIdentity {
         tree_id: MANIFEST_TREE_ID_SENTINEL,
         table_id: MANIFEST_TABLE_ID_SENTINEL,
@@ -631,6 +645,42 @@ mod tests {
         let fs = MemFs::new();
         fs.create_dir_all(Path::new("/m")).unwrap();
         fs
+    }
+
+    #[test]
+    fn validate_block_header_fits_rejects_understated_exact_slot() {
+        use crate::coding::Encode;
+        use crate::table::block::{BlockType, Header};
+
+        // A valid (checksummed) header declaring data_length = 4 with no
+        // parity, handed a slot LARGER than the block's on-disk size (extra
+        // trailing bytes). For an exact-fit context the understated header
+        // must be rejected: otherwise `Block::from_reader` consumes only the
+        // declared bytes and silently ignores the trailing remainder (e.g. a
+        // stripped ECC_PARITY trailer), which `Block::from_file` rejects.
+        let header = Header {
+            data_length: 4,
+            uncompressed_length: 4,
+            ..Header::test_dummy(BlockType::ManifestFooter)
+        };
+        let mut buf = header.encode_into_vec();
+        buf.extend_from_slice(&[0u8; 4]); // declared payload
+        buf.extend_from_slice(&[0xAB, 0xCD]); // extra trailing bytes beyond the block
+
+        // on_disk_size = header (34) + data_length (4) = 38; buf.len() = 40.
+        assert!(
+            validate_block_header_fits(&buf, HeaderContext::SectionExact).is_err(),
+            "an understated header in an exact-fit section slot must be rejected",
+        );
+        assert!(
+            validate_block_header_fits(&buf, HeaderContext::FooterExact).is_err(),
+            "an understated header in an exact-fit footer slot must be rejected",
+        );
+        // The padded head-mirror context tolerates a smaller declared size.
+        assert!(
+            validate_block_header_fits(&buf, HeaderContext::FooterPadded).is_ok(),
+            "padded slot accepts a smaller declared size (trailing pad expected)",
+        );
     }
 
     fn write_manifest(fs: &MemFs, path: &Path, runtime: RuntimeConfig, sections: &[(&str, &[u8])]) {
