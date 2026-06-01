@@ -75,15 +75,19 @@ pub enum FormatVersion {
     ///    per-layer header layout is documented in
     ///    `src/table/filter/ribbon/burr/wire.rs`.
     ///
-    /// 2. Per-block Reed-Solomon Page ECC: the block header gains a
-    ///    `block_flags: u8` byte whose `ECC_PARITY` bit marks that a
-    ///    Reed-Solomon parity trailer follows the XXH3-covered payload
-    ///    bytes (its length is derived from `data_length`, not stored).
-    ///    When `Config::page_ecc(false)` (the default), the bit is clear
-    ///    and no parity bytes follow. The block magic was bumped to
-    ///    `[L,S,M,4]` (was `[L,S,M,3]` on pre-V5 versions) so a pre-V5
-    ///    reader that bypasses the manifest gate fails fast at block
-    ///    header decode rather than misreading the new layout.
+    /// 2. Per-block transform flags + Page ECC: the block header gains a
+    ///    `block_flags: u8` byte carrying the transform-presence bits.
+    ///    `ECC_PARITY` marks that a Reed-Solomon parity trailer follows
+    ///    the XXH3-covered payload (its length is derived from
+    ///    `data_length`, not stored); `KV_CHECKSUM_FOOTER` marks a
+    ///    per-entry checksum footer (the per-KV integrity feature).
+    ///    When `Config::page_ecc(false)` (the default) the `ECC_PARITY`
+    ///    bit is clear and no parity bytes follow; likewise the footer
+    ///    bit is clear unless per-KV checksums are enabled. The block
+    ///    magic was bumped to `[L,S,M,4]` (was `[L,S,M,3]` on pre-V5
+    ///    versions) so a pre-V5 reader that bypasses the manifest gate
+    ///    fails fast at block header decode rather than misreading the
+    ///    new layout.
     ///
     /// V3 / V4 ↔ V5 incompatibility is enforced primarily by the
     /// manifest version gate at `Tree::open` (returns

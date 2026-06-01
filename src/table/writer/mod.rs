@@ -1059,6 +1059,13 @@ fn write_meta_section<W: std::io::Write + std::io::Seek>(
 ) -> crate::Result<()> {
     file_writer.start(p.section_name)?;
 
+    // Record the EFFECTIVE Page-ECC setting, not the requested flag. On
+    // builds without the `page_ecc` cargo feature, `with_ecc()` compiles to
+    // the identity and no parity trailer is ever emitted, so the descriptor
+    // must read false to stay consistent with the on-disk blocks (otherwise
+    // an SST advertises parity that isn't there).
+    let effective_page_ecc = cfg!(feature = "page_ecc") && page_ecc;
+
     let meta = meta_kv;
     let meta_items = [
         meta("block_count#data", &p.data_block_count.to_le_bytes()),
@@ -1099,7 +1106,7 @@ fn write_meta_section<W: std::io::Write + std::io::Seek>(
         // carries a Reed-Solomon parity trailer (Page ECC). One byte for the
         // whole homogeneous SST, so the read path learns ECC presence from
         // the descriptor instead of a per-block header field.
-        meta("descriptor#page_ecc", &[u8::from(page_ecc)]),
+        meta("descriptor#page_ecc", &[u8::from(effective_page_ecc)]),
         meta("file_size", &p.file_size.to_le_bytes()),
         meta("filter_hash_type", &[u8::from(ChecksumType::Xxh3)]),
         meta("index_keys_have_seqno", &[0x1]),
