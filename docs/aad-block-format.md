@@ -504,7 +504,7 @@ All `key` / `value` / `nonce` byte sequences are shown hex, big-endian to small-
 | TableID (BE) | `00000000 00002a30` (= 10800) | The SST file's per-tree TableId |
 | BlockOffset (BE) | `00000000 00000000` (= 0) | The block's offset in the file (first block) |
 
-**AAD (38 B, NEVER on disk):** `502a4d18 10 01 00 02 0000000000000007 0000000000002a30 0000000000000000 00 00000000 00` (canonical order per §5.3: MagicMetadata | HeaderByte=0x10 [v1, low nibble reserved] | KeyEpoch=0x01 | BlockType=0x00 | SuiteID=0x02 | TreeID BE | TableID BE | BlockOffset BE | CompressionType=0x00 [None] | DictID BE | WindowLog=0x00 [no zstd])
+**AAD (39 B, NEVER on disk):** `502a4d18 10 01 00 02 0000000000000007 0000000000002a30 0000000000000000 00 00000000 00 00` (canonical order per §5.3: MagicMetadata | HeaderByte=0x10 [v1, low nibble reserved] | KeyEpoch=0x01 | BlockType=0x00 | SuiteID=0x02 | TreeID BE | TableID BE | BlockOffset BE | CompressionType=0x00 [None] | DictID BE | WindowLog=0x00 [no zstd] | BlockFlags=0x00 [no transform layers])
 
 **Expected on-disk size:** 68 B total = 47 (MetadataFrame = 8 framing + 39 payload for v1 suite) + 8 (BodyFrame framing header) + 13 (EncryptedBody). For AES-256-GCM and ChaCha20-Poly1305, `ciphertext_len == plaintext_len` because the tag is stored in MetadataFrame, not appended to the ciphertext.
 
