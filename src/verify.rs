@@ -459,7 +459,13 @@ pub fn verify_block_checksums(tree: &impl crate::AbstractTree) -> BlockVerifyRep
         // attach to different SSTs once #251 lands), so feed each
         // table's `max_overhead()` separately.
         let max_enc_overhead = table.encryption.as_ref().map_or(0u32, |e| e.max_overhead());
-        match scan_sst_blocks(&*table.fs, path, table_id, max_enc_overhead) {
+        match scan_sst_blocks(
+            &*table.fs,
+            path,
+            table_id,
+            max_enc_overhead,
+            table.metadata.page_ecc,
+        ) {
             Ok(per_file) => {
                 report.blocks_scanned += per_file.blocks_scanned;
                 report.errors.extend(per_file.errors);
@@ -547,7 +553,12 @@ pub fn verify_sst_file(path: &std::path::Path) -> BlockVerifyReport {
         ..BlockVerifyReport::default()
     };
 
-    match scan_sst_blocks(&fs, path, 0, 0) {
+    // SST blocks omit the block_flags byte, so the parity-trailer presence the
+    // walk must skip is the per-SST `page_ecc` flag — read it from the meta
+    // descriptor (best-effort; see `read_page_ecc_out_of_band`).
+    let page_ecc = read_page_ecc_out_of_band(&fs, path);
+
+    match scan_sst_blocks(&fs, path, 0, 0, page_ecc) {
         Ok(per_file) => {
             report.blocks_scanned = per_file.blocks_scanned;
             report.errors = per_file.errors;
@@ -562,6 +573,39 @@ pub fn verify_sst_file(path: &std::path::Path) -> BlockVerifyReport {
     }
 
     report
+}
+
+/// Best-effort read of the per-SST `page_ecc` flag from an SST file's meta
+/// descriptor, for the out-of-band scrub (no live `Table` to consult).
+///
+/// Returns `false` when the file can't be opened, the TOC has no `meta`
+/// section, or the meta block can't be decoded (e.g. an encrypted SST —
+/// out-of-band tools carry no key, matching the documented encryption
+/// limitation). A wrong `false` only mis-aligns a `page_ecc` SST's walk, which
+/// surfaces as a reported `HeaderCorrupted`, never a silent pass.
+#[cfg(feature = "std")]
+fn read_page_ecc_out_of_band(fs: &dyn crate::fs::Fs, path: &std::path::Path) -> bool {
+    let Ok(file) = fs.open(path, &crate::fs::FsOpenOptions::new().read(true)) else {
+        return false;
+    };
+    let mut probe = file;
+    let Ok(sfa_reader) = crate::sfa::Reader::from_reader(&mut probe) else {
+        return false;
+    };
+    let Some((pos, len)) = sfa_reader
+        .toc()
+        .section(b"meta")
+        .map(|e| (e.pos(), e.len()))
+    else {
+        return false;
+    };
+    let Ok(size) = u32::try_from(len) else {
+        return false;
+    };
+    let handle = crate::table::BlockHandle::new(crate::table::BlockOffset(pos), size);
+    crate::table::meta::ParsedMeta::load_with_handle(probe.as_ref(), &handle, None)
+        .map(|meta| meta.page_ecc)
+        .unwrap_or(false)
 }
 
 struct PerFileScan {
@@ -581,6 +625,7 @@ fn scan_sst_blocks(
     path: &Path,
     table_id: TableId,
     max_enc_overhead: u32,
+    page_ecc: bool,
 ) -> std::io::Result<PerFileScan> {
     use std::io::{BufReader, Seek, SeekFrom};
 
@@ -694,6 +739,7 @@ fn scan_sst_blocks(
             blocks_scanned: &mut blocks_scanned,
             errors: &mut errors,
             max_data_length: block_data_length_cap(max_enc_overhead),
+            page_ecc,
         };
         walk_block_region(&mut ctx, start, end);
     }
@@ -761,6 +807,14 @@ struct WalkCtx<'a> {
     /// so the scrub does not false-flag legitimate encrypted blocks
     /// near the 256 MiB plaintext limit as `HeaderCorrupted`.
     max_data_length: u64,
+    /// Per-SST Page-ECC setting. SST blocks (`Data` / `Index` / `Filter` /
+    /// `RangeTombstone`) omit the `block_flags` byte, so their parity-trailer
+    /// presence is NOT derivable from the header — it is this table-wide flag.
+    /// When `true`, each such block carries `expected_parity_len(data_length)`
+    /// parity bytes after the payload that the walk must skip to stay aligned.
+    /// Meta / Manifest / `ManifestFooter` blocks keep the byte and self-describe
+    /// parity via their `ECC_PARITY` bit regardless of this flag.
+    page_ecc: bool,
 }
 
 fn walk_block_region(ctx: &mut WalkCtx<'_>, start_offset: u64, end_offset: u64) {
@@ -823,6 +877,24 @@ fn walk_block_region(ctx: &mut WalkCtx<'_>, start_offset: u64, end_offset: u64) 
         // advance so the walk tracks what `decode_from` actually consumed.
         let header_len = Header::header_len(header.block_type) as u64;
 
+        // Page-ECC parity trailer that follows the payload on disk. Presence
+        // depends on the block type: Meta / Manifest / ManifestFooter keep the
+        // block_flags byte and self-describe via the ECC_PARITY bit; SST blocks
+        // omit the byte, so parity presence is the per-SST `page_ecc` flag. The
+        // trailer length is derived from data_length (never stored). The walk
+        // must skip these bytes — otherwise the next iteration would read parity
+        // as the following block's header and mis-align the whole section.
+        let has_parity = if Header::has_block_flags(header.block_type) {
+            header.block_flags & crate::table::block::header::block_flags::ECC_PARITY != 0
+        } else {
+            ctx.page_ecc
+        };
+        let parity_len = if has_parity {
+            u64::from(crate::table::block::expected_parity_len(header.data_length))
+        } else {
+            0
+        };
+
         // Validate data_length against TWO bounds before allocating
         // / reading:
         //
@@ -857,13 +929,15 @@ fn walk_block_region(ctx: &mut WalkCtx<'_>, start_offset: u64, end_offset: u64) 
             return;
         }
         let remaining = end_offset.saturating_sub(offset).saturating_sub(header_len);
-        if data_length_u64 > remaining {
+        let on_disk_payload = data_length_u64.saturating_add(parity_len);
+        if on_disk_payload > remaining {
             ctx.errors.push(BlockVerifyError::HeaderCorrupted {
                 table_id: ctx.table_id,
                 path: ctx.path.to_path_buf(),
                 offset,
                 reason: format!(
-                    "header data_length {data_length_u64} exceeds remaining section bytes {remaining}",
+                    "header data_length {data_length_u64} + parity {parity_len} exceeds \
+                     remaining section bytes {remaining}",
                 ),
             });
             return;
@@ -904,12 +978,50 @@ fn walk_block_region(ctx: &mut WalkCtx<'_>, start_offset: u64, end_offset: u64) 
             });
         }
 
+        // Consume the parity trailer (if any) so the reader cursor lands on
+        // the next block's header. The payload checksum above already covers
+        // correctness; parity is only consulted for ECC recovery on the live
+        // read path, so the scrub discards it — but it MUST still skip exactly
+        // `parity_len` bytes or the next iteration mis-reads parity as a header.
+        if parity_len > 0 {
+            match std::io::copy(
+                &mut ctx.reader.by_ref().take(parity_len),
+                &mut std::io::sink(),
+            ) {
+                Ok(n) if n == parity_len => {}
+                Ok(n) => {
+                    ctx.errors.push(BlockVerifyError::DataReadError {
+                        table_id: ctx.table_id,
+                        path: ctx.path.to_path_buf(),
+                        offset,
+                        data_length: header.data_length,
+                        error: std::io::Error::new(
+                            std::io::ErrorKind::UnexpectedEof,
+                            format!("parity trailer truncated: read {n} of {parity_len} bytes"),
+                        ),
+                    });
+                    return;
+                }
+                Err(e) => {
+                    ctx.errors.push(BlockVerifyError::DataReadError {
+                        table_id: ctx.table_id,
+                        path: ctx.path.to_path_buf(),
+                        offset,
+                        data_length: header.data_length,
+                        error: e,
+                    });
+                    return;
+                }
+            }
+        }
+
         // blocks_scanned was already incremented right after a
         // successful Header::decode_from above — do not double-count
         // here.
         offset = offset
             .saturating_add(header_len)
-            .saturating_add(data_length_u64);
+            .saturating_add(data_length_u64)
+            .saturating_add(parity_len);
     }
 }
 
@@ -1014,6 +1126,60 @@ mod block_verify_tests {
         assert!(
             report.sst_files_scanned >= 1,
             "expected at least one SST scanned",
+        );
+    }
+
+    #[cfg(feature = "page_ecc")]
+    #[test]
+    fn verify_block_checksums_clean_page_ecc_tree_has_no_errors() {
+        // Regression: with page_ecc on, every SST data / index / filter block
+        // carries a Reed-Solomon parity trailer after its payload. SST blocks
+        // omit the block_flags byte, so the scrub learns parity presence from
+        // the per-SST descriptor and must skip `expected_parity_len(data_length)`
+        // bytes per block. Without that skip the walk mis-reads parity as the
+        // next block's header and reports spurious HeaderCorrupted. Enough items
+        // to spill multiple data blocks so cross-block alignment is exercised.
+        use crate::AbstractTree;
+
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let any = Config::new(
+                dir.path(),
+                SequenceNumberCounter::default(),
+                SequenceNumberCounter::default(),
+            )
+            .data_block_compression_policy(CompressionPolicy::all(CompressionType::None))
+            .page_ecc(true)
+            .open()
+            .unwrap();
+            for i in 0u64..2_000 {
+                let key = format!("k{i:08}");
+                let val = format!("v{i:08}");
+                any.insert(key.as_bytes(), val.as_bytes(), 1 + i);
+            }
+            any.flush_active_memtable(2_001).unwrap();
+            drop(any);
+        }
+
+        let tree = Config::new(
+            dir.path(),
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .data_block_compression_policy(CompressionPolicy::all(CompressionType::None))
+        .page_ecc(true)
+        .open()
+        .unwrap();
+        let report = verify_block_checksums(&tree);
+        assert!(
+            report.is_ok(),
+            "page_ecc tree must verify with zero errors (parity trailers skipped \
+             per block), got {:?}",
+            report.errors,
+        );
+        assert!(
+            report.blocks_scanned > 1,
+            "expected multiple blocks scanned to exercise cross-block alignment",
         );
     }
 
@@ -1402,7 +1568,8 @@ mod block_verify_tests {
         }
 
         let table_id: TableId = 42;
-        let scan = scan_sst_blocks(&fs, path, table_id, 0).expect("forged SFA must parse cleanly");
+        let scan =
+            scan_sst_blocks(&fs, path, table_id, 0, false).expect("forged SFA must parse cleanly");
         assert_eq!(
             scan.errors.len(),
             1,
