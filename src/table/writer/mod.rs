@@ -119,8 +119,8 @@ pub struct Writer {
     page_ecc: bool,
 
     /// Per-KV checksum policy + algorithm for data blocks. `None` (default)
-    /// means no per-KV checksums: data blocks are byte-identical to the
-    /// pre-per-KV format with the `KV_CHECKSUM_FOOTER` header flag clear.
+    /// means no per-KV checksums: data blocks carry no per-KV footer, with
+    /// the `KV_CHECKSUM_FOOTER` header flag clear.
     /// When `Some((policy, algo))`, each data block whose `(level,
     /// table_id)` satisfies `policy.applies` is emitted with a per-entry
     /// checksum footer under `algo` and the `KV_CHECKSUM_FOOTER` flag set
@@ -383,7 +383,7 @@ impl Writer {
     /// `(level, table_id)` satisfies `policy.applies` gets a per-entry
     /// checksum footer and the `KV_CHECKSUM_FOOTER` header flag set; all
     /// other data blocks stay plain (flag clear). `Off` (or never calling
-    /// this) leaves data blocks byte-identical to the pre-per-KV format.
+    /// this) leaves data blocks without a per-KV footer (flag clear).
     ///
     /// Must be called BEFORE the first key is added (same contract as
     /// [`Self::use_page_ecc`]).
@@ -509,7 +509,7 @@ impl Writer {
         // Decide per-block whether to emit the per-KV checksum footer.
         // `kv_checksum` is None unless the tree opted in; even then only
         // blocks whose (level, table_id) satisfy the policy carry the
-        // footer. Off-path is byte-identical to the pre-per-KV format.
+        // footer. Off-path emits no footer (KV_CHECKSUM_FOOTER bit clear).
         let kv_emit = self.kv_checksum.and_then(|(policy, algo)| {
             policy
                 .applies(self.initial_level, self.table_id)
@@ -518,8 +518,8 @@ impl Writer {
 
         // A per-KV-checked block is a plain Data block plus a footer: the
         // role stays Data, the footer is recorded as a header flag bit
-        // (KV_CHECKSUM_FOOTER), not as a distinct block type. Off-path is
-        // byte-identical to the pre-per-KV format with the bit clear.
+        // (KV_CHECKSUM_FOOTER), not as a distinct block type. Off-path emits
+        // no footer (KV_CHECKSUM_FOOTER bit clear).
         let kv_flags = if let Some(algo) = kv_emit {
             // Compute one logical-content digest per entry, in scan order.
             let mut digests = Vec::with_capacity(self.chunk.len());

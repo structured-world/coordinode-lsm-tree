@@ -79,16 +79,16 @@ pub mod block_flags {
 
     /// The payload was compressed. The codec (and any zstd dict) is
     /// not stored per block — it comes from the owning SST's
-    /// compression policy, which the reader already supplies via the
-    /// `BlockTransform`. This bit is the self-describing presence
-    /// signal (and a cross-check against that caller-supplied
-    /// transform).
+    /// compression policy, which the reader supplies via the
+    /// `BlockTransform`. This bit is a presence-only self-describing
+    /// signal; the read path decodes using the caller-supplied
+    /// transform and does not currently validate this bit against it.
     pub const COMPRESSED: u8 = 1 << 2;
 
     /// The payload was encrypted. The scheme/key comes from the
     /// owning SST's encryption config (caller-supplied via the
-    /// `BlockTransform`); this bit is the self-describing presence
-    /// signal and a cross-check.
+    /// `BlockTransform`); this bit is a presence-only self-describing
+    /// signal, not validated against the transform on the read path.
     pub const ENCRYPTED: u8 = 1 << 3;
 }
 

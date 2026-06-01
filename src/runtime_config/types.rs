@@ -141,8 +141,8 @@ impl ChecksumAlgorithm {
 /// is compiled, additionally requires
 /// [`KvChecksumComputePoint::AtInsert`] (not yet implemented — see its
 /// docs); the digests in this implementation are computed when the
-/// block is compiled. Default [`Self::Off`] is wire-identical to the
-/// pre-per-KV format: no footer, the flag bit clear, zero overhead.
+/// block is compiled. Default [`Self::Off`] emits no per-KV footer (the
+/// `KV_CHECKSUM_FOOTER` bit clear), zero per-KV overhead.
 ///
 /// Selection granularity:
 /// - [`Self::Off`] / [`Self::AllLevels`] are unconditional.
@@ -161,8 +161,8 @@ impl ChecksumAlgorithm {
 // no-std: pure data — compiles under `--no-default-features --features alloc`.
 #[derive(Copy, Clone, Debug, Default, Eq, PartialEq, Hash)]
 pub enum KvChecksumPolicy {
-    /// No per-KV checksums. Blocks are wire-identical to the
-    /// pre-per-KV [`crate::table::block::BlockType::Data`] format.
+    /// No per-KV checksums. Blocks carry no per-KV footer
+    /// (the `KV_CHECKSUM_FOOTER` header bit clear).
     /// Default — zero compute, zero storage, zero memtable overhead.
     #[default]
     Off,
@@ -353,8 +353,8 @@ pub struct RuntimeConfig {
 
     /// Which data blocks emit a per-entry checksum footer (recorded via
     /// the `KV_CHECKSUM_FOOTER` header flag). Default
-    /// [`KvChecksumPolicy::Off`] keeps blocks wire-identical to the
-    /// pre-per-KV format (no footer, flag clear).
+    /// [`KvChecksumPolicy::Off`] keeps blocks free of the per-KV footer
+    /// (the `KV_CHECKSUM_FOOTER` bit clear).
     ///
     /// Toggle takes effect on the next block compile; existing blocks
     /// keep their original footer flag and read transparently.
@@ -516,9 +516,9 @@ mod tests {
 
     #[test]
     fn kv_checksum_policy_default_is_off() {
-        // Off is the wire-identical, zero-overhead default: a tree that
-        // never opts in must produce BlockType::Data blocks and pay no
-        // per-entry cost. A regression flipping this default would
+        // Off is the zero-overhead default: a tree that never opts in
+        // produces plain data blocks (KV_CHECKSUM_FOOTER bit clear) and
+        // pays no per-entry cost. A regression flipping this default would
         // silently change the on-disk format for every existing user.
         assert_eq!(KvChecksumPolicy::default(), KvChecksumPolicy::Off);
     }
