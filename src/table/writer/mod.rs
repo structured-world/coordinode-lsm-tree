@@ -825,6 +825,10 @@ impl Writer {
             data_block_restart_interval: self.data_block_restart_interval,
             index_block_restart_interval: self.index_block_restart_interval,
             initial_level: self.initial_level,
+            // Always 0 for now: the writer is not yet wired to the runtime
+            // `seqno_in_index` config, so every SST uses the legacy index
+            // format (byte-identical to the pre-#224 layout).
+            index_format: 0,
             range_tombstone_count,
             // `block_offset` here feeds `BlockIdentity` which today is
             // unused (`let _ = identity;` in `Block::write_into` /
@@ -1035,6 +1039,10 @@ struct MetaSectionParams<'a> {
     data_block_restart_interval: u8,
     index_block_restart_interval: u8,
     initial_level: u8,
+    /// Index block format byte written to the SST Properties (#224).
+    /// `0` = legacy (no per-block seqno bounds). Currently always `0`
+    /// until the writer is wired to the runtime `seqno_in_index` config.
+    index_format: u8,
     range_tombstone_count: u64,
     block_offset: u64,
     /// `created_at` snapshot taken once in `finish()`. Both MID and
@@ -1108,6 +1116,12 @@ fn write_meta_section<W: std::io::Write + std::io::Seek>(
         meta("descriptor#page_ecc", &[u8::from(effective_page_ecc)]),
         meta("file_size", &p.file_size.to_le_bytes()),
         meta("filter_hash_type", &[u8::from(ChecksumType::Xxh3)]),
+        // Index block format (#224): 0 = legacy (no per-block seqno
+        // bounds in index entries). The seqno-bounded format (1) is
+        // emitted once the writer is wired to the runtime
+        // `seqno_in_index` config; until then every SST is index_format=0,
+        // byte-identical to the pre-#224 layout.
+        meta("index_format", &[p.index_format]),
         meta("index_keys_have_seqno", &[0x1]),
         meta("initial_level", &p.initial_level.to_le_bytes()),
         meta("item_count", &p.item_count.to_le_bytes()),

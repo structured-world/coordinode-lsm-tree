@@ -81,6 +81,17 @@ pub struct ParsedMeta {
     /// types (`Meta` / `Manifest` / `ManifestFooter`) keep the byte and still
     /// carry a per-block `ECC_PARITY` flag.
     pub page_ecc: bool,
+
+    /// Index block format for this SST (#224). `0` = legacy: index
+    /// entries carry no per-block seqno bounds (byte-identical to the
+    /// pre-#224 format). `1` = each index entry includes
+    /// `seqno_min` / `seqno_max` for its data block, enabling
+    /// `scan_since_seqno` block-skip.
+    ///
+    /// Optional on disk: SSTs written before this field existed lack the
+    /// `index_format` property and parse as `0`, so legacy tables read
+    /// correctly and fall back to the per-entry filter scan path.
+    pub index_format: u8,
 }
 
 macro_rules! read_u8 {
@@ -322,6 +333,17 @@ impl ParsedMeta {
 
         let page_ecc = read_u8!(block, b"descriptor#page_ecc", &cmp) != 0;
 
+        // Optional field introduced for scan_since_seqno block-skip (#224).
+        // SSTs written before this key existed parse as 0 (legacy index
+        // format, no per-block seqno bounds). A present-but-truncated value
+        // propagates the I/O error to surface metadata corruption.
+        let index_format = block
+            .point_read(b"index_format", SeqNo::MAX, &cmp)?
+            .map_or(Ok(0u8), |item| {
+                let mut bytes = &item.value[..];
+                bytes.read_u8()
+            })?;
+
         Ok(Self {
             id,
             created_at,
@@ -339,6 +361,7 @@ impl ParsedMeta {
             index_block_compression,
             kv_checksum_algo,
             page_ecc,
+            index_format,
         })
     }
 }
@@ -474,6 +497,28 @@ mod tests {
         let items = valid_meta_items();
         let result = load_meta_from_items(&items);
         assert!(result.is_ok(), "valid meta must parse: {result:?}");
+    }
+
+    #[test]
+    fn index_format_absent_parses_as_legacy_zero() {
+        // valid_meta_items() carries no `index_format` key (legacy SST).
+        // It must parse as index_format = 0 so pre-#224 tables fall back
+        // to the per-entry scan path.
+        let meta = load_meta_from_items(&valid_meta_items()).unwrap();
+        assert_eq!(meta.index_format, 0);
+    }
+
+    #[test]
+    fn index_format_present_parses_its_value() {
+        // An SST carrying `index_format = 1` must parse as 1 so the read
+        // path knows the index entries hold per-block seqno bounds.
+        let mut items = valid_meta_items();
+        // Insert in sorted position (between filter_hash_type and
+        // index_keys_have_seqno) to keep the block ordered.
+        items.push(meta("index_format", &[1u8]));
+        items.sort_by(|a, b| a.key.user_key.cmp(&b.key.user_key));
+        let meta = load_meta_from_items(&items).unwrap();
+        assert_eq!(meta.index_format, 1);
     }
 
     /// Missing `table_version` must return `Err(InvalidHeader)`, not panic.
