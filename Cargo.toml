@@ -81,6 +81,11 @@ encryption = ["dep:aes-gcm", "dep:chacha20poly1305", "dep:rand_chacha", "std"]
 # `reed-solomon-simd` dep only when set.
 page_ecc = ["dep:reed-solomon-simd", "std"]
 bytes_1 = ["dep:bytes"]
+# Optional CRC32C (Castagnoli) checksum algorithm for block-level and
+# per-KV checksums. Without this feature the `Xxh3_64` (default) and
+# `Xxh3Low32` algorithms still work; selecting `ChecksumAlgorithm::Crc32c`
+# at runtime returns "not compiled in" so callers can fall back or error.
+crc32c = ["dep:crc32c"]
 metrics = []
 # Vendored Ribbon filter retains its `#[cfg(feature = "ribbon-serde")]`
 # guards (renamed from upstream's bare `serde` feature to avoid clashing
@@ -148,6 +153,12 @@ serde = { version = "1", optional = true, features = ["derive"] }
 tempfile = { version = "3.20.0", optional = true }
 varint-rs = { version = "2.2.0", default-features = false }
 xxhash-rust = { version = "0.8.15", features = ["xxh3"] }
+# CRC32C (Castagnoli) for the optional `Crc32c` checksum algorithm.
+# Hardware-accelerated (SSE4.2 `_mm_crc32` on x86, CRC32 instructions on
+# ARM) with a safe scalar fallback; runtime-detected by the crate. Only
+# pulled in behind the `crc32c` feature — the default `Xxh3_64` algorithm
+# needs only `xxhash-rust`.
+crc32c = { version = "0.6", optional = true }
 # Exact pin on a prerelease — RC API can churn between releases, so locking
 # the exact version is intentional. The 0.11 surface we depend on:
 #   - aes_gcm::aead::{AeadInOut, Generate, Nonce, Tag}

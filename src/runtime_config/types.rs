@@ -75,6 +75,31 @@ impl ChecksumAlgorithm {
         }
     }
 
+    /// Compute the digest of `bytes` under this algorithm, returned as a
+    /// `u64` (the low [`Self::digest_size`] bytes are the meaningful
+    /// digest; wider algorithms fill more of the word).
+    ///
+    /// Returns `None` when the selected algorithm is not compiled into
+    /// this build: [`Self::Crc32c`] needs the `crc32c` cargo feature.
+    /// The default [`Self::Xxh3_64`] and [`Self::Xxh3Low32`] are always
+    /// available. Callers on a fallible path translate `None` into
+    /// [`crate::Error::FeatureUnsupported`]; the `Option` return keeps
+    /// this method `core`-clean (no dependency on the std-bound crate
+    /// error type) so no-std verify paths can call it.
+    #[must_use]
+    pub fn compute(self, bytes: &[u8]) -> Option<u64> {
+        match self {
+            Self::Xxh3_64 => Some(crate::hash::hash64(bytes)),
+            // Low 32 bits of the same XXH3-64 digest: identical compute,
+            // half the stored width (see `digest_size`).
+            Self::Xxh3Low32 => Some(crate::hash::hash64(bytes) & 0xFFFF_FFFF),
+            #[cfg(feature = "crc32c")]
+            Self::Crc32c => Some(u64::from(crc32c::crc32c(bytes))),
+            #[cfg(not(feature = "crc32c"))]
+            Self::Crc32c => None,
+        }
+    }
+
     /// On-disk discriminator byte. Stable across format versions —
     /// new variants take fresh values; existing variants never
     /// change. Downstream `BlockHeader` extension (per #297 / #298
@@ -433,6 +458,7 @@ impl RuntimeConfig {
 }
 
 #[cfg(test)]
+#[expect(clippy::expect_used, reason = "test code")]
 mod tests {
     use super::*;
 
@@ -533,6 +559,57 @@ mod tests {
         // Locked here so a regression switching the default to
         // something slower (e.g. CRC32C) lights up the test.
         assert_eq!(ChecksumAlgorithm::default(), ChecksumAlgorithm::Xxh3_64);
+    }
+
+    #[test]
+    fn checksum_algorithm_compute_xxh3_64_matches_canonical_hash() {
+        // Xxh3_64 must produce exactly the crate's canonical hash64 so a
+        // per-KV digest is byte-identical to every other XXH3 site (the
+        // reader recomputes with hash64 on verify).
+        let data = b"per-kv checksum payload bytes";
+        assert_eq!(
+            ChecksumAlgorithm::Xxh3_64.compute(data),
+            Some(crate::hash::hash64(data))
+        );
+    }
+
+    #[test]
+    fn checksum_algorithm_compute_xxh3low32_is_low_32_bits() {
+        // Xxh3Low32 is the low 32 bits of the same digest: same compute,
+        // half the stored width. The high bits must be zero so the
+        // stored 4 bytes round-trip without truncation surprises.
+        let data = b"per-kv checksum payload bytes";
+        let full = crate::hash::hash64(data);
+        let got = ChecksumAlgorithm::Xxh3Low32
+            .compute(data)
+            .expect("Xxh3Low32 is always available");
+        assert_eq!(got, full & 0xFFFF_FFFF);
+        assert_eq!(got >> 32, 0, "high 32 bits must be clear");
+    }
+
+    #[test]
+    #[cfg(feature = "crc32c")]
+    fn checksum_algorithm_compute_crc32c_when_feature_on() {
+        // With the crc32c feature, Crc32c computes a non-trivial digest
+        // that fits in 32 bits and is order-sensitive (a real checksum,
+        // not a stub returning a constant).
+        let a = ChecksumAlgorithm::Crc32c
+            .compute(b"abc")
+            .expect("crc32c feature enabled");
+        let b = ChecksumAlgorithm::Crc32c
+            .compute(b"acb")
+            .expect("crc32c feature enabled");
+        assert_eq!(a >> 32, 0, "CRC32C digest fits in 32 bits");
+        assert_ne!(a, b, "CRC32C must be order-sensitive");
+    }
+
+    #[test]
+    #[cfg(not(feature = "crc32c"))]
+    fn checksum_algorithm_compute_crc32c_none_when_feature_off() {
+        // Without the feature, selecting Crc32c must surface as None so a
+        // caller translates it into a typed "not compiled in" error
+        // rather than silently substituting another algorithm.
+        assert_eq!(ChecksumAlgorithm::Crc32c.compute(b"abc"), None);
     }
 
     #[test]
