@@ -284,12 +284,39 @@ impl Table {
     ///   the stored digest).
     /// - Any I/O / decode error encountered while loading a block.
     pub(crate) fn verify_kv_checksums(&self) -> crate::Result<()> {
+        use crate::table::block::header::block_flags::KV_CHECKSUM_FOOTER;
+
         // Homogeneous SST: the per-SST descriptor records whether ANY data
-        // block carries a per-KV footer. When it says none do, there is
-        // nothing to verify — skip the whole block scan instead of loading
-        // every data block only to find the footer flag clear.
+        // block carries a per-KV footer. When it says none do, the scan can
+        // be skipped — but the scrub is the paranoid integrity path, so it
+        // does not skip on the strength of a single descriptor byte alone.
+        // That byte rides the meta block checksum, yet could have flipped in
+        // RAM before that checksum was taken. Confirm the first data block's
+        // footer flag agrees (all-or-none, so block 0 is representative)
+        // before trusting "no footers". If it disagrees, fall through to the
+        // full scan rather than skip.
         if self.metadata.kv_checksum_algo.is_none() {
-            return Ok(());
+            let mut iter = self.block_index.iter();
+            match iter.next() {
+                // Empty table: nothing to scrub.
+                None => return Ok(()),
+                Some(handle) => {
+                    let handle = handle?;
+                    let block = self.load_block(
+                        &BlockHandle::new(handle.offset(), handle.size()),
+                        BlockType::Data,
+                        self.metadata.data_block_compression,
+                        #[cfg(zstd_any)]
+                        self.zstd_dictionary.as_deref(),
+                    )?;
+                    if block.header.block_flags & KV_CHECKSUM_FOOTER == 0 {
+                        // Descriptor confirmed by the first block: no footers.
+                        return Ok(());
+                    }
+                    // Descriptor claimed "none" but a footer is present —
+                    // do not trust it; fall through to verify every block.
+                }
+            }
         }
 
         for handle in self.block_index.iter() {
@@ -304,10 +331,7 @@ impl Table {
                 #[cfg(zstd_any)]
                 self.zstd_dictionary.as_deref(),
             )?;
-            if block.header.block_flags
-                & crate::table::block::header::block_flags::KV_CHECKSUM_FOOTER
-                != 0
-            {
+            if block.header.block_flags & KV_CHECKSUM_FOOTER != 0 {
                 DataBlock::verify_kv_checked(&block.data, block.header, self.comparator.clone())?;
             }
         }

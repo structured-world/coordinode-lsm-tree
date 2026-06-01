@@ -8,6 +8,9 @@
 //! state (load-old-then-act-old guarantee that compaction-as-migration
 //! relies on).
 
+// `AbstractTree` is used for its trait methods (`insert`,
+// `flush_active_memtable`, `get_internal_entry`) called on the tree below;
+// it must stay in scope even though no path names the trait directly.
 use lsm_tree::{
     AbstractTree, AnyTree, Config, SeqNo, SequenceNumberCounter, get_tmp_folder,
     runtime_config::{ChecksumAlgorithm, KvChecksumPolicy, RuntimeConfig},
