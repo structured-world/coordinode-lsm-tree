@@ -333,7 +333,12 @@ impl Table {
                 self.zstd_dictionary.as_deref(),
             )?;
             if block.header.block_flags & KV_CHECKSUM_FOOTER != 0 {
-                DataBlock::verify_kv_checked(&block.data, block.header, self.comparator.clone())?;
+                DataBlock::verify_kv_checked(
+                    &block.data,
+                    block.header,
+                    self.comparator.clone(),
+                    self.metadata.kv_checksum_algo,
+                )?;
             } else if self.metadata.kv_checksum_algo.is_some() {
                 // The descriptor declares this SST footer-bearing, and an SST
                 // is homogeneous, so every data block must carry the footer.

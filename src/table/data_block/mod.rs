@@ -762,10 +762,18 @@ impl DataBlock {
     /// inner standard data block, and for each entry in scan order recomputes
     /// the logical-content digest and compares it to the stored value.
     ///
+    /// When `expected_algo` is `Some`, the footer's own algorithm tag must
+    /// match it (the per-SST `descriptor#kv_checksum` algorithm): a divergence
+    /// means a writer bug or corruption flipped the tag, which would otherwise
+    /// let the scrub verify digests under the wrong algorithm and silently
+    /// return `Ok`. `None` skips the cross-check (the footer's self-described
+    /// algorithm is then authoritative).
+    ///
     /// # Errors
     ///
-    /// - [`crate::Error::InvalidTrailer`] if the footer is malformed or its
-    ///   entry count disagrees with the decoded block.
+    /// - [`crate::Error::InvalidTrailer`] if the footer is malformed, its
+    ///   entry count disagrees with the decoded block, or its algorithm tag
+    ///   diverges from `expected_algo`.
     /// - [`crate::Error::FeatureUnsupported`] if the footer's algorithm is not
     ///   compiled into this build.
     /// - [`crate::Error::ChecksumMismatch`] on the first entry whose recomputed
@@ -775,10 +783,14 @@ impl DataBlock {
         footer_wrapped: &[u8],
         header: super::block::Header,
         comparator: crate::comparator::SharedComparator,
+        expected_algo: Option<crate::runtime_config::ChecksumAlgorithm>,
     ) -> crate::Result<()> {
         use super::block::{BlockType, ParsedItem, kv_checksum};
 
         let split = kv_checksum::split_full(footer_wrapped)?;
+
+        // TEMP: cross-check neutralized to prove the regression test fails.
+        let _ = expected_algo;
 
         // Decode the inner slice through the standard data-block path. Reuse
         // the real header (Copy) but present the inner slice as a consistent
@@ -1282,6 +1294,53 @@ mod tests {
         assert!(
             matches!(result, Err(crate::Error::InvalidTrailer)),
             "digest/item count mismatch must fail the write, got {result:?}",
+        );
+    }
+
+    #[test]
+    fn verify_kv_checked_rejects_footer_algo_diverging_from_descriptor() {
+        use crate::runtime_config::ChecksumAlgorithm;
+        use crate::table::block::header::block_flags::KV_CHECKSUM_FOOTER;
+        use crate::table::block::kv_checksum::kv_digest;
+
+        // A footer-bearing block written under Xxh3_64.
+        let items = [InternalValue::from_components(
+            b"a".to_vec(),
+            b"v".to_vec(),
+            0,
+            Value,
+        )];
+        let algo = ChecksumAlgorithm::Xxh3_64;
+        let digests: Vec<u64> = items
+            .iter()
+            .map(|it| kv_digest(it, algo).expect("xxh3 always available"))
+            .collect();
+        let mut bytes = Vec::new();
+        DataBlock::encode_kv_checked_into(&mut bytes, &items, &digests, algo, 2, 0.0)
+            .expect("encode kv-checked block");
+        let header = Header {
+            block_flags: KV_CHECKSUM_FOOTER,
+            ..Header::test_dummy(BlockType::Data)
+        };
+
+        // Matching per-SST descriptor algorithm → verifies.
+        DataBlock::verify_kv_checked(&bytes, header, default_comparator(), Some(algo))
+            .expect("matching descriptor algorithm must verify");
+        // No descriptor cross-check → footer's own algorithm is authoritative.
+        DataBlock::verify_kv_checked(&bytes, header, default_comparator(), None)
+            .expect("None skips the cross-check and verifies");
+        // Descriptor algorithm diverges from the footer tag → reject, even
+        // though the digests are internally consistent with the footer's tag.
+        let err = DataBlock::verify_kv_checked(
+            &bytes,
+            header,
+            default_comparator(),
+            Some(ChecksumAlgorithm::Xxh3Low32),
+        )
+        .expect_err("descriptor/footer algorithm divergence must be rejected");
+        assert!(
+            matches!(err, crate::Error::InvalidTrailer),
+            "expected InvalidTrailer for algorithm divergence, got {err:?}",
         );
     }
 

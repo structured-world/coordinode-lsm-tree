@@ -1143,9 +1143,11 @@ mod block_verify_tests {
             "footer flag must survive the round-trip"
         );
 
-        // Only the per-KV verifier catches the bad digest.
-        let err = DataBlock::verify_kv_checked(&block.data, block.header, default_comparator())
-            .expect_err("corrupted stored digest must fail the per-KV verifier");
+        // Only the per-KV verifier catches the bad digest. `None` skips the
+        // algorithm cross-check — this test exercises the digest-mismatch path.
+        let err =
+            DataBlock::verify_kv_checked(&block.data, block.header, default_comparator(), None)
+                .expect_err("corrupted stored digest must fail the per-KV verifier");
         assert!(
             matches!(err, crate::Error::ChecksumMismatch { .. }),
             "expected ChecksumMismatch, got {err:?}"
