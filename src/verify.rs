@@ -282,7 +282,7 @@ pub enum BlockVerifyError {
         /// Path to the SST file.
         path: PathBuf,
         /// File offset where the (clean) header sits; the read for
-        /// its data segment started at `offset + Header::serialized_len()`.
+        /// its data segment started at `offset + Header::header_len(block_type)`.
         offset: u64,
         /// Length the (clean) header advertised for the data segment.
         data_length: u32,
@@ -432,7 +432,7 @@ impl BlockVerifyReport {
 /// 3. Inside each block region, decode each block's `Header` (which
 ///    validates the header's own XXH3), read the data segment, and
 ///    compare a fresh XXH3 over the data against `header.checksum`.
-///    Advance by `Header::serialized_len() + data_length` until the
+///    Advance by `Header::header_len(block_type) + data_length` until the
 ///    section end. A corrupt header inside a section stops that
 ///    section's walk and is reported; the next section is still walked.
 ///

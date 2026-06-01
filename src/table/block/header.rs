@@ -179,9 +179,9 @@ impl Header {
 
     /// Total bytes this block occupies on disk: header + payload +
     /// optional ECC parity trailer. Use this when computing block
-    /// handles instead of manually summing `serialized_len() +
-    /// data_length` — that older form silently underflows the
-    /// on-disk size when a parity trailer is present.
+    /// handles instead of manually summing `header_len(block_type) +
+    /// data_length` — that form silently underflows the on-disk size
+    /// when a parity trailer is present.
     ///
     /// The parity-trailer length is derived from `data_length` (the
     /// Reed-Solomon scheme is deterministic) and the `ECC_PARITY`
@@ -189,10 +189,10 @@ impl Header {
     /// carries `expected_parity_len(data_length)` parity bytes.
     #[must_use]
     pub fn on_disk_size(&self) -> u32 {
-        // serialized_len is a small constant (34 bytes: 4 magic + 1
-        // block_type + 1 block_flags + 16 checksum + 4 data_length +
-        // 4 uncompressed + 4 header checksum); cast to u32 is safe by
-        // construction. `data_length` is bounded by the writer's
+        // header_len is a small constant (33 or 34 bytes: 4 magic + 1
+        // block_type + [1 block_flags for meta/manifest] + 16 checksum +
+        // 4 data_length + 4 uncompressed + 4 header checksum); cast to u32
+        // is safe by construction. `data_length` is bounded by the writer's
         // `MAX_DECOMPRESSION_SIZE` cap and the parity length is bounded
         // by `expected_parity_len(data_length)`, so the sum stays well
         // within u32.
