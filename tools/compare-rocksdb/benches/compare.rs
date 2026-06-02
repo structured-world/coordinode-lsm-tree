@@ -39,6 +39,22 @@
 //! engine-agnostic. Adding a third engine (Pebble, LevelDB,
 //! sled, …) is "add a variant + match arm" — no workload rewrite.
 //!
+//! ## Compression axis + cross-engine overlay
+//!
+//! Every scenario is run twice: once with `None` block compression
+//! (the `<scenario>` group) and once with zstd at level 22, the maximum
+//! "ultra" level (the `<scenario>_zstd22` group). Both engines are
+//! configured identically per variant — ours via
+//! `CompressionType::Zstd(22)`, RocksDB via `DBCompressionType::Zstd`
+//! pinned to level 22 — so the no-compression and high-ratio paths sit
+//! side-by-side on the dashboard.
+//!
+//! Within each group both engines run in the SAME process and the SAME
+//! invocation, so criterion plots them as an overlay (ours vs rocksdb)
+//! on one chart. Because the comparison is a ratio measured on one host
+//! in one run, it stays meaningful even if the bench host's CPU changes
+//! between runs — the absolute numbers move, the relative gap does not.
+//!
 //! ## Workload coverage
 //!
 //! - `write_throughput/{1k,10k}` — bulk insert N keys, 256-byte
@@ -50,14 +66,28 @@
 //!   is opened + populated + flushed ONCE outside the timed window,
 //!   so the measurement is steady-state read latency (block cache +
 //!   bloom filter + on-disk block fetch), not setup cost.
+//! - `range_scan/{1k,10k}` — full forward scan reading every value
+//!   from a warm, pre-populated engine. Steady-state sequential-scan
+//!   throughput (block decode + iterator advance).
+//! - `seek_random/{1k,10k}` — seek to each (scattered) key and read
+//!   the value at the cursor, on a warm engine. Seek-then-read latency
+//!   (index descent + cursor positioning + block decode).
+//! - `overwrite/{1k,10k}` — rewrite the whole keyspace into an engine
+//!   that already holds one copy (the first copy is written outside the
+//!   timed window). Overwrite cost (memtable churn over existing keys +
+//!   a superseding flush), distinct from cold first-insert.
 //!
-//! Follow-up commits expand to range scans, mixed YCSB-A/C, and
-//! bloom-filter negative probes per [#244]'s workload list.
+//! Each of the above also has a `_zstd22` sibling. Not yet portable
+//! head-to-head: `readwhilewriting` (concurrency) and `mergerandom`
+//! (merge-operator semantics differ across engines) from [#244]'s list.
 
 use std::time::Duration;
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use lsm_tree::{AbstractTree, Config, MAX_SEQNO, SequenceNumberCounter};
+use lsm_tree::{
+    AbstractTree, CompressionType, Config, Guard, MAX_SEQNO, SequenceNumberCounter,
+    config::CompressionPolicy,
+};
 
 /// Engine under test. The harness runs each workload once per
 /// variant and emits per-engine timings under the same criterion
@@ -76,6 +106,25 @@ impl Engine {
             Self::RocksDb => "rocksdb",
         }
     }
+}
+
+/// Compression axis of the engine matrix. Each workload runs once per
+/// variant so the dashboard plots the `None` baseline and the
+/// high-ratio zstd path side-by-side, with both engines configured the
+/// same way per variant (apples-to-apples).
+#[derive(Debug, Clone, Copy)]
+enum Compression {
+    /// No block compression — the `None`-policy baseline.
+    None,
+    /// Zstd at level 22 (the maximum / "ultra" level) on both engines.
+    Zstd22,
+}
+
+impl Compression {
+    /// Zstd maximum level. `CompressionType::Zstd` upholds a `1..=22`
+    /// invariant, so 22 is the highest valid setting; RocksDB's zstd
+    /// accepts the same level range.
+    const ZSTD_MAX_LEVEL: i32 = 22;
 }
 
 /// Deterministic but pseudo-random key derivation. Each key is the
@@ -142,7 +191,12 @@ impl WorkloadInputs {
 /// `create_if_missing` is set here too. WAL handling is per-call
 /// (`WriteOptions::disable_wal`) since it only applies to the write
 /// path.
-fn rocksdb_options() -> rocksdb::Options {
+///
+/// The `compression` argument selects the codec to match our engine's
+/// per-variant setting: `None` leaves RocksDB uncompressed; `Zstd22`
+/// sets `DBCompressionType::Zstd` and pins the level to 22 via
+/// `set_compression_options`.
+fn rocksdb_options(compression: Compression) -> rocksdb::Options {
     let mut block_opts = rocksdb::BlockBasedOptions::default();
     let cache = rocksdb::Cache::new_lru_cache(16 * 1024 * 1024);
     block_opts.set_block_cache(&cache);
@@ -151,9 +205,41 @@ fn rocksdb_options() -> rocksdb::Options {
     block_opts.set_bloom_filter(10.0, false);
     let mut opts = rocksdb::Options::default();
     opts.create_if_missing(true);
-    opts.set_compression_type(rocksdb::DBCompressionType::None);
+    match compression {
+        Compression::None => opts.set_compression_type(rocksdb::DBCompressionType::None),
+        Compression::Zstd22 => {
+            opts.set_compression_type(rocksdb::DBCompressionType::Zstd);
+            // (window_bits, level, strategy, max_dict_bytes). -14 is RocksDB's
+            // default zstd window-bits sentinel, strategy 0 / max_dict 0 keep
+            // every other zstd parameter at its default — only the level is
+            // pinned to 22 to match our `CompressionType::Zstd(22)`.
+            opts.set_compression_options(-14, Compression::ZSTD_MAX_LEVEL, 0, 0);
+        }
+    }
     opts.set_block_based_table_factory(&block_opts);
     opts
+}
+
+/// Opens our engine at `dir` with the block-compression policy for the
+/// given `compression` variant. `None` keeps the engine default (the
+/// `None` policy on this build, since only the `zstd` feature is
+/// enabled — not `lz4`); `Zstd22` applies level-22 zstd to every level.
+fn open_ours(
+    dir: &std::path::Path,
+    compression: Compression,
+) -> Result<lsm_tree::AnyTree, Box<dyn std::error::Error>> {
+    let config = Config::new(
+        dir,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    );
+    let config = match compression {
+        Compression::None => config,
+        Compression::Zstd22 => config.data_block_compression_policy(CompressionPolicy::all(
+            CompressionType::Zstd(Compression::ZSTD_MAX_LEVEL),
+        )),
+    };
+    Ok(config.open()?)
 }
 
 /// Workload: bulk-insert `inputs.keys.len()` (key, value) pairs
@@ -194,18 +280,14 @@ fn rocksdb_options() -> rocksdb::Options {
 /// does NO per-key allocation.
 fn run_write_throughput(
     engine: Engine,
+    compression: Compression,
     inputs: &WorkloadInputs,
 ) -> Result<Duration, Box<dyn std::error::Error>> {
     let dir = tempfile::tempdir()?;
     let start = std::time::Instant::now();
     let elapsed = match engine {
         Engine::Ours => {
-            let tree = Config::new(
-                dir.path(),
-                SequenceNumberCounter::default(),
-                SequenceNumberCounter::default(),
-            )
-            .open()?;
+            let tree = open_ours(dir.path(), compression)?;
             // Zip the seqno counter as a native `u64` instead of
             // enumerate()+try_from(usize). lsm-tree's `insert` takes
             // SeqNo (= u64) directly; using `0u64..` avoids the
@@ -227,7 +309,7 @@ fn run_write_throughput(
             // our engine's defaults — see `rocksdb_options`. Our engine
             // builds a bloom filter at flush, so giving RocksDB the same
             // keeps the write comparison apples-to-apples.
-            let opts = rocksdb_options();
+            let opts = rocksdb_options(compression);
             // Match our engine's durability shape: lsm-tree has no
             // WAL — durability is the caller's responsibility, and
             // `flush_active_memtable` is the equivalent of an
@@ -253,7 +335,15 @@ fn run_write_throughput(
 }
 
 fn bench_write_throughput(c: &mut Criterion) {
-    let mut group = c.benchmark_group("write_throughput");
+    // `None` baseline + `Zstd22` high-ratio variant, each in its own
+    // criterion group so the existing baseline charts stay intact and
+    // the zstd path lands as a sibling group on the dashboard.
+    write_throughput_variant(c, "write_throughput", Compression::None);
+    write_throughput_variant(c, "write_throughput_zstd22", Compression::Zstd22);
+}
+
+fn write_throughput_variant(c: &mut Criterion, group_name: &str, compression: Compression) {
+    let mut group = c.benchmark_group(group_name);
     for &n in &[1_000_u64, 10_000_u64] {
         // Precompute the keys + values ONCE per `n` (outside the
         // criterion warmup / measurement loop), so the timed body
@@ -275,9 +365,9 @@ fn bench_write_throughput(c: &mut Criterion) {
                         // no meaningful Duration to report — so
                         // surface it as a bench panic with the
                         // engine label for diagnosis.
-                        total += run_write_throughput(engine, &inputs).unwrap_or_else(|e| {
-                            panic!("run_write_throughput failed for {}: {e}", engine.label())
-                        });
+                        total += run_write_throughput(engine, compression, &inputs).unwrap_or_else(
+                            |e| panic!("run_write_throughput failed for {}: {e}", engine.label()),
+                        );
                     }
                     total
                 });
@@ -328,7 +418,14 @@ fn bench_write_throughput(c: &mut Criterion) {
 /// a broken setup fails loudly) and the timed loop itself stays a
 /// bare `get` + `black_box` with no per-read branch.
 fn bench_point_read(c: &mut Criterion) {
-    let mut group = c.benchmark_group("point_read");
+    // `None` baseline + `Zstd22` high-ratio variant in sibling groups,
+    // mirroring `bench_write_throughput`.
+    point_read_variant(c, "point_read", Compression::None);
+    point_read_variant(c, "point_read_zstd22", Compression::Zstd22);
+}
+
+fn point_read_variant(c: &mut Criterion, group_name: &str, compression: Compression) {
+    let mut group = c.benchmark_group(group_name);
     for &n in &[1_000_u64, 10_000_u64] {
         let inputs = WorkloadInputs::build(n);
         group.throughput(Throughput::Elements(n));
@@ -341,13 +438,7 @@ fn bench_point_read(c: &mut Criterion) {
                 let dir = tempfile::tempdir().expect("tempdir");
                 match engine {
                     Engine::Ours => {
-                        let tree = Config::new(
-                            dir.path(),
-                            SequenceNumberCounter::default(),
-                            SequenceNumberCounter::default(),
-                        )
-                        .open()
-                        .expect("ours: open");
+                        let tree = open_ours(dir.path(), compression).expect("ours: open");
                         for ((key, value), seqno) in
                             inputs.keys.iter().zip(inputs.values.iter()).zip(0u64..)
                         {
@@ -382,7 +473,7 @@ fn bench_point_read(c: &mut Criterion) {
                         // matching our engine's defaults so the per-`get`
                         // overhead is attributable, not a config artefact —
                         // see `rocksdb_options`.
-                        let opts = rocksdb_options();
+                        let opts = rocksdb_options(compression);
                         let db = rocksdb::DB::open(&opts, dir.path()).expect("rocksdb: open");
                         let mut write_opts = rocksdb::WriteOptions::default();
                         write_opts.disable_wal(true);
@@ -417,15 +508,237 @@ fn bench_point_read(c: &mut Criterion) {
     group.finish();
 }
 
+/// Opens a RocksDB instance at `dir` with the matched options, populates
+/// it with `inputs` (WAL disabled, matching the untimed populate phase of
+/// our warm read scenarios), and flushes. Used by the warm read groups
+/// (`range_scan`, `seek_random`) so their per-engine setup lives in one
+/// place rather than being copy-pasted per scenario.
+fn populate_rocksdb(
+    dir: &std::path::Path,
+    compression: Compression,
+    inputs: &WorkloadInputs,
+) -> rocksdb::DB {
+    let opts = rocksdb_options(compression);
+    let db = rocksdb::DB::open(&opts, dir).expect("rocksdb: open");
+    let mut write_opts = rocksdb::WriteOptions::default();
+    write_opts.disable_wal(true);
+    for (key, value) in inputs.keys.iter().zip(inputs.values.iter()) {
+        db.put_opt(key, value, &write_opts).expect("rocksdb: put");
+    }
+    db.flush().expect("rocksdb: flush");
+    db
+}
+
+/// Populates our engine at `dir` and flushes, returning the warm handle.
+/// Companion to [`populate_rocksdb`] for the warm read groups.
+fn populate_ours(
+    dir: &std::path::Path,
+    compression: Compression,
+    inputs: &WorkloadInputs,
+) -> lsm_tree::AnyTree {
+    let tree = open_ours(dir, compression).expect("ours: open");
+    for ((key, value), seqno) in inputs.keys.iter().zip(inputs.values.iter()).zip(0u64..) {
+        tree.insert(key, value, seqno);
+    }
+    tree.flush_active_memtable(0).expect("ours: flush");
+    tree
+}
+
+fn bench_range_scan(c: &mut Criterion) {
+    range_scan_variant(c, "range_scan", Compression::None);
+    range_scan_variant(c, "range_scan_zstd22", Compression::Zstd22);
+}
+
+/// Workload: full forward scan reading every value. The engine is
+/// populated + flushed ONCE outside the timed window (warm, like
+/// [`point_read_variant`]); the timed body iterates the whole keyspace
+/// front-to-back and touches each value, so the number reflects
+/// steady-state sequential-scan throughput (block decode + iterator
+/// advance), not setup cost.
+fn range_scan_variant(c: &mut Criterion, group_name: &str, compression: Compression) {
+    let mut group = c.benchmark_group(group_name);
+    for &n in &[1_000_u64, 10_000_u64] {
+        let inputs = WorkloadInputs::build(n);
+        group.throughput(Throughput::Elements(n));
+        for engine in [Engine::Ours, Engine::RocksDb] {
+            group.bench_with_input(BenchmarkId::new(engine.label(), n), &n, |b, _| {
+                let dir = tempfile::tempdir().expect("tempdir");
+                match engine {
+                    Engine::Ours => {
+                        let tree = populate_ours(dir.path(), compression, &inputs);
+                        b.iter_custom(|iters| {
+                            let start = std::time::Instant::now();
+                            for _ in 0..iters {
+                                for guard in tree.iter(MAX_SEQNO, None) {
+                                    let v = guard.value().expect("ours: scan value");
+                                    std::hint::black_box(v);
+                                }
+                            }
+                            start.elapsed()
+                        });
+                    }
+                    Engine::RocksDb => {
+                        let db = populate_rocksdb(dir.path(), compression, &inputs);
+                        b.iter_custom(|iters| {
+                            let start = std::time::Instant::now();
+                            for _ in 0..iters {
+                                for kv in db.iterator(rocksdb::IteratorMode::Start) {
+                                    let (_k, v) = kv.expect("rocksdb: scan");
+                                    std::hint::black_box(v);
+                                }
+                            }
+                            start.elapsed()
+                        });
+                    }
+                }
+            });
+        }
+    }
+    group.finish();
+}
+
+fn bench_seek_random(c: &mut Criterion) {
+    seek_random_variant(c, "seek_random", Compression::None);
+    seek_random_variant(c, "seek_random_zstd22", Compression::Zstd22);
+}
+
+/// Workload: seek to each key (in insertion order, i.e. scattered across
+/// the sorted keyspace) and read the single value the cursor lands on.
+/// Warm: the engine is populated + flushed ONCE outside the timed window.
+/// This measures seek-then-read latency (index descent + block decode +
+/// cursor positioning), the closest head-to-head analogue of a
+/// `seekrandom` workload.
+fn seek_random_variant(c: &mut Criterion, group_name: &str, compression: Compression) {
+    let mut group = c.benchmark_group(group_name);
+    for &n in &[1_000_u64, 10_000_u64] {
+        let inputs = WorkloadInputs::build(n);
+        group.throughput(Throughput::Elements(n));
+        for engine in [Engine::Ours, Engine::RocksDb] {
+            group.bench_with_input(BenchmarkId::new(engine.label(), n), &n, |b, _| {
+                let dir = tempfile::tempdir().expect("tempdir");
+                match engine {
+                    Engine::Ours => {
+                        let tree = populate_ours(dir.path(), compression, &inputs);
+                        b.iter_custom(|iters| {
+                            let start = std::time::Instant::now();
+                            for _ in 0..iters {
+                                for key in &inputs.keys {
+                                    let lo: &[u8] = key;
+                                    let got = tree
+                                        .range(lo.., MAX_SEQNO, None)
+                                        .next()
+                                        .map(|g| g.value().expect("ours: seek value"));
+                                    std::hint::black_box(got);
+                                }
+                            }
+                            start.elapsed()
+                        });
+                    }
+                    Engine::RocksDb => {
+                        let db = populate_rocksdb(dir.path(), compression, &inputs);
+                        b.iter_custom(|iters| {
+                            let start = std::time::Instant::now();
+                            for _ in 0..iters {
+                                for key in &inputs.keys {
+                                    let mut it = db.iterator(rocksdb::IteratorMode::From(
+                                        key,
+                                        rocksdb::Direction::Forward,
+                                    ));
+                                    let got = it.next().map(|kv| kv.expect("rocksdb: seek").1);
+                                    std::hint::black_box(got);
+                                }
+                            }
+                            start.elapsed()
+                        });
+                    }
+                }
+            });
+        }
+    }
+    group.finish();
+}
+
+fn bench_overwrite(c: &mut Criterion) {
+    overwrite_variant(c, "overwrite", Compression::None);
+    overwrite_variant(c, "overwrite_zstd22", Compression::Zstd22);
+}
+
+/// Workload: rewrite the entire keyspace into an engine that already
+/// holds one copy of it. The first populate + flush happens OUTSIDE the
+/// timed window; the timed body writes every key a second time and
+/// flushes, so the number reflects overwrite cost (memtable churn over
+/// existing keys + a flush that supersedes prior versions) rather than
+/// cold first-insert cost. A fresh engine is built per timed iteration
+/// so each measurement starts from the same one-copy state.
+fn overwrite_variant(c: &mut Criterion, group_name: &str, compression: Compression) {
+    let mut group = c.benchmark_group(group_name);
+    for &n in &[1_000_u64, 10_000_u64] {
+        let inputs = WorkloadInputs::build(n);
+        group.throughput(Throughput::Elements(n));
+        for engine in [Engine::Ours, Engine::RocksDb] {
+            group.bench_with_input(BenchmarkId::new(engine.label(), n), &n, |b, _| {
+                b.iter_custom(|iters| {
+                    let mut total = Duration::ZERO;
+                    for _ in 0..iters {
+                        let dir = tempfile::tempdir().expect("tempdir");
+                        match engine {
+                            Engine::Ours => {
+                                // First copy (untimed): populate + flush so the
+                                // timed pass overwrites existing keys.
+                                let tree = populate_ours(dir.path(), compression, &inputs);
+                                let start = std::time::Instant::now();
+                                // Second seqno range so the overwrite produces a
+                                // newer version of every key.
+                                for ((key, value), seqno) in
+                                    inputs.keys.iter().zip(inputs.values.iter()).zip(n..)
+                                {
+                                    tree.insert(key, value, seqno);
+                                }
+                                tree.flush_active_memtable(0)
+                                    .expect("ours: overwrite flush");
+                                total += start.elapsed();
+                            }
+                            Engine::RocksDb => {
+                                let db = populate_rocksdb(dir.path(), compression, &inputs);
+                                let mut write_opts = rocksdb::WriteOptions::default();
+                                write_opts.disable_wal(true);
+                                let start = std::time::Instant::now();
+                                for (key, value) in inputs.keys.iter().zip(inputs.values.iter()) {
+                                    db.put_opt(key, value, &write_opts)
+                                        .expect("rocksdb: overwrite put");
+                                }
+                                db.flush().expect("rocksdb: overwrite flush");
+                                total += start.elapsed();
+                            }
+                        }
+                    }
+                    total
+                });
+            });
+        }
+    }
+    group.finish();
+}
+
 // P50 / P99 / P999 percentile capture is deferred to a follow-up
 // commit. Criterion's default reporter gives mean + CI only,
 // which hides tail-latency regressions; structured-zstd's
 // `benches/bloom.rs` ports Vitter's Algorithm R reservoir +
 // per-iteration `iter_custom` to expose percentiles to stderr,
 // and that same pattern wires here once the workload surface is
-// fleshed out (point reads, range scans, YCSB-A/C). Foundation
-// commit prioritises wiring up the cross-engine path; the
-// percentile harness lands alongside the dashboard JSON merger.
+// fleshed out (YCSB-A/C, bloom negative probes). The cross-engine
+// overlay path (each scenario runs both engines in the same process
+// so the ratio stays host-independent) and the None/zstd22
+// compression axis are in place; readwhilewriting (concurrency) and
+// mergerandom (merge-operator semantics differ across engines) are
+// the remaining db_bench scenarios not yet portable head-to-head.
 
-criterion_group!(benches, bench_write_throughput, bench_point_read);
+criterion_group!(
+    benches,
+    bench_write_throughput,
+    bench_point_read,
+    bench_range_scan,
+    bench_seek_random,
+    bench_overwrite
+);
 criterion_main!(benches);
