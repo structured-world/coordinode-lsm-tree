@@ -82,6 +82,12 @@
 //! presence from the per-SST meta descriptors (`descriptor#page_ecc`,
 //! `descriptor#kv_checksum`). The block magic is bumped so a pre-V5 reader
 //! rejects V5 blocks immediately at header decode.
+//! A V5 SST written with every optional transform off (no Page ECC, no per-KV
+//! footers) is still NOT byte-identical to a pre-V5 table — the bumped block
+//! magic and the per-SST meta descriptor keys always differ. Any
+//! "byte-identical when off" guarantees in the feature docs are within-V5 and
+//! payload-level (e.g. index entries when `seqno_in_index = false`), not a
+//! cross-version equivalence.
 //! V3-V4 databases are not readable by this version and vice versa. The
 //! manifest version gate rejects pre-V5 databases at `Tree::open` time.
 //! V4 introduced range tombstones (still supported).
