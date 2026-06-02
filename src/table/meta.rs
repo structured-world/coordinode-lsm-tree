@@ -8,7 +8,6 @@ use crate::{
     CompressionType, KeyRange, SeqNo, TableId, checksum::ChecksumType, coding::Decode,
     comparator::default_comparator, runtime_config::ChecksumAlgorithm, table::block::BlockType,
 };
-use byteorder::{LittleEndian, ReadBytesExt};
 use std::ops::Deref;
 
 /// Nanosecond timestamp.
@@ -81,6 +80,17 @@ pub struct ParsedMeta {
     /// types (`Meta` / `Manifest` / `ManifestFooter`) keep the byte and still
     /// carry a per-block `ECC_PARITY` flag.
     pub page_ecc: bool,
+
+    /// Index block format for this SST (#224). `0` = legacy: index
+    /// entries carry no per-block seqno bounds (byte-identical to the
+    /// pre-#224 format). `1` = each index entry includes
+    /// `seqno_min` / `seqno_max` for its data block, enabling
+    /// `scan_since_seqno` block-skip.
+    ///
+    /// Optional on disk: SSTs written before this field existed lack the
+    /// `index_format` property and parse as `0`, so legacy tables read
+    /// correctly and fall back to the per-entry filter scan path.
+    pub index_format: u8,
 }
 
 macro_rules! read_u8 {
@@ -109,6 +119,19 @@ macro_rules! read_u64 {
         let bytes = <[u8; 8]>::try_from(&item.value[..])
             .map_err(|_| crate::Error::InvalidHeader("TableMeta"))?;
         u64::from_le_bytes(bytes)
+    }};
+}
+
+macro_rules! read_u128 {
+    ($block:expr, $name:expr, $cmp:expr) => {{
+        let item = $block
+            .point_read($name, SeqNo::MAX, $cmp)?
+            .ok_or(crate::Error::InvalidHeader("TableMeta"))?;
+        // Exactly sixteen little-endian bytes — same exact-width contract as
+        // read_u64!, so an overlong / short payload is rejected as corrupt meta.
+        let bytes = <[u8; 16]>::try_from(&item.value[..])
+            .map_err(|_| crate::Error::InvalidHeader("TableMeta"))?;
+        u128::from_le_bytes(bytes)
     }};
 }
 
@@ -230,14 +253,7 @@ impl ParsedMeta {
         let weak_tombstone_count = read_u64!(block, b"weak_tombstone_count", &cmp);
         let weak_tombstone_reclaimable = read_u64!(block, b"weak_tombstone_reclaimable", &cmp);
 
-        let created_at = {
-            let bytes = block
-                .point_read(b"created_at", SeqNo::MAX, &cmp)?
-                .ok_or(crate::Error::InvalidHeader("TableMeta"))?;
-
-            let mut bytes = &bytes.value[..];
-            bytes.read_u128::<LittleEndian>()?.into()
-        };
+        let created_at = read_u128!(block, b"created_at", &cmp).into();
 
         let key_range = KeyRange::new((
             block
@@ -251,24 +267,8 @@ impl ParsedMeta {
         ));
 
         let seqnos = {
-            let min = {
-                let bytes = block
-                    .point_read(b"seqno#min", SeqNo::MAX, &cmp)?
-                    .ok_or(crate::Error::InvalidHeader("TableMeta"))?
-                    .value;
-                let mut bytes = &bytes[..];
-                bytes.read_u64::<LittleEndian>()?
-            };
-
-            let max = {
-                let bytes = block
-                    .point_read(b"seqno#max", SeqNo::MAX, &cmp)?
-                    .ok_or(crate::Error::InvalidHeader("TableMeta"))?
-                    .value;
-                let mut bytes = &bytes[..];
-                bytes.read_u64::<LittleEndian>()?
-            };
-
+            let min = read_u64!(block, b"seqno#min", &cmp);
+            let max = read_u64!(block, b"seqno#max", &cmp);
             (min, max)
         };
 
@@ -281,8 +281,11 @@ impl ParsedMeta {
         // surface metadata corruption rather than silently falling back.
         let highest_kv_seqno =
             if let Some(item) = block.point_read(b"seqno#kv_max", SeqNo::MAX, &cmp)? {
-                let mut bytes = &item.value[..];
-                validated_kv_seqno(bytes.read_u64::<LittleEndian>()?, seqnos.1)?
+                // Present-but-wrong-width is corrupt meta — require exactly 8
+                // bytes rather than truncating an overlong payload.
+                let bytes = <[u8; 8]>::try_from(&item.value[..])
+                    .map_err(|_| crate::Error::InvalidHeader("TableMeta"))?;
+                validated_kv_seqno(u64::from_le_bytes(bytes), seqnos.1)?
             } else {
                 seqnos.1
             };
@@ -322,6 +325,28 @@ impl ParsedMeta {
 
         let page_ecc = read_u8!(block, b"descriptor#page_ecc", &cmp) != 0;
 
+        // Optional field introduced for scan_since_seqno block-skip (#224).
+        // SSTs written before this key existed parse as 0 (legacy index
+        // format, no per-block seqno bounds).
+        let index_format = match block.point_read(b"index_format", SeqNo::MAX, &cmp)? {
+            None => 0u8,
+            // The value must be EXACTLY one byte. Matching a single-element slice
+            // rejects trailing bytes, so a corrupt payload like `[1, 0xFF]` is an
+            // error rather than parsing as `1`. This byte is a metadata hint
+            // recording which index format the writer emitted; the per-entry
+            // decode itself dispatches on per-entry markers, not on this value.
+            Some(item) => match &item.value[..] {
+                [b] => *b,
+                _ => return Err(crate::Error::InvalidHeader("TableMeta")),
+            },
+        };
+        // Only `0` (legacy) and `1` (per-block seqno bounds) are defined in
+        // this format slice. Reject any other byte as corrupt / forward-
+        // incompatible metadata rather than trusting a bogus on-disk hint.
+        if index_format > 1 {
+            return Err(crate::Error::InvalidHeader("TableMeta"));
+        }
+
         Ok(Self {
             id,
             created_at,
@@ -339,6 +364,7 @@ impl ParsedMeta {
             index_block_compression,
             kv_checksum_algo,
             page_ecc,
+            index_format,
         })
     }
 }
@@ -476,6 +502,62 @@ mod tests {
         assert!(result.is_ok(), "valid meta must parse: {result:?}");
     }
 
+    #[test]
+    fn index_format_absent_parses_as_legacy_zero() {
+        // valid_meta_items() carries no `index_format` key (legacy SST).
+        // It must parse as index_format = 0 so pre-#224 tables fall back
+        // to the per-entry scan path.
+        let meta = load_meta_from_items(&valid_meta_items()).unwrap();
+        assert_eq!(meta.index_format, 0);
+    }
+
+    #[test]
+    fn index_format_present_parses_its_value() {
+        // An SST carrying `index_format = 1` must parse as 1 so the read
+        // path knows the index entries hold per-block seqno bounds.
+        let mut items = valid_meta_items();
+        // Insert in sorted position (between filter_hash_type and
+        // index_keys_have_seqno) to keep the block ordered.
+        items.push(meta("index_format", &[1u8]));
+        items.sort_by(|a, b| a.key.user_key.cmp(&b.key.user_key));
+        let meta = load_meta_from_items(&items).unwrap();
+        assert_eq!(meta.index_format, 1);
+    }
+
+    #[test]
+    fn index_format_unknown_byte_is_rejected() {
+        // Only 0 and 1 are defined in this format slice; a present-but-unknown
+        // byte (e.g. corrupt metadata, or a forward-incompatible writer) must
+        // fail fast as InvalidHeader rather than flowing downstream as a bogus
+        // on-disk index format.
+        for bad in [2u8, 255u8] {
+            let mut items = valid_meta_items();
+            items.push(meta("index_format", &[bad]));
+            items.sort_by(|a, b| a.key.user_key.cmp(&b.key.user_key));
+            let result = load_meta_from_items(&items);
+            assert!(
+                matches!(result, Err(crate::Error::InvalidHeader("TableMeta"))),
+                "index_format = {bad} must be rejected, got {result:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn index_format_overlong_payload_is_rejected() {
+        // The index_format value must be exactly one byte. A payload with
+        // trailing bytes (e.g. [1, 0xFF]) would otherwise parse as 1 because
+        // read_u8 ignores the remainder — since this byte selects the index
+        // decoder, an overlong payload is corrupt metadata and must be rejected.
+        let mut items = valid_meta_items();
+        items.push(meta("index_format", &[1u8, 0xFF]));
+        items.sort_by(|a, b| a.key.user_key.cmp(&b.key.user_key));
+        let result = load_meta_from_items(&items);
+        assert!(
+            matches!(result, Err(crate::Error::InvalidHeader("TableMeta"))),
+            "overlong index_format payload must be rejected, got {result:?}",
+        );
+    }
+
     /// Missing `table_version` must return `Err(InvalidHeader)`, not panic.
     #[test]
     fn load_with_handle_missing_table_version_returns_err() {
@@ -589,6 +671,33 @@ mod tests {
                 .find(|iv| &*iv.key.user_key == key.as_bytes())
             {
                 *item = meta(key, &[0u8, 0xFF]);
+            }
+            let result = load_meta_from_items(&items);
+            assert!(
+                matches!(result, Err(crate::Error::InvalidHeader("TableMeta"))),
+                "overlong {key} payload must be rejected, got {result:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn load_with_handle_overlong_fixed_width_field_is_rejected() {
+        // created_at (16 B) and the seqno fields (8 B each) are fixed-width;
+        // an overlong payload (junk byte appended) must be rejected as
+        // InvalidHeader, not silently truncated to the leading bytes.
+        for (key, mut value) in [
+            ("created_at", 1_000_000u128.to_le_bytes().to_vec()),
+            ("seqno#min", 1u64.to_le_bytes().to_vec()),
+            ("seqno#max", 10u64.to_le_bytes().to_vec()),
+            ("seqno#kv_max", 5u64.to_le_bytes().to_vec()),
+        ] {
+            value.push(0xFF); // overlong
+            let mut items = valid_meta_items();
+            if let Some(item) = items
+                .iter_mut()
+                .find(|iv| &*iv.key.user_key == key.as_bytes())
+            {
+                *item = meta(key, &value);
             }
             let result = load_meta_from_items(&items);
             assert!(

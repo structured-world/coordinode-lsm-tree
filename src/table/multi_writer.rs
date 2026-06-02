@@ -87,6 +87,12 @@ pub struct MultiWriter {
         crate::runtime_config::ChecksumAlgorithm,
     )>,
 
+    /// `seqno_in_index` runtime config — preserved here so the rotation
+    /// path stamps the same index format on every successor [`Writer`],
+    /// keeping all SSTs of one flush / compaction at a uniform
+    /// `index_format`.
+    use_seqno_in_index: bool,
+
     #[cfg(zstd_any)]
     zstd_dictionary: Option<Arc<crate::compression::ZstdDictionary>>,
 }
@@ -145,6 +151,7 @@ impl MultiWriter {
             page_ecc: false,
 
             kv_checksum: None,
+            use_seqno_in_index: false,
 
             #[cfg(zstd_any)]
             zstd_dictionary: None,
@@ -449,6 +456,16 @@ impl MultiWriter {
         self
     }
 
+    /// Wires the `seqno_in_index` runtime config through to the inner
+    /// [`Writer`] and preserves it across rotations so every successor
+    /// writer stamps the same `index_format` on its index entries.
+    #[must_use]
+    pub fn use_seqno_in_index(mut self, seqno_in_index: bool) -> Self {
+        self.use_seqno_in_index = seqno_in_index;
+        self.writer = self.writer.use_seqno_in_index(seqno_in_index);
+        self
+    }
+
     #[cfg(zstd_any)]
     #[must_use]
     pub fn use_zstd_dictionary(
@@ -489,6 +506,7 @@ impl MultiWriter {
         if let Some((policy, algo)) = self.kv_checksum {
             new_writer = new_writer.use_kv_checksums(policy, algo);
         }
+        new_writer = new_writer.use_seqno_in_index(self.use_seqno_in_index);
 
         #[cfg(zstd_any)]
         {
