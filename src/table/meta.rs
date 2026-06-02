@@ -8,7 +8,6 @@ use crate::{
     CompressionType, KeyRange, SeqNo, TableId, checksum::ChecksumType, coding::Decode,
     comparator::default_comparator, runtime_config::ChecksumAlgorithm, table::block::BlockType,
 };
-use byteorder::{LittleEndian, ReadBytesExt};
 use std::ops::Deref;
 
 /// Nanosecond timestamp.
@@ -120,6 +119,19 @@ macro_rules! read_u64 {
         let bytes = <[u8; 8]>::try_from(&item.value[..])
             .map_err(|_| crate::Error::InvalidHeader("TableMeta"))?;
         u64::from_le_bytes(bytes)
+    }};
+}
+
+macro_rules! read_u128 {
+    ($block:expr, $name:expr, $cmp:expr) => {{
+        let item = $block
+            .point_read($name, SeqNo::MAX, $cmp)?
+            .ok_or(crate::Error::InvalidHeader("TableMeta"))?;
+        // Exactly sixteen little-endian bytes — same exact-width contract as
+        // read_u64!, so an overlong / short payload is rejected as corrupt meta.
+        let bytes = <[u8; 16]>::try_from(&item.value[..])
+            .map_err(|_| crate::Error::InvalidHeader("TableMeta"))?;
+        u128::from_le_bytes(bytes)
     }};
 }
 
@@ -241,14 +253,7 @@ impl ParsedMeta {
         let weak_tombstone_count = read_u64!(block, b"weak_tombstone_count", &cmp);
         let weak_tombstone_reclaimable = read_u64!(block, b"weak_tombstone_reclaimable", &cmp);
 
-        let created_at = {
-            let bytes = block
-                .point_read(b"created_at", SeqNo::MAX, &cmp)?
-                .ok_or(crate::Error::InvalidHeader("TableMeta"))?;
-
-            let mut bytes = &bytes.value[..];
-            bytes.read_u128::<LittleEndian>()?.into()
-        };
+        let created_at = read_u128!(block, b"created_at", &cmp).into();
 
         let key_range = KeyRange::new((
             block
@@ -262,24 +267,8 @@ impl ParsedMeta {
         ));
 
         let seqnos = {
-            let min = {
-                let bytes = block
-                    .point_read(b"seqno#min", SeqNo::MAX, &cmp)?
-                    .ok_or(crate::Error::InvalidHeader("TableMeta"))?
-                    .value;
-                let mut bytes = &bytes[..];
-                bytes.read_u64::<LittleEndian>()?
-            };
-
-            let max = {
-                let bytes = block
-                    .point_read(b"seqno#max", SeqNo::MAX, &cmp)?
-                    .ok_or(crate::Error::InvalidHeader("TableMeta"))?
-                    .value;
-                let mut bytes = &bytes[..];
-                bytes.read_u64::<LittleEndian>()?
-            };
-
+            let min = read_u64!(block, b"seqno#min", &cmp);
+            let max = read_u64!(block, b"seqno#max", &cmp);
             (min, max)
         };
 
@@ -292,8 +281,11 @@ impl ParsedMeta {
         // surface metadata corruption rather than silently falling back.
         let highest_kv_seqno =
             if let Some(item) = block.point_read(b"seqno#kv_max", SeqNo::MAX, &cmp)? {
-                let mut bytes = &item.value[..];
-                validated_kv_seqno(bytes.read_u64::<LittleEndian>()?, seqnos.1)?
+                // Present-but-wrong-width is corrupt meta — require exactly 8
+                // bytes rather than truncating an overlong payload.
+                let bytes = <[u8; 8]>::try_from(&item.value[..])
+                    .map_err(|_| crate::Error::InvalidHeader("TableMeta"))?;
+                validated_kv_seqno(u64::from_le_bytes(bytes), seqnos.1)?
             } else {
                 seqnos.1
             };
@@ -338,15 +330,14 @@ impl ParsedMeta {
         // format, no per-block seqno bounds).
         let index_format = match block.point_read(b"index_format", SeqNo::MAX, &cmp)? {
             None => 0u8,
-            // The value must be EXACTLY one byte. `read_u8` alone would ignore
-            // trailing bytes, so a corrupt payload like `[1, 0xFF]` would parse
-            // as `1`. Since this byte selects the index-entry decoder, require
-            // an exact one-byte payload and reject anything else.
-            Some(item) if item.value.len() == 1 => {
-                let mut bytes = &item.value[..];
-                bytes.read_u8()?
-            }
-            Some(_) => return Err(crate::Error::InvalidHeader("TableMeta")),
+            // The value must be EXACTLY one byte. Matching a single-element slice
+            // rejects trailing bytes, so a corrupt payload like `[1, 0xFF]` is an
+            // error rather than parsing as `1`. Since this byte selects the
+            // index-entry decoder, require an exact one-byte payload.
+            Some(item) => match &item.value[..] {
+                [b] => *b,
+                _ => return Err(crate::Error::InvalidHeader("TableMeta")),
+            },
         };
         // Only `0` (legacy) and `1` (per-block seqno bounds) are defined in
         // this format slice. Reject any other byte as corrupt / forward-
@@ -680,6 +671,33 @@ mod tests {
                 .find(|iv| &*iv.key.user_key == key.as_bytes())
             {
                 *item = meta(key, &[0u8, 0xFF]);
+            }
+            let result = load_meta_from_items(&items);
+            assert!(
+                matches!(result, Err(crate::Error::InvalidHeader("TableMeta"))),
+                "overlong {key} payload must be rejected, got {result:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn load_with_handle_overlong_fixed_width_field_is_rejected() {
+        // created_at (16 B) and the seqno fields (8 B each) are fixed-width;
+        // an overlong payload (junk byte appended) must be rejected as
+        // InvalidHeader, not silently truncated to the leading bytes.
+        for (key, mut value) in [
+            ("created_at", 1_000_000u128.to_le_bytes().to_vec()),
+            ("seqno#min", 1u64.to_le_bytes().to_vec()),
+            ("seqno#max", 10u64.to_le_bytes().to_vec()),
+            ("seqno#kv_max", 5u64.to_le_bytes().to_vec()),
+        ] {
+            value.push(0xFF); // overlong
+            let mut items = valid_meta_items();
+            if let Some(item) = items
+                .iter_mut()
+                .find(|iv| &*iv.key.user_key == key.as_bytes())
+            {
+                *item = meta(key, &value);
             }
             let result = load_meta_from_items(&items);
             assert!(
