@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1780428105384,
+  "lastUpdate": 1780433017654,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -12324,6 +12324,84 @@ window.BENCHMARK_DATA = {
             "value": 448161.2187202964,
             "unit": "ops/sec",
             "extra": "P50: 2.0us | P99: 6.6us | P99.9: 9.8us\nthreads: 1 | elapsed: 0.45s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "333083cbe63da6feebb5b8dacbc6becb7bfea2f1",
+          "message": "test(compare-rocksdb): zstd-22 compression axis + scan/seek/overwrite scenarios (#386)\n\n## Summary\n\nExtends the RocksDB head-to-head harness so every scenario is measured\n**twice** (no-compression baseline + zstd level 22) and adds three new\nscenarios, each producing an **ours-vs-rocksdb overlay** chart.\n\n### Compression axis (duplicated graphs)\n\nEach scenario now has a sibling `_zstd22` group: `write_throughput`,\n`point_read`, `range_scan`, `seek_random`, `overwrite` each gain a\n`*_zstd22` variant.\n\nBoth engines are configured identically per variant: ours via\n`CompressionType::Zstd(22)`, RocksDB via `DBCompressionType::Zstd`\npinned to level 22 (`set_compression_options(-14, 22, 0, 0)`).\n\n### Cross-engine overlay, host-independent\n\nWithin every group both engines run in the **same process and the same\ninvocation**, so criterion plots them as an overlay (ours vs rocksdb) on\none chart. The comparison is a **ratio measured on one host in one\nrun**: if the bench host CPU changes between runs the absolute numbers\nmove but the relative gap holds, giving a consistent baseline.\n\n### New scenarios\n\n- `range_scan` — full forward scan reading every value (warm)\n- `seek_random` — seek to each scattered key, read the cursor value\n(warm)\n- `overwrite` — rewrite the whole keyspace over an existing copy (first\ncopy written outside the timed window)\n\nNot yet portable head-to-head (noted in the module doc):\n`readwhilewriting` (concurrency) and `mergerandom` (merge-operator\nsemantics differ across engines).\n\n## Testing\n\nThis crate is standalone (not in the workspace / main CI), verified\nlocally:\n\n- `cargo bench --no-run` compiles (rocksdb + zstd C deps)\n- `cargo bench -- --quick` smoke on all new scenarios x both\ncompressions x both engines runs clean (e.g. range_scan/ours/1k 8.2\nMelem/s vs rocksdb 6.4; write_throughput_zstd22 ours 365ms vs rocksdb\n410ms @1k)\n- `cargo fmt --check` clean; `cargo clippy --all-targets` clean\n\n## Follow-up\n\nPublishing the criterion overlay reports to the gh-pages dashboard\n(current `benchmark.yml` runs the single-engine `db_bench` trend) is a\nseparate CI-wiring change.\n\nCloses #385\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n\n## Summary by CodeRabbit\n\n* **Tests**\n* Enhanced benchmark suite with compression parameterization, running\nbaseline and Zstd22 variants across write throughput, point reads, range\nscans, seek-random, and overwrite workloads\n* Added shared population helpers for warm-read benchmarks with\ncompression support\n* Updated engine configurations to ensure matching compression settings\nfor fair performance comparison\n\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-06-02T18:31:31Z",
+          "tree_id": "1101055cdd29ad6243af85d74af447d39986ce0f",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/333083cbe63da6feebb5b8dacbc6becb7bfea2f1"
+        },
+        "date": 1780433015970,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 2037875.7342300694,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.6us | P99.9: 3.7us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1238660.1131141938,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.2us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 512774.2027359775,
+            "unit": "ops/sec",
+            "extra": "P50: 1.8us | P99: 5.1us | P99.9: 7.5us\nthreads: 1 | elapsed: 0.39s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3637531.1515894365,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 3.1us | P99.9: 5.5us\nthreads: 1 | elapsed: 0.05s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 383933.97343099734,
+            "unit": "ops/sec",
+            "extra": "P50: 2.3us | P99: 5.6us | P99.9: 8.5us\nthreads: 1 | elapsed: 0.52s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 203967.89411951558,
+            "unit": "ops/sec",
+            "extra": "P50: 4.6us | P99: 5.7us | P99.9: 8.3us\nthreads: 1 | elapsed: 0.98s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1258305.049257295,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.2us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1115794.8085928205,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 1.5us | P99.9: 1.9us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 454179.18896409246,
+            "unit": "ops/sec",
+            "extra": "P50: 2.0us | P99: 5.5us | P99.9: 8.0us\nthreads: 1 | elapsed: 0.44s | num: 200000 | iterations: 3"
           }
         ]
       }
