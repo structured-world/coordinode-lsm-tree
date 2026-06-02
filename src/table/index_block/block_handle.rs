@@ -336,9 +336,15 @@ impl Decodable<IndexBlockParsedItem> for KeyedBlockHandle {
         let seqno = reader.read_u64_varint().ok()?;
 
         if has_bounds {
-            // Skip per-block seqno bounds; the restart key only needs the key.
-            let _seqno_min = reader.read_u64_varint().ok()?;
-            let _seqno_max = reader.read_u64_varint().ok()?;
+            // The restart key only needs the key, but still reject inverted
+            // bounds (seqno_min > seqno_max) here as `parse_full` /
+            // `parse_truncated` do — a malformed marker-2 head must not feed a
+            // forged entry into restart-table navigation.
+            let seqno_min = reader.read_u64_varint().ok()?;
+            let seqno_max = reader.read_u64_varint().ok()?;
+            if seqno_min > seqno_max {
+                return None;
+            }
         }
 
         let key_len: usize = reader.read_u16_varint().ok()?.into();
@@ -831,5 +837,40 @@ mod tests {
             .unwrap();
         assert_eq!(key, b"abcdef");
         assert_eq!(seqno, 7);
+    }
+
+    #[test]
+    fn parse_restart_key_rejects_inverted_seqno_bounds() {
+        // A marker-2 restart head with seqno_min > seqno_max must be rejected
+        // (like parse_full / parse_truncated), not feed a forged entry into
+        // restart-table navigation. Build valid (3, 9), then swap the two
+        // single-byte bound varints on the wire to invert them.
+        let handle = KeyedBlockHandle::new(
+            b"abcdef".to_vec().into(),
+            7,
+            BlockHandle::new(BlockOffset(0), 1),
+        )
+        .with_seqno_bounds(3, 9);
+        let mut bytes = Vec::new();
+        let mut state = BlockOffset(0);
+        handle.encode_full_into(&mut bytes, &mut state).unwrap();
+        assert_eq!(
+            (bytes.get(4).copied(), bytes.get(5).copied()),
+            (Some(3), Some(9)),
+            "bound varint layout changed",
+        );
+        bytes.swap(4, 5); // invert
+
+        let mut cursor = Cursor::new(bytes.as_slice());
+        let parsed = <KeyedBlockHandle as Decodable<IndexBlockParsedItem>>::parse_restart_key(
+            &mut cursor,
+            0,
+            bytes.as_slice(),
+            bytes.len(),
+        );
+        assert!(
+            parsed.is_none(),
+            "inverted seqno bounds must be rejected by parse_restart_key",
+        );
     }
 }
