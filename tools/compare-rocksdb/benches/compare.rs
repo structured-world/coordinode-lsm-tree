@@ -126,6 +126,36 @@ impl WorkloadInputs {
     }
 }
 
+/// RocksDB `Options` configured to match our engine's defaults so the
+/// head-to-head stays apples-to-apples:
+///
+/// - **No compression** — our default `data_block_compression_policy`
+///   writes L0 with `None`.
+/// - **10-bits/key bloom filter** — `Config::default()` gives our engine
+///   `Bloom(BitsPerKey(10.0))`. RocksDB has NO filter policy by default,
+///   so without this it would skip the bloom construction our engine
+///   pays at flush (write side) and the bloom probe per lookup (read
+///   side).
+/// - **16 MiB block cache** — matches our default per-tree cache
+///   capacity, so neither engine gets an unfair cache-size edge.
+///
+/// `create_if_missing` is set here too. WAL handling is per-call
+/// (`WriteOptions::disable_wal`) since it only applies to the write
+/// path.
+fn rocksdb_options() -> rocksdb::Options {
+    let mut block_opts = rocksdb::BlockBasedOptions::default();
+    let cache = rocksdb::Cache::new_lru_cache(16 * 1024 * 1024);
+    block_opts.set_block_cache(&cache);
+    // bits_per_key = 10.0, block_based = false → modern full-block filter,
+    // the closest match to our `BitsPerKey(10.0)` policy.
+    block_opts.set_bloom_filter(10.0, false);
+    let mut opts = rocksdb::Options::default();
+    opts.create_if_missing(true);
+    opts.set_compression_type(rocksdb::DBCompressionType::None);
+    opts.set_block_based_table_factory(&block_opts);
+    opts
+}
+
 /// Workload: bulk-insert `inputs.keys.len()` (key, value) pairs
 /// into a freshly-opened engine. The `Instant::now()` snapshot is
 /// taken BEFORE the engine open and the elapsed capture is taken
@@ -138,10 +168,12 @@ impl WorkloadInputs {
 ///
 /// Apples-to-apples configuration:
 ///
-///   - **Compression: None on both sides.** lsm-tree's default
-///     `data_block_compression_policy` writes L0 with `None`, so
-///     RocksDB is set to `DBCompressionType::None` too. A future
-///     `write_throughput_lz4` variant can flip both.
+///   - **Compression / bloom / cache matched via [`rocksdb_options`].**
+///     None compression on both sides; RocksDB gets the same 10-bits/key
+///     bloom filter and 16 MiB block cache our engine has by default, so
+///     RocksDB also builds a bloom filter at flush (the work our engine
+///     does) instead of skipping it. A future `write_throughput_lz4`
+///     variant can flip compression on both.
 ///
 ///   - **No WAL on either side.** lsm-tree has no WAL —
 ///     durability is the caller's responsibility, and
@@ -191,8 +223,11 @@ fn run_write_throughput(
             start.elapsed()
         }
         Engine::RocksDb => {
-            let mut opts = rocksdb::Options::default();
-            opts.create_if_missing(true);
+            // Bloom (10 bits/key) + 16 MiB cache + no compression, matching
+            // our engine's defaults — see `rocksdb_options`. Our engine
+            // builds a bloom filter at flush, so giving RocksDB the same
+            // keeps the write comparison apples-to-apples.
+            let opts = rocksdb_options();
             // Match our engine's durability shape: lsm-tree has no
             // WAL — durability is the caller's responsibility, and
             // `flush_active_memtable` is the equivalent of an
@@ -201,7 +236,6 @@ fn run_write_throughput(
             // measures the same kind of work (memtable insert +
             // terminal flush) rather than penalising RocksDB for
             // its built-in WAL.
-            opts.set_compression_type(rocksdb::DBCompressionType::None);
             let db = rocksdb::DB::open(&opts, dir.path())?;
             let mut write_opts = rocksdb::WriteOptions::default();
             write_opts.disable_wal(true);
@@ -279,10 +313,13 @@ fn bench_write_throughput(c: &mut Criterion) {
 /// scattered on-disk access pattern (realistic for the bloom filter
 /// and block cache) without a per-iteration shuffle.
 ///
-/// Apples-to-apples configuration matches [`run_write_throughput`]:
-/// compression `None` on both sides; RocksDB writes with the WAL
-/// disabled during the (untimed) populate phase. Reads themselves
-/// take no special options on either engine.
+/// Apples-to-apples configuration matches [`run_write_throughput`] via
+/// [`rocksdb_options`]: compression `None`, a matching 10-bits/key bloom
+/// filter, and a 16 MiB block cache on both sides, so the bloom probe and
+/// cache behaviour the latency claim above describes apply to RocksDB too
+/// (not just our engine). RocksDB writes with the WAL disabled during the
+/// (untimed) populate phase. Reads themselves take no special options on
+/// either engine.
 ///
 /// Setup failures (open / insert / flush) and read failures panic
 /// with the engine label: a benchmark that can't populate or read
@@ -341,9 +378,11 @@ fn bench_point_read(c: &mut Criterion) {
                         });
                     }
                     Engine::RocksDb => {
-                        let mut opts = rocksdb::Options::default();
-                        opts.create_if_missing(true);
-                        opts.set_compression_type(rocksdb::DBCompressionType::None);
+                        // Bloom (10 bits/key) + 16 MiB cache + no compression,
+                        // matching our engine's defaults so the per-`get`
+                        // overhead is attributable, not a config artefact —
+                        // see `rocksdb_options`.
+                        let opts = rocksdb_options();
                         let db = rocksdb::DB::open(&opts, dir.path()).expect("rocksdb: open");
                         let mut write_opts = rocksdb::WriteOptions::default();
                         write_opts.disable_wal(true);
