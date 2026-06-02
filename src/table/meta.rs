@@ -551,6 +551,22 @@ mod tests {
         }
     }
 
+    #[test]
+    fn index_format_overlong_payload_is_rejected() {
+        // The index_format value must be exactly one byte. A payload with
+        // trailing bytes (e.g. [1, 0xFF]) would otherwise parse as 1 because
+        // read_u8 ignores the remainder — since this byte selects the index
+        // decoder, an overlong payload is corrupt metadata and must be rejected.
+        let mut items = valid_meta_items();
+        items.push(meta("index_format", &[1u8, 0xFF]));
+        items.sort_by(|a, b| a.key.user_key.cmp(&b.key.user_key));
+        let result = load_meta_from_items(&items);
+        assert!(
+            matches!(result, Err(crate::Error::InvalidHeader("TableMeta"))),
+            "overlong index_format payload must be rejected, got {result:?}",
+        );
+    }
+
     /// Missing `table_version` must return `Err(InvalidHeader)`, not panic.
     #[test]
     fn load_with_handle_missing_table_version_returns_err() {
