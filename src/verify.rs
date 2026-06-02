@@ -559,19 +559,35 @@ pub fn verify_sst_file(path: &std::path::Path) -> BlockVerifyReport {
     // with no key out-of-band), DO NOT assume disabled: walking an ECC-bearing
     // SST without skipping parity trailers mis-aligns the scan and reports
     // spurious corruption. Surface the indeterminacy and skip the walk.
-    let Some(page_ecc) = read_page_ecc_out_of_band(&fs, path) else {
-        report.errors.push(BlockVerifyError::SstFileUnreadable {
-            table_id: 0,
-            path: path.to_path_buf(),
-            error: std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "could not read the SST meta block to determine page_ecc \
-                 (missing / corrupt file, or an encrypted SST with no key \
-                 out-of-band); skipping the block walk — use \
-                 verify_block_checksums on a live tree for ECC-aware verification",
-            ),
-        });
-        return report;
+    let page_ecc = match read_page_ecc_out_of_band(&fs, path) {
+        Ok(Some(ecc)) => ecc,
+        // File + trailer readable, but neither meta block decodes (corrupt
+        // meta, or an encrypted SST with no key out-of-band). page_ecc is
+        // undeterminable; skip the walk rather than mis-walk an ECC-bearing SST.
+        Ok(None) => {
+            report.errors.push(BlockVerifyError::SstFileUnreadable {
+                table_id: 0,
+                path: path.to_path_buf(),
+                error: std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "could not decode the SST meta block to determine page_ecc \
+                     (corrupt meta, or an encrypted SST with no key out-of-band); \
+                     skipping the block walk — use verify_block_checksums on a live \
+                     tree for ECC-aware verification",
+                ),
+            });
+            return report;
+        }
+        // Real file-open / SFA-trailer failure — preserve the underlying error
+        // rather than collapsing it into the undeterminable message above.
+        Err(error) => {
+            report.errors.push(BlockVerifyError::SstFileUnreadable {
+                table_id: 0,
+                path: path.to_path_buf(),
+                error,
+            });
+            return report;
+        }
     };
 
     match scan_sst_blocks(&fs, path, 0, 0, page_ecc) {
@@ -594,23 +610,28 @@ pub fn verify_sst_file(path: &std::path::Path) -> BlockVerifyReport {
 /// Best-effort read of the per-SST `page_ecc` flag from an SST file's meta
 /// descriptor, for the out-of-band scrub (no live `Table` to consult).
 ///
-/// Returns `Some(page_ecc)` when a meta block decodes. The authoritative tail
-/// `meta` section is tried first; if its block is corrupt / undecodable the
-/// early `meta_mid` mirror (which the writer emits so one bad meta block can't
-/// lose the descriptor) is tried next. Returns `None` only when the flag is
-/// UNDETERMINABLE — the file can't be opened, neither meta section exists, or
-/// neither decodes (both corrupt, or an encrypted SST whose key the out-of-band
-/// tool doesn't have). The caller MUST NOT treat `None` as "`page_ecc`
-/// disabled": walking an ECC-bearing SST without skipping the parity trailers
-/// mis-aligns the block scan and reports spurious corruption, so the caller
-/// skips the walk and surfaces the indeterminacy instead.
+/// Returns `Ok(Some(page_ecc))` when a meta block decodes. The authoritative
+/// tail `meta` section is tried first; if its block is corrupt / undecodable
+/// the early `meta_mid` mirror (which the writer emits so one bad meta block
+/// can't lose the descriptor) is tried next. Returns `Ok(None)` when the file
+/// and SFA trailer are readable but NEITHER meta block decodes (both corrupt,
+/// or an encrypted SST whose key the out-of-band tool doesn't have) — the flag
+/// is genuinely UNDETERMINABLE. Returns `Err` when the file can't be opened or
+/// its SFA trailer can't be parsed, preserving the real I/O / structural error
+/// for the caller to report rather than collapsing it into "undeterminable".
+///
+/// The caller MUST NOT treat `Ok(None)` as "`page_ecc` disabled": walking an
+/// ECC-bearing SST without skipping the parity trailers mis-aligns the block
+/// scan and reports spurious corruption, so the caller skips the walk and
+/// surfaces the indeterminacy instead.
 #[cfg(feature = "std")]
-fn read_page_ecc_out_of_band(fs: &dyn crate::fs::Fs, path: &std::path::Path) -> Option<bool> {
-    let file = fs
-        .open(path, &crate::fs::FsOpenOptions::new().read(true))
-        .ok()?;
-    let mut probe = file;
-    let sfa_reader = crate::sfa::Reader::from_reader(&mut probe).ok()?;
+fn read_page_ecc_out_of_band(
+    fs: &dyn crate::fs::Fs,
+    path: &std::path::Path,
+) -> std::io::Result<Option<bool>> {
+    let mut probe = fs.open(path, &crate::fs::FsOpenOptions::new().read(true))?;
+    let sfa_reader = crate::sfa::Reader::from_reader(&mut probe)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     let toc = sfa_reader.toc();
     // Tail `meta` is authoritative; `meta_mid` is the early mirror written so a
     // single corrupt meta block doesn't lose the per-SST descriptor.
@@ -625,10 +646,10 @@ fn read_page_ecc_out_of_band(fs: &dyn crate::fs::Fs, path: &std::path::Path) -> 
         if let Ok(meta) =
             crate::table::meta::ParsedMeta::load_with_handle(probe.as_ref(), &handle, None)
         {
-            return Some(meta.page_ecc);
+            return Ok(Some(meta.page_ecc));
         }
     }
-    None
+    Ok(None)
 }
 
 struct PerFileScan {
