@@ -717,7 +717,11 @@ mod tests {
         // Layout: [marker=2][offset=0][size=1][seqno=7][seqno_min=3][seqno_max=9]…
         // all single-byte varints, so the bounds sit at indices 4 and 5.
         assert_eq!(bytes.first().copied(), Some(2));
-        assert_eq!((bytes[4], bytes[5]), (3, 9), "bound varint layout changed");
+        assert_eq!(
+            (bytes.get(4).copied(), bytes.get(5).copied()),
+            (Some(3), Some(9)),
+            "bound varint layout changed",
+        );
         bytes.swap(4, 5); // → seqno_min=9, seqno_max=3 (inverted)
 
         let mut cursor = Cursor::new(bytes.as_slice());
@@ -747,7 +751,11 @@ mod tests {
             .unwrap();
         // Layout: [marker=3][offset=0][size=1][seqno=7][seqno_min=3][seqno_max=9]…
         assert_eq!(bytes.first().copied(), Some(3));
-        assert_eq!((bytes[4], bytes[5]), (3, 9), "bound varint layout changed");
+        assert_eq!(
+            (bytes.get(4).copied(), bytes.get(5).copied()),
+            (Some(3), Some(9)),
+            "bound varint layout changed",
+        );
         bytes.swap(4, 5); // invert
 
         let offset = 16;
