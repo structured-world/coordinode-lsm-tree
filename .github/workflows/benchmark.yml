@@ -184,14 +184,30 @@ jobs:
             echo "::error::criterion report tree not found at $src/report"
             exit 1
           fi
-          work="$(mktemp -d)"
+          # Explicit template (not bare `mktemp -d`, which is GNU-only and
+          # fails on macOS/BSD with "too few X's") so the step survives a
+          # future runner-OS change.
+          work="$(mktemp -d "${TMPDIR:-/tmp}/compare-ghpages.XXXXXXXX")"
           # Remove the temp clone on every exit path (success, error, or
-          # cancellation): its .git/config holds the installation token in
-          # plaintext, and uncleaned temp dirs leak disk on a long-lived
+          # cancellation) so it doesn't leak disk on a long-lived
           # self-hosted runner.
           trap 'rm -rf "$work"' EXIT
+          # Supply the token through a credential helper that reads it from
+          # the environment at call time, so it appears neither in argv
+          # (visible via `ps` on a shared self-hosted host) nor in a
+          # persisted remote URL / .git/config. The clone + push both use a
+          # plain, secret-free https URL; GIT_CONFIG_* injects the helper
+          # into every git invocation in this step's environment.
+          export GIT_CONFIG_COUNT=1
+          export GIT_CONFIG_KEY_0=credential.helper
+          # SC2016: the single quotes are deliberate — `${GH_TOKEN}` must NOT
+          # expand here. It is expanded later by the helper's own shell when
+          # git invokes it, reading the token from the (exported) environment
+          # so it never lands in argv or config.
+          # shellcheck disable=SC2016
+          export GIT_CONFIG_VALUE_0='!f() { echo username=x-access-token; echo "password=${GH_TOKEN}"; }; f'
           git clone --depth 1 --branch gh-pages \
-            "https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git" "$work"
+            "https://github.com/${REPO}.git" "$work"
           # Replace the previous report tree wholesale so deleted /
           # renamed scenarios don't leave stale pages behind; dev/bench
           # and every other gh-pages path are untouched.
