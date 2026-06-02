@@ -57,7 +57,7 @@
 use std::time::Duration;
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use lsm_tree::{AbstractTree, Config, SequenceNumberCounter};
+use lsm_tree::{AbstractTree, Config, MAX_SEQNO, SequenceNumberCounter};
 
 /// Engine under test. The harness runs each workload once per
 /// variant and emits per-engine timings under the same criterion
@@ -264,10 +264,12 @@ fn bench_write_throughput(c: &mut Criterion) {
 /// read latency (block cache + bloom filter + block fetch + decode),
 /// not the open / write / flush setup cost.
 ///
-/// Keys are read in stored order; because `key_for` spreads keys
-/// quasi-randomly across the keyspace, index-order iteration still
-/// produces a scattered on-disk access pattern (realistic for the
-/// bloom filter and block cache) without a per-iteration shuffle.
+/// Keys are read in insertion order (the `inputs.keys` `Vec` order),
+/// which is NOT the on-disk sorted order the engine stores them in
+/// after flush. Because `key_for` spreads keys quasi-randomly across
+/// the keyspace, iterating them in insertion order still produces a
+/// scattered on-disk access pattern (realistic for the bloom filter
+/// and block cache) without a per-iteration shuffle.
 ///
 /// Apples-to-apples configuration matches [`run_write_throughput`]:
 /// compression `None` on both sides; RocksDB writes with the WAL
@@ -308,9 +310,16 @@ fn bench_point_read(c: &mut Criterion) {
                             let start = std::time::Instant::now();
                             for _ in 0..iters {
                                 for key in &inputs.keys {
-                                    // `u64::MAX` (= `SeqNo::MAX`) reads the
-                                    // latest visible version of every key.
-                                    let got = tree.get(key, u64::MAX).expect("ours: get");
+                                    // `MAX_SEQNO` (not `u64::MAX`, whose MSB is
+                                    // reserved) reads the latest visible version
+                                    // of every key.
+                                    let got = tree.get(key, MAX_SEQNO).expect("ours: get");
+                                    // Every key was inserted + flushed, so the
+                                    // workload ("read every stored key") requires
+                                    // a hit: assert it so a setup/flush regression
+                                    // can't silently turn this into a miss-read
+                                    // benchmark.
+                                    assert!(got.is_some(), "ours: key unexpectedly missing");
                                     std::hint::black_box(got);
                                 }
                             }
@@ -333,6 +342,10 @@ fn bench_point_read(c: &mut Criterion) {
                             for _ in 0..iters {
                                 for key in &inputs.keys {
                                     let got = db.get(key).expect("rocksdb: get");
+                                    // Same hit-required invariant as the `ours`
+                                    // arm: a miss here means setup/flush broke,
+                                    // not a legitimately-measured read.
+                                    assert!(got.is_some(), "rocksdb: key unexpectedly missing");
                                     std::hint::black_box(got);
                                 }
                             }
