@@ -259,10 +259,18 @@ fn bench_write_throughput(c: &mut Criterion) {
 /// In contrast to [`run_write_throughput`]'s cold-start measurement,
 /// the engine here is opened, populated and flushed ONCE — outside
 /// the criterion timing window — and kept warm for the whole
-/// benchmark. The timed body issues one `get` per stored key against
-/// that warm, on-disk engine, so the number reflects steady-state
-/// read latency (block cache + bloom filter + block fetch + decode),
-/// not the open / write / flush setup cost.
+/// benchmark. The timed body issues one `get` per stored key, so the
+/// number reflects warm steady-state read latency (lookup path +
+/// bloom filter + block decode), NOT the open / write / flush setup
+/// cost.
+///
+/// Note this is a CACHE-WARM read: the engine stays open across the
+/// criterion warmup and measurement sweeps, so after the first pass
+/// the working set is largely block-cache resident (both engines use
+/// their default cache; lsm-tree's is 16 MiB). The number is "read a
+/// resident key", not "fault a block in from disk" — forcing cold
+/// misses would need per-iteration cache capping/clearing, which a
+/// future `point_read_cold` variant can add.
 ///
 /// Keys are read in insertion order (the `inputs.keys` `Vec` order),
 /// which is NOT the on-disk sorted order the engine stores them in
@@ -278,7 +286,10 @@ fn bench_write_throughput(c: &mut Criterion) {
 ///
 /// Setup failures (open / insert / flush) and read failures panic
 /// with the engine label: a benchmark that can't populate or read
-/// the database has no meaningful Duration to report.
+/// the database has no meaningful Duration to report. The "every key
+/// is present" invariant is checked ONCE before the timed window (so
+/// a broken setup fails loudly) and the timed loop itself stays a
+/// bare `get` + `black_box` with no per-read branch.
 fn bench_point_read(c: &mut Criterion) {
     let mut group = c.benchmark_group("point_read");
     for &n in &[1_000_u64, 10_000_u64] {
@@ -306,20 +317,23 @@ fn bench_point_read(c: &mut Criterion) {
                             tree.insert(key, value, seqno);
                         }
                         tree.flush_active_memtable(0).expect("ours: flush");
+                        // One-time hit check OUTSIDE the timed window: enforce
+                        // the workload contract ("read every stored key") so a
+                        // setup/flush regression can't silently become a
+                        // miss-read benchmark, without taxing each timed `get`
+                        // with a branch. `MAX_SEQNO` (not `u64::MAX`, whose MSB
+                        // is reserved) reads the latest visible version.
+                        for key in &inputs.keys {
+                            assert!(
+                                tree.get(key, MAX_SEQNO).expect("ours: verify").is_some(),
+                                "ours: key unexpectedly missing"
+                            );
+                        }
                         b.iter_custom(|iters| {
                             let start = std::time::Instant::now();
                             for _ in 0..iters {
                                 for key in &inputs.keys {
-                                    // `MAX_SEQNO` (not `u64::MAX`, whose MSB is
-                                    // reserved) reads the latest visible version
-                                    // of every key.
                                     let got = tree.get(key, MAX_SEQNO).expect("ours: get");
-                                    // Every key was inserted + flushed, so the
-                                    // workload ("read every stored key") requires
-                                    // a hit: assert it so a setup/flush regression
-                                    // can't silently turn this into a miss-read
-                                    // benchmark.
-                                    assert!(got.is_some(), "ours: key unexpectedly missing");
                                     std::hint::black_box(got);
                                 }
                             }
@@ -337,15 +351,20 @@ fn bench_point_read(c: &mut Criterion) {
                             db.put_opt(key, value, &write_opts).expect("rocksdb: put");
                         }
                         db.flush().expect("rocksdb: flush");
+                        // Same one-time, outside-the-timed-window hit check as
+                        // the `ours` arm: enforce "read every stored key"
+                        // without a per-read branch in the measured loop.
+                        for key in &inputs.keys {
+                            assert!(
+                                db.get(key).expect("rocksdb: verify").is_some(),
+                                "rocksdb: key unexpectedly missing"
+                            );
+                        }
                         b.iter_custom(|iters| {
                             let start = std::time::Instant::now();
                             for _ in 0..iters {
                                 for key in &inputs.keys {
                                     let got = db.get(key).expect("rocksdb: get");
-                                    // Same hit-required invariant as the `ours`
-                                    // arm: a miss here means setup/flush broke,
-                                    // not a legitimately-measured read.
-                                    assert!(got.is_some(), "rocksdb: key unexpectedly missing");
                                     std::hint::black_box(got);
                                 }
                             }
