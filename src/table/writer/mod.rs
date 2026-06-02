@@ -1041,7 +1041,12 @@ impl Writer {
         )?;
 
         // Write fixed-size trailer
-        // and flush & fsync the table file
+        // and flush & fsync the table file.
+        // SyncMode coverage: SST writer (here), manifest, version persist,
+        // directory syncs, and the blob-file writer all honor
+        // `Config::sync_mode`. The only remaining unconditional F_FULLFSYNC is
+        // `StdFs::hard_link`'s cross-device copy fallback (no trait param),
+        // tracked in #377.
         let mut checksum = self.file_writer.into_inner()?;
         FsFile::sync_all_with(&**checksum.inner_mut().get_mut(), self.sync_mode)?;
         let checksum = checksum.checksum();

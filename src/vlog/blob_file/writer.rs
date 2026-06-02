@@ -9,7 +9,7 @@ use super::meta::Metadata;
 use crate::{
     Checksum, CompressionType, KeyRange, SeqNo, TreeId, UserKey,
     checksum::ChecksummedWriter,
-    fs::{Fs, FsFile, FsOpenOptions},
+    fs::{Fs, FsFile, FsOpenOptions, SyncMode},
     time::unix_timestamp,
     vlog::BlobFileId,
 };
@@ -121,6 +121,11 @@ pub struct Writer {
 
     pub(crate) compression: CompressionType,
 
+    /// Durability level for the final blob-file fsync. Default
+    /// [`SyncMode::Normal`]; wired from `Config::sync_mode` via
+    /// [`Self::use_sync_mode`].
+    pub(crate) sync_mode: SyncMode,
+
     /// Dictionary for `ZstdDict` compression.  Must be supplied when
     /// `compression` is [`CompressionType::ZstdDict`].
     #[cfg(zstd_any)]
@@ -168,6 +173,7 @@ impl Writer {
             last_key: None,
 
             compression: CompressionType::None,
+            sync_mode: SyncMode::Normal,
 
             #[cfg(zstd_any)]
             zstd_dictionary: None,
@@ -176,6 +182,13 @@ impl Writer {
 
     pub fn use_compression(mut self, compressor: CompressionType) -> Self {
         self.compression = compressor;
+        self
+    }
+
+    /// Wires the tree's `Config::sync_mode` into the final blob-file fsync.
+    #[must_use]
+    pub fn use_sync_mode(mut self, sync_mode: SyncMode) -> Self {
+        self.sync_mode = sync_mode;
         self
     }
 
@@ -390,7 +403,7 @@ impl Writer {
         metadata.encode_into(&mut self.writer)?;
 
         let mut checksum = self.writer.into_inner()?;
-        FsFile::sync_all(&**checksum.inner_mut().get_mut())?;
+        FsFile::sync_all_with(&**checksum.inner_mut().get_mut(), self.sync_mode)?;
         let checksum = checksum.checksum();
 
         Ok((metadata, checksum))

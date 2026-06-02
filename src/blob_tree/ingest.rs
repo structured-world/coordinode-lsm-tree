@@ -52,7 +52,8 @@ impl<'a> BlobIngestion<'a> {
             tree.index.config.fs.clone(),
         )?
         .use_target_size(blob_file_size)
-        .use_compression(kv.compression);
+        .use_compression(kv.compression)
+        .use_sync_mode(tree.index.config.sync_mode);
 
         let separation_threshold = kv.separation_threshold;
 

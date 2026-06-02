@@ -548,7 +548,8 @@ impl AbstractTree for BlobTree {
                 self.index.config.fs.clone(),
             )?
             .use_target_size(kv_opts.file_target_size)
-            .use_compression(kv_opts.compression);
+            .use_compression(kv_opts.compression)
+            .use_sync_mode(self.index.config.sync_mode);
             #[cfg(zstd_any)]
             let w = w.use_zstd_dictionary(kv_opts.zstd_dictionary.clone());
             w

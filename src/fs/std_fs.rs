@@ -379,6 +379,10 @@ fn copy_fallback(src: &Path, dst: &Path) -> io::Result<()> {
             )]
             dst_file.write_all(&buf[..n])?;
         }
+        // Full-durability sync: `hard_link` has no `SyncMode` parameter, so
+        // this cross-device fallback can't honor `Config::sync_mode` and uses
+        // `F_FULLFSYNC` on macOS regardless. Reachable only from cross-device
+        // checkpoint copies; threading `SyncMode` here is tracked in #377.
         dst_file.sync_all()
     })();
 
