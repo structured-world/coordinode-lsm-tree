@@ -236,9 +236,13 @@ impl Block {
     /// (currently only the `KV_CHECKSUM_FOOTER` flag from the `block_flags`
     /// module, since the footer lives in `data` and `write_into` can't see it).
     /// The compression / encryption / ECC bits are still derived from
-    /// `transform` here, so every block self-describes its full transform
-    /// stack in [`Header::block_flags`] regardless of which entry point is
-    /// used.
+    /// `transform` here, so the in-memory [`Header::block_flags`] always
+    /// reflects the full transform stack regardless of which entry point is
+    /// used. Note this is the IN-MEMORY header: only the self-describing block
+    /// types (`Meta` / `Manifest` / `ManifestFooter`) serialize the
+    /// `block_flags` byte to disk; SST block types omit it and the reader
+    /// recovers transform presence from the per-SST meta descriptors, so a
+    /// decoded SST header has `block_flags == 0`.
     ///
     /// Crate-internal: the `extra_flags` bag is a raw `u8` whose only valid
     /// bits live in the crate-private `block_flags` module, so an external
