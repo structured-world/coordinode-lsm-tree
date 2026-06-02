@@ -130,13 +130,13 @@ impl Drop for RootCleanup<'_> {
 ///    different `Arc<dyn Fs>` handle — common when `level_routes`
 ///    builds `Arc::new(StdFs)` independently from `config.fs`) will
 ///    succeed in O(1) without doubling disk usage. `StdFs::hard_link`
-///    handles its own `EXDEV` → byte-copy fallback transparently.
-/// 2. **On `NotFound`** (the dst backend doesn't see `src` at all —
-///    e.g. `MemFs` target with `StdFs` source) **or `Unsupported`**
-///    (in-memory backends that don't implement linking), stream bytes
-///    through both trait objects. This is the only path that doubles
-///    storage. The fallback itself is silent here (the [`StdFs`] EXDEV
-///    fallback emits one [`log::debug`] per file); operator-visible
+///    is a pure link — it surfaces the underlying error rather than
+///    copying.
+/// 2. **On cross-device (`EXDEV` / `CrossesDevices`), `Unsupported`, or
+///    `NotFound`**, stream bytes through both trait objects. This is the
+///    only path that doubles storage, and it owns the cross-filesystem
+///    copy so the copied file's durability honors `sync_mode` (via
+///    `sync_all_with` below). Logged at [`log::debug`]; operator-visible
 ///    notification of unexpected copies is the checkpoint driver's
 ///    responsibility — a per-file warning would drown real signal on
 ///    a misconfigured tier with thousands of SSTs.
@@ -185,19 +185,20 @@ pub fn link_or_copy_cross_fs(
             // link itself.
             Ok(()) => return Ok(dst_fs.metadata(dst)?.len),
             Err(e)
-                if matches!(
-                    e.kind(),
-                    std::io::ErrorKind::NotFound | std::io::ErrorKind::Unsupported
-                ) =>
+                if crate::fs::is_cross_device(&e) || e.kind() == std::io::ErrorKind::NotFound =>
             {
-                // Same kernel namespace but the link didn't take —
-                // either dst_fs's backend doesn't support hard_link at
-                // all, or the file moved out from under us before the
-                // syscall. Either way, fall through to the streamed
-                // copy below. Log at `debug` for symmetry with
-                // `StdFs::hard_link`'s EXDEV fallback — operators
-                // wanting visibility of unexpected full copies grep the
-                // `fs` / `checkpoint` modules at debug level. `warn`
+                // The link didn't take, for one of:
+                //   - cross-device (EXDEV / CrossesDevices) — src and dst
+                //     sit on different filesystems, so a true link is
+                //     impossible. `StdFs::hard_link` now surfaces this
+                //     instead of byte-copying, so the SyncMode-aware
+                //     streamed copy below owns the cross-fs copy and the
+                //     copied file honors `Config::sync_mode`.
+                //   - Unsupported — dst_fs's backend has no hard_link.
+                //   - NotFound — the file moved out before the syscall.
+                // All fall through to the streamed copy below. Log at
+                // `debug`: operators wanting visibility of full copies grep
+                // the `fs` / `checkpoint` modules at debug level; `warn`
                 // would drown real signal on a misconfigured tier with
                 // thousands of SSTs.
                 log::debug!(

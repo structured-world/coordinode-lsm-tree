@@ -46,6 +46,7 @@ mod io_uring_fs;
 
 pub use mem_fs::MemFs;
 pub use std_fs::StdFs;
+pub(crate) use std_fs::is_cross_device;
 
 #[cfg(all(target_os = "linux", feature = "io-uring"))]
 pub use io_uring_fs::{IoUringFs, is_io_uring_available};
@@ -575,21 +576,21 @@ pub trait Fs: Send + Sync + 'static {
     /// the other intact; the inode is reclaimed only after the last link
     /// is removed.
     ///
-    /// # Cross-filesystem fallback
+    /// # Cross-filesystem behaviour
     ///
-    /// Hard links cannot span filesystems. Implementations that detect a
-    /// cross-device situation (Unix `EXDEV`) MUST fall back to a byte copy
-    /// so that callers can treat `hard_link` as always-succeeding when the
-    /// destination filesystem is writable. The fallback emits a [`log::debug`]
-    /// trace per call (deliberately not `warn`: a tier-misconfigured
-    /// checkpoint can hit this path thousands of times per snapshot, and
-    /// per-file warnings would drown real signal). Callers that need
-    /// operator-visible notification of unexpected copies are expected
-    /// to aggregate per-checkpoint and emit a single summary warning.
+    /// Hard links cannot span filesystems. `hard_link` is a PURE link: on a
+    /// cross-device situation (Unix `EXDEV` / [`io::ErrorKind::CrossesDevices`])
+    /// implementations surface the error rather than silently byte-copying.
+    /// Callers that want a cross-filesystem copy use the checkpoint driver's
+    /// `link_or_copy_cross_fs`, which detects the cross-device (and
+    /// `Unsupported` / `NotFound`) error and performs a `SyncMode`-aware
+    /// streamed copy. Keeping the copy in one place means the copied file's
+    /// durability honors `Config::sync_mode` instead of an unconditional
+    /// barrier hidden inside `hard_link`.
     ///
-    /// In-memory backends ([`MemFs`]) do not have inodes;
-    /// they implement this as a byte copy that produces an independent file
-    /// with the same contents.
+    /// In-memory backends ([`MemFs`]) have no inodes; they implement this
+    /// as a byte copy that produces an independent file with the same
+    /// contents (their "link" semantics).
     ///
     /// # Default implementation
     ///
@@ -605,8 +606,8 @@ pub trait Fs: Send + Sync + 'static {
     /// # Errors
     ///
     /// Returns an I/O error if `src` does not exist, `dst` already exists,
-    /// the destination's parent directory is missing, or the fallback copy
-    /// fails.
+    /// the destination's parent directory is missing, or `src` and `dst`
+    /// are on different filesystems (cross-device — surfaced, not copied).
     fn hard_link(&self, src: &Path, dst: &Path) -> io::Result<()> {
         let _ = (src, dst);
         Err(io::Error::new(

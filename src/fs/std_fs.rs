@@ -279,23 +279,15 @@ impl Fs for StdFs {
     }
 
     fn hard_link(&self, src: &Path, dst: &Path) -> io::Result<()> {
-        match std::fs::hard_link(src, dst) {
-            Ok(()) => Ok(()),
-            Err(e) if is_cross_device(&e) => {
-                // `debug!`, not `warn!`: a tier-misconfigured checkpoint
-                // can hit this path once per SST + once per blob (potentially
-                // thousands of times). The checkpoint driver is responsible
-                // for emitting a single summary warning if the fallback rate
-                // is excessive; per-file noise here would drown real logs.
-                log::debug!(
-                    "hard_link({}, {}) crossed filesystems — falling back to copy",
-                    src.display(),
-                    dst.display(),
-                );
-                copy_fallback(src, dst)
-            }
-            Err(e) => Err(e),
-        }
+        // Pure hard link. On a cross-device target this returns the EXDEV
+        // error instead of silently byte-copying: the copy belongs to the
+        // caller that actually wants a cross-filesystem copy
+        // (checkpoint's `link_or_copy_cross_fs`), which detects the
+        // cross-device error via `is_cross_device` and runs its own
+        // SyncMode-aware streamed copy. Keeping the copy in one place means
+        // the copied file's durability honors `Config::sync_mode` instead
+        // of always paying `F_FULLFSYNC` here.
+        std::fs::hard_link(src, dst)
     }
 
     fn backend_id(&self) -> Option<u64> {
@@ -324,7 +316,17 @@ pub const KERNEL_BACKEND_ID: u64 = 0x4b45_524e_454c_5f46; // "KERNEL_F"
 /// misconfigurations. Operators hitting that edge case on Windows can
 /// fix it explicitly (move the target volume, adjust ACLs); the
 /// fall-back is opt-out by design.
-fn is_cross_device(err: &io::Error) -> bool {
+// `pub(crate)`, surfaced crate-wide via the `pub(crate) use` re-export in
+// `fs/mod.rs` so `checkpoint::link_or_copy_cross_fs` can detect cross-device
+// errors. The crate-scoped visibility (not `pub`) keeps this off any public
+// surface even if `std_fs` is ever exported. clippy's `redundant_pub_crate`
+// fires only because the enclosing module is currently private; the re-export
+// genuinely needs crate visibility, so the lint is a false positive here.
+#[expect(
+    clippy::redundant_pub_crate,
+    reason = "re-exported crate-wide via fs::mod; pub(crate) communicates the intended scope"
+)]
+pub(crate) fn is_cross_device(err: &io::Error) -> bool {
     #[cfg(unix)]
     {
         // POSIX `EXDEV` ("invalid cross-device link"). The raw value is
@@ -343,56 +345,6 @@ fn is_cross_device(err: &io::Error) -> bool {
         err.kind(),
         io::ErrorKind::CrossesDevices | io::ErrorKind::Unsupported
     )
-}
-
-/// Byte-copy fallback used when [`hard_link`](Fs::hard_link) cannot create
-/// a true link (cross-device or in-memory FS without inode semantics).
-///
-/// Uses `create_new` semantics so an accidental clobber surfaces as
-/// [`io::ErrorKind::AlreadyExists`] — matching real `hard_link` behaviour.
-fn copy_fallback(src: &Path, dst: &Path) -> io::Result<()> {
-    use std::io::{Read, Write};
-
-    // Wrap the copy in an inner closure so any post-`create_new` error
-    // (ENOSPC, EIO, write_all failure, sync_all failure) triggers a
-    // best-effort unlink of the partially-written destination. Without
-    // this, a failed `copy_fallback` leaves a truncated file behind and
-    // the next retry surfaces as `AlreadyExists` — callers would then
-    // see a corrupt file from an operation that already reported error.
-    let res: io::Result<()> = (|| {
-        let mut src_file = File::open(src)?;
-        let mut dst_file = OpenOptions::new().write(true).create_new(true).open(dst)?;
-
-        // Heap-allocated buffer — checkpoint is cold-path I/O, so a
-        // 64 KiB Vec is cheaper than blowing past clippy's stack-array budget.
-        let mut buf = vec![0u8; 64 * 1024].into_boxed_slice();
-        loop {
-            let n = match src_file.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => n,
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                Err(e) => return Err(e),
-            };
-            #[expect(
-                clippy::indexing_slicing,
-                reason = "n was just produced by read() and bounded by buf.len()"
-            )]
-            dst_file.write_all(&buf[..n])?;
-        }
-        // Full-durability sync: `hard_link` has no `SyncMode` parameter, so
-        // this cross-device fallback can't honor `Config::sync_mode` and uses
-        // `F_FULLFSYNC` on macOS regardless. Reachable only from cross-device
-        // checkpoint copies; threading `SyncMode` here is tracked in #377.
-        dst_file.sync_all()
-    })();
-
-    if res.is_err() {
-        // Best-effort: if cleanup itself fails (permission denied,
-        // already removed by another process), there's nothing more we
-        // can do — the original error is what the caller needs to see.
-        let _ = std::fs::remove_file(dst);
-    }
-    res
 }
 
 // ---------------------------------------------------------------------------
@@ -1094,25 +1046,6 @@ mod tests {
         Ok(())
     }
 
-    /// Forces the EXDEV fallback by calling [`copy_fallback`] directly.
-    /// A real cross-device scenario needs two mounted filesystems which is
-    /// impractical in unit tests, but the fallback path itself is exercised.
-    #[test]
-    fn copy_fallback_copies_bytes_independently() -> io::Result<()> {
-        let dir = tempfile::tempdir()?;
-        let src = dir.path().join("src");
-        let dst = dir.path().join("dst");
-        std::fs::write(&src, b"payload-for-fallback")?;
-
-        copy_fallback(&src, &dst)?;
-        assert_eq!(std::fs::read(&dst)?, b"payload-for-fallback");
-
-        // Writing to dst must NOT affect src (independent file).
-        std::fs::write(&dst, b"modified")?;
-        assert_eq!(std::fs::read(&src)?, b"payload-for-fallback");
-        Ok(())
-    }
-
     #[test]
     fn is_cross_device_detects_exdev_and_kind_variants() {
         // Synthesise a raw EXDEV error — what Linux/macOS/BSDs return when
@@ -1142,19 +1075,6 @@ mod tests {
         // needs to surface that error verbatim, not silently copy.
         let notfound = io::Error::from(io::ErrorKind::NotFound);
         assert!(!is_cross_device(&notfound));
-    }
-
-    #[test]
-    fn copy_fallback_refuses_to_overwrite() -> io::Result<()> {
-        let dir = tempfile::tempdir()?;
-        let src = dir.path().join("src");
-        let dst = dir.path().join("dst");
-        std::fs::write(&src, b"src")?;
-        std::fs::write(&dst, b"dst")?;
-
-        let err = copy_fallback(&src, &dst).unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
-        Ok(())
     }
 
     #[test]
