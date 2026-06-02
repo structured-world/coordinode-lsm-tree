@@ -364,6 +364,15 @@ pub fn encrypt_block(
             "HeaderByte low nibble is reserved and must be zero on write (spec §4.8)",
         ));
     }
+    // Symmetric to the decrypt path: reject any BlockFlags bit outside the
+    // KNOWN transform mask so this version never PRODUCES a block its own
+    // decrypt would reject as forward-incompatible. `EncryptionContext` fields
+    // are `pub`, so a hand-rolled context could carry reserved bits.
+    if ctx.block_flags & !crate::table::block::header::block_flags::KNOWN != 0 {
+        return Err(crate::Error::Encrypt(
+            "BlockFlags has bits set outside the known transform mask",
+        ));
+    }
 
     // Look up the key for this epoch. Missing epoch on encode is a
     // CALLER configuration bug — the caller owns the chain — so
@@ -810,6 +819,21 @@ mod tests {
         assert!(
             matches!(err, crate::Error::Encrypt(_)),
             "expected Error::Encrypt for empty plaintext, got {err:?}",
+        );
+    }
+
+    #[test]
+    fn encrypt_block_rejects_unknown_block_flags_bit() {
+        // Symmetric to the decrypt-side rejection: encrypt_block must refuse to
+        // PRODUCE a block whose BlockFlags carry a bit outside the KNOWN mask,
+        // so this version never seals something its own decrypt rejects as
+        // forward-incompatible.
+        let mut c = ctx();
+        c.block_flags = 0x10; // reserved bit, outside KNOWN
+        let err = encrypt_block(b"payload", &id(), &c, &chain()).unwrap_err();
+        assert!(
+            matches!(err, crate::Error::Encrypt(_)),
+            "expected Error::Encrypt for unknown BlockFlags bit, got {err:?}",
         );
     }
 
