@@ -850,7 +850,7 @@ impl DataBlock {
             // (no owned Vec<u64> materialization — see `SplitFull`).
             let stored = split.digest(idx).ok_or(crate::Error::InvalidTrailer)?;
             let recomputed = kv_checksum::kv_digest(&item, split.algo)
-                .ok_or(crate::Error::FeatureUnsupported("kv checksum algorithm"))?;
+                .ok_or(crate::Error::FeatureUnsupported("kv-checksum-algorithm"))?;
             if recomputed != stored {
                 return Err(crate::Error::ChecksumMismatch {
                     got: crate::Checksum::from_raw(u128::from(recomputed)),

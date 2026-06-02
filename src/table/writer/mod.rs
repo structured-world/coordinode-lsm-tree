@@ -524,9 +524,8 @@ impl Writer {
             // Compute one logical-content digest per entry, in scan order.
             let mut digests = Vec::with_capacity(self.chunk.len());
             for item in &self.chunk {
-                let d = crate::table::block::kv_checksum::kv_digest(item, algo).ok_or(
-                    crate::Error::FeatureUnsupported("kv checksum algorithm not compiled in"),
-                )?;
+                let d = crate::table::block::kv_checksum::kv_digest(item, algo)
+                    .ok_or(crate::Error::FeatureUnsupported("kv-checksum-algorithm"))?;
                 digests.push(d);
             }
             DataBlock::encode_kv_checked_into(
