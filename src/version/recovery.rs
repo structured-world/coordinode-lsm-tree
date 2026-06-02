@@ -1132,6 +1132,7 @@ mod tests {
             fs,
             std::sync::Arc::new(crate::runtime_config::RuntimeConfig::default()),
             None,
+            crate::fs::SyncMode::Normal,
         )
     }
 

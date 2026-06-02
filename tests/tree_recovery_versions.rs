@@ -65,6 +65,7 @@ fn rewrite_manifest_format_version(path: &Path, version: u8) -> lsm_tree::Result
         &lsm_tree::fs::StdFs,
         std::sync::Arc::new(lsm_tree::runtime_config::RuntimeConfig::default()),
         None,
+        lsm_tree::fs::SyncMode::Normal,
     )?;
     for (name, payload) in sections {
         w.start(&name)?;

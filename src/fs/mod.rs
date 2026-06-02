@@ -264,12 +264,48 @@ pub enum FileHint {
     WriteOnce,
 }
 
+/// Durability level for a sync (fsync) operation.
+///
+/// The distinction is only observable on macOS, where Rust's
+/// [`std::fs::File::sync_all`] / [`sync_data`](std::fs::File::sync_data)
+/// both issue `fcntl(F_FULLFSYNC)` — a full hardware barrier that flushes
+/// the drive's write cache to the platters (~4 ms on a modern SSD). On
+/// every other platform `sync_all` is already a plain `fsync` and both
+/// variants behave identically.
+///
+/// [`Self::Normal`] is the default: it matches the durability that
+/// `RocksDB` and `SQLite` give out of the box (plain `fsync`, which on macOS
+/// reaches the drive cache but not necessarily the platters). [`Self::Full`]
+/// opts into `F_FULLFSYNC` on macOS for callers that need power-loss
+/// durability at the cost of a much slower flush.
+//
+// no-std: pure data type — `Copy` enum, no allocator needed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SyncMode {
+    /// Plain `fsync` on every platform. On macOS this does NOT issue
+    /// `F_FULLFSYNC`, so it is dramatically faster but only guarantees the
+    /// data reached the drive's write cache (same as `RocksDB` / `SQLite`
+    /// defaults). The default.
+    #[default]
+    Normal,
+
+    /// Full durability. On macOS this issues `fcntl(F_FULLFSYNC)` so the
+    /// data survives power loss; elsewhere it is identical to
+    /// [`Self::Normal`]. Slower — opt in only when the workload needs
+    /// power-loss durability without an external journal.
+    Full,
+}
+
 /// Filesystem operations on an open file handle.
 ///
 /// Extends [`Read`] + [`Write`] + [`Seek`] with persistence and
 /// metadata operations needed by the storage engine.
 pub trait FsFile: Read + Write + Seek + Send + Sync {
     /// Flushes all OS-internal buffers and metadata to durable storage.
+    ///
+    /// Equivalent to [`sync_all_with`](Self::sync_all_with) with
+    /// [`SyncMode::Full`] — the strongest durability the platform offers
+    /// (`F_FULLFSYNC` on macOS).
     ///
     /// # Errors
     ///
@@ -278,10 +314,41 @@ pub trait FsFile: Read + Write + Seek + Send + Sync {
 
     /// Flushes file data (but not necessarily metadata) to durable storage.
     ///
+    /// Equivalent to [`sync_data_with`](Self::sync_data_with) with
+    /// [`SyncMode::Full`].
+    ///
     /// # Errors
     ///
     /// Returns an I/O error if the sync operation fails.
     fn sync_data(&self) -> io::Result<()>;
+
+    /// Flushes all buffers and metadata at the requested durability
+    /// [`SyncMode`].
+    ///
+    /// The default implementation ignores `mode` and delegates to
+    /// [`sync_all`](Self::sync_all) (full durability); backends where the
+    /// mode is observable (the std `File` backend on macOS) override this.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if the sync operation fails.
+    fn sync_all_with(&self, mode: SyncMode) -> io::Result<()> {
+        let _ = mode;
+        self.sync_all()
+    }
+
+    /// Flushes file data at the requested durability [`SyncMode`].
+    ///
+    /// The default implementation ignores `mode` and delegates to
+    /// [`sync_data`](Self::sync_data).
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if the sync operation fails.
+    fn sync_data_with(&self, mode: SyncMode) -> io::Result<()> {
+        let _ = mode;
+        self.sync_data()
+    }
 
     /// Returns metadata for this open file handle.
     ///
@@ -476,6 +543,21 @@ pub trait Fs: Send + Sync + 'static {
     ///
     /// Returns an I/O error if the sync operation fails.
     fn sync_directory(&self, path: &Path) -> io::Result<()>;
+
+    /// Ensures directory metadata is persisted at the requested durability
+    /// [`SyncMode`].
+    ///
+    /// The default implementation ignores `mode` and delegates to
+    /// [`sync_directory`](Self::sync_directory); backends where the mode is
+    /// observable (the std backend on macOS) override this.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if the sync operation fails.
+    fn sync_directory_with(&self, path: &Path, mode: SyncMode) -> io::Result<()> {
+        let _ = mode;
+        self.sync_directory(path)
+    }
 
     /// Returns `Ok(true)` if a file or directory exists at `path`.
     ///

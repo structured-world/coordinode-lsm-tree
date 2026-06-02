@@ -125,6 +125,7 @@ impl<'a> Ingestion<'a> {
         writer = writer.use_prefix_extractor(tree.config.prefix_extractor.clone());
         writer = writer.use_encryption(tree.config.encryption.clone());
         writer = writer.use_page_ecc(tree.config.page_ecc);
+        writer = writer.use_sync_mode(tree.config.sync_mode);
 
         // One runtime-config snapshot for the whole ingestion writer setup, so
         // a concurrent `update_runtime_config` can't leave the ingested SST

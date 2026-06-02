@@ -27,7 +27,7 @@
 use crate::{
     AbstractTree, CheckpointInfo,
     file::{BLOBS_FOLDER, CURRENT_VERSION_FILE, TABLES_FOLDER, fsync_directory},
-    fs::{Fs, FsFile, FsOpenOptions},
+    fs::{Fs, FsFile, FsOpenOptions, SyncMode},
     version::Version,
     vlog::BlobFile,
 };
@@ -154,6 +154,7 @@ pub fn link_or_copy_cross_fs(
     src: &Path,
     dst_fs: &Arc<dyn Fs>,
     dst: &Path,
+    sync_mode: SyncMode,
 ) -> std::io::Result<u64> {
     // Refuse to attempt `hard_link` unless both backends positively
     // assert (via `Fs::backend_id`) that they resolve paths against
@@ -259,7 +260,7 @@ pub fn link_or_copy_cross_fs(
             total = total.saturating_add(n as u64);
         }
         dst_file.flush()?;
-        FsFile::sync_all(&*dst_file)?;
+        FsFile::sync_all_with(&*dst_file, sync_mode)?;
         Ok(total)
     })();
 
@@ -284,6 +285,7 @@ pub fn link_tables(
     version: &Version,
     target_root: &Path,
     target_fs: &Arc<dyn Fs>,
+    sync_mode: SyncMode,
 ) -> crate::Result<(usize, u64)> {
     let tables_dir = target_root.join(TABLES_FOLDER);
     let mut count = 0usize;
@@ -295,7 +297,7 @@ pub fn link_tables(
         // Source Fs may differ from `target_fs` when `level_routes` points
         // a hot tier at one backend (e.g. tmpfs) and the rest of the tree
         // at another. `link_or_copy_cross_fs` picks the right strategy.
-        let written = link_or_copy_cross_fs(&table.fs, &table.path, target_fs, &dst)
+        let written = link_or_copy_cross_fs(&table.fs, &table.path, target_fs, &dst, sync_mode)
             .map_err(crate::Error::from)?;
         bytes = bytes.saturating_add(written);
         count = count.saturating_add(1);
@@ -312,6 +314,7 @@ pub fn link_blob_files(
     blob_files: impl IntoIterator<Item = BlobFile>,
     target_root: &Path,
     target_fs: &Arc<dyn Fs>,
+    sync_mode: SyncMode,
 ) -> crate::Result<(usize, u64)> {
     let blobs_dir = target_root.join(BLOBS_FOLDER);
     let mut count = 0usize;
@@ -319,7 +322,7 @@ pub fn link_blob_files(
 
     for blob in blob_files {
         let dst = blobs_dir.join(blob_link_name(blob.id()));
-        let written = link_or_copy_cross_fs(&blob.0.fs, &blob.0.path, target_fs, &dst)
+        let written = link_or_copy_cross_fs(&blob.0.fs, &blob.0.path, target_fs, &dst, sync_mode)
             .map_err(crate::Error::from)?;
         bytes = bytes.saturating_add(written);
         count = count.saturating_add(1);
@@ -343,6 +346,7 @@ fn copy_metadata_file_optional(
     target_fs: &dyn Fs,
     target_root: &Path,
     file_name: &str,
+    sync_mode: SyncMode,
 ) -> crate::Result<()> {
     let src = src_root.join(file_name);
     let mut src_file = match src_fs.open(&src, &FsOpenOptions::new().read(true)) {
@@ -355,7 +359,7 @@ fn copy_metadata_file_optional(
 
     std::io::copy(&mut src_file, &mut dst_file)?;
     dst_file.flush()?;
-    FsFile::sync_all(&*dst_file)?;
+    FsFile::sync_all_with(&*dst_file, sync_mode)?;
     Ok(())
 }
 
@@ -387,6 +391,7 @@ fn write_current_for_version(
     version_id: u64,
     runtime: Arc<crate::runtime_config::RuntimeConfig>,
     encryption: Option<Arc<dyn crate::encryption::EncryptionProvider>>,
+    sync_mode: SyncMode,
 ) -> crate::Result<()> {
     use crate::checksum::ChecksumType;
     use crate::file::rewrite_atomic;
@@ -415,7 +420,12 @@ fn write_current_for_version(
     content.write_u128::<LittleEndian>(checksum)?;
     content.write_u8(u8::from(ChecksumType::Xxh3))?;
 
-    rewrite_atomic(&target_root.join(CURRENT_VERSION_FILE), &content, target_fs)?;
+    rewrite_atomic(
+        &target_root.join(CURRENT_VERSION_FILE),
+        &content,
+        target_fs,
+        sync_mode,
+    )?;
     Ok(())
 }
 
@@ -452,11 +462,19 @@ pub fn copy_metadata(
     comparator_name: &str,
     runtime: std::sync::Arc<crate::runtime_config::RuntimeConfig>,
     encryption: Option<std::sync::Arc<dyn crate::encryption::EncryptionProvider>>,
+    sync_mode: SyncMode,
 ) -> crate::Result<()> {
     // Manifest stores level count + comparator name. On a never-written
     // tree the manifest may legitimately be absent (recovery treats
     // missing manifest as a freshly-initialised tree), so this is optional.
-    copy_metadata_file_optional(src_fs, src_root, target_fs, target_root, "manifest")?;
+    copy_metadata_file_optional(
+        src_fs,
+        src_root,
+        target_fs,
+        target_root,
+        "manifest",
+        sync_mode,
+    )?;
     // Re-serialise the captured Version into target/v<id> rather than
     // copying the source file. Reason: SuperVersions::maintenance can
     // physically remove the source v<id> between current_version() and
@@ -479,6 +497,7 @@ pub fn copy_metadata(
         target_fs,
         Arc::clone(&runtime),
         encryption.clone(),
+        sync_mode,
     )?;
     // CURRENT pointer is generated fresh for the captured `version_id`
     // (NOT copied from source) so a concurrent publish to `v<N+1>` on
@@ -495,7 +514,14 @@ pub fn copy_metadata(
     // `persist_version` above used — the helper reopens the manifest
     // via `ManifestArchiveReader`, and an encrypted manifest reopened
     // without its provider would fail to decode the footer Block.
-    write_current_for_version(target_fs, target_root, version.id(), runtime, encryption)?;
+    write_current_for_version(
+        target_fs,
+        target_root,
+        version.id(),
+        runtime,
+        encryption,
+        sync_mode,
+    )?;
     Ok(())
 }
 
@@ -651,10 +677,18 @@ pub fn run_checkpoint<T: AbstractTree>(
 
     let version = tree.current_version();
 
-    let (sst_files, sst_bytes) = link_tables(&version, target_root, target_fs)?;
+    // Checkpoint fsyncs follow the source tree's configured durability.
+    let sync_mode = tree.tree_config().sync_mode;
+
+    let (sst_files, sst_bytes) = link_tables(&version, target_root, target_fs, sync_mode)?;
 
     let (blob_files, blob_bytes) = if include_blobs {
-        link_blob_files(version.blob_files.iter().cloned(), target_root, target_fs)?
+        link_blob_files(
+            version.blob_files.iter().cloned(),
+            target_root,
+            target_fs,
+            sync_mode,
+        )?
     } else {
         (0, 0)
     };
@@ -668,6 +702,7 @@ pub fn run_checkpoint<T: AbstractTree>(
         tree.tree_config().comparator.name(),
         Arc::clone(&params.runtime_config),
         params.encryption.clone(),
+        sync_mode,
     )?;
 
     // fsync each populated child directory BEFORE the root so the
@@ -675,12 +710,12 @@ pub fn run_checkpoint<T: AbstractTree>(
     // `current`, `manifest`, `v<id>`) survive a power loss. The root
     // fsync alone only persists the existence of `tables/` and
     // `blobs/`, not their contents.
-    fsync_directory(&target_root.join(TABLES_FOLDER), &**target_fs)?;
+    fsync_directory(&target_root.join(TABLES_FOLDER), &**target_fs, sync_mode)?;
     if include_blobs {
-        fsync_directory(&target_root.join(BLOBS_FOLDER), &**target_fs)?;
+        fsync_directory(&target_root.join(BLOBS_FOLDER), &**target_fs, sync_mode)?;
     }
 
-    fsync_directory(target_root, &**target_fs)?;
+    fsync_directory(target_root, &**target_fs, sync_mode)?;
 
     // Finally, fsync the directory that CONTAINS `target_root` so the
     // checkpoint's own directory entry survives a power loss even
@@ -698,7 +733,7 @@ pub fn run_checkpoint<T: AbstractTree>(
     if let Some(parent) = target_root.parent()
         && !parent.as_os_str().is_empty()
     {
-        fsync_directory(parent, &**target_fs)?;
+        fsync_directory(parent, &**target_fs, sync_mode)?;
     }
 
     cleanup.commit();
@@ -737,7 +772,7 @@ mod tests {
         mem_fs.create_dir_all(Path::new("/dst")).unwrap();
 
         let dst = Path::new("/dst/payload.bin");
-        let bytes = link_or_copy_cross_fs(&std_fs, &src, &mem_fs, dst).unwrap();
+        let bytes = link_or_copy_cross_fs(&std_fs, &src, &mem_fs, dst, SyncMode::Normal).unwrap();
         assert_eq!(bytes, b"cross-fs-payload".len() as u64);
 
         // Bytes landed in MemFs.

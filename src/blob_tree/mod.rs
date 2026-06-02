@@ -166,7 +166,7 @@ impl BlobTree {
 
         let blobs_folder = index.config.path.join(BLOBS_FOLDER);
         (*index.config.fs).create_dir_all(&blobs_folder)?;
-        fsync_directory(&blobs_folder, &*index.config.fs)?;
+        fsync_directory(&blobs_folder, &*index.config.fs, index.config.sync_mode)?;
 
         let blob_file_id_to_continue_with = index
             .current_version()

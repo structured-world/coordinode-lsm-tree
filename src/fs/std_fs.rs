@@ -2,10 +2,35 @@
 // Copyright (c) 2024-present, fjall-rs
 // Copyright (c) 2026-present, Structured World Foundation
 
-use super::{FileHint, Fs, FsDirEntry, FsFile, FsMetadata, FsOpenOptions};
+use super::{FileHint, Fs, FsDirEntry, FsFile, FsMetadata, FsOpenOptions, SyncMode};
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::path::Path;
+
+/// Plain `fsync` (no `F_FULLFSYNC`) for [`SyncMode::Normal`].
+///
+/// On macOS, `File::sync_all` issues `fcntl(F_FULLFSYNC)` (a full hardware
+/// barrier, ~50× slower than `fsync`). `Normal` mode wants the cheaper plain
+/// `fsync` — which std does not expose on macOS — so call it directly via
+/// `libc`. On every other platform `File::sync_all` IS plain `fsync`, so just
+/// delegate.
+#[cfg(target_os = "macos")]
+fn normal_fsync(file: &File) -> io::Result<()> {
+    use std::os::unix::io::AsRawFd;
+    // SAFETY: `fd` is a valid open descriptor for the lifetime of `file`.
+    let rc = unsafe { libc::fsync(file.as_raw_fd()) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn normal_fsync(file: &File) -> io::Result<()> {
+    // No `F_FULLFSYNC` distinction off macOS — `sync_all` is plain `fsync`.
+    File::sync_all(file)
+}
 
 /// Default [`Fs`] implementation backed by [`std::fs`].
 ///
@@ -26,6 +51,25 @@ impl FsFile for File {
 
     fn sync_data(&self) -> io::Result<()> {
         Self::sync_data(self)
+    }
+
+    fn sync_all_with(&self, mode: SyncMode) -> io::Result<()> {
+        match mode {
+            // `File::sync_all` is `fcntl(F_FULLFSYNC)` on macOS.
+            SyncMode::Full => Self::sync_all(self),
+            SyncMode::Normal => normal_fsync(self),
+        }
+    }
+
+    fn sync_data_with(&self, mode: SyncMode) -> io::Result<()> {
+        match mode {
+            SyncMode::Full => Self::sync_data(self),
+            // Normal data-sync collapses to plain `fsync`: on macOS
+            // `sync_data` is also `F_FULLFSYNC`, and a plain `fsync` already
+            // covers the data, so there is no cheaper data-only barrier to
+            // issue.
+            SyncMode::Normal => normal_fsync(self),
+        }
     }
 
     fn metadata(&self) -> io::Result<FsMetadata> {
@@ -202,6 +246,30 @@ impl Fs for StdFs {
         #[cfg(target_os = "windows")]
         {
             let _ = path;
+            Ok(())
+        }
+    }
+
+    fn sync_directory_with(&self, path: &Path, mode: SyncMode) -> io::Result<()> {
+        #[cfg(not(target_os = "windows"))]
+        {
+            let dir = File::open(path)?;
+            if !dir.metadata()?.is_dir() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "sync_directory: path is not a directory",
+                ));
+            }
+            match mode {
+                SyncMode::Full => dir.sync_all(),
+                SyncMode::Normal => normal_fsync(&dir),
+            }
+        }
+
+        // Windows cannot fsync directories — no-op.
+        #[cfg(target_os = "windows")]
+        {
+            let _ = (path, mode);
             Ok(())
         }
     }
@@ -626,6 +694,31 @@ mod tests {
         file.read_to_string(&mut buf)?;
         assert_eq!(buf, "hello world");
 
+        Ok(())
+    }
+
+    #[test]
+    fn std_fs_sync_with_both_modes_persists() -> io::Result<()> {
+        // Both durability modes must succeed and leave the bytes readable.
+        // On macOS this exercises the plain-`fsync` (Normal) and
+        // `F_FULLFSYNC` (Full) branches; elsewhere both are plain `fsync`.
+        let dir = tempfile::tempdir()?;
+        let fs = StdFs;
+        for (name, mode) in [("normal", SyncMode::Normal), ("full", SyncMode::Full)] {
+            let path = dir.path().join(name);
+            let mut file = fs.open(&path, &FsOpenOptions::new().write(true).create(true))?;
+            file.write_all(b"durable")?;
+            file.sync_data_with(mode)?;
+            file.sync_all_with(mode)?;
+            drop(file);
+            // Directory sync at both modes must also succeed.
+            fs.sync_directory_with(dir.path(), mode)?;
+
+            let mut file = fs.open(&path, &FsOpenOptions::new().read(true))?;
+            let mut buf = String::new();
+            file.read_to_string(&mut buf)?;
+            assert_eq!(buf, "durable", "{name} mode lost data");
+        }
         Ok(())
     }
 

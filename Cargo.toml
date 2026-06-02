@@ -186,6 +186,11 @@ reed-solomon-simd = { version = "3", optional = true, default-features = false }
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = { version = "0.7", optional = true }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+# Plain `fsync` for SyncMode::Normal — std's `File::sync_all` issues the much
+# slower `fcntl(F_FULLFSYNC)` on macOS, which we only want under SyncMode::Full.
+libc = "0.2"
+
 [dev-dependencies]
 criterion = { version = "0.8.0", features = ["html_reports"] }
 fs_extra = "1.3.0"

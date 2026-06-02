@@ -12,7 +12,7 @@ use crate::{
     checksum::{ChecksumType, ChecksummedWriter},
     coding::Encode,
     encryption::EncryptionProvider,
-    fs::{Fs, FsFile, FsOpenOptions},
+    fs::{Fs, FsFile, FsOpenOptions, SyncMode},
     prefix::PrefixExtractor,
     range_tombstone::RangeTombstone,
     table::{
@@ -118,6 +118,11 @@ pub struct Writer {
     /// is added.
     page_ecc: bool,
 
+    /// Durability level for the SST file + folder fsync at finish. Default
+    /// [`SyncMode::Normal`]; caller wires `Config::sync_mode` via
+    /// [`Self::use_sync_mode`].
+    sync_mode: SyncMode,
+
     /// Per-KV checksum policy + algorithm for data blocks. `None` (default)
     /// means no per-KV checksums: data blocks carry no per-KV footer, with
     /// the `KV_CHECKSUM_FOOTER` header flag clear.
@@ -216,6 +221,7 @@ impl Writer {
             encryption: None,
 
             page_ecc: false,
+            sync_mode: SyncMode::Normal,
 
             kv_checksum: None,
             use_seqno_in_index: false,
@@ -386,6 +392,14 @@ impl Writer {
         self.page_ecc = page_ecc;
         self.index_writer = self.index_writer.use_page_ecc(page_ecc);
         self.filter_writer = self.filter_writer.use_page_ecc(page_ecc);
+        self
+    }
+
+    /// Wires the tree's `Config::sync_mode` into this writer's final SST +
+    /// folder fsync.
+    #[must_use]
+    pub fn use_sync_mode(mut self, sync_mode: SyncMode) -> Self {
+        self.sync_mode = sync_mode;
         self
     }
 
@@ -1029,7 +1043,7 @@ impl Writer {
         // Write fixed-size trailer
         // and flush & fsync the table file
         let mut checksum = self.file_writer.into_inner()?;
-        FsFile::sync_all(&**checksum.inner_mut().get_mut())?;
+        FsFile::sync_all_with(&**checksum.inner_mut().get_mut(), self.sync_mode)?;
         let checksum = checksum.checksum();
 
         // IMPORTANT: fsync folder on Unix
@@ -1038,7 +1052,11 @@ impl Writer {
             clippy::expect_used,
             reason = "if there's no parent folder, something has gone horribly wrong"
         )]
-        crate::file::fsync_directory(self.path.parent().expect("should have folder"), &*self.fs)?;
+        crate::file::fsync_directory(
+            self.path.parent().expect("should have folder"),
+            &*self.fs,
+            self.sync_mode,
+        )?;
 
         log::debug!(
             "Written {} items in {} blocks into new table file #{}, written {} MiB",

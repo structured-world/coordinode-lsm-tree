@@ -5,7 +5,7 @@
 use crate::{
     MAX_SEQNO, SeqNo, SharedSequenceNumberGenerator,
     comparator::SharedComparator,
-    fs::Fs,
+    fs::{Fs, SyncMode},
     memtable::Memtable,
     tree::sealed::SealedMemtables,
     version::{Version, persist_version},
@@ -33,10 +33,14 @@ pub struct SuperVersions {
 
     /// Stable comparator identity persisted in every version file.
     comparator_name: Arc<str>,
+
+    /// Durability level (`Config::sync_mode`) applied to every manifest /
+    /// version persist this history performs. Immutable for the tree's life.
+    sync_mode: SyncMode,
 }
 
 impl SuperVersions {
-    pub fn new(version: Version, comparator: &SharedComparator) -> Self {
+    pub fn new(version: Version, comparator: &SharedComparator, sync_mode: SyncMode) -> Self {
         let comparator_name: Arc<str> = comparator.name().into();
 
         Self {
@@ -48,6 +52,7 @@ impl SuperVersions {
             }]
             .into(),
             comparator_name,
+            sync_mode,
         }
     }
 
@@ -192,6 +197,7 @@ impl SuperVersions {
             fs,
             runtime,
             encryption,
+            self.sync_mode,
         )?;
         self.append_version(next_version);
 
@@ -267,6 +273,7 @@ mod tests {
         SuperVersions {
             versions: versions.into(),
             comparator_name: "default".into(),
+            sync_mode: SyncMode::Normal,
         }
     }
 
