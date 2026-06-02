@@ -425,6 +425,12 @@ impl Writer {
     /// writer construction. Default `false` (legacy `index_format = 0`).
     #[must_use]
     pub fn use_seqno_in_index(mut self, seqno_in_index: bool) -> Self {
+        // Must be fixed before the first key: `finish()` stamps a single
+        // SST-wide `index_format` from the final flag, while `spill_block`
+        // snapshots it per block — a mid-write toggle would leave mixed
+        // index-entry encodings behind incorrect table metadata. Same
+        // contract as `use_page_ecc` / `use_kv_checksums`.
+        self.assert_not_started("use_seqno_in_index");
         self.use_seqno_in_index = seqno_in_index;
         self
     }

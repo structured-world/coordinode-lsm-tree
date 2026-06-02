@@ -257,6 +257,13 @@ impl Decodable<IndexBlockParsedItem> for KeyedBlockHandle {
         let seqno_bounds = if has_bounds {
             let seqno_min = reader.read_u64_varint().ok()?;
             let seqno_max = reader.read_u64_varint().ok()?;
+            // Reject inverted bounds: a forged `seqno_max < seqno_min` would
+            // let a seqno-scoped scan skip a block that still holds visible
+            // entries, silently returning incomplete results. Surface it as a
+            // decode failure instead of propagating bogus bounds.
+            if seqno_min > seqno_max {
+                return None;
+            }
             Some((seqno_min, seqno_max))
         } else {
             None
@@ -370,6 +377,11 @@ impl Decodable<IndexBlockParsedItem> for KeyedBlockHandle {
         let seqno_bounds = if has_bounds {
             let seqno_min = reader.read_u64_varint().ok()?;
             let seqno_max = reader.read_u64_varint().ok()?;
+            // Reject inverted bounds (see `parse_full`): a forged
+            // `seqno_max < seqno_min` could drive an incorrect block-skip.
+            if seqno_min > seqno_max {
+                return None;
+            }
             Some((seqno_min, seqno_max))
         } else {
             None
@@ -670,6 +682,65 @@ mod tests {
         assert_eq!(
             bytes.get(parsed.end_key.0..parsed.end_key.1).unwrap(),
             b"abcdef"
+        );
+    }
+
+    #[test]
+    fn full_entry_with_inverted_seqno_bounds_is_rejected() {
+        // A forged entry whose seqno_min > seqno_max must fail to decode, not
+        // propagate bounds that could drive an incorrect seqno block-skip
+        // (skipping a block that still holds visible entries).
+        let handle = KeyedBlockHandle::new(
+            b"abcdef".to_vec().into(),
+            7,
+            BlockHandle::new(BlockOffset(0), 1),
+        )
+        .with_seqno_bounds(9, 3); // inverted: min > max
+        let mut bytes = Vec::new();
+        let mut state = BlockOffset(0);
+        handle.encode_full_into(&mut bytes, &mut state).unwrap();
+        assert_eq!(bytes.first().copied(), Some(2));
+
+        let mut cursor = Cursor::new(bytes.as_slice());
+        let parsed = <KeyedBlockHandle as Decodable<IndexBlockParsedItem>>::parse_full(
+            &mut cursor,
+            0,
+            bytes.len(),
+        );
+        assert!(
+            parsed.is_none(),
+            "inverted seqno bounds (min > max) must be rejected on decode",
+        );
+    }
+
+    #[test]
+    fn truncated_entry_with_inverted_seqno_bounds_is_rejected() {
+        let handle = KeyedBlockHandle::new(
+            b"abcdef".to_vec().into(),
+            7,
+            BlockHandle::new(BlockOffset(0), 1),
+        )
+        .with_seqno_bounds(9, 3); // inverted: min > max
+        let mut bytes = Vec::new();
+        let mut state = BlockOffset(0);
+        handle
+            .encode_truncated_into(&mut bytes, &mut state, 2)
+            .unwrap();
+        assert_eq!(bytes.first().copied(), Some(3));
+
+        let offset = 16;
+        let entries_end = offset + bytes.len();
+        let mut cursor = Cursor::new(bytes.as_slice());
+        let parsed = <KeyedBlockHandle as Decodable<IndexBlockParsedItem>>::parse_truncated(
+            &mut cursor,
+            offset,
+            12,
+            16,
+            entries_end,
+        );
+        assert!(
+            parsed.is_none(),
+            "inverted seqno bounds (min > max) must be rejected on decode",
         );
     }
 

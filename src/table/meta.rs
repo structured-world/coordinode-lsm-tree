@@ -343,6 +343,13 @@ impl ParsedMeta {
                 let mut bytes = &item.value[..];
                 bytes.read_u8()
             })?;
+        // Only `0` (legacy) and `1` (per-block seqno bounds) are defined in
+        // this format slice. Reject any other byte as corrupt / forward-
+        // incompatible metadata rather than letting a bogus on-disk format
+        // flow downstream to the index decoder.
+        if index_format > 1 {
+            return Err(crate::Error::InvalidHeader("TableMeta"));
+        }
 
         Ok(Self {
             id,
@@ -519,6 +526,24 @@ mod tests {
         items.sort_by(|a, b| a.key.user_key.cmp(&b.key.user_key));
         let meta = load_meta_from_items(&items).unwrap();
         assert_eq!(meta.index_format, 1);
+    }
+
+    #[test]
+    fn index_format_unknown_byte_is_rejected() {
+        // Only 0 and 1 are defined in this format slice; a present-but-unknown
+        // byte (e.g. corrupt metadata, or a forward-incompatible writer) must
+        // fail fast as InvalidHeader rather than flowing downstream as a bogus
+        // on-disk index format.
+        for bad in [2u8, 255u8] {
+            let mut items = valid_meta_items();
+            items.push(meta("index_format", &[bad]));
+            items.sort_by(|a, b| a.key.user_key.cmp(&b.key.user_key));
+            let result = load_meta_from_items(&items);
+            assert!(
+                matches!(result, Err(crate::Error::InvalidHeader("TableMeta"))),
+                "index_format = {bad} must be rejected, got {result:?}",
+            );
+        }
     }
 
     /// Missing `table_version` must return `Err(InvalidHeader)`, not panic.
