@@ -58,7 +58,10 @@ jobs:
     # self-hosted runners (if added later) without the label
     # won't pick the job up.
     runs-on: [self-hosted, gpu-private-systems]
-    timeout-minutes: 30
+    # 60 (was 30): absorbs the compare-rocksdb head-to-head pass added
+    # below (bounded criterion settings, but the zstd22/10k write points
+    # are seconds each) plus the first-run librocksdb-sys C++ compile.
+    timeout-minutes: 60
     steps:
       # v6 requires runner ≥2.327.1 (node24 runtime) — the self-hosted
       # runner has a current runner agent that satisfies this.
@@ -133,3 +136,70 @@ jobs:
           # Store data for PRs without pushing (compare only)
           save-data-file: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
           benchmark-data-dir-path: dev/bench
+
+      # Head-to-head RocksDB comparison. Distinct from the db_bench
+      # trend above (single-engine, value-over-commits): this runs the
+      # standalone `tools/compare-rocksdb` criterion harness where every
+      # scenario runs BOTH engines in the same process, so each criterion
+      # group is an ours-vs-rocksdb overlay chart. Because the comparison
+      # is a ratio measured on one host in one run, it stays meaningful
+      # even if this runner's CPU changes between runs.
+      #
+      # Bounded criterion settings keep the heavy zstd22/10k write points
+      # from dominating the timeout: a small sample count with a short
+      # measurement window still yields a stable median for the dashboard
+      # without the default 100-sample sweep (which on a multi-second-per
+      # -iteration point would run for many minutes each).
+      #
+      # Runner requirement: librocksdb-sys builds from source via bindgen,
+      # so the host must have a C/C++ toolchain + libclang. On Linux
+      # bindgen finds the distro libclang.so without env-var help.
+      - name: Run compare-rocksdb head-to-head benches
+        run: |
+          cd tools/compare-rocksdb
+          cargo bench --bench compare -- \
+            --sample-size 10 --warm-up-time 1 --measurement-time 5
+
+      # Publish the criterion HTML report tree (per-group overlay charts)
+      # to gh-pages under dev/compare, alongside the db_bench dashboard at
+      # dev/bench. Manual git push (rather than a third-party publish
+      # action) keeps the workflow's "every `uses:` pinned to a SHA"
+      # hardening policy intact and reuses the same App-scoped token the
+      # benchmark-action step uses. Only publishes on main pushes; PR /
+      # workflow_dispatch runs produce the reports as a job artifact path
+      # but do not mutate gh-pages.
+      - name: Publish compare-rocksdb overlay reports to gh-pages
+        if: >
+          steps.bot-token.outputs.token != '' &&
+          github.event_name == 'push' &&
+          github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ steps.bot-token.outputs.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          src="tools/compare-rocksdb/target/criterion"
+          if [ ! -d "$src/report" ]; then
+            echo "::error::criterion report tree not found at $src/report"
+            exit 1
+          fi
+          work="$(mktemp -d)"
+          git clone --depth 1 --branch gh-pages \
+            "https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git" "$work"
+          # Replace the previous report tree wholesale so deleted /
+          # renamed scenarios don't leave stale pages behind; dev/bench
+          # and every other gh-pages path are untouched.
+          rm -rf "$work/dev/compare"
+          mkdir -p "$work/dev/compare"
+          cp -R "$src/." "$work/dev/compare/"
+          cd "$work"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add dev/compare
+          if git diff --cached --quiet; then
+            echo "::notice::compare-rocksdb reports unchanged — nothing to publish"
+          else
+            git commit -m "bench: refresh compare-rocksdb overlay reports (dev/compare)"
+            git push origin gh-pages
+            echo "::notice::published compare-rocksdb overlays to dev/compare/report/index.html"
+          fi
