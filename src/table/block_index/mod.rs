@@ -70,6 +70,47 @@ impl DoubleEndedIterator for BlockIndexIterImpl {
     }
 }
 
+/// Borrowing point-read iterator over block handles.
+///
+/// Returned by [`BlockIndexImpl::point_read_reader`]. For the common
+/// fully-pinned [`FullBlockIndex`] it borrows the index block (no per-lookup
+/// `Arc`/`Bytes` clone) and reuses the trailer metadata parsed at table
+/// open (no per-lookup trailer parse). The volatile / two-level variants
+/// keep the owned [`BlockIndexIterImpl`] path.
+pub enum PointReadIterImpl<'a> {
+    Full(self::full::PointReadIter<'a>),
+    Owned(BlockIndexIterImpl),
+}
+
+impl Iterator for PointReadIterImpl<'_> {
+    type Item = crate::Result<KeyedBlockHandle>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Full(i) => i.next(),
+            Self::Owned(i) => i.next(),
+        }
+    }
+}
+
+impl BlockIndexImpl {
+    /// Point-read seek that avoids the owned-iterator overhead where
+    /// possible. For [`Self::Full`] it returns a borrowing iterator (no
+    /// block clone, no trailer re-parse); other variants fall back to the
+    /// owned [`BlockIndex::forward_reader`].
+    pub fn point_read_reader(&self, needle: &[u8], seqno: SeqNo) -> Option<PointReadIterImpl<'_>> {
+        match self {
+            Self::Full(index) => index
+                .point_read_reader(needle, seqno)
+                .map(PointReadIterImpl::Full),
+            Self::VolatileFull(_) | Self::TwoLevel(_) => self
+                .forward_reader(needle, seqno)
+                .map(PointReadIterImpl::Owned),
+            Self::Closed => None,
+        }
+    }
+}
+
 /// The block index stores references to the positions of blocks on a file and their size
 ///
 /// __________________

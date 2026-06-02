@@ -16,7 +16,7 @@ use crate::Slice;
 use crate::{
     SeqNo,
     table::{
-        block::{Decoder, ParsedItem},
+        block::{Decoder, DecoderMeta, ParsedItem},
         util::{SliceIndexes, compare_prefixed_slice},
     },
 };
@@ -149,6 +149,33 @@ impl IndexBlock {
     pub fn iter(&self, comparator: crate::comparator::SharedComparator) -> Iter<'_> {
         Iter::new(
             Decoder::<KeyedBlockHandle, IndexBlockParsedItem>::new(&self.inner),
+            comparator,
+        )
+    }
+
+    /// Parses the block trailer once and returns the reusable
+    /// [`DecoderMeta`], so repeated lookups can build decoders via
+    /// [`Self::iter_with_meta`] without re-parsing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error::InvalidTrailer`] / [`crate::Error::InvalidTag`]
+    /// if the block is not a valid index block.
+    pub fn decoder_meta(&self) -> crate::Result<DecoderMeta> {
+        Ok(Decoder::<KeyedBlockHandle, IndexBlockParsedItem>::try_new(&self.inner)?.meta())
+    }
+
+    /// Builds a borrowing iterator from pre-parsed [`DecoderMeta`],
+    /// skipping the per-call trailer parse. `meta` must come from
+    /// [`Self::decoder_meta`] on this same block.
+    #[must_use]
+    pub fn iter_with_meta(
+        &self,
+        comparator: crate::comparator::SharedComparator,
+        meta: DecoderMeta,
+    ) -> Iter<'_> {
+        Iter::new(
+            Decoder::<KeyedBlockHandle, IndexBlockParsedItem>::from_meta(&self.inner, meta),
             comparator,
         )
     }

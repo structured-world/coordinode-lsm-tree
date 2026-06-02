@@ -122,10 +122,98 @@ pub struct Decoder<'a, Item: Decodable<Parsed>, Parsed: ParsedItem<Item>> {
     cached_entries_end: Option<usize>,
 }
 
+/// Pre-parsed block-trailer metadata, extracted once and reused across
+/// many [`Decoder`] constructions over the same block.
+///
+/// All fields are small `Copy` integers read from the fixed trailer plus
+/// the derived `cached_entries_end`. Parsing the trailer (six reads +
+/// validation + `compute_entries_end`) is identical on every call, so a
+/// long-lived index that decodes the same block on every point read
+/// (e.g. [`crate::table::block_index::FullBlockIndex`]) can parse once at
+/// construction and hand this struct to [`Decoder::from_meta`] thereafter,
+/// turning per-lookup trailer parsing into a few field copies.
+#[derive(Clone, Copy, Debug)]
+pub struct DecoderMeta {
+    restart_interval: u8,
+    binary_index_step_size: u8,
+    binary_index_offset: u32,
+    binary_index_len: u32,
+    hash_index_len: u32,
+    hash_index_offset: u32,
+    cached_entries_end: usize,
+}
+
 impl<'a, Item: Decodable<Parsed>, Parsed: ParsedItem<Item>> Decoder<'a, Item, Parsed> {
     #[must_use]
     pub fn restart_interval(&self) -> u8 {
         self.restart_interval
+    }
+
+    /// Extracts the reusable trailer metadata from a fully-constructed
+    /// decoder so future decodes of the same block can skip the trailer
+    /// parse via [`Self::from_meta`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if `cached_entries_end` was never computed, which cannot
+    /// happen for a decoder built by [`Self::try_new`] / [`Self::new`]
+    /// (both populate it before returning).
+    #[must_use]
+    #[expect(
+        clippy::expect_used,
+        reason = "try_new/new always populate cached_entries_end before returning"
+    )]
+    pub fn meta(&self) -> DecoderMeta {
+        DecoderMeta {
+            restart_interval: self.restart_interval,
+            binary_index_step_size: self.binary_index_step_size,
+            binary_index_offset: self.binary_index_offset,
+            binary_index_len: self.binary_index_len,
+            hash_index_len: self.hash_index_len,
+            hash_index_offset: self.hash_index_offset,
+            cached_entries_end: self
+                .cached_entries_end
+                .expect("cached_entries_end populated by constructor"),
+        }
+    }
+
+    /// Builds a decoder from a block plus already-parsed [`DecoderMeta`],
+    /// skipping the trailer read + validation + `compute_entries_end` that
+    /// [`Self::try_new`] performs. The caller guarantees `meta` was
+    /// produced by [`Self::meta`] on a decoder of the SAME block layout
+    /// (same trailer), so no validation is repeated.
+    ///
+    /// This is the parse-once fast path for hot read loops: the owning
+    /// index parses the trailer once and reuses `meta` on every lookup.
+    #[must_use]
+    pub fn from_meta(block: &'a Block, meta: DecoderMeta) -> Self {
+        Self {
+            block,
+            phantom: PhantomData,
+
+            lo_scanner: LoScanner {
+                offset: 0,
+                remaining_in_interval: 0,
+                base_key_offset: None,
+                base_key_end: None,
+            },
+
+            hi_scanner: HiScanner {
+                offset: 0,
+                ptr_idx: usize::try_from(meta.binary_index_len).unwrap_or(usize::MAX),
+                stack: Vec::new(),
+                base_key_offset: None,
+                base_key_end: None,
+            },
+
+            restart_interval: meta.restart_interval,
+            binary_index_step_size: meta.binary_index_step_size,
+            binary_index_offset: meta.binary_index_offset,
+            binary_index_len: meta.binary_index_len,
+            hash_index_len: meta.hash_index_len,
+            hash_index_offset: meta.hash_index_offset,
+            cached_entries_end: Some(meta.cached_entries_end),
+        }
     }
 
     /// Creates a new block decoder, returning an error on malformed trailer
