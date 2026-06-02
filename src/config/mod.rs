@@ -511,6 +511,16 @@ pub struct Config {
     /// `fsync`. Set via [`Config::sync_mode`].
     pub(crate) sync_mode: SyncMode,
 
+    /// Compaction I/O rate limit in bytes per second.
+    ///
+    /// Caps the rate at which the compaction worker is allowed to issue
+    /// I/O, so background compaction cannot saturate the device and starve
+    /// user point reads / range scans (P99 stability). `0` (the default)
+    /// means unlimited — no throttling, no behaviour change. Flush and
+    /// user reads are never throttled, only compaction. Set via
+    /// [`Config::compaction_rate_limit`].
+    pub(crate) compaction_rate_limit: u64,
+
     /// Pre-trained zstd dictionary for dictionary compression.
     ///
     /// When set together with a [`CompressionType::ZstdDict`] compression
@@ -620,6 +630,7 @@ impl Default for Config {
             encryption: None,
             manifest_recovery_mode: ManifestRecoveryMode::AbsoluteConsistency,
             sync_mode: SyncMode::Normal,
+            compaction_rate_limit: 0,
         }
     }
 }
@@ -1320,6 +1331,18 @@ impl Config {
     #[must_use]
     pub fn sync_mode(mut self, mode: SyncMode) -> Self {
         self.sync_mode = mode;
+        self
+    }
+
+    /// Sets the compaction I/O rate limit in bytes per second.
+    ///
+    /// Caps how fast the compaction worker may issue I/O so background
+    /// compaction does not saturate the device and spike user read P99.
+    /// `0` (the default) disables throttling. Only compaction is limited;
+    /// flush and user reads always pass through.
+    #[must_use]
+    pub fn compaction_rate_limit(mut self, bytes_per_sec: u64) -> Self {
+        self.compaction_rate_limit = bytes_per_sec;
         self
     }
 

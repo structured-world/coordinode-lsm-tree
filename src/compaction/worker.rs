@@ -73,6 +73,12 @@ pub struct Options {
     /// AEAD pipeline the data blocks use.
     pub encryption: Option<Arc<dyn crate::encryption::EncryptionProvider>>,
 
+    /// Per-compaction I/O rate limiter. Built from
+    /// [`Config::compaction_rate_limit`]; a limit of `0` makes every
+    /// request immediate (no throttling). Only the compaction merge loop
+    /// calls it, so flush and user reads are never throttled.
+    pub rate_limiter: Arc<crate::rate_limiter::RateLimiter>,
+
     #[cfg(feature = "metrics")]
     pub metrics: Arc<Metrics>,
 }
@@ -94,6 +100,9 @@ impl Options {
             compaction_state: tree.compaction_state.clone(),
             runtime_config: tree.runtime_config.clone(),
             encryption: tree.config.encryption.clone(),
+            rate_limiter: Arc::new(crate::rate_limiter::RateLimiter::new(
+                tree.config.compaction_rate_limit,
+            )),
 
             #[cfg(feature = "metrics")]
             metrics: tree.metrics.clone(),
@@ -571,6 +580,13 @@ fn merge_tables(
 
         for (idx, item) in merge_iter.enumerate() {
             let item = item?;
+
+            // Pace compaction I/O so it cannot saturate the device and
+            // starve user reads. `request` is a no-op (returns immediately)
+            // when `compaction_rate_limit` is 0 (the default), so this adds
+            // only two relaxed atomic loads on the unthrottled hot path.
+            let io_bytes = (item.key.user_key.len() + item.value.len()) as u64;
+            opts.rate_limiter.request(io_bytes);
 
             compactor.write(item)?;
 
