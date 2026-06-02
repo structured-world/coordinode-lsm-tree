@@ -39,13 +39,20 @@
 //! engine-agnostic. Adding a third engine (Pebble, LevelDB,
 //! sled, …) is "add a variant + match arm" — no workload rewrite.
 //!
-//! ## Workload coverage (this initial commit)
+//! ## Workload coverage
 //!
 //! - `write_throughput/{1k,10k}` — bulk insert N keys, 256-byte
-//!   values, random keys.
+//!   values, random keys. Cold-start: each iteration opens an empty
+//!   engine, writes N, flushes. Dominated by the fixed open + flush
+//!   cost at small N.
+//! - `point_read/{1k,10k}` — read N random keys from an engine
+//!   pre-populated with N keys and flushed to disk. Warm: the engine
+//!   is opened + populated + flushed ONCE outside the timed window,
+//!   so the measurement is steady-state read latency (block cache +
+//!   bloom filter + on-disk block fetch), not setup cost.
 //!
-//! Follow-up commits expand to point reads, range scans, mixed
-//! YCSB-A/C, bloom-filter probes per [#244]'s workload list.
+//! Follow-up commits expand to range scans, mixed YCSB-A/C, and
+//! bloom-filter negative probes per [#244]'s workload list.
 
 use std::time::Duration;
 
@@ -246,6 +253,99 @@ fn bench_write_throughput(c: &mut Criterion) {
     group.finish();
 }
 
+/// Workload: point-read every key from an engine pre-populated with
+/// `inputs.keys.len()` keys and flushed to disk.
+///
+/// In contrast to [`run_write_throughput`]'s cold-start measurement,
+/// the engine here is opened, populated and flushed ONCE — outside
+/// the criterion timing window — and kept warm for the whole
+/// benchmark. The timed body issues one `get` per stored key against
+/// that warm, on-disk engine, so the number reflects steady-state
+/// read latency (block cache + bloom filter + block fetch + decode),
+/// not the open / write / flush setup cost.
+///
+/// Keys are read in stored order; because `key_for` spreads keys
+/// quasi-randomly across the keyspace, index-order iteration still
+/// produces a scattered on-disk access pattern (realistic for the
+/// bloom filter and block cache) without a per-iteration shuffle.
+///
+/// Apples-to-apples configuration matches [`run_write_throughput`]:
+/// compression `None` on both sides; RocksDB writes with the WAL
+/// disabled during the (untimed) populate phase. Reads themselves
+/// take no special options on either engine.
+///
+/// Setup failures (open / insert / flush) and read failures panic
+/// with the engine label: a benchmark that can't populate or read
+/// the database has no meaningful Duration to report.
+fn bench_point_read(c: &mut Criterion) {
+    let mut group = c.benchmark_group("point_read");
+    for &n in &[1_000_u64, 10_000_u64] {
+        let inputs = WorkloadInputs::build(n);
+        group.throughput(Throughput::Elements(n));
+        for engine in [Engine::Ours, Engine::RocksDb] {
+            group.bench_with_input(BenchmarkId::new(engine.label(), n), &n, |b, _| {
+                // The temp dir + engine handle outlive every timed
+                // iteration: build the on-disk database once here so
+                // the criterion warmup / measurement loop only ever
+                // pays for reads, never for open / write / flush.
+                let dir = tempfile::tempdir().expect("tempdir");
+                match engine {
+                    Engine::Ours => {
+                        let tree = Config::new(
+                            dir.path(),
+                            SequenceNumberCounter::default(),
+                            SequenceNumberCounter::default(),
+                        )
+                        .open()
+                        .expect("ours: open");
+                        for ((key, value), seqno) in
+                            inputs.keys.iter().zip(inputs.values.iter()).zip(0u64..)
+                        {
+                            tree.insert(key, value, seqno);
+                        }
+                        tree.flush_active_memtable(0).expect("ours: flush");
+                        b.iter_custom(|iters| {
+                            let start = std::time::Instant::now();
+                            for _ in 0..iters {
+                                for key in &inputs.keys {
+                                    // `u64::MAX` (= `SeqNo::MAX`) reads the
+                                    // latest visible version of every key.
+                                    let got = tree.get(key, u64::MAX).expect("ours: get");
+                                    std::hint::black_box(got);
+                                }
+                            }
+                            start.elapsed()
+                        });
+                    }
+                    Engine::RocksDb => {
+                        let mut opts = rocksdb::Options::default();
+                        opts.create_if_missing(true);
+                        opts.set_compression_type(rocksdb::DBCompressionType::None);
+                        let db = rocksdb::DB::open(&opts, dir.path()).expect("rocksdb: open");
+                        let mut write_opts = rocksdb::WriteOptions::default();
+                        write_opts.disable_wal(true);
+                        for (key, value) in inputs.keys.iter().zip(inputs.values.iter()) {
+                            db.put_opt(key, value, &write_opts).expect("rocksdb: put");
+                        }
+                        db.flush().expect("rocksdb: flush");
+                        b.iter_custom(|iters| {
+                            let start = std::time::Instant::now();
+                            for _ in 0..iters {
+                                for key in &inputs.keys {
+                                    let got = db.get(key).expect("rocksdb: get");
+                                    std::hint::black_box(got);
+                                }
+                            }
+                            start.elapsed()
+                        });
+                    }
+                }
+            });
+        }
+    }
+    group.finish();
+}
+
 // P50 / P99 / P999 percentile capture is deferred to a follow-up
 // commit. Criterion's default reporter gives mean + CI only,
 // which hides tail-latency regressions; structured-zstd's
@@ -256,5 +356,5 @@ fn bench_write_throughput(c: &mut Criterion) {
 // commit prioritises wiring up the cross-engine path; the
 // percentile harness lands alongside the dashboard JSON merger.
 
-criterion_group!(benches, bench_write_throughput);
+criterion_group!(benches, bench_write_throughput, bench_point_read);
 criterion_main!(benches);
