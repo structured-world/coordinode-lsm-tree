@@ -199,20 +199,23 @@ pub fn load_block(
 /// every truncated entry pays one call against the restart base key.
 ///
 /// Dispatch:
-/// - **`x86_64` with AVX-512BW** (runtime-detected): 64-byte vectorized lanes via
+/// - **`x86_64` / `x86` with AVX-512BW** (runtime-detected): 64-byte vectorized lanes via
 ///   `_mm512_cmpeq_epi8_mask`. Checked first so AVX-512 hosts use the widest lane.
-/// - **`x86_64` with AVX2** (runtime-detected): 32-byte vectorized lanes via `_mm256_cmpeq_epi8`.
-/// - **`x86_64` without AVX2**: 16-byte SSE2 lanes via `_mm_cmpeq_epi8` — SSE2 is the mandatory
-///   `x86_64` ISA baseline, so this path needs no runtime check, only the AVX2 negative result.
+/// - **`x86_64` / `x86` with AVX2** (runtime-detected): 32-byte vectorized lanes via `_mm256_cmpeq_epi8`.
+/// - **`x86_64` with SSE2**: 16-byte lanes via `_mm_cmpeq_epi8` — SSE2 is the mandatory `x86_64`
+///   ISA baseline, so this path needs no runtime check, only the AVX2 negative result.
+/// - **`x86` (32-bit) with SSE2** (runtime-detected): same 16-byte kernel, but SSE2 is *not*
+///   guaranteed on 32-bit x86 (pre-Pentium-4 lacks it), so it is runtime-detected; pre-SSE2
+///   hosts fall through to the scalar kernel below.
 /// - **`aarch64` little-endian**: 16-byte vectorized lanes via NEON (`ARMv8` baseline — no runtime check).
-/// - **Everything else** (incl. big-endian aarch64, 32-bit x86, riscv, powerpc): 8-byte word
+/// - **Everything else** (incl. big-endian aarch64, pre-SSE2 32-bit x86, riscv, powerpc): 8-byte word
 ///   stride via XOR. First-mismatch position uses `trailing_zeros() / 8` on little-endian
 ///   targets and `leading_zeros() / 8` on big-endian, so the byte ordering of the word matches
 ///   the byte ordering of the source slice on either endianness.
 ///
 /// `is_x86_feature_detected!` caches the CPUID result, so the per-call dispatch
-/// cost is one or two cached atomic loads on `x86_64` (one for AVX-512 hosts, two
-/// for the majority AVX2-only hosts that fail the AVX-512BW check then take AVX2).
+/// cost is one to three cached atomic loads on x86 (one for AVX-512 hosts; more for
+/// narrower hosts that fail the wider checks before taking their lane).
 #[must_use]
 pub fn longest_shared_prefix_length(s1: &[u8], s2: &[u8]) -> usize {
     #[cfg(target_arch = "x86_64")]
@@ -230,6 +233,24 @@ pub fn longest_shared_prefix_length(s1: &[u8], s2: &[u8]) -> usize {
         // attribute on `lsp_sse2` documents this contract explicitly.
         return unsafe { lsp_sse2(s1, s2) };
     }
+    #[cfg(target_arch = "x86")]
+    {
+        if std::is_x86_feature_detected!("avx512bw") {
+            // SAFETY: AVX-512BW availability just verified via runtime CPU feature detection.
+            return unsafe { lsp_avx512(s1, s2) };
+        }
+        if std::is_x86_feature_detected!("avx2") {
+            // SAFETY: AVX2 availability just verified via runtime CPU feature detection.
+            return unsafe { lsp_avx2(s1, s2) };
+        }
+        if std::is_x86_feature_detected!("sse2") {
+            // SAFETY: SSE2 availability just verified via runtime CPU feature detection.
+            // Unlike x86_64, SSE2 is not a guaranteed baseline on 32-bit x86, so the
+            // check is required; pre-SSE2 hosts fall through to the scalar tail below.
+            return unsafe { lsp_sse2(s1, s2) };
+        }
+        // Pre-SSE2 32-bit x86 (i586 and earlier): fall through to the scalar kernel.
+    }
     #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
     {
         // SAFETY: NEON is mandatory in the ARMv8 baseline that `target_arch = "aarch64"` implies.
@@ -240,8 +261,8 @@ pub fn longest_shared_prefix_length(s1: &[u8], s2: &[u8]) -> usize {
     }
     // On x86_64 the SSE2 arm above unconditionally returns, and on LE aarch64 the NEON
     // arm does the same — so the scalar tail is statically unreachable on both. It IS
-    // reachable on every other target (BE aarch64, 32-bit x86, riscv, powerpc, …),
-    // which is the whole point of having a portable fallback.
+    // reachable on 32-bit x86 (pre-SSE2 fall-through) and every other target (BE aarch64,
+    // riscv, powerpc, …), which is the whole point of having a portable fallback.
     #[cfg_attr(
         any(
             target_arch = "x86_64",
@@ -316,11 +337,14 @@ pub(crate) fn lsp_scalar(s1: &[u8], s2: &[u8]) -> usize {
 /// # Safety
 ///
 /// Caller must ensure the host CPU supports AVX2 (`is_x86_feature_detected!("avx2")`).
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
 #[target_feature(enable = "avx2")]
 #[expect(unsafe_code, reason = "intrinsics require unsafe")]
 #[must_use]
 unsafe fn lsp_avx2(s1: &[u8], s2: &[u8]) -> usize {
+    #[cfg(target_arch = "x86")]
+    use std::arch::x86::{__m256i, _mm256_cmpeq_epi8, _mm256_loadu_si256, _mm256_movemask_epi8};
+    #[cfg(target_arch = "x86_64")]
     use std::arch::x86_64::{__m256i, _mm256_cmpeq_epi8, _mm256_loadu_si256, _mm256_movemask_epi8};
 
     let min_len = s1.len().min(s2.len());
@@ -379,7 +403,7 @@ unsafe fn lsp_avx2(s1: &[u8], s2: &[u8]) -> usize {
 /// Caller must ensure the host CPU supports AVX-512BW
 /// (`is_x86_feature_detected!("avx512bw")`). BW implies the F subset, so the
 /// 512-bit load and the byte-granular compare-mask are both available.
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
 // List both ISA features the body relies on: `_mm512_loadu_si512` is AVX-512F,
 // `_mm512_cmpeq_epi8_mask` is AVX-512BW. BW implies F (so `avx512bw` alone would
 // compile), but naming both keeps the gate matching the actual requirements and
@@ -390,6 +414,9 @@ unsafe fn lsp_avx2(s1: &[u8], s2: &[u8]) -> usize {
 #[expect(unsafe_code, reason = "intrinsics require unsafe")]
 #[must_use]
 unsafe fn lsp_avx512(s1: &[u8], s2: &[u8]) -> usize {
+    #[cfg(target_arch = "x86")]
+    use std::arch::x86::{__m512i, _mm512_cmpeq_epi8_mask, _mm512_loadu_si512};
+    #[cfg(target_arch = "x86_64")]
     use std::arch::x86_64::{__m512i, _mm512_cmpeq_epi8_mask, _mm512_loadu_si512};
 
     let min_len = s1.len().min(s2.len());
@@ -435,18 +462,22 @@ unsafe fn lsp_avx512(s1: &[u8], s2: &[u8]) -> usize {
 /// SSE2 implementation — 16 bytes per iteration via `_mm_cmpeq_epi8`.
 ///
 /// Used on `x86_64` hosts that lack AVX2 (older Intel Atoms, some sandboxed
-/// VMs / containers, AMD pre-Excavator, low-power embedded `x86_64`). SSE2 is
-/// mandatory in the `x86_64` ISA baseline, so no runtime detection is needed.
+/// VMs / containers, AMD pre-Excavator, low-power embedded `x86_64`) and on
+/// 32-bit `x86` hosts with SSE2 but without AVX2.
 ///
 /// # Safety
 ///
-/// Caller must be on `target_arch = "x86_64"`. The `#[target_feature(enable = "sse2")]`
-/// attribute is satisfied unconditionally on `x86_64` — every CPU supports SSE2.
-#[cfg(target_arch = "x86_64")]
+/// Caller must ensure the host supports SSE2. On `x86_64` this is the mandatory
+/// ISA baseline (always true); on 32-bit `x86` it must be runtime-detected via
+/// `is_x86_feature_detected!("sse2")` because pre-Pentium-4 CPUs lack it.
+#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
 #[target_feature(enable = "sse2")]
 #[expect(unsafe_code, reason = "intrinsics require unsafe")]
 #[must_use]
 unsafe fn lsp_sse2(s1: &[u8], s2: &[u8]) -> usize {
+    #[cfg(target_arch = "x86")]
+    use std::arch::x86::{__m128i, _mm_cmpeq_epi8, _mm_loadu_si128, _mm_movemask_epi8};
+    #[cfg(target_arch = "x86_64")]
     use std::arch::x86_64::{__m128i, _mm_cmpeq_epi8, _mm_loadu_si128, _mm_movemask_epi8};
 
     let min_len = s1.len().min(s2.len());
@@ -797,12 +828,13 @@ mod tests {
     /// at `mismatch_at == total_len`) and assert the kernel under test agrees
     /// with the byte-by-byte reference, both at full and asymmetric lengths.
     //
-    // cfg-gated to mirror the union of its callers (SSE2/AVX2 on x86_64,
-    // NEON on LE aarch64). On other targets (riscv64, i686, powerpc64,
-    // BE aarch64) no per-kernel test fires, so the helper would trip
-    // dead_code without the cfg.
+    // cfg-gated to mirror the union of its callers (SSE2/AVX2/AVX-512 on x86_64
+    // and 32-bit x86, NEON on LE aarch64). On other targets (riscv64, powerpc64,
+    // BE aarch64) no per-kernel test fires, so the helper would trip dead_code
+    // without the cfg.
     #[cfg(any(
         target_arch = "x86_64",
+        target_arch = "x86",
         all(target_arch = "aarch64", target_endian = "little")
     ))]
     fn assert_kernel_matches_reference<F: Fn(&[u8], &[u8]) -> usize>(label: &str, kernel: F) {
@@ -844,10 +876,16 @@ mod tests {
     /// have AVX2 → the dispatch path never hits `lsp_sse2` and coverage would be
     /// 0% even though all dispatched tests pass. Calling the kernel directly
     /// guarantees the SSE2-path exercise the boundary cases.
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
     #[test]
     fn lsp_sse2_on_boundaries_matches_reference() {
-        // SAFETY: SSE2 is mandatory in the x86_64 ISA baseline.
+        // On x86_64 SSE2 is the mandatory ISA baseline; on 32-bit x86 it is not
+        // guaranteed (pre-Pentium-4 lacks it), so runtime-detect before calling.
+        #[cfg(target_arch = "x86")]
+        if !std::is_x86_feature_detected!("sse2") {
+            return;
+        }
+        // SAFETY: SSE2 is the x86_64 baseline / runtime-verified on x86 above.
         assert_kernel_matches_reference("sse2", |a, b| unsafe { lsp_sse2(a, b) });
     }
 
@@ -855,7 +893,7 @@ mod tests {
     /// Without this, AVX2 lines are only exercised via the dispatched path, which
     /// is fine for coverage on AVX2-capable runners — but the direct test makes
     /// the AVX2 contract explicit (matches reference on every boundary case).
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
     #[test]
     fn lsp_avx2_on_boundaries_matches_reference() {
         if !std::is_x86_feature_detected!("avx2") {
@@ -871,7 +909,7 @@ mod tests {
     /// dropped it; AMD Zen4+ and Intel server keep it), so the dispatched path can't
     /// be relied on to reach `lsp_avx512`. This direct test exercises it whenever the
     /// host supports AVX-512BW and is a no-op otherwise.
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
     #[test]
     fn lsp_avx512_on_boundaries_matches_reference() {
         if !std::is_x86_feature_detected!("avx512bw") {
