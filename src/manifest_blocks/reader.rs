@@ -491,11 +491,30 @@ fn validate_block_header_fits(buf: &[u8], ctx: HeaderContext) -> crate::Result<(
         }
         // Padded slot: the head-mirror reservation is intentionally larger
         // than the footer Block and zero-padded, so a smaller declared size
-        // is expected; only reject an over-read past the buffer.
+        // is expected. Reject an over-read past the buffer AND any non-zero
+        // byte past the declared size: a forged smaller `declared` would let
+        // `Block::from_reader` stop early and silently treat non-zero trailing
+        // bytes (e.g. a stripped ECC trailer copied into the mirror) as
+        // padding. Only genuine zero padding is acceptable here.
         HeaderContext::FooterPadded => {
             if declared > buf_len {
                 return Err(wrap(
                     "manifest Block header declares on-disk size larger than buffer",
+                ));
+            }
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "declared <= buf_len = buf.len(), so it fits usize"
+            )]
+            let declared_usize = declared as usize;
+            if buf
+                .get(declared_usize..)
+                .unwrap_or(&[])
+                .iter()
+                .any(|&b| b != 0)
+            {
+                return Err(wrap(
+                    "manifest head-mirror footer has non-zero bytes past the declared block size",
                 ));
             }
         }
@@ -696,10 +715,24 @@ mod tests {
             validate_block_header_fits(&buf, HeaderContext::FooterExact).is_err(),
             "an understated header in an exact-fit footer slot must be rejected",
         );
-        // The padded head-mirror context tolerates a smaller declared size.
+        // The padded head-mirror context tolerates a smaller declared size
+        // ONLY when the trailing bytes are genuine zero padding. Here the
+        // trailing bytes are non-zero (0xAB, 0xCD), so even the padded context
+        // must reject them — otherwise a forged smaller declared size could
+        // hide non-zero remainder (e.g. a stripped ECC trailer) as "padding".
         assert!(
-            validate_block_header_fits(&buf, HeaderContext::FooterPadded).is_ok(),
-            "padded slot accepts a smaller declared size (trailing pad expected)",
+            validate_block_header_fits(&buf, HeaderContext::FooterPadded).is_err(),
+            "padded slot must reject non-zero bytes past the declared block size",
+        );
+
+        // Same understated header but with genuine zero padding past the
+        // declared block: the padded head-mirror context accepts it.
+        let mut zero_padded = header.encode_into_vec();
+        zero_padded.extend_from_slice(&[0u8; 4]); // declared payload
+        zero_padded.extend_from_slice(&[0u8; 2]); // zero pad beyond the block
+        assert!(
+            validate_block_header_fits(&zero_padded, HeaderContext::FooterPadded).is_ok(),
+            "padded slot accepts a smaller declared size with genuine zero padding",
         );
     }
 
