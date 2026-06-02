@@ -39,18 +39,25 @@
 //! engine-agnostic. Adding a third engine (Pebble, LevelDB,
 //! sled, …) is "add a variant + match arm" — no workload rewrite.
 //!
-//! ## Workload coverage (this initial commit)
+//! ## Workload coverage
 //!
 //! - `write_throughput/{1k,10k}` — bulk insert N keys, 256-byte
-//!   values, random keys.
+//!   values, random keys. Cold-start: each iteration opens an empty
+//!   engine, writes N, flushes. Dominated by the fixed open + flush
+//!   cost at small N.
+//! - `point_read/{1k,10k}` — read N random keys from an engine
+//!   pre-populated with N keys and flushed to disk. Warm: the engine
+//!   is opened + populated + flushed ONCE outside the timed window,
+//!   so the measurement is steady-state read latency (block cache +
+//!   bloom filter + on-disk block fetch), not setup cost.
 //!
-//! Follow-up commits expand to point reads, range scans, mixed
-//! YCSB-A/C, bloom-filter probes per [#244]'s workload list.
+//! Follow-up commits expand to range scans, mixed YCSB-A/C, and
+//! bloom-filter negative probes per [#244]'s workload list.
 
 use std::time::Duration;
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use lsm_tree::{AbstractTree, Config, SequenceNumberCounter};
+use lsm_tree::{AbstractTree, Config, MAX_SEQNO, SequenceNumberCounter};
 
 /// Engine under test. The harness runs each workload once per
 /// variant and emits per-engine timings under the same criterion
@@ -119,6 +126,36 @@ impl WorkloadInputs {
     }
 }
 
+/// RocksDB `Options` configured to match our engine's defaults so the
+/// head-to-head stays apples-to-apples:
+///
+/// - **No compression** — our default `data_block_compression_policy`
+///   writes L0 with `None`.
+/// - **10-bits/key bloom filter** — `Config::default()` gives our engine
+///   `Bloom(BitsPerKey(10.0))`. RocksDB has NO filter policy by default,
+///   so without this it would skip the bloom construction our engine
+///   pays at flush (write side) and the bloom probe per lookup (read
+///   side).
+/// - **16 MiB block cache** — matches our default per-tree cache
+///   capacity, so neither engine gets an unfair cache-size edge.
+///
+/// `create_if_missing` is set here too. WAL handling is per-call
+/// (`WriteOptions::disable_wal`) since it only applies to the write
+/// path.
+fn rocksdb_options() -> rocksdb::Options {
+    let mut block_opts = rocksdb::BlockBasedOptions::default();
+    let cache = rocksdb::Cache::new_lru_cache(16 * 1024 * 1024);
+    block_opts.set_block_cache(&cache);
+    // bits_per_key = 10.0, block_based = false → modern full-block filter,
+    // the closest match to our `BitsPerKey(10.0)` policy.
+    block_opts.set_bloom_filter(10.0, false);
+    let mut opts = rocksdb::Options::default();
+    opts.create_if_missing(true);
+    opts.set_compression_type(rocksdb::DBCompressionType::None);
+    opts.set_block_based_table_factory(&block_opts);
+    opts
+}
+
 /// Workload: bulk-insert `inputs.keys.len()` (key, value) pairs
 /// into a freshly-opened engine. The `Instant::now()` snapshot is
 /// taken BEFORE the engine open and the elapsed capture is taken
@@ -131,10 +168,12 @@ impl WorkloadInputs {
 ///
 /// Apples-to-apples configuration:
 ///
-///   - **Compression: None on both sides.** lsm-tree's default
-///     `data_block_compression_policy` writes L0 with `None`, so
-///     RocksDB is set to `DBCompressionType::None` too. A future
-///     `write_throughput_lz4` variant can flip both.
+///   - **Compression / bloom / cache matched via [`rocksdb_options`].**
+///     None compression on both sides; RocksDB gets the same 10-bits/key
+///     bloom filter and 16 MiB block cache our engine has by default, so
+///     RocksDB also builds a bloom filter at flush (the work our engine
+///     does) instead of skipping it. A future `write_throughput_lz4`
+///     variant can flip compression on both.
 ///
 ///   - **No WAL on either side.** lsm-tree has no WAL —
 ///     durability is the caller's responsibility, and
@@ -184,8 +223,11 @@ fn run_write_throughput(
             start.elapsed()
         }
         Engine::RocksDb => {
-            let mut opts = rocksdb::Options::default();
-            opts.create_if_missing(true);
+            // Bloom (10 bits/key) + 16 MiB cache + no compression, matching
+            // our engine's defaults — see `rocksdb_options`. Our engine
+            // builds a bloom filter at flush, so giving RocksDB the same
+            // keeps the write comparison apples-to-apples.
+            let opts = rocksdb_options();
             // Match our engine's durability shape: lsm-tree has no
             // WAL — durability is the caller's responsibility, and
             // `flush_active_memtable` is the equivalent of an
@@ -194,7 +236,6 @@ fn run_write_throughput(
             // measures the same kind of work (memtable insert +
             // terminal flush) rather than penalising RocksDB for
             // its built-in WAL.
-            opts.set_compression_type(rocksdb::DBCompressionType::None);
             let db = rocksdb::DB::open(&opts, dir.path())?;
             let mut write_opts = rocksdb::WriteOptions::default();
             write_opts.disable_wal(true);
@@ -246,6 +287,136 @@ fn bench_write_throughput(c: &mut Criterion) {
     group.finish();
 }
 
+/// Workload: point-read every key from an engine pre-populated with
+/// `inputs.keys.len()` keys and flushed to disk.
+///
+/// In contrast to [`run_write_throughput`]'s cold-start measurement,
+/// the engine here is opened, populated and flushed ONCE — outside
+/// the criterion timing window — and kept warm for the whole
+/// benchmark. The timed body issues one `get` per stored key, so the
+/// number reflects warm steady-state read latency (lookup path +
+/// bloom filter + block decode), NOT the open / write / flush setup
+/// cost.
+///
+/// Note this is a CACHE-WARM read: the engine stays open across the
+/// criterion warmup and measurement sweeps, so after the first pass
+/// the working set is largely block-cache resident (both engines use
+/// their default cache; lsm-tree's is 16 MiB). The number is "read a
+/// resident key", not "fault a block in from disk" — forcing cold
+/// misses would need per-iteration cache capping/clearing, which a
+/// future `point_read_cold` variant can add.
+///
+/// Keys are read in insertion order (the `inputs.keys` `Vec` order),
+/// which is NOT the on-disk sorted order the engine stores them in
+/// after flush. Because `key_for` spreads keys quasi-randomly across
+/// the keyspace, iterating them in insertion order still produces a
+/// scattered on-disk access pattern (realistic for the bloom filter
+/// and block cache) without a per-iteration shuffle.
+///
+/// Apples-to-apples configuration matches [`run_write_throughput`] via
+/// [`rocksdb_options`]: compression `None`, a matching 10-bits/key bloom
+/// filter, and a 16 MiB block cache on both sides, so the bloom probe and
+/// cache behaviour the latency claim above describes apply to RocksDB too
+/// (not just our engine). RocksDB writes with the WAL disabled during the
+/// (untimed) populate phase. Reads themselves take no special options on
+/// either engine.
+///
+/// Setup failures (open / insert / flush) and read failures panic
+/// with the engine label: a benchmark that can't populate or read
+/// the database has no meaningful Duration to report. The "every key
+/// is present" invariant is checked ONCE before the timed window (so
+/// a broken setup fails loudly) and the timed loop itself stays a
+/// bare `get` + `black_box` with no per-read branch.
+fn bench_point_read(c: &mut Criterion) {
+    let mut group = c.benchmark_group("point_read");
+    for &n in &[1_000_u64, 10_000_u64] {
+        let inputs = WorkloadInputs::build(n);
+        group.throughput(Throughput::Elements(n));
+        for engine in [Engine::Ours, Engine::RocksDb] {
+            group.bench_with_input(BenchmarkId::new(engine.label(), n), &n, |b, _| {
+                // The temp dir + engine handle outlive every timed
+                // iteration: build the on-disk database once here so
+                // the criterion warmup / measurement loop only ever
+                // pays for reads, never for open / write / flush.
+                let dir = tempfile::tempdir().expect("tempdir");
+                match engine {
+                    Engine::Ours => {
+                        let tree = Config::new(
+                            dir.path(),
+                            SequenceNumberCounter::default(),
+                            SequenceNumberCounter::default(),
+                        )
+                        .open()
+                        .expect("ours: open");
+                        for ((key, value), seqno) in
+                            inputs.keys.iter().zip(inputs.values.iter()).zip(0u64..)
+                        {
+                            tree.insert(key, value, seqno);
+                        }
+                        tree.flush_active_memtable(0).expect("ours: flush");
+                        // One-time hit check OUTSIDE the timed window: enforce
+                        // the workload contract ("read every stored key") so a
+                        // setup/flush regression can't silently become a
+                        // miss-read benchmark, without taxing each timed `get`
+                        // with a branch. `MAX_SEQNO` (not `u64::MAX`, whose MSB
+                        // is reserved) reads the latest visible version.
+                        for key in &inputs.keys {
+                            assert!(
+                                tree.get(key, MAX_SEQNO).expect("ours: verify").is_some(),
+                                "ours: key unexpectedly missing"
+                            );
+                        }
+                        b.iter_custom(|iters| {
+                            let start = std::time::Instant::now();
+                            for _ in 0..iters {
+                                for key in &inputs.keys {
+                                    let got = tree.get(key, MAX_SEQNO).expect("ours: get");
+                                    std::hint::black_box(got);
+                                }
+                            }
+                            start.elapsed()
+                        });
+                    }
+                    Engine::RocksDb => {
+                        // Bloom (10 bits/key) + 16 MiB cache + no compression,
+                        // matching our engine's defaults so the per-`get`
+                        // overhead is attributable, not a config artefact —
+                        // see `rocksdb_options`.
+                        let opts = rocksdb_options();
+                        let db = rocksdb::DB::open(&opts, dir.path()).expect("rocksdb: open");
+                        let mut write_opts = rocksdb::WriteOptions::default();
+                        write_opts.disable_wal(true);
+                        for (key, value) in inputs.keys.iter().zip(inputs.values.iter()) {
+                            db.put_opt(key, value, &write_opts).expect("rocksdb: put");
+                        }
+                        db.flush().expect("rocksdb: flush");
+                        // Same one-time, outside-the-timed-window hit check as
+                        // the `ours` arm: enforce "read every stored key"
+                        // without a per-read branch in the measured loop.
+                        for key in &inputs.keys {
+                            assert!(
+                                db.get(key).expect("rocksdb: verify").is_some(),
+                                "rocksdb: key unexpectedly missing"
+                            );
+                        }
+                        b.iter_custom(|iters| {
+                            let start = std::time::Instant::now();
+                            for _ in 0..iters {
+                                for key in &inputs.keys {
+                                    let got = db.get(key).expect("rocksdb: get");
+                                    std::hint::black_box(got);
+                                }
+                            }
+                            start.elapsed()
+                        });
+                    }
+                }
+            });
+        }
+    }
+    group.finish();
+}
+
 // P50 / P99 / P999 percentile capture is deferred to a follow-up
 // commit. Criterion's default reporter gives mean + CI only,
 // which hides tail-latency regressions; structured-zstd's
@@ -256,5 +427,5 @@ fn bench_write_throughput(c: &mut Criterion) {
 // commit prioritises wiring up the cross-engine path; the
 // percentile harness lands alongside the dashboard JSON merger.
 
-criterion_group!(benches, bench_write_throughput);
+criterion_group!(benches, bench_write_throughput, bench_point_read);
 criterion_main!(benches);
