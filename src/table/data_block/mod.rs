@@ -788,7 +788,7 @@ impl DataBlock {
     ///   logical-content digest disagrees with the stored one (corruption of
     ///   the entry bytes or the stored digest).
     pub(crate) fn verify_kv_checked(
-        footer_wrapped: &[u8],
+        footer_wrapped: &Slice,
         header: super::block::Header,
         comparator: crate::comparator::SharedComparator,
         expected_algo: Option<crate::runtime_config::ChecksumAlgorithm>,
@@ -825,16 +825,21 @@ impl DataBlock {
         // matches its bytes (the type gate then passes and no field lies).
         let mut inner_header = header;
         inner_header.block_flags &= !super::block::header::block_flags::KV_CHECKSUM_FOOTER;
+        let inner_len = split.inner.len();
         #[expect(
             clippy::cast_possible_truncation,
             reason = "split.inner is a prefix of the footered payload, which fits u32"
         )]
         {
-            inner_header.uncompressed_length = split.inner.len() as u32;
+            inner_header.uncompressed_length = inner_len as u32;
         }
+        // Zero-copy: the inner payload is a prefix of `footer_wrapped`, so take
+        // a refcounted sub-slice of the caller's owning `Slice` rather than
+        // `Slice::from(&[u8])` (which would copy ~block_size bytes per block on
+        // the scrub path).
         let inner = Self::new(Block {
             header: inner_header,
-            data: Slice::from(split.inner),
+            data: footer_wrapped.slice(..inner_len),
         });
         let inner_data = inner.inner.data.clone();
 
@@ -1345,6 +1350,7 @@ mod tests {
         let mut bytes = Vec::new();
         DataBlock::encode_kv_checked_into(&mut bytes, &items, &digests, algo, 2, 0.0)
             .expect("encode kv-checked block");
+        let bytes = Slice::from(bytes);
         let header = Header {
             block_flags: KV_CHECKSUM_FOOTER,
             ..Header::test_dummy(BlockType::Data)
