@@ -316,7 +316,17 @@ pub const KERNEL_BACKEND_ID: u64 = 0x4b45_524e_454c_5f46; // "KERNEL_F"
 /// misconfigurations. Operators hitting that edge case on Windows can
 /// fix it explicitly (move the target volume, adjust ACLs); the
 /// fall-back is opt-out by design.
-pub fn is_cross_device(err: &io::Error) -> bool {
+// `pub(crate)`, surfaced crate-wide via the `pub(crate) use` re-export in
+// `fs/mod.rs` so `checkpoint::link_or_copy_cross_fs` can detect cross-device
+// errors. The crate-scoped visibility (not `pub`) keeps this off any public
+// surface even if `std_fs` is ever exported. clippy's `redundant_pub_crate`
+// fires only because the enclosing module is currently private; the re-export
+// genuinely needs crate visibility, so the lint is a false positive here.
+#[expect(
+    clippy::redundant_pub_crate,
+    reason = "re-exported crate-wide via fs::mod; pub(crate) communicates the intended scope"
+)]
+pub(crate) fn is_cross_device(err: &io::Error) -> bool {
     #[cfg(unix)]
     {
         // POSIX `EXDEV` ("invalid cross-device link"). The raw value is
