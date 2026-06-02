@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1780433017654,
+  "lastUpdate": 1780433073580,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -12402,6 +12402,84 @@ window.BENCHMARK_DATA = {
             "value": 454179.18896409246,
             "unit": "ops/sec",
             "extra": "P50: 2.0us | P99: 5.5us | P99.9: 8.0us\nthreads: 1 | elapsed: 0.44s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "0dc08c2bb578ddfb9d140547121407d7835c1da9",
+          "message": "ci(benchmark): publish compare-rocksdb overlay reports to gh-pages (#388)\n\n## Summary\n\nWires the `tools/compare-rocksdb` head-to-head harness into the\n`benchmark.yml` self-hosted job so the ours-vs-rocksdb **overlay**\ncharts get published, alongside the existing single-engine `db_bench`\ntrend.\n\nAfter the db_bench publish, the job now:\n\n1. Runs `cargo bench --bench compare` with bounded criterion settings\n(`--sample-size 10 --warm-up-time 1 --measurement-time 5`) so the heavy\nzstd22/10k write points don't blow the timeout while still giving a\nstable median.\n2. Pushes the generated `tools/compare-rocksdb/target/criterion/` report\ntree to `gh-pages:dev/compare/` (entry point\n`dev/compare/report/index.html`), via a manual git step. The existing\n`dev/bench` dashboard and all other gh-pages paths are untouched.\n\nEach criterion group runs **both engines in the same process on the same\nhost**, so every scenario chart is a host-independent ours-vs-rocksdb\noverlay (None baseline + `*_zstd22` sibling for all 5 scenarios:\nwrite_throughput, point_read, range_scan, seek_random, overwrite).\n\n## Why a manual git push (not a publish action)\n\nKeeps the workflow's \"every `uses:` pinned to a SHA\" hardening policy\nintact (no new third-party action) and reuses the same App-scoped token\nthe `benchmark-action` step already uses. Publishing is gated to `push`\non main; PR / `workflow_dispatch` runs generate the reports but don't\nmutate gh-pages.\n\n## Constraints\n\n- Job timeout bumped 30 -> 60 min (extra bench pass + first-run\nlibrocksdb-sys C++ compile).\n- The self-hosted runner must have a C/C++ toolchain + libclang\n(librocksdb-sys builds via bindgen; distro libclang is found without env\nhelp on Linux).\n\n## Testing\n\n`benchmark.yml` runs only on `push` to main and `workflow_dispatch`\n(never on PRs), so this can't be exercised from the PR itself. Verified:\n\n- `actionlint` clean on the added steps (only the pre-existing custom\n`gpu-private-systems` runner-label note remains)\n- the bench command + report generation confirmed locally:\n`target/criterion/report/index.html` master index + per-group overlay\nreports for all 10 groups (5 scenarios x {none, zstd22})\n\nEnd-to-end validation needs a `workflow_dispatch` run after merge\n(maintainer-only trigger).\n\nCloses #387\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n\n## Summary by CodeRabbit\n\n* **Chores**\n* Extended benchmark workflow timeout from 30 to 60 minutes for more\ncomprehensive testing.\n* Added automated publication of benchmark comparison reports to project\ndocumentation on main branch pushes, making performance data publicly\naccessible.\n* Integrated head-to-head performance comparison benchmarking with\noptimized sampling parameters.\n\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-06-02T23:11:21+03:00",
+          "tree_id": "aceb1387be6979a62e1b5f9a652f0b8f89f7c5c0",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/0dc08c2bb578ddfb9d140547121407d7835c1da9"
+        },
+        "date": 1780433072641,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 1988199.0643356266,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.6us | P99.9: 3.7us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1253306.5438224054,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.2us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 517781.87886914937,
+            "unit": "ops/sec",
+            "extra": "P50: 1.8us | P99: 5.1us | P99.9: 7.5us\nthreads: 1 | elapsed: 0.39s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3626273.6288896226,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 3.1us | P99.9: 5.5us\nthreads: 1 | elapsed: 0.06s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 385846.140309484,
+            "unit": "ops/sec",
+            "extra": "P50: 2.3us | P99: 5.5us | P99.9: 8.4us\nthreads: 1 | elapsed: 0.52s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 204142.94948764943,
+            "unit": "ops/sec",
+            "extra": "P50: 4.5us | P99: 5.7us | P99.9: 8.6us\nthreads: 1 | elapsed: 0.98s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1135277.3501014556,
+            "unit": "ops/sec",
+            "extra": "P50: 0.8us | P99: 2.2us | P99.9: 4.3us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1113632.9452894183,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.5us | P99.9: 1.9us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 449052.7978901416,
+            "unit": "ops/sec",
+            "extra": "P50: 2.0us | P99: 5.5us | P99.9: 7.9us\nthreads: 1 | elapsed: 0.45s | num: 200000 | iterations: 3"
           }
         ]
       }
