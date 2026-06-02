@@ -446,9 +446,10 @@ fn tree_page_ecc_emits_parity_trailer_on_disk() -> lsm_tree::Result<()> {
     let mut trailing = section_bytes.get(after_first_payload..).unwrap_or(&[]);
     assert!(
         Header::decode_from(&mut trailing).is_err(),
-        "bytes after the first data block's payload must be a parity trailer, \
-         not a second block header — a successful decode means the fixture \
-         spilled multiple data blocks and this ECC assertion is invalid",
+        "bytes after the first data block's payload must be a parity trailer. A \
+         successful Header decode here most likely means the parity trailer was \
+         NOT emitted (a page_ecc regression); less likely, the fixture spilled a \
+         second data block (which would invalidate this single-block assertion).",
     );
 
     Ok(())
