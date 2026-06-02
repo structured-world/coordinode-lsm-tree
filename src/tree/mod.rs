@@ -504,23 +504,20 @@ impl AbstractTree for Tree {
         table_writer = table_writer.use_prefix_extractor(self.config.prefix_extractor.clone());
         table_writer = table_writer.use_encryption(self.config.encryption.clone());
         table_writer = table_writer.use_page_ecc(self.config.page_ecc);
-        // `seqno_in_index` is a live runtime config (toggleable via
-        // `update_runtime_config`), read once per flush off the current
-        // snapshot so the resulting SST's index format matches the policy
-        // in force at flush time.
-        table_writer =
-            table_writer.use_seqno_in_index(self.0.runtime_config.load_full().seqno_in_index);
 
-        // Per-KV checksums follow the LIVE runtime config snapshot so a
-        // toggle via `update_runtime_config` takes effect on the next
-        // flush. `Off` (default) emits no per-KV footer and leaves the
-        // data-block payload encoding unchanged (the V5 header carries a
-        // block_flags byte and the meta block a descriptor key regardless,
-        // so the on-disk bytes are not identical to a pre-V5 table).
-        {
-            let rc = self.0.runtime_config.load_full();
-            table_writer = table_writer.use_kv_checksums(rc.kv_checksums, rc.kv_checksum_algo);
-        }
+        // One runtime-config snapshot for the whole flush writer setup. Both
+        // `seqno_in_index` and the per-KV checksum policy are live (toggleable
+        // via `update_runtime_config`); reading `load_full()` per field could
+        // straddle a concurrent update and mix two snapshots into one SST.
+        // Compaction is the migration mechanism, so a toggle takes effect on
+        // the next flush / compaction.
+        let rc = self.0.runtime_config.load_full();
+        table_writer = table_writer.use_seqno_in_index(rc.seqno_in_index);
+        // `Off` (default) emits no per-KV footer and leaves the data-block
+        // payload encoding unchanged (the V5 header carries a block_flags byte
+        // and the meta block a descriptor key regardless, so the on-disk bytes
+        // are not identical to a pre-V5 table).
+        table_writer = table_writer.use_kv_checksums(rc.kv_checksums, rc.kv_checksum_algo);
 
         #[cfg(zstd_any)]
         {

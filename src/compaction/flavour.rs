@@ -94,6 +94,13 @@ pub(super) fn prepare_table_writer(
     let last_level = (version.level_count() - 1) as u8;
     let is_last_level = payload.dest_level == last_level;
 
+    // One runtime-config snapshot for the whole writer setup: reading
+    // `load_full()` per field could straddle a concurrent
+    // `update_runtime_config`, letting one SST mix `seqno_in_index` from
+    // snapshot A with `kv_checksums` from snapshot B and breaking the
+    // single-snapshot-per-compaction contract.
+    let rc = opts.runtime_config.load_full();
+
     let table_writer = table_writer
         .use_data_block_restart_interval(data_block_restart_interval)
         .use_index_block_restart_interval(index_block_restart_interval)
@@ -112,7 +119,7 @@ pub(super) fn prepare_table_writer(
         // snapshot so a compaction started after a toggle rewrites its
         // output SSTs in the new index format (compaction is the migration
         // mechanism for the on-disk index layout).
-        .use_seqno_in_index(opts.runtime_config.load_full().seqno_in_index)
+        .use_seqno_in_index(rc.seqno_in_index)
         .use_bloom_policy({
             use crate::config::FilterPolicyEntry::{Bloom, None};
             use crate::table::filter::BloomConstructionPolicy;
@@ -137,10 +144,7 @@ pub(super) fn prepare_table_writer(
     // per-KV footer and leaves the `KV_CHECKSUM_FOOTER` flag clear (the
     // data-block payload encoding is unchanged; the V5 header/meta layout
     // still differs from pre-V5 regardless).
-    let table_writer = {
-        let rc = opts.runtime_config.load_full();
-        table_writer.use_kv_checksums(rc.kv_checksums, rc.kv_checksum_algo)
-    };
+    let table_writer = table_writer.use_kv_checksums(rc.kv_checksums, rc.kv_checksum_algo);
 
     #[cfg(zstd_any)]
     let table_writer = table_writer.use_zstd_dictionary(opts.config.zstd_dictionary.clone());

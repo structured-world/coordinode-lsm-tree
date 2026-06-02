@@ -125,19 +125,16 @@ impl<'a> Ingestion<'a> {
         writer = writer.use_prefix_extractor(tree.config.prefix_extractor.clone());
         writer = writer.use_encryption(tree.config.encryption.clone());
         writer = writer.use_page_ecc(tree.config.page_ecc);
-        // `seqno_in_index` is a live runtime config; read off the current
-        // snapshot so ingested SSTs match the index format in force.
-        writer = writer.use_seqno_in_index(tree.0.runtime_config.load_full().seqno_in_index);
 
-        // Per-KV checksums follow the live runtime config snapshot (same as
-        // the flush / compaction write paths). `Off` (default) emits no
-        // per-KV footer and leaves the `KV_CHECKSUM_FOOTER` flag clear (the
-        // data-block payload encoding is unchanged; the V5 header/meta layout
-        // still differs from pre-V5 regardless).
-        {
-            let rc = tree.0.runtime_config.load_full();
-            writer = writer.use_kv_checksums(rc.kv_checksums, rc.kv_checksum_algo);
-        }
+        // One runtime-config snapshot for the whole ingestion writer setup, so
+        // a concurrent `update_runtime_config` can't leave the ingested SST
+        // with `seqno_in_index` from one snapshot and checksum settings from
+        // another. `Off` (default) emits no per-KV footer and leaves the
+        // data-block payload encoding unchanged; the index format follows the
+        // policy in force at ingestion.
+        let rc = tree.0.runtime_config.load_full();
+        writer = writer.use_seqno_in_index(rc.seqno_in_index);
+        writer = writer.use_kv_checksums(rc.kv_checksums, rc.kv_checksum_algo);
 
         #[cfg(zstd_any)]
         {
