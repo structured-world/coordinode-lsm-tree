@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1780392123958,
+  "lastUpdate": 1780395007985,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -11776,6 +11776,84 @@ window.BENCHMARK_DATA = {
           {
             "name": "readwhilewriting",
             "value": 461122.66722942074,
+            "unit": "ops/sec",
+            "extra": "P50: 2.0us | P99: 5.4us | P99.9: 7.9us\nthreads: 1 | elapsed: 0.43s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "9a9206ad2b62373e58abb25171c9ecac9870eb7a",
+          "message": "feat(bench): add point-read workload to compare-rocksdb harness (#372)\n\n## Summary\n\nAdds a `point_read/{1k,10k}` workload to the `compare-rocksdb`\nhead-to-head harness, alongside the existing `write_throughput`.\n\nUnlike `write_throughput` (cold-start: opens an empty engine, writes N,\nflushes, per iteration), the read workload opens + populates + flushes\nthe engine **once outside the timing window** and keeps it warm. The\ntimed body issues one `get` per stored key, so the measurement is\nsteady-state read latency (block cache + bloom filter + on-disk block\nfetch + decode), not setup cost.\n\nMirrors the existing harness shape: same `Engine` enum dispatch, same\napples-to-apples configuration (compression `None` on both sides;\nRocksDB WAL disabled during the untimed populate phase), same\nprecomputed `WorkloadInputs` so the timed body does no per-key\nallocation.\n\n## Local results (macOS, M-series)\n\n| Workload | Ours | RocksDB | Gap |\n|---|---|---|---|\n| `point_read/1k` | ~1.25 ms (798 Kelem/s) | ~751 us (1.33 Melem/s) |\n1.67x |\n| `point_read/10k` | ~14.06 ms (711 Kelem/s) | ~8.47 ms (1.18 Melem/s) |\n1.66x |\n\nThe read-path gap is steady (~1.66x), pointing at a per-`get` overhead\n(block fetch + bloom + decode) rather than a fixed cost. This is a far\ntighter comparison than the write cold-start path, where the fixed open\n+ flush cost dominates at small N and amortizes as N grows.\n\n## Testing\n\n- Bench-crate lint clean with `-D warnings` (with `LIBCLANG_PATH` /\n`DYLD_FALLBACK_LIBRARY_PATH` set for `librocksdb-sys` bindgen on macOS)\n- `cargo bench -- point_read` runs all four cases and produces the\nnumbers above\n\nPart of #244",
+          "timestamp": "2026-06-02T13:09:12+03:00",
+          "tree_id": "940192bd7937e076505250f711062e736460596b",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/9a9206ad2b62373e58abb25171c9ecac9870eb7a"
+        },
+        "date": 1780395006308,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 2070450.730084407,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.6us | P99.9: 3.7us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1196836.8225136113,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.2us | P99.9: 4.3us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 511906.16440576996,
+            "unit": "ops/sec",
+            "extra": "P50: 1.8us | P99: 5.1us | P99.9: 7.7us\nthreads: 1 | elapsed: 0.39s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3593383.0510218893,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 3.1us | P99.9: 5.6us\nthreads: 1 | elapsed: 0.06s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 376229.46923075855,
+            "unit": "ops/sec",
+            "extra": "P50: 2.3us | P99: 5.7us | P99.9: 8.5us\nthreads: 1 | elapsed: 0.53s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 202079.39434073403,
+            "unit": "ops/sec",
+            "extra": "P50: 4.6us | P99: 5.9us | P99.9: 11.2us\nthreads: 1 | elapsed: 0.99s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1200481.8998451997,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.2us | P99.9: 4.3us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1103540.9915708671,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.5us | P99.9: 2.0us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 467058.10027620645,
             "unit": "ops/sec",
             "extra": "P50: 2.0us | P99: 5.4us | P99.9: 7.9us\nthreads: 1 | elapsed: 0.43s | num: 200000 | iterations: 3"
           }
