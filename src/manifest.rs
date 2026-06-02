@@ -152,6 +152,7 @@ mod tests {
             fs,
             std::sync::Arc::new(crate::runtime_config::RuntimeConfig::default()),
             None,
+            crate::fs::SyncMode::Normal,
         )?;
 
         writer.start("format_version")?;
@@ -242,6 +243,7 @@ mod tests {
             &StdFs,
             std::sync::Arc::new(crate::runtime_config::RuntimeConfig::default()),
             None,
+            crate::fs::SyncMode::Normal,
         )?;
         writer.start("format_version")?;
         writer.write_u8(FormatVersion::V5.into())?;

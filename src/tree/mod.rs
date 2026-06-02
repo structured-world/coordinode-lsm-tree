@@ -504,6 +504,7 @@ impl AbstractTree for Tree {
         table_writer = table_writer.use_prefix_extractor(self.config.prefix_extractor.clone());
         table_writer = table_writer.use_encryption(self.config.encryption.clone());
         table_writer = table_writer.use_page_ecc(self.config.page_ecc);
+        table_writer = table_writer.use_sync_mode(self.config.sync_mode);
 
         // One runtime-config snapshot for the whole flush writer setup. Both
         // `seqno_in_index` and the per-KV checksum policy are live (toggleable
@@ -2070,12 +2071,17 @@ impl Tree {
         // below — the runtime handle initializer needs it after the
         // move.
         let initial_runtime = config.initial_runtime_config.clone();
+        let sync_mode = config.sync_mode;
         let inner = TreeInner {
             id: tree_id,
             memtable_id_counter: SequenceNumberCounter::new(1),
             table_id_counter: SequenceNumberCounter::new(highest_table_id + 1),
             blob_file_id_counter: SequenceNumberCounter::default(),
-            version_history: Arc::new(RwLock::new(SuperVersions::new(version, &comparator))),
+            version_history: Arc::new(RwLock::new(SuperVersions::new(
+                version,
+                &comparator,
+                sync_mode,
+            ))),
             stop_signal: StopSignal::default(),
             config: Arc::new(config),
             major_compaction_lock: RwLock::default(),
@@ -2124,6 +2130,8 @@ impl Tree {
         let path = config.path.clone();
         log::trace!("Creating LSM-tree at {}", path.display());
 
+        let sync_mode = config.sync_mode;
+
         (*config.fs).create_dir_all(&path)?;
 
         // Create tables directories for all configured paths (primary + routes).
@@ -2132,17 +2140,17 @@ impl Tree {
         // to make all newly-created directory entries durable on POSIX.
         for (table_folder_path, folder_fs) in config.all_tables_folders() {
             folder_fs.create_dir_all(&table_folder_path)?;
-            fsync_directory(&table_folder_path, &*folder_fs)?;
+            fsync_directory(&table_folder_path, &*folder_fs, sync_mode)?;
             if let Some(parent) = table_folder_path.parent() {
-                fsync_directory(parent, &*folder_fs)?;
+                fsync_directory(parent, &*folder_fs, sync_mode)?;
                 if let Some(grandparent) = parent.parent() {
-                    fsync_directory(grandparent, &*folder_fs)?;
+                    fsync_directory(grandparent, &*folder_fs, sync_mode)?;
                 }
             }
         }
 
         // IMPORTANT: fsync primary folder on Unix
-        fsync_directory(&path, &*config.fs)?;
+        fsync_directory(&path, &*config.fs, sync_mode)?;
 
         let inner = TreeInner::create_new(config)?;
         Ok(Self(Arc::new(inner)))
@@ -2225,11 +2233,11 @@ impl Tree {
         for (table_base_folder, folder_fs) in &all_folders {
             if !folder_fs.exists(table_base_folder)? {
                 folder_fs.create_dir_all(table_base_folder)?;
-                fsync_directory(table_base_folder, &**folder_fs)?;
+                fsync_directory(table_base_folder, &**folder_fs, config.sync_mode)?;
                 if let Some(parent) = table_base_folder.parent() {
-                    fsync_directory(parent, &**folder_fs)?;
+                    fsync_directory(parent, &**folder_fs, config.sync_mode)?;
                     if let Some(grandparent) = parent.parent() {
-                        fsync_directory(grandparent, &**folder_fs)?;
+                        fsync_directory(grandparent, &**folder_fs, config.sync_mode)?;
                     }
                 }
             }

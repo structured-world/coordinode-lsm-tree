@@ -166,7 +166,7 @@ impl BlobTree {
 
         let blobs_folder = index.config.path.join(BLOBS_FOLDER);
         (*index.config.fs).create_dir_all(&blobs_folder)?;
-        fsync_directory(&blobs_folder, &*index.config.fs)?;
+        fsync_directory(&blobs_folder, &*index.config.fs, index.config.sync_mode)?;
 
         let blob_file_id_to_continue_with = index
             .current_version()
@@ -548,7 +548,8 @@ impl AbstractTree for BlobTree {
                 self.index.config.fs.clone(),
             )?
             .use_target_size(kv_opts.file_target_size)
-            .use_compression(kv_opts.compression);
+            .use_compression(kv_opts.compression)
+            .use_sync_mode(self.index.config.sync_mode);
             #[cfg(zstd_any)]
             let w = w.use_zstd_dictionary(kv_opts.zstd_dictionary.clone());
             w

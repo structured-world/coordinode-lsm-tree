@@ -26,7 +26,7 @@ use crate::{
     comparator::{self, SharedComparator},
     encryption::EncryptionProvider,
     file::TABLES_FOLDER,
-    fs::{Fs, StdFs},
+    fs::{Fs, StdFs, SyncMode},
     merge_operator::MergeOperator,
     path::absolute_path,
     prefix::PrefixExtractor,
@@ -501,6 +501,16 @@ pub struct Config {
     /// motivate each mode.
     pub(crate) manifest_recovery_mode: ManifestRecoveryMode,
 
+    /// Durability level for every fsync the tree issues (SST writes,
+    /// manifest, version persist, directory syncs).
+    ///
+    /// Defaults to [`SyncMode::Normal`] (plain `fsync`), matching the
+    /// out-of-the-box durability of `RocksDB` and `SQLite`. Only observable on
+    /// macOS, where [`SyncMode::Full`] opts into the much slower
+    /// `F_FULLFSYNC` barrier; on other platforms both modes are plain
+    /// `fsync`. Set via [`Config::sync_mode`].
+    pub(crate) sync_mode: SyncMode,
+
     /// Pre-trained zstd dictionary for dictionary compression.
     ///
     /// When set together with a [`CompressionType::ZstdDict`] compression
@@ -609,6 +619,7 @@ impl Default for Config {
             comparator: comparator::default_comparator(),
             encryption: None,
             manifest_recovery_mode: ManifestRecoveryMode::AbsoluteConsistency,
+            sync_mode: SyncMode::Normal,
         }
     }
 }
@@ -1296,6 +1307,19 @@ impl Config {
     #[must_use]
     pub fn manifest_recovery_mode(mut self, mode: ManifestRecoveryMode) -> Self {
         self.manifest_recovery_mode = mode;
+        self
+    }
+
+    /// Sets the durability level for every fsync the tree issues.
+    ///
+    /// Defaults to [`SyncMode::Normal`] (plain `fsync`, matching `RocksDB` /
+    /// `SQLite` defaults). Pass [`SyncMode::Full`] to force `F_FULLFSYNC` on
+    /// macOS for power-loss durability without an external journal — at a
+    /// large per-flush cost. On non-macOS platforms both modes are
+    /// identical (plain `fsync`).
+    #[must_use]
+    pub fn sync_mode(mut self, mode: SyncMode) -> Self {
+        self.sync_mode = mode;
         self
     }
 

@@ -23,7 +23,7 @@
 
 use crate::{
     encryption::EncryptionProvider,
-    fs::{Fs, FsFile, FsOpenOptions},
+    fs::{Fs, FsFile, FsOpenOptions, SyncMode},
     manifest_blocks::{
         FLAG_FOOTER_MIRROR_ENABLED, HEAD_FOOTER_RESERVED_SIZE, MANIFEST_TABLE_ID_SENTINEL,
         MANIFEST_TREE_ID_SENTINEL, MAX_MANIFEST_BLOCK_SIZE, MAX_SECTION_NAME_BYTES,
@@ -81,6 +81,10 @@ pub struct ManifestArchiveWriter {
     /// the head reservation zeroes are written; advanced by each
     /// section's Block size.
     write_cursor: u64,
+
+    /// Durability level for the final `sync_all` of the manifest file,
+    /// plumbed from `Config::sync_mode`.
+    sync_mode: SyncMode,
 }
 
 struct CurrentSection {
@@ -105,6 +109,7 @@ impl ManifestArchiveWriter {
         fs: &dyn Fs,
         runtime: Arc<RuntimeConfig>,
         encryption: Option<Arc<dyn EncryptionProvider>>,
+        sync_mode: SyncMode,
     ) -> crate::Result<Self> {
         let mut file = fs.open(
             path,
@@ -132,6 +137,7 @@ impl ManifestArchiveWriter {
             toc: Vec::new(),
             section_names: BTreeSet::new(),
             write_cursor: HEAD_FOOTER_RESERVED_SIZE,
+            sync_mode,
         })
     }
 
@@ -351,7 +357,7 @@ impl ManifestArchiveWriter {
             }
         }
 
-        self.file.sync_all()?;
+        self.file.sync_all_with(self.sync_mode)?;
         Ok(payload)
     }
 
@@ -505,7 +511,7 @@ mod tests {
     use crate::runtime_config::RuntimeConfig;
 
     fn open_writer(fs: &dyn Fs, path: &Path, runtime: RuntimeConfig) -> ManifestArchiveWriter {
-        ManifestArchiveWriter::create(path, fs, Arc::new(runtime), None)
+        ManifestArchiveWriter::create(path, fs, Arc::new(runtime), None, SyncMode::Normal)
             .expect("manifest writer opens cleanly on a fresh path")
     }
 

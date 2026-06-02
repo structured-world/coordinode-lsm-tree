@@ -115,6 +115,7 @@ pub(super) fn prepare_table_writer(
         .use_prefix_extractor(opts.config.prefix_extractor.clone())
         .use_encryption(opts.config.encryption.clone())
         .use_page_ecc(opts.config.page_ecc)
+        .use_sync_mode(opts.config.sync_mode)
         // `seqno_in_index` is a live runtime config: read off the current
         // snapshot so a compaction started after a toggle rewrites its
         // output SSTs in the new index format (compaction is the migration

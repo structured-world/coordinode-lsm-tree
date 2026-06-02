@@ -125,9 +125,11 @@ impl TreeInner {
             &*config.fs,
             std::sync::Arc::clone(&initial_runtime),
             config.encryption.clone(),
+            config.sync_mode,
         )?;
 
         let comparator = config.comparator.clone();
+        let sync_mode = config.sync_mode;
 
         Ok(Self {
             id: get_next_tree_id(),
@@ -135,7 +137,11 @@ impl TreeInner {
             table_id_counter: SequenceNumberCounter::default(),
             blob_file_id_counter: SequenceNumberCounter::default(),
             config: Arc::new(config),
-            version_history: Arc::new(RwLock::new(SuperVersions::new(version, &comparator))),
+            version_history: Arc::new(RwLock::new(SuperVersions::new(
+                version,
+                &comparator,
+                sync_mode,
+            ))),
             stop_signal: StopSignal::default(),
             major_compaction_lock: RwLock::default(),
             flush_lock: Mutex::default(),

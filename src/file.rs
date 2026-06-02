@@ -4,7 +4,7 @@
 
 use crate::{
     Slice,
-    fs::{Fs, FsFile},
+    fs::{Fs, FsFile, SyncMode},
 };
 use std::{io::Write, path::Path};
 
@@ -57,7 +57,12 @@ pub fn read_exact(file: &dyn FsFile, offset: u64, size: usize) -> std::io::Resul
 ///
 /// Writes `content` to a temporary file in the same directory, fsyncs it,
 /// then renames over `path`. This ensures readers never see a partial write.
-pub fn rewrite_atomic(path: &Path, content: &[u8], fs: &dyn Fs) -> std::io::Result<()> {
+pub fn rewrite_atomic(
+    path: &Path,
+    content: &[u8],
+    fs: &dyn Fs,
+    mode: SyncMode,
+) -> std::io::Result<()> {
     use crate::fs::FsOpenOptions;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -84,7 +89,7 @@ pub fn rewrite_atomic(path: &Path, content: &[u8], fs: &dyn Fs) -> std::io::Resu
                 let write_result = file
                     .write_all(content)
                     .and_then(|()| file.flush())
-                    .and_then(|()| FsFile::sync_all(&*file));
+                    .and_then(|()| FsFile::sync_all_with(&*file, mode));
                 if let Err(e) = write_result {
                     drop(file);
                     let _ = fs.remove_file(&candidate);
@@ -104,7 +109,7 @@ pub fn rewrite_atomic(path: &Path, content: &[u8], fs: &dyn Fs) -> std::io::Resu
         let _ = fs.remove_file(&tmp_path);
         return Err(e);
     }
-    fsync_directory(folder, fs)?;
+    fsync_directory(folder, fs, mode)?;
 
     Ok(())
 }
@@ -114,8 +119,8 @@ pub fn rewrite_atomic(path: &Path, content: &[u8], fs: &dyn Fs) -> std::io::Resu
 /// On Windows, `StdFs::sync_directory` already returns `Ok(())` (directory
 /// fsync is unsupported), but non-`StdFs` backends (e.g., `MemFs`) may use
 /// this call for path validation. Always delegate rather than short-circuiting.
-pub fn fsync_directory(path: &Path, fs: &dyn Fs) -> std::io::Result<()> {
-    fs.sync_directory(path)
+pub fn fsync_directory(path: &Path, fs: &dyn Fs, mode: SyncMode) -> std::io::Result<()> {
+    fs.sync_directory_with(path, mode)
 }
 
 #[cfg(test)]
@@ -159,7 +164,7 @@ mod tests {
             write!(file, "asdasdasdasdasd")?;
         }
 
-        rewrite_atomic(&path, b"newcontent", &StdFs)?;
+        rewrite_atomic(&path, b"newcontent", &StdFs, SyncMode::Normal)?;
 
         let content = std::fs::read_to_string(&path)?;
         assert_eq!("newcontent", content);

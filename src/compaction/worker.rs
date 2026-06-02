@@ -524,7 +524,8 @@ fn merge_tables(
                     opts.config.fs.clone(),
                 )?
                 .use_target_size(blob_opts.file_target_size)
-                .use_passthrough_compression(blob_opts.compression);
+                .use_passthrough_compression(blob_opts.compression)
+                .use_sync_mode(opts.config.sync_mode);
 
                 let inner = StandardCompaction::new(table_writer, tables);
 

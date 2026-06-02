@@ -1,7 +1,7 @@
 use crate::{
     encryption::EncryptionProvider,
     file::{CURRENT_VERSION_FILE, fsync_directory, rewrite_atomic},
-    fs::Fs,
+    fs::{Fs, SyncMode},
     manifest_blocks::{current_digest, writer::ManifestArchiveWriter},
     runtime_config::RuntimeConfig,
     version::Version,
@@ -25,6 +25,7 @@ pub fn persist_version(
     fs: &dyn Fs,
     runtime: Arc<RuntimeConfig>,
     encryption: Option<Arc<dyn EncryptionProvider>>,
+    sync_mode: SyncMode,
 ) -> crate::Result<()> {
     if comparator_name.len() > crate::comparator::MAX_COMPARATOR_NAME_BYTES {
         return Err(crate::Error::from(std::io::Error::new(
@@ -51,12 +52,12 @@ pub fn persist_version(
     // start() / finish()), and on finish() writes the tail footer
     // Block + size-hint trailer + optional head mirror per the
     // runtime config.
-    let mut writer = ManifestArchiveWriter::create(&path, fs, runtime, encryption)?;
+    let mut writer = ManifestArchiveWriter::create(&path, fs, runtime, encryption, sync_mode)?;
     version.encode_into(&mut writer, comparator_name)?;
     let footer = writer.finish()?;
 
     // IMPORTANT: fsync folder on Unix
-    fsync_directory(folder, fs)?;
+    fsync_directory(folder, fs, sync_mode)?;
 
     // CURRENT pointer carries a content-binding XXH3-128 over the
     // canonical footer payload (version_id + layout_version + flags +
@@ -88,6 +89,7 @@ pub fn persist_version(
         &folder.join(CURRENT_VERSION_FILE),
         &current_file_content,
         fs,
+        sync_mode,
     )?;
 
     Ok(())

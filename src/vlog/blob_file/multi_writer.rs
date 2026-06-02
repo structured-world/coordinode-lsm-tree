@@ -7,7 +7,7 @@ use crate::fs::FsFile;
 use crate::{
     BlobFile, CompressionType, DescriptorTable, SeqNo, SequenceNumberCounter, TreeId,
     file_accessor::FileAccessor,
-    fs::Fs,
+    fs::{Fs, SyncMode},
     vlog::{
         ValueHandle,
         blob_file::{Inner as BlobFileInner, Metadata},
@@ -33,6 +33,10 @@ pub struct MultiWriter {
 
     compression: CompressionType,
     passthrough_compression: CompressionType,
+
+    /// Durability level wired from `Config::sync_mode`, stamped on every
+    /// rotated blob writer.
+    sync_mode: SyncMode,
 
     /// Dictionary for `ZstdDict` compression, shared across all rotated writers.
     #[cfg(zstd_any)]
@@ -72,6 +76,7 @@ impl MultiWriter {
 
             compression: CompressionType::None,
             passthrough_compression: CompressionType::None,
+            sync_mode: SyncMode::Normal,
 
             #[cfg(zstd_any)]
             zstd_dictionary: None,
@@ -80,6 +85,15 @@ impl MultiWriter {
             descriptor_table,
             fs,
         })
+    }
+
+    /// Wires the tree's `Config::sync_mode` through to every blob file this
+    /// writer finalizes (active + rotated).
+    #[must_use]
+    pub fn use_sync_mode(mut self, sync_mode: SyncMode) -> Self {
+        self.sync_mode = sync_mode;
+        self.active_writer.sync_mode = sync_mode;
+        self
     }
 
     /// Sets the blob file target size.
@@ -132,7 +146,8 @@ impl MultiWriter {
 
         let new_writer = {
             let w = Writer::new(blob_file_path, new_blob_file_id, self.tree_id, &*self.fs)?
-                .use_compression(self.compression);
+                .use_compression(self.compression)
+                .use_sync_mode(self.sync_mode);
             #[cfg(zstd_any)]
             let w = w.use_zstd_dictionary(self.zstd_dictionary.clone());
             w

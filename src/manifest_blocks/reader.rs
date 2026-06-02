@@ -737,7 +737,14 @@ mod tests {
     }
 
     fn write_manifest(fs: &MemFs, path: &Path, runtime: RuntimeConfig, sections: &[(&str, &[u8])]) {
-        let mut w = ManifestArchiveWriter::create(path, fs, Arc::new(runtime), None).unwrap();
+        let mut w = ManifestArchiveWriter::create(
+            path,
+            fs,
+            Arc::new(runtime),
+            None,
+            crate::fs::SyncMode::Normal,
+        )
+        .unwrap();
         for (name, data) in sections {
             w.start(name).unwrap();
             use std::io::Write;
@@ -1041,6 +1048,7 @@ mod tests {
             &fs,
             Arc::new(RuntimeConfig::default()),
             Some(Arc::clone(&enc)),
+            crate::fs::SyncMode::Normal,
         )
         .unwrap();
         w.start("format_version").unwrap();

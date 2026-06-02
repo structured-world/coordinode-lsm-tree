@@ -5,9 +5,14 @@
 use super::{filter::BloomConstructionPolicy, writer::Writer};
 use crate::{
     Checksum, CompressionType, HashMap, SequenceNumberCounter, TableId, UserKey,
-    blob_tree::handle::BlobIndirection, encryption::EncryptionProvider, fs::Fs,
-    prefix::PrefixExtractor, range_tombstone::RangeTombstone, table::writer::LinkedFile,
-    value::InternalValue, vlog::BlobFileId,
+    blob_tree::handle::BlobIndirection,
+    encryption::EncryptionProvider,
+    fs::{Fs, SyncMode},
+    prefix::PrefixExtractor,
+    range_tombstone::RangeTombstone,
+    table::writer::LinkedFile,
+    value::InternalValue,
+    vlog::BlobFileId,
 };
 use std::{path::PathBuf, sync::Arc};
 
@@ -79,6 +84,10 @@ pub struct MultiWriter {
     /// can stamp the same flag on every successor [`Writer`].
     page_ecc: bool,
 
+    /// `Config::sync_mode` — preserved so every successor [`Writer`]
+    /// finishes its SST with the same durability level.
+    sync_mode: SyncMode,
+
     /// Per-KV checksum policy + algorithm (from the runtime
     /// `kv_checksums` config) — preserved here so the rotation path
     /// stamps the same setting on every successor [`Writer`].
@@ -149,6 +158,7 @@ impl MultiWriter {
             encryption: None,
 
             page_ecc: false,
+            sync_mode: SyncMode::Normal,
 
             kv_checksum: None,
             use_seqno_in_index: false,
@@ -435,6 +445,16 @@ impl MultiWriter {
         self
     }
 
+    /// Wires the tree's `Config::sync_mode` through to the inner [`Writer`]
+    /// and preserves it across rotations so every successor SST is finished
+    /// at the same durability level.
+    #[must_use]
+    pub fn use_sync_mode(mut self, sync_mode: SyncMode) -> Self {
+        self.sync_mode = sync_mode;
+        self.writer = self.writer.use_sync_mode(sync_mode);
+        self
+    }
+
     /// Wires the runtime `kv_checksums` policy + algorithm through to the
     /// inner [`Writer`] and preserves it across rotations so every
     /// successor writer applies the same per-KV checksum setting. `Off`
@@ -503,6 +523,7 @@ impl MultiWriter {
         new_writer = new_writer.use_prefix_extractor(self.prefix_extractor.clone());
         new_writer = new_writer.use_encryption(self.encryption.clone());
         new_writer = new_writer.use_page_ecc(self.page_ecc);
+        new_writer = new_writer.use_sync_mode(self.sync_mode);
         if let Some((policy, algo)) = self.kv_checksum {
             new_writer = new_writer.use_kv_checksums(policy, algo);
         }
