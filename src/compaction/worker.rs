@@ -582,10 +582,12 @@ fn merge_tables(
             let item = item?;
 
             // Pace compaction I/O so it cannot saturate the device and
-            // starve user reads. `request` is a no-op (returns immediately)
-            // when `compaction_rate_limit` is 0 (the default), so this adds
-            // only two relaxed atomic loads on the unthrottled hot path.
-            let io_bytes = (item.key.user_key.len() + item.value.len()) as u64;
+            // starve user reads. `request` short-circuits to a single
+            // relaxed atomic load when `compaction_rate_limit` is 0 (the
+            // default), so the unthrottled hot path stays cheap. Sum the
+            // sizes in u64 with a saturating add so a pathological item
+            // can't overflow `usize` on 32-bit targets before the cast.
+            let io_bytes = (item.key.user_key.len() as u64).saturating_add(item.value.len() as u64);
             opts.rate_limiter.request(io_bytes);
 
             compactor.write(item)?;

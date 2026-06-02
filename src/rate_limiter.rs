@@ -115,7 +115,7 @@ impl RateLimiter {
         // backwards step underflow).
         let elapsed = now_nanos.saturating_sub(bucket.last_refill_nanos);
         if elapsed > 0 {
-            let refilled = (elapsed * rate_u128) / NANOS_PER_SEC;
+            let refilled = elapsed.saturating_mul(rate_u128) / NANOS_PER_SEC;
             // refilled fits in i64 for any realistic elapsed/rate; clamp
             // defensively so an absurd elapsed can't overflow the add.
             let refilled = i64::try_from(refilled).unwrap_or(i64::MAX);
@@ -138,7 +138,7 @@ impl RateLimiter {
 
         // Wait long enough for the refill rate to repay the deficit.
         let deficit = bucket.available.unsigned_abs();
-        let wait_nanos = (u128::from(deficit) * NANOS_PER_SEC) / rate_u128;
+        let wait_nanos = u128::from(deficit).saturating_mul(NANOS_PER_SEC) / rate_u128;
         Duration::from_nanos(u64::try_from(wait_nanos).unwrap_or(u64::MAX))
     }
 
@@ -152,6 +152,14 @@ impl RateLimiter {
     // no-std: caller-provided clock + acquire_wait() + caller's wait primitive
     #[cfg(feature = "std")]
     pub fn request(&self, bytes: u64) {
+        // Short-circuit BEFORE any clock read so the unthrottled default
+        // (rate 0) costs a single relaxed atomic load — the compaction
+        // merge loop calls this per item, so a `std_now()` clock read on
+        // the disabled path would be pure overhead. `acquire_wait` repeats
+        // the check, but returning here avoids the clock read entirely.
+        if self.rate_bytes_per_sec.load(Ordering::Relaxed) == 0 {
+            return;
+        }
         let wait = self.acquire_wait(bytes, Self::std_now());
         if !wait.is_zero() {
             std::thread::sleep(wait);
