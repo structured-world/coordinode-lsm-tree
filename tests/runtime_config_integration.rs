@@ -198,6 +198,22 @@ fn seqno_in_index_round_trips_through_disk_and_reopen() -> lsm_tree::Result<()> 
         }
         tree.flush_active_memtable(0)?;
 
+        // Make the multi-block precondition explicit: the per-block
+        // seqno-bounds path is only exercised when the SST holds more than one
+        // data block. If a future default (block size / dataset) drops this to
+        // a single block, fail loudly here instead of silently no longer
+        // covering the bug class this test locks down.
+        let data_blocks: u64 = tree
+            .current_version()
+            .iter_tables()
+            .map(|t| t.metadata.data_block_count)
+            .sum();
+        assert!(
+            data_blocks > 1,
+            "test must produce >1 data block to exercise per-block seqno \
+             bounds, got {data_blocks}",
+        );
+
         for i in 0..500u64 {
             let key = format!("key{i:05}");
             let got = tree.get(key.as_bytes(), SeqNo::MAX)?;
