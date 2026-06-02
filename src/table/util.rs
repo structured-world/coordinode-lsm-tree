@@ -680,7 +680,7 @@ mod tests {
     }
 
     #[test]
-    fn lsp_scalar_matches_reference_on_boundaries() {
+    fn lsp_scalar_on_boundaries_matches_reference() {
         // 0 / 7 / 8 / 9 / 15 / 16 / 17 / 31 / 32 / 33 / 63 / 64 / 127 / 128 — covers all
         // word-stride and AVX2-stride boundary cases.
         for total_len in [
@@ -718,8 +718,8 @@ mod tests {
     }
 
     #[test]
-    fn longest_shared_prefix_length_matches_reference_on_boundaries() {
-        // Same coverage as `lsp_scalar_matches_reference_on_boundaries`, but exercises
+    fn longest_shared_prefix_length_on_boundaries_matches_reference() {
+        // Same coverage as `lsp_scalar_on_boundaries_matches_reference`, but exercises
         // the *dispatched* path — on x86_64 this hits AVX2 when available and SSE2
         // otherwise, on little-endian aarch64 it hits NEON, and on other targets it
         // falls back to the scalar kernel.
@@ -846,7 +846,7 @@ mod tests {
     /// guarantees the SSE2-path exercise the boundary cases.
     #[cfg(target_arch = "x86_64")]
     #[test]
-    fn lsp_sse2_matches_reference_on_boundaries() {
+    fn lsp_sse2_on_boundaries_matches_reference() {
         // SAFETY: SSE2 is mandatory in the x86_64 ISA baseline.
         assert_kernel_matches_reference("sse2", |a, b| unsafe { lsp_sse2(a, b) });
     }
@@ -857,7 +857,7 @@ mod tests {
     /// the AVX2 contract explicit (matches reference on every boundary case).
     #[cfg(target_arch = "x86_64")]
     #[test]
-    fn lsp_avx2_matches_reference_on_boundaries() {
+    fn lsp_avx2_on_boundaries_matches_reference() {
         if !std::is_x86_feature_detected!("avx2") {
             // No AVX2 on this host — nothing to verify directly.
             return;
@@ -873,7 +873,7 @@ mod tests {
     /// host supports AVX-512BW and is a no-op otherwise.
     #[cfg(target_arch = "x86_64")]
     #[test]
-    fn lsp_avx512_matches_reference_on_boundaries() {
+    fn lsp_avx512_on_boundaries_matches_reference() {
         if !std::is_x86_feature_detected!("avx512bw") {
             // No AVX-512BW on this host — nothing to verify directly.
             return;
@@ -888,7 +888,7 @@ mod tests {
     /// (e.g. macos-latest on M1/M2) to keep the path covered.
     #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
     #[test]
-    fn lsp_neon_matches_reference_on_boundaries() {
+    fn lsp_neon_on_boundaries_matches_reference() {
         // SAFETY: NEON is mandatory in the ARMv8 baseline (`target_arch = "aarch64"`).
         assert_kernel_matches_reference("neon", |a, b| unsafe { lsp_neon(a, b) });
     }
