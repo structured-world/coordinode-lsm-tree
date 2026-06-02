@@ -46,6 +46,7 @@ mod io_uring_fs;
 
 pub use mem_fs::MemFs;
 pub use std_fs::StdFs;
+pub(crate) use std_fs::is_cross_device;
 
 #[cfg(all(target_os = "linux", feature = "io-uring"))]
 pub use io_uring_fs::{IoUringFs, is_io_uring_available};
