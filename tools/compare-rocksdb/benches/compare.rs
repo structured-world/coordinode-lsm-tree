@@ -84,6 +84,11 @@
 use std::time::Duration;
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+// `Guard` is a trait, used (not dead) for its `.value()` method on the
+// `IterGuardImpl` items yielded by `tree.iter()` / `tree.range()` in the
+// range_scan and seek_random scenarios — there is no direct path
+// reference, so it reads as unused at a glance but the import is required
+// for method resolution (clippy `-D warnings` confirms it is live).
 use lsm_tree::{
     AbstractTree, CompressionType, Config, Guard, MAX_SEQNO, SequenceNumberCounter,
     config::CompressionPolicy,
@@ -221,9 +226,13 @@ fn rocksdb_options(compression: Compression) -> rocksdb::Options {
 }
 
 /// Opens our engine at `dir` with the block-compression policy for the
-/// given `compression` variant. `None` keeps the engine default (the
-/// `None` policy on this build, since only the `zstd` feature is
-/// enabled — not `lz4`); `Zstd22` applies level-22 zstd to every level.
+/// given `compression` variant. Both arms set the policy EXPLICITLY:
+/// `None` pins `CompressionPolicy::all(None)` rather than relying on the
+/// `Config` default (which becomes `[None, Lz4]` if the `lz4` feature is
+/// ever enabled on this bench crate, silently compressing the supposed
+/// "uncompressed baseline"); `Zstd22` applies level-22 zstd to every
+/// level. Keeping the `None` arm explicit holds the baseline apples-to-
+/// apples with RocksDB's `DBCompressionType::None`.
 fn open_ours(
     dir: &std::path::Path,
     compression: Compression,
@@ -234,7 +243,9 @@ fn open_ours(
         SequenceNumberCounter::default(),
     );
     let config = match compression {
-        Compression::None => config,
+        Compression::None => {
+            config.data_block_compression_policy(CompressionPolicy::all(CompressionType::None))
+        }
         Compression::Zstd22 => config.data_block_compression_policy(CompressionPolicy::all(
             CompressionType::Zstd(Compression::ZSTD_MAX_LEVEL),
         )),
