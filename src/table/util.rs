@@ -199,6 +199,8 @@ pub fn load_block(
 /// every truncated entry pays one call against the restart base key.
 ///
 /// Dispatch:
+/// - **`x86_64` with AVX-512BW** (runtime-detected): 64-byte vectorized lanes via
+///   `_mm512_cmpeq_epi8_mask`. Checked first so AVX-512 hosts use the widest lane.
 /// - **`x86_64` with AVX2** (runtime-detected): 32-byte vectorized lanes via `_mm256_cmpeq_epi8`.
 /// - **`x86_64` without AVX2**: 16-byte SSE2 lanes via `_mm_cmpeq_epi8` — SSE2 is the mandatory
 ///   `x86_64` ISA baseline, so this path needs no runtime check, only the AVX2 negative result.
@@ -209,11 +211,16 @@ pub fn load_block(
 ///   the byte ordering of the source slice on either endianness.
 ///
 /// `is_x86_feature_detected!` caches the CPUID result, so the per-call dispatch
-/// cost is one cached atomic load on `x86_64`.
+/// cost is one or two cached atomic loads on `x86_64` (one for AVX-512 hosts, two
+/// for the majority AVX2-only hosts that fail the AVX-512BW check then take AVX2).
 #[must_use]
 pub fn longest_shared_prefix_length(s1: &[u8], s2: &[u8]) -> usize {
     #[cfg(target_arch = "x86_64")]
     {
+        if std::is_x86_feature_detected!("avx512bw") {
+            // SAFETY: AVX-512BW availability just verified via runtime CPU feature detection.
+            return unsafe { lsp_avx512(s1, s2) };
+        }
         if std::is_x86_feature_detected!("avx2") {
             // SAFETY: AVX2 availability just verified via runtime CPU feature detection.
             return unsafe { lsp_avx2(s1, s2) };
@@ -347,6 +354,72 @@ unsafe fn lsp_avx2(s1: &[u8], s2: &[u8]) -> usize {
     }
 
     // Tail: byte-stride (≤31 bytes left, not worth dispatching a narrower kernel).
+    while i < min_len {
+        // SAFETY: i < min_len ≤ s{1,2}.len()
+        let (a, b) = unsafe { (*s1.get_unchecked(i), *s2.get_unchecked(i)) };
+        if a != b {
+            return i;
+        }
+        i += 1;
+    }
+
+    min_len
+}
+
+/// AVX-512BW implementation — 64 bytes per iteration via `_mm512_cmpeq_epi8_mask`.
+///
+/// The widest `x86_64` lane: one iteration consumes a full 64-byte cache line, so
+/// keys that share a long prefix (time-series, tenant-prefixed, sorted UUIDs)
+/// settle in half the iterations of the AVX2 kernel. `_mm512_cmpeq_epi8_mask`
+/// folds the 64-lane byte comparison directly into a `__mmask64`, avoiding the
+/// separate `movemask` step the AVX2/SSE2 kernels need.
+///
+/// # Safety
+///
+/// Caller must ensure the host CPU supports AVX-512BW
+/// (`is_x86_feature_detected!("avx512bw")`). BW implies the F subset, so the
+/// 512-bit load and the byte-granular compare-mask are both available.
+#[cfg(target_arch = "x86_64")]
+// List both ISA features the body relies on: `_mm512_loadu_si512` is AVX-512F,
+// `_mm512_cmpeq_epi8_mask` is AVX-512BW. BW implies F (so `avx512bw` alone would
+// compile), but naming both keeps the gate matching the actual requirements and
+// guards against a future edit dropping the BW-only compare without noticing the
+// F load is still gated. Runtime detection on `avx512bw` is sufficient because
+// any CPU exposing BW necessarily implements F.
+#[target_feature(enable = "avx512bw,avx512f")]
+#[expect(unsafe_code, reason = "intrinsics require unsafe")]
+#[must_use]
+unsafe fn lsp_avx512(s1: &[u8], s2: &[u8]) -> usize {
+    use std::arch::x86_64::{__m512i, _mm512_cmpeq_epi8_mask, _mm512_loadu_si512};
+
+    let min_len = s1.len().min(s2.len());
+    let mut i = 0;
+
+    while i + 64 <= min_len {
+        // SAFETY: i + 64 <= min_len ≤ s{1,2}.len() — both 64-byte loads are in-bounds.
+        // `_mm512_loadu_si512` is the *unaligned* load, so the u8→__m512i pointer cast
+        // does not require 64-byte alignment (the pointer is only used by `loadu`).
+        #[expect(
+            clippy::cast_ptr_alignment,
+            reason = "_mm512_loadu_si512 explicitly performs an unaligned 64-byte load"
+        )]
+        let (va, vb) = unsafe {
+            (
+                _mm512_loadu_si512(s1.as_ptr().add(i).cast::<__m512i>()),
+                _mm512_loadu_si512(s2.as_ptr().add(i).cast::<__m512i>()),
+            )
+        };
+        // `_mm512_cmpeq_epi8_mask` yields a 64-bit mask: bit j is set iff byte j is
+        // equal. A full-match lane is `u64::MAX`; the first mismatch is the lowest
+        // zero bit of the mask, i.e. the lowest set bit of its complement.
+        let mask = _mm512_cmpeq_epi8_mask(va, vb);
+        if mask != u64::MAX {
+            return i + (!mask).trailing_zeros() as usize;
+        }
+        i += 64;
+    }
+
+    // Tail: byte-stride (≤63 bytes left, not worth dispatching a narrower kernel).
     while i < min_len {
         // SAFETY: i < min_len ≤ s{1,2}.len()
         let (a, b) = unsafe { (*s1.get_unchecked(i), *s2.get_unchecked(i)) };
@@ -607,7 +680,7 @@ mod tests {
     }
 
     #[test]
-    fn lsp_scalar_matches_reference_on_boundaries() {
+    fn lsp_scalar_on_boundaries_matches_reference() {
         // 0 / 7 / 8 / 9 / 15 / 16 / 17 / 31 / 32 / 33 / 63 / 64 / 127 / 128 — covers all
         // word-stride and AVX2-stride boundary cases.
         for total_len in [
@@ -645,8 +718,8 @@ mod tests {
     }
 
     #[test]
-    fn longest_shared_prefix_length_matches_reference_on_boundaries() {
-        // Same coverage as `lsp_scalar_matches_reference_on_boundaries`, but exercises
+    fn longest_shared_prefix_length_on_boundaries_matches_reference() {
+        // Same coverage as `lsp_scalar_on_boundaries_matches_reference`, but exercises
         // the *dispatched* path — on x86_64 this hits AVX2 when available and SSE2
         // otherwise, on little-endian aarch64 it hits NEON, and on other targets it
         // falls back to the scalar kernel.
@@ -773,7 +846,7 @@ mod tests {
     /// guarantees the SSE2-path exercise the boundary cases.
     #[cfg(target_arch = "x86_64")]
     #[test]
-    fn lsp_sse2_matches_reference_on_boundaries() {
+    fn lsp_sse2_on_boundaries_matches_reference() {
         // SAFETY: SSE2 is mandatory in the x86_64 ISA baseline.
         assert_kernel_matches_reference("sse2", |a, b| unsafe { lsp_sse2(a, b) });
     }
@@ -784,7 +857,7 @@ mod tests {
     /// the AVX2 contract explicit (matches reference on every boundary case).
     #[cfg(target_arch = "x86_64")]
     #[test]
-    fn lsp_avx2_matches_reference_on_boundaries() {
+    fn lsp_avx2_on_boundaries_matches_reference() {
         if !std::is_x86_feature_detected!("avx2") {
             // No AVX2 on this host — nothing to verify directly.
             return;
@@ -793,13 +866,29 @@ mod tests {
         assert_kernel_matches_reference("avx2", |a, b| unsafe { lsp_avx2(a, b) });
     }
 
+    /// Direct test for the AVX-512BW 64-byte kernel, gated by runtime CPU detection.
+    /// CI `x86_64` runners may or may not expose AVX-512 (consumer Intel 11th gen+
+    /// dropped it; AMD Zen4+ and Intel server keep it), so the dispatched path can't
+    /// be relied on to reach `lsp_avx512`. This direct test exercises it whenever the
+    /// host supports AVX-512BW and is a no-op otherwise.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn lsp_avx512_on_boundaries_matches_reference() {
+        if !std::is_x86_feature_detected!("avx512bw") {
+            // No AVX-512BW on this host — nothing to verify directly.
+            return;
+        }
+        // SAFETY: AVX-512BW availability just verified via runtime CPU feature detection.
+        assert_kernel_matches_reference("avx512bw", |a, b| unsafe { lsp_avx512(a, b) });
+    }
+
     /// Direct test for the NEON 16-byte kernel on LE aarch64. Required because
     /// CI codecov runs on `x86_64` Linux — the NEON kernel never executes there
     /// even when cross-compiling, but this test gates onto LE aarch64 runners
     /// (e.g. macos-latest on M1/M2) to keep the path covered.
     #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
     #[test]
-    fn lsp_neon_matches_reference_on_boundaries() {
+    fn lsp_neon_on_boundaries_matches_reference() {
         // SAFETY: NEON is mandatory in the ARMv8 baseline (`target_arch = "aarch64"`).
         assert_kernel_matches_reference("neon", |a, b| unsafe { lsp_neon(a, b) });
     }
