@@ -335,14 +335,19 @@ impl ParsedMeta {
 
         // Optional field introduced for scan_since_seqno block-skip (#224).
         // SSTs written before this key existed parse as 0 (legacy index
-        // format, no per-block seqno bounds). A present-but-truncated value
-        // propagates the I/O error to surface metadata corruption.
-        let index_format = block
-            .point_read(b"index_format", SeqNo::MAX, &cmp)?
-            .map_or(Ok(0u8), |item| {
+        // format, no per-block seqno bounds).
+        let index_format = match block.point_read(b"index_format", SeqNo::MAX, &cmp)? {
+            None => 0u8,
+            // The value must be EXACTLY one byte. `read_u8` alone would ignore
+            // trailing bytes, so a corrupt payload like `[1, 0xFF]` would parse
+            // as `1`. Since this byte selects the index-entry decoder, require
+            // an exact one-byte payload and reject anything else.
+            Some(item) if item.value.len() == 1 => {
                 let mut bytes = &item.value[..];
-                bytes.read_u8()
-            })?;
+                bytes.read_u8()?
+            }
+            Some(_) => return Err(crate::Error::InvalidHeader("TableMeta")),
+        };
         // Only `0` (legacy) and `1` (per-block seqno bounds) are defined in
         // this format slice. Reject any other byte as corrupt / forward-
         // incompatible metadata rather than letting a bogus on-disk format

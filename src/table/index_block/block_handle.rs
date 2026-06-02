@@ -109,8 +109,21 @@ impl KeyedBlockHandle {
 
     /// Attaches per-block seqno bounds `(min, max)`, switching this handle to
     /// the seqno-bounded wire format (markers 2 / 3) when encoded.
+    ///
+    /// # Panics
+    ///
+    /// In debug builds, panics if `seqno_min > seqno_max`. Inverted bounds are
+    /// a caller invariant violation (the writer derives them from a single
+    /// min/max fold over the block, so it cannot produce them); encoding an
+    /// inverted pair would let a seqno-scoped scan skip a block that still
+    /// holds visible entries. Corruption arriving from disk is rejected
+    /// separately on the decode path (`parse_full` / `parse_truncated`).
     #[must_use]
     pub fn with_seqno_bounds(mut self, seqno_min: SeqNo, seqno_max: SeqNo) -> Self {
+        debug_assert!(
+            seqno_min <= seqno_max,
+            "inverted seqno bounds: min {seqno_min} > max {seqno_max}",
+        );
         self.seqno_bounds = Some((seqno_min, seqno_max));
         self
     }
@@ -689,17 +702,23 @@ mod tests {
     fn full_entry_with_inverted_seqno_bounds_is_rejected() {
         // A forged entry whose seqno_min > seqno_max must fail to decode, not
         // propagate bounds that could drive an incorrect seqno block-skip
-        // (skipping a block that still holds visible entries).
+        // (skipping a block that still holds visible entries). Build a VALID
+        // (3, 9) entry — `with_seqno_bounds` debug-asserts min <= max — then
+        // swap the two single-byte bound varints on the wire to invert them.
         let handle = KeyedBlockHandle::new(
             b"abcdef".to_vec().into(),
             7,
             BlockHandle::new(BlockOffset(0), 1),
         )
-        .with_seqno_bounds(9, 3); // inverted: min > max
+        .with_seqno_bounds(3, 9);
         let mut bytes = Vec::new();
         let mut state = BlockOffset(0);
         handle.encode_full_into(&mut bytes, &mut state).unwrap();
+        // Layout: [marker=2][offset=0][size=1][seqno=7][seqno_min=3][seqno_max=9]…
+        // all single-byte varints, so the bounds sit at indices 4 and 5.
         assert_eq!(bytes.first().copied(), Some(2));
+        assert_eq!((bytes[4], bytes[5]), (3, 9), "bound varint layout changed");
+        bytes.swap(4, 5); // → seqno_min=9, seqno_max=3 (inverted)
 
         let mut cursor = Cursor::new(bytes.as_slice());
         let parsed = <KeyedBlockHandle as Decodable<IndexBlockParsedItem>>::parse_full(
@@ -720,13 +739,16 @@ mod tests {
             7,
             BlockHandle::new(BlockOffset(0), 1),
         )
-        .with_seqno_bounds(9, 3); // inverted: min > max
+        .with_seqno_bounds(3, 9);
         let mut bytes = Vec::new();
         let mut state = BlockOffset(0);
         handle
             .encode_truncated_into(&mut bytes, &mut state, 2)
             .unwrap();
+        // Layout: [marker=3][offset=0][size=1][seqno=7][seqno_min=3][seqno_max=9]…
         assert_eq!(bytes.first().copied(), Some(3));
+        assert_eq!((bytes[4], bytes[5]), (3, 9), "bound varint layout changed");
+        bytes.swap(4, 5); // invert
 
         let offset = 16;
         let entries_end = offset + bytes.len();
