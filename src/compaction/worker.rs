@@ -582,13 +582,21 @@ fn merge_tables(
             let item = item?;
 
             // Pace compaction I/O so it cannot saturate the device and
-            // starve user reads. `request` short-circuits to a single
-            // relaxed atomic load when `compaction_rate_limit` is 0 (the
-            // default), so the unthrottled hot path stays cheap. Sum the
-            // sizes in u64 with a saturating add so a pathological item
-            // can't overflow `usize` on 32-bit targets before the cast.
+            // starve user reads. Short-circuits to a single relaxed atomic
+            // load when `compaction_rate_limit` is 0 (the default), so the
+            // unthrottled hot path stays cheap. Sum the sizes in u64 with a
+            // saturating add so a pathological item can't overflow `usize`
+            // on 32-bit targets before the cast. The throttle wait is
+            // interruptible by the stop signal so a low limit plus a large
+            // item can't stall tree drop / shutdown for the whole wait.
             let io_bytes = (item.key.user_key.len() as u64).saturating_add(item.value.len() as u64);
-            opts.rate_limiter.request(io_bytes);
+            if opts
+                .rate_limiter
+                .request_interruptible(io_bytes, || opts.stop_signal.is_stopped())
+            {
+                log::debug!("Stopping amidst compaction because of stop signal (I/O throttle)");
+                return Ok(());
+            }
 
             compactor.write(item)?;
 

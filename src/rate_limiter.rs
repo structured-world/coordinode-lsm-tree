@@ -25,9 +25,9 @@
 //! The core decision function [`RateLimiter::acquire_wait`] takes the
 //! current monotonic time as a `Duration` since an arbitrary origin, so
 //! it is pure (no syscalls), unit-testable without sleeping, and compiles
-//! without `std`. The blocking convenience wrapper
-//! [`RateLimiter::request`] (which reads the system clock and sleeps) is
-//! gated behind the `std` feature.
+//! without `std`. The interruptible blocking wrapper
+//! [`RateLimiter::request_interruptible`] (which reads the system clock and
+//! sleeps in pollable chunks) is gated behind the `std` feature.
 //!
 //! A priority-class extension (flush / user I/O also debiting the bucket
 //! but draining ahead of compaction) is a planned refinement; this
@@ -142,29 +142,51 @@ impl RateLimiter {
         Duration::from_nanos(u64::try_from(wait_nanos).unwrap_or(u64::MAX))
     }
 
-    /// Blocking request: waits (sleeping the current thread) until an I/O
-    /// of `bytes` may proceed.
+    /// Interruptible blocking request: waits (sleeping the current thread)
+    /// until an I/O of `bytes` may proceed, polling `should_stop` so a
+    /// shutdown / drop can break a long wait promptly.
     ///
-    /// Convenience wrapper over [`acquire_wait`](Self::acquire_wait) that
-    /// reads the system monotonic clock and sleeps. A no-op when the rate
-    /// is `0`. Only available with the `std` feature; `no_std` callers
-    /// drive `acquire_wait` with their own clock and wait primitive.
-    // no-std: caller-provided clock + acquire_wait() + caller's wait primitive
+    /// Returns `true` if `should_stop` fired during the wait (caller should
+    /// abort), `false` if the full wait elapsed (caller may proceed).
+    ///
+    /// The budget is debited exactly once (via a single
+    /// [`acquire_wait`](Self::acquire_wait)); the resulting wait is then
+    /// slept in <= [`POLL_INTERVAL`](Self::POLL_INTERVAL) chunks with a
+    /// `should_stop` check before each, so even a multi-gigabyte item under
+    /// a low limit cannot stall shutdown for more than one poll interval.
+    /// Re-calling `acquire_wait` in the loop would wrongly re-debit the
+    /// bucket each iteration, so the wait is computed once up front.
+    ///
+    /// A no-op returning `false` when the rate is `0` (no clock read).
+    /// Only with the `std` feature; `no_std` callers drive `acquire_wait`
+    /// with their own clock + interruptible wait.
+    // no-std: caller-provided clock + acquire_wait() + caller's wait/poll loop
     #[cfg(feature = "std")]
-    pub fn request(&self, bytes: u64) {
+    pub fn request_interruptible(&self, bytes: u64, should_stop: impl Fn() -> bool) -> bool {
         // Short-circuit BEFORE any clock read so the unthrottled default
         // (rate 0) costs a single relaxed atomic load — the compaction
-        // merge loop calls this per item, so a `std_now()` clock read on
-        // the disabled path would be pure overhead. `acquire_wait` repeats
-        // the check, but returning here avoids the clock read entirely.
+        // merge loop calls this per item.
         if self.rate_bytes_per_sec.load(Ordering::Relaxed) == 0 {
-            return;
+            return false;
         }
-        let wait = self.acquire_wait(bytes, Self::std_now());
-        if !wait.is_zero() {
-            std::thread::sleep(wait);
+        // Debit once, then sleep the computed wait in interruptible chunks.
+        let mut remaining = self.acquire_wait(bytes, Self::std_now());
+        while !remaining.is_zero() {
+            if should_stop() {
+                return true;
+            }
+            let chunk = remaining.min(Self::POLL_INTERVAL);
+            std::thread::sleep(chunk);
+            remaining = remaining.saturating_sub(chunk);
         }
+        false
     }
+
+    /// Maximum single sleep span inside
+    /// [`request_interruptible`](Self::request_interruptible): the upper
+    /// bound on how long a stop signal can go unnoticed mid-throttle.
+    #[cfg(feature = "std")]
+    const POLL_INTERVAL: Duration = Duration::from_millis(100);
 
     /// Monotonic time since a process-global origin, for the `std`
     /// wrapper. A shared origin is fine: each limiter's bucket tracks its
@@ -254,6 +276,31 @@ mod tests {
                 "steady-state request at second {sec} should not wait"
             );
         }
+    }
+
+    #[test]
+    fn request_interruptible_bails_out_before_sleeping_when_stopped() {
+        // 1 B/s with a 1 MiB request implies an ~12-day wait. With
+        // should_stop already true, the call must return `true` immediately
+        // (the stop check precedes the first sleep) rather than blocking —
+        // this is what keeps shutdown responsive under a low rate limit.
+        let rl = RateLimiter::new(1);
+        let start = std::time::Instant::now();
+        let stopped = rl.request_interruptible(1_024 * 1_024, || true);
+        assert!(stopped, "should report it was interrupted");
+        assert!(
+            start.elapsed() < ms(500),
+            "must not sleep the full computed wait when stopped"
+        );
+    }
+
+    #[test]
+    fn request_interruptible_zero_rate_is_immediate_passthrough() {
+        let rl = RateLimiter::new(0);
+        let start = std::time::Instant::now();
+        let stopped = rl.request_interruptible(1_000_000, || false);
+        assert!(!stopped, "rate 0 never throttles, so never interrupted");
+        assert!(start.elapsed() < ms(500), "rate 0 must not sleep");
     }
 
     #[test]
