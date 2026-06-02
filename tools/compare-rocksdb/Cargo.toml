@@ -18,21 +18,20 @@ edition = "2024"
 publish = false
 
 [dependencies]
-# Local path dep on the main crate. Default features only — the
-# initial workload (write_throughput) runs with
-# `DBCompressionType::None` on both engines, so no compression
-# codec is needed yet. Future `*_lz4` / `*_zstd` workload variants
-# will add the matching feature here AND set the matching
-# RocksDB compression type on the rocksdb side, so the two
-# engines stay aligned per-variant.
-lsm-tree = { package = "coordinode-lsm-tree", path = "../.." }
+# Local path dep on the main crate. The `zstd` feature is enabled so
+# the `*_zstd22` workload variants can drive our engine's zstd codec
+# (`CompressionType::Zstd(22)`); the `None`-compression baseline
+# groups still run on the same build. Future `*_lz4` variants add the
+# `lz4` feature alongside their workload.
+lsm-tree = { package = "coordinode-lsm-tree", path = "../..", features = ["zstd"] }
 # RocksDB binding — the whole reason this crate exists outside the
 # main `--all-features` graph. `default-features = false` strips
-# the upstream default compression codecs (snappy, lz4, bz2, zlib,
-# zstd); the matching `*_lz4` / `*_zstd` features land alongside
-# the corresponding workload variants so the C-toolchain compile
-# burden scales with the workloads that actually need each codec.
-rocksdb = { version = "0.24", default-features = false }
+# the upstream default compression codecs (snappy, lz4, bz2, zlib);
+# the `zstd` feature is enabled so the `*_zstd22` variants can set
+# `DBCompressionType::Zstd` at level 22, matching our engine. The
+# C-toolchain compile burden scales with the codecs the workloads
+# actually need (a future `*_lz4` variant adds rocksdb's `lz4`).
+rocksdb = { version = "0.24", default-features = false, features = ["zstd"] }
 criterion = { version = "0.8", features = ["html_reports"] }
 tempfile = "3"
 
