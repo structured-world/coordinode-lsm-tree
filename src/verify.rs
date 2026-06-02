@@ -594,14 +594,16 @@ pub fn verify_sst_file(path: &std::path::Path) -> BlockVerifyReport {
 /// Best-effort read of the per-SST `page_ecc` flag from an SST file's meta
 /// descriptor, for the out-of-band scrub (no live `Table` to consult).
 ///
-/// Returns `Some(page_ecc)` when the meta block decodes. Returns `None` when
-/// the flag is UNDETERMINABLE — the file can't be opened, the TOC has no `meta`
-/// section, or the meta block can't be decoded (a corrupt meta, or an encrypted
-/// SST whose key the out-of-band tool doesn't have). The caller MUST NOT treat
-/// `None` as "`page_ecc` disabled": walking an ECC-bearing SST without skipping
-/// the parity trailers mis-aligns the block scan and reports spurious
-/// corruption, so the caller skips the walk and surfaces the indeterminacy
-/// instead.
+/// Returns `Some(page_ecc)` when a meta block decodes. The authoritative tail
+/// `meta` section is tried first; if its block is corrupt / undecodable the
+/// early `meta_mid` mirror (which the writer emits so one bad meta block can't
+/// lose the descriptor) is tried next. Returns `None` only when the flag is
+/// UNDETERMINABLE — the file can't be opened, neither meta section exists, or
+/// neither decodes (both corrupt, or an encrypted SST whose key the out-of-band
+/// tool doesn't have). The caller MUST NOT treat `None` as "`page_ecc`
+/// disabled": walking an ECC-bearing SST without skipping the parity trailers
+/// mis-aligns the block scan and reports spurious corruption, so the caller
+/// skips the walk and surfaces the indeterminacy instead.
 #[cfg(feature = "std")]
 fn read_page_ecc_out_of_band(fs: &dyn crate::fs::Fs, path: &std::path::Path) -> Option<bool> {
     let file = fs
@@ -609,15 +611,24 @@ fn read_page_ecc_out_of_band(fs: &dyn crate::fs::Fs, path: &std::path::Path) -> 
         .ok()?;
     let mut probe = file;
     let sfa_reader = crate::sfa::Reader::from_reader(&mut probe).ok()?;
-    let (pos, len) = sfa_reader
-        .toc()
-        .section(b"meta")
-        .map(|e| (e.pos(), e.len()))?;
-    let size = u32::try_from(len).ok()?;
-    let handle = crate::table::BlockHandle::new(crate::table::BlockOffset(pos), size);
-    crate::table::meta::ParsedMeta::load_with_handle(probe.as_ref(), &handle, None)
-        .map(|meta| meta.page_ecc)
-        .ok()
+    let toc = sfa_reader.toc();
+    // Tail `meta` is authoritative; `meta_mid` is the early mirror written so a
+    // single corrupt meta block doesn't lose the per-SST descriptor.
+    for name in [b"meta".as_slice(), b"meta_mid".as_slice()] {
+        let Some((pos, len)) = toc.section(name).map(|e| (e.pos(), e.len())) else {
+            continue;
+        };
+        let Ok(size) = u32::try_from(len) else {
+            continue;
+        };
+        let handle = crate::table::BlockHandle::new(crate::table::BlockOffset(pos), size);
+        if let Ok(meta) =
+            crate::table::meta::ParsedMeta::load_with_handle(probe.as_ref(), &handle, None)
+        {
+            return Some(meta.page_ecc);
+        }
+    }
+    None
 }
 
 struct PerFileScan {
