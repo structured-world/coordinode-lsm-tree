@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1780395007985,
+  "lastUpdate": 1780407668085,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -11856,6 +11856,84 @@ window.BENCHMARK_DATA = {
             "value": 467058.10027620645,
             "unit": "ops/sec",
             "extra": "P50: 2.0us | P99: 5.4us | P99.9: 7.9us\nthreads: 1 | elapsed: 0.43s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "10cee2b566a7ac7c17fcd2649633ff2319ffb578",
+          "message": "perf(read): borrow index block on point-read, parse trailer once (#376)\n\n## Summary\n\nThe point-read index lookup went through\n`FullBlockIndex::forward_reader` → `iter()`, which on every `get`:\n\n1. **Cloned the index block** (`self.block.clone()` — a `Bytes` refcount\nbump) so the owned `self_cell` iterator could own its backing data, and\n2. **Re-parsed the block trailer** (`Decoder::new` reads restart /\nbinary-index metadata) even though `FullBlockIndex::new` already parsed\n+ validated it once at table open and discarded it.\n\nNeither is needed for a point read: the lookup is short-lived and can\nborrow the pinned index block, and the trailer metadata is immutable for\nthe table's life.\n\n## Changes\n\n- `DecoderMeta` (`Copy`) captures the parsed trailer fields;\n`Decoder::meta()` extracts it, `Decoder::from_meta()` rebuilds a decoder\nwithout re-reading/validating the trailer.\n- `FullBlockIndex` stores the `DecoderMeta` parsed once in `new()`.\n- `FullBlockIndex::point_read_reader` returns a borrowing\n`PointReadIter` that borrows the pinned index block (no clone) and uses\nthe cached meta (no re-parse), materializing handles lazily.\n- `BlockIndexImpl::point_read_reader` dispatches: `Full` → borrowing\npath; volatile / two-level → existing owned `forward_reader`.\n- `Table::point_read_inner` uses the borrowing reader.\n\nRange scans keep the owned iterator unchanged; read correctness is\nidentical.\n\n## Effect\n\nPer lookup this removes one `Bytes` refcount bump and the trailer\nre-parse from the hot read path. The absolute win is small relative to\nthe ~1.5 us/get warm point-read cost, so it sits below the\n`compare-rocksdb` `point_read` measurement noise floor (the\n`ours/rocksdb` ratio stays ~1.5–1.6x, unchanged within run-to-run\nvariance). This is an architectural overhead removal on the hot path,\nnot a headline number — kept because removing avoidable per-lookup\natomics + re-parsing is strictly better and these add up in P99.\n\n## Testing\n\n- `cargo clippy --all-features --all-targets -- -D warnings` clean\n- `cargo fmt --check` clean; rustdoc `-D warnings` clean\n- `cargo nextest run` 1570 passed (read path is correctness-critical;\nfull suite green)\n\nCloses #375",
+          "timestamp": "2026-06-02T15:40:17+03:00",
+          "tree_id": "0cbd7c60f5b2c4b2126eb5c75c19ecbd263e6284",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/10cee2b566a7ac7c17fcd2649633ff2319ffb578"
+        },
+        "date": 1780407666359,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 2078586.4049349467,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.6us | P99.9: 3.7us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1231514.0277175508,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.2us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 519318.8750734719,
+            "unit": "ops/sec",
+            "extra": "P50: 1.8us | P99: 4.9us | P99.9: 7.3us\nthreads: 1 | elapsed: 0.39s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3644441.0429661376,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 3.0us | P99.9: 5.4us\nthreads: 1 | elapsed: 0.05s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 383471.55239488586,
+            "unit": "ops/sec",
+            "extra": "P50: 2.3us | P99: 5.6us | P99.9: 8.3us\nthreads: 1 | elapsed: 0.52s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 204550.55624552674,
+            "unit": "ops/sec",
+            "extra": "P50: 4.5us | P99: 5.7us | P99.9: 8.1us\nthreads: 1 | elapsed: 0.98s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1254167.952842031,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.3us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1127506.7441674965,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 1.5us | P99.9: 1.8us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 451678.9633140316,
+            "unit": "ops/sec",
+            "extra": "P50: 2.0us | P99: 5.4us | P99.9: 7.9us\nthreads: 1 | elapsed: 0.44s | num: 200000 | iterations: 3"
           }
         ]
       }
