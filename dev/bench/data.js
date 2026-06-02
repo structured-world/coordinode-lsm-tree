@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1780414932587,
+  "lastUpdate": 1780421880117,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -12090,6 +12090,84 @@ window.BENCHMARK_DATA = {
             "value": 460179.44932317873,
             "unit": "ops/sec",
             "extra": "P50: 2.0us | P99: 5.4us | P99.9: 7.9us\nthreads: 1 | elapsed: 0.43s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "c614f7d2d15f67e5328d73ecb50fbd35e72d9793",
+          "message": "perf(table): AVX-512BW 64-byte lane for longest_shared_prefix_length (#380)\n\n## Summary\n\nAdds an AVX-512BW kernel to `longest_shared_prefix_length` (the\nblock-encoding hot path used during flush + compaction), extending the\nx86_64 runtime dispatch from AVX2 to a wider 64-byte lane.\n\n```\nx86_64 dispatch: avx512bw (64B) -> avx2 (32B) -> sse2 (16B)\n```\n\n`lsp_avx512` processes 64 bytes per iteration via\n`_mm512_cmpeq_epi8_mask`, which folds the lane comparison straight into\na native `__mmask64` (no separate `movemask` step). First mismatch is\n`(!mask).trailing_zeros()`; full match is `u64::MAX`. The structure\nmirrors the proven AVX2 kernel.\n\n## Why\n\nWorkloads where adjacent keys share long prefixes (time-series keys,\ntenant/namespace-prefixed keys, sorted UUIDs with a common high prefix)\nfrequently have shared runs exceeding 32 bytes. A 64-byte lane halves\nthe vector-iteration count on those runs. Keys with shared prefix < 64B\nfall through to the existing byte-stride tail, so there is no regression\nfor short keys.\n\n## Detection\n\n- Runtime-only: `is_x86_feature_detected!(\"avx512bw\")` (cached CPUID).\nNo compile-time `#[cfg(target_feature)]` — the same binary runs on CPUs\nwith and without AVX-512.\n- AVX-512BW implies the F subset; `_mm512_cmpeq_epi8_mask` is the BW\nbyte-granular compare. MSRV 1.92 satisfies the 1.89 AVX-512\nstabilization.\n- Majority AVX2-only hosts (consumer Intel 11th gen+ dropped AVX-512;\nAMD Zen4+ / Intel server keep it) pay one extra cached atomic load on\ndispatch, then take the AVX2 path unchanged.\n\n## Testing\n\n- `cargo nextest run --all-features`: 1801 passed, 2 skipped\n- `cargo clippy --all-features --all-targets -- -D warnings` clean on\nboth `aarch64-apple-darwin` and `x86_64-apple-darwin`\n- `cargo fmt --check` clean, `RUSTDOCFLAGS=\"-D warnings\" cargo doc\n--no-deps --all-features` clean\n- New direct kernel test `lsp_avx512_matches_reference_on_boundaries`\ngated on `is_x86_feature_detected!(\"avx512bw\")`, reusing\n`assert_kernel_matches_reference`; runs and verifies the kernel on any\nAVX-512BW CI runner, no-op otherwise. Existing proptest + boundary tests\ncover the dispatched path.\n\nNote: the AVX-512 execution path cannot be exercised on the author's\naarch64 host (Rosetta lacks AVX-512); CI x86_64 runners with AVX-512BW\nprovide live coverage.\n\nCloses #379\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n\n## Summary by CodeRabbit\n\n* **Refactor**\n* Optimized string comparison operations for x86_64 systems with newer\nCPU capabilities, improving performance through enhanced instruction\ndispatch that automatically selects the best code path based on\nprocessor features.\n\n* **Tests**\n* Extended test coverage to validate optimization across boundary\nconditions and mismatch scenarios on compatible hardware.\n\n* **Documentation**\n* Updated dispatch strategy documentation and feature-detection caching\nbehavior.\n\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-06-02T19:45:08+03:00",
+          "tree_id": "b8289e1494ddc540bf3ef60ba33754f1c31c23e6",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/c614f7d2d15f67e5328d73ecb50fbd35e72d9793"
+        },
+        "date": 1780421878221,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 2074687.096470118,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.6us | P99.9: 3.7us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1167146.14781138,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.2us | P99.9: 4.4us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 512934.58026464557,
+            "unit": "ops/sec",
+            "extra": "P50: 1.8us | P99: 5.0us | P99.9: 8.1us\nthreads: 1 | elapsed: 0.39s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3635086.72953428,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 3.1us | P99.9: 5.5us\nthreads: 1 | elapsed: 0.06s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 386214.10900698573,
+            "unit": "ops/sec",
+            "extra": "P50: 2.3us | P99: 5.6us | P99.9: 8.4us\nthreads: 1 | elapsed: 0.52s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 202330.95088706107,
+            "unit": "ops/sec",
+            "extra": "P50: 4.6us | P99: 5.8us | P99.9: 8.4us\nthreads: 1 | elapsed: 0.99s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1234805.997746615,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.2us | P99.9: 4.3us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1114441.570212956,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 1.5us | P99.9: 1.9us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 445039.3562432726,
+            "unit": "ops/sec",
+            "extra": "P50: 2.0us | P99: 6.5us | P99.9: 9.6us\nthreads: 1 | elapsed: 0.45s | num: 200000 | iterations: 3"
           }
         ]
       }
