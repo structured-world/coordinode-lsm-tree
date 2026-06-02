@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1780423491028,
+  "lastUpdate": 1780428105384,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -12246,6 +12246,84 @@ window.BENCHMARK_DATA = {
             "value": 457006.05512229266,
             "unit": "ops/sec",
             "extra": "P50: 2.0us | P99: 5.5us | P99.9: 8.0us\nthreads: 1 | elapsed: 0.44s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "c031849cd24e3d7ba13cfb9e7ca500818694536d",
+          "message": "perf(table): extend longest_shared_prefix_length SIMD to 32-bit x86 (i686) (#382)\n\n## Summary\n\nWidens the SSE2 / AVX2 / AVX-512BW kernels of\n`longest_shared_prefix_length` (block-encoding hot path: flush +\ncompaction) from `target_arch = \"x86_64\"` only to also cover\n`target_arch = \"x86\"` (i686), reusing the identical intrinsics from\n`std::arch::x86`. Previously 32-bit x86 fell back to the 8-byte scalar\nword-stride kernel despite those CPUs exposing the same\nSSE2/AVX2/AVX-512 ISA.\n\n## Dispatch on x86\n\nFully runtime-detected (no compile-time feature gate — one binary serves\nall CPUs):\n\n```\nx86: avx512bw (64B) -> avx2 (32B) -> sse2 (16B) -> scalar\n```\n\nKey difference from x86_64: SSE2 is the **mandatory** x86_64 baseline\n(called unconditionally there), but on 32-bit x86 it is **not**\nguaranteed (pre-Pentium-4 lacks it), so SSE2 is runtime-detected too,\nwith the scalar kernel as the pre-SSE2 fallback. The unreachable-code\n`expect` on the scalar tail intentionally excludes `x86` (the tail is\nreachable there).\n\n## Implementation\n\n- Kernel cfg gates widened to `any(target_arch = \"x86_64\", target_arch =\n\"x86\")`; intrinsics imported from the matching arch module via per-arch\n`use`.\n- New `#[cfg(target_arch = \"x86\")]` dispatch arm.\n- Direct kernel tests widened to x86; the SSE2 test runtime-detects\n`sse2` on x86 (unconditional on x86_64).\n\n## Testing\n\n- `cargo check --target i686-unknown-linux-gnu --lib`: clean (verifies\nthe x86 kernels + dispatch compile)\n- `cargo nextest run --all-features`: 1799 passed, 2 skipped (aarch64\nhost; no regression)\n- `cargo clippy --all-features --all-targets -- -D warnings` clean on\nx86_64 + aarch64; `cargo fmt --check` clean; `RUSTDOCFLAGS=\"-D warnings\"\ncargo doc` clean\n\nNote: full i686 test execution (and the C-zstd `--all-features` build)\nis covered by the CI `cross (i686-unknown-linux-gnu)` job; locally the\ni686 test build needs an i686 C cross-compiler that isn't installed on\nthe author's host. No behavior change on x86_64 / aarch64 / other\ntargets.\n\nCloses #381",
+          "timestamp": "2026-06-02T18:21:14Z",
+          "tree_id": "843e1d7a5476ca89f11dd676e24a311aab00ae96",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/c031849cd24e3d7ba13cfb9e7ca500818694536d"
+        },
+        "date": 1780428103542,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 2076783.763073198,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.6us | P99.9: 3.7us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1209078.0652194966,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.2us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 513954.7978811083,
+            "unit": "ops/sec",
+            "extra": "P50: 1.8us | P99: 5.1us | P99.9: 7.5us\nthreads: 1 | elapsed: 0.39s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3649437.247652819,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 3.0us | P99.9: 5.5us\nthreads: 1 | elapsed: 0.05s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 379642.4748503422,
+            "unit": "ops/sec",
+            "extra": "P50: 2.3us | P99: 5.6us | P99.9: 8.4us\nthreads: 1 | elapsed: 0.53s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 203480.13209409267,
+            "unit": "ops/sec",
+            "extra": "P50: 4.6us | P99: 5.8us | P99.9: 9.4us\nthreads: 1 | elapsed: 0.98s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1200436.5987909802,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.2us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1106968.1904111481,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.4us | P99.9: 1.8us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 448161.2187202964,
+            "unit": "ops/sec",
+            "extra": "P50: 2.0us | P99: 6.6us | P99.9: 9.8us\nthreads: 1 | elapsed: 0.45s | num: 200000 | iterations: 3"
           }
         ]
       }
