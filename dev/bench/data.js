@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1780407725473,
+  "lastUpdate": 1780414932587,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -12012,6 +12012,84 @@ window.BENCHMARK_DATA = {
             "value": 443787.92431312334,
             "unit": "ops/sec",
             "extra": "P50: 2.1us | P99: 5.4us | P99.9: 7.8us\nthreads: 1 | elapsed: 0.45s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "07470ba5dd3332488b4f6062ce3f4d33fc678b30",
+          "message": "perf(fs): pure hard_link; single SyncMode-aware cross-fs copy path (#378)\n\n## Summary\n\n`StdFs::hard_link` caught EXDEV (cross-device) internally and\nbyte-copied the file with an unconditional `FsFile::sync_all`, so\ncross-device checkpoint copies paid `F_FULLFSYNC` on macOS regardless of\n`Config::sync_mode`. This was the last fsync site not honoring\n`SyncMode` (noted as a known limitation in #374).\n\n## Changes\n\n- `StdFs::hard_link` is now a **pure link** — it surfaces the EXDEV /\ncross-device error instead of silently byte-copying.\n- Checkpoint's `link_or_copy_cross_fs` (the one production caller)\nalready has a `SyncMode`-aware streamed copy; its `hard_link`\nfall-through now also triggers on cross-device errors (via\n`is_cross_device`), so the copied file's durability honors\n`Config::sync_mode`.\n- This collapses the two cross-filesystem copy implementations into one:\n`copy_fallback` (and its two unit tests) are removed, leaving\n`link_or_copy_cross_fs` as the single copy path. `is_cross_device` is\nre-exported `pub(crate)` for the caller's detection.\n- `MemFs` (in-memory copy = its link semantics) and `IoUringFs`\n(delegates to `StdFs`) are unaffected.\n\nThis is Option B from #377 (the architecturally cleaner one): rather\nthan add a `SyncMode` parameter to the generic `Fs::hard_link` trait\nmethod — which is about linking, not fsync — the durability decision\nstays at the single layer that performs the copy.\n\n## Testing\n\n- `cargo clippy --all-features --all-targets -- -D warnings` clean\n- `cargo fmt --check` clean; rustdoc `-D warnings` clean\n- `cargo nextest run` 1572 passed; `--all-features` 1799 passed (the −2\nvs prior is the removed `copy_fallback` unit tests; cross-fs copy is\ncovered by the `link_or_copy_cross_fs` StdFs→MemFs test + the\n`is_cross_device` detection test). A real EXDEV scenario needs two\nmounted filesystems, impractical in unit tests.\n\nCloses #377",
+          "timestamp": "2026-06-02T18:41:12+03:00",
+          "tree_id": "aa98886ee7467f4a920375ed88c33c7273343b6e",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/07470ba5dd3332488b4f6062ce3f4d33fc678b30"
+        },
+        "date": 1780414931632,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 2050528.5714140711,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.6us | P99.9: 3.7us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1146700.7264303232,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.2us | P99.9: 4.3us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 519829.20741079334,
+            "unit": "ops/sec",
+            "extra": "P50: 1.8us | P99: 4.9us | P99.9: 7.4us\nthreads: 1 | elapsed: 0.38s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3621973.9290678785,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 3.1us | P99.9: 5.4us\nthreads: 1 | elapsed: 0.06s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 387496.9002427651,
+            "unit": "ops/sec",
+            "extra": "P50: 2.3us | P99: 5.6us | P99.9: 8.5us\nthreads: 1 | elapsed: 0.52s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 203497.85420568395,
+            "unit": "ops/sec",
+            "extra": "P50: 4.6us | P99: 5.7us | P99.9: 8.1us\nthreads: 1 | elapsed: 0.98s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1159902.419265311,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.2us | P99.9: 4.3us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1125510.5745066868,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 1.5us | P99.9: 1.9us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 460179.44932317873,
+            "unit": "ops/sec",
+            "extra": "P50: 2.0us | P99: 5.4us | P99.9: 7.9us\nthreads: 1 | elapsed: 0.43s | num: 200000 | iterations: 3"
           }
         ]
       }
