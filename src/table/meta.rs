@@ -71,11 +71,15 @@ pub struct ParsedMeta {
     ///
     /// Note this is "ECC enabled for the table", not "every block carries a
     /// parity trailer": a block with an empty payload emits a zero-length
-    /// trailer and leaves its `ECC_PARITY` flag clear even under `page_ecc`.
-    /// The per-block `ECC_PARITY` flag (self-describing) is the authoritative
-    /// per-block signal; this descriptor records the table-wide intent and is
-    /// the source for the SST read path once `block_flags` later moves off
-    /// the per-block header.
+    /// trailer (`expected_parity_len(0) == 0`) even under `page_ecc`.
+    ///
+    /// For SST block types (`Data` / `Index` / `Filter` / `RangeTombstone`)
+    /// this descriptor IS the parity-presence signal today: those blocks omit
+    /// the `block_flags` byte on disk, so there is no per-block `ECC_PARITY`
+    /// flag to read and the read path derives the trailer from this table-wide
+    /// flag + `expected_parity_len(data_length)`. The self-describing block
+    /// types (`Meta` / `Manifest` / `ManifestFooter`) keep the byte and still
+    /// carry a per-block `ECC_PARITY` flag.
     pub page_ecc: bool,
 }
 
