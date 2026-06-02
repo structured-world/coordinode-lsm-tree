@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1780386474802,
+  "lastUpdate": 1780392123958,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -11700,6 +11700,84 @@ window.BENCHMARK_DATA = {
             "value": 456322.6404039967,
             "unit": "ops/sec",
             "extra": "P50: 2.0us | P99: 6.6us | P99.9: 9.7us\nthreads: 1 | elapsed: 0.44s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "9d5b30b8ef3c7c8d8ed068c453f0300df7481d0b",
+          "message": "feat(index): per-block seqno bounds in SST index entries (#371)\n\n> **Stacked on #369 (#298).** This branch is rebased on top of\n`feat/#298-per-kv-protection`, so the diff currently also shows #369's\ncommits (per-KV checksum footers, Page ECC, the `block_flags` transform\ndescriptors). Those are NOT part of #224's own change — once #369\nmerges, this PR rebases onto `main` and the diff narrows to the\n`seqno_in_index` work described below. Review #224's own changes via the\ncommit list (`feat(runtime-config)`/`feat(table)`/`feat(index)` + their\nreview-fix commits), not the combined file diff.\n\n## Summary\n\nLands the on-disk format slice for `scan_since_seqno` (#224): SST index\nentries can carry per-block `(seqno_min, seqno_max)` so a seqno-scoped\nscan\ncan skip a whole data block whose `max` is below the target without\nreading\nit. This is the V5-gating part of #224 (it changes the on-disk wire\nformat);\nthe `Tree::scan_since_seqno` public API + block-skip read path + CDC\nevent\nstream land in a follow-up PR (they are read-only and do not change the\non-disk format).\n\n**Default off, byte-identical.** `RuntimeConfig.seqno_in_index` defaults\n`false`; when off, index blocks are byte-identical to the pre-#224\n`index_format = 0` layout. The capability is purely additive within V5\n(no format-version bump): a tree opts in at runtime, and the next flush\n/\ncompaction starts emitting the bounded format.\n\n## What changed\n\n- **`RuntimeConfig.seqno_in_index: bool`** (default `false`) — runtime\nswitch,\ntoggleable via `update_runtime_config`. Read off the current snapshot in\n  flush / compaction / ingest and preserved across writer rotation.\n- **`index_format` byte in the SST Properties block** (per-SST, per Q8):\n`0` =\nlegacy (no per-block seqno bounds), `1` = index entries carry the\nbounds.\n  Parsed as optional — SSTs written before the key existed read as `0`.\n- **Self-describing index entries** — wire markers `0`/`1` stay the\nlegacy\nfull/truncated entries; `2`/`3` add the two bounds right after the entry\nseqno. Decode dispatches on the marker, so legacy and mixed-format trees\nread transparently with no per-SST flag threaded through the block\ndecoder.\n- The writer computes the bounds in one pass over the spill chunk\n(already in\n  hand) and tags `index_format = 1` only when `seqno_in_index` is on.\n\n## Testing\n\n- Full suite (default features): 1566 passed\n- Full suite (`--all-features`): 1792 passed\n- Lint (`--all-features --all-targets` and default-feature), fmt, and\nrustdoc with warnings-as-errors: clean\n- New unit tests: marker 2/3 round-trip, `parse_restart_key` skips\nbounds on marker 2, `index_format` absent maps to 0 / present maps to 1,\ninverted-bounds rejection, unknown `index_format` rejection\n- New integration test:\n`seqno_in_index_round_trips_through_disk_and_reopen` (asserts\nmulti-block precondition)\n- Wire-compat: with `seqno_in_index = false`, index layout is\nbyte-identical to legacy\n\nPart of #224. Depends on #352 (RuntimeConfig foundation, merged).\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n## Summary by CodeRabbit\n\n* **New Features**\n* Added optional per-block sequence number indexing as configurable\nruntime behavior for improved index efficiency.\n* Added support for KV checksums in SST files to enhance data integrity\nverification.\n* Extended metadata to expose checksum algorithms and index format\ninformation.\n\n* **Tests**\n* Added integration test validating index format persistence through\ndisk flushes and tree reopens.\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-06-02T12:21:07+03:00",
+          "tree_id": "3000717ec6e7f2b79c34905b5e32fea0338963ad",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/9d5b30b8ef3c7c8d8ed068c453f0300df7481d0b"
+        },
+        "date": 1780392120951,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 2115454.996979183,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.6us | P99.9: 3.7us\nthreads: 1 | elapsed: 0.09s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1114123.825727414,
+            "unit": "ops/sec",
+            "extra": "P50: 0.8us | P99: 2.2us | P99.9: 4.3us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 529844.7773893065,
+            "unit": "ops/sec",
+            "extra": "P50: 1.7us | P99: 5.0us | P99.9: 7.4us\nthreads: 1 | elapsed: 0.38s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3607602.126796897,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 3.1us | P99.9: 5.5us\nthreads: 1 | elapsed: 0.06s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 376102.8527418305,
+            "unit": "ops/sec",
+            "extra": "P50: 2.3us | P99: 5.7us | P99.9: 8.4us\nthreads: 1 | elapsed: 0.53s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 202184.16807062004,
+            "unit": "ops/sec",
+            "extra": "P50: 4.6us | P99: 5.8us | P99.9: 10.9us\nthreads: 1 | elapsed: 0.99s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1217522.6591620194,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.3us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1105733.2423418078,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.5us | P99.9: 1.9us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 461122.66722942074,
+            "unit": "ops/sec",
+            "extra": "P50: 2.0us | P99: 5.4us | P99.9: 7.9us\nthreads: 1 | elapsed: 0.43s | num: 200000 | iterations: 3"
           }
         ]
       }
