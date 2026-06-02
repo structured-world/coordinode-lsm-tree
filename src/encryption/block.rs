@@ -257,11 +257,19 @@ fn decode_metadata_payload(payload: &[u8]) -> Result<ParsedMetadata, DecryptErro
         ));
     }
     // BlockFlags: transform-presence bitfield mirrored from the
-    // Block::Header. Read verbatim; the AAD binds the whole byte so a
-    // relabel of any transform bit (e.g. clearing the per-KV footer bit)
-    // fails AEAD verification. No per-bit validation here — unknown bits
-    // are reserved and a future writer may set them.
+    // Block::Header. The AAD binds the whole byte, so a relabel of any known
+    // transform bit fails AEAD verification. Reject any bit outside the KNOWN
+    // mask BEFORE running the AEAD: for an encrypted block this byte is the
+    // only transform descriptor the reader can trust, so a forward-
+    // incompatible block (one whose post-decrypt transform stack this build
+    // does not understand) must fail-fast rather than authenticate and then
+    // mis-process. Mirrors the same rejection in `Header::decode_from`.
     let block_flags = read_u8(&mut cursor)?;
+    if block_flags & !crate::table::block::header::block_flags::KNOWN != 0 {
+        return Err(DecryptError::MalformedMetadataFrame(
+            "unknown bits set in BlockFlags",
+        ));
+    }
     // Zero-init scratch buffer that gets overwritten by the next
     // `read_exact` from the on-disk `MetadataPayload`. NOT a
     // hard-coded nonce: this is the read side, and the bytes that
@@ -847,6 +855,26 @@ mod tests {
         assert!(
             matches!(err, DecryptError::MalformedBodyFrame(_)),
             "expected MalformedBodyFrame for oversized BodyFrame PayloadLen, got {err:?}",
+        );
+    }
+
+    #[test]
+    fn unknown_block_flags_bit_rejected_before_aead() {
+        // For an encrypted block the BlockFlags byte is the only transform
+        // descriptor the reader can trust. A byte with a reserved bit set (a
+        // forward-incompatible transform stack this build cannot process) must
+        // be rejected structurally — before the AEAD runs — not authenticated
+        // and then mis-processed.
+        let plaintext = b"the quick brown fox";
+        let mut sealed = encrypt_block(plaintext, &id(), &ctx(), &chain()).unwrap();
+        // BlockFlags sits at MetadataFrame payload offset 10 → absolute offset
+        // 8 (framing) + 10 = 18. Set a reserved bit (1<<4) outside KNOWN.
+        const BLOCK_FLAGS_AT: usize = 8 + 10;
+        sealed[BLOCK_FLAGS_AT] |= 0x10;
+        let err = decrypt_block(&sealed, &id(), &chain()).unwrap_err();
+        assert!(
+            matches!(err, DecryptError::MalformedMetadataFrame(_)),
+            "expected MalformedMetadataFrame for unknown BlockFlags bit, got {err:?}",
         );
     }
 }
