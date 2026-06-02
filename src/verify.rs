@@ -555,8 +555,24 @@ pub fn verify_sst_file(path: &std::path::Path) -> BlockVerifyReport {
 
     // SST blocks omit the block_flags byte, so the parity-trailer presence the
     // walk must skip is the per-SST `page_ecc` flag — read it from the meta
-    // descriptor (best-effort; see `read_page_ecc_out_of_band`).
-    let page_ecc = read_page_ecc_out_of_band(&fs, path);
+    // descriptor. If it can't be determined (corrupt meta, or an encrypted SST
+    // with no key out-of-band), DO NOT assume disabled: walking an ECC-bearing
+    // SST without skipping parity trailers mis-aligns the scan and reports
+    // spurious corruption. Surface the indeterminacy and skip the walk.
+    let Some(page_ecc) = read_page_ecc_out_of_band(&fs, path) else {
+        report.errors.push(BlockVerifyError::SstFileUnreadable {
+            table_id: 0,
+            path: path.to_path_buf(),
+            error: std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "could not read the SST meta block to determine page_ecc \
+                 (missing / corrupt file, or an encrypted SST with no key \
+                 out-of-band); skipping the block walk — use \
+                 verify_block_checksums on a live tree for ECC-aware verification",
+            ),
+        });
+        return report;
+    };
 
     match scan_sst_blocks(&fs, path, 0, 0, page_ecc) {
         Ok(per_file) => {
@@ -578,34 +594,30 @@ pub fn verify_sst_file(path: &std::path::Path) -> BlockVerifyReport {
 /// Best-effort read of the per-SST `page_ecc` flag from an SST file's meta
 /// descriptor, for the out-of-band scrub (no live `Table` to consult).
 ///
-/// Returns `false` when the file can't be opened, the TOC has no `meta`
-/// section, or the meta block can't be decoded (e.g. an encrypted SST —
-/// out-of-band tools carry no key, matching the documented encryption
-/// limitation). A wrong `false` only mis-aligns a `page_ecc` SST's walk, which
-/// surfaces as a reported `HeaderCorrupted`, never a silent pass.
+/// Returns `Some(page_ecc)` when the meta block decodes. Returns `None` when
+/// the flag is UNDETERMINABLE — the file can't be opened, the TOC has no `meta`
+/// section, or the meta block can't be decoded (a corrupt meta, or an encrypted
+/// SST whose key the out-of-band tool doesn't have). The caller MUST NOT treat
+/// `None` as "`page_ecc` disabled": walking an ECC-bearing SST without skipping
+/// the parity trailers mis-aligns the block scan and reports spurious
+/// corruption, so the caller skips the walk and surfaces the indeterminacy
+/// instead.
 #[cfg(feature = "std")]
-fn read_page_ecc_out_of_band(fs: &dyn crate::fs::Fs, path: &std::path::Path) -> bool {
-    let Ok(file) = fs.open(path, &crate::fs::FsOpenOptions::new().read(true)) else {
-        return false;
-    };
+fn read_page_ecc_out_of_band(fs: &dyn crate::fs::Fs, path: &std::path::Path) -> Option<bool> {
+    let file = fs
+        .open(path, &crate::fs::FsOpenOptions::new().read(true))
+        .ok()?;
     let mut probe = file;
-    let Ok(sfa_reader) = crate::sfa::Reader::from_reader(&mut probe) else {
-        return false;
-    };
-    let Some((pos, len)) = sfa_reader
+    let sfa_reader = crate::sfa::Reader::from_reader(&mut probe).ok()?;
+    let (pos, len) = sfa_reader
         .toc()
         .section(b"meta")
-        .map(|e| (e.pos(), e.len()))
-    else {
-        return false;
-    };
-    let Ok(size) = u32::try_from(len) else {
-        return false;
-    };
+        .map(|e| (e.pos(), e.len()))?;
+    let size = u32::try_from(len).ok()?;
     let handle = crate::table::BlockHandle::new(crate::table::BlockOffset(pos), size);
     crate::table::meta::ParsedMeta::load_with_handle(probe.as_ref(), &handle, None)
         .map(|meta| meta.page_ecc)
-        .unwrap_or(false)
+        .ok()
 }
 
 struct PerFileScan {
