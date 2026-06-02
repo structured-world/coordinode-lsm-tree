@@ -719,10 +719,13 @@ impl DataBlock {
     }
 
     /// Builds a per-KV-checked data block: the standard data-block payload
-    /// followed by a per-KV checksum footer. The caller records the
-    /// presence of the footer by setting the `KV_CHECKSUM_FOOTER` header
-    /// flag (via `Block::write_into_with_flags`); the block role stays
-    /// `Data`.
+    /// followed by a per-KV checksum footer. The block role stays `Data`.
+    ///
+    /// Footer presence is recorded out-of-band in the per-SST meta descriptor
+    /// (`descriptor#kv_checksum`), NOT in a per-block header flag: SST data
+    /// blocks omit the `block_flags` byte on disk, so `header.block_flags`
+    /// decodes as `0` and the read path consults the descriptor (not the
+    /// header) to decide whether to strip the footer.
     ///
     /// `digests` MUST be in the same order as `items` (digest `i` belongs to
     /// entry `i` in scan order) and computed via

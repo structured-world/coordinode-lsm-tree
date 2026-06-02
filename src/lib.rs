@@ -74,10 +74,14 @@
 //! Current version: **V5**. V5 introduces the `BuRR` filter wire format,
 //! per-block Reed-Solomon Page ECC, and per-entry (per-KV) checksum
 //! footers (collapsed into the same version because V5 had not shipped
-//! when they landed): the block header gains a `block_flags` byte whose
-//! `ECC_PARITY` bit marks a parity trailer and whose `KV_CHECKSUM_FOOTER`
-//! bit marks a per-entry checksum footer, and the block magic is bumped
-//! so a pre-V5 reader rejects V5 blocks immediately at header decode.
+//! when they landed): the self-describing block types (`Meta` / `Manifest` /
+//! `ManifestFooter`) gain a `block_flags` byte whose `ECC_PARITY` bit marks a
+//! parity trailer and whose `KV_CHECKSUM_FOOTER` bit marks a per-entry
+//! checksum footer. SST block types (`Data` / `Index` / `Filter` /
+//! `RangeTombstone`) keep the compact header WITHOUT that byte and derive parity / footer
+//! presence from the per-SST meta descriptors (`descriptor#page_ecc`,
+//! `descriptor#kv_checksum`). The block magic is bumped so a pre-V5 reader
+//! rejects V5 blocks immediately at header decode.
 //! V3-V4 databases are not readable by this version and vice versa. The
 //! manifest version gate rejects pre-V5 databases at `Tree::open` time.
 //! V4 introduced range tombstones (still supported).

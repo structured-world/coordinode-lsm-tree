@@ -3,11 +3,17 @@
 
 //! Per-KV checksum footer for per-KV-checked data blocks.
 //!
-//! A per-KV-checked block (one whose header carries the
-//! [`KV_CHECKSUM_FOOTER`](super::header::block_flags::KV_CHECKSUM_FOOTER)
-//! flag) is a standard data block payload, byte-for-byte identical to a
-//! plain [`BlockType::Data`](super::BlockType::Data) block, followed by a
-//! fixed trailing footer:
+//! A per-KV-checked block is a standard data block payload, byte-for-byte
+//! identical to a plain [`BlockType::Data`](super::BlockType::Data) block,
+//! followed by a fixed trailing footer.
+//!
+//! Footer presence is NOT read from a per-block header flag for SST data
+//! blocks: those omit the `block_flags` byte on disk (V5 variable header), so
+//! `header.block_flags` always decodes as `0` and the
+//! [`KV_CHECKSUM_FOOTER`](super::header::block_flags::KV_CHECKSUM_FOOTER) bit
+//! is never serialized for them. The read path learns whether to strip the
+//! footer from the per-SST meta descriptor (`descriptor#kv_checksum`),
+//! threaded in out-of-band. The footer layout is:
 //!
 //! ```text
 //! [ standard Data-block payload ]

@@ -25,9 +25,9 @@ use std::process::ExitCode;
 /// caller does not supply `--len`. Chosen to cover one `Header`
 /// (at least 33 bytes: 4 B magic + 1 B block_type + 16 B
 /// XXH3-128 checksum + 4 B data_length + 4 B uncompressed_length +
-/// 4 B trailing checksum tag — see `Header::MIN_LEN`; meta / manifest
-/// blocks add one `block_flags` byte) plus a few payload lines worth
-/// of context.
+/// 4 B trailing checksum tag — see `Header::MIN_LEN`; the self-describing
+/// block types (Meta / Manifest / ManifestFooter) add one `block_flags`
+/// byte) plus a few payload lines worth of context.
 const HEX_DEFAULT_LEN: u64 = 256;
 /// Hard ceiling on the user-requestable `hex` length so a typo
 /// (`--len 4294967295`) can't allocate a 4 GiB buffer. 1 MiB
