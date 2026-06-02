@@ -85,23 +85,30 @@ pub struct ParsedMeta {
 
 macro_rules! read_u8 {
     ($block:expr, $name:expr, $cmp:expr) => {{
-        let bytes = $block
+        let item = $block
             .point_read($name, SeqNo::MAX, $cmp)?
             .ok_or(crate::Error::InvalidHeader("TableMeta"))?;
-
-        let mut bytes = &bytes.value[..];
-        bytes.read_u8()?
+        // Single-byte meta value: reject an overlong / corrupt payload instead
+        // of silently truncating to the first byte (read_u8 ignores trailing
+        // bytes), which would weaken corruption detection on these
+        // format-critical descriptor fields.
+        match &item.value[..] {
+            [b] => *b,
+            _ => return Err(crate::Error::InvalidHeader("TableMeta")),
+        }
     }};
 }
 
 macro_rules! read_u64 {
     ($block:expr, $name:expr, $cmp:expr) => {{
-        let bytes = $block
+        let item = $block
             .point_read($name, SeqNo::MAX, $cmp)?
             .ok_or(crate::Error::InvalidHeader("TableMeta"))?;
-
-        let mut bytes = &bytes.value[..];
-        bytes.read_u64::<LittleEndian>()?
+        // Exactly eight little-endian bytes: an overlong / short payload is
+        // corrupt meta, not silently truncatable.
+        let bytes = <[u8; 8]>::try_from(&item.value[..])
+            .map_err(|_| crate::Error::InvalidHeader("TableMeta"))?;
+        u64::from_le_bytes(bytes)
     }};
 }
 
@@ -567,6 +574,28 @@ mod tests {
             matches!(result, Err(crate::Error::InvalidHeader("TableMeta"))),
             "expected InvalidHeader(\"TableMeta\"), got {result:?}",
         );
+    }
+
+    /// An overlong single-byte descriptor payload (e.g. `[0, 0xFF]`) must be
+    /// rejected as `InvalidHeader`, not silently truncated to the first byte —
+    /// `read_u8!` would otherwise ignore the trailing bytes and weaken
+    /// corruption detection on these format-critical per-SST descriptors.
+    #[test]
+    fn load_with_handle_overlong_descriptor_payload_is_rejected() {
+        for key in ["descriptor#kv_checksum", "descriptor#page_ecc"] {
+            let mut items = valid_meta_items();
+            if let Some(item) = items
+                .iter_mut()
+                .find(|iv| &*iv.key.user_key == key.as_bytes())
+            {
+                *item = meta(key, &[0u8, 0xFF]);
+            }
+            let result = load_meta_from_items(&items);
+            assert!(
+                matches!(result, Err(crate::Error::InvalidHeader("TableMeta"))),
+                "overlong {key} payload must be rejected, got {result:?}",
+            );
+        }
     }
 
     /// `descriptor#page_ecc` round-trips: `0` → `false` (no parity trailer),
