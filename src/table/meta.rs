@@ -332,8 +332,9 @@ impl ParsedMeta {
             None => 0u8,
             // The value must be EXACTLY one byte. Matching a single-element slice
             // rejects trailing bytes, so a corrupt payload like `[1, 0xFF]` is an
-            // error rather than parsing as `1`. Since this byte selects the
-            // index-entry decoder, require an exact one-byte payload.
+            // error rather than parsing as `1`. This byte is a metadata hint
+            // recording which index format the writer emitted; the per-entry
+            // decode itself dispatches on per-entry markers, not on this value.
             Some(item) => match &item.value[..] {
                 [b] => *b,
                 _ => return Err(crate::Error::InvalidHeader("TableMeta")),
@@ -341,8 +342,7 @@ impl ParsedMeta {
         };
         // Only `0` (legacy) and `1` (per-block seqno bounds) are defined in
         // this format slice. Reject any other byte as corrupt / forward-
-        // incompatible metadata rather than letting a bogus on-disk format
-        // flow downstream to the index decoder.
+        // incompatible metadata rather than trusting a bogus on-disk hint.
         if index_format > 1 {
             return Err(crate::Error::InvalidHeader("TableMeta"));
         }

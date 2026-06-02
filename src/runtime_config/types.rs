@@ -530,9 +530,11 @@ pub struct RuntimeConfig {
     ///
     /// Default `false`: index blocks are byte-identical to the pre-#224
     /// `index_format = 0` format, and `scan_since_seqno` falls back to a
-    /// per-entry filter. Read paths dispatch on each SST's own
-    /// `index_format` byte regardless of this setting, so mixed-format
-    /// trees (some SSTs migrated, some not) read correctly.
+    /// per-entry filter. Decoding is marker-based: each index entry is
+    /// self-describing (legacy markers `0`/`1`, seqno-bounded `2`/`3`), so
+    /// mixed-format trees (some SSTs migrated, some not) read correctly
+    /// regardless of this setting; the stored `index_format` byte is a
+    /// metadata hint, not the decode switch.
     ///
     /// Toggle takes effect on the next compaction / flush; existing SSTs
     /// keep their original `index_format`. Compaction migrates source
