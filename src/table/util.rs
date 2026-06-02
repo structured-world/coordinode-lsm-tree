@@ -380,7 +380,13 @@ unsafe fn lsp_avx2(s1: &[u8], s2: &[u8]) -> usize {
 /// (`is_x86_feature_detected!("avx512bw")`). BW implies the F subset, so the
 /// 512-bit load and the byte-granular compare-mask are both available.
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx512bw")]
+// List both ISA features the body relies on: `_mm512_loadu_si512` is AVX-512F,
+// `_mm512_cmpeq_epi8_mask` is AVX-512BW. BW implies F (so `avx512bw` alone would
+// compile), but naming both keeps the gate matching the actual requirements and
+// guards against a future edit dropping the BW-only compare without noticing the
+// F load is still gated. Runtime detection on `avx512bw` is sufficient because
+// any CPU exposing BW necessarily implements F.
+#[target_feature(enable = "avx512bw,avx512f")]
 #[expect(unsafe_code, reason = "intrinsics require unsafe")]
 #[must_use]
 unsafe fn lsp_avx512(s1: &[u8], s2: &[u8]) -> usize {
@@ -873,7 +879,7 @@ mod tests {
             return;
         }
         // SAFETY: AVX-512BW availability just verified via runtime CPU feature detection.
-        assert_kernel_matches_reference("avx512", |a, b| unsafe { lsp_avx512(a, b) });
+        assert_kernel_matches_reference("avx512bw", |a, b| unsafe { lsp_avx512(a, b) });
     }
 
     /// Direct test for the NEON 16-byte kernel on LE aarch64. Required because
