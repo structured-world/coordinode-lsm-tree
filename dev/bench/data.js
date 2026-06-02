@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1780407668085,
+  "lastUpdate": 1780407725473,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -11934,6 +11934,84 @@ window.BENCHMARK_DATA = {
             "value": 451678.9633140316,
             "unit": "ops/sec",
             "extra": "P50: 2.0us | P99: 5.4us | P99.9: 7.9us\nthreads: 1 | elapsed: 0.44s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "d3cadd02812dc35a29f267643aada5a3ce1fe970",
+          "message": "perf(fs): configurable SyncMode; default plain fsync on macOS (#374)\n\n## Summary\n\nOn macOS, Rust std maps **both** `File::sync_all` and `File::sync_data`\nto `fcntl(F_FULLFSYNC)` — a full hardware barrier. Measured on an\nM-series machine: `File::sync_all` **3.9 ms** vs plain `libc::fsync`\n**0.075 ms** (52x). A fresh open + flush issues ~8-10 sync points, so\nmacOS paid ~40 ms of fixed cost per flush — dominating small-batch\nwrites and slowing the whole test suite. RocksDB and SQLite default to\nplain `fsync`; we now match that.\n\nThis is also a durability-level choice: `F_FULLFSYNC` survives power\nloss; plain `fsync` reaches the drive cache (the RocksDB / SQLite\ndefault). On Linux there is no `F_FULLFSYNC` concept — `sync_all` is\nalready plain `fsync`, so this only changes macOS behavior.\n\n## Changes\n\nAdds `SyncMode { Normal, Full }` with `Config::sync_mode` (default\n`Normal`):\n\n- `Normal`: plain `fsync` on every platform; on macOS skips\n`F_FULLFSYNC`.\n- `Full`: `F_FULLFSYNC` on macOS for power-loss durability; identical to\n`Normal` elsewhere.\n\n`FsFile` gains `sync_all_with` / `sync_data_with`, `Fs` gains\n`sync_directory_with` (default impls delegate to the full-durability\nmethods; the std `File` / `StdFs` backends override them, calling\n`libc::fsync` directly on macOS for `Normal`). The mode is threaded from\n`Config` through the SST writer, `MultiWriter`, manifest writer, version\npersist, directory fsyncs, tree open, checkpoint, and the **blob-file\nwriter** (vlog `Writer` / `MultiWriter`, wired at flush / compaction /\nGC / ingest).\n\n### Known limitation\n\n`StdFs::hard_link`'s cross-device (EXDEV) copy fallback still issues an\nunconditional `F_FULLFSYNC` because `Fs::hard_link` has no `SyncMode`\nparameter. Reachable only from cross-device checkpoint copies; threading\n`SyncMode` there is tracked in #377.\n\n## Effect\n\nDefault-feature test suite execution on this macOS machine: **~37.7 s →\n~12.6 s** (~3x), purely from skipping `F_FULLFSYNC` on the many flushes\ntests perform. The same fixed-cost reduction shows up in the\n`compare-rocksdb` `write_throughput` workload.\n\n## Testing\n\n- `cargo clippy --all-features --all-targets -- -D warnings` clean\n- `cargo fmt --check` clean; rustdoc `-D warnings` clean\n- `cargo nextest run` 1574 passed; `--all-features` 1801 passed\n- `tests/sync_mode.rs`: flush round-trips under both modes +\ndefault-is-Normal; fs-level `std_fs_sync_with_both_modes_persists`\nexercises the macOS plain-fsync and F_FULLFSYNC branches\n\nCloses #373",
+          "timestamp": "2026-06-02T16:12:23+03:00",
+          "tree_id": "8355171248e57d9164850f37541d4bafa6b74791",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/d3cadd02812dc35a29f267643aada5a3ce1fe970"
+        },
+        "date": 1780407724493,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 2116025.866850363,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.6us | P99.9: 3.7us\nthreads: 1 | elapsed: 0.09s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1204017.6189677469,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.2us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 509078.40927220753,
+            "unit": "ops/sec",
+            "extra": "P50: 1.8us | P99: 5.0us | P99.9: 7.5us\nthreads: 1 | elapsed: 0.39s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3650311.876258662,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 3.0us | P99.9: 5.4us\nthreads: 1 | elapsed: 0.05s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 375375.10060756525,
+            "unit": "ops/sec",
+            "extra": "P50: 2.3us | P99: 5.6us | P99.9: 8.3us\nthreads: 1 | elapsed: 0.53s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 201335.27669524692,
+            "unit": "ops/sec",
+            "extra": "P50: 4.6us | P99: 7.2us | P99.9: 9.4us\nthreads: 1 | elapsed: 0.99s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1261942.3201626032,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.2us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1125273.8262427663,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 1.4us | P99.9: 1.9us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 443787.92431312334,
+            "unit": "ops/sec",
+            "extra": "P50: 2.1us | P99: 5.4us | P99.9: 7.8us\nthreads: 1 | elapsed: 0.45s | num: 200000 | iterations: 3"
           }
         ]
       }
