@@ -17,7 +17,7 @@ mod trailer;
 mod transform;
 mod r#type;
 
-pub(crate) use decoder::{Decodable, Decoder, ParsedItem};
+pub(crate) use decoder::{Decodable, Decoder, DecoderMeta, ParsedItem};
 pub(crate) use encoder::{Encodable, Encoder};
 pub use header::Header;
 pub use identity::BlockIdentity;

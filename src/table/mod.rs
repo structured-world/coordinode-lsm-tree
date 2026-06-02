@@ -486,7 +486,10 @@ impl Table {
         key: &[u8],
         seqno: SeqNo,
     ) -> crate::Result<Option<(InternalValue, DataBlock)>> {
-        let Some(iter) = self.block_index.forward_reader(key, seqno) else {
+        // Borrowing point-read seek: avoids cloning the index block + reuses
+        // the trailer metadata parsed at table open (see
+        // `BlockIndexImpl::point_read_reader`).
+        let Some(iter) = self.block_index.point_read_reader(key, seqno) else {
             return Ok(None);
         };
 
