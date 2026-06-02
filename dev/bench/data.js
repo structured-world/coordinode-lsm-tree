@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1780269060597,
+  "lastUpdate": 1780386474802,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -11622,6 +11622,84 @@ window.BENCHMARK_DATA = {
             "value": 447360.6223208565,
             "unit": "ops/sec",
             "extra": "P50: 2.1us | P99: 5.5us | P99.9: 8.0us\nthreads: 1 | elapsed: 0.45s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "5cc22ebf3bd399127dd09db16ddd8800a5fa9bb8",
+          "message": "feat(integrity)!: per-KV checksum protection + flag-based ECC parity (V5 block header) (#369)\n\n## Summary\n\nAdds per-KV integrity protection for data blocks: a per-entry checksum\nfooter recorded by a header flag, so a bit-flip in an individual entry\nis caught independently of the block-level XXH3. The block-level\nchecksum verifies *what was written* as one digest over the whole block;\nper-KV digests verify *each logical entry* and survive restart-interval\nre-encoding across compactions.\n\nThis is the **on-disk-format slice** of the per-KV protection work (part\nof the V5 release batch). It lands the wire format + the\nblock-compile-time path + a scrub verifier. The memtable `AtInsert`\nRAM-lifecycle carry (the remaining part of the parent issue) is deferred\nand is **not an on-disk concern**, so it can follow post-V5 without a\nformat bump.\n\n## Design: per-KV checking is a transform flag, not a block type\n\nPer-KV checking is an orthogonal, composable transform layer over a\nblock of some role — the same class as compression, encryption, and\nReed-Solomon ECC, all of which the engine already records as header\nfields / transforms, never as block types. Modelling it as a dedicated\n`BlockType` would force a combinatorial \"checked\" twin per role and put\none transform layer on the role axis while its siblings stay flags.\n\nSo a per-KV-checked block stays `BlockType::Data`; its footer is\nrecorded by a header flag.\n\n## What this PR does\n\n- **`block_flags: u8` in `BlockHeader`** — a single bitfield that is the\nhome for the whole transform-presence family: `KV_CHECKSUM_FOOTER`,\n`ECC_PARITY`, `COMPRESSED`, `ENCRYPTED`. Each bit is\npresence-authoritative; per-layer parameters keep their existing homes\n(parity length **derived** from `data_length`, footer algo/count\nself-describing in the footer tail, codec/key caller-supplied via\n`BlockTransform`). `write_into` derives the compression/encryption/ECC\nbits from the active transform so every block self-describes its full\nstack; the data-block writer ORs in the KV footer bit via\n`write_into_with_flags`.\n- **`BlockType` carries only block ROLE** — `Data`, `Index`, `Filter`,\n`Meta`, `RangeTombstone`, `Manifest`, `ManifestFooter`, renumbered\ncontiguously `0..=6` (no reserved holes). No `DataKvChecked` /\n`FilterKvChecked` variants.\n- **Footer-wrapped layout** (not a payload prefix): a footer-bearing\nblock is a byte-identical standard `Data` payload followed by a fixed\ntail:\n  ```\n  [ standard Data payload ]\n[ kv_checksums_array: count × digest_size ] (LE digests, entry order)\n  [ algorithm: u8 ]\n  [ count: u32 LE ]\n  ```\nThe reader splits the footer off the end (on the `KV_CHECKSUM_FOOTER`\nflag) and feeds the unchanged inner slice to the existing decoder, so\nthe hot read / seek / point-read paths run unchanged.\n- **Digest domain = logical content** `value_type ‖ seqno (LE u64) ‖\nlen(user_key) (LE u32) ‖ user_key ‖ value`, not on-disk entry bytes. The\nexplicit `len(user_key)` frame keeps the domain injective across the\nkey/value boundary. Invariant to prefix-truncation, so recompute ==\ncarry across compactions.\n- **`ChecksumAlgorithm`** {`Xxh3_64`, `Xxh3Low32`, `Crc32c`} with\n`digest_size` / `wire_tag` / `from_wire_tag` / `compute`. `crc32c` is an\noptional dependency behind a feature gate.\n- **`KvChecksumPolicy`** {`Off` / `AllLevels` / `PerLevel(LevelMask)` /\n`PerTable(TableIdRange)`} + `KvChecksumComputePoint` {`AtBlockCompile`\n(default) / `AtInsert`} in `RuntimeConfig`, runtime-toggleable via\n`update_runtime_config`.\n- **Writer wiring**: `use_kv_checksums` builder threaded from the live\nruntime config into flush / compaction / ingest. When the effective\npolicy applies, the writer appends the footer and sets the\n`KV_CHECKSUM_FOOTER` flag; otherwise a plain data block with the flag\nclear. `use_kv_checksums` asserts it is called before the first key (no\nmid-write format mixing).\n- **Read path**: `from_loaded` strips the footer when the\n`KV_CHECKSUM_FOOTER` flag is set (zero-copy via `Slice::slice`) and\nclears the bit, so normal reads are unaffected.\n- **Scrub verifier**: `verify_kv_checksums(tree)` (and\n`Table::verify_kv_checksums()`) recompute and compare per-entry digests\nfor footer-bearing blocks.\n\n## Per-SST descriptor (block-layout foundation)\n\nAn SST is homogeneous: one writer, one config snapshot, one `(level,\ntable_id)`, so the per-KV-footer decision is constant across all of a\ntable's data blocks. That decision is now also recorded once per SST as\na single `descriptor#kv_checksum` byte in the table meta block (`0` = no\nfooter; otherwise `1 + algo wire tag`, with `0` reserved so it never\naliases `Xxh3_64`), parsed on open into `ParsedMeta::kv_checksum_algo`.\n\n- `kv_checksum::descriptor_byte` / `descriptor_from_byte` are the single\nsource of truth for the encoding (writer emits, meta parse decodes).\n- Writer evaluates the kv-checksum policy once per table and records the\neffective algorithm — identical to the per-block decision `spill_block`\nmakes via the same expression.\n- `verify_kv_checksums` early-returns when the descriptor reports no\nfooters, skipping the whole block scan instead of loading every data\nblock only to find the flag clear.\n\nThis makes per-KV-footer presence a per-SST property, the foundation for\nsourcing block-transform presence from a per-SST descriptor (cached at\nopen) rather than per-block header fields.\n\n## Per-SST Page-ECC descriptor + `ecc_length` removal (flag-based parity\nlength)\n\nPage-ECC presence is now also a per-SST descriptor\n(`descriptor#page_ecc` meta byte → `ParsedMeta::page_ecc`), and the\nper-block `ecc_length: u32` field is **removed** (header\n`serialized_len` 38 → 34, −4 bytes per block).\n\n- The Reed-Solomon parity-trailer length is deterministic, so it is\n**derived** on read as `expected_parity_len(data_length)` whenever a\nblock's `ECC_PARITY` flag is set — no per-block length field to store,\ncorrupt, or forge.\n- The `ECC_PARITY` flag is **self-describing per block**, so blocks stay\nreadable across `page_ecc` config changes (mixed-config trees from\ncompaction-as-migration) and the meta-block bootstrap + the separate\nmanifest read path need no out-of-band ECC config.\n- The persisted `descriptor#page_ecc` is retained for self-description\nand becomes the SST read source once `block_flags` later moves off the\nper-block header (follow-up).\n\n**Breaking (semver major):** the V5 block header layout changes\n(`ecc_length` removed, `serialized_len` 38 → 34). V5 is pre-release, so\nno migration is provided; the block magic bump (`[L,S,M,4]`) already\nrejects pre-V5 tables at decode.\n\n## AAD binds `block_flags` (encrypted block format)\n\nThe AAD-bound encrypted block format now mirrors the header\n`block_flags` bitfield into the `MetadataPayload` (offset 10; v1 payload\n38 → 39 bytes) and binds it into the AEAD AAD (offset 38; AAD 38 → 39\nbytes). Tampering with a block's transform stack (e.g. clearing the\nper-KV footer or ECC bit) fails AEAD verification — the same\nanti-relabel defence already covering `block_type` and\n`compression_type`.\n\n- `EncryptionContext` carries `block_flags`;\n`encode/decode_metadata_payload` round-trip it; `DecryptedBlock` exposes\nit so the caller knows which transform layers to strip after decryption.\n- Threat-model test covers on-disk `block_flags` tamper → AEAD verify\nfail; spec (`docs/aad-block-format.md`) updated for the 39-byte\nAAD/payload.\n- Foundation for the AAD-bound block I/O path: `encrypt_block` /\n`decrypt_block` have no production callers yet (wired later). The\n`MetadataFrame` stays fixed-layout here; a flag-gated variable layout is\na later refinement.\n\n## Wire compatibility\n\nWith `KvChecksumPolicy::Off` (the default) the writer emits plain data\nblocks with the `KV_CHECKSUM_FOOTER` flag clear and no footer —\n**byte-identical to the pre-per-KV format**. Normal point-read / scan\ndoes not recompute per-entry digests (block-level XXH3 at load already\ncovers the on-disk bytes on the hot path); per-entry verification runs\nonly under the scrub pass. Safe to reshape pre-release (V5 not shipped).\n\n## Deferred (tracked on the parent issue, not in this PR)\n\n- **`AtInsert` memtable carry** — computing the digest at memtable\ninsert to cover the RAM-residence window. Currently `AtInsert` is\nrejected at config-validation with a typed error (for every algorithm)\nto avoid a silent downgrade. RAM-only, no on-disk format impact, so it\ndoes not gate V5.\n- **Filter per-region protection** — `Filter` blocks could carry\nper-layer checksums via the same flag mechanism; not implemented here.\n- **Benchmarks** from the acceptance matrix.\n\n## Testing\n\n- `BlockType` wire-tag round-trip for all variants + unknown-tag\nrejection.\n- `BlockHeader` serde round-trip exercising `block_flags`.\n- `kv_checksum` codec unit tests (footer split inner / split full digest\nrecovery, footer tail length, malformed-footer rejection).\n- Per-KV verifier test that corrupts a stored digest under a *valid*\nblock-level checksum, so only the per-KV path can catch it.\n- Integration test\n`tree_kv_checksums_all_levels_round_trips_through_disk` (write under\n`AllLevels`, flush, reopen, read back correctly).\n- Per-SST descriptor: `descriptor_byte` / `descriptor_from_byte`\nround-trip (none + every algorithm, unknown-tag rejection); meta parse\nof the kv-checksum + page-ecc bytes (zero/non-zero/missing →\n`InvalidHeader`).\n- Page-ECC: `ECC_PARITY` flag agrees with the emitted parity trailer\n(empty vs non-empty payload); `page_ecc(true)` emits a parity trailer on\ndisk (observed via `on_disk_size`); RS single-byte-flip recovery\nround-trips with the derived parity length.\n- Full suite green: `cargo nextest run --all-features` -> 1773 passed.\n- `cargo clippy --all-features --all-targets -- -D warnings`, `cargo fmt\n--check`, `RUSTDOCFLAGS=\"-D warnings\" cargo doc --no-deps\n--all-features` all clean.\n\nPart of #298\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n## Summary by CodeRabbit\n\n* **New Features**\n* Per-entry (KV) checksum support with configurable policies/timing\n(default: off); table-level verification added.\n  * Optional CRC32C algorithm selectable.\n* New V5 on-disk block flags record parity and checksum-footer presence;\nreaders/writers honor them.\n* Page-level ECC parity trailer handling improved; encoding/decoding now\nderives parity length.\n\n* **Bug Fixes / Validation**\n* Runtime config now rejects unsupported compute-point selections\n(prevents invalid settings).\n\n* **Tests**\n* Added unit & integration tests covering emission, verification, and\nconfig behavior.\n\n* **Documentation**\n* Updated docs for runtime config, parity/footer behavior, encryption\nAAD, and V5 format notes.\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-06-02T10:46:57+03:00",
+          "tree_id": "df3c98bdf7159c1106df03ac3102584b793cd463",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/5cc22ebf3bd399127dd09db16ddd8800a5fa9bb8"
+        },
+        "date": 1780386473160,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 2044855.981253333,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.6us | P99.9: 3.7us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1224607.1882629532,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.2us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 520539.80310727697,
+            "unit": "ops/sec",
+            "extra": "P50: 1.8us | P99: 5.0us | P99.9: 7.5us\nthreads: 1 | elapsed: 0.38s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3675463.4842151524,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 3.0us | P99.9: 5.4us\nthreads: 1 | elapsed: 0.05s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 376878.5385915078,
+            "unit": "ops/sec",
+            "extra": "P50: 2.3us | P99: 5.7us | P99.9: 8.4us\nthreads: 1 | elapsed: 0.53s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 198532.35591195626,
+            "unit": "ops/sec",
+            "extra": "P50: 4.7us | P99: 6.0us | P99.9: 10.9us\nthreads: 1 | elapsed: 1.01s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1238330.8446907932,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.2us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1094583.1727671034,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.5us | P99.9: 1.9us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 456322.6404039967,
+            "unit": "ops/sec",
+            "extra": "P50: 2.0us | P99: 6.6us | P99.9: 9.7us\nthreads: 1 | elapsed: 0.44s | num: 200000 | iterations: 3"
           }
         ]
       }
