@@ -4,7 +4,7 @@
 //! AAD (Additional Authenticated Data) construction for AAD-bound encrypted
 //! blocks, per the wire-format spec in `docs/aad-block-format.md` §5.3.
 //!
-//! AAD is the 38-byte buffer that is fed to the AEAD primitive alongside the
+//! AAD is the 39-byte buffer that is fed to the AEAD primitive alongside the
 //! ciphertext and nonce, but is **never** written to disk. It mixes
 //! disk-mirrored fields (header byte, key epoch, block type, suite id,
 //! compression type, dict id, window log) with caller-supplied identity
@@ -31,7 +31,7 @@
 //! discriminator) live on [`EncryptionContext`], the small per-block
 //! struct passed alongside `BlockIdentity` into [`build`].
 //!
-//! ## Layout (38 bytes, big-endian for u64 identity fields)
+//! ## Layout (39 bytes, big-endian for u64 identity fields)
 //!
 //! ```text
 //! Offset  Size  Field             Source
@@ -47,8 +47,12 @@
 //! 32      1     CompressionType   Mirror of disk
 //! 33      4     DictID            u32 BE, mirror of disk
 //! 37      1     WindowLog         Mirror of disk
+//! 38      1     BlockFlags        Mirror of disk (transform-presence
+//!                                 bitfield: KV footer / ECC / compressed /
+//!                                 encrypted) — binds the block's transform
+//!                                 stack so a flag relabel fails AEAD
 //! ══════
-//! Total   38 bytes
+//! Total   39 bytes
 //! ```
 
 use core::convert::TryFrom;
@@ -57,7 +61,7 @@ pub use crate::table::block::{BlockIdentity, BlockType};
 
 /// Length of the AAD buffer in bytes. Spec-locked: see
 /// `docs/aad-block-format.md` §5.3.
-pub const AAD_LEN: usize = 38;
+pub const AAD_LEN: usize = 39;
 
 /// First four bytes of the AAD: the literal `MetadataFrame` magic.
 ///
@@ -97,8 +101,8 @@ pub enum SuiteId {
 
 impl SuiteId {
     /// Nonce length (bytes) for this suite. Drives the variable-length
-    /// `Nonce` field on disk at `MetadataFrame` offset 18 and the
-    /// `PayloadLen == 26 + NONCE_LEN` structural check.
+    /// `Nonce` field on disk at `MetadataFrame` offset 19 and the
+    /// `PayloadLen == 27 + NONCE_LEN` structural check.
     #[must_use]
     pub const fn nonce_len(self) -> usize {
         match self {
@@ -154,6 +158,17 @@ pub struct EncryptionContext {
     /// byte participates in AAD; level (for Zstd) and dict-fingerprint
     /// (already carried on [`BlockIdentity::dict_id`]) live elsewhere.
     pub compression_type: u8,
+    /// `block_flags` transform-presence bitfield, mirror of the
+    /// `Block::Header` byte (see `crate::table::block::header::block_flags`:
+    /// `KV_CHECKSUM_FOOTER` / `ECC_PARITY` / `COMPRESSED` / `ENCRYPTED`).
+    /// Bound in the AAD so an attacker cannot relabel a block's transform
+    /// stack (e.g. clear the per-KV footer bit) under a forged
+    /// non-cryptographic header checksum — the same anti-relabel rationale
+    /// that puts `block_type` and `compression_type` in the AAD. The full
+    /// byte is mirrored verbatim; the `COMPRESSED` / `ENCRYPTED` bits are
+    /// redundant with `compression_type` / the suite but kept so the AAD is
+    /// a faithful mirror of the header byte with no masking logic.
+    pub block_flags: u8,
 }
 
 impl EncryptionContext {
@@ -162,17 +177,23 @@ impl EncryptionContext {
     /// different version byte (e.g. negative tests) build the struct
     /// directly.
     #[must_use]
-    pub const fn v1(key_epoch: u8, suite_id: SuiteId, compression_type: u8) -> Self {
+    pub const fn v1(
+        key_epoch: u8,
+        suite_id: SuiteId,
+        compression_type: u8,
+        block_flags: u8,
+    ) -> Self {
         Self {
             header_byte: HEADER_BYTE_V1,
             key_epoch,
             suite_id,
             compression_type,
+            block_flags,
         }
     }
 }
 
-/// Build the 38-byte AAD buffer from the encryption context and the
+/// Build the 39-byte AAD buffer from the encryption context and the
 /// per-block identity.
 ///
 /// The returned array is the exact buffer to pass to the AEAD primitive
@@ -207,6 +228,9 @@ pub fn build(ctx: &EncryptionContext, identity: &BlockIdentity) -> [u8; AAD_LEN]
     buf[33..37].copy_from_slice(&identity.dict_id.to_be_bytes());
     buf[37] = identity.window_log;
 
+    // Offset 38: disk-mirrored transform-presence flags.
+    buf[38] = ctx.block_flags;
+
     buf
 }
 
@@ -228,8 +252,8 @@ mod tests {
     #[test]
     fn aad_len_matches_spec() {
         // Hard-coded to catch any drift between `AAD_LEN` and the spec's
-        // 38-byte total. The encoder/decoder rely on this exact size.
-        assert_eq!(AAD_LEN, 38);
+        // 39-byte total. The encoder/decoder rely on this exact size.
+        assert_eq!(AAD_LEN, 39);
     }
 
     #[test]
@@ -285,7 +309,8 @@ mod tests {
         let ctx = EncryptionContext::v1(
             0x55, // key_epoch
             SuiteId::ChaCha20Poly1305,
-            3, // CompressionType::Zstd
+            3,    // CompressionType::Zstd
+            0x05, // block_flags: KV_CHECKSUM_FOOTER | COMPRESSED (bits 0,2)
         );
         let identity = BlockIdentity {
             tree_id: 0x0102_0304_0506_0708,
@@ -320,16 +345,18 @@ mod tests {
         assert_eq!(&aad[33..37], &0xDEAD_BEEFu32.to_be_bytes());
         // WindowLog
         assert_eq!(aad[37], 21);
+        // BlockFlags
+        assert_eq!(aad[38], 0x05);
     }
 
     #[test]
     fn aad_for_zero_identity_is_well_formed() {
         // The `tree_id = 0` placeholder path still produces a valid
-        // 38-byte AAD; the cross-tree defence in that case relies on
+        // 39-byte AAD; the cross-tree defence in that case relies on
         // per-tree key isolation, not on AAD bytes. The fixture also
         // pins the AES-256-GCM byte at the SuiteID offset for the
         // zero-codec / zero-block-type happy path.
-        let ctx = EncryptionContext::v1(0, SuiteId::Aes256Gcm, 0);
+        let ctx = EncryptionContext::v1(0, SuiteId::Aes256Gcm, 0, 0);
         let id = identity(0, 0, 0, BlockType::Data);
         let aad = build(&ctx, &id);
         assert_eq!(aad.len(), AAD_LEN);
@@ -346,7 +373,7 @@ mod tests {
         // Cross-block-relocation defence: same identity except for
         // `block_offset` must produce a different AAD, so the same
         // AEAD ciphertext + tag will not verify after a relocation.
-        let ctx = EncryptionContext::v1(1, SuiteId::Aes256Gcm, 0);
+        let ctx = EncryptionContext::v1(1, SuiteId::Aes256Gcm, 0, 0);
         let a = build(&ctx, &identity(1, 2, 100, BlockType::Data));
         let b = build(&ctx, &identity(1, 2, 101, BlockType::Data));
         assert_ne!(a, b);
@@ -361,12 +388,32 @@ mod tests {
         // `block_type` must produce a different AAD, so an attacker
         // cannot relabel a Data block as an Index block to bypass
         // type-specific decode paths.
-        let ctx = EncryptionContext::v1(1, SuiteId::Aes256Gcm, 0);
+        let ctx = EncryptionContext::v1(1, SuiteId::Aes256Gcm, 0, 0);
         let a = build(&ctx, &identity(1, 2, 100, BlockType::Data));
         let b = build(&ctx, &identity(1, 2, 100, BlockType::Index));
         assert_ne!(a, b);
         // Only the block_type byte (offset 6) differs.
         assert_eq!(&a[..6], &b[..6]);
         assert_eq!(&a[7..], &b[7..]);
+    }
+
+    #[test]
+    fn aad_changes_when_block_flags_changes() {
+        // Transform-relabel defence: same identity + codec, differing only
+        // in `block_flags`, must produce a different AAD — so an attacker
+        // cannot flip a transform bit (e.g. clear the per-KV footer bit)
+        // and still pass AEAD verification.
+        let a = build(
+            &EncryptionContext::v1(1, SuiteId::Aes256Gcm, 0, 0),
+            &identity(1, 2, 100, BlockType::Data),
+        );
+        let b = build(
+            &EncryptionContext::v1(1, SuiteId::Aes256Gcm, 0, 0x01),
+            &identity(1, 2, 100, BlockType::Data),
+        );
+        assert_ne!(a, b);
+        // Only the block_flags byte (offset 38) differs.
+        assert_eq!(&a[..38], &b[..38]);
+        assert_ne!(a[38], b[38]);
     }
 }

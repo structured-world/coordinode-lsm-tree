@@ -667,6 +667,36 @@ fn table_range_exclusive_bounds() -> crate::Result<()> {
 }
 
 #[test]
+fn writer_records_effective_page_ecc_descriptor() -> crate::Result<()> {
+    // descriptor#page_ecc must record the EFFECTIVE (compiled) setting, not
+    // the requested flag. Without the `page_ecc` cargo feature,
+    // use_page_ecc(true) is a no-op (with_ecc() is identity, no parity is
+    // emitted and no ECC_PARITY bit is set), so the persisted descriptor
+    // must read false to stay consistent with the actual on-disk blocks.
+    // With the feature it reads true. `cfg!(feature = "page_ecc")` is the
+    // effective value either way.
+    let items = [crate::InternalValue::from_components(
+        b"a",
+        b"v",
+        0,
+        crate::ValueType::Value,
+    )];
+    test_with_table(
+        &items,
+        |table| {
+            assert_eq!(
+                table.metadata.page_ecc,
+                cfg!(feature = "page_ecc"),
+                "descriptor#page_ecc must reflect the effective (compiled) page_ecc setting",
+            );
+            Ok(())
+        },
+        None,
+        Some(|w: Writer| w.use_page_ecc(true)),
+    )
+}
+
+#[test]
 #[expect(clippy::unwrap_used)]
 fn table_point_read_mvcc_block_boundary() -> crate::Result<()> {
     let items = [
@@ -1816,6 +1846,7 @@ fn load_block_range_tombstone_metrics() -> crate::Result<()> {
         BlockType::RangeTombstone,
         CompressionType::None,
         None,
+        false,
         #[cfg(zstd_any)]
         None,
         #[cfg(feature = "metrics")]
@@ -1837,6 +1868,7 @@ fn load_block_range_tombstone_metrics() -> crate::Result<()> {
         BlockType::RangeTombstone,
         CompressionType::None,
         None,
+        false,
         #[cfg(zstd_any)]
         None,
         #[cfg(feature = "metrics")]
@@ -1918,6 +1950,7 @@ fn load_block_cache_hit_rejects_wrong_block_type() -> crate::Result<()> {
         BlockType::Index,
         CompressionType::None,
         None,
+        false,
         #[cfg(zstd_any)]
         None,
         #[cfg(feature = "metrics")]
@@ -1936,6 +1969,7 @@ fn load_block_cache_hit_rejects_wrong_block_type() -> crate::Result<()> {
         BlockType::Data,
         CompressionType::None,
         None,
+        false,
         #[cfg(zstd_any)]
         None,
         #[cfg(feature = "metrics")]
@@ -2004,7 +2038,9 @@ fn meta_seqno_kv_max_corruption_returns_invalid_data() -> crate::Result<()> {
         let raw_block =
             crate::file::read_exact(&f, *meta_handle.offset(), meta_handle.size() as usize)?;
 
-        let header_len = Header::serialized_len();
+        // Meta blocks carry the block_flags byte, so their header is
+        // header_len(Meta), not the SST MIN_LEN.
+        let header_len = Header::header_len(crate::table::block::BlockType::Meta);
         let payload = &raw_block[header_len..];
 
         // Find the seqno#kv_max value bytes in the payload and replace

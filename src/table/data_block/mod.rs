@@ -406,6 +406,59 @@ impl DataBlock {
         Self { inner }
     }
 
+    /// Builds a `DataBlock` from a freshly loaded block, transparently
+    /// stripping the per-KV checksum footer when the SST carries one.
+    ///
+    /// `has_kv_footer` comes from the per-SST descriptor
+    /// (`ParsedMeta::kv_checksum_algo.is_some()`), NOT from a per-block header
+    /// flag: data blocks omit the `block_flags` byte (it lives in the
+    /// descriptor), so the caller supplies the table-wide footer state. When
+    /// `false` this is identical to [`Self::new`]; when `true` it splits the
+    /// footer off and stores only the inner standard data-block slice, so
+    /// every downstream read path — `try_iter`, `point_read`, seek, trailer —
+    /// operates unchanged. The per-KV digests are NOT verified here (that is
+    /// the scrub / paranoid path, see [`Self::verify_kv_checked`]); the
+    /// block-level checksum already validated the on-disk bytes at load time.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error::InvalidTrailer`] if a footer-bearing block's
+    /// footer is structurally malformed.
+    pub(crate) fn from_loaded(block: Block, has_kv_footer: bool) -> crate::Result<Self> {
+        use crate::table::block::kv_checksum;
+
+        if !has_kv_footer {
+            return Ok(Self::new(block));
+        }
+
+        // Determine the inner-slice length by splitting the footer, then
+        // keep a zero-copy sub-slice of the original block bytes.
+        let array_start = kv_checksum::split_inner(&block.data)?.len();
+        let mut header = block.header;
+        // The footer was part of the (decompressed) payload, so shrink
+        // `uncompressed_length` to the stripped inner length. Leaving it at
+        // the footered length makes the in-memory block inconsistent and
+        // makes cache weighing over-count footer bytes. `array_start` is a
+        // prefix of the original payload, so it fits the same u32.
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "array_start <= original uncompressed_length, which is u32"
+        )]
+        {
+            header.uncompressed_length = array_start as u32;
+        }
+        // Clear the footer flag so the in-memory block doesn't advertise a
+        // footer that has just been stripped. (SST data blocks already decode
+        // with block_flags == 0 since they omit the byte, so this is a no-op
+        // there; it keeps the stripped block honest if a flag was ever set —
+        // matching the same clear in `verify_kv_checked`.)
+        header.block_flags &= !crate::table::block::header::block_flags::KV_CHECKSUM_FOOTER;
+        Ok(Self::new(Block {
+            header,
+            data: block.data.slice(..array_start),
+        }))
+    }
+
     /// Accesses the inner raw bytes
     #[must_use]
     pub fn as_slice(&self) -> &Slice {
@@ -663,6 +716,156 @@ impl DataBlock {
         }
 
         serializer.finish()
+    }
+
+    /// Builds a per-KV-checked data block: the standard data-block payload
+    /// followed by a per-KV checksum footer. The block role stays `Data`.
+    ///
+    /// Footer presence is recorded out-of-band in the per-SST meta descriptor
+    /// (`descriptor#kv_checksum`), NOT in a per-block header flag: SST data
+    /// blocks omit the `block_flags` byte on disk, so `header.block_flags`
+    /// decodes as `0` and the read path consults the descriptor (not the
+    /// header) to decide whether to strip the footer.
+    ///
+    /// `digests` MUST be in the same order as `items` (digest `i` belongs to
+    /// entry `i` in scan order) and computed via
+    /// [`kv_checksum::kv_digest`](super::block::kv_checksum) over each entry's
+    /// logical content. The writer computes the digests when it compiles the
+    /// block; a `None` for an unavailable algorithm is the caller's
+    /// responsibility to reject before reaching this point.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error::InvalidTrailer`] if `digests.len()` does not
+    /// equal `items.len()`: the footer's `count` field would disagree with
+    /// the stored digest array, so the write is rejected rather than
+    /// producing structurally-corrupt on-disk data (validated at runtime,
+    /// not only via a debug assertion that vanishes in release builds).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `items` is empty (same contract as [`Self::encode_into`]).
+    pub(crate) fn encode_kv_checked_into(
+        writer: &mut Vec<u8>,
+        items: &[InternalValue],
+        digests: &[u64],
+        algo: crate::runtime_config::ChecksumAlgorithm,
+        restart_interval: u8,
+        hash_index_ratio: f32,
+    ) -> crate::Result<()> {
+        if items.len() != digests.len() {
+            return Err(crate::Error::InvalidTrailer);
+        }
+        Self::encode_into(writer, items, restart_interval, hash_index_ratio)?;
+        super::block::kv_checksum::append_footer(writer, digests, algo);
+        Ok(())
+    }
+
+    /// Verifies every entry of a footer-bearing data block against its
+    /// stored per-KV digest (the scrub / paranoid path).
+    ///
+    /// `footer_wrapped` is the full on-disk data-block payload INCLUDING the
+    /// per-KV checksum footer (i.e. the bytes as loaded, before
+    /// [`Self::from_loaded`] strips them). This splits the footer, decodes the
+    /// inner standard data block, and for each entry in scan order recomputes
+    /// the logical-content digest and compares it to the stored value.
+    ///
+    /// When `expected_algo` is `Some`, the footer's own algorithm tag must
+    /// match it (the per-SST `descriptor#kv_checksum` algorithm): a divergence
+    /// means a writer bug or corruption flipped the tag, which would otherwise
+    /// let the scrub verify digests under the wrong algorithm and silently
+    /// return `Ok`. `None` skips the cross-check (the footer's self-described
+    /// algorithm is then authoritative).
+    ///
+    /// # Errors
+    ///
+    /// - [`crate::Error::InvalidTrailer`] if the footer is malformed, its
+    ///   entry count disagrees with the decoded block, or its algorithm tag
+    ///   diverges from `expected_algo`.
+    /// - [`crate::Error::FeatureUnsupported`] if the footer's algorithm is not
+    ///   compiled into this build.
+    /// - [`crate::Error::ChecksumMismatch`] on the first entry whose recomputed
+    ///   logical-content digest disagrees with the stored one (corruption of
+    ///   the entry bytes or the stored digest).
+    pub(crate) fn verify_kv_checked(
+        footer_wrapped: &Slice,
+        header: super::block::Header,
+        comparator: crate::comparator::SharedComparator,
+        expected_algo: Option<crate::runtime_config::ChecksumAlgorithm>,
+    ) -> crate::Result<()> {
+        use super::block::{BlockType, ParsedItem, kv_checksum};
+
+        let split = kv_checksum::split_full(footer_wrapped)?;
+
+        // Cross-check the footer's self-described algorithm against the
+        // per-SST descriptor when provided. A mismatch means the tag was
+        // flipped (writer bug / corruption); verifying under the wrong
+        // algorithm could otherwise pass against forged digests.
+        if let Some(expected) = expected_algo
+            && split.algo != expected
+        {
+            return Err(crate::Error::InvalidTrailer);
+        }
+
+        // The scrub only verifies Data blocks. The caller loads raw Data
+        // blocks, so a non-Data header here is corruption or a caller bug:
+        // reject it rather than coerce `block_type = Data`, which would verify
+        // a non-Data payload as if it were Data and defeat the scrub.
+        if header.block_type != BlockType::Data {
+            return Err(crate::Error::InvalidTag((
+                "BlockType",
+                header.block_type.into(),
+            )));
+        }
+
+        // Decode the inner slice through the standard data-block path. Reuse
+        // the real header (Copy) but present the inner slice as a consistent
+        // plain Data block: clear the per-KV footer flag and shrink
+        // `uncompressed_length` to the stripped length so the in-memory block
+        // matches its bytes (the type gate then passes and no field lies).
+        let mut inner_header = header;
+        inner_header.block_flags &= !super::block::header::block_flags::KV_CHECKSUM_FOOTER;
+        let inner_len = split.inner.len();
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "split.inner is a prefix of the footered payload, which fits u32"
+        )]
+        {
+            inner_header.uncompressed_length = inner_len as u32;
+        }
+        // Zero-copy: the inner payload is a prefix of `footer_wrapped`, so take
+        // a refcounted sub-slice of the caller's owning `Slice` rather than
+        // `Slice::from(&[u8])` (which would copy ~block_size bytes per block on
+        // the scrub path).
+        let inner = Self::new(Block {
+            header: inner_header,
+            data: footer_wrapped.slice(..inner_len),
+        });
+        let inner_data = inner.inner.data.clone();
+
+        let mut idx = 0usize;
+        for parsed in inner.try_iter(comparator)? {
+            let item = parsed.materialize(&inner_data);
+            // Read the stored digest on demand from the borrowed footer bytes
+            // (no owned Vec<u64> materialization — see `SplitFull`).
+            let stored = split.digest(idx).ok_or(crate::Error::InvalidTrailer)?;
+            let recomputed = kv_checksum::kv_digest(&item, split.algo)
+                .ok_or(crate::Error::FeatureUnsupported("kv-checksum-algorithm"))?;
+            if recomputed != stored {
+                return Err(crate::Error::ChecksumMismatch {
+                    got: crate::Checksum::from_raw(u128::from(recomputed)),
+                    expected: crate::Checksum::from_raw(u128::from(stored)),
+                });
+            }
+            idx += 1;
+        }
+
+        if idx != split.count() {
+            // Footer claims a different entry count than the inner block
+            // decoded — structural inconsistency, not a content mismatch.
+            return Err(crate::Error::InvalidTrailer);
+        }
+        Ok(())
     }
 }
 
@@ -993,6 +1196,185 @@ mod tests {
             entries_end,
         );
         assert!(parsed.is_none());
+    }
+
+    #[test]
+    fn kv_checked_block_round_trips_through_reader() -> crate::Result<()> {
+        use crate::runtime_config::ChecksumAlgorithm;
+        use crate::table::block::kv_checksum::kv_digest;
+
+        // The write path (encode_kv_checked_into) followed by the read path
+        // (from_loaded → try_iter) must recover the exact items: from_loaded
+        // strips the per-KV footer and the standard decoder reads the inner
+        // payload unchanged.
+        let items = [
+            InternalValue::from_components(b"alpha".to_vec(), b"first".to_vec(), 30, Value),
+            InternalValue::from_components(b"bravo".to_vec(), b"second".to_vec(), 20, Value),
+            InternalValue::from_components(b"delta".to_vec(), Slice::from([]), 10, Tombstone),
+        ];
+        let algo = ChecksumAlgorithm::Xxh3_64;
+        let digests: Vec<u64> = items
+            .iter()
+            .map(|it| kv_digest(it, algo).expect("xxh3 always available"))
+            .collect();
+
+        let mut bytes = Vec::new();
+        DataBlock::encode_kv_checked_into(&mut bytes, &items, &digests, algo, 2, 0.0)?;
+
+        // The SST carries per-KV footers (descriptor → has_kv_footer=true), so
+        // from_loaded strips the footer. Data block headers omit the
+        // block_flags byte; footer presence is supplied out-of-band.
+        let loaded = DataBlock::from_loaded(
+            Block {
+                data: bytes.into(),
+                header: Header::test_dummy(BlockType::Data),
+            },
+            true,
+        )?;
+        assert_eq!(loaded.inner.header.block_type, BlockType::Data);
+        assert_eq!(loaded.inner.header.block_flags, 0);
+
+        let recovered: Vec<InternalValue> = loaded
+            .try_iter(default_comparator())?
+            .map(|parsed| parsed.materialize(loaded.as_slice()))
+            .collect();
+        assert_eq!(recovered.len(), items.len());
+        for (got, want) in recovered.iter().zip(items.iter()) {
+            assert_eq!(got.key.user_key, want.key.user_key);
+            assert_eq!(got.key.seqno, want.key.seqno);
+            assert_eq!(got.key.value_type, want.key.value_type);
+            assert_eq!(got.value, want.value);
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "test footered block is tiny"
+    )]
+    fn from_loaded_shrinks_uncompressed_length_to_stripped_inner() -> crate::Result<()> {
+        use crate::runtime_config::ChecksumAlgorithm;
+        use crate::table::block::kv_checksum::kv_digest;
+
+        // from_loaded strips the per-KV footer from `data`; it must also
+        // shrink `uncompressed_length` to the stripped inner length.
+        // Leaving it at the footered length makes the in-memory Block
+        // internally inconsistent (header size > slice length) and makes
+        // cache weighing over-count footer bytes for kv-checked blocks.
+        let items = [
+            InternalValue::from_components(b"alpha".to_vec(), b"first".to_vec(), 30, Value),
+            InternalValue::from_components(b"bravo".to_vec(), b"second".to_vec(), 20, Value),
+        ];
+        let algo = ChecksumAlgorithm::Xxh3_64;
+        let digests: Vec<u64> = items
+            .iter()
+            .map(|it| kv_digest(it, algo).expect("xxh3 always available"))
+            .collect();
+
+        let mut bytes = Vec::new();
+        DataBlock::encode_kv_checked_into(&mut bytes, &items, &digests, algo, 2, 0.0)?;
+        let footered_len = bytes.len();
+
+        let loaded = DataBlock::from_loaded(
+            Block {
+                data: bytes.into(),
+                header: Header {
+                    // uncompressed_length includes the footer, as on disk.
+                    uncompressed_length: footered_len as u32,
+                    ..Header::test_dummy(BlockType::Data)
+                },
+            },
+            true,
+        )?;
+
+        let inner_len = loaded.as_slice().len();
+        assert!(
+            inner_len < footered_len,
+            "footer must have been stripped: inner {inner_len} vs footered {footered_len}",
+        );
+        assert_eq!(
+            loaded.inner.header.uncompressed_length as usize, inner_len,
+            "uncompressed_length must match the stripped inner slice length",
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn encode_kv_checked_into_rejects_digest_count_mismatch() {
+        use crate::runtime_config::ChecksumAlgorithm;
+
+        // A digest array whose length disagrees with the item count would
+        // serialize a footer whose `count` field does not match the stored
+        // digests — structurally corrupt on-disk data. The writer must fail
+        // at write time, not defer the failure to a later read/scrub (and
+        // not rely on a debug_assert that vanishes in release builds).
+        let items = [
+            InternalValue::from_components(b"alpha".to_vec(), b"first".to_vec(), 30, Value),
+            InternalValue::from_components(b"bravo".to_vec(), b"second".to_vec(), 20, Value),
+        ];
+        let digests = [0u64]; // one digest for two items: mismatch
+        let mut buf = Vec::new();
+        let result = DataBlock::encode_kv_checked_into(
+            &mut buf,
+            &items,
+            &digests,
+            ChecksumAlgorithm::Xxh3_64,
+            2,
+            0.0,
+        );
+        assert!(
+            matches!(result, Err(crate::Error::InvalidTrailer)),
+            "digest/item count mismatch must fail the write, got {result:?}",
+        );
+    }
+
+    #[test]
+    fn verify_kv_checked_rejects_footer_algo_diverging_from_descriptor() {
+        use crate::runtime_config::ChecksumAlgorithm;
+        use crate::table::block::header::block_flags::KV_CHECKSUM_FOOTER;
+        use crate::table::block::kv_checksum::kv_digest;
+
+        // A footer-bearing block written under Xxh3_64.
+        let items = [InternalValue::from_components(
+            b"a".to_vec(),
+            b"v".to_vec(),
+            0,
+            Value,
+        )];
+        let algo = ChecksumAlgorithm::Xxh3_64;
+        let digests: Vec<u64> = items
+            .iter()
+            .map(|it| kv_digest(it, algo).expect("xxh3 always available"))
+            .collect();
+        let mut bytes = Vec::new();
+        DataBlock::encode_kv_checked_into(&mut bytes, &items, &digests, algo, 2, 0.0)
+            .expect("encode kv-checked block");
+        let bytes = Slice::from(bytes);
+        let header = Header {
+            block_flags: KV_CHECKSUM_FOOTER,
+            ..Header::test_dummy(BlockType::Data)
+        };
+
+        // Matching per-SST descriptor algorithm → verifies.
+        DataBlock::verify_kv_checked(&bytes, header, default_comparator(), Some(algo))
+            .expect("matching descriptor algorithm must verify");
+        // No descriptor cross-check → footer's own algorithm is authoritative.
+        DataBlock::verify_kv_checked(&bytes, header, default_comparator(), None)
+            .expect("None skips the cross-check and verifies");
+        // Descriptor algorithm diverges from the footer tag → reject, even
+        // though the digests are internally consistent with the footer's tag.
+        let err = DataBlock::verify_kv_checked(
+            &bytes,
+            header,
+            default_comparator(),
+            Some(ChecksumAlgorithm::Xxh3Low32),
+        )
+        .expect_err("descriptor/footer algorithm divergence must be rejected");
+        assert!(
+            matches!(err, crate::Error::InvalidTrailer),
+            "expected InvalidTrailer for algorithm divergence, got {err:?}",
+        );
     }
 
     #[test]

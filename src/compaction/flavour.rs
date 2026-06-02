@@ -126,6 +126,17 @@ pub(super) fn prepare_table_writer(
             }
         });
 
+    // Per-KV checksums follow the LIVE runtime config snapshot, so a toggle
+    // via `update_runtime_config` migrates data through compaction: each
+    // rewritten block reflects the current policy. `Off` (default) emits no
+    // per-KV footer and leaves the `KV_CHECKSUM_FOOTER` flag clear (the
+    // data-block payload encoding is unchanged; the V5 header/meta layout
+    // still differs from pre-V5 regardless).
+    let table_writer = {
+        let rc = opts.runtime_config.load_full();
+        table_writer.use_kv_checksums(rc.kv_checksums, rc.kv_checksum_algo)
+    };
+
     #[cfg(zstd_any)]
     let table_writer = table_writer.use_zstd_dictionary(opts.config.zstd_dictionary.clone());
 

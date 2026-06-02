@@ -75,16 +75,24 @@ pub enum FormatVersion {
     ///    per-layer header layout is documented in
     ///    `src/table/filter/ribbon/burr/wire.rs`.
     ///
-    /// 2. Per-block Reed-Solomon Page ECC: the block header gains a
-    ///    `ecc_length: u32` field and the on-disk block can carry a
-    ///    Reed-Solomon parity trailer immediately after the
-    ///    XXH3-covered payload bytes. When `Config::page_ecc(false)`
-    ///    (the default), `ecc_length = 0` and no parity bytes
-    ///    follow. The block magic was bumped to `[L,S,M,4]`
-    ///    (was `[L,S,M,3]` on pre-V5 versions) so a pre-V5 reader
-    ///    that bypasses the manifest gate fails fast at block header
-    ///    decode rather than misreading the moved field as checksum
-    ///    bytes.
+    /// 2. Per-block transform flags + Page ECC. The self-describing block
+    ///    types (`Meta` / `Manifest` / `ManifestFooter`) carry a
+    ///    `block_flags: u8` byte with the transform-presence bits;
+    ///    `ECC_PARITY` marks that a Reed-Solomon parity trailer follows
+    ///    the XXH3-covered payload (its length is derived from
+    ///    `data_length`, not stored). SST block types (`Data` / `Index` /
+    ///    `Filter` / `RangeTombstone`) keep the compact header WITHOUT this
+    ///    byte: their parity / per-KV-footer presence is a per-SST property
+    ///    read from the table descriptor (`page_ecc` / `kv_checksum_algo`),
+    ///    not a serialized header flag. `KV_CHECKSUM_FOOTER` (set on the
+    ///    self-describing types) marks a per-entry checksum footer.
+    ///    When `Config::page_ecc(false)` (the default) no parity bytes
+    ///    follow; likewise no footer unless per-KV checksums are enabled.
+    ///    The block
+    ///    magic was bumped to `[L,S,M,4]` (was `[L,S,M,3]` on pre-V5
+    ///    versions) so a pre-V5 reader that bypasses the manifest gate
+    ///    fails fast at block header decode rather than misreading the
+    ///    new layout.
     ///
     /// V3 / V4 ↔ V5 incompatibility is enforced primarily by the
     /// manifest version gate at `Tree::open` (returns

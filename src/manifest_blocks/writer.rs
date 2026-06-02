@@ -418,9 +418,9 @@ impl ManifestArchiveWriter {
         )?;
 
         // Extract the section Block's XXH3-128 checksum from the
-        // just-written bytes by decoding the header (the body bytes
-        // we wrote — header_serialized_len() leading bytes of
-        // `block_bytes`). The TOC entry carries this checksum so
+        // just-written bytes by decoding the header that occupies the
+        // leading `Header::header_len(block_type)` bytes of
+        // `block_bytes`. The TOC entry carries this checksum so
         // the CURRENT pointer's content-binding digest is computed
         // over the canonical TOC + per-section content hashes,
         // letting `Block::from_reader` run its own ECC repair on

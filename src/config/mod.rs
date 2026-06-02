@@ -1030,8 +1030,9 @@ impl Config {
     /// `MultiWriter` construction site. With this flag set, every
     /// `Block::write_into` call those writers make upgrades its
     /// `BlockTransform` to the matching `*Ecc` variant — emitting a
-    /// Reed-Solomon parity trailer and recording non-zero
-    /// `ecc_length` in each block header.
+    /// Reed-Solomon parity trailer and setting the `ECC_PARITY` flag in
+    /// each block header (the trailer length is derived from
+    /// `data_length`, not stored).
     #[must_use]
     pub fn page_ecc(mut self, enabled: bool) -> Self {
         self.page_ecc = enabled;

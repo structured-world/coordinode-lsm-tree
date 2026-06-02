@@ -115,9 +115,9 @@ fn read_framed_payload<R: std::io::Read>(
     Ok((variant_byte, payload))
 }
 
-/// `MetadataPayload` size for v1 suites: 38 bytes
-/// (= `26 + NONCE_LEN` where v1 suites declare `NONCE_LEN` = 12).
-const METADATA_PAYLOAD_LEN_V1: u32 = 38;
+/// `MetadataPayload` size for v1 suites: 39 bytes
+/// (= `27 + NONCE_LEN` where v1 suites declare `NONCE_LEN` = 12).
+const METADATA_PAYLOAD_LEN_V1: u32 = 39;
 
 /// Upper bound on the encrypted body payload (256 MiB). Mirrors
 /// the block-write cap on the plaintext path; rejecting larger
@@ -125,7 +125,7 @@ const METADATA_PAYLOAD_LEN_V1: u32 = 38;
 /// `PayloadLen` triggering an unbounded `Vec` allocation on read.
 const MAX_BODY_LEN: u32 = 256 * 1024 * 1024;
 
-/// Encodes the 38-byte `MetadataPayload` (v1 suites only).
+/// Encodes the 39-byte `MetadataPayload` (v1 suites only).
 ///
 /// Layout per `docs/aad-block-format.md` §5.1 (skippable-frame
 /// payload, NOT including the 8-byte SFA framing header which
@@ -140,8 +140,9 @@ const MAX_BODY_LEN: u32 = 256 * 1024 * 1024;
 /// | 4      | 1    | CompressionType   |
 /// | 5      | 4    | DictID (u32 BE)   |
 /// | 9      | 1    | WindowLog         |
-/// | 10     | 12   | Nonce             |
-/// | 22     | 16   | AEADTag           |
+/// | 10     | 1    | BlockFlags        |
+/// | 11     | 12   | Nonce             |
+/// | 23     | 16   | AEADTag           |
 fn encode_metadata_payload(
     ctx: EncryptionContext,
     identity: &BlockIdentity,
@@ -162,17 +163,18 @@ fn encode_metadata_payload(
     // without any partial-write risk on a theoretical error path.
     out.extend_from_slice(&identity.dict_id.to_be_bytes());
     out.push(identity.window_log);
+    out.push(ctx.block_flags);
     out.extend_from_slice(nonce);
     out.extend_from_slice(tag);
     debug_assert_eq!(
         out.len(),
         METADATA_PAYLOAD_LEN_V1 as usize,
-        "v1 MetadataPayload must be exactly 38 bytes"
+        "v1 MetadataPayload must be exactly 39 bytes"
     );
     out
 }
 
-/// Decoded `MetadataPayload` view — parses the 38 bytes into the
+/// Decoded `MetadataPayload` view — parses the 39 bytes into the
 /// fields required to reconstruct the AAD and decrypt the body.
 struct ParsedMetadata {
     suite_id: SuiteId,
@@ -187,7 +189,7 @@ struct ParsedMetadata {
 fn decode_metadata_payload(payload: &[u8]) -> Result<ParsedMetadata, DecryptError> {
     if payload.len() != METADATA_PAYLOAD_LEN_V1 as usize {
         return Err(DecryptError::MalformedMetadataFrame(
-            "MetadataPayload length != 38 for v1",
+            "MetadataPayload length != 39 for v1",
         ));
     }
     let mut cursor = Cursor::new(payload);
@@ -254,6 +256,20 @@ fn decode_metadata_payload(payload: &[u8]) -> Result<ParsedMetadata, DecryptErro
             "non-zero WindowLog with non-zstd CompressionType",
         ));
     }
+    // BlockFlags: transform-presence bitfield mirrored from the
+    // Block::Header. The AAD binds the whole byte, so a relabel of any known
+    // transform bit fails AEAD verification. Reject any bit outside the KNOWN
+    // mask BEFORE running the AEAD: for an encrypted block this byte is the
+    // only transform descriptor the reader can trust, so a forward-
+    // incompatible block (one whose post-decrypt transform stack this build
+    // does not understand) must fail-fast rather than authenticate and then
+    // mis-process. Mirrors the same rejection in `Header::decode_from`.
+    let block_flags = read_u8(&mut cursor)?;
+    if block_flags & !crate::table::block::header::block_flags::KNOWN != 0 {
+        return Err(DecryptError::MalformedMetadataFrame(
+            "unknown bits set in BlockFlags",
+        ));
+    }
     // Zero-init scratch buffer that gets overwritten by the next
     // `read_exact` from the on-disk `MetadataPayload`. NOT a
     // hard-coded nonce: this is the read side, and the bytes that
@@ -277,6 +293,7 @@ fn decode_metadata_payload(payload: &[u8]) -> Result<ParsedMetadata, DecryptErro
             key_epoch,
             suite_id,
             compression_type,
+            block_flags,
         },
         block_type_byte,
         dict_id,
@@ -288,7 +305,7 @@ fn decode_metadata_payload(payload: &[u8]) -> Result<ParsedMetadata, DecryptErro
 /// byte sequence.
 ///
 /// Reads the active key from `key_chain` at `ctx.key_epoch`, draws
-/// a fresh 12-byte nonce from a CSPRNG, builds the 38-byte AAD via
+/// a fresh 12-byte nonce from a CSPRNG, builds the 39-byte AAD via
 /// [`aad::build`](super::aad::build), encrypts the plaintext in place via
 /// [`encrypt_in_place`], and serialises the result.
 ///
@@ -345,6 +362,15 @@ pub fn encrypt_block(
     if (ctx.header_byte & 0x0F) != 0 {
         return Err(crate::Error::Encrypt(
             "HeaderByte low nibble is reserved and must be zero on write (spec §4.8)",
+        ));
+    }
+    // Symmetric to the decrypt path: reject any BlockFlags bit outside the
+    // KNOWN transform mask so this version never PRODUCES a block its own
+    // decrypt would reject as forward-incompatible. `EncryptionContext` fields
+    // are `pub`, so a hand-rolled context could carry reserved bits.
+    if ctx.block_flags & !crate::table::block::header::block_flags::KNOWN != 0 {
+        return Err(crate::Error::Encrypt(
+            "BlockFlags has bits set outside the known transform mask",
         ));
     }
 
@@ -427,7 +453,7 @@ pub fn encrypt_block(
     // module already does.
     let nonce: [u8; 12] = <[u8; 12]>::generate();
 
-    // Build the 38-byte AAD: binds ciphertext to format identity,
+    // Build the 39-byte AAD: binds ciphertext to format identity,
     // header byte, key epoch, block type, suite id, tree id,
     // table id, block offset, compression type, dict id, window
     // log.
@@ -490,12 +516,18 @@ pub struct DecryptedBlock {
     /// `WindowLog` parsed from `MetadataPayload` offset 9. Zero
     /// when not using zstd; `10..=31` per RFC 8878 otherwise.
     pub window_log: u8,
+
+    /// `block_flags` transform-presence bitfield parsed from
+    /// `MetadataPayload` offset 10 (mirror of the `Block::Header` byte).
+    /// Lets the caller know which transform layers the block carries —
+    /// e.g. whether to strip a per-KV checksum footer — after decryption.
+    pub block_flags: u8,
 }
 
 /// Recovers plaintext from the `MetadataFrame ‖ BodyFrame ‖ *trailing`
 /// byte sequence produced by [`encrypt_block`].
 ///
-/// Reads the `MetadataFrame`, parses the 38-byte payload, decodes
+/// Reads the `MetadataFrame`, parses the 39-byte payload, decodes
 /// the `BodyFrame`, reconstructs the AAD from `identity` + the
 /// parsed `EncryptionContext`, looks up the matching key from
 /// `key_chain`, runs [`decrypt_in_place`], then consumes any
@@ -533,7 +565,7 @@ pub fn decrypt_block(
     let mut cursor = Cursor::new(bytes);
 
     // ── MetadataFrame ──────────────────────────────────────────
-    // v1 MetadataPayload is fixed at exactly 38 bytes; reject any
+    // v1 MetadataPayload is fixed at exactly 39 bytes; reject any
     // other declared length upfront so a forged `PayloadLen`
     // can't allocate-and-then-discard.
     let (_, metadata_payload) = read_framed_payload(
@@ -670,6 +702,7 @@ pub fn decrypt_block(
         compression_type: parsed.ctx.compression_type,
         dict_id: parsed.dict_id,
         window_log: parsed.window_log,
+        block_flags: parsed.ctx.block_flags,
     })
 }
 
@@ -695,7 +728,7 @@ mod tests {
     }
 
     fn ctx() -> EncryptionContext {
-        EncryptionContext::v1(0, SuiteId::Aes256Gcm, 0)
+        EncryptionContext::v1(0, SuiteId::Aes256Gcm, 0, 0)
     }
 
     fn chain() -> StaticKeyChain {
@@ -720,7 +753,7 @@ mod tests {
     #[test]
     fn roundtrip_chacha_recovers_plaintext() {
         let plaintext = b"the quick brown fox";
-        let chacha_ctx = EncryptionContext::v1(0, SuiteId::ChaCha20Poly1305, 0);
+        let chacha_ctx = EncryptionContext::v1(0, SuiteId::ChaCha20Poly1305, 0, 0);
         let sealed = encrypt_block(plaintext, &id(), &chacha_ctx, &chain()).unwrap();
         let recovered = decrypt_block(&sealed, &id(), &chain()).unwrap();
         assert_eq!(&recovered.plaintext[..], plaintext);
@@ -790,6 +823,21 @@ mod tests {
     }
 
     #[test]
+    fn encrypt_block_rejects_unknown_block_flags_bit() {
+        // Symmetric to the decrypt-side rejection: encrypt_block must refuse to
+        // PRODUCE a block whose BlockFlags carry a bit outside the KNOWN mask,
+        // so this version never seals something its own decrypt rejects as
+        // forward-incompatible.
+        let mut c = ctx();
+        c.block_flags = 0x10; // reserved bit, outside KNOWN
+        let err = encrypt_block(b"payload", &id(), &c, &chain()).unwrap_err();
+        assert!(
+            matches!(err, crate::Error::Encrypt(_)),
+            "expected Error::Encrypt for unknown BlockFlags bit, got {err:?}",
+        );
+    }
+
+    #[test]
     fn invalid_window_log_surfaces_malformed_metadata() {
         // WindowLog spec: 0 (no enforcement) or 10..=31. Tamper a
         // sealed block to put a forbidden value (9) in the
@@ -819,16 +867,38 @@ mod tests {
         // The upfront cap rejects before any allocation.
         let plaintext = b"the quick brown fox";
         let mut sealed = encrypt_block(plaintext, &id(), &ctx(), &chain()).unwrap();
-        // MetadataFrame total size = 8 + 38 = 46 bytes. BodyFrame
-        // starts at offset 46; its PayloadLen is at frame offset 4
-        // → absolute offset 50..54.
-        let body_payload_len_at = 46 + 4;
+        // MetadataFrame total size = 8 (framing) + METADATA_PAYLOAD_LEN_V1.
+        // BodyFrame starts right after it; its PayloadLen is at frame offset 4.
+        // Derive from the constant so this keeps hitting PayloadLen (not the
+        // BodyFrame magic) if the payload length ever changes again.
+        let metadata_frame_len = 8 + METADATA_PAYLOAD_LEN_V1 as usize;
+        let body_payload_len_at = metadata_frame_len + 4;
         sealed[body_payload_len_at..body_payload_len_at + 4]
             .copy_from_slice(&u32::MAX.to_le_bytes());
         let err = decrypt_block(&sealed, &id(), &chain()).unwrap_err();
         assert!(
             matches!(err, DecryptError::MalformedBodyFrame(_)),
             "expected MalformedBodyFrame for oversized BodyFrame PayloadLen, got {err:?}",
+        );
+    }
+
+    #[test]
+    fn unknown_block_flags_bit_rejected_before_aead() {
+        // For an encrypted block the BlockFlags byte is the only transform
+        // descriptor the reader can trust. A byte with a reserved bit set (a
+        // forward-incompatible transform stack this build cannot process) must
+        // be rejected structurally — before the AEAD runs — not authenticated
+        // and then mis-processed.
+        let plaintext = b"the quick brown fox";
+        let mut sealed = encrypt_block(plaintext, &id(), &ctx(), &chain()).unwrap();
+        // BlockFlags sits at MetadataFrame payload offset 10 → absolute offset
+        // 8 (framing) + 10 = 18. Set a reserved bit (1<<4) outside KNOWN.
+        const BLOCK_FLAGS_AT: usize = 8 + 10;
+        sealed[BLOCK_FLAGS_AT] |= 0x10;
+        let err = decrypt_block(&sealed, &id(), &chain()).unwrap_err();
+        assert!(
+            matches!(err, DecryptError::MalformedMetadataFrame(_)),
+            "expected MalformedMetadataFrame for unknown BlockFlags bit, got {err:?}",
         );
     }
 }

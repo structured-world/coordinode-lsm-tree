@@ -282,7 +282,7 @@ pub enum BlockVerifyError {
         /// Path to the SST file.
         path: PathBuf,
         /// File offset where the (clean) header sits; the read for
-        /// its data segment started at `offset + Header::serialized_len()`.
+        /// its data segment started at `offset + Header::header_len(block_type)`.
         offset: u64,
         /// Length the (clean) header advertised for the data segment.
         data_length: u32,
@@ -432,7 +432,7 @@ impl BlockVerifyReport {
 /// 3. Inside each block region, decode each block's `Header` (which
 ///    validates the header's own XXH3), read the data segment, and
 ///    compare a fresh XXH3 over the data against `header.checksum`.
-///    Advance by `Header::serialized_len() + data_length` until the
+///    Advance by `Header::header_len(block_type) + data_length` until the
 ///    section end. A corrupt header inside a section stops that
 ///    section's walk and is reported; the next section is still walked.
 ///
@@ -459,7 +459,13 @@ pub fn verify_block_checksums(tree: &impl crate::AbstractTree) -> BlockVerifyRep
         // attach to different SSTs once #251 lands), so feed each
         // table's `max_overhead()` separately.
         let max_enc_overhead = table.encryption.as_ref().map_or(0u32, |e| e.max_overhead());
-        match scan_sst_blocks(&*table.fs, path, table_id, max_enc_overhead) {
+        match scan_sst_blocks(
+            &*table.fs,
+            path,
+            table_id,
+            max_enc_overhead,
+            table.metadata.page_ecc,
+        ) {
             Ok(per_file) => {
                 report.blocks_scanned += per_file.blocks_scanned;
                 report.errors.extend(per_file.errors);
@@ -475,6 +481,38 @@ pub fn verify_block_checksums(tree: &impl crate::AbstractTree) -> BlockVerifyRep
     }
 
     report
+}
+
+/// Verifies the per-KV checksum footer of every data block across all SST
+/// tables in the tree (the paranoid / scrub integrity path).
+///
+/// Footer presence is a per-SST property read from each table's descriptor
+/// (`ParsedMeta::kv_checksum_algo`), not a per-block header flag — SST data
+/// blocks omit the `block_flags` byte. A table whose descriptor reports no
+/// footers is skipped wholesale.
+///
+/// This is stronger than [`verify_block_checksums`]: for footer-bearing
+/// tables it decodes each block and recomputes every entry's logical-content
+/// digest, localising which entry diverged rather than only flagging the
+/// block. Tables written without per-KV footers carry no per-KV digests and
+/// are covered by [`verify_block_checksums`] only.
+///
+/// Returns the first error encountered (`ChecksumMismatch` on a per-entry
+/// digest disagreement, or an I/O / decode error). `Ok(())` means every
+/// per-KV-checked table verified. A tree written entirely with
+/// `kv_checksums = Off` has no footer-bearing tables, so this is a no-op
+/// returning `Ok(())`.
+///
+/// # Errors
+///
+/// Propagates [`crate::Error::ChecksumMismatch`] on a detected per-entry
+/// corruption, or any I/O / decode error from loading a block.
+pub fn verify_kv_checksums(tree: &impl crate::AbstractTree) -> crate::Result<()> {
+    let version = tree.current_version();
+    for table in version.iter_tables() {
+        table.verify_kv_checksums()?;
+    }
+    Ok(())
 }
 
 /// Out-of-band variant of [`verify_block_checksums`].
@@ -515,7 +553,44 @@ pub fn verify_sst_file(path: &std::path::Path) -> BlockVerifyReport {
         ..BlockVerifyReport::default()
     };
 
-    match scan_sst_blocks(&fs, path, 0, 0) {
+    // SST blocks omit the block_flags byte, so the parity-trailer presence the
+    // walk must skip is the per-SST `page_ecc` flag — read it from the meta
+    // descriptor. If it can't be determined (corrupt meta, or an encrypted SST
+    // with no key out-of-band), DO NOT assume disabled: walking an ECC-bearing
+    // SST without skipping parity trailers mis-aligns the scan and reports
+    // spurious corruption. Surface the indeterminacy and skip the walk.
+    let page_ecc = match read_page_ecc_out_of_band(&fs, path) {
+        Ok(Some(ecc)) => ecc,
+        // File + trailer readable, but neither meta block decodes (corrupt
+        // meta, or an encrypted SST with no key out-of-band). page_ecc is
+        // undeterminable; skip the walk rather than mis-walk an ECC-bearing SST.
+        Ok(None) => {
+            report.errors.push(BlockVerifyError::SstFileUnreadable {
+                table_id: 0,
+                path: path.to_path_buf(),
+                error: std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "could not decode the SST meta block to determine page_ecc \
+                     (corrupt meta, or an encrypted SST with no key out-of-band); \
+                     skipping the block walk — use verify_block_checksums on a live \
+                     tree for ECC-aware verification",
+                ),
+            });
+            return report;
+        }
+        // Real file-open / SFA-trailer failure — preserve the underlying error
+        // rather than collapsing it into the undeterminable message above.
+        Err(error) => {
+            report.errors.push(BlockVerifyError::SstFileUnreadable {
+                table_id: 0,
+                path: path.to_path_buf(),
+                error,
+            });
+            return report;
+        }
+    };
+
+    match scan_sst_blocks(&fs, path, 0, 0, page_ecc) {
         Ok(per_file) => {
             report.blocks_scanned = per_file.blocks_scanned;
             report.errors = per_file.errors;
@@ -530,6 +605,51 @@ pub fn verify_sst_file(path: &std::path::Path) -> BlockVerifyReport {
     }
 
     report
+}
+
+/// Best-effort read of the per-SST `page_ecc` flag from an SST file's meta
+/// descriptor, for the out-of-band scrub (no live `Table` to consult).
+///
+/// Returns `Ok(Some(page_ecc))` when a meta block decodes. The authoritative
+/// tail `meta` section is tried first; if its block is corrupt / undecodable
+/// the early `meta_mid` mirror (which the writer emits so one bad meta block
+/// can't lose the descriptor) is tried next. Returns `Ok(None)` when the file
+/// and SFA trailer are readable but NEITHER meta block decodes (both corrupt,
+/// or an encrypted SST whose key the out-of-band tool doesn't have) — the flag
+/// is genuinely UNDETERMINABLE. Returns `Err` when the file can't be opened or
+/// its SFA trailer can't be parsed, preserving the real I/O / structural error
+/// for the caller to report rather than collapsing it into "undeterminable".
+///
+/// The caller MUST NOT treat `Ok(None)` as "`page_ecc` disabled": walking an
+/// ECC-bearing SST without skipping the parity trailers mis-aligns the block
+/// scan and reports spurious corruption, so the caller skips the walk and
+/// surfaces the indeterminacy instead.
+#[cfg(feature = "std")]
+fn read_page_ecc_out_of_band(
+    fs: &dyn crate::fs::Fs,
+    path: &std::path::Path,
+) -> std::io::Result<Option<bool>> {
+    let mut probe = fs.open(path, &crate::fs::FsOpenOptions::new().read(true))?;
+    let sfa_reader = crate::sfa::Reader::from_reader(&mut probe)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    let toc = sfa_reader.toc();
+    // Tail `meta` is authoritative; `meta_mid` is the early mirror written so a
+    // single corrupt meta block doesn't lose the per-SST descriptor.
+    for name in [b"meta".as_slice(), b"meta_mid".as_slice()] {
+        let Some((pos, len)) = toc.section(name).map(|e| (e.pos(), e.len())) else {
+            continue;
+        };
+        let Ok(size) = u32::try_from(len) else {
+            continue;
+        };
+        let handle = crate::table::BlockHandle::new(crate::table::BlockOffset(pos), size);
+        if let Ok(meta) =
+            crate::table::meta::ParsedMeta::load_with_handle(probe.as_ref(), &handle, None)
+        {
+            return Ok(Some(meta.page_ecc));
+        }
+    }
+    Ok(None)
 }
 
 struct PerFileScan {
@@ -549,6 +669,7 @@ fn scan_sst_blocks(
     path: &Path,
     table_id: TableId,
     max_enc_overhead: u32,
+    page_ecc: bool,
 ) -> std::io::Result<PerFileScan> {
     use std::io::{BufReader, Seek, SeekFrom};
 
@@ -662,6 +783,7 @@ fn scan_sst_blocks(
             blocks_scanned: &mut blocks_scanned,
             errors: &mut errors,
             max_data_length: block_data_length_cap(max_enc_overhead),
+            page_ecc,
         };
         walk_block_region(&mut ctx, start, end);
     }
@@ -729,12 +851,19 @@ struct WalkCtx<'a> {
     /// so the scrub does not false-flag legitimate encrypted blocks
     /// near the 256 MiB plaintext limit as `HeaderCorrupted`.
     max_data_length: u64,
+    /// Per-SST Page-ECC setting. SST blocks (`Data` / `Index` / `Filter` /
+    /// `RangeTombstone`) omit the `block_flags` byte, so their parity-trailer
+    /// presence is NOT derivable from the header — it is this table-wide flag.
+    /// When `true`, each such block carries `expected_parity_len(data_length)`
+    /// parity bytes after the payload that the walk must skip to stay aligned.
+    /// Meta / Manifest / `ManifestFooter` blocks keep the byte and self-describe
+    /// parity via their `ECC_PARITY` bit regardless of this flag.
+    page_ecc: bool,
 }
 
 fn walk_block_region(ctx: &mut WalkCtx<'_>, start_offset: u64, end_offset: u64) {
     use std::io::Read;
 
-    let header_len = Header::serialized_len() as u64;
     let mut offset = start_offset;
 
     while offset < end_offset {
@@ -750,14 +879,17 @@ fn walk_block_region(ctx: &mut WalkCtx<'_>, start_offset: u64, end_offset: u64) 
         // run because `walk_block_region` returns rather than
         // bubbling the error up.
         let remaining_in_section = end_offset - offset;
-        if remaining_in_section < header_len {
+        // Lower bound: the header is at least MIN_LEN (the exact length, with
+        // or without the block_flags byte, is known only after decode).
+        if remaining_in_section < Header::MIN_LEN as u64 {
             ctx.errors.push(BlockVerifyError::HeaderCorrupted {
                 table_id: ctx.table_id,
                 path: ctx.path.to_path_buf(),
                 offset,
                 reason: format!(
                     "section has only {remaining_in_section} bytes left at this offset, \
-                     less than Header::serialized_len() = {header_len}",
+                     less than Header::MIN_LEN = {}",
+                    Header::MIN_LEN,
                 ),
             });
             return;
@@ -783,6 +915,29 @@ fn walk_block_region(ctx: &mut WalkCtx<'_>, start_offset: u64, end_offset: u64) 
         // be silently uncounted, contradicting the documented
         // semantics.
         *ctx.blocks_scanned = ctx.blocks_scanned.saturating_add(1);
+
+        // Actual header length for this block (variable: SST blocks omit the
+        // block_flags byte). Used for the section-bounds math and the offset
+        // advance so the walk tracks what `decode_from` actually consumed.
+        let header_len = Header::header_len(header.block_type) as u64;
+
+        // Page-ECC parity trailer that follows the payload on disk. Presence
+        // depends on the block type: Meta / Manifest / ManifestFooter keep the
+        // block_flags byte and self-describe via the ECC_PARITY bit; SST blocks
+        // omit the byte, so parity presence is the per-SST `page_ecc` flag. The
+        // trailer length is derived from data_length (never stored). The walk
+        // must skip these bytes — otherwise the next iteration would read parity
+        // as the following block's header and mis-align the whole section.
+        let has_parity = if Header::has_block_flags(header.block_type) {
+            header.block_flags & crate::table::block::header::block_flags::ECC_PARITY != 0
+        } else {
+            ctx.page_ecc
+        };
+        let parity_len = if has_parity {
+            u64::from(crate::table::block::expected_parity_len(header.data_length))
+        } else {
+            0
+        };
 
         // Validate data_length against TWO bounds before allocating
         // / reading:
@@ -818,13 +973,15 @@ fn walk_block_region(ctx: &mut WalkCtx<'_>, start_offset: u64, end_offset: u64) 
             return;
         }
         let remaining = end_offset.saturating_sub(offset).saturating_sub(header_len);
-        if data_length_u64 > remaining {
+        let on_disk_payload = data_length_u64.saturating_add(parity_len);
+        if on_disk_payload > remaining {
             ctx.errors.push(BlockVerifyError::HeaderCorrupted {
                 table_id: ctx.table_id,
                 path: ctx.path.to_path_buf(),
                 offset,
                 reason: format!(
-                    "header data_length {data_length_u64} exceeds remaining section bytes {remaining}",
+                    "header data_length {data_length_u64} + parity {parity_len} exceeds \
+                     remaining section bytes {remaining}",
                 ),
             });
             return;
@@ -865,12 +1022,50 @@ fn walk_block_region(ctx: &mut WalkCtx<'_>, start_offset: u64, end_offset: u64) 
             });
         }
 
+        // Consume the parity trailer (if any) so the reader cursor lands on
+        // the next block's header. The payload checksum above already covers
+        // correctness; parity is only consulted for ECC recovery on the live
+        // read path, so the scrub discards it — but it MUST still skip exactly
+        // `parity_len` bytes or the next iteration mis-reads parity as a header.
+        if parity_len > 0 {
+            match std::io::copy(
+                &mut ctx.reader.by_ref().take(parity_len),
+                &mut std::io::sink(),
+            ) {
+                Ok(n) if n == parity_len => {}
+                Ok(n) => {
+                    ctx.errors.push(BlockVerifyError::DataReadError {
+                        table_id: ctx.table_id,
+                        path: ctx.path.to_path_buf(),
+                        offset,
+                        data_length: header.data_length,
+                        error: std::io::Error::new(
+                            std::io::ErrorKind::UnexpectedEof,
+                            format!("parity trailer truncated: read {n} of {parity_len} bytes"),
+                        ),
+                    });
+                    return;
+                }
+                Err(e) => {
+                    ctx.errors.push(BlockVerifyError::DataReadError {
+                        table_id: ctx.table_id,
+                        path: ctx.path.to_path_buf(),
+                        offset,
+                        data_length: header.data_length,
+                        error: e,
+                    });
+                    return;
+                }
+            }
+        }
+
         // blocks_scanned was already incremented right after a
         // successful Header::decode_from above — do not double-count
         // here.
         offset = offset
             .saturating_add(header_len)
-            .saturating_add(data_length_u64);
+            .saturating_add(data_length_u64)
+            .saturating_add(parity_len);
     }
 }
 
@@ -926,6 +1121,36 @@ mod block_verify_tests {
         .unwrap()
     }
 
+    /// Populates a tree with per-KV checksums enabled (`AllLevels`) so the
+    /// flushed SST carries data blocks with the `KV_CHECKSUM_FOOTER` flag
+    /// set and a per-entry checksum footer.
+    fn populate_tree_kv_checked(dir: &std::path::Path, items: usize) {
+        use crate::AbstractTree;
+        use crate::runtime_config::KvChecksumPolicy;
+
+        let cfg = Config::new(
+            dir,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .data_block_compression_policy(CompressionPolicy::all(CompressionType::None));
+        let any = cfg.open().unwrap();
+        let crate::AnyTree::Standard(tree) = any else {
+            panic!("expected Standard tree");
+        };
+        tree.update_runtime_config(|c| {
+            c.kv_checksums = KvChecksumPolicy::AllLevels;
+        })
+        .unwrap();
+        for i in 0u64..items as u64 {
+            let key = format!("k{i:08}");
+            let val = format!("v{i:08}");
+            tree.insert(key.as_bytes(), val.as_bytes(), 1 + i);
+        }
+        tree.flush_active_memtable(1 + items as u64).unwrap();
+        drop(tree);
+    }
+
     #[test]
     fn verify_block_checksums_clean_tree_has_no_errors() {
         let dir = tempfile::tempdir().unwrap();
@@ -945,6 +1170,60 @@ mod block_verify_tests {
         assert!(
             report.sst_files_scanned >= 1,
             "expected at least one SST scanned",
+        );
+    }
+
+    #[cfg(feature = "page_ecc")]
+    #[test]
+    fn verify_block_checksums_clean_page_ecc_tree_has_no_errors() {
+        // Regression: with page_ecc on, every SST data / index / filter block
+        // carries a Reed-Solomon parity trailer after its payload. SST blocks
+        // omit the block_flags byte, so the scrub learns parity presence from
+        // the per-SST descriptor and must skip `expected_parity_len(data_length)`
+        // bytes per block. Without that skip the walk mis-reads parity as the
+        // next block's header and reports spurious HeaderCorrupted. Enough items
+        // to spill multiple data blocks so cross-block alignment is exercised.
+        use crate::AbstractTree;
+
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let any = Config::new(
+                dir.path(),
+                SequenceNumberCounter::default(),
+                SequenceNumberCounter::default(),
+            )
+            .data_block_compression_policy(CompressionPolicy::all(CompressionType::None))
+            .page_ecc(true)
+            .open()
+            .unwrap();
+            for i in 0u64..2_000 {
+                let key = format!("k{i:08}");
+                let val = format!("v{i:08}");
+                any.insert(key.as_bytes(), val.as_bytes(), 1 + i);
+            }
+            any.flush_active_memtable(2_001).unwrap();
+            drop(any);
+        }
+
+        let tree = Config::new(
+            dir.path(),
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .data_block_compression_policy(CompressionPolicy::all(CompressionType::None))
+        .page_ecc(true)
+        .open()
+        .unwrap();
+        let report = verify_block_checksums(&tree);
+        assert!(
+            report.is_ok(),
+            "page_ecc tree must verify with zero errors (parity trailers skipped \
+             per block), got {:?}",
+            report.errors,
+        );
+        assert!(
+            report.blocks_scanned > 1,
+            "expected multiple blocks scanned to exercise cross-block alignment",
         );
     }
 
@@ -980,7 +1259,7 @@ mod block_verify_tests {
         // Header — that lands squarely inside the data segment of the
         // first data block, so the header's own XXH3 stays valid (no
         // HeaderCorrupted) but the data XXH3 will now mismatch.
-        let flip_offset = Header::serialized_len() as u64;
+        let flip_offset = Header::MIN_LEN as u64;
         {
             let mut f = std::fs::OpenOptions::new()
                 .read(true)
@@ -1013,6 +1292,137 @@ mod block_verify_tests {
             "expected a DataCorrupted error for {}, got {:?}",
             sst_path.display(),
             report.errors,
+        );
+    }
+
+    #[test]
+    fn verify_kv_checksums_clean_kv_checked_tree_passes() {
+        // A tree written with per-KV checksums enabled must pass the
+        // per-KV scrub with no error.
+        let dir = tempfile::tempdir().unwrap();
+        populate_tree_kv_checked(dir.path(), 500);
+
+        let tree = reopen_tree(dir.path());
+        let crate::AnyTree::Standard(tree) = tree else {
+            panic!("expected Standard tree");
+        };
+        verify_kv_checksums(&tree).expect("clean kv-checked tree must pass per-KV scrub");
+    }
+
+    #[test]
+    fn verify_kv_checked_detects_corrupted_digest_under_valid_block_checksum() {
+        // The per-KV verifier must catch a divergence that the block-level
+        // XXH3 does NOT: corrupt a stored digest, then write the block so its
+        // block-level checksum is computed over the already-corrupted bytes.
+        // The block therefore loads cleanly (block checksum valid) and only
+        // the per-KV recompute disagrees. (Flipping a payload byte in the
+        // file without recomputing the block checksum would be caught at
+        // load, never reaching the per-KV path — which would prove nothing.)
+        use crate::InternalValue;
+        use crate::ValueType::Value;
+        use crate::comparator::default_comparator;
+        use crate::runtime_config::ChecksumAlgorithm;
+        use crate::table::block::header::block_flags;
+        use crate::table::block::{Block, BlockIdentity, BlockTransform, BlockType, kv_checksum};
+        use crate::table::data_block::DataBlock;
+
+        let algo = ChecksumAlgorithm::Xxh3_64;
+        let items = [
+            InternalValue::from_components(b"alpha".to_vec(), b"one".to_vec(), 3, Value),
+            InternalValue::from_components(b"bravo".to_vec(), b"two".to_vec(), 2, Value),
+        ];
+        let digests: Vec<u64> = items
+            .iter()
+            .map(|it| kv_checksum::kv_digest(it, algo).expect("xxh3 always available"))
+            .collect();
+
+        let mut payload = Vec::new();
+        DataBlock::encode_kv_checked_into(&mut payload, &items, &digests, algo, 2, 0.0).unwrap();
+
+        // Corrupt the first stored digest (its first byte sits right after the
+        // inner payload, where the digest array begins).
+        let inner_len = kv_checksum::split_inner(&payload).unwrap().len();
+        *payload.get_mut(inner_len).expect("digest array byte") ^= 0xFF;
+
+        // Write with a VALID block-level checksum over the corrupted payload.
+        // Data blocks omit the `block_flags` byte (footer presence is a per-SST
+        // descriptor property), so the KV_CHECKSUM_FOOTER flag passed here is
+        // dropped on encode — the footer rides inside the payload structurally,
+        // and `verify_kv_checked` splits it without consulting the header bit.
+        let id = BlockIdentity::for_test(0, 0, BlockType::Data);
+        let mut buf = Vec::new();
+        Block::write_into_with_flags(
+            &mut buf,
+            &payload,
+            id,
+            &BlockTransform::PLAIN,
+            block_flags::KV_CHECKSUM_FOOTER,
+        )
+        .unwrap();
+
+        // Block loads fine (block-level checksum matches the corrupted bytes).
+        let block = Block::from_reader(&mut &buf[..], id, &BlockTransform::PLAIN).unwrap();
+
+        // Only the per-KV verifier catches the bad digest. `None` skips the
+        // algorithm cross-check — this test exercises the digest-mismatch path.
+        let err =
+            DataBlock::verify_kv_checked(&block.data, block.header, default_comparator(), None)
+                .expect_err("corrupted stored digest must fail the per-KV verifier");
+        assert!(
+            matches!(err, crate::Error::ChecksumMismatch { .. }),
+            "expected ChecksumMismatch, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn verify_kv_checked_rejects_non_data_block_type() {
+        // The scrub verifies only Data blocks. A header whose block_type is
+        // not Data (corruption or a caller bug) must be rejected with
+        // InvalidTag, not silently coerced to Data and verified as if it were
+        // a data block — coercion would defeat the scrub's purpose.
+        use crate::InternalValue;
+        use crate::ValueType::Value;
+        use crate::comparator::default_comparator;
+        use crate::runtime_config::ChecksumAlgorithm;
+        use crate::table::block::header::block_flags;
+        use crate::table::block::{Block, BlockIdentity, BlockTransform, BlockType, kv_checksum};
+        use crate::table::data_block::DataBlock;
+
+        let algo = ChecksumAlgorithm::Xxh3_64;
+        let items = [
+            InternalValue::from_components(b"alpha".to_vec(), b"one".to_vec(), 3, Value),
+            InternalValue::from_components(b"bravo".to_vec(), b"two".to_vec(), 2, Value),
+        ];
+        let digests: Vec<u64> = items
+            .iter()
+            .map(|it| kv_checksum::kv_digest(it, algo).expect("xxh3 always available"))
+            .collect();
+
+        let mut payload = Vec::new();
+        DataBlock::encode_kv_checked_into(&mut payload, &items, &digests, algo, 2, 0.0).unwrap();
+
+        let id = BlockIdentity::for_test(0, 0, BlockType::Data);
+        let mut buf = Vec::new();
+        Block::write_into_with_flags(
+            &mut buf,
+            &payload,
+            id,
+            &BlockTransform::PLAIN,
+            block_flags::KV_CHECKSUM_FOOTER,
+        )
+        .unwrap();
+        let block = Block::from_reader(&mut &buf[..], id, &BlockTransform::PLAIN).unwrap();
+
+        // The footer + inner bytes form a valid data block, so only the
+        // block_type gate can catch a tampered type: flip it to a non-Data
+        // variant and require InvalidTag.
+        let mut bad_header = block.header;
+        bad_header.block_type = BlockType::Index;
+        let err = DataBlock::verify_kv_checked(&block.data, bad_header, default_comparator(), None)
+            .expect_err("non-Data block_type must be rejected, not coerced");
+        assert!(
+            matches!(err, crate::Error::InvalidTag(("BlockType", _))),
+            "expected InvalidTag(BlockType), got {err:?}"
         );
     }
 
@@ -1132,7 +1542,7 @@ mod block_verify_tests {
         //   MAGIC(4) | version(1) | csum_type(1) | toc_checksum(16) | toc_pos(8) | toc_len(8)
         const TRAILER_LEN: usize = 4 + 1 + 1 + 16 + 8 + 8;
         const DATA_LENGTH: u32 = 4096;
-        const HEADER_LEN: u64 = Header::serialized_len() as u64;
+        const HEADER_LEN: u64 = Header::MIN_LEN as u64;
 
         let header = Header {
             // Arbitrary sentinel; the walker reaches `read_exact` and
@@ -1202,7 +1612,8 @@ mod block_verify_tests {
         }
 
         let table_id: TableId = 42;
-        let scan = scan_sst_blocks(&fs, path, table_id, 0).expect("forged SFA must parse cleanly");
+        let scan =
+            scan_sst_blocks(&fs, path, table_id, 0, false).expect("forged SFA must parse cleanly");
         assert_eq!(
             scan.errors.len(),
             1,

@@ -505,6 +505,17 @@ impl AbstractTree for Tree {
         table_writer = table_writer.use_encryption(self.config.encryption.clone());
         table_writer = table_writer.use_page_ecc(self.config.page_ecc);
 
+        // Per-KV checksums follow the LIVE runtime config snapshot so a
+        // toggle via `update_runtime_config` takes effect on the next
+        // flush. `Off` (default) emits no per-KV footer and leaves the
+        // data-block payload encoding unchanged (the V5 header carries a
+        // block_flags byte and the meta block a descriptor key regardless,
+        // so the on-disk bytes are not identical to a pre-V5 table).
+        {
+            let rc = self.0.runtime_config.load_full();
+            table_writer = table_writer.use_kv_checksums(rc.kv_checksums, rc.kv_checksum_algo);
+        }
+
         #[cfg(zstd_any)]
         {
             table_writer = table_writer.use_zstd_dictionary(self.config.zstd_dictionary.clone());
@@ -1979,7 +1990,7 @@ impl Tree {
             let manifest_path = config.path.join(format!("v{version_id}"));
             // Open the manifest with a default runtime snapshot:
             // ECC awareness is captured per-Block via the header
-            // (`ecc_length` field) so the reader doesn't actually
+            // (`ECC_PARITY` flag) so the reader doesn't actually
             // need to know which ECC mode the writer used. The
             // captured runtime here is a placeholder; once we want
             // runtime-driven decisions on the read path (e.g.

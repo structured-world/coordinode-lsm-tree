@@ -6,7 +6,7 @@ use super::{Block, BlockHandle, DataBlock};
 use crate::fs::FsFile;
 use crate::{
     CompressionType, KeyRange, SeqNo, TableId, checksum::ChecksumType, coding::Decode,
-    comparator::default_comparator, table::block::BlockType,
+    comparator::default_comparator, runtime_config::ChecksumAlgorithm, table::block::BlockType,
 };
 use byteorder::{LittleEndian, ReadBytesExt};
 use std::ops::Deref;
@@ -57,27 +57,58 @@ pub struct ParsedMeta {
 
     pub data_block_compression: CompressionType,
     pub index_block_compression: CompressionType,
+
+    /// Per-SST per-KV-footer descriptor: `Some(algo)` when every data block
+    /// in this table carries a per-KV checksum footer under `algo`, `None`
+    /// when the table was written with no per-KV footers. Sourced from the
+    /// `descriptor#kv_checksum` meta byte. Because an SST is homogeneous,
+    /// this single value lets the read / scrub path know the footer state
+    /// of the whole table without inspecting any data block header.
+    pub kv_checksum_algo: Option<ChecksumAlgorithm>,
+
+    /// Per-SST Page-ECC indicator: `true` when this table was written with
+    /// Page ECC enabled. Sourced from the `descriptor#page_ecc` meta byte.
+    ///
+    /// Note this is "ECC enabled for the table", not "every block carries a
+    /// parity trailer": a block with an empty payload emits a zero-length
+    /// trailer (`expected_parity_len(0) == 0`) even under `page_ecc`.
+    ///
+    /// For SST block types (`Data` / `Index` / `Filter` / `RangeTombstone`)
+    /// this descriptor IS the parity-presence signal today: those blocks omit
+    /// the `block_flags` byte on disk, so there is no per-block `ECC_PARITY`
+    /// flag to read and the read path derives the trailer from this table-wide
+    /// flag + `expected_parity_len(data_length)`. The self-describing block
+    /// types (`Meta` / `Manifest` / `ManifestFooter`) keep the byte and still
+    /// carry a per-block `ECC_PARITY` flag.
+    pub page_ecc: bool,
 }
 
 macro_rules! read_u8 {
     ($block:expr, $name:expr, $cmp:expr) => {{
-        let bytes = $block
+        let item = $block
             .point_read($name, SeqNo::MAX, $cmp)?
             .ok_or(crate::Error::InvalidHeader("TableMeta"))?;
-
-        let mut bytes = &bytes.value[..];
-        bytes.read_u8()?
+        // Single-byte meta value: reject an overlong / corrupt payload instead
+        // of silently truncating to the first byte (read_u8 ignores trailing
+        // bytes), which would weaken corruption detection on these
+        // format-critical descriptor fields.
+        match &item.value[..] {
+            [b] => *b,
+            _ => return Err(crate::Error::InvalidHeader("TableMeta")),
+        }
     }};
 }
 
 macro_rules! read_u64 {
     ($block:expr, $name:expr, $cmp:expr) => {{
-        let bytes = $block
+        let item = $block
             .point_read($name, SeqNo::MAX, $cmp)?
             .ok_or(crate::Error::InvalidHeader("TableMeta"))?;
-
-        let mut bytes = &bytes.value[..];
-        bytes.read_u64::<LittleEndian>()?
+        // Exactly eight little-endian bytes: an overlong / short payload is
+        // corrupt meta, not silently truncatable.
+        let bytes = <[u8; 8]>::try_from(&item.value[..])
+            .map_err(|_| crate::Error::InvalidHeader("TableMeta"))?;
+        u64::from_le_bytes(bytes)
     }};
 }
 
@@ -274,6 +305,23 @@ impl ParsedMeta {
             CompressionType::decode_from(&mut bytes)?
         };
 
+        // The per-SST transform descriptor keys are REQUIRED, not optional.
+        // They are new in the V5 on-disk format, which bumped the block magic
+        // to `[L,S,M,4]` (pre-V5 used `[L,S,M,3]`). A pre-V5 table's blocks —
+        // including this meta block — are already rejected at the magic check
+        // in `Header::decode_from` before this parse runs, so requiring the
+        // descriptor adds no incremental incompatibility: there is no
+        // readable older table that reaches this point lacking the key.
+        // (Treating it as optional-with-default would only mask a corrupt or
+        // truncated V5 meta block.)
+        let kv_checksum_algo = crate::table::block::kv_checksum::descriptor_from_byte(read_u8!(
+            block,
+            b"descriptor#kv_checksum",
+            &cmp
+        ))?;
+
+        let page_ecc = read_u8!(block, b"descriptor#page_ecc", &cmp) != 0;
+
         Ok(Self {
             id,
             created_at,
@@ -289,6 +337,8 @@ impl ParsedMeta {
             weak_tombstone_reclaimable,
             data_block_compression,
             index_block_compression,
+            kv_checksum_algo,
+            page_ecc,
         })
     }
 }
@@ -361,6 +411,8 @@ mod tests {
             meta("crate_version", env!("CARGO_PKG_VERSION").as_bytes()),
             meta("created_at", &1_000_000u128.to_le_bytes()),
             meta("data_block_hash_ratio", &0.0f64.to_le_bytes()),
+            meta("descriptor#kv_checksum", &[0u8]),
+            meta("descriptor#page_ecc", &[0u8]),
             meta("file_size", &4096u64.to_le_bytes()),
             meta("filter_hash_type", &[u8::from(ChecksumType::Xxh3)]),
             meta("index_keys_have_seqno", &[0x1]),
@@ -475,6 +527,102 @@ mod tests {
         let items: Vec<_> = valid_meta_items()
             .into_iter()
             .filter(|iv| &*iv.key.user_key != b"compression#data")
+            .collect();
+        let result = load_meta_from_items(&items);
+        assert!(
+            matches!(result, Err(crate::Error::InvalidHeader("TableMeta"))),
+            "expected InvalidHeader(\"TableMeta\"), got {result:?}",
+        );
+    }
+
+    /// A `descriptor#kv_checksum` byte of 0 parses as "no per-KV footer"
+    /// (`kv_checksum_algo == None`) — the common, footer-free table.
+    #[test]
+    fn load_with_handle_kv_descriptor_zero_parses_as_none() {
+        let parsed = load_meta_from_items(&valid_meta_items()).unwrap();
+        assert_eq!(parsed.kv_checksum_algo, None);
+    }
+
+    /// A non-zero `descriptor#kv_checksum` byte round-trips to the encoded
+    /// algorithm, so the read / scrub path learns the whole table's footer
+    /// state from this single per-SST byte.
+    #[test]
+    fn load_with_handle_kv_descriptor_nonzero_parses_algorithm() {
+        let mut items = valid_meta_items();
+        let byte =
+            crate::table::block::kv_checksum::descriptor_byte(Some(ChecksumAlgorithm::Xxh3Low32));
+        if let Some(item) = items
+            .iter_mut()
+            .find(|iv| &*iv.key.user_key == b"descriptor#kv_checksum")
+        {
+            *item = meta("descriptor#kv_checksum", &[byte]);
+        }
+        let parsed = load_meta_from_items(&items).unwrap();
+        assert_eq!(parsed.kv_checksum_algo, Some(ChecksumAlgorithm::Xxh3Low32));
+    }
+
+    /// Missing `descriptor#kv_checksum` must return `Err(InvalidHeader)`,
+    /// not panic — the descriptor is a required per-SST field.
+    #[test]
+    fn load_with_handle_missing_kv_descriptor_returns_err() {
+        let items: Vec<_> = valid_meta_items()
+            .into_iter()
+            .filter(|iv| &*iv.key.user_key != b"descriptor#kv_checksum")
+            .collect();
+        let result = load_meta_from_items(&items);
+        assert!(
+            matches!(result, Err(crate::Error::InvalidHeader("TableMeta"))),
+            "expected InvalidHeader(\"TableMeta\"), got {result:?}",
+        );
+    }
+
+    /// An overlong single-byte descriptor payload (e.g. `[0, 0xFF]`) must be
+    /// rejected as `InvalidHeader`, not silently truncated to the first byte —
+    /// `read_u8!` would otherwise ignore the trailing bytes and weaken
+    /// corruption detection on these format-critical per-SST descriptors.
+    #[test]
+    fn load_with_handle_overlong_descriptor_payload_is_rejected() {
+        for key in ["descriptor#kv_checksum", "descriptor#page_ecc"] {
+            let mut items = valid_meta_items();
+            if let Some(item) = items
+                .iter_mut()
+                .find(|iv| &*iv.key.user_key == key.as_bytes())
+            {
+                *item = meta(key, &[0u8, 0xFF]);
+            }
+            let result = load_meta_from_items(&items);
+            assert!(
+                matches!(result, Err(crate::Error::InvalidHeader("TableMeta"))),
+                "overlong {key} payload must be rejected, got {result:?}",
+            );
+        }
+    }
+
+    /// `descriptor#page_ecc` round-trips: `0` → `false` (no parity trailer),
+    /// any non-zero → `true`.
+    #[test]
+    fn load_with_handle_page_ecc_descriptor_parses() {
+        let parsed = load_meta_from_items(&valid_meta_items()).unwrap();
+        assert!(!parsed.page_ecc, "0 byte means no Page ECC");
+
+        let mut items = valid_meta_items();
+        if let Some(item) = items
+            .iter_mut()
+            .find(|iv| &*iv.key.user_key == b"descriptor#page_ecc")
+        {
+            *item = meta("descriptor#page_ecc", &[1u8]);
+        }
+        let parsed = load_meta_from_items(&items).unwrap();
+        assert!(parsed.page_ecc, "non-zero byte means Page ECC is on");
+    }
+
+    /// Missing `descriptor#page_ecc` must return `Err(InvalidHeader)`, not
+    /// panic — it is a required per-SST field.
+    #[test]
+    fn load_with_handle_missing_page_ecc_descriptor_returns_err() {
+        let items: Vec<_> = valid_meta_items()
+            .into_iter()
+            .filter(|iv| &*iv.key.user_key != b"descriptor#page_ecc")
             .collect();
         let result = load_meta_from_items(&items);
         assert!(

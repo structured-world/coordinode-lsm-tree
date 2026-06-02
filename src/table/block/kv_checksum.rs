@@ -1,0 +1,485 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026-present, Structured World Foundation
+
+//! Per-KV checksum footer for per-KV-checked data blocks.
+//!
+//! A per-KV-checked block is a standard data block payload, byte-for-byte
+//! identical to a plain [`BlockType::Data`](super::BlockType::Data) block,
+//! followed by a fixed trailing footer.
+//!
+//! Footer presence is NOT read from a per-block header flag for SST data
+//! blocks: those omit the `block_flags` byte on disk (V5 variable header), so
+//! `header.block_flags` always decodes as `0` and the
+//! [`KV_CHECKSUM_FOOTER`](super::header::block_flags::KV_CHECKSUM_FOOTER) bit
+//! is never serialized for them. The read path learns whether to strip the
+//! footer from the per-SST meta descriptor (`descriptor#kv_checksum`),
+//! threaded in out-of-band. The footer layout is:
+//!
+//! ```text
+//! [ standard Data-block payload ]
+//! [ kv_checksums_array: count × digest_size ]   little-endian digests
+//! [ kv_checksum_algorithm: u8 ]                 ChecksumAlgorithm wire tag
+//! [ kv_count: u32 ]                             entry count, little-endian
+//! ```
+//!
+//! Wrapping (rather than prefixing) keeps the inner payload identical to a
+//! plain data block, so the standard [`Decoder`](super::Decoder) /
+//! `point_read` / seek paths run on the inner slice with zero changes: the
+//! reader splits the footer off the end, hands the inner slice to the
+//! unchanged decoder, and verifies digests only on the scrub / paranoid
+//! path (block-level XXH3 already covers the on-disk bytes on the hot read
+//! path).
+//!
+//! ## Digest domain
+//!
+//! Each digest is computed over the entry's LOGICAL content, not its
+//! on-disk encoding:
+//! `value_type ‖ seqno (LE u64) ‖ len(user_key) (LE u32) ‖ user_key ‖ value`.
+//! The explicit `len(user_key)` frame keeps the domain injective (without it
+//! `user_key ‖ value` would be ambiguous across the key/value boundary).
+//! The domain is invariant to restart-interval re-encoding (prefix truncation
+//! differs per block layout), so the same digest is reproduced every time a
+//! compaction re-packs the entry. In this implementation the writer
+//! computes the digests when it compiles the block; because the domain is
+//! logical, a future memtable-insert path that carries a precomputed digest
+//! would yield the identical value (recompute and carry agree).
+
+use alloc::vec::Vec;
+
+use crate::InternalValue;
+use crate::runtime_config::ChecksumAlgorithm;
+
+/// Size of the fixed footer tail after the checksum array: a one-byte
+/// algorithm tag plus a four-byte little-endian entry count.
+pub const FOOTER_TAIL_LEN: usize = 1 + 4;
+
+/// Computes the per-KV digest of `item` under `algo` over the entry's
+/// logical content (`value_type ‖ seqno ‖ len(user_key) ‖ user_key ‖ value`).
+///
+/// The user-key length is framed as a little-endian `u32` between the
+/// fixed-width header (`value_type`, `seqno`) and the two variable-length
+/// fields so the domain is injective: without it, `user_key ‖ value` is
+/// ambiguous (`key="a",value="bc"` and `key="ab",value="c"` would collide),
+/// letting a boundary-shifting corruption evade per-KV verification.
+///
+/// Returns `None` when `algo` is not compiled into this build (mirrors
+/// [`ChecksumAlgorithm::compute`]); callers translate that into a typed
+/// not-compiled-in error.
+#[must_use]
+pub fn kv_digest(item: &InternalValue, algo: ChecksumAlgorithm) -> Option<u64> {
+    // Logical domain: the same fields the writer/memtable hold, independent of
+    // on-disk prefix truncation. The fixed-width prefix (value_type ‖ seqno ‖
+    // len(user_key)) lives in a 13-byte stack array; the two variable-length
+    // fields are fed as borrowed slices. Streaming the three chunks into the
+    // hasher avoids a fresh per-entry heap buffer on the write hot path while
+    // producing the identical digest a one-shot hash over the concatenation
+    // would (see `ChecksumAlgorithm::compute_chunks`).
+    //
+    // Frame the user-key length so the key/value boundary is unambiguous.
+    // A data block never holds a 4 GiB key, so u32 is sufficient.
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "user keys are bounded well below u32::MAX"
+    )]
+    let user_key_len = item.key.user_key.len() as u32;
+
+    let mut head = [0u8; 1 + 8 + 4];
+    head[0] = u8::from(item.key.value_type);
+    head[1..9].copy_from_slice(&item.key.seqno.to_le_bytes());
+    head[9..13].copy_from_slice(&user_key_len.to_le_bytes());
+
+    algo.compute_chunks(&[&head, &item.key.user_key, &item.value])
+}
+
+/// Appends the per-KV checksum footer to `payload` (which already holds the
+/// encoded standard data-block bytes).
+///
+/// `digests` are stored little-endian, each truncated to `algo.digest_size()`
+/// bytes, in entry order. The tail records `algo`'s wire tag and the entry
+/// count so the reader can split the footer without consulting the block
+/// trailer.
+pub fn append_footer(payload: &mut Vec<u8>, digests: &[u64], algo: ChecksumAlgorithm) {
+    let size = algo.digest_size();
+    // Every digest is stored from a `u64`'s LE bytes, so the width must fit
+    // in 8. A future algorithm with a wider digest would silently skip the
+    // `le.get(..size)` copy below and emit a malformed footer; catch that in
+    // debug builds rather than ship a footer the reader can't split.
+    assert!(size <= 8, "digest_size must fit in u64 LE bytes");
+    for &d in digests {
+        let le = d.to_le_bytes();
+        // `digest_size` is 4 or 8; the low `size` bytes are the meaningful
+        // digest (Xxh3Low32 / Crc32c already mask to 32 bits in `compute`).
+        // Index rather than `get(..size)`: the assert above guarantees
+        // `size <= 8`, so this never panics for any real algorithm, and a
+        // future wider-digest algorithm fails loudly in release too instead
+        // of silently emitting a footer the reader can't split.
+        #[expect(clippy::indexing_slicing, reason = "size <= 8 enforced above")]
+        payload.extend_from_slice(&le[..size]);
+    }
+    payload.push(algo.wire_tag());
+    // Entry count fits u32: data blocks never approach 4G entries.
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "a data block never holds more than u32::MAX entries"
+    )]
+    payload.extend_from_slice(&(digests.len() as u32).to_le_bytes());
+}
+
+/// Encodes the per-SST per-KV-footer descriptor as a single byte for the
+/// table meta block.
+///
+/// `0` means the SST writes no per-KV footers; any other value is
+/// `1 + algo.wire_tag()`, so the algorithm is recoverable. Reserving `0`
+/// for "absent" keeps the present/absent distinction unambiguous: a bare
+/// `wire_tag` of `0` would otherwise collide with
+/// [`ChecksumAlgorithm::Xxh3_64`]. An SST is homogeneous (one writer, one
+/// config snapshot, one `(level, table_id)`), so a single per-SST byte
+/// fully describes whether every data block carries a footer and under
+/// which algorithm — no per-block inspection needed.
+#[must_use]
+pub fn descriptor_byte(algo: Option<ChecksumAlgorithm>) -> u8 {
+    match algo {
+        None => 0,
+        Some(a) => 1 + a.wire_tag(),
+    }
+}
+
+/// Decodes the per-SST per-KV-footer descriptor byte written by
+/// [`descriptor_byte`].
+///
+/// `0` decodes to `None` (no footer); any other byte decodes to the
+/// algorithm whose [`ChecksumAlgorithm::wire_tag`] is `byte - 1`.
+///
+/// # Errors
+///
+/// Returns [`crate::Error::InvalidTrailer`] for a non-zero byte that does
+/// not map to a known algorithm (forward-incompatible or corrupt meta).
+pub fn descriptor_from_byte(byte: u8) -> crate::Result<Option<ChecksumAlgorithm>> {
+    if byte == 0 {
+        return Ok(None);
+    }
+    ChecksumAlgorithm::from_wire_tag(byte - 1)
+        .map(Some)
+        .ok_or(crate::Error::InvalidTrailer)
+}
+
+/// Splits a footer-bearing data block, returning the inner standard
+/// data-block slice (byte-identical to a plain `BlockType::Data` block) with
+/// the per-KV checksum footer removed. Feed the returned slice straight to
+/// the standard decoder.
+///
+/// The footer's algorithm tag and entry count are validated to locate the
+/// inner/footer boundary, but the parsed digests are not returned here: the
+/// read path does not verify per-entry checksums (that is the scrub /
+/// paranoid path; the block-level checksum already validated the on-disk
+/// bytes at load time).
+///
+/// # Errors
+///
+/// Returns [`crate::Error::InvalidTrailer`] when the footer is structurally
+/// malformed: too short to hold the tail, an unknown algorithm tag, or a
+/// `count` inconsistent with the available bytes.
+pub fn split_inner(bytes: &[u8]) -> crate::Result<&[u8]> {
+    let total = bytes.len();
+    if total < FOOTER_TAIL_LEN {
+        return Err(crate::Error::InvalidTrailer);
+    }
+    let tail_start = total - FOOTER_TAIL_LEN;
+    let tail = bytes
+        .get(tail_start..total)
+        .ok_or(crate::Error::InvalidTrailer)?;
+    // `tail` is exactly FOOTER_TAIL_LEN (= 5) bytes: [algo_tag][count: u32 LE].
+    let algo_tag = *tail.first().ok_or(crate::Error::InvalidTrailer)?;
+    let algo = ChecksumAlgorithm::from_wire_tag(algo_tag).ok_or(crate::Error::InvalidTrailer)?;
+    let count = u32::from_le_bytes(
+        tail.get(1..)
+            .and_then(|s| s.try_into().ok())
+            .ok_or(crate::Error::InvalidTrailer)?,
+    ) as usize;
+
+    let array_len = count
+        .checked_mul(algo.digest_size())
+        .ok_or(crate::Error::InvalidTrailer)?;
+    if array_len > tail_start {
+        return Err(crate::Error::InvalidTrailer);
+    }
+    let array_start = tail_start - array_len;
+
+    bytes.get(..array_start).ok_or(crate::Error::InvalidTrailer)
+}
+
+/// Full decomposition of a footer-bearing data block: the inner standard
+/// data-block slice plus a borrowed view over the per-entry digest array.
+/// Used by the scrub / paranoid verify path, which re-derives each entry's
+/// digest and compares it against the stored array.
+///
+/// The stored digests are NOT expanded into an owned `Vec<u64>`: they are
+/// read on demand from the borrowed on-disk bytes via [`Self::digest`]. For
+/// 4-byte algorithms (`Xxh3Low32` / `Crc32c`) an owned `Vec<u64>` would
+/// double the digest-array memory; reading on demand keeps the verify path's
+/// transient footprint at zero beyond the borrowed block buffer.
+pub struct SplitFull<'a> {
+    /// Inner payload: byte-identical to a plain `BlockType::Data` block.
+    pub inner: &'a [u8],
+    /// Raw on-disk per-entry digest array: `count × digest_size` bytes, in
+    /// scan order. Borrowed, not expanded.
+    digest_array: &'a [u8],
+    /// Algorithm the digests were computed under.
+    pub algo: ChecksumAlgorithm,
+    /// Number of per-entry digests in [`Self::digest_array`].
+    count: usize,
+}
+
+impl SplitFull<'_> {
+    /// Number of per-entry digests stored in the footer.
+    #[must_use]
+    pub fn count(&self) -> usize {
+        self.count
+    }
+
+    /// Stored digest for entry `index`, read directly from the borrowed
+    /// on-disk digest array (low `digest_size` bytes, little-endian, widened
+    /// to `u64`). Returns `None` if `index` is out of range.
+    #[must_use]
+    pub fn digest(&self, index: usize) -> Option<u64> {
+        let size = self.algo.digest_size();
+        let off = index.checked_mul(size)?;
+        let end = off.checked_add(size)?;
+        let chunk = self.digest_array.get(off..end)?;
+        let mut word = [0u8; 8];
+        word.get_mut(..size)?.copy_from_slice(chunk);
+        Some(u64::from_le_bytes(word))
+    }
+}
+
+/// Splits a footer-bearing data block into its inner slice plus a borrowed
+/// view over the per-entry digest array and algorithm. The verify path uses
+/// this to recompute each entry's logical-content digest and compare against
+/// the stored value, reading digests on demand (no owned `Vec`).
+///
+/// # Errors
+///
+/// Returns [`crate::Error::InvalidTrailer`] when the footer is structurally
+/// malformed (too short, unknown algorithm tag, or a `count` inconsistent
+/// with the available bytes).
+pub fn split_full(bytes: &[u8]) -> crate::Result<SplitFull<'_>> {
+    let total = bytes.len();
+    if total < FOOTER_TAIL_LEN {
+        return Err(crate::Error::InvalidTrailer);
+    }
+    let tail_start = total - FOOTER_TAIL_LEN;
+    let tail = bytes
+        .get(tail_start..total)
+        .ok_or(crate::Error::InvalidTrailer)?;
+    let algo_tag = *tail.first().ok_or(crate::Error::InvalidTrailer)?;
+    let algo = ChecksumAlgorithm::from_wire_tag(algo_tag).ok_or(crate::Error::InvalidTrailer)?;
+    let count = u32::from_le_bytes(
+        tail.get(1..)
+            .and_then(|s| s.try_into().ok())
+            .ok_or(crate::Error::InvalidTrailer)?,
+    ) as usize;
+
+    let size = algo.digest_size();
+    let array_len = count
+        .checked_mul(size)
+        .ok_or(crate::Error::InvalidTrailer)?;
+    // Bounds-check `count` against the available bytes BEFORE borrowing the
+    // array. This caps `count` at `tail_start / digest_size`, so a forged
+    // count cannot make a downstream caller over-read or over-allocate.
+    if array_len > tail_start {
+        return Err(crate::Error::InvalidTrailer);
+    }
+    let array_start = tail_start - array_len;
+
+    let digest_array = bytes
+        .get(array_start..tail_start)
+        .ok_or(crate::Error::InvalidTrailer)?;
+    let inner = bytes
+        .get(..array_start)
+        .ok_or(crate::Error::InvalidTrailer)?;
+    Ok(SplitFull {
+        inner,
+        digest_array,
+        algo,
+        count,
+    })
+}
+
+#[cfg(test)]
+#[expect(clippy::expect_used, reason = "test code")]
+mod tests {
+    use super::*;
+    use crate::ValueType;
+
+    fn val(user_key: &[u8], value: &[u8], seqno: u64, vt: ValueType) -> InternalValue {
+        InternalValue::from_components(user_key.to_vec(), value.to_vec(), seqno, vt)
+    }
+
+    #[test]
+    fn kv_digest_is_invariant_to_callsite_but_sensitive_to_content() {
+        // The digest must depend only on logical content, so two
+        // independent constructions of the same entry agree (carry ==
+        // recompute), while any field change flips it.
+        let a = val(b"key", b"value", 7, ValueType::Value);
+        let same = val(b"key", b"value", 7, ValueType::Value);
+        let d = ChecksumAlgorithm::Xxh3_64;
+        assert_eq!(kv_digest(&a, d), kv_digest(&same, d));
+
+        // Each logical field participates.
+        assert_ne!(
+            kv_digest(&a, d),
+            kv_digest(&val(b"KEY", b"value", 7, ValueType::Value), d),
+            "user_key must matter"
+        );
+        assert_ne!(
+            kv_digest(&a, d),
+            kv_digest(&val(b"key", b"VALUE", 7, ValueType::Value), d),
+            "value must matter"
+        );
+        assert_ne!(
+            kv_digest(&a, d),
+            kv_digest(&val(b"key", b"value", 8, ValueType::Value), d),
+            "seqno must matter"
+        );
+        assert_ne!(
+            kv_digest(&a, d),
+            kv_digest(&val(b"key", b"value", 7, ValueType::Tombstone), d),
+            "value_type must matter"
+        );
+    }
+
+    #[test]
+    fn kv_digest_is_injective_across_key_value_boundary() {
+        // Without length framing, `user_key ‖ value` is ambiguous: the pair
+        // (key="a", value="bc") and (key="ab", value="c") concatenate to the
+        // same bytes, so a structured corruption that shifts the key/value
+        // boundary would evade per-KV verification. The digest domain must be
+        // injective for (value_type, seqno, user_key, value).
+        let d = ChecksumAlgorithm::Xxh3_64;
+        let a = val(b"a", b"bc", 7, ValueType::Value);
+        let b = val(b"ab", b"c", 7, ValueType::Value);
+        assert_ne!(
+            kv_digest(&a, d),
+            kv_digest(&b, d),
+            "key/value boundary must be unambiguous in the digest domain",
+        );
+    }
+
+    #[test]
+    fn footer_roundtrips_inner_payload() {
+        // append_footer then split_inner must reproduce the inner bytes
+        // exactly, for both digest widths (the footer occupies the tail).
+        for algo in [ChecksumAlgorithm::Xxh3_64, ChecksumAlgorithm::Xxh3Low32] {
+            let inner = b"standard data block payload bytes".to_vec();
+            let digests: Vec<u64> = (0..5).map(|i| 0x0102_0304_0506_0708 ^ i).collect();
+
+            let mut payload = inner.clone();
+            append_footer(&mut payload, &digests, algo);
+            assert!(
+                payload.len() > inner.len(),
+                "footer must add bytes for {algo:?}"
+            );
+
+            let recovered = split_inner(&payload).expect("well-formed footer must split");
+            assert_eq!(recovered, &inner[..], "inner payload must round-trip");
+        }
+    }
+
+    #[test]
+    fn split_inner_rejects_too_short() {
+        // Fewer bytes than the fixed tail cannot carry a footer.
+        assert!(split_inner(&[0u8; FOOTER_TAIL_LEN - 1]).is_err());
+    }
+
+    #[test]
+    fn split_inner_rejects_unknown_algorithm_tag() {
+        // A tag outside the registry must be rejected, not silently
+        // coerced to a known algorithm.
+        let mut payload = b"inner".to_vec();
+        payload.push(0xFE); // unknown algo tag
+        payload.extend_from_slice(&0u32.to_le_bytes());
+        assert!(split_inner(&payload).is_err());
+    }
+
+    #[test]
+    fn split_inner_rejects_count_exceeding_available_bytes() {
+        // A forged count that would reach past the inner payload must be
+        // rejected rather than slicing out of bounds.
+        let mut payload = b"x".to_vec();
+        payload.push(ChecksumAlgorithm::Xxh3_64.wire_tag());
+        payload.extend_from_slice(&1000u32.to_le_bytes()); // 1000×8 ≫ payload
+        assert!(split_inner(&payload).is_err());
+    }
+
+    #[test]
+    fn split_full_recovers_digests() {
+        // The scrub path relies on split_full to recover the inner slice,
+        // the per-entry digests in order, and the algorithm. Xxh3_64 keeps
+        // the full u64; Xxh3Low32 stores only the low 32 bits, so compare
+        // against the masked expectation.
+        for algo in [ChecksumAlgorithm::Xxh3_64, ChecksumAlgorithm::Xxh3Low32] {
+            let inner = b"standard data block payload bytes".to_vec();
+            let digests: Vec<u64> = (0..5u64).map(|i| 0x0102_0304_0506_0708 ^ i).collect();
+
+            let mut payload = inner.clone();
+            append_footer(&mut payload, &digests, algo);
+
+            let split = split_full(&payload).expect("well-formed footer must split");
+            assert_eq!(split.inner, &inner[..], "inner payload must round-trip");
+            assert_eq!(split.algo, algo, "algorithm tag must round-trip");
+
+            let mask = if algo.digest_size() == 8 {
+                u64::MAX
+            } else {
+                0xFFFF_FFFF
+            };
+            let expected: Vec<u64> = digests.iter().map(|d| d & mask).collect();
+            assert_eq!(
+                split.count(),
+                expected.len(),
+                "digest count must round-trip"
+            );
+            let recovered: Vec<u64> = (0..split.count())
+                .map(|i| split.digest(i).expect("index < count is in range"))
+                .collect();
+            assert_eq!(
+                recovered, expected,
+                "digests must round-trip (masked to width) for {algo:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn descriptor_byte_roundtrips_none_and_every_algorithm() {
+        // The per-SST descriptor byte must round-trip "no footer" and each
+        // known algorithm, with `0` reserved for absent so it never aliases
+        // Xxh3_64 (wire tag 0).
+        assert_eq!(descriptor_byte(None), 0);
+        assert_eq!(
+            descriptor_from_byte(0).expect("zero decodes"),
+            None,
+            "0 must mean no footer"
+        );
+
+        for algo in [
+            ChecksumAlgorithm::Xxh3_64,
+            ChecksumAlgorithm::Xxh3Low32,
+            ChecksumAlgorithm::Crc32c,
+        ] {
+            let byte = descriptor_byte(Some(algo));
+            assert_ne!(byte, 0, "present footer must not encode as 0 for {algo:?}");
+            assert_eq!(
+                descriptor_from_byte(byte).expect("present byte decodes"),
+                Some(algo),
+                "algorithm must round-trip for {algo:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn descriptor_from_byte_rejects_unknown_nonzero_tag() {
+        // A non-zero byte that maps to no known algorithm is corrupt /
+        // forward-incompatible meta and must error, not silently decode.
+        assert!(descriptor_from_byte(0xFE).is_err());
+    }
+}

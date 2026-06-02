@@ -79,6 +79,14 @@ pub struct MultiWriter {
     /// can stamp the same flag on every successor [`Writer`].
     page_ecc: bool,
 
+    /// Per-KV checksum policy + algorithm (from the runtime
+    /// `kv_checksums` config) — preserved here so the rotation path
+    /// stamps the same setting on every successor [`Writer`].
+    kv_checksum: Option<(
+        crate::runtime_config::KvChecksumPolicy,
+        crate::runtime_config::ChecksumAlgorithm,
+    )>,
+
     #[cfg(zstd_any)]
     zstd_dictionary: Option<Arc<crate::compression::ZstdDictionary>>,
 }
@@ -135,6 +143,8 @@ impl MultiWriter {
             encryption: None,
 
             page_ecc: false,
+
+            kv_checksum: None,
 
             #[cfg(zstd_any)]
             zstd_dictionary: None,
@@ -418,6 +428,27 @@ impl MultiWriter {
         self
     }
 
+    /// Wires the runtime `kv_checksums` policy + algorithm through to the
+    /// inner [`Writer`] and preserves it across rotations so every
+    /// successor writer applies the same per-KV checksum setting. `Off`
+    /// emits no per-KV footer and leaves the `KV_CHECKSUM_FOOTER` flag clear
+    /// (the data-block payload encoding is unchanged; the V5 header/meta
+    /// layout still differs from pre-V5 regardless).
+    #[must_use]
+    pub fn use_kv_checksums(
+        mut self,
+        policy: crate::runtime_config::KvChecksumPolicy,
+        algo: crate::runtime_config::ChecksumAlgorithm,
+    ) -> Self {
+        self.kv_checksum = if matches!(policy, crate::runtime_config::KvChecksumPolicy::Off) {
+            None
+        } else {
+            Some((policy, algo))
+        };
+        self.writer = self.writer.use_kv_checksums(policy, algo);
+        self
+    }
+
     #[cfg(zstd_any)]
     #[must_use]
     pub fn use_zstd_dictionary(
@@ -455,6 +486,9 @@ impl MultiWriter {
         new_writer = new_writer.use_prefix_extractor(self.prefix_extractor.clone());
         new_writer = new_writer.use_encryption(self.encryption.clone());
         new_writer = new_writer.use_page_ecc(self.page_ecc);
+        if let Some((policy, algo)) = self.kv_checksum {
+            new_writer = new_writer.use_kv_checksums(policy, algo);
+        }
 
         #[cfg(zstd_any)]
         {

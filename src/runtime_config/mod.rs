@@ -59,4 +59,7 @@ pub mod types;
 #[cfg(feature = "std")]
 pub(crate) mod handle;
 
-pub use types::{ChecksumAlgorithm, RuntimeConfig};
+pub use types::{
+    ChecksumAlgorithm, KvChecksumComputePoint, KvChecksumPolicy, LevelMask, RuntimeConfig,
+    TableIdRange,
+};

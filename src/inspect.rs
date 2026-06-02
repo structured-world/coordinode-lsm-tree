@@ -476,6 +476,13 @@ pub struct DataBlockEntryIter {
     file: Box<dyn crate::fs::FsFile>,
     table_id: crate::table::TableId,
     data_block_compression: CompressionType,
+    /// Per-SST Page-ECC flag from the parsed meta: data blocks omit the
+    /// `block_flags` byte, so the read transform needs it to expect a parity
+    /// trailer.
+    page_ecc: bool,
+    /// Per-SST per-KV-footer flag (`kv_checksum_algo.is_some()`) from the
+    /// parsed meta: tells `from_loaded` whether to strip a footer.
+    has_kv_footer: bool,
     /// Remaining data-block handles (FIFO). Drained as blocks are
     /// loaded. Held as a `Vec` rather than a `VecDeque` because the
     /// TLI walks the handles in sorted order already, and `Vec::pop`
@@ -559,6 +566,8 @@ impl Iterator for DataBlockEntryIter {
                 &handle,
                 self.table_id,
                 self.data_block_compression,
+                self.page_ecc,
+                self.has_kv_footer,
             ) {
                 Ok(iter) => {
                     self.current = Some(iter);
@@ -711,6 +720,8 @@ pub fn iter_data_block_entries(path: &Path) -> crate::Result<DataBlockEntryIter>
         file,
         table_id,
         data_block_compression,
+        page_ecc: meta.page_ecc,
+        has_kv_footer: meta.kv_checksum_algo.is_some(),
         remaining_handles: handles,
         current: None,
         keys_only: false,
@@ -723,6 +734,8 @@ fn load_data_block_iter(
     handle: &crate::table::BlockHandle,
     table_id: crate::table::TableId,
     compression: CompressionType,
+    page_ecc: bool,
+    has_kv_footer: bool,
 ) -> crate::Result<crate::table::iter::OwnedDataBlockIter> {
     use crate::table::DataBlock;
     use crate::table::block::{Block, BlockIdentity, BlockType};
@@ -756,12 +769,18 @@ fn load_data_block_iter(
             dict_id: 0,
             window_log: 0,
         },
-        &crate::table::block::BlockTransform::from_parts(
-            compression,
-            None,
-            #[cfg(zstd_any)]
-            None,
-        )?,
+        &{
+            // Data blocks omit the block_flags byte, so ECC presence is a
+            // per-SST property: upgrade to the `*Ecc` transform when the SST
+            // was written with Page ECC. Identity without the feature.
+            let t = crate::table::block::BlockTransform::from_parts(
+                compression,
+                None,
+                #[cfg(zstd_any)]
+                None,
+            )?;
+            if page_ecc { t.with_ecc() } else { t }
+        },
     )?;
 
     if block.header.block_type != BlockType::Data {
@@ -771,7 +790,10 @@ fn load_data_block_iter(
         )));
     }
 
-    let data_block = DataBlock::new(block);
+    // `from_loaded` strips the per-KV checksum footer when this SST carries
+    // one (per-SST `has_kv_footer`; data blocks omit the byte) so the
+    // inspection iterator decodes the inner payload normally.
+    let data_block = DataBlock::from_loaded(block, has_kv_footer)?;
     OwnedDataBlockIter::try_new(data_block, |b| {
         b.try_iter(crate::comparator::default_comparator())
     })

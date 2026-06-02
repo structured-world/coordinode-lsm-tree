@@ -9,8 +9,9 @@ pub(crate) mod binary_index;
 pub(crate) mod decoder;
 mod encoder;
 pub mod hash_index;
-mod header;
+pub(crate) mod header;
 mod identity;
+pub(crate) mod kv_checksum;
 mod offset;
 mod trailer;
 mod transform;
@@ -53,19 +54,16 @@ const MAX_DECOMPRESSION_SIZE: u32 = 256 * 1024 * 1024;
 /// `parity_len(N) = shard_bytes(N) * 2` where
 /// `shard_bytes(N) = ceil(N / 4) rounded up to the nearest even`.
 /// Mirrors `crate::ecc::parity_len` byte-for-byte but is available
-/// without the `page_ecc` cargo feature — the read-side header
-/// validator below uses it to reject any non-zero `ecc_length`
-/// that doesn't EXACTLY match the value the writer would have
-/// emitted for this `data_length`. A bare upper-bound check ("is
-/// it ≤ N/2 + 4") would tolerate in-range-but-wrong `ecc_length`
-/// values; a streaming reader (e.g. `Scanner`) reading such a
-/// block would over-consume or under-consume bytes and
-/// desynchronize from the next block boundary.
+/// without the `page_ecc` cargo feature — the parity trailer length is
+/// NOT stored in the block header; the read path derives it from
+/// `data_length` with this function whenever a block's `ECC_PARITY`
+/// flag is set, so writer and reader always agree on the trailer size
+/// without a per-block length field to corrupt or forge.
 ///
 /// Returns zero for `data_length == 0` to match
 /// `crate::ecc::encode_parity`'s empty-payload short-circuit.
 #[inline]
-fn expected_parity_len(data_length: u32) -> u32 {
+pub(crate) fn expected_parity_len(data_length: u32) -> u32 {
     if data_length == 0 {
         return 0;
     }
@@ -77,6 +75,24 @@ fn expected_parity_len(data_length: u32) -> u32 {
     // shard sizes that are a multiple of two).
     let shard_bytes = ceil_quarter.saturating_add(u32::from(!ceil_quarter.is_multiple_of(2)));
     shard_bytes.saturating_mul(2)
+}
+
+/// Whether the on-disk block carries a Reed-Solomon parity trailer.
+///
+/// Source of truth depends on the block type:
+/// - Blocks that carry the `block_flags` byte (`Meta` / `Manifest` /
+///   `ManifestFooter` — see [`Header::has_block_flags`]) self-describe parity
+///   via the `ECC_PARITY` bit.
+/// - SST blocks (`Data` / `Index` / `Filter` / `RangeTombstone`) omit the
+///   byte, so
+///   parity presence comes from the per-SST descriptor, threaded in via the
+///   caller-supplied `transform` (`transform.page_ecc()`).
+fn block_has_parity(header: &Header, transform: &BlockTransform<'_>) -> bool {
+    if Header::has_block_flags(header.block_type) {
+        header.block_flags & header::block_flags::ECC_PARITY != 0
+    } else {
+        transform.page_ecc()
+    }
 }
 
 /// A block on disk
@@ -201,17 +217,50 @@ impl Block {
     /// the mismatch before the call reaches `write_into`, so the
     /// guard is unreachable from any in-tree caller and exists purely
     /// as a "should-never-fire" assertion.
+    pub fn write_into<W: std::io::Write>(
+        writer: &mut W,
+        data: &[u8],
+        identity: BlockIdentity,
+        transform: &BlockTransform<'_>,
+    ) -> crate::Result<Header> {
+        // Most blocks carry no caller-supplied transform bits beyond what
+        // the `transform` itself implies (compression / encryption / ECC).
+        // The per-KV footer is the one bit `write_into` can't derive from
+        // the payload, so the data-block writer routes through
+        // `write_into_with_flags` to set it.
+        Self::write_into_with_flags(writer, data, identity, transform, 0)
+    }
+
+    /// Like [`Self::write_into`] but lets the caller OR in
+    /// transform-presence bits that aren't derivable from `transform`
+    /// (currently only the `KV_CHECKSUM_FOOTER` flag from the `block_flags`
+    /// module, since the footer lives in `data` and `write_into` can't see it).
+    /// The compression / encryption / ECC bits are still derived from
+    /// `transform` here, so the in-memory [`Header::block_flags`] always
+    /// reflects the full transform stack regardless of which entry point is
+    /// used. Note this is the IN-MEMORY header: only the self-describing block
+    /// types (`Meta` / `Manifest` / `ManifestFooter`) serialize the
+    /// `block_flags` byte to disk; SST block types omit it and the reader
+    /// recovers transform presence from the per-SST meta descriptors, so a
+    /// decoded SST header has `block_flags == 0`.
+    ///
+    /// Crate-internal: the `extra_flags` bag is a raw `u8` whose only valid
+    /// bits live in the crate-private `block_flags` module, so an external
+    /// caller could only guess magic values and a wrong bit would serialize
+    /// a header claiming a transform the payload doesn't carry. External
+    /// code uses the safe [`Self::write_into`] wrapper instead.
     #[expect(
         clippy::too_many_lines,
         reason = "linear writer pipeline: compress → encrypt → checksum → ecc; \
                   each step is small but they share state (header, payload, owned buffers) \
                   so factoring would just hide the data flow"
     )]
-    pub fn write_into<W: std::io::Write>(
+    pub(crate) fn write_into_with_flags<W: std::io::Write>(
         mut writer: &mut W,
         data: &[u8],
         identity: BlockIdentity,
         transform: &BlockTransform<'_>,
+        extra_flags: u8,
     ) -> crate::Result<Header> {
         // Unpack the transform back to the (compression, encryption,
         // zstd_dict) triple the implementation below was written
@@ -237,21 +286,43 @@ impl Block {
             });
         }
 
+        // Self-describe the transform stack in the header. Compression /
+        // encryption are derived from the active `transform`; the caller
+        // ORs in any bit it can't derive (the per-KV footer). The ECC_PARITY
+        // bit is NOT set here: it must agree with whether a parity trailer is
+        // actually emitted, which is only known after the parity step below
+        // (the ECC encoder short-circuits to a zero-length trailer for an
+        // empty payload even when page_ecc is on). It is set after the parity
+        // is computed, gated on a non-empty trailer, so the bit stays
+        // presence-authoritative.
+        let block_flags = {
+            use crate::table::block::header::block_flags;
+            // The header decoder rejects any bit outside `KNOWN`, so a caller
+            // that ORs in a reserved bit here would write a block this build
+            // can't read back. Catch that at the source in debug builds.
+            debug_assert_eq!(
+                extra_flags & !block_flags::KNOWN,
+                0,
+                "extra_flags must contain only defined block_flags bits",
+            );
+            let mut f = extra_flags;
+            if transform.compression() != CompressionType::None {
+                f |= block_flags::COMPRESSED;
+            }
+            if transform.encryption().is_some() {
+                f |= block_flags::ENCRYPTED;
+            }
+            f
+        };
+
         let mut header = Header {
             block_type,
+            block_flags,
             checksum: Checksum::from_raw(0), // <-- NOTE: Is set later on
             data_length: 0,                  // <-- NOTE: Is set later on
 
             #[expect(clippy::cast_possible_truncation, reason = "blocks are limited to u32")]
             uncompressed_length: data.len() as u32,
-
-            // Updated in the ECC-emit step below when the active
-            // `BlockTransform` variant is one of the `*Ecc` arms,
-            // which `Writer::use_page_ecc(true)` wires through the
-            // emit path. Zero means "no parity trailer follows" —
-            // the V5-default-off layout that non-page-ecc trees
-            // produce.
-            ecc_length: 0,
         };
 
         // Compression step — produces an owned Vec when a compressor is active.
@@ -355,26 +426,33 @@ impl Block {
         header.data_length = payload_len;
         header.checksum = Checksum::from_raw(crate::hash::hash128(payload));
 
-        // Optional Reed-Solomon parity trailer. Computed BEFORE
-        // encode_into so header.ecc_length lands in the header
-        // bytes the reader parses. On builds without the page_ecc
-        // feature, transform.page_ecc() is a constant `false`
-        // (the Ecc variants of BlockTransform don't exist), so the
-        // entire branch is dead and the compiler folds it out.
+        // Optional Reed-Solomon parity trailer. The parity LENGTH is not
+        // stored in the header: it is `expected_parity_len(data_length)`,
+        // recomputed by the reader from the presence-authoritative
+        // `ECC_PARITY` block flag. On builds without the page_ecc feature,
+        // transform.page_ecc() is a constant `false` (the Ecc variants of
+        // BlockTransform don't exist), so the entire branch is dead and the
+        // compiler folds it out.
         #[cfg(feature = "page_ecc")]
         let parity_buf: Option<Vec<u8>> = if transform.page_ecc() {
             let p = crate::ecc::encode_parity(payload)?;
             // parity_len is shard_bytes * RS_PARITY_SHARDS where
-            // shard_bytes <= payload.len(). payload_len fits in
-            // u32 (checked above), so parity_len fits in u32 too,
-            // but the explicit try_from keeps the truncation
-            // path typed rather than implicit.
+            // shard_bytes <= payload.len(). payload_len fits in u32
+            // (checked above), so parity_len fits in u32 too; the
+            // explicit try_from keeps the truncation path typed.
             let p_len =
                 u32::try_from(p.len()).map_err(|_| crate::Error::DecompressedSizeTooLarge {
                     declared: p.len() as u64,
                     limit: u64::from(u32::MAX),
                 })?;
-            header.ecc_length = p_len;
+            // Presence-authoritative ECC_PARITY bit: set only when a
+            // non-empty parity trailer was actually emitted. An empty
+            // payload yields a zero-length trailer (the encoder
+            // short-circuits), so the bit stays clear and the reader
+            // recomputes a zero parity length to match.
+            if p_len > 0 {
+                header.block_flags |= crate::table::block::header::block_flags::ECC_PARITY;
+            }
             Some(p)
         } else {
             None
@@ -392,8 +470,8 @@ impl Block {
             "Writing block with size {}B (on-disk: {}B, ecc: {}B) (excluding header of {}B)",
             header.uncompressed_length,
             header.data_length,
-            header.ecc_length,
-            Header::serialized_len(),
+            parity_buf.as_ref().map_or(0, Vec::len),
+            Header::header_len(header.block_type),
         );
 
         Ok(header)
@@ -459,24 +537,16 @@ impl Block {
             });
         }
 
-        // Reject any non-zero `ecc_length` that doesn't match the
-        // RS(4, 2) parity-length function applied to the
-        // just-validated `data_length`. A bare upper-bound check
-        // would tolerate in-range-but-wrong values; the streaming
-        // reader would then over-consume or under-consume parity
-        // bytes and desynchronize from the next block boundary.
-        let expected_ecc = expected_parity_len(header.data_length);
-        if header.ecc_length != 0 && header.ecc_length != expected_ecc {
-            // Mismatch — either smaller or larger than the parity
-            // trailer the writer is supposed to emit for this
-            // `data_length`. Both directions indicate a corrupted
-            // / forged header rather than an oversized payload, so
-            // surface this as `InvalidHeader` instead of the
-            // size-cap variant (the field can be UNDER-sized as
-            // well as over-sized, which the size-cap error
-            // semantically can't represent).
-            return Err(crate::Error::InvalidHeader("Block"));
-        }
+        // Parity-trailer length is derived, not stored: when the block
+        // carries a parity trailer (per `block_has_parity` — header bit for
+        // self-describing blocks, descriptor-via-transform for SST blocks) it
+        // is `expected_parity_len(data_length)` (the RS(4, 2) scheme is
+        // deterministic), otherwise none.
+        let ecc_length = if block_has_parity(&header, transform) {
+            expected_parity_len(header.data_length)
+        } else {
+            0
+        };
 
         // When encryption is active, read into a Vec so decrypt_vec can
         // reuse the buffer in-place (one allocation instead of two).
@@ -488,7 +558,7 @@ impl Block {
             let raw_vec = Self::read_payload_and_verify(
                 reader,
                 header.data_length,
-                header.ecc_length,
+                ecc_length,
                 header.checksum,
             )?;
 
@@ -570,7 +640,7 @@ impl Block {
             // Zero-copy fast path for non-ECC blocks (the v0..v5
             // legacy shape); ECC blocks go through the Vec-allocating
             // recovery-capable helper instead.
-            let raw_data = if header.ecc_length == 0 {
+            let raw_data = if ecc_length == 0 {
                 let s = Slice::from_reader(reader, header.data_length as usize)?;
                 let checksum = Checksum::from_raw(crate::hash::hash128(&s));
                 checksum.check(header.checksum).inspect_err(|_| {
@@ -585,7 +655,7 @@ impl Block {
                 Slice::from(Self::read_payload_and_verify(
                     reader,
                     header.data_length,
-                    header.ecc_length,
+                    ecc_length,
                     header.checksum,
                 )?)
             };
@@ -691,7 +761,7 @@ impl Block {
         // fields so the read path's AEAD verification (#251) can
         // reconstruct the same AAD the writer used.
         let _ = identity;
-        // handle.size() includes Header::serialized_len() + payload +
+        // handle.size() includes Header::MIN_LEN + payload +
         // optional ECC parity trailer. Encrypted blocks add
         // provider-specific overhead to the on-disk size, AND ECC
         // parity scales with the (encrypted) payload — about
@@ -707,7 +777,7 @@ impl Block {
         // parity_len(N) ≤ N/2 + 4; saturating_add covers overflow at
         // the u64 boundary (defensive — max_payload is well below u32).
         let max_ecc_overhead = (max_payload / 2).saturating_add(4);
-        let max_on_disk_size = max_payload + max_ecc_overhead + Header::serialized_len() as u64;
+        let max_on_disk_size = max_payload + max_ecc_overhead + Header::MAX_LEN as u64;
 
         if u64::from(handle.size()) > max_on_disk_size {
             return Err(crate::Error::DecompressedSizeTooLarge {
@@ -723,10 +793,12 @@ impl Block {
         // When no encryption, read into a Slice (zero-copy on the
         // None-compression path).
         let (header, data) = if let Some(enc) = encryption {
-            let header_len = Header::serialized_len();
             let block_size = handle.size() as usize;
 
-            if block_size < header_len {
+            // Pre-decode lower bound: every header is at least MIN_LEN; the
+            // exact length (with or without the block_flags byte) is known
+            // only after the block_type is decoded.
+            if block_size < Header::MIN_LEN {
                 return Err(crate::Error::InvalidHeader("Block"));
             }
 
@@ -746,15 +818,26 @@ impl Block {
                 )));
             }
 
-            #[expect(
-                clippy::indexing_slicing,
-                reason = "buf.len() == block_size == handle.size() ≥ Header::serialized_len()"
-            )]
-            let parsed_header = Header::decode_from(&mut &buf[..header_len])?;
+            // `decode_from` reads exactly the header (variable: 33 or 34
+            // bytes per block_type) and stops, leaving the payload untouched.
+            let parsed_header = Header::decode_from(&mut &buf[..])?;
+            let header_len = Header::header_len(parsed_header.block_type);
+
+            // Parity-trailer length is derived from data_length + parity
+            // presence (`block_has_parity`: header bit for self-describing
+            // blocks, descriptor-via-transform for SST), not stored. The size
+            // check below then implicitly validates it: if the on-disk byte
+            // count doesn't equal header + data_length + derived-parity, the
+            // header is rejected.
+            let ecc_length = if block_has_parity(&parsed_header, transform) {
+                expected_parity_len(parsed_header.data_length)
+            } else {
+                0
+            };
 
             let actual_payload_plus_ecc = block_size.saturating_sub(header_len);
             let expected_payload_plus_ecc =
-                parsed_header.data_length as usize + parsed_header.ecc_length as usize;
+                parsed_header.data_length as usize + ecc_length as usize;
             if expected_payload_plus_ecc != actual_payload_plus_ecc {
                 return Err(crate::Error::InvalidHeader("Block"));
             }
@@ -783,21 +866,11 @@ impl Block {
                 });
             }
 
-            let expected_ecc = expected_parity_len(parsed_header.data_length);
-            if parsed_header.ecc_length != 0 && parsed_header.ecc_length != expected_ecc {
-                // Mismatch — see the matching check in `from_reader`
-                // for the reasoning. Surfaced as `InvalidHeader`
-                // because the field can be under- or over-sized,
-                // either of which means the on-disk header doesn't
-                // match what the writer would have emitted.
-                return Err(crate::Error::InvalidHeader("Block"));
-            }
-
             // ECC fast path: no parity trailer → existing in-buffer
             // checksum check + decrypt_vec. With parity, run the
             // shared helper against a cursor over the post-header
             // bytes so recovery is available on mismatch.
-            let buf = if parsed_header.ecc_length == 0 {
+            let buf = if ecc_length == 0 {
                 #[expect(clippy::indexing_slicing, reason = "header was decoded from buf")]
                 let checksum = Checksum::from_raw(crate::hash::hash128(&buf[header_len..]));
                 checksum.check(parsed_header.checksum).inspect_err(|_| {
@@ -817,7 +890,7 @@ impl Block {
                 Self::read_payload_and_verify(
                     &mut cursor,
                     parsed_header.data_length,
-                    parsed_header.ecc_length,
+                    ecc_length,
                     parsed_header.checksum,
                 )?
             };
@@ -902,10 +975,22 @@ impl Block {
             let buf = crate::file::read_exact(file, *handle.offset(), handle.size() as usize)?;
 
             let parsed_header = Header::decode_from(&mut &buf[..])?;
+            let header_len = Header::header_len(parsed_header.block_type);
 
-            let actual_payload_plus_ecc = buf.len().saturating_sub(Header::serialized_len());
+            // Parity-trailer length is derived from data_length + parity
+            // presence (`block_has_parity`: header bit for self-describing
+            // blocks, descriptor-via-transform for SST), not stored. The size
+            // check below implicitly validates it (header + data_length +
+            // derived-parity must equal the buffer length).
+            let ecc_length = if block_has_parity(&parsed_header, transform) {
+                expected_parity_len(parsed_header.data_length)
+            } else {
+                0
+            };
+
+            let actual_payload_plus_ecc = buf.len().saturating_sub(header_len);
             let expected_payload_plus_ecc =
-                parsed_header.data_length as usize + parsed_header.ecc_length as usize;
+                parsed_header.data_length as usize + ecc_length as usize;
             if expected_payload_plus_ecc != actual_payload_plus_ecc {
                 return Err(crate::Error::InvalidHeader("Block"));
             }
@@ -917,21 +1002,12 @@ impl Block {
                 });
             }
 
-            let expected_ecc = expected_parity_len(parsed_header.data_length);
-            if parsed_header.ecc_length != 0 && parsed_header.ecc_length != expected_ecc {
-                // Mismatch (under- or over-sized) → corrupted /
-                // forged header. Same reasoning as the matching
-                // check in `from_reader`.
-                return Err(crate::Error::InvalidHeader("Block"));
-            }
-
             // Zero-copy fast path for non-ECC blocks; ECC blocks go
             // through the recovery-capable helper (which copies the
             // verified bytes out of `buf`).
-            let payload_slice: Slice = if parsed_header.ecc_length == 0 {
+            let payload_slice: Slice = if ecc_length == 0 {
                 #[expect(clippy::indexing_slicing, reason = "header was decoded from buf")]
-                let checksum =
-                    Checksum::from_raw(crate::hash::hash128(&buf[Header::serialized_len()..]));
+                let checksum = Checksum::from_raw(crate::hash::hash128(&buf[header_len..]));
                 checksum.check(parsed_header.checksum).inspect_err(|_| {
                     log::error!(
                         "Checksum mismatch for block {handle:?}, got={}, expected={}",
@@ -939,14 +1015,14 @@ impl Block {
                         parsed_header.checksum,
                     );
                 })?;
-                buf.slice(Header::serialized_len()..)
+                buf.slice(header_len..)
             } else {
                 #[expect(clippy::indexing_slicing, reason = "header was decoded from buf")]
-                let mut cursor = std::io::Cursor::new(&buf[Header::serialized_len()..]);
+                let mut cursor = std::io::Cursor::new(&buf[header_len..]);
                 Slice::from(Self::read_payload_and_verify(
                     &mut cursor,
                     parsed_header.data_length,
-                    parsed_header.ecc_length,
+                    ecc_length,
                     parsed_header.checksum,
                 )?)
             };
@@ -2218,7 +2294,7 @@ mod tests {
             )?;
 
             // Tamper a byte in the encrypted payload (after header)
-            let mid = Header::serialized_len() + 1;
+            let mid = Header::MIN_LEN + 1;
             if mid < buf.len() {
                 #[expect(clippy::indexing_slicing, reason = "mid < buf.len() checked above")]
                 {
@@ -2234,10 +2310,7 @@ mod tests {
             drop(file);
 
             let file = std::fs::File::open(&path)?;
-            let handle = crate::table::BlockHandle::new(
-                BlockOffset(0),
-                header.data_length + Header::serialized_len() as u32,
-            );
+            let handle = crate::table::BlockHandle::new(BlockOffset(0), header.on_disk_size());
             let result = Block::from_file(
                 &file,
                 handle,
@@ -2274,7 +2347,7 @@ mod tests {
             drop(file);
 
             let file = std::fs::File::open(&path)?;
-            // Handle size smaller than Header::serialized_len()
+            // Handle size smaller than Header::MIN_LEN
             let handle = crate::table::BlockHandle::new(BlockOffset(0), 2);
             let result = Block::from_file(
                 &file,
@@ -2534,10 +2607,7 @@ mod tests {
             drop(file);
 
             let file = std::fs::File::open(&path)?;
-            let handle = crate::table::BlockHandle::new(
-                BlockOffset(0),
-                header.data_length + Header::serialized_len() as u32,
-            );
+            let handle = crate::table::BlockHandle::new(BlockOffset(0), header.on_disk_size());
             let block = Block::from_file(
                 &file,
                 handle,
@@ -2737,10 +2807,7 @@ mod tests {
             drop(file);
 
             let file = std::fs::File::open(&path)?;
-            let handle = crate::table::BlockHandle::new(
-                BlockOffset(0),
-                header.data_length + Header::serialized_len() as u32,
-            );
+            let handle = crate::table::BlockHandle::new(BlockOffset(0), header.on_disk_size());
             let block = Block::from_file(
                 &file,
                 handle,
@@ -2786,21 +2853,20 @@ mod tests {
             )?;
 
             assert!(
-                header.ecc_length > 0,
-                "PlainEcc writer must emit non-zero ecc_length; got {}",
-                header.ecc_length,
+                header.block_flags & crate::table::block::header::block_flags::ECC_PARITY != 0,
+                "PlainEcc writer must set the ECC_PARITY flag",
             );
             assert_eq!(
                 writer.len(),
-                Header::serialized_len() + header.data_length as usize + header.ecc_length as usize,
-                "on-disk size must equal header + payload + parity",
+                header.on_disk_size() as usize,
+                "on-disk size must equal header + payload + derived parity length",
             );
 
             let mut reader = &writer[..];
             let block = Block::from_reader(
                 &mut reader,
                 BlockIdentity::for_test(0, 0, BlockType::Data),
-                &BlockTransform::PLAIN,
+                &BlockTransform::PlainEcc,
             )?;
             assert_eq!(&*block.data, PAYLOAD);
             Ok(())
@@ -2820,7 +2886,7 @@ mod tests {
             // the header, before the parity trailer) so the on-disk
             // bytes' XXH3 no longer matches header.checksum but the
             // recoverable shape (1 of 6 shards corrupted) holds.
-            let header_len = Header::serialized_len();
+            let header_len = Header::MIN_LEN;
             let flip_at = header_len + (header.data_length as usize) / 2;
             writer[flip_at] ^= 0xFF;
 
@@ -2828,7 +2894,7 @@ mod tests {
             let block = Block::from_reader(
                 &mut reader,
                 BlockIdentity::for_test(0, 0, BlockType::Data),
-                &BlockTransform::PLAIN,
+                &BlockTransform::PlainEcc,
             )?;
             // ECC recovery reconstructs the original payload despite
             // the in-flight bit-flip.
@@ -2852,7 +2918,7 @@ mod tests {
             // Flip one byte inside the payload region (after the
             // header, before the parity trailer).
             let mut bytes = std::fs::read(&path)?;
-            let payload_start = Header::serialized_len();
+            let payload_start = Header::MIN_LEN;
             bytes[payload_start + 3] ^= 0x80;
             std::fs::write(&path, &bytes)?;
 
@@ -2863,7 +2929,7 @@ mod tests {
                 &file,
                 tmp.handle,
                 BlockIdentity::for_test(0, 0, BlockType::Data),
-                &BlockTransform::PLAIN,
+                &BlockTransform::PlainEcc,
             )?;
             assert_eq!(&*block.data, PAYLOAD);
             Ok(())
@@ -2885,10 +2951,10 @@ mod tests {
                 BlockIdentity::for_test(0, 0, BlockType::Data),
                 &BlockTransform::CompressedEcc(CompressionContext::new(CompressionType::Lz4)?),
             )?;
-            assert!(header.ecc_length > 0);
+            assert!(header.block_flags & crate::table::block::header::block_flags::ECC_PARITY != 0);
 
             // Flip a byte in the compressed-payload region.
-            let header_len = Header::serialized_len();
+            let header_len = Header::MIN_LEN;
             let flip_at = header_len + (header.data_length as usize) / 2;
             writer[flip_at] ^= 0x55;
 
@@ -2896,7 +2962,7 @@ mod tests {
             let block = Block::from_reader(
                 &mut reader,
                 BlockIdentity::for_test(0, 0, BlockType::Data),
-                &BlockTransform::Compressed(CompressionContext::new(CompressionType::Lz4)?),
+                &BlockTransform::CompressedEcc(CompressionContext::new(CompressionType::Lz4)?),
             )?;
             assert_eq!(
                 &*block.data, PAYLOAD,
@@ -2924,10 +2990,10 @@ mod tests {
                 BlockIdentity::for_test(0, 0, BlockType::Data),
                 &BlockTransform::EncryptedEcc(&enc),
             )?;
-            assert!(header.ecc_length > 0);
+            assert!(header.block_flags & crate::table::block::header::block_flags::ECC_PARITY != 0);
 
             // Flip one byte in the ciphertext region.
-            let header_len = Header::serialized_len();
+            let header_len = Header::MIN_LEN;
             let flip_at = header_len + (header.data_length as usize) / 2;
             writer[flip_at] ^= 0x21;
 
@@ -2935,7 +3001,7 @@ mod tests {
             let block = Block::from_reader(
                 &mut reader,
                 BlockIdentity::for_test(0, 0, BlockType::Data),
-                &BlockTransform::Encrypted(&enc),
+                &BlockTransform::EncryptedEcc(&enc),
             )?;
             assert_eq!(
                 &*block.data, PAYLOAD,
@@ -2971,7 +3037,7 @@ mod tests {
             // RS(4, 2) recovers up to 2 missing shards; with 3
             // corrupted data shards no subset of 4 intact shards
             // reconstructs the original.
-            let payload_start = Header::serialized_len();
+            let payload_start = Header::MIN_LEN;
             for shard_idx in 0..3 {
                 let pos = payload_start + shard_idx * shard_bytes;
                 if pos < writer.len() {
@@ -2983,7 +3049,7 @@ mod tests {
             let result = Block::from_reader(
                 &mut reader,
                 BlockIdentity::for_test(0, 0, BlockType::Data),
-                &BlockTransform::PLAIN,
+                &BlockTransform::PlainEcc,
             );
             match result {
                 Ok(_) => panic!(
@@ -2993,6 +3059,63 @@ mod tests {
                 Err(crate::Error::PageEccUnrecoverable { .. }) => {}
                 Err(e) => panic!("expected PageEccUnrecoverable, got {e:?}"),
             }
+            Ok(())
+        }
+
+        #[test]
+        fn ecc_parity_bit_agrees_with_emitted_parity_length() -> crate::Result<()> {
+            use crate::table::block::header::block_flags;
+
+            // Empty payload: the Reed-Solomon encoder short-circuits to a
+            // zero-length parity trailer even under PlainEcc, so the
+            // presence-authoritative ECC_PARITY bit must stay CLEAR — and the
+            // derived on-disk size carries no parity (header + 0 payload).
+            let mut empty_buf = vec![];
+            let empty = Block::write_into(
+                &mut empty_buf,
+                &[],
+                BlockIdentity::for_test(0, 0, BlockType::Data),
+                &BlockTransform::PlainEcc,
+            )?;
+            assert_eq!(
+                empty.block_flags & block_flags::ECC_PARITY,
+                0,
+                "ECC_PARITY must be clear when no parity trailer is emitted",
+            );
+            assert_eq!(
+                empty_buf.len(),
+                empty.on_disk_size() as usize,
+                "on-disk size matches the derived (zero) parity length",
+            );
+            assert_eq!(
+                empty.on_disk_size() as usize,
+                Header::MIN_LEN,
+                "empty payload emits no parity, so on-disk size is just the header",
+            );
+
+            // Non-empty payload: parity is emitted, so the bit is set and the
+            // derived on-disk size includes the parity trailer.
+            let mut full_buf = vec![];
+            let full = Block::write_into(
+                &mut full_buf,
+                PAYLOAD,
+                BlockIdentity::for_test(0, 0, BlockType::Data),
+                &BlockTransform::PlainEcc,
+            )?;
+            assert_ne!(
+                full.block_flags & block_flags::ECC_PARITY,
+                0,
+                "ECC_PARITY must be set when a parity trailer is emitted",
+            );
+            assert_eq!(
+                full_buf.len(),
+                full.on_disk_size() as usize,
+                "on-disk size matches header + payload + derived parity",
+            );
+            assert!(
+                full.on_disk_size() as usize > Header::MIN_LEN + full.data_length as usize,
+                "non-empty payload emits a parity trailer beyond header + payload",
+            );
             Ok(())
         }
     }

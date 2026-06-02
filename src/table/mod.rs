@@ -240,6 +240,7 @@ impl Table {
             block_type,
             compression,
             self.encryption.as_deref(),
+            self.metadata.page_ecc,
             #[cfg(zstd_any)]
             zstd_dict,
             #[cfg(feature = "metrics")]
@@ -248,6 +249,11 @@ impl Table {
     }
 
     fn load_data_block(&self, handle: &BlockHandle) -> crate::Result<DataBlock> {
+        // `from_loaded` transparently strips the per-KV checksum footer when
+        // this SST carries one. Footer presence is a per-SST property
+        // (`kv_checksum_algo`), not a per-block header flag — data blocks omit
+        // the block_flags byte — so the descriptor supplies it here.
+        let has_kv_footer = self.metadata.kv_checksum_algo.is_some();
         self.load_block(
             handle,
             BlockType::Data,
@@ -255,12 +261,64 @@ impl Table {
             #[cfg(zstd_any)]
             self.zstd_dictionary.as_deref(),
         )
-        .map(DataBlock::new)
+        .and_then(|block| DataBlock::from_loaded(block, has_kv_footer))
     }
 
     /// Returns the (possibly compressed) file size.
     pub(crate) fn file_size(&self) -> u64 {
         self.metadata.file_size
+    }
+
+    /// Scrub: verifies the per-KV checksum footer of every data block in this
+    /// table, decoding each block and recomputing each entry's logical-content
+    /// digest.
+    ///
+    /// Footer presence is a per-SST property read from the descriptor
+    /// (`metadata.kv_checksum_algo`), not a per-block header flag — SST data
+    /// blocks omit the `block_flags` byte. When the descriptor reports no
+    /// footers the whole scrub is a no-op; otherwise every data block is
+    /// verified under the descriptor's algorithm. This is the paranoid /
+    /// offline integrity path — the live read path does NOT verify per-entry
+    /// digests (the block-level checksum already covers the on-disk bytes).
+    /// Stops and returns on the first detected mismatch.
+    ///
+    /// # Errors
+    ///
+    /// - [`crate::Error::ChecksumMismatch`] if any entry's recomputed digest
+    ///   disagrees with the stored value (corruption of the entry bytes or
+    ///   the stored digest).
+    /// - Any I/O / decode error encountered while loading a block.
+    pub(crate) fn verify_kv_checksums(&self) -> crate::Result<()> {
+        // Footer presence is a per-SST property recorded in the descriptor
+        // (`kv_checksum_algo`); data blocks omit the block_flags byte, so the
+        // descriptor is the authoritative source. When it reports no footers,
+        // there is nothing to scrub.
+        let Some(expected_algo) = self.metadata.kv_checksum_algo else {
+            return Ok(());
+        };
+
+        // Descriptor declares this SST footer-bearing, and an SST is
+        // homogeneous — every data block carries a footer under `expected_algo`.
+        for handle in self.block_index.iter() {
+            let handle = handle?;
+            let block_handle = BlockHandle::new(handle.offset(), handle.size());
+            // Load the RAW block (footer intact) — do NOT route through
+            // `load_data_block`, which strips the footer via `from_loaded`.
+            let block = self.load_block(
+                &block_handle,
+                BlockType::Data,
+                self.metadata.data_block_compression,
+                #[cfg(zstd_any)]
+                self.zstd_dictionary.as_deref(),
+            )?;
+            DataBlock::verify_kv_checked(
+                &block.data,
+                block.header,
+                self.comparator.clone(),
+                Some(expected_algo),
+            )?;
+        }
+        Ok(())
     }
 
     /// Loads the filter block (if any) and checks the bloom filter.
@@ -798,6 +856,8 @@ impl Table {
             self.metadata.data_block_compression,
             self.global_seqno(),
             self.encryption.clone(),
+            self.metadata.page_ecc,
+            self.metadata.kv_checksum_algo.is_some(),
             #[cfg(zstd_any)]
             self.zstd_dictionary.clone(),
             self.comparator.clone(),
@@ -838,6 +898,8 @@ impl Table {
             self.cache.clone(),
             self.metadata.data_block_compression,
             self.encryption.clone(),
+            self.metadata.page_ecc,
+            self.metadata.kv_checksum_algo.is_some(),
             #[cfg(zstd_any)]
             self.zstd_dictionary.clone(),
             self.comparator.clone(),
@@ -866,6 +928,7 @@ impl Table {
         table_id: TableId,
         compression: CompressionType,
         encryption: Option<&dyn crate::encryption::EncryptionProvider>,
+        page_ecc: bool,
     ) -> crate::Result<IndexBlock> {
         // Tail copy first (preferred): if a fresh `tli_tail` exists it
         // landed after the head `tli`, so it's the most-recently
@@ -886,7 +949,14 @@ impl Table {
         // `tli_tail`; reader falls straight through to the head copy.
         if let Some(tail_handle) = regions.tli_tail {
             log::trace!("Reading TLI tail mirror, with tli_tail_ptr={tail_handle:?}");
-            match Self::read_tli_at(file, tail_handle, table_id, compression, encryption) {
+            match Self::read_tli_at(
+                file,
+                tail_handle,
+                table_id,
+                compression,
+                encryption,
+                page_ecc,
+            ) {
                 Ok(idx) => return Ok(idx),
                 Err(tail_err) => {
                     log::warn!(
@@ -906,6 +976,7 @@ impl Table {
                         table_id,
                         compression,
                         encryption,
+                        page_ecc,
                     ) {
                         Ok(idx) => Ok(idx),
                         Err(head_err) => {
@@ -920,7 +991,14 @@ impl Table {
         }
 
         log::trace!("Reading TLI head copy, with tli_ptr={:?}", regions.tli);
-        Self::read_tli_at(file, regions.tli, table_id, compression, encryption)
+        Self::read_tli_at(
+            file,
+            regions.tli,
+            table_id,
+            compression,
+            encryption,
+            page_ecc,
+        )
     }
 
     fn read_tli_at(
@@ -929,6 +1007,7 @@ impl Table {
         table_id: TableId,
         compression: CompressionType,
         encryption: Option<&dyn crate::encryption::EncryptionProvider>,
+        page_ecc: bool,
     ) -> crate::Result<IndexBlock> {
         let block = Block::from_file(
             file,
@@ -951,12 +1030,19 @@ impl Table {
                 dict_id: 0,
                 window_log: 0,
             },
-            &crate::table::block::BlockTransform::from_parts(
-                compression,
-                encryption,
-                #[cfg(zstd_any)]
-                None,
-            )?,
+            &{
+                // Index blocks are SST blocks that omit the block_flags byte,
+                // so ECC presence comes from the per-SST descriptor: upgrade
+                // to the `*Ecc` transform when this table was written with
+                // Page ECC. Identity without the feature.
+                let t = crate::table::block::BlockTransform::from_parts(
+                    compression,
+                    encryption,
+                    #[cfg(zstd_any)]
+                    None,
+                )?;
+                if page_ecc { t.with_ecc() } else { t }
+            },
         )?;
 
         if block.header.block_type != BlockType::Index {
@@ -1092,6 +1178,7 @@ impl Table {
                 metadata.id,
                 metadata.index_block_compression,
                 encryption.as_deref(),
+                metadata.page_ecc,
             )?;
 
             BlockIndexImpl::TwoLevel(TwoLevelBlockIndex {
@@ -1102,6 +1189,7 @@ impl Table {
                 file_accessor: file_accessor.clone(),
                 table_id: (tree_id, metadata.id).into(),
                 encryption: encryption.clone(),
+                page_ecc: metadata.page_ecc,
                 comparator: comparator.clone(),
 
                 #[cfg(feature = "metrics")]
@@ -1119,6 +1207,7 @@ impl Table {
                 metadata.id,
                 metadata.index_block_compression,
                 encryption.as_deref(),
+                metadata.page_ecc,
             )?;
             BlockIndexImpl::Full(FullBlockIndex::new(block, comparator.clone())?)
         } else {
@@ -1132,6 +1221,7 @@ impl Table {
                 path: Arc::clone(&file_path),
                 table_id: (tree_id, metadata.id).into(),
                 encryption: encryption.clone(),
+                page_ecc: metadata.page_ecc,
                 comparator: comparator.clone(),
 
                 #[cfg(feature = "metrics")]
@@ -1151,12 +1241,17 @@ impl Table {
                     dict_id: 0,
                     window_log: 0,
                 },
-                &crate::table::block::BlockTransform::from_parts(
-                    metadata.index_block_compression,
-                    encryption.as_deref(),
-                    #[cfg(zstd_any)]
-                    None,
-                )?,
+                &{
+                    // Filter TLI is an Index (SST) block: no block_flags byte,
+                    // so ECC presence comes from the per-SST descriptor.
+                    let t = crate::table::block::BlockTransform::from_parts(
+                        metadata.index_block_compression,
+                        encryption.as_deref(),
+                        #[cfg(zstd_any)]
+                        None,
+                    )?;
+                    if metadata.page_ecc { t.with_ecc() } else { t }
+                },
             )?;
             if block.header.block_type != BlockType::Index {
                 return Err(crate::Error::InvalidTag((
@@ -1193,12 +1288,17 @@ impl Table {
                             dict_id: 0,
                             window_log: 0,
                         },
-                        // Filter blocks are never written compressed,
-                        // so the transform is Plain or Encrypted
-                        // depending on whether the table is keyed.
-                        &match encryption.as_deref() {
-                            Some(enc) => crate::table::block::BlockTransform::Encrypted(enc),
-                            None => crate::table::block::BlockTransform::PLAIN,
+                        // Filter blocks are never written compressed, so the
+                        // transform is Plain or Encrypted depending on whether
+                        // the table is keyed. Filter is an SST block (no
+                        // block_flags byte), so ECC presence comes from the
+                        // per-SST descriptor: upgrade to `*Ecc` when page_ecc.
+                        &{
+                            let t = match encryption.as_deref() {
+                                Some(enc) => crate::table::block::BlockTransform::Encrypted(enc),
+                                None => crate::table::block::BlockTransform::PLAIN,
+                            };
+                            if metadata.page_ecc { t.with_ecc() } else { t }
                         },
                     )
                     .and_then(|block| {
@@ -1234,11 +1334,16 @@ impl Table {
                     window_log: 0,
                 },
                 // Range-tombstone blocks are always uncompressed; the
-                // transform is Plain or Encrypted depending on whether
-                // the table is keyed.
-                &match encryption.as_deref() {
-                    Some(enc) => crate::table::block::BlockTransform::Encrypted(enc),
-                    None => crate::table::block::BlockTransform::PLAIN,
+                // transform is Plain or Encrypted depending on whether the
+                // table is keyed. RangeTombstone is an SST block (no
+                // block_flags byte), so ECC presence comes from the per-SST
+                // descriptor: upgrade to `*Ecc` when page_ecc.
+                &{
+                    let t = match encryption.as_deref() {
+                        Some(enc) => crate::table::block::BlockTransform::Encrypted(enc),
+                        None => crate::table::block::BlockTransform::PLAIN,
+                    };
+                    if metadata.page_ecc { t.with_ecc() } else { t }
                 },
             )?;
 

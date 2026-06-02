@@ -29,12 +29,13 @@
 
 | Threat | Defended? | Defending mechanism |
 |---|---|---|
-| Random bit flip in encrypted payload (bit-rot, bad sector) | Yes | AEAD tag mismatch on decrypt → `crate::Error::Decrypt(&'static str)` |
-| Random bit flip in AAD-bound disk bytes (suite_id, key_epoch, block_type, dict_id, window_log) | Yes | AAD mismatch on decrypt. AEAD verification fails as a single opaque tag-mismatch event under `crate::Error::Decrypt`, NOT a per-field diagnostic: the cipher cannot tell whether the flipped byte was in the ciphertext or in one of the AAD-mirrored disk bytes. Per-field attribution would require typed decrypt errors, which is a follow-up tracked in #251. (The caller-supplied AAD fields `tree_id`, `table_id`, `block_offset` are not on disk, so they cannot be bit-flipped at rest; they can only fail to match if the reader supplies wrong context.) |
+| Random bit flip in encrypted payload (bit-rot, bad sector) | Yes | AEAD tag mismatch on decrypt → `DecryptError::AeadVerificationFailed` |
+| Random bit flip in AAD-bound disk bytes (suite_id, key_epoch, block_type, dict_id, window_log, block_flags) | Yes | AAD mismatch on decrypt. AEAD verification fails as `DecryptError::AeadVerificationFailed` — a single tag-mismatch event, NOT a per-field diagnostic: the cipher cannot tell whether the flipped byte was in the ciphertext or in one of the AAD-mirrored disk bytes, so per-field attribution is impossible by construction (not a missing feature). Structural pre-AEAD failures surface as the more specific typed variants (`MalformedMetadataFrame`, `UnsupportedSuite`, `UnknownKeyEpoch`, …). (The caller-supplied AAD fields `tree_id`, `table_id`, `block_offset` are not on disk, so they cannot be bit-flipped at rest; they can only fail to match if the reader supplies wrong context.) |
 | **Block swap** within the same file (move block N's bytes to offset M, M ≠ N) | Yes | AAD carries caller-supplied `block_offset`; decrypt at the wrong offset fails because the reader's seek position doesn't match what the writer used. |
 | **Block swap** across files in the same tree (move a block from file A to file B) | Yes | AAD carries caller-supplied `table_id` (derived from the SST file's path / table metadata); decrypt under the wrong table_id fails. |
 | **Block swap** across trees (same encryption key reused, colliding per-tree `table_id` values) | Yes | AAD carries caller-supplied `tree_id` paired with `table_id`. `table_id` alone is per-tree in this codebase, so the pair `(tree_id, table_id)` gives the globally unique block identity. Substitution under the wrong tree_id fails. |
 | **Block type swap** (relabel a Filter block as Data, e.g. to confuse a partial-decode path) | Yes | AAD carries `block_type`; decrypt under the wrong type fails |
+| **Transform-flag relabel** (flip a `block_flags` bit, e.g. clear the per-KV checksum footer bit so a verifying reader stops stripping/checking the footer, or set the compressed/encrypted bit) | Yes | AAD carries the whole `block_flags` byte; decrypt under any flipped transform bit fails. Closes the gap that `block_flags` lives in the plaintext `Block::Header` under a non-cryptographic XXH3 checksum an attacker could recompute. |
 | **Compression codec substitution** (relabel a zstd block as Lz4 or vice versa to confuse the decompressor selection step) | Yes | AAD carries `compression_type` (codec discriminator byte); decrypt under the wrong codec tag fails. Defends per-block codec rotation: an attacker cannot mix up old-codec and new-codec blocks during a policy migration. |
 | **Codec / decompression pipeline bug** (zstd / lz4 library version drift between write-time and read-time; non-deterministic decoder output; in-memory corruption between AEAD-verify and decompression-end producing wrong plaintext after a successful AEAD verify) | Yes (for compressed blocks) | Codec's built-in content checksum (zstd `Content_Checksum_flag` bit 2 / LZ4 `ContentChecksum` bit) is **required** per §4.11. The codec verifies this automatically during streaming decompression and fails on mismatch. For `CompressionType = None` this defence does not apply: there's no codec to drift, and AEAD primitives have no analogous version-drift failure mode, so AEAD-tag alone is sufficient. |
 | **Compression dictionary substitution** (decode under a different zstd dictionary to manipulate decompressed output) | Yes | AAD carries `dict_id`; structured-zstd's `FrameDecoder::expect_dict_id` cross-checks during inner-frame decode. Wiring lives in this repo's encoder/decoder issue #251; the matching enforcement on the structured-zstd side is tracked there as `S-ZSTD-T7`. |
@@ -52,13 +53,13 @@
 | 4.1 | Outer framing | [Zstandard skippable frame](https://datatracker.ietf.org/doc/html/rfc8878#section-3.1.1) | Already standard, already understood by `zstd` CLI / libzstd readers, has dedicated magic range. Unknown-to-reader frames skip cleanly. |
 | 4.2 | Magic allocation | `0x184D2A50` (metadata frame), `0x184D2A51` (body frame), `0x184D2A52` (ECC parity frame, owned by #254), `0x184D2A53..0x184D2A5F` reserved for future spec revisions | Stable magic split keeps the metadata size known-at-parse before the variable-length body; ECC magic is locked here so this spec and #254 can't drift. |
 | 4.3 | Endianness, outer framing | Little-endian per RFC 8878 §3.1.1 | Mandatory by the framing spec we're inside of. |
-| 4.4 | Endianness, AAD payload content | **Multi-byte numeric fields:** big-endian (TreeID / TableID / BlockOffset as u64 BE; DictID as u32 BE). **MagicMetadata:** literal 4-byte byte string (the on-disk LE bytes `50 2A 4D 18` of the framing magic, used verbatim, NOT re-encoded as a BE integer). **Single-byte fields** (HeaderByte / KeyEpoch / BlockType / SuiteID / CompressionType / WindowLog): no endianness; one byte. | Crypto convention for numerics (RFC 8446 TLS, RFC 5116 AEAD framework). Avoids endianness ambiguity across deployments. MagicMetadata keeps the LE on-disk bytes as a fixed literal so that the AAD's first 4 bytes are byte-for-byte identical to the on-disk MetadataFrame magic the decoder just read; this binds the AAD to the format identity without conversion logic. |
+| 4.4 | Endianness, AAD payload content | **Multi-byte numeric fields:** big-endian (TreeID / TableID / BlockOffset as u64 BE; DictID as u32 BE). **MagicMetadata:** literal 4-byte byte string (the on-disk LE bytes `50 2A 4D 18` of the framing magic, used verbatim, NOT re-encoded as a BE integer). **Single-byte fields** (HeaderByte / KeyEpoch / BlockType / SuiteID / CompressionType / WindowLog / BlockFlags): no endianness; one byte. | Crypto convention for numerics (RFC 8446 TLS, RFC 5116 AEAD framework). Avoids endianness ambiguity across deployments. MagicMetadata keeps the LE on-disk bytes as a fixed literal so that the AAD's first 4 bytes are byte-for-byte identical to the on-disk MetadataFrame magic the decoder just read; this binds the AAD to the format identity without conversion logic. |
 | 4.5 | AEAD suite registry | `0x00` reserved (Plain, encryption disabled, not used in this format), `0x01` reserved (future stream cipher), `0x02 = AES-256-GCM`, `0x03 = ChaCha20-Poly1305`, `0x04..0xFF` reserved | Two initial suites cover the hardware-accelerated (AES-GCM via AES-NI/NEON) and the constant-time-on-any-CPU (ChaCha-Poly) cases. |
 | 4.6 | Nonce field width on disk | **Suite-defined** (registry lookup; see §7). v1 suites (AES-256-GCM, ChaCha20-Poly1305) both store 12 bytes. Future suites with different nonce lengths (e.g. XChaCha20-Poly1305 with 24 B) introduce their own SuiteID and their own nonce length in the registry; the decoder reads SuiteID first, then reads exactly the registered nonce length. No padding bytes wasted on speculative future suites. | Saves 12 B per block today vs. always reserving 24 B "for future use". MetadataFrame is variable-length but its `PayloadLen` (u32 LE in the framing header) tells the decoder how many bytes to read, so variable size doesn't complicate parsing. |
 | 4.7 | Authentication tag field width | Fixed 16 bytes | Both initial suites (AES-256-GCM, ChaCha20-Poly1305) emit a 128-bit tag. Reserving 16 bytes covers any plausible future tag-truncation policy and keeps the metadata frame size constant. |
 | 4.8 | `HeaderByte` layout | High nibble = format version (`0b0001` = v1 in this spec), low nibble reserved (MUST be zero on write, ignored on read until a future spec assigns it) | Single byte covers version + future spare. Forward extension can promote low-nibble bits to typed fields without breaking v1 readers. |
 | 4.9 | Inner-frame integrity (dict / window) | Delegated to [structured-zstd](https://github.com/structured-world/structured-zstd) `FrameDecoder::expect_dict_id` / `expect_window_log` (the call-out is structured-zstd PR-F; this spec describes the contract, the implementation lives in S-ZSTD-T7). | Avoids re-validating zstd internals at the LSM layer. The AAD carries `dict_id` + `window_log` so the LSM decoder can pass them through. |
-| 4.10 | Number of frames per block | Exactly **two required** frames: one MetadataFrame (magic `0x184D2A50`, payload size suite-defined: 38 bytes for v1 suites) immediately followed by one BodyFrame (magic `0x184D2A51`, variable payload). Optionally followed by **zero or more** ECC parity frames (magic `0x184D2A52`, owned by #254) and other reserved-range frames. v1 readers MUST accept MetadataFrame + BodyFrame and MUST skip any trailing skippable frame in the reserved range `0x184D2A52..0x184D2A5F` without rejecting the block (RFC 8878 skippable-frame semantics). v1 readers MUST reject if MetadataFrame or BodyFrame is missing or out of order. | Splitting metadata out keeps it known-size and parseable without first probing the body. ECC and future extensions ride alongside as additional skippable frames; v1 readers ignore what they don't recognise and recover the block from the MetadataFrame + BodyFrame pair alone, so a v1 reader on an ECC-augmented block still works (it just doesn't get the parity-based repair path). |
+| 4.10 | Number of frames per block | Exactly **two required** frames: one MetadataFrame (magic `0x184D2A50`, payload size suite-defined: 39 bytes for v1 suites) immediately followed by one BodyFrame (magic `0x184D2A51`, variable payload). Optionally followed by **zero or more** ECC parity frames (magic `0x184D2A52`, owned by #254) and other reserved-range frames. v1 readers MUST accept MetadataFrame + BodyFrame and MUST skip any trailing skippable frame in the reserved range `0x184D2A52..0x184D2A5F` without rejecting the block (RFC 8878 skippable-frame semantics). v1 readers MUST reject if MetadataFrame or BodyFrame is missing or out of order. | Splitting metadata out keeps it known-size and parseable without first probing the body. ECC and future extensions ride alongside as additional skippable frames; v1 readers ignore what they don't recognise and recover the block from the MetadataFrame + BodyFrame pair alone, so a v1 reader on an ECC-augmented block still works (it just doesn't get the parity-based repair path). |
 | 4.11 | Plaintext-side integrity | **Delegated to codec.** For `CompressionType ∈ {Lz4, Zstd, ZstdDict}` the writer MUST enable the codec's built-in content checksum (zstd: `Content_Checksum_flag` bit 2 of Frame_Header_Descriptor per RFC 8878 §3.1.1.1.3, emitting a 4-byte XXH64-truncated-to-32-bits at the end of the zstd frame; LZ4: `ContentChecksum` bit in FLG byte of FrameDescriptor per LZ4 Frame Format Description, emitting a 4-byte XXH32). The decoder verifies this automatically during streaming decompression. For `CompressionType = None` the AEAD tag is the sole integrity layer; there's no codec to drift and no separate codec checksum to enable. | AEAD authenticates the ciphertext round-trip but never inspects decrypted+decompressed bytes; codec content checksum catches codec-internal failures (library version drift, non-deterministic decoder output) that AEAD cannot see. Using the codec's built-in mechanism instead of an external XXH3-32 field in MetadataFrame: (a) reuses RFC-standardised, well-fuzzed reference implementations, (b) streaming verification is "free" inside the codec library, (c) zero MetadataFrame overhead (the 4 bytes live inside the codec frame, which is encrypted as part of BodyFrame ciphertext anyway, and AEAD-tag still covers them). For `CompressionType = None`, an external checksum was considered and rejected: AEAD primitives (AES-256-GCM, ChaCha20-Poly1305) have stable reference implementations with no "version drift" failure mode analogous to codec drift, so AEAD-tag alone provides the integrity guarantee. |
 
 ## 5. Wire format
@@ -66,7 +67,7 @@
 The on-disk layout for an AAD-bound encrypted block begins with two required consecutive [Zstandard skippable frames](https://datatracker.ietf.org/doc/html/rfc8878#section-3.1.1) and MAY be followed by zero or more optional skippable frames (e.g. an `EccFrame` owned by #254 at magic `0x184D2A52`). Per §4.10, v1 readers MUST accept and skip any trailing skippable frame in the reserved range `0x184D2A52..0x184D2A5F` without rejecting the block:
 
 ```text
-MetadataFrame  (8-byte framing header + 38-byte payload   = 46 bytes total for v1 suites)
+MetadataFrame  (8-byte framing header + 39-byte payload   = 47 bytes total for v1 suites)
 BodyFrame      (8-byte framing header + N-byte payload    = 8 + N bytes total)
 ```
 
@@ -78,19 +79,20 @@ Both framing headers are little-endian per RFC 8878 §3.1.1; both payloads are A
 Offset  Size  Field             Description
 ══════  ════  ═══════════════   ═══════════════════════════════════════════════
 0       4     MagicMetadata     0x50 0x2A 0x4D 0x18  (LE for 0x184D2A50)
-4       4     PayloadLen        u32 LE; equals 38 for v1 suites
+4       4     PayloadLen        u32 LE; equals 39 for v1 suites
                                 (AES-256-GCM, ChaCha20-Poly1305). For
                                 future suites with longer or shorter
                                 nonces (see §4.6 / §7), PayloadLen
                                 tracks the actual on-disk size:
-                                `PayloadLen = 26 + NONCE_LEN`.
+                                `PayloadLen = 27 + NONCE_LEN`.
 8       1     HeaderByte        High nibble = version (0b0001 for v1),
                                 low nibble = 0 (reserved, MUST be zero)
 9       1     KeyEpoch          Index into the caller's key chain
 10      1     BlockType         0=Data 1=Index 2=Filter 3=Meta 4=RangeTombstone
 11      1     SuiteID           AEAD primitive (see §4.5 / §7 registry).
                                 Also determines the on-disk Nonce length
-                                read at offset 18.
+                                read at offset 19 (after the BlockFlags
+                                byte at offset 18).
 12      1     CompressionType   Compression codec applied to the block's
                                 plaintext BEFORE encryption. Stores ONLY
                                 the leading 1-byte codec discriminator
@@ -144,22 +146,41 @@ Offset  Size  Field             Description
                                 values). Any other value is malformed and
                                 MUST be rejected. On disk for the same
                                 reason as DictID.
-18     NONCE_LEN  Nonce         Nonce bytes; length determined by SuiteID
+18      1     BlockFlags        Transform-presence bitfield, mirror of the
+                                `Block::Header` `block_flags` byte
+                                (`crate::table::block::header::block_flags`):
+                                  bit 0 = KV_CHECKSUM_FOOTER
+                                  bit 1 = ECC_PARITY
+                                  bit 2 = COMPRESSED
+                                  bit 3 = ENCRYPTED
+                                  others = reserved (MUST be 0 on write,
+                                           IGNORED on read)
+                                On disk + bound in the AAD so an attacker
+                                cannot relabel the block's transform stack
+                                (e.g. clear the per-KV footer bit) under a
+                                forged non-cryptographic header checksum,
+                                the same anti-relabel rationale as BlockType
+                                / CompressionType. The full byte is mirrored
+                                verbatim; the COMPRESSED / ENCRYPTED bits are
+                                redundant with CompressionType / SuiteID but
+                                kept so the AAD is a faithful mirror with no
+                                masking logic.
+19     NONCE_LEN  Nonce         Nonce bytes; length determined by SuiteID
                                 via the §7 registry (v1: 12 bytes for both
                                 AES-256-GCM and ChaCha20-Poly1305). The
                                 decoder MUST consult the registry by
                                 SuiteID before reading this field; the
                                 next field (AEADTag) starts at offset
-                                `18 + NONCE_LEN`. No padding bytes:
+                                `19 + NONCE_LEN`. No padding bytes:
                                 future suites with different nonce
                                 lengths use their own SuiteID and pay
                                 exactly their own nonce-length cost.
-18+NONCE_LEN  16  AEADTag       AEAD authentication tag over the body
+19+NONCE_LEN  16  AEADTag       AEAD authentication tag over the body
                                 payload + the AAD (see §5.3)
 ═════════
-Total  for v1 suites: 46 bytes on disk
-       (8-byte framing header + 38-byte payload).
-       For other suites: 8 + (26 + NONCE_LEN) bytes.
+Total  for v1 suites: 47 bytes on disk
+       (8-byte framing header + 39-byte payload).
+       For other suites: 8 + (27 + NONCE_LEN) bytes.
 ```
 
 **On-disk minimalism.** The MetadataFrame on disk carries ONLY the fields the decoder needs *before* it can construct the AAD: the version byte, the key epoch (so the right key is selected), the block type (mirrors the existing `Header` pattern), the AEAD suite id (so the right primitive is selected), the compression-context fields (`DictID` + `WindowLog`, which can vary per block and which the decoder must know to bind the AAD before any decompression / decryption work), the nonce, and the AEAD tag. Three further identifiers (`TreeID`, `TableID`, `BlockOffset`) participate in the AAD but are **NOT** stored on disk: they are caller-supplied from the read context (the owning `Tree`, the SST file's per-tree `TableId`, and the read cursor's byte position). See §5.3.
@@ -258,18 +279,25 @@ Offset  Size  Field             Source
 33      4     DictID            u32 BE, mirror of MetadataFrame offset 13
                                 (disk)
 37      1     WindowLog         Mirror of MetadataFrame offset 17 (disk)
+38      1     BlockFlags        Mirror of MetadataFrame offset 18 (disk).
+                                Binds the block's transform-presence
+                                bitfield (KV footer / ECC / compressed /
+                                encrypted) so an attacker cannot relabel
+                                the transform stack — e.g. clear the per-KV
+                                checksum footer bit — under a forged
+                                non-cryptographic header checksum.
 ═════════
-Total  38 bytes (NEVER written to disk, passed to AEAD as AAD only)
+Total  39 bytes (NEVER written to disk, passed to AEAD as AAD only)
 ```
 
-**Disk vs caller-supplied: the contract.** Fields marked "mirror of MetadataFrame offset X (disk)" are read from the on-disk MetadataFrame the decoder has just parsed. Fields marked "caller-supplied" are passed in by the calling code from its own context (`BlockIdentity` struct in `src/table/block/identity.rs`). The writer feeds *the same values* from its own context into AAD construction. The AEAD's authentication tag binds all 38 bytes together: an attacker who modifies any disk byte, or who relocates a block to a different file / different offset, produces an AAD that doesn't match the one the AEAD was sealed under, and decryption fails.
+**Disk vs caller-supplied: the contract.** Fields marked "mirror of MetadataFrame offset X (disk)" are read from the on-disk MetadataFrame the decoder has just parsed. Fields marked "caller-supplied" are passed in by the calling code from its own context (`BlockIdentity` struct in `src/table/block/identity.rs`). The writer feeds *the same values* from its own context into AAD construction. The AEAD's authentication tag binds all 39 bytes together: an attacker who modifies any disk byte, or who relocates a block to a different file / different offset, produces an AAD that doesn't match the one the AEAD was sealed under, and decryption fails.
 
 The `Nonce` and `AEADTag` fields are **not** part of the AAD, they're the AEAD's nonce and tag inputs, respectively.
 
 The `MagicBody` and `PayloadLen` from BodyFrame are also **not** part of the AAD. RFC 8878 skippable framing carries no integrity check (a non-conformant reader is expected to *skip* unknown frames, not validate them), so a decoder MUST NOT rely on framing for authentication. Instead the decoder MUST enforce these structural invariants explicitly before doing any further work:
 
 - MetadataFrame `MagicMetadata` equals `0x184D2A50` (LE bytes `50 2A 4D 18`). If not, treat as a non-AAD-bound block and refuse to decrypt.
-- MetadataFrame `PayloadLen` equals `26 + NONCE_LEN`, where `NONCE_LEN` is the nonce length registered for the suite byte at offset 11 (v1 suites: 38 = 26 + 12). Decoder sequencing for this check: (1) read the framing header's 8 bytes (`MagicMetadata` + `PayloadLen`); (2) read the first 4 bytes of payload (HeaderByte + KeyEpoch + BlockType + SuiteID) and resolve `NONCE_LEN` from SuiteID via the §7 registry; (3) validate `PayloadLen == 26 + NONCE_LEN` BEFORE reading the variable-length tail (DictID + WindowLog + Nonce + AEADTag) or touching the BodyFrame. Any mismatch is malformed and MUST be rejected: no AAD can be constructed, so AEAD cannot bind context.
+- MetadataFrame `PayloadLen` equals `27 + NONCE_LEN`, where `NONCE_LEN` is the nonce length registered for the suite byte at offset 11 (v1 suites: 39 = 27 + 12). Decoder sequencing for this check: (1) read the framing header's 8 bytes (`MagicMetadata` + `PayloadLen`); (2) read the first 4 bytes of payload (HeaderByte + KeyEpoch + BlockType + SuiteID) and resolve `NONCE_LEN` from SuiteID via the §7 registry; (3) validate `PayloadLen == 27 + NONCE_LEN` BEFORE reading the variable-length tail (DictID + WindowLog + Nonce + AEADTag) or touching the BodyFrame. Any mismatch is malformed and MUST be rejected: no AAD can be constructed, so AEAD cannot bind context.
 - BodyFrame `MagicBody` equals `0x184D2A51` (LE bytes `51 2A 4D 18`). If not, reject.
 - BodyFrame `PayloadLen` is in the range `[1, 256 MiB]` for the v1 suites. `256 MiB` is the plaintext upper bound on a single block's on-disk data segment, mirroring the internal 256 MiB hard cap enforced by block I/O (`table::block::MAX_DECOMPRESSION_SIZE`, a private const) and the scrub / verify paths (`verify::MAX_BLOCK_DATA_LENGTH`, also a private const that intentionally tracks the same value). Neither is a public API constant; the 256 MiB value is the spec-level invariant. In this wire format, the nonce and authentication tag live in `MetadataFrame`, and for the v1 suites `ciphertext_len == plaintext_len`, so `EncryptionProvider::max_overhead()` does **not** apply to BodyFrame sizing. A larger value means either a forged TOC or a header bit-flip and MUST be rejected before allocating the read buffer. If a future suite permits ciphertext expansion in BodyFrame, that expansion MUST be defined explicitly as a suite-specific ciphertext expansion term in the suite registry/spec, and decoders MUST validate against that term rather than a provider-generic `max_overhead()`.
 
@@ -286,7 +314,7 @@ These checks are not AEAD-authenticated, but they bound the attack surface so th
 ;; below for the v1-with-v1-suites concrete bytes that appear on disk
 ;; today. Future suites with different NONCE_LEN (or a future spec
 ;; revision that adds / removes payload fields) get their own ABNF
-;; revision; the abstract framing contract is `PayloadLen == 26 +
+;; revision; the abstract framing contract is `PayloadLen == 27 +
 ;; NONCE_LEN` (10 fixed pre-nonce bytes: HeaderByte + KeyEpoch +
 ;; BlockType + SuiteID + CompressionType + 4-byte DictID + WindowLog;
 ;; plus the suite-defined NONCE_LEN bytes; plus 16 bytes of AEADTag)
@@ -318,8 +346,8 @@ optional-payload  = *OCTET                          ; opaque bytes, length
 
 metadata-frame    = metadata-magic metadata-payload-len metadata-payload
 metadata-magic    = %x50.2A.4D.18                  ; 0x184D2A50 LE
-metadata-payload-len = %x26.00.00.00               ; u32 LE = 38 (v1 suites: 26 + 12-byte nonce)
-                                                   ; For other suites: u32 LE = 26 + suite's NONCE_LEN.
+metadata-payload-len = %x27.00.00.00               ; u32 LE = 39 (v1 suites: 27 + 12-byte nonce)
+                                                   ; For other suites: u32 LE = 27 + suite's NONCE_LEN.
                                                    ; Decoder MUST resolve NONCE_LEN from SuiteID
                                                    ; via the §7 registry before reading the payload.
 metadata-payload  = header-byte                    ; 1B
@@ -329,6 +357,7 @@ metadata-payload  = header-byte                    ; 1B
                     compression-type               ; 1B
                     dict-id                        ; 4B BE
                     window-log                     ; 1B
+                    block-flags                    ; 1B
                     nonce                          ; NONCE_LEN B (suite-defined; 12B for v1)
                     aead-tag                       ; 16B
 
@@ -352,6 +381,9 @@ compression-type  = %x00 / %x01 / %x03 / %x04      ; None / Lz4 / Zstd / ZstdDic
                                                    ; (tags match `impl Encode for CompressionType` in src/compression/mod.rs)
 dict-id           = 4OCTET                         ; u32 BE
 window-log        = %x00 / %x0A-1F                 ; 0 = no zstd, 10..=31 = raw log2 window
+block-flags       = OCTET                          ; transform-presence bitfield: bit0 KV footer,
+                                                   ; bit1 ECC, bit2 compressed, bit3 encrypted;
+                                                   ; other bits reserved (0 on write, ignored on read)
 nonce             = 12OCTET                       ; v1 suites only. Length is suite-defined
                                                    ; (see §7 registry); other suites may use
                                                    ; different lengths under their own SuiteID.
@@ -371,7 +403,7 @@ OCTET             = %x00-FF                        ; any 8-bit byte
 2. Read **exactly** that many bytes for `optional-payload`.
 3. Stop consuming bytes for this optional-frame at that point; the next byte is either the start of another optional-frame's magic or end-of-block.
 
-A reader that consumes more or fewer bytes than the declared length MUST treat the file as malformed. The same applies to `metadata-payload` (length 38 for v1 suites with 12-byte nonces; in general `26 + NONCE_LEN`) and `encrypted-body` (length declared by `body-payload-len`): these are also `*OCTET` in the grammar but constrained by their preceding length fields in the same way.
+A reader that consumes more or fewer bytes than the declared length MUST treat the file as malformed. The same applies to `metadata-payload` (length 39 for v1 suites with 12-byte nonces; in general `27 + NONCE_LEN`) and `encrypted-body` (length declared by `body-payload-len`): these are also `*OCTET` in the grammar but constrained by their preceding length fields in the same way.
 
 ## 6. Magic allocation
 
@@ -398,7 +430,7 @@ Implementations MUST reject blocks whose first frame magic is not `0x184D2A50` (
 | `0x03` | ChaCha20-Poly1305 ([RFC 8439](https://datatracker.ietf.org/doc/html/rfc8439)) | 32 B | 12 B | 16 B |
 | `0x04..0xFF` | Reserved | n/a | n/a | n/a |
 
-The on-disk Nonce field length is **determined by SuiteID via this registry**. Decoders MUST read SuiteID at MetadataFrame offset 11, look up its registered nonce length, then read exactly that many bytes at offset 18. There is no padding: future suites with longer nonces (e.g. a hypothetical XChaCha20-Poly1305 with a 24-byte nonce) declare their own length here and pay exactly that cost; no v1 block carries bytes reserved "for future use".
+The on-disk Nonce field length is **determined by SuiteID via this registry**. Decoders MUST read SuiteID at MetadataFrame offset 11, look up its registered nonce length, then read exactly that many bytes at offset 19 (immediately after the BlockFlags byte at offset 18). There is no padding: future suites with longer nonces (e.g. a hypothetical XChaCha20-Poly1305 with a 24-byte nonce) declare their own length here and pay exactly that cost; no v1 block carries bytes reserved "for future use".
 
 Adding a new suite requires:
 1. Allocating a SuiteID byte in the registry (above table).
@@ -414,8 +446,8 @@ Per-attack mapping of which AAD-bound field defeats which threat:
 | Attack | Defending field(s) | How it defeats the attack |
 |---|---|---|
 | Bit flip in encrypted payload | (AEAD tag) | Standard AEAD: any payload modification invalidates the tag. |
-| Bit flip in MetadataFrame **payload-mirrored** fields (HeaderByte / KeyEpoch / BlockType / SuiteID / CompressionType / DictID / WindowLog) | The mirrored AAD field | The flipped byte ends up in the AAD; decryption derives a different tag and fails (cryptographically infeasible to forge). |
-| Bit flip in MetadataFrame **framing** fields (MagicMetadata / PayloadLen / MagicBody / BodyFrame PayloadLen) | Structural decoder checks per §5.3 | These fields are NOT in the AAD (they're framing layer. A flipped Magic byte causes structural rejection ("not a v1 encrypted block" or "BodyFrame absent"). A flipped PayloadLen byte produces a value ≠ `26 + NONCE_LEN` and the decoder rejects before reading the rest of the payload. AEAD is never reached for these. |
+| Bit flip in MetadataFrame **payload-mirrored** fields (HeaderByte / KeyEpoch / BlockType / SuiteID / CompressionType / DictID / WindowLog / BlockFlags) | The mirrored AAD field | The flipped byte ends up in the AAD; decryption derives a different tag and fails (cryptographically infeasible to forge). |
+| Bit flip in MetadataFrame **framing** fields (MagicMetadata / PayloadLen / MagicBody / BodyFrame PayloadLen) | Structural decoder checks per §5.3 | These fields are NOT in the AAD (they're framing layer. A flipped Magic byte causes structural rejection ("not a v1 encrypted block" or "BodyFrame absent"). A flipped PayloadLen byte produces a value ≠ `27 + NONCE_LEN` and the decoder rejects before reading the rest of the payload. AEAD is never reached for these. |
 | Bit flip in Nonce | (AEAD construction) | Different nonce → AEAD verifies against a tag computed under a different keystream/counter → fails. |
 | Bit flip in AEADTag | (AEAD construction) | Standard AEAD: the on-disk tag doesn't match the recomputed one → fails. |
 | Block swap within the same file | `BlockOffset` (caller-supplied) | The block's bytes are valid but at a different offset; the reader's seek position feeds a different BlockOffset into AAD construction; AEAD verification fails. |
@@ -473,11 +505,11 @@ All `key` / `value` / `nonce` byte sequences are shown hex, big-endian to small-
 | TableID (BE) | `00000000 00002a30` (= 10800) | The SST file's per-tree TableId |
 | BlockOffset (BE) | `00000000 00000000` (= 0) | The block's offset in the file (first block) |
 
-**AAD (38 B, NEVER on disk):** `502a4d18 10 01 00 02 0000000000000007 0000000000002a30 0000000000000000 00 00000000 00` (canonical order per §5.3: MagicMetadata | HeaderByte=0x10 [v1, low nibble reserved] | KeyEpoch=0x01 | BlockType=0x00 | SuiteID=0x02 | TreeID BE | TableID BE | BlockOffset BE | CompressionType=0x00 [None] | DictID BE | WindowLog=0x00 [no zstd])
+**AAD (39 B, NEVER on disk):** `502a4d18 10 01 00 02 0000000000000007 0000000000002a30 0000000000000000 00 00000000 00 00` (canonical order per §5.3: MagicMetadata | HeaderByte=0x10 [v1, low nibble reserved] | KeyEpoch=0x01 | BlockType=0x00 | SuiteID=0x02 | TreeID BE | TableID BE | BlockOffset BE | CompressionType=0x00 [None] | DictID BE | WindowLog=0x00 [no zstd] | BlockFlags=0x00 [no transform layers])
 
-**Expected on-disk size:** 67 B total = 46 (MetadataFrame = 8 framing + 38 payload for v1 suite) + 8 (BodyFrame framing header) + 13 (EncryptedBody). For AES-256-GCM and ChaCha20-Poly1305, `ciphertext_len == plaintext_len` because the tag is stored in MetadataFrame, not appended to the ciphertext.
+**Expected on-disk size:** 68 B total = 47 (MetadataFrame = 8 framing + 39 payload for v1 suite) + 8 (BodyFrame framing header) + 13 (EncryptedBody). For AES-256-GCM and ChaCha20-Poly1305, `ciphertext_len == plaintext_len` because the tag is stored in MetadataFrame, not appended to the ciphertext.
 
-The 67-byte on-disk output for this vector ships as fixed binary test data with #253 and becomes the canonical wire reference once that PR lands. The test asserts byte equality between the AEAD library's output and the published bytes.
+The 68-byte on-disk output for this vector ships as fixed binary test data with #253 and becomes the canonical wire reference once that PR lands. The test asserts byte equality between the AEAD library's output and the published bytes.
 
 ### Vector 2: Index block, ChaCha20-Poly1305, no dict, no zstd
 
@@ -489,20 +521,20 @@ Key as above, KeyEpoch=01, BlockType=`00`, SuiteID=`02`, CompressionType=`04` (Z
 
 ### Vector 4: Negative, window-bomb (rejection)
 
-Construct a block whose inner zstd frame's `Window_Descriptor` byte (encoded per RFC 8878 §3.1.1.1.2) decodes to a 1 GiB window, but the AAD-bound `WindowLog` field declares 21 (raw log2, = 2 MiB). A conformant decoder MUST reject this block. The reject path is split across two issues by repo: this repo's encoder/decoder (issue #251) wires the AAD-bound `WindowLog` into the inner-validator call, and the structured-zstd side (tracked as `S-ZSTD-T7` in [structured-world/structured-zstd](https://github.com/structured-world/structured-zstd)) implements `FrameDecoder::expect_window_log` to decode the frame's descriptor byte and compare the decoded log against the AAD-bound limit. Error variant: `crate::Error::Decrypt(_)` with an implementation-defined reason. The exact reason string is NOT part of this spec (it varies by suite, see `src/encryption.rs` for the current AES-256-GCM string) and may be replaced by a typed decrypt-error variant when #251 introduces one; conformance tests assert on the variant family, not on the static string.
+Construct a block whose inner zstd frame's `Window_Descriptor` byte (encoded per RFC 8878 §3.1.1.1.2) decodes to a 1 GiB window, but the AAD-bound `WindowLog` field declares 21 (raw log2, = 2 MiB). A conformant decoder MUST reject this block. The reject path is split across two issues by repo: this repo's encoder/decoder (issue #251) wires the AAD-bound `WindowLog` into the inner-validator call, and the structured-zstd side (tracked as `S-ZSTD-T7` in [structured-world/structured-zstd](https://github.com/structured-world/structured-zstd)) implements `FrameDecoder::expect_window_log` to decode the frame's descriptor byte and compare the decoded log against the AAD-bound limit. Error variant: a typed [`DecryptError`](../src/encryption/error.rs) (the WindowLog-validation reject path itself is wired under #251); conformance tests assert on the variant family, not on a static string.
 
 ### Vector 5: Negative, key-epoch mismatch (rejection)
 
-Encrypt a block under KeyEpoch=`01`. Tamper the on-disk `KeyEpoch` byte to `02`. The reader selects key `02` from the chain (different from the actual encryption key), AEAD verification fails. Error variant: `crate::Error::Decrypt(_)` (standard AEAD tag-mismatch path). The reason string is implementation-defined (see `src/encryption.rs` for the current per-suite strings) and may move to a typed variant under #251; conformance tests assert on the variant family.
+Encrypt a block under KeyEpoch=`01`. Tamper the on-disk `KeyEpoch` byte to `02`. The reader selects key `02` from the chain (different from the actual encryption key), AEAD verification fails. Error variant: `DecryptError::AeadVerificationFailed` (standard AEAD tag-mismatch path); conformance tests assert on the variant family.
 
 ## 10. Worked hex-dump example
 
 A minimum-size Data block (single-byte plaintext = `41`, "A") encrypted under AES-256-GCM with all-zero key, KeyEpoch=`01`, CompressionType=0 (None), DictID=0, WindowLog=`0` (no zstd, no window enforcement), Nonce = first 12 bytes `00..0b`. Caller context (NOT on disk): TreeID=0, TableID=0, BlockOffset=0.
 
 ```text
-;; MetadataFrame (46 bytes = 8-byte framing + 38-byte payload)
+;; MetadataFrame (47 bytes = 8-byte framing + 39-byte payload)
 0000: 50 2a 4d 18         ; MagicMetadata (0x184D2A50 LE)
-0004: 26 00 00 00         ; PayloadLen = 38 (u32 LE)
+0004: 27 00 00 00         ; PayloadLen = 39 (u32 LE)
 0008: 10                  ; HeaderByte: version=0x1, low nibble reserved=0
 0009: 01                  ; KeyEpoch
 000a: 00                  ; BlockType = Data
@@ -510,20 +542,21 @@ A minimum-size Data block (single-byte plaintext = `41`, "A") encrypted under AE
 000c: 00                  ; CompressionType = None (tag 0 per `impl Encode for CompressionType` in src/compression/mod.rs)
 000d: 00 00 00 00         ; DictID = 0 (u32 BE)
 0011: 00                  ; WindowLog = 0 (CompressionType=None → no zstd, no window enforcement)
-0012: 00 01 02 03 04 05 06 07   ; Nonce bytes 0..7
-001a: 08 09 0a 0b         ; Nonce bytes 8..11 (12-byte AES-GCM nonce, no padding)
-001e: <16 bytes AEADTag>  ; depends on the AEAD library output, not literal
+0012: 00                  ; BlockFlags = 0 (no transform layers: no KV footer / ECC / compression / encryption-flag bits set)
+0013: 00 01 02 03 04 05 06 07   ; Nonce bytes 0..7
+001b: 08 09 0a 0b         ; Nonce bytes 8..11 (12-byte AES-GCM nonce, no padding)
+001f: <16 bytes AEADTag>  ; depends on the AEAD library output, not literal
 
 ;; BodyFrame (8 + 1 = 9 bytes)
-002e: 51 2a 4d 18         ; MagicBody (0x184D2A51 LE)
-0032: 01 00 00 00         ; PayloadLen = 1 (u32 LE)
-0036: <1 byte ciphertext> ; AES-GCM ciphertext of "A" under the AAD below
+002f: 51 2a 4d 18         ; MagicBody (0x184D2A51 LE)
+0033: 01 00 00 00         ; PayloadLen = 1 (u32 LE)
+0037: <1 byte ciphertext> ; AES-GCM ciphertext of "A" under the AAD below
 
-;; AAD (38 bytes; NEVER written to disk, input to AEAD only)
+;; AAD (39 bytes; NEVER written to disk, input to AEAD only)
 ;; Canonical byte sequence per §5.3:
 ;;   MagicMetadata | HeaderByte | KeyEpoch | BlockType | SuiteID
 ;;     | TreeID (caller) | TableID (caller) | BlockOffset (caller)
-;;     | CompressionType | DictID | WindowLog
+;;     | CompressionType | DictID | WindowLog | BlockFlags
      50 2a 4d 18          ; MagicMetadata
      10                   ; HeaderByte         (mirror of disk byte 0008)
      01                   ; KeyEpoch           (mirror of disk byte 0009)
@@ -535,9 +568,10 @@ A minimum-size Data block (single-byte plaintext = `41`, "A") encrypted under AE
      00                   ; CompressionType    (mirror of disk byte 000c)
      00 00 00 00          ; DictID BE          (mirror of disk bytes 000d-0010)
      00                   ; WindowLog          (mirror of disk byte 0011)
+     00                   ; BlockFlags         (mirror of disk byte 0012)
 ```
 
-Total on-disk size: 55 bytes (46 metadata + 9 body). The AEADTag and ciphertext bytes are generated by the AEAD library and not literal in this example, the conformance harness in #253 computes them and asserts exact byte equality.
+Total on-disk size: 56 bytes (47 metadata + 9 body). The AEADTag and ciphertext bytes are generated by the AEAD library and not literal in this example, the conformance harness in #253 computes them and asserts exact byte equality.
 
 ## 11. Implementation hand-off
 

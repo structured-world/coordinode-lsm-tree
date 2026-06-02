@@ -5,7 +5,7 @@
 //! the AAD-bound block format.
 //!
 //! Sits on top of the [`super::aad`] module: takes a [`super::aad::SuiteId`]
-//! discriminator + key material + the 38-byte AAD buffer and produces /
+//! discriminator + key material + the 39-byte AAD buffer and produces /
 //! verifies an `(nonce, ciphertext, tag)` triple. Pure AEAD layer; the
 //! on-disk skippable-frame envelope that wraps these bytes is its own
 //! module (wire format, separate slice of #251).
@@ -46,7 +46,7 @@ pub const TAG_LEN: usize = 16;
 /// `crate::Error::Encrypt`.
 ///
 /// The 32-byte `key` MUST match the key the reader will use for the
-/// matching `KeyEpoch`. The 38-byte `aad` is the buffer produced by
+/// matching `KeyEpoch`. The 39-byte `aad` is the buffer produced by
 /// [`super::aad::build`] and is bound into the tag.
 ///
 /// # Errors
@@ -158,11 +158,12 @@ mod tests {
     /// Alt 32-byte key for "wrong key" assertions.
     const TEST_KEY_OTHER: [u8; 32] = [0x55; 32];
 
-    /// Build a canonical 38-byte AAD for a concrete test block.
-    fn test_aad(suite: SuiteId) -> [u8; 38] {
+    /// Build a canonical AAD for a concrete test block.
+    fn test_aad(suite: SuiteId) -> [u8; AAD_LEN] {
         let ctx = EncryptionContext::v1(
             7, // key_epoch
             suite, 0, // CompressionType::None tag
+            0, // block_flags: no transform layers
         );
         let identity = TableBlockIdentity::for_test(0xAB, 0xCD, BlockType::Data);
         build(&ctx, &identity)

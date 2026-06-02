@@ -112,11 +112,24 @@ pub struct Writer {
     /// Per-block Reed-Solomon Page ECC opt-in. When `true`, every
     /// `Block::write_into` call this writer makes upgrades its
     /// `BlockTransform` to the matching `*Ecc` variant so the
-    /// writer emits a parity trailer + records non-zero
-    /// `ecc_length` in the header. Default `false`. Caller wires
-    /// `Config::page_ecc` into this field via
-    /// [`Self::use_page_ecc`] before the first key is added.
+    /// writer emits a parity trailer + sets the `ECC_PARITY` flag in
+    /// the header. Default `false`. Caller wires `Config::page_ecc`
+    /// into this field via [`Self::use_page_ecc`] before the first key
+    /// is added.
     page_ecc: bool,
+
+    /// Per-KV checksum policy + algorithm for data blocks. `None` (default)
+    /// means no per-KV checksums: data blocks carry no per-KV footer, with
+    /// the `KV_CHECKSUM_FOOTER` header flag clear.
+    /// When `Some((policy, algo))`, each data block whose `(level,
+    /// table_id)` satisfies `policy.applies` is emitted with a per-entry
+    /// checksum footer under `algo` and the `KV_CHECKSUM_FOOTER` flag set
+    /// (the block role stays [`BlockType::Data`]). Wired from the tree's
+    /// runtime `kv_checksums` config via [`Self::use_kv_checksums`].
+    kv_checksum: Option<(
+        crate::runtime_config::KvChecksumPolicy,
+        crate::runtime_config::ChecksumAlgorithm,
+    )>,
 
     /// Pre-trained zstd dictionary for dictionary compression
     #[cfg(zstd_any)]
@@ -193,6 +206,8 @@ impl Writer {
             encryption: None,
 
             page_ecc: false,
+
+            kv_checksum: None,
 
             #[cfg(zstd_any)]
             zstd_dictionary: None,
@@ -346,7 +361,7 @@ impl Writer {
     /// When `true`, every block this writer emits upgrades its
     /// `BlockTransform` to the matching `*Ecc` variant (so the
     /// `Block::write_into` call emits a Reed-Solomon parity
-    /// trailer and records non-zero `ecc_length` in the header).
+    /// trailer and sets the `ECC_PARITY` flag in the header).
     /// Must be called BEFORE the first key is added so all blocks
     /// in the table use the same setting; the contract is
     /// enforced by callers (`Tree::open` + compaction worker pass
@@ -360,6 +375,33 @@ impl Writer {
         self.page_ecc = page_ecc;
         self.index_writer = self.index_writer.use_page_ecc(page_ecc);
         self.filter_writer = self.filter_writer.use_page_ecc(page_ecc);
+        self
+    }
+
+    /// Wires the tree's runtime `kv_checksums` policy + algorithm into this
+    /// writer. When `policy != Off`, every data block whose
+    /// `(level, table_id)` satisfies `policy.applies` gets a per-entry
+    /// checksum footer and the `KV_CHECKSUM_FOOTER` header flag set; all
+    /// other data blocks stay plain (flag clear). `Off` (or never calling
+    /// this) leaves data blocks without a per-KV footer (flag clear).
+    ///
+    /// Must be called BEFORE the first key is added (same contract as
+    /// [`Self::use_page_ecc`]).
+    #[must_use]
+    pub fn use_kv_checksums(
+        mut self,
+        policy: crate::runtime_config::KvChecksumPolicy,
+        algo: crate::runtime_config::ChecksumAlgorithm,
+    ) -> Self {
+        // Must be fixed before the first key: toggling mid-write would mix
+        // footer-bearing and plain data blocks in one table at an arbitrary
+        // boundary, which the per-SST policy contract does not allow.
+        self.assert_not_started("use_kv_checksums");
+        self.kv_checksum = if matches!(policy, crate::runtime_config::KvChecksumPolicy::Off) {
+            None
+        } else {
+            Some((policy, algo))
+        };
         self
     }
 
@@ -464,14 +506,48 @@ impl Writer {
 
         self.block_buffer.clear();
 
-        DataBlock::encode_into(
-            &mut self.block_buffer,
-            &self.chunk,
-            self.data_block_restart_interval,
-            self.data_block_hash_ratio,
-        )?;
+        // Decide per-block whether to emit the per-KV checksum footer.
+        // `kv_checksum` is None unless the tree opted in; even then only
+        // blocks whose (level, table_id) satisfy the policy carry the
+        // footer. Off-path emits no footer (KV_CHECKSUM_FOOTER bit clear).
+        let kv_emit = self.kv_checksum.and_then(|(policy, algo)| {
+            policy
+                .applies(self.initial_level, self.table_id)
+                .then_some(algo)
+        });
 
-        let header = Block::write_into(
+        // A per-KV-checked block is a plain Data block plus a footer: the
+        // role stays Data, the footer is recorded as a header flag bit
+        // (KV_CHECKSUM_FOOTER), not as a distinct block type. Off-path emits
+        // no footer (KV_CHECKSUM_FOOTER bit clear).
+        let kv_flags = if let Some(algo) = kv_emit {
+            // Compute one logical-content digest per entry, in scan order.
+            let mut digests = Vec::with_capacity(self.chunk.len());
+            for item in &self.chunk {
+                let d = crate::table::block::kv_checksum::kv_digest(item, algo)
+                    .ok_or(crate::Error::FeatureUnsupported("kv-checksum-algorithm"))?;
+                digests.push(d);
+            }
+            DataBlock::encode_kv_checked_into(
+                &mut self.block_buffer,
+                &self.chunk,
+                &digests,
+                algo,
+                self.data_block_restart_interval,
+                self.data_block_hash_ratio,
+            )?;
+            crate::table::block::header::block_flags::KV_CHECKSUM_FOOTER
+        } else {
+            DataBlock::encode_into(
+                &mut self.block_buffer,
+                &self.chunk,
+                self.data_block_restart_interval,
+                self.data_block_hash_ratio,
+            )?;
+            0
+        };
+
+        let header = Block::write_into_with_flags(
             &mut self.file_writer,
             &self.block_buffer,
             super::block::BlockIdentity {
@@ -495,6 +571,7 @@ impl Writer {
                 )?;
                 if self.page_ecc { t.with_ecc() } else { t }
             },
+            kv_flags,
         )?;
 
         self.meta.uncompressed_size += u64::from(header.uncompressed_length);
@@ -734,6 +811,16 @@ impl Writer {
             highest_kv_seqno: self.meta.highest_kv_seqno,
             data_block_compression: self.data_block_compression,
             index_block_compression: self.index_block_compression,
+            // Evaluate the kv-checksum policy once for this table's
+            // (level, table_id). The result is constant across all the
+            // table's data blocks (homogeneous SST), so it doubles as
+            // the per-SST descriptor value — identical to the per-block
+            // decision `spill_block` makes via the same expression.
+            kv_checksum_algo: self.kv_checksum.and_then(|(policy, algo)| {
+                policy
+                    .applies(self.initial_level, self.table_id)
+                    .then_some(algo)
+            }),
             data_block_hash_ratio: self.data_block_hash_ratio,
             data_block_restart_interval: self.data_block_restart_interval,
             index_block_restart_interval: self.index_block_restart_interval,
@@ -938,6 +1025,12 @@ struct MetaSectionParams<'a> {
     highest_kv_seqno: crate::SeqNo,
     data_block_compression: CompressionType,
     index_block_compression: CompressionType,
+    /// Effective per-SST per-KV-footer algorithm: `Some(algo)` when this
+    /// table's `(level, table_id)` satisfies the kv-checksum policy (so
+    /// every data block carries a footer under `algo`), `None` otherwise.
+    /// An SST is homogeneous, so this single value describes the whole
+    /// table. Recorded in meta as the `descriptor#kv_checksum` byte.
+    kv_checksum_algo: Option<crate::runtime_config::ChecksumAlgorithm>,
     data_block_hash_ratio: f32,
     data_block_restart_interval: u8,
     index_block_restart_interval: u8,
@@ -965,6 +1058,13 @@ fn write_meta_section<W: std::io::Write + std::io::Seek>(
 ) -> crate::Result<()> {
     file_writer.start(p.section_name)?;
 
+    // Record the EFFECTIVE Page-ECC setting, not the requested flag. On
+    // builds without the `page_ecc` cargo feature, `with_ecc()` compiles to
+    // the identity and no parity trailer is ever emitted, so the descriptor
+    // must read false to stay consistent with the on-disk blocks (otherwise
+    // an SST advertises parity that isn't there).
+    let effective_page_ecc = cfg!(feature = "page_ecc") && page_ecc;
+
     let meta = meta_kv;
     let meta_items = [
         meta("block_count#data", &p.data_block_count.to_le_bytes()),
@@ -991,6 +1091,21 @@ fn write_meta_section<W: std::io::Write + std::io::Seek>(
             "data_block_hash_ratio",
             &p.data_block_hash_ratio.to_le_bytes(),
         ),
+        // Per-SST transform descriptor: per-KV-footer presence + algorithm
+        // as one byte (0 = no footer, else 1 + algo wire tag). Lets the
+        // reader know the whole table's footer state without inspecting any
+        // data block — the foundation for descriptor-driven block layout.
+        meta(
+            "descriptor#kv_checksum",
+            &[crate::table::block::kv_checksum::descriptor_byte(
+                p.kv_checksum_algo,
+            )],
+        ),
+        // Per-SST transform descriptor: whether every block in this table
+        // carries a Reed-Solomon parity trailer (Page ECC). One byte for the
+        // whole homogeneous SST, so the read path learns ECC presence from
+        // the descriptor instead of a per-block header field.
+        meta("descriptor#page_ecc", &[u8::from(effective_page_ecc)]),
         meta("file_size", &p.file_size.to_le_bytes()),
         meta("filter_hash_type", &[u8::from(ChecksumType::Xxh3)]),
         meta("index_keys_have_seqno", &[0x1]),

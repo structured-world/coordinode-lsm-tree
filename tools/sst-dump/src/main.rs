@@ -23,10 +23,11 @@ use std::process::ExitCode;
 
 /// Default number of bytes the `hex` subcommand prints when the
 /// caller does not supply `--len`. Chosen to cover one `Header`
-/// (currently 33 bytes: 4 B magic + 1 B block_type + 16 B
+/// (at least 33 bytes: 4 B magic + 1 B block_type + 16 B
 /// XXH3-128 checksum + 4 B data_length + 4 B uncompressed_length +
-/// 4 B trailing checksum tag — see `Header::serialized_len()`)
-/// plus a few payload lines worth of context.
+/// 4 B trailing checksum tag — see `Header::MIN_LEN`; the self-describing
+/// block types (Meta / Manifest / ManifestFooter) add one `block_flags`
+/// byte) plus a few payload lines worth of context.
 const HEX_DEFAULT_LEN: u64 = 256;
 /// Hard ceiling on the user-requestable `hex` length so a typo
 /// (`--len 4294967295`) can't allocate a 4 GiB buffer. 1 MiB
@@ -301,7 +302,7 @@ fn run_hex(path: &std::path::Path, offset: u64, len: u64, no_header: bool) -> Ex
     // Attempt header decode unless the caller asked us to skip it
     // (offset known not to be a block boundary) or the buffer is
     // shorter than a serialized header.
-    if !no_header && read_len as usize >= Header::serialized_len() {
+    if !no_header && read_len as usize >= Header::MIN_LEN {
         let mut header_reader = &buf[..];
         match Header::decode_from(&mut header_reader) {
             Ok(header) => {
@@ -326,8 +327,9 @@ fn run_hex(path: &std::path::Path, offset: u64, len: u64, no_header: bool) -> Ex
         println!("header:         skipped (--no-header)");
     } else {
         println!(
-            "header:         skipped (only {read_len} bytes available, header is {} bytes)",
-            Header::serialized_len(),
+            "header:         skipped (only {read_len} bytes available, \
+             header is at least {} bytes)",
+            Header::MIN_LEN,
         );
     }
 

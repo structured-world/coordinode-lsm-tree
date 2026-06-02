@@ -44,10 +44,73 @@ impl<R: std::io::Read> std::io::Read for ChecksummedReader<R> {
     }
 }
 
+/// Per-block transform-layer presence flags carried in the block
+/// header (`Header::block_flags`).
+///
+/// Each bit records that one orthogonal, composable transform layer
+/// was applied to the block payload. This is the single home for the
+/// "which layers are present" question; the per-layer PARAMETERS live
+/// elsewhere (the parity length is DERIVED from `data_length` via the
+/// Reed-Solomon scheme, the per-KV footer's algorithm + count
+/// self-describe in the footer tail, the compression codec + zstd dict
+/// come from the owning SST's compression policy, the encryption
+/// scheme/key from its encryption config). A presence bit can't carry
+/// those parameters, so it doesn't try to — it answers presence, the
+/// parameter homes answer "how".
+///
+/// `BlockType` stays orthogonal to these flags: it is the block's
+/// mutually-exclusive ROLE (Data / Index / Filter / …), not a
+/// transform layer. A compressed, encrypted, per-KV-checked data
+/// block is still `BlockType::Data` with three bits set — the layers
+/// compose, the role does not.
+pub mod block_flags {
+    /// The payload is followed by a per-entry checksum footer
+    /// (per-KV integrity). The footer's algorithm + entry count
+    /// self-describe in its tail; this bit says only that it is
+    /// present and must be split off before the inner payload is
+    /// decoded as a plain block of its role.
+    pub const KV_CHECKSUM_FOOTER: u8 = 1 << 0;
+
+    /// The payload is followed by a Reed-Solomon parity trailer.
+    /// Its byte length is NOT stored: the reader derives it as
+    /// `expected_parity_len(data_length)` (the RS(4, 2) scheme is
+    /// deterministic). This bit is the canonical, presence-authoritative
+    /// signal that a trailer follows; a block whose payload is empty
+    /// emits a zero-length trailer and leaves this bit clear.
+    pub const ECC_PARITY: u8 = 1 << 1;
+
+    /// The payload was compressed. The codec (and any zstd dict) is
+    /// not stored per block — it comes from the owning SST's
+    /// compression policy, which the reader supplies via the
+    /// `BlockTransform`. This bit is a presence-only self-describing
+    /// signal; the read path decodes using the caller-supplied
+    /// transform and does not currently validate this bit against it.
+    pub const COMPRESSED: u8 = 1 << 2;
+
+    /// The payload was encrypted. The scheme/key comes from the
+    /// owning SST's encryption config (caller-supplied via the
+    /// `BlockTransform`); this bit is a presence-only self-describing
+    /// signal, not validated against the transform on the read path.
+    pub const ENCRYPTED: u8 = 1 << 3;
+
+    /// Mask of every defined transform-layer bit. The header decoder
+    /// rejects any byte with a bit set outside this mask: `block_flags`
+    /// is a persisted transform field, so an unknown high bit means a
+    /// newer writer or a forged header is trying to declare a layer this
+    /// build does not understand. Failing fast beats silently treating
+    /// it as a partially-known block.
+    pub const KNOWN: u8 = KV_CHECKSUM_FOOTER | ECC_PARITY | COMPRESSED | ENCRYPTED;
+}
+
 /// Header of a disk-based block
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct Header {
     pub block_type: BlockType,
+
+    /// Transform-layer presence bitfield — see the `block_flags` module in
+    /// this file for the bit definitions. `0` means a plain block of its role
+    /// with no compression / encryption / ECC / per-KV footer.
+    pub block_flags: u8,
 
     /// Checksum value to verify integrity of data
     pub checksum: Checksum,
@@ -57,67 +120,110 @@ pub struct Header {
 
     /// Uncompressed size of data segment
     pub uncompressed_length: u32,
-
-    /// Length in bytes of the Reed-Solomon parity trailer that follows
-    /// the `data_length` payload bytes on disk. `0` when the block was
-    /// written without Page ECC (`Config::page_ecc(false)`, the
-    /// default), in which case no parity bytes follow — the *payload
-    /// region* stays V5-shaped (header + payload, no trailer). The
-    /// *header* itself is always V5: 4 extra bytes for this field
-    /// plus the bumped magic `[L,S,M,4]` (pre-V5 V3/V4 used
-    /// `[L,S,M,3]`), so a pre-V5 reader rejects every V5 block at
-    /// header decode
-    /// regardless of `ecc_length`'s value. Non-zero when ECC is
-    /// enabled — the reader uses it to read the parity bytes and
-    /// attempt Reed-Solomon recovery on `data` XXH3 mismatch.
-    pub ecc_length: u32,
 }
 
 impl Header {
+    /// Header size WITHOUT the optional `block_flags` byte: the fixed part
+    /// every block carries (magic + `block_type` + checksum + `data_length` +
+    /// `uncompressed_length` + header checksum). Pre-decode lower bound; the
+    /// actual size for a given block is [`Self::header_len`].
+    pub const MIN_LEN: usize = MAGIC_BYTES.len()
+        // Block type — encoded as a single u8 by encode_into, not as
+        // size_of::<BlockType>(). BlockType is a fieldless enum without
+        // `#[repr(u8)]`, so its in-memory size is implementation-defined;
+        // the wire format is the contract and that contract is 1 byte.
+        + 1
+        // Data checksum
+        + std::mem::size_of::<Checksum>()
+        // On-disk size
+        + std::mem::size_of::<u32>()
+        // Uncompressed data length
+        + std::mem::size_of::<u32>()
+        // Header checksum
+        + std::mem::size_of::<u32>();
+
+    /// Largest possible header size: [`Self::MIN_LEN`] plus the optional
+    /// `block_flags` byte. Used as a pre-decode upper bound where the
+    /// `block_type` (and thus exact header length) is not yet known.
+    pub const MAX_LEN: usize = Self::MIN_LEN + 1;
+
+    /// Whether a block of `block_type` carries the `block_flags` byte.
+    ///
+    /// Bootstrap / out-of-band blocks keep the self-describing byte:
+    /// `Meta` is read before its own per-SST descriptor exists (the
+    /// descriptor lives inside it); `Manifest` / `ManifestFooter` belong to
+    /// the manifest subsystem, which has no per-SST descriptor at all.
+    ///
+    /// Ordinary SST blocks (`Data` / `Index` / `Filter` / `RangeTombstone`)
+    /// are read AFTER their table's `ParsedMeta` descriptor is loaded, so
+    /// their transform presence is sourced from that descriptor and the byte
+    /// is omitted — saving one byte per block.
     #[must_use]
-    pub const fn serialized_len() -> usize {
-        MAGIC_BYTES.len()
-            // Block type — encoded as a single u8 by encode_into,
-            // not as size_of::<BlockType>(). BlockType is a fieldless
-            // enum without `#[repr(u8)]`, so its in-memory size is
-            // implementation-defined; the wire format is the contract
-            // and that contract is 1 byte.
-            + 1
-            // Data checksum
-            + std::mem::size_of::<Checksum>()
-            // On-disk size
-            + std::mem::size_of::<u32>()
-            // Uncompressed data length
-            + std::mem::size_of::<u32>()
-            // Reed-Solomon parity trailer length (0 when ECC off)
-            + std::mem::size_of::<u32>()
-            // Checksum
-            + std::mem::size_of::<u32>()
+    pub const fn has_block_flags(block_type: BlockType) -> bool {
+        matches!(
+            block_type,
+            BlockType::Meta | BlockType::Manifest | BlockType::ManifestFooter
+        )
+    }
+
+    /// On-disk header length for `block_type`: [`Self::MIN_LEN`] plus the
+    /// `block_flags` byte when [`Self::has_block_flags`] is true.
+    #[must_use]
+    pub const fn header_len(block_type: BlockType) -> usize {
+        if Self::has_block_flags(block_type) {
+            Self::MIN_LEN + 1
+        } else {
+            Self::MIN_LEN
+        }
     }
 
     /// Total bytes this block occupies on disk: header + payload +
     /// optional ECC parity trailer. Use this when computing block
-    /// handles instead of manually summing `serialized_len() +
-    /// data_length` — that older form silently underflows the
-    /// on-disk size when `ecc_length > 0`.
+    /// handles instead of manually summing `header_len(block_type) +
+    /// data_length` — that form silently underflows the on-disk size
+    /// when a parity trailer is present.
+    ///
+    /// The parity-trailer length is derived from `data_length` (the
+    /// Reed-Solomon scheme is deterministic) and the `ECC_PARITY`
+    /// presence bit, not stored: a block that set the bit at write time
+    /// carries `expected_parity_len(data_length)` parity bytes.
+    ///
+    /// # Parity accounting is only valid when `block_flags` is authoritative
+    ///
+    /// This reads parity presence from [`Self::block_flags`]. That field is
+    /// authoritative for headers freshly built by the writer (the on-disk-size
+    /// call sites that compute block handles) and for the block types that
+    /// serialize the byte (`Meta` / `Manifest` / `ManifestFooter` — see
+    /// [`Self::has_block_flags`]). It is NOT authoritative on a header obtained
+    /// from [`Decode::decode_from`] for an SST block type (`Data` / `Index` /
+    /// `Filter` / `RangeTombstone`): those omit the byte on disk, so it decodes
+    /// as `0` and this method UNDERCOUNTS an ECC-bearing SST block by its parity
+    /// trailer. A caller holding a decoded SST header must derive the trailer
+    /// from the per-SST `page_ecc` descriptor and
+    /// [`expected_parity_len`](super::expected_parity_len), as the block scrub
+    /// walker does — do not call `on_disk_size` for that.
     #[must_use]
     pub fn on_disk_size(&self) -> u32 {
-        // serialized_len is a small constant (37 bytes: 4 magic + 1
-        // block_type + 16 checksum + 4 data_length + 4 uncompressed +
-        // 4 ecc_length + 4 header checksum); cast to u32 is safe by
-        // construction. `data_length` is bounded by the writer's
-        // `MAX_DECOMPRESSION_SIZE` cap, and `ecc_length` is bounded
-        // by the per-block `expected_parity_len(data_length)` invariant
-        // enforced on read (see `Block::from_reader` / `from_file`),
-        // so the sum stays well within u32.
+        // header_len is a small constant (33 or 34 bytes: 4 magic + 1
+        // block_type + [1 block_flags for meta/manifest] + 16 checksum +
+        // 4 data_length + 4 uncompressed + 4 header checksum); cast to u32
+        // is safe by construction. `data_length` is bounded by the writer's
+        // `MAX_DECOMPRESSION_SIZE` cap and the parity length is bounded
+        // by `expected_parity_len(data_length)`, so the sum stays well
+        // within u32.
         #[expect(
             clippy::cast_possible_truncation,
-            reason = "Header::serialized_len() is a small const"
+            reason = "Header::header_len() is a small const"
         )]
-        let header = Self::serialized_len() as u32;
+        let header = Self::header_len(self.block_type) as u32;
+        let parity = if self.block_flags & block_flags::ECC_PARITY != 0 {
+            super::expected_parity_len(self.data_length)
+        } else {
+            0
+        };
         header
             .saturating_add(self.data_length)
-            .saturating_add(self.ecc_length)
+            .saturating_add(parity)
     }
 }
 
@@ -134,6 +240,14 @@ impl Encode for Header {
             // Write block type
             writer.write_u8(self.block_type.into())?;
 
+            // Write transform-layer presence flags — only for block types
+            // that carry the byte (Meta / Manifest / ManifestFooter). SST
+            // blocks omit it and derive transform presence from the per-SST
+            // descriptor on read.
+            if Self::has_block_flags(self.block_type) {
+                writer.write_u8(self.block_flags)?;
+            }
+
             // Write data checksum
             writer.write_u128::<LE>(self.checksum.into_u128())?;
 
@@ -142,10 +256,6 @@ impl Encode for Header {
 
             // Write uncompressed data length
             writer.write_u32::<LE>(self.uncompressed_length)?;
-
-            // Write Reed-Solomon parity trailer length (V5+); 0 when
-            // Page ECC is disabled.
-            writer.write_u32::<LE>(self.ecc_length)?;
 
             writer.checksum()
         };
@@ -179,6 +289,23 @@ impl Decode for Header {
         let block_type = protected_reader.read_u8()?;
         let block_type = BlockType::try_from(block_type)?;
 
+        // Read transform-layer presence flags — only for block types that
+        // carry the byte (Meta / Manifest / ManifestFooter). SST blocks omit
+        // it (transform presence comes from the per-SST descriptor), so their
+        // in-memory `block_flags` is 0 and callers consult the descriptor.
+        // Reject any byte with a bit outside the defined set: an unknown high
+        // bit means a newer writer or a forged header is declaring a layer
+        // this build can't honor.
+        let block_flags = if Self::has_block_flags(block_type) {
+            let flags = protected_reader.read_u8()?;
+            if flags & !block_flags::KNOWN != 0 {
+                return Err(crate::Error::InvalidTag(("block_flags", flags)));
+            }
+            flags
+        } else {
+            0
+        };
+
         // Read data checksum
         let checksum = protected_reader.read_u128::<LE>()?;
 
@@ -187,9 +314,6 @@ impl Decode for Header {
 
         // Read data length
         let uncompressed_length = protected_reader.read_u32::<LE>()?;
-
-        // Read Reed-Solomon parity trailer length (V5+)
-        let ecc_length = protected_reader.read_u32::<LE>()?;
 
         #[expect(
             clippy::cast_possible_truncation,
@@ -214,10 +338,10 @@ impl Decode for Header {
 
         Ok(Self {
             block_type,
+            block_flags,
             checksum: Checksum::from_raw(checksum),
             data_length,
             uncompressed_length,
-            ecc_length,
         })
     }
 }
@@ -248,10 +372,10 @@ impl Header {
     pub(crate) fn test_dummy(block_type: BlockType) -> Self {
         Self {
             block_type,
+            block_flags: 0,
             checksum: Checksum::from_raw(0),
             data_length: 0,
             uncompressed_length: 0,
-            ecc_length: 0,
         }
     }
 }
@@ -263,20 +387,65 @@ mod tests {
 
     #[test]
     fn block_header_serde_roundtrip() -> crate::Result<()> {
+        // Manifest carries the block_flags byte, so this exercises the
+        // round-trip of a non-zero flags byte (SST block types omit it).
         let header = Header {
-            block_type: BlockType::Data,
+            block_type: BlockType::Manifest,
+            block_flags: block_flags::KV_CHECKSUM_FOOTER | block_flags::COMPRESSED,
             checksum: Checksum::from_raw(5),
             data_length: 252_356,
             uncompressed_length: 124_124_124,
-            ecc_length: 0,
         };
 
         let bytes = header.encode_into_vec();
 
-        assert_eq!(bytes.len(), Header::serialized_len());
+        assert_eq!(bytes.len(), Header::header_len(BlockType::Manifest));
         assert_eq!(header, Header::decode_from(&mut &bytes[..])?);
 
         Ok(())
+    }
+
+    #[test]
+    fn block_header_serde_roundtrip_sst_omits_flags_byte() -> crate::Result<()> {
+        // SST block types omit the block_flags byte: a Data header encodes to
+        // MIN_LEN bytes and decodes back with block_flags == 0 regardless of
+        // the in-memory value (which the writer leaves at 0 for SST blocks).
+        let header = Header {
+            block_type: BlockType::Data,
+            block_flags: 0,
+            checksum: Checksum::from_raw(7),
+            data_length: 42,
+            uncompressed_length: 42,
+        };
+        let bytes = header.encode_into_vec();
+        assert_eq!(bytes.len(), Header::MIN_LEN);
+        assert_eq!(header, Header::decode_from(&mut &bytes[..])?);
+        Ok(())
+    }
+
+    #[test]
+    fn block_header_rejects_unknown_block_flags_bit() {
+        // `block_flags` is a persisted transform field. A header carrying a
+        // bit this build does not define (here the reserved 1 << 4) must be
+        // rejected at decode, not silently accepted as a partially-known
+        // block. The header + checksum are otherwise valid, so this isolates
+        // the flag-mask check from checksum validation. Uses Manifest, which
+        // carries the block_flags byte (SST types omit it entirely).
+        let header = Header {
+            block_type: BlockType::Manifest,
+            block_flags: 1 << 4,
+            checksum: Checksum::from_raw(5),
+            data_length: 10,
+            uncompressed_length: 10,
+        };
+        let bytes = header.encode_into_vec();
+        assert!(
+            matches!(
+                Header::decode_from(&mut &bytes[..]),
+                Err(crate::Error::InvalidTag(("block_flags", _))),
+            ),
+            "decode must reject an unknown block_flags bit",
+        );
     }
 
     #[test]
@@ -284,14 +453,17 @@ mod tests {
     fn block_header_detect_corruption() {
         let header = Header {
             block_type: BlockType::Data,
+            block_flags: 0,
             checksum: Checksum::from_raw(5),
             data_length: 252_356,
             uncompressed_length: 124_124_124,
-            ecc_length: 0,
         };
 
         let mut bytes = header.encode_into_vec();
-        bytes[5] += 1; // mutate block type enum tag
+        // Mutate a header byte (offset 5 is the first checksum byte for a
+        // Data header, which omits the block_flags byte). Any header byte flip
+        // must be caught by the header checksum.
+        bytes[5] += 1;
 
         assert!(
             matches!(

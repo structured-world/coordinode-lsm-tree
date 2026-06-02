@@ -28,7 +28,7 @@
 //! - `error`: `DecryptError` enum with one variant per decode-time
 //!   failure mode (re-exported at the crate's encryption surface).
 //! - `aead` (feature `encryption`): per-suite AEAD dispatch
-//!   (AES-256-GCM, ChaCha20-Poly1305) that takes the 38-byte AAD
+//!   (AES-256-GCM, ChaCha20-Poly1305) that takes the 39-byte AAD
 //!   from `aad::build` and produces / verifies the
 //!   `(nonce, ciphertext, tag)` triple.
 //! - `key_chain`: the `KeyChain` trait + in-memory
