@@ -165,9 +165,10 @@ jobs:
       # dev/bench. Manual git push (rather than a third-party publish
       # action) keeps the workflow's "every `uses:` pinned to a SHA"
       # hardening policy intact and reuses the same App-scoped token the
-      # benchmark-action step uses. Only publishes on main pushes; PR /
-      # workflow_dispatch runs produce the reports as a job artifact path
-      # but do not mutate gh-pages.
+      # benchmark-action step uses. Only publishes on main pushes; on PR /
+      # workflow_dispatch runs the previous step still generates the report
+      # tree in the workspace, but this step is skipped (no artifact upload,
+      # no gh-pages mutation).
       - name: Publish compare-rocksdb overlay reports to gh-pages
         if: >
           steps.bot-token.outputs.token != '' &&
@@ -184,6 +185,11 @@ jobs:
             exit 1
           fi
           work="$(mktemp -d)"
+          # Remove the temp clone on every exit path (success, error, or
+          # cancellation): its .git/config holds the installation token in
+          # plaintext, and uncleaned temp dirs leak disk on a long-lived
+          # self-hosted runner.
+          trap 'rm -rf "$work"' EXIT
           git clone --depth 1 --branch gh-pages \
             "https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git" "$work"
           # Replace the previous report tree wholesale so deleted /
