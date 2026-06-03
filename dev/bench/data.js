@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1780474578144,
+  "lastUpdate": 1780490056646,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -12558,6 +12558,84 @@ window.BENCHMARK_DATA = {
             "value": 452800.3117186018,
             "unit": "ops/sec",
             "extra": "P50: 2.0us | P99: 5.6us | P99.9: 8.6us\nthreads: 1 | elapsed: 0.44s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "a5fb3ed60153a54e91491eae8366258b2334a4ec",
+          "message": "perf(compaction): I/O rate limiter (leaky token bucket) (#389)\n\n## Summary\n\nFirst slice of #133 Phase 4. Adds a token-bucket rate limiter that caps\nhow fast the compaction worker issues I/O, so background compaction\ncan't saturate the device and spike user point-read / range-scan P99.\n\nThe compaction merge loop debits the bucket per written item; when it\ngoes into debt the worker sleeps long enough for the refill rate to\nrepay it, serialising compaction I/O down to the configured bytes/sec.\n\n## Design\n\n- `src/rate_limiter.rs` — clock-injected core `acquire_wait(bytes, now)\n-> Duration` (pure, no syscalls, no_std-usable, unit-testable without\nreal sleeping) + an std blocking wrapper `request(bytes)` behind the std\nfeature. Leaky bucket with debt; burst capped at one second of rate; a\nrate of 0 is unlimited.\n- `Config::compaction_rate_limit` (default 0 = no throttling, no\nbehaviour change) + builder.\n- Wired into the compaction merge loop via `Options::rate_limiter`. Only\nthe compaction loop calls it, so flush and user reads are never\nthrottled. On the unthrottled default path the call is two relaxed\natomic loads.\n\nThe issue sketched an async priority queue, but lsm-tree compaction is\nsynchronous (thread-based, std::sync + StopSignal), so this is a sync\nblocking limiter — the correct shape for the actual execution model.\n\n## Scope / follow-ups (rest of #133 Phase 4 + Phase 3)\n\n- Priority classes (flush / user I/O debiting the bucket but draining\nahead of compaction)\n- Per-tree shared limiter so the cap holds across concurrent compactions\n(currently per-compaction-invocation)\n- Phase 3 adaptive prefetch (separate slice)\n\n## Testing\n\n- 7 unit tests on the limiter core (burst, overdraft wait, refill\naccrual, burst cap, sustained-rate steady state, zero-rate passthrough,\nbackwards-clock guard) — clock injected, no real sleeps\n- nextest --all-features: 1806 passed, 2 skipped (the 2 skips are\npre-existing #[ignore] tests unrelated to this change)\n- clippy --all-features --all-targets clean, fmt clean, rustdoc clean\n\nPart of #133\n\n\n## Related\n- #390 — account blob-relocation bytes in the rate limiter — IMPLEMENTED\nin this PR (debited at the relocation write site in\nRelocatingCompaction::write); Closes #390\n\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n## Summary by CodeRabbit\n\n* **New Features**\n* Added configurable compaction I/O rate limiting to throttle background\ncompaction and relocated blob writes, reducing impact on overall I/O.\n* New configuration knob to set bytes-per-second for compaction\n(defaults to 0 — disabled).\n* Throttling is interruptible so compaction can stop early and commit\nprogress when shutdown is requested.\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-06-03T15:30:58+03:00",
+          "tree_id": "3403ca19f86ced9cfdf4c92f126ac746caec1688",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/a5fb3ed60153a54e91491eae8366258b2334a4ec"
+        },
+        "date": 1780490055028,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 2065683.0187098414,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.6us | P99.9: 3.7us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1214071.327066827,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.3us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 516543.87230771006,
+            "unit": "ops/sec",
+            "extra": "P50: 1.8us | P99: 5.0us | P99.9: 7.5us\nthreads: 1 | elapsed: 0.39s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3616434.7139687645,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 3.0us | P99.9: 5.5us\nthreads: 1 | elapsed: 0.06s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 375512.7518666823,
+            "unit": "ops/sec",
+            "extra": "P50: 2.3us | P99: 5.5us | P99.9: 8.5us\nthreads: 1 | elapsed: 0.53s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 204023.5411134749,
+            "unit": "ops/sec",
+            "extra": "P50: 4.6us | P99: 5.7us | P99.9: 8.8us\nthreads: 1 | elapsed: 0.98s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1232316.6488893693,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.2us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1122587.7371636385,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 1.4us | P99.9: 1.8us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 444593.9307557757,
+            "unit": "ops/sec",
+            "extra": "P50: 2.0us | P99: 6.6us | P99.9: 9.7us\nthreads: 1 | elapsed: 0.45s | num: 200000 | iterations: 3"
           }
         ]
       }
