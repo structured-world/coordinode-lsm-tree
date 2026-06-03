@@ -84,7 +84,10 @@ pub(super) fn prepare_table_writer(
     .use_clip_range_tombstones();
 
     if index_partitioning {
-        table_writer = table_writer.use_partitioned_index();
+        // Size-adaptive index: single-level for small SSTs, spill to a
+        // partitioned index only past the threshold (see flush path).
+        table_writer =
+            table_writer.use_adaptive_index(crate::table::writer::DEFAULT_SPILL_THRESHOLD);
     }
     if filter_partitioning {
         table_writer = table_writer.use_partitioned_filter();

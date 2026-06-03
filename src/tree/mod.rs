@@ -521,7 +521,13 @@ impl AbstractTree for Tree {
         });
 
         if index_partitioning {
-            table_writer = table_writer.use_partitioned_index();
+            // Size-adaptive: single-level index for small SSTs (where pinning
+            // the whole index is cheap and a two-level lookup is pure overhead),
+            // spilling to a partitioned index only once the index grows past the
+            // threshold. Recovers the point-read cost of an unconditional
+            // two-level index on small/medium SSTs.
+            table_writer =
+                table_writer.use_adaptive_index(crate::table::writer::DEFAULT_SPILL_THRESHOLD);
         }
         if filter_partitioning {
             table_writer = table_writer.use_partitioned_filter();

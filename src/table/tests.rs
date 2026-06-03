@@ -499,6 +499,131 @@ fn table_point_read() -> crate::Result<()> {
     )
 }
 
+/// Writes `items` through an adaptive-index writer with the given spill
+/// threshold and recovers the resulting [`Table`]. Returns the table plus
+/// the backing temp dir (kept alive by the caller).
+#[cfg(test)]
+#[expect(clippy::unwrap_used)]
+fn recover_adaptive_table(
+    items: &[crate::InternalValue],
+    spill_threshold: u64,
+) -> crate::Result<(Table, tempfile::TempDir)> {
+    // Writer::new opens the file exclusively, so the path must not exist yet.
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("table");
+
+    let mut writer =
+        Writer::new(path.clone(), 0, 0, Arc::new(StdFs))?.use_adaptive_index(spill_threshold);
+    for item in items {
+        writer.write(item.clone())?;
+    }
+    let (_, checksum) = writer.finish()?.unwrap();
+
+    #[cfg(feature = "metrics")]
+    let metrics = Arc::new(Metrics::default());
+    let table = Table::recover(
+        path,
+        checksum,
+        0,
+        0,
+        Arc::new(Cache::with_capacity_bytes(1_000_000)),
+        Some(Arc::new(DescriptorTable::new(10))),
+        Arc::new(StdFs),
+        false,
+        false,
+        None,
+        #[cfg(zstd_any)]
+        None,
+        crate::comparator::default_comparator(),
+        #[cfg(feature = "metrics")]
+        metrics,
+    )?;
+    Ok((table, dir))
+}
+
+/// Adaptive index, small SST: a high spill threshold keeps the index
+/// single-level (no separate index region), and every key reads back.
+#[test]
+#[expect(clippy::unwrap_used)]
+fn adaptive_index_small_sst_is_single_level() -> crate::Result<()> {
+    let items: Vec<_> = (0u32..500)
+        .map(|i| {
+            let key = format!("key-{i:08}");
+            crate::InternalValue::from_components(
+                key.as_bytes(),
+                b"some-value-payload",
+                0,
+                crate::ValueType::Value,
+            )
+        })
+        .collect();
+
+    // Threshold far above any plausible index size for 500 keys.
+    let (table, _dir) = recover_adaptive_table(&items, u64::MAX)?;
+
+    assert!(
+        table.regions.index.is_none(),
+        "small index must stay single-level (Full), got a two-level index region",
+    );
+    assert_eq!(
+        items.len(),
+        usize::try_from(table.metadata.item_count).unwrap()
+    );
+
+    for i in 0u32..500 {
+        let key = format!("key-{i:08}");
+        let got = table.get(key.as_bytes(), SeqNo::MAX, hash64(key.as_bytes()))?;
+        assert_eq!(
+            b"some-value-payload",
+            &*got.unwrap().value,
+            "single-level read mismatch for {key}",
+        );
+    }
+    Ok(())
+}
+
+/// Adaptive index, forced spill: a zero spill threshold forces the
+/// two-level (partitioned) layout, and the same keys still read back —
+/// proving both layouts round-trip identically.
+#[test]
+#[expect(clippy::unwrap_used)]
+fn adaptive_index_zero_threshold_spills_to_two_level() -> crate::Result<()> {
+    let items: Vec<_> = (0u32..500)
+        .map(|i| {
+            let key = format!("key-{i:08}");
+            crate::InternalValue::from_components(
+                key.as_bytes(),
+                b"some-value-payload",
+                0,
+                crate::ValueType::Value,
+            )
+        })
+        .collect();
+
+    // Threshold 0 → spill on the first index entry → partitioned.
+    let (table, _dir) = recover_adaptive_table(&items, 0)?;
+
+    assert!(
+        table.regions.index.is_some(),
+        "zero threshold must spill to a two-level (partitioned) index",
+    );
+    assert_eq!(
+        items.len(),
+        usize::try_from(table.metadata.item_count).unwrap()
+    );
+
+    for i in 0u32..500 {
+        let key = format!("key-{i:08}");
+        let got = table.get(key.as_bytes(), SeqNo::MAX, hash64(key.as_bytes()))?;
+        assert_eq!(
+            b"some-value-payload",
+            &*got.unwrap().value,
+            "two-level read mismatch for {key}",
+        );
+    }
+    Ok(())
+}
+
 #[test]
 fn table_point_read_index_block_restart_interval() -> crate::Result<()> {
     let items: Vec<_> = (0u32..24)

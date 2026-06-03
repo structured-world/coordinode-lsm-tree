@@ -38,8 +38,14 @@ pub struct MultiWriter {
     data_block_restart_interval: u8,
     index_block_restart_interval: u8,
 
-    use_partitioned_index: bool,
     use_partitioned_filter: bool,
+
+    /// `Some(threshold)` selects the size-adaptive index (single-level
+    /// until the index exceeds `threshold` bytes, then a streaming
+    /// partitioned index). `None` leaves the writer's default single-level
+    /// index. Re-applied to each rotated table writer. Pure
+    /// always-partition is `Some(0)` (spill on the first entry).
+    index_spill_threshold: Option<u64>,
 
     /// Target size of tables in bytes
     ///
@@ -141,8 +147,8 @@ impl MultiWriter {
             data_block_compression: CompressionType::None,
             index_block_compression: CompressionType::None,
 
-            use_partitioned_index: false,
             use_partitioned_filter: false,
+            index_spill_threshold: None,
 
             bloom_policy: BloomConstructionPolicy::default(),
 
@@ -355,9 +361,9 @@ impl MultiWriter {
     }
 
     #[must_use]
-    pub fn use_partitioned_index(mut self) -> Self {
-        self.use_partitioned_index = true;
-        self.writer = self.writer.use_partitioned_index();
+    pub fn use_adaptive_index(mut self, spill_threshold: u64) -> Self {
+        self.index_spill_threshold = Some(spill_threshold);
+        self.writer = self.writer.use_adaptive_index(spill_threshold);
         self
     }
 
@@ -513,8 +519,8 @@ impl MultiWriter {
             .use_bloom_policy(self.bloom_policy)
             .use_data_block_hash_ratio(self.data_block_hash_ratio);
 
-        if self.use_partitioned_index {
-            new_writer = new_writer.use_partitioned_index();
+        if let Some(threshold) = self.index_spill_threshold {
+            new_writer = new_writer.use_adaptive_index(threshold);
         }
         if self.use_partitioned_filter {
             new_writer = new_writer.use_partitioned_filter();
