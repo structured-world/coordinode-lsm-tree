@@ -146,16 +146,20 @@ impl RateLimiter {
     /// until an I/O of `bytes` may proceed, polling `should_stop` so a
     /// shutdown / drop can break a long wait promptly.
     ///
-    /// Returns `true` if `should_stop` fired during the wait (caller should
-    /// abort), `false` if the full wait elapsed (caller may proceed).
+    /// Returns `true` if the caller should abort: either `should_stop` was
+    /// already set on entry (stop pending before any work) or it fired during
+    /// the wait. Returns `false` if the full wait elapsed (caller may
+    /// proceed).
     ///
-    /// The budget is debited exactly once (via a single
-    /// [`acquire_wait`](Self::acquire_wait)); the resulting wait is then
-    /// slept in <= [`POLL_INTERVAL`](Self::POLL_INTERVAL) chunks with a
-    /// `should_stop` check before each, so even a multi-gigabyte item under
-    /// a low limit cannot stall shutdown for more than one poll interval.
-    /// Re-calling `acquire_wait` in the loop would wrongly re-debit the
-    /// bucket each iteration, so the wait is computed once up front.
+    /// The budget is debited at most once (via a single
+    /// [`acquire_wait`](Self::acquire_wait)) — the early returns for
+    /// `rate == 0` and for an already-pending stop skip the debit entirely.
+    /// When a wait is computed it is slept in
+    /// <= [`POLL_INTERVAL`](Self::POLL_INTERVAL) chunks with a `should_stop`
+    /// check before each, so even a multi-gigabyte item under a low limit
+    /// cannot stall shutdown for more than one poll interval. Re-calling
+    /// `acquire_wait` in the loop would wrongly re-debit the bucket each
+    /// iteration, so the wait is computed once up front.
     ///
     /// A no-op returning `false` when the rate is `0` (no clock read).
     /// Only with the `std` feature; `no_std` callers drive `acquire_wait`
