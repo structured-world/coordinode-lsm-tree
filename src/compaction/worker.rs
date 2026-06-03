@@ -584,11 +584,17 @@ fn merge_tables(
             // Pace compaction I/O so it cannot saturate the device and
             // starve user reads. Short-circuits to a single relaxed atomic
             // load when `compaction_rate_limit` is 0 (the default), so the
-            // unthrottled hot path stays cheap. Sum the sizes in u64 with a
-            // saturating add so a pathological item can't overflow `usize`
-            // on 32-bit targets before the cast. The throttle wait is
-            // interruptible by the stop signal so a low limit plus a large
-            // item can't stall tree drop / shutdown for the whole wait.
+            // unthrottled hot path stays cheap. The wait is interruptible by
+            // the stop signal so a low limit plus a large item can't stall
+            // tree drop / shutdown for the whole wait.
+            //
+            // Accounting covers the SST entry's key + value bytes. Each
+            // length is widened to u64 before the add, so there is no
+            // intermediate usize sum; the saturating add only guards the
+            // (practically impossible) u64 overflow. For blob-indirection
+            // (KV-separated) compactions the relocated blob payload is NOT
+            // counted here — `item.value` is only the encoded handle — so
+            // blob-relocation I/O is under-accounted; tracked in #390.
             let io_bytes = (item.key.user_key.len() as u64).saturating_add(item.value.len() as u64);
             if opts
                 .rate_limiter
