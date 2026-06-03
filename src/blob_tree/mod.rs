@@ -513,9 +513,10 @@ impl AbstractTree for BlobTree {
 
         if index_partitioning {
             // Size-adaptive index: single-level for small SSTs, spill to
-            // partitioned only past the threshold (see flush path).
-            table_writer =
-                table_writer.use_adaptive_index(crate::table::writer::DEFAULT_SPILL_THRESHOLD);
+            // partitioned only past the threshold (see flush path). The
+            // threshold is a live runtime config, read off the current snapshot.
+            let rc = self.index.0.runtime_config.load_full();
+            table_writer = table_writer.use_adaptive_index(rc.index_partition_spill_threshold);
         }
         if filter_partitioning {
             table_writer = table_writer.use_partitioned_filter();

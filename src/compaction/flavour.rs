@@ -83,11 +83,17 @@ pub(super) fn prepare_table_writer(
     // Compaction consumes input tables, so clip RTs to each output table's key range.
     .use_clip_range_tombstones();
 
+    // One runtime-config snapshot for the whole writer setup: reading
+    // `load_full()` per field could straddle a concurrent
+    // `update_runtime_config`, letting one SST mix `seqno_in_index` from
+    // snapshot A with `kv_checksums` from snapshot B and breaking the
+    // single-snapshot-per-compaction contract.
+    let rc = opts.runtime_config.load_full();
+
     if index_partitioning {
         // Size-adaptive index: single-level for small SSTs, spill to a
         // partitioned index only past the threshold (see flush path).
-        table_writer =
-            table_writer.use_adaptive_index(crate::table::writer::DEFAULT_SPILL_THRESHOLD);
+        table_writer = table_writer.use_adaptive_index(rc.index_partition_spill_threshold);
     }
     if filter_partitioning {
         table_writer = table_writer.use_partitioned_filter();
@@ -96,13 +102,6 @@ pub(super) fn prepare_table_writer(
     #[expect(clippy::cast_possible_truncation, reason = "max key size = u16")]
     let last_level = (version.level_count() - 1) as u8;
     let is_last_level = payload.dest_level == last_level;
-
-    // One runtime-config snapshot for the whole writer setup: reading
-    // `load_full()` per field could straddle a concurrent
-    // `update_runtime_config`, letting one SST mix `seqno_in_index` from
-    // snapshot A with `kv_checksums` from snapshot B and breaking the
-    // single-snapshot-per-compaction contract.
-    let rc = opts.runtime_config.load_full();
 
     let table_writer = table_writer
         .use_data_block_restart_interval(data_block_restart_interval)

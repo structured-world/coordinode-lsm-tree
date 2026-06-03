@@ -540,6 +540,22 @@ pub struct RuntimeConfig {
     /// keep their original `index_format`. Compaction migrates source
     /// SSTs to the current setting over time.
     pub seqno_in_index: bool,
+
+    /// Index-size threshold (bytes) at or below which an SST's block index
+    /// is written single-level; above it the index spills to a two-level
+    /// (partitioned) layout. A single-level index is one block that the
+    /// reader pins whole, so a point read costs one index lookup — cheap
+    /// while the index is small. Past the threshold, partitioning bounds
+    /// resident index RAM (only the top-level index stays pinned) at the
+    /// cost of an extra per-lookup level.
+    ///
+    /// Default 256 KiB keeps typical SSTs single-level (matching the
+    /// point-read profile where single-level is both faster and
+    /// memory-cheap) while genuinely large indexes still partition. Takes
+    /// effect on the next flush / compaction; existing SSTs keep their
+    /// original layout (each SST self-describes it). `0` forces always-
+    /// partition (spill on the first index entry).
+    pub index_partition_spill_threshold: u64,
 }
 
 impl Default for RuntimeConfig {
@@ -555,6 +571,7 @@ impl Default for RuntimeConfig {
             data_block_ecc_override: None,
             kv_checksums_ecc_override: None,
             seqno_in_index: false,
+            index_partition_spill_threshold: crate::table::writer::DEFAULT_SPILL_THRESHOLD,
         }
     }
 }
@@ -862,6 +879,17 @@ mod tests {
         // format. A regression flipping this default would change the
         // on-disk index layout for every existing tree.
         assert!(!RuntimeConfig::default().seqno_in_index);
+    }
+
+    #[test]
+    fn runtime_config_default_index_partition_spill_threshold_is_256kib() {
+        // Default keeps typical SSTs single-level (fast point reads) while
+        // large indexes still partition. A regression here would change the
+        // index layout — and thus point-read cost — of newly written SSTs.
+        assert_eq!(
+            RuntimeConfig::default().index_partition_spill_threshold,
+            256 * 1024,
+        );
     }
 
     #[test]
