@@ -54,6 +54,10 @@ pub struct TreeInner {
     /// [`version_history`](Self::version_history) via
     /// [`SuperVersions::latest_handle`]). The point-read hot path loads this
     /// for `MAX_SEQNO` reads instead of taking the history `RwLock`.
+    ///
+    /// `std`-only: `arc-swap` is not `#![no_std]`, so the lock-free mirror is
+    /// absent under no-std and point reads fall back to the history `RwLock`.
+    #[cfg(feature = "std")]
     pub(crate) latest_super_version: Arc<arc_swap::ArcSwap<crate::version::SuperVersion>>,
 
     pub(crate) compaction_state: Arc<Mutex<CompactionState>>,
@@ -138,6 +142,7 @@ impl TreeInner {
         let sync_mode = config.sync_mode;
 
         let super_versions = SuperVersions::new(version, &comparator, sync_mode);
+        #[cfg(feature = "std")]
         let latest_super_version = super_versions.latest_handle();
 
         Ok(Self {
@@ -147,6 +152,7 @@ impl TreeInner {
             blob_file_id_counter: SequenceNumberCounter::default(),
             config: Arc::new(config),
             version_history: Arc::new(RwLock::new(super_versions)),
+            #[cfg(feature = "std")]
             latest_super_version,
             stop_signal: StopSignal::default(),
             major_compaction_lock: RwLock::default(),

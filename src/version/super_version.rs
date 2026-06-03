@@ -10,6 +10,7 @@ use crate::{
     tree::sealed::SealedMemtables,
     version::{Version, persist_version},
 };
+#[cfg(feature = "std")]
 use arc_swap::ArcSwap;
 use std::{collections::VecDeque, path::Path, sync::Arc};
 
@@ -48,6 +49,11 @@ pub struct SuperVersions {
     /// inserts remain visible through it because they mutate the shared
     /// `active_memtable` behind a stable `Arc` — the back only changes on
     /// flush / compaction.
+    ///
+    /// `std`-only: `arc-swap` is not `#![no_std]`. A no-std build (where
+    /// `SuperVersions` is already std-bound for other reasons) simply does
+    /// without the lock-free mirror.
+    #[cfg(feature = "std")]
     latest: Arc<ArcSwap<SuperVersion>>,
 }
 
@@ -63,6 +69,7 @@ impl SuperVersions {
         };
 
         Self {
+            #[cfg(feature = "std")]
             latest: Arc::new(ArcSwap::from_pointee(initial.clone())),
             versions: vec![initial].into(),
             comparator_name,
@@ -225,12 +232,14 @@ impl SuperVersions {
     pub fn append_version(&mut self, version: SuperVersion) {
         // Mirror the new back into the lock-free latest pointer so point
         // reads at MAX_SEQNO see it without taking the history lock.
+        #[cfg(feature = "std")]
         self.latest.store(Arc::new(version.clone()));
         self.versions.push_back(version);
     }
 
     pub fn replace_latest_version(&mut self, version: SuperVersion) {
         if self.versions.pop_back().is_some() {
+            #[cfg(feature = "std")]
             self.latest.store(Arc::new(version.clone()));
             self.versions.push_back(version);
         }
@@ -248,6 +257,9 @@ impl SuperVersions {
     /// Crate-internal: exposing the `ArcSwap` publicly would let a downstream
     /// caller `store()` into it without the version-history write lock,
     /// breaking the "mirror only changes at back-changing sites" invariant.
+    ///
+    /// `std`-only: the mirror exists only when `arc-swap` is available.
+    #[cfg(feature = "std")]
     #[must_use]
     pub(crate) fn latest_handle(&self) -> Arc<ArcSwap<SuperVersion>> {
         Arc::clone(&self.latest)
@@ -305,6 +317,7 @@ mod tests {
     }
 
     fn test_super_versions(versions: Vec<SuperVersion>) -> SuperVersions {
+        #[cfg(feature = "std")]
         #[expect(
             clippy::expect_used,
             reason = "test helper: every caller passes a non-empty version list"
@@ -319,6 +332,7 @@ mod tests {
             versions: versions.into(),
             comparator_name: "default".into(),
             sync_mode: SyncMode::Normal,
+            #[cfg(feature = "std")]
             latest,
         }
     }

@@ -248,14 +248,20 @@ impl AbstractTree for Tree {
         // Recent inserts stay visible because they mutate the shared
         // `active_memtable` behind a stable Arc; the back only changes on
         // flush / compaction, which refresh this mirror under the write lock.
-        let latest = self.latest_super_version.load();
-        if seqno > latest.seqno {
-            return Self::get_internal_entry_from_version(
-                &latest,
-                key,
-                seqno,
-                self.config.comparator.as_ref(),
-            );
+        //
+        // std-only: the mirror needs `arc-swap` (not no_std). Under no-std we
+        // skip straight to the history RwLock path below.
+        #[cfg(feature = "std")]
+        {
+            let latest = self.latest_super_version.load();
+            if seqno > latest.seqno {
+                return Self::get_internal_entry_from_version(
+                    &latest,
+                    key,
+                    seqno,
+                    self.config.comparator.as_ref(),
+                );
+            }
         }
 
         // Historical snapshot read (seqno <= latest.seqno): consult the locked
@@ -2093,6 +2099,7 @@ impl Tree {
         let initial_runtime = config.initial_runtime_config.clone();
         let sync_mode = config.sync_mode;
         let super_versions = SuperVersions::new(version, &comparator, sync_mode);
+        #[cfg(feature = "std")]
         let latest_super_version = super_versions.latest_handle();
         let inner = TreeInner {
             id: tree_id,
@@ -2100,6 +2107,7 @@ impl Tree {
             table_id_counter: SequenceNumberCounter::new(highest_table_id + 1),
             blob_file_id_counter: SequenceNumberCounter::default(),
             version_history: Arc::new(RwLock::new(super_versions)),
+            #[cfg(feature = "std")]
             latest_super_version,
             stop_signal: StopSignal::default(),
             config: Arc::new(config),

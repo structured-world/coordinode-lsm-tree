@@ -110,11 +110,11 @@ bytes = { version = "1", optional = true }
 byteorder = { package = "byteorder-lite", version = "0.1.0", default-features = false }
 byteview = "~0.10.1"
 # Lockless atomic snapshot for RuntimeConfig (see src/runtime_config/).
-# std-bound — `RuntimeConfigHandle` is gated behind the `std` feature,
-# and so is this dep. Without `std`, only `runtime_config::types`
-# (alloc-friendly POD data) compiles, keeping the no-std-check job
-# from regressing on this crate's behalf. Types stay reachable from
-# downstream no_std consumers (block decoders, format constants).
+# Lock-free atomic Arc swap. `arc-swap` 1.x is NOT `#![no_std]` (it requires
+# `std`), so it stays an optional dependency enabled only by the `std`
+# feature. Both its consumers — `RuntimeConfigHandle` and the version
+# latest-`SuperVersion` mirror on the point-read fast path — gate their use
+# behind `#[cfg(feature = "std")]` so the no-std-check job never sees it.
 arc-swap = { version = "1.9", optional = true }
 enum_dispatch = "0.3.13"
 log = "0.4.30"
