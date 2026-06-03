@@ -244,8 +244,12 @@ impl SuperVersions {
     /// [`append_version`](Self::append_version) /
     /// [`replace_latest_version`](Self::replace_latest_version) under the
     /// history write lock.
+    ///
+    /// Crate-internal: exposing the `ArcSwap` publicly would let a downstream
+    /// caller `store()` into it without the version-history write lock,
+    /// breaking the "mirror only changes at back-changing sites" invariant.
     #[must_use]
-    pub fn latest_handle(&self) -> Arc<ArcSwap<SuperVersion>> {
+    pub(crate) fn latest_handle(&self) -> Arc<ArcSwap<SuperVersion>> {
         Arc::clone(&self.latest)
     }
 
