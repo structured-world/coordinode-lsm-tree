@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1780433073580,
+  "lastUpdate": 1780474578144,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -12480,6 +12480,84 @@ window.BENCHMARK_DATA = {
             "value": 449052.7978901416,
             "unit": "ops/sec",
             "extra": "P50: 2.0us | P99: 5.5us | P99.9: 7.9us\nthreads: 1 | elapsed: 0.45s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "98d472ba1cc2da8c89271c64c1d32dad5651de82",
+          "message": "perf(io): drop cold-level SST output from the page cache after write (#392)\n\n## Summary\n\nWires the previously-unused `FileHint::WriteOnce` (POSIX_FADV_DONTNEED).\nUntil now only `FileHint::Sequential` was applied anywhere; `WriteOnce`\nwas defined in the Fs layer but never called.\n\nAfter the table writer syncs an output SST, if the SST level is >= 1\n(compaction product), it advises the kernel to drop the just-written\npages from the OS page cache. Cold compaction output isn't read back\nimmediately, so pinning its pages only evicts hot pages of files still\nserving reads, hurting read P99. L0 (flush output) is intentionally left\ncached because freshly written keys are often read back soon.\n\n## Details\n\n- Single call site: src/table/writer/mod.rs finish, right after\nsync_all_with, gated on initial_level >= 1.\n- Best-effort / advisory: hint() failures are ignored. The engine\nBlockCache is unaffected, so no correctness impact, purely a page-cache\nresidency hint.\n\n## Testing\n\n- nextest --all-features: 1799 passed, 2 skipped (clean single run)\n- clippy --all-features --all-targets clean, fmt clean, rustdoc clean\n\nThe hint is advisory and unobservable in functional results (consistent\nwith the existing untested FileHint::Sequential site), so no dedicated\nassertion test is added; the full suite confirms no regression.\n\nPart of #133. Closes #391\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n\n## Summary by CodeRabbit\n\n* **Chores**\n* Optimized file synchronization and page cache handling in write\noperations for improved performance.\n\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-06-03T11:14:30+03:00",
+          "tree_id": "c599b27eb97b9ae6838838b93562d5ff2f3571d8",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/98d472ba1cc2da8c89271c64c1d32dad5651de82"
+        },
+        "date": 1780474576573,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 2044739.7021311126,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.6us | P99.9: 3.7us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1218650.0299489337,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.2us | P99.9: 4.3us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 511379.93325760594,
+            "unit": "ops/sec",
+            "extra": "P50: 1.8us | P99: 5.1us | P99.9: 7.6us\nthreads: 1 | elapsed: 0.39s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3661888.128475441,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 3.0us | P99.9: 5.5us\nthreads: 1 | elapsed: 0.05s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 383589.4090879761,
+            "unit": "ops/sec",
+            "extra": "P50: 2.3us | P99: 5.7us | P99.9: 8.5us\nthreads: 1 | elapsed: 0.52s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 202727.44558743664,
+            "unit": "ops/sec",
+            "extra": "P50: 4.6us | P99: 5.8us | P99.9: 8.2us\nthreads: 1 | elapsed: 0.99s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1242007.3489202233,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.2us | P99.9: 4.3us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1104565.9686450392,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.5us | P99.9: 2.2us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 452800.3117186018,
+            "unit": "ops/sec",
+            "extra": "P50: 2.0us | P99: 5.6us | P99.9: 8.6us\nthreads: 1 | elapsed: 0.44s | num: 200000 | iterations: 3"
           }
         ]
       }
