@@ -154,6 +154,27 @@ jobs:
       # Runner requirement: librocksdb-sys builds from source via bindgen,
       # so the host must have a C/C++ toolchain + libclang. On Linux
       # bindgen finds the distro libclang.so without env-var help.
+      # Pre-flight: librocksdb-sys builds C bindings via bindgen -> clang-sys,
+      # which needs libclang + llvm-config on the host. When they are absent the
+      # raw failure is a deep, cryptic clang-sys build-script panic. Fail early
+      # with an actionable message naming the exact packages to install on the
+      # self-hosted runner instead.
+      - name: Verify libclang toolchain (compare-rocksdb prerequisite)
+        run: |
+          # Detection covers: llvm-config on PATH (Fedora/most), explicit
+          # LIBCLANG_PATH, direct lib dirs (/usr/lib64 on Fedora), Debian/Ubuntu
+          # multiarch (/usr/lib/x86_64-linux-gnu) + llvm-* dirs via the nested
+          # glob, and finally ldconfig -p (the robust Linux probe that finds
+          # libclang wherever the dynamic linker registered it).
+          if ! command -v llvm-config >/dev/null 2>&1 \
+             && [ -z "${LLVM_CONFIG_PATH:-}" ] \
+             && [ -z "${LIBCLANG_PATH:-}" ] \
+             && ! ls /usr/lib*/libclang.so* /usr/lib*/*/libclang.so* >/dev/null 2>&1 \
+             && ! { command -v ldconfig >/dev/null 2>&1 && ldconfig -p | grep -q libclang; }; then
+            echo "::error::libclang/llvm-config not found on the bench runner. compare-rocksdb (librocksdb-sys -> bindgen -> clang-sys) cannot build. Install LLVM dev tools on the runner host: Fedora 'dnf install -y clang clang-devel llvm llvm-devel', Debian/Ubuntu 'apt-get install -y clang libclang-dev llvm-dev', or set LIBCLANG_PATH/LLVM_CONFIG_PATH."
+            exit 1
+          fi
+
       - name: Run compare-rocksdb head-to-head benches
         run: |
           cd tools/compare-rocksdb
@@ -170,10 +191,19 @@ jobs:
       # tree in the workspace, but this step is skipped (no artifact upload,
       # no gh-pages mutation).
       - name: Publish compare-rocksdb overlay reports to gh-pages
+        # Publish on main pushes AND on manual workflow_dispatch. The overlay is
+        # a ratio SNAPSHOT (dev/compare is replaced wholesale each run), not the
+        # per-commit trend that dev/bench is — so a manual dispatch refreshing it
+        # can't contaminate any time series. This lets a maintainer populate the
+        # overlays on demand (e.g. right after a runner fix) without waiting for
+        # the next merge to main. The db_bench trend (benchmark-action auto-push /
+        # save-data above) stays push+main only.
         if: >
           steps.bot-token.outputs.token != '' &&
-          github.event_name == 'push' &&
-          github.ref == 'refs/heads/main'
+          (
+            (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+            github.event_name == 'workflow_dispatch'
+          )
         env:
           GH_TOKEN: ${{ steps.bot-token.outputs.token }}
           REPO: ${{ github.repository }}
@@ -214,10 +244,61 @@ jobs:
           rm -rf "$work/dev/compare"
           mkdir -p "$work/dev/compare"
           cp -R "$src/." "$work/dev/compare/"
+          # Landing gallery: Criterion's own dev/compare/report/index.html is a
+          # FLAT LIST of individual benchmarks with no overlay charts on it — a
+          # visitor lands there and sees links, not the head-to-head. The actual
+          # ours-vs-rocksdb overlays are Criterion's per-group `lines.svg`
+          # (X=element count, one line per engine), buried under
+          # <scenario>/report/. Generate a single landing page at
+          # dev/compare/index.html that embeds every scenario's lines.svg inline,
+          # so the head-to-head is the first thing shown.
+          gallery="$work/dev/compare/index.html"
+          {
+            cat <<'HTML_HEAD'
+          <!doctype html><html lang="en"><head><meta charset="utf-8">
+          <meta name="viewport" content="width=device-width, initial-scale=1">
+          <title>lsm-tree vs RocksDB — head-to-head</title>
+          <style>
+            body{font-family:system-ui,-apple-system,sans-serif;max-width:1080px;margin:2rem auto;padding:0 1rem;background:#0d1117;color:#c9d1d9}
+            h1{font-size:1.5rem} h2{font-size:1.1rem;margin:0 0 .5rem}
+            a{color:#58a6ff;text-decoration:none} a:hover{text-decoration:underline}
+            .intro{color:#8b949e;font-size:.95rem;line-height:1.5}
+            .scenario{margin:1.5rem 0;padding-bottom:1rem;border-bottom:1px solid #30363d}
+            .scenario img{max-width:100%;background:#fff;border-radius:6px;padding:6px}
+            .links{font-size:.85rem;color:#8b949e}
+          </style></head><body>
+          <h1>lsm-tree vs RocksDB — head-to-head overlays</h1>
+          <p class="intro">Each chart overlays <strong>ours</strong> against <strong>rocksdb</strong> on the
+          same axes (X = element count, Y = average time; <strong>lower is faster</strong>). Generated by the
+          <code>compare-rocksdb</code> harness — both engines run in the same process per scenario.
+          &nbsp;&middot;&nbsp; <a href="../bench/">single-engine db_bench trend &rarr;</a>
+          &nbsp;&middot;&nbsp; <a href="report/">raw criterion index &rarr;</a></p>
+          HTML_HEAD
+            for d in "$work"/dev/compare/*/; do
+              name="$(basename "$d")"
+              [ -f "$d/report/lines.svg" ] || continue
+              printf '<div class="scenario"><h2>%s</h2><a href="%s/report/"><img src="%s/report/lines.svg" alt="%s overlay" loading="lazy"></a><div class="links"><a href="%s/report/">full report (violin, regression, per-size) &rarr;</a></div></div>\n' \
+                "$name" "$name" "$name" "$name" "$name"
+            done
+            echo '</body></html>'
+          } > "$gallery"
+          # Cross-link banner: the db_bench dashboard (dev/bench/index.html) is
+          # regenerated by benchmark-action on every main push and has no link to
+          # the overlay reports, so visitors never discover dev/compare. Inject a
+          # banner pointing at the overlays right after <body>. Idempotent via the
+          # marker id; awk (not sed) avoids `&`/`/` escaping pitfalls in the HTML.
+          bench_index="$work/dev/bench/index.html"
+          if [ -f "$bench_index" ] && ! grep -q "compare-overlay-banner" "$bench_index"; then
+            banner='<div id="compare-overlay-banner" style="padding:8px 14px;background:#0d1117;color:#c9d1d9;font-family:system-ui,sans-serif;border-bottom:1px solid #30363d;font-size:14px">&#128202; <strong>lsm-tree benchmarks</strong> &nbsp;&middot;&nbsp; you are viewing the single-engine db_bench trend &nbsp;&middot;&nbsp; <a href="../compare/" style="color:#58a6ff;font-weight:600">RocksDB head-to-head overlays &rarr;</a></div>'
+            awk -v b="$banner" 'BEGIN{done=0} {print} /<body/ && !done {print b; done=1}' "$bench_index" > "$bench_index.tmp" \
+              && mv "$bench_index.tmp" "$bench_index"
+          fi
           cd "$work"
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add dev/compare
+          # Stage the banner edit too (file may be absent on a first-ever run).
+          git add dev/bench/index.html 2>/dev/null || true
           if git diff --cached --quiet; then
             echo "::notice::compare-rocksdb reports unchanged — nothing to publish"
           else
