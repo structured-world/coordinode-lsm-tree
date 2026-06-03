@@ -18,6 +18,7 @@ use lsm_tree::{
     config::{BlockSizePolicy, PinningPolicy},
     get_tmp_folder,
     inspect::{IndexEntry, read_top_level_index_entries},
+    runtime_config::RuntimeConfig,
 };
 use std::{fs::OpenOptions, io::Write, path::Path};
 use test_log::test;
@@ -51,6 +52,17 @@ fn key_for(i: usize) -> String {
     format!("key-{i:08}")
 }
 
+/// Runtime config that forces the size-adaptive index writer to spill
+/// to a two-level (partitioned) layout immediately. A `0` spill
+/// threshold makes the very first registered data block exceed it, so
+/// the index is partitioned regardless of corpus size — exactly the
+/// shape this blast-radius test must exercise.
+fn force_partitioned_runtime() -> RuntimeConfig {
+    let mut rc = RuntimeConfig::default();
+    rc.index_partition_spill_threshold = 0;
+    rc
+}
+
 /// Builds a single-SST tree with a partitioned index that has many
 /// sub-index partitions, returns (dir, sst_path, total_items).
 fn build_partitioned_tree() -> (tempfile::TempDir, std::path::PathBuf, usize) {
@@ -60,7 +72,8 @@ fn build_partitioned_tree() -> (tempfile::TempDir, std::path::PathBuf, usize) {
     // Small data blocks → many data blocks → many index handles →
     // many sub-index partitions (the partition-size budget is the
     // hardcoded 4 KiB in the writer; we shrink the data block side
-    // to fit dozens of partitions in a reasonable corpus).
+    // to fit dozens of partitions in a reasonable corpus). The
+    // zero spill threshold guarantees the index actually partitions.
     let tree = Config::new(
         dir.path(),
         SequenceNumberCounter::default(),
@@ -68,6 +81,7 @@ fn build_partitioned_tree() -> (tempfile::TempDir, std::path::PathBuf, usize) {
     )
     .index_block_partitioning_policy(PinningPolicy::all(true))
     .data_block_size_policy(BlockSizePolicy::all(256))
+    .with_runtime_config(force_partitioned_runtime())
     .open()
     .unwrap();
 
@@ -89,6 +103,7 @@ fn reopen_partitioned(dir: &Path) -> lsm_tree::AnyTree {
     )
     .index_block_partitioning_policy(PinningPolicy::all(true))
     .data_block_size_policy(BlockSizePolicy::all(256))
+    .with_runtime_config(force_partitioned_runtime())
     .open()
     .expect("table reopen should succeed")
 }

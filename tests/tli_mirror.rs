@@ -8,9 +8,21 @@
 
 use lsm_tree::{
     AbstractTree, Config, SequenceNumberCounter, config::PinningPolicy, get_tmp_folder,
+    runtime_config::RuntimeConfig,
 };
 use std::{fs::OpenOptions, io::Write, path::Path};
 use test_log::test;
+
+/// Runtime config that forces the size-adaptive index writer to spill
+/// to a two-level (partitioned) layout immediately, so these tests
+/// exercise the `read_tli` branch rather than the volatile-full branch
+/// (which bypasses `read_tli` entirely). A `0` spill threshold makes
+/// the first registered data block exceed it.
+fn force_partitioned_runtime() -> RuntimeConfig {
+    let mut rc = RuntimeConfig::default();
+    rc.index_partition_spill_threshold = 0;
+    rc
+}
 
 fn find_table_file(dir: &Path) -> std::path::PathBuf {
     let tables_dir = dir.join("tables");
@@ -60,6 +72,7 @@ fn build_partitioned_tree(items: usize) -> (tempfile::TempDir, std::path::PathBu
         SequenceNumberCounter::default(),
     )
     .index_block_partitioning_policy(PinningPolicy::all(true))
+    .with_runtime_config(force_partitioned_runtime())
     .open()
     .unwrap();
 
@@ -79,6 +92,7 @@ fn reopen_partitioned(dir: &Path) -> lsm_tree::AnyTree {
         SequenceNumberCounter::default(),
     )
     .index_block_partitioning_policy(PinningPolicy::all(true))
+    .with_runtime_config(force_partitioned_runtime())
     .open()
     .expect("table open should succeed")
 }
@@ -181,6 +195,7 @@ fn table_open_fails_when_both_tli_copies_are_zeroed() {
         SequenceNumberCounter::default(),
     )
     .index_block_partitioning_policy(PinningPolicy::all(true))
+    .with_runtime_config(force_partitioned_runtime())
     .open();
 
     assert!(

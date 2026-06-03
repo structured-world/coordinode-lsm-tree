@@ -10,6 +10,7 @@ use lsm_tree::{
     AbstractTree, Config, SequenceNumberCounter,
     compression::CompressionType,
     config::{CompressionPolicy, PinningPolicy},
+    runtime_config::RuntimeConfig,
 };
 use std::process::Command;
 
@@ -183,18 +184,25 @@ fn dump_keys_only_omits_value_column() {
 /// the path live.
 fn build_partitioned_index_sst(item_count: u64) -> (tempfile::TempDir, std::path::PathBuf) {
     let dir = tempfile::tempdir().expect("tempdir");
+    // Force a two-level (partitioned) index on every flush so the SST
+    // emits a separate `index` SFA section instead of an inline
+    // single-block top-level index. The index writer is size-adaptive:
+    // it stays single-level until the buffered index exceeds the spill
+    // threshold, then spills to a streaming partitioned layout. A
+    // threshold of `0` makes it spill immediately, guaranteeing the
+    // partitioned shape regardless of key count.
+    let mut runtime = RuntimeConfig::default();
+    runtime.index_partition_spill_threshold = 0;
     let tree = Config::new(
         dir.path(),
         SequenceNumberCounter::default(),
         SequenceNumberCounter::default(),
     )
     .data_block_compression_policy(CompressionPolicy::all(CompressionType::None))
-    // Force partitioned-index on every level so the flushed SST
-    // emits a separate `index` SFA section instead of a single
-    // top-level index block. `PinningPolicy::all(true)` returns a
-    // pin-everything policy, which the writer interprets as
-    // "partition the index at every level".
+    // Enables the adaptive index writer; the spill threshold above
+    // then decides single-level vs partitioned.
     .index_block_partitioning_policy(PinningPolicy::all(true))
+    .with_runtime_config(runtime)
     .open()
     .expect("open tree");
 
@@ -223,10 +231,10 @@ fn dump_partitioned_index_sst_returns_unsupported_error() {
     // SSTs into the full-index code path is caught here instead of
     // producing wrong dumps.
     //
-    // The partitioned-index writer always emits a separate `index`
-    // SFA section even with a tiny key count (the section starts on
-    // the first call to `write_top_level_index`, before any
-    // splitting decision); 256 entries is a comfortable count that
+    // The fixture forces a spill threshold of `0`, so the adaptive
+    // index writer spills to the streaming partitioned layout on the
+    // first registered block and emits a separate `index` SFA section
+    // regardless of key count; 256 entries is a comfortable count that
     // also actually exercises a multi-partition layout so the test
     // covers the same writer path real workloads use, not a
     // degenerate single-partition shape.
