@@ -275,7 +275,10 @@ impl Writer {
             .use_partition_size(self.meta_partition_size)
             .use_restart_interval(self.index_block_restart_interval)
             .use_encryption(self.encryption.clone())
-            .use_table_id(self.table_id);
+            .use_table_id(self.table_id)
+            // Reapply page_ecc — swapping the index writer would otherwise drop
+            // a flag set earlier in the builder chain (order-independence).
+            .use_page_ecc(self.page_ecc);
         self
     }
 
@@ -292,7 +295,12 @@ impl Writer {
             .use_partition_size(self.meta_partition_size)
             .use_restart_interval(self.index_block_restart_interval)
             .use_encryption(self.encryption.clone())
-            .use_table_id(self.table_id);
+            .use_table_id(self.table_id)
+            // Swapping in a fresh index writer drops any flag set earlier in the
+            // builder chain; reapply page_ecc so it survives regardless of call
+            // order (otherwise the table mixes ECC and non-ECC index blocks
+            // while `Writer` still records ECC as enabled).
+            .use_page_ecc(self.page_ecc);
         self
     }
 
