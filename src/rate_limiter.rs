@@ -278,6 +278,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "std")]
     #[test]
     fn request_interruptible_bails_out_before_sleeping_when_stopped() {
         // 1 B/s with a 1 MiB request implies an ~12-day wait. With
@@ -294,6 +295,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "std")]
     #[test]
     fn request_interruptible_zero_rate_is_immediate_passthrough() {
         let rl = RateLimiter::new(0);
