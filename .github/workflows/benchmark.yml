@@ -167,6 +167,7 @@ jobs:
           # glob, and finally ldconfig -p (the robust Linux probe that finds
           # libclang wherever the dynamic linker registered it).
           if ! command -v llvm-config >/dev/null 2>&1 \
+             && [ -z "${LLVM_CONFIG_PATH:-}" ] \
              && [ -z "${LIBCLANG_PATH:-}" ] \
              && ! ls /usr/lib*/libclang.so* /usr/lib*/*/libclang.so* >/dev/null 2>&1 \
              && ! { command -v ldconfig >/dev/null 2>&1 && ldconfig -p | grep -q libclang; }; then
