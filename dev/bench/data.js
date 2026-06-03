@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1780490056646,
+  "lastUpdate": 1780503690801,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -12636,6 +12636,84 @@ window.BENCHMARK_DATA = {
             "value": 444593.9307557757,
             "unit": "ops/sec",
             "extra": "P50: 2.0us | P99: 6.6us | P99.9: 9.7us\nthreads: 1 | elapsed: 0.45s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "4a84ce4a4f078008a430e1c4a9e083d23c3d245a",
+          "message": "perf(read): lock-free latest-version fast path for point reads (#394)\n\n## Summary\n\nAttacks the measured point_read ~1.5x gap vs RocksDB. Every point read\nat MAX_SEQNO took version_history.read() (a RwLock) plus\nget_version_for_snapshot, which clones the SuperVersion (atomic refcount\nbumps on active_memtable / sealed_memtables / version). On the warm read\nhot path that lock + multi-Arc-clone per get is pure overhead.\n\nAdapted from RocksDB's DBImpl::GetImpl, which keeps a thread-local\ncached SuperVersion and only re-locks when the version changed.\n\n## Change\n\n- SuperVersions holds an Arc<ArcSwap<SuperVersion>> mirroring the latest\n(back) version, shared with the Tree via latest_handle().\n- A read at seqno > latest.seqno (always true for MAX_SEQNO, the common\ncase) loads the mirror lock-free (one atomic, no RwLock, no deque\nclone). This is exactly the version get_version_for_snapshot would\nreturn (it yields the latest iff latest.seqno < seqno).\n- Historical snapshot reads (seqno <= latest.seqno) keep the locked\npath.\n\n## Correctness\n\n- The mirror is refreshed under the existing write lock at the only\nthree sites that change the back of the version deque: construction,\nappend_version, replace_latest_version. GC pop_front only removes the\nfront, never the back.\n- Recent inserts stay visible because they mutate the shared\nactive_memtable behind a stable Arc; the back only changes on flush /\ncompaction, which refresh the mirror.\n- A read may observe a version one install behind a concurrent\nflush/compaction, identical to the prior RwLock semantics; snapshot\nconsistency is preserved.\n\n## Testing\n\n- cargo nextest run --all-features: 1799 passed, 2 skipped (clean single\nrun), exercising both the lock-free and historical paths.\n- clippy --all-features --all-targets clean, fmt clean, rustdoc clean.\n\nPart of the point_read perf work. Closes #393\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n## Summary by CodeRabbit\n\n* **Performance**\n* Adds a lock-free fast path that mirrors the latest data snapshot to\nspeed point reads of the most-recent state, reducing latency under high\nread workloads while preserving historical read behavior.\n* **Documentation**\n* Clarifies rationale for optional arc-swap usage and its conditional\nscope.\n* **Tests**\n* Updates test helper initialization to account for the new\nlatest-snapshot mirror.\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-06-03T17:29:18+03:00",
+          "tree_id": "dc7162704d8e7cf1dbd0e98b9a2134bd2c82145c",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/4a84ce4a4f078008a430e1c4a9e083d23c3d245a"
+        },
+        "date": 1780503689133,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 2147930.5086915903,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.6us | P99.9: 3.6us\nthreads: 1 | elapsed: 0.09s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1225274.947103349,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.2us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 515600.41077472246,
+            "unit": "ops/sec",
+            "extra": "P50: 1.8us | P99: 5.0us | P99.9: 7.5us\nthreads: 1 | elapsed: 0.39s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3646128.2994156806,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 3.0us | P99.9: 5.5us\nthreads: 1 | elapsed: 0.05s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 381645.62314363633,
+            "unit": "ops/sec",
+            "extra": "P50: 2.3us | P99: 5.6us | P99.9: 8.3us\nthreads: 1 | elapsed: 0.52s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 203677.9678609202,
+            "unit": "ops/sec",
+            "extra": "P50: 4.6us | P99: 5.7us | P99.9: 8.3us\nthreads: 1 | elapsed: 0.98s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1149200.4139327954,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.2us | P99.9: 4.3us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1121170.1500376803,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 1.5us | P99.9: 1.9us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 456377.20432100765,
+            "unit": "ops/sec",
+            "extra": "P50: 2.0us | P99: 5.4us | P99.9: 8.0us\nthreads: 1 | elapsed: 0.44s | num: 200000 | iterations: 3"
           }
         ]
       }
