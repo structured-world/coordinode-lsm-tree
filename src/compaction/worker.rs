@@ -73,6 +73,12 @@ pub struct Options {
     /// AEAD pipeline the data blocks use.
     pub encryption: Option<Arc<dyn crate::encryption::EncryptionProvider>>,
 
+    /// Per-compaction I/O rate limiter. Built from
+    /// [`Config::compaction_rate_limit`]; a limit of `0` makes every
+    /// request immediate (no throttling). Only the compaction merge loop
+    /// calls it, so flush and user reads are never throttled.
+    pub rate_limiter: Arc<crate::rate_limiter::RateLimiter>,
+
     #[cfg(feature = "metrics")]
     pub metrics: Arc<Metrics>,
 }
@@ -94,6 +100,9 @@ impl Options {
             compaction_state: tree.compaction_state.clone(),
             runtime_config: tree.runtime_config.clone(),
             encryption: tree.config.encryption.clone(),
+            rate_limiter: Arc::new(crate::rate_limiter::RateLimiter::new(
+                tree.config.compaction_rate_limit,
+            )),
 
             #[cfg(feature = "metrics")]
             metrics: tree.metrics.clone(),
@@ -534,6 +543,8 @@ fn merge_tables(
                     scanner.peekable(),
                     writer,
                     blob_files_to_rewrite,
+                    opts.rate_limiter.clone(),
+                    opts.stop_signal.clone(),
                 ))
             }
         }
@@ -571,6 +582,30 @@ fn merge_tables(
 
         for (idx, item) in merge_iter.enumerate() {
             let item = item?;
+
+            // Pace compaction I/O so it cannot saturate the device and
+            // starve user reads. Short-circuits to a single relaxed atomic
+            // load when `compaction_rate_limit` is 0 (the default), so the
+            // unthrottled hot path stays cheap. The wait is interruptible by
+            // the stop signal so a low limit plus a large item can't stall
+            // tree drop / shutdown for the whole wait.
+            //
+            // Accounting here covers the SST entry's key + value bytes
+            // (for KV-separated entries `item.value` is the encoded handle).
+            // Each length is widened to u64 before the add, so there is no
+            // intermediate usize sum; the saturating add only guards the
+            // (practically impossible) u64 overflow. The relocated blob
+            // payload of KV-separated compactions is debited separately at
+            // its write site in `RelocatingCompaction::write`, where the
+            // real moved bytes are known.
+            let io_bytes = (item.key.user_key.len() as u64).saturating_add(item.value.len() as u64);
+            if opts
+                .rate_limiter
+                .request_interruptible(io_bytes, || opts.stop_signal.is_stopped())
+            {
+                log::debug!("Stopping amidst compaction because of stop signal (I/O throttle)");
+                return Ok(());
+            }
 
             compactor.write(item)?;
 

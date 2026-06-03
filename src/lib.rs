@@ -244,6 +244,7 @@ mod manifest;
 pub mod manifest_blocks;
 mod memtable;
 mod merge_operator;
+pub(crate) mod rate_limiter;
 mod run_reader;
 mod run_scanner;
 // Vendored sfa is std-only internally (`std::io` / `std::fs` /
