@@ -240,6 +240,32 @@ impl AbstractTree for Tree {
     }
 
     fn get_internal_entry(&self, key: &[u8], seqno: SeqNo) -> crate::Result<Option<InternalValue>> {
+        // Lock-free fast path: when reading at or beyond the latest installed
+        // version (always the case for MAX_SEQNO, and the common case), the
+        // mirrored latest SuperVersion is exactly what `get_version_for_snapshot`
+        // would return (it yields the latest iff `latest.seqno < seqno`), so
+        // load it without taking the history RwLock or cloning a deque entry.
+        // Recent inserts stay visible because they mutate the shared
+        // `active_memtable` behind a stable Arc; the back only changes on
+        // flush / compaction, which refresh this mirror under the write lock.
+        //
+        // std-only: the mirror needs `arc-swap` (not no_std). Under no-std we
+        // skip straight to the history RwLock path below.
+        #[cfg(feature = "std")]
+        {
+            let latest = self.latest_super_version.load();
+            if seqno > latest.seqno {
+                return Self::get_internal_entry_from_version(
+                    &latest,
+                    key,
+                    seqno,
+                    self.config.comparator.as_ref(),
+                );
+            }
+        }
+
+        // Historical snapshot read (seqno <= latest.seqno): consult the locked
+        // version history for the correct point-in-time SuperVersion.
         #[expect(clippy::expect_used, reason = "lock is expected to not be poisoned")]
         let super_version = self
             .version_history
@@ -2072,16 +2098,17 @@ impl Tree {
         // move.
         let initial_runtime = config.initial_runtime_config.clone();
         let sync_mode = config.sync_mode;
+        let super_versions = SuperVersions::new(version, &comparator, sync_mode);
+        #[cfg(feature = "std")]
+        let latest_super_version = super_versions.latest_handle();
         let inner = TreeInner {
             id: tree_id,
             memtable_id_counter: SequenceNumberCounter::new(1),
             table_id_counter: SequenceNumberCounter::new(highest_table_id + 1),
             blob_file_id_counter: SequenceNumberCounter::default(),
-            version_history: Arc::new(RwLock::new(SuperVersions::new(
-                version,
-                &comparator,
-                sync_mode,
-            ))),
+            version_history: Arc::new(RwLock::new(super_versions)),
+            #[cfg(feature = "std")]
+            latest_super_version,
             stop_signal: StopSignal::default(),
             config: Arc::new(config),
             major_compaction_lock: RwLock::default(),
