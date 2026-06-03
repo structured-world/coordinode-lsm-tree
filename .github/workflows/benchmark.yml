@@ -161,9 +161,15 @@ jobs:
       # self-hosted runner instead.
       - name: Verify libclang toolchain (compare-rocksdb prerequisite)
         run: |
+          # Detection covers: llvm-config on PATH (Fedora/most), explicit
+          # LIBCLANG_PATH, direct lib dirs (/usr/lib64 on Fedora), Debian/Ubuntu
+          # multiarch (/usr/lib/x86_64-linux-gnu) + llvm-* dirs via the nested
+          # glob, and finally ldconfig -p (the robust Linux probe that finds
+          # libclang wherever the dynamic linker registered it).
           if ! command -v llvm-config >/dev/null 2>&1 \
              && [ -z "${LIBCLANG_PATH:-}" ] \
-             && ! ls /usr/lib*/libclang.so* >/dev/null 2>&1; then
+             && ! ls /usr/lib*/libclang.so* /usr/lib*/*/libclang.so* >/dev/null 2>&1 \
+             && ! { command -v ldconfig >/dev/null 2>&1 && ldconfig -p | grep -q libclang; }; then
             echo "::error::libclang/llvm-config not found on the bench runner. compare-rocksdb (librocksdb-sys -> bindgen -> clang-sys) cannot build. Install LLVM dev tools on the runner host: Fedora 'dnf install -y clang clang-devel llvm llvm-devel', Debian/Ubuntu 'apt-get install -y clang libclang-dev llvm-dev', or set LIBCLANG_PATH/LLVM_CONFIG_PATH."
             exit 1
           fi
