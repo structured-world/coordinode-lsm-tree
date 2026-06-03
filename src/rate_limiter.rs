@@ -169,6 +169,11 @@ impl RateLimiter {
         if self.rate_bytes_per_sec.load(Ordering::Relaxed) == 0 {
             return false;
         }
+        // If a stop is already pending, bail before touching the bucket /
+        // clock — no point debiting or locking on the shutdown path.
+        if should_stop() {
+            return true;
+        }
         // Debit once, then sleep the computed wait in interruptible chunks.
         let mut remaining = self.acquire_wait(bytes, Self::std_now());
         while !remaining.is_zero() {
