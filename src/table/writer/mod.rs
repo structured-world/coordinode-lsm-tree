@@ -12,7 +12,7 @@ use crate::{
     checksum::{ChecksumType, ChecksummedWriter},
     coding::Encode,
     encryption::EncryptionProvider,
-    fs::{Fs, FsFile, FsOpenOptions, SyncMode},
+    fs::{FileHint, Fs, FsFile, FsOpenOptions, SyncMode},
     prefix::PrefixExtractor,
     range_tombstone::RangeTombstone,
     table::{
@@ -1048,7 +1048,20 @@ impl Writer {
         // `StdFs::hard_link`'s cross-device copy fallback (no trait param),
         // tracked in #377.
         let mut checksum = self.file_writer.into_inner()?;
-        FsFile::sync_all_with(&**checksum.inner_mut().get_mut(), self.sync_mode)?;
+        {
+            let file = checksum.inner_mut().get_mut();
+            FsFile::sync_all_with(&**file, self.sync_mode)?;
+            // Cold-level output (L1+) is compaction product: it isn't read
+            // back immediately, so drop its just-written pages from the OS
+            // page cache (advisory POSIX_FADV_DONTNEED) instead of letting
+            // them evict hot pages of files we are still serving reads from.
+            // L0 (flush output) is left cached — freshly written keys are
+            // often read back soon. Best-effort: hint() is advisory, so a
+            // failure just leaves the kernel on its default policy.
+            if self.initial_level >= 1 {
+                let _ = FsFile::hint(&**file, FileHint::WriteOnce);
+            }
+        }
         let checksum = checksum.checksum();
 
         // IMPORTANT: fsync folder on Unix
