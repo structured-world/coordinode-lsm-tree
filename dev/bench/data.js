@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1780503690801,
+  "lastUpdate": 1780518596023,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -12714,6 +12714,84 @@ window.BENCHMARK_DATA = {
             "value": 456377.20432100765,
             "unit": "ops/sec",
             "extra": "P50: 2.0us | P99: 5.4us | P99.9: 8.0us\nthreads: 1 | elapsed: 0.44s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "2981c78ef85706f55e17d3cf73b147ee9d128e61",
+          "message": "ci(bench): publish RocksDB overlays on dispatch + link from db_bench dashboard (#395)\n\n## Why\n\nThe RocksDB head-to-head overlay charts never appeared on the bench\nsite. Two causes:\n\n1. **They live at a different URL** — `dev/compare/report/` (criterion\noverlay tree), not `dev/bench/` (single-engine db_bench trend). Nothing\nlinked the two, so visitors never found them.\n2. **They were never published.** Every `Benchmark` run since the\ncompare-rocksdb step was added failed at *Run compare-rocksdb\nhead-to-head benches*: the self-hosted runner was missing\n`libclang`/`llvm-config`, so `librocksdb-sys` → `bindgen` → `clang-sys`\ncould not build (`could not execute llvm-config` → exit 101). The\nfailure happens after the db_bench publish, which is why the trend\nupdated but the overlays did not.\n\nThe runner has now had LLVM dev tools installed (Fedora: `clang\nclang-devel llvm llvm-devel`), so the build itself is fixed. This PR\nhardens the workflow and makes the overlays discoverable.\n\n## Changes\n\n- **libclang pre-flight** before the compare bench: fail early with an\nactionable message (exact packages / `LIBCLANG_PATH`) instead of a\ncryptic clang-sys panic if a runner ever lacks LLVM again.\n- **Cross-link banner** injected into the auto-generated\n`dev/bench/index.html` pointing at `../compare/report/`. Idempotent via\na marker id; re-applied each run (benchmark-action regenerates that\nfile).\n- **Publish overlays on `workflow_dispatch`** too, not only `push` to\nmain. The overlay is a ratio *snapshot* (`dev/compare` replaced\nwholesale each run), not a per-commit trend, so a manual refresh cannot\ncontaminate any time series. The db_bench trend stays push+main only.\n\n## Testing\n\n- `benchmark.yml` validates as YAML; awk banner injection verified\nlocally (inserts after `<body>`, idempotent).\n- Triggered a `workflow_dispatch` run to confirm compare-rocksdb now\nbuilds on the LLVM-equipped runner.\n\nCloses #133 (overlay-publishing portion)\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n## Summary by CodeRabbit\n\n* **Bug Fixes**\n* Added a pre-flight check that validates required LLVM/libclang tooling\nbefore running benchmarks and provides clear, actionable install\nguidance if missing.\n\n* **Chores**\n* Publishing of comparison reports now runs on both main branch pushes\nand manual triggers.\n* Comparison publishing creates/updates a landing page that embeds\nscenario visuals and injects an idempotent cross-link banner into the\nmain dashboard; git staging is tolerant if the dashboard file is absent.\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-06-03T23:21:15+03:00",
+          "tree_id": "e12bbaa601eb73018ef96ed50af0f0f9fe580fcc",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/2981c78ef85706f55e17d3cf73b147ee9d128e61"
+        },
+        "date": 1780518594277,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 2088928.5283966437,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.6us | P99.9: 3.7us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1217901.4684463316,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.2us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 513246.22424320335,
+            "unit": "ops/sec",
+            "extra": "P50: 1.8us | P99: 4.9us | P99.9: 7.4us\nthreads: 1 | elapsed: 0.39s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3600673.433952352,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 3.0us | P99.9: 5.5us\nthreads: 1 | elapsed: 0.06s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 383003.08378571435,
+            "unit": "ops/sec",
+            "extra": "P50: 2.3us | P99: 5.6us | P99.9: 8.4us\nthreads: 1 | elapsed: 0.52s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 206586.66118931054,
+            "unit": "ops/sec",
+            "extra": "P50: 4.5us | P99: 5.7us | P99.9: 7.8us\nthreads: 1 | elapsed: 0.97s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1239046.066115783,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.3us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1128150.2410924754,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 1.5us | P99.9: 1.9us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 454461.49485001503,
+            "unit": "ops/sec",
+            "extra": "P50: 2.0us | P99: 5.4us | P99.9: 7.9us\nthreads: 1 | elapsed: 0.44s | num: 200000 | iterations: 3"
           }
         ]
       }
