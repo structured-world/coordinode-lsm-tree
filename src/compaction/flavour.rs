@@ -179,6 +179,14 @@ pub struct RelocatingCompaction {
     blob_writer: BlobFileWriter,
     rewriting_blob_file_ids: HashSet<BlobFileId>,
     rewriting_blob_files: Vec<BlobFile>,
+    /// Paces relocated-blob I/O. The merge loop's limiter only sees the
+    /// encoded handle in `item.value`; the real payload moved here is
+    /// debited at the relocation write site so KV-separated compactions
+    /// are throttled by their actual bandwidth.
+    rate_limiter: std::sync::Arc<crate::rate_limiter::RateLimiter>,
+    /// Polled by the blob throttle so a long wait under a low limit stays
+    /// interruptible by tree drop / shutdown.
+    stop_signal: crate::stop_signal::StopSignal,
 }
 
 impl RelocatingCompaction {
@@ -187,6 +195,8 @@ impl RelocatingCompaction {
         blob_scanner: Peekable<BlobFileMergeScanner>,
         blob_writer: BlobFileWriter,
         rewriting_blob_files: Vec<BlobFile>,
+        rate_limiter: std::sync::Arc<crate::rate_limiter::RateLimiter>,
+        stop_signal: crate::stop_signal::StopSignal,
     ) -> Self {
         Self {
             inner,
@@ -194,6 +204,8 @@ impl RelocatingCompaction {
             blob_writer,
             rewriting_blob_file_ids: rewriting_blob_files.iter().map(BlobFile::id).collect(),
             rewriting_blob_files,
+            rate_limiter,
+            stop_signal,
         }
     }
 
@@ -256,6 +268,18 @@ impl CompactionFlavour for RelocatingCompaction {
                 );
 
                 log::trace!("RELOCATE to {indirection:?}");
+
+                // Throttle the relocated blob payload — this is the heavy
+                // KV-separation I/O the merge-loop limiter cannot see (it
+                // only has the encoded handle). Interruptible so a low
+                // limit can't stall shutdown; the return is ignored because
+                // the blob is already read and must be written to keep the
+                // new vptr valid — only the *wait* is shortened on stop.
+                let _ = self
+                    .rate_limiter
+                    .request_interruptible(blob_entry.value.len() as u64, || {
+                        self.stop_signal.is_stopped()
+                    });
 
                 let new_indirection = BlobIndirection {
                     vhandle: self.blob_writer.write_raw(

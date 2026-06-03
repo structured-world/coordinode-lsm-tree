@@ -543,6 +543,8 @@ fn merge_tables(
                     scanner.peekable(),
                     writer,
                     blob_files_to_rewrite,
+                    opts.rate_limiter.clone(),
+                    opts.stop_signal.clone(),
                 ))
             }
         }
@@ -588,13 +590,14 @@ fn merge_tables(
             // the stop signal so a low limit plus a large item can't stall
             // tree drop / shutdown for the whole wait.
             //
-            // Accounting covers the SST entry's key + value bytes. Each
-            // length is widened to u64 before the add, so there is no
+            // Accounting here covers the SST entry's key + value bytes
+            // (for KV-separated entries `item.value` is the encoded handle).
+            // Each length is widened to u64 before the add, so there is no
             // intermediate usize sum; the saturating add only guards the
-            // (practically impossible) u64 overflow. For blob-indirection
-            // (KV-separated) compactions the relocated blob payload is NOT
-            // counted here — `item.value` is only the encoded handle — so
-            // blob-relocation I/O is under-accounted; tracked in #390.
+            // (practically impossible) u64 overflow. The relocated blob
+            // payload of KV-separated compactions is debited separately at
+            // its write site in `RelocatingCompaction::write`, where the
+            // real moved bytes are known.
             let io_bytes = (item.key.user_key.len() as u64).saturating_add(item.value.len() as u64);
             if opts
                 .rate_limiter
