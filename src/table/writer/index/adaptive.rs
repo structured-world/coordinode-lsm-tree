@@ -48,11 +48,14 @@ use std::{
 /// single-level. The estimate mirrors [`PartitionedIndexWriter`]'s own
 /// per-entry accounting (`end_key.len() + size_of::<KeyedBlockHandle>()`).
 ///
-/// A point read on a single-level index pins the whole index block in
-/// `FullBlockIndex`; this default keeps that cheap (a few hundred KB at
-/// most) while still letting genuinely large indexes partition. Tunable
-/// per tree (see the index-partition policy / runtime config).
-pub const DEFAULT_SPILL_THRESHOLD: u64 = 256 * 1024;
+/// A single-level index is reached by one lookup (versus two-level's two).
+/// On hot levels the reader pins the index block; on cold levels it pages
+/// the block through the shared block cache (evictable), so a multi-MiB
+/// threshold does not pin unbounded RAM. 4 MiB keeps SSTs up to a
+/// few-hundred-MB single-level (where single-level wins point reads) while
+/// genuinely huge indexes still partition. Tunable per tree (see the
+/// index-partition policy / runtime config).
+pub const DEFAULT_SPILL_THRESHOLD: u64 = 4 * 1024 * 1024;
 
 pub struct AdaptiveIndexWriter<W: Write + Seek + 'static> {
     // Forwarded config (applied to whichever inner writer is built).
