@@ -1,0 +1,1 @@
+{"group_id":"write_throughput","function_id":"rocksdb","value_str":"10000","throughput":{"Elements":10000},"full_id":"write_throughput/rocksdb/10000","directory_name":"write_throughput/rocksdb/10000","title":"write_throughput/rocksdb/10000"}

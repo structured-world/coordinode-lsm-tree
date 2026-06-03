@@ -1,0 +1,1 @@
+{"group_id":"write_throughput_zstd22","function_id":"rocksdb","value_str":"1000","throughput":{"Elements":1000},"full_id":"write_throughput_zstd22/rocksdb/1000","directory_name":"write_throughput_zstd22/rocksdb/1000","title":"write_throughput_zstd22/rocksdb/1000"}
