@@ -115,8 +115,18 @@ impl<'a> Ingestion<'a> {
                 .get(INITIAL_CANONICAL_LEVEL),
         );
 
+        // One runtime-config snapshot for the whole ingestion writer setup, so
+        // a concurrent `update_runtime_config` can't leave the ingested SST
+        // with `seqno_in_index` from one snapshot and checksum settings from
+        // another. `Off` (default) emits no per-KV footer and leaves the
+        // data-block payload encoding unchanged; the index format follows the
+        // policy in force at ingestion.
+        let rc = tree.0.runtime_config.load_full();
+
         if index_partitioning {
-            writer = writer.use_partitioned_index();
+            // Size-adaptive index: single-level for small SSTs, spill to
+            // partitioned only past the threshold (see flush path).
+            writer = writer.use_adaptive_index(rc.index_partition_spill_threshold);
         }
         if filter_partitioning {
             writer = writer.use_partitioned_filter();
@@ -127,13 +137,6 @@ impl<'a> Ingestion<'a> {
         writer = writer.use_page_ecc(tree.config.page_ecc);
         writer = writer.use_sync_mode(tree.config.sync_mode);
 
-        // One runtime-config snapshot for the whole ingestion writer setup, so
-        // a concurrent `update_runtime_config` can't leave the ingested SST
-        // with `seqno_in_index` from one snapshot and checksum settings from
-        // another. `Off` (default) emits no per-KV footer and leaves the
-        // data-block payload encoding unchanged; the index format follows the
-        // policy in force at ingestion.
-        let rc = tree.0.runtime_config.load_full();
         writer = writer.use_seqno_in_index(rc.seqno_in_index);
         writer = writer.use_kv_checksums(rc.kv_checksums, rc.kv_checksum_algo);
 

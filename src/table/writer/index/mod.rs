@@ -2,9 +2,11 @@
 // Copyright (c) 2024-present, fjall-rs
 // Copyright (c) 2026-present, Structured World Foundation
 
+mod adaptive;
 mod full;
 mod partitioned;
 
+pub use adaptive::{AdaptiveIndexWriter, DEFAULT_SPILL_THRESHOLD};
 pub use full::FullIndexWriter;
 pub use partitioned::PartitionedIndexWriter;
 

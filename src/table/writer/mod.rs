@@ -6,6 +6,8 @@ mod filter;
 mod index;
 mod meta;
 
+pub(crate) use index::DEFAULT_SPILL_THRESHOLD;
+
 use super::{Block, BlockOffset, DataBlock, KeyedBlockHandle, filter::BloomConstructionPolicy};
 use crate::{
     Checksum, CompressionType, InternalValue, TableId, UserKey, ValueType,
@@ -273,7 +275,32 @@ impl Writer {
             .use_partition_size(self.meta_partition_size)
             .use_restart_interval(self.index_block_restart_interval)
             .use_encryption(self.encryption.clone())
-            .use_table_id(self.table_id);
+            .use_table_id(self.table_id)
+            // Reapply page_ecc — swapping the index writer would otherwise drop
+            // a flag set earlier in the builder chain (order-independence).
+            .use_page_ecc(self.page_ecc);
+        self
+    }
+
+    /// Size-adaptive index: single-level until the index exceeds
+    /// `spill_threshold` bytes, then a streaming two-level (partitioned)
+    /// index. See [`index::AdaptiveIndexWriter`]. The per-bottom-partition
+    /// size (once spilled) is `meta_partition_size`, matching
+    /// [`Self::use_partitioned_index`].
+    #[must_use]
+    pub fn use_adaptive_index(mut self, spill_threshold: u64) -> Self {
+        self.assert_not_started("adaptive index");
+        self.index_writer = Box::new(index::AdaptiveIndexWriter::new(spill_threshold))
+            .use_compression(self.index_block_compression)
+            .use_partition_size(self.meta_partition_size)
+            .use_restart_interval(self.index_block_restart_interval)
+            .use_encryption(self.encryption.clone())
+            .use_table_id(self.table_id)
+            // Swapping in a fresh index writer drops any flag set earlier in the
+            // builder chain; reapply page_ecc so it survives regardless of call
+            // order (otherwise the table mixes ECC and non-ECC index blocks
+            // while `Writer` still records ECC as enabled).
+            .use_page_ecc(self.page_ecc);
         self
     }
 

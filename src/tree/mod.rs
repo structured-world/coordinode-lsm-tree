@@ -491,6 +491,14 @@ impl AbstractTree for Tree {
         let index_partitioning = self.config.index_block_partitioning_policy.get(0);
         let filter_partitioning = self.config.filter_block_partitioning_policy.get(0);
 
+        // One runtime-config snapshot for the whole flush writer setup. The
+        // index spill threshold, `seqno_in_index`, and the per-KV checksum
+        // policy are all live (toggleable via `update_runtime_config`); reading
+        // `load_full()` per field could straddle a concurrent update and mix two
+        // snapshots into one SST. Compaction is the migration mechanism, so a
+        // toggle takes effect on the next flush / compaction.
+        let rc = self.0.runtime_config.load_full();
+
         log::debug!(
             "Flushing memtable(s) to {}, data_block_restart_interval={data_block_restart_interval}, index_block_restart_interval={index_block_restart_interval}, data_block_size={data_block_size}, data_block_compression={data_block_compression:?}, index_block_compression={index_block_compression:?}",
             folder.display(),
@@ -521,7 +529,12 @@ impl AbstractTree for Tree {
         });
 
         if index_partitioning {
-            table_writer = table_writer.use_partitioned_index();
+            // Size-adaptive: single-level index for small SSTs (where pinning
+            // the whole index is cheap and a two-level lookup is pure overhead),
+            // spilling to a partitioned index only once the index grows past the
+            // threshold. Recovers the point-read cost of an unconditional
+            // two-level index on small/medium SSTs.
+            table_writer = table_writer.use_adaptive_index(rc.index_partition_spill_threshold);
         }
         if filter_partitioning {
             table_writer = table_writer.use_partitioned_filter();
@@ -532,13 +545,6 @@ impl AbstractTree for Tree {
         table_writer = table_writer.use_page_ecc(self.config.page_ecc);
         table_writer = table_writer.use_sync_mode(self.config.sync_mode);
 
-        // One runtime-config snapshot for the whole flush writer setup. Both
-        // `seqno_in_index` and the per-KV checksum policy are live (toggleable
-        // via `update_runtime_config`); reading `load_full()` per field could
-        // straddle a concurrent update and mix two snapshots into one SST.
-        // Compaction is the migration mechanism, so a toggle takes effect on
-        // the next flush / compaction.
-        let rc = self.0.runtime_config.load_full();
         table_writer = table_writer.use_seqno_in_index(rc.seqno_in_index);
         // `Off` (default) emits no per-KV footer and leaves the data-block
         // payload encoding unchanged (the V5 header carries a block_flags byte
