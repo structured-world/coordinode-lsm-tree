@@ -651,15 +651,13 @@ fn merge_tables(
         })?
         .unwrap_or_default();
 
-    let tables_out = compactor
-        .finish(
-            &mut version_history_lock,
-            opts,
-            payload,
-            dst_lvl,
-            blob_frag_map,
-            extra_blob_files,
-        )
+    // Phase split: `produce` finalizes this compaction's output files (no
+    // version touch); `install_merge` commits one atomic version edit. With a
+    // single output the result is identical to the old combined `finish`; the
+    // split is what lets parallel sub-compactions each produce independently
+    // and then share one install.
+    let produce_output = compactor
+        .produce(opts, dst_lvl, blob_frag_map, extra_blob_files)
         .inspect_err(|e| {
             // NOTE: We cannot use hidden_guard here because we already locked the compaction state
 
@@ -669,6 +667,22 @@ fn merge_tables(
                 .hidden_set_mut()
                 .show(payload.table_ids.iter().copied());
         })?;
+
+    let tables_out = super::flavour::install_merge(
+        &mut version_history_lock,
+        opts,
+        payload,
+        vec![produce_output],
+    )
+    .inspect_err(|e| {
+        // NOTE: We cannot use hidden_guard here because we already locked the compaction state
+
+        log::error!("Compaction failed: {e:?}");
+
+        compaction_state
+            .hidden_set_mut()
+            .show(payload.table_ids.iter().copied());
+    })?;
 
     compaction_state
         .hidden_set_mut()
