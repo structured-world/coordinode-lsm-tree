@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1780596256195,
+  "lastUpdate": 1780604097255,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -13104,6 +13104,84 @@ window.BENCHMARK_DATA = {
             "value": 543838.0481617645,
             "unit": "ops/sec",
             "extra": "P50: 1.6us | P99: 6.2us | P99.9: 9.2us\nthreads: 1 | elapsed: 0.37s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "042407bd6a0f952c9bf41d76854c15698343e3d5",
+          "message": "feat(compaction): parallel block compression (#401)\n\n## Summary\n\nParallel block compression during compaction (#144 Phase 1): the\nCPU-bound\nper-block transform (compress → encrypt → checksum → ecc) runs on worker\nthreads while file writes and offset-dependent index registration stay\nordered\non the writer thread. Plus the enabling refactor for Phase 2\n(sub-compaction)\nand dashboard benches.\n\n## Changes\n\n- **`Block::prepare_with_flags` / `PreparedBlock::write_to`** — split\nthe\nper-block transform (pure CPU) from the framed file write (single source\nof\n  framing).\n- **`CompactionSpawner` trait** = executor seam; default\n**`RayonSpawner`**\nbehind the new `parallel` feature (default-on in std). A threaded no-std\n  consumer can inject its own executor; below std the writer is serial.\n- **`BlockCompressor`** pipeline: spawn-per-block, reorder by submission\nsequence, bounded in-flight (cap = 2·threads). On-disk output is\nidentical to\n  the serial path.\n- **Config**: `compaction_threads` (default `max(1,\navailable_parallelism/2)`)\nand `compaction_pool` (caller-shared pool). Per-tree default pool built\nonce\nat `Tree::open`; wired through `MultiWriter` into compaction. Table\nrotation\n  uses an output-size hint (deferred writes).\n- **Compaction `finish` → `produce` + `install_merge`** (Phase 2\nenabling\nrefactor, zero behavior change): finalize output files separately from\nthe\nsingle atomic version edit, so parallel sub-compactions can later share\none\n  install.\n- **Benches**: `benches/compaction.rs` (serial vs parallel, zstd 1 & 22)\nand a\n`compare-rocksdb` head-to-head scenario that auto-publishes\nours-vs-RocksDB\n  compaction overlays (zstd 1 & 22) on the dashboard.\n\n## Results (local, 4 threads)\n\n- Serial → parallel: ~2.9× faster compaction (zstd).\n- vs RocksDB (same 4-thread parallel block compression): **parity at\nzstd-22**;\nRocksDB ~1.5× at zstd-1 (the gap is structured-zstd codec throughput,\nnot the\n  merge/framing path — proven by layered profiling; tracked separately).\n\n## Testing\n\n- Full lib suite (1225) green incl. a readback-equivalence test proving\nparallel\n  output matches serial across plain / seqno-in-index / lz4.\n- Key compaction + blob-relocation integration tests green.\n- clippy `--all-features --all-targets -D warnings`, fmt, rustdoc clean.\n- Serial / single-thread / no-std builds unchanged and byte-identical.\n\nPart of #144\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n## Summary by CodeRabbit\n\n* **New Features**\n* Parallel block-compression enabled by default; optional\nruntime-controlled parallel pipeline for table writes and compaction.\nNew config options to set compaction thread count and supply a shared\ncompaction worker pool.\n* **Tests**\n* Unit and end-to-end tests validating parity between parallel and\nserial outputs and a regression test preventing a compaction panic.\n* **Benchmarks**\n* New compaction benchmarks (including comparison harness) reporting\ntail-latencies (P50/P95/P99).\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-06-04T22:38:59+03:00",
+          "tree_id": "578ed6a4389f6128cef269c66641355ab99d2a2e",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/042407bd6a0f952c9bf41d76854c15698343e3d5"
+        },
+        "date": 1780604093513,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 2089258.6886053316,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.6us | P99.9: 3.7us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1207887.8798851168,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.2us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 626647.2401844561,
+            "unit": "ops/sec",
+            "extra": "P50: 1.4us | P99: 4.7us | P99.9: 7.2us\nthreads: 1 | elapsed: 0.32s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3689058.142876484,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 3.0us | P99.9: 5.4us\nthreads: 1 | elapsed: 0.05s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 435047.82425263413,
+            "unit": "ops/sec",
+            "extra": "P50: 2.0us | P99: 5.3us | P99.9: 8.0us\nthreads: 1 | elapsed: 0.46s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 216233.70847128378,
+            "unit": "ops/sec",
+            "extra": "P50: 4.3us | P99: 5.5us | P99.9: 8.4us\nthreads: 1 | elapsed: 0.92s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1241711.6831646482,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.3us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1131833.7931502438,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 1.5us | P99.9: 2.2us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 536383.2096940087,
+            "unit": "ops/sec",
+            "extra": "P50: 1.7us | P99: 5.1us | P99.9: 7.5us\nthreads: 1 | elapsed: 0.37s | num: 200000 | iterations: 3"
           }
         ]
       }
