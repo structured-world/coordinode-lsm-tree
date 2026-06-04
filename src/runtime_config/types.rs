@@ -543,15 +543,18 @@ pub struct RuntimeConfig {
 
     /// Index-size threshold (bytes) at or below which an SST's block index
     /// is written single-level; above it the index spills to a two-level
-    /// (partitioned) layout. A single-level index is one block that the
-    /// reader pins whole, so a point read costs one index lookup — cheap
-    /// while the index is small. Past the threshold, partitioning bounds
-    /// resident index RAM (only the top-level index stays pinned) at the
-    /// cost of an extra per-lookup level.
+    /// (partitioned) layout. A single-level index is one block reached by a
+    /// single lookup, so a point read costs one index level instead of two.
+    /// On hot levels the block is pinned resident; on cold levels (per the
+    /// index-block pinning policy) it is paged through the shared block
+    /// cache, so a high threshold does not pin unbounded index RAM — the
+    /// cold-level single-level index is evictable just like a two-level
+    /// index's bottom partitions, but cheaper (one cache load + one
+    /// iterator versus two levels).
     ///
-    /// Default 256 KiB keeps typical SSTs single-level (matching the
-    /// point-read profile where single-level is both faster and
-    /// memory-cheap) while genuinely large indexes still partition. Takes
+    /// Default 4 MiB keeps SSTs up to a few-hundred-MB single-level (where
+    /// single-level beats two-level on point reads at every measured size
+    /// up to 1M keys) while genuinely huge indexes still partition. Takes
     /// effect on the next flush / compaction; existing SSTs keep their
     /// original layout (each SST self-describes it). `0` forces always-
     /// partition (spill on the first index entry).
@@ -882,13 +885,17 @@ mod tests {
     }
 
     #[test]
-    fn runtime_config_default_index_partition_spill_threshold_is_256kib() {
-        // Default keeps typical SSTs single-level (fast point reads) while
-        // large indexes still partition. A regression here would change the
-        // index layout — and thus point-read cost — of newly written SSTs.
+    fn runtime_config_default_index_partition_spill_threshold_is_4mib() {
+        // Default keeps SSTs up to a few-hundred-MB single-level (fast point
+        // reads; single-level beats two-level at every measured size up to
+        // 1M keys) while genuinely huge indexes still partition. On cold
+        // levels the single-level block is cache-managed (evictable), so the
+        // raised threshold does not pin unbounded index RAM. A regression
+        // here would change the index layout — and thus point-read cost — of
+        // newly written SSTs.
         assert_eq!(
             RuntimeConfig::default().index_partition_spill_threshold,
-            256 * 1024,
+            4 * 1024 * 1024,
         );
     }
 
