@@ -651,6 +651,11 @@ fn merge_tables(
         })?
         .unwrap_or_default();
 
+    // Filter-created blob files are already finalized on disk; if `produce`
+    // fails they would be orphaned (produce consumes the Vec, so keep a handle
+    // to mark them deleted on the error path).
+    let rollback_extra_blob_files = extra_blob_files.clone();
+
     // Phase split: `produce` finalizes this compaction's output files (no
     // version touch); `install_merge` commits one atomic version edit. With a
     // single output the result is identical to the old combined `finish`; the
@@ -666,6 +671,10 @@ fn merge_tables(
             compaction_state
                 .hidden_set_mut()
                 .show(payload.table_ids.iter().copied());
+
+            for blob_file in &rollback_extra_blob_files {
+                blob_file.mark_as_deleted();
+            }
         })?;
 
     let tables_out = super::flavour::install_merge(
