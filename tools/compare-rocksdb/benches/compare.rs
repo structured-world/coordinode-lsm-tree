@@ -887,6 +887,180 @@ fn compaction_variant(c: &mut Criterion, group_name: &str, level: i32) {
     group.finish();
 }
 
+/// High-entropy 256-byte value: an xorshift fill so zstd does real,
+/// parallelizable work during sub-compaction. The 0xAA `value_for`
+/// compresses to almost nothing, which would hide any compaction-CPU
+/// parallelism behind near-zero codec time.
+fn value_incompressible(i: u64) -> Vec<u8> {
+    let mut s = i.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+    let mut v = vec![0_u8; 256];
+    for chunk in v.chunks_mut(8) {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        let bytes = s.to_le_bytes();
+        chunk.copy_from_slice(&bytes[..chunk.len()]);
+    }
+    v
+}
+
+/// Precomputed high-entropy workload for the sub-compaction head-to-head,
+/// built once per `n` outside the timing loop.
+struct SubcompactionInputs {
+    keys: Vec<[u8; 16]>,
+    values: Vec<Vec<u8>>,
+}
+
+impl SubcompactionInputs {
+    fn build(n_keys: u64) -> Self {
+        let n = usize::try_from(n_keys).expect("n_keys fits in usize");
+        let mut keys = Vec::with_capacity(n);
+        let mut values = Vec::with_capacity(n);
+        for i in 0..n_keys {
+            keys.push(key_for(i));
+            values.push(value_incompressible(i));
+        }
+        Self { keys, values }
+    }
+}
+
+/// Bottom-level target file size for the two-phase setup: small enough
+/// that the populated bottom level holds several tables — the boundaries
+/// the timed compaction splits on — on both engines.
+const SUBCOMPACTION_BOTTOM_TARGET: u64 = 1024 * 1024;
+/// Sub-compaction worker threads (ours: range-parallel split; RocksDB:
+/// `max_subcompactions`).
+const SUBCOMPACTION_THREADS: usize = 4;
+
+/// Times one range-parallel compaction: a full-keyspace overwrite (gen 1)
+/// merged into a pre-populated bottom level (gen 0). Only the second
+/// compaction is timed — the gen-0 populate and the gen-1 L0 writes are
+/// excluded. Ours forces the split (`subcompaction_min_bytes = 0`, so the
+/// populated bottom's table boundaries drive the range partition); RocksDB
+/// runs with `max_subcompactions = 4`, so the head-to-head isolates the
+/// range-parallel mechanism on both sides.
+fn run_subcompaction_bench(
+    engine: Engine,
+    level: i32,
+    inputs: &SubcompactionInputs,
+) -> Result<Duration, Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let total = inputs.keys.len() as u64;
+    // Flush the gen-1 overwrite into COMPACTION_FLUSHES L0 tables.
+    let flush_points: Vec<u64> = (1..COMPACTION_FLUSHES)
+        .map(|b| (b * total) / COMPACTION_FLUSHES)
+        .collect();
+
+    let elapsed = match engine {
+        Engine::Ours => {
+            let tree = Config::new(
+                dir.path(),
+                SequenceNumberCounter::default(),
+                SequenceNumberCounter::default(),
+            )
+            .data_block_compression_policy(CompressionPolicy::all(CompressionType::Zstd(level)))
+            .compaction_threads(SUBCOMPACTION_THREADS)
+            .subcompaction_min_bytes(0)
+            .open()?;
+
+            // Step 1: populate the bottom level with several tables.
+            for ((key, value), seqno) in inputs.keys.iter().zip(inputs.values.iter()).zip(0u64..) {
+                tree.insert(key, value, seqno);
+            }
+            tree.flush_active_memtable(0)?;
+            tree.major_compact(SUBCOMPACTION_BOTTOM_TARGET, 0)?;
+
+            // Step 2: overwrite the whole keyspace into fresh L0 tables.
+            let mut written = 0u64;
+            for ((key, value), seqno) in inputs.keys.iter().zip(inputs.values.iter()).zip(total..) {
+                tree.insert(key, value, seqno);
+                written += 1;
+                if flush_points.contains(&written) {
+                    tree.flush_active_memtable(0)?;
+                }
+            }
+            tree.flush_active_memtable(0)?;
+
+            let start = std::time::Instant::now();
+            tree.major_compact(u64::MAX, 0)?;
+            start.elapsed()
+        }
+        Engine::RocksDb => {
+            let mut opts = rocksdb::Options::default();
+            opts.create_if_missing(true);
+            opts.set_disable_auto_compactions(true);
+            opts.set_compression_type(rocksdb::DBCompressionType::Zstd);
+            opts.set_compression_options(-14, level, 0, 0);
+            // Give RocksDB the matching parallelism knob + a small target file
+            // size so the bottom level also splits into several files.
+            opts.set_max_subcompactions(SUBCOMPACTION_THREADS as u32);
+            opts.set_target_file_size_base(SUBCOMPACTION_BOTTOM_TARGET);
+
+            let db = rocksdb::DB::open(&opts, dir.path())?;
+            let mut write_opts = rocksdb::WriteOptions::default();
+            write_opts.disable_wal(true);
+
+            // Step 1: populate the bottom level.
+            for (key, value) in inputs.keys.iter().zip(inputs.values.iter()) {
+                db.put_opt(key, value, &write_opts)?;
+            }
+            db.flush()?;
+            db.compact_range(None::<&[u8]>, None::<&[u8]>);
+
+            // Step 2: overwrite the whole keyspace into fresh L0 tables.
+            let mut written = 0u64;
+            for (key, value) in inputs.keys.iter().zip(inputs.values.iter()) {
+                db.put_opt(key, value, &write_opts)?;
+                written += 1;
+                if flush_points.contains(&written) {
+                    db.flush()?;
+                }
+            }
+            db.flush()?;
+
+            let start = std::time::Instant::now();
+            db.compact_range(None::<&[u8]>, None::<&[u8]>);
+            start.elapsed()
+        }
+    };
+    drop(dir);
+    Ok(elapsed)
+}
+
+fn subcompaction_variant(c: &mut Criterion, group_name: &str, level: i32) {
+    let mut group = c.benchmark_group(group_name);
+    for &n in &[40_000_u64, 100_000_u64] {
+        let inputs = SubcompactionInputs::build(n);
+        group.throughput(Throughput::Elements(n));
+        for engine in [Engine::Ours, Engine::RocksDb] {
+            group.bench_with_input(BenchmarkId::new(engine.label(), n), &n, |b, _| {
+                let mut samples = Vec::new();
+                b.iter_custom(|iters| {
+                    let mut total = Duration::ZERO;
+                    for _ in 0..iters {
+                        let elapsed = run_subcompaction_bench(engine, level, &inputs)
+                            .unwrap_or_else(|e| {
+                                panic!("run_subcompaction_bench failed for {}: {e}", engine.label())
+                            });
+                        samples.push(elapsed);
+                        total += elapsed;
+                    }
+                    total
+                });
+                report_percentiles(&format!("{group_name}/{}/{n}", engine.label()), samples);
+            });
+        }
+    }
+    group.finish();
+}
+
+/// Sub-compaction head-to-head: our range-parallel split vs RocksDB
+/// `max_subcompactions`, at both ends of the zstd spectrum.
+fn bench_subcompaction(c: &mut Criterion) {
+    subcompaction_variant(c, "subcompaction_zstd1", 1);
+    subcompaction_variant(c, "subcompaction_zstd22", 22);
+}
+
 criterion_group!(
     benches,
     bench_write_throughput,
@@ -894,6 +1068,7 @@ criterion_group!(
     bench_range_scan,
     bench_seek_random,
     bench_overwrite,
-    bench_compaction
+    bench_compaction,
+    bench_subcompaction
 );
 criterion_main!(benches);
