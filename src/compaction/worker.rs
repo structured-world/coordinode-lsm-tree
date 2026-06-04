@@ -477,7 +477,18 @@ fn run_subcompaction(
         .transpose()?
         .unwrap_or_default();
 
-    compactor.produce(opts, dst_lvl, blob_frag_map, extra_blob_files)
+    // produce() consumes the (already finalized on disk) filter blob files; if
+    // it fails, mark them deleted so they are not orphaned. The parallel caller
+    // rolls back sibling outputs on error but cannot reach this range's own
+    // filter blobs, so clean them up here.
+    let rollback_extra_blob_files = extra_blob_files.clone();
+    compactor
+        .produce(opts, dst_lvl, blob_frag_map, extra_blob_files)
+        .inspect_err(|_| {
+            for blob_file in &rollback_extra_blob_files {
+                blob_file.mark_as_deleted();
+            }
+        })
 }
 
 #[expect(
