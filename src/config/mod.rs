@@ -1378,7 +1378,9 @@ impl Config {
     #[cfg(feature = "std")]
     #[must_use]
     pub fn compaction_threads(mut self, threads: usize) -> Self {
-        self.compaction_threads = threads;
+        // Clamp to >= 1: the documented semantics treat `1` as "serial", and a
+        // 0-thread pool would be an invalid state.
+        self.compaction_threads = threads.max(1);
         self
     }
 

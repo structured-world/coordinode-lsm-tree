@@ -9,9 +9,32 @@
 //! and enough data — hence the compressible payload below. Requires the `zstd`
 //! feature.
 
-use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
+use criterion::{Criterion, criterion_group, criterion_main};
 use lsm_tree::config::CompressionPolicy;
 use lsm_tree::{AbstractTree, AnyTree, CompressionType, Config, SequenceNumberCounter};
+use std::time::{Duration, Instant};
+
+/// Reports compaction tail latency (P50/P95/P99) from the per-iteration
+/// `major_compact` durations to stderr, since Criterion's default summary only
+/// surfaces mean/CI. Each iteration is one whole compaction, so these are the
+/// distribution of compaction wall-times.
+fn report_percentiles(label: &str, mut samples: Vec<Duration>) {
+    if samples.is_empty() {
+        return;
+    }
+    samples.sort_unstable();
+    let pick = |p: f64| {
+        let idx = (((samples.len() - 1) as f64) * p).round() as usize;
+        samples[idx.min(samples.len() - 1)]
+    };
+    eprintln!(
+        "  [{label}] n={} P50={:?} P95={:?} P99={:?}",
+        samples.len(),
+        pick(0.50),
+        pick(0.95),
+        pick(0.99),
+    );
+}
 
 const KEYS: u64 = 40_000;
 const FLUSHES: u64 = 6;
@@ -58,14 +81,24 @@ fn bench_major_compact(c: &mut Criterion) {
 
         for threads in [1usize, 4] {
             group.bench_function(format!("threads_{threads}"), |b| {
-                b.iter_batched(
-                    || build_filled_tree(threads, level),
-                    |(tree, _folder)| {
+                // iter_custom so each compaction is timed individually: the
+                // setup (building L0) is excluded, and per-iteration durations
+                // feed the percentile report below (tail latency, not just mean).
+                let mut samples = Vec::new();
+                b.iter_custom(|iters| {
+                    let mut total = Duration::ZERO;
+                    for _ in 0..iters {
+                        let (tree, _folder) = build_filled_tree(threads, level);
+                        let start = Instant::now();
                         tree.major_compact(u64::MAX, 0).unwrap();
+                        let elapsed = start.elapsed();
+                        samples.push(elapsed);
+                        total += elapsed;
                         std::hint::black_box(&tree);
-                    },
-                    BatchSize::PerIteration,
-                );
+                    }
+                    total
+                });
+                report_percentiles(&format!("zstd{level}/threads_{threads}"), samples);
             });
         }
 

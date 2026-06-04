@@ -764,7 +764,13 @@ fn run_compaction(
     inputs: &WorkloadInputs,
 ) -> Result<Duration, Box<dyn std::error::Error>> {
     let dir = tempfile::tempdir()?;
-    let per = (inputs.keys.len() as u64 / COMPACTION_FLUSHES).max(1);
+    let total = inputs.keys.len() as u64;
+    // Flush at the COMPACTION_FLUSHES-1 interior boundaries, then once more after
+    // the loop — exactly COMPACTION_FLUSHES L0 tables, with no stray remainder
+    // table from floor division.
+    let boundaries: Vec<u64> = (1..COMPACTION_FLUSHES)
+        .map(|b| (b * total) / COMPACTION_FLUSHES)
+        .collect();
 
     let elapsed = match engine {
         Engine::Ours => {
@@ -781,11 +787,11 @@ fn run_compaction(
             for ((key, value), seqno) in inputs.keys.iter().zip(inputs.values.iter()).zip(0u64..) {
                 tree.insert(key, value, seqno);
                 written += 1;
-                if written.is_multiple_of(per) {
+                if boundaries.contains(&written) {
                     tree.flush_active_memtable(0)?;
                 }
             }
-            tree.flush_active_memtable(0)?; // flush any trailing partial batch
+            tree.flush_active_memtable(0)?; // final batch
 
             let start = std::time::Instant::now();
             tree.major_compact(u64::MAX, 0)?;
@@ -811,11 +817,11 @@ fn run_compaction(
             for (key, value) in inputs.keys.iter().zip(inputs.values.iter()) {
                 db.put_opt(key, value, &write_opts)?;
                 written += 1;
-                if written.is_multiple_of(per) {
+                if boundaries.contains(&written) {
                     db.flush()?;
                 }
             }
-            db.flush()?;
+            db.flush()?; // final batch
 
             let start = std::time::Instant::now();
             db.compact_range(None::<&[u8]>, None::<&[u8]>);
@@ -834,6 +840,27 @@ fn bench_compaction(c: &mut Criterion) {
     compaction_variant(c, "major_compact_zstd22", 22);
 }
 
+/// Reports compaction tail latency (P50/P95/P99) to stderr from per-iteration
+/// durations — Criterion's overlay only plots mean/CI. Each iteration is one
+/// whole compaction, so this is the distribution of compaction wall-times.
+fn report_percentiles(label: &str, mut samples: Vec<Duration>) {
+    if samples.is_empty() {
+        return;
+    }
+    samples.sort_unstable();
+    let pick = |p: f64| {
+        let idx = (((samples.len() - 1) as f64) * p).round() as usize;
+        samples[idx.min(samples.len() - 1)]
+    };
+    eprintln!(
+        "  [{label}] n={} P50={:?} P95={:?} P99={:?}",
+        samples.len(),
+        pick(0.50),
+        pick(0.95),
+        pick(0.99),
+    );
+}
+
 fn compaction_variant(c: &mut Criterion, group_name: &str, level: i32) {
     let mut group = c.benchmark_group(group_name);
     for &n in &[10_000_u64, 40_000_u64] {
@@ -841,15 +868,19 @@ fn compaction_variant(c: &mut Criterion, group_name: &str, level: i32) {
         group.throughput(Throughput::Elements(n));
         for engine in [Engine::Ours, Engine::RocksDb] {
             group.bench_with_input(BenchmarkId::new(engine.label(), n), &n, |b, _| {
+                let mut samples = Vec::new();
                 b.iter_custom(|iters| {
                     let mut total = Duration::ZERO;
                     for _ in 0..iters {
-                        total += run_compaction(engine, level, &inputs).unwrap_or_else(|e| {
+                        let elapsed = run_compaction(engine, level, &inputs).unwrap_or_else(|e| {
                             panic!("run_compaction failed for {}: {e}", engine.label())
                         });
+                        samples.push(elapsed);
+                        total += elapsed;
                     }
                     total
                 });
+                report_percentiles(&format!("{group_name}/{}/{n}", engine.label()), samples);
             });
         }
     }

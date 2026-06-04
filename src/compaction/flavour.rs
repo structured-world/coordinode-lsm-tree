@@ -234,37 +234,51 @@ pub(super) fn install_merge(
         }
     }
 
-    super_version.upgrade_version(
-        &opts.config.path,
-        |current| {
-            let mut copy = current.clone();
+    // Handles kept for rollback: the output SSTs and blob files are already
+    // finalized on disk, so if the version edit fails they must be marked
+    // deleted here or they leak (the caller only un-hides the input tables).
+    // `created_blob_files` is moved into the closure, so clone for cleanup.
+    let rollback_blob_files = created_blob_files.clone();
+    super_version
+        .upgrade_version(
+            &opts.config.path,
+            |current| {
+                let mut copy = current.clone();
 
-            let ctx = crate::version::TransformContext::new(opts.config.comparator.as_ref());
-            copy.version = copy.version.with_merge(
-                &payload.table_ids.iter().copied().collect::<Vec<_>>(),
-                &created_tables,
-                payload.dest_level as usize,
-                if blob_frag_map.is_empty() {
-                    None
-                } else {
-                    Some(blob_frag_map)
-                },
-                created_blob_files,
-                &blob_files_to_drop
-                    .iter()
-                    .map(BlobFile::id)
-                    .collect::<HashSet<_>>(),
-                &ctx,
-            );
+                let ctx = crate::version::TransformContext::new(opts.config.comparator.as_ref());
+                copy.version = copy.version.with_merge(
+                    &payload.table_ids.iter().copied().collect::<Vec<_>>(),
+                    &created_tables,
+                    payload.dest_level as usize,
+                    if blob_frag_map.is_empty() {
+                        None
+                    } else {
+                        Some(blob_frag_map)
+                    },
+                    created_blob_files,
+                    &blob_files_to_drop
+                        .iter()
+                        .map(BlobFile::id)
+                        .collect::<HashSet<_>>(),
+                    &ctx,
+                );
 
-            Ok(copy)
-        },
-        &opts.global_seqno,
-        &opts.visible_seqno,
-        &*opts.config.fs,
-        opts.runtime_config.load_full(),
-        opts.encryption.clone(),
-    )?;
+                Ok(copy)
+            },
+            &opts.global_seqno,
+            &opts.visible_seqno,
+            &*opts.config.fs,
+            opts.runtime_config.load_full(),
+            opts.encryption.clone(),
+        )
+        .inspect_err(|_| {
+            for table in &created_tables {
+                table.mark_as_deleted();
+            }
+            for blob_file in &rollback_blob_files {
+                blob_file.mark_as_deleted();
+            }
+        })?;
 
     // NOTE: If the application were to crash >here< it's fine — the tables /
     // blob files are not referenced anymore and are cleaned up upon recovery.
@@ -444,7 +458,13 @@ impl CompactionFlavour for RelocatingCompaction {
         let tables_to_delete = std::mem::take(&mut self.inner.tables_to_rewrite);
 
         let created_tables = self.inner.consume_writer(opts, dst_lvl)?;
-        let mut created_blob_files = self.blob_writer.finish()?;
+        // The output SSTs are already finalized; if blob finalization fails the
+        // compaction aborts, so delete them here or they orphan on disk.
+        let mut created_blob_files = self.blob_writer.finish().inspect_err(|_| {
+            for table in &created_tables {
+                table.mark_as_deleted();
+            }
+        })?;
         created_blob_files.extend(extra_blob_files);
 
         Ok(ProducedOutput {
