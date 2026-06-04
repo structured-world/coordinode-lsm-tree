@@ -35,6 +35,7 @@ use crate::{
     fs::FsFile,
     table::BlockHandle,
 };
+use std::borrow::Cow;
 
 /// Safety cap on block payload size (256 MiB).
 ///
@@ -92,6 +93,47 @@ fn block_has_parity(header: &Header, transform: &BlockTransform<'_>) -> bool {
         header.block_flags & header::block_flags::ECC_PARITY != 0
     } else {
         transform.page_ecc()
+    }
+}
+
+/// A block whose transform pipeline (compress → encrypt → checksum → ecc)
+/// has run, but whose framed bytes have not yet been written to the file.
+///
+/// Splitting "prepare" from "write" is what lets compaction run the
+/// CPU-bound transform stack on worker threads while a single thread keeps
+/// the file writes (and the index registration that depends on byte offsets)
+/// strictly ordered. The serial path stays zero-copy: `payload` borrows the
+/// caller's `data` on the uncompressed/unencrypted path and owns it only when
+/// a transform produced a fresh buffer. A worker thread takes ownership via
+/// [`PreparedBlock::into_owned`] so the prepared block can outlive `data`.
+pub(crate) struct PreparedBlock<'a> {
+    header: Header,
+    payload: Cow<'a, [u8]>,
+    /// Reed-Solomon parity trailer, present only when page-ECC is active and
+    /// the payload was non-empty. Always `None` without the `page_ecc` feature.
+    parity: Option<Vec<u8>>,
+}
+
+impl PreparedBlock<'_> {
+    /// Writes the framed block (header + payload + optional parity trailer)
+    /// to `writer` and returns the header. This is the single point where
+    /// block bytes hit the file, so it must run in on-disk order.
+    pub(crate) fn write_to<W: std::io::Write>(self, mut writer: &mut W) -> crate::Result<Header> {
+        self.header.encode_into(&mut writer)?;
+        writer.write_all(&self.payload)?;
+        if let Some(parity) = &self.parity {
+            writer.write_all(parity)?;
+        }
+
+        log::trace!(
+            "Writing block with size {}B (on-disk: {}B, ecc: {}B) (excluding header of {}B)",
+            self.header.uncompressed_length,
+            self.header.data_length,
+            self.parity.as_ref().map_or(0, Vec::len),
+            Header::header_len(self.header.block_type),
+        );
+
+        Ok(self.header)
     }
 }
 
@@ -249,19 +291,33 @@ impl Block {
     /// caller could only guess magic values and a wrong bit would serialize
     /// a header claiming a transform the payload doesn't carry. External
     /// code uses the safe [`Self::write_into`] wrapper instead.
-    #[expect(
-        clippy::too_many_lines,
-        reason = "linear writer pipeline: compress → encrypt → checksum → ecc; \
-                  each step is small but they share state (header, payload, owned buffers) \
-                  so factoring would just hide the data flow"
-    )]
     pub(crate) fn write_into_with_flags<W: std::io::Write>(
-        mut writer: &mut W,
+        writer: &mut W,
         data: &[u8],
         identity: BlockIdentity,
         transform: &BlockTransform<'_>,
         extra_flags: u8,
     ) -> crate::Result<Header> {
+        Self::prepare_with_flags(data, identity, transform, extra_flags)?.write_to(writer)
+    }
+
+    /// Runs the block transform pipeline (compress → encrypt → checksum → ecc)
+    /// and returns a [`PreparedBlock`] ready to be framed to disk by
+    /// [`PreparedBlock::write_to`]. Pure CPU work, no I/O — safe to run on a
+    /// worker thread for parallel compaction. See [`Self::write_into_with_flags`]
+    /// for the `extra_flags` contract.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "linear transform pipeline: compress → encrypt → checksum → ecc; \
+                  each step is small but they share state (header, payload, owned buffers) \
+                  so factoring would just hide the data flow"
+    )]
+    pub(crate) fn prepare_with_flags<'a>(
+        data: &'a [u8],
+        identity: BlockIdentity,
+        transform: &BlockTransform<'_>,
+        extra_flags: u8,
+    ) -> crate::Result<PreparedBlock<'a>> {
         // Unpack the transform back to the (compression, encryption,
         // zstd_dict) triple the implementation below was written
         // against. The transform's accessor methods carry the
@@ -384,17 +440,19 @@ impl Block {
             encrypted_buf = encryption.map(|enc| enc.encrypt(data)).transpose()?;
         }
 
-        // Determine the final on-disk payload reference.
-        let payload: &[u8] = if let Some(ref enc) = encrypted_buf {
-            enc
+        // Determine the final on-disk payload. Owns a fresh buffer when a
+        // transform produced one; borrows the caller's `data` otherwise, so the
+        // serial uncompressed/unencrypted path stays zero-copy.
+        let payload: Cow<'a, [u8]> = if let Some(enc) = encrypted_buf {
+            Cow::Owned(enc)
         } else {
             #[cfg(any(feature = "lz4", zstd_any))]
             {
-                compressed_buf.as_deref().unwrap_or(data)
+                compressed_buf.map_or(Cow::Borrowed(data), Cow::Owned)
             }
             #[cfg(not(any(feature = "lz4", zstd_any)))]
             {
-                data
+                Cow::Borrowed(data)
             }
         };
 
@@ -424,7 +482,7 @@ impl Block {
         let payload_len = payload.len() as u32;
 
         header.data_length = payload_len;
-        header.checksum = Checksum::from_raw(crate::hash::hash128(payload));
+        header.checksum = Checksum::from_raw(crate::hash::hash128(&payload));
 
         // Optional Reed-Solomon parity trailer. The parity LENGTH is not
         // stored in the header: it is `expected_parity_len(data_length)`,
@@ -435,7 +493,7 @@ impl Block {
         // compiler folds it out.
         #[cfg(feature = "page_ecc")]
         let parity_buf: Option<Vec<u8>> = if transform.page_ecc() {
-            let p = crate::ecc::encode_parity(payload)?;
+            let p = crate::ecc::encode_parity(&payload)?;
             // parity_len is shard_bytes * RS_PARITY_SHARDS where
             // shard_bytes <= payload.len(). payload_len fits in u32
             // (checked above), so parity_len fits in u32 too; the
@@ -460,21 +518,11 @@ impl Block {
         #[cfg(not(feature = "page_ecc"))]
         let parity_buf: Option<Vec<u8>> = None;
 
-        header.encode_into(&mut writer)?;
-        writer.write_all(payload)?;
-        if let Some(parity) = &parity_buf {
-            writer.write_all(parity)?;
-        }
-
-        log::trace!(
-            "Writing block with size {}B (on-disk: {}B, ecc: {}B) (excluding header of {}B)",
-            header.uncompressed_length,
-            header.data_length,
-            parity_buf.as_ref().map_or(0, Vec::len),
-            Header::header_len(header.block_type),
-        );
-
-        Ok(header)
+        Ok(PreparedBlock {
+            header,
+            payload,
+            parity: parity_buf,
+        })
     }
 
     /// Reads a block from a reader.
