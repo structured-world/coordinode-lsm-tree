@@ -8,7 +8,6 @@
 //! block compression only changes *how* blocks are produced, never *what*.
 
 #![cfg(all(feature = "std", feature = "parallel"))]
-#![expect(clippy::unwrap_used, reason = "test code")]
 
 use lsm_tree::config::BlockSizePolicy;
 use lsm_tree::{AbstractTree, AnyTree, Config, MAX_SEQNO, SequenceNumberCounter};
@@ -27,8 +26,8 @@ fn value_for(i: u64) -> String {
 
 /// Builds a tree at `compaction_threads`, fills it, and major-compacts so the
 /// compaction runs through the parallel (or serial) block-compression path.
-fn build(compaction_threads: usize) -> (AnyTree, TempDir) {
-    let dir = tempdir().unwrap();
+fn build(compaction_threads: usize) -> lsm_tree::Result<(AnyTree, TempDir)> {
+    let dir = tempdir()?;
     let tree = Config::new(
         &dir,
         SequenceNumberCounter::default(),
@@ -36,35 +35,35 @@ fn build(compaction_threads: usize) -> (AnyTree, TempDir) {
     )
     .data_block_size_policy(BlockSizePolicy::all(512))
     .compaction_threads(compaction_threads)
-    .open()
-    .unwrap();
+    .open()?;
 
     for i in 0..N {
         tree.insert(key_for(i), value_for(i), i);
     }
-    tree.flush_active_memtable(0).unwrap();
-    tree.major_compact(u64::MAX, 0).unwrap();
+    tree.flush_active_memtable(0)?;
+    tree.major_compact(u64::MAX, 0)?;
 
-    (tree, dir)
+    Ok((tree, dir))
 }
 
 #[test]
-fn parallel_compaction_matches_serial_via_config() {
-    let (parallel, _dp) = build(4);
-    let (serial, _ds) = build(1);
+fn parallel_compaction_matches_serial_via_config() -> lsm_tree::Result<()> {
+    let (parallel, _dp) = build(4)?;
+    let (serial, _ds) = build(1)?;
 
     for i in 0..N {
         let key = key_for(i);
         let expected = value_for(i);
         assert_eq!(
-            parallel.get(&key, MAX_SEQNO).unwrap().as_deref(),
+            parallel.get(&key, MAX_SEQNO)?.as_deref(),
             Some(expected.as_bytes()),
             "parallel: wrong/missing value for {key}",
         );
         assert_eq!(
-            serial.get(&key, MAX_SEQNO).unwrap().as_deref(),
+            serial.get(&key, MAX_SEQNO)?.as_deref(),
             Some(expected.as_bytes()),
             "serial: wrong/missing value for {key}",
         );
     }
+    Ok(())
 }
