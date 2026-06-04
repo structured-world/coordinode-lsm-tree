@@ -45,6 +45,11 @@ pub(super) fn prepare_table_writer(
     version: &Version,
     opts: &Options,
     payload: &CompactionPayload,
+    // When false, the writer compresses blocks serially. Used by parallel
+    // sub-compactions, which already run on the compaction pool: re-submitting
+    // block compression to the same pool from a pool thread would deadlock
+    // (the draining thread parks on a worker slot that can't be scheduled).
+    block_parallel: bool,
 ) -> crate::Result<MultiWriter> {
     let (table_base_folder, level_fs) = opts.config.tables_folder_for_level(payload.dest_level);
 
@@ -155,11 +160,19 @@ pub(super) fn prepare_table_writer(
     // Parallel block compression: hand the (per-tree or caller-shared) pool to
     // the writer so its CPU-bound transform work runs on worker threads while
     // writes stay ordered. None / single-thread leaves the serial path.
+    // Skipped for sub-compaction writers (block_parallel = false), which already
+    // occupy a pool thread and would deadlock re-submitting to the same pool.
     #[cfg(feature = "std")]
-    let table_writer = table_writer.use_parallel_compression(
-        opts.config.compaction_pool.clone(),
-        opts.config.compaction_threads,
-    );
+    let table_writer = if block_parallel {
+        table_writer.use_parallel_compression(
+            opts.config.compaction_pool.clone(),
+            opts.config.compaction_threads,
+        )
+    } else {
+        table_writer
+    };
+    #[cfg(not(feature = "std"))]
+    let _ = block_parallel;
 
     Ok(table_writer)
 }

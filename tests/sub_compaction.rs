@@ -99,6 +99,14 @@ fn assert_parallel_matches_serial(kv_separation: bool) {
         );
     }
 
+    // Serial baseline: single-threaded major compaction into the bottom level
+    // with sub-compaction disabled produces exactly one merged table.
+    assert_eq!(
+        serial.table_count(),
+        1,
+        "serial baseline should produce a single merged table (kv_separation={kv_separation})",
+    );
+
     // Non-vacuous: the parallel compaction must actually have split into more
     // output tables than the single-table serial compaction.
     assert!(

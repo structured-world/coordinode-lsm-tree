@@ -93,7 +93,7 @@ impl CompactionResult {
 ///
 /// The compaction strategy chooses which tables to compact and how.
 /// That information is given to the compactor.
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Debug, Clone, Eq, PartialEq)]
 pub struct Input {
     /// Tables to compact
     pub table_ids: HashSet<TableId>,

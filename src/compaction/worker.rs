@@ -41,6 +41,7 @@ pub type CompactionReader<'a> = Box<dyn Iterator<Item = crate::Result<InternalVa
 pub const SUBCOMPACTION_MIN_INPUT_BYTES: u64 = 8 * 1024 * 1024;
 
 /// Compaction options
+#[derive(Clone)]
 pub struct Options {
     pub tree_id: TreeId,
 
@@ -344,6 +345,17 @@ fn ranges_from_boundaries(
     ranges
 }
 
+/// Error returned when a sub-compaction is interrupted by the stop signal, so
+/// the parallel caller re-shows the inputs and skips the atomic install instead
+/// of committing a truncated sub-range.
+#[cfg(feature = "std")]
+fn cancelled_compaction() -> crate::Error {
+    crate::Error::Io(std::io::Error::new(
+        std::io::ErrorKind::Interrupted,
+        "sub-compaction cancelled by stop signal",
+    ))
+}
+
 /// Runs one sub-compaction over the key range `bounds`: builds a bounded merge
 /// stream of the inputs, applies the same transforms as the serial path
 /// (tombstone eviction, KV-separation drop tracking, compaction filter), writes
@@ -384,15 +396,14 @@ fn run_subcompaction(
         opts.config.merge_operator.clone(),
         opts.config.comparator.clone(),
     ) else {
-        // Inputs vanished mid-flight (validated by the caller, so unexpected):
-        // emit an empty output rather than corrupting the merge.
-        let table_writer = super::flavour::prepare_table_writer(version, opts, payload)?;
-        return Box::new(StandardCompaction::new(table_writer, tables_for_deletion)).produce(
-            opts,
-            dst_lvl,
-            blob_frag_map,
-            Vec::new(),
-        );
+        // The caller validated every input exists, so a missing table here is
+        // unexpected. Fail closed: an empty output would let the install delete
+        // the source tables (this range may own input deletion) while producing
+        // no replacement SSTs. Returning an error makes the parallel caller
+        // re-show the inputs and skip the install entirely.
+        return Err(crate::Error::Io(std::io::Error::other(
+            "sub-compaction input tables disappeared mid-flight",
+        )));
     };
 
     merge_iter = merge_iter
@@ -422,7 +433,9 @@ fn run_subcompaction(
         &filter_ctx,
     ));
 
-    let table_writer = super::flavour::prepare_table_writer(version, opts, payload)?;
+    // block_parallel = false: this sub-compaction already runs on a pool thread,
+    // so its block compression must stay serial (nested-pool deadlock otherwise).
+    let table_writer = super::flavour::prepare_table_writer(version, opts, payload, false)?;
     let mut compactor: Box<dyn CompactionFlavour> =
         Box::new(StandardCompaction::new(table_writer, tables_for_deletion));
 
@@ -441,15 +454,17 @@ fn run_subcompaction(
             .rate_limiter
             .request_interruptible(io_bytes, || opts.stop_signal.is_stopped())
         {
-            log::debug!("Stopping sub-compaction because of stop signal (I/O throttle)");
-            break;
+            // Abort, do not produce: a truncated sub-range would be installed
+            // atomically alongside its siblings, dropping the unwritten tail of
+            // this range (a gap in the middle of the key space). The error makes
+            // the caller re-show the inputs and skip the install.
+            return Err(cancelled_compaction());
         }
 
         compactor.write(item)?;
 
         if idx % 1_000_000 == 0 && opts.stop_signal.is_stopped() {
-            log::debug!("Stopping sub-compaction because of stop signal");
-            break;
+            return Err(cancelled_compaction());
         }
     }
 
@@ -651,7 +666,9 @@ fn merge_tables(
         return Ok(CompactionResult::nothing());
     }
 
-    let current_super_version = version_history_lock.latest_version();
+    // Arc so the snapshot can be shared with sub-compactions running on the
+    // configured compaction pool (fire-and-forget executor needs `'static`).
+    let current_super_version = Arc::new(version_history_lock.latest_version());
 
     let Some(tables) = payload
         .table_ids
@@ -729,65 +746,92 @@ fn merge_tables(
                 .hide(payload.table_ids.iter().copied());
             drop(compaction_state);
 
-            // First range runs on this thread; the rest on scoped workers. Only
-            // the first carries the input tables to delete, so they are dropped
-            // exactly once at install.
+            // Run the sub-compactions on the configured compaction pool (NOT raw
+            // threads), so a caller-shared pool bounds total threads across
+            // trees. The executor is fire-and-forget + `'static`, so each task
+            // owns an Arc'd snapshot of the context; results come back over an
+            // mpsc channel, indexed by range. Only range 0 carries the input
+            // tables to delete, so they are dropped exactly once at install. No
+            // pool configured (e.g. caller injected none) → run sequentially.
             let num_ranges = ranges.len();
-            // `ranges_from_boundaries` always emits at least two ranges when
-            // boundaries is non-empty (checked above), so split_first is Some.
-            let Some((first_range, rest_ranges)) = ranges.split_first() else {
-                unreachable!("non-empty boundaries yield >= 2 ranges");
-            };
+            let only_first_owns_inputs =
+                |idx: usize| if idx == 0 { tables.clone() } else { Vec::new() };
 
             let outputs: Vec<crate::Result<super::flavour::ProducedOutput>> =
-                std::thread::scope(|scope| {
-                    let version = &current_super_version.version;
-                    let rts = input_range_tombstones.as_slice();
-                    let blobs_dir = blobs_folder.as_path();
+                if let Some(spawner) = opts.config.compaction_pool.clone() {
+                    let opts = Arc::new(opts.clone());
+                    let payload = Arc::new(payload.clone());
+                    let version = Arc::clone(&current_super_version);
+                    let rts = Arc::new(input_range_tombstones.clone());
+                    let blobs = Arc::new(blobs_folder);
 
-                    let handles: Vec<_> = rest_ranges
-                        .iter()
-                        .map(|range| {
-                            let range = range.clone();
-                            scope.spawn(move || {
-                                run_subcompaction(
-                                    opts,
-                                    payload,
-                                    version,
-                                    Vec::new(),
-                                    rts,
-                                    range,
-                                    dst_lvl,
-                                    is_last_level,
-                                    blobs_dir,
-                                )
-                            })
-                        })
-                        .collect();
-
-                    let first = run_subcompaction(
-                        opts,
-                        payload,
-                        version,
-                        tables.clone(),
-                        rts,
-                        first_range.clone(),
-                        dst_lvl,
-                        is_last_level,
-                        blobs_dir,
-                    );
-
-                    let mut outputs = Vec::with_capacity(num_ranges);
-                    outputs.push(first);
-                    for handle in handles {
-                        outputs.push(handle.join().unwrap_or_else(|_| {
-                            Err(crate::Error::Io(std::io::Error::other(
-                                "sub-compaction worker panicked",
-                            )))
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    for (idx, range) in ranges.iter().cloned().enumerate() {
+                        let tx = tx.clone();
+                        let opts = Arc::clone(&opts);
+                        let payload = Arc::clone(&payload);
+                        let version = Arc::clone(&version);
+                        let rts = Arc::clone(&rts);
+                        let blobs = Arc::clone(&blobs);
+                        let tables_for_deletion = only_first_owns_inputs(idx);
+                        spawner.spawn(Box::new(move || {
+                            let out = run_subcompaction(
+                                &opts,
+                                &payload,
+                                &version.version,
+                                tables_for_deletion,
+                                &rts,
+                                range,
+                                dst_lvl,
+                                is_last_level,
+                                &blobs,
+                            );
+                            // The receiver outlives every send (it drains N
+                            // items below), so this cannot fail.
+                            let _ = tx.send((idx, out));
                         }));
                     }
-                    outputs
-                });
+                    drop(tx);
+
+                    let mut slots: Vec<Option<crate::Result<super::flavour::ProducedOutput>>> =
+                        (0..num_ranges).map(|_| None).collect();
+                    for (idx, out) in rx {
+                        if let Some(slot) = slots.get_mut(idx) {
+                            *slot = Some(out);
+                        }
+                    }
+                    slots
+                        .into_iter()
+                        .map(|slot| {
+                            slot.unwrap_or_else(|| {
+                                // A worker panicked before sending: treat as a
+                                // failed sub-compaction so install is skipped.
+                                Err(crate::Error::Io(std::io::Error::other(
+                                    "sub-compaction worker did not report a result",
+                                )))
+                            })
+                        })
+                        .collect()
+                } else {
+                    ranges
+                        .iter()
+                        .cloned()
+                        .enumerate()
+                        .map(|(idx, range)| {
+                            run_subcompaction(
+                                opts,
+                                payload,
+                                &current_super_version.version,
+                                only_first_owns_inputs(idx),
+                                &input_range_tombstones,
+                                range,
+                                dst_lvl,
+                                is_last_level,
+                                &blobs_folder,
+                            )
+                        })
+                        .collect()
+                };
 
             let outputs = outputs
                 .into_iter()
@@ -884,8 +928,9 @@ fn merge_tables(
         &filter_ctx,
     ));
 
+    // Serial (single-stream) compaction: block compression may use the pool.
     let table_writer =
-        super::flavour::prepare_table_writer(&current_super_version.version, opts, payload)?;
+        super::flavour::prepare_table_writer(&current_super_version.version, opts, payload, true)?;
 
     let start = Instant::now();
 
