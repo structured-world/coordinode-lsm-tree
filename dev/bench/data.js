@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1780571295091,
+  "lastUpdate": 1780596256195,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -13026,6 +13026,84 @@ window.BENCHMARK_DATA = {
             "value": 552064.8921806776,
             "unit": "ops/sec",
             "extra": "P50: 1.6us | P99: 4.9us | P99.9: 7.3us\nthreads: 1 | elapsed: 0.36s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "bb2dfcef7f2d8a10c0d8639c4e61895fa6af24aa",
+          "message": "perf(compression): pass source-size hint on zstd block compression (#404)\n\n## Summary\n\nAt high zstd levels (btultra2 / L22) a small 4-64 KiB block compressed\n**without** a source-size hint allocates the full ~8 MiB parameter\ntables and the optimal parser grinds over them. An LSM compaction\ncompresses thousands of blocks per SST, so this dominated zstd-22\ncompaction CPU.\n\nMeasured (structured-zstd 0.0.28, L22, 4 KiB high-entropy blocks, single\nthread, release):\n\n| path | throughput |\n|------|-----------|\n| non-dict, hint set | 6.8 MB/s |\n| raw FrameCompressor, **no hint** | **0.2 MB/s** (~34x slower) |\n| dict path (before) | 0.2 MB/s |\n| dict path (after) | 4.7 MB/s |\n\n## Changes\n\n- **non-dict** `ZstdProvider::compress`: call\n`compress_slice_to_vec(&[u8])` directly instead of\n`compress_to_vec(Cursor)` — skips the `read_to_end` copy and sets the\nsource-size hint internally.\n- **dict** `ZstdProvider::compress_with_dict`:\n`set_source_size_hint(data.len())` before `compress()` so btultra2\nselects the small-source parameter set.\n\n## Correctness\n\nOutput stays a valid, independently-decodable frame — the hint only\naffects table sizing / the window-size header. Roundtrip + cross-decode\n+ dict-roundtrip tests (91) pass unchanged. No wire-format or\nframe-independence change.\n\n## Follow-up (separate)\n\nstructured-zstd PR #336 adds the incompressible early-out, a tiny-input\ntable-size cap, prepared-dictionary reuse, and a public\n`compress_independent_frame` (CCtx-equivalent). Once it ships a release,\nadopt `compress_independent_frame` to reuse one compressor across blocks\n(amortize matcher tables, full RocksDB-style context reuse).\n\nCloses #403\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n\n## Summary by CodeRabbit\n\n* **Refactor**\n* Optimized compression backend efficiency with improved algorithm\nparameter selection for different data sizes.\n\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-06-04T19:34:13+03:00",
+          "tree_id": "b5ecff6b2d763ab524a33590c1563bd6bb4f3802",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/bb2dfcef7f2d8a10c0d8639c4e61895fa6af24aa"
+        },
+        "date": 1780596252821,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 2023121.3024992517,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.6us | P99.9: 3.7us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1188532.8826163088,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.2us | P99.9: 4.3us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 657404.9161166941,
+            "unit": "ops/sec",
+            "extra": "P50: 1.4us | P99: 4.5us | P99.9: 6.9us\nthreads: 1 | elapsed: 0.30s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3654225.757628799,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 3.0us | P99.9: 5.4us\nthreads: 1 | elapsed: 0.05s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 439518.35785111773,
+            "unit": "ops/sec",
+            "extra": "P50: 2.0us | P99: 5.3us | P99.9: 7.9us\nthreads: 1 | elapsed: 0.46s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 220153.53461271647,
+            "unit": "ops/sec",
+            "extra": "P50: 4.2us | P99: 5.3us | P99.9: 8.1us\nthreads: 1 | elapsed: 0.91s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1234362.9436492517,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.2us | P99.9: 4.3us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1100306.9465771986,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.5us | P99.9: 1.9us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 543838.0481617645,
+            "unit": "ops/sec",
+            "extra": "P50: 1.6us | P99: 6.2us | P99.9: 9.2us\nthreads: 1 | elapsed: 0.37s | num: 200000 | iterations: 3"
           }
         ]
       }
