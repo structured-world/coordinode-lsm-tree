@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1780518596023,
+  "lastUpdate": 1780543611612,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -12792,6 +12792,84 @@ window.BENCHMARK_DATA = {
             "value": 454461.49485001503,
             "unit": "ops/sec",
             "extra": "P50: 2.0us | P99: 5.4us | P99.9: 7.9us\nthreads: 1 | elapsed: 0.44s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "0fdc96589ebc4239c2fb040fbe8e7dfe5ca5bf89",
+          "message": "perf(table): size-adaptive block index — single-level for small SSTs (#397)\n\n## Summary\n\nCloses the #1 read-path gap vs RocksDB: **point_read was ~1.6× slower**\nbecause every SST got an unconditional two-level (partitioned) index, so\neach point read paid an extra index level — even for tiny SSTs where\npinning the whole index is cheap and the extra level is pure overhead.\n\nThis adds a **size-adaptive index** (`AdaptiveIndexWriter`, streaming\nspill): single-level (`Full`) index while the index stays at or below\nthe spill threshold; the moment it grows past, it spills (replays the\nbuffer into a streaming `PartitionedIndexWriter` and forwards the rest)\n→ two-level. Memory stays bounded by the threshold; the two-level layout\nstill bounds resident index RAM for genuinely large SSTs (only the TLI\nstays pinned).\n\n## Measured (compare-rocksdb, production default)\n\n| point_read | before (2-level) | after (adaptive) |\n|---|---|---|\n| /1000 | 1.56 ms (**1.60×** vs rocksdb) | 1.17 ms (**1.16×**) |\n| /10000 | 16.9 ms (~1.6×) | 13.6 ms (~1.29×) |\n\nrocksdb control stable ~1.0 ms / ~10.5 ms.\n\n## Why it's safe (no format change)\n\nThe reader already selects `Full` vs `TwoLevel` from **each SST's own\nregion layout** (`regions.index.is_some()`), so this is a\n**write-policy** change, not an on-disk format change. Both layouts\ncoexist; old (two-level) SSTs read unchanged; new small SSTs are written\nsingle-level.\n\n## Changes\n\n- `AdaptiveIndexWriter` (`src/table/writer/index/adaptive.rs`) —\nstreaming spill, reuses `Full`/`Partitioned` writers verbatim.\n- Wired into all write paths (flush, compaction, ingest, blob tree) in\nplace of unconditional `use_partitioned_index`. Pure always-partition\nremains available via `use_adaptive_index(0)`.\n- Threshold default `DEFAULT_SPILL_THRESHOLD = 256 KiB` (keeps typical\nSSTs single-level; genuinely large indexes still partition).\n\n## Tests\n\n- `adaptive_index_small_sst_is_single_level`: small SST → `Full`\n(`regions.index.is_none()`), reads correct.\n- `adaptive_index_zero_threshold_spills_to_two_level`: threshold 0 →\n`TwoLevel`, same keys read back — both layouts round-trip identically.\n- All 1055 lib tests pass; clippy `--all-features --all-targets`, fmt,\nrustdoc clean.\n\n## Follow-up (not in this PR)\n\nPromote the threshold to a runtime-toggleable **manifest parameter**\n(`RuntimeConfig`), so it's durable + tunable without recompiling.\nTracked for a follow-up commit.\n\nPart of #396\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n## Summary by CodeRabbit\n\n* **New Features**\n* SST index writing is now size-adaptive: small indexes stay\nsingle-level; larger indexes automatically spill to a partitioned layout\nfor ingests, flushes, and compactions.\n\n* **Configuration**\n* Added a runtime-tunable spill threshold controlling when indexes\nspill; has a sensible default and takes effect on next flush/compaction.\n\n* **Tests**\n* Added end-to-end tests verifying adaptive-index layout selection and\nround-trip reads for both single-level and spilled cases.\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-06-03T22:07:12Z",
+          "tree_id": "a0a39f757348834256995c36e9e3ae95949c1373",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/0fdc96589ebc4239c2fb040fbe8e7dfe5ca5bf89"
+        },
+        "date": 1780543609712,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 2066320.584142217,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.6us | P99.9: 3.7us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1186541.484720665,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.2us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 663065.2960280377,
+            "unit": "ops/sec",
+            "extra": "P50: 1.4us | P99: 4.4us | P99.9: 6.8us\nthreads: 1 | elapsed: 0.30s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3655067.213396494,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 3.0us | P99.9: 5.4us\nthreads: 1 | elapsed: 0.05s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 440295.70823343465,
+            "unit": "ops/sec",
+            "extra": "P50: 2.0us | P99: 5.2us | P99.9: 7.9us\nthreads: 1 | elapsed: 0.45s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 223864.02481223783,
+            "unit": "ops/sec",
+            "extra": "P50: 4.2us | P99: 5.2us | P99.9: 7.7us\nthreads: 1 | elapsed: 0.89s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1253599.5151327795,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.2us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1116939.3440448674,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 1.4us | P99.9: 1.8us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 548838.2540350877,
+            "unit": "ops/sec",
+            "extra": "P50: 1.6us | P99: 6.1us | P99.9: 9.0us\nthreads: 1 | elapsed: 0.36s | num: 200000 | iterations: 3"
           }
         ]
       }
