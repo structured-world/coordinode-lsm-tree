@@ -833,17 +833,37 @@ fn merge_tables(
                         .collect()
                 };
 
-            let outputs = outputs
-                .into_iter()
-                .collect::<crate::Result<Vec<_>>>()
-                .inspect_err(|e| {
-                    log::error!("Sub-compaction failed: {e:?}");
+            // Collect outputs keeping every successful one, so a single failed
+            // range can roll back the SSTs/blob files its succeeded siblings
+            // already finalized on disk (collecting straight into Result would
+            // drop those Ok outputs and leak their files). On the first error:
+            // mark the committed outputs deleted, un-hide the inputs, propagate.
+            let mut committed = Vec::with_capacity(outputs.len());
+            let mut first_err = None;
+            for out in outputs {
+                match out {
+                    Ok(done) => committed.push(done),
+                    Err(e) => {
+                        first_err = Some(e);
+                        break;
+                    }
+                }
+            }
+            if let Some(err) = first_err {
+                log::error!("Sub-compaction failed: {err:?}");
+                for done in &committed {
+                    done.rollback_uninstalled();
+                }
+                {
                     #[expect(clippy::expect_used, reason = "lock is expected to not be poisoned")]
                     let mut state = opts.compaction_state.lock().expect("lock is poisoned");
                     state
                         .hidden_set_mut()
                         .show(payload.table_ids.iter().copied());
-                })?;
+                }
+                return Err(err);
+            }
+            let outputs = committed;
 
             // Re-acquire locks and install one atomic version edit for all outputs.
             #[expect(clippy::expect_used, reason = "lock is expected to not be poisoned")]

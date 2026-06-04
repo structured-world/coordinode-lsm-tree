@@ -192,6 +192,24 @@ pub(super) struct ProducedOutput {
     blob_frag_map: FragmentationMap,
 }
 
+impl ProducedOutput {
+    /// Marks this produced-but-not-installed output's freshly written files as
+    /// deleted. Used when a sibling sub-compaction fails and the shared
+    /// [`install_merge`] is skipped: each already-finished sub-compaction has
+    /// finalized its SSTs and blob files on disk, so without this they would be
+    /// orphaned. Only the newly created files are dropped — input tables stay
+    /// intact (the caller un-hides them) and rewritten-blob-file drops are left
+    /// for a later successful compaction.
+    pub(super) fn rollback_uninstalled(&self) {
+        for table in &self.created_tables {
+            table.mark_as_deleted();
+        }
+        for blob_file in &self.created_blob_files {
+            blob_file.mark_as_deleted();
+        }
+    }
+}
+
 // TODO: find a better name
 pub(super) trait CompactionFlavour {
     fn write(&mut self, item: InternalValue) -> crate::Result<()>;
