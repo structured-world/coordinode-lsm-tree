@@ -239,8 +239,14 @@ pub struct ZstdProvider;
 
 impl CompressionProvider for ZstdProvider {
     fn compress(data: &[u8], level: i32) -> crate::Result<Vec<u8>> {
-        let compressed = structured_zstd::encoding::compress_to_vec(
-            std::io::Cursor::new(data),
+        // `compress_slice_to_vec` (not `compress_to_vec`) for two reasons:
+        //   1. it takes `&[u8]`, skipping the `read_to_end` copy the generic
+        //      `Read` adapter does;
+        //   2. it sets the source-size hint, which at high levels (btultra2 /
+        //      L22) selects the small-source parameter set instead of the full
+        //      8 MiB tables — ~34x faster on the 4-64 KiB blocks an LSM writes.
+        let compressed = structured_zstd::encoding::compress_slice_to_vec(
+            data,
             structured_zstd::encoding::CompressionLevel::from_level(level),
         );
         Ok(compressed)
@@ -376,6 +382,11 @@ impl CompressionProvider for ZstdProvider {
                     v
                 },
             );
+            // Size hint so btultra2 (L22) picks the small-source parameter set
+            // for this 4-64 KiB block instead of allocating the full 8 MiB
+            // tables — without it dictionary block compression at L22 runs ~34x
+            // slower (the matcher reset rebuilds the large tables every call).
+            compressor.set_source_size_hint(data.len() as u64);
             compressor.set_source(std::io::Cursor::new(src_buf));
             compressor.set_drain(Vec::new());
             compressor.compress();
