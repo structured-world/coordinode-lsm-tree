@@ -39,7 +39,7 @@ path = "src/lib.rs"
 # crate MUST be no-std-friendly: prefer `core::*` / `alloc::*`, gate
 # std-only primitives behind `#[cfg(feature = "std")]`, and pick external
 # crates that support no-std.
-default = ["std"]
+default = ["std", "parallel"]
 std = [
     "dep:arc-swap",
     "dep:tempfile",
@@ -47,6 +47,12 @@ std = [
     "rustc-hash/std",
     "varint-rs/std",
 ]
+# Parallel block-compression pipeline (default executor: rayon thread pool).
+# std-only — there are no threads below std. The pipeline itself is reached
+# through the `CompactionSpawner` trait (available with just `std`), so callers
+# can inject a custom executor without this feature; `parallel` only adds the
+# built-in rayon-backed `RayonSpawner` default.
+parallel = ["std", "dep:rayon"]
 # `alloc` is the minimal hard requirement — the crate uses `Arc`,
 # `Vec`, `Box` everywhere. Listed explicitly so consumers can pick it up
 # without enabling `std` once the no-std migration completes per-module.
@@ -182,6 +188,12 @@ rand_chacha = { version = "0.10", optional = true }
 # Used by the optional `page_ecc` feature for per-block parity. Apache-2.0 /
 # MIT, matches our license stance.
 reed-solomon-simd = { version = "3", optional = true, default-features = false }
+# Work-stealing thread pool backing the default parallel block-compression
+# pipeline (the `parallel` feature). std-only by nature — there are no threads
+# below `std`; the pipeline is reached through the `CompactionSpawner` seam, so
+# rayon is just the default executor, not a hard dependency. Optional + gated so
+# minimal / no-std builds drop it.
+rayon = { version = "1.10", optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = { version = "0.7", optional = true }
@@ -259,3 +271,9 @@ name = "ecc"
 harness = false
 path = "benches/ecc.rs"
 required-features = ["page_ecc"]
+
+[[bench]]
+name = "compaction"
+harness = false
+path = "benches/compaction.rs"
+required-features = ["zstd"]

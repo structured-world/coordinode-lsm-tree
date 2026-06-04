@@ -521,6 +521,23 @@ pub struct Config {
     /// [`Config::compaction_rate_limit`].
     pub(crate) compaction_rate_limit: u64,
 
+    /// Worker-thread count for the parallel block-compression pipeline used
+    /// during compaction. Default `max(1, available_parallelism / 2)` — leaves
+    /// half the cores for application work. `1` (or no `parallel` feature) keeps
+    /// compaction on the serial path. Sizes the per-tree default pool built at
+    /// open when [`Self::compaction_pool`] is `None`. Set via
+    /// [`Config::compaction_threads`].
+    #[cfg(feature = "std")] // no-std: parallel compaction unavailable (no threads)
+    pub(crate) compaction_threads: usize,
+
+    /// Optional shared compaction thread pool. `None` (default) = a per-tree
+    /// pool is built at [`crate::Tree::open`] sized by [`Self::compaction_threads`]
+    /// (predictable, matches the per-DB pattern). `Some` = caller-supplied
+    /// executor shared across every tree holding this `Arc`, bounding total
+    /// threads regardless of tree count. Set via [`Config::compaction_pool`].
+    #[cfg(feature = "std")]
+    pub(crate) compaction_pool: Option<Arc<dyn crate::table::writer::CompactionSpawner>>,
+
     /// Pre-trained zstd dictionary for dictionary compression.
     ///
     /// When set together with a [`CompressionType::ZstdDict`] compression
@@ -631,6 +648,12 @@ impl Default for Config {
             manifest_recovery_mode: ManifestRecoveryMode::AbsoluteConsistency,
             sync_mode: SyncMode::Normal,
             compaction_rate_limit: 0,
+
+            #[cfg(feature = "std")]
+            compaction_threads: std::thread::available_parallelism()
+                .map_or(1, |n| (n.get() / 2).max(1)),
+            #[cfg(feature = "std")]
+            compaction_pool: None,
         }
     }
 }
@@ -1343,6 +1366,36 @@ impl Config {
     #[must_use]
     pub fn compaction_rate_limit(mut self, bytes_per_sec: u64) -> Self {
         self.compaction_rate_limit = bytes_per_sec;
+        self
+    }
+
+    /// Sets the compaction parallel-compression worker-thread count.
+    ///
+    /// Sizes the per-tree pool built at open when no shared pool is supplied
+    /// (see [`Self::compaction_pool`]). `1` keeps compaction serial. Default is
+    /// `max(1, available_parallelism / 2)`. Ignored without the `parallel`
+    /// feature (no built-in pool to size).
+    #[cfg(feature = "std")]
+    #[must_use]
+    pub fn compaction_threads(mut self, threads: usize) -> Self {
+        // Clamp to >= 1: the documented semantics treat `1` as "serial", and a
+        // 0-thread pool would be an invalid state.
+        self.compaction_threads = threads.max(1);
+        self
+    }
+
+    /// Supplies a shared compaction thread pool, used in place of the per-tree
+    /// default. Pass one [`crate::table::writer::CompactionSpawner`] (e.g. a
+    /// `RayonSpawner` wrapping a shared rayon thread pool) to several trees so
+    /// the total worker-thread count stays bounded by the pool size rather than
+    /// the number of open trees.
+    #[cfg(feature = "std")]
+    #[must_use]
+    pub fn compaction_pool(
+        mut self,
+        pool: Option<Arc<dyn crate::table::writer::CompactionSpawner>>,
+    ) -> Self {
+        self.compaction_pool = pool;
         self
     }
 

@@ -266,6 +266,21 @@ proptest! {
 }
 
 #[test]
+fn regression_rt_only_compaction_does_not_panic() -> Result<(), TestCaseError> {
+    // A compaction whose merged output is range-tombstone-only writes a
+    // synthetic sentinel block late in `finish()`. With parallel block
+    // compression that spill is submitted to the worker pool and MUST be
+    // drained before the index is finalized — otherwise the index writer sees
+    // zero data blocks and panics ("chunk should not be empty").
+    let ops = vec![
+        RtOp::DeleteRange { lo: 0, hi: 5 },
+        RtOp::Flush,
+        RtOp::Compact,
+    ];
+    run_rt_test(ops)
+}
+
+#[test]
 fn regression_point_read_after_flush_and_followup_insert() -> Result<(), TestCaseError> {
     let ops = vec![
         RtOp::Compact,

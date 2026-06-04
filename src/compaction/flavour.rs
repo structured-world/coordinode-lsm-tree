@@ -152,7 +152,31 @@ pub(super) fn prepare_table_writer(
     #[cfg(zstd_any)]
     let table_writer = table_writer.use_zstd_dictionary(opts.config.zstd_dictionary.clone());
 
+    // Parallel block compression: hand the (per-tree or caller-shared) pool to
+    // the writer so its CPU-bound transform work runs on worker threads while
+    // writes stay ordered. None / single-thread leaves the serial path.
+    #[cfg(feature = "std")]
+    let table_writer = table_writer.use_parallel_compression(
+        opts.config.compaction_pool.clone(),
+        opts.config.compaction_threads,
+    );
+
     Ok(table_writer)
+}
+
+/// Output of one (sub-)compaction's write phase: finalized SSTs and blob files
+/// plus what it consumed — everything needed to install a version edit, but
+/// WITHOUT touching the shared version. Splitting "produce" from "install" lets
+/// N parallel sub-compactions each finalize their files independently, then a
+/// single atomic version upgrade ([`install_merge`]) merges all of them.
+pub(super) struct ProducedOutput {
+    created_tables: Vec<Table>,
+    created_blob_files: Vec<BlobFile>,
+    /// Blob files this (sub-)compaction rewrote and must drop. Globally-dead
+    /// blob files are added once at install time, not per sub-compaction.
+    rewritten_blob_files_to_drop: Vec<BlobFile>,
+    tables_to_delete: Vec<Table>,
+    blob_frag_map: FragmentationMap,
 }
 
 // TODO: find a better name
@@ -162,16 +186,110 @@ pub(super) trait CompactionFlavour {
     /// Writes range tombstones to the current output table.
     fn write_range_tombstones(&mut self, tombstones: &[RangeTombstone]);
 
-    /// Finishes compaction and returns the number of output tables produced.
-    fn finish(
+    /// Finalizes this (sub-)compaction's output files (flushing the table
+    /// writer, finishing blob writers) WITHOUT installing a version edit. The
+    /// returned [`ProducedOutput`] is handed to [`install_merge`] — alone for a
+    /// single compaction, or alongside sibling outputs for parallel
+    /// sub-compactions.
+    fn produce(
         self: Box<Self>,
-        super_version: &mut SuperVersions,
         opts: &Options,
-        payload: &CompactionPayload,
         dst_lvl: usize,
         blob_frag_map: FragmentationMap,
         extra_blob_files: Vec<BlobFile>,
-    ) -> crate::Result<usize>;
+    ) -> crate::Result<ProducedOutput>;
+}
+
+/// Installs one atomic version edit replacing `payload.table_ids` with the SSTs
+/// and blob files produced by all `outputs` (one for a single compaction, N for
+/// parallel sub-compactions). Globally-dead blob files are dropped once here.
+/// Returns the total number of output tables.
+pub(super) fn install_merge(
+    super_version: &mut SuperVersions,
+    opts: &Options,
+    payload: &CompactionPayload,
+    outputs: Vec<ProducedOutput>,
+) -> crate::Result<usize> {
+    let mut created_tables = Vec::new();
+    let mut created_blob_files = Vec::new();
+    let mut blob_files_to_drop = Vec::new();
+    let mut tables_to_delete = Vec::new();
+    let mut blob_frag_map = FragmentationMap::default();
+
+    for out in outputs {
+        created_tables.extend(out.created_tables);
+        created_blob_files.extend(out.created_blob_files);
+        blob_files_to_drop.extend(out.rewritten_blob_files_to_drop);
+        tables_to_delete.extend(out.tables_to_delete);
+        out.blob_frag_map.merge_into(&mut blob_frag_map);
+    }
+
+    let tables_out = created_tables.len();
+
+    // Globally-dead blob files are dropped once, from the install-time version.
+    let current_version = super_version.latest_version();
+    for blob_file in current_version.version.blob_files.iter() {
+        if blob_file.is_dead(current_version.version.gc_stats()) {
+            blob_files_to_drop.push(blob_file.clone());
+        }
+    }
+
+    // Handles kept for rollback: the output SSTs and blob files are already
+    // finalized on disk, so if the version edit fails they must be marked
+    // deleted here or they leak (the caller only un-hides the input tables).
+    // `created_blob_files` is moved into the closure, so clone for cleanup.
+    let rollback_blob_files = created_blob_files.clone();
+    super_version
+        .upgrade_version(
+            &opts.config.path,
+            |current| {
+                let mut copy = current.clone();
+
+                let ctx = crate::version::TransformContext::new(opts.config.comparator.as_ref());
+                copy.version = copy.version.with_merge(
+                    &payload.table_ids.iter().copied().collect::<Vec<_>>(),
+                    &created_tables,
+                    payload.dest_level as usize,
+                    if blob_frag_map.is_empty() {
+                        None
+                    } else {
+                        Some(blob_frag_map)
+                    },
+                    created_blob_files,
+                    &blob_files_to_drop
+                        .iter()
+                        .map(BlobFile::id)
+                        .collect::<HashSet<_>>(),
+                    &ctx,
+                );
+
+                Ok(copy)
+            },
+            &opts.global_seqno,
+            &opts.visible_seqno,
+            &*opts.config.fs,
+            opts.runtime_config.load_full(),
+            opts.encryption.clone(),
+        )
+        .inspect_err(|_| {
+            for table in &created_tables {
+                table.mark_as_deleted();
+            }
+            for blob_file in &rollback_blob_files {
+                blob_file.mark_as_deleted();
+            }
+        })?;
+
+    // NOTE: If the application were to crash >here< it's fine — the tables /
+    // blob files are not referenced anymore and are cleaned up upon recovery.
+    for table in tables_to_delete {
+        table.mark_as_deleted();
+    }
+    for blob_file in blob_files_to_drop {
+        blob_file.mark_as_deleted();
+    }
+
+    Ok(tables_out)
 }
 
 /// Compaction worker that will relocate blobs that sit in blob files that are being rewritten
@@ -325,81 +443,37 @@ impl CompactionFlavour for RelocatingCompaction {
         Ok(())
     }
 
-    fn finish(
+    fn produce(
         mut self: Box<Self>,
-        super_version: &mut SuperVersions,
         opts: &Options,
-        payload: &CompactionPayload,
         dst_lvl: usize,
-        blob_frag_map_diff: FragmentationMap,
+        blob_frag_map: FragmentationMap,
         extra_blob_files: Vec<BlobFile>,
-    ) -> crate::Result<usize> {
+    ) -> crate::Result<ProducedOutput> {
         log::debug!(
             "Relocating compaction done in {:?}",
             self.inner.start.elapsed(),
         );
 
-        let table_ids_to_delete = std::mem::take(&mut self.inner.tables_to_rewrite);
+        let tables_to_delete = std::mem::take(&mut self.inner.tables_to_rewrite);
 
         let created_tables = self.inner.consume_writer(opts, dst_lvl)?;
-        let tables_out = created_tables.len();
-        let mut created_blob_files = self.blob_writer.finish()?;
+        // The output SSTs are already finalized; if blob finalization fails the
+        // compaction aborts, so delete them here or they orphan on disk.
+        let mut created_blob_files = self.blob_writer.finish().inspect_err(|_| {
+            for table in &created_tables {
+                table.mark_as_deleted();
+            }
+        })?;
         created_blob_files.extend(extra_blob_files);
 
-        let mut blob_files_to_drop = self.rewriting_blob_files;
-
-        let current_version = super_version.latest_version();
-
-        for blob_file in current_version.version.blob_files.iter() {
-            if blob_file.is_dead(current_version.version.gc_stats()) {
-                blob_files_to_drop.push(blob_file.clone());
-            }
-        }
-
-        super_version.upgrade_version(
-            &opts.config.path,
-            |current| {
-                let mut copy = current.clone();
-
-                let ctx = crate::version::TransformContext::new(opts.config.comparator.as_ref());
-                copy.version = copy.version.with_merge(
-                    &payload.table_ids.iter().copied().collect::<Vec<_>>(),
-                    &created_tables,
-                    payload.dest_level as usize,
-                    if blob_frag_map_diff.is_empty() {
-                        None
-                    } else {
-                        Some(blob_frag_map_diff)
-                    },
-                    created_blob_files,
-                    &blob_files_to_drop
-                        .iter()
-                        .map(BlobFile::id)
-                        .collect::<HashSet<_>>(),
-                    &ctx,
-                );
-
-                Ok(copy)
-            },
-            &opts.global_seqno,
-            &opts.visible_seqno,
-            &*opts.config.fs,
-            opts.runtime_config.load_full(),
-            opts.encryption.clone(),
-        )?;
-
-        // NOTE: If the application were to crash >here< it's fine
-        // The tables/blob files are not referenced anymore, and will be
-        // cleaned up upon recovery
-        for table in table_ids_to_delete {
-            table.mark_as_deleted();
-        }
-
-        for blob_file in blob_files_to_drop {
-            blob_file.mark_as_deleted();
-        }
-
-        Ok(tables_out)
+        Ok(ProducedOutput {
+            created_tables,
+            created_blob_files,
+            rewritten_blob_files_to_drop: self.rewriting_blob_files,
+            tables_to_delete,
+            blob_frag_map,
+        })
     }
 }
 
@@ -476,76 +550,28 @@ impl CompactionFlavour for StandardCompaction {
         Ok(())
     }
 
-    fn finish(
+    fn produce(
         mut self: Box<Self>,
-        super_version: &mut SuperVersions,
         opts: &Options,
-        payload: &CompactionPayload,
         dst_lvl: usize,
         blob_frag_map: FragmentationMap,
         extra_blob_files: Vec<BlobFile>,
-    ) -> crate::Result<usize> {
+    ) -> crate::Result<ProducedOutput> {
         log::debug!("Compaction done in {:?}", self.start.elapsed());
 
-        let table_ids_to_delete = std::mem::take(&mut self.tables_to_rewrite);
-
+        let tables_to_delete = std::mem::take(&mut self.tables_to_rewrite);
         let created_tables = self.consume_writer(opts, dst_lvl)?;
-        let tables_out = created_tables.len();
 
-        let mut blob_files_to_drop = Vec::default();
-
-        let current_version = super_version.latest_version();
-
-        for blob_file in current_version.version.blob_files.iter() {
-            if blob_file.is_dead(current_version.version.gc_stats()) {
-                blob_files_to_drop.push(blob_file.clone());
-            }
-        }
-
-        super_version.upgrade_version(
-            &opts.config.path,
-            |current| {
-                let mut copy = current.clone();
-
-                let ctx = crate::version::TransformContext::new(opts.config.comparator.as_ref());
-                copy.version = copy.version.with_merge(
-                    &payload.table_ids.iter().copied().collect::<Vec<_>>(),
-                    &created_tables,
-                    payload.dest_level as usize,
-                    if blob_frag_map.is_empty() {
-                        None
-                    } else {
-                        Some(blob_frag_map)
-                    },
-                    extra_blob_files,
-                    &blob_files_to_drop
-                        .iter()
-                        .map(BlobFile::id)
-                        .collect::<HashSet<_>>(),
-                    &ctx,
-                );
-
-                Ok(copy)
-            },
-            &opts.global_seqno,
-            &opts.visible_seqno,
-            &*opts.config.fs,
-            opts.runtime_config.load_full(),
-            opts.encryption.clone(),
-        )?;
-
-        // NOTE: If the application were to crash >here< it's fine
-        // The tables are not referenced anymore, and will be
-        // cleaned up upon recovery
-        for table in table_ids_to_delete {
-            table.mark_as_deleted();
-        }
-
-        for blob_file in blob_files_to_drop {
-            blob_file.mark_as_deleted();
-        }
-
-        Ok(tables_out)
+        Ok(ProducedOutput {
+            created_tables,
+            // A standard compaction rewrites no blob files; it only passes
+            // through indirections. The only blob files it emits are those the
+            // compaction filter created (threaded in as `extra_blob_files`).
+            created_blob_files: extra_blob_files,
+            rewritten_blob_files_to_drop: Vec::new(),
+            tables_to_delete,
+            blob_frag_map,
+        })
     }
 }
 

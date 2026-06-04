@@ -5,8 +5,14 @@
 mod filter;
 mod index;
 mod meta;
+#[cfg(feature = "std")] // no-std: parallel compaction unavailable (no threads)
+pub(crate) mod parallel_compressor;
 
 pub(crate) use index::DEFAULT_SPILL_THRESHOLD;
+#[cfg(feature = "std")]
+pub use parallel_compressor::CompactionSpawner;
+#[cfg(feature = "parallel")]
+pub use parallel_compressor::RayonSpawner;
 
 use super::{Block, BlockOffset, DataBlock, KeyedBlockHandle, filter::BloomConstructionPolicy};
 use crate::{
@@ -29,6 +35,20 @@ use crate::{
 };
 use index::BlockIndexWriter;
 use std::{io::BufWriter, path::PathBuf, sync::Arc};
+
+#[cfg(feature = "std")] // no-std: parallel compaction unavailable (no threads)
+use {parallel_compressor::BlockCompressor, std::collections::VecDeque};
+
+/// Order-independent index-handle data for a spilled block, captured before the
+/// chunk is consumed so the parallel pipeline can write + register the block
+/// later (after a worker has compressed it) without the original chunk in hand.
+#[cfg(feature = "std")]
+struct HandleMeta {
+    last_key: UserKey,
+    last_seqno: crate::SeqNo,
+    seqno_bounds: Option<(u64, u64)>,
+    item_count: usize,
+}
 
 #[derive(Copy, Clone, PartialEq, Eq, Debug, std::hash::Hash)]
 pub struct LinkedFile {
@@ -151,6 +171,36 @@ pub struct Writer {
     /// Pre-trained zstd dictionary for dictionary compression
     #[cfg(zstd_any)]
     zstd_dictionary: Option<Arc<crate::compression::ZstdDictionary>>,
+
+    /// Optional executor for parallel block compression. `None` (default) =
+    /// serial path: each block is compressed and written inline. `Some` =
+    /// blocks are compressed on worker threads while writes stay ordered here.
+    /// Wired from the tree's compaction pool via [`Self::use_parallel_compression`].
+    #[cfg(feature = "std")]
+    spawner: Option<Arc<dyn CompactionSpawner>>,
+
+    /// Lazily built on the first spill once all transform params are finalized,
+    /// so builder-call order doesn't matter. Only `Some` when `spawner` is set.
+    #[cfg(feature = "std")]
+    parallel: Option<BlockCompressor>,
+
+    /// Max blocks in flight (submitted but not yet drained) before the writer
+    /// drains one to bound buffered-output memory. Derived from thread count.
+    #[cfg(feature = "std")]
+    parallel_cap: usize,
+
+    /// Per-block index-handle data queued in submission order, popped as each
+    /// prepared block is drained and written. Length tracks the pipeline's
+    /// `pending` count.
+    #[cfg(feature = "std")]
+    pending_meta: VecDeque<HandleMeta>,
+
+    /// Uncompressed bytes of submitted-but-not-yet-drained blocks. The parallel
+    /// path writes blocks lazily, so `meta.file_pos` lags; this keeps a
+    /// synchronous size proxy for size-based table rotation (see
+    /// [`Self::output_size_hint`]). Added on submit, subtracted on drain.
+    #[cfg(feature = "std")]
+    parallel_pending_bytes: u64,
 }
 
 impl Writer {
@@ -230,7 +280,50 @@ impl Writer {
 
             #[cfg(zstd_any)]
             zstd_dictionary: None,
+
+            #[cfg(feature = "std")]
+            spawner: None,
+            #[cfg(feature = "std")]
+            parallel: None,
+            #[cfg(feature = "std")]
+            parallel_cap: 0,
+            #[cfg(feature = "std")]
+            pending_meta: VecDeque::new(),
+            #[cfg(feature = "std")]
+            parallel_pending_bytes: 0,
         })
+    }
+
+    /// Current output-size estimate for table-rotation decisions: the bytes
+    /// already on disk plus the uncompressed size of blocks still in flight on
+    /// the parallel pipeline (whose on-disk size isn't known until written).
+    /// Equals `meta.file_pos` exactly on the serial path.
+    pub(crate) fn output_size_hint(&self) -> u64 {
+        #[cfg(feature = "std")]
+        {
+            *self.meta.file_pos + self.parallel_pending_bytes
+        }
+        #[cfg(not(feature = "std"))]
+        {
+            *self.meta.file_pos
+        }
+    }
+
+    /// Enables parallel block compression on this writer using `spawner` to run
+    /// per-block transform work on worker threads. `threads` sizes the in-flight
+    /// cap (`2 * threads`), bounding buffered-output memory. The compressor is
+    /// built lazily on the first spill, so this may be called in any builder
+    /// order. Default (not called) keeps the serial path.
+    #[cfg(feature = "std")]
+    #[must_use]
+    pub(crate) fn use_parallel_compression(
+        mut self,
+        spawner: Arc<dyn CompactionSpawner>,
+        threads: usize,
+    ) -> Self {
+        self.spawner = Some(spawner);
+        self.parallel_cap = (threads * 2).max(1);
+        self
     }
 
     pub fn link_blob_file(
@@ -575,48 +668,77 @@ impl Writer {
             return Ok(());
         };
 
-        self.block_buffer.clear();
+        // Order-independent index-handle data, captured before the chunk is
+        // consumed. The parallel path needs it owned because the chunk is
+        // cleared at submit time, before a worker has produced the block.
+        let last_key = last.key.user_key.clone();
+        let last_seqno = last.key.seqno;
+        let item_count = self.chunk.len();
+        // Per-block seqno bounds let a seqno-scoped scan skip this whole block
+        // when its `max` is below the target: one fold over entries in hand.
+        let seqno_bounds = self.use_seqno_in_index.then(|| {
+            self.chunk
+                .iter()
+                .fold((u64::MAX, u64::MIN), |(min, max), e| {
+                    (min.min(e.key.seqno), max.max(e.key.seqno))
+                })
+        });
 
         // Decide per-block whether to emit the per-KV checksum footer.
-        // `kv_checksum` is None unless the tree opted in; even then only
-        // blocks whose (level, table_id) satisfy the policy carry the
-        // footer. Off-path emits no footer (KV_CHECKSUM_FOOTER bit clear).
+        // `kv_checksum` is None unless the tree opted in; even then only blocks
+        // whose (level, table_id) satisfy the policy carry the footer. A
+        // per-KV-checked block is a plain Data block plus a footer (role stays
+        // Data; the footer is a header flag bit, not a distinct block type).
         let kv_emit = self.kv_checksum.and_then(|(policy, algo)| {
             policy
                 .applies(self.initial_level, self.table_id)
                 .then_some(algo)
         });
 
-        // A per-KV-checked block is a plain Data block plus a footer: the
-        // role stays Data, the footer is recorded as a header flag bit
-        // (KV_CHECKSUM_FOOTER), not as a distinct block type. Off-path emits
-        // no footer (KV_CHECKSUM_FOOTER bit clear).
-        let kv_flags = if let Some(algo) = kv_emit {
-            // Compute one logical-content digest per entry, in scan order.
-            let mut digests = Vec::with_capacity(self.chunk.len());
-            for item in &self.chunk {
-                let d = crate::table::block::kv_checksum::kv_digest(item, algo)
-                    .ok_or(crate::Error::FeatureUnsupported("kv-checksum-algorithm"))?;
-                digests.push(d);
+        // Parallel path: encode into a fresh owned buffer (the reusable
+        // block_buffer can't serve here — it would be in flight on a worker),
+        // submit it, and let an ordered drain write it later.
+        #[cfg(feature = "std")]
+        if self.spawner.is_some() {
+            self.ensure_parallel();
+            let mut encoded = Vec::new();
+            let kv_flags = Self::encode_chunk_into(
+                &self.chunk,
+                self.data_block_restart_interval,
+                self.data_block_hash_ratio,
+                kv_emit,
+                &mut encoded,
+            )?;
+            // Backpressure: bound buffered output by draining before the cap.
+            while self.parallel.as_ref().map_or(0, BlockCompressor::pending) >= self.parallel_cap {
+                self.drain_one_parallel()?;
             }
-            DataBlock::encode_kv_checked_into(
-                &mut self.block_buffer,
-                &self.chunk,
-                &digests,
-                algo,
-                self.data_block_restart_interval,
-                self.data_block_hash_ratio,
-            )?;
-            crate::table::block::header::block_flags::KV_CHECKSUM_FOOTER
-        } else {
-            DataBlock::encode_into(
-                &mut self.block_buffer,
-                &self.chunk,
-                self.data_block_restart_interval,
-                self.data_block_hash_ratio,
-            )?;
-            0
-        };
+            self.pending_meta.push_back(HandleMeta {
+                last_key,
+                last_seqno,
+                seqno_bounds,
+                item_count,
+            });
+            // Track in-flight uncompressed bytes for the rotation size hint
+            // (file_pos only advances once the block is drained and written).
+            self.parallel_pending_bytes += encoded.len() as u64;
+            if let Some(par) = self.parallel.as_mut() {
+                par.submit(encoded, kv_flags);
+            }
+            self.chunk.clear();
+            self.chunk_size = 0;
+            return Ok(());
+        }
+
+        // Serial path: encode into the reusable buffer, prepare + write inline.
+        self.block_buffer.clear();
+        let kv_flags = Self::encode_chunk_into(
+            &self.chunk,
+            self.data_block_restart_interval,
+            self.data_block_hash_ratio,
+            kv_emit,
+            &mut self.block_buffer,
+        )?;
 
         let header = Block::write_into_with_flags(
             &mut self.file_writer,
@@ -629,10 +751,9 @@ impl Writer {
                 dict_id: self.data_block_compression.dict_id(),
                 window_log: 0,
             },
-            // Data blocks use the configured codec and may carry a
-            // zstd dict; encryption is optional. page_ecc upgrades
-            // the transform to its matching `*Ecc` variant when
-            // the tree was opened with `Config::page_ecc(true)`.
+            // Data blocks use the configured codec and may carry a zstd dict;
+            // encryption is optional. page_ecc upgrades the transform to its
+            // matching `*Ecc` variant when the tree was opened with page_ecc.
             &{
                 let t = crate::table::block::BlockTransform::from_parts(
                     self.data_block_compression,
@@ -645,61 +766,130 @@ impl Writer {
             kv_flags,
         )?;
 
-        self.meta.uncompressed_size += u64::from(header.uncompressed_length);
-
-        let bytes_written = header.on_disk_size();
-
-        let mut handle = KeyedBlockHandle::new(
-            last.key.user_key.clone(),
-            last.key.seqno,
-            BlockHandle::new(self.meta.file_pos, bytes_written),
-        );
-
-        if self.use_seqno_in_index {
-            // Per-block seqno bounds let a seqno-scoped scan skip this whole
-            // block when its `max` is below the target. The chunk is still
-            // intact here (popped further down), so both bounds come from a
-            // single fold over entries already in hand: zero extra tracking,
-            // one pass. Seeds (MAX, MIN) are overwritten on the first entry
-            // because the chunk is non-empty (`last` exists above).
-            let (seqno_min, seqno_max) = self
-                .chunk
-                .iter()
-                .fold((u64::MAX, u64::MIN), |(min, max), e| {
-                    (min.min(e.key.seqno), max.max(e.key.seqno))
-                });
-            handle = handle.with_seqno_bounds(seqno_min, seqno_max);
-        }
-
-        self.index_writer.register_data_block(handle)?;
-
-        // Adjust metadata
-        self.meta.file_pos += u64::from(bytes_written);
-        self.meta.item_count += self.chunk.len();
-        self.meta.data_block_count += 1;
-
-        // Back link stuff
-        self.prev_pos.0 = self.prev_pos.1;
-        self.prev_pos.1 += u64::from(bytes_written);
-
-        // Set last key
-        self.meta.last_key = Some(
-            // NOTE: We are allowed to remove the last item
-            // to get ownership of it, because the chunk is cleared after
-            // this anyway
-            #[expect(clippy::expect_used, reason = "chunk is not empty")]
-            self.chunk
-                .pop()
-                .expect("chunk should not be empty")
-                .key
-                .user_key,
-        );
+        self.register_written_block(header, last_key, last_seqno, seqno_bounds, item_count)?;
 
         // IMPORTANT: Clear chunk after everything else
         self.chunk.clear();
         self.chunk_size = 0;
 
         Ok(())
+    }
+
+    /// Encodes `chunk` into `buf`, returning the `block_flags` bits the transform
+    /// can't derive (the per-KV checksum-footer bit). Associated fn (no `&self`)
+    /// so callers can pass disjoint field borrows (`&self.chunk`,
+    /// `&mut self.block_buffer`) without aliasing.
+    fn encode_chunk_into(
+        chunk: &[InternalValue],
+        restart_interval: u8,
+        hash_ratio: f32,
+        kv_emit: Option<crate::runtime_config::ChecksumAlgorithm>,
+        buf: &mut Vec<u8>,
+    ) -> crate::Result<u8> {
+        if let Some(algo) = kv_emit {
+            // One logical-content digest per entry, in scan order.
+            let mut digests = Vec::with_capacity(chunk.len());
+            for item in chunk {
+                let d = crate::table::block::kv_checksum::kv_digest(item, algo)
+                    .ok_or(crate::Error::FeatureUnsupported("kv-checksum-algorithm"))?;
+                digests.push(d);
+            }
+            DataBlock::encode_kv_checked_into(
+                buf,
+                chunk,
+                &digests,
+                algo,
+                restart_interval,
+                hash_ratio,
+            )?;
+            Ok(crate::table::block::header::block_flags::KV_CHECKSUM_FOOTER)
+        } else {
+            DataBlock::encode_into(buf, chunk, restart_interval, hash_ratio)?;
+            Ok(0)
+        }
+    }
+
+    /// Records a just-written data block: index entry (with optional seqno
+    /// bounds), metadata counters, back link, and the running last key. Single
+    /// source of truth for both the serial and parallel write paths.
+    fn register_written_block(
+        &mut self,
+        header: crate::table::block::Header,
+        last_key: UserKey,
+        last_seqno: crate::SeqNo,
+        seqno_bounds: Option<(u64, u64)>,
+        item_count: usize,
+    ) -> crate::Result<()> {
+        self.meta.uncompressed_size += u64::from(header.uncompressed_length);
+        let bytes_written = header.on_disk_size();
+
+        let mut handle = KeyedBlockHandle::new(
+            last_key.clone(),
+            last_seqno,
+            BlockHandle::new(self.meta.file_pos, bytes_written),
+        );
+        if let Some((seqno_min, seqno_max)) = seqno_bounds {
+            handle = handle.with_seqno_bounds(seqno_min, seqno_max);
+        }
+        self.index_writer.register_data_block(handle)?;
+
+        self.meta.file_pos += u64::from(bytes_written);
+        self.meta.item_count += item_count;
+        self.meta.data_block_count += 1;
+
+        self.prev_pos.0 = self.prev_pos.1;
+        self.prev_pos.1 += u64::from(bytes_written);
+
+        self.meta.last_key = Some(last_key);
+        Ok(())
+    }
+
+    /// Builds the parallel compressor on first use, capturing the now-finalized
+    /// transform params. No-op once built. Only reachable when `spawner` is set.
+    #[cfg(feature = "std")]
+    fn ensure_parallel(&mut self) {
+        if self.parallel.is_some() {
+            return;
+        }
+        if let Some(spawner) = self.spawner.clone() {
+            self.parallel = Some(BlockCompressor::new(
+                spawner,
+                self.table_id,
+                self.data_block_compression,
+                self.encryption.clone(),
+                #[cfg(zstd_any)]
+                self.zstd_dictionary.clone(),
+                self.page_ecc,
+            ));
+        }
+    }
+
+    /// Drains one prepared block from the parallel pipeline in submission order,
+    /// writes it, and registers its index entry. No-op when nothing is in
+    /// flight; the per-block error is propagated.
+    #[cfg(feature = "std")]
+    fn drain_one_parallel(&mut self) -> crate::Result<()> {
+        let Some(prepared) = self.parallel.as_mut().and_then(BlockCompressor::take_next) else {
+            return Ok(());
+        };
+        let prepared = prepared?;
+        let Some(meta) = self.pending_meta.pop_front() else {
+            return Err(crate::Error::Io(std::io::Error::other(
+                "parallel block pipeline meta desync",
+            )));
+        };
+        let header = prepared.write_to(&mut self.file_writer)?;
+        // Header is Copy; read the in-flight size before handing it off.
+        self.parallel_pending_bytes = self
+            .parallel_pending_bytes
+            .saturating_sub(u64::from(header.uncompressed_length));
+        self.register_written_block(
+            header,
+            meta.last_key,
+            meta.last_seqno,
+            meta.seqno_bounds,
+            meta.item_count,
+        )
     }
 
     // TODO: split meta writing into new function
@@ -709,6 +899,13 @@ impl Writer {
         use std::io::Write;
 
         self.spill_block()?;
+
+        // Drain any blocks still being compressed on worker threads before we
+        // read item_count or write the index, filter and metadata.
+        #[cfg(feature = "std")]
+        while self.parallel.as_ref().map_or(0, BlockCompressor::pending) > 0 {
+            self.drain_one_parallel()?;
+        }
 
         // No items and no range tombstones — delete the empty table file.
         if self.meta.item_count == 0 && self.range_tombstones.is_empty() {
@@ -787,6 +984,14 @@ impl Writer {
                 self.meta.first_key = Some(start);
                 self.meta.last_key = Some(end);
             }
+        }
+
+        // Drain any block submitted to the parallel pipeline after the initial
+        // drain above — notably the RT-only sentinel spill — so the index sees
+        // every data block before it is finalized.
+        #[cfg(feature = "std")]
+        while self.parallel.as_ref().map_or(0, BlockCompressor::pending) > 0 {
+            self.drain_one_parallel()?;
         }
 
         // Write index

@@ -2908,3 +2908,122 @@ fn batch_get_same_user_key_across_block_boundary_finds_older_visible_version() -
         Some(|x| x),
     )
 }
+
+/// Builds an SST from `items`, optionally with parallel block compression
+/// (`parallel_threads`), applying `config` to the writer, then recovers it.
+/// Returns the table plus the temp dir (kept alive for the table's lifetime).
+#[cfg(all(test, feature = "parallel"))]
+#[expect(clippy::unwrap_used, reason = "test code")]
+fn build_and_recover(
+    items: &[crate::InternalValue],
+    parallel_threads: Option<usize>,
+    config: impl Fn(Writer) -> Writer,
+) -> crate::Result<(Table, tempfile::TempDir)> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("table");
+
+    let mut writer = config(Writer::new(path.clone(), 0, 0, Arc::new(StdFs))?);
+    if let Some(threads) = parallel_threads {
+        let spawner = Arc::new(crate::table::writer::RayonSpawner::with_threads(threads)?);
+        writer = writer.use_parallel_compression(spawner, threads);
+    }
+    for item in items {
+        writer.write(item.clone())?;
+    }
+    let (_, checksum) = writer.finish()?.unwrap();
+
+    #[cfg(feature = "metrics")]
+    let metrics = Arc::new(Metrics::default());
+    let table = Table::recover(
+        path,
+        checksum,
+        0,
+        0,
+        Arc::new(Cache::with_capacity_bytes(1_000_000)),
+        Some(Arc::new(DescriptorTable::new(10))),
+        Arc::new(StdFs),
+        false,
+        false,
+        None,
+        #[cfg(zstd_any)]
+        None,
+        crate::comparator::default_comparator(),
+        #[cfg(feature = "metrics")]
+        metrics,
+    )?;
+    Ok((table, dir))
+}
+
+/// The parallel block-compression pipeline must produce an SST functionally
+/// identical to the serial path: workers compress out of order, but the writer
+/// drains and frames blocks strictly in submission order, so block boundaries,
+/// scan order, contents and index entries are unchanged. (The on-disk data
+/// section is in fact byte-identical; only the `created_at` metadata timestamp
+/// varies between builds, so we compare recovered content rather than raw
+/// bytes.) Checked across the encode + transform variations that flow through
+/// the pipeline.
+#[cfg(feature = "parallel")]
+#[test]
+fn parallel_compression_matches_serial_output() -> crate::Result<()> {
+    // Enough keys, with small blocks, to force many data-block spills so the
+    // pipeline genuinely reorders work across its 4 workers.
+    let items: Vec<_> = (0u32..4000)
+        .map(|i| {
+            crate::InternalValue::from_components(
+                format!("key{i:08}").as_bytes(),
+                format!("value-{i}-some-payload-bytes").as_bytes(),
+                u64::from(i),
+                crate::ValueType::Value,
+            )
+        })
+        .collect();
+
+    let check = |config: &dyn Fn(Writer) -> Writer, label: &str| -> crate::Result<()> {
+        let (serial, _ds) = build_and_recover(&items, None, config)?;
+        let (parallel, _dp) = build_and_recover(&items, Some(4), config)?;
+
+        // Identical block boundaries and item count.
+        assert_eq!(
+            serial.metadata.data_block_count, parallel.metadata.data_block_count,
+            "{label}: data_block_count must match"
+        );
+        assert_eq!(
+            serial.metadata.item_count, parallel.metadata.item_count,
+            "{label}: item_count must match"
+        );
+
+        // Identical scan content and order.
+        let s: Vec<_> = serial.iter().collect::<crate::Result<_>>()?;
+        let p: Vec<_> = parallel.iter().collect::<crate::Result<_>>()?;
+        assert_eq!(s.len(), items.len(), "{label}: all items must scan back");
+        assert_eq!(s, p, "{label}: scan content/order must match serial");
+
+        // Index resolves point reads identically (sampled across the key space).
+        for i in (0..items.len()).step_by(137) {
+            let key = format!("key{i:08}");
+            let hash = hash64(key.as_bytes());
+            assert_eq!(
+                serial.get(key.as_bytes(), crate::SeqNo::MAX, hash)?,
+                parallel.get(key.as_bytes(), crate::SeqNo::MAX, hash)?,
+                "{label}: point read for {key} must match"
+            );
+        }
+        Ok(())
+    };
+
+    check(&|w| w.use_data_block_size(256), "plain")?;
+    check(
+        &|w| w.use_data_block_size(256).use_seqno_in_index(true),
+        "seqno_in_index",
+    )?;
+    #[cfg(feature = "lz4")]
+    check(
+        &|w| {
+            w.use_data_block_size(256)
+                .use_data_block_compression(CompressionType::Lz4)
+        },
+        "lz4",
+    )?;
+
+    Ok(())
+}
