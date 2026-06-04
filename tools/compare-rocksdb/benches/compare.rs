@@ -744,12 +744,125 @@ fn overwrite_variant(c: &mut Criterion, group_name: &str, compression: Compressi
 // mergerandom (merge-operator semantics differ across engines) are
 // the remaining db_bench scenarios not yet portable head-to-head.
 
+/// L0 tables built before timing the compaction. Their key ranges overlap
+/// (the golden-ratio key scatter spreads consecutive indices across the
+/// keyspace), so neither engine can "trivially move" them to the next level
+/// without rewriting — the timed compaction actually merges + recompresses.
+const COMPACTION_FLUSHES: u64 = 6;
+/// Worker threads for parallel block compression on both engines (ours via
+/// `compaction_threads`; RocksDB via `compression_options_parallel_threads`).
+const COMPACTION_THREADS: usize = 4;
+
+/// Builds `COMPACTION_FLUSHES` zstd L0 tables from `inputs`, then times one full
+/// compaction. Setup (open + writes + flushes) is excluded from the returned
+/// `Duration` — only the compaction is measured. Both engines run 4-thread
+/// parallel block compression with `max_subcompactions = 1` (RocksDB), so the
+/// head-to-head isolates the same mechanism.
+fn run_compaction(
+    engine: Engine,
+    level: i32,
+    inputs: &WorkloadInputs,
+) -> Result<Duration, Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let per = (inputs.keys.len() as u64 / COMPACTION_FLUSHES).max(1);
+
+    let elapsed = match engine {
+        Engine::Ours => {
+            let tree = Config::new(
+                dir.path(),
+                SequenceNumberCounter::default(),
+                SequenceNumberCounter::default(),
+            )
+            .data_block_compression_policy(CompressionPolicy::all(CompressionType::Zstd(level)))
+            .compaction_threads(COMPACTION_THREADS)
+            .open()?;
+
+            let mut written = 0u64;
+            for ((key, value), seqno) in inputs.keys.iter().zip(inputs.values.iter()).zip(0u64..) {
+                tree.insert(key, value, seqno);
+                written += 1;
+                if written.is_multiple_of(per) {
+                    tree.flush_active_memtable(0)?;
+                }
+            }
+            tree.flush_active_memtable(0)?; // flush any trailing partial batch
+
+            let start = std::time::Instant::now();
+            tree.major_compact(u64::MAX, 0)?;
+            start.elapsed()
+        }
+        Engine::RocksDb => {
+            let mut opts = rocksdb::Options::default();
+            opts.create_if_missing(true);
+            // Hold L0 until the single explicit compaction we time below.
+            opts.set_disable_auto_compactions(true);
+            opts.set_compression_type(rocksdb::DBCompressionType::Zstd);
+            // (window_bits, level, strategy, max_dict_bytes); -14 = default window.
+            opts.set_compression_options(-14, level, 0, 0);
+            // Same mechanism as ours: parallel block compression, no range split.
+            opts.set_compression_options_parallel_threads(COMPACTION_THREADS as i32);
+            opts.set_max_subcompactions(1);
+
+            let db = rocksdb::DB::open(&opts, dir.path())?;
+            let mut write_opts = rocksdb::WriteOptions::default();
+            write_opts.disable_wal(true);
+
+            let mut written = 0u64;
+            for (key, value) in inputs.keys.iter().zip(inputs.values.iter()) {
+                db.put_opt(key, value, &write_opts)?;
+                written += 1;
+                if written.is_multiple_of(per) {
+                    db.flush()?;
+                }
+            }
+            db.flush()?;
+
+            let start = std::time::Instant::now();
+            db.compact_range(None::<&[u8]>, None::<&[u8]>);
+            start.elapsed()
+        }
+    };
+    drop(dir);
+    Ok(elapsed)
+}
+
+fn bench_compaction(c: &mut Criterion) {
+    // Two ends of the zstd spectrum: level 1 (cheap codec — non-compression
+    // overhead most visible) and level 22 (max — codec CPU dominates). Each is
+    // its own group, so each renders its own ours-vs-rocksdb overlay chart.
+    compaction_variant(c, "major_compact_zstd1", 1);
+    compaction_variant(c, "major_compact_zstd22", 22);
+}
+
+fn compaction_variant(c: &mut Criterion, group_name: &str, level: i32) {
+    let mut group = c.benchmark_group(group_name);
+    for &n in &[10_000_u64, 40_000_u64] {
+        let inputs = WorkloadInputs::build(n);
+        group.throughput(Throughput::Elements(n));
+        for engine in [Engine::Ours, Engine::RocksDb] {
+            group.bench_with_input(BenchmarkId::new(engine.label(), n), &n, |b, _| {
+                b.iter_custom(|iters| {
+                    let mut total = Duration::ZERO;
+                    for _ in 0..iters {
+                        total += run_compaction(engine, level, &inputs).unwrap_or_else(|e| {
+                            panic!("run_compaction failed for {}: {e}", engine.label())
+                        });
+                    }
+                    total
+                });
+            });
+        }
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_write_throughput,
     bench_point_read,
     bench_range_scan,
     bench_seek_random,
-    bench_overwrite
+    bench_overwrite,
+    bench_compaction
 );
 criterion_main!(benches);

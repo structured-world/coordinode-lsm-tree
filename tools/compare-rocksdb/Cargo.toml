@@ -39,8 +39,3 @@ tempfile = "3"
 name = "compare"
 harness = false
 path = "benches/compare.rs"
-
-[[bench]]
-name = "compaction"
-harness = false
-path = "benches/compaction.rs"
