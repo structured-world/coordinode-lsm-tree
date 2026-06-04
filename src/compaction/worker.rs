@@ -302,7 +302,10 @@ fn subcompaction_boundaries(
         return Vec::new();
     }
     keys.sort_by(|a, b| comparator.compare(a, b));
-    keys.dedup();
+    // Dedup under the configured comparator, not raw bytes: a custom comparator
+    // can rank two byte-distinct keys as equal, and a leftover equal cut point
+    // would make adjacent sub-compaction ranges overlap or gap.
+    keys.dedup_by(|a, b| comparator.compare(a, b).is_eq());
     // The global maximum is not a cut point (splitting after it yields an empty
     // trailing range); the rest are interior boundaries.
     keys.pop();
@@ -854,9 +857,12 @@ fn merge_tables(
             for out in outputs {
                 match out {
                     Ok(done) => committed.push(done),
+                    // Keep scanning after an error: ranges complete in any order,
+                    // so a later Ok must still be collected and rolled back (an
+                    // [Ok, Err, Ok] layout would otherwise orphan the trailing
+                    // Ok's finalized files). Keep only the first error to return.
                     Err(e) => {
-                        first_err = Some(e);
-                        break;
+                        first_err.get_or_insert(e);
                     }
                 }
             }
