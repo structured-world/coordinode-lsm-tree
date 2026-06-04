@@ -781,6 +781,9 @@ fn run_compaction(
             )
             .data_block_compression_policy(CompressionPolicy::all(CompressionType::Zstd(level)))
             .compaction_threads(COMPACTION_THREADS)
+            // Disable range-split sub-compaction so this bench isolates parallel
+            // block compression only, matching RocksDB's max_subcompactions(1).
+            .subcompaction_min_bytes(u64::MAX)
             .open()?;
 
             let mut written = 0u64;
