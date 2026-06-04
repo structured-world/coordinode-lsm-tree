@@ -521,11 +521,14 @@ pub struct Config {
     /// [`Config::compaction_rate_limit`].
     pub(crate) compaction_rate_limit: u64,
 
-    /// Worker-thread count for the parallel block-compression pipeline used
-    /// during compaction. Default `max(1, available_parallelism / 2)` — leaves
-    /// half the cores for application work. `1` (or no `parallel` feature) keeps
-    /// compaction on the serial path. Sizes the per-tree default pool built at
-    /// open when [`Self::compaction_pool`] is `None`. Set via
+    /// Worker-thread count for compaction parallelism (`std` only), used two
+    /// ways: it sizes the per-tree block-compression pool built at open when
+    /// [`Self::compaction_pool`] is `None`, and it caps how many range-parallel
+    /// sub-compactions a single compaction is split into. Default
+    /// `max(1, available_parallelism / 2)` — leaves half the cores for
+    /// application work. `1` forces the serial path for both. Without the
+    /// `parallel` feature there is no built-in pool, so block compression and
+    /// sub-compaction ranges run serially even for a value > 1. Set via
     /// [`Config::compaction_threads`].
     #[cfg(feature = "std")] // no-std: parallel compaction unavailable (no threads)
     pub(crate) compaction_threads: usize,
@@ -1380,12 +1383,14 @@ impl Config {
         self
     }
 
-    /// Sets the compaction parallel-compression worker-thread count.
+    /// Sets the compaction worker-thread count.
     ///
-    /// Sizes the per-tree pool built at open when no shared pool is supplied
-    /// (see [`Self::compaction_pool`]). `1` keeps compaction serial. Default is
-    /// `max(1, available_parallelism / 2)`. Ignored without the `parallel`
-    /// feature (no built-in pool to size).
+    /// Under `std` this both sizes the per-tree block-compression pool built at
+    /// open when no shared pool is supplied (see [`Self::compaction_pool`]) and
+    /// caps how many range-parallel sub-compactions a compaction splits into.
+    /// `1` keeps compaction serial. Default is `max(1, available_parallelism /
+    /// 2)`. Without the `parallel` feature there is no built-in pool, so the
+    /// work runs serially even for a value > 1.
     #[cfg(feature = "std")]
     #[must_use]
     pub fn compaction_threads(mut self, threads: usize) -> Self {
