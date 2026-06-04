@@ -275,6 +275,28 @@ fn create_bounded_compaction_stream<'a>(
     }
 }
 
+/// Sorts the destination-level max-keys, drops comparator-equal duplicates, and
+/// removes the global maximum (splitting after it yields an empty trailing
+/// range), returning the candidate interior boundary keys. Split out of
+/// [`subcompaction_boundaries`] so the comparator-equality dedup is unit
+/// testable without constructing a full [`Version`].
+#[cfg(feature = "std")]
+fn boundary_candidates(
+    mut keys: Vec<UserKey>,
+    comparator: &crate::comparator::SharedComparator,
+) -> Vec<UserKey> {
+    if keys.len() < 2 {
+        return Vec::new();
+    }
+    keys.sort_by(|a, b| comparator.compare(a, b));
+    // Dedup under the configured comparator, not raw bytes: a custom comparator
+    // can rank two byte-distinct keys as equal, and a leftover equal cut point
+    // would make adjacent sub-compaction ranges overlap or gap.
+    keys.dedup_by(|a, b| comparator.compare(a, b).is_eq());
+    keys.pop();
+    keys
+}
+
 /// Interior split-boundary keys for a parallel compaction, derived from the
 /// destination level's existing table boundaries (`RocksDB`'s approach: aligning
 /// sub-compaction cuts to target-level files keeps outputs structured). Returns
@@ -293,22 +315,12 @@ fn subcompaction_boundaries(
     let Some(level) = version.level(dest_level) else {
         return Vec::new();
     };
-    let mut keys: Vec<UserKey> = level
+    let keys: Vec<UserKey> = level
         .iter()
         .flat_map(|run| run.iter())
         .map(|t| t.metadata.key_range.max().clone())
         .collect();
-    if keys.len() < 2 {
-        return Vec::new();
-    }
-    keys.sort_by(|a, b| comparator.compare(a, b));
-    // Dedup under the configured comparator, not raw bytes: a custom comparator
-    // can rank two byte-distinct keys as equal, and a leftover equal cut point
-    // would make adjacent sub-compaction ranges overlap or gap.
-    keys.dedup_by(|a, b| comparator.compare(a, b).is_eq());
-    // The global maximum is not a cut point (splitting after it yields an empty
-    // trailing range); the rest are interior boundaries.
-    keys.pop();
+    let keys = boundary_candidates(keys, comparator);
     if keys.is_empty() {
         return Vec::new();
     }
@@ -1303,6 +1315,45 @@ mod tests {
     };
     use std::sync::Arc;
     use test_log::test;
+
+    /// Ranks keys by their first byte only, so byte-distinct keys that share a
+    /// first byte compare equal — exercises the comparator-aware dedup path that
+    /// raw `dedup()` would miss.
+    struct FirstByteComparator;
+    impl crate::comparator::UserComparator for FirstByteComparator {
+        fn name(&self) -> &'static str {
+            "test-first-byte"
+        }
+
+        fn compare(&self, a: &[u8], b: &[u8]) -> std::cmp::Ordering {
+            a.first().cmp(&b.first())
+        }
+    }
+
+    #[test]
+    fn boundary_candidates_dedups_comparator_equal_keys() {
+        let cmp: crate::comparator::SharedComparator = Arc::new(FirstByteComparator);
+        // "a1" and "a2" are byte-distinct but compare equal under the first-byte
+        // comparator; "b1" is in a different group. Raw dedup() would keep both
+        // a-keys (not byte-identical) and, after popping the global max, leave
+        // two boundaries in the "a" group → overlapping sub-compaction ranges.
+        let keys = vec![
+            crate::UserKey::from("a1"),
+            crate::UserKey::from("a2"),
+            crate::UserKey::from("b1"),
+        ];
+        let out = super::boundary_candidates(keys, &cmp);
+        assert_eq!(
+            out.len(),
+            1,
+            "comparator-equal keys must collapse to a single boundary candidate",
+        );
+        assert_eq!(
+            out.first().and_then(|k| k.first()),
+            Some(&b'a'),
+            "the surviving boundary should be from the deduped a-group",
+        );
+    }
 
     #[test]
     fn compaction_stream_run_not_found() -> crate::Result<()> {
