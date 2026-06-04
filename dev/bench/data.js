@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1780569725763,
+  "lastUpdate": 1780571295091,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -12948,6 +12948,84 @@ window.BENCHMARK_DATA = {
             "value": 562922.5859852992,
             "unit": "ops/sec",
             "extra": "P50: 1.6us | P99: 4.9us | P99.9: 7.2us\nthreads: 1 | elapsed: 0.36s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "b936b043eb4ebf146d1c3826923eb4d5b54c70b0",
+          "message": "perf(table): raise index spill threshold to 4 MiB (#399)\n\n## Summary\n\nRaises `DEFAULT_SPILL_THRESHOLD` (the `index_partition_spill_threshold`\nruntime-config default) from **256 KiB to 4 MiB**, so SSTs with an index\nup to ~4 MiB (a few-hundred-MB SST) use the single-level index layout\ninstead of spilling to two-level.\n\n## Why\n\n`point_read` benchmarks (compare-rocksdb) show single-level beats\ntwo-level at **every** measured size up to 1M keys (1.75 MiB index):\n\n| size | two-level (256 KiB default) | single-level | RocksDB |\n|------|------|------|------|\n| 1k | 1.56 ms (1.60x) | **1.16 ms (1.18x)** | ~0.98 ms |\n| 100k | — | **0.29 s (1.03x, par)** | 0.29 s |\n| 1M | 3.37 s (1.10x) | **3.06 s (~1.00x, par)** | 3.07 s |\n\nThe 256 KiB default forced two-level for any SST whose index exceeded\n~256 KiB (~36 MB SST), conceding the win on medium/large SSTs.\n\n## Memory safety\n\nRaising the threshold does **not** pin unbounded index RAM. A\nsingle-level index is only pinned resident on hot levels (per\n`index_block_pinning_policy`, default `[true, true, false]`). On cold\nlevels — where the large bottom SSTs live — a single-level index is\nserved by `VolatileBlockIndex`, which pages the index block through the\nshared block cache (evictable), exactly like a two-level index's bottom\npartitions, but cheaper: **one** cache load + one iterator versus two\nindex levels. So the cache-managed single-level path that makes a high\nthreshold safe already exists; this PR just lets more SSTs use it.\n\n## Validation\n\n- `cargo nextest run --lib --all-features`: 1223/1223 pass\n- `cargo clippy --all-features --all-targets -- -D warnings`: clean\n- `cargo fmt --check`, `RUSTDOCFLAGS=\"-D warnings\" cargo doc --no-deps\n--all-features`: clean\n- **Pending:** compare-rocksdb `point_read` validation of the cold-level\n(cache-managed) single-level path vs two-level at 1M, on a quiet\nmachine.\n\nPart of #398\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n\n## Summary by CodeRabbit\n\n* **Chores**\n* Increased default index partition spill threshold from 256 KiB to 4\nMiB, affecting SST block-index partitioning behavior.\n* Updated documentation to clarify single-level versus partitioned index\nselection and corresponding performance characteristics.\n\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-06-04T08:36:31Z",
+          "tree_id": "6af095f857a867ca90b03c83b9fd21fd2403427d",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/b936b043eb4ebf146d1c3826923eb4d5b54c70b0"
+        },
+        "date": 1780571292226,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 2080569.383597615,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.6us | P99.9: 3.7us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1138539.8258612445,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.2us | P99.9: 4.3us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 664620.656345531,
+            "unit": "ops/sec",
+            "extra": "P50: 1.4us | P99: 4.4us | P99.9: 6.7us\nthreads: 1 | elapsed: 0.30s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3588659.1337601277,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 3.0us | P99.9: 5.4us\nthreads: 1 | elapsed: 0.06s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 429518.8818766185,
+            "unit": "ops/sec",
+            "extra": "P50: 2.0us | P99: 5.2us | P99.9: 7.9us\nthreads: 1 | elapsed: 0.47s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 222161.02747351347,
+            "unit": "ops/sec",
+            "extra": "P50: 4.2us | P99: 5.3us | P99.9: 7.6us\nthreads: 1 | elapsed: 0.90s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1205837.294348067,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.2us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1127909.4805720805,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 1.4us | P99.9: 1.8us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 552064.8921806776,
+            "unit": "ops/sec",
+            "extra": "P50: 1.6us | P99: 4.9us | P99.9: 7.3us\nthreads: 1 | elapsed: 0.36s | num: 200000 | iterations: 3"
           }
         ]
       }
