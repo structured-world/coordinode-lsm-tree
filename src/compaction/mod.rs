@@ -135,7 +135,7 @@ pub enum Choice {
 /// The strategy receives the levels of the LSM-tree as argument
 /// and emits a choice on what to do.
 #[expect(clippy::module_name_repetitions)]
-pub trait CompactionStrategy {
+pub trait CompactionStrategy: Send + Sync {
     /// Gets the compaction strategy name.
     fn get_name(&self) -> &'static str;
 

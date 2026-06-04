@@ -538,6 +538,15 @@ pub struct Config {
     #[cfg(feature = "std")]
     pub(crate) compaction_pool: Option<Arc<dyn crate::table::writer::CompactionSpawner>>,
 
+    /// Minimum total input size (bytes) for a compaction to be split into
+    /// parallel sub-compactions. Below it the compaction stays single-threaded
+    /// (per-thread setup + extra output tables outweigh the parallelism on small
+    /// compactions). Default
+    /// [`SUBCOMPACTION_MIN_INPUT_BYTES`](crate::compaction::worker::SUBCOMPACTION_MIN_INPUT_BYTES)
+    /// (8 MiB). Set via [`Config::subcompaction_min_bytes`].
+    #[cfg(feature = "std")]
+    pub(crate) subcompaction_min_bytes: u64,
+
     /// Pre-trained zstd dictionary for dictionary compression.
     ///
     /// When set together with a [`CompressionType::ZstdDict`] compression
@@ -654,6 +663,8 @@ impl Default for Config {
                 .map_or(1, |n| (n.get() / 2).max(1)),
             #[cfg(feature = "std")]
             compaction_pool: None,
+            #[cfg(feature = "std")]
+            subcompaction_min_bytes: crate::compaction::worker::SUBCOMPACTION_MIN_INPUT_BYTES,
         }
     }
 }
@@ -1381,6 +1392,17 @@ impl Config {
         // Clamp to >= 1: the documented semantics treat `1` as "serial", and a
         // 0-thread pool would be an invalid state.
         self.compaction_threads = threads.max(1);
+        self
+    }
+
+    /// Sets the minimum total input size (bytes) for a compaction to be split
+    /// into parallel sub-compactions. Default 8 MiB. `0` splits every eligible
+    /// compaction; a large value effectively disables sub-compaction (block
+    /// compression still parallelizes via [`Self::compaction_threads`]).
+    #[cfg(feature = "std")]
+    #[must_use]
+    pub fn subcompaction_min_bytes(mut self, bytes: u64) -> Self {
+        self.subcompaction_min_bytes = bytes;
         self
     }
 

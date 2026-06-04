@@ -5,7 +5,7 @@
 use super::{CompactionAction, CompactionResult, CompactionStrategy, Input as CompactionPayload};
 use crate::{
     BlobFile, Config, HashSet, InternalValue, SeqNo, SequenceNumberCounter,
-    SharedSequenceNumberGenerator, Table, TableId,
+    SharedSequenceNumberGenerator, Table, TableId, UserKey,
     blob_tree::FragmentationMap,
     compaction::{
         Choice,
@@ -31,6 +31,14 @@ use std::{
 use crate::metrics::Metrics;
 
 pub type CompactionReader<'a> = Box<dyn Iterator<Item = crate::Result<InternalValue>> + 'a>;
+
+/// Minimum total input size for a compaction to be split into parallel
+/// sub-compactions. Below this the per-thread setup + the extra output tables
+/// (one per sub-range) cost more than the parallelism buys, so the compaction
+/// stays single-threaded (which also keeps small/test compactions producing a
+/// single merged table). Default for [`Config::subcompaction_min_bytes`].
+#[cfg(feature = "std")]
+pub const SUBCOMPACTION_MIN_INPUT_BYTES: u64 = 8 * 1024 * 1024;
 
 /// Compaction options
 pub struct Options {
@@ -228,6 +236,233 @@ fn create_compaction_stream<'a>(
     } else {
         None
     })
+}
+
+/// Like [`create_compaction_stream`] but restricts every input table to the key
+/// range `bounds`, used by parallel sub-compactions where each thread owns a
+/// disjoint slice of the key space. Each input table is read via
+/// [`crate::Table::range`] (a raw, all-seqno, key-bounded scan that seeks within
+/// the table), so a sub-compaction only touches the blocks overlapping its
+/// slice. The bounds must partition the key space across sub-compactions
+/// (`Included(lo)..Excluded(hi)`) so every entry lands in exactly one.
+#[cfg(feature = "std")]
+fn create_bounded_compaction_stream<'a>(
+    version: &'a Version,
+    to_compact: &[TableId],
+    bounds: (std::ops::Bound<UserKey>, std::ops::Bound<UserKey>),
+    eviction_seqno: SeqNo,
+    merge_operator: Option<Arc<dyn crate::merge_operator::MergeOperator>>,
+    comparator: crate::comparator::SharedComparator,
+) -> Option<CompactionStream<'a, Merger<CompactionReader<'a>>>> {
+    let mut readers: Vec<CompactionReader<'_>> = vec![];
+    let mut found = 0;
+
+    for run in version.iter_levels().flat_map(|lvl| lvl.iter()) {
+        for table in run.iter().filter(|x| to_compact.contains(&x.metadata.id)) {
+            found += 1;
+            readers.push(Box::new(table.range(bounds.clone())));
+        }
+    }
+
+    if found == to_compact.len() {
+        Some(
+            CompactionStream::new(Merger::new(readers, comparator), eviction_seqno)
+                .with_merge_operator(merge_operator),
+        )
+    } else {
+        None
+    }
+}
+
+/// Interior split-boundary keys for a parallel compaction, derived from the
+/// destination level's existing table boundaries (`RocksDB`'s approach: aligning
+/// sub-compaction cuts to target-level files keeps outputs structured). Returns
+/// at most `max_ranges - 1` keys (evenly sampled), sorted by `comparator`.
+/// Empty → the compaction stays single-threaded (no usable cut points).
+#[cfg(feature = "std")]
+fn subcompaction_boundaries(
+    version: &Version,
+    dest_level: usize,
+    max_ranges: usize,
+    comparator: &crate::comparator::SharedComparator,
+) -> Vec<UserKey> {
+    if max_ranges < 2 {
+        return Vec::new();
+    }
+    let Some(level) = version.level(dest_level) else {
+        return Vec::new();
+    };
+    let mut keys: Vec<UserKey> = level
+        .iter()
+        .flat_map(|run| run.iter())
+        .map(|t| t.metadata.key_range.max().clone())
+        .collect();
+    if keys.len() < 2 {
+        return Vec::new();
+    }
+    keys.sort_by(|a, b| comparator.compare(a, b));
+    keys.dedup();
+    // The global maximum is not a cut point (splitting after it yields an empty
+    // trailing range); the rest are interior boundaries.
+    keys.pop();
+    if keys.is_empty() {
+        return Vec::new();
+    }
+    let want = (max_ranges - 1).min(keys.len());
+    if want == keys.len() {
+        return keys;
+    }
+    // Evenly sample `want` boundaries across the candidates.
+    let mut out = Vec::with_capacity(want);
+    for i in 1..=want {
+        let idx = ((i * keys.len()) / (want + 1)).min(keys.len() - 1);
+        if let Some(key) = keys.get(idx) {
+            out.push(key.clone());
+        }
+    }
+    out.dedup();
+    out
+}
+
+/// Turns interior boundary keys into `boundaries.len() + 1` disjoint key ranges
+/// that partition the whole key space: `(Unbounded, Excluded(b0))`,
+/// `[Included(b_i), Excluded(b_{i+1}))`, …, `[Included(b_last), Unbounded)`.
+/// Every entry falls in exactly one range, so the sub-compaction outputs union
+/// to the same set the serial compaction would produce.
+#[cfg(feature = "std")]
+fn ranges_from_boundaries(
+    boundaries: &[UserKey],
+) -> Vec<(std::ops::Bound<UserKey>, std::ops::Bound<UserKey>)> {
+    use std::ops::Bound::{Excluded, Included, Unbounded};
+    let mut ranges = Vec::with_capacity(boundaries.len() + 1);
+    let mut lo = Unbounded;
+    for b in boundaries {
+        ranges.push((lo.clone(), Excluded(b.clone())));
+        lo = Included(b.clone());
+    }
+    ranges.push((lo, Unbounded));
+    ranges
+}
+
+/// Runs one sub-compaction over the key range `bounds`: builds a bounded merge
+/// stream of the inputs, applies the same transforms as the serial path
+/// (tombstone eviction, KV-separation drop tracking, compaction filter), writes
+/// its output SSTs, and returns a [`ProducedOutput`](super::flavour::ProducedOutput)
+/// WITHOUT installing a version edit (the caller merges all outputs into one).
+/// Only the sub-compaction that `owns_input_deletion` carries the input tables
+/// to be dropped, so the shared inputs are marked deleted exactly once.
+#[cfg(feature = "std")]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a sub-compaction needs the full compaction context (opts, payload, \
+              version, inputs, range, level info, blob folder) threaded in by value/ref \
+              so it can run on its own thread; bundling into a struct would just move \
+              the argument list"
+)]
+fn run_subcompaction(
+    opts: &Options,
+    payload: &CompactionPayload,
+    version: &Version,
+    tables_for_deletion: Vec<Table>,
+    input_range_tombstones: &[crate::range_tombstone::RangeTombstone],
+    bounds: (std::ops::Bound<UserKey>, std::ops::Bound<UserKey>),
+    dst_lvl: usize,
+    is_last_level: bool,
+    blobs_folder: &std::path::Path,
+) -> crate::Result<super::flavour::ProducedOutput> {
+    use super::flavour::CompactionFlavour;
+
+    let mut blob_frag_map = FragmentationMap::default();
+
+    let to_compact = payload.table_ids.iter().copied().collect::<Vec<_>>();
+
+    let Some(mut merge_iter) = create_bounded_compaction_stream(
+        version,
+        &to_compact,
+        bounds,
+        opts.mvcc_gc_watermark,
+        opts.config.merge_operator.clone(),
+        opts.config.comparator.clone(),
+    ) else {
+        // Inputs vanished mid-flight (validated by the caller, so unexpected):
+        // emit an empty output rather than corrupting the merge.
+        let table_writer = super::flavour::prepare_table_writer(version, opts, payload)?;
+        return Box::new(StandardCompaction::new(table_writer, tables_for_deletion)).produce(
+            opts,
+            dst_lvl,
+            blob_frag_map,
+            Vec::new(),
+        );
+    };
+
+    merge_iter = merge_iter
+        .evict_tombstones(is_last_level)
+        .zero_seqnos(false);
+
+    let filter_ctx = Context { is_last_level };
+    let mut compaction_filter = opts
+        .config
+        .compaction_filter_factory
+        .as_ref()
+        .map(|f| f.make_filter(&filter_ctx));
+
+    // KV separation (no relocation on this path): track fragmentation from
+    // dropped/GC'd entries so the merged install updates blob GC stats.
+    if opts.config.kv_separation_opts.is_some() {
+        merge_iter = merge_iter.with_drop_callback(&mut blob_frag_map);
+    }
+
+    let mut filter_blob_writer = None;
+    let merge_iter = merge_iter.with_filter(StreamFilterAdapter::new(
+        compaction_filter.as_deref_mut(),
+        opts,
+        version,
+        blobs_folder,
+        &mut filter_blob_writer,
+        &filter_ctx,
+    ));
+
+    let table_writer = super::flavour::prepare_table_writer(version, opts, payload)?;
+    let mut compactor: Box<dyn CompactionFlavour> =
+        Box::new(StandardCompaction::new(table_writer, tables_for_deletion));
+
+    // Propagate range tombstones to this sub-range's output; the writer clips
+    // them to each output table's key range (a boundary-spanning RT is written
+    // clipped on both sides, which is correct).
+    if !input_range_tombstones.is_empty() {
+        compactor.write_range_tombstones(input_range_tombstones);
+    }
+
+    for (idx, item) in merge_iter.enumerate() {
+        let item = item?;
+
+        let io_bytes = (item.key.user_key.len() as u64).saturating_add(item.value.len() as u64);
+        if opts
+            .rate_limiter
+            .request_interruptible(io_bytes, || opts.stop_signal.is_stopped())
+        {
+            log::debug!("Stopping sub-compaction because of stop signal (I/O throttle)");
+            break;
+        }
+
+        compactor.write(item)?;
+
+        if idx % 1_000_000 == 0 && opts.stop_signal.is_stopped() {
+            log::debug!("Stopping sub-compaction because of stop signal");
+            break;
+        }
+    }
+
+    if let Some(filter) = compaction_filter {
+        filter.finish();
+    }
+
+    let extra_blob_files = filter_blob_writer
+        .map(BlobFileWriter::finish)
+        .transpose()?
+        .unwrap_or_default();
+
+    compactor.produce(opts, dst_lvl, blob_frag_map, extra_blob_files)
 }
 
 #[expect(
@@ -442,6 +677,166 @@ fn merge_tables(
         .collect();
     input_range_tombstones.sort();
     input_range_tombstones.dedup();
+
+    // ---- Parallel sub-compaction (std only) ----
+    // A non-relocating compaction can be split into disjoint key ranges that
+    // compact in parallel — each writes its own SSTs, then all merge into one
+    // atomic version edit. Active blob relocation stays single-threaded and
+    // falls through to the serial path below.
+    #[cfg(feature = "std")]
+    {
+        let threads = opts.config.compaction_threads;
+        let dst_lvl: usize = payload.canonical_level.into();
+        let is_last_level = payload.dest_level == opts.config.level_count - 1;
+
+        // Only KV-separated trees with fragmented blob files relocate; that
+        // path is not split here.
+        let relocating = match &opts.config.kv_separation_opts {
+            Some(blob_opts) => !pick_blob_files_to_rewrite(
+                &payload.table_ids,
+                &current_super_version.version,
+                blob_opts,
+            )?
+            .is_empty(),
+            None => false,
+        };
+
+        let total_input_bytes: u64 = tables.iter().map(Table::file_size).sum();
+
+        let boundaries = if threads > 1
+            && !relocating
+            && total_input_bytes >= opts.config.subcompaction_min_bytes
+        {
+            subcompaction_boundaries(
+                &current_super_version.version,
+                payload.dest_level as usize,
+                threads,
+                &opts.config.comparator,
+            )
+        } else {
+            Vec::new()
+        };
+
+        if !boundaries.is_empty() {
+            let blobs_folder = opts.config.path.join(BLOBS_FOLDER);
+            let ranges = ranges_from_boundaries(&boundaries);
+
+            // Hand off: hide inputs, release the exclusive + version locks for
+            // the CPU-heavy parallel phase.
+            drop(version_history_lock);
+            compaction_state
+                .hidden_set_mut()
+                .hide(payload.table_ids.iter().copied());
+            drop(compaction_state);
+
+            // First range runs on this thread; the rest on scoped workers. Only
+            // the first carries the input tables to delete, so they are dropped
+            // exactly once at install.
+            let num_ranges = ranges.len();
+            // `ranges_from_boundaries` always emits at least two ranges when
+            // boundaries is non-empty (checked above), so split_first is Some.
+            let Some((first_range, rest_ranges)) = ranges.split_first() else {
+                unreachable!("non-empty boundaries yield >= 2 ranges");
+            };
+
+            let outputs: Vec<crate::Result<super::flavour::ProducedOutput>> =
+                std::thread::scope(|scope| {
+                    let version = &current_super_version.version;
+                    let rts = input_range_tombstones.as_slice();
+                    let blobs_dir = blobs_folder.as_path();
+
+                    let handles: Vec<_> = rest_ranges
+                        .iter()
+                        .map(|range| {
+                            let range = range.clone();
+                            scope.spawn(move || {
+                                run_subcompaction(
+                                    opts,
+                                    payload,
+                                    version,
+                                    Vec::new(),
+                                    rts,
+                                    range,
+                                    dst_lvl,
+                                    is_last_level,
+                                    blobs_dir,
+                                )
+                            })
+                        })
+                        .collect();
+
+                    let first = run_subcompaction(
+                        opts,
+                        payload,
+                        version,
+                        tables.clone(),
+                        rts,
+                        first_range.clone(),
+                        dst_lvl,
+                        is_last_level,
+                        blobs_dir,
+                    );
+
+                    let mut outputs = Vec::with_capacity(num_ranges);
+                    outputs.push(first);
+                    for handle in handles {
+                        outputs.push(handle.join().unwrap_or_else(|_| {
+                            Err(crate::Error::Io(std::io::Error::other(
+                                "sub-compaction worker panicked",
+                            )))
+                        }));
+                    }
+                    outputs
+                });
+
+            let outputs = outputs
+                .into_iter()
+                .collect::<crate::Result<Vec<_>>>()
+                .inspect_err(|e| {
+                    log::error!("Sub-compaction failed: {e:?}");
+                    #[expect(clippy::expect_used, reason = "lock is expected to not be poisoned")]
+                    let mut state = opts.compaction_state.lock().expect("lock is poisoned");
+                    state
+                        .hidden_set_mut()
+                        .show(payload.table_ids.iter().copied());
+                })?;
+
+            // Re-acquire locks and install one atomic version edit for all outputs.
+            #[expect(clippy::expect_used, reason = "lock is expected to not be poisoned")]
+            let mut compaction_state = opts.compaction_state.lock().expect("lock is poisoned");
+            #[expect(clippy::expect_used, reason = "lock is expected to not be poisoned")]
+            let mut version_history_lock = opts.version_history.write().expect("lock is poisoned");
+
+            let tables_out =
+                super::flavour::install_merge(&mut version_history_lock, opts, payload, outputs)
+                    .inspect_err(|e| {
+                        log::error!("Sub-compaction install failed: {e:?}");
+                        compaction_state
+                            .hidden_set_mut()
+                            .show(payload.table_ids.iter().copied());
+                    })?;
+
+            compaction_state
+                .hidden_set_mut()
+                .show(payload.table_ids.iter().copied());
+
+            version_history_lock
+                .maintenance(&opts.config.path, opts.mvcc_gc_watermark, &*opts.config.fs)
+                .inspect_err(|e| log::error!("Manifest maintenance failed: {e:?}"))?;
+
+            drop(version_history_lock);
+            drop(compaction_state);
+
+            log::trace!("Parallel compaction done in {num_ranges} sub-ranges");
+
+            return Ok(CompactionResult {
+                action: CompactionAction::Merged,
+                dest_level: Some(payload.dest_level),
+                tables_in,
+                tables_out,
+            });
+        }
+    }
 
     let mut blob_frag_map = FragmentationMap::default();
 
