@@ -1775,6 +1775,23 @@ impl Tree {
     pub(crate) fn open(config: Config) -> crate::Result<Self> {
         log::debug!("Opening LSM-tree at {}", config.path.display());
 
+        // Resolve the per-tree compaction compression pool once, at open: if the
+        // caller supplied no shared pool but asked for >1 thread, build the
+        // default rayon-backed pool now so every compaction reuses it (building
+        // a pool per compaction would spawn threads on each run). A caller-
+        // supplied pool is left untouched. Shadowed under `parallel` only, so
+        // non-parallel builds don't carry an unused `mut`.
+        #[cfg(feature = "parallel")]
+        let config = {
+            let mut config = config;
+            if config.compaction_pool.is_none() && config.compaction_threads > 1 {
+                config.compaction_pool = Some(Arc::new(
+                    crate::table::writer::RayonSpawner::with_threads(config.compaction_threads)?,
+                ));
+            }
+            config
+        };
+
         // Gate on the `page_ecc` cargo feature: caller asked for ECC
         // but the build does not link the Reed-Solomon codec. We have
         // no way to verify or recover RS parity without the codec, so

@@ -152,6 +152,15 @@ pub(super) fn prepare_table_writer(
     #[cfg(zstd_any)]
     let table_writer = table_writer.use_zstd_dictionary(opts.config.zstd_dictionary.clone());
 
+    // Parallel block compression: hand the (per-tree or caller-shared) pool to
+    // the writer so its CPU-bound transform work runs on worker threads while
+    // writes stay ordered. None / single-thread leaves the serial path.
+    #[cfg(feature = "std")]
+    let table_writer = table_writer.use_parallel_compression(
+        opts.config.compaction_pool.clone(),
+        opts.config.compaction_threads,
+    );
+
     Ok(table_writer)
 }
 

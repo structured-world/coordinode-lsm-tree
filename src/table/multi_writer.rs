@@ -110,6 +110,13 @@ pub struct MultiWriter {
 
     #[cfg(zstd_any)]
     zstd_dictionary: Option<Arc<crate::compression::ZstdDictionary>>,
+
+    /// Optional parallel block-compression executor + worker count, preserved
+    /// here so every successor [`Writer`] of a rotated run shares the same pool.
+    #[cfg(feature = "std")]
+    spawner: Option<Arc<dyn crate::table::writer::CompactionSpawner>>,
+    #[cfg(feature = "std")]
+    parallel_threads: usize,
 }
 
 impl MultiWriter {
@@ -171,7 +178,30 @@ impl MultiWriter {
 
             #[cfg(zstd_any)]
             zstd_dictionary: None,
+
+            #[cfg(feature = "std")]
+            spawner: None,
+            #[cfg(feature = "std")]
+            parallel_threads: 0,
         })
+    }
+
+    /// Enables parallel block compression for this run, sharing `spawner` across
+    /// every rotated successor table. `threads` sizes the in-flight cap. No-op
+    /// when `spawner` is `None`.
+    #[cfg(feature = "std")]
+    #[must_use]
+    pub fn use_parallel_compression(
+        mut self,
+        spawner: Option<Arc<dyn crate::table::writer::CompactionSpawner>>,
+        threads: usize,
+    ) -> Self {
+        if let Some(spawner) = spawner {
+            self.spawner = Some(Arc::clone(&spawner));
+            self.parallel_threads = threads;
+            self.writer = self.writer.use_parallel_compression(spawner, threads);
+        }
+        self
     }
 
     /// Enables RT clipping: each tombstone is intersected with the output
@@ -540,6 +570,11 @@ impl MultiWriter {
             new_writer = new_writer.use_zstd_dictionary(self.zstd_dictionary.clone());
         }
 
+        #[cfg(feature = "std")]
+        if let Some(spawner) = self.spawner.clone() {
+            new_writer = new_writer.use_parallel_compression(spawner, self.parallel_threads);
+        }
+
         let mut old_writer = std::mem::replace(&mut self.writer, new_writer);
         old_writer.spill_block()?;
 
@@ -583,7 +618,7 @@ impl MultiWriter {
         if is_next_key {
             self.current_key = Some(item.key.user_key.clone());
 
-            if *self.writer.meta.file_pos >= self.target_size {
+            if self.writer.output_size_hint() >= self.target_size {
                 self.rotate()?;
             }
         }

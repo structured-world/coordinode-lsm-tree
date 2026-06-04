@@ -35,7 +35,11 @@ use crate::{
     fs::FsFile,
     table::BlockHandle,
 };
-use std::borrow::Cow;
+use alloc::borrow::Cow;
+// Vec lives in the std prelude on std builds; pull it from alloc on no-std so
+// this module's heap buffers resolve under `--no-default-features --features alloc`.
+#[cfg(not(feature = "std"))]
+use alloc::vec::Vec;
 
 /// Safety cap on block payload size (256 MiB).
 ///
@@ -115,9 +119,23 @@ pub(crate) struct PreparedBlock<'a> {
 }
 
 impl PreparedBlock<'_> {
+    /// Takes ownership of the payload so the prepared block no longer borrows
+    /// the source `data`, yielding a `'static` value safe to move to a worker
+    /// thread. A no-op allocation when the payload is already owned (a
+    /// transform ran); copies once on the borrowed (uncompressed) path.
+    #[cfg(feature = "std")] // no-std: parallel compaction unavailable (no threads)
+    pub(crate) fn into_owned(self) -> PreparedBlock<'static> {
+        PreparedBlock {
+            header: self.header,
+            payload: Cow::Owned(self.payload.into_owned()),
+            parity: self.parity,
+        }
+    }
+
     /// Writes the framed block (header + payload + optional parity trailer)
     /// to `writer` and returns the header. This is the single point where
     /// block bytes hit the file, so it must run in on-disk order.
+    // no-std: core2::io::Write (whole block-write path migrates together)
     pub(crate) fn write_to<W: std::io::Write>(self, mut writer: &mut W) -> crate::Result<Header> {
         self.header.encode_into(&mut writer)?;
         writer.write_all(&self.payload)?;
