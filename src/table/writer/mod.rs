@@ -986,6 +986,14 @@ impl Writer {
             }
         }
 
+        // Drain any block submitted to the parallel pipeline after the initial
+        // drain above — notably the RT-only sentinel spill — so the index sees
+        // every data block before it is finalized.
+        #[cfg(feature = "std")]
+        while self.parallel.as_ref().map_or(0, BlockCompressor::pending) > 0 {
+            self.drain_one_parallel()?;
+        }
+
         // Write index
         log::trace!("Finishing index writer");
         let (index_block_count, tli_bytes) = self.index_writer.finish(&mut self.file_writer)?;
