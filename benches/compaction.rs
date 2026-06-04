@@ -15,13 +15,14 @@ use lsm_tree::{AbstractTree, AnyTree, CompressionType, Config, SequenceNumberCou
 
 const KEYS: u64 = 40_000;
 const FLUSHES: u64 = 6;
-/// zstd "ultra" (max) level — compression CPU dominates, so the serial-vs-
-/// parallel gap is clearest. Lower KEYS keeps the level-22 run tractable.
-const ZSTD_LEVEL: i32 = 22;
+/// The two ends of the zstd spectrum: level 1 (cheap compression — per-block
+/// overhead most visible) and level 22 (max — codec CPU dominates, parallel
+/// win clearest). Level 6 in between is uninformative, so it is skipped.
+const ZSTD_LEVELS: [i32; 2] = [1, 22];
 
 /// Builds a tree of `FLUSHES` zstd-compressed L0 tables ready for one big
 /// `major_compact`. `threads` selects serial (1) vs parallel (>1) compression.
-fn build_filled_tree(threads: usize) -> (AnyTree, tempfile::TempDir) {
+fn build_filled_tree(threads: usize, level: i32) -> (AnyTree, tempfile::TempDir) {
     let folder = tempfile::tempdir().unwrap();
     let tree = Config::new(
         &folder,
@@ -29,7 +30,7 @@ fn build_filled_tree(threads: usize) -> (AnyTree, tempfile::TempDir) {
         SequenceNumberCounter::default(),
     )
     .data_block_compression_policy(CompressionPolicy::all(
-        CompressionType::zstd(ZSTD_LEVEL).unwrap(),
+        CompressionType::zstd(level).unwrap(),
     ))
     .compaction_threads(threads)
     .open()
@@ -51,23 +52,25 @@ fn build_filled_tree(threads: usize) -> (AnyTree, tempfile::TempDir) {
 }
 
 fn bench_major_compact(c: &mut Criterion) {
-    let mut group = c.benchmark_group("major_compact_zstd22");
-    group.sample_size(10);
+    for level in ZSTD_LEVELS {
+        let mut group = c.benchmark_group(format!("major_compact_zstd{level}"));
+        group.sample_size(10);
 
-    for threads in [1usize, 4] {
-        group.bench_function(format!("threads_{threads}"), |b| {
-            b.iter_batched(
-                || build_filled_tree(threads),
-                |(tree, _folder)| {
-                    tree.major_compact(u64::MAX, 0).unwrap();
-                    std::hint::black_box(&tree);
-                },
-                BatchSize::PerIteration,
-            );
-        });
+        for threads in [1usize, 4] {
+            group.bench_function(format!("threads_{threads}"), |b| {
+                b.iter_batched(
+                    || build_filled_tree(threads, level),
+                    |(tree, _folder)| {
+                        tree.major_compact(u64::MAX, 0).unwrap();
+                        std::hint::black_box(&tree);
+                    },
+                    BatchSize::PerIteration,
+                );
+            });
+        }
+
+        group.finish();
     }
-
-    group.finish();
 }
 
 criterion_group!(benches, bench_major_compact);

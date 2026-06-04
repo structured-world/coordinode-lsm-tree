@@ -10,8 +10,10 @@
 //!   = 1` (so the only parallelism is block compression, not range-split —
 //!   apples-to-apples with our parallel block-compression path).
 //!
-//! Both build the same FLUSHES zstd-22 L0 tables, then a single full compaction
-//! is timed (setup excluded via `iter_custom`). zstd level 22 is the max; the CPU-bound compression dominates so the parallel win is clearest.
+//! Both build the same FLUSHES zstd L0 tables, then a single full compaction is
+//! timed (setup excluded via `iter_custom`). Run at the two ends of the zstd
+//! spectrum — level 1 (cheap compression; per-block overhead most visible) and
+//! level 22 (max; codec CPU dominates).
 
 use criterion::{Criterion, criterion_group, criterion_main};
 use lsm_tree::config::CompressionPolicy;
@@ -21,10 +23,10 @@ use std::time::{Duration, Instant};
 const KEYS: u64 = 40_000;
 const FLUSHES: u64 = 6;
 const THREADS: usize = 4;
-// zstd level 22 ("ultra", the max) — compression CPU dominates, so it both
-// stresses the parallel pipeline hardest and matches the dashboard's zstd22
-// convention. Lower KEYS keeps the (much slower) level-22 run tractable.
-const ZSTD_LEVEL: i32 = 22;
+// The two ends of the zstd spectrum: level 1 (fastest — compression is cheap,
+// so per-block overhead is most visible) and level 22 ("ultra", max — codec
+// CPU dominates). Level 6 in between is uninformative, so it is skipped.
+const ZSTD_LEVELS: [i32; 2] = [1, 22];
 
 fn key_for(batch: u64, i: u64) -> Vec<u8> {
     // Interleave keys across batches (batch b owns i*FLUSHES + b) so the L0
@@ -41,16 +43,16 @@ fn value_for(i: u64) -> Vec<u8> {
     format!("row-{i}-{}", "the quick brown fox ".repeat(8)).into_bytes()
 }
 
-/// Builds FLUSHES zstd-22 L0 tables in our engine, then times one full
+/// Builds FLUSHES zstd L0 tables in our engine, then times one full
 /// `major_compact` (parallel block compression across THREADS workers).
-fn ours_compaction() -> Duration {
+fn ours_compaction(level: i32) -> Duration {
     let dir = tempfile::tempdir().unwrap();
     let tree = Config::new(
         &dir,
         SequenceNumberCounter::default(),
         SequenceNumberCounter::default(),
     )
-    .data_block_compression_policy(CompressionPolicy::all(CompressionType::Zstd(ZSTD_LEVEL)))
+    .data_block_compression_policy(CompressionPolicy::all(CompressionType::Zstd(level)))
     .compaction_threads(THREADS)
     .open()
     .unwrap();
@@ -70,9 +72,9 @@ fn ours_compaction() -> Duration {
     start.elapsed()
 }
 
-/// Builds FLUSHES zstd-22 L0 tables in RocksDB (auto-compaction off), then times
+/// Builds FLUSHES zstd L0 tables in RocksDB (auto-compaction off), then times
 /// one full `compact_range` with parallel block compression across THREADS.
-fn rocksdb_compaction() -> Duration {
+fn rocksdb_compaction(level: i32) -> Duration {
     let dir = tempfile::tempdir().unwrap();
 
     let mut opts = rocksdb::Options::default();
@@ -81,7 +83,7 @@ fn rocksdb_compaction() -> Duration {
     opts.set_disable_auto_compactions(true);
     opts.set_compression_type(rocksdb::DBCompressionType::Zstd);
     // (window_bits, level, strategy, max_dict_bytes); -14 = default zstd window.
-    opts.set_compression_options(-14, ZSTD_LEVEL, 0, 0);
+    opts.set_compression_options(-14, level, 0, 0);
     // The mechanism under test: parallel block compression within a compaction.
     opts.set_compression_options_parallel_threads(THREADS as i32);
     // Isolate block-compression parallelism (no range-split sub-compactions),
@@ -106,30 +108,32 @@ fn rocksdb_compaction() -> Duration {
 }
 
 fn bench_compaction(c: &mut Criterion) {
-    let mut group = c.benchmark_group("major_compact_zstd22_4threads");
-    group.sample_size(10);
+    for level in ZSTD_LEVELS {
+        let mut group = c.benchmark_group(format!("major_compact_zstd{level}_4threads"));
+        group.sample_size(10);
 
-    group.bench_function("ours", |b| {
-        b.iter_custom(|iters| {
-            let mut total = Duration::ZERO;
-            for _ in 0..iters {
-                total += ours_compaction();
-            }
-            total
+        group.bench_function("ours", |b| {
+            b.iter_custom(|iters| {
+                let mut total = Duration::ZERO;
+                for _ in 0..iters {
+                    total += ours_compaction(level);
+                }
+                total
+            });
         });
-    });
 
-    group.bench_function("rocksdb", |b| {
-        b.iter_custom(|iters| {
-            let mut total = Duration::ZERO;
-            for _ in 0..iters {
-                total += rocksdb_compaction();
-            }
-            total
+        group.bench_function("rocksdb", |b| {
+            b.iter_custom(|iters| {
+                let mut total = Duration::ZERO;
+                for _ in 0..iters {
+                    total += rocksdb_compaction(level);
+                }
+                total
+            });
         });
-    });
 
-    group.finish();
+        group.finish();
+    }
 }
 
 criterion_group!(benches, bench_compaction);
