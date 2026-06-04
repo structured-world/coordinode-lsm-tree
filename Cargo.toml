@@ -271,3 +271,9 @@ name = "ecc"
 harness = false
 path = "benches/ecc.rs"
 required-features = ["page_ecc"]
+
+[[bench]]
+name = "compaction"
+harness = false
+path = "benches/compaction.rs"
+required-features = ["zstd"]
