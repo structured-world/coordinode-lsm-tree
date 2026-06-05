@@ -399,6 +399,19 @@ fn run_subcompaction(
 ) -> crate::Result<super::flavour::ProducedOutput> {
     use super::flavour::CompactionFlavour;
 
+    // Test-only failpoint: the first range to observe an armed flag fails (and
+    // disarms it), so exactly one sub-compaction errors while its siblings
+    // succeed — deterministically driving the rollback path that marks the
+    // siblings' finalized files deleted and restores the hidden inputs.
+    #[cfg(test)]
+    if opts
+        .config
+        .fail_one_subcompaction
+        .swap(false, std::sync::atomic::Ordering::SeqCst)
+    {
+        return Err(cancelled_compaction());
+    }
+
     let mut blob_frag_map = FragmentationMap::default();
 
     let to_compact = payload.table_ids.iter().copied().collect::<Vec<_>>();
@@ -1353,6 +1366,81 @@ mod tests {
             Some(&b'a'),
             "the surviving boundary should be from the deduped a-group",
         );
+    }
+
+    /// A failing sub-compaction range must abort the whole compaction, roll
+    /// back the finalized files of the ranges that DID succeed, and restore the
+    /// hidden input tables — leaving the tree fully readable with nothing
+    /// partially installed. Drives the parallel rollback path via the test
+    /// failpoint (one range errors, its siblings succeed and are rolled back).
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn failed_subcompaction_rolls_back_and_restores_inputs() -> crate::Result<()> {
+        use std::sync::atomic::Ordering;
+
+        const N: u64 = 4_000;
+        let key = |i: u64| format!("key_{i:08}");
+        let val = |i: u64, generation: u64| format!("g{generation}-{i}-{}", "x".repeat(40));
+
+        let dir = tempfile::tempdir()?;
+        let config = Config::new(
+            &dir,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .data_block_size_policy(BlockSizePolicy::all(512))
+        .compaction_threads(4)
+        .subcompaction_min_bytes(0)
+        // KV separation so the surviving sub-compactions also produce blob
+        // files, exercising the blob-file arm of the rollback as well.
+        .with_kv_separation(Some(
+            KvSeparationOptions::default().separation_threshold(16),
+        ));
+        // Share the failpoint handle before the config is consumed by open().
+        let failpoint = config.fail_one_subcompaction.clone();
+        let tree = config.open()?;
+
+        // Populate the bottom level with several tables (the split boundaries).
+        for i in 0..N {
+            tree.insert(key(i), val(i, 0), i);
+        }
+        tree.flush_active_memtable(0)?;
+        tree.major_compact(4_096, 0)?;
+
+        // Overwrite the whole keyspace into L0; the next compaction merges it
+        // into the populated bottom and splits into parallel sub-compactions.
+        for i in 0..N {
+            tree.insert(key(i), val(i, 1), N + i);
+        }
+        tree.flush_active_memtable(0)?;
+        let tables_before = tree.table_count();
+
+        // Arm: exactly one sub-compaction range will error.
+        failpoint.store(true, Ordering::SeqCst);
+        let result = tree.major_compact(u64::MAX, 0);
+
+        assert!(
+            result.is_err(),
+            "a failing sub-compaction range must abort the compaction",
+        );
+        assert!(
+            !failpoint.load(Ordering::SeqCst),
+            "the failpoint should have fired and disarmed itself",
+        );
+        assert_eq!(
+            tree.table_count(),
+            tables_before,
+            "rollback must leave nothing partially installed",
+        );
+        for i in 0..N {
+            assert_eq!(
+                tree.get(key(i), crate::MAX_SEQNO)?.as_deref(),
+                Some(val(i, 1).as_bytes()),
+                "value for {} must survive the rolled-back compaction",
+                key(i),
+            );
+        }
+        Ok(())
     }
 
     #[test]

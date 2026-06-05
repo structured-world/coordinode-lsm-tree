@@ -550,6 +550,13 @@ pub struct Config {
     #[cfg(feature = "std")]
     pub(crate) subcompaction_min_bytes: u64,
 
+    /// Test-only failpoint: when armed, the first parallel sub-compaction range
+    /// that observes it returns an error and disarms it, so the crash-safety
+    /// rollback paths (sibling output rollback, input restore) can be exercised
+    /// deterministically. Behind `cfg(test)`, never compiled into release builds.
+    #[cfg(all(test, feature = "std"))]
+    pub(crate) fail_one_subcompaction: Arc<std::sync::atomic::AtomicBool>,
+
     /// Pre-trained zstd dictionary for dictionary compression.
     ///
     /// When set together with a [`CompressionType::ZstdDict`] compression
@@ -668,6 +675,8 @@ impl Default for Config {
             compaction_pool: None,
             #[cfg(feature = "std")]
             subcompaction_min_bytes: crate::compaction::worker::SUBCOMPACTION_MIN_INPUT_BYTES,
+            #[cfg(all(test, feature = "std"))]
+            fail_one_subcompaction: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 }
