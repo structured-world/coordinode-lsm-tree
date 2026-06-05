@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1780604097255,
+  "lastUpdate": 1780656055694,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -13182,6 +13182,84 @@ window.BENCHMARK_DATA = {
             "value": 536383.2096940087,
             "unit": "ops/sec",
             "extra": "P50: 1.7us | P99: 5.1us | P99.9: 7.5us\nthreads: 1 | elapsed: 0.37s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "ab8328f44f3290064b436788889598e40e62c26f",
+          "message": "feat(compaction): parallel sub-compaction across key ranges (#402)\n\n## Summary\n\nPhase 2 of #144 (stacked on #401): split a non-relocating compaction\ninto\ndisjoint key ranges that compact in parallel, each writing its own SSTs,\nthen\nmerge all into one atomic version edit. Compounds with #401's parallel\nblock\ncompression (an N-way split, each compressing on its own threads).\n\n## Changes\n\n- Split boundaries from the destination level's table boundaries\n(`subcompaction_boundaries`) → disjoint ranges\n(`ranges_from_boundaries`);\n  each input table read range-bounded via `Table::range`\n  (`create_bounded_compaction_stream`).\n- `run_subcompaction`: full per-range pipeline (tombstone eviction,\nKV-separation drop tracking, compaction filter) returning a\n`ProducedOutput`\nwithout touching the version. First range on the calling thread, rest on\n`std::thread::scope` workers; only the first carries the input tables to\n  delete (dropped once at install).\n- Gated to non-relocating compactions (active blob relocation stays\nsingle-threaded — it already parallelizes block compression). Skipped\nbelow\n`Config::subcompaction_min_bytes` (default 8 MiB) so small compactions\nstay a\n  single merged table.\n- `CompactionStrategy: Send + Sync` (to share `Options` across workers;\nall\n  strategies already satisfy it).\n\n## Testing\n\n- `tests/sub_compaction.rs`: compares parallel output against the serial\npath\nkey-for-key (plain **and** KV-separated) and asserts the split actually\nhappened (more output tables than serial) — guarding against\nsplit-boundary\n  off-by-one (silent loss/dup).\n- Full lib suite (1225) green with sub-compaction active by default; key\n  compaction + blob-relocation integration tests green.\n- clippy `--all-features --all-targets -D warnings`, fmt, rustdoc clean.\n- no-std unchanged (the whole path is std-gated).\n\n> Stacked on #401 — review/merge #401 first, then this rebases onto\nmain.\n\nPart of #144\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n## Summary by CodeRabbit\n\n* **New Features**\n* Range-parallel sub-compaction: eligible compactions can split into\nparallel tasks to use multiple CPU cores and produce atomic outputs.\n\n* **Configuration**\n* New setting to control minimum size for splitting compactions (0\nforces splits).\n* Option to enable parallel block compression and clearer docs on\ncompression threads sizing/capping.\n\n* **Reliability**\n* Sub-compactions are cancellable, roll back on failure, and restore\ninputs to avoid partial installs.\n\n* **Performance**\n  * Benchmarks added to measure parallel sub-compaction.\n\n* **Tests**\n  * Integration tests verify parallel results match serial compaction.\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-06-05T13:39:58+03:00",
+          "tree_id": "7b0a5bc71391eeefd7ebd98568bcb9b3f5519cfe",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/ab8328f44f3290064b436788889598e40e62c26f"
+        },
+        "date": 1780656051787,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 2086029.85286032,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.6us | P99.9: 3.7us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1203398.3029424418,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.3us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 656338.6055066376,
+            "unit": "ops/sec",
+            "extra": "P50: 1.4us | P99: 4.5us | P99.9: 7.0us\nthreads: 1 | elapsed: 0.30s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3640824.5069431616,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 3.0us | P99.9: 5.4us\nthreads: 1 | elapsed: 0.05s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 442308.65586008725,
+            "unit": "ops/sec",
+            "extra": "P50: 2.0us | P99: 5.3us | P99.9: 8.0us\nthreads: 1 | elapsed: 0.45s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 221146.75875108605,
+            "unit": "ops/sec",
+            "extra": "P50: 4.2us | P99: 5.4us | P99.9: 7.6us\nthreads: 1 | elapsed: 0.90s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1228243.7726121598,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.3us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1116807.5618057218,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 1.5us | P99.9: 2.0us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 551441.5716636234,
+            "unit": "ops/sec",
+            "extra": "P50: 1.6us | P99: 6.0us | P99.9: 8.9us\nthreads: 1 | elapsed: 0.36s | num: 200000 | iterations: 3"
           }
         ]
       }
