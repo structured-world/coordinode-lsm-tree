@@ -1299,7 +1299,6 @@ mod tests {
         }
 
         #[test]
-        #[allow(clippy::unwrap_used, reason = "test assertion")]
         fn compaction_merge_mixed_keys() -> crate::Result<()> {
             // Multiple keys, some with merge operands, some without
             let vec = vec![
@@ -1539,7 +1538,6 @@ mod tests {
 
         /// Complete merge (with base) emits Value; partial merge emits MergeOperand.
         #[test]
-        #[allow(clippy::unwrap_used, reason = "test assertion")]
         fn compaction_merge_complete_vs_partial() -> crate::Result<()> {
             // Complete merge: operand + base → Value
             #[rustfmt::skip]

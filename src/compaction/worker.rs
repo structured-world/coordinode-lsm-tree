@@ -1056,18 +1056,23 @@ fn merge_tables(
     let dst_lvl = payload.canonical_level.into();
     let is_last_level = payload.dest_level == opts.config.level_count - 1;
 
+    merge_iter = merge_iter
+        .evict_tombstones(is_last_level)
+        .zero_seqnos(false);
+
     // Whole-version tombstones for compaction-time RT application (drop covered
     // KVs in the merge) and the bottommost seqno-zeroing gate; gathered from
-    // every level so coverage outside this compaction is respected.
+    // every level so coverage outside this compaction is respected. Both the
+    // whole-version scan and the seqno-zeroer wrapper are std-only, so the
+    // bottommost RT-application + zeroing is gated here; without std the merge
+    // stream is iterated directly (see the zeroer wrap below).
+    #[cfg(feature = "std")]
     let zeroing_tombstones = if is_last_level {
         collect_version_tombstones(&current_super_version.version)
     } else {
         Vec::new()
     };
-
-    merge_iter = merge_iter
-        .evict_tombstones(is_last_level)
-        .zero_seqnos(false);
+    #[cfg(feature = "std")]
     if is_last_level {
         merge_iter = merge_iter.with_range_tombstone_application(
             zeroing_tombstones.clone(),
@@ -1197,6 +1202,10 @@ fn merge_tables(
             compactor.write_range_tombstones(&input_range_tombstones);
         }
 
+        // Bottommost seqno-zeroing is std-only (the zeroer and the whole-version
+        // tombstone scan live behind the std feature); without std, iterate the
+        // filtered merge stream directly.
+        #[cfg(feature = "std")]
         let merge_iter = super::seqno_zeroer::BottommostSeqnoZeroer::new(
             merge_iter,
             is_last_level,
