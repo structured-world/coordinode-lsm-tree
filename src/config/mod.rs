@@ -521,11 +521,14 @@ pub struct Config {
     /// [`Config::compaction_rate_limit`].
     pub(crate) compaction_rate_limit: u64,
 
-    /// Worker-thread count for the parallel block-compression pipeline used
-    /// during compaction. Default `max(1, available_parallelism / 2)` — leaves
-    /// half the cores for application work. `1` (or no `parallel` feature) keeps
-    /// compaction on the serial path. Sizes the per-tree default pool built at
-    /// open when [`Self::compaction_pool`] is `None`. Set via
+    /// Worker-thread count for compaction parallelism (`std` only), used two
+    /// ways: it sizes the per-tree block-compression pool built at open when
+    /// [`Self::compaction_pool`] is `None`, and it caps how many range-parallel
+    /// sub-compactions a single compaction is split into. Default
+    /// `max(1, available_parallelism / 2)` — leaves half the cores for
+    /// application work. `1` forces the serial path for both. Without the
+    /// `parallel` feature there is no built-in pool, so block compression and
+    /// sub-compaction ranges run serially even for a value > 1. Set via
     /// [`Config::compaction_threads`].
     #[cfg(feature = "std")] // no-std: parallel compaction unavailable (no threads)
     pub(crate) compaction_threads: usize,
@@ -537,6 +540,22 @@ pub struct Config {
     /// threads regardless of tree count. Set via [`Config::compaction_pool`].
     #[cfg(feature = "std")]
     pub(crate) compaction_pool: Option<Arc<dyn crate::table::writer::CompactionSpawner>>,
+
+    /// Minimum total input size (bytes) for a compaction to be split into
+    /// parallel sub-compactions. Below it the compaction stays single-threaded
+    /// (per-thread setup + extra output tables outweigh the parallelism on small
+    /// compactions). Default
+    /// [`SUBCOMPACTION_MIN_INPUT_BYTES`](crate::compaction::worker::SUBCOMPACTION_MIN_INPUT_BYTES)
+    /// (8 MiB). Set via [`Config::subcompaction_min_bytes`].
+    #[cfg(feature = "std")]
+    pub(crate) subcompaction_min_bytes: u64,
+
+    /// Test-only failpoint: when armed, the first parallel sub-compaction range
+    /// that observes it returns an error and disarms it, so the crash-safety
+    /// rollback paths (sibling output rollback, input restore) can be exercised
+    /// deterministically. Behind `cfg(test)`, never compiled into release builds.
+    #[cfg(all(test, feature = "std"))]
+    pub(crate) fail_one_subcompaction: Arc<std::sync::atomic::AtomicBool>,
 
     /// Pre-trained zstd dictionary for dictionary compression.
     ///
@@ -654,6 +673,10 @@ impl Default for Config {
                 .map_or(1, |n| (n.get() / 2).max(1)),
             #[cfg(feature = "std")]
             compaction_pool: None,
+            #[cfg(feature = "std")]
+            subcompaction_min_bytes: crate::compaction::worker::SUBCOMPACTION_MIN_INPUT_BYTES,
+            #[cfg(all(test, feature = "std"))]
+            fail_one_subcompaction: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 }
@@ -1369,18 +1392,31 @@ impl Config {
         self
     }
 
-    /// Sets the compaction parallel-compression worker-thread count.
+    /// Sets the compaction worker-thread count.
     ///
-    /// Sizes the per-tree pool built at open when no shared pool is supplied
-    /// (see [`Self::compaction_pool`]). `1` keeps compaction serial. Default is
-    /// `max(1, available_parallelism / 2)`. Ignored without the `parallel`
-    /// feature (no built-in pool to size).
+    /// Under `std` this both sizes the per-tree block-compression pool built at
+    /// open when no shared pool is supplied (see [`Self::compaction_pool`]) and
+    /// caps how many range-parallel sub-compactions a compaction splits into.
+    /// `1` keeps compaction serial. Default is `max(1, available_parallelism /
+    /// 2)`. Without the `parallel` feature there is no built-in pool, so the
+    /// work runs serially even for a value > 1.
     #[cfg(feature = "std")]
     #[must_use]
     pub fn compaction_threads(mut self, threads: usize) -> Self {
         // Clamp to >= 1: the documented semantics treat `1` as "serial", and a
         // 0-thread pool would be an invalid state.
         self.compaction_threads = threads.max(1);
+        self
+    }
+
+    /// Sets the minimum total input size (bytes) for a compaction to be split
+    /// into parallel sub-compactions. Default 8 MiB. `0` splits every eligible
+    /// compaction; a large value effectively disables sub-compaction (block
+    /// compression still parallelizes via [`Self::compaction_threads`]).
+    #[cfg(feature = "std")]
+    #[must_use]
+    pub fn subcompaction_min_bytes(mut self, bytes: u64) -> Self {
+        self.subcompaction_min_bytes = bytes;
         self
     }
 

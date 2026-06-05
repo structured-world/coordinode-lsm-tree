@@ -5,7 +5,7 @@
 use super::{CompactionAction, CompactionResult, CompactionStrategy, Input as CompactionPayload};
 use crate::{
     BlobFile, Config, HashSet, InternalValue, SeqNo, SequenceNumberCounter,
-    SharedSequenceNumberGenerator, Table, TableId,
+    SharedSequenceNumberGenerator, Table, TableId, UserKey,
     blob_tree::FragmentationMap,
     compaction::{
         Choice,
@@ -32,7 +32,16 @@ use crate::metrics::Metrics;
 
 pub type CompactionReader<'a> = Box<dyn Iterator<Item = crate::Result<InternalValue>> + 'a>;
 
+/// Minimum total input size for a compaction to be split into parallel
+/// sub-compactions. Below this the per-thread setup + the extra output tables
+/// (one per sub-range) cost more than the parallelism buys, so the compaction
+/// stays single-threaded (which also keeps small/test compactions producing a
+/// single merged table). Default for [`Config::subcompaction_min_bytes`].
+#[cfg(feature = "std")]
+pub const SUBCOMPACTION_MIN_INPUT_BYTES: u64 = 8 * 1024 * 1024;
+
 /// Compaction options
+#[derive(Clone)]
 pub struct Options {
     pub tree_id: TreeId,
 
@@ -230,6 +239,284 @@ fn create_compaction_stream<'a>(
     })
 }
 
+/// Like [`create_compaction_stream`] but restricts every input table to the key
+/// range `bounds`, used by parallel sub-compactions where each thread owns a
+/// disjoint slice of the key space. Each input table is read via
+/// [`crate::Table::range`] (a raw, all-seqno, key-bounded scan that seeks within
+/// the table), so a sub-compaction only touches the blocks overlapping its
+/// slice. The bounds must partition the key space across sub-compactions
+/// (`Included(lo)..Excluded(hi)`) so every entry lands in exactly one.
+#[cfg(feature = "std")]
+fn create_bounded_compaction_stream<'a>(
+    version: &'a Version,
+    to_compact: &HashSet<TableId>,
+    bounds: (std::ops::Bound<UserKey>, std::ops::Bound<UserKey>),
+    eviction_seqno: SeqNo,
+    merge_operator: Option<Arc<dyn crate::merge_operator::MergeOperator>>,
+    comparator: crate::comparator::SharedComparator,
+) -> Option<CompactionStream<'a, Merger<CompactionReader<'a>>>> {
+    let mut readers: Vec<CompactionReader<'_>> = vec![];
+    let mut found = 0;
+
+    for run in version.iter_levels().flat_map(|lvl| lvl.iter()) {
+        for table in run.iter().filter(|x| to_compact.contains(&x.metadata.id)) {
+            found += 1;
+            readers.push(Box::new(table.range(bounds.clone())));
+        }
+    }
+
+    if found == to_compact.len() {
+        Some(
+            CompactionStream::new(Merger::new(readers, comparator), eviction_seqno)
+                .with_merge_operator(merge_operator),
+        )
+    } else {
+        None
+    }
+}
+
+/// Sorts the destination-level max-keys, drops comparator-equal duplicates, and
+/// removes the global maximum (splitting after it yields an empty trailing
+/// range), returning the candidate interior boundary keys. Split out of
+/// [`subcompaction_boundaries`] so the comparator-equality dedup is unit
+/// testable without constructing a full [`Version`].
+#[cfg(feature = "std")]
+fn boundary_candidates(
+    mut keys: Vec<UserKey>,
+    comparator: &crate::comparator::SharedComparator,
+) -> Vec<UserKey> {
+    if keys.len() < 2 {
+        return Vec::new();
+    }
+    keys.sort_by(|a, b| comparator.compare(a, b));
+    // Dedup under the configured comparator, not raw bytes: a custom comparator
+    // can rank two byte-distinct keys as equal, and a leftover equal cut point
+    // would make adjacent sub-compaction ranges overlap or gap.
+    keys.dedup_by(|a, b| comparator.compare(a, b).is_eq());
+    keys.pop();
+    keys
+}
+
+/// Interior split-boundary keys for a parallel compaction, derived from the
+/// destination level's existing table boundaries (`RocksDB`'s approach: aligning
+/// sub-compaction cuts to target-level files keeps outputs structured). Returns
+/// at most `max_ranges - 1` keys (evenly sampled), sorted by `comparator`.
+/// Empty → the compaction stays single-threaded (no usable cut points).
+#[cfg(feature = "std")]
+fn subcompaction_boundaries(
+    version: &Version,
+    dest_level: usize,
+    max_ranges: usize,
+    comparator: &crate::comparator::SharedComparator,
+) -> Vec<UserKey> {
+    if max_ranges < 2 {
+        return Vec::new();
+    }
+    let Some(level) = version.level(dest_level) else {
+        return Vec::new();
+    };
+    let keys: Vec<UserKey> = level
+        .iter()
+        .flat_map(|run| run.iter())
+        .map(|t| t.metadata.key_range.max().clone())
+        .collect();
+    let keys = boundary_candidates(keys, comparator);
+    if keys.is_empty() {
+        return Vec::new();
+    }
+    let want = (max_ranges - 1).min(keys.len());
+    if want == keys.len() {
+        return keys;
+    }
+    // Evenly sample `want` boundaries across the candidates.
+    let mut out = Vec::with_capacity(want);
+    for i in 1..=want {
+        let idx = ((i * keys.len()) / (want + 1)).min(keys.len() - 1);
+        if let Some(key) = keys.get(idx) {
+            out.push(key.clone());
+        }
+    }
+    out.dedup();
+    out
+}
+
+/// Turns interior boundary keys into `boundaries.len() + 1` disjoint key ranges
+/// that partition the whole key space: `(Unbounded, Excluded(b0))`,
+/// `[Included(b_i), Excluded(b_{i+1}))`, …, `[Included(b_last), Unbounded)`.
+/// Every entry falls in exactly one range, so the sub-compaction outputs union
+/// to the same set the serial compaction would produce.
+#[cfg(feature = "std")]
+fn ranges_from_boundaries(
+    boundaries: &[UserKey],
+) -> Vec<(std::ops::Bound<UserKey>, std::ops::Bound<UserKey>)> {
+    use std::ops::Bound::{Excluded, Included, Unbounded};
+    let mut ranges = Vec::with_capacity(boundaries.len() + 1);
+    let mut lo = Unbounded;
+    for b in boundaries {
+        ranges.push((lo.clone(), Excluded(b.clone())));
+        lo = Included(b.clone());
+    }
+    ranges.push((lo, Unbounded));
+    ranges
+}
+
+/// Error returned when a sub-compaction is interrupted by the stop signal, so
+/// the parallel caller re-shows the inputs and skips the atomic install instead
+/// of committing a truncated sub-range.
+#[cfg(feature = "std")]
+fn cancelled_compaction() -> crate::Error {
+    crate::Error::Io(std::io::Error::new(
+        std::io::ErrorKind::Interrupted,
+        "sub-compaction cancelled by stop signal",
+    ))
+}
+
+/// Runs one sub-compaction over the key range `bounds`: builds a bounded merge
+/// stream of the inputs, applies the same transforms as the serial path
+/// (tombstone eviction, KV-separation drop tracking, compaction filter), writes
+/// its output SSTs, and returns a [`ProducedOutput`](super::flavour::ProducedOutput)
+/// WITHOUT installing a version edit (the caller merges all outputs into one).
+/// Only the sub-compaction that `owns_input_deletion` carries the input tables
+/// to be dropped, so the shared inputs are marked deleted exactly once.
+#[cfg(feature = "std")]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a sub-compaction needs the full compaction context (opts, payload, \
+              version, inputs, range, level info, blob folder) threaded in by value/ref \
+              so it can run on its own thread; bundling into a struct would just move \
+              the argument list"
+)]
+fn run_subcompaction(
+    opts: &Options,
+    payload: &CompactionPayload,
+    version: &Version,
+    tables_for_deletion: Vec<Table>,
+    input_range_tombstones: &[crate::range_tombstone::RangeTombstone],
+    bounds: (std::ops::Bound<UserKey>, std::ops::Bound<UserKey>),
+    dst_lvl: usize,
+    is_last_level: bool,
+    blobs_folder: &std::path::Path,
+) -> crate::Result<super::flavour::ProducedOutput> {
+    use super::flavour::CompactionFlavour;
+
+    // Test-only failpoint: the first range to observe an armed flag fails (and
+    // disarms it), so exactly one sub-compaction errors while its siblings
+    // succeed — deterministically driving the rollback path that marks the
+    // siblings' finalized files deleted and restores the hidden inputs.
+    #[cfg(test)]
+    if opts
+        .config
+        .fail_one_subcompaction
+        .swap(false, std::sync::atomic::Ordering::SeqCst)
+    {
+        return Err(cancelled_compaction());
+    }
+
+    let mut blob_frag_map = FragmentationMap::default();
+
+    let Some(mut merge_iter) = create_bounded_compaction_stream(
+        version,
+        &payload.table_ids,
+        bounds,
+        opts.mvcc_gc_watermark,
+        opts.config.merge_operator.clone(),
+        opts.config.comparator.clone(),
+    ) else {
+        // The caller validated every input exists, so a missing table here is
+        // unexpected. Fail closed: an empty output would let the install delete
+        // the source tables (this range may own input deletion) while producing
+        // no replacement SSTs. Returning an error makes the parallel caller
+        // re-show the inputs and skip the install entirely.
+        return Err(crate::Error::Io(std::io::Error::other(
+            "sub-compaction input tables disappeared mid-flight",
+        )));
+    };
+
+    merge_iter = merge_iter
+        .evict_tombstones(is_last_level)
+        .zero_seqnos(false);
+
+    let filter_ctx = Context { is_last_level };
+    let mut compaction_filter = opts
+        .config
+        .compaction_filter_factory
+        .as_ref()
+        .map(|f| f.make_filter(&filter_ctx));
+
+    // KV separation (no relocation on this path): track fragmentation from
+    // dropped/GC'd entries so the merged install updates blob GC stats.
+    if opts.config.kv_separation_opts.is_some() {
+        merge_iter = merge_iter.with_drop_callback(&mut blob_frag_map);
+    }
+
+    let mut filter_blob_writer = None;
+    let merge_iter = merge_iter.with_filter(StreamFilterAdapter::new(
+        compaction_filter.as_deref_mut(),
+        opts,
+        version,
+        blobs_folder,
+        &mut filter_blob_writer,
+        &filter_ctx,
+    ));
+
+    // block_parallel = false: this sub-compaction already runs on a pool thread,
+    // so its block compression must stay serial (nested-pool deadlock otherwise).
+    let table_writer = super::flavour::prepare_table_writer(version, opts, payload, false)?;
+    let mut compactor: Box<dyn CompactionFlavour> =
+        Box::new(StandardCompaction::new(table_writer, tables_for_deletion));
+
+    // Propagate range tombstones to this sub-range's output; the writer clips
+    // them to each output table's key range (a boundary-spanning RT is written
+    // clipped on both sides, which is correct).
+    if !input_range_tombstones.is_empty() {
+        compactor.write_range_tombstones(input_range_tombstones);
+    }
+
+    for (idx, item) in merge_iter.enumerate() {
+        let item = item?;
+
+        let io_bytes = (item.key.user_key.len() as u64).saturating_add(item.value.len() as u64);
+        if opts
+            .rate_limiter
+            .request_interruptible(io_bytes, || opts.stop_signal.is_stopped())
+        {
+            // Abort, do not produce: a truncated sub-range would be installed
+            // atomically alongside its siblings, dropping the unwritten tail of
+            // this range (a gap in the middle of the key space). The error makes
+            // the caller re-show the inputs and skip the install.
+            return Err(cancelled_compaction());
+        }
+
+        compactor.write(item)?;
+
+        if idx % 1_000_000 == 0 && opts.stop_signal.is_stopped() {
+            return Err(cancelled_compaction());
+        }
+    }
+
+    if let Some(filter) = compaction_filter {
+        filter.finish();
+    }
+
+    let extra_blob_files = filter_blob_writer
+        .map(BlobFileWriter::finish)
+        .transpose()?
+        .unwrap_or_default();
+
+    // produce() consumes the (already finalized on disk) filter blob files; if
+    // it fails, mark them deleted so they are not orphaned. The parallel caller
+    // rolls back sibling outputs on error but cannot reach this range's own
+    // filter blobs, so clean them up here.
+    let rollback_extra_blob_files = extra_blob_files.clone();
+    compactor
+        .produce(opts, dst_lvl, blob_frag_map, extra_blob_files)
+        .inspect_err(|_| {
+            for blob_file in &rollback_extra_blob_files {
+                blob_file.mark_as_deleted();
+            }
+        })
+}
+
 #[expect(
     clippy::significant_drop_tightening,
     reason = "version_history_lock must be held across upgrade_version and maintenance"
@@ -416,7 +703,9 @@ fn merge_tables(
         return Ok(CompactionResult::nothing());
     }
 
-    let current_super_version = version_history_lock.latest_version();
+    // Arc so the snapshot can be shared with sub-compactions running on the
+    // configured compaction pool (fire-and-forget executor needs `'static`).
+    let current_super_version = Arc::new(version_history_lock.latest_version());
 
     let Some(tables) = payload
         .table_ids
@@ -442,6 +731,219 @@ fn merge_tables(
         .collect();
     input_range_tombstones.sort();
     input_range_tombstones.dedup();
+
+    // ---- Parallel sub-compaction (std only) ----
+    // A non-relocating compaction can be split into disjoint key ranges that
+    // compact in parallel — each writes its own SSTs, then all merge into one
+    // atomic version edit. Active blob relocation stays single-threaded and
+    // falls through to the serial path below.
+    #[cfg(feature = "std")]
+    {
+        let threads = opts.config.compaction_threads;
+        let dst_lvl: usize = payload.canonical_level.into();
+        let is_last_level = payload.dest_level == opts.config.level_count - 1;
+
+        // Only KV-separated trees with fragmented blob files relocate; that
+        // path is not split here.
+        let relocating = match &opts.config.kv_separation_opts {
+            Some(blob_opts) => !pick_blob_files_to_rewrite(
+                &payload.table_ids,
+                &current_super_version.version,
+                blob_opts,
+            )?
+            .is_empty(),
+            None => false,
+        };
+
+        let total_input_bytes: u64 = tables.iter().map(Table::file_size).sum();
+
+        let boundaries = if threads > 1
+            && !relocating
+            && total_input_bytes >= opts.config.subcompaction_min_bytes
+        {
+            subcompaction_boundaries(
+                &current_super_version.version,
+                payload.dest_level as usize,
+                threads,
+                &opts.config.comparator,
+            )
+        } else {
+            Vec::new()
+        };
+
+        if !boundaries.is_empty() {
+            let blobs_folder = opts.config.path.join(BLOBS_FOLDER);
+            let ranges = ranges_from_boundaries(&boundaries);
+
+            // Hand off: hide inputs, release the exclusive + version locks for
+            // the CPU-heavy parallel phase.
+            drop(version_history_lock);
+            compaction_state
+                .hidden_set_mut()
+                .hide(payload.table_ids.iter().copied());
+            drop(compaction_state);
+
+            // Run the sub-compactions on the configured compaction pool (NOT raw
+            // threads), so a caller-shared pool bounds total threads across
+            // trees. The executor is fire-and-forget + `'static`, so each task
+            // owns an Arc'd snapshot of the context; results come back over an
+            // mpsc channel, indexed by range. Only range 0 carries the input
+            // tables to delete, so they are dropped exactly once at install. No
+            // pool configured (e.g. caller injected none) → run sequentially.
+            let num_ranges = ranges.len();
+            let only_first_owns_inputs =
+                |idx: usize| if idx == 0 { tables.clone() } else { Vec::new() };
+
+            let outputs: Vec<crate::Result<super::flavour::ProducedOutput>> =
+                if let Some(spawner) = opts.config.compaction_pool.clone() {
+                    let opts = Arc::new(opts.clone());
+                    let payload = Arc::new(payload.clone());
+                    let version = Arc::clone(&current_super_version);
+                    let rts = Arc::new(input_range_tombstones.clone());
+                    let blobs = Arc::new(blobs_folder);
+
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    for (idx, range) in ranges.iter().cloned().enumerate() {
+                        let tx = tx.clone();
+                        let opts = Arc::clone(&opts);
+                        let payload = Arc::clone(&payload);
+                        let version = Arc::clone(&version);
+                        let rts = Arc::clone(&rts);
+                        let blobs = Arc::clone(&blobs);
+                        let tables_for_deletion = only_first_owns_inputs(idx);
+                        spawner.spawn(Box::new(move || {
+                            let out = run_subcompaction(
+                                &opts,
+                                &payload,
+                                &version.version,
+                                tables_for_deletion,
+                                &rts,
+                                range,
+                                dst_lvl,
+                                is_last_level,
+                                &blobs,
+                            );
+                            // The receiver outlives every send (it drains N
+                            // items below), so this cannot fail.
+                            let _ = tx.send((idx, out));
+                        }));
+                    }
+                    drop(tx);
+
+                    let mut slots: Vec<Option<crate::Result<super::flavour::ProducedOutput>>> =
+                        (0..num_ranges).map(|_| None).collect();
+                    for (idx, out) in rx {
+                        if let Some(slot) = slots.get_mut(idx) {
+                            *slot = Some(out);
+                        }
+                    }
+                    slots
+                        .into_iter()
+                        .map(|slot| {
+                            slot.unwrap_or_else(|| {
+                                // A worker panicked before sending: treat as a
+                                // failed sub-compaction so install is skipped.
+                                Err(crate::Error::Io(std::io::Error::other(
+                                    "sub-compaction worker did not report a result",
+                                )))
+                            })
+                        })
+                        .collect()
+                } else {
+                    ranges
+                        .iter()
+                        .cloned()
+                        .enumerate()
+                        .map(|(idx, range)| {
+                            run_subcompaction(
+                                opts,
+                                payload,
+                                &current_super_version.version,
+                                only_first_owns_inputs(idx),
+                                &input_range_tombstones,
+                                range,
+                                dst_lvl,
+                                is_last_level,
+                                &blobs_folder,
+                            )
+                        })
+                        .collect()
+                };
+
+            // Collect outputs keeping every successful one, so a single failed
+            // range can roll back the SSTs/blob files its succeeded siblings
+            // already finalized on disk (collecting straight into Result would
+            // drop those Ok outputs and leak their files). On the first error:
+            // mark the committed outputs deleted, un-hide the inputs, propagate.
+            let mut committed = Vec::with_capacity(outputs.len());
+            let mut first_err = None;
+            for out in outputs {
+                match out {
+                    Ok(done) => committed.push(done),
+                    // Keep scanning after an error: ranges complete in any order,
+                    // so a later Ok must still be collected and rolled back (an
+                    // [Ok, Err, Ok] layout would otherwise orphan the trailing
+                    // Ok's finalized files). Keep only the first error to return.
+                    Err(e) => {
+                        first_err.get_or_insert(e);
+                    }
+                }
+            }
+            if let Some(err) = first_err {
+                log::error!("Sub-compaction failed: {err:?}");
+                for done in &committed {
+                    done.rollback_uninstalled();
+                }
+                {
+                    #[expect(clippy::expect_used, reason = "lock is expected to not be poisoned")]
+                    let mut state = opts.compaction_state.lock().expect("lock is poisoned");
+                    state
+                        .hidden_set_mut()
+                        .show(payload.table_ids.iter().copied());
+                }
+                return Err(err);
+            }
+            let outputs = committed;
+
+            // Re-acquire locks and install one atomic version edit for all outputs.
+            #[expect(clippy::expect_used, reason = "lock is expected to not be poisoned")]
+            let mut compaction_state = opts.compaction_state.lock().expect("lock is poisoned");
+            #[expect(clippy::expect_used, reason = "lock is expected to not be poisoned")]
+            let mut version_history_lock = opts.version_history.write().expect("lock is poisoned");
+
+            let tables_out =
+                super::flavour::install_merge(&mut version_history_lock, opts, payload, outputs)
+                    .inspect_err(|e| {
+                        // install_merge marks its own created tables/blob files
+                        // deleted if the version edit fails, so the caller only
+                        // restores the hidden inputs here (the outputs are gone).
+                        log::error!("Sub-compaction install failed: {e:?}");
+                        compaction_state
+                            .hidden_set_mut()
+                            .show(payload.table_ids.iter().copied());
+                    })?;
+
+            compaction_state
+                .hidden_set_mut()
+                .show(payload.table_ids.iter().copied());
+
+            version_history_lock
+                .maintenance(&opts.config.path, opts.mvcc_gc_watermark, &*opts.config.fs)
+                .inspect_err(|e| log::error!("Manifest maintenance failed: {e:?}"))?;
+
+            drop(version_history_lock);
+            drop(compaction_state);
+
+            log::trace!("Parallel compaction done in {num_ranges} sub-ranges");
+
+            return Ok(CompactionResult {
+                action: CompactionAction::Merged,
+                dest_level: Some(payload.dest_level),
+                tables_in,
+                tables_out,
+            });
+        }
+    }
 
     let mut blob_frag_map = FragmentationMap::default();
 
@@ -489,8 +991,9 @@ fn merge_tables(
         &filter_ctx,
     ));
 
+    // Serial (single-stream) compaction: block compression may use the pool.
     let table_writer =
-        super::flavour::prepare_table_writer(&current_super_version.version, opts, payload)?;
+        super::flavour::prepare_table_writer(&current_super_version.version, opts, payload, true)?;
 
     let start = Instant::now();
 
@@ -826,6 +1329,120 @@ mod tests {
     };
     use std::sync::Arc;
     use test_log::test;
+
+    /// Ranks keys by their first byte only, so byte-distinct keys that share a
+    /// first byte compare equal — exercises the comparator-aware dedup path that
+    /// raw `dedup()` would miss.
+    struct FirstByteComparator;
+    impl crate::comparator::UserComparator for FirstByteComparator {
+        fn name(&self) -> &'static str {
+            "test-first-byte"
+        }
+
+        fn compare(&self, a: &[u8], b: &[u8]) -> std::cmp::Ordering {
+            a.first().cmp(&b.first())
+        }
+    }
+
+    #[test]
+    fn boundary_candidates_dedups_comparator_equal_keys() {
+        let cmp: crate::comparator::SharedComparator = Arc::new(FirstByteComparator);
+        // "a1" and "a2" are byte-distinct but compare equal under the first-byte
+        // comparator; "b1" is in a different group. Raw dedup() would keep both
+        // a-keys (not byte-identical) and, after popping the global max, leave
+        // two boundaries in the "a" group → overlapping sub-compaction ranges.
+        let keys = vec![
+            crate::UserKey::from("a1"),
+            crate::UserKey::from("a2"),
+            crate::UserKey::from("b1"),
+        ];
+        let out = super::boundary_candidates(keys, &cmp);
+        assert_eq!(
+            out.len(),
+            1,
+            "comparator-equal keys must collapse to a single boundary candidate",
+        );
+        assert_eq!(
+            out.first().and_then(|k| k.first()),
+            Some(&b'a'),
+            "the surviving boundary should be from the deduped a-group",
+        );
+    }
+
+    /// A failing sub-compaction range must abort the whole compaction, roll
+    /// back the finalized files of the ranges that DID succeed, and restore the
+    /// hidden input tables — leaving the tree fully readable with nothing
+    /// partially installed. Drives the parallel rollback path via the test
+    /// failpoint (one range errors, its siblings succeed and are rolled back).
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn failed_subcompaction_rolls_back_and_restores_inputs() -> crate::Result<()> {
+        use std::sync::atomic::Ordering;
+
+        const N: u64 = 4_000;
+        let key = |i: u64| format!("key_{i:08}");
+        let val = |i: u64, generation: u64| format!("g{generation}-{i}-{}", "x".repeat(40));
+
+        let dir = tempfile::tempdir()?;
+        let config = Config::new(
+            &dir,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .data_block_size_policy(BlockSizePolicy::all(512))
+        .compaction_threads(4)
+        .subcompaction_min_bytes(0)
+        // KV separation so the surviving sub-compactions also produce blob
+        // files, exercising the blob-file arm of the rollback as well.
+        .with_kv_separation(Some(
+            KvSeparationOptions::default().separation_threshold(16),
+        ));
+        // Share the failpoint handle before the config is consumed by open().
+        let failpoint = config.fail_one_subcompaction.clone();
+        let tree = config.open()?;
+
+        // Populate the bottom level with several tables (the split boundaries).
+        for i in 0..N {
+            tree.insert(key(i), val(i, 0), i);
+        }
+        tree.flush_active_memtable(0)?;
+        tree.major_compact(4_096, 0)?;
+
+        // Overwrite the whole keyspace into L0; the next compaction merges it
+        // into the populated bottom and splits into parallel sub-compactions.
+        for i in 0..N {
+            tree.insert(key(i), val(i, 1), N + i);
+        }
+        tree.flush_active_memtable(0)?;
+        let tables_before = tree.table_count();
+
+        // Arm: exactly one sub-compaction range will error.
+        failpoint.store(true, Ordering::SeqCst);
+        let result = tree.major_compact(u64::MAX, 0);
+
+        assert!(
+            result.is_err(),
+            "a failing sub-compaction range must abort the compaction",
+        );
+        assert!(
+            !failpoint.load(Ordering::SeqCst),
+            "the failpoint should have fired and disarmed itself",
+        );
+        assert_eq!(
+            tree.table_count(),
+            tables_before,
+            "rollback must leave nothing partially installed",
+        );
+        for i in 0..N {
+            assert_eq!(
+                tree.get(key(i), crate::MAX_SEQNO)?.as_deref(),
+                Some(val(i, 1).as_bytes()),
+                "value for {} must survive the rolled-back compaction",
+                key(i),
+            );
+        }
+        Ok(())
+    }
 
     #[test]
     fn compaction_stream_run_not_found() -> crate::Result<()> {
