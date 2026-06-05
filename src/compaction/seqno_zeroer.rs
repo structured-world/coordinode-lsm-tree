@@ -50,7 +50,7 @@ pub(super) struct BottommostSeqnoZeroer<I> {
     tombstones: Vec<RangeTombstone>,
     idx: usize,
     active: ActiveTombstoneSet,
-    initialized: bool,
+    tombstones_sorted: bool,
 }
 
 impl<I> BottommostSeqnoZeroer<I> {
@@ -69,23 +69,21 @@ impl<I> BottommostSeqnoZeroer<I> {
             tombstones,
             idx: 0,
             active: ActiveTombstoneSet::new_with_comparator(comparator),
-            initialized: false,
-        }
-    }
-
-    fn ensure_sorted(&mut self) {
-        if !self.initialized {
-            let comparator = self.comparator.as_ref();
-            self.tombstones
-                .sort_by(|a, b| a.cmp_with_comparator(b, comparator));
-            self.initialized = true;
+            tombstones_sorted: false,
         }
     }
 
     /// Returns `true` if any range tombstone covers `key` (any seqno). Keys
     /// arrive in non-decreasing `user_key` order, so the active set is swept
-    /// monotonically.
+    /// monotonically. The lazy sort lives here (not in `next`) so streams whose
+    /// entries are all ineligible for zeroing never pay for it.
     fn covered(&mut self, key: &[u8]) -> bool {
+        if !self.tombstones_sorted {
+            let comparator = self.comparator.as_ref();
+            self.tombstones
+                .sort_by(|a, b| a.cmp_with_comparator(b, comparator));
+            self.tombstones_sorted = true;
+        }
         while let Some(rt) = self.tombstones.get(self.idx) {
             if self.comparator.compare(&rt.start, key) == std::cmp::Ordering::Greater {
                 break;
@@ -108,7 +106,6 @@ impl<I: Iterator<Item = crate::Result<InternalValue>>> Iterator for BottommostSe
         if !self.enabled {
             return self.inner.next();
         }
-        self.ensure_sorted();
         match self.inner.next()? {
             Ok(mut kv) => {
                 if kv.key.seqno > 0
