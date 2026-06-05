@@ -155,6 +155,21 @@ enum Command {
         keys_only: bool,
     },
 
+    /// Rebuild a missing or corrupt `MANIFEST` from the SST files on
+    /// disk. Here the leading path argument is the DB **directory**
+    /// (not a single SST). Scans `<db-dir>/tables`, reads each SST's
+    /// own metadata, and writes a fresh manifest placing every
+    /// recovered table at L0 (background compaction restructures it on
+    /// the next open). Recent unlogged version edits (in-flight
+    /// compactions, recent deletions) are lost; all readable data is
+    /// preserved.
+    ///
+    /// Uses the default comparator and no encryption: a tree created
+    /// with a custom comparator or with encryption must be repaired via
+    /// the library `Config::repair` API with the matching config.
+    /// KV-separated (blob) trees are not supported by repair.
+    Repair,
+
     /// Print sizing stats for the SST's BuRR filter: on-disk filter
     /// section bytes, BuRR layer count, item count from meta, and
     /// approximate bits-per-key. Only single-block (full) filters
@@ -184,7 +199,40 @@ fn main() -> ExitCode {
             keys_only,
         } => run_dump(&cli.file, from.as_deref(), to.as_deref(), max, keys_only),
         Command::FilterStats => run_filter_stats(&cli.file),
+        Command::Repair => run_repair(&cli.file),
     }
+}
+
+fn run_repair(db_dir: &std::path::Path) -> ExitCode {
+    use lsm_tree::{Config, SequenceNumberCounter};
+
+    let config = Config::new(
+        db_dir,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    );
+
+    let report = match config.repair() {
+        Ok(report) => report,
+        Err(err) => {
+            eprintln!("repair failed: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    println!("db dir:        {}", db_dir.display());
+    println!("method:        {}", report.method);
+    println!("recovered:     {}", report.recovered);
+    println!("unreadable:    {}", report.unreadable);
+    for (path, reason) in &report.unreadable_files {
+        println!("  skipped {} — {reason}", path.display());
+    }
+    for warning in &report.warnings {
+        println!("warning:       {warning}");
+    }
+    println!("status:        manifest rebuilt");
+
+    ExitCode::SUCCESS
 }
 
 fn run_verify(path: &std::path::Path, verbose: bool) -> ExitCode {
