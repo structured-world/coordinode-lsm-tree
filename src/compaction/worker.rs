@@ -1179,24 +1179,22 @@ fn merge_tables(
         // so that if the compactor rotates tables during the merge loop,
         // earlier tables already carry the RT metadata.
         //
-        // At the last level a fully-applied tombstone (at/below the watermark,
-        // its covered KVs physically dropped this compaction) is GC'd — unless a
-        // table outside this compaction overlaps it, which would let dropping it
-        // resurrect a covered key.
-        let output_rts = range_tombstones_after_gc(
-            &input_range_tombstones,
-            &current_super_version.version,
-            &payload.table_ids,
-            opts.mvcc_gc_watermark,
-            is_last_level,
-            &opts.config.comparator,
-        );
-        if !output_rts.is_empty() {
+        // NOTE: this path does NOT GC fully-applied tombstones (unlike the
+        // parallel sub-compaction path). The serial stop-signal handling below
+        // commits whatever was written so far (`return Ok(())`), so a stop
+        // landing after this write but before the covered tail is processed
+        // could drop a below-watermark tombstone while some covered keys were
+        // never visited — resurrecting them. Tombstone GC therefore only runs in
+        // the sub-compaction path, which is atomic (it returns an error and
+        // rolls back on stop). Covered keys are still physically dropped here by
+        // the merge stream; keeping the tombstone is the conservative, correct
+        // choice when the compaction may commit partial output.
+        if !input_range_tombstones.is_empty() {
             log::debug!(
                 "Propagating {} range tombstones to compaction output",
-                output_rts.len(),
+                input_range_tombstones.len(),
             );
-            compactor.write_range_tombstones(&output_rts);
+            compactor.write_range_tombstones(&input_range_tombstones);
         }
 
         let merge_iter = super::seqno_zeroer::BottommostSeqnoZeroer::new(
@@ -1573,6 +1571,10 @@ mod tests {
     /// tombstone itself is GC'd. If the keys were only suppressed (not dropped)
     /// while the tombstone was GC'd, they would resurrect — so a `None` read
     /// after GC proves both the physical drop (#1) and the tombstone GC (#2).
+    ///
+    /// Routed through the atomic sub-compaction path (which is where GC runs):
+    /// `compaction_threads > 1` + `subcompaction_min_bytes = 0` + a populated
+    /// bottom level (split boundaries) make the final compaction split.
     #[test]
     fn last_level_applies_and_gcs_below_watermark_range_tombstone() -> crate::Result<()> {
         let dir = tempfile::tempdir()?;
@@ -1581,25 +1583,39 @@ mod tests {
             SequenceNumberCounter::default(),
             SequenceNumberCounter::default(),
         )
+        .data_block_size_policy(BlockSizePolicy::all(512))
+        .compaction_threads(4)
+        .subcompaction_min_bytes(0)
         .open()?;
 
         let key = |i: u64| format!("k{i:04}");
-        for i in 0..50u64 {
-            tree.insert(key(i), "v", i);
+        let val = |i: u64| format!("v{i}-{}", "x".repeat(40));
+
+        // Step 1: populate the bottom level with several tables (split
+        // boundaries the final compaction can partition on).
+        for i in 0..200u64 {
+            tree.insert(key(i), val(i), i);
+        }
+        tree.flush_active_memtable(0)?;
+        tree.major_compact(4_096, 0)?;
+
+        // Delete [k0000, k0050) at seqno 1000 and overwrite the rest into L0, so
+        // the next compaction merges L0 into the populated bottom and splits.
+        tree.remove_range(
+            crate::UserKey::from("k0000"),
+            crate::UserKey::from("k0050"),
+            1000,
+        );
+        for i in 50..200u64 {
+            tree.insert(key(i), val(i), 1001 + i);
         }
         tree.flush_active_memtable(0)?;
 
-        // Delete [k0000, k0025) with a tombstone at seqno 100, then compact to
-        // the bottom with a watermark (200) above it — fully applied.
-        tree.remove_range(
-            crate::UserKey::from("k0000"),
-            crate::UserKey::from("k0025"),
-            100,
-        );
-        tree.flush_active_memtable(0)?;
-        tree.major_compact(u64::MAX, 200)?;
+        // Compact to the bottom with a watermark (5000) above the tombstone:
+        // covered keys are physically dropped and the tombstone is GC'd.
+        tree.major_compact(u64::MAX, 5000)?;
 
-        for i in 0..25u64 {
+        for i in 0..50u64 {
             assert_eq!(
                 tree.get(key(i), crate::MAX_SEQNO)?,
                 None,
@@ -1607,7 +1623,7 @@ mod tests {
                 key(i),
             );
         }
-        for i in 25..50u64 {
+        for i in 50..200u64 {
             assert!(
                 tree.get(key(i), crate::MAX_SEQNO)?.is_some(),
                 "uncovered key {} must survive",
