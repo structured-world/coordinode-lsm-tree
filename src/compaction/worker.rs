@@ -249,7 +249,7 @@ fn create_compaction_stream<'a>(
 #[cfg(feature = "std")]
 fn create_bounded_compaction_stream<'a>(
     version: &'a Version,
-    to_compact: &[TableId],
+    to_compact: &HashSet<TableId>,
     bounds: (std::ops::Bound<UserKey>, std::ops::Bound<UserKey>),
     eviction_seqno: SeqNo,
     merge_operator: Option<Arc<dyn crate::merge_operator::MergeOperator>>,
@@ -414,11 +414,9 @@ fn run_subcompaction(
 
     let mut blob_frag_map = FragmentationMap::default();
 
-    let to_compact = payload.table_ids.iter().copied().collect::<Vec<_>>();
-
     let Some(mut merge_iter) = create_bounded_compaction_stream(
         version,
-        &to_compact,
+        &payload.table_ids,
         bounds,
         opts.mvcc_gc_watermark,
         opts.config.merge_operator.clone(),
@@ -916,6 +914,9 @@ fn merge_tables(
             let tables_out =
                 super::flavour::install_merge(&mut version_history_lock, opts, payload, outputs)
                     .inspect_err(|e| {
+                        // install_merge marks its own created tables/blob files
+                        // deleted if the version edit fails, so the caller only
+                        // restores the hidden inputs here (the outputs are gone).
                         log::error!("Sub-compaction install failed: {e:?}");
                         compaction_state
                             .hidden_set_mut()
