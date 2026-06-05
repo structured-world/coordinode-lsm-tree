@@ -2,6 +2,9 @@
 // Copyright (c) 2024-present, fjall-rs
 // Copyright (c) 2026-present, Structured World Foundation
 
+use crate::active_tombstone_set::ActiveTombstoneSet;
+use crate::comparator::SharedComparator;
+use crate::range_tombstone::RangeTombstone;
 use crate::{InternalValue, SeqNo, UserKey, UserValue, ValueType, merge_operator::MergeOperator};
 use std::{collections::VecDeque, iter::Peekable, sync::Arc};
 
@@ -69,6 +72,16 @@ pub struct CompactionStream<'a, I: Iterator<Item = Item>, F: StreamFilter = NoFi
     /// Entries that could not be merged (e.g., Indirection base) and need
     /// to be re-emitted unchanged on subsequent `next()` calls.
     pending: VecDeque<InternalValue>,
+
+    /// Range tombstones with `seqno <= gc_seqno_threshold` whose covered entries
+    /// can be physically dropped during this (bottommost) compaction: every
+    /// live snapshot (>= the watermark) sees them in effect, so the covered KVs
+    /// are deleted for all readers. Empty when RT application is not enabled.
+    rt_apply: Vec<RangeTombstone>,
+    rt_comparator: Option<SharedComparator>,
+    rt_active: Option<ActiveTombstoneSet>,
+    rt_idx: usize,
+    rt_sorted: bool,
 }
 
 impl<I: Iterator<Item = Item>> CompactionStream<'_, I, NoFilter> {
@@ -86,6 +99,11 @@ impl<I: Iterator<Item = Item>> CompactionStream<'_, I, NoFilter> {
             zero_seqnos: false,
             merge_operator: None,
             pending: VecDeque::new(),
+            rt_apply: Vec::new(),
+            rt_comparator: None,
+            rt_active: None,
+            rt_idx: 0,
+            rt_sorted: false,
         }
     }
 }
@@ -102,6 +120,11 @@ impl<'a, I: Iterator<Item = Item>, F: StreamFilter + 'a> CompactionStream<'a, I,
             zero_seqnos: self.zero_seqnos,
             merge_operator: self.merge_operator,
             pending: self.pending,
+            rt_apply: self.rt_apply,
+            rt_comparator: self.rt_comparator,
+            rt_active: self.rt_active,
+            rt_idx: self.rt_idx,
+            rt_sorted: self.rt_sorted,
         }
     }
 
@@ -129,6 +152,61 @@ impl<'a, I: Iterator<Item = Item>, F: StreamFilter + 'a> CompactionStream<'a, I,
     pub fn zero_seqnos(mut self, b: bool) -> Self {
         self.zero_seqnos = b;
         self
+    }
+
+    /// Enables compaction-time range-tombstone application: surviving entries
+    /// covered by a tombstone whose seqno is `<= gc_seqno_threshold` (the
+    /// watermark) and higher than the entry's seqno are physically dropped (and
+    /// reported to the drop callback for blob-GC accounting) instead of being
+    /// carried to the output and suppressed at read time.
+    ///
+    /// Only watermark-or-below tombstones are applied: a newer tombstone might
+    /// not be in effect for a snapshot between the entry's seqno and the
+    /// tombstone's, so those entries are preserved (PITR/MVCC safety). Pass
+    /// tombstones gathered from the whole version; this filters them to the
+    /// applicable set.
+    #[must_use]
+    pub fn with_range_tombstone_application(
+        mut self,
+        tombstones: Vec<RangeTombstone>,
+        comparator: SharedComparator,
+    ) -> Self {
+        self.rt_apply = tombstones
+            .into_iter()
+            .filter(|rt| rt.seqno <= self.gc_seqno_threshold)
+            .collect();
+        self.rt_active = Some(ActiveTombstoneSet::new_with_comparator(comparator.clone()));
+        self.rt_comparator = Some(comparator);
+        self
+    }
+
+    /// Returns `true` if `user_key`/`seqno` is covered by an applicable
+    /// (watermark-or-below) range tombstone with a higher seqno — meaning the
+    /// entry is deleted for every live snapshot and can be physically dropped.
+    /// Entries arrive in non-decreasing `user_key` order, so the active set is
+    /// swept monotonically.
+    fn covered_by_applied_tombstone(&mut self, user_key: &[u8], seqno: SeqNo) -> bool {
+        let (Some(comparator), Some(active)) =
+            (self.rt_comparator.as_ref(), self.rt_active.as_mut())
+        else {
+            return false;
+        };
+        if !self.rt_sorted {
+            self.rt_apply
+                .sort_by(|a, b| a.cmp_with_comparator(b, comparator.as_ref()));
+            self.rt_sorted = true;
+        }
+        while let Some(rt) = self.rt_apply.get(self.rt_idx) {
+            if comparator.compare(&rt.start, user_key) == std::cmp::Ordering::Greater {
+                break;
+            }
+            // cutoff = MAX: every applicable tombstone is active; `is_suppressed`
+            // then drops the entry iff some active tombstone outranks its seqno.
+            active.activate(rt, SeqNo::MAX);
+            self.rt_idx += 1;
+        }
+        active.expire_until(user_key);
+        active.is_suppressed(seqno)
     }
 
     /// Collects merge operands and resolves them via the merge operator.
@@ -347,6 +425,17 @@ impl<'a, I: Iterator<Item = Item>, F: StreamFilter + 'a> Iterator for Compaction
                         if let Some(merge_op) = self.merge_operator.clone() {
                             let mut merged =
                                 fail_iter!(self.resolve_merge_operands(head, merge_op.as_ref()));
+                            // Drop the merged result if an applicable tombstone
+                            // outranks it (same rule as the main emit path).
+                            if self.covered_by_applied_tombstone(
+                                merged.key.user_key.as_ref(),
+                                merged.key.seqno,
+                            ) {
+                                if let Some(watcher) = &mut self.dropped_callback {
+                                    watcher.on_dropped(&merged);
+                                }
+                                continue;
+                            }
                             // Skip zeroing for partial merges (MergeOperand) to avoid duplicate keys
                             if self.zero_seqnos
                                 && merged.key.seqno < self.gc_seqno_threshold
@@ -387,6 +476,17 @@ impl<'a, I: Iterator<Item = Item>, F: StreamFilter + 'a> Iterator for Compaction
                     let merged = fail_iter!(self.resolve_merge_operands(head, merge_op.as_ref()));
                     head = merged;
                 }
+            }
+
+            // Compaction-time range-tombstone application: physically drop the
+            // surviving entry when an applicable (watermark-or-below) tombstone
+            // outranks it, accounting it to the drop callback (blob GC) instead
+            // of carrying it to the output to be suppressed at every read.
+            if self.covered_by_applied_tombstone(head.key.user_key.as_ref(), head.key.seqno) {
+                if let Some(watcher) = &mut self.dropped_callback {
+                    watcher.on_dropped(&head);
+                }
+                continue;
             }
 
             // Zero seqnos below GC, but skip MergeOperands (duplicate key risk)
