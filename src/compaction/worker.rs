@@ -281,6 +281,20 @@ fn create_bounded_compaction_stream<'a>(
 /// [`subcompaction_boundaries`] so the comparator-equality dedup is unit
 /// testable without constructing a full [`Version`].
 #[cfg(feature = "std")]
+/// Gathers every range tombstone in the version (all levels), to gate
+/// bottommost seqno-zeroing: a key covered by any tombstone keeps its real
+/// seqno. Includes tombstones from tables NOT in the current compaction, so
+/// "beyond output level" coverage is respected.
+#[cfg(feature = "std")]
+fn collect_version_tombstones(version: &Version) -> Vec<crate::range_tombstone::RangeTombstone> {
+    version
+        .iter_levels()
+        .flat_map(|level| level.iter())
+        .flat_map(|run| run.iter())
+        .flat_map(|t| t.range_tombstones().iter().cloned())
+        .collect()
+}
+
 fn boundary_candidates(
     mut keys: Vec<UserKey>,
     comparator: &crate::comparator::SharedComparator,
@@ -458,6 +472,22 @@ fn run_subcompaction(
         &mut filter_blob_writer,
         &filter_ctx,
     ));
+
+    // Bottommost seqno-zeroing: at the last level, entries below the GC
+    // watermark and not covered by any range tombstone get seqno 0 (packs to
+    // one byte). Tombstones are gathered from the whole version so coverage in
+    // levels outside this compaction still blocks zeroing.
+    let merge_iter = super::seqno_zeroer::BottommostSeqnoZeroer::new(
+        merge_iter,
+        is_last_level,
+        if is_last_level {
+            collect_version_tombstones(version)
+        } else {
+            Vec::new()
+        },
+        opts.mvcc_gc_watermark,
+        opts.config.comparator.clone(),
+    );
 
     // block_parallel = false: this sub-compaction already runs on a pool thread,
     // so its block compression must stay serial (nested-pool deadlock otherwise).
@@ -1067,6 +1097,14 @@ fn merge_tables(
     // IMPORTANT: Unlock exclusive compaction lock as we are now doing the actual (CPU-intensive) compaction
     drop(compaction_state);
 
+    // Whole-version tombstones for bottommost seqno-zeroing; gathered before the
+    // hidden-input phase and moved into the merge loop below.
+    let zeroing_tombstones = if is_last_level {
+        collect_version_tombstones(&current_super_version.version)
+    } else {
+        Vec::new()
+    };
+
     hidden_guard(payload, opts, || {
         // Propagate range tombstones to output tables BEFORE writing KV items,
         // so that if the compactor rotates tables during the merge loop,
@@ -1082,6 +1120,14 @@ fn merge_tables(
             );
             compactor.write_range_tombstones(&input_range_tombstones);
         }
+
+        let merge_iter = super::seqno_zeroer::BottommostSeqnoZeroer::new(
+            merge_iter,
+            is_last_level,
+            zeroing_tombstones,
+            opts.mvcc_gc_watermark,
+            opts.config.comparator.clone(),
+        );
 
         for (idx, item) in merge_iter.enumerate() {
             let item = item?;
