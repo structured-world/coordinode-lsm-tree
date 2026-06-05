@@ -994,8 +994,11 @@ fn run_subcompaction_bench(
             opts.set_disable_auto_compactions(true);
             opts.set_compression_type(rocksdb::DBCompressionType::Zstd);
             opts.set_compression_options(-14, level, 0, 0);
-            // Give RocksDB the matching parallelism knob + a small target file
-            // size so the bottom level also splits into several files.
+            // Give RocksDB the matching parallelism knobs + a small target file
+            // size so the bottom level also splits into several files. Our
+            // compaction_threads drives BOTH range-split and the block-
+            // compression pool, so match both on the RocksDB side.
+            opts.set_compression_options_parallel_threads(SUBCOMPACTION_THREADS as i32);
             opts.set_max_subcompactions(SUBCOMPACTION_THREADS as u32);
             opts.set_target_file_size_base(SUBCOMPACTION_BOTTOM_TARGET);
 
