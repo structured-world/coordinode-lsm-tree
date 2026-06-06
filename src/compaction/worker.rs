@@ -280,7 +280,67 @@ fn create_bounded_compaction_stream<'a>(
 /// range), returning the candidate interior boundary keys. Split out of
 /// [`subcompaction_boundaries`] so the comparator-equality dedup is unit
 /// testable without constructing a full [`Version`].
+/// Gathers every range tombstone in the version (all levels), to gate
+/// bottommost seqno-zeroing: a key covered by any tombstone keeps its real
+/// seqno. Includes tombstones from tables NOT in the current compaction, so
+/// "beyond output level" coverage is respected.
 #[cfg(feature = "std")]
+fn collect_version_tombstones(version: &Version) -> Vec<crate::range_tombstone::RangeTombstone> {
+    version
+        .iter_levels()
+        .flat_map(|level| level.iter())
+        .flat_map(|run| run.iter())
+        .flat_map(|t| t.range_tombstones().iter().cloned())
+        .collect()
+}
+
+/// Garbage-collects range tombstones for a bottommost compaction's output.
+///
+/// A tombstone at or below the watermark has been fully applied (every live
+/// snapshot sees it, and this compaction physically dropped the keys it covers),
+/// so it can be dropped — UNLESS a table outside this compaction overlaps its
+/// range and might still hold a covered key, in which case dropping it would
+/// resurrect that key. Tombstones above the watermark are always kept (read-time
+/// application still needs them). Non-bottommost compactions keep everything.
+#[cfg(feature = "std")]
+fn range_tombstones_after_gc(
+    input_rts: &[crate::range_tombstone::RangeTombstone],
+    version: &Version,
+    input_ids: &HashSet<TableId>,
+    watermark: SeqNo,
+    is_last_level: bool,
+    comparator: &crate::comparator::SharedComparator,
+) -> Vec<crate::range_tombstone::RangeTombstone> {
+    if !is_last_level {
+        return input_rts.to_vec();
+    }
+    let cmp = comparator.as_ref();
+    input_rts
+        .iter()
+        .filter(|rt| {
+            // Strict visibility: a tombstone at or above the watermark is still
+            // needed by the oldest live snapshot (which reads at the watermark
+            // and does not see `RT@watermark`), so keep it. Only strictly-below
+            // tombstones are candidates for GC.
+            if !rt.visible_at(watermark) {
+                return true;
+            }
+            version
+                .iter_levels()
+                .flat_map(|level| level.iter())
+                .flat_map(|run| run.iter())
+                .filter(|t| !input_ids.contains(&t.id()))
+                .any(|t| {
+                    let kr = &t.metadata.key_range;
+                    // [rt.start, rt.end) overlaps [kr.min, kr.max].
+                    cmp.compare(&rt.start, kr.max()) != std::cmp::Ordering::Greater
+                        && cmp.compare(kr.min(), &rt.end) == std::cmp::Ordering::Less
+                })
+        })
+        .cloned()
+        .collect()
+}
+
 fn boundary_candidates(
     mut keys: Vec<UserKey>,
     comparator: &crate::comparator::SharedComparator,
@@ -432,9 +492,25 @@ fn run_subcompaction(
         )));
     };
 
+    // Whole-version range tombstones drive both compaction-time RT application
+    // (drop covered KVs in the merge, with blob-GC accounting) and the
+    // bottommost seqno-zeroing gate below. Gathered from every level so coverage
+    // outside this compaction is respected.
+    let version_tombstones = if is_last_level {
+        collect_version_tombstones(version)
+    } else {
+        Vec::new()
+    };
+
     merge_iter = merge_iter
         .evict_tombstones(is_last_level)
         .zero_seqnos(false);
+    if is_last_level {
+        merge_iter = merge_iter.with_range_tombstone_application(
+            version_tombstones.clone(),
+            opts.config.comparator.clone(),
+        );
+    }
 
     let filter_ctx = Context { is_last_level };
     let mut compaction_filter = opts
@@ -459,17 +535,37 @@ fn run_subcompaction(
         &filter_ctx,
     ));
 
+    // Bottommost seqno-zeroing: at the last level, entries below the GC
+    // watermark and not covered by any range tombstone get seqno 0 (packs to
+    // one byte). Tombstones are gathered from the whole version so coverage in
+    // levels outside this compaction still blocks zeroing.
+    let merge_iter = super::seqno_zeroer::BottommostSeqnoZeroer::new(
+        merge_iter,
+        is_last_level,
+        version_tombstones,
+        opts.mvcc_gc_watermark,
+        opts.config.comparator.clone(),
+    );
+
     // block_parallel = false: this sub-compaction already runs on a pool thread,
     // so its block compression must stay serial (nested-pool deadlock otherwise).
     let table_writer = super::flavour::prepare_table_writer(version, opts, payload, false)?;
     let mut compactor: Box<dyn CompactionFlavour> =
         Box::new(StandardCompaction::new(table_writer, tables_for_deletion));
 
-    // Propagate range tombstones to this sub-range's output; the writer clips
-    // them to each output table's key range (a boundary-spanning RT is written
-    // clipped on both sides, which is correct).
-    if !input_range_tombstones.is_empty() {
-        compactor.write_range_tombstones(input_range_tombstones);
+    // Propagate range tombstones to this sub-range's output (GC'd at the last
+    // level when fully applied); the writer clips them to each output table's
+    // key range (a boundary-spanning RT is written clipped on both sides).
+    let output_rts = range_tombstones_after_gc(
+        input_range_tombstones,
+        version,
+        &payload.table_ids,
+        opts.mvcc_gc_watermark,
+        is_last_level,
+        &opts.config.comparator,
+    );
+    if !output_rts.is_empty() {
+        compactor.write_range_tombstones(&output_rts);
     }
 
     for (idx, item) in merge_iter.enumerate() {
@@ -968,6 +1064,26 @@ fn merge_tables(
         .evict_tombstones(is_last_level)
         .zero_seqnos(false);
 
+    // Whole-version tombstones for compaction-time RT application (drop covered
+    // KVs in the merge) and the bottommost seqno-zeroing gate; gathered from
+    // every level so coverage outside this compaction is respected. Both the
+    // whole-version scan and the seqno-zeroer wrapper are std-only, so the
+    // bottommost RT-application + zeroing is gated here; without std the merge
+    // stream is iterated directly (see the zeroer wrap below).
+    #[cfg(feature = "std")]
+    let zeroing_tombstones = if is_last_level {
+        collect_version_tombstones(&current_super_version.version)
+    } else {
+        Vec::new()
+    };
+    #[cfg(feature = "std")]
+    if is_last_level {
+        merge_iter = merge_iter.with_range_tombstone_application(
+            zeroing_tombstones.clone(),
+            opts.config.comparator.clone(),
+        );
+    }
+
     let blobs_folder = opts.config.path.join(BLOBS_FOLDER);
 
     let filter_ctx = Context { is_last_level };
@@ -1072,9 +1188,16 @@ fn merge_tables(
         // so that if the compactor rotates tables during the merge loop,
         // earlier tables already carry the RT metadata.
         //
-        // Keep RTs even at the last level until compaction itself becomes
-        // RT-aware and can physically drop covered KVs. Dropping the RT first
-        // would only remove the logical delete marker and can resurrect data.
+        // NOTE: this path does NOT GC fully-applied tombstones (unlike the
+        // parallel sub-compaction path). The serial stop-signal handling below
+        // commits whatever was written so far (`return Ok(())`), so a stop
+        // landing after this write but before the covered tail is processed
+        // could drop a below-watermark tombstone while some covered keys were
+        // never visited — resurrecting them. Tombstone GC therefore only runs in
+        // the sub-compaction path, which is atomic (it returns an error and
+        // rolls back on stop). Covered keys are still physically dropped here by
+        // the merge stream; keeping the tombstone is the conservative, correct
+        // choice when the compaction may commit partial output.
         if !input_range_tombstones.is_empty() {
             log::debug!(
                 "Propagating {} range tombstones to compaction output",
@@ -1082,6 +1205,18 @@ fn merge_tables(
             );
             compactor.write_range_tombstones(&input_range_tombstones);
         }
+
+        // Bottommost seqno-zeroing is std-only (the zeroer and the whole-version
+        // tombstone scan live behind the std feature); without std, iterate the
+        // filtered merge stream directly.
+        #[cfg(feature = "std")]
+        let merge_iter = super::seqno_zeroer::BottommostSeqnoZeroer::new(
+            merge_iter,
+            is_last_level,
+            zeroing_tombstones,
+            opts.mvcc_gc_watermark,
+            opts.config.comparator.clone(),
+        );
 
         for (idx, item) in merge_iter.enumerate() {
             let item = item?;
@@ -1441,6 +1576,184 @@ mod tests {
                 key(i),
             );
         }
+        Ok(())
+    }
+
+    /// A range tombstone fully below the GC watermark must be applied during a
+    /// last-level compaction: its covered keys are physically dropped AND the
+    /// tombstone itself is GC'd. If the keys were only suppressed (not dropped)
+    /// while the tombstone was GC'd, they would resurrect — so a `None` read
+    /// after GC proves both the physical drop (#1) and the tombstone GC (#2).
+    ///
+    /// Routed through the atomic sub-compaction path (which is where GC runs):
+    /// `compaction_threads > 1` + `subcompaction_min_bytes = 0` + a populated
+    /// bottom level (split boundaries) make the final compaction split.
+    #[test]
+    fn last_level_applies_and_gcs_below_watermark_range_tombstone() -> crate::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let tree = Config::new(
+            &dir,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .data_block_size_policy(BlockSizePolicy::all(512))
+        .compaction_threads(4)
+        .subcompaction_min_bytes(0)
+        .open()?;
+
+        let key = |i: u64| format!("k{i:04}");
+        let val = |i: u64| format!("v{i}-{}", "x".repeat(40));
+
+        // Step 1: populate the bottom level with several tables (split
+        // boundaries the final compaction can partition on).
+        for i in 0..200u64 {
+            tree.insert(key(i), val(i), i);
+        }
+        tree.flush_active_memtable(0)?;
+        tree.major_compact(4_096, 0)?;
+
+        // Delete [k0000, k0050) at seqno 1000 and overwrite the rest into L0, so
+        // the next compaction merges L0 into the populated bottom and splits.
+        tree.remove_range(
+            crate::UserKey::from("k0000"),
+            crate::UserKey::from("k0050"),
+            1000,
+        );
+        for i in 50..200u64 {
+            tree.insert(key(i), val(i), 1001 + i);
+        }
+        tree.flush_active_memtable(0)?;
+
+        // Compact to the bottom with a watermark (5000) above the tombstone:
+        // covered keys are physically dropped and the tombstone is GC'd.
+        tree.major_compact(u64::MAX, 5000)?;
+
+        for i in 0..50u64 {
+            assert_eq!(
+                tree.get(key(i), crate::MAX_SEQNO)?,
+                None,
+                "covered key {} must be physically gone after GC",
+                key(i),
+            );
+        }
+        for i in 50..200u64 {
+            assert!(
+                tree.get(key(i), crate::MAX_SEQNO)?.is_some(),
+                "uncovered key {} must survive",
+                key(i),
+            );
+        }
+        let remaining = super::collect_version_tombstones(&tree.current_version());
+        assert!(
+            remaining.is_empty(),
+            "a fully-applied below-watermark tombstone must be GC'd, found {remaining:?}",
+        );
+        Ok(())
+    }
+
+    /// An above-watermark tombstone must be retained, not GC'd: read-time
+    /// application still needs it for snapshots that predate the tombstone.
+    #[test]
+    fn above_watermark_range_tombstone_is_retained() -> crate::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let tree = Config::new(
+            &dir,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .open()?;
+
+        let key = |i: u64| format!("k{i:04}");
+        for i in 0..50u64 {
+            tree.insert(key(i), "v", i);
+        }
+        tree.flush_active_memtable(0)?;
+
+        // Tombstone at seqno 100; compact with a watermark (50) BELOW it, so the
+        // tombstone is neither applied nor GC'd.
+        tree.remove_range(
+            crate::UserKey::from("k0000"),
+            crate::UserKey::from("k0025"),
+            100,
+        );
+        tree.flush_active_memtable(0)?;
+        tree.major_compact(u64::MAX, 50)?;
+
+        let remaining = super::collect_version_tombstones(&tree.current_version());
+        assert!(
+            !remaining.is_empty(),
+            "an above-watermark tombstone must be retained, not GC'd",
+        );
+        Ok(())
+    }
+
+    /// A range tombstone whose seqno equals the GC watermark sits exactly on the
+    /// visibility boundary. RT visibility is strict (`visible_at` is `seqno <
+    /// read_seqno`), so the oldest live snapshot reading at `read_seqno ==
+    /// watermark` does NOT see `RT@watermark`. Compaction must therefore neither
+    /// apply it (physically dropping covered keys) nor GC it — doing either one
+    /// compaction too early makes a key that is still visible at the watermark
+    /// disappear. Reading the covered key at `read_seqno == watermark` (where the
+    /// tombstone is invisible but the key is committed) must still return it.
+    #[test]
+    fn range_tombstone_at_exact_watermark_is_not_applied_or_gced() -> crate::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let tree = Config::new(
+            &dir,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .data_block_size_policy(BlockSizePolicy::all(512))
+        .compaction_threads(4)
+        .subcompaction_min_bytes(0)
+        .open()?;
+
+        let key = |i: u64| format!("k{i:04}");
+        let val = |i: u64| format!("v{i}-{}", "x".repeat(40));
+
+        // Populate the bottom level (split boundaries for the final compaction).
+        // Covered keys live here at low seqnos (< the watermark).
+        for i in 0..200u64 {
+            tree.insert(key(i), val(i), i);
+        }
+        tree.flush_active_memtable(0)?;
+        tree.major_compact(4_096, 0)?;
+
+        // Delete [k0000, k0050) at seqno 1000 and overwrite the rest into L0.
+        tree.remove_range(
+            crate::UserKey::from("k0000"),
+            crate::UserKey::from("k0050"),
+            1000,
+        );
+        for i in 50..200u64 {
+            tree.insert(key(i), val(i), 1001 + i);
+        }
+        tree.flush_active_memtable(0)?;
+
+        // Compact to the bottom with the watermark set EXACTLY to the tombstone's
+        // seqno. At this boundary the tombstone is invisible to a read at the
+        // watermark, so its covered keys must be preserved, not dropped.
+        tree.major_compact(u64::MAX, 1000)?;
+
+        // Read at read_seqno == watermark: RT@1000 is invisible here
+        // (`1000 < 1000` is false), and each covered key was committed at
+        // seqno < 1000, so it must still be visible.
+        for i in 0..50u64 {
+            assert_eq!(
+                tree.get(key(i), 1000)?.as_deref(),
+                Some(val(i).as_bytes()),
+                "covered key {} must survive: RT@watermark is invisible at read==watermark",
+                key(i),
+            );
+        }
+
+        // The boundary tombstone must also be retained (not GC'd one compaction
+        // early), since snapshots at the watermark still rely on it.
+        let remaining = super::collect_version_tombstones(&tree.current_version());
+        assert!(
+            !remaining.is_empty(),
+            "a tombstone at the exact watermark must be retained, not GC'd",
+        );
         Ok(())
     }
 
