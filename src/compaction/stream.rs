@@ -73,10 +73,13 @@ pub struct CompactionStream<'a, I: Iterator<Item = Item>, F: StreamFilter = NoFi
     /// to be re-emitted unchanged on subsequent `next()` calls.
     pending: VecDeque<InternalValue>,
 
-    /// Range tombstones with `seqno <= gc_seqno_threshold` whose covered entries
-    /// can be physically dropped during this (bottommost) compaction: every
-    /// live snapshot (>= the watermark) sees them in effect, so the covered KVs
-    /// are deleted for all readers. Empty when RT application is not enabled.
+    /// Range tombstones strictly below the watermark (`seqno <
+    /// gc_seqno_threshold`) whose covered entries can be physically dropped
+    /// during this (bottommost) compaction: every live snapshot (which reads at
+    /// or above the watermark) sees them in effect, so the covered KVs are
+    /// deleted for all readers. A tombstone exactly at the watermark is excluded
+    /// — it is invisible to a read at the watermark. Empty when RT application is
+    /// not enabled.
     rt_apply: Vec<RangeTombstone>,
     rt_comparator: Option<SharedComparator>,
     rt_active: Option<ActiveTombstoneSet>,
@@ -155,16 +158,18 @@ impl<'a, I: Iterator<Item = Item>, F: StreamFilter + 'a> CompactionStream<'a, I,
     }
 
     /// Enables compaction-time range-tombstone application: surviving entries
-    /// covered by a tombstone whose seqno is `<= gc_seqno_threshold` (the
-    /// watermark) and higher than the entry's seqno are physically dropped (and
-    /// reported to the drop callback for blob-GC accounting) instead of being
-    /// carried to the output and suppressed at read time.
+    /// covered by a tombstone whose seqno is strictly below the watermark
+    /// (`seqno < gc_seqno_threshold`) and higher than the entry's seqno are
+    /// physically dropped (and reported to the drop callback for blob-GC
+    /// accounting) instead of being carried to the output and suppressed at read
+    /// time.
     ///
-    /// Only watermark-or-below tombstones are applied: a newer tombstone might
-    /// not be in effect for a snapshot between the entry's seqno and the
-    /// tombstone's, so those entries are preserved (PITR/MVCC safety). Pass
-    /// tombstones gathered from the whole version; this filters them to the
-    /// applicable set.
+    /// Only strictly-below-watermark tombstones are applied: a tombstone at or
+    /// above the watermark might not be in effect for a snapshot between the
+    /// entry's seqno and the tombstone's (a read at the watermark does not see a
+    /// tombstone at the watermark), so those entries are preserved (PITR/MVCC
+    /// safety). Pass tombstones gathered from the whole version; this filters
+    /// them to the applicable set.
     #[must_use]
     pub fn with_range_tombstone_application(
         mut self,
@@ -173,7 +178,11 @@ impl<'a, I: Iterator<Item = Item>, F: StreamFilter + 'a> CompactionStream<'a, I,
     ) -> Self {
         self.rt_apply = tombstones
             .into_iter()
-            .filter(|rt| rt.seqno <= self.gc_seqno_threshold)
+            // Strict visibility (`seqno < threshold`), matching the read path and
+            // the point-key GC: a tombstone exactly at the watermark is still
+            // invisible to the oldest live snapshot (which reads at the
+            // watermark), so it must NOT physically drop covered keys yet.
+            .filter(|rt| rt.visible_at(self.gc_seqno_threshold))
             .collect();
         self.rt_active = Some(ActiveTombstoneSet::new_with_comparator(comparator.clone()));
         self.rt_comparator = Some(comparator);
@@ -181,8 +190,8 @@ impl<'a, I: Iterator<Item = Item>, F: StreamFilter + 'a> CompactionStream<'a, I,
     }
 
     /// Returns `true` if `user_key`/`seqno` is covered by an applicable
-    /// (watermark-or-below) range tombstone with a higher seqno — meaning the
-    /// entry is deleted for every live snapshot and can be physically dropped.
+    /// (strictly-below-watermark) range tombstone with a higher seqno — meaning
+    /// the entry is deleted for every live snapshot and can be physically dropped.
     /// Entries arrive in non-decreasing `user_key` order, so the active set is
     /// swept monotonically.
     fn covered_by_applied_tombstone(&mut self, user_key: &[u8], seqno: SeqNo) -> bool {
@@ -479,9 +488,9 @@ impl<'a, I: Iterator<Item = Item>, F: StreamFilter + 'a> Iterator for Compaction
             }
 
             // Compaction-time range-tombstone application: physically drop the
-            // surviving entry when an applicable (watermark-or-below) tombstone
-            // outranks it, accounting it to the drop callback (blob GC) instead
-            // of carrying it to the output to be suppressed at every read.
+            // surviving entry when an applicable (strictly-below-watermark)
+            // tombstone outranks it, accounting it to the drop callback (blob GC)
+            // instead of carrying it to the output to be suppressed at every read.
             if self.covered_by_applied_tombstone(head.key.user_key.as_ref(), head.key.seqno) {
                 if let Some(watcher) = &mut self.dropped_callback {
                     watcher.on_dropped(&head);

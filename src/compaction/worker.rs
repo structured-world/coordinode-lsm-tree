@@ -318,7 +318,11 @@ fn range_tombstones_after_gc(
     input_rts
         .iter()
         .filter(|rt| {
-            if rt.seqno > watermark {
+            // Strict visibility: a tombstone at or above the watermark is still
+            // needed by the oldest live snapshot (which reads at the watermark
+            // and does not see `RT@watermark`), so keep it. Only strictly-below
+            // tombstones are candidates for GC.
+            if !rt.visible_at(watermark) {
                 return true;
             }
             version
