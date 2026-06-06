@@ -285,6 +285,10 @@ pub mod range;
 /// Runtime-toggleable configuration (`RuntimeConfig` + atomic-swap handle).
 pub mod runtime_config;
 
+/// Disaster-recovery: rebuild a missing/corrupt manifest from on-disk SSTs.
+#[cfg(feature = "std")]
+pub mod repair;
+
 pub(crate) mod active_tombstone_set;
 pub(crate) mod range_tombstone;
 pub(crate) mod range_tombstone_filter;
@@ -370,6 +374,8 @@ pub use encryption::EncryptionProvider;
 pub use encryption::Aes256GcmProvider;
 
 pub use pinnable_slice::PinnableSlice;
+#[cfg(feature = "std")]
+pub use repair::RepairReport;
 pub use write_batch::WriteBatch;
 
 pub use {

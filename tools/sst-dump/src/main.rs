@@ -41,8 +41,11 @@ const HEX_MAX_LEN: u64 = 1024 * 1024;
     version
 )]
 struct Cli {
-    /// Path to the SST file (typically `<dir>/tables/<id>`).
-    file: PathBuf,
+    /// Path target, interpreted per subcommand:
+    /// - an SST file (typically `<dir>/tables/<id>`) for `verify`, `hex`,
+    ///   `properties`, `index-dump`, `dump`, `filter-stats`
+    /// - the DB **directory** (the tree root containing `tables/`) for `repair`
+    path: PathBuf,
 
     #[command(subcommand)]
     command: Command,
@@ -155,6 +158,21 @@ enum Command {
         keys_only: bool,
     },
 
+    /// Rebuild a missing or corrupt `MANIFEST` from the SST files on
+    /// disk. Here the leading path argument is the DB **directory**
+    /// (not a single SST). Scans `<db-dir>/tables`, reads each SST's
+    /// own metadata, and writes a fresh manifest placing every
+    /// recovered table at L0 (background compaction restructures it on
+    /// the next open). Recent unlogged version edits (in-flight
+    /// compactions, recent deletions) are lost; all readable data is
+    /// preserved.
+    ///
+    /// Uses the default comparator and no encryption: a tree created
+    /// with a custom comparator or with encryption must be repaired via
+    /// the library `Config::repair` API with the matching config.
+    /// KV-separated (blob) trees are not supported by repair.
+    Repair,
+
     /// Print sizing stats for the SST's BuRR filter: on-disk filter
     /// section bytes, BuRR layer count, item count from meta, and
     /// approximate bits-per-key. Only single-block (full) filters
@@ -169,22 +187,55 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Verify { verbose } => run_verify(&cli.file, verbose),
+        Command::Verify { verbose } => run_verify(&cli.path, verbose),
         Command::Hex {
             offset,
             len,
             no_header,
-        } => run_hex(&cli.file, offset, len, no_header),
-        Command::Properties => run_properties(&cli.file),
-        Command::IndexDump => run_index_dump(&cli.file),
+        } => run_hex(&cli.path, offset, len, no_header),
+        Command::Properties => run_properties(&cli.path),
+        Command::IndexDump => run_index_dump(&cli.path),
         Command::Dump {
             from,
             to,
             max,
             keys_only,
-        } => run_dump(&cli.file, from.as_deref(), to.as_deref(), max, keys_only),
-        Command::FilterStats => run_filter_stats(&cli.file),
+        } => run_dump(&cli.path, from.as_deref(), to.as_deref(), max, keys_only),
+        Command::FilterStats => run_filter_stats(&cli.path),
+        Command::Repair => run_repair(&cli.path),
     }
+}
+
+fn run_repair(db_dir: &std::path::Path) -> ExitCode {
+    use lsm_tree::{Config, SequenceNumberCounter};
+
+    let config = Config::new(
+        db_dir,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    );
+
+    let report = match config.repair() {
+        Ok(report) => report,
+        Err(err) => {
+            eprintln!("repair failed: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    println!("db dir:        {}", db_dir.display());
+    println!("method:        {}", report.method);
+    println!("recovered:     {}", report.recovered);
+    println!("unreadable:    {}", report.unreadable);
+    for (path, reason) in &report.unreadable_files {
+        println!("  skipped {} — {reason}", path.display());
+    }
+    for warning in &report.warnings {
+        println!("warning:       {warning}");
+    }
+    println!("status:        manifest rebuilt");
+
+    ExitCode::SUCCESS
 }
 
 fn run_verify(path: &std::path::Path, verbose: bool) -> ExitCode {

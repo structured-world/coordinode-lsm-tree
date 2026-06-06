@@ -239,17 +239,41 @@ pub struct ZstdProvider;
 
 impl CompressionProvider for ZstdProvider {
     fn compress(data: &[u8], level: i32) -> crate::Result<Vec<u8>> {
-        // `compress_slice_to_vec` (not `compress_to_vec`) for two reasons:
-        //   1. it takes `&[u8]`, skipping the `read_to_end` copy the generic
-        //      `Read` adapter does;
-        //   2. it sets the source-size hint, which at high levels (btultra2 /
-        //      L22) selects the small-source parameter set instead of the full
-        //      8 MiB tables — ~34x faster on the 4-64 KiB blocks an LSM writes.
-        let compressed = structured_zstd::encoding::compress_slice_to_vec(
-            data,
-            structured_zstd::encoding::CompressionLevel::from_level(level),
-        );
-        Ok(compressed)
+        use structured_zstd::encoding::{CompressionLevel, FrameCompressor};
+
+        // Thread-local compressor reused across blocks. `compress_slice_to_vec`
+        // builds a fresh `FrameCompressor` (and its matcher tables) on every
+        // call; reusing one per thread avoids that per-block reconstruction —
+        // most visible at btultra2 / L22, where the tables are large. Keyed by
+        // level so a level change rebuilds the compressor.
+        //
+        // `compress_independent_frame_into` emits a standalone frame: it resets
+        // per-frame state and re-derives the source-size hint from `data`, so
+        // the L22 small-source parameter set is still selected for the 4-64 KiB
+        // blocks an LSM writes (the ~34x win the old size-hint path delivered).
+        // Default generics (`R = &'static [u8]`, `W = Vec<u8>`) keep the cached
+        // type `'static` for thread-local storage.
+        thread_local! {
+            static TLS_COMPRESSOR: std::cell::RefCell<Option<(i32, FrameCompressor)>> =
+                const { std::cell::RefCell::new(None) };
+        }
+
+        TLS_COMPRESSOR.with(|cell| {
+            let mut state = cell.borrow_mut();
+            if !matches!(&*state, Some((l, _)) if *l == level) {
+                *state = Some((
+                    level,
+                    FrameCompressor::new(CompressionLevel::from_level(level)),
+                ));
+            }
+            let Some((_, compressor)) = state.as_mut() else {
+                unreachable!("TLS_COMPRESSOR initialised above");
+            };
+            // `compress_independent_frame` is the `FrameCompressor` CCtx-style
+            // single-frame API (structured-zstd >= 0.0.29); it allocates a fresh
+            // output Vec and emits one standalone frame.
+            Ok(compressor.compress_independent_frame(data))
+        })
     }
 
     fn decompress(data: &[u8], capacity: usize) -> crate::Result<Vec<u8>> {
@@ -260,7 +284,9 @@ impl CompressionProvider for ZstdProvider {
 
     fn compress_with_dict(data: &[u8], level: i32, dict_raw: &[u8]) -> crate::Result<Vec<u8>> {
         use structured_zstd::decoding::Dictionary;
-        use structured_zstd::encoding::{CompressionLevel, FrameCompressor, MatchGeneratorDriver};
+        use structured_zstd::encoding::{
+            CompressionLevel, EncoderDictionary, FrameCompressor, MatchGeneratorDriver,
+        };
 
         // Thread-local `FrameCompressor` with the dictionary pre-loaded.
         //
@@ -296,20 +322,23 @@ impl CompressionProvider for ZstdProvider {
                 const { std::cell::RefCell::new(None) };
         }
 
-        // `FrameCompressor::set_dictionary` accepts a parsed `Dictionary`.
+        // The encoder attaches the dictionary via the `EncoderDictionary`
+        // (CDict-analog) path, which parses for the encode side only.
         //
         // Two dictionary formats are supported:
         //
         // 1. **Finalized zstd dictionary** (magic bytes `37 A4 30 EC` prefix): produced by
         //    `zstd --train` / `zstd::dict::from_continuous` and the C zstd library.
         //    Contains entropy tables (Huffman + FSE) that prime the compressor's
-        //    coding state for better ratios. Parsed via `Dictionary::decode_dict`.
+        //    coding state for better ratios. Attached via `set_dictionary_from_bytes`
+        //    (which builds an `EncoderDictionary`, skipping the decode lookup tables).
         //
         // 2. **Raw content dictionary** (no magic): a bare byte sequence used as
         //    LZ77 history to improve match distances on repetitive data. No entropy
-        //    table seeding. Parsed via `Dictionary::from_raw_content`.
+        //    table seeding. Parsed via `Dictionary::from_raw_content`, then wrapped
+        //    in an `EncoderDictionary` and attached via `set_encoder_dictionary`.
         //
-        // `set_dictionary` transparently handles both formats, so a
+        // Both formats end up attached as an `EncoderDictionary`, so a
         // `ZstdDictionary` created from a raw training corpus (without a
         // finalized header) compresses just as one created from a
         // finalized dictionary.
@@ -331,26 +360,36 @@ impl CompressionProvider for ZstdProvider {
             // Re-initialise if this is the first call in this thread or if the
             // dictionary or compression level has changed.
             if !matches!(&*state, Some((k, l, _)) if *k == dict_key && *l == level) {
-                let dictionary = if dict_raw.starts_with(&DICT_MAGIC) {
-                    Dictionary::decode_dict(dict_raw)
-                        .map_err(|e| crate::Error::Io(std::io::Error::other(e)))?
+                let mut compressor = FrameCompressor::new(CompressionLevel::from_level(level));
+                if dict_raw.starts_with(&DICT_MAGIC) {
+                    // Finalized dict: parse for the ENCODER side only via
+                    // `EncoderDictionary` (the `set_dictionary_from_bytes` path),
+                    // which skips building the decode lookup tables the encoder
+                    // never reads. Cheaper than the old `decode_dict` full parse
+                    // on every cache miss — most visible at btultra2 / L22, where
+                    // dictionary parsing dominates the miss-path cost.
+                    compressor
+                        .set_dictionary_from_bytes(dict_raw)
+                        .map_err(|e| crate::Error::Io(std::io::Error::other(e)))?;
                 } else {
+                    // Raw-content dict (no magic header): there is no serialized
+                    // dictionary blob to parse for encoding, so wrap the
+                    // raw-content `Dictionary` as an `EncoderDictionary` and
+                    // attach it without a reparse.
                     #[expect(
                         clippy::cast_possible_truncation,
                         reason = "intentional: lower 32 bits of xxh3 as internal dict id"
                     )]
                     let id = {
                         let h = dict_key as u32;
-                        h.max(1) // id=0 is rejected by set_dictionary; internal use only
+                        h.max(1) // id=0 is rejected by the attach path; internal use only
                     };
-                    Dictionary::from_raw_content(id, dict_raw.to_vec())
-                        .map_err(|e| crate::Error::Io(std::io::Error::other(e)))?
-                };
-
-                let mut compressor = FrameCompressor::new(CompressionLevel::from_level(level));
-                compressor
-                    .set_dictionary(dictionary)
-                    .map_err(|e| crate::Error::Io(std::io::Error::other(e)))?;
+                    let dictionary = Dictionary::from_raw_content(id, dict_raw.to_vec())
+                        .map_err(|e| crate::Error::Io(std::io::Error::other(e)))?;
+                    compressor
+                        .set_encoder_dictionary(EncoderDictionary::from_dictionary(dictionary))
+                        .map_err(|e| crate::Error::Io(std::io::Error::other(e)))?;
+                }
                 *state = Some((dict_key, level, compressor));
             }
 
