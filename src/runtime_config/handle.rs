@@ -91,17 +91,21 @@ impl RuntimeConfigHandle {
     /// Reed-Solomon codec would silently no-op at the manifest writer
     /// (the `PlainEcc` `BlockTransform` arm is feature-gated out), so
     /// we reject the update instead of letting the caller believe ECC
-    /// is on; (2) `kv_checksum_compute_point = AtInsert`, which is not
-    /// yet wired into the memtable / writer path — accepting it would
-    /// silently behave as `AtBlockCompile`, so it is rejected.
+    /// is on; (2) when ECC is on, the scheme must be one the writer can
+    /// emit — `Secded` (the on-default) is rejected until #255 wires it,
+    /// and shard schemes with a zero shard count are rejected (there is
+    /// no implicit RS(4,2) fallback); (3) `kv_checksum_compute_point =
+    /// AtInsert`, which is not yet wired into the memtable / writer path
+    /// — accepting it would silently behave as `AtBlockCompile`.
     ///
     /// # Errors
     ///
     /// - [`crate::Error::PageEccUnsupported`] when the mutator
     ///   leaves `page_ecc = true` on a build without the cargo
     ///   feature.
-    /// - [`crate::Error::FeatureUnsupported`] when the mutator sets
-    ///   `kv_checksum_compute_point = AtInsert` (not yet implemented).
+    /// - [`crate::Error::FeatureUnsupported`] when the mutator enables
+    ///   ECC with an unwired / invalid scheme (`Secded`, or a zero shard
+    ///   count), or sets `kv_checksum_compute_point = AtInsert`.
     pub fn try_update<F>(&self, mutator: F) -> crate::Result<()>
     where
         F: FnOnce(&mut RuntimeConfig),
@@ -111,6 +115,36 @@ impl RuntimeConfigHandle {
         mutator(&mut next);
         if next.page_ecc && !cfg!(feature = "page_ecc") {
             return Err(crate::Error::PageEccUnsupported);
+        }
+        // When ECC is on, the scheme must be one the writer can actually
+        // emit. `Secded` (the on-default) is the per-word Hamming tier,
+        // not yet wired (#255) — accepting it would silently write no
+        // parity, so reject until it lands. There is no implicit RS(4,2)
+        // fallback: enabling ECC today requires an explicit shard scheme
+        // with non-zero shard counts.
+        if next.data_block_ecc() || next.manifest_ecc() {
+            use crate::runtime_config::EccScheme;
+            match next.ecc_scheme {
+                EccScheme::Secded => {
+                    return Err(crate::Error::FeatureUnsupported(
+                        "ecc_scheme=Secded (not yet wired; use Xor/ReedSolomon)",
+                    ));
+                }
+                EccScheme::Xor { data_shards: 0 } => {
+                    return Err(crate::Error::FeatureUnsupported(
+                        "ecc_scheme=Xor data_shards=0",
+                    ));
+                }
+                EccScheme::ReedSolomon { data_shards: 0, .. }
+                | EccScheme::ReedSolomon {
+                    parity_shards: 0, ..
+                } => {
+                    return Err(crate::Error::FeatureUnsupported(
+                        "ecc_scheme=ReedSolomon with zero shard count",
+                    ));
+                }
+                _ => {}
+            }
         }
         // AtInsert (compute the per-KV digest at memtable insert and carry
         // it through flush) is not yet wired into the memtable / writer
@@ -163,6 +197,45 @@ mod tests {
         let handle = RuntimeConfigHandle::new(RuntimeConfig::default());
         let snap = handle.load();
         assert_eq!(snap.block_checksum_algo, ChecksumAlgorithm::Xxh3_64);
+    }
+
+    #[test]
+    #[cfg(feature = "page_ecc")]
+    fn try_update_rejects_ecc_on_with_secded_until_wired() {
+        use super::super::types::EccScheme;
+
+        // Enabling ECC with the on-default Secded scheme must be rejected
+        // (SECDED not yet wired, #255) — there is NO implicit RS(4,2)
+        // fallback. The live snapshot stays off.
+        let handle = RuntimeConfigHandle::new(RuntimeConfig::default());
+        let secded = handle.try_update(|c| c.page_ecc = true);
+        assert!(
+            matches!(secded, Err(crate::Error::FeatureUnsupported(_))),
+            "ECC on + Secded must be rejected until #255, got {secded:?}"
+        );
+        assert!(
+            !handle.load().page_ecc,
+            "rejected update must not enable ECC"
+        );
+
+        // An explicit shard scheme is accepted.
+        let xor = handle.try_update(|c| {
+            c.page_ecc = true;
+            c.ecc_scheme = EccScheme::Xor { data_shards: 10 };
+        });
+        assert!(
+            xor.is_ok(),
+            "ECC on + explicit Xor must be accepted, got {xor:?}"
+        );
+        assert!(handle.load().page_ecc);
+
+        // Zero shard count is rejected (non-recoverable layout).
+        let handle2 = RuntimeConfigHandle::new(RuntimeConfig::default());
+        let bad = handle2.try_update(|c| {
+            c.page_ecc = true;
+            c.ecc_scheme = EccScheme::Xor { data_shards: 0 };
+        });
+        assert!(matches!(bad, Err(crate::Error::FeatureUnsupported(_))));
     }
 
     #[test]
