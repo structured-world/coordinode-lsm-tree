@@ -269,6 +269,9 @@ impl CompressionProvider for ZstdProvider {
             let Some((_, compressor)) = state.as_mut() else {
                 unreachable!("TLS_COMPRESSOR initialised above");
             };
+            // `compress_independent_frame` is the `FrameCompressor` CCtx-style
+            // single-frame API (structured-zstd >= 0.0.29); it allocates a fresh
+            // output Vec and emits one standalone frame.
             Ok(compressor.compress_independent_frame(data))
         })
     }
