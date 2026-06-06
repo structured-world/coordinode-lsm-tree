@@ -239,17 +239,38 @@ pub struct ZstdProvider;
 
 impl CompressionProvider for ZstdProvider {
     fn compress(data: &[u8], level: i32) -> crate::Result<Vec<u8>> {
-        // `compress_slice_to_vec` (not `compress_to_vec`) for two reasons:
-        //   1. it takes `&[u8]`, skipping the `read_to_end` copy the generic
-        //      `Read` adapter does;
-        //   2. it sets the source-size hint, which at high levels (btultra2 /
-        //      L22) selects the small-source parameter set instead of the full
-        //      8 MiB tables — ~34x faster on the 4-64 KiB blocks an LSM writes.
-        let compressed = structured_zstd::encoding::compress_slice_to_vec(
-            data,
-            structured_zstd::encoding::CompressionLevel::from_level(level),
-        );
-        Ok(compressed)
+        use structured_zstd::encoding::{CompressionLevel, FrameCompressor};
+
+        // Thread-local compressor reused across blocks. `compress_slice_to_vec`
+        // builds a fresh `FrameCompressor` (and its matcher tables) on every
+        // call; reusing one per thread avoids that per-block reconstruction —
+        // most visible at btultra2 / L22, where the tables are large. Keyed by
+        // level so a level change rebuilds the compressor.
+        //
+        // `compress_independent_frame_into` emits a standalone frame: it resets
+        // per-frame state and re-derives the source-size hint from `data`, so
+        // the L22 small-source parameter set is still selected for the 4-64 KiB
+        // blocks an LSM writes (the ~34x win the old size-hint path delivered).
+        // Default generics (`R = &'static [u8]`, `W = Vec<u8>`) keep the cached
+        // type `'static` for thread-local storage.
+        thread_local! {
+            static TLS_COMPRESSOR: std::cell::RefCell<Option<(i32, FrameCompressor)>> =
+                const { std::cell::RefCell::new(None) };
+        }
+
+        TLS_COMPRESSOR.with(|cell| {
+            let mut state = cell.borrow_mut();
+            if !matches!(&*state, Some((l, _)) if *l == level) {
+                *state = Some((
+                    level,
+                    FrameCompressor::new(CompressionLevel::from_level(level)),
+                ));
+            }
+            let Some((_, compressor)) = state.as_mut() else {
+                unreachable!("TLS_COMPRESSOR initialised above");
+            };
+            Ok(compressor.compress_independent_frame(data))
+        })
     }
 
     fn decompress(data: &[u8], capacity: usize) -> crate::Result<Vec<u8>> {
