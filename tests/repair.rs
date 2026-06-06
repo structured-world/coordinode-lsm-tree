@@ -244,9 +244,9 @@ fn repair_reports_non_table_id_filename_as_unreadable() -> lsm_tree::Result<()> 
     let good_count = count_sst_files(dir.path())?;
     nuke_manifest(dir.path())?;
 
-    // A non-numeric file name cannot be a table id and must be reported, not
-    // parsed. Removed before reopen so it does not trip the stricter open-time
-    // scan (which rejects non-numeric names outright).
+    // A non-numeric file name cannot be a table id. Repair must move it out of
+    // `tables/` (Tree::open rejects non-numeric names outright), otherwise repair
+    // would report success while the DB still cannot reopen.
     let bad = dir.path().join("tables").join("not-a-table-id");
     std::fs::write(&bad, b"whatever")?;
 
@@ -268,6 +268,25 @@ fn repair_reports_non_table_id_filename_as_unreadable() -> lsm_tree::Result<()> 
         "the reason should explain the name is not a table id, got: {}",
         report.unreadable_files[0].1,
     );
+
+    // The junk must no longer sit in `tables/` — repair quarantines it so the
+    // tree reopens cleanly WITHOUT any manual cleanup.
+    assert!(
+        !dir.path().join("tables").join("not-a-table-id").exists(),
+        "non-table-id file must be moved out of tables/ by repair",
+    );
+    let tree = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .open()?;
+    for i in 0..20 {
+        assert_eq!(
+            tree.get(key(i), MAX_SEQNO)?.as_deref(),
+            Some(format!("v0-{i}").as_bytes()),
+        );
+    }
 
     Ok(())
 }
