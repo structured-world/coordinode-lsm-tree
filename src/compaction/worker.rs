@@ -1683,6 +1683,76 @@ mod tests {
         Ok(())
     }
 
+    /// A range tombstone whose seqno equals the GC watermark sits exactly on the
+    /// visibility boundary. RT visibility is strict (`visible_at` is `seqno <
+    /// read_seqno`), so the oldest live snapshot reading at `read_seqno ==
+    /// watermark` does NOT see `RT@watermark`. Compaction must therefore neither
+    /// apply it (physically dropping covered keys) nor GC it — doing either one
+    /// compaction too early makes a key that is still visible at the watermark
+    /// disappear. Reading the covered key at `read_seqno == watermark` (where the
+    /// tombstone is invisible but the key is committed) must still return it.
+    #[test]
+    fn range_tombstone_at_exact_watermark_is_not_applied_or_gced() -> crate::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let tree = Config::new(
+            &dir,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .data_block_size_policy(BlockSizePolicy::all(512))
+        .compaction_threads(4)
+        .subcompaction_min_bytes(0)
+        .open()?;
+
+        let key = |i: u64| format!("k{i:04}");
+        let val = |i: u64| format!("v{i}-{}", "x".repeat(40));
+
+        // Populate the bottom level (split boundaries for the final compaction).
+        // Covered keys live here at low seqnos (< the watermark).
+        for i in 0..200u64 {
+            tree.insert(key(i), val(i), i);
+        }
+        tree.flush_active_memtable(0)?;
+        tree.major_compact(4_096, 0)?;
+
+        // Delete [k0000, k0050) at seqno 1000 and overwrite the rest into L0.
+        tree.remove_range(
+            crate::UserKey::from("k0000"),
+            crate::UserKey::from("k0050"),
+            1000,
+        );
+        for i in 50..200u64 {
+            tree.insert(key(i), val(i), 1001 + i);
+        }
+        tree.flush_active_memtable(0)?;
+
+        // Compact to the bottom with the watermark set EXACTLY to the tombstone's
+        // seqno. At this boundary the tombstone is invisible to a read at the
+        // watermark, so its covered keys must be preserved, not dropped.
+        tree.major_compact(u64::MAX, 1000)?;
+
+        // Read at read_seqno == watermark: RT@1000 is invisible here
+        // (`1000 < 1000` is false), and each covered key was committed at
+        // seqno < 1000, so it must still be visible.
+        for i in 0..50u64 {
+            assert_eq!(
+                tree.get(key(i), 1000)?.as_deref(),
+                Some(val(i).as_bytes()),
+                "covered key {} must survive: RT@watermark is invisible at read==watermark",
+                key(i),
+            );
+        }
+
+        // The boundary tombstone must also be retained (not GC'd one compaction
+        // early), since snapshots at the watermark still rely on it.
+        let remaining = super::collect_version_tombstones(&tree.current_version());
+        assert!(
+            !remaining.is_empty(),
+            "a tombstone at the exact watermark must be retained, not GC'd",
+        );
+        Ok(())
+    }
+
     #[test]
     fn compaction_stream_run_not_found() -> crate::Result<()> {
         let folder = tempfile::tempdir()?;
