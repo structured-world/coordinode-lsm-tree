@@ -934,7 +934,13 @@ fn walk_block_region(ctx: &mut WalkCtx<'_>, start_offset: u64, end_offset: u64) 
             ctx.page_ecc
         };
         let parity_len = if has_parity {
-            u64::from(crate::table::block::expected_parity_len(header.data_length))
+            // TODO(#254): thread the per-SST ECC scheme from TableMeta into
+            // the verify context; until then the default layout is assumed
+            // (matches the current default-scheme write path).
+            u64::from(crate::table::block::expected_parity_len(
+                header.data_length,
+                crate::table::block::EccParams::default(),
+            ))
         } else {
             0
         };

@@ -390,7 +390,10 @@ impl BlockTransform<'_> {
     /// Shard layout for the parity trailer when this transform emits
     /// one, else `None`. The write path sizes the trailer from this and
     /// the read path recovers with it (sourced per-SST so both agree).
-    #[cfg(feature = "page_ecc")]
+    ///
+    /// Not feature-gated: without `page_ecc` there are no `*Ecc`
+    /// variants, so this is always `None` — call sites stay uniform
+    /// across the feature matrix.
     #[must_use]
     pub fn ecc_params(&self) -> Option<EccParams> {
         match self {
@@ -398,6 +401,7 @@ impl BlockTransform<'_> {
             | Self::Compressed(_)
             | Self::Encrypted(_)
             | Self::CompressedAndEncrypted(_, _) => None,
+            #[cfg(feature = "page_ecc")]
             Self::PlainEcc(p)
             | Self::CompressedEcc(_, p)
             | Self::EncryptedEcc(_, p)

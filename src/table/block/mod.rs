@@ -68,18 +68,21 @@ const MAX_DECOMPRESSION_SIZE: u32 = 256 * 1024 * 1024;
 /// Returns zero for `data_length == 0` to match
 /// `crate::ecc::encode_parity`'s empty-payload short-circuit.
 #[inline]
-pub(crate) fn expected_parity_len(data_length: u32) -> u32 {
-    if data_length == 0 {
+pub(crate) fn expected_parity_len(data_length: u32, params: EccParams) -> u32 {
+    let data_shards = u32::from(params.data_shards);
+    let parity_shards = u32::from(params.parity_shards);
+    if data_length == 0 || data_shards == 0 || parity_shards == 0 {
         return 0;
     }
-    // ceil(N / 4) — overflow-safe for u32 since `data_length` is
-    // already capped at MAX_DECOMPRESSION_SIZE + max overhead by
-    // the caller before this function fires.
-    let ceil_quarter = (data_length / 4).saturating_add(u32::from(!data_length.is_multiple_of(4)));
-    // Round up to even (the `reed-solomon-simd` engine requires
-    // shard sizes that are a multiple of two).
-    let shard_bytes = ceil_quarter.saturating_add(u32::from(!ceil_quarter.is_multiple_of(2)));
-    shard_bytes.saturating_mul(2)
+    // ceil(N / data_shards) — overflow-safe for u32 since `data_length`
+    // is already capped at MAX_DECOMPRESSION_SIZE + max overhead by the
+    // caller before this function fires.
+    let ceil = (data_length / data_shards)
+        .saturating_add(u32::from(!data_length.is_multiple_of(data_shards)));
+    // Round up to even (the `reed-solomon-simd` engine requires shard
+    // sizes that are a multiple of two; XOR shares the layout).
+    let shard_bytes = ceil.saturating_add(u32::from(!ceil.is_multiple_of(2)));
+    shard_bytes.saturating_mul(parity_shards)
 }
 
 /// Whether the on-disk block carries a Reed-Solomon parity trailer.
@@ -187,6 +190,11 @@ impl Block {
         data_length: u32,
         ecc_length: u32,
         expected: Checksum,
+        #[cfg_attr(
+            not(feature = "page_ecc"),
+            expect(unused_variables, reason = "recovery scheme only used under page_ecc")
+        )]
+        ecc_params: EccParams,
     ) -> crate::Result<Vec<u8>> {
         let mut data = vec![0u8; data_length as usize];
         reader.read_exact(&mut data)?;
@@ -216,12 +224,13 @@ impl Block {
         #[cfg(feature = "page_ecc")]
         {
             let expected_raw = expected.into_u128();
+            let (data_shards, parity_shards) = ecc_params.as_shards();
             if let Some(recovered) = crate::ecc::try_recover(
                 &data,
                 &parity,
                 data.len(),
-                crate::ecc::RS_DATA_SHARDS,
-                crate::ecc::RS_PARITY_SHARDS,
+                data_shards,
+                parity_shards,
                 |buf| crate::hash::hash128(buf) == expected_raw,
             )? {
                 log::warn!(
@@ -515,12 +524,9 @@ impl Block {
         // BlockTransform don't exist), so the entire branch is dead and the
         // compiler folds it out.
         #[cfg(feature = "page_ecc")]
-        let parity_buf: Option<Vec<u8>> = if transform.page_ecc() {
-            let p = crate::ecc::encode_parity(
-                &payload,
-                crate::ecc::RS_DATA_SHARDS,
-                crate::ecc::RS_PARITY_SHARDS,
-            )?;
+        let parity_buf: Option<Vec<u8>> = if let Some(ecc_params) = transform.ecc_params() {
+            let (data_shards, parity_shards) = ecc_params.as_shards();
+            let p = crate::ecc::encode_parity(&payload, data_shards, parity_shards)?;
             // parity_len is shard_bytes * RS_PARITY_SHARDS where
             // shard_bytes <= payload.len(). payload_len fits in u32
             // (checked above), so parity_len fits in u32 too; the
@@ -618,7 +624,10 @@ impl Block {
         // is `expected_parity_len(data_length)` (the RS(4, 2) scheme is
         // deterministic), otherwise none.
         let ecc_length = if block_has_parity(&header, transform) {
-            expected_parity_len(header.data_length)
+            expected_parity_len(
+                header.data_length,
+                transform.ecc_params().unwrap_or_default(),
+            )
         } else {
             0
         };
@@ -635,6 +644,7 @@ impl Block {
                 header.data_length,
                 ecc_length,
                 header.checksum,
+                transform.ecc_params().unwrap_or_default(),
             )?;
 
             // Decrypt in-place, reusing the read buffer.
@@ -732,6 +742,7 @@ impl Block {
                     header.data_length,
                     ecc_length,
                     header.checksum,
+                    transform.ecc_params().unwrap_or_default(),
                 )?)
             };
 
@@ -905,7 +916,10 @@ impl Block {
             // count doesn't equal header + data_length + derived-parity, the
             // header is rejected.
             let ecc_length = if block_has_parity(&parsed_header, transform) {
-                expected_parity_len(parsed_header.data_length)
+                expected_parity_len(
+                    parsed_header.data_length,
+                    transform.ecc_params().unwrap_or_default(),
+                )
             } else {
                 0
             };
@@ -967,6 +981,7 @@ impl Block {
                     parsed_header.data_length,
                     ecc_length,
                     parsed_header.checksum,
+                    transform.ecc_params().unwrap_or_default(),
                 )?
             };
 
@@ -1058,7 +1073,10 @@ impl Block {
             // check below implicitly validates it (header + data_length +
             // derived-parity must equal the buffer length).
             let ecc_length = if block_has_parity(&parsed_header, transform) {
-                expected_parity_len(parsed_header.data_length)
+                expected_parity_len(
+                    parsed_header.data_length,
+                    transform.ecc_params().unwrap_or_default(),
+                )
             } else {
                 0
             };
@@ -1099,6 +1117,7 @@ impl Block {
                     parsed_header.data_length,
                     ecc_length,
                     parsed_header.checksum,
+                    transform.ecc_params().unwrap_or_default(),
                 )?)
             };
 

@@ -217,7 +217,11 @@ impl Header {
         )]
         let header = Self::header_len(self.block_type) as u32;
         let parity = if self.block_flags & block_flags::ECC_PARITY != 0 {
-            super::expected_parity_len(self.data_length)
+            // Self-describing blocks (Meta / Manifest) carry only the
+            // ECC_PARITY bit, not a scheme, so they use the fixed default
+            // layout; the configurable per-SST scheme applies to SST data
+            // blocks (whose scheme comes from the table descriptor).
+            super::expected_parity_len(self.data_length, super::EccParams::default())
         } else {
             0
         };
