@@ -182,9 +182,11 @@ pub mod config;
 #[doc(hidden)]
 pub mod descriptor_table;
 
-/// Per-block Reed-Solomon Page ECC. Gated behind the `page_ecc`
-/// cargo feature so the `reed-solomon-simd` dependency is only
-/// pulled in when the feature is enabled.
+/// Shard-based Page ECC (XOR single-parity and Reed-Solomon).
+///
+/// Gated behind the `page_ecc` cargo feature so the
+/// `reed-solomon-simd` dependency is only pulled in when the feature
+/// is enabled.
 #[cfg(feature = "page_ecc")]
 pub mod ecc;
 

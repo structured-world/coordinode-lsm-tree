@@ -216,9 +216,14 @@ impl Block {
         #[cfg(feature = "page_ecc")]
         {
             let expected_raw = expected.into_u128();
-            if let Some(recovered) = crate::ecc::try_recover(&data, &parity, data.len(), |buf| {
-                crate::hash::hash128(buf) == expected_raw
-            })? {
+            if let Some(recovered) = crate::ecc::try_recover(
+                &data,
+                &parity,
+                data.len(),
+                crate::ecc::RS_DATA_SHARDS,
+                crate::ecc::RS_PARITY_SHARDS,
+                |buf| crate::hash::hash128(buf) == expected_raw,
+            )? {
                 log::warn!(
                     "recovered block from RS parity after checksum mismatch \
                      (data_len={}, ecc_len={ecc_length})",
@@ -511,7 +516,11 @@ impl Block {
         // compiler folds it out.
         #[cfg(feature = "page_ecc")]
         let parity_buf: Option<Vec<u8>> = if transform.page_ecc() {
-            let p = crate::ecc::encode_parity(&payload)?;
+            let p = crate::ecc::encode_parity(
+                &payload,
+                crate::ecc::RS_DATA_SHARDS,
+                crate::ecc::RS_PARITY_SHARDS,
+            )?;
             // parity_len is shard_bytes * RS_PARITY_SHARDS where
             // shard_bytes <= payload.len(). payload_len fits in u32
             // (checked above), so parity_len fits in u32 too; the
