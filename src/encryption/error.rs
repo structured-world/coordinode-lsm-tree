@@ -76,22 +76,6 @@ pub enum DecryptError {
     /// (intra-file / inter-file / cross-tree), block-type relabel,
     /// codec relabel, dict substitution, AAD format substitution.
     AeadVerificationFailed,
-
-    /// The trailing `EccFrame` (variant 2) was present and a
-    /// Reed-Solomon repair was attempted, but the corruption exceeded
-    /// the parity budget — no subset of intact shards reproduced a
-    /// ciphertext whose AEAD tag verifies. The block is genuinely
-    /// unrecoverable. Distinct from `AeadVerificationFailed` so the
-    /// caller can tell "ECC tried and ran out of budget" from "no ECC
-    /// frame / plain tag mismatch".
-    EccBudgetExhausted,
-
-    /// The trailing `EccFrame` payload was structurally malformed:
-    /// truncated header, unknown `SchemeID`, non-zero `Reserved`,
-    /// degenerate scheme, or parity length inconsistent with the
-    /// declared scheme. Distinct from `MalformedBodyFrame` because the
-    /// ECC frame is an additive optional trailer, not the mandatory body.
-    MalformedEccFrame(&'static str),
 }
 
 impl fmt::Display for DecryptError {
@@ -123,10 +107,6 @@ impl fmt::Display for DecryptError {
             Self::AeadVerificationFailed => {
                 f.write_str("AEAD tag verification failed (corruption, tampering, or wrong key)")
             }
-            Self::EccBudgetExhausted => {
-                f.write_str("ECC parity budget exhausted — block unrecoverable")
-            }
-            Self::MalformedEccFrame(reason) => write!(f, "malformed ECC frame: {reason}"),
         }
     }
 }

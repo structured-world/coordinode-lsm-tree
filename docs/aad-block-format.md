@@ -1,10 +1,10 @@
 # AAD-bound encrypted block wire format
 
-**Status:** Draft v1. Design decisions in §4 / §6 / §7 are locked; layout in §5 is locked; test vectors in §9 are locked. Implementation lands in #251, conformance tests in #253, ECC layer in #254.
+**Status:** Draft v1. Design decisions in §4 / §6 / §7 are locked; layout in §5 is locked; test vectors in §9 are locked. Implementation lands in #251, conformance tests in #253. ECC-at-rest (#254) is a separate orthogonal layer (Page ECC parity trailer) outside this encryption envelope.
 
 **Scope:** Encrypted-at-rest SST block payloads. Plaintext blocks (no encryption) use the existing `Header` envelope from `src/table/block/header.rs` and are out of scope here.
 
-**Related:** #250 (this spec), #251 (encoder/decoder), #253 (threat-model regression suite), #254 (ECC layer), #255 (lazy block-precise repair), #256 (forensics CLI), #257 (partial-decode for range queries).
+**Related:** #250 (this spec), #251 (encoder/decoder), #253 (threat-model regression suite), #254 (ECC-at-rest on the Page ECC path), #255 (SECDED single-bit fast path), #256 (forensics CLI), #257 (partial-decode for range queries).
 
 ---
 
@@ -51,7 +51,7 @@
 | # | Decision | Value | Rationale |
 |---|---|---|---|
 | 4.1 | Outer framing | [Zstandard skippable frame](https://datatracker.ietf.org/doc/html/rfc8878#section-3.1.1) | Already standard, already understood by `zstd` CLI / libzstd readers, has dedicated magic range. Unknown-to-reader frames skip cleanly. |
-| 4.2 | Magic allocation | `0x184D2A50` (metadata frame), `0x184D2A51` (body frame), `0x184D2A52` (ECC parity frame, owned by #254), `0x184D2A53..0x184D2A5F` reserved for future spec revisions | Stable magic split keeps the metadata size known-at-parse before the variable-length body; ECC magic is locked here so this spec and #254 can't drift. |
+| 4.2 | Magic allocation | `0x184D2A50` (metadata frame), `0x184D2A51` (body frame). No other magic in the RFC 8878 skippable range is claimed by this format. | Stable magic split keeps the metadata size known-at-parse before the variable-length body. Unused magics are not pre-reserved: a future extension that needs one claims it then. |
 | 4.3 | Endianness, outer framing | Little-endian per RFC 8878 §3.1.1 | Mandatory by the framing spec we're inside of. |
 | 4.4 | Endianness, AAD payload content | **Multi-byte numeric fields:** big-endian (TreeID / TableID / BlockOffset as u64 BE; DictID as u32 BE). **MagicMetadata:** literal 4-byte byte string (the on-disk LE bytes `50 2A 4D 18` of the framing magic, used verbatim, NOT re-encoded as a BE integer). **Single-byte fields** (HeaderByte / KeyEpoch / BlockType / SuiteID / CompressionType / WindowLog / BlockFlags): no endianness; one byte. | Crypto convention for numerics (RFC 8446 TLS, RFC 5116 AEAD framework). Avoids endianness ambiguity across deployments. MagicMetadata keeps the LE on-disk bytes as a fixed literal so that the AAD's first 4 bytes are byte-for-byte identical to the on-disk MetadataFrame magic the decoder just read; this binds the AAD to the format identity without conversion logic. |
 | 4.5 | AEAD suite registry | `0x00` reserved (Plain, encryption disabled, not used in this format), `0x01` reserved (future stream cipher), `0x02 = AES-256-GCM`, `0x03 = ChaCha20-Poly1305`, `0x04..0xFF` reserved | Two initial suites cover the hardware-accelerated (AES-GCM via AES-NI/NEON) and the constant-time-on-any-CPU (ChaCha-Poly) cases. |
@@ -59,12 +59,12 @@
 | 4.7 | Authentication tag field width | Fixed 16 bytes | Both initial suites (AES-256-GCM, ChaCha20-Poly1305) emit a 128-bit tag. Reserving 16 bytes covers any plausible future tag-truncation policy and keeps the metadata frame size constant. |
 | 4.8 | `HeaderByte` layout | High nibble = format version (`0b0001` = v1 in this spec), low nibble reserved (MUST be zero on write, ignored on read until a future spec assigns it) | Single byte covers version + future spare. Forward extension can promote low-nibble bits to typed fields without breaking v1 readers. |
 | 4.9 | Inner-frame integrity (dict / window) | Delegated to [structured-zstd](https://github.com/structured-world/structured-zstd) `FrameDecoder::expect_dict_id` / `expect_window_log` (the call-out is structured-zstd PR-F; this spec describes the contract, the implementation lives in S-ZSTD-T7). | Avoids re-validating zstd internals at the LSM layer. The AAD carries `dict_id` + `window_log` so the LSM decoder can pass them through. |
-| 4.10 | Number of frames per block | Exactly **two required** frames: one MetadataFrame (magic `0x184D2A50`, payload size suite-defined: 39 bytes for v1 suites) immediately followed by one BodyFrame (magic `0x184D2A51`, variable payload). Optionally followed by **zero or more** ECC parity frames (magic `0x184D2A52`, owned by #254) and other reserved-range frames. v1 readers MUST accept MetadataFrame + BodyFrame and MUST skip any trailing skippable frame in the reserved range `0x184D2A52..0x184D2A5F` without rejecting the block (RFC 8878 skippable-frame semantics). v1 readers MUST reject if MetadataFrame or BodyFrame is missing or out of order. | Splitting metadata out keeps it known-size and parseable without first probing the body. ECC and future extensions ride alongside as additional skippable frames; v1 readers ignore what they don't recognise and recover the block from the MetadataFrame + BodyFrame pair alone, so a v1 reader on an ECC-augmented block still works (it just doesn't get the parity-based repair path). |
+| 4.10 | Number of frames per block | Exactly **two** frames: one MetadataFrame (magic `0x184D2A50`, payload size suite-defined: 39 bytes for v1 suites) immediately followed by one BodyFrame (magic `0x184D2A51`, variable payload), and nothing after the BodyFrame. v1 readers MUST reject a block if MetadataFrame or BodyFrame is missing or out of order, or if any bytes follow the BodyFrame. | Splitting metadata out keeps it known-size and parseable without first probing the body. The format defines no trailing frames, so trailing bytes are malformed data, not a forward-compat extension point. ECC-at-rest is NOT carried here: it lives in the Page ECC parity trailer outside the encryption envelope, so it stays orthogonal to encryption and covers non-encrypted blocks too. |
 | 4.11 | Plaintext-side integrity | **Delegated to codec.** For `CompressionType ∈ {Lz4, Zstd, ZstdDict}` the writer MUST enable the codec's built-in content checksum (zstd: `Content_Checksum_flag` bit 2 of Frame_Header_Descriptor per RFC 8878 §3.1.1.1.3, emitting a 4-byte XXH64-truncated-to-32-bits at the end of the zstd frame; LZ4: `ContentChecksum` bit in FLG byte of FrameDescriptor per LZ4 Frame Format Description, emitting a 4-byte XXH32). The decoder verifies this automatically during streaming decompression. For `CompressionType = None` the AEAD tag is the sole integrity layer; there's no codec to drift and no separate codec checksum to enable. | AEAD authenticates the ciphertext round-trip but never inspects decrypted+decompressed bytes; codec content checksum catches codec-internal failures (library version drift, non-deterministic decoder output) that AEAD cannot see. Using the codec's built-in mechanism instead of an external XXH3-32 field in MetadataFrame: (a) reuses RFC-standardised, well-fuzzed reference implementations, (b) streaming verification is "free" inside the codec library, (c) zero MetadataFrame overhead (the 4 bytes live inside the codec frame, which is encrypted as part of BodyFrame ciphertext anyway, and AEAD-tag still covers them). For `CompressionType = None`, an external checksum was considered and rejected: AEAD primitives (AES-256-GCM, ChaCha20-Poly1305) have stable reference implementations with no "version drift" failure mode analogous to codec drift, so AEAD-tag alone provides the integrity guarantee. |
 
 ## 5. Wire format
 
-The on-disk layout for an AAD-bound encrypted block begins with two required consecutive [Zstandard skippable frames](https://datatracker.ietf.org/doc/html/rfc8878#section-3.1.1) and MAY be followed by zero or more optional skippable frames (e.g. an `EccFrame` owned by #254 at magic `0x184D2A52`). Per §4.10, v1 readers MUST accept and skip any trailing skippable frame in the reserved range `0x184D2A52..0x184D2A5F` without rejecting the block:
+The on-disk layout for an AAD-bound encrypted block is exactly two consecutive [Zstandard skippable frames](https://datatracker.ietf.org/doc/html/rfc8878#section-3.1.1) and nothing more. Per §4.10, v1 readers MUST reject any bytes following the BodyFrame:
 
 ```text
 MetadataFrame  (8-byte framing header + 39-byte payload   = 47 bytes total for v1 suites)
@@ -320,28 +320,10 @@ These checks are not AEAD-authenticated, but they bound the attack surface so th
 ;; plus the suite-defined NONCE_LEN bytes; plus 16 bytes of AEADTag)
 ;; and the per-field structure described in §5.1.
 ;;
-;; A single AAD-bound encrypted block on disk begins with the
-;; required pair (metadata-frame, body-frame) and may carry zero or
-;; more optional trailing skippable frames (e.g. an ECC parity frame
-;; per #254 at magic 0x184D2A52). v1 readers MUST skip optional
-;; frames they don't recognise (per RFC 8878 skippable-frame
-;; semantics) and MUST NOT reject the block on their presence.
-encrypted-block   = metadata-frame body-frame *optional-frame
-
-optional-frame    = optional-magic optional-payload-len optional-payload
-optional-magic    = %x52.2A.4D.18                  ; 0x184D2A52 (EccFrame, #254)
-                  / %x53.2A.4D.18                  ; 0x184D2A53 (reserved, future)
-                  / %x54.2A.4D.18                  ; 0x184D2A54 (reserved, future)
-                  / %x55.2A.4D.18 / %x56.2A.4D.18  ; 0x184D2A55..0x184D2A5F (reserved)
-                  / %x57.2A.4D.18 / %x58.2A.4D.18
-                  / %x59.2A.4D.18 / %x5A.2A.4D.18
-                  / %x5B.2A.4D.18 / %x5C.2A.4D.18
-                  / %x5D.2A.4D.18 / %x5E.2A.4D.18
-                  / %x5F.2A.4D.18
-optional-payload-len = 4OCTET                       ; u32 LE
-optional-payload  = *OCTET                          ; opaque bytes, length
-                                                   ; constraint enforced
-                                                   ; outside the grammar
+;; A single AAD-bound encrypted block on disk is exactly the pair
+;; (metadata-frame, body-frame) with no trailing frames. v1 readers
+;; MUST reject any bytes following the body-frame.
+encrypted-block   = metadata-frame body-frame
                                                    ; (see prose below)
 
 metadata-frame    = metadata-magic metadata-payload-len metadata-payload
@@ -397,28 +379,19 @@ aead-tag          = 16OCTET
 OCTET             = %x00-FF                        ; any 8-bit byte
 ```
 
-**Length constraint on `optional-payload` (cannot be expressed in ABNF).** ABNF's `*OCTET` matches an unbounded run of bytes, which doesn't capture the contract that the payload is **exactly** the number of bytes declared by the preceding `optional-payload-len` u32 LE. Decoders MUST:
-
-1. Read the 4-byte `optional-payload-len` field into a `u32` (LE).
-2. Read **exactly** that many bytes for `optional-payload`.
-3. Stop consuming bytes for this optional-frame at that point; the next byte is either the start of another optional-frame's magic or end-of-block.
-
-A reader that consumes more or fewer bytes than the declared length MUST treat the file as malformed. The same applies to `metadata-payload` (length 39 for v1 suites with 12-byte nonces; in general `27 + NONCE_LEN`) and `encrypted-body` (length declared by `body-payload-len`): these are also `*OCTET` in the grammar but constrained by their preceding length fields in the same way.
+**Length constraints (cannot be expressed in ABNF).** ABNF's `*OCTET` matches an unbounded run of bytes, which doesn't capture the contract that a payload is **exactly** the number of bytes declared by its preceding length field. This applies to `metadata-payload` (length 39 for v1 suites with 12-byte nonces; in general `27 + NONCE_LEN`) and `encrypted-body` (length declared by `body-payload-len`): both are `*OCTET` in the grammar but constrained by their preceding length fields. A reader that consumes more or fewer bytes than the declared length, or that finds any bytes after the body-frame, MUST treat the file as malformed.
 
 ## 6. Magic allocation
 
-The `0x184D2A50..0x184D2A5F` range is reserved by [RFC 8878 §3.1.2](https://datatracker.ietf.org/doc/html/rfc8878#section-3.1.2) for user-defined skippable frames. This spec claims a subset of that range:
+The `0x184D2A50..0x184D2A5F` range is reserved by [RFC 8878 §3.1.2](https://datatracker.ietf.org/doc/html/rfc8878#section-3.1.2) for user-defined skippable frames. This spec claims exactly two magics from that range and pre-reserves none of the rest:
 
 | Magic | Frame | Status |
 |---|---|---|
 | `0x184D2A50` | MetadataFrame v1 (this spec) | Locked |
 | `0x184D2A51` | BodyFrame v1 (this spec) | Locked |
-| `0x184D2A52` | EccFrame (ECC parity, owned by #254 - kept consistent with that issue's ABNF) | Locked |
-| `0x184D2A53` | (Reserved for spec v2 metadata) | Reserved |
-| `0x184D2A54` | (Reserved for spec v2 body) | Reserved |
-| `0x184D2A55..0x184D2A5F` | Reserved for future use | Reserved |
+| `0x184D2A52..0x184D2A5F` | Not used by this format | Unclaimed |
 
-Implementations MUST reject blocks whose first frame magic is not `0x184D2A50` (any conformant v1 writer, including the #251 encoder implementation, always emits this magic as the first byte of an encrypted block). Implementations MAY recognise reserved magics in a future spec revision; until then a reserved magic is treated as an unknown-format error.
+Implementations MUST reject blocks whose first frame magic is not `0x184D2A50` (any conformant v1 writer, including the #251 encoder implementation, always emits this magic as the first byte of an encrypted block). The remaining magics in the range are unclaimed: a future spec revision that needs one allocates it at that point.
 
 ## 7. AEAD suite registry
 
@@ -581,14 +554,14 @@ Total on-disk size: 56 bytes (47 metadata + 9 body). The AEADTag and ciphertext 
 | Codec content-checksum enforcement | #251 (writer-side mandate) + codec libraries (verification side) | Per §4.11, writer MUST enable the codec's built-in content checksum for `CompressionType ∈ {Lz4, Zstd, ZstdDict}`. Zstd: set `Content_Checksum_flag` bit 2 of Frame_Header_Descriptor (RFC 8878 §3.1.1.1.3); the zstd library appends 4-byte XXH64-truncated-to-32-bits and verifies it on streaming decompress automatically. LZ4: set `ContentChecksum` bit in FLG byte of FrameDescriptor; the lz4 library appends 4-byte XXH32 and verifies similarly. For `CompressionType = None` no codec checksum is required (AEAD-tag is sole integrity). |
 | Inner-frame validation | lsm-tree wiring: #251 (this repo). Structured-zstd enforcement: `S-ZSTD-T7` in [structured-world/structured-zstd](https://github.com/structured-world/structured-zstd). | This repo's encoder/decoder (#251) passes the AAD-bound `dict_id` / `window_log` into `FrameDecoder::expect_dict_id` / `expect_window_log` before letting decompression proceed. Those `expect_*` hooks are implemented on the structured-zstd side under tracker `S-ZSTD-T7`. |
 | Conformance test suite | #253 | One test per row in §9 (vectors 1-5) plus regressions for each row in §8 (attack → defending field). |
-| ECC layer (outer Reed-Solomon parity) | #254 | Uses frame magic `0x184D2A52` (locked here in §6, matching #254's `EccFrame` ABNF) for parity blocks; spec extension lands with that PR. |
-| Lazy block-precise repair | #255 (this repo) | Uses the inner-validator error categories produced by the structured-zstd `S-ZSTD-T7` work to attempt single-block repair before reporting whole-SST corruption. |
+| ECC-at-rest (Reed-Solomon parity) | #254 | Built on the Page ECC parity trailer (`crate::ecc`, `BlockTransform`) **outside** the encryption envelope — orthogonal to encryption/compression, covers non-encrypted blocks too. Does NOT use an encryption-envelope skippable frame. |
+| SECDED single-bit fast path | #255 (this repo) | DIMM-style single-bit auto-correct on the Page ECC read path (on-disk block bytes, verify = block checksum), ahead of the heavier RS recover. Independent of the encryption wire-format. |
 | Forensics CLI | #256 | Reads MetadataFrame in isolation to dump per-block structure (table_id, offset, type, suite, epoch, dict, window) without requiring the key. |
 | Partial decode for range queries | #257 | Uses structured-zstd's block-subset API to decode only the matching key range of a compressed block; the AEAD verification covers the entire body, so partial-decode only saves decompression work, not verification work. |
 
 ## 12. Open questions
 
-These intentionally remain open for follow-up spec revisions; resolving them does not require breaking the v1 wire format because the HeaderByte's low nibble (§4.8) and the reserved magic range (§6) leave room for forward-compatible extensions.
+These intentionally remain open for follow-up spec revisions; resolving them does not require breaking the v1 wire format because the HeaderByte's low nibble (§4.8) leaves room for forward-compatible extensions, and the unclaimed magics in the RFC 8878 skippable range (§6) can be allocated by a future revision when one is actually needed.
 
 - **Per-block version / generation counter** to defend against block-level replay within a single SST (currently §3 documents this as a known gap). Adding a 4-byte generation counter to the AAD would close the gap at the cost of 4 bytes per block; deferred until a deployment incident motivates it.
 - **AEAD nonce derivation policy.** Random 96-bit nonces under AES-GCM hit the birthday bound at ~2³² distinct nonces under the same key; a deployment that ever approaches 4 billion writes per key needs an explicit counter-mode nonce policy. The spec leaves nonce generation to the writer; a future revision may pin a recommended policy.
