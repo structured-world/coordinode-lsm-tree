@@ -41,8 +41,11 @@ const HEX_MAX_LEN: u64 = 1024 * 1024;
     version
 )]
 struct Cli {
-    /// Path to the SST file (typically `<dir>/tables/<id>`).
-    file: PathBuf,
+    /// Path target, interpreted per subcommand:
+    /// - an SST file (typically `<dir>/tables/<id>`) for `verify`, `hex`,
+    ///   `properties`, `index-dump`, `dump`, `filter-stats`
+    /// - the DB **directory** (the tree root containing `tables/`) for `repair`
+    path: PathBuf,
 
     #[command(subcommand)]
     command: Command,
@@ -184,22 +187,22 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Verify { verbose } => run_verify(&cli.file, verbose),
+        Command::Verify { verbose } => run_verify(&cli.path, verbose),
         Command::Hex {
             offset,
             len,
             no_header,
-        } => run_hex(&cli.file, offset, len, no_header),
-        Command::Properties => run_properties(&cli.file),
-        Command::IndexDump => run_index_dump(&cli.file),
+        } => run_hex(&cli.path, offset, len, no_header),
+        Command::Properties => run_properties(&cli.path),
+        Command::IndexDump => run_index_dump(&cli.path),
         Command::Dump {
             from,
             to,
             max,
             keys_only,
-        } => run_dump(&cli.file, from.as_deref(), to.as_deref(), max, keys_only),
-        Command::FilterStats => run_filter_stats(&cli.file),
-        Command::Repair => run_repair(&cli.file),
+        } => run_dump(&cli.path, from.as_deref(), to.as_deref(), max, keys_only),
+        Command::FilterStats => run_filter_stats(&cli.path),
+        Command::Repair => run_repair(&cli.path),
     }
 }
 

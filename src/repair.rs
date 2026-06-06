@@ -94,16 +94,23 @@ fn compute_table_checksum(fs: &dyn crate::fs::Fs, path: &std::path::Path) -> cra
 /// Highest existing `v{N}` manifest id in `folder`, if any. The rebuilt manifest
 /// uses `max + 1` so it supersedes any stale version file and the `current`
 /// pointer never races a half-written predecessor.
-fn highest_existing_version_id(fs: &dyn crate::fs::Fs, folder: &std::path::Path) -> Option<u64> {
-    let entries = fs.read_dir(folder).ok()?;
-    entries
+///
+/// A directory-read failure is propagated (not swallowed as "no versions"): a
+/// transient scan error must not silently reset the version chain to `0` and
+/// risk reusing a live version id.
+fn highest_existing_version_id(
+    fs: &dyn crate::fs::Fs,
+    folder: &std::path::Path,
+) -> crate::Result<Option<u64>> {
+    Ok(fs
+        .read_dir(folder)?
         .into_iter()
         .filter_map(|e| {
             e.file_name
                 .strip_prefix('v')
                 .and_then(|rest| rest.parse::<u64>().ok())
         })
-        .max()
+        .max())
 }
 
 impl Config {
@@ -260,7 +267,7 @@ fn repair_tree(config: &Config) -> crate::Result<RepairReport> {
         levels.push(Level::empty());
     }
 
-    let version_id = highest_existing_version_id(&*config.fs, &config.path)
+    let version_id = highest_existing_version_id(&*config.fs, &config.path)?
         .map_or(0, |max| max.saturating_add(1));
 
     let version = Version::from_levels(
@@ -271,12 +278,18 @@ fn repair_tree(config: &Config) -> crate::Result<RepairReport> {
         crate::blob_tree::FragmentationMap::default(),
     );
 
+    // Persist with the tree's own runtime config, not defaults: it drives the
+    // manifest framing (checksum algorithm, page ECC, footer mirror, manifest
+    // KV checksums), so defaulting it would rewrite a recovered tree's manifest
+    // metadata to settings it never used. The last live runtime config died with
+    // the lost manifest; the config supplied to `repair` is the authoritative
+    // replacement.
     crate::version::persist_version(
         &config.path,
         &version,
         config.comparator.name(),
         &*config.fs,
-        Arc::new(crate::runtime_config::RuntimeConfig::default()),
+        Arc::new(config.initial_runtime_config.clone()),
         config.encryption.clone(),
         config.sync_mode,
     )?;
@@ -320,19 +333,21 @@ mod tests {
 
     #[test]
     #[expect(clippy::unwrap_used, reason = "test assertion")]
-    fn highest_existing_version_id_picks_the_max_and_ignores_non_versions() {
-        let dir = tempfile::tempdir().unwrap();
+    fn highest_existing_version_id_picks_the_max_and_ignores_non_versions() -> crate::Result<()> {
+        let dir = tempfile::tempdir()?;
         for name in ["v2", "v10", "v3", "current", "vNaN", "notaversion"] {
             std::fs::write(dir.path().join(name), b"x").unwrap();
         }
-        assert_eq!(highest_existing_version_id(&StdFs, dir.path()), Some(10));
+        assert_eq!(highest_existing_version_id(&StdFs, dir.path())?, Some(10));
+        Ok(())
     }
 
     #[test]
     #[expect(clippy::unwrap_used, reason = "test assertion")]
-    fn highest_existing_version_id_none_when_no_versions_present() {
-        let dir = tempfile::tempdir().unwrap();
+    fn highest_existing_version_id_none_when_no_versions_present() -> crate::Result<()> {
+        let dir = tempfile::tempdir()?;
         std::fs::write(dir.path().join("current"), b"x").unwrap();
-        assert_eq!(highest_existing_version_id(&StdFs, dir.path()), None);
+        assert_eq!(highest_existing_version_id(&StdFs, dir.path())?, None);
+        Ok(())
     }
 }

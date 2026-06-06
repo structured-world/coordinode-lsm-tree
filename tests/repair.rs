@@ -23,26 +23,26 @@ fn key(i: u64) -> String {
 /// Keep in sync with the copy in `tools/sst-dump/tests/repair_smoke.rs` (a
 /// separate crate, so the helper cannot be shared directly): both encode the
 /// manifest file-naming convention (`v{N}` + `current`).
-fn nuke_manifest(dir: &std::path::Path) {
-    for entry in std::fs::read_dir(dir).unwrap() {
-        let entry = entry.unwrap();
+fn nuke_manifest(dir: &std::path::Path) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
         let name = entry.file_name();
         let name = name.to_string_lossy();
         let is_version = name
             .strip_prefix('v')
             .is_some_and(|rest| rest.parse::<u64>().is_ok());
         if is_version || name == "current" {
-            std::fs::remove_file(entry.path()).unwrap();
+            std::fs::remove_file(entry.path())?;
         }
     }
+    Ok(())
 }
 
-fn count_sst_files(dir: &std::path::Path) -> usize {
-    std::fs::read_dir(dir.join("tables"))
-        .unwrap()
+fn count_sst_files(dir: &std::path::Path) -> std::io::Result<usize> {
+    Ok(std::fs::read_dir(dir.join("tables"))?
         .filter_map(Result::ok)
         .filter(|e| e.file_name().to_string_lossy().parse::<u64>().is_ok())
-        .count()
+        .count())
 }
 
 #[test]
@@ -76,10 +76,10 @@ fn repair_rebuilds_manifest_and_preserves_all_keys() -> lsm_tree::Result<()> {
         tree.flush_active_memtable(0)?;
     }
 
-    let sst_count = count_sst_files(dir.path());
+    let sst_count = count_sst_files(dir.path())?;
     assert!(sst_count >= 3, "expected at least 3 SSTs, got {sst_count}");
 
-    nuke_manifest(dir.path());
+    nuke_manifest(dir.path())?;
 
     let report = Config::new(
         dir.path(),
@@ -139,20 +139,20 @@ fn repair_skips_unreadable_file_but_recovers_the_rest() -> lsm_tree::Result<()> 
         tree.flush_active_memtable(0)?;
     }
 
-    let good_count = count_sst_files(dir.path());
+    let good_count = count_sst_files(dir.path())?;
     assert!(good_count >= 1);
 
-    nuke_manifest(dir.path());
+    nuke_manifest(dir.path())?;
 
     // Drop a garbage file with a table-id-shaped name into the tables folder.
     // A free id well above any the tree allocated avoids colliding with a real
     // table that could then be silently overwritten.
     let bogus = dir.path().join("tables").join("999999");
-    std::fs::write(&bogus, b"not a valid sst file at all").unwrap();
+    std::fs::write(&bogus, b"not a valid sst file at all")?;
 
     // A macOS Finder artifact must be silently skipped, not counted as
     // unreadable.
-    std::fs::write(dir.path().join("tables").join(".DS_Store"), b"\x00").unwrap();
+    std::fs::write(dir.path().join("tables").join(".DS_Store"), b"\x00")?;
 
     let report = Config::new(
         dir.path(),
@@ -200,7 +200,7 @@ fn repair_with_no_ssts_produces_empty_readable_tree() -> lsm_tree::Result<()> {
         .open()?;
     }
 
-    nuke_manifest(dir.path());
+    nuke_manifest(dir.path())?;
 
     let report = Config::new(
         dir.path(),
@@ -241,14 +241,14 @@ fn repair_reports_non_table_id_filename_as_unreadable() -> lsm_tree::Result<()> 
         tree.flush_active_memtable(0)?;
     }
 
-    let good_count = count_sst_files(dir.path());
-    nuke_manifest(dir.path());
+    let good_count = count_sst_files(dir.path())?;
+    nuke_manifest(dir.path())?;
 
     // A non-numeric file name cannot be a table id and must be reported, not
     // parsed. Removed before reopen so it does not trip the stricter open-time
     // scan (which rejects non-numeric names outright).
     let bad = dir.path().join("tables").join("not-a-table-id");
-    std::fs::write(&bad, b"whatever").unwrap();
+    std::fs::write(&bad, b"whatever")?;
 
     let report = Config::new(
         dir.path(),
@@ -292,13 +292,13 @@ fn repair_reports_unopenable_file_as_unreadable() -> lsm_tree::Result<()> {
         tree.flush_active_memtable(0)?;
     }
 
-    let good_count = count_sst_files(dir.path());
-    nuke_manifest(dir.path());
+    let good_count = count_sst_files(dir.path())?;
+    nuke_manifest(dir.path())?;
 
     // Dangling symlink with a valid table-id name: `read_dir` lists it and the
     // name parses, but opening it to checksum fails.
     let dangling = dir.path().join("tables").join("888888");
-    std::os::unix::fs::symlink(dir.path().join("does-not-exist"), &dangling).unwrap();
+    std::os::unix::fs::symlink(dir.path().join("does-not-exist"), &dangling)?;
 
     let report = Config::new(
         dir.path(),
@@ -333,7 +333,7 @@ fn repair_rejects_kv_separated_trees() -> lsm_tree::Result<()> {
         tree.flush_active_memtable(0)?;
     }
 
-    nuke_manifest(dir.path());
+    nuke_manifest(dir.path())?;
 
     let result = Config::new(
         dir.path(),

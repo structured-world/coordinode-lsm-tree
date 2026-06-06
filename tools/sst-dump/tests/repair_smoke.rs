@@ -14,23 +14,24 @@ const SST_DUMP_BIN: &str = env!("CARGO_BIN_EXE_sst-dump");
 /// Keep in sync with the copy in the `lsm-tree` crate's `tests/repair.rs` (a
 /// separate crate, so the helper cannot be shared directly): both encode the
 /// manifest file-naming convention (`v{N}` + `current`).
-fn nuke_manifest(dir: &std::path::Path) {
-    for entry in std::fs::read_dir(dir).expect("read dir") {
-        let entry = entry.expect("dir entry");
+fn nuke_manifest(dir: &std::path::Path) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
         let name = entry.file_name();
         let name = name.to_string_lossy();
         let is_version = name
             .strip_prefix('v')
             .is_some_and(|rest| rest.parse::<u64>().is_ok());
         if is_version || name == "current" {
-            std::fs::remove_file(entry.path()).expect("remove manifest file");
+            std::fs::remove_file(entry.path())?;
         }
     }
+    Ok(())
 }
 
 #[test]
-fn repair_rebuilds_manifest_and_db_reopens() {
-    let dir = tempfile::tempdir().expect("tempdir");
+fn repair_rebuilds_manifest_and_db_reopens() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
 
     {
         let tree = Config::new(
@@ -38,21 +39,19 @@ fn repair_rebuilds_manifest_and_db_reopens() {
             SequenceNumberCounter::default(),
             SequenceNumberCounter::default(),
         )
-        .open()
-        .expect("open tree");
+        .open()?;
         for i in 0u64..200 {
             tree.insert(format!("key-{i:06}"), format!("value-{i}"), 1 + i);
         }
-        tree.flush_active_memtable(0).expect("flush");
+        tree.flush_active_memtable(0)?;
     }
 
-    nuke_manifest(dir.path());
+    nuke_manifest(dir.path())?;
 
     let out = Command::new(SST_DUMP_BIN)
         .arg(dir.path())
         .arg("repair")
-        .output()
-        .expect("spawn sst-dump");
+        .output()?;
 
     assert!(
         out.status.success(),
@@ -71,14 +70,11 @@ fn repair_rebuilds_manifest_and_db_reopens() {
         SequenceNumberCounter::default(),
         SequenceNumberCounter::default(),
     )
-    .open()
-    .expect("reopen tree after repair");
+    .open()?;
     for i in 0u64..200 {
-        assert_eq!(
-            tree.get(format!("key-{i:06}"), MAX_SEQNO)
-                .expect("get")
-                .as_deref(),
-            Some(format!("value-{i}").as_bytes()),
-        );
+        let got = tree.get(format!("key-{i:06}"), MAX_SEQNO)?;
+        assert_eq!(got.as_deref(), Some(format!("value-{i}").as_bytes()));
     }
+
+    Ok(())
 }
