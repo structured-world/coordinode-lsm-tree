@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1780757159775,
+  "lastUpdate": 1780768442816,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -13338,6 +13338,84 @@ window.BENCHMARK_DATA = {
             "value": 559409.0056430803,
             "unit": "ops/sec",
             "extra": "P50: 1.6us | P99: 5.1us | P99.9: 7.5us\nthreads: 1 | elapsed: 0.36s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "af343d569f7486faaec2db3644211267121512c9",
+          "message": "feat(tooling): repair_db — rebuild MANIFEST from on-disk SSTs (#409)\n\n## Summary\n\nTwo related pieces:\n\n1. **`repair_db`** — last-resort `MANIFEST` reconstruction from the SST\nfiles on disk (`Config::repair()` + `sst-dump <db-dir> repair`).\n2. **structured-zstd 0.0.29 bump + encoder-side dictionary /\ncompressor-reuse adoption** — picked up while the repair path exercises\nthe compression stack; roughly halves our zstd:22 encode time.\n\n## repair_db\n\n- `Config::repair() -> Result<RepairReport>`: scans the table folder(s),\nrecomputes each SST's whole-file XXH3-128 checksum, validates\nreadability via `Table::recover`, and writes a fresh manifest placing\nevery recovered table at L0 (RocksDB `RepairDB()` pattern; background\ncompaction restructures on next open).\n- Unreadable files are reported and skipped, not fatal. KV-separated\n(blob) trees return `FeatureUnsupported` (tracked in #408).\n- `sst-dump <db-dir> repair` CLI wrapper.\n\n## Compression (structured-zstd 0.0.29)\n\n- `build(deps)`: 0.0.28 → 0.0.29 (per-strategy block-split, decode-bomb\noutput bound, donor-correct block-split).\n- **A**: attach the encode dictionary via `EncoderDictionary`\n(`set_dictionary_from_bytes` / `set_encoder_dictionary`) — parses for\nthe encoder side only, skipping the decode lookup tables the compressor\nnever reads.\n- **B**: reuse a thread-local `FrameCompressor` across block frames via\n`compress_independent_frame` — avoids reconstructing matcher tables per\nblock; the independent-frame path re-derives the source-size hint so the\nL22 small-source parameter set is still selected.\n\n### Measured (local compare-rocksdb, zstd:22, median)\n\n| bench | ours | rocksdb | A+B delta |\n|-------|------|---------|-----------|\n| write_throughput / 10k | 3.38 s | 4.11 s | ~2x faster |\n| overwrite / 10k | 2.92 s | 4.11 s | ~2x faster |\n| major_compact / 10k | 0.87 s | 1.06 s | ~2x faster |\n\nOur zstd:22 encode now beats RocksDB on these. (zstd:1 also improved\n~30% but still trails RocksDB; the subcompaction gap is split out as\n#410.)\n\n## Testing\n\n- repair: manifest-loss round-trip (all keys readable after repair incl.\noverwrites), unreadable-file skip, non-table-id / dangling-symlink /\n.DS_Store handling, zero-SST, blob-tree rejection; CLI smoke test.\n- compression: dictionary round-trip / wrong-dict rejection / per-level\n/ encryption / blob / major-compaction (39 tests) unchanged; full\nworkspace suite green; clippy `--all-features` + fmt clean; doc tests\npass.\n\n## Related\n\n- #408 — repair for KV-separated (blob) trees (follow-up)\n- #410 — subcompaction far slower than RocksDB (perf investigation,\nsplit out)\n\nCloses #303\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n## Summary by CodeRabbit\n\n* **New Features**\n* Added a disaster-recovery repair mechanism to rebuild missing or\ncorrupt manifests from on-disk SST files.\n* Added a CLI \"repair\" command to run reconstruction and print a repair\nreport.\n\n* **Behavior & Reliability**\n* Recovery skips or quarantines unreadable or non-table files, preserves\nreadable data, and reports recovered/unreadable counts, per-file\nreasons, and warnings.\n  * Rejects unsupported KV-separated/tree formats.\n\n* **Tests**\n* Added unit and end-to-end tests covering repair scenarios and edge\ncases.\n\n* **Improvements**\n* Improved compression performance by reusing compressors and refining\ndictionary handling.\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-06-06T20:53:01+03:00",
+          "tree_id": "223453873bf98c43cae405b1578ac9d9dc386cb8",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/af343d569f7486faaec2db3644211267121512c9"
+        },
+        "date": 1780768436537,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 2083203.154836189,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.6us | P99.9: 3.7us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1172969.6464310556,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.2us | P99.9: 4.3us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 652369.1997634275,
+            "unit": "ops/sec",
+            "extra": "P50: 1.4us | P99: 4.5us | P99.9: 6.9us\nthreads: 1 | elapsed: 0.31s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3636242.1858746284,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 3.1us | P99.9: 5.5us\nthreads: 1 | elapsed: 0.06s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 440161.5967911269,
+            "unit": "ops/sec",
+            "extra": "P50: 2.0us | P99: 5.3us | P99.9: 8.0us\nthreads: 1 | elapsed: 0.45s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 216954.10268484976,
+            "unit": "ops/sec",
+            "extra": "P50: 4.3us | P99: 5.4us | P99.9: 7.9us\nthreads: 1 | elapsed: 0.92s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1224185.6882067116,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.2us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1106149.5816323818,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 1.5us | P99.9: 2.2us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 537573.9055261383,
+            "unit": "ops/sec",
+            "extra": "P50: 1.7us | P99: 5.1us | P99.9: 8.0us\nthreads: 1 | elapsed: 0.37s | num: 200000 | iterations: 3"
           }
         ]
       }
