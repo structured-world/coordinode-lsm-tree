@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1780656055694,
+  "lastUpdate": 1780757159775,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -13260,6 +13260,84 @@ window.BENCHMARK_DATA = {
             "value": 551441.5716636234,
             "unit": "ops/sec",
             "extra": "P50: 1.6us | P99: 6.0us | P99.9: 8.9us\nthreads: 1 | elapsed: 0.36s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "87d2e95aefdb2d3ffa97761ef90ddf2432d14e9e",
+          "message": "feat(compaction): compaction-time range tombstones + bottommost seqno-zeroing (#407)\n\n## Summary\n\nMakes the last level self-cleaning by handling range tombstones during\ncompaction (RocksDB model) instead of only at read time, which unblocks\nbottommost sequence-number zeroing.\n\nThree pieces, all gated on MVCC/PITR safety (single GC watermark `W`):\n\n1. **Apply (compaction-time RT application).** `CompactionStream`\nphysically drops a surviving entry covered by a tombstone `RT@r` with `r\n<= W` and `r > entry.seqno`, routing the drop through the existing drop\ncallback so blob-GC fragmentation accounting stays correct. Only\nwatermark-or-below tombstones are applied — every live snapshot (`>= W\n>= r`) sees them in effect; newer tombstones are preserved for read-time\napplication so snapshots in `[W, r)` still see the entry (PITR).\n2. **GC.** A fully-applied (`r <= W`) tombstone is dropped from the\nlast-level output, unless a table **outside** this compaction overlaps\nits range (dropping it then could resurrect a covered key). Tombstones\nabove `W` are always retained.\n3. **Zero.** At the last level, an entry below `W` that no tombstone in\nthe whole version covers gets its seqno set to `0` (packs to one byte).\nThe whole-version coverage check includes tombstones in levels outside\nthis compaction, so a zeroed entry can never be wrongly suppressed at\nread time.\n\nRead-time range-tombstone application is unchanged (still required for\nnot-yet-compacted data).\n\n## Why it is correct\n\nA zeroed entry has no surviving covering tombstone: `r <= W` tombstones\nare applied (their covered entries dropped) and GC'd; `r > W` tombstones\nblock zeroing of the entries they cover. The watermark contract (no read\nbelow `W`) is the same one the existing `evict_tombstones` relies on.\n\n## Testing\n\n- `prop_range_tombstone` (3000 cases) and `prop_mvcc` green — these\nmodel RT + seqno + compaction + snapshot reads and caught earlier\nincorrect attempts.\n- Unit tests: physical drop + tombstone GC at the last level (a `None`\nread after GC proves both — a non-dropped key would resurrect once its\ntombstone is GC'd); retention of an above-watermark tombstone; the zero\n/ overwrite / re-compact cycle.\n- Full MVCC / snapshot / blob-GC-stats / compaction suites green (frag\naccounting verified).\n\nCloses #406\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n## Summary by CodeRabbit\n\n* **New Features**\n* Compaction now applies range tombstones during compaction, zeroes\nbottommost sequence numbers when safe, and drops keys fully covered by\napplicable tombstones—reducing on-disk footprint and aiding reclamation\nwhile preserving visibility across levels.\n* **Tests**\n* Added integration tests validating bottommost seqno-zeroing and\ncompaction semantics.\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-06-06T15:49:43+03:00",
+          "tree_id": "1090ec2b07ed5404c7e2aef65e60d409cab3be8d",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/87d2e95aefdb2d3ffa97761ef90ddf2432d14e9e"
+        },
+        "date": 1780757155189,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 2046753.3732798188,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.6us | P99.9: 3.7us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1192414.886737041,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.2us | P99.9: 4.4us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 648263.9421939672,
+            "unit": "ops/sec",
+            "extra": "P50: 1.4us | P99: 4.7us | P99.9: 7.2us\nthreads: 1 | elapsed: 0.31s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3628114.096496733,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 3.1us | P99.9: 5.6us\nthreads: 1 | elapsed: 0.06s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 436689.4406687536,
+            "unit": "ops/sec",
+            "extra": "P50: 2.0us | P99: 5.4us | P99.9: 8.3us\nthreads: 1 | elapsed: 0.46s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 216623.89137294452,
+            "unit": "ops/sec",
+            "extra": "P50: 4.3us | P99: 5.4us | P99.9: 8.0us\nthreads: 1 | elapsed: 0.92s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1208696.1116360915,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.2us | P99.9: 4.3us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1104162.4816608273,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.5us | P99.9: 2.1us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 559409.0056430803,
+            "unit": "ops/sec",
+            "extra": "P50: 1.6us | P99: 5.1us | P99.9: 7.5us\nthreads: 1 | elapsed: 0.36s | num: 200000 | iterations: 3"
           }
         ]
       }
