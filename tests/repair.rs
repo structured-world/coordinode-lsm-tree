@@ -19,6 +19,10 @@ fn key(i: u64) -> String {
 
 /// Removes every `v{N}` manifest file and the `current` pointer from a tree
 /// directory, simulating a manifest loss while leaving the SSTs intact.
+///
+/// Keep in sync with the copy in `tools/sst-dump/tests/repair_smoke.rs` (a
+/// separate crate, so the helper cannot be shared directly): both encode the
+/// manifest file-naming convention (`v{N}` + `current`).
 fn nuke_manifest(dir: &std::path::Path) {
     for entry in std::fs::read_dir(dir).unwrap() {
         let entry = entry.unwrap();
@@ -146,6 +150,10 @@ fn repair_skips_unreadable_file_but_recovers_the_rest() -> lsm_tree::Result<()> 
     let bogus = dir.path().join("tables").join("999999");
     std::fs::write(&bogus, b"not a valid sst file at all").unwrap();
 
+    // A macOS Finder artifact must be silently skipped, not counted as
+    // unreadable.
+    std::fs::write(dir.path().join("tables").join(".DS_Store"), b"\x00").unwrap();
+
     let report = Config::new(
         dir.path(),
         SequenceNumberCounter::default(),
@@ -173,6 +181,138 @@ fn repair_skips_unreadable_file_but_recovers_the_rest() -> lsm_tree::Result<()> 
             Some(format!("v0-{i}").as_bytes()),
         );
     }
+
+    Ok(())
+}
+
+#[test]
+fn repair_with_no_ssts_produces_empty_readable_tree() -> lsm_tree::Result<()> {
+    let dir = tempfile::tempdir()?;
+
+    // Open and close without ever flushing: the manifest exists but no SST does
+    // (manifest lost before the first flush is the scenario).
+    {
+        let _tree = Config::new(
+            &dir,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .open()?;
+    }
+
+    nuke_manifest(dir.path());
+
+    let report = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .repair()?;
+
+    assert_eq!(report.recovered, 0, "no SSTs to recover");
+    assert_eq!(report.unreadable, 0);
+
+    // The rebuilt (empty) manifest must still open cleanly and read as empty.
+    let tree = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .open()?;
+    assert_eq!(tree.get("anything", MAX_SEQNO)?, None);
+
+    Ok(())
+}
+
+#[test]
+fn repair_reports_non_table_id_filename_as_unreadable() -> lsm_tree::Result<()> {
+    let dir = tempfile::tempdir()?;
+
+    {
+        let tree = Config::new(
+            &dir,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .open()?;
+        for i in 0..20 {
+            tree.insert(key(i), format!("v0-{i}"), i);
+        }
+        tree.flush_active_memtable(0)?;
+    }
+
+    let good_count = count_sst_files(dir.path());
+    nuke_manifest(dir.path());
+
+    // A non-numeric file name cannot be a table id and must be reported, not
+    // parsed. Removed before reopen so it does not trip the stricter open-time
+    // scan (which rejects non-numeric names outright).
+    let bad = dir.path().join("tables").join("not-a-table-id");
+    std::fs::write(&bad, b"whatever").unwrap();
+
+    let report = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .repair()?;
+
+    assert_eq!(report.recovered, good_count);
+    assert_eq!(report.unreadable, 1);
+    assert!(
+        report.unreadable_files[0].0.ends_with("not-a-table-id"),
+        "the non-numeric file must be the reported unreadable entry",
+    );
+    assert!(
+        report.unreadable_files[0].1.contains("table id"),
+        "the reason should explain the name is not a table id, got: {}",
+        report.unreadable_files[0].1,
+    );
+
+    Ok(())
+}
+
+// A table-id-named entry that cannot even be opened (here a dangling symlink)
+// must be reported via the checksum step's failure path, not abort the repair.
+#[cfg(unix)]
+#[test]
+fn repair_reports_unopenable_file_as_unreadable() -> lsm_tree::Result<()> {
+    let dir = tempfile::tempdir()?;
+
+    {
+        let tree = Config::new(
+            &dir,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .open()?;
+        for i in 0..20 {
+            tree.insert(key(i), format!("v0-{i}"), i);
+        }
+        tree.flush_active_memtable(0)?;
+    }
+
+    let good_count = count_sst_files(dir.path());
+    nuke_manifest(dir.path());
+
+    // Dangling symlink with a valid table-id name: `read_dir` lists it and the
+    // name parses, but opening it to checksum fails.
+    let dangling = dir.path().join("tables").join("888888");
+    std::os::unix::fs::symlink(dir.path().join("does-not-exist"), &dangling).unwrap();
+
+    let report = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .repair()?;
+
+    assert_eq!(
+        report.recovered, good_count,
+        "real SSTs must still be recovered"
+    );
+    assert_eq!(report.unreadable, 1, "the unopenable file must be reported");
+    assert!(report.unreadable_files[0].0.ends_with("888888"));
 
     Ok(())
 }

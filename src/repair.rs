@@ -79,12 +79,14 @@ fn compute_table_checksum(fs: &dyn crate::fs::Fs, path: &std::path::Path) -> cra
     let mut buf = vec![0u8; 256 * 1024];
     loop {
         let n = file.read(&mut buf)?;
-        // `Read::read` guarantees `n <= buf.len()`, so `get(..n)` is always
-        // `Some`; an empty read signals EOF.
-        match buf.get(..n) {
-            None | Some([]) => break,
-            Some(chunk) => hasher.update(chunk),
+        if n == 0 {
+            break; // EOF
         }
+        // `get(..n)` rather than `buf[..n]` to satisfy
+        // `deny(clippy::indexing_slicing)`; `Read::read` guarantees
+        // `n <= buf.len()`, so this slice is always present.
+        let Some(chunk) = buf.get(..n) else { break };
+        hasher.update(chunk);
     }
     Ok(hasher.digest128())
 }
@@ -133,10 +135,13 @@ impl Config {
     /// );
     /// let report = config.repair()?;
     /// println!("recovered {} tables, {} unreadable", report.recovered, report.unreadable);
+    ///
+    /// // `repair` borrows, so the same config opens the rebuilt tree.
+    /// let _tree = config.open()?;
     /// # Ok::<(), lsm_tree::Error>(())
     /// ```
-    pub fn repair(self) -> crate::Result<RepairReport> {
-        repair_tree(&self)
+    pub fn repair(&self) -> crate::Result<RepairReport> {
+        repair_tree(self)
     }
 }
 
@@ -189,6 +194,10 @@ fn repair_tree(config: &Config) -> crate::Result<RepairReport> {
             let checksum = match compute_table_checksum(&*folder_fs, &table_path) {
                 Ok(c) => crate::Checksum::from_raw(c),
                 Err(e) => {
+                    // Mirror the `Table::recover` failure path below: free the id
+                    // so an aliased copy in another scanned folder can still be
+                    // retried.
+                    seen_ids.remove(&table_id);
                     unreadable_files.push((table_path, e.to_string()));
                     continue;
                 }
@@ -234,11 +243,16 @@ fn repair_tree(config: &Config) -> crate::Result<RepairReport> {
     // Each recovered table becomes its own single-table L0 run. L0 permits
     // overlapping runs, so this is always legal regardless of key overlap;
     // background compaction collapses them into sorted lower levels later.
+    // `Run::new` only returns `None` for an empty run, which `vec![t]` never is,
+    // so no table is dropped here — but build the runs explicitly and derive the
+    // recovered count from what actually lands in the manifest, so the report
+    // can never overcount relative to the persisted version.
     let l0_runs = recovered_tables
         .iter()
         .cloned()
         .filter_map(|t| Run::new(vec![t]).map(Arc::new))
         .collect::<Vec<_>>();
+    let recovered = l0_runs.len();
 
     let mut levels = Vec::with_capacity(config.level_count.into());
     levels.push(Level::from_runs(l0_runs));
@@ -268,7 +282,7 @@ fn repair_tree(config: &Config) -> crate::Result<RepairReport> {
     )?;
 
     Ok(RepairReport {
-        recovered: recovered_tables.len(),
+        recovered,
         unreadable: unreadable_files.len(),
         unreadable_files,
         method: "all-to-L0 with sequence-number ordering",

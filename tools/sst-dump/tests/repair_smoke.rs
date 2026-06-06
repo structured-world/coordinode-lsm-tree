@@ -11,6 +11,9 @@ use std::process::Command;
 
 const SST_DUMP_BIN: &str = env!("CARGO_BIN_EXE_sst-dump");
 
+/// Keep in sync with the copy in the `lsm-tree` crate's `tests/repair.rs` (a
+/// separate crate, so the helper cannot be shared directly): both encode the
+/// manifest file-naming convention (`v{N}` + `current`).
 fn nuke_manifest(dir: &std::path::Path) {
     for entry in std::fs::read_dir(dir).expect("read dir") {
         let entry = entry.expect("dir entry");
