@@ -23,7 +23,7 @@ pub use header::Header;
 pub use identity::BlockIdentity;
 pub use offset::BlockOffset;
 pub(crate) use trailer::{TRAILER_START_MARKER, Trailer};
-pub use transform::{BlockTransform, CompressionContext};
+pub use transform::{BlockTransform, CompressionContext, EccParams};
 pub use r#type::BlockType;
 
 #[cfg(zstd_any)]
@@ -2924,7 +2924,7 @@ mod tests {
                 &mut writer,
                 PAYLOAD,
                 BlockIdentity::for_test(0, 0, BlockType::Data),
-                &BlockTransform::PlainEcc,
+                &BlockTransform::PlainEcc(EccParams::default()),
             )?;
 
             assert!(
@@ -2941,7 +2941,7 @@ mod tests {
             let block = Block::from_reader(
                 &mut reader,
                 BlockIdentity::for_test(0, 0, BlockType::Data),
-                &BlockTransform::PlainEcc,
+                &BlockTransform::PlainEcc(EccParams::default()),
             )?;
             assert_eq!(&*block.data, PAYLOAD);
             Ok(())
@@ -2954,7 +2954,7 @@ mod tests {
                 &mut writer,
                 PAYLOAD,
                 BlockIdentity::for_test(0, 0, BlockType::Data),
-                &BlockTransform::PlainEcc,
+                &BlockTransform::PlainEcc(EccParams::default()),
             )?;
 
             // Flip a single byte inside the payload region (after
@@ -2969,7 +2969,7 @@ mod tests {
             let block = Block::from_reader(
                 &mut reader,
                 BlockIdentity::for_test(0, 0, BlockType::Data),
-                &BlockTransform::PlainEcc,
+                &BlockTransform::PlainEcc(EccParams::default()),
             )?;
             // ECC recovery reconstructs the original payload despite
             // the in-flight bit-flip.
@@ -2986,7 +2986,7 @@ mod tests {
             let tmp = super::write_block_to_tempfile(
                 PAYLOAD,
                 BlockIdentity::for_test(0, 0, BlockType::Data),
-                &BlockTransform::PlainEcc,
+                &BlockTransform::PlainEcc(EccParams::default()),
             )?;
             let path = tmp.dir.path().join("block");
 
@@ -3004,7 +3004,7 @@ mod tests {
                 &file,
                 tmp.handle,
                 BlockIdentity::for_test(0, 0, BlockType::Data),
-                &BlockTransform::PlainEcc,
+                &BlockTransform::PlainEcc(EccParams::default()),
             )?;
             assert_eq!(&*block.data, PAYLOAD);
             Ok(())
@@ -3024,7 +3024,10 @@ mod tests {
                 &mut writer,
                 PAYLOAD,
                 BlockIdentity::for_test(0, 0, BlockType::Data),
-                &BlockTransform::CompressedEcc(CompressionContext::new(CompressionType::Lz4)?),
+                &BlockTransform::CompressedEcc(
+                    CompressionContext::new(CompressionType::Lz4)?,
+                    EccParams::default(),
+                ),
             )?;
             assert!(header.block_flags & crate::table::block::header::block_flags::ECC_PARITY != 0);
 
@@ -3037,7 +3040,10 @@ mod tests {
             let block = Block::from_reader(
                 &mut reader,
                 BlockIdentity::for_test(0, 0, BlockType::Data),
-                &BlockTransform::CompressedEcc(CompressionContext::new(CompressionType::Lz4)?),
+                &BlockTransform::CompressedEcc(
+                    CompressionContext::new(CompressionType::Lz4)?,
+                    EccParams::default(),
+                ),
             )?;
             assert_eq!(
                 &*block.data, PAYLOAD,
@@ -3063,7 +3069,7 @@ mod tests {
                 &mut writer,
                 PAYLOAD,
                 BlockIdentity::for_test(0, 0, BlockType::Data),
-                &BlockTransform::EncryptedEcc(&enc),
+                &BlockTransform::EncryptedEcc(&enc, EccParams::default()),
             )?;
             assert!(header.block_flags & crate::table::block::header::block_flags::ECC_PARITY != 0);
 
@@ -3076,7 +3082,7 @@ mod tests {
             let block = Block::from_reader(
                 &mut reader,
                 BlockIdentity::for_test(0, 0, BlockType::Data),
-                &BlockTransform::EncryptedEcc(&enc),
+                &BlockTransform::EncryptedEcc(&enc, EccParams::default()),
             )?;
             assert_eq!(
                 &*block.data, PAYLOAD,
@@ -3100,7 +3106,7 @@ mod tests {
                 &mut writer,
                 PAYLOAD,
                 BlockIdentity::for_test(0, 0, BlockType::Data),
-                &BlockTransform::PlainEcc,
+                &BlockTransform::PlainEcc(EccParams::default()),
             )?;
 
             // Shard size in bytes — same formula as crate::ecc::shard_bytes
@@ -3124,7 +3130,7 @@ mod tests {
             let result = Block::from_reader(
                 &mut reader,
                 BlockIdentity::for_test(0, 0, BlockType::Data),
-                &BlockTransform::PlainEcc,
+                &BlockTransform::PlainEcc(EccParams::default()),
             );
             match result {
                 Ok(_) => panic!(
@@ -3150,7 +3156,7 @@ mod tests {
                 &mut empty_buf,
                 &[],
                 BlockIdentity::for_test(0, 0, BlockType::Data),
-                &BlockTransform::PlainEcc,
+                &BlockTransform::PlainEcc(EccParams::default()),
             )?;
             assert_eq!(
                 empty.block_flags & block_flags::ECC_PARITY,
@@ -3175,7 +3181,7 @@ mod tests {
                 &mut full_buf,
                 PAYLOAD,
                 BlockIdentity::for_test(0, 0, BlockType::Data),
-                &BlockTransform::PlainEcc,
+                &BlockTransform::PlainEcc(EccParams::default()),
             )?;
             assert_ne!(
                 full.block_flags & block_flags::ECC_PARITY,

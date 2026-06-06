@@ -1044,7 +1044,11 @@ impl Table {
                     #[cfg(zstd_any)]
                     None,
                 )?;
-                if page_ecc { t.with_ecc() } else { t }
+                if page_ecc {
+                    t.with_ecc(crate::table::block::EccParams::default())
+                } else {
+                    t
+                }
             },
         )?;
 
@@ -1253,7 +1257,11 @@ impl Table {
                         #[cfg(zstd_any)]
                         None,
                     )?;
-                    if metadata.page_ecc { t.with_ecc() } else { t }
+                    if metadata.page_ecc {
+                        t.with_ecc(crate::table::block::EccParams::default())
+                    } else {
+                        t
+                    }
                 },
             )?;
             if block.header.block_type != BlockType::Index {
@@ -1301,7 +1309,11 @@ impl Table {
                                 Some(enc) => crate::table::block::BlockTransform::Encrypted(enc),
                                 None => crate::table::block::BlockTransform::PLAIN,
                             };
-                            if metadata.page_ecc { t.with_ecc() } else { t }
+                            if metadata.page_ecc {
+                                t.with_ecc(crate::table::block::EccParams::default())
+                            } else {
+                                t
+                            }
                         },
                     )
                     .and_then(|block| {
@@ -1346,7 +1358,11 @@ impl Table {
                         Some(enc) => crate::table::block::BlockTransform::Encrypted(enc),
                         None => crate::table::block::BlockTransform::PLAIN,
                     };
-                    if metadata.page_ecc { t.with_ecc() } else { t }
+                    if metadata.page_ecc {
+                        t.with_ecc(crate::table::block::EccParams::default())
+                    } else {
+                        t
+                    }
                 },
             )?;
 

@@ -106,7 +106,11 @@ impl PartitionedIndexWriter {
                     #[cfg(zstd_any)]
                     None,
                 )?;
-                if self.page_ecc { t.with_ecc() } else { t }
+                if self.page_ecc {
+                    t.with_ecc(crate::table::block::EccParams::default())
+                } else {
+                    t
+                }
             },
         )?;
 
@@ -189,7 +193,11 @@ impl PartitionedIndexWriter {
                     #[cfg(zstd_any)]
                     None,
                 )?;
-                if self.page_ecc { t.with_ecc() } else { t }
+                if self.page_ecc {
+                    t.with_ecc(crate::table::block::EccParams::default())
+                } else {
+                    t
+                }
             },
         )?;
 

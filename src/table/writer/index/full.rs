@@ -137,7 +137,11 @@ impl<W: std::io::Write + std::io::Seek> BlockIndexWriter<W> for FullIndexWriter 
                     #[cfg(zstd_any)]
                     None,
                 )?;
-                if self.page_ecc { t.with_ecc() } else { t }
+                if self.page_ecc {
+                    t.with_ecc(crate::table::block::EccParams::default())
+                } else {
+                    t
+                }
             },
         )?;
 

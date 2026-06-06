@@ -237,7 +237,7 @@ fn prepare_owned(
         zstd_dict,
     )?;
     let transform = if page_ecc {
-        transform.with_ecc()
+        transform.with_ecc(crate::table::block::EccParams::default())
     } else {
         transform
     };

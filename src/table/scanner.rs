@@ -162,7 +162,11 @@ impl Scanner {
                     #[cfg(zstd_any)]
                     zstd_dict,
                 )?;
-                if page_ecc { t.with_ecc() } else { t }
+                if page_ecc {
+                    t.with_ecc(crate::table::block::EccParams::default())
+                } else {
+                    t
+                }
             },
         );
 

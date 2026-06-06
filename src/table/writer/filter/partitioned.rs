@@ -136,7 +136,11 @@ impl PartitionedFilterWriter {
                     Some(enc) => crate::table::block::BlockTransform::Encrypted(enc),
                     None => crate::table::block::BlockTransform::PLAIN,
                 };
-                if self.page_ecc { t.with_ecc() } else { t }
+                if self.page_ecc {
+                    t.with_ecc(crate::table::block::EccParams::default())
+                } else {
+                    t
+                }
             },
         )?;
 
@@ -196,7 +200,11 @@ impl PartitionedFilterWriter {
                     #[cfg(zstd_any)]
                     None,
                 )?;
-                if self.page_ecc { t.with_ecc() } else { t }
+                if self.page_ecc {
+                    t.with_ecc(crate::table::block::EccParams::default())
+                } else {
+                    t
+                }
             },
         )?;
 

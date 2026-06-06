@@ -761,7 +761,11 @@ impl Writer {
                     #[cfg(zstd_any)]
                     self.zstd_dictionary.as_deref(),
                 )?;
-                if self.page_ecc { t.with_ecc() } else { t }
+                if self.page_ecc {
+                    t.with_ecc(crate::table::block::EccParams::default())
+                } else {
+                    t
+                }
             },
             kv_flags,
         )?;
@@ -1051,7 +1055,11 @@ impl Writer {
                         Some(enc) => crate::table::block::BlockTransform::Encrypted(enc),
                         None => crate::table::block::BlockTransform::PLAIN,
                     };
-                    if self.page_ecc { t.with_ecc() } else { t }
+                    if self.page_ecc {
+                        t.with_ecc(crate::table::block::EccParams::default())
+                    } else {
+                        t
+                    }
                 },
             )?;
         }
@@ -1242,7 +1250,11 @@ impl Writer {
                     #[cfg(zstd_any)]
                     None,
                 )?;
-                if self.page_ecc { t.with_ecc() } else { t }
+                if self.page_ecc {
+                    t.with_ecc(crate::table::block::EccParams::default())
+                } else {
+                    t
+                }
             },
         )?;
 
@@ -1510,7 +1522,11 @@ fn write_meta_section<W: std::io::Write + std::io::Seek>(
                 Some(enc) => crate::table::block::BlockTransform::Encrypted(enc),
                 None => crate::table::block::BlockTransform::PLAIN,
             };
-            if page_ecc { t.with_ecc() } else { t }
+            if page_ecc {
+                t.with_ecc(crate::table::block::EccParams::default())
+            } else {
+                t
+            }
         },
     )?;
 

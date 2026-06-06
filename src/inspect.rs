@@ -779,7 +779,11 @@ fn load_data_block_iter(
                 #[cfg(zstd_any)]
                 None,
             )?;
-            if page_ecc { t.with_ecc() } else { t }
+            if page_ecc {
+                t.with_ecc(crate::table::block::EccParams::default())
+            } else {
+                t
+            }
         },
     )?;
 

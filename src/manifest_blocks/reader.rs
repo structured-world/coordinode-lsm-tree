@@ -539,9 +539,11 @@ fn build_transform<'a>(
 
     match (ecc_on, encryption) {
         #[cfg(feature = "page_ecc")]
-        (true, Some(enc)) => BlockTransform::EncryptedEcc(enc),
+        (true, Some(enc)) => {
+            BlockTransform::EncryptedEcc(enc, crate::table::block::EccParams::default())
+        }
         #[cfg(feature = "page_ecc")]
-        (true, None) => BlockTransform::PlainEcc,
+        (true, None) => BlockTransform::PlainEcc(crate::table::block::EccParams::default()),
         (_, Some(enc)) => BlockTransform::Encrypted(enc),
         (_, None) => BlockTransform::PLAIN,
     }
