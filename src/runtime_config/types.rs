@@ -330,6 +330,23 @@ pub enum EccScheme {
     },
 }
 
+impl EccScheme {
+    /// Shard layout `(data_shards, parity_shards)` for the shard-based
+    /// schemes; `None` for [`Self::Secded`] (per-word Hamming, not
+    /// shard-based). [`Self::Xor`] is single-parity (`parity_shards = 1`).
+    #[must_use]
+    pub const fn shard_params(self) -> Option<(usize, usize)> {
+        match self {
+            Self::Secded => None,
+            Self::Xor { data_shards } => Some((data_shards as usize, 1)),
+            Self::ReedSolomon {
+                data_shards,
+                parity_shards,
+            } => Some((data_shards as usize, parity_shards as usize)),
+        }
+    }
+}
+
 /// Granularity at which Page ECC parity is computed.
 ///
 /// Exactly one level is active per SST (never both). [`Self::Block`]
@@ -346,6 +363,84 @@ pub enum EccGranularity {
 
     /// Per sector-aligned page parity (matches the physical failure unit).
     Page,
+}
+
+/// Fixed width of the per-SST `descriptor#page_ecc` value: `[kind,
+/// data_shards, parity_shards, granularity]`.
+pub const ECC_DESCRIPTOR_LEN: usize = 4;
+
+/// Encodes the per-SST ECC descriptor value `[kind, data_shards,
+/// parity_shards, granularity]`.
+///
+/// `None` (ECC off) encodes as all-zero. There is no legacy / implicit
+/// scheme: `kind == 0` is the only "off" encoding and every enabled SST
+/// records its scheme explicitly.
+///
+/// `kind`: 0 = off, 1 = `Secded`, 2 = `Xor`, 3 = `ReedSolomon`.
+#[must_use]
+pub fn ecc_descriptor_bytes(cfg: Option<(EccScheme, EccGranularity)>) -> [u8; ECC_DESCRIPTOR_LEN] {
+    let Some((scheme, gran)) = cfg else {
+        return [0; ECC_DESCRIPTOR_LEN];
+    };
+    let gran_byte = match gran {
+        EccGranularity::Block => 0,
+        EccGranularity::Page => 1,
+    };
+    match scheme {
+        EccScheme::Secded => [1, 0, 0, gran_byte],
+        EccScheme::Xor { data_shards } => [2, data_shards, 1, gran_byte],
+        EccScheme::ReedSolomon {
+            data_shards,
+            parity_shards,
+        } => [3, data_shards, parity_shards, gran_byte],
+    }
+}
+
+/// Decodes a per-SST ECC descriptor value written by
+/// [`ecc_descriptor_bytes`].
+///
+/// Returns `Ok(None)` when ECC is off (`kind == 0`), else the
+/// `(scheme, granularity)` pair.
+///
+/// # Errors
+///
+/// Returns [`crate::Error::InvalidTrailer`] when the value is the wrong
+/// length, carries an unknown `kind` / `granularity`, or encodes a
+/// shard-based scheme with a zero shard count (which would be a
+/// non-recoverable layout).
+pub fn ecc_descriptor_from_bytes(
+    bytes: &[u8],
+) -> crate::Result<Option<(EccScheme, EccGranularity)>> {
+    let [kind, data_shards, parity_shards, gran_byte] =
+        *<&[u8; ECC_DESCRIPTOR_LEN]>::try_from(bytes).map_err(|_| crate::Error::InvalidTrailer)?;
+    if kind == 0 {
+        return Ok(None);
+    }
+    let granularity = match gran_byte {
+        0 => EccGranularity::Block,
+        1 => EccGranularity::Page,
+        _ => return Err(crate::Error::InvalidTrailer),
+    };
+    let scheme = match kind {
+        1 => EccScheme::Secded,
+        2 => {
+            if data_shards == 0 {
+                return Err(crate::Error::InvalidTrailer);
+            }
+            EccScheme::Xor { data_shards }
+        }
+        3 => {
+            if data_shards == 0 || parity_shards == 0 {
+                return Err(crate::Error::InvalidTrailer);
+            }
+            EccScheme::ReedSolomon {
+                data_shards,
+                parity_shards,
+            }
+        }
+        _ => return Err(crate::Error::InvalidTrailer),
+    };
+    Ok(Some((scheme, granularity)))
 }
 
 /// Bitmask over LSM levels for [`KvChecksumPolicy::PerLevel`].
@@ -692,6 +787,80 @@ impl RuntimeConfig {
 #[expect(clippy::expect_used, reason = "test code")]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ecc_defaults_are_off_secded_block() {
+        // ECC master default is OFF (page_ecc=false); when enabled without
+        // an explicit scheme the on-default is the cheapest tier (Secded),
+        // and the granularity default is Block. Pinning these guards the
+        // efficiency-first contract (never RS(4,2)/+50% by default).
+        let c = RuntimeConfig::default();
+        assert!(!c.page_ecc);
+        assert_eq!(c.ecc_scheme, EccScheme::Secded);
+        assert_eq!(c.ecc_granularity, EccGranularity::Block);
+    }
+
+    #[test]
+    fn ecc_scheme_shard_params_match_scheme() {
+        // Secded is per-word, not shard-based. Xor is single-parity.
+        assert_eq!(EccScheme::Secded.shard_params(), None);
+        assert_eq!(
+            EccScheme::Xor { data_shards: 10 }.shard_params(),
+            Some((10, 1))
+        );
+        assert_eq!(
+            EccScheme::ReedSolomon {
+                data_shards: 8,
+                parity_shards: 2,
+            }
+            .shard_params(),
+            Some((8, 2)),
+        );
+    }
+
+    #[test]
+    fn ecc_descriptor_roundtrips_off_and_every_scheme() {
+        // The per-SST descriptor must round-trip "off" and each scheme +
+        // granularity so the read path recovers the exact parity layout.
+        // No legacy/implicit scheme: off is the only kind==0 encoding.
+        assert_eq!(ecc_descriptor_bytes(None), [0, 0, 0, 0]);
+        assert_eq!(
+            ecc_descriptor_from_bytes(&[0, 0, 0, 0]).expect("decode"),
+            None,
+        );
+        let cases = [
+            (EccScheme::Secded, EccGranularity::Block),
+            (EccScheme::Secded, EccGranularity::Page),
+            (EccScheme::Xor { data_shards: 10 }, EccGranularity::Block),
+            (
+                EccScheme::ReedSolomon {
+                    data_shards: 8,
+                    parity_shards: 2,
+                },
+                EccGranularity::Page,
+            ),
+        ];
+        for (scheme, gran) in cases {
+            let bytes = ecc_descriptor_bytes(Some((scheme, gran)));
+            assert_eq!(
+                ecc_descriptor_from_bytes(&bytes).expect("decode"),
+                Some((scheme, gran)),
+                "roundtrip {scheme:?}/{gran:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn ecc_descriptor_rejects_malformed() {
+        // Wrong length, unknown kind, unknown granularity, and zero shard
+        // counts for shard-based schemes are all rejected, not silently
+        // coerced (a zero shard count is a non-recoverable layout).
+        assert!(ecc_descriptor_from_bytes(&[0, 0, 0]).is_err()); // too short
+        assert!(ecc_descriptor_from_bytes(&[9, 0, 0, 0]).is_err()); // unknown kind
+        assert!(ecc_descriptor_from_bytes(&[1, 0, 0, 7]).is_err()); // unknown granularity
+        assert!(ecc_descriptor_from_bytes(&[2, 0, 1, 0]).is_err()); // Xor data_shards=0
+        assert!(ecc_descriptor_from_bytes(&[3, 8, 0, 0]).is_err()); // RS parity_shards=0
+    }
 
     #[test]
     fn kv_checksum_policy_default_is_off() {
