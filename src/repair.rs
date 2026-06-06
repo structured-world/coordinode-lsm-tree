@@ -113,6 +113,29 @@ fn highest_existing_version_id(
         .max())
 }
 
+/// Moves a file that does not belong in `tables/` (a non-table-id name) into a
+/// sibling `repair-quarantine/` directory, so a subsequent `Tree::open` — which
+/// rejects non-numeric names in `tables/` — succeeds. Returns the new path.
+///
+/// Quarantine (move) rather than delete: the file was not created by repair, so
+/// it is preserved for the operator to inspect. The quarantine dir is a sibling
+/// of the table folder (same filesystem) so the move is a plain rename.
+fn quarantine_file(
+    fs: &dyn crate::fs::Fs,
+    table_base_folder: &std::path::Path,
+    src: &std::path::Path,
+    file_name: &str,
+) -> crate::Result<PathBuf> {
+    let quarantine_dir = table_base_folder
+        .parent()
+        .unwrap_or(table_base_folder)
+        .join("repair-quarantine");
+    fs.create_dir_all(&quarantine_dir)?;
+    let dest = quarantine_dir.join(file_name);
+    fs.rename(src, &dest)?;
+    Ok(dest)
+}
+
 impl Config {
     /// Rebuilds the `MANIFEST` for the tree at this config's path from the SST
     /// files present on disk, then returns a [`RepairReport`].
@@ -189,7 +212,23 @@ fn repair_tree(config: &Config) -> crate::Result<RepairReport> {
             }
 
             let Ok(table_id) = file_name.parse::<TableId>() else {
-                unreadable_files.push((table_path, "file name is not a table id".to_owned()));
+                // A non-numeric name cannot be a table id, and `Tree::open`
+                // rejects such a file outright (recovery parses every name in
+                // `tables/`). Leaving it in place would let repair report
+                // success while the tree still cannot reopen, so move it out of
+                // `tables/` into a sibling quarantine dir; report where it went.
+                let reason =
+                    match quarantine_file(&*folder_fs, &table_base_folder, &table_path, &file_name)
+                    {
+                        Ok(dest) => {
+                            format!(
+                                "file name is not a table id; quarantined to {}",
+                                dest.display()
+                            )
+                        }
+                        Err(e) => format!("file name is not a table id; quarantine failed: {e}"),
+                    };
+                unreadable_files.push((table_path, reason));
                 continue;
             };
 
