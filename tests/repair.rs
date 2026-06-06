@@ -291,6 +291,100 @@ fn repair_reports_non_table_id_filename_as_unreadable() -> lsm_tree::Result<()> 
     Ok(())
 }
 
+// A production-written SST that is later corrupted must be rejected by
+// `Table::recover` during repair (per-block / structural validation), reported,
+// and skipped — while intact SSTs still recover and the tree reopens.
+#[test]
+fn repair_rejects_corrupted_sst_and_recovers_the_rest() -> lsm_tree::Result<()> {
+    let dir = tempfile::tempdir()?;
+
+    {
+        let tree = Config::new(
+            &dir,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .open()?;
+        for i in 0..25 {
+            tree.insert(key(i), format!("v0-{i}"), i);
+        }
+        tree.flush_active_memtable(0)?;
+        for i in 25..50 {
+            tree.insert(key(i), format!("v0-{i}"), 1000 + i);
+        }
+        tree.flush_active_memtable(0)?;
+    }
+
+    let total = count_sst_files(dir.path())?;
+    assert!(
+        total >= 2,
+        "need two SSTs (intact + corrupted), got {total}"
+    );
+    nuke_manifest(dir.path())?;
+
+    // Corrupt the newest SST (highest table id = second flush, keys 25..50) by
+    // tampering its SFA trailer, so `Table::recover` rejects it. Production write
+    // path: a real flushed table, single trailing region flipped.
+    let tables = dir.path().join("tables");
+    let newest = std::fs::read_dir(&tables)?
+        .filter_map(Result::ok)
+        .filter_map(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .parse::<u64>()
+                .ok()
+                .map(|id| (id, e.path()))
+        })
+        .max_by_key(|(id, _)| *id)
+        .expect("at least one SST")
+        .1;
+    let mut bytes = std::fs::read(&newest)?;
+    let n = bytes.len();
+    for b in &mut bytes[n - 32..] {
+        *b ^= 0xFF;
+    }
+    std::fs::write(&newest, &bytes)?;
+
+    let report = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .repair()?;
+
+    assert_eq!(report.unreadable, 1, "the corrupted SST must be rejected");
+    assert!(
+        report.unreadable_files[0]
+            .0
+            .ends_with(newest.file_name().expect("file name")),
+        "the corrupted SST must be the reported unreadable entry",
+    );
+    assert_eq!(
+        report.recovered,
+        total - 1,
+        "every intact SST must still be recovered",
+    );
+
+    // Reopen succeeds; the intact SST's keys read back (the corrupted SST's keys
+    // are gone — it was not added to the manifest and is orphan-cleaned on open).
+    let tree = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .open()?;
+    for i in 0..25 {
+        assert_eq!(
+            tree.get(key(i), MAX_SEQNO)?.as_deref(),
+            Some(format!("v0-{i}").as_bytes()),
+            "intact key {} must survive repair",
+            key(i),
+        );
+    }
+
+    Ok(())
+}
+
 // A table-id-named entry that cannot even be opened (here a dangling symlink)
 // must be reported via the checksum step's failure path, not abort the repair.
 #[cfg(unix)]
