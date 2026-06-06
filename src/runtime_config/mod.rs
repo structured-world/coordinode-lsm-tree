@@ -60,6 +60,6 @@ pub mod types;
 pub(crate) mod handle;
 
 pub use types::{
-    ChecksumAlgorithm, KvChecksumComputePoint, KvChecksumPolicy, LevelMask, RuntimeConfig,
-    TableIdRange,
+    ChecksumAlgorithm, EccGranularity, EccScheme, KvChecksumComputePoint, KvChecksumPolicy,
+    LevelMask, RuntimeConfig, TableIdRange,
 };

@@ -280,6 +280,74 @@ pub enum KvChecksumComputePoint {
     AtInsert,
 }
 
+/// Page ECC-at-rest scheme: the correction algorithm matched to the
+/// failure mode and storage budget.
+///
+/// ECC is off by default ([`RuntimeConfig::page_ecc`] = `false`); these
+/// variants only take effect once it is enabled. They are ordered
+/// cheapest-first — pick the lowest tier that covers the failure mode you
+/// care about. The engine never defaults to a high-overhead scheme.
+///
+/// - [`Self::Secded`] — Hamming SECDED, per word: single-bit correct +
+///   double-bit detect. The cheapest tier (~1-3% overhead) and the
+///   default when ECC is enabled without an explicit scheme; matches the
+///   dominant single-bit-rot failure mode of DRAM and disks.
+/// - [`Self::Xor`] — one XOR parity shard over `data_shards` data shards
+///   (RAID-5 equivalent): recovers one fully-lost shard. Overhead =
+///   `1 / data_shards` (e.g. 10 → 10%). XOR is computed directly (no RS
+///   engine), so it is far cheaper than Reed-Solomon for single-erasure.
+/// - [`Self::ReedSolomon`] — `parity_shards` Reed-Solomon parity shards
+///   over `data_shards`: recovers up to `parity_shards` lost shards or
+///   bursts. Overhead = `parity_shards / data_shards`. For higher
+///   tolerance only.
+//
+// no-std: pure data — compiles under `--no-default-features --features alloc`.
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq, Hash)]
+pub enum EccScheme {
+    /// Hamming SECDED per word — single-bit correct, double-bit detect.
+    /// Cheapest tier; the default when ECC is on without an explicit
+    /// scheme. Implemented by the SECDED read path (#255).
+    #[default]
+    Secded,
+
+    /// One XOR parity shard over `data_shards` shards (RAID-5):
+    /// recovers one lost shard. Overhead = `1 / data_shards`.
+    Xor {
+        /// Number of data shards the block is split into. The single
+        /// parity shard is their XOR; overhead is `1 / data_shards`.
+        data_shards: u8,
+    },
+
+    /// `parity_shards` Reed-Solomon parity shards over `data_shards`:
+    /// recovers up to `parity_shards` lost shards. Overhead =
+    /// `parity_shards / data_shards`.
+    ReedSolomon {
+        /// Number of data shards the block is split into.
+        data_shards: u8,
+        /// Number of Reed-Solomon parity shards (max recoverable shard
+        /// losses).
+        parity_shards: u8,
+    },
+}
+
+/// Granularity at which Page ECC parity is computed.
+///
+/// Exactly one level is active per SST (never both). [`Self::Block`]
+/// computes parity over the whole block payload (one parity region per
+/// block). [`Self::Page`] computes parity per sector-aligned page,
+/// matching the physical bit-rot / bad-sector unit.
+//
+// no-std: pure data — compiles under `--no-default-features --features alloc`.
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq, Hash)]
+pub enum EccGranularity {
+    /// One parity region over the whole block payload.
+    #[default]
+    Block,
+
+    /// Per sector-aligned page parity (matches the physical failure unit).
+    Page,
+}
+
 /// Bitmask over LSM levels for [`KvChecksumPolicy::PerLevel`].
 ///
 /// Bit `n` set means level `n` is selected. A `u8` covers levels
@@ -521,6 +589,20 @@ pub struct RuntimeConfig {
     /// considered sufficient and ECC is wanted only on value bytes).
     pub kv_checksums_ecc_override: Option<bool>,
 
+    /// Page ECC scheme used when ECC is enabled ([`Self::page_ecc`] or a
+    /// per-scope override is `true`). Default [`EccScheme::Secded`] — the
+    /// cheapest single-bit-correcting tier. ECC stays off until a
+    /// `page_ecc` flag turns it on; this field only chooses *which*
+    /// algorithm is used once it is on. The scheme is recorded per-SST so
+    /// the reader can re-derive the parity layout (existing SSTs keep the
+    /// scheme they were written with; compaction migrates over time).
+    pub ecc_scheme: EccScheme,
+
+    /// Granularity at which Page ECC parity is computed when ECC is on.
+    /// Default [`EccGranularity::Block`]. Exactly one level is active per
+    /// SST; recorded per-SST alongside [`Self::ecc_scheme`].
+    pub ecc_granularity: EccGranularity,
+
     /// Per-block seqno bounds in SST index entries (#224). When `true`,
     /// SSTs written by the next flush / compaction record each data
     /// block's `seqno_min` / `seqno_max` in its index entry
@@ -573,6 +655,8 @@ impl Default for RuntimeConfig {
             page_ecc: false,
             data_block_ecc_override: None,
             kv_checksums_ecc_override: None,
+            ecc_scheme: EccScheme::Secded,
+            ecc_granularity: EccGranularity::Block,
             seqno_in_index: false,
             index_partition_spill_threshold: crate::table::writer::DEFAULT_SPILL_THRESHOLD,
         }
