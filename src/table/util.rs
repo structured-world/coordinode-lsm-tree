@@ -134,8 +134,16 @@ pub fn load_block(
             // ECC presence is a per-SST descriptor property (passed in by
             // the caller from table metadata), not a per-block header field:
             // upgrade the transform to its `*Ecc` variant when this SST was
-            // written with Page ECC. `with_ecc` is the identity function on
-            // builds without the `page_ecc` feature.
+            // written with Page ECC. The descriptor is parsed regardless of
+            // the cargo feature, so a build WITHOUT `page_ecc` can still see
+            // `ecc.is_some()` for an SST written by a `page_ecc` build. There
+            // `with_ecc` is the identity function, which would silently drop
+            // the parity trailer and mis-parse the parity-bearing bytes as
+            // payload. Fail closed instead.
+            #[cfg(not(feature = "page_ecc"))]
+            if ecc.is_some() {
+                return Err(crate::Error::PageEccUnsupported);
+            }
             let t = crate::table::block::BlockTransform::from_parts(
                 compression,
                 encryption,
