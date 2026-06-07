@@ -2,43 +2,47 @@
 // Copyright (c) 2024-present, fjall-rs
 // Copyright (c) 2026-present, Structured World Foundation
 
+#[cfg(feature = "zstd")]
+use crate::UserKey;
 use crate::table::block::Header;
 use crate::table::{Block, BlockOffset};
-use crate::{GlobalTableId, UserKey, UserValue};
+use crate::{GlobalTableId, UserValue};
 use quick_cache::Weighter;
 use quick_cache::sync::Cache as QuickCache;
 
 const TAG_BLOCK: u8 = 0;
 const TAG_BLOB: u8 = 1;
+#[cfg(feature = "zstd")]
 const TAG_PARTIAL_BLOCK: u8 = 2;
 
 #[derive(Clone)]
 enum Item {
     Block(Block),
     Blob(UserValue),
-    /// A partial (covering) data block synthesized for the adaptive partial-tier
-    /// read path: only the inner zstd blocks up to `covered_upper` are decoded,
-    /// so a cold block keeps just the touched fraction resident. Serves any range
-    /// whose upper bound is `<= covered_upper`; a wider query grows the extent
-    /// (high-water). The access stats drive promotion to a full resident block
-    /// (see [`Cache::peek_partial_block`]).
+    /// The adaptive partial-tier entry for a cold zstd block: the decompressed
+    /// prefix + resume snapshot (so a later read extends it without re-decoding
+    /// from block 0) plus the access stats driving promotion to a full resident
+    /// block. The served data block is synthesized on demand from the prefix, so
+    /// only the touched fraction stays resident. See [`Cache::peek_partial_block`].
+    #[cfg(feature = "zstd")]
     PartialBlock(PartialBlockEntry),
 }
 
-/// A cached partial (covering) data block plus the access stats the partial-tier
-/// promotion heuristic reads: how much of the block is decoded and how often it
-/// has been served. When a cold block is read often enough or its decoded
-/// fraction passes the promotion threshold, the reader decodes it fully and
-/// caches the whole block instead, evicting this entry.
+/// A cached partial-tier entry: the resumable decode state for a cold block plus
+/// the access stats the promotion heuristic reads. When the block is read often
+/// enough or its decoded fraction passes the promotion threshold, the reader
+/// decodes it fully and caches the whole block instead, evicting this entry.
+#[cfg(feature = "zstd")]
 #[doc(hidden)]
 #[derive(Clone)]
 pub struct PartialBlockEntry {
-    /// Synthesized standalone data block covering `[block_start, covered_upper]`.
-    pub block: Block,
-    /// Highest user key the synthesized block covers (its last complete entry).
+    /// Resumable decode state: the decompressed prefix (`window_prime`), the
+    /// entropy/repcode snapshot, the inner-block count, and the compressed
+    /// cursor. The served data block is synthesized from `window_prime`; growth
+    /// resumes from the snapshot.
+    pub resume: crate::table::lazy_block::PartialResume,
+    /// Highest user key the decoded prefix covers (its last complete entry).
     pub covered_upper: UserKey,
-    /// Inner zstd blocks decoded into `block` so far.
-    pub covered_blocks: u32,
     /// Total inner zstd blocks in the full data block.
     pub total_blocks: u32,
     /// Number of times this partial entry has served a read (promotion input).
@@ -67,10 +71,12 @@ impl Weighter<CacheKey, Item> for BlockWeighter {
                     + u64::from(b.header.uncompressed_length)
             }
             Blob(b) => b.len() as u64,
+            // Weighed by the resident decompressed prefix + covered key; the
+            // shared `Arc<ResumeState>` scratch is approximated by a small fixed
+            // term rather than counted per entry.
+            #[cfg(feature = "zstd")]
             Item::PartialBlock(entry) => {
-                (Header::header_len(entry.block.header.block_type) as u64)
-                    + u64::from(entry.block.header.uncompressed_length)
-                    + entry.covered_upper.len() as u64
+                entry.resume.window_prime.len() as u64 + entry.covered_upper.len() as u64 + 64
             }
         }
     }
@@ -155,13 +161,16 @@ impl Cache {
 
         Some(match self.data.get(&key)? {
             Item::Block(block) => block,
-            Item::Blob(_) | Item::PartialBlock(_) => unreachable!("invalid cache item"),
+            Item::Blob(_) => unreachable!("invalid cache item"),
+            #[cfg(feature = "zstd")]
+            Item::PartialBlock(_) => unreachable!("invalid cache item"),
         })
     }
 
     /// Whether a full (non-partial) data block is already resident for `offset`.
     /// The partial-tier reader uses this to bail out (let the normal cached path
     /// serve) once a block has been promoted to a full resident block.
+    #[cfg(feature = "zstd")]
     #[doc(hidden)]
     #[must_use]
     pub fn has_block(&self, id: GlobalTableId, offset: BlockOffset) -> bool {
@@ -169,10 +178,11 @@ impl Cache {
         self.data.peek(&key).is_some()
     }
 
-    /// Reads the cached partial-block entry for `offset` (block + access stats),
-    /// without mutating it. The caller checks coverage against its query, applies
-    /// the promotion heuristic, then re-inserts with bumped stats, grows the
-    /// extent, or promotes to a full block.
+    /// Reads the cached partial-tier entry for `offset` (resume state + access
+    /// stats), without mutating it. The caller checks coverage against its query,
+    /// applies the promotion heuristic, then re-inserts with bumped stats, grows
+    /// the extent, or promotes to a full block.
+    #[cfg(feature = "zstd")]
     #[doc(hidden)]
     #[must_use]
     pub fn peek_partial_block(
@@ -187,9 +197,10 @@ impl Cache {
         }
     }
 
-    /// Inserts or replaces the partial-block entry for `offset` (high-water
-    /// growth: a wider covering block with more decoded inner blocks replaces a
+    /// Inserts or replaces the partial-tier entry for `offset` (high-water
+    /// growth: a wider covering prefix with more decoded inner blocks replaces a
     /// narrower one).
+    #[cfg(feature = "zstd")]
     #[doc(hidden)]
     pub fn insert_partial_block(
         &self,
@@ -203,8 +214,9 @@ impl Cache {
         );
     }
 
-    /// Drops the partial-block entry for `offset` (used on promotion to a full
+    /// Drops the partial-tier entry for `offset` (used on promotion to a full
     /// resident block, so the stale partial does not linger).
+    #[cfg(feature = "zstd")]
     #[doc(hidden)]
     pub fn evict_partial_block(&self, id: GlobalTableId, offset: BlockOffset) {
         let key: CacheKey = (TAG_PARTIAL_BLOCK, id.tree_id(), id.table_id(), *offset).into();
@@ -243,7 +255,9 @@ impl Cache {
 
         Some(match self.data.get(&key)? {
             Item::Blob(blob) => blob,
-            Item::Block(_) | Item::PartialBlock(_) => unreachable!("invalid cache item"),
+            Item::Block(_) => unreachable!("invalid cache item"),
+            #[cfg(feature = "zstd")]
+            Item::PartialBlock(_) => unreachable!("invalid cache item"),
         })
     }
 }

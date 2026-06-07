@@ -3,13 +3,13 @@
 
 //! Range-query throughput over large cold-tier zstd blocks (#257).
 //!
-//! Builds a tree with 256 KiB data blocks at zstd L19 (so each block splits
-//! into many inner zstd blocks and the `block_layout` section is present), then
-//! times many DISTINCT small range reads spread across the tree with a tiny
-//! block cache (so reads are cache-cold). On a build with the partial-decode
-//! path, each read decodes only the inner blocks covering its key range; on a
-//! build without it, each read decodes the whole 256 KiB block — the A/B delta
-//! is the win. Run on this branch and on the pre-#257 baseline to compare.
+//! Builds a tree with 512 KiB data blocks at zstd L19 (above the partial tier's
+//! 256 KiB engage floor; production cold blocks are far larger), so each block
+//! splits into many inner zstd blocks and the `block_layout` section is present.
+//! Times small range reads with a tiny block cache. With the partial path on, a
+//! read decodes only the inner blocks covering its key range and a wider read
+//! RESUMES (decoding just the new tail blocks); with it off, each cold read
+//! decodes the whole block. Toggle `LSM_PARTIAL_DECODE` for the A/B.
 
 use criterion::{Criterion, criterion_group, criterion_main};
 use lsm_tree::config::{BlockSizePolicy, CompressionPolicy};
@@ -33,7 +33,9 @@ fn bench_partial_range(c: &mut Criterion) {
     .data_block_compression_policy(CompressionPolicy::all(
         CompressionType::zstd(19).expect("level"),
     ))
-    .data_block_size_policy(BlockSizePolicy::all(256 * 1024))
+    // Above the partial tier's 256 KiB engage floor (production cold blocks are
+    // far larger; this is the smallest size at which the path turns on).
+    .data_block_size_policy(BlockSizePolicy::all(512 * 1024))
     // Tiny block cache so each distinct read is cache-cold (the partial-decode
     // win is on the first decode; warm reads hit the cache regardless).
     .use_cache(std::sync::Arc::new(lsm_tree::Cache::with_capacity_bytes(
@@ -51,10 +53,11 @@ fn bench_partial_range(c: &mut Criterion) {
     }
     tree.flush_active_memtable(0).unwrap();
 
-    // Adversarial-to-partial pattern: small step keeps many consecutive windows
-    // inside the same large block with a monotonically rising upper, so the
-    // partial path repeatedly re-decodes a growing prefix (no resumable decode
-    // upstream) while full-decode + block-cache amortizes one decode per block.
+    // In-block marching: a small step keeps many consecutive windows inside the
+    // same block with a monotonically rising upper, so the partial path RESUMES
+    // (decoding only each new tail) and eventually promotes to a full block.
+    // Exercises that resume keeps this at parity with full decode + block cache
+    // (it was a ~3x regression before the resumable decoder).
     c.bench_function("range_small_window_marching_in_block", |b| {
         b.iter_custom(|iters| {
             let start = Instant::now();

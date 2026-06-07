@@ -37,8 +37,9 @@ fn key(i: u64) -> Vec<u8> {
     format!("key-{i:08}").into_bytes()
 }
 
-/// Build a flushed tree with large (256 KiB) zstd-L19 data blocks, so blocks
-/// split into many inner zstd blocks and the `block_layout` section is present.
+/// Build a flushed tree with large (512 KiB) zstd-L19 data blocks (above the
+/// partial tier's 256 KiB engage floor), so blocks split into many inner zstd
+/// blocks and the `block_layout` section is present.
 fn large_zstd_block_tree() -> (tempfile::TempDir, lsm_tree::AnyTree) {
     let folder = get_tmp_folder();
     let dir = tempfile::TempDir::new_in(folder).unwrap();
@@ -50,12 +51,41 @@ fn large_zstd_block_tree() -> (tempfile::TempDir, lsm_tree::AnyTree) {
     .data_block_compression_policy(CompressionPolicy::all(
         CompressionType::zstd(19).expect("valid level"),
     ))
-    .data_block_size_policy(BlockSizePolicy::all(256 * 1024))
+    .data_block_size_policy(BlockSizePolicy::all(512 * 1024))
     .open()
     .unwrap();
 
     for i in 0..N {
-        // Values padded so 256 KiB blocks hold many entries across inner blocks.
+        // Values padded so 512 KiB blocks hold many entries across inner blocks.
+        tree.insert(
+            key(i),
+            format!("value-{i:08}-padding-padding").into_bytes(),
+            0,
+        );
+    }
+    tree.flush_active_memtable(0).unwrap();
+    (dir, tree)
+}
+
+/// Build a flushed tree with SMALL (64 KiB) zstd-L19 data blocks: they still
+/// split into a few inner blocks (so a layout is recorded), but each is below
+/// the partial tier's 256 KiB engage floor, so the partial path must skip them.
+fn small_zstd_block_tree() -> (tempfile::TempDir, lsm_tree::AnyTree) {
+    let folder = get_tmp_folder();
+    let dir = tempfile::TempDir::new_in(folder).unwrap();
+    let tree = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .data_block_compression_policy(CompressionPolicy::all(
+        CompressionType::zstd(19).expect("valid level"),
+    ))
+    .data_block_size_policy(BlockSizePolicy::all(64 * 1024))
+    .open()
+    .unwrap();
+
+    for i in 0..N {
         tree.insert(
             key(i),
             format!("value-{i:08}-padding-padding").into_bytes(),
@@ -79,7 +109,7 @@ fn large_zstd_block_tree_with_cache(cache: Arc<Cache>) -> (tempfile::TempDir, ls
     .data_block_compression_policy(CompressionPolicy::all(
         CompressionType::zstd(19).expect("valid level"),
     ))
-    .data_block_size_policy(BlockSizePolicy::all(256 * 1024))
+    .data_block_size_policy(BlockSizePolicy::all(512 * 1024))
     .use_cache(cache)
     .open()
     .unwrap();
@@ -171,6 +201,7 @@ fn partial_decode_cache_reuse_and_high_water_growth_stays_correct() {
     // block and serves / grows it on later reads of the same block. Correctness
     // must hold regardless of read order: a narrow read after a wide one reuses
     // the wider cached block; a wider read after a narrow one grows the extent.
+    enable_partial_decode();
     let cache = Arc::new(Cache::with_capacity_bytes(64 * 1024 * 1024));
     let (_dir, tree) = large_zstd_block_tree_with_cache(cache.clone());
 
@@ -255,5 +286,48 @@ fn partial_decode_promotion_paths_stay_correct() {
     assert_eq!(
         range_keys(&tree, 8_000, 8_010),
         (8_000..8_010).map(key).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn partial_decode_skips_blocks_below_engage_floor() {
+    // Small (64 KiB) blocks are below the partial tier's engage floor: the path
+    // must skip them and fall back to full decode, staying exactly correct.
+    enable_partial_decode();
+    let (_dir, tree) = small_zstd_block_tree();
+
+    for (lo, hi) in [(10u64, 50), (5_000, 5_004), (12_345, 12_900), (0, N)] {
+        let got = range_keys(&tree, lo, hi);
+        let expected: Vec<Vec<u8>> = (lo..hi.min(N)).map(key).collect();
+        assert_eq!(
+            got, expected,
+            "below-floor block range [{lo}, {hi}) must match full decode",
+        );
+    }
+}
+
+#[test]
+fn partial_decode_runtime_fraction_promotion_stays_correct() {
+    // A single read covering most of a large block decodes >= 75% of its inner
+    // blocks, tripping the runtime fraction-promotion path (decode fully + cache
+    // the whole block). Result must be exact, and a re-read off the now-resident
+    // full block must match too.
+    enable_partial_decode();
+    let cache = Arc::new(Cache::with_capacity_bytes(64 * 1024 * 1024));
+    let (_dir, tree) = large_zstd_block_tree_with_cache(cache);
+
+    // ~12.8k keys fit in a 512 KiB block; reading the first 12k covers well over
+    // 75% of the first block's inner blocks.
+    let wide = range_keys(&tree, 0, 12_000);
+    assert_eq!(wide, (0..12_000).map(key).collect::<Vec<_>>());
+
+    // Re-read a sub-window: served from the promoted full block, still exact.
+    assert_eq!(
+        range_keys(&tree, 50, 90),
+        (50..90).map(key).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        range_keys_rev(&tree, 50, 90),
+        (50..90).rev().map(key).collect::<Vec<_>>()
     );
 }

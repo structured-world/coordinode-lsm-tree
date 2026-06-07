@@ -1098,7 +1098,7 @@ mod tests {
         let mut dec = FrameDecoder::new();
         dec.reset(&mut src).expect("reset frame header");
         let pd = dec
-            .decode_blocks_partial(&mut src, 0, 1)
+            .decode_blocks_partial(&mut src, 0, 1, None, false)
             .expect("partial decode of first inner block");
         let want_end = layout[0] as usize;
         assert_eq!(

@@ -9,35 +9,59 @@
 //! start of such a block should pay to decompress only the inner blocks
 //! covering its key range, not the whole block.
 //!
-//! [`LazyBlock`] decodes the inner blocks `[0, end_block)` that cover a read's
-//! key range and skips the trailing blocks (the perf win). A range query knows
-//! its upper bound up front, so it decodes ONCE to the needed extent.
-//!
-//! `decode_blocks_partial` drains the in-range output from the match window on
-//! return, so consecutive calls cannot resume one another (a later block would
-//! lack the earlier blocks as match history). Each extent growth therefore
-//! re-decodes the covering prefix in a single call from block 0. True
-//! incremental resume (decode block N continuing, without re-decoding the
-//! prefix) needs a window-priming decoder API tracked in structured-zstd#368.
+//! [`LazyBlock`] decodes the inner blocks covering a read's key range and skips
+//! the trailing blocks (the perf win). The first touch is a cold `[0, N)` pass;
+//! growing the covered extent RESUMES from a stored entropy/repcode snapshot +
+//! decompressed window ([`PartialResume`]), decoding only the new tail blocks
+//! instead of re-decompressing the prefix. The resume payload is cached
+//! alongside the partial block, so even a later range query (a fresh, dropped
+//! decoder) continues incrementally rather than from block 0.
 //!
 //! It is a TRANSIENT, single-thread engine (`FrameDecoder` is not `Send`): a
-//! live `LazyBlock` lives on the stack for one block access, while the cache
-//! stores only the grown decompressed bytes (a follow-up wires that path).
+//! live `LazyBlock` lives on the stack for one block access; the resumable
+//! state needed to continue later is handed back via [`LazyBlock::resume_payload`]
+//! and kept in the cache.
 
 use crate::comparator::SharedComparator;
 use crate::table::DataBlock;
 use crate::table::block::{Block, Decoder, Header, ParsedItem};
 use crate::table::data_block::DataBlockParsedItem;
 use crate::{Checksum, InternalValue, Slice, UserKey};
-use structured_zstd::decoding::FrameDecoder;
+use std::sync::Arc;
+use structured_zstd::decoding::{FrameDecoder, ResumeInput, ResumeState};
+
+/// Cross-call resume payload for a partially-decoded cold block, stored in the
+/// cache alongside the partial block so a later range query can extend the
+/// decoded prefix WITHOUT re-decompressing it from inner block 0.
+///
+/// Holds the decompressed prefix (`window_prime`), the entropy/repcode snapshot
+/// to resume at the next inner block, and the compressed-frame cursor of that
+/// block. The `ResumeState` is reference-counted because it carries the FSE /
+/// Huffman scratch and is not itself `Clone`.
+#[derive(Clone)]
+pub struct PartialResume {
+    /// Decompressed bytes of inner blocks `[0, decoded_blocks)`, contiguous.
+    /// Fed back as the resume match window and reused as the synthesized block's
+    /// entry region.
+    pub window_prime: Slice,
+    /// Number of inner blocks already decoded into `window_prime`.
+    pub decoded_blocks: u32,
+    /// Entropy/repcode snapshot to resume at inner block `decoded_blocks`, or
+    /// `None` when the frame has been fully decoded (nothing left to resume).
+    pub state: Option<Arc<ResumeState>>,
+    /// Absolute frame offset of inner block `decoded_blocks` (where the
+    /// resuming `decode_blocks_partial` repositions `source`).
+    pub compressed_cursor: u64,
+}
 
 /// A data block decoded lazily from its compressed zstd frame, inner block by
-/// inner block, on demand.
+/// inner block, on demand, with true incremental resume.
 pub struct LazyBlock {
     /// Compressed zstd frame (the block payload after decrypt + ECC verify),
     /// owned so the resumable decoder can read further inner blocks on top-up.
     source: std::io::Cursor<Vec<u8>>,
-    /// Decoder, reset before each (re-)decode of the covering prefix.
+    /// Decoder, reset (header re-parse) before each decode; resume restores the
+    /// entropy/repcode state so only the new tail blocks are decompressed.
     decoder: FrameDecoder,
     /// Cumulative decompressed END offset of each inner block (the persisted
     /// `block_layout`). `ends.last()` == total decompressed size.
@@ -46,12 +70,17 @@ pub struct LazyBlock {
     decoded_blocks: u32,
     /// Decompressed bytes of inner blocks `[0, decoded_blocks)`, contiguous.
     decompressed: Vec<u8>,
+    /// Resume snapshot to continue at `decoded_blocks`; `None` before the first
+    /// decode or once the frame is fully decoded.
+    resume_state: Option<Arc<ResumeState>>,
+    /// Absolute frame offset of inner block `decoded_blocks`.
+    compressed_cursor: u64,
 }
 
 impl LazyBlock {
-    /// Wraps a compressed `frame` with its inner-block `ends` layout (the
-    /// persisted cumulative decompressed offsets). Reads the frame header
-    /// up front; decodes no block bodies until [`Self::ensure_decoded_to`].
+    /// Wraps a compressed `frame` with its inner-block `ends` layout for a cold
+    /// (first-touch) decode. Reads the frame header up front; decodes no block
+    /// bodies until [`Self::ensure_decoded_to`].
     ///
     /// # Errors
     ///
@@ -68,7 +97,26 @@ impl LazyBlock {
             ends,
             decoded_blocks: 0,
             decompressed: Vec::new(),
+            resume_state: None,
+            compressed_cursor: 0,
         })
+    }
+
+    /// Resumes a partially-decoded block from a cached [`PartialResume`]: the
+    /// decompressed prefix and resume snapshot are seeded so
+    /// [`Self::ensure_decoded_to`] decodes only the new tail blocks. The frame
+    /// header is re-parsed lazily inside `ensure_decoded_to`, so this is
+    /// infallible.
+    pub fn from_resume(frame: Vec<u8>, ends: Vec<u32>, resume: PartialResume) -> Self {
+        Self {
+            source: std::io::Cursor::new(frame),
+            decoder: FrameDecoder::new(),
+            ends,
+            decoded_blocks: resume.decoded_blocks,
+            decompressed: resume.window_prime.to_vec(),
+            resume_state: resume.state,
+            compressed_cursor: resume.compressed_cursor,
+        }
     }
 
     /// Total decompressed size of the block (last cumulative end).
@@ -82,28 +130,41 @@ impl LazyBlock {
     }
 
     /// Number of inner blocks decoded so far (for laziness assertions / tests).
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "laziness assertion helper, used in tests")
+    )]
     pub fn decoded_blocks(&self) -> u32 {
         self.decoded_blocks
     }
 
+    /// Snapshot the current decode as a [`PartialResume`] for caching, so a
+    /// later read continues from here instead of re-decoding from block 0.
+    pub fn resume_payload(&self) -> PartialResume {
+        PartialResume {
+            window_prime: Slice::from(self.decompressed.as_slice()),
+            decoded_blocks: self.decoded_blocks,
+            state: self.resume_state.clone(),
+            compressed_cursor: self.compressed_cursor,
+        }
+    }
+
     /// Grow the decompressed prefix until it covers byte offset `upto`
-    /// (exclusive), decoding inner blocks `[0, end_block)` where `end_block`
-    /// covers `upto` and skipping the trailing blocks. A no-op when the prefix
-    /// already reaches `upto`.
+    /// (exclusive), decoding inner blocks up to the one covering `upto` and
+    /// skipping the trailing blocks. A no-op when the prefix already reaches
+    /// `upto`.
     ///
-    /// `decode_blocks_partial` returns (and drains from the match window) the
-    /// in-range output, so consecutive calls cannot resume one another — a
-    /// later block would lack the earlier blocks as match history. Each growth
-    /// therefore re-decodes the covering prefix in a SINGLE call from block 0
-    /// (within one call the window is maintained until the final drain). A
-    /// range query knows its upper bound up front, so it calls this ONCE for
-    /// the extent it needs — one decode, trailing blocks skipped. (True
-    /// incremental resume without re-decoding the prefix needs the
-    /// window-priming decoder API tracked in structured-zstd#368.)
+    /// The first decode is a cold `[0, end_block)` pass; every later growth
+    /// RESUMES from the stored entropy/repcode snapshot + decompressed window,
+    /// decoding only the new tail blocks `[decoded_blocks, end_block)` (no
+    /// re-decode of the prefix). `reset` re-parses the frame header from the
+    /// start, then `source` is repositioned to the resume block's compressed
+    /// offset.
     ///
     /// # Errors
     ///
-    /// Returns an error if an inner block fails to decode (corruption).
+    /// Returns an error if an inner block fails to decode (corruption), or a
+    /// resume snapshot is rejected (frame / window mismatch).
     pub fn ensure_decoded_to(&mut self, upto: usize) -> crate::Result<()> {
         if upto <= self.decompressed.len() {
             return Ok(());
@@ -124,25 +185,52 @@ impl LazyBlock {
             return Ok(());
         }
 
-        // Re-read the frame header and decode `[0, end_block)` in one call: the
-        // drain-on-return behaviour means a single call is the only way to keep
-        // each block's match history available to the next.
+        // `reset` re-parses the frame header (it reads from the start); for a
+        // resume we then reposition `source` to the resume block's offset.
         self.source.set_position(0);
         self.decoder
             .reset(&mut self.source)
             .map_err(|e| crate::Error::Io(std::io::Error::other(e)))?;
-        let pd = self
-            .decoder
-            .decode_blocks_partial(&mut self.source, 0, end_block)
-            .map_err(|e| crate::Error::Io(std::io::Error::other(e)))?;
+
+        let resuming = self.resume_state.is_some();
+        let pd = if let Some(state) = self.resume_state.as_deref() {
+            self.source.set_position(self.compressed_cursor);
+            self.decoder
+                .decode_blocks_partial(
+                    &mut self.source,
+                    state.block_index(),
+                    end_block,
+                    Some(ResumeInput {
+                        window_prime: &self.decompressed,
+                        state,
+                    }),
+                    true,
+                )
+                .map_err(|e| crate::Error::Io(std::io::Error::other(e)))?
+        } else {
+            self.decoder
+                .decode_blocks_partial(&mut self.source, 0, end_block, None, true)
+                .map_err(|e| crate::Error::Io(std::io::Error::other(e)))?
+        };
         if let Some((idx, err)) = pd.stopped_at {
             return Err(crate::Error::Io(std::io::Error::other(format!(
                 "lazy partial decode stopped at inner block {idx}: {err:?}"
             ))));
         }
-        self.decompressed.clear();
-        self.decompressed.extend_from_slice(&pd.data);
-        self.decoded_blocks = pd.blocks_decoded;
+
+        // Fresh decode emits `[0, end_block)`; a resume emits only the new tail
+        // `[block_index, end_block)`, contiguous with the existing prefix.
+        let consumed = self.decoder.bytes_read_from_source();
+        if resuming {
+            self.decompressed.extend_from_slice(&pd.data);
+            self.compressed_cursor += consumed;
+        } else {
+            self.decompressed.clear();
+            self.decompressed.extend_from_slice(&pd.data);
+            self.compressed_cursor = consumed;
+        }
+        self.decoded_blocks = pd.start_block + pd.blocks_decoded;
+        self.resume_state = pd.resume_state.map(Arc::new);
         Ok(())
     }
 }
@@ -238,14 +326,35 @@ fn synthetic_header(len: usize) -> Header {
     }
 }
 
+/// Synthesize a standalone `DataBlock` (entries + trailer) from an
+/// already-decoded prefix, so the normal seek / iterate path can read it. Used
+/// to serve a cached partial block whose decompressed prefix is held in the
+/// cache (no re-decode).
+///
+/// # Errors
+///
+/// Returns an error if the trailer fails to synthesize.
+pub fn synthesize_data_block(prefix: &[u8], restart_interval: u8) -> crate::Result<DataBlock> {
+    let bytes = synthesize_block_bytes(prefix, restart_interval)?;
+    Ok(DataBlock::new(Block {
+        header: synthetic_header(bytes.len()),
+        data: Slice::from(bytes),
+    }))
+}
+
 /// Build a standalone `DataBlock` covering `[block_start, upper]` from a
 /// compressed `frame`, decoding only the inner zstd blocks needed to reach
 /// `upper` (skipping the trailing blocks) and synthesizing a trailer so the
 /// normal seek / iterate path works. The caller's iterator then trims to the
-/// exact query bounds. Returns the block, the number of inner blocks decoded,
-/// and the highest user key the block covers (its last complete entry's key, or
-/// `None` for an empty prefix) so callers can cache it tagged with the extent it
-/// satisfies.
+/// exact query bounds.
+///
+/// `resume` continues a previously-cached partial decode (see [`PartialResume`])
+/// so growing the extent decodes only the new tail blocks instead of from block
+/// 0. Pass `None` for a cold first-touch decode.
+///
+/// Returns the block, the highest user key it covers (its last complete entry's
+/// key, or `None` for an empty prefix), and the updated [`PartialResume`] to
+/// cache so the next read continues from here.
 ///
 /// # Errors
 ///
@@ -257,35 +366,36 @@ pub fn partial_data_block(
     restart_interval: u8,
     comparator: &SharedComparator,
     upper: &[u8],
-) -> crate::Result<(DataBlock, u32, Option<UserKey>)> {
-    let mut lazy = LazyBlock::new(frame, ends)?;
+    resume: Option<PartialResume>,
+) -> crate::Result<(DataBlock, Option<UserKey>, PartialResume)> {
+    let mut lazy = match resume {
+        Some(payload) => LazyBlock::from_resume(frame, ends, payload),
+        None => LazyBlock::new(frame, ends)?,
+    };
     let total = lazy.total_len();
-    let mut extent = 0usize;
 
     // Grow the decoded extent until a key strictly greater than `upper` appears
-    // (so `upper`'s entry is fully decoded) or the block is exhausted.
+    // (so `upper`'s entry is fully decoded) or the block is exhausted. A resumed
+    // block may already cover `upper`, in which case no decode happens.
     loop {
-        extent = if extent == 0 {
-            (64 * 1024).min(total)
-        } else {
-            extent.saturating_mul(2).min(total)
-        };
-        lazy.ensure_decoded_to(extent)?;
-        if extent >= total
-            || prefix_reaches_past(lazy.decoded(), restart_interval, comparator, upper)
+        if lazy.decoded().len() >= total
+            || (!lazy.decoded().is_empty()
+                && prefix_reaches_past(lazy.decoded(), restart_interval, comparator, upper))
         {
             break;
         }
+        let extent = if lazy.decoded().is_empty() {
+            (64 * 1024).min(total)
+        } else {
+            lazy.decoded().len().saturating_mul(2).min(total)
+        };
+        lazy.ensure_decoded_to(extent)?;
     }
 
     let covered_upper = last_complete_key(lazy.decoded(), restart_interval);
-    let bytes = synthesize_block_bytes(lazy.decoded(), restart_interval)?;
-    let blocks = lazy.decoded_blocks();
-    let block = DataBlock::new(Block {
-        header: synthetic_header(bytes.len()),
-        data: Slice::from(bytes),
-    });
-    Ok((block, blocks, covered_upper))
+    let block = synthesize_data_block(lazy.decoded(), restart_interval)?;
+    let payload = lazy.resume_payload();
+    Ok((block, covered_upper, payload))
 }
 
 /// The user key of the last COMPLETE entry in a decoded `prefix` (a truncated
@@ -435,9 +545,9 @@ mod tests {
 
     #[test]
     fn lazy_block_growing_extents_equal_one_shot_full() {
-        // Growing the decoded extent in steps (each a re-decode of the covering
-        // prefix) must always equal the matching prefix of a full decode and
-        // converge to the whole block.
+        // Growing the decoded extent in steps (each a RESUME from the prior
+        // snapshot, decoding only the new tail blocks) must always equal the
+        // matching prefix of a full decode and converge to the whole block.
         let (frame, ends, reference) = large_block_frame();
         let mut lazy = LazyBlock::new(frame, ends).expect("new lazy block");
         let total = reference.len();
@@ -448,6 +558,45 @@ mod tests {
             assert_eq!(lazy.decoded(), &reference[..lazy.decoded().len()]);
         }
         assert_eq!(lazy.decoded(), reference.as_slice());
+    }
+
+    #[test]
+    fn lazy_block_resume_across_decoders_equals_full() {
+        // The resume path must work across a DROPPED decoder: decode a cold
+        // prefix, snapshot the resume payload, drop the LazyBlock, then rebuild a
+        // fresh one from the payload and grow it. Each growth resumes from the
+        // cached entropy/window snapshot (not block 0) yet must stay byte-
+        // identical to a one-shot full decode at every step.
+        let (frame, ends, reference) = large_block_frame();
+        let total = reference.len();
+
+        // Cold first touch: decode roughly the first quarter.
+        let mut lazy = LazyBlock::new(frame.clone(), ends.clone()).expect("new lazy block");
+        lazy.ensure_decoded_to((total / 4).max(1))
+            .expect("cold decode");
+        assert!(lazy.decoded_blocks() >= 1);
+        assert_eq!(lazy.decoded(), &reference[..lazy.decoded().len()]);
+        let mut payload = lazy.resume_payload();
+        let mut prev_len = lazy.decoded().len();
+        assert!(
+            payload.state.is_some(),
+            "mid-frame snapshot must be resumable"
+        );
+        drop(lazy);
+
+        // Resume across fresh (dropped) decoders, growing in quarter steps.
+        let mut target = prev_len;
+        while target < total {
+            target = (target + total / 4 + 1).min(total);
+            let mut resumed = LazyBlock::from_resume(frame.clone(), ends.clone(), payload.clone());
+            resumed.ensure_decoded_to(target).expect("resume grow");
+            // Must extend (not shrink / restart) and match the full reference.
+            assert!(resumed.decoded().len() >= prev_len);
+            assert_eq!(resumed.decoded(), &reference[..resumed.decoded().len()]);
+            prev_len = resumed.decoded().len();
+            payload = resumed.resume_payload();
+        }
+        assert_eq!(payload.window_prime.as_ref(), reference.as_slice());
     }
 
     /// A block synthesized (trailer rebuilt) from a full block's entry region
@@ -576,8 +725,9 @@ mod tests {
         assert_eq!(reference.len(), 40, "i=10..50 → 40 entries");
 
         // Partial: build a covering block from the frame, then seek the same range.
-        let (partial, blocks, covered_upper) =
-            partial_data_block(frame, ends, 16, &cmp, &upper).expect("partial block");
+        let (partial, covered_upper, payload) =
+            partial_data_block(frame, ends, 16, &cmp, &upper, None).expect("partial block");
+        let blocks = payload.decoded_blocks;
         assert!(
             blocks < nblocks,
             "near-start upper must skip trailing inner blocks: {blocks}/{nblocks}",
@@ -596,6 +746,56 @@ mod tests {
             got, reference,
             "partial range scan must equal the full range scan"
         );
+    }
+
+    /// `partial_data_block` fed a cached `PartialResume` must grow the covered
+    /// extent by RESUMING (decoding only the new tail blocks) and produce a block
+    /// whose wider range scan equals the full block's — proving the cache-resume
+    /// round-trip is correct end to end.
+    #[test]
+    fn partial_data_block_resume_grows_and_matches_full() {
+        use crate::SeqNo;
+        use crate::comparator::default_comparator;
+        use crate::table::block::{Block, BlockType, Header, ParsedItem};
+
+        let (frame, ends, block_bytes) = large_block_frame();
+        let cmp = default_comparator();
+        let full = DataBlock::new(Block {
+            data: Slice::from(block_bytes),
+            header: Header::test_dummy(BlockType::Data),
+        });
+
+        // First (cold) decode covering a near-start window; capture the resume.
+        let narrow = b"key-000000000050".to_vec();
+        let (_b0, _c0, payload) =
+            partial_data_block(frame.clone(), ends.clone(), 16, &cmp, &narrow, None)
+                .expect("cold partial");
+        let narrow_blocks = payload.decoded_blocks;
+
+        // Resume-grow to a much wider window; must decode strictly more blocks.
+        let lower = b"key-000000000010".to_vec();
+        let wide = b"key-000000005000".to_vec();
+        let (partial, _covered, payload2) =
+            partial_data_block(frame, ends, 16, &cmp, &wide, Some(payload)).expect("resume grow");
+        assert!(
+            payload2.decoded_blocks > narrow_blocks,
+            "resume must extend the decoded extent: {} -> {}",
+            narrow_blocks,
+            payload2.decoded_blocks,
+        );
+
+        // The grown block's range scan must equal the full block's.
+        let mut fi = full.iter(cmp.clone());
+        fi.seek(&lower, SeqNo::MAX);
+        fi.seek_upper_exclusive(&wide, SeqNo::MAX);
+        let reference: Vec<InternalValue> = fi.map(|x| x.materialize(full.as_slice())).collect();
+
+        let mut pi = partial.iter(cmp.clone());
+        pi.seek(&lower, SeqNo::MAX);
+        pi.seek_upper_exclusive(&wide, SeqNo::MAX);
+        let got: Vec<InternalValue> = pi.map(|x| x.materialize(partial.as_slice())).collect();
+
+        assert_eq!(got, reference, "resume-grown range scan must equal full");
     }
 
     /// Synthesizing over a prefix that ends mid-entry (inner-block boundaries

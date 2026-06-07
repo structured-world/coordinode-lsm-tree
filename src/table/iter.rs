@@ -25,19 +25,16 @@ use crate::metrics::Metrics;
 
 type InnerIter<'a> = DataBlockIter<'a>;
 
-/// Whether the range-query partial-decode path is engaged (opt-in, OFF by
+/// Whether the cold-block partial-tier read path is engaged (opt-in, OFF by
 /// default). Set `LSM_PARTIAL_DECODE` to `1` / `on` / `true` / `yes` to enable.
 ///
-/// The path is currently a perf regression for forward range scans: decoding
-/// inner zstd block `N` drains the match window, so growing the covered extent
-/// must re-decode `[0, N)` from scratch each step. A multi-read sweep of one
-/// large cold block therefore cascades into re-decoding the whole block, which
-/// full decode + block cache does in a single pass. It flips to a win once a
-/// resumable (non-draining, window-priming) decoder lands upstream
-/// (structured-zstd#368): then a grown extent decodes only the new tail blocks,
-/// and this gate defaults ON. All machinery (block layout, lazy block, partial
-/// cache) is in place so that switch is a one-line change plus the resumable
-/// `ensure_decoded_to`.
+/// On a large cold zstd block, a bounded range decodes only the inner blocks up
+/// to its upper bound and keeps just that decompressed prefix resident; growing
+/// the extent RESUMES from a cached entropy/window snapshot (decoding only the
+/// new tail blocks) rather than re-decompressing from block 0. Repeatedly read
+/// or mostly-decoded blocks promote to a full resident block. Off by default
+/// while the path is being validated against full decode + block cache; flip the
+/// env to compare.
 // no-std: feature-gate behind `std`; a no-std build has no env, default OFF.
 #[cfg(feature = "zstd")]
 fn partial_decode_enabled() -> bool {
@@ -49,6 +46,13 @@ fn partial_decode_enabled() -> bool {
             .is_some_and(|v| matches!(v.trim(), "1" | "on" | "true" | "yes"))
     })
 }
+
+/// Minimum decompressed block size for the partial tier to engage. Below this a
+/// block decodes fully: the decode it would save is cheap relative to the
+/// per-call setup (decoder reset, window prime, trailer synthesis), so partial
+/// would cost more than it saves. Only genuinely large cold blocks qualify.
+#[cfg(feature = "zstd")]
+const PARTIAL_MIN_BLOCK_BYTES: usize = 256 * 1024;
 
 /// Promote a partially-decoded cold block to a full resident block once it has
 /// been served this many times: a repeatedly-read block earns its full memory.
@@ -305,6 +309,13 @@ impl Iter {
         if self.cache.has_block(self.table_id, offset) {
             return Ok(None);
         }
+        // Cold-block gate: only engage on genuinely large blocks (the cold tier
+        // runs multi-MB blocks) where decoding a fraction saves far more than the
+        // per-call setup. The total decompressed size is the last cumulative end.
+        let total_bytes = ends.last().copied().unwrap_or(0) as usize;
+        if total_bytes < PARTIAL_MIN_BLOCK_BYTES {
+            return Ok(None);
+        }
         #[expect(
             clippy::cast_possible_truncation,
             reason = "inner-block count is bounded well within u32"
@@ -314,37 +325,43 @@ impl Iter {
 
         // Existing partial entry: serve from it (bumping hits) when it already
         // covers the query, else decide whether to grow it or promote. The fall-
-        // through value is the hit count carried into the grown entry.
-        let carried_hits = match self.cache.peek_partial_block(self.table_id, offset) {
-            Some(entry) => {
-                let covered = self.comparator.compare(&entry.covered_upper, upper)
-                    != std::cmp::Ordering::Less;
-                if covered {
-                    let hits = entry.hits + 1;
-                    if hits >= PARTIAL_PROMOTE_HITS {
-                        // Hot enough: promote to a full resident block.
+        // through carries the hit count + the resume payload to continue from.
+        let (carried_hits, carried_resume) =
+            match self.cache.peek_partial_block(self.table_id, offset) {
+                Some(entry) => {
+                    let covered = self.comparator.compare(&entry.covered_upper, upper)
+                        != std::cmp::Ordering::Less;
+                    if covered {
+                        let hits = entry.hits + 1;
+                        if hits >= PARTIAL_PROMOTE_HITS {
+                            // Hot enough: promote to a full resident block.
+                            self.cache.evict_partial_block(self.table_id, offset);
+                            return Ok(None);
+                        }
+                        // Synthesize the served block from the cached decompressed
+                        // prefix (only the touched fraction is held in memory).
+                        let block = crate::table::lazy_block::synthesize_data_block(
+                            &entry.resume.window_prime,
+                            self.data_block_restart_interval,
+                        )?;
+                        self.cache.insert_partial_block(
+                            self.table_id,
+                            offset,
+                            crate::cache::PartialBlockEntry { hits, ..entry },
+                        );
+                        return Ok(Some(block));
+                    }
+                    // Coverage miss → grow the extent by resuming from the snapshot.
+                    // If most of the block is already decoded, a full decode + block
+                    // cache beats holding a near-complete partial, so promote.
+                    if promote_by_fraction(entry.resume.decoded_blocks, total_blocks) {
                         self.cache.evict_partial_block(self.table_id, offset);
                         return Ok(None);
                     }
-                    let block = entry.block.clone();
-                    self.cache.insert_partial_block(
-                        self.table_id,
-                        offset,
-                        crate::cache::PartialBlockEntry { hits, ..entry },
-                    );
-                    return Ok(Some(DataBlock::new(block)));
+                    (entry.hits, Some(entry.resume))
                 }
-                // Coverage miss → would grow the extent. If most of the block is
-                // already decoded, a full decode is cheaper than re-growing (the
-                // grow re-decodes from inner block 0 without a resumable decoder).
-                if promote_by_fraction(entry.covered_blocks, total_blocks) {
-                    self.cache.evict_partial_block(self.table_id, offset);
-                    return Ok(None);
-                }
-                entry.hits
-            }
-            None => 0,
-        };
+                None => (0, None),
+            };
 
         let (fd, _cache_event) = self
             .file_accessor
@@ -364,29 +381,31 @@ impl Iter {
             BlockHandle::new(handle.offset(), handle.size()),
             &transform,
         )?;
-        let (block, blocks, covered_upper) = crate::table::lazy_block::partial_data_block(
+        // Cold first touch (carried_resume None) or resume-grow from the cached
+        // snapshot — either way only the new tail blocks are decompressed.
+        let (block, covered_upper, payload) = crate::table::lazy_block::partial_data_block(
             frame.to_vec(),
             ends,
             self.data_block_restart_interval,
             &self.comparator,
             upper,
+            carried_resume,
         )?;
-        // Covering this query already decoded most of the block → promote: throw
-        // the partial away and let the caller cache the whole block.
-        if promote_by_fraction(blocks, total_blocks) {
+        // Covering this query decoded most of the block → promote: drop the
+        // partial and let the caller cache the whole block.
+        if promote_by_fraction(payload.decoded_blocks, total_blocks) {
             self.cache.evict_partial_block(self.table_id, offset);
             return Ok(None);
         }
-        // Cache the synthesized block tagged with the extent it covers + carried
-        // access stats, so the next read reuses or grows it (high-water growth).
+        // Cache the resume payload tagged with the extent it covers + carried
+        // access stats, so the next read serves or resume-grows it.
         if let Some(covered) = covered_upper {
             self.cache.insert_partial_block(
                 self.table_id,
                 offset,
                 crate::cache::PartialBlockEntry {
-                    block: block.inner.clone(),
+                    resume: payload,
                     covered_upper: covered,
-                    covered_blocks: blocks,
                     total_blocks,
                     hits: carried_hits,
                 },
