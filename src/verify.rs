@@ -485,21 +485,25 @@ pub fn verify_block_checksums(tree: &impl crate::AbstractTree) -> BlockVerifyRep
         report.sst_files_scanned += 1;
 
         // Tables whose ECC descriptor decodes to a scheme this build can't
-        // apply can't be ECC-walked: the parity trailer length isn't derivable
-        // from a scheme, so the sequential walk would mis-align. The per-block
-        // read path still serves their data (framed by data_length, checksum
-        // verified), so this is a warning + skip, not an error.
-        if table.metadata.ecc_unrecognized {
+        // apply can't have their SST-block parity trailers sized (the length
+        // isn't derivable without the scheme), so those sections are skipped
+        // with a warning rather than mis-walked. The walk still covers the
+        // self-describing `meta` / `meta_mid` sections (which size parity from
+        // their own `block_flags`), so corruption there is NOT downgraded. The
+        // per-block read path still serves the data (framed by data_length,
+        // checksum-verified), hence a warning, not an error.
+        let ecc_unrecognized = table.metadata.ecc_unrecognized;
+        if ecc_unrecognized {
             log::warn!(
-                "table {table_id} at {}: unrecognized ECC scheme — skipping \
-                 ECC block-walk; recompact to re-stamp with a supported scheme",
+                "table {table_id} at {}: unrecognized ECC scheme — skipping the \
+                 ECC-dependent block sections; recompact to re-stamp with a \
+                 supported scheme",
                 path.display(),
             );
             report.warnings.push(BlockVerifyWarning::UnrecognizedEcc {
                 table_id,
                 path: path.to_path_buf(),
             });
-            continue;
         }
 
         // Use each Table's own `Fs` handle (StdFs, MemFs, IoUring, …).
@@ -515,6 +519,7 @@ pub fn verify_block_checksums(tree: &impl crate::AbstractTree) -> BlockVerifyRep
             table_id,
             max_enc_overhead,
             table.metadata.ecc_params,
+            ecc_unrecognized,
         ) {
             Ok(per_file) => {
                 report.blocks_scanned += per_file.blocks_scanned;
@@ -610,23 +615,27 @@ pub fn verify_sst_file(path: &std::path::Path) -> BlockVerifyReport {
     // walking an ECC-bearing SST without skipping parity trailers mis-aligns
     // the scan and reports spurious corruption. Surface the indeterminacy and
     // skip the walk.
+    let mut ecc_unrecognized = false;
     let ecc = match read_ecc_params_out_of_band(&fs, path) {
         Ok(Some(ScrubEcc::Off)) => None,
         Ok(Some(ScrubEcc::Scheme(params))) => Some(params),
         // The descriptor decodes to a scheme this build can't apply: the
-        // trailer length isn't derivable, so an ECC-walk would mis-align.
-        // Data still loads via the per-block read path; warn + skip the walk.
+        // SST-block trailer length isn't derivable, so those sections are
+        // skipped during the walk. The self-describing `meta` / `meta_mid`
+        // sections still size parity from `block_flags`, so corruption there
+        // is NOT downgraded. Warn + continue (don't drop the whole scrub).
         Ok(Some(ScrubEcc::Unrecognized)) => {
             log::warn!(
-                "{}: unrecognized ECC scheme — skipping ECC block-walk; \
-                 recompact to re-stamp with a supported scheme",
+                "{}: unrecognized ECC scheme — skipping the ECC-dependent block \
+                 sections; recompact to re-stamp with a supported scheme",
                 path.display(),
             );
             report.warnings.push(BlockVerifyWarning::UnrecognizedEcc {
                 table_id: 0,
                 path: path.to_path_buf(),
             });
-            return report;
+            ecc_unrecognized = true;
+            None
         }
         // File + trailer readable, but neither meta block decodes (corrupt
         // meta, or an encrypted SST with no key out-of-band). The ECC scheme is
@@ -657,7 +666,7 @@ pub fn verify_sst_file(path: &std::path::Path) -> BlockVerifyReport {
         }
     };
 
-    match scan_sst_blocks(&fs, path, 0, 0, ecc) {
+    match scan_sst_blocks(&fs, path, 0, 0, ecc, ecc_unrecognized) {
         Ok(per_file) => {
             report.blocks_scanned = per_file.blocks_scanned;
             report.errors = per_file.errors;
@@ -756,6 +765,7 @@ fn scan_sst_blocks(
     table_id: TableId,
     max_enc_overhead: u32,
     ecc: Option<crate::table::block::EccParams>,
+    ecc_unrecognized: bool,
 ) -> std::io::Result<PerFileScan> {
     use std::io::{BufReader, Seek, SeekFrom};
 
@@ -870,6 +880,7 @@ fn scan_sst_blocks(
             errors: &mut errors,
             max_data_length: block_data_length_cap(max_enc_overhead),
             ecc,
+            ecc_unrecognized,
         };
         walk_block_region(&mut ctx, start, end);
     }
@@ -947,6 +958,12 @@ struct WalkCtx<'a> {
     /// self-describe parity via their `ECC_PARITY` bit, sized with the fixed
     /// RS(4,2) layout the writer uses for them, regardless of this field.
     ecc: Option<crate::table::block::EccParams>,
+    /// `true` when the table's ECC descriptor decodes to a scheme this build
+    /// can't apply. The trailer length of its SST blocks (`Data` / `Index` /
+    /// `Filter` / `RangeTombstone`) isn't derivable, so those sections are
+    /// skipped (the caller warns once). Self-describing sections (`meta` /
+    /// `meta_mid`) still size parity from `block_flags` and ARE walked.
+    ecc_unrecognized: bool,
 }
 
 fn walk_block_region(ctx: &mut WalkCtx<'_>, start_offset: u64, end_offset: u64) {
@@ -994,6 +1011,18 @@ fn walk_block_region(ctx: &mut WalkCtx<'_>, start_offset: u64, end_offset: u64) 
                 return;
             }
         };
+
+        // Unrecognized-ECC table: SST blocks (no `block_flags` byte) carry a
+        // parity trailer whose length we can't derive without the descriptor
+        // scheme, so this section can't be walked — stop here (the caller has
+        // already warned). Self-describing blocks (`block_flags` present) size
+        // parity from their `ECC_PARITY` bit, so those sections still walk.
+        // Checked before the scanned-count increment so skipped blocks aren't
+        // tallied. Sections are homogeneous in block type, so the first block
+        // decides the whole section.
+        if ctx.ecc_unrecognized && !Header::has_block_flags(header.block_type) {
+            return;
+        }
 
         // Count the block as "header-read" immediately on successful
         // decode — matches the BlockVerifyReport.blocks_scanned docs
@@ -1775,8 +1804,8 @@ mod block_verify_tests {
         }
 
         let table_id: TableId = 42;
-        let scan =
-            scan_sst_blocks(&fs, path, table_id, 0, None).expect("forged SFA must parse cleanly");
+        let scan = scan_sst_blocks(&fs, path, table_id, 0, None, false)
+            .expect("forged SFA must parse cleanly");
         assert_eq!(
             scan.errors.len(),
             1,

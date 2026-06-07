@@ -123,6 +123,48 @@ fn block_ecc_params(header: &Header, transform: &BlockTransform<'_>) -> EccParam
     }
 }
 
+/// Classifies the on-disk trailer (bytes after the `data_length` payload) into
+/// an [`EccStatus`], or `Err` on a framing violation.
+///
+/// The decision keys off whether the block carries a RECOGNIZED ECC layout
+/// (`has_recognized_ecc`, from [`block_has_parity`]), NOT off `ecc_length`:
+/// a recognized layout on an empty payload also has `ecc_length == 0`, and its
+/// trailer must still be exactly zero. So:
+/// - recognized layout → require `trailer == ecc_length` exactly (extra bytes
+///   are corruption), even when `ecc_length == 0`;
+/// - no recognized layout, `trailer == 0` → ECC off, clean;
+/// - no recognized layout, `trailer > 0` → an ECC trailer this build can't
+///   interpret: the payload is framed by `data_length` and verified by its
+///   checksum, so the read succeeds with [`EccStatus::Unrecognized`] (a WARN),
+///   but recovery is unavailable;
+/// - `actual_payload_plus_ecc < data_length` (payload doesn't fit) → corruption.
+fn classify_block_trailer(
+    has_recognized_ecc: bool,
+    actual_payload_plus_ecc: usize,
+    data_length: usize,
+    ecc_length: u32,
+    handle: &BlockHandle,
+) -> crate::Result<EccStatus> {
+    let trailer = actual_payload_plus_ecc
+        .checked_sub(data_length)
+        .ok_or(crate::Error::InvalidHeader("Block"))?;
+    if has_recognized_ecc {
+        if trailer != ecc_length as usize {
+            return Err(crate::Error::InvalidHeader("Block"));
+        }
+        Ok(EccStatus::Ok)
+    } else if trailer == 0 {
+        Ok(EccStatus::Ok)
+    } else {
+        log::warn!(
+            "block {handle:?} carries an unrecognized ECC trailer ({trailer} B); \
+             payload verified by checksum but recovery is unavailable — recompact \
+             to re-stamp with a supported scheme",
+        );
+        Ok(EccStatus::Unrecognized)
+    }
+}
+
 /// A block whose transform pipeline (compress → encrypt → checksum → ecc)
 /// has run, but whose framed bytes have not yet been written to the file.
 ///
@@ -866,13 +908,6 @@ impl Block {
 
     /// Reads a block from a file.
     ///
-    /// Pipeline: read → verify checksum → decrypt → decompress.
-    /// When `encryption` is `None`, the decrypt step is skipped.
-    // Same duplication rationale as from_reader — see comment there.
-    #[expect(
-        clippy::too_many_lines,
-        reason = "encrypt/no-encrypt branches duplicate compression match — see from_reader"
-    )]
     /// Reads a block from a file, discarding the ECC status (warnings are
     /// still logged). Convenience wrapper over [`Self::from_file_with_status`]
     /// for the many call sites that don't act on the status.
@@ -894,6 +929,14 @@ impl Block {
     /// trailer this build could not interpret ([`EccStatus::Unrecognized`] —
     /// the payload still verified by its checksum; recompaction re-stamps it
     /// with a supported scheme). A WARN is also logged in the latter case.
+    ///
+    /// Pipeline: read → verify checksum → decrypt → decompress. When
+    /// `encryption` is `None`, the decrypt step is skipped.
+    // Same duplication rationale as from_reader — see comment there.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "encrypt/no-encrypt branches duplicate compression match — see from_reader"
+    )]
     pub fn from_file_with_status(
         file: &dyn FsFile,
         handle: BlockHandle,
@@ -988,13 +1031,13 @@ impl Block {
             let parsed_header = Header::decode_from(&mut &buf[..])?;
             let header_len = Header::header_len(parsed_header.block_type);
 
-            // Parity-trailer length is derived from data_length + parity
-            // presence (`block_has_parity`: header bit for self-describing
-            // blocks, descriptor-via-transform for SST), not stored. The size
-            // check below then implicitly validates it: if the on-disk byte
-            // count doesn't equal header + data_length + derived-parity, the
-            // header is rejected.
-            let ecc_length = if block_has_parity(&parsed_header, transform) {
+            // Parity-trailer presence is keyed on a RECOGNIZED ECC layout
+            // (`block_has_parity`: header bit for self-describing blocks,
+            // descriptor-via-transform for SST), NOT on `ecc_length` (which is
+            // also 0 for a recognized scheme on an empty payload). The trailer
+            // length, when recognized, is derived from `data_length` + scheme.
+            let has_ecc = block_has_parity(&parsed_header, transform);
+            let ecc_length = if has_ecc {
                 expected_parity_len(
                     parsed_header.data_length,
                     block_ecc_params(&parsed_header, transform),
@@ -1005,31 +1048,13 @@ impl Block {
 
             let actual_payload_plus_ecc = block_size.saturating_sub(header_len);
             let actual_data_len = parsed_header.data_length as usize;
-            // Classify the trailer (bytes after the payload). `ecc_length` is
-            // non-zero only for a recognized scheme — then the trailer must
-            // match it exactly (a wrong length is corruption). With no
-            // recognized scheme, any extra bytes are an ECC trailer this build
-            // can't interpret: the payload is still framed by `data_length` and
-            // verified by its checksum, so it reads (WARN), but recovery is
-            // unavailable. A short read (payload doesn't fit) is corruption.
-            let trailer = actual_payload_plus_ecc
-                .checked_sub(actual_data_len)
-                .ok_or(crate::Error::InvalidHeader("Block"))?;
-            let ecc_status = if ecc_length != 0 {
-                if trailer != ecc_length as usize {
-                    return Err(crate::Error::InvalidHeader("Block"));
-                }
-                EccStatus::Ok
-            } else if trailer == 0 {
-                EccStatus::Ok
-            } else {
-                log::warn!(
-                    "block {handle:?} carries an unrecognized ECC trailer \
-                     ({trailer} B); payload verified by checksum but recovery is \
-                     unavailable — recompact to re-stamp with a supported scheme",
-                );
-                EccStatus::Unrecognized
-            };
+            let ecc_status = classify_block_trailer(
+                has_ecc,
+                actual_payload_plus_ecc,
+                actual_data_len,
+                ecc_length,
+                &handle,
+            )?;
 
             // Payload-length safety cap. Mirrors the `from_reader`
             // check (see `Block::from_reader` above): the on-disk
@@ -1173,12 +1198,11 @@ impl Block {
             let parsed_header = Header::decode_from(&mut &buf[..])?;
             let header_len = Header::header_len(parsed_header.block_type);
 
-            // Parity-trailer length is derived from data_length + parity
-            // presence (`block_has_parity`: header bit for self-describing
-            // blocks, descriptor-via-transform for SST), not stored. The size
-            // check below implicitly validates it (header + data_length +
-            // derived-parity must equal the buffer length).
-            let ecc_length = if block_has_parity(&parsed_header, transform) {
+            // Recognized-ECC presence keys on `block_has_parity`, not on
+            // `ecc_length` (which is also 0 for a recognized scheme on an empty
+            // payload). See the encrypted branch + `classify_block_trailer`.
+            let has_ecc = block_has_parity(&parsed_header, transform);
+            let ecc_length = if has_ecc {
                 expected_parity_len(
                     parsed_header.data_length,
                     block_ecc_params(&parsed_header, transform),
@@ -1189,28 +1213,13 @@ impl Block {
 
             let actual_payload_plus_ecc = buf.len().saturating_sub(header_len);
             let actual_data_len = parsed_header.data_length as usize;
-            // Trailer classification (see the encrypted branch above for the
-            // full rationale): recognized scheme → exact trailer length;
-            // no recognized scheme + extra bytes → unrecognized opaque trailer
-            // (WARN, framed by data_length, no recovery); short read → corrupt.
-            let trailer = actual_payload_plus_ecc
-                .checked_sub(actual_data_len)
-                .ok_or(crate::Error::InvalidHeader("Block"))?;
-            let ecc_status = if ecc_length != 0 {
-                if trailer != ecc_length as usize {
-                    return Err(crate::Error::InvalidHeader("Block"));
-                }
-                EccStatus::Ok
-            } else if trailer == 0 {
-                EccStatus::Ok
-            } else {
-                log::warn!(
-                    "block {handle:?} carries an unrecognized ECC trailer \
-                     ({trailer} B); payload verified by checksum but recovery is \
-                     unavailable — recompact to re-stamp with a supported scheme",
-                );
-                EccStatus::Unrecognized
-            };
+            let ecc_status = classify_block_trailer(
+                has_ecc,
+                actual_payload_plus_ecc,
+                actual_data_len,
+                ecc_length,
+                &handle,
+            )?;
 
             if parsed_header.uncompressed_length > MAX_DECOMPRESSION_SIZE {
                 return Err(crate::Error::DecompressedSizeTooLarge {
@@ -1429,7 +1438,13 @@ mod tests {
             header
         };
         let file = std::fs::File::open(&path)?;
-        let handle = crate::table::BlockHandle::new(BlockOffset(0), header.on_disk_size());
+        // Size the handle under the transform's actual scheme so the helper
+        // works for any ECC layout, not just RS(4,2). `on_disk_size()` hardcodes
+        // RS(4,2) and would mis-size a block written with a different scheme.
+        let handle = crate::table::BlockHandle::new(
+            BlockOffset(0),
+            header.on_disk_size_with(transform.ecc_params()),
+        );
         Ok(TempBlock { file, handle, dir })
     }
 
@@ -3168,10 +3183,13 @@ mod tests {
         /// with the matching scheme, it reports `EccStatus::Ok`.
         #[test]
         fn from_file_with_status_soft_warns_on_unrecognized_trailer() -> crate::Result<()> {
+            // A non-default scheme on purpose: the read path is descriptor-
+            // driven, never an implicit RS(4,2).
+            let scheme = EccParams::try_new(8, 2).expect("valid shards");
             let tmp = super::write_block_to_tempfile(
                 PAYLOAD,
                 BlockIdentity::for_test(0, 0, BlockType::Data),
-                &BlockTransform::PlainEcc(EccParams::RS_4_2),
+                &BlockTransform::PlainEcc(scheme),
             )?;
 
             // Reader recognizes the scheme → clean read.
@@ -3179,7 +3197,7 @@ mod tests {
                 &tmp.file,
                 tmp.handle,
                 BlockIdentity::for_test(0, 0, BlockType::Data),
-                &BlockTransform::PlainEcc(EccParams::RS_4_2),
+                &BlockTransform::PlainEcc(scheme),
             )?;
             assert_eq!(&*block.data, PAYLOAD);
             assert_eq!(status, EccStatus::Ok);
@@ -3198,6 +3216,50 @@ mod tests {
                 "payload reads despite unknown trailer"
             );
             assert_eq!(status, EccStatus::Unrecognized);
+            Ok(())
+        }
+
+        /// Regression: a RECOGNIZED ECC layout must require an exact trailer
+        /// length — including the empty-payload case where the parity length is
+        /// zero. Extra trailing bytes on such a block are corruption and must
+        /// FAIL, not be softened to `EccStatus::Unrecognized` (which keying the
+        /// decision off `ecc_length == 0` instead of "is the layout recognized"
+        /// would wrongly do).
+        #[test]
+        fn from_file_recognized_empty_block_rejects_extra_trailer() -> crate::Result<()> {
+            // Empty payload under a (non-default) recognized scheme →
+            // data_length 0, parity length 0, so the on-disk block is just the
+            // header (no trailer).
+            let scheme = EccParams::try_new(8, 2).expect("valid shards");
+            let tmp = super::write_block_to_tempfile(
+                b"",
+                BlockIdentity::for_test(0, 0, BlockType::Data),
+                &BlockTransform::PlainEcc(scheme),
+            )?;
+            let path = tmp.dir.path().join("block");
+            let base = tmp.handle.size();
+
+            // Append junk so the handle covers a 4-byte trailer that the
+            // recognized (zero-parity) layout does not expect.
+            let mut bytes = std::fs::read(&path)?;
+            bytes.extend_from_slice(&[0xAB, 0xCD, 0xEF, 0x01]);
+            std::fs::write(&path, &bytes)?;
+
+            let file = std::fs::File::open(&path)?;
+            let handle = crate::table::BlockHandle::new(crate::table::BlockOffset(0), base + 4);
+            // `.err()` drops the `Ok((Block, _))` payload (Block is not Debug)
+            // so the assert can format the error variant.
+            let err = Block::from_file_with_status(
+                &file,
+                handle,
+                BlockIdentity::for_test(0, 0, BlockType::Data),
+                &BlockTransform::PlainEcc(scheme),
+            )
+            .err();
+            assert!(
+                matches!(err, Some(crate::Error::InvalidHeader("Block"))),
+                "recognized zero-parity layout + extra trailer must fail, got {err:?}",
+            );
             Ok(())
         }
 

@@ -311,10 +311,13 @@ pub enum BlockTransform<'a> {
     /// `raw → checksum → ecc parity → disk`. Same as [`Self::Plain`]
     /// but emits a parity trailer after the on-disk payload under the
     /// shard scheme carried in its [`EccParams`] (data + parity shard
-    /// counts). The header's `ECC_PARITY` flag marks the trailer's
-    /// presence (its length is derived from `data_length` + the scheme),
-    /// so the reader can verify-and-recover up to `parity_shards` lost
-    /// shards without a separate sidecar.
+    /// counts). On the SST read path, decoded headers zero `block_flags`,
+    /// so trailer presence and sizing come from the per-SST descriptor
+    /// (`ParsedMeta::ecc_params`) via `Header::on_disk_size_with(ecc)` —
+    /// not a header flag; self-describing blocks (Meta / Manifest) keep
+    /// the `ECC_PARITY` flag and the fixed RS(4,2) layout. Either way the
+    /// reader verifies-and-recovers up to `parity_shards` lost shards
+    /// without a separate sidecar.
     #[cfg(feature = "page_ecc")]
     PlainEcc(EccParams),
 
@@ -657,7 +660,7 @@ mod tests {
 
         #[cfg(feature = "lz4")]
         {
-            let ctx = CompressionContext::new(CompressionType::Lz4).unwrap();
+            let ctx = CompressionContext::new(CompressionType::Lz4).expect("lz4 ctx");
             let t = BlockTransform::CompressedAndEncrypted(ctx, &enc).with_ecc(p);
             assert!(matches!(
                 t,

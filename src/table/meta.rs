@@ -65,20 +65,19 @@ pub struct ParsedMeta {
     /// of the whole table without inspecting any data block header.
     pub kv_checksum_algo: Option<ChecksumAlgorithm>,
 
-    /// Per-SST Page-ECC indicator: `true` when this table was written with
-    /// Page ECC enabled. Sourced from the `descriptor#page_ecc` meta byte.
+    /// `true` only when this table was written with a RECOGNIZED + applicable
+    /// Page ECC scheme (`page_ecc == ecc_params.is_some()`). Under the
+    /// three-state contract this is NOT a blanket "ECC present" flag: a table
+    /// whose descriptor decodes to an unsupported scheme has `page_ecc = false`
+    /// but [`Self::ecc_unrecognized`] `= true`.
     ///
-    /// Note this is "ECC enabled for the table", not "every block carries a
-    /// parity trailer": a block with an empty payload emits a zero-length
-    /// trailer (`expected_parity_len(0) == 0`) even under `page_ecc`.
-    ///
-    /// For SST block types (`Data` / `Index` / `Filter` / `RangeTombstone`)
-    /// this descriptor IS the parity-presence signal today: those blocks omit
-    /// the `block_flags` byte on disk, so there is no per-block `ECC_PARITY`
-    /// flag to read and the read path derives the trailer from this table-wide
-    /// flag + `expected_parity_len(data_length)`. The self-describing block
-    /// types (`Meta` / `Manifest` / `ManifestFooter`) keep the byte and still
-    /// carry a per-block `ECC_PARITY` flag.
+    /// Callers MUST size / verify parity trailers from [`Self::ecc_params`]
+    /// (the per-SST scheme), NOT from this boolean — for SST block types
+    /// (`Data` / `Index` / `Filter` / `RangeTombstone`) decoded headers zero
+    /// `block_flags`, so trailer sizing comes from `ecc_params` via
+    /// `Header::on_disk_size_with(ecc)`. Self-describing block types (`Meta` /
+    /// `Manifest` / `ManifestFooter`) keep the `block_flags` byte and still
+    /// carry a per-block `ECC_PARITY` flag (fixed RS(4,2) layout).
     pub page_ecc: bool,
 
     /// Per-SST Page-ECC shard scheme decoded from the
