@@ -573,7 +573,7 @@ impl CompressionProvider for ZstdProvider {
 }
 
 #[cfg(test)]
-#[expect(clippy::expect_used, reason = "test code")]
+#[expect(clippy::expect_used, clippy::indexing_slicing, reason = "test code")]
 mod tests {
     use super::*;
     use crate::compression::ZstdDictionary;

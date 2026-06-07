@@ -38,6 +38,12 @@ pub enum BlockType {
     /// mirrored at file offset 0 in a 4 KiB padded region for
     /// partial-write recovery.
     ManifestFooter,
+    /// Optional per-table index of inner zstd-block layouts: for each data
+    /// block that compressed into >= 2 inner zstd blocks, its file offset and
+    /// the cumulative decompressed END offsets of those inner blocks. Lets a
+    /// range query partial-decode only the inner blocks covering a key range.
+    /// Absent unless the table has at least one such multi-inner-block block.
+    BlockLayout,
 }
 
 // Wire tags are renumbered contiguously `0..=6` for V5. The previous
@@ -58,6 +64,7 @@ impl From<BlockType> for u8 {
             BlockType::RangeTombstone => 4,
             BlockType::Manifest => 5,
             BlockType::ManifestFooter => 6,
+            BlockType::BlockLayout => 7,
         }
     }
 }
@@ -74,6 +81,7 @@ impl TryFrom<u8> for BlockType {
             4 => Ok(Self::RangeTombstone),
             5 => Ok(Self::Manifest),
             6 => Ok(Self::ManifestFooter),
+            7 => Ok(Self::BlockLayout),
             _ => Err(crate::Error::InvalidTag(("BlockType", value))),
         }
     }
@@ -99,6 +107,7 @@ mod tests {
             (4, BlockType::RangeTombstone),
             (5, BlockType::Manifest),
             (6, BlockType::ManifestFooter),
+            (7, BlockType::BlockLayout),
         ] {
             assert_eq!(
                 u8::from(variant),
@@ -117,9 +126,9 @@ mod tests {
     fn block_type_rejects_unknown_wire_tag() {
         // Forward-incompatibility guard: a tag this build doesn't know
         // (newer writer, older reader) must surface as a typed error,
-        // not a silent coercion to a known variant. 7 is the first
+        // not a silent coercion to a known variant. 8 is the first
         // unused tag past the contiguous range.
-        assert!(BlockType::try_from(7).is_err());
+        assert!(BlockType::try_from(8).is_err());
         assert!(BlockType::try_from(255).is_err());
     }
 }

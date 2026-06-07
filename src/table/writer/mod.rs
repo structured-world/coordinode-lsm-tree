@@ -126,6 +126,15 @@ pub struct Writer {
     /// Range tombstones to be written as a separate block
     range_tombstones: Vec<RangeTombstone>,
 
+    /// Inner zstd-block layout per data block, accumulated in write order and
+    /// serialized into the optional `block_layout` SST section at finish. Only
+    /// data blocks that split into >= 2 inner zstd blocks contribute an entry
+    /// `(block_offset, cumulative_decompressed_ends)`; small single-inner-block
+    /// blocks (the default) contribute nothing, so the section is absent for a
+    /// table with no large multi-inner-block data blocks. Powers range-query
+    /// partial decode.
+    block_layouts: Vec<(BlockOffset, Vec<u32>)>,
+
     initial_level: u8,
 
     /// Block encryption provider (if encryption at rest is enabled)
@@ -250,6 +259,8 @@ impl Writer {
             index_writer: Box::new(FullIndexWriter::new()).use_table_id(table_id),
             filter_writer: Box::new(FullFilterWriter::new(BloomConstructionPolicy::default()))
                 .use_table_id(table_id),
+
+            block_layouts: Vec::new(),
 
             block_buffer: Vec::new(),
             file_writer: writer,
@@ -766,8 +777,23 @@ impl Writer {
             &mut self.block_buffer,
         )?;
 
-        let header = Block::write_into_with_flags(
-            &mut self.file_writer,
+        // Prepare then write in two steps (instead of `write_into_with_flags`)
+        // so the inner-block layout can be taken from the prepared block before
+        // `write_to` consumes it.
+        let transform = {
+            let t = crate::table::block::BlockTransform::from_parts(
+                self.data_block_compression,
+                self.encryption.as_deref(),
+                #[cfg(zstd_any)]
+                self.zstd_dictionary.as_deref(),
+            )?;
+            if let Some(ecc) = self.ecc {
+                t.with_ecc(ecc)
+            } else {
+                t
+            }
+        };
+        let mut prepared = Block::prepare_with_flags(
             &self.block_buffer,
             super::block::BlockIdentity {
                 tree_id: 0,
@@ -780,23 +806,20 @@ impl Writer {
             // Data blocks use the configured codec and may carry a zstd dict;
             // encryption is optional. page_ecc upgrades the transform to its
             // matching `*Ecc` variant when the tree was opened with page_ecc.
-            &{
-                let t = crate::table::block::BlockTransform::from_parts(
-                    self.data_block_compression,
-                    self.encryption.as_deref(),
-                    #[cfg(zstd_any)]
-                    self.zstd_dictionary.as_deref(),
-                )?;
-                if let Some(ecc) = self.ecc {
-                    t.with_ecc(ecc)
-                } else {
-                    t
-                }
-            },
+            &transform,
             kv_flags,
         )?;
+        let layout = std::mem::take(&mut prepared.layout);
+        let header = prepared.write_to(&mut self.file_writer)?;
 
-        self.register_written_block(header, last_key, last_seqno, seqno_bounds, item_count)?;
+        self.register_written_block(
+            header,
+            layout,
+            last_key,
+            last_seqno,
+            seqno_bounds,
+            item_count,
+        )?;
 
         // IMPORTANT: Clear chunk after everything else
         self.chunk.clear();
@@ -845,12 +868,21 @@ impl Writer {
     fn register_written_block(
         &mut self,
         header: crate::table::block::Header,
+        layout: Vec<u32>,
         last_key: UserKey,
         last_seqno: crate::SeqNo,
         seqno_bounds: Option<(u64, u64)>,
         item_count: usize,
     ) -> crate::Result<()> {
         self.meta.uncompressed_size += u64::from(header.uncompressed_length);
+
+        // Record the inner zstd-block layout keyed by this block's file offset
+        // (`meta.file_pos`, captured before the increment below). Only
+        // multi-inner-block data blocks carry a non-empty layout, so single
+        // (default 4 KiB) blocks add nothing.
+        if !layout.is_empty() {
+            self.block_layouts.push((self.meta.file_pos, layout));
+        }
         // Size the block-handle with the scheme this writer actually wrote
         // the parity under (NOT the fixed RS(4,2) `on_disk_size` assumes),
         // or the handle over-reads on a non-default scheme.
@@ -905,12 +937,14 @@ impl Writer {
         let Some(prepared) = self.parallel.as_mut().and_then(BlockCompressor::take_next) else {
             return Ok(());
         };
-        let prepared = prepared?;
+        let mut prepared = prepared?;
         let Some(meta) = self.pending_meta.pop_front() else {
             return Err(crate::Error::Io(std::io::Error::other(
                 "parallel block pipeline meta desync",
             )));
         };
+        // Take the inner-block layout before `write_to` consumes the block.
+        let layout = std::mem::take(&mut prepared.layout);
         let header = prepared.write_to(&mut self.file_writer)?;
         // Header is Copy; read the in-flight size before handing it off.
         self.parallel_pending_bytes = self
@@ -918,6 +952,7 @@ impl Writer {
             .saturating_sub(u64::from(header.uncompressed_length));
         self.register_written_block(
             header,
+            layout,
             meta.last_key,
             meta.last_seqno,
             meta.seqno_bounds,
@@ -1034,6 +1069,46 @@ impl Writer {
         // Write filter
         log::trace!("Finishing filter writer");
         let filter_block_count = self.filter_writer.finish(&mut self.file_writer)?;
+
+        // Write the optional inner-block layout section (only when at least one
+        // data block split into >= 2 inner zstd blocks). Absent otherwise, so
+        // default small-block tables gain no bytes.
+        if !self.block_layouts.is_empty() {
+            self.file_writer.start("block_layout")?;
+
+            self.block_buffer.clear();
+            crate::table::block_layout::encode_block_layouts(
+                &mut self.block_buffer,
+                &self.block_layouts,
+            );
+
+            Block::write_into(
+                &mut self.file_writer,
+                &self.block_buffer,
+                crate::table::block::BlockIdentity {
+                    tree_id: 0,
+                    table_id: self.table_id,
+                    block_offset: *self.meta.file_pos,
+                    block_type: crate::table::block::BlockType::BlockLayout,
+                    dict_id: 0,
+                    window_log: 0,
+                },
+                // Layout metadata is small and read on the cold-block path;
+                // store it uncompressed. Encryption / page_ecc still apply via
+                // the configured providers, matching the other meta sections.
+                &{
+                    let t = match self.encryption.as_deref() {
+                        Some(enc) => crate::table::block::BlockTransform::Encrypted(enc),
+                        None => crate::table::block::BlockTransform::PLAIN,
+                    };
+                    if let Some(ecc) = self.ecc {
+                        t.with_ecc(ecc)
+                    } else {
+                        t
+                    }
+                },
+            )?;
+        }
 
         // Write range tombstones block (if any)
         if !self.range_tombstones.is_empty() {

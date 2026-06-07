@@ -79,6 +79,10 @@ pub struct ParsedRegions {
     pub filter_tli: Option<BlockHandle>,
     pub filter: Option<BlockHandle>,
     pub range_tombstones: Option<BlockHandle>,
+    /// Optional inner zstd-block layout index (the `block_layout` section).
+    /// Present only when the table has at least one data block that compressed
+    /// into >= 2 inner zstd blocks; powers range-query partial decode.
+    pub block_layout: Option<BlockHandle>,
     pub linked_blob_files: Option<BlockHandle>,
     pub metadata: BlockHandle,
     /// Mid-file backup of the meta block. Writer order:
@@ -109,6 +113,7 @@ impl ParsedRegions {
             index: toc.section(b"index").map(toc_entry_to_handle),
             filter: toc.section(b"filter").map(toc_entry_to_handle),
             range_tombstones: toc.section(b"range_tombstones").map(toc_entry_to_handle),
+            block_layout: toc.section(b"block_layout").map(toc_entry_to_handle),
             linked_blob_files: toc.section(b"linked_blob_files").map(toc_entry_to_handle),
             metadata: toc
                 .section(b"meta")

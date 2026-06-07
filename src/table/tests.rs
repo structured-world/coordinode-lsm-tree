@@ -463,6 +463,94 @@ fn make_test_dictionary() -> crate::compression::ZstdDictionary {
     crate::compression::ZstdDictionary::new(&samples)
 }
 
+/// A table with large data blocks compressed at a high zstd level splits each
+/// block into several inner zstd blocks. The writer must persist their
+/// cumulative decompressed-end layout in the `block_layout` section, and the
+/// reader must reload it on open. A default small-block table must NOT carry
+/// the section. This is the write → persist → reload contract for range-query
+/// partial decode.
+#[cfg(feature = "zstd")]
+#[test]
+#[expect(clippy::unwrap_used)]
+fn block_layout_section_roundtrips_for_large_zstd_blocks() {
+    use crate::cache::Cache;
+    use crate::fs::StdFs;
+    #[cfg(feature = "metrics")]
+    use crate::metrics::Metrics;
+    use crate::table::Writer;
+
+    // 256 KiB blocks at L19 split into many inner zstd blocks (the cold-tier
+    // shape); ~600 KiB of sorted KV yields at least one full multi-inner-block
+    // data block.
+    let items: Vec<crate::InternalValue> = (0u64..20_000)
+        .map(|i| {
+            crate::InternalValue::from_components(
+                format!("key-{i:012}").into_bytes(),
+                format!("value-{i:08}-payload").into_bytes(),
+                1,
+                crate::ValueType::Value,
+            )
+        })
+        .collect();
+
+    let dir = tempdir().unwrap();
+    let file = dir.path().join("table");
+
+    let mut writer = Writer::new(file.clone(), 0, 0, Arc::new(StdFs))
+        .unwrap()
+        .use_data_block_size(256 * 1024)
+        .use_data_block_compression(crate::CompressionType::Zstd(19));
+    for item in &items {
+        writer.write(item.clone()).unwrap();
+    }
+    let (_, checksum) = writer.finish().unwrap().unwrap();
+
+    #[cfg(feature = "metrics")]
+    let metrics = Arc::new(Metrics::default());
+    let table = Table::recover(
+        file,
+        checksum,
+        0,
+        0,
+        Arc::new(Cache::with_capacity_bytes(4_000_000)),
+        Some(Arc::new(DescriptorTable::new(10))),
+        Arc::new(StdFs),
+        false,
+        false,
+        None,
+        None,
+        crate::comparator::default_comparator(),
+        #[cfg(feature = "metrics")]
+        metrics,
+    )
+    .unwrap();
+
+    assert!(
+        table.regions.block_layout.is_some(),
+        "large multi-inner-block table must carry a block_layout section",
+    );
+    assert!(
+        table.block_layout.len() >= 1,
+        "at least one data block must have a recorded inner-block layout",
+    );
+    // Every recorded entry must have strictly increasing cumulative ends whose
+    // last value is the block's uncompressed length (a non-trivial split).
+    for offset in table.block_layout.offsets() {
+        let ends = table
+            .block_layout
+            .ends_for(offset)
+            .expect("offsets() entries must resolve via ends_for");
+        assert!(
+            ends.len() >= 2,
+            "recorded block must have >= 2 inner blocks"
+        );
+        assert!(
+            ends.windows(2).all(|w| w[0] < w[1]),
+            "cumulative ends must be strictly increasing: {ends:?}",
+        );
+    }
+}
+
 #[test]
 #[expect(clippy::unwrap_used)]
 fn table_point_read() -> crate::Result<()> {

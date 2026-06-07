@@ -181,6 +181,13 @@ pub(crate) struct PreparedBlock<'a> {
     /// Reed-Solomon parity trailer, present only when page-ECC is active and
     /// the payload was non-empty. Always `None` without the `page_ecc` feature.
     parity: Option<Vec<u8>>,
+    /// Inner zstd-block layout of the compressed payload: cumulative
+    /// decompressed END offsets, one per inner block (the last equals the
+    /// uncompressed length). Empty unless this is a `Data` block compressed
+    /// into >= 2 inner zstd blocks; lets the reader partial-decode a key-range
+    /// subset instead of the whole block. See
+    /// [`CompressionProvider::compress_with_layout`](crate::compression::CompressionProvider::compress_with_layout).
+    pub(crate) layout: Vec<u32>,
 }
 
 impl PreparedBlock<'_> {
@@ -194,6 +201,7 @@ impl PreparedBlock<'_> {
             header: self.header,
             payload: Cow::Owned(self.payload.into_owned()),
             parity: self.parity,
+            layout: self.layout,
         }
     }
 
@@ -504,6 +512,13 @@ impl Block {
         #[cfg(any(feature = "lz4", zstd_any))]
         let mut compressed_buf: Option<Vec<u8>> = None;
 
+        // Inner zstd-block layout, captured only for Data blocks compressed with
+        // a non-dict zstd codec that split into >= 2 inner blocks (empty
+        // otherwise). Enables range-query partial decode of large cold blocks.
+        // `mut` is only exercised by the zstd Data arm below.
+        #[cfg_attr(not(zstd_any), allow(unused_mut))]
+        let mut layout: Vec<u32> = Vec::new();
+
         match compression {
             CompressionType::None => {}
 
@@ -514,7 +529,14 @@ impl Block {
 
             #[cfg(zstd_any)]
             CompressionType::Zstd(level) => {
-                compressed_buf = Some(crate::compression::ZstdBackend::compress(data, level)?);
+                if block_type == BlockType::Data {
+                    let (buf, lay) =
+                        crate::compression::ZstdBackend::compress_with_layout(data, level)?;
+                    compressed_buf = Some(buf);
+                    layout = lay;
+                } else {
+                    compressed_buf = Some(crate::compression::ZstdBackend::compress(data, level)?);
+                }
             }
 
             #[cfg(zstd_any)]
@@ -642,6 +664,7 @@ impl Block {
             header,
             payload,
             parity: parity_buf,
+            layout,
         })
     }
 
