@@ -401,66 +401,97 @@ pub fn ecc_descriptor_bytes(cfg: Option<(EccScheme, EccGranularity)>) -> [u8; EC
     }
 }
 
+/// Outcome of decoding a per-SST `descriptor#page_ecc` value.
+///
+/// The decoder is a faithful, lenient reader: it never hard-fails on a
+/// 4-byte value (only a wrong length is unparseable). Anything that is not
+/// canonical `Off` or a recognized scheme + granularity decodes to
+/// [`Self::Unrecognized`] rather than an error, so the read path can apply
+/// the three-state ECC contract: a recognized+applicable scheme is used
+/// for recovery; an unrecognized one is a "typing" warning (data still
+/// reads via its checksum, but ECC recovery is unavailable — recompaction
+/// re-stamps the block with a supported scheme).
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
+pub enum EccDescriptor {
+    /// `kind == 0` with canonical all-zero reserved bytes: ECC is off.
+    Off,
+
+    /// A recognized scheme + granularity pair. Round-trips through
+    /// [`ecc_descriptor_bytes`]. Whether it is *applicable* (i.e. the
+    /// read path can size + recover its trailer) is decided downstream:
+    /// [`EccScheme::Secded`] and [`EccGranularity::Page`] are recognized
+    /// here but not yet applicable.
+    Recognized(EccScheme, EccGranularity),
+
+    /// A 4-byte value that is neither canonical `Off` nor a recognized
+    /// scheme: unknown `kind`, unknown granularity byte, non-canonical
+    /// reserved bytes, a zero shard count, or a non-canonical shard layout
+    /// (e.g. `Xor` whose parity byte is not `1`, `ReedSolomon` with fewer
+    /// than two parity shards). The read path treats this as ECC present
+    /// but unusable — a warning, not a read failure.
+    Unrecognized,
+}
+
 /// Decodes a per-SST ECC descriptor value written by
 /// [`ecc_descriptor_bytes`].
 ///
-/// Returns `Ok(None)` when ECC is off (`kind == 0`), else the
-/// `(scheme, granularity)` pair.
-///
 /// # Errors
 ///
-/// Returns [`crate::Error::InvalidTrailer`] when the value is the wrong
-/// length, carries an unknown `kind` / `granularity`, or encodes a
-/// shard-based scheme with a zero shard count (which would be a
-/// non-recoverable layout).
-pub fn ecc_descriptor_from_bytes(
-    bytes: &[u8],
-) -> crate::Result<Option<(EccScheme, EccGranularity)>> {
+/// Returns [`crate::Error::InvalidTrailer`] only when the value is not
+/// exactly [`ECC_DESCRIPTOR_LEN`] bytes (it is not a descriptor at all).
+/// Any 4-byte value decodes to an [`EccDescriptor`] (possibly
+/// [`EccDescriptor::Unrecognized`]); see that type for the three-state
+/// contract.
+pub fn ecc_descriptor_from_bytes(bytes: &[u8]) -> crate::Result<EccDescriptor> {
     let [kind, data_shards, parity_shards, gran_byte] =
         *<&[u8; ECC_DESCRIPTOR_LEN]>::try_from(bytes).map_err(|_| crate::Error::InvalidTrailer)?;
     if kind == 0 {
         // `Off` carries no scheme: the remaining three bytes are
-        // reserved-zero. A non-zero reserved byte means a corrupted /
-        // forged descriptor — fail closed rather than silently reading the
-        // SST as "ECC off" and parsing parity-bearing bytes as plain.
+        // reserved-zero. A non-zero reserved byte is a non-canonical /
+        // corrupted descriptor — surface it as `Unrecognized` (a warning at
+        // the read layer) rather than silently treating the SST as "ECC off".
         if data_shards != 0 || parity_shards != 0 || gran_byte != 0 {
-            return Err(crate::Error::InvalidTrailer);
+            return Ok(EccDescriptor::Unrecognized);
         }
-        return Ok(None);
+        return Ok(EccDescriptor::Off);
     }
     let granularity = match gran_byte {
         0 => EccGranularity::Block,
         1 => EccGranularity::Page,
-        _ => return Err(crate::Error::InvalidTrailer),
+        _ => return Ok(EccDescriptor::Unrecognized),
     };
     let scheme = match kind {
         1 => {
             // `Secded` is per-word Hamming with no shard layout: its shard
-            // bytes are reserved-zero. Reject non-zero reserved bytes so a
-            // tampered descriptor can't masquerade as a valid Secded SST.
+            // bytes are reserved-zero. Non-zero reserved bytes are
+            // non-canonical → `Unrecognized`.
             if data_shards != 0 || parity_shards != 0 {
-                return Err(crate::Error::InvalidTrailer);
+                return Ok(EccDescriptor::Unrecognized);
             }
             EccScheme::Secded
         }
         2 => {
-            if data_shards == 0 {
-                return Err(crate::Error::InvalidTrailer);
+            // Canonical `Xor` has exactly one parity shard (the descriptor
+            // writer always emits parity byte `1`).
+            if data_shards == 0 || parity_shards != 1 {
+                return Ok(EccDescriptor::Unrecognized);
             }
             EccScheme::Xor { data_shards }
         }
         3 => {
-            if data_shards == 0 || parity_shards == 0 {
-                return Err(crate::Error::InvalidTrailer);
+            // Canonical `ReedSolomon` has at least two parity shards; a
+            // single parity shard is expressed as `Xor`.
+            if data_shards == 0 || parity_shards < 2 {
+                return Ok(EccDescriptor::Unrecognized);
             }
             EccScheme::ReedSolomon {
                 data_shards,
                 parity_shards,
             }
         }
-        _ => return Err(crate::Error::InvalidTrailer),
+        _ => return Ok(EccDescriptor::Unrecognized),
     };
-    Ok(Some((scheme, granularity)))
+    Ok(EccDescriptor::Recognized(scheme, granularity))
 }
 
 /// Bitmask over LSM levels for [`KvChecksumPolicy::PerLevel`].
@@ -842,13 +873,14 @@ mod tests {
 
     #[test]
     fn ecc_descriptor_roundtrips_off_and_every_scheme() {
-        // The per-SST descriptor must round-trip "off" and each scheme +
-        // granularity so the read path recovers the exact parity layout.
-        // No legacy/implicit scheme: off is the only kind==0 encoding.
+        // The per-SST descriptor codec is a faithful round-trip serializer:
+        // "off" and every recognized scheme + granularity decode back to the
+        // exact value written. (Whether a recognized scheme is *applicable*
+        // for recovery is decided at the read layer, not here.)
         assert_eq!(ecc_descriptor_bytes(None), [0, 0, 0, 0]);
         assert_eq!(
             ecc_descriptor_from_bytes(&[0, 0, 0, 0]).expect("decode"),
-            None,
+            EccDescriptor::Off,
         );
         let cases = [
             (EccScheme::Secded, EccGranularity::Block),
@@ -866,45 +898,51 @@ mod tests {
             let bytes = ecc_descriptor_bytes(Some((scheme, gran)));
             assert_eq!(
                 ecc_descriptor_from_bytes(&bytes).expect("decode"),
-                Some((scheme, gran)),
+                EccDescriptor::Recognized(scheme, gran),
                 "roundtrip {scheme:?}/{gran:?}",
             );
         }
     }
 
     #[test]
-    fn ecc_descriptor_rejects_malformed() {
-        // Wrong length, unknown kind, unknown granularity, and zero shard
-        // counts for shard-based schemes are all rejected, not silently
-        // coerced (a zero shard count is a non-recoverable layout).
+    fn ecc_descriptor_wrong_length_is_error() {
+        // The only hard error: a value that is not a 4-byte descriptor at
+        // all. Any 4-byte value decodes (possibly to `Unrecognized`).
         assert!(ecc_descriptor_from_bytes(&[0, 0, 0]).is_err()); // too short
-        assert!(ecc_descriptor_from_bytes(&[9, 0, 0, 0]).is_err()); // unknown kind
-        assert!(ecc_descriptor_from_bytes(&[1, 0, 0, 7]).is_err()); // unknown granularity
-        assert!(ecc_descriptor_from_bytes(&[2, 0, 1, 0]).is_err()); // Xor data_shards=0
-        assert!(ecc_descriptor_from_bytes(&[3, 8, 0, 0]).is_err()); // RS parity_shards=0
+        assert!(ecc_descriptor_from_bytes(&[0, 0, 0, 0, 0]).is_err()); // too long
     }
 
     #[test]
-    fn ecc_descriptor_rejects_noncanonical_off_and_secded() {
-        // `Off` (kind 0) and `Secded` (kind 1) carry no shard layout, so the
-        // shard/granularity bytes are reserved-zero. A corrupted descriptor
-        // that sets them must surface `InvalidTrailer` rather than being
-        // silently coerced to "ECC off" / "Secded" — otherwise the SST read
-        // path would pick the wrong block framing / recovery layout from a
-        // tampered trailer instead of failing closed.
-        // Off with non-zero reserved bytes:
-        assert!(ecc_descriptor_from_bytes(&[0, 8, 2, 1]).is_err());
-        assert!(ecc_descriptor_from_bytes(&[0, 1, 0, 0]).is_err());
-        assert!(ecc_descriptor_from_bytes(&[0, 0, 1, 0]).is_err());
-        assert!(ecc_descriptor_from_bytes(&[0, 0, 0, 1]).is_err());
-        // Secded with non-zero reserved shard bytes:
-        assert!(ecc_descriptor_from_bytes(&[1, 8, 2, 0]).is_err());
-        assert!(ecc_descriptor_from_bytes(&[1, 1, 0, 0]).is_err());
-        // Canonical encodings still decode:
-        assert_eq!(ecc_descriptor_from_bytes(&[0, 0, 0, 0]).expect("off"), None);
+    fn ecc_descriptor_unparseable_layouts_decode_as_unrecognized() {
+        // Unknown kind / granularity, non-canonical reserved bytes, and
+        // non-canonical shard layouts are NOT hard errors: they decode to
+        // `Unrecognized` so the read path can warn (and recommend
+        // recompaction) instead of failing the read.
+        for bytes in [
+            [9, 0, 0, 0], // unknown kind
+            [1, 0, 0, 7], // unknown granularity
+            [2, 0, 1, 0], // Xor data_shards = 0
+            [2, 8, 2, 0], // Xor parity byte != 1 (non-canonical)
+            [3, 8, 0, 0], // RS parity_shards = 0
+            [3, 8, 1, 0], // RS parity_shards = 1 (should be Xor)
+            [0, 8, 2, 1], // Off with non-canonical reserved bytes
+            [0, 0, 0, 1],
+            [1, 8, 2, 0], // Secded with non-canonical reserved shard bytes
+        ] {
+            assert_eq!(
+                ecc_descriptor_from_bytes(&bytes).expect("4 bytes always decode"),
+                EccDescriptor::Unrecognized,
+                "{bytes:?} must decode as Unrecognized",
+            );
+        }
+        // Canonical encodings still decode to their recognized form.
+        assert_eq!(
+            ecc_descriptor_from_bytes(&[0, 0, 0, 0]).expect("off"),
+            EccDescriptor::Off,
+        );
         assert_eq!(
             ecc_descriptor_from_bytes(&[1, 0, 0, 0]).expect("secded"),
-            Some((EccScheme::Secded, EccGranularity::Block)),
+            EccDescriptor::Recognized(EccScheme::Secded, EccGranularity::Block),
         );
     }
 

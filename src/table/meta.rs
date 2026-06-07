@@ -338,27 +338,27 @@ impl ParsedMeta {
             let v = block
                 .point_read(b"descriptor#page_ecc", SeqNo::MAX, &cmp)?
                 .ok_or(crate::Error::InvalidHeader("TableMeta"))?;
-            let cfg = crate::runtime_config::ecc_descriptor_from_bytes(&v.value)?;
-            // Only whole-block granularity is wired today. A descriptor that
-            // records page-granular ECC must fail closed rather than be read
-            // with the wrong (block) parity layout.
-            let params = cfg
-                .map(|(scheme, gran)| match gran {
-                    crate::runtime_config::EccGranularity::Block => Ok(scheme),
-                    crate::runtime_config::EccGranularity::Page => {
-                        Err(crate::Error::InvalidTrailer)
-                    }
-                })
-                .transpose()?
-                .and_then(crate::runtime_config::EccScheme::shard_params)
-                .map(|(d, p)| {
-                    #[expect(
-                        clippy::cast_possible_truncation,
-                        reason = "shard counts originate as u8 in the descriptor"
-                    )]
-                    crate::table::block::EccParams::try_new(d as u8, p as u8)
-                })
-                .transpose()?;
+            use crate::runtime_config::{EccDescriptor, EccGranularity};
+            let params = match crate::runtime_config::ecc_descriptor_from_bytes(&v.value)? {
+                EccDescriptor::Off => None,
+                EccDescriptor::Recognized(scheme, EccGranularity::Block) => scheme
+                    .shard_params()
+                    .map(|(d, p)| {
+                        #[expect(
+                            clippy::cast_possible_truncation,
+                            reason = "shard counts originate as u8 in the descriptor"
+                        )]
+                        crate::table::block::EccParams::try_new(d as u8, p as u8)
+                    })
+                    .transpose()?,
+                // Page granularity and any unrecognized descriptor are rejected
+                // here today; the three-state soft-fail (warn + recompaction
+                // hint) lands in a follow-up step.
+                EccDescriptor::Recognized(_, EccGranularity::Page)
+                | EccDescriptor::Unrecognized => {
+                    return Err(crate::Error::InvalidTrailer);
+                }
+            };
             (params.is_some(), params)
         };
 
