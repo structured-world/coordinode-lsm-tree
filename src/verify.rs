@@ -464,7 +464,7 @@ pub fn verify_block_checksums(tree: &impl crate::AbstractTree) -> BlockVerifyRep
             path,
             table_id,
             max_enc_overhead,
-            table.metadata.page_ecc,
+            table.metadata.ecc_params,
         ) {
             Ok(per_file) => {
                 report.blocks_scanned += per_file.blocks_scanned;
@@ -553,16 +553,17 @@ pub fn verify_sst_file(path: &std::path::Path) -> BlockVerifyReport {
         ..BlockVerifyReport::default()
     };
 
-    // SST blocks omit the block_flags byte, so the parity-trailer presence the
-    // walk must skip is the per-SST `page_ecc` flag — read it from the meta
-    // descriptor. If it can't be determined (corrupt meta, or an encrypted SST
-    // with no key out-of-band), DO NOT assume disabled: walking an ECC-bearing
-    // SST without skipping parity trailers mis-aligns the scan and reports
-    // spurious corruption. Surface the indeterminacy and skip the walk.
-    let page_ecc = match read_page_ecc_out_of_band(&fs, path) {
+    // SST blocks omit the block_flags byte, so the parity-trailer presence and
+    // shard layout the walk must skip come from the per-SST ECC descriptor —
+    // read it from the meta block. If it can't be determined (corrupt meta, or
+    // an encrypted SST with no key out-of-band), DO NOT assume disabled:
+    // walking an ECC-bearing SST without skipping parity trailers mis-aligns
+    // the scan and reports spurious corruption. Surface the indeterminacy and
+    // skip the walk.
+    let ecc = match read_ecc_params_out_of_band(&fs, path) {
         Ok(Some(ecc)) => ecc,
         // File + trailer readable, but neither meta block decodes (corrupt
-        // meta, or an encrypted SST with no key out-of-band). page_ecc is
+        // meta, or an encrypted SST with no key out-of-band). The ECC scheme is
         // undeterminable; skip the walk rather than mis-walk an ECC-bearing SST.
         Ok(None) => {
             report.errors.push(BlockVerifyError::SstFileUnreadable {
@@ -570,7 +571,7 @@ pub fn verify_sst_file(path: &std::path::Path) -> BlockVerifyReport {
                 path: path.to_path_buf(),
                 error: std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
-                    "could not decode the SST meta block to determine page_ecc \
+                    "could not decode the SST meta block to determine the ECC scheme \
                      (corrupt meta, or an encrypted SST with no key out-of-band); \
                      skipping the block walk — use verify_block_checksums on a live \
                      tree for ECC-aware verification",
@@ -590,7 +591,7 @@ pub fn verify_sst_file(path: &std::path::Path) -> BlockVerifyReport {
         }
     };
 
-    match scan_sst_blocks(&fs, path, 0, 0, page_ecc) {
+    match scan_sst_blocks(&fs, path, 0, 0, ecc) {
         Ok(per_file) => {
             report.blocks_scanned = per_file.blocks_scanned;
             report.errors = per_file.errors;
@@ -607,28 +608,29 @@ pub fn verify_sst_file(path: &std::path::Path) -> BlockVerifyReport {
     report
 }
 
-/// Best-effort read of the per-SST `page_ecc` flag from an SST file's meta
+/// Best-effort read of the per-SST ECC scheme from an SST file's meta
 /// descriptor, for the out-of-band scrub (no live `Table` to consult).
 ///
-/// Returns `Ok(Some(page_ecc))` when a meta block decodes. The authoritative
-/// tail `meta` section is tried first; if its block is corrupt / undecodable
-/// the early `meta_mid` mirror (which the writer emits so one bad meta block
-/// can't lose the descriptor) is tried next. Returns `Ok(None)` when the file
-/// and SFA trailer are readable but NEITHER meta block decodes (both corrupt,
-/// or an encrypted SST whose key the out-of-band tool doesn't have) — the flag
-/// is genuinely UNDETERMINABLE. Returns `Err` when the file can't be opened or
-/// its SFA trailer can't be parsed, preserving the real I/O / structural error
-/// for the caller to report rather than collapsing it into "undeterminable".
+/// Returns `Ok(Some(ecc))` when a meta block decodes, where `ecc` is the
+/// per-SST shard layout (`None` = ECC off). The authoritative tail `meta`
+/// section is tried first; if its block is corrupt / undecodable the early
+/// `meta_mid` mirror (which the writer emits so one bad meta block can't lose
+/// the descriptor) is tried next. The outer `Ok(None)` means the file and SFA
+/// trailer are readable but NEITHER meta block decodes (both corrupt, or an
+/// encrypted SST whose key the out-of-band tool doesn't have) — the scheme is
+/// genuinely UNDETERMINABLE. Returns `Err` when the file can't be opened or its
+/// SFA trailer can't be parsed, preserving the real I/O / structural error for
+/// the caller to report rather than collapsing it into "undeterminable".
 ///
-/// The caller MUST NOT treat `Ok(None)` as "`page_ecc` disabled": walking an
+/// The caller MUST NOT treat the outer `Ok(None)` as "ECC disabled": walking an
 /// ECC-bearing SST without skipping the parity trailers mis-aligns the block
 /// scan and reports spurious corruption, so the caller skips the walk and
 /// surfaces the indeterminacy instead.
 #[cfg(feature = "std")]
-fn read_page_ecc_out_of_band(
+fn read_ecc_params_out_of_band(
     fs: &dyn crate::fs::Fs,
     path: &std::path::Path,
-) -> std::io::Result<Option<bool>> {
+) -> std::io::Result<Option<Option<crate::table::block::EccParams>>> {
     let mut probe = fs.open(path, &crate::fs::FsOpenOptions::new().read(true))?;
     let sfa_reader = crate::sfa::Reader::from_reader(&mut probe)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
@@ -646,7 +648,7 @@ fn read_page_ecc_out_of_band(
         if let Ok(meta) =
             crate::table::meta::ParsedMeta::load_with_handle(probe.as_ref(), &handle, None)
         {
-            return Ok(Some(meta.page_ecc));
+            return Ok(Some(meta.ecc_params));
         }
     }
     Ok(None)
@@ -669,7 +671,7 @@ fn scan_sst_blocks(
     path: &Path,
     table_id: TableId,
     max_enc_overhead: u32,
-    page_ecc: bool,
+    ecc: Option<crate::table::block::EccParams>,
 ) -> std::io::Result<PerFileScan> {
     use std::io::{BufReader, Seek, SeekFrom};
 
@@ -783,7 +785,7 @@ fn scan_sst_blocks(
             blocks_scanned: &mut blocks_scanned,
             errors: &mut errors,
             max_data_length: block_data_length_cap(max_enc_overhead),
-            page_ecc,
+            ecc,
         };
         walk_block_region(&mut ctx, start, end);
     }
@@ -851,14 +853,16 @@ struct WalkCtx<'a> {
     /// so the scrub does not false-flag legitimate encrypted blocks
     /// near the 256 MiB plaintext limit as `HeaderCorrupted`.
     max_data_length: u64,
-    /// Per-SST Page-ECC setting. SST blocks (`Data` / `Index` / `Filter` /
+    /// Per-SST Page-ECC shard layout. SST blocks (`Data` / `Index` / `Filter` /
     /// `RangeTombstone`) omit the `block_flags` byte, so their parity-trailer
-    /// presence is NOT derivable from the header — it is this table-wide flag.
-    /// When `true`, each such block carries `expected_parity_len(data_length)`
-    /// parity bytes after the payload that the walk must skip to stay aligned.
-    /// Meta / Manifest / `ManifestFooter` blocks keep the byte and self-describe
-    /// parity via their `ECC_PARITY` bit regardless of this flag.
-    page_ecc: bool,
+    /// presence AND shard layout are NOT derivable from the header — both come
+    /// from this table-wide descriptor scheme. When `Some`, each such block
+    /// carries `expected_parity_len(data_length, scheme)` parity bytes after
+    /// the payload that the walk must skip (sized by the scheme) to stay
+    /// aligned. Meta / Manifest / `ManifestFooter` blocks keep the byte and
+    /// self-describe parity via their `ECC_PARITY` bit, sized with the fixed
+    /// RS(4,2) layout the writer uses for them, regardless of this field.
+    ecc: Option<crate::table::block::EccParams>,
 }
 
 fn walk_block_region(ctx: &mut WalkCtx<'_>, start_offset: u64, end_offset: u64) {
@@ -928,22 +932,22 @@ fn walk_block_region(ctx: &mut WalkCtx<'_>, start_offset: u64, end_offset: u64) 
         // trailer length is derived from data_length (never stored). The walk
         // must skip these bytes — otherwise the next iteration would read parity
         // as the following block's header and mis-align the whole section.
-        let has_parity = if Header::has_block_flags(header.block_type) {
-            header.block_flags & crate::table::block::header::block_flags::ECC_PARITY != 0
+        // Parity-trailer scheme to skip for this block. Self-describing blocks
+        // (Meta / Manifest / `ManifestFooter`) carry the `block_flags` byte and
+        // are written with the fixed RS(4,2) layout; SST blocks size their
+        // trailer from the per-SST descriptor scheme threaded in via `ctx.ecc`.
+        let block_ecc = if Header::has_block_flags(header.block_type) {
+            (header.block_flags & crate::table::block::header::block_flags::ECC_PARITY != 0)
+                .then_some(crate::table::block::EccParams::RS_4_2)
         } else {
-            ctx.page_ecc
+            ctx.ecc
         };
-        let parity_len = if has_parity {
-            // TODO(#254): thread the per-SST ECC scheme from TableMeta into
-            // the verify context; until then the default layout is assumed
-            // (matches the current default-scheme write path).
+        let parity_len = block_ecc.map_or(0, |scheme| {
             u64::from(crate::table::block::expected_parity_len(
                 header.data_length,
-                crate::table::block::EccParams::RS_4_2,
+                scheme,
             ))
-        } else {
-            0
-        };
+        });
 
         // Validate data_length against TWO bounds before allocating
         // / reading:
@@ -1688,7 +1692,7 @@ mod block_verify_tests {
 
         let table_id: TableId = 42;
         let scan =
-            scan_sst_blocks(&fs, path, table_id, 0, false).expect("forged SFA must parse cleanly");
+            scan_sst_blocks(&fs, path, table_id, 0, None).expect("forged SFA must parse cleanly");
         assert_eq!(
             scan.errors.len(),
             1,
