@@ -147,7 +147,7 @@ impl<W: std::io::Write + std::io::Seek> BlockIndexWriter<W> for FullIndexWriter 
             },
         )?;
 
-        let bytes_written = header.on_disk_size();
+        let bytes_written = header.on_disk_size_with(self.ecc);
 
         debug_assert!(bytes_written > 0, "Block index should never be empty");
 

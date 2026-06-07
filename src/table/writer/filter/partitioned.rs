@@ -143,7 +143,7 @@ impl PartitionedFilterWriter {
             },
         )?;
 
-        let bytes_written = header.on_disk_size();
+        let bytes_written = header.on_disk_size_with(self.ecc);
 
         self.tli_handles.push(KeyedBlockHandle::new(
             key.clone(),
@@ -207,7 +207,7 @@ impl PartitionedFilterWriter {
             },
         )?;
 
-        let bytes_written = header.on_disk_size();
+        let bytes_written = header.on_disk_size_with(self.ecc);
 
         debug_assert!(bytes_written > 0, "Top level index should never be empty");
 

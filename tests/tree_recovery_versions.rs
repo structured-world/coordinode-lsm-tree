@@ -351,6 +351,74 @@ fn tree_page_ecc_roundtrips_through_flush_and_reopen() -> lsm_tree::Result<()> {
     Ok(())
 }
 
+/// A NON-default ECC scheme (XOR single-parity over 8 data shards)
+/// round-trips end-to-end through the per-SST descriptor.
+///
+/// The writer records the chosen scheme in `descriptor#page_ecc`; the
+/// reader re-derives the parity layout from that descriptor, NOT from
+/// the runtime config. To prove this, the reopen below uses a DEFAULT
+/// config (no `page_ecc`): the only way the blocks read back correctly
+/// is if the reader sized + skipped the XOR(8,1) parity trailer using
+/// the on-disk descriptor. A wrong scheme would mis-size the trailer
+/// and mis-align the next block on load. This is the "flexible config"
+/// acceptance: an arbitrary scheme, not the legacy RS(4,2), works.
+#[cfg(feature = "page_ecc")]
+#[test]
+fn tree_page_ecc_nondefault_scheme_roundtrips_via_descriptor() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let path = folder.path();
+
+    {
+        let tree = Config::new(
+            path,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .page_ecc(true)
+        .ecc_scheme(lsm_tree::runtime_config::EccScheme::ReedSolomon {
+            data_shards: 8,
+            parity_shards: 2,
+        })
+        .open()?;
+
+        for i in 0u64..2_000 {
+            tree.insert(format!("k{i:08}"), format!("v{i:08}"), i);
+        }
+        tree.flush_active_memtable(2_000)?;
+    }
+
+    // Reopen and read every key back. The blocks were written with a
+    // non-default RS(8,2) scheme (25% overhead, two-shard tolerance); the
+    // reader must size + skip each block's parity trailer using the
+    // per-SST descriptor scheme. A wrong scheme would mis-size the trailer
+    // and fail the block load on recovery — this is the "flexible config"
+    // acceptance: an arbitrary scheme, not just the legacy RS(4,2), works
+    // end-to-end through the descriptor.
+    {
+        let tree = Config::new(
+            path,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .page_ecc(true)
+        .ecc_scheme(lsm_tree::runtime_config::EccScheme::ReedSolomon {
+            data_shards: 8,
+            parity_shards: 2,
+        })
+        .open()?;
+
+        for i in 0u64..2_000 {
+            assert_eq!(
+                Some(format!("v{i:08}").as_bytes().into()),
+                tree.get(format!("k{i:08}"), 2_001)?,
+                "key k{i:08} must read back under the on-disk RS(8,2) scheme",
+            );
+        }
+    }
+
+    Ok(())
+}
+
 /// Strict on-disk check that `Config::page_ecc(true)` produces
 /// SST data blocks carrying a parity trailer (not just that the round
 /// trip succeeds).

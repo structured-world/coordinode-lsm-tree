@@ -835,7 +835,10 @@ impl Writer {
         item_count: usize,
     ) -> crate::Result<()> {
         self.meta.uncompressed_size += u64::from(header.uncompressed_length);
-        let bytes_written = header.on_disk_size();
+        // Size the block-handle with the scheme this writer actually wrote
+        // the parity under (NOT the fixed RS(4,2) `on_disk_size` assumes),
+        // or the handle over-reads on a non-default scheme.
+        let bytes_written = header.on_disk_size_with(self.ecc);
 
         let mut handle = KeyedBlockHandle::new(
             last_key.clone(),
@@ -1586,8 +1589,16 @@ fn write_meta_section<W: std::io::Write + std::io::Seek>(
                 Some(enc) => crate::table::block::BlockTransform::Encrypted(enc),
                 None => crate::table::block::BlockTransform::PLAIN,
             };
-            if let Some(ecc) = effective_ecc {
-                t.with_ecc(ecc)
+            // The Meta block is read at table-open BEFORE its own
+            // descriptor is parsed (chicken-and-egg: the scheme is IN
+            // the descriptor), so the reader cannot know a per-config
+            // scheme for it. Self-describing blocks therefore use the
+            // FIXED RS(4,2) layout (matching the reader's fallback);
+            // the configurable scheme applies only to the SST data /
+            // index / filter blocks, whose scheme the reader learns
+            // from this descriptor.
+            if effective_ecc.is_some() {
+                t.with_ecc(crate::table::block::EccParams::RS_4_2)
             } else {
                 t
             }

@@ -114,7 +114,7 @@ impl PartitionedIndexWriter {
             },
         )?;
 
-        let bytes_written = header.on_disk_size();
+        let bytes_written = header.on_disk_size_with(self.ecc);
 
         // Also, we are allowed to remove the last item
         // to get ownership of it, because the chunk is cleared after
@@ -201,7 +201,7 @@ impl PartitionedIndexWriter {
             },
         )?;
 
-        let bytes_written = header.on_disk_size();
+        let bytes_written = header.on_disk_size_with(self.ecc);
 
         debug_assert!(bytes_written > 0, "Top level index should never be empty");
 

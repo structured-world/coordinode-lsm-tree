@@ -103,6 +103,26 @@ fn block_has_parity(header: &Header, transform: &BlockTransform<'_>) -> bool {
     }
 }
 
+/// The ECC shard scheme to size + recover a block's parity trailer with.
+///
+/// Self-describing blocks (`Meta` / `Manifest` / `ManifestFooter`) are read
+/// at table / manifest open BEFORE any per-SST descriptor is known, so they
+/// always use the fixed [`EccParams::RS_4_2`] layout (matching the writer).
+/// SST blocks (`Data` / `Index` / `Filter` / `RangeTombstone`) are
+/// descriptor-driven: their scheme rides on the caller-supplied `transform`
+/// (sourced from the SST's `TableMeta`).
+///
+/// Not feature-gated: callable from read sizing on all builds (without
+/// `page_ecc` it is only reached from dead `block_has_parity == false`
+/// branches, but must still compile).
+fn block_ecc_params(header: &Header, transform: &BlockTransform<'_>) -> EccParams {
+    if Header::has_block_flags(header.block_type) {
+        EccParams::RS_4_2
+    } else {
+        transform.ecc_params().unwrap_or(EccParams::RS_4_2)
+    }
+}
+
 /// A block whose transform pipeline (compress → encrypt → checksum → ecc)
 /// has run, but whose framed bytes have not yet been written to the file.
 ///
@@ -624,10 +644,7 @@ impl Block {
         // is `expected_parity_len(data_length)` (the RS(4, 2) scheme is
         // deterministic), otherwise none.
         let ecc_length = if block_has_parity(&header, transform) {
-            expected_parity_len(
-                header.data_length,
-                transform.ecc_params().unwrap_or(EccParams::RS_4_2),
-            )
+            expected_parity_len(header.data_length, block_ecc_params(&header, transform))
         } else {
             0
         };
@@ -644,7 +661,7 @@ impl Block {
                 header.data_length,
                 ecc_length,
                 header.checksum,
-                transform.ecc_params().unwrap_or(EccParams::RS_4_2),
+                block_ecc_params(&header, transform),
             )?;
 
             // Decrypt in-place, reusing the read buffer.
@@ -742,7 +759,7 @@ impl Block {
                     header.data_length,
                     ecc_length,
                     header.checksum,
-                    transform.ecc_params().unwrap_or(EccParams::RS_4_2),
+                    block_ecc_params(&header, transform),
                 )?)
             };
 
@@ -918,7 +935,7 @@ impl Block {
             let ecc_length = if block_has_parity(&parsed_header, transform) {
                 expected_parity_len(
                     parsed_header.data_length,
-                    transform.ecc_params().unwrap_or(EccParams::RS_4_2),
+                    block_ecc_params(&parsed_header, transform),
                 )
             } else {
                 0
@@ -981,7 +998,7 @@ impl Block {
                     parsed_header.data_length,
                     ecc_length,
                     parsed_header.checksum,
-                    transform.ecc_params().unwrap_or(EccParams::RS_4_2),
+                    block_ecc_params(&parsed_header, transform),
                 )?
             };
 
@@ -1075,7 +1092,7 @@ impl Block {
             let ecc_length = if block_has_parity(&parsed_header, transform) {
                 expected_parity_len(
                     parsed_header.data_length,
-                    transform.ecc_params().unwrap_or(EccParams::RS_4_2),
+                    block_ecc_params(&parsed_header, transform),
                 )
             } else {
                 0
@@ -1117,7 +1134,7 @@ impl Block {
                     parsed_header.data_length,
                     ecc_length,
                     parsed_header.checksum,
-                    transform.ecc_params().unwrap_or(EccParams::RS_4_2),
+                    block_ecc_params(&parsed_header, transform),
                 )?)
             };
 
