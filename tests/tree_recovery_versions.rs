@@ -395,16 +395,17 @@ fn tree_page_ecc_nondefault_scheme_roundtrips_via_descriptor() -> lsm_tree::Resu
     // acceptance: an arbitrary scheme, not just the legacy RS(4,2), works
     // end-to-end through the descriptor.
     {
+        // Reopen with a DEFAULT config: no `page_ecc`, no `ecc_scheme`. The
+        // reader must source the RS(8,2) layout from the on-disk descriptor,
+        // NOT from the runtime config — so a reopen that omits the ECC config
+        // entirely is the load-bearing proof. If the reader fell back to the
+        // (now default-off) runtime config, it would mis-size the parity
+        // trailer and fail the block load.
         let tree = Config::new(
             path,
             SequenceNumberCounter::default(),
             SequenceNumberCounter::default(),
         )
-        .page_ecc(true)
-        .ecc_scheme(lsm_tree::runtime_config::EccScheme::ReedSolomon {
-            data_shards: 8,
-            parity_shards: 2,
-        })
         .open()?;
 
         for i in 0u64..2_000 {
