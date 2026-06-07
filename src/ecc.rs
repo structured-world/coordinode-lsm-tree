@@ -45,11 +45,15 @@ use alloc::vec::Vec;
 
 use reed_solomon_simd::{ReedSolomonDecoder, ReedSolomonEncoder};
 
-/// Data-shard count of the legacy fixed scheme (RS(4,2)).
+/// Data-shard count of the historical RS(4,2) layout.
 ///
-/// Block I/O still selects this until the per-SST scheme descriptor is
-/// wired; new configurations should prefer a lower-overhead scheme (XOR
-/// single-parity, or SECDED for single-bit rot).
+/// The chosen ECC scheme now flows write → per-SST descriptor → read
+/// (the descriptor records `(data_shards, parity_shards)` and block I/O
+/// re-derives the layout from it), so RS(4,2) is no longer the layout
+/// block I/O selects: it remains only as the fixed scheme for
+/// self-describing blocks (read before any descriptor is known) and as a
+/// test default. New configurations should prefer a lower-overhead scheme
+/// (XOR single-parity, or SECDED for single-bit rot).
 pub const RS_DATA_SHARDS: usize = 4;
 
 /// Parity-shard count of the legacy fixed scheme (RS(4,2)).

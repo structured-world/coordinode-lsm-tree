@@ -1114,7 +1114,7 @@ impl Config {
     /// [`EccScheme::ReedSolomon`]. The default
     /// [`EccScheme::Secded`](crate::runtime_config::EccScheme::Secded) is
     /// not yet wired (#255), so enabling ECC without choosing a shard
-    /// scheme emits no parity — pick `Xor`/`ReedSolomon` explicitly.
+    /// scheme fails validation — pick `Xor`/`ReedSolomon` explicitly.
     /// There is no implicit RS(4,2) default.
     #[must_use]
     pub fn ecc_scheme(mut self, scheme: crate::runtime_config::EccScheme) -> Self {

@@ -289,9 +289,12 @@ pub enum KvChecksumComputePoint {
 /// care about. The engine never defaults to a high-overhead scheme.
 ///
 /// - [`Self::Secded`] — Hamming SECDED, per word: single-bit correct +
-///   double-bit detect. The cheapest tier (~1-3% overhead) and the
-///   default when ECC is enabled without an explicit scheme; matches the
-///   dominant single-bit-rot failure mode of DRAM and disks.
+///   double-bit detect, the cheapest tier (~1-3% overhead). It is the
+///   placeholder default while ECC is OFF, NOT a valid enabled-state
+///   scheme yet: it is not wired (#255), so enabling ECC with `Secded` is
+///   rejected and an enabled config must pick [`Self::Xor`] /
+///   [`Self::ReedSolomon`] explicitly. Matches the dominant single-bit-rot
+///   failure mode of DRAM and disks.
 /// - [`Self::Xor`] — one XOR parity shard over `data_shards` data shards
 ///   (RAID-5 equivalent): recovers one fully-lost shard. Overhead =
 ///   `1 / data_shards` (e.g. 10 → 10%). XOR is computed directly (no RS
@@ -305,8 +308,10 @@ pub enum KvChecksumComputePoint {
 #[derive(Copy, Clone, Debug, Default, Eq, PartialEq, Hash)]
 pub enum EccScheme {
     /// Hamming SECDED per word — single-bit correct, double-bit detect.
-    /// Cheapest tier; the default when ECC is on without an explicit
-    /// scheme. Implemented by the SECDED read path (#255).
+    /// Cheapest tier and the type-level default, but valid only while ECC
+    /// is OFF: enabling ECC with `Secded` is rejected until the SECDED read
+    /// path lands (#255), so an enabled config must pick [`Self::Xor`] /
+    /// [`Self::ReedSolomon`].
     #[default]
     Secded,
 
@@ -700,12 +705,14 @@ pub struct RuntimeConfig {
     pub kv_checksums_ecc_override: Option<bool>,
 
     /// Page ECC scheme used when ECC is enabled ([`Self::page_ecc`] or a
-    /// per-scope override is `true`). Default [`EccScheme::Secded`] — the
-    /// cheapest single-bit-correcting tier. ECC stays off until a
-    /// `page_ecc` flag turns it on; this field only chooses *which*
-    /// algorithm is used once it is on. The scheme is recorded per-SST so
-    /// the reader can re-derive the parity layout (existing SSTs keep the
-    /// scheme they were written with; compaction migrates over time).
+    /// per-scope override is `true`). The type-level default
+    /// [`EccScheme::Secded`] is a placeholder valid only while ECC is OFF:
+    /// it is not wired yet (#255), so turning ECC on while this is still
+    /// `Secded` is rejected — an enabled config must set an explicit
+    /// shard-based scheme ([`EccScheme::Xor`] / [`EccScheme::ReedSolomon`]).
+    /// The scheme is recorded per-SST so the reader can re-derive the
+    /// parity layout (existing SSTs keep the scheme they were written with;
+    /// compaction migrates over time).
     pub ecc_scheme: EccScheme,
 
     /// Granularity at which Page ECC parity is computed when ECC is on.
