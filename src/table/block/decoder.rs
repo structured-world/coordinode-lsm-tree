@@ -339,6 +339,7 @@ impl<'a, Item: Decodable<Parsed>, Parsed: ParsedItem<Item>> Decoder<'a, Item, Pa
     ///
     /// Panics if `restart_interval == 0` (a zero interval has no restart heads,
     /// so positional restart tracking is undefined).
+    #[cfg(feature = "zstd")]
     #[must_use]
     pub(crate) fn new_forward_headerless(
         block: &'a Block,
@@ -383,6 +384,7 @@ impl<'a, Item: Decodable<Parsed>, Parsed: ParsedItem<Item>> Decoder<'a, Item, Pa
     /// past the last complete entry. Used to synthesize a binary-index trailer
     /// over a decoded prefix (whose tail may be a truncated entry, which this
     /// scan stops cleanly before — see [`Self::new_forward_headerless`]).
+    #[cfg(feature = "zstd")]
     pub(crate) fn scan_restart_offsets(mut self) -> (Vec<u32>, usize, usize) {
         let mut restart_offsets = Vec::new();
         let mut item_count = 0usize;

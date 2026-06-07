@@ -1384,13 +1384,6 @@ impl Block {
     /// Returns an error on a framing / checksum failure (unrecoverable), or if
     /// called for an encrypted transform.
     #[cfg(feature = "zstd")]
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "consumed by the range-iterator partial path (next step)"
-        )
-    )]
     pub(crate) fn read_data_frame(
         file: &dyn FsFile,
         handle: BlockHandle,

@@ -1,4 +1,4 @@
-#[expect(clippy::expect_used)]
+#[expect(clippy::expect_used, clippy::indexing_slicing)]
 mod tests {
     use crate::comparator::default_comparator;
     use crate::{

@@ -2,6 +2,8 @@
 // Copyright (c) 2025-present, fjall-rs
 // Copyright (c) 2026-present, Structured World Foundation
 
+#[cfg(feature = "zstd")]
+use super::KeyedBlockHandle;
 use super::{BlockOffset, DataBlock, GlobalTableId, data_block::Iter as DataBlockIter};
 use crate::{
     Cache, CompressionType, InternalValue, SeqNo, UserKey,
@@ -120,6 +122,17 @@ pub struct Iter {
     zstd_dictionary: Option<Arc<crate::compression::ZstdDictionary>>,
     comparator: SharedComparator,
 
+    /// Per-table inner-block layout (clone). Drives the partial-decode path:
+    /// when a data block has a recorded layout and the query upper bound falls
+    /// within it, only the inner zstd blocks covering `[start, upper]` are
+    /// decoded (trailing blocks skipped).
+    #[cfg(feature = "zstd")]
+    block_layout: crate::table::block_layout::BlockLayoutMap,
+    /// Data-block restart interval, to rebuild a positional index when
+    /// synthesizing a partial block's trailer.
+    #[cfg(feature = "zstd")]
+    data_block_restart_interval: u8,
+
     index_initialized: bool,
 
     lo_offset: BlockOffset,
@@ -157,6 +170,8 @@ impl Iter {
         has_kv_footer: bool,
         #[cfg(zstd_any)] zstd_dictionary: Option<Arc<crate::compression::ZstdDictionary>>,
         comparator: SharedComparator,
+        #[cfg(feature = "zstd")] block_layout: crate::table::block_layout::BlockLayoutMap,
+        #[cfg(feature = "zstd")] data_block_restart_interval: u8,
         #[cfg(feature = "metrics")] metrics: Arc<Metrics>,
     ) -> Self {
         Self {
@@ -175,6 +190,11 @@ impl Iter {
             #[cfg(zstd_any)]
             zstd_dictionary,
             comparator,
+
+            #[cfg(feature = "zstd")]
+            block_layout,
+            #[cfg(feature = "zstd")]
+            data_block_restart_interval,
 
             index_initialized: false,
 
@@ -198,6 +218,58 @@ impl Iter {
 
     pub fn set_upper_bound(&mut self, bound: Bound) {
         self.range.1 = Some(bound);
+    }
+
+    /// Try to build a partial (covering) data block for `handle` instead of
+    /// fully decoding it: decode only the inner zstd blocks up to the query's
+    /// upper bound, skipping the trailing blocks. Returns `None` (caller does a
+    /// full load) unless ALL hold: plain zstd, no encryption, the block has a
+    /// recorded multi-inner-block layout, the query has an upper bound, and that
+    /// upper bound falls within this block (for a block entirely below `upper`
+    /// the whole block is in range and a full decode is cheaper than
+    /// synthesizing one).
+    #[cfg(feature = "zstd")]
+    fn try_partial_block(&self, handle: &KeyedBlockHandle) -> crate::Result<Option<DataBlock>> {
+        if !matches!(self.compression, CompressionType::Zstd(_)) || self.encryption.is_some() {
+            return Ok(None);
+        }
+        let Some(Bound::Included(upper) | Bound::Excluded(upper)) = &self.range.1 else {
+            return Ok(None);
+        };
+        if self.comparator.compare(upper, handle.end_key()) == std::cmp::Ordering::Greater {
+            return Ok(None);
+        }
+        let Some(ends) = self.block_layout.ends_for(*handle.offset()) else {
+            return Ok(None);
+        };
+        let ends = ends.to_vec();
+
+        let (fd, _cache_event) = self
+            .file_accessor
+            .get_or_open_table(&self.table_id, &self.path)?;
+        let transform = crate::table::block::BlockTransform::from_parts(
+            self.compression,
+            None,
+            #[cfg(zstd_any)]
+            None,
+        )?;
+        let transform = match self.ecc {
+            Some(ecc) => transform.with_ecc(ecc),
+            None => transform,
+        };
+        let (_header, frame) = crate::table::block::Block::read_data_frame(
+            fd.as_ref(),
+            BlockHandle::new(handle.offset(), handle.size()),
+            &transform,
+        )?;
+        let (block, _blocks) = crate::table::lazy_block::partial_data_block(
+            frame.to_vec(),
+            ends,
+            self.data_block_restart_interval,
+            &self.comparator,
+            upper,
+        )?;
+        Ok(Some(block))
     }
 }
 
@@ -300,29 +372,43 @@ impl Iterator for Iter {
                 Err(e) => return self.poison(e),
             };
 
-            // Load the next data block via `load_block`, which checks the block cache
-            // internally and validates block type on both cache-hit and I/O paths.
-            let block = match load_block(
-                self.table_id,
-                &self.path,
-                &self.file_accessor,
-                &self.cache,
-                &BlockHandle::new(handle.offset(), handle.size()),
-                crate::table::block::BlockType::Data,
-                self.compression,
-                self.encryption.as_deref(),
-                self.ecc,
-                #[cfg(zstd_any)]
-                self.zstd_dictionary.as_deref(),
-                #[cfg(feature = "metrics")]
-                &self.metrics,
-            ) {
-                Ok(b) => b,
+            // Partial-decode fast path: for a large multi-inner-block zstd block
+            // whose recorded layout lets us skip the inner blocks past the query
+            // upper bound, decode only the covering prefix. Falls back to a full
+            // load (which checks the block cache) otherwise.
+            #[cfg(feature = "zstd")]
+            let partial = match self.try_partial_block(&handle) {
+                Ok(p) => p,
                 Err(e) => return self.poison(e),
             };
-            let block = match DataBlock::from_loaded(block, self.has_kv_footer) {
-                Ok(b) => b,
-                Err(e) => return self.poison(e),
+            #[cfg(not(feature = "zstd"))]
+            let partial: Option<DataBlock> = None;
+
+            let block = if let Some(db) = partial {
+                db
+            } else {
+                let raw = match load_block(
+                    self.table_id,
+                    &self.path,
+                    &self.file_accessor,
+                    &self.cache,
+                    &BlockHandle::new(handle.offset(), handle.size()),
+                    crate::table::block::BlockType::Data,
+                    self.compression,
+                    self.encryption.as_deref(),
+                    self.ecc,
+                    #[cfg(zstd_any)]
+                    self.zstd_dictionary.as_deref(),
+                    #[cfg(feature = "metrics")]
+                    &self.metrics,
+                ) {
+                    Ok(b) => b,
+                    Err(e) => return self.poison(e),
+                };
+                match DataBlock::from_loaded(raw, self.has_kv_footer) {
+                    Ok(b) => b,
+                    Err(e) => return self.poison(e),
+                }
             };
 
             let mut reader = match create_data_block_reader(block, self.comparator.clone()) {
@@ -432,29 +518,43 @@ impl DoubleEndedIterator for Iter {
                 Err(e) => return self.poison(e),
             };
 
-            // Load the next data block via `load_block`, which checks the block cache
-            // internally and validates block type on both cache-hit and I/O paths.
-            let block = match load_block(
-                self.table_id,
-                &self.path,
-                &self.file_accessor,
-                &self.cache,
-                &BlockHandle::new(handle.offset(), handle.size()),
-                crate::table::block::BlockType::Data,
-                self.compression,
-                self.encryption.as_deref(),
-                self.ecc,
-                #[cfg(zstd_any)]
-                self.zstd_dictionary.as_deref(),
-                #[cfg(feature = "metrics")]
-                &self.metrics,
-            ) {
-                Ok(b) => b,
+            // Partial-decode fast path: for a large multi-inner-block zstd block
+            // whose recorded layout lets us skip the inner blocks past the query
+            // upper bound, decode only the covering prefix. Falls back to a full
+            // load (which checks the block cache) otherwise.
+            #[cfg(feature = "zstd")]
+            let partial = match self.try_partial_block(&handle) {
+                Ok(p) => p,
                 Err(e) => return self.poison(e),
             };
-            let block = match DataBlock::from_loaded(block, self.has_kv_footer) {
-                Ok(b) => b,
-                Err(e) => return self.poison(e),
+            #[cfg(not(feature = "zstd"))]
+            let partial: Option<DataBlock> = None;
+
+            let block = if let Some(db) = partial {
+                db
+            } else {
+                let raw = match load_block(
+                    self.table_id,
+                    &self.path,
+                    &self.file_accessor,
+                    &self.cache,
+                    &BlockHandle::new(handle.offset(), handle.size()),
+                    crate::table::block::BlockType::Data,
+                    self.compression,
+                    self.encryption.as_deref(),
+                    self.ecc,
+                    #[cfg(zstd_any)]
+                    self.zstd_dictionary.as_deref(),
+                    #[cfg(feature = "metrics")]
+                    &self.metrics,
+                ) {
+                    Ok(b) => b,
+                    Err(e) => return self.poison(e),
+                };
+                match DataBlock::from_loaded(raw, self.has_kv_footer) {
+                    Ok(b) => b,
+                    Err(e) => return self.poison(e),
+                }
             };
 
             let mut reader = match create_data_block_reader(block, self.comparator.clone()) {

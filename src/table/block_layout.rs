@@ -25,7 +25,6 @@
 //! ```
 
 use crate::table::block::BlockOffset;
-use byteorder::{LittleEndian, ReadBytesExt};
 
 /// Serialize the per-block inner-block layouts into `out`.
 ///
@@ -75,31 +74,48 @@ impl BlockLayoutMap {
     /// the entries are not strictly ascending by offset (a corrupt section
     /// must surface rather than silently mis-map a range).
     pub fn decode(bytes: &[u8]) -> crate::Result<Self> {
+        // Manual little-endian slice parsing (no `std::io::Read`), so the codec
+        // stays `no_std + alloc`-clean. Any truncation or invariant violation
+        // surfaces as a typed `InvalidHeader`, not a stringly-typed I/O error.
+        const ERR: crate::Error = crate::Error::InvalidHeader("BlockLayout");
+
+        fn take<'a>(r: &mut &'a [u8], n: usize) -> Option<&'a [u8]> {
+            if r.len() < n {
+                return None;
+            }
+            let (head, tail) = r.split_at(n);
+            *r = tail;
+            Some(head)
+        }
+        fn read_u32(r: &mut &[u8]) -> Option<u32> {
+            let b: [u8; 4] = take(r, 4)?.try_into().ok()?;
+            Some(u32::from_le_bytes(b))
+        }
+        fn read_u64(r: &mut &[u8]) -> Option<u64> {
+            let b: [u8; 8] = take(r, 8)?.try_into().ok()?;
+            Some(u64::from_le_bytes(b))
+        }
+
         let mut r = bytes;
-        let count = r.read_u32::<LittleEndian>()?;
+        let count = read_u32(&mut r).ok_or(ERR)?;
         let mut entries = Vec::with_capacity(count as usize);
         let mut prev: Option<u64> = None;
         for _ in 0..count {
-            let offset = r.read_u64::<LittleEndian>()?;
-            if let Some(p) = prev
-                && offset <= p
-            {
-                return Err(crate::Error::Io(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "block_layout entries must be strictly ascending by offset",
-                )));
+            let offset = read_u64(&mut r).ok_or(ERR)?;
+            // Entries must be strictly ascending by offset (else a lookup could
+            // silently mis-map a range).
+            if prev.is_some_and(|p| offset <= p) {
+                return Err(ERR);
             }
             prev = Some(offset);
-            let inner = r.read_u32::<LittleEndian>()?;
+            let inner = read_u32(&mut r).ok_or(ERR)?;
+            // A recorded block always split into >= 2 inner blocks.
             if inner < 2 {
-                return Err(crate::Error::Io(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "block_layout entry must have >= 2 inner blocks",
-                )));
+                return Err(ERR);
             }
             let mut ends = Vec::with_capacity(inner as usize);
             for _ in 0..inner {
-                ends.push(r.read_u32::<LittleEndian>()?);
+                ends.push(read_u32(&mut r).ok_or(ERR)?);
             }
             entries.push((offset, ends));
         }
@@ -108,15 +124,7 @@ impl BlockLayoutMap {
 
     /// Cumulative inner-block END offsets for the data block at `offset`, or
     /// `None` if the block was not recorded (single inner block → full decode).
-    // Consumed by the range-query partial-decode read path (wired in a
-    // follow-up slice); the section is already produced and reloaded today.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "consumed by range-query partial decode (next slice)"
-        )
-    )]
+    #[cfg(feature = "zstd")]
     pub fn ends_for(&self, offset: u64) -> Option<&[u32]> {
         let idx = self
             .entries

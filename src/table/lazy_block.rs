@@ -24,19 +24,9 @@
 //! live `LazyBlock` lives on the stack for one block access, while the cache
 //! stores only the grown decompressed bytes (a follow-up wires that path).
 
-// The lazy-decode engine is exercised by its tests; its production consumer
-// (the range-query iterator + cache path) lands in a follow-up slice.
-#![cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "consumed by the range-query partial-decode wiring (next slice)"
-    )
-)]
-
 use crate::comparator::SharedComparator;
 use crate::table::DataBlock;
-use crate::table::block::{Block, BlockType, Decoder, Header, ParsedItem};
+use crate::table::block::{Block, Decoder, Header, ParsedItem};
 use crate::table::data_block::DataBlockParsedItem;
 use crate::{Checksum, InternalValue, Slice};
 use structured_zstd::decoding::FrameDecoder;
@@ -155,102 +145,6 @@ impl LazyBlock {
         self.decoded_blocks = pd.blocks_decoded;
         Ok(())
     }
-
-    /// Decode the whole block (all inner blocks).
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if any inner block fails to decode.
-    pub fn ensure_fully_decoded(&mut self) -> crate::Result<()> {
-        self.ensure_decoded_to(self.total_len())
-    }
-}
-
-/// Collect the entries in `[lower, upper)` from a compressed data-block `frame`,
-/// decoding only the inner zstd blocks the range covers and skipping the
-/// trailing blocks after `upper` (the perf win). `lower` is inclusive, `upper`
-/// exclusive; `None` means unbounded on that side.
-///
-/// The covering prefix is decoded (growing geometrically until the first key
-/// `>= upper` is reached, or the block is exhausted), then walked with a
-/// trailer-independent forward decoder. Returns the in-range entries and the
-/// number of inner blocks that had to be decoded (so callers / tests can see
-/// the trailing blocks were skipped).
-///
-/// # Errors
-///
-/// Returns an error if the frame header or an inner block fails to decode.
-pub fn collect_range_partial(
-    frame: Vec<u8>,
-    ends: Vec<u32>,
-    restart_interval: u8,
-    comparator: &SharedComparator,
-    lower: Option<&[u8]>,
-    upper: Option<&[u8]>,
-) -> crate::Result<(Vec<InternalValue>, u32)> {
-    let mut lazy = LazyBlock::new(frame, ends)?;
-    let total = lazy.total_len();
-    let mut extent = 0usize;
-    let mut out = Vec::new();
-
-    loop {
-        // Grow the decoded extent geometrically; the drain-on-return decode is
-        // re-run from block 0 per growth, so geometric steps keep total decode
-        // work O(final extent) rather than O(extent^2).
-        extent = if extent == 0 {
-            (64 * 1024).min(total)
-        } else {
-            extent.saturating_mul(2).min(total)
-        };
-        lazy.ensure_decoded_to(extent)?;
-        let prefix = lazy.decoded();
-        let entries_end = prefix.len();
-
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "prefix length <= block size, well within u32"
-        )]
-        let synthetic_len = entries_end as u32;
-        let block = Block {
-            header: Header {
-                block_type: BlockType::Data,
-                block_flags: 0,
-                checksum: Checksum::from_raw(0),
-                data_length: synthetic_len,
-                uncompressed_length: synthetic_len,
-            },
-            data: Slice::from(prefix),
-        };
-
-        out.clear();
-        let mut reached_upper = upper.is_none();
-        let decoder = Decoder::<InternalValue, DataBlockParsedItem>::new_forward_headerless(
-            &block,
-            restart_interval,
-            entries_end,
-        );
-        for item in decoder {
-            let kv = item.materialize(&block.data);
-            if let Some(up) = upper
-                && comparator.compare(&kv.key.user_key, up) != std::cmp::Ordering::Less
-            {
-                reached_upper = true;
-                break;
-            }
-            if let Some(lo) = lower
-                && comparator.compare(&kv.key.user_key, lo) == std::cmp::Ordering::Less
-            {
-                continue;
-            }
-            out.push(kv);
-        }
-
-        if reached_upper || entries_end >= total {
-            break;
-        }
-    }
-
-    Ok((out, lazy.decoded_blocks()))
 }
 
 /// Synthesize a valid standalone data-block (`entries ‖ trailer`) from a
@@ -415,7 +309,12 @@ fn prefix_reaches_past(
 }
 
 #[cfg(test)]
-#[expect(clippy::expect_used, clippy::indexing_slicing, reason = "test code")]
+#[expect(
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::cast_possible_truncation,
+    reason = "test code"
+)]
 mod tests {
     use super::*;
     use crate::compression::{CompressionProvider as _, ZstdBackend};
@@ -492,55 +391,11 @@ mod tests {
     }
 
     #[test]
-    fn collect_range_partial_matches_full_and_skips_trailing() {
-        use crate::table::block::{Block, BlockType, Header, ParsedItem};
-        use crate::{Slice, comparator::default_comparator};
-
-        let (frame, ends, block_bytes) = large_block_frame();
-        let nblocks = ends.len() as u32;
-        let comparator = default_comparator();
-
-        // Full reference: real block, iterate, filter [lower, upper).
-        let full = DataBlock::new(Block {
-            data: Slice::from(block_bytes),
-            header: Header::test_dummy(BlockType::Data),
-        });
-        // Keys are "key-{i:012}"; pick a range near the block start so the
-        // trailing inner blocks are skippable.
-        let lower = b"key-000000000010".to_vec();
-        let upper = b"key-000000000050".to_vec();
-        let reference: Vec<InternalValue> = full
-            .iter(comparator.clone())
-            .map(|x| x.materialize(full.as_slice()))
-            .filter(|kv| {
-                let k = kv.key.user_key.as_ref();
-                k >= lower.as_slice() && k < upper.as_slice()
-            })
-            .collect();
-        assert_eq!(reference.len(), 40, "i=10..50 → 40 entries");
-
-        let (got, blocks) = collect_range_partial(
-            frame,
-            ends,
-            16, // restart_interval used by large_block_frame
-            &comparator,
-            Some(&lower),
-            Some(&upper),
-        )
-        .expect("partial range");
-
-        assert_eq!(got, reference, "partial range must equal the full range");
-        assert!(
-            blocks < nblocks,
-            "a near-start range must skip trailing inner blocks: decoded {blocks}/{nblocks}",
-        );
-    }
-
-    #[test]
     fn lazy_block_full_decode_matches_reference() {
         let (frame, ends, reference) = large_block_frame();
         let mut lazy = LazyBlock::new(frame, ends.clone()).expect("new lazy block");
-        lazy.ensure_fully_decoded().expect("full decode");
+        let total = lazy.total_len();
+        lazy.ensure_decoded_to(total).expect("full decode");
         assert_eq!(lazy.decoded_blocks(), ends.len() as u32);
         assert_eq!(lazy.decoded(), reference.as_slice());
     }
@@ -551,7 +406,7 @@ mod tests {
         // prefix) must always equal the matching prefix of a full decode and
         // converge to the whole block.
         let (frame, ends, reference) = large_block_frame();
-        let mut lazy = LazyBlock::new(frame, ends.clone()).expect("new lazy block");
+        let mut lazy = LazyBlock::new(frame, ends).expect("new lazy block");
         let total = reference.len();
         let mut cursor = 0usize;
         while cursor < total {

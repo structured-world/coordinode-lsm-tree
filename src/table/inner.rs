@@ -86,13 +86,13 @@ pub struct Inner {
     /// `block_layout` section. Empty (no entries) when the table has no
     /// multi-inner-block data blocks. Lets a range query partial-decode only
     /// the inner blocks covering a key range in a large cold block.
-    // Read by the range-query partial-decode path (wired in a follow-up slice);
-    // the section is already produced and reloaded into this field today.
+    // Read only by the zstd partial-decode path; in a no-zstd build it is still
+    // loaded (always empty there, since no zstd blocks ever split) but unread.
     #[cfg_attr(
-        not(test),
+        not(feature = "zstd"),
         expect(
             dead_code,
-            reason = "consumed by range-query partial decode (next slice)"
+            reason = "consumed only by the zstd partial-decode read path"
         )
     )]
     pub(crate) block_layout: BlockLayoutMap,

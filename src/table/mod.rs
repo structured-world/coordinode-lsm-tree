@@ -909,6 +909,10 @@ impl Table {
             #[cfg(zstd_any)]
             self.zstd_dictionary.clone(),
             self.comparator.clone(),
+            #[cfg(feature = "zstd")]
+            self.block_layout.clone(),
+            #[cfg(feature = "zstd")]
+            self.metadata.data_block_restart_interval,
             #[cfg(feature = "metrics")]
             self.metrics.clone(),
         );

@@ -108,6 +108,11 @@ pub struct ParsedMeta {
     /// `index_format` property and parse as `0`, so legacy tables read
     /// correctly and fall back to the per-entry filter scan path.
     pub index_format: u8,
+
+    /// Restart interval the data blocks were encoded with. Needed to rebuild a
+    /// positional restart index when partial-decoding a block on the lazy read
+    /// path (the restart heads sit every `data_block_restart_interval` entries).
+    pub data_block_restart_interval: u8,
 }
 
 macro_rules! read_u8 {
@@ -259,6 +264,10 @@ impl ParsedMeta {
 
         let _index_block_restart_interval =
             validated_restart_interval_index(read_u8!(block, b"restart_interval#index", &cmp))?;
+        // Data-block restart interval: needed to rebuild a positional restart
+        // index when partial-decoding a block (lazy read path).
+        let data_block_restart_interval =
+            validated_restart_interval_index(read_u8!(block, b"restart_interval#data", &cmp))?;
 
         let id = read_u64!(block, b"table_id", &cmp);
         let item_count = read_u64!(block, b"item_count", &cmp);
@@ -424,6 +433,7 @@ impl ParsedMeta {
             ecc_params,
             ecc_unrecognized,
             index_format,
+            data_block_restart_interval,
         })
     }
 }
