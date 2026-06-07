@@ -863,6 +863,30 @@ mod tests {
     }
 
     #[test]
+    fn ecc_descriptor_rejects_noncanonical_off_and_secded() {
+        // `Off` (kind 0) and `Secded` (kind 1) carry no shard layout, so the
+        // shard/granularity bytes are reserved-zero. A corrupted descriptor
+        // that sets them must surface `InvalidTrailer` rather than being
+        // silently coerced to "ECC off" / "Secded" — otherwise the SST read
+        // path would pick the wrong block framing / recovery layout from a
+        // tampered trailer instead of failing closed.
+        // Off with non-zero reserved bytes:
+        assert!(ecc_descriptor_from_bytes(&[0, 8, 2, 1]).is_err());
+        assert!(ecc_descriptor_from_bytes(&[0, 1, 0, 0]).is_err());
+        assert!(ecc_descriptor_from_bytes(&[0, 0, 1, 0]).is_err());
+        assert!(ecc_descriptor_from_bytes(&[0, 0, 0, 1]).is_err());
+        // Secded with non-zero reserved shard bytes:
+        assert!(ecc_descriptor_from_bytes(&[1, 8, 2, 0]).is_err());
+        assert!(ecc_descriptor_from_bytes(&[1, 1, 0, 0]).is_err());
+        // Canonical encodings still decode:
+        assert_eq!(ecc_descriptor_from_bytes(&[0, 0, 0, 0]).expect("off"), None);
+        assert_eq!(
+            ecc_descriptor_from_bytes(&[1, 0, 0, 0]).expect("secded"),
+            Some((EccScheme::Secded, EccGranularity::Block)),
+        );
+    }
+
+    #[test]
     fn kv_checksum_policy_default_is_off() {
         // Off is the zero-overhead default: a tree that never opts in
         // produces plain data blocks (KV_CHECKSUM_FOOTER bit clear) and
