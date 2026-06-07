@@ -414,6 +414,13 @@ pub fn ecc_descriptor_from_bytes(
     let [kind, data_shards, parity_shards, gran_byte] =
         *<&[u8; ECC_DESCRIPTOR_LEN]>::try_from(bytes).map_err(|_| crate::Error::InvalidTrailer)?;
     if kind == 0 {
+        // `Off` carries no scheme: the remaining three bytes are
+        // reserved-zero. A non-zero reserved byte means a corrupted /
+        // forged descriptor — fail closed rather than silently reading the
+        // SST as "ECC off" and parsing parity-bearing bytes as plain.
+        if data_shards != 0 || parity_shards != 0 || gran_byte != 0 {
+            return Err(crate::Error::InvalidTrailer);
+        }
         return Ok(None);
     }
     let granularity = match gran_byte {
@@ -422,7 +429,15 @@ pub fn ecc_descriptor_from_bytes(
         _ => return Err(crate::Error::InvalidTrailer),
     };
     let scheme = match kind {
-        1 => EccScheme::Secded,
+        1 => {
+            // `Secded` is per-word Hamming with no shard layout: its shard
+            // bytes are reserved-zero. Reject non-zero reserved bytes so a
+            // tampered descriptor can't masquerade as a valid Secded SST.
+            if data_shards != 0 || parity_shards != 0 {
+                return Err(crate::Error::InvalidTrailer);
+            }
+            EccScheme::Secded
+        }
         2 => {
             if data_shards == 0 {
                 return Err(crate::Error::InvalidTrailer);
