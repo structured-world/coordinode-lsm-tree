@@ -15,7 +15,7 @@
 #![cfg(feature = "page_ecc")]
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use lsm_tree::ecc::{encode_parity, try_recover};
+use lsm_tree::ecc::{RS_DATA_SHARDS, RS_PARITY_SHARDS, encode_parity, try_recover};
 
 /// Block sizes covering the typical SST data-block range. 4 KiB is
 /// the default `data_block_size` in `Writer`; the larger sizes show
@@ -41,7 +41,8 @@ fn bench_encode_parity(c: &mut Criterion) {
         group.throughput(Throughput::Bytes(size as u64));
         group.bench_with_input(BenchmarkId::from_parameter(size), &payload, |b, payload| {
             b.iter(|| {
-                let parity = encode_parity(payload).expect("encode succeeds on non-empty input");
+                let parity = encode_parity(payload, RS_DATA_SHARDS, RS_PARITY_SHARDS)
+                    .expect("encode succeeds on non-empty input");
                 std::hint::black_box(parity);
             });
         });
@@ -58,7 +59,8 @@ fn bench_try_recover_first_subset(c: &mut Criterion) {
     let mut group = c.benchmark_group("ecc/try_recover/first_subset");
     for &size in SIZES {
         let payload = deterministic_payload(size);
-        let parity = encode_parity(&payload).expect("parity encodes");
+        let parity =
+            encode_parity(&payload, RS_DATA_SHARDS, RS_PARITY_SHARDS).expect("parity encodes");
         let expected_xxh3 = lsm_tree::hash::hash128(&payload);
 
         // Corrupt the first byte of shard 0 in a COPY of the payload.
@@ -68,9 +70,14 @@ fn bench_try_recover_first_subset(c: &mut Criterion) {
         group.throughput(Throughput::Bytes(size as u64));
         group.bench_with_input(BenchmarkId::from_parameter(size), &corrupt, |b, corrupt| {
             b.iter(|| {
-                let recovered = try_recover(corrupt, &parity, payload.len(), |buf| {
-                    lsm_tree::hash::hash128(buf) == expected_xxh3
-                })
+                let recovered = try_recover(
+                    corrupt,
+                    &parity,
+                    payload.len(),
+                    RS_DATA_SHARDS,
+                    RS_PARITY_SHARDS,
+                    |buf| lsm_tree::hash::hash128(buf) == expected_xxh3,
+                )
                 .expect("recovery succeeds");
                 std::hint::black_box(recovered);
             });
@@ -90,7 +97,8 @@ fn bench_try_recover_all_subsets_fail(c: &mut Criterion) {
     let mut group = c.benchmark_group("ecc/try_recover/all_subsets_fail");
     for &size in SIZES {
         let payload = deterministic_payload(size);
-        let parity = encode_parity(&payload).expect("parity encodes");
+        let parity =
+            encode_parity(&payload, RS_DATA_SHARDS, RS_PARITY_SHARDS).expect("parity encodes");
 
         // Flip enough bytes that recovery genuinely can't reconstruct
         // a matching payload — corrupt 3 data shards (more than the
@@ -109,8 +117,15 @@ fn bench_try_recover_all_subsets_fail(c: &mut Criterion) {
             b.iter(|| {
                 // Oracle always returns false — forces all 15 subsets
                 // to be tried.
-                let result = try_recover(corrupt, &parity, payload.len(), |_| false)
-                    .expect("try_recover surfaces engine errors only");
+                let result = try_recover(
+                    corrupt,
+                    &parity,
+                    payload.len(),
+                    RS_DATA_SHARDS,
+                    RS_PARITY_SHARDS,
+                    |_| false,
+                )
+                .expect("try_recover surfaces engine errors only");
                 std::hint::black_box(result);
             });
         });

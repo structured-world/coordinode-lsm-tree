@@ -350,7 +350,7 @@ impl ParsedMeta {
                     }
                 })
                 .transpose()?
-                .and_then(|scheme| scheme.shard_params())
+                .and_then(crate::runtime_config::EccScheme::shard_params)
                 .map(|(d, p)| {
                     #[expect(
                         clippy::cast_possible_truncation,
@@ -771,7 +771,7 @@ mod tests {
         assert!(parsed.page_ecc, "a present scheme means Page ECC is on");
         assert_eq!(
             parsed.ecc_params,
-            Some(crate::table::block::EccParams::try_new(8, 2).expect("valid shards")),
+            Some(crate::table::block::EccParams::try_new(8, 2).unwrap()),
         );
     }
 

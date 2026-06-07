@@ -627,6 +627,12 @@ pub fn verify_sst_file(path: &std::path::Path) -> BlockVerifyReport {
 /// scan and reports spurious corruption, so the caller skips the walk and
 /// surfaces the indeterminacy instead.
 #[cfg(feature = "std")]
+#[expect(
+    clippy::option_option,
+    reason = "three distinct outcomes: Err = I/O failure; Ok(None) = meta \
+              undecodable (scheme indeterminate); Ok(Some(inner)) = meta \
+              decoded where inner is the ECC scheme (None = ECC off)"
+)]
 fn read_ecc_params_out_of_band(
     fs: &dyn crate::fs::Fs,
     path: &std::path::Path,

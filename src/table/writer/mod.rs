@@ -1409,6 +1409,12 @@ struct MetaSectionParams<'a> {
 /// `Secded` has no shard layout (it is per-word, gated until #255) and
 /// resolves to `None` — there is no implicit RS(4,2) fallback.
 #[must_use]
+#[expect(
+    clippy::expect_used,
+    reason = "a zero shard count here is an upstream config-invariant violation \
+              (try_update rejects it on the live path), so it is a programming \
+              error that must fail loud, like the writer's other contract asserts"
+)]
 pub(crate) fn resolve_ecc(
     page_ecc: bool,
     scheme: crate::runtime_config::EccScheme,
