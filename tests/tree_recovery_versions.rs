@@ -312,6 +312,10 @@ fn tree_page_ecc_roundtrips_through_flush_and_reopen() -> lsm_tree::Result<()> {
             SequenceNumberCounter::default(),
         )
         .page_ecc(true)
+        .ecc_scheme(lsm_tree::runtime_config::EccScheme::ReedSolomon {
+            data_shards: 4,
+            parity_shards: 2,
+        })
         .open()?;
 
         tree.insert("k1", "v1", 0);
@@ -334,10 +338,135 @@ fn tree_page_ecc_roundtrips_through_flush_and_reopen() -> lsm_tree::Result<()> {
             SequenceNumberCounter::default(),
         )
         .page_ecc(true)
+        .ecc_scheme(lsm_tree::runtime_config::EccScheme::ReedSolomon {
+            data_shards: 4,
+            parity_shards: 2,
+        })
         .open()?;
 
         assert_eq!(Some("v1".as_bytes().into()), tree.get("k1", 2)?);
         assert_eq!(Some("v2".as_bytes().into()), tree.get("k2", 2)?);
+    }
+
+    Ok(())
+}
+
+/// A NON-default ECC scheme (XOR single-parity over 8 data shards)
+/// round-trips end-to-end through the per-SST descriptor.
+///
+/// The writer records the chosen scheme in `descriptor#page_ecc`; the
+/// reader re-derives the parity layout from that descriptor, NOT from
+/// the runtime config. To prove this, the reopen below uses a DEFAULT
+/// config (no `page_ecc`): the only way the blocks read back correctly
+/// is if the reader sized + skipped the XOR(8,1) parity trailer using
+/// the on-disk descriptor. A wrong scheme would mis-size the trailer
+/// and mis-align the next block on load. This is the "flexible config"
+/// acceptance: an arbitrary scheme, not the legacy RS(4,2), works.
+#[cfg(feature = "page_ecc")]
+#[test]
+fn tree_page_ecc_nondefault_scheme_roundtrips_via_descriptor() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let path = folder.path();
+
+    {
+        let tree = Config::new(
+            path,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .page_ecc(true)
+        .ecc_scheme(lsm_tree::runtime_config::EccScheme::ReedSolomon {
+            data_shards: 8,
+            parity_shards: 2,
+        })
+        .open()?;
+
+        for i in 0u64..2_000 {
+            tree.insert(format!("k{i:08}"), format!("v{i:08}"), i);
+        }
+        tree.flush_active_memtable(2_000)?;
+    }
+
+    // Reopen and read every key back. The blocks were written with a
+    // non-default RS(8,2) scheme (25% overhead, two-shard tolerance); the
+    // reader must size + skip each block's parity trailer using the
+    // per-SST descriptor scheme. A wrong scheme would mis-size the trailer
+    // and fail the block load on recovery — this is the "flexible config"
+    // acceptance: an arbitrary scheme, not just the legacy RS(4,2), works
+    // end-to-end through the descriptor.
+    {
+        // Reopen with a DEFAULT config: no `page_ecc`, no `ecc_scheme`. The
+        // reader must source the RS(8,2) layout from the on-disk descriptor,
+        // NOT from the runtime config — so a reopen that omits the ECC config
+        // entirely is the load-bearing proof. If the reader fell back to the
+        // (now default-off) runtime config, it would mis-size the parity
+        // trailer and fail the block load.
+        let tree = Config::new(
+            path,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .open()?;
+
+        for i in 0u64..2_000 {
+            assert_eq!(
+                Some(format!("v{i:08}").as_bytes().into()),
+                tree.get(format!("k{i:08}"), 2_001)?,
+                "key k{i:08} must read back under the on-disk RS(8,2) scheme",
+            );
+        }
+    }
+
+    Ok(())
+}
+
+/// The XOR single-parity scheme (RAID-5, `parity_shards == 1`) round-trips
+/// end-to-end through the per-SST descriptor.
+///
+/// XOR takes a different write path than Reed-Solomon: the writer maps it to
+/// the `Xor` descriptor kind (not `ReedSolomon`) and the codec computes parity
+/// directly without the RS engine. Reopening with a default config proves the
+/// reader sources the XOR(8,1) layout from the descriptor, not the runtime
+/// config.
+#[cfg(feature = "page_ecc")]
+#[test]
+fn tree_page_ecc_xor_scheme_roundtrips_via_descriptor() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let path = folder.path();
+
+    {
+        let tree = Config::new(
+            path,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .page_ecc(true)
+        .ecc_scheme(lsm_tree::runtime_config::EccScheme::Xor { data_shards: 8 })
+        .open()?;
+
+        for i in 0u64..2_000 {
+            tree.insert(format!("k{i:08}"), format!("v{i:08}"), i);
+        }
+        tree.flush_active_memtable(2_000)?;
+    }
+
+    {
+        // Default config reopen: the reader must size + skip each block's
+        // single XOR parity shard from the on-disk descriptor.
+        let tree = Config::new(
+            path,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .open()?;
+
+        for i in 0u64..2_000 {
+            assert_eq!(
+                Some(format!("v{i:08}").as_bytes().into()),
+                tree.get(format!("k{i:08}"), 2_001)?,
+                "key k{i:08} must read back under the on-disk XOR(8,1) scheme",
+            );
+        }
     }
 
     Ok(())
@@ -374,6 +503,10 @@ fn tree_page_ecc_emits_parity_trailer_on_disk() -> lsm_tree::Result<()> {
         SequenceNumberCounter::default(),
     )
     .page_ecc(true)
+    .ecc_scheme(lsm_tree::runtime_config::EccScheme::ReedSolomon {
+        data_shards: 4,
+        parity_shards: 2,
+    })
     .open()?;
 
     tree.insert("a", "alpha", 0);
@@ -451,6 +584,93 @@ fn tree_page_ecc_emits_parity_trailer_on_disk() -> lsm_tree::Result<()> {
          successful Header decode here most likely means the parity trailer was \
          NOT emitted (a page_ecc regression); less likely, the fixture spilled a \
          second data block (which would invalidate this single-block assertion).",
+    );
+
+    Ok(())
+}
+
+/// The on-disk parity overhead matches the CONFIGURED scheme, not a fixed
+/// layout: a single-block SST written with `Xor { data_shards: 8 }` carries
+/// exactly one XOR parity shard whose length follows the scheme's formula
+/// (`shard_bytes = ceil(N / 8)` rounded up to even). This pins the acceptance
+/// criterion "measured parity overhead matches the configured scheme".
+#[cfg(feature = "page_ecc")]
+#[test]
+fn tree_page_ecc_parity_overhead_matches_scheme() -> lsm_tree::Result<()> {
+    use lsm_tree::coding::Decode;
+    use lsm_tree::table::block::Header;
+    use std::fs;
+    use std::io::Read as _;
+
+    let folder = get_tmp_folder();
+    let path = folder.path();
+    const DATA_SHARDS: usize = 8;
+    {
+        let tree = Config::new(
+            path,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .page_ecc(true)
+        .ecc_scheme(lsm_tree::runtime_config::EccScheme::Xor {
+            data_shards: DATA_SHARDS as u8,
+        })
+        .open()?;
+        // A handful of entries → a single small data block.
+        tree.insert("a", "alpha", 0);
+        tree.insert("b", "bravo", 1);
+        tree.flush_active_memtable(0)?;
+    }
+
+    let tables_dir = path.join("tables");
+    let mut sst_path: Option<std::path::PathBuf> = None;
+    for entry in fs::read_dir(&tables_dir)? {
+        let entry = entry?;
+        if entry
+            .file_name()
+            .to_string_lossy()
+            .chars()
+            .all(|c| c.is_ascii_digit())
+        {
+            sst_path = Some(entry.path());
+            break;
+        }
+    }
+    let sst_path = sst_path.unwrap_or_else(|| panic!("flush should produce an SST"));
+
+    let reader = lsm_tree::sfa::Reader::new(&sst_path)?;
+    let data_section = reader
+        .toc()
+        .section(b"data")
+        .unwrap_or_else(|| panic!("data section must exist"));
+    let mut section_bytes = Vec::new();
+    data_section
+        .buf_reader(&sst_path)?
+        .read_to_end(&mut section_bytes)?;
+
+    let mut cursor = &section_bytes[..];
+    let header = Header::decode_from(&mut cursor)?;
+    let data_len = header.data_length as usize;
+    assert!(data_len > 0, "decoded a real data block");
+
+    // Single block ⇒ everything after `header + payload` is the parity trailer.
+    let parity_bytes = section_bytes
+        .len()
+        .checked_sub(Header::MIN_LEN + data_len)
+        .unwrap_or_else(|| panic!("section shorter than header + payload"));
+
+    // Xor{D} writes exactly one parity shard: shard_bytes = ceil(N / D) rounded
+    // up to even. This is the scheme's overhead — assert it byte-for-byte.
+    let ceil = data_len.div_ceil(DATA_SHARDS);
+    let expected_parity = if ceil.is_multiple_of(2) {
+        ceil
+    } else {
+        ceil + 1
+    };
+    assert_eq!(
+        parity_bytes, expected_parity,
+        "Xor({DATA_SHARDS}) on-disk parity ({parity_bytes} B) must equal the \
+         scheme's shard size ({expected_parity} B) for data_length {data_len}",
     );
 
     Ok(())

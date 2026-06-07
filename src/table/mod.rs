@@ -240,7 +240,7 @@ impl Table {
             block_type,
             compression,
             self.encryption.as_deref(),
-            self.metadata.page_ecc,
+            self.metadata.ecc_params,
             #[cfg(zstd_any)]
             zstd_dict,
             #[cfg(feature = "metrics")]
@@ -859,7 +859,7 @@ impl Table {
             self.metadata.data_block_compression,
             self.global_seqno(),
             self.encryption.clone(),
-            self.metadata.page_ecc,
+            self.metadata.ecc_params,
             self.metadata.kv_checksum_algo.is_some(),
             #[cfg(zstd_any)]
             self.zstd_dictionary.clone(),
@@ -901,7 +901,7 @@ impl Table {
             self.cache.clone(),
             self.metadata.data_block_compression,
             self.encryption.clone(),
-            self.metadata.page_ecc,
+            self.metadata.ecc_params,
             self.metadata.kv_checksum_algo.is_some(),
             #[cfg(zstd_any)]
             self.zstd_dictionary.clone(),
@@ -931,7 +931,7 @@ impl Table {
         table_id: TableId,
         compression: CompressionType,
         encryption: Option<&dyn crate::encryption::EncryptionProvider>,
-        page_ecc: bool,
+        ecc: Option<crate::table::block::EccParams>,
     ) -> crate::Result<IndexBlock> {
         // Tail copy first (preferred): if a fresh `tli_tail` exists it
         // landed after the head `tli`, so it's the most-recently
@@ -952,14 +952,7 @@ impl Table {
         // `tli_tail`; reader falls straight through to the head copy.
         if let Some(tail_handle) = regions.tli_tail {
             log::trace!("Reading TLI tail mirror, with tli_tail_ptr={tail_handle:?}");
-            match Self::read_tli_at(
-                file,
-                tail_handle,
-                table_id,
-                compression,
-                encryption,
-                page_ecc,
-            ) {
+            match Self::read_tli_at(file, tail_handle, table_id, compression, encryption, ecc) {
                 Ok(idx) => return Ok(idx),
                 Err(tail_err) => {
                     log::warn!(
@@ -979,7 +972,7 @@ impl Table {
                         table_id,
                         compression,
                         encryption,
-                        page_ecc,
+                        ecc,
                     ) {
                         Ok(idx) => Ok(idx),
                         Err(head_err) => {
@@ -994,14 +987,7 @@ impl Table {
         }
 
         log::trace!("Reading TLI head copy, with tli_ptr={:?}", regions.tli);
-        Self::read_tli_at(
-            file,
-            regions.tli,
-            table_id,
-            compression,
-            encryption,
-            page_ecc,
-        )
+        Self::read_tli_at(file, regions.tli, table_id, compression, encryption, ecc)
     }
 
     fn read_tli_at(
@@ -1010,7 +996,7 @@ impl Table {
         table_id: TableId,
         compression: CompressionType,
         encryption: Option<&dyn crate::encryption::EncryptionProvider>,
-        page_ecc: bool,
+        ecc: Option<crate::table::block::EccParams>,
     ) -> crate::Result<IndexBlock> {
         let block = Block::from_file(
             file,
@@ -1044,7 +1030,11 @@ impl Table {
                     #[cfg(zstd_any)]
                     None,
                 )?;
-                if page_ecc { t.with_ecc() } else { t }
+                if let Some(ecc) = ecc {
+                    t.with_ecc(ecc)
+                } else {
+                    t
+                }
             },
         )?;
 
@@ -1181,7 +1171,7 @@ impl Table {
                 metadata.id,
                 metadata.index_block_compression,
                 encryption.as_deref(),
-                metadata.page_ecc,
+                metadata.ecc_params,
             )?;
 
             BlockIndexImpl::TwoLevel(TwoLevelBlockIndex {
@@ -1192,7 +1182,7 @@ impl Table {
                 file_accessor: file_accessor.clone(),
                 table_id: (tree_id, metadata.id).into(),
                 encryption: encryption.clone(),
-                page_ecc: metadata.page_ecc,
+                ecc: metadata.ecc_params,
                 comparator: comparator.clone(),
 
                 #[cfg(feature = "metrics")]
@@ -1210,7 +1200,7 @@ impl Table {
                 metadata.id,
                 metadata.index_block_compression,
                 encryption.as_deref(),
-                metadata.page_ecc,
+                metadata.ecc_params,
             )?;
             BlockIndexImpl::Full(FullBlockIndex::new(block, comparator.clone())?)
         } else {
@@ -1224,7 +1214,7 @@ impl Table {
                 path: Arc::clone(&file_path),
                 table_id: (tree_id, metadata.id).into(),
                 encryption: encryption.clone(),
-                page_ecc: metadata.page_ecc,
+                ecc: metadata.ecc_params,
                 comparator: comparator.clone(),
 
                 #[cfg(feature = "metrics")]
@@ -1253,7 +1243,11 @@ impl Table {
                         #[cfg(zstd_any)]
                         None,
                     )?;
-                    if metadata.page_ecc { t.with_ecc() } else { t }
+                    if let Some(ecc) = metadata.ecc_params {
+                        t.with_ecc(ecc)
+                    } else {
+                        t
+                    }
                 },
             )?;
             if block.header.block_type != BlockType::Index {
@@ -1301,7 +1295,11 @@ impl Table {
                                 Some(enc) => crate::table::block::BlockTransform::Encrypted(enc),
                                 None => crate::table::block::BlockTransform::PLAIN,
                             };
-                            if metadata.page_ecc { t.with_ecc() } else { t }
+                            if let Some(ecc) = metadata.ecc_params {
+                                t.with_ecc(ecc)
+                            } else {
+                                t
+                            }
                         },
                     )
                     .and_then(|block| {
@@ -1346,7 +1344,11 @@ impl Table {
                         Some(enc) => crate::table::block::BlockTransform::Encrypted(enc),
                         None => crate::table::block::BlockTransform::PLAIN,
                     };
-                    if metadata.page_ecc { t.with_ecc() } else { t }
+                    if let Some(ecc) = metadata.ecc_params {
+                        t.with_ecc(ecc)
+                    } else {
+                        t
+                    }
                 },
             )?;
 

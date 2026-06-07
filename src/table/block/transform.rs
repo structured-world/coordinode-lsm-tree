@@ -70,6 +70,88 @@
 use crate::compression::ZstdDictionary;
 use crate::{CompressionType, encryption::EncryptionProvider};
 
+/// Reed-Solomon / XOR shard layout carried by the `*Ecc` transform
+/// variants: `data_shards` data shards plus `parity_shards` parity
+/// shards (`parity_shards == 1` is plain-XOR RAID-5).
+///
+/// Recorded per-SST in the ECC descriptor; the write path takes it from
+/// the configured scheme and the read path from the SST's `TableMeta`,
+/// so writer and reader always size and recover the parity trailer
+/// identically. [`Self::RS_4_2`] is the historical default kept for
+/// tests; production picks a low-overhead scheme (XOR single-parity).
+///
+/// Not feature-gated (a 2-byte POD) so call sites pass it uniformly
+/// across the feature matrix; the `*Ecc` variants that store it and
+/// the parity codec that consumes it are `page_ecc`-gated.
+///
+/// Both shard counts are non-zero by construction: the only public
+/// constructor is [`Self::try_new`], which rejects a zero in either
+/// position (a zero-shard layout is non-recoverable and would serialize
+/// to a descriptor that the read path rejects on reopen). The fields are
+/// private so an external caller cannot bypass that check by building the
+/// struct literally and feeding it to a `*Ecc` transform variant.
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
+pub struct EccParams {
+    /// Number of data shards the block payload is split into (`>= 1`).
+    data_shards: u8,
+    /// Number of parity shards (`1` = XOR single-parity / RAID-5; `>= 1`).
+    parity_shards: u8,
+}
+
+impl EccParams {
+    /// Legacy fixed RS(4,2) layout (50% overhead). Default for tests
+    /// only; never an implicit production default.
+    pub const RS_4_2: Self = Self {
+        data_shards: 4,
+        parity_shards: 2,
+    };
+
+    /// Builds a shard layout, rejecting a zero count in either position.
+    ///
+    /// A zero-shard layout has no valid parity trailer, so it is refused
+    /// here (the only public construction path) rather than later, deep
+    /// in block I/O or on reopen where `TableMeta` parsing would reject
+    /// the resulting descriptor.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error::FeatureUnsupported`] when `data_shards` or
+    /// `parity_shards` is zero.
+    pub fn try_new(data_shards: u8, parity_shards: u8) -> crate::Result<Self> {
+        if data_shards == 0 {
+            return Err(crate::Error::FeatureUnsupported("ecc_scheme data_shards=0"));
+        }
+        if parity_shards == 0 {
+            return Err(crate::Error::FeatureUnsupported(
+                "ecc_scheme parity_shards=0",
+            ));
+        }
+        Ok(Self {
+            data_shards,
+            parity_shards,
+        })
+    }
+
+    /// Number of data shards the block payload is split into (`>= 1`).
+    #[must_use]
+    pub const fn data_shards(self) -> u8 {
+        self.data_shards
+    }
+
+    /// Number of parity shards (`1` = XOR single-parity / RAID-5; `>= 1`).
+    #[must_use]
+    pub const fn parity_shards(self) -> u8 {
+        self.parity_shards
+    }
+
+    /// `(data_shards, parity_shards)` as `usize`, for the `crate::ecc`
+    /// shard-based encode / recover API.
+    #[must_use]
+    pub const fn as_shards(self) -> (usize, usize) {
+        (self.data_shards as usize, self.parity_shards as usize)
+    }
+}
+
 /// Codec configuration for the compression step of a block payload.
 ///
 /// Fields are private; the only way to construct a value is via
@@ -227,17 +309,21 @@ pub enum BlockTransform<'a> {
     CompressedAndEncrypted(CompressionContext<'a>, &'a dyn EncryptionProvider),
 
     /// `raw → checksum → ecc parity → disk`. Same as [`Self::Plain`]
-    /// but emits a Reed-Solomon (4, 2) parity trailer after the
-    /// on-disk payload. The header's `ECC_PARITY` flag marks the
-    /// trailer's presence (its length is derived from `data_length`),
-    /// so the reader can verify-and-recover from a single data-shard
-    /// loss without a separate sidecar.
+    /// but emits a parity trailer after the on-disk payload under the
+    /// shard scheme carried in its [`EccParams`] (data + parity shard
+    /// counts). On the SST read path, decoded headers zero `block_flags`,
+    /// so trailer presence and sizing come from the per-SST descriptor
+    /// (`ParsedMeta::ecc_params`) via `Header::on_disk_size_with(ecc)` —
+    /// not a header flag; self-describing blocks (Meta / Manifest) keep
+    /// the `ECC_PARITY` flag and the fixed RS(4,2) layout. Either way the
+    /// reader verifies-and-recovers up to `parity_shards` lost shards
+    /// without a separate sidecar.
     #[cfg(feature = "page_ecc")]
-    PlainEcc,
+    PlainEcc(EccParams),
 
     /// `raw → compress → checksum → ecc parity → disk`.
     #[cfg(feature = "page_ecc")]
-    CompressedEcc(CompressionContext<'a>),
+    CompressedEcc(CompressionContext<'a>, EccParams),
 
     /// `raw → encrypt → checksum → ecc parity → disk`. The parity is
     /// computed over the encrypted ciphertext and stored in a
@@ -249,11 +335,15 @@ pub enum BlockTransform<'a> {
     /// impacts recoverability. ECC is a best-effort recovery aid for
     /// bit-rot, not an integrity primitive on top of AEAD.
     #[cfg(feature = "page_ecc")]
-    EncryptedEcc(&'a dyn EncryptionProvider),
+    EncryptedEcc(&'a dyn EncryptionProvider, EccParams),
 
     /// `raw → compress → encrypt → checksum → ecc parity → disk`.
     #[cfg(feature = "page_ecc")]
-    CompressedAndEncryptedEcc(CompressionContext<'a>, &'a dyn EncryptionProvider),
+    CompressedAndEncryptedEcc(
+        CompressionContext<'a>,
+        &'a dyn EncryptionProvider,
+        EccParams,
+    ),
 }
 
 impl BlockTransform<'_> {
@@ -278,9 +368,9 @@ impl BlockTransform<'_> {
             Self::Plain | Self::Encrypted(_) => CompressionType::None,
             Self::Compressed(ctx) | Self::CompressedAndEncrypted(ctx, _) => ctx.kind(),
             #[cfg(feature = "page_ecc")]
-            Self::PlainEcc | Self::EncryptedEcc(_) => CompressionType::None,
+            Self::PlainEcc(_) | Self::EncryptedEcc(_, _) => CompressionType::None,
             #[cfg(feature = "page_ecc")]
-            Self::CompressedEcc(ctx) | Self::CompressedAndEncryptedEcc(ctx, _) => ctx.kind(),
+            Self::CompressedEcc(ctx, _) | Self::CompressedAndEncryptedEcc(ctx, _, _) => ctx.kind(),
         }
     }
 
@@ -296,9 +386,11 @@ impl BlockTransform<'_> {
             Self::Plain | Self::Encrypted(_) => None,
             Self::Compressed(ctx) | Self::CompressedAndEncrypted(ctx, _) => ctx.zstd_dict(),
             #[cfg(feature = "page_ecc")]
-            Self::PlainEcc | Self::EncryptedEcc(_) => None,
+            Self::PlainEcc(_) | Self::EncryptedEcc(_, _) => None,
             #[cfg(feature = "page_ecc")]
-            Self::CompressedEcc(ctx) | Self::CompressedAndEncryptedEcc(ctx, _) => ctx.zstd_dict(),
+            Self::CompressedEcc(ctx, _) | Self::CompressedAndEncryptedEcc(ctx, _, _) => {
+                ctx.zstd_dict()
+            }
         }
     }
 
@@ -312,9 +404,9 @@ impl BlockTransform<'_> {
             Self::Plain | Self::Compressed(_) => None,
             Self::Encrypted(enc) | Self::CompressedAndEncrypted(_, enc) => Some(*enc),
             #[cfg(feature = "page_ecc")]
-            Self::PlainEcc | Self::CompressedEcc(_) => None,
+            Self::PlainEcc(_) | Self::CompressedEcc(_, _) => None,
             #[cfg(feature = "page_ecc")]
-            Self::EncryptedEcc(enc) | Self::CompressedAndEncryptedEcc(_, enc) => Some(*enc),
+            Self::EncryptedEcc(enc, _) | Self::CompressedAndEncryptedEcc(_, enc, _) => Some(*enc),
         }
     }
 
@@ -331,10 +423,32 @@ impl BlockTransform<'_> {
             | Self::Encrypted(_)
             | Self::CompressedAndEncrypted(_, _) => false,
             #[cfg(feature = "page_ecc")]
-            Self::PlainEcc
-            | Self::CompressedEcc(_)
-            | Self::EncryptedEcc(_)
-            | Self::CompressedAndEncryptedEcc(_, _) => true,
+            Self::PlainEcc(_)
+            | Self::CompressedEcc(_, _)
+            | Self::EncryptedEcc(_, _)
+            | Self::CompressedAndEncryptedEcc(_, _, _) => true,
+        }
+    }
+
+    /// Shard layout for the parity trailer when this transform emits
+    /// one, else `None`. The write path sizes the trailer from this and
+    /// the read path recovers with it (sourced per-SST so both agree).
+    ///
+    /// Not feature-gated: without `page_ecc` there are no `*Ecc`
+    /// variants, so this is always `None` — call sites stay uniform
+    /// across the feature matrix.
+    #[must_use]
+    pub fn ecc_params(&self) -> Option<EccParams> {
+        match self {
+            Self::Plain
+            | Self::Compressed(_)
+            | Self::Encrypted(_)
+            | Self::CompressedAndEncrypted(_, _) => None,
+            #[cfg(feature = "page_ecc")]
+            Self::PlainEcc(p)
+            | Self::CompressedEcc(_, p)
+            | Self::EncryptedEcc(_, p)
+            | Self::CompressedAndEncryptedEcc(_, _, p) => Some(*p),
         }
     }
 
@@ -348,10 +462,9 @@ impl BlockTransform<'_> {
     ///
     /// ```text
     /// let transform = BlockTransform::from_parts(...)?;
-    /// let transform = if config.page_ecc {
-    ///     transform.with_ecc()
-    /// } else {
-    ///     transform
+    /// let transform = match ecc_params {
+    ///     Some(params) => transform.with_ecc(params),
+    ///     None => transform,
     /// };
     /// ```
     ///
@@ -359,21 +472,31 @@ impl BlockTransform<'_> {
     /// don't exist and this method becomes the identity function —
     /// the compiler folds it out at the call site so the
     /// runtime-flag branch is dead code.
+    #[cfg(feature = "page_ecc")]
     #[must_use]
-    pub fn with_ecc(self) -> Self {
+    pub fn with_ecc(self, params: EccParams) -> Self {
+        // Non-Ecc variants gain the trailer; already-Ecc variants
+        // re-stamp the params (same target variant either way).
         match self {
-            #[cfg(feature = "page_ecc")]
-            Self::Plain => Self::PlainEcc,
-            #[cfg(feature = "page_ecc")]
-            Self::Compressed(ctx) => Self::CompressedEcc(ctx),
-            #[cfg(feature = "page_ecc")]
-            Self::Encrypted(enc) => Self::EncryptedEcc(enc),
-            #[cfg(feature = "page_ecc")]
-            Self::CompressedAndEncrypted(ctx, enc) => Self::CompressedAndEncryptedEcc(ctx, enc),
-            // Already-Ecc variants pass through; on builds with
-            // the feature off, every variant lands here.
-            other => other,
+            Self::Plain | Self::PlainEcc(_) => Self::PlainEcc(params),
+            Self::Compressed(ctx) | Self::CompressedEcc(ctx, _) => Self::CompressedEcc(ctx, params),
+            Self::Encrypted(enc) | Self::EncryptedEcc(enc, _) => Self::EncryptedEcc(enc, params),
+            Self::CompressedAndEncrypted(ctx, enc)
+            | Self::CompressedAndEncryptedEcc(ctx, enc, _) => {
+                Self::CompressedAndEncryptedEcc(ctx, enc, params)
+            }
         }
+    }
+
+    /// Identity on builds without the `page_ecc` feature: the `Ecc`
+    /// variants don't exist, so callers' `if ecc { t.with_ecc(..) }`
+    /// branch is dead and folds out. Takes [`EccParams`] (which is not
+    /// feature-gated) so call sites compile across the feature matrix
+    /// without per-call `#[cfg]`.
+    #[cfg(not(feature = "page_ecc"))]
+    #[must_use]
+    pub fn with_ecc(self, _params: EccParams) -> Self {
+        self
     }
 }
 
@@ -448,6 +571,10 @@ impl<'a> BlockTransform<'a> {
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::expect_used,
+    reason = "tests panic on the unhappy paths to surface failures loudly"
+)]
 mod tests {
     use super::*;
 
@@ -469,7 +596,7 @@ mod tests {
     #[cfg(feature = "page_ecc")]
     #[test]
     fn plain_ecc_variant_reports_ecc_enabled_no_other_transform() {
-        let t = BlockTransform::PlainEcc;
+        let t = BlockTransform::PlainEcc(EccParams::RS_4_2);
         assert_eq!(t.compression(), CompressionType::None);
         assert!(t.encryption().is_none());
         assert!(t.page_ecc());
@@ -481,9 +608,67 @@ mod tests {
         let Ok(ctx) = CompressionContext::new(CompressionType::Lz4) else {
             panic!("Lz4 ctx construction is total");
         };
-        let t = BlockTransform::CompressedEcc(ctx);
+        let t = BlockTransform::CompressedEcc(ctx, EccParams::RS_4_2);
         assert_eq!(t.compression(), CompressionType::Lz4);
         assert!(t.encryption().is_none());
         assert!(t.page_ecc());
+    }
+
+    #[test]
+    fn eccparams_try_new_rejects_zero_shards() {
+        // Zero in either position has no valid parity layout, so the only
+        // public constructor must refuse it (the invariant the private
+        // fields exist to protect).
+        assert!(matches!(
+            EccParams::try_new(0, 2),
+            Err(crate::Error::FeatureUnsupported(_))
+        ));
+        assert!(matches!(
+            EccParams::try_new(8, 0),
+            Err(crate::Error::FeatureUnsupported(_))
+        ));
+        let ok = EccParams::try_new(8, 2).expect("non-zero shards are accepted");
+        assert_eq!((ok.data_shards(), ok.parity_shards()), (8, 2));
+        assert_eq!(ok.as_shards(), (8, 2));
+    }
+
+    #[cfg(feature = "page_ecc")]
+    #[test]
+    fn with_ecc_upgrades_plain_to_plain_ecc() {
+        let p = EccParams::try_new(8, 2).expect("valid shards");
+        let t = BlockTransform::Plain.with_ecc(p);
+        assert!(matches!(t, BlockTransform::PlainEcc(_)));
+        assert_eq!(t.ecc_params(), Some(p));
+        assert_eq!(t.compression(), CompressionType::None);
+        assert!(t.encryption().is_none());
+        // Re-stamping an already-Ecc variant replaces the params.
+        let p2 = EccParams::try_new(4, 2).expect("valid shards");
+        assert_eq!(t.with_ecc(p2).ecc_params(), Some(p2));
+    }
+
+    #[cfg(all(feature = "page_ecc", feature = "encryption"))]
+    #[test]
+    fn with_ecc_upgrades_encrypted_variants() {
+        let p = EccParams::try_new(8, 2).expect("valid shards");
+        let enc = crate::encryption::Aes256GcmProvider::new(&[0x11; 32]);
+
+        let t = BlockTransform::Encrypted(&enc).with_ecc(p);
+        assert!(matches!(t, BlockTransform::EncryptedEcc(_, _)));
+        assert_eq!(t.ecc_params(), Some(p));
+        assert!(t.encryption().is_some());
+        assert_eq!(t.compression(), CompressionType::None);
+
+        #[cfg(feature = "lz4")]
+        {
+            let ctx = CompressionContext::new(CompressionType::Lz4).expect("lz4 ctx");
+            let t = BlockTransform::CompressedAndEncrypted(ctx, &enc).with_ecc(p);
+            assert!(matches!(
+                t,
+                BlockTransform::CompressedAndEncryptedEcc(_, _, _)
+            ));
+            assert_eq!(t.ecc_params(), Some(p));
+            assert!(t.encryption().is_some());
+            assert_eq!(t.compression(), CompressionType::Lz4);
+        }
     }
 }

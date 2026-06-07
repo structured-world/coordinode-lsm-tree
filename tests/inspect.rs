@@ -135,3 +135,83 @@ fn read_table_properties_errors_when_both_meta_copies_zeroed() {
     // routing and break the next time the error enum changes.
     let _ = err;
 }
+
+/// The out-of-band inspect facade must decode index + filter blocks of an
+/// ECC-enabled SST, sizing each block's parity trailer from the per-SST
+/// descriptor scheme. Before the index/filter loaders threaded the
+/// descriptor's `EccParams`, they built non-ECC transforms and failed on
+/// the parity-bearing index/filter blocks of an ECC SST. A non-default
+/// scheme (RS(8,2)) pins that the loaders use the descriptor, not a
+/// hardcoded layout.
+#[cfg(feature = "page_ecc")]
+#[test]
+fn inspect_reads_ecc_sst_index_filter_and_data() {
+    use lsm_tree::inspect::{
+        iter_data_block_entries, read_filter_stats, read_top_level_index_entries,
+    };
+    use lsm_tree::runtime_config::EccScheme;
+
+    let folder = get_tmp_folder();
+    let dir = tempfile::TempDir::new_in(folder).unwrap();
+    {
+        let tree = Config::new(
+            dir.path(),
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .page_ecc(true)
+        .ecc_scheme(EccScheme::ReedSolomon {
+            data_shards: 8,
+            parity_shards: 2,
+        })
+        .open()
+        .unwrap();
+        for i in 0u64..2_000 {
+            tree.insert(format!("key-{i:06}"), format!("v{i:06}"), i);
+        }
+        tree.flush_active_memtable(2_000).unwrap();
+    }
+    let sst = find_table_file(dir.path());
+
+    // Index (TLI) block: must decode through the descriptor-driven ECC
+    // transform. A non-empty entry list also proves the block parsed.
+    let entries = read_top_level_index_entries(&sst)
+        .expect("TLI of an ECC SST must decode via the descriptor scheme");
+    assert!(!entries.is_empty(), "expected at least one TLI entry");
+
+    // Filter block: ECC-enabled SSTs carry a parity trailer on the filter
+    // block too; the loader must size it from the descriptor.
+    let _ = read_filter_stats(&sst).expect("filter block of an ECC SST must decode");
+
+    // Data blocks: the iterator must walk every data block (each parity
+    // sized from the descriptor) without a load error.
+    let count = iter_data_block_entries(&sst)
+        .expect("data-block iterator must open on an ECC SST")
+        .filter(|e| {
+            if let Err(err) = e {
+                panic!("data block of an ECC SST failed to load: {err:?}");
+            }
+            true
+        })
+        .count();
+    assert_eq!(count, 2_000, "every inserted key must be enumerated");
+
+    // Inspect surfaces the per-table ECC state structurally: a recognized
+    // RS(8,2) scheme is `page_ecc = true`, not flagged unrecognized.
+    let props = read_table_properties(&sst).expect("table properties decode");
+    assert!(props.page_ecc, "RS(8,2) SST must report page_ecc");
+    assert!(
+        !props.ecc_unrecognized,
+        "a recognized scheme is not flagged unrecognized",
+    );
+}
+
+/// A non-ECC SST reports `page_ecc = false` and is not flagged unrecognized —
+/// the structural ECC surface in `TableProperties`.
+#[test]
+fn read_table_properties_reports_no_ecc_for_plain_sst() {
+    let (_dir, sst) = build_tree_with_items(32);
+    let props = read_table_properties(&sst).expect("table properties decode");
+    assert!(!props.page_ecc);
+    assert!(!props.ecc_unrecognized);
+}

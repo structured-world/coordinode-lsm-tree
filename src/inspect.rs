@@ -90,6 +90,16 @@ pub struct TableProperties {
     /// meta — the writer snapshots `unix_timestamp()` once and emits
     /// the same value to both copies.
     pub created_at_nanos: u128,
+    /// `true` when the table was written with a recognized, applicable Page
+    /// ECC scheme (the read path sizes + recovers its parity trailers).
+    pub page_ecc: bool,
+    /// `true` when the table's ECC descriptor decodes to a scheme this build
+    /// cannot apply (an unimplemented scheme, page granularity, an unknown
+    /// kind, or a non-canonical descriptor). Block data still reads (verified
+    /// by its checksum) but without ECC recovery; recompaction re-stamps the
+    /// table with a supported scheme. Mutually exclusive with
+    /// [`Self::page_ecc`].
+    pub ecc_unrecognized: bool,
 }
 
 /// Reads `path` and returns its on-disk metadata as
@@ -177,6 +187,8 @@ pub fn read_table_properties(path: &Path) -> crate::Result<TableProperties> {
         data_block_compression: meta.data_block_compression,
         index_block_compression: meta.index_block_compression,
         created_at_nanos: *meta.created_at,
+        page_ecc: meta.page_ecc,
+        ecc_unrecognized: meta.ecc_unrecognized,
     })
 }
 
@@ -284,6 +296,7 @@ pub fn read_top_level_index_entries(path: &Path) -> crate::Result<Vec<IndexEntry
         }
     };
     let index_compression = meta.index_block_compression;
+    let ecc = meta.ecc_params;
     let table_id = meta.id;
 
     // TLI tail mirror tried first when present (most-recently fsynced
@@ -291,17 +304,17 @@ pub fn read_top_level_index_entries(path: &Path) -> crate::Result<Vec<IndexEntry
     // `Table::read_tli` so a partially-corrupted TLI behaves the
     // same here as in a live open.
     let tli_block = if let Some(tail_handle) = regions.tli_tail {
-        match load_index_block(&*file, tail_handle, table_id, index_compression) {
+        match load_index_block(&*file, tail_handle, table_id, index_compression, ecc) {
             Ok(b) => b,
             Err(tail_err) => {
-                match load_index_block(&*file, regions.tli, table_id, index_compression) {
+                match load_index_block(&*file, regions.tli, table_id, index_compression, ecc) {
                     Ok(b) => b,
                     Err(_) => return Err(tail_err),
                 }
             }
         }
     } else {
-        load_index_block(&*file, regions.tli, table_id, index_compression)?
+        load_index_block(&*file, regions.tli, table_id, index_compression, ecc)?
     };
 
     let block = IndexBlock::new(tli_block);
@@ -328,6 +341,7 @@ fn load_index_block(
     handle: crate::table::BlockHandle,
     table_id: crate::table::TableId,
     compression: CompressionType,
+    ecc: Option<crate::table::block::EccParams>,
 ) -> crate::Result<crate::table::Block> {
     use crate::table::block::{Block, BlockIdentity, BlockType};
 
@@ -355,12 +369,25 @@ fn load_index_block(
         // `Error::ZstdDictMismatch` because the dict can't be
         // recovered without a live `Tree`; inspect such SSTs through
         // the owning tree instead.
-        &crate::table::block::BlockTransform::from_parts(
-            compression,
-            None,
-            #[cfg(zstd_any)]
-            None,
-        )?,
+        //
+        // Index blocks omit the block_flags byte, so ECC presence is a
+        // per-SST descriptor property: upgrade to the `*Ecc` transform when
+        // the SST was written with Page ECC, sizing the parity trailer the
+        // reader must skip from the descriptor scheme. Identity without the
+        // feature.
+        &{
+            let t = crate::table::block::BlockTransform::from_parts(
+                compression,
+                None,
+                #[cfg(zstd_any)]
+                None,
+            )?;
+            if let Some(ecc) = ecc {
+                t.with_ecc(ecc)
+            } else {
+                t
+            }
+        },
     )?;
 
     if block.header.block_type != BlockType::Index {
@@ -477,9 +504,9 @@ pub struct DataBlockEntryIter {
     table_id: crate::table::TableId,
     data_block_compression: CompressionType,
     /// Per-SST Page-ECC flag from the parsed meta: data blocks omit the
-    /// `block_flags` byte, so the read transform needs it to expect a parity
-    /// trailer.
-    page_ecc: bool,
+    /// `block_flags` byte, so the read transform needs the parity scheme
+    /// to size + recover the trailer. `None` = no parity.
+    ecc: Option<crate::table::block::EccParams>,
     /// Per-SST per-KV-footer flag (`kv_checksum_algo.is_some()`) from the
     /// parsed meta: tells `from_loaded` whether to strip a footer.
     has_kv_footer: bool,
@@ -566,7 +593,7 @@ impl Iterator for DataBlockEntryIter {
                 &handle,
                 self.table_id,
                 self.data_block_compression,
-                self.page_ecc,
+                self.ecc,
                 self.has_kv_footer,
             ) {
                 Ok(iter) => {
@@ -679,22 +706,23 @@ pub fn iter_data_block_entries(path: &Path) -> crate::Result<DataBlockEntryIter>
     let table_id = meta.id;
     let data_block_compression = meta.data_block_compression;
     let index_compression = meta.index_block_compression;
+    let ecc = meta.ecc_params;
 
     // Load TLI (with tail-mirror fallback). For full-index tables
     // each TLI entry IS a data-block handle, so this list is what
     // we stream over.
     let tli_block = if let Some(tail_handle) = regions.tli_tail {
-        match load_index_block(&*file, tail_handle, table_id, index_compression) {
+        match load_index_block(&*file, tail_handle, table_id, index_compression, ecc) {
             Ok(b) => b,
             Err(tail_err) => {
-                match load_index_block(&*file, regions.tli, table_id, index_compression) {
+                match load_index_block(&*file, regions.tli, table_id, index_compression, ecc) {
                     Ok(b) => b,
                     Err(_) => return Err(tail_err),
                 }
             }
         }
     } else {
-        load_index_block(&*file, regions.tli, table_id, index_compression)?
+        load_index_block(&*file, regions.tli, table_id, index_compression, ecc)?
     };
 
     let block = IndexBlock::new(tli_block);
@@ -720,7 +748,7 @@ pub fn iter_data_block_entries(path: &Path) -> crate::Result<DataBlockEntryIter>
         file,
         table_id,
         data_block_compression,
-        page_ecc: meta.page_ecc,
+        ecc: meta.ecc_params,
         has_kv_footer: meta.kv_checksum_algo.is_some(),
         remaining_handles: handles,
         current: None,
@@ -734,7 +762,7 @@ fn load_data_block_iter(
     handle: &crate::table::BlockHandle,
     table_id: crate::table::TableId,
     compression: CompressionType,
-    page_ecc: bool,
+    ecc: Option<crate::table::block::EccParams>,
     has_kv_footer: bool,
 ) -> crate::Result<crate::table::iter::OwnedDataBlockIter> {
     use crate::table::DataBlock;
@@ -779,7 +807,11 @@ fn load_data_block_iter(
                 #[cfg(zstd_any)]
                 None,
             )?;
-            if page_ecc { t.with_ecc() } else { t }
+            if let Some(ecc) = ecc {
+                t.with_ecc(ecc)
+            } else {
+                t
+            }
         },
     )?;
 
@@ -973,7 +1005,19 @@ pub fn read_filter_stats(path: &Path) -> crate::Result<Option<FilterStats>> {
             dict_id: 0,
             window_log: 0,
         },
-        &crate::table::block::BlockTransform::PLAIN,
+        // Filter blocks omit the block_flags byte, so ECC presence is a
+        // per-SST descriptor property: upgrade the `Plain` transform to its
+        // `*Ecc` variant when the SST was written with Page ECC, so the
+        // parity trailer is sized + skipped with the descriptor scheme.
+        // Identity without the feature.
+        &{
+            let t = crate::table::block::BlockTransform::PLAIN;
+            if let Some(ecc) = meta.ecc_params {
+                t.with_ecc(ecc)
+            } else {
+                t
+            }
+        },
     )?;
     if block.header.block_type != BlockType::Filter {
         return Err(crate::Error::InvalidTag((

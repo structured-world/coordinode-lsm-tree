@@ -162,9 +162,11 @@ impl ManifestArchiveWriter {
 
         match (ecc_on, self.encryption.as_deref()) {
             #[cfg(feature = "page_ecc")]
-            (true, Some(enc)) => BlockTransform::EncryptedEcc(enc),
+            (true, Some(enc)) => {
+                BlockTransform::EncryptedEcc(enc, crate::table::block::EccParams::RS_4_2)
+            }
             #[cfg(feature = "page_ecc")]
-            (true, None) => BlockTransform::PlainEcc,
+            (true, None) => BlockTransform::PlainEcc(crate::table::block::EccParams::RS_4_2),
             (_, Some(enc)) => BlockTransform::Encrypted(enc),
             (_, None) => BlockTransform::PLAIN,
         }

@@ -86,22 +86,28 @@ impl RuntimeConfigHandle {
     /// validation error without applying the update, so the live
     /// snapshot stays at the pre-mutation value.
     ///
-    /// Checks: (1) the `page_ecc` cargo feature — flipping
-    /// `page_ecc = true` on a binary that doesn't link the
-    /// Reed-Solomon codec would silently no-op at the manifest writer
-    /// (the `PlainEcc` `BlockTransform` arm is feature-gated out), so
-    /// we reject the update instead of letting the caller believe ECC
-    /// is on; (2) `kv_checksum_compute_point = AtInsert`, which is not
-    /// yet wired into the memtable / writer path — accepting it would
-    /// silently behave as `AtBlockCompile`, so it is rejected.
+    /// Checks operate on the EFFECTIVE ECC state (the global `page_ecc`
+    /// flag OR any per-scope override), not the raw flag:
+    /// (1) the `page_ecc` cargo feature — enabling ECC on a binary that
+    /// doesn't link the Reed-Solomon codec would silently no-op at the
+    /// writer (the `*Ecc` `BlockTransform` arms are feature-gated out), so
+    /// the update is rejected; (2) when ECC is on, the scheme + granularity
+    /// must be ones the writer can emit — `Secded` (the on-default) is
+    /// rejected until #255 wires it, `Page` granularity is rejected (only
+    /// `Block` is wired), a zero shard count is rejected (no implicit
+    /// RS(4,2) fallback), and `ReedSolomon` needs >= 2 parity shards
+    /// (single parity is expressed as `Xor`); (3) `kv_checksum_compute_point
+    /// = AtInsert`, which is not yet wired into the memtable / writer path —
+    /// accepting it would silently behave as `AtBlockCompile`.
     ///
     /// # Errors
     ///
-    /// - [`crate::Error::PageEccUnsupported`] when the mutator
-    ///   leaves `page_ecc = true` on a build without the cargo
-    ///   feature.
-    /// - [`crate::Error::FeatureUnsupported`] when the mutator sets
-    ///   `kv_checksum_compute_point = AtInsert` (not yet implemented).
+    /// - [`crate::Error::PageEccUnsupported`] when the mutator enables ECC
+    ///   (via the flag or an override) on a build without the cargo feature.
+    /// - [`crate::Error::FeatureUnsupported`] when the mutator enables ECC
+    ///   with an unwired / invalid scheme or granularity (`Secded`, `Page`,
+    ///   a zero shard count, single-parity `ReedSolomon`), or sets
+    ///   `kv_checksum_compute_point = AtInsert`.
     pub fn try_update<F>(&self, mutator: F) -> crate::Result<()>
     where
         F: FnOnce(&mut RuntimeConfig),
@@ -109,8 +115,51 @@ impl RuntimeConfigHandle {
         let current = self.inner.load_full();
         let mut next = (*current).clone();
         mutator(&mut next);
-        if next.page_ecc && !cfg!(feature = "page_ecc") {
+        // Validate the EFFECTIVE ECC state, not just the global `page_ecc`
+        // flag: a per-scope override (`data_block_ecc_override` /
+        // `kv_checksums_ecc_override`) can enable ECC even with
+        // `page_ecc == false`, and the manifest tracks the global flag.
+        let ecc_enabled = next.data_block_ecc() || next.kv_checksums_ecc() || next.manifest_ecc();
+        if ecc_enabled && !cfg!(feature = "page_ecc") {
             return Err(crate::Error::PageEccUnsupported);
+        }
+        // When ECC is on, the scheme + granularity must be one the writer
+        // can actually emit. `Secded` (the on-default) is the per-word
+        // Hamming tier, not yet wired (#255) — accepting it would silently
+        // write no parity. Page granularity is likewise unimplemented. There
+        // is no implicit RS(4,2) fallback: enabling ECC today requires an
+        // explicit shard scheme with non-zero counts (and `ReedSolomon`
+        // needs >= 2 parity shards — single parity is `Xor`).
+        if ecc_enabled {
+            use crate::runtime_config::{EccGranularity, EccScheme};
+            if next.ecc_granularity != EccGranularity::Block {
+                return Err(crate::Error::FeatureUnsupported(
+                    "ecc_granularity=Page (not yet wired; use Block)",
+                ));
+            }
+            match next.ecc_scheme {
+                EccScheme::Secded => {
+                    return Err(crate::Error::FeatureUnsupported(
+                        "ecc_scheme=Secded (not yet wired; use Xor/ReedSolomon)",
+                    ));
+                }
+                EccScheme::Xor { data_shards: 0 } => {
+                    return Err(crate::Error::FeatureUnsupported(
+                        "ecc_scheme=Xor data_shards=0",
+                    ));
+                }
+                EccScheme::ReedSolomon { data_shards: 0, .. } => {
+                    return Err(crate::Error::FeatureUnsupported(
+                        "ecc_scheme=ReedSolomon data_shards=0",
+                    ));
+                }
+                EccScheme::ReedSolomon { parity_shards, .. } if parity_shards < 2 => {
+                    return Err(crate::Error::FeatureUnsupported(
+                        "ecc_scheme=ReedSolomon needs >= 2 parity shards (use Xor for single parity)",
+                    ));
+                }
+                _ => {}
+            }
         }
         // AtInsert (compute the per-KV digest at memtable insert and carry
         // it through flush) is not yet wired into the memtable / writer
@@ -163,6 +212,124 @@ mod tests {
         let handle = RuntimeConfigHandle::new(RuntimeConfig::default());
         let snap = handle.load();
         assert_eq!(snap.block_checksum_algo, ChecksumAlgorithm::Xxh3_64);
+    }
+
+    #[test]
+    #[cfg(feature = "page_ecc")]
+    fn try_update_rejects_ecc_on_with_secded_until_wired() {
+        use super::super::types::EccScheme;
+
+        // Enabling ECC with the on-default Secded scheme must be rejected
+        // (SECDED not yet wired, #255) — there is NO implicit RS(4,2)
+        // fallback. The live snapshot stays off.
+        let handle = RuntimeConfigHandle::new(RuntimeConfig::default());
+        let secded = handle.try_update(|c| c.page_ecc = true);
+        assert!(
+            matches!(secded, Err(crate::Error::FeatureUnsupported(_))),
+            "ECC on + Secded must be rejected until #255, got {secded:?}"
+        );
+        assert!(
+            !handle.load().page_ecc,
+            "rejected update must not enable ECC"
+        );
+
+        // An explicit shard scheme is accepted.
+        let xor = handle.try_update(|c| {
+            c.page_ecc = true;
+            c.ecc_scheme = EccScheme::Xor { data_shards: 10 };
+        });
+        assert!(
+            xor.is_ok(),
+            "ECC on + explicit Xor must be accepted, got {xor:?}"
+        );
+        assert!(handle.load().page_ecc);
+
+        // Zero shard count is rejected (non-recoverable layout) for every
+        // shard-based scheme: Xor with no data shards, and Reed-Solomon with
+        // either a zero data-shard or a zero parity-shard count.
+        for bad_scheme in [
+            EccScheme::Xor { data_shards: 0 },
+            EccScheme::ReedSolomon {
+                data_shards: 0,
+                parity_shards: 2,
+            },
+            EccScheme::ReedSolomon {
+                data_shards: 8,
+                parity_shards: 0,
+            },
+        ] {
+            let h = RuntimeConfigHandle::new(RuntimeConfig::default());
+            let bad = h.try_update(|c| {
+                c.page_ecc = true;
+                c.ecc_scheme = bad_scheme;
+            });
+            assert!(
+                matches!(bad, Err(crate::Error::FeatureUnsupported(_))),
+                "zero-shard scheme {bad_scheme:?} must be rejected, got {bad:?}"
+            );
+            assert!(!h.load().page_ecc, "rejected update must not enable ECC");
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "page_ecc")]
+    fn try_update_rejects_unwritable_ecc_layouts_when_enabled() {
+        use super::super::types::{EccGranularity, EccScheme};
+
+        // Page granularity is not yet wired; single-parity ReedSolomon is a
+        // non-canonical layout (single parity is `Xor`). Both must be rejected
+        // when ECC is enabled, leaving the live snapshot off.
+        let page = RuntimeConfigHandle::new(RuntimeConfig::default());
+        let r = page.try_update(|c| {
+            c.page_ecc = true;
+            c.ecc_scheme = EccScheme::ReedSolomon {
+                data_shards: 8,
+                parity_shards: 2,
+            };
+            c.ecc_granularity = EccGranularity::Page;
+        });
+        assert!(
+            matches!(r, Err(crate::Error::FeatureUnsupported(_))),
+            "{r:?}"
+        );
+        assert!(!page.load().page_ecc);
+
+        let rs1 = RuntimeConfigHandle::new(RuntimeConfig::default());
+        let r = rs1.try_update(|c| {
+            c.page_ecc = true;
+            c.ecc_scheme = EccScheme::ReedSolomon {
+                data_shards: 8,
+                parity_shards: 1,
+            };
+        });
+        assert!(
+            matches!(r, Err(crate::Error::FeatureUnsupported(_))),
+            "{r:?}"
+        );
+        assert!(!rs1.load().page_ecc);
+
+        // An override enables ECC even with page_ecc=false: a valid scheme is
+        // accepted, an invalid one (Secded) is still rejected.
+        let ovr = RuntimeConfigHandle::new(RuntimeConfig::default());
+        let r = ovr.try_update(|c| {
+            c.data_block_ecc_override = Some(true);
+            c.ecc_scheme = EccScheme::Xor { data_shards: 8 };
+        });
+        assert!(
+            r.is_ok(),
+            "override-enabled valid scheme must be accepted: {r:?}"
+        );
+
+        let ovr_bad = RuntimeConfigHandle::new(RuntimeConfig::default());
+        let r = ovr_bad.try_update(|c| {
+            c.data_block_ecc_override = Some(true);
+            // ecc_scheme stays the Secded default → rejected even though
+            // page_ecc is false, because the override enables ECC.
+        });
+        assert!(
+            matches!(r, Err(crate::Error::FeatureUnsupported(_))),
+            "{r:?}"
+        );
     }
 
     #[test]

@@ -46,7 +46,7 @@ pub fn load_block(
     block_type: BlockType,
     compression: CompressionType,
     encryption: Option<&dyn EncryptionProvider>,
-    page_ecc: bool,
+    ecc: Option<crate::table::block::EccParams>,
     #[cfg(zstd_any)] zstd_dict: Option<&crate::compression::ZstdDictionary>,
     #[cfg(feature = "metrics")] metrics: &Metrics,
 ) -> crate::Result<Block> {
@@ -132,17 +132,25 @@ pub fn load_block(
         },
         &{
             // ECC presence is a per-SST descriptor property (passed in by
-            // the caller from table metadata), not a per-block header field:
-            // upgrade the transform to its `*Ecc` variant when this SST was
-            // written with Page ECC. `with_ecc` is the identity function on
-            // builds without the `page_ecc` feature.
+            // the caller from table metadata): upgrade the transform to its
+            // `*Ecc` variant when this SST was written with a recognized Page
+            // ECC scheme. On a build WITHOUT the `page_ecc` feature `with_ecc`
+            // is the identity function — the parity trailer then reads as an
+            // unrecognized opaque trailer (the read frames the payload by
+            // `data_length`, verifies its checksum, and reports
+            // `EccStatus::Unrecognized`), so the data still loads without ECC
+            // recovery rather than failing closed.
             let t = crate::table::block::BlockTransform::from_parts(
                 compression,
                 encryption,
                 #[cfg(zstd_any)]
                 zstd_dict,
             )?;
-            if page_ecc { t.with_ecc() } else { t }
+            if let Some(ecc) = ecc {
+                t.with_ecc(ecc)
+            } else {
+                t
+            }
         },
     )?;
 

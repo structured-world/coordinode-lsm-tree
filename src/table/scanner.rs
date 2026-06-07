@@ -26,10 +26,10 @@ pub struct Scanner {
     encryption: Option<Arc<dyn EncryptionProvider>>,
     comparator: SharedComparator,
 
-    /// Per-SST Page-ECC flag from table metadata: data blocks omit the
-    /// `block_flags` byte, so the scanner's block-read transform is told here
-    /// whether each block carries a parity trailer.
-    page_ecc: bool,
+    /// Per-SST Page-ECC scheme from table metadata: data blocks omit the
+    /// `block_flags` byte, so the scanner's block-read transform is told
+    /// here the parity scheme (sizing + recovery). `None` = no parity.
+    ecc: Option<crate::table::block::EccParams>,
     /// Per-SST per-KV-footer flag (`kv_checksum_algo.is_some()`): supplied to
     /// `from_loaded` so it strips the footer (data blocks omit the byte).
     has_kv_footer: bool,
@@ -56,7 +56,7 @@ impl Scanner {
         compression: CompressionType,
         global_seqno: SeqNo,
         encryption: Option<Arc<dyn EncryptionProvider>>,
-        page_ecc: bool,
+        ecc: Option<crate::table::block::EccParams>,
         has_kv_footer: bool,
         #[cfg(zstd_any)] zstd_dictionary: Option<Arc<crate::compression::ZstdDictionary>>,
         comparator: SharedComparator,
@@ -88,7 +88,7 @@ impl Scanner {
             table_id,
             compression,
             encryption.as_deref(),
-            page_ecc,
+            ecc,
             has_kv_footer,
             #[cfg(zstd_any)]
             zstd_dictionary.as_deref(),
@@ -108,7 +108,7 @@ impl Scanner {
             encryption,
             comparator,
 
-            page_ecc,
+            ecc,
             has_kv_footer,
 
             #[cfg(zstd_any)]
@@ -123,7 +123,7 @@ impl Scanner {
         table_id: crate::TableId,
         compression: CompressionType,
         encryption: Option<&dyn EncryptionProvider>,
-        page_ecc: bool,
+        ecc: Option<crate::table::block::EccParams>,
         has_kv_footer: bool,
         #[cfg(zstd_any)] zstd_dict: Option<&crate::compression::ZstdDictionary>,
     ) -> crate::Result<DataBlock> {
@@ -162,7 +162,11 @@ impl Scanner {
                     #[cfg(zstd_any)]
                     zstd_dict,
                 )?;
-                if page_ecc { t.with_ecc() } else { t }
+                if let Some(ecc) = ecc {
+                    t.with_ecc(ecc)
+                } else {
+                    t
+                }
             },
         );
 
@@ -206,7 +210,7 @@ impl Iterator for Scanner {
                 self.table_id,
                 self.compression,
                 self.encryption.as_deref(),
-                self.page_ecc,
+                self.ecc,
                 self.has_kv_footer,
                 #[cfg(zstd_any)]
                 self.zstd_dictionary.as_deref(),

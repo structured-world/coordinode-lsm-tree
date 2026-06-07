@@ -23,7 +23,7 @@ pub use header::Header;
 pub use identity::BlockIdentity;
 pub use offset::BlockOffset;
 pub(crate) use trailer::{TRAILER_START_MARKER, Trailer};
-pub use transform::{BlockTransform, CompressionContext};
+pub use transform::{BlockTransform, CompressionContext, EccParams};
 pub use r#type::BlockType;
 
 #[cfg(zstd_any)]
@@ -53,33 +53,36 @@ use alloc::vec::Vec;
 /// independent storage formats that may diverge in the future.
 const MAX_DECOMPRESSION_SIZE: u32 = 256 * 1024 * 1024;
 
-/// Exact Reed-Solomon parity trailer size for a given data length
-/// under the (4, 2) scheme.
+/// Exact parity trailer size for a given data length under the supplied
+/// shard scheme `params` (`data_shards`, `parity_shards`).
 ///
-/// `parity_len(N) = shard_bytes(N) * 2` where
-/// `shard_bytes(N) = ceil(N / 4) rounded up to the nearest even`.
+/// `parity_len(N) = shard_bytes(N) * parity_shards` where
+/// `shard_bytes(N) = ceil(N / data_shards) rounded up to the nearest even`.
 /// Mirrors `crate::ecc::parity_len` byte-for-byte but is available
 /// without the `page_ecc` cargo feature — the parity trailer length is
 /// NOT stored in the block header; the read path derives it from
-/// `data_length` with this function whenever a block's `ECC_PARITY`
+/// `data_length` and the per-SST scheme whenever a block's `ECC_PARITY`
 /// flag is set, so writer and reader always agree on the trailer size
 /// without a per-block length field to corrupt or forge.
 ///
 /// Returns zero for `data_length == 0` to match
 /// `crate::ecc::encode_parity`'s empty-payload short-circuit.
 #[inline]
-pub(crate) fn expected_parity_len(data_length: u32) -> u32 {
-    if data_length == 0 {
+pub(crate) fn expected_parity_len(data_length: u32, params: EccParams) -> u32 {
+    let data_shards = u32::from(params.data_shards());
+    let parity_shards = u32::from(params.parity_shards());
+    if data_length == 0 || data_shards == 0 || parity_shards == 0 {
         return 0;
     }
-    // ceil(N / 4) — overflow-safe for u32 since `data_length` is
-    // already capped at MAX_DECOMPRESSION_SIZE + max overhead by
-    // the caller before this function fires.
-    let ceil_quarter = (data_length / 4).saturating_add(u32::from(!data_length.is_multiple_of(4)));
-    // Round up to even (the `reed-solomon-simd` engine requires
-    // shard sizes that are a multiple of two).
-    let shard_bytes = ceil_quarter.saturating_add(u32::from(!ceil_quarter.is_multiple_of(2)));
-    shard_bytes.saturating_mul(2)
+    // ceil(N / data_shards) — overflow-safe for u32 since `data_length`
+    // is already capped at MAX_DECOMPRESSION_SIZE + max overhead by the
+    // caller before this function fires.
+    let ceil = (data_length / data_shards)
+        .saturating_add(u32::from(!data_length.is_multiple_of(data_shards)));
+    // Round up to even (the `reed-solomon-simd` engine requires shard
+    // sizes that are a multiple of two; XOR shares the layout).
+    let shard_bytes = ceil.saturating_add(u32::from(!ceil.is_multiple_of(2)));
+    shard_bytes.saturating_mul(parity_shards)
 }
 
 /// Whether the on-disk block carries a Reed-Solomon parity trailer.
@@ -97,6 +100,68 @@ fn block_has_parity(header: &Header, transform: &BlockTransform<'_>) -> bool {
         header.block_flags & header::block_flags::ECC_PARITY != 0
     } else {
         transform.page_ecc()
+    }
+}
+
+/// The ECC shard scheme to size + recover a block's parity trailer with.
+///
+/// Self-describing blocks (`Meta` / `Manifest` / `ManifestFooter`) are read
+/// at table / manifest open BEFORE any per-SST descriptor is known, so they
+/// always use the fixed [`EccParams::RS_4_2`] layout (matching the writer).
+/// SST blocks (`Data` / `Index` / `Filter` / `RangeTombstone`) are
+/// descriptor-driven: their scheme rides on the caller-supplied `transform`
+/// (sourced from the SST's `TableMeta`).
+///
+/// Not feature-gated: callable from read sizing on all builds (without
+/// `page_ecc` it is only reached from dead `block_has_parity == false`
+/// branches, but must still compile).
+fn block_ecc_params(header: &Header, transform: &BlockTransform<'_>) -> EccParams {
+    if Header::has_block_flags(header.block_type) {
+        EccParams::RS_4_2
+    } else {
+        transform.ecc_params().unwrap_or(EccParams::RS_4_2)
+    }
+}
+
+/// Classifies the on-disk trailer (bytes after the `data_length` payload) into
+/// an [`EccStatus`], or `Err` on a framing violation.
+///
+/// The decision keys off whether the block carries a RECOGNIZED ECC layout
+/// (`has_recognized_ecc`, from [`block_has_parity`]), NOT off `ecc_length`:
+/// a recognized layout on an empty payload also has `ecc_length == 0`, and its
+/// trailer must still be exactly zero. So:
+/// - recognized layout → require `trailer == ecc_length` exactly (extra bytes
+///   are corruption), even when `ecc_length == 0`;
+/// - no recognized layout, `trailer == 0` → ECC off, clean;
+/// - no recognized layout, `trailer > 0` → an ECC trailer this build can't
+///   interpret: the payload is framed by `data_length` and verified by its
+///   checksum, so the read succeeds with [`EccStatus::Unrecognized`] (a WARN),
+///   but recovery is unavailable;
+/// - `actual_payload_plus_ecc < data_length` (payload doesn't fit) → corruption.
+fn classify_block_trailer(
+    has_recognized_ecc: bool,
+    actual_payload_plus_ecc: usize,
+    data_length: usize,
+    ecc_length: u32,
+    handle: &BlockHandle,
+) -> crate::Result<EccStatus> {
+    let trailer = actual_payload_plus_ecc
+        .checked_sub(data_length)
+        .ok_or(crate::Error::InvalidHeader("Block"))?;
+    if has_recognized_ecc {
+        if trailer != ecc_length as usize {
+            return Err(crate::Error::InvalidHeader("Block"));
+        }
+        Ok(EccStatus::Ok)
+    } else if trailer == 0 {
+        Ok(EccStatus::Ok)
+    } else {
+        log::warn!(
+            "block {handle:?} carries an unrecognized ECC trailer ({trailer} B); \
+             payload verified by checksum but recovery is unavailable — recompact \
+             to re-stamp with a supported scheme",
+        );
+        Ok(EccStatus::Unrecognized)
     }
 }
 
@@ -158,6 +223,31 @@ impl PreparedBlock<'_> {
 /// A block on disk
 ///
 /// Consists of a fixed-size header and some bytes (the data/payload).
+/// Outcome of the ECC check performed while reading a block, distinct from
+/// success / failure of the read itself.
+///
+/// A read returns `Err` only on real payload corruption (checksum mismatch
+/// with no available recovery). When the read *succeeds*, this reports
+/// whether the block's ECC was usable:
+///
+/// - [`Self::Ok`] — ECC absent, or a recognized scheme that verified (and
+///   recovered, if needed).
+/// - [`Self::Unrecognized`] — the block carries an ECC trailer this build
+///   cannot interpret (an unimplemented or non-canonical scheme: Secded,
+///   page granularity, unknown kind, …). The payload was returned (its
+///   checksum passed), but ECC recovery is unavailable for this block;
+///   recompaction re-stamps it with a supported scheme. A "typing" warning,
+///   not a read failure.
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, Default)]
+pub enum EccStatus {
+    /// ECC absent or a recognized scheme verified normally.
+    #[default]
+    Ok,
+    /// ECC trailer present but its scheme is unrecognized / unusable; the
+    /// payload still verified by its checksum. Recommend recompaction.
+    Unrecognized,
+}
+
 #[derive(Clone)]
 pub struct Block {
     pub header: Header,
@@ -187,6 +277,11 @@ impl Block {
         data_length: u32,
         ecc_length: u32,
         expected: Checksum,
+        #[cfg_attr(
+            not(feature = "page_ecc"),
+            expect(unused_variables, reason = "recovery scheme only used under page_ecc")
+        )]
+        ecc_params: EccParams,
     ) -> crate::Result<Vec<u8>> {
         let mut data = vec![0u8; data_length as usize];
         reader.read_exact(&mut data)?;
@@ -216,9 +311,15 @@ impl Block {
         #[cfg(feature = "page_ecc")]
         {
             let expected_raw = expected.into_u128();
-            if let Some(recovered) = crate::ecc::try_recover(&data, &parity, data.len(), |buf| {
-                crate::hash::hash128(buf) == expected_raw
-            })? {
+            let (data_shards, parity_shards) = ecc_params.as_shards();
+            if let Some(recovered) = crate::ecc::try_recover(
+                &data,
+                &parity,
+                data.len(),
+                data_shards,
+                parity_shards,
+                |buf| crate::hash::hash128(buf) == expected_raw,
+            )? {
                 log::warn!(
                     "recovered block from RS parity after checksum mismatch \
                      (data_len={}, ecc_len={ecc_length})",
@@ -510,8 +611,9 @@ impl Block {
         // BlockTransform don't exist), so the entire branch is dead and the
         // compiler folds it out.
         #[cfg(feature = "page_ecc")]
-        let parity_buf: Option<Vec<u8>> = if transform.page_ecc() {
-            let p = crate::ecc::encode_parity(&payload)?;
+        let parity_buf: Option<Vec<u8>> = if let Some(ecc_params) = transform.ecc_params() {
+            let (data_shards, parity_shards) = ecc_params.as_shards();
+            let p = crate::ecc::encode_parity(&payload, data_shards, parity_shards)?;
             // parity_len is shard_bytes * RS_PARITY_SHARDS where
             // shard_bytes <= payload.len(). payload_len fits in u32
             // (checked above), so parity_len fits in u32 too; the
@@ -609,7 +711,7 @@ impl Block {
         // is `expected_parity_len(data_length)` (the RS(4, 2) scheme is
         // deterministic), otherwise none.
         let ecc_length = if block_has_parity(&header, transform) {
-            expected_parity_len(header.data_length)
+            expected_parity_len(header.data_length, block_ecc_params(&header, transform))
         } else {
             0
         };
@@ -626,6 +728,7 @@ impl Block {
                 header.data_length,
                 ecc_length,
                 header.checksum,
+                block_ecc_params(&header, transform),
             )?;
 
             // Decrypt in-place, reusing the read buffer.
@@ -723,6 +826,7 @@ impl Block {
                     header.data_length,
                     ecc_length,
                     header.checksum,
+                    block_ecc_params(&header, transform),
                 )?)
             };
 
@@ -804,19 +908,41 @@ impl Block {
 
     /// Reads a block from a file.
     ///
-    /// Pipeline: read → verify checksum → decrypt → decompress.
-    /// When `encryption` is `None`, the decrypt step is skipped.
-    // Same duplication rationale as from_reader — see comment there.
-    #[expect(
-        clippy::too_many_lines,
-        reason = "encrypt/no-encrypt branches duplicate compression match — see from_reader"
-    )]
+    /// Reads a block from a file, discarding the ECC status (warnings are
+    /// still logged). Convenience wrapper over [`Self::from_file_with_status`]
+    /// for the many call sites that don't act on the status.
     pub fn from_file(
         file: &dyn FsFile,
         handle: BlockHandle,
         identity: BlockIdentity,
         transform: &BlockTransform<'_>,
     ) -> crate::Result<Self> {
+        let (block, _status) = Self::from_file_with_status(file, handle, identity, transform)?;
+        Ok(block)
+    }
+
+    /// Reads a block from a file and reports its [`EccStatus`].
+    ///
+    /// Returns `Err` only on real payload corruption (checksum mismatch with
+    /// no recovery available). On success, the [`EccStatus`] distinguishes a
+    /// clean read ([`EccStatus::Ok`]) from one where the block carried an ECC
+    /// trailer this build could not interpret ([`EccStatus::Unrecognized`] —
+    /// the payload still verified by its checksum; recompaction re-stamps it
+    /// with a supported scheme). A WARN is also logged in the latter case.
+    ///
+    /// Pipeline: read → verify checksum → decrypt → decompress. When
+    /// `encryption` is `None`, the decrypt step is skipped.
+    // Same duplication rationale as from_reader — see comment there.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "encrypt/no-encrypt branches duplicate compression match — see from_reader"
+    )]
+    pub fn from_file_with_status(
+        file: &dyn FsFile,
+        handle: BlockHandle,
+        identity: BlockIdentity,
+        transform: &BlockTransform<'_>,
+    ) -> crate::Result<(Self, EccStatus)> {
         let compression = transform.compression();
         let encryption = transform.encryption();
         #[cfg(zstd_any)]
@@ -840,9 +966,25 @@ impl Block {
         // near-limit encrypted+ECC blocks the writer can produce.
         let enc_overhead = encryption.map_or(0u64, |e| u64::from(e.max_overhead()));
         let max_payload = u64::from(MAX_DECOMPRESSION_SIZE) + enc_overhead;
-        // parity_len(N) ≤ N/2 + 4; saturating_add covers overflow at
-        // the u64 boundary (defensive — max_payload is well below u32).
-        let max_ecc_overhead = (max_payload / 2).saturating_add(4);
+        // ECC parity scales with the (data_shards, parity_shards) scheme, not a
+        // fixed RS(4,2). A high-overhead scheme (parity_shards > data_shards /
+        // 2, e.g. RS(2,4)) produces a larger trailer than the old `N/2 + 4`
+        // RS(4,2) approximation, so that bound would reject a legitimate
+        // near-limit block. Size the cap from the actual scheme this block is
+        // read with (`transform.ecc_params()`), keeping RS(4,2) in the running
+        // max so self-describing blocks (which carry no transform ECC but are
+        // written RS(4,2)) stay covered.
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "max_payload is MAX_DECOMPRESSION_SIZE (+ enc overhead), well below u32::MAX"
+        )]
+        let max_payload_u32 = max_payload.min(u64::from(u32::MAX)) as u32;
+        let max_ecc_overhead = [Some(EccParams::RS_4_2), transform.ecc_params()]
+            .into_iter()
+            .flatten()
+            .map(|params| u64::from(expected_parity_len(max_payload_u32, params)))
+            .max()
+            .unwrap_or(0);
         let max_on_disk_size = max_payload + max_ecc_overhead + Header::MAX_LEN as u64;
 
         if u64::from(handle.size()) > max_on_disk_size {
@@ -858,7 +1000,7 @@ impl Block {
         // No intermediate Slice, no overlap of encrypted + decrypted buffers.
         // When no encryption, read into a Slice (zero-copy on the
         // None-compression path).
-        let (header, data) = if let Some(enc) = encryption {
+        let (header, data, ecc_status) = if let Some(enc) = encryption {
             let block_size = handle.size() as usize;
 
             // Pre-decode lower bound: every header is at least MIN_LEN; the
@@ -889,25 +1031,30 @@ impl Block {
             let parsed_header = Header::decode_from(&mut &buf[..])?;
             let header_len = Header::header_len(parsed_header.block_type);
 
-            // Parity-trailer length is derived from data_length + parity
-            // presence (`block_has_parity`: header bit for self-describing
-            // blocks, descriptor-via-transform for SST), not stored. The size
-            // check below then implicitly validates it: if the on-disk byte
-            // count doesn't equal header + data_length + derived-parity, the
-            // header is rejected.
-            let ecc_length = if block_has_parity(&parsed_header, transform) {
-                expected_parity_len(parsed_header.data_length)
+            // Parity-trailer presence is keyed on a RECOGNIZED ECC layout
+            // (`block_has_parity`: header bit for self-describing blocks,
+            // descriptor-via-transform for SST), NOT on `ecc_length` (which is
+            // also 0 for a recognized scheme on an empty payload). The trailer
+            // length, when recognized, is derived from `data_length` + scheme.
+            let has_ecc = block_has_parity(&parsed_header, transform);
+            let ecc_length = if has_ecc {
+                expected_parity_len(
+                    parsed_header.data_length,
+                    block_ecc_params(&parsed_header, transform),
+                )
             } else {
                 0
             };
 
             let actual_payload_plus_ecc = block_size.saturating_sub(header_len);
-            let expected_payload_plus_ecc =
-                parsed_header.data_length as usize + ecc_length as usize;
-            if expected_payload_plus_ecc != actual_payload_plus_ecc {
-                return Err(crate::Error::InvalidHeader("Block"));
-            }
             let actual_data_len = parsed_header.data_length as usize;
+            let ecc_status = classify_block_trailer(
+                has_ecc,
+                actual_payload_plus_ecc,
+                actual_data_len,
+                ecc_length,
+                &handle,
+            )?;
 
             // Payload-length safety cap. Mirrors the `from_reader`
             // check (see `Block::from_reader` above): the on-disk
@@ -932,13 +1079,20 @@ impl Block {
                 });
             }
 
-            // ECC fast path: no parity trailer → existing in-buffer
-            // checksum check + decrypt_vec. With parity, run the
-            // shared helper against a cursor over the post-header
-            // bytes so recovery is available on mismatch.
+            // ECC fast path: no recognized parity trailer → in-buffer
+            // checksum check + decrypt_vec. The checksum covers exactly the
+            // `data_length` payload bytes (NOT any trailing bytes), so an
+            // unrecognized opaque trailer is excluded and discarded. With a
+            // recognized scheme, run the shared helper against a cursor over
+            // the post-header bytes so recovery is available on mismatch.
             let buf = if ecc_length == 0 {
-                #[expect(clippy::indexing_slicing, reason = "header was decoded from buf")]
-                let checksum = Checksum::from_raw(crate::hash::hash128(&buf[header_len..]));
+                #[expect(
+                    clippy::indexing_slicing,
+                    reason = "actual_data_len <= post-header len"
+                )]
+                let checksum = Checksum::from_raw(crate::hash::hash128(
+                    &buf[header_len..header_len + actual_data_len],
+                ));
                 checksum.check(parsed_header.checksum).inspect_err(|_| {
                     log::error!(
                         "Checksum mismatch for block {handle:?}, got={}, expected={}",
@@ -946,8 +1100,8 @@ impl Block {
                         parsed_header.checksum,
                     );
                 })?;
-                // Strip header prefix so buf contains only the payload.
-                buf.copy_within(header_len.., 0);
+                // Strip header prefix + any opaque trailer so buf is the payload.
+                buf.copy_within(header_len..header_len + actual_data_len, 0);
                 buf.truncate(actual_data_len);
                 buf
             } else {
@@ -958,6 +1112,7 @@ impl Block {
                     parsed_header.data_length,
                     ecc_length,
                     parsed_header.checksum,
+                    block_ecc_params(&parsed_header, transform),
                 )?
             };
 
@@ -1035,7 +1190,7 @@ impl Block {
                 }
             };
 
-            (parsed_header, data)
+            (parsed_header, data, ecc_status)
         } else {
             // Single I/O read — header + payload in one Slice.
             let buf = crate::file::read_exact(file, *handle.offset(), handle.size() as usize)?;
@@ -1043,23 +1198,28 @@ impl Block {
             let parsed_header = Header::decode_from(&mut &buf[..])?;
             let header_len = Header::header_len(parsed_header.block_type);
 
-            // Parity-trailer length is derived from data_length + parity
-            // presence (`block_has_parity`: header bit for self-describing
-            // blocks, descriptor-via-transform for SST), not stored. The size
-            // check below implicitly validates it (header + data_length +
-            // derived-parity must equal the buffer length).
-            let ecc_length = if block_has_parity(&parsed_header, transform) {
-                expected_parity_len(parsed_header.data_length)
+            // Recognized-ECC presence keys on `block_has_parity`, not on
+            // `ecc_length` (which is also 0 for a recognized scheme on an empty
+            // payload). See the encrypted branch + `classify_block_trailer`.
+            let has_ecc = block_has_parity(&parsed_header, transform);
+            let ecc_length = if has_ecc {
+                expected_parity_len(
+                    parsed_header.data_length,
+                    block_ecc_params(&parsed_header, transform),
+                )
             } else {
                 0
             };
 
             let actual_payload_plus_ecc = buf.len().saturating_sub(header_len);
-            let expected_payload_plus_ecc =
-                parsed_header.data_length as usize + ecc_length as usize;
-            if expected_payload_plus_ecc != actual_payload_plus_ecc {
-                return Err(crate::Error::InvalidHeader("Block"));
-            }
+            let actual_data_len = parsed_header.data_length as usize;
+            let ecc_status = classify_block_trailer(
+                has_ecc,
+                actual_payload_plus_ecc,
+                actual_data_len,
+                ecc_length,
+                &handle,
+            )?;
 
             if parsed_header.uncompressed_length > MAX_DECOMPRESSION_SIZE {
                 return Err(crate::Error::DecompressedSizeTooLarge {
@@ -1068,12 +1228,18 @@ impl Block {
                 });
             }
 
-            // Zero-copy fast path for non-ECC blocks; ECC blocks go
-            // through the recovery-capable helper (which copies the
-            // verified bytes out of `buf`).
+            // Zero-copy fast path for non-recovery blocks (Off or unrecognized
+            // opaque trailer); recognized-ECC blocks go through the
+            // recovery-capable helper. The checksum covers exactly the
+            // `data_length` payload bytes, so an opaque trailer is excluded.
             let payload_slice: Slice = if ecc_length == 0 {
-                #[expect(clippy::indexing_slicing, reason = "header was decoded from buf")]
-                let checksum = Checksum::from_raw(crate::hash::hash128(&buf[header_len..]));
+                #[expect(
+                    clippy::indexing_slicing,
+                    reason = "actual_data_len <= post-header len"
+                )]
+                let checksum = Checksum::from_raw(crate::hash::hash128(
+                    &buf[header_len..header_len + actual_data_len],
+                ));
                 checksum.check(parsed_header.checksum).inspect_err(|_| {
                     log::error!(
                         "Checksum mismatch for block {handle:?}, got={}, expected={}",
@@ -1081,7 +1247,7 @@ impl Block {
                         parsed_header.checksum,
                     );
                 })?;
-                buf.slice(header_len..)
+                buf.slice(header_len..header_len + actual_data_len)
             } else {
                 #[expect(clippy::indexing_slicing, reason = "header was decoded from buf")]
                 let mut cursor = std::io::Cursor::new(&buf[header_len..]);
@@ -1090,6 +1256,7 @@ impl Block {
                     parsed_header.data_length,
                     ecc_length,
                     parsed_header.checksum,
+                    block_ecc_params(&parsed_header, transform),
                 )?)
             };
 
@@ -1172,10 +1339,10 @@ impl Block {
                 }
             };
 
-            (parsed_header, data)
+            (parsed_header, data, ecc_status)
         };
 
-        Ok(Self { header, data })
+        Ok((Self { header, data }, ecc_status))
     }
 }
 
@@ -1271,7 +1438,13 @@ mod tests {
             header
         };
         let file = std::fs::File::open(&path)?;
-        let handle = crate::table::BlockHandle::new(BlockOffset(0), header.on_disk_size());
+        // Size the handle under the transform's actual scheme so the helper
+        // works for any ECC layout, not just RS(4,2). `on_disk_size()` hardcodes
+        // RS(4,2) and would mis-size a block written with a different scheme.
+        let handle = crate::table::BlockHandle::new(
+            BlockOffset(0),
+            header.on_disk_size_with(transform.ecc_params()),
+        );
         Ok(TempBlock { file, handle, dir })
     }
 
@@ -2915,7 +3088,7 @@ mod tests {
                 &mut writer,
                 PAYLOAD,
                 BlockIdentity::for_test(0, 0, BlockType::Data),
-                &BlockTransform::PlainEcc,
+                &BlockTransform::PlainEcc(EccParams::RS_4_2),
             )?;
 
             assert!(
@@ -2932,7 +3105,7 @@ mod tests {
             let block = Block::from_reader(
                 &mut reader,
                 BlockIdentity::for_test(0, 0, BlockType::Data),
-                &BlockTransform::PlainEcc,
+                &BlockTransform::PlainEcc(EccParams::RS_4_2),
             )?;
             assert_eq!(&*block.data, PAYLOAD);
             Ok(())
@@ -2945,7 +3118,7 @@ mod tests {
                 &mut writer,
                 PAYLOAD,
                 BlockIdentity::for_test(0, 0, BlockType::Data),
-                &BlockTransform::PlainEcc,
+                &BlockTransform::PlainEcc(EccParams::RS_4_2),
             )?;
 
             // Flip a single byte inside the payload region (after
@@ -2960,7 +3133,7 @@ mod tests {
             let block = Block::from_reader(
                 &mut reader,
                 BlockIdentity::for_test(0, 0, BlockType::Data),
-                &BlockTransform::PlainEcc,
+                &BlockTransform::PlainEcc(EccParams::RS_4_2),
             )?;
             // ECC recovery reconstructs the original payload despite
             // the in-flight bit-flip.
@@ -2977,7 +3150,7 @@ mod tests {
             let tmp = super::write_block_to_tempfile(
                 PAYLOAD,
                 BlockIdentity::for_test(0, 0, BlockType::Data),
-                &BlockTransform::PlainEcc,
+                &BlockTransform::PlainEcc(EccParams::RS_4_2),
             )?;
             let path = tmp.dir.path().join("block");
 
@@ -2995,9 +3168,98 @@ mod tests {
                 &file,
                 tmp.handle,
                 BlockIdentity::for_test(0, 0, BlockType::Data),
-                &BlockTransform::PlainEcc,
+                &BlockTransform::PlainEcc(EccParams::RS_4_2),
             )?;
             assert_eq!(&*block.data, PAYLOAD);
+            Ok(())
+        }
+
+        /// Three-state read contract: a block written WITH a parity trailer,
+        /// read back by a reader that does NOT recognize the scheme (a `Plain`
+        /// transform — as happens when the per-SST descriptor decodes to an
+        /// unsupported scheme), must still return the payload (framed by
+        /// `data_length`, checksum-verified) and report
+        /// `EccStatus::Unrecognized` — a soft warning, not a read error. Read
+        /// with the matching scheme, it reports `EccStatus::Ok`.
+        #[test]
+        fn from_file_with_status_soft_warns_on_unrecognized_trailer() -> crate::Result<()> {
+            // A non-default scheme on purpose: the read path is descriptor-
+            // driven, never an implicit RS(4,2).
+            let scheme = EccParams::try_new(8, 2).expect("valid shards");
+            let tmp = super::write_block_to_tempfile(
+                PAYLOAD,
+                BlockIdentity::for_test(0, 0, BlockType::Data),
+                &BlockTransform::PlainEcc(scheme),
+            )?;
+
+            // Reader recognizes the scheme → clean read.
+            let (block, status) = Block::from_file_with_status(
+                &tmp.file,
+                tmp.handle,
+                BlockIdentity::for_test(0, 0, BlockType::Data),
+                &BlockTransform::PlainEcc(scheme),
+            )?;
+            assert_eq!(&*block.data, PAYLOAD);
+            assert_eq!(status, EccStatus::Ok);
+
+            // Reader does NOT recognize the trailer (Plain transform): the
+            // opaque trailer is excluded from the payload, the checksum still
+            // verifies, and the status is a warning rather than an error.
+            let (block, status) = Block::from_file_with_status(
+                &tmp.file,
+                tmp.handle,
+                BlockIdentity::for_test(0, 0, BlockType::Data),
+                &BlockTransform::PLAIN,
+            )?;
+            assert_eq!(
+                &*block.data, PAYLOAD,
+                "payload reads despite unknown trailer"
+            );
+            assert_eq!(status, EccStatus::Unrecognized);
+            Ok(())
+        }
+
+        /// Regression: a RECOGNIZED ECC layout must require an exact trailer
+        /// length — including the empty-payload case where the parity length is
+        /// zero. Extra trailing bytes on such a block are corruption and must
+        /// FAIL, not be softened to `EccStatus::Unrecognized` (which keying the
+        /// decision off `ecc_length == 0` instead of "is the layout recognized"
+        /// would wrongly do).
+        #[test]
+        fn from_file_recognized_empty_block_rejects_extra_trailer() -> crate::Result<()> {
+            // Empty payload under a (non-default) recognized scheme →
+            // data_length 0, parity length 0, so the on-disk block is just the
+            // header (no trailer).
+            let scheme = EccParams::try_new(8, 2).expect("valid shards");
+            let tmp = super::write_block_to_tempfile(
+                b"",
+                BlockIdentity::for_test(0, 0, BlockType::Data),
+                &BlockTransform::PlainEcc(scheme),
+            )?;
+            let path = tmp.dir.path().join("block");
+            let base = tmp.handle.size();
+
+            // Append junk so the handle covers a 4-byte trailer that the
+            // recognized (zero-parity) layout does not expect.
+            let mut bytes = std::fs::read(&path)?;
+            bytes.extend_from_slice(&[0xAB, 0xCD, 0xEF, 0x01]);
+            std::fs::write(&path, &bytes)?;
+
+            let file = std::fs::File::open(&path)?;
+            let handle = crate::table::BlockHandle::new(crate::table::BlockOffset(0), base + 4);
+            // `.err()` drops the `Ok((Block, _))` payload (Block is not Debug)
+            // so the assert can format the error variant.
+            let err = Block::from_file_with_status(
+                &file,
+                handle,
+                BlockIdentity::for_test(0, 0, BlockType::Data),
+                &BlockTransform::PlainEcc(scheme),
+            )
+            .err();
+            assert!(
+                matches!(err, Some(crate::Error::InvalidHeader("Block"))),
+                "recognized zero-parity layout + extra trailer must fail, got {err:?}",
+            );
             Ok(())
         }
 
@@ -3015,7 +3277,10 @@ mod tests {
                 &mut writer,
                 PAYLOAD,
                 BlockIdentity::for_test(0, 0, BlockType::Data),
-                &BlockTransform::CompressedEcc(CompressionContext::new(CompressionType::Lz4)?),
+                &BlockTransform::CompressedEcc(
+                    CompressionContext::new(CompressionType::Lz4)?,
+                    EccParams::RS_4_2,
+                ),
             )?;
             assert!(header.block_flags & crate::table::block::header::block_flags::ECC_PARITY != 0);
 
@@ -3028,7 +3293,10 @@ mod tests {
             let block = Block::from_reader(
                 &mut reader,
                 BlockIdentity::for_test(0, 0, BlockType::Data),
-                &BlockTransform::CompressedEcc(CompressionContext::new(CompressionType::Lz4)?),
+                &BlockTransform::CompressedEcc(
+                    CompressionContext::new(CompressionType::Lz4)?,
+                    EccParams::RS_4_2,
+                ),
             )?;
             assert_eq!(
                 &*block.data, PAYLOAD,
@@ -3054,7 +3322,7 @@ mod tests {
                 &mut writer,
                 PAYLOAD,
                 BlockIdentity::for_test(0, 0, BlockType::Data),
-                &BlockTransform::EncryptedEcc(&enc),
+                &BlockTransform::EncryptedEcc(&enc, EccParams::RS_4_2),
             )?;
             assert!(header.block_flags & crate::table::block::header::block_flags::ECC_PARITY != 0);
 
@@ -3067,7 +3335,7 @@ mod tests {
             let block = Block::from_reader(
                 &mut reader,
                 BlockIdentity::for_test(0, 0, BlockType::Data),
-                &BlockTransform::EncryptedEcc(&enc),
+                &BlockTransform::EncryptedEcc(&enc, EccParams::RS_4_2),
             )?;
             assert_eq!(
                 &*block.data, PAYLOAD,
@@ -3091,7 +3359,7 @@ mod tests {
                 &mut writer,
                 PAYLOAD,
                 BlockIdentity::for_test(0, 0, BlockType::Data),
-                &BlockTransform::PlainEcc,
+                &BlockTransform::PlainEcc(EccParams::RS_4_2),
             )?;
 
             // Shard size in bytes — same formula as crate::ecc::shard_bytes
@@ -3115,7 +3383,7 @@ mod tests {
             let result = Block::from_reader(
                 &mut reader,
                 BlockIdentity::for_test(0, 0, BlockType::Data),
-                &BlockTransform::PlainEcc,
+                &BlockTransform::PlainEcc(EccParams::RS_4_2),
             );
             match result {
                 Ok(_) => panic!(
@@ -3141,7 +3409,7 @@ mod tests {
                 &mut empty_buf,
                 &[],
                 BlockIdentity::for_test(0, 0, BlockType::Data),
-                &BlockTransform::PlainEcc,
+                &BlockTransform::PlainEcc(EccParams::RS_4_2),
             )?;
             assert_eq!(
                 empty.block_flags & block_flags::ECC_PARITY,
@@ -3166,7 +3434,7 @@ mod tests {
                 &mut full_buf,
                 PAYLOAD,
                 BlockIdentity::for_test(0, 0, BlockType::Data),
-                &BlockTransform::PlainEcc,
+                &BlockTransform::PlainEcc(EccParams::RS_4_2),
             )?;
             assert_ne!(
                 full.block_flags & block_flags::ECC_PARITY,

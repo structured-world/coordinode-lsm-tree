@@ -60,12 +60,14 @@ pub trait BlockIndexWriter<W: std::io::Write + std::io::Seek> {
     /// degrades to "any table can substitute".
     fn use_table_id(self: Box<Self>, table_id: crate::TableId) -> Box<dyn BlockIndexWriter<W>>;
 
-    /// Wires the tree's `Config::page_ecc` flag through to every
-    /// `Block::write_into` call this index writer makes. When
-    /// `true`, the `BlockTransform` passed to `write_into` gets
-    /// `.with_ecc()` applied so the matching `*Ecc` variant emits
-    /// a Reed-Solomon parity trailer.
-    fn use_page_ecc(self: Box<Self>, page_ecc: bool) -> Box<dyn BlockIndexWriter<W>>;
+    /// Wires the resolved Page ECC scheme through to every
+    /// `Block::write_into` call this index writer makes. `Some(params)`
+    /// applies `.with_ecc(params)` so the matching `*Ecc` variant emits
+    /// the parity trailer; `None` = no parity.
+    fn use_ecc(
+        self: Box<Self>,
+        ecc: Option<crate::table::block::EccParams>,
+    ) -> Box<dyn BlockIndexWriter<W>>;
 }
 
 // FilterWriter mirrors the use_page_ecc pattern via its own trait

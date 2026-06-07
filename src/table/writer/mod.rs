@@ -131,14 +131,14 @@ pub struct Writer {
     /// Block encryption provider (if encryption at rest is enabled)
     encryption: Option<Arc<dyn EncryptionProvider>>,
 
-    /// Per-block Reed-Solomon Page ECC opt-in. When `true`, every
-    /// `Block::write_into` call this writer makes upgrades its
-    /// `BlockTransform` to the matching `*Ecc` variant so the
-    /// writer emits a parity trailer + sets the `ECC_PARITY` flag in
-    /// the header. Default `false`. Caller wires `Config::page_ecc`
-    /// into this field via [`Self::use_page_ecc`] before the first key
-    /// is added.
-    page_ecc: bool,
+    /// Per-block Page ECC scheme. `Some(params)` makes every
+    /// `Block::write_into` call this writer makes upgrade its
+    /// `BlockTransform` to the matching `*Ecc` variant carrying that
+    /// scheme (so the writer emits a parity trailer sized by the scheme
+    /// and sets the `ECC_PARITY` flag). `None` (default) = no parity.
+    /// Caller resolves the `page_ecc` flag and `ecc_scheme` into this
+    /// via [`Self::use_ecc`] before the first key is added.
+    ecc: Option<crate::table::block::EccParams>,
 
     /// Durability level for the SST file + folder fsync at finish. Default
     /// [`SyncMode::Normal`]; caller wires `Config::sync_mode` via
@@ -272,7 +272,7 @@ impl Writer {
 
             encryption: None,
 
-            page_ecc: false,
+            ecc: None,
             sync_mode: SyncMode::Normal,
 
             kv_checksum: None,
@@ -342,8 +342,18 @@ impl Writer {
     }
 
     fn assert_not_started(&self, setting: &str) {
+        // A parallel spill clears `chunk` and submits the block to the
+        // pipeline immediately, but `data_block_count` only ticks once
+        // `drain_one_parallel` registers it — so neither alone proves "no
+        // block is in flight". Also check the pipeline's pending queue /
+        // byte counter so a setter can't change the per-table layout after
+        // a block was already queued under the old one.
+        #[cfg(feature = "std")]
+        let in_flight = !self.pending_meta.is_empty() || self.parallel_pending_bytes > 0;
+        #[cfg(not(feature = "std"))]
+        let in_flight = false;
         assert!(
-            self.meta.data_block_count == 0 && self.chunk.is_empty(),
+            self.meta.data_block_count == 0 && self.chunk.is_empty() && !in_flight,
             "{setting} must be configured before writing starts",
         );
     }
@@ -371,7 +381,7 @@ impl Writer {
             .use_table_id(self.table_id)
             // Reapply page_ecc — swapping the index writer would otherwise drop
             // a flag set earlier in the builder chain (order-independence).
-            .use_page_ecc(self.page_ecc);
+            .use_ecc(self.ecc);
         self
     }
 
@@ -393,7 +403,7 @@ impl Writer {
             // builder chain; reapply page_ecc so it survives regardless of call
             // order (otherwise the table mixes ECC and non-ECC index blocks
             // while `Writer` still records ECC as enabled).
-            .use_page_ecc(self.page_ecc);
+            .use_ecc(self.ecc);
         self
     }
 
@@ -508,11 +518,27 @@ impl Writer {
     /// `BlockTransform::with_ecc` becomes the identity function
     /// in that build and the flag is dead.
     #[must_use]
-    pub fn use_page_ecc(mut self, page_ecc: bool) -> Self {
-        self.page_ecc = page_ecc;
-        self.index_writer = self.index_writer.use_page_ecc(page_ecc);
-        self.filter_writer = self.filter_writer.use_page_ecc(page_ecc);
+    pub fn use_ecc(mut self, ecc: Option<crate::table::block::EccParams>) -> Self {
+        // The ECC scheme is recorded once per-SST in the final descriptor,
+        // so every block in the table must be written under the same layout.
+        // Toggling it mid-write would stamp blocks with mixed layouts under a
+        // single descriptor; enforce the "configure before first key" contract
+        // (shard counts are already non-zero by `EccParams` construction).
+        self.assert_not_started("page ecc");
+        self.ecc = ecc;
+        self.index_writer = self.index_writer.use_ecc(ecc);
+        self.filter_writer = self.filter_writer.use_ecc(ecc);
         self
+    }
+
+    /// Convenience wiring: resolves the tree's `Config::page_ecc` flag +
+    /// the configured `EccScheme` into the per-block [`EccParams`] and
+    /// applies it via [`Self::use_ecc`]. `page_ecc == false` (or a
+    /// non-shard scheme such as `Secded`, which is gated until #255)
+    /// yields no parity. See [`resolve_ecc`].
+    #[must_use]
+    pub fn use_page_ecc(self, page_ecc: bool, scheme: crate::runtime_config::EccScheme) -> Self {
+        self.use_ecc(resolve_ecc(page_ecc, scheme))
     }
 
     /// Wires the tree's `Config::sync_mode` into this writer's final SST +
@@ -761,7 +787,11 @@ impl Writer {
                     #[cfg(zstd_any)]
                     self.zstd_dictionary.as_deref(),
                 )?;
-                if self.page_ecc { t.with_ecc() } else { t }
+                if let Some(ecc) = self.ecc {
+                    t.with_ecc(ecc)
+                } else {
+                    t
+                }
             },
             kv_flags,
         )?;
@@ -821,7 +851,10 @@ impl Writer {
         item_count: usize,
     ) -> crate::Result<()> {
         self.meta.uncompressed_size += u64::from(header.uncompressed_length);
-        let bytes_written = header.on_disk_size();
+        // Size the block-handle with the scheme this writer actually wrote
+        // the parity under (NOT the fixed RS(4,2) `on_disk_size` assumes),
+        // or the handle over-reads on a non-default scheme.
+        let bytes_written = header.on_disk_size_with(self.ecc);
 
         let mut handle = KeyedBlockHandle::new(
             last_key.clone(),
@@ -859,7 +892,7 @@ impl Writer {
                 self.encryption.clone(),
                 #[cfg(zstd_any)]
                 self.zstd_dictionary.clone(),
-                self.page_ecc,
+                self.ecc,
             ));
         }
     }
@@ -1051,7 +1084,11 @@ impl Writer {
                         Some(enc) => crate::table::block::BlockTransform::Encrypted(enc),
                         None => crate::table::block::BlockTransform::PLAIN,
                     };
-                    if self.page_ecc { t.with_ecc() } else { t }
+                    if let Some(ecc) = self.ecc {
+                        t.with_ecc(ecc)
+                    } else {
+                        t
+                    }
                 },
             )?;
         }
@@ -1152,7 +1189,7 @@ impl Writer {
             &mut self.file_writer,
             &mut self.block_buffer,
             self.encryption.as_deref(),
-            self.page_ecc,
+            self.ecc,
             &meta_params,
         )?;
 
@@ -1242,7 +1279,11 @@ impl Writer {
                     #[cfg(zstd_any)]
                     None,
                 )?;
-                if self.page_ecc { t.with_ecc() } else { t }
+                if let Some(ecc) = self.ecc {
+                    t.with_ecc(ecc)
+                } else {
+                    t
+                }
             },
         )?;
 
@@ -1268,7 +1309,7 @@ impl Writer {
             &mut self.file_writer,
             &mut self.block_buffer,
             self.encryption.as_deref(),
-            self.page_ecc,
+            self.ecc,
             &meta_params,
         )?;
 
@@ -1370,6 +1411,44 @@ struct MetaSectionParams<'a> {
     created_at_nanos: u128,
 }
 
+/// Resolves a `(page_ecc, EccScheme)` config pair into the per-block
+/// [`EccParams`](crate::table::block::EccParams) the writer emits.
+///
+/// `page_ecc == false` → `None` (no parity). A shard scheme
+/// (`Xor` / `ReedSolomon`) maps to its `(data_shards, parity_shards)`.
+/// `Secded` has no shard layout (it is per-word, gated until #255) and
+/// resolves to `None` — there is no implicit RS(4,2) fallback.
+#[must_use]
+#[expect(
+    clippy::expect_used,
+    reason = "a zero shard count here is an upstream config-invariant violation \
+              (try_update rejects it on the live path), so it is a programming \
+              error that must fail loud, like the writer's other contract asserts"
+)]
+pub(crate) fn resolve_ecc(
+    page_ecc: bool,
+    scheme: crate::runtime_config::EccScheme,
+) -> Option<crate::table::block::EccParams> {
+    if !page_ecc {
+        return None;
+    }
+    scheme.shard_params().map(|(data, parity)| {
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "shard counts originate as u8 in EccScheme"
+        )]
+        let (data, parity) = (data as u8, parity as u8);
+        // Shard counts come from a runtime-validated `EccScheme`
+        // (`try_update` rejects zero counts), so `try_new` cannot fail on
+        // the live path. The `expect` localizes the invariant for the one
+        // remaining injection point — a hand-built `Config::ecc_scheme`
+        // with a zero count — to a loud config error rather than a corrupt
+        // SST descriptor.
+        crate::table::block::EccParams::try_new(data, parity)
+            .expect("EccScheme shard counts are non-zero")
+    })
+}
+
 fn meta_kv(key: &str, value: &[u8]) -> InternalValue {
     InternalValue::from_components(key, value, 0, crate::ValueType::Value)
 }
@@ -1378,17 +1457,44 @@ fn write_meta_section<W: std::io::Write + std::io::Seek>(
     file_writer: &mut crate::sfa::Writer<ChecksummedWriter<W>>,
     block_buffer: &mut Vec<u8>,
     encryption: Option<&dyn EncryptionProvider>,
-    page_ecc: bool,
+    ecc: Option<crate::table::block::EccParams>,
     p: &MetaSectionParams<'_>,
 ) -> crate::Result<()> {
     file_writer.start(p.section_name)?;
 
-    // Record the EFFECTIVE Page-ECC setting, not the requested flag. On
+    // Record the EFFECTIVE Page-ECC scheme, not the requested one. On
     // builds without the `page_ecc` cargo feature, `with_ecc()` compiles to
     // the identity and no parity trailer is ever emitted, so the descriptor
-    // must read false to stay consistent with the on-disk blocks (otherwise
+    // must read "off" to stay consistent with the on-disk blocks (otherwise
     // an SST advertises parity that isn't there).
-    let effective_page_ecc = cfg!(feature = "page_ecc") && page_ecc;
+    let effective_ecc = if cfg!(feature = "page_ecc") {
+        ecc
+    } else {
+        None
+    };
+
+    // Per-SST ECC descriptor: 4 bytes [kind, data_shards, parity_shards,
+    // granularity], recording the exact scheme the blocks were written
+    // with so the read path re-derives the parity layout. Map the
+    // resolved EccParams back to a scheme (parity_shards == 1 => XOR,
+    // else Reed-Solomon); granularity is Block (the only level today).
+    let ecc_descriptor = {
+        use crate::runtime_config::{EccGranularity, EccScheme};
+        let cfg = effective_ecc.map(|p| {
+            let scheme = if p.parity_shards() == 1 {
+                EccScheme::Xor {
+                    data_shards: p.data_shards(),
+                }
+            } else {
+                EccScheme::ReedSolomon {
+                    data_shards: p.data_shards(),
+                    parity_shards: p.parity_shards(),
+                }
+            };
+            (scheme, EccGranularity::Block)
+        });
+        crate::runtime_config::ecc_descriptor_bytes(cfg)
+    };
 
     let meta = meta_kv;
     let meta_items = [
@@ -1430,7 +1536,7 @@ fn write_meta_section<W: std::io::Write + std::io::Seek>(
         // carries a Reed-Solomon parity trailer (Page ECC). One byte for the
         // whole homogeneous SST, so the read path learns ECC presence from
         // the descriptor instead of a per-block header field.
-        meta("descriptor#page_ecc", &[u8::from(effective_page_ecc)]),
+        meta("descriptor#page_ecc", &ecc_descriptor),
         meta("file_size", &p.file_size.to_le_bytes()),
         meta("filter_hash_type", &[u8::from(ChecksumType::Xxh3)]),
         // Index block format: 0 = legacy (no per-block seqno bounds in
@@ -1510,7 +1616,19 @@ fn write_meta_section<W: std::io::Write + std::io::Seek>(
                 Some(enc) => crate::table::block::BlockTransform::Encrypted(enc),
                 None => crate::table::block::BlockTransform::PLAIN,
             };
-            if page_ecc { t.with_ecc() } else { t }
+            // The Meta block is read at table-open BEFORE its own
+            // descriptor is parsed (chicken-and-egg: the scheme is IN
+            // the descriptor), so the reader cannot know a per-config
+            // scheme for it. Self-describing blocks therefore use the
+            // FIXED RS(4,2) layout (matching the reader's fallback);
+            // the configurable scheme applies only to the SST data /
+            // index / filter blocks, whose scheme the reader learns
+            // from this descriptor.
+            if effective_ecc.is_some() {
+                t.with_ecc(crate::table::block::EccParams::RS_4_2)
+            } else {
+                t
+            }
         },
     )?;
 

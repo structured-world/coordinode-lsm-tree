@@ -817,7 +817,15 @@ fn writer_records_effective_page_ecc_descriptor() -> crate::Result<()> {
             Ok(())
         },
         None,
-        Some(|w: Writer| w.use_page_ecc(true)),
+        Some(|w: Writer| {
+            w.use_page_ecc(
+                true,
+                crate::runtime_config::EccScheme::ReedSolomon {
+                    data_shards: 4,
+                    parity_shards: 2,
+                },
+            )
+        }),
     )
 }
 
@@ -1971,7 +1979,7 @@ fn load_block_range_tombstone_metrics() -> crate::Result<()> {
         BlockType::RangeTombstone,
         CompressionType::None,
         None,
-        false,
+        None,
         #[cfg(zstd_any)]
         None,
         #[cfg(feature = "metrics")]
@@ -1993,7 +2001,7 @@ fn load_block_range_tombstone_metrics() -> crate::Result<()> {
         BlockType::RangeTombstone,
         CompressionType::None,
         None,
-        false,
+        None,
         #[cfg(zstd_any)]
         None,
         #[cfg(feature = "metrics")]
@@ -2075,7 +2083,7 @@ fn load_block_cache_hit_rejects_wrong_block_type() -> crate::Result<()> {
         BlockType::Index,
         CompressionType::None,
         None,
-        false,
+        None,
         #[cfg(zstd_any)]
         None,
         #[cfg(feature = "metrics")]
@@ -2094,7 +2102,7 @@ fn load_block_cache_hit_rejects_wrong_block_type() -> crate::Result<()> {
         BlockType::Data,
         CompressionType::None,
         None,
-        false,
+        None,
         #[cfg(zstd_any)]
         None,
         #[cfg(feature = "metrics")]

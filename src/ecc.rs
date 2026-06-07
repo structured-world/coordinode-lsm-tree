@@ -1,179 +1,232 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026-present, Structured World Foundation
 
-//! Per-block Reed-Solomon Page ECC.
+//! Shard-based Page ECC: XOR single-parity (RAID-5) and Reed-Solomon.
 //!
-//! Encodes a fixed (4, 2) Reed-Solomon scheme over each block's
-//! on-disk bytes: 4 data shards + 2 parity shards = 6 shards
-//! total. The reader can reconstruct the original block when up
-//! to 2 of the 6 shards are corrupt or missing.
+//! Parity is computed over a block's on-disk bytes and appended after
+//! the payload; the reader reconstructs the block when corruption stays
+//! within the scheme's recovery bound. Two shard-based schemes live here:
+//!
+//! - **XOR single-parity** (`parity_shards == 1`, RAID-5 equivalent):
+//!   the block is split into `data_shards` shards and one parity shard is
+//!   their XOR. Recovers one fully-lost shard. Overhead = `1 /
+//!   data_shards`. Computed directly (no Reed-Solomon engine), so it is
+//!   far cheaper than RS for the single-erasure case.
+//! - **Reed-Solomon** (`parity_shards >= 2`): `parity_shards` recovery
+//!   shards over `data_shards` data shards, via `reed-solomon-simd`.
+//!   Recovers up to `parity_shards` lost shards. Overhead =
+//!   `parity_shards / data_shards`.
+//!
+//! Single-bit correction (SECDED / Hamming) is a separate, cheaper,
+//! per-word codec and does not live here.
 //!
 //! # Wire layout
 //!
-//! Block bytes are conceptually partitioned into 4 equal-size
-//! data shards (the last one padded with zeros if the block
-//! length is not a multiple of 4). The 2 parity shards are
-//! computed over these 4 data shards and appended after the
-//! block payload. The total bytes on disk for a block of length
-//! `N`:
-//!
-//! - Data: `4 * shard_bytes(N) >= N` bytes (first `N` are the
-//!   block payload, the remainder is zero padding that the
-//!   reader strips).
-//! - Parity: `2 * shard_bytes(N)` bytes appended after.
-//!
-//! where `shard_bytes(N) = ((N + 3) / 4)` rounded up to the
-//! nearest even number. The even-rounding satisfies the
-//! `reed-solomon-simd` requirement that `shard_bytes` be a
-//! multiple of 2.
+//! Block bytes are conceptually partitioned into `data_shards` equal-size
+//! shards (the last padded with zeros if the length is not a multiple of
+//! `data_shards`). The parity shards are appended after the payload.
+//! `shard_bytes(N, D) = ((N + D - 1) / D)` rounded up to the nearest even
+//! number (the `reed-solomon-simd` requirement that `shard_bytes` be a
+//! multiple of 2; XOR shares the layout for uniformity). Total parity:
+//! `shard_bytes(N, D) * parity_shards` bytes.
 //!
 //! # Recovery strategy
 //!
-//! On read, the block's stored XXH3 is recomputed over the
-//! payload. If it disagrees, the reader trials every
-//! `C(6, 4) = 15` subset of "shards still believed intact" and
-//! runs Reed-Solomon decode on each. The first subset whose
-//! recovered payload reproduces the stored XXH3 wins. This is
-//! more compact than per-shard checksums (which would cost
-//! `6 * 8 = 48` bytes per block on every block, parity or not)
-//! and the trial cost is paid only on actual corruption, not
-//! on the happy path.
+//! On read, the block's stored XXH3 is recomputed over the payload. If it
+//! disagrees, the reader enumerates which shards are corrupt and tries to
+//! reconstruct: for XOR, each of the `data_shards + 1` single-shard
+//! losses; for RS, every `C(data_shards + parity_shards, parity_shards)`
+//! subset of declared-missing shards. The first reconstruction whose XXH3
+//! reproduces the stored digest wins. The trial cost is paid only on
+//! actual corruption, not on the happy path.
+
+use alloc::vec;
+use alloc::vec::Vec;
 
 use reed_solomon_simd::{ReedSolomonDecoder, ReedSolomonEncoder};
 
-/// Number of original (data) shards in the Reed-Solomon scheme.
+/// Data-shard count of the historical RS(4,2) layout.
+///
+/// The chosen ECC scheme now flows write → per-SST descriptor → read
+/// (the descriptor records `(data_shards, parity_shards)` and block I/O
+/// re-derives the layout from it), so RS(4,2) is no longer the layout
+/// block I/O selects: it remains only as the fixed scheme for
+/// self-describing blocks (read before any descriptor is known) and as a
+/// test default. New configurations should prefer a lower-overhead scheme
+/// (XOR single-parity, or SECDED for single-bit rot).
 pub const RS_DATA_SHARDS: usize = 4;
 
-/// Number of recovery (parity) shards. Together with
-/// [`RS_DATA_SHARDS`] this lets the reader recover the original
-/// payload when up to `RS_PARITY_SHARDS` shards are corrupt.
+/// Parity-shard count of the legacy fixed scheme (RS(4,2)).
 pub const RS_PARITY_SHARDS: usize = 2;
 
-/// Per-shard byte length for a block of `payload_len` bytes.
+/// Per-shard byte length for a `payload_len`-byte block split into
+/// `data_shards` shards.
 ///
-/// Rounds up so that 4 shards cover all payload bytes (last
-/// shard zero-padded), then rounds up to an even number to
-/// satisfy reed-solomon-simd's `shard_bytes` alignment.
+/// Rounds up so the shards cover all payload bytes (last shard
+/// zero-padded), then rounds up to an even number to satisfy
+/// `reed-solomon-simd`'s `shard_bytes` alignment (XOR shares the layout).
+/// Returns 0 when `data_shards == 0` (caller treats it as "no parity").
 #[must_use]
-pub fn shard_bytes(payload_len: usize) -> usize {
-    let raw = payload_len.div_ceil(RS_DATA_SHARDS);
+pub fn shard_bytes(payload_len: usize, data_shards: usize) -> usize {
+    if data_shards == 0 {
+        return 0;
+    }
+    let raw = payload_len.div_ceil(data_shards);
     // Round up to multiple of 2 (reed-solomon-simd requirement).
     raw.div_ceil(2) * 2
 }
 
-/// Total parity-trailer byte size for a block of `payload_len` bytes.
+/// Total parity-trailer byte size for a `payload_len`-byte block under a
+/// `(data_shards, parity_shards)` scheme.
 ///
 /// This is what the writer emits after the payload, and what the reader
-/// re-derives from `data_length` (the length is not stored in the block
-/// header — only the `ECC_PARITY` presence flag is).
+/// re-derives from `data_length` + the per-SST scheme descriptor (the
+/// trailer length is not stored per block).
 #[must_use]
-pub fn parity_len(payload_len: usize) -> usize {
-    shard_bytes(payload_len) * RS_PARITY_SHARDS
+pub fn parity_len(payload_len: usize, data_shards: usize, parity_shards: usize) -> usize {
+    shard_bytes(payload_len, data_shards) * parity_shards
 }
 
-/// Encodes a Reed-Solomon parity trailer for `payload`.
+/// Encodes a parity trailer for `payload` under a `(data_shards,
+/// parity_shards)` scheme.
 ///
-/// Returns a `Vec<u8>` of length [`parity_len`] for `payload.len()`.
-/// The caller writes the bytes verbatim after the payload and sets the
-/// `ECC_PARITY` flag in the block header (the trailer length is not
-/// stored; the reader re-derives it from `data_length`).
-///
-/// Empty input (`payload.len() == 0`) is handled by short-circuit
-/// returning `Ok(Vec::new())` — a zero-length block has nothing to
-/// protect, so emitting zero parity bytes is the correct shape, and
-/// the writer leaves the `ECC_PARITY` flag clear to match.
+/// `parity_shards == 1` uses direct XOR (RAID-5); `parity_shards >= 2`
+/// uses Reed-Solomon. Returns a `Vec<u8>` of length [`parity_len`].
+/// Empty input or a degenerate scheme (`shard_bytes == 0` or
+/// `parity_shards == 0`) returns `Ok(Vec::new())`.
 ///
 /// # Errors
 ///
-/// Returns [`crate::Error::Unrecoverable`] if the reed-solomon
-/// engine rejects the (4, 2, `shard_bytes`) configuration. With
-/// `shard_bytes` computed from a non-zero payload length and
-/// rounded to the nearest even integer (the only constraint the
-/// engine has on the shard size), the engine has no remaining
-/// reason to reject; this branch is defensive and is expected to
-/// be unreachable from any in-tree caller.
-pub fn encode_parity(payload: &[u8]) -> crate::Result<Vec<u8>> {
-    let sb = shard_bytes(payload.len());
-    if sb == 0 {
+/// Returns [`crate::Error::Unrecoverable`] if the Reed-Solomon engine
+/// rejects the `(data_shards, parity_shards, shard_bytes)` configuration.
+/// XOR encoding cannot fail.
+pub fn encode_parity(
+    payload: &[u8],
+    data_shards: usize,
+    parity_shards: usize,
+) -> crate::Result<Vec<u8>> {
+    let sb = shard_bytes(payload.len(), data_shards);
+    if sb == 0 || parity_shards == 0 {
         return Ok(Vec::new());
     }
-    let mut encoder = ReedSolomonEncoder::new(RS_DATA_SHARDS, RS_PARITY_SHARDS, sb)
-        .map_err(|_| crate::Error::Unrecoverable)?;
+    if parity_shards == 1 {
+        return Ok(encode_xor(payload, data_shards, sb));
+    }
+    encode_rs(payload, data_shards, parity_shards, sb)
+}
 
-    // Walk the payload as 4 contiguous shards. The last shard may
-    // run past payload.len() — fill the tail with zero padding.
-    let mut shard_buf = vec![0u8; sb];
-    for i in 0..RS_DATA_SHARDS {
-        shard_buf.fill(0);
-        let start = i * sb;
-        let end = ((i + 1) * sb).min(payload.len());
-        if start < payload.len() {
-            #[expect(
-                clippy::indexing_slicing,
-                reason = "start < payload.len() and end <= payload.len() guarded above"
-            )]
-            shard_buf[..end - start].copy_from_slice(&payload[start..end]);
+/// Copies data shard `i` (length `sb`, zero-padded past `payload.len()`)
+/// into `buf`.
+fn fill_data_shard(buf: &mut [u8], payload: &[u8], i: usize, sb: usize) {
+    buf.fill(0);
+    let start = i * sb;
+    let end = ((i + 1) * sb).min(payload.len());
+    if start < payload.len() {
+        #[expect(
+            clippy::indexing_slicing,
+            reason = "start < payload.len() and end <= payload.len() guarded above"
+        )]
+        buf[..end - start].copy_from_slice(&payload[start..end]);
+    }
+}
+
+/// XOR single-parity (RAID-5): parity shard = XOR of all data shards.
+/// The byte-wise XOR loop autovectorizes; no explicit SIMD kernel needed.
+fn encode_xor(payload: &[u8], data_shards: usize, sb: usize) -> Vec<u8> {
+    let mut parity = vec![0u8; sb];
+    let mut shard = vec![0u8; sb];
+    for i in 0..data_shards {
+        fill_data_shard(&mut shard, payload, i, sb);
+        for (p, &b) in parity.iter_mut().zip(shard.iter()) {
+            *p ^= b;
         }
+    }
+    parity
+}
+
+/// Reed-Solomon parity (`parity_shards >= 2`) over `data_shards`.
+fn encode_rs(
+    payload: &[u8],
+    data_shards: usize,
+    parity_shards: usize,
+    sb: usize,
+) -> crate::Result<Vec<u8>> {
+    let mut encoder = ReedSolomonEncoder::new(data_shards, parity_shards, sb)
+        .map_err(|_| crate::Error::Unrecoverable)?;
+    let mut shard_buf = vec![0u8; sb];
+    for i in 0..data_shards {
+        fill_data_shard(&mut shard_buf, payload, i, sb);
         encoder
             .add_original_shard(&shard_buf)
             .map_err(|_| crate::Error::Unrecoverable)?;
     }
-
     let result = encoder.encode().map_err(|_| crate::Error::Unrecoverable)?;
-    let mut out = Vec::with_capacity(parity_len(payload.len()));
+    let mut out = Vec::with_capacity(sb * parity_shards);
     for shard in result.recovery_iter() {
         out.extend_from_slice(shard);
     }
     Ok(out)
 }
 
-/// Attempts to recover the original payload bytes from the
-/// concatenated `data` (possibly corrupted) and `parity` shards.
+/// Attempts to recover the original payload from `data` (possibly
+/// corrupted) and `parity` shards under a `(data_shards, parity_shards)`
+/// scheme.
 ///
-/// `expected_payload_len` is the original payload size (the
-/// reader gets this from `BlockHeader.data_length`); the data
-/// portion in the returned vec is exactly this many bytes — the
-/// padding bytes inside the last data shard are stripped.
-///
-/// `xxh3_oracle` is invoked on each candidate reconstruction;
-/// the first candidate whose XXH3 matches the expected digest
-/// wins. The caller provides the digest comparison so this
-/// module stays independent of the block-checksum surface.
-///
-/// Returns `Ok(Some(payload))` on successful recovery,
-/// `Ok(None)` if no subset of 4 intact shards yields a payload
-/// matching the oracle.
+/// `expected_payload_len` is the original payload size (from
+/// `BlockHeader.data_length`); the returned vec is trimmed to it.
+/// `xxh3_oracle` is invoked on each candidate; the first whose XXH3
+/// matches wins. Returns `Ok(Some(payload))` on success, `Ok(None)` if no
+/// reconstruction matched.
 ///
 /// # Errors
 ///
-/// Returns [`crate::Error::Unrecoverable`] on engine-level
-/// failure (reed-solomon-simd rejects the (4, 2, `shard_bytes`)
-/// configuration, allocation failure inside the decoder, etc.).
-/// "No subset matched" is NOT an error — it surfaces as
-/// `Ok(None)` so callers can fall through to the "block is
-/// genuinely unrecoverable" path without a `Result` branch.
+/// Returns [`crate::Error::Unrecoverable`] on Reed-Solomon engine-level
+/// failure. "No subset matched" is `Ok(None)`, not an error.
 pub fn try_recover<F>(
     data: &[u8],
     parity: &[u8],
     expected_payload_len: usize,
+    data_shards: usize,
+    parity_shards: usize,
     mut xxh3_oracle: F,
 ) -> crate::Result<Option<Vec<u8>>>
 where
     F: FnMut(&[u8]) -> bool,
 {
-    let sb = shard_bytes(expected_payload_len);
-    if sb == 0 || data.len() < expected_payload_len || parity.len() < sb * RS_PARITY_SHARDS {
-        // Not enough bytes to attempt recovery at all.
+    let sb = shard_bytes(expected_payload_len, data_shards);
+    if sb == 0
+        || parity_shards == 0
+        || data.len() < expected_payload_len
+        || parity.len() < sb * parity_shards
+    {
         return Ok(None);
     }
 
-    // Carve the 6 shards out of the on-disk bytes. Data shards
-    // are taken in row-major order from `data`; the last data
-    // shard's tail (past `expected_payload_len`) is treated as
-    // zero padding by the encoder, so we re-create that padding
-    // here for the symmetric read view.
-    let mut shards: [Vec<u8>; RS_DATA_SHARDS + RS_PARITY_SHARDS] = Default::default();
-    for (i, shard) in shards.iter_mut().enumerate().take(RS_DATA_SHARDS) {
+    if parity_shards == 1 {
+        return Ok(xor_recover(
+            data,
+            parity,
+            expected_payload_len,
+            data_shards,
+            sb,
+            &mut xxh3_oracle,
+        ));
+    }
+    rs_recover(
+        data,
+        parity,
+        expected_payload_len,
+        data_shards,
+        parity_shards,
+        sb,
+        &mut xxh3_oracle,
+    )
+}
+
+/// Carves the `data_shards` data shards out of `data` (last zero-padded).
+fn carve_data_shards(data: &[u8], data_shards: usize, sb: usize) -> Vec<Vec<u8>> {
+    let mut shards = Vec::with_capacity(data_shards);
+    for i in 0..data_shards {
         let mut buf = vec![0u8; sb];
         let start = i * sb;
         let end = ((i + 1) * sb).min(data.len());
@@ -184,59 +237,160 @@ where
             )]
             buf[..end - start].copy_from_slice(&data[start..end]);
         }
-        *shard = buf;
+        shards.push(buf);
     }
-    for i in 0..RS_PARITY_SHARDS {
+    shards
+}
+
+/// XOR single-parity recovery: try the data-intact candidate (parity
+/// itself corrupt) and each single-data-shard reconstruction.
+fn xor_recover<F>(
+    data: &[u8],
+    parity: &[u8],
+    expected_payload_len: usize,
+    data_shards: usize,
+    sb: usize,
+    xxh3_oracle: &mut F,
+) -> Option<Vec<u8>>
+where
+    F: FnMut(&[u8]) -> bool,
+{
+    let shards = carve_data_shards(data, data_shards, sb);
+
+    // Candidate 0: data shards intact, parity shard was the corrupt one.
+    let mut payload = Vec::with_capacity(data_shards * sb);
+    for s in &shards {
+        payload.extend_from_slice(s);
+    }
+    payload.truncate(expected_payload_len);
+    if xxh3_oracle(&payload) {
+        return Some(payload);
+    }
+
+    // Candidates 1..=data_shards: shard `miss` corrupt → reconstruct it
+    // as parity XOR (all other data shards).
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "parity.len() >= sb guarded by caller"
+    )]
+    let parity_shard = &parity[..sb];
+    for miss in 0..data_shards {
+        let mut recovered = parity_shard.to_vec();
+        for (i, s) in shards.iter().enumerate() {
+            if i == miss {
+                continue;
+            }
+            for (r, &b) in recovered.iter_mut().zip(s.iter()) {
+                *r ^= b;
+            }
+        }
+        let mut payload = Vec::with_capacity(data_shards * sb);
+        for (i, s) in shards.iter().enumerate() {
+            if i == miss {
+                payload.extend_from_slice(&recovered);
+            } else {
+                payload.extend_from_slice(s);
+            }
+        }
+        payload.truncate(expected_payload_len);
+        if xxh3_oracle(&payload) {
+            return Some(payload);
+        }
+    }
+    None
+}
+
+/// Reed-Solomon recovery: enumerate every `C(n, parity_shards)` subset of
+/// declared-missing shards and try a decode against each.
+fn rs_recover<F>(
+    data: &[u8],
+    parity: &[u8],
+    expected_payload_len: usize,
+    data_shards: usize,
+    parity_shards: usize,
+    sb: usize,
+    xxh3_oracle: &mut F,
+) -> crate::Result<Option<Vec<u8>>>
+where
+    F: FnMut(&[u8]) -> bool,
+{
+    let n = data_shards + parity_shards;
+    let mut shards = carve_data_shards(data, data_shards, sb);
+    for i in 0..parity_shards {
         let start = i * sb;
         let end = start + sb;
         if end > parity.len() {
             return Ok(None);
         }
         #[expect(clippy::indexing_slicing, reason = "end <= parity.len() guarded above")]
-        let buf = parity[start..end].to_vec();
-        #[expect(
-            clippy::indexing_slicing,
-            reason = "RS_DATA_SHARDS + i < shards.len() by the const arithmetic"
-        )]
+        shards.push(parity[start..end].to_vec());
+    }
+
+    // Enumerate every size-`parity_shards` subset of {0..n} as the
+    // declared-missing set; the first decode whose payload matches wins.
+    let mut missing = (0..parity_shards).collect::<Vec<usize>>();
+    loop {
+        if let Some(payload) = try_decode_one(
+            &shards,
+            sb,
+            expected_payload_len,
+            data_shards,
+            parity_shards,
+            &missing,
+        )? && xxh3_oracle(&payload)
         {
-            shards[RS_DATA_SHARDS + i] = buf;
+            return Ok(Some(payload));
+        }
+        if !next_combination(&mut missing, n) {
+            break;
         }
     }
-
-    // Enumerate every C(6, 4) = 15 subset of "shards believed
-    // intact" and try Reed-Solomon decode against each. The
-    // first subset whose reconstruction matches the oracle wins.
-    for missing_a in 0..(RS_DATA_SHARDS + RS_PARITY_SHARDS) {
-        for missing_b in (missing_a + 1)..(RS_DATA_SHARDS + RS_PARITY_SHARDS) {
-            if let Some(payload) =
-                try_decode_one(&shards, sb, expected_payload_len, missing_a, missing_b)?
-                && xxh3_oracle(&payload)
-            {
-                return Ok(Some(payload));
-            }
-        }
-    }
-
     Ok(None)
 }
 
-/// Single Reed-Solomon decode attempt with two declared-missing
-/// shard indices. Returns the reconstructed payload (trimmed to
-/// `expected_payload_len`) or `Ok(None)` if the decode failed.
+/// Advances `combo` (strictly increasing indices into `0..n`) to the next
+/// combination in lexicographic order. Returns `false` when exhausted.
+fn next_combination(combo: &mut [usize], n: usize) -> bool {
+    let k = combo.len();
+    if k == 0 {
+        return false;
+    }
+    let mut i = k - 1;
+    loop {
+        // Max value position `i` may take so the tail still fits.
+        let max_at_i = n - k + i;
+        #[expect(clippy::indexing_slicing, reason = "i < k == combo.len()")]
+        if combo[i] < max_at_i {
+            combo[i] += 1;
+            for j in (i + 1)..k {
+                #[expect(clippy::indexing_slicing, reason = "i < j < k == combo.len()")]
+                {
+                    combo[j] = combo[j - 1] + 1;
+                }
+            }
+            return true;
+        }
+        if i == 0 {
+            return false;
+        }
+        i -= 1;
+    }
+}
+
+/// Single Reed-Solomon decode attempt with `missing` declared-missing
+/// shard indices. Returns the reconstructed payload or `Ok(None)`.
 fn try_decode_one(
-    shards: &[Vec<u8>; RS_DATA_SHARDS + RS_PARITY_SHARDS],
+    shards: &[Vec<u8>],
     sb: usize,
     expected_payload_len: usize,
-    missing_a: usize,
-    missing_b: usize,
+    data_shards: usize,
+    parity_shards: usize,
+    missing: &[usize],
 ) -> crate::Result<Option<Vec<u8>>> {
-    let mut decoder = ReedSolomonDecoder::new(RS_DATA_SHARDS, RS_PARITY_SHARDS, sb)
+    let mut decoder = ReedSolomonDecoder::new(data_shards, parity_shards, sb)
         .map_err(|_| crate::Error::Unrecoverable)?;
-
-    // Submit the 4 shards we BELIEVE intact: every shard except
-    // missing_a / missing_b.
-    for (i, shard) in shards.iter().enumerate().take(RS_DATA_SHARDS) {
-        if i == missing_a || i == missing_b {
+    for (i, shard) in shards.iter().enumerate().take(data_shards) {
+        if missing.contains(&i) {
             continue;
         }
         decoder
@@ -246,14 +400,14 @@ fn try_decode_one(
     for (i, shard) in shards
         .iter()
         .enumerate()
-        .skip(RS_DATA_SHARDS)
-        .take(RS_PARITY_SHARDS)
+        .skip(data_shards)
+        .take(parity_shards)
     {
-        if i == missing_a || i == missing_b {
+        if missing.contains(&i) {
             continue;
         }
         decoder
-            .add_recovery_shard(i - RS_DATA_SHARDS, shard)
+            .add_recovery_shard(i - data_shards, shard)
             .map_err(|_| crate::Error::Unrecoverable)?;
     }
 
@@ -261,14 +415,9 @@ fn try_decode_one(
         return Ok(None);
     };
 
-    // Reassemble the 4 data shards into a payload, preferring the
-    // decoder's restored shard for `missing_a` / `missing_b` when
-    // they are data-side indices (recovery-side missing shards
-    // don't affect the payload reconstruction).
-    let mut payload = Vec::with_capacity(RS_DATA_SHARDS * sb);
-    for (i, shard) in shards.iter().enumerate().take(RS_DATA_SHARDS) {
-        if i == missing_a || i == missing_b {
-            // Decoder restored this shard.
+    let mut payload = Vec::with_capacity(data_shards * sb);
+    for (i, shard) in shards.iter().enumerate().take(data_shards) {
+        if missing.contains(&i) {
             match result.restored_original(i) {
                 Some(s) => payload.extend_from_slice(s),
                 None => return Ok(None),
@@ -277,7 +426,6 @@ fn try_decode_one(
             payload.extend_from_slice(shard);
         }
     }
-
     payload.truncate(expected_payload_len);
     Ok(Some(payload))
 }
@@ -287,12 +435,7 @@ fn try_decode_one(
 mod tests {
     use super::*;
     // `test_log::test` shadows the std `test` attribute so every
-    // `#[test]` below routes through test-log — drives RUST_LOG
-    // capture for the ecc warnings emitted by `try_recover` /
-    // `encode_parity`. Looks unused at a glance because the
-    // `#[test]` syntax is identical to the std macro; clippy
-    // resolves the shadowing correctly and does NOT warn under
-    // `-D warnings`.
+    // `#[test]` below routes through test-log for RUST_LOG capture.
     use test_log::test;
 
     fn xxh3_oracle(expected: u128) -> impl FnMut(&[u8]) -> bool {
@@ -301,110 +444,252 @@ mod tests {
 
     #[test]
     fn shard_bytes_rounds_up_to_even_quarter() {
-        // payload = 4 → shard = 1 → rounded to 2
-        assert_eq!(shard_bytes(4), 2);
+        // RS(4,2)-style splits: payload 4 → shard 1 → rounded to 2.
+        assert_eq!(shard_bytes(4, 4), 2);
         // payload = 33 → ceil(33/4) = 9 → rounded to 10
-        assert_eq!(shard_bytes(33), 10);
+        assert_eq!(shard_bytes(33, 4), 10);
         // payload = 4096 → exact, no rounding
-        assert_eq!(shard_bytes(4096), 1024);
+        assert_eq!(shard_bytes(4096, 4), 1024);
         // payload = 4097 → ceil(4097/4) = 1025 → rounded to 1026
-        assert_eq!(shard_bytes(4097), 1026);
+        assert_eq!(shard_bytes(4097, 4), 1026);
+        // 10-shard split (10% XOR overhead): 4096 → ceil(409.6)=410
+        assert_eq!(shard_bytes(4096, 10), 410);
+        assert_eq!(shard_bytes(0, 4), 0);
     }
 
     #[test]
-    fn encode_decode_roundtrip_no_corruption() {
-        // Even with no corruption, decode trials should find the
-        // first subset (drop two parity shards) that reproduces
-        // the payload via XXH3 match.
-        let payload: Vec<u8> = (0..4096_u32).map(|i| (i & 0xff) as u8).collect();
-        let parity = encode_parity(&payload).expect("encode");
-        assert_eq!(parity.len(), parity_len(payload.len()));
-
-        let expected = crate::hash::hash128(&payload);
-        let recovered = try_recover(&payload, &parity, payload.len(), xxh3_oracle(expected))
-            .expect("try_recover")
-            .expect("payload should be recoverable");
-        assert_eq!(recovered, payload);
-    }
-
-    #[test]
-    fn recovers_from_single_data_shard_corruption() {
-        let payload: Vec<u8> = (0..4096_u32).map(|i| (i & 0xff) as u8).collect();
-        let parity = encode_parity(&payload).expect("encode");
-        let expected = crate::hash::hash128(&payload);
-
-        let mut corrupted = payload.clone();
-        // Flip every byte in shard 1 (mid-block corruption).
-        let sb = shard_bytes(payload.len());
-        for b in &mut corrupted[sb..2 * sb] {
-            *b ^= 0xFF;
+    fn rs_4_2_layout_is_byte_identical_to_legacy() {
+        // The legacy fixed scheme is RS(4,2); parity_len must match the
+        // old `shard_bytes(N) * 2` formula so existing SSTs round-trip.
+        for n in [1usize, 4, 33, 4096, 4097] {
+            assert_eq!(
+                parity_len(n, RS_DATA_SHARDS, RS_PARITY_SHARDS),
+                shard_bytes(n, 4) * 2,
+            );
         }
+    }
 
-        let recovered = try_recover(&corrupted, &parity, payload.len(), xxh3_oracle(expected))
-            .expect("try_recover")
-            .expect("single data-shard corruption must be recoverable");
+    #[test]
+    fn rs_encode_decode_roundtrip_no_corruption() {
+        let payload: Vec<u8> = (0..4096_u32).map(|i| (i & 0xff) as u8).collect();
+        let parity = encode_parity(&payload, 4, 2).expect("encode");
+        assert_eq!(parity.len(), parity_len(payload.len(), 4, 2));
+        let expected = crate::hash::hash128(&payload);
+        let recovered = try_recover(
+            &payload,
+            &parity,
+            payload.len(),
+            4,
+            2,
+            xxh3_oracle(expected),
+        )
+        .expect("try_recover")
+        .expect("recoverable");
         assert_eq!(recovered, payload);
     }
 
     #[test]
-    fn recovers_from_double_data_shard_corruption() {
+    fn rs_recovers_from_double_data_shard_corruption() {
         let payload: Vec<u8> = (0..4096_u32).map(|i| (i & 0xff) as u8).collect();
-        let parity = encode_parity(&payload).expect("encode");
+        let parity = encode_parity(&payload, 4, 2).expect("encode");
         let expected = crate::hash::hash128(&payload);
-
         let mut corrupted = payload.clone();
-        // Wipe shards 0 AND 2 — two simultaneous failures within
-        // the RS(4, 2) bound.
-        let sb = shard_bytes(payload.len());
+        let sb = shard_bytes(payload.len(), 4);
         for b in &mut corrupted[0..sb] {
             *b ^= 0xAA;
         }
         for b in &mut corrupted[2 * sb..3 * sb] {
             *b ^= 0xBB;
         }
-
-        let recovered = try_recover(&corrupted, &parity, payload.len(), xxh3_oracle(expected))
-            .expect("try_recover")
-            .expect("double data-shard corruption must be recoverable");
+        let recovered = try_recover(
+            &corrupted,
+            &parity,
+            payload.len(),
+            4,
+            2,
+            xxh3_oracle(expected),
+        )
+        .expect("try_recover")
+        .expect("double-shard corruption recoverable under RS(4,2)");
         assert_eq!(recovered, payload);
     }
 
     #[test]
-    fn unrecoverable_when_three_shards_corrupt() {
+    fn rs_unrecoverable_when_three_shards_corrupt() {
         let payload: Vec<u8> = (0..4096_u32).map(|i| (i & 0xff) as u8).collect();
-        let parity = encode_parity(&payload).expect("encode");
+        let parity = encode_parity(&payload, 4, 2).expect("encode");
         let expected = crate::hash::hash128(&payload);
-
         let mut corrupted = payload.clone();
-        // Wipe 3 data shards — exceeds the RS(4, 2) recovery bound.
-        let sb = shard_bytes(payload.len());
+        let sb = shard_bytes(payload.len(), 4);
         for b in &mut corrupted[0..3 * sb] {
             *b ^= 0xCC;
         }
-
-        let outcome = try_recover(&corrupted, &parity, payload.len(), xxh3_oracle(expected))
-            .expect("try_recover");
+        let outcome = try_recover(
+            &corrupted,
+            &parity,
+            payload.len(),
+            4,
+            2,
+            xxh3_oracle(expected),
+        )
+        .expect("try_recover");
         assert!(
             outcome.is_none(),
-            "three-shard corruption must NOT be recoverable, got: {outcome:?}",
+            "three-shard corruption must be unrecoverable"
         );
     }
 
     #[test]
-    fn handles_unaligned_block_size() {
-        // 33 bytes — index/filter blocks come in this shape; the
-        // shard padding logic must produce a recoverable encoding.
-        let payload: Vec<u8> = (0..33_u8).collect();
-        let parity = encode_parity(&payload).expect("encode");
+    fn xor_single_parity_overhead_is_one_over_data_shards() {
+        // 10 data shards → parity is exactly one shard ≈ 10% of payload.
+        let payload: Vec<u8> = (0..4096_u32).map(|i| (i & 0xff) as u8).collect();
+        let parity = encode_parity(&payload, 10, 1).expect("encode");
+        assert_eq!(parity.len(), parity_len(payload.len(), 10, 1));
+        assert_eq!(parity.len(), shard_bytes(4096, 10)); // one shard
+    }
+
+    #[test]
+    fn xor_recovers_single_data_shard_loss() {
+        let payload: Vec<u8> = (0..4096_u32)
+            .map(|i| (i.wrapping_mul(7) & 0xff) as u8)
+            .collect();
+        let parity = encode_parity(&payload, 8, 1).expect("encode");
         let expected = crate::hash::hash128(&payload);
-
+        let sb = shard_bytes(payload.len(), 8);
         let mut corrupted = payload.clone();
-        // Corrupt the first byte → falls in shard 0.
-        corrupted[0] ^= 0xFF;
-
-        let recovered = try_recover(&corrupted, &parity, payload.len(), xxh3_oracle(expected))
-            .expect("try_recover")
-            .expect("unaligned-block single-shard corruption must be recoverable");
+        // Wipe shard 3.
+        for b in &mut corrupted[3 * sb..4 * sb] {
+            *b ^= 0xFF;
+        }
+        let recovered = try_recover(
+            &corrupted,
+            &parity,
+            payload.len(),
+            8,
+            1,
+            xxh3_oracle(expected),
+        )
+        .expect("try_recover")
+        .expect("single-shard loss recoverable under XOR");
         assert_eq!(recovered, payload);
+    }
+
+    #[test]
+    fn xor_recovers_when_parity_itself_is_corrupt() {
+        // Data intact, parity shard corrupt → candidate-0 path returns
+        // the untouched data.
+        let payload: Vec<u8> = (0..2048_u32).map(|i| (i & 0xff) as u8).collect();
+        let mut parity = encode_parity(&payload, 8, 1).expect("encode");
+        let expected = crate::hash::hash128(&payload);
+        parity[0] ^= 0xFF;
+        let recovered = try_recover(
+            &payload,
+            &parity,
+            payload.len(),
+            8,
+            1,
+            xxh3_oracle(expected),
+        )
+        .expect("try_recover")
+        .expect("data intact, parity corrupt is recoverable");
+        assert_eq!(recovered, payload);
+    }
+
+    #[test]
+    fn xor_unrecoverable_when_two_data_shards_lost() {
+        // XOR single-parity tolerates exactly one shard loss.
+        let payload: Vec<u8> = (0..4096_u32).map(|i| (i & 0xff) as u8).collect();
+        let parity = encode_parity(&payload, 8, 1).expect("encode");
+        let expected = crate::hash::hash128(&payload);
+        let sb = shard_bytes(payload.len(), 8);
+        let mut corrupted = payload.clone();
+        for b in &mut corrupted[0..sb] {
+            *b ^= 0xAA;
+        }
+        for b in &mut corrupted[2 * sb..3 * sb] {
+            *b ^= 0xBB;
+        }
+        let outcome = try_recover(
+            &corrupted,
+            &parity,
+            payload.len(),
+            8,
+            1,
+            xxh3_oracle(expected),
+        )
+        .expect("try_recover");
+        assert!(
+            outcome.is_none(),
+            "two-shard loss must be unrecoverable under XOR"
+        );
+    }
+
+    #[test]
+    fn rs_8_2_recovers_double_loss_low_overhead() {
+        // RS(8,2): 25% overhead, two-shard tolerance — the higher tier.
+        let payload: Vec<u8> = (0..8192_u32).map(|i| (i & 0xff) as u8).collect();
+        let parity = encode_parity(&payload, 8, 2).expect("encode");
+        assert_eq!(parity.len(), shard_bytes(8192, 8) * 2);
+        let expected = crate::hash::hash128(&payload);
+        let sb = shard_bytes(payload.len(), 8);
+        let mut corrupted = payload.clone();
+        for b in &mut corrupted[5 * sb..6 * sb] {
+            *b ^= 0xAA;
+        }
+        for b in &mut corrupted[7 * sb..8 * sb] {
+            *b ^= 0xBB;
+        }
+        let recovered = try_recover(
+            &corrupted,
+            &parity,
+            payload.len(),
+            8,
+            2,
+            xxh3_oracle(expected),
+        )
+        .expect("try_recover")
+        .expect("double-shard loss recoverable under RS(8,2)");
+        assert_eq!(recovered, payload);
+    }
+
+    #[test]
+    fn handles_unaligned_block_size() {
+        let payload: Vec<u8> = (0..33_u8).collect();
+        let parity = encode_parity(&payload, 4, 2).expect("encode");
+        let expected = crate::hash::hash128(&payload);
+        let mut corrupted = payload.clone();
+        corrupted[0] ^= 0xFF;
+        let recovered = try_recover(
+            &corrupted,
+            &parity,
+            payload.len(),
+            4,
+            2,
+            xxh3_oracle(expected),
+        )
+        .expect("try_recover")
+        .expect("unaligned single-shard corruption recoverable");
+        assert_eq!(recovered, payload);
+    }
+
+    #[test]
+    fn next_combination_enumerates_all_pairs() {
+        // C(4,2) = 6 pairs in lexicographic order.
+        let mut combo = vec![0usize, 1];
+        let mut seen = vec![combo.clone()];
+        while next_combination(&mut combo, 4) {
+            seen.push(combo.clone());
+        }
+        assert_eq!(
+            seen,
+            vec![
+                vec![0, 1],
+                vec![0, 2],
+                vec![0, 3],
+                vec![1, 2],
+                vec![1, 3],
+                vec![2, 3],
+            ],
+        );
     }
 }

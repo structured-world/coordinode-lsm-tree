@@ -524,16 +524,15 @@ pub struct DecryptedBlock {
     pub block_flags: u8,
 }
 
-/// Recovers plaintext from the `MetadataFrame ‖ BodyFrame ‖ *trailing`
-/// byte sequence produced by [`encrypt_block`].
+/// Recovers plaintext from the `MetadataFrame ‖ BodyFrame` byte
+/// sequence produced by [`encrypt_block`].
 ///
 /// Reads the `MetadataFrame`, parses the 39-byte payload, decodes
 /// the `BodyFrame`, reconstructs the AAD from `identity` + the
 /// parsed `EncryptionContext`, looks up the matching key from
-/// `key_chain`, runs [`decrypt_in_place`], then consumes any
-/// trailing optional skippable frames (variants 2..=15, e.g. the
-/// `EccFrame` at variant 2 owned by #254) until either EOF or
-/// non-conformant trailing bytes.
+/// `key_chain`, runs [`decrypt_in_place`], then requires the input
+/// to end exactly at the `BodyFrame`: the encrypted-block format
+/// defines no trailing frames, so any extra bytes are rejected.
 ///
 /// `identity` MUST supply the three AAD-bound fields that are
 /// NOT recorded on disk: `tree_id`, `table_id`, and `block_offset`.
@@ -590,75 +589,19 @@ pub fn decrypt_block(
         DecryptError::MalformedBodyFrame,
     )?;
 
-    // ── Optional trailing skippable frames ─────────────────────
-    // Spec §5 row "encrypted-block": MetadataFrame ‖ BodyFrame
-    // followed by *zero or more* optional skippable frames in
-    // variants 2..=15 (e.g. EccFrame at variant 2 owned by
-    // #254). v1 readers MUST accept and skip those. Any
-    // remaining bytes that don't parse as a well-formed
-    // skippable frame are rejected — silently ignoring them
-    // would mean malformed trailing data is accepted as a valid
-    // block.
-    loop {
-        // Peek one byte to detect EOF without consuming bytes
-        // we'd then have to put back. Cursor::position() lets us
-        // do this cheaply.
-        let pos = cursor.position();
-        let total = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
-        if pos >= total {
-            break;
-        }
-        // Read one more frame HEADER (no payload alloc). Variant
-        // must be 2..=15 (anything else is malformed trailing
-        // data); payload length bounded by MAX_BODY_LEN as a
-        // generic cap. The payload itself is then SKIPPED (cursor
-        // advanced) without allocating, since trailing frame
-        // contents are spec-defined per-variant and this layer
-        // ignores them — allocating MAX_BODY_LEN scratch for
-        // every skipped frame would let a crafted ECC-frame chain
-        // amplify peak memory unnecessarily.
-        let mut header = [0u8; 8];
-        std::io::Read::read_exact(&mut cursor, &mut header).map_err(|_| {
-            DecryptError::MalformedBodyFrame("truncated trailing skippable-frame header")
-        })?;
-        let magic = u32::from_le_bytes([header[0], header[1], header[2], header[3]]);
-        let variant = magic.wrapping_sub(SKIPPABLE_MAGIC_START);
-        if variant > 15 {
-            return Err(DecryptError::MalformedBodyFrame(
-                "trailing frame magic outside skippable-frame range",
-            ));
-        }
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "guarded by `variant > 15` immediately above"
-        )]
-        let variant_byte = variant as u8;
-        if !(2..=15).contains(&variant_byte) {
-            return Err(DecryptError::MalformedBodyFrame(
-                "trailing frame variant outside spec-permitted range 2..=15",
-            ));
-        }
-        let payload_len = u32::from_le_bytes([header[4], header[5], header[6], header[7]]);
-        if payload_len > MAX_BODY_LEN {
-            return Err(DecryptError::MalformedBodyFrame(
-                "trailing frame PayloadLen exceeds cap",
-            ));
-        }
-        // Skip payload bytes without allocating: advance the
-        // Cursor by the declared length, then verify the cursor
-        // didn't run past EOF (truncated trailing frame).
-        let skip_end = cursor.position().saturating_add(u64::from(payload_len));
-        if skip_end > total {
-            return Err(DecryptError::MalformedBodyFrame(
-                "truncated trailing skippable-frame payload",
-            ));
-        }
-        cursor.set_position(skip_end);
-        // Frame contents are spec-defined per-variant (e.g. ECC
-        // parity for variant 2). Beyond skipping, the contract
-        // for this layer is "tolerate and ignore" — verification
-        // of those frames belongs to whichever component owns
-        // their definition.
+    // ── Strict end-of-block ────────────────────────────────────
+    // The encrypted-block wire format is exactly MetadataFrame ‖
+    // BodyFrame. No trailing frames are defined (ECC-at-rest lives
+    // in the Page ECC parity trailer outside the encryption
+    // envelope), so any bytes past the BodyFrame are malformed
+    // trailing data and the block is rejected rather than silently
+    // accepted.
+    let pos = cursor.position();
+    let total = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    if pos != total {
+        return Err(DecryptError::MalformedBodyFrame(
+            "unexpected trailing bytes after BodyFrame",
+        ));
     }
 
     // ── AAD reconstruction ──────────────────────────────────────
@@ -797,6 +740,26 @@ mod tests {
         wrong_id.block_offset = 0x0000_2000; // shifted by 4 KiB
         let err = decrypt_block(&sealed, &wrong_id, &chain()).unwrap_err();
         assert!(matches!(err, DecryptError::AeadVerificationFailed));
+    }
+
+    #[test]
+    fn trailing_bytes_after_body_are_rejected() {
+        // The encrypted-block format is exactly MetadataFrame ‖
+        // BodyFrame; nothing follows. A well-formed block with extra
+        // bytes appended (e.g. a stray skippable frame from a
+        // retired extension, or junk) must be rejected, not silently
+        // accepted by ignoring the tail.
+        let plaintext = b"the quick brown fox";
+        let mut sealed = encrypt_block(plaintext, &id(), &ctx(), &chain()).unwrap();
+        // The clean block round-trips.
+        assert!(decrypt_block(&sealed, &id(), &chain()).is_ok());
+        // Append trailing bytes; decrypt must now reject.
+        sealed.extend_from_slice(&[0xAB, 0xCD, 0xEF, 0x01]);
+        let err = decrypt_block(&sealed, &id(), &chain()).unwrap_err();
+        assert!(
+            matches!(err, DecryptError::MalformedBodyFrame(_)),
+            "expected MalformedBodyFrame for trailing bytes, got {err:?}",
+        );
     }
 
     #[test]

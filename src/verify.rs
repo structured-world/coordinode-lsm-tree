@@ -395,6 +395,26 @@ impl std::error::Error for BlockVerifyError {
     }
 }
 
+/// A non-fatal finding from a scrub run: the data is intact, but something
+/// about a table could not be fully checked.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum BlockVerifyWarning {
+    /// The table's `descriptor#page_ecc` decodes to an ECC scheme this build
+    /// cannot apply (an unimplemented scheme, page granularity, an unknown
+    /// kind, or a non-canonical descriptor). Block payloads still verify by
+    /// their own checksums, but the parity trailer length is not derivable
+    /// from a scheme, so the sequential block walk cannot size it and ECC
+    /// verification was skipped for this table. Recompaction re-stamps the
+    /// table with a supported scheme.
+    UnrecognizedEcc {
+        /// Table the warning applies to.
+        table_id: TableId,
+        /// On-disk path of the SST.
+        path: std::path::PathBuf,
+    },
+}
+
 /// Aggregated result of a per-block scrub run.
 #[derive(Debug, Default)]
 #[non_exhaustive]
@@ -408,13 +428,25 @@ pub struct BlockVerifyReport {
     /// runs to completion across all SSTs even if individual blocks
     /// or whole files are corrupt.
     pub errors: Vec<BlockVerifyError>,
+    /// Non-fatal findings: data verified, but ECC could not be checked for
+    /// some tables (unrecognized scheme — recompaction recommended). Distinct
+    /// from `errors`: warnings do NOT make [`Self::is_ok`] false.
+    pub warnings: Vec<BlockVerifyWarning>,
 }
 
 impl BlockVerifyReport {
-    /// `true` if every block in every SST verified clean.
+    /// `true` if every block in every SST verified clean. Warnings (e.g. an
+    /// unrecognized ECC scheme whose data still checksum-verified) do NOT
+    /// make this false — only real corruption (`errors`) does.
     #[must_use]
     pub fn is_ok(&self) -> bool {
         self.errors.is_empty()
+    }
+
+    /// `true` if the scrub produced any non-fatal warning.
+    #[must_use]
+    pub fn has_warnings(&self) -> bool {
+        !self.warnings.is_empty()
     }
 }
 
@@ -452,6 +484,28 @@ pub fn verify_block_checksums(tree: &impl crate::AbstractTree) -> BlockVerifyRep
         let table_id = table.id();
         report.sst_files_scanned += 1;
 
+        // Tables whose ECC descriptor decodes to a scheme this build can't
+        // apply can't have their SST-block parity trailers sized (the length
+        // isn't derivable without the scheme), so those sections are skipped
+        // with a warning rather than mis-walked. The walk still covers the
+        // self-describing `meta` / `meta_mid` sections (which size parity from
+        // their own `block_flags`), so corruption there is NOT downgraded. The
+        // per-block read path still serves the data (framed by data_length,
+        // checksum-verified), hence a warning, not an error.
+        let ecc_unrecognized = table.metadata.ecc_unrecognized;
+        if ecc_unrecognized {
+            log::warn!(
+                "table {table_id} at {}: unrecognized ECC scheme — skipping the \
+                 ECC-dependent block sections; recompact to re-stamp with a \
+                 supported scheme",
+                path.display(),
+            );
+            report.warnings.push(BlockVerifyWarning::UnrecognizedEcc {
+                table_id,
+                path: path.to_path_buf(),
+            });
+        }
+
         // Use each Table's own `Fs` handle (StdFs, MemFs, IoUring, …).
         // `std::fs::File::open` is wrong here: it skips the pluggable
         // backend and produces NotFound on MemFs-only trees. Encryption
@@ -464,7 +518,8 @@ pub fn verify_block_checksums(tree: &impl crate::AbstractTree) -> BlockVerifyRep
             path,
             table_id,
             max_enc_overhead,
-            table.metadata.page_ecc,
+            table.metadata.ecc_params,
+            ecc_unrecognized,
         ) {
             Ok(per_file) => {
                 report.blocks_scanned += per_file.blocks_scanned;
@@ -553,16 +608,37 @@ pub fn verify_sst_file(path: &std::path::Path) -> BlockVerifyReport {
         ..BlockVerifyReport::default()
     };
 
-    // SST blocks omit the block_flags byte, so the parity-trailer presence the
-    // walk must skip is the per-SST `page_ecc` flag — read it from the meta
-    // descriptor. If it can't be determined (corrupt meta, or an encrypted SST
-    // with no key out-of-band), DO NOT assume disabled: walking an ECC-bearing
-    // SST without skipping parity trailers mis-aligns the scan and reports
-    // spurious corruption. Surface the indeterminacy and skip the walk.
-    let page_ecc = match read_page_ecc_out_of_band(&fs, path) {
-        Ok(Some(ecc)) => ecc,
+    // SST blocks omit the block_flags byte, so the parity-trailer presence and
+    // shard layout the walk must skip come from the per-SST ECC descriptor —
+    // read it from the meta block. If it can't be determined (corrupt meta, or
+    // an encrypted SST with no key out-of-band), DO NOT assume disabled:
+    // walking an ECC-bearing SST without skipping parity trailers mis-aligns
+    // the scan and reports spurious corruption. Surface the indeterminacy and
+    // skip the walk.
+    let mut ecc_unrecognized = false;
+    let ecc = match read_ecc_params_out_of_band(&fs, path) {
+        Ok(Some(ScrubEcc::Off)) => None,
+        Ok(Some(ScrubEcc::Scheme(params))) => Some(params),
+        // The descriptor decodes to a scheme this build can't apply: the
+        // SST-block trailer length isn't derivable, so those sections are
+        // skipped during the walk. The self-describing `meta` / `meta_mid`
+        // sections still size parity from `block_flags`, so corruption there
+        // is NOT downgraded. Warn + continue (don't drop the whole scrub).
+        Ok(Some(ScrubEcc::Unrecognized)) => {
+            log::warn!(
+                "{}: unrecognized ECC scheme — skipping the ECC-dependent block \
+                 sections; recompact to re-stamp with a supported scheme",
+                path.display(),
+            );
+            report.warnings.push(BlockVerifyWarning::UnrecognizedEcc {
+                table_id: 0,
+                path: path.to_path_buf(),
+            });
+            ecc_unrecognized = true;
+            None
+        }
         // File + trailer readable, but neither meta block decodes (corrupt
-        // meta, or an encrypted SST with no key out-of-band). page_ecc is
+        // meta, or an encrypted SST with no key out-of-band). The ECC scheme is
         // undeterminable; skip the walk rather than mis-walk an ECC-bearing SST.
         Ok(None) => {
             report.errors.push(BlockVerifyError::SstFileUnreadable {
@@ -570,7 +646,7 @@ pub fn verify_sst_file(path: &std::path::Path) -> BlockVerifyReport {
                 path: path.to_path_buf(),
                 error: std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
-                    "could not decode the SST meta block to determine page_ecc \
+                    "could not decode the SST meta block to determine the ECC scheme \
                      (corrupt meta, or an encrypted SST with no key out-of-band); \
                      skipping the block walk — use verify_block_checksums on a live \
                      tree for ECC-aware verification",
@@ -590,7 +666,7 @@ pub fn verify_sst_file(path: &std::path::Path) -> BlockVerifyReport {
         }
     };
 
-    match scan_sst_blocks(&fs, path, 0, 0, page_ecc) {
+    match scan_sst_blocks(&fs, path, 0, 0, ecc, ecc_unrecognized) {
         Ok(per_file) => {
             report.blocks_scanned = per_file.blocks_scanned;
             report.errors = per_file.errors;
@@ -607,28 +683,40 @@ pub fn verify_sst_file(path: &std::path::Path) -> BlockVerifyReport {
     report
 }
 
-/// Best-effort read of the per-SST `page_ecc` flag from an SST file's meta
+/// Per-SST ECC state as seen by the out-of-band scrub.
+#[cfg(feature = "std")]
+enum ScrubEcc {
+    /// ECC off — no parity trailer to skip.
+    Off,
+    /// A recognized + applicable scheme — size + verify the trailer with it.
+    Scheme(crate::table::block::EccParams),
+    /// An ECC scheme this build can't apply (unimplemented / unknown /
+    /// non-canonical). The trailer length isn't derivable, so the walk must
+    /// be skipped with a warning.
+    Unrecognized,
+}
+
+/// Best-effort read of the per-SST ECC state from an SST file's meta
 /// descriptor, for the out-of-band scrub (no live `Table` to consult).
 ///
-/// Returns `Ok(Some(page_ecc))` when a meta block decodes. The authoritative
+/// Returns `Ok(Some(state))` when a meta block decodes. The authoritative
 /// tail `meta` section is tried first; if its block is corrupt / undecodable
 /// the early `meta_mid` mirror (which the writer emits so one bad meta block
-/// can't lose the descriptor) is tried next. Returns `Ok(None)` when the file
-/// and SFA trailer are readable but NEITHER meta block decodes (both corrupt,
-/// or an encrypted SST whose key the out-of-band tool doesn't have) — the flag
-/// is genuinely UNDETERMINABLE. Returns `Err` when the file can't be opened or
-/// its SFA trailer can't be parsed, preserving the real I/O / structural error
-/// for the caller to report rather than collapsing it into "undeterminable".
+/// can't lose the descriptor) is tried next. The `Ok(None)` outer means the
+/// file and SFA trailer are readable but NEITHER meta block decodes (both
+/// corrupt, or an encrypted SST whose key the out-of-band tool doesn't have) —
+/// the scheme is genuinely UNDETERMINABLE. Returns `Err` when the file can't be
+/// opened or its SFA trailer can't be parsed.
 ///
-/// The caller MUST NOT treat `Ok(None)` as "`page_ecc` disabled": walking an
+/// The caller MUST NOT treat `Ok(None)` as "ECC disabled": walking an
 /// ECC-bearing SST without skipping the parity trailers mis-aligns the block
 /// scan and reports spurious corruption, so the caller skips the walk and
 /// surfaces the indeterminacy instead.
 #[cfg(feature = "std")]
-fn read_page_ecc_out_of_band(
+fn read_ecc_params_out_of_band(
     fs: &dyn crate::fs::Fs,
     path: &std::path::Path,
-) -> std::io::Result<Option<bool>> {
+) -> std::io::Result<Option<ScrubEcc>> {
     let mut probe = fs.open(path, &crate::fs::FsOpenOptions::new().read(true))?;
     let sfa_reader = crate::sfa::Reader::from_reader(&mut probe)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
@@ -646,7 +734,14 @@ fn read_page_ecc_out_of_band(
         if let Ok(meta) =
             crate::table::meta::ParsedMeta::load_with_handle(probe.as_ref(), &handle, None)
         {
-            return Ok(Some(meta.page_ecc));
+            let state = if meta.ecc_unrecognized {
+                ScrubEcc::Unrecognized
+            } else if let Some(params) = meta.ecc_params {
+                ScrubEcc::Scheme(params)
+            } else {
+                ScrubEcc::Off
+            };
+            return Ok(Some(state));
         }
     }
     Ok(None)
@@ -669,7 +764,8 @@ fn scan_sst_blocks(
     path: &Path,
     table_id: TableId,
     max_enc_overhead: u32,
-    page_ecc: bool,
+    ecc: Option<crate::table::block::EccParams>,
+    ecc_unrecognized: bool,
 ) -> std::io::Result<PerFileScan> {
     use std::io::{BufReader, Seek, SeekFrom};
 
@@ -783,7 +879,8 @@ fn scan_sst_blocks(
             blocks_scanned: &mut blocks_scanned,
             errors: &mut errors,
             max_data_length: block_data_length_cap(max_enc_overhead),
-            page_ecc,
+            ecc,
+            ecc_unrecognized,
         };
         walk_block_region(&mut ctx, start, end);
     }
@@ -851,14 +948,22 @@ struct WalkCtx<'a> {
     /// so the scrub does not false-flag legitimate encrypted blocks
     /// near the 256 MiB plaintext limit as `HeaderCorrupted`.
     max_data_length: u64,
-    /// Per-SST Page-ECC setting. SST blocks (`Data` / `Index` / `Filter` /
+    /// Per-SST Page-ECC shard layout. SST blocks (`Data` / `Index` / `Filter` /
     /// `RangeTombstone`) omit the `block_flags` byte, so their parity-trailer
-    /// presence is NOT derivable from the header — it is this table-wide flag.
-    /// When `true`, each such block carries `expected_parity_len(data_length)`
-    /// parity bytes after the payload that the walk must skip to stay aligned.
-    /// Meta / Manifest / `ManifestFooter` blocks keep the byte and self-describe
-    /// parity via their `ECC_PARITY` bit regardless of this flag.
-    page_ecc: bool,
+    /// presence AND shard layout are NOT derivable from the header — both come
+    /// from this table-wide descriptor scheme. When `Some`, each such block
+    /// carries `expected_parity_len(data_length, scheme)` parity bytes after
+    /// the payload that the walk must skip (sized by the scheme) to stay
+    /// aligned. Meta / Manifest / `ManifestFooter` blocks keep the byte and
+    /// self-describe parity via their `ECC_PARITY` bit, sized with the fixed
+    /// RS(4,2) layout the writer uses for them, regardless of this field.
+    ecc: Option<crate::table::block::EccParams>,
+    /// `true` when the table's ECC descriptor decodes to a scheme this build
+    /// can't apply. The trailer length of its SST blocks (`Data` / `Index` /
+    /// `Filter` / `RangeTombstone`) isn't derivable, so those sections are
+    /// skipped (the caller warns once). Self-describing sections (`meta` /
+    /// `meta_mid`) still size parity from `block_flags` and ARE walked.
+    ecc_unrecognized: bool,
 }
 
 fn walk_block_region(ctx: &mut WalkCtx<'_>, start_offset: u64, end_offset: u64) {
@@ -907,6 +1012,18 @@ fn walk_block_region(ctx: &mut WalkCtx<'_>, start_offset: u64, end_offset: u64) 
             }
         };
 
+        // Unrecognized-ECC table: SST blocks (no `block_flags` byte) carry a
+        // parity trailer whose length we can't derive without the descriptor
+        // scheme, so this section can't be walked — stop here (the caller has
+        // already warned). Self-describing blocks (`block_flags` present) size
+        // parity from their `ECC_PARITY` bit, so those sections still walk.
+        // Checked before the scanned-count increment so skipped blocks aren't
+        // tallied. Sections are homogeneous in block type, so the first block
+        // decides the whole section.
+        if ctx.ecc_unrecognized && !Header::has_block_flags(header.block_type) {
+            return;
+        }
+
         // Count the block as "header-read" immediately on successful
         // decode — matches the BlockVerifyReport.blocks_scanned docs
         // ("includes blocks where the data checksum subsequently
@@ -928,16 +1045,22 @@ fn walk_block_region(ctx: &mut WalkCtx<'_>, start_offset: u64, end_offset: u64) 
         // trailer length is derived from data_length (never stored). The walk
         // must skip these bytes — otherwise the next iteration would read parity
         // as the following block's header and mis-align the whole section.
-        let has_parity = if Header::has_block_flags(header.block_type) {
-            header.block_flags & crate::table::block::header::block_flags::ECC_PARITY != 0
+        // Parity-trailer scheme to skip for this block. Self-describing blocks
+        // (Meta / Manifest / `ManifestFooter`) carry the `block_flags` byte and
+        // are written with the fixed RS(4,2) layout; SST blocks size their
+        // trailer from the per-SST descriptor scheme threaded in via `ctx.ecc`.
+        let block_ecc = if Header::has_block_flags(header.block_type) {
+            (header.block_flags & crate::table::block::header::block_flags::ECC_PARITY != 0)
+                .then_some(crate::table::block::EccParams::RS_4_2)
         } else {
-            ctx.page_ecc
+            ctx.ecc
         };
-        let parity_len = if has_parity {
-            u64::from(crate::table::block::expected_parity_len(header.data_length))
-        } else {
-            0
-        };
+        let parity_len = block_ecc.map_or(0, |scheme| {
+            u64::from(crate::table::block::expected_parity_len(
+                header.data_length,
+                scheme,
+            ))
+        });
 
         // Validate data_length against TWO bounds before allocating
         // / reading:
@@ -1194,6 +1317,10 @@ mod block_verify_tests {
             )
             .data_block_compression_policy(CompressionPolicy::all(CompressionType::None))
             .page_ecc(true)
+            .ecc_scheme(crate::runtime_config::EccScheme::ReedSolomon {
+                data_shards: 4,
+                parity_shards: 2,
+            })
             .open()
             .unwrap();
             for i in 0u64..2_000 {
@@ -1212,6 +1339,10 @@ mod block_verify_tests {
         )
         .data_block_compression_policy(CompressionPolicy::all(CompressionType::None))
         .page_ecc(true)
+        .ecc_scheme(crate::runtime_config::EccScheme::ReedSolomon {
+            data_shards: 4,
+            parity_shards: 2,
+        })
         .open()
         .unwrap();
         let report = verify_block_checksums(&tree);
@@ -1219,6 +1350,67 @@ mod block_verify_tests {
             report.is_ok(),
             "page_ecc tree must verify with zero errors (parity trailers skipped \
              per block), got {:?}",
+            report.errors,
+        );
+        assert!(
+            report.blocks_scanned > 1,
+            "expected multiple blocks scanned to exercise cross-block alignment",
+        );
+    }
+
+    #[cfg(feature = "page_ecc")]
+    #[test]
+    fn verify_block_checksums_clean_nondefault_ecc_tree_has_no_errors() {
+        // Regression: the scrub must size each SST's parity trailer from the
+        // per-SST descriptor scheme, NOT a hardcoded RS(4,2). A table written
+        // with a non-default scheme (RS(8,2), different shard size → different
+        // trailer length) is mis-walked if the scrub assumes RS(4,2): the
+        // wrong trailer length mis-aligns the next block and reports spurious
+        // corruption. With descriptor-driven sizing the walk stays aligned.
+        use crate::AbstractTree;
+
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let any = Config::new(
+                dir.path(),
+                SequenceNumberCounter::default(),
+                SequenceNumberCounter::default(),
+            )
+            .data_block_compression_policy(CompressionPolicy::all(CompressionType::None))
+            .page_ecc(true)
+            .ecc_scheme(crate::runtime_config::EccScheme::ReedSolomon {
+                data_shards: 8,
+                parity_shards: 2,
+            })
+            .open()
+            .unwrap();
+            for i in 0u64..2_000 {
+                let key = format!("k{i:08}");
+                let val = format!("v{i:08}");
+                any.insert(key.as_bytes(), val.as_bytes(), 1 + i);
+            }
+            any.flush_active_memtable(2_001).unwrap();
+            drop(any);
+        }
+
+        let tree = Config::new(
+            dir.path(),
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .data_block_compression_policy(CompressionPolicy::all(CompressionType::None))
+        .page_ecc(true)
+        .ecc_scheme(crate::runtime_config::EccScheme::ReedSolomon {
+            data_shards: 8,
+            parity_shards: 2,
+        })
+        .open()
+        .unwrap();
+        let report = verify_block_checksums(&tree);
+        assert!(
+            report.is_ok(),
+            "non-default-scheme ECC tree must verify with zero errors \
+             (parity sized from the descriptor, not RS(4,2)), got {:?}",
             report.errors,
         );
         assert!(
@@ -1612,8 +1804,8 @@ mod block_verify_tests {
         }
 
         let table_id: TableId = 42;
-        let scan =
-            scan_sst_blocks(&fs, path, table_id, 0, false).expect("forged SFA must parse cleanly");
+        let scan = scan_sst_blocks(&fs, path, table_id, 0, None, false)
+            .expect("forged SFA must parse cleanly");
         assert_eq!(
             scan.errors.len(),
             1,

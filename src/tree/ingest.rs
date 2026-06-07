@@ -134,7 +134,10 @@ impl<'a> Ingestion<'a> {
 
         writer = writer.use_prefix_extractor(tree.config.prefix_extractor.clone());
         writer = writer.use_encryption(tree.config.encryption.clone());
-        writer = writer.use_page_ecc(tree.config.page_ecc);
+        // ECC scheme from the same live snapshot as `seqno_in_index` /
+        // `kv_checksums` below, so an ingestion started after a scheme change
+        // writes its SST with the current scheme rather than the startup one.
+        writer = writer.use_page_ecc(tree.config.page_ecc, rc.ecc_scheme);
         writer = writer.use_sync_mode(tree.config.sync_mode);
 
         writer = writer.use_seqno_in_index(rc.seqno_in_index);

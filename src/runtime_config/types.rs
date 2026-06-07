@@ -280,6 +280,220 @@ pub enum KvChecksumComputePoint {
     AtInsert,
 }
 
+/// Page ECC-at-rest scheme: the correction algorithm matched to the
+/// failure mode and storage budget.
+///
+/// ECC is off by default ([`RuntimeConfig::page_ecc`] = `false`); these
+/// variants only take effect once it is enabled. They are ordered
+/// cheapest-first — pick the lowest tier that covers the failure mode you
+/// care about. The engine never defaults to a high-overhead scheme.
+///
+/// - [`Self::Secded`] — Hamming SECDED, per word: single-bit correct +
+///   double-bit detect, the cheapest tier (~1-3% overhead). It is the
+///   placeholder default while ECC is OFF, NOT a valid enabled-state
+///   scheme yet: it is not wired (#255), so enabling ECC with `Secded` is
+///   rejected and an enabled config must pick [`Self::Xor`] /
+///   [`Self::ReedSolomon`] explicitly. Matches the dominant single-bit-rot
+///   failure mode of DRAM and disks.
+/// - [`Self::Xor`] — one XOR parity shard over `data_shards` data shards
+///   (RAID-5 equivalent): recovers one fully-lost shard. Overhead =
+///   `1 / data_shards` (e.g. 10 → 10%). XOR is computed directly (no RS
+///   engine), so it is far cheaper than Reed-Solomon for single-erasure.
+/// - [`Self::ReedSolomon`] — `parity_shards` Reed-Solomon parity shards
+///   over `data_shards`: recovers up to `parity_shards` lost shards or
+///   bursts. Overhead = `parity_shards / data_shards`. For higher
+///   tolerance only.
+//
+// no-std: pure data — compiles under `--no-default-features --features alloc`.
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq, Hash)]
+pub enum EccScheme {
+    /// Hamming SECDED per word — single-bit correct, double-bit detect.
+    /// Cheapest tier and the type-level default, but valid only while ECC
+    /// is OFF: enabling ECC with `Secded` is rejected until the SECDED read
+    /// path lands (#255), so an enabled config must pick [`Self::Xor`] /
+    /// [`Self::ReedSolomon`].
+    #[default]
+    Secded,
+
+    /// One XOR parity shard over `data_shards` shards (RAID-5):
+    /// recovers one lost shard. Overhead = `1 / data_shards`.
+    Xor {
+        /// Number of data shards the block is split into. The single
+        /// parity shard is their XOR; overhead is `1 / data_shards`.
+        data_shards: u8,
+    },
+
+    /// `parity_shards` Reed-Solomon parity shards over `data_shards`:
+    /// recovers up to `parity_shards` lost shards. Overhead =
+    /// `parity_shards / data_shards`.
+    ReedSolomon {
+        /// Number of data shards the block is split into.
+        data_shards: u8,
+        /// Number of Reed-Solomon parity shards (max recoverable shard
+        /// losses).
+        parity_shards: u8,
+    },
+}
+
+impl EccScheme {
+    /// Shard layout `(data_shards, parity_shards)` for the shard-based
+    /// schemes; `None` for [`Self::Secded`] (per-word Hamming, not
+    /// shard-based). [`Self::Xor`] is single-parity (`parity_shards = 1`).
+    #[must_use]
+    pub const fn shard_params(self) -> Option<(usize, usize)> {
+        match self {
+            Self::Secded => None,
+            Self::Xor { data_shards } => Some((data_shards as usize, 1)),
+            Self::ReedSolomon {
+                data_shards,
+                parity_shards,
+            } => Some((data_shards as usize, parity_shards as usize)),
+        }
+    }
+}
+
+/// Granularity at which Page ECC parity is computed.
+///
+/// Exactly one level is active per SST (never both). [`Self::Block`]
+/// computes parity over the whole block payload (one parity region per
+/// block). [`Self::Page`] computes parity per sector-aligned page,
+/// matching the physical bit-rot / bad-sector unit.
+//
+// no-std: pure data — compiles under `--no-default-features --features alloc`.
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq, Hash)]
+pub enum EccGranularity {
+    /// One parity region over the whole block payload.
+    #[default]
+    Block,
+
+    /// Per sector-aligned page parity (matches the physical failure unit).
+    Page,
+}
+
+/// Fixed width of the per-SST `descriptor#page_ecc` value: `[kind,
+/// data_shards, parity_shards, granularity]`.
+pub const ECC_DESCRIPTOR_LEN: usize = 4;
+
+/// Encodes the per-SST ECC descriptor value `[kind, data_shards,
+/// parity_shards, granularity]`.
+///
+/// `None` (ECC off) encodes as all-zero. There is no legacy / implicit
+/// scheme: `kind == 0` is the only "off" encoding and every enabled SST
+/// records its scheme explicitly.
+///
+/// `kind`: 0 = off, 1 = `Secded`, 2 = `Xor`, 3 = `ReedSolomon`.
+#[must_use]
+pub fn ecc_descriptor_bytes(cfg: Option<(EccScheme, EccGranularity)>) -> [u8; ECC_DESCRIPTOR_LEN] {
+    let Some((scheme, gran)) = cfg else {
+        return [0; ECC_DESCRIPTOR_LEN];
+    };
+    let gran_byte = match gran {
+        EccGranularity::Block => 0,
+        EccGranularity::Page => 1,
+    };
+    match scheme {
+        EccScheme::Secded => [1, 0, 0, gran_byte],
+        EccScheme::Xor { data_shards } => [2, data_shards, 1, gran_byte],
+        EccScheme::ReedSolomon {
+            data_shards,
+            parity_shards,
+        } => [3, data_shards, parity_shards, gran_byte],
+    }
+}
+
+/// Outcome of decoding a per-SST `descriptor#page_ecc` value.
+///
+/// The decoder is a faithful, lenient reader: it never hard-fails on a
+/// 4-byte value (only a wrong length is unparseable). Anything that is not
+/// canonical `Off` or a recognized scheme + granularity decodes to
+/// [`Self::Unrecognized`] rather than an error, so the read path can apply
+/// the three-state ECC contract: a recognized+applicable scheme is used
+/// for recovery; an unrecognized one is a "typing" warning (data still
+/// reads via its checksum, but ECC recovery is unavailable — recompaction
+/// re-stamps the block with a supported scheme).
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
+pub enum EccDescriptor {
+    /// `kind == 0` with canonical all-zero reserved bytes: ECC is off.
+    Off,
+
+    /// A recognized scheme + granularity pair. Round-trips through
+    /// [`ecc_descriptor_bytes`]. Whether it is *applicable* (i.e. the
+    /// read path can size + recover its trailer) is decided downstream:
+    /// [`EccScheme::Secded`] and [`EccGranularity::Page`] are recognized
+    /// here but not yet applicable.
+    Recognized(EccScheme, EccGranularity),
+
+    /// A 4-byte value that is neither canonical `Off` nor a recognized
+    /// scheme: unknown `kind`, unknown granularity byte, non-canonical
+    /// reserved bytes, a zero shard count, or a non-canonical shard layout
+    /// (e.g. `Xor` whose parity byte is not `1`, `ReedSolomon` with fewer
+    /// than two parity shards). The read path treats this as ECC present
+    /// but unusable — a warning, not a read failure.
+    Unrecognized,
+}
+
+/// Decodes a per-SST ECC descriptor value written by
+/// [`ecc_descriptor_bytes`].
+///
+/// # Errors
+///
+/// Returns [`crate::Error::InvalidTrailer`] only when the value is not
+/// exactly [`ECC_DESCRIPTOR_LEN`] bytes (it is not a descriptor at all).
+/// Any 4-byte value decodes to an [`EccDescriptor`] (possibly
+/// [`EccDescriptor::Unrecognized`]); see that type for the three-state
+/// contract.
+pub fn ecc_descriptor_from_bytes(bytes: &[u8]) -> crate::Result<EccDescriptor> {
+    let [kind, data_shards, parity_shards, gran_byte] =
+        *<&[u8; ECC_DESCRIPTOR_LEN]>::try_from(bytes).map_err(|_| crate::Error::InvalidTrailer)?;
+    if kind == 0 {
+        // `Off` carries no scheme: the remaining three bytes are
+        // reserved-zero. A non-zero reserved byte is a non-canonical /
+        // corrupted descriptor — surface it as `Unrecognized` (a warning at
+        // the read layer) rather than silently treating the SST as "ECC off".
+        if data_shards != 0 || parity_shards != 0 || gran_byte != 0 {
+            return Ok(EccDescriptor::Unrecognized);
+        }
+        return Ok(EccDescriptor::Off);
+    }
+    let granularity = match gran_byte {
+        0 => EccGranularity::Block,
+        1 => EccGranularity::Page,
+        _ => return Ok(EccDescriptor::Unrecognized),
+    };
+    let scheme = match kind {
+        1 => {
+            // `Secded` is per-word Hamming with no shard layout: its shard
+            // bytes are reserved-zero. Non-zero reserved bytes are
+            // non-canonical → `Unrecognized`.
+            if data_shards != 0 || parity_shards != 0 {
+                return Ok(EccDescriptor::Unrecognized);
+            }
+            EccScheme::Secded
+        }
+        2 => {
+            // Canonical `Xor` has exactly one parity shard (the descriptor
+            // writer always emits parity byte `1`).
+            if data_shards == 0 || parity_shards != 1 {
+                return Ok(EccDescriptor::Unrecognized);
+            }
+            EccScheme::Xor { data_shards }
+        }
+        3 => {
+            // Canonical `ReedSolomon` has at least two parity shards; a
+            // single parity shard is expressed as `Xor`.
+            if data_shards == 0 || parity_shards < 2 {
+                return Ok(EccDescriptor::Unrecognized);
+            }
+            EccScheme::ReedSolomon {
+                data_shards,
+                parity_shards,
+            }
+        }
+        _ => return Ok(EccDescriptor::Unrecognized),
+    };
+    Ok(EccDescriptor::Recognized(scheme, granularity))
+}
+
 /// Bitmask over LSM levels for [`KvChecksumPolicy::PerLevel`].
 ///
 /// Bit `n` set means level `n` is selected. A `u8` covers levels
@@ -521,6 +735,22 @@ pub struct RuntimeConfig {
     /// considered sufficient and ECC is wanted only on value bytes).
     pub kv_checksums_ecc_override: Option<bool>,
 
+    /// Page ECC scheme used when ECC is enabled ([`Self::page_ecc`] or a
+    /// per-scope override is `true`). The type-level default
+    /// [`EccScheme::Secded`] is a placeholder valid only while ECC is OFF:
+    /// it is not wired yet (#255), so turning ECC on while this is still
+    /// `Secded` is rejected — an enabled config must set an explicit
+    /// shard-based scheme ([`EccScheme::Xor`] / [`EccScheme::ReedSolomon`]).
+    /// The scheme is recorded per-SST so the reader can re-derive the
+    /// parity layout (existing SSTs keep the scheme they were written with;
+    /// compaction migrates over time).
+    pub ecc_scheme: EccScheme,
+
+    /// Granularity at which Page ECC parity is computed when ECC is on.
+    /// Default [`EccGranularity::Block`]. Exactly one level is active per
+    /// SST; recorded per-SST alongside [`Self::ecc_scheme`].
+    pub ecc_granularity: EccGranularity,
+
     /// Per-block seqno bounds in SST index entries (#224). When `true`,
     /// SSTs written by the next flush / compaction record each data
     /// block's `seqno_min` / `seqno_max` in its index entry
@@ -573,6 +803,8 @@ impl Default for RuntimeConfig {
             page_ecc: false,
             data_block_ecc_override: None,
             kv_checksums_ecc_override: None,
+            ecc_scheme: EccScheme::Secded,
+            ecc_granularity: EccGranularity::Block,
             seqno_in_index: false,
             index_partition_spill_threshold: crate::table::writer::DEFAULT_SPILL_THRESHOLD,
         }
@@ -608,6 +840,111 @@ impl RuntimeConfig {
 #[expect(clippy::expect_used, reason = "test code")]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ecc_defaults_are_off_secded_block() {
+        // ECC master default is OFF (page_ecc=false); when enabled without
+        // an explicit scheme the on-default is the cheapest tier (Secded),
+        // and the granularity default is Block. Pinning these guards the
+        // efficiency-first contract (never RS(4,2)/+50% by default).
+        let c = RuntimeConfig::default();
+        assert!(!c.page_ecc);
+        assert_eq!(c.ecc_scheme, EccScheme::Secded);
+        assert_eq!(c.ecc_granularity, EccGranularity::Block);
+    }
+
+    #[test]
+    fn ecc_scheme_shard_params_match_scheme() {
+        // Secded is per-word, not shard-based. Xor is single-parity.
+        assert_eq!(EccScheme::Secded.shard_params(), None);
+        assert_eq!(
+            EccScheme::Xor { data_shards: 10 }.shard_params(),
+            Some((10, 1))
+        );
+        assert_eq!(
+            EccScheme::ReedSolomon {
+                data_shards: 8,
+                parity_shards: 2,
+            }
+            .shard_params(),
+            Some((8, 2)),
+        );
+    }
+
+    #[test]
+    fn ecc_descriptor_roundtrips_off_and_every_scheme() {
+        // The per-SST descriptor codec is a faithful round-trip serializer:
+        // "off" and every recognized scheme + granularity decode back to the
+        // exact value written. (Whether a recognized scheme is *applicable*
+        // for recovery is decided at the read layer, not here.)
+        assert_eq!(ecc_descriptor_bytes(None), [0, 0, 0, 0]);
+        assert_eq!(
+            ecc_descriptor_from_bytes(&[0, 0, 0, 0]).expect("decode"),
+            EccDescriptor::Off,
+        );
+        let cases = [
+            (EccScheme::Secded, EccGranularity::Block),
+            (EccScheme::Secded, EccGranularity::Page),
+            (EccScheme::Xor { data_shards: 10 }, EccGranularity::Block),
+            (
+                EccScheme::ReedSolomon {
+                    data_shards: 8,
+                    parity_shards: 2,
+                },
+                EccGranularity::Page,
+            ),
+        ];
+        for (scheme, gran) in cases {
+            let bytes = ecc_descriptor_bytes(Some((scheme, gran)));
+            assert_eq!(
+                ecc_descriptor_from_bytes(&bytes).expect("decode"),
+                EccDescriptor::Recognized(scheme, gran),
+                "roundtrip {scheme:?}/{gran:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn ecc_descriptor_wrong_length_is_error() {
+        // The only hard error: a value that is not a 4-byte descriptor at
+        // all. Any 4-byte value decodes (possibly to `Unrecognized`).
+        assert!(ecc_descriptor_from_bytes(&[0, 0, 0]).is_err()); // too short
+        assert!(ecc_descriptor_from_bytes(&[0, 0, 0, 0, 0]).is_err()); // too long
+    }
+
+    #[test]
+    fn ecc_descriptor_unparseable_layouts_decode_as_unrecognized() {
+        // Unknown kind / granularity, non-canonical reserved bytes, and
+        // non-canonical shard layouts are NOT hard errors: they decode to
+        // `Unrecognized` so the read path can warn (and recommend
+        // recompaction) instead of failing the read.
+        for bytes in [
+            [9, 0, 0, 0], // unknown kind
+            [1, 0, 0, 7], // unknown granularity
+            [2, 0, 1, 0], // Xor data_shards = 0
+            [2, 8, 2, 0], // Xor parity byte != 1 (non-canonical)
+            [3, 8, 0, 0], // RS parity_shards = 0
+            [3, 8, 1, 0], // RS parity_shards = 1 (should be Xor)
+            [0, 8, 2, 1], // Off with non-canonical reserved bytes
+            [0, 0, 0, 1],
+            [1, 8, 2, 0], // Secded with non-canonical reserved shard bytes
+        ] {
+            assert_eq!(
+                ecc_descriptor_from_bytes(&bytes).expect("4 bytes always decode"),
+                EccDescriptor::Unrecognized,
+                "{bytes:?} must decode as Unrecognized",
+            );
+        }
+        // Canonical encodings still decode to their recognized form.
+        assert_eq!(
+            ecc_descriptor_from_bytes(&[0, 0, 0, 0]).expect("off"),
+            EccDescriptor::Off,
+        );
+        assert_eq!(
+            ecc_descriptor_from_bytes(&[1, 0, 0, 0]).expect("secded"),
+            EccDescriptor::Recognized(EccScheme::Secded, EccGranularity::Block),
+        );
+    }
 
     #[test]
     fn kv_checksum_policy_default_is_off() {

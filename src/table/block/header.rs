@@ -217,10 +217,35 @@ impl Header {
         )]
         let header = Self::header_len(self.block_type) as u32;
         let parity = if self.block_flags & block_flags::ECC_PARITY != 0 {
-            super::expected_parity_len(self.data_length)
+            // Self-describing blocks (Meta / Manifest) carry only the
+            // ECC_PARITY bit, not a scheme, so they use the fixed default
+            // layout; the configurable per-SST scheme applies to SST data
+            // blocks (whose scheme comes from the table descriptor).
+            super::expected_parity_len(self.data_length, super::EccParams::RS_4_2)
         } else {
             0
         };
+        header
+            .saturating_add(self.data_length)
+            .saturating_add(parity)
+    }
+
+    /// On-disk byte size of this block under a CALLER-supplied ECC scheme,
+    /// rather than the fixed RS(4,2) [`Self::on_disk_size`] assumes.
+    ///
+    /// SST data / index / filter blocks carry a configurable scheme (the
+    /// writer's resolved [`EccParams`](super::EccParams)); their on-disk
+    /// size — and therefore the index block-handle size — must be computed
+    /// with the SAME scheme the parity trailer was written under, not the
+    /// RS(4,2) default. `ecc = None` means no parity trailer.
+    #[must_use]
+    pub fn on_disk_size_with(&self, ecc: Option<super::EccParams>) -> u32 {
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "Header::header_len() is a small const"
+        )]
+        let header = Self::header_len(self.block_type) as u32;
+        let parity = ecc.map_or(0, |p| super::expected_parity_len(self.data_length, p));
         header
             .saturating_add(self.data_length)
             .saturating_add(parity)
