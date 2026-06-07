@@ -234,6 +234,35 @@ fn do_decompress_with_dict(
     }
 }
 
+/// Extract the inner-block layout (cumulative decompressed END offsets) from a
+/// just-emitted frame's [`FrameEmitInfo`].
+///
+/// Returns an empty `Vec` when the frame has fewer than two inner blocks
+/// (nothing to partial-decode), when the encoder did not capture layout
+/// (`None`), or when any cumulative offset would not fit `u32` (the per-block
+/// table is then skipped and the reader falls back to full decode — never a
+/// correctness risk, only a missed optimisation).
+fn inner_block_layout(
+    info: Option<&structured_zstd::encoding::frame_emit_info::FrameEmitInfo>,
+) -> Vec<u32> {
+    let Some(info) = info else { return Vec::new() };
+    let n = info.blocks.len();
+    if n < 2 {
+        return Vec::new();
+    }
+    let mut ends = Vec::with_capacity(n);
+    for i in 0..n {
+        let Some(range) = info.decompressed_byte_range(i) else {
+            return Vec::new();
+        };
+        let Ok(end) = u32::try_from(range.end) else {
+            return Vec::new();
+        };
+        ends.push(end);
+    }
+    ends
+}
+
 /// Pure Rust zstd backend.
 pub struct ZstdProvider;
 
@@ -273,6 +302,37 @@ impl CompressionProvider for ZstdProvider {
             // single-frame API (structured-zstd >= 0.0.29); it allocates a fresh
             // output Vec and emits one standalone frame.
             Ok(compressor.compress_independent_frame(data))
+        })
+    }
+
+    fn compress_with_layout(data: &[u8], level: i32) -> crate::Result<(Vec<u8>, Vec<u32>)> {
+        use structured_zstd::encoding::{CompressionLevel, FrameCompressor};
+
+        // Mirrors `compress`'s thread-local reuse, but also reads back the
+        // frame layout the encoder recorded during this emit
+        // (`last_frame_emit_info`, captured under the `lsm` feature). The
+        // layout is only meaningful when the frame split into >= 2 inner zstd
+        // blocks; for a single-block frame there is nothing to partial-decode,
+        // so an empty layout is returned and no per-block table is persisted.
+        thread_local! {
+            static TLS_COMPRESSOR: std::cell::RefCell<Option<(i32, FrameCompressor)>> =
+                const { std::cell::RefCell::new(None) };
+        }
+
+        TLS_COMPRESSOR.with(|cell| {
+            let mut state = cell.borrow_mut();
+            if !matches!(&*state, Some((l, _)) if *l == level) {
+                *state = Some((
+                    level,
+                    FrameCompressor::new(CompressionLevel::from_level(level)),
+                ));
+            }
+            let Some((_, compressor)) = state.as_mut() else {
+                unreachable!("TLS_COMPRESSOR initialised above");
+            };
+            let frame = compressor.compress_independent_frame(data);
+            let layout = inner_block_layout(compressor.last_frame_emit_info());
+            Ok((frame, layout))
         })
     }
 
@@ -957,6 +1017,94 @@ mod tests {
         assert!(
             matches!(result, Err(crate::Error::DecompressedSizeTooLarge { .. })),
             "capacity=0 must return DecompressedSizeTooLarge; got {result:?}",
+        );
+    }
+
+    // --- compress_with_layout (#257 inner-block layout) tests ---
+
+    /// Build a realistic sorted-KV data-block payload of about `target` bytes:
+    /// monotonically increasing keys + short values, the shape a flushed
+    /// memtable serialises into a data block.
+    fn sorted_kv_payload(target: usize) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(target + 64);
+        let mut i = 0u64;
+        while buf.len() < target {
+            buf.extend_from_slice(format!("key-{i:012}").as_bytes());
+            buf.push(0);
+            buf.extend_from_slice(format!("value-{i:08}-payload").as_bytes());
+            buf.push(0);
+            i += 1;
+        }
+        buf
+    }
+
+    #[test]
+    fn compress_with_layout_single_inner_block_returns_empty_layout() {
+        // A small (default-sized) block compresses to a single inner zstd
+        // block: nothing to partial-decode, so the layout must be empty and no
+        // per-block table is persisted by the caller.
+        let payload = sorted_kv_payload(4 * 1024);
+        let (frame, layout) =
+            ZstdProvider::compress_with_layout(&payload, 3).expect("compress with layout");
+        assert!(
+            layout.is_empty(),
+            "single-inner-block frame must yield an empty layout, got {layout:?}",
+        );
+        // The compressed bytes still round-trip.
+        let back = ZstdProvider::decompress(&frame, payload.len() + 1).expect("decompress");
+        assert_eq!(back, payload);
+    }
+
+    #[test]
+    fn compress_with_layout_multi_inner_block_offsets_are_monotonic_and_total() {
+        // A large block at a high level pre-splits into several inner zstd
+        // blocks. The layout must be strictly increasing cumulative ends whose
+        // last entry equals the total decompressed size.
+        let payload = sorted_kv_payload(256 * 1024);
+        let (_frame, layout) =
+            ZstdProvider::compress_with_layout(&payload, 19).expect("compress with layout");
+        assert!(
+            layout.len() >= 2,
+            "256 KiB @ L19 must split into >= 2 inner blocks, got {} block(s)",
+            layout.len(),
+        );
+        assert!(
+            layout.windows(2).all(|w| w[0] < w[1]),
+            "cumulative ends must be strictly increasing: {layout:?}",
+        );
+        assert_eq!(
+            *layout.last().expect("non-empty layout") as usize,
+            payload.len(),
+            "last cumulative end must equal the total decompressed size",
+        );
+    }
+
+    #[test]
+    fn compress_with_layout_subrange_partial_decode_matches_full_slice() {
+        // The persisted layout must let a reader decode exactly the inner-block
+        // subset and get bytes identical to the matching full-decode slice —
+        // the core correctness contract of the partial-decode read path.
+        use structured_zstd::decoding::FrameDecoder;
+
+        let payload = sorted_kv_payload(256 * 1024);
+        let (frame, layout) =
+            ZstdProvider::compress_with_layout(&payload, 19).expect("compress with layout");
+        let nblocks = layout.len();
+        assert!(nblocks >= 2, "need a multi-block frame");
+
+        // Decode the first inner block only, then assert it equals the prefix
+        // of the full payload up to that block's cumulative end.
+        let mut src = frame.as_slice();
+        let mut dec = FrameDecoder::new();
+        dec.reset(&mut src).expect("reset frame header");
+        let pd = dec
+            .decode_blocks_partial(&mut src, 0, 1)
+            .expect("partial decode of first inner block");
+        let want_end = layout[0] as usize;
+        assert_eq!(
+            pd.data.as_slice(),
+            &payload[..want_end],
+            "partial-decode [0,1) must equal the full-decode slice [0,{want_end})",
         );
     }
 
