@@ -1107,6 +1107,21 @@ impl Config {
         self
     }
 
+    /// Sets the Page ECC scheme used when [`Self::page_ecc`] is enabled.
+    ///
+    /// ECC is off until `page_ecc(true)`. When on, this picks the
+    /// algorithm: [`EccScheme::Xor`] (RAID-5 single-parity) or
+    /// [`EccScheme::ReedSolomon`]. The default
+    /// [`EccScheme::Secded`](crate::runtime_config::EccScheme::Secded) is
+    /// not yet wired (#255), so enabling ECC without choosing a shard
+    /// scheme emits no parity — pick `Xor`/`ReedSolomon` explicitly.
+    /// There is no implicit RS(4,2) default.
+    #[must_use]
+    pub fn ecc_scheme(mut self, scheme: crate::runtime_config::EccScheme) -> Self {
+        self.initial_runtime_config.ecc_scheme = scheme;
+        self
+    }
+
     /// Sets the initial [`crate::runtime_config::RuntimeConfig`]
     /// snapshot the tree will start with.
     ///

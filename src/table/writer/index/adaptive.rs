@@ -67,7 +67,7 @@ pub struct AdaptiveIndexWriter<W: Write + Seek + 'static> {
     partition_size: u32,
     encryption: Option<Arc<dyn EncryptionProvider>>,
     table_id: crate::TableId,
-    page_ecc: bool,
+    ecc: Option<crate::table::block::EccParams>,
 
     /// Total index size, in bytes, above which we spill to two-level.
     spill_threshold: u64,
@@ -90,7 +90,7 @@ impl<W: Write + Seek + 'static> AdaptiveIndexWriter<W> {
             partition_size: 4_096,
             encryption: None,
             table_id: 0,
-            page_ecc: false,
+            ecc: None,
             spill_threshold,
             buffer: Vec::new(),
             buffered_bytes: 0,
@@ -108,7 +108,7 @@ impl<W: Write + Seek + 'static> AdaptiveIndexWriter<W> {
             .use_partition_size(self.partition_size)
             .use_encryption(self.encryption.clone())
             .use_table_id(self.table_id)
-            .use_page_ecc(self.page_ecc)
+            .use_ecc(self.ecc)
     }
 
     /// Transition to two-level: build a partitioned writer with the
@@ -193,8 +193,11 @@ impl<W: Write + Seek + 'static> BlockIndexWriter<W> for AdaptiveIndexWriter<W> {
         self
     }
 
-    fn use_page_ecc(mut self: Box<Self>, page_ecc: bool) -> Box<dyn BlockIndexWriter<W>> {
-        self.page_ecc = page_ecc;
+    fn use_ecc(
+        mut self: Box<Self>,
+        ecc: Option<crate::table::block::EccParams>,
+    ) -> Box<dyn BlockIndexWriter<W>> {
+        self.ecc = ecc;
         self
     }
 }

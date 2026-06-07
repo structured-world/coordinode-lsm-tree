@@ -477,9 +477,9 @@ pub struct DataBlockEntryIter {
     table_id: crate::table::TableId,
     data_block_compression: CompressionType,
     /// Per-SST Page-ECC flag from the parsed meta: data blocks omit the
-    /// `block_flags` byte, so the read transform needs it to expect a parity
-    /// trailer.
-    page_ecc: bool,
+    /// `block_flags` byte, so the read transform needs the parity scheme
+    /// to size + recover the trailer. `None` = no parity.
+    ecc: Option<crate::table::block::EccParams>,
     /// Per-SST per-KV-footer flag (`kv_checksum_algo.is_some()`) from the
     /// parsed meta: tells `from_loaded` whether to strip a footer.
     has_kv_footer: bool,
@@ -566,7 +566,7 @@ impl Iterator for DataBlockEntryIter {
                 &handle,
                 self.table_id,
                 self.data_block_compression,
-                self.page_ecc,
+                self.ecc,
                 self.has_kv_footer,
             ) {
                 Ok(iter) => {
@@ -720,7 +720,7 @@ pub fn iter_data_block_entries(path: &Path) -> crate::Result<DataBlockEntryIter>
         file,
         table_id,
         data_block_compression,
-        page_ecc: meta.page_ecc,
+        ecc: meta.ecc_params,
         has_kv_footer: meta.kv_checksum_algo.is_some(),
         remaining_handles: handles,
         current: None,
@@ -734,7 +734,7 @@ fn load_data_block_iter(
     handle: &crate::table::BlockHandle,
     table_id: crate::table::TableId,
     compression: CompressionType,
-    page_ecc: bool,
+    ecc: Option<crate::table::block::EccParams>,
     has_kv_footer: bool,
 ) -> crate::Result<crate::table::iter::OwnedDataBlockIter> {
     use crate::table::DataBlock;
@@ -779,8 +779,8 @@ fn load_data_block_iter(
                 #[cfg(zstd_any)]
                 None,
             )?;
-            if page_ecc {
-                t.with_ecc(crate::table::block::EccParams::default())
+            if let Some(ecc) = ecc {
+                t.with_ecc(ecc)
             } else {
                 t
             }

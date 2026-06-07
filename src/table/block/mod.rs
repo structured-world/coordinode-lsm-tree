@@ -626,7 +626,7 @@ impl Block {
         let ecc_length = if block_has_parity(&header, transform) {
             expected_parity_len(
                 header.data_length,
-                transform.ecc_params().unwrap_or_default(),
+                transform.ecc_params().unwrap_or(EccParams::RS_4_2),
             )
         } else {
             0
@@ -644,7 +644,7 @@ impl Block {
                 header.data_length,
                 ecc_length,
                 header.checksum,
-                transform.ecc_params().unwrap_or_default(),
+                transform.ecc_params().unwrap_or(EccParams::RS_4_2),
             )?;
 
             // Decrypt in-place, reusing the read buffer.
@@ -742,7 +742,7 @@ impl Block {
                     header.data_length,
                     ecc_length,
                     header.checksum,
-                    transform.ecc_params().unwrap_or_default(),
+                    transform.ecc_params().unwrap_or(EccParams::RS_4_2),
                 )?)
             };
 
@@ -918,7 +918,7 @@ impl Block {
             let ecc_length = if block_has_parity(&parsed_header, transform) {
                 expected_parity_len(
                     parsed_header.data_length,
-                    transform.ecc_params().unwrap_or_default(),
+                    transform.ecc_params().unwrap_or(EccParams::RS_4_2),
                 )
             } else {
                 0
@@ -981,7 +981,7 @@ impl Block {
                     parsed_header.data_length,
                     ecc_length,
                     parsed_header.checksum,
-                    transform.ecc_params().unwrap_or_default(),
+                    transform.ecc_params().unwrap_or(EccParams::RS_4_2),
                 )?
             };
 
@@ -1075,7 +1075,7 @@ impl Block {
             let ecc_length = if block_has_parity(&parsed_header, transform) {
                 expected_parity_len(
                     parsed_header.data_length,
-                    transform.ecc_params().unwrap_or_default(),
+                    transform.ecc_params().unwrap_or(EccParams::RS_4_2),
                 )
             } else {
                 0
@@ -1117,7 +1117,7 @@ impl Block {
                     parsed_header.data_length,
                     ecc_length,
                     parsed_header.checksum,
-                    transform.ecc_params().unwrap_or_default(),
+                    transform.ecc_params().unwrap_or(EccParams::RS_4_2),
                 )?)
             };
 
@@ -2943,7 +2943,7 @@ mod tests {
                 &mut writer,
                 PAYLOAD,
                 BlockIdentity::for_test(0, 0, BlockType::Data),
-                &BlockTransform::PlainEcc(EccParams::default()),
+                &BlockTransform::PlainEcc(EccParams::RS_4_2),
             )?;
 
             assert!(
@@ -2960,7 +2960,7 @@ mod tests {
             let block = Block::from_reader(
                 &mut reader,
                 BlockIdentity::for_test(0, 0, BlockType::Data),
-                &BlockTransform::PlainEcc(EccParams::default()),
+                &BlockTransform::PlainEcc(EccParams::RS_4_2),
             )?;
             assert_eq!(&*block.data, PAYLOAD);
             Ok(())
@@ -2973,7 +2973,7 @@ mod tests {
                 &mut writer,
                 PAYLOAD,
                 BlockIdentity::for_test(0, 0, BlockType::Data),
-                &BlockTransform::PlainEcc(EccParams::default()),
+                &BlockTransform::PlainEcc(EccParams::RS_4_2),
             )?;
 
             // Flip a single byte inside the payload region (after
@@ -2988,7 +2988,7 @@ mod tests {
             let block = Block::from_reader(
                 &mut reader,
                 BlockIdentity::for_test(0, 0, BlockType::Data),
-                &BlockTransform::PlainEcc(EccParams::default()),
+                &BlockTransform::PlainEcc(EccParams::RS_4_2),
             )?;
             // ECC recovery reconstructs the original payload despite
             // the in-flight bit-flip.
@@ -3005,7 +3005,7 @@ mod tests {
             let tmp = super::write_block_to_tempfile(
                 PAYLOAD,
                 BlockIdentity::for_test(0, 0, BlockType::Data),
-                &BlockTransform::PlainEcc(EccParams::default()),
+                &BlockTransform::PlainEcc(EccParams::RS_4_2),
             )?;
             let path = tmp.dir.path().join("block");
 
@@ -3023,7 +3023,7 @@ mod tests {
                 &file,
                 tmp.handle,
                 BlockIdentity::for_test(0, 0, BlockType::Data),
-                &BlockTransform::PlainEcc(EccParams::default()),
+                &BlockTransform::PlainEcc(EccParams::RS_4_2),
             )?;
             assert_eq!(&*block.data, PAYLOAD);
             Ok(())
@@ -3045,7 +3045,7 @@ mod tests {
                 BlockIdentity::for_test(0, 0, BlockType::Data),
                 &BlockTransform::CompressedEcc(
                     CompressionContext::new(CompressionType::Lz4)?,
-                    EccParams::default(),
+                    EccParams::RS_4_2,
                 ),
             )?;
             assert!(header.block_flags & crate::table::block::header::block_flags::ECC_PARITY != 0);
@@ -3061,7 +3061,7 @@ mod tests {
                 BlockIdentity::for_test(0, 0, BlockType::Data),
                 &BlockTransform::CompressedEcc(
                     CompressionContext::new(CompressionType::Lz4)?,
-                    EccParams::default(),
+                    EccParams::RS_4_2,
                 ),
             )?;
             assert_eq!(
@@ -3088,7 +3088,7 @@ mod tests {
                 &mut writer,
                 PAYLOAD,
                 BlockIdentity::for_test(0, 0, BlockType::Data),
-                &BlockTransform::EncryptedEcc(&enc, EccParams::default()),
+                &BlockTransform::EncryptedEcc(&enc, EccParams::RS_4_2),
             )?;
             assert!(header.block_flags & crate::table::block::header::block_flags::ECC_PARITY != 0);
 
@@ -3101,7 +3101,7 @@ mod tests {
             let block = Block::from_reader(
                 &mut reader,
                 BlockIdentity::for_test(0, 0, BlockType::Data),
-                &BlockTransform::EncryptedEcc(&enc, EccParams::default()),
+                &BlockTransform::EncryptedEcc(&enc, EccParams::RS_4_2),
             )?;
             assert_eq!(
                 &*block.data, PAYLOAD,
@@ -3125,7 +3125,7 @@ mod tests {
                 &mut writer,
                 PAYLOAD,
                 BlockIdentity::for_test(0, 0, BlockType::Data),
-                &BlockTransform::PlainEcc(EccParams::default()),
+                &BlockTransform::PlainEcc(EccParams::RS_4_2),
             )?;
 
             // Shard size in bytes — same formula as crate::ecc::shard_bytes
@@ -3149,7 +3149,7 @@ mod tests {
             let result = Block::from_reader(
                 &mut reader,
                 BlockIdentity::for_test(0, 0, BlockType::Data),
-                &BlockTransform::PlainEcc(EccParams::default()),
+                &BlockTransform::PlainEcc(EccParams::RS_4_2),
             );
             match result {
                 Ok(_) => panic!(
@@ -3175,7 +3175,7 @@ mod tests {
                 &mut empty_buf,
                 &[],
                 BlockIdentity::for_test(0, 0, BlockType::Data),
-                &BlockTransform::PlainEcc(EccParams::default()),
+                &BlockTransform::PlainEcc(EccParams::RS_4_2),
             )?;
             assert_eq!(
                 empty.block_flags & block_flags::ECC_PARITY,
@@ -3200,7 +3200,7 @@ mod tests {
                 &mut full_buf,
                 PAYLOAD,
                 BlockIdentity::for_test(0, 0, BlockType::Data),
-                &BlockTransform::PlainEcc(EccParams::default()),
+                &BlockTransform::PlainEcc(EccParams::RS_4_2),
             )?;
             assert_ne!(
                 full.block_flags & block_flags::ECC_PARITY,

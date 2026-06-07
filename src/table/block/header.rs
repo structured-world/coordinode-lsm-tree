@@ -221,7 +221,7 @@ impl Header {
             // ECC_PARITY bit, not a scheme, so they use the fixed default
             // layout; the configurable per-SST scheme applies to SST data
             // blocks (whose scheme comes from the table descriptor).
-            super::expected_parity_len(self.data_length, super::EccParams::default())
+            super::expected_parity_len(self.data_length, super::EccParams::RS_4_2)
         } else {
             0
         };

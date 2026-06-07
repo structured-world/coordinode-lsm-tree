@@ -20,12 +20,11 @@ pub struct FullIndexWriter {
     /// `BlockIdentity::table_id` when writing the top-level
     /// index block.
     table_id: crate::TableId,
-    /// `Config::page_ecc` threaded by the outer Writer via
-    /// `use_page_ecc`. When `true`, the `BlockTransform` used for
-    /// the top-level-index block emit upgrades to its matching
-    /// `*Ecc` variant so the index block gets the same
-    /// Reed-Solomon parity trailer that data blocks do.
-    page_ecc: bool,
+    /// Page ECC scheme threaded by the outer Writer via `use_ecc`.
+    /// `Some(params)` makes the top-level-index block emit upgrade to
+    /// its matching `*Ecc` variant so the index block gets the same
+    /// parity scheme as data blocks; `None` = no parity.
+    ecc: Option<crate::table::block::EccParams>,
 }
 
 impl FullIndexWriter {
@@ -36,7 +35,7 @@ impl FullIndexWriter {
             block_handles: Vec::new(),
             encryption: None,
             table_id: 0,
-            page_ecc: false,
+            ecc: None,
         }
     }
 }
@@ -72,8 +71,11 @@ impl<W: std::io::Write + std::io::Seek> BlockIndexWriter<W> for FullIndexWriter 
         self
     }
 
-    fn use_page_ecc(mut self: Box<Self>, page_ecc: bool) -> Box<dyn BlockIndexWriter<W>> {
-        self.page_ecc = page_ecc;
+    fn use_ecc(
+        mut self: Box<Self>,
+        ecc: Option<crate::table::block::EccParams>,
+    ) -> Box<dyn BlockIndexWriter<W>> {
+        self.ecc = ecc;
         self
     }
 
@@ -137,8 +139,8 @@ impl<W: std::io::Write + std::io::Seek> BlockIndexWriter<W> for FullIndexWriter 
                     #[cfg(zstd_any)]
                     None,
                 )?;
-                if self.page_ecc {
-                    t.with_ecc(crate::table::block::EccParams::default())
+                if let Some(ecc) = self.ecc {
+                    t.with_ecc(ecc)
                 } else {
                     t
                 }

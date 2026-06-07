@@ -939,7 +939,7 @@ fn walk_block_region(ctx: &mut WalkCtx<'_>, start_offset: u64, end_offset: u64) 
             // (matches the current default-scheme write path).
             u64::from(crate::table::block::expected_parity_len(
                 header.data_length,
-                crate::table::block::EccParams::default(),
+                crate::table::block::EccParams::RS_4_2,
             ))
         } else {
             0
@@ -1200,6 +1200,10 @@ mod block_verify_tests {
             )
             .data_block_compression_policy(CompressionPolicy::all(CompressionType::None))
             .page_ecc(true)
+            .ecc_scheme(crate::runtime_config::EccScheme::ReedSolomon {
+                data_shards: 4,
+                parity_shards: 2,
+            })
             .open()
             .unwrap();
             for i in 0u64..2_000 {
@@ -1218,6 +1222,10 @@ mod block_verify_tests {
         )
         .data_block_compression_policy(CompressionPolicy::all(CompressionType::None))
         .page_ecc(true)
+        .ecc_scheme(crate::runtime_config::EccScheme::ReedSolomon {
+            data_shards: 4,
+            parity_shards: 2,
+        })
         .open()
         .unwrap();
         let report = verify_block_checksums(&tree);

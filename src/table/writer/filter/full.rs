@@ -27,11 +27,10 @@ pub struct FullFilterWriter {
     /// `use_table_id` before `finish` runs.
     table_id: crate::TableId,
 
-    /// `Config::page_ecc` threaded by the outer Writer via
-    /// `use_page_ecc`. When `true`, the filter block this writer
-    /// emits upgrades its `BlockTransform` to the matching `*Ecc`
-    /// variant.
-    page_ecc: bool,
+    /// Page ECC scheme threaded by the outer Writer via `use_ecc`.
+    /// `Some(params)` upgrades the filter block's `BlockTransform` to
+    /// the matching `*Ecc` variant; `None` = no parity.
+    ecc: Option<crate::table::block::EccParams>,
 }
 
 impl FullFilterWriter {
@@ -42,7 +41,7 @@ impl FullFilterWriter {
             prefix_extractor: None,
             encryption: None,
             table_id: 0,
-            page_ecc: false,
+            ecc: None,
         }
     }
 }
@@ -85,8 +84,11 @@ impl<W: std::io::Write + std::io::Seek> FilterWriter<W> for FullFilterWriter {
         self
     }
 
-    fn use_page_ecc(mut self: Box<Self>, page_ecc: bool) -> Box<dyn FilterWriter<W>> {
-        self.page_ecc = page_ecc;
+    fn use_ecc(
+        mut self: Box<Self>,
+        ecc: Option<crate::table::block::EccParams>,
+    ) -> Box<dyn FilterWriter<W>> {
+        self.ecc = ecc;
         self
     }
 
@@ -165,8 +167,8 @@ impl<W: std::io::Write + std::io::Seek> FilterWriter<W> for FullFilterWriter {
                     Some(enc) => crate::table::block::BlockTransform::Encrypted(enc),
                     None => crate::table::block::BlockTransform::PLAIN,
                 };
-                if self.page_ecc {
-                    t.with_ecc(crate::table::block::EccParams::default())
+                if let Some(ecc) = self.ecc {
+                    t.with_ecc(ecc)
                 } else {
                     t
                 }

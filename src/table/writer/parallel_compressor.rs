@@ -118,7 +118,7 @@ pub struct BlockCompressor {
     encryption: Option<Arc<dyn EncryptionProvider>>,
     #[cfg(zstd_any)]
     zstd_dict: Option<Arc<ZstdDictionary>>,
-    page_ecc: bool,
+    ecc: Option<crate::table::block::EccParams>,
 
     next_submit: u64,
     next_drain: u64,
@@ -131,7 +131,7 @@ impl BlockCompressor {
         compression: CompressionType,
         encryption: Option<Arc<dyn EncryptionProvider>>,
         #[cfg(zstd_any)] zstd_dict: Option<Arc<ZstdDictionary>>,
-        page_ecc: bool,
+        ecc: Option<crate::table::block::EccParams>,
     ) -> Self {
         Self {
             spawner,
@@ -144,7 +144,7 @@ impl BlockCompressor {
             encryption,
             #[cfg(zstd_any)]
             zstd_dict,
-            page_ecc,
+            ecc,
             next_submit: 0,
             next_drain: 0,
         }
@@ -171,7 +171,7 @@ impl BlockCompressor {
         let encryption = self.encryption.clone();
         #[cfg(zstd_any)]
         let zstd_dict = self.zstd_dict.clone();
-        let page_ecc = self.page_ecc;
+        let ecc = self.ecc;
 
         self.spawner.spawn(Box::new(move || {
             let result = prepare_owned(
@@ -181,7 +181,7 @@ impl BlockCompressor {
                 encryption.as_deref(),
                 #[cfg(zstd_any)]
                 zstd_dict.as_deref(),
-                page_ecc,
+                ecc,
                 extra_flags,
             );
             let mut ready = shared.ready.lock().unwrap_or_else(PoisonError::into_inner);
@@ -227,7 +227,7 @@ fn prepare_owned(
     compression: CompressionType,
     encryption: Option<&dyn EncryptionProvider>,
     #[cfg(zstd_any)] zstd_dict: Option<&ZstdDictionary>,
-    page_ecc: bool,
+    ecc: Option<crate::table::block::EccParams>,
     extra_flags: u8,
 ) -> crate::Result<PreparedBlock<'static>> {
     let transform = BlockTransform::from_parts(
@@ -236,8 +236,8 @@ fn prepare_owned(
         #[cfg(zstd_any)]
         zstd_dict,
     )?;
-    let transform = if page_ecc {
-        transform.with_ecc(crate::table::block::EccParams::default())
+    let transform = if let Some(ecc) = ecc {
+        transform.with_ecc(ecc)
     } else {
         transform
     };
@@ -312,7 +312,7 @@ mod tests {
             None,
             #[cfg(zstd_any)]
             None,
-            false,
+            None,
         );
         assert_eq!(c.pending(), 0);
         assert!(c.take_next().is_none());
@@ -346,7 +346,7 @@ mod tests {
             None,
             #[cfg(zstd_any)]
             None,
-            false,
+            None,
         );
 
         // Distinct uncompressed lengths (1, 2, 3) tag each block by submission

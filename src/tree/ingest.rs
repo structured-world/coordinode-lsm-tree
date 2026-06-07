@@ -134,7 +134,10 @@ impl<'a> Ingestion<'a> {
 
         writer = writer.use_prefix_extractor(tree.config.prefix_extractor.clone());
         writer = writer.use_encryption(tree.config.encryption.clone());
-        writer = writer.use_page_ecc(tree.config.page_ecc);
+        writer = writer.use_page_ecc(
+            tree.config.page_ecc,
+            tree.config.initial_runtime_config.ecc_scheme,
+        );
         writer = writer.use_sync_mode(tree.config.sync_mode);
 
         writer = writer.use_seqno_in_index(rc.seqno_in_index);

@@ -312,6 +312,10 @@ fn tree_page_ecc_roundtrips_through_flush_and_reopen() -> lsm_tree::Result<()> {
             SequenceNumberCounter::default(),
         )
         .page_ecc(true)
+        .ecc_scheme(lsm_tree::runtime_config::EccScheme::ReedSolomon {
+            data_shards: 4,
+            parity_shards: 2,
+        })
         .open()?;
 
         tree.insert("k1", "v1", 0);
@@ -334,6 +338,10 @@ fn tree_page_ecc_roundtrips_through_flush_and_reopen() -> lsm_tree::Result<()> {
             SequenceNumberCounter::default(),
         )
         .page_ecc(true)
+        .ecc_scheme(lsm_tree::runtime_config::EccScheme::ReedSolomon {
+            data_shards: 4,
+            parity_shards: 2,
+        })
         .open()?;
 
         assert_eq!(Some("v1".as_bytes().into()), tree.get("k1", 2)?);
@@ -374,6 +382,10 @@ fn tree_page_ecc_emits_parity_trailer_on_disk() -> lsm_tree::Result<()> {
         SequenceNumberCounter::default(),
     )
     .page_ecc(true)
+    .ecc_scheme(lsm_tree::runtime_config::EccScheme::ReedSolomon {
+        data_shards: 4,
+        parity_shards: 2,
+    })
     .open()?;
 
     tree.insert("a", "alpha", 0);

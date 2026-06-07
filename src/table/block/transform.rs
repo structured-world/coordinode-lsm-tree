@@ -107,12 +107,6 @@ impl EccParams {
     }
 }
 
-impl Default for EccParams {
-    fn default() -> Self {
-        Self::RS_4_2
-    }
-}
-
 /// Codec configuration for the compression step of a block payload.
 ///
 /// Fields are private; the only way to construct a value is via
@@ -550,7 +544,7 @@ mod tests {
     #[cfg(feature = "page_ecc")]
     #[test]
     fn plain_ecc_variant_reports_ecc_enabled_no_other_transform() {
-        let t = BlockTransform::PlainEcc(EccParams::default());
+        let t = BlockTransform::PlainEcc(EccParams::RS_4_2);
         assert_eq!(t.compression(), CompressionType::None);
         assert!(t.encryption().is_none());
         assert!(t.page_ecc());
@@ -562,7 +556,7 @@ mod tests {
         let Ok(ctx) = CompressionContext::new(CompressionType::Lz4) else {
             panic!("Lz4 ctx construction is total");
         };
-        let t = BlockTransform::CompressedEcc(ctx, EccParams::default());
+        let t = BlockTransform::CompressedEcc(ctx, EccParams::RS_4_2);
         assert_eq!(t.compression(), CompressionType::Lz4);
         assert!(t.encryption().is_none());
         assert!(t.page_ecc());

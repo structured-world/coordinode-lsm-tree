@@ -19,13 +19,6 @@ use std::{path::PathBuf, sync::Arc};
 /// Like `Writer` but will rotate to a new table, once a table grows larger than `target_size`
 ///
 /// This results in a sorted "run" of tables
-#[expect(
-    clippy::struct_excessive_bools,
-    reason = "writer rotation needs to preserve every per-tree builder flag \
-              (clip_range_tombstones, page_ecc, ...) across successor Writers; \
-              a state-machine refactor would obscure the existing 'use_X' chain \
-              and not reduce the working set"
-)]
 pub struct MultiWriter {
     pub(crate) fs: Arc<dyn Fs>,
 
@@ -86,9 +79,9 @@ pub struct MultiWriter {
 
     encryption: Option<Arc<dyn EncryptionProvider>>,
 
-    /// `Config::page_ecc` — preserved here so the rotation path
-    /// can stamp the same flag on every successor [`Writer`].
-    page_ecc: bool,
+    /// Resolved Page ECC scheme — preserved here so the rotation path
+    /// can stamp the same scheme on every successor [`Writer`].
+    ecc: Option<crate::table::block::EccParams>,
 
     /// `Config::sync_mode` — preserved so every successor [`Writer`]
     /// finishes its SST with the same durability level.
@@ -170,7 +163,7 @@ impl MultiWriter {
 
             encryption: None,
 
-            page_ecc: false,
+            ecc: None,
             sync_mode: SyncMode::Normal,
 
             kv_checksum: None,
@@ -475,10 +468,18 @@ impl MultiWriter {
     /// inner [`Writer`] and preserves it across rotations so every
     /// successor writer stamps the same setting on its blocks.
     #[must_use]
-    pub fn use_page_ecc(mut self, page_ecc: bool) -> Self {
-        self.page_ecc = page_ecc;
-        self.writer = self.writer.use_page_ecc(page_ecc);
+    pub fn use_ecc(mut self, ecc: Option<crate::table::block::EccParams>) -> Self {
+        self.ecc = ecc;
+        self.writer = self.writer.use_ecc(ecc);
         self
+    }
+
+    /// Convenience: resolves `(page_ecc, EccScheme)` into the per-block
+    /// scheme and applies it via [`Self::use_ecc`]. Mirrors
+    /// [`crate::table::writer::Writer::use_page_ecc`].
+    #[must_use]
+    pub fn use_page_ecc(self, page_ecc: bool, scheme: crate::runtime_config::EccScheme) -> Self {
+        self.use_ecc(crate::table::writer::resolve_ecc(page_ecc, scheme))
     }
 
     /// Wires the tree's `Config::sync_mode` through to the inner [`Writer`]
@@ -558,7 +559,7 @@ impl MultiWriter {
 
         new_writer = new_writer.use_prefix_extractor(self.prefix_extractor.clone());
         new_writer = new_writer.use_encryption(self.encryption.clone());
-        new_writer = new_writer.use_page_ecc(self.page_ecc);
+        new_writer = new_writer.use_ecc(self.ecc);
         new_writer = new_writer.use_sync_mode(self.sync_mode);
         if let Some((policy, algo)) = self.kv_checksum {
             new_writer = new_writer.use_kv_checksums(policy, algo);

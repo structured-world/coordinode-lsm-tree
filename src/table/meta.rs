@@ -81,6 +81,13 @@ pub struct ParsedMeta {
     /// carry a per-block `ECC_PARITY` flag.
     pub page_ecc: bool,
 
+    /// Per-SST Page-ECC shard scheme decoded from the
+    /// `descriptor#page_ecc` value: `Some(params)` when this table's
+    /// blocks carry a parity trailer (the read path sizes + recovers
+    /// with this scheme), `None` when off. Agrees with
+    /// [`Self::page_ecc`] (`page_ecc == ecc_params.is_some()`).
+    pub ecc_params: Option<crate::table::block::EccParams>,
+
     /// Index block format for this SST (#224). `0` = legacy: index
     /// entries carry no per-block seqno bounds (byte-identical to the
     /// pre-#224 format). `1` = each index entry includes
@@ -323,7 +330,29 @@ impl ParsedMeta {
             &cmp
         ))?;
 
-        let page_ecc = read_u8!(block, b"descriptor#page_ecc", &cmp) != 0;
+        // Per-SST ECC descriptor: 4 bytes [kind, data_shards,
+        // parity_shards, granularity]. `kind == 0` = no parity. A present
+        // descriptor records the exact shard scheme so the read path
+        // re-derives the parity layout (no implicit RS(4,2) fallback).
+        let (page_ecc, ecc_params) = {
+            let v = block
+                .point_read(b"descriptor#page_ecc", SeqNo::MAX, &cmp)?
+                .ok_or(crate::Error::InvalidHeader("TableMeta"))?;
+            let cfg = crate::runtime_config::ecc_descriptor_from_bytes(&v.value)?;
+            let params = cfg
+                .and_then(|(scheme, _gran)| scheme.shard_params())
+                .map(|(d, p)| {
+                    #[expect(
+                        clippy::cast_possible_truncation,
+                        reason = "shard counts originate as u8 in the descriptor"
+                    )]
+                    crate::table::block::EccParams {
+                        data_shards: d as u8,
+                        parity_shards: p as u8,
+                    }
+                });
+            (params.is_some(), params)
+        };
 
         // Optional field introduced for scan_since_seqno block-skip (#224).
         // SSTs written before this key existed parse as 0 (legacy index
@@ -364,6 +393,7 @@ impl ParsedMeta {
             index_block_compression,
             kv_checksum_algo,
             page_ecc,
+            ecc_params,
             index_format,
         })
     }
@@ -438,7 +468,7 @@ mod tests {
             meta("created_at", &1_000_000u128.to_le_bytes()),
             meta("data_block_hash_ratio", &0.0f64.to_le_bytes()),
             meta("descriptor#kv_checksum", &[0u8]),
-            meta("descriptor#page_ecc", &[0u8]),
+            meta("descriptor#page_ecc", &[0u8, 0, 0, 0]),
             meta("file_size", &4096u64.to_le_bytes()),
             meta("filter_hash_type", &[u8::from(ChecksumType::Xxh3)]),
             meta("index_keys_have_seqno", &[0x1]),
@@ -658,10 +688,13 @@ mod tests {
         );
     }
 
-    /// An overlong single-byte descriptor payload (e.g. `[0, 0xFF]`) must be
-    /// rejected as `InvalidHeader`, not silently truncated to the first byte —
-    /// `read_u8!` would otherwise ignore the trailing bytes and weaken
-    /// corruption detection on these format-critical per-SST descriptors.
+    /// A wrong-length descriptor payload (e.g. `[0, 0xFF]`) must be rejected,
+    /// not silently truncated to the first byte — otherwise trailing bytes
+    /// would be ignored and weaken corruption detection on these
+    /// format-critical per-SST descriptors. `descriptor#kv_checksum` is a
+    /// single byte (rejected as `InvalidHeader`); `descriptor#page_ecc` is a
+    /// fixed 4-byte value whose codec rejects a wrong length as
+    /// `InvalidTrailer`.
     #[test]
     fn load_with_handle_overlong_descriptor_payload_is_rejected() {
         for key in ["descriptor#kv_checksum", "descriptor#page_ecc"] {
@@ -674,8 +707,11 @@ mod tests {
             }
             let result = load_meta_from_items(&items);
             assert!(
-                matches!(result, Err(crate::Error::InvalidHeader("TableMeta"))),
-                "overlong {key} payload must be rejected, got {result:?}",
+                matches!(
+                    result,
+                    Err(crate::Error::InvalidHeader("TableMeta") | crate::Error::InvalidTrailer)
+                ),
+                "wrong-length {key} payload must be rejected, got {result:?}",
             );
         }
     }
@@ -707,22 +743,31 @@ mod tests {
         }
     }
 
-    /// `descriptor#page_ecc` round-trips: `0` → `false` (no parity trailer),
-    /// any non-zero → `true`.
+    /// `descriptor#page_ecc` round-trips: `[0,0,0,0]` → off, and a shard
+    /// scheme descriptor → on with the decoded `EccParams`.
     #[test]
     fn load_with_handle_page_ecc_descriptor_parses() {
         let parsed = load_meta_from_items(&valid_meta_items()).unwrap();
-        assert!(!parsed.page_ecc, "0 byte means no Page ECC");
+        assert!(!parsed.page_ecc, "kind 0 means no Page ECC");
+        assert_eq!(parsed.ecc_params, None);
 
         let mut items = valid_meta_items();
         if let Some(item) = items
             .iter_mut()
             .find(|iv| &*iv.key.user_key == b"descriptor#page_ecc")
         {
-            *item = meta("descriptor#page_ecc", &[1u8]);
+            // kind 3 = ReedSolomon, data_shards 8, parity_shards 2, Block.
+            *item = meta("descriptor#page_ecc", &[3u8, 8, 2, 0]);
         }
         let parsed = load_meta_from_items(&items).unwrap();
-        assert!(parsed.page_ecc, "non-zero byte means Page ECC is on");
+        assert!(parsed.page_ecc, "a present scheme means Page ECC is on");
+        assert_eq!(
+            parsed.ecc_params,
+            Some(crate::table::block::EccParams {
+                data_shards: 8,
+                parity_shards: 2,
+            }),
+        );
     }
 
     /// Missing `descriptor#page_ecc` must return `Err(InvalidHeader)`, not

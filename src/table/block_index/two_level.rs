@@ -31,9 +31,9 @@ pub struct TwoLevelBlockIndex {
     pub(crate) cache: Arc<Cache>,
     pub(crate) compression: CompressionType,
     pub(crate) encryption: Option<Arc<dyn EncryptionProvider>>,
-    /// Per-SST Page-ECC flag from table metadata; the block reader needs it
-    /// to know whether index blocks carry a parity trailer.
-    pub(crate) page_ecc: bool,
+    /// Per-SST Page-ECC scheme from table metadata; the block reader needs
+    /// it to size + recover index-block parity. `None` = no parity.
+    pub(crate) ecc: Option<crate::table::block::EccParams>,
     pub(crate) comparator: SharedComparator,
 
     #[cfg(feature = "metrics")]
@@ -55,7 +55,7 @@ impl TwoLevelBlockIndex {
             cache: self.cache.clone(),
             compression: self.compression,
             encryption: self.encryption.clone(),
-            page_ecc: self.page_ecc,
+            ecc: self.ecc,
             comparator: self.comparator.clone(),
 
             #[cfg(feature = "metrics")]
@@ -81,7 +81,7 @@ pub struct Iter {
     cache: Arc<Cache>,
     compression: CompressionType,
     encryption: Option<Arc<dyn EncryptionProvider>>,
-    page_ecc: bool,
+    ecc: Option<crate::table::block::EccParams>,
     comparator: SharedComparator,
 
     #[cfg(feature = "metrics")]
@@ -169,7 +169,7 @@ impl Iterator for Iter {
                     BlockType::Index,
                     self.compression,
                     self.encryption.as_deref(),
-                    self.page_ecc,
+                    self.ecc,
                     #[cfg(zstd_any)]
                     None,
                     #[cfg(feature = "metrics")]
@@ -249,7 +249,7 @@ impl DoubleEndedIterator for Iter {
                     BlockType::Index,
                     self.compression,
                     self.encryption.as_deref(),
-                    self.page_ecc,
+                    self.ecc,
                     #[cfg(zstd_any)]
                     None,
                     #[cfg(feature = "metrics")]

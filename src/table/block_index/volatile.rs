@@ -31,9 +31,9 @@ pub struct VolatileBlockIndex {
     pub(crate) handle: BlockHandle,
     pub(crate) compression: CompressionType,
     pub(crate) encryption: Option<Arc<dyn EncryptionProvider>>,
-    /// Per-SST Page-ECC flag from table metadata; the block reader needs it
-    /// to know whether the index block carries a parity trailer.
-    pub(crate) page_ecc: bool,
+    /// Per-SST Page-ECC scheme from table metadata; the block reader needs
+    /// it to size + recover index-block parity. `None` = no parity.
+    pub(crate) ecc: Option<crate::table::block::EccParams>,
     pub(crate) comparator: SharedComparator,
 
     #[cfg(feature = "metrics")]
@@ -61,7 +61,7 @@ pub struct Iter {
     handle: BlockHandle,
     compression: CompressionType,
     encryption: Option<Arc<dyn EncryptionProvider>>,
-    page_ecc: bool,
+    ecc: Option<crate::table::block::EccParams>,
     comparator: SharedComparator,
 
     lo: Option<(UserKey, SeqNo)>,
@@ -84,7 +84,7 @@ impl Iter {
             handle: index.handle,
             compression: index.compression,
             encryption: index.encryption.clone(),
-            page_ecc: index.page_ecc,
+            ecc: index.ecc,
             comparator: index.comparator.clone(),
 
             lo: None,
@@ -120,7 +120,7 @@ impl Iter {
             BlockType::Index,
             self.compression,
             self.encryption.as_deref(),
-            self.page_ecc,
+            self.ecc,
             #[cfg(zstd_any)]
             None,
             #[cfg(feature = "metrics")]

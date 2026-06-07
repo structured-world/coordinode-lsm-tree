@@ -46,7 +46,7 @@ pub fn load_block(
     block_type: BlockType,
     compression: CompressionType,
     encryption: Option<&dyn EncryptionProvider>,
-    page_ecc: bool,
+    ecc: Option<crate::table::block::EccParams>,
     #[cfg(zstd_any)] zstd_dict: Option<&crate::compression::ZstdDictionary>,
     #[cfg(feature = "metrics")] metrics: &Metrics,
 ) -> crate::Result<Block> {
@@ -142,8 +142,8 @@ pub fn load_block(
                 #[cfg(zstd_any)]
                 zstd_dict,
             )?;
-            if page_ecc {
-                t.with_ecc(crate::table::block::EccParams::default())
+            if let Some(ecc) = ecc {
+                t.with_ecc(ecc)
             } else {
                 t
             }

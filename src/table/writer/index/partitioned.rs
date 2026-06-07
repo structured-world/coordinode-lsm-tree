@@ -44,7 +44,7 @@ pub struct PartitionedIndexWriter {
     /// `use_page_ecc`. When `true`, every `BlockTransform` this
     /// index writer constructs for the sub-index + TLI blocks
     /// upgrades to its matching `*Ecc` variant.
-    page_ecc: bool,
+    ecc: Option<crate::table::block::EccParams>,
 }
 
 impl PartitionedIndexWriter {
@@ -66,7 +66,7 @@ impl PartitionedIndexWriter {
 
             encryption: None,
             table_id: 0,
-            page_ecc: false,
+            ecc: None,
         }
     }
 
@@ -106,8 +106,8 @@ impl PartitionedIndexWriter {
                     #[cfg(zstd_any)]
                     None,
                 )?;
-                if self.page_ecc {
-                    t.with_ecc(crate::table::block::EccParams::default())
+                if let Some(ecc) = self.ecc {
+                    t.with_ecc(ecc)
                 } else {
                     t
                 }
@@ -193,8 +193,8 @@ impl PartitionedIndexWriter {
                     #[cfg(zstd_any)]
                     None,
                 )?;
-                if self.page_ecc {
-                    t.with_ecc(crate::table::block::EccParams::default())
+                if let Some(ecc) = self.ecc {
+                    t.with_ecc(ecc)
                 } else {
                     t
                 }
@@ -238,8 +238,11 @@ impl<W: std::io::Write + std::io::Seek> BlockIndexWriter<W> for PartitionedIndex
         self
     }
 
-    fn use_page_ecc(mut self: Box<Self>, page_ecc: bool) -> Box<dyn BlockIndexWriter<W>> {
-        self.page_ecc = page_ecc;
+    fn use_ecc(
+        mut self: Box<Self>,
+        ecc: Option<crate::table::block::EccParams>,
+    ) -> Box<dyn BlockIndexWriter<W>> {
+        self.ecc = ecc;
         self
     }
 

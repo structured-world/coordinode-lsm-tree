@@ -542,7 +542,10 @@ impl AbstractTree for Tree {
 
         table_writer = table_writer.use_prefix_extractor(self.config.prefix_extractor.clone());
         table_writer = table_writer.use_encryption(self.config.encryption.clone());
-        table_writer = table_writer.use_page_ecc(self.config.page_ecc);
+        table_writer = table_writer.use_page_ecc(
+            self.config.page_ecc,
+            self.config.initial_runtime_config.ecc_scheme,
+        );
         table_writer = table_writer.use_sync_mode(self.config.sync_mode);
 
         table_writer = table_writer.use_seqno_in_index(rc.seqno_in_index);

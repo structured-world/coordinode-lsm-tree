@@ -96,12 +96,6 @@ fn create_data_block_reader(
     OwnedDataBlockIter::try_new(block, |b| b.try_iter(comparator))
 }
 
-#[expect(
-    clippy::struct_excessive_bools,
-    reason = "independent per-SST/iterator state flags (page_ecc, has_kv_footer, \
-              index_initialized, poisoned); each is threaded or set independently, \
-              so a state-machine enum would conflate orthogonal concerns"
-)]
 pub struct Iter {
     table_id: GlobalTableId,
     path: Arc<PathBuf>,
@@ -115,9 +109,9 @@ pub struct Iter {
     cache: Arc<Cache>,
     compression: CompressionType,
     encryption: Option<Arc<dyn EncryptionProvider>>,
-    /// Per-SST Page-ECC flag from table metadata; the block reader needs it
-    /// to know whether data blocks carry a parity trailer.
-    page_ecc: bool,
+    /// Per-SST Page-ECC scheme from table metadata; the block reader needs
+    /// it to size + recover the parity trailer. `None` = no parity.
+    ecc: Option<crate::table::block::EccParams>,
     /// Per-SST per-KV-footer flag from table metadata
     /// (`kv_checksum_algo.is_some()`); data blocks omit the `block_flags` byte,
     /// so `from_loaded` is told here whether to strip a footer.
@@ -159,7 +153,7 @@ impl Iter {
         cache: Arc<Cache>,
         compression: CompressionType,
         encryption: Option<Arc<dyn EncryptionProvider>>,
-        page_ecc: bool,
+        ecc: Option<crate::table::block::EccParams>,
         has_kv_footer: bool,
         #[cfg(zstd_any)] zstd_dictionary: Option<Arc<crate::compression::ZstdDictionary>>,
         comparator: SharedComparator,
@@ -176,7 +170,7 @@ impl Iter {
             cache,
             compression,
             encryption,
-            page_ecc,
+            ecc,
             has_kv_footer,
             #[cfg(zstd_any)]
             zstd_dictionary,
@@ -317,7 +311,7 @@ impl Iterator for Iter {
                 crate::table::block::BlockType::Data,
                 self.compression,
                 self.encryption.as_deref(),
-                self.page_ecc,
+                self.ecc,
                 #[cfg(zstd_any)]
                 self.zstd_dictionary.as_deref(),
                 #[cfg(feature = "metrics")]
@@ -449,7 +443,7 @@ impl DoubleEndedIterator for Iter {
                 crate::table::block::BlockType::Data,
                 self.compression,
                 self.encryption.as_deref(),
-                self.page_ecc,
+                self.ecc,
                 #[cfg(zstd_any)]
                 self.zstd_dictionary.as_deref(),
                 #[cfg(feature = "metrics")]
