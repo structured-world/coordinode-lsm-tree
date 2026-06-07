@@ -123,13 +123,13 @@ byteview = "~0.10.1"
 # behind `#[cfg(feature = "std")]` so the no-std-check job never sees it.
 arc-swap = { version = "1.9", optional = true }
 enum_dispatch = "0.3.13"
-log = "0.4.30"
+log = "0.4.32"
 # `spin` provides a no_std-compatible Mutex. Used by
 # `deletion_pause` so that module's only std footprint comes from the
 # `Fs` trait it interacts with, not from its own synchronisation.
 spin = { version = "0.12", default-features = false, features = ["mutex", "spin_mutex"] }
 lz4_flex = { version = "0.13.0", optional = true, default-features = false }
-structured-zstd = { version = "0.0.29", optional = true, default-features = false, features = ["std", "lsm"] }
+structured-zstd = { version = "0.0.30", optional = true, default-features = false, features = ["std", "lsm"] }
 # `once_cell::race::OnceBox` — the no-std + alloc one-shot primitive.
 # We pick it over `std::sync::OnceLock` (which has both `set` and the
 # stabilised `get_or_try_init` on our 1.92 MSRV) because OnceLock is
@@ -143,7 +143,7 @@ structured-zstd = { version = "0.0.29", optional = true, default-features = fals
 #   - `deletion_pause` slot on tables / blob files (one-shot install of
 #     the shared `Arc<DeletionPause>` after recovery / compaction).
 once_cell = { version = "1", default-features = false, features = ["race"] }
-quick_cache = { version = "0.6.16", default-features = false, features = [] }
+quick_cache = { version = "0.6.23", default-features = false, features = [] }
 rustc-hash = { version = "2.1.1", default-features = false }
 self_cell = "1.2.0"
 # Optional — only pulled in by the vendored Ribbon filter under the
@@ -157,7 +157,7 @@ serde = { version = "1", optional = true, features = ["derive"] }
 # feature so the no-std build does not pull in `fastrand` (which
 # transitively does `extern crate std`).
 tempfile = { version = "3.20.0", optional = true }
-varint-rs = { version = "2.2.0", default-features = false }
+varint-rs = { version = "2.2.1", default-features = false }
 xxhash-rust = { version = "0.8.15", features = ["xxh3"] }
 # CRC32C (Castagnoli) for the optional `Crc32c` checksum algorithm.
 # Hardware-accelerated (SSE4.2 `_mm_crc32` on x86, CRC32 instructions on
