@@ -346,11 +346,9 @@ impl ParsedMeta {
                         clippy::cast_possible_truncation,
                         reason = "shard counts originate as u8 in the descriptor"
                     )]
-                    crate::table::block::EccParams {
-                        data_shards: d as u8,
-                        parity_shards: p as u8,
-                    }
-                });
+                    crate::table::block::EccParams::try_new(d as u8, p as u8)
+                })
+                .transpose()?;
             (params.is_some(), params)
         };
 
@@ -763,10 +761,7 @@ mod tests {
         assert!(parsed.page_ecc, "a present scheme means Page ECC is on");
         assert_eq!(
             parsed.ecc_params,
-            Some(crate::table::block::EccParams {
-                data_shards: 8,
-                parity_shards: 2,
-            }),
+            Some(crate::table::block::EccParams::try_new(8, 2).expect("valid shards")),
         );
     }
 

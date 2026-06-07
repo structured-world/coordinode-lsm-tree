@@ -69,8 +69,8 @@ const MAX_DECOMPRESSION_SIZE: u32 = 256 * 1024 * 1024;
 /// `crate::ecc::encode_parity`'s empty-payload short-circuit.
 #[inline]
 pub(crate) fn expected_parity_len(data_length: u32, params: EccParams) -> u32 {
-    let data_shards = u32::from(params.data_shards);
-    let parity_shards = u32::from(params.parity_shards);
+    let data_shards = u32::from(params.data_shards());
+    let parity_shards = u32::from(params.parity_shards());
     if data_length == 0 || data_shards == 0 || parity_shards == 0 {
         return 0;
     }

@@ -83,12 +83,19 @@ use crate::{CompressionType, encryption::EncryptionProvider};
 /// Not feature-gated (a 2-byte POD) so call sites pass it uniformly
 /// across the feature matrix; the `*Ecc` variants that store it and
 /// the parity codec that consumes it are `page_ecc`-gated.
+///
+/// Both shard counts are non-zero by construction: the only public
+/// constructor is [`Self::try_new`], which rejects a zero in either
+/// position (a zero-shard layout is non-recoverable and would serialize
+/// to a descriptor that the read path rejects on reopen). The fields are
+/// private so an external caller cannot bypass that check by building the
+/// struct literally and feeding it to a `*Ecc` transform variant.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
 pub struct EccParams {
-    /// Number of data shards the block payload is split into.
-    pub data_shards: u8,
-    /// Number of parity shards (`1` = XOR single-parity / RAID-5).
-    pub parity_shards: u8,
+    /// Number of data shards the block payload is split into (`>= 1`).
+    data_shards: u8,
+    /// Number of parity shards (`1` = XOR single-parity / RAID-5; `>= 1`).
+    parity_shards: u8,
 }
 
 impl EccParams {
@@ -98,6 +105,44 @@ impl EccParams {
         data_shards: 4,
         parity_shards: 2,
     };
+
+    /// Builds a shard layout, rejecting a zero count in either position.
+    ///
+    /// A zero-shard layout has no valid parity trailer, so it is refused
+    /// here (the only public construction path) rather than later, deep
+    /// in block I/O or on reopen where `TableMeta` parsing would reject
+    /// the resulting descriptor.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error::FeatureUnsupported`] when `data_shards` or
+    /// `parity_shards` is zero.
+    pub fn try_new(data_shards: u8, parity_shards: u8) -> crate::Result<Self> {
+        if data_shards == 0 {
+            return Err(crate::Error::FeatureUnsupported("ecc_scheme data_shards=0"));
+        }
+        if parity_shards == 0 {
+            return Err(crate::Error::FeatureUnsupported(
+                "ecc_scheme parity_shards=0",
+            ));
+        }
+        Ok(Self {
+            data_shards,
+            parity_shards,
+        })
+    }
+
+    /// Number of data shards the block payload is split into (`>= 1`).
+    #[must_use]
+    pub const fn data_shards(self) -> u8 {
+        self.data_shards
+    }
+
+    /// Number of parity shards (`1` = XOR single-parity / RAID-5; `>= 1`).
+    #[must_use]
+    pub const fn parity_shards(self) -> u8 {
+        self.parity_shards
+    }
 
     /// `(data_shards, parity_shards)` as `usize`, for the `crate::ecc`
     /// shard-based encode / recover API.

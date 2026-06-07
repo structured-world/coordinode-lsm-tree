@@ -1415,10 +1415,15 @@ pub(crate) fn resolve_ecc(
             clippy::cast_possible_truncation,
             reason = "shard counts originate as u8 in EccScheme"
         )]
-        crate::table::block::EccParams {
-            data_shards: data as u8,
-            parity_shards: parity as u8,
-        }
+        let (data, parity) = (data as u8, parity as u8);
+        // Shard counts come from a runtime-validated `EccScheme`
+        // (`try_update` rejects zero counts), so `try_new` cannot fail on
+        // the live path. The `expect` localizes the invariant for the one
+        // remaining injection point — a hand-built `Config::ecc_scheme`
+        // with a zero count — to a loud config error rather than a corrupt
+        // SST descriptor.
+        crate::table::block::EccParams::try_new(data, parity)
+            .expect("EccScheme shard counts are non-zero")
     })
 }
 
@@ -1454,14 +1459,14 @@ fn write_meta_section<W: std::io::Write + std::io::Seek>(
     let ecc_descriptor = {
         use crate::runtime_config::{EccGranularity, EccScheme};
         let cfg = effective_ecc.map(|p| {
-            let scheme = if p.parity_shards == 1 {
+            let scheme = if p.parity_shards() == 1 {
                 EccScheme::Xor {
-                    data_shards: p.data_shards,
+                    data_shards: p.data_shards(),
                 }
             } else {
                 EccScheme::ReedSolomon {
-                    data_shards: p.data_shards,
-                    parity_shards: p.parity_shards,
+                    data_shards: p.data_shards(),
+                    parity_shards: p.parity_shards(),
                 }
             };
             (scheme, EccGranularity::Block)
