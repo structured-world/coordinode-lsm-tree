@@ -765,6 +765,28 @@ mod tests {
         );
     }
 
+    /// A descriptor recording page-granular ECC must be rejected, not
+    /// silently read as whole-block ECC. Only block granularity is wired
+    /// today; coercing a `Page` descriptor to `Block` would size and
+    /// recover the parity trailer with the wrong layout instead of failing
+    /// closed.
+    #[test]
+    fn load_with_handle_page_granularity_descriptor_returns_err() {
+        let mut items = valid_meta_items();
+        if let Some(item) = items
+            .iter_mut()
+            .find(|iv| &*iv.key.user_key == b"descriptor#page_ecc")
+        {
+            // kind 3 = ReedSolomon, data 8, parity 2, granularity 1 = Page.
+            *item = meta("descriptor#page_ecc", &[3u8, 8, 2, 1]);
+        }
+        let result = load_meta_from_items(&items);
+        assert!(
+            result.is_err(),
+            "page-granular ECC descriptor must be rejected, got {result:?}",
+        );
+    }
+
     /// Missing `descriptor#page_ecc` must return `Err(InvalidHeader)`, not
     /// panic — it is a required per-SST field.
     #[test]
