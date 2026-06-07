@@ -35,6 +35,7 @@
 )]
 
 use crate::comparator::SharedComparator;
+use crate::table::DataBlock;
 use crate::table::block::{Block, BlockType, Decoder, Header, ParsedItem};
 use crate::table::data_block::DataBlockParsedItem;
 use crate::{Checksum, InternalValue, Slice};
@@ -252,6 +253,167 @@ pub fn collect_range_partial(
     Ok((out, lazy.decoded_blocks()))
 }
 
+/// Synthesize a valid standalone data-block (`entries ‖ trailer`) from a
+/// decoded entry-region `prefix`, so the normal trailer-driven decoder / seek
+/// path can read it. The binary index is rebuilt from the prefix's positional
+/// restart heads (no trailer needed in the source); no hash index is emitted
+/// (seek falls back to binary search). A truncated tail entry in `prefix` is
+/// dropped (only complete entries are indexed and kept).
+///
+/// # Errors
+///
+/// Returns an error if the binary index fails to serialize.
+fn synthesize_block_bytes(prefix: &[u8], restart_interval: u8) -> crate::Result<Vec<u8>> {
+    use crate::table::block::TRAILER_START_MARKER;
+    use crate::table::block::binary_index::Builder as BinaryIndexBuilder;
+
+    // Scan the prefix's complete entries for restart-head offsets, the item
+    // count, and the end of the last complete entry (truncated tail excluded).
+    let probe = Block {
+        header: synthetic_header(prefix.len()),
+        data: Slice::from(prefix),
+    };
+    let (restart_offsets, item_count, entries_end) =
+        Decoder::<InternalValue, DataBlockParsedItem>::new_forward_headerless(
+            &probe,
+            restart_interval,
+            prefix.len(),
+        )
+        .scan_restart_offsets();
+
+    let mut out =
+        Vec::with_capacity(entries_end + 1 + restart_offsets.len() * 4 + TRAILER_FOOTER_SIZE);
+    out.extend_from_slice(prefix.get(..entries_end).unwrap_or(prefix));
+    out.push(TRAILER_START_MARKER);
+
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "block offsets are far below u32::MAX"
+    )]
+    let binary_index_offset = out.len() as u32;
+    let mut bib = BinaryIndexBuilder::new(restart_offsets.len());
+    for off in restart_offsets {
+        bib.insert(off);
+    }
+    let (step_size, binary_index_len) = bib.write(&mut out)?;
+
+    // Footer — byte-for-byte the layout `Trailer::write` emits.
+    out.push(restart_interval);
+    out.push(step_size);
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "index pointers <= item count, far below u32::MAX"
+    )]
+    out.extend_from_slice(&(binary_index_len as u32).to_le_bytes());
+    out.extend_from_slice(&binary_index_offset.to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes()); // hash_index_len
+    out.extend_from_slice(&0u32.to_le_bytes()); // hash_index_offset
+    out.push(1); // prefix truncation on
+    out.push(0); // fixed key size (u8, unused)
+    out.extend_from_slice(&0u16.to_le_bytes()); // fixed key size (u16, unused)
+    out.push(0); // fixed value size (u8, unused)
+    out.extend_from_slice(&0u32.to_le_bytes()); // fixed value size (u32, unused)
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "item count far below u32::MAX for a single block"
+    )]
+    out.extend_from_slice(&(item_count as u32).to_le_bytes());
+
+    Ok(out)
+}
+
+/// Trailer footer size in bytes (mirrors `Trailer::TRAILER_SIZE`): the fixed
+/// fields after the (optional) hash index.
+const TRAILER_FOOTER_SIZE: usize = 31;
+
+/// Synthetic block header for a decoder-only block built from decoded bytes
+/// (checksum / lengths are not consulted by the entry decoder).
+fn synthetic_header(len: usize) -> Header {
+    use crate::table::block::BlockType;
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "block length is far below u32::MAX"
+    )]
+    let len = len as u32;
+    Header {
+        block_type: BlockType::Data,
+        block_flags: 0,
+        checksum: Checksum::from_raw(0),
+        data_length: len,
+        uncompressed_length: len,
+    }
+}
+
+/// Build a standalone `DataBlock` covering `[block_start, upper]` from a
+/// compressed `frame`, decoding only the inner zstd blocks needed to reach
+/// `upper` (skipping the trailing blocks) and synthesizing a trailer so the
+/// normal seek / iterate path works. The caller's iterator then trims to the
+/// exact query bounds. Returns the block and the number of inner blocks
+/// decoded.
+///
+/// # Errors
+///
+/// Returns an error if the frame or an inner block fails to decode, or the
+/// trailer fails to synthesize.
+pub fn partial_data_block(
+    frame: Vec<u8>,
+    ends: Vec<u32>,
+    restart_interval: u8,
+    comparator: &SharedComparator,
+    upper: &[u8],
+) -> crate::Result<(DataBlock, u32)> {
+    let mut lazy = LazyBlock::new(frame, ends)?;
+    let total = lazy.total_len();
+    let mut extent = 0usize;
+
+    // Grow the decoded extent until a key strictly greater than `upper` appears
+    // (so `upper`'s entry is fully decoded) or the block is exhausted.
+    loop {
+        extent = if extent == 0 {
+            (64 * 1024).min(total)
+        } else {
+            extent.saturating_mul(2).min(total)
+        };
+        lazy.ensure_decoded_to(extent)?;
+        if extent >= total
+            || prefix_reaches_past(lazy.decoded(), restart_interval, comparator, upper)
+        {
+            break;
+        }
+    }
+
+    let bytes = synthesize_block_bytes(lazy.decoded(), restart_interval)?;
+    let blocks = lazy.decoded_blocks();
+    let block = DataBlock::new(Block {
+        header: synthetic_header(bytes.len()),
+        data: Slice::from(bytes),
+    });
+    Ok((block, blocks))
+}
+
+/// Whether the decoded `prefix` contains an entry whose key is strictly greater
+/// than `upper` (i.e. the prefix already covers everything `<= upper`).
+fn prefix_reaches_past(
+    prefix: &[u8],
+    restart_interval: u8,
+    comparator: &SharedComparator,
+    upper: &[u8],
+) -> bool {
+    let probe = Block {
+        header: synthetic_header(prefix.len()),
+        data: Slice::from(prefix),
+    };
+    Decoder::<InternalValue, DataBlockParsedItem>::new_forward_headerless(
+        &probe,
+        restart_interval,
+        prefix.len(),
+    )
+    .any(|item| {
+        comparator.compare(item.materialize(&probe.data).key.user_key.as_ref(), upper)
+            == std::cmp::Ordering::Greater
+    })
+}
+
 #[cfg(test)]
 #[expect(clippy::expect_used, clippy::indexing_slicing, reason = "test code")]
 mod tests {
@@ -398,5 +560,203 @@ mod tests {
             assert_eq!(lazy.decoded(), &reference[..lazy.decoded().len()]);
         }
         assert_eq!(lazy.decoded(), reference.as_slice());
+    }
+
+    /// A block synthesized (trailer rebuilt) from a full block's entry region
+    /// must be indistinguishable from the original under forward iteration,
+    /// backward iteration, and seek to arbitrary keys — proving the rebuilt
+    /// binary-index trailer is wire-correct.
+    #[test]
+    fn synthesized_block_matches_original_seek_iter_both_ways() {
+        use crate::SeqNo;
+        use crate::comparator::default_comparator;
+        use crate::table::block::Decoder as BlockDecoder;
+        use crate::table::block::{Block, BlockType, Header, ParsedItem};
+        use crate::table::data_block::DataBlockParsedItem;
+
+        let items: Vec<InternalValue> = (0u64..500)
+            .map(|i| {
+                InternalValue::from_components(
+                    format!("key-{i:06}").into_bytes(),
+                    format!("value-{i:06}").into_bytes(),
+                    0,
+                    Value,
+                )
+            })
+            .collect();
+        let ri = 16u8;
+        let block_bytes = DataBlock::encode_into_vec(&items, ri, 0.0).expect("encode");
+        let cmp = default_comparator();
+
+        let full = DataBlock::new(Block {
+            data: Slice::from(block_bytes.clone()),
+            header: Header::test_dummy(BlockType::Data),
+        });
+
+        // Entry-region prefix (no trailer), via the real decoder's entries_end.
+        let entries_end = BlockDecoder::<InternalValue, DataBlockParsedItem>::new(&Block {
+            data: Slice::from(block_bytes.clone()),
+            header: Header::test_dummy(BlockType::Data),
+        })
+        .entries_end_for_test()
+        .expect("entries_end");
+        let prefix = &block_bytes[..entries_end];
+
+        let synth_bytes = synthesize_block_bytes(prefix, ri).expect("synthesize");
+        let synth = DataBlock::new(Block {
+            data: Slice::from(synth_bytes),
+            header: Header::test_dummy(BlockType::Data),
+        });
+
+        // Forward iteration identical (and equals the original items).
+        let full_fwd: Vec<InternalValue> = full
+            .iter(cmp.clone())
+            .map(|x| x.materialize(full.as_slice()))
+            .collect();
+        let synth_fwd: Vec<InternalValue> = synth
+            .iter(cmp.clone())
+            .map(|x| x.materialize(synth.as_slice()))
+            .collect();
+        assert_eq!(full_fwd, items, "sanity: full forward == items");
+        assert_eq!(synth_fwd, full_fwd, "synth forward must equal full forward");
+
+        // Backward iteration identical.
+        let full_bwd: Vec<InternalValue> = full
+            .iter(cmp.clone())
+            .rev()
+            .map(|x| x.materialize(full.as_slice()))
+            .collect();
+        let synth_bwd: Vec<InternalValue> = synth
+            .iter(cmp.clone())
+            .rev()
+            .map(|x| x.materialize(synth.as_slice()))
+            .collect();
+        assert_eq!(
+            synth_bwd, full_bwd,
+            "synth backward must equal full backward"
+        );
+
+        // Seek to arbitrary keys (including misses between keys) identical.
+        for needle in [
+            b"key-000000".to_vec(),
+            b"key-000001".to_vec(),
+            b"key-000250".to_vec(),
+            b"key-000499".to_vec(),
+            b"key-0002".to_vec(),   // prefix / between keys
+            b"key-999999".to_vec(), // past end
+        ] {
+            let mut fi = full.iter(cmp.clone());
+            fi.seek(&needle, SeqNo::MAX);
+            let f: Vec<InternalValue> = fi.map(|x| x.materialize(full.as_slice())).collect();
+
+            let mut si = synth.iter(cmp.clone());
+            si.seek(&needle, SeqNo::MAX);
+            let s: Vec<InternalValue> = si.map(|x| x.materialize(synth.as_slice())).collect();
+
+            assert_eq!(s, f, "synth seek({needle:?}) must equal full seek");
+        }
+    }
+
+    /// `partial_data_block` builds, from a compressed frame, a block covering
+    /// `[start, upper]` by decoding only the inner blocks up to `upper`. Its
+    /// range scan must equal the full block's, and it must decode strictly fewer
+    /// inner blocks for a near-start upper bound.
+    #[test]
+    fn partial_data_block_range_matches_full_and_skips_trailing() {
+        use crate::SeqNo;
+        use crate::comparator::default_comparator;
+        use crate::table::block::{Block, BlockType, Header, ParsedItem};
+
+        let (frame, ends, block_bytes) = large_block_frame();
+        let nblocks = ends.len() as u32;
+        let cmp = default_comparator();
+
+        let full = DataBlock::new(Block {
+            data: Slice::from(block_bytes),
+            header: Header::test_dummy(BlockType::Data),
+        });
+
+        // Near-start window so trailing inner blocks are skippable.
+        let lower = b"key-000000000010".to_vec();
+        let upper = b"key-000000000050".to_vec();
+
+        // Full reference: seek the range on the whole block.
+        let mut fi = full.iter(cmp.clone());
+        fi.seek(&lower, SeqNo::MAX);
+        fi.seek_upper_exclusive(&upper, SeqNo::MAX);
+        let reference: Vec<InternalValue> = fi.map(|x| x.materialize(full.as_slice())).collect();
+        assert_eq!(reference.len(), 40, "i=10..50 → 40 entries");
+
+        // Partial: build a covering block from the frame, then seek the same range.
+        let (partial, blocks) =
+            partial_data_block(frame, ends, 16, &cmp, &upper).expect("partial block");
+        assert!(
+            blocks < nblocks,
+            "near-start upper must skip trailing inner blocks: {blocks}/{nblocks}",
+        );
+        let mut pi = partial.iter(cmp.clone());
+        pi.seek(&lower, SeqNo::MAX);
+        pi.seek_upper_exclusive(&upper, SeqNo::MAX);
+        let got: Vec<InternalValue> = pi.map(|x| x.materialize(partial.as_slice())).collect();
+
+        assert_eq!(
+            got, reference,
+            "partial range scan must equal the full range scan"
+        );
+    }
+
+    /// Synthesizing over a prefix that ends mid-entry (inner-block boundaries
+    /// need not align with KV entries) must drop the truncated tail and produce
+    /// a valid block of the complete-entry prefix.
+    #[test]
+    fn synthesize_handles_truncated_prefix() {
+        use crate::comparator::default_comparator;
+        use crate::table::block::Decoder as BlockDecoder;
+        use crate::table::block::{Block, BlockType, Header, ParsedItem};
+        use crate::table::data_block::DataBlockParsedItem;
+
+        let items: Vec<InternalValue> = (0u64..300)
+            .map(|i| {
+                InternalValue::from_components(
+                    format!("key-{i:06}").into_bytes(),
+                    format!("value-{i:06}").into_bytes(),
+                    0,
+                    Value,
+                )
+            })
+            .collect();
+        let ri = 16u8;
+        let block_bytes = DataBlock::encode_into_vec(&items, ri, 0.0).expect("encode");
+        let cmp = default_comparator();
+
+        let entries_end = BlockDecoder::<InternalValue, DataBlockParsedItem>::new(&Block {
+            data: Slice::from(block_bytes.clone()),
+            header: Header::test_dummy(BlockType::Data),
+        })
+        .entries_end_for_test()
+        .expect("entries_end");
+
+        // Cut a few bytes into the last entry.
+        let prefix = &block_bytes[..entries_end - 3];
+        let synth_bytes = synthesize_block_bytes(prefix, ri).expect("synthesize truncated");
+        let synth = DataBlock::new(Block {
+            data: Slice::from(synth_bytes),
+            header: Header::test_dummy(BlockType::Data),
+        });
+
+        let got: Vec<InternalValue> = synth
+            .iter(cmp)
+            .map(|x| x.materialize(synth.as_slice()))
+            .collect();
+        assert!(!got.is_empty());
+        assert!(
+            got.len() < items.len(),
+            "truncated tail entry must be dropped"
+        );
+        assert_eq!(
+            got,
+            items[..got.len()].to_vec(),
+            "must be a clean entry prefix"
+        );
     }
 }

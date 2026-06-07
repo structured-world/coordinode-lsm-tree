@@ -378,6 +378,37 @@ impl<'a, Item: Decodable<Parsed>, Parsed: ParsedItem<Item>> Decoder<'a, Item, Pa
         }
     }
 
+    /// Forward-scan a headerless block, returning the byte offset of every
+    /// restart head, the count of complete entries, and the byte offset just
+    /// past the last complete entry. Used to synthesize a binary-index trailer
+    /// over a decoded prefix (whose tail may be a truncated entry, which this
+    /// scan stops cleanly before — see [`Self::new_forward_headerless`]).
+    pub(crate) fn scan_restart_offsets(mut self) -> (Vec<u32>, usize, usize) {
+        let mut restart_offsets = Vec::new();
+        let mut item_count = 0usize;
+        // `next()` clobbers `lo_scanner.offset` to `data.len()` when it stops on
+        // a truncated tail entry, so track the end of the last COMPLETE entry
+        // ourselves rather than reading the post-loop scanner offset.
+        let mut last_complete_end = 0usize;
+        loop {
+            let is_restart = self.lo_scanner.remaining_in_interval == 0;
+            let head = self.lo_scanner.offset;
+            if self.next().is_none() {
+                break;
+            }
+            if is_restart {
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "block offsets are far below u32::MAX"
+                )]
+                restart_offsets.push(head as u32);
+            }
+            item_count += 1;
+            last_complete_end = self.lo_scanner.offset;
+        }
+        (restart_offsets, item_count, last_complete_end)
+    }
+
     fn binary_index_bounds(&self) -> Option<(usize, usize)> {
         let step_size = match self.binary_index_step_size {
             2 | 4 => usize::from(self.binary_index_step_size),
