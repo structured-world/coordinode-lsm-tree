@@ -208,9 +208,28 @@ mod tests {
         encode_block_layouts(&mut buf, &layouts);
         let map = BlockLayoutMap::decode(&buf).expect("decode");
         assert_eq!(map.len(), 2);
-        assert_eq!(map.ends_for(0), Some([100u32, 250, 400].as_slice()));
-        assert_eq!(map.ends_for(512), Some([80u32, 160].as_slice()));
-        assert_eq!(map.ends_for(999), None, "unrecorded offset → None");
+        // `ends_for` is only compiled for the zstd partial-decode read path.
+        #[cfg(feature = "zstd")]
+        {
+            assert_eq!(map.ends_for(0), Some([100u32, 250, 400].as_slice()));
+            assert_eq!(map.ends_for(512), Some([80u32, 160].as_slice()));
+            assert_eq!(map.ends_for(999), None, "unrecorded offset → None");
+        }
+    }
+
+    #[test]
+    fn decode_rejects_inner_count_less_than_two() {
+        // A recorded block must always have >= 2 inner blocks; a hand-crafted
+        // payload with inner_count = 1 must be rejected (corruption guard).
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&1u32.to_le_bytes()); // entry_count = 1
+        buf.extend_from_slice(&0u64.to_le_bytes()); // block_offset = 0
+        buf.extend_from_slice(&1u32.to_le_bytes()); // inner_count = 1 (invalid)
+        buf.extend_from_slice(&100u32.to_le_bytes()); // one end offset
+        assert!(
+            BlockLayoutMap::decode(&buf).is_err(),
+            "inner_count < 2 must be rejected",
+        );
     }
 
     #[test]
@@ -233,6 +252,7 @@ mod tests {
         encode_block_layouts(&mut buf, &[]);
         let map = BlockLayoutMap::decode(&buf).expect("decode empty");
         assert_eq!(map.len(), 0);
+        #[cfg(feature = "zstd")]
         assert_eq!(map.ends_for(0), None);
     }
 

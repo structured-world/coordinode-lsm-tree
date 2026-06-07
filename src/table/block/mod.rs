@@ -516,7 +516,10 @@ impl Block {
         // a non-dict zstd codec that split into >= 2 inner blocks (empty
         // otherwise). Enables range-query partial decode of large cold blocks.
         // `mut` is only exercised by the zstd Data arm below.
-        #[cfg_attr(not(zstd_any), allow(unused_mut))]
+        #[cfg_attr(
+            not(zstd_any),
+            expect(unused_mut, reason = "`layout` is only mutated on zstd-enabled builds")
+        )]
         let mut layout: Vec<u32> = Vec::new();
 
         match compression {
@@ -1395,8 +1398,35 @@ impl Block {
             )));
         }
 
+        // Pre-allocation sanity cap on `handle.size()`, mirroring
+        // `from_file_with_status`: reject an absurd on-disk size before
+        // allocating the read buffer, so a corrupt handle cannot force a huge
+        // allocation. Non-encrypted path (encryption rejected above), so no
+        // encryption overhead; the ECC term uses the block's ACTUAL per-SST
+        // scheme (never a hardcoded one) and is 0 when there is no parity.
+        let max_ecc_overhead = match transform.ecc_params() {
+            Some(params) => u64::from(expected_parity_len(MAX_DECOMPRESSION_SIZE, params)),
+            None => 0,
+        };
+        let max_on_disk_size =
+            u64::from(MAX_DECOMPRESSION_SIZE) + max_ecc_overhead + Header::MAX_LEN as u64;
+        if u64::from(handle.size()) > max_on_disk_size {
+            return Err(crate::Error::DecompressedSizeTooLarge {
+                declared: u64::from(handle.size()),
+                limit: max_on_disk_size,
+            });
+        }
+
         let buf = crate::file::read_exact(file, *handle.offset(), handle.size() as usize)?;
         let parsed_header = Header::decode_from(&mut &buf[..])?;
+        // Reject a header that declares a decompressed size past the cap before
+        // the lazy decode path trusts it.
+        if parsed_header.uncompressed_length > MAX_DECOMPRESSION_SIZE {
+            return Err(crate::Error::DecompressedSizeTooLarge {
+                declared: u64::from(parsed_header.uncompressed_length),
+                limit: u64::from(MAX_DECOMPRESSION_SIZE),
+            });
+        }
         let header_len = Header::header_len(parsed_header.block_type);
 
         let has_ecc = block_has_parity(&parsed_header, transform);
@@ -1607,6 +1637,30 @@ mod tests {
             header.uncompressed_length as usize + 1,
         )?;
         assert_eq!(decompressed, data, "frame must decompress to the original");
+        Ok(())
+    }
+
+    #[cfg(feature = "zstd")]
+    #[test]
+    fn read_data_frame_rejects_oversized_handle() -> crate::Result<()> {
+        // A handle declaring an absurd on-disk size must be rejected by the
+        // pre-allocation cap before any read / allocation, mirroring
+        // `from_file_with_status`.
+        let data: Vec<u8> = (0..1_000u32).map(|i| (i % 64) as u8).collect();
+        let transform =
+            crate::table::block::BlockTransform::from_parts(CompressionType::Zstd(3), None, None)?;
+        let tmp = write_block_to_tempfile(
+            &data,
+            crate::table::block::BlockIdentity::for_test(0, 0, BlockType::Data),
+            &transform,
+        )?;
+        let oversized = BlockHandle::new(tmp.handle.offset(), u32::MAX);
+        let err = Block::read_data_frame(&tmp.file, oversized, &transform)
+            .expect_err("oversized handle must be rejected");
+        assert!(
+            matches!(err, crate::Error::DecompressedSizeTooLarge { .. }),
+            "expected DecompressedSizeTooLarge, got {err:?}",
+        );
         Ok(())
     }
 

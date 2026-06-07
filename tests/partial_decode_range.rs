@@ -180,6 +180,7 @@ fn partial_decode_reverse_ranges_match_expected() {
 
 #[test]
 fn partial_decode_empty_and_boundary_ranges() {
+    enable_partial_decode();
     let (_dir, tree) = large_zstd_block_tree();
 
     // Empty (lo == hi) and a range whose bounds fall between existing keys

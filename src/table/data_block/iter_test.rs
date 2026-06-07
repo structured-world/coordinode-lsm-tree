@@ -1773,6 +1773,8 @@ mod tests {
         /// forward sequence as a normal full decode. This is the read-side core
         /// of range-query partial decode, where the decompressed prefix of a
         /// subset of inner zstd blocks carries entries but not the trailer.
+        // `new_forward_headerless` is only compiled for the zstd partial path.
+        #[cfg(feature = "zstd")]
         #[test]
         fn headerless_forward_decode_matches_full_forward_decode() -> crate::Result<()> {
             use crate::Slice;
@@ -1836,6 +1838,7 @@ mod tests {
         /// A prefix that ends MID-ENTRY (an inner zstd block boundary need not
         /// align with a KV entry) must yield every complete entry before the cut
         /// and drop the truncated tail cleanly — no panic, no garbage entry.
+        #[cfg(feature = "zstd")]
         #[test]
         fn headerless_forward_decode_stops_cleanly_on_truncated_prefix() -> crate::Result<()> {
             use crate::Slice;

@@ -263,77 +263,68 @@ fn inner_block_layout(
     ends
 }
 
+/// Runs `f` with a thread-local [`FrameCompressor`] cached by `level` (rebuilt
+/// only on a level change). Shared by [`ZstdProvider::compress`] and
+/// `compress_with_layout` so interleaving them at the same level reuses one
+/// compressor instead of maintaining two separate thread-local caches.
+///
+/// `compress_slice_to_vec` builds a fresh `FrameCompressor` (and its matcher
+/// tables) on every call; reusing one per thread avoids that per-block
+/// reconstruction — most visible at btultra2 / L22, where the tables are large.
+/// `compress_independent_frame` still resets per-frame state and re-derives the
+/// source-size hint from `data`, so the L22 small-source parameter set is still
+/// selected for the 4-64 KiB blocks an LSM writes. Default generics keep the
+/// cached type `'static` for thread-local storage.
+fn with_tls_compressor<R>(
+    level: i32,
+    f: impl FnOnce(&mut structured_zstd::encoding::FrameCompressor) -> R,
+) -> R {
+    use structured_zstd::encoding::{CompressionLevel, FrameCompressor};
+
+    thread_local! {
+        static TLS_COMPRESSOR: std::cell::RefCell<Option<(i32, FrameCompressor)>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    TLS_COMPRESSOR.with(|cell| {
+        let mut state = cell.borrow_mut();
+        if !matches!(&*state, Some((l, _)) if *l == level) {
+            *state = Some((
+                level,
+                FrameCompressor::new(CompressionLevel::from_level(level)),
+            ));
+        }
+        let Some((_, compressor)) = state.as_mut() else {
+            unreachable!("TLS_COMPRESSOR initialised above");
+        };
+        f(compressor)
+    })
+}
+
 /// Pure Rust zstd backend.
 pub struct ZstdProvider;
 
 impl CompressionProvider for ZstdProvider {
     fn compress(data: &[u8], level: i32) -> crate::Result<Vec<u8>> {
-        use structured_zstd::encoding::{CompressionLevel, FrameCompressor};
-
-        // Thread-local compressor reused across blocks. `compress_slice_to_vec`
-        // builds a fresh `FrameCompressor` (and its matcher tables) on every
-        // call; reusing one per thread avoids that per-block reconstruction —
-        // most visible at btultra2 / L22, where the tables are large. Keyed by
-        // level so a level change rebuilds the compressor.
-        //
-        // `compress_independent_frame_into` emits a standalone frame: it resets
-        // per-frame state and re-derives the source-size hint from `data`, so
-        // the L22 small-source parameter set is still selected for the 4-64 KiB
-        // blocks an LSM writes (the ~34x win the old size-hint path delivered).
-        // Default generics (`R = &'static [u8]`, `W = Vec<u8>`) keep the cached
-        // type `'static` for thread-local storage.
-        thread_local! {
-            static TLS_COMPRESSOR: std::cell::RefCell<Option<(i32, FrameCompressor)>> =
-                const { std::cell::RefCell::new(None) };
-        }
-
-        TLS_COMPRESSOR.with(|cell| {
-            let mut state = cell.borrow_mut();
-            if !matches!(&*state, Some((l, _)) if *l == level) {
-                *state = Some((
-                    level,
-                    FrameCompressor::new(CompressionLevel::from_level(level)),
-                ));
-            }
-            let Some((_, compressor)) = state.as_mut() else {
-                unreachable!("TLS_COMPRESSOR initialised above");
-            };
-            // `compress_independent_frame` is the `FrameCompressor` CCtx-style
-            // single-frame API (structured-zstd >= 0.0.29); it allocates a fresh
-            // output Vec and emits one standalone frame.
-            Ok(compressor.compress_independent_frame(data))
-        })
+        // `compress_independent_frame` is the `FrameCompressor` CCtx-style
+        // single-frame API (structured-zstd >= 0.0.29): it allocates a fresh
+        // output Vec and emits one standalone frame.
+        Ok(with_tls_compressor(level, |compressor| {
+            compressor.compress_independent_frame(data)
+        }))
     }
 
     fn compress_with_layout(data: &[u8], level: i32) -> crate::Result<(Vec<u8>, Vec<u32>)> {
-        use structured_zstd::encoding::{CompressionLevel, FrameCompressor};
-
-        // Mirrors `compress`'s thread-local reuse, but also reads back the
-        // frame layout the encoder recorded during this emit
-        // (`last_frame_emit_info`, captured under the `lsm` feature). The
-        // layout is only meaningful when the frame split into >= 2 inner zstd
-        // blocks; for a single-block frame there is nothing to partial-decode,
-        // so an empty layout is returned and no per-block table is persisted.
-        thread_local! {
-            static TLS_COMPRESSOR: std::cell::RefCell<Option<(i32, FrameCompressor)>> =
-                const { std::cell::RefCell::new(None) };
-        }
-
-        TLS_COMPRESSOR.with(|cell| {
-            let mut state = cell.borrow_mut();
-            if !matches!(&*state, Some((l, _)) if *l == level) {
-                *state = Some((
-                    level,
-                    FrameCompressor::new(CompressionLevel::from_level(level)),
-                ));
-            }
-            let Some((_, compressor)) = state.as_mut() else {
-                unreachable!("TLS_COMPRESSOR initialised above");
-            };
+        // Mirrors `compress`, but also reads back the frame layout the encoder
+        // recorded during this emit (`last_frame_emit_info`, under the `lsm`
+        // feature). The layout is only meaningful when the frame split into
+        // >= 2 inner zstd blocks; a single-block frame returns an empty layout
+        // (nothing to partial-decode) and no per-block table is persisted.
+        Ok(with_tls_compressor(level, |compressor| {
             let frame = compressor.compress_independent_frame(data);
             let layout = inner_block_layout(compressor.last_frame_emit_info());
-            Ok((frame, layout))
-        })
+            (frame, layout)
+        }))
     }
 
     fn decompress(data: &[u8], capacity: usize) -> crate::Result<Vec<u8>> {

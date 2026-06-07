@@ -549,6 +549,49 @@ fn block_layout_section_roundtrips_for_large_zstd_blocks() {
             "cumulative ends must be strictly increasing: {ends:?}",
         );
     }
+
+    // Negative control: a default small-block (4 KiB) zstd table must NOT carry
+    // the section — each tiny block compresses into a single inner zstd block,
+    // so there is nothing to partial-decode and no layout is persisted.
+    let small_file = dir.path().join("table-small");
+    let mut small_writer = Writer::new(small_file.clone(), 0, 0, Arc::new(StdFs))
+        .unwrap()
+        .use_data_block_size(4 * 1024)
+        .use_data_block_compression(crate::CompressionType::Zstd(19));
+    for item in &items {
+        small_writer.write(item.clone()).unwrap();
+    }
+    let (_, small_checksum) = small_writer.finish().unwrap().unwrap();
+
+    #[cfg(feature = "metrics")]
+    let small_metrics = Arc::new(Metrics::default());
+    let small_table = Table::recover(
+        small_file,
+        small_checksum,
+        0,
+        0,
+        Arc::new(Cache::with_capacity_bytes(4_000_000)),
+        Some(Arc::new(DescriptorTable::new(10))),
+        Arc::new(StdFs),
+        false,
+        false,
+        None,
+        None,
+        crate::comparator::default_comparator(),
+        #[cfg(feature = "metrics")]
+        small_metrics,
+    )
+    .unwrap();
+
+    assert!(
+        small_table.regions.block_layout.is_none(),
+        "default small-block table must NOT carry a block_layout section",
+    );
+    assert_eq!(
+        small_table.block_layout.len(),
+        0,
+        "small-block table's layout map must be empty",
+    );
 }
 
 #[test]

@@ -6,18 +6,18 @@ use super::{BlockHandle, BlockOffset};
 use crate::sfa::TocEntry;
 
 /// Converts a [`crate::sfa::TocEntry`] to our [`BlockHandle`] struct.
-fn toc_entry_to_handle(entry: &TocEntry) -> BlockHandle {
-    #[expect(
-        clippy::expect_used,
-        reason = "Function is only used for regions that do not exceed >= 4 GiB"
-    )]
-    BlockHandle::new(
-        BlockOffset(entry.pos()),
-        entry
-            .len()
-            .try_into()
-            .expect("region should not exceed 4 GiB"),
-    )
+///
+/// # Errors
+///
+/// Returns [`crate::Error::InvalidHeader`] if the on-disk region length does not
+/// fit a `u32` (a region >= 4 GiB), surfacing a corrupt TOC as a typed recovery
+/// error instead of panicking during table open.
+fn toc_entry_to_handle(entry: &TocEntry) -> crate::Result<BlockHandle> {
+    let size: u32 = entry
+        .len()
+        .try_into()
+        .map_err(|_| crate::Error::InvalidHeader("Toc"))?;
+    Ok(BlockHandle::new(BlockOffset(entry.pos()), size))
 }
 
 /// The regions block stores offsets to the different table file "regions"
@@ -101,28 +101,51 @@ pub struct ParsedRegions {
 impl ParsedRegions {
     pub fn parse_from_toc(toc: &crate::sfa::Toc) -> crate::Result<Self> {
         Ok(Self {
-            filter_tli: toc.section(b"filter_tli").map(toc_entry_to_handle),
+            filter_tli: toc
+                .section(b"filter_tli")
+                .map(toc_entry_to_handle)
+                .transpose()?,
             tli: toc
                 .section(b"tli")
                 .map(toc_entry_to_handle)
+                .transpose()?
                 .ok_or_else(|| {
                     log::error!("TLI should exist");
                     crate::Error::Unrecoverable
                 })?,
-            tli_tail: toc.section(b"tli_tail").map(toc_entry_to_handle),
-            index: toc.section(b"index").map(toc_entry_to_handle),
-            filter: toc.section(b"filter").map(toc_entry_to_handle),
-            range_tombstones: toc.section(b"range_tombstones").map(toc_entry_to_handle),
-            block_layout: toc.section(b"block_layout").map(toc_entry_to_handle),
-            linked_blob_files: toc.section(b"linked_blob_files").map(toc_entry_to_handle),
+            tli_tail: toc
+                .section(b"tli_tail")
+                .map(toc_entry_to_handle)
+                .transpose()?,
+            index: toc.section(b"index").map(toc_entry_to_handle).transpose()?,
+            filter: toc
+                .section(b"filter")
+                .map(toc_entry_to_handle)
+                .transpose()?,
+            range_tombstones: toc
+                .section(b"range_tombstones")
+                .map(toc_entry_to_handle)
+                .transpose()?,
+            block_layout: toc
+                .section(b"block_layout")
+                .map(toc_entry_to_handle)
+                .transpose()?,
+            linked_blob_files: toc
+                .section(b"linked_blob_files")
+                .map(toc_entry_to_handle)
+                .transpose()?,
             metadata: toc
                 .section(b"meta")
                 .map(toc_entry_to_handle)
+                .transpose()?
                 .ok_or_else(|| {
                     log::error!("Metadata should exist");
                     crate::Error::Unrecoverable
                 })?,
-            metadata_mid: toc.section(b"meta_mid").map(toc_entry_to_handle),
+            metadata_mid: toc
+                .section(b"meta_mid")
+                .map(toc_entry_to_handle)
+                .transpose()?,
         })
     }
 }
