@@ -277,3 +277,9 @@ name = "compaction"
 harness = false
 path = "benches/compaction.rs"
 required-features = ["zstd"]
+
+[[bench]]
+name = "partial_decode"
+harness = false
+path = "benches/partial_decode.rs"
+required-features = ["zstd"]

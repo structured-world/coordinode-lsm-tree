@@ -28,7 +28,7 @@ use crate::comparator::SharedComparator;
 use crate::table::DataBlock;
 use crate::table::block::{Block, Decoder, Header, ParsedItem};
 use crate::table::data_block::DataBlockParsedItem;
-use crate::{Checksum, InternalValue, Slice};
+use crate::{Checksum, InternalValue, Slice, UserKey};
 use structured_zstd::decoding::FrameDecoder;
 
 /// A data block decoded lazily from its compressed zstd frame, inner block by
@@ -242,8 +242,10 @@ fn synthetic_header(len: usize) -> Header {
 /// compressed `frame`, decoding only the inner zstd blocks needed to reach
 /// `upper` (skipping the trailing blocks) and synthesizing a trailer so the
 /// normal seek / iterate path works. The caller's iterator then trims to the
-/// exact query bounds. Returns the block and the number of inner blocks
-/// decoded.
+/// exact query bounds. Returns the block, the number of inner blocks decoded,
+/// and the highest user key the block covers (its last complete entry's key, or
+/// `None` for an empty prefix) so callers can cache it tagged with the extent it
+/// satisfies.
 ///
 /// # Errors
 ///
@@ -255,7 +257,7 @@ pub fn partial_data_block(
     restart_interval: u8,
     comparator: &SharedComparator,
     upper: &[u8],
-) -> crate::Result<(DataBlock, u32)> {
+) -> crate::Result<(DataBlock, u32, Option<UserKey>)> {
     let mut lazy = LazyBlock::new(frame, ends)?;
     let total = lazy.total_len();
     let mut extent = 0usize;
@@ -276,13 +278,44 @@ pub fn partial_data_block(
         }
     }
 
+    let covered_upper = last_complete_key(lazy.decoded(), restart_interval);
     let bytes = synthesize_block_bytes(lazy.decoded(), restart_interval)?;
     let blocks = lazy.decoded_blocks();
     let block = DataBlock::new(Block {
         header: synthetic_header(bytes.len()),
         data: Slice::from(bytes),
     });
-    Ok((block, blocks))
+    Ok((block, blocks, covered_upper))
+}
+
+/// The user key of the last COMPLETE entry in a decoded `prefix` (a truncated
+/// tail entry is excluded, matching [`synthesize_block_bytes`]). `None` when the
+/// prefix holds no complete entry. This is the highest key the synthesized
+/// partial block covers, used to tag the cache entry's extent.
+fn last_complete_key(prefix: &[u8], restart_interval: u8) -> Option<UserKey> {
+    let probe = Block {
+        header: synthetic_header(prefix.len()),
+        data: Slice::from(prefix),
+    };
+    // Bound the scan to the complete-entry region so a truncated tail entry is
+    // not materialized (its decoded bytes would be garbage).
+    let (_offsets, _count, entries_end) =
+        Decoder::<InternalValue, DataBlockParsedItem>::new_forward_headerless(
+            &probe,
+            restart_interval,
+            prefix.len(),
+        )
+        .scan_restart_offsets();
+    // Forward-consume to the last complete entry (the decoder is forward-only
+    // here; `fold` keeps the final key without a reverse pass).
+    Decoder::<InternalValue, DataBlockParsedItem>::new_forward_headerless(
+        &probe,
+        restart_interval,
+        entries_end,
+    )
+    .fold(None, |_, item| {
+        Some(item.materialize(&probe.data).key.user_key)
+    })
 }
 
 /// Whether the decoded `prefix` contains an entry whose key is strictly greater
@@ -543,11 +576,16 @@ mod tests {
         assert_eq!(reference.len(), 40, "i=10..50 → 40 entries");
 
         // Partial: build a covering block from the frame, then seek the same range.
-        let (partial, blocks) =
+        let (partial, blocks, covered_upper) =
             partial_data_block(frame, ends, 16, &cmp, &upper).expect("partial block");
         assert!(
             blocks < nblocks,
             "near-start upper must skip trailing inner blocks: {blocks}/{nblocks}",
+        );
+        let covered = covered_upper.expect("covering block has a last key");
+        assert!(
+            cmp.compare(covered.as_ref(), &upper) != std::cmp::Ordering::Less,
+            "covered_upper ({covered:?}) must reach at least the query upper",
         );
         let mut pi = partial.iter(cmp.clone());
         pi.seek(&lower, SeqNo::MAX);

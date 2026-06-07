@@ -4,17 +4,45 @@
 
 use crate::table::block::Header;
 use crate::table::{Block, BlockOffset};
-use crate::{GlobalTableId, UserValue};
+use crate::{GlobalTableId, UserKey, UserValue};
 use quick_cache::Weighter;
 use quick_cache::sync::Cache as QuickCache;
 
 const TAG_BLOCK: u8 = 0;
 const TAG_BLOB: u8 = 1;
+const TAG_PARTIAL_BLOCK: u8 = 2;
 
 #[derive(Clone)]
 enum Item {
     Block(Block),
     Blob(UserValue),
+    /// A partial (covering) data block synthesized for the adaptive partial-tier
+    /// read path: only the inner zstd blocks up to `covered_upper` are decoded,
+    /// so a cold block keeps just the touched fraction resident. Serves any range
+    /// whose upper bound is `<= covered_upper`; a wider query grows the extent
+    /// (high-water). The access stats drive promotion to a full resident block
+    /// (see [`Cache::peek_partial_block`]).
+    PartialBlock(PartialBlockEntry),
+}
+
+/// A cached partial (covering) data block plus the access stats the partial-tier
+/// promotion heuristic reads: how much of the block is decoded and how often it
+/// has been served. When a cold block is read often enough or its decoded
+/// fraction passes the promotion threshold, the reader decodes it fully and
+/// caches the whole block instead, evicting this entry.
+#[doc(hidden)]
+#[derive(Clone)]
+pub struct PartialBlockEntry {
+    /// Synthesized standalone data block covering `[block_start, covered_upper]`.
+    pub block: Block,
+    /// Highest user key the synthesized block covers (its last complete entry).
+    pub covered_upper: UserKey,
+    /// Inner zstd blocks decoded into `block` so far.
+    pub covered_blocks: u32,
+    /// Total inner zstd blocks in the full data block.
+    pub total_blocks: u32,
+    /// Number of times this partial entry has served a read (promotion input).
+    pub hits: u32,
 }
 
 #[derive(Eq, std::hash::Hash, PartialEq)]
@@ -39,6 +67,11 @@ impl Weighter<CacheKey, Item> for BlockWeighter {
                     + u64::from(b.header.uncompressed_length)
             }
             Blob(b) => b.len() as u64,
+            Item::PartialBlock(entry) => {
+                (Header::header_len(entry.block.header.block_type) as u64)
+                    + u64::from(entry.block.header.uncompressed_length)
+                    + entry.covered_upper.len() as u64
+            }
         }
     }
 }
@@ -122,8 +155,60 @@ impl Cache {
 
         Some(match self.data.get(&key)? {
             Item::Block(block) => block,
-            Item::Blob(_) => unreachable!("invalid cache item"),
+            Item::Blob(_) | Item::PartialBlock(_) => unreachable!("invalid cache item"),
         })
+    }
+
+    /// Whether a full (non-partial) data block is already resident for `offset`.
+    /// The partial-tier reader uses this to bail out (let the normal cached path
+    /// serve) once a block has been promoted to a full resident block.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn has_block(&self, id: GlobalTableId, offset: BlockOffset) -> bool {
+        let key: CacheKey = (TAG_BLOCK, id.tree_id(), id.table_id(), *offset).into();
+        self.data.peek(&key).is_some()
+    }
+
+    /// Reads the cached partial-block entry for `offset` (block + access stats),
+    /// without mutating it. The caller checks coverage against its query, applies
+    /// the promotion heuristic, then re-inserts with bumped stats, grows the
+    /// extent, or promotes to a full block.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn peek_partial_block(
+        &self,
+        id: GlobalTableId,
+        offset: BlockOffset,
+    ) -> Option<PartialBlockEntry> {
+        let key: CacheKey = (TAG_PARTIAL_BLOCK, id.tree_id(), id.table_id(), *offset).into();
+        match self.data.peek(&key) {
+            Some(Item::PartialBlock(entry)) => Some(entry),
+            _ => None,
+        }
+    }
+
+    /// Inserts or replaces the partial-block entry for `offset` (high-water
+    /// growth: a wider covering block with more decoded inner blocks replaces a
+    /// narrower one).
+    #[doc(hidden)]
+    pub fn insert_partial_block(
+        &self,
+        id: GlobalTableId,
+        offset: BlockOffset,
+        entry: PartialBlockEntry,
+    ) {
+        self.data.insert(
+            (TAG_PARTIAL_BLOCK, id.tree_id(), id.table_id(), *offset).into(),
+            Item::PartialBlock(entry),
+        );
+    }
+
+    /// Drops the partial-block entry for `offset` (used on promotion to a full
+    /// resident block, so the stale partial does not linger).
+    #[doc(hidden)]
+    pub fn evict_partial_block(&self, id: GlobalTableId, offset: BlockOffset) {
+        let key: CacheKey = (TAG_PARTIAL_BLOCK, id.tree_id(), id.table_id(), *offset).into();
+        self.data.remove(&key);
     }
 
     #[doc(hidden)]
@@ -158,7 +243,7 @@ impl Cache {
 
         Some(match self.data.get(&key)? {
             Item::Blob(blob) => blob,
-            Item::Block(_) => unreachable!("invalid cache item"),
+            Item::Block(_) | Item::PartialBlock(_) => unreachable!("invalid cache item"),
         })
     }
 }

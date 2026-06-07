@@ -25,6 +25,50 @@ use crate::metrics::Metrics;
 
 type InnerIter<'a> = DataBlockIter<'a>;
 
+/// Whether the range-query partial-decode path is engaged (opt-in, OFF by
+/// default). Set `LSM_PARTIAL_DECODE` to `1` / `on` / `true` / `yes` to enable.
+///
+/// The path is currently a perf regression for forward range scans: decoding
+/// inner zstd block `N` drains the match window, so growing the covered extent
+/// must re-decode `[0, N)` from scratch each step. A multi-read sweep of one
+/// large cold block therefore cascades into re-decoding the whole block, which
+/// full decode + block cache does in a single pass. It flips to a win once a
+/// resumable (non-draining, window-priming) decoder lands upstream
+/// (structured-zstd#368): then a grown extent decodes only the new tail blocks,
+/// and this gate defaults ON. All machinery (block layout, lazy block, partial
+/// cache) is in place so that switch is a one-line change plus the resumable
+/// `ensure_decoded_to`.
+// no-std: feature-gate behind `std`; a no-std build has no env, default OFF.
+#[cfg(feature = "zstd")]
+fn partial_decode_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("LSM_PARTIAL_DECODE")
+            .ok()
+            .is_some_and(|v| matches!(v.trim(), "1" | "on" | "true" | "yes"))
+    })
+}
+
+/// Promote a partially-decoded cold block to a full resident block once it has
+/// been served this many times: a repeatedly-read block earns its full memory.
+#[cfg(feature = "zstd")]
+const PARTIAL_PROMOTE_HITS: u32 = 4;
+
+/// Promote once covering a query would decode at least this percentage of the
+/// block's inner zstd blocks: past this point the partial saves little memory
+/// and a single full decode beats re-growing the extent.
+#[cfg(feature = "zstd")]
+const PARTIAL_PROMOTE_FRACTION_PCT: u32 = 75;
+
+/// Whether `covered` of `total` inner blocks reaches the promotion fraction.
+/// `total == 0` never promotes (no layout → partial tier does not apply).
+#[cfg(feature = "zstd")]
+fn promote_by_fraction(covered: u32, total: u32) -> bool {
+    total > 0
+        && u64::from(covered) * 100 >= u64::from(total) * u64::from(PARTIAL_PROMOTE_FRACTION_PCT)
+}
+
 pub enum Bound {
     Included(UserKey),
     Excluded(UserKey),
@@ -220,17 +264,30 @@ impl Iter {
         self.range.1 = Some(bound);
     }
 
-    /// Try to build a partial (covering) data block for `handle` instead of
-    /// fully decoding it: decode only the inner zstd blocks up to the query's
-    /// upper bound, skipping the trailing blocks. Returns `None` (caller does a
-    /// full load) unless ALL hold: plain zstd, no encryption, the block has a
-    /// recorded multi-inner-block layout, the query has an upper bound, and that
-    /// upper bound falls within this block (for a block entirely below `upper`
-    /// the whole block is in range and a full decode is cheaper than
-    /// synthesizing one).
+    /// Adaptive partial-tier read for `handle`: keep a cold block only partially
+    /// decoded (the touched fraction) instead of materializing the whole block,
+    /// and promote it to a full resident block once access justifies the memory.
+    /// Returns `None` (caller does a full load + caches the whole block) when the
+    /// partial tier does not apply or the block should be promoted:
+    ///
+    /// - not plain zstd, encrypted, no recorded multi-inner-block layout, or no
+    ///   query upper bound (an unbounded scan reads the whole block anyway);
+    /// - the block sits entirely below `upper` (fully in range → full decode);
+    /// - the block is already resident as a full block (let the cache serve it);
+    /// - PROMOTION: the cached partial has been served [`PARTIAL_PROMOTE_HITS`]
+    ///   times, or covering the query would decode at least
+    ///   [`PARTIAL_PROMOTE_FRACTION_PCT`]% of the inner blocks — at that point a
+    ///   single full decode + block cache beats re-growing the partial extent
+    ///   (which, lacking a resumable decoder, re-decodes from inner block 0).
+    ///
+    /// Otherwise it returns a synthesized covering block and caches it with the
+    /// extent + access stats for the next read.
     #[cfg(feature = "zstd")]
     fn try_partial_block(&self, handle: &KeyedBlockHandle) -> crate::Result<Option<DataBlock>> {
-        if !matches!(self.compression, CompressionType::Zstd(_)) || self.encryption.is_some() {
+        if !partial_decode_enabled()
+            || !matches!(self.compression, CompressionType::Zstd(_))
+            || self.encryption.is_some()
+        {
             return Ok(None);
         }
         let Some(Bound::Included(upper) | Bound::Excluded(upper)) = &self.range.1 else {
@@ -242,7 +299,52 @@ impl Iter {
         let Some(ends) = self.block_layout.ends_for(*handle.offset()) else {
             return Ok(None);
         };
+        let offset = BlockOffset(*handle.offset());
+        // Already promoted to a full resident block → let the normal cached load
+        // path serve it (no point re-synthesizing a partial alongside it).
+        if self.cache.has_block(self.table_id, offset) {
+            return Ok(None);
+        }
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "inner-block count is bounded well within u32"
+        )]
+        let total_blocks = ends.len() as u32;
         let ends = ends.to_vec();
+
+        // Existing partial entry: serve from it (bumping hits) when it already
+        // covers the query, else decide whether to grow it or promote. The fall-
+        // through value is the hit count carried into the grown entry.
+        let carried_hits = match self.cache.peek_partial_block(self.table_id, offset) {
+            Some(entry) => {
+                let covered = self.comparator.compare(&entry.covered_upper, upper)
+                    != std::cmp::Ordering::Less;
+                if covered {
+                    let hits = entry.hits + 1;
+                    if hits >= PARTIAL_PROMOTE_HITS {
+                        // Hot enough: promote to a full resident block.
+                        self.cache.evict_partial_block(self.table_id, offset);
+                        return Ok(None);
+                    }
+                    let block = entry.block.clone();
+                    self.cache.insert_partial_block(
+                        self.table_id,
+                        offset,
+                        crate::cache::PartialBlockEntry { hits, ..entry },
+                    );
+                    return Ok(Some(DataBlock::new(block)));
+                }
+                // Coverage miss → would grow the extent. If most of the block is
+                // already decoded, a full decode is cheaper than re-growing (the
+                // grow re-decodes from inner block 0 without a resumable decoder).
+                if promote_by_fraction(entry.covered_blocks, total_blocks) {
+                    self.cache.evict_partial_block(self.table_id, offset);
+                    return Ok(None);
+                }
+                entry.hits
+            }
+            None => 0,
+        };
 
         let (fd, _cache_event) = self
             .file_accessor
@@ -262,13 +364,34 @@ impl Iter {
             BlockHandle::new(handle.offset(), handle.size()),
             &transform,
         )?;
-        let (block, _blocks) = crate::table::lazy_block::partial_data_block(
+        let (block, blocks, covered_upper) = crate::table::lazy_block::partial_data_block(
             frame.to_vec(),
             ends,
             self.data_block_restart_interval,
             &self.comparator,
             upper,
         )?;
+        // Covering this query already decoded most of the block → promote: throw
+        // the partial away and let the caller cache the whole block.
+        if promote_by_fraction(blocks, total_blocks) {
+            self.cache.evict_partial_block(self.table_id, offset);
+            return Ok(None);
+        }
+        // Cache the synthesized block tagged with the extent it covers + carried
+        // access stats, so the next read reuses or grows it (high-water growth).
+        if let Some(covered) = covered_upper {
+            self.cache.insert_partial_block(
+                self.table_id,
+                offset,
+                crate::cache::PartialBlockEntry {
+                    block: block.inner.clone(),
+                    covered_upper: covered,
+                    covered_blocks: blocks,
+                    total_blocks,
+                    hits: carried_hits,
+                },
+            );
+        }
         Ok(Some(block))
     }
 }
@@ -585,5 +708,37 @@ impl DoubleEndedIterator for Iter {
                 return Some(Ok(item));
             }
         }
+    }
+}
+
+#[cfg(all(test, feature = "zstd"))]
+mod promote_tests {
+    use super::promote_by_fraction;
+
+    #[test]
+    fn promote_by_fraction_triggers_at_or_above_threshold() {
+        // 75% threshold: 3 of 4 blocks == exactly 75% → promote.
+        assert!(promote_by_fraction(3, 4));
+        // 6 of 8 == 75% → promote.
+        assert!(promote_by_fraction(6, 8));
+        // Full coverage always promotes.
+        assert!(promote_by_fraction(10, 10));
+    }
+
+    #[test]
+    fn promote_by_fraction_holds_below_threshold() {
+        // 2 of 4 == 50% → keep partial.
+        assert!(!promote_by_fraction(2, 4));
+        // 1 of 8 → keep partial.
+        assert!(!promote_by_fraction(1, 8));
+        // 5 of 8 == 62.5% → keep partial.
+        assert!(!promote_by_fraction(5, 8));
+    }
+
+    #[test]
+    fn promote_by_fraction_zero_total_never_promotes() {
+        // No layout (total == 0): the partial tier does not apply, never promote.
+        assert!(!promote_by_fraction(0, 0));
+        assert!(!promote_by_fraction(5, 0));
     }
 }
