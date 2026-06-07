@@ -989,25 +989,25 @@ impl Block {
         // near-limit encrypted+ECC blocks the writer can produce.
         let enc_overhead = encryption.map_or(0u64, |e| u64::from(e.max_overhead()));
         let max_payload = u64::from(MAX_DECOMPRESSION_SIZE) + enc_overhead;
-        // ECC parity scales with the (data_shards, parity_shards) scheme, not a
-        // fixed RS(4,2). A high-overhead scheme (parity_shards > data_shards /
-        // 2, e.g. RS(2,4)) produces a larger trailer than the old `N/2 + 4`
-        // RS(4,2) approximation, so that bound would reject a legitimate
-        // near-limit block. Size the cap from the actual scheme this block is
-        // read with (`transform.ecc_params()`), keeping RS(4,2) in the running
-        // max so self-describing blocks (which carry no transform ECC but are
-        // written RS(4,2)) stay covered.
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "max_payload is MAX_DECOMPRESSION_SIZE (+ enc overhead), well below u32::MAX"
-        )]
-        let max_payload_u32 = max_payload.min(u64::from(u32::MAX)) as u32;
-        let max_ecc_overhead = [Some(EccParams::RS_4_2), transform.ecc_params()]
-            .into_iter()
-            .flatten()
-            .map(|params| u64::from(expected_parity_len(max_payload_u32, params)))
-            .max()
-            .unwrap_or(0);
+        // Pre-allocation sanity cap on `handle.size()`: reject an absurd on-disk
+        // size before allocating the read buffer. The ECC-OFF path adds NO ECC
+        // term and runs NO ECC math — when there is no parity, the cap is just
+        // payload + header. When ECC is on, the cap allows the block's ACTUAL
+        // scheme parity (from the per-SST descriptor carried by `transform`),
+        // never a hardcoded scheme. Self-describing blocks (Meta / Manifest)
+        // carry their own small RS parity but are orders of magnitude below
+        // `max_payload`, so they pass this cap without an explicit ECC term.
+        let max_ecc_overhead = match transform.ecc_params() {
+            Some(params) => {
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "max_payload is MAX_DECOMPRESSION_SIZE (+ enc overhead), well below u32::MAX"
+                )]
+                let max_payload_u32 = max_payload.min(u64::from(u32::MAX)) as u32;
+                u64::from(expected_parity_len(max_payload_u32, params))
+            }
+            None => 0,
+        };
         let max_on_disk_size = max_payload + max_ecc_overhead + Header::MAX_LEN as u64;
 
         if u64::from(handle.size()) > max_on_disk_size {
