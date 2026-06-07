@@ -281,3 +281,69 @@ fn tree_update_runtime_config_rejects_page_ecc_without_feature() {
         "rejected update must not mutate the live runtime config"
     );
 }
+
+/// A runtime `ecc_scheme` change must be picked up by the flush writer,
+/// not pinned to the startup snapshot.
+///
+/// A plain round-trip read can't catch this: the writer and the on-disk
+/// descriptor are always self-consistent, so reads succeed whichever
+/// scheme was used. The bug (writer reading the startup config instead of
+/// the live snapshot) only shows up by asserting the scheme actually
+/// recorded in the SST. Open with RS(4,2), switch to RS(8,2) at runtime,
+/// flush, and assert the new SST records (8,2).
+#[cfg(feature = "page_ecc")]
+#[test]
+fn ecc_scheme_runtime_change_is_written_to_new_ssts() -> lsm_tree::Result<()> {
+    use lsm_tree::runtime_config::EccScheme;
+
+    let folder = get_tmp_folder();
+    let any = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .page_ecc(true)
+    .ecc_scheme(EccScheme::ReedSolomon {
+        data_shards: 4,
+        parity_shards: 2,
+    })
+    .open()?;
+    let tree = match any {
+        AnyTree::Standard(t) => t,
+        AnyTree::Blob(_) => panic!("expected Standard tree, got Blob"),
+    };
+
+    tree.update_runtime_config(|cfg| {
+        cfg.ecc_scheme = EccScheme::ReedSolomon {
+            data_shards: 8,
+            parity_shards: 2,
+        };
+    })?;
+
+    for i in 0..200u64 {
+        tree.insert(format!("k{i:05}"), format!("v{i:05}"), i);
+    }
+    tree.flush_active_memtable(0)?;
+
+    let schemes: Vec<(u8, u8)> = tree
+        .current_version()
+        .iter_tables()
+        .filter_map(|t| t.metadata.ecc_params)
+        .map(|p| (p.data_shards(), p.parity_shards()))
+        .collect();
+
+    assert!(
+        !schemes.is_empty(),
+        "flush must produce at least one ECC-bearing SST"
+    );
+    for s in &schemes {
+        assert_eq!(
+            *s,
+            (8, 2),
+            "the flushed SST must record the live runtime ecc_scheme (8,2), \
+             not the startup scheme (4,2)"
+        );
+    }
+
+    Ok(())
+}
