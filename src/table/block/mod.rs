@@ -1367,6 +1367,89 @@ impl Block {
 
         Ok((Self { header, data }, ecc_status))
     }
+
+    /// Reads a data block's verified COMPRESSED payload (the zstd frame) WITHOUT
+    /// decompressing it, for partial / lazy decode. Returns the header and the
+    /// compressed-frame bytes (checksum-verified; ECC-recovered if a recognized
+    /// parity trailer is present).
+    ///
+    /// Non-encrypted blocks only — the caller must ensure
+    /// `transform.encryption().is_none()` (an encrypted block's plaintext frame
+    /// is only available after a whole-block decrypt, which defeats the lazy
+    /// path). Mirrors the non-encrypted read+verify of
+    /// [`Self::from_file_with_status`], stopping before decompression.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on a framing / checksum failure (unrecoverable), or if
+    /// called for an encrypted transform.
+    #[cfg(feature = "zstd")]
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "consumed by the range-iterator partial path (next step)"
+        )
+    )]
+    pub(crate) fn read_data_frame(
+        file: &dyn FsFile,
+        handle: BlockHandle,
+        transform: &BlockTransform<'_>,
+    ) -> crate::Result<(Header, Slice)> {
+        if transform.encryption().is_some() {
+            return Err(crate::Error::Io(std::io::Error::other(
+                "read_data_frame: encrypted blocks are not supported on the lazy path",
+            )));
+        }
+
+        let buf = crate::file::read_exact(file, *handle.offset(), handle.size() as usize)?;
+        let parsed_header = Header::decode_from(&mut &buf[..])?;
+        let header_len = Header::header_len(parsed_header.block_type);
+
+        let has_ecc = block_has_parity(&parsed_header, transform);
+        let ecc_length = if has_ecc {
+            expected_parity_len(
+                parsed_header.data_length,
+                block_ecc_params(&parsed_header, transform),
+            )
+        } else {
+            0
+        };
+
+        let actual_payload_plus_ecc = buf.len().saturating_sub(header_len);
+        let actual_data_len = parsed_header.data_length as usize;
+        let _ecc_status = classify_block_trailer(
+            has_ecc,
+            actual_payload_plus_ecc,
+            actual_data_len,
+            ecc_length,
+            &handle,
+        )?;
+
+        let payload: Slice = if ecc_length == 0 {
+            #[expect(
+                clippy::indexing_slicing,
+                reason = "actual_data_len <= post-header len, checked via classify_block_trailer"
+            )]
+            let checksum = Checksum::from_raw(crate::hash::hash128(
+                &buf[header_len..header_len + actual_data_len],
+            ));
+            checksum.check(parsed_header.checksum)?;
+            buf.slice(header_len..header_len + actual_data_len)
+        } else {
+            #[expect(clippy::indexing_slicing, reason = "header was decoded from buf")]
+            let mut cursor = std::io::Cursor::new(&buf[header_len..]);
+            Slice::from(Self::read_payload_and_verify(
+                &mut cursor,
+                parsed_header.data_length,
+                ecc_length,
+                parsed_header.checksum,
+                block_ecc_params(&parsed_header, transform),
+            )?)
+        };
+
+        Ok((parsed_header, payload))
+    }
 }
 
 #[cfg(test)]
@@ -1500,6 +1583,37 @@ mod tests {
             )?,
         )?;
         assert_eq!(data, &*block.data);
+        Ok(())
+    }
+
+    #[cfg(feature = "zstd")]
+    #[test]
+    fn read_data_frame_returns_decompressible_zstd_frame() -> crate::Result<()> {
+        // Repetitive payload so zstd produces a real (smaller) compressed frame.
+        let data: Vec<u8> = (0..40_000u32).map(|i| (i % 64) as u8).collect();
+        let transform =
+            crate::table::block::BlockTransform::from_parts(CompressionType::Zstd(3), None, None)?;
+        let tmp = write_block_to_tempfile(
+            &data,
+            crate::table::block::BlockIdentity::for_test(0, 0, BlockType::Data),
+            &transform,
+        )?;
+
+        let (header, frame) = Block::read_data_frame(&tmp.file, tmp.handle, &transform)?;
+        // The returned bytes are the COMPRESSED frame: it must be smaller than
+        // the payload and must decompress back to the original (proving
+        // read_data_frame skipped decode yet returned a valid frame).
+        assert!(
+            frame.len() < data.len(),
+            "frame must be compressed (got {} for {} bytes)",
+            frame.len(),
+            data.len(),
+        );
+        let decompressed = crate::compression::ZstdBackend::decompress(
+            &frame,
+            header.uncompressed_length as usize + 1,
+        )?;
+        assert_eq!(decompressed, data, "frame must decompress to the original");
         Ok(())
     }
 
