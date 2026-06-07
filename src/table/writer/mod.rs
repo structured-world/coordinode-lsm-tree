@@ -509,6 +509,12 @@ impl Writer {
     /// in that build and the flag is dead.
     #[must_use]
     pub fn use_ecc(mut self, ecc: Option<crate::table::block::EccParams>) -> Self {
+        // The ECC scheme is recorded once per-SST in the final descriptor,
+        // so every block in the table must be written under the same layout.
+        // Toggling it mid-write would stamp blocks with mixed layouts under a
+        // single descriptor; enforce the "configure before first key" contract
+        // (shard counts are already non-zero by `EccParams` construction).
+        self.assert_not_started("page ecc");
         self.ecc = ecc;
         self.index_writer = self.index_writer.use_ecc(ecc);
         self.filter_writer = self.filter_writer.use_ecc(ecc);
