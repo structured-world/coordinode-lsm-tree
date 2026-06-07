@@ -877,9 +877,25 @@ impl Block {
         // near-limit encrypted+ECC blocks the writer can produce.
         let enc_overhead = encryption.map_or(0u64, |e| u64::from(e.max_overhead()));
         let max_payload = u64::from(MAX_DECOMPRESSION_SIZE) + enc_overhead;
-        // parity_len(N) ≤ N/2 + 4; saturating_add covers overflow at
-        // the u64 boundary (defensive — max_payload is well below u32).
-        let max_ecc_overhead = (max_payload / 2).saturating_add(4);
+        // ECC parity scales with the (data_shards, parity_shards) scheme, not a
+        // fixed RS(4,2). A high-overhead scheme (parity_shards > data_shards /
+        // 2, e.g. RS(2,4)) produces a larger trailer than the old `N/2 + 4`
+        // RS(4,2) approximation, so that bound would reject a legitimate
+        // near-limit block. Size the cap from the actual scheme this block is
+        // read with (`transform.ecc_params()`), keeping RS(4,2) in the running
+        // max so self-describing blocks (which carry no transform ECC but are
+        // written RS(4,2)) stay covered.
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "max_payload is MAX_DECOMPRESSION_SIZE (+ enc overhead), well below u32::MAX"
+        )]
+        let max_payload_u32 = max_payload.min(u64::from(u32::MAX)) as u32;
+        let max_ecc_overhead = [Some(EccParams::RS_4_2), transform.ecc_params()]
+            .into_iter()
+            .flatten()
+            .map(|params| u64::from(expected_parity_len(max_payload_u32, params)))
+            .max()
+            .unwrap_or(0);
         let max_on_disk_size = max_payload + max_ecc_overhead + Header::MAX_LEN as u64;
 
         if u64::from(handle.size()) > max_on_disk_size {
