@@ -53,15 +53,15 @@ use alloc::vec::Vec;
 /// independent storage formats that may diverge in the future.
 const MAX_DECOMPRESSION_SIZE: u32 = 256 * 1024 * 1024;
 
-/// Exact Reed-Solomon parity trailer size for a given data length
-/// under the (4, 2) scheme.
+/// Exact parity trailer size for a given data length under the supplied
+/// shard scheme `params` (`data_shards`, `parity_shards`).
 ///
-/// `parity_len(N) = shard_bytes(N) * 2` where
-/// `shard_bytes(N) = ceil(N / 4) rounded up to the nearest even`.
+/// `parity_len(N) = shard_bytes(N) * parity_shards` where
+/// `shard_bytes(N) = ceil(N / data_shards) rounded up to the nearest even`.
 /// Mirrors `crate::ecc::parity_len` byte-for-byte but is available
 /// without the `page_ecc` cargo feature — the parity trailer length is
 /// NOT stored in the block header; the read path derives it from
-/// `data_length` with this function whenever a block's `ECC_PARITY`
+/// `data_length` and the per-SST scheme whenever a block's `ECC_PARITY`
 /// flag is set, so writer and reader always agree on the trailer size
 /// without a per-block length field to corrupt or forge.
 ///

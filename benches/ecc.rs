@@ -100,12 +100,13 @@ fn bench_try_recover_all_subsets_fail(c: &mut Criterion) {
         let parity =
             encode_parity(&payload, RS_DATA_SHARDS, RS_PARITY_SHARDS).expect("parity encodes");
 
-        // Flip enough bytes that recovery genuinely can't reconstruct
-        // a matching payload — corrupt 3 data shards (more than the
-        // (4, 2) scheme can recover).
-        let sb = (size.div_ceil(4) + 1) & !1usize; // shard_bytes
+        // Flip enough bytes that recovery genuinely can't reconstruct a
+        // matching payload — corrupt one more shard than the scheme can
+        // recover. Derived from the scheme constants so this keeps targeting
+        // distinct unrecoverable shards if the layout changes.
+        let sb = (size.div_ceil(RS_DATA_SHARDS) + 1) & !1usize; // shard_bytes
         let mut corrupt = payload.clone();
-        for i in 0..3 {
+        for i in 0..(RS_PARITY_SHARDS + 1) {
             let offset = i * sb;
             if offset < corrupt.len() {
                 corrupt[offset] ^= 0xFF;

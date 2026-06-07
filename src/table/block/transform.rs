@@ -309,11 +309,12 @@ pub enum BlockTransform<'a> {
     CompressedAndEncrypted(CompressionContext<'a>, &'a dyn EncryptionProvider),
 
     /// `raw → checksum → ecc parity → disk`. Same as [`Self::Plain`]
-    /// but emits a Reed-Solomon (4, 2) parity trailer after the
-    /// on-disk payload. The header's `ECC_PARITY` flag marks the
-    /// trailer's presence (its length is derived from `data_length`),
-    /// so the reader can verify-and-recover from a single data-shard
-    /// loss without a separate sidecar.
+    /// but emits a parity trailer after the on-disk payload under the
+    /// shard scheme carried in its [`EccParams`] (data + parity shard
+    /// counts). The header's `ECC_PARITY` flag marks the trailer's
+    /// presence (its length is derived from `data_length` + the scheme),
+    /// so the reader can verify-and-recover up to `parity_shards` lost
+    /// shards without a separate sidecar.
     #[cfg(feature = "page_ecc")]
     PlainEcc(EccParams),
 
@@ -458,10 +459,9 @@ impl BlockTransform<'_> {
     ///
     /// ```text
     /// let transform = BlockTransform::from_parts(...)?;
-    /// let transform = if config.page_ecc {
-    ///     transform.with_ecc()
-    /// } else {
-    ///     transform
+    /// let transform = match ecc_params {
+    ///     Some(params) => transform.with_ecc(params),
+    ///     None => transform,
     /// };
     /// ```
     ///
@@ -568,8 +568,7 @@ impl<'a> BlockTransform<'a> {
 }
 
 #[cfg(test)]
-#[allow(
-    clippy::unwrap_used,
+#[expect(
     clippy::expect_used,
     reason = "tests panic on the unhappy paths to surface failures loudly"
 )]
@@ -633,21 +632,21 @@ mod tests {
     #[cfg(feature = "page_ecc")]
     #[test]
     fn with_ecc_upgrades_plain_to_plain_ecc() {
-        let p = EccParams::try_new(8, 2).unwrap();
+        let p = EccParams::try_new(8, 2).expect("valid shards");
         let t = BlockTransform::Plain.with_ecc(p);
         assert!(matches!(t, BlockTransform::PlainEcc(_)));
         assert_eq!(t.ecc_params(), Some(p));
         assert_eq!(t.compression(), CompressionType::None);
         assert!(t.encryption().is_none());
         // Re-stamping an already-Ecc variant replaces the params.
-        let p2 = EccParams::try_new(4, 2).unwrap();
+        let p2 = EccParams::try_new(4, 2).expect("valid shards");
         assert_eq!(t.with_ecc(p2).ecc_params(), Some(p2));
     }
 
     #[cfg(all(feature = "page_ecc", feature = "encryption"))]
     #[test]
     fn with_ecc_upgrades_encrypted_variants() {
-        let p = EccParams::try_new(8, 2).unwrap();
+        let p = EccParams::try_new(8, 2).expect("valid shards");
         let enc = crate::encryption::Aes256GcmProvider::new(&[0x11; 32]);
 
         let t = BlockTransform::Encrypted(&enc).with_ecc(p);

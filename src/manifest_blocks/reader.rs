@@ -1131,7 +1131,7 @@ mod tests {
     /// the `PlainEcc` arm of both the writer's and reader's transform matrix.
     #[cfg(feature = "page_ecc")]
     #[test]
-    fn reader_reads_section_with_manifest_ecc() {
+    fn reader_reads_section_when_manifest_ecc_enabled_returns_verbatim_bytes() {
         let fs = fresh_fs();
         let path = Path::new("/m/ecc_plain");
         let runtime = RuntimeConfig {
@@ -1155,7 +1155,7 @@ mod tests {
     /// writer's and reader's transform matrix.
     #[cfg(all(feature = "page_ecc", feature = "encryption"))]
     #[test]
-    fn reader_reads_encrypted_section_with_manifest_ecc() {
+    fn reader_reads_encrypted_section_when_manifest_ecc_enabled_returns_verbatim_bytes() {
         use crate::encryption::{Aes256GcmProvider, EncryptionProvider};
 
         let fs = fresh_fs();
