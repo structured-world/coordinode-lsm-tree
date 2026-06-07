@@ -339,6 +339,15 @@ impl ParsedMeta {
                 .point_read(b"descriptor#page_ecc", SeqNo::MAX, &cmp)?
                 .ok_or(crate::Error::InvalidHeader("TableMeta"))?;
             use crate::runtime_config::{EccDescriptor, EccGranularity};
+            // Three-state ECC contract: a recognized + applicable scheme
+            // (`Xor`/`ReedSolomon`, block granularity, valid shards) yields the
+            // recovery params. Anything else that still decodes — an
+            // unimplemented scheme (`Secded`), page granularity, an unknown
+            // kind, or a non-canonical descriptor — is NOT a hard error: it
+            // resolves to "no recovery scheme" (`None`). The per-block read
+            // then frames the payload by `data_length`, verifies it by
+            // checksum, and reports `EccStatus::Unrecognized` (a WARN +
+            // recompaction hint) instead of failing the read.
             let params = match crate::runtime_config::ecc_descriptor_from_bytes(&v.value)? {
                 EccDescriptor::Off => None,
                 EccDescriptor::Recognized(scheme, EccGranularity::Block) => scheme
@@ -351,13 +360,8 @@ impl ParsedMeta {
                         crate::table::block::EccParams::try_new(d as u8, p as u8)
                     })
                     .transpose()?,
-                // Page granularity and any unrecognized descriptor are rejected
-                // here today; the three-state soft-fail (warn + recompaction
-                // hint) lands in a follow-up step.
                 EccDescriptor::Recognized(_, EccGranularity::Page)
-                | EccDescriptor::Unrecognized => {
-                    return Err(crate::Error::InvalidTrailer);
-                }
+                | EccDescriptor::Unrecognized => None,
             };
             (params.is_some(), params)
         };
@@ -775,26 +779,34 @@ mod tests {
         );
     }
 
-    /// A descriptor recording page-granular ECC must be rejected, not
-    /// silently read as whole-block ECC. Only block granularity is wired
-    /// today; coercing a `Page` descriptor to `Block` would size and
-    /// recover the parity trailer with the wrong layout instead of failing
-    /// closed.
+    /// An unsupported-but-decodable ECC descriptor (page granularity, the
+    /// unimplemented `Secded` scheme) does NOT fail meta load: it resolves to
+    /// "no recovery scheme" (`ecc_params == None`). The per-block read then
+    /// frames the payload by `data_length` and reports `EccStatus::Unrecognized`
+    /// (a WARN) rather than failing the read. This is the three-state contract:
+    /// unrecognized ECC is a typing warning, not corruption.
     #[test]
-    fn load_with_handle_page_granularity_descriptor_returns_err() {
-        let mut items = valid_meta_items();
-        if let Some(item) = items
-            .iter_mut()
-            .find(|iv| &*iv.key.user_key == b"descriptor#page_ecc")
-        {
-            // kind 3 = ReedSolomon, data 8, parity 2, granularity 1 = Page.
-            *item = meta("descriptor#page_ecc", &[3u8, 8, 2, 1]);
+    fn load_with_handle_unsupported_ecc_descriptor_parses_without_recovery_scheme() {
+        for descriptor in [
+            [3u8, 8, 2, 1], // ReedSolomon(8,2) with page granularity
+            [1u8, 0, 0, 0], // Secded, block granularity (unimplemented)
+            [9u8, 0, 0, 0], // unknown kind
+            [0u8, 8, 2, 1], // non-canonical "off" with junk reserved bytes
+        ] {
+            let mut items = valid_meta_items();
+            if let Some(item) = items
+                .iter_mut()
+                .find(|iv| &*iv.key.user_key == b"descriptor#page_ecc")
+            {
+                *item = meta("descriptor#page_ecc", &descriptor);
+            }
+            let parsed = load_meta_from_items(&items)
+                .unwrap_or_else(|e| panic!("descriptor {descriptor:?} must parse, got {e:?}"));
+            assert_eq!(
+                parsed.ecc_params, None,
+                "unsupported descriptor {descriptor:?} must yield no recovery scheme",
+            );
         }
-        let result = load_meta_from_items(&items);
-        assert!(
-            result.is_err(),
-            "page-granular ECC descriptor must be rejected, got {result:?}",
-        );
     }
 
     /// Missing `descriptor#page_ecc` must return `Err(InvalidHeader)`, not

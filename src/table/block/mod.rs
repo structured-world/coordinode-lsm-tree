@@ -181,6 +181,31 @@ impl PreparedBlock<'_> {
 /// A block on disk
 ///
 /// Consists of a fixed-size header and some bytes (the data/payload).
+/// Outcome of the ECC check performed while reading a block, distinct from
+/// success / failure of the read itself.
+///
+/// A read returns `Err` only on real payload corruption (checksum mismatch
+/// with no available recovery). When the read *succeeds*, this reports
+/// whether the block's ECC was usable:
+///
+/// - [`Self::Ok`] — ECC absent, or a recognized scheme that verified (and
+///   recovered, if needed).
+/// - [`Self::Unrecognized`] — the block carries an ECC trailer this build
+///   cannot interpret (an unimplemented or non-canonical scheme: Secded,
+///   page granularity, unknown kind, …). The payload was returned (its
+///   checksum passed), but ECC recovery is unavailable for this block;
+///   recompaction re-stamps it with a supported scheme. A "typing" warning,
+///   not a read failure.
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, Default)]
+pub enum EccStatus {
+    /// ECC absent or a recognized scheme verified normally.
+    #[default]
+    Ok,
+    /// ECC trailer present but its scheme is unrecognized / unusable; the
+    /// payload still verified by its checksum. Recommend recompaction.
+    Unrecognized,
+}
+
 #[derive(Clone)]
 pub struct Block {
     pub header: Header,
@@ -848,12 +873,33 @@ impl Block {
         clippy::too_many_lines,
         reason = "encrypt/no-encrypt branches duplicate compression match — see from_reader"
     )]
+    /// Reads a block from a file, discarding the ECC status (warnings are
+    /// still logged). Convenience wrapper over [`Self::from_file_with_status`]
+    /// for the many call sites that don't act on the status.
     pub fn from_file(
         file: &dyn FsFile,
         handle: BlockHandle,
         identity: BlockIdentity,
         transform: &BlockTransform<'_>,
     ) -> crate::Result<Self> {
+        let (block, _status) = Self::from_file_with_status(file, handle, identity, transform)?;
+        Ok(block)
+    }
+
+    /// Reads a block from a file and reports its [`EccStatus`].
+    ///
+    /// Returns `Err` only on real payload corruption (checksum mismatch with
+    /// no recovery available). On success, the [`EccStatus`] distinguishes a
+    /// clean read ([`EccStatus::Ok`]) from one where the block carried an ECC
+    /// trailer this build could not interpret ([`EccStatus::Unrecognized`] —
+    /// the payload still verified by its checksum; recompaction re-stamps it
+    /// with a supported scheme). A WARN is also logged in the latter case.
+    pub fn from_file_with_status(
+        file: &dyn FsFile,
+        handle: BlockHandle,
+        identity: BlockIdentity,
+        transform: &BlockTransform<'_>,
+    ) -> crate::Result<(Self, EccStatus)> {
         let compression = transform.compression();
         let encryption = transform.encryption();
         #[cfg(zstd_any)]
@@ -911,7 +957,7 @@ impl Block {
         // No intermediate Slice, no overlap of encrypted + decrypted buffers.
         // When no encryption, read into a Slice (zero-copy on the
         // None-compression path).
-        let (header, data) = if let Some(enc) = encryption {
+        let (header, data, ecc_status) = if let Some(enc) = encryption {
             let block_size = handle.size() as usize;
 
             // Pre-decode lower bound: every header is at least MIN_LEN; the
@@ -958,12 +1004,32 @@ impl Block {
             };
 
             let actual_payload_plus_ecc = block_size.saturating_sub(header_len);
-            let expected_payload_plus_ecc =
-                parsed_header.data_length as usize + ecc_length as usize;
-            if expected_payload_plus_ecc != actual_payload_plus_ecc {
-                return Err(crate::Error::InvalidHeader("Block"));
-            }
             let actual_data_len = parsed_header.data_length as usize;
+            // Classify the trailer (bytes after the payload). `ecc_length` is
+            // non-zero only for a recognized scheme — then the trailer must
+            // match it exactly (a wrong length is corruption). With no
+            // recognized scheme, any extra bytes are an ECC trailer this build
+            // can't interpret: the payload is still framed by `data_length` and
+            // verified by its checksum, so it reads (WARN), but recovery is
+            // unavailable. A short read (payload doesn't fit) is corruption.
+            let trailer = actual_payload_plus_ecc
+                .checked_sub(actual_data_len)
+                .ok_or(crate::Error::InvalidHeader("Block"))?;
+            let ecc_status = if ecc_length != 0 {
+                if trailer != ecc_length as usize {
+                    return Err(crate::Error::InvalidHeader("Block"));
+                }
+                EccStatus::Ok
+            } else if trailer == 0 {
+                EccStatus::Ok
+            } else {
+                log::warn!(
+                    "block {handle:?} carries an unrecognized ECC trailer \
+                     ({trailer} B); payload verified by checksum but recovery is \
+                     unavailable — recompact to re-stamp with a supported scheme",
+                );
+                EccStatus::Unrecognized
+            };
 
             // Payload-length safety cap. Mirrors the `from_reader`
             // check (see `Block::from_reader` above): the on-disk
@@ -988,13 +1054,20 @@ impl Block {
                 });
             }
 
-            // ECC fast path: no parity trailer → existing in-buffer
-            // checksum check + decrypt_vec. With parity, run the
-            // shared helper against a cursor over the post-header
-            // bytes so recovery is available on mismatch.
+            // ECC fast path: no recognized parity trailer → in-buffer
+            // checksum check + decrypt_vec. The checksum covers exactly the
+            // `data_length` payload bytes (NOT any trailing bytes), so an
+            // unrecognized opaque trailer is excluded and discarded. With a
+            // recognized scheme, run the shared helper against a cursor over
+            // the post-header bytes so recovery is available on mismatch.
             let buf = if ecc_length == 0 {
-                #[expect(clippy::indexing_slicing, reason = "header was decoded from buf")]
-                let checksum = Checksum::from_raw(crate::hash::hash128(&buf[header_len..]));
+                #[expect(
+                    clippy::indexing_slicing,
+                    reason = "actual_data_len <= post-header len"
+                )]
+                let checksum = Checksum::from_raw(crate::hash::hash128(
+                    &buf[header_len..header_len + actual_data_len],
+                ));
                 checksum.check(parsed_header.checksum).inspect_err(|_| {
                     log::error!(
                         "Checksum mismatch for block {handle:?}, got={}, expected={}",
@@ -1002,8 +1075,8 @@ impl Block {
                         parsed_header.checksum,
                     );
                 })?;
-                // Strip header prefix so buf contains only the payload.
-                buf.copy_within(header_len.., 0);
+                // Strip header prefix + any opaque trailer so buf is the payload.
+                buf.copy_within(header_len..header_len + actual_data_len, 0);
                 buf.truncate(actual_data_len);
                 buf
             } else {
@@ -1092,7 +1165,7 @@ impl Block {
                 }
             };
 
-            (parsed_header, data)
+            (parsed_header, data, ecc_status)
         } else {
             // Single I/O read — header + payload in one Slice.
             let buf = crate::file::read_exact(file, *handle.offset(), handle.size() as usize)?;
@@ -1115,11 +1188,29 @@ impl Block {
             };
 
             let actual_payload_plus_ecc = buf.len().saturating_sub(header_len);
-            let expected_payload_plus_ecc =
-                parsed_header.data_length as usize + ecc_length as usize;
-            if expected_payload_plus_ecc != actual_payload_plus_ecc {
-                return Err(crate::Error::InvalidHeader("Block"));
-            }
+            let actual_data_len = parsed_header.data_length as usize;
+            // Trailer classification (see the encrypted branch above for the
+            // full rationale): recognized scheme → exact trailer length;
+            // no recognized scheme + extra bytes → unrecognized opaque trailer
+            // (WARN, framed by data_length, no recovery); short read → corrupt.
+            let trailer = actual_payload_plus_ecc
+                .checked_sub(actual_data_len)
+                .ok_or(crate::Error::InvalidHeader("Block"))?;
+            let ecc_status = if ecc_length != 0 {
+                if trailer != ecc_length as usize {
+                    return Err(crate::Error::InvalidHeader("Block"));
+                }
+                EccStatus::Ok
+            } else if trailer == 0 {
+                EccStatus::Ok
+            } else {
+                log::warn!(
+                    "block {handle:?} carries an unrecognized ECC trailer \
+                     ({trailer} B); payload verified by checksum but recovery is \
+                     unavailable — recompact to re-stamp with a supported scheme",
+                );
+                EccStatus::Unrecognized
+            };
 
             if parsed_header.uncompressed_length > MAX_DECOMPRESSION_SIZE {
                 return Err(crate::Error::DecompressedSizeTooLarge {
@@ -1128,12 +1219,18 @@ impl Block {
                 });
             }
 
-            // Zero-copy fast path for non-ECC blocks; ECC blocks go
-            // through the recovery-capable helper (which copies the
-            // verified bytes out of `buf`).
+            // Zero-copy fast path for non-recovery blocks (Off or unrecognized
+            // opaque trailer); recognized-ECC blocks go through the
+            // recovery-capable helper. The checksum covers exactly the
+            // `data_length` payload bytes, so an opaque trailer is excluded.
             let payload_slice: Slice = if ecc_length == 0 {
-                #[expect(clippy::indexing_slicing, reason = "header was decoded from buf")]
-                let checksum = Checksum::from_raw(crate::hash::hash128(&buf[header_len..]));
+                #[expect(
+                    clippy::indexing_slicing,
+                    reason = "actual_data_len <= post-header len"
+                )]
+                let checksum = Checksum::from_raw(crate::hash::hash128(
+                    &buf[header_len..header_len + actual_data_len],
+                ));
                 checksum.check(parsed_header.checksum).inspect_err(|_| {
                     log::error!(
                         "Checksum mismatch for block {handle:?}, got={}, expected={}",
@@ -1141,7 +1238,7 @@ impl Block {
                         parsed_header.checksum,
                     );
                 })?;
-                buf.slice(header_len..)
+                buf.slice(header_len..header_len + actual_data_len)
             } else {
                 #[expect(clippy::indexing_slicing, reason = "header was decoded from buf")]
                 let mut cursor = std::io::Cursor::new(&buf[header_len..]);
@@ -1233,10 +1330,10 @@ impl Block {
                 }
             };
 
-            (parsed_header, data)
+            (parsed_header, data, ecc_status)
         };
 
-        Ok(Self { header, data })
+        Ok((Self { header, data }, ecc_status))
     }
 }
 
@@ -3059,6 +3156,48 @@ mod tests {
                 &BlockTransform::PlainEcc(EccParams::RS_4_2),
             )?;
             assert_eq!(&*block.data, PAYLOAD);
+            Ok(())
+        }
+
+        /// Three-state read contract: a block written WITH a parity trailer,
+        /// read back by a reader that does NOT recognize the scheme (a `Plain`
+        /// transform — as happens when the per-SST descriptor decodes to an
+        /// unsupported scheme), must still return the payload (framed by
+        /// `data_length`, checksum-verified) and report
+        /// `EccStatus::Unrecognized` — a soft warning, not a read error. Read
+        /// with the matching scheme, it reports `EccStatus::Ok`.
+        #[test]
+        fn from_file_with_status_soft_warns_on_unrecognized_trailer() -> crate::Result<()> {
+            let tmp = super::write_block_to_tempfile(
+                PAYLOAD,
+                BlockIdentity::for_test(0, 0, BlockType::Data),
+                &BlockTransform::PlainEcc(EccParams::RS_4_2),
+            )?;
+
+            // Reader recognizes the scheme → clean read.
+            let (block, status) = Block::from_file_with_status(
+                &tmp.file,
+                tmp.handle,
+                BlockIdentity::for_test(0, 0, BlockType::Data),
+                &BlockTransform::PlainEcc(EccParams::RS_4_2),
+            )?;
+            assert_eq!(&*block.data, PAYLOAD);
+            assert_eq!(status, EccStatus::Ok);
+
+            // Reader does NOT recognize the trailer (Plain transform): the
+            // opaque trailer is excluded from the payload, the checksum still
+            // verifies, and the status is a warning rather than an error.
+            let (block, status) = Block::from_file_with_status(
+                &tmp.file,
+                tmp.handle,
+                BlockIdentity::for_test(0, 0, BlockType::Data),
+                &BlockTransform::PLAIN,
+            )?;
+            assert_eq!(
+                &*block.data, PAYLOAD,
+                "payload reads despite unknown trailer"
+            );
+            assert_eq!(status, EccStatus::Unrecognized);
             Ok(())
         }
 
