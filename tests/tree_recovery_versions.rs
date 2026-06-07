@@ -420,6 +420,58 @@ fn tree_page_ecc_nondefault_scheme_roundtrips_via_descriptor() -> lsm_tree::Resu
     Ok(())
 }
 
+/// The XOR single-parity scheme (RAID-5, `parity_shards == 1`) round-trips
+/// end-to-end through the per-SST descriptor.
+///
+/// XOR takes a different write path than Reed-Solomon: the writer maps it to
+/// the `Xor` descriptor kind (not `ReedSolomon`) and the codec computes parity
+/// directly without the RS engine. Reopening with a default config proves the
+/// reader sources the XOR(8,1) layout from the descriptor, not the runtime
+/// config.
+#[cfg(feature = "page_ecc")]
+#[test]
+fn tree_page_ecc_xor_scheme_roundtrips_via_descriptor() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let path = folder.path();
+
+    {
+        let tree = Config::new(
+            path,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .page_ecc(true)
+        .ecc_scheme(lsm_tree::runtime_config::EccScheme::Xor { data_shards: 8 })
+        .open()?;
+
+        for i in 0u64..2_000 {
+            tree.insert(format!("k{i:08}"), format!("v{i:08}"), i);
+        }
+        tree.flush_active_memtable(2_000)?;
+    }
+
+    {
+        // Default config reopen: the reader must size + skip each block's
+        // single XOR parity shard from the on-disk descriptor.
+        let tree = Config::new(
+            path,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .open()?;
+
+        for i in 0u64..2_000 {
+            assert_eq!(
+                Some(format!("v{i:08}").as_bytes().into()),
+                tree.get(format!("k{i:08}"), 2_001)?,
+                "key k{i:08} must read back under the on-disk XOR(8,1) scheme",
+            );
+        }
+    }
+
+    Ok(())
+}
+
 /// Strict on-disk check that `Config::page_ecc(true)` produces
 /// SST data blocks carrying a parity trailer (not just that the round
 /// trip succeeds).

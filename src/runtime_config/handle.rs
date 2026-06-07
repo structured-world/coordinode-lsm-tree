@@ -229,13 +229,31 @@ mod tests {
         );
         assert!(handle.load().page_ecc);
 
-        // Zero shard count is rejected (non-recoverable layout).
-        let handle2 = RuntimeConfigHandle::new(RuntimeConfig::default());
-        let bad = handle2.try_update(|c| {
-            c.page_ecc = true;
-            c.ecc_scheme = EccScheme::Xor { data_shards: 0 };
-        });
-        assert!(matches!(bad, Err(crate::Error::FeatureUnsupported(_))));
+        // Zero shard count is rejected (non-recoverable layout) for every
+        // shard-based scheme: Xor with no data shards, and Reed-Solomon with
+        // either a zero data-shard or a zero parity-shard count.
+        for bad_scheme in [
+            EccScheme::Xor { data_shards: 0 },
+            EccScheme::ReedSolomon {
+                data_shards: 0,
+                parity_shards: 2,
+            },
+            EccScheme::ReedSolomon {
+                data_shards: 8,
+                parity_shards: 0,
+            },
+        ] {
+            let h = RuntimeConfigHandle::new(RuntimeConfig::default());
+            let bad = h.try_update(|c| {
+                c.page_ecc = true;
+                c.ecc_scheme = bad_scheme;
+            });
+            assert!(
+                matches!(bad, Err(crate::Error::FeatureUnsupported(_))),
+                "zero-shard scheme {bad_scheme:?} must be rejected, got {bad:?}"
+            );
+            assert!(!h.load().page_ecc, "rejected update must not enable ECC");
+        }
     }
 
     #[test]

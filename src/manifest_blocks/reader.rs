@@ -1124,4 +1124,63 @@ mod tests {
         );
         assert!(reader.section("format_version").is_some());
     }
+
+    /// With `manifest_ecc` on (`RuntimeConfig` `page_ecc = true`), manifest
+    /// blocks are written with a fixed RS(4,2) parity trailer and the reader
+    /// must size + skip it to read the section bytes back verbatim. Exercises
+    /// the `PlainEcc` arm of both the writer's and reader's transform matrix.
+    #[cfg(feature = "page_ecc")]
+    #[test]
+    fn reader_reads_section_with_manifest_ecc() {
+        let fs = fresh_fs();
+        let path = Path::new("/m/ecc_plain");
+        let runtime = RuntimeConfig {
+            page_ecc: true,
+            ..RuntimeConfig::default()
+        };
+        write_manifest(
+            &fs,
+            path,
+            runtime.clone(),
+            &[("format_version", &[5]), ("tree_type", &[0])],
+        );
+
+        let mut reader = ManifestArchiveReader::open(path, &fs, Arc::new(runtime), None).unwrap();
+        assert_eq!(reader.read_section("format_version").unwrap(), vec![5]);
+        assert_eq!(reader.read_section("tree_type").unwrap(), vec![0]);
+    }
+
+    /// `manifest_ecc` on AND encryption configured: the parity trailer sits
+    /// over the ciphertext. Exercises the `EncryptedEcc` arm of both the
+    /// writer's and reader's transform matrix.
+    #[cfg(all(feature = "page_ecc", feature = "encryption"))]
+    #[test]
+    fn reader_reads_encrypted_section_with_manifest_ecc() {
+        use crate::encryption::{Aes256GcmProvider, EncryptionProvider};
+
+        let fs = fresh_fs();
+        let path = Path::new("/m/ecc_enc");
+        let enc: Arc<dyn EncryptionProvider> = Arc::new(Aes256GcmProvider::new(&[7u8; 32]));
+        let runtime = RuntimeConfig {
+            page_ecc: true,
+            ..RuntimeConfig::default()
+        };
+
+        let mut w = ManifestArchiveWriter::create(
+            path,
+            &fs,
+            Arc::new(runtime.clone()),
+            Some(Arc::clone(&enc)),
+            crate::fs::SyncMode::Normal,
+        )
+        .unwrap();
+        w.start("format_version").unwrap();
+        use std::io::Write;
+        w.write_all(&[5u8]).unwrap();
+        w.finish().unwrap();
+
+        let mut reader =
+            ManifestArchiveReader::open(path, &fs, Arc::new(runtime), Some(enc)).unwrap();
+        assert_eq!(reader.read_section("format_version").unwrap(), vec![5]);
+    }
 }
