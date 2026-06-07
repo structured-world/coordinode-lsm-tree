@@ -589,6 +589,93 @@ fn tree_page_ecc_emits_parity_trailer_on_disk() -> lsm_tree::Result<()> {
     Ok(())
 }
 
+/// The on-disk parity overhead matches the CONFIGURED scheme, not a fixed
+/// layout: a single-block SST written with `Xor { data_shards: 8 }` carries
+/// exactly one XOR parity shard whose length follows the scheme's formula
+/// (`shard_bytes = ceil(N / 8)` rounded up to even). This pins the acceptance
+/// criterion "measured parity overhead matches the configured scheme".
+#[cfg(feature = "page_ecc")]
+#[test]
+fn tree_page_ecc_parity_overhead_matches_scheme() -> lsm_tree::Result<()> {
+    use lsm_tree::coding::Decode;
+    use lsm_tree::table::block::Header;
+    use std::fs;
+    use std::io::Read as _;
+
+    let folder = get_tmp_folder();
+    let path = folder.path();
+    const DATA_SHARDS: usize = 8;
+    {
+        let tree = Config::new(
+            path,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .page_ecc(true)
+        .ecc_scheme(lsm_tree::runtime_config::EccScheme::Xor {
+            data_shards: DATA_SHARDS as u8,
+        })
+        .open()?;
+        // A handful of entries → a single small data block.
+        tree.insert("a", "alpha", 0);
+        tree.insert("b", "bravo", 1);
+        tree.flush_active_memtable(0)?;
+    }
+
+    let tables_dir = path.join("tables");
+    let mut sst_path: Option<std::path::PathBuf> = None;
+    for entry in fs::read_dir(&tables_dir)? {
+        let entry = entry?;
+        if entry
+            .file_name()
+            .to_string_lossy()
+            .chars()
+            .all(|c| c.is_ascii_digit())
+        {
+            sst_path = Some(entry.path());
+            break;
+        }
+    }
+    let sst_path = sst_path.unwrap_or_else(|| panic!("flush should produce an SST"));
+
+    let reader = lsm_tree::sfa::Reader::new(&sst_path)?;
+    let data_section = reader
+        .toc()
+        .section(b"data")
+        .unwrap_or_else(|| panic!("data section must exist"));
+    let mut section_bytes = Vec::new();
+    data_section
+        .buf_reader(&sst_path)?
+        .read_to_end(&mut section_bytes)?;
+
+    let mut cursor = &section_bytes[..];
+    let header = Header::decode_from(&mut cursor)?;
+    let data_len = header.data_length as usize;
+    assert!(data_len > 0, "decoded a real data block");
+
+    // Single block ⇒ everything after `header + payload` is the parity trailer.
+    let parity_bytes = section_bytes
+        .len()
+        .checked_sub(Header::MIN_LEN + data_len)
+        .unwrap_or_else(|| panic!("section shorter than header + payload"));
+
+    // Xor{D} writes exactly one parity shard: shard_bytes = ceil(N / D) rounded
+    // up to even. This is the scheme's overhead — assert it byte-for-byte.
+    let ceil = data_len.div_ceil(DATA_SHARDS);
+    let expected_parity = if ceil.is_multiple_of(2) {
+        ceil
+    } else {
+        ceil + 1
+    };
+    assert_eq!(
+        parity_bytes, expected_parity,
+        "Xor({DATA_SHARDS}) on-disk parity ({parity_bytes} B) must equal the \
+         scheme's shard size ({expected_parity} B) for data_length {data_len}",
+    );
+
+    Ok(())
+}
+
 #[cfg(not(feature = "page_ecc"))]
 #[test]
 fn tree_open_with_page_ecc_on_feature_off_build_errors() {
