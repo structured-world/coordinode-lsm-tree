@@ -340,15 +340,6 @@ impl<'a, Item: Decodable<Parsed>, Parsed: ParsedItem<Item>> Decoder<'a, Item, Pa
     /// Panics if `restart_interval == 0` (a zero interval has no restart heads,
     /// so positional restart tracking is undefined).
     #[must_use]
-    // Consumed by the range-query partial-decode read path (wired next); the
-    // forward-from-prefix mechanism is proven by its tests already.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "consumed by range-query partial decode wiring (next slice)"
-        )
-    )]
     pub(crate) fn new_forward_headerless(
         block: &'a Block,
         restart_interval: u8,
