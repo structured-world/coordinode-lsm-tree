@@ -1241,6 +1241,67 @@ mod block_verify_tests {
         );
     }
 
+    #[cfg(feature = "page_ecc")]
+    #[test]
+    fn verify_block_checksums_clean_nondefault_ecc_tree_has_no_errors() {
+        // Regression: the scrub must size each SST's parity trailer from the
+        // per-SST descriptor scheme, NOT a hardcoded RS(4,2). A table written
+        // with a non-default scheme (RS(8,2), different shard size → different
+        // trailer length) is mis-walked if the scrub assumes RS(4,2): the
+        // wrong trailer length mis-aligns the next block and reports spurious
+        // corruption. With descriptor-driven sizing the walk stays aligned.
+        use crate::AbstractTree;
+
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let any = Config::new(
+                dir.path(),
+                SequenceNumberCounter::default(),
+                SequenceNumberCounter::default(),
+            )
+            .data_block_compression_policy(CompressionPolicy::all(CompressionType::None))
+            .page_ecc(true)
+            .ecc_scheme(crate::runtime_config::EccScheme::ReedSolomon {
+                data_shards: 8,
+                parity_shards: 2,
+            })
+            .open()
+            .unwrap();
+            for i in 0u64..2_000 {
+                let key = format!("k{i:08}");
+                let val = format!("v{i:08}");
+                any.insert(key.as_bytes(), val.as_bytes(), 1 + i);
+            }
+            any.flush_active_memtable(2_001).unwrap();
+            drop(any);
+        }
+
+        let tree = Config::new(
+            dir.path(),
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .data_block_compression_policy(CompressionPolicy::all(CompressionType::None))
+        .page_ecc(true)
+        .ecc_scheme(crate::runtime_config::EccScheme::ReedSolomon {
+            data_shards: 8,
+            parity_shards: 2,
+        })
+        .open()
+        .unwrap();
+        let report = verify_block_checksums(&tree);
+        assert!(
+            report.is_ok(),
+            "non-default-scheme ECC tree must verify with zero errors \
+             (parity sized from the descriptor, not RS(4,2)), got {:?}",
+            report.errors,
+        );
+        assert!(
+            report.blocks_scanned > 1,
+            "expected multiple blocks scanned to exercise cross-block alignment",
+        );
+    }
+
     /// Returns the on-disk path of the first SST registered with the
     /// tree's current version. Drops the tree before returning so the
     /// caller can mutate the file safely (no descriptor cache, no
