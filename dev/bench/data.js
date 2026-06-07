@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1780768442816,
+  "lastUpdate": 1780848217216,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -13416,6 +13416,84 @@ window.BENCHMARK_DATA = {
             "value": 537573.9055261383,
             "unit": "ops/sec",
             "extra": "P50: 1.7us | P99: 5.1us | P99.9: 8.0us\nthreads: 1 | elapsed: 0.37s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "b6c723e6c4304f4e6350c8828beebd0bf408cdbb",
+          "message": "feat(ecc): configurable ECC-at-rest scheme (XOR / Reed-Solomon) on the Page ECC path (#414)\n\n## Summary\n\nMakes Page ECC-at-rest a **configurable, efficiency-first** feature on\nthe per-block (`crate::ecc` / `BlockTransform`) path, and removes the\ninert duplicate ECC track. The scheme chosen in config now flows write →\nper-SST descriptor → read, so an arbitrary scheme (not just the legacy\nfixed RS(4,2)) takes effect end-to-end.\n\nCloses #254.\n\n## What changed\n\n**Scheme spectrum (cheapest-first), selected per config, off by\ndefault**\n\n| Tier | `EccScheme` | Corrects | Overhead |\n|------|-------------|----------|----------|\n| 0 | `Secded` (on-default) | single-bit rot | ~1-3% — gated until #255\n|\n| 1 | `Xor { data_shards }` (RAID-5) | one lost shard | `1/D` (e.g.\n12.5%) |\n| 2 | `ReedSolomon { data_shards, parity_shards }` (RAID-6 at P=2) | up\nto P lost shards | `P/D` (e.g. RS(8,2)=25%, RS(16,2)=12.5%) |\n\n- **Off by default** (`page_ecc = false`). Enabling ECC requires an\nexplicit shard scheme; the `Secded` default is rejected until its read\npath lands (#255). **RS(4,2) is never an implicit default** — `impl\nDefault for EccParams` is removed.\n- `crate::ecc` generalized from fixed RS(4,2) to `(data_shards,\nparity_shards)`: `parity_shards == 1` uses direct XOR (no RS engine),\n`>= 2` uses Reed-Solomon with a combination enumerator.\n- The scheme is recorded per-SST in a 4-byte `descriptor#page_ecc`\n`[kind, data_shards, parity_shards, granularity]` and re-derived on\nread; self-describing blocks (Meta / Manifest, read before the\ndescriptor is known) use the fixed RS(4,2) layout.\n- `BlockTransform` carries the scheme (`EccParams`); block I/O sizes +\nrecovers parity from it. `Header::on_disk_size_with(ecc)` sizes the\nblock-handle by the actual scheme rather than a hardcoded RS(4,2).\n- Config validation (`try_update`) rejects enabling ECC with an unwired\n(`Secded`) or zero-shard scheme. New `Config::ecc_scheme(..)` builder.\n\n**Removed: the inert `EccFrame` track**\n\n`EccFrame` (RS over AEAD ciphertext as a skippable frame inside the\nencryption envelope) duplicated Page ECC on the encrypted quadrant only\nand was never wired into the live path. Deleted (`ecc_frame.rs`, the\n`EccBudgetExhausted` / `MalformedEccFrame` errors); the encrypted-block\nformat is now strictly `MetadataFrame ‖ BodyFrame` (the unused\nskippable-magic reservation dropped). Page ECC is the one ECC path —\northogonal to compression and encryption, covering non-encrypted blocks\ntoo.\n\n## Read paths are fully descriptor-driven\n\nThe chosen scheme reaches every read path, not just data-block reads:\n\n- The write paths (flush / compaction / ingestion) take the scheme from\nthe live runtime snapshot, so a runtime `ecc_scheme` change applies to\nthe next SST without a restart.\n- The scrub (`verify`) sizes each SST's parity trailer from the per-SST\ndescriptor scheme; the inspect facade threads the descriptor scheme into\nits index (TLI) and filter loaders. Both previously assumed a fixed\nRS(4,2) layout.\n- `from_file`'s on-disk-size cap is derived from the actual scheme (a\nhigher-overhead scheme is no longer falsely rejected).\n- Descriptor decode rejects non-canonical `Off`/`Secded` encodings and\npage-granular descriptors (fail closed); `EccParams` is non-zero by\nconstruction (`try_new`, private fields); a build without the `page_ecc`\nfeature returns `PageEccUnsupported` for a descriptor-bearing SST\ninstead of silently dropping the parity trailer.\n\n## Testing\n\n- Full suite green (1822 tests) with `page_ecc,zstd,lz4,encryption`;\n`cargo clippy --all-features -- -D warnings` clean.\n- Off-by-default is byte-identical to before.\n- Integration: a tree written with a non-default RS(8,2) scheme\nround-trips through flush + reopen, reopening with a default config to\nprove the reader sources the layout from the on-disk descriptor (not the\nruntime config).\n- Regression tests: runtime `ecc_scheme` change reaches new SSTs;\nnon-canonical and page-granular descriptors are rejected; the scrub\nverifies a non-default-scheme tree with zero false errors; the inspect\nfacade decodes an ECC SST's index + filter + data blocks.\n- `crate::ecc` unit tests cover XOR single-shard recovery +\nparity-corrupt case, RS(8,2) double-loss recovery, RS(4,2)\nbyte-identity, and the combination enumerator.\n\n## Follow-ups (not in this PR)\n\n- `granularity: page` (sector-aligned parity) — only `block` granularity\nis implemented; page-granular descriptors are rejected on read until it\nlands.\n- SECDED single-bit tier → #255 (currently gated/rejected).\n- Tree-level fault-injection recovery test (algorithm-level recovery is\ncovered by `crate::ecc` unit tests).\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n## Summary by CodeRabbit\n\n* **New Features**\n* Per-SST page ECC now supports parameterized schemes (XOR,\nReed–Solomon) with on-disk descriptors so parity layout follows the SST,\nnot runtime-only config.\n\n* **Bug Fixes**\n  * Encrypted-block decoding now rejects unexpected trailing bytes.\n* Readers size/verify parity from descriptors; unrecognized descriptors\nemit warnings instead of hard failures.\n\n* **Refactor**\n* ECC configuration converted from a boolean to an optional,\nparameterized setting throughout IO paths.\n\n* **Documentation**\n* Spec clarifies ECC-at-rest placement and tightens framing/validation.\n\n* **Tests**\n* Added regression and integration tests for schemes, descriptors,\nrecovery, and tooling.\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-06-07T18:50:53+03:00",
+          "tree_id": "84c690e32bdfe0d059188396ce6a6230f34eba4f",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/b6c723e6c4304f4e6350c8828beebd0bf408cdbb"
+        },
+        "date": 1780848214097,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 2017441.5284669625,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.7us | P99.9: 4.0us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 912240.1902878302,
+            "unit": "ops/sec",
+            "extra": "P50: 0.9us | P99: 2.8us | P99.9: 5.4us\nthreads: 1 | elapsed: 0.22s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 549891.8316026432,
+            "unit": "ops/sec",
+            "extra": "P50: 1.7us | P99: 4.9us | P99.9: 7.8us\nthreads: 1 | elapsed: 0.36s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3563041.489890075,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 3.2us | P99.9: 5.9us\nthreads: 1 | elapsed: 0.06s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 382938.45881040796,
+            "unit": "ops/sec",
+            "extra": "P50: 2.3us | P99: 5.9us | P99.9: 9.2us\nthreads: 1 | elapsed: 0.52s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 206044.36310893577,
+            "unit": "ops/sec",
+            "extra": "P50: 4.5us | P99: 6.5us | P99.9: 11.6us\nthreads: 1 | elapsed: 0.97s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1033547.841536879,
+            "unit": "ops/sec",
+            "extra": "P50: 0.8us | P99: 2.5us | P99.9: 4.8us\nthreads: 1 | elapsed: 0.19s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1092774.2021538075,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 1.5us | P99.9: 2.5us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 472962.3874036476,
+            "unit": "ops/sec",
+            "extra": "P50: 1.9us | P99: 6.4us | P99.9: 10.1us\nthreads: 1 | elapsed: 0.42s | num: 200000 | iterations: 3"
           }
         ]
       }
