@@ -195,4 +195,23 @@ fn inspect_reads_ecc_sst_index_filter_and_data() {
         })
         .count();
     assert_eq!(count, 2_000, "every inserted key must be enumerated");
+
+    // Inspect surfaces the per-table ECC state structurally: a recognized
+    // RS(8,2) scheme is `page_ecc = true`, not flagged unrecognized.
+    let props = read_table_properties(&sst).expect("table properties decode");
+    assert!(props.page_ecc, "RS(8,2) SST must report page_ecc");
+    assert!(
+        !props.ecc_unrecognized,
+        "a recognized scheme is not flagged unrecognized",
+    );
+}
+
+/// A non-ECC SST reports `page_ecc = false` and is not flagged unrecognized —
+/// the structural ECC surface in `TableProperties`.
+#[test]
+fn read_table_properties_reports_no_ecc_for_plain_sst() {
+    let (_dir, sst) = build_tree_with_items(32);
+    let props = read_table_properties(&sst).expect("table properties decode");
+    assert!(!props.page_ecc);
+    assert!(!props.ecc_unrecognized);
 }

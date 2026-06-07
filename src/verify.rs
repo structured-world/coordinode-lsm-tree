@@ -395,6 +395,26 @@ impl std::error::Error for BlockVerifyError {
     }
 }
 
+/// A non-fatal finding from a scrub run: the data is intact, but something
+/// about a table could not be fully checked.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum BlockVerifyWarning {
+    /// The table's `descriptor#page_ecc` decodes to an ECC scheme this build
+    /// cannot apply (an unimplemented scheme, page granularity, an unknown
+    /// kind, or a non-canonical descriptor). Block payloads still verify by
+    /// their own checksums, but the parity trailer length is not derivable
+    /// from a scheme, so the sequential block walk cannot size it and ECC
+    /// verification was skipped for this table. Recompaction re-stamps the
+    /// table with a supported scheme.
+    UnrecognizedEcc {
+        /// Table the warning applies to.
+        table_id: TableId,
+        /// On-disk path of the SST.
+        path: std::path::PathBuf,
+    },
+}
+
 /// Aggregated result of a per-block scrub run.
 #[derive(Debug, Default)]
 #[non_exhaustive]
@@ -408,13 +428,25 @@ pub struct BlockVerifyReport {
     /// runs to completion across all SSTs even if individual blocks
     /// or whole files are corrupt.
     pub errors: Vec<BlockVerifyError>,
+    /// Non-fatal findings: data verified, but ECC could not be checked for
+    /// some tables (unrecognized scheme — recompaction recommended). Distinct
+    /// from `errors`: warnings do NOT make [`Self::is_ok`] false.
+    pub warnings: Vec<BlockVerifyWarning>,
 }
 
 impl BlockVerifyReport {
-    /// `true` if every block in every SST verified clean.
+    /// `true` if every block in every SST verified clean. Warnings (e.g. an
+    /// unrecognized ECC scheme whose data still checksum-verified) do NOT
+    /// make this false — only real corruption (`errors`) does.
     #[must_use]
     pub fn is_ok(&self) -> bool {
         self.errors.is_empty()
+    }
+
+    /// `true` if the scrub produced any non-fatal warning.
+    #[must_use]
+    pub fn has_warnings(&self) -> bool {
+        !self.warnings.is_empty()
     }
 }
 
@@ -451,6 +483,24 @@ pub fn verify_block_checksums(tree: &impl crate::AbstractTree) -> BlockVerifyRep
         let path: &Path = &table.path;
         let table_id = table.id();
         report.sst_files_scanned += 1;
+
+        // Tables whose ECC descriptor decodes to a scheme this build can't
+        // apply can't be ECC-walked: the parity trailer length isn't derivable
+        // from a scheme, so the sequential walk would mis-align. The per-block
+        // read path still serves their data (framed by data_length, checksum
+        // verified), so this is a warning + skip, not an error.
+        if table.metadata.ecc_unrecognized {
+            log::warn!(
+                "table {table_id} at {}: unrecognized ECC scheme — skipping \
+                 ECC block-walk; recompact to re-stamp with a supported scheme",
+                path.display(),
+            );
+            report.warnings.push(BlockVerifyWarning::UnrecognizedEcc {
+                table_id,
+                path: path.to_path_buf(),
+            });
+            continue;
+        }
 
         // Use each Table's own `Fs` handle (StdFs, MemFs, IoUring, …).
         // `std::fs::File::open` is wrong here: it skips the pluggable
@@ -561,7 +611,23 @@ pub fn verify_sst_file(path: &std::path::Path) -> BlockVerifyReport {
     // the scan and reports spurious corruption. Surface the indeterminacy and
     // skip the walk.
     let ecc = match read_ecc_params_out_of_band(&fs, path) {
-        Ok(Some(ecc)) => ecc,
+        Ok(Some(ScrubEcc::Off)) => None,
+        Ok(Some(ScrubEcc::Scheme(params))) => Some(params),
+        // The descriptor decodes to a scheme this build can't apply: the
+        // trailer length isn't derivable, so an ECC-walk would mis-align.
+        // Data still loads via the per-block read path; warn + skip the walk.
+        Ok(Some(ScrubEcc::Unrecognized)) => {
+            log::warn!(
+                "{}: unrecognized ECC scheme — skipping ECC block-walk; \
+                 recompact to re-stamp with a supported scheme",
+                path.display(),
+            );
+            report.warnings.push(BlockVerifyWarning::UnrecognizedEcc {
+                table_id: 0,
+                path: path.to_path_buf(),
+            });
+            return report;
+        }
         // File + trailer readable, but neither meta block decodes (corrupt
         // meta, or an encrypted SST with no key out-of-band). The ECC scheme is
         // undeterminable; skip the walk rather than mis-walk an ECC-bearing SST.
@@ -608,35 +674,40 @@ pub fn verify_sst_file(path: &std::path::Path) -> BlockVerifyReport {
     report
 }
 
-/// Best-effort read of the per-SST ECC scheme from an SST file's meta
+/// Per-SST ECC state as seen by the out-of-band scrub.
+#[cfg(feature = "std")]
+enum ScrubEcc {
+    /// ECC off — no parity trailer to skip.
+    Off,
+    /// A recognized + applicable scheme — size + verify the trailer with it.
+    Scheme(crate::table::block::EccParams),
+    /// An ECC scheme this build can't apply (unimplemented / unknown /
+    /// non-canonical). The trailer length isn't derivable, so the walk must
+    /// be skipped with a warning.
+    Unrecognized,
+}
+
+/// Best-effort read of the per-SST ECC state from an SST file's meta
 /// descriptor, for the out-of-band scrub (no live `Table` to consult).
 ///
-/// Returns `Ok(Some(ecc))` when a meta block decodes, where `ecc` is the
-/// per-SST shard layout (`None` = ECC off). The authoritative tail `meta`
-/// section is tried first; if its block is corrupt / undecodable the early
-/// `meta_mid` mirror (which the writer emits so one bad meta block can't lose
-/// the descriptor) is tried next. The outer `Ok(None)` means the file and SFA
-/// trailer are readable but NEITHER meta block decodes (both corrupt, or an
-/// encrypted SST whose key the out-of-band tool doesn't have) — the scheme is
-/// genuinely UNDETERMINABLE. Returns `Err` when the file can't be opened or its
-/// SFA trailer can't be parsed, preserving the real I/O / structural error for
-/// the caller to report rather than collapsing it into "undeterminable".
+/// Returns `Ok(Some(state))` when a meta block decodes. The authoritative
+/// tail `meta` section is tried first; if its block is corrupt / undecodable
+/// the early `meta_mid` mirror (which the writer emits so one bad meta block
+/// can't lose the descriptor) is tried next. The `Ok(None)` outer means the
+/// file and SFA trailer are readable but NEITHER meta block decodes (both
+/// corrupt, or an encrypted SST whose key the out-of-band tool doesn't have) —
+/// the scheme is genuinely UNDETERMINABLE. Returns `Err` when the file can't be
+/// opened or its SFA trailer can't be parsed.
 ///
-/// The caller MUST NOT treat the outer `Ok(None)` as "ECC disabled": walking an
+/// The caller MUST NOT treat `Ok(None)` as "ECC disabled": walking an
 /// ECC-bearing SST without skipping the parity trailers mis-aligns the block
 /// scan and reports spurious corruption, so the caller skips the walk and
 /// surfaces the indeterminacy instead.
 #[cfg(feature = "std")]
-#[expect(
-    clippy::option_option,
-    reason = "three distinct outcomes: Err = I/O failure; Ok(None) = meta \
-              undecodable (scheme indeterminate); Ok(Some(inner)) = meta \
-              decoded where inner is the ECC scheme (None = ECC off)"
-)]
 fn read_ecc_params_out_of_band(
     fs: &dyn crate::fs::Fs,
     path: &std::path::Path,
-) -> std::io::Result<Option<Option<crate::table::block::EccParams>>> {
+) -> std::io::Result<Option<ScrubEcc>> {
     let mut probe = fs.open(path, &crate::fs::FsOpenOptions::new().read(true))?;
     let sfa_reader = crate::sfa::Reader::from_reader(&mut probe)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
@@ -654,7 +725,14 @@ fn read_ecc_params_out_of_band(
         if let Ok(meta) =
             crate::table::meta::ParsedMeta::load_with_handle(probe.as_ref(), &handle, None)
         {
-            return Ok(Some(meta.ecc_params));
+            let state = if meta.ecc_unrecognized {
+                ScrubEcc::Unrecognized
+            } else if let Some(params) = meta.ecc_params {
+                ScrubEcc::Scheme(params)
+            } else {
+                ScrubEcc::Off
+            };
+            return Ok(Some(state));
         }
     }
     Ok(None)

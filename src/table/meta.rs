@@ -83,10 +83,21 @@ pub struct ParsedMeta {
 
     /// Per-SST Page-ECC shard scheme decoded from the
     /// `descriptor#page_ecc` value: `Some(params)` when this table's
-    /// blocks carry a parity trailer (the read path sizes + recovers
-    /// with this scheme), `None` when off. Agrees with
-    /// [`Self::page_ecc`] (`page_ecc == ecc_params.is_some()`).
+    /// blocks carry a parity trailer under a recognized + applicable scheme
+    /// (the read path sizes + recovers with it), `None` otherwise. Agrees
+    /// with [`Self::page_ecc`] (`page_ecc == ecc_params.is_some()`).
     pub ecc_params: Option<crate::table::block::EccParams>,
+
+    /// `true` when the `descriptor#page_ecc` value decoded to an ECC scheme
+    /// this build cannot apply: an unimplemented scheme (`Secded`), page
+    /// granularity, an unknown kind, or a non-canonical descriptor. The
+    /// per-block read still returns the payload (framed by `data_length`,
+    /// checksum-verified) with `EccStatus::Unrecognized`, but the trailer
+    /// length is not derivable from a scheme — so the sequential scrub walk
+    /// cannot size it and must skip ECC verification for this table, warning
+    /// that recompaction is needed. Mutually exclusive with a `Some`
+    /// [`Self::ecc_params`].
+    pub ecc_unrecognized: bool,
 
     /// Index block format for this SST (#224). `0` = legacy: index
     /// entries carry no per-block seqno bounds (byte-identical to the
@@ -334,36 +345,42 @@ impl ParsedMeta {
         // parity_shards, granularity]. `kind == 0` = no parity. A present
         // descriptor records the exact shard scheme so the read path
         // re-derives the parity layout (no implicit RS(4,2) fallback).
-        let (page_ecc, ecc_params) = {
+        let (page_ecc, ecc_params, ecc_unrecognized) = {
             let v = block
                 .point_read(b"descriptor#page_ecc", SeqNo::MAX, &cmp)?
                 .ok_or(crate::Error::InvalidHeader("TableMeta"))?;
             use crate::runtime_config::{EccDescriptor, EccGranularity};
             // Three-state ECC contract: a recognized + applicable scheme
             // (`Xor`/`ReedSolomon`, block granularity, valid shards) yields the
-            // recovery params. Anything else that still decodes — an
-            // unimplemented scheme (`Secded`), page granularity, an unknown
-            // kind, or a non-canonical descriptor — is NOT a hard error: it
-            // resolves to "no recovery scheme" (`None`). The per-block read
-            // then frames the payload by `data_length`, verifies it by
-            // checksum, and reports `EccStatus::Unrecognized` (a WARN +
-            // recompaction hint) instead of failing the read.
-            let params = match crate::runtime_config::ecc_descriptor_from_bytes(&v.value)? {
-                EccDescriptor::Off => None,
-                EccDescriptor::Recognized(scheme, EccGranularity::Block) => scheme
-                    .shard_params()
-                    .map(|(d, p)| {
-                        #[expect(
-                            clippy::cast_possible_truncation,
-                            reason = "shard counts originate as u8 in the descriptor"
-                        )]
-                        crate::table::block::EccParams::try_new(d as u8, p as u8)
-                    })
-                    .transpose()?,
+            // recovery params (`ecc_unrecognized = false`). Anything else that
+            // still decodes — an unimplemented scheme (`Secded`), page
+            // granularity, an unknown kind, or a non-canonical descriptor — is
+            // NOT a hard error: it resolves to "no recovery scheme" (`None`)
+            // with `ecc_unrecognized = true`. The per-block read then frames
+            // the payload by `data_length`, verifies it by checksum, and
+            // reports `EccStatus::Unrecognized` (a WARN + recompaction hint)
+            // instead of failing; the scrub skips ECC-walk of such tables.
+            match crate::runtime_config::ecc_descriptor_from_bytes(&v.value)? {
+                EccDescriptor::Off => (false, None, false),
+                EccDescriptor::Recognized(scheme, EccGranularity::Block) => {
+                    let params = scheme
+                        .shard_params()
+                        .map(|(d, p)| {
+                            #[expect(
+                                clippy::cast_possible_truncation,
+                                reason = "shard counts originate as u8 in the descriptor"
+                            )]
+                            crate::table::block::EccParams::try_new(d as u8, p as u8)
+                        })
+                        .transpose()?;
+                    // `Secded` is recognized but has no shard layout
+                    // (`shard_params() == None`) → unimplemented → unrecognized.
+                    let unrecognized = params.is_none();
+                    (params.is_some(), params, unrecognized)
+                }
                 EccDescriptor::Recognized(_, EccGranularity::Page)
-                | EccDescriptor::Unrecognized => None,
-            };
-            (params.is_some(), params)
+                | EccDescriptor::Unrecognized => (false, None, true),
+            }
         };
 
         // Optional field introduced for scan_since_seqno block-skip (#224).
@@ -406,6 +423,7 @@ impl ParsedMeta {
             kv_checksum_algo,
             page_ecc,
             ecc_params,
+            ecc_unrecognized,
             index_format,
         })
     }
@@ -806,7 +824,34 @@ mod tests {
                 parsed.ecc_params, None,
                 "unsupported descriptor {descriptor:?} must yield no recovery scheme",
             );
+            assert!(
+                parsed.ecc_unrecognized,
+                "unsupported descriptor {descriptor:?} must flag ecc_unrecognized \
+                 (drives the scrub warn + skip)",
+            );
+            assert!(
+                !parsed.page_ecc,
+                "unrecognized ECC is not 'recognized active'"
+            );
         }
+
+        // Sanity: a recognized + applicable scheme is NOT flagged unrecognized,
+        // and `Off` is neither.
+        let parsed = load_meta_from_items(&valid_meta_items()).unwrap();
+        assert!(!parsed.ecc_unrecognized && !parsed.page_ecc, "off");
+
+        let mut items = valid_meta_items();
+        if let Some(item) = items
+            .iter_mut()
+            .find(|iv| &*iv.key.user_key == b"descriptor#page_ecc")
+        {
+            *item = meta("descriptor#page_ecc", &[3u8, 8, 2, 0]); // RS(8,2) block
+        }
+        let parsed = load_meta_from_items(&items).unwrap();
+        assert!(
+            parsed.page_ecc && !parsed.ecc_unrecognized && parsed.ecc_params.is_some(),
+            "recognized RS(8,2) is applicable, not unrecognized",
+        );
     }
 
     /// Missing `descriptor#page_ecc` must return `Err(InvalidHeader)`, not

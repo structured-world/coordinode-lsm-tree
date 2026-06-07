@@ -90,6 +90,16 @@ pub struct TableProperties {
     /// meta — the writer snapshots `unix_timestamp()` once and emits
     /// the same value to both copies.
     pub created_at_nanos: u128,
+    /// `true` when the table was written with a recognized, applicable Page
+    /// ECC scheme (the read path sizes + recovers its parity trailers).
+    pub page_ecc: bool,
+    /// `true` when the table's ECC descriptor decodes to a scheme this build
+    /// cannot apply (an unimplemented scheme, page granularity, an unknown
+    /// kind, or a non-canonical descriptor). Block data still reads (verified
+    /// by its checksum) but without ECC recovery; recompaction re-stamps the
+    /// table with a supported scheme. Mutually exclusive with
+    /// [`Self::page_ecc`].
+    pub ecc_unrecognized: bool,
 }
 
 /// Reads `path` and returns its on-disk metadata as
@@ -177,6 +187,8 @@ pub fn read_table_properties(path: &Path) -> crate::Result<TableProperties> {
         data_block_compression: meta.data_block_compression,
         index_block_compression: meta.index_block_compression,
         created_at_nanos: *meta.created_at,
+        page_ecc: meta.page_ecc,
+        ecc_unrecognized: meta.ecc_unrecognized,
     })
 }
 
