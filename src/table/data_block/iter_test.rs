@@ -1767,5 +1767,131 @@ mod tests {
             }
             Ok(())
         }
+
+        /// The headerless forward decoder — fed only the entry region of a block
+        /// (no trailer / restart index) — must reconstruct exactly the same
+        /// forward sequence as a normal full decode. This is the read-side core
+        /// of range-query partial decode, where the decompressed prefix of a
+        /// subset of inner zstd blocks carries entries but not the trailer.
+        #[test]
+        fn headerless_forward_decode_matches_full_forward_decode() -> crate::Result<()> {
+            use crate::Slice;
+            use crate::comparator::default_comparator;
+            use crate::table::block::Decoder;
+            use crate::table::data_block::DataBlockParsedItem;
+
+            let items: Vec<InternalValue> = (0u64..200)
+                .map(|i| {
+                    InternalValue::from_components(
+                        format!("key-{i:08}").into_bytes(),
+                        format!("val-{i:08}").into_bytes(),
+                        0,
+                        Value,
+                    )
+                })
+                .collect();
+
+            for restart_interval in [1u8, 4, 16] {
+                let bytes = DataBlock::encode_into_vec(&items, restart_interval, 0.0)?;
+                let full_block = Block {
+                    data: Slice::from(bytes),
+                    header: Header::test_dummy(BlockType::Data),
+                };
+
+                // Reference: full forward decode of every entry.
+                let data_block = DataBlock::new(full_block.clone());
+                let reference: Vec<InternalValue> = data_block
+                    .iter(default_comparator())
+                    .map(|x| x.materialize(data_block.as_slice()))
+                    .collect();
+                assert_eq!(reference.len(), items.len());
+
+                // Entry-region length + restart interval from a normal decoder.
+                let probe = Decoder::<InternalValue, DataBlockParsedItem>::new(&full_block);
+                let entries_end = probe.entries_end_for_test().expect("entries_end");
+                let ri = probe.restart_interval();
+
+                // Headerless forward decode over the EXACT entry region (no trailer).
+                let prefix_block = Block {
+                    data: full_block.data.slice(0..entries_end),
+                    header: Header::test_dummy(BlockType::Data),
+                };
+                let got: Vec<InternalValue> =
+                    Decoder::<InternalValue, DataBlockParsedItem>::new_forward_headerless(
+                        &prefix_block,
+                        ri,
+                        entries_end,
+                    )
+                    .map(|x| x.materialize(&prefix_block.data))
+                    .collect();
+
+                assert_eq!(
+                    got, reference,
+                    "headerless forward (ri={restart_interval}) must equal full forward decode",
+                );
+            }
+            Ok(())
+        }
+
+        /// A prefix that ends MID-ENTRY (an inner zstd block boundary need not
+        /// align with a KV entry) must yield every complete entry before the cut
+        /// and drop the truncated tail cleanly — no panic, no garbage entry.
+        #[test]
+        fn headerless_forward_decode_stops_cleanly_on_truncated_prefix() -> crate::Result<()> {
+            use crate::Slice;
+            use crate::table::block::Decoder;
+            use crate::table::data_block::DataBlockParsedItem;
+
+            let items: Vec<InternalValue> = (0u64..200)
+                .map(|i| {
+                    InternalValue::from_components(
+                        format!("key-{i:08}").into_bytes(),
+                        format!("val-{i:08}").into_bytes(),
+                        0,
+                        Value,
+                    )
+                })
+                .collect();
+
+            let bytes = DataBlock::encode_into_vec(&items, 16, 0.0)?;
+            let full_block = Block {
+                data: Slice::from(bytes),
+                header: Header::test_dummy(BlockType::Data),
+            };
+
+            let probe = Decoder::<InternalValue, DataBlockParsedItem>::new(&full_block);
+            let entries_end = probe.entries_end_for_test().expect("entries_end");
+            let ri = probe.restart_interval();
+
+            // Cut a few bytes short of the entry region end (into the last entry).
+            let cut = entries_end - 3;
+            let prefix_block = Block {
+                data: full_block.data.slice(0..cut),
+                header: Header::test_dummy(BlockType::Data),
+            };
+            let got: Vec<InternalValue> =
+                Decoder::<InternalValue, DataBlockParsedItem>::new_forward_headerless(
+                    &prefix_block,
+                    ri,
+                    cut,
+                )
+                .map(|x| x.materialize(&prefix_block.data))
+                .collect();
+
+            assert!(
+                !got.is_empty(),
+                "complete entries before the cut must decode"
+            );
+            assert!(
+                got.len() < items.len(),
+                "a truncated prefix must drop at least the tail entry",
+            );
+            assert_eq!(
+                got,
+                items[..got.len()].to_vec(),
+                "decoded entries must match the original block prefix exactly",
+            );
+            Ok(())
+        }
     }
 }

@@ -149,6 +149,14 @@ impl<'a, Item: Decodable<Parsed>, Parsed: ParsedItem<Item>> Decoder<'a, Item, Pa
         self.restart_interval
     }
 
+    /// Byte length of the entry region (offset where the trailer begins).
+    /// Test-only: lets headerless-decode tests slice the exact entry region.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn entries_end_for_test(&self) -> Option<usize> {
+        self.cached_entries_end
+    }
+
     /// Extracts the reusable trailer metadata from a fully-constructed
     /// decoder so future decodes of the same block can skip the trailer
     /// parse via [`Self::from_meta`].
@@ -299,6 +307,74 @@ impl<'a, Item: Decodable<Parsed>, Parsed: ParsedItem<Item>> Decoder<'a, Item, Pa
     )]
     pub fn new(block: &'a Block) -> Self {
         Self::try_new(block).expect("valid block trailer")
+    }
+
+    /// Builds a forward-only decoder over a block whose bytes are JUST the
+    /// entry region, with NO trailer (restart array / binary index / hash
+    /// index). Used for partial-decode reads, where `block.data` is the
+    /// contiguous decompressed prefix of a subset of inner zstd blocks (the
+    /// trailer lives in a later inner block that was skipped).
+    ///
+    /// Only forward iteration ([`Iterator::next`]) is valid: there is no
+    /// index, so seeking / binary search / backward iteration are unsupported.
+    /// `restart_interval` must match the value the block was encoded with
+    /// (per-SST constant from `TableMeta`); restart heads are positional, so
+    /// the forward scan reconstructs every key from byte 0 without the trailer.
+    /// `entries_end` is the length of the entry region (== `block.data.len()`
+    /// for a clean prefix); a partial prefix may end mid-entry, in which case
+    /// the final truncated entry parses to `None` and iteration stops cleanly
+    /// before it.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `restart_interval == 0` (a zero interval has no restart heads,
+    /// so positional restart tracking is undefined).
+    #[must_use]
+    // Consumed by the range-query partial-decode read path (wired next); the
+    // forward-from-prefix mechanism is proven by its tests already.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "consumed by range-query partial decode wiring (next slice)"
+        )
+    )]
+    pub(crate) fn new_forward_headerless(
+        block: &'a Block,
+        restart_interval: u8,
+        entries_end: usize,
+    ) -> Self {
+        assert!(
+            restart_interval > 0,
+            "restart_interval must be non-zero for headerless forward decode",
+        );
+        Self {
+            block,
+            phantom: PhantomData,
+            lo_scanner: LoScanner {
+                offset: 0,
+                remaining_in_interval: 0,
+                base_key_offset: None,
+                base_key_end: None,
+            },
+            // No backward cursor: base_key_offset stays None so `next` never
+            // treats the (zeroed) hi_scanner.offset as an upper bound.
+            hi_scanner: HiScanner {
+                offset: 0,
+                ptr_idx: 0,
+                stack: Vec::new(),
+                base_key_offset: None,
+                base_key_end: None,
+            },
+            restart_interval,
+            // No trailer/index: keep these zeroed. Forward `next` reads neither.
+            binary_index_step_size: 2,
+            binary_index_offset: 0,
+            binary_index_len: 0,
+            hash_index_len: 0,
+            hash_index_offset: 0,
+            cached_entries_end: Some(entries_end),
+        }
     }
 
     fn binary_index_bounds(&self) -> Option<(usize, usize)> {
