@@ -339,8 +339,18 @@ impl ParsedMeta {
                 .point_read(b"descriptor#page_ecc", SeqNo::MAX, &cmp)?
                 .ok_or(crate::Error::InvalidHeader("TableMeta"))?;
             let cfg = crate::runtime_config::ecc_descriptor_from_bytes(&v.value)?;
+            // Only whole-block granularity is wired today. A descriptor that
+            // records page-granular ECC must fail closed rather than be read
+            // with the wrong (block) parity layout.
             let params = cfg
-                .and_then(|(scheme, _gran)| scheme.shard_params())
+                .map(|(scheme, gran)| match gran {
+                    crate::runtime_config::EccGranularity::Block => Ok(scheme),
+                    crate::runtime_config::EccGranularity::Page => {
+                        Err(crate::Error::InvalidTrailer)
+                    }
+                })
+                .transpose()?
+                .and_then(|scheme| scheme.shard_params())
                 .map(|(d, p)| {
                     #[expect(
                         clippy::cast_possible_truncation,
