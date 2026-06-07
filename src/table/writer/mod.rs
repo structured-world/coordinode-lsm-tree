@@ -342,8 +342,18 @@ impl Writer {
     }
 
     fn assert_not_started(&self, setting: &str) {
+        // A parallel spill clears `chunk` and submits the block to the
+        // pipeline immediately, but `data_block_count` only ticks once
+        // `drain_one_parallel` registers it — so neither alone proves "no
+        // block is in flight". Also check the pipeline's pending queue /
+        // byte counter so a setter can't change the per-table layout after
+        // a block was already queued under the old one.
+        #[cfg(feature = "std")]
+        let in_flight = !self.pending_meta.is_empty() || self.parallel_pending_bytes > 0;
+        #[cfg(not(feature = "std"))]
+        let in_flight = false;
         assert!(
-            self.meta.data_block_count == 0 && self.chunk.is_empty(),
+            self.meta.data_block_count == 0 && self.chunk.is_empty() && !in_flight,
             "{setting} must be configured before writing starts",
         );
     }
