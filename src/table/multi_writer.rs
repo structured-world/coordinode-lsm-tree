@@ -19,6 +19,12 @@ use std::{path::PathBuf, sync::Arc};
 /// Like `Writer` but will rotate to a new table, once a table grows larger than `target_size`
 ///
 /// This results in a sorted "run" of tables
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "writer config: each bool is an independent feature toggle carried \
+              across table rotations (partitioned filter, range-tombstone clip, \
+              seqno-in-index, disable-CoW); enums would obscure the per-feature wiring"
+)]
 pub struct MultiWriter {
     pub(crate) fs: Arc<dyn Fs>,
 
@@ -101,6 +107,12 @@ pub struct MultiWriter {
     /// `index_format`.
     use_seqno_in_index: bool,
 
+    /// When `true`, each output SST has per-file copy-on-write cleared at
+    /// creation (Btrfs `FS_NOCOW_FL`) so write-once SSTs avoid the
+    /// copy-on-write fragmentation penalty. Preserved across rotations so every successor
+    /// table in the run is flagged the same way. No-op on non-CoW filesystems.
+    disable_cow_on_sst: bool,
+
     #[cfg(zstd_any)]
     zstd_dictionary: Option<Arc<crate::compression::ZstdDictionary>>,
 
@@ -168,6 +180,7 @@ impl MultiWriter {
 
             kv_checksum: None,
             use_seqno_in_index: false,
+            disable_cow_on_sst: false,
 
             #[cfg(zstd_any)]
             zstd_dictionary: None,
@@ -523,6 +536,17 @@ impl MultiWriter {
         self
     }
 
+    /// Wires the `disable_cow_on_sst_files` runtime config through to the inner
+    /// [`Writer`] (clearing per-file copy-on-write on the current output file) and
+    /// preserves it across rotations so every successor SST is flagged the same
+    /// way. A no-op on non-CoW filesystems.
+    #[must_use]
+    pub fn use_disable_cow_on_sst(mut self, disable_cow: bool) -> Self {
+        self.disable_cow_on_sst = disable_cow;
+        self.writer = self.writer.use_disable_cow(disable_cow);
+        self
+    }
+
     #[cfg(zstd_any)]
     #[must_use]
     pub fn use_zstd_dictionary(
@@ -565,6 +589,7 @@ impl MultiWriter {
             new_writer = new_writer.use_kv_checksums(policy, algo);
         }
         new_writer = new_writer.use_seqno_in_index(self.use_seqno_in_index);
+        new_writer = new_writer.use_disable_cow(self.disable_cow_on_sst);
 
         #[cfg(zstd_any)]
         {

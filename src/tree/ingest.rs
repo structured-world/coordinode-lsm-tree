@@ -141,6 +141,7 @@ impl<'a> Ingestion<'a> {
         writer = writer.use_sync_mode(tree.config.sync_mode);
 
         writer = writer.use_seqno_in_index(rc.seqno_in_index);
+        writer = writer.use_disable_cow_on_sst(rc.disable_cow_on_sst_files);
         writer = writer.use_kv_checksums(rc.kv_checksums, rc.kv_checksum_algo);
 
         #[cfg(zstd_any)]

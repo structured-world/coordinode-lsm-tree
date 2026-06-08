@@ -155,6 +155,7 @@ pub fn link_or_copy_cross_fs(
     dst_fs: &Arc<dyn Fs>,
     dst: &Path,
     sync_mode: SyncMode,
+    use_reflink: bool,
 ) -> std::io::Result<u64> {
     // Refuse to attempt `hard_link` unless both backends positively
     // assert (via `Fs::backend_id`) that they resolve paths against
@@ -167,6 +168,23 @@ pub fn link_or_copy_cross_fs(
         (Some(a), Some(b)) => a == b,
         _ => false,
     };
+
+    // Reflink fast path: when enabled and the destination filesystem reports
+    // O(1) reflink support (Btrfs / XFS-reflink / APFS), clone into an
+    // INDEPENDENT inode (modifying the checkpoint never touches the original,
+    // no max-links-per-inode limit) at copy-on-write cost. Gated on a shared
+    // namespace for the same reason as `hard_link` below: `reflink_file`
+    // resolves `src` through `dst_fs`, so a cross-namespace clone could capture
+    // the wrong file. `reflink_file` clones when it can and byte-copies on a
+    // rare decline, so it always yields an independent file or a genuine I/O
+    // error (the latter cleaned up by the caller's `PartialCheckpointGuard`).
+    if use_reflink
+        && shared_namespace
+        && dst.parent().is_some_and(|p| dst_fs.capabilities(p).reflink)
+    {
+        dst_fs.reflink_file(src, dst)?;
+        return Ok(dst_fs.metadata(dst)?.len);
+    }
 
     if shared_namespace {
         match dst_fs.hard_link(src, dst) {
@@ -287,6 +305,7 @@ pub fn link_tables(
     target_root: &Path,
     target_fs: &Arc<dyn Fs>,
     sync_mode: SyncMode,
+    use_reflink: bool,
 ) -> crate::Result<(usize, u64)> {
     let tables_dir = target_root.join(TABLES_FOLDER);
     let mut count = 0usize;
@@ -298,8 +317,15 @@ pub fn link_tables(
         // Source Fs may differ from `target_fs` when `level_routes` points
         // a hot tier at one backend (e.g. tmpfs) and the rest of the tree
         // at another. `link_or_copy_cross_fs` picks the right strategy.
-        let written = link_or_copy_cross_fs(&table.fs, &table.path, target_fs, &dst, sync_mode)
-            .map_err(crate::Error::from)?;
+        let written = link_or_copy_cross_fs(
+            &table.fs,
+            &table.path,
+            target_fs,
+            &dst,
+            sync_mode,
+            use_reflink,
+        )
+        .map_err(crate::Error::from)?;
         bytes = bytes.saturating_add(written);
         count = count.saturating_add(1);
     }
@@ -316,6 +342,7 @@ pub fn link_blob_files(
     target_root: &Path,
     target_fs: &Arc<dyn Fs>,
     sync_mode: SyncMode,
+    use_reflink: bool,
 ) -> crate::Result<(usize, u64)> {
     let blobs_dir = target_root.join(BLOBS_FOLDER);
     let mut count = 0usize;
@@ -323,8 +350,15 @@ pub fn link_blob_files(
 
     for blob in blob_files {
         let dst = blobs_dir.join(blob_link_name(blob.id()));
-        let written = link_or_copy_cross_fs(&blob.0.fs, &blob.0.path, target_fs, &dst, sync_mode)
-            .map_err(crate::Error::from)?;
+        let written = link_or_copy_cross_fs(
+            &blob.0.fs,
+            &blob.0.path,
+            target_fs,
+            &dst,
+            sync_mode,
+            use_reflink,
+        )
+        .map_err(crate::Error::from)?;
         bytes = bytes.saturating_add(written);
         count = count.saturating_add(1);
     }
@@ -681,7 +715,14 @@ pub fn run_checkpoint<T: AbstractTree>(
     // Checkpoint fsyncs follow the source tree's configured durability.
     let sync_mode = tree.tree_config().sync_mode;
 
-    let (sst_files, sst_bytes) = link_tables(&version, target_root, target_fs, sync_mode)?;
+    // Reflink the snapshot files when the live config opts in (default) and
+    // the destination filesystem supports it; otherwise the hard-link path is
+    // used. Read from the captured live RuntimeConfig so a runtime toggle is
+    // honoured.
+    let use_reflink = params.runtime_config.use_reflink_for_checkpoint;
+
+    let (sst_files, sst_bytes) =
+        link_tables(&version, target_root, target_fs, sync_mode, use_reflink)?;
 
     let (blob_files, blob_bytes) = if include_blobs {
         link_blob_files(
@@ -689,6 +730,7 @@ pub fn run_checkpoint<T: AbstractTree>(
             target_root,
             target_fs,
             sync_mode,
+            use_reflink,
         )?
     } else {
         (0, 0)
@@ -773,7 +815,11 @@ mod tests {
         mem_fs.create_dir_all(Path::new("/dst")).unwrap();
 
         let dst = Path::new("/dst/payload.bin");
-        let bytes = link_or_copy_cross_fs(&std_fs, &src, &mem_fs, dst, SyncMode::Normal).unwrap();
+        // use_reflink = true, but src/dst are different backends (StdFs vs
+        // MemFs) so the reflink + hard_link paths are both gated out by the
+        // shared-namespace check, exercising the cross-fs streamed copy.
+        let bytes =
+            link_or_copy_cross_fs(&std_fs, &src, &mem_fs, dst, SyncMode::Normal, true).unwrap();
         assert_eq!(bytes, b"cross-fs-payload".len() as u64);
 
         // Bytes landed in MemFs.
