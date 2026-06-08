@@ -149,6 +149,24 @@ impl<'a, Item: Decodable<Parsed>, Parsed: ParsedItem<Item>> Decoder<'a, Item, Pa
         self.restart_interval
     }
 
+    /// Byte length of the entry region (offset where the trailer begins).
+    /// Test-only: lets headerless-decode tests slice the exact entry region.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn entries_end_for_test(&self) -> Option<usize> {
+        self.cached_entries_end
+    }
+
+    /// Entry-region bytes the decoder parses. Single seam for byte access so a
+    /// lazily-decoded backing (decode only the inner blocks a read covers) can
+    /// later replace the resident slice without touching every read site.
+    /// Returns `'a`-lifetime bytes (tied to the block, not `&self`), preserving
+    /// the disjoint borrow that lets reads coexist with scanner-state mutation.
+    #[inline]
+    fn entries(&self) -> &'a [u8] {
+        &self.block.data
+    }
+
     /// Extracts the reusable trailer metadata from a fully-constructed
     /// decoder so future decodes of the same block can skip the trailer
     /// parse via [`Self::from_meta`].
@@ -301,6 +319,98 @@ impl<'a, Item: Decodable<Parsed>, Parsed: ParsedItem<Item>> Decoder<'a, Item, Pa
         Self::try_new(block).expect("valid block trailer")
     }
 
+    /// Builds a forward-only decoder over a block whose bytes are JUST the
+    /// entry region, with NO trailer (restart array / binary index / hash
+    /// index). Used for partial-decode reads, where `block.data` is the
+    /// contiguous decompressed prefix of a subset of inner zstd blocks (the
+    /// trailer lives in a later inner block that was skipped).
+    ///
+    /// Only forward iteration ([`Iterator::next`]) is valid: there is no
+    /// index, so seeking / binary search / backward iteration are unsupported.
+    /// `restart_interval` must match the value the block was encoded with
+    /// (per-SST constant from `TableMeta`); restart heads are positional, so
+    /// the forward scan reconstructs every key from byte 0 without the trailer.
+    /// `entries_end` is the length of the entry region (== `block.data.len()`
+    /// for a clean prefix); a partial prefix may end mid-entry, in which case
+    /// the final truncated entry parses to `None` and iteration stops cleanly
+    /// before it.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `restart_interval == 0` (a zero interval has no restart heads,
+    /// so positional restart tracking is undefined).
+    #[cfg(feature = "zstd")]
+    #[must_use]
+    pub(crate) fn new_forward_headerless(
+        block: &'a Block,
+        restart_interval: u8,
+        entries_end: usize,
+    ) -> Self {
+        assert!(
+            restart_interval > 0,
+            "restart_interval must be non-zero for headerless forward decode",
+        );
+        Self {
+            block,
+            phantom: PhantomData,
+            lo_scanner: LoScanner {
+                offset: 0,
+                remaining_in_interval: 0,
+                base_key_offset: None,
+                base_key_end: None,
+            },
+            // No backward cursor: base_key_offset stays None so `next` never
+            // treats the (zeroed) hi_scanner.offset as an upper bound.
+            hi_scanner: HiScanner {
+                offset: 0,
+                ptr_idx: 0,
+                stack: Vec::new(),
+                base_key_offset: None,
+                base_key_end: None,
+            },
+            restart_interval,
+            // No trailer/index: keep these zeroed. Forward `next` reads neither.
+            binary_index_step_size: 2,
+            binary_index_offset: 0,
+            binary_index_len: 0,
+            hash_index_len: 0,
+            hash_index_offset: 0,
+            cached_entries_end: Some(entries_end),
+        }
+    }
+
+    /// Forward-scan a headerless block, returning the byte offset of every
+    /// restart head, the count of complete entries, and the byte offset just
+    /// past the last complete entry. Used to synthesize a binary-index trailer
+    /// over a decoded prefix (whose tail may be a truncated entry, which this
+    /// scan stops cleanly before — see [`Self::new_forward_headerless`]).
+    #[cfg(feature = "zstd")]
+    pub(crate) fn scan_restart_offsets(mut self) -> (Vec<u32>, usize, usize) {
+        let mut restart_offsets = Vec::new();
+        let mut item_count = 0usize;
+        // `next()` clobbers `lo_scanner.offset` to `data.len()` when it stops on
+        // a truncated tail entry, so track the end of the last COMPLETE entry
+        // ourselves rather than reading the post-loop scanner offset.
+        let mut last_complete_end = 0usize;
+        loop {
+            let is_restart = self.lo_scanner.remaining_in_interval == 0;
+            let head = self.lo_scanner.offset;
+            if self.next().is_none() {
+                break;
+            }
+            if is_restart {
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "block offsets are far below u32::MAX"
+                )]
+                restart_offsets.push(head as u32);
+            }
+            item_count += 1;
+            last_complete_end = self.lo_scanner.offset;
+        }
+        (restart_offsets, item_count, last_complete_end)
+    }
+
     fn binary_index_bounds(&self) -> Option<(usize, usize)> {
         let step_size = match self.binary_index_step_size {
             2 | 4 => usize::from(self.binary_index_step_size),
@@ -369,7 +479,7 @@ impl<'a, Item: Decodable<Parsed>, Parsed: ParsedItem<Item>> Decoder<'a, Item, Pa
         if pos >= entries_end {
             return None;
         }
-        let bytes = &self.block.data;
+        let bytes = self.entries();
         let mut cursor = Self::reader_at(bytes, pos)?;
         Item::parse_restart_key(&mut cursor, pos, bytes, entries_end)
     }
@@ -512,7 +622,7 @@ impl<'a, Item: Decodable<Parsed>, Parsed: ParsedItem<Item>> Decoder<'a, Item, Pa
     }
 
     fn exhaust(&mut self) {
-        let end = self.block.data.len();
+        let end = self.entries().len();
 
         self.lo_scanner.offset = end;
         self.lo_scanner.remaining_in_interval = 0;
@@ -673,7 +783,7 @@ impl<'a, Item: Decodable<Parsed>, Parsed: ParsedItem<Item>> Decoder<'a, Item, Pa
             self.hi_scanner.offset = binary_index.get(self.hi_scanner.ptr_idx);
 
             let offset = self.hi_scanner.offset;
-            let Some(mut reader) = Self::reader_at(&self.block.data, offset) else {
+            let Some(mut reader) = Self::reader_at(self.entries(), offset) else {
                 self.poison_back_cursor();
                 return;
             };
@@ -699,7 +809,7 @@ impl<'a, Item: Decodable<Parsed>, Parsed: ParsedItem<Item>> Decoder<'a, Item, Pa
 
         for _ in 1..self.restart_interval {
             let offset = self.hi_scanner.offset;
-            let Some(mut reader) = Self::reader_at(&self.block.data, offset) else {
+            let Some(mut reader) = Self::reader_at(self.entries(), offset) else {
                 self.poison_back_cursor();
                 return;
             };
@@ -744,7 +854,7 @@ impl<'a, Item: Decodable<Parsed>, Parsed: ParsedItem<Item>> Decoder<'a, Item, Pa
 
         let is_restart = self.hi_scanner.stack.is_empty();
 
-        let mut reader = Self::reader_at(&self.block.data, offset)?;
+        let mut reader = Self::reader_at(self.entries(), offset)?;
 
         Self::parse_current_item(
             &mut reader,
@@ -773,7 +883,7 @@ impl<'a, Item: Decodable<Parsed>, Parsed: ParsedItem<Item>> Decoder<'a, Item, Pa
 
             let is_restart = self.lo_scanner.remaining_in_interval == 0;
 
-            let Some(mut reader) = Self::reader_at(&self.block.data, self.lo_scanner.offset) else {
+            let Some(mut reader) = Self::reader_at(self.entries(), self.lo_scanner.offset) else {
                 break;
             };
 
@@ -788,7 +898,7 @@ impl<'a, Item: Decodable<Parsed>, Parsed: ParsedItem<Item>> Decoder<'a, Item, Pa
                 break;
             };
 
-            if !pred(&item, &self.block.data) {
+            if !pred(&item, self.entries()) {
                 break;
             }
 
@@ -834,7 +944,7 @@ impl<'a, Item: Decodable<Parsed>, Parsed: ParsedItem<Item>> Decoder<'a, Item, Pa
 
             let is_restart = self.hi_scanner.stack.len() == 1;
 
-            let Some(mut reader) = Self::reader_at(&self.block.data, offset) else {
+            let Some(mut reader) = Self::reader_at(self.entries(), offset) else {
                 break;
             };
 
@@ -849,7 +959,7 @@ impl<'a, Item: Decodable<Parsed>, Parsed: ParsedItem<Item>> Decoder<'a, Item, Pa
                 break;
             };
 
-            if cmp(&item, &self.block.data) != std::cmp::Ordering::Greater {
+            if cmp(&item, self.entries()) != std::cmp::Ordering::Greater {
                 break;
             }
 
@@ -864,7 +974,7 @@ impl<'a, Item: Decodable<Parsed>, Parsed: ParsedItem<Item>> Decoder<'a, Item, Pa
         let should_restore = if let Some(&offset) = self.hi_scanner.stack.last() {
             let is_restart = self.hi_scanner.stack.len() == 1;
 
-            let Some(mut reader) = Self::reader_at(&self.block.data, offset) else {
+            let Some(mut reader) = Self::reader_at(self.entries(), offset) else {
                 return;
             };
 
@@ -879,7 +989,7 @@ impl<'a, Item: Decodable<Parsed>, Parsed: ParsedItem<Item>> Decoder<'a, Item, Pa
                 return;
             };
 
-            cmp(&item, &self.block.data) == std::cmp::Ordering::Less
+            cmp(&item, self.entries()) == std::cmp::Ordering::Less
         } else {
             true
         };
@@ -899,7 +1009,7 @@ impl<'a, Item: Decodable<Parsed>, Parsed: ParsedItem<Item>> Decoder<'a, Item, Pa
         };
         let is_restart = self.hi_scanner.stack.len() == 1;
 
-        let Some(mut reader) = Self::reader_at(&self.block.data, offset) else {
+        let Some(mut reader) = Self::reader_at(self.entries(), offset) else {
             return;
         };
 
@@ -930,7 +1040,7 @@ impl<'a, Item: Decodable<Parsed>, Parsed: ParsedItem<Item>> Decoder<'a, Item, Pa
         let entries_end = self.entries_end()?;
         let is_restart = self.hi_scanner.stack.len() == 1;
 
-        let mut reader = Self::reader_at(&self.block.data, offset)?;
+        let mut reader = Self::reader_at(self.entries(), offset)?;
 
         let item = Self::parse_current_item(
             &mut reader,
@@ -941,7 +1051,7 @@ impl<'a, Item: Decodable<Parsed>, Parsed: ParsedItem<Item>> Decoder<'a, Item, Pa
             entries_end,
         )?;
 
-        Some(cmp(&item, &self.block.data))
+        Some(cmp(&item, self.entries()))
     }
 
     #[must_use]
@@ -976,7 +1086,7 @@ impl<Item: Decodable<Parsed>, Parsed: ParsedItem<Item>> Iterator for Decoder<'_,
 
     fn next(&mut self) -> Option<Self::Item> {
         let entries_end = self.entries_end()?;
-        if self.lo_scanner.offset >= self.block.data.len() {
+        if self.lo_scanner.offset >= self.entries().len() {
             return None;
         }
 
@@ -988,7 +1098,7 @@ impl<Item: Decodable<Parsed>, Parsed: ParsedItem<Item>> Iterator for Decoder<'_,
 
         let is_restart: bool = self.lo_scanner.remaining_in_interval == 0;
 
-        let mut reader = Cursor::new(self.block.data.get(self.lo_scanner.offset..)?);
+        let mut reader = Cursor::new(self.entries().get(self.lo_scanner.offset..)?);
 
         #[expect(
             clippy::cast_possible_truncation,
@@ -1018,7 +1128,7 @@ impl<Item: Decodable<Parsed>, Parsed: ParsedItem<Item>> Iterator for Decoder<'_,
                 self.lo_scanner.remaining_in_interval -= 1;
             }
         } else {
-            self.lo_scanner.offset = self.block.data.len();
+            self.lo_scanner.offset = self.entries().len();
             self.lo_scanner.remaining_in_interval = 0;
             self.lo_scanner.base_key_offset = None;
             self.lo_scanner.base_key_end = None;

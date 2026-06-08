@@ -4,12 +4,15 @@
 
 pub mod block;
 pub(crate) mod block_index;
+pub(crate) mod block_layout;
 pub mod data_block;
 pub mod filter;
 mod id;
 mod index_block;
 mod inner;
 pub(crate) mod iter;
+#[cfg(feature = "zstd")]
+pub(crate) mod lazy_block;
 pub(crate) mod meta;
 pub(crate) mod multi_writer;
 pub(crate) mod regions;
@@ -906,6 +909,10 @@ impl Table {
             #[cfg(zstd_any)]
             self.zstd_dictionary.clone(),
             self.comparator.clone(),
+            #[cfg(feature = "zstd")]
+            self.block_layout.clone(),
+            #[cfg(feature = "zstd")]
+            self.metadata.data_block_restart_interval,
             #[cfg(feature = "metrics")]
             self.metrics.clone(),
         );
@@ -1374,6 +1381,52 @@ impl Table {
             Vec::new()
         };
 
+        // Load the optional inner-block layout section (present only when the
+        // table has data blocks that split into >= 2 inner zstd blocks). Mirrors
+        // the range-tombstone loader: same Plain/Encrypted (+ optional ECC)
+        // transform the writer used for this uncompressed meta section.
+        let block_layout = if let Some(bl_handle) = regions.block_layout {
+            let block = Block::from_file(
+                file_handle.as_ref(),
+                bl_handle,
+                crate::table::block::BlockIdentity {
+                    tree_id: 0,
+                    table_id: metadata.id,
+                    block_offset: *bl_handle.offset(),
+                    block_type: BlockType::BlockLayout,
+                    dict_id: 0,
+                    window_log: 0,
+                },
+                &{
+                    let t = match encryption.as_deref() {
+                        Some(enc) => crate::table::block::BlockTransform::Encrypted(enc),
+                        None => crate::table::block::BlockTransform::PLAIN,
+                    };
+                    if let Some(ecc) = metadata.ecc_params {
+                        t.with_ecc(ecc)
+                    } else {
+                        t
+                    }
+                },
+            )?;
+
+            if block.header.block_type != BlockType::BlockLayout {
+                return Err(crate::Error::InvalidTag((
+                    "BlockType",
+                    block.header.block_type.into(),
+                )));
+            }
+
+            let map = crate::table::block_layout::BlockLayoutMap::decode(&block.data)?;
+            log::trace!(
+                "Loaded block-layout index with {} multi-inner-block entries",
+                map.len(),
+            );
+            map
+        } else {
+            crate::table::block_layout::BlockLayoutMap::default()
+        };
+
         log::debug!(
             "Recovered table #{} from {}",
             metadata.id,
@@ -1410,6 +1463,7 @@ impl Table {
 
             cached_blob_bytes: std::sync::OnceLock::new(),
             range_tombstones,
+            block_layout,
             encryption,
 
             #[cfg(zstd_any)]

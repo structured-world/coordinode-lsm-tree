@@ -181,6 +181,13 @@ pub(crate) struct PreparedBlock<'a> {
     /// Reed-Solomon parity trailer, present only when page-ECC is active and
     /// the payload was non-empty. Always `None` without the `page_ecc` feature.
     parity: Option<Vec<u8>>,
+    /// Inner zstd-block layout of the compressed payload: cumulative
+    /// decompressed END offsets, one per inner block (the last equals the
+    /// uncompressed length). Empty unless this is a `Data` block compressed
+    /// into >= 2 inner zstd blocks; lets the reader partial-decode a key-range
+    /// subset instead of the whole block. See
+    /// [`CompressionProvider::compress_with_layout`](crate::compression::CompressionProvider::compress_with_layout).
+    pub(crate) layout: Vec<u32>,
 }
 
 impl PreparedBlock<'_> {
@@ -194,6 +201,7 @@ impl PreparedBlock<'_> {
             header: self.header,
             payload: Cow::Owned(self.payload.into_owned()),
             parity: self.parity,
+            layout: self.layout,
         }
     }
 
@@ -504,6 +512,16 @@ impl Block {
         #[cfg(any(feature = "lz4", zstd_any))]
         let mut compressed_buf: Option<Vec<u8>> = None;
 
+        // Inner zstd-block layout, captured only for Data blocks compressed with
+        // a non-dict zstd codec that split into >= 2 inner blocks (empty
+        // otherwise). Enables range-query partial decode of large cold blocks.
+        // `mut` is only exercised by the zstd Data arm below.
+        #[cfg_attr(
+            not(zstd_any),
+            expect(unused_mut, reason = "`layout` is only mutated on zstd-enabled builds")
+        )]
+        let mut layout: Vec<u32> = Vec::new();
+
         match compression {
             CompressionType::None => {}
 
@@ -514,7 +532,14 @@ impl Block {
 
             #[cfg(zstd_any)]
             CompressionType::Zstd(level) => {
-                compressed_buf = Some(crate::compression::ZstdBackend::compress(data, level)?);
+                if block_type == BlockType::Data {
+                    let (buf, lay) =
+                        crate::compression::ZstdBackend::compress_with_layout(data, level)?;
+                    compressed_buf = Some(buf);
+                    layout = lay;
+                } else {
+                    compressed_buf = Some(crate::compression::ZstdBackend::compress(data, level)?);
+                }
             }
 
             #[cfg(zstd_any)]
@@ -642,6 +667,7 @@ impl Block {
             header,
             payload,
             parity: parity_buf,
+            layout,
         })
     }
 
@@ -966,25 +992,25 @@ impl Block {
         // near-limit encrypted+ECC blocks the writer can produce.
         let enc_overhead = encryption.map_or(0u64, |e| u64::from(e.max_overhead()));
         let max_payload = u64::from(MAX_DECOMPRESSION_SIZE) + enc_overhead;
-        // ECC parity scales with the (data_shards, parity_shards) scheme, not a
-        // fixed RS(4,2). A high-overhead scheme (parity_shards > data_shards /
-        // 2, e.g. RS(2,4)) produces a larger trailer than the old `N/2 + 4`
-        // RS(4,2) approximation, so that bound would reject a legitimate
-        // near-limit block. Size the cap from the actual scheme this block is
-        // read with (`transform.ecc_params()`), keeping RS(4,2) in the running
-        // max so self-describing blocks (which carry no transform ECC but are
-        // written RS(4,2)) stay covered.
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "max_payload is MAX_DECOMPRESSION_SIZE (+ enc overhead), well below u32::MAX"
-        )]
-        let max_payload_u32 = max_payload.min(u64::from(u32::MAX)) as u32;
-        let max_ecc_overhead = [Some(EccParams::RS_4_2), transform.ecc_params()]
-            .into_iter()
-            .flatten()
-            .map(|params| u64::from(expected_parity_len(max_payload_u32, params)))
-            .max()
-            .unwrap_or(0);
+        // Pre-allocation sanity cap on `handle.size()`: reject an absurd on-disk
+        // size before allocating the read buffer. The ECC-OFF path adds NO ECC
+        // term and runs NO ECC math — when there is no parity, the cap is just
+        // payload + header. When ECC is on, the cap allows the block's ACTUAL
+        // scheme parity (from the per-SST descriptor carried by `transform`),
+        // never a hardcoded scheme. Self-describing blocks (Meta / Manifest)
+        // carry their own small RS parity but are orders of magnitude below
+        // `max_payload`, so they pass this cap without an explicit ECC term.
+        let max_ecc_overhead = match transform.ecc_params() {
+            Some(params) => {
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "max_payload is MAX_DECOMPRESSION_SIZE (+ enc overhead), well below u32::MAX"
+                )]
+                let max_payload_u32 = max_payload.min(u64::from(u32::MAX)) as u32;
+                u64::from(expected_parity_len(max_payload_u32, params))
+            }
+            None => 0,
+        };
         let max_on_disk_size = max_payload + max_ecc_overhead + Header::MAX_LEN as u64;
 
         if u64::from(handle.size()) > max_on_disk_size {
@@ -1344,6 +1370,109 @@ impl Block {
 
         Ok((Self { header, data }, ecc_status))
     }
+
+    /// Reads a data block's verified COMPRESSED payload (the zstd frame) WITHOUT
+    /// decompressing it, for partial / lazy decode. Returns the header and the
+    /// compressed-frame bytes (checksum-verified; ECC-recovered if a recognized
+    /// parity trailer is present).
+    ///
+    /// Non-encrypted blocks only — the caller must ensure
+    /// `transform.encryption().is_none()` (an encrypted block's plaintext frame
+    /// is only available after a whole-block decrypt, which defeats the lazy
+    /// path). Mirrors the non-encrypted read+verify of
+    /// [`Self::from_file_with_status`], stopping before decompression.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on a framing / checksum failure (unrecoverable), or if
+    /// called for an encrypted transform.
+    #[cfg(feature = "zstd")]
+    pub(crate) fn read_data_frame(
+        file: &dyn FsFile,
+        handle: BlockHandle,
+        transform: &BlockTransform<'_>,
+    ) -> crate::Result<(Header, Slice)> {
+        if transform.encryption().is_some() {
+            return Err(crate::Error::Io(std::io::Error::other(
+                "read_data_frame: encrypted blocks are not supported on the lazy path",
+            )));
+        }
+
+        // Pre-allocation sanity cap on `handle.size()`, mirroring
+        // `from_file_with_status`: reject an absurd on-disk size before
+        // allocating the read buffer, so a corrupt handle cannot force a huge
+        // allocation. Non-encrypted path (encryption rejected above), so no
+        // encryption overhead; the ECC term uses the block's ACTUAL per-SST
+        // scheme (never a hardcoded one) and is 0 when there is no parity.
+        let max_ecc_overhead = match transform.ecc_params() {
+            Some(params) => u64::from(expected_parity_len(MAX_DECOMPRESSION_SIZE, params)),
+            None => 0,
+        };
+        let max_on_disk_size =
+            u64::from(MAX_DECOMPRESSION_SIZE) + max_ecc_overhead + Header::MAX_LEN as u64;
+        if u64::from(handle.size()) > max_on_disk_size {
+            return Err(crate::Error::DecompressedSizeTooLarge {
+                declared: u64::from(handle.size()),
+                limit: max_on_disk_size,
+            });
+        }
+
+        let buf = crate::file::read_exact(file, *handle.offset(), handle.size() as usize)?;
+        let parsed_header = Header::decode_from(&mut &buf[..])?;
+        // Reject a header that declares a decompressed size past the cap before
+        // the lazy decode path trusts it.
+        if parsed_header.uncompressed_length > MAX_DECOMPRESSION_SIZE {
+            return Err(crate::Error::DecompressedSizeTooLarge {
+                declared: u64::from(parsed_header.uncompressed_length),
+                limit: u64::from(MAX_DECOMPRESSION_SIZE),
+            });
+        }
+        let header_len = Header::header_len(parsed_header.block_type);
+
+        let has_ecc = block_has_parity(&parsed_header, transform);
+        let ecc_length = if has_ecc {
+            expected_parity_len(
+                parsed_header.data_length,
+                block_ecc_params(&parsed_header, transform),
+            )
+        } else {
+            0
+        };
+
+        let actual_payload_plus_ecc = buf.len().saturating_sub(header_len);
+        let actual_data_len = parsed_header.data_length as usize;
+        let _ecc_status = classify_block_trailer(
+            has_ecc,
+            actual_payload_plus_ecc,
+            actual_data_len,
+            ecc_length,
+            &handle,
+        )?;
+
+        let payload: Slice = if ecc_length == 0 {
+            #[expect(
+                clippy::indexing_slicing,
+                reason = "actual_data_len <= post-header len, checked via classify_block_trailer"
+            )]
+            let checksum = Checksum::from_raw(crate::hash::hash128(
+                &buf[header_len..header_len + actual_data_len],
+            ));
+            checksum.check(parsed_header.checksum)?;
+            buf.slice(header_len..header_len + actual_data_len)
+        } else {
+            #[expect(clippy::indexing_slicing, reason = "header was decoded from buf")]
+            let mut cursor = std::io::Cursor::new(&buf[header_len..]);
+            Slice::from(Self::read_payload_and_verify(
+                &mut cursor,
+                parsed_header.data_length,
+                ecc_length,
+                parsed_header.checksum,
+                block_ecc_params(&parsed_header, transform),
+            )?)
+        };
+
+        Ok((parsed_header, payload))
+    }
 }
 
 #[cfg(test)]
@@ -1477,6 +1606,61 @@ mod tests {
             )?,
         )?;
         assert_eq!(data, &*block.data);
+        Ok(())
+    }
+
+    #[cfg(feature = "zstd")]
+    #[test]
+    fn read_data_frame_returns_decompressible_zstd_frame() -> crate::Result<()> {
+        // Repetitive payload so zstd produces a real (smaller) compressed frame.
+        let data: Vec<u8> = (0..40_000u32).map(|i| (i % 64) as u8).collect();
+        let transform =
+            crate::table::block::BlockTransform::from_parts(CompressionType::Zstd(3), None, None)?;
+        let tmp = write_block_to_tempfile(
+            &data,
+            crate::table::block::BlockIdentity::for_test(0, 0, BlockType::Data),
+            &transform,
+        )?;
+
+        let (header, frame) = Block::read_data_frame(&tmp.file, tmp.handle, &transform)?;
+        // The returned bytes are the COMPRESSED frame: it must be smaller than
+        // the payload and must decompress back to the original (proving
+        // read_data_frame skipped decode yet returned a valid frame).
+        assert!(
+            frame.len() < data.len(),
+            "frame must be compressed (got {} for {} bytes)",
+            frame.len(),
+            data.len(),
+        );
+        let decompressed = crate::compression::ZstdBackend::decompress(
+            &frame,
+            header.uncompressed_length as usize + 1,
+        )?;
+        assert_eq!(decompressed, data, "frame must decompress to the original");
+        Ok(())
+    }
+
+    #[cfg(feature = "zstd")]
+    #[test]
+    fn read_data_frame_rejects_oversized_handle() -> crate::Result<()> {
+        // A handle declaring an absurd on-disk size must be rejected by the
+        // pre-allocation cap before any read / allocation, mirroring
+        // `from_file_with_status`.
+        let data: Vec<u8> = (0..1_000u32).map(|i| (i % 64) as u8).collect();
+        let transform =
+            crate::table::block::BlockTransform::from_parts(CompressionType::Zstd(3), None, None)?;
+        let tmp = write_block_to_tempfile(
+            &data,
+            crate::table::block::BlockIdentity::for_test(0, 0, BlockType::Data),
+            &transform,
+        )?;
+        let oversized = BlockHandle::new(tmp.handle.offset(), u32::MAX);
+        let err = Block::read_data_frame(&tmp.file, oversized, &transform)
+            .expect_err("oversized handle must be rejected");
+        assert!(
+            matches!(err, crate::Error::DecompressedSizeTooLarge { .. }),
+            "expected DecompressedSizeTooLarge, got {err:?}",
+        );
         Ok(())
     }
 

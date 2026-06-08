@@ -5,7 +5,10 @@
 #[cfg(feature = "metrics")]
 use crate::metrics::Metrics;
 
-use super::{block_index::BlockIndexImpl, meta::ParsedMeta, regions::ParsedRegions};
+use super::{
+    block_index::BlockIndexImpl, block_layout::BlockLayoutMap, meta::ParsedMeta,
+    regions::ParsedRegions,
+};
 use crate::deletion_pause::DeletionPause;
 use crate::{
     Checksum, GlobalTableId, SeqNo,
@@ -78,6 +81,21 @@ pub struct Inner {
 
     /// Range tombstones stored in this table. Loaded on open.
     pub(crate) range_tombstones: Vec<RangeTombstone>,
+
+    /// Inner zstd-block layout index, loaded on open from the optional
+    /// `block_layout` section. Empty (no entries) when the table has no
+    /// multi-inner-block data blocks. Lets a range query partial-decode only
+    /// the inner blocks covering a key range in a large cold block.
+    // Read only by the zstd partial-decode path; in a no-zstd build it is still
+    // loaded (always empty there, since no zstd blocks ever split) but unread.
+    #[cfg_attr(
+        not(feature = "zstd"),
+        expect(
+            dead_code,
+            reason = "consumed only by the zstd partial-decode read path"
+        )
+    )]
+    pub(crate) block_layout: BlockLayoutMap,
 
     /// Block encryption provider for encryption at rest.
     pub(crate) encryption: Option<Arc<dyn EncryptionProvider>>,

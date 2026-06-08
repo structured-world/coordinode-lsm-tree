@@ -25,6 +25,24 @@ pub trait CompressionProvider {
     /// Compress `data` at the given zstd level (1–22).
     fn compress(data: &[u8], level: i32) -> crate::Result<Vec<u8>>;
 
+    /// Compress `data`, additionally returning the inner zstd-block layout of
+    /// the produced frame: the cumulative decompressed END offset of each inner
+    /// block (a monotonically increasing prefix sum whose last entry equals the
+    /// total decompressed size). A reader can binary-search this array to map a
+    /// decompressed byte offset to the inner-block index covering it, then
+    /// partial-decode only the covering blocks (see
+    /// [`FrameDecoder::decode_blocks_partial`](structured_zstd::decoding::FrameDecoder::decode_blocks_partial)).
+    ///
+    /// The layout is returned **empty** when the frame is a single inner block
+    /// (nothing to skip, so the caller persists no per-block table) or when the
+    /// backend could not capture it. The compressed bytes are identical to
+    /// [`compress`](Self::compress); only the side-channel layout differs.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if compression fails.
+    fn compress_with_layout(data: &[u8], level: i32) -> crate::Result<(Vec<u8>, Vec<u32>)>;
+
     /// Decompress a zstd frame, pre-allocating `capacity` bytes.
     fn decompress(data: &[u8], capacity: usize) -> crate::Result<Vec<u8>>;
 

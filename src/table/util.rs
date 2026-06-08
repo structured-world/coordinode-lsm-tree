@@ -92,9 +92,10 @@ pub fn load_block(
             BlockType::Data | BlockType::Meta => {
                 metrics.data_block_load_cached.fetch_add(1, Relaxed);
             }
-            // Manifest variants are rejected by the function-level
-            // guard above; nothing to do here.
-            BlockType::Manifest | BlockType::ManifestFooter => {}
+            // Manifest variants are rejected by the function-level guard
+            // above; the block-layout section is loaded once on open via
+            // `Block::from_file`, never through this cached data-block path.
+            BlockType::Manifest | BlockType::ManifestFooter | BlockType::BlockLayout => {}
         }
 
         return Ok(block);
@@ -191,9 +192,10 @@ pub fn load_block(
                 .data_block_io_requested
                 .fetch_add(handle.size().into(), Relaxed);
         }
-        // Manifest variants are rejected by the function-level
-        // guard above; nothing to do here.
-        BlockType::Manifest | BlockType::ManifestFooter => {}
+        // Manifest variants are rejected by the function-level guard above;
+        // the block-layout section is loaded once on open via
+        // `Block::from_file`, never through this cached data-block path.
+        BlockType::Manifest | BlockType::ManifestFooter | BlockType::BlockLayout => {}
     }
 
     cache.insert_block(table_id, handle.offset(), block.clone());
