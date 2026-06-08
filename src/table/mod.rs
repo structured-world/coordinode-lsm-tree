@@ -1090,7 +1090,7 @@ impl Table {
         let metadata = match ParsedMeta::load_with_handle(
             &*file,
             &regions.metadata,
-            table_id,
+            Some(table_id),
             encryption.as_deref(),
         ) {
             Ok(m) => m,
@@ -1116,7 +1116,7 @@ impl Table {
                     match ParsedMeta::load_with_handle(
                         &*file,
                         &mid_handle,
-                        table_id,
+                        Some(table_id),
                         encryption.as_deref(),
                     ) {
                         Ok(mid) => mid,

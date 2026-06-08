@@ -2373,7 +2373,7 @@ fn meta_seqno_kv_max_corruption_returns_invalid_data() -> crate::Result<()> {
         let trailer = crate::sfa::Reader::from_reader(&mut f)?;
         let regions = ParsedRegions::parse_from_toc(trailer.toc())?;
 
-        let result = ParsedMeta::load_with_handle(&f, &regions.metadata, 0, None);
+        let result = ParsedMeta::load_with_handle(&f, &regions.metadata, None, None);
 
         let err = result.expect_err("corrupted seqno#kv_max should cause an error");
         assert!(
@@ -2419,11 +2419,11 @@ fn meta_mid_and_tail_have_identical_created_at() -> crate::Result<()> {
     let trailer = crate::sfa::Reader::from_reader(&mut f)?;
     let regions = ParsedRegions::parse_from_toc(trailer.toc())?;
 
-    let tail = ParsedMeta::load_with_handle(&f, &regions.metadata, 0, None)?;
+    let tail = ParsedMeta::load_with_handle(&f, &regions.metadata, None, None)?;
     let mid_handle = regions
         .metadata_mid
         .expect("writer must emit meta_mid alongside meta");
-    let mid = ParsedMeta::load_with_handle(&f, &mid_handle, 0, None)?;
+    let mid = ParsedMeta::load_with_handle(&f, &mid_handle, None, None)?;
 
     assert_eq!(
         tail.created_at, mid.created_at,
@@ -2481,11 +2481,11 @@ fn meta_mid_and_tail_have_identical_file_size() -> crate::Result<()> {
     let trailer = crate::sfa::Reader::from_reader(&mut f)?;
     let regions = ParsedRegions::parse_from_toc(trailer.toc())?;
 
-    let tail = ParsedMeta::load_with_handle(&f, &regions.metadata, 0, None)?;
+    let tail = ParsedMeta::load_with_handle(&f, &regions.metadata, None, None)?;
     let mid_handle = regions
         .metadata_mid
         .expect("writer must emit meta_mid alongside meta");
-    let mid = ParsedMeta::load_with_handle(&f, &mid_handle, 0, None)?;
+    let mid = ParsedMeta::load_with_handle(&f, &mid_handle, None, None)?;
 
     assert_eq!(
         tail.file_size, mid.file_size,

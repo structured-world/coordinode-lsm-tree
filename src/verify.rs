@@ -734,7 +734,7 @@ fn read_ecc_params_out_of_band(
         // table_id is moot here: this scrub path reads unencrypted meta
         // (encryption = None), so the AAD identity is unused.
         if let Ok(meta) =
-            crate::table::meta::ParsedMeta::load_with_handle(probe.as_ref(), &handle, 0, None)
+            crate::table::meta::ParsedMeta::load_with_handle(probe.as_ref(), &handle, None, None)
         {
             let state = if meta.ecc_unrecognized {
                 ScrubEcc::Unrecognized

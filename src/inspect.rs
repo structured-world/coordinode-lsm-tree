@@ -159,11 +159,11 @@ pub fn read_table_properties(path: &Path) -> crate::Result<TableProperties> {
     // `Table::recover` so a corrupted-tail SST that the live open
     // path can still recover also produces inspectable properties
     // here.
-    let meta = match ParsedMeta::load_with_handle(&*file, &regions.metadata, 0, None) {
+    let meta = match ParsedMeta::load_with_handle(&*file, &regions.metadata, None, None) {
         Ok(m) => m,
         Err(tail_err) => {
             if let Some(mid_handle) = regions.metadata_mid {
-                match ParsedMeta::load_with_handle(&*file, &mid_handle, 0, None) {
+                match ParsedMeta::load_with_handle(&*file, &mid_handle, None, None) {
                     Ok(mid) => mid,
                     Err(_) => return Err(tail_err),
                 }
@@ -282,11 +282,11 @@ pub fn read_top_level_index_entries(path: &Path) -> crate::Result<Vec<IndexEntry
     // TAIL-first / MID-fallback as `read_table_properties` above —
     // factored together so this function gives identical recovery
     // behaviour on a meta-corrupted SST.
-    let meta = match ParsedMeta::load_with_handle(&*file, &regions.metadata, 0, None) {
+    let meta = match ParsedMeta::load_with_handle(&*file, &regions.metadata, None, None) {
         Ok(m) => m,
         Err(tail_err) => {
             if let Some(mid_handle) = regions.metadata_mid {
-                match ParsedMeta::load_with_handle(&*file, &mid_handle, 0, None) {
+                match ParsedMeta::load_with_handle(&*file, &mid_handle, None, None) {
                     Ok(mid) => mid,
                     Err(_) => return Err(tail_err),
                 }
@@ -688,11 +688,11 @@ pub fn iter_data_block_entries(path: &Path) -> crate::Result<DataBlockEntryIter>
         )));
     }
 
-    let meta = match ParsedMeta::load_with_handle(&*file, &regions.metadata, 0, None) {
+    let meta = match ParsedMeta::load_with_handle(&*file, &regions.metadata, None, None) {
         Ok(m) => m,
         Err(tail_err) => {
             if let Some(mid_handle) = regions.metadata_mid {
-                match ParsedMeta::load_with_handle(&*file, &mid_handle, 0, None) {
+                match ParsedMeta::load_with_handle(&*file, &mid_handle, None, None) {
                     Ok(mid) => mid,
                     Err(_) => return Err(tail_err),
                 }
@@ -948,11 +948,11 @@ pub fn read_filter_stats(path: &Path) -> crate::Result<Option<FilterStats>> {
     // Meta block carries `item_count`. Same TAIL-first / MID-fallback
     // as `read_table_properties` so a partially-corrupted meta still
     // yields stats from the surviving copy.
-    let meta = match ParsedMeta::load_with_handle(&*file, &regions.metadata, 0, None) {
+    let meta = match ParsedMeta::load_with_handle(&*file, &regions.metadata, None, None) {
         Ok(m) => m,
         Err(tail_err) => {
             if let Some(mid_handle) = regions.metadata_mid {
-                match ParsedMeta::load_with_handle(&*file, &mid_handle, 0, None) {
+                match ParsedMeta::load_with_handle(&*file, &mid_handle, None, None) {
                     Ok(mid) => mid,
                     Err(_) => return Err(tail_err),
                 }

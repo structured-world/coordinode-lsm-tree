@@ -188,7 +188,7 @@ impl ParsedMeta {
     pub fn load_with_handle(
         file: &dyn FsFile,
         handle: &BlockHandle,
-        table_id: crate::TableId,
+        expected_table_id: Option<crate::TableId>,
         encryption: Option<&dyn crate::encryption::EncryptionProvider>,
     ) -> crate::Result<Self> {
         let block = Block::from_file(
@@ -202,7 +202,10 @@ impl ParsedMeta {
                 // another SST fails AEAD verification. `table_id` is durable
                 // across reopen (persisted as `metadata.id` + the file name),
                 // unlike the ephemeral tree id, so binding it is safe.
-                table_id,
+                // `None` (diagnostic readers / unencrypted opens) maps to 0:
+                // the AAD identity is unused without a provider, and no
+                // payload-id cross-check is enforced.
+                table_id: expected_table_id.unwrap_or(0),
                 block_type: BlockType::Meta,
                 dict_id: 0,
                 window_log: 0,
@@ -535,6 +538,16 @@ mod tests {
     /// Write a meta block from given items to a temp file and call
     /// `ParsedMeta::load_with_handle`, returning the result.
     fn load_meta_from_items(items: &[InternalValue]) -> crate::Result<ParsedMeta> {
+        load_meta_from_items_expecting(items, None)
+    }
+
+    /// Like [`load_meta_from_items`] but threads an explicit
+    /// `expected_table_id` into `load_with_handle` so the payload-id
+    /// cross-check can be exercised.
+    fn load_meta_from_items_expecting(
+        items: &[InternalValue],
+        expected_table_id: Option<TableId>,
+    ) -> crate::Result<ParsedMeta> {
         use std::io::Write;
 
         let encoded = DataBlock::encode_into_vec(items, 1, 0.0).unwrap();
@@ -559,7 +572,32 @@ mod tests {
         let file = std::fs::File::open(&path).unwrap();
         #[expect(clippy::cast_possible_truncation, reason = "test meta blocks are tiny")]
         let handle = BlockHandle::new(crate::table::BlockOffset(0), buf.len() as u32);
-        ParsedMeta::load_with_handle(&file, &handle, 0, None)
+        ParsedMeta::load_with_handle(&file, &handle, expected_table_id, None)
+    }
+
+    /// Regression: `valid_meta_items` encodes `table_id = 42`. When the caller
+    /// supplies a DIFFERENT `expected_table_id`, the parse must be rejected
+    /// (out-of-band id is the durable identity; a payload whose stored id
+    /// disagrees is a swapped / wrong file). `Some(42)` must succeed; `None`
+    /// (diagnostic readers) skips the cross-check.
+    #[test]
+    fn load_with_handle_rejects_table_id_mismatch() {
+        let items = valid_meta_items();
+
+        let mismatch = load_meta_from_items_expecting(&items, Some(99));
+        assert!(
+            matches!(mismatch, Err(crate::Error::InvalidHeader("TableMeta"))),
+            "payload table_id 42 read under expected 99 must be rejected, got {mismatch:?}"
+        );
+
+        assert!(
+            load_meta_from_items_expecting(&items, Some(42)).is_ok(),
+            "matching expected table_id must parse",
+        );
+        assert!(
+            load_meta_from_items_expecting(&items, None).is_ok(),
+            "None expected id (diagnostic read) must skip the cross-check",
+        );
     }
 
     /// Sanity check: valid meta items produce a successful parse.
