@@ -455,8 +455,8 @@ pub fn encrypt_block(
 
     // Build the 23-byte AAD: binds ciphertext to format identity,
     // header byte, key epoch, block type, suite id, table id,
-    // compression type, dict id, window log. (Block offset and tree
-    // id are intentionally not bound — see aad::build.)
+    // compression type, dict id, window log, and block_flags. (Block
+    // offset and tree id are intentionally not bound — see aad::build.)
     let aad = build(ctx, identity);
 
     // Encrypt the plaintext in-place; move it into an owned Vec
