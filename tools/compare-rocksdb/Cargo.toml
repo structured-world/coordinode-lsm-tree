@@ -32,6 +32,15 @@ lsm-tree = { package = "coordinode-lsm-tree", path = "../..", features = ["zstd"
 # C-toolchain compile burden scales with the codecs the workloads
 # actually need (a future `*_lz4` variant adds rocksdb's `lz4`).
 rocksdb = { version = "0.24", default-features = false, features = ["zstd"] }
+# SurrealKV — pure-Rust embedded LSM/MVCC store, the Rust-native
+# comparison point. Not published to crates.io, so pinned to a git tag
+# for reproducibility. No FFI / libclang burden (unlike rocksdb).
+surrealkv = { git = "https://github.com/surrealdb/surrealkv", tag = "v0.21.2" }
+# SurrealKV needs a tokio runtime: its `build()` spawns background
+# compaction tasks via `tokio::spawn`, and `commit()` is async. The
+# criterion harness is sync, so each surrealkv arm owns a multi-thread
+# runtime and drives open / commit through `rt.block_on`.
+tokio = { version = "1", features = ["rt-multi-thread"] }
 criterion = { version = "0.8", features = ["html_reports"] }
 tempfile = "3"
 

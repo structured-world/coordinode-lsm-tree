@@ -36,8 +36,10 @@
 //! The shared workload closure is parameterised over an [`Engine`]
 //! enum so the per-engine glue (open, put, get, flush, close) lives
 //! in exactly one place per engine and the workload code stays
-//! engine-agnostic. Adding a third engine (Pebble, LevelDB,
-//! sled, …) is "add a variant + match arm" — no workload rewrite.
+//! engine-agnostic. Three engines today: `ours`, `rocksdb`, and
+//! `surrealkv` (pure-Rust embedded LSM/MVCC). SurrealKV has no zstd
+//! codec, so it overlays ONLY on the `None`-compression groups (see
+//! [`engines_for`]); the `_zstd22` groups stay ours-vs-rocksdb.
 //!
 //! ## Compression axis + cross-engine overlay
 //!
@@ -49,11 +51,12 @@
 //! pinned to level 22 — so the no-compression and high-ratio paths sit
 //! side-by-side on the dashboard.
 //!
-//! Within each group both engines run in the SAME process and the SAME
-//! invocation, so criterion plots them as an overlay (ours vs rocksdb)
-//! on one chart. Because the comparison is a ratio measured on one host
-//! in one run, it stays meaningful even if the bench host's CPU changes
-//! between runs — the absolute numbers move, the relative gap does not.
+//! Within each group every engine runs in the SAME process and the SAME
+//! invocation, so criterion plots them as an overlay (ours vs rocksdb,
+//! plus surrealkv on the `None` groups) on one chart. Because the
+//! comparison is a ratio measured on one host in one run, it stays
+//! meaningful even if the bench host's CPU changes between runs — the
+//! absolute numbers move, the relative gap does not.
 //!
 //! ## Workload coverage
 //!
@@ -93,6 +96,65 @@ use lsm_tree::{
     AbstractTree, CompressionType, Config, Guard, MAX_SEQNO, SequenceNumberCounter,
     config::CompressionPolicy,
 };
+use surrealkv::{
+    Durability as SkvDurability, LSMIterator as _, Options as SkvOptions, Tree as SkvTree,
+    TreeBuilder as SkvTreeBuilder,
+};
+
+/// Full-keyspace scan bounds for SurrealKV's `range(start, end)` (start
+/// inclusive, end exclusive). Keys are 16-byte big-endian; a 17-byte all-`0xFF`
+/// upper bound sorts after every 16-byte key, so the half-open range covers the
+/// whole keyspace.
+const SKV_MIN_KEY: &[u8] = &[0u8; 16];
+const SKV_MAX_KEY: &[u8] = &[0xFFu8; 17];
+
+/// A multi-thread tokio runtime for SurrealKV. Each surrealkv bench arm owns
+/// one for its whole duration: `build()` spawns background compaction tasks via
+/// `tokio::spawn` (so it must run inside a runtime context, here via
+/// `block_on`), and those tasks need worker threads to keep running while the
+/// tree is read. The runtime must outlive the tree.
+fn skv_runtime() -> tokio::runtime::Runtime {
+    tokio::runtime::Runtime::new().expect("surrealkv: tokio runtime")
+}
+
+/// Opens a fresh SurrealKV tree at `dir` on `rt`. Compression is left at the
+/// default (`None`) — SurrealKV has no zstd, and it only runs in the
+/// None-compression groups (see [`engines_for`]). `build()` is sync but spawns
+/// background tasks, so it runs inside `rt.block_on` to see the runtime.
+fn open_surrealkv(rt: &tokio::runtime::Runtime, dir: &std::path::Path) -> SkvTree {
+    let path = dir.to_path_buf();
+    rt.block_on(async move {
+        let opts = SkvOptions::new().with_path(path);
+        SkvTreeBuilder::with_options(opts).build()
+    })
+    .expect("surrealkv: open")
+}
+
+/// Populates a SurrealKV tree with `inputs` in a single write transaction and
+/// commits with `Immediate` durability (fsync) — the flush-to-disk equivalent
+/// of `ours`' `flush_active_memtable` / rocksdb's `flush`, so the warm-read
+/// groups start from an on-disk state. `commit()` is async; driven via
+/// `rt.block_on`.
+///
+/// NOTE: SurrealKV is versioned/MVCC — a single committed write per key here, so
+/// there is no extra version history, but its write path still carries MVCC
+/// bookkeeping the flat-LSM engines do not. Read this in the comparison as
+/// "Rust-native LSM with MVCC semantics", not a byte-for-byte equivalent setup.
+fn populate_surrealkv(
+    rt: &tokio::runtime::Runtime,
+    dir: &std::path::Path,
+    inputs: &WorkloadInputs,
+) -> SkvTree {
+    let tree = open_surrealkv(rt, dir);
+    let mut txn = tree.begin().expect("surrealkv: begin");
+    for (key, value) in inputs.keys.iter().zip(inputs.values.iter()) {
+        txn.set(key.as_slice(), value.as_slice())
+            .expect("surrealkv: set");
+    }
+    txn.set_durability(SkvDurability::Immediate);
+    rt.block_on(txn.commit()).expect("surrealkv: commit");
+    tree
+}
 
 /// Engine under test. The harness runs each workload once per
 /// variant and emits per-engine timings under the same criterion
@@ -102,6 +164,10 @@ use lsm_tree::{
 enum Engine {
     Ours,
     RocksDb,
+    /// SurrealKV — pure-Rust embedded LSM/MVCC store. No zstd codec
+    /// (only None / Snappy), so it participates ONLY in the
+    /// None-compression (codec-neutral) groups — see [`engines_for`].
+    SurrealKv,
 }
 
 impl Engine {
@@ -109,7 +175,22 @@ impl Engine {
         match self {
             Self::Ours => "ours",
             Self::RocksDb => "rocksdb",
+            Self::SurrealKv => "surrealkv",
         }
+    }
+}
+
+/// Engines to overlay for a given compression variant.
+///
+/// SurrealKV has no zstd codec (its `CompressionType` is `None` / `Snappy`
+/// only), so it cannot match the `Zstd22` variant apples-to-apples — adding a
+/// non-zstd line to a zstd22 graph would misrepresent the comparison. It is
+/// therefore restricted to the `None`-compression groups, where all three
+/// engines run codec-neutral. The `_zstd22` groups stay ours-vs-rocksdb.
+fn engines_for(compression: Compression) -> &'static [Engine] {
+    match compression {
+        Compression::None => &[Engine::Ours, Engine::RocksDb, Engine::SurrealKv],
+        Compression::Zstd22 => &[Engine::Ours, Engine::RocksDb],
     }
 }
 
@@ -340,6 +421,20 @@ fn run_write_throughput(
             // work doesn't leak into the timed window.
             start.elapsed()
         }
+        Engine::SurrealKv => {
+            // One write transaction, committed with Immediate durability
+            // (fsync) — the flush barrier equivalent of the other engines'
+            // terminal flush. `commit()` is async; driven via the runtime.
+            let rt = skv_runtime();
+            let tree = open_surrealkv(&rt, dir.path());
+            let mut txn = tree.begin()?;
+            for (key, value) in inputs.keys.iter().zip(inputs.values.iter()) {
+                txn.set(key.as_slice(), value.as_slice())?;
+            }
+            txn.set_durability(SkvDurability::Immediate);
+            rt.block_on(txn.commit())?;
+            start.elapsed()
+        }
     };
     drop(dir);
     Ok(elapsed)
@@ -361,7 +456,7 @@ fn write_throughput_variant(c: &mut Criterion, group_name: &str, compression: Co
         // does no per-iteration allocation.
         let inputs = WorkloadInputs::build(n);
         group.throughput(Throughput::Elements(n));
-        for engine in [Engine::Ours, Engine::RocksDb] {
+        for &engine in engines_for(compression) {
             group.bench_with_input(BenchmarkId::new(engine.label(), n), &n, |b, _| {
                 b.iter_custom(|iters| {
                     let mut total = Duration::ZERO;
@@ -440,7 +535,7 @@ fn point_read_variant(c: &mut Criterion, group_name: &str, compression: Compress
     for &n in &[1_000_u64, 10_000_u64] {
         let inputs = WorkloadInputs::build(n);
         group.throughput(Throughput::Elements(n));
-        for engine in [Engine::Ours, Engine::RocksDb] {
+        for &engine in engines_for(compression) {
             group.bench_with_input(BenchmarkId::new(engine.label(), n), &n, |b, _| {
                 // The temp dir + engine handle outlive every timed
                 // iteration: build the on-disk database once here so
@@ -512,6 +607,34 @@ fn point_read_variant(c: &mut Criterion, group_name: &str, compression: Compress
                             start.elapsed()
                         });
                     }
+                    Engine::SurrealKv => {
+                        // `rt` outlives `tree` (drops last) so its background
+                        // tasks keep running for the whole read phase.
+                        let rt = skv_runtime();
+                        let tree = populate_surrealkv(&rt, dir.path(), &inputs);
+                        // One read snapshot, reused across all iterations — the
+                        // closest analogue of the other engines' direct warm
+                        // reads (a single consistent view, no per-get txn churn).
+                        let txn = tree.begin().expect("surrealkv: begin");
+                        for key in &inputs.keys {
+                            assert!(
+                                txn.get(key.as_slice())
+                                    .expect("surrealkv: verify")
+                                    .is_some(),
+                                "surrealkv: key unexpectedly missing"
+                            );
+                        }
+                        b.iter_custom(|iters| {
+                            let start = std::time::Instant::now();
+                            for _ in 0..iters {
+                                for key in &inputs.keys {
+                                    let got = txn.get(key.as_slice()).expect("surrealkv: get");
+                                    std::hint::black_box(got);
+                                }
+                            }
+                            start.elapsed()
+                        });
+                    }
                 }
             });
         }
@@ -571,7 +694,7 @@ fn range_scan_variant(c: &mut Criterion, group_name: &str, compression: Compress
     for &n in &[1_000_u64, 10_000_u64] {
         let inputs = WorkloadInputs::build(n);
         group.throughput(Throughput::Elements(n));
-        for engine in [Engine::Ours, Engine::RocksDb] {
+        for &engine in engines_for(compression) {
             group.bench_with_input(BenchmarkId::new(engine.label(), n), &n, |b, _| {
                 let dir = tempfile::tempdir().expect("tempdir");
                 match engine {
@@ -601,6 +724,26 @@ fn range_scan_variant(c: &mut Criterion, group_name: &str, compression: Compress
                             start.elapsed()
                         });
                     }
+                    Engine::SurrealKv => {
+                        let rt = skv_runtime();
+                        let tree = populate_surrealkv(&rt, dir.path(), &inputs);
+                        let txn = tree.begin().expect("surrealkv: begin");
+                        b.iter_custom(|iters| {
+                            let start = std::time::Instant::now();
+                            for _ in 0..iters {
+                                let mut iter = txn
+                                    .range(SKV_MIN_KEY, SKV_MAX_KEY)
+                                    .expect("surrealkv: range");
+                                iter.seek_first().expect("surrealkv: seek_first");
+                                while iter.valid() {
+                                    let v = iter.value().expect("surrealkv: scan value");
+                                    std::hint::black_box(v);
+                                    iter.next().expect("surrealkv: scan next");
+                                }
+                            }
+                            start.elapsed()
+                        });
+                    }
                 }
             });
         }
@@ -624,7 +767,7 @@ fn seek_random_variant(c: &mut Criterion, group_name: &str, compression: Compres
     for &n in &[1_000_u64, 10_000_u64] {
         let inputs = WorkloadInputs::build(n);
         group.throughput(Throughput::Elements(n));
-        for engine in [Engine::Ours, Engine::RocksDb] {
+        for &engine in engines_for(compression) {
             group.bench_with_input(BenchmarkId::new(engine.label(), n), &n, |b, _| {
                 let dir = tempfile::tempdir().expect("tempdir");
                 match engine {
@@ -662,6 +805,32 @@ fn seek_random_variant(c: &mut Criterion, group_name: &str, compression: Compres
                             start.elapsed()
                         });
                     }
+                    Engine::SurrealKv => {
+                        let rt = skv_runtime();
+                        let tree = populate_surrealkv(&rt, dir.path(), &inputs);
+                        let txn = tree.begin().expect("surrealkv: begin");
+                        b.iter_custom(|iters| {
+                            let start = std::time::Instant::now();
+                            for _ in 0..iters {
+                                for key in &inputs.keys {
+                                    // Seek to the first key >= this key, read its
+                                    // value — the SurrealKV analogue of the
+                                    // index-descent-then-read the other engines do.
+                                    let mut it = txn
+                                        .range(key.as_slice(), SKV_MAX_KEY)
+                                        .expect("surrealkv: seek range");
+                                    it.seek_first().expect("surrealkv: seek_first");
+                                    let got = if it.valid() {
+                                        Some(it.value().expect("surrealkv: seek value"))
+                                    } else {
+                                        None
+                                    };
+                                    std::hint::black_box(got);
+                                }
+                            }
+                            start.elapsed()
+                        });
+                    }
                 }
             });
         }
@@ -686,7 +855,7 @@ fn overwrite_variant(c: &mut Criterion, group_name: &str, compression: Compressi
     for &n in &[1_000_u64, 10_000_u64] {
         let inputs = WorkloadInputs::build(n);
         group.throughput(Throughput::Elements(n));
-        for engine in [Engine::Ours, Engine::RocksDb] {
+        for &engine in engines_for(compression) {
             group.bench_with_input(BenchmarkId::new(engine.label(), n), &n, |b, _| {
                 b.iter_custom(|iters| {
                     let mut total = Duration::ZERO;
@@ -719,6 +888,22 @@ fn overwrite_variant(c: &mut Criterion, group_name: &str, compression: Compressi
                                         .expect("rocksdb: overwrite put");
                                 }
                                 db.flush().expect("rocksdb: overwrite flush");
+                                total += start.elapsed();
+                            }
+                            Engine::SurrealKv => {
+                                // First copy (untimed) so the timed pass
+                                // overwrites existing keys.
+                                let rt = skv_runtime();
+                                let tree = populate_surrealkv(&rt, dir.path(), &inputs);
+                                let start = std::time::Instant::now();
+                                let mut txn = tree.begin().expect("surrealkv: begin");
+                                for (key, value) in inputs.keys.iter().zip(inputs.values.iter()) {
+                                    txn.set(key.as_slice(), value.as_slice())
+                                        .expect("surrealkv: overwrite set");
+                                }
+                                txn.set_durability(SkvDurability::Immediate);
+                                rt.block_on(txn.commit())
+                                    .expect("surrealkv: overwrite commit");
                                 total += start.elapsed();
                             }
                         }
@@ -829,6 +1014,12 @@ fn run_compaction(
             let start = std::time::Instant::now();
             db.compact_range(None::<&[u8]>, None::<&[u8]>);
             start.elapsed()
+        }
+        // The compaction benches are zstd-level workloads; SurrealKV has no zstd
+        // codec, so `engines_for` never yields it for these groups (its variant
+        // loop is fixed to ours+rocksdb). The arm exists only for exhaustiveness.
+        Engine::SurrealKv => {
+            unreachable!("surrealkv is excluded from zstd-level compaction benches")
         }
     };
     drop(dir);
@@ -1027,6 +1218,12 @@ fn run_subcompaction_bench(
             let start = std::time::Instant::now();
             db.compact_range(None::<&[u8]>, None::<&[u8]>);
             start.elapsed()
+        }
+        // The compaction benches are zstd-level workloads; SurrealKV has no zstd
+        // codec, so `engines_for` never yields it for these groups (its variant
+        // loop is fixed to ours+rocksdb). The arm exists only for exhaustiveness.
+        Engine::SurrealKv => {
+            unreachable!("surrealkv is excluded from zstd-level compaction benches")
         }
     };
     drop(dir);
