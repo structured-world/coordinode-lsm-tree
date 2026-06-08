@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1780910888492,
+  "lastUpdate": 1780932543457,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -13804,6 +13804,84 @@ window.BENCHMARK_DATA = {
           {
             "name": "readwhilewriting",
             "value": 556956.8667678556,
+            "unit": "ops/sec",
+            "extra": "P50: 1.6us | P99: 4.9us | P99.9: 7.3us\nthreads: 1 | elapsed: 0.36s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "5761b3a6dfcfb9c8abbb0a03742573d8f95025dc",
+          "message": "feat(encryption): activate AAD-bound block encryption on the live path (#423)\n\n## Summary\n\nActivates the AAD-bound block encryption format (`MetadataFrame ‖\nBodyFrame`) on the **live block I/O path**. Until now encrypted blocks\nwent through the opaque `encrypt`/`decrypt` provider methods that\nignored block identity; this PR cuts the write/read path over to\n`encrypt_block_aad` / `decrypt_block_aad`, so every encrypted block now\nbinds its identity + transform context into the AEAD tag (anti-swap /\nanti-relabel).\n\nWhile wiring this up, the live round-trip surfaced that the\npreviously-planned **tree-id binding cannot work**: `TreeId` is a\nprocess-ephemeral counter (`get_next_tree_id()`), not durable across\nreopen, so the same on-disk SST is assigned a different tree id when its\ntree is reopened and every encrypted block then fails AEAD verification.\nThe tree id is therefore dropped from the AAD entirely; cross-tree\nsubstitution is prevented by **per-tree key isolation** instead (each\ntree owns a distinct key). A block's byte offset was likewise dropped\nearlier (offset-independent AAD keeps encryption parallelisable).\n\n**Resulting AAD: 23 bytes** — binds `table_id` + codec context\n(`compression_type`, `dict_id`, `window_log`) + `block_flags` +\n`key_epoch` + `suite_id`.\n\n## What changed\n\n- **Live crypto flip** (`src/table/block/mod.rs`):\n`encrypt_block_payload` / `decrypt_block_payload` centralise the\nzstd-AAD vs opaque-fallback choice. The AAD envelope needs the\nskippable-frame format, so non-zstd builds keep the opaque `[nonce ‖\nciphertext ‖ tag]` form. `max_overhead` now accounts for the 71-byte\nenvelope framing under zstd.\n- **Drop `tree_id` from `BlockIdentity` + AAD** and revert the tree-id\nplumbing added for the abandoned approach (writer, index/filter\nsub-writers, multi-writer, parallel compressor, scanner, `recover`).\n- **`src/encryption/aad.rs`**: 23-byte layout (`table_id` at 8..16,\ncodec context 16..22).\n- **Threat-model suite** (`tests/encryption_aad_threat_model.rs`)\nreframed to the new model: same-table and shared-key cross-tree swaps\nare AAD-valid **by design** (regression guards for offset/tree\nindependence); cross-table swap still fails AEAD; cross-tree is enforced\nby key isolation (covered by the wrong-key unit test).\n- **`docs/aad-block-format.md`** updated end-to-end to the 23-byte AAD\ncontract (goals, threat table, §5.3 layout, worked examples).\n\n## Cross-tree security model\n\nCross-tree block substitution is now defended **only** by per-tree key\nisolation, not by AAD. Production deployments MUST use a distinct\nencryption key per tree (the default). Sharing one key across trees\nwould leave cross-tree substitution undefended — documented in §5.3 and\nthe threat table.\n\n## Compatibility\n\nThe encrypted-block AAD format is pre-release (V5 is not frozen), so\nthis is an in-place format change — no released-format contract is\nbroken and no migration is required. Encryption-OFF blocks stay\n**byte-identical** (the encrypt path is only taken when a provider is\npresent).\n\n## Testing\n\n- Full suite green: `cargo nextest run --features lz4,encryption,zstd` →\n1856 passed, including encrypted flush + **reopen** round-trips across\n`None` / `Lz4` / `Zstd` / `ZstdDict` and the AAD threat-model suite.\n- `cargo clippy --all-features --all-targets` clean; `cargo fmt --check`\nclean; doctests pass.\n\nPart of #413\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n## Summary by CodeRabbit\n\n* **Documentation**\n* Updated encryption spec: AAD shortened to a fixed 23-byte layout and\nthreat model rewritten.\n\n* **Refactor**\n* Block authentication now binds only per-table identity (removed\nblock-position/tree id from AAD); on-disk frame/minimalism prose\nsimplified.\n\n* **Behavior**\n* Encryption path extended to support AAD-bound block envelopes;\nruntime/open validation rejects providers that don't support the AAD\nblock API.\n\n* **Tests**\n* Regression and stress suites rewritten for the new AAD model; added\nECC-aware stress coverage and updated threat-model tests.\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-06-08T18:25:51+03:00",
+          "tree_id": "7c659fddb78d983dd55bebe1fa20b2321a842228",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/5761b3a6dfcfb9c8abbb0a03742573d8f95025dc"
+        },
+        "date": 1780932536665,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 2112231.944696783,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.6us | P99.9: 3.7us\nthreads: 1 | elapsed: 0.09s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1221447.1237708188,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.2us | P99.9: 4.3us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 652623.7651860737,
+            "unit": "ops/sec",
+            "extra": "P50: 1.4us | P99: 4.6us | P99.9: 7.2us\nthreads: 1 | elapsed: 0.31s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3695788.624839369,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 3.0us | P99.9: 5.6us\nthreads: 1 | elapsed: 0.05s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 434051.5469981271,
+            "unit": "ops/sec",
+            "extra": "P50: 2.0us | P99: 5.4us | P99.9: 8.1us\nthreads: 1 | elapsed: 0.46s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 217831.04342678483,
+            "unit": "ops/sec",
+            "extra": "P50: 4.3us | P99: 5.4us | P99.9: 7.8us\nthreads: 1 | elapsed: 0.92s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1214327.254686344,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.2us | P99.9: 4.3us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1134453.4037586881,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.5us | P99.9: 2.8us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 561661.9946873066,
             "unit": "ops/sec",
             "extra": "P50: 1.6us | P99: 4.9us | P99.9: 7.3us\nthreads: 1 | elapsed: 0.36s | num: 200000 | iterations: 3"
           }
