@@ -1044,6 +1044,13 @@ fn run_compaction(
             opts.set_compression_options_parallel_threads(COMPACTION_THREADS as i32);
             opts.set_max_subcompactions(1);
 
+            // Force the bottommost level to actually compact. RocksDB's manual
+            // compaction defaults to `kIfHaveCompactionFilter` (skip bottommost
+            // without a filter); `Force` makes the timed compaction do the full
+            // merge-into-bottom, matching ours' `major_compact`.
+            let mut compact_opts = rocksdb::CompactOptions::default();
+            compact_opts.set_bottommost_level_compaction(rocksdb::BottommostLevelCompaction::Force);
+
             let db = rocksdb::DB::open(&opts, dir.path())?;
             let mut write_opts = rocksdb::WriteOptions::default();
             write_opts.disable_wal(true);
@@ -1059,7 +1066,7 @@ fn run_compaction(
             db.flush()?; // final batch
 
             let start = std::time::Instant::now();
-            db.compact_range(None::<&[u8]>, None::<&[u8]>);
+            db.compact_range_opt(None::<&[u8]>, None::<&[u8]>, &compact_opts);
             start.elapsed()
         }
         // The compaction benches are zstd-level workloads; SurrealKV has no zstd
@@ -1074,11 +1081,18 @@ fn run_compaction(
 }
 
 fn bench_compaction(c: &mut Criterion) {
-    // Two ends of the zstd spectrum: level 1 (cheap codec — non-compression
-    // overhead most visible) and level 22 (max — codec CPU dominates). Each is
-    // its own group, so each renders its own ours-vs-rocksdb overlay chart.
-    compaction_variant(c, "major_compact_zstd1", 1);
-    compaction_variant(c, "major_compact_zstd22", 22);
+    // Compaction output lands in the bottommost level. RocksDB's manual
+    // compaction compresses the bottommost output at zstd's default level (3)
+    // regardless of the configured `compression_opts.level` — the level setting
+    // does not reach the bottommost level, and the only way to override it
+    // (`set_bottommost_compression_options`) cannot carry parallel_threads, so it
+    // would force RocksDB single-threaded there. So the honest apples-to-apples
+    // compaction codec comparison is pinned to level 3 — the level RocksDB
+    // actually performs on the bottommost output — with both engines at 4-thread
+    // parallel block compression (RocksDB inherits the 4 threads from
+    // `compression_opts`; ours via `compaction_threads`). As structured-zstd's
+    // level-3 encoder improves, the gain shows directly against RocksDB here.
+    compaction_variant(c, "major_compact_zstd3", 3);
 }
 
 /// Reports compaction tail latency (P50/P95/P99) to stderr from per-iteration
@@ -1244,12 +1258,23 @@ fn run_subcompaction_bench(
             let mut write_opts = rocksdb::WriteOptions::default();
             write_opts.disable_wal(true);
 
+            // RocksDB's manual compaction defaults to
+            // `bottommost_level_compaction = kIfHaveCompactionFilter`: with no
+            // compaction filter it leaves the gen-1 overwrite at a higher level
+            // (reads still see it, newest-seqno wins) instead of rewriting the
+            // already-bottommost gen-0 data. That makes the timed compaction a
+            // near-no-op (it skips the expensive bottom rewrite), whereas ours'
+            // `major_compact` forces the full merge-into-bottom. Force RocksDB to
+            // rewrite the bottommost level so both engines do equivalent work.
+            let mut compact_opts = rocksdb::CompactOptions::default();
+            compact_opts.set_bottommost_level_compaction(rocksdb::BottommostLevelCompaction::Force);
+
             // Step 1: populate the bottom level.
             for (key, value) in inputs.keys.iter().zip(inputs.values.iter()) {
                 db.put_opt(key, value, &write_opts)?;
             }
             db.flush()?;
-            db.compact_range(None::<&[u8]>, None::<&[u8]>);
+            db.compact_range_opt(None::<&[u8]>, None::<&[u8]>, &compact_opts);
 
             // Step 2: overwrite the whole keyspace into fresh L0 tables.
             let mut written = 0u64;
@@ -1263,7 +1288,7 @@ fn run_subcompaction_bench(
             db.flush()?;
 
             let start = std::time::Instant::now();
-            db.compact_range(None::<&[u8]>, None::<&[u8]>);
+            db.compact_range_opt(None::<&[u8]>, None::<&[u8]>, &compact_opts);
             start.elapsed()
         }
         // The compaction benches are zstd-level workloads; SurrealKV has no zstd
@@ -1305,10 +1330,12 @@ fn subcompaction_variant(c: &mut Criterion, group_name: &str, level: i32) {
 }
 
 /// Sub-compaction head-to-head: our range-parallel split vs RocksDB
-/// `max_subcompactions`, at both ends of the zstd spectrum.
+/// `max_subcompactions`. Pinned to zstd level 3 — the level RocksDB actually
+/// applies to bottommost compaction output (see [`bench_compaction`]) — with
+/// both engines at 4-thread block compression, so the comparison is honest and
+/// tracks structured-zstd's level-3 encoder progress against RocksDB.
 fn bench_subcompaction(c: &mut Criterion) {
-    subcompaction_variant(c, "subcompaction_zstd1", 1);
-    subcompaction_variant(c, "subcompaction_zstd22", 22);
+    subcompaction_variant(c, "subcompaction_zstd3", 3);
 }
 
 criterion_group!(
