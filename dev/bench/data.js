@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1780881922947,
+  "lastUpdate": 1780885176124,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -13572,6 +13572,84 @@ window.BENCHMARK_DATA = {
             "value": 535793.9965525728,
             "unit": "ops/sec",
             "extra": "P50: 1.7us | P99: 5.2us | P99.9: 8.0us\nthreads: 1 | elapsed: 0.37s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "dcd0eda4e941ec9c50ba73c771fadc5b56eab3b2",
+          "message": "feat(query): cold-block partial decode with resumable zstd (#415)\n\n## Summary\n\nPartial-decode read path for range queries over large cold-tier zstd\nblocks (#257): a bounded range decodes only the inner zstd blocks\ncovering its key range and keeps just that decompressed prefix resident,\ninstead of materializing the whole block.\n\n- **Resumable decode** (structured-zstd 0.0.32): growing a block's\ncovered extent RESUMES from a cached entropy/repcode snapshot +\ndecompressed window, decoding only the new tail inner blocks. The resume\npayload (`window_prime` + `ResumeState` + compressed cursor) lives in\nthe cache next to the partial entry, so even a later range query on a\nfresh decoder continues incrementally rather than from inner block 0.\n- **Adaptive partial tier**: the served block is synthesized on demand\nfrom the cached prefix; a cold block holds only the touched fraction.\nRepeated reads (>= 4) or a >= 75% decoded fraction promote it to a full\nresident block.\n- **Cold-block size gate**: engages only on blocks >= 256 KiB\ndecompressed (production cold blocks run multi-MB); smaller blocks\ndecode fully since the saved decode is cheap relative to setup.\n- **Opt-in** via `LSM_PARTIAL_DECODE=1` while validated against full\ndecode + block cache.\n\n## Why\n\nWithout a resumable decoder, growing the covered extent re-decoded from\nblock 0, cascading a forward sweep into re-decompressing the whole block\n(~3.2-3.4x slower than full decode + block cache on a same-binary A/B).\nThe resumable decoder removes that cascade: the path is now at parity on\nwhole-block-covering scans, and wins on random reads into large cold\nblocks where only a small fraction is touched (decode a ~12 KiB inner\nblock instead of an 8-256 MB block, hold only that fraction in memory).\n\n## Testing\n\n- Resume across dropped decoders is byte-identical to a one-shot full\ndecode.\n- `partial_data_block` resume round-trip grows correctly and matches\nfull.\n- Cache reuse + high-water growth; runtime + fraction promotion;\nbelow-floor skip; forward/reverse/empty/boundary correctness all match\nfull decode.\n- `clippy --all-features` and `clippy --no-default-features --features\nzstd,lz4` clean; no-std `alloc` check flat.\n\nRefs #257\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n## Summary by CodeRabbit\n\n* **New Features**\n* Partial decoding for cold zstd-compressed data blocks to serve range\nqueries without full decompression\n* Lazy/resumable block decoding and per-table block-layout metadata to\nenable incremental reads and lower memory use\n\n* **Bug Fixes / Stability**\n* Iterator and block-loading paths made exact and consistent when using\npartial decode and promotions\n\n* **Tests**\n* Extensive unit, integration and benchmark coverage for partial-decode\nscenarios\n\n* **Dependencies**\n  * structured-zstd updated 0.0.30 → 0.0.32\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-06-08T01:20:43Z",
+          "tree_id": "2e6add02d3a0aec09a4ae7b1e60529ed908ce582",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/dcd0eda4e941ec9c50ba73c771fadc5b56eab3b2"
+        },
+        "date": 1780885170364,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 1001636.1977699621,
+            "unit": "ops/sec",
+            "extra": "P50: 0.8us | P99: 2.7us | P99.9: 8.0us\nthreads: 1 | elapsed: 0.20s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 585812.7499163232,
+            "unit": "ops/sec",
+            "extra": "P50: 1.3us | P99: 6.1us | P99.9: 13.5us\nthreads: 1 | elapsed: 0.34s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 356735.8317512812,
+            "unit": "ops/sec",
+            "extra": "P50: 2.5us | P99: 8.9us | P99.9: 19.3us\nthreads: 1 | elapsed: 0.56s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 2536210.94193936,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 4.4us | P99.9: 13.6us\nthreads: 1 | elapsed: 0.08s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 250286.87662798082,
+            "unit": "ops/sec",
+            "extra": "P50: 3.4us | P99: 10.4us | P99.9: 16.2us\nthreads: 1 | elapsed: 0.80s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 125742.8269289216,
+            "unit": "ops/sec",
+            "extra": "P50: 7.1us | P99: 18.0us | P99.9: 25.2us\nthreads: 1 | elapsed: 1.59s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 573102.5762172913,
+            "unit": "ops/sec",
+            "extra": "P50: 1.4us | P99: 6.4us | P99.9: 13.9us\nthreads: 1 | elapsed: 0.35s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 681734.5941846492,
+            "unit": "ops/sec",
+            "extra": "P50: 0.6us | P99: 1.0us | P99.9: 4.1us\nthreads: 1 | elapsed: 0.29s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 306327.1489711045,
+            "unit": "ops/sec",
+            "extra": "P50: 2.9us | P99: 9.6us | P99.9: 17.1us\nthreads: 1 | elapsed: 0.65s | num: 200000 | iterations: 3"
           }
         ]
       }
