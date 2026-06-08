@@ -4,3 +4,7 @@ coverage:
     # llvm-cov captures those files; exclude them so only workspace sources
     # count toward patch and project coverage.
     - "zstd/**"
+    # Vendored byteview slice backend (in-tree copy of an upstream crate, kept
+    # faithful for future extraction). It ships its own test suite; exclude it
+    # so vendored lines do not count toward patch and project coverage.
+    - "src/byteview/**"
