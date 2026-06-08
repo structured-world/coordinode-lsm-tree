@@ -113,21 +113,28 @@ const SKV_MAX_KEY: &[u8] = &[0xFFu8; 17];
 /// `tokio::spawn` (so it must run inside a runtime context, here via
 /// `block_on`), and those tasks need worker threads to keep running while the
 /// tree is read. The runtime must outlive the tree.
-fn skv_runtime() -> tokio::runtime::Runtime {
-    tokio::runtime::Runtime::new().expect("surrealkv: tokio runtime")
+fn skv_runtime() -> std::io::Result<tokio::runtime::Runtime> {
+    tokio::runtime::Runtime::new()
 }
 
 /// Opens a fresh SurrealKV tree at `dir` on `rt`. Compression is left at the
 /// default (`None`) — SurrealKV has no zstd, and it only runs in the
 /// None-compression groups (see [`engines_for`]). `build()` is sync but spawns
 /// background tasks, so it runs inside `rt.block_on` to see the runtime.
-fn open_surrealkv(rt: &tokio::runtime::Runtime, dir: &std::path::Path) -> SkvTree {
+///
+/// Returns `Result` so open failures propagate to the benchmark boundary (where
+/// the engine label is attached) rather than panicking on the I/O path — same
+/// shape as `open_ours` / `rocksdb::DB::open`.
+fn open_surrealkv(
+    rt: &tokio::runtime::Runtime,
+    dir: &std::path::Path,
+) -> Result<SkvTree, Box<dyn std::error::Error>> {
     let path = dir.to_path_buf();
-    rt.block_on(async move {
+    let tree = rt.block_on(async move {
         let opts = SkvOptions::new().with_path(path);
         SkvTreeBuilder::with_options(opts).build()
-    })
-    .expect("surrealkv: open")
+    })?;
+    Ok(tree)
 }
 
 /// Populates a SurrealKV tree with `inputs` in a single write transaction and
@@ -144,16 +151,15 @@ fn populate_surrealkv(
     rt: &tokio::runtime::Runtime,
     dir: &std::path::Path,
     inputs: &WorkloadInputs,
-) -> SkvTree {
-    let tree = open_surrealkv(rt, dir);
-    let mut txn = tree.begin().expect("surrealkv: begin");
+) -> Result<SkvTree, Box<dyn std::error::Error>> {
+    let tree = open_surrealkv(rt, dir)?;
+    let mut txn = tree.begin()?;
     for (key, value) in inputs.keys.iter().zip(inputs.values.iter()) {
-        txn.set(key.as_slice(), value.as_slice())
-            .expect("surrealkv: set");
+        txn.set(key.as_slice(), value.as_slice())?;
     }
     txn.set_durability(SkvDurability::Immediate);
-    rt.block_on(txn.commit()).expect("surrealkv: commit");
-    tree
+    rt.block_on(txn.commit())?;
+    Ok(tree)
 }
 
 /// Engine under test. The harness runs each workload once per
@@ -371,6 +377,7 @@ fn open_ours(
 /// Keys / values are precomputed in `inputs` so the timed body
 /// does NO per-key allocation.
 fn run_write_throughput(
+    skv_rt: Option<&tokio::runtime::Runtime>,
     engine: Engine,
     compression: Compression,
     inputs: &WorkloadInputs,
@@ -425,8 +432,12 @@ fn run_write_throughput(
             // One write transaction, committed with Immediate durability
             // (fsync) — the flush barrier equivalent of the other engines'
             // terminal flush. `commit()` is async; driven via the runtime.
-            let rt = skv_runtime();
-            let tree = open_surrealkv(&rt, dir.path());
+            // The runtime is prebuilt once per variant (see
+            // `write_throughput_variant`) and borrowed here so tokio executor
+            // bootstrap is NOT charged to the timed write window.
+            let rt =
+                skv_rt.expect("surrealkv runtime must be prebuilt for None-compression benches");
+            let tree = open_surrealkv(rt, dir.path())?;
             let mut txn = tree.begin()?;
             for (key, value) in inputs.keys.iter().zip(inputs.values.iter()) {
                 txn.set(key.as_slice(), value.as_slice())?;
@@ -450,6 +461,16 @@ fn bench_write_throughput(c: &mut Criterion) {
 
 fn write_throughput_variant(c: &mut Criterion, group_name: &str, compression: Compression) {
     let mut group = c.benchmark_group(group_name);
+    // SurrealKV participates only in the None-compression group (no zstd
+    // codec). Build its tokio runtime ONCE here, outside the timed write
+    // window, and reuse it across every sample: `Runtime::new` spins up worker
+    // threads, and charging that executor bootstrap to each timed write sample
+    // would bias surrealkv's throughput downward vs the other engines (which
+    // only pay open/write/flush). `None` for the zstd group where it doesn't run.
+    let skv_rt = match compression {
+        Compression::None => Some(skv_runtime().expect("surrealkv: tokio runtime")),
+        Compression::Zstd22 => None,
+    };
     for &n in &[1_000_u64, 10_000_u64] {
         // Precompute the keys + values ONCE per `n` (outside the
         // criterion warmup / measurement loop), so the timed body
@@ -471,9 +492,14 @@ fn write_throughput_variant(c: &mut Criterion, group_name: &str, compression: Co
                         // no meaningful Duration to report — so
                         // surface it as a bench panic with the
                         // engine label for diagnosis.
-                        total += run_write_throughput(engine, compression, &inputs).unwrap_or_else(
-                            |e| panic!("run_write_throughput failed for {}: {e}", engine.label()),
-                        );
+                        total +=
+                            run_write_throughput(skv_rt.as_ref(), engine, compression, &inputs)
+                                .unwrap_or_else(|e| {
+                                    panic!(
+                                        "run_write_throughput failed for {}: {e}",
+                                        engine.label()
+                                    )
+                                });
                     }
                     total
                 });
@@ -610,8 +636,9 @@ fn point_read_variant(c: &mut Criterion, group_name: &str, compression: Compress
                     Engine::SurrealKv => {
                         // `rt` outlives `tree` (drops last) so its background
                         // tasks keep running for the whole read phase.
-                        let rt = skv_runtime();
-                        let tree = populate_surrealkv(&rt, dir.path(), &inputs);
+                        let rt = skv_runtime().expect("surrealkv: tokio runtime");
+                        let tree = populate_surrealkv(&rt, dir.path(), &inputs)
+                            .expect("surrealkv: populate");
                         // One read snapshot, reused across all iterations — the
                         // closest analogue of the other engines' direct warm
                         // reads (a single consistent view, no per-get txn churn).
@@ -725,8 +752,9 @@ fn range_scan_variant(c: &mut Criterion, group_name: &str, compression: Compress
                         });
                     }
                     Engine::SurrealKv => {
-                        let rt = skv_runtime();
-                        let tree = populate_surrealkv(&rt, dir.path(), &inputs);
+                        let rt = skv_runtime().expect("surrealkv: tokio runtime");
+                        let tree = populate_surrealkv(&rt, dir.path(), &inputs)
+                            .expect("surrealkv: populate");
                         let txn = tree.begin().expect("surrealkv: begin");
                         b.iter_custom(|iters| {
                             let start = std::time::Instant::now();
@@ -806,8 +834,9 @@ fn seek_random_variant(c: &mut Criterion, group_name: &str, compression: Compres
                         });
                     }
                     Engine::SurrealKv => {
-                        let rt = skv_runtime();
-                        let tree = populate_surrealkv(&rt, dir.path(), &inputs);
+                        let rt = skv_runtime().expect("surrealkv: tokio runtime");
+                        let tree = populate_surrealkv(&rt, dir.path(), &inputs)
+                            .expect("surrealkv: populate");
                         let txn = tree.begin().expect("surrealkv: begin");
                         b.iter_custom(|iters| {
                             let start = std::time::Instant::now();
@@ -893,8 +922,9 @@ fn overwrite_variant(c: &mut Criterion, group_name: &str, compression: Compressi
                             Engine::SurrealKv => {
                                 // First copy (untimed) so the timed pass
                                 // overwrites existing keys.
-                                let rt = skv_runtime();
-                                let tree = populate_surrealkv(&rt, dir.path(), &inputs);
+                                let rt = skv_runtime().expect("surrealkv: tokio runtime");
+                                let tree = populate_surrealkv(&rt, dir.path(), &inputs)
+                                    .expect("surrealkv: populate");
                                 let start = std::time::Instant::now();
                                 let mut txn = tree.begin().expect("surrealkv: begin");
                                 for (key, value) in inputs.keys.iter().zip(inputs.values.iter()) {
