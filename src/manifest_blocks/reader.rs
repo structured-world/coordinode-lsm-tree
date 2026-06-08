@@ -342,7 +342,6 @@ impl ManifestArchiveReader {
         let identity = BlockIdentity {
             tree_id: MANIFEST_TREE_ID_SENTINEL,
             table_id: MANIFEST_TABLE_ID_SENTINEL,
-            block_offset,
             block_type: BlockType::Manifest,
             dict_id: 0,
             window_log: 0,
@@ -605,7 +604,6 @@ fn read_tail_footer(
     let identity = BlockIdentity {
         tree_id: MANIFEST_TREE_ID_SENTINEL,
         table_id: MANIFEST_TABLE_ID_SENTINEL,
-        block_offset: footer_offset,
         block_type: BlockType::ManifestFooter,
         dict_id: 0,
         window_log: 0,
@@ -647,7 +645,6 @@ fn read_head_footer(
     let identity = BlockIdentity {
         tree_id: MANIFEST_TREE_ID_SENTINEL,
         table_id: MANIFEST_TABLE_ID_SENTINEL,
-        block_offset: 0,
         block_type: BlockType::ManifestFooter,
         dict_id: 0,
         window_log: 0,

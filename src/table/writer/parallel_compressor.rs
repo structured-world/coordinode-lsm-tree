@@ -114,6 +114,7 @@ pub struct BlockCompressor {
 
     // Constant transform parameters, cloned into each job closure.
     table_id: TableId,
+    tree_id: crate::tree::inner::TreeId,
     compression: CompressionType,
     encryption: Option<Arc<dyn EncryptionProvider>>,
     #[cfg(zstd_any)]
@@ -128,6 +129,7 @@ impl BlockCompressor {
     pub fn new(
         spawner: Arc<dyn CompactionSpawner>,
         table_id: TableId,
+        tree_id: crate::tree::inner::TreeId,
         compression: CompressionType,
         encryption: Option<Arc<dyn EncryptionProvider>>,
         #[cfg(zstd_any)] zstd_dict: Option<Arc<ZstdDictionary>>,
@@ -140,6 +142,7 @@ impl BlockCompressor {
                 woke: Condvar::new(),
             }),
             table_id,
+            tree_id,
             compression,
             encryption,
             #[cfg(zstd_any)]
@@ -167,6 +170,7 @@ impl BlockCompressor {
 
         let shared = Arc::clone(&self.shared);
         let table_id = self.table_id;
+        let tree_id = self.tree_id;
         let compression = self.compression;
         let encryption = self.encryption.clone();
         #[cfg(zstd_any)]
@@ -177,6 +181,7 @@ impl BlockCompressor {
             let result = prepare_owned(
                 &encoded,
                 table_id,
+                tree_id,
                 compression,
                 encryption.as_deref(),
                 #[cfg(zstd_any)]
@@ -221,9 +226,16 @@ impl BlockCompressor {
 
 /// Worker-side block preparation: rebuild the transform from owned parts, run
 /// the pipeline, and detach the result from the borrowed `encoded` buffer.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "worker entry threads each owned transform part (table/tree id, codec, \
+              encryption, dict, ecc, flags) needed to rebuild the BlockIdentity + \
+              transform off-thread; a struct would add an alloc per submitted block"
+)]
 fn prepare_owned(
     encoded: &[u8],
     table_id: TableId,
+    tree_id: crate::tree::inner::TreeId,
     compression: CompressionType,
     encryption: Option<&dyn EncryptionProvider>,
     #[cfg(zstd_any)] zstd_dict: Option<&ZstdDictionary>,
@@ -243,14 +255,8 @@ fn prepare_owned(
     };
 
     let identity = BlockIdentity {
-        tree_id: 0,
+        tree_id,
         table_id,
-        // Provisional: the real on-disk offset is unknown until the serial
-        // write step assigns it. prepare_with_flags does not consume the
-        // offset today; if AAD-over-offset ever lands, encryption must move to
-        // the (offset-bearing) write phase, since the offset depends on
-        // post-compression size and so cannot be known at submit time.
-        block_offset: 0,
         block_type: BlockType::Data,
         dict_id: compression.dict_id(),
         window_log: 0,
@@ -308,6 +314,7 @@ mod tests {
         let mut c = BlockCompressor::new(
             Arc::new(InlineSpawner),
             7,
+            11,
             CompressionType::None,
             None,
             #[cfg(zstd_any)]
@@ -342,6 +349,7 @@ mod tests {
         let mut c = BlockCompressor::new(
             spawner.clone() as Arc<dyn CompactionSpawner>,
             7,
+            11,
             CompressionType::None,
             None,
             #[cfg(zstd_any)]

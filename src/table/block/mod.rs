@@ -1582,7 +1582,7 @@ mod tests {
         let data = b"abcdefabcdefabcdef";
         let tmp = write_block_to_tempfile(
             data,
-            crate::table::block::BlockIdentity::for_test(0, 0, BlockType::Data),
+            crate::table::block::BlockIdentity::for_test(0, BlockType::Data),
             &crate::table::block::BlockTransform::from_parts(
                 CompressionType::None,
                 None,
@@ -1593,11 +1593,7 @@ mod tests {
         let block = Block::from_file(
             &tmp.file,
             tmp.handle,
-            crate::table::block::BlockIdentity::for_test(
-                0,
-                0,
-                crate::table::block::BlockType::Data,
-            ),
+            crate::table::block::BlockIdentity::for_test(0, crate::table::block::BlockType::Data),
             &crate::table::block::BlockTransform::from_parts(
                 CompressionType::None,
                 None,
@@ -1618,7 +1614,7 @@ mod tests {
             crate::table::block::BlockTransform::from_parts(CompressionType::Zstd(3), None, None)?;
         let tmp = write_block_to_tempfile(
             &data,
-            crate::table::block::BlockIdentity::for_test(0, 0, BlockType::Data),
+            crate::table::block::BlockIdentity::for_test(0, BlockType::Data),
             &transform,
         )?;
 
@@ -1651,7 +1647,7 @@ mod tests {
             crate::table::block::BlockTransform::from_parts(CompressionType::Zstd(3), None, None)?;
         let tmp = write_block_to_tempfile(
             &data,
-            crate::table::block::BlockIdentity::for_test(0, 0, BlockType::Data),
+            crate::table::block::BlockIdentity::for_test(0, BlockType::Data),
             &transform,
         )?;
         let oversized = BlockHandle::new(tmp.handle.offset(), u32::MAX);
@@ -1670,7 +1666,7 @@ mod tests {
         let data = b"abcdefabcdefabcdef";
         let tmp = write_block_to_tempfile(
             data,
-            crate::table::block::BlockIdentity::for_test(0, 0, BlockType::Data),
+            crate::table::block::BlockIdentity::for_test(0, BlockType::Data),
             &crate::table::block::BlockTransform::from_parts(
                 CompressionType::Lz4,
                 None,
@@ -1681,11 +1677,7 @@ mod tests {
         let block = Block::from_file(
             &tmp.file,
             tmp.handle,
-            crate::table::block::BlockIdentity::for_test(
-                0,
-                0,
-                crate::table::block::BlockType::Data,
-            ),
+            crate::table::block::BlockIdentity::for_test(0, crate::table::block::BlockType::Data),
             &crate::table::block::BlockTransform::from_parts(
                 CompressionType::Lz4,
                 None,
@@ -1703,7 +1695,7 @@ mod tests {
         let data = b"abcdefabcdefabcdef";
         let tmp = write_block_to_tempfile(
             data,
-            BlockIdentity::for_test(0, 0, BlockType::Data),
+            BlockIdentity::for_test(0, BlockType::Data),
             &crate::table::block::BlockTransform::from_parts(
                 CompressionType::Zstd(3),
                 None,
@@ -1714,7 +1706,7 @@ mod tests {
         let block = Block::from_file(
             &tmp.file,
             tmp.handle,
-            BlockIdentity::for_test(0, 0, BlockType::Data),
+            BlockIdentity::for_test(0, BlockType::Data),
             &crate::table::block::BlockTransform::from_parts(
                 CompressionType::Zstd(3),
                 None,
@@ -1733,7 +1725,7 @@ mod tests {
         Block::write_into(
             &mut writer,
             b"abcdefabcdefabcdef",
-            crate::table::block::BlockIdentity::for_test(0, 0, BlockType::Data),
+            crate::table::block::BlockIdentity::for_test(0, BlockType::Data),
             &crate::table::block::BlockTransform::from_parts(
                 CompressionType::None,
                 None,
@@ -1747,7 +1739,6 @@ mod tests {
             let block = Block::from_reader(
                 &mut reader,
                 crate::table::block::BlockIdentity::for_test(
-                    0,
                     0,
                     crate::table::block::BlockType::Data,
                 ),
@@ -1771,7 +1762,7 @@ mod tests {
         Block::write_into(
             &mut writer,
             b"abcdefabcdefabcdef",
-            crate::table::block::BlockIdentity::for_test(0, 0, BlockType::Data),
+            crate::table::block::BlockIdentity::for_test(0, BlockType::Data),
             &crate::table::block::BlockTransform::from_parts(
                 CompressionType::Lz4,
                 None,
@@ -1785,7 +1776,6 @@ mod tests {
             let block = Block::from_reader(
                 &mut reader,
                 crate::table::block::BlockIdentity::for_test(
-                    0,
                     0,
                     crate::table::block::BlockType::Data,
                 ),
@@ -1812,7 +1802,7 @@ mod tests {
         Block::write_into(
             &mut buf,
             b"hello",
-            crate::table::block::BlockIdentity::for_test(0, 0, BlockType::Data),
+            crate::table::block::BlockIdentity::for_test(0, BlockType::Data),
             &crate::table::block::BlockTransform::from_parts(
                 CompressionType::Lz4,
                 None,
@@ -1839,11 +1829,7 @@ mod tests {
         let mut r = &tampered[..];
         let result = Block::from_reader(
             &mut r,
-            crate::table::block::BlockIdentity::for_test(
-                0,
-                0,
-                crate::table::block::BlockType::Data,
-            ),
+            crate::table::block::BlockIdentity::for_test(0, crate::table::block::BlockType::Data),
             &crate::table::block::BlockTransform::from_parts(
                 CompressionType::Lz4,
                 None,
@@ -1872,7 +1858,7 @@ mod tests {
         Block::write_into(
             &mut buf,
             b"hello",
-            crate::table::block::BlockIdentity::for_test(0, 0, BlockType::Data),
+            crate::table::block::BlockIdentity::for_test(0, BlockType::Data),
             &crate::table::block::BlockTransform::from_parts(
                 CompressionType::Lz4,
                 None,
@@ -1894,11 +1880,7 @@ mod tests {
         let mut r = &tampered[..];
         let result = Block::from_reader(
             &mut r,
-            crate::table::block::BlockIdentity::for_test(
-                0,
-                0,
-                crate::table::block::BlockType::Data,
-            ),
+            crate::table::block::BlockIdentity::for_test(0, crate::table::block::BlockType::Data),
             &crate::table::block::BlockTransform::from_parts(
                 CompressionType::Lz4,
                 None,
@@ -1946,11 +1928,7 @@ mod tests {
         let mut cursor = Cursor::new(buf);
         let result = Block::from_reader(
             &mut cursor,
-            crate::table::block::BlockIdentity::for_test(
-                0,
-                0,
-                crate::table::block::BlockType::Data,
-            ),
+            crate::table::block::BlockIdentity::for_test(0, crate::table::block::BlockType::Data),
             &crate::table::block::BlockTransform::from_parts(
                 CompressionType::Lz4,
                 None,
@@ -1977,7 +1955,7 @@ mod tests {
         Block::write_into(
             &mut buf,
             b"hello",
-            crate::table::block::BlockIdentity::for_test(0, 0, BlockType::Data),
+            crate::table::block::BlockIdentity::for_test(0, BlockType::Data),
             &crate::table::block::BlockTransform::from_parts(
                 CompressionType::Lz4,
                 None,
@@ -2010,11 +1988,7 @@ mod tests {
         let result = Block::from_file(
             &file,
             handle,
-            crate::table::block::BlockIdentity::for_test(
-                0,
-                0,
-                crate::table::block::BlockType::Data,
-            ),
+            crate::table::block::BlockIdentity::for_test(0, crate::table::block::BlockType::Data),
             &crate::table::block::BlockTransform::from_parts(
                 CompressionType::Lz4,
                 None,
@@ -2041,7 +2015,7 @@ mod tests {
         Block::write_into(
             &mut buf,
             b"hello",
-            crate::table::block::BlockIdentity::for_test(0, 0, BlockType::Data),
+            crate::table::block::BlockIdentity::for_test(0, BlockType::Data),
             &crate::table::block::BlockTransform::from_parts(
                 CompressionType::Lz4,
                 None,
@@ -2069,11 +2043,7 @@ mod tests {
         let result = Block::from_file(
             &file,
             handle,
-            crate::table::block::BlockIdentity::for_test(
-                0,
-                0,
-                crate::table::block::BlockType::Data,
-            ),
+            crate::table::block::BlockIdentity::for_test(0, crate::table::block::BlockType::Data),
             &crate::table::block::BlockTransform::from_parts(
                 CompressionType::Lz4,
                 None,
@@ -2098,7 +2068,7 @@ mod tests {
         Block::write_into(
             &mut buf,
             b"hello",
-            crate::table::block::BlockIdentity::for_test(0, 0, BlockType::Data),
+            crate::table::block::BlockIdentity::for_test(0, BlockType::Data),
             &crate::table::block::BlockTransform::from_parts(
                 CompressionType::None,
                 None,
@@ -2121,11 +2091,7 @@ mod tests {
         let mut r = &tampered[..];
         let result = Block::from_reader(
             &mut r,
-            crate::table::block::BlockIdentity::for_test(
-                0,
-                0,
-                crate::table::block::BlockType::Data,
-            ),
+            crate::table::block::BlockIdentity::for_test(0, crate::table::block::BlockType::Data),
             &crate::table::block::BlockTransform::from_parts(
                 CompressionType::None,
                 None,
@@ -2155,11 +2121,7 @@ mod tests {
         let result = Block::from_file(
             &file,
             handle,
-            crate::table::block::BlockIdentity::for_test(
-                0,
-                0,
-                crate::table::block::BlockType::Data,
-            ),
+            crate::table::block::BlockIdentity::for_test(0, crate::table::block::BlockType::Data),
             &crate::table::block::BlockTransform::from_parts(
                 CompressionType::None,
                 None,
@@ -2207,11 +2169,7 @@ mod tests {
         let mut cursor = Cursor::new(buf);
         let result = Block::from_reader(
             &mut cursor,
-            crate::table::block::BlockIdentity::for_test(
-                0,
-                0,
-                crate::table::block::BlockType::Data,
-            ),
+            crate::table::block::BlockIdentity::for_test(0, crate::table::block::BlockType::Data),
             &crate::table::block::BlockTransform::from_parts(
                 CompressionType::Zstd(3),
                 None,
@@ -2260,11 +2218,7 @@ mod tests {
         let mut cursor = Cursor::new(buf);
         let result = Block::from_reader(
             &mut cursor,
-            crate::table::block::BlockIdentity::for_test(
-                0,
-                0,
-                crate::table::block::BlockType::Data,
-            ),
+            crate::table::block::BlockIdentity::for_test(0, crate::table::block::BlockType::Data),
             &crate::table::block::BlockTransform::from_parts(
                 CompressionType::Zstd(3),
                 None,
@@ -2289,7 +2243,7 @@ mod tests {
         Block::write_into(
             &mut writer,
             b"abcdefabcdefabcdef",
-            crate::table::block::BlockIdentity::for_test(0, 0, BlockType::Data),
+            crate::table::block::BlockIdentity::for_test(0, BlockType::Data),
             &crate::table::block::BlockTransform::from_parts(
                 CompressionType::Zstd(3),
                 None,
@@ -2303,7 +2257,6 @@ mod tests {
             let block = Block::from_reader(
                 &mut reader,
                 crate::table::block::BlockIdentity::for_test(
-                    0,
                     0,
                     crate::table::block::BlockType::Data,
                 ),
@@ -2327,7 +2280,7 @@ mod tests {
         let result = Block::write_into(
             &mut sink,
             &oversized,
-            crate::table::block::BlockIdentity::for_test(0, 0, BlockType::Data),
+            crate::table::block::BlockIdentity::for_test(0, BlockType::Data),
             &crate::table::block::BlockTransform::from_parts(
                 CompressionType::None,
                 None,
@@ -2351,7 +2304,7 @@ mod tests {
         Block::write_into(
             &mut writer,
             &data,
-            crate::table::block::BlockIdentity::for_test(0, 0, BlockType::Data),
+            crate::table::block::BlockIdentity::for_test(0, BlockType::Data),
             &crate::table::block::BlockTransform::from_parts(
                 CompressionType::Zstd(3),
                 None,
@@ -2371,7 +2324,6 @@ mod tests {
             let block = Block::from_reader(
                 &mut reader,
                 crate::table::block::BlockIdentity::for_test(
-                    0,
                     0,
                     crate::table::block::BlockType::Data,
                 ),
@@ -2412,7 +2364,7 @@ mod tests {
             Block::write_into(
                 &mut writer,
                 data,
-                crate::table::block::BlockIdentity::for_test(0, 0, BlockType::Data),
+                crate::table::block::BlockIdentity::for_test(0, BlockType::Data),
                 &crate::table::block::BlockTransform::from_parts(
                     CompressionType::None,
                     Some(&enc),
@@ -2425,7 +2377,6 @@ mod tests {
             let block = Block::from_reader(
                 &mut reader,
                 crate::table::block::BlockIdentity::for_test(
-                    0,
                     0,
                     crate::table::block::BlockType::Data,
                 ),
@@ -2450,7 +2401,7 @@ mod tests {
             Block::write_into(
                 &mut writer,
                 data,
-                crate::table::block::BlockIdentity::for_test(0, 0, BlockType::Data),
+                crate::table::block::BlockIdentity::for_test(0, BlockType::Data),
                 &crate::table::block::BlockTransform::from_parts(
                     CompressionType::Lz4,
                     Some(&enc),
@@ -2463,7 +2414,6 @@ mod tests {
             let block = Block::from_reader(
                 &mut reader,
                 crate::table::block::BlockIdentity::for_test(
-                    0,
                     0,
                     crate::table::block::BlockType::Data,
                 ),
@@ -2488,7 +2438,7 @@ mod tests {
             Block::write_into(
                 &mut writer,
                 data,
-                crate::table::block::BlockIdentity::for_test(0, 0, BlockType::Data),
+                crate::table::block::BlockIdentity::for_test(0, BlockType::Data),
                 &crate::table::block::BlockTransform::from_parts(
                     CompressionType::Zstd(3),
                     Some(&enc),
@@ -2501,7 +2451,6 @@ mod tests {
             let block = Block::from_reader(
                 &mut reader,
                 crate::table::block::BlockIdentity::for_test(
-                    0,
                     0,
                     crate::table::block::BlockType::Data,
                 ),
@@ -2522,7 +2471,7 @@ mod tests {
             let data = b"plaintext block data for from_file encryption test";
             let tmp = super::write_block_to_tempfile(
                 data,
-                crate::table::block::BlockIdentity::for_test(0, 0, BlockType::Data),
+                crate::table::block::BlockIdentity::for_test(0, BlockType::Data),
                 &crate::table::block::BlockTransform::from_parts(
                     CompressionType::None,
                     Some(&enc),
@@ -2534,7 +2483,6 @@ mod tests {
                 &tmp.file,
                 tmp.handle,
                 crate::table::block::BlockIdentity::for_test(
-                    0,
                     0,
                     crate::table::block::BlockType::Data,
                 ),
@@ -2556,7 +2504,7 @@ mod tests {
             let data = b"abcdefabcdefabcdef";
             let tmp = super::write_block_to_tempfile(
                 data,
-                crate::table::block::BlockIdentity::for_test(0, 0, BlockType::Data),
+                crate::table::block::BlockIdentity::for_test(0, BlockType::Data),
                 &crate::table::block::BlockTransform::from_parts(
                     CompressionType::Lz4,
                     Some(&enc),
@@ -2568,7 +2516,6 @@ mod tests {
                 &tmp.file,
                 tmp.handle,
                 crate::table::block::BlockIdentity::for_test(
-                    0,
                     0,
                     crate::table::block::BlockType::Data,
                 ),
@@ -2590,7 +2537,7 @@ mod tests {
             let data = b"abcdefabcdefabcdef";
             let tmp = super::write_block_to_tempfile(
                 data,
-                crate::table::block::BlockIdentity::for_test(0, 0, BlockType::Data),
+                crate::table::block::BlockIdentity::for_test(0, BlockType::Data),
                 &crate::table::block::BlockTransform::from_parts(
                     CompressionType::Zstd(3),
                     Some(&enc),
@@ -2602,7 +2549,6 @@ mod tests {
                 &tmp.file,
                 tmp.handle,
                 crate::table::block::BlockIdentity::for_test(
-                    0,
                     0,
                     crate::table::block::BlockType::Data,
                 ),
@@ -2624,7 +2570,7 @@ mod tests {
             let data = b"encrypted block data";
             let tmp = super::write_block_to_tempfile(
                 data,
-                crate::table::block::BlockIdentity::for_test(0, 0, BlockType::Data),
+                crate::table::block::BlockIdentity::for_test(0, BlockType::Data),
                 &crate::table::block::BlockTransform::from_parts(
                     CompressionType::None,
                     Some(&enc_write),
@@ -2636,7 +2582,6 @@ mod tests {
                 &tmp.file,
                 tmp.handle,
                 crate::table::block::BlockIdentity::for_test(
-                    0,
                     0,
                     crate::table::block::BlockType::Data,
                 ),
@@ -2665,7 +2610,7 @@ mod tests {
             Block::write_into(
                 &mut writer,
                 data,
-                crate::table::block::BlockIdentity::for_test(0, 0, BlockType::Data),
+                crate::table::block::BlockIdentity::for_test(0, BlockType::Data),
                 &crate::table::block::BlockTransform::from_parts(
                     CompressionType::None,
                     Some(&enc_write),
@@ -2678,7 +2623,6 @@ mod tests {
             let result = Block::from_reader(
                 &mut reader,
                 crate::table::block::BlockIdentity::for_test(
-                    0,
                     0,
                     crate::table::block::BlockType::Data,
                 ),
@@ -2707,7 +2651,7 @@ mod tests {
             let header = Block::write_into(
                 &mut buf,
                 data,
-                crate::table::block::BlockIdentity::for_test(0, 0, BlockType::Data),
+                crate::table::block::BlockIdentity::for_test(0, BlockType::Data),
                 &crate::table::block::BlockTransform::from_parts(
                     CompressionType::None,
                     Some(&enc),
@@ -2738,7 +2682,6 @@ mod tests {
                 &file,
                 handle,
                 crate::table::block::BlockIdentity::for_test(
-                    0,
                     0,
                     crate::table::block::BlockType::Data,
                 ),
@@ -2777,7 +2720,6 @@ mod tests {
                 handle,
                 crate::table::block::BlockIdentity::for_test(
                     0,
-                    0,
                     crate::table::block::BlockType::Data,
                 ),
                 &crate::table::block::BlockTransform::from_parts(
@@ -2802,7 +2744,7 @@ mod tests {
             let data = vec![0xBB_u8; 32 * 1024]; // 32 KiB
             let tmp = super::write_block_to_tempfile(
                 &data,
-                crate::table::block::BlockIdentity::for_test(0, 0, BlockType::Data),
+                crate::table::block::BlockIdentity::for_test(0, BlockType::Data),
                 &crate::table::block::BlockTransform::from_parts(
                     CompressionType::None,
                     Some(&enc),
@@ -2814,7 +2756,6 @@ mod tests {
                 &tmp.file,
                 tmp.handle,
                 crate::table::block::BlockIdentity::for_test(
-                    0,
                     0,
                     crate::table::block::BlockType::Data,
                 ),
@@ -2838,7 +2779,7 @@ mod tests {
             Block::write_into(
                 &mut writer,
                 &data,
-                crate::table::block::BlockIdentity::for_test(0, 0, BlockType::Data),
+                crate::table::block::BlockIdentity::for_test(0, BlockType::Data),
                 &crate::table::block::BlockTransform::from_parts(
                     CompressionType::None,
                     Some(&enc),
@@ -2851,7 +2792,6 @@ mod tests {
             let block = Block::from_reader(
                 &mut reader,
                 crate::table::block::BlockIdentity::for_test(
-                    0,
                     0,
                     crate::table::block::BlockType::Data,
                 ),
@@ -2876,7 +2816,7 @@ mod tests {
             Block::write_into(
                 &mut writer,
                 &data,
-                crate::table::block::BlockIdentity::for_test(0, 0, BlockType::Data),
+                crate::table::block::BlockIdentity::for_test(0, BlockType::Data),
                 &crate::table::block::BlockTransform::from_parts(
                     CompressionType::Lz4,
                     Some(&enc),
@@ -2889,7 +2829,6 @@ mod tests {
             let block = Block::from_reader(
                 &mut reader,
                 crate::table::block::BlockIdentity::for_test(
-                    0,
                     0,
                     crate::table::block::BlockType::Data,
                 ),
@@ -2914,7 +2853,7 @@ mod tests {
             Block::write_into(
                 &mut writer,
                 &data,
-                crate::table::block::BlockIdentity::for_test(0, 0, BlockType::Data),
+                crate::table::block::BlockIdentity::for_test(0, BlockType::Data),
                 &crate::table::block::BlockTransform::from_parts(
                     CompressionType::Zstd(3),
                     Some(&enc),
@@ -2927,7 +2866,6 @@ mod tests {
             let block = Block::from_reader(
                 &mut reader,
                 crate::table::block::BlockIdentity::for_test(
-                    0,
                     0,
                     crate::table::block::BlockType::Data,
                 ),
@@ -2974,7 +2912,7 @@ mod tests {
             Block::write_into(
                 &mut writer,
                 data,
-                crate::table::block::BlockIdentity::for_test(0, 0, BlockType::Data),
+                crate::table::block::BlockIdentity::for_test(0, BlockType::Data),
                 &crate::table::block::BlockTransform::from_parts(
                     compression,
                     None,
@@ -2987,7 +2925,6 @@ mod tests {
             let block = Block::from_reader(
                 &mut reader,
                 crate::table::block::BlockIdentity::for_test(
-                    0,
                     0,
                     crate::table::block::BlockType::Data,
                 ),
@@ -3013,7 +2950,7 @@ mod tests {
             let header = Block::write_into(
                 &mut buf,
                 data,
-                crate::table::block::BlockIdentity::for_test(0, 0, BlockType::Data),
+                crate::table::block::BlockIdentity::for_test(0, BlockType::Data),
                 &crate::table::block::BlockTransform::from_parts(
                     compression,
                     None,
@@ -3035,7 +2972,6 @@ mod tests {
                 &file,
                 handle,
                 crate::table::block::BlockIdentity::for_test(
-                    0,
                     0,
                     crate::table::block::BlockType::Data,
                 ),
@@ -3060,7 +2996,7 @@ mod tests {
             Block::write_into(
                 &mut writer,
                 &data,
-                crate::table::block::BlockIdentity::for_test(0, 0, BlockType::Data),
+                crate::table::block::BlockIdentity::for_test(0, BlockType::Data),
                 &crate::table::block::BlockTransform::from_parts(
                     compression,
                     None,
@@ -3078,7 +3014,6 @@ mod tests {
             let block = Block::from_reader(
                 &mut reader,
                 crate::table::block::BlockIdentity::for_test(
-                    0,
                     0,
                     crate::table::block::BlockType::Data,
                 ),
@@ -3172,7 +3107,7 @@ mod tests {
             Block::write_into(
                 &mut writer,
                 data,
-                crate::table::block::BlockIdentity::for_test(0, 0, BlockType::Data),
+                crate::table::block::BlockIdentity::for_test(0, BlockType::Data),
                 &crate::table::block::BlockTransform::from_parts(
                     compression,
                     Some(&enc),
@@ -3185,7 +3120,6 @@ mod tests {
             let block = Block::from_reader(
                 &mut reader,
                 crate::table::block::BlockIdentity::for_test(
-                    0,
                     0,
                     crate::table::block::BlockType::Data,
                 ),
@@ -3213,7 +3147,7 @@ mod tests {
             let header = Block::write_into(
                 &mut buf,
                 &data,
-                crate::table::block::BlockIdentity::for_test(0, 0, BlockType::Data),
+                crate::table::block::BlockIdentity::for_test(0, BlockType::Data),
                 &crate::table::block::BlockTransform::from_parts(
                     compression,
                     Some(&enc),
@@ -3235,7 +3169,6 @@ mod tests {
                 &file,
                 handle,
                 crate::table::block::BlockIdentity::for_test(
-                    0,
                     0,
                     crate::table::block::BlockType::Data,
                 ),
@@ -3271,7 +3204,7 @@ mod tests {
             let header = Block::write_into(
                 &mut writer,
                 PAYLOAD,
-                BlockIdentity::for_test(0, 0, BlockType::Data),
+                BlockIdentity::for_test(0, BlockType::Data),
                 &BlockTransform::PlainEcc(EccParams::RS_4_2),
             )?;
 
@@ -3288,7 +3221,7 @@ mod tests {
             let mut reader = &writer[..];
             let block = Block::from_reader(
                 &mut reader,
-                BlockIdentity::for_test(0, 0, BlockType::Data),
+                BlockIdentity::for_test(0, BlockType::Data),
                 &BlockTransform::PlainEcc(EccParams::RS_4_2),
             )?;
             assert_eq!(&*block.data, PAYLOAD);
@@ -3301,7 +3234,7 @@ mod tests {
             let header = Block::write_into(
                 &mut writer,
                 PAYLOAD,
-                BlockIdentity::for_test(0, 0, BlockType::Data),
+                BlockIdentity::for_test(0, BlockType::Data),
                 &BlockTransform::PlainEcc(EccParams::RS_4_2),
             )?;
 
@@ -3316,7 +3249,7 @@ mod tests {
             let mut reader = &writer[..];
             let block = Block::from_reader(
                 &mut reader,
-                BlockIdentity::for_test(0, 0, BlockType::Data),
+                BlockIdentity::for_test(0, BlockType::Data),
                 &BlockTransform::PlainEcc(EccParams::RS_4_2),
             )?;
             // ECC recovery reconstructs the original payload despite
@@ -3333,7 +3266,7 @@ mod tests {
         fn block_from_file_plain_ecc_recovers_from_single_byte_flip() -> crate::Result<()> {
             let tmp = super::write_block_to_tempfile(
                 PAYLOAD,
-                BlockIdentity::for_test(0, 0, BlockType::Data),
+                BlockIdentity::for_test(0, BlockType::Data),
                 &BlockTransform::PlainEcc(EccParams::RS_4_2),
             )?;
             let path = tmp.dir.path().join("block");
@@ -3351,7 +3284,7 @@ mod tests {
             let block = Block::from_file(
                 &file,
                 tmp.handle,
-                BlockIdentity::for_test(0, 0, BlockType::Data),
+                BlockIdentity::for_test(0, BlockType::Data),
                 &BlockTransform::PlainEcc(EccParams::RS_4_2),
             )?;
             assert_eq!(&*block.data, PAYLOAD);
@@ -3372,7 +3305,7 @@ mod tests {
             let scheme = EccParams::try_new(8, 2).expect("valid shards");
             let tmp = super::write_block_to_tempfile(
                 PAYLOAD,
-                BlockIdentity::for_test(0, 0, BlockType::Data),
+                BlockIdentity::for_test(0, BlockType::Data),
                 &BlockTransform::PlainEcc(scheme),
             )?;
 
@@ -3380,7 +3313,7 @@ mod tests {
             let (block, status) = Block::from_file_with_status(
                 &tmp.file,
                 tmp.handle,
-                BlockIdentity::for_test(0, 0, BlockType::Data),
+                BlockIdentity::for_test(0, BlockType::Data),
                 &BlockTransform::PlainEcc(scheme),
             )?;
             assert_eq!(&*block.data, PAYLOAD);
@@ -3392,7 +3325,7 @@ mod tests {
             let (block, status) = Block::from_file_with_status(
                 &tmp.file,
                 tmp.handle,
-                BlockIdentity::for_test(0, 0, BlockType::Data),
+                BlockIdentity::for_test(0, BlockType::Data),
                 &BlockTransform::PLAIN,
             )?;
             assert_eq!(
@@ -3417,7 +3350,7 @@ mod tests {
             let scheme = EccParams::try_new(8, 2).expect("valid shards");
             let tmp = super::write_block_to_tempfile(
                 b"",
-                BlockIdentity::for_test(0, 0, BlockType::Data),
+                BlockIdentity::for_test(0, BlockType::Data),
                 &BlockTransform::PlainEcc(scheme),
             )?;
             let path = tmp.dir.path().join("block");
@@ -3436,7 +3369,7 @@ mod tests {
             let err = Block::from_file_with_status(
                 &file,
                 handle,
-                BlockIdentity::for_test(0, 0, BlockType::Data),
+                BlockIdentity::for_test(0, BlockType::Data),
                 &BlockTransform::PlainEcc(scheme),
             )
             .err();
@@ -3460,7 +3393,7 @@ mod tests {
             let header = Block::write_into(
                 &mut writer,
                 PAYLOAD,
-                BlockIdentity::for_test(0, 0, BlockType::Data),
+                BlockIdentity::for_test(0, BlockType::Data),
                 &BlockTransform::CompressedEcc(
                     CompressionContext::new(CompressionType::Lz4)?,
                     EccParams::RS_4_2,
@@ -3476,7 +3409,7 @@ mod tests {
             let mut reader = &writer[..];
             let block = Block::from_reader(
                 &mut reader,
-                BlockIdentity::for_test(0, 0, BlockType::Data),
+                BlockIdentity::for_test(0, BlockType::Data),
                 &BlockTransform::CompressedEcc(
                     CompressionContext::new(CompressionType::Lz4)?,
                     EccParams::RS_4_2,
@@ -3505,7 +3438,7 @@ mod tests {
             let header = Block::write_into(
                 &mut writer,
                 PAYLOAD,
-                BlockIdentity::for_test(0, 0, BlockType::Data),
+                BlockIdentity::for_test(0, BlockType::Data),
                 &BlockTransform::EncryptedEcc(&enc, EccParams::RS_4_2),
             )?;
             assert!(header.block_flags & crate::table::block::header::block_flags::ECC_PARITY != 0);
@@ -3518,7 +3451,7 @@ mod tests {
             let mut reader = &writer[..];
             let block = Block::from_reader(
                 &mut reader,
-                BlockIdentity::for_test(0, 0, BlockType::Data),
+                BlockIdentity::for_test(0, BlockType::Data),
                 &BlockTransform::EncryptedEcc(&enc, EccParams::RS_4_2),
             )?;
             assert_eq!(
@@ -3542,7 +3475,7 @@ mod tests {
             let header = Block::write_into(
                 &mut writer,
                 PAYLOAD,
-                BlockIdentity::for_test(0, 0, BlockType::Data),
+                BlockIdentity::for_test(0, BlockType::Data),
                 &BlockTransform::PlainEcc(EccParams::RS_4_2),
             )?;
 
@@ -3566,7 +3499,7 @@ mod tests {
             let mut reader = &writer[..];
             let result = Block::from_reader(
                 &mut reader,
-                BlockIdentity::for_test(0, 0, BlockType::Data),
+                BlockIdentity::for_test(0, BlockType::Data),
                 &BlockTransform::PlainEcc(EccParams::RS_4_2),
             );
             match result {
@@ -3592,7 +3525,7 @@ mod tests {
             let empty = Block::write_into(
                 &mut empty_buf,
                 &[],
-                BlockIdentity::for_test(0, 0, BlockType::Data),
+                BlockIdentity::for_test(0, BlockType::Data),
                 &BlockTransform::PlainEcc(EccParams::RS_4_2),
             )?;
             assert_eq!(
@@ -3617,7 +3550,7 @@ mod tests {
             let full = Block::write_into(
                 &mut full_buf,
                 PAYLOAD,
-                BlockIdentity::for_test(0, 0, BlockType::Data),
+                BlockIdentity::for_test(0, BlockType::Data),
                 &BlockTransform::PlainEcc(EccParams::RS_4_2),
             )?;
             assert_ne!(

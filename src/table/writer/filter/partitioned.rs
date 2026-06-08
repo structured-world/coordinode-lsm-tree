@@ -49,6 +49,11 @@ pub struct PartitionedFilterWriter {
     /// `use_table_id` before `spill_filter_partition` / `finish`.
     table_id: crate::TableId,
 
+    /// Owning SST's tree id. Set by the outer Writer via `use_tree_id`
+    /// before `spill_filter_partition` / `finish`, so partition + TLI
+    /// blocks seal under the same AAD the reader rebuilds.
+    tree_id: crate::tree::inner::TreeId,
+
     /// Page ECC scheme threaded by the outer Writer via `use_ecc`.
     /// `Some(params)` upgrades every partition + TLI block transform to
     /// its matching `*Ecc` variant; `None` = no parity.
@@ -77,6 +82,7 @@ impl PartitionedFilterWriter {
 
             encryption: None,
             table_id: 0,
+            tree_id: 0,
             ecc: None,
         }
     }
@@ -120,9 +126,8 @@ impl PartitionedFilterWriter {
             &mut self.final_filter_buffer,
             &filter_bytes,
             crate::table::block::BlockIdentity {
-                tree_id: 0,
+                tree_id: self.tree_id,
                 table_id: self.table_id,
-                block_offset: 0,
                 block_type: crate::table::block::BlockType::Filter,
                 dict_id: 0,
                 window_log: 0,
@@ -181,9 +186,8 @@ impl PartitionedFilterWriter {
             file_writer,
             &bytes,
             crate::table::block::BlockIdentity {
-                tree_id: 0,
+                tree_id: self.tree_id,
                 table_id: self.table_id,
-                block_offset: 0,
                 block_type: crate::table::block::BlockType::Index,
                 dict_id: 0,
                 window_log: 0,
@@ -231,6 +235,14 @@ impl<W: std::io::Write + std::io::Seek> FilterWriter<W> for PartitionedFilterWri
 
     fn use_table_id(mut self: Box<Self>, table_id: crate::TableId) -> Box<dyn FilterWriter<W>> {
         self.table_id = table_id;
+        self
+    }
+
+    fn use_tree_id(
+        mut self: Box<Self>,
+        tree_id: crate::tree::inner::TreeId,
+    ) -> Box<dyn FilterWriter<W>> {
+        self.tree_id = tree_id;
         self
     }
 

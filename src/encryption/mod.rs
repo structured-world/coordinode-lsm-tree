@@ -177,7 +177,7 @@ pub trait EncryptionProvider:
     /// binding and recover the plaintext. The transform fields the writer bound
     /// (`compression_type`, `block_flags`, `key_epoch`, `suite_id`) are read back
     /// from the frame's `MetadataFrame`; the reader supplies only `identity` (the
-    /// out-of-band tree/table/offset + dict/window context, from the per-SST
+    /// out-of-band tree/table + dict/window context, from the per-SST
     /// descriptor + block handle). Any mismatch fails AEAD verification.
     ///
     /// # Errors

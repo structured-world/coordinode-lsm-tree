@@ -4,12 +4,13 @@
 //! AAD (Additional Authenticated Data) construction for AAD-bound encrypted
 //! blocks, per the wire-format spec in `docs/aad-block-format.md` §5.3.
 //!
-//! AAD is the 39-byte buffer that is fed to the AEAD primitive alongside the
+//! AAD is the 31-byte buffer that is fed to the AEAD primitive alongside the
 //! ciphertext and nonce, but is **never** written to disk. It mixes
 //! disk-mirrored fields (header byte, key epoch, block type, suite id,
 //! compression type, dict id, window log) with caller-supplied identity
-//! fields (tree id, table id, block offset) so that the AEAD tag binds the
-//! ciphertext to its exact block-identity, codec context, and key epoch.
+//! fields (tree id, table id) so that the AEAD tag binds the ciphertext to its
+//! block-identity, codec context, and key epoch. A block's byte offset is
+//! intentionally NOT bound — see [`build`] for why.
 //!
 //! ## Why a separate module
 //!
@@ -31,7 +32,7 @@
 //! discriminator) live on [`EncryptionContext`], the small per-block
 //! struct passed alongside `BlockIdentity` into [`build`].
 //!
-//! ## Layout (39 bytes, big-endian for u64 identity fields)
+//! ## Layout (31 bytes, big-endian for u64 identity fields)
 //!
 //! ```text
 //! Offset  Size  Field             Source
@@ -43,25 +44,32 @@
 //! 7       1     SuiteID           Mirror of disk
 //! 8       8     TreeID            u64 BE, caller-supplied
 //! 16      8     TableID           u64 BE, caller-supplied
-//! 24      8     BlockOffset       u64 BE, caller-supplied
-//! 32      1     CompressionType   Mirror of disk
-//! 33      4     DictID            u32 BE, mirror of disk
-//! 37      1     WindowLog         Mirror of disk
-//! 38      1     BlockFlags        Mirror of disk (transform-presence
+//! 24      1     CompressionType   Mirror of disk
+//! 25      4     DictID            u32 BE, mirror of disk
+//! 29      1     WindowLog         Mirror of disk
+//! 30      1     BlockFlags        Mirror of disk (transform-presence
 //!                                 bitfield: KV footer / ECC / compressed /
 //!                                 encrypted) — binds the block's transform
 //!                                 stack so a flag relabel fails AEAD
 //! ══════
-//! Total   39 bytes
+//! Total   31 bytes
 //! ```
+//!
+//! A block's byte offset is intentionally absent: the on-disk offset is unknown
+//! to several writers and varies across MID/tail/head mirrors of one block, so
+//! binding it would break those paths and force serial encryption. Cross-tree /
+//! cross-table substitution is bound via `tree_id` + `table_id`.
 
 use core::convert::TryFrom;
 
 pub use crate::table::block::{BlockIdentity, BlockType};
 
-/// Length of the AAD buffer in bytes. Spec-locked: see
-/// `docs/aad-block-format.md` §5.3.
-pub const AAD_LEN: usize = 39;
+/// Length of the AAD buffer in bytes.
+///
+/// Spec-locked: see `docs/aad-block-format.md` §5.3. A block's byte offset is
+/// not bound (see [`build`]), so the buffer is 31 bytes (was 39 before the
+/// offset was dropped).
+pub const AAD_LEN: usize = 31;
 
 /// First four bytes of the AAD: the literal `MetadataFrame` magic.
 ///
@@ -206,7 +214,7 @@ impl EncryptionContext {
 #[must_use]
 pub fn build(ctx: &EncryptionContext, identity: &BlockIdentity) -> [u8; AAD_LEN] {
     // Stack-allocated; the compiler emits a sequence of direct writes,
-    // no heap and no zero-init beyond the initial `[0; 38]`.
+    // no heap and no zero-init beyond the initial `[0; AAD_LEN]`.
     let mut buf = [0u8; AAD_LEN];
 
     // Offset 0..4: MagicMetadata (literal, format-identity binding).
@@ -218,18 +226,24 @@ pub fn build(ctx: &EncryptionContext, identity: &BlockIdentity) -> [u8; AAD_LEN]
     buf[6] = u8::from(identity.block_type);
     buf[7] = ctx.suite_id.as_byte();
 
-    // Offset 8..32: three u64 BE identity fields (NEVER on disk).
+    // Offset 8..24: two u64 BE identity fields (NEVER on disk). block_offset is
+    // intentionally NOT bound: the on-disk offset is unknown to several writers
+    // (sfa-wrapped index/filter writers, the parallel compressor) and varies
+    // across MID/tail/head mirrors of one block, so binding it would break those
+    // paths and force serial encryption. Cross-tree / cross-table substitution
+    // is bound via tree_id + table_id; intra-file block-swap degrades only to a
+    // lookup miss (a value is inseparable from its key inside the authenticated
+    // block), not forgery.
     buf[8..16].copy_from_slice(&identity.tree_id.to_be_bytes());
     buf[16..24].copy_from_slice(&identity.table_id.to_be_bytes());
-    buf[24..32].copy_from_slice(&identity.block_offset.to_be_bytes());
 
-    // Offset 32..38: disk-mirrored codec context.
-    buf[32] = ctx.compression_type;
-    buf[33..37].copy_from_slice(&identity.dict_id.to_be_bytes());
-    buf[37] = identity.window_log;
+    // Offset 24..30: disk-mirrored codec context.
+    buf[24] = ctx.compression_type;
+    buf[25..29].copy_from_slice(&identity.dict_id.to_be_bytes());
+    buf[29] = identity.window_log;
 
-    // Offset 38: disk-mirrored transform-presence flags.
-    buf[38] = ctx.block_flags;
+    // Offset 30: disk-mirrored transform-presence flags.
+    buf[30] = ctx.block_flags;
 
     buf
 }
@@ -238,11 +252,10 @@ pub fn build(ctx: &EncryptionContext, identity: &BlockIdentity) -> [u8; AAD_LEN]
 mod tests {
     use super::*;
 
-    fn identity(tree_id: u64, table_id: u64, block_offset: u64, bt: BlockType) -> BlockIdentity {
+    fn identity(tree_id: u64, table_id: u64, bt: BlockType) -> BlockIdentity {
         BlockIdentity {
             tree_id,
             table_id,
-            block_offset,
             block_type: bt,
             dict_id: 0,
             window_log: 0,
@@ -252,8 +265,9 @@ mod tests {
     #[test]
     fn aad_len_matches_spec() {
         // Hard-coded to catch any drift between `AAD_LEN` and the spec's
-        // 39-byte total. The encoder/decoder rely on this exact size.
-        assert_eq!(AAD_LEN, 39);
+        // 31-byte total (block_offset dropped). The encoder/decoder rely on
+        // this exact size.
+        assert_eq!(AAD_LEN, 31);
     }
 
     #[test]
@@ -315,7 +329,6 @@ mod tests {
         let identity = BlockIdentity {
             tree_id: 0x0102_0304_0506_0708,
             table_id: 0x1112_1314_1516_1718,
-            block_offset: 0x2122_2324_2526_2728,
             block_type: BlockType::Index, // 1
             dict_id: 0xDEAD_BEEF,
             window_log: 21,
@@ -337,16 +350,15 @@ mod tests {
         assert_eq!(&aad[8..16], &0x0102_0304_0506_0708u64.to_be_bytes());
         // TableID (BE)
         assert_eq!(&aad[16..24], &0x1112_1314_1516_1718u64.to_be_bytes());
-        // BlockOffset (BE)
-        assert_eq!(&aad[24..32], &0x2122_2324_2526_2728u64.to_be_bytes());
-        // CompressionType
-        assert_eq!(aad[32], 3);
+        // CompressionType (block_offset is no longer bound, so codec context
+        // starts right after table_id)
+        assert_eq!(aad[24], 3);
         // DictID (BE)
-        assert_eq!(&aad[33..37], &0xDEAD_BEEFu32.to_be_bytes());
+        assert_eq!(&aad[25..29], &0xDEAD_BEEFu32.to_be_bytes());
         // WindowLog
-        assert_eq!(aad[37], 21);
+        assert_eq!(aad[29], 21);
         // BlockFlags
-        assert_eq!(aad[38], 0x05);
+        assert_eq!(aad[30], 0x05);
     }
 
     #[test]
@@ -357,7 +369,7 @@ mod tests {
         // pins the AES-256-GCM byte at the SuiteID offset for the
         // zero-codec / zero-block-type happy path.
         let ctx = EncryptionContext::v1(0, SuiteId::Aes256Gcm, 0, 0);
-        let id = identity(0, 0, 0, BlockType::Data);
+        let id = identity(0, 0, BlockType::Data);
         let aad = build(&ctx, &id);
         assert_eq!(aad.len(), AAD_LEN);
         assert_eq!(&aad[0..4], &MAGIC_METADATA_LE);
@@ -369,28 +381,14 @@ mod tests {
     }
 
     #[test]
-    fn aad_changes_when_block_offset_changes() {
-        // Cross-block-relocation defence: same identity except for
-        // `block_offset` must produce a different AAD, so the same
-        // AEAD ciphertext + tag will not verify after a relocation.
-        let ctx = EncryptionContext::v1(1, SuiteId::Aes256Gcm, 0, 0);
-        let a = build(&ctx, &identity(1, 2, 100, BlockType::Data));
-        let b = build(&ctx, &identity(1, 2, 101, BlockType::Data));
-        assert_ne!(a, b);
-        // Only the block_offset bytes (24..32) differ.
-        assert_eq!(&a[..24], &b[..24]);
-        assert_eq!(&a[32..], &b[32..]);
-    }
-
-    #[test]
     fn aad_changes_when_block_type_changes() {
         // Block-type-relabel defence: same identity except for
         // `block_type` must produce a different AAD, so an attacker
         // cannot relabel a Data block as an Index block to bypass
         // type-specific decode paths.
         let ctx = EncryptionContext::v1(1, SuiteId::Aes256Gcm, 0, 0);
-        let a = build(&ctx, &identity(1, 2, 100, BlockType::Data));
-        let b = build(&ctx, &identity(1, 2, 100, BlockType::Index));
+        let a = build(&ctx, &identity(1, 2, BlockType::Data));
+        let b = build(&ctx, &identity(1, 2, BlockType::Index));
         assert_ne!(a, b);
         // Only the block_type byte (offset 6) differs.
         assert_eq!(&a[..6], &b[..6]);
@@ -405,15 +403,15 @@ mod tests {
         // and still pass AEAD verification.
         let a = build(
             &EncryptionContext::v1(1, SuiteId::Aes256Gcm, 0, 0),
-            &identity(1, 2, 100, BlockType::Data),
+            &identity(1, 2, BlockType::Data),
         );
         let b = build(
             &EncryptionContext::v1(1, SuiteId::Aes256Gcm, 0, 0x01),
-            &identity(1, 2, 100, BlockType::Data),
+            &identity(1, 2, BlockType::Data),
         );
         assert_ne!(a, b);
-        // Only the block_flags byte (offset 38) differs.
-        assert_eq!(&a[..38], &b[..38]);
-        assert_ne!(a[38], b[38]);
+        // Only the block_flags byte (offset 30, the AAD's last byte) differs.
+        assert_eq!(&a[..30], &b[..30]);
+        assert_ne!(a[30], b[30]);
     }
 }

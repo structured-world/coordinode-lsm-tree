@@ -616,7 +616,6 @@ pub fn decrypt_block(
     let aad_identity = BlockIdentity {
         tree_id: identity.tree_id,
         table_id: identity.table_id,
-        block_offset: identity.block_offset,
         block_type,
         dict_id: parsed.dict_id,
         window_log: parsed.window_log,
@@ -663,7 +662,6 @@ mod tests {
         BlockIdentity {
             tree_id: 0xAABB_CCDD_EEFF_0011,
             table_id: 0x1234_5678_9ABC_DEF0,
-            block_offset: 0x0000_1000,
             block_type: BlockType::Data,
             dict_id: 0,
             window_log: 0,
@@ -732,12 +730,12 @@ mod tests {
     fn cross_identity_substitution_surfaces_aead_failure() {
         // Same plaintext, sealed under one BlockIdentity. Reader
         // attempts to decrypt with a DIFFERENT BlockIdentity (one
-        // field changed). AAD includes tree_id / table_id /
-        // block_offset, so any mismatch surfaces as AEAD failure.
+        // field changed). AAD includes tree_id / table_id, so any
+        // mismatch surfaces as AEAD failure.
         let plaintext = b"the quick brown fox";
         let sealed = encrypt_block(plaintext, &id(), &ctx(), &chain()).unwrap();
         let mut wrong_id = id();
-        wrong_id.block_offset = 0x0000_2000; // shifted by 4 KiB
+        wrong_id.table_id ^= 0x1; // flip one bit of the table id
         let err = decrypt_block(&sealed, &wrong_id, &chain()).unwrap_err();
         assert!(matches!(err, DecryptError::AeadVerificationFailed));
     }

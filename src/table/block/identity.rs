@@ -46,26 +46,16 @@
 //!   know the id before the block is parsed (chicken-and-egg).
 //!   Cross-store substitution is still prevented because the
 //!   meta payload's own id field is part of the verified body.
-//! - `block_offset = 0` is allowed in two cases until AAD
-//!   wiring lands:
-//!   - Index / filter writers that hand their blocks to
-//!     `crate::sfa::Writer` (the sectioned-file-archive wrapper):
-//!     the wrapper doesn't expose a byte-position cursor, and
-//!     the [`crate::table::writer::index::BlockIndexWriter`] /
-//!     [`crate::table::writer::filter::FilterWriter`] traits
-//!     don't surface `block_offset` to `finish()`. Extending
-//!     those signatures is a follow-up.
-//!   - Sequential scanners reading via `BufReader`: the buffer
-//!     doesn't expose its own byte offset, and the scan path
-//!     walks blocks in order so per-block offset bookkeeping
-//!     isn't load-bearing for the scan itself.
 //!
-//! `table_id = 0` AND `block_offset = 0` together — both zero
-//! at the same call site — is reserved for tests; a CI canary
-//! to enforce that is tracked as a follow-up. Outside the
-//! exceptions listed above, defaulting either to zero in
-//! production weakens block-swap resistance and should be
-//! avoided.
+//! **Block position is deliberately NOT part of the identity.**
+//! AAD binds `(tree_id, table_id)` plus the codec context, but
+//! never a per-block byte offset. Offset-independent AAD is what
+//! lets a writer encrypt every block of a table in parallel (the
+//! on-disk offset isn't known until placement). The cost is that
+//! two blocks of the SAME table are interchangeable at the AEAD
+//! layer; block-position integrity is supplied one layer up by the
+//! authenticated index (key-range -> offset) plus the structural
+//! file layout, not by per-block AEAD.
 
 use crate::table::block::BlockType;
 
@@ -86,9 +76,9 @@ pub struct BlockIdentity {
     /// Combined with [`Self::table_id`] this gives the
     /// [`crate::table::GlobalTableId`] shape: `TableId` alone is
     /// a per-tree counter that CAN collide across different
-    /// trees, so AAD that binds only `(table_id, block_offset)`
-    /// would permit cross-tree block substitution if the same
-    /// encryption key were ever reused across trees. Including
+    /// trees, so AAD that binds only `table_id` would permit
+    /// cross-tree block substitution if the same encryption key
+    /// were ever reused across trees. Including
     /// `tree_id` closes that gap at the AAD layer regardless of
     /// key isolation.
     ///
@@ -102,21 +92,10 @@ pub struct BlockIdentity {
     /// the per-tree [`crate::TableId`] (a `u64` alias); for blob
     /// files it is the `crate::vlog::BlobFileId` (also a `u64`
     /// alias). Combined with [`Self::tree_id`], gives the
-    /// per-process unique discriminator that prevents block-swap
-    /// attacks: AAD built from `(tree_id, table_id, block_offset)`
+    /// per-process unique discriminator that prevents cross-store
+    /// block-swap attacks: AAD built from `(tree_id, table_id)`
     /// rejects any block whose declared origin doesn't match.
     pub table_id: u64,
-
-    /// Byte offset of the block's start within its underlying
-    /// container — SST file, blob-file slice, or in-memory buffer
-    /// — depending on which caller constructs the identity.
-    /// Combined with `table_id`, gives the AAD a per-block
-    /// discriminator that prevents block-swap within the same
-    /// container. `0` is the allowed-zero default for callers
-    /// whose container doesn't surface a usable position cursor
-    /// (sfa-wrapped index/filter writers, BufReader-based
-    /// scanners — see the module docstring for the full list).
-    pub block_offset: u64,
 
     /// Whether this is a Data, Filter, Index, or Meta block.
     /// Was previously a separate `block_type: BlockType`
@@ -148,11 +127,10 @@ impl BlockIdentity {
     /// populate every field explicitly from the local context.
     #[cfg(test)]
     #[must_use]
-    pub(crate) const fn for_test(table_id: u64, block_offset: u64, block_type: BlockType) -> Self {
+    pub(crate) const fn for_test(table_id: u64, block_type: BlockType) -> Self {
         Self {
             tree_id: 0,
             table_id,
-            block_offset,
             block_type,
             dict_id: 0,
             window_log: 0,

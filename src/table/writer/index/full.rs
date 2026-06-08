@@ -20,6 +20,11 @@ pub struct FullIndexWriter {
     /// `BlockIdentity::table_id` when writing the top-level
     /// index block.
     table_id: crate::TableId,
+    /// Owning SST's tree id; passed by the outer Writer via
+    /// `use_tree_id` before `finish()`. Used to populate
+    /// `BlockIdentity::tree_id` so the top-level index block seals
+    /// under the same AAD the reader rebuilds.
+    tree_id: crate::tree::inner::TreeId,
     /// Page ECC scheme threaded by the outer Writer via `use_ecc`.
     /// `Some(params)` makes the top-level-index block emit upgrade to
     /// its matching `*Ecc` variant so the index block gets the same
@@ -35,6 +40,7 @@ impl FullIndexWriter {
             block_handles: Vec::new(),
             encryption: None,
             table_id: 0,
+            tree_id: 0,
             ecc: None,
         }
     }
@@ -68,6 +74,14 @@ impl<W: std::io::Write + std::io::Seek> BlockIndexWriter<W> for FullIndexWriter 
 
     fn use_table_id(mut self: Box<Self>, table_id: crate::TableId) -> Box<dyn BlockIndexWriter<W>> {
         self.table_id = table_id;
+        self
+    }
+
+    fn use_tree_id(
+        mut self: Box<Self>,
+        tree_id: crate::tree::inner::TreeId,
+    ) -> Box<dyn BlockIndexWriter<W>> {
+        self.tree_id = tree_id;
         self
     }
 
@@ -109,17 +123,8 @@ impl<W: std::io::Write + std::io::Seek> BlockIndexWriter<W> for FullIndexWriter 
             file_writer,
             &bytes,
             crate::table::block::BlockIdentity {
-                tree_id: 0,
+                tree_id: self.tree_id,
                 table_id: self.table_id,
-                // crate::sfa::Writer doesn't expose its position cursor;
-                // outer table Writer tracks meta.file_pos but the
-                // BlockIndexWriter trait doesn't surface it here.
-                // Leaving offset=0 intentionally — extending
-                // BlockIndexWriter::finish to thread block_offset
-                // alongside file_writer is a planned follow-up
-                // (alongside the canary check that would refuse
-                // this combination once both fields can be real).
-                block_offset: 0,
                 block_type: crate::table::block::BlockType::Index,
                 dict_id: 0,
                 window_log: 0,

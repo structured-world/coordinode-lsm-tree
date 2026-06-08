@@ -203,7 +203,6 @@ impl ParsedMeta {
                 // being part of the verified payload.
                 tree_id: 0,
                 table_id: 0,
-                block_offset: *handle.offset(),
                 block_type: BlockType::Meta,
                 dict_id: 0,
                 window_log: 0,
@@ -544,7 +543,7 @@ mod tests {
         let _header = Block::write_into(
             &mut buf,
             &encoded,
-            crate::table::block::BlockIdentity::for_test(0, 0, BlockType::Meta),
+            crate::table::block::BlockIdentity::for_test(0, BlockType::Meta),
             &crate::table::block::BlockTransform::PLAIN,
         )
         .unwrap();

@@ -165,7 +165,7 @@ mod tests {
             suite, 0, // CompressionType::None tag
             0, // block_flags: no transform layers
         );
-        let identity = TableBlockIdentity::for_test(0xAB, 0xCD, BlockType::Data);
+        let identity = TableBlockIdentity::for_test(0xAB, BlockType::Data);
         build(&ctx, &identity)
     }
 

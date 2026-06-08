@@ -263,7 +263,6 @@ impl ManifestArchiveWriter {
         let identity = BlockIdentity {
             tree_id: MANIFEST_TREE_ID_SENTINEL,
             table_id: MANIFEST_TABLE_ID_SENTINEL,
-            block_offset: self.write_cursor,
             block_type: BlockType::ManifestFooter,
             dict_id: 0,
             window_log: 0,
@@ -375,7 +374,6 @@ impl ManifestArchiveWriter {
         let identity = BlockIdentity {
             tree_id: MANIFEST_TREE_ID_SENTINEL,
             table_id: MANIFEST_TABLE_ID_SENTINEL,
-            block_offset,
             block_type: BlockType::Manifest,
             dict_id: 0,
             window_log: 0,

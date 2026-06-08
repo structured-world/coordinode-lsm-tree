@@ -355,7 +355,6 @@ fn load_index_block(
             // `block_offset: 0` (see `Table::read_tli`'s comment for
             // the writer-side rationale). When #251 wires real
             // offsets into AAD this needs the SFA section offset.
-            block_offset: 0,
             block_type: BlockType::Index,
             dict_id: 0,
             window_log: 0,
@@ -792,7 +791,6 @@ fn load_data_block_iter(
             // with how it loads the meta / TLI / filter blocks
             // above. Once real offsets are threaded, all three
             // load sites need updating together.
-            block_offset: 0,
             block_type: BlockType::Data,
             dict_id: 0,
             window_log: 0,
@@ -1000,7 +998,6 @@ pub fn read_filter_stats(path: &Path) -> crate::Result<Option<FilterStats>> {
         BlockIdentity {
             tree_id: 0,
             table_id,
-            block_offset: 0,
             block_type: BlockType::Filter,
             dict_id: 0,
             window_log: 0,

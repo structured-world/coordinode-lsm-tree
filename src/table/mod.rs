@@ -1041,7 +1041,6 @@ impl Table {
                 // encrypted tables fail to reopen. Threading real
                 // section offsets through is tracked alongside the
                 // BlockIndexWriter::finish surface in #251.
-                block_offset: 0,
                 block_type: BlockType::Index,
                 dict_id: 0,
                 window_log: 0,
@@ -1258,7 +1257,6 @@ impl Table {
                 crate::table::block::BlockIdentity {
                     tree_id,
                     table_id: metadata.id,
-                    block_offset: *filter_tli_handle.offset(),
                     block_type: BlockType::Index,
                     dict_id: 0,
                     window_log: 0,
@@ -1309,7 +1307,6 @@ impl Table {
                         crate::table::block::BlockIdentity {
                             tree_id,
                             table_id: metadata.id,
-                            block_offset: *filter_handle.offset(),
                             block_type: BlockType::Filter,
                             dict_id: 0,
                             window_log: 0,
@@ -1358,7 +1355,6 @@ impl Table {
                 crate::table::block::BlockIdentity {
                     tree_id,
                     table_id: metadata.id,
-                    block_offset: *rt_handle.offset(),
                     block_type: BlockType::RangeTombstone,
                     dict_id: 0,
                     window_log: 0,
@@ -1414,7 +1410,6 @@ impl Table {
                 crate::table::block::BlockIdentity {
                     tree_id,
                     table_id: metadata.id,
-                    block_offset: *bl_handle.offset(),
                     block_type: BlockType::BlockLayout,
                     dict_id: 0,
                     window_log: 0,
