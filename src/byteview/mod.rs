@@ -53,10 +53,6 @@
 //
 // - `dead_code` / `unused_imports`: the retained-but-unused surface (StrView,
 //   Mutator re-export) is intentional for extraction parity.
-// - `unsafe_op_in_unsafe_fn`: upstream is edition 2021 (unsafe-fn bodies are
-//   implicitly unsafe); kept verbatim rather than rewrapping every unsafe op
-//   in the core type's hot internals (the unsafe semantics are unchanged, this
-//   is purely the edition-2024 explicit-block style lint).
 // - `unexpected_cfgs`: the vendored `serde` integration is gated on byteview's
 //   own `serde` feature, which this crate does not surface; the code is simply
 //   never compiled here.
@@ -69,7 +65,7 @@
 // path of the core slice type for no behavioural gain (the same boundary the
 // vendored Ribbon filter uses, and what a standalone `structured-byteview`
 // crate would keep as its own lint config).
-#![allow(dead_code, unused_imports, unsafe_op_in_unsafe_fn, unexpected_cfgs)]
+#![allow(dead_code, unused_imports, unexpected_cfgs)]
 #![allow(
     clippy::all,
     clippy::pedantic,

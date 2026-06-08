@@ -209,7 +209,9 @@ impl ByteView {
     #[doc(hidden)]
     #[must_use]
     pub unsafe fn builder_unzeroed(len: usize) -> Builder {
-        Builder::new(Self::with_size_unzeroed(len))
+        // SAFETY: forwards the caller's "fully initialize before reading" contract
+        // for the uninitialized allocation to `with_size_unzeroed`.
+        Builder::new(unsafe { Self::with_size_unzeroed(len) })
     }
 
     #[doc(hidden)]
@@ -464,11 +466,15 @@ impl ByteView {
 
         debug_assert!(!self.is_inline());
 
-        self.trailer
-            .long
-            .heap
-            .add(HEADER_SIZE)
-            .add(self.trailer.long.offset as usize)
+        // SAFETY: caller guarantees the heap (long) union variant is active, so
+        // reading `trailer.long` and offsetting past the header is in-bounds.
+        unsafe {
+            self.trailer
+                .long
+                .heap
+                .add(HEADER_SIZE)
+                .add(self.trailer.long.offset as usize)
+        }
     }
 
     unsafe fn data_ptr_mut(&mut self) -> *mut u8 {
@@ -476,12 +482,16 @@ impl ByteView {
 
         debug_assert!(!self.is_inline());
 
-        self.trailer
-            .long
-            .heap
-            .add(HEADER_SIZE)
-            .add(self.trailer.long.offset as usize)
-            .cast_mut()
+        // SAFETY: caller guarantees the heap (long) union variant is active, so
+        // reading `trailer.long` and offsetting past the header is in-bounds.
+        unsafe {
+            self.trailer
+                .long
+                .heap
+                .add(HEADER_SIZE)
+                .add(self.trailer.long.offset as usize)
+                .cast_mut()
+        }
     }
 
     fn get_heap_region(&self) -> &HeapAllocationHeader {
