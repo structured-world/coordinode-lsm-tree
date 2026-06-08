@@ -272,6 +272,18 @@ impl ParsedMeta {
             validated_restart_interval_index(read_u8!(block, b"restart_interval#data", &cmp))?;
 
         let id = read_u64!(block, b"table_id", &cmp);
+        // Cross-check the payload's stored id against the caller's durable
+        // expected id (manifest entry / SST path). A mismatch means a swapped
+        // or wrong-id file: reject it here rather than recovering the table
+        // under the wrong logical id (on encryption-OFF opens nothing else
+        // catches it; on encryption-ON opens the AEAD already bound the
+        // expected id, but the explicit check fails loudly + uniformly).
+        // `None` skips the check for diagnostic readers (inspect / scrub).
+        if let Some(expected) = expected_table_id {
+            if id != expected {
+                return Err(crate::Error::InvalidHeader("TableMeta"));
+            }
+        }
         let item_count = read_u64!(block, b"item_count", &cmp);
         let tombstone_count = read_u64!(block, b"tombstone_count", &cmp);
         let data_block_count = read_u64!(block, b"block_count#data", &cmp);
