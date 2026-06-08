@@ -41,11 +41,15 @@ fn test_key() -> [u8; 32] {
     [0x42; 32]
 }
 
-/// Default config + per-cell compression + optional encryption.
+/// Default config + per-cell compression + optional encryption + optional
+/// Page ECC. When `ecc` is set the SST blocks carry a Reed-Solomon parity
+/// trailer OUTSIDE the encryption envelope, so this exercises the
+/// ECC-trailer-strip → AEAD-decrypt → decompress read path end-to-end.
 fn open_tree(
     dir: &std::path::Path,
     compression: CompressionType,
     encrypt: bool,
+    ecc: bool,
 ) -> lsm_tree::Result<AnyTree> {
     let mut cfg = Config::new(
         dir,
@@ -59,27 +63,43 @@ fn open_tree(
         cfg = cfg.with_encryption(Some(provider));
     }
 
+    // ECC needs an explicit shard scheme (there is no implicit RS default);
+    // RS(4,2) matches the SST writer's per-block parity layout.
+    #[cfg(feature = "page_ecc")]
+    if ecc {
+        cfg = cfg
+            .page_ecc(true)
+            .ecc_scheme(lsm_tree::runtime_config::EccScheme::ReedSolomon {
+                data_shards: 4,
+                parity_shards: 2,
+            });
+    }
+    #[cfg(not(feature = "page_ecc"))]
+    let _ = ecc;
+
     cfg.open()
 }
 
-/// Human-readable label for a (compression, encryption) cell. Used in
+/// Human-readable label for a (compression, encryption, ecc) cell. Used in
 /// assertion messages so a failing cell is identifiable without inspecting
 /// the stack trace.
-fn cell_label(compression: CompressionType, encrypt: bool) -> String {
+fn cell_label(compression: CompressionType, encrypt: bool, ecc: bool) -> String {
+    let suffix = format!(
+        "{}{}",
+        if encrypt { "+enc" } else { "" },
+        if ecc { "+ecc" } else { "" }
+    );
     let comp = match compression {
         CompressionType::None => "none",
         #[cfg(feature = "lz4")]
         CompressionType::Lz4 => "lz4",
         #[cfg(zstd_any)]
         CompressionType::Zstd(level) => {
-            return format!("zstd{level}{}", if encrypt { "+enc" } else { "" });
+            return format!("zstd{level}{suffix}");
         }
         #[cfg(zstd_any)]
         CompressionType::ZstdDict { level, dict_id } => {
-            return format!(
-                "zstdDict{level}@{dict_id}{}",
-                if encrypt { "+enc" } else { "" }
-            );
+            return format!("zstdDict{level}@{dict_id}{suffix}");
         }
         // CompressionType is #[non_exhaustive] — future variants get a
         // generic label so a new compression type doesn't break this
@@ -87,7 +107,7 @@ fn cell_label(compression: CompressionType, encrypt: bool) -> String {
         // via explicit `cell_*` test functions below.
         _ => "other",
     };
-    format!("{comp}{}", if encrypt { "+enc" } else { "" })
+    format!("{comp}{suffix}")
 }
 
 /// The single-cell stress sequence. Runs the same invariant chain across
@@ -114,13 +134,13 @@ fn cell_label(compression: CompressionType, encrypt: bool) -> String {
 ///      original values
 ///   9. Drop the tree, reopen from disk with the SAME encryption provider
 ///      bytes, repeat steps 6 + 8 against the recovered tree.
-fn stress_cell(compression: CompressionType, encrypt: bool) -> lsm_tree::Result<()> {
-    let label = cell_label(compression, encrypt);
+fn stress_cell(compression: CompressionType, encrypt: bool, ecc: bool) -> lsm_tree::Result<()> {
+    let label = cell_label(compression, encrypt, ecc);
     let dir = tempfile::tempdir()?;
 
     // Phase 1: open + populate + flush + extra inserts
     {
-        let tree = open_tree(dir.path(), compression, encrypt)?;
+        let tree = open_tree(dir.path(), compression, encrypt, ecc)?;
 
         // Step 1: initial inserts at seqno=1+i (1..=1000). seqno=0 is a
         // sentinel meaning "compacted final" in the engine, so writes
@@ -166,7 +186,7 @@ fn stress_cell(compression: CompressionType, encrypt: bool) -> lsm_tree::Result<
 
     // Phase 2: reopen from disk → recovery + decrypt path exercised
     {
-        let tree = open_tree(dir.path(), compression, encrypt)?;
+        let tree = open_tree(dir.path(), compression, encrypt, ecc)?;
         verify_invariants(&tree, &label, "post-reopen")?;
     }
 
@@ -252,48 +272,128 @@ fn verify_invariants(tree: &AnyTree, label: &str, phase: &str) -> lsm_tree::Resu
 
 #[test]
 fn cell_none_plaintext_round_trips() -> lsm_tree::Result<()> {
-    stress_cell(CompressionType::None, false)
+    stress_cell(CompressionType::None, false, false)
 }
 
 #[test]
 fn cell_none_encrypted_round_trips() -> lsm_tree::Result<()> {
-    stress_cell(CompressionType::None, true)
+    stress_cell(CompressionType::None, true, false)
 }
 
 #[test]
 #[cfg(feature = "lz4")]
 fn cell_lz4_plaintext_round_trips() -> lsm_tree::Result<()> {
-    stress_cell(CompressionType::Lz4, false)
+    stress_cell(CompressionType::Lz4, false, false)
 }
 
 #[test]
 #[cfg(feature = "lz4")]
 fn cell_lz4_encrypted_round_trips() -> lsm_tree::Result<()> {
-    stress_cell(CompressionType::Lz4, true)
+    stress_cell(CompressionType::Lz4, true, false)
 }
 
 #[test]
 #[cfg(zstd_any)]
 fn cell_zstd1_plaintext_round_trips() -> lsm_tree::Result<()> {
-    stress_cell(CompressionType::Zstd(1), false)
+    stress_cell(CompressionType::Zstd(1), false, false)
 }
 
 #[test]
 #[cfg(zstd_any)]
 fn cell_zstd1_encrypted_round_trips() -> lsm_tree::Result<()> {
-    stress_cell(CompressionType::Zstd(1), true)
+    stress_cell(CompressionType::Zstd(1), true, false)
 }
 
 #[test]
 #[cfg(zstd_any)]
 fn cell_zstd3_plaintext_round_trips() -> lsm_tree::Result<()> {
-    stress_cell(CompressionType::Zstd(3), false)
+    stress_cell(CompressionType::Zstd(3), false, false)
 }
 
 #[test]
 #[cfg(zstd_any)]
 fn cell_zstd3_encrypted_round_trips() -> lsm_tree::Result<()> {
-    stress_cell(CompressionType::Zstd(3), true)
+    stress_cell(CompressionType::Zstd(3), true, false)
+}
+
+// ────────────────────────────────────────────────────────────────────────
+// Encryption × Page-ECC cells — the third axis. With Page ECC on, every
+// SST block carries a Reed-Solomon parity trailer that sits OUTSIDE the
+// AAD-bound encryption envelope. The read path must strip + verify the
+// parity trailer, THEN AEAD-decrypt the body, THEN decompress — so these
+// cells pin that the two features coexist through flush + reopen and that
+// the parity layer doesn't corrupt the AAD layer (or vice versa). Gated on
+// `page_ecc`: the RS implementation only exists under that feature.
+// ────────────────────────────────────────────────────────────────────────
+
+#[test]
+#[cfg(feature = "page_ecc")]
+fn cell_none_encrypted_ecc_round_trips() -> lsm_tree::Result<()> {
+    stress_cell(CompressionType::None, true, true)
+}
+
+#[test]
+#[cfg(all(feature = "page_ecc", feature = "lz4"))]
+fn cell_lz4_encrypted_ecc_round_trips() -> lsm_tree::Result<()> {
+    stress_cell(CompressionType::Lz4, true, true)
+}
+
+#[test]
+#[cfg(all(feature = "page_ecc", zstd_any))]
+fn cell_zstd1_encrypted_ecc_round_trips() -> lsm_tree::Result<()> {
+    stress_cell(CompressionType::Zstd(1), true, true)
+}
+
+#[test]
+#[cfg(all(feature = "page_ecc", zstd_any))]
+fn cell_zstd3_encrypted_ecc_round_trips() -> lsm_tree::Result<()> {
+    stress_cell(CompressionType::Zstd(3), true, true)
+}
+
+// ────────────────────────────────────────────────────────────────────────
+// Provider capability gate — on a zstd build the live block path seals
+// encrypted blocks through the AAD-bound envelope, so a provider that only
+// implements the opaque surface must be rejected at open time (fail-fast)
+// rather than blowing up on the first encrypted read/write.
+// ────────────────────────────────────────────────────────────────────────
+
+#[cfg(zstd_any)]
+#[test]
+fn opaque_only_provider_is_rejected_at_open() {
+    use lsm_tree::encryption::EncryptionProvider;
+
+    // Minimal provider with NO `supports_aad_block_path` override (defaults to
+    // false) and no AAD-bound block methods — exactly the downstream shape the
+    // gate must catch.
+    struct OpaqueOnly;
+    impl std::panic::UnwindSafe for OpaqueOnly {}
+    impl std::panic::RefUnwindSafe for OpaqueOnly {}
+    impl EncryptionProvider for OpaqueOnly {
+        fn encrypt(&self, p: &[u8]) -> lsm_tree::Result<Vec<u8>> {
+            Ok(p.to_vec())
+        }
+        fn decrypt(&self, c: &[u8]) -> lsm_tree::Result<Vec<u8>> {
+            Ok(c.to_vec())
+        }
+        fn max_overhead(&self) -> u32 {
+            0
+        }
+    }
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let result = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_encryption(Some(Arc::new(OpaqueOnly)))
+    .open();
+
+    assert!(
+        matches!(result, Err(lsm_tree::Error::Encrypt(_))),
+        "opaque-only provider must be rejected at open, got {:?}",
+        result.map(|_| "Ok(tree)")
+    );
 }
 
 // ────────────────────────────────────────────────────────────────────────
@@ -311,7 +411,7 @@ fn major_compaction_encrypted_round_trips() -> lsm_tree::Result<()> {
     let dir = tempfile::tempdir()?;
 
     {
-        let tree = open_tree(dir.path(), compression, true)?;
+        let tree = open_tree(dir.path(), compression, true, false)?;
 
         // Populate three flush groups so major compaction has multiple
         // SSTs to merge (otherwise it's a no-op).
@@ -354,7 +454,7 @@ fn major_compaction_encrypted_round_trips() -> lsm_tree::Result<()> {
 
     // Reopen — recovers from post-compaction encrypted SSTs only
     {
-        let tree = open_tree(dir.path(), compression, true)?;
+        let tree = open_tree(dir.path(), compression, true, false)?;
         for batch in 0u32..3 {
             for i in 0u32..200 {
                 let key = format!("b{batch}k{i:05}");
@@ -399,7 +499,7 @@ fn major_compaction_encrypted_round_trips() -> lsm_tree::Result<()> {
 #[test]
 fn concurrent_encrypted_no_corruption() -> lsm_tree::Result<()> {
     let dir = tempfile::tempdir()?;
-    let tree = Arc::new(open_tree(dir.path(), CompressionType::None, true)?);
+    let tree = Arc::new(open_tree(dir.path(), CompressionType::None, true, false)?);
 
     let stop = Arc::new(AtomicBool::new(false));
     // Start at 1 so the first concurrent write doesn't hit the engine's
@@ -546,7 +646,7 @@ fn concurrent_encrypted_no_corruption() -> lsm_tree::Result<()> {
     // that gives one writer 10× more CPU than the others is still
     // covered exactly.
     drop(tree);
-    let tree = open_tree(dir.path(), CompressionType::None, true)?;
+    let tree = open_tree(dir.path(), CompressionType::None, true, false)?;
     let mut found = 0u64;
     for writer_id in 0u32..4 {
         #[expect(
@@ -662,7 +762,7 @@ fn wrong_key_reopen_reads_error() -> lsm_tree::Result<()> {
 #[test]
 fn single_cell_smoke_under_30s() -> lsm_tree::Result<()> {
     let start = Instant::now();
-    stress_cell(CompressionType::None, false)?;
+    stress_cell(CompressionType::None, false, false)?;
     let elapsed = start.elapsed();
     assert!(
         elapsed < Duration::from_secs(30),

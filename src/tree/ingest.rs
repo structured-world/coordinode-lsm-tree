@@ -344,6 +344,7 @@ impl<'a> Ingestion<'a> {
                     checksum,
                     global_seqno,
                     self.tree.id,
+                    table_id,
                     self.tree.config.cache.clone(),
                     self.tree.config.descriptor_table.clone(),
                     self.level_fs.clone(),

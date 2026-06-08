@@ -11,10 +11,10 @@
 ## 1. Goals
 
 - **Authenticated integrity** of every encrypted block under an AEAD construction (AES-256-GCM or ChaCha20-Poly1305). A bit flip in any byte of the encrypted payload or its surrounding metadata fails AEAD verification.
-- **Block-context binding** via AEAD's Additional Authenticated Data (AAD): the AAD includes the file's `table_id`, the block's `block_offset`, its `block_type`, the compression dictionary id, and the AEAD `suite_id` + `key_epoch`. Swapping a block from a different file, a different offset within the same file, a different block type, or under a different key/suite fails AEAD verification.
+- **Block-context binding** via AEAD's Additional Authenticated Data (AAD): the AAD includes the file's `table_id`, the block's `block_type`, the compression context (`compression_type`, dictionary id, window log), the plaintext-affecting `block_flags` bits (the outer `ECC_PARITY` bit is excluded — see §5.3), and the AEAD `suite_id` + `key_epoch`. Swapping a block from a different table, a different block type, a different codec, or decrypting under a different key/suite fails AEAD verification. A block's byte offset and the owning tree id are deliberately NOT bound (see §5.3): position integrity is supplied by the authenticated index, and cross-tree isolation by per-tree encryption keys.
 - **Crypto-agility:** the on-disk record carries an explicit `suite_id` byte so a deployment can rotate to a new AEAD without rewriting old data, and so a future suite can be added by registry update alone.
 - **Key rotation without rewrite:** the `key_epoch` byte indexes into a caller-managed key chain. Old blocks under epoch `N` stay readable as long as the corresponding key is still in the chain; new writes pick the latest epoch.
-- **Single-pass decode:** all *on-disk* metadata that feeds the AAD lives at known fixed offsets inside the MetadataFrame. The remaining AAD fields (`TreeID`, `TableID`, `BlockOffset`) are caller-supplied from the read context (the process knows which tree / table / file offset it is reading) and are deliberately NOT on disk; see §5.3 (the caller-supplied vs on-disk contract) and the "Why not store them on disk" rationale in §5.1. Decode reads the metadata frame once, combines the on-disk fields with the caller-supplied context fields to form AAD, then verifies + decrypts the body frame.
+- **Single-pass decode:** all *on-disk* metadata that feeds the AAD lives at known fixed offsets inside the MetadataFrame. The one remaining AAD field, `TableID`, is caller-supplied from the read context (the process knows which table it is reading) and is deliberately NOT on disk; see §5.3 (the caller-supplied vs on-disk contract) and the "Why not store them on disk" rationale in §5.1. Decode reads the metadata frame once, combines the on-disk fields with the caller-supplied `TableID` to form AAD, then verifies + decrypts the body frame.
 - **Zstd-skippable framing:** the on-disk record uses the [Zstandard skippable frame](https://datatracker.ietf.org/doc/html/rfc8878#section-3.1.1) magic range `0x184D2A50..0x184D2A5F`. A reader that doesn't understand encrypted blocks (e.g. a plain `zstd` CLI on the payload region) skips over them cleanly instead of corrupting on parse.
 
 ## 2. Non-goals
@@ -30,19 +30,19 @@
 | Threat | Defended? | Defending mechanism |
 |---|---|---|
 | Random bit flip in encrypted payload (bit-rot, bad sector) | Yes | AEAD tag mismatch on decrypt → `DecryptError::AeadVerificationFailed` |
-| Random bit flip in AAD-bound disk bytes (suite_id, key_epoch, block_type, dict_id, window_log, block_flags) | Yes | AAD mismatch on decrypt. AEAD verification fails as `DecryptError::AeadVerificationFailed` — a single tag-mismatch event, NOT a per-field diagnostic: the cipher cannot tell whether the flipped byte was in the ciphertext or in one of the AAD-mirrored disk bytes, so per-field attribution is impossible by construction (not a missing feature). Structural pre-AEAD failures surface as the more specific typed variants (`MalformedMetadataFrame`, `UnsupportedSuite`, `UnknownKeyEpoch`, …). (The caller-supplied AAD fields `tree_id`, `table_id`, `block_offset` are not on disk, so they cannot be bit-flipped at rest; they can only fail to match if the reader supplies wrong context.) |
-| **Block swap** within the same file (move block N's bytes to offset M, M ≠ N) | Yes | AAD carries caller-supplied `block_offset`; decrypt at the wrong offset fails because the reader's seek position doesn't match what the writer used. |
-| **Block swap** across files in the same tree (move a block from file A to file B) | Yes | AAD carries caller-supplied `table_id` (derived from the SST file's path / table metadata); decrypt under the wrong table_id fails. |
-| **Block swap** across trees (same encryption key reused, colliding per-tree `table_id` values) | Yes | AAD carries caller-supplied `tree_id` paired with `table_id`. `table_id` alone is per-tree in this codebase, so the pair `(tree_id, table_id)` gives the globally unique block identity. Substitution under the wrong tree_id fails. |
+| Random bit flip in AAD-bound disk bytes (suite_id, key_epoch, block_type, compression_type, dict_id, window_log, block_flags) | Yes | AAD mismatch on decrypt. AEAD verification fails as `DecryptError::AeadVerificationFailed` — a single tag-mismatch event, NOT a per-field diagnostic: the cipher cannot tell whether the flipped byte was in the ciphertext or in one of the AAD-mirrored disk bytes, so per-field attribution is impossible by construction (not a missing feature). Structural pre-AEAD failures surface as the more specific typed variants (`MalformedMetadataFrame`, `UnsupportedSuite`, `UnknownKeyEpoch`, …). (The caller-supplied AAD field `table_id` is not on disk, so it cannot be bit-flipped at rest; it can only fail to match if the reader supplies wrong context.) |
+| **Block swap** within the same table (move block N's bytes to a different block slot of the same table) | **No (by design)** | A block's byte offset is intentionally NOT bound in AAD (offset-independent AAD keeps encryption parallel — see §5.3). Same-table blocks share identical AAD, so an intra-table swap VERIFIES at the AEAD layer and returns the swapped block's plaintext. Position integrity is enforced one layer up by the authenticated index (key-range → offset) + the structural SST layout: a swapped block surfaces as a lookup miss, not as forged content (a value is inseparable from its key inside the authenticated block). |
+| **Block swap** across tables in the same tree (move a block from table A to table B) | Yes | AAD carries caller-supplied `table_id` (derived from the SST file's path / table metadata); decrypt under the wrong table_id fails. |
+| **Block swap** across trees (move a block from tree A to tree B) | Yes (via key isolation) | The owning tree id is NOT bound in AAD (`TreeId` is a process-ephemeral counter, not durable across reopen — see §5.3). Cross-tree substitution is instead prevented by per-tree key isolation: each tree owns a distinct encryption key, so a block sealed by tree A's key fails AEAD verification under tree B's key. (If a deployment were to share one key across trees, this row would be undefended — production MUST use per-tree keys.) |
 | **Block type swap** (relabel a Filter block as Data, e.g. to confuse a partial-decode path) | Yes | AAD carries `block_type`; decrypt under the wrong type fails |
-| **Transform-flag relabel** (flip a `block_flags` bit, e.g. clear the per-KV checksum footer bit so a verifying reader stops stripping/checking the footer, or set the compressed/encrypted bit) | Yes | AAD carries the whole `block_flags` byte; decrypt under any flipped transform bit fails. Closes the gap that `block_flags` lives in the plaintext `Block::Header` under a non-cryptographic XXH3 checksum an attacker could recompute. |
+| **Transform-flag relabel** (flip a `block_flags` bit, e.g. clear the per-KV checksum footer bit so a verifying reader stops stripping/checking the footer, or set the compressed/encrypted bit) | Yes | AAD carries the plaintext-affecting `block_flags` bits (KV_CHECKSUM_FOOTER / COMPRESSED / ENCRYPTED); flipping any of them fails decrypt. Closes the gap that those bits live in the plaintext `Block::Header` under a non-cryptographic XXH3 checksum an attacker could recompute. The `ECC_PARITY` bit is masked out of the AAD (outer parity framing); flipping it instead mis-strips the trailer so the AEAD runs over the wrong bytes and fails — caught, just one layer out. |
 | **Compression codec substitution** (relabel a zstd block as Lz4 or vice versa to confuse the decompressor selection step) | Yes | AAD carries `compression_type` (codec discriminator byte); decrypt under the wrong codec tag fails. Defends per-block codec rotation: an attacker cannot mix up old-codec and new-codec blocks during a policy migration. |
 | **Codec / decompression pipeline bug** (zstd / lz4 library version drift between write-time and read-time; non-deterministic decoder output; in-memory corruption between AEAD-verify and decompression-end producing wrong plaintext after a successful AEAD verify) | Yes (for compressed blocks) | Codec's built-in content checksum (zstd `Content_Checksum_flag` bit 2 / LZ4 `ContentChecksum` bit) is **required** per §4.11. The codec verifies this automatically during streaming decompression and fails on mismatch. For `CompressionType = None` this defence does not apply: there's no codec to drift, and AEAD primitives have no analogous version-drift failure mode, so AEAD-tag alone is sufficient. |
 | **Compression dictionary substitution** (decode under a different zstd dictionary to manipulate decompressed output) | Yes | AAD carries `dict_id`; structured-zstd's `FrameDecoder::expect_dict_id` cross-checks during inner-frame decode. Wiring lives in this repo's encoder/decoder issue #251; the matching enforcement on the structured-zstd side is tracked there as `S-ZSTD-T7`. |
 | **Decompression bomb** (forged compressed payload that expands to TBs of plaintext) | Yes | AAD carries raw `window_log` (base-2 log of max window size, not the encoded RFC 8878 `Window_Descriptor` byte); structured-zstd's `FrameDecoder::expect_window_log` rejects frames whose decoded window exceeds the AAD-declared value |
 | **Key epoch downgrade** (replay a block encrypted under epoch N as if it were epoch M ≠ N) | Yes | AAD carries `key_epoch`; the wrong key is selected and AEAD verification fails |
 | **Suite downgrade** (relabel an AES-256-GCM block as ChaCha20-Poly1305 to coerce a different decrypt path) | Yes | AAD carries `suite_id`; the wrong primitive is selected and AEAD verification fails |
-| **Replay across versions** (re-introduce an old block at its same offset after compaction has logically deleted it) | **Partial** | AAD does not include a per-block version / generation counter. The same `(table_id, block_offset, block_type, dict_id, key_epoch, suite_id)` tuple is valid for the same block content. Detection lives one layer up: the manifest's per-table XXH3 + per-file checksum catch a swap of an entire SST file, and the SFA TOC catches reorder within a file. Per-block replay within a single SST is **not defended at the AEAD layer.** |
+| **Replay across versions** (re-introduce an old block after compaction has logically deleted it) | **Partial** | AAD does not include a per-block version / generation counter. The same `(table_id, block_type, compression_type, dict_id, window_log, block_flags, key_epoch, suite_id)` tuple is valid for the same block content. Detection lives one layer up: the manifest's per-table XXH3 + per-file checksum catch a swap of an entire SST file, and the SFA TOC catches reorder within a file. Per-block replay within a single SST is **not defended at the AEAD layer.** |
 | Key disclosure | **No** (non-goal, §2) | n/a |
 | Brute-force AEAD key search | **No** (assumed infeasible for 256-bit keys with the chosen suites) | n/a |
 
@@ -53,7 +53,7 @@
 | 4.1 | Outer framing | [Zstandard skippable frame](https://datatracker.ietf.org/doc/html/rfc8878#section-3.1.1) | Already standard, already understood by `zstd` CLI / libzstd readers, has dedicated magic range. Unknown-to-reader frames skip cleanly. |
 | 4.2 | Magic allocation | `0x184D2A50` (metadata frame), `0x184D2A51` (body frame). No other magic in the RFC 8878 skippable range is claimed by this format. | Stable magic split keeps the metadata size known-at-parse before the variable-length body. Unused magics are not pre-reserved: a future extension that needs one claims it then. |
 | 4.3 | Endianness, outer framing | Little-endian per RFC 8878 §3.1.1 | Mandatory by the framing spec we're inside of. |
-| 4.4 | Endianness, AAD payload content | **Multi-byte numeric fields:** big-endian (TreeID / TableID / BlockOffset as u64 BE; DictID as u32 BE). **MagicMetadata:** literal 4-byte byte string (the on-disk LE bytes `50 2A 4D 18` of the framing magic, used verbatim, NOT re-encoded as a BE integer). **Single-byte fields** (HeaderByte / KeyEpoch / BlockType / SuiteID / CompressionType / WindowLog / BlockFlags): no endianness; one byte. | Crypto convention for numerics (RFC 8446 TLS, RFC 5116 AEAD framework). Avoids endianness ambiguity across deployments. MagicMetadata keeps the LE on-disk bytes as a fixed literal so that the AAD's first 4 bytes are byte-for-byte identical to the on-disk MetadataFrame magic the decoder just read; this binds the AAD to the format identity without conversion logic. |
+| 4.4 | Endianness, AAD payload content | **Multi-byte numeric fields:** big-endian (TableID as u64 BE; DictID as u32 BE). **MagicMetadata:** literal 4-byte byte string (the on-disk LE bytes `50 2A 4D 18` of the framing magic, used verbatim, NOT re-encoded as a BE integer). **Single-byte fields** (HeaderByte / KeyEpoch / BlockType / SuiteID / CompressionType / WindowLog / BlockFlags): no endianness; one byte. | Crypto convention for numerics (RFC 8446 TLS, RFC 5116 AEAD framework). Avoids endianness ambiguity across deployments. MagicMetadata keeps the LE on-disk bytes as a fixed literal so that the AAD's first 4 bytes are byte-for-byte identical to the on-disk MetadataFrame magic the decoder just read; this binds the AAD to the format identity without conversion logic. |
 | 4.5 | AEAD suite registry | `0x00` reserved (Plain, encryption disabled, not used in this format), `0x01` reserved (future stream cipher), `0x02 = AES-256-GCM`, `0x03 = ChaCha20-Poly1305`, `0x04..0xFF` reserved | Two initial suites cover the hardware-accelerated (AES-GCM via AES-NI/NEON) and the constant-time-on-any-CPU (ChaCha-Poly) cases. |
 | 4.6 | Nonce field width on disk | **Suite-defined** (registry lookup; see §7). v1 suites (AES-256-GCM, ChaCha20-Poly1305) both store 12 bytes. Future suites with different nonce lengths (e.g. XChaCha20-Poly1305 with 24 B) introduce their own SuiteID and their own nonce length in the registry; the decoder reads SuiteID first, then reads exactly the registered nonce length. No padding bytes wasted on speculative future suites. | Saves 12 B per block today vs. always reserving 24 B "for future use". MetadataFrame is variable-length but its `PayloadLen` (u32 LE in the framing header) tells the decoder how many bytes to read, so variable size doesn't complicate parsing. |
 | 4.7 | Authentication tag field width | Fixed 16 bytes | Both initial suites (AES-256-GCM, ChaCha20-Poly1305) emit a 128-bit tag. Reserving 16 bytes covers any plausible future tag-truncation policy and keeps the metadata frame size constant. |
@@ -155,16 +155,24 @@ Offset  Size  Field             Description
                                   bit 3 = ENCRYPTED
                                   others = reserved (MUST be 0 on write,
                                            IGNORED on read)
-                                On disk + bound in the AAD so an attacker
-                                cannot relabel the block's transform stack
-                                (e.g. clear the per-KV footer bit) under a
-                                forged non-cryptographic header checksum,
-                                the same anti-relabel rationale as BlockType
-                                / CompressionType. The full byte is mirrored
-                                verbatim; the COMPRESSED / ENCRYPTED bits are
-                                redundant with CompressionType / SuiteID but
-                                kept so the AAD is a faithful mirror with no
-                                masking logic.
+                                The plaintext-affecting bits
+                                (KV_CHECKSUM_FOOTER / COMPRESSED / ENCRYPTED)
+                                are bound in the AAD so an attacker cannot
+                                relabel the block's transform stack (e.g.
+                                clear the per-KV footer bit) under a forged
+                                non-cryptographic header checksum, the same
+                                anti-relabel rationale as BlockType /
+                                CompressionType. The COMPRESSED / ENCRYPTED
+                                bits are redundant with CompressionType /
+                                SuiteID but kept so the AAD mirrors them.
+                                EXCEPTION: the ECC_PARITY bit is MASKED OUT
+                                of the AAD — Reed-Solomon parity is OUTER
+                                framing computed over the encrypted payload
+                                and stripped before decrypt, so it is not
+                                part of the encrypted content. Its integrity
+                                is self-enforced: a flipped ECC_PARITY bit
+                                mis-strips the trailer, so the AEAD then runs
+                                over the wrong bytes and fails.
 19     NONCE_LEN  Nonce         Nonce bytes; length determined by SuiteID
                                 via the §7 registry (v1: 12 bytes for both
                                 AES-256-GCM and ChaCha20-Poly1305). The
@@ -183,9 +191,9 @@ Total  for v1 suites: 47 bytes on disk
        For other suites: 8 + (27 + NONCE_LEN) bytes.
 ```
 
-**On-disk minimalism.** The MetadataFrame on disk carries ONLY the fields the decoder needs *before* it can construct the AAD: the version byte, the key epoch (so the right key is selected), the block type (mirrors the existing `Header` pattern), the AEAD suite id (so the right primitive is selected), the compression-context fields (`DictID` + `WindowLog`, which can vary per block and which the decoder must know to bind the AAD before any decompression / decryption work), the nonce, and the AEAD tag. Three further identifiers (`TreeID`, `TableID`, `BlockOffset`) participate in the AAD but are **NOT** stored on disk: they are caller-supplied from the read context (the owning `Tree`, the SST file's per-tree `TableId`, and the read cursor's byte position). See §5.3.
+**On-disk minimalism.** The MetadataFrame on disk carries ONLY the fields the decoder needs *before* it can construct the AAD: the version byte, the key epoch (so the right key is selected), the block type (mirrors the existing `Header` pattern), the AEAD suite id (so the right primitive is selected), the compression-context fields (`DictID` + `WindowLog`, which can vary per block and which the decoder must know to bind the AAD before any decompression / decryption work), the nonce, and the AEAD tag. One further identifier (`TableID`) participates in the AAD but is **NOT** stored on disk: it is caller-supplied from the read context (the SST file's per-tree `TableId`). The block's byte offset and the owning tree id participate in neither the AAD nor the on-disk frame (see §5.3 for why each is excluded). See §5.3.
 
-**Why not store them on disk.** Industry-standard LSMs (RocksDB / LevelDB / Pebble) put zero identity bytes in per-block headers: a per-block trailer is 5 bytes total (1 byte compression + 4 byte checksum). Block identity is purely positional: the SST footer points at the index, the index gives `BlockHandle { offset, size }`, and the file's path/manifest gives the table id. The same model applies here: spending 24 bytes per block on `TreeID + TableID + BlockOffset` would duplicate context the caller already has at decrypt time, and it would be cryptographically *weaker* than the AAD binding it would replace (a tamperer could just patch the on-disk bytes; tampering with the AAD-bound values is infeasible). Orphan-block forensics is addressed at the per-file layer (the META blocks introduced in #295 carry the file-level identity), not by fattening every block header.
+**Why not store it on disk.** Industry-standard LSMs (RocksDB / LevelDB / Pebble) put zero identity bytes in per-block headers: a per-block trailer is 5 bytes total (1 byte compression + 4 byte checksum). Block identity is purely positional: the SST footer points at the index, the index gives `BlockHandle { offset, size }`, and the file's path/manifest gives the table id. The same model applies here: spending 8 bytes per block on an on-disk `TableID` would duplicate context the caller already has at decrypt time, and it would be cryptographically *weaker* than the AAD binding it would replace (a tamperer could just patch the on-disk bytes; tampering with the AAD-bound value is infeasible). Orphan-block forensics is addressed at the per-file layer (the META blocks introduced in #295 carry the file-level identity), not by fattening every block header.
 
 ### 5.2 BodyFrame
 
@@ -205,7 +213,7 @@ Total  8 + N bytes on disk
 
 ### 5.3 AAD construction
 
-The AEAD's Additional Authenticated Data is constructed by the writer immediately before encrypting the body, and reconstructed by the reader immediately before decrypting. AAD is **NEVER** written to disk; both sides construct it from a mix of disk-mirrored fields (which the decoder has just read from the MetadataFrame) and caller-supplied fields (which the decoder knows from its read context: the owning `Tree`, the SST file's path-derived `TableId`, the seek offset):
+The AEAD's Additional Authenticated Data is constructed by the writer immediately before encrypting the body, and reconstructed by the reader immediately before decrypting. AAD is **NEVER** written to disk; both sides construct it from a mix of disk-mirrored fields (which the decoder has just read from the MetadataFrame) and one caller-supplied field (the SST file's per-tree `TableId`, which the decoder knows from its read context):
 
 ```text
 Offset  Size  Field             Source
@@ -219,78 +227,43 @@ Offset  Size  Field             Source
 5       1     KeyEpoch          Mirror of MetadataFrame offset 9 (disk)
 6       1     BlockType         Mirror of MetadataFrame offset 10 (disk)
 7       1     SuiteID           Mirror of MetadataFrame offset 11 (disk)
-8       8     TreeID            u64 BE, caller-supplied from the owning
-                                Tree's id (`AbstractTree::id()`, the
-                                accessor method on the trait that both
-                                `Tree` and `BlobTree` implement).
-                                NOT on disk: a process knows which tree
-                                it opened.
-
-                                **Required for the cross-tree
-                                substitution defence in §3.** The
-                                `(TreeID, TableID)` pair is what makes
-                                block identity globally unique; with all
-                                callers feeding a real TreeID a swapped
-                                block from another tree fails AEAD
-                                verification.
-
-                                **Placeholder zero (`0`) weakens
-                                this defence.** Call sites that have
-                                not yet plumbed a real tree id are
-                                permitted to pass `0` so that the
-                                migration to AAD-bound blocks is not
-                                blocked, but for those call sites the
-                                cross-tree substitution row in §3 is
-                                NOT defended by AAD: any two trees
-                                feeding TreeID=0 collapse the pair to
-                                just `(0, TableID)`, and `TableID` is
-                                only unique within a tree. The
-                                substitute defence at those call sites
-                                is per-tree encryption-provider key
-                                isolation (a different encryption key
-                                per tree, so AEAD fails on
-                                cross-tree-substituted blocks even
-                                when the AAD-bound TreeID collides).
-                                Callers MUST either (a) supply a real
-                                TreeID, or (b) ensure per-tree key
-                                isolation; sharing a key across trees
-                                while feeding TreeID=0 leaves the
-                                cross-tree row of §3 undefended.
-                                See `BlockIdentity` module docs in
-                                `src/table/block/identity.rs`.
-16      8     TableID           u64 BE, caller-supplied from the SST
-                                file's per-tree `TableId` (derived from
-                                the file path / table metadata). NOT on
-                                disk: the reader already knows which file
-                                it opened. Pair with TreeID gives the
-                                globally unique block identity that
-                                defeats cross-tree substitution.
-24      8     BlockOffset       u64 BE, caller-supplied from the read or
-                                write cursor's byte position within the
-                                SST file. NOT on disk: the reader already
-                                knows its own seek offset. Binds the
-                                block to its position to defeat
-                                same-file relocations.
-32      1     CompressionType   Mirror of MetadataFrame offset 12 (disk).
+8       8     TableID           u64 BE, caller-supplied from the SST file's
+                                per-tree `TableId` (derived from the file
+                                path / table metadata). NOT on disk: the
+                                reader already knows which file it opened.
+                                Defeats cross-TABLE substitution. Cross-TREE
+                                substitution is NOT bound here (see below)
+                                and is prevented by per-tree key isolation.
+16      1     CompressionType   Mirror of MetadataFrame offset 12 (disk).
                                 Binds the AAD to the codec the writer
                                 used so an attacker cannot relabel
                                 a zstd block as Lz4 (or vice versa)
                                 to confuse downstream decompression.
-33      4     DictID            u32 BE, mirror of MetadataFrame offset 13
+17      4     DictID            u32 BE, mirror of MetadataFrame offset 13
                                 (disk)
-37      1     WindowLog         Mirror of MetadataFrame offset 17 (disk)
-38      1     BlockFlags        Mirror of MetadataFrame offset 18 (disk).
-                                Binds the block's transform-presence
-                                bitfield (KV footer / ECC / compressed /
-                                encrypted) so an attacker cannot relabel
-                                the transform stack — e.g. clear the per-KV
-                                checksum footer bit — under a forged
-                                non-cryptographic header checksum.
+21      1     WindowLog         Mirror of MetadataFrame offset 17 (disk)
+22      1     BlockFlags        Mirror of MetadataFrame offset 18 (disk),
+                                with the ECC_PARITY bit MASKED OUT. Binds the
+                                plaintext-affecting transform bits (KV footer /
+                                compressed / encrypted) so an attacker cannot
+                                relabel the transform stack — e.g. clear the
+                                per-KV checksum footer bit — under a forged
+                                non-cryptographic header checksum. ECC_PARITY
+                                is excluded because Reed-Solomon parity is
+                                OUTER framing (computed over the encrypted
+                                payload, stripped before decrypt); a flipped
+                                ECC_PARITY bit mis-strips the trailer so the
+                                AEAD runs over wrong bytes and fails anyway.
 ═════════
-Total  39 bytes (NEVER written to disk, passed to AEAD as AAD only)
+Total  23 bytes (NEVER written to disk, passed to AEAD as AAD only)
 ```
 
-**Disk vs caller-supplied: the contract.** Fields marked "mirror of MetadataFrame offset X (disk)" are read from the on-disk MetadataFrame the decoder has just parsed. Fields marked "caller-supplied" are passed in by the calling code from its own context (`BlockIdentity` struct in `src/table/block/identity.rs`). The writer feeds *the same values* from its own context into AAD construction. The AEAD's authentication tag binds all 39 bytes together: an attacker who modifies any disk byte, or who relocates a block to a different file / different offset, produces an AAD that doesn't match the one the AEAD was sealed under, and decryption fails.
+**Two identifiers are deliberately NOT bound in the AAD:**
+
+- **A block's byte offset.** The on-disk offset is unknown to several writers (the sfa-wrapped index / filter writers and the parallel block compressor do not surface a byte cursor) and it varies across the MID / tail / head mirrors of one logical block. Binding it would break those paths and force serial encryption (the offset is only known at placement). The cost is that two blocks of the SAME table are interchangeable at the AEAD layer; block-position integrity is provided one layer up by the authenticated index (which maps key ranges to offsets) plus the structural SST layout, not by per-block AEAD. Intra-file block swap therefore degrades only to a lookup miss (a value is inseparable from its key inside the authenticated block), not to forgery.
+- **The owning tree id.** `TreeId` in this codebase is a process-ephemeral counter (`get_next_tree_id()`), not a durable identifier — the same SST is assigned a different tree id when its tree is reopened. Binding it would make every encrypted block fail AEAD verification after a restart. Cross-tree substitution is instead prevented by **per-tree key isolation**: each tree owns a distinct encryption key, so a block sealed by tree A's key fails to decrypt under tree B's key regardless of AAD.
+
+**Disk vs caller-supplied: the contract.** Fields marked "mirror of MetadataFrame offset X (disk)" are read from the on-disk MetadataFrame the decoder has just parsed. The `TableID` field is passed in by the calling code from its own context (`BlockIdentity` struct in `src/table/block/identity.rs`). The writer feeds *the same value* from its own context into AAD construction. The AEAD's authentication tag binds all 23 bytes together: an attacker who modifies any disk byte, or who relocates a block to a different table, produces an AAD that doesn't match the one the AEAD was sealed under, and decryption fails.
 
 The `Nonce` and `AEADTag` fields are **not** part of the AAD, they're the AEAD's nonce and tag inputs, respectively.
 
@@ -343,10 +316,11 @@ metadata-payload  = header-byte                    ; 1B
                     nonce                          ; NONCE_LEN B (suite-defined; 12B for v1)
                     aead-tag                       ; 16B
 
-;; Note: tree-id, table-id, block-offset are AAD-bound (see §5.3)
-;; but NOT part of metadata-payload. They are caller-supplied from
-;; read context (owning Tree, SST file path, seek cursor) and never
-;; transmitted on the wire.
+;; Note: only table-id is AAD-bound from caller context (see §5.3).
+;; tree-id and block-offset are intentionally NOT AAD-bound. None of
+;; these caller-context values are part of metadata-payload — table-id
+;; is caller-supplied from the SST file path and never transmitted on
+;; the wire.
 
 body-frame        = body-magic body-payload-len encrypted-body
 body-magic        = %x51.2A.4D.18                  ; 0x184D2A51 LE
@@ -423,9 +397,9 @@ Per-attack mapping of which AAD-bound field defeats which threat:
 | Bit flip in MetadataFrame **framing** fields (MagicMetadata / PayloadLen / MagicBody / BodyFrame PayloadLen) | Structural decoder checks per §5.3 | These fields are NOT in the AAD (they're framing layer. A flipped Magic byte causes structural rejection ("not a v1 encrypted block" or "BodyFrame absent"). A flipped PayloadLen byte produces a value ≠ `27 + NONCE_LEN` and the decoder rejects before reading the rest of the payload. AEAD is never reached for these. |
 | Bit flip in Nonce | (AEAD construction) | Different nonce → AEAD verifies against a tag computed under a different keystream/counter → fails. |
 | Bit flip in AEADTag | (AEAD construction) | Standard AEAD: the on-disk tag doesn't match the recomputed one → fails. |
-| Block swap within the same file | `BlockOffset` (caller-supplied) | The block's bytes are valid but at a different offset; the reader's seek position feeds a different BlockOffset into AAD construction; AEAD verification fails. |
-| Block swap across files in the same tree | `TableID` (caller-supplied from file path) | Same as above for cross-file moves; the reader's file-path-derived TableID doesn't match what the writer used. |
-| Block swap across trees | `TreeID` paired with `TableID` (both caller-supplied) | The pair `(tree_id, table_id)` is the globally unique block identity; substitution under the wrong tree_id fails AEAD verification. |
+| Block swap within the same table | (not AAD-bound — by design) | A block's byte offset is intentionally NOT in AAD (offset-independent AAD keeps encryption parallel). Same-table swaps verify at the AEAD layer; position integrity is enforced by the authenticated index + structural SST layout, so a swap surfaces as a lookup miss, not forged content. |
+| Block swap across tables in the same tree | `TableID` (caller-supplied from file path) | The reader's file-path-derived TableID doesn't match what the writer used; AEAD verification fails. |
+| Block swap across trees | (per-tree key isolation) | The owning tree id is NOT in AAD (`TreeId` is process-ephemeral). Each tree owns a distinct key, so a cross-tree-substituted block fails AEAD verification at the key layer. |
 | Block type relabel (Filter → Data) | `BlockType` | The bytes are valid but the type byte differs → AAD mismatch. |
 | Compression codec relabel (zstd → Lz4 or similar) | `CompressionType` | AAD binds the codec discriminator byte; decoding the block under a different codec selection produces an AAD that doesn't match. |
 | Codec / decompression pipeline bug (library version drift, non-deterministic decoder, in-memory corruption between AEAD-verify and decompression-end) | Codec's built-in content checksum (zstd `Content_Checksum_flag`; LZ4 `ContentChecksum` bit) | Mandated by §4.11 for compressed blocks. Verified by the codec library during streaming decompression; mismatch surfaces as a codec-library error. AEAD covers the ciphertext including the codec's trailing checksum bytes, so tampering with the checksum itself fails AEAD before the codec even sees it. For `CompressionType = None` there's no codec and no codec checksum; AEAD-tag is the sole integrity layer (no version-drift risk for stable AEAD primitives). |
@@ -474,11 +448,9 @@ All `key` / `value` / `nonce` byte sequences are shown hex, big-endian to small-
 
 | Field | Value | Source in the conformance harness |
 |---|---|---|
-| TreeID (BE) | `00000000 00000007` (= 7) | The owning tree's id |
 | TableID (BE) | `00000000 00002a30` (= 10800) | The SST file's per-tree TableId |
-| BlockOffset (BE) | `00000000 00000000` (= 0) | The block's offset in the file (first block) |
 
-**AAD (39 B, NEVER on disk):** `502a4d18 10 01 00 02 0000000000000007 0000000000002a30 0000000000000000 00 00000000 00 00` (canonical order per §5.3: MagicMetadata | HeaderByte=0x10 [v1, low nibble reserved] | KeyEpoch=0x01 | BlockType=0x00 | SuiteID=0x02 | TreeID BE | TableID BE | BlockOffset BE | CompressionType=0x00 [None] | DictID BE | WindowLog=0x00 [no zstd] | BlockFlags=0x00 [no transform layers])
+**AAD (23 B, NEVER on disk):** `502a4d18 10 01 00 02 0000000000002a30 00 00000000 00 00` (canonical order per §5.3: MagicMetadata | HeaderByte=0x10 [v1, low nibble reserved] | KeyEpoch=0x01 | BlockType=0x00 | SuiteID=0x02 | TableID BE | CompressionType=0x00 [None] | DictID BE | WindowLog=0x00 [no zstd] | BlockFlags=0x00 [no transform layers]). A block's byte offset and the owning tree id are not bound — see §5.3.
 
 **Expected on-disk size:** 68 B total = 47 (MetadataFrame = 8 framing + 39 payload for v1 suite) + 8 (BodyFrame framing header) + 13 (EncryptedBody). For AES-256-GCM and ChaCha20-Poly1305, `ciphertext_len == plaintext_len` because the tag is stored in MetadataFrame, not appended to the ciphertext.
 
@@ -486,11 +458,11 @@ The 68-byte on-disk output for this vector ships as fixed binary test data with 
 
 ### Vector 2: Index block, ChaCha20-Poly1305, no dict, no zstd
 
-Same key, KeyEpoch=01, plaintext body `00 01 02 03 04 05 06 07` (8 bytes). BlockType=`01`, SuiteID=`03`, CompressionType=`00` (None). DictID=0. WindowLog=`00` (no zstd compression on this block; window enforcement disabled). Nonce (12 B per §7 registry for SuiteID=0x03): `0c0d0e0f10111213 14151617`. Caller-supplied AAD context: TreeID=7, TableID=`00000000 00002a30`, BlockOffset=`00000000 00010000` (= 65536).
+Same key, KeyEpoch=01, plaintext body `00 01 02 03 04 05 06 07` (8 bytes). BlockType=`01`, SuiteID=`03`, CompressionType=`00` (None). DictID=0. WindowLog=`00` (no zstd compression on this block; window enforcement disabled). Nonce (12 B per §7 registry for SuiteID=0x03): `0c0d0e0f10111213 14151617`. Caller-supplied AAD context: TableID=`00000000 00002a30`.
 
 ### Vector 3: Data block, AES-256-GCM, with dict
 
-Key as above, KeyEpoch=01, BlockType=`00`, SuiteID=`02`, CompressionType=`04` (ZstdDict), DictID=`deadbeef`, WindowLog=`15`. Plaintext body 32 bytes of `aa`. Caller-supplied AAD context: TreeID=7, TableID=`00000000 00002a30`, BlockOffset=`00000000 00020000`. The AAD now carries the non-zero DictID and the ZstdDict codec tag, exercising both the dict-substitution and codec-relabel defences.
+Key as above, KeyEpoch=01, BlockType=`00`, SuiteID=`02`, CompressionType=`04` (ZstdDict), DictID=`deadbeef`, WindowLog=`15`. Plaintext body 32 bytes of `aa`. Caller-supplied AAD context: TableID=`00000000 00002a30`. The AAD now carries the non-zero DictID and the ZstdDict codec tag, exercising both the dict-substitution and codec-relabel defences.
 
 ### Vector 4: Negative, window-bomb (rejection)
 
@@ -502,7 +474,7 @@ Encrypt a block under KeyEpoch=`01`. Tamper the on-disk `KeyEpoch` byte to `02`.
 
 ## 10. Worked hex-dump example
 
-A minimum-size Data block (single-byte plaintext = `41`, "A") encrypted under AES-256-GCM with all-zero key, KeyEpoch=`01`, CompressionType=0 (None), DictID=0, WindowLog=`0` (no zstd, no window enforcement), Nonce = first 12 bytes `00..0b`. Caller context (NOT on disk): TreeID=0, TableID=0, BlockOffset=0.
+A minimum-size Data block (single-byte plaintext = `41`, "A") encrypted under AES-256-GCM with all-zero key, KeyEpoch=`01`, CompressionType=0 (None), DictID=0, WindowLog=`0` (no zstd, no window enforcement), Nonce = first 12 bytes `00..0b`. Caller context (NOT on disk): TableID=0.
 
 ```text
 ;; MetadataFrame (47 bytes = 8-byte framing + 39-byte payload)
@@ -525,19 +497,18 @@ A minimum-size Data block (single-byte plaintext = `41`, "A") encrypted under AE
 0033: 01 00 00 00         ; PayloadLen = 1 (u32 LE)
 0037: <1 byte ciphertext> ; AES-GCM ciphertext of "A" under the AAD below
 
-;; AAD (39 bytes; NEVER written to disk, input to AEAD only)
+;; AAD (23 bytes; NEVER written to disk, input to AEAD only)
 ;; Canonical byte sequence per §5.3:
 ;;   MagicMetadata | HeaderByte | KeyEpoch | BlockType | SuiteID
-;;     | TreeID (caller) | TableID (caller) | BlockOffset (caller)
+;;     | TableID (caller)
 ;;     | CompressionType | DictID | WindowLog | BlockFlags
+;; (a block's byte offset and the owning tree id are NOT bound — see §5.3)
      50 2a 4d 18          ; MagicMetadata
      10                   ; HeaderByte         (mirror of disk byte 0008)
      01                   ; KeyEpoch           (mirror of disk byte 0009)
      00                   ; BlockType          (mirror of disk byte 000a)
      02                   ; SuiteID            (mirror of disk byte 000b)
-     00 00 00 00 00 00 00 00   ; TreeID BE      (caller-supplied, not on disk)
      00 00 00 00 00 00 00 00   ; TableID BE     (caller-supplied, not on disk)
-     00 00 00 00 00 00 00 00   ; BlockOffset BE (caller-supplied, not on disk)
      00                   ; CompressionType    (mirror of disk byte 000c)
      00 00 00 00          ; DictID BE          (mirror of disk bytes 000d-0010)
      00                   ; WindowLog          (mirror of disk byte 0011)

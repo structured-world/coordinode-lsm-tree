@@ -77,6 +77,7 @@ fn test_with_table_impl(
                 checksum,
                 0,
                 0,
+                0,
                 Arc::new(Cache::with_capacity_bytes(1_000_000)),
                 Some(Arc::new(DescriptorTable::new(10))),
                 Arc::new(StdFs),
@@ -110,6 +111,7 @@ fn test_with_table_impl(
             let table = Table::recover(
                 file.clone(),
                 checksum,
+                0,
                 0,
                 0,
                 Arc::new(Cache::with_capacity_bytes(1_000_000)),
@@ -147,6 +149,7 @@ fn test_with_table_impl(
                 checksum,
                 0,
                 0,
+                0,
                 Arc::new(Cache::with_capacity_bytes(1_000_000)),
                 Some(Arc::new(DescriptorTable::new(10))),
                 Arc::new(StdFs),
@@ -182,6 +185,7 @@ fn test_with_table_impl(
                 checksum,
                 0,
                 0,
+                0,
                 Arc::new(Cache::with_capacity_bytes(1_000_000)),
                 Some(Arc::new(DescriptorTable::new(10))),
                 Arc::new(StdFs),
@@ -215,6 +219,7 @@ fn test_with_table_impl(
             let table = Table::recover(
                 file.clone(),
                 checksum,
+                0,
                 0,
                 0,
                 Arc::new(Cache::with_capacity_bytes(1_000_000)),
@@ -275,6 +280,7 @@ fn test_with_table_impl(
                 checksum,
                 0,
                 0,
+                0,
                 Arc::new(Cache::with_capacity_bytes(1_000_000)),
                 Some(Arc::new(DescriptorTable::new(10))),
                 Arc::new(StdFs),
@@ -309,6 +315,7 @@ fn test_with_table_impl(
                 checksum,
                 0,
                 0,
+                0,
                 Arc::new(Cache::with_capacity_bytes(1_000_000)),
                 Some(Arc::new(DescriptorTable::new(10))),
                 Arc::new(StdFs),
@@ -341,6 +348,7 @@ fn test_with_table_impl(
             let table = Table::recover(
                 file.clone(),
                 checksum,
+                0,
                 0,
                 0,
                 Arc::new(Cache::with_capacity_bytes(1_000_000)),
@@ -378,6 +386,7 @@ fn test_with_table_impl(
                 checksum,
                 0,
                 0,
+                0,
                 Arc::new(Cache::with_capacity_bytes(1_000_000)),
                 Some(Arc::new(DescriptorTable::new(10))),
                 Arc::new(StdFs),
@@ -411,6 +420,7 @@ fn test_with_table_impl(
             let table = Table::recover(
                 file,
                 checksum,
+                0,
                 0,
                 0,
                 Arc::new(Cache::with_capacity_bytes(1_000_000)),
@@ -512,6 +522,7 @@ fn block_layout_section_roundtrips_for_large_zstd_blocks() {
         checksum,
         0,
         0,
+        0,
         Arc::new(Cache::with_capacity_bytes(4_000_000)),
         Some(Arc::new(DescriptorTable::new(10))),
         Arc::new(StdFs),
@@ -568,6 +579,7 @@ fn block_layout_section_roundtrips_for_large_zstd_blocks() {
     let small_table = Table::recover(
         small_file,
         small_checksum,
+        0,
         0,
         0,
         Arc::new(Cache::with_capacity_bytes(4_000_000)),
@@ -655,6 +667,7 @@ fn recover_adaptive_table(
     let table = Table::recover(
         path,
         checksum,
+        0,
         0,
         0,
         Arc::new(Cache::with_capacity_bytes(1_000_000)),
@@ -1661,6 +1674,7 @@ fn table_read_fuzz_1() -> crate::Result<()> {
         crate::Checksum::from_raw(0),
         0,
         0,
+        0,
         Arc::new(crate::Cache::with_capacity_bytes(0)),
         Some(Arc::new(crate::DescriptorTable::new(10))),
         Arc::new(StdFs),
@@ -1740,6 +1754,7 @@ fn table_partitioned_index() -> crate::Result<()> {
         crate::Checksum::from_raw(0),
         0,
         0,
+        0,
         Arc::new(crate::Cache::with_capacity_bytes(0)),
         Some(Arc::new(crate::DescriptorTable::new(10))),
         Arc::new(StdFs),
@@ -1807,6 +1822,7 @@ fn table_global_seqno() -> crate::Result<()> {
         crate::Checksum::from_raw(0),
         7,
         0,
+        0,
         Arc::new(crate::Cache::with_capacity_bytes(0)),
         Some(Arc::new(crate::DescriptorTable::new(10))),
         Arc::new(StdFs),
@@ -1869,6 +1885,7 @@ fn table_return_global_seqno() -> crate::Result<()> {
         file,
         crate::Checksum::from_raw(0),
         SEQNO,
+        0,
         0,
         Arc::new(crate::Cache::with_capacity_bytes(0)),
         Some(Arc::new(crate::DescriptorTable::new(10))),
@@ -2071,6 +2088,7 @@ fn load_block_range_tombstone_metrics() -> crate::Result<()> {
         checksum,
         0,
         0,
+        0,
         // Recovery bypasses load_block() (reads via Block::from_file() directly),
         // so it intentionally does NOT increment block-load metrics — consistent
         // with how filter and index recovery reads are handled.
@@ -2182,6 +2200,7 @@ fn load_block_cache_hit_rejects_wrong_block_type() -> crate::Result<()> {
     let table = Table::recover(
         file,
         checksum,
+        0,
         0,
         0,
         Arc::new(Cache::with_capacity_bytes(10_000_000)),
@@ -2354,7 +2373,7 @@ fn meta_seqno_kv_max_corruption_returns_invalid_data() -> crate::Result<()> {
         let trailer = crate::sfa::Reader::from_reader(&mut f)?;
         let regions = ParsedRegions::parse_from_toc(trailer.toc())?;
 
-        let result = ParsedMeta::load_with_handle(&f, &regions.metadata, None);
+        let result = ParsedMeta::load_with_handle(&f, &regions.metadata, None, None);
 
         let err = result.expect_err("corrupted seqno#kv_max should cause an error");
         assert!(
@@ -2400,11 +2419,11 @@ fn meta_mid_and_tail_have_identical_created_at() -> crate::Result<()> {
     let trailer = crate::sfa::Reader::from_reader(&mut f)?;
     let regions = ParsedRegions::parse_from_toc(trailer.toc())?;
 
-    let tail = ParsedMeta::load_with_handle(&f, &regions.metadata, None)?;
+    let tail = ParsedMeta::load_with_handle(&f, &regions.metadata, None, None)?;
     let mid_handle = regions
         .metadata_mid
         .expect("writer must emit meta_mid alongside meta");
-    let mid = ParsedMeta::load_with_handle(&f, &mid_handle, None)?;
+    let mid = ParsedMeta::load_with_handle(&f, &mid_handle, None, None)?;
 
     assert_eq!(
         tail.created_at, mid.created_at,
@@ -2462,11 +2481,11 @@ fn meta_mid_and_tail_have_identical_file_size() -> crate::Result<()> {
     let trailer = crate::sfa::Reader::from_reader(&mut f)?;
     let regions = ParsedRegions::parse_from_toc(trailer.toc())?;
 
-    let tail = ParsedMeta::load_with_handle(&f, &regions.metadata, None)?;
+    let tail = ParsedMeta::load_with_handle(&f, &regions.metadata, None, None)?;
     let mid_handle = regions
         .metadata_mid
         .expect("writer must emit meta_mid alongside meta");
-    let mid = ParsedMeta::load_with_handle(&f, &mid_handle, None)?;
+    let mid = ParsedMeta::load_with_handle(&f, &mid_handle, None, None)?;
 
     assert_eq!(
         tail.file_size, mid.file_size,
@@ -2629,6 +2648,7 @@ fn two_level_index_scan_skips_empty_child_partition() -> crate::Result<()> {
     let table = crate::Table::recover(
         file,
         crate::Checksum::from_raw(0),
+        0,
         0,
         0,
         Arc::new(crate::Cache::with_capacity_bytes(0)),
@@ -3076,6 +3096,7 @@ fn build_and_recover(
     let table = Table::recover(
         path,
         checksum,
+        0,
         0,
         0,
         Arc::new(Cache::with_capacity_bytes(1_000_000)),

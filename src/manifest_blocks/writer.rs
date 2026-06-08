@@ -26,7 +26,7 @@ use crate::{
     fs::{Fs, FsFile, FsOpenOptions, SyncMode},
     manifest_blocks::{
         FLAG_FOOTER_MIRROR_ENABLED, HEAD_FOOTER_RESERVED_SIZE, MANIFEST_TABLE_ID_SENTINEL,
-        MANIFEST_TREE_ID_SENTINEL, MAX_MANIFEST_BLOCK_SIZE, MAX_SECTION_NAME_BYTES,
+        MAX_MANIFEST_BLOCK_SIZE, MAX_SECTION_NAME_BYTES,
         footer::{FooterPayload, TocEntry},
     },
     runtime_config::RuntimeConfig,
@@ -261,9 +261,7 @@ impl ManifestArchiveWriter {
         payload.encode(&mut payload_bytes)?;
 
         let identity = BlockIdentity {
-            tree_id: MANIFEST_TREE_ID_SENTINEL,
             table_id: MANIFEST_TABLE_ID_SENTINEL,
-            block_offset: self.write_cursor,
             block_type: BlockType::ManifestFooter,
             dict_id: 0,
             window_log: 0,
@@ -373,9 +371,7 @@ impl ManifestArchiveWriter {
 
         let block_offset = self.write_cursor;
         let identity = BlockIdentity {
-            tree_id: MANIFEST_TREE_ID_SENTINEL,
             table_id: MANIFEST_TABLE_ID_SENTINEL,
-            block_offset,
             block_type: BlockType::Manifest,
             dict_id: 0,
             window_log: 0,

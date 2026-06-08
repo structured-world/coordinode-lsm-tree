@@ -796,9 +796,7 @@ impl Writer {
         let mut prepared = Block::prepare_with_flags(
             &self.block_buffer,
             super::block::BlockIdentity {
-                tree_id: 0,
                 table_id: self.table_id,
-                block_offset: *self.meta.file_pos,
                 block_type: super::block::BlockType::Data,
                 dict_id: self.data_block_compression.dict_id(),
                 window_log: 0,
@@ -1086,9 +1084,7 @@ impl Writer {
                 &mut self.file_writer,
                 &self.block_buffer,
                 crate::table::block::BlockIdentity {
-                    tree_id: 0,
                     table_id: self.table_id,
-                    block_offset: *self.meta.file_pos,
                     block_type: crate::table::block::BlockType::BlockLayout,
                     dict_id: 0,
                     window_log: 0,
@@ -1143,9 +1139,7 @@ impl Writer {
                 &mut self.file_writer,
                 &self.block_buffer,
                 crate::table::block::BlockIdentity {
-                    tree_id: 0,
                     table_id: self.table_id,
-                    block_offset: *self.meta.file_pos,
                     block_type: crate::table::block::BlockType::RangeTombstone,
                     dict_id: 0,
                     window_log: 0,
@@ -1236,17 +1230,6 @@ impl Writer {
             // legacy format, byte-identical to the pre-seqno-bounds layout.
             index_format: u8::from(self.use_seqno_in_index),
             range_tombstone_count,
-            // `block_offset` here feeds `BlockIdentity` which today is
-            // unused (`let _ = identity;` in `Block::write_into` /
-            // `Block::from_file`). Once AAD is wired in #251 the read
-            // side will derive this from `*handle.offset()` (the SFA
-            // TOC section offset, distinct for MID vs TAIL), so this
-            // shared `*self.meta.file_pos` value will need to be
-            // replaced with each section's actual file position at
-            // write time. Tracked as part of the #251 AAD-wiring
-            // surface — the writer here will need to query the SFA
-            // writer's current file position per section.
-            block_offset: *self.meta.file_pos,
             created_at_nanos,
         };
 
@@ -1265,6 +1248,7 @@ impl Writer {
             &mut self.block_buffer,
             self.encryption.as_deref(),
             self.ecc,
+            self.table_id,
             &meta_params,
         )?;
 
@@ -1327,19 +1311,12 @@ impl Writer {
         // so the resulting ciphertext differs byte-for-byte across
         // the two copies, but both decrypt to the same plaintext
         // IndexBlock.
-        // `block_offset` is held at 0 to match the head copy's
-        // BlockIdentity (`partitioned::write_top_level_index` /
-        // `full::finish` both encode with offset=0); once #251 wires
-        // real offsets into AAD this needs to thread the tail SFA
-        // section offset alongside the head one.
         self.file_writer.start("tli_tail")?;
         Block::write_into(
             &mut self.file_writer,
             &tli_bytes,
             crate::table::block::BlockIdentity {
-                tree_id: 0,
                 table_id: self.table_id,
-                block_offset: 0,
                 block_type: crate::table::block::BlockType::Index,
                 dict_id: 0,
                 window_log: 0,
@@ -1372,19 +1349,16 @@ impl Writer {
         // picking, checkpoint sizing — see the comment in
         // `checkpoint.rs:170-185`) read.
         meta_params.section_name = "meta";
-        // file_size and block_offset already carry `*self.meta.file_pos`
-        // from the MID write; `file_pos` hasn't moved since (no
-        // intermediate write touches it), so re-assigning is a
-        // no-op. Kept explicit for readability — if someone later
-        // adds a Block::write_into call before TAIL that DOES bump
-        // file_pos, this line will need to re-snapshot.
+        // file_size already carries `*self.meta.file_pos` from the MID write;
+        // `file_pos` hasn't moved since (no intermediate write touches it), so
+        // re-assigning is a no-op. Kept explicit for readability.
         meta_params.file_size = *self.meta.file_pos;
-        meta_params.block_offset = *self.meta.file_pos;
         write_meta_section(
             &mut self.file_writer,
             &mut self.block_buffer,
             self.encryption.as_deref(),
             self.ecc,
+            self.table_id,
             &meta_params,
         )?;
 
@@ -1477,7 +1451,6 @@ struct MetaSectionParams<'a> {
     /// `seqno_in_index` config (`u8::from(self.use_seqno_in_index)`).
     index_format: u8,
     range_tombstone_count: u64,
-    block_offset: u64,
     /// `created_at` snapshot taken once in `finish()`. Both MID and
     /// TAIL writes consume this same value; generating it inside
     /// `write_meta_section` per call would stamp the two copies with
@@ -1533,6 +1506,7 @@ fn write_meta_section<W: std::io::Write + std::io::Seek>(
     block_buffer: &mut Vec<u8>,
     encryption: Option<&dyn EncryptionProvider>,
     ecc: Option<crate::table::block::EccParams>,
+    table_id: TableId,
     p: &MetaSectionParams<'_>,
 ) -> crate::Result<()> {
     file_writer.start(p.section_name)?;
@@ -1670,14 +1644,13 @@ fn write_meta_section<W: std::io::Write + std::io::Seek>(
         file_writer,
         block_buffer,
         crate::table::block::BlockIdentity {
-            tree_id: 0,
-            // Meta is read FIRST during table open, BEFORE the reader
-            // knows the table_id (the table_id is what meta itself
-            // carries). Writer mirrors that with table_id=0 so write
-            // and read sides agree on the AAD discriminator once
-            // #251 wires AAD.
-            table_id: 0,
-            block_offset: p.block_offset,
+            // Seal the Meta block under the writer's own (durable) table id.
+            // The reader supplies the same id out-of-band (SST path / manifest
+            // entry), so a Meta block transplanted from another SST fails AEAD
+            // verification. The reader cannot take it from the meta payload
+            // (that is what it is about to decrypt), hence the out-of-band
+            // source on both sides.
+            table_id,
             block_type: crate::table::block::BlockType::Meta,
             dict_id: 0,
             window_log: 0,

@@ -10,9 +10,9 @@
 //! depends on which gate catches the tamper:
 //!
 //! - [`DecryptError::AeadVerificationFailed`] for scenarios that
-//!   reach AEAD tag verification (block swap, cross-table swap,
-//!   cross-tree swap, BlockType / CompressionType / supported-suite
-//!   relabel, ciphertext / nonce bit-flip).
+//!   reach AEAD tag verification (cross-table swap, BlockType /
+//!   CompressionType / supported-suite relabel, ciphertext / nonce
+//!   bit-flip).
 //! - [`DecryptError::MalformedMetadataFrame`] for tampers that
 //!   violate the codec-consistency gate before AAD is rebuilt
 //!   (WindowLog!=0 with non-zstd CompressionType, DictID!=0 with
@@ -28,13 +28,17 @@
 //! The contract pinned across all scenarios: NO silent
 //! wrong-plaintext.
 //!
-//! Reference: AAD-bound block wire format spec (locked layout, 38-byte
+//! Reference: AAD-bound block wire format spec (locked layout, 23-byte
 //! AAD) — see `docs/aad-block-format.md` §5.3.
 //!
 //! First-wave coverage:
-//! 1. Block swap (same key, different block_offset)
+//! 1. Block position and owning tree id are intentionally NOT bound in
+//!    AAD (offset-independent so encryption parallelises; tree id is
+//!    process-ephemeral). Same-table and shared-key cross-tree swaps are
+//!    therefore AAD-valid — caught one layer up by the authenticated
+//!    index + structural layout, and (cross-tree) by per-tree key
+//!    isolation, not by per-block AEAD.
 //! 2. Cross-table swap (same key, different table_id)
-//! 3. Cross-tree swap (same key, different tree_id)
 //! 4. Per-AAD-field modification. Each field has at least one tamper
 //!    test that pins TYPED rejection; for the fields whose obvious
 //!    tamper hits an early gate (key_epoch -> UnknownKeyEpoch,
@@ -45,8 +49,7 @@
 //!    AEAD verify catches the field's actual AAD binding.
 //! 5. Tampered ciphertext (single bit-flip in BodyFrame payload)
 //! 6. ChaCha20-Poly1305 cross-suite coverage of the most consequential
-//!    scenarios (round-trip, block-swap, ciphertext bit-flip,
-//!    cross-tree swap).
+//!    scenarios (round-trip, cross-table swap, ciphertext bit-flip).
 //!
 //! Out of first-wave (require structured-zstd integration):
 //! - Dict substitution (needs ZstdDict frame inner-id check)
@@ -77,11 +80,9 @@ fn ctx_with_suite(suite: SuiteId) -> EncryptionContext {
     EncryptionContext::v1(KEY_EPOCH, suite, 0, 0)
 }
 
-fn identity(tree_id: u64, table_id: u64, block_offset: u64) -> BlockIdentity {
+fn identity(table_id: u64) -> BlockIdentity {
     BlockIdentity {
-        tree_id,
         table_id,
-        block_offset,
         block_type: BlockType::Data,
         dict_id: 0,
         window_log: 0,
@@ -92,49 +93,50 @@ const PLAINTEXT_A: &[u8] = b"block A payload bytes for AAD threat-model regressi
 const PLAINTEXT_B: &[u8] = b"block B payload bytes for AAD threat-model regression tests";
 
 #[test]
-fn block_swap_at_same_offset_fails_aead_verify() {
-    // Two blocks under the same (tree_id, table_id, key, suite), encrypted
-    // at distinct block_offsets. Swap them on "disk": present block B's
-    // bytes when the caller's identity says offset = A's offset. AAD
-    // construction at decrypt mixes the caller-supplied block_offset
-    // into the tag input, so verify must fail.
+fn same_table_block_swap_is_not_bound_in_aad() {
+    // AAD intentionally does NOT bind block position: every block of the
+    // same (tree_id, table_id, type, dict, window) shares identical AAD,
+    // so encryption needs no on-disk offset and parallelises freely.
+    // The consequence — pinned here as a regression guard — is that two
+    // data blocks of the SAME table are interchangeable at the AEAD layer:
+    // presenting B's sealed bytes under A's identity VERIFIES and returns
+    // B's plaintext. Block-position integrity is provided one layer up by
+    // the authenticated index (which maps key ranges to offsets) plus the
+    // structural file layout, not by per-block AEAD. If this assertion ever
+    // flips to a failure, someone re-introduced an offset (or other
+    // position) field into AAD and broke parallel encryption.
     let chain = key_chain();
-    let id_a = identity(7, 99, 0x1000);
-    let id_b = identity(7, 99, 0x2000);
+    let id = identity(99);
 
-    let bytes_a = encrypt_block(PLAINTEXT_A, &id_a, &ctx(), &chain).expect("encrypt A");
-    let bytes_b = encrypt_block(PLAINTEXT_B, &id_b, &ctx(), &chain).expect("encrypt B");
+    let bytes_a = encrypt_block(PLAINTEXT_A, &id, &ctx(), &chain).expect("encrypt A");
+    let bytes_b = encrypt_block(PLAINTEXT_B, &id, &ctx(), &chain).expect("encrypt B");
 
-    // Sanity: each round-trips under its OWN identity.
+    // Each round-trips under the shared identity.
     assert_eq!(
-        decrypt_block(&bytes_a, &id_a, &chain)
+        decrypt_block(&bytes_a, &id, &chain)
             .expect("rt A")
             .plaintext,
         PLAINTEXT_A
     );
+
+    // Swap: B's bytes decrypt fine under the same identity (no position
+    // binding) and yield B's plaintext.
     assert_eq!(
-        decrypt_block(&bytes_b, &id_b, &chain)
-            .expect("rt B")
+        decrypt_block(&bytes_b, &id, &chain)
+            .expect("same-table swap is AAD-valid by design")
             .plaintext,
         PLAINTEXT_B
-    );
-
-    // The attack: substitute B's on-disk bytes at A's offset.
-    let err = decrypt_block(&bytes_b, &id_a, &chain).expect_err("must fail");
-    assert!(
-        matches!(err, DecryptError::AeadVerificationFailed),
-        "expected AeadVerificationFailed, got {err:?}"
     );
 }
 
 #[test]
 fn cross_table_swap_fails_aead_verify() {
-    // Block sealed for table_id=66 — same tree, same key, same offset —
-    // attempt decrypt with table_id=99 identity. AAD includes table_id,
+    // Block sealed for table_id=66 — same tree, same key — attempt
+    // decrypt with table_id=99 identity. AAD includes table_id,
     // verify must fail.
     let chain = key_chain();
-    let id_sealed = identity(7, 66, 0x1000);
-    let id_attempt = identity(7, 99, 0x1000);
+    let id_sealed = identity(66);
+    let id_attempt = identity(99);
 
     let bytes = encrypt_block(PLAINTEXT_A, &id_sealed, &ctx(), &chain).expect("encrypt");
     let err = decrypt_block(&bytes, &id_attempt, &chain).expect_err("must fail");
@@ -145,20 +147,36 @@ fn cross_table_swap_fails_aead_verify() {
 }
 
 #[test]
-fn cross_tree_swap_fails_aead_verify() {
-    // Two trees sharing a key chain — collision risk if tree_id were
-    // omitted from AAD. AAD covers tree_id, so a block sealed for
-    // tree_id=10 must not decrypt under tree_id=20 even when every
-    // other field matches.
-    let chain = key_chain();
-    let id_sealed = identity(10, 99, 0x1000);
-    let id_attempt = identity(20, 99, 0x1000);
+fn cross_tree_swap_is_not_bound_in_aad() {
+    // The owning tree id is intentionally NOT part of AAD (it is a
+    // process-ephemeral counter, not durable across reopen). So two
+    // trees that share a key chain and a table id produce interchangeable
+    // blocks at the AEAD layer — pinned here as a regression guard for
+    // the offset/tree-independent AAD. Cross-tree substitution is instead
+    // prevented by per-tree KEY ISOLATION: in production each tree owns a
+    // distinct key, so a block sealed by tree A's key fails to decrypt
+    // under tree B's key. That key-layer defence is exercised by
+    // `wrong_key_in_chain_surfaces_aead_failure` (in the encryption unit
+    // tests). With a deliberately shared key + table id here, the swap
+    // VERIFIES — if this ever starts failing, someone re-introduced a
+    // tree/position field into AAD.
+    //
+    // Two SEPARATE key-chain instances carrying the SAME key material model
+    // the documented "different tree, same key" case (a misconfiguration
+    // where an operator shares one key across trees): tree A seals, tree B
+    // reads. Because the key bytes match and the AAD carries no tree id, the
+    // block decrypts — demonstrating exactly why distinct per-tree keys (not
+    // AAD) are the cross-tree defence.
+    let chain_a = key_chain();
+    let chain_b = key_chain();
+    let id = identity(99);
 
-    let bytes = encrypt_block(PLAINTEXT_A, &id_sealed, &ctx(), &chain).expect("encrypt");
-    let err = decrypt_block(&bytes, &id_attempt, &chain).expect_err("must fail");
-    assert!(
-        matches!(err, DecryptError::AeadVerificationFailed),
-        "expected AeadVerificationFailed, got {err:?}"
+    let bytes = encrypt_block(PLAINTEXT_A, &id, &ctx(), &chain_a).expect("encrypt");
+    assert_eq!(
+        decrypt_block(&bytes, &id, &chain_b)
+            .expect("shared-key cross-tree swap is AAD-valid by design")
+            .plaintext,
+        PLAINTEXT_A
     );
 }
 
@@ -184,7 +202,7 @@ fn block_type_tamper_on_disk_fails_aead_verify() {
     // caller identity), so tampering must surface at AAD verify.
     // Flip Data (0) → Index (1).
     let chain = key_chain();
-    let id = identity(7, 99, 0x1000);
+    let id = identity(99);
     let mut bytes = encrypt_block(PLAINTEXT_A, &id, &ctx(), &chain).expect("encrypt");
     bytes[META_BLOCK_TYPE] = 1; // Index discriminator
 
@@ -207,7 +225,7 @@ fn dict_id_tamper_on_disk_fails() {
     // covers the AAD-verify branch by sealing with a valid
     // ZstdDict context. Test pinned to typed rejection either way.
     let chain = key_chain();
-    let id = identity(7, 99, 0x1000);
+    let id = identity(99);
     let mut bytes = encrypt_block(PLAINTEXT_A, &id, &ctx(), &chain).expect("encrypt");
     bytes[META_DICT_ID_START + 3] ^= 0x01; // flip low bit of u32 BE
 
@@ -229,7 +247,7 @@ fn window_log_tamper_on_disk_fails() {
     // a TYPED rejection at the metadata-consistency gate, not at
     // AEAD verify (see the inner comment for why).
     let chain = key_chain();
-    let id = identity(7, 99, 0x1000);
+    let id = identity(99);
     let mut bytes = encrypt_block(PLAINTEXT_A, &id, &ctx(), &chain).expect("encrypt");
     // The original block was sealed with CompressionType=None and
     // WindowLog=0. Setting WindowLog to a non-zero value on the
@@ -264,7 +282,7 @@ fn compression_type_tamper_on_disk_fails_aead_verify() {
     // Defends per-block codec rotation: an attacker cannot swap an
     // None-compressed block's tag byte to claim Lz4 / Zstd.
     let chain = key_chain();
-    let id = identity(7, 99, 0x1000);
+    let id = identity(99);
     let mut bytes = encrypt_block(PLAINTEXT_A, &id, &ctx(), &chain).expect("encrypt");
     bytes[META_COMPRESSION_TYPE] = 1; // claim Lz4 (was None=0)
 
@@ -283,7 +301,7 @@ fn block_flags_tamper_on_disk_fails_aead_verify() {
     // as compressed/encrypted) under a forged non-cryptographic header
     // checksum — the AAD binds the whole byte so any flip fails AEAD.
     let chain = key_chain();
-    let id = identity(7, 99, 0x1000);
+    let id = identity(99);
     let mut bytes = encrypt_block(PLAINTEXT_A, &id, &ctx(), &chain).expect("encrypt");
     bytes[META_BLOCK_FLAGS] ^= 0x01; // flip the KV_CHECKSUM_FOOTER bit (was 0)
 
@@ -312,7 +330,7 @@ fn suite_id_supported_relabel_rejected() {
     // declared suite was swapped between two supported suites does
     // NOT decrypt.
     let chain = key_chain();
-    let id = identity(7, 99, 0x1000);
+    let id = identity(99);
     let mut bytes = encrypt_block(PLAINTEXT_A, &id, &ctx(), &chain).expect("encrypt");
     // 0x02 ^ 0x01 = 0x03 (supported suite).
     bytes[META_SUITE_ID] ^= 0x01;
@@ -336,7 +354,7 @@ fn suite_id_is_part_of_aad() {
     // two buffers identical and fail this assertion.
     use lsm_tree::encryption::aad::{EncryptionContext, build};
 
-    let id = identity(7, 99, 0x1000);
+    let id = identity(99);
     let aad_aes = build(
         &EncryptionContext::v1(KEY_EPOCH, SuiteId::Aes256Gcm, 0, 0),
         &id,
@@ -373,7 +391,7 @@ fn suite_id_unsupported_rejected_before_aead() {
     // is complete: supported relabels go through AEAD verify,
     // unsupported ones are caught at the typed-byte gate.
     let chain = key_chain();
-    let id = identity(7, 99, 0x1000);
+    let id = identity(99);
     let mut bytes = encrypt_block(PLAINTEXT_A, &id, &ctx(), &chain).expect("encrypt");
     // 0x02 ^ 0x0F = 0x0D (unregistered suite byte).
     bytes[META_SUITE_ID] ^= 0x0F;
@@ -406,7 +424,7 @@ fn key_epoch_downgrade_to_unknown_epoch_fails() {
     // verify, MalformedMetadataFrame) would be caught rather than
     // silently accepted.
     let chain = key_chain();
-    let id = identity(7, 99, 0x1000);
+    let id = identity(99);
 
     let mut bytes = encrypt_block(PLAINTEXT_A, &id, &ctx(), &chain).expect("encrypt");
 
@@ -435,7 +453,7 @@ fn header_byte_tamper_fails() {
     // BEFORE AEAD). Either typed error is acceptable — the point is
     // no silent wrong-plaintext.
     let chain = key_chain();
-    let id = identity(7, 99, 0x1000);
+    let id = identity(99);
     let mut bytes = encrypt_block(PLAINTEXT_A, &id, &ctx(), &chain).expect("encrypt");
 
     // MetadataPayload offset 0 = HeaderByte.
@@ -458,7 +476,7 @@ fn ciphertext_bit_flip_fails_aead_verify() {
     // integrity property; the test pins behaviour against future
     // refactors of the body framing.
     let chain = key_chain();
-    let id = identity(7, 99, 0x1000);
+    let id = identity(99);
     let mut bytes = encrypt_block(PLAINTEXT_A, &id, &ctx(), &chain).expect("encrypt");
 
     // BodyFrame payload starts at offset 54 (pure ciphertext — nonce
@@ -488,7 +506,7 @@ fn nonce_bit_flip_fails_aead_verify() {
     // because nonce tampering is the easiest attack to misclassify
     // as "garbled plaintext" if the verify step were ever weakened.
     let chain = key_chain();
-    let id = identity(7, 99, 0x1000);
+    let id = identity(99);
     let mut bytes = encrypt_block(PLAINTEXT_A, &id, &ctx(), &chain).expect("encrypt");
 
     // Nonce lives inside MetadataPayload at offsets 18-29 (NOT in
@@ -509,7 +527,7 @@ fn round_trip_under_correct_identity_succeeds() {
     // bit-exact. Guards against the trap of all-tests-pass-because-
     // everything-fails.
     let chain = key_chain();
-    let id = identity(7, 99, 0x1000);
+    let id = identity(99);
     let bytes = encrypt_block(PLAINTEXT_A, &id, &ctx(), &chain).expect("encrypt");
     let decrypted = decrypt_block(&bytes, &id, &chain).expect("decrypt");
     assert_eq!(decrypted.plaintext, PLAINTEXT_A);
@@ -535,7 +553,7 @@ fn chacha_round_trip_succeeds() {
     // bit-exact. Any breakage of the per-suite encrypt / decrypt wiring
     // surfaces here first.
     let chain = key_chain();
-    let id = identity(7, 99, 0x1000);
+    let id = identity(99);
     let bytes = encrypt_block(
         PLAINTEXT_A,
         &id,
@@ -548,24 +566,25 @@ fn chacha_round_trip_succeeds() {
 }
 
 #[test]
-fn chacha_block_swap_at_same_offset_fails_aead_verify() {
-    // Most consequential AAD attack under ChaCha: substitute block B's
-    // ChaCha-sealed bytes at A's offset. AEAD verify must catch the
-    // block_offset mismatch on the chacha path the same way it does
-    // on the AES path.
+fn chacha_cross_table_swap_fails_aead_verify() {
+    // Cross-table swap under ChaCha: a block sealed for table_id=66 must
+    // not decrypt under table_id=99, since AAD binds table_id. Mirrors the
+    // AES `cross_table_swap_fails_aead_verify` on the chacha path. (Same-
+    // table position swap is intentionally AAD-valid; see
+    // `same_table_block_swap_is_not_bound_in_aad`.)
     let chain = key_chain();
-    let id_a = identity(7, 99, 0x1000);
-    let id_b = identity(7, 99, 0x2000);
+    let id_sealed = identity(66);
+    let id_attempt = identity(99);
 
-    let bytes_b = encrypt_block(
+    let bytes = encrypt_block(
         PLAINTEXT_B,
-        &id_b,
+        &id_sealed,
         &ctx_with_suite(SuiteId::ChaCha20Poly1305),
         &chain,
     )
-    .expect("encrypt B");
+    .expect("encrypt");
 
-    let err = decrypt_block(&bytes_b, &id_a, &chain).expect_err("must fail");
+    let err = decrypt_block(&bytes, &id_attempt, &chain).expect_err("must fail");
     assert!(
         matches!(err, DecryptError::AeadVerificationFailed),
         "expected AeadVerificationFailed, got {err:?}"
@@ -579,7 +598,7 @@ fn chacha_ciphertext_bit_flip_fails_aead_verify() {
     // weakened only the chacha verify step would slip past the AES
     // matrix.
     let chain = key_chain();
-    let id = identity(7, 99, 0x1000);
+    let id = identity(99);
     let mut bytes = encrypt_block(
         PLAINTEXT_A,
         &id,
@@ -593,28 +612,6 @@ fn chacha_ciphertext_bit_flip_fails_aead_verify() {
     bytes[target_byte] ^= 0x01;
 
     let err = decrypt_block(&bytes, &id, &chain).expect_err("must fail");
-    assert!(
-        matches!(err, DecryptError::AeadVerificationFailed),
-        "expected AeadVerificationFailed, got {err:?}"
-    );
-}
-
-#[test]
-fn chacha_cross_tree_swap_fails_aead_verify() {
-    // AAD-bound tree_id must reject cross-tree substitution on the
-    // chacha path. Companion to the AES cross_tree_swap test.
-    let chain = key_chain();
-    let id_sealed = identity(10, 99, 0x1000);
-    let id_attempt = identity(20, 99, 0x1000);
-    let bytes = encrypt_block(
-        PLAINTEXT_A,
-        &id_sealed,
-        &ctx_with_suite(SuiteId::ChaCha20Poly1305),
-        &chain,
-    )
-    .expect("encrypt");
-
-    let err = decrypt_block(&bytes, &id_attempt, &chain).expect_err("must fail");
     assert!(
         matches!(err, DecryptError::AeadVerificationFailed),
         "expected AeadVerificationFailed, got {err:?}"
@@ -662,7 +659,7 @@ fn key_epoch_supported_relabel_fails_aead_verify() {
     let chain = StaticKeyChain::new()
         .with_key(KEY_EPOCH, KEY_BYTES)
         .with_key(KEY_EPOCH_2, KEY_BYTES_2);
-    let id = identity(7, 99, 0x1000);
+    let id = identity(99);
     let mut bytes = encrypt_block(PLAINTEXT_A, &id, &ctx(), &chain).expect("encrypt");
     bytes[META_KEY_EPOCH] = KEY_EPOCH_2;
 
@@ -682,7 +679,7 @@ fn header_byte_low_nibble_tamper_fails_aead_verify() {
     // and the tampered byte propagates into AAD reconstruction —
     // AEAD verify catches the mismatch.
     let chain = key_chain();
-    let id = identity(7, 99, 0x1000);
+    let id = identity(99);
     let mut bytes = encrypt_block(PLAINTEXT_A, &id, &ctx(), &chain).expect("encrypt");
     bytes[META_HEADER_BYTE] |= 0x01; // set lowest reserved bit
 
@@ -703,7 +700,7 @@ fn window_log_under_zstd_tamper_fails_aead_verify() {
     // AAD-binding of WindowLog beyond what the early-gate test
     // verifies.
     let chain = key_chain();
-    let mut id = identity(7, 99, 0x1000);
+    let mut id = identity(99);
     id.window_log = 15;
     let zstd_ctx = EncryptionContext::v1(KEY_EPOCH, SuiteId::Aes256Gcm, 3, 0);
     let mut bytes = encrypt_block(PLAINTEXT_A, &id, &zstd_ctx, &chain).expect("encrypt");
@@ -723,7 +720,7 @@ fn dict_id_under_zstd_dict_tamper_fails_aead_verify() {
     // so a DictID tamper at decode time bypasses the codec-consistency
     // gate and lands on AAD verify. Pins the AAD-binding of DictID.
     let chain = key_chain();
-    let mut id = identity(7, 99, 0x1000);
+    let mut id = identity(99);
     id.dict_id = 0x1234_5678;
     let zstd_dict_ctx = EncryptionContext::v1(KEY_EPOCH, SuiteId::Aes256Gcm, 4, 0);
     let mut bytes = encrypt_block(PLAINTEXT_A, &id, &zstd_dict_ctx, &chain).expect("encrypt");

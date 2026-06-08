@@ -453,10 +453,10 @@ pub fn encrypt_block(
     // module already does.
     let nonce: [u8; 12] = <[u8; 12]>::generate();
 
-    // Build the 39-byte AAD: binds ciphertext to format identity,
-    // header byte, key epoch, block type, suite id, tree id,
-    // table id, block offset, compression type, dict id, window
-    // log.
+    // Build the 23-byte AAD: binds ciphertext to format identity,
+    // header byte, key epoch, block type, suite id, table id,
+    // compression type, dict id, window log, and block_flags. (Block
+    // offset and tree id are intentionally not bound — see aad::build.)
     let aad = build(ctx, identity);
 
     // Encrypt the plaintext in-place; move it into an owned Vec
@@ -534,16 +534,17 @@ pub struct DecryptedBlock {
 /// to end exactly at the `BodyFrame`: the encrypted-block format
 /// defines no trailing frames, so any extra bytes are rejected.
 ///
-/// `identity` MUST supply the three AAD-bound fields that are
-/// NOT recorded on disk: `tree_id`, `table_id`, and `block_offset`.
-/// Any mismatch on any of those three propagates through the AAD
-/// and surfaces as [`DecryptError::AeadVerificationFailed`]. The
-/// six on-disk-recorded AAD fields (`HeaderByte`, `KeyEpoch`,
-/// `BlockType`, `SuiteID`, `CompressionType`, `DictID`, `WindowLog`)
-/// are read back from the `MetadataPayload` regardless of what the
-/// caller supplies on `identity.block_type` / `identity.dict_id` /
-/// `identity.window_log` — those three fields are IGNORED on the
-/// read path because the disk is the source of truth for them.
+/// `identity` MUST supply the AAD-bound `table_id` that is NOT
+/// recorded on disk; a mismatch propagates through the AAD and
+/// surfaces as [`DecryptError::AeadVerificationFailed`]. A block's
+/// byte offset and the owning tree id are deliberately not bound
+/// (see [`crate::encryption::aad::build`]). The on-disk-recorded AAD
+/// fields (`HeaderByte`, `KeyEpoch`, `BlockType`, `SuiteID`,
+/// `CompressionType`, `DictID`, `WindowLog`) are read back from the
+/// `MetadataPayload` regardless of what the caller supplies on
+/// `identity.block_type` / `identity.dict_id` / `identity.window_log`
+/// — those fields are IGNORED on the read path because the disk is
+/// the source of truth for them.
 ///
 /// The returned `compression_type` / `dict_id` / `window_log`
 /// fields on [`DecryptedBlock`] are the spec's post-decrypt
@@ -608,15 +609,13 @@ pub fn decrypt_block(
     // Reconstruct the BlockIdentity that participates in AAD using
     // the on-disk-mirrored fields from the MetadataPayload (dict_id,
     // window_log, block_type) plus the caller-supplied identity
-    // (tree_id, table_id, block_offset). Block-type byte goes
-    // through TryFrom so an unknown discriminator surfaces as
-    // MalformedMetadataFrame rather than being silently coerced.
+    // (table_id). Block-type byte goes through TryFrom so an unknown
+    // discriminator surfaces as MalformedMetadataFrame rather than
+    // being silently coerced.
     let block_type = crate::table::block::BlockType::try_from(parsed.block_type_byte)
         .map_err(|_| DecryptError::MalformedMetadataFrame("unknown BlockType byte"))?;
     let aad_identity = BlockIdentity {
-        tree_id: identity.tree_id,
         table_id: identity.table_id,
-        block_offset: identity.block_offset,
         block_type,
         dict_id: parsed.dict_id,
         window_log: parsed.window_log,
@@ -661,9 +660,7 @@ mod tests {
 
     fn id() -> BlockIdentity {
         BlockIdentity {
-            tree_id: 0xAABB_CCDD_EEFF_0011,
             table_id: 0x1234_5678_9ABC_DEF0,
-            block_offset: 0x0000_1000,
             block_type: BlockType::Data,
             dict_id: 0,
             window_log: 0,
@@ -731,13 +728,13 @@ mod tests {
     #[test]
     fn cross_identity_substitution_surfaces_aead_failure() {
         // Same plaintext, sealed under one BlockIdentity. Reader
-        // attempts to decrypt with a DIFFERENT BlockIdentity (one
-        // field changed). AAD includes tree_id / table_id /
-        // block_offset, so any mismatch surfaces as AEAD failure.
+        // attempts to decrypt with a DIFFERENT BlockIdentity (table_id
+        // flipped). AAD binds table_id (not tree_id — that is no longer
+        // part of the identity), so the mismatch surfaces as AEAD failure.
         let plaintext = b"the quick brown fox";
         let sealed = encrypt_block(plaintext, &id(), &ctx(), &chain()).unwrap();
         let mut wrong_id = id();
-        wrong_id.block_offset = 0x0000_2000; // shifted by 4 KiB
+        wrong_id.table_id ^= 0x1; // flip one bit of the table id
         let err = decrypt_block(&sealed, &wrong_id, &chain()).unwrap_err();
         assert!(matches!(err, DecryptError::AeadVerificationFailed));
     }

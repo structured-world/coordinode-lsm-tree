@@ -109,17 +109,7 @@ impl<W: std::io::Write + std::io::Seek> BlockIndexWriter<W> for FullIndexWriter 
             file_writer,
             &bytes,
             crate::table::block::BlockIdentity {
-                tree_id: 0,
                 table_id: self.table_id,
-                // crate::sfa::Writer doesn't expose its position cursor;
-                // outer table Writer tracks meta.file_pos but the
-                // BlockIndexWriter trait doesn't surface it here.
-                // Leaving offset=0 intentionally — extending
-                // BlockIndexWriter::finish to thread block_offset
-                // alongside file_writer is a planned follow-up
-                // (alongside the canary check that would refuse
-                // this combination once both fields can be real).
-                block_offset: 0,
                 block_type: crate::table::block::BlockType::Index,
                 dict_id: 0,
                 window_log: 0,

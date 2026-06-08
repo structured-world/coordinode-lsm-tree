@@ -118,15 +118,6 @@ pub const TAIL_FOOTER_SIZE_HINT_BYTES: u64 = 4;
 /// layout-version-2 if real production names ever approach it.
 pub const MAX_SECTION_NAME_BYTES: usize = 64;
 
-/// AAD tree-id sentinel used for manifest Blocks: `u64::MAX`.
-///
-/// The manifest file lives at the per-tree folder level (one file
-/// per version, no per-table sharding), so AAD doesn't need to bind
-/// a specific tree id — per-tree encryption-provider isolation
-/// (each tree's `KeyChain` decrypts only its own blocks) is the
-/// substitute defence per the AAD design's allowed-zero list.
-pub const MANIFEST_TREE_ID_SENTINEL: u64 = u64::MAX;
-
 /// AAD table-id sentinel used for manifest Blocks: `u64::MAX`.
 ///
 /// The manifest is not an SST and has no `TableId`; the sentinel

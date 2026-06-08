@@ -731,8 +731,10 @@ fn read_ecc_params_out_of_band(
             continue;
         };
         let handle = crate::table::BlockHandle::new(crate::table::BlockOffset(pos), size);
+        // table_id is moot here: this scrub path reads unencrypted meta
+        // (encryption = None), so the AAD identity is unused.
         if let Ok(meta) =
-            crate::table::meta::ParsedMeta::load_with_handle(probe.as_ref(), &handle, None)
+            crate::table::meta::ParsedMeta::load_with_handle(probe.as_ref(), &handle, None, None)
         {
             let state = if meta.ecc_unrecognized {
                 ScrubEcc::Unrecognized
@@ -1541,7 +1543,7 @@ mod block_verify_tests {
         // descriptor property), so the KV_CHECKSUM_FOOTER flag passed here is
         // dropped on encode — the footer rides inside the payload structurally,
         // and `verify_kv_checked` splits it without consulting the header bit.
-        let id = BlockIdentity::for_test(0, 0, BlockType::Data);
+        let id = BlockIdentity::for_test(0, BlockType::Data);
         let mut buf = Vec::new();
         Block::write_into_with_flags(
             &mut buf,
@@ -1593,7 +1595,7 @@ mod block_verify_tests {
         let mut payload = Vec::new();
         DataBlock::encode_kv_checked_into(&mut payload, &items, &digests, algo, 2, 0.0).unwrap();
 
-        let id = BlockIdentity::for_test(0, 0, BlockType::Data);
+        let id = BlockIdentity::for_test(0, BlockType::Data);
         let mut buf = Vec::new();
         Block::write_into_with_flags(
             &mut buf,

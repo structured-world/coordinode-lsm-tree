@@ -120,13 +120,7 @@ pub fn load_block(
         fd.as_ref(),
         *handle,
         crate::table::block::BlockIdentity {
-            // load_block has a GlobalTableId — use the real
-            // tree_id rather than 0. This is the one production
-            // call site that doesn't need to fall back to
-            // per-tree key isolation as a substitute defence.
-            tree_id: table_id.tree_id(),
             table_id: table_id.table_id(),
-            block_offset: *handle.offset(),
             block_type,
             dict_id: compression.dict_id(),
             window_log: 0,

@@ -82,13 +82,7 @@ impl PartitionedIndexWriter {
             &mut self.block_buffer,
             &bytes,
             crate::table::block::BlockIdentity {
-                tree_id: 0,
                 table_id: self.table_id,
-                // Index partition writes into an internal buffer
-                // before being flushed; the buffer position isn't
-                // the file offset. Real per-block file offset is
-                // not available here without trait-surface changes.
-                block_offset: 0,
                 block_type: crate::table::block::BlockType::Index,
                 dict_id: 0,
                 window_log: 0,
@@ -173,9 +167,7 @@ impl PartitionedIndexWriter {
             file_writer,
             &bytes,
             crate::table::block::BlockIdentity {
-                tree_id: 0,
                 table_id: self.table_id,
-                block_offset: 0,
                 block_type: crate::table::block::BlockType::Index,
                 dict_id: 0,
                 window_log: 0,

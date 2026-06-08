@@ -1009,19 +1009,7 @@ impl Table {
             file,
             handle,
             crate::table::block::BlockIdentity {
-                tree_id: 0,
                 table_id,
-                // Match the writer: both `tli` and `tli_tail` are
-                // emitted with `block_offset: 0` (the partitioned /
-                // full index writers do not currently thread their
-                // SFA section offset through `BlockIndexWriter`).
-                // BlockIdentity is ignored by `Block::from_file`
-                // today, but once #251 wires it into AEAD AAD,
-                // reader and writer MUST encode the same value or
-                // encrypted tables fail to reopen. Threading real
-                // section offsets through is tracked alongside the
-                // BlockIndexWriter::finish surface in #251.
-                block_offset: 0,
                 block_type: BlockType::Index,
                 dict_id: 0,
                 window_log: 0,
@@ -1066,6 +1054,7 @@ impl Table {
         checksum: Checksum,
         global_seqno: SeqNo,
         tree_id: TreeId,
+        table_id: TableId,
         cache: Arc<Cache>,
         descriptor_table: Option<Arc<DescriptorTable>>,
         fs: Arc<dyn Fs>,
@@ -1101,6 +1090,7 @@ impl Table {
         let metadata = match ParsedMeta::load_with_handle(
             &*file,
             &regions.metadata,
+            Some(table_id),
             encryption.as_deref(),
         ) {
             Ok(m) => m,
@@ -1123,7 +1113,12 @@ impl Table {
                     // directly — no sentinel patching, no
                     // `std::fs::metadata` (which would also bypass the
                     // pluggable `Fs` backend).
-                    match ParsedMeta::load_with_handle(&*file, &mid_handle, encryption.as_deref()) {
+                    match ParsedMeta::load_with_handle(
+                        &*file,
+                        &mid_handle,
+                        Some(table_id),
+                        encryption.as_deref(),
+                    ) {
                         Ok(mid) => mid,
                         Err(mid_err) => {
                             log::warn!(
@@ -1234,9 +1229,7 @@ impl Table {
                 file_handle.as_ref(),
                 filter_tli_handle,
                 crate::table::block::BlockIdentity {
-                    tree_id: 0,
                     table_id: metadata.id,
-                    block_offset: *filter_tli_handle.offset(),
                     block_type: BlockType::Index,
                     dict_id: 0,
                     window_log: 0,
@@ -1285,9 +1278,7 @@ impl Table {
                         file_handle.as_ref(),
                         filter_handle,
                         crate::table::block::BlockIdentity {
-                            tree_id: 0,
                             table_id: metadata.id,
-                            block_offset: *filter_handle.offset(),
                             block_type: BlockType::Filter,
                             dict_id: 0,
                             window_log: 0,
@@ -1334,9 +1325,7 @@ impl Table {
                 file_handle.as_ref(),
                 rt_handle,
                 crate::table::block::BlockIdentity {
-                    tree_id: 0,
                     table_id: metadata.id,
-                    block_offset: *rt_handle.offset(),
                     block_type: BlockType::RangeTombstone,
                     dict_id: 0,
                     window_log: 0,
@@ -1390,9 +1379,7 @@ impl Table {
                 file_handle.as_ref(),
                 bl_handle,
                 crate::table::block::BlockIdentity {
-                    tree_id: 0,
                     table_id: metadata.id,
-                    block_offset: *bl_handle.offset(),
                     block_type: BlockType::BlockLayout,
                     dict_id: 0,
                     window_log: 0,

@@ -243,14 +243,7 @@ fn prepare_owned(
     };
 
     let identity = BlockIdentity {
-        tree_id: 0,
         table_id,
-        // Provisional: the real on-disk offset is unknown until the serial
-        // write step assigns it. prepare_with_flags does not consume the
-        // offset today; if AAD-over-offset ever lands, encryption must move to
-        // the (offset-bearing) write phase, since the offset depends on
-        // post-compression size and so cannot be known at submit time.
-        block_offset: 0,
         block_type: BlockType::Data,
         dict_id: compression.dict_id(),
         window_log: 0,
