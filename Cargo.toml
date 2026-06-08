@@ -198,9 +198,15 @@ rayon = { version = "1.10", optional = true }
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = { version = "0.7", optional = true }
 
-[target.'cfg(target_os = "macos")'.dependencies]
-# Plain `fsync` for SyncMode::Normal — std's `File::sync_all` issues the much
-# slower `fcntl(F_FULLFSYNC)` on macOS, which we only want under SyncMode::Full.
+[target.'cfg(unix)'.dependencies]
+# Unix syscall surface that std does not expose:
+#   - macOS: plain `fsync` for SyncMode::Normal (std's `File::sync_all` issues
+#     the much slower `fcntl(F_FULLFSYNC)`), plus `statfs`/`clonefile` for
+#     FS-capability detection + O(1) APFS reflink.
+#   - Linux: `statfs` f_type detection (Btrfs/XFS), `ioctl(FICLONE)` reflink,
+#     and `ioctl(FS_IOC_SETFLAGS|FS_NOCOW_FL)` CoW disable on Btrfs SSTs.
+# libc provides the arch-correct struct layouts and ioctl constants that are
+# otherwise error-prone to hand-declare per architecture.
 libc = "0.2"
 
 [dev-dependencies]

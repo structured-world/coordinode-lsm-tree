@@ -11,7 +11,7 @@ use std::path::Path;
 ///
 /// On macOS, `File::sync_all` issues `fcntl(F_FULLFSYNC)` (a full hardware
 /// barrier, ~50× slower than `fsync`). `Normal` mode wants the cheaper plain
-/// `fsync` — which std does not expose on macOS — so call it directly via
+/// `fsync` - which std does not expose on macOS - so call it directly via
 /// `libc`. On every other platform `File::sync_all` IS plain `fsync`, so just
 /// delegate.
 #[cfg(target_os = "macos")]
@@ -28,13 +28,13 @@ fn normal_fsync(file: &File) -> io::Result<()> {
 
 #[cfg(not(target_os = "macos"))]
 fn normal_fsync(file: &File) -> io::Result<()> {
-    // No `F_FULLFSYNC` distinction off macOS — `sync_all` is plain `fsync`.
+    // No `F_FULLFSYNC` distinction off macOS - `sync_all` is plain `fsync`.
     File::sync_all(file)
 }
 
 /// Default [`Fs`] implementation backed by [`std::fs`].
 ///
-/// This is a zero-sized type — when used as a monomorphized generic
+/// This is a zero-sized type - when used as a monomorphized generic
 /// parameter it adds no runtime overhead.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct StdFs;
@@ -161,7 +161,7 @@ impl Fs for StdFs {
             .append(opts.append);
 
         // Gate matches the `mod direct_io;` declaration in `fs/mod.rs`
-        // — the submodule only exists when `feature = "std"` is on.
+        // - the submodule only exists when `feature = "std"` is on.
         // Without the gate this site would fail to compile under
         // `--no-default-features --features alloc` even before the
         // wider std-bound surface of `StdFs` itself hits the trait
@@ -194,7 +194,7 @@ impl Fs for StdFs {
                 let file_name = file_name_os.into_string().map_err(|os| {
                     #[expect(
                         clippy::unnecessary_debug_formatting,
-                        reason = "OsString has no Display impl — Debug is required"
+                        reason = "OsString has no Display impl - Debug is required"
                     )]
                     let msg = format!("non-UTF-8 filename in directory {}: {os:?}", path.display());
                     io::Error::new(io::ErrorKind::InvalidData, msg)
@@ -242,7 +242,7 @@ impl Fs for StdFs {
             dir.sync_all()
         }
 
-        // Windows cannot fsync directories — no-op, same as crate::file::fsync_directory.
+        // Windows cannot fsync directories - no-op, same as crate::file::fsync_directory.
         #[cfg(target_os = "windows")]
         {
             let _ = path;
@@ -266,7 +266,7 @@ impl Fs for StdFs {
             }
         }
 
-        // Windows cannot fsync directories — no-op.
+        // Windows cannot fsync directories - no-op.
         #[cfg(target_os = "windows")]
         {
             let _ = (path, mode);
@@ -319,10 +319,46 @@ impl Fs for StdFs {
             Err(e) => Err(e),
         }
     }
+
+    /// Linux: detect the filesystem via `statfs(2)`'s `f_type` magic. Btrfs and
+    /// ZFS report the full profile (integrity, scrub, copy-on-write, reflink,
+    /// snapshot); XFS reports copy-on-write plus reflink (reflink only when the
+    /// volume was formatted `reflink=1`, which `reflink_file` handles by falling
+    /// back). Other filesystems and any detection failure report the
+    /// conservative default.
+    #[cfg(target_os = "linux")]
+    fn capabilities(&self, path: &Path) -> super::FsCapabilities {
+        linux_caps::capabilities(path)
+    }
+
+    /// Linux: O(1) clone via `ioctl(FICLONE)` (Btrfs, XFS-reflink). Falls back
+    /// to the shared streamed copy when the filesystem declines the clone
+    /// (non-reflink FS, cross-device); a genuine I/O error propagates.
+    #[cfg(target_os = "linux")]
+    fn reflink_file(&self, src: &Path, dst: &Path) -> io::Result<()> {
+        match linux_caps::ficlone(src, dst) {
+            Ok(()) => Ok(()),
+            Err(e) if linux_caps::clone_should_fall_back(&e) => {
+                super::copy_file_streamed(self, src, dst)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Linux: clear per-file copy-on-write (`FS_NOCOW_FL` via
+    /// `ioctl(FS_IOC_SETFLAGS)`) so write-once SST files on Btrfs avoid the
+    /// copy-on-write fragmentation penalty. The flag only takes effect on a
+    /// still-empty file,
+    /// so callers invoke this right after creating the SST. A no-op on
+    /// filesystems that do not support the inode-flags ioctl.
+    #[cfg(target_os = "linux")]
+    fn try_disable_cow(&self, path: &Path) -> io::Result<()> {
+        linux_caps::try_disable_cow(path)
+    }
 }
 
 /// Shared by every backend that resolves paths against the host kernel's
-/// filesystem table — currently `StdFs` and `IoUringFs`. Two such backends
+/// filesystem table - currently `StdFs` and `IoUringFs`. Two such backends
 /// can hard-link across instances because `std::fs::hard_link(src, dst)`
 /// resolves both paths through the same kernel namespace.
 pub const KERNEL_BACKEND_ID: u64 = 0x4b45_524e_454c_5f46; // "KERNEL_F"
@@ -357,7 +393,7 @@ pub(crate) fn is_cross_device(err: &io::Error) -> bool {
     {
         // POSIX `EXDEV` ("invalid cross-device link"). The raw value is
         // 18 on every supported Unix target (Linux, macOS, FreeBSD,
-        // OpenBSD, NetBSD, Android — see `errno.h` on each platform).
+        // OpenBSD, NetBSD, Android - see `errno.h` on each platform).
         // We declare it as a named constant rather than depending on
         // `libc`: the crate deliberately avoids a `libc` dependency
         // (see the `flock` extern in this file for the same pattern),
@@ -414,7 +450,7 @@ mod sys {
     }
 
     // POSIX_FADV_* values are stable across glibc / musl / *BSD libc.
-    // macOS has no posix_fadvise — routed to a no-op `fadvise` below.
+    // macOS has no posix_fadvise - routed to a no-op `fadvise` below.
     #[cfg(not(target_os = "macos"))]
     const POSIX_FADV_NORMAL: c_int = 0;
     #[cfg(not(target_os = "macos"))]
@@ -426,7 +462,7 @@ mod sys {
 
     // EINVAL == 22 on every Linux / *BSD target we ship to. Used to
     // map "kernel rejected this hint" to Ok(()) per the FsFile::hint
-    // contract — hints are advisory, EINVAL means "the kernel didn't
+    // contract - hints are advisory, EINVAL means "the kernel didn't
     // like this advice code", not "the file is broken".
     #[cfg(not(target_os = "macos"))]
     const EINVAL: c_int = 22;
@@ -434,7 +470,7 @@ mod sys {
     // libc symbol selection (the 32-bit glibc trap):
     //
     // Plain `posix_fadvise` on 32-bit glibc takes a 32-bit off_t
-    // unless the caller opts into `_FILE_OFFSET_BITS=64` — and Rust
+    // unless the caller opts into `_FILE_OFFSET_BITS=64` - and Rust
     // FFI declarations don't get that define. Passing i64 args into
     // a 32-bit-off_t syscall wrapper corrupts the stack.
     //
@@ -447,7 +483,7 @@ mod sys {
     // - 32-bit glibc Linux + 32-bit Android: posix_fadvise64
     //   (otherwise stack corruption)
     // - musl on any pointer width: posix_fadvise (musl is sane on
-    //   32-bit too — its plain wrapper takes 64-bit off_t)
+    //   32-bit too - its plain wrapper takes 64-bit off_t)
     // - 64-bit Linux/Android: posix_fadvise (off_t is always 64-bit)
     // - BSDs (freebsd/netbsd/dragonfly): posix_fadvise (off_t is
     //   always 64-bit, no *64 variant exists)
@@ -511,7 +547,7 @@ mod sys {
             }
         };
         // EINVAL = kernel doesn't recognise this advice code (or the
-        // fd isn't a regular file — e.g. pipe / socket / character
+        // fd isn't a regular file - e.g. pipe / socket / character
         // device). Hints are advisory; treat as a no-op per the
         // FsFile::hint contract.
         if ret == 0 || ret == EINVAL {
@@ -523,8 +559,8 @@ mod sys {
 
     // macOS has no posix_fadvise. The closest primitives are
     // `fcntl(F_RDADVISE)` (sequential prefetch hint, requires a byte
-    // range — not useful for the whole-file hints we want) and
-    // `fcntl(F_NOCACHE)` (toggle uncached I/O — too blunt for our use
+    // range - not useful for the whole-file hints we want) and
+    // `fcntl(F_NOCACHE)` (toggle uncached I/O - too blunt for our use
     // case). Treat as a no-op for now; the performance benefit on
     // macOS is small enough that wiring a half-equivalent isn't worth
     // the complexity.
@@ -553,7 +589,7 @@ mod sys {
         // Windows has no direct posix_fadvise equivalent. The closest
         // primitive (`FILE_FLAG_SEQUENTIAL_SCAN` / `_RANDOM_ACCESS`)
         // must be set at CreateFile time and can't be changed for an
-        // already-open handle. Treat as a no-op — if Windows
+        // already-open handle. Treat as a no-op - if Windows
         // performance becomes a concern we'd thread the hint through
         // FsOpenOptions instead and set the flag at open time.
         Ok(())
@@ -634,7 +670,7 @@ mod sys {
         reason = "FsFile::hint signature requires io::Result<()>; unsupported platforms have no fallible path"
     )]
     pub(super) fn fadvise(_file: &File, _hint: FileHint) -> io::Result<()> {
-        // Unsupported platform — silently ignore. Hints are advisory.
+        // Unsupported platform - silently ignore. Hints are advisory.
         Ok(())
     }
 }
@@ -719,7 +755,7 @@ mod macos_caps {
     /// clone" (so fall back to a byte copy) rather than a real I/O failure.
     pub(super) fn clone_should_fall_back(err: &io::Error) -> bool {
         // ENOTSUP/EOPNOTSUPP (45): non-APFS mount or clone unsupported.
-        // EXDEV (18): cross-device — cannot clone across filesystems.
+        // EXDEV (18): cross-device - cannot clone across filesystems.
         const ENOTSUP: i32 = 45;
         const EXDEV: i32 = 18;
         matches!(err.raw_os_error(), Some(ENOTSUP | EXDEV))
@@ -727,6 +763,214 @@ mod macos_caps {
                 err.kind(),
                 io::ErrorKind::Unsupported | io::ErrorKind::CrossesDevices
             )
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Linux filesystem capability detection (statfs) + FICLONE reflink + NoCoW
+// ---------------------------------------------------------------------------
+
+#[cfg(target_os = "linux")]
+mod linux_caps {
+    use crate::fs::FsCapabilities;
+    use std::ffi::CString;
+    use std::fs::{File, OpenOptions};
+    use std::io;
+    use std::mem::MaybeUninit;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::io::AsRawFd;
+    use std::path::Path;
+
+    fn to_cstring(path: &Path) -> io::Result<CString> {
+        CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "path contains an interior NUL byte",
+            )
+        })
+    }
+
+    /// Capabilities derived from `statfs(2)`'s `f_type` magic for the mount
+    /// backing `path`. Btrfs / ZFS get the full profile; XFS gets copy-on-write
+    /// plus reflink (reflink is only present on `reflink=1` volumes, which
+    /// `ficlone` handles by falling back). Everything else (ext4, tmpfs,
+    /// network) and any detection failure report the conservative default.
+    ///
+    /// Gated to 64-bit targets: `statfs.f_type` is `__fsword_t` (`c_long`),
+    /// and the magic numbers exceed `i32::MAX`, so a clean comparison needs the
+    /// 64-bit field. 32-bit Linux is not a storage-engine deployment target;
+    /// it reports the conservative default.
+    #[cfg(target_pointer_width = "64")]
+    pub(super) fn capabilities(path: &Path) -> FsCapabilities {
+        // statfs f_type magic numbers (stable kernel ABI, arch-independent).
+        const BTRFS: i64 = 0x9123_683E;
+        const ZFS: i64 = 0x2FC1_2FC1;
+        const XFS: i64 = 0x5846_5342;
+
+        let Ok(c) = to_cstring(path) else {
+            return FsCapabilities::default();
+        };
+        let mut buf = MaybeUninit::<libc::statfs>::uninit();
+        // SAFETY: `c` is a valid NUL-terminated C string; on success (rc == 0)
+        // the kernel fully initializes the `statfs` buffer.
+        #[expect(unsafe_code, reason = "statfs FFI to read f_type")]
+        let rc = unsafe { libc::statfs(c.as_ptr(), buf.as_mut_ptr()) };
+        if rc != 0 {
+            return FsCapabilities::default();
+        }
+        // SAFETY: statfs returned 0, so `buf` is initialized. `f_type` is
+        // `c_long` (i64) on 64-bit, matching the magic constants directly.
+        #[expect(unsafe_code, reason = "read initialized statfs.f_type")]
+        let f_type: i64 = unsafe { buf.assume_init() }.f_type;
+
+        match f_type {
+            BTRFS | ZFS => FsCapabilities {
+                per_block_integrity_on_read: true,
+                background_scrub: true,
+                copy_on_write: true,
+                reflink: true,
+                native_snapshot: true,
+            },
+            XFS => FsCapabilities {
+                copy_on_write: true,
+                reflink: true,
+                ..FsCapabilities::default()
+            },
+            _ => FsCapabilities::default(),
+        }
+    }
+
+    /// 32-bit Linux: not a storage-engine deployment target; the `statfs`
+    /// `f_type` magic comparison needs the 64-bit field, so report the
+    /// conservative default.
+    #[cfg(not(target_pointer_width = "64"))]
+    pub(super) fn capabilities(_path: &Path) -> FsCapabilities {
+        FsCapabilities::default()
+    }
+
+    /// O(1) data clone via `ioctl(FICLONE)`. Creates `dst` (failing if it
+    /// exists), then clones `src` into it; on clone failure the empty `dst` is
+    /// removed so a caller's copy fallback can re-create it.
+    pub(super) fn ficlone(src: &Path, dst: &Path) -> io::Result<()> {
+        let src_f = File::open(src)?;
+        let dst_f = OpenOptions::new().write(true).create_new(true).open(dst)?;
+        // SAFETY: FICLONE takes the source fd as its argument; both fds are
+        // valid and owned by `src_f` / `dst_f` for the duration of the call.
+        #[expect(unsafe_code, reason = "ioctl(FICLONE) for an O(1) reflink clone")]
+        let rc = unsafe {
+            libc::ioctl(
+                dst_f.as_raw_fd(),
+                libc::FICLONE as libc::c_ulong,
+                src_f.as_raw_fd(),
+            )
+        };
+        if rc != 0 {
+            let err = io::Error::last_os_error();
+            drop(dst_f);
+            // Best-effort cleanup of the empty target so the copy fallback's
+            // `create_new` does not trip over it.
+            let _ = std::fs::remove_file(dst);
+            return Err(err);
+        }
+        Ok(())
+    }
+
+    /// Whether a `ficlone` failure means "this filesystem / placement cannot
+    /// reflink" (fall back to a byte copy) rather than a real I/O failure.
+    pub(super) fn clone_should_fall_back(err: &io::Error) -> bool {
+        // EOPNOTSUPP/ENOTSUP (95): FS has no reflink. EXDEV (18): cross-device.
+        // EINVAL (22): kernel/FS rejected the clone (e.g. non-reflink XFS).
+        const EOPNOTSUPP: i32 = 95;
+        const EXDEV: i32 = 18;
+        const EINVAL: i32 = 22;
+        matches!(err.raw_os_error(), Some(EOPNOTSUPP | EXDEV | EINVAL))
+            || matches!(
+                err.kind(),
+                io::ErrorKind::Unsupported | io::ErrorKind::CrossesDevices
+            )
+    }
+
+    /// Clears per-file `CoW` (`FS_NOCOW_FL`) on the asm-generic ioctl
+    /// architectures (the only ones where these constant values are correct).
+    /// A no-op on other architectures and on filesystems without the
+    /// inode-flags ioctl.
+    #[cfg(any(
+        target_arch = "x86",
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        target_arch = "riscv32",
+        target_arch = "riscv64",
+        target_arch = "loongarch64",
+        target_arch = "s390x"
+    ))]
+    pub(super) fn try_disable_cow(path: &Path) -> io::Result<()> {
+        // asm-generic `_IO*` encodings of FS_IOC_{GET,SET}FLAGS (size = 8 =
+        // sizeof(long)); FS_NOCOW_FL is the inode flag bit.
+        const FS_IOC_GETFLAGS: libc::c_ulong = 0x8008_6601;
+        const FS_IOC_SETFLAGS: libc::c_ulong = 0x4008_6602;
+        const FS_NOCOW_FL: libc::c_int = 0x0080_0000;
+
+        let f = OpenOptions::new().read(true).write(true).open(path)?;
+        let mut flags: libc::c_int = 0;
+        // SAFETY: valid fd; GETFLAGS writes one `int` through the pointer arg.
+        #[expect(unsafe_code, reason = "ioctl(FS_IOC_GETFLAGS) to read inode flags")]
+        let rc = unsafe { libc::ioctl(f.as_raw_fd(), FS_IOC_GETFLAGS, &raw mut flags) };
+        if rc != 0 {
+            return ignore_if_unsupported(io::Error::last_os_error());
+        }
+        if flags & FS_NOCOW_FL != 0 {
+            return Ok(()); // already NoCoW
+        }
+        flags |= FS_NOCOW_FL;
+        // SAFETY: valid fd; SETFLAGS reads one `int` through the pointer arg.
+        #[expect(unsafe_code, reason = "ioctl(FS_IOC_SETFLAGS) to set FS_NOCOW_FL")]
+        let rc = unsafe { libc::ioctl(f.as_raw_fd(), FS_IOC_SETFLAGS, &raw const flags) };
+        if rc != 0 {
+            return ignore_if_unsupported(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    #[cfg(not(any(
+        target_arch = "x86",
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        target_arch = "riscv32",
+        target_arch = "riscv64",
+        target_arch = "loongarch64",
+        target_arch = "s390x"
+    )))]
+    pub(super) fn try_disable_cow(_path: &Path) -> io::Result<()> {
+        // The FS_IOC_* constants above are only valid for the asm-generic ioctl
+        // encoding; on other arches leave `CoW` alone (optimization, not
+        // correctness).
+        Ok(())
+    }
+
+    /// Maps "filesystem does not support the inode-flags ioctl" errors to a
+    /// no-op success - disabling `CoW` is an optimization, never required.
+    #[cfg(any(
+        target_arch = "x86",
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        target_arch = "riscv32",
+        target_arch = "riscv64",
+        target_arch = "loongarch64",
+        target_arch = "s390x"
+    ))]
+    fn ignore_if_unsupported(err: io::Error) -> io::Result<()> {
+        // ENOTTY (25): ioctl not supported by this FS. EOPNOTSUPP/ENOTSUP (95):
+        // flag not supported. EPERM/EINVAL: FS rejected the flag.
+        const ENOTTY: i32 = 25;
+        const EOPNOTSUPP: i32 = 95;
+        const EINVAL: i32 = 22;
+        if matches!(err.raw_os_error(), Some(ENOTTY | EOPNOTSUPP | EINVAL))
+            || matches!(err.kind(), io::ErrorKind::Unsupported)
+        {
+            Ok(())
+        } else {
+            Err(err)
+        }
     }
 }
 
@@ -912,7 +1156,7 @@ mod tests {
 
         // Verifies flock() syscall succeeds without error. Testing actual
         // lock contention (try_lock from second thread) is out of scope for
-        // the Fs trait definition — belongs in integration tests.
+        // the Fs trait definition - belongs in integration tests.
         Ok(())
     }
 
@@ -1067,7 +1311,7 @@ mod tests {
         let bad_path = dir.path().join(bad_name);
         if std::fs::write(&bad_path, b"data").is_err() {
             // Filesystem rejected the non-UTF-8 filename (e.g. overlay,
-            // container mounts, restrictive mount options) — test
+            // container mounts, restrictive mount options) - test
             // precondition cannot be met, skip gracefully.
             return Ok(());
         }
@@ -1092,7 +1336,7 @@ mod tests {
     }
 
     /// Compile-time assertion: `Fs` is object-safe without specifying
-    /// associated types — enables simple `Arc<dyn Fs>` for per-level routing.
+    /// associated types - enables simple `Arc<dyn Fs>` for per-level routing.
     #[test]
     fn object_safety() -> io::Result<()> {
         let fs: Arc<dyn Fs> = Arc::new(StdFs);
@@ -1117,7 +1361,7 @@ mod tests {
         assert_eq!(std::fs::read(&dst)?, b"checkpoint payload");
 
         // Mutating the link changes both views (same inode), proving this
-        // was a true hard link, not a copy. We only check this on Unix —
+        // was a true hard link, not a copy. We only check this on Unix -
         // Windows hard links share content but inode equality is not
         // exposed through std.
         #[cfg(unix)]
@@ -1165,7 +1409,7 @@ mod tests {
 
     #[test]
     fn is_cross_device_detects_exdev_and_kind_variants() {
-        // Synthesise a raw EXDEV error — what Linux/macOS/BSDs return when
+        // Synthesise a raw EXDEV error - what Linux/macOS/BSDs return when
         // hard_link spans devices. `is_cross_device` must accept it so the
         // fallback copy path kicks in. Gated to Unix because errno 18 has
         // a different meaning on Windows (ERROR_NO_MORE_FILES) and the
@@ -1184,11 +1428,11 @@ mod tests {
         assert!(is_cross_device(&crosses));
 
         // ErrorKind::Unsupported covers Windows / exotic filesystems where
-        // hard links are simply not implemented — also a cue to fall back.
+        // hard links are simply not implemented - also a cue to fall back.
         let unsupported = io::Error::from(io::ErrorKind::Unsupported);
         assert!(is_cross_device(&unsupported));
 
-        // A garden-variety NotFound must NOT be misclassified — the caller
+        // A garden-variety NotFound must NOT be misclassified - the caller
         // needs to surface that error verbatim, not silently copy.
         let notfound = io::Error::from(io::ErrorKind::NotFound);
         assert!(!is_cross_device(&notfound));
@@ -1230,7 +1474,7 @@ mod tests {
     }
 
     /// On macOS the capability profile for any real directory must be either
-    /// the full APFS profile (copy-on-write + reflink + native snapshot — the
+    /// the full APFS profile (copy-on-write + reflink + native snapshot - the
     /// common case, including CI runners and `/var/folders` temp dirs) or the
     /// conservative all-false default (non-APFS mount). Never a partial mix.
     #[cfg(target_os = "macos")]
@@ -1276,7 +1520,7 @@ mod tests {
         assert_eq!(buf, b"reflink-source-data");
 
         // Overwrite the source; the clone must be unaffected (clonefile shares
-        // blocks copy-on-write, the fallback is a separate file — either way
+        // blocks copy-on-write, the fallback is a separate file - either way
         // independent).
         let mut w = fs.open(&src, &FsOpenOptions::new().write(true).truncate(true))?;
         w.write_all(b"changed")?;
@@ -1290,6 +1534,61 @@ mod tests {
             after, b"reflink-source-data",
             "reflink clone must be independent"
         );
+        Ok(())
+    }
+
+    /// Linux `reflink_file` must produce an independent, byte-identical clone
+    /// on any filesystem: `ioctl(FICLONE)` on Btrfs / XFS-reflink, the byte-copy
+    /// fallback on ext4 / tmpfs. Robust regardless of the CI runner's FS.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn reflink_file_linux_produces_independent_identical_copy() -> io::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let src = dir.path().join("src.bin");
+        let dst = dir.path().join("clone.bin");
+        let fs = StdFs;
+
+        let mut f = fs.open(&src, &FsOpenOptions::new().write(true).create_new(true))?;
+        f.write_all(b"reflink-source-data")?;
+        f.sync_all()?;
+        drop(f);
+
+        fs.reflink_file(&src, &dst)?;
+
+        let mut buf = Vec::new();
+        fs.open(&dst, &FsOpenOptions::new().read(true))?
+            .read_to_end(&mut buf)?;
+        assert_eq!(buf, b"reflink-source-data");
+
+        let mut w = fs.open(&src, &FsOpenOptions::new().write(true).truncate(true))?;
+        w.write_all(b"changed")?;
+        w.sync_all()?;
+        drop(w);
+
+        let mut after = Vec::new();
+        fs.open(&dst, &FsOpenOptions::new().read(true))?
+            .read_to_end(&mut after)?;
+        assert_eq!(
+            after, b"reflink-source-data",
+            "reflink clone must be independent"
+        );
+        Ok(())
+    }
+
+    /// Linux `try_disable_cow` must succeed on any filesystem: it sets
+    /// `FS_NOCOW_FL` on Btrfs and is a graceful no-op elsewhere (the
+    /// inode-flags ioctl is unsupported on tmpfs / ext4-without-the-flag), never
+    /// surfacing an error for a missing optimization.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn try_disable_cow_linux_succeeds_or_noops() -> io::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("sst.bin");
+        let fs = StdFs;
+        // Empty file, as at SST creation time (the flag only takes on an empty
+        // file).
+        fs.open(&path, &FsOpenOptions::new().write(true).create_new(true))?;
+        fs.try_disable_cow(&path)?;
         Ok(())
     }
 }
