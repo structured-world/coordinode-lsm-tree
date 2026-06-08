@@ -11,7 +11,7 @@
 ## 1. Goals
 
 - **Authenticated integrity** of every encrypted block under an AEAD construction (AES-256-GCM or ChaCha20-Poly1305). A bit flip in any byte of the encrypted payload or its surrounding metadata fails AEAD verification.
-- **Block-context binding** via AEAD's Additional Authenticated Data (AAD): the AAD includes the file's `table_id`, the block's `block_type`, the compression context (`compression_type`, dictionary id, window log), the transform-presence `block_flags`, and the AEAD `suite_id` + `key_epoch`. Swapping a block from a different table, a different block type, a different codec, or decrypting under a different key/suite fails AEAD verification. A block's byte offset and the owning tree id are deliberately NOT bound (see §5.3): position integrity is supplied by the authenticated index, and cross-tree isolation by per-tree encryption keys.
+- **Block-context binding** via AEAD's Additional Authenticated Data (AAD): the AAD includes the file's `table_id`, the block's `block_type`, the compression context (`compression_type`, dictionary id, window log), the plaintext-affecting `block_flags` bits (the outer `ECC_PARITY` bit is excluded — see §5.3), and the AEAD `suite_id` + `key_epoch`. Swapping a block from a different table, a different block type, a different codec, or decrypting under a different key/suite fails AEAD verification. A block's byte offset and the owning tree id are deliberately NOT bound (see §5.3): position integrity is supplied by the authenticated index, and cross-tree isolation by per-tree encryption keys.
 - **Crypto-agility:** the on-disk record carries an explicit `suite_id` byte so a deployment can rotate to a new AEAD without rewriting old data, and so a future suite can be added by registry update alone.
 - **Key rotation without rewrite:** the `key_epoch` byte indexes into a caller-managed key chain. Old blocks under epoch `N` stay readable as long as the corresponding key is still in the chain; new writes pick the latest epoch.
 - **Single-pass decode:** all *on-disk* metadata that feeds the AAD lives at known fixed offsets inside the MetadataFrame. The one remaining AAD field, `TableID`, is caller-supplied from the read context (the process knows which table it is reading) and is deliberately NOT on disk; see §5.3 (the caller-supplied vs on-disk contract) and the "Why not store them on disk" rationale in §5.1. Decode reads the metadata frame once, combines the on-disk fields with the caller-supplied `TableID` to form AAD, then verifies + decrypts the body frame.
@@ -35,7 +35,7 @@
 | **Block swap** across tables in the same tree (move a block from table A to table B) | Yes | AAD carries caller-supplied `table_id` (derived from the SST file's path / table metadata); decrypt under the wrong table_id fails. |
 | **Block swap** across trees (move a block from tree A to tree B) | Yes (via key isolation) | The owning tree id is NOT bound in AAD (`TreeId` is a process-ephemeral counter, not durable across reopen — see §5.3). Cross-tree substitution is instead prevented by per-tree key isolation: each tree owns a distinct encryption key, so a block sealed by tree A's key fails AEAD verification under tree B's key. (If a deployment were to share one key across trees, this row would be undefended — production MUST use per-tree keys.) |
 | **Block type swap** (relabel a Filter block as Data, e.g. to confuse a partial-decode path) | Yes | AAD carries `block_type`; decrypt under the wrong type fails |
-| **Transform-flag relabel** (flip a `block_flags` bit, e.g. clear the per-KV checksum footer bit so a verifying reader stops stripping/checking the footer, or set the compressed/encrypted bit) | Yes | AAD carries the whole `block_flags` byte; decrypt under any flipped transform bit fails. Closes the gap that `block_flags` lives in the plaintext `Block::Header` under a non-cryptographic XXH3 checksum an attacker could recompute. |
+| **Transform-flag relabel** (flip a `block_flags` bit, e.g. clear the per-KV checksum footer bit so a verifying reader stops stripping/checking the footer, or set the compressed/encrypted bit) | Yes | AAD carries the plaintext-affecting `block_flags` bits (KV_CHECKSUM_FOOTER / COMPRESSED / ENCRYPTED); flipping any of them fails decrypt. Closes the gap that those bits live in the plaintext `Block::Header` under a non-cryptographic XXH3 checksum an attacker could recompute. The `ECC_PARITY` bit is masked out of the AAD (outer parity framing); flipping it instead mis-strips the trailer so the AEAD runs over the wrong bytes and fails — caught, just one layer out. |
 | **Compression codec substitution** (relabel a zstd block as Lz4 or vice versa to confuse the decompressor selection step) | Yes | AAD carries `compression_type` (codec discriminator byte); decrypt under the wrong codec tag fails. Defends per-block codec rotation: an attacker cannot mix up old-codec and new-codec blocks during a policy migration. |
 | **Codec / decompression pipeline bug** (zstd / lz4 library version drift between write-time and read-time; non-deterministic decoder output; in-memory corruption between AEAD-verify and decompression-end producing wrong plaintext after a successful AEAD verify) | Yes (for compressed blocks) | Codec's built-in content checksum (zstd `Content_Checksum_flag` bit 2 / LZ4 `ContentChecksum` bit) is **required** per §4.11. The codec verifies this automatically during streaming decompression and fails on mismatch. For `CompressionType = None` this defence does not apply: there's no codec to drift, and AEAD primitives have no analogous version-drift failure mode, so AEAD-tag alone is sufficient. |
 | **Compression dictionary substitution** (decode under a different zstd dictionary to manipulate decompressed output) | Yes | AAD carries `dict_id`; structured-zstd's `FrameDecoder::expect_dict_id` cross-checks during inner-frame decode. Wiring lives in this repo's encoder/decoder issue #251; the matching enforcement on the structured-zstd side is tracked there as `S-ZSTD-T7`. |
@@ -155,16 +155,24 @@ Offset  Size  Field             Description
                                   bit 3 = ENCRYPTED
                                   others = reserved (MUST be 0 on write,
                                            IGNORED on read)
-                                On disk + bound in the AAD so an attacker
-                                cannot relabel the block's transform stack
-                                (e.g. clear the per-KV footer bit) under a
-                                forged non-cryptographic header checksum,
-                                the same anti-relabel rationale as BlockType
-                                / CompressionType. The full byte is mirrored
-                                verbatim; the COMPRESSED / ENCRYPTED bits are
-                                redundant with CompressionType / SuiteID but
-                                kept so the AAD is a faithful mirror with no
-                                masking logic.
+                                The plaintext-affecting bits
+                                (KV_CHECKSUM_FOOTER / COMPRESSED / ENCRYPTED)
+                                are bound in the AAD so an attacker cannot
+                                relabel the block's transform stack (e.g.
+                                clear the per-KV footer bit) under a forged
+                                non-cryptographic header checksum, the same
+                                anti-relabel rationale as BlockType /
+                                CompressionType. The COMPRESSED / ENCRYPTED
+                                bits are redundant with CompressionType /
+                                SuiteID but kept so the AAD mirrors them.
+                                EXCEPTION: the ECC_PARITY bit is MASKED OUT
+                                of the AAD — Reed-Solomon parity is OUTER
+                                framing computed over the encrypted payload
+                                and stripped before decrypt, so it is not
+                                part of the encrypted content. Its integrity
+                                is self-enforced: a flipped ECC_PARITY bit
+                                mis-strips the trailer, so the AEAD then runs
+                                over the wrong bytes and fails.
 19     NONCE_LEN  Nonce         Nonce bytes; length determined by SuiteID
                                 via the §7 registry (v1: 12 bytes for both
                                 AES-256-GCM and ChaCha20-Poly1305). The
@@ -234,13 +242,18 @@ Offset  Size  Field             Source
 17      4     DictID            u32 BE, mirror of MetadataFrame offset 13
                                 (disk)
 21      1     WindowLog         Mirror of MetadataFrame offset 17 (disk)
-22      1     BlockFlags        Mirror of MetadataFrame offset 18 (disk).
-                                Binds the block's transform-presence
-                                bitfield (KV footer / ECC / compressed /
-                                encrypted) so an attacker cannot relabel
-                                the transform stack — e.g. clear the per-KV
-                                checksum footer bit — under a forged
-                                non-cryptographic header checksum.
+22      1     BlockFlags        Mirror of MetadataFrame offset 18 (disk),
+                                with the ECC_PARITY bit MASKED OUT. Binds the
+                                plaintext-affecting transform bits (KV footer /
+                                compressed / encrypted) so an attacker cannot
+                                relabel the transform stack — e.g. clear the
+                                per-KV checksum footer bit — under a forged
+                                non-cryptographic header checksum. ECC_PARITY
+                                is excluded because Reed-Solomon parity is
+                                OUTER framing (computed over the encrypted
+                                payload, stripped before decrypt); a flipped
+                                ECC_PARITY bit mis-strips the trailer so the
+                                AEAD runs over wrong bytes and fails anyway.
 ═════════
 Total  23 bytes (NEVER written to disk, passed to AEAD as AAD only)
 ```

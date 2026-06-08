@@ -165,11 +165,22 @@ fn encrypt_block_payload(
     #[cfg(zstd_any)]
     {
         let plaintext = owned.as_deref().unwrap_or(borrow);
+        // The `ECC_PARITY` flag describes the Reed-Solomon parity trailer,
+        // which is OUTER framing: parity is computed over the (encrypted)
+        // payload AFTER this seal and stripped BEFORE decrypt, so the bit is
+        // not part of the encrypted content and must not enter the AAD. It is
+        // also unknown here (set only once the trailer is emitted, later in
+        // `prepare_with_flags`). Masking it keeps seal == verify regardless of
+        // pipeline ordering; its integrity is self-enforced (a flipped bit
+        // mis-strips the trailer, so the AEAD then runs over wrong bytes and
+        // fails). The plaintext-affecting transform bits (COMPRESSED /
+        // ENCRYPTED / KV_CHECKSUM_FOOTER) stay bound.
+        let aad_block_flags = block_flags & !crate::table::block::header::block_flags::ECC_PARITY;
         enc.encrypt_block_aad(
             plaintext,
             identity,
             compression_tag_byte(compression),
-            block_flags,
+            aad_block_flags,
         )
     }
     #[cfg(not(zstd_any))]
