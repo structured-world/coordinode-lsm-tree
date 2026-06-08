@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1780932543457,
+  "lastUpdate": 1780939754957,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -13884,6 +13884,84 @@ window.BENCHMARK_DATA = {
             "value": 561661.9946873066,
             "unit": "ops/sec",
             "extra": "P50: 1.6us | P99: 4.9us | P99.9: 7.3us\nthreads: 1 | elapsed: 0.36s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "3fe919917fecf662dd46d5f6c083418ca84ef06c",
+          "message": "test(compare): add surrealkv as a third bench engine (#425)\n\n## Summary\n\nAdds **SurrealKV** (`surrealdb/surrealkv`, Apache-2.0, pure-Rust\nembedded LSM/MVCC, git-pinned `v0.21.2`) as a third engine in the\n`compare-rocksdb` head-to-head harness, overlaid on the SAME criterion\ngraphs as `ours` and `rocksdb` (same `BenchmarkGroup`, third\n`BenchmarkId` per workload).\n\n## Changes\n\n- `Engine::SurrealKv` + `engines_for(compression)` — surrealkv overlays\nONLY on the `None`-compression groups (`write_throughput` / `point_read`\n/ `range_scan` / `seek_random` / `overwrite`). SurrealKV has no zstd\ncodec (its `CompressionType` is `None` / `Snappy` only), so the\n`_zstd22` and compaction groups stay ours-vs-rocksdb (a non-zstd line on\na zstd22 graph would misrepresent the comparison).\n- `open_surrealkv` / `populate_surrealkv` / `setup_surrealkv_warm` — the\nsurrealkv helpers return `Result` so the open/begin/set/commit I/O path\npropagates errors; each arm panics once with the engine label at the\nCriterion boundary (the closure can't return `Result`). `build()` spawns\nbackground compaction tasks via `tokio::spawn` and `commit()` is async,\nso open/commit run through `rt.block_on`. The warm\nread/scan/seek/overwrite arms get their runtime + populated tree from\n`setup_surrealkv_warm` (runtime drops after the tree, keeping its tasks\nalive for the timed reads); the cold `write_throughput` arm prebuilds\none runtime per variant so executor bootstrap is never charged to the\ntimed window. Writes commit with `Durability::Immediate` (fsync) — the\nflush-to-disk equivalent of ours' `flush_active_memtable` / rocksdb's\n`flush`.\n- Pure-Rust dep → no extra libclang/FFI burden (unlike rocksdb).\n`Cargo.lock` is gitignored for this crate, so only `Cargo.toml` +\n`compare.rs` change.\n\n## Fair-comparison caveats (documented in-code)\n\n- Both engines are MVCC (ours tags writes with a sequence number and\nreads a snapshot via `get(key, seqno)`; surrealkv versions per\ntransaction), so the write asymmetry is the write PATH, not \"MVCC vs\nflat\": surrealkv runs a real transaction (begin / set / commit) with a\nper-commit `Immediate` fsync plus vlog (KV-separation) and B+tree index\nupkeep, vs our seqno-tagged memtable inserts + one terminal flush. Read\nit as two MVCC LSMs with different transaction / index layers, not a\nbyte-for-byte equivalent setup.\n- Restricted to `None`-compression groups (no zstd codec).\n\n## Local results (3-way, None groups, this host)\n\n| Workload | ours | rocksdb | surrealkv |\n|---|---|---|---|\n| write_throughput 1k / 10k | 2.72 / 12.7 ms | 4.26 / 15.3 ms | 30.9 /\n43.8 ms |\n| point_read 1k / 10k | 1.15 / 13.5 ms | 1.00 / 10.8 ms | 0.284 / 4.13\nms |\n| range_scan 1k / 10k | 152 µs / 1.54 ms | 200 µs / 1.99 ms | 94 µs /\n1.19 ms |\n| seek_random 1k / 10k | 1.85 / 20.7 ms | 1.81 / 19.7 ms | 1.01 / 12.3\nms |\n| overwrite 1k | 1.54 ms | 1.45 ms | 6.25 ms |\n\nSurrealKV is markedly slower on writes (per-commit `Immediate` fsync +\ntransaction / vlog overhead) and faster on reads / scans / seeks (B+tree\nindex + KV-separation) — a useful Rust-native comparison point.\n\n## Note\n\nThe gh-pages bench dashboard will pick up the surrealkv overlay on the\nnext `compare-rocksdb` run, provided the bench runner can fetch the git\ndependency at build time.\n\nCloses #424\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n## Summary by CodeRabbit\n\n* **New Features**\n  * Added SurrealKV as a third engine in the benchmark comparison suite.\n* Extended benchmarks to include SurrealKV for write throughput, point\nreads, range scans, seeks, and overwrites.\n* Added async runtime support and warm setup to keep SurrealKV\nbackground tasks alive during timed phases.\n* Excluded SurrealKV from compression-specific compaction benches to\npreserve valid comparisons.\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-06-08T20:28:13+03:00",
+          "tree_id": "eca21ca5d9ffc2d601a4c5c08a0911410913f0aa",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/3fe919917fecf662dd46d5f6c083418ca84ef06c"
+        },
+        "date": 1780939747492,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 1985002.827239527,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.6us | P99.9: 3.7us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1223105.6646487666,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.3us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 671018.0914965846,
+            "unit": "ops/sec",
+            "extra": "P50: 1.3us | P99: 4.5us | P99.9: 6.9us\nthreads: 1 | elapsed: 0.30s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3688160.293642471,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 3.0us | P99.9: 5.4us\nthreads: 1 | elapsed: 0.05s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 431522.1306664115,
+            "unit": "ops/sec",
+            "extra": "P50: 2.0us | P99: 5.3us | P99.9: 8.2us\nthreads: 1 | elapsed: 0.46s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 218760.11539937355,
+            "unit": "ops/sec",
+            "extra": "P50: 4.3us | P99: 5.4us | P99.9: 7.7us\nthreads: 1 | elapsed: 0.91s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1235191.1008927869,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.2us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1123812.2688012626,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.5us | P99.9: 2.6us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 555734.9097354241,
+            "unit": "ops/sec",
+            "extra": "P50: 1.6us | P99: 4.9us | P99.9: 7.4us\nthreads: 1 | elapsed: 0.36s | num: 200000 | iterations: 3"
           }
         ]
       }
