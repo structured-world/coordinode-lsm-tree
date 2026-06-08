@@ -766,14 +766,16 @@ impl Config {
         // Reject an opaque-only provider here, at open time, instead of letting
         // it fail on the first encrypted read/write.
         #[cfg(zstd_any)]
-        if let Some(enc) = &self.encryption {
-            if !enc.supports_aad_block_path() {
-                return Err(crate::Error::Encrypt(
-                    "encryption provider does not implement the AAD-bound block path \
-                     (encrypt_block_aad / decrypt_block_aad) required for encrypted \
-                     blocks on a zstd build",
-                ));
-            }
+        if self
+            .encryption
+            .as_ref()
+            .is_some_and(|enc| !enc.supports_aad_block_path())
+        {
+            return Err(crate::Error::Encrypt(
+                "encryption provider does not implement the AAD-bound block path \
+                 (encrypt_block_aad / decrypt_block_aad) required for encrypted \
+                 blocks on a zstd build",
+            ));
         }
 
         Ok(if self.kv_separation_opts.is_some() {
