@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1780885176124,
+  "lastUpdate": 1780905130595,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -13650,6 +13650,84 @@ window.BENCHMARK_DATA = {
             "value": 306327.1489711045,
             "unit": "ops/sec",
             "extra": "P50: 2.9us | P99: 9.6us | P99.9: 17.1us\nthreads: 1 | elapsed: 0.65s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "d20870ba91454ec5acd0f09fa5af67e84c1b8eba",
+          "message": "perf(memtable): stop zeroing the arena, restore cheap fixed-block decode (#420)\n\n## Summary\n\n#417's geometric arena removed the small-memtable 64 MiB zeroing waste\nbut its buddy decode (branch + `ilog2` + per-block size math) is far\ncostlier than the previous fixed-block `cur >> SHIFT / & MASK` on the\nalloc/decode hot path. Skiplist traversal is decode-bound, so the\ndb_bench trend shows **fillseq dropping ~33% (2.02M → 1.35M ops/sec) at\nthe #417 commit**, and reads regressed too.\n\nThis matches RocksDB's arena (`memory/arena.cc`: `AllocateNewBlock` uses\nan uninitialized `new char[]`, with an explicit comment that\n`make_unique`'s zero-init is \"not appropriate\"):\n\n- **Allocate blocks with `alloc`, not `alloc_zeroed`** — no eager\nzeroing. The 64 MiB-bzero-per-flush #417 was trying to avoid simply\nnever happens; lazy page-faulting zero-fills only the pages actually\ntouched.\n- **Revert to the fixed-block decode** (`cur >> SHIFT / & MASK`) —\nrestores the cheap hot path that #417's buddy geometry regressed.\n\n### Why uninitialized memory is sound\n\nThe skiplist already initializes every regular node fully before\npublishing it: the header + key/value fields in `alloc_node`, and all\n`[0, height)` tower slots in `insert` (release store, then CAS-link at\nthat level). No reader observes an unwritten slot. Two small fixes\ncomplete the contract:\n\n- the head sentinel's full tower is now explicitly UNSET-initialized at\ncreation (it previously relied on arena zeroing);\n- `alloc_node` zeroes the previously-reserved header padding.\n\n`ValueStore` is a separate store with its own `alloc_zeroed` and is\nunchanged.\n\n## Validation\n\n- Arena + skiplist + memtable suites pass.\n- **miri clean** on the arena (incl. concurrent alloc) and\nsingle-threaded skiplist insert / range / reverse paths — no\nuninitialized-read UB.\n- Local fillseq A/B (same machine): this branch 3.55M vs main 3.34M\nops/sec — recovers the direction (the larger db_bench delta will show on\nthe trend post-merge), while keeping the overwrite win (no eager bzero).\n- `clippy --all-features` + `--no-default-features --features zstd,lz4`\nclean; no-std `alloc` count unchanged.\n\nCloses #419\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n\n## Summary by CodeRabbit\n\n* **Refactor**\n* Restructured internal memory allocation strategy with fixed-size\nblocks for improved predictability and resource efficiency.\n* Optimized memory initialization and encoding mechanisms in memory\nmanagement subsystem.\n\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-06-08T10:51:09+03:00",
+          "tree_id": "e52c075ada57f173d4c1cb44752fb8cabb9e3288",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/d20870ba91454ec5acd0f09fa5af67e84c1b8eba"
+        },
+        "date": 1780905124954,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 2083216.4345111176,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.6us | P99.9: 3.7us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1193352.197685761,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.2us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 622473.938510132,
+            "unit": "ops/sec",
+            "extra": "P50: 1.5us | P99: 4.4us | P99.9: 6.8us\nthreads: 1 | elapsed: 0.32s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3707230.309514249,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 2.9us | P99.9: 5.3us\nthreads: 1 | elapsed: 0.05s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 426552.60991119733,
+            "unit": "ops/sec",
+            "extra": "P50: 2.1us | P99: 5.3us | P99.9: 8.0us\nthreads: 1 | elapsed: 0.47s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 219341.35148073017,
+            "unit": "ops/sec",
+            "extra": "P50: 4.3us | P99: 5.5us | P99.9: 8.1us\nthreads: 1 | elapsed: 0.91s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1256558.9155459276,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.1us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1120443.4526951266,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.4us | P99.9: 2.1us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 545247.4926759972,
+            "unit": "ops/sec",
+            "extra": "P50: 1.6us | P99: 6.2us | P99.9: 9.6us\nthreads: 1 | elapsed: 0.37s | num: 200000 | iterations: 3"
           }
         ]
       }
