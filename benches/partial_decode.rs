@@ -29,7 +29,8 @@ fn key(i: u64) -> Vec<u8> {
 /// is the signal that matters for the partial-decode path (a cold-block decode
 /// is a tail event), so it is surfaced explicitly rather than hidden in a mean.
 fn run_window_reads(tree: &lsm_tree::AnyTree, iters: u64, stride: u64) -> Duration {
-    let mut lat_us: Vec<u64> = Vec::with_capacity(iters as usize);
+    let mut lat_us: Vec<u64> =
+        Vec::with_capacity(usize::try_from(iters).expect("iters fits usize"));
     let mut lo = 0u64;
     let batch_start = Instant::now();
     for _ in 0..iters {
@@ -38,7 +39,7 @@ fn run_window_reads(tree: &lsm_tree::AnyTree, iters: u64, stride: u64) -> Durati
         for g in tree.range(key(lo)..key(lo + SPAN), SeqNo::MAX, None) {
             std::hint::black_box(g.key().unwrap());
         }
-        lat_us.push(t0.elapsed().as_micros() as u64);
+        lat_us.push(u64::try_from(t0.elapsed().as_micros()).expect("elapsed micros fits u64"));
     }
     let elapsed = batch_start.elapsed();
     if !lat_us.is_empty() {

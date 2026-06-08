@@ -227,8 +227,11 @@ mod tests {
         buf.extend_from_slice(&1u32.to_le_bytes()); // inner_count = 1 (invalid)
         buf.extend_from_slice(&100u32.to_le_bytes()); // one end offset
         assert!(
-            BlockLayoutMap::decode(&buf).is_err(),
-            "inner_count < 2 must be rejected",
+            matches!(
+                BlockLayoutMap::decode(&buf),
+                Err(crate::Error::InvalidHeader("BlockLayout"))
+            ),
+            "inner_count < 2 must surface as InvalidHeader(\"BlockLayout\")",
         );
     }
 
