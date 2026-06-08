@@ -252,8 +252,6 @@ impl Arena {
 
     /// Decodes an encoded offset into `(block_base_ptr, within_block_offset)`.
     ///
-    /// Decodes an encoded offset into `(block_base_ptr, within_block_offset)`.
-    ///
     /// Hot path: single `Acquire` load returns the cached block pointer.
     /// Cold path: spins until the block pointer becomes visible (another
     /// thread's `ensure_block` is in progress).
