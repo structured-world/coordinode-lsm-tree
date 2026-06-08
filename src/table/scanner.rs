@@ -40,6 +40,10 @@ pub struct Scanner {
     /// Table id of the SST being scanned; threaded through to
     /// per-block reads via `BlockIdentity`.
     table_id: crate::TableId,
+
+    /// Owning tree id, threaded into per-block `BlockIdentity` so encrypted
+    /// blocks decrypt under the same AAD the writer sealed.
+    tree_id: crate::tree::inner::TreeId,
 }
 
 impl Scanner {
@@ -60,6 +64,7 @@ impl Scanner {
         has_kv_footer: bool,
         #[cfg(zstd_any)] zstd_dictionary: Option<Arc<crate::compression::ZstdDictionary>>,
         comparator: SharedComparator,
+        tree_id: crate::tree::inner::TreeId,
         table_id: crate::TableId,
     ) -> crate::Result<Self> {
         // 2 MiB buffer matches RocksDB's `compaction_readahead_size`
@@ -85,6 +90,7 @@ impl Scanner {
 
         let block = Self::fetch_next_block(
             &mut reader,
+            tree_id,
             table_id,
             compression,
             encryption.as_deref(),
@@ -115,11 +121,19 @@ impl Scanner {
             zstd_dictionary,
 
             table_id,
+            tree_id,
         })
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "per-block read threads each piece of decode state (tree/table id, codec, \
+                  encryption, ecc, kv-footer, dict) needed to build the BlockIdentity + \
+                  transform; a config struct would add indirection without removing a decision"
+    )]
     fn fetch_next_block(
         reader: &mut BufReader<File>,
+        tree_id: crate::tree::inner::TreeId,
         table_id: crate::TableId,
         compression: CompressionType,
         encryption: Option<&dyn EncryptionProvider>,
@@ -130,7 +144,7 @@ impl Scanner {
         let block = Block::from_reader(
             reader,
             crate::table::block::BlockIdentity {
-                tree_id: 0,
+                tree_id,
                 table_id,
                 // Sequential scan via from_reader: BufReader<File>
                 // does implement Seek (and could report position
@@ -207,6 +221,7 @@ impl Iterator for Scanner {
             // Init new block
             let block = match Self::fetch_next_block(
                 &mut self.reader,
+                self.tree_id,
                 self.table_id,
                 self.compression,
                 self.encryption.as_deref(),

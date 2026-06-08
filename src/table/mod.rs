@@ -867,6 +867,7 @@ impl Table {
             #[cfg(zstd_any)]
             self.zstd_dictionary.clone(),
             self.comparator.clone(),
+            self.global_id().tree_id(),
             self.metadata.id,
         )
     }
@@ -935,6 +936,7 @@ impl Table {
     fn read_tli(
         regions: &ParsedRegions,
         file: &dyn FsFile,
+        tree_id: TreeId,
         table_id: TableId,
         compression: CompressionType,
         encryption: Option<&dyn crate::encryption::EncryptionProvider>,
@@ -959,7 +961,15 @@ impl Table {
         // `tli_tail`; reader falls straight through to the head copy.
         if let Some(tail_handle) = regions.tli_tail {
             log::trace!("Reading TLI tail mirror, with tli_tail_ptr={tail_handle:?}");
-            match Self::read_tli_at(file, tail_handle, table_id, compression, encryption, ecc) {
+            match Self::read_tli_at(
+                file,
+                tail_handle,
+                tree_id,
+                table_id,
+                compression,
+                encryption,
+                ecc,
+            ) {
                 Ok(idx) => return Ok(idx),
                 Err(tail_err) => {
                     log::warn!(
@@ -976,6 +986,7 @@ impl Table {
                     return match Self::read_tli_at(
                         file,
                         regions.tli,
+                        tree_id,
                         table_id,
                         compression,
                         encryption,
@@ -994,12 +1005,21 @@ impl Table {
         }
 
         log::trace!("Reading TLI head copy, with tli_ptr={:?}", regions.tli);
-        Self::read_tli_at(file, regions.tli, table_id, compression, encryption, ecc)
+        Self::read_tli_at(
+            file,
+            regions.tli,
+            tree_id,
+            table_id,
+            compression,
+            encryption,
+            ecc,
+        )
     }
 
     fn read_tli_at(
         file: &dyn FsFile,
         handle: BlockHandle,
+        tree_id: TreeId,
         table_id: TableId,
         compression: CompressionType,
         encryption: Option<&dyn crate::encryption::EncryptionProvider>,
@@ -1009,7 +1029,7 @@ impl Table {
             file,
             handle,
             crate::table::block::BlockIdentity {
-                tree_id: 0,
+                tree_id,
                 table_id,
                 // Match the writer: both `tli` and `tli_tail` are
                 // emitted with `block_offset: 0` (the partitioned /
@@ -1175,6 +1195,7 @@ impl Table {
             let block = Self::read_tli(
                 &regions,
                 file_handle.as_ref(),
+                tree_id,
                 metadata.id,
                 metadata.index_block_compression,
                 encryption.as_deref(),
@@ -1204,6 +1225,7 @@ impl Table {
             let block = Self::read_tli(
                 &regions,
                 file_handle.as_ref(),
+                tree_id,
                 metadata.id,
                 metadata.index_block_compression,
                 encryption.as_deref(),
@@ -1234,7 +1256,7 @@ impl Table {
                 file_handle.as_ref(),
                 filter_tli_handle,
                 crate::table::block::BlockIdentity {
-                    tree_id: 0,
+                    tree_id,
                     table_id: metadata.id,
                     block_offset: *filter_tli_handle.offset(),
                     block_type: BlockType::Index,
@@ -1285,7 +1307,7 @@ impl Table {
                         file_handle.as_ref(),
                         filter_handle,
                         crate::table::block::BlockIdentity {
-                            tree_id: 0,
+                            tree_id,
                             table_id: metadata.id,
                             block_offset: *filter_handle.offset(),
                             block_type: BlockType::Filter,
@@ -1334,7 +1356,7 @@ impl Table {
                 file_handle.as_ref(),
                 rt_handle,
                 crate::table::block::BlockIdentity {
-                    tree_id: 0,
+                    tree_id,
                     table_id: metadata.id,
                     block_offset: *rt_handle.offset(),
                     block_type: BlockType::RangeTombstone,
@@ -1390,7 +1412,7 @@ impl Table {
                 file_handle.as_ref(),
                 bl_handle,
                 crate::table::block::BlockIdentity {
-                    tree_id: 0,
+                    tree_id,
                     table_id: metadata.id,
                     block_offset: *bl_handle.offset(),
                     block_type: BlockType::BlockLayout,
