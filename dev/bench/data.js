@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1780905130595,
+  "lastUpdate": 1780910888492,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -13728,6 +13728,84 @@ window.BENCHMARK_DATA = {
             "value": 545247.4926759972,
             "unit": "ops/sec",
             "extra": "P50: 1.6us | P99: 6.2us | P99.9: 9.6us\nthreads: 1 | elapsed: 0.37s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "44288a0de7021c11aab31e8a6a3bc7a33bcd6c00",
+          "message": "feat(manifest): incremental manifest via append-only edit log (#421)\n\n## Summary\n\nReplaces the full-manifest-rewrite-per-version with a **snapshot +\nappend-only edit log** model. The old path serialized **every SST** into\na new `v{id}` file on every flush and compaction (`O(all-SSTs)`); the\nnew path appends one framed `VersionEdit` describing only the changed\nlevels (`O(changed-levels)`), rotating to a fresh snapshot only when the\nlog passes a configurable threshold.\n\nThis closes the second-largest overwrite/flush perf gap (the per-flush\nmanifest cost that grows with the number of SSTs).\n\n## How it works\n\n- A manifest generation = full snapshot `v{snapshot_id}` + append-only\n`edits-{snapshot_id}` log of `VersionEdit` deltas.\n- Each version upgrade appends one edit and fsyncs. Once the log passes\n`Config::manifest_log_rotate_bytes` (default 1 MiB) the next upgrade\nrotates: writes a fresh snapshot, repoints `CURRENT` atomically, then\ndeletes the previous snapshot + log. `CURRENT` only changes on rotation.\n- A `VersionEdit` carries the **full new run layout** of every changed\nlevel (`ChangedLevel { level, runs }`) — run grouping is load-bearing\nfor recovery, so a flat add/remove-id delta would lose it. Table removal\nis implicit; blob files keep a per-id delta.\n- Every record is framed (`len + xxh3_64 + payload`); a\npower-loss-truncated or bit-flipped trailing edit is detected and\ndropped on replay.\n- Recovery loads the snapshot `CURRENT` names, replays its log, applies\neach edit. The durable prefix is always recovered: a torn trailing edit\n(unacknowledged write) is dropped, and any prefix is internally\nconsistent (edits apply in order and reference tables fsynced before\ntheir edit landed).\n- Orphan cleanup preserves `v{snapshot_id}` + `edits-{snapshot_id}` and\nsweeps any `v*`/`edits-*` a crashed rotation leaked; manifest GC no\nlonger deletes the live snapshot; `repair` drops any stale edit log so\nits rebuilt snapshot is a clean standalone generation.\n\n## Performance (local ours-vs-ours, 300 small flushes, ×2)\n\n| metric | main | this branch | delta |\n|---|---|---|---|\n| total | ~316 ms | ~219 ms | **−31%** |\n| median flush | ~975 µs | ~653 µs | **−33%** |\n| p99 flush | ~1.71 ms | ~1.41 ms | **−18%** |\n\nPer-flush manifest cost drops ~33%; the gain scales with the number of\nSSTs the old full-rewrite had to serialize. Authoritative vs-RocksDB\nnumbers come from the CI `compare-rocksdb` overwrite benchmark /\ndashboard.\n\n## On-disk format\n\nV5 is pre-release and amended in-place, so no format-version bump. No\nbreaking change for any released version.\n\n## Testing\n\n- New: torn-edit-log-tail crash recovery (durable-prefix contract),\nsnapshot rotation + old-generation GC, append-model version-file\nlifecycle, diff/apply unit coverage (run-layout reconstruction, blob\nadd/update/remove, GC overwrite).\n- Full regression green locally: 1118 lib unit + recovery/reopen +\ncompaction/blob/ingest + repair/checkpoint + zstd + tree/mvcc suites.\n`clippy --all-features` (lib + tests) clean.\n\nRefs #418\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n## Summary by CodeRabbit\n\n* **New Features**\n* Configurable manifest log-rotation threshold and incremental edit\nlogging for manifests.\n\n* **Improvements**\n* Recovery replays incremental edit logs on top of snapshots and\npreserves the on-disk CURRENT snapshot during GC.\n* Orphan cleanup now removes leaked snapshot manifests and stale edit\nlogs while keeping the live snapshot’s files.\n* Manifest persistence now rotates to full snapshots when logs exceed\nthe configured threshold.\n\n* **Bug Fixes**\n* Repair now removes stale per-snapshot edit logs (tolerating missing\nfiles) to avoid leftover edits.\n\n* **Tests**\n* New tests for edit-log replay, torn-tail handling, snapshot rotation,\nand GC behavior.\n\n* **Chores**\n  * Updated structured-zstd dependency to 0.0.33.\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-06-08T12:27:09+03:00",
+          "tree_id": "8cdb6701b4ddccd7bc2734c8431f6f3bc42d20e8",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/44288a0de7021c11aab31e8a6a3bc7a33bcd6c00"
+        },
+        "date": 1780910882577,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 2022319.8384773147,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.6us | P99.9: 3.7us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1210951.4990250538,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.3us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 649078.5547775275,
+            "unit": "ops/sec",
+            "extra": "P50: 1.4us | P99: 4.4us | P99.9: 6.8us\nthreads: 1 | elapsed: 0.31s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3704267.8499777447,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 3.0us | P99.9: 5.4us\nthreads: 1 | elapsed: 0.05s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 434929.2933273191,
+            "unit": "ops/sec",
+            "extra": "P50: 2.0us | P99: 5.2us | P99.9: 8.0us\nthreads: 1 | elapsed: 0.46s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 218842.80733645387,
+            "unit": "ops/sec",
+            "extra": "P50: 4.3us | P99: 5.4us | P99.9: 7.9us\nthreads: 1 | elapsed: 0.91s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1185052.2767443575,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.2us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1151110.7781587136,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 1.4us | P99.9: 2.5us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 556956.8667678556,
+            "unit": "ops/sec",
+            "extra": "P50: 1.6us | P99: 4.9us | P99.9: 7.3us\nthreads: 1 | elapsed: 0.36s | num: 200000 | iterations: 3"
           }
         ]
       }
