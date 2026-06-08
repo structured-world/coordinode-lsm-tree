@@ -605,6 +605,30 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn default_aad_block_methods_reject_unsupported_provider() {
+        // A provider that implements only the opaque surface (no AAD
+        // override) must surface a typed error from the AAD-bound block
+        // entry points rather than silently mis-encrypting: the trait
+        // defaults return `Encrypt` / `Decrypt`. This pins the contract
+        // that only AAD-capable providers may serve the block path.
+        let provider = XorProvider;
+        let identity =
+            crate::table::block::BlockIdentity::for_test(0, crate::table::block::BlockType::Data);
+
+        let enc = provider.encrypt_block_aad(b"plaintext", &identity, 0, 0);
+        assert!(
+            matches!(enc, Err(crate::Error::Encrypt(_))),
+            "default encrypt_block_aad must reject, got {enc:?}"
+        );
+
+        let dec = provider.decrypt_block_aad(b"ciphertext", &identity);
+        assert!(
+            matches!(dec, Err(crate::Error::Decrypt(_))),
+            "default decrypt_block_aad must reject, got {dec:?}"
+        );
+    }
+
     #[cfg(feature = "encryption")]
     mod aes256gcm {
         use super::*;
