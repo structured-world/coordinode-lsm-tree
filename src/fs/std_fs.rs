@@ -297,9 +297,9 @@ impl Fs for StdFs {
     /// macOS: detects APFS (the common macOS filesystem with copy-on-write,
     /// reflink, and native snapshots) via `statfs(2)`'s `f_fstypename`. Other
     /// macOS filesystems (HFS+, exFAT, SMB/NFS mounts) and any detection failure
-    /// report the conservative default. Linux FS detection (Btrfs, ZFS,
-    /// XFS-reflink via `statfs` `f_type`) lands in a follow-up increment;
-    /// non-macOS targets currently use the trait's conservative default.
+    /// report the conservative default. (Linux has its own `statfs` `f_type`
+    /// detection in the `target_os = "linux"` variant of this method below;
+    /// other targets fall back to the trait's conservative default.)
     #[cfg(target_os = "macos")]
     fn capabilities(&self, path: &Path) -> super::FsCapabilities {
         macos_caps::capabilities(path)

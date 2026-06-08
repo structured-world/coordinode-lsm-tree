@@ -872,32 +872,6 @@ mod tests {
     use std::sync::Arc;
 
     #[test]
-    fn fs_aware_builders_thread_to_initial_runtime_config() {
-        // The CoW-disable + reflink toggles default ON and flip via the builder
-        // (AC: "controlled via builder"). This verifies the builder threads to
-        // the initial RuntimeConfig the Tree opens with — a regression in the
-        // wiring would silently ignore the user's setting.
-        let folder = tempfile::tempdir().unwrap();
-        let mk = || {
-            Config::new(
-                folder.path(),
-                SequenceNumberCounter::default(),
-                SequenceNumberCounter::default(),
-            )
-        };
-
-        let dflt = mk();
-        assert!(dflt.initial_runtime_config.disable_cow_on_sst_files);
-        assert!(dflt.initial_runtime_config.use_reflink_for_checkpoint);
-
-        let off = mk()
-            .disable_cow_on_sst_files(false)
-            .use_reflink_for_checkpoint(false);
-        assert!(!off.initial_runtime_config.disable_cow_on_sst_files);
-        assert!(!off.initial_runtime_config.use_reflink_for_checkpoint);
-    }
-
-    #[test]
     fn blob_zstd_dict_no_dict_is_rejected() {
         // ZstdDict compression for blobs without providing a dictionary must fail.
         let folder = tempfile::tempdir().unwrap_or_else(|err| panic!("tempdir failed: {err}"));
@@ -1600,6 +1574,34 @@ mod builder_tests {
 
         assert_eq!(cfg.data_block_restart_interval_policy.first(), Some(&7));
         assert_eq!(cfg.index_block_restart_interval_policy.first(), Some(&3));
+    }
+
+    #[test]
+    fn fs_aware_builders_thread_to_initial_runtime_config() -> crate::Result<()> {
+        // The CoW-disable + reflink toggles default ON and flip via the builder
+        // (AC: "controlled via builder"). Verifies the builder threads to the
+        // initial RuntimeConfig the Tree opens with; a wiring regression would
+        // silently ignore the user's setting. Lives in the ungated builder
+        // tests (the behaviour is unrelated to zstd).
+        let folder = tempfile::tempdir()?;
+        let mk = || {
+            Config::new(
+                folder.path(),
+                SequenceNumberCounter::default(),
+                SequenceNumberCounter::default(),
+            )
+        };
+
+        let dflt = mk();
+        assert!(dflt.initial_runtime_config.disable_cow_on_sst_files);
+        assert!(dflt.initial_runtime_config.use_reflink_for_checkpoint);
+
+        let off = mk()
+            .disable_cow_on_sst_files(false)
+            .use_reflink_for_checkpoint(false);
+        assert!(!off.initial_runtime_config.disable_cow_on_sst_files);
+        assert!(!off.initial_runtime_config.use_reflink_for_checkpoint);
+        Ok(())
     }
 
     #[test]

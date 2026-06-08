@@ -785,16 +785,34 @@ pub(crate) fn copy_file_streamed<F: Fs + ?Sized>(fs: &F, src: &Path, dst: &Path)
     // Heap buffer (not a 64 KiB stack array) - keeps the cold-path clone off
     // the stack and satisfies the large-stack-array lint.
     let mut buf = vec![0u8; 64 * 1024].into_boxed_slice();
-    loop {
-        let n = src_file.read(&mut buf)?;
-        if n == 0 {
-            break;
+
+    // Run the copy in a closure so any failure leaves the original error AND
+    // lets us best-effort remove the partial `dst` before propagating —
+    // otherwise a mid-copy ENOSPC/EIO leaves a partial file and a retry trips
+    // `create_new`'s AlreadyExists for an unrelated reason. Reads retry on
+    // EINTR so a signal during the copy doesn't spuriously fail it. Mirrors
+    // `checkpoint::link_or_copy_cross_fs`'s streamed-copy contract.
+    let result: io::Result<()> = (|| {
+        loop {
+            let n = match src_file.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            };
+            let chunk = buf.get(..n).ok_or_else(|| {
+                io::Error::other("read returned more bytes than the buffer holds")
+            })?;
+            dst_file.write_all(chunk)?;
         }
-        let chunk = buf
-            .get(..n)
-            .ok_or_else(|| io::Error::other("read returned more bytes than the buffer holds"))?;
-        dst_file.write_all(chunk)?;
+        dst_file.sync_all()?;
+        Ok(())
+    })();
+
+    if let Err(e) = result {
+        drop(dst_file);
+        let _ = fs.remove_file(dst);
+        return Err(e);
     }
-    dst_file.sync_all()?;
     Ok(())
 }
