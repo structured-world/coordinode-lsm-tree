@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1780939754957,
+  "lastUpdate": 1780945016244,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -13962,6 +13962,84 @@ window.BENCHMARK_DATA = {
             "value": 555734.9097354241,
             "unit": "ops/sec",
             "extra": "P50: 1.6us | P99: 4.9us | P99.9: 7.4us\nthreads: 1 | elapsed: 0.36s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "1edf60bf79d37f0c4093ea667fcafa91bb81670b",
+          "message": "test(compare): honest L3 compaction baseline vs RocksDB (#427)\n\n## Summary\n\nMakes the `compare-rocksdb` compaction / sub-compaction benches an\nhonest apples-to-apples comparison. The previous groups reported RocksDB\nas 3-13× faster on the sub-compaction path; that turned out to be a\nbenchmark artifact, not a real gap.\n\n## Root cause\n\nRocksDB's **manual** compaction (`compact_range`) diverged from our\n`major_compact` in two ways:\n\n1. **`bottommost_level_compaction` defaults to\n`kIfHaveCompactionFilter`** — with no compaction filter, RocksDB leaves\nan overwrite at a higher level (reads still see it, newest-seqno wins)\ninstead of rewriting the already-bottommost data. The timed\nsub-compaction was therefore a near-no-op while ours did the full\nmerge-into-bottom.\n2. **The configured `compression_opts.level` does not reach the\nbottommost level** — RocksDB compresses bottommost output at zstd's\ndefault level (3). The only override\n(`set_bottommost_compression_options`) cannot carry `parallel_threads`,\nso forcing a higher level there drops RocksDB to single-threaded — not\napples-to-apples either.\n\nEvidence: after forcing the bottommost rewrite, RocksDB sub-compaction\nat \"zstd1\" (55 ms) vs \"zstd22\" (199 ms) differed only ~3.6×, where a\ngenuine L1→L22 codec step is ~50× — confirming the bottommost output was\nnever compressed at the configured level.\n\n## Changes\n\n- Force the bottommost rewrite on both compaction arms via\n`compact_range_opt` + `BottommostLevelCompaction::Force`, so RocksDB\ndoes the same full merge-into-bottom as ours.\n- Pin the compaction + sub-compaction comparison to **zstd level 3** —\nthe level RocksDB actually applies to bottommost output — with **both\nengines at 4-thread** block compression (RocksDB inherits the threads\nfrom `compression_opts`; ours via `compaction_threads`). No\nbottommost-level override needed, so neither side is artificially\nsingle-threaded.\n- Drop the misleading `*_zstd1` / `*_zstd22` compaction groups\n(ours-L1/L22 vs rocksdb-de-facto-L3) in favour of one honest `*_zstd3`\ngroup per type.\n\n## Result (40k keys, level 3, 4 threads)\n\n| bench | ours | rocksdb | verdict |\n|---|---|---|---|\n| `major_compact_zstd3` (single-stream) | ~43 ms | ~65 ms | ours ~1.5×\nfaster |\n| `subcompaction_zstd3` (range-split) | ~70 ms | ~55 ms | ours ~1.27×\nslower |\n\nThe \"3-13×\" gap was the artifact. Honest baseline: our single-stream\ncompaction beats RocksDB; only the **range-split sub-compaction\ncoordination** remains modestly behind — the real optimization target\n(flamegraph follow-up).\n\n## Testing\n\n- `cargo clippy --benches -- -D warnings` clean, `cargo fmt --check`\nclean.\n- Bench-harness only; no library code changed.\n\nPart of #410 (bench fairness / apples-to-apples verification; the\nrange-split sub-compaction optimization remains open under #410).",
+          "timestamp": "2026-06-08T21:55:54+03:00",
+          "tree_id": "7d9a051e6e05f8e4bf4a2e78188f002fdb79bbab",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/1edf60bf79d37f0c4093ea667fcafa91bb81670b"
+        },
+        "date": 1780945007759,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 1933474.7225393683,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.6us | P99.9: 3.7us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1224680.8786269666,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.3us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 659972.861123983,
+            "unit": "ops/sec",
+            "extra": "P50: 1.4us | P99: 4.5us | P99.9: 7.0us\nthreads: 1 | elapsed: 0.30s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3672134.4994171956,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 3.0us | P99.9: 5.5us\nthreads: 1 | elapsed: 0.05s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 436662.092522082,
+            "unit": "ops/sec",
+            "extra": "P50: 2.0us | P99: 5.2us | P99.9: 8.1us\nthreads: 1 | elapsed: 0.46s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 216541.3353567995,
+            "unit": "ops/sec",
+            "extra": "P50: 4.3us | P99: 5.4us | P99.9: 7.9us\nthreads: 1 | elapsed: 0.92s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1201595.89478127,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.2us | P99.9: 4.2us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1137238.0949196685,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.5us | P99.9: 2.6us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 563037.2032969184,
+            "unit": "ops/sec",
+            "extra": "P50: 1.6us | P99: 5.0us | P99.9: 7.5us\nthreads: 1 | elapsed: 0.36s | num: 200000 | iterations: 3"
           }
         ]
       }
