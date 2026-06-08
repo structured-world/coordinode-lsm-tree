@@ -143,10 +143,14 @@ fn open_surrealkv(
 /// groups start from an on-disk state. `commit()` is async; driven via
 /// `rt.block_on`.
 ///
-/// NOTE: SurrealKV is versioned/MVCC — a single committed write per key here, so
-/// there is no extra version history, but its write path still carries MVCC
-/// bookkeeping the flat-LSM engines do not. Read this in the comparison as
-/// "Rust-native LSM with MVCC semantics", not a byte-for-byte equivalent setup.
+/// NOTE: both engines are MVCC — ours tags every write with a sequence number
+/// and reads a snapshot via `get(key, seqno)`; surrealkv versions per
+/// transaction. So the write asymmetry here is NOT "MVCC vs flat": it is the
+/// write PATH. surrealkv runs a real transaction (begin / set / commit) with a
+/// per-commit `Immediate` fsync, plus vlog (KV-separation) and B+tree index
+/// upkeep, whereas our arm does seqno-tagged memtable inserts + one terminal
+/// flush. Read the comparison as two MVCC LSMs with different transaction /
+/// index layers, not a byte-for-byte equivalent setup.
 fn populate_surrealkv(
     rt: &tokio::runtime::Runtime,
     dir: &std::path::Path,
