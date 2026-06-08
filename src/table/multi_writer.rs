@@ -784,6 +784,7 @@ mod tests {
                 *checksum,
                 0,
                 0,
+                0,
                 cache.clone(),
                 None,
                 Arc::new(StdFs),
@@ -873,6 +874,7 @@ mod tests {
             tables.push(crate::Table::recover(
                 base_path.join(table_id.to_string()),
                 *checksum,
+                0,
                 0,
                 0,
                 cache.clone(),

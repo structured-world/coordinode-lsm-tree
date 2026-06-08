@@ -1248,6 +1248,7 @@ impl Writer {
             &mut self.block_buffer,
             self.encryption.as_deref(),
             self.ecc,
+            self.table_id,
             &meta_params,
         )?;
 
@@ -1357,6 +1358,7 @@ impl Writer {
             &mut self.block_buffer,
             self.encryption.as_deref(),
             self.ecc,
+            self.table_id,
             &meta_params,
         )?;
 
@@ -1504,6 +1506,7 @@ fn write_meta_section<W: std::io::Write + std::io::Seek>(
     block_buffer: &mut Vec<u8>,
     encryption: Option<&dyn EncryptionProvider>,
     ecc: Option<crate::table::block::EccParams>,
+    table_id: TableId,
     p: &MetaSectionParams<'_>,
 ) -> crate::Result<()> {
     file_writer.start(p.section_name)?;
@@ -1641,12 +1644,13 @@ fn write_meta_section<W: std::io::Write + std::io::Seek>(
         file_writer,
         block_buffer,
         crate::table::block::BlockIdentity {
-            // Meta is read FIRST during table open, BEFORE the reader
-            // knows the table_id (the table_id is what meta itself
-            // carries). Writer mirrors that with table_id=0 so write
-            // and read sides agree on the AAD discriminator once
-            // #251 wires AAD.
-            table_id: 0,
+            // Seal the Meta block under the writer's own (durable) table id.
+            // The reader supplies the same id out-of-band (SST path / manifest
+            // entry), so a Meta block transplanted from another SST fails AEAD
+            // verification. The reader cannot take it from the meta payload
+            // (that is what it is about to decrypt), hence the out-of-band
+            // source on both sides.
+            table_id,
             block_type: crate::table::block::BlockType::Meta,
             dict_id: 0,
             window_log: 0,

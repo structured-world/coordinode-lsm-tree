@@ -620,6 +620,7 @@ impl AbstractTree for BlobTree {
                     checksum,
                     0,
                     self.index.id,
+                    table_id,
                     self.index.config.cache.clone(),
                     self.index.config.descriptor_table.clone(),
                     level_fs.clone(),

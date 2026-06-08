@@ -268,6 +268,7 @@ fn repair_tree(config: &Config) -> crate::Result<RepairReport> {
                 checksum,
                 0,
                 0,
+                table_id,
                 config.cache.clone(),
                 None,
                 folder_fs.clone(),

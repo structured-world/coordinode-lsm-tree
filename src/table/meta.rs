@@ -188,18 +188,21 @@ impl ParsedMeta {
     pub fn load_with_handle(
         file: &dyn FsFile,
         handle: &BlockHandle,
+        table_id: crate::TableId,
         encryption: Option<&dyn crate::encryption::EncryptionProvider>,
     ) -> crate::Result<Self> {
         let block = Block::from_file(
             file,
             *handle,
             crate::table::block::BlockIdentity {
-                // Meta is the FIRST block read during table open, so its
-                // own table_id isn't known yet (chicken-and-egg) — bind 0.
-                // Cross-file substitution is still prevented because the
-                // meta block's own table_id field is part of the verified
-                // payload.
-                table_id: 0,
+                // The caller supplies the durable `table_id` from an
+                // out-of-band source (the SST file path / manifest entry),
+                // NOT from this meta payload — so the Meta block's AAD binds
+                // it to its owning table and a Meta block transplanted from
+                // another SST fails AEAD verification. `table_id` is durable
+                // across reopen (persisted as `metadata.id` + the file name),
+                // unlike the ephemeral tree id, so binding it is safe.
+                table_id,
                 block_type: BlockType::Meta,
                 dict_id: 0,
                 window_log: 0,
@@ -556,7 +559,7 @@ mod tests {
         let file = std::fs::File::open(&path).unwrap();
         #[expect(clippy::cast_possible_truncation, reason = "test meta blocks are tiny")]
         let handle = BlockHandle::new(crate::table::BlockOffset(0), buf.len() as u32);
-        ParsedMeta::load_with_handle(&file, &handle, None)
+        ParsedMeta::load_with_handle(&file, &handle, 0, None)
     }
 
     /// Sanity check: valid meta items produce a successful parse.

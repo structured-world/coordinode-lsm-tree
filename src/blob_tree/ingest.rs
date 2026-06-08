@@ -226,6 +226,7 @@ impl<'a> BlobIngestion<'a> {
                     checksum,
                     global_seqno,
                     index.id,
+                    table_id,
                     index.config.cache.clone(),
                     index.config.descriptor_table.clone(),
                     self.table.level_fs.clone(),

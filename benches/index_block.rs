@@ -120,6 +120,7 @@ fn build_table_for_point_read_inner(restart_interval: u8, partitioned: bool) -> 
         checksum,
         0,
         0,
+        0,
         Arc::new(Cache::with_capacity_bytes(1_000_000)),
         Some(Arc::new(DescriptorTable::new(8))),
         Arc::new(lsm_tree::fs::StdFs),

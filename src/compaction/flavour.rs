@@ -544,6 +544,7 @@ impl StandardCompaction {
                     checksum,
                     0,
                     opts.tree_id,
+                    table_id,
                     opts.config.cache.clone(),
                     opts.config.descriptor_table.clone(),
                     level_fs.clone(),

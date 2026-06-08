@@ -1054,6 +1054,7 @@ impl Table {
         checksum: Checksum,
         global_seqno: SeqNo,
         tree_id: TreeId,
+        table_id: TableId,
         cache: Arc<Cache>,
         descriptor_table: Option<Arc<DescriptorTable>>,
         fs: Arc<dyn Fs>,
@@ -1089,6 +1090,7 @@ impl Table {
         let metadata = match ParsedMeta::load_with_handle(
             &*file,
             &regions.metadata,
+            table_id,
             encryption.as_deref(),
         ) {
             Ok(m) => m,
@@ -1111,7 +1113,12 @@ impl Table {
                     // directly — no sentinel patching, no
                     // `std::fs::metadata` (which would also bypass the
                     // pluggable `Fs` backend).
-                    match ParsedMeta::load_with_handle(&*file, &mid_handle, encryption.as_deref()) {
+                    match ParsedMeta::load_with_handle(
+                        &*file,
+                        &mid_handle,
+                        table_id,
+                        encryption.as_deref(),
+                    ) {
                         Ok(mid) => mid,
                         Err(mid_err) => {
                             log::warn!(
