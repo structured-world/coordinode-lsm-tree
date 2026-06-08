@@ -606,6 +606,26 @@ impl Writer {
         self
     }
 
+    /// When `enabled`, clears per-file copy-on-write on this table's (still
+    /// empty) file via [`crate::fs::Fs::try_disable_cow`], so a write-once SST
+    /// on a copy-on-write filesystem (Btrfs) avoids the fragmentation penalty.
+    ///
+    /// Called at construction, before any block is written, because the inode
+    /// flag only takes effect on a file with no data blocks yet. Best-effort:
+    /// a failure (or a filesystem that does not support the flag) is logged and
+    /// ignored: disabling copy-on-write is a throughput optimization, never a
+    /// correctness requirement, so it must not fail SST creation.
+    #[must_use]
+    pub fn use_disable_cow(self, enabled: bool) -> Self {
+        if enabled && let Err(e) = self.fs.try_disable_cow(&self.path) {
+            log::warn!(
+                "try_disable_cow({}) failed; continuing with CoW enabled: {e}",
+                self.path.display(),
+            );
+        }
+        self
+    }
+
     #[must_use]
     pub fn use_bloom_policy(mut self, bloom_policy: BloomConstructionPolicy) -> Self {
         self.bloom_policy = bloom_policy;

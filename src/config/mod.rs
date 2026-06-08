@@ -1153,6 +1153,35 @@ impl Config {
         self
     }
 
+    /// Sets whether the writer clears per-file copy-on-write on newly created
+    /// SST / blob files when the backing filesystem is copy-on-write (Btrfs).
+    ///
+    /// Default `true`: write-once SSTs gain no benefit from `CoW` but suffer a
+    /// fragmentation penalty (~20% write throughput on Btrfs), so clearing it
+    /// recovers the ext4-equivalent baseline. A no-op on non-`CoW` filesystems.
+    /// Set `false` to preserve `CoW` (e.g. Btrfs subvolume snapshots that depend
+    /// on it). See [`crate::runtime_config::RuntimeConfig::disable_cow_on_sst_files`].
+    #[must_use]
+    pub fn disable_cow_on_sst_files(mut self, enabled: bool) -> Self {
+        self.initial_runtime_config.disable_cow_on_sst_files = enabled;
+        self
+    }
+
+    /// Sets whether [`crate::AbstractTree::create_checkpoint`] clones files via
+    /// reflink (`FICLONE` / `clonefile`) when the filesystem supports it,
+    /// falling back to a hard link otherwise.
+    ///
+    /// Default `true`: a reflinked checkpoint has an independent inode (no
+    /// max-links constraint, modifications never touch the original) at O(1)
+    /// cost via copy-on-write block sharing. A no-op (hard-link path) on
+    /// filesystems without reflink. See
+    /// [`crate::runtime_config::RuntimeConfig::use_reflink_for_checkpoint`].
+    #[must_use]
+    pub fn use_reflink_for_checkpoint(mut self, enabled: bool) -> Self {
+        self.initial_runtime_config.use_reflink_for_checkpoint = enabled;
+        self
+    }
+
     /// Sets the initial [`crate::runtime_config::RuntimeConfig`]
     /// snapshot the tree will start with.
     ///
@@ -1545,6 +1574,34 @@ mod builder_tests {
 
         assert_eq!(cfg.data_block_restart_interval_policy.first(), Some(&7));
         assert_eq!(cfg.index_block_restart_interval_policy.first(), Some(&3));
+    }
+
+    #[test]
+    fn fs_aware_builders_thread_to_initial_runtime_config() -> crate::Result<()> {
+        // The CoW-disable + reflink toggles default ON and flip via the builder
+        // (AC: "controlled via builder"). Verifies the builder threads to the
+        // initial RuntimeConfig the Tree opens with; a wiring regression would
+        // silently ignore the user's setting. Lives in the ungated builder
+        // tests (the behaviour is unrelated to zstd).
+        let folder = tempfile::tempdir()?;
+        let mk = || {
+            Config::new(
+                folder.path(),
+                SequenceNumberCounter::default(),
+                SequenceNumberCounter::default(),
+            )
+        };
+
+        let dflt = mk();
+        assert!(dflt.initial_runtime_config.disable_cow_on_sst_files);
+        assert!(dflt.initial_runtime_config.use_reflink_for_checkpoint);
+
+        let off = mk()
+            .disable_cow_on_sst_files(false)
+            .use_reflink_for_checkpoint(false);
+        assert!(!off.initial_runtime_config.disable_cow_on_sst_files);
+        assert!(!off.initial_runtime_config.use_reflink_for_checkpoint);
+        Ok(())
     }
 
     #[test]

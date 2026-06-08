@@ -31,7 +31,7 @@ impl From<&[u8]> for Slice {
     fn from(value: &[u8]) -> Self {
         #[cfg(not(feature = "bytes_1"))]
         {
-            Self(byteview::ByteView::new(value))
+            Self(crate::byteview::ByteView::new(value))
         }
 
         #[cfg(feature = "bytes_1")]

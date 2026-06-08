@@ -549,6 +549,7 @@ impl AbstractTree for Tree {
         table_writer = table_writer.use_sync_mode(self.config.sync_mode);
 
         table_writer = table_writer.use_seqno_in_index(rc.seqno_in_index);
+        table_writer = table_writer.use_disable_cow_on_sst(rc.disable_cow_on_sst_files);
         // `Off` (default) emits no per-KV footer and leaves the data-block
         // payload encoding unchanged (the V5 header carries a block_flags byte
         // and the meta block a descriptor key regardless, so the on-disk bytes

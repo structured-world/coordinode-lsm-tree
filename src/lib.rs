@@ -158,6 +158,10 @@ pub(crate) mod checkpoint;
 #[doc(hidden)]
 pub mod blob_tree;
 
+// Vendored, `no_std`-ported `byteview` (backs `Slice`); kept in-tree so the
+// engine carries no external dependency that fails to compile on `no_std`.
+mod byteview;
+
 mod comparator;
 
 #[doc(hidden)]

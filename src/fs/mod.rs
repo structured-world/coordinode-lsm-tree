@@ -15,10 +15,10 @@
 //!
 //! # Platform-specific backends
 //!
-//! - **Linux 5.6+**: `IoUringFs` — batched SQE submission via `io_uring`
+//! - **Linux 5.6+**: `IoUringFs` - batched SQE submission via `io_uring`
 //!   (feature-gated: `io-uring`)
 //! - **Windows**: IOCP (`IoCompletionPort`) could provide similar batched
-//!   completion semantics — not yet implemented, tracked for when Windows
+//!   completion semantics - not yet implemented, tracked for when Windows
 //!   becomes a production target
 //! - **macOS / BSD**: no batched I/O API exists (`dispatch_io` and `kqueue`
 //!   do not help for storage I/O patterns); [`StdFs`](crate::fs::StdFs) is the correct choice
@@ -29,7 +29,7 @@ mod aligned_buf;
 // this crate does not even attempt to compile it. The wider
 // `fs::*` backend (Fs / FsFile traits, std_fs, io_uring_fs)
 // still depends on `std::io::{Read, Write, Seek}` + `std::path::Path`
-// — those have no `core::*` equivalents, so feature-gating just
+// - those have no `core::*` equivalents, so feature-gating just
 // this submodule does not yet make a no-std build work end-to-end.
 // Porting the traits off std::io / std::path is tracked as #311
 // (prerequisite); the wider no-std migration epic is #274. This
@@ -58,12 +58,12 @@ pub use io_uring_fs::{IoUringFs, is_io_uring_available};
 // these bounds without any change to their own impls.
 //
 // `io::{Result, Error, ErrorKind}` still come from `std::io` here
-// (no public re-export — `use std::io;` is a local module alias).
+// (no public re-export - `use std::io;` is a local module alias).
 // The trait *bounds* are what blocked no-std for this module; the
 // surrounding `io::Result<T>` return type still resolves to
 // `std::io::Result<T>` and will be migrated to `crate::io::Result<T>`
 // in a follow-up so we keep the diff scoped to what this issue
-// actually unblocks. `std::path::Path` likewise stays for now —
+// actually unblocks. `std::path::Path` likewise stays for now -
 // the path migration is the second blocker tracked separately.
 use crate::io::{Read, Seek, Write};
 use std::io;
@@ -107,15 +107,15 @@ pub struct FsOpenOptions {
     ///
     /// `direct_io` is a HINT, not a guarantee. The flag is honoured only
     /// on Linux and Android, and only on architectures where the
-    /// `asm-generic/fcntl.h` value `O_DIRECT = 0o40000` is authoritative
-    /// — `x86`, `x86_64`, `aarch64`, `riscv32`/`riscv64`, `loongarch64`,
+    /// `asm-generic/fcntl.h` value `O_DIRECT = 0o40000` is authoritative on
+    /// `x86`, `x86_64`, `aarch64`, `riscv32`/`riscv64`, `loongarch64`, and
     /// `s390x`. On Linux
     /// architectures with a divergent `O_DIRECT` bit (arm `0o200000`,
     /// mips `0o100000`, parisc, sparc) the flag is silently dropped to
-    /// avoid passing the wrong bit to `open(2)`. Other platforms — macOS
+    /// avoid passing the wrong bit to `open(2)`. Other platforms - macOS
     /// (would need `F_NOCACHE` post-open via `fcntl`, not wired here),
     /// Windows (would need `FILE_FLAG_NO_BUFFERING` at `CreateFile` time,
-    /// not wired here), other Unixes — also silently drop the flag.
+    /// not wired here), other Unixes - also silently drop the flag.
     ///
     /// Callers must therefore treat `direct_io` as best-effort:
     /// correctness must not depend on cache bypass being in effect, and
@@ -209,13 +209,64 @@ pub struct FsMetadata {
     pub is_file: bool,
 }
 
+/// Static capability profile of a filesystem backend.
+///
+/// Different filesystems offer different guarantees - per-block integrity
+/// checks, copy-on-write semantics, O(1) reflink clones, native snapshots.
+/// The storage engine queries [`Fs::capabilities`] to make FS-aware decisions
+/// (skip redundant checksums where the FS already verifies, disable `CoW` on
+/// write-once SST files, prefer reflink over hard-link for checkpoints).
+///
+/// The [`Default`] is conservative: every field `false`, i.e. "assume the
+/// backend offers no special guarantees". A backend opts into an optimization
+/// only by reporting the corresponding capability `true`, so an unknown or
+/// third-party backend is always treated safely.
+//
+// no-std: pure data type - `Copy` struct of `bool`s, no allocator needed.
+#[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "a capability profile is a flat set of independent yes/no FS guarantees; \
+              each flag is queried on its own, so distinct bools read clearer than \
+              bitflags or a state machine (same rationale as FsOpenOptions)"
+)]
+pub struct FsCapabilities {
+    /// The filesystem detects single-byte corruption on read and returns an
+    /// I/O error (EIO) rather than silently handing back wrong bytes. True for
+    /// ZFS, Btrfs, `ReFS`, and S3-backed backends (service-side validation).
+    ///
+    /// When set, the engine may skip computing its own file checksum on the
+    /// read path and rely on the FS surfacing corruption.
+    pub per_block_integrity_on_read: bool,
+
+    /// The filesystem has a background scrub mechanism (`zfs scrub`,
+    /// `btrfs scrub`) that detects and repairs latent corruption out-of-band.
+    pub background_scrub: bool,
+
+    /// The filesystem is inherently copy-on-write (Btrfs, ZFS, APFS). Implies
+    /// atomic full-file rewrite, but a fragmentation penalty on the
+    /// append-then-read SST access pattern - the engine can disable per-file
+    /// `CoW` on write-once SSTs to recover throughput.
+    pub copy_on_write: bool,
+
+    /// The filesystem supports an O(1) reflink data clone (`FICLONE` on Linux,
+    /// `clonefile(2)` on macOS/APFS, block cloning on `ReFS`). A reflinked file
+    /// shares blocks copy-on-write yet has an independent inode.
+    pub reflink: bool,
+
+    /// The filesystem supports instant native snapshots (Btrfs subvolume
+    /// snapshot, ZFS snapshot, APFS snapshot).
+    pub native_snapshot: bool,
+}
+
 /// A directory entry returned by [`Fs::read_dir`].
 #[derive(Clone, Debug)]
 pub struct FsDirEntry {
     /// Full path to the entry.
     pub path: PathBuf,
     /// File name component (without parent path).
-    // String (not OsString) — lsm-tree uses numeric file names for tables/blobs.
+    // String (not OsString) - lsm-tree uses numeric file names for tables/blobs.
     // StdFs::read_dir returns InvalidData for non-UTF-8 names (not lossy) since
     // any such name indicates filesystem corruption for this crate's usage.
     pub file_name: String,
@@ -227,7 +278,7 @@ pub struct FsDirEntry {
 ///
 /// Backends translate it to the platform's nearest equivalent
 /// (`posix_fadvise` on Linux, no-op on macOS / Windows for now). The
-/// hint is advisory — backends are free to ignore it — and only
+/// hint is advisory - backends are free to ignore it - and only
 /// influences kernel readahead / page-cache eviction heuristics, not
 /// correctness.
 ///
@@ -239,7 +290,7 @@ pub struct FsDirEntry {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum FileHint {
-    /// No hint — leave the kernel's default caching / readahead policy in
+    /// No hint - leave the kernel's default caching / readahead policy in
     /// place. Use when the access pattern is unknown or genuinely mixed.
     #[default]
     Default,
@@ -257,7 +308,7 @@ pub enum FileHint {
     /// service.
     Random,
 
-    /// File is being written and we won't need it cached afterwards —
+    /// File is being written and we won't need it cached afterwards -
     /// drop pages from the page cache when the write completes
     /// (`POSIX_FADV_DONTNEED`). Use for compaction output and memtable
     /// flush output to keep them from evicting hot pages of files we're
@@ -269,7 +320,7 @@ pub enum FileHint {
 ///
 /// The distinction is only observable on macOS, where Rust's
 /// [`std::fs::File::sync_all`] / [`sync_data`](std::fs::File::sync_data)
-/// both issue `fcntl(F_FULLFSYNC)` — a full hardware barrier that flushes
+/// both issue `fcntl(F_FULLFSYNC)` - a full hardware barrier that flushes
 /// the drive's write cache to the platters (~4 ms on a modern SSD). On
 /// every other platform `sync_all` is already a plain `fsync` and both
 /// variants behave identically.
@@ -280,7 +331,7 @@ pub enum FileHint {
 /// opts into `F_FULLFSYNC` on macOS for callers that need power-loss
 /// durability at the cost of a much slower flush.
 //
-// no-std: pure data type — `Copy` enum, no allocator needed.
+// no-std: pure data type - `Copy` enum, no allocator needed.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum SyncMode {
     /// Plain `fsync` on every platform. On macOS this does NOT issue
@@ -292,7 +343,7 @@ pub enum SyncMode {
 
     /// Full durability. On macOS this issues `fcntl(F_FULLFSYNC)` so the
     /// data survives power loss; elsewhere it is identical to
-    /// [`Self::Normal`]. Slower — opt in only when the workload needs
+    /// [`Self::Normal`]. Slower - opt in only when the workload needs
     /// power-loss durability without an external journal.
     Full,
 }
@@ -305,7 +356,7 @@ pub trait FsFile: Read + Write + Seek + Send + Sync {
     /// Flushes all OS-internal buffers and metadata to durable storage.
     ///
     /// Equivalent to [`sync_all_with`](Self::sync_all_with) with
-    /// [`SyncMode::Full`] — the strongest durability the platform offers
+    /// [`SyncMode::Full`] - the strongest durability the platform offers
     /// (`F_FULLFSYNC` on macOS).
     ///
     /// # Errors
@@ -403,7 +454,7 @@ pub trait FsFile: Read + Write + Seek + Send + Sync {
     /// is a no-op so backends that have nothing useful to do here
     /// don't need to override it.
     ///
-    /// The hint is advisory — backends may ignore it — and only
+    /// The hint is advisory - backends may ignore it - and only
     /// influences kernel readahead / page-cache eviction heuristics, not
     /// correctness.
     ///
@@ -412,7 +463,7 @@ pub trait FsFile: Read + Write + Seek + Send + Sync {
     /// Returns an I/O error only if the underlying syscall fails with a
     /// non-`EINVAL` error. A backend that doesn't support the requested
     /// hint should treat the call as a no-op and return `Ok(())` rather
-    /// than fail — the hint is a performance lever, not a correctness
+    /// than fail - the hint is a performance lever, not a correctness
     /// requirement.
     fn hint(&self, _hint: FileHint) -> io::Result<()> {
         Ok(())
@@ -442,7 +493,7 @@ pub trait Fs: Send + Sync + 'static {
     /// # Errors
     ///
     /// Returns an I/O error if the file cannot be opened.
-    // Box<dyn FsFile> is intentionally 'static (the default) — file handles are
+    // Box<dyn FsFile> is intentionally 'static (the default) - file handles are
     // owned values that do not borrow from the Fs instance that created them.
     fn open(&self, path: &Path, opts: &FsOpenOptions) -> io::Result<Box<dyn FsFile>>;
 
@@ -457,7 +508,7 @@ pub trait Fs: Send + Sync + 'static {
     ///
     /// Unlike [`create_dir_all`](Self::create_dir_all), this method must
     /// FAIL with [`io::ErrorKind::AlreadyExists`] when `path` already
-    /// exists — it is the POSIX `mkdir(2)` primitive used by
+    /// exists - it is the POSIX `mkdir(2)` primitive used by
     /// [`AbstractTree::create_checkpoint`](crate::AbstractTree::create_checkpoint) to
     /// claim its target directory without a TOCTOU window.
     ///
@@ -598,7 +649,7 @@ pub trait Fs: Send + Sync + 'static {
     /// this default in place: the checkpoint driver's
     /// `link_or_copy_cross_fs` helper treats `Unsupported` (and `NotFound`)
     /// as a signal to fall back to a streamed byte copy, so snapshots
-    /// still succeed — they just lose the O(1) hard-link optimisation
+    /// still succeed - they just lose the O(1) hard-link optimisation
     /// and pay full-bytes worth of disk on the target volume. Backends
     /// that DO support real hard links (most kernel filesystems) should
     /// override this for the inode-sharing benefit.
@@ -607,7 +658,7 @@ pub trait Fs: Send + Sync + 'static {
     ///
     /// Returns an I/O error if `src` does not exist, `dst` already exists,
     /// the destination's parent directory is missing, or `src` and `dst`
-    /// are on different filesystems (cross-device — surfaced, not copied).
+    /// are on different filesystems (cross-device - surfaced, not copied).
     fn hard_link(&self, src: &Path, dst: &Path) -> io::Result<()> {
         let _ = (src, dst);
         Err(io::Error::new(
@@ -638,15 +689,130 @@ pub trait Fs: Send + Sync + 'static {
     /// - A [`crate::fs::MemFs`] vs any kernel-backed backend (a
     ///   hard-link attempt would resolve `src` against the host
     ///   filesystem and silently capture an unrelated file if one
-    ///   happens to exist at the same path — a checkpoint correctness
+    ///   happens to exist at the same path - a checkpoint correctness
     ///   bug).
     ///
     /// The default returns `None`, meaning "no shared-namespace
-    /// guarantee" — safe-by-default for third-party backends that have
+    /// guarantee" - safe-by-default for third-party backends that have
     /// not opted in. Callers MUST treat `None` as a veto on
     /// cross-backend [`Fs::hard_link`] and stream-copy instead, even
     /// when both sides return `None`.
     fn backend_id(&self) -> Option<u64> {
         None
     }
+
+    /// Reports the [`FsCapabilities`] of the filesystem backing `path`.
+    ///
+    /// Capabilities are a property of the *mount* `path` lives on, not of the
+    /// backend as a whole: one [`StdFs`] can serve a data directory on Btrfs and
+    /// a WAL on ext4. Callers pass the directory whose mount they care about
+    /// (typically the tree's data dir).
+    ///
+    /// The default is conservative - every capability `false`, i.e. "assume no
+    /// special FS guarantees". A backend overrides this to opt into FS-aware
+    /// optimizations (skip redundant checksums, disable `CoW` on SSTs, reflink
+    /// checkpoints). Unknown / third-party backends keep the safe default.
+    fn capabilities(&self, path: &Path) -> FsCapabilities {
+        let _ = path;
+        FsCapabilities::default()
+    }
+
+    /// Requests that per-file copy-on-write be disabled for the file at `path`.
+    ///
+    /// On `CoW` filesystems (Btrfs) write-once SST files gain no benefit from `CoW`
+    /// and suffer a fragmentation penalty; clearing the per-file `CoW` flag
+    /// (`FS_NOCOW_FL` via `FS_IOC_SETFLAGS`) recovers throughput. The flag only
+    /// takes effect on a file with no data blocks yet, so callers invoke this
+    /// immediately after creating the (empty) SST file and before writing.
+    ///
+    /// Path-based (rather than handle-based) so the trait stays object-safe and
+    /// portable: backends with no fd concept ([`MemFs`], a future Windows
+    /// backend) implement it as a no-op.
+    ///
+    /// # Default implementation
+    ///
+    /// No-op returning `Ok(())`. Backends on non-`CoW` filesystems, or that
+    /// cannot express the request, correctly leave this default in place -
+    /// disabling `CoW` is a throughput optimization, never a correctness
+    /// requirement.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error only if the backend supports the operation and the
+    /// underlying syscall fails for a reason other than "not applicable".
+    fn try_disable_cow(&self, path: &Path) -> io::Result<()> {
+        let _ = path;
+        Ok(())
+    }
+
+    /// Clones the file at `src` to `dst` with O(1) reflink semantics when the
+    /// backend supports it (`FICLONE` on Linux, `clonefile(2)` on macOS/APFS,
+    /// `ReFS` block cloning on Windows).
+    ///
+    /// A reflinked clone shares data blocks copy-on-write but has an
+    /// independent inode: later modifications to either path do not affect the
+    /// other, and there is no max-links-per-inode constraint. This makes it a
+    /// safer, cheaper alternative to [`hard_link`](Self::hard_link) for
+    /// checkpoint / backup tooling.
+    ///
+    /// # Default implementation
+    ///
+    /// Falls back to a streamed byte copy through this backend's own
+    /// [`open`](Self::open) - correct on every backend, just without the O(1)
+    /// block-sharing benefit. `dst` is created with `create_new`, so the call
+    /// fails if it already exists. Backends that support real reflink override
+    /// this for the O(1) path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if `src` cannot be read, `dst` already exists or
+    /// cannot be created, or the clone / copy fails.
+    fn reflink_file(&self, src: &Path, dst: &Path) -> io::Result<()> {
+        copy_file_streamed(self, src, dst)
+    }
+}
+
+/// Streamed independent copy of `src` to `dst` through `fs`'s own [`Fs::open`].
+///
+/// The fallback for [`Fs::reflink_file`] on backends without O(1) reflink, and
+/// the slow path a real reflink takes when the FS declines the clone (non-CoW
+/// mount, cross-device). `dst` is created with `create_new`, so an existing
+/// target is an error rather than a silent overwrite. The copy is fsynced so a
+/// clone is durable on return.
+pub(crate) fn copy_file_streamed<F: Fs + ?Sized>(fs: &F, src: &Path, dst: &Path) -> io::Result<()> {
+    let mut src_file = fs.open(src, &FsOpenOptions::new().read(true))?;
+    let mut dst_file = fs.open(dst, &FsOpenOptions::new().write(true).create_new(true))?;
+    // Heap buffer (not a 64 KiB stack array) - keeps the cold-path clone off
+    // the stack and satisfies the large-stack-array lint.
+    let mut buf = vec![0u8; 64 * 1024].into_boxed_slice();
+
+    // Run the copy in a closure so any failure leaves the original error AND
+    // lets us best-effort remove the partial `dst` before propagating —
+    // otherwise a mid-copy ENOSPC/EIO leaves a partial file and a retry trips
+    // `create_new`'s AlreadyExists for an unrelated reason. Reads retry on
+    // EINTR so a signal during the copy doesn't spuriously fail it. Mirrors
+    // `checkpoint::link_or_copy_cross_fs`'s streamed-copy contract.
+    let result: io::Result<()> = (|| {
+        loop {
+            let n = match src_file.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            };
+            let chunk = buf.get(..n).ok_or_else(|| {
+                io::Error::other("read returned more bytes than the buffer holds")
+            })?;
+            dst_file.write_all(chunk)?;
+        }
+        dst_file.sync_all()?;
+        Ok(())
+    })();
+
+    if let Err(e) = result {
+        drop(dst_file);
+        let _ = fs.remove_file(dst);
+        return Err(e);
+    }
+    Ok(())
 }

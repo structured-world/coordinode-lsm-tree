@@ -4,7 +4,7 @@
 
 //! In-memory [`Fs`] implementation for testing and ephemeral trees.
 //!
-//! All file data lives in memory — there are no durability guarantees.
+//! All file data lives in memory - there are no durability guarantees.
 //! `sync_all`, `sync_data`, and `sync_directory` are deliberate no-ops.
 //!
 //! # Known limitations
@@ -13,7 +13,7 @@
 //!   bypass the `Fs` trait. Write + flush + point-read works; compaction
 //!   may fail with `ENOENT` on virtual paths.
 
-use super::{Fs, FsDirEntry, FsFile, FsMetadata, FsOpenOptions};
+use super::{Fs, FsCapabilities, FsDirEntry, FsFile, FsMetadata, FsOpenOptions};
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -25,7 +25,7 @@ use std::sync::{Arc, Mutex, RwLock};
 
 /// In-memory [`Fs`] backend for testing and ephemeral in-memory trees.
 ///
-/// Backed by a `HashMap<PathBuf, Arc<Mutex<Vec<u8>>>>` — no disk I/O is
+/// Backed by a `HashMap<PathBuf, Arc<Mutex<Vec<u8>>>>` - no disk I/O is
 /// performed. Clones share the same backing store, and individual file
 /// contents are synchronized through a per-file [`Mutex`].
 ///
@@ -42,7 +42,7 @@ use std::sync::{Arc, Mutex, RwLock};
 pub struct MemFs {
     state: Arc<RwLock<State>>,
     /// Per-instance namespace ID used by [`Fs::backend_id`]. Cloned
-    /// `MemFs` values share the same `state` Arc AND the same ID — they
+    /// `MemFs` values share the same `state` Arc AND the same ID - they
     /// are the same backend by all observable behaviour. Independently
     /// constructed `MemFs::new()` values get DIFFERENT IDs because they
     /// have disjoint file trees.
@@ -256,7 +256,7 @@ impl FsFile for MemFile {
     }
 
     /// No-op: in-memory files are not shared across processes. `MemFs` is a
-    /// test/ephemeral backend — cross-process exclusivity is not meaningful.
+    /// test/ephemeral backend - cross-process exclusivity is not meaningful.
     fn lock_exclusive(&self) -> io::Result<()> {
         Ok(())
     }
@@ -388,7 +388,7 @@ impl Fs for MemFs {
                 lock(&data)?.clear();
             }
 
-            // Cursor starts at 0 even in append mode — append only affects
+            // Cursor starts at 0 even in append mode - append only affects
             // where writes land (Write::write checks is_append), not the
             // read cursor. This matches std::fs::File behaviour.
             let cursor = 0;
@@ -556,7 +556,7 @@ impl Fs for MemFs {
     fn remove_dir_all(&self, path: &Path) -> io::Result<()> {
         let mut state = write_state(&self.state)?;
 
-        // Reject files — std::fs::remove_dir_all errors on non-directories.
+        // Reject files - std::fs::remove_dir_all errors on non-directories.
         if state.files.contains_key(path) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -682,7 +682,7 @@ impl Fs for MemFs {
             ));
         }
 
-        // MemFs has no inode concept — produce an independent copy so the
+        // MemFs has no inode concept - produce an independent copy so the
         // destination has the same byte contents but its own backing buffer.
         // This matches the documented [`Fs::hard_link`] semantics for
         // in-memory backends.
@@ -706,10 +706,18 @@ impl Fs for MemFs {
     fn backend_id(&self) -> Option<u64> {
         Some(self.namespace_id)
     }
+
+    /// In-memory backend: no filesystem-level guarantees on any path.
+    /// Explicitly returns the all-`false` default so the "no integrity / no
+    /// `CoW` / no reflink" stance is intentional rather than inherited by
+    /// accident.
+    fn capabilities(&self, _path: &Path) -> FsCapabilities {
+        FsCapabilities::default()
+    }
 }
 
 // ---------------------------------------------------------------------------
-// Lock helpers — convert PoisonError to io::Error
+// Lock helpers - convert PoisonError to io::Error
 // ---------------------------------------------------------------------------
 
 fn lock<T>(m: &Mutex<T>) -> io::Result<std::sync::MutexGuard<'_, T>> {
@@ -1005,7 +1013,7 @@ mod tests {
         file.write_all(b"existing")?;
         drop(file);
 
-        // Open with read + append — cursor should start at 0 for reads,
+        // Open with read + append - cursor should start at 0 for reads,
         // but writes go to EOF.
         let opts = FsOpenOptions::new().read(true).append(true);
         let mut file = fs.open(path, &opts)?;
@@ -1163,7 +1171,7 @@ mod tests {
         fs.open(Path::new("/dir/file"), &opts)?;
 
         let err = fs.read_dir(Path::new("/dir/file")).unwrap_err();
-        // Must NOT be NotFound — the path exists but is a file.
+        // Must NOT be NotFound - the path exists but is a file.
         assert_ne!(err.kind(), io::ErrorKind::NotFound);
         Ok(())
     }
@@ -1242,7 +1250,7 @@ mod tests {
         fs.open(Path::new("/dir/src"), &opts)?;
         fs.open(Path::new("/dir/blocker"), &opts)?;
 
-        // /dir/blocker is a file, not a directory — cannot be parent of dst.
+        // /dir/blocker is a file, not a directory - cannot be parent of dst.
         let err = fs
             .rename(Path::new("/dir/src"), Path::new("/dir/blocker/child"))
             .unwrap_err();
@@ -1352,7 +1360,7 @@ mod tests {
 
         // Critical invariant: `MemFs::hard_link` returns an *independent*
         // copy (no `Arc<Mutex<Vec<u8>>>` aliasing). Mutate the source and
-        // verify the destination is unaffected — if the test only relied
+        // verify the destination is unaffected - if the test only relied
         // on `remove_file` it would pass even with an aliased buffer.
         let mut writer = fs.open(src, &FsOpenOptions::new().write(true).truncate(true))?;
         writer.write_all(b"mutated")?;
@@ -1363,7 +1371,7 @@ mod tests {
             .read_to_string(&mut after)?;
         assert_eq!(
             after, "checkpoint",
-            "dst must not see writes to src — buffers must be independent",
+            "dst must not see writes to src - buffers must be independent",
         );
 
         // Removing the source leaves the destination intact.
@@ -1371,6 +1379,97 @@ mod tests {
         assert!(!fs.exists(src)?);
         assert!(fs.exists(dst)?);
         Ok(())
+    }
+
+    #[test]
+    fn fs_capabilities_default_reports_no_guarantees() {
+        // The conservative default is load-bearing: any backend that does not
+        // override capabilities() must be treated as offering nothing, so an
+        // unknown FS never skips a checksum or disables `CoW` by accident.
+        let caps = FsCapabilities::default();
+        assert!(!caps.per_block_integrity_on_read);
+        assert!(!caps.background_scrub);
+        assert!(!caps.copy_on_write);
+        assert!(!caps.reflink);
+        assert!(!caps.native_snapshot);
+    }
+
+    #[test]
+    fn memfs_capabilities_match_default_no_guarantees() {
+        // RAM has no FS-level integrity / `CoW` / reflink - MemFs must report the
+        // all-false profile for any path.
+        assert_eq!(
+            MemFs::new().capabilities(Path::new("/dir/sst.bin")),
+            FsCapabilities::default()
+        );
+    }
+
+    #[test]
+    fn try_disable_cow_without_cow_support_is_noop() {
+        // MemFs reports copy_on_write=false, so the default no-op path applies:
+        // the call succeeds and changes nothing.
+        let fs = MemFs::new();
+        fs.create_dir_all(Path::new("/dir")).unwrap();
+        let path = Path::new("/dir/sst.bin");
+        fs.open(path, &FsOpenOptions::new().write(true).create(true))
+            .unwrap();
+        assert!(
+            fs.try_disable_cow(path).is_ok(),
+            "no-op must succeed on a non-CoW backend"
+        );
+    }
+
+    #[test]
+    fn reflink_file_without_backend_support_copies_independently() -> io::Result<()> {
+        // No backend reflink support → default streamed-copy fallback. The
+        // clone must be byte-identical AND an independent file (writing the
+        // source afterwards must not change the clone).
+        let fs = MemFs::new();
+        fs.create_dir_all(Path::new("/dir"))?;
+        let src = Path::new("/dir/src.bin");
+        let dst = Path::new("/dir/clone.bin");
+
+        let mut f = fs.open(src, &FsOpenOptions::new().write(true).create(true))?;
+        f.write_all(b"original-contents")?;
+        drop(f);
+
+        fs.reflink_file(src, dst)?;
+
+        let mut buf = String::new();
+        fs.open(dst, &FsOpenOptions::new().read(true))?
+            .read_to_string(&mut buf)?;
+        assert_eq!(buf, "original-contents");
+
+        // Independence: mutate src, clone must be unaffected.
+        let mut w = fs.open(src, &FsOpenOptions::new().write(true).truncate(true))?;
+        w.write_all(b"changed")?;
+        drop(w);
+
+        let mut after = String::new();
+        fs.open(dst, &FsOpenOptions::new().read(true))?
+            .read_to_string(&mut after)?;
+        assert_eq!(
+            after, "original-contents",
+            "reflink clone must be independent"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn reflink_file_rejects_existing_destination() {
+        // Default fallback opens dst with create_new, so an existing target is
+        // an error (no silent overwrite of a checkpoint file).
+        let fs = MemFs::new();
+        fs.create_dir_all(Path::new("/dir")).unwrap();
+        let src = Path::new("/dir/src.bin");
+        let dst = Path::new("/dir/dst.bin");
+        for p in [src, dst] {
+            fs.open(p, &FsOpenOptions::new().write(true).create(true))
+                .unwrap();
+        }
+        let err = fs.reflink_file(src, dst).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
     }
 
     #[test]
