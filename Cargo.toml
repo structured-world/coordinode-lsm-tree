@@ -114,7 +114,6 @@ ribbon-serde = ["dep:serde"]
 [dependencies]
 bytes = { version = "1", optional = true }
 byteorder = { package = "byteorder-lite", version = "0.1.0", default-features = false }
-byteview = "~0.10.1"
 # Lockless atomic snapshot for RuntimeConfig (see src/runtime_config/).
 # Lock-free atomic Arc swap. `arc-swap` 1.x is NOT `#![no_std]` (it requires
 # `std`), so it stays an optional dependency enabled only by the `std`

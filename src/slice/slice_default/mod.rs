@@ -2,9 +2,9 @@
 // Copyright (c) 2024-present, fjall-rs
 // Copyright (c) 2026-present, Structured World Foundation
 
-use byteview::ByteView;
+use crate::byteview::ByteView;
 
-pub use byteview::Builder;
+pub use crate::byteview::Builder;
 
 /// An immutable byte slice that can be cloned without additional heap allocation
 ///
@@ -42,6 +42,7 @@ impl Slice {
     }
 
     #[doc(hidden)]
+    #[cfg(feature = "std")]
     pub fn from_reader<R: std::io::Read>(reader: &mut R, len: usize) -> std::io::Result<Self> {
         ByteView::from_reader(reader, len).map(Self)
     }
