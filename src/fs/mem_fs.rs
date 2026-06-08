@@ -1413,7 +1413,10 @@ mod tests {
         let path = Path::new("/dir/sst.bin");
         fs.open(path, &FsOpenOptions::new().write(true).create(true))
             .unwrap();
-        fs.try_disable_cow(path).expect("no-op must succeed");
+        assert!(
+            fs.try_disable_cow(path).is_ok(),
+            "no-op must succeed on a non-CoW backend"
+        );
     }
 
     #[test]
