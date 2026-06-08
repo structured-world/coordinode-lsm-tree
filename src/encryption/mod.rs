@@ -112,6 +112,23 @@ pub trait EncryptionProvider:
     /// Returns `u32` because block sizes are `u32`-bounded on disk.
     fn max_overhead(&self) -> u32;
 
+    /// Whether this provider implements the AAD-bound block path
+    /// ([`encrypt_block_aad`](Self::encrypt_block_aad) /
+    /// [`decrypt_block_aad`](Self::decrypt_block_aad)).
+    ///
+    /// On a `zstd` build the live block I/O path routes encrypted blocks
+    /// through the AAD-bound envelope, so a provider that only implements the
+    /// opaque [`encrypt`](Self::encrypt) / [`decrypt`](Self::decrypt) surface
+    /// would fail on the first encrypted read/write. The store validates this
+    /// capability when an encryption provider is configured (see
+    /// `Config::open`) and rejects an unsupported provider up front rather than
+    /// failing mid-I/O. Defaults to `false`; AAD-capable providers (e.g.
+    /// [`Aes256GcmProvider`]) override it to `true`.
+    #[must_use]
+    fn supports_aad_block_path(&self) -> bool {
+        false
+    }
+
     /// Decrypt `ciphertext` previously produced by [`encrypt`](EncryptionProvider::encrypt).
     ///
     /// # Errors
@@ -364,6 +381,15 @@ impl EncryptionProvider for Aes256GcmProvider {
         {
             Self::OVERHEAD as u32
         }
+    }
+
+    // The AAD-bound block entry points are only compiled under `zstd_any` (the
+    // envelope wraps `SkippableFrame`); on a non-zstd build this provider falls
+    // back to the opaque block path, which needs no AAD capability, so the
+    // default `false` is correct there.
+    #[cfg(zstd_any)]
+    fn supports_aad_block_path(&self) -> bool {
+        true
     }
 
     fn encrypt(&self, plaintext: &[u8]) -> crate::Result<Vec<u8>> {

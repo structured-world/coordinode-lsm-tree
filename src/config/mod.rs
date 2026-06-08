@@ -761,6 +761,21 @@ impl Config {
         #[cfg(zstd_any)]
         self.validate_zstd_dictionary()?;
 
+        // On a zstd build the live block path seals encrypted blocks through
+        // the AAD-bound envelope, so the configured provider MUST implement it.
+        // Reject an opaque-only provider here, at open time, instead of letting
+        // it fail on the first encrypted read/write.
+        #[cfg(zstd_any)]
+        if let Some(enc) = &self.encryption {
+            if !enc.supports_aad_block_path() {
+                return Err(crate::Error::Encrypt(
+                    "encryption provider does not implement the AAD-bound block path \
+                     (encrypt_block_aad / decrypt_block_aad) required for encrypted \
+                     blocks on a zstd build",
+                ));
+            }
+        }
+
         Ok(if self.kv_separation_opts.is_some() {
             AnyTree::Blob(BlobTree::open(self)?)
         } else {

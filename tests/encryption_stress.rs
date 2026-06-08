@@ -351,6 +351,52 @@ fn cell_zstd3_encrypted_ecc_round_trips() -> lsm_tree::Result<()> {
 }
 
 // ────────────────────────────────────────────────────────────────────────
+// Provider capability gate — on a zstd build the live block path seals
+// encrypted blocks through the AAD-bound envelope, so a provider that only
+// implements the opaque surface must be rejected at open time (fail-fast)
+// rather than blowing up on the first encrypted read/write.
+// ────────────────────────────────────────────────────────────────────────
+
+#[cfg(zstd_any)]
+#[test]
+fn opaque_only_provider_is_rejected_at_open() {
+    use lsm_tree::encryption::EncryptionProvider;
+
+    // Minimal provider with NO `supports_aad_block_path` override (defaults to
+    // false) and no AAD-bound block methods — exactly the downstream shape the
+    // gate must catch.
+    struct OpaqueOnly;
+    impl std::panic::UnwindSafe for OpaqueOnly {}
+    impl std::panic::RefUnwindSafe for OpaqueOnly {}
+    impl EncryptionProvider for OpaqueOnly {
+        fn encrypt(&self, p: &[u8]) -> lsm_tree::Result<Vec<u8>> {
+            Ok(p.to_vec())
+        }
+        fn decrypt(&self, c: &[u8]) -> lsm_tree::Result<Vec<u8>> {
+            Ok(c.to_vec())
+        }
+        fn max_overhead(&self) -> u32 {
+            0
+        }
+    }
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let result = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_encryption(Some(Arc::new(OpaqueOnly)))
+    .open();
+
+    assert!(
+        matches!(result, Err(lsm_tree::Error::Encrypt(_))),
+        "opaque-only provider must be rejected at open, got {:?}",
+        result.map(|_| "Ok(tree)")
+    );
+}
+
+// ────────────────────────────────────────────────────────────────────────
 // Major compaction cell — runs the same invariant chain BUT triggers a
 // major compaction before reopen, so the recovery path validates that
 // post-compaction SSTs (single merged file per level) decrypt + decode
