@@ -141,7 +141,16 @@ impl TreeInner {
         let comparator = config.comparator.clone();
         let sync_mode = config.sync_mode;
 
-        let super_versions = SuperVersions::new(version, &comparator, sync_mode);
+        // The first persist above wrote the full snapshot `v{version.id()}` and
+        // pointed CURRENT at it, so that id is the initial manifest snapshot.
+        let snapshot_id = version.id();
+        let super_versions = SuperVersions::new(
+            version,
+            &comparator,
+            sync_mode,
+            snapshot_id,
+            config.manifest_log_rotate_bytes,
+        );
         #[cfg(feature = "std")]
         let latest_super_version = super_versions.latest_handle();
 

@@ -8,8 +8,18 @@ use crate::{
     fs::{Fs, SyncMode},
     memtable::Memtable,
     tree::sealed::SealedMemtables,
-    version::{Version, persist_version},
+    version::{Version, VersionId, edit_log, persist_version},
 };
+
+/// Removes `path`, treating an already-absent file as success — a prior crash
+/// (or a racing rotation) may have removed it already.
+fn remove_if_present(fs: &dyn Fs, path: &Path) -> crate::Result<()> {
+    match fs.remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
 #[cfg(feature = "std")]
 use arc_swap::ArcSwap;
 use std::{collections::VecDeque, path::Path, sync::Arc};
@@ -40,6 +50,19 @@ pub struct SuperVersions {
     /// version persist this history performs. Immutable for the tree's life.
     sync_mode: SyncMode,
 
+    /// Version id of the on-disk snapshot the `CURRENT` pointer references. Each
+    /// version upgrade appends a [`VersionEdit`](crate::version::edit::VersionEdit)
+    /// to the log `edits-{snapshot_id}` instead of rewriting the whole manifest;
+    /// once that log grows past [`Self::log_rotate_bytes`] the next upgrade
+    /// rotates — writes a fresh snapshot, repoints `CURRENT`, starts an empty
+    /// log — and this id advances to the new snapshot's.
+    snapshot_id: VersionId,
+
+    /// Edit-log size (bytes) past which the next upgrade rotates instead of
+    /// appending (`Config::manifest_log_rotate_bytes`, default 1 MiB). Immutable
+    /// for the tree's life.
+    log_rotate_bytes: u64,
+
     /// Lock-free mirror of the latest (back) `SuperVersion`, shared with the
     /// `Tree` so a point read at `MAX_SEQNO` can load the current snapshot
     /// without taking the history `RwLock` or cloning the deque entry. Kept
@@ -58,7 +81,18 @@ pub struct SuperVersions {
 }
 
 impl SuperVersions {
-    pub fn new(version: Version, comparator: &SharedComparator, sync_mode: SyncMode) -> Self {
+    /// Builds the in-memory version history. `snapshot_id` is the version id of
+    /// the on-disk snapshot `CURRENT` points at — `version.id()` on a fresh
+    /// create (the first persist writes that snapshot), or the recovered
+    /// snapshot id on open (which may be `< version.id()` when edits were
+    /// replayed on top of it).
+    pub fn new(
+        version: Version,
+        comparator: &SharedComparator,
+        sync_mode: SyncMode,
+        snapshot_id: VersionId,
+        log_rotate_bytes: u64,
+    ) -> Self {
         let comparator_name: Arc<str> = comparator.name().into();
 
         let initial = SuperVersion {
@@ -74,6 +108,8 @@ impl SuperVersions {
             versions: vec![initial].into(),
             comparator_name,
             sync_mode,
+            snapshot_id,
+            log_rotate_bytes,
         }
     }
 
@@ -125,17 +161,24 @@ impl SuperVersions {
                     break;
                 };
 
-                log::trace!(
-                    "Removing version #{} (seqno={})",
-                    head.version.id(),
-                    head.seqno,
-                );
+                let evicted_id = head.version.id();
+                log::trace!("Removing version #{evicted_id} (seqno={})", head.seqno);
 
-                let path = folder.join(format!("v{}", head.version.id()));
-                match fs.remove_file(&path) {
-                    Ok(()) => {}
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(e) => return Err(e.into()),
+                // Under the incremental manifest only the CURRENT snapshot has a
+                // `v{id}` file on disk; intermediate versions live in the edit
+                // log and have no file (so removing them is a no-op NotFound).
+                // The snapshot file must NOT be removed here even when its
+                // in-memory version is evicted from the history — `CURRENT` still
+                // points at it and the log layers on top. Its lifecycle belongs
+                // to rotation (which writes the next snapshot and deletes the old
+                // one only after `CURRENT` is repointed).
+                if evicted_id != self.snapshot_id {
+                    let path = folder.join(format!("v{evicted_id}"));
+                    match fs.remove_file(&path) {
+                        Ok(()) => {}
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(e) => return Err(e.into()),
+                    }
                 }
 
                 self.versions.pop_front();
@@ -207,18 +250,18 @@ impl SuperVersions {
         runtime: std::sync::Arc<crate::runtime_config::RuntimeConfig>,
         encryption: Option<std::sync::Arc<dyn crate::encryption::EncryptionProvider>>,
     ) -> crate::Result<()> {
-        let mut next_version = f(&self.latest_version())?;
+        let prior = self.latest_version();
+        let mut next_version = f(&prior)?;
         next_version.seqno = seqno;
         log::trace!("Next version seqno={}", next_version.seqno);
 
-        persist_version(
+        self.persist_change(
             tree_path,
+            &prior.version,
             &next_version.version,
-            &self.comparator_name,
             fs,
             runtime,
             encryption,
-            self.sync_mode,
         )?;
         self.append_version(next_version);
 
@@ -226,6 +269,61 @@ impl SuperVersions {
         let next_visible = seqno.saturating_add(1).min(MAX_SEQNO);
         visible_seqno.fetch_max(next_visible);
 
+        Ok(())
+    }
+
+    /// Persists the transition from `prior` to `next` to disk, durably, the
+    /// incremental way: append one [`VersionEdit`](crate::version::edit::VersionEdit)
+    /// to the current snapshot's log (the common, O(changed-levels) path), or
+    /// rotate when that log has grown past [`Self::log_rotate_bytes`].
+    ///
+    /// Rotation writes a fresh full snapshot for `next`, fsyncs it, and atomically
+    /// repoints `CURRENT` (all inside [`persist_version`]); only after `CURRENT`
+    /// commits does it delete the previous snapshot file and its log. Crash points:
+    /// before the `CURRENT` switch, `CURRENT` still names the old snapshot and its
+    /// log is intact (recover old + replay); after the switch, the new snapshot is
+    /// complete and its log is empty (recover new, no edits). A torn trailing edit
+    /// from an interrupted append is dropped on replay — the operation that wrote
+    /// it was never acknowledged upward.
+    fn persist_change(
+        &mut self,
+        tree_path: &Path,
+        prior: &Version,
+        next: &Version,
+        fs: &dyn Fs,
+        runtime: std::sync::Arc<crate::runtime_config::RuntimeConfig>,
+        encryption: Option<std::sync::Arc<dyn crate::encryption::EncryptionProvider>>,
+    ) -> crate::Result<()> {
+        let log_path = tree_path.join(format!("edits-{}", self.snapshot_id));
+
+        if edit_log::log_size(fs, &log_path)? < self.log_rotate_bytes {
+            // Common path: append the delta and fsync. No snapshot rewrite.
+            let edit = next.diff(prior)?;
+            let mut scratch = Vec::new();
+            return edit_log::append_edit(fs, &log_path, &edit, &mut scratch, self.sync_mode);
+        }
+
+        // Rotation: write `next` as a fresh full snapshot and repoint CURRENT.
+        let old_snapshot = self.snapshot_id;
+        persist_version(
+            tree_path,
+            next,
+            &self.comparator_name,
+            fs,
+            runtime,
+            encryption,
+            self.sync_mode,
+        )?;
+        self.snapshot_id = next.id();
+
+        // CURRENT now names the new snapshot; the old generation is unreferenced.
+        // Delete its log first (so a crash here can't leave a long log attached
+        // to a snapshot CURRENT no longer points at), then the old snapshot file.
+        // Both removals tolerate a missing file (a prior crash may have raced).
+        remove_if_present(fs, &log_path)?;
+        if old_snapshot != self.snapshot_id {
+            remove_if_present(fs, &tree_path.join(format!("v{old_snapshot}")))?;
+        }
         Ok(())
     }
 
@@ -332,6 +430,8 @@ mod tests {
             versions: versions.into(),
             comparator_name: "default".into(),
             sync_mode: SyncMode::Normal,
+            snapshot_id: 0,
+            log_rotate_bytes: 1024 * 1024,
             #[cfg(feature = "std")]
             latest,
         }

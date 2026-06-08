@@ -2037,12 +2037,17 @@ impl Tree {
         // NOTE: the version file is read twice (here for metadata, then inside
         // recover_levels for table/blob data). This is intentional — metadata
         // validation must complete before any disk-mutating recovery work.
+        // Version id of the on-disk snapshot CURRENT references. This is the
+        // base the edit log replays on top of; the live version id can be higher
+        // (it has no `v{id}` file of its own). Threaded into the version history
+        // so the next persist appends to / rotates the right snapshot's log.
+        let snapshot_id = crate::version::recovery::get_current_version(
+            &config.path,
+            &*config.fs,
+            config.encryption.clone(),
+        )?;
         {
-            let version_id = crate::version::recovery::get_current_version(
-                &config.path,
-                &*config.fs,
-                config.encryption.clone(),
-            )?;
+            let version_id = snapshot_id;
             let manifest_path = config.path.join(format!("v{version_id}"));
             // Open the manifest with a default runtime snapshot:
             // ECC awareness is captured per-Block via the header
@@ -2124,7 +2129,13 @@ impl Tree {
         // move.
         let initial_runtime = config.initial_runtime_config.clone();
         let sync_mode = config.sync_mode;
-        let super_versions = SuperVersions::new(version, &comparator, sync_mode);
+        let super_versions = SuperVersions::new(
+            version,
+            &comparator,
+            sync_mode,
+            snapshot_id,
+            config.manifest_log_rotate_bytes,
+        );
         #[cfg(feature = "std")]
         let latest_super_version = super_versions.latest_handle();
         let inner = TreeInner {
@@ -2234,6 +2245,11 @@ impl Tree {
             config.manifest_recovery_mode,
             config.encryption.clone(),
         )?;
+
+        // The on-disk snapshot CURRENT points at — the generation orphan cleanup
+        // must preserve. Intermediate versions live only in the edit log, so the
+        // latest version id (`version.id()`) has no `v{id}` file of its own.
+        let snapshot_id = recovery.snapshot_id;
 
         let mut table_map = {
             let mut result: crate::HashMap<TableId, (u8 /* Level index */, Checksum, SeqNo)> =
@@ -2428,8 +2444,11 @@ impl Tree {
         let version = Version::from_recovery(recovery, &tables, &blob_files)?;
 
         // NOTE: Cleanup old versions
-        // But only after we definitely recovered the latest version
-        Self::cleanup_orphaned_version(tree_path, version.id(), &*config.fs)?;
+        // But only after we definitely recovered the latest version.
+        // Preserve the snapshot CURRENT references (and its `edits-` log) — the
+        // latest version id has no file of its own under the incremental
+        // manifest, so cleaning by it would delete the live snapshot.
+        Self::cleanup_orphaned_version(tree_path, snapshot_id, &*config.fs)?;
 
         for (table_path, orphan_fs) in orphaned_tables {
             log::debug!("Deleting orphaned table {}", table_path.display());
@@ -2454,20 +2473,29 @@ impl Tree {
     /// function now fails fast on non-UTF-8 names. This is intentional: version
     /// files are always `v{u64}` — any non-UTF-8 entry indicates filesystem
     /// corruption and should surface as an error rather than be silently ignored.
+    /// Removes stale manifest files left by older generations: every `v{id}`
+    /// snapshot except the live one (`v{snapshot_id}`) and every `edits-{id}`
+    /// log except the live snapshot's (`edits-{snapshot_id}`). A crashed
+    /// rotation can leak an old snapshot or its log; this sweeps them on open.
+    /// The live snapshot and log are exactly the generation `CURRENT` points at.
     fn cleanup_orphaned_version(
         path: &Path,
-        latest_version_id: crate::version::VersionId,
+        snapshot_id: crate::version::VersionId,
         fs: &dyn crate::fs::Fs,
     ) -> crate::Result<()> {
-        let version_str = format!("v{latest_version_id}");
+        let snapshot_str = format!("v{snapshot_id}");
+        let log_str = format!("edits-{snapshot_id}");
 
         for dirent in fs.read_dir(path)? {
             if dirent.is_dir {
                 continue;
             }
 
-            if dirent.file_name.starts_with('v') && dirent.file_name != version_str {
-                log::trace!("Cleanup orphaned version {}", dirent.file_name);
+            let name = &dirent.file_name;
+            let is_orphan_snapshot = name.starts_with('v') && *name != snapshot_str;
+            let is_orphan_log = name.starts_with("edits-") && *name != log_str;
+            if is_orphan_snapshot || is_orphan_log {
+                log::trace!("Cleanup orphaned manifest file {name}");
                 match fs.remove_file(&dirent.path) {
                     Ok(()) => {}
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
