@@ -707,10 +707,11 @@ impl Fs for MemFs {
         Some(self.namespace_id)
     }
 
-    /// In-memory backend: no filesystem-level guarantees. Explicitly returns
-    /// the all-`false` default so the "no integrity / no `CoW` / no reflink"
-    /// stance is intentional rather than inherited by accident.
-    fn capabilities(&self) -> FsCapabilities {
+    /// In-memory backend: no filesystem-level guarantees on any path.
+    /// Explicitly returns the all-`false` default so the "no integrity / no
+    /// `CoW` / no reflink" stance is intentional rather than inherited by
+    /// accident.
+    fn capabilities(&self, _path: &Path) -> FsCapabilities {
         FsCapabilities::default()
     }
 }
@@ -1396,8 +1397,11 @@ mod tests {
     #[test]
     fn memfs_capabilities_match_default_no_guarantees() {
         // RAM has no FS-level integrity / `CoW` / reflink — MemFs must report the
-        // all-false profile explicitly.
-        assert_eq!(MemFs::new().capabilities(), FsCapabilities::default());
+        // all-false profile for any path.
+        assert_eq!(
+            MemFs::new().capabilities(Path::new("/dir/sst.bin")),
+            FsCapabilities::default()
+        );
     }
 
     #[test]

@@ -701,13 +701,19 @@ pub trait Fs: Send + Sync + 'static {
         None
     }
 
-    /// Reports the static [`FsCapabilities`] of this backend.
+    /// Reports the [`FsCapabilities`] of the filesystem backing `path`.
+    ///
+    /// Capabilities are a property of the *mount* `path` lives on, not of the
+    /// backend as a whole: one [`StdFs`] can serve a data directory on Btrfs and
+    /// a WAL on ext4. Callers pass the directory whose mount they care about
+    /// (typically the tree's data dir).
     ///
     /// The default is conservative — every capability `false`, i.e. "assume no
     /// special FS guarantees". A backend overrides this to opt into FS-aware
     /// optimizations (skip redundant checksums, disable `CoW` on SSTs, reflink
     /// checkpoints). Unknown / third-party backends keep the safe default.
-    fn capabilities(&self) -> FsCapabilities {
+    fn capabilities(&self, path: &Path) -> FsCapabilities {
+        let _ = path;
         FsCapabilities::default()
     }
 
@@ -762,22 +768,33 @@ pub trait Fs: Send + Sync + 'static {
     /// Returns an I/O error if `src` cannot be read, `dst` already exists or
     /// cannot be created, or the clone / copy fails.
     fn reflink_file(&self, src: &Path, dst: &Path) -> io::Result<()> {
-        let mut src_file = self.open(src, &FsOpenOptions::new().read(true))?;
-        let mut dst_file = self.open(dst, &FsOpenOptions::new().write(true).create_new(true))?;
-        // Heap buffer (not a 64 KiB stack array) — keeps the cold-path clone
-        // off the stack and satisfies the large-stack-array lint.
-        let mut buf = vec![0u8; 64 * 1024].into_boxed_slice();
-        loop {
-            let n = src_file.read(&mut buf)?;
-            if n == 0 {
-                break;
-            }
-            let chunk = buf.get(..n).ok_or_else(|| {
-                io::Error::other("read returned more bytes than the buffer holds")
-            })?;
-            dst_file.write_all(chunk)?;
-        }
-        dst_file.sync_all()?;
-        Ok(())
+        copy_file_streamed(self, src, dst)
     }
+}
+
+/// Streamed independent copy of `src` to `dst` through `fs`'s own [`Fs::open`].
+///
+/// The fallback for [`Fs::reflink_file`] on backends without O(1) reflink, and
+/// the slow path a real reflink takes when the FS declines the clone (non-CoW
+/// mount, cross-device). `dst` is created with `create_new`, so an existing
+/// target is an error rather than a silent overwrite. The copy is fsynced so a
+/// clone is durable on return.
+pub(crate) fn copy_file_streamed<F: Fs + ?Sized>(fs: &F, src: &Path, dst: &Path) -> io::Result<()> {
+    let mut src_file = fs.open(src, &FsOpenOptions::new().read(true))?;
+    let mut dst_file = fs.open(dst, &FsOpenOptions::new().write(true).create_new(true))?;
+    // Heap buffer (not a 64 KiB stack array) — keeps the cold-path clone off
+    // the stack and satisfies the large-stack-array lint.
+    let mut buf = vec![0u8; 64 * 1024].into_boxed_slice();
+    loop {
+        let n = src_file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        let chunk = buf
+            .get(..n)
+            .ok_or_else(|| io::Error::other("read returned more bytes than the buffer holds"))?;
+        dst_file.write_all(chunk)?;
+    }
+    dst_file.sync_all()?;
+    Ok(())
 }

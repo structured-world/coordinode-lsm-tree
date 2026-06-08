@@ -293,6 +293,32 @@ impl Fs for StdFs {
     fn backend_id(&self) -> Option<u64> {
         Some(KERNEL_BACKEND_ID)
     }
+
+    /// macOS: detects APFS (the common macOS filesystem with copy-on-write,
+    /// reflink, and native snapshots) via `statfs(2)`'s `f_fstypename`. Other
+    /// macOS filesystems (HFS+, exFAT, SMB/NFS mounts) and any detection failure
+    /// report the conservative default. Linux FS detection (Btrfs, ZFS,
+    /// XFS-reflink via `statfs` `f_type`) lands in a follow-up increment;
+    /// non-macOS targets currently use the trait's conservative default.
+    #[cfg(target_os = "macos")]
+    fn capabilities(&self, path: &Path) -> super::FsCapabilities {
+        macos_caps::capabilities(path)
+    }
+
+    /// macOS: O(1) clone via `clonefile(2)` on APFS. When the filesystem
+    /// declines the clone (non-APFS mount, cross-device) it falls back to the
+    /// shared streamed byte copy, so the clone still succeeds (just without
+    /// block sharing). A genuine I/O error propagates.
+    #[cfg(target_os = "macos")]
+    fn reflink_file(&self, src: &Path, dst: &Path) -> io::Result<()> {
+        match macos_caps::clonefile(src, dst) {
+            Ok(()) => Ok(()),
+            Err(e) if macos_caps::clone_should_fall_back(&e) => {
+                super::copy_file_streamed(self, src, dst)
+            }
+            Err(e) => Err(e),
+        }
+    }
 }
 
 /// Shared by every backend that resolves paths against the host kernel's
@@ -610,6 +636,97 @@ mod sys {
     pub(super) fn fadvise(_file: &File, _hint: FileHint) -> io::Result<()> {
         // Unsupported platform — silently ignore. Hints are advisory.
         Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// macOS filesystem capability detection (statfs) + clonefile reflink
+// ---------------------------------------------------------------------------
+
+#[cfg(target_os = "macos")]
+mod macos_caps {
+    use crate::fs::FsCapabilities;
+    use std::ffi::{CStr, CString};
+    use std::io;
+    use std::mem::MaybeUninit;
+    use std::os::unix::ffi::OsStrExt;
+    use std::path::Path;
+
+    fn to_cstring(path: &Path) -> io::Result<CString> {
+        CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "path contains an interior NUL byte",
+            )
+        })
+    }
+
+    /// Filesystem type name for the mount backing `path` (e.g. `"apfs"`),
+    /// read from `statfs(2)`'s `f_fstypename`.
+    fn fs_type_name(path: &Path) -> io::Result<String> {
+        let c = to_cstring(path)?;
+        let mut buf = MaybeUninit::<libc::statfs>::uninit();
+        // SAFETY: `c` is a valid NUL-terminated C string; on success (rc == 0)
+        // the kernel fully initializes the `statfs` buffer.
+        #[expect(unsafe_code, reason = "statfs FFI to read the filesystem type name")]
+        let rc = unsafe { libc::statfs(c.as_ptr(), buf.as_mut_ptr()) };
+        if rc != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: statfs returned 0, so `buf` is initialized; `f_fstypename`
+        // is a NUL-terminated `c_char` array.
+        #[expect(unsafe_code, reason = "read initialized statfs.f_fstypename")]
+        let name = unsafe {
+            let st = buf.assume_init();
+            CStr::from_ptr(st.f_fstypename.as_ptr())
+                .to_string_lossy()
+                .into_owned()
+        };
+        Ok(name)
+    }
+
+    /// APFS is the one common macOS filesystem with copy-on-write, reflink, and
+    /// native snapshots. Detection failure falls back to the conservative
+    /// default (capabilities are an optimization, never a correctness
+    /// requirement).
+    pub(super) fn capabilities(path: &Path) -> FsCapabilities {
+        if matches!(fs_type_name(path).as_deref(), Ok("apfs")) {
+            FsCapabilities {
+                copy_on_write: true,
+                reflink: true,
+                native_snapshot: true,
+                ..FsCapabilities::default()
+            }
+        } else {
+            FsCapabilities::default()
+        }
+    }
+
+    /// O(1) data clone via `clonefile(2)` (APFS block sharing).
+    pub(super) fn clonefile(src: &Path, dst: &Path) -> io::Result<()> {
+        let s = to_cstring(src)?;
+        let d = to_cstring(dst)?;
+        // SAFETY: both args are valid NUL-terminated C strings; flags = 0.
+        #[expect(unsafe_code, reason = "clonefile FFI for an O(1) APFS clone")]
+        let rc = unsafe { libc::clonefile(s.as_ptr(), d.as_ptr(), 0) };
+        if rc != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    /// Whether a `clonefile` failure means "this filesystem / placement cannot
+    /// clone" (so fall back to a byte copy) rather than a real I/O failure.
+    pub(super) fn clone_should_fall_back(err: &io::Error) -> bool {
+        // ENOTSUP/EOPNOTSUPP (45): non-APFS mount or clone unsupported.
+        // EXDEV (18): cross-device — cannot clone across filesystems.
+        const ENOTSUP: i32 = 45;
+        const EXDEV: i32 = 18;
+        matches!(err.raw_os_error(), Some(ENOTSUP | EXDEV))
+            || matches!(
+                err.kind(),
+                io::ErrorKind::Unsupported | io::ErrorKind::CrossesDevices
+            )
     }
 }
 
@@ -1109,6 +1226,70 @@ mod tests {
         ] {
             file.hint(hint)?;
         }
+        Ok(())
+    }
+
+    /// On macOS the capability profile for any real directory must be either
+    /// the full APFS profile (copy-on-write + reflink + native snapshot — the
+    /// common case, including CI runners and `/var/folders` temp dirs) or the
+    /// conservative all-false default (non-APFS mount). Never a partial mix.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn capabilities_macos_is_apfs_profile_or_conservative() {
+        use crate::fs::FsCapabilities;
+        let dir = tempfile::tempdir().unwrap();
+        let caps = StdFs.capabilities(dir.path());
+        let apfs = FsCapabilities {
+            copy_on_write: true,
+            reflink: true,
+            native_snapshot: true,
+            ..FsCapabilities::default()
+        };
+        assert!(
+            caps == apfs || caps == FsCapabilities::default(),
+            "unexpected macOS capability profile: {caps:?}"
+        );
+    }
+
+    /// macOS `reflink_file` must produce an independent, byte-identical clone
+    /// whether it went through `clonefile(2)` (APFS) or the byte-copy fallback:
+    /// the clone matches the source, and a later overwrite of the source does
+    /// not change the clone.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn reflink_file_macos_produces_independent_identical_copy() -> io::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let src = dir.path().join("src.bin");
+        let dst = dir.path().join("clone.bin");
+        let fs = StdFs;
+
+        let mut f = fs.open(&src, &FsOpenOptions::new().write(true).create_new(true))?;
+        f.write_all(b"reflink-source-data")?;
+        f.sync_all()?;
+        drop(f);
+
+        fs.reflink_file(&src, &dst)?;
+
+        let mut buf = Vec::new();
+        fs.open(&dst, &FsOpenOptions::new().read(true))?
+            .read_to_end(&mut buf)?;
+        assert_eq!(buf, b"reflink-source-data");
+
+        // Overwrite the source; the clone must be unaffected (clonefile shares
+        // blocks copy-on-write, the fallback is a separate file — either way
+        // independent).
+        let mut w = fs.open(&src, &FsOpenOptions::new().write(true).truncate(true))?;
+        w.write_all(b"changed")?;
+        w.sync_all()?;
+        drop(w);
+
+        let mut after = Vec::new();
+        fs.open(&dst, &FsOpenOptions::new().read(true))?
+            .read_to_end(&mut after)?;
+        assert_eq!(
+            after, b"reflink-source-data",
+            "reflink clone must be independent"
+        );
         Ok(())
     }
 }
