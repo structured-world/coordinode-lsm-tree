@@ -727,9 +727,9 @@ mod tests {
     #[test]
     fn cross_identity_substitution_surfaces_aead_failure() {
         // Same plaintext, sealed under one BlockIdentity. Reader
-        // attempts to decrypt with a DIFFERENT BlockIdentity (one
-        // field changed). AAD includes tree_id / table_id, so any
-        // mismatch surfaces as AEAD failure.
+        // attempts to decrypt with a DIFFERENT BlockIdentity (table_id
+        // flipped). AAD binds table_id (not tree_id — that is no longer
+        // part of the identity), so the mismatch surfaces as AEAD failure.
         let plaintext = b"the quick brown fox";
         let sealed = encrypt_block(plaintext, &id(), &ctx(), &chain()).unwrap();
         let mut wrong_id = id();

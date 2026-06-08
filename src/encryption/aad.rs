@@ -4,13 +4,13 @@
 //! AAD (Additional Authenticated Data) construction for AAD-bound encrypted
 //! blocks, per the wire-format spec in `docs/aad-block-format.md` §5.3.
 //!
-//! AAD is the 31-byte buffer that is fed to the AEAD primitive alongside the
+//! AAD is the 23-byte buffer that is fed to the AEAD primitive alongside the
 //! ciphertext and nonce, but is **never** written to disk. It mixes
 //! disk-mirrored fields (header byte, key epoch, block type, suite id,
-//! compression type, dict id, window log) with caller-supplied identity
-//! fields (tree id, table id) so that the AEAD tag binds the ciphertext to its
-//! block-identity, codec context, and key epoch. A block's byte offset is
-//! intentionally NOT bound — see [`build`] for why.
+//! compression type, dict id, window log) with one caller-supplied identity
+//! field (table id) so that the AEAD tag binds the ciphertext to its
+//! block-identity, codec context, and key epoch. A block's byte offset and the
+//! owning tree id are intentionally NOT bound — see [`build`] for why.
 //!
 //! ## Why a separate module
 //!

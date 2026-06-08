@@ -160,12 +160,20 @@ fn cross_tree_swap_is_not_bound_in_aad() {
     // tests). With a deliberately shared key + table id here, the swap
     // VERIFIES — if this ever starts failing, someone re-introduced a
     // tree/position field into AAD.
-    let chain = key_chain();
+    //
+    // Two SEPARATE key-chain instances carrying the SAME key material model
+    // the documented "different tree, same key" case (a misconfiguration
+    // where an operator shares one key across trees): tree A seals, tree B
+    // reads. Because the key bytes match and the AAD carries no tree id, the
+    // block decrypts — demonstrating exactly why distinct per-tree keys (not
+    // AAD) are the cross-tree defence.
+    let chain_a = key_chain();
+    let chain_b = key_chain();
     let id = identity(99);
 
-    let bytes = encrypt_block(PLAINTEXT_A, &id, &ctx(), &chain).expect("encrypt");
+    let bytes = encrypt_block(PLAINTEXT_A, &id, &ctx(), &chain_a).expect("encrypt");
     assert_eq!(
-        decrypt_block(&bytes, &id, &chain)
+        decrypt_block(&bytes, &id, &chain_b)
             .expect("shared-key cross-tree swap is AAD-valid by design")
             .plaintext,
         PLAINTEXT_A

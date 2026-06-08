@@ -19,7 +19,7 @@
 //! site is fiddly and the type system couldn't enforce
 //! correctness. With `BlockIdentity`, every call site contributes
 //! its OWN local context (the writer/scanner/reader already knows
-//! its table id, the block offset, etc.) and the Block layer
+//! its table id, codec context, etc.) and the Block layer
 //! computes AAD once, internally. Adding a new AAD-relevant field
 //! later means adding it to `BlockIdentity` rather than chasing
 //! down 90+ call sites.

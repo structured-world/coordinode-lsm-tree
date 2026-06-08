@@ -303,10 +303,11 @@ metadata-payload  = header-byte                    ; 1B
                     nonce                          ; NONCE_LEN B (suite-defined; 12B for v1)
                     aead-tag                       ; 16B
 
-;; Note: tree-id, table-id, block-offset are AAD-bound (see §5.3)
-;; but NOT part of metadata-payload. They are caller-supplied from
-;; read context (owning Tree, SST file path, seek cursor) and never
-;; transmitted on the wire.
+;; Note: only table-id is AAD-bound from caller context (see §5.3).
+;; tree-id and block-offset are intentionally NOT AAD-bound. None of
+;; these caller-context values are part of metadata-payload — table-id
+;; is caller-supplied from the SST file path and never transmitted on
+;; the wire.
 
 body-frame        = body-magic body-payload-len encrypted-body
 body-magic        = %x51.2A.4D.18                  ; 0x184D2A51 LE
