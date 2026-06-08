@@ -114,11 +114,16 @@ impl SkipMap {
             .alloc(head_size, 4)
             .expect("arena must fit at least the head sentinel");
 
-        // Head is zero-initialised by the arena; set the height byte.
-        // SAFETY: head was just allocated with size head_size >= OFF_HEIGHT+1;
-        // we have exclusive access because no other thread can see this arena yet.
+        // The arena no longer zeroes memory, so explicitly initialize the head
+        // sentinel: zero the whole node (header fields + all MAX_HEIGHT tower
+        // slots = UNSET), then stamp the height byte. The head's tower is read
+        // by every search start, so its slots MUST be UNSET before any reader;
+        // regular nodes self-initialize their `[0, height)` tower in `insert`.
+        // SAFETY: head was just allocated with size head_size; we have exclusive
+        // access because no other thread can see this arena yet.
         unsafe {
             let bytes = arena.get_bytes_mut(head, head_size);
+            bytes.fill(0);
             #[expect(
                 clippy::indexing_slicing,
                 reason = "OFF_HEIGHT (11) < head_size (104) by construction"
@@ -325,9 +330,14 @@ impl SkipMap {
             meta[8..10].copy_from_slice(&(key_bytes.len() as u16).to_ne_bytes());
             meta[10] = u8::from(key.value_type);
             meta[11] = height as u8;
-            // meta[12..16] reserved padding
+            // Arena memory is uninitialized — zero the reserved padding so the
+            // whole header is fully written before the node is published.
+            meta[12..16].copy_from_slice(&[0u8; 4]);
             meta[16..24].copy_from_slice(&key.seqno.to_ne_bytes());
-            // Tower entries are already zero (= UNSET) from arena zero-init.
+            // Tower slots [0, height) are NOT initialized here: `insert` writes
+            // every one of them (release store) before linking the node at that
+            // level, so no reader observes an unwritten slot even though the
+            // arena did not zero them.
         }
 
         node
