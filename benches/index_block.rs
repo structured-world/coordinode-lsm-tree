@@ -88,7 +88,7 @@ fn build_table_for_point_read_inner(restart_interval: u8, partitioned: bool) -> 
     let dir = tempfile::tempdir().expect("tempdir should be created");
     let path = dir.path().join("table.sst");
 
-    let mut writer = Writer::new(path.clone(), TableId::default(), 0, Arc::new(StdFs))
+    let mut writer = Writer::new(path.clone(), 0, TableId::default(), 0, Arc::new(StdFs))
         .expect("writer should be created")
         .use_data_block_size(256)
         .use_index_block_restart_interval(restart_interval);

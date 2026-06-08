@@ -67,6 +67,7 @@ impl<'a> Ingestion<'a> {
         // TODO: maybe create a PrepareMultiWriter that can be used by flush, ingest and compaction worker
         let mut writer = MultiWriter::new(
             folder.clone(),
+            tree.id,
             tree.table_id_counter.clone(),
             64 * 1_024 * 1_024,
             ingest_level,

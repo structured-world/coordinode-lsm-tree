@@ -47,7 +47,7 @@ fn test_with_table_impl(
     let file = dir.path().join("table");
 
     {
-        let mut writer = Writer::new(file.clone(), 0, 0, Arc::new(StdFs))?;
+        let mut writer = Writer::new(file.clone(), 0, 0, 0, Arc::new(StdFs))?;
 
         #[cfg(zstd_any)]
         if zstd_dictionary.is_some() {
@@ -245,7 +245,8 @@ fn test_with_table_impl(
 
     // Test with partitioned indexes
     {
-        let mut writer = Writer::new(file.clone(), 0, 0, Arc::new(StdFs))?.use_partitioned_index();
+        let mut writer =
+            Writer::new(file.clone(), 0, 0, 0, Arc::new(StdFs))?.use_partitioned_index();
 
         #[cfg(zstd_any)]
         if zstd_dictionary.is_some() {
@@ -496,7 +497,7 @@ fn block_layout_section_roundtrips_for_large_zstd_blocks() {
     let dir = tempdir().unwrap();
     let file = dir.path().join("table");
 
-    let mut writer = Writer::new(file.clone(), 0, 0, Arc::new(StdFs))
+    let mut writer = Writer::new(file.clone(), 0, 0, 0, Arc::new(StdFs))
         .unwrap()
         .use_data_block_size(256 * 1024)
         .use_data_block_compression(crate::CompressionType::Zstd(19));
@@ -554,7 +555,7 @@ fn block_layout_section_roundtrips_for_large_zstd_blocks() {
     // the section — each tiny block compresses into a single inner zstd block,
     // so there is nothing to partial-decode and no layout is persisted.
     let small_file = dir.path().join("table-small");
-    let mut small_writer = Writer::new(small_file.clone(), 0, 0, Arc::new(StdFs))
+    let mut small_writer = Writer::new(small_file.clone(), 0, 0, 0, Arc::new(StdFs))
         .unwrap()
         .use_data_block_size(4 * 1024)
         .use_data_block_compression(crate::CompressionType::Zstd(19));
@@ -644,7 +645,7 @@ fn recover_adaptive_table(
     let path = dir.path().join("table");
 
     let mut writer =
-        Writer::new(path.clone(), 0, 0, Arc::new(StdFs))?.use_adaptive_index(spill_threshold);
+        Writer::new(path.clone(), 0, 0, 0, Arc::new(StdFs))?.use_adaptive_index(spill_threshold);
     for item in items {
         writer.write(item.clone())?;
     }
@@ -1646,7 +1647,7 @@ fn table_read_fuzz_1() -> crate::Result<()> {
 
     let data_block_size = 97;
 
-    let mut writer = crate::table::Writer::new(file.clone(), 0, 0, Arc::new(StdFs))
+    let mut writer = crate::table::Writer::new(file.clone(), 0, 0, 0, Arc::new(StdFs))
         .unwrap()
         .use_data_block_size(data_block_size);
 
@@ -1723,7 +1724,7 @@ fn table_partitioned_index() -> crate::Result<()> {
     let dir = tempfile::tempdir()?;
     let file = dir.path().join("table_fuzz");
 
-    let mut writer = crate::table::Writer::new(file.clone(), 0, 0, Arc::new(StdFs))
+    let mut writer = crate::table::Writer::new(file.clone(), 0, 0, 0, Arc::new(StdFs))
         .unwrap()
         .use_partitioned_index()
         .use_data_block_size(5)
@@ -1790,7 +1791,7 @@ fn table_global_seqno() -> crate::Result<()> {
     let dir = tempfile::tempdir()?;
     let file = dir.path().join("table_fuzz");
 
-    let mut writer = crate::table::Writer::new(file.clone(), 0, 0, Arc::new(StdFs))
+    let mut writer = crate::table::Writer::new(file.clone(), 0, 0, 0, Arc::new(StdFs))
         .unwrap()
         .use_partitioned_filter()
         .use_data_block_size(1)
@@ -1857,7 +1858,7 @@ fn table_return_global_seqno() -> crate::Result<()> {
     let dir = tempfile::tempdir()?;
     let file = dir.path().join("table_fuzz");
 
-    let mut writer = crate::table::Writer::new(file.clone(), 0, 0, Arc::new(StdFs))?;
+    let mut writer = crate::table::Writer::new(file.clone(), 0, 0, 0, Arc::new(StdFs))?;
 
     for item in items {
         writer.write(item)?;
@@ -2044,7 +2045,7 @@ fn load_block_range_tombstone_metrics() -> crate::Result<()> {
     let file = dir.path().join("table");
 
     // Build a table that contains a range tombstone block.
-    let mut writer = Writer::new(file.clone(), 0, 0, Arc::new(StdFs))?;
+    let mut writer = Writer::new(file.clone(), 0, 0, 0, Arc::new(StdFs))?;
     writer.write(InternalValue::from_components(
         b"a",
         b"v1",
@@ -2165,7 +2166,7 @@ fn load_block_cache_hit_rejects_wrong_block_type() -> crate::Result<()> {
     let file = dir.path().join("table");
 
     // Build a minimal table with one data block.
-    let mut writer = Writer::new(file.clone(), 0, 0, Arc::new(StdFs))?;
+    let mut writer = Writer::new(file.clone(), 0, 0, 0, Arc::new(StdFs))?;
     writer.write(InternalValue::from_components(
         b"a",
         b"v1",
@@ -2275,7 +2276,7 @@ fn meta_seqno_kv_max_corruption_returns_invalid_data() -> crate::Result<()> {
 
     // Write a valid table with KV entries at seqnos 1..=5.
     // Both seqno#max and seqno#kv_max will be 5.
-    let mut writer = Writer::new(file.clone(), 0, 0, Arc::new(StdFs))?;
+    let mut writer = Writer::new(file.clone(), 0, 0, 0, Arc::new(StdFs))?;
     for (i, key) in (b'a'..=b'e').enumerate() {
         writer.write(InternalValue::from_components(
             [key],
@@ -2381,7 +2382,7 @@ fn meta_mid_and_tail_have_identical_created_at() -> crate::Result<()> {
     let dir = tempfile::tempdir()?;
     let file = dir.path().join("table");
 
-    let mut writer = Writer::new(file.clone(), 0, 0, Arc::new(StdFs))?;
+    let mut writer = Writer::new(file.clone(), 0, 0, 0, Arc::new(StdFs))?;
     for (i, key) in (b'a'..=b'e').enumerate() {
         writer.write(InternalValue::from_components(
             [key],
@@ -2443,7 +2444,7 @@ fn meta_mid_and_tail_have_identical_file_size() -> crate::Result<()> {
     let dir = tempfile::tempdir()?;
     let file = dir.path().join("table");
 
-    let mut writer = Writer::new(file.clone(), 0, 0, Arc::new(StdFs))?;
+    let mut writer = Writer::new(file.clone(), 0, 0, 0, Arc::new(StdFs))?;
     for (i, key) in (b'a'..=b'e').enumerate() {
         writer.write(InternalValue::from_components(
             [key],
@@ -2616,7 +2617,7 @@ fn two_level_index_scan_skips_empty_child_partition() -> crate::Result<()> {
     let dir = tempfile::tempdir()?;
     let file = dir.path().join("two_level_skip");
 
-    let mut writer = crate::table::Writer::new(file.clone(), 0, 0, Arc::new(StdFs))?
+    let mut writer = crate::table::Writer::new(file.clone(), 0, 0, 0, Arc::new(StdFs))?
         .use_partitioned_index()
         .use_data_block_size(1)
         .use_meta_partition_size(3);
@@ -3061,7 +3062,7 @@ fn build_and_recover(
     let dir = tempfile::tempdir()?;
     let path = dir.path().join("table");
 
-    let mut writer = config(Writer::new(path.clone(), 0, 0, Arc::new(StdFs))?);
+    let mut writer = config(Writer::new(path.clone(), 0, 0, 0, Arc::new(StdFs))?);
     if let Some(threads) = parallel_threads {
         let spawner = Arc::new(crate::table::writer::RayonSpawner::with_threads(threads)?);
         writer = writer.use_parallel_compression(spawner, threads);

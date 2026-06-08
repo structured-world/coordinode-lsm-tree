@@ -79,6 +79,7 @@ pub(super) fn prepare_table_writer(
 
     let mut table_writer = MultiWriter::new(
         table_base_folder,
+        opts.tree_id,
         opts.table_id_generator.clone(),
         payload.target_size,
         payload.dest_level,

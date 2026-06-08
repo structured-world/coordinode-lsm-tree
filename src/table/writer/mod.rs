@@ -72,6 +72,10 @@ pub struct Writer {
 
     table_id: TableId,
 
+    /// Owning tree id. Sealed into each block's AAD identity so a block cannot
+    /// be replayed across trees; mirrors the read-side `load_block` identity.
+    tree_id: crate::tree::inner::TreeId,
+
     data_block_restart_interval: u8,
     index_block_restart_interval: u8,
 
@@ -215,6 +219,7 @@ pub struct Writer {
 impl Writer {
     pub fn new(
         path: PathBuf,
+        tree_id: crate::tree::inner::TreeId,
         table_id: TableId,
         initial_level: u8,
         fs: Arc<dyn Fs>,
@@ -236,6 +241,7 @@ impl Writer {
             meta: meta::Metadata::default(),
 
             table_id,
+            tree_id,
 
             data_block_restart_interval: 16,
             index_block_restart_interval: 1,
@@ -796,7 +802,7 @@ impl Writer {
         let mut prepared = Block::prepare_with_flags(
             &self.block_buffer,
             super::block::BlockIdentity {
-                tree_id: 0,
+                tree_id: self.tree_id,
                 table_id: self.table_id,
                 block_offset: *self.meta.file_pos,
                 block_type: super::block::BlockType::Data,
@@ -1086,7 +1092,7 @@ impl Writer {
                 &mut self.file_writer,
                 &self.block_buffer,
                 crate::table::block::BlockIdentity {
-                    tree_id: 0,
+                    tree_id: self.tree_id,
                     table_id: self.table_id,
                     block_offset: *self.meta.file_pos,
                     block_type: crate::table::block::BlockType::BlockLayout,
@@ -1143,7 +1149,7 @@ impl Writer {
                 &mut self.file_writer,
                 &self.block_buffer,
                 crate::table::block::BlockIdentity {
-                    tree_id: 0,
+                    tree_id: self.tree_id,
                     table_id: self.table_id,
                     block_offset: *self.meta.file_pos,
                     block_type: crate::table::block::BlockType::RangeTombstone,
@@ -1337,7 +1343,7 @@ impl Writer {
             &mut self.file_writer,
             &tli_bytes,
             crate::table::block::BlockIdentity {
-                tree_id: 0,
+                tree_id: self.tree_id,
                 table_id: self.table_id,
                 block_offset: 0,
                 block_type: crate::table::block::BlockType::Index,
@@ -1720,7 +1726,7 @@ mod tests {
     fn table_writer_count() -> crate::Result<()> {
         let dir = tempfile::tempdir()?;
         let path = dir.path().join("1");
-        let mut writer = Writer::new(path, 1, 0, Arc::new(StdFs))?;
+        let mut writer = Writer::new(path, 0, 1, 0, Arc::new(StdFs))?;
 
         assert_eq!(0, writer.meta.key_count);
         assert_eq!(0, writer.chunk_size);
@@ -1766,7 +1772,7 @@ mod tests {
             Err(e) => panic!("tempdir should be created: {e}"),
         };
         let path = dir.path().join("1");
-        let writer = match Writer::new(path, 1, 0, Arc::new(StdFs)) {
+        let writer = match Writer::new(path, 0, 1, 0, Arc::new(StdFs)) {
             Ok(writer) => writer,
             Err(e) => panic!("writer should be created: {e}"),
         };
@@ -1781,7 +1787,7 @@ mod tests {
             Err(e) => panic!("tempdir should be created: {e}"),
         };
         let path = dir.path().join("1");
-        let writer = match Writer::new(path, 1, 0, Arc::new(StdFs)) {
+        let writer = match Writer::new(path, 0, 1, 0, Arc::new(StdFs)) {
             Ok(writer) => writer,
             Err(e) => panic!("writer should be created: {e}"),
         };
@@ -1798,7 +1804,7 @@ mod tests {
             Err(e) => panic!("tempdir should be created: {e}"),
         };
         let path = dir.path().join("1");
-        let mut writer = match Writer::new(path, 1, 0, Arc::new(StdFs)) {
+        let mut writer = match Writer::new(path, 0, 1, 0, Arc::new(StdFs)) {
             Ok(writer) => writer,
             Err(e) => panic!("writer should be created: {e}"),
         };
@@ -1823,7 +1829,7 @@ mod tests {
             Err(e) => panic!("tempdir should be created: {e}"),
         };
         let path = dir.path().join("1");
-        let mut writer = match Writer::new(path, 1, 0, Arc::new(StdFs)) {
+        let mut writer = match Writer::new(path, 0, 1, 0, Arc::new(StdFs)) {
             Ok(writer) => writer,
             Err(e) => panic!("writer should be created: {e}"),
         };
@@ -1846,7 +1852,7 @@ mod tests {
             Err(e) => panic!("tempdir should be created: {e}"),
         };
         let path = dir.path().join("1");
-        let mut writer = match Writer::new(path, 1, 0, Arc::new(StdFs)) {
+        let mut writer = match Writer::new(path, 0, 1, 0, Arc::new(StdFs)) {
             Ok(writer) => writer,
             Err(e) => panic!("writer should be created: {e}"),
         };
@@ -1865,7 +1871,8 @@ mod tests {
     fn writer_meta_partition_size_is_chainable_with_full_index_writer() -> crate::Result<()> {
         let dir = tempfile::tempdir()?;
         let path = dir.path().join("full-index");
-        let mut writer = Writer::new(path, 1, 0, Arc::new(StdFs))?.use_meta_partition_size(8_192);
+        let mut writer =
+            Writer::new(path, 0, 1, 0, Arc::new(StdFs))?.use_meta_partition_size(8_192);
 
         writer.write(InternalValue::from_components(
             b"k",
@@ -1886,7 +1893,7 @@ mod tests {
             Err(e) => panic!("tempdir should be created: {e}"),
         };
         let path = dir.path().join("1");
-        let mut writer = match Writer::new(path, 1, 0, Arc::new(StdFs)) {
+        let mut writer = match Writer::new(path, 0, 1, 0, Arc::new(StdFs)) {
             Ok(writer) => writer,
             Err(e) => panic!("writer should be created: {e}"),
         };
