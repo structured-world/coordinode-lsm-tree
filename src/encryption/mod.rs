@@ -146,6 +146,53 @@ pub trait EncryptionProvider:
     fn decrypt_vec(&self, ciphertext: Vec<u8>) -> crate::Result<Vec<u8>> {
         self.decrypt(&ciphertext)
     }
+
+    /// AAD-bound block encryption: seal `plaintext` into a `MetadataFrame ‖
+    /// BodyFrame` blob whose AEAD tag binds the block's identity and transform
+    /// stack (anti-swap / anti-relabel), per `docs/aad-block-format.md`. The
+    /// per-block AAD inputs (`identity`, `compression_type`, `block_flags`) come
+    /// from the block layer; the provider supplies the key material (key chain +
+    /// active epoch + suite). This is the live block-I/O encryption path
+    /// (`BlockTransform`), distinct from the opaque [`encrypt`](Self::encrypt)
+    /// the manifest subsystem still uses.
+    ///
+    /// # Errors
+    ///
+    /// The default returns [`crate::Error::Encrypt`]: a provider that cannot bind
+    /// AAD must not serve the block path. AAD-capable providers (e.g.
+    /// [`Aes256GcmProvider`]) override this.
+    fn encrypt_block_aad(
+        &self,
+        _plaintext: &[u8],
+        _identity: &crate::table::block::BlockIdentity,
+        _compression_type: u8,
+        _block_flags: u8,
+    ) -> crate::Result<Vec<u8>> {
+        Err(crate::Error::Encrypt(
+            "provider does not support AAD-bound block encryption",
+        ))
+    }
+
+    /// Inverse of [`encrypt_block_aad`](Self::encrypt_block_aad): verify the AAD
+    /// binding and recover the plaintext. The transform fields the writer bound
+    /// (`compression_type`, `block_flags`, `key_epoch`, `suite_id`) are read back
+    /// from the frame's `MetadataFrame`; the reader supplies only `identity` (the
+    /// out-of-band tree/table/offset + dict/window context, from the per-SST
+    /// descriptor + block handle). Any mismatch fails AEAD verification.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::Error::Decrypt`] on tag-verify failure / malformed frame, or for
+    /// providers that do not bind AAD (the default).
+    fn decrypt_block_aad(
+        &self,
+        _ciphertext: &[u8],
+        _identity: &crate::table::block::BlockIdentity,
+    ) -> crate::Result<Vec<u8>> {
+        Err(crate::Error::Decrypt(
+            "provider does not support AAD-bound block decryption",
+        ))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -170,6 +217,15 @@ pub trait EncryptionProvider:
 #[cfg(feature = "encryption")]
 pub struct Aes256GcmProvider {
     cipher: aes_gcm::Aes256Gcm,
+    /// Key material for the AAD-bound block path
+    /// ([`encrypt_block_aad`](EncryptionProvider::encrypt_block_aad)). The
+    /// opaque [`encrypt`](EncryptionProvider::encrypt) (manifest subsystem) uses
+    /// `cipher` directly; the block path looks the key up by epoch here.
+    key_chain: crate::encryption::key_chain::StaticKeyChain,
+    /// Active key epoch sealed into every block's `MetadataFrame`.
+    key_epoch: u8,
+    /// AEAD suite tag (AES-256-GCM) mirrored into the AAD.
+    suite_id: crate::encryption::aad::SuiteId,
 }
 
 #[cfg(feature = "encryption")]
@@ -193,6 +249,11 @@ impl Aes256GcmProvider {
 
         Self {
             cipher: aes_gcm::Aes256Gcm::new(key.into()),
+            // Single-epoch shortcut: the one supplied key is epoch 0. Deployments
+            // that rotate keys construct a provider over a multi-epoch chain.
+            key_chain: crate::encryption::key_chain::StaticKeyChain::new().with_key(0, *key),
+            key_epoch: 0,
+            suite_id: crate::encryption::aad::SuiteId::Aes256Gcm,
         }
     }
 
@@ -423,6 +484,49 @@ impl EncryptionProvider for Aes256GcmProvider {
             })?;
 
         Ok(buf)
+    }
+
+    // The AAD-bound entry points (`encrypt_block` / `decrypt_block`) live in the
+    // `block` module, gated on `zstd_any` (it wraps `SkippableFrame`). Without
+    // zstd this provider falls back to the trait default (unsupported), since the
+    // wire-format frame is unavailable.
+    #[cfg(zstd_any)]
+    fn encrypt_block_aad(
+        &self,
+        plaintext: &[u8],
+        identity: &crate::table::block::BlockIdentity,
+        compression_type: u8,
+        block_flags: u8,
+    ) -> crate::Result<Vec<u8>> {
+        let ctx = crate::encryption::aad::EncryptionContext::v1(
+            self.key_epoch,
+            self.suite_id,
+            compression_type,
+            block_flags,
+        );
+        crate::encryption::encrypt_block(plaintext, identity, &ctx, &self.key_chain)
+    }
+
+    #[cfg(zstd_any)]
+    fn decrypt_block_aad(
+        &self,
+        ciphertext: &[u8],
+        identity: &crate::table::block::BlockIdentity,
+    ) -> crate::Result<Vec<u8>> {
+        // The frame self-describes its transform fields (key_epoch / suite /
+        // compression_type / block_flags); the reader supplies only `identity`.
+        match crate::encryption::decrypt_block(ciphertext, identity, &self.key_chain) {
+            Ok(decrypted) => Ok(decrypted.plaintext),
+            Err(e) => {
+                // Map the typed AAD-decrypt failure into the crate error; the
+                // specific variant (block-swap / dict-sub / tamper) is logged for
+                // diagnostics since `Error::Decrypt` carries only a static reason.
+                log::debug!("AAD-bound block decryption failed: {e:?}");
+                Err(crate::Error::Decrypt(
+                    "AAD-bound block decryption failed (tampered, wrong key, or malformed frame)",
+                ))
+            }
+        }
     }
 }
 
