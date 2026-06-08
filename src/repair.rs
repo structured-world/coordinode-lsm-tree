@@ -146,6 +146,15 @@ impl Config {
     /// compaction restructures it into proper levels (expect elevated I/O for a
     /// period proportional to the data size).
     ///
+    /// # Exclusive access (required)
+    ///
+    /// The caller MUST guarantee no other instance has this tree directory open.
+    /// Repair rewrites `CURRENT`, writes a fresh snapshot, and removes the stale
+    /// `edits-*` logs in place — `lsm-tree` takes no cross-process directory lock
+    /// here (nor does [`Config::open`]; exclusive directory ownership is the
+    /// embedder's responsibility). Running repair against a live tree corrupts
+    /// that instance's manifest state.
+    ///
     /// # Errors
     ///
     /// Returns [`crate::Error::FeatureUnsupported`] for KV-separated (blob)
@@ -332,6 +341,22 @@ fn repair_tree(config: &Config) -> crate::Result<RepairReport> {
         config.encryption.clone(),
         config.sync_mode,
     )?;
+
+    // A rebuilt snapshot is a complete generation on its own. Sweep every stale
+    // edit log so nothing is replayed on top of it: the lost manifest's
+    // generation left its log under an OLDER snapshot id (the rebuilt snapshot
+    // uses `max(v*) + 1`), so removing only `edits-{version_id}` would normally
+    // miss it. Drop all `edits-*` — none belong to the fresh snapshot.
+    for dirent in config.fs.read_dir(&config.path)? {
+        if dirent.is_dir || !dirent.file_name.starts_with("edits-") {
+            continue;
+        }
+        match config.fs.remove_file(&dirent.path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
 
     Ok(RepairReport {
         recovered,

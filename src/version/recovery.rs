@@ -184,7 +184,7 @@ pub fn get_current_version(
     Ok(version_id)
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct RecoveredTable {
     pub id: TableId,
     pub checksum: Checksum,
@@ -232,6 +232,15 @@ pub struct RecoveryStats {
 #[derive(Debug)]
 pub struct Recovery {
     pub tree_type: TreeType,
+    /// Version id of the on-disk snapshot the `CURRENT` pointer references —
+    /// the base the edit log is replayed on top of. The snapshot file
+    /// `v{snapshot_id}` and its log `edits-{snapshot_id}` are the generation
+    /// that must survive orphan cleanup; intermediate versions live only in the
+    /// log. Equals [`Self::curr_version_id`] when the log is empty (just after a
+    /// rotation) and is `<=` it otherwise.
+    pub snapshot_id: VersionId,
+    /// Version id of the recovered state: the snapshot's id advanced by every
+    /// edit replayed from the log (so the next persist continues from here).
     pub curr_version_id: VersionId,
     pub table_ids: Vec<Vec<Vec<RecoveredTable>>>,
     pub blob_file_ids: Vec<(BlobFileId, Checksum)>,
@@ -263,6 +272,68 @@ pub struct Recovery {
         )
     )]
     pub stats: RecoveryStats,
+}
+
+impl Recovery {
+    /// Applies one edit-log [`VersionEdit`](super::edit::VersionEdit) on top of
+    /// the recovered snapshot state, in place — the consumer side of the
+    /// incremental manifest. Edits are replayed in order after the snapshot to
+    /// reconstruct the current version.
+    ///
+    /// A changed level replaces its run layout wholesale (a dropped table is
+    /// simply absent from the new layout; an emptied level becomes zero runs).
+    /// Blob files take a per-id add / remove (an added id whose entry already
+    /// exists overwrites its checksum). GC stats overwrite when the edit carries
+    /// them. The version id advances to the edit's `new_version_id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the edit's GC-stats payload fails to decode.
+    pub(crate) fn apply_edit(&mut self, edit: &super::edit::VersionEdit) -> crate::Result<()> {
+        for cl in &edit.changed_levels {
+            let idx = usize::from(cl.level);
+            if idx >= self.table_ids.len() {
+                self.table_ids.resize_with(idx + 1, Vec::new);
+            }
+            let new_layout = cl
+                .runs
+                .iter()
+                .map(|run| {
+                    run.iter()
+                        .map(|t| RecoveredTable {
+                            id: t.id,
+                            checksum: Checksum::from_raw(t.checksum),
+                            global_seqno: t.global_seqno,
+                        })
+                        .collect()
+                })
+                .collect();
+            // `idx < len` holds: the resize above grew the vec to `idx + 1`.
+            if let Some(slot) = self.table_ids.get_mut(idx) {
+                *slot = new_layout;
+            }
+        }
+
+        if !edit.removed_blob_file_ids.is_empty() {
+            self.blob_file_ids
+                .retain(|(id, _)| !edit.removed_blob_file_ids.contains(id));
+        }
+        for b in &edit.added_blob_files {
+            let checksum = Checksum::from_raw(b.checksum);
+            if let Some(entry) = self.blob_file_ids.iter_mut().find(|(id, _)| *id == b.id) {
+                entry.1 = checksum;
+            } else {
+                self.blob_file_ids.push((b.id, checksum));
+            }
+        }
+
+        if let Some(bytes) = &edit.gc_stats {
+            self.gc_stats = crate::blob_tree::FragmentationMap::decode_from(&mut &bytes[..])?;
+        }
+
+        self.curr_version_id = edit.new_version_id;
+        Ok(())
+    }
 }
 
 #[expect(
@@ -1045,7 +1116,7 @@ pub fn recover(
         }
     };
 
-    Ok(Recovery {
+    let mut recovery = Recovery {
         tree_type: {
             if archive.section("tree_type").is_none() {
                 log::error!(
@@ -1060,6 +1131,7 @@ pub fn recover(
                 .ok_or(crate::Error::InvalidHeader("TreeType"))?;
             TreeType::try_from(byte).map_err(|()| crate::Error::InvalidHeader("TreeType"))?
         },
+        snapshot_id: curr_version_id,
         curr_version_id,
         table_ids: levels,
         blob_file_ids,
@@ -1071,7 +1143,28 @@ pub fn recover(
             blob_dropped_to_tail,
             blob_dropped_to_corruption,
         },
-    })
+    };
+
+    // Replay the incremental edit log layered on top of the snapshot. The log
+    // `edits-{snapshot_id}` holds every VersionEdit appended since the snapshot
+    // was written; applying them in order reconstructs the current version.
+    // `replay_log` returns only the durable prefix — a power-loss-truncated
+    // trailing edit is dropped (it was never acknowledged upward), which is the
+    // same tail-tolerance the snapshot sections already grant. Each applied edit
+    // advances `recovery.curr_version_id` past the snapshot's id.
+    let log_path = folder.join(format!("edits-{curr_version_id}"));
+    let edits = super::edit_log::replay_log(fs, &log_path)?;
+    if !edits.is_empty() {
+        log::info!(
+            "Replaying {} manifest edit(s) on top of snapshot #{curr_version_id}",
+            edits.len(),
+        );
+        for edit in &edits {
+            recovery.apply_edit(edit)?;
+        }
+    }
+
+    Ok(recovery)
 }
 
 #[cfg(test)]
@@ -1082,9 +1175,180 @@ pub fn recover(
 )]
 mod tests {
     use super::*;
+    use crate::coding::Encode;
     use crate::fs::{FsOpenOptions, MemFs};
+    use crate::version::edit::{AddedBlobFile, ChangedLevel, TableDesc, VersionEdit};
     use byteorder::{LittleEndian, WriteBytesExt};
     use std::io::Write;
+
+    /// A snapshot-state `Recovery` with the given level layout and no blobs /
+    /// GC stats — the starting point an edit is applied on top of.
+    fn recovery_with(version_id: u64, table_ids: Vec<Vec<Vec<RecoveredTable>>>) -> Recovery {
+        Recovery {
+            tree_type: TreeType::Standard,
+            snapshot_id: version_id,
+            curr_version_id: version_id,
+            table_ids,
+            blob_file_ids: Vec::new(),
+            gc_stats: crate::blob_tree::FragmentationMap::default(),
+            stats: RecoveryStats::default(),
+        }
+    }
+
+    fn rtable(id: u64, seqno: u64) -> RecoveredTable {
+        RecoveredTable {
+            id,
+            checksum: Checksum::from_raw(u128::from(id) * 31),
+            global_seqno: seqno,
+        }
+    }
+
+    fn tdesc(id: u64, seqno: u64) -> TableDesc {
+        TableDesc {
+            id,
+            checksum: u128::from(id) * 31,
+            global_seqno: seqno,
+        }
+    }
+
+    #[test]
+    fn apply_replaces_a_changed_levels_run_layout_wholesale() {
+        // L0 starts with one run; the edit gives it a two-run layout.
+        let mut rec = recovery_with(1, vec![vec![vec![rtable(1, 10)]]]);
+        let edit = VersionEdit {
+            new_version_id: 2,
+            changed_levels: vec![ChangedLevel {
+                level: 0,
+                runs: vec![vec![tdesc(1, 10)], vec![tdesc(2, 11)]],
+            }],
+            ..Default::default()
+        };
+        rec.apply_edit(&edit).expect("apply");
+
+        assert_eq!(rec.curr_version_id, 2);
+        assert_eq!(
+            rec.table_ids,
+            vec![vec![vec![rtable(1, 10)], vec![rtable(2, 11)]]],
+            "changed level's run grouping must be reconstructed exactly",
+        );
+    }
+
+    #[test]
+    fn apply_leaves_unmentioned_levels_untouched() {
+        let mut rec = recovery_with(1, vec![vec![vec![rtable(1, 10)]], vec![vec![rtable(9, 5)]]]);
+        // Edit only changes L0; L1 must survive verbatim.
+        let edit = VersionEdit {
+            new_version_id: 2,
+            changed_levels: vec![ChangedLevel {
+                level: 0,
+                runs: vec![vec![tdesc(3, 12)]],
+            }],
+            ..Default::default()
+        };
+        rec.apply_edit(&edit).expect("apply");
+
+        assert_eq!(rec.table_ids[0], vec![vec![rtable(3, 12)]]);
+        assert_eq!(
+            rec.table_ids[1],
+            vec![vec![rtable(9, 5)]],
+            "a level the edit does not mention is left as-is",
+        );
+    }
+
+    #[test]
+    fn apply_empties_a_drained_level() {
+        let mut rec = recovery_with(1, vec![vec![vec![rtable(1, 10)]]]);
+        let edit = VersionEdit {
+            new_version_id: 2,
+            changed_levels: vec![ChangedLevel {
+                level: 0,
+                runs: vec![],
+            }],
+            ..Default::default()
+        };
+        rec.apply_edit(&edit).expect("apply");
+        assert!(
+            rec.table_ids[0].is_empty(),
+            "a compaction that drains a level leaves zero runs",
+        );
+    }
+
+    #[test]
+    fn apply_grows_levels_for_a_higher_index() {
+        // Recovery snapshot only has L0; edit targets L2 (compaction output).
+        let mut rec = recovery_with(1, vec![vec![vec![rtable(1, 10)]]]);
+        let edit = VersionEdit {
+            new_version_id: 2,
+            changed_levels: vec![ChangedLevel {
+                level: 2,
+                runs: vec![vec![tdesc(5, 20)]],
+            }],
+            ..Default::default()
+        };
+        rec.apply_edit(&edit).expect("apply");
+        assert_eq!(rec.table_ids.len(), 3, "levels grew to fit index 2");
+        assert!(rec.table_ids[1].is_empty(), "the gap level is empty");
+        assert_eq!(rec.table_ids[2], vec![vec![rtable(5, 20)]]);
+    }
+
+    #[test]
+    fn apply_adds_updates_and_removes_blob_files() {
+        let mut rec = recovery_with(1, vec![]);
+        rec.blob_file_ids = vec![(100, Checksum::from_raw(1)), (200, Checksum::from_raw(2))];
+        let edit = VersionEdit {
+            new_version_id: 2,
+            added_blob_files: vec![
+                // New blob 300, plus an in-place checksum update of 100.
+                AddedBlobFile {
+                    id: 300,
+                    checksum: 9,
+                },
+                AddedBlobFile {
+                    id: 100,
+                    checksum: 7,
+                },
+            ],
+            removed_blob_file_ids: vec![200],
+            ..Default::default()
+        };
+        rec.apply_edit(&edit).expect("apply");
+
+        assert!(
+            !rec.blob_file_ids.iter().any(|(id, _)| *id == 200),
+            "removed blob is gone",
+        );
+        assert_eq!(
+            rec.blob_file_ids
+                .iter()
+                .find(|(id, _)| *id == 100)
+                .map(|(_, c)| *c),
+            Some(Checksum::from_raw(7)),
+            "existing blob's checksum updated in place",
+        );
+        assert!(
+            rec.blob_file_ids
+                .iter()
+                .any(|(id, c)| *id == 300 && *c == Checksum::from_raw(9)),
+            "new blob appended",
+        );
+    }
+
+    #[test]
+    fn apply_overwrites_gc_stats_when_present() {
+        let mut rec = recovery_with(1, vec![]);
+        let mut gc = crate::blob_tree::FragmentationMap::default();
+        gc.insert(42, crate::blob_tree::FragmentationEntry::new(2, 50, 60));
+        let mut bytes = Vec::new();
+        gc.encode_into(&mut bytes).expect("encode gc");
+
+        let edit = VersionEdit {
+            new_version_id: 2,
+            gc_stats: Some(bytes),
+            ..Default::default()
+        };
+        rec.apply_edit(&edit).expect("apply");
+        assert_eq!(rec.gc_stats, gc, "GC stats overwritten from the edit");
+    }
 
     /// Write a CURRENT pointer so `recover()` can find the version file.
     ///

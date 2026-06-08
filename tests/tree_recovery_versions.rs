@@ -234,6 +234,13 @@ fn tree_rejects_unsupported_manifest_version() -> lsm_tree::Result<()> {
 
 #[test]
 fn tree_recovery_version_free_list() -> lsm_tree::Result<()> {
+    // Under the incremental manifest a version upgrade appends a VersionEdit to
+    // the snapshot's `edits-{snapshot_id}` log rather than writing a full
+    // `v{id}` per version. So only the snapshot file (`v0`, which CURRENT points
+    // at) exists on disk; intermediate versions live in the log. The in-memory
+    // free list still tracks every version for MVCC. On reopen the snapshot is
+    // loaded and the log replayed, and orphan-cleanup keeps exactly that one
+    // snapshot generation (`v0` + `edits-0`).
     let folder = get_tmp_folder();
 
     let path = folder.path();
@@ -245,17 +252,31 @@ fn tree_recovery_version_free_list() -> lsm_tree::Result<()> {
             SequenceNumberCounter::default(),
         )
         .open()?;
-        assert!(path.join("v0").try_exists()?);
+        assert!(
+            path.join("v0").try_exists()?,
+            "create writes the v0 snapshot"
+        );
 
         tree.insert("a", "a", 0);
         tree.flush_active_memtable(0)?;
         assert_eq!(1, tree.version_free_list_len());
-        assert!(path.join("v1").try_exists()?);
+        // The flush appended an edit to the log, not a new snapshot file.
+        assert!(
+            path.join("edits-0").try_exists()?,
+            "first upgrade appends to the snapshot's edit log"
+        );
+        assert!(
+            !path.join("v1").try_exists()?,
+            "no per-version snapshot file is written on append"
+        );
 
         tree.insert("b", "b", 0);
         tree.flush_active_memtable(0)?;
         assert_eq!(2, tree.version_free_list_len());
-        assert!(path.join("v2").try_exists()?);
+        assert!(
+            !path.join("v2").try_exists()?,
+            "second upgrade also appends, no v2 snapshot"
+        );
     }
 
     {
@@ -266,12 +287,180 @@ fn tree_recovery_version_free_list() -> lsm_tree::Result<()> {
         )
         .open()?;
         assert_eq!(0, tree.version_free_list_len());
-        assert!(!path.join("v0").try_exists()?);
+        // CURRENT still points at the v0 snapshot, with its edit log layered on
+        // top — both survive orphan cleanup; there is no v1/v2 to clean.
+        assert!(
+            path.join("v0").try_exists()?,
+            "the snapshot CURRENT references is preserved across reopen"
+        );
+        assert!(
+            path.join("edits-0").try_exists()?,
+            "its edit log is preserved"
+        );
         assert!(!path.join("v1").try_exists()?);
-        assert!(path.join("v2").try_exists()?);
+        assert!(!path.join("v2").try_exists()?);
 
+        // The replayed edits reconstruct both flushed tables.
         assert!(tree.contains_key("a", 1)?);
         assert!(tree.contains_key("b", 1)?);
+    }
+
+    Ok(())
+}
+
+/// Crash safety of the incremental manifest: a power-loss-truncated trailing
+/// edit in the log is dropped on recovery, and the tree recovers exactly the
+/// durable prefix — the state after the last fully-fsynced edit.
+///
+/// Two flushes append two edits to `edits-0`. Truncating the file mid-second
+/// record simulates a crash between the second flush's edit being partially
+/// written and its fsync completing. On reopen the snapshot (`v0`, empty) plus
+/// the first edit are replayed; the torn second edit is discarded. So `a` (first
+/// flush) is present and `b` (second flush) is gone — the second flush was never
+/// durably committed to the manifest, which is the contract: an unacknowledged
+/// write may be lost, but the recovered state is always internally consistent.
+#[test]
+fn tree_recovers_durable_prefix_when_edit_log_tail_is_torn() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let path = folder.path();
+
+    let clean_after_first;
+    {
+        let tree = Config::new(
+            path,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .open()?;
+
+        tree.insert("a", "a", 0);
+        tree.flush_active_memtable(0)?;
+        // Size of the log after exactly one durable edit — the boundary the torn
+        // tail must collapse back to.
+        clean_after_first = std::fs::metadata(path.join("edits-0"))?.len();
+
+        tree.insert("b", "b", 1);
+        tree.flush_active_memtable(1)?;
+    }
+
+    // The second edit made the log strictly longer; chop part of it off so the
+    // trailing record is incomplete (a framing-checksum / truncation failure on
+    // replay, not a clean record boundary).
+    let full = std::fs::metadata(path.join("edits-0"))?.len();
+    assert!(
+        full > clean_after_first,
+        "second flush must have appended a second edit ({full} > {clean_after_first})"
+    );
+    let torn_len = clean_after_first + (full - clean_after_first) / 2;
+    let log = std::fs::OpenOptions::new()
+        .write(true)
+        .open(path.join("edits-0"))?;
+    log.set_len(torn_len)?;
+    log.sync_all()?;
+    drop(log);
+
+    {
+        let tree = Config::new(
+            path,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .open()?;
+
+        assert!(
+            tree.contains_key("a", 2)?,
+            "the first flush's edit was durable — its key must survive"
+        );
+        assert!(
+            !tree.contains_key("b", 2)?,
+            "the second flush's edit was torn off — its key must be dropped"
+        );
+    }
+
+    Ok(())
+}
+
+/// Rotation: with a tiny rotate threshold every upgrade after the first writes
+/// a fresh full snapshot, repoints CURRENT, and garbage-collects the previous
+/// snapshot + its edit log — leaving exactly one live `v{id}` generation. After
+/// several rotating flushes the tree reopens cleanly and all keys read back.
+///
+/// `manifest_log_rotate_bytes(0)` forces a rotation on every upgrade (any
+/// non-empty log already exceeds 0), so this exercises the rotation path — and
+/// its old-generation cleanup — cheaply, without writing a megabyte of edits.
+#[test]
+fn tree_rotates_snapshot_and_gcs_old_generation() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let path = folder.path();
+
+    {
+        let tree = Config::new(
+            path,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        // Threshold 1: the first upgrade appends (log 0 < 1), the next rotates
+        // (log now > 1), and so on — so the run alternates append / rotate and
+        // every rotation must clean the previous generation's snapshot AND log.
+        .manifest_log_rotate_bytes(1)
+        .open()?;
+
+        for i in 0u64..4 {
+            tree.insert(format!("k{i}"), format!("v{i}"), i);
+            tree.flush_active_memtable(i)?;
+
+            // Exactly one `v{id}` snapshot file exists at any time after a
+            // rotation (the old one is deleted once CURRENT is repointed).
+            let snapshots = std::fs::read_dir(path)?
+                .filter_map(Result::ok)
+                .filter(|e| {
+                    let n = e.file_name();
+                    let n = n.to_string_lossy();
+                    n.starts_with('v') && n[1..].bytes().all(|c| c.is_ascii_digit())
+                })
+                .count();
+            assert_eq!(
+                snapshots, 1,
+                "rotation must leave exactly one live snapshot file after flush {i}"
+            );
+
+            // The other half of the generation-GC contract: a rotation deletes
+            // the previous snapshot's edit log. At most one `edits-*` may exist
+            // at any point (the current snapshot's, present after an append and
+            // gone right after a rotate). A rotation that leaked old logs would
+            // accumulate them and trip this bound.
+            let edit_logs = std::fs::read_dir(path)?
+                .filter_map(Result::ok)
+                .filter(|e| {
+                    let n = e.file_name();
+                    let n = n.to_string_lossy();
+                    n.strip_prefix("edits-")
+                        .is_some_and(|rest| rest.bytes().all(|c| c.is_ascii_digit()))
+                })
+                .count();
+            assert!(
+                edit_logs <= 1,
+                "at most one edit log may exist; leaked old logs after flush {i} (found {edit_logs})"
+            );
+        }
+    }
+
+    // Reopen: the single surviving snapshot is the full current state (its log is
+    // empty just after a rotation), so every key reads back.
+    {
+        let tree = Config::new(
+            path,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .open()?;
+        for i in 0u64..4 {
+            assert_eq!(
+                Some(format!("v{i}").as_bytes().into()),
+                tree.get(format!("k{i}"), 100)?,
+                "key k{i} must survive rotation + reopen"
+            );
+        }
     }
 
     Ok(())

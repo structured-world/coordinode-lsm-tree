@@ -3,6 +3,9 @@
 // Copyright (c) 2026-present, Structured World Foundation
 
 mod blob_file_list;
+mod diff;
+pub mod edit;
+pub mod edit_log;
 // `framing` uses `std::io::{Read, Write}`. The whole `version`
 // module (recovery, persist, super_version, this file's
 // `Version::encode_into`) is also std-bound today and consumes

@@ -511,6 +511,19 @@ pub struct Config {
     /// `fsync`. Set via [`Config::sync_mode`].
     pub(crate) sync_mode: SyncMode,
 
+    /// Edit-log size (bytes) past which the next manifest persist rotates: it
+    /// writes a fresh full snapshot and starts an empty log instead of appending
+    /// another [`VersionEdit`](crate::version::edit::VersionEdit). Bounds both
+    /// recovery replay time (edits to re-apply) and log disk use, while keeping
+    /// the common per-flush path a tiny `O(changed-levels)` append rather than an
+    /// `O(all-SSTs)` full manifest rewrite.
+    ///
+    /// Defaults to 1 MiB (≈ tens of thousands of edits). Set via
+    /// [`Config::manifest_log_rotate_bytes`]. A smaller value rotates more
+    /// often (shorter recovery, more frequent full-snapshot writes); `0` rotates
+    /// on every upgrade, degenerating to the full-rewrite-per-version behaviour.
+    pub(crate) manifest_log_rotate_bytes: u64,
+
     /// Compaction I/O rate limit in bytes per second.
     ///
     /// Caps the rate at which the compaction worker is allowed to issue
@@ -666,6 +679,7 @@ impl Default for Config {
             encryption: None,
             manifest_recovery_mode: ManifestRecoveryMode::AbsoluteConsistency,
             sync_mode: SyncMode::Normal,
+            manifest_log_rotate_bytes: 1024 * 1024,
             compaction_rate_limit: 0,
 
             #[cfg(feature = "std")]
@@ -1392,6 +1406,18 @@ impl Config {
     #[must_use]
     pub fn sync_mode(mut self, mode: SyncMode) -> Self {
         self.sync_mode = mode;
+        self
+    }
+
+    /// Sets the edit-log rotation threshold in bytes (default 1 MiB).
+    ///
+    /// Once the manifest edit log exceeds this size, the next version upgrade
+    /// writes a fresh full snapshot and starts an empty log instead of appending
+    /// another edit. Lower it to shorten recovery replay and cap log size at the
+    /// cost of more frequent full-snapshot writes; `0` rotates on every upgrade.
+    #[must_use]
+    pub fn manifest_log_rotate_bytes(mut self, bytes: u64) -> Self {
+        self.manifest_log_rotate_bytes = bytes;
         self
     }
 
