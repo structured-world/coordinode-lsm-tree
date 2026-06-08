@@ -146,6 +146,15 @@ impl Config {
     /// compaction restructures it into proper levels (expect elevated I/O for a
     /// period proportional to the data size).
     ///
+    /// # Exclusive access (required)
+    ///
+    /// The caller MUST guarantee no other instance has this tree directory open.
+    /// Repair rewrites `CURRENT`, writes a fresh snapshot, and removes the stale
+    /// `edits-*` logs in place — `lsm-tree` takes no cross-process directory lock
+    /// here (nor does [`Config::open`]; exclusive directory ownership is the
+    /// embedder's responsibility). Running repair against a live tree corrupts
+    /// that instance's manifest state.
+    ///
     /// # Errors
     ///
     /// Returns [`crate::Error::FeatureUnsupported`] for KV-separated (blob)

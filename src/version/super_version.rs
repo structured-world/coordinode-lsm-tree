@@ -316,13 +316,28 @@ impl SuperVersions {
         )?;
         self.snapshot_id = next.id();
 
-        // CURRENT now names the new snapshot; the old generation is unreferenced.
-        // Delete its log first (so a crash here can't leave a long log attached
-        // to a snapshot CURRENT no longer points at), then the old snapshot file.
-        // Both removals tolerate a missing file (a prior crash may have raced).
-        remove_if_present(fs, &log_path)?;
+        // The durable commit point of a rotation is the CURRENT repoint inside
+        // `persist_version` above — past it, the rotation has SUCCEEDED. Deleting
+        // the old generation's log + snapshot is pure garbage collection, so it
+        // is best-effort: a failure here must NOT propagate, or the caller
+        // (`upgrade_version_with_seqno`) would skip `append_version` /
+        // `fetch_max` and keep stale in-memory state while CURRENT already names
+        // the new snapshot — an on-disk/in-memory divergence. A leaked old file
+        // is harmless and swept by `cleanup_orphaned_version` on the next open.
+        if let Err(e) = remove_if_present(fs, &log_path) {
+            log::warn!(
+                "rotation: failed to remove old edit log {}: {e}",
+                log_path.display()
+            );
+        }
         if old_snapshot != self.snapshot_id {
-            remove_if_present(fs, &tree_path.join(format!("v{old_snapshot}")))?;
+            let old_path = tree_path.join(format!("v{old_snapshot}"));
+            if let Err(e) = remove_if_present(fs, &old_path) {
+                log::warn!(
+                    "rotation: failed to remove old snapshot {}: {e}",
+                    old_path.display()
+                );
+            }
         }
         Ok(())
     }
