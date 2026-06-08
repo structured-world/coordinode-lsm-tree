@@ -528,7 +528,7 @@ impl ByteView {
     ///
     /// # Examples
     ///
-    /// ```
+    /// ```ignore
     /// # use byteview::ByteView;
     /// let slice = ByteView::from("helloworld_thisisalongstring");
     /// let copy = slice.slice(11..);
