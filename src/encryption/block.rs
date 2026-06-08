@@ -608,13 +608,12 @@ pub fn decrypt_block(
     // Reconstruct the BlockIdentity that participates in AAD using
     // the on-disk-mirrored fields from the MetadataPayload (dict_id,
     // window_log, block_type) plus the caller-supplied identity
-    // (tree_id, table_id, block_offset). Block-type byte goes
-    // through TryFrom so an unknown discriminator surfaces as
-    // MalformedMetadataFrame rather than being silently coerced.
+    // (table_id). Block-type byte goes through TryFrom so an unknown
+    // discriminator surfaces as MalformedMetadataFrame rather than
+    // being silently coerced.
     let block_type = crate::table::block::BlockType::try_from(parsed.block_type_byte)
         .map_err(|_| DecryptError::MalformedMetadataFrame("unknown BlockType byte"))?;
     let aad_identity = BlockIdentity {
-        tree_id: identity.tree_id,
         table_id: identity.table_id,
         block_type,
         dict_id: parsed.dict_id,
@@ -660,7 +659,6 @@ mod tests {
 
     fn id() -> BlockIdentity {
         BlockIdentity {
-            tree_id: 0xAABB_CCDD_EEFF_0011,
             table_id: 0x1234_5678_9ABC_DEF0,
             block_type: BlockType::Data,
             dict_id: 0,

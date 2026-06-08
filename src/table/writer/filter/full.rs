@@ -27,11 +27,6 @@ pub struct FullFilterWriter {
     /// `use_table_id` before `finish` runs.
     table_id: crate::TableId,
 
-    /// Owning SST's tree id. Set by the outer Writer via `use_tree_id`
-    /// before `finish` runs, so the filter block seals under the same
-    /// AAD the reader rebuilds.
-    tree_id: crate::tree::inner::TreeId,
-
     /// Page ECC scheme threaded by the outer Writer via `use_ecc`.
     /// `Some(params)` upgrades the filter block's `BlockTransform` to
     /// the matching `*Ecc` variant; `None` = no parity.
@@ -46,7 +41,6 @@ impl FullFilterWriter {
             prefix_extractor: None,
             encryption: None,
             table_id: 0,
-            tree_id: 0,
             ecc: None,
         }
     }
@@ -87,14 +81,6 @@ impl<W: std::io::Write + std::io::Seek> FilterWriter<W> for FullFilterWriter {
 
     fn use_table_id(mut self: Box<Self>, table_id: crate::TableId) -> Box<dyn FilterWriter<W>> {
         self.table_id = table_id;
-        self
-    }
-
-    fn use_tree_id(
-        mut self: Box<Self>,
-        tree_id: crate::tree::inner::TreeId,
-    ) -> Box<dyn FilterWriter<W>> {
-        self.tree_id = tree_id;
         self
     }
 
@@ -165,7 +151,6 @@ impl<W: std::io::Write + std::io::Seek> FilterWriter<W> for FullFilterWriter {
             file_writer,
             &filter_bytes,
             crate::table::block::BlockIdentity {
-                tree_id: self.tree_id,
                 table_id: self.table_id,
                 block_type: crate::table::block::BlockType::Filter,
                 dict_id: 0,

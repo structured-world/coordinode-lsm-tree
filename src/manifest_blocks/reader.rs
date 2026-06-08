@@ -46,8 +46,8 @@ use crate::{
     encryption::EncryptionProvider,
     fs::{Fs, FsFile, FsOpenOptions},
     manifest_blocks::{
-        HEAD_FOOTER_RESERVED_SIZE, MANIFEST_TABLE_ID_SENTINEL, MANIFEST_TREE_ID_SENTINEL,
-        MAX_MANIFEST_BLOCK_SIZE, TAIL_FOOTER_SIZE_HINT_BYTES,
+        HEAD_FOOTER_RESERVED_SIZE, MANIFEST_TABLE_ID_SENTINEL, MAX_MANIFEST_BLOCK_SIZE,
+        TAIL_FOOTER_SIZE_HINT_BYTES,
         footer::{FooterPayload, TocEntry},
     },
     runtime_config::RuntimeConfig,
@@ -340,7 +340,6 @@ impl ManifestArchiveReader {
 
         validate_block_header_fits(&block_bytes, HeaderContext::SectionExact)?;
         let identity = BlockIdentity {
-            tree_id: MANIFEST_TREE_ID_SENTINEL,
             table_id: MANIFEST_TABLE_ID_SENTINEL,
             block_type: BlockType::Manifest,
             dict_id: 0,
@@ -602,7 +601,6 @@ fn read_tail_footer(
     file.read_exact(&mut footer_buf)?;
     validate_block_header_fits(&footer_buf, HeaderContext::FooterExact)?;
     let identity = BlockIdentity {
-        tree_id: MANIFEST_TREE_ID_SENTINEL,
         table_id: MANIFEST_TABLE_ID_SENTINEL,
         block_type: BlockType::ManifestFooter,
         dict_id: 0,
@@ -643,7 +641,6 @@ fn read_head_footer(
 
     validate_block_header_fits(&head_buf, HeaderContext::FooterPadded)?;
     let identity = BlockIdentity {
-        tree_id: MANIFEST_TREE_ID_SENTINEL,
         table_id: MANIFEST_TABLE_ID_SENTINEL,
         block_type: BlockType::ManifestFooter,
         dict_id: 0,

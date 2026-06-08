@@ -121,7 +121,6 @@ impl Metadata {
                 // but choosing the asymmetric `self.id` here would
                 // bake a permanent decrypt-mismatch into any
                 // encrypted blob meta we ever write.
-                tree_id: 0,
                 table_id: 0,
                 block_type: crate::table::block::BlockType::Meta,
                 dict_id: 0,
@@ -157,7 +156,6 @@ impl Metadata {
                 // the table-meta parse path: cross-blob swap
                 // detection still relies on the meta payload's
                 // own id field being part of the verified body.
-                tree_id: 0,
                 table_id: 0,
                 block_type: crate::table::block::BlockType::Meta,
                 dict_id: 0,

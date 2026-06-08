@@ -194,14 +194,11 @@ impl ParsedMeta {
             file,
             *handle,
             crate::table::block::BlockIdentity {
-                // Meta is the FIRST block read during table open;
-                // table_id is what meta itself carries (chicken-and-
-                // egg). Binding the meta block's AAD to its own
-                // file offset still gives block-swap resistance
-                // within a single file; cross-file substitution is
-                // prevented by the meta block's own table_id field
-                // being part of the verified payload.
-                tree_id: 0,
+                // Meta is the FIRST block read during table open, so its
+                // own table_id isn't known yet (chicken-and-egg) — bind 0.
+                // Cross-file substitution is still prevented because the
+                // meta block's own table_id field is part of the verified
+                // payload.
                 table_id: 0,
                 block_type: BlockType::Meta,
                 dict_id: 0,

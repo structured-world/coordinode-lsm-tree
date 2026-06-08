@@ -123,6 +123,94 @@ fn block_ecc_params(header: &Header, transform: &BlockTransform<'_>) -> EccParam
     }
 }
 
+/// On-disk `CompressionType` tag byte (spec §5.1 registry: 0 none, 1 lz4,
+/// 3 zstd, 4 zstd+dict). Used as the AAD-bound `compression_type` field so a
+/// codec relabel (e.g. forging a different window/dict context) fails AEAD
+/// verification. Mirrors the leading byte of [`CompressionType`]'s `Encode`.
+#[cfg(zstd_any)]
+fn compression_tag_byte(compression: CompressionType) -> u8 {
+    match compression {
+        CompressionType::None => 0,
+        #[cfg(feature = "lz4")]
+        CompressionType::Lz4 => 1,
+        CompressionType::Zstd(_) => 3,
+        CompressionType::ZstdDict { .. } => 4,
+    }
+}
+
+/// Seal a (post-compression) block payload for the on-disk encryption envelope.
+///
+/// Under zstd builds this is the AAD-bound `MetadataFrame ‖ BodyFrame` envelope
+/// ([`EncryptionProvider::encrypt_block_aad`]) binding the block identity +
+/// transform context. Without zstd the wire-format frame is unavailable, so it
+/// falls back to the opaque `[nonce ‖ ciphertext ‖ tag]` form. `owned` is the
+/// compressor's output (reused in-place on the opaque path); `borrow` is the
+/// raw `data` for the uncompressed case.
+#[cfg_attr(
+    zstd_any,
+    expect(
+        clippy::needless_pass_by_value,
+        reason = "owned is consumed by encrypt_vec on the non-zstd path; the AAD \
+                  path only borrows it, so by-value is needed for the other cfg"
+    )
+)]
+fn encrypt_block_payload(
+    enc: &dyn crate::encryption::EncryptionProvider,
+    owned: Option<Vec<u8>>,
+    borrow: &[u8],
+    identity: &BlockIdentity,
+    compression: CompressionType,
+    block_flags: u8,
+) -> crate::Result<Vec<u8>> {
+    #[cfg(zstd_any)]
+    {
+        let plaintext = owned.as_deref().unwrap_or(borrow);
+        enc.encrypt_block_aad(
+            plaintext,
+            identity,
+            compression_tag_byte(compression),
+            block_flags,
+        )
+    }
+    #[cfg(not(zstd_any))]
+    {
+        let _ = (identity, compression, block_flags);
+        match owned {
+            Some(buf) => enc.encrypt_vec(buf),
+            None => enc.encrypt(borrow),
+        }
+    }
+}
+
+/// Inverse of [`encrypt_block_payload`]: recover the plaintext from the on-disk
+/// envelope. Under zstd builds it verifies the AAD binding via
+/// [`EncryptionProvider::decrypt_block_aad`] (the reader supplies only
+/// `identity`; the transform fields are read back from the frame); without zstd
+/// it falls back to the opaque in-place `decrypt_vec`.
+#[cfg_attr(
+    zstd_any,
+    expect(
+        clippy::needless_pass_by_value,
+        reason = "raw is consumed by decrypt_vec on the non-zstd path; the AAD path \
+                  only borrows it, so by-value is needed for the other cfg"
+    )
+)]
+fn decrypt_block_payload(
+    enc: &dyn crate::encryption::EncryptionProvider,
+    raw: Vec<u8>,
+    identity: &BlockIdentity,
+) -> crate::Result<Vec<u8>> {
+    #[cfg(zstd_any)]
+    {
+        enc.decrypt_block_aad(&raw, identity)
+    }
+    #[cfg(not(zstd_any))]
+    {
+        let _ = identity;
+        enc.decrypt_vec(raw)
+    }
+}
+
 /// Classifies the on-disk trailer (bytes after the `data_length` payload) into
 /// an [`EccStatus`], or `Err` on a framing violation.
 ///
@@ -563,25 +651,34 @@ impl Block {
             }
         }
 
-        // Encryption step — reuses the owned compression buffer via encrypt_vec
-        // when available, eliminating one allocation on the compress+encrypt path.
+        // Encryption step — under zstd this seals the AAD-bound envelope
+        // binding the block identity + transform context; otherwise the opaque
+        // form, reusing the owned compression buffer when present.
         let encrypted_buf: Option<Vec<u8>>;
 
         #[cfg(any(feature = "lz4", zstd_any))]
         {
-            encrypted_buf = if let Some(enc) = encryption {
-                Some(match compressed_buf.take() {
-                    Some(owned) => enc.encrypt_vec(owned)?,
-                    None => enc.encrypt(data)?,
+            encrypted_buf = encryption
+                .map(|enc| {
+                    encrypt_block_payload(
+                        enc,
+                        compressed_buf.take(),
+                        data,
+                        &identity,
+                        compression,
+                        block_flags,
+                    )
                 })
-            } else {
-                None
-            };
+                .transpose()?;
         }
 
         #[cfg(not(any(feature = "lz4", zstd_any)))]
         {
-            encrypted_buf = encryption.map(|enc| enc.encrypt(data)).transpose()?;
+            encrypted_buf = encryption
+                .map(|enc| {
+                    encrypt_block_payload(enc, None, data, &identity, compression, block_flags)
+                })
+                .transpose()?;
         }
 
         // Determine the final on-disk payload. Owns a fresh buffer when a
@@ -701,12 +798,10 @@ impl Block {
         let encryption = transform.encryption();
         #[cfg(zstd_any)]
         let zstd_dict = transform.zstd_dict();
-        // identity carries table_id / offset / dict_id / window_log
-        // for AAD construction once AEAD wiring lands; unused on the
-        // read path today (block_type is derived from the parsed
-        // header rather than asserted against identity.block_type —
-        // mismatch detection is part of the AEAD-bound spec).
-        let _ = identity;
+        // `identity` (tree/table + dict/window context) feeds AAD
+        // reconstruction on the encrypted path; `block_type` is still derived
+        // from the parsed header (the frame self-describes it), not asserted
+        // against identity.block_type.
         let header = Header::decode_from(reader)?;
 
         // Validate both size fields before any I/O or hashing to fail fast
@@ -757,8 +852,9 @@ impl Block {
                 block_ecc_params(&header, transform),
             )?;
 
-            // Decrypt in-place, reusing the read buffer.
-            let decrypted = enc.decrypt_vec(raw_vec)?;
+            // Recover the plaintext: AAD-bound envelope under zstd (verifies the
+            // block identity), opaque in-place decrypt otherwise.
+            let decrypted = decrypt_block_payload(enc, raw_vec, &identity)?;
 
             match compression {
                 CompressionType::None => {
@@ -973,12 +1069,8 @@ impl Block {
         let encryption = transform.encryption();
         #[cfg(zstd_any)]
         let zstd_dict = transform.zstd_dict();
-        // identity carries AAD context; unused today. handle gives
-        // the byte offset (caller already computed it), identity
-        // packages it alongside the table_id + compression-context
-        // fields so the read path's AEAD verification (#251) can
-        // reconstruct the same AAD the writer used.
-        let _ = identity;
+        // `identity` (tree/table + compression context) feeds AAD
+        // reconstruction on the encrypted read path below.
         // handle.size() includes Header::MIN_LEN + payload +
         // optional ECC parity trailer. Encrypted blocks add
         // provider-specific overhead to the on-disk size, AND ECC
@@ -1142,7 +1234,7 @@ impl Block {
                 )?
             };
 
-            let decrypted = enc.decrypt_vec(buf)?;
+            let decrypted = decrypt_block_payload(enc, buf, &identity)?;
 
             let data = match compression {
                 CompressionType::None => {

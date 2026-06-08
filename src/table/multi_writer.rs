@@ -22,10 +22,6 @@ use std::{path::PathBuf, sync::Arc};
 pub struct MultiWriter {
     pub(crate) fs: Arc<dyn Fs>,
 
-    /// Owning tree id, threaded into every successor [`Writer`] so each block's
-    /// AAD identity binds the tree (anti-cross-tree replay).
-    tree_id: crate::tree::inner::TreeId,
-
     pub(crate) base_path: PathBuf,
 
     data_block_hash_ratio: f32,
@@ -120,7 +116,6 @@ impl MultiWriter {
     /// Sets up a new `MultiWriter` at the given tables folder
     pub fn new(
         base_path: PathBuf,
-        tree_id: crate::tree::inner::TreeId,
         table_id_generator: SequenceNumberCounter,
         target_size: u64,
         initial_level: u8,
@@ -129,11 +124,10 @@ impl MultiWriter {
         let current_table_id = table_id_generator.next();
 
         let path = base_path.join(current_table_id.to_string());
-        let writer = Writer::new(path, tree_id, current_table_id, initial_level, fs.clone())?;
+        let writer = Writer::new(path, current_table_id, initial_level, fs.clone())?;
 
         Ok(Self {
             fs,
-            tree_id,
             initial_level,
 
             base_path,
@@ -547,20 +541,14 @@ impl MultiWriter {
         let new_table_id = self.table_id_generator.next();
         let path = self.base_path.join(new_table_id.to_string());
 
-        let mut new_writer = Writer::new(
-            path,
-            self.tree_id,
-            new_table_id,
-            self.initial_level,
-            self.fs.clone(),
-        )?
-        .use_data_block_compression(self.data_block_compression)
-        .use_index_block_compression(self.index_block_compression)
-        .use_data_block_size(self.data_block_size)
-        .use_data_block_restart_interval(self.data_block_restart_interval)
-        .use_index_block_restart_interval(self.index_block_restart_interval)
-        .use_bloom_policy(self.bloom_policy)
-        .use_data_block_hash_ratio(self.data_block_hash_ratio);
+        let mut new_writer = Writer::new(path, new_table_id, self.initial_level, self.fs.clone())?
+            .use_data_block_compression(self.data_block_compression)
+            .use_index_block_compression(self.index_block_compression)
+            .use_data_block_size(self.data_block_size)
+            .use_data_block_restart_interval(self.data_block_restart_interval)
+            .use_index_block_restart_interval(self.index_block_restart_interval)
+            .use_bloom_policy(self.bloom_policy)
+            .use_data_block_hash_ratio(self.data_block_hash_ratio);
 
         if let Some(threshold) = self.index_spill_threshold {
             new_writer = new_writer.use_adaptive_index(threshold);
@@ -741,7 +729,7 @@ mod tests {
         let fs: Arc<dyn crate::fs::Fs> = Arc::new(StdFs);
 
         // Tiny target_size to force rotation between "l" and "q"
-        let mut mw = super::MultiWriter::new(base_path.clone(), 0, id_gen, 100, 1, fs)?
+        let mut mw = super::MultiWriter::new(base_path.clone(), id_gen, 100, 1, fs)?
             .use_clip_range_tombstones();
 
         mw.set_range_tombstones(vec![RangeTombstone::new(
@@ -836,7 +824,7 @@ mod tests {
         let id_gen = SequenceNumberCounter::default();
         let fs: Arc<dyn crate::fs::Fs> = Arc::new(StdFs);
 
-        let mut mw = super::MultiWriter::new(base_path.clone(), 0, id_gen, 100, 1, fs)?
+        let mut mw = super::MultiWriter::new(base_path.clone(), id_gen, 100, 1, fs)?
             .use_clip_range_tombstones();
 
         // RT [m, r) — end "r" > next table's first key "q", so after

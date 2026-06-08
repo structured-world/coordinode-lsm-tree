@@ -60,17 +60,6 @@ pub trait FilterWriter<W: std::io::Write + std::io::Seek> {
     /// written blocks bind to `table_id = 0`.
     fn use_table_id(self: Box<Self>, table_id: crate::TableId) -> Box<dyn FilterWriter<W>>;
 
-    /// Sets the owning tree id. Used by `finish()` to populate
-    /// `BlockIdentity::tree_id` when writing filter blocks, so they
-    /// seal under the same AAD the reader rebuilds (the reader opens
-    /// filter blocks with the real tree id). MUST be called by the
-    /// owning Writer before `finish()`, otherwise the blocks bind to
-    /// `tree_id = 0`.
-    fn use_tree_id(
-        self: Box<Self>,
-        tree_id: crate::tree::inner::TreeId,
-    ) -> Box<dyn FilterWriter<W>>;
-
     /// Wires the resolved Page ECC scheme through to every
     /// `Block::write_into` call this filter writer makes. `Some(params)`
     /// applies `.with_ecc(params)` so the matching `*Ecc` variant emits

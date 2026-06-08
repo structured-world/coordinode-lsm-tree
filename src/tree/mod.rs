@@ -506,7 +506,6 @@ impl AbstractTree for Tree {
 
         let mut table_writer = MultiWriter::new(
             folder.clone(),
-            self.id,
             self.table_id_counter.clone(),
             64 * 1_024 * 1_024,
             0,

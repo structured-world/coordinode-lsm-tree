@@ -40,11 +40,6 @@ pub struct PartitionedIndexWriter {
     /// `use_table_id` before `cut_index_block` / `finish` runs.
     table_id: crate::TableId,
 
-    /// Owning SST's tree id. Set by the outer Writer via `use_tree_id`
-    /// before `cut_index_block` / `finish` runs, so sub-index + TLI
-    /// blocks seal under the same AAD the reader rebuilds.
-    tree_id: crate::tree::inner::TreeId,
-
     /// `Config::page_ecc` threaded by the outer Writer via
     /// `use_page_ecc`. When `true`, every `BlockTransform` this
     /// index writer constructs for the sub-index + TLI blocks
@@ -71,7 +66,6 @@ impl PartitionedIndexWriter {
 
             encryption: None,
             table_id: 0,
-            tree_id: 0,
             ecc: None,
         }
     }
@@ -88,7 +82,6 @@ impl PartitionedIndexWriter {
             &mut self.block_buffer,
             &bytes,
             crate::table::block::BlockIdentity {
-                tree_id: self.tree_id,
                 table_id: self.table_id,
                 block_type: crate::table::block::BlockType::Index,
                 dict_id: 0,
@@ -174,7 +167,6 @@ impl PartitionedIndexWriter {
             file_writer,
             &bytes,
             crate::table::block::BlockIdentity {
-                tree_id: self.tree_id,
                 table_id: self.table_id,
                 block_type: crate::table::block::BlockType::Index,
                 dict_id: 0,
@@ -235,14 +227,6 @@ impl<W: std::io::Write + std::io::Seek> BlockIndexWriter<W> for PartitionedIndex
 
     fn use_table_id(mut self: Box<Self>, table_id: crate::TableId) -> Box<dyn BlockIndexWriter<W>> {
         self.table_id = table_id;
-        self
-    }
-
-    fn use_tree_id(
-        mut self: Box<Self>,
-        tree_id: crate::tree::inner::TreeId,
-    ) -> Box<dyn BlockIndexWriter<W>> {
-        self.tree_id = tree_id;
         self
     }
 

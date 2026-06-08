@@ -33,29 +33,25 @@
 //! **Allowed zero exceptions in production code** (each individually
 //! documented at the call site):
 //!
-//! - `tree_id = 0` is allowed at any site that doesn't yet have
-//!   the owning Tree's id threaded through to it (most current
-//!   call sites — Writer / Table / Scanner predate `tree_id`
-//!   plumbing). The substitute defence is per-tree encryption-
-//!   provider isolation: a tree's keys decrypt only its own
-//!   blocks, so cross-tree substitution fails at the key layer.
-//!   Plumbing real `tree_id` is a follow-up that strengthens the
-//!   guarantee at the AAD layer regardless of key isolation.
 //! - `table_id = 0` is allowed when reading a META block that
 //!   itself CARRIES the `table_id` field — there's no way to
 //!   know the id before the block is parsed (chicken-and-egg).
 //!   Cross-store substitution is still prevented because the
 //!   meta payload's own id field is part of the verified body.
 //!
-//! **Block position is deliberately NOT part of the identity.**
-//! AAD binds `(tree_id, table_id)` plus the codec context, but
-//! never a per-block byte offset. Offset-independent AAD is what
-//! lets a writer encrypt every block of a table in parallel (the
-//! on-disk offset isn't known until placement). The cost is that
-//! two blocks of the SAME table are interchangeable at the AEAD
-//! layer; block-position integrity is supplied one layer up by the
-//! authenticated index (key-range -> offset) plus the structural
-//! file layout, not by per-block AEAD.
+//! **Neither block position nor tree id is part of the identity.**
+//! AAD binds `table_id` plus the codec context, but never a per-block
+//! byte offset nor the owning tree id. Offset-independent AAD lets a
+//! writer encrypt every block of a table in parallel (the on-disk
+//! offset isn't known until placement). The tree id is a
+//! process-ephemeral counter, not durable across reopen, so binding it
+//! would fail AEAD verify after a restart; cross-tree substitution is
+//! instead prevented by per-tree key isolation (a tree's blocks decrypt
+//! only under its own key). The cost of dropping the offset is that two
+//! blocks of the SAME table are interchangeable at the AEAD layer;
+//! block-position integrity is supplied one layer up by the
+//! authenticated index (key-range -> offset) plus the structural file
+//! layout, not by per-block AEAD.
 
 use crate::table::block::BlockType;
 
@@ -66,35 +62,14 @@ use crate::table::block::BlockType;
 /// docstring for the rationale.
 #[derive(Clone, Copy, Debug)]
 pub struct BlockIdentity {
-    /// Identifier of the owning tree (database). `0` is the
-    /// allowed-zero default for sites that don't yet have the
-    /// owning Tree's id plumbed to them (see the module
-    /// docstring's exception list — most current writer / reader
-    /// paths fall here, including blob-file metadata: `BlobFileId`
-    /// is itself a per-tree counter that can collide across
-    /// trees, so it can't substitute for a real `tree_id`).
-    /// Combined with [`Self::table_id`] this gives the
-    /// [`crate::table::GlobalTableId`] shape: `TableId` alone is
-    /// a per-tree counter that CAN collide across different
-    /// trees, so AAD that binds only `table_id` would permit
-    /// cross-tree block substitution if the same encryption key
-    /// were ever reused across trees. Including
-    /// `tree_id` closes that gap at the AAD layer regardless of
-    /// key isolation.
-    ///
-    /// Callers that don't have `tree_id` plumbed yet pass `0` and
-    /// rely on per-tree encryption-provider isolation as the
-    /// substitute defence; see the module docstring for the list
-    /// of allowed-zero exceptions.
-    pub tree_id: u64,
-
     /// Identifier of the owning store unit — for SST blocks this is
     /// the per-tree [`crate::TableId`] (a `u64` alias); for blob
     /// files it is the `crate::vlog::BlobFileId` (also a `u64`
-    /// alias). Combined with [`Self::tree_id`], gives the
-    /// per-process unique discriminator that prevents cross-store
-    /// block-swap attacks: AAD built from `(tree_id, table_id)`
-    /// rejects any block whose declared origin doesn't match.
+    /// alias). Bound into the AAD so a block cannot be substituted for
+    /// one from a different table. The owning tree id is deliberately
+    /// NOT part of the identity (it is process-ephemeral, not durable
+    /// across reopen); cross-tree substitution is prevented by per-tree
+    /// key isolation instead. See the module docstring.
     pub table_id: u64,
 
     /// Whether this is a Data, Filter, Index, or Meta block.
@@ -129,7 +104,6 @@ impl BlockIdentity {
     #[must_use]
     pub(crate) const fn for_test(table_id: u64, block_type: BlockType) -> Self {
         Self {
-            tree_id: 0,
             table_id,
             block_type,
             dict_id: 0,

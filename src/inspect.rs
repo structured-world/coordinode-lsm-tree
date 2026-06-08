@@ -349,7 +349,6 @@ fn load_index_block(
         file,
         handle,
         BlockIdentity {
-            tree_id: 0,
             table_id,
             // Match the writer: index blocks are emitted with
             // `block_offset: 0` (see `Table::read_tli`'s comment for
@@ -780,7 +779,6 @@ fn load_data_block_iter(
         file,
         *handle,
         BlockIdentity {
-            tree_id: 0,
             table_id,
             // Same writer / reader agreement as TLI / filter: writer
             // emits data blocks with `block_offset` set to a
@@ -996,7 +994,6 @@ pub fn read_filter_stats(path: &Path) -> crate::Result<Option<FilterStats>> {
         &*file,
         filter_handle,
         BlockIdentity {
-            tree_id: 0,
             table_id,
             block_type: BlockType::Filter,
             dict_id: 0,

@@ -349,7 +349,17 @@ fn thread_local_rng<R>(f: impl FnOnce(&mut rand_chacha::ChaCha20Rng) -> R) -> R 
 #[cfg(feature = "encryption")]
 impl EncryptionProvider for Aes256GcmProvider {
     fn max_overhead(&self) -> u32 {
-        // OVERHEAD = NONCE_LEN + TAG_LEN = 28, always fits u32.
+        // The block path under zstd seals the AAD-bound `MetadataFrame ‖
+        // BodyFrame` envelope, whose framing overhead over the plaintext is
+        // 8 (meta SFA header) + 39 (meta payload, incl. 12-byte nonce) +
+        // 8 (body SFA header) + 16 (auth tag) = 71 bytes. Without zstd the
+        // opaque `[nonce ‖ ciphertext ‖ tag]` form is used: NONCE_LEN +
+        // TAG_LEN = 28. This bound sizes the read-path payload check.
+        #[cfg(zstd_any)]
+        {
+            8 + 39 + 8 + 16
+        }
+        #[cfg(not(zstd_any))]
         #[expect(clippy::cast_possible_truncation, reason = "OVERHEAD is 28")]
         {
             Self::OVERHEAD as u32

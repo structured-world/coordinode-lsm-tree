@@ -42,23 +42,24 @@
 //! 5       1     KeyEpoch          Mirror of disk
 //! 6       1     BlockType         Mirror of disk
 //! 7       1     SuiteID           Mirror of disk
-//! 8       8     TreeID            u64 BE, caller-supplied
-//! 16      8     TableID           u64 BE, caller-supplied
-//! 24      1     CompressionType   Mirror of disk
-//! 25      4     DictID            u32 BE, mirror of disk
-//! 29      1     WindowLog         Mirror of disk
-//! 30      1     BlockFlags        Mirror of disk (transform-presence
+//! 8       8     TableID           u64 BE, caller-supplied
+//! 16      1     CompressionType   Mirror of disk
+//! 17      4     DictID            u32 BE, mirror of disk
+//! 21      1     WindowLog         Mirror of disk
+//! 22      1     BlockFlags        Mirror of disk (transform-presence
 //!                                 bitfield: KV footer / ECC / compressed /
 //!                                 encrypted) — binds the block's transform
 //!                                 stack so a flag relabel fails AEAD
 //! ══════
-//! Total   31 bytes
+//! Total   23 bytes
 //! ```
 //!
-//! A block's byte offset is intentionally absent: the on-disk offset is unknown
-//! to several writers and varies across MID/tail/head mirrors of one block, so
-//! binding it would break those paths and force serial encryption. Cross-tree /
-//! cross-table substitution is bound via `tree_id` + `table_id`.
+//! Neither a block's byte offset nor the owning tree id is bound. The offset is
+//! unknown to several writers and varies across MID/tail/head mirrors, so
+//! binding it would break those paths and force serial encryption. The tree id
+//! is a process-ephemeral counter (not durable across reopen), so binding it
+//! would fail AEAD verify after a restart. Cross-table substitution is bound via
+//! `table_id`; cross-tree substitution is prevented by per-tree key isolation.
 
 use core::convert::TryFrom;
 
@@ -66,10 +67,10 @@ pub use crate::table::block::{BlockIdentity, BlockType};
 
 /// Length of the AAD buffer in bytes.
 ///
-/// Spec-locked: see `docs/aad-block-format.md` §5.3. A block's byte offset is
-/// not bound (see [`build`]), so the buffer is 31 bytes (was 39 before the
-/// offset was dropped).
-pub const AAD_LEN: usize = 31;
+/// Spec-locked: see `docs/aad-block-format.md` §5.3. Neither a block's byte
+/// offset nor the owning tree id is bound (see [`build`]), so the buffer is
+/// 23 bytes.
+pub const AAD_LEN: usize = 23;
 
 /// First four bytes of the AAD: the literal `MetadataFrame` magic.
 ///
@@ -201,7 +202,7 @@ impl EncryptionContext {
     }
 }
 
-/// Build the 39-byte AAD buffer from the encryption context and the
+/// Build the 23-byte AAD buffer from the encryption context and the
 /// per-block identity.
 ///
 /// The returned array is the exact buffer to pass to the AEAD primitive
@@ -226,24 +227,26 @@ pub fn build(ctx: &EncryptionContext, identity: &BlockIdentity) -> [u8; AAD_LEN]
     buf[6] = u8::from(identity.block_type);
     buf[7] = ctx.suite_id.as_byte();
 
-    // Offset 8..24: two u64 BE identity fields (NEVER on disk). block_offset is
-    // intentionally NOT bound: the on-disk offset is unknown to several writers
-    // (sfa-wrapped index/filter writers, the parallel compressor) and varies
-    // across MID/tail/head mirrors of one block, so binding it would break those
-    // paths and force serial encryption. Cross-tree / cross-table substitution
-    // is bound via tree_id + table_id; intra-file block-swap degrades only to a
+    // Offset 8..16: the u64 BE table id (NEVER on disk). Neither a block's byte
+    // offset nor the owning tree id is bound: the offset is unknown to several
+    // writers (sfa-wrapped index/filter writers, the parallel compressor) and
+    // varies across MID/tail/head mirrors, so binding it would break those paths
+    // and force serial encryption; the tree id is a process-ephemeral counter
+    // (not durable across reopen), so binding it would fail AEAD verify after a
+    // restart. Cross-table substitution is bound via table_id; cross-tree
+    // substitution is prevented by per-tree key isolation (a tree's blocks
+    // decrypt only under its own key). Intra-file block-swap degrades only to a
     // lookup miss (a value is inseparable from its key inside the authenticated
     // block), not forgery.
-    buf[8..16].copy_from_slice(&identity.tree_id.to_be_bytes());
-    buf[16..24].copy_from_slice(&identity.table_id.to_be_bytes());
+    buf[8..16].copy_from_slice(&identity.table_id.to_be_bytes());
 
-    // Offset 24..30: disk-mirrored codec context.
-    buf[24] = ctx.compression_type;
-    buf[25..29].copy_from_slice(&identity.dict_id.to_be_bytes());
-    buf[29] = identity.window_log;
+    // Offset 16..22: disk-mirrored codec context.
+    buf[16] = ctx.compression_type;
+    buf[17..21].copy_from_slice(&identity.dict_id.to_be_bytes());
+    buf[21] = identity.window_log;
 
-    // Offset 30: disk-mirrored transform-presence flags.
-    buf[30] = ctx.block_flags;
+    // Offset 22: disk-mirrored transform-presence flags.
+    buf[22] = ctx.block_flags;
 
     buf
 }
@@ -252,9 +255,8 @@ pub fn build(ctx: &EncryptionContext, identity: &BlockIdentity) -> [u8; AAD_LEN]
 mod tests {
     use super::*;
 
-    fn identity(tree_id: u64, table_id: u64, bt: BlockType) -> BlockIdentity {
+    fn identity(table_id: u64, bt: BlockType) -> BlockIdentity {
         BlockIdentity {
-            tree_id,
             table_id,
             block_type: bt,
             dict_id: 0,
@@ -265,9 +267,9 @@ mod tests {
     #[test]
     fn aad_len_matches_spec() {
         // Hard-coded to catch any drift between `AAD_LEN` and the spec's
-        // 31-byte total (block_offset dropped). The encoder/decoder rely on
-        // this exact size.
-        assert_eq!(AAD_LEN, 31);
+        // 23-byte total (block offset + tree id both unbound). The
+        // encoder/decoder rely on this exact size.
+        assert_eq!(AAD_LEN, 23);
     }
 
     #[test]
@@ -318,7 +320,7 @@ mod tests {
         // Synthesise a concrete AAD payload and check every offset
         // matches the spec. The values picked here are non-degenerate:
         // each field uses a recognisable bit pattern so a layout mistake
-        // (e.g. swapping table_id and block_offset) is immediately
+        // (e.g. swapping table_id and the codec context) is immediately
         // visible in the diff.
         let ctx = EncryptionContext::v1(
             0x55, // key_epoch
@@ -327,7 +329,6 @@ mod tests {
             0x05, // block_flags: KV_CHECKSUM_FOOTER | COMPRESSED (bits 0,2)
         );
         let identity = BlockIdentity {
-            tree_id: 0x0102_0304_0506_0708,
             table_id: 0x1112_1314_1516_1718,
             block_type: BlockType::Index, // 1
             dict_id: 0xDEAD_BEEF,
@@ -346,30 +347,27 @@ mod tests {
         assert_eq!(aad[6], 1);
         // SuiteID: ChaCha20-Poly1305 = 0x03
         assert_eq!(aad[7], 0x03);
-        // TreeID (BE)
-        assert_eq!(&aad[8..16], &0x0102_0304_0506_0708u64.to_be_bytes());
-        // TableID (BE)
-        assert_eq!(&aad[16..24], &0x1112_1314_1516_1718u64.to_be_bytes());
-        // CompressionType (block_offset is no longer bound, so codec context
-        // starts right after table_id)
-        assert_eq!(aad[24], 3);
+        // TableID (BE) — neither block offset nor tree id is bound, so the
+        // table id sits right after the 8-byte preamble.
+        assert_eq!(&aad[8..16], &0x1112_1314_1516_1718u64.to_be_bytes());
+        // CompressionType
+        assert_eq!(aad[16], 3);
         // DictID (BE)
-        assert_eq!(&aad[25..29], &0xDEAD_BEEFu32.to_be_bytes());
+        assert_eq!(&aad[17..21], &0xDEAD_BEEFu32.to_be_bytes());
         // WindowLog
-        assert_eq!(aad[29], 21);
+        assert_eq!(aad[21], 21);
         // BlockFlags
-        assert_eq!(aad[30], 0x05);
+        assert_eq!(aad[22], 0x05);
     }
 
     #[test]
     fn aad_for_zero_identity_is_well_formed() {
-        // The `tree_id = 0` placeholder path still produces a valid
-        // 39-byte AAD; the cross-tree defence in that case relies on
-        // per-tree key isolation, not on AAD bytes. The fixture also
-        // pins the AES-256-GCM byte at the SuiteID offset for the
-        // zero-codec / zero-block-type happy path.
+        // The all-zero codec / block-type happy path produces a valid
+        // 23-byte AAD; the cross-tree defence relies on per-tree key
+        // isolation, not on AAD bytes. The fixture also pins the
+        // AES-256-GCM byte at the SuiteID offset.
         let ctx = EncryptionContext::v1(0, SuiteId::Aes256Gcm, 0, 0);
-        let id = identity(0, 0, BlockType::Data);
+        let id = identity(0, BlockType::Data);
         let aad = build(&ctx, &id);
         assert_eq!(aad.len(), AAD_LEN);
         assert_eq!(&aad[0..4], &MAGIC_METADATA_LE);
@@ -387,8 +385,8 @@ mod tests {
         // cannot relabel a Data block as an Index block to bypass
         // type-specific decode paths.
         let ctx = EncryptionContext::v1(1, SuiteId::Aes256Gcm, 0, 0);
-        let a = build(&ctx, &identity(1, 2, BlockType::Data));
-        let b = build(&ctx, &identity(1, 2, BlockType::Index));
+        let a = build(&ctx, &identity(2, BlockType::Data));
+        let b = build(&ctx, &identity(2, BlockType::Index));
         assert_ne!(a, b);
         // Only the block_type byte (offset 6) differs.
         assert_eq!(&a[..6], &b[..6]);
@@ -403,15 +401,15 @@ mod tests {
         // and still pass AEAD verification.
         let a = build(
             &EncryptionContext::v1(1, SuiteId::Aes256Gcm, 0, 0),
-            &identity(1, 2, BlockType::Data),
+            &identity(2, BlockType::Data),
         );
         let b = build(
             &EncryptionContext::v1(1, SuiteId::Aes256Gcm, 0, 0x01),
-            &identity(1, 2, BlockType::Data),
+            &identity(2, BlockType::Data),
         );
         assert_ne!(a, b);
-        // Only the block_flags byte (offset 30, the AAD's last byte) differs.
-        assert_eq!(&a[..30], &b[..30]);
-        assert_ne!(a[30], b[30]);
+        // Only the block_flags byte (offset 22, the AAD's last byte) differs.
+        assert_eq!(&a[..22], &b[..22]);
+        assert_ne!(a[22], b[22]);
     }
 }

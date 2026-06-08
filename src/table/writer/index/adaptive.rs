@@ -67,7 +67,6 @@ pub struct AdaptiveIndexWriter<W: Write + Seek + 'static> {
     partition_size: u32,
     encryption: Option<Arc<dyn EncryptionProvider>>,
     table_id: crate::TableId,
-    tree_id: crate::tree::inner::TreeId,
     ecc: Option<crate::table::block::EccParams>,
 
     /// Total index size, in bytes, above which we spill to two-level.
@@ -91,7 +90,6 @@ impl<W: Write + Seek + 'static> AdaptiveIndexWriter<W> {
             partition_size: 4_096,
             encryption: None,
             table_id: 0,
-            tree_id: 0,
             ecc: None,
             spill_threshold,
             buffer: Vec::new(),
@@ -110,7 +108,6 @@ impl<W: Write + Seek + 'static> AdaptiveIndexWriter<W> {
             .use_partition_size(self.partition_size)
             .use_encryption(self.encryption.clone())
             .use_table_id(self.table_id)
-            .use_tree_id(self.tree_id)
             .use_ecc(self.ecc)
     }
 
@@ -193,14 +190,6 @@ impl<W: Write + Seek + 'static> BlockIndexWriter<W> for AdaptiveIndexWriter<W> {
 
     fn use_table_id(mut self: Box<Self>, table_id: crate::TableId) -> Box<dyn BlockIndexWriter<W>> {
         self.table_id = table_id;
-        self
-    }
-
-    fn use_tree_id(
-        mut self: Box<Self>,
-        tree_id: crate::tree::inner::TreeId,
-    ) -> Box<dyn BlockIndexWriter<W>> {
-        self.tree_id = tree_id;
         self
     }
 
