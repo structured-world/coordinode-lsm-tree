@@ -162,6 +162,23 @@ fn populate_surrealkv(
     Ok(tree)
 }
 
+/// Builds a warm, on-disk SurrealKV tree for the read / scan / seek / overwrite
+/// groups: a tokio runtime plus a tree already populated and fsynced. Returns
+/// both so the caller binds them as `let (rt, tree) = ...` — the runtime drops
+/// LAST (after the tree), keeping its background compaction tasks alive for the
+/// whole timed read phase. Fallible end-to-end so the open/begin/set/commit I/O
+/// path propagates errors; the caller panics once with the engine label at the
+/// Criterion closure boundary (which cannot itself return `Result`), mirroring
+/// how `run_write_throughput` surfaces failures.
+fn setup_surrealkv_warm(
+    dir: &std::path::Path,
+    inputs: &WorkloadInputs,
+) -> Result<(tokio::runtime::Runtime, SkvTree), Box<dyn std::error::Error>> {
+    let rt = skv_runtime()?;
+    let tree = populate_surrealkv(&rt, dir, inputs)?;
+    Ok((rt, tree))
+}
+
 /// Engine under test. The harness runs each workload once per
 /// variant and emits per-engine timings under the same criterion
 /// `BenchmarkGroup`, so the gh-pages dashboard can plot them
@@ -636,9 +653,8 @@ fn point_read_variant(c: &mut Criterion, group_name: &str, compression: Compress
                     Engine::SurrealKv => {
                         // `rt` outlives `tree` (drops last) so its background
                         // tasks keep running for the whole read phase.
-                        let rt = skv_runtime().expect("surrealkv: tokio runtime");
-                        let tree = populate_surrealkv(&rt, dir.path(), &inputs)
-                            .expect("surrealkv: populate");
+                        let (_rt, tree) = setup_surrealkv_warm(dir.path(), &inputs)
+                            .unwrap_or_else(|e| panic!("surrealkv: warm setup: {e}"));
                         // One read snapshot, reused across all iterations — the
                         // closest analogue of the other engines' direct warm
                         // reads (a single consistent view, no per-get txn churn).
@@ -752,9 +768,8 @@ fn range_scan_variant(c: &mut Criterion, group_name: &str, compression: Compress
                         });
                     }
                     Engine::SurrealKv => {
-                        let rt = skv_runtime().expect("surrealkv: tokio runtime");
-                        let tree = populate_surrealkv(&rt, dir.path(), &inputs)
-                            .expect("surrealkv: populate");
+                        let (_rt, tree) = setup_surrealkv_warm(dir.path(), &inputs)
+                            .unwrap_or_else(|e| panic!("surrealkv: warm setup: {e}"));
                         let txn = tree.begin().expect("surrealkv: begin");
                         b.iter_custom(|iters| {
                             let start = std::time::Instant::now();
@@ -834,9 +849,8 @@ fn seek_random_variant(c: &mut Criterion, group_name: &str, compression: Compres
                         });
                     }
                     Engine::SurrealKv => {
-                        let rt = skv_runtime().expect("surrealkv: tokio runtime");
-                        let tree = populate_surrealkv(&rt, dir.path(), &inputs)
-                            .expect("surrealkv: populate");
+                        let (_rt, tree) = setup_surrealkv_warm(dir.path(), &inputs)
+                            .unwrap_or_else(|e| panic!("surrealkv: warm setup: {e}"));
                         let txn = tree.begin().expect("surrealkv: begin");
                         b.iter_custom(|iters| {
                             let start = std::time::Instant::now();
@@ -922,9 +936,8 @@ fn overwrite_variant(c: &mut Criterion, group_name: &str, compression: Compressi
                             Engine::SurrealKv => {
                                 // First copy (untimed) so the timed pass
                                 // overwrites existing keys.
-                                let rt = skv_runtime().expect("surrealkv: tokio runtime");
-                                let tree = populate_surrealkv(&rt, dir.path(), &inputs)
-                                    .expect("surrealkv: populate");
+                                let (rt, tree) = setup_surrealkv_warm(dir.path(), &inputs)
+                                    .unwrap_or_else(|e| panic!("surrealkv: warm setup: {e}"));
                                 let start = std::time::Instant::now();
                                 let mut txn = tree.begin().expect("surrealkv: begin");
                                 for (key, value) in inputs.keys.iter().zip(inputs.values.iter()) {
