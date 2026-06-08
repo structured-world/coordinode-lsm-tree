@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1780848217216,
+  "lastUpdate": 1780881922947,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -13494,6 +13494,84 @@ window.BENCHMARK_DATA = {
             "value": 472962.3874036476,
             "unit": "ops/sec",
             "extra": "P50: 1.9us | P99: 6.4us | P99.9: 10.1us\nthreads: 1 | elapsed: 0.42s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "93637099ae98af163495d302fc882902b2a07271",
+          "message": "perf(memtable): geometric arena chunks (no 64 MiB zeroing per flush) (#417)\n\n## Summary\n\nThe memtable arena allocated a fixed **64 MiB** block via\n`alloc_zeroed`. Every memtable rotation (each flush) therefore zeroed a\nfull 64 MiB even for a few hundred KB of data. Profiling `overwrite/1k`\nattributed **~23% of total CPU to `__bzero`** under\n`Arena::ensure_block` — a large fixed per-flush cost behind the ~2×\n`overwrite@1k` gap vs RocksDB.\n\nThis grows arena blocks **geometrically** instead: a 64 KiB first chunk\ndoubling up to `2^31`. A small memtable zeroes only a few small chunks;\na large one grows on demand (RocksDB's growing-chunk model).\n\n## Encoding\n\nThe `u32` node pointer becomes a **global byte offset** into the logical\nconcatenation of the blocks. With block sizes `2^S, 2^S, 2^(S+1), …` (`S\n= 16`), block `i >= 1` starts at `2^(S+i-1)`, so `offset → (block,\nwithin)` decodes in O(1) via a single `ilog2` (no table, no search).\nTotal addressable space stays 4 GiB. Opaque to the skiplist — only\n`arena.rs` internals change.\n\n## Measured (overwrite/1k profile)\n\n- `__bzero`: **~23% → ~0.06%** of CPU (1749 → 4 samples).\n- user-time for the populate + overwrite loop: **−44%**.\n\n## Testing\n\n- Geometric block sizing; `block_start(i) == block_size(i)` for `i >=\n1`; blocks tile the address space.\n- `locate` round-trips every block boundary; small allocs stay in block\n0 (block 1 not materialized); an outsized alloc jumps to a big-enough\nblock; 5k allocs spanning blocks each read back their own payload;\nexact-fill boundary; concurrent alloc (8 threads × 1k, all distinct).\n- All memtable / skiplist / arena tests pass; `clippy --all-features` +\n`--no-default-features --features zstd,lz4` clean; no-std `alloc` check\nunchanged.\n\nCloses #416\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n## Summary by CodeRabbit\n\n* **Refactor**\n* Memory arena now uses a geometric (doubling) per-block layout for\noffsets, improving allocation packing, alignment validation, and\noverflow handling; blocks are managed and released individually for\nsafer memory lifetimes.\n\n* **Tests**\n* Substantially expanded tests to verify geometric growth, cross-block\nbehavior, alignment and boundary checks, and regressions around\nexact-fill and overflow scenarios.\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-06-08T04:16:42+03:00",
+          "tree_id": "9e5f40dbc7ae8b3326103e0b585d22281774dcf5",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/93637099ae98af163495d302fc882902b2a07271"
+        },
+        "date": 1780881918653,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 1345272.0035396258,
+            "unit": "ops/sec",
+            "extra": "P50: 0.6us | P99: 2.0us | P99.9: 4.0us\nthreads: 1 | elapsed: 0.15s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 890298.0605729242,
+            "unit": "ops/sec",
+            "extra": "P50: 1.0us | P99: 2.6us | P99.9: 4.6us\nthreads: 1 | elapsed: 0.22s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 651999.7794936746,
+            "unit": "ops/sec",
+            "extra": "P50: 1.4us | P99: 4.7us | P99.9: 7.2us\nthreads: 1 | elapsed: 0.31s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3654031.8770432887,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 3.1us | P99.9: 5.6us\nthreads: 1 | elapsed: 0.05s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 437563.41743347433,
+            "unit": "ops/sec",
+            "extra": "P50: 2.0us | P99: 5.5us | P99.9: 8.2us\nthreads: 1 | elapsed: 0.46s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 221297.55252873615,
+            "unit": "ops/sec",
+            "extra": "P50: 4.2us | P99: 5.4us | P99.9: 7.7us\nthreads: 1 | elapsed: 0.90s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 905130.1418746241,
+            "unit": "ops/sec",
+            "extra": "P50: 1.0us | P99: 2.5us | P99.9: 4.6us\nthreads: 1 | elapsed: 0.22s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1067961.3490904267,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 0.8us | P99.9: 1.0us\nthreads: 1 | elapsed: 0.19s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 535793.9965525728,
+            "unit": "ops/sec",
+            "extra": "P50: 1.7us | P99: 5.2us | P99.9: 8.0us\nthreads: 1 | elapsed: 0.37s | num: 200000 | iterations: 3"
           }
         ]
       }
