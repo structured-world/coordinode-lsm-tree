@@ -13,7 +13,7 @@
 //!   bypass the `Fs` trait. Write + flush + point-read works; compaction
 //!   may fail with `ENOENT` on virtual paths.
 
-use super::{Fs, FsDirEntry, FsFile, FsMetadata, FsOpenOptions};
+use super::{Fs, FsCapabilities, FsDirEntry, FsFile, FsMetadata, FsOpenOptions};
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -706,6 +706,13 @@ impl Fs for MemFs {
     fn backend_id(&self) -> Option<u64> {
         Some(self.namespace_id)
     }
+
+    /// In-memory backend: no filesystem-level guarantees. Explicitly returns
+    /// the all-`false` default so the "no integrity / no `CoW` / no reflink"
+    /// stance is intentional rather than inherited by accident.
+    fn capabilities(&self) -> FsCapabilities {
+        FsCapabilities::default()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1371,6 +1378,91 @@ mod tests {
         assert!(!fs.exists(src)?);
         assert!(fs.exists(dst)?);
         Ok(())
+    }
+
+    #[test]
+    fn fs_capabilities_default_reports_no_guarantees() {
+        // The conservative default is load-bearing: any backend that does not
+        // override capabilities() must be treated as offering nothing, so an
+        // unknown FS never skips a checksum or disables `CoW` by accident.
+        let caps = FsCapabilities::default();
+        assert!(!caps.per_block_integrity_on_read);
+        assert!(!caps.background_scrub);
+        assert!(!caps.copy_on_write);
+        assert!(!caps.reflink);
+        assert!(!caps.native_snapshot);
+    }
+
+    #[test]
+    fn memfs_capabilities_match_default_no_guarantees() {
+        // RAM has no FS-level integrity / `CoW` / reflink — MemFs must report the
+        // all-false profile explicitly.
+        assert_eq!(MemFs::new().capabilities(), FsCapabilities::default());
+    }
+
+    #[test]
+    fn try_disable_cow_without_cow_support_is_noop() {
+        // MemFs reports copy_on_write=false, so the default no-op path applies:
+        // the call succeeds and changes nothing.
+        let fs = MemFs::new();
+        fs.create_dir_all(Path::new("/dir")).unwrap();
+        let path = Path::new("/dir/sst.bin");
+        fs.open(path, &FsOpenOptions::new().write(true).create(true))
+            .unwrap();
+        fs.try_disable_cow(path).expect("no-op must succeed");
+    }
+
+    #[test]
+    fn reflink_file_without_backend_support_copies_independently() -> io::Result<()> {
+        // No backend reflink support → default streamed-copy fallback. The
+        // clone must be byte-identical AND an independent file (writing the
+        // source afterwards must not change the clone).
+        let fs = MemFs::new();
+        fs.create_dir_all(Path::new("/dir"))?;
+        let src = Path::new("/dir/src.bin");
+        let dst = Path::new("/dir/clone.bin");
+
+        let mut f = fs.open(src, &FsOpenOptions::new().write(true).create(true))?;
+        f.write_all(b"original-contents")?;
+        drop(f);
+
+        fs.reflink_file(src, dst)?;
+
+        let mut buf = String::new();
+        fs.open(dst, &FsOpenOptions::new().read(true))?
+            .read_to_string(&mut buf)?;
+        assert_eq!(buf, "original-contents");
+
+        // Independence: mutate src, clone must be unaffected.
+        let mut w = fs.open(src, &FsOpenOptions::new().write(true).truncate(true))?;
+        w.write_all(b"changed")?;
+        drop(w);
+
+        let mut after = String::new();
+        fs.open(dst, &FsOpenOptions::new().read(true))?
+            .read_to_string(&mut after)?;
+        assert_eq!(
+            after, "original-contents",
+            "reflink clone must be independent"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn reflink_file_rejects_existing_destination() {
+        // Default fallback opens dst with create_new, so an existing target is
+        // an error (no silent overwrite of a checkpoint file).
+        let fs = MemFs::new();
+        fs.create_dir_all(Path::new("/dir")).unwrap();
+        let src = Path::new("/dir/src.bin");
+        let dst = Path::new("/dir/dst.bin");
+        for p in [src, dst] {
+            fs.open(p, &FsOpenOptions::new().write(true).create(true))
+                .unwrap();
+        }
+        let err = fs.reflink_file(src, dst).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
     }
 
     #[test]

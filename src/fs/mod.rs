@@ -209,6 +209,57 @@ pub struct FsMetadata {
     pub is_file: bool,
 }
 
+/// Static capability profile of a filesystem backend.
+///
+/// Different filesystems offer different guarantees — per-block integrity
+/// checks, copy-on-write semantics, O(1) reflink clones, native snapshots.
+/// The storage engine queries [`Fs::capabilities`] to make FS-aware decisions
+/// (skip redundant checksums where the FS already verifies, disable `CoW` on
+/// write-once SST files, prefer reflink over hard-link for checkpoints).
+///
+/// The [`Default`] is conservative: every field `false`, i.e. "assume the
+/// backend offers no special guarantees". A backend opts into an optimization
+/// only by reporting the corresponding capability `true`, so an unknown or
+/// third-party backend is always treated safely.
+//
+// no-std: pure data type — `Copy` struct of `bool`s, no allocator needed.
+#[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "a capability profile is a flat set of independent yes/no FS guarantees; \
+              each flag is queried on its own, so distinct bools read clearer than \
+              bitflags or a state machine (same rationale as FsOpenOptions)"
+)]
+pub struct FsCapabilities {
+    /// The filesystem detects single-byte corruption on read and returns an
+    /// I/O error (EIO) rather than silently handing back wrong bytes. True for
+    /// ZFS, Btrfs, `ReFS`, and S3-backed backends (service-side validation).
+    ///
+    /// When set, the engine may skip computing its own file checksum on the
+    /// read path and rely on the FS surfacing corruption.
+    pub per_block_integrity_on_read: bool,
+
+    /// The filesystem has a background scrub mechanism (`zfs scrub`,
+    /// `btrfs scrub`) that detects and repairs latent corruption out-of-band.
+    pub background_scrub: bool,
+
+    /// The filesystem is inherently copy-on-write (Btrfs, ZFS, APFS). Implies
+    /// atomic full-file rewrite, but a fragmentation penalty on the
+    /// append-then-read SST access pattern — the engine can disable per-file
+    /// `CoW` on write-once SSTs to recover throughput.
+    pub copy_on_write: bool,
+
+    /// The filesystem supports an O(1) reflink data clone (`FICLONE` on Linux,
+    /// `clonefile(2)` on macOS/APFS, block cloning on `ReFS`). A reflinked file
+    /// shares blocks copy-on-write yet has an independent inode.
+    pub reflink: bool,
+
+    /// The filesystem supports instant native snapshots (Btrfs subvolume
+    /// snapshot, ZFS snapshot, APFS snapshot).
+    pub native_snapshot: bool,
+}
+
 /// A directory entry returned by [`Fs::read_dir`].
 #[derive(Clone, Debug)]
 pub struct FsDirEntry {
@@ -648,5 +699,85 @@ pub trait Fs: Send + Sync + 'static {
     /// when both sides return `None`.
     fn backend_id(&self) -> Option<u64> {
         None
+    }
+
+    /// Reports the static [`FsCapabilities`] of this backend.
+    ///
+    /// The default is conservative — every capability `false`, i.e. "assume no
+    /// special FS guarantees". A backend overrides this to opt into FS-aware
+    /// optimizations (skip redundant checksums, disable `CoW` on SSTs, reflink
+    /// checkpoints). Unknown / third-party backends keep the safe default.
+    fn capabilities(&self) -> FsCapabilities {
+        FsCapabilities::default()
+    }
+
+    /// Requests that per-file copy-on-write be disabled for the file at `path`.
+    ///
+    /// On `CoW` filesystems (Btrfs) write-once SST files gain no benefit from `CoW`
+    /// and suffer a fragmentation penalty; clearing the per-file `CoW` flag
+    /// (`FS_NOCOW_FL` via `FS_IOC_SETFLAGS`) recovers throughput. The flag only
+    /// takes effect on a file with no data blocks yet, so callers invoke this
+    /// immediately after creating the (empty) SST file and before writing.
+    ///
+    /// Path-based (rather than handle-based) so the trait stays object-safe and
+    /// portable: backends with no fd concept ([`MemFs`], a future Windows
+    /// backend) implement it as a no-op.
+    ///
+    /// # Default implementation
+    ///
+    /// No-op returning `Ok(())`. Backends on non-`CoW` filesystems, or that
+    /// cannot express the request, correctly leave this default in place —
+    /// disabling `CoW` is a throughput optimization, never a correctness
+    /// requirement.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error only if the backend supports the operation and the
+    /// underlying syscall fails for a reason other than "not applicable".
+    fn try_disable_cow(&self, path: &Path) -> io::Result<()> {
+        let _ = path;
+        Ok(())
+    }
+
+    /// Clones the file at `src` to `dst` with O(1) reflink semantics when the
+    /// backend supports it (`FICLONE` on Linux, `clonefile(2)` on macOS/APFS,
+    /// `ReFS` block cloning on Windows).
+    ///
+    /// A reflinked clone shares data blocks copy-on-write but has an
+    /// independent inode: later modifications to either path do not affect the
+    /// other, and there is no max-links-per-inode constraint. This makes it a
+    /// safer, cheaper alternative to [`hard_link`](Self::hard_link) for
+    /// checkpoint / backup tooling.
+    ///
+    /// # Default implementation
+    ///
+    /// Falls back to a streamed byte copy through this backend's own
+    /// [`open`](Self::open) — correct on every backend, just without the O(1)
+    /// block-sharing benefit. `dst` is created with `create_new`, so the call
+    /// fails if it already exists. Backends that support real reflink override
+    /// this for the O(1) path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if `src` cannot be read, `dst` already exists or
+    /// cannot be created, or the clone / copy fails.
+    fn reflink_file(&self, src: &Path, dst: &Path) -> io::Result<()> {
+        let mut src_file = self.open(src, &FsOpenOptions::new().read(true))?;
+        let mut dst_file = self.open(dst, &FsOpenOptions::new().write(true).create_new(true))?;
+        // Heap buffer (not a 64 KiB stack array) — keeps the cold-path clone
+        // off the stack and satisfies the large-stack-array lint.
+        let mut buf = vec![0u8; 64 * 1024].into_boxed_slice();
+        loop {
+            let n = src_file.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            let chunk = buf.get(..n).ok_or_else(|| {
+                io::Error::other("read returned more bytes than the buffer holds")
+            })?;
+            dst_file.write_all(chunk)?;
+        }
+        dst_file.sync_all()?;
+        Ok(())
     }
 }
