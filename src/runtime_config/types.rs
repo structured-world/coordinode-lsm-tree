@@ -789,6 +789,34 @@ pub struct RuntimeConfig {
     /// original layout (each SST self-describes it). `0` forces always-
     /// partition (spill on the first index entry).
     pub index_partition_spill_threshold: u64,
+
+    /// When `true`, the writer clears per-file copy-on-write
+    /// ([`crate::fs::Fs::try_disable_cow`]) on each newly created SST / blob
+    /// file when the backing filesystem is copy-on-write (Btrfs). SST files
+    /// are write-once-then-read-only, so `CoW` gives them no benefit while
+    /// imposing a fragmentation penalty (~20% write throughput on Btrfs);
+    /// clearing it recovers the ext4-equivalent baseline.
+    ///
+    /// Default `true`: correct out of the box on any filesystem (a no-op on
+    /// non-`CoW` filesystems, where [`crate::fs::Fs::try_disable_cow`] does
+    /// nothing). Set `false` to preserve `CoW`, e.g. when running on a Btrfs
+    /// subvolume whose FS-level snapshots depend on per-file `CoW`.
+    ///
+    /// Takes effect on the next SST creation; existing files are not
+    /// re-flagged (the inode flag only applies to a still-empty file).
+    pub disable_cow_on_sst_files: bool,
+
+    /// When `true`, [`crate::AbstractTree::create_checkpoint`] clones SST /
+    /// blob files via reflink ([`crate::fs::Fs::reflink_file`], i.e. `FICLONE`
+    /// / `clonefile`) when the filesystem supports it, falling back to a hard
+    /// link otherwise. Reflink gives an independent inode (modifying the
+    /// checkpoint never touches the original) with no max-links-per-inode
+    /// constraint, while still sharing data blocks copy-on-write for O(1)
+    /// cost.
+    ///
+    /// Default `true`. On a filesystem without reflink the checkpoint driver
+    /// uses the existing hard-link path, so the setting is a no-op there.
+    pub use_reflink_for_checkpoint: bool,
 }
 
 impl Default for RuntimeConfig {
@@ -807,6 +835,8 @@ impl Default for RuntimeConfig {
             ecc_granularity: EccGranularity::Block,
             seqno_in_index: false,
             index_partition_spill_threshold: crate::table::writer::DEFAULT_SPILL_THRESHOLD,
+            disable_cow_on_sst_files: true,
+            use_reflink_for_checkpoint: true,
         }
     }
 }
@@ -1210,6 +1240,20 @@ mod tests {
         assert!(!cfg.page_ecc);
         assert_eq!(cfg.data_block_ecc_override, None);
         assert_eq!(cfg.kv_checksums_ecc_override, None);
+    }
+
+    #[test]
+    fn runtime_config_fs_aware_defaults_on() {
+        // FS-aware optimizations default ON: out of the box we clear Btrfs `CoW`
+        // on write-once SSTs (~20% throughput) and reflink checkpoints. Both
+        // are no-ops on filesystems that don't support them, so the default is
+        // safe everywhere. A regression flipping either to false would silently
+        // drop the optimization for every new tree (and, per #353 Benchmark
+        // Symmetry, the RocksDbParity preset relies on being able to turn these
+        // OFF to match RocksDB's lack of FS-aware behaviour).
+        let c = RuntimeConfig::default();
+        assert!(c.disable_cow_on_sst_files);
+        assert!(c.use_reflink_for_checkpoint);
     }
 
     #[test]
