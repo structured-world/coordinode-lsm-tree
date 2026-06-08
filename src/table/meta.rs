@@ -279,10 +279,10 @@ impl ParsedMeta {
         // catches it; on encryption-ON opens the AEAD already bound the
         // expected id, but the explicit check fails loudly + uniformly).
         // `None` skips the check for diagnostic readers (inspect / scrub).
-        if let Some(expected) = expected_table_id {
-            if id != expected {
-                return Err(crate::Error::InvalidHeader("TableMeta"));
-            }
+        if let Some(expected) = expected_table_id
+            && id != expected
+        {
+            return Err(crate::Error::InvalidHeader("TableMeta"));
         }
         let item_count = read_u64!(block, b"item_count", &cmp);
         let tombstone_count = read_u64!(block, b"tombstone_count", &cmp);

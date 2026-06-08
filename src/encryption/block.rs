@@ -453,10 +453,10 @@ pub fn encrypt_block(
     // module already does.
     let nonce: [u8; 12] = <[u8; 12]>::generate();
 
-    // Build the 39-byte AAD: binds ciphertext to format identity,
-    // header byte, key epoch, block type, suite id, tree id,
-    // table id, block offset, compression type, dict id, window
-    // log.
+    // Build the 23-byte AAD: binds ciphertext to format identity,
+    // header byte, key epoch, block type, suite id, table id,
+    // compression type, dict id, window log. (Block offset and tree
+    // id are intentionally not bound — see aad::build.)
     let aad = build(ctx, identity);
 
     // Encrypt the plaintext in-place; move it into an owned Vec
@@ -534,16 +534,17 @@ pub struct DecryptedBlock {
 /// to end exactly at the `BodyFrame`: the encrypted-block format
 /// defines no trailing frames, so any extra bytes are rejected.
 ///
-/// `identity` MUST supply the three AAD-bound fields that are
-/// NOT recorded on disk: `tree_id`, `table_id`, and `block_offset`.
-/// Any mismatch on any of those three propagates through the AAD
-/// and surfaces as [`DecryptError::AeadVerificationFailed`]. The
-/// six on-disk-recorded AAD fields (`HeaderByte`, `KeyEpoch`,
-/// `BlockType`, `SuiteID`, `CompressionType`, `DictID`, `WindowLog`)
-/// are read back from the `MetadataPayload` regardless of what the
-/// caller supplies on `identity.block_type` / `identity.dict_id` /
-/// `identity.window_log` — those three fields are IGNORED on the
-/// read path because the disk is the source of truth for them.
+/// `identity` MUST supply the AAD-bound `table_id` that is NOT
+/// recorded on disk; a mismatch propagates through the AAD and
+/// surfaces as [`DecryptError::AeadVerificationFailed`]. A block's
+/// byte offset and the owning tree id are deliberately not bound
+/// (see [`crate::encryption::aad::build`]). The on-disk-recorded AAD
+/// fields (`HeaderByte`, `KeyEpoch`, `BlockType`, `SuiteID`,
+/// `CompressionType`, `DictID`, `WindowLog`) are read back from the
+/// `MetadataPayload` regardless of what the caller supplies on
+/// `identity.block_type` / `identity.dict_id` / `identity.window_log`
+/// — those fields are IGNORED on the read path because the disk is
+/// the source of truth for them.
 ///
 /// The returned `compression_type` / `dict_id` / `window_log`
 /// fields on [`DecryptedBlock`] are the spec's post-decrypt

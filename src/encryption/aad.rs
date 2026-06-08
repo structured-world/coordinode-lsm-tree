@@ -23,8 +23,8 @@
 //!
 //! ## Type-reuse contract
 //!
-//! [`BlockType`] (block discriminator) and [`BlockIdentity`] (tree id /
-//! table id / block offset + per-block codec context) are re-exported
+//! [`BlockType`] (block discriminator) and [`BlockIdentity`] (table id +
+//! per-block codec context) are re-exported
 //! straight from [`crate::table::block`]; we deliberately do NOT define
 //! second copies in this module to avoid drift between the Block I/O
 //! API and the AAD constructor. The AAD-specific bits that don't fit on
@@ -32,7 +32,7 @@
 //! discriminator) live on [`EncryptionContext`], the small per-block
 //! struct passed alongside `BlockIdentity` into [`build`].
 //!
-//! ## Layout (31 bytes, big-endian for u64 identity fields)
+//! ## Layout (23 bytes, big-endian for `TableID` and `DictID`)
 //!
 //! ```text
 //! Offset  Size  Field             Source

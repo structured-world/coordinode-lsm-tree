@@ -639,6 +639,13 @@ mod tests {
         // defaults return `Encrypt` / `Decrypt`. This pins the contract
         // that only AAD-capable providers may serve the block path.
         let provider = XorProvider;
+        // The capability flag and the default block methods must agree: if
+        // the default ever regressed to `true`, `Config::open` would let an
+        // unsupported provider through and only fail mid-I/O.
+        assert!(
+            !provider.supports_aad_block_path(),
+            "default providers must advertise the AAD block path as unsupported",
+        );
         let identity =
             crate::table::block::BlockIdentity::for_test(0, crate::table::block::BlockType::Data);
 

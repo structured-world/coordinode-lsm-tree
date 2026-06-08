@@ -350,10 +350,9 @@ fn load_index_block(
         handle,
         BlockIdentity {
             table_id,
-            // Match the writer: index blocks are emitted with
-            // `block_offset: 0` (see `Table::read_tli`'s comment for
-            // the writer-side rationale). When #251 wires real
-            // offsets into AAD this needs the SFA section offset.
+            // A block's byte offset is intentionally NOT part of the AAD
+            // identity (offset-independent AAD keeps encryption parallel),
+            // so nothing per-block needs threading here.
             block_type: BlockType::Index,
             dict_id: 0,
             window_log: 0,
@@ -780,15 +779,9 @@ fn load_data_block_iter(
         *handle,
         BlockIdentity {
             table_id,
-            // Same writer / reader agreement as TLI / filter: writer
-            // emits data blocks with `block_offset` set to a
-            // running cursor that we don't have exposed here; the
-            // BlockIdentity is ignored by `Block::from_file` today
-            // and only becomes load-bearing when #251 wires it into
-            // AEAD AAD. Holding at 0 keeps this facade consistent
-            // with how it loads the meta / TLI / filter blocks
-            // above. Once real offsets are threaded, all three
-            // load sites need updating together.
+            // A block's byte offset is intentionally NOT part of the AAD
+            // identity, so this facade needs no per-block offset for any of
+            // its meta / TLI / filter / data loads.
             block_type: BlockType::Data,
             dict_id: 0,
             window_log: 0,
@@ -979,17 +972,12 @@ pub fn read_filter_stats(path: &Path) -> crate::Result<Option<FilterStats>> {
     //    typically `InvalidHeader` from `uncompressed_length`
     //    disagreeing with the ciphertext length, not a clean
     //    `Error::Decrypt`. Encrypted-aware filter inspection is
-    //    tracked alongside #251 / #256.
+    //    tracked alongside #256.
     //
-    // 2. **`block_offset` held at 0.** `filter_handle.offset()`
-    //    carries the real on-disk position, but the writer emits
-    //    the filter block with `BlockIdentity { block_offset: 0,
-    //    ... }`. Reader and writer must agree on `BlockIdentity`
-    //    for AEAD verification once #251 wires it into AAD;
-    //    switching only this side to `filter_handle.offset()`
-    //    would break that agreement. Threading real offsets
-    //    through both sides is a coordinated change tracked
-    //    alongside #251.
+    // 2. **A block's byte offset is not part of the AAD identity** —
+    //    offset-independent AAD keeps encryption parallel, so neither the
+    //    writer nor this reader threads `filter_handle.offset()` into the
+    //    BlockIdentity; there is nothing per-block to agree on here.
     let block = Block::from_file(
         &*file,
         filter_handle,
