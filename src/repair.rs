@@ -333,15 +333,20 @@ fn repair_tree(config: &Config) -> crate::Result<RepairReport> {
         config.sync_mode,
     )?;
 
-    // A rebuilt snapshot is a complete generation on its own. Drop any edit log
-    // that would otherwise be replayed on top of it: the lost manifest's
-    // generation may have left an `edits-{version_id}` describing the old
-    // layout, which would corrupt recovery if layered over the fresh snapshot.
-    let log_path = config.path.join(format!("edits-{version_id}"));
-    match config.fs.remove_file(&log_path) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e.into()),
+    // A rebuilt snapshot is a complete generation on its own. Sweep every stale
+    // edit log so nothing is replayed on top of it: the lost manifest's
+    // generation left its log under an OLDER snapshot id (the rebuilt snapshot
+    // uses `max(v*) + 1`), so removing only `edits-{version_id}` would normally
+    // miss it. Drop all `edits-*` — none belong to the fresh snapshot.
+    for dirent in config.fs.read_dir(&config.path)? {
+        if dirent.is_dir || !dirent.file_name.starts_with("edits-") {
+            continue;
+        }
+        match config.fs.remove_file(&dirent.path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
     }
 
     Ok(RepairReport {

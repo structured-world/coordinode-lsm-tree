@@ -196,7 +196,10 @@ impl VersionEdit {
                 let mut run = Vec::with_capacity(cap(table_count));
                 for _ in 0..table_count {
                     let id = r.read_u64::<LittleEndian>().map_err(|_| ERR)?;
-                    let _checksum_type = r.read_u8().map_err(|_| ERR)?;
+                    let checksum_type = r.read_u8().map_err(|_| ERR)?;
+                    if checksum_type != CHECKSUM_TYPE_XXH3 {
+                        return Err(ERR);
+                    }
                     let checksum = r.read_u128::<LittleEndian>().map_err(|_| ERR)?;
                     let global_seqno = r.read_u64::<LittleEndian>().map_err(|_| ERR)?;
                     run.push(TableDesc {
@@ -214,7 +217,10 @@ impl VersionEdit {
         let mut added_blob_files = Vec::with_capacity(cap(added_blob_count));
         for _ in 0..added_blob_count {
             let id = r.read_u64::<LittleEndian>().map_err(|_| ERR)?;
-            let _checksum_type = r.read_u8().map_err(|_| ERR)?;
+            let checksum_type = r.read_u8().map_err(|_| ERR)?;
+            if checksum_type != CHECKSUM_TYPE_XXH3 {
+                return Err(ERR);
+            }
             let checksum = r.read_u128::<LittleEndian>().map_err(|_| ERR)?;
             added_blob_files.push(AddedBlobFile { id, checksum });
         }
@@ -232,9 +238,18 @@ impl VersionEdit {
             if r.len() < gc_stats_len {
                 return Err(ERR);
             }
-            let (head, _tail) = r.split_at(gc_stats_len);
+            let (head, tail) = r.split_at(gc_stats_len);
+            *r = tail;
             Some(head.to_vec())
         };
+
+        // A well-formed edit consumes its payload exactly. Trailing bytes mean a
+        // corrupt / mis-encoded record (format drift, not power loss — the
+        // framing checksum already passed), so reject rather than silently
+        // accept a truncated interpretation.
+        if !r.is_empty() {
+            return Err(ERR);
+        }
 
         Ok(Self {
             new_version_id,
@@ -488,6 +503,43 @@ mod tests {
     fn replay_of_empty_log_is_empty() {
         let replayed = replay_edits(&mut &[][..]).expect("replay");
         assert!(replayed.is_empty(), "empty log → no edits");
+    }
+
+    #[test]
+    fn decode_rejects_unknown_table_checksum_type() {
+        // Flip the table record's checksum_type byte to a non-XXH3 value: the
+        // framing checksum still matches (we corrupt the decoded payload, not
+        // the wire), so only the in-decode validation can catch it.
+        let edit = sample();
+        let mut payload = Vec::new();
+        edit.encode_payload(&mut payload).expect("encode");
+        // Layout: new_version_id(8) | changed_level_count(4) | level(1) |
+        // run_count(4) | table_count(4) | id(8) | checksum_type(1) | ...
+        let cs_type_off = 8 + 4 + 1 + 4 + 4 + 8;
+        payload[cs_type_off] = 0xEE; // not CHECKSUM_TYPE_XXH3
+        assert!(
+            matches!(
+                VersionEdit::decode_payload(&payload),
+                Err(crate::Error::InvalidHeader("VersionEdit"))
+            ),
+            "an unknown table checksum_type tag must be rejected",
+        );
+    }
+
+    #[test]
+    fn decode_rejects_trailing_garbage() {
+        // A well-formed edit followed by extra bytes is a malformed record.
+        let edit = sample();
+        let mut payload = Vec::new();
+        edit.encode_payload(&mut payload).expect("encode");
+        payload.extend_from_slice(&[0xAB, 0xCD]);
+        assert!(
+            matches!(
+                VersionEdit::decode_payload(&payload),
+                Err(crate::Error::InvalidHeader("VersionEdit"))
+            ),
+            "trailing bytes after a complete edit must be rejected",
+        );
     }
 
     #[test]

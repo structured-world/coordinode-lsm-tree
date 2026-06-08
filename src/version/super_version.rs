@@ -491,6 +491,53 @@ mod tests {
     }
 
     #[test]
+    fn super_version_gc_preserves_current_snapshot_file() -> crate::Result<()> {
+        // The CURRENT snapshot file must survive GC even when its in-memory
+        // version is evicted from the history — `CURRENT` still points at it and
+        // the edit log layers on top. Set snapshot_id to a seeded v{id} that GC
+        // will evict, and assert its file stays while a non-snapshot evictee is
+        // removed.
+        let fs = MemFs::new();
+        let dir = Path::new("/gc/snapshot");
+        let mut history = test_super_versions(vec![
+            SuperVersion {
+                active_memtable: Arc::new(new_memtable(0)),
+                sealed_memtables: Arc::default(),
+                version: Version::new(1, crate::TreeType::Standard),
+                seqno: 0,
+            },
+            SuperVersion {
+                active_memtable: Arc::new(new_memtable(0)),
+                sealed_memtables: Arc::default(),
+                version: Version::new(2, crate::TreeType::Standard),
+                seqno: 1,
+            },
+            SuperVersion {
+                active_memtable: Arc::new(new_memtable(0)),
+                sealed_memtables: Arc::default(),
+                version: Version::new(3, crate::TreeType::Standard),
+                seqno: 2,
+            },
+        ]);
+        // CURRENT points at v1 (the snapshot the edit log is layered on).
+        history.snapshot_id = 1;
+        seed_version_files(dir, &history, &fs)?;
+
+        // Watermark 3 evicts v1 (seqno 0) and v2 (seqno 1) from the history.
+        history.maintenance(dir, 3, &fs)?;
+
+        assert!(
+            fs.exists(&dir.join("v1"))?,
+            "the CURRENT snapshot file must NOT be GC'd even when its version is evicted"
+        );
+        assert!(
+            !fs.exists(&dir.join("v2"))?,
+            "a non-snapshot evicted version's file is still removed"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn super_version_gc_below_watermark_simple() -> crate::Result<()> {
         let fs = MemFs::new();
         let dir = Path::new("/gc/simple");

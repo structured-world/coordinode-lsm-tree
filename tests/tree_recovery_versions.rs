@@ -399,11 +399,12 @@ fn tree_rotates_snapshot_and_gcs_old_generation() -> lsm_tree::Result<()> {
             SequenceNumberCounter::default(),
             SequenceNumberCounter::default(),
         )
-        .manifest_log_rotate_bytes(0)
+        // Threshold 1: the first upgrade appends (log 0 < 1), the next rotates
+        // (log now > 1), and so on — so the run alternates append / rotate and
+        // every rotation must clean the previous generation's snapshot AND log.
+        .manifest_log_rotate_bytes(1)
         .open()?;
 
-        // Threshold 0 means `log_size < 0` is never true, so every upgrade takes
-        // the rotation branch. Each rotation must leave only one snapshot file.
         for i in 0u64..4 {
             tree.insert(format!("k{i}"), format!("v{i}"), i);
             tree.flush_active_memtable(i)?;
@@ -421,6 +422,25 @@ fn tree_rotates_snapshot_and_gcs_old_generation() -> lsm_tree::Result<()> {
             assert_eq!(
                 snapshots, 1,
                 "rotation must leave exactly one live snapshot file after flush {i}"
+            );
+
+            // The other half of the generation-GC contract: a rotation deletes
+            // the previous snapshot's edit log. At most one `edits-*` may exist
+            // at any point (the current snapshot's, present after an append and
+            // gone right after a rotate). A rotation that leaked old logs would
+            // accumulate them and trip this bound.
+            let edit_logs = std::fs::read_dir(path)?
+                .filter_map(Result::ok)
+                .filter(|e| {
+                    let n = e.file_name();
+                    let n = n.to_string_lossy();
+                    n.strip_prefix("edits-")
+                        .is_some_and(|rest| rest.bytes().all(|c| c.is_ascii_digit()))
+                })
+                .count();
+            assert!(
+                edit_logs <= 1,
+                "at most one edit log may exist; leaked old logs after flush {i} (found {edit_logs})"
             );
         }
     }
