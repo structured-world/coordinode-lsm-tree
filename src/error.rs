@@ -272,6 +272,35 @@ pub enum Error {
     ///   this internally and the check here becomes belt-and-
     ///   braces.
     ManifestSectionInvalid(&'static str),
+
+    /// The trailing record of the incremental manifest edit log is
+    /// incomplete or corrupt, and the tree was opened under
+    /// [`ManifestRecoveryMode::AbsoluteConsistency`](crate::config::ManifestRecoveryMode::AbsoluteConsistency),
+    /// which refuses to silently roll back an unacknowledged or
+    /// bit-rotted edit.
+    ///
+    /// A clean end-of-log is never reported here: a crash exactly at a
+    /// record boundary is byte-identical to a pristine close, so that
+    /// case is always tolerated. This fires only when bytes of a
+    /// trailing record are present but the record fails framing (a
+    /// power-loss-truncated append), a fully-framed record's checksum
+    /// doesn't match (bit-rot), or a framing header is forged.
+    ///
+    /// Recover by truncating the torn tail: run
+    /// [`Config::repair`](crate::Config::repair), which rebuilds a clean
+    /// standalone snapshot (dropping the edit log), or re-open under a tolerant
+    /// [`ManifestRecoveryMode`](crate::config::ManifestRecoveryMode) to
+    /// roll the unacknowledged tail back.
+    TornManifestEditLog {
+        /// The trailing defect detected: `"truncated"` (partial record
+        /// from a power-loss-interrupted append), `"checksum-mismatch"`
+        /// (fully-framed record whose payload bit-rotted),
+        /// `"bad-header"` (implausible framing length), or
+        /// `"len-mismatch"` (record length disagrees with the expected
+        /// fixed size). Static so callers can branch without parsing
+        /// the message string.
+        kind: &'static str,
+    },
 }
 
 impl std::fmt::Display for Error {

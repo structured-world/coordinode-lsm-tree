@@ -1148,12 +1148,16 @@ pub fn recover(
     // Replay the incremental edit log layered on top of the snapshot. The log
     // `edits-{snapshot_id}` holds every VersionEdit appended since the snapshot
     // was written; applying them in order reconstructs the current version.
-    // `replay_log` returns only the durable prefix — a power-loss-truncated
-    // trailing edit is dropped (it was never acknowledged upward), which is the
-    // same tail-tolerance the snapshot sections already grant. Each applied edit
-    // advances `recovery.curr_version_id` past the snapshot's id.
+    // Under tolerant modes `replay_log` returns only the durable prefix — a
+    // power-loss-truncated trailing edit is dropped (it was never acknowledged
+    // upward). Under `AbsoluteConsistency` (`!tolerate_tail`, the default) it
+    // instead surfaces `TornManifestEditLog` so an incomplete or bit-rotted
+    // trailing edit is not silently rolled back: the operator truncates the tail
+    // (Tree::repair) deliberately. A clean end-of-log is always accepted in both
+    // modes. Each applied edit advances `recovery.curr_version_id` past the
+    // snapshot's id.
     let log_path = folder.join(format!("edits-{curr_version_id}"));
-    let edits = super::edit_log::replay_log(fs, &log_path)?;
+    let edits = super::edit_log::replay_log(fs, &log_path, !tolerate_tail)?;
     if !edits.is_empty() {
         log::info!(
             "Replaying {} manifest edit(s) on top of snapshot #{curr_version_id}",

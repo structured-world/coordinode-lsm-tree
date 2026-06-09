@@ -310,17 +310,26 @@ fn tree_recovery_version_free_list() -> lsm_tree::Result<()> {
 
 /// Crash safety of the incremental manifest: a power-loss-truncated trailing
 /// edit in the log is dropped on recovery, and the tree recovers exactly the
-/// durable prefix — the state after the last fully-fsynced edit.
+/// durable prefix — but only when the recovery mode opts into tail tolerance.
 ///
 /// Two flushes append two edits to `edits-0`. Truncating the file mid-second
 /// record simulates a crash between the second flush's edit being partially
-/// written and its fsync completing. On reopen the snapshot (`v0`, empty) plus
-/// the first edit are replayed; the torn second edit is discarded. So `a` (first
-/// flush) is present and `b` (second flush) is gone — the second flush was never
-/// durably committed to the manifest, which is the contract: an unacknowledged
-/// write may be lost, but the recovered state is always internally consistent.
+/// written and its fsync completing.
+///
+/// Under the default [`ManifestRecoveryMode::AbsoluteConsistency`] the torn
+/// trailing edit must NOT be silently rolled back: reopen fails with
+/// [`lsm_tree::Error::TornManifestEditLog`] so an operator deliberately
+/// truncates the tail (e.g. via repair) rather than losing an edit unnoticed.
+///
+/// Under [`ManifestRecoveryMode::TolerateCorruptedTailRecords`] the snapshot
+/// (`v0`, empty) plus the first edit are replayed and the torn second edit is
+/// discarded. So `a` (first flush) is present and `b` (second flush) is gone:
+/// the second flush was never durably committed, an unacknowledged write may be
+/// lost, but the recovered state is always internally consistent.
 #[test]
 fn tree_recovers_durable_prefix_when_edit_log_tail_is_torn() -> lsm_tree::Result<()> {
+    use lsm_tree::config::ManifestRecoveryMode;
+
     let folder = get_tmp_folder();
     let path = folder.path();
 
@@ -359,12 +368,28 @@ fn tree_recovers_durable_prefix_when_edit_log_tail_is_torn() -> lsm_tree::Result
     log.sync_all()?;
     drop(log);
 
+    // Default (AbsoluteConsistency): the torn trailing edit aborts the open.
+    let strict = Config::new(
+        path,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .open();
+    assert!(
+        matches!(strict, Err(lsm_tree::Error::TornManifestEditLog { .. })),
+        "default AbsoluteConsistency must reject a torn edit-log tail, got {:?}",
+        strict.map(|_| "Ok"),
+    );
+
+    // Tolerant mode: recover the durable prefix (first flush survives, torn
+    // second flush is dropped).
     {
         let tree = Config::new(
             path,
             SequenceNumberCounter::default(),
             SequenceNumberCounter::default(),
         )
+        .manifest_recovery_mode(ManifestRecoveryMode::TolerateCorruptedTailRecords)
         .open()?;
 
         assert!(
@@ -374,6 +399,87 @@ fn tree_recovers_durable_prefix_when_edit_log_tail_is_torn() -> lsm_tree::Result
         assert!(
             !tree.contains_key("b", 2)?,
             "the second flush's edit was torn off — its key must be dropped"
+        );
+    }
+
+    Ok(())
+}
+
+/// The prescribed operator fix for a torn edit-log tail under the default
+/// strict mode: run repair, which rebuilds a clean standalone snapshot from the
+/// on-disk SST files and sweeps the stale edit log. Because repair scans the
+/// `tables/` directory directly (not the manifest), it even salvages the SST
+/// the torn edit had dropped — so after repair the tree reopens cleanly under
+/// the default [`ManifestRecoveryMode::AbsoluteConsistency`] with BOTH keys.
+#[test]
+fn repair_clears_torn_edit_log_tail_and_reopens_under_default() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let path = folder.path();
+
+    let clean_after_first;
+    {
+        let tree = Config::new(
+            path,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .open()?;
+        tree.insert("a", "a", 0);
+        tree.flush_active_memtable(0)?;
+        clean_after_first = std::fs::metadata(path.join("edits-0"))?.len();
+        tree.insert("b", "b", 1);
+        tree.flush_active_memtable(1)?;
+    }
+
+    // Tear the trailing (second) edit.
+    let full = std::fs::metadata(path.join("edits-0"))?.len();
+    let torn_len = clean_after_first + (full - clean_after_first) / 2;
+    let log = std::fs::OpenOptions::new()
+        .write(true)
+        .open(path.join("edits-0"))?;
+    log.set_len(torn_len)?;
+    log.sync_all()?;
+    drop(log);
+
+    // Default open rejects it.
+    let strict = Config::new(
+        path,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .open();
+    assert!(
+        matches!(strict, Err(lsm_tree::Error::TornManifestEditLog { .. })),
+        "torn tail must abort the default open before repair",
+    );
+
+    // Repair: rebuild the manifest from the SST files on disk, dropping the log.
+    Config::new(
+        path,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .repair()?;
+    assert!(
+        !path.join("edits-0").try_exists()?,
+        "repair must sweep the stale edit log",
+    );
+
+    // Default open now succeeds, and both SSTs were salvaged by the directory scan.
+    {
+        let tree = Config::new(
+            path,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .open()?;
+        assert!(
+            tree.contains_key("a", 2)?,
+            "repair salvaged the first flush's table",
+        );
+        assert!(
+            tree.contains_key("b", 2)?,
+            "repair salvaged the orphaned SST the torn edit had dropped",
         );
     }
 
