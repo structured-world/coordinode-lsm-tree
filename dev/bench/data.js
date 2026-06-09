@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1780965163182,
+  "lastUpdate": 1780966556615,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -14196,6 +14196,84 @@ window.BENCHMARK_DATA = {
             "value": 552399.7250806,
             "unit": "ops/sec",
             "extra": "P50: 1.6us | P99: 5.0us | P99.9: 7.7us\nthreads: 1 | elapsed: 0.36s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "a641d06024fdea358fcf3a8ec28556db856f85f5",
+          "message": "fix(fs): silence unfulfilled non_snake_case expect on Windows (#431)\n\n## Summary\n\nThe `#[expect(non_snake_case, reason = \"FFI name matches Windows API\")]`\non the `extern \"system\"` block declaring `LockFileEx`\n(`src/fs/std_fs.rs`, `#[cfg(windows)] mod sys`) was never fulfilled:\nparameters are already snake_case and the foreign-function name\n`LockFileEx` is not flagged by the `non_snake_case` lint on the Windows\ntoolchain. This produced an `unfulfilled_lint_expectations` warning on\nevery Windows build (doc-tests step).\n\nSwitches `#[expect(...)]` to `#[allow(...)]`, which stays silent whether\nor not the lint fires and preserves the documenting reason (the symbol\nmust keep its Windows API name).\n\n## Testing\n\nWindows-gated code, not compilable on a non-Windows host;\n`fmt`/`clippy`/full suite green locally for the rest of the crate. The\nWindows CI job confirms the warning is gone.\n\nCloses #430\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n\n## Summary by CodeRabbit\n\n* **Chores**\n* Updated internal lint configuration for Windows compatibility without\naffecting functionality or public APIs.\n\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-06-09T00:33:22Z",
+          "tree_id": "72dd0cd1b4d2fefa6a739d0f8d9dd6143fa05911",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/a641d06024fdea358fcf3a8ec28556db856f85f5"
+        },
+        "date": 1780966547578,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 1912290.2819932092,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.6us | P99.9: 3.7us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1212867.0224300774,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.3us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 664563.1735879414,
+            "unit": "ops/sec",
+            "extra": "P50: 1.4us | P99: 4.6us | P99.9: 7.1us\nthreads: 1 | elapsed: 0.30s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3706632.2177210525,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 3.1us | P99.9: 5.6us\nthreads: 1 | elapsed: 0.05s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 437778.09196625015,
+            "unit": "ops/sec",
+            "extra": "P50: 2.0us | P99: 5.4us | P99.9: 8.2us\nthreads: 1 | elapsed: 0.46s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 219771.17583407403,
+            "unit": "ops/sec",
+            "extra": "P50: 4.3us | P99: 5.4us | P99.9: 8.0us\nthreads: 1 | elapsed: 0.91s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1243355.7091356816,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.2us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1163474.6584282732,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 1.5us | P99.9: 2.4us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 555749.2851251061,
+            "unit": "ops/sec",
+            "extra": "P50: 1.6us | P99: 6.1us | P99.9: 9.1us\nthreads: 1 | elapsed: 0.36s | num: 200000 | iterations: 3"
           }
         ]
       }
