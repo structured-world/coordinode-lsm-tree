@@ -244,7 +244,10 @@ fn scan_since_resolves_blob_values_on_blob_tree() -> lsm_tree::Result<()> {
     tree.insert(b"big", &big, 0);
     tree.insert(b"small", b"inline", 1);
     tree.flush_active_memtable(0)?;
-    assert!(tree.blob_file_count() > 0, "the big value must be separated");
+    assert!(
+        tree.blob_file_count() > 0,
+        "the big value must be separated"
+    );
 
     let got: Vec<ScanSinceEvent> = tree
         .scan_since_seqno(0)
