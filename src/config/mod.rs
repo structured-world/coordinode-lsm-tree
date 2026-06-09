@@ -432,8 +432,8 @@ pub struct Config {
     /// trailer; on read, if the block's XXH3 disagrees with the on-disk bytes,
     /// the reader attempts recovery from the trailer before surfacing the
     /// corruption. The correction scheme is selected at runtime
-    /// (`update_runtime_config`): Reed-Solomon (the default), single XOR parity,
-    /// or per-word SEC-DED. Requires the `page_ecc` cargo feature — opening a
+    /// (`update_runtime_config`): per-word SEC-DED (the default), single XOR
+    /// parity, or Reed-Solomon. Requires the `page_ecc` cargo feature — opening a
     /// tree with `page_ecc = true` on a build without the feature returns
     /// [`crate::Error::PageEccUnsupported`].
     ///
@@ -1117,9 +1117,9 @@ impl Config {
     /// When enabled, every block written by this tree carries a parity
     /// trailer; on read, if the block's XXH3 disagrees with the on-disk
     /// bytes, the reader attempts recovery from the trailer before surfacing
-    /// the corruption. The correction scheme defaults to Reed-Solomon and is
-    /// selectable at runtime (`update_runtime_config`): Reed-Solomon, single
-    /// XOR parity, or per-word SEC-DED.
+    /// the corruption. The correction scheme defaults to per-word SEC-DED and
+    /// is selectable at runtime (`update_runtime_config`): per-word SEC-DED,
+    /// single XOR parity, or Reed-Solomon.
     ///
     /// Opening a tree with `page_ecc = true` on a build that does not
     /// have the `page_ecc` cargo feature enabled returns

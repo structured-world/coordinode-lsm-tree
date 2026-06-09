@@ -3497,7 +3497,7 @@ mod tests {
                 &BlockTransform::PlainEcc(EccParams::SECDED),
             );
             assert!(
-                matches!(result, Err(crate::Error::PageEccUnrecoverable { .. })),
+                matches!(&result, Err(crate::Error::PageEccUnrecoverable { .. })),
                 "a double-bit error in one word must be detected as unrecoverable \
                  (got ok={})",
                 result.is_ok(),
