@@ -189,18 +189,19 @@ fn do_decompress_with_dict(
         // garbage. `init` validates the pinned id against the parsed header
         // before any block decode runs.
         //
-        // This is an INDEPENDENT check, not a duplicate of the block checksum.
-        // The block's integrity checksum is configurable
-        // (`ChecksumAlgorithm`: `Xxh3_64` / `Xxh3Low32` / `Crc32c`) and runs over
-        // the compressed bytes. Under a 32-bit choice — `Crc32c` (linear,
-        // adversarially forgeable to any target) or `Xxh3Low32` — that checksum
-        // is no longer an adversarial barrier, so on a NON-encrypted dict block
-        // the embedded Dictionary_ID is the one independent witness that the
-        // frame was produced under the expected dictionary. For ENCRYPTED blocks
-        // the AAD already binds `dict_id` (AEAD verify catches substitution), so
-        // here the gate is belt-and-suspenders; it also turns an honest
-        // wrong-dictionary misconfiguration into a clear typed error instead of
-        // decompressed garbage.
+        // Primary value is correctness, with defense-in-depth on top:
+        // - Correctness: `force_dict` applies the given dictionary REGARDLESS of
+        //   the frame's id, so a wrong-dictionary configuration would otherwise
+        //   decode to silent garbage. The gate turns that into a clear typed
+        //   error at the source.
+        // - Defense-in-depth: the block-level integrity checksum (a fixed
+        //   XXH3-128 over the compressed bytes, verified before we get here) and,
+        //   for encrypted blocks, the AAD `dict_id` binding (AEAD verify) already
+        //   reject a substituted frame; the embedded Dictionary_ID is an
+        //   independent third witness behind them.
+        // (Note: the configurable `ChecksumAlgorithm` — `Xxh3_64` / `Xxh3Low32`
+        // / `Crc32c` — is the per-KV / per-entry checksum, NOT this block
+        // checksum, which is unconditionally XXH3-128.)
         decoder.expect_dict_id(Some(raw_content_id));
         decoder.init(&mut cursor).map_err(|e| {
             if matches!(

@@ -55,13 +55,16 @@
 //! live, since each is defended by an existing layer rather than a new gate in
 //! THIS file):
 //!
-//! - **Dict substitution.** AAD binds `dict_id`, so on an encrypted block AEAD
-//!   verify rejects a swap (covered here by `dict_id_*` tampers). The inner
-//!   zstd frame's embedded `Dictionary_ID` is independently pinned on the
-//!   compression read path via `FrameDecoder::expect_dict_id` — the one barrier
-//!   that still holds for a NON-encrypted dict block when the block checksum is
-//!   configured to a forgeable 32-bit algorithm (`Crc32c` / `Xxh3Low32`). That
-//!   gate + its unit test live in `crate::compression::zstd_backend`
+//! - **Dict substitution.** Two independent layers reject a substituted frame:
+//!   the block integrity checksum (fixed XXH3-128 over the compressed bytes,
+//!   verified before decode) and, on encrypted blocks, the AAD `dict_id` binding
+//!   (AEAD verify — covered here by `dict_id_*` tampers). On top, the inner zstd
+//!   frame's embedded `Dictionary_ID` is pinned on the compression read path via
+//!   `FrameDecoder::expect_dict_id`, which mainly converts a wrong-dictionary
+//!   configuration into a clear typed error (the raw-content `force_dict` path
+//!   would otherwise apply the wrong tables and decode to silent garbage) and
+//!   adds defense-in-depth behind the checksum + AAD. That gate + its unit test
+//!   live in `crate::compression::zstd_backend`
 //!   (`raw_content_dict_substitution_rejected_by_inner_frame_gate`).
 //! - **Decompression-bomb window swap.** Defended without a strict
 //!   window-descriptor gate: AAD binds `window_log` (AEAD verify catches the
