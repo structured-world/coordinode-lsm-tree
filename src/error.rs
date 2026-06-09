@@ -272,6 +272,41 @@ pub enum Error {
     ///   this internally and the check here becomes belt-and-
     ///   braces.
     ManifestSectionInvalid(&'static str),
+
+    /// The trailing record of the incremental manifest edit log is
+    /// incomplete or corrupt, and the active
+    /// [`ManifestRecoveryMode`](crate::config::ManifestRecoveryMode) does
+    /// not tolerate that defect, so the open aborts rather than silently
+    /// rolling the edit back.
+    ///
+    /// A clean end-of-log is never reported here: a crash exactly at a
+    /// record boundary is byte-identical to a pristine close, so that
+    /// case is always tolerated. This fires when bytes of a trailing
+    /// record are present but the record fails framing — a
+    /// power-loss-truncated append (only
+    /// [`AbsoluteConsistency`](crate::config::ManifestRecoveryMode::AbsoluteConsistency)
+    /// rejects it; other modes roll it back), or a fully-framed record
+    /// whose checksum doesn't match (bit-rot) / whose header is forged
+    /// (rejected by both `AbsoluteConsistency` and
+    /// [`TolerateCorruptedTailRecords`](crate::config::ManifestRecoveryMode::TolerateCorruptedTailRecords),
+    /// which salvages writer-incomplete tails only; rolled back under
+    /// `PointInTimeRecovery` / `SkipAnyCorruptedRecords`).
+    ///
+    /// Recover by truncating the torn tail: run
+    /// [`Config::repair`](crate::Config::repair), which rebuilds a clean
+    /// standalone snapshot (dropping the edit log), or re-open under a
+    /// [`ManifestRecoveryMode`](crate::config::ManifestRecoveryMode) that
+    /// tolerates the defect to roll the trailing edit back.
+    TornManifestEditLog {
+        /// The trailing defect detected: `"truncated"` (partial record
+        /// from a power-loss-interrupted append), `"checksum-mismatch"`
+        /// (fully-framed record whose payload bit-rotted),
+        /// `"bad-header"` (implausible framing length), or
+        /// `"len-mismatch"` (record length disagrees with the expected
+        /// fixed size). Static so callers can branch without parsing
+        /// the message string.
+        kind: &'static str,
+    },
 }
 
 impl std::fmt::Display for Error {

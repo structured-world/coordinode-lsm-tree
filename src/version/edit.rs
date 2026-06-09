@@ -261,37 +261,115 @@ impl VersionEdit {
     }
 }
 
+/// Maps a non-`Ok` trailing-record outcome to the static `kind` carried by
+/// [`crate::Error::TornManifestEditLog`].
+fn tail_defect_kind(outcome: &framing::FramedRecordOutcome) -> &'static str {
+    use framing::FramedRecordOutcome;
+    match outcome {
+        FramedRecordOutcome::TailTruncation => "truncated",
+        FramedRecordOutcome::ChecksumMismatch { .. } => "checksum-mismatch",
+        FramedRecordOutcome::BadHeader => "bad-header",
+        FramedRecordOutcome::LenMismatch { .. } => "len-mismatch",
+        // The caller only routes non-`Ok` outcomes here.
+        FramedRecordOutcome::Ok => "ok",
+    }
+}
+
 /// Replays an edit log: reads framed `VersionEdit` records from `reader` in
-/// order and returns the durable prefix. Replay STOPS at the first record that
-/// is not cleanly `Ok` (torn tail, bad checksum, bad/short header) — under the
-/// append-only invariant a crash can only ever truncate or corrupt the trailing
-/// record, so the clean prefix is exactly the set of durably-committed edits.
-/// The dropped tail (and anything after it) was never acknowledged upward, so a
-/// higher-level journal replays that data.
+/// order and returns the durable prefix. Under the append-only invariant a
+/// crash can only ever truncate or corrupt the trailing record, so the clean
+/// prefix is exactly the set of durably-committed edits.
+///
+/// The edit log has no count header and no terminator: a clean end-of-log is a
+/// record boundary with no further bytes, which is byte-identical to a crash
+/// that landed exactly at a boundary. That clean boundary always ends replay
+/// successfully in every mode — otherwise a pristine database would fail to
+/// open.
+///
+/// For a trailing record with bytes present, the policy follows `mode` and the
+/// kind of defect, mirroring how the snapshot sections route the same
+/// [`ManifestRecoveryMode`](crate::config::ManifestRecoveryMode) variants:
+///
+/// - **Truncated tail** (`TailTruncation`): the writer never finished the
+///   record, so the operation was never acknowledged upward. Rolled back (and
+///   the durable prefix recovered) under every mode except
+///   [`AbsoluteConsistency`](crate::config::ManifestRecoveryMode::AbsoluteConsistency),
+///   which surfaces [`crate::Error::TornManifestEditLog`] so an operator
+///   truncates the tail deliberately (via [`Config::repair`](crate::Config::repair)).
+/// - **Corrupt fully-framed tail** (`ChecksumMismatch` / `BadHeader` /
+///   `LenMismatch`): bit-rot or forgery of already-committed bytes, not an
+///   incomplete write. Rolled back only under the corruption-tolerant modes
+///   ([`PointInTimeRecovery`](crate::config::ManifestRecoveryMode::PointInTimeRecovery)
+///   / [`SkipAnyCorruptedRecords`](crate::config::ManifestRecoveryMode::SkipAnyCorruptedRecords)).
+///   Both [`AbsoluteConsistency`](crate::config::ManifestRecoveryMode::AbsoluteConsistency)
+///   and [`TolerateCorruptedTailRecords`](crate::config::ManifestRecoveryMode::TolerateCorruptedTailRecords)
+///   abort with [`crate::Error::TornManifestEditLog`] — the latter salvages
+///   writer-incomplete tails only, never arbitrary bit-rot.
 ///
 /// A record whose framing is `Ok` (full payload + matching checksum) but whose
 /// payload fails to decode is a genuine format error, not power loss, and is
-/// surfaced as an error rather than silently truncating the log.
+/// surfaced as an error in every mode rather than silently truncating the log.
 ///
 /// # Errors
 ///
-/// Returns an I/O error from `reader` (other than EOF, which ends replay), or
-/// [`crate::Error::InvalidHeader`] if a checksum-valid record fails to decode.
-pub fn replay_edits<R: Read>(reader: &mut R) -> crate::Result<Vec<VersionEdit>> {
+/// Returns an I/O error from `reader`, [`crate::Error::InvalidHeader`] if a
+/// checksum-valid record fails to decode, or
+/// [`crate::Error::TornManifestEditLog`] when the trailing record is
+/// torn / bit-rotted / mis-framed and `mode` does not tolerate that defect.
+pub fn replay_edits<R: Read>(
+    reader: &mut R,
+    mode: crate::config::ManifestRecoveryMode,
+) -> crate::Result<Vec<VersionEdit>> {
+    use crate::config::ManifestRecoveryMode;
     use framing::FramedRecordOutcome;
+    use std::io::BufRead;
 
+    // Only AbsoluteConsistency refuses to roll back a writer-incomplete tail.
+    let abort_on_truncation = matches!(mode, ManifestRecoveryMode::AbsoluteConsistency);
+    // Only PIT / SkipAny roll back a fully-framed but corrupt trailing record;
+    // AbsoluteConsistency and TolerateCorruptedTailRecords abort on it.
+    let tolerate_corruption = matches!(
+        mode,
+        ManifestRecoveryMode::PointInTimeRecovery | ManifestRecoveryMode::SkipAnyCorruptedRecords
+    );
+
+    // Buffer the reader so a clean record boundary can be detected (empty fill)
+    // without consuming bytes from a genuine trailing record.
+    let mut reader = std::io::BufReader::new(reader);
     let mut edits = Vec::new();
     let mut scratch = Vec::new();
-    // Loop until the first non-`Ok` outcome: under the append-only invariant a
-    // crash truncates / corrupts only the trailing record, so the first
-    // TailTruncation / ChecksumMismatch / Bad-or-LenMismatch header ends the
-    // durable prefix. A clean record that fails to *decode* is a real format
-    // error and propagates via `?`.
-    while matches!(
-        framing::read_framed_record(reader, u64::MAX, None, &mut scratch)?,
-        FramedRecordOutcome::Ok
-    ) {
-        edits.push(VersionEdit::decode_payload(&scratch)?);
+    loop {
+        // No bytes left at a record boundary: the normal end of the log. A crash
+        // exactly at a boundary is indistinguishable from a pristine close, so
+        // this is always a successful end — never a "torn tail", in any mode.
+        if reader.fill_buf().map_err(crate::Error::Io)?.is_empty() {
+            break;
+        }
+        let outcome = framing::read_framed_record(&mut reader, u64::MAX, None, &mut scratch)?;
+        match outcome {
+            FramedRecordOutcome::Ok => edits.push(VersionEdit::decode_payload(&scratch)?),
+            // Writer-incomplete tail (power loss mid-append): unacknowledged, so
+            // tolerant modes drop it; AbsoluteConsistency surfaces it.
+            FramedRecordOutcome::TailTruncation => {
+                if abort_on_truncation {
+                    return Err(crate::Error::TornManifestEditLog { kind: "truncated" });
+                }
+                break;
+            }
+            // Fully-framed but corrupt: bit-rot / forgery of committed bytes.
+            // PIT / SkipAny roll it back; AbsoluteConsistency and
+            // TolerateCorruptedTailRecords (truncation-salvage only) abort.
+            FramedRecordOutcome::ChecksumMismatch { .. }
+            | FramedRecordOutcome::BadHeader
+            | FramedRecordOutcome::LenMismatch { .. } => {
+                if tolerate_corruption {
+                    break;
+                }
+                return Err(crate::Error::TornManifestEditLog {
+                    kind: tail_defect_kind(&outcome),
+                });
+            }
+        }
     }
     Ok(edits)
 }
@@ -312,6 +390,7 @@ fn cap(count: u32) -> usize {
 #[expect(clippy::expect_used, clippy::indexing_slicing, reason = "test code")]
 mod tests {
     use super::*;
+    use crate::config::ManifestRecoveryMode;
 
     fn sample() -> VersionEdit {
         VersionEdit {
@@ -453,7 +532,8 @@ mod tests {
         for e in &edits {
             e.append_to(&mut log, &mut scratch).expect("append");
         }
-        let replayed = replay_edits(&mut &log[..]).expect("replay");
+        let replayed =
+            replay_edits(&mut &log[..], ManifestRecoveryMode::AbsoluteConsistency).expect("replay");
         assert_eq!(replayed, edits, "replay must recover every edit in order");
     }
 
@@ -475,13 +555,22 @@ mod tests {
         e2.append_to(&mut log, &mut scratch).expect("append e2");
         log.truncate(clean_len + 6); // partial third record
 
-        let replayed = replay_edits(&mut &log[..]).expect("replay");
+        // A writer-incomplete (truncated) tail is rolled back under every mode
+        // except AbsoluteConsistency; TolerateCorruptedTailRecords is the mode
+        // dedicated to exactly this salvage.
+        let replayed = replay_edits(
+            &mut &log[..],
+            ManifestRecoveryMode::TolerateCorruptedTailRecords,
+        )
+        .expect("replay");
         assert_eq!(replayed, vec![e0, e1], "torn tail dropped, prefix kept");
     }
 
     #[test]
-    fn replay_stops_at_bitflipped_record() {
-        // A bit-flip in the second record stops replay after the first.
+    fn replay_stops_at_bitflipped_record_under_corruption_tolerant_mode() {
+        // A bit-flip in the second record is corruption of committed bytes (a
+        // fully-framed record with a bad checksum), not a writer-incomplete tail.
+        // Only the corruption-tolerant modes (PIT / SkipAny) roll it back.
         let mut log = Vec::new();
         let mut scratch = Vec::new();
         let mut e0 = sample();
@@ -495,13 +584,50 @@ mod tests {
         let target = after_e0 + framing::FRAME_HEADER_LEN + 2;
         log[target] ^= 0xFF;
 
-        let replayed = replay_edits(&mut &log[..]).expect("replay");
-        assert_eq!(replayed, vec![e0], "replay stops at the corrupted record");
+        let replayed =
+            replay_edits(&mut &log[..], ManifestRecoveryMode::PointInTimeRecovery).expect("replay");
+        assert_eq!(replayed, vec![e0], "PIT drops the corrupted record");
+    }
+
+    #[test]
+    fn bitflipped_tail_aborts_under_tolerate_corrupted_tail() {
+        // The mode distinction the bool collapsed: TolerateCorruptedTailRecords
+        // salvages writer-incomplete tails ONLY, so a fully-framed but bit-rotted
+        // trailing record (corruption of committed bytes) must abort, not roll
+        // back. PIT / SkipAny roll it back (covered above); this guards the
+        // boundary so the two policies never merge again.
+        let mut log = Vec::new();
+        let mut scratch = Vec::new();
+        let mut e0 = sample();
+        e0.new_version_id = 1;
+        let mut e1 = sample();
+        e1.new_version_id = 2;
+        e0.append_to(&mut log, &mut scratch).expect("append e0");
+        let after_e0 = log.len();
+        e1.append_to(&mut log, &mut scratch).expect("append e1");
+        let target = after_e0 + framing::FRAME_HEADER_LEN + 2;
+        log[target] ^= 0xFF;
+
+        let err = replay_edits(
+            &mut &log[..],
+            ManifestRecoveryMode::TolerateCorruptedTailRecords,
+        )
+        .expect_err("tolerate-tail must reject committed bit-rot");
+        assert!(
+            matches!(
+                err,
+                crate::Error::TornManifestEditLog {
+                    kind: "checksum-mismatch"
+                }
+            ),
+            "expected TornManifestEditLog(checksum-mismatch), got {err:?}",
+        );
     }
 
     #[test]
     fn replay_of_empty_log_is_empty() {
-        let replayed = replay_edits(&mut &[][..]).expect("replay");
+        let replayed =
+            replay_edits(&mut &[][..], ManifestRecoveryMode::AbsoluteConsistency).expect("replay");
         assert!(replayed.is_empty(), "empty log → no edits");
     }
 
