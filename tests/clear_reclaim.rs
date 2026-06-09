@@ -75,3 +75,50 @@ fn clear_reclaims_sst_disk_footprint_synchronously() -> lsm_tree::Result<()> {
     );
     Ok(())
 }
+
+#[test]
+fn clear_reclaims_blob_files_synchronously() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let path = folder.path();
+    let any = Config::new(
+        path,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_kv_separation(Some(lsm_tree::KvSeparationOptions::default()))
+    .open()?;
+    let tree = match any {
+        lsm_tree::AnyTree::Blob(t) => t,
+        lsm_tree::AnyTree::Standard(_) => panic!("expected Blob tree"),
+    };
+
+    // Large values are stored out-of-line; clear() must reclaim both the SSTs
+    // and the blob files.
+    let big = b"blobby-payload".repeat(8_000);
+    for i in 0..40u64 {
+        tree.insert(format!("k{i:04}").as_bytes(), &big, i);
+    }
+    tree.flush_active_memtable(0)?;
+    assert!(tree.blob_file_count() > 0, "values must be blob-separated");
+
+    // The repetitive payload compresses hard, so the on-disk footprint is far
+    // below the logical size; the floor is just a sanity that blob + SST data
+    // landed — the relative drop below is the real reclaim assertion.
+    let before = dir_size(path);
+    assert!(
+        before > 20_000,
+        "blob tree should occupy real disk, got {before}"
+    );
+
+    tree.clear()?;
+
+    // Drop > 50%: the blob + SST bytes are reclaimed; what remains is the
+    // small manifest baseline (snapshot + CURRENT + edit log), which is a
+    // larger fraction here precisely because the payload compressed so well.
+    let after = dir_size(path);
+    assert!(
+        after * 2 < before,
+        "clear() must reclaim SST + blob footprint: before={before}, after={after}",
+    );
+    Ok(())
+}

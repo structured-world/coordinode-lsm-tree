@@ -413,6 +413,10 @@ impl AbstractTree for BlobTree {
         let config = self.tree_config();
         let mut versions = self.get_version_history_lock();
 
+        // Pre-clear snapshot: its tables AND blob files all become garbage once
+        // the new empty version is installed.
+        let prior = versions.latest_version();
+
         versions.upgrade_version(
             &config.path,
             |v| {
@@ -430,7 +434,23 @@ impl AbstractTree for BlobTree {
             &*config.fs,
             self.index.0.runtime_config.load_full(),
             self.index.0.config.encryption.clone(),
-        )
+        )?;
+
+        // Same MVCC-safe reclaim as the standard tree, plus the blob files:
+        // mark every obsolete table / blob file deleted, drop the history's
+        // hold, and let Inner::Drop reclaim each once its last reference is
+        // released (a live reader's snapshot clone defers deletion).
+        versions.drain_obsolete_to_latest();
+        drop(versions);
+
+        for table in prior.version.iter_tables() {
+            table.mark_as_deleted();
+        }
+        for blob_file in prior.version.blob_files.iter() {
+            blob_file.mark_as_deleted();
+        }
+
+        Ok(())
     }
 
     fn major_compact(
