@@ -899,15 +899,26 @@ impl Table {
     /// Returns `Err` if reading the index or a data block fails.
     #[doc(hidden)]
     pub fn scan_since_seqno(&self, target_seqno: SeqNo) -> crate::Result<Vec<InternalValue>> {
+        // Bulk-ingested tables store entries at LOCAL seqno coordinates with a
+        // `global_seqno` offset; the on-disk seqno bounds and per-entry seqnos
+        // are all local. Translate the incoming global target down to local
+        // for the comparisons, then translate matched record seqnos back up to
+        // global before returning — exactly as `Table::get` does. For a
+        // non-ingested table `global_seqno` is 0 and both translations are
+        // no-ops.
+        let global_seqno = self.global_seqno();
+        let local_target = target_seqno.saturating_sub(global_seqno);
+
         let mut out = Vec::new();
 
         for handle in self.block_index.iter() {
             let handle = handle?;
 
-            // Block-skip: a seqno-bounded entry whose max is below the target
-            // cannot reference any qualifying record, so skip the data-block read.
+            // Block-skip: a seqno-bounded entry whose (local) max is below the
+            // (local) target cannot reference any qualifying record, so skip
+            // the data-block read.
             if let Some((_, seqno_max)) = handle.seqno_bounds()
-                && seqno_max < target_seqno
+                && seqno_max < local_target
             {
                 continue;
             }
@@ -915,8 +926,9 @@ impl Table {
             let block = self.load_data_block(handle.as_ref())?;
             let data = &block.inner.data;
             for item in block.iter(self.comparator.clone()) {
-                let value = item.materialize(data);
-                if value.key.seqno >= target_seqno {
+                let mut value = item.materialize(data);
+                if value.key.seqno >= local_target {
+                    value.key.seqno = value.key.seqno.saturating_add(global_seqno);
                     out.push(value);
                 }
             }
