@@ -384,6 +384,10 @@ impl AbstractTree for Tree {
         let config = self.tree_config();
         let mut versions = self.get_version_history_lock();
 
+        // Pre-clear snapshot: every table + blob file it references becomes
+        // garbage the moment the new empty version is installed.
+        let prior = versions.latest_version();
+
         versions.upgrade_version(
             &config.path,
             |v| {
@@ -401,7 +405,29 @@ impl AbstractTree for Tree {
             &*config.fs,
             self.0.runtime_config.load_full(),
             self.0.config.encryption.clone(),
-        )
+        )?;
+
+        // Release the history's hold on the now-obsolete versions; only the new
+        // empty version remains. `prior` still holds them, so nothing reaches
+        // refcount zero yet.
+        versions.drain_obsolete_to_latest();
+        drop(versions); // release the version-history lock before any fs work
+
+        // Mark every obsolete table / blob file deleted so the file is
+        // reclaimed (Inner::Drop) once its last reference is released. A
+        // concurrent reader still holding the pre-clear snapshot keeps its own
+        // clone alive, deferring physical deletion until it finishes — the
+        // version-history Arc refcount is the MVCC guard, so reclaim never
+        // races a live read. Tables with no other live reference are reclaimed
+        // as `prior` drops at the end of this call.
+        for table in prior.version.iter_tables() {
+            table.mark_as_deleted();
+        }
+        for blob_file in prior.version.blob_files.iter() {
+            blob_file.mark_as_deleted();
+        }
+
+        Ok(())
     }
 
     #[doc(hidden)]
