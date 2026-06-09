@@ -88,14 +88,32 @@ impl BackgroundDeleter {
 
     /// Enqueues `path` for background unlink through `fs`.
     ///
-    /// Non-blocking. If the worker thread has already exited (shutdown in
-    /// progress) the job is dropped — the file is then reclaimed on next
-    /// recovery's orphan sweep, never leaked silently into correctness.
+    /// Non-blocking on the happy path. If the worker is not running — the
+    /// thread failed to spawn in [`Self::new`], or the channel is otherwise
+    /// disconnected — the unlink is performed **synchronously** instead of
+    /// silently dropped: the caller has typically already truncated the file,
+    /// so dropping the job would leave a zero-length directory entry behind.
     pub fn enqueue(&self, fs: Arc<dyn Fs>, path: PathBuf) {
-        if let Some(sender) = &self.sender {
-            // A send error means the worker is gone; the path falls to the
-            // recovery orphan sweep rather than blocking the caller.
-            let _ = sender.send(DeleteJob { fs, path });
+        let job = DeleteJob { fs, path };
+        match &self.sender {
+            // `send` only fails if the receiver (worker) is gone; it hands the
+            // job back in the error, so reclaim it synchronously.
+            Some(sender) => {
+                if let Err(std::sync::mpsc::SendError(job)) = sender.send(job) {
+                    Self::unlink_now(&job);
+                }
+            }
+            None => Self::unlink_now(&job),
+        }
+    }
+
+    /// Synchronous unlink fallback for when the background worker is gone.
+    fn unlink_now(job: &DeleteJob) {
+        if let Err(e) = job.fs.remove_file(&job.path) {
+            log::warn!(
+                "background deleter sync fallback failed to unlink {}: {e:?}",
+                job.path.display(),
+            );
         }
     }
 
