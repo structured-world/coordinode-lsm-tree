@@ -798,6 +798,31 @@ pub trait Fs: Send + Sync + 'static {
         self.open(path, &FsOpenOptions::new().write(true))?
             .set_len(0)
     }
+
+    /// Number of hard links to the file at `path` (the inode's link count).
+    ///
+    /// Used to keep [`Self::truncate_file`] safe: truncation frees the inode's
+    /// blocks for **every** hard link, so a file a checkpoint has linked (via
+    /// [`Self::hard_link`]) must not be truncated — only unlinked. A caller
+    /// truncates only when this returns `Ok(1)` (it owns the sole link).
+    ///
+    /// # Default implementation
+    ///
+    /// Returns an `Unsupported` error so a backend that cannot report link
+    /// counts makes callers conservatively skip truncation (correctness over
+    /// the reclaim optimization). [`StdFs`] overrides it on Unix via `nlink`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if the count cannot be determined (including the
+    /// `Unsupported` default).
+    fn hard_link_count(&self, path: &Path) -> io::Result<u64> {
+        let _ = path;
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "hard_link_count is not supported by this backend",
+        ))
+    }
 }
 
 /// Streamed independent copy of `src` to `dst` through `fs`'s own [`Fs::open`].

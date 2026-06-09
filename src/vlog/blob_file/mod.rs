@@ -145,7 +145,13 @@ impl Drop for Inner {
             // Falls through to a synchronous remove_file when none installed.
             #[cfg(feature = "std")]
             if let Some(deleter) = self.background_deleter.get() {
-                if let Err(e) = self.fs.truncate_file(&self.path) {
+                // Truncate only when we own the sole hard link — a checkpoint
+                // may have hard-linked this blob file, and truncating the shared
+                // inode would zero the checkpoint's copy. Otherwise skip the
+                // truncate and just unlink (data survives via the other link).
+                if self.fs.hard_link_count(&self.path).is_ok_and(|n| n <= 1)
+                    && let Err(e) = self.fs.truncate_file(&self.path)
+                {
                     log::warn!(
                         "Failed to truncate deleted blob file {:?} at {}: {e:?}",
                         self.id,

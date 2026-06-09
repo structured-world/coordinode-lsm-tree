@@ -192,7 +192,17 @@ impl Drop for Inner {
             // installed (e.g. orphan cleanup before a tree owns the table).
             #[cfg(feature = "std")]
             if let Some(deleter) = self.background_deleter.get() {
-                if let Err(e) = self.fs.truncate_file(&self.path) {
+                // Truncate (instant block-free) only when we own the sole hard
+                // link. A completed checkpoint may have hard-linked this SST;
+                // truncating the shared inode would zero the checkpoint's copy
+                // too. When the link is shared (or the count is unknown), skip
+                // the truncate and just unlink our directory entry — the data
+                // survives via the other link and its blocks free once the last
+                // link is gone. (An in-progress checkpoint is already handled by
+                // the deletion-pause branch above.)
+                if self.fs.hard_link_count(&self.path).is_ok_and(|n| n <= 1)
+                    && let Err(e) = self.fs.truncate_file(&self.path)
+                {
                     log::warn!(
                         "Failed to truncate deleted table {global_id:?} at {:?}: {e:?}",
                         self.path,

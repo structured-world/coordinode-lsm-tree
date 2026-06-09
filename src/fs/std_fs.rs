@@ -294,6 +294,24 @@ impl Fs for StdFs {
         Some(KERNEL_BACKEND_ID)
     }
 
+    fn hard_link_count(&self, path: &Path) -> io::Result<u64> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            Ok(std::fs::metadata(path)?.nlink())
+        }
+        // Windows: no portable nlink; fall back to the conservative
+        // "unsupported" contract so the reclaim path skips truncation.
+        #[cfg(not(unix))]
+        {
+            let _ = path;
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "hard_link_count requires a Unix target",
+            ))
+        }
+    }
+
     /// macOS: detects APFS (the common macOS filesystem with copy-on-write,
     /// reflink, and native snapshots) via `statfs(2)`'s `f_fstypename`. Other
     /// macOS filesystems (HFS+, exFAT, SMB/NFS mounts) and any detection failure
