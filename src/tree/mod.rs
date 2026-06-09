@@ -17,6 +17,8 @@ use crate::{
     key::InternalKey,
     manifest::Manifest,
     memtable::Memtable,
+    range_tombstone::RangeTombstone,
+    scan_since::ScanSinceEvent,
     slice::Slice,
     table::Table,
     value::InternalValue,
@@ -1036,6 +1038,130 @@ impl AbstractTree for Tree {
 }
 
 impl Tree {
+    /// Maps a raw internal entry to its change-data-capture event.
+    ///
+    /// `Indirection` (KV-separated) values are not resolvable at this level
+    /// because the blob files live above the standard tree; the blob-tree scan
+    /// path resolves them into [`ScanSinceEvent::Insert`]. A standard tree
+    /// never stores `Indirection`, so this arm is unreachable there.
+    fn point_event(entry: InternalValue) -> crate::Result<ScanSinceEvent> {
+        let seqno = entry.key.seqno;
+        let key = entry.key.user_key;
+        Ok(match entry.key.value_type {
+            ValueType::Value => ScanSinceEvent::Insert {
+                key,
+                value: entry.value,
+                seqno,
+            },
+            ValueType::MergeOperand => ScanSinceEvent::MergeOperand {
+                key,
+                operand: entry.value,
+                seqno,
+            },
+            ValueType::Tombstone | ValueType::WeakTombstone => {
+                ScanSinceEvent::PointTombstone { key, seqno }
+            }
+            ValueType::Indirection => {
+                return Err(crate::Error::FeatureUnsupported(
+                    "scan_since_seqno on KV-separated values requires the blob-tree scan path",
+                ));
+            }
+        })
+    }
+
+    /// Iterate change events with `seqno >= target_seqno`.
+    ///
+    /// Returns every change committed at or after `target_seqno` as a stream
+    /// of [`ScanSinceEvent`]s in increasing seqno order. This is the canonical
+    /// change-data-capture primitive: a downstream consumer (replica, Kafka
+    /// connector, Debezium-style pipeline) replays the events in order to
+    /// reconstruct the source's history. Superseded versions are not collapsed
+    /// (a key written three times after the target yields three events).
+    ///
+    /// # Block-skip
+    ///
+    /// On SSTs written in the seqno-bounded index format (`seqno_in_index`),
+    /// data blocks whose `seqno_max < target_seqno` are skipped without being
+    /// read; legacy SSTs are read and filtered per entry, so mixed-format trees
+    /// are handled transparently.
+    ///
+    /// # KV-separation
+    ///
+    /// Standard trees never store blob-indirected values. On the inner tree of
+    /// a KV-separated (blob) tree this returns an `Err` for indirected entries:
+    /// blob resolution into [`ScanSinceEvent::Insert`] is provided by the
+    /// blob-tree scan path, which owns the blob files.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal version-history lock is poisoned.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if reading the index or a data block fails, or if an entry
+    /// is a KV-separated value (see above).
+    pub fn scan_since_seqno(
+        &self,
+        target_seqno: SeqNo,
+    ) -> crate::Result<impl Iterator<Item = ScanSinceEvent> + use<>> {
+        #[expect(clippy::expect_used, reason = "lock is expected to not be poisoned")]
+        let super_version = self
+            .version_history
+            .read()
+            .expect("lock is poisoned")
+            .latest_version();
+
+        let mut events: Vec<ScanSinceEvent> = Vec::new();
+
+        // Point entries: active + sealed memtables, then SSTs (block-skip).
+        for entry in super_version.active_memtable.iter() {
+            if entry.key.seqno >= target_seqno {
+                events.push(Self::point_event(entry)?);
+            }
+        }
+        for memtable in super_version.sealed_memtables.iter() {
+            for entry in memtable.iter() {
+                if entry.key.seqno >= target_seqno {
+                    events.push(Self::point_event(entry)?);
+                }
+            }
+        }
+        for table in super_version.version.iter_tables() {
+            for entry in table.scan_since_seqno(target_seqno)? {
+                events.push(Self::point_event(entry)?);
+            }
+        }
+
+        // Range tombstones from the same sources, carrying their own seqno.
+        let mut push_range_tombstone = |rt: &RangeTombstone| {
+            if rt.seqno >= target_seqno {
+                events.push(ScanSinceEvent::RangeTombstone {
+                    start_key: rt.start.clone(),
+                    end_key: rt.end.clone(),
+                    seqno: rt.seqno,
+                });
+            }
+        };
+        for rt in super_version.active_memtable.range_tombstones_sorted() {
+            push_range_tombstone(&rt);
+        }
+        for memtable in super_version.sealed_memtables.iter() {
+            for rt in memtable.range_tombstones_sorted() {
+                push_range_tombstone(&rt);
+            }
+        }
+        for table in super_version.version.iter_tables() {
+            for rt in table.range_tombstones() {
+                push_range_tombstone(rt);
+            }
+        }
+
+        // Replay order is increasing seqno across every source.
+        events.sort_by_key(ScanSinceEvent::seqno);
+
+        Ok(events.into_iter())
+    }
+
     /// Update the live [`crate::runtime_config::RuntimeConfig`].
     ///
     /// Mutator runs on a clone of the current snapshot; the new snapshot
