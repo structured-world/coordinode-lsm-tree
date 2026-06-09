@@ -1136,30 +1136,56 @@ impl Tree {
             .latest_version();
         let version = &super_version.version;
 
+        // Stable upper watermark, captured once before walking any source: the
+        // highest seqno present across every source at scan start (in global
+        // coordinates — `Table::get_highest_seqno` already adds the offset).
+        // The active memtable is shared and mutable, so without this cap a
+        // write committed mid-scan could leak in and break the "consistent
+        // snapshot of changes in [target, watermark]" contract. The seqno
+        // counter is not a reliable bound here because callers may assign
+        // seqnos explicitly without advancing it, so derive it from the data.
+        let end_seqno = {
+            let active = super_version.active_memtable.get_highest_seqno();
+            let sealed = super_version
+                .sealed_memtables
+                .iter()
+                .map(|mt| mt.get_highest_seqno())
+                .max()
+                .flatten();
+            let tables = version.iter_tables().map(Table::get_highest_seqno).max();
+            active.max(sealed).max(tables)
+        };
+        // No entries anywhere ⇒ nothing qualifies, regardless of target.
+        let Some(end_seqno) = end_seqno else {
+            return Ok(Vec::new().into_iter());
+        };
+
         let mut events: Vec<ScanSinceEvent> = Vec::new();
 
         // Point entries: active + sealed memtables, then SSTs (block-skip).
         for entry in super_version.active_memtable.iter() {
-            if entry.key.seqno >= target_seqno {
+            if entry.key.seqno >= target_seqno && entry.key.seqno <= end_seqno {
                 events.push(Self::map_event(entry, version, &resolve_indirection)?);
             }
         }
         for memtable in super_version.sealed_memtables.iter() {
             for entry in memtable.iter() {
-                if entry.key.seqno >= target_seqno {
+                if entry.key.seqno >= target_seqno && entry.key.seqno <= end_seqno {
                     events.push(Self::map_event(entry, version, &resolve_indirection)?);
                 }
             }
         }
         for table in version.iter_tables() {
-            for entry in table.scan_since_seqno(target_seqno)? {
+            // `scan_seqno_range` upper bound is exclusive; `end_seqno` is the
+            // inclusive max, so add one (saturating for the MAX edge).
+            for entry in table.scan_seqno_range(target_seqno, end_seqno.saturating_add(1))? {
                 events.push(Self::map_event(entry, version, &resolve_indirection)?);
             }
         }
 
         // Range tombstones from the same sources, carrying their own seqno.
         let mut push_range_tombstone = |rt: &RangeTombstone| {
-            if rt.seqno >= target_seqno {
+            if rt.seqno >= target_seqno && rt.seqno <= end_seqno {
                 events.push(ScanSinceEvent::RangeTombstone {
                     start_key: rt.start.clone(),
                     end_key: rt.end.clone(),

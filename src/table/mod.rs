@@ -899,6 +899,23 @@ impl Table {
     /// Returns `Err` if reading the index or a data block fails.
     #[doc(hidden)]
     pub fn scan_since_seqno(&self, target_seqno: SeqNo) -> crate::Result<Vec<InternalValue>> {
+        self.scan_seqno_range(target_seqno, SeqNo::MAX)
+    }
+
+    /// Like [`Self::scan_since_seqno`] but also bounds the result above:
+    /// collects entries whose global seqno is in `[target_seqno, end_seqno)`.
+    /// The upper bound lets the tree-level scan pin a stable snapshot watermark
+    /// so a concurrent write cannot leak in mid-scan.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if reading the index or a data block fails.
+    #[doc(hidden)]
+    pub fn scan_seqno_range(
+        &self,
+        target_seqno: SeqNo,
+        end_seqno: SeqNo,
+    ) -> crate::Result<Vec<InternalValue>> {
         // Bulk-ingested tables store entries at LOCAL seqno coordinates with a
         // `global_seqno` offset; the on-disk seqno bounds and per-entry seqnos
         // are all local. Translate the incoming global target down to local
@@ -908,17 +925,21 @@ impl Table {
         // no-ops.
         let global_seqno = self.global_seqno();
         let local_target = target_seqno.saturating_sub(global_seqno);
+        // Upper bound in local coords. `SeqNo::MAX` (the unbounded case) stays
+        // MAX so every entry passes; a real watermark maps below the offset to
+        // 0, correctly excluding the whole table.
+        let local_end = end_seqno.saturating_sub(global_seqno);
 
         let mut out = Vec::new();
 
         for handle in self.block_index.iter() {
             let handle = handle?;
 
-            // Block-skip: a seqno-bounded entry whose (local) max is below the
-            // (local) target cannot reference any qualifying record, so skip
-            // the data-block read.
-            if let Some((_, seqno_max)) = handle.seqno_bounds()
-                && seqno_max < local_target
+            // Block-skip: a seqno-bounded entry whose (local) min exceeds the
+            // upper bound, or whose (local) max is below the target, cannot
+            // reference any qualifying record — skip the data-block read.
+            if let Some((seqno_min, seqno_max)) = handle.seqno_bounds()
+                && (seqno_max < local_target || seqno_min >= local_end)
             {
                 continue;
             }
@@ -927,7 +948,7 @@ impl Table {
             let data = &block.inner.data;
             for item in block.iter(self.comparator.clone()) {
                 let mut value = item.materialize(data);
-                if value.key.seqno >= local_target {
+                if value.key.seqno >= local_target && value.key.seqno < local_end {
                     value.key.seqno = value.key.seqno.saturating_add(global_seqno);
                     out.push(value);
                 }
