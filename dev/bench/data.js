@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1780963758206,
+  "lastUpdate": 1780965163182,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -14118,6 +14118,84 @@ window.BENCHMARK_DATA = {
             "value": 568751.7801752985,
             "unit": "ops/sec",
             "extra": "P50: 1.6us | P99: 5.0us | P99.9: 7.6us\nthreads: 1 | elapsed: 0.35s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "255865126+sw-release-bot[bot]@users.noreply.github.com",
+            "name": "sw-release-bot[bot]",
+            "username": "sw-release-bot[bot]"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "300d6faae130ccce5f7cb40770eb94a949363f8f",
+          "message": "chore: release v5.0.0 (#272)\n\n## 🤖 New release\n\n* `coordinode-lsm-tree`: 4.5.0 -> 5.0.0\n\n<details><summary><i><b>Changelog</b></i></summary><p>\n\n<blockquote>\n\n##\n[5.0.0](https://github.com/structured-world/coordinode-lsm-tree/compare/v4.5.0...v5.0.0)\n- 2026-06-08\n\n### Added\n\n- *(fs)* filesystem-aware capability framework (CoW-disable + reflink)\n([#428](https://github.com/structured-world/coordinode-lsm-tree/pull/428))\n- *(encryption)* activate AAD-bound block encryption on the live path\n([#423](https://github.com/structured-world/coordinode-lsm-tree/pull/423))\n- *(manifest)* incremental manifest via append-only edit log\n([#421](https://github.com/structured-world/coordinode-lsm-tree/pull/421))\n- *(query)* cold-block partial decode with resumable zstd\n([#415](https://github.com/structured-world/coordinode-lsm-tree/pull/415))\n- *(ecc)* configurable ECC-at-rest scheme (XOR / Reed-Solomon) on the\nPage ECC path\n([#414](https://github.com/structured-world/coordinode-lsm-tree/pull/414))\n- *(tooling)* repair_db — rebuild MANIFEST from on-disk SSTs\n([#409](https://github.com/structured-world/coordinode-lsm-tree/pull/409))\n- *(compaction)* compaction-time range tombstones + bottommost\nseqno-zeroing\n([#407](https://github.com/structured-world/coordinode-lsm-tree/pull/407))\n- *(compaction)* parallel sub-compaction across key ranges\n([#402](https://github.com/structured-world/coordinode-lsm-tree/pull/402))\n- *(compaction)* parallel block compression\n([#401](https://github.com/structured-world/coordinode-lsm-tree/pull/401))\n- *(bench)* add point-read workload to compare-rocksdb harness\n([#372](https://github.com/structured-world/coordinode-lsm-tree/pull/372))\n- *(index)* per-block seqno bounds in SST index entries\n([#371](https://github.com/structured-world/coordinode-lsm-tree/pull/371))\n- *(integrity)* [**breaking**] per-KV checksum protection + flag-based\nECC parity (V5 block header)\n([#369](https://github.com/structured-world/coordinode-lsm-tree/pull/369))\n- *(encryption)* outer Reed-Solomon ECC frame codec over block\nciphertext\n([#365](https://github.com/structured-world/coordinode-lsm-tree/pull/365))\n- *(manifest)* Blocks-based manifest hardening\n([#297](https://github.com/structured-world/coordinode-lsm-tree/pull/297))\n([#357](https://github.com/structured-world/coordinode-lsm-tree/pull/357))\n- *(config)* runtime-toggleable RuntimeConfig foundation\n([#352](https://github.com/structured-world/coordinode-lsm-tree/pull/352))\n([#355](https://github.com/structured-world/coordinode-lsm-tree/pull/355))\n- *(version)* PointInTimeRecovery + SkipAnyCorruptedRecords + per-record\nframing\n([#323](https://github.com/structured-world/coordinode-lsm-tree/pull/323))\n([#342](https://github.com/structured-world/coordinode-lsm-tree/pull/342))\n- *(io)* local Read/Write/Seek trait surface to lift Fs off std::io\n([#311](https://github.com/structured-world/coordinode-lsm-tree/pull/311))\n([#347](https://github.com/structured-world/coordinode-lsm-tree/pull/347))\n- *(bench)* foundation for compare-rocksdb head-to-head harness\n([#244](https://github.com/structured-world/coordinode-lsm-tree/pull/244))\n([#345](https://github.com/structured-world/coordinode-lsm-tree/pull/345))\n- *(encryption)* top-level encrypt_block/decrypt_block + KeyChain + wire\nformat\n([#251](https://github.com/structured-world/coordinode-lsm-tree/pull/251))\n([#344](https://github.com/structured-world/coordinode-lsm-tree/pull/344))\n- *(ecc)* per-block Reed-Solomon Page ECC\n([#267](https://github.com/structured-world/coordinode-lsm-tree/pull/267))\n([#343](https://github.com/structured-world/coordinode-lsm-tree/pull/343))\n- *(sst-dump)* dump subcommand + public inspect::iter_data_block_entries\nfacade\n([#335](https://github.com/structured-world/coordinode-lsm-tree/pull/335))\n- *(sst-dump)* filter-stats subcommand + public\ninspect::read_filter_stats facade\n([#334](https://github.com/structured-world/coordinode-lsm-tree/pull/334))\n- *(encryption)* AEAD dispatch with AES-256-GCM + ChaCha20-Poly1305\n(#251 PR2)\n([#338](https://github.com/structured-world/coordinode-lsm-tree/pull/338))\n- *(encryption)* AAD construction + decode-time error types (#251\nfoundation)\n([#336](https://github.com/structured-world/coordinode-lsm-tree/pull/336))\n- *(sst-dump)* index-dump subcommand + public inspect facade extension\n([#333](https://github.com/structured-world/coordinode-lsm-tree/pull/333))\n- *(sst-dump)* properties subcommand + public inspect facade\n([#328](https://github.com/structured-world/coordinode-lsm-tree/pull/328))\n- *(table)* mirror TLI block near file tail for torn-write safety\n([#325](https://github.com/structured-world/coordinode-lsm-tree/pull/325))\n- *(sst-dump)* hex subcommand for raw block-region dump with header\ndecode\n([#327](https://github.com/structured-world/coordinode-lsm-tree/pull/327))\n- *(tooling)* sst-dump CLI scaffold + verify subcommand\n([#301](https://github.com/structured-world/coordinode-lsm-tree/pull/301))\n([#316](https://github.com/structured-world/coordinode-lsm-tree/pull/316))\n- *(config)* ManifestRecoveryMode + TolerateCorruptedTailRecords\n([#299](https://github.com/structured-world/coordinode-lsm-tree/pull/299))\n([#317](https://github.com/structured-world/coordinode-lsm-tree/pull/317))\n- *(verify)* per-block XXH3 scrub for proactive bit-rot detection (#300\npart 1)\n([#313](https://github.com/structured-world/coordinode-lsm-tree/pull/313))\n- *(fs)* FileHint enum + FsFile::hint() primitive for posix_fadvise\n(#133 Phase 1a)\n([#307](https://github.com/structured-world/coordinode-lsm-tree/pull/307))\n- *(seeking-merger)* allow self-coordinating independent-cursor sources\nvia broadened CoherentMergeSource\n([#280](https://github.com/structured-world/coordinode-lsm-tree/pull/280))\n([#305](https://github.com/structured-world/coordinode-lsm-tree/pull/305))\n- *(range)* wire SeekingMerger into Tree::range read path\n([#222](https://github.com/structured-world/coordinode-lsm-tree/pull/222))\n([#288](https://github.com/structured-world/coordinode-lsm-tree/pull/288))\n- *(merge)* SeekingMerger — RocksDB-style dual loser trees\n([#222](https://github.com/structured-world/coordinode-lsm-tree/pull/222))\n([#284](https://github.com/structured-world/coordinode-lsm-tree/pull/284))\n- *(checkpoint)* [**breaking**] hard-link snapshot for PITR backup (V5\nstorage)\n([#276](https://github.com/structured-world/coordinode-lsm-tree/pull/276))\n- *(filter)* replace standard bloom with BuRR\n([#269](https://github.com/structured-world/coordinode-lsm-tree/pull/269))\n\n### Documentation\n\n- fix broken and redundant intra-doc links across the crate\n([#368](https://github.com/structured-world/coordinode-lsm-tree/pull/368))\n- *(format_version)* document on-disk version bump policy\n([#360](https://github.com/structured-world/coordinode-lsm-tree/pull/360))\n- add Manifest recovery modes section to README\n([#332](https://github.com/structured-world/coordinode-lsm-tree/pull/332))\n- *(encryption)* AAD-bound encrypted block wire format spec\n([#250](https://github.com/structured-world/coordinode-lsm-tree/pull/250))\n([#318](https://github.com/structured-world/coordinode-lsm-tree/pull/318))\n\n### Fixed\n\n- *(compaction/leveled)* tie level-count assertion to config\n([#359](https://github.com/structured-world/coordinode-lsm-tree/pull/359))\n- *(table/index)* default partitioned index ON at every level\n([#329](https://github.com/structured-world/coordinode-lsm-tree/pull/329))\n([#340](https://github.com/structured-world/coordinode-lsm-tree/pull/340))\n- *(table)* mirror meta block at mid-file for tail-corruption resilience\n([#295](https://github.com/structured-world/coordinode-lsm-tree/pull/295))\n([#314](https://github.com/structured-world/coordinode-lsm-tree/pull/314))\n\n### Performance\n\n- *(memtable)* stop zeroing the arena, restore cheap fixed-block decode\n([#420](https://github.com/structured-world/coordinode-lsm-tree/pull/420))\n- *(memtable)* geometric arena chunks (no 64 MiB zeroing per flush)\n([#417](https://github.com/structured-world/coordinode-lsm-tree/pull/417))\n- *(compression)* pass source-size hint on zstd block compression\n([#404](https://github.com/structured-world/coordinode-lsm-tree/pull/404))\n- *(table)* raise index spill threshold to 4 MiB\n([#399](https://github.com/structured-world/coordinode-lsm-tree/pull/399))\n- *(table)* size-adaptive block index — single-level for small SSTs\n([#397](https://github.com/structured-world/coordinode-lsm-tree/pull/397))\n- *(read)* lock-free latest-version fast path for point reads\n([#394](https://github.com/structured-world/coordinode-lsm-tree/pull/394))\n- *(compaction)* I/O rate limiter (leaky token bucket)\n([#389](https://github.com/structured-world/coordinode-lsm-tree/pull/389))\n- *(io)* drop cold-level SST output from the page cache after write\n([#392](https://github.com/structured-world/coordinode-lsm-tree/pull/392))\n- *(table)* extend longest_shared_prefix_length SIMD to 32-bit x86\n(i686)\n([#382](https://github.com/structured-world/coordinode-lsm-tree/pull/382))\n- *(table)* AVX-512BW 64-byte lane for longest_shared_prefix_length\n([#380](https://github.com/structured-world/coordinode-lsm-tree/pull/380))\n- *(fs)* pure hard_link; single SyncMode-aware cross-fs copy path\n([#378](https://github.com/structured-world/coordinode-lsm-tree/pull/378))\n- *(fs)* configurable SyncMode; default plain fsync on macOS\n([#374](https://github.com/structured-world/coordinode-lsm-tree/pull/374))\n- *(read)* borrow index block on point-read, parse trailer once\n([#376](https://github.com/structured-world/coordinode-lsm-tree/pull/376))\n- *(zstd)* retain dictionary id in frame header\n([#366](https://github.com/structured-world/coordinode-lsm-tree/pull/366))\n- *(fs)* O_DIRECT foundation — AlignedBuf + FsOpenOptions::direct_io\n(#133 phase 2)\n([#310](https://github.com/structured-world/coordinode-lsm-tree/pull/310))\n- *(table/scanner)* bump compaction readahead 32 KiB → 2 MiB (#133 Phase\n1c)\n([#308](https://github.com/structured-world/coordinode-lsm-tree/pull/308))\n- *(ci)* proptest env-var budgets + slow-timeout audit (#158 items 2-5)\n([#306](https://github.com/structured-world/coordinode-lsm-tree/pull/306))\n- *(table)* add Table::batch_get for sorted multi-key point reads (#223\nphase 1)\n([#290](https://github.com/structured-world/coordinode-lsm-tree/pull/290))\n- *(loser_tree)* eliminate comparator dispatch, close #283 fully\n([#287](https://github.com/structured-world/coordinode-lsm-tree/pull/287))\n- *(loser_tree)* close N≥16 regression, reduce small-N gap (#283\npartial)\n([#286](https://github.com/structured-world/coordinode-lsm-tree/pull/286))\n- *(compression)* pre-parse zstd dict once via OnceCell + no-std\nfoundation\n([#273](https://github.com/structured-world/coordinode-lsm-tree/pull/273))\n\n### Refactored\n\n- *(block)* collapse 4 Block I/O paths into a single BlockTransform enum\n([#248](https://github.com/structured-world/coordinode-lsm-tree/pull/248))\n([#337](https://github.com/structured-world/coordinode-lsm-tree/pull/337))\n- *(block)* [**breaking**] thread BlockIdentity through Block I/O API\n([#252](https://github.com/structured-world/coordinode-lsm-tree/pull/252))\n([#294](https://github.com/structured-world/coordinode-lsm-tree/pull/294))\n- *(table/block/tests)* extract write_block_to_tempfile helper (#128\npart 1)\n([#293](https://github.com/structured-world/coordinode-lsm-tree/pull/293))\n- *(filter/burr)* re-deny indexing/expect/unwrap with per-site\njustifications\n([#270](https://github.com/structured-world/coordinode-lsm-tree/pull/270))\n([#282](https://github.com/structured-world/coordinode-lsm-tree/pull/282))\n\n### Testing\n\n- *(compare)* honest L3 compaction baseline vs RocksDB\n([#427](https://github.com/structured-world/coordinode-lsm-tree/pull/427))\n- *(compare)* add surrealkv as a third bench engine\n([#425](https://github.com/structured-world/coordinode-lsm-tree/pull/425))\n- *(compare-rocksdb)* zstd-22 compression axis + scan/seek/overwrite\nscenarios\n([#386](https://github.com/structured-world/coordinode-lsm-tree/pull/386))\n- *(encryption)* AAD threat-model regression suite (first wave)\n([#361](https://github.com/structured-world/coordinode-lsm-tree/pull/361))\n- *(table/index)* tighten blast-radius assertion to corruption variants\n([#341](https://github.com/structured-world/coordinode-lsm-tree/pull/341))\n- triage all #[ignore] annotations across the crate\n([#326](https://github.com/structured-world/coordinode-lsm-tree/pull/326))\n- *(table)* pin global-seqno translation on Table::get return path\n([#321](https://github.com/structured-world/coordinode-lsm-tree/pull/321))\n([#322](https://github.com/structured-world/coordinode-lsm-tree/pull/322))\n- *(verify)* pin DataReadError routing for truncated data segment\n([#315](https://github.com/structured-world/coordinode-lsm-tree/pull/315))\n([#319](https://github.com/structured-world/coordinode-lsm-tree/pull/319))\n- *(encryption)* mixed-load stress test across encryption × compression\nmatrix (#128 part 2)\n([#304](https://github.com/structured-world/coordinode-lsm-tree/pull/304))\n- *(bench)* P99/P999 tail-latency reporting for BuRR/ribbon probes\n([#271](https://github.com/structured-world/coordinode-lsm-tree/pull/271))\n([#281](https://github.com/structured-world/coordinode-lsm-tree/pull/281))\n</blockquote>\n\n\n</p></details>\n\n---\nThis PR was generated with\n[release-plz](https://github.com/release-plz/release-plz/).\n\nCo-authored-by: sw-release-bot[bot] <255865126+sw-release-bot[bot]@users.noreply.github.com>",
+          "timestamp": "2026-06-09T03:09:20+03:00",
+          "tree_id": "e0971e793386680b0e83e0b2fc21bebc30849008",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/300d6faae130ccce5f7cb40770eb94a949363f8f"
+        },
+        "date": 1780965154990,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 1976235.374376053,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.6us | P99.9: 3.7us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1189415.515030953,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.2us | P99.9: 4.4us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 660590.9998519087,
+            "unit": "ops/sec",
+            "extra": "P50: 1.4us | P99: 4.6us | P99.9: 7.3us\nthreads: 1 | elapsed: 0.30s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3796678.669296778,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 3.0us | P99.9: 5.4us\nthreads: 1 | elapsed: 0.05s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 434687.0966008656,
+            "unit": "ops/sec",
+            "extra": "P50: 2.0us | P99: 5.5us | P99.9: 8.4us\nthreads: 1 | elapsed: 0.46s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 215353.1128355136,
+            "unit": "ops/sec",
+            "extra": "P50: 4.4us | P99: 5.4us | P99.9: 8.9us\nthreads: 1 | elapsed: 0.93s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1185658.113467363,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.2us | P99.9: 4.3us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1158719.2747696566,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 1.5us | P99.9: 2.5us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 552399.7250806,
+            "unit": "ops/sec",
+            "extra": "P50: 1.6us | P99: 5.0us | P99.9: 7.7us\nthreads: 1 | elapsed: 0.36s | num: 200000 | iterations: 3"
           }
         ]
       }
