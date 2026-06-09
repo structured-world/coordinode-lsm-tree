@@ -304,6 +304,16 @@ pub mod table;
 
 mod background_deleter;
 mod scan_since;
+
+/// Single-error-correct / double-error-detect word codecs for the Page ECC
+/// read path (pluggable SEC-DED shapes; default Hsiao `(72, 64)`).
+///
+/// Gated behind `page_ecc` and crate-internal: the codec only runs on the
+/// Page ECC recovery path. Trailer sizing on the read path uses a plain
+/// `ceil(len / 8)` so reading a SEC-DED SST does not require this module.
+#[cfg(feature = "page_ecc")]
+pub(crate) mod secded;
+
 mod seqno;
 mod slice;
 mod slice_windows;

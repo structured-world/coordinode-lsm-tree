@@ -69,8 +69,15 @@ const MAX_DECOMPRESSION_SIZE: u32 = 256 * 1024 * 1024;
 /// `crate::ecc::encode_parity`'s empty-payload short-circuit.
 #[inline]
 pub(crate) fn expected_parity_len(data_length: u32, params: EccParams) -> u32 {
-    let data_shards = u32::from(params.data_shards());
-    let parity_shards = u32::from(params.parity_shards());
+    // SEC-DED: one parity byte per 8-byte word (matches
+    // `crate::secded::block_parity_len`); no shard arithmetic.
+    let (data_shards, parity_shards) = match params {
+        EccParams::Secded => return data_length.div_ceil(8),
+        EccParams::Shard {
+            data_shards,
+            parity_shards,
+        } => (u32::from(data_shards), u32::from(parity_shards)),
+    };
     if data_length == 0 || data_shards == 0 || parity_shards == 0 {
         return 0;
     }
@@ -414,10 +421,40 @@ impl Block {
             return Ok(data);
         }
 
-        // Mismatch — try Reed-Solomon recovery before failing.
+        // Mismatch — try ECC recovery before failing.
         #[cfg(feature = "page_ecc")]
         {
             let expected_raw = expected.into_u128();
+
+            // SEC-DED fast path: heal a single bit flip per word. The repaired
+            // block must reproduce the stored checksum; a double-bit error (or
+            // a heal that still mismatches) is surfaced, never silently
+            // accepted. This scheme stores no shard parity, so there is no RS
+            // fall-through here — the shard schemes are a separate EccParams
+            // variant.
+            if matches!(ecc_params, crate::table::block::EccParams::Secded) {
+                let mut healed = data.clone();
+                if crate::secded::try_correct_block(&mut healed, &parity)
+                    == crate::secded::SecdedOutcome::Corrected
+                    && crate::hash::hash128(&healed) == expected_raw
+                {
+                    log::warn!(
+                        "recovered block via SEC-DED single-bit heal after \
+                         checksum mismatch (data_len={}, ecc_len={ecc_length})",
+                        data.len(),
+                    );
+                    return Ok(healed);
+                }
+                log::error!(
+                    "Checksum mismatch on SEC-DED block, heal failed, \
+                     got={computed}, expected={expected}",
+                );
+                return Err(crate::Error::PageEccUnrecoverable {
+                    got: computed,
+                    expected,
+                });
+            }
+
             let (data_shards, parity_shards) = ecc_params.as_shards();
             if let Some(recovered) = crate::ecc::try_recover(
                 &data,
@@ -745,8 +782,18 @@ impl Block {
         // compiler folds it out.
         #[cfg(feature = "page_ecc")]
         let parity_buf: Option<Vec<u8>> = if let Some(ecc_params) = transform.ecc_params() {
-            let (data_shards, parity_shards) = ecc_params.as_shards();
-            let p = crate::ecc::encode_parity(&payload, data_shards, parity_shards)?;
+            // SEC-DED emits one check byte per 8-byte word; shard schemes emit a
+            // Reed-Solomon / XOR trailer. Both produce a parity buffer the
+            // reader re-sizes from `data_length` via `expected_parity_len`.
+            let p = match ecc_params {
+                crate::table::block::EccParams::Secded => {
+                    crate::secded::encode_block_parity(&payload)
+                }
+                crate::table::block::EccParams::Shard { .. } => {
+                    let (data_shards, parity_shards) = ecc_params.as_shards();
+                    crate::ecc::encode_parity(&payload, data_shards, parity_shards)?
+                }
+            };
             // parity_len is shard_bytes * RS_PARITY_SHARDS where
             // shard_bytes <= payload.len(). payload_len fits in u32
             // (checked above), so parity_len fits in u32 too; the
@@ -3361,6 +3408,99 @@ mod tests {
                 &*block.data, PAYLOAD,
                 "Reed-Solomon recovery must reconstruct the original \
                  payload from a single-byte data-shard flip",
+            );
+            Ok(())
+        }
+
+        #[test]
+        fn block_roundtrip_secded_clean_read() -> crate::Result<()> {
+            let mut writer = vec![];
+            let header = Block::write_into(
+                &mut writer,
+                PAYLOAD,
+                BlockIdentity::for_test(0, BlockType::Data),
+                &BlockTransform::PlainEcc(EccParams::SECDED),
+            )?;
+
+            assert!(
+                header.block_flags & crate::table::block::header::block_flags::ECC_PARITY != 0,
+                "SECDED writer must set the ECC_PARITY flag",
+            );
+            // One parity byte per 8-byte word: header + payload + ceil(N/8).
+            // `on_disk_size()` hardcodes the RS(4,2) default; the scheme-aware
+            // `on_disk_size_with` sizes the SECDED trailer.
+            assert_eq!(
+                writer.len(),
+                header.on_disk_size_with(Some(EccParams::SECDED)) as usize,
+                "on-disk size must equal header + payload + SECDED parity length",
+            );
+
+            let mut reader = &writer[..];
+            let block = Block::from_reader(
+                &mut reader,
+                BlockIdentity::for_test(0, BlockType::Data),
+                &BlockTransform::PlainEcc(EccParams::SECDED),
+            )?;
+            assert_eq!(&*block.data, PAYLOAD);
+            Ok(())
+        }
+
+        #[test]
+        fn block_roundtrip_secded_recovers_from_single_bit_flip() -> crate::Result<()> {
+            let mut writer = vec![];
+            let header = Block::write_into(
+                &mut writer,
+                PAYLOAD,
+                BlockIdentity::for_test(0, BlockType::Data),
+                &BlockTransform::PlainEcc(EccParams::SECDED),
+            )?;
+
+            // Flip a SINGLE bit inside the payload region: SECDED heals one bit
+            // per 8-byte word, so a single-bit flip is recoverable (a whole-byte
+            // flip would be 8 bit-errors in one word — uncorrectable).
+            let flip_at = Header::MIN_LEN + (header.data_length as usize) / 2;
+            writer[flip_at] ^= 0x01;
+
+            let mut reader = &writer[..];
+            let block = Block::from_reader(
+                &mut reader,
+                BlockIdentity::for_test(0, BlockType::Data),
+                &BlockTransform::PlainEcc(EccParams::SECDED),
+            )?;
+            assert_eq!(
+                &*block.data, PAYLOAD,
+                "SECDED must heal a single-bit payload flip",
+            );
+            Ok(())
+        }
+
+        #[test]
+        fn block_roundtrip_secded_unrecoverable_on_double_bit_flip() -> crate::Result<()> {
+            let mut writer = vec![];
+            let header = Block::write_into(
+                &mut writer,
+                PAYLOAD,
+                BlockIdentity::for_test(0, BlockType::Data),
+                &BlockTransform::PlainEcc(EccParams::SECDED),
+            )?;
+
+            // Two bit errors in the same byte (hence the same 8-byte word):
+            // SECDED detects but cannot correct — the read must fail rather
+            // than return miscorrected data.
+            let flip_at = Header::MIN_LEN + (header.data_length as usize) / 2;
+            writer[flip_at] ^= 0x03;
+
+            let mut reader = &writer[..];
+            let result = Block::from_reader(
+                &mut reader,
+                BlockIdentity::for_test(0, BlockType::Data),
+                &BlockTransform::PlainEcc(EccParams::SECDED),
+            );
+            assert!(
+                matches!(&result, Err(crate::Error::PageEccUnrecoverable { .. })),
+                "a double-bit error in one word must be detected as unrecoverable \
+                 (got ok={})",
+                result.is_ok(),
             );
             Ok(())
         }
