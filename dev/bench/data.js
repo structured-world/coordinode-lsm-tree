@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1780966556615,
+  "lastUpdate": 1781011090177,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -14274,6 +14274,84 @@ window.BENCHMARK_DATA = {
             "value": 555749.2851251061,
             "unit": "ops/sec",
             "extra": "P50: 1.6us | P99: 6.1us | P99.9: 9.1us\nthreads: 1 | elapsed: 0.36s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "69f6a74d721772ca4c1bae19610b43ef7b94ff56",
+          "message": "feat(scan): scan_since_seqno CDC stream + synchronous clear() reclaim (#433)\n\n## Summary\n\nThree related workstreams on the read / reclaim path.\n\n### 1. `scan_since_seqno` — CDC event stream (Part of #224)\n\n`Tree::scan_since_seqno(target)` (and `BlobTree::scan_since_seqno`)\nstreams every change committed at or after a sequence number as\n`ScanSinceEvent`s (`Insert` / `MergeOperand` / `PointTombstone` /\n`RangeTombstone`) in increasing seqno order — the canonical CDC\nprimitive for replicas / Kafka connectors / Debezium-style pipelines.\nSuperseded versions are preserved (no MVCC collapse), tombstones are\nexposed for faithful replay.\n\n- Block-skip: builds on the per-block seqno bounds (#371). On SSTs\nwritten with `seqno_in_index`, data blocks whose `seqno_max < target`\nare skipped unread; legacy SSTs fall back to a per-entry filter, so\nmixed-format trees scan transparently.\n- KV-separation: blob-indirected values are resolved into `Insert`\ncarrying the real value, so a downstream consumer needs no access to the\nsource's blob files.\n- New public surface: `ScanSinceEvent` enum +\n`KeyedBlockHandle::seqno_bounds()`.\n\n### 2. Synchronous `clear()` disk reclaim\n\n`clear()` (standard + blob trees) upgraded the version but left the old\nSSTs / blob files pinned by stale version-history entries, so a caller\nmeasuring on-disk footprint right after it returned still saw the\npre-clear bytes. Now:\n\n- **MVCC-safe mark + prune:** marks every obsolete table / blob file\ndeleted and drains the obsolete versions from the history; a concurrent\nreader holding the pre-clear snapshot keeps its own clone alive, so the\nArc refcount remains the MVCC guard.\n- **Off-foreground reclaim:** a rate-limited `BackgroundDeleter`\n(RocksDB `DeleteScheduler` model) drains unlinks on a worker thread; the\nDrop site frees the blocks synchronously via the new `Fs::truncate_file`\nhook (instant, accurate footprint scan) and hands the directory-entry\nunlink to the deleter. Arc refcounting keeps the worker alive until the\nlast table reference drops — no leaked files, no field-ordering\ndependency.\n- **`Fs::truncate_file`:** the per-filesystem-pluggable reclaim hook\n(portable `set_len(0)` default; a backend whose FS offers a cheaper\nprimitive, reported via `Fs::capabilities`, can override).\n\n### 3. aarch64/x86_64-musl portability fix\n\nThe Linux FS-capability path assumed glibc libc types (`statfs.f_type`\nis `c_long` on glibc / `c_ulong` on musl; `ioctl`'s request is `c_ulong`\n/ `c_int`), breaking the musl cross builds. Normalized.\n\n## no_std\n\nAll background-deleter surface is gated behind `std`; a `no_std` build\nkeeps the synchronous Drop reclaim. The no-std-check error count is\nunchanged (the sole remaining blocker is `quick_cache`, tracked in\n#429).\n\n## Testing\n\n- Full suite green (2004 tests); `clippy --all-targets --all-features`,\n`fmt`, doc-tests clean.\n- New: `scan_since_seqno` end-to-end (target filter, seqno order, event\nmapping, block-skip, mixed-format, blob resolution) + `clear()`\nfootprint-reclaim (SST + blob) + background-deleter drain-on-drop.\n- Cross-checked on `aarch64-unknown-linux-musl` and\n`x86_64-unknown-linux-gnu`.\n\nBenches (sparse-scan ≥10×, write-throughput, point-lookup) are a\nfollow-up.\n\nPart of #224\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n## Summary by CodeRabbit\n\n* **New Features**\n* Change-data-capture \"scan since\" that replays committed changes in\nseqno order (public API)\n* Optional background file deleter to offload unlink work (std feature)\n* Seqno-based block skipping to speed scans and preserve checkpoints\nduring clear\n\n* **Documentation**\n* README: incremental scan / CDC usage, trade-offs, comparisons, and\ncheckpoint guidance\n\n* **Tests**\n* End-to-end CDC tests, clear/reclaim and checkpoint regression tests\nverifying behavior and on-disk reclamation\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-06-09T15:48:51+03:00",
+          "tree_id": "9f47a32fd7afc5c3b54e6082dee806f00145a48e",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/69f6a74d721772ca4c1bae19610b43ef7b94ff56"
+        },
+        "date": 1781011080241,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 1903375.957026948,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.7us | P99.9: 3.7us\nthreads: 1 | elapsed: 0.11s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1160064.6132788304,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.2us | P99.9: 4.3us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 667857.0149386724,
+            "unit": "ops/sec",
+            "extra": "P50: 1.4us | P99: 4.6us | P99.9: 7.1us\nthreads: 1 | elapsed: 0.30s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3798255.001888777,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 3.1us | P99.9: 5.5us\nthreads: 1 | elapsed: 0.05s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 440513.7956443243,
+            "unit": "ops/sec",
+            "extra": "P50: 2.0us | P99: 5.3us | P99.9: 8.2us\nthreads: 1 | elapsed: 0.45s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 223109.76202785925,
+            "unit": "ops/sec",
+            "extra": "P50: 4.2us | P99: 5.2us | P99.9: 7.8us\nthreads: 1 | elapsed: 0.90s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1225090.532812148,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.3us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1168494.3427492457,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 1.5us | P99.9: 2.6us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 559605.5890854436,
+            "unit": "ops/sec",
+            "extra": "P50: 1.6us | P99: 5.0us | P99.9: 7.4us\nthreads: 1 | elapsed: 0.36s | num: 200000 | iterations: 3"
           }
         ]
       }
