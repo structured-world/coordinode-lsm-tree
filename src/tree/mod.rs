@@ -17,6 +17,8 @@ use crate::{
     key::InternalKey,
     manifest::Manifest,
     memtable::Memtable,
+    range_tombstone::RangeTombstone,
+    scan_since::ScanSinceEvent,
     slice::Slice,
     table::Table,
     value::InternalValue,
@@ -382,6 +384,10 @@ impl AbstractTree for Tree {
         let config = self.tree_config();
         let mut versions = self.get_version_history_lock();
 
+        // Pre-clear snapshot: every table + blob file it references becomes
+        // garbage the moment the new empty version is installed.
+        let prior = versions.latest_version();
+
         versions.upgrade_version(
             &config.path,
             |v| {
@@ -399,7 +405,29 @@ impl AbstractTree for Tree {
             &*config.fs,
             self.0.runtime_config.load_full(),
             self.0.config.encryption.clone(),
-        )
+        )?;
+
+        // Release the history's hold on the now-obsolete versions; only the new
+        // empty version remains. `prior` still holds them, so nothing reaches
+        // refcount zero yet.
+        versions.drain_obsolete_to_latest();
+        drop(versions); // release the version-history lock before any fs work
+
+        // Mark every obsolete table / blob file deleted so the file is
+        // reclaimed (Inner::Drop) once its last reference is released. A
+        // concurrent reader still holding the pre-clear snapshot keeps its own
+        // clone alive, deferring physical deletion until it finishes — the
+        // version-history Arc refcount is the MVCC guard, so reclaim never
+        // races a live read. Tables with no other live reference are reclaimed
+        // as `prior` drops at the end of this call.
+        for table in prior.version.iter_tables() {
+            table.mark_as_deleted();
+        }
+        for blob_file in prior.version.blob_files.iter() {
+            blob_file.mark_as_deleted();
+        }
+
+        Ok(())
     }
 
     #[doc(hidden)]
@@ -628,10 +656,14 @@ impl AbstractTree for Tree {
         // later get marked `is_deleted` by compaction.
         for table in tables {
             table.install_deletion_pause(Arc::clone(&self.deletion_pause));
+            #[cfg(feature = "std")]
+            table.install_background_deleter(Arc::clone(&self.background_deleter));
         }
         if let Some(bfs) = blob_files {
             for bf in bfs {
                 bf.install_deletion_pause(Arc::clone(&self.deletion_pause));
+                #[cfg(feature = "std")]
+                bf.install_background_deleter(Arc::clone(&self.background_deleter));
             }
         }
 
@@ -1036,6 +1068,196 @@ impl AbstractTree for Tree {
 }
 
 impl Tree {
+    /// Maps a raw internal entry to its change-data-capture event, routing
+    /// `Indirection` (KV-separated) values through `resolve_indirection`.
+    ///
+    /// A standard tree never stores `Indirection` and supplies a resolver that
+    /// errors; the blob-tree scan path supplies one that reads the blob and
+    /// returns an [`ScanSinceEvent::Insert`].
+    fn map_event<F>(
+        entry: InternalValue,
+        version: &Version,
+        resolve_indirection: &F,
+    ) -> crate::Result<ScanSinceEvent>
+    where
+        F: Fn(&Version, InternalValue) -> crate::Result<ScanSinceEvent>,
+    {
+        if entry.key.value_type == ValueType::Indirection {
+            return resolve_indirection(version, entry);
+        }
+        let seqno = entry.key.seqno;
+        let key = entry.key.user_key;
+        Ok(match entry.key.value_type {
+            ValueType::Value => ScanSinceEvent::Insert {
+                key,
+                value: entry.value,
+                seqno,
+            },
+            ValueType::MergeOperand => ScanSinceEvent::MergeOperand {
+                key,
+                operand: entry.value,
+                seqno,
+            },
+            ValueType::Tombstone | ValueType::WeakTombstone => {
+                ScanSinceEvent::PointTombstone { key, seqno }
+            }
+            ValueType::Indirection => unreachable!("Indirection handled above"),
+        })
+    }
+
+    /// Shared CDC aggregation behind [`Self::scan_since_seqno`] and the
+    /// blob-tree scan path: gathers qualifying entries (`seqno >= target`) plus
+    /// range tombstones from the active + sealed memtables and every SST (with
+    /// block-skip), maps each entry to a [`ScanSinceEvent`] — routing
+    /// `Indirection` values through `resolve_indirection` against the same
+    /// version snapshot — and returns them in increasing seqno order.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal version-history lock is poisoned.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if reading the index or a data block fails, or if
+    /// `resolve_indirection` errors.
+    pub(crate) fn scan_since_seqno_with<F>(
+        &self,
+        target_seqno: SeqNo,
+        resolve_indirection: F,
+    ) -> crate::Result<std::vec::IntoIter<ScanSinceEvent>>
+    where
+        F: Fn(&Version, InternalValue) -> crate::Result<ScanSinceEvent>,
+    {
+        #[expect(clippy::expect_used, reason = "lock is expected to not be poisoned")]
+        let super_version = self
+            .version_history
+            .read()
+            .expect("lock is poisoned")
+            .latest_version();
+        let version = &super_version.version;
+
+        // Stable upper watermark, captured once before walking any source: the
+        // highest seqno present across every source at scan start (in global
+        // coordinates — `Table::get_highest_seqno` already adds the offset).
+        // The active memtable is shared and mutable, so without this cap a
+        // write committed mid-scan could leak in and break the "consistent
+        // snapshot of changes in [target, watermark]" contract. The seqno
+        // counter is not a reliable bound here because callers may assign
+        // seqnos explicitly without advancing it, so derive it from the data.
+        let end_seqno = {
+            let active = super_version.active_memtable.get_highest_seqno();
+            let sealed = super_version
+                .sealed_memtables
+                .iter()
+                .map(|mt| mt.get_highest_seqno())
+                .max()
+                .flatten();
+            let tables = version.iter_tables().map(Table::get_highest_seqno).max();
+            active.max(sealed).max(tables)
+        };
+        // No entries anywhere ⇒ nothing qualifies, regardless of target.
+        let Some(end_seqno) = end_seqno else {
+            return Ok(Vec::new().into_iter());
+        };
+
+        let mut events: Vec<ScanSinceEvent> = Vec::new();
+
+        // Point entries: active + sealed memtables, then SSTs (block-skip).
+        for entry in super_version.active_memtable.iter() {
+            if entry.key.seqno >= target_seqno && entry.key.seqno <= end_seqno {
+                events.push(Self::map_event(entry, version, &resolve_indirection)?);
+            }
+        }
+        for memtable in super_version.sealed_memtables.iter() {
+            for entry in memtable.iter() {
+                if entry.key.seqno >= target_seqno && entry.key.seqno <= end_seqno {
+                    events.push(Self::map_event(entry, version, &resolve_indirection)?);
+                }
+            }
+        }
+        for table in version.iter_tables() {
+            // `scan_seqno_range` upper bound is exclusive; `end_seqno` is the
+            // inclusive max, so add one (saturating for the MAX edge).
+            for entry in table.scan_seqno_range(target_seqno, end_seqno.saturating_add(1))? {
+                events.push(Self::map_event(entry, version, &resolve_indirection)?);
+            }
+        }
+
+        // Range tombstones from the same sources, carrying their own seqno.
+        let mut push_range_tombstone = |rt: &RangeTombstone| {
+            if rt.seqno >= target_seqno && rt.seqno <= end_seqno {
+                events.push(ScanSinceEvent::RangeTombstone {
+                    start_key: rt.start.clone(),
+                    end_key: rt.end.clone(),
+                    seqno: rt.seqno,
+                });
+            }
+        };
+        for rt in super_version.active_memtable.range_tombstones_sorted() {
+            push_range_tombstone(&rt);
+        }
+        for memtable in super_version.sealed_memtables.iter() {
+            for rt in memtable.range_tombstones_sorted() {
+                push_range_tombstone(&rt);
+            }
+        }
+        for table in version.iter_tables() {
+            for rt in table.range_tombstones() {
+                push_range_tombstone(rt);
+            }
+        }
+
+        // Replay order is increasing seqno across every source.
+        events.sort_by_key(ScanSinceEvent::seqno);
+
+        Ok(events.into_iter())
+    }
+
+    /// Iterate change events with `seqno >= target_seqno`.
+    ///
+    /// Returns every change committed at or after `target_seqno` as a stream
+    /// of [`ScanSinceEvent`]s in increasing seqno order. This is the canonical
+    /// change-data-capture primitive: a downstream consumer (replica, Kafka
+    /// connector, Debezium-style pipeline) replays the events in order to
+    /// reconstruct the source's history. Superseded versions are not collapsed
+    /// (a key written three times after the target yields three events).
+    ///
+    /// # Block-skip
+    ///
+    /// On SSTs written in the seqno-bounded index format (`seqno_in_index`),
+    /// data blocks whose `seqno_max < target_seqno` are skipped without being
+    /// read; legacy SSTs are read and filtered per entry, so mixed-format trees
+    /// are handled transparently.
+    ///
+    /// # KV-separation
+    ///
+    /// Standard trees never store blob-indirected values. On the inner tree of
+    /// a KV-separated (blob) tree this returns an `Err` for indirected entries:
+    /// blob resolution into [`ScanSinceEvent::Insert`] is provided by the
+    /// blob-tree scan path, which owns the blob files.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal version-history lock is poisoned.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if reading the index or a data block fails, or if an entry
+    /// is a KV-separated value (see above).
+    pub fn scan_since_seqno(
+        &self,
+        target_seqno: SeqNo,
+    ) -> crate::Result<impl Iterator<Item = ScanSinceEvent> + use<>> {
+        // A standard tree never stores blob-indirected values; the resolver
+        // errors so an indirected entry (only reachable via a blob tree's inner
+        // index) surfaces as a clear error rather than a wrong event.
+        self.scan_since_seqno_with(target_seqno, |_version, _entry| {
+            Err(crate::Error::FeatureUnsupported(
+                "scan_since_seqno on KV-separated values requires the blob-tree scan path",
+            ))
+        })
+    }
+
     /// Update the live [`crate::runtime_config::RuntimeConfig`].
     ///
     /// Mutator runs on a clone of the current snapshot; the new snapshot
@@ -2125,6 +2347,8 @@ impl Tree {
         let comparator = config.comparator.clone();
 
         let deletion_pause = crate::deletion_pause::DeletionPause::new_shared();
+        #[cfg(feature = "std")]
+        let background_deleter = Arc::new(crate::BackgroundDeleter::new(None));
 
         // Clone the seed snapshot BEFORE moving config into the Arc
         // below — the runtime handle initializer needs it after the
@@ -2154,6 +2378,8 @@ impl Tree {
             flush_lock: Mutex::default(),
             compaction_state: Arc::new(Mutex::new(CompactionState::default())),
             deletion_pause: Arc::clone(&deletion_pause),
+            #[cfg(feature = "std")]
+            background_deleter: Arc::clone(&background_deleter),
             runtime_config: Arc::new(crate::runtime_config::handle::RuntimeConfigHandle::new(
                 initial_runtime,
             )),
@@ -2181,9 +2407,13 @@ impl Tree {
 
         for table in &recovered_tables {
             table.install_deletion_pause(Arc::clone(&deletion_pause));
+            #[cfg(feature = "std")]
+            table.install_background_deleter(Arc::clone(&background_deleter));
         }
         for blob_file in &recovered_blobs {
             blob_file.install_deletion_pause(Arc::clone(&deletion_pause));
+            #[cfg(feature = "std")]
+            blob_file.install_background_deleter(Arc::clone(&background_deleter));
         }
 
         Ok(Self(Arc::new(inner)))

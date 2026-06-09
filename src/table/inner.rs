@@ -116,6 +116,20 @@ pub struct Inner {
     // compaction and read on every Drop; CAS-based race semantics are
     // fine for this single-publisher, many-reader pattern.
     pub(crate) deletion_pause: once_cell::race::OnceBox<Arc<DeletionPause>>,
+
+    /// Tree-wide background file deleter. Installed once by
+    /// [`Table::install_background_deleter`](super::Table::install_background_deleter)
+    /// after the table is registered with a tree. When present (and no
+    /// checkpoint pause is active), the [`Drop`] impl reclaims the SST's blocks
+    /// synchronously via [`Fs::truncate_file`](crate::fs::Fs::truncate_file) and
+    /// hands the directory-entry `unlink` to this deleter's worker, off the
+    /// foreground path. Absent (e.g. orphan cleanup before a tree owns the
+    /// table) the Drop falls back to a synchronous `remove_file`.
+    // std-only (the deleter spawns a thread); `no_std` builds never install
+    // one and keep the synchronous Drop path. OnceBox keeps the field itself
+    // alloc-friendly, matching `deletion_pause`.
+    #[cfg(feature = "std")]
+    pub(crate) background_deleter: once_cell::race::OnceBox<Arc<crate::BackgroundDeleter>>,
 }
 
 impl Inner {
@@ -168,6 +182,33 @@ impl Drop for Inner {
                     "Deferred deletion of table {global_id:?} at {:?} (checkpoint active)",
                     self.path,
                 );
+                return;
+            }
+
+            // Off-foreground reclaim: return the SST's blocks to the filesystem
+            // synchronously (so a footprint scan reflects the reclaim at once)
+            // and hand the directory-entry unlink to the background deleter.
+            // Falls through to a synchronous remove_file when no deleter is
+            // installed (e.g. orphan cleanup before a tree owns the table).
+            #[cfg(feature = "std")]
+            if let Some(deleter) = self.background_deleter.get() {
+                // Truncate (instant block-free) only when we own the sole hard
+                // link. A completed checkpoint may have hard-linked this SST;
+                // truncating the shared inode would zero the checkpoint's copy
+                // too. When the link is shared (or the count is unknown), skip
+                // the truncate and just unlink our directory entry — the data
+                // survives via the other link and its blocks free once the last
+                // link is gone. (An in-progress checkpoint is already handled by
+                // the deletion-pause branch above.)
+                if self.fs.hard_link_count(&self.path).is_ok_and(|n| n <= 1)
+                    && let Err(e) = self.fs.truncate_file(&self.path)
+                {
+                    log::warn!(
+                        "Failed to truncate deleted table {global_id:?} at {:?}: {e:?}",
+                        self.path,
+                    );
+                }
+                deleter.enqueue(Arc::clone(&self.fs), (*self.path).clone());
                 return;
             }
 

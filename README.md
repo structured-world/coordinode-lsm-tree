@@ -71,6 +71,37 @@ On-disk format version **V5**. V5 introduces a wire-format break for filter bloc
 - Pluggable `Fs` trait — back the engine on the standard filesystem, on `io_uring`, on an in-memory `MemFs`, or on a custom implementation.
 - Pluggable `CompressionProvider` for third-party codecs.
 
+## Incremental scan / CDC
+
+`Tree::scan_since_seqno(target)` streams every change committed at or after a
+sequence number as `ScanSinceEvent`s (`Insert`, `MergeOperand`,
+`PointTombstone`, `RangeTombstone`), in increasing seqno order. It is a
+change-data-capture primitive: a downstream consumer (replica, Kafka connector,
+Debezium-style pipeline) replays the events in order to reconstruct the source's
+history. Superseded versions are preserved (no MVCC collapse) and tombstones are
+exposed, so deletes replay faithfully.
+
+With the runtime-toggleable `seqno_in_index` policy, each SST index entry
+carries its data block's `(seqno_min, seqno_max)`, and the scan **skips any data
+block whose `seqno_max` is below the target without reading it**. On a
+sparse-change workload (e.g. 1% of data changed since the last poll) this turns
+an O(data) scan into O(changed blocks). Trees with a mix of seqno-bounded and
+legacy SSTs are scanned transparently (legacy blocks fall back to a per-entry
+filter), so the policy can be enabled on a live tree and takes effect as
+compaction rewrites SSTs — no migration step, no format-version bump.
+
+| Engine | CDC granularity | Survives compaction | Embeddable | Block-skip |
+|--------|-----------------|---------------------|------------|------------|
+| RocksDB `GetUpdatesSince` | WAL events (lost after compaction) | no | yes | n/a |
+| Pebble | SST file (64–128 MB) | yes | yes | no |
+| CockroachDB changefeed | SST file | yes | no (distributed) | no |
+| FoundationDB | per-event | yes | no (distributed) | n/a |
+| **coordinode-lsm-tree** | **data block (4–32 KB)** | **yes** | **yes** | **yes** |
+
+The trade-off: there is no write-ahead log, so we do not offer WAL-style
+millisecond tailing of in-flight updates. For arbitrary historical-seqno queries
+(not just "since X"), pair with `Tree::create_checkpoint`.
+
 ## Limits
 
 - Keys: up to 65,535 bytes (the on-disk encoding caps the key-length field at `u16`).

@@ -860,3 +860,79 @@ fn checkpoint_survives_concurrent_manifest_gc_of_captured_version() -> lsm_tree:
     }
     Ok(())
 }
+
+/// A checkpoint hard-links the source SST/blob files (shared inode). Reclaiming
+/// the source (e.g. `clear()`) must NOT truncate those inodes, or it would zero
+/// the checkpoint's copy too. Regression guard for the truncate-based reclaim.
+#[cfg(unix)]
+#[test_log::test]
+fn clear_does_not_truncate_checkpoint_hardlinked_ssts() -> lsm_tree::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    let src_dir = tempfile::tempdir()?;
+    let dst_dir = tempfile::tempdir()?;
+    let dst_path = dst_dir.path().join("checkpoint");
+
+    let any = open_tree(src_dir.path())?;
+    let tree = match &any {
+        AnyTree::Standard(t) => t.clone(),
+        AnyTree::Blob(_) => panic!("expected Standard tree"),
+    };
+    // Force the hard-link checkpoint path (shared inode) instead of reflink
+    // (independent CoW inode), so the truncate-vs-shared-inode hazard is
+    // exercised on every filesystem, not only non-reflink ones.
+    tree.update_runtime_config(|c| {
+        c.use_reflink_for_checkpoint = false;
+    })?;
+    for i in 0u32..500 {
+        tree.insert(
+            format!("k{i:04}"),
+            b"payload-value-data".as_slice(),
+            u64::from(i),
+        );
+    }
+    tree.flush_active_memtable(0)?;
+
+    let info = any.create_checkpoint(&dst_path)?;
+    assert!(
+        info.sst_files >= 1,
+        "checkpoint must capture at least one SST"
+    );
+
+    // Precondition: the checkpoint must have hard-linked (shared inode) for this
+    // test to exercise the bug. If the platform fell back to a copy, nlink == 1
+    // and there is nothing to corrupt — fail loudly so the gap is visible.
+    let mut shared = false;
+    let mut stack = vec![dst_path.clone()];
+    while let Some(d) = stack.pop() {
+        for entry in std::fs::read_dir(&d)? {
+            let e = entry?;
+            let m = e.metadata()?;
+            if m.is_dir() {
+                stack.push(e.path());
+            } else if m.nlink() > 1 {
+                shared = true;
+            }
+        }
+    }
+    assert!(
+        shared,
+        "checkpoint must hard-link a source file (same-fs) to test this"
+    );
+
+    // Reclaim the source: marks the SSTs deleted and runs the truncate path.
+    tree.clear()?;
+
+    // The checkpoint must still be fully readable.
+    let restored = open_tree(&dst_path)?;
+    for i in 0u32..500 {
+        let key = format!("k{i:04}");
+        assert!(
+            restored
+                .get(key.as_bytes(), lsm_tree::SeqNo::MAX)?
+                .is_some(),
+            "checkpoint key {key} must survive source clear() — inode was truncated",
+        );
+    }
+    Ok(())
+}

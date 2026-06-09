@@ -193,6 +193,24 @@ impl SuperVersions {
         Ok(())
     }
 
+    /// Drops every retained version except the latest from the in-memory
+    /// history.
+    ///
+    /// Used by [`AbstractTree::clear`](crate::AbstractTree::clear): the new
+    /// (latest) version is empty and every prior version's tables / blob files
+    /// were just marked deleted, so releasing the history's hold lets
+    /// [`Inner::Drop`](crate::table::Table) reclaim their files once any
+    /// concurrent reader's own snapshot clone is released (MVCC-safe — a reader
+    /// keeps its clone alive, deferring deletion until it finishes). The
+    /// on-disk manifest already reflects the latest version (persisted by the
+    /// preceding `upgrade_version`); intermediate in-memory versions carry no
+    /// `v{id}` snapshot file, so there is nothing to unlink here.
+    pub(crate) fn drain_obsolete_to_latest(&mut self) {
+        while self.versions.len() > 1 {
+            self.versions.pop_front();
+        }
+    }
+
     /// Modifies the level manifest atomically.
     ///
     /// The function accepts a transition function that receives the current version

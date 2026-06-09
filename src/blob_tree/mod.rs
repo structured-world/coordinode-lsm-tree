@@ -10,7 +10,7 @@ pub mod ingest;
 pub use gc::{FragmentationEntry, FragmentationMap};
 
 use crate::{
-    Cache, Config, Memtable, SeqNo, TableId, TreeId, UserKey, UserValue,
+    Cache, Config, Memtable, ScanSinceEvent, SeqNo, TableId, TreeId, UserKey, UserValue,
     abstract_tree::{AbstractTree, RangeItem},
     coding::Decode,
     iter_guard::{IterGuard, IterGuardImpl},
@@ -220,6 +220,48 @@ impl BlobTree {
 
         Ok(Some(v))
     }
+
+    /// Iterate change events with `seqno >= target_seqno`, resolving
+    /// KV-separated values.
+    ///
+    /// Same change-data-capture contract as [`Tree::scan_since_seqno`](crate::Tree::scan_since_seqno),
+    /// but a blob-indirected value is resolved from its blob file into a
+    /// [`ScanSinceEvent::Insert`] carrying the real value, so a downstream
+    /// consumer can replicate without access to the source's blob files.
+    /// Block-skip, seqno ordering, and tombstone handling are identical to the
+    /// standard-tree path (the same shared aggregation backs both).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal version-history lock is poisoned.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if reading the index, a data block, or a referenced blob
+    /// fails.
+    pub fn scan_since_seqno(
+        &self,
+        target_seqno: SeqNo,
+    ) -> crate::Result<impl Iterator<Item = ScanSinceEvent> + use<>> {
+        self.index
+            .scan_since_seqno_with(target_seqno, |version, entry| {
+                let seqno = entry.key.seqno;
+                let (key, value) = resolve_value_handle(
+                    self.id(),
+                    self.blobs_folder.as_path(),
+                    &self.index.config.cache,
+                    version,
+                    entry,
+                    #[cfg(zstd_any)]
+                    self.index
+                        .config
+                        .kv_separation_opts
+                        .as_ref()
+                        .and_then(|o| o.zstd_dictionary.as_deref()),
+                )?;
+                Ok(ScanSinceEvent::Insert { key, value, seqno })
+            })
+    }
 }
 
 impl crate::abstract_tree::sealed::Sealed for BlobTree {}
@@ -371,6 +413,10 @@ impl AbstractTree for BlobTree {
         let config = self.tree_config();
         let mut versions = self.get_version_history_lock();
 
+        // Pre-clear snapshot: its tables AND blob files all become garbage once
+        // the new empty version is installed.
+        let prior = versions.latest_version();
+
         versions.upgrade_version(
             &config.path,
             |v| {
@@ -388,7 +434,23 @@ impl AbstractTree for BlobTree {
             &*config.fs,
             self.index.0.runtime_config.load_full(),
             self.index.0.config.encryption.clone(),
-        )
+        )?;
+
+        // Same MVCC-safe reclaim as the standard tree, plus the blob files:
+        // mark every obsolete table / blob file deleted, drop the history's
+        // hold, and let Inner::Drop reclaim each once its last reference is
+        // released (a live reader's snapshot clone defers deletion).
+        versions.drain_obsolete_to_latest();
+        drop(versions);
+
+        for table in prior.version.iter_tables() {
+            table.mark_as_deleted();
+        }
+        for blob_file in prior.version.blob_files.iter() {
+            blob_file.mark_as_deleted();
+        }
+
+        Ok(())
     }
 
     fn major_compact(

@@ -770,6 +770,59 @@ pub trait Fs: Send + Sync + 'static {
     fn reflink_file(&self, src: &Path, dst: &Path) -> io::Result<()> {
         copy_file_streamed(self, src, dst)
     }
+
+    /// Returns the data blocks of the file at `path` to the filesystem,
+    /// leaving a zero-length file in place.
+    ///
+    /// This is the synchronous half of obsolete-file reclaim: it frees the
+    /// space immediately (so a `walkdir + sum(len)` footprint scan reflects the
+    /// reclaim at once) and is O(1) — a metadata operation, not a data rewrite
+    /// — while the directory-entry `unlink` can be deferred to a background
+    /// deleter. Reclaim is split this way so a caller measuring disk usage
+    /// right after a logical delete sees the drop without the foreground thread
+    /// blocking on the unlink.
+    ///
+    /// # Default implementation
+    ///
+    /// Opens the file for writing and sets its length to zero. Portable across
+    /// every backend. A backend MAY override with a filesystem-specific
+    /// primitive when one is genuinely cheaper (none beats `set_len(0)` for the
+    /// length-based footprint today; the hook exists so an FS that grows one —
+    /// reported via [`Fs::capabilities`] — can plug it in without touching the
+    /// call sites). [`MemFs`] truncates its in-memory buffer.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if the file cannot be opened or truncated.
+    fn truncate_file(&self, path: &Path) -> io::Result<()> {
+        self.open(path, &FsOpenOptions::new().write(true))?
+            .set_len(0)
+    }
+
+    /// Number of hard links to the file at `path` (the inode's link count).
+    ///
+    /// Used to keep [`Self::truncate_file`] safe: truncation frees the inode's
+    /// blocks for **every** hard link, so a file a checkpoint has linked (via
+    /// [`Self::hard_link`]) must not be truncated — only unlinked. A caller
+    /// truncates only when this returns `Ok(1)` (it owns the sole link).
+    ///
+    /// # Default implementation
+    ///
+    /// Returns an `Unsupported` error so a backend that cannot report link
+    /// counts makes callers conservatively skip truncation (correctness over
+    /// the reclaim optimization). [`StdFs`] overrides it on Unix via `nlink`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if the count cannot be determined (including the
+    /// `Unsupported` default).
+    fn hard_link_count(&self, path: &Path) -> io::Result<u64> {
+        let _ = path;
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "hard_link_count is not supported by this backend",
+        ))
+    }
 }
 
 /// Streamed independent copy of `src` to `dst` through `fs`'s own [`Fs::open`].

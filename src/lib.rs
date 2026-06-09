@@ -302,6 +302,8 @@ pub(crate) mod range_tombstone_filter;
 #[doc(hidden)]
 pub mod table;
 
+mod background_deleter;
+mod scan_since;
 mod seqno;
 mod slice;
 mod slice_windows;
@@ -379,6 +381,9 @@ pub use encryption::EncryptionProvider;
 #[cfg(feature = "encryption")]
 pub use encryption::Aes256GcmProvider;
 
+#[cfg(feature = "std")]
+#[doc(hidden)]
+pub use background_deleter::BackgroundDeleter;
 pub use pinnable_slice::PinnableSlice;
 #[cfg(feature = "std")]
 pub use repair::RepairReport;
@@ -400,6 +405,7 @@ pub use {
     memtable::{Memtable, MemtableId},
     merge_operator::MergeOperator,
     prefix::PrefixExtractor,
+    scan_since::ScanSinceEvent,
     seqno::{
         MAX_SEQNO, SequenceNumberCounter, SequenceNumberGenerator, SharedSequenceNumberGenerator,
     },

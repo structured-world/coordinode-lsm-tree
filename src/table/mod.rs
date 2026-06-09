@@ -882,6 +882,90 @@ impl Table {
         self.range(..)
     }
 
+    /// Collects every entry in this SST with `seqno >= target_seqno`,
+    /// applying the per-block seqno-bounds skip when the SST carries it.
+    ///
+    /// A data block whose index entry reports `seqno_max < target_seqno`
+    /// (seqno-bounded format, `Properties.index_format = 1`) cannot hold a
+    /// qualifying record, so it is skipped without being read. Blocks without
+    /// bounds on disk (legacy `index_format = 0`) are always read and filtered
+    /// per entry, so the result is correct regardless of the SST's index
+    /// format. Entries come back in the SST's stored order (key-ascending,
+    /// seqno-descending within a key); ordering across sources is the caller's
+    /// job.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if reading the index or a data block fails.
+    #[doc(hidden)]
+    pub fn scan_since_seqno(&self, target_seqno: SeqNo) -> crate::Result<Vec<InternalValue>> {
+        self.scan_seqno_range(target_seqno, SeqNo::MAX)
+    }
+
+    /// Like [`Self::scan_since_seqno`] but also bounds the result above:
+    /// collects entries whose global seqno is in `[target_seqno, end_seqno)`.
+    /// The upper bound lets the tree-level scan pin a stable snapshot watermark
+    /// so a concurrent write cannot leak in mid-scan.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if reading the index or a data block fails.
+    #[doc(hidden)]
+    pub fn scan_seqno_range(
+        &self,
+        target_seqno: SeqNo,
+        end_seqno: SeqNo,
+    ) -> crate::Result<Vec<InternalValue>> {
+        // Bulk-ingested tables store entries at LOCAL seqno coordinates with a
+        // `global_seqno` offset; the on-disk seqno bounds and per-entry seqnos
+        // are all local. Translate the incoming global target down to local
+        // for the comparisons, then translate matched record seqnos back up to
+        // global before returning — exactly as `Table::get` does. For a
+        // non-ingested table `global_seqno` is 0 and both translations are
+        // no-ops.
+        let global_seqno = self.global_seqno();
+        let local_target = target_seqno.saturating_sub(global_seqno);
+        // Upper bound in local coords. `SeqNo::MAX` (the unbounded case) stays
+        // MAX so every entry passes; a real watermark maps below the offset to
+        // 0, correctly excluding the whole table.
+        let local_end = end_seqno.saturating_sub(global_seqno);
+
+        // Empty window (e.g. a caught-up CDC poller whose target equals the
+        // current watermark): nothing can qualify, so skip walking the index
+        // entirely. Without this a legacy SST (no per-block seqno bounds) would
+        // load + filter every block to return nothing on every poll.
+        if local_target >= local_end {
+            return Ok(Vec::new());
+        }
+
+        let mut out = Vec::new();
+
+        for handle in self.block_index.iter() {
+            let handle = handle?;
+
+            // Block-skip: a seqno-bounded entry whose (local) min exceeds the
+            // upper bound, or whose (local) max is below the target, cannot
+            // reference any qualifying record — skip the data-block read.
+            if let Some((seqno_min, seqno_max)) = handle.seqno_bounds()
+                && (seqno_max < local_target || seqno_min >= local_end)
+            {
+                continue;
+            }
+
+            let block = self.load_data_block(handle.as_ref())?;
+            let data = &block.inner.data;
+            for item in block.iter(self.comparator.clone()) {
+                let mut value = item.materialize(data);
+                if value.key.seqno >= local_target && value.key.seqno < local_end {
+                    value.key.seqno = value.key.seqno.saturating_add(global_seqno);
+                    out.push(value);
+                }
+            }
+        }
+
+        Ok(out)
+    }
+
     /// Creates a ranged iterator over the `Table`.
     ///
     /// # Errors
@@ -1457,6 +1541,9 @@ impl Table {
             zstd_dictionary,
 
             deletion_pause: once_cell::race::OnceBox::new(),
+
+            #[cfg(feature = "std")]
+            background_deleter: once_cell::race::OnceBox::new(),
         })))
     }
 
@@ -1466,6 +1553,17 @@ impl Table {
     /// after recovery and after compaction registers freshly-built tables.
     pub(crate) fn install_deletion_pause(&self, pause: Arc<crate::deletion_pause::DeletionPause>) {
         let _ = self.0.deletion_pause.set(Box::new(pause));
+    }
+
+    /// Installs the tree-wide background file deleter.
+    ///
+    /// Idempotent: a second call is a no-op. Called by the owning tree after
+    /// recovery and after compaction registers freshly-built tables, so an
+    /// obsolete SST's `unlink` runs off the foreground path while its blocks
+    /// are reclaimed synchronously at Drop.
+    #[cfg(feature = "std")]
+    pub(crate) fn install_background_deleter(&self, deleter: Arc<crate::BackgroundDeleter>) {
+        let _ = self.0.background_deleter.set(Box::new(deleter));
     }
 
     #[must_use]

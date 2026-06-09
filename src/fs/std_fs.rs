@@ -294,6 +294,30 @@ impl Fs for StdFs {
         Some(KERNEL_BACKEND_ID)
     }
 
+    fn hard_link_count(&self, path: &Path) -> io::Result<u64> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            Ok(std::fs::metadata(path)?.nlink())
+        }
+        // Windows: no portable stable-Rust nlink. NTFS hard links are real, so
+        // truncating without a confirmed link count could zero a checkpoint's
+        // hard-linked copy — the same hazard the Unix guard prevents. Report
+        // "unsupported" so the reclaim path conservatively SKIPS the
+        // synchronous truncate and relies on the async unlink alone (correct,
+        // just without the immediate-footprint fast path). Narrowing the
+        // contract this way is deliberate; raising it to truncate-on-Windows
+        // would need a winapi `GetFileInformationByHandle` link-count query.
+        #[cfg(not(unix))]
+        {
+            let _ = path;
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "hard_link_count requires a Unix target",
+            ))
+        }
+    }
+
     /// macOS: detects APFS (the common macOS filesystem with copy-on-write,
     /// reflink, and native snapshots) via `statfs(2)`'s `f_fstypename`. Other
     /// macOS filesystems (HFS+, exFAT, SMB/NFS mounts) and any detection failure
@@ -777,14 +801,22 @@ mod macos_caps {
 #[cfg(target_os = "linux")]
 mod linux_caps {
     use crate::fs::FsCapabilities;
-    use std::ffi::CString;
     use std::fs::{File, OpenOptions};
     use std::io;
-    use std::mem::MaybeUninit;
-    use std::os::unix::ffi::OsStrExt;
     use std::os::unix::io::AsRawFd;
     use std::path::Path;
 
+    // statfs-based capability detection only compiles on 64-bit (the magic
+    // numbers exceed i32::MAX); these imports + helper feed only that path, so
+    // gate them to avoid unused-import / dead_code warnings on 32-bit targets.
+    #[cfg(target_pointer_width = "64")]
+    use std::ffi::CString;
+    #[cfg(target_pointer_width = "64")]
+    use std::mem::MaybeUninit;
+    #[cfg(target_pointer_width = "64")]
+    use std::os::unix::ffi::OsStrExt;
+
+    #[cfg(target_pointer_width = "64")]
     fn to_cstring(path: &Path) -> io::Result<CString> {
         CString::new(path.as_os_str().as_bytes()).map_err(|_| {
             io::Error::new(
@@ -823,9 +855,16 @@ mod linux_caps {
             return FsCapabilities::default();
         }
         // SAFETY: statfs returned 0, so `buf` is initialized. `f_type` is
-        // `c_long` (i64) on 64-bit, matching the magic constants directly.
+        // `c_long` (i64) on glibc but `c_ulong` (u64) on musl, so normalize to
+        // i64 before matching the magic constants (their bit patterns are
+        // identical across the cast).
         #[expect(unsafe_code, reason = "read initialized statfs.f_type")]
-        let f_type: i64 = unsafe { buf.assume_init() }.f_type;
+        #[allow(
+            clippy::unnecessary_cast,
+            clippy::cast_possible_wrap,
+            reason = "f_type is i64 on glibc (no-op cast) and u64 on musl (cast required)"
+        )]
+        let f_type = unsafe { buf.assume_init() }.f_type as i64;
 
         match f_type {
             BTRFS | ZFS => FsCapabilities {
@@ -864,7 +903,9 @@ mod linux_caps {
         let rc = unsafe {
             libc::ioctl(
                 dst_f.as_raw_fd(),
-                libc::FICLONE as libc::c_ulong,
+                // ioctl's request param is c_ulong on glibc but c_int on musl;
+                // infer the target type so FICLONE casts to whichever applies.
+                libc::FICLONE as _,
                 src_f.as_raw_fd(),
             )
         };
@@ -918,7 +959,13 @@ mod linux_caps {
         let mut flags: libc::c_int = 0;
         // SAFETY: valid fd; GETFLAGS writes one `int` through the pointer arg.
         #[expect(unsafe_code, reason = "ioctl(FS_IOC_GETFLAGS) to read inode flags")]
-        let rc = unsafe { libc::ioctl(f.as_raw_fd(), FS_IOC_GETFLAGS, &raw mut flags) };
+        #[allow(
+            clippy::unnecessary_cast,
+            clippy::cast_possible_truncation,
+            reason = "ioctl request is c_ulong on glibc (no-op) but c_int on musl; \
+                      the 32-bit request code's low bits are preserved by truncation"
+        )]
+        let rc = unsafe { libc::ioctl(f.as_raw_fd(), FS_IOC_GETFLAGS as _, &raw mut flags) };
         if rc != 0 {
             return ignore_if_unsupported(io::Error::last_os_error());
         }
@@ -928,7 +975,13 @@ mod linux_caps {
         flags |= FS_NOCOW_FL;
         // SAFETY: valid fd; SETFLAGS reads one `int` through the pointer arg.
         #[expect(unsafe_code, reason = "ioctl(FS_IOC_SETFLAGS) to set FS_NOCOW_FL")]
-        let rc = unsafe { libc::ioctl(f.as_raw_fd(), FS_IOC_SETFLAGS, &raw const flags) };
+        #[allow(
+            clippy::unnecessary_cast,
+            clippy::cast_possible_truncation,
+            reason = "ioctl request is c_ulong on glibc (no-op) but c_int on musl; \
+                      the 32-bit request code's low bits are preserved by truncation"
+        )]
+        let rc = unsafe { libc::ioctl(f.as_raw_fd(), FS_IOC_SETFLAGS as _, &raw const flags) };
         if rc != 0 {
             return ignore_if_unsupported(io::Error::last_os_error());
         }
