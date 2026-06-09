@@ -9,7 +9,7 @@
 //! SSTs must scan correctly).
 
 use lsm_tree::{
-    AbstractTree, AnyTree, Config, ScanSinceEvent, SeqNo, SequenceNumberCounter, Tree,
+    AbstractTree, AnyTree, BlobTree, Config, ScanSinceEvent, SeqNo, SequenceNumberCounter, Tree,
     get_tmp_folder,
 };
 use test_log::test;
@@ -33,6 +33,22 @@ fn events(tree: &Tree, target: SeqNo) -> Vec<ScanSinceEvent> {
     tree.scan_since_seqno(target)
         .expect("scan_since_seqno should succeed")
         .collect()
+}
+
+fn open_blob_tree(path: &std::path::Path) -> BlobTree {
+    let any = Config::new(
+        path,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_kv_separation(Some(lsm_tree::KvSeparationOptions::default()))
+    .open()
+    .expect("BlobTree open should succeed");
+
+    match any {
+        AnyTree::Blob(t) => t,
+        AnyTree::Standard(_) => panic!("expected Blob tree, got Standard"),
+    }
 }
 
 #[test]
@@ -214,5 +230,42 @@ fn scan_since_mixed_format_tree_scans_correctly() -> lsm_tree::Result<()> {
     let mut sorted = seqnos.clone();
     sorted.sort_unstable();
     assert_eq!(seqnos, sorted, "merged output stays seqno-ordered");
+    Ok(())
+}
+
+#[test]
+fn scan_since_resolves_blob_values_on_blob_tree() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let tree = open_blob_tree(folder.path());
+
+    // A large value is stored out-of-line in a blob file (KV-separation); the
+    // index entry becomes an indirection pointer. A small value stays inline.
+    let big = b"blobby".repeat(40_000);
+    tree.insert(b"big", &big, 0);
+    tree.insert(b"small", b"inline", 1);
+    tree.flush_active_memtable(0)?;
+    assert!(tree.blob_file_count() > 0, "the big value must be separated");
+
+    let got: Vec<ScanSinceEvent> = tree
+        .scan_since_seqno(0)
+        .expect("blob-tree scan_since_seqno should succeed")
+        .collect();
+
+    // The blob-indirected entry must come back as an Insert carrying the real
+    // resolved value, not a pointer.
+    let big_value = got
+        .iter()
+        .find_map(|e| match e {
+            ScanSinceEvent::Insert { key, value, .. } if &**key == b"big" => Some(value.to_vec()),
+            _ => None,
+        })
+        .expect("an Insert for the blob-separated key must be emitted");
+    assert_eq!(big_value, big, "blob value must be resolved, not a handle");
+
+    let small_value = got.iter().find_map(|e| match e {
+        ScanSinceEvent::Insert { key, value, .. } if &**key == b"small" => Some(value.to_vec()),
+        _ => None,
+    });
+    assert_eq!(small_value.as_deref(), Some(b"inline" as &[u8]));
     Ok(())
 }

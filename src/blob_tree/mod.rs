@@ -10,7 +10,7 @@ pub mod ingest;
 pub use gc::{FragmentationEntry, FragmentationMap};
 
 use crate::{
-    Cache, Config, Memtable, SeqNo, TableId, TreeId, UserKey, UserValue,
+    Cache, Config, Memtable, ScanSinceEvent, SeqNo, TableId, TreeId, UserKey, UserValue,
     abstract_tree::{AbstractTree, RangeItem},
     coding::Decode,
     iter_guard::{IterGuard, IterGuardImpl},
@@ -219,6 +219,48 @@ impl BlobTree {
         )?;
 
         Ok(Some(v))
+    }
+
+    /// Iterate change events with `seqno >= target_seqno`, resolving
+    /// KV-separated values.
+    ///
+    /// Same change-data-capture contract as [`Tree::scan_since_seqno`](crate::Tree::scan_since_seqno),
+    /// but a blob-indirected value is resolved from its blob file into a
+    /// [`ScanSinceEvent::Insert`] carrying the real value, so a downstream
+    /// consumer can replicate without access to the source's blob files.
+    /// Block-skip, seqno ordering, and tombstone handling are identical to the
+    /// standard-tree path (the same shared aggregation backs both).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal version-history lock is poisoned.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if reading the index, a data block, or a referenced blob
+    /// fails.
+    pub fn scan_since_seqno(
+        &self,
+        target_seqno: SeqNo,
+    ) -> crate::Result<impl Iterator<Item = ScanSinceEvent> + use<>> {
+        self.index
+            .scan_since_seqno_with(target_seqno, |version, entry| {
+                let seqno = entry.key.seqno;
+                let (key, value) = resolve_value_handle(
+                    self.id(),
+                    self.blobs_folder.as_path(),
+                    &self.index.config.cache,
+                    version,
+                    entry,
+                    #[cfg(zstd_any)]
+                    self.index
+                        .config
+                        .kv_separation_opts
+                        .as_ref()
+                        .and_then(|o| o.zstd_dictionary.as_deref()),
+                )?;
+                Ok(ScanSinceEvent::Insert { key, value, seqno })
+            })
     }
 }
 
