@@ -882,6 +882,49 @@ impl Table {
         self.range(..)
     }
 
+    /// Collects every entry in this SST with `seqno >= target_seqno`,
+    /// applying the per-block seqno-bounds skip when the SST carries it.
+    ///
+    /// A data block whose index entry reports `seqno_max < target_seqno`
+    /// (seqno-bounded format, `Properties.index_format = 1`) cannot hold a
+    /// qualifying record, so it is skipped without being read. Blocks without
+    /// bounds on disk (legacy `index_format = 0`) are always read and filtered
+    /// per entry, so the result is correct regardless of the SST's index
+    /// format. Entries come back in the SST's stored order (key-ascending,
+    /// seqno-descending within a key); ordering across sources is the caller's
+    /// job.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if reading the index or a data block fails.
+    #[doc(hidden)]
+    pub fn scan_since_seqno(&self, target_seqno: SeqNo) -> crate::Result<Vec<InternalValue>> {
+        let mut out = Vec::new();
+
+        for handle in self.block_index.iter() {
+            let handle = handle?;
+
+            // Block-skip: a seqno-bounded entry whose max is below the target
+            // cannot reference any qualifying record, so skip the data-block read.
+            if let Some((_, seqno_max)) = handle.seqno_bounds()
+                && seqno_max < target_seqno
+            {
+                continue;
+            }
+
+            let block = self.load_data_block(handle.as_ref())?;
+            let data = &block.inner.data;
+            for item in block.iter(self.comparator.clone()) {
+                let value = item.materialize(data);
+                if value.key.seqno >= target_seqno {
+                    out.push(value);
+                }
+            }
+        }
+
+        Ok(out)
+    }
+
     /// Creates a ranged iterator over the `Table`.
     ///
     /// # Errors
