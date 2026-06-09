@@ -819,9 +819,16 @@ mod linux_caps {
             return FsCapabilities::default();
         }
         // SAFETY: statfs returned 0, so `buf` is initialized. `f_type` is
-        // `c_long` (i64) on 64-bit, matching the magic constants directly.
+        // `c_long` (i64) on glibc but `c_ulong` (u64) on musl, so normalize to
+        // i64 before matching the magic constants (their bit patterns are
+        // identical across the cast).
         #[expect(unsafe_code, reason = "read initialized statfs.f_type")]
-        let f_type: i64 = unsafe { buf.assume_init() }.f_type;
+        #[allow(
+            clippy::unnecessary_cast,
+            clippy::cast_possible_wrap,
+            reason = "f_type is i64 on glibc (no-op cast) and u64 on musl (cast required)"
+        )]
+        let f_type = unsafe { buf.assume_init() }.f_type as i64;
 
         match f_type {
             BTRFS | ZFS => FsCapabilities {
@@ -860,7 +867,9 @@ mod linux_caps {
         let rc = unsafe {
             libc::ioctl(
                 dst_f.as_raw_fd(),
-                libc::FICLONE as libc::c_ulong,
+                // ioctl's request param is c_ulong on glibc but c_int on musl;
+                // infer the target type so FICLONE casts to whichever applies.
+                libc::FICLONE as _,
                 src_f.as_raw_fd(),
             )
         };
@@ -914,7 +923,13 @@ mod linux_caps {
         let mut flags: libc::c_int = 0;
         // SAFETY: valid fd; GETFLAGS writes one `int` through the pointer arg.
         #[expect(unsafe_code, reason = "ioctl(FS_IOC_GETFLAGS) to read inode flags")]
-        let rc = unsafe { libc::ioctl(f.as_raw_fd(), FS_IOC_GETFLAGS, &raw mut flags) };
+        #[allow(
+            clippy::unnecessary_cast,
+            clippy::cast_possible_truncation,
+            reason = "ioctl request is c_ulong on glibc (no-op) but c_int on musl; \
+                      the 32-bit request code's low bits are preserved by truncation"
+        )]
+        let rc = unsafe { libc::ioctl(f.as_raw_fd(), FS_IOC_GETFLAGS as _, &raw mut flags) };
         if rc != 0 {
             return ignore_if_unsupported(io::Error::last_os_error());
         }
@@ -924,7 +939,13 @@ mod linux_caps {
         flags |= FS_NOCOW_FL;
         // SAFETY: valid fd; SETFLAGS reads one `int` through the pointer arg.
         #[expect(unsafe_code, reason = "ioctl(FS_IOC_SETFLAGS) to set FS_NOCOW_FL")]
-        let rc = unsafe { libc::ioctl(f.as_raw_fd(), FS_IOC_SETFLAGS, &raw const flags) };
+        #[allow(
+            clippy::unnecessary_cast,
+            clippy::cast_possible_truncation,
+            reason = "ioctl request is c_ulong on glibc (no-op) but c_int on musl; \
+                      the 32-bit request code's low bits are preserved by truncation"
+        )]
+        let rc = unsafe { libc::ioctl(f.as_raw_fd(), FS_IOC_SETFLAGS as _, &raw const flags) };
         if rc != 0 {
             return ignore_if_unsupported(io::Error::last_os_error());
         }
