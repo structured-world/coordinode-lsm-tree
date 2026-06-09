@@ -180,9 +180,31 @@ fn do_decompress_with_dict(
         //   - older frames written before the id was retained (header
         //     omits it).
         let mut cursor = std::io::Cursor::new(data);
-        decoder
-            .init(&mut cursor)
-            .map_err(|e| crate::Error::Io(std::io::Error::other(e)))?;
+        // Inner-frame defense-in-depth: pin the frame's embedded Dictionary_ID
+        // against the dictionary we are about to decode with. On the raw-content
+        // path the frame carries the synthetic `raw_content_id` we wrote at
+        // compress time, so a genuine frame always matches; a spliced frame body
+        // compressed under a different dictionary (the dict-substitution attack —
+        // header kept valid to pass the block-header and AAD checks) diverges
+        // here and is rejected BEFORE `force_dict` blindly applies the wrong
+        // tables and yields silent garbage. `init` validates the pinned id
+        // against the parsed header before any block decode runs.
+        decoder.expect_dict_id(Some(raw_content_id));
+        decoder.init(&mut cursor).map_err(|e| {
+            if matches!(
+                e,
+                structured_zstd::decoding::errors::FrameDecoderError::UnexpectedDictId { .. }
+            ) {
+                // Typed signal: the inner frame was compressed under a different
+                // dictionary than this block claims. Never silent wrong output.
+                crate::Error::Decompress(crate::CompressionType::ZstdDict {
+                    level: 0,
+                    dict_id: raw_content_id,
+                })
+            } else {
+                crate::Error::Io(std::io::Error::other(e))
+            }
+        })?;
 
         // Decompression-bomb guard: if the frame header declares a
         // content size larger than `capacity`, reject before allocating
@@ -728,6 +750,48 @@ mod tests {
         assert_eq!(
             decompressed, PLAINTEXT,
             "round-trip with raw content dict must equal the original plaintext"
+        );
+    }
+
+    #[test]
+    fn raw_content_dict_substitution_rejected_by_inner_frame_gate() {
+        // Defense-in-depth for the dict-substitution threat (#253): the
+        // raw-content decode path applies the dictionary via `force_dict`, which
+        // ignores the inner zstd frame's embedded Dictionary_ID. Without the
+        // `expect_dict_id` gate, a frame body compressed under a DIFFERENT
+        // dictionary (spliced in while the block header + AAD dict_id are kept
+        // valid) would be decoded against the wrong tables and yield silent
+        // garbage. The gate pins the frame id to the decoding dict, so the
+        // substitution surfaces a typed error instead of wrong plaintext.
+        let dict_a_raw = b"raw content dictionary ALPHA for the substitution test".to_vec();
+        let dict_b_raw = b"raw content dictionary BRAVO for the substitution test".to_vec();
+        let dict_a = ZstdDictionary::new(&dict_a_raw);
+        let dict_b = ZstdDictionary::new(&dict_b_raw);
+        assert_ne!(
+            dict_a.id(),
+            dict_b.id(),
+            "distinct raw dicts must hash to distinct ids"
+        );
+
+        let payload = b"defense-in-depth payload bytes compressed under a raw dict";
+
+        // Frame genuinely compressed under dict B (carries dict B's synthetic id).
+        let frame_b =
+            ZstdProvider::compress_with_dict(payload, 3, &dict_b_raw).expect("compress under B");
+
+        // Matching dict B decodes cleanly (the gate's expectation == frame id).
+        let ok = ZstdProvider::decompress_with_dict(&frame_b, &dict_b, payload.len() + 1)
+            .expect("matching dict must decode");
+        assert_eq!(ok, payload, "matching-dict round-trip must be exact");
+
+        // Substitution: decode frame B against dict A. The inner-frame id (B)
+        // diverges from the expectation (A) and the gate rejects it before
+        // `force_dict` can apply A's tables to B's frame.
+        let err = ZstdProvider::decompress_with_dict(&frame_b, &dict_a, payload.len() + 1)
+            .expect_err("dict substitution must be rejected by the inner-frame gate");
+        assert!(
+            matches!(err, crate::Error::Decompress(_)),
+            "expected a typed Decompress error (never silent wrong output), got {err:?}"
         );
     }
 
