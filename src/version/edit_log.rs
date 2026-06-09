@@ -51,20 +51,24 @@ pub fn append_edit(
 /// Replays the durable prefix of the log at `path`. An absent log is an empty
 /// edit list (a snapshot with no edits yet).
 ///
-/// `strict` mirrors [`ManifestRecoveryMode::AbsoluteConsistency`](crate::config::ManifestRecoveryMode::AbsoluteConsistency):
-/// when `true`, an incomplete or corrupt trailing record is surfaced as
-/// [`crate::Error::TornManifestEditLog`] instead of being rolled back. A clean
-/// end-of-log is always tolerated (see [`replay_edits`]).
+/// `mode` selects the trailing-record policy (see [`replay_edits`]): a clean
+/// end-of-log is always tolerated, a writer-incomplete tail is rolled back in
+/// every mode except `AbsoluteConsistency`, and a fully-framed corrupt tail is
+/// rolled back only under `PointInTimeRecovery` / `SkipAnyCorruptedRecords`.
 ///
 /// # Errors
 ///
 /// Returns an I/O error if the open (other than not-found) or a read fails,
 /// [`crate::Error::InvalidHeader`] if a checksum-valid record fails to decode,
-/// or [`crate::Error::TornManifestEditLog`] when `strict` and the trailing
-/// record is torn / bit-rotted / mis-framed.
-pub fn replay_log(fs: &dyn Fs, path: &Path, strict: bool) -> crate::Result<Vec<VersionEdit>> {
+/// or [`crate::Error::TornManifestEditLog`] when the trailing record is
+/// torn / bit-rotted / mis-framed and `mode` does not tolerate that defect.
+pub fn replay_log(
+    fs: &dyn Fs,
+    path: &Path,
+    mode: crate::config::ManifestRecoveryMode,
+) -> crate::Result<Vec<VersionEdit>> {
     match fs.open(path, &FsOpenOptions::new().read(true)) {
-        Ok(mut file) => replay_edits(&mut file, strict),
+        Ok(mut file) => replay_edits(&mut file, mode),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
         Err(e) => Err(crate::Error::Io(e)),
     }
@@ -90,6 +94,7 @@ pub fn log_size(fs: &dyn Fs, path: &Path) -> crate::Result<u64> {
 mod tests {
     use super::super::edit::{ChangedLevel, TableDesc, VersionEdit};
     use super::*;
+    use crate::config::ManifestRecoveryMode;
     use crate::fs::StdFs;
 
     fn edit(id: u64) -> VersionEdit {
@@ -116,7 +121,8 @@ mod tests {
         for e in &edits {
             append_edit(&StdFs, &path, e, &mut scratch, SyncMode::Normal).expect("append");
         }
-        let replayed = replay_log(&StdFs, &path, false).expect("replay");
+        let replayed =
+            replay_log(&StdFs, &path, ManifestRecoveryMode::AbsoluteConsistency).expect("replay");
         assert_eq!(replayed, edits, "append+replay must round-trip in order");
     }
 
@@ -124,7 +130,11 @@ mod tests {
     fn replay_absent_log_is_empty() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("edits-missing");
-        assert!(replay_log(&StdFs, &path, false).expect("replay").is_empty());
+        assert!(
+            replay_log(&StdFs, &path, ManifestRecoveryMode::AbsoluteConsistency)
+                .expect("replay")
+                .is_empty()
+        );
         assert_eq!(log_size(&StdFs, &path).expect("size"), 0);
     }
 
@@ -161,7 +171,12 @@ mod tests {
         // is dropped, keeping the durable prefix.
         let dir = tempfile::tempdir().expect("tempdir");
         let path = log_with_torn_tail(dir.path(), 2);
-        let replayed = replay_log(&StdFs, &path, false).expect("replay");
+        let replayed = replay_log(
+            &StdFs,
+            &path,
+            ManifestRecoveryMode::TolerateCorruptedTailRecords,
+        )
+        .expect("replay");
         assert_eq!(
             replayed,
             vec![edit(1), edit(2)],
@@ -176,7 +191,8 @@ mod tests {
         // truncate the tail (Tree::repair) before the tree opens.
         let dir = tempfile::tempdir().expect("tempdir");
         let path = log_with_torn_tail(dir.path(), 2);
-        let err = replay_log(&StdFs, &path, true).expect_err("strict must reject torn tail");
+        let err = replay_log(&StdFs, &path, ManifestRecoveryMode::AbsoluteConsistency)
+            .expect_err("strict must reject torn tail");
         assert!(
             matches!(err, crate::Error::TornManifestEditLog { kind: "truncated" }),
             "expected TornManifestEditLog(truncated), got {err:?}",
@@ -196,15 +212,18 @@ mod tests {
         for e in &edits {
             append_edit(&StdFs, &path, e, &mut scratch, SyncMode::Normal).expect("append");
         }
-        let replayed = replay_log(&StdFs, &path, true).expect("strict must accept a clean log");
+        let replayed = replay_log(&StdFs, &path, ManifestRecoveryMode::AbsoluteConsistency)
+            .expect("strict must accept a clean log");
         assert_eq!(replayed, edits, "clean log replays fully under strict");
     }
 
     #[test]
-    fn checksum_mismatch_tail_aborts_under_strict() {
+    fn checksum_mismatch_tail_aborts_under_strict_and_tolerate_tail() {
         // A fully-framed trailing record whose payload bit-rotted (length and
-        // digest intact, bytes flipped) is corruption, not an unacknowledged
-        // write. Strict mode rejects it; lenient mode drops it.
+        // digest intact, bytes flipped) is corruption of committed bytes, not an
+        // unacknowledged write. AbsoluteConsistency AND TolerateCorruptedTailRecords
+        // (writer-incomplete salvage only) must both reject it; only the
+        // corruption-tolerant modes (PIT / SkipAny) drop it.
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("edits-bitrot");
         let mut scratch = Vec::new();
@@ -217,22 +236,28 @@ mod tests {
         bytes[last] ^= 0xFF;
         std::fs::write(&path, &bytes).expect("write");
 
-        let err = replay_log(&StdFs, &path, true).expect_err("strict must reject bit-rot");
-        assert!(
-            matches!(
-                err,
-                crate::Error::TornManifestEditLog {
-                    kind: "checksum-mismatch"
-                }
-            ),
-            "expected TornManifestEditLog(checksum-mismatch), got {err:?}",
-        );
+        for mode in [
+            ManifestRecoveryMode::AbsoluteConsistency,
+            ManifestRecoveryMode::TolerateCorruptedTailRecords,
+        ] {
+            let err = replay_log(&StdFs, &path, mode).expect_err("must reject committed bit-rot");
+            assert!(
+                matches!(
+                    err,
+                    crate::Error::TornManifestEditLog {
+                        kind: "checksum-mismatch"
+                    }
+                ),
+                "expected TornManifestEditLog(checksum-mismatch) under {mode:?}, got {err:?}",
+            );
+        }
 
-        let replayed = replay_log(&StdFs, &path, false).expect("lenient drops bit-rotted tail");
+        let replayed = replay_log(&StdFs, &path, ManifestRecoveryMode::PointInTimeRecovery)
+            .expect("PIT drops bit-rotted tail");
         assert_eq!(
             replayed,
             vec![edit(1), edit(2)],
-            "lenient: bit-rotted tail dropped, prefix kept",
+            "PIT: bit-rotted tail dropped, prefix kept",
         );
     }
 

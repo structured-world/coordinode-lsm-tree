@@ -274,23 +274,29 @@ pub enum Error {
     ManifestSectionInvalid(&'static str),
 
     /// The trailing record of the incremental manifest edit log is
-    /// incomplete or corrupt, and the tree was opened under
-    /// [`ManifestRecoveryMode::AbsoluteConsistency`](crate::config::ManifestRecoveryMode::AbsoluteConsistency),
-    /// which refuses to silently roll back an unacknowledged or
-    /// bit-rotted edit.
+    /// incomplete or corrupt, and the active
+    /// [`ManifestRecoveryMode`](crate::config::ManifestRecoveryMode) does
+    /// not tolerate that defect, so the open aborts rather than silently
+    /// rolling the edit back.
     ///
     /// A clean end-of-log is never reported here: a crash exactly at a
     /// record boundary is byte-identical to a pristine close, so that
-    /// case is always tolerated. This fires only when bytes of a
-    /// trailing record are present but the record fails framing (a
-    /// power-loss-truncated append), a fully-framed record's checksum
-    /// doesn't match (bit-rot), or a framing header is forged.
+    /// case is always tolerated. This fires when bytes of a trailing
+    /// record are present but the record fails framing — a
+    /// power-loss-truncated append (only
+    /// [`AbsoluteConsistency`](crate::config::ManifestRecoveryMode::AbsoluteConsistency)
+    /// rejects it; other modes roll it back), or a fully-framed record
+    /// whose checksum doesn't match (bit-rot) / whose header is forged
+    /// (rejected by both `AbsoluteConsistency` and
+    /// [`TolerateCorruptedTailRecords`](crate::config::ManifestRecoveryMode::TolerateCorruptedTailRecords),
+    /// which salvages writer-incomplete tails only; rolled back under
+    /// `PointInTimeRecovery` / `SkipAnyCorruptedRecords`).
     ///
     /// Recover by truncating the torn tail: run
     /// [`Config::repair`](crate::Config::repair), which rebuilds a clean
-    /// standalone snapshot (dropping the edit log), or re-open under a tolerant
-    /// [`ManifestRecoveryMode`](crate::config::ManifestRecoveryMode) to
-    /// roll the unacknowledged tail back.
+    /// standalone snapshot (dropping the edit log), or re-open under a
+    /// [`ManifestRecoveryMode`](crate::config::ManifestRecoveryMode) that
+    /// tolerates the defect to roll the trailing edit back.
     TornManifestEditLog {
         /// The trailing defect detected: `"truncated"` (partial record
         /// from a power-loss-interrupted append), `"checksum-mismatch"`
