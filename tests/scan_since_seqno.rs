@@ -272,3 +272,55 @@ fn scan_since_resolves_blob_values_on_blob_tree() -> lsm_tree::Result<()> {
     assert_eq!(small_value.as_deref(), Some(b"inline" as &[u8]));
     Ok(())
 }
+
+#[test]
+fn scan_since_seqno_translates_ingested_global_seqno() -> lsm_tree::Result<()> {
+    // Bulk-ingested tables store entries at LOCAL seqno 0 but carry a
+    // global_seqno offset; reads translate (target down, results up) the way
+    // Table::get does. scan_since_seqno must do the same: comparing a global
+    // target against the table's LOCAL seqno bounds would block-skip the whole
+    // table (local max 0 < global target) and silently drop ingested changes.
+    let folder = get_tmp_folder();
+    let seqno = SequenceNumberCounter::default();
+    let visible = SequenceNumberCounter::default();
+    let any = Config::new(folder.path(), seqno.clone(), visible.clone()).open()?;
+    // `ingestion()` lives on AnyTree; `scan_since_seqno` on the concrete Tree.
+    // Tree is an Arc handle, so this clone shares state with `any`.
+    let tree = match &any {
+        AnyTree::Standard(t) => t.clone(),
+        AnyTree::Blob(_) => panic!("expected Standard tree"),
+    };
+
+    // A regular flushed table at global_seqno 0.
+    let s0 = seqno.next();
+    tree.insert(b"x", b"x", s0);
+    visible.fetch_max(s0 + 1);
+    tree.flush_active_memtable(0)?;
+
+    // Bulk-ingest: ingested table carries a nonzero global_seqno offset.
+    let global = seqno.get();
+    assert!(
+        global > 0,
+        "ingest must carry a nonzero global_seqno offset"
+    );
+    let mut ing = any.ingestion()?;
+    ing.write("a", "a")?;
+    ing.finish()?;
+
+    // Scanning at the ingest's global seqno must surface the ingested entry,
+    // in GLOBAL coordinates.
+    let events: Vec<ScanSinceEvent> = tree.scan_since_seqno(global)?.collect();
+    let a = events
+        .iter()
+        .find(|e| matches!(e, ScanSinceEvent::Insert { key, .. } if &**key == b"a"));
+    assert!(
+        a.is_some(),
+        "ingested entry must not be block-skipped by a global/local seqno mismatch",
+    );
+    assert_eq!(
+        a.unwrap().seqno(),
+        global,
+        "event seqno must be reported in GLOBAL coordinates",
+    );
+    Ok(())
+}
