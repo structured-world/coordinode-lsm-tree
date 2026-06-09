@@ -300,8 +300,14 @@ impl Fs for StdFs {
             use std::os::unix::fs::MetadataExt;
             Ok(std::fs::metadata(path)?.nlink())
         }
-        // Windows: no portable nlink; fall back to the conservative
-        // "unsupported" contract so the reclaim path skips truncation.
+        // Windows: no portable stable-Rust nlink. NTFS hard links are real, so
+        // truncating without a confirmed link count could zero a checkpoint's
+        // hard-linked copy — the same hazard the Unix guard prevents. Report
+        // "unsupported" so the reclaim path conservatively SKIPS the
+        // synchronous truncate and relies on the async unlink alone (correct,
+        // just without the immediate-footprint fast path). Narrowing the
+        // contract this way is deliberate; raising it to truncate-on-Windows
+        // would need a winapi `GetFileInformationByHandle` link-count query.
         #[cfg(not(unix))]
         {
             let _ = path;
