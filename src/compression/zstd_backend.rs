@@ -802,9 +802,17 @@ mod tests {
         // `force_dict` can apply A's tables to B's frame.
         let err = ZstdProvider::decompress_with_dict(&frame_b, &dict_a, payload.len() + 1)
             .expect_err("dict substitution must be rejected by the inner-frame gate");
+        // Lock down the exact mismatch payload the gate emits, not just any
+        // Decompress error: the id carried is the EXPECTED dict (the one we
+        // decoded with), so an unrelated decompression failure would not match.
+        let expected_dict_id = dict_a.id().max(1);
         assert!(
-            matches!(err, crate::Error::Decompress(_)),
-            "expected a typed Decompress error (never silent wrong output), got {err:?}"
+            matches!(
+                err,
+                crate::Error::Decompress(crate::CompressionType::ZstdDict { level: 0, dict_id })
+                    if dict_id == expected_dict_id
+            ),
+            "expected Decompress(ZstdDict {{ level: 0, dict_id: {expected_dict_id} }}), got {err:?}"
         );
     }
 
