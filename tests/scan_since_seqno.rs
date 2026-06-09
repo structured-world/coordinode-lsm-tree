@@ -323,3 +323,28 @@ fn scan_since_seqno_translates_ingested_global_seqno() -> lsm_tree::Result<()> {
     );
     Ok(())
 }
+
+#[test]
+fn scan_since_caught_up_target_returns_empty() -> lsm_tree::Result<()> {
+    // A caught-up CDC poller scans at (or beyond) the current watermark; the
+    // window is empty and the scan must return nothing without re-reading the
+    // legacy/mixed-format portion of the tree.
+    let folder = get_tmp_folder();
+    let tree = open_tree(folder.path())?;
+
+    for i in 0..10u64 {
+        tree.insert(format!("k{i:02}").as_bytes(), b"v", i);
+    }
+    tree.flush_active_memtable(0)?;
+
+    // Highest seqno present is 9; scanning since 10 (one past it) yields nothing.
+    assert!(
+        events(&tree, 10)?.is_empty(),
+        "an empty seqno window must yield no events"
+    );
+    assert!(
+        events(&tree, 100)?.is_empty(),
+        "a far-future target must yield no events"
+    );
+    Ok(())
+}

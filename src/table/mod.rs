@@ -930,6 +930,14 @@ impl Table {
         // 0, correctly excluding the whole table.
         let local_end = end_seqno.saturating_sub(global_seqno);
 
+        // Empty window (e.g. a caught-up CDC poller whose target equals the
+        // current watermark): nothing can qualify, so skip walking the index
+        // entirely. Without this a legacy SST (no per-block seqno bounds) would
+        // load + filter every block to return nothing on every poll.
+        if local_target >= local_end {
+            return Ok(Vec::new());
+        }
+
         let mut out = Vec::new();
 
         for handle in self.block_index.iter() {
