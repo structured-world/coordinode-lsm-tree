@@ -85,6 +85,17 @@ pub struct TreeInner {
     /// [`Table`](crate::Table) and [`BlobFile`](crate::BlobFile).
     pub(crate) deletion_pause: Arc<DeletionPause>,
 
+    /// Tree-wide background file deleter. Installed into every table / blob
+    /// file so an obsolete file's directory-entry `unlink` runs off the
+    /// foreground path (its blocks are freed synchronously at the Drop site).
+    /// Held here so the deleter — and its worker thread — outlives every table
+    /// (each table holds a clone, so the worker drains and joins only once the
+    /// last reference, including this one, is dropped).
+    // std-only: the deleter spawns a thread. A no_std build keeps the
+    // synchronous Drop path and never constructs one.
+    #[cfg(feature = "std")]
+    pub(crate) background_deleter: Arc<crate::BackgroundDeleter>,
+
     /// Runtime-toggleable configuration. Lockless atomic snapshot.
     ///
     /// Reachable through the public Tree API
@@ -168,6 +179,8 @@ impl TreeInner {
             flush_lock: Mutex::default(),
             compaction_state: Arc::new(Mutex::new(CompactionState::default())),
             deletion_pause: DeletionPause::new_shared(),
+            #[cfg(feature = "std")]
+            background_deleter: Arc::new(crate::BackgroundDeleter::new(None)),
             runtime_config: Arc::new(RuntimeConfigHandle::new((*initial_runtime).clone())),
 
             #[cfg(feature = "metrics")]

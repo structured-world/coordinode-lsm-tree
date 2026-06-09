@@ -656,10 +656,14 @@ impl AbstractTree for Tree {
         // later get marked `is_deleted` by compaction.
         for table in tables {
             table.install_deletion_pause(Arc::clone(&self.deletion_pause));
+            #[cfg(feature = "std")]
+            table.install_background_deleter(Arc::clone(&self.background_deleter));
         }
         if let Some(bfs) = blob_files {
             for bf in bfs {
                 bf.install_deletion_pause(Arc::clone(&self.deletion_pause));
+                #[cfg(feature = "std")]
+                bf.install_background_deleter(Arc::clone(&self.background_deleter));
             }
         }
 
@@ -2317,6 +2321,8 @@ impl Tree {
         let comparator = config.comparator.clone();
 
         let deletion_pause = crate::deletion_pause::DeletionPause::new_shared();
+        #[cfg(feature = "std")]
+        let background_deleter = Arc::new(crate::BackgroundDeleter::new(None));
 
         // Clone the seed snapshot BEFORE moving config into the Arc
         // below — the runtime handle initializer needs it after the
@@ -2346,6 +2352,8 @@ impl Tree {
             flush_lock: Mutex::default(),
             compaction_state: Arc::new(Mutex::new(CompactionState::default())),
             deletion_pause: Arc::clone(&deletion_pause),
+            #[cfg(feature = "std")]
+            background_deleter: Arc::clone(&background_deleter),
             runtime_config: Arc::new(crate::runtime_config::handle::RuntimeConfigHandle::new(
                 initial_runtime,
             )),
@@ -2373,9 +2381,13 @@ impl Tree {
 
         for table in &recovered_tables {
             table.install_deletion_pause(Arc::clone(&deletion_pause));
+            #[cfg(feature = "std")]
+            table.install_background_deleter(Arc::clone(&background_deleter));
         }
         for blob_file in &recovered_blobs {
             blob_file.install_deletion_pause(Arc::clone(&deletion_pause));
+            #[cfg(feature = "std")]
+            blob_file.install_background_deleter(Arc::clone(&background_deleter));
         }
 
         Ok(Self(Arc::new(inner)))

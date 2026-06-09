@@ -1500,6 +1500,9 @@ impl Table {
             zstd_dictionary,
 
             deletion_pause: once_cell::race::OnceBox::new(),
+
+            #[cfg(feature = "std")]
+            background_deleter: once_cell::race::OnceBox::new(),
         })))
     }
 
@@ -1509,6 +1512,17 @@ impl Table {
     /// after recovery and after compaction registers freshly-built tables.
     pub(crate) fn install_deletion_pause(&self, pause: Arc<crate::deletion_pause::DeletionPause>) {
         let _ = self.0.deletion_pause.set(Box::new(pause));
+    }
+
+    /// Installs the tree-wide background file deleter.
+    ///
+    /// Idempotent: a second call is a no-op. Called by the owning tree after
+    /// recovery and after compaction registers freshly-built tables, so an
+    /// obsolete SST's `unlink` runs off the foreground path while its blocks
+    /// are reclaimed synchronously at Drop.
+    #[cfg(feature = "std")]
+    pub(crate) fn install_background_deleter(&self, deleter: Arc<crate::BackgroundDeleter>) {
+        let _ = self.0.background_deleter.set(Box::new(deleter));
     }
 
     #[must_use]

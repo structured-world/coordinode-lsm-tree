@@ -1051,6 +1051,9 @@ mod tests {
             file_accessor: FileAccessor::File(Arc::new(file2)),
             fs: Arc::new(crate::fs::StdFs),
             deletion_pause: once_cell::race::OnceBox::new(),
+
+            #[cfg(feature = "std")]
+            background_deleter: once_cell::race::OnceBox::new(),
         }));
 
         let reader = Reader::new(&blob_file, &file);

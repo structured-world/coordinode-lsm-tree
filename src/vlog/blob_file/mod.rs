@@ -60,6 +60,16 @@ pub struct Inner {
     // `once_cell::race::OnceBox` — see Table::Inner::deletion_pause
     // for the rationale (no-std-friendly one-shot slot).
     pub(crate) deletion_pause: once_cell::race::OnceBox<Arc<DeletionPause>>,
+
+    /// Tree-wide background file deleter. See
+    /// [`Table::install_background_deleter`](crate::Table) for the contract:
+    /// when present (and no checkpoint pause is active) the [`Drop`] impl frees
+    /// the blob file's blocks synchronously via
+    /// [`Fs::truncate_file`](crate::fs::Fs::truncate_file) and hands the
+    /// directory-entry `unlink` to this deleter, off the foreground path.
+    // std-only (the deleter spawns a thread); see Table::Inner for rationale.
+    #[cfg(feature = "std")]
+    pub(crate) background_deleter: once_cell::race::OnceBox<Arc<crate::BackgroundDeleter>>,
 }
 
 impl Inner {
@@ -127,7 +137,26 @@ impl Drop for Inner {
                     self.id,
                     self.path.display(),
                 );
-            } else if let Err(e) = self.fs.remove_file(&self.path) {
+                return;
+            }
+
+            // Off-foreground reclaim: free the blocks synchronously (accurate
+            // footprint scan) and hand the unlink to the background deleter.
+            // Falls through to a synchronous remove_file when none installed.
+            #[cfg(feature = "std")]
+            if let Some(deleter) = self.background_deleter.get() {
+                if let Err(e) = self.fs.truncate_file(&self.path) {
+                    log::warn!(
+                        "Failed to truncate deleted blob file {:?} at {}: {e:?}",
+                        self.id,
+                        self.path.display(),
+                    );
+                }
+                deleter.enqueue(Arc::clone(&self.fs), self.path.clone());
+                return;
+            }
+
+            if let Err(e) = self.fs.remove_file(&self.path) {
                 log::warn!(
                     "Failed to cleanup deleted blob file {:?} at {}: {e:?}",
                     self.id,
@@ -167,6 +196,12 @@ impl BlobFile {
     /// Idempotent: a second call is a no-op.
     pub(crate) fn install_deletion_pause(&self, pause: Arc<DeletionPause>) {
         let _ = self.0.deletion_pause.set(Box::new(pause));
+    }
+
+    /// Installs the tree-wide background file deleter. Idempotent.
+    #[cfg(feature = "std")]
+    pub(crate) fn install_background_deleter(&self, deleter: Arc<crate::BackgroundDeleter>) {
+        let _ = self.0.background_deleter.set(Box::new(deleter));
     }
 
     /// Returns the blob file ID.

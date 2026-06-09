@@ -137,6 +137,9 @@ pub fn recover_blob_files(
                 tree_id,
                 fs: fs.clone(),
                 deletion_pause: once_cell::race::OnceBox::new(),
+
+                #[cfg(feature = "std")]
+                background_deleter: once_cell::race::OnceBox::new(),
             })));
 
             if idx % progress_mod == 0 {
