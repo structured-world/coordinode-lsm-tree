@@ -602,7 +602,11 @@ mod sys {
         const LOCKFILE_EXCLUSIVE_LOCK: u32 = 0x0000_0002;
 
         // SAFETY: declaration matches the Windows `LockFileEx` ABI and `Overlapped` layout.
-        #[expect(non_snake_case, reason = "FFI name matches Windows API")]
+        // `allow` not `expect`: the foreign-fn name `LockFileEx` is not flagged by
+        // `non_snake_case` on the Windows toolchain, so `expect` would be unfulfilled
+        // and warn on every build; `allow` documents the intentional API-matching name
+        // without depending on whether the lint fires.
+        #[allow(non_snake_case, reason = "FFI name matches Windows API")]
         unsafe extern "system" {
             fn LockFileEx(
                 h_file: *mut std::ffi::c_void,
