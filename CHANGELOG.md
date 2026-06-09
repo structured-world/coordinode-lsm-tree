@@ -11,6 +11,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [5.1.0](https://github.com/structured-world/coordinode-lsm-tree/compare/v5.0.0...v5.1.0) - 2026-06-09
+
+### Added
+
+- *(scan)* scan_since_seqno CDC stream + synchronous clear() reclaim ([#433](https://github.com/structured-world/coordinode-lsm-tree/pull/433))
+
+### Fixed
+
+- *(fs)* silence unfulfilled non_snake_case expect on Windows ([#431](https://github.com/structured-world/coordinode-lsm-tree/pull/431))
+
 ## [5.0.0](https://github.com/structured-world/coordinode-lsm-tree/compare/v4.5.0...v5.0.0) - 2026-06-08
 
 ### Added
