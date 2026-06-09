@@ -777,14 +777,22 @@ mod macos_caps {
 #[cfg(target_os = "linux")]
 mod linux_caps {
     use crate::fs::FsCapabilities;
-    use std::ffi::CString;
     use std::fs::{File, OpenOptions};
     use std::io;
-    use std::mem::MaybeUninit;
-    use std::os::unix::ffi::OsStrExt;
     use std::os::unix::io::AsRawFd;
     use std::path::Path;
 
+    // statfs-based capability detection only compiles on 64-bit (the magic
+    // numbers exceed i32::MAX); these imports + helper feed only that path, so
+    // gate them to avoid unused-import / dead_code warnings on 32-bit targets.
+    #[cfg(target_pointer_width = "64")]
+    use std::ffi::CString;
+    #[cfg(target_pointer_width = "64")]
+    use std::mem::MaybeUninit;
+    #[cfg(target_pointer_width = "64")]
+    use std::os::unix::ffi::OsStrExt;
+
+    #[cfg(target_pointer_width = "64")]
     fn to_cstring(path: &Path) -> io::Result<CString> {
         CString::new(path.as_os_str().as_bytes()).map_err(|_| {
             io::Error::new(
