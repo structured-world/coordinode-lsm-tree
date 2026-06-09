@@ -302,6 +302,7 @@ pub(crate) mod range_tombstone_filter;
 #[doc(hidden)]
 pub mod table;
 
+mod scan_since;
 mod seqno;
 mod slice;
 mod slice_windows;
@@ -400,6 +401,7 @@ pub use {
     memtable::{Memtable, MemtableId},
     merge_operator::MergeOperator,
     prefix::PrefixExtractor,
+    scan_since::ScanSinceEvent,
     seqno::{
         MAX_SEQNO, SequenceNumberCounter, SequenceNumberGenerator, SharedSequenceNumberGenerator,
     },

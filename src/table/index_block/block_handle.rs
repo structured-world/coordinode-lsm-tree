@@ -133,6 +133,17 @@ impl KeyedBlockHandle {
         self.seqno
     }
 
+    /// Per-block seqno bounds `(min, max)` if this entry uses the
+    /// seqno-bounded wire format (markers 2 / 3), else `None` (legacy entry).
+    ///
+    /// A seqno-scoped scan skips the referenced data block without reading it
+    /// when `max < target`; `None` means the bounds are unavailable on disk and
+    /// the caller must fall back to reading and filtering the block.
+    #[must_use]
+    pub fn seqno_bounds(&self) -> Option<(SeqNo, SeqNo)> {
+        self.seqno_bounds
+    }
+
     pub fn shift(&mut self, delta: BlockOffset) {
         self.inner.offset += delta;
     }
