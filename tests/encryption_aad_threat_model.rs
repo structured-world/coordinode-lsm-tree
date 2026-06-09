@@ -51,11 +51,36 @@
 //! 6. ChaCha20-Poly1305 cross-suite coverage of the most consequential
 //!    scenarios (round-trip, cross-table swap, ciphertext bit-flip).
 //!
-//! Out of first-wave (require structured-zstd integration):
-//! - Dict substitution (needs ZstdDict frame inner-id check)
-//! - Decompression-bomb window swap (needs zstd window-log inner check)
-//! - Suite downgrade beyond AAD coverage (needs key-chain suite metadata)
-//! - Codec / decompression library version drift (needs zstd content checksum)
+//! Coverage of the remaining structured-zstd-integration scenarios (where they
+//! live, since each is defended by an existing layer rather than a new gate in
+//! THIS file):
+//!
+//! - **Dict substitution.** AAD binds `dict_id`, so on an encrypted block AEAD
+//!   verify rejects a swap (covered here by `dict_id_*` tampers). The inner
+//!   zstd frame's embedded `Dictionary_ID` is independently pinned on the
+//!   compression read path via `FrameDecoder::expect_dict_id` — the one barrier
+//!   that still holds for a NON-encrypted dict block when the block checksum is
+//!   configured to a forgeable 32-bit algorithm (`Crc32c` / `Xxh3Low32`). That
+//!   gate + its unit test live in `crate::compression::zstd_backend`
+//!   (`raw_content_dict_substitution_rejected_by_inner_frame_gate`).
+//! - **Decompression-bomb window swap.** Defended without a strict
+//!   window-descriptor gate: AAD binds `window_log` (AEAD verify catches the
+//!   swap on encrypted blocks — covered here by `window_log_*` tampers), and the
+//!   decode path bounds the output allocation to the block's
+//!   `uncompressed_length` (`DecompressedSizeTooLarge`), which caps the bomb's
+//!   effect on every block regardless of segment type or checksum algorithm.
+//!   `expect_window_descriptor` is intentionally NOT wired: it is strict
+//!   equality, applies only to (non-single-segment) dict frames, and adds
+//!   nothing over the always-applicable capacity bound.
+//! - **Codec / decompression library version drift.** Not applicable: the codec
+//!   is a single pinned pure-Rust dependency (deterministic decode within a
+//!   build; cross-version divergence is a codec bug caught by round-trip tests,
+//!   not an at-rest tamper). A per-frame zstd content checksum would change the
+//!   on-disk frame format (+4 bytes / block) and is deferred to a separate,
+//!   benchmark-symmetry-gated decision rather than enabled here.
+//! - **Suite downgrade beyond AAD coverage.** Covered: `suite_id` tamper +
+//!   key-chain epoch/suite disagreement are exercised below (`suite_id_*`,
+//!   `key_epoch_*`).
 
 #![cfg(all(feature = "encryption", feature = "zstd"))]
 

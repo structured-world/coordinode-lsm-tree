@@ -183,12 +183,24 @@ fn do_decompress_with_dict(
         // Inner-frame defense-in-depth: pin the frame's embedded Dictionary_ID
         // against the dictionary we are about to decode with. On the raw-content
         // path the frame carries the synthetic `raw_content_id` we wrote at
-        // compress time, so a genuine frame always matches; a spliced frame body
-        // compressed under a different dictionary (the dict-substitution attack —
-        // header kept valid to pass the block-header and AAD checks) diverges
-        // here and is rejected BEFORE `force_dict` blindly applies the wrong
-        // tables and yields silent garbage. `init` validates the pinned id
-        // against the parsed header before any block decode runs.
+        // compress time, so a genuine frame always matches; a frame body
+        // compressed under a different dictionary diverges here and is rejected
+        // BEFORE `force_dict` blindly applies the wrong tables and yields silent
+        // garbage. `init` validates the pinned id against the parsed header
+        // before any block decode runs.
+        //
+        // This is an INDEPENDENT check, not a duplicate of the block checksum.
+        // The block's integrity checksum is configurable
+        // (`ChecksumAlgorithm`: `Xxh3_64` / `Xxh3Low32` / `Crc32c`) and runs over
+        // the compressed bytes. Under a 32-bit choice — `Crc32c` (linear,
+        // adversarially forgeable to any target) or `Xxh3Low32` — that checksum
+        // is no longer an adversarial barrier, so on a NON-encrypted dict block
+        // the embedded Dictionary_ID is the one independent witness that the
+        // frame was produced under the expected dictionary. For ENCRYPTED blocks
+        // the AAD already binds `dict_id` (AEAD verify catches substitution), so
+        // here the gate is belt-and-suspenders; it also turns an honest
+        // wrong-dictionary misconfiguration into a clear typed error instead of
+        // decompressed garbage.
         decoder.expect_dict_id(Some(raw_content_id));
         decoder.init(&mut cursor).map_err(|e| {
             if matches!(
