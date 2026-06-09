@@ -905,7 +905,8 @@ fn clear_does_not_truncate_checkpoint_hardlinked_ssts() -> lsm_tree::Result<()> 
     let mut shared = false;
     let mut stack = vec![dst_path.clone()];
     while let Some(d) = stack.pop() {
-        for e in std::fs::read_dir(&d)?.flatten() {
+        for entry in std::fs::read_dir(&d)? {
+            let e = entry?;
             let m = e.metadata()?;
             if m.is_dir() {
                 stack.push(e.path());

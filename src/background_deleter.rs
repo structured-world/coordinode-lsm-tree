@@ -21,6 +21,20 @@
 //! unlinked — is the part no filesystem primitive offers; the per-file op
 //! itself (`truncate` / `unlink`) is a plain `Fs` call.
 //!
+//! # Synchronous truncate is conditional
+//!
+//! Step 1 only runs when the reclaim site can confirm it owns the **sole** hard
+//! link to the inode (link count == 1, via [`Fs::hard_link_count`]). Truncating
+//! a shared inode would zero a checkpoint's hard-linked copy too, so when the
+//! link is shared — or the count can't be determined (e.g. a backend without a
+//! link-count primitive, currently non-Unix `StdFs`) — the truncate is skipped
+//! and reclaim is the async unlink (step 2) alone. The reclaim is still correct
+//! in that case; the *immediate* footprint drop (step 1) is the part that's
+//! conditional on link-count support, so it is effectively a Unix-only fast
+//! path today.
+//!
+//! [`Fs::hard_link_count`]: crate::fs::Fs::hard_link_count
+//!
 //! # no-std
 //!
 //! Background deletion needs a thread, so the whole module is gated behind the

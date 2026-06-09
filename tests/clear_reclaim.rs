@@ -6,6 +6,13 @@
 //! Regression guard for the v5 deferred-cleanup gap: `clear()` upgraded the
 //! version but left the old SSTs referenced by stale version-history entries,
 //! so a directory scan still saw the pre-clear bytes.
+//!
+//! Unix-only: the *synchronous* footprint drop relies on `Fs::truncate_file`,
+//! which only runs when the inode link count can be confirmed as 1 (via
+//! `nlink`). On platforms without a link-count primitive the reclaim is correct
+//! but lands via the asynchronous unlink alone, so the right-after-`clear()`
+//! footprint assertion does not hold deterministically.
+#![cfg(unix)]
 
 use lsm_tree::{AbstractTree, Config, SequenceNumberCounter, get_tmp_folder};
 use std::path::Path;
