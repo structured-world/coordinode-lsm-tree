@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1780945016244,
+  "lastUpdate": 1780963758206,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -14040,6 +14040,84 @@ window.BENCHMARK_DATA = {
             "value": 563037.2032969184,
             "unit": "ops/sec",
             "extra": "P50: 1.6us | P99: 5.0us | P99.9: 7.5us\nthreads: 1 | elapsed: 0.36s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "5e86902fc11d2da230903863fd1e8b561acf625e",
+          "message": "feat(fs): filesystem-aware capability framework (CoW-disable + reflink) (#428)\n\n## Summary\n\nAdds a filesystem-aware capability framework to the `Fs` trait and wires\ntwo\nout-of-the-box optimizations into the write and checkpoint paths:\n\n- **Disable copy-on-write on write-once SST files** (Btrfs\n`FS_NOCOW_FL`) so SSTs\navoid the CoW fragmentation penalty (~20% write throughput) without any\n  operator setup.\n- **Reflink checkpoints** (`FICLONE` / `clonefile`) so\n`create_checkpoint`\nproduces independent-inode clones at copy-on-write cost where the\nfilesystem\n  supports it, falling back to the existing hard-link path otherwise.\n\nBoth default ON and are no-ops on filesystems that lack the capability,\nso they\nare safe on any filesystem.\n\n## What's in it\n\n- **`Fs` trait**: `capabilities(&self, path) -> FsCapabilities`\n(`per_block_integrity_on_read` / `background_scrub` / `copy_on_write` /\n  `reflink` / `native_snapshot`), `try_disable_cow(&self, path)`, and\n`reflink_file(&self, src, dst)`. Conservative all-false default so\nunknown\nbackends are always treated safely; `reflink_file` defaults to a shared\nstreamed independent copy. Capabilities are path-based (a property of\nthe\nmount, not the backend — one `StdFs` can serve a data dir on Btrfs and a\nWAL\n  on ext4). `MemFs` reports the explicit no-guarantees profile.\n- **`StdFs` detection**:\n- macOS: APFS via `statfs(2)` `f_fstypename`; reflink via\n`clonefile(2)`.\n  - Linux: Btrfs / ZFS / XFS-reflink via `statfs` `f_type`; reflink via\n`ioctl(FICLONE)`; CoW-disable via `ioctl(FS_IOC_SETFLAGS | FS_NOCOW_FL)`\non\nthe asm-generic ioctl architectures (no-op elsewhere). `libc` moves from\na\n    macOS-only to a unix dependency for the arch-correct struct + ioctl\n    constants.\n- **`RuntimeConfig`**: `disable_cow_on_sst_files` /\n`use_reflink_for_checkpoint`\n  (both default `true`), exposed via `Config` builder methods.\n- **Wiring**: the SST writer clears per-file CoW on each newly created\n(empty)\noutput file via `MultiWriter::use_disable_cow_on_sst` at the flush /\ningest /\ncompaction construction sites; `create_checkpoint` takes the reflink\nfast path\nin `link_or_copy_cross_fs` when the destination filesystem supports it.\n\n## Testing\n\n- `cargo clippy --all-features -- -D warnings` clean, `cargo fmt\n--check` clean.\n- Full suite green: **1925 passed, 2 skipped**. The default-ON wiring\nmeans the\nentire flush / compaction / checkpoint suite exercises the new paths\n(the\n  checkpoint tests take the reflink path on APFS).\n- macOS `clonefile` reflink verified end-to-end (independent identical\nclone).\n- **Linux paths verified on a real Btrfs filesystem** (`TMPDIR` on\nBtrfs, not\ntmpfs): `ioctl(FICLONE)` reflink and `ioctl(FS_NOCOW_FL)` CoW-disable\nboth\nexecute successfully on-FS, with the reflink clone asserted independent.\n\n## Deferred / follow-up\n\n- `file_checksum_policy` (Q17) belongs to the online VerifyChecksum work\nin\n#300 — it consumes `capabilities().per_block_integrity_on_read` — and is\nnot\n  part of this change.\n- Windows ReFS block-clone is not implemented (Windows is not yet a\nproduction\ntarget); `reflink_file` there uses the graceful streamed-copy fallback.\n- The Btrfs CoW-disable test currently asserts `try_disable_cow`\nsucceeds on\nBtrfs; a follow-up can strengthen it to assert the resulting\n`FS_NOCOW_FL`\n  bit directly.\n\nPart of #354.\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n## Summary by CodeRabbit\n\n* **New Features**\n* Runtime options to disable per-file CoW for SST files and to prefer\nreflink-based checkpoint cloning (enabled by default).\n* Writers and checkpointing will attempt reflinks and can disable CoW\nwhen the filesystem supports it.\n* New immutable byte/string view types plus a mutable builder for\nefficient in-memory buffers.\n\n* **Documentation**\n* Updated filesystem/platform docs describing reflink and CoW behavior\nand the new runtime flags.\n\n* **Tests**\n* Added/expanded tests covering reflink, CoW-disable behavior, and the\nnew view types.\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-06-09T02:58:19+03:00",
+          "tree_id": "1e98ee81c7f6bb1e16f84cc685058b527a277783",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/5e86902fc11d2da230903863fd1e8b561acf625e"
+        },
+        "date": 1780963750677,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 2023938.7221787993,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.6us | P99.9: 3.7us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1206525.2529385178,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.3us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 669012.9687394626,
+            "unit": "ops/sec",
+            "extra": "P50: 1.4us | P99: 4.5us | P99.9: 6.9us\nthreads: 1 | elapsed: 0.30s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3669483.931302344,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 3.0us | P99.9: 5.4us\nthreads: 1 | elapsed: 0.05s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 437310.8701549596,
+            "unit": "ops/sec",
+            "extra": "P50: 2.0us | P99: 5.3us | P99.9: 8.0us\nthreads: 1 | elapsed: 0.46s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 221650.91919450756,
+            "unit": "ops/sec",
+            "extra": "P50: 4.2us | P99: 5.3us | P99.9: 7.6us\nthreads: 1 | elapsed: 0.90s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1151710.0749553072,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.2us | P99.9: 4.3us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1164059.6106312564,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 1.5us | P99.9: 2.5us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 568751.7801752985,
+            "unit": "ops/sec",
+            "extra": "P50: 1.6us | P99: 5.0us | P99.9: 7.6us\nthreads: 1 | elapsed: 0.35s | num: 200000 | iterations: 3"
           }
         ]
       }
