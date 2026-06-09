@@ -248,10 +248,7 @@ fn scan_since_resolves_blob_values_on_blob_tree() -> lsm_tree::Result<()> {
         "the big value must be separated"
     );
 
-    let got: Vec<ScanSinceEvent> = tree
-        .scan_since_seqno(0)
-        .expect("blob-tree scan_since_seqno should succeed")
-        .collect();
+    let got: Vec<ScanSinceEvent> = tree.scan_since_seqno(0)?.collect();
 
     // The blob-indirected entry must come back as an Insert carrying the real
     // resolved value, not a pointer.
