@@ -428,12 +428,13 @@ pub struct Config {
     /// by ~90% typically
     pub(crate) expect_point_read_hits: bool,
 
-    /// Per-block Reed-Solomon Page ECC. When `true`, every block on
-    /// disk carries a Reed-Solomon parity trailer; on read, if the
-    /// block's XXH3 disagrees with the on-disk bytes, the reader
-    /// attempts RS recovery before surfacing the corruption. Requires
-    /// the `page_ecc` cargo feature — opening a tree with
-    /// `page_ecc = true` on a build without the feature returns
+    /// Per-block Page ECC. When `true`, every block on disk carries a parity
+    /// trailer; on read, if the block's XXH3 disagrees with the on-disk bytes,
+    /// the reader attempts recovery from the trailer before surfacing the
+    /// corruption. The correction scheme is selected at runtime
+    /// (`update_runtime_config`): Reed-Solomon (the default), single XOR parity,
+    /// or per-word SEC-DED. Requires the `page_ecc` cargo feature — opening a
+    /// tree with `page_ecc = true` on a build without the feature returns
     /// [`crate::Error::PageEccUnsupported`].
     ///
     /// Off by default. `RocksDB` ships per-block ECC as an operator-
@@ -1111,12 +1112,14 @@ impl Config {
         self
     }
 
-    /// Enables per-block Reed-Solomon Page ECC.
+    /// Enables per-block Page ECC.
     ///
-    /// When enabled, every block written by this tree carries a
-    /// Reed-Solomon parity trailer; on read, if the block's XXH3
-    /// disagrees with the on-disk bytes, the reader attempts RS
-    /// recovery before surfacing the corruption.
+    /// When enabled, every block written by this tree carries a parity
+    /// trailer; on read, if the block's XXH3 disagrees with the on-disk
+    /// bytes, the reader attempts recovery from the trailer before surfacing
+    /// the corruption. The correction scheme defaults to Reed-Solomon and is
+    /// selectable at runtime (`update_runtime_config`): Reed-Solomon, single
+    /// XOR parity, or per-word SEC-DED.
     ///
     /// Opening a tree with `page_ecc = true` on a build that does not
     /// have the `page_ecc` cargo feature enabled returns
@@ -1128,9 +1131,9 @@ impl Config {
     /// at every `Tree::open` / `Tree::ingestion` / compaction-worker
     /// `MultiWriter` construction site. With this flag set, every
     /// `Block::write_into` call those writers make upgrades its
-    /// `BlockTransform` to the matching `*Ecc` variant — emitting a
-    /// Reed-Solomon parity trailer and setting the `ECC_PARITY` flag in
-    /// each block header (the trailer length is derived from
+    /// `BlockTransform` to the matching `*Ecc` variant — emitting the
+    /// configured scheme's parity trailer and setting the `ECC_PARITY` flag
+    /// in each block header (the trailer length is derived from
     /// `data_length`, not stored).
     #[must_use]
     pub fn page_ecc(mut self, enabled: bool) -> Self {
@@ -1141,11 +1144,13 @@ impl Config {
     /// Sets the Page ECC scheme used when [`Self::page_ecc`] is enabled.
     ///
     /// ECC is off until `page_ecc(true)`. When on, this picks the
-    /// algorithm: [`EccScheme::Xor`] (RAID-5 single-parity) or
-    /// [`EccScheme::ReedSolomon`]. The default
-    /// [`EccScheme::Secded`](crate::runtime_config::EccScheme::Secded) is
-    /// not yet wired (#255), so enabling ECC without choosing a shard
-    /// scheme fails validation — pick `Xor`/`ReedSolomon` explicitly.
+    /// algorithm:
+    /// [`EccScheme::Secded`](crate::runtime_config::EccScheme::Secded)
+    /// (per-word single-bit correct / double-bit detect, the default, supported
+    /// at Block granularity),
+    /// [`EccScheme::Xor`](crate::runtime_config::EccScheme::Xor) (RAID-5
+    /// single-parity), or
+    /// [`EccScheme::ReedSolomon`](crate::runtime_config::EccScheme::ReedSolomon).
     /// There is no implicit RS(4,2) default.
     #[must_use]
     pub fn ecc_scheme(mut self, scheme: crate::runtime_config::EccScheme) -> Self {

@@ -288,13 +288,13 @@ pub enum KvChecksumComputePoint {
 /// cheapest-first — pick the lowest tier that covers the failure mode you
 /// care about. The engine never defaults to a high-overhead scheme.
 ///
-/// - [`Self::Secded`] — Hamming SECDED, per word: single-bit correct +
-///   double-bit detect, the cheapest tier (~1-3% overhead). It is the
-///   placeholder default while ECC is OFF, NOT a valid enabled-state
-///   scheme yet: it is not wired (#255), so enabling ECC with `Secded` is
-///   rejected and an enabled config must pick [`Self::Xor`] /
-///   [`Self::ReedSolomon`] explicitly. Matches the dominant single-bit-rot
-///   failure mode of DRAM and disks.
+/// - [`Self::Secded`] — Hsiao SECDED, per word: single-bit correct +
+///   double-bit detect (the default `(72, 64)` shape is 12.5% overhead). It
+///   is the type-level default and is supported at [`EccGranularity::Block`]:
+///   on a block checksum mismatch the SEC-DED trailer heals an isolated bit
+///   flip before the heavier shard recovery. Page granularity is not yet
+///   wired, so an enabled `Secded` config must use Block granularity. Matches
+///   the dominant single-bit-rot failure mode of DRAM and disks.
 /// - [`Self::Xor`] — one XOR parity shard over `data_shards` data shards
 ///   (RAID-5 equivalent): recovers one fully-lost shard. Overhead =
 ///   `1 / data_shards` (e.g. 10 → 10%). XOR is computed directly (no RS
@@ -307,11 +307,10 @@ pub enum KvChecksumComputePoint {
 // no-std: pure data — compiles under `--no-default-features --features alloc`.
 #[derive(Copy, Clone, Debug, Default, Eq, PartialEq, Hash)]
 pub enum EccScheme {
-    /// Hamming SECDED per word — single-bit correct, double-bit detect.
-    /// Cheapest tier and the type-level default, but valid only while ECC
-    /// is OFF: enabling ECC with `Secded` is rejected until the SECDED read
-    /// path lands (#255), so an enabled config must pick [`Self::Xor`] /
-    /// [`Self::ReedSolomon`].
+    /// Hsiao SECDED per word — single-bit correct, double-bit detect (the
+    /// default `(72, 64)` shape is 12.5% overhead). The type-level default;
+    /// supported when ECC is enabled at [`EccGranularity::Block`]. Page
+    /// granularity is not yet wired for `Secded`.
     #[default]
     Secded,
 

@@ -1482,10 +1482,9 @@ struct MetaSectionParams<'a> {
 /// Resolves a `(page_ecc, EccScheme)` config pair into the per-block
 /// [`EccParams`](crate::table::block::EccParams) the writer emits.
 ///
-/// `page_ecc == false` → `None` (no parity). A shard scheme
-/// (`Xor` / `ReedSolomon`) maps to its `(data_shards, parity_shards)`.
-/// `Secded` has no shard layout (it is per-word, gated until #255) and
-/// resolves to `None` — there is no implicit RS(4,2) fallback.
+/// `page_ecc == false` → `None` (no parity). `Secded` maps to the per-word
+/// SEC-DED scheme; a shard scheme (`Xor` / `ReedSolomon`) maps to its
+/// `(data_shards, parity_shards)`. There is no implicit RS(4,2) fallback.
 #[must_use]
 #[expect(
     clippy::expect_used,
@@ -1497,8 +1496,15 @@ pub(crate) fn resolve_ecc(
     page_ecc: bool,
     scheme: crate::runtime_config::EccScheme,
 ) -> Option<crate::table::block::EccParams> {
-    if !page_ecc {
+    // Without the `page_ecc` feature the parity codecs are not compiled, so no
+    // block can actually carry a trailer; returning `None` keeps the stored
+    // writer state (`self.ecc`) aligned with the real on-disk layout instead of
+    // pushing a compensating feature guard into every consumer.
+    if !page_ecc || !cfg!(feature = "page_ecc") {
         return None;
+    }
+    if matches!(scheme, crate::runtime_config::EccScheme::Secded) {
+        return Some(crate::table::block::EccParams::SECDED);
     }
     scheme.shard_params().map(|(data, parity)| {
         #[expect(
@@ -1549,16 +1555,24 @@ fn write_meta_section<W: std::io::Write + std::io::Seek>(
     // else Reed-Solomon); granularity is Block (the only level today).
     let ecc_descriptor = {
         use crate::runtime_config::{EccGranularity, EccScheme};
+        use crate::table::block::EccParams;
         let cfg = effective_ecc.map(|p| {
-            let scheme = if p.parity_shards() == 1 {
-                EccScheme::Xor {
-                    data_shards: p.data_shards(),
-                }
-            } else {
-                EccScheme::ReedSolomon {
-                    data_shards: p.data_shards(),
-                    parity_shards: p.parity_shards(),
-                }
+            // Branch on the scheme: the shard accessors panic on the per-word
+            // SEC-DED variant, so match it explicitly. (SEC-DED carries no
+            // shard counts; its descriptor is kind=1.)
+            let scheme = match p {
+                EccParams::Secded => EccScheme::Secded,
+                EccParams::Shard {
+                    data_shards,
+                    parity_shards: 1,
+                } => EccScheme::Xor { data_shards },
+                EccParams::Shard {
+                    data_shards,
+                    parity_shards,
+                } => EccScheme::ReedSolomon {
+                    data_shards,
+                    parity_shards,
+                },
             };
             (scheme, EccGranularity::Block)
         });

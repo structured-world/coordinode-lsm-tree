@@ -661,6 +661,57 @@ fn tree_page_ecc_xor_scheme_roundtrips_via_descriptor() -> lsm_tree::Result<()> 
     Ok(())
 }
 
+/// Full-tree write + reopen under the per-word SEC-DED scheme. Exercises the
+/// table writer's metadata-serialization path (`write_meta_section`), which
+/// must emit the SEC-DED descriptor (kind=1) without touching the shard
+/// accessors — those panic on the SEC-DED variant, so a SEC-DED table write
+/// would otherwise die in `finish()`. Block-level tests do not cover this path.
+#[cfg(feature = "page_ecc")]
+#[test]
+fn tree_page_ecc_secded_scheme_roundtrips_via_descriptor() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let path = folder.path();
+
+    {
+        let tree = Config::new(
+            path,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .page_ecc(true)
+        .ecc_scheme(lsm_tree::runtime_config::EccScheme::Secded)
+        .open()?;
+
+        for i in 0u64..2_000 {
+            tree.insert(format!("k{i:08}"), format!("v{i:08}"), i);
+        }
+        // Without the write_meta_section SEC-DED branch this flush panics
+        // serializing the page-ecc descriptor.
+        tree.flush_active_memtable(2_000)?;
+    }
+
+    {
+        // Default reopen: the reader sizes + skips each block's SEC-DED parity
+        // trailer (one byte per 8-byte word) from the on-disk descriptor.
+        let tree = Config::new(
+            path,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .open()?;
+
+        for i in 0u64..2_000 {
+            assert_eq!(
+                Some(format!("v{i:08}").as_bytes().into()),
+                tree.get(format!("k{i:08}"), 2_001)?,
+                "key k{i:08} must read back under the on-disk SEC-DED scheme",
+            );
+        }
+    }
+
+    Ok(())
+}
+
 /// Strict on-disk check that `Config::page_ecc(true)` produces
 /// SST data blocks carrying a parity trailer (not just that the round
 /// trip succeeds).

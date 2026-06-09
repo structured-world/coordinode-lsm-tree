@@ -87,24 +87,45 @@ use crate::{CompressionType, encryption::EncryptionProvider};
 /// Both shard counts are non-zero by construction: the only public
 /// constructor is [`Self::try_new`], which rejects a zero in either
 /// position (a zero-shard layout is non-recoverable and would serialize
-/// to a descriptor that the read path rejects on reopen). The fields are
-/// private so an external caller cannot bypass that check by building the
-/// struct literally and feeding it to a `*Ecc` transform variant.
+/// to a descriptor that the read path rejects on reopen). The enum is
+/// `#[non_exhaustive]`, so a downstream crate cannot bypass that check
+/// by building a `Shard { .. }` literal and feeding it to a `*Ecc`
+/// transform variant.
+// `non_exhaustive` blocks external struct-literal construction of any variant
+// (e.g. `EccParams::Shard { data_shards: 0, parity_shards: 0 }`), so the
+// non-zero-shard invariant enforced by `try_new` cannot be bypassed by a
+// downstream crate reaching the doc-hidden `table::block` module.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
-pub struct EccParams {
-    /// Number of data shards the block payload is split into (`>= 1`).
-    data_shards: u8,
-    /// Number of parity shards (`1` = XOR single-parity / RAID-5; `>= 1`).
-    parity_shards: u8,
+#[non_exhaustive]
+pub enum EccParams {
+    /// Shard-based parity (XOR single-parity / RAID-5 when `parity_shards ==
+    /// 1`, Reed-Solomon when `>= 2`): the block payload is split into
+    /// `data_shards` shards and `parity_shards` recovery shards are appended.
+    Shard {
+        /// Number of data shards the block payload is split into (`>= 1`).
+        data_shards: u8,
+        /// Number of parity shards (`1` = XOR single-parity / RAID-5; `>= 1`).
+        parity_shards: u8,
+    },
+
+    /// Per-word Hamming SEC-DED (`crate::secded`, `page_ecc`-gated): one check
+    /// byte protects each 8-byte data word, healing a single bit flip and
+    /// detecting a double-bit error. No shard layout — the trailer is one byte
+    /// per word.
+    Secded,
 }
 
 impl EccParams {
     /// Legacy fixed RS(4,2) layout (50% overhead). Default for tests
     /// only; never an implicit production default.
-    pub const RS_4_2: Self = Self {
+    pub const RS_4_2: Self = Self::Shard {
         data_shards: 4,
         parity_shards: 2,
     };
+
+    /// Per-word SEC-DED scheme (12.5% overhead; single-bit correct, double-bit
+    /// detect).
+    pub const SECDED: Self = Self::Secded;
 
     /// Builds a shard layout, rejecting a zero count in either position.
     ///
@@ -126,29 +147,55 @@ impl EccParams {
                 "ecc_scheme parity_shards=0",
             ));
         }
-        Ok(Self {
+        Ok(Self::Shard {
             data_shards,
             parity_shards,
         })
     }
 
     /// Number of data shards the block payload is split into (`>= 1`).
+    ///
+    /// # Panics
+    ///
+    /// Panics on a non-shard scheme; callers that may hold one branch on the
+    /// variant first.
     #[must_use]
     pub const fn data_shards(self) -> u8 {
-        self.data_shards
+        match self {
+            Self::Shard { data_shards, .. } => data_shards,
+            Self::Secded => panic!("EccParams::data_shards on a non-shard (SEC-DED) scheme"),
+        }
     }
 
     /// Number of parity shards (`1` = XOR single-parity / RAID-5; `>= 1`).
+    ///
+    /// # Panics
+    ///
+    /// Panics on a non-shard scheme; callers that may hold one branch on the
+    /// variant first.
     #[must_use]
     pub const fn parity_shards(self) -> u8 {
-        self.parity_shards
+        match self {
+            Self::Shard { parity_shards, .. } => parity_shards,
+            Self::Secded => panic!("EccParams::parity_shards on a non-shard (SEC-DED) scheme"),
+        }
     }
 
     /// `(data_shards, parity_shards)` as `usize`, for the `crate::ecc`
     /// shard-based encode / recover API.
+    ///
+    /// # Panics
+    ///
+    /// Panics on a non-shard scheme; callers branch on the variant first.
     #[must_use]
     pub const fn as_shards(self) -> (usize, usize) {
-        (self.data_shards as usize, self.parity_shards as usize)
+        match self {
+            Self::Shard {
+                data_shards,
+                parity_shards,
+            } => (data_shards as usize, parity_shards as usize),
+            Self::Secded => panic!("EccParams::as_shards on a non-shard (SEC-DED) scheme"),
+        }
     }
 }
 
