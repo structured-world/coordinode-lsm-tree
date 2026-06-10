@@ -128,9 +128,15 @@ mod strategy_tests {
 #[cfg(all(test, feature = "page_ecc"))]
 mod tests {
     use crate::{
-        AbstractTree, Config, MAX_SEQNO, SequenceNumberCounter,
+        AbstractTree,
+        Config,
+        MAX_SEQNO,
+        SequenceNumberCounter,
         runtime_config::EccScheme,
-        table::{block::Header, block_index::BlockIndex},
+        // `BlockIndex` is imported only for its `.iter()` method on
+        // `table.block_index` (a trait method); `as _` keeps it in scope for
+        // method resolution without binding the unused type name.
+        table::{block::Header, block_index::BlockIndex as _},
     };
     use alloc::sync::Arc;
 
