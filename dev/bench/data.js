@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1781063712367,
+  "lastUpdate": 1781080272580,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -14820,6 +14820,84 @@ window.BENCHMARK_DATA = {
             "value": 549021.0656555434,
             "unit": "ops/sec",
             "extra": "P50: 1.6us | P99: 5.1us | P99.9: 7.6us\nthreads: 1 | elapsed: 0.36s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "d5c0974ffdf71b28a2bf97b9620ebcb150b3339d",
+          "message": "feat(ecc): self-heal SSTs after a parity-corrected read (#446)\n\n## Summary\n\nWhen a block read recovers its payload from Page-ECC parity, the\nreturned bytes are correct but the on-disk copy is still faulty, so the\nsame latent fault is re-corrected on every future read. This adds opt-in\nself-healing: a corrected read (confirmed persistent) flags the owning\nSST, and a compaction strategy rewrites it clean.\n\nBecause SSTs are immutable, \"rewrite the corrected block\" means\nrecompacting the owning SST: the corrected data flows into a fresh SST\nwith newly computed parity, and the faulty source is dropped. No\nin-place mutation.\n\n## What's included\n\n- **Correction signal** — block reads report `EccStatus::Corrected` when\nparity repaired the payload.\n- **Persistence confirmation** — on a corrected read the loader re-reads\nthe block straight from disk (cache-bypassing) to distinguish a\npersistent medium fault (re-read again recovers) from a transient\nread-path glitch (re-read clean), and flags the SST only on confirmed\npersistence. Transients cost no rewrite.\n- **Heal queue** — `HealHints`, a tree-wide, dedup-by-SST set (no-std +\nalloc), installed into every table.\n- **Heal strategy** — `compaction::EccHeal` claims one flagged SST per\npass and merges it back into its own level; the merge re-reads\n(correcting on the way in) and writes fresh parity. Drive it via\n`Tree::heal_hints()` + `Tree::compact`, leader-only in a clustered\ndeployment.\n- **Opt-in gate** — `RuntimeConfig::auto_heal` (default **false**):\ncorrection-on-read still happens whenever ECC is enabled; only the\npersistence re-read + scheduling are gated. The gate tracks the runtime\nflag at open and on update.\n- **Metric** — `ecc_auto_heal_scheduled` (+ accessor).\n\n## Tests\n\n- Persistent corrected read flags the SST; a disabled gate corrects but\nflags nothing.\n- End-to-end (page_ecc): corrupt a data block, read repairs + flags, run\n`EccHeal`, then the re-read is clean and flags nothing.\n- Queue dedup + drain.\n\nFull lib suite green (1407).\n\n## Follow-ups (not in this change)\n\n- Scheduling on **index-block** corrections: the read path wires the\nheal sink through the data-block paths (point read + scan). Index-block\nreaders are built before the tree installs the sink, so wiring them\nneeds a live sink reference rather than a captured one; tracked\nseparately. Index-block faults still heal on read, just without\nproactive scheduling.\n- A transient-vs-persistent unit test needs a fault-injecting filesystem\n(the re-read currently can only be exercised for the persistent case).\n\nPart of #411",
+          "timestamp": "2026-06-10T11:13:43+03:00",
+          "tree_id": "83a0b103f441465f8fbba4fa8a0d56ba355148d6",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/d5c0974ffdf71b28a2bf97b9620ebcb150b3339d"
+        },
+        "date": 1781080260416,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 2034771.1046306363,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.6us | P99.9: 3.7us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1225382.9300212115,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.3us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 668689.0587718704,
+            "unit": "ops/sec",
+            "extra": "P50: 1.4us | P99: 4.7us | P99.9: 7.1us\nthreads: 1 | elapsed: 0.30s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3638659.9615866668,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 3.2us | P99.9: 5.8us\nthreads: 1 | elapsed: 0.05s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 440903.6267804237,
+            "unit": "ops/sec",
+            "extra": "P50: 2.0us | P99: 5.6us | P99.9: 8.5us\nthreads: 1 | elapsed: 0.45s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 222596.37655703913,
+            "unit": "ops/sec",
+            "extra": "P50: 4.2us | P99: 5.3us | P99.9: 8.6us\nthreads: 1 | elapsed: 0.90s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1262359.5811952935,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.6us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1117845.8904008332,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.5us | P99.9: 2.8us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 559660.0792576612,
+            "unit": "ops/sec",
+            "extra": "P50: 1.6us | P99: 5.2us | P99.9: 7.8us\nthreads: 1 | elapsed: 0.36s | num: 200000 | iterations: 3"
           }
         ]
       }
