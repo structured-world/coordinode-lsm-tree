@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1781084424725,
+  "lastUpdate": 1781119614741,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -14976,6 +14976,84 @@ window.BENCHMARK_DATA = {
             "value": 554513.2923712146,
             "unit": "ops/sec",
             "extra": "P50: 1.6us | P99: 5.1us | P99.9: 7.8us\nthreads: 1 | elapsed: 0.36s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "e283a1fa8ab2e267b7f053e320e03296dccabfd4",
+          "message": "feat(cache): replace quick_cache with in-tree sharded S3-FIFO cache (#429) (#448)\n\n## Summary\n\nReplaces `quick_cache` — the last std-only **dependency** blocking a\n`no_std + alloc` build — with an in-tree sharded cache that serves both\ntargets from one implementation. std stays the primary high-perf build;\nthe cache now also has a working `no_std` path.\n\n- **Per-shard byte-weighted S3-FIFO** eviction (small / main / ghost\nFIFO queues + a 2-bit frequency counter). S3-FIFO is uniquely suited to\na lock-free read path: a read only bumps an `AtomicU8` and never\nreorders a queue (promotion happens lazily at eviction), so `get` /\n`peek` run under a **shared** lock and proceed concurrently. O(1)\nremoval via lazy tombstoning.\n- **Concurrency:** N shards (key hash high-bits → shard), each behind an\n`RwLock` — `parking_lot::RwLock` under `std`, `spin::RwLock` under\n`no_std`. Writes are exclusive; reads shared. `weight()` sums shard\ntallies under read locks (no `AtomicU64` — unavailable on 32-bit no-std\ntargets).\n- Ports both call sites: block/blob cache (byte-weighted) and\ndescriptor/FD cache (unit-weighted). Drops `quick_cache`; adds\n`hashbrown` (no_std map) + `parking_lot` (std lock) as direct deps.\n\n## Testing\n\n- Full suite `--all-features`: **2052 passed, 0 failed**\n- 9 cache unit tests (eviction correctness, hot-key retention under\nchurn, oversized entry, unit-weighter) + an 8-thread concurrent stress\ntest asserting weight/len consistency\n- `cargo clippy --all-features` and `--no-default-features --features\nzstd,lz4 --all-targets` both clean\n\n## Performance (vs main / quick_cache)\n\nWarm point reads through a `Tree` with a block cache large enough to\nhold the dataset (every read a cache hit, isolating the cache get path),\ncriterion:\n\n| bench | this PR (S3-FIFO) | main (quick_cache) |\n|-------|-------------------|--------------------|\n| warm_point_read_sequential | 884 ns | 887 ns |\n| warm_point_read_random | 1.090 µs | 1.086 µs |\n\nParity — both within run-to-run noise, no regression on the hot read\npath.\n\n## no-std impact (read carefully)\n\n`sharded_cache` compiles **clean (0 errors)** on `thumbv7em-none-eabihf`\n(`--no-default-features --features alloc`), and `quick_cache` (a\ndependency that could not compile for no-std at all) is gone.\n\n⚠️ The `no-std-check` raw error count **rises** on this PR (≈582 →\n≈1408), and this is **un-masking, not regression**: on main `cargo\ncheck` aborted at the `quick_cache` dependency (so it never reached\nlsm-tree's own code, reporting only quick_cache's ~600 errors). With\nquick_cache removed, the check now proceeds *past the dependency layer*\ninto lsm-tree's own still-std-bound modules, surfacing the pre-existing\nfirst-party backlog (tracked under #358 / #274). There are now **no\nexternal dependency blockers left** — every remaining no-std error is\nfirst-party code to port.\n\nCloses #429\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n## Summary by CodeRabbit\n\n* **New Features**\n* Added a sharded, byte-weighted in-memory cache with\nget/peek/insert/remove, capacity reporting, and public cache/weighter\ntypes for integration.\n\n* **Performance Improvements**\n* Sharded S3‑FIFO eviction with frequency-aware promotion improves read\nthroughput, latency stability, and memory efficiency under concurrent\naccess.\n\n* **Tests**\n* Added unit tests for cache correctness and benchmarks measuring\nthroughput plus per-operation latency (P50/P99/P999) for warm point\nreads.\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-06-10T22:14:12+03:00",
+          "tree_id": "7d4b6b3555d742faea435c93e8298a58a5e7cfe8",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/e283a1fa8ab2e267b7f053e320e03296dccabfd4"
+        },
+        "date": 1781119600849,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 2100106.4239430865,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.6us | P99.9: 3.7us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1222319.1616386669,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.3us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 659303.9252443761,
+            "unit": "ops/sec",
+            "extra": "P50: 1.4us | P99: 4.6us | P99.9: 7.0us\nthreads: 1 | elapsed: 0.30s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3639073.4889784474,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 3.2us | P99.9: 5.7us\nthreads: 1 | elapsed: 0.05s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 438577.6824009714,
+            "unit": "ops/sec",
+            "extra": "P50: 2.0us | P99: 5.3us | P99.9: 8.2us\nthreads: 1 | elapsed: 0.46s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 221608.5784654131,
+            "unit": "ops/sec",
+            "extra": "P50: 4.2us | P99: 5.3us | P99.9: 8.0us\nthreads: 1 | elapsed: 0.90s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1209655.2016957914,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.2us | P99.9: 4.7us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1149949.5850602414,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 1.5us | P99.9: 2.6us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 559869.8253387543,
+            "unit": "ops/sec",
+            "extra": "P50: 1.6us | P99: 4.9us | P99.9: 7.4us\nthreads: 1 | elapsed: 0.36s | num: 200000 | iterations: 3"
           }
         ]
       }
