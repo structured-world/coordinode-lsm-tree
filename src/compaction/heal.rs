@@ -213,6 +213,12 @@ mod tests {
             !tree.heal_hints().is_empty(),
             "a persistent ECC correction must record a heal hint",
         );
+        #[cfg(feature = "metrics")]
+        assert_eq!(
+            tree.metrics().ecc_auto_heal_scheduled_count(),
+            1,
+            "the scheduled SST is counted once",
+        );
 
         // Run the heal strategy: it claims the SST and rewrites it clean.
         let result = tree.compact(
