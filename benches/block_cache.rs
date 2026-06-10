@@ -101,16 +101,19 @@ fn report_percentiles(name: &str, samples: &mut [Duration]) {
         return;
     }
     samples.sort_unstable();
-    let at = |p: f64| {
-        // Nearest-rank: index of the p-quantile in the sorted slice.
-        let idx = (((samples.len() - 1) as f64) * p).round() as usize;
+    // Nearest-rank in pure integer math: round((n-1) * num / den), no float cast
+    // (lossy f64→usize). `n * num` can't overflow usize on any realistic sample
+    // count (n is a few million, num ≤ 999), so plain `*` is provably safe here.
+    let at = |num: usize, den: usize| {
+        let n = samples.len() - 1;
+        let idx = (n * num + den / 2) / den;
         samples[idx]
     };
     eprintln!(
         "{name}: P50={:?} P99={:?} P999={:?} max={:?} (n={})",
-        at(0.50),
-        at(0.99),
-        at(0.999),
+        at(50, 100),
+        at(99, 100),
+        at(999, 1000),
         samples[samples.len() - 1],
         samples.len(),
     );
