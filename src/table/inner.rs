@@ -130,6 +130,18 @@ pub struct Inner {
     // alloc-friendly, matching `deletion_pause`.
     #[cfg(feature = "std")]
     pub(crate) background_deleter: once_cell::race::OnceBox<Arc<crate::BackgroundDeleter>>,
+
+    /// Tree-wide ECC heal-hint sink. Installed once by
+    /// [`Table::install_heal_hints`](super::Table::install_heal_hints) after the
+    /// table joins a tree. When present, a block read that is ECC-corrected and
+    /// confirmed persistent (via a cache-bypassing re-read) records this SST's
+    /// id so the compaction picker can rewrite it clean. Absent before the table
+    /// is tree-owned: corrections are still returned to the caller, they are
+    /// just not scheduled for healing.
+    // alloc-friendly `OnceBox` (not `std::sync::OnceLock`) so the field does not
+    // pin `Inner` to std, matching `deletion_pause`. The hint set itself is
+    // `no_std` + alloc (see `crate::heal_hints`).
+    pub(crate) heal_hints: once_cell::race::OnceBox<Arc<crate::heal_hints::HealHints>>,
 }
 
 impl Inner {

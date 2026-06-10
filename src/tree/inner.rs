@@ -96,6 +96,13 @@ pub struct TreeInner {
     #[cfg(feature = "std")]
     pub(crate) background_deleter: Arc<crate::BackgroundDeleter>,
 
+    /// Tree-wide ECC heal-hint sink. A block read that recovers a payload from
+    /// its Page-ECC parity, and confirms the on-disk fault is persistent via a
+    /// cache-bypassing re-read, records the SST id here. The compaction picker
+    /// drains it to rewrite the faulty file clean. Installed into every table so
+    /// the read path can record without a back-reference to the tree.
+    pub(crate) heal_hints: Arc<crate::heal_hints::HealHints>,
+
     /// Runtime-toggleable configuration. Lockless atomic snapshot.
     ///
     /// Reachable through the public Tree API
@@ -181,6 +188,7 @@ impl TreeInner {
             deletion_pause: DeletionPause::new_shared(),
             #[cfg(feature = "std")]
             background_deleter: Arc::new(crate::BackgroundDeleter::new(None)),
+            heal_hints: crate::heal_hints::HealHints::new_shared(),
             runtime_config: Arc::new(RuntimeConfigHandle::new((*initial_runtime).clone())),
 
             #[cfg(feature = "metrics")]

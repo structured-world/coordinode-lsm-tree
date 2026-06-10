@@ -2131,6 +2131,7 @@ fn load_block_range_tombstone_metrics() -> crate::Result<()> {
         None,
         #[cfg(zstd_any)]
         None,
+        None,
         #[cfg(feature = "metrics")]
         &metrics,
     )?;
@@ -2152,6 +2153,7 @@ fn load_block_range_tombstone_metrics() -> crate::Result<()> {
         None,
         None,
         #[cfg(zstd_any)]
+        None,
         None,
         #[cfg(feature = "metrics")]
         &metrics,
@@ -2236,6 +2238,7 @@ fn load_block_cache_hit_rejects_wrong_block_type() -> crate::Result<()> {
         None,
         #[cfg(zstd_any)]
         None,
+        None,
         #[cfg(feature = "metrics")]
         &metrics,
     )?;
@@ -2255,6 +2258,7 @@ fn load_block_cache_hit_rejects_wrong_block_type() -> crate::Result<()> {
         None,
         #[cfg(zstd_any)]
         None,
+        None,
         #[cfg(feature = "metrics")]
         &metrics,
     );
@@ -2263,6 +2267,160 @@ fn load_block_cache_hit_rejects_wrong_block_type() -> crate::Result<()> {
         matches!(&result, Err(crate::Error::InvalidTag(("BlockType", _)))),
         "expected InvalidTag for block type mismatch on cache hit, got Ok or wrong Err",
     );
+
+    Ok(())
+}
+
+/// A read that recovers a data block from its Page-ECC parity, and confirms the
+/// on-disk fault persists across a cache-bypassing re-read, must record the SST
+/// in the heal sink for a healing recompaction. A clean read records nothing.
+#[cfg(feature = "page_ecc")]
+#[test]
+fn load_block_records_heal_hint_on_persistent_ecc_correction() -> crate::Result<()> {
+    use crate::{
+        Cache, InternalValue,
+        descriptor_table::DescriptorTable,
+        fs::StdFs,
+        heal_hints::HealHints,
+        table::{
+            BlockHandle,
+            block::{BlockType, EccParams, Header},
+            util::load_block,
+        },
+    };
+
+    let dir = tempdir()?;
+    let file = dir.path().join("table");
+
+    // Build a table whose data blocks carry RS(4,2) parity.
+    let scheme = EccParams::RS_4_2;
+    let mut writer = Writer::new(file.clone(), 0, 0, Arc::new(StdFs))?.use_ecc(Some(scheme));
+    for i in 0..200u32 {
+        let key = format!("key{i:05}");
+        writer.write(InternalValue::from_components(
+            key.as_bytes(),
+            b"value-payload-bytes",
+            u64::from(i) + 1,
+            crate::ValueType::Value,
+        ))?;
+    }
+    #[expect(
+        clippy::unwrap_used,
+        reason = "finish() returns Some after writing items"
+    )]
+    let (_, checksum) = writer.finish()?.unwrap();
+
+    let metrics = Arc::new(crate::metrics::Metrics::default());
+    let table = Table::recover(
+        file.clone(),
+        checksum,
+        0,
+        0,
+        0,
+        Arc::new(Cache::with_capacity_bytes(10_000_000)),
+        Some(Arc::new(DescriptorTable::new(10))),
+        Arc::new(StdFs),
+        false,
+        false,
+        None,
+        #[cfg(zstd_any)]
+        None,
+        crate::comparator::default_comparator(),
+        #[cfg(feature = "metrics")]
+        metrics.clone(),
+    )?;
+
+    let table_id = table.global_id();
+    let compression = table.metadata.data_block_compression;
+
+    // First data block.
+    #[expect(clippy::unwrap_used, reason = "table has at least one data block")]
+    let keyed = table.block_index.iter().next().unwrap()?;
+    let handle = BlockHandle::new(keyed.offset(), keyed.size());
+
+    // Clean read with a sink installed: a non-corrected read records nothing.
+    {
+        let clean_sink = HealHints::default();
+        let fresh_cache = Cache::with_capacity_bytes(10_000_000);
+        let _block = load_block(
+            table_id,
+            &table.path,
+            &table.file_accessor,
+            &fresh_cache,
+            &handle,
+            BlockType::Data,
+            compression,
+            None,
+            table.metadata.ecc_params,
+            #[cfg(zstd_any)]
+            None,
+            Some(&clean_sink),
+            #[cfg(feature = "metrics")]
+            &metrics,
+        )?;
+        assert!(
+            clean_sink.snapshot().is_empty(),
+            "a clean read must not record a heal hint",
+        );
+    }
+
+    // Flip one payload byte of the first data block so the read must repair it
+    // via RS parity, and drop any cached fd so the re-read re-opens the tampered
+    // file from disk (confirming the fault is persistent).
+    let mut bytes = std::fs::read(&file)?;
+    let pos = handle.offset().0 as usize + Header::MIN_LEN + 3;
+    bytes[pos] ^= 0x80;
+    std::fs::write(&file, &bytes)?;
+    table.file_accessor.remove_for_table(&table_id);
+
+    let sink = HealHints::default();
+    let fresh_cache = Cache::with_capacity_bytes(10_000_000);
+    let block = load_block(
+        table_id,
+        &table.path,
+        &table.file_accessor,
+        &fresh_cache,
+        &handle,
+        BlockType::Data,
+        compression,
+        None,
+        table.metadata.ecc_params,
+        #[cfg(zstd_any)]
+        None,
+        Some(&sink),
+        #[cfg(feature = "metrics")]
+        &metrics,
+    )?;
+    assert_eq!(
+        block.header.block_type,
+        BlockType::Data,
+        "repaired read still yields a valid data block",
+    );
+    assert_eq!(
+        sink.snapshot(),
+        vec![table_id],
+        "a persistent ECC correction must queue the SST for healing",
+    );
+
+    // Passing no sink (None) must not panic and must still return repaired data.
+    table.file_accessor.remove_for_table(&table_id);
+    let fresh_cache = Cache::with_capacity_bytes(10_000_000);
+    let _block = load_block(
+        table_id,
+        &table.path,
+        &table.file_accessor,
+        &fresh_cache,
+        &handle,
+        BlockType::Data,
+        compression,
+        None,
+        table.metadata.ecc_params,
+        #[cfg(zstd_any)]
+        None,
+        None,
+        #[cfg(feature = "metrics")]
+        &metrics,
+    )?;
 
     Ok(())
 }

@@ -658,6 +658,7 @@ impl AbstractTree for Tree {
             table.install_deletion_pause(Arc::clone(&self.deletion_pause));
             #[cfg(feature = "std")]
             table.install_background_deleter(Arc::clone(&self.background_deleter));
+            table.install_heal_hints(Arc::clone(&self.heal_hints));
         }
         if let Some(bfs) = blob_files {
             for bf in bfs {
@@ -2349,6 +2350,7 @@ impl Tree {
         let deletion_pause = crate::deletion_pause::DeletionPause::new_shared();
         #[cfg(feature = "std")]
         let background_deleter = Arc::new(crate::BackgroundDeleter::new(None));
+        let heal_hints = crate::heal_hints::HealHints::new_shared();
 
         // Clone the seed snapshot BEFORE moving config into the Arc
         // below — the runtime handle initializer needs it after the
@@ -2380,6 +2382,7 @@ impl Tree {
             deletion_pause: Arc::clone(&deletion_pause),
             #[cfg(feature = "std")]
             background_deleter: Arc::clone(&background_deleter),
+            heal_hints: Arc::clone(&heal_hints),
             runtime_config: Arc::new(crate::runtime_config::handle::RuntimeConfigHandle::new(
                 initial_runtime,
             )),
@@ -2409,6 +2412,7 @@ impl Tree {
             table.install_deletion_pause(Arc::clone(&deletion_pause));
             #[cfg(feature = "std")]
             table.install_background_deleter(Arc::clone(&background_deleter));
+            table.install_heal_hints(Arc::clone(&heal_hints));
         }
         for blob_file in &recovered_blobs {
             blob_file.install_deletion_pause(Arc::clone(&deletion_pause));

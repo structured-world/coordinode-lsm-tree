@@ -162,6 +162,10 @@ pub struct Iter {
     /// Per-SST Page-ECC scheme from table metadata; the block reader needs
     /// it to size + recover the parity trailer. `None` = no parity.
     ecc: Option<crate::table::block::EccParams>,
+    /// Tree-wide ECC heal sink. A scan that recovers a data block from parity
+    /// records this SST here (on confirmed persistence) for a healing
+    /// recompaction. `None` before the table is tree-owned.
+    heal_hints: Option<Arc<crate::heal_hints::HealHints>>,
     /// Per-SST per-KV-footer flag from table metadata
     /// (`kv_checksum_algo.is_some()`); data blocks omit the `block_flags` byte,
     /// so `from_loaded` is told here whether to strip a footer.
@@ -215,6 +219,7 @@ impl Iter {
         compression: CompressionType,
         encryption: Option<Arc<dyn EncryptionProvider>>,
         ecc: Option<crate::table::block::EccParams>,
+        heal_hints: Option<Arc<crate::heal_hints::HealHints>>,
         has_kv_footer: bool,
         #[cfg(zstd_any)] zstd_dictionary: Option<Arc<crate::compression::ZstdDictionary>>,
         comparator: SharedComparator,
@@ -234,6 +239,7 @@ impl Iter {
             compression,
             encryption,
             ecc,
+            heal_hints,
             has_kv_footer,
             #[cfg(zstd_any)]
             zstd_dictionary,
@@ -541,6 +547,7 @@ impl Iterator for Iter {
                     self.ecc,
                     #[cfg(zstd_any)]
                     self.zstd_dictionary.as_deref(),
+                    self.heal_hints.as_ref().map(AsRef::as_ref),
                     #[cfg(feature = "metrics")]
                     &self.metrics,
                 ) {
@@ -687,6 +694,7 @@ impl DoubleEndedIterator for Iter {
                     self.ecc,
                     #[cfg(zstd_any)]
                     self.zstd_dictionary.as_deref(),
+                    self.heal_hints.as_ref().map(AsRef::as_ref),
                     #[cfg(feature = "metrics")]
                     &self.metrics,
                 ) {
