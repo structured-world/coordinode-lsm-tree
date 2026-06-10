@@ -74,7 +74,7 @@ pub mod key_chain;
 #[cfg(all(feature = "encryption", zstd_any))]
 pub use block::{
     DecryptedBlock, EncryptedBlockMetadata, decrypt_block, encrypt_block,
-    parse_encrypted_block_metadata,
+    parse_encrypted_block_metadata, reconstruct_block_aad,
 };
 pub use error::DecryptError;
 pub use key_chain::KeyChain;

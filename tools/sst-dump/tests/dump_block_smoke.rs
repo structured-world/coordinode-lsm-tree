@@ -138,3 +138,57 @@ fn dump_block_on_plain_block_reports_not_encrypted() {
         "expected the not-encrypted notice; got:\n{stderr}",
     );
 }
+
+#[test]
+fn dump_block_reconstruct_aad_emits_hex() {
+    let (_dir, sst) = build_encrypted_sst();
+    let out = Command::new(SST_DUMP_BIN)
+        .arg(&sst)
+        .arg("dump-block")
+        .arg("0")
+        .arg("--table-id")
+        .arg("42")
+        .arg("--reconstruct-aad")
+        .output()
+        .expect("spawn sst-dump");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "got:\n{stdout}");
+    // The v1 AAD is 23 bytes → 46 lowercase hex chars between the quotes.
+    let hex = stdout
+        .lines()
+        .find_map(|l| l.strip_prefix("reconstructed_aad: \""))
+        .and_then(|rest| rest.strip_suffix('"'))
+        .unwrap_or_else(|| panic!("no reconstructed_aad line; got:\n{stdout}"));
+    assert_eq!(
+        hex.len(),
+        46,
+        "AAD must be 23 bytes (46 hex chars); got {hex:?}"
+    );
+    assert!(
+        hex.bytes().all(|b| b.is_ascii_hexdigit()),
+        "AAD must be lowercase hex; got {hex:?}",
+    );
+}
+
+#[test]
+fn dump_block_reconstruct_aad_requires_table_id() {
+    let (_dir, sst) = build_encrypted_sst();
+    let out = Command::new(SST_DUMP_BIN)
+        .arg(&sst)
+        .arg("dump-block")
+        .arg("0")
+        .arg("--reconstruct-aad")
+        .output()
+        .expect("spawn sst-dump");
+
+    assert!(
+        !out.status.success(),
+        "--reconstruct-aad without --table-id must exit non-zero",
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("requires --table-id"),
+        "expected the requires-table-id error; got:\n{stderr}",
+    );
+}
