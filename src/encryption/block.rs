@@ -444,6 +444,65 @@ pub fn parse_encrypted_block_metadata(
     })
 }
 
+/// Reconstructs the [`AAD_LEN`]-byte AAD an AEAD verify of this block would
+/// use, from the on-disk `MetadataFrame` plus the caller-supplied `table_id`,
+/// WITHOUT the key.
+///
+/// For offline forensic AEAD verification with an externally-held key: the AAD
+/// is never written to disk, so a key holder needs to rebuild it to check the
+/// tag. The on-disk-mirrored fields (header byte, key epoch, block type, suite,
+/// compression type, dict id, window log, block flags) come from the block;
+/// `table_id` is an AAD-binding field that is NOT stored on disk and must be
+/// supplied from read context (the owning SST's table id).
+///
+/// Note: the block's byte offset and owning tree id are intentionally NOT
+/// bound in the AAD (see [`build`]), so they are not required here — only
+/// `table_id` is.
+///
+/// # Errors
+///
+/// Same envelope-structure errors as [`parse_encrypted_block_metadata`] for a
+/// malformed `MetadataFrame`, plus [`DecryptError::MalformedMetadataFrame`] if
+/// the on-disk block-type byte is not a known [`crate::table::block::BlockType`].
+///
+/// # Examples
+///
+/// ```
+/// use lsm_tree::encryption::{
+///     StaticKeyChain, encrypt_block, reconstruct_block_aad,
+///     aad::{BlockIdentity, BlockType, EncryptionContext, SuiteId},
+/// };
+///
+/// let chain = StaticKeyChain::new().with_key(1, [0x42; 32]);
+/// let ctx = EncryptionContext::v1(1, SuiteId::Aes256Gcm, 0, 0);
+/// let id = BlockIdentity { table_id: 7, block_type: BlockType::Data, dict_id: 0, window_log: 0 };
+/// let sealed = encrypt_block(b"payload bytes", &id, &ctx, &chain).unwrap();
+///
+/// // Reconstruct the AAD with the owning table id (the only AAD field not on disk).
+/// let aad = reconstruct_block_aad(&sealed, 7).unwrap();
+/// assert_eq!(aad.len(), 23);
+/// ```
+pub fn reconstruct_block_aad(bytes: &[u8], table_id: u64) -> Result<[u8; AAD_LEN], DecryptError> {
+    let mut cursor = Cursor::new(bytes);
+    let metadata_payload = read_framed_payload(
+        &mut cursor,
+        Some(METADATA_VARIANT),
+        METADATA_PAYLOAD_LEN_V1,
+        METADATA_PAYLOAD_LEN_V1,
+        DecryptError::MalformedMetadataFrame,
+    )?;
+    let parsed = decode_metadata_payload(&metadata_payload)?;
+    let block_type = crate::table::block::BlockType::try_from(parsed.block_type_byte)
+        .map_err(|_| DecryptError::MalformedMetadataFrame("unknown BlockType byte"))?;
+    let identity = BlockIdentity {
+        table_id,
+        block_type,
+        dict_id: parsed.dict_id,
+        window_log: parsed.window_log,
+    };
+    Ok(build(&parsed.ctx, &identity))
+}
+
 /// Seals `plaintext` into the AAD-bound `MetadataFrame ‖ BodyFrame`
 /// byte sequence.
 ///
@@ -869,6 +928,28 @@ mod tests {
             matches!(err, DecryptError::MalformedBodyFrame(_)),
             "expected MalformedBodyFrame for a truncated body, got {err:?}",
         );
+    }
+
+    #[test]
+    fn reconstruct_aad_matches_seal_with_correct_table_id() {
+        // The AAD is never on disk; offline AEAD verification needs it rebuilt.
+        // Reconstructing with the SAME table_id the block was sealed under must
+        // yield byte-for-byte the AAD encrypt_block used.
+        let sealed = encrypt_block(b"forensic payload bytes", &id(), &ctx(), &chain()).unwrap();
+        let expected = build(&ctx(), &id());
+        let got = reconstruct_block_aad(&sealed, id().table_id).unwrap();
+        assert_eq!(got.len(), AAD_LEN);
+        assert_eq!(
+            got, expected,
+            "reconstructed AAD must match the sealing AAD"
+        );
+
+        // A different table_id binds to a different AAD (table_id IS in the AAD).
+        let other = reconstruct_block_aad(&sealed, id().table_id ^ 1).unwrap();
+        assert_ne!(got, other, "table_id must affect the reconstructed AAD");
+
+        // Malformed input is a typed error, not a panic.
+        assert!(reconstruct_block_aad(b"not a frame", 0).is_err());
     }
 
     #[test]

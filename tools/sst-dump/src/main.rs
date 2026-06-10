@@ -11,7 +11,7 @@
 
 use clap::{Parser, Subcommand};
 use lsm_tree::coding::Decode;
-use lsm_tree::encryption::parse_encrypted_block_metadata;
+use lsm_tree::encryption::{parse_encrypted_block_metadata, reconstruct_block_aad};
 use lsm_tree::inspect::{
     iter_data_block_entries, read_filter_stats, read_table_properties, read_top_level_index_entries,
 };
@@ -209,6 +209,14 @@ enum Command {
         /// context. Echoed in the output when provided.
         #[arg(long)]
         table_id: Option<u64>,
+
+        /// Also emit the AAD bytes (hex) an AEAD verify of this block would
+        /// use, reconstructed from the on-disk metadata plus `--table-id`,
+        /// for offline tag verification with an externally-held key. Requires
+        /// `--table-id` (the only AAD-binding field not stored on disk; the
+        /// v1 AAD binds neither `tree_id` nor the block offset).
+        #[arg(long)]
+        reconstruct_aad: bool,
     },
 }
 
@@ -236,7 +244,8 @@ fn main() -> ExitCode {
             offset,
             tree_id,
             table_id,
-        } => run_dump_block(&cli.path, offset, tree_id, table_id),
+            reconstruct_aad,
+        } => run_dump_block(&cli.path, offset, tree_id, table_id, reconstruct_aad),
     }
 }
 
@@ -832,6 +841,7 @@ fn run_dump_block(
     offset: u64,
     tree_id: Option<u64>,
     table_id: Option<u64>,
+    reconstruct_aad: bool,
 ) -> ExitCode {
     let mut file = match File::open(path) {
         Ok(f) => f,
@@ -917,6 +927,25 @@ fn run_dump_block(
     match table_id {
         Some(t) => println!("  table_id: {t}"),
         None => println!("  table_id: null  # not on disk; pass --table-id"),
+    }
+
+    if reconstruct_aad {
+        // The v1 AAD binds table_id (not tree_id, not block offset), so the
+        // only caller-side input needed to rebuild it is --table-id.
+        let Some(tid) = table_id else {
+            eprintln!(
+                "error: --reconstruct-aad requires --table-id (the AAD binds table_id, \
+                 which is not stored on disk)"
+            );
+            return ExitCode::FAILURE;
+        };
+        match reconstruct_block_aad(&payload, tid) {
+            Ok(aad) => println!("reconstructed_aad: \"{}\"", hex_string(&aad)),
+            Err(e) => {
+                eprintln!("error: reconstruct AAD: {e:?}");
+                return ExitCode::FAILURE;
+            }
+        }
     }
 
     ExitCode::SUCCESS
