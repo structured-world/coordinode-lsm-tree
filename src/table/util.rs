@@ -191,11 +191,16 @@ pub fn load_block(
     }
 
     // ECC recovered this block's payload from parity. The bytes returned below
-    // are correct, but the on-disk copy is still faulty. When a heal sink is
-    // installed, confirm the fault is persistent (a transient read-path glitch
-    // would re-read clean) and queue the SST for a healing recompaction. This
-    // runs only on the cold corrected path, so clean reads pay nothing.
-    if corrected && let Some(hints) = heal_hints {
+    // are correct, but the on-disk copy is still faulty. When auto-heal is on
+    // (sink installed and enabled), confirm the fault is persistent (a transient
+    // read-path glitch would re-read clean) and queue the SST for a healing
+    // recompaction. Gated by `is_enabled` so a disabled tree pays nothing beyond
+    // the correction itself; the whole block only runs on the cold corrected
+    // path anyway, so clean reads pay nothing.
+    if corrected
+        && let Some(hints) = heal_hints
+        && hints.is_enabled()
+    {
         match reread_block_is_corrected(
             table_id,
             path,
@@ -210,6 +215,8 @@ pub fn load_block(
         ) {
             Ok(true) => {
                 if hints.record(table_id) {
+                    #[cfg(feature = "metrics")]
+                    metrics.ecc_auto_heal_scheduled.fetch_add(1, Relaxed);
                     log::warn!(
                         "Persistent ECC correction on table {table_id:?} block {handle:?}; \
                          queued for healing recompaction"

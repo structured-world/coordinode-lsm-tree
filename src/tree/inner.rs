@@ -188,7 +188,7 @@ impl TreeInner {
             deletion_pause: DeletionPause::new_shared(),
             #[cfg(feature = "std")]
             background_deleter: Arc::new(crate::BackgroundDeleter::new(None)),
-            heal_hints: crate::heal_hints::HealHints::new_shared(),
+            heal_hints: crate::heal_hints::HealHints::new_shared(initial_runtime.auto_heal),
             runtime_config: Arc::new(RuntimeConfigHandle::new((*initial_runtime).clone())),
 
             #[cfg(feature = "metrics")]

@@ -1313,7 +1313,12 @@ impl Tree {
         // mutation (currently: `page_ecc = true` on a non-`page_ecc`
         // build) is rejected at update time, not silently swallowed
         // at the next manifest write.
-        self.0.runtime_config.try_update(mutator)
+        self.0.runtime_config.try_update(mutator)?;
+        // Keep the read-path heal gate in sync with `auto_heal`.
+        self.0
+            .heal_hints
+            .set_enabled(self.0.runtime_config.load_full().auto_heal);
+        Ok(())
     }
 
     /// Snapshot of the current runtime config. Cheap atomic load —
@@ -2364,7 +2369,8 @@ impl Tree {
         let deletion_pause = crate::deletion_pause::DeletionPause::new_shared();
         #[cfg(feature = "std")]
         let background_deleter = Arc::new(crate::BackgroundDeleter::new(None));
-        let heal_hints = crate::heal_hints::HealHints::new_shared();
+        let heal_hints =
+            crate::heal_hints::HealHints::new_shared(config.initial_runtime_config.auto_heal);
 
         // Clone the seed snapshot BEFORE moving config into the Arc
         // below — the runtime handle initializer needs it after the

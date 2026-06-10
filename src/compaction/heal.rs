@@ -159,6 +159,14 @@ mod tests {
         };
         assert!(tree.heal_hints().is_empty(), "fresh tree has no hints");
 
+        // Opt into rewrite scheduling (default off). The gate tracks auto_heal.
+        assert!(!tree.heal_hints().is_enabled(), "auto_heal defaults off");
+        tree.update_runtime_config(|c| c.auto_heal = true)?;
+        assert!(
+            tree.heal_hints().is_enabled(),
+            "auto_heal toggle syncs the gate"
+        );
+
         // A read of a key in the corrupted block repairs it (correct value) and
         // records the SST for healing.
         #[expect(clippy::expect_used, reason = "key was inserted before flush")]

@@ -28,6 +28,7 @@ use alloc::collections::BTreeSet;
 use alloc::sync::Arc;
 #[cfg(test)]
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicBool, Ordering};
 use spin::Mutex;
 
 /// Shared set of SSTs awaiting priority recompaction after a confirmed
@@ -44,13 +45,37 @@ use spin::Mutex;
 pub struct HealHints {
     /// SSTs queued for healing recompaction, deduped by id.
     pending: Mutex<BTreeSet<GlobalTableId>>,
+
+    /// Mirrors [`RuntimeConfig::auto_heal`](crate::runtime_config::RuntimeConfig::auto_heal).
+    /// When `false`, the read path skips the persistence re-read and records
+    /// nothing — correction-on-read still happens, only the rewrite scheduling
+    /// is suppressed. The owning tree keeps this in sync with its runtime
+    /// config. Default `false` (scheduling is opt-in).
+    enabled: AtomicBool,
 }
 
 impl HealHints {
-    /// Creates a fresh, empty shared hint set.
+    /// Creates a fresh, empty shared hint set with scheduling set to `enabled`
+    /// (mirrors the tree's initial `auto_heal`).
     #[must_use]
-    pub fn new_shared() -> Arc<Self> {
-        Arc::new(Self::default())
+    pub fn new_shared(enabled: bool) -> Arc<Self> {
+        let hints = Self::default();
+        hints.set_enabled(enabled);
+        Arc::new(hints)
+    }
+
+    /// Returns `true` when rewrite scheduling is enabled (mirrors
+    /// [`RuntimeConfig::auto_heal`](crate::runtime_config::RuntimeConfig::auto_heal)).
+    #[must_use]
+    pub fn is_enabled(&self) -> bool {
+        self.enabled.load(Ordering::Relaxed)
+    }
+
+    /// Enables or disables rewrite scheduling. The owning tree calls this on open
+    /// and on every runtime-config update so the read-path gate tracks
+    /// `auto_heal`.
+    pub fn set_enabled(&self, enabled: bool) {
+        self.enabled.store(enabled, Ordering::Relaxed);
     }
 
     /// Records `id` as needing a healing recompaction.

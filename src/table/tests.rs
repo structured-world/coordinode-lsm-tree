@@ -2338,9 +2338,10 @@ fn load_block_records_heal_hint_on_persistent_ecc_correction() -> crate::Result<
     let keyed = table.block_index.iter().next().unwrap()?;
     let handle = BlockHandle::new(keyed.offset(), keyed.size());
 
-    // Clean read with a sink installed: a non-corrected read records nothing.
+    // Clean read with an enabled sink: a non-corrected read records nothing.
     {
         let clean_sink = HealHints::default();
+        clean_sink.set_enabled(true);
         let fresh_cache = Cache::with_capacity_bytes(10_000_000);
         let _block = load_block(
             table_id,
@@ -2374,6 +2375,7 @@ fn load_block_records_heal_hint_on_persistent_ecc_correction() -> crate::Result<
     table.file_accessor.remove_for_table(&table_id);
 
     let sink = HealHints::default();
+    sink.set_enabled(true);
     let fresh_cache = Cache::with_capacity_bytes(10_000_000);
     let block = load_block(
         table_id,
@@ -2402,10 +2404,11 @@ fn load_block_records_heal_hint_on_persistent_ecc_correction() -> crate::Result<
         "a persistent ECC correction must queue the SST for healing",
     );
 
-    // Passing no sink (None) must not panic and must still return repaired data.
+    // A DISABLED sink (auto_heal off) corrects on read but records nothing.
     table.file_accessor.remove_for_table(&table_id);
+    let off_sink = HealHints::default(); // enabled == false
     let fresh_cache = Cache::with_capacity_bytes(10_000_000);
-    let _block = load_block(
+    let block = load_block(
         table_id,
         &table.path,
         &table.file_accessor,
@@ -2417,10 +2420,19 @@ fn load_block_records_heal_hint_on_persistent_ecc_correction() -> crate::Result<
         table.metadata.ecc_params,
         #[cfg(zstd_any)]
         None,
-        None,
+        Some(&off_sink),
         #[cfg(feature = "metrics")]
         &metrics,
     )?;
+    assert_eq!(
+        block.header.block_type,
+        BlockType::Data,
+        "disabled auto-heal still returns repaired data",
+    );
+    assert!(
+        off_sink.snapshot().is_empty(),
+        "auto_heal off must not schedule a rewrite",
+    );
 
     Ok(())
 }
