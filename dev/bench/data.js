@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1781059155972,
+  "lastUpdate": 1781063712367,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -14740,6 +14740,84 @@ window.BENCHMARK_DATA = {
           {
             "name": "readwhilewriting",
             "value": 550880.5855080577,
+            "unit": "ops/sec",
+            "extra": "P50: 1.6us | P99: 5.1us | P99.9: 7.6us\nthreads: 1 | elapsed: 0.36s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "802763c3b5c7f6771a4cbf9819ba31fc9946b307",
+          "message": "feat(tooling): reconstruct block AAD for offline tag verification (#445)\n\n## Summary\n\nNext slice of the forensic block inspector (#256): reconstruct the AAD\nan AEAD verify of an encrypted block would use, so a key holder can\nverify the tag offline with no live process.\n\n## What\n\n**Library**:\n- `reconstruct_block_aad(bytes, table_id) -> [u8; 23]`: rebuilds the AAD\nfrom the on-disk `MetadataFrame` (header byte, key epoch, block type,\nsuite, compression, dict id, window log, block flags) plus the\ncaller-supplied `table_id`, WITHOUT the key. The AAD is never written to\ndisk, so a key holder needs it rebuilt to check the AEAD tag.\n\n**CLI**:\n- `sst-dump <file> dump-block <offset> --table-id N --reconstruct-aad`\nprints the reconstructed AAD as hex. `--reconstruct-aad` requires\n`--table-id` and errors clearly otherwise.\n\n## Note on the AAD shape\n\n#256 was written before the change that dropped `tree_id` from the AAD\n(it is process-ephemeral, not durable across reopen). The current v1 AAD\nis **23 bytes** keyed on `table_id` (not the originally-specced 38 bytes\nwith `tree_id`), and binds neither `tree_id` nor the block offset — so\n`--reconstruct-aad` needs only `--table-id`.\n\n## Testing\n\n- Library unit test (reconstructing with the correct `table_id` yields\nbyte-for-byte the sealing AAD; a different `table_id` changes it;\nmalformed input is a typed error) + a doctest.\n- CLI smoke tests: `--reconstruct-aad` emits 46-hex-char (23-byte) AAD;\nrequires `--table-id`.\n- `clippy --lib --all-features` + tool clippy + fmt clean; lib suite\n(2036) + `sst-dump` suite (28) green. No on-disk format change.\n\nPart of #256\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n\n## Summary by CodeRabbit\n\n* **New Features**\n* Added `--reconstruct-aad` flag to `sst-dump dump-block` subcommand\nenabling offline AEAD-tag verification using external keys and block\nmetadata.\n  * Reconstructs block AAD without decrypting full block contents.\n\n* **Tests**\n* Added smoke tests verifying successful AAD reconstruction with correct\ntable ID and proper error handling for missing parameters.\n\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-06-10T06:10:20+03:00",
+          "tree_id": "d3279d7d68b9b3607d1a45b5a34ebfd3d7e77329",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/802763c3b5c7f6771a4cbf9819ba31fc9946b307"
+        },
+        "date": 1781063700343,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 1986475.597378901,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.6us | P99.9: 3.7us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1217010.6890170518,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.3us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 660651.6317550268,
+            "unit": "ops/sec",
+            "extra": "P50: 1.4us | P99: 4.6us | P99.9: 7.3us\nthreads: 1 | elapsed: 0.30s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3725250.8998390115,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 3.2us | P99.9: 5.7us\nthreads: 1 | elapsed: 0.05s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 438276.8288328406,
+            "unit": "ops/sec",
+            "extra": "P50: 2.0us | P99: 5.4us | P99.9: 8.3us\nthreads: 1 | elapsed: 0.46s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 223751.48681324697,
+            "unit": "ops/sec",
+            "extra": "P50: 4.2us | P99: 5.2us | P99.9: 8.0us\nthreads: 1 | elapsed: 0.89s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1271207.886924584,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.3us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1147226.5880408043,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.5us | P99.9: 2.7us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 549021.0656555434,
             "unit": "ops/sec",
             "extra": "P50: 1.6us | P99: 5.1us | P99.9: 7.6us\nthreads: 1 | elapsed: 0.36s | num: 200000 | iterations: 3"
           }
