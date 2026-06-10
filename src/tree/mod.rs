@@ -1337,6 +1337,36 @@ impl Tree {
     /// clustered deployment — to rewrite the flagged SSTs clean. Check
     /// [`HealHints::is_empty`](crate::heal_hints::HealHints::is_empty) to skip
     /// the pass when nothing is queued.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use lsm_tree::{AbstractTree, AnyTree, Config, SequenceNumberCounter, compaction::EccHeal};
+    /// use std::sync::Arc;
+    /// # fn main() -> lsm_tree::Result<()> {
+    /// let AnyTree::Standard(tree) = Config::new(
+    ///     "/tmp/db",
+    ///     SequenceNumberCounter::default(),
+    ///     SequenceNumberCounter::default(),
+    /// )
+    /// .open()?
+    /// else {
+    ///     return Ok(());
+    /// };
+    ///
+    /// // Opt into rewrite scheduling; reads that recover a block from parity now
+    /// // flag its SST for healing.
+    /// tree.update_runtime_config(|c| c.auto_heal = true)?;
+    ///
+    /// // Drain the queue, rewriting each flagged SST clean (leader-only in a
+    /// // clustered deployment).
+    /// let hints = tree.heal_hints();
+    /// while !hints.is_empty() {
+    ///     tree.compact(Arc::new(EccHeal::new(tree.heal_hints(), u64::MAX)), 0)?;
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
     #[must_use]
     pub fn heal_hints(&self) -> Arc<crate::heal_hints::HealHints> {
         Arc::clone(&self.0.heal_hints)
