@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1781055558768,
+  "lastUpdate": 1781059155972,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -14664,6 +14664,84 @@ window.BENCHMARK_DATA = {
             "value": 546374.3985435495,
             "unit": "ops/sec",
             "extra": "P50: 1.7us | P99: 5.0us | P99.9: 7.5us\nthreads: 1 | elapsed: 0.37s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "f8cb6c2df3cf73ef069e968e1e69bcf297d0884c",
+          "message": "feat(tooling): key-free forensic dump-block for encrypted SSTs (#444)\n\n## Summary\n\nFirst slice of the forensic block inspector (#256): a key-free\nstructural dump of an encrypted block's metadata, plus the `sst-dump\ndump-block` subcommand that drives it. For an on-call engineer\ninspecting a block that fails to decode — no key, no live process.\n\n## What\n\n**Library** (`coordinode-lsm-tree`):\n- `parse_encrypted_block_metadata(bytes) -> EncryptedBlockMetadata`:\nwalks the on-disk `MetadataFrame ‖ BodyFrame` envelope and returns\nformat version, key epoch, block type, suite, compression type, dict id,\nwindow log, block flags, nonce, AEAD tag, and ciphertext length —\n**without the key**. Reuses the decrypt path's structural validation\n(frame magic/length, codec-context invariants, body bounds) but performs\nno AEAD work and produces no plaintext. Trailing bytes after the\n`BodyFrame` (e.g. a Page ECC parity trailer outside the envelope) are\ntolerated.\n\n**CLI** (`sst-dump`):\n- `sst-dump <file> dump-block <offset>`: reads the block `Header` at the\noffset, reads the `data_length` payload, and prints the parsed metadata\nas YAML. `data_length` is capped before allocation to guard a forged\nheader. A non-encrypted block (no `MetadataFrame` envelope) is reported\nand exits non-zero.\n- The AAD-binding `tree_id` / `table_id` / `block_offset` are **not\nstored on disk** (supplied from read context at decrypt time):\n`block_offset` is the positional arg; `tree_id` / `table_id` are echoed\nonly when passed via `--tree-id` / `--table-id`.\n- Enables the `encryption` feature on the tool's `lsm-tree` dependency.\n\n## Design note\n\nThe body is ciphertext, so inner-zstd-block layout (`visit_blocks`) is\nonly accessible for non-encrypted blocks — encrypted blocks dump the\n`MetadataPayload` structurally (the key-free value). The non-encrypted\ninner-block listing, `--reconstruct-aad`, the Page ECC trailer report,\nand the mixed-suite integration corpus are follow-up slices.\n\n## Testing\n\n- Library unit test + doctest: parse a real sealed block (AES + ChaCha)\nkey-free and confirm fields; malformed/truncated input is a typed error.\n- CLI smoke tests: key-free dump of a real encrypted block,\n`--tree-id`/`--table-id` echo, and the non-encrypted rejection.\n- `clippy --lib --all-features` + `clippy` on the tool, `fmt --check`,\nlib full suite (2033) and full `sst-dump` suite (26) all green. No\non-disk format change (decode-side only).\n\nPart of #256\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n## Summary by CodeRabbit\n\n* **New Features**\n* Key-free metadata parsing for encrypted blocks to inspect block\ncryptographic parameters without decryption keys.\n* sst-dump gains a DumpBlock subcommand that prints block metadata\n(format, suite, nonce, tag, ciphertext length, caller hints).\n\n* **Bug Fixes**\n* Safer payload handling with enforced size caps and explicit errors on\nmalformed or truncated inputs.\n\n* **Tests**\n  * Added end-to-end smoke tests for encrypted and plain SST inspection.\n\n* **Chores**\n* Metadata parsing APIs are exposed only when encryption support is\nenabled.\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-06-10T02:11:59Z",
+          "tree_id": "c0cbc1f470f4eace3e58441369371f1ab67a387a",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/f8cb6c2df3cf73ef069e968e1e69bcf297d0884c"
+        },
+        "date": 1781059144895,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 1902806.1643422667,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.6us | P99.9: 3.8us\nthreads: 1 | elapsed: 0.11s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1189931.010834316,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.2us | P99.9: 4.3us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 665968.4032356634,
+            "unit": "ops/sec",
+            "extra": "P50: 1.4us | P99: 4.4us | P99.9: 6.9us\nthreads: 1 | elapsed: 0.30s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3748929.8913933137,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 3.0us | P99.9: 5.5us\nthreads: 1 | elapsed: 0.05s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 441891.2498298774,
+            "unit": "ops/sec",
+            "extra": "P50: 2.0us | P99: 5.2us | P99.9: 8.0us\nthreads: 1 | elapsed: 0.45s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 225717.97620964583,
+            "unit": "ops/sec",
+            "extra": "P50: 4.1us | P99: 5.3us | P99.9: 9.1us\nthreads: 1 | elapsed: 0.89s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1250199.070760786,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.2us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1159905.231102998,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 1.5us | P99.9: 2.7us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 550880.5855080577,
+            "unit": "ops/sec",
+            "extra": "P50: 1.6us | P99: 5.1us | P99.9: 7.6us\nthreads: 1 | elapsed: 0.36s | num: 200000 | iterations: 3"
           }
         ]
       }
