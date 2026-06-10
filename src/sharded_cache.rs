@@ -572,7 +572,9 @@ mod tests {
                     for i in 0..5_000u64 {
                         let key = (t * 5_000 + i) % 2_000; // overlapping key space
                         match i % 4 {
-                            0 => cache.insert(key, vec![(t as u8); 64]),
+                            // Payload byte value is irrelevant (all entries are
+                            // 64 B); a constant avoids a u64→u8 cast lint.
+                            0 => cache.insert(key, vec![0u8; 64]),
                             1 => {
                                 let _ = cache.get(&key);
                             }
