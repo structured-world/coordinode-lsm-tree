@@ -237,4 +237,95 @@ mod tests {
 
         Ok(())
     }
+
+    /// The zstd partial-decode read path also schedules auto-heal: a bounded
+    /// range scan that takes the partial path over a corrupted large block
+    /// recovers via parity and flags the SST, just like the full load path.
+    #[cfg(feature = "zstd")]
+    #[test]
+    fn ecc_heal_scheduled_on_partial_decode_corrected_read() -> crate::Result<()> {
+        use crate::{
+            CompressionType,
+            config::{BlockSizePolicy, CompressionPolicy},
+        };
+
+        // Opt into the partial-decode path for this test process (OnceLock-cached;
+        // nextest isolates each test in its own process so this does not leak).
+        // SAFETY: set before any tree in this process reads the env.
+        unsafe { std::env::set_var("LSM_PARTIAL_DECODE", "1") };
+
+        let dir = tempfile::tempdir()?;
+        let open = || {
+            Config::new(
+                dir.path(),
+                SequenceNumberCounter::default(),
+                SequenceNumberCounter::default(),
+            )
+            .page_ecc(true)
+            .ecc_scheme(EccScheme::ReedSolomon {
+                data_shards: 8,
+                parity_shards: 2,
+            })
+            .data_block_compression_policy(CompressionPolicy::all(
+                #[expect(clippy::expect_used, reason = "19 is a valid zstd level")]
+                CompressionType::zstd(19).expect("valid level"),
+            ))
+            .data_block_size_policy(BlockSizePolicy::all(512 * 1024))
+            .open()
+        };
+
+        // Build a large multi-inner-block zstd+ECC SST; capture the first data
+        // block's on-disk offset before dropping the tree.
+        let (sst_path, corrupt_pos) = {
+            let crate::AnyTree::Standard(tree) = open()? else {
+                unreachable!("standard tree configured");
+            };
+            for i in 0u64..20_000 {
+                tree.insert(
+                    format!("key-{i:08}"),
+                    format!("value-{i:08}-padding-padding"),
+                    0,
+                );
+            }
+            tree.flush_active_memtable(0)?;
+
+            #[expect(clippy::expect_used, reason = "test asserts the tree shape")]
+            let versions = tree.version_history.read().expect("lock not poisoned");
+            let binding = versions.latest_version();
+            #[expect(clippy::expect_used, reason = "flush produced exactly one table")]
+            let table = binding.version.iter_tables().next().expect("one table");
+            #[expect(clippy::expect_used, reason = "table has at least one data block")]
+            let keyed = table.block_index.iter().next().expect("a data block")?;
+            let off = keyed.offset().0 as usize;
+            ((*table.path).clone(), off + Header::MIN_LEN + 8)
+        };
+
+        // Flip one byte of the first block's compressed frame (RS-correctable).
+        let mut bytes = std::fs::read(&sst_path)?;
+        bytes[corrupt_pos] ^= 0x01;
+        std::fs::write(&sst_path, &bytes)?;
+
+        // Reopen (fresh caches/fds), opt into healing, then run a bounded range
+        // scan whose upper bound falls inside the first block so the read takes
+        // the partial-decode path.
+        let crate::AnyTree::Standard(tree) = open()? else {
+            unreachable!("standard tree configured");
+        };
+        tree.update_runtime_config(|c| c.auto_heal = true)?;
+
+        let count = tree
+            .range(
+                b"key-00000000".to_vec()..b"key-00000050".to_vec(),
+                MAX_SEQNO,
+                None,
+            )
+            .count();
+        assert!(count > 0, "bounded range returned rows");
+        assert!(
+            !tree.heal_hints().is_empty(),
+            "a corrected read on the partial-decode path must schedule healing",
+        );
+
+        Ok(())
+    }
 }
