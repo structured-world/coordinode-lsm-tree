@@ -66,13 +66,13 @@ const SKIPPABLE_MAGIC_START: u32 = 0x184D_2A50;
 ///   value (including out-of-range bytes) is rejected.
 /// - `None`: any variant in 0..=15 is acceptable; the variant byte
 ///   is returned alongside the payload so the caller can dispatch.
-fn read_framed_payload<R: std::io::Read>(
+fn read_framed_payload_len<R: std::io::Read>(
     reader: &mut R,
     expected_variant: Option<u8>,
     min_payload: u32,
     max_payload: u32,
     err_ctor: fn(&'static str) -> DecryptError,
-) -> Result<(u8, Vec<u8>), DecryptError> {
+) -> Result<u32, DecryptError> {
     let mut header = [0u8; 8];
     reader
         .read_exact(&mut header)
@@ -107,12 +107,28 @@ fn read_framed_payload<R: std::io::Read>(
     if payload_len > max_payload {
         return Err(err_ctor("PayloadLen exceeds cap"));
     }
+    Ok(payload_len)
+}
 
+/// Reads + validates the skippable-frame header (via
+/// [`read_framed_payload_len`]) and then reads exactly the declared
+/// payload bytes into a `Vec<u8>`. Use when the payload bytes are needed
+/// (decrypt); use [`read_framed_payload_len`] alone when only the length
+/// matters (forensic metadata parse), to skip the body allocation.
+fn read_framed_payload<R: std::io::Read>(
+    reader: &mut R,
+    expected_variant: Option<u8>,
+    min_payload: u32,
+    max_payload: u32,
+    err_ctor: fn(&'static str) -> DecryptError,
+) -> Result<Vec<u8>, DecryptError> {
+    let payload_len =
+        read_framed_payload_len(reader, expected_variant, min_payload, max_payload, err_ctor)?;
     let mut payload = vec![0u8; payload_len as usize];
     reader
         .read_exact(&mut payload)
         .map_err(|_| err_ctor("truncated frame payload"))?;
-    Ok((variant_byte, payload))
+    Ok(payload)
 }
 
 /// `MetadataPayload` size for v1 suites: 39 bytes
@@ -298,6 +314,133 @@ fn decode_metadata_payload(payload: &[u8]) -> Result<ParsedMetadata, DecryptErro
         block_type_byte,
         dict_id,
         window_log,
+    })
+}
+
+/// Key-free structural view of an AAD-bound encrypted block's metadata,
+/// parsed from the on-disk `MetadataFrame` WITHOUT the encryption key.
+///
+/// Produced by [`parse_encrypted_block_metadata`] for offline forensic
+/// inspection — e.g. an on-call engineer examining a block that fails to
+/// decode, with no live process and no key. Every field is read from the
+/// on-disk `MetadataFrame` mirror; nothing here requires decryption and the
+/// ciphertext body is never touched beyond bounds-checking its frame.
+///
+/// The three AAD-binding fields `tree_id`, `table_id` and `block_offset` are
+/// deliberately NOT stored on disk (they are supplied from read context at
+/// decrypt time), so they are absent here — reconstructing the AAD for offline
+/// verification requires the caller to supply them from the file path /
+/// inventory.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct EncryptedBlockMetadata {
+    /// Wire-format version (high nibble of the on-disk `HeaderByte`); `1` for v1.
+    pub format_version: u8,
+    /// Key epoch the block was sealed under (selects the key in the chain).
+    pub key_epoch: u8,
+    /// Raw `BlockType` discriminator byte (mirrors the block header).
+    pub block_type: u8,
+    /// AEAD suite the block was sealed with.
+    pub suite_id: SuiteId,
+    /// Raw `CompressionType` tag (`0` None, `1` Lz4, `3` Zstd, `4` `ZstdDict`).
+    pub compression_type: u8,
+    /// zstd dictionary id (non-zero only for `ZstdDict`).
+    pub dict_id: u32,
+    /// zstd window-log descriptor (`0`, or `10..=31`).
+    pub window_log: u8,
+    /// Transform-presence bitfield mirrored from the block header.
+    pub block_flags: u8,
+    /// 12-byte AEAD nonce.
+    pub nonce: [u8; 12],
+    /// 16-byte AEAD authentication tag.
+    pub aead_tag: [u8; TAG_LEN],
+    /// Length in bytes of the encrypted `BodyFrame` payload (the ciphertext).
+    pub ciphertext_len: usize,
+}
+
+/// Parses the metadata of an AAD-bound encrypted block WITHOUT decrypting it.
+///
+/// Walks the on-disk `MetadataFrame ‖ BodyFrame` envelope, validating the
+/// `MetadataFrame` structure (magic, length, codec-context invariants) and the
+/// `BodyFrame` bounds, and returns the [`EncryptedBlockMetadata`] view. No key
+/// is consulted and no plaintext is produced — this is the read-only structural
+/// parse a forensics tool uses to inspect a block that fails to decode.
+///
+/// Trailing bytes after the `BodyFrame` (e.g. a Page ECC parity trailer added
+/// outside the encryption envelope) are ignored, so this accepts either the
+/// bare envelope or an envelope followed by such a trailer.
+///
+/// # Errors
+///
+/// Returns [`DecryptError::MalformedMetadataFrame`] / [`DecryptError::MalformedBodyFrame`]
+/// for a structurally invalid envelope, [`DecryptError::UnsupportedFormatVersion`]
+/// for an unknown wire version, or [`DecryptError::UnsupportedSuite`] for an
+/// unregistered suite byte.
+///
+/// # Examples
+///
+/// ```
+/// use lsm_tree::encryption::{
+///     StaticKeyChain, encrypt_block, parse_encrypted_block_metadata,
+///     aad::{BlockIdentity, BlockType, EncryptionContext, SuiteId},
+/// };
+///
+/// let chain = StaticKeyChain::new().with_key(1, [0x42; 32]);
+/// let ctx = EncryptionContext::v1(1, SuiteId::Aes256Gcm, 0, 0);
+/// let id = BlockIdentity { table_id: 7, block_type: BlockType::Data, dict_id: 0, window_log: 0 };
+/// let sealed = encrypt_block(b"payload bytes", &id, &ctx, &chain).unwrap();
+///
+/// let meta = parse_encrypted_block_metadata(&sealed).unwrap();
+/// assert_eq!(meta.format_version, 1);
+/// assert_eq!(meta.key_epoch, 1);
+/// assert_eq!(meta.suite_id, SuiteId::Aes256Gcm);
+/// assert_eq!(meta.dict_id, 0);
+/// ```
+pub fn parse_encrypted_block_metadata(
+    bytes: &[u8],
+) -> Result<EncryptedBlockMetadata, DecryptError> {
+    let mut cursor = Cursor::new(bytes);
+    let metadata_payload = read_framed_payload(
+        &mut cursor,
+        Some(METADATA_VARIANT),
+        METADATA_PAYLOAD_LEN_V1,
+        METADATA_PAYLOAD_LEN_V1,
+        DecryptError::MalformedMetadataFrame,
+    )?;
+    let parsed = decode_metadata_payload(&metadata_payload)?;
+    // Forensic parse needs only the body LENGTH, not its bytes — read the
+    // BodyFrame header and validate its bounds without allocating / copying
+    // the ciphertext (which can be up to 256 MiB).
+    let ciphertext_len = read_framed_payload_len(
+        &mut cursor,
+        Some(BODY_VARIANT),
+        1,
+        MAX_BODY_LEN,
+        DecryptError::MalformedBodyFrame,
+    )?;
+    // The length-only read does not consume the payload, so verify the input
+    // actually contains the advertised ciphertext bytes — otherwise a block cut
+    // off right after the BodyFrame header would be reported as structurally
+    // valid with a ciphertext_len for bytes that aren't there.
+    let remaining = u64::try_from(bytes.len())
+        .unwrap_or(u64::MAX)
+        .saturating_sub(cursor.position());
+    if u64::from(ciphertext_len) > remaining {
+        return Err(DecryptError::MalformedBodyFrame("truncated frame payload"));
+    }
+    let ciphertext_len = ciphertext_len as usize;
+    Ok(EncryptedBlockMetadata {
+        format_version: parsed.ctx.header_byte >> 4,
+        key_epoch: parsed.ctx.key_epoch,
+        block_type: parsed.block_type_byte,
+        suite_id: parsed.suite_id,
+        compression_type: parsed.ctx.compression_type,
+        dict_id: parsed.dict_id,
+        window_log: parsed.window_log,
+        block_flags: parsed.ctx.block_flags,
+        nonce: parsed.nonce,
+        aead_tag: parsed.tag,
+        ciphertext_len,
     })
 }
 
@@ -568,7 +711,7 @@ pub fn decrypt_block(
     // v1 MetadataPayload is fixed at exactly 39 bytes; reject any
     // other declared length upfront so a forged `PayloadLen`
     // can't allocate-and-then-discard.
-    let (_, metadata_payload) = read_framed_payload(
+    let metadata_payload = read_framed_payload(
         &mut cursor,
         Some(METADATA_VARIANT),
         METADATA_PAYLOAD_LEN_V1,
@@ -582,7 +725,7 @@ pub fn decrypt_block(
     // PayloadLen": valid range `[1, 256 MiB]` for v1 suites.
     // Empty body is forbidden by spec — encrypt_block enforces
     // the matching rule on the write side.
-    let (_, mut ciphertext) = read_framed_payload(
+    let mut ciphertext = read_framed_payload(
         &mut cursor,
         Some(BODY_VARIANT),
         1,
@@ -673,6 +816,59 @@ mod tests {
 
     fn chain() -> StaticKeyChain {
         StaticKeyChain::new().with_key(0, TEST_KEY)
+    }
+
+    #[test]
+    fn parse_metadata_is_key_free_and_matches_seal() {
+        // Forensic parse needs no key: seal a block, then read its
+        // MetadataPayload structurally with `parse_encrypted_block_metadata`
+        // (no KeyChain) and confirm the fields mirror what was sealed.
+        let plaintext = b"forensic payload bytes";
+        let sealed = encrypt_block(plaintext, &id(), &ctx(), &chain()).unwrap();
+
+        let meta = parse_encrypted_block_metadata(&sealed).unwrap();
+        assert_eq!(meta.format_version, 1);
+        assert_eq!(meta.key_epoch, 0);
+        assert_eq!(meta.suite_id, SuiteId::Aes256Gcm);
+        assert_eq!(meta.block_type, u8::from(BlockType::Data));
+        assert_eq!(meta.compression_type, 0);
+        assert_eq!(meta.dict_id, 0);
+        assert_eq!(meta.window_log, 0);
+        assert!(meta.ciphertext_len > 0, "body must carry ciphertext");
+
+        // Suite is reflected for ChaCha too (proves it reads the on-disk
+        // SuiteID byte, not a hard-coded default).
+        let chacha_ctx = EncryptionContext::v1(0, SuiteId::ChaCha20Poly1305, 0, 0);
+        let sealed_cc = encrypt_block(plaintext, &id(), &chacha_ctx, &chain()).unwrap();
+        let meta_cc = parse_encrypted_block_metadata(&sealed_cc).unwrap();
+        assert_eq!(meta_cc.suite_id, SuiteId::ChaCha20Poly1305);
+
+        // Garbage / truncated input is a typed error, never a panic.
+        assert!(parse_encrypted_block_metadata(b"not a frame").is_err());
+        assert!(parse_encrypted_block_metadata(&sealed[..10]).is_err());
+    }
+
+    #[test]
+    fn parse_metadata_rejects_truncated_body() {
+        // Regression: the forensic parser reads only the BodyFrame header (for
+        // ciphertext_len) without the payload. A block cut off right after that
+        // header — full MetadataFrame + BodyFrame header, but zero ciphertext
+        // bytes — must still be rejected, not reported as structurally valid
+        // with a ciphertext_len for bytes that aren't there.
+        let sealed = encrypt_block(b"forensic payload bytes", &id(), &ctx(), &chain()).unwrap();
+        // MetadataFrame = 8-byte SFA header + 39-byte payload; BodyFrame header
+        // = 8 bytes. Cut to exactly that boundary: header present, body absent.
+        let cut = 8 + METADATA_PAYLOAD_LEN_V1 as usize + 8;
+        assert!(
+            sealed.len() > cut,
+            "test setup: sealed block must extend past the body header",
+        );
+        let err = parse_encrypted_block_metadata(&sealed[..cut])
+            .expect_err("truncated body must be rejected");
+        assert!(
+            matches!(err, DecryptError::MalformedBodyFrame(_)),
+            "expected MalformedBodyFrame for a truncated body, got {err:?}",
+        );
     }
 
     #[test]

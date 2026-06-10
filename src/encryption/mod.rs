@@ -72,7 +72,10 @@ pub mod key_chain;
 // through the submodule path each time. Matches the surface
 // shape #251's design discussion settled on.
 #[cfg(all(feature = "encryption", zstd_any))]
-pub use block::{DecryptedBlock, decrypt_block, encrypt_block};
+pub use block::{
+    DecryptedBlock, EncryptedBlockMetadata, decrypt_block, encrypt_block,
+    parse_encrypted_block_metadata,
+};
 pub use error::DecryptError;
 pub use key_chain::KeyChain;
 #[cfg(feature = "std")]

@@ -11,6 +11,7 @@
 
 use clap::{Parser, Subcommand};
 use lsm_tree::coding::Decode;
+use lsm_tree::encryption::parse_encrypted_block_metadata;
 use lsm_tree::inspect::{
     iter_data_block_entries, read_filter_stats, read_table_properties, read_top_level_index_entries,
 };
@@ -181,6 +182,34 @@ enum Command {
     /// "not supported" error. Filter-less tables (no `filter`
     /// section at all) exit 0 with a "no filter installed" notice.
     FilterStats,
+
+    /// Forensic structural dump of a single encrypted block WITHOUT the
+    /// key. Reads the `Header` at `offset`, then parses the block's
+    /// AAD-bound `MetadataFrame` envelope (no decryption, no live
+    /// process) and prints the cryptographic parameters as YAML: format
+    /// version, suite, key epoch, block type, compression, dict id,
+    /// window log, block flags, nonce, AEAD tag, ciphertext length.
+    ///
+    /// Use when a production block fails to decode and on-call needs the
+    /// block's structure without the key. The AAD-binding fields
+    /// `tree_id` / `table_id` / `block_offset` are NOT stored on disk, so
+    /// they are shown only if supplied via `--tree-id` / `--table-id`
+    /// (block offset is the positional arg).
+    DumpBlock {
+        /// Byte offset of the block's `Header` in the file (e.g. a value
+        /// reported by `verify --verbose` or a TOC section start).
+        offset: u64,
+
+        /// Owning tree id — not stored on disk; supplied from read
+        /// context. Echoed in the output when provided.
+        #[arg(long)]
+        tree_id: Option<u64>,
+
+        /// Owning table id — not stored on disk; supplied from read
+        /// context. Echoed in the output when provided.
+        #[arg(long)]
+        table_id: Option<u64>,
+    },
 }
 
 fn main() -> ExitCode {
@@ -203,6 +232,11 @@ fn main() -> ExitCode {
         } => run_dump(&cli.path, from.as_deref(), to.as_deref(), max, keys_only),
         Command::FilterStats => run_filter_stats(&cli.path),
         Command::Repair => run_repair(&cli.path),
+        Command::DumpBlock {
+            offset,
+            tree_id,
+            table_id,
+        } => run_dump_block(&cli.path, offset, tree_id, table_id),
     }
 }
 
@@ -764,4 +798,126 @@ fn format_key(key: &[u8]) -> String {
     }
     out.push('"');
     out
+}
+
+/// Lowercase hex string of `bytes`, no separators (for nonce / tag dumps).
+fn hex_string(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        // Writing to a String is infallible; the Result is discarded
+        // deliberately rather than unwrapped (clippy::unwrap_used).
+        let _ = write!(s, "{b:02x}");
+    }
+    s
+}
+
+/// Cap on the block payload the forensic dump will read, guarding against a
+/// forged `Header.data_length` triggering a multi-GiB allocation. This is
+/// compared against the full envelope length (`Header.data_length`), so it is
+/// the 256 MiB encrypted-body cap PLUS the envelope framing overhead: a 47-byte
+/// `MetadataFrame` (8-byte skippable header + 39-byte payload) and an 8-byte
+/// `BodyFrame` header. Without the +55 a maximum-sized valid block would be
+/// rejected.
+const DUMP_BLOCK_MAX_PAYLOAD: u64 = 256 * 1024 * 1024 + 55;
+
+/// Forensic structural dump of one encrypted block at `offset`, key-free.
+///
+/// Reads the block `Header` at `offset` (which leaves the cursor at the
+/// payload), reads `data_length` payload bytes, and parses them as the
+/// AAD-bound `MetadataFrame ‖ BodyFrame` envelope. Emits the cryptographic
+/// parameters as YAML. No key is used and no plaintext is produced.
+fn run_dump_block(
+    path: &std::path::Path,
+    offset: u64,
+    tree_id: Option<u64>,
+    table_id: Option<u64>,
+) -> ExitCode {
+    let mut file = match File::open(path) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("error: open {}: {e}", path.display());
+            return ExitCode::FAILURE;
+        }
+    };
+    if let Err(e) = file.seek(SeekFrom::Start(offset)) {
+        eprintln!("error: seek to {offset}: {e}");
+        return ExitCode::FAILURE;
+    }
+    let header = match Header::decode_from(&mut file) {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("error: decode block header at offset {offset}: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let data_len = u64::from(header.data_length);
+    if data_len > DUMP_BLOCK_MAX_PAYLOAD {
+        eprintln!(
+            "error: block data_length {data_len} exceeds cap {DUMP_BLOCK_MAX_PAYLOAD}; \
+             refusing to allocate (forged header?)"
+        );
+        return ExitCode::FAILURE;
+    }
+    // `Header::decode_from` consumed exactly the header bytes, so the file
+    // cursor now sits at the start of the block payload.
+    let mut payload = vec![0u8; data_len as usize];
+    if let Err(e) = file.read_exact(&mut payload) {
+        eprintln!("error: read {data_len}-byte block payload at offset {offset}: {e}");
+        return ExitCode::FAILURE;
+    }
+
+    let meta = match parse_encrypted_block_metadata(&payload) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!(
+                "block at offset {offset} is not an AAD-bound encrypted block \
+                 (no MetadataFrame envelope): {e:?}"
+            );
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // Spec §5.1 CompressionType registry.
+    let compression = match meta.compression_type {
+        0 => "None",
+        1 => "Lz4",
+        3 => "Zstd",
+        4 => "ZstdDict",
+        _ => "unknown",
+    };
+
+    // YAML output (machine-parseable for incident postmortems).
+    println!("file: {}", format_key(path.to_string_lossy().as_bytes()));
+    println!("block_offset: {offset}");
+    println!("encrypted: true");
+    println!("header_block_type: {:?}", header.block_type);
+    println!("format_version: {}", meta.format_version);
+    println!("suite: {:?}", meta.suite_id);
+    println!("suite_byte: {}", meta.suite_id.as_byte());
+    println!("key_epoch: {}", meta.key_epoch);
+    println!("block_type_byte: {}", meta.block_type);
+    println!("compression_type: {compression}");
+    println!("compression_type_byte: {}", meta.compression_type);
+    println!("dict_id: {}", meta.dict_id);
+    println!("window_log: {}", meta.window_log);
+    println!("block_flags: 0x{:02x}", meta.block_flags);
+    println!("nonce: \"{}\"", hex_string(&meta.nonce));
+    println!("aead_tag: \"{}\"", hex_string(&meta.aead_tag));
+    println!("ciphertext_len: {}", meta.ciphertext_len);
+
+    // tree_id / table_id / block_offset are AAD-binding but NOT stored on
+    // disk (supplied from read context at decrypt time), so they are echoed
+    // only when the operator passes them.
+    println!("caller_supplied:");
+    match tree_id {
+        Some(t) => println!("  tree_id: {t}"),
+        None => println!("  tree_id: null  # not on disk; pass --tree-id"),
+    }
+    match table_id {
+        Some(t) => println!("  table_id: {t}"),
+        None => println!("  table_id: null  # not on disk; pass --table-id"),
+    }
+
+    ExitCode::SUCCESS
 }

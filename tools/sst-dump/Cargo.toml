@@ -24,7 +24,7 @@ path = "src/main.rs"
 # `lz4` + `zstd` features enabled because real production SSTs are
 # usually compressed; without them the tool refuses to walk
 # compressed blocks.
-lsm-tree = { package = "coordinode-lsm-tree", path = "../..", features = ["lz4", "zstd"] }
+lsm-tree = { package = "coordinode-lsm-tree", path = "../..", features = ["lz4", "zstd", "encryption"] }
 clap = { version = "4", features = ["derive"] }
 
 [dev-dependencies]
