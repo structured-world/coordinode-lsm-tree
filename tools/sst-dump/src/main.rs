@@ -813,9 +813,13 @@ fn hex_string(bytes: &[u8]) -> String {
 }
 
 /// Cap on the block payload the forensic dump will read, guarding against a
-/// forged `Header.data_length` triggering a multi-GiB allocation. 256 MiB
-/// matches the encrypted-body cap enforced on the read path.
-const DUMP_BLOCK_MAX_PAYLOAD: u64 = 256 * 1024 * 1024;
+/// forged `Header.data_length` triggering a multi-GiB allocation. This is
+/// compared against the full envelope length (`Header.data_length`), so it is
+/// the 256 MiB encrypted-body cap PLUS the envelope framing overhead: a 47-byte
+/// `MetadataFrame` (8-byte skippable header + 39-byte payload) and an 8-byte
+/// `BodyFrame` header. Without the +55 a maximum-sized valid block would be
+/// rejected.
+const DUMP_BLOCK_MAX_PAYLOAD: u64 = 256 * 1024 * 1024 + 55;
 
 /// Forensic structural dump of one encrypted block at `offset`, key-free.
 ///
