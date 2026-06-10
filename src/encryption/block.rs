@@ -66,13 +66,13 @@ const SKIPPABLE_MAGIC_START: u32 = 0x184D_2A50;
 ///   value (including out-of-range bytes) is rejected.
 /// - `None`: any variant in 0..=15 is acceptable; the variant byte
 ///   is returned alongside the payload so the caller can dispatch.
-fn read_framed_payload<R: std::io::Read>(
+fn read_framed_payload_len<R: std::io::Read>(
     reader: &mut R,
     expected_variant: Option<u8>,
     min_payload: u32,
     max_payload: u32,
     err_ctor: fn(&'static str) -> DecryptError,
-) -> Result<(u8, Vec<u8>), DecryptError> {
+) -> Result<u32, DecryptError> {
     let mut header = [0u8; 8];
     reader
         .read_exact(&mut header)
@@ -107,12 +107,28 @@ fn read_framed_payload<R: std::io::Read>(
     if payload_len > max_payload {
         return Err(err_ctor("PayloadLen exceeds cap"));
     }
+    Ok(payload_len)
+}
 
+/// Reads + validates the skippable-frame header (via
+/// [`read_framed_payload_len`]) and then reads exactly the declared
+/// payload bytes into a `Vec<u8>`. Use when the payload bytes are needed
+/// (decrypt); use [`read_framed_payload_len`] alone when only the length
+/// matters (forensic metadata parse), to skip the body allocation.
+fn read_framed_payload<R: std::io::Read>(
+    reader: &mut R,
+    expected_variant: Option<u8>,
+    min_payload: u32,
+    max_payload: u32,
+    err_ctor: fn(&'static str) -> DecryptError,
+) -> Result<Vec<u8>, DecryptError> {
+    let payload_len =
+        read_framed_payload_len(reader, expected_variant, min_payload, max_payload, err_ctor)?;
     let mut payload = vec![0u8; payload_len as usize];
     reader
         .read_exact(&mut payload)
         .map_err(|_| err_ctor("truncated frame payload"))?;
-    Ok((variant_byte, payload))
+    Ok(payload)
 }
 
 /// `MetadataPayload` size for v1 suites: 39 bytes
@@ -384,7 +400,7 @@ pub fn parse_encrypted_block_metadata(
     bytes: &[u8],
 ) -> Result<EncryptedBlockMetadata, DecryptError> {
     let mut cursor = Cursor::new(bytes);
-    let (_, metadata_payload) = read_framed_payload(
+    let metadata_payload = read_framed_payload(
         &mut cursor,
         Some(METADATA_VARIANT),
         METADATA_PAYLOAD_LEN_V1,
@@ -392,13 +408,16 @@ pub fn parse_encrypted_block_metadata(
         DecryptError::MalformedMetadataFrame,
     )?;
     let parsed = decode_metadata_payload(&metadata_payload)?;
-    let (_, ciphertext) = read_framed_payload(
+    // Forensic parse needs only the body LENGTH, not its bytes — read the
+    // BodyFrame header and validate its bounds without allocating / copying
+    // the ciphertext (which can be up to 256 MiB).
+    let ciphertext_len = read_framed_payload_len(
         &mut cursor,
         Some(BODY_VARIANT),
         1,
         MAX_BODY_LEN,
         DecryptError::MalformedBodyFrame,
-    )?;
+    )? as usize;
     Ok(EncryptedBlockMetadata {
         format_version: parsed.ctx.header_byte >> 4,
         key_epoch: parsed.ctx.key_epoch,
@@ -410,7 +429,7 @@ pub fn parse_encrypted_block_metadata(
         block_flags: parsed.ctx.block_flags,
         nonce: parsed.nonce,
         aead_tag: parsed.tag,
-        ciphertext_len: ciphertext.len(),
+        ciphertext_len,
     })
 }
 
@@ -681,7 +700,7 @@ pub fn decrypt_block(
     // v1 MetadataPayload is fixed at exactly 39 bytes; reject any
     // other declared length upfront so a forged `PayloadLen`
     // can't allocate-and-then-discard.
-    let (_, metadata_payload) = read_framed_payload(
+    let metadata_payload = read_framed_payload(
         &mut cursor,
         Some(METADATA_VARIANT),
         METADATA_PAYLOAD_LEN_V1,
@@ -695,7 +714,7 @@ pub fn decrypt_block(
     // PayloadLen": valid range `[1, 256 MiB]` for v1 suites.
     // Empty body is forbidden by spec — encrypt_block enforces
     // the matching rule on the write side.
-    let (_, mut ciphertext) = read_framed_payload(
+    let mut ciphertext = read_framed_payload(
         &mut cursor,
         Some(BODY_VARIANT),
         1,
