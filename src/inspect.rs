@@ -100,6 +100,84 @@ pub struct TableProperties {
     /// table with a supported scheme. Mutually exclusive with
     /// [`Self::page_ecc`].
     pub ecc_unrecognized: bool,
+    /// Page-ECC scheme decoded from the table's `descriptor#page_ecc`
+    /// value, in a public form independent of the crate-internal
+    /// `EccParams` type. `Some(_)` whenever the SST carries an ECC
+    /// descriptor (recognized OR not — [`Self::page_ecc`] /
+    /// [`Self::ecc_unrecognized`] distinguish the two); `None` for a
+    /// table written without Page ECC. Pair with
+    /// [`EccSchemeInfo::parity_trailer_len`] and a block's `data_length`
+    /// to report the per-block parity-trailer size a forensic dump would
+    /// see following the payload.
+    pub ecc_scheme: Option<EccSchemeInfo>,
+}
+
+/// Page-ECC scheme of an SST, in a public form decoupled from the
+/// crate-internal (doc-hidden) `EccParams` enum.
+///
+/// Returned via [`TableProperties::ecc_scheme`] so diagnostic tooling can
+/// report the parity layout — and, with a block's on-disk payload length,
+/// the per-block parity-trailer size — without reaching into
+/// `crate::table::block`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum EccSchemeInfo {
+    /// Shard-based parity: the block payload is split into `data_shards`
+    /// shards with `parity_shards` recovery shards appended (XOR / RAID-5
+    /// when `parity_shards == 1`, Reed-Solomon when `>= 2`).
+    Shard {
+        /// Number of data shards the payload is split into (`>= 1`).
+        data_shards: u8,
+        /// Number of parity shards appended (`>= 1`).
+        parity_shards: u8,
+    },
+    /// Per-word Hamming SEC-DED: one check byte per 8-byte data word.
+    Secded,
+}
+
+impl EccSchemeInfo {
+    /// Byte length of the parity trailer this scheme appends after a
+    /// `payload_len`-byte block payload.
+    ///
+    /// The trailer length is not stored per block; the read path re-derives
+    /// it from `data_length` plus the per-SST scheme descriptor, and this
+    /// mirrors that derivation for out-of-band reporting.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use lsm_tree::inspect::EccSchemeInfo;
+    /// // RS(4,2): payload split into 4 shards, 2 parity shards appended.
+    /// let rs = EccSchemeInfo::Shard { data_shards: 4, parity_shards: 2 };
+    /// assert!(rs.parity_trailer_len(4096) > 0);
+    /// // SEC-DED: one check byte per 8-byte word.
+    /// assert_eq!(EccSchemeInfo::Secded.parity_trailer_len(64), 8);
+    /// ```
+    #[must_use]
+    pub fn parity_trailer_len(self, payload_len: usize) -> usize {
+        match self {
+            Self::Shard {
+                data_shards,
+                parity_shards,
+            } => {
+                let ds = usize::from(data_shards);
+                let ps = usize::from(parity_shards);
+                if ds == 0 || ps == 0 {
+                    return 0;
+                }
+                // Mirrors `crate::ecc::parity_len` (the writer-side source of
+                // truth), inlined here because that module is gated behind the
+                // `page_ecc` feature while this reporting API must work on any
+                // build: per-shard bytes = ceil(payload / data_shards) rounded
+                // up to a multiple of 2 (reed-solomon-simd's shard alignment;
+                // XOR shares the layout), times the parity-shard count.
+                let shard = payload_len.div_ceil(ds).div_ceil(2) * 2;
+                shard * ps
+            }
+            // One check byte per 8-byte word, last word zero-padded.
+            Self::Secded => payload_len.div_ceil(8),
+        }
+    }
 }
 
 /// Reads `path` and returns its on-disk metadata as
@@ -189,7 +267,23 @@ pub fn read_table_properties(path: &Path) -> crate::Result<TableProperties> {
         created_at_nanos: *meta.created_at,
         page_ecc: meta.page_ecc,
         ecc_unrecognized: meta.ecc_unrecognized,
+        ecc_scheme: meta.ecc_params.map(ecc_scheme_info),
     })
+}
+
+/// Projects the crate-internal (doc-hidden) `EccParams` onto the public
+/// [`EccSchemeInfo`] reported by [`TableProperties::ecc_scheme`].
+fn ecc_scheme_info(params: crate::table::block::EccParams) -> EccSchemeInfo {
+    match params {
+        crate::table::block::EccParams::Shard {
+            data_shards,
+            parity_shards,
+        } => EccSchemeInfo::Shard {
+            data_shards,
+            parity_shards,
+        },
+        crate::table::block::EccParams::Secded => EccSchemeInfo::Secded,
+    }
 }
 
 /// One entry parsed from an SST's top-level index (TLI) block.
@@ -1051,4 +1145,382 @@ pub fn read_filter_stats(path: &Path) -> crate::Result<Option<FilterStats>> {
         item_count,
         bits_per_key,
     }))
+}
+
+/// Little-endian zstd frame magic (`0xFD2FB528`), per RFC 8878 §3.1.1.
+const ZSTD_FRAME_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
+
+/// Type of a single inner zstd block, decoded from the 2 type bits of its
+/// 3-byte header (RFC 8878 §3.1.1.2.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ZstdBlockType {
+    /// Uncompressed bytes stored verbatim (`Block_Size` content bytes follow).
+    Raw,
+    /// Run-length: a single byte follows, regenerated `Block_Size` times.
+    Rle,
+    /// Zstd-compressed content (`Block_Size` compressed bytes follow).
+    Compressed,
+}
+
+/// One inner zstd block within a compressed block payload, enumerated
+/// key-free by walking the frozen block-header chain WITHOUT decompressing.
+///
+/// Returned in frame order by [`census_zstd_frame`]. The walk reads only the
+/// 3-byte block headers (RFC 8878 §3.1.1.2), so it is cheap and immune to
+/// decompression bombs, but cannot recover a `Compressed` block's regenerated
+/// size (that lives in the compressed stream, not the header).
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct InnerZstdBlock {
+    /// Zero-based position of this block within the frame.
+    pub index: u32,
+    /// Block kind from the header's 2 type bits.
+    pub block_type: ZstdBlockType,
+    /// `true` for the frame's final block (the header's `Last_Block` bit).
+    pub last: bool,
+    /// Byte offset of this block's 3-byte header within the frame payload.
+    pub header_offset: u64,
+    /// On-disk content bytes following the 3-byte header: the `Block_Size`
+    /// field for `Raw` / `Compressed`, and `1` for `Rle` (a single repeated
+    /// byte is stored regardless of the regenerated size).
+    pub content_len: u32,
+    /// Regenerated (decompressed) size when derivable from the header alone:
+    /// the `Block_Size` field for `Raw` / `Rle`. `None` for `Compressed`,
+    /// whose output size is not in the header.
+    pub decompressed_len: Option<u32>,
+}
+
+/// Key-free structural census of a single zstd frame, produced by
+/// [`census_zstd_frame`].
+///
+/// `#[non_exhaustive]` so new frame-header fields can be surfaced in a minor
+/// version bump.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct ZstdFrameCensus {
+    /// Length in bytes of the frame header (magic + descriptor + optional
+    /// window / dictionary-id / frame-content-size fields).
+    pub frame_header_len: u8,
+    /// Decoded window size in bytes (from the window descriptor, or the frame
+    /// content size for a single-segment frame). `None` if neither was
+    /// present in the header.
+    pub window_size: Option<u64>,
+    /// Dictionary id declared in the frame header, if any (`0` is treated as
+    /// "no dictionary" per the spec and reported as `None`).
+    pub dictionary_id: Option<u32>,
+    /// Declared uncompressed content size of the whole frame, if the header
+    /// carried a `Frame_Content_Size` field.
+    pub frame_content_size: Option<u64>,
+    /// `true` if the frame header's `Content_Checksum_flag` is set (a 4-byte
+    /// XXH64 content checksum trails the last block).
+    pub content_checksum: bool,
+    /// Inner blocks in frame order.
+    pub blocks: Vec<InnerZstdBlock>,
+}
+
+/// Returns `true` if `payload` begins with the zstd frame magic.
+///
+/// A cheap pre-check before [`census_zstd_frame`] so a forensic caller can
+/// distinguish a zstd-compressed block payload from a raw / lz4 / otherwise
+/// non-zstd one without attempting a full header parse.
+#[must_use]
+pub fn is_zstd_frame(payload: &[u8]) -> bool {
+    payload.starts_with(&ZSTD_FRAME_MAGIC)
+}
+
+/// Walks a zstd frame's block structure key-free, WITHOUT decompressing.
+///
+/// Parses the frame header (RFC 8878 §3.1.1) to locate the first block, then
+/// walks the 3-byte block-header chain to the final block, recording each
+/// inner block's type, on-disk length, and (for `Raw` / `Rle`) regenerated
+/// size. No block content is decompressed, so a multi-block cold-tier frame
+/// can be inspected — and a truncated / malformed block localised — without
+/// the cost or decode-bomb exposure of a full decode, and without the
+/// encryption key (the caller passes the already-plaintext compressed
+/// payload; encrypted blocks have an opaque ciphertext body and cannot be
+/// walked this way).
+///
+/// # Errors
+///
+/// Returns [`crate::Error::InvalidHeader`] if `payload` does not start with a
+/// zstd frame, the frame header is truncated, a block declares a reserved
+/// type, or a block's content runs past the end of `payload` (a truncated or
+/// forged frame).
+///
+/// # Examples
+///
+/// ```
+/// use lsm_tree::inspect::{census_zstd_frame, is_zstd_frame, ZstdBlockType};
+/// // A minimal hand-built zstd frame: magic + single-segment header
+/// // (declared content size 5) + one RLE last-block regenerating 5 bytes
+/// // of 0x41. Hand-built so the example needs no compression feature.
+/// let frame = [0x28, 0xB5, 0x2F, 0xFD, 0x20, 0x05, 0x2B, 0x00, 0x00, 0x41];
+/// assert!(is_zstd_frame(&frame));
+/// let census = census_zstd_frame(&frame).unwrap();
+/// assert_eq!(census.blocks.len(), 1);
+/// assert_eq!(census.blocks[0].block_type, ZstdBlockType::Rle);
+/// assert!(census.blocks[0].last);
+/// assert_eq!(census.blocks[0].decompressed_len, Some(5));
+/// ```
+pub fn census_zstd_frame(payload: &[u8]) -> crate::Result<ZstdFrameCensus> {
+    use crate::Error::InvalidHeader;
+
+    // Magic (4) + frame descriptor (1) is the minimum to read.
+    if !payload.starts_with(&ZSTD_FRAME_MAGIC) {
+        return Err(InvalidHeader("zstd frame magic"));
+    }
+    let desc = *payload
+        .get(4)
+        .ok_or(InvalidHeader("zstd frame descriptor"))?;
+    let fcs_flag = desc >> 6;
+    let single_segment = (desc >> 5) & 1 == 1;
+    let content_checksum = (desc >> 2) & 1 == 1;
+    // Field-size tables straight from RFC 8878 §3.1.1.1.
+    let dict_id_size = match desc & 0x3 {
+        0 => 0usize,
+        1 => 1,
+        2 => 2,
+        // dict-id flag is 2 bits, so the only remaining value is 3 (= 4 bytes).
+        _ => 4,
+    };
+    let fcs_size = match fcs_flag {
+        0 => usize::from(single_segment),
+        1 => 2,
+        2 => 4,
+        // fcs_flag is 2 bits, so the only remaining value is 3.
+        _ => 8,
+    };
+
+    let mut pos = 5usize;
+
+    // Window descriptor is present iff the frame is not single-segment.
+    let window_from_descriptor = if single_segment {
+        None
+    } else {
+        let wd = *payload
+            .get(pos)
+            .ok_or(InvalidHeader("zstd window descriptor"))?;
+        pos += 1;
+        let exp = u64::from(wd >> 3);
+        let mantissa = u64::from(wd & 0x7);
+        let window_base = 1u64 << (10 + exp);
+        Some(window_base + (window_base / 8) * mantissa)
+    };
+
+    // Dictionary id (little-endian, `dict_id_size` bytes; 0 means "none").
+    let mut dictionary_id = None;
+    if dict_id_size > 0 {
+        let bytes = payload
+            .get(pos..pos + dict_id_size)
+            .ok_or(InvalidHeader("zstd dictionary id"))?;
+        let mut id = 0u32;
+        for (i, &b) in bytes.iter().enumerate() {
+            id |= u32::from(b) << (8 * i);
+        }
+        if id != 0 {
+            dictionary_id = Some(id);
+        }
+        pos += dict_id_size;
+    }
+
+    // Frame content size (little-endian; the 2-byte form has a +256 bias).
+    let mut frame_content_size = None;
+    if fcs_size > 0 {
+        let bytes = payload
+            .get(pos..pos + fcs_size)
+            .ok_or(InvalidHeader("zstd frame content size"))?;
+        let mut fcs = 0u64;
+        for (i, &b) in bytes.iter().enumerate() {
+            fcs |= u64::from(b) << (8 * i);
+        }
+        if fcs_size == 2 {
+            fcs += 256;
+        }
+        frame_content_size = Some(fcs);
+        pos += fcs_size;
+    }
+
+    let frame_header_len =
+        u8::try_from(pos).map_err(|_| InvalidHeader("zstd frame header too long"))?;
+    // Single-segment frames omit the window descriptor: the window equals the
+    // declared content size.
+    let window_size = window_from_descriptor.or(frame_content_size);
+
+    // Walk the 3-byte block-header chain to the last block. `pos` advances by
+    // at least 3 each iteration and is bounded by `payload.len()`, so the loop
+    // terminates without an explicit block-count cap.
+    let mut blocks = Vec::new();
+    let mut index = 0u32;
+    loop {
+        // Exactly three bytes; the slice pattern avoids per-byte indexing
+        // (the `else` is unreachable since `get(..3)` yields a 3-byte slice).
+        let &[b0, b1, b2] = payload
+            .get(pos..pos + 3)
+            .ok_or(InvalidHeader("zstd block header"))?
+        else {
+            return Err(InvalidHeader("zstd block header"));
+        };
+        let raw = u32::from(b0) | (u32::from(b1) << 8) | (u32::from(b2) << 16);
+        let last = raw & 1 == 1;
+        let block_size = raw >> 3; // 21-bit Block_Size
+        let header_offset = pos as u64;
+        pos += 3;
+
+        let (block_type, content_len, decompressed_len) = match (raw >> 1) & 0x3 {
+            0 => (ZstdBlockType::Raw, block_size, Some(block_size)),
+            1 => (ZstdBlockType::Rle, 1u32, Some(block_size)),
+            2 => (ZstdBlockType::Compressed, block_size, None),
+            // 3 = Reserved: per spec this is corruption.
+            _ => return Err(InvalidHeader("zstd reserved block type")),
+        };
+
+        let content_end = pos
+            .checked_add(content_len as usize)
+            .ok_or(InvalidHeader("zstd block content overflow"))?;
+        if content_end > payload.len() {
+            return Err(InvalidHeader("zstd block content truncated"));
+        }
+        pos = content_end;
+
+        blocks.push(InnerZstdBlock {
+            index,
+            block_type,
+            last,
+            header_offset,
+            content_len,
+            decompressed_len,
+        });
+        index += 1;
+        if last {
+            break;
+        }
+    }
+
+    Ok(ZstdFrameCensus {
+        frame_header_len,
+        window_size,
+        dictionary_id,
+        frame_content_size,
+        content_checksum,
+        blocks,
+    })
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::indexing_slicing,
+    clippy::expect_used,
+    reason = "test code"
+)]
+mod census_tests {
+    use super::*;
+
+    /// Hand-built minimal zstd frame: magic + single-segment header (declared
+    /// content size 5) + one RLE last-block regenerating 5 bytes of 0x41.
+    /// Built without the compression feature so the structural-walk tests run
+    /// in the default build profile.
+    const RLE_FRAME: [u8; 10] = [0x28, 0xB5, 0x2F, 0xFD, 0x20, 0x05, 0x2B, 0x00, 0x00, 0x41];
+
+    #[test]
+    fn is_zstd_frame_matches_only_on_magic() {
+        assert!(is_zstd_frame(&RLE_FRAME));
+        assert!(!is_zstd_frame(b"not a frame"));
+        assert!(!is_zstd_frame(&[0x28, 0xB5, 0x2F])); // too short
+    }
+
+    #[test]
+    fn census_zstd_frame_decodes_single_rle_block() {
+        let census = census_zstd_frame(&RLE_FRAME).unwrap();
+        assert_eq!(census.frame_header_len, 6);
+        // Single-segment frame: window size falls back to the declared
+        // content size (5).
+        assert_eq!(census.window_size, Some(5));
+        assert_eq!(census.frame_content_size, Some(5));
+        assert!(!census.content_checksum);
+        assert_eq!(census.blocks.len(), 1);
+        let b = &census.blocks[0];
+        assert_eq!(b.index, 0);
+        assert_eq!(b.block_type, ZstdBlockType::Rle);
+        assert!(b.last);
+        assert_eq!(b.header_offset, 6);
+        // RLE stores a single repeated byte on disk; regenerated size is 5.
+        assert_eq!(b.content_len, 1);
+        assert_eq!(b.decompressed_len, Some(5));
+    }
+
+    #[test]
+    fn census_zstd_frame_rejects_non_zstd_payload() {
+        let err = census_zstd_frame(b"definitely not zstd").unwrap_err();
+        assert!(matches!(err, crate::Error::InvalidHeader(_)));
+    }
+
+    #[test]
+    fn census_zstd_frame_rejects_truncated_frame() {
+        // Drop the RLE block's single content byte: the block content now runs
+        // past EOF.
+        let err = census_zstd_frame(&RLE_FRAME[..RLE_FRAME.len() - 1]).unwrap_err();
+        assert!(matches!(err, crate::Error::InvalidHeader(_)));
+    }
+
+    #[test]
+    fn census_zstd_frame_rejects_reserved_block_type() {
+        // Same header shape as RLE_FRAME but block type bits = 3 (Reserved):
+        // block-header raw = (5 << 3) | (3 << 1) | 1 = 0x2F.
+        let mut frame = RLE_FRAME;
+        frame[6] = 0x2F;
+        let err = census_zstd_frame(&frame).unwrap_err();
+        assert!(matches!(err, crate::Error::InvalidHeader(_)));
+    }
+
+    #[test]
+    fn ecc_scheme_parity_trailer_len() {
+        // RS(4,2): four data shards + two parity shards → non-zero trailer.
+        let rs = EccSchemeInfo::Shard {
+            data_shards: 4,
+            parity_shards: 2,
+        };
+        assert!(rs.parity_trailer_len(4096) > 0);
+        // SEC-DED: one check byte per 8-byte word.
+        assert_eq!(EccSchemeInfo::Secded.parity_trailer_len(64), 8);
+        assert_eq!(EccSchemeInfo::Secded.parity_trailer_len(65), 9);
+    }
+
+    // Real-compression coverage: walk a frame produced by the actual zstd
+    // backend (multi-byte, multi-block-capable). Gated on a zstd build since
+    // the backend is only present then.
+    #[cfg(zstd_any)]
+    mod with_zstd {
+        use super::*;
+        use crate::compression::CompressionProvider;
+
+        #[test]
+        fn census_real_frame_walks_to_last_block() {
+            let frame = crate::compression::ZstdBackend::compress(&vec![0x5Au8; 8192], 3).unwrap();
+            assert!(is_zstd_frame(&frame));
+            let census = census_zstd_frame(&frame).unwrap();
+            assert!(!census.blocks.is_empty());
+            assert!(census.frame_header_len >= 5);
+            // Exactly one last block, and it is the final entry.
+            assert_eq!(census.blocks.iter().filter(|b| b.last).count(), 1);
+            assert!(census.blocks.last().unwrap().last);
+            // Indices contiguous from zero; headers in-bounds and non-overlapping.
+            let mut prev = u64::from(census.frame_header_len);
+            for (i, b) in census.blocks.iter().enumerate() {
+                assert_eq!(b.index as usize, i);
+                assert!(b.header_offset >= prev);
+                let end = b.header_offset + 3 + u64::from(b.content_len);
+                assert!(end <= frame.len() as u64);
+                prev = end;
+            }
+        }
+
+        #[test]
+        fn census_real_frame_rejects_truncation() {
+            let frame = crate::compression::ZstdBackend::compress(&vec![0x7Eu8; 4096], 3).unwrap();
+            let truncated = &frame[..frame.len() - 8];
+            let err = census_zstd_frame(truncated).unwrap_err();
+            assert!(matches!(err, crate::Error::InvalidHeader(_)));
+        }
+    }
 }
