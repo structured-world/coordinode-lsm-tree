@@ -162,6 +162,10 @@ pub struct Iter {
     /// Per-SST Page-ECC scheme from table metadata; the block reader needs
     /// it to size + recover the parity trailer. `None` = no parity.
     ecc: Option<crate::table::block::EccParams>,
+    /// Tree-wide ECC heal sink. A scan that recovers a data block from parity
+    /// records this SST here (on confirmed persistence) for a healing
+    /// recompaction. `None` before the table is tree-owned.
+    heal_hints: Option<Arc<crate::heal_hints::HealHints>>,
     /// Per-SST per-KV-footer flag from table metadata
     /// (`kv_checksum_algo.is_some()`); data blocks omit the `block_flags` byte,
     /// so `from_loaded` is told here whether to strip a footer.
@@ -215,6 +219,7 @@ impl Iter {
         compression: CompressionType,
         encryption: Option<Arc<dyn EncryptionProvider>>,
         ecc: Option<crate::table::block::EccParams>,
+        heal_hints: Option<Arc<crate::heal_hints::HealHints>>,
         has_kv_footer: bool,
         #[cfg(zstd_any)] zstd_dictionary: Option<Arc<crate::compression::ZstdDictionary>>,
         comparator: SharedComparator,
@@ -234,6 +239,7 @@ impl Iter {
             compression,
             encryption,
             ecc,
+            heal_hints,
             has_kv_footer,
             #[cfg(zstd_any)]
             zstd_dictionary,
@@ -376,11 +382,29 @@ impl Iter {
             Some(ecc) => transform.with_ecc(ecc),
             None => transform,
         };
-        let (_header, frame) = crate::table::block::Block::read_data_frame(
-            fd.as_ref(),
-            BlockHandle::new(handle.offset(), handle.size()),
-            &transform,
-        )?;
+        let block_handle = BlockHandle::new(handle.offset(), handle.size());
+        let (_header, frame, corrected) =
+            crate::table::block::Block::read_data_frame(fd.as_ref(), block_handle, &transform)?;
+        // The partial path bypasses `load_block`, so schedule auto-heal here too:
+        // an ECC-corrected frame read flags the SST for a healing rewrite (the
+        // partial path is non-encrypted by the guard above).
+        if corrected {
+            crate::table::util::maybe_record_persistent_heal(
+                self.table_id,
+                &self.path,
+                &self.file_accessor,
+                &block_handle,
+                crate::table::block::BlockType::Data,
+                self.compression,
+                None,
+                self.ecc,
+                #[cfg(zstd_any)]
+                self.zstd_dictionary.as_deref(),
+                self.heal_hints.as_ref().map(AsRef::as_ref),
+                #[cfg(feature = "metrics")]
+                &self.metrics,
+            );
+        }
         // Cold first touch (carried_resume None) or resume-grow from the cached
         // snapshot — either way only the new tail blocks are decompressed.
         let (block, covered_upper, payload) = crate::table::lazy_block::partial_data_block(
@@ -541,6 +565,7 @@ impl Iterator for Iter {
                     self.ecc,
                     #[cfg(zstd_any)]
                     self.zstd_dictionary.as_deref(),
+                    self.heal_hints.as_ref().map(AsRef::as_ref),
                     #[cfg(feature = "metrics")]
                     &self.metrics,
                 ) {
@@ -687,6 +712,7 @@ impl DoubleEndedIterator for Iter {
                     self.ecc,
                     #[cfg(zstd_any)]
                     self.zstd_dictionary.as_deref(),
+                    self.heal_hints.as_ref().map(AsRef::as_ref),
                     #[cfg(feature = "metrics")]
                     &self.metrics,
                 ) {

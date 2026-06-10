@@ -246,6 +246,7 @@ impl Table {
             self.metadata.ecc_params,
             #[cfg(zstd_any)]
             zstd_dict,
+            self.heal_hints.get().map(AsRef::as_ref),
             #[cfg(feature = "metrics")]
             &self.metrics,
         )
@@ -989,6 +990,7 @@ impl Table {
             self.metadata.data_block_compression,
             self.encryption.clone(),
             self.metadata.ecc_params,
+            self.heal_hints.get().cloned(),
             self.metadata.kv_checksum_algo.is_some(),
             #[cfg(zstd_any)]
             self.zstd_dictionary.clone(),
@@ -1544,6 +1546,8 @@ impl Table {
 
             #[cfg(feature = "std")]
             background_deleter: once_cell::race::OnceBox::new(),
+
+            heal_hints: once_cell::race::OnceBox::new(),
         })))
     }
 
@@ -1564,6 +1568,16 @@ impl Table {
     #[cfg(feature = "std")]
     pub(crate) fn install_background_deleter(&self, deleter: Arc<crate::BackgroundDeleter>) {
         let _ = self.0.background_deleter.set(Box::new(deleter));
+    }
+
+    /// Installs the tree-wide ECC heal-hint sink.
+    ///
+    /// Idempotent: a second call is a no-op. Called by the owning tree after
+    /// recovery and after compaction registers freshly-built tables, so a
+    /// confirmed-persistent ECC correction on a read can queue this SST for a
+    /// healing recompaction.
+    pub(crate) fn install_heal_hints(&self, hints: Arc<crate::heal_hints::HealHints>) {
+        let _ = self.0.heal_hints.set(Box::new(hints));
     }
 
     #[must_use]

@@ -33,9 +33,19 @@ pub struct SliceIndexes(pub usize, pub usize);
 /// Loads a block from disk or block cache, if cached.
 ///
 /// Also handles file descriptor opening and caching.
+///
+/// When this read recovers the payload from its Page-ECC parity (a checksum
+/// mismatch the parity repaired) the returned bytes are correct, but the on-disk
+/// copy still carries the fault. If `heal_hints` is `Some`, the loader then
+/// re-reads the same block straight from disk to tell a persistent medium fault
+/// (re-read again recovers) from a transient read-path glitch (re-read clean),
+/// and records the SST in the sink on confirmed persistence so the compaction
+/// picker can rewrite it clean. `None` disables that scheduling (the payload is
+/// still healed and returned). A cache hit never triggers this path: the cached
+/// bytes were already verified on their original read.
 #[expect(
     clippy::too_many_arguments,
-    reason = "block loading requires table id, path, file accessor, cache, handle, block type, compression, and encryption context"
+    reason = "block loading requires table id, path, file accessor, cache, handle, block type, compression, and heal context"
 )]
 pub fn load_block(
     table_id: GlobalTableId,
@@ -48,6 +58,7 @@ pub fn load_block(
     encryption: Option<&dyn EncryptionProvider>,
     ecc: Option<crate::table::block::EccParams>,
     #[cfg(zstd_any)] zstd_dict: Option<&crate::compression::ZstdDictionary>,
+    heal_hints: Option<&crate::heal_hints::HealHints>,
     #[cfg(feature = "metrics")] metrics: &Metrics,
 ) -> crate::Result<Block> {
     #[cfg(feature = "metrics")]
@@ -116,7 +127,14 @@ pub fn load_block(
     #[cfg(not(feature = "metrics"))]
     let _ = cache_event;
 
-    let block = Block::from_file(
+    let transform = build_block_transform(
+        compression,
+        encryption,
+        ecc,
+        #[cfg(zstd_any)]
+        zstd_dict,
+    )?;
+    let (block, ecc_status) = Block::from_file_with_status(
         fd.as_ref(),
         *handle,
         crate::table::block::BlockIdentity {
@@ -125,29 +143,9 @@ pub fn load_block(
             dict_id: compression.dict_id(),
             window_log: 0,
         },
-        &{
-            // ECC presence is a per-SST descriptor property (passed in by
-            // the caller from table metadata): upgrade the transform to its
-            // `*Ecc` variant when this SST was written with a recognized Page
-            // ECC scheme. On a build WITHOUT the `page_ecc` feature `with_ecc`
-            // is the identity function — the parity trailer then reads as an
-            // unrecognized opaque trailer (the read frames the payload by
-            // `data_length`, verifies its checksum, and reports
-            // `EccStatus::Unrecognized`), so the data still loads without ECC
-            // recovery rather than failing closed.
-            let t = crate::table::block::BlockTransform::from_parts(
-                compression,
-                encryption,
-                #[cfg(zstd_any)]
-                zstd_dict,
-            )?;
-            if let Some(ecc) = ecc {
-                t.with_ecc(ecc)
-            } else {
-                t
-            }
-        },
+        &transform,
     )?;
+    let corrected = matches!(ecc_status, crate::table::block::EccStatus::Corrected);
 
     if block.header.block_type != block_type {
         return Err(crate::Error::InvalidTag((
@@ -192,9 +190,178 @@ pub fn load_block(
         BlockType::Manifest | BlockType::ManifestFooter | BlockType::BlockLayout => {}
     }
 
+    // ECC recovered this block's payload from parity. The bytes returned below
+    // are correct, but the on-disk copy is still faulty: when auto-heal is on,
+    // confirm the fault is persistent and queue the SST for a healing rewrite.
+    if corrected {
+        maybe_record_persistent_heal(
+            table_id,
+            path,
+            file_accessor,
+            handle,
+            block_type,
+            compression,
+            encryption,
+            ecc,
+            #[cfg(zstd_any)]
+            zstd_dict,
+            heal_hints,
+            #[cfg(feature = "metrics")]
+            metrics,
+        );
+    }
+
     cache.insert_block(table_id, handle.offset(), block.clone());
 
     Ok(block)
+}
+
+/// Schedules a healing recompaction for `table_id` when a just-read block was
+/// ECC-corrected and the fault is confirmed persistent.
+///
+/// Call this on any read path that recovers a block from parity (full
+/// [`load_block`] and the zstd partial-decode path both feed it). No-op unless
+/// `heal_hints` is `Some` and enabled (`auto_heal`). On a corrected read it
+/// re-reads the block straight from disk (cache-bypassing) to tell a persistent
+/// medium fault from a transient read-path glitch, recording the SST only on
+/// confirmed persistence. A re-read error is treated as non-persistent: a
+/// genuinely faulty medium resurfaces on the next read, and this must never mask
+/// a live-path I/O failure.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "mirrors the block read context needed for the confirming re-read"
+)]
+pub(crate) fn maybe_record_persistent_heal(
+    table_id: GlobalTableId,
+    path: &Path,
+    file_accessor: &FileAccessor,
+    handle: &BlockHandle,
+    block_type: BlockType,
+    compression: CompressionType,
+    encryption: Option<&dyn EncryptionProvider>,
+    ecc: Option<crate::table::block::EccParams>,
+    #[cfg(zstd_any)] zstd_dict: Option<&crate::compression::ZstdDictionary>,
+    heal_hints: Option<&crate::heal_hints::HealHints>,
+    #[cfg(feature = "metrics")] metrics: &Metrics,
+) {
+    let Some(hints) = heal_hints else { return };
+    if !hints.is_enabled() {
+        return;
+    }
+    match reread_block_is_corrected(
+        table_id,
+        path,
+        file_accessor,
+        handle,
+        block_type,
+        compression,
+        encryption,
+        ecc,
+        #[cfg(zstd_any)]
+        zstd_dict,
+    ) {
+        Ok(true) => {
+            if hints.record(table_id) {
+                #[cfg(feature = "metrics")]
+                metrics
+                    .ecc_auto_heal_scheduled
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                log::warn!(
+                    "Persistent ECC correction on table {table_id:?} block {handle:?}; \
+                     queued for healing recompaction"
+                );
+            }
+        }
+        Ok(false) => log::debug!(
+            "Transient ECC correction on table {table_id:?} block {handle:?}; \
+             re-read clean, not scheduling"
+        ),
+        Err(e) => log::debug!(
+            "ECC re-read confirmation for table {table_id:?} block {handle:?} failed: {e:?}"
+        ),
+    }
+}
+
+/// Builds the [`BlockTransform`](crate::table::block::BlockTransform) for a
+/// block read from its per-SST codec context.
+///
+/// ECC presence is a per-SST descriptor property (`ecc`): the transform is
+/// upgraded to its `*Ecc` variant when this SST was written with a recognized
+/// Page ECC scheme. On a build WITHOUT the `page_ecc` feature `with_ecc` is the
+/// identity function — the parity trailer then reads as an unrecognized opaque
+/// trailer (the read frames the payload by `data_length`, verifies its
+/// checksum, and reports
+/// [`EccStatus::Unrecognized`](crate::table::block::EccStatus::Unrecognized)),
+/// so the data still loads without ECC recovery rather than failing closed.
+fn build_block_transform<'a>(
+    compression: CompressionType,
+    encryption: Option<&'a dyn EncryptionProvider>,
+    ecc: Option<crate::table::block::EccParams>,
+    #[cfg(zstd_any)] zstd_dict: Option<&'a crate::compression::ZstdDictionary>,
+) -> crate::Result<crate::table::block::BlockTransform<'a>> {
+    let t = crate::table::block::BlockTransform::from_parts(
+        compression,
+        encryption,
+        #[cfg(zstd_any)]
+        zstd_dict,
+    )?;
+    Ok(if let Some(ecc) = ecc {
+        t.with_ecc(ecc)
+    } else {
+        t
+    })
+}
+
+/// Re-reads a block straight from disk (bypassing the block cache) and reports
+/// whether its on-disk bytes are *still* ECC-corrected.
+///
+/// Used to confirm that a correction observed on a cache-miss read reflects a
+/// **persistent** on-disk fault rather than a transient read-path glitch (bad
+/// RAM / DMA / cable during the first read): a second independent read of the
+/// same offset that again recovers from parity proves the bytes on the medium
+/// are faulty. Returns `Ok(true)` when the re-read was itself ECC-corrected,
+/// `Ok(false)` when it read clean (transient) or carried no recognized parity.
+///
+/// Runs only on the cold corrected-read path, so the extra disk read costs
+/// nothing on clean reads.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "mirrors load_block's read context minus the cache"
+)]
+fn reread_block_is_corrected(
+    table_id: GlobalTableId,
+    path: &Path,
+    file_accessor: &FileAccessor,
+    handle: &BlockHandle,
+    block_type: BlockType,
+    compression: CompressionType,
+    encryption: Option<&dyn EncryptionProvider>,
+    ecc: Option<crate::table::block::EccParams>,
+    #[cfg(zstd_any)] zstd_dict: Option<&crate::compression::ZstdDictionary>,
+) -> crate::Result<bool> {
+    let (fd, _cache_event) = file_accessor.get_or_open_table(&table_id, path)?;
+    let transform = build_block_transform(
+        compression,
+        encryption,
+        ecc,
+        #[cfg(zstd_any)]
+        zstd_dict,
+    )?;
+    let (_block, ecc_status) = Block::from_file_with_status(
+        fd.as_ref(),
+        *handle,
+        crate::table::block::BlockIdentity {
+            table_id: table_id.table_id(),
+            block_type,
+            dict_id: compression.dict_id(),
+            window_log: 0,
+        },
+        &transform,
+    )?;
+    Ok(matches!(
+        ecc_status,
+        crate::table::block::EccStatus::Corrected
+    ))
 }
 
 /// Returns the length of the longest shared byte prefix of `s1` and `s2`.

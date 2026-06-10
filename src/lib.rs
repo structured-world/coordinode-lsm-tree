@@ -146,6 +146,7 @@ mod any_tree;
 mod abstract_tree;
 
 pub(crate) mod deletion_pause;
+pub mod heal_hints;
 
 // `checkpoint` is `pub(crate)`: it contains internal helpers
 // (`link_or_copy_cross_fs`, `prepare_target`, `run_checkpoint`) used by

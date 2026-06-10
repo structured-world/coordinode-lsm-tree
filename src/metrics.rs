@@ -65,6 +65,12 @@ pub struct Metrics {
 
     /// Number of range tombstone block bytes that were requested from OS or disk
     pub(crate) range_tombstone_block_io_requested: AtomicU64,
+
+    /// Number of SSTs flagged for a healing recompaction after a read recovered
+    /// a block from Page-ECC parity and confirmed the fault persistent (counted
+    /// only when `auto_heal` is enabled). Each SST is counted once per pending
+    /// schedule.
+    pub(crate) ecc_auto_heal_scheduled: AtomicUsize,
 }
 
 #[expect(
@@ -131,6 +137,12 @@ impl Metrics {
     pub fn range_tombstone_block_load_count(&self) -> usize {
         self.range_tombstone_block_load_cached.load(Relaxed)
             + self.range_tombstone_block_load_io.load(Relaxed)
+    }
+
+    /// Number of SSTs scheduled for a healing recompaction after a persistent
+    /// ECC correction on read (`auto_heal` enabled).
+    pub fn ecc_auto_heal_scheduled_count(&self) -> usize {
+        self.ecc_auto_heal_scheduled.load(Relaxed)
     }
 
     /// Number of blocks that were loaded from disk or OS page cache.

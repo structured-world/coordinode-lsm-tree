@@ -750,6 +750,20 @@ pub struct RuntimeConfig {
     /// SST; recorded per-SST alongside [`Self::ecc_scheme`].
     pub ecc_granularity: EccGranularity,
 
+    /// When `true`, a read that recovers a block from its Page-ECC parity, and
+    /// confirms the on-disk fault is persistent (via a cache-bypassing re-read),
+    /// flags the owning SST for a healing recompaction — the corrected data is
+    /// rewritten into a fresh SST so the latent fault is not re-corrected on
+    /// every subsequent read. Drive the rewrite with
+    /// [`compaction::EccHeal`](crate::compaction::EccHeal) over
+    /// [`Tree::heal_hints`](crate::Tree::heal_hints), leader-only in a clustered
+    /// deployment (compaction is a background mutation).
+    ///
+    /// Default `false`: correction-on-read still happens whenever ECC is
+    /// enabled; only the rewrite *scheduling* is opt-in, because it costs
+    /// compaction I/O. Toggling takes effect immediately for subsequent reads.
+    pub auto_heal: bool,
+
     /// Per-block seqno bounds in SST index entries (#224). When `true`,
     /// SSTs written by the next flush / compaction record each data
     /// block's `seqno_min` / `seqno_max` in its index entry
@@ -832,6 +846,7 @@ impl Default for RuntimeConfig {
             kv_checksums_ecc_override: None,
             ecc_scheme: EccScheme::Secded,
             ecc_granularity: EccGranularity::Block,
+            auto_heal: false,
             seqno_in_index: false,
             index_partition_spill_threshold: crate::table::writer::DEFAULT_SPILL_THRESHOLD,
             disable_cow_on_sst_files: true,

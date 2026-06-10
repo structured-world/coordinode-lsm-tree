@@ -10,6 +10,7 @@ pub(crate) mod leveled;
 pub(crate) mod drop_range;
 pub mod filter;
 mod flavour;
+pub(crate) mod heal;
 pub(crate) mod major;
 pub(crate) mod movedown;
 pub(crate) mod pulldown;
@@ -22,6 +23,7 @@ pub(crate) mod worker;
 
 pub use fifo::Strategy as Fifo;
 pub use filter::{CompactionFilter, Factory, ItemAccessor, Verdict};
+pub use heal::Strategy as EccHeal;
 pub use leveled::Strategy as Leveled;
 pub use tiered::Strategy as SizeTiered;
 

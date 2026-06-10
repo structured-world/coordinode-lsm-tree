@@ -344,8 +344,13 @@ impl PreparedBlock<'_> {
 /// with no available recovery). When the read *succeeds*, this reports
 /// whether the block's ECC was usable:
 ///
-/// - [`Self::Ok`] — ECC absent, or a recognized scheme that verified (and
-///   recovered, if needed).
+/// - [`Self::Ok`] — the read returned correct bytes with no ECC intervention:
+///   ECC was absent, or a recognized scheme verified the payload as-is (no
+///   repair needed).
+/// - [`Self::Corrected`] — ECC repaired the on-disk payload (the caller saw
+///   correct bytes, but the on-disk copy still holds a latent fault). Treat as
+///   a signal to confirm persistence and potentially schedule an auto-heal
+///   recompaction.
 /// - [`Self::Unrecognized`] — the block carries an ECC trailer this build
 ///   cannot interpret (an unimplemented or non-canonical scheme: Secded,
 ///   page granularity, unknown kind, …). The payload was returned (its
@@ -360,6 +365,14 @@ pub enum EccStatus {
     /// ECC trailer present but its scheme is unrecognized / unusable; the
     /// payload still verified by its checksum. Recommend recompaction.
     Unrecognized,
+    /// The on-disk payload failed its checksum and was REPAIRED by ECC
+    /// (SEC-DED single-bit heal or Reed-Solomon shard recovery): the bytes
+    /// returned to the caller are correct (they reproduce the stored
+    /// checksum), but the on-disk copy still holds the latent fault. A signal
+    /// for auto-heal — the caller may re-read to confirm the corruption is
+    /// persistent (not a transient read-path fault) and, if so, schedule a
+    /// recompaction so the corrected bytes are persisted to a fresh SST.
+    Corrected,
 }
 
 #[derive(Clone)]
@@ -396,7 +409,7 @@ impl Block {
             expect(unused_variables, reason = "recovery scheme only used under page_ecc")
         )]
         ecc_params: EccParams,
-    ) -> crate::Result<Vec<u8>> {
+    ) -> crate::Result<(Vec<u8>, bool)> {
         let mut data = vec![0u8; data_length as usize];
         reader.read_exact(&mut data)?;
 
@@ -408,7 +421,7 @@ impl Block {
                     "Checksum mismatch for block payload, got={computed}, expected={expected}",
                 );
             })?;
-            return Ok(data);
+            return Ok((data, false));
         }
 
         // ECC trailer present — always consume the parity bytes so
@@ -418,7 +431,7 @@ impl Block {
         reader.read_exact(&mut parity)?;
 
         if computed == expected {
-            return Ok(data);
+            return Ok((data, false));
         }
 
         // Mismatch — try ECC recovery before failing.
@@ -443,7 +456,7 @@ impl Block {
                          checksum mismatch (data_len={}, ecc_len={ecc_length})",
                         data.len(),
                     );
-                    return Ok(healed);
+                    return Ok((healed, true));
                 }
                 log::error!(
                     "Checksum mismatch on SEC-DED block, heal failed, \
@@ -469,7 +482,7 @@ impl Block {
                      (data_len={}, ecc_len={ecc_length})",
                     data.len(),
                 );
-                return Ok(recovered);
+                return Ok((recovered, true));
             }
             log::error!(
                 "Checksum mismatch on ECC-protected block, recovery failed, \
@@ -902,7 +915,10 @@ impl Block {
         let data = if let Some(enc) = encryption {
             // Read payload + optional ECC trailer, verify checksum
             // (with recovery on mismatch when parity is present).
-            let raw_vec = Self::read_payload_and_verify(
+            // `from_reader` returns no EccStatus, so a heal here is logged but
+            // not surfaced; the status-returning `from_file_with_status` path is
+            // what auto-heal observes.
+            let (raw_vec, _corrected) = Self::read_payload_and_verify(
                 reader,
                 header.data_length,
                 ecc_length,
@@ -1001,13 +1017,15 @@ impl Block {
                 })?;
                 s
             } else {
-                Slice::from(Self::read_payload_and_verify(
+                // from_reader has no EccStatus return; a heal is logged only.
+                let (payload, _corrected) = Self::read_payload_and_verify(
                     reader,
                     header.data_length,
                     ecc_length,
                     header.checksum,
                     block_ecc_params(&header, transform),
-                )?)
+                )?;
+                Slice::from(payload)
             };
 
             match compression {
@@ -1261,7 +1279,7 @@ impl Block {
             // unrecognized opaque trailer is excluded and discarded. With a
             // recognized scheme, run the shared helper against a cursor over
             // the post-header bytes so recovery is available on mismatch.
-            let buf = if ecc_length == 0 {
+            let (buf, payload_corrected) = if ecc_length == 0 {
                 #[expect(
                     clippy::indexing_slicing,
                     reason = "actual_data_len <= post-header len"
@@ -1279,7 +1297,7 @@ impl Block {
                 // Strip header prefix + any opaque trailer so buf is the payload.
                 buf.copy_within(header_len..header_len + actual_data_len, 0);
                 buf.truncate(actual_data_len);
-                buf
+                (buf, false)
             } else {
                 #[expect(clippy::indexing_slicing, reason = "header was decoded from buf")]
                 let mut cursor = std::io::Cursor::new(&buf[header_len..]);
@@ -1290,6 +1308,14 @@ impl Block {
                     parsed_header.checksum,
                     block_ecc_params(&parsed_header, transform),
                 )?
+            };
+
+            // Fold a successful ECC repair into the reported status (an
+            // unrecognized scheme never heals, so the two are exclusive).
+            let ecc_status = if payload_corrected {
+                EccStatus::Corrected
+            } else {
+                ecc_status
             };
 
             let decrypted = decrypt_block_payload(enc, buf, &identity)?;
@@ -1408,7 +1434,7 @@ impl Block {
             // opaque trailer); recognized-ECC blocks go through the
             // recovery-capable helper. The checksum covers exactly the
             // `data_length` payload bytes, so an opaque trailer is excluded.
-            let payload_slice: Slice = if ecc_length == 0 {
+            let (payload_slice, payload_corrected): (Slice, bool) = if ecc_length == 0 {
                 #[expect(
                     clippy::indexing_slicing,
                     reason = "actual_data_len <= post-header len"
@@ -1423,17 +1449,24 @@ impl Block {
                         parsed_header.checksum,
                     );
                 })?;
-                buf.slice(header_len..header_len + actual_data_len)
+                (buf.slice(header_len..header_len + actual_data_len), false)
             } else {
                 #[expect(clippy::indexing_slicing, reason = "header was decoded from buf")]
                 let mut cursor = std::io::Cursor::new(&buf[header_len..]);
-                Slice::from(Self::read_payload_and_verify(
+                let (payload, corrected) = Self::read_payload_and_verify(
                     &mut cursor,
                     parsed_header.data_length,
                     ecc_length,
                     parsed_header.checksum,
                     block_ecc_params(&parsed_header, transform),
-                )?)
+                )?;
+                (Slice::from(payload), corrected)
+            };
+            // Fold a successful ECC repair into the reported status.
+            let ecc_status = if payload_corrected {
+                EccStatus::Corrected
+            } else {
+                ecc_status
             };
 
             let data = match compression {
@@ -1541,7 +1574,7 @@ impl Block {
         file: &dyn FsFile,
         handle: BlockHandle,
         transform: &BlockTransform<'_>,
-    ) -> crate::Result<(Header, Slice)> {
+    ) -> crate::Result<(Header, Slice, bool)> {
         if transform.encryption().is_some() {
             return Err(crate::Error::Io(std::io::Error::other(
                 "read_data_frame: encrypted blocks are not supported on the lazy path",
@@ -1599,7 +1632,7 @@ impl Block {
             &handle,
         )?;
 
-        let payload: Slice = if ecc_length == 0 {
+        let (payload, corrected): (Slice, bool) = if ecc_length == 0 {
             #[expect(
                 clippy::indexing_slicing,
                 reason = "actual_data_len <= post-header len, checked via classify_block_trailer"
@@ -1608,20 +1641,24 @@ impl Block {
                 &buf[header_len..header_len + actual_data_len],
             ));
             checksum.check(parsed_header.checksum)?;
-            buf.slice(header_len..header_len + actual_data_len)
+            (buf.slice(header_len..header_len + actual_data_len), false)
         } else {
             #[expect(clippy::indexing_slicing, reason = "header was decoded from buf")]
             let mut cursor = std::io::Cursor::new(&buf[header_len..]);
-            Slice::from(Self::read_payload_and_verify(
+            // `corrected` is surfaced so the partial-decode caller can schedule
+            // auto-heal (the recovered bytes are correct but the on-disk copy is
+            // still faulty); a heal is also logged inside read_payload_and_verify.
+            let (frame, corrected) = Self::read_payload_and_verify(
                 &mut cursor,
                 parsed_header.data_length,
                 ecc_length,
                 parsed_header.checksum,
                 block_ecc_params(&parsed_header, transform),
-            )?)
+            )?;
+            (Slice::from(frame), corrected)
         };
 
-        Ok((parsed_header, payload))
+        Ok((parsed_header, payload, corrected))
     }
 }
 
@@ -1768,7 +1805,8 @@ mod tests {
             &transform,
         )?;
 
-        let (header, frame) = Block::read_data_frame(&tmp.file, tmp.handle, &transform)?;
+        let (header, frame, _corrected) =
+            Block::read_data_frame(&tmp.file, tmp.handle, &transform)?;
         // The returned bytes are the COMPRESSED frame: it must be smaller than
         // the payload and must decompress back to the original (proving
         // read_data_frame skipped decode yet returned a valid frame).
@@ -3531,6 +3569,54 @@ mod tests {
                 &BlockTransform::PlainEcc(EccParams::RS_4_2),
             )?;
             assert_eq!(&*block.data, PAYLOAD);
+            Ok(())
+        }
+
+        /// `from_file_with_status` reports `EccStatus::Corrected` when a read
+        /// repaired the block via ECC, and `EccStatus::Ok` for a clean read.
+        /// This is the auto-heal (#411) signal: a healed read returns the
+        /// correct bytes AND flags that the on-disk copy still holds the fault.
+        #[test]
+        fn from_file_with_status_reports_corrected_after_ecc_repair() -> crate::Result<()> {
+            let transform = BlockTransform::PlainEcc(EccParams::RS_4_2);
+            let tmp = super::write_block_to_tempfile(
+                PAYLOAD,
+                BlockIdentity::for_test(0, BlockType::Data),
+                &transform,
+            )?;
+            let path = tmp.dir.path().join("block");
+
+            // Clean read first: no repair → EccStatus::Ok.
+            {
+                let file = std::fs::File::open(&path)?;
+                let (block, status) = Block::from_file_with_status(
+                    &file,
+                    tmp.handle,
+                    BlockIdentity::for_test(0, BlockType::Data),
+                    &transform,
+                )?;
+                assert_eq!(&*block.data, PAYLOAD);
+                assert_eq!(status, EccStatus::Ok, "clean read must not flag a repair");
+            }
+
+            // Flip one payload byte so the read must repair via RS parity.
+            let mut bytes = std::fs::read(&path)?;
+            bytes[Header::MIN_LEN + 3] ^= 0x80;
+            std::fs::write(&path, &bytes)?;
+
+            let file = std::fs::File::open(&path)?;
+            let (block, status) = Block::from_file_with_status(
+                &file,
+                tmp.handle,
+                BlockIdentity::for_test(0, BlockType::Data),
+                &transform,
+            )?;
+            assert_eq!(&*block.data, PAYLOAD, "repaired bytes must equal original");
+            assert_eq!(
+                status,
+                EccStatus::Corrected,
+                "a read that repaired the block must report Corrected",
+            );
             Ok(())
         }
 

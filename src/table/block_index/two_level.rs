@@ -172,6 +172,12 @@ impl Iterator for Iter {
                     self.ecc,
                     #[cfg(zstd_any)]
                     None,
+                    // Index-block ECC corrections are healed-on-read but not yet
+                    // scheduled for recompaction (the heal sink is threaded
+                    // through the data-block paths only). An index fault
+                    // resurfaces on the next read and is rewritten whenever the
+                    // SST is otherwise recompacted.
+                    None,
                     #[cfg(feature = "metrics")]
                     &self.metrics,
                 ) {
@@ -251,6 +257,12 @@ impl DoubleEndedIterator for Iter {
                     self.encryption.as_deref(),
                     self.ecc,
                     #[cfg(zstd_any)]
+                    None,
+                    // Index-block ECC corrections are healed-on-read but not yet
+                    // scheduled for recompaction (the heal sink is threaded
+                    // through the data-block paths only). An index fault
+                    // resurfaces on the next read and is rewritten whenever the
+                    // SST is otherwise recompacted.
                     None,
                     #[cfg(feature = "metrics")]
                     &self.metrics,

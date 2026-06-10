@@ -658,6 +658,7 @@ impl AbstractTree for Tree {
             table.install_deletion_pause(Arc::clone(&self.deletion_pause));
             #[cfg(feature = "std")]
             table.install_background_deleter(Arc::clone(&self.background_deleter));
+            table.install_heal_hints(Arc::clone(&self.heal_hints));
         }
         if let Some(bfs) = blob_files {
             for bf in bfs {
@@ -1312,7 +1313,21 @@ impl Tree {
         // mutation (currently: `page_ecc = true` on a non-`page_ecc`
         // build) is rejected at update time, not silently swallowed
         // at the next manifest write.
-        self.0.runtime_config.try_update(mutator)
+        // Capture this update's `auto_heal` inside the mutation so the read-path
+        // heal gate reflects exactly the config THIS call commits, rather than a
+        // separate `load_full()` that could observe a different concurrent
+        // update's value. Concurrent `update_runtime_config` calls must be
+        // serialized by the caller (see the last-writer-wins note above); under
+        // that contract the gate and the committed config stay in sync. On a
+        // validation error `try_update` does not commit and `?` returns before
+        // the gate is touched, so it keeps tracking the unchanged config.
+        let mut auto_heal = false;
+        self.0.runtime_config.try_update(|c| {
+            mutator(c);
+            auto_heal = c.auto_heal;
+        })?;
+        self.0.heal_hints.set_enabled(auto_heal);
+        Ok(())
     }
 
     /// Snapshot of the current runtime config. Cheap atomic load —
@@ -1320,6 +1335,50 @@ impl Tree {
     #[must_use]
     pub fn runtime_config(&self) -> Arc<crate::runtime_config::RuntimeConfig> {
         self.0.runtime_config.load_full()
+    }
+
+    /// Shared handle to this tree's ECC heal-hint queue.
+    ///
+    /// A read that recovers a block from Page-ECC parity records the owning SST
+    /// here (when the on-disk fault is confirmed persistent). Pass the handle to
+    /// [`compaction::EccHeal`](crate::compaction::EccHeal) and run that strategy
+    /// via [`Tree::compact`](crate::AbstractTree::compact) — leader-only in a
+    /// clustered deployment — to rewrite the flagged SSTs clean. Check
+    /// [`HealHints::is_empty`](crate::heal_hints::HealHints::is_empty) to skip
+    /// the pass when nothing is queued.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use lsm_tree::{AbstractTree, AnyTree, Config, SequenceNumberCounter, compaction::EccHeal};
+    /// use std::sync::Arc;
+    /// # fn main() -> lsm_tree::Result<()> {
+    /// let AnyTree::Standard(tree) = Config::new(
+    ///     "/tmp/db",
+    ///     SequenceNumberCounter::default(),
+    ///     SequenceNumberCounter::default(),
+    /// )
+    /// .open()?
+    /// else {
+    ///     return Ok(());
+    /// };
+    ///
+    /// // Opt into rewrite scheduling; reads that recover a block from parity now
+    /// // flag its SST for healing.
+    /// tree.update_runtime_config(|c| c.auto_heal = true)?;
+    ///
+    /// // Drain the queue, rewriting each flagged SST clean (leader-only in a
+    /// // clustered deployment).
+    /// let hints = tree.heal_hints();
+    /// while !hints.is_empty() {
+    ///     tree.compact(Arc::new(EccHeal::new(tree.heal_hints(), u64::MAX)), 0)?;
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn heal_hints(&self) -> Arc<crate::heal_hints::HealHints> {
+        Arc::clone(&self.0.heal_hints)
     }
 
     /// Shared point-read logic for `get()` and `multi_get()`: finds the newest
@@ -2349,6 +2408,8 @@ impl Tree {
         let deletion_pause = crate::deletion_pause::DeletionPause::new_shared();
         #[cfg(feature = "std")]
         let background_deleter = Arc::new(crate::BackgroundDeleter::new(None));
+        let heal_hints =
+            crate::heal_hints::HealHints::new_shared(config.initial_runtime_config.auto_heal);
 
         // Clone the seed snapshot BEFORE moving config into the Arc
         // below — the runtime handle initializer needs it after the
@@ -2380,6 +2441,7 @@ impl Tree {
             deletion_pause: Arc::clone(&deletion_pause),
             #[cfg(feature = "std")]
             background_deleter: Arc::clone(&background_deleter),
+            heal_hints: Arc::clone(&heal_hints),
             runtime_config: Arc::new(crate::runtime_config::handle::RuntimeConfigHandle::new(
                 initial_runtime,
             )),
@@ -2409,6 +2471,7 @@ impl Tree {
             table.install_deletion_pause(Arc::clone(&deletion_pause));
             #[cfg(feature = "std")]
             table.install_background_deleter(Arc::clone(&background_deleter));
+            table.install_heal_hints(Arc::clone(&heal_hints));
         }
         for blob_file in &recovered_blobs {
             blob_file.install_deletion_pause(Arc::clone(&deletion_pause));
