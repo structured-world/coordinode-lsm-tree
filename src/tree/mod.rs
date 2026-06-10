@@ -1323,6 +1323,20 @@ impl Tree {
         self.0.runtime_config.load_full()
     }
 
+    /// Shared handle to this tree's ECC heal-hint queue.
+    ///
+    /// A read that recovers a block from Page-ECC parity records the owning SST
+    /// here (when the on-disk fault is confirmed persistent). Pass the handle to
+    /// [`compaction::EccHeal`](crate::compaction::EccHeal) and run that strategy
+    /// via [`Tree::compact`](crate::AbstractTree::compact) — leader-only in a
+    /// clustered deployment — to rewrite the flagged SSTs clean. Check
+    /// [`HealHints::is_empty`](crate::heal_hints::HealHints::is_empty) to skip
+    /// the pass when nothing is queued.
+    #[must_use]
+    pub fn heal_hints(&self) -> Arc<crate::heal_hints::HealHints> {
+        Arc::clone(&self.0.heal_hints)
+    }
+
     /// Shared point-read logic for `get()` and `multi_get()`: finds the newest
     /// entry, applies merge resolution or RT suppression, and returns the value.
     fn resolve_or_passthrough(

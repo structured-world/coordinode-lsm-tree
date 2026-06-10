@@ -48,6 +48,7 @@ pub struct HealHints {
 
 impl HealHints {
     /// Creates a fresh, empty shared hint set.
+    #[must_use]
     pub fn new_shared() -> Arc<Self> {
         Arc::new(Self::default())
     }
@@ -60,9 +61,27 @@ impl HealHints {
         self.pending.lock().insert(id)
     }
 
-    /// Returns a snapshot of the queued ids (test-only until the compaction
-    /// picker consumes the queue).
+    /// Claims one queued id, removing and returning it (`None` when empty).
+    ///
+    /// The heal compaction strategy pops one SST per pass; losing a popped id to
+    /// a failed compaction is self-correcting (the next read re-records it).
+    #[must_use]
+    pub fn pop(&self) -> Option<GlobalTableId> {
+        self.pending.lock().pop_first()
+    }
+
+    /// Returns `true` when no SST is currently queued for healing.
+    ///
+    /// Lets a scheduler skip running the heal strategy when there is nothing to
+    /// do.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.pending.lock().is_empty()
+    }
+
+    /// Returns a snapshot of the queued ids (test-only helper).
     #[cfg(test)]
+    #[must_use]
     pub fn snapshot(&self) -> Vec<GlobalTableId> {
         self.pending.lock().iter().copied().collect()
     }
