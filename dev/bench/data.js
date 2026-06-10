@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1781080272580,
+  "lastUpdate": 1781084424725,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -14898,6 +14898,84 @@ window.BENCHMARK_DATA = {
             "value": 559660.0792576612,
             "unit": "ops/sec",
             "extra": "P50: 1.6us | P99: 5.2us | P99.9: 7.8us\nthreads: 1 | elapsed: 0.36s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "c9f45ed151d4d77b8b4c3700338abcd6f8cea1cd",
+          "message": "feat(tooling): key-free forensic block structure dump (#256) (#447)\n\n## Summary\n\nExtends the key-free forensic `sst-dump dump-block` from crypto-envelope\ninspection to full **block structure** dumping, and adds the supporting\npublic surface in `lsm_tree::inspect`.\n\n- **`dump-block` is now dual-mode.** A non-encrypted block (previously\nan error) dumps its plaintext structure: for a zstd payload it walks the\ninner blocks **key-free, without decompression** and prints a per-block\ncensus (index / type / on-disk length / regenerated size / last flag);\nan uncompressed payload is reported as non-zstd. An encrypted block\nkeeps the AAD-bound envelope dump and reports `inner_zstd_frame: null`\n(the compressed stream is sealed inside the AEAD ciphertext).\n- **Page ECC trailer reporting** from the SST's own metadata: scheme +\nper-block parity-trailer length. Key-free for non-encrypted SSTs;\n`unknown` for encrypted SSTs whose ECC descriptor is sealed under AEAD.\n- **New public API in `lsm_tree::inspect`:** `census_zstd_frame` /\n`is_zstd_frame` / `ZstdFrameCensus` / `InnerZstdBlock` /\n`ZstdBlockType`, plus `EccSchemeInfo` and `TableProperties::ecc_scheme`.\nThe frame walk is a minimal structural parse of the frozen zstd\nframe/block-header format (RFC 8878) — structured-zstd 0.0.33 exposes no\npublic structural-walk API.\n\n## Architectural limits (documented, by construction)\n\n1. Inner zstd census is impossible for encrypted blocks key-free\n(ciphertext opaque) — census applies only to non-encrypted blocks, which\nis also the only tier with multi-inner-block frames.\n2. Page ECC scheme for an encrypted SST is not recoverable key-free\n(descriptor under AEAD) → reported as `unknown`.\n3. Suite-mix corpus is single-suite (AES-256-GCM): ChaCha20-Poly1305 is\na defined suite but has no public provider (separate work).\n\n## Testing\n\n- Full suite `--all-features`: 2051 passed, 0 failed\n- 9 `inspect` census unit tests (hand-built + real-frame) + 2 doctests\n- 8 `dump-block` integration smoke tests, incl. a {None, Lz4, Zstd} x\n{AES-encrypted, plain} corpus round-trip\n- `cargo clippy --all-features` and `--no-default-features --features\nzstd,lz4 --all-targets` both clean\n\nPart of #256\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n\n## Summary by CodeRabbit\n\n## Release Notes\n\n* **New Features**\n* `sst-dump dump-block` now provides key-free forensic analysis of zstd\nframe structure and page-ECC scheme details for plaintext blocks.\n* Improved handling and reporting of encrypted vs. plaintext block\nmetadata in YAML output.\n  * Enhanced `--reconstruct-aad` with clearer error reporting.\n\n* **Tests**\n* Expanded smoke test coverage for plaintext and encrypted blocks across\ncompression types.\n\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-06-10T12:39:17+03:00",
+          "tree_id": "4aae960f20ef1e3ea659d3ca1bfc97aaefdfdd3c",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/c9f45ed151d4d77b8b4c3700338abcd6f8cea1cd"
+        },
+        "date": 1781084412071,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 2063323.2459867047,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.6us | P99.9: 3.7us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1172540.8451818635,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.2us | P99.9: 4.3us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 661587.7479427028,
+            "unit": "ops/sec",
+            "extra": "P50: 1.4us | P99: 4.6us | P99.9: 7.2us\nthreads: 1 | elapsed: 0.30s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3681822.089570263,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 3.1us | P99.9: 5.7us\nthreads: 1 | elapsed: 0.05s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 431829.6579857721,
+            "unit": "ops/sec",
+            "extra": "P50: 2.0us | P99: 5.4us | P99.9: 8.2us\nthreads: 1 | elapsed: 0.46s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 216550.29104245428,
+            "unit": "ops/sec",
+            "extra": "P50: 4.2us | P99: 9.3us | P99.9: 11.6us\nthreads: 1 | elapsed: 0.92s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1187535.2594062707,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.2us | P99.9: 4.8us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1160662.1310505355,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 1.5us | P99.9: 2.7us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 554513.2923712146,
+            "unit": "ops/sec",
+            "extra": "P50: 1.6us | P99: 5.1us | P99.9: 7.8us\nthreads: 1 | elapsed: 0.36s | num: 200000 | iterations: 3"
           }
         ]
       }
