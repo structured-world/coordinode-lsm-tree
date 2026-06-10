@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1781051292633,
+  "lastUpdate": 1781055558768,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -14586,6 +14586,84 @@ window.BENCHMARK_DATA = {
             "value": 545864.8204310259,
             "unit": "ops/sec",
             "extra": "P50: 1.6us | P99: 4.9us | P99.9: 7.3us\nthreads: 1 | elapsed: 0.37s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "9d862a72024d669a16286e2f85d5026317b62dbb",
+          "message": "fix(verify): don't sleep the scrub throttle after the last SST (#443)\n\n## Summary\n\nPost-merge follow-up to #435 (#300) addressing CodeRabbit review on the\nmerged PR.\n\n## Fixes\n\n1. **Throttle sleeps after the last SST** (Major). The inter-SST scrub\nthrottle slept unconditionally after every scan in both the sequential\nand worker loops, so a single-table scrub (or a worker after its final\ntable) waited one extra throttle interval before returning — a finished\nscrub looked hung for large throttle values. Now the sleep fires only\nwhen another table remains: the sequential loop skips the final\niteration; each worker claims its next index first and pauses only if\nthat index still maps to a table.\n\n2. **`verify_checksum` doc overpromise** (Minor). The docs claimed\nper-entry indices and ECC-correction counts, but\n`verify_block_checksums*` report at block granularity\n(`BlockVerifyReport`: file + offset). Docs corrected to match what the\nAPI actually returns.\n\n## Testing\n\n- New regression test\n`verify_checksum_with_throttle_does_not_sleep_after_last_sst`: a\nsingle-SST scrub under a 400ms throttle must return in under half an\ninterval. Verified test-first — it failed at ~404ms against the pre-fix\ncode and passes after.\n- `clippy --lib --all-features` clean; `fmt --check` clean; full suite\ngreen (the only failure is the known `encryption_stress` SLOW test\nflaking under full-suite parallel load — passes in isolation, unrelated\nto this change).\n\nPart of #300\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n## Summary by CodeRabbit\n\n* **Bug Fixes**\n* Removed an unnecessary throttling delay at the end of verification,\nimproving completion time for final storage structures.\n\n* **Tests**\n* Added a regression test ensuring verification completes quickly when\nonly a single storage structure is processed.\n\n* **Documentation**\n* Clarified verification and reporting behavior, including how\nblock-level and file-level findings are represented.\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-06-10T00:34:15Z",
+          "tree_id": "8a9dbe11b09abae67ab9fa7abfb74dc3d44156f6",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/9d862a72024d669a16286e2f85d5026317b62dbb"
+        },
+        "date": 1781055548511,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 2044609.9542571683,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.6us | P99.9: 3.7us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1169791.6832630862,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.2us | P99.9: 4.4us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 662808.3685694138,
+            "unit": "ops/sec",
+            "extra": "P50: 1.4us | P99: 4.5us | P99.9: 7.0us\nthreads: 1 | elapsed: 0.30s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3678053.7063885126,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 3.1us | P99.9: 5.6us\nthreads: 1 | elapsed: 0.05s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 437256.7643102196,
+            "unit": "ops/sec",
+            "extra": "P50: 2.0us | P99: 5.4us | P99.9: 8.2us\nthreads: 1 | elapsed: 0.46s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 217652.23554751967,
+            "unit": "ops/sec",
+            "extra": "P50: 4.2us | P99: 9.2us | P99.9: 11.5us\nthreads: 1 | elapsed: 0.92s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1178582.913861924,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.2us | P99.9: 4.8us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1164740.113722313,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 1.4us | P99.9: 2.7us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 546374.3985435495,
+            "unit": "ops/sec",
+            "extra": "P50: 1.7us | P99: 5.0us | P99.9: 7.5us\nthreads: 1 | elapsed: 0.37s | num: 200000 | iterations: 3"
           }
         ]
       }
