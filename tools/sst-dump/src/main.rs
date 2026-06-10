@@ -13,7 +13,8 @@ use clap::{Parser, Subcommand};
 use lsm_tree::coding::Decode;
 use lsm_tree::encryption::{parse_encrypted_block_metadata, reconstruct_block_aad};
 use lsm_tree::inspect::{
-    iter_data_block_entries, read_filter_stats, read_table_properties, read_top_level_index_entries,
+    EccSchemeInfo, ZstdBlockType, census_zstd_frame, is_zstd_frame, iter_data_block_entries,
+    read_filter_stats, read_table_properties, read_top_level_index_entries,
 };
 use lsm_tree::table::block::Header;
 use lsm_tree::verify::{BlockVerifyError, verify_sst_file};
@@ -183,12 +184,27 @@ enum Command {
     /// section at all) exit 0 with a "no filter installed" notice.
     FilterStats,
 
-    /// Forensic structural dump of a single encrypted block WITHOUT the
-    /// key. Reads the `Header` at `offset`, then parses the block's
-    /// AAD-bound `MetadataFrame` envelope (no decryption, no live
-    /// process) and prints the cryptographic parameters as YAML: format
-    /// version, suite, key epoch, block type, compression, dict id,
-    /// window log, block flags, nonce, AEAD tag, ciphertext length.
+    /// Forensic structural dump of a single block WITHOUT the key. Reads the
+    /// `Header` at `offset`, then dumps the block's structure as YAML (no
+    /// decryption, no live process). The output adapts to the block:
+    ///
+    /// - **Encrypted block** (AAD-bound `MetadataFrame` envelope): prints the
+    ///   cryptographic parameters — format version, suite, key epoch, block
+    ///   type, compression, dict id, window log, block flags, nonce, AEAD tag,
+    ///   ciphertext length. The inner zstd-block census is reported as `null`:
+    ///   the compressed stream is sealed inside the AEAD ciphertext and cannot
+    ///   be walked without the key.
+    /// - **Non-encrypted block**: reports the plaintext structure. For a
+    ///   zstd-compressed payload it walks the inner block chain key-free (no
+    ///   decompression) and prints a per-block census — index, type
+    ///   (raw / rle / compressed), on-disk content length, regenerated size
+    ///   (for raw / rle), and the last-block flag — which localises a truncated
+    ///   or malformed inner block in a large cold-tier frame. An uncompressed
+    ///   payload is reported as non-zstd.
+    ///
+    /// Page-ECC presence is reported from the SST's own metadata when readable
+    /// key-free (non-encrypted SSTs); an encrypted SST's ECC descriptor is
+    /// sealed under AEAD and reported as `unknown`.
     ///
     /// Use when a production block fails to decode and on-call needs the
     /// block's structure without the key. The AAD-binding fields
@@ -877,17 +893,54 @@ fn run_dump_block(
         return ExitCode::FAILURE;
     }
 
-    let meta = match parse_encrypted_block_metadata(&payload) {
-        Ok(m) => m,
-        Err(e) => {
-            eprintln!(
-                "block at offset {offset} is not an AAD-bound encrypted block \
-                 (no MetadataFrame envelope): {e:?}"
-            );
-            return ExitCode::FAILURE;
-        }
-    };
+    // YAML preamble common to both the encrypted and plaintext paths.
+    println!("file: {}", format_key(path.to_string_lossy().as_bytes()));
+    println!("block_offset: {offset}");
+    println!("header_block_type: {:?}", header.block_type);
 
+    // Branch on whether the payload parses as an AAD-bound encrypted envelope.
+    // A non-encrypted block has no `MetadataFrame`; instead of erroring we dump
+    // its plaintext structure (inner zstd-block census key-free). A *corrupt*
+    // encrypted block also lands here — the plaintext path reports it as
+    // non-encrypted / non-zstd, which is the honest signal without the key.
+    match parse_encrypted_block_metadata(&payload) {
+        Ok(meta) => {
+            dump_encrypted_block(offset, &meta, &payload, tree_id, table_id, reconstruct_aad)
+        }
+        Err(_) => {
+            if reconstruct_aad {
+                // AAD reconstruction only applies to an AAD-bound encrypted
+                // block; there is nothing to rebuild for a plaintext one.
+                eprintln!(
+                    "error: --reconstruct-aad requires an AAD-bound encrypted block; \
+                     this block has no MetadataFrame envelope"
+                );
+                return ExitCode::FAILURE;
+            }
+            dump_plaintext_block(&payload)
+        }
+    }
+
+    // Page ECC is a per-SST descriptor property reported from the SST's own
+    // metadata, independent of the per-block envelope. Done last so it trails
+    // the per-block dump.
+    report_page_ecc(path, payload.len());
+
+    ExitCode::SUCCESS
+}
+
+/// Dumps the AAD-bound encrypted envelope's cryptographic parameters (key-free)
+/// and echoes the caller-supplied identity fields. The inner zstd-block census
+/// is intentionally absent: the compressed frame lives inside the AEAD
+/// ciphertext, which is opaque without the key.
+fn dump_encrypted_block(
+    offset: u64,
+    meta: &lsm_tree::encryption::EncryptedBlockMetadata,
+    payload: &[u8],
+    tree_id: Option<u64>,
+    table_id: Option<u64>,
+    reconstruct_aad: bool,
+) {
     // Spec §5.1 CompressionType registry.
     let compression = match meta.compression_type {
         0 => "None",
@@ -897,11 +950,7 @@ fn run_dump_block(
         _ => "unknown",
     };
 
-    // YAML output (machine-parseable for incident postmortems).
-    println!("file: {}", format_key(path.to_string_lossy().as_bytes()));
-    println!("block_offset: {offset}");
     println!("encrypted: true");
-    println!("header_block_type: {:?}", header.block_type);
     println!("format_version: {}", meta.format_version);
     println!("suite: {:?}", meta.suite_id);
     println!("suite_byte: {}", meta.suite_id.as_byte());
@@ -915,6 +964,9 @@ fn run_dump_block(
     println!("nonce: \"{}\"", hex_string(&meta.nonce));
     println!("aead_tag: \"{}\"", hex_string(&meta.aead_tag));
     println!("ciphertext_len: {}", meta.ciphertext_len);
+    // The compressed stream is sealed inside the AEAD ciphertext, so a key-free
+    // structural walk of the inner zstd blocks is impossible by construction.
+    println!("inner_zstd_frame: null  # ciphertext opaque without the key");
 
     // tree_id / table_id / block_offset are AAD-binding but NOT stored on
     // disk (supplied from read context at decrypt time), so they are echoed
@@ -937,16 +989,121 @@ fn run_dump_block(
                 "error: --reconstruct-aad requires --table-id (the AAD binds table_id, \
                  which is not stored on disk)"
             );
-            return ExitCode::FAILURE;
+            // Caller still gets a non-zero exit via the missing field; we keep
+            // the structural dump above so the operator sees the envelope.
+            std::process::exit(1);
         };
-        match reconstruct_block_aad(&payload, tid) {
+        match reconstruct_block_aad(payload, tid) {
             Ok(aad) => println!("reconstructed_aad: \"{}\"", hex_string(&aad)),
             Err(e) => {
-                eprintln!("error: reconstruct AAD: {e:?}");
-                return ExitCode::FAILURE;
+                eprintln!("error: reconstruct AAD at offset {offset}: {e:?}");
+                std::process::exit(1);
             }
         }
     }
+}
 
-    ExitCode::SUCCESS
+/// Dumps a non-encrypted block's plaintext structure. When the payload is a
+/// zstd frame, walks its inner blocks key-free (no decompression) and prints
+/// a per-block census; otherwise reports the payload as raw / non-zstd.
+fn dump_plaintext_block(payload: &[u8]) {
+    println!("encrypted: false");
+    println!("payload_len: {}", payload.len());
+
+    if !is_zstd_frame(payload) {
+        // Raw (uncompressed), lz4, or a checked-KV layout: no zstd frame to
+        // walk. The block's whole-payload XXH3-128 (in the Header) is the
+        // integrity signal here; there is no inner structure to enumerate.
+        println!("compression: none-or-non-zstd");
+        println!("inner_zstd_frame: null  # payload is not a zstd frame");
+        return;
+    }
+
+    println!("compression: zstd");
+    let census = match census_zstd_frame(payload) {
+        Ok(c) => c,
+        Err(e) => {
+            // A zstd magic with a malformed/truncated frame: report the parse
+            // failure rather than a block list. This is itself a forensic
+            // signal (the frame header or a block ran past EOF).
+            println!("inner_zstd_frame: malformed  # {e}");
+            return;
+        }
+    };
+
+    println!("inner_zstd_frame:");
+    println!("  frame_header_len: {}", census.frame_header_len);
+    match census.window_size {
+        Some(w) => println!("  window_size: {w}"),
+        None => println!("  window_size: null"),
+    }
+    match census.dictionary_id {
+        Some(d) => println!("  dictionary_id: {d}"),
+        None => println!("  dictionary_id: null"),
+    }
+    match census.frame_content_size {
+        Some(s) => println!("  frame_content_size: {s}"),
+        None => println!("  frame_content_size: null"),
+    }
+    println!("  content_checksum: {}", census.content_checksum);
+    println!("  block_count: {}", census.blocks.len());
+    println!("  blocks:");
+    for b in &census.blocks {
+        let kind = match b.block_type {
+            ZstdBlockType::Raw => "raw",
+            ZstdBlockType::Rle => "rle",
+            ZstdBlockType::Compressed => "compressed",
+        };
+        // Compressed blocks don't carry their regenerated size in the header.
+        let decompressed = match b.decompressed_len {
+            Some(n) => n.to_string(),
+            None => "null".to_string(),
+        };
+        println!(
+            "    - {{index: {}, type: {kind}, header_offset: {}, content_len: {}, \
+             decompressed_len: {decompressed}, last: {}}}",
+            b.index, b.header_offset, b.content_len, b.last,
+        );
+    }
+}
+
+/// Reports the SST's Page-ECC parity layout from its own metadata, and (when a
+/// scheme is present) the per-block parity-trailer length for a `payload_len`
+/// block. The SST's ECC descriptor lives in its meta block: readable key-free
+/// for a non-encrypted SST, but sealed under AEAD for an encrypted one — in
+/// which case the scheme is reported as unknown.
+fn report_page_ecc(path: &std::path::Path, payload_len: usize) {
+    match read_table_properties(path) {
+        Ok(props) => match props.ecc_scheme {
+            Some(scheme) => {
+                println!("page_ecc: true");
+                println!("ecc_recognized: {}", !props.ecc_unrecognized);
+                match scheme {
+                    EccSchemeInfo::Shard {
+                        data_shards,
+                        parity_shards,
+                    } => println!("ecc_scheme: shard(data={data_shards}, parity={parity_shards})"),
+                    EccSchemeInfo::Secded => println!("ecc_scheme: secded"),
+                    // `EccSchemeInfo` is `#[non_exhaustive]`: a future lib
+                    // release can add a scheme this tool predates. Report it
+                    // generically rather than failing the dump.
+                    _ => println!("ecc_scheme: unknown  # scheme newer than this tool"),
+                }
+                println!(
+                    "ecc_parity_trailer_len: {}  # bytes trailing this block's payload on disk",
+                    scheme.parity_trailer_len(payload_len),
+                );
+            }
+            None => println!("page_ecc: false"),
+        },
+        Err(_) => {
+            // Either an encrypted SST (meta sealed under AEAD, no provider here)
+            // or an unreadable meta block. Report the limit honestly rather than
+            // guessing.
+            println!(
+                "page_ecc: unknown  # SST meta not readable key-free \
+                 (encrypted SSTs store the ECC descriptor under AEAD)"
+            );
+        }
+    }
 }
