@@ -417,7 +417,18 @@ pub fn parse_encrypted_block_metadata(
         1,
         MAX_BODY_LEN,
         DecryptError::MalformedBodyFrame,
-    )? as usize;
+    )?;
+    // The length-only read does not consume the payload, so verify the input
+    // actually contains the advertised ciphertext bytes — otherwise a block cut
+    // off right after the BodyFrame header would be reported as structurally
+    // valid with a ciphertext_len for bytes that aren't there.
+    let remaining = u64::try_from(bytes.len())
+        .unwrap_or(u64::MAX)
+        .saturating_sub(cursor.position());
+    if u64::from(ciphertext_len) > remaining {
+        return Err(DecryptError::MalformedBodyFrame("truncated frame payload"));
+    }
+    let ciphertext_len = ciphertext_len as usize;
     Ok(EncryptedBlockMetadata {
         format_version: parsed.ctx.header_byte >> 4,
         key_epoch: parsed.ctx.key_epoch,
@@ -835,6 +846,29 @@ mod tests {
         // Garbage / truncated input is a typed error, never a panic.
         assert!(parse_encrypted_block_metadata(b"not a frame").is_err());
         assert!(parse_encrypted_block_metadata(&sealed[..10]).is_err());
+    }
+
+    #[test]
+    fn parse_metadata_rejects_truncated_body() {
+        // Regression: the forensic parser reads only the BodyFrame header (for
+        // ciphertext_len) without the payload. A block cut off right after that
+        // header — full MetadataFrame + BodyFrame header, but zero ciphertext
+        // bytes — must still be rejected, not reported as structurally valid
+        // with a ciphertext_len for bytes that aren't there.
+        let sealed = encrypt_block(b"forensic payload bytes", &id(), &ctx(), &chain()).unwrap();
+        // MetadataFrame = 8-byte SFA header + 39-byte payload; BodyFrame header
+        // = 8 bytes. Cut to exactly that boundary: header present, body absent.
+        let cut = 8 + METADATA_PAYLOAD_LEN_V1 as usize + 8;
+        assert!(
+            sealed.len() > cut,
+            "test setup: sealed block must extend past the body header",
+        );
+        let err = parse_encrypted_block_metadata(&sealed[..cut])
+            .expect_err("truncated body must be rejected");
+        assert!(
+            matches!(err, DecryptError::MalformedBodyFrame(_)),
+            "expected MalformedBodyFrame for a truncated body, got {err:?}",
+        );
     }
 
     #[test]
