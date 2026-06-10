@@ -450,6 +450,117 @@ impl BlockVerifyReport {
     }
 }
 
+/// Options for the block-checksum scrubber
+/// ([`verify_block_checksums_with`] / [`AbstractTree::verify_checksum_with`](crate::AbstractTree::verify_checksum_with)).
+#[derive(Clone, Debug)]
+pub struct VerifyOptions {
+    /// Number of SSTs to scan concurrently. Clamped to `>= 1` and to the table
+    /// count. `1` (the default) scans sequentially in table order with no
+    /// thread spawn. Per-SST scans are independent (each opens its own file
+    /// through the table's `Fs` handle), so they parallelize cleanly.
+    pub parallelism: usize,
+
+    /// Minimum delay each worker waits after finishing one SST before taking
+    /// the next, capping I/O pressure on a production box during a scrub.
+    /// `None` (default) runs at full speed.
+    pub throttle: Option<std::time::Duration>,
+}
+
+impl Default for VerifyOptions {
+    fn default() -> Self {
+        Self {
+            parallelism: 1,
+            throttle: None,
+        }
+    }
+}
+
+impl VerifyOptions {
+    /// Sets the number of SSTs to scan concurrently.
+    #[must_use]
+    pub const fn parallelism(mut self, workers: usize) -> Self {
+        self.parallelism = workers;
+        self
+    }
+
+    /// Sets the per-worker inter-SST throttle delay.
+    #[must_use]
+    pub const fn throttle(mut self, delay: std::time::Duration) -> Self {
+        self.throttle = Some(delay);
+        self
+    }
+}
+
+/// Merges a per-SST partial report into an accumulator.
+fn merge_report(dst: &mut BlockVerifyReport, src: BlockVerifyReport) {
+    dst.sst_files_scanned += src.sst_files_scanned;
+    dst.blocks_scanned += src.blocks_scanned;
+    dst.errors.extend(src.errors);
+    dst.warnings.extend(src.warnings);
+}
+
+/// Scans one SST and returns a partial report (`sst_files_scanned == 1`).
+///
+/// Self-contained per table: opens the file through the table's own `Fs`
+/// handle, sizes encryption overhead and ECC params from the table's
+/// descriptor, so it can run on its own worker thread without shared state.
+fn scan_one_table(table: &crate::table::Table) -> BlockVerifyReport {
+    let mut report = BlockVerifyReport {
+        sst_files_scanned: 1,
+        ..BlockVerifyReport::default()
+    };
+    let path: &Path = &table.path;
+    let table_id = table.id();
+
+    // Tables whose ECC descriptor decodes to a scheme this build can't apply
+    // can't have their SST-block parity trailers sized (the length isn't
+    // derivable without the scheme), so those sections are skipped with a
+    // warning rather than mis-walked. The self-describing `meta` / `meta_mid`
+    // sections are still walked (parity sized from their own `block_flags`),
+    // so corruption there is NOT downgraded. The per-block read path still
+    // serves the data (framed by data_length, checksum-verified), hence a
+    // warning, not an error.
+    let ecc_unrecognized = table.metadata.ecc_unrecognized;
+    if ecc_unrecognized {
+        log::warn!(
+            "table {table_id} at {}: unrecognized ECC scheme — skipping the \
+             ECC-dependent block sections; recompact to re-stamp with a \
+             supported scheme",
+            path.display(),
+        );
+        report.warnings.push(BlockVerifyWarning::UnrecognizedEcc {
+            table_id,
+            path: path.to_path_buf(),
+        });
+    }
+
+    // Use each Table's own `Fs` handle (StdFs, MemFs, IoUring, …).
+    // Encryption overhead is per-table (different keys / AEAD suites can attach
+    // to different SSTs), so feed each table's `max_overhead()` separately.
+    let max_enc_overhead = table.encryption.as_ref().map_or(0u32, |e| e.max_overhead());
+    match scan_sst_blocks(
+        &*table.fs,
+        path,
+        table_id,
+        max_enc_overhead,
+        table.metadata.ecc_params,
+        ecc_unrecognized,
+    ) {
+        Ok(per_file) => {
+            report.blocks_scanned += per_file.blocks_scanned;
+            report.errors.extend(per_file.errors);
+        }
+        Err(error) => {
+            report.errors.push(BlockVerifyError::SstFileUnreadable {
+                table_id,
+                path: path.to_path_buf(),
+                error,
+            });
+        }
+    }
+    report
+}
+
 /// Walks every block in every SST referenced by the tree's current
 /// version and verifies each block's XXH3 checksum.
 ///
@@ -476,65 +587,76 @@ impl BlockVerifyReport {
 /// path does not need to reach checksum-level corruption.
 #[must_use]
 pub fn verify_block_checksums(tree: &impl crate::AbstractTree) -> BlockVerifyReport {
+    verify_block_checksums_with(tree, &VerifyOptions::default())
+}
+
+/// Like [`verify_block_checksums`] but with configurable parallelism and
+/// throttle (see [`VerifyOptions`]).
+///
+/// With `parallelism == 1` (default) SSTs are scanned sequentially in table
+/// order. With `> 1`, up to that many worker threads pull SSTs from a shared
+/// cursor and scan them concurrently (each scan is independent — its own file
+/// handle through the table's `Fs`), then their partial reports are merged.
+/// Parallel runs report the same findings as a sequential run; only the order
+/// of `errors` / `warnings` may differ. `throttle` makes each worker pause
+/// between SSTs so a scrub does not saturate production I/O.
+#[must_use]
+pub fn verify_block_checksums_with(
+    tree: &impl crate::AbstractTree,
+    options: &VerifyOptions,
+) -> BlockVerifyReport {
     let version = tree.current_version();
-    let mut report = BlockVerifyReport::default();
+    let tables: Vec<crate::table::Table> = version.iter_tables().cloned().collect();
 
-    for table in version.iter_tables() {
-        let path: &Path = &table.path;
-        let table_id = table.id();
-        report.sst_files_scanned += 1;
+    let workers = options.parallelism.max(1).min(tables.len().max(1));
 
-        // Tables whose ECC descriptor decodes to a scheme this build can't
-        // apply can't have their SST-block parity trailers sized (the length
-        // isn't derivable without the scheme), so those sections are skipped
-        // with a warning rather than mis-walked. The walk still covers the
-        // self-describing `meta` / `meta_mid` sections (which size parity from
-        // their own `block_flags`), so corruption there is NOT downgraded. The
-        // per-block read path still serves the data (framed by data_length,
-        // checksum-verified), hence a warning, not an error.
-        let ecc_unrecognized = table.metadata.ecc_unrecognized;
-        if ecc_unrecognized {
-            log::warn!(
-                "table {table_id} at {}: unrecognized ECC scheme — skipping the \
-                 ECC-dependent block sections; recompact to re-stamp with a \
-                 supported scheme",
-                path.display(),
-            );
-            report.warnings.push(BlockVerifyWarning::UnrecognizedEcc {
-                table_id,
-                path: path.to_path_buf(),
-            });
-        }
-
-        // Use each Table's own `Fs` handle (StdFs, MemFs, IoUring, …).
-        // `std::fs::File::open` is wrong here: it skips the pluggable
-        // backend and produces NotFound on MemFs-only trees. Encryption
-        // overhead is also per-table (different keys / AEAD suites can
-        // attach to different SSTs once #251 lands), so feed each
-        // table's `max_overhead()` separately.
-        let max_enc_overhead = table.encryption.as_ref().map_or(0u32, |e| e.max_overhead());
-        match scan_sst_blocks(
-            &*table.fs,
-            path,
-            table_id,
-            max_enc_overhead,
-            table.metadata.ecc_params,
-            ecc_unrecognized,
-        ) {
-            Ok(per_file) => {
-                report.blocks_scanned += per_file.blocks_scanned;
-                report.errors.extend(per_file.errors);
-            }
-            Err(error) => {
-                report.errors.push(BlockVerifyError::SstFileUnreadable {
-                    table_id,
-                    path: path.to_path_buf(),
-                    error,
-                });
+    // Sequential fast path: no thread spawn, deterministic table order.
+    if workers <= 1 {
+        let mut report = BlockVerifyReport::default();
+        for table in &tables {
+            merge_report(&mut report, scan_one_table(table));
+            if let Some(delay) = options.throttle {
+                std::thread::sleep(delay);
             }
         }
+        return report;
     }
 
+    let cursor = std::sync::atomic::AtomicUsize::new(0);
+    let partials = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..workers)
+            .map(|_| {
+                scope.spawn(|| {
+                    let mut local = BlockVerifyReport::default();
+                    loop {
+                        let idx = cursor.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let Some(table) = tables.get(idx) else {
+                            break;
+                        };
+                        merge_report(&mut local, scan_one_table(table));
+                        if let Some(delay) = options.throttle {
+                            std::thread::sleep(delay);
+                        }
+                    }
+                    local
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| match handle.join() {
+                Ok(local) => local,
+                // A scrub worker panicking is a bug, not a corruption finding —
+                // propagate it rather than silently dropping that worker's SSTs.
+                Err(payload) => std::panic::resume_unwind(payload),
+            })
+            .collect::<Vec<_>>()
+    });
+
+    let mut report = BlockVerifyReport::default();
+    for partial in partials {
+        merge_report(&mut report, partial);
+    }
     report
 }
 
@@ -1833,5 +1955,111 @@ mod block_verify_tests {
             "header decoded successfully, so blocks_scanned must count this block \
              even though the data segment read failed",
         );
+    }
+
+    /// Builds a tree with `batches` separate L0 SSTs (one flush per batch) so
+    /// the parallel scrubber actually has multiple files to fan out over.
+    fn populate_multi_sst(dir: &std::path::Path, batches: usize, per_batch: usize) {
+        let cfg = Config::new(
+            dir,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .data_block_compression_policy(CompressionPolicy::all(CompressionType::None));
+        let tree = cfg.open().unwrap();
+        let mut seqno = 1u64;
+        for b in 0..batches {
+            for i in 0..per_batch {
+                let key = format!("b{b:03}k{i:08}");
+                tree.insert(key.as_bytes(), b"v".as_slice(), seqno);
+                seqno += 1;
+            }
+            tree.flush_active_memtable(seqno).unwrap();
+            seqno += 1;
+        }
+        drop(tree);
+    }
+
+    #[test]
+    fn verify_checksum_method_on_clean_tree_is_ok() {
+        let dir = tempfile::tempdir().unwrap();
+        populate_tree(dir.path(), 500);
+        let tree = reopen_tree(dir.path());
+        let report = tree.verify_checksum();
+        assert!(report.is_ok(), "clean tree must verify clean: {report:?}");
+        assert!(report.sst_files_scanned >= 1);
+        assert!(report.blocks_scanned >= 1);
+    }
+
+    #[test]
+    fn verify_checksum_with_parallel_matches_sequential() {
+        let dir = tempfile::tempdir().unwrap();
+        populate_multi_sst(dir.path(), 5, 300);
+        let tree = reopen_tree(dir.path());
+
+        let seq = tree.verify_checksum_with(&VerifyOptions::default());
+        let par = tree.verify_checksum_with(&VerifyOptions::default().parallelism(4));
+
+        assert!(
+            seq.sst_files_scanned >= 2,
+            "need >1 SST to exercise parallelism, got {}",
+            seq.sst_files_scanned,
+        );
+        // Parallel run reports the SAME findings as sequential — only order may
+        // differ. Counts must match exactly.
+        assert_eq!(seq.sst_files_scanned, par.sst_files_scanned);
+        assert_eq!(seq.blocks_scanned, par.blocks_scanned);
+        assert_eq!(seq.errors.len(), par.errors.len());
+        assert!(
+            seq.is_ok() && par.is_ok(),
+            "clean tree: seq={seq:?} par={par:?}"
+        );
+    }
+
+    #[test]
+    fn verify_checksum_with_parallel_detects_corruption() {
+        use crate::table::block::Header;
+        let dir = tempfile::tempdir().unwrap();
+        populate_multi_sst(dir.path(), 4, 300);
+
+        let sst_path = pick_first_sst_path(dir.path());
+        let flip_offset = Header::MIN_LEN as u64;
+        {
+            let mut f = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&sst_path)
+                .unwrap();
+            f.seek(SeekFrom::Start(flip_offset)).unwrap();
+            let mut byte = [0u8; 1];
+            f.read_exact(&mut byte).unwrap();
+            byte[0] ^= 0xFF;
+            f.seek(SeekFrom::Start(flip_offset)).unwrap();
+            f.write_all(&byte).unwrap();
+            f.sync_all().unwrap();
+        }
+
+        let tree = reopen_tree(dir.path());
+        let report = tree.verify_checksum_with(&VerifyOptions::default().parallelism(4));
+        assert!(
+            !report.is_ok(),
+            "parallel scrub must surface the flipped byte: {report:?}",
+        );
+    }
+
+    #[test]
+    fn verify_checksum_with_throttle_completes_clean() {
+        let dir = tempfile::tempdir().unwrap();
+        populate_multi_sst(dir.path(), 3, 200);
+        let tree = reopen_tree(dir.path());
+        let opts = VerifyOptions::default()
+            .parallelism(2)
+            .throttle(std::time::Duration::from_millis(1));
+        let report = tree.verify_checksum_with(&opts);
+        assert!(
+            report.is_ok(),
+            "throttled scrub must still verify clean: {report:?}"
+        );
+        assert!(report.sst_files_scanned >= 2);
     }
 }

@@ -97,6 +97,41 @@ pub trait AbstractTree: sealed::Sealed {
     #[doc(hidden)]
     fn current_version(&self) -> Version;
 
+    /// Proactively verifies every block's XXH3 checksum across every SST in
+    /// the tree's current version — a scrubber for catching bit rot before it
+    /// surfaces as a user-visible read failure (cron / scrub jobs).
+    ///
+    /// Per-KV-checked SSTs (footer digests) pinpoint a corrupt entry by index;
+    /// when ECC-at-rest is enabled a within-budget corrupt block may be
+    /// corrected on read. The returned [`BlockVerifyReport`](crate::verify::BlockVerifyReport)
+    /// lists every finding with `(file, offset)` and never aborts early.
+    ///
+    /// Filesystems with native per-block integrity (ZFS, Btrfs, `ReFS`, S3 —
+    /// see [`Fs::capabilities`](crate::fs::Fs::capabilities)) already detect
+    /// corruption on read; this scrub is the portable check for the rest.
+    ///
+    /// Use [`Self::verify_checksum_with`] for parallelism / throttle control.
+    #[cfg(feature = "std")]
+    fn verify_checksum(&self) -> crate::verify::BlockVerifyReport
+    where
+        Self: Sized,
+    {
+        crate::verify::verify_block_checksums(self)
+    }
+
+    /// Like [`Self::verify_checksum`] but with configurable parallelism and
+    /// I/O throttle (see [`VerifyOptions`](crate::verify::VerifyOptions)).
+    #[cfg(feature = "std")]
+    fn verify_checksum_with(
+        &self,
+        options: &crate::verify::VerifyOptions,
+    ) -> crate::verify::BlockVerifyReport
+    where
+        Self: Sized,
+    {
+        crate::verify::verify_block_checksums_with(self, options)
+    }
+
     #[doc(hidden)]
     fn get_version_history_lock(&self) -> RwLockWriteGuard<'_, crate::version::SuperVersions>;
 
