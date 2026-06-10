@@ -101,10 +101,14 @@ pub trait AbstractTree: sealed::Sealed {
     /// the tree's current version — a scrubber for catching bit rot before it
     /// surfaces as a user-visible read failure (cron / scrub jobs).
     ///
-    /// Per-KV-checked SSTs (footer digests) pinpoint a corrupt entry by index;
-    /// when ECC-at-rest is enabled a within-budget corrupt block may be
-    /// corrected on read. The returned [`BlockVerifyReport`](crate::verify::BlockVerifyReport)
-    /// lists every finding with `(file, offset)` and never aborts early.
+    /// Reports at block granularity and never aborts early. The returned
+    /// [`BlockVerifyReport`](crate::verify::BlockVerifyReport) records
+    /// block-corruption findings with `(file, offset)`, while file-level errors
+    /// (e.g. [`BlockVerifyError::SstFileUnreadable`](crate::verify::BlockVerifyError::SstFileUnreadable))
+    /// carry the file only (no offset). It does not surface per-entry indices or
+    /// ECC-correction counts (when ECC-at-rest is enabled a within-budget corrupt
+    /// block may still be healed on read as a side effect of the scan, but the
+    /// report does not tally corrections).
     ///
     /// Filesystems with native per-block integrity (ZFS, Btrfs, `ReFS`, S3 —
     /// see [`Fs::capabilities`](crate::fs::Fs::capabilities)) already detect

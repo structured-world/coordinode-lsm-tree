@@ -613,9 +613,14 @@ pub fn verify_block_checksums_with(
     // Sequential fast path: no thread spawn, deterministic table order.
     if workers <= 1 {
         let mut report = BlockVerifyReport::default();
-        for table in &tables {
+        for (idx, table) in tables.iter().enumerate() {
             merge_report(&mut report, scan_one_table(table));
-            if let Some(delay) = options.throttle {
+            // Inter-SST pause only: skip the sleep after the final table so a
+            // finished scrub returns promptly instead of waiting one extra
+            // throttle interval (which makes a done single-table scrub look hung).
+            if idx + 1 < tables.len()
+                && let Some(delay) = options.throttle
+            {
                 std::thread::sleep(delay);
             }
         }
@@ -628,13 +633,16 @@ pub fn verify_block_checksums_with(
             .map(|_| {
                 scope.spawn(|| {
                     let mut local = BlockVerifyReport::default();
-                    loop {
-                        let idx = cursor.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        let Some(table) = tables.get(idx) else {
-                            break;
-                        };
+                    let mut idx = cursor.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    while let Some(table) = tables.get(idx) {
                         merge_report(&mut local, scan_one_table(table));
-                        if let Some(delay) = options.throttle {
+                        // Claim the next SST first; only pause if this worker
+                        // actually has another table to scan, so no worker sleeps
+                        // after its final SST.
+                        idx = cursor.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if tables.get(idx).is_some()
+                            && let Some(delay) = options.throttle
+                        {
                             std::thread::sleep(delay);
                         }
                     }
@@ -2061,5 +2069,29 @@ mod block_verify_tests {
             "throttled scrub must still verify clean: {report:?}"
         );
         assert!(report.sst_files_scanned >= 2);
+    }
+
+    #[test]
+    fn verify_checksum_with_throttle_does_not_sleep_after_last_sst() {
+        // Regression: the throttle is an INTER-SST pause and must not fire after
+        // the final SST. A single-SST tree scrubbed with a large throttle must
+        // return promptly; the bug slept one full throttle interval after the
+        // only table, making a finished scrub look hung. Sequential path
+        // (parallelism 1, one table) so this pins the single-worker loop.
+        let dir = tempfile::tempdir().unwrap();
+        populate_multi_sst(dir.path(), 1, 50);
+        let tree = reopen_tree(dir.path());
+        let throttle = std::time::Duration::from_millis(400);
+        let opts = VerifyOptions::default().parallelism(1).throttle(throttle);
+        let start = std::time::Instant::now();
+        let report = tree.verify_checksum_with(&opts);
+        let elapsed = start.elapsed();
+        assert!(report.is_ok(), "clean single-SST scrub: {report:?}");
+        assert_eq!(report.sst_files_scanned, 1, "test needs exactly one SST");
+        assert!(
+            elapsed < throttle / 2,
+            "a single-SST scrub must not sleep the inter-SST throttle after the \
+             last table: took {elapsed:?} with a {throttle:?} throttle",
+        );
     }
 }
