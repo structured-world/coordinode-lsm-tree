@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1781048636090,
+  "lastUpdate": 1781051292633,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -14508,6 +14508,84 @@ window.BENCHMARK_DATA = {
             "value": 547688.0831803248,
             "unit": "ops/sec",
             "extra": "P50: 1.6us | P99: 6.2us | P99.9: 9.4us\nthreads: 1 | elapsed: 0.37s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "dd1ec83fb0f1ae502fd80a886acc470b28bd57ee",
+          "message": "feat(verify): verify_checksum scrubber with parallelism + throttle (#435)\n\n## Summary\n\nExposes the proactive block-checksum scrubber as public\n`AbstractTree::verify_checksum()` /\n`verify_checksum_with(VerifyOptions)` (std-gated) — the operator-facing\nbit-rot check matching RocksDB `DB::VerifyChecksum()`. Walks every SST\nin the current version, verifies each block's XXH3, never aborts early,\nreports `(file, offset)` per finding.\n\n`VerifyOptions` adds:\n- **Configurable parallelism** — independent per-SST scans fan out over\nworker threads (`thread::scope`, each opens its own `Fs` handle; partial\nreports merged). `parallelism = 1` (default) keeps the deterministic\nsequential path. Parallel runs report identical findings to sequential;\nonly order may differ.\n- **Throttle** — per-worker inter-SST delay to cap I/O on production\nboxes during a scrub.\n\nPer-KV pinpointing (#298, footer digests) and ECC correction-on-read\n(#254) tiers are carried by the existing per-block scan.\n\n## Reframed scope (file-level checksums dropped)\n\nThe original issue also proposed per-SST file-level checksums stored in\nthe MANIFEST (`FileChecksumPolicy::Auto`). **Dropped as redundant**, so\nthere is **no on-disk format change**:\n\n1. Filesystems with native per-block integrity (ZFS / Btrfs / ReFS / S3)\ndetect corruption on read — exactly\n`Fs::capabilities().per_block_integrity_on_read` from #354. A file-level\nXXH3 there is redundant work.\n2. An SST is block-structured; every block carries a per-block XXH3, so\n`verify_checksum` already validates every byte of the file. A file-level\nhash covers nothing not already checksummed.\n\nRocksDB adds file checksums because it lacks both FS-capability\nawareness and whole-file block coverage; we have both (#354 +\nper-block). Issue #300 updated to reflect this.\n\n## Testing\n\n- Full suite green (2011 tests). New: clean-tree method check,\nparallel-matches-sequential (identical counts),\nparallel-detects-corruption (flipped byte across a multi-SST tree),\nthrottle-completes-clean.\n- `clippy --all-targets --all-features`, `fmt` clean.\n\n## Dependencies\n\n- #354 ✅ (Fs capability framework) —\n`Fs::capabilities().per_block_integrity_on_read`\n- #298 ✅ (per-KV) / #254 ✅ (ECC) — detection / correction tiers\n\nCloses #300\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n\n## Summary by CodeRabbit\n\n## Release Notes\n\n* **New Features**\n* Added checksum verification APIs to the tree abstraction with default\nand customizable options.\n* Introduced parallel block-checksum scrubbing with configurable\nparallelism and throttle settings.\n* Block verification now supports both sequential and concurrent\nexecution modes.\n\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-06-10T00:00:53Z",
+          "tree_id": "3d5de227cdb4ee7f5402bd7721704a3b71499ae2",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/dd1ec83fb0f1ae502fd80a886acc470b28bd57ee"
+        },
+        "date": 1781051282858,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 2055707.9800209443,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.6us | P99.9: 3.7us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1220689.2745278238,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.3us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 658540.3793615368,
+            "unit": "ops/sec",
+            "extra": "P50: 1.4us | P99: 4.5us | P99.9: 6.9us\nthreads: 1 | elapsed: 0.30s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3746332.597946976,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 3.1us | P99.9: 5.5us\nthreads: 1 | elapsed: 0.05s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 441684.2018423394,
+            "unit": "ops/sec",
+            "extra": "P50: 2.0us | P99: 5.4us | P99.9: 8.2us\nthreads: 1 | elapsed: 0.45s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 223123.15907844866,
+            "unit": "ops/sec",
+            "extra": "P50: 4.2us | P99: 5.3us | P99.9: 8.6us\nthreads: 1 | elapsed: 0.90s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1266577.2159173698,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.2us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1160728.5015293353,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 1.5us | P99.9: 2.4us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 545864.8204310259,
+            "unit": "ops/sec",
+            "extra": "P50: 1.6us | P99: 4.9us | P99.9: 7.3us\nthreads: 1 | elapsed: 0.37s | num: 200000 | iterations: 3"
           }
         ]
       }
