@@ -344,8 +344,13 @@ impl PreparedBlock<'_> {
 /// with no available recovery). When the read *succeeds*, this reports
 /// whether the block's ECC was usable:
 ///
-/// - [`Self::Ok`] — ECC absent, or a recognized scheme that verified (and
-///   recovered, if needed).
+/// - [`Self::Ok`] — the read returned correct bytes with no ECC intervention:
+///   ECC was absent, or a recognized scheme verified the payload as-is (no
+///   repair needed).
+/// - [`Self::Corrected`] — ECC repaired the on-disk payload (the caller saw
+///   correct bytes, but the on-disk copy still holds a latent fault). Treat as
+///   a signal to confirm persistence and potentially schedule an auto-heal
+///   recompaction.
 /// - [`Self::Unrecognized`] — the block carries an ECC trailer this build
 ///   cannot interpret (an unimplemented or non-canonical scheme: Secded,
 ///   page granularity, unknown kind, …). The payload was returned (its
@@ -1569,7 +1574,7 @@ impl Block {
         file: &dyn FsFile,
         handle: BlockHandle,
         transform: &BlockTransform<'_>,
-    ) -> crate::Result<(Header, Slice)> {
+    ) -> crate::Result<(Header, Slice, bool)> {
         if transform.encryption().is_some() {
             return Err(crate::Error::Io(std::io::Error::other(
                 "read_data_frame: encrypted blocks are not supported on the lazy path",
@@ -1627,7 +1632,7 @@ impl Block {
             &handle,
         )?;
 
-        let payload: Slice = if ecc_length == 0 {
+        let (payload, corrected): (Slice, bool) = if ecc_length == 0 {
             #[expect(
                 clippy::indexing_slicing,
                 reason = "actual_data_len <= post-header len, checked via classify_block_trailer"
@@ -1636,22 +1641,24 @@ impl Block {
                 &buf[header_len..header_len + actual_data_len],
             ));
             checksum.check(parsed_header.checksum)?;
-            buf.slice(header_len..header_len + actual_data_len)
+            (buf.slice(header_len..header_len + actual_data_len), false)
         } else {
             #[expect(clippy::indexing_slicing, reason = "header was decoded from buf")]
             let mut cursor = std::io::Cursor::new(&buf[header_len..]);
-            // This frame-extraction path returns no EccStatus; a heal is logged.
-            let (frame, _corrected) = Self::read_payload_and_verify(
+            // `corrected` is surfaced so the partial-decode caller can schedule
+            // auto-heal (the recovered bytes are correct but the on-disk copy is
+            // still faulty); a heal is also logged inside read_payload_and_verify.
+            let (frame, corrected) = Self::read_payload_and_verify(
                 &mut cursor,
                 parsed_header.data_length,
                 ecc_length,
                 parsed_header.checksum,
                 block_ecc_params(&parsed_header, transform),
             )?;
-            Slice::from(frame)
+            (Slice::from(frame), corrected)
         };
 
-        Ok((parsed_header, payload))
+        Ok((parsed_header, payload, corrected))
     }
 }
 
@@ -1798,7 +1805,8 @@ mod tests {
             &transform,
         )?;
 
-        let (header, frame) = Block::read_data_frame(&tmp.file, tmp.handle, &transform)?;
+        let (header, frame, _corrected) =
+            Block::read_data_frame(&tmp.file, tmp.handle, &transform)?;
         // The returned bytes are the COMPRESSED frame: it must be smaller than
         // the payload and must decompress back to the original (proving
         // read_data_frame skipped decode yet returned a valid frame).

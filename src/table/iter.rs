@@ -382,11 +382,29 @@ impl Iter {
             Some(ecc) => transform.with_ecc(ecc),
             None => transform,
         };
-        let (_header, frame) = crate::table::block::Block::read_data_frame(
-            fd.as_ref(),
-            BlockHandle::new(handle.offset(), handle.size()),
-            &transform,
-        )?;
+        let block_handle = BlockHandle::new(handle.offset(), handle.size());
+        let (_header, frame, corrected) =
+            crate::table::block::Block::read_data_frame(fd.as_ref(), block_handle, &transform)?;
+        // The partial path bypasses `load_block`, so schedule auto-heal here too:
+        // an ECC-corrected frame read flags the SST for a healing rewrite (the
+        // partial path is non-encrypted by the guard above).
+        if corrected {
+            crate::table::util::maybe_record_persistent_heal(
+                self.table_id,
+                &self.path,
+                &self.file_accessor,
+                &block_handle,
+                crate::table::block::BlockType::Data,
+                self.compression,
+                None,
+                self.ecc,
+                #[cfg(zstd_any)]
+                self.zstd_dictionary.as_deref(),
+                self.heal_hints.as_ref().map(AsRef::as_ref),
+                #[cfg(feature = "metrics")]
+                &self.metrics,
+            );
+        }
         // Cold first touch (carried_resume None) or resume-grow from the cached
         // snapshot — either way only the new tail blocks are decompressed.
         let (block, covered_upper, payload) = crate::table::lazy_block::partial_data_block(

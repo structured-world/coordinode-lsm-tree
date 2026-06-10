@@ -2310,6 +2310,7 @@ fn load_block_records_heal_hint_on_persistent_ecc_correction() -> crate::Result<
     )]
     let (_, checksum) = writer.finish()?.unwrap();
 
+    #[cfg(feature = "metrics")]
     let metrics = Arc::new(crate::metrics::Metrics::default());
     let table = Table::recover(
         file.clone(),

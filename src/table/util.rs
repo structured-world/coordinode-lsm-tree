@@ -191,17 +191,10 @@ pub fn load_block(
     }
 
     // ECC recovered this block's payload from parity. The bytes returned below
-    // are correct, but the on-disk copy is still faulty. When auto-heal is on
-    // (sink installed and enabled), confirm the fault is persistent (a transient
-    // read-path glitch would re-read clean) and queue the SST for a healing
-    // recompaction. Gated by `is_enabled` so a disabled tree pays nothing beyond
-    // the correction itself; the whole block only runs on the cold corrected
-    // path anyway, so clean reads pay nothing.
-    if corrected
-        && let Some(hints) = heal_hints
-        && hints.is_enabled()
-    {
-        match reread_block_is_corrected(
+    // are correct, but the on-disk copy is still faulty: when auto-heal is on,
+    // confirm the fault is persistent and queue the SST for a healing rewrite.
+    if corrected {
+        maybe_record_persistent_heal(
             table_id,
             path,
             file_accessor,
@@ -212,30 +205,81 @@ pub fn load_block(
             ecc,
             #[cfg(zstd_any)]
             zstd_dict,
-        ) {
-            Ok(true) => {
-                if hints.record(table_id) {
-                    #[cfg(feature = "metrics")]
-                    metrics.ecc_auto_heal_scheduled.fetch_add(1, Relaxed);
-                    log::warn!(
-                        "Persistent ECC correction on table {table_id:?} block {handle:?}; \
-                         queued for healing recompaction"
-                    );
-                }
-            }
-            Ok(false) => log::debug!(
-                "Transient ECC correction on table {table_id:?} block {handle:?}; \
-                 re-read clean, not scheduling"
-            ),
-            Err(e) => log::debug!(
-                "ECC re-read confirmation for table {table_id:?} block {handle:?} failed: {e:?}"
-            ),
-        }
+            heal_hints,
+            #[cfg(feature = "metrics")]
+            metrics,
+        );
     }
 
     cache.insert_block(table_id, handle.offset(), block.clone());
 
     Ok(block)
+}
+
+/// Schedules a healing recompaction for `table_id` when a just-read block was
+/// ECC-corrected and the fault is confirmed persistent.
+///
+/// Call this on any read path that recovers a block from parity (full
+/// [`load_block`] and the zstd partial-decode path both feed it). No-op unless
+/// `heal_hints` is `Some` and enabled (`auto_heal`). On a corrected read it
+/// re-reads the block straight from disk (cache-bypassing) to tell a persistent
+/// medium fault from a transient read-path glitch, recording the SST only on
+/// confirmed persistence. A re-read error is treated as non-persistent: a
+/// genuinely faulty medium resurfaces on the next read, and this must never mask
+/// a live-path I/O failure.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "mirrors the block read context needed for the confirming re-read"
+)]
+pub(crate) fn maybe_record_persistent_heal(
+    table_id: GlobalTableId,
+    path: &Path,
+    file_accessor: &FileAccessor,
+    handle: &BlockHandle,
+    block_type: BlockType,
+    compression: CompressionType,
+    encryption: Option<&dyn EncryptionProvider>,
+    ecc: Option<crate::table::block::EccParams>,
+    #[cfg(zstd_any)] zstd_dict: Option<&crate::compression::ZstdDictionary>,
+    heal_hints: Option<&crate::heal_hints::HealHints>,
+    #[cfg(feature = "metrics")] metrics: &Metrics,
+) {
+    let Some(hints) = heal_hints else { return };
+    if !hints.is_enabled() {
+        return;
+    }
+    match reread_block_is_corrected(
+        table_id,
+        path,
+        file_accessor,
+        handle,
+        block_type,
+        compression,
+        encryption,
+        ecc,
+        #[cfg(zstd_any)]
+        zstd_dict,
+    ) {
+        Ok(true) => {
+            if hints.record(table_id) {
+                #[cfg(feature = "metrics")]
+                metrics
+                    .ecc_auto_heal_scheduled
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                log::warn!(
+                    "Persistent ECC correction on table {table_id:?} block {handle:?}; \
+                     queued for healing recompaction"
+                );
+            }
+        }
+        Ok(false) => log::debug!(
+            "Transient ECC correction on table {table_id:?} block {handle:?}; \
+             re-read clean, not scheduling"
+        ),
+        Err(e) => log::debug!(
+            "ECC re-read confirmation for table {table_id:?} block {handle:?} failed: {e:?}"
+        ),
+    }
 }
 
 /// Builds the [`BlockTransform`](crate::table::block::BlockTransform) for a

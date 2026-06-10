@@ -1313,11 +1313,20 @@ impl Tree {
         // mutation (currently: `page_ecc = true` on a non-`page_ecc`
         // build) is rejected at update time, not silently swallowed
         // at the next manifest write.
-        self.0.runtime_config.try_update(mutator)?;
-        // Keep the read-path heal gate in sync with `auto_heal`.
-        self.0
-            .heal_hints
-            .set_enabled(self.0.runtime_config.load_full().auto_heal);
+        // Capture this update's `auto_heal` inside the mutation so the read-path
+        // heal gate reflects exactly the config THIS call commits, rather than a
+        // separate `load_full()` that could observe a different concurrent
+        // update's value. Concurrent `update_runtime_config` calls must be
+        // serialized by the caller (see the last-writer-wins note above); under
+        // that contract the gate and the committed config stay in sync. On a
+        // validation error `try_update` does not commit and `?` returns before
+        // the gate is touched, so it keeps tracking the unchanged config.
+        let mut auto_heal = false;
+        self.0.runtime_config.try_update(|c| {
+            mutator(c);
+            auto_heal = c.auto_heal;
+        })?;
+        self.0.heal_hints.set_enabled(auto_heal);
         Ok(())
     }
 
