@@ -301,6 +301,119 @@ fn decode_metadata_payload(payload: &[u8]) -> Result<ParsedMetadata, DecryptErro
     })
 }
 
+/// Key-free structural view of an AAD-bound encrypted block's metadata,
+/// parsed from the on-disk `MetadataFrame` WITHOUT the encryption key.
+///
+/// Produced by [`parse_encrypted_block_metadata`] for offline forensic
+/// inspection — e.g. an on-call engineer examining a block that fails to
+/// decode, with no live process and no key. Every field is read from the
+/// on-disk `MetadataFrame` mirror; nothing here requires decryption and the
+/// ciphertext body is never touched beyond bounds-checking its frame.
+///
+/// The three AAD-binding fields `tree_id`, `table_id` and `block_offset` are
+/// deliberately NOT stored on disk (they are supplied from read context at
+/// decrypt time), so they are absent here — reconstructing the AAD for offline
+/// verification requires the caller to supply them from the file path /
+/// inventory.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct EncryptedBlockMetadata {
+    /// Wire-format version (high nibble of the on-disk `HeaderByte`); `1` for v1.
+    pub format_version: u8,
+    /// Key epoch the block was sealed under (selects the key in the chain).
+    pub key_epoch: u8,
+    /// Raw `BlockType` discriminator byte (mirrors the block header).
+    pub block_type: u8,
+    /// AEAD suite the block was sealed with.
+    pub suite_id: SuiteId,
+    /// Raw `CompressionType` tag (`0` None, `1` Lz4, `3` Zstd, `4` `ZstdDict`).
+    pub compression_type: u8,
+    /// zstd dictionary id (non-zero only for `ZstdDict`).
+    pub dict_id: u32,
+    /// zstd window-log descriptor (`0`, or `10..=31`).
+    pub window_log: u8,
+    /// Transform-presence bitfield mirrored from the block header.
+    pub block_flags: u8,
+    /// 12-byte AEAD nonce.
+    pub nonce: [u8; 12],
+    /// 16-byte AEAD authentication tag.
+    pub aead_tag: [u8; TAG_LEN],
+    /// Length in bytes of the encrypted `BodyFrame` payload (the ciphertext).
+    pub ciphertext_len: usize,
+}
+
+/// Parses the metadata of an AAD-bound encrypted block WITHOUT decrypting it.
+///
+/// Walks the on-disk `MetadataFrame ‖ BodyFrame` envelope, validating the
+/// `MetadataFrame` structure (magic, length, codec-context invariants) and the
+/// `BodyFrame` bounds, and returns the [`EncryptedBlockMetadata`] view. No key
+/// is consulted and no plaintext is produced — this is the read-only structural
+/// parse a forensics tool uses to inspect a block that fails to decode.
+///
+/// Trailing bytes after the `BodyFrame` (e.g. a Page ECC parity trailer added
+/// outside the encryption envelope) are ignored, so this accepts either the
+/// bare envelope or an envelope followed by such a trailer.
+///
+/// # Errors
+///
+/// Returns [`DecryptError::MalformedMetadataFrame`] / [`DecryptError::MalformedBodyFrame`]
+/// for a structurally invalid envelope, [`DecryptError::UnsupportedFormatVersion`]
+/// for an unknown wire version, or [`DecryptError::UnsupportedSuite`] for an
+/// unregistered suite byte.
+///
+/// # Examples
+///
+/// ```
+/// use lsm_tree::encryption::{
+///     StaticKeyChain, encrypt_block, parse_encrypted_block_metadata,
+///     aad::{BlockIdentity, BlockType, EncryptionContext, SuiteId},
+/// };
+///
+/// let chain = StaticKeyChain::new().with_key(1, [0x42; 32]);
+/// let ctx = EncryptionContext::v1(1, SuiteId::Aes256Gcm, 0, 0);
+/// let id = BlockIdentity { table_id: 7, block_type: BlockType::Data, dict_id: 0, window_log: 0 };
+/// let sealed = encrypt_block(b"payload bytes", &id, &ctx, &chain).unwrap();
+///
+/// let meta = parse_encrypted_block_metadata(&sealed).unwrap();
+/// assert_eq!(meta.format_version, 1);
+/// assert_eq!(meta.key_epoch, 1);
+/// assert_eq!(meta.suite_id, SuiteId::Aes256Gcm);
+/// assert_eq!(meta.dict_id, 0);
+/// ```
+pub fn parse_encrypted_block_metadata(
+    bytes: &[u8],
+) -> Result<EncryptedBlockMetadata, DecryptError> {
+    let mut cursor = Cursor::new(bytes);
+    let (_, metadata_payload) = read_framed_payload(
+        &mut cursor,
+        Some(METADATA_VARIANT),
+        METADATA_PAYLOAD_LEN_V1,
+        METADATA_PAYLOAD_LEN_V1,
+        DecryptError::MalformedMetadataFrame,
+    )?;
+    let parsed = decode_metadata_payload(&metadata_payload)?;
+    let (_, ciphertext) = read_framed_payload(
+        &mut cursor,
+        Some(BODY_VARIANT),
+        1,
+        MAX_BODY_LEN,
+        DecryptError::MalformedBodyFrame,
+    )?;
+    Ok(EncryptedBlockMetadata {
+        format_version: parsed.ctx.header_byte >> 4,
+        key_epoch: parsed.ctx.key_epoch,
+        block_type: parsed.block_type_byte,
+        suite_id: parsed.suite_id,
+        compression_type: parsed.ctx.compression_type,
+        dict_id: parsed.dict_id,
+        window_log: parsed.window_log,
+        block_flags: parsed.ctx.block_flags,
+        nonce: parsed.nonce,
+        aead_tag: parsed.tag,
+        ciphertext_len: ciphertext.len(),
+    })
+}
+
 /// Seals `plaintext` into the AAD-bound `MetadataFrame ‖ BodyFrame`
 /// byte sequence.
 ///
@@ -673,6 +786,36 @@ mod tests {
 
     fn chain() -> StaticKeyChain {
         StaticKeyChain::new().with_key(0, TEST_KEY)
+    }
+
+    #[test]
+    fn parse_metadata_is_key_free_and_matches_seal() {
+        // Forensic parse needs no key: seal a block, then read its
+        // MetadataPayload structurally with `parse_encrypted_block_metadata`
+        // (no KeyChain) and confirm the fields mirror what was sealed.
+        let plaintext = b"forensic payload bytes";
+        let sealed = encrypt_block(plaintext, &id(), &ctx(), &chain()).unwrap();
+
+        let meta = parse_encrypted_block_metadata(&sealed).unwrap();
+        assert_eq!(meta.format_version, 1);
+        assert_eq!(meta.key_epoch, 0);
+        assert_eq!(meta.suite_id, SuiteId::Aes256Gcm);
+        assert_eq!(meta.block_type, u8::from(BlockType::Data));
+        assert_eq!(meta.compression_type, 0);
+        assert_eq!(meta.dict_id, 0);
+        assert_eq!(meta.window_log, 0);
+        assert!(meta.ciphertext_len > 0, "body must carry ciphertext");
+
+        // Suite is reflected for ChaCha too (proves it reads the on-disk
+        // SuiteID byte, not a hard-coded default).
+        let chacha_ctx = EncryptionContext::v1(0, SuiteId::ChaCha20Poly1305, 0, 0);
+        let sealed_cc = encrypt_block(plaintext, &id(), &chacha_ctx, &chain()).unwrap();
+        let meta_cc = parse_encrypted_block_metadata(&sealed_cc).unwrap();
+        assert_eq!(meta_cc.suite_id, SuiteId::ChaCha20Poly1305);
+
+        // Garbage / truncated input is a typed error, never a panic.
+        assert!(parse_encrypted_block_metadata(b"not a frame").is_err());
+        assert!(parse_encrypted_block_metadata(&sealed[..10]).is_err());
     }
 
     #[test]
