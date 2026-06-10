@@ -13,10 +13,18 @@
 //! Two access patterns: a sequential sweep (predictable, best case for any
 //! cache) and a pseudo-random sweep (the realistic read pattern, where shard
 //! routing + per-shard lock cost shows).
+//!
+//! Each pattern is measured two ways: a `b.iter()` throughput pass (Criterion's
+//! mean/median estimate, lowest noise for the sub-microsecond `get` path) and an
+//! `iter_custom` latency pass that timestamps every individual call and prints
+//! P50/P99/P999. Tail latency is where shard-level lock contention and eviction
+//! pauses surface — invisible in a throughput mean, which is exactly the point
+//! of reporting percentiles alongside it.
 
 use criterion::{Criterion, criterion_group, criterion_main};
 use lsm_tree::{AbstractTree, Cache, Config, SeqNo, SequenceNumberCounter};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 const N: u64 = 50_000;
 
@@ -82,5 +90,83 @@ fn warm_point_read_random(c: &mut Criterion) {
     });
 }
 
-criterion_group!(benches, warm_point_read_sequential, warm_point_read_random);
+/// Sorts the collected per-call durations and prints P50/P99/P999 to stderr.
+///
+/// Criterion's own report covers throughput (mean/median); this surfaces the
+/// tail the mean hides. Nearest-rank percentile (no interpolation) — for the
+/// millions of samples a sub-microsecond op collects, the rank error is far
+/// below timer resolution.
+fn report_percentiles(name: &str, samples: &mut [Duration]) {
+    if samples.is_empty() {
+        return;
+    }
+    samples.sort_unstable();
+    let at = |p: f64| {
+        // Nearest-rank: index of the p-quantile in the sorted slice.
+        let idx = (((samples.len() - 1) as f64) * p).round() as usize;
+        samples[idx]
+    };
+    eprintln!(
+        "{name}: P50={:?} P99={:?} P999={:?} max={:?} (n={})",
+        at(0.50),
+        at(0.99),
+        at(0.999),
+        samples[samples.len() - 1],
+        samples.len(),
+    );
+}
+
+fn warm_point_read_sequential_latency(c: &mut Criterion) {
+    let (_dir, tree, keys) = warm_tree();
+    let mut i = 0usize;
+    // Accumulate across every `iter_custom` batch (Criterion calls the routine
+    // repeatedly through warmup + sampling); print percentiles once, after the
+    // whole bench returns, over the full sample set.
+    let mut samples: Vec<Duration> = Vec::new();
+    c.bench_function("block_cache/warm_point_read_sequential_latency", |b| {
+        b.iter_custom(|iters| {
+            let mut total = Duration::ZERO;
+            for _ in 0..iters {
+                i = (i + 1) % keys.len();
+                let start = Instant::now();
+                std::hint::black_box(tree.get(&keys[i], SeqNo::MAX).expect("get"));
+                let elapsed = start.elapsed();
+                samples.push(elapsed);
+                total += elapsed;
+            }
+            total
+        });
+    });
+    report_percentiles("warm_point_read_sequential", &mut samples);
+}
+
+fn warm_point_read_random_latency(c: &mut Criterion) {
+    let (_dir, tree, keys) = warm_tree();
+    let mut state = 0x9E37_79B9_7F4A_7C15u64;
+    let mut samples: Vec<Duration> = Vec::new();
+    c.bench_function("block_cache/warm_point_read_random_latency", |b| {
+        b.iter_custom(|iters| {
+            let mut total = Duration::ZERO;
+            for _ in 0..iters {
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                let idx = (state >> 33) as usize % keys.len();
+                let start = Instant::now();
+                std::hint::black_box(tree.get(&keys[idx], SeqNo::MAX).expect("get"));
+                let elapsed = start.elapsed();
+                samples.push(elapsed);
+                total += elapsed;
+            }
+            total
+        });
+    });
+    report_percentiles("warm_point_read_random", &mut samples);
+}
+
+criterion_group!(
+    benches,
+    warm_point_read_sequential,
+    warm_point_read_random,
+    warm_point_read_sequential_latency,
+    warm_point_read_random_latency,
+);
 criterion_main!(benches);
