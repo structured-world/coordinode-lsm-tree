@@ -11,6 +11,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [5.2.0](https://github.com/structured-world/coordinode-lsm-tree/compare/v5.1.0...v5.2.0) - 2026-06-10
+
+### Added
+
+- *(cache)* replace quick_cache with in-tree sharded S3-FIFO cache ([#429](https://github.com/structured-world/coordinode-lsm-tree/pull/429)) ([#448](https://github.com/structured-world/coordinode-lsm-tree/pull/448))
+- *(tooling)* key-free forensic block structure dump ([#256](https://github.com/structured-world/coordinode-lsm-tree/pull/256)) ([#447](https://github.com/structured-world/coordinode-lsm-tree/pull/447))
+- *(ecc)* self-heal SSTs after a parity-corrected read ([#446](https://github.com/structured-world/coordinode-lsm-tree/pull/446))
+- *(tooling)* reconstruct block AAD for offline tag verification ([#445](https://github.com/structured-world/coordinode-lsm-tree/pull/445))
+- *(tooling)* key-free forensic dump-block for encrypted SSTs ([#444](https://github.com/structured-world/coordinode-lsm-tree/pull/444))
+- *(verify)* verify_checksum scrubber with parallelism + throttle ([#435](https://github.com/structured-world/coordinode-lsm-tree/pull/435))
+- *(ecc)* SEC-DED single-bit fast path on the Page ECC read path ([#437](https://github.com/structured-world/coordinode-lsm-tree/pull/437))
+- *(compression)* pin inner-frame dict id as configurable-checksum defense-in-depth ([#441](https://github.com/structured-world/coordinode-lsm-tree/pull/441))
+
+### Fixed
+
+- *(verify)* don't sleep the scrub throttle after the last SST ([#443](https://github.com/structured-world/coordinode-lsm-tree/pull/443))
+- *(manifest)* reject torn edit-log tail under AbsoluteConsistency ([#438](https://github.com/structured-world/coordinode-lsm-tree/pull/438))
+
 ## [5.1.0](https://github.com/structured-world/coordinode-lsm-tree/compare/v5.0.0...v5.1.0) - 2026-06-09
 
 ### Added
