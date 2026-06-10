@@ -168,6 +168,10 @@ mod comparator;
 #[doc(hidden)]
 mod cache;
 
+/// In-tree sharded S3-FIFO cache backing `cache` and `descriptor_table`
+/// (replaces `quick_cache`; works on `std` and `no_std + alloc`).
+mod sharded_cache;
+
 #[doc(hidden)]
 pub mod checksum;
 

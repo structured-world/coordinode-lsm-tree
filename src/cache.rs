@@ -4,11 +4,10 @@
 
 #[cfg(feature = "zstd")]
 use crate::UserKey;
+use crate::sharded_cache::{ShardedCache, Weighter};
 use crate::table::block::Header;
 use crate::table::{Block, BlockOffset};
 use crate::{GlobalTableId, UserValue};
-use quick_cache::Weighter;
-use quick_cache::sync::Cache as QuickCache;
 
 const TAG_BLOCK: u8 = 0;
 const TAG_BLOB: u8 = 1;
@@ -49,7 +48,7 @@ pub struct PartialBlockEntry {
     pub hits: u32,
 }
 
-#[derive(Eq, std::hash::Hash, PartialEq)]
+#[derive(Clone, Copy, Eq, std::hash::Hash, PartialEq)]
 struct CacheKey(u8, u64, u64, u64);
 
 impl From<(u8, u64, u64, u64)> for CacheKey {
@@ -108,37 +107,31 @@ impl Weighter<CacheKey, Item> for BlockWeighter {
 /// ```
 pub struct Cache {
     // NOTE: rustc_hash performed best: https://fjall-rs.github.io/post/fjall-2-1
-    /// Concurrent cache implementation
-    data: QuickCache<CacheKey, Item, BlockWeighter, rustc_hash::FxBuildHasher>,
-
-    /// Capacity in bytes
-    capacity: u64,
+    /// In-tree sharded S3-FIFO cache (byte-weighted).
+    data: ShardedCache<CacheKey, Item, BlockWeighter, rustc_hash::FxBuildHasher>,
 }
+
+/// Number of shards in the block cache. 64 keeps per-shard write contention low
+/// on many-core hosts while the lock array stays small; reads take a shared lock
+/// and don't contend regardless of shard count.
+const BLOCK_CACHE_SHARDS: usize = 64;
+/// Seeds the per-shard ghost-queue sizing (S3-FIFO remembers recently-evicted
+/// fingerprints to fast-track re-admission). Matches the previous
+/// `estimated_items_capacity`.
+const BLOCK_CACHE_EST_ITEMS: usize = 10_000;
 
 impl Cache {
     /// Creates a new block cache with roughly `n` bytes of capacity.
     #[must_use]
     pub fn with_capacity_bytes(bytes: u64) -> Self {
-        use quick_cache::sync::DefaultLifecycle;
-
-        #[expect(clippy::expect_used, reason = "nothing we can do if it fails")]
-        let opts = quick_cache::OptionsBuilder::new()
-            .weight_capacity(bytes)
-            .hot_allocation(0.8)
-            .estimated_items_capacity(10_000)
-            .build()
-            .expect("cache options should be valid");
-
-        let quick_cache = QuickCache::with_options(
-            opts,
-            BlockWeighter,
-            rustc_hash::FxBuildHasher,
-            DefaultLifecycle::default(),
-        );
-
         Self {
-            data: quick_cache,
-            capacity: bytes,
+            data: ShardedCache::with_weighter(
+                bytes,
+                BLOCK_CACHE_SHARDS,
+                BLOCK_CACHE_EST_ITEMS,
+                BlockWeighter,
+                rustc_hash::FxBuildHasher,
+            ),
         }
     }
 
@@ -151,7 +144,7 @@ impl Cache {
     /// Returns the cache capacity in bytes.
     #[must_use]
     pub fn capacity(&self) -> u64 {
-        self.capacity
+        self.data.capacity()
     }
 
     #[doc(hidden)]
