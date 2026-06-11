@@ -513,7 +513,13 @@ pub(crate) fn lsp_scalar(s1: &[u8], s2: &[u8]) -> usize {
 /// # Safety
 ///
 /// Caller must ensure the host CPU supports AVX2 (`is_x86_feature_detected!("avx2")`).
-#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+// Exists only where it is used: the std-gated runtime dispatch above, or the
+// #[cfg(test)] kernel tests below (kept alive under `--all-targets` clippy on
+// the no-default-features build, where the std dispatch is compiled out).
+#[cfg(all(
+    any(target_arch = "x86_64", target_arch = "x86"),
+    any(feature = "std", test)
+))]
 #[target_feature(enable = "avx2")]
 #[expect(unsafe_code, reason = "intrinsics require unsafe")]
 #[must_use]
@@ -581,7 +587,11 @@ unsafe fn lsp_avx2(s1: &[u8], s2: &[u8]) -> usize {
 /// Caller must ensure the host CPU supports AVX-512BW
 /// (`is_x86_feature_detected!("avx512bw")`). BW implies the F subset, so the
 /// 512-bit load and the byte-granular compare-mask are both available.
-#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+// See `lsp_avx2`: gated to where it is used (std dispatch or kernel tests).
+#[cfg(all(
+    any(target_arch = "x86_64", target_arch = "x86"),
+    any(feature = "std", test)
+))]
 // List both ISA features the body relies on: `_mm512_loadu_si512` is AVX-512F,
 // `_mm512_cmpeq_epi8_mask` is AVX-512BW. BW implies F (so `avx512bw` alone would
 // compile), but naming both keeps the gate matching the actual requirements and
@@ -648,7 +658,11 @@ unsafe fn lsp_avx512(s1: &[u8], s2: &[u8]) -> usize {
 /// Caller must ensure the host supports SSE2. On `x86_64` this is the mandatory
 /// ISA baseline (always true); on 32-bit `x86` it must be runtime-detected via
 /// `is_x86_feature_detected!("sse2")` because pre-Pentium-4 CPUs lack it.
-#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+// See `lsp_avx2`: gated to where it is used (std dispatch or kernel tests).
+#[cfg(all(
+    any(target_arch = "x86_64", target_arch = "x86"),
+    any(feature = "std", test)
+))]
 #[target_feature(enable = "sse2")]
 #[expect(unsafe_code, reason = "intrinsics require unsafe")]
 #[must_use]

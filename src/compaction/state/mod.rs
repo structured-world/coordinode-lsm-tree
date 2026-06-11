@@ -26,7 +26,6 @@ impl CompactionState {
 }
 
 #[cfg(test)]
-#[expect(clippy::expect_used)]
 mod tests {
     use crate::{AbstractTree, SequenceNumberCounter};
     use test_log::test;
