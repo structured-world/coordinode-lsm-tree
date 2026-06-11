@@ -346,6 +346,10 @@ pub fn read_framed_record<R: Read>(
     payload_scratch.resize(len as usize, 0);
     match reader.read_exact(payload_scratch) {
         Ok(()) => {}
+        // Two cfg arms, not one: under `std`, `crate::io::Read` is a method-less
+        // supertrait alias, so `read_exact` resolves to `std::io::Read` and
+        // `e.kind()` is `std::io::ErrorKind`; under no_std it is
+        // `crate::io::ErrorKind`. A single arm would not type-check on both.
         #[cfg(feature = "std")]
         Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
             return Ok(FramedRecordOutcome::TailTruncation);
