@@ -606,7 +606,7 @@ mod sys {
         if ret == 0 || ret == EINVAL {
             Ok(())
         } else {
-            Err(std::io::Error::from_raw_os_error(ret).into())
+            Err(std::io::Error::from_raw_os_error(ret))
         }
     }
 
