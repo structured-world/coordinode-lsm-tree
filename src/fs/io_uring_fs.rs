@@ -1163,7 +1163,8 @@ mod tests {
 
         match fs.sync_directory(&path) {
             Ok(()) => panic!("sync_directory on a file should fail"),
-            Err(err) => assert_eq!(err.kind(), io::ErrorKind::InvalidInput),
+            // sync_directory is an `Fs` method → returns `crate::io::Result`.
+            Err(err) => assert_eq!(err.kind(), crate::io::ErrorKind::InvalidInput),
         }
 
         Ok(())
