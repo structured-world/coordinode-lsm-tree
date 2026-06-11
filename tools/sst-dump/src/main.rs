@@ -582,7 +582,9 @@ fn run_dump(
         // value byte count.
         Ok(it) if keys_only => it.keys_only(),
         Ok(it) => it,
-        Err(lsm_tree::Error::Io(io_err)) if io_err.kind() == std::io::ErrorKind::Unsupported => {
+        Err(lsm_tree::Error::Io(io_err))
+            if io_err.kind() == lsm_tree::io::ErrorKind::Unsupported =>
+        {
             // Partitioned-index SSTs surface here. Same pattern as
             // `filter-stats` for partitioned filters: print a
             // user-facing "not supported" message that names the
