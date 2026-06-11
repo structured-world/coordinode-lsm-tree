@@ -2,12 +2,15 @@
 // Copyright (c) 2025-present, fjall-rs
 // Copyright (c) 2026-present, Structured World Foundation
 
+#[cfg(not(feature = "std"))]
+use alloc::vec::Vec;
+
 use super::{Block, BlockHandle, GlobalTableId};
+use crate::path::Path;
 use crate::{
     Cache, CompressionType, KeyRange, Table, encryption::EncryptionProvider,
     file_accessor::FileAccessor, table::block::BlockType, version::run::Ranged,
 };
-use std::path::Path;
 
 #[cfg(feature = "metrics")]
 use crate::metrics::Metrics;
@@ -62,7 +65,7 @@ pub fn load_block(
     #[cfg(feature = "metrics")] metrics: &Metrics,
 ) -> crate::Result<Block> {
     #[cfg(feature = "metrics")]
-    use std::sync::atomic::Ordering::Relaxed;
+    use core::sync::atomic::Ordering::Relaxed;
 
     log::trace!("load {block_type:?} block {handle:?}");
 
@@ -265,7 +268,7 @@ pub(crate) fn maybe_record_persistent_heal(
                 #[cfg(feature = "metrics")]
                 metrics
                     .ecc_auto_heal_scheduled
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                 log::warn!(
                     "Persistent ECC correction on table {table_id:?} block {handle:?}; \
                      queued for healing recompaction"
@@ -514,9 +517,11 @@ pub(crate) fn lsp_scalar(s1: &[u8], s2: &[u8]) -> usize {
 #[must_use]
 unsafe fn lsp_avx2(s1: &[u8], s2: &[u8]) -> usize {
     #[cfg(target_arch = "x86")]
-    use std::arch::x86::{__m256i, _mm256_cmpeq_epi8, _mm256_loadu_si256, _mm256_movemask_epi8};
+    use core::arch::x86::{__m256i, _mm256_cmpeq_epi8, _mm256_loadu_si256, _mm256_movemask_epi8};
     #[cfg(target_arch = "x86_64")]
-    use std::arch::x86_64::{__m256i, _mm256_cmpeq_epi8, _mm256_loadu_si256, _mm256_movemask_epi8};
+    use core::arch::x86_64::{
+        __m256i, _mm256_cmpeq_epi8, _mm256_loadu_si256, _mm256_movemask_epi8,
+    };
 
     let min_len = s1.len().min(s2.len());
     let mut i = 0;
@@ -586,9 +591,9 @@ unsafe fn lsp_avx2(s1: &[u8], s2: &[u8]) -> usize {
 #[must_use]
 unsafe fn lsp_avx512(s1: &[u8], s2: &[u8]) -> usize {
     #[cfg(target_arch = "x86")]
-    use std::arch::x86::{__m512i, _mm512_cmpeq_epi8_mask, _mm512_loadu_si512};
+    use core::arch::x86::{__m512i, _mm512_cmpeq_epi8_mask, _mm512_loadu_si512};
     #[cfg(target_arch = "x86_64")]
-    use std::arch::x86_64::{__m512i, _mm512_cmpeq_epi8_mask, _mm512_loadu_si512};
+    use core::arch::x86_64::{__m512i, _mm512_cmpeq_epi8_mask, _mm512_loadu_si512};
 
     let min_len = s1.len().min(s2.len());
     let mut i = 0;
@@ -647,9 +652,9 @@ unsafe fn lsp_avx512(s1: &[u8], s2: &[u8]) -> usize {
 #[must_use]
 unsafe fn lsp_sse2(s1: &[u8], s2: &[u8]) -> usize {
     #[cfg(target_arch = "x86")]
-    use std::arch::x86::{__m128i, _mm_cmpeq_epi8, _mm_loadu_si128, _mm_movemask_epi8};
+    use core::arch::x86::{__m128i, _mm_cmpeq_epi8, _mm_loadu_si128, _mm_movemask_epi8};
     #[cfg(target_arch = "x86_64")]
-    use std::arch::x86_64::{__m128i, _mm_cmpeq_epi8, _mm_loadu_si128, _mm_movemask_epi8};
+    use core::arch::x86_64::{__m128i, _mm_cmpeq_epi8, _mm_loadu_si128, _mm_movemask_epi8};
 
     let min_len = s1.len().min(s2.len());
     let mut i = 0;
@@ -710,7 +715,7 @@ unsafe fn lsp_sse2(s1: &[u8], s2: &[u8]) -> usize {
 #[expect(unsafe_code, reason = "intrinsics require unsafe")]
 #[must_use]
 unsafe fn lsp_neon(s1: &[u8], s2: &[u8]) -> usize {
-    use std::arch::aarch64::{
+    use core::arch::aarch64::{
         vandq_u8, vceqq_u8, vdupq_n_u8, vgetq_lane_u64, vld1q_u8, vreinterpretq_u64_u8,
     };
 
@@ -768,7 +773,7 @@ pub fn compare_prefixed_slice(
     suffix: &[u8],
     needle: &[u8],
     cmp: &dyn crate::comparator::UserComparator,
-) -> std::cmp::Ordering {
+) -> core::cmp::Ordering {
     // Fast path: zero-allocation bytewise comparison for the default
     // (lexicographic) comparator. This is the hot path for block index
     // and data block binary searches.
@@ -809,8 +814,8 @@ fn compare_prefixed_slice_lexicographic(
     prefix: &[u8],
     suffix: &[u8],
     needle: &[u8],
-) -> std::cmp::Ordering {
-    use std::cmp::Ordering::{Equal, Greater};
+) -> core::cmp::Ordering {
+    use core::cmp::Ordering::{Equal, Greater};
 
     if needle.is_empty() {
         let combined_len = prefix.len() + suffix.len();
@@ -1124,7 +1129,7 @@ mod tests {
 
     #[test]
     fn test_compare_prefixed_slice() {
-        use std::cmp::Ordering::{Equal, Greater, Less};
+        use core::cmp::Ordering::{Equal, Greater, Less};
 
         assert_eq!(
             Greater,
@@ -1241,14 +1246,14 @@ mod tests {
             "test-reverse"
         }
 
-        fn compare(&self, a: &[u8], b: &[u8]) -> std::cmp::Ordering {
+        fn compare(&self, a: &[u8], b: &[u8]) -> core::cmp::Ordering {
             b.cmp(a)
         }
     }
 
     #[test]
     fn test_compare_prefixed_slice_custom_comparator() {
-        use std::cmp::Ordering::{Equal, Greater, Less};
+        use core::cmp::Ordering::{Equal, Greater, Less};
 
         use crate::comparator::UserComparator as _;
         assert_eq!(ReverseComparator.name(), "test-reverse");

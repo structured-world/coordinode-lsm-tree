@@ -25,8 +25,8 @@ impl From<crate::sfa::Checksum> for Checksum {
     }
 }
 
-impl std::fmt::Display for Checksum {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for Checksum {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(f, "{self:?}")
     }
 }
@@ -56,18 +56,30 @@ impl Checksum {
     }
 }
 
-pub struct ChecksummedWriter<W: std::io::Write> {
+pub struct ChecksummedWriter<W: crate::io::Write> {
     inner: W,
     hasher: xxhash_rust::xxh3::Xxh3Default,
 }
 
-impl<W: std::io::Write + std::io::Seek> std::io::Seek for ChecksummedWriter<W> {
+// `crate::io::{Write,Seek}` is the std trait (via the std-mode supertrait
+// blanket) under `std` and the native trait under `no_std`; the two impls
+// differ only in the trait path and the `Result`/`SeekFrom` type they name,
+// so each is gated to its build.
+#[cfg(feature = "std")]
+impl<W: crate::io::Write + crate::io::Seek> std::io::Seek for ChecksummedWriter<W> {
     fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
         self.inner.seek(pos)
     }
 }
 
-impl<W: std::io::Write> ChecksummedWriter<W> {
+#[cfg(not(feature = "std"))]
+impl<W: crate::io::Write + crate::io::Seek> crate::io::Seek for ChecksummedWriter<W> {
+    fn seek(&mut self, pos: crate::io::SeekFrom) -> crate::io::Result<u64> {
+        self.inner.seek(pos)
+    }
+}
+
+impl<W: crate::io::Write> ChecksummedWriter<W> {
     pub fn new(writer: W) -> Self {
         Self {
             inner: writer,
@@ -84,12 +96,25 @@ impl<W: std::io::Write> ChecksummedWriter<W> {
     }
 }
 
-impl<W: std::io::Write> std::io::Write for ChecksummedWriter<W> {
+#[cfg(feature = "std")]
+impl<W: crate::io::Write> std::io::Write for ChecksummedWriter<W> {
     fn flush(&mut self) -> std::io::Result<()> {
         self.inner.flush()
     }
 
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.hasher.update(buf);
+        self.inner.write(buf)
+    }
+}
+
+#[cfg(not(feature = "std"))]
+impl<W: crate::io::Write> crate::io::Write for ChecksummedWriter<W> {
+    fn flush(&mut self) -> crate::io::Result<()> {
+        self.inner.flush()
+    }
+
+    fn write(&mut self, buf: &[u8]) -> crate::io::Result<usize> {
         self.hasher.update(buf);
         self.inner.write(buf)
     }

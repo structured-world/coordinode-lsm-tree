@@ -21,6 +21,8 @@ use crate::{
     table::{Table, util::aggregate_run_key_range},
     version::{Level, Version, run::Ranged},
 };
+#[cfg(not(feature = "std"))]
+use alloc::{boxed::Box, string::String, vec::Vec};
 
 /// Tries to find the most optimal compaction set from one level into the other.
 ///
@@ -433,7 +435,7 @@ impl CompactionStrategy for Strategy {
             (
                 crate::UserKey::from("leveled_level_ratio_policy"),
                 crate::UserValue::from({
-                    use byteorder::{LittleEndian, WriteBytesExt};
+                    use crate::io::{LittleEndian, WriteBytesExt};
 
                     let mut v = vec![];
 
@@ -714,7 +716,7 @@ impl CompactionStrategy for Strategy {
             .max_by(|(_, (score_a, _)), (_, (score_b, _))| {
                 score_a
                     .partial_cmp(score_b)
-                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .unwrap_or(core::cmp::Ordering::Equal)
             })
             .expect("should have highest score somewhere");
 

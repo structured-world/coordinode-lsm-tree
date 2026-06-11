@@ -43,7 +43,7 @@ fn bounded_read(reader: &mut impl Read, capacity: usize) -> crate::Result<Vec<u8
         match reader.read(dest) {
             Ok(0) => break,
             Ok(n) => filled += n,
-            Err(e) => return Err(crate::Error::Io(e)),
+            Err(e) => return Err(crate::Error::from(e)),
         }
     }
 
@@ -58,7 +58,7 @@ fn bounded_read(reader: &mut impl Read, capacity: usize) -> crate::Result<Vec<u8
                 limit: capacity as u64,
             });
         }
-        Err(e) => return Err(crate::Error::Io(e)),
+        Err(e) => return Err(crate::Error::from(e)),
     }
 
     output.truncate(filled);
@@ -106,7 +106,7 @@ fn decode_raw_content_bounded(
                     &mut *cursor,
                     BlockDecodingStrategy::UptoBytes(remaining.max(1)),
                 )
-                .map_err(|e| crate::Error::Io(std::io::Error::other(e)))?;
+                .map_err(|e| crate::Error::Io(crate::io::Error::other(e.to_string())))?;
         }
 
         // Drain collectible bytes from the decoder's internal buffer.
@@ -138,7 +138,7 @@ fn decode_raw_content_bounded(
             // `read_exact` ensures all `can` bytes are drained in one call.
             // `Read::read` may do short reads, which would leave zero-filled
             // slack and corrupt capacity accounting on the next iteration.
-            decoder.read_exact(dest).map_err(crate::Error::Io)?;
+            decoder.read_exact(dest).map_err(crate::Error::from)?;
         }
 
         if decoder.is_finished() && decoder.can_collect() == 0 {
@@ -215,7 +215,7 @@ fn do_decompress_with_dict(
                     dict_id: raw_content_id,
                 })
             } else {
-                crate::Error::Io(std::io::Error::other(e))
+                crate::Error::Io(crate::io::Error::other(e.to_string()))
             }
         })?;
 
@@ -236,7 +236,7 @@ fn do_decompress_with_dict(
         // reusing the cached xxh3 fingerprint without re-hashing dict_raw.
         decoder
             .force_dict(raw_content_id)
-            .map_err(|e| crate::Error::Io(std::io::Error::other(e)))?;
+            .map_err(|e| crate::Error::Io(crate::io::Error::other(e.to_string())))?;
 
         decode_raw_content_bounded(decoder, &mut cursor, capacity)
     } else {
@@ -258,7 +258,7 @@ fn do_decompress_with_dict(
                     limit: capacity as u64,
                 }
             } else {
-                crate::Error::Io(std::io::Error::other(e))
+                crate::Error::Io(crate::io::Error::other(e.to_string()))
             }
         })?;
         // `decode_all_to_vec` returns `TargetTooSmall` if the frame would exceed
@@ -364,7 +364,7 @@ impl CompressionProvider for ZstdProvider {
 
     fn decompress(data: &[u8], capacity: usize) -> crate::Result<Vec<u8>> {
         let mut decoder = structured_zstd::decoding::StreamingDecoder::new(data)
-            .map_err(|e| crate::Error::Io(std::io::Error::other(e)))?;
+            .map_err(|e| crate::Error::Io(crate::io::Error::other(e.to_string())))?;
         bounded_read(&mut decoder, capacity)
     }
 
@@ -456,7 +456,7 @@ impl CompressionProvider for ZstdProvider {
                     // dictionary parsing dominates the miss-path cost.
                     compressor
                         .set_dictionary_from_bytes(dict_raw)
-                        .map_err(|e| crate::Error::Io(std::io::Error::other(e)))?;
+                        .map_err(|e| crate::Error::Io(crate::io::Error::other(e.to_string())))?;
                 } else {
                     // Raw-content dict (no magic header): there is no serialized
                     // dictionary blob to parse for encoding, so wrap the
@@ -471,10 +471,10 @@ impl CompressionProvider for ZstdProvider {
                         h.max(1) // id=0 is rejected by the attach path; internal use only
                     };
                     let dictionary = Dictionary::from_raw_content(id, dict_raw.to_vec())
-                        .map_err(|e| crate::Error::Io(std::io::Error::other(e)))?;
+                        .map_err(|e| crate::Error::Io(crate::io::Error::other(e.to_string())))?;
                     compressor
                         .set_encoder_dictionary(EncoderDictionary::from_dictionary(dictionary))
-                        .map_err(|e| crate::Error::Io(std::io::Error::other(e)))?;
+                        .map_err(|e| crate::Error::Io(crate::io::Error::other(e.to_string())))?;
                 }
                 *state = Some((dict_key, level, compressor));
             }
@@ -584,7 +584,7 @@ impl CompressionProvider for ZstdProvider {
                 let mut decoder = FrameDecoder::new();
                 decoder
                     .add_dict_handle(handle)
-                    .map_err(|e| crate::Error::Io(std::io::Error::other(e)))?;
+                    .map_err(|e| crate::Error::Io(crate::io::Error::other(e.to_string())))?;
                 *state = Some((dict.id64(), decoder));
             }
 

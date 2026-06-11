@@ -10,12 +10,14 @@ use super::{
     },
     Trailer,
 };
-use std::marker::PhantomData;
+#[cfg(not(feature = "std"))]
+use alloc::{boxed::Box, string::String, vec::Vec};
+use core::marker::PhantomData;
 
 pub trait Encodable<Context: Default> {
     fn key(&self) -> &[u8];
 
-    fn encode_full_into<W: std::io::Write>(
+    fn encode_full_into<W: crate::io::Write>(
         &self,
         writer: &mut W,
         state: &mut Context,
@@ -23,7 +25,7 @@ pub trait Encodable<Context: Default> {
     where
         Self: Sized;
 
-    fn encode_truncated_into<W: std::io::Write>(
+    fn encode_truncated_into<W: crate::io::Write>(
         &self,
         writer: &mut W,
         state: &mut Context,

@@ -6,6 +6,7 @@ pub mod ingest;
 pub mod inner;
 pub mod sealed;
 
+use crate::path::Path;
 use crate::{
     AbstractTree, Checksum, KvPair, SeqNo, SequenceNumberCounter, TableId, UserKey, UserValue,
     ValueType,
@@ -25,12 +26,21 @@ use crate::{
     version::{SuperVersion, SuperVersions, Version, recovery::recover},
     vlog::BlobFile,
 };
-use inner::{TreeId, TreeInner};
-use std::{
-    ops::{Bound, RangeBounds},
-    path::Path,
-    sync::{Arc, Mutex, RwLock},
+use alloc::sync::Arc;
+#[cfg(not(feature = "std"))]
+use alloc::{
+    boxed::Box,
+    string::{String, ToString},
+    vec::Vec,
 };
+use core::ops::{Bound, RangeBounds};
+use inner::{FlushGuard, TreeId, TreeInner, VersionsWriteGuard};
+// no-std: spin mirrors parking_lot's Mutex/RwLock API without an allocator.
+// parking_lot wins on the std hot path, so keep it for std.
+#[cfg(feature = "std")]
+use parking_lot::{Mutex, RwLock};
+#[cfg(not(feature = "std"))]
+use spin::{Mutex, RwLock};
 
 #[cfg(feature = "metrics")]
 use crate::metrics::Metrics;
@@ -138,7 +148,7 @@ fn ignore_tombstone_value(item: InternalValue) -> Option<InternalValue> {
 #[derive(Clone)]
 pub struct Tree(#[doc(hidden)] pub Arc<TreeInner>);
 
-impl std::ops::Deref for Tree {
+impl core::ops::Deref for Tree {
     type Target = TreeInner;
 
     fn deref(&self) -> &Self::Target {
@@ -156,11 +166,8 @@ impl AbstractTree for Tree {
             .map_or(0, |dt| dt.len())
     }
 
-    fn get_version_history_lock(
-        &self,
-    ) -> std::sync::RwLockWriteGuard<'_, crate::version::SuperVersions> {
-        #[expect(clippy::expect_used, reason = "lock is expected to not be poisoned")]
-        self.version_history.write().expect("lock is poisoned")
+    fn get_version_history_lock(&self) -> VersionsWriteGuard<'_> {
+        self.version_history.write()
     }
 
     fn next_table_id(&self) -> TableId {
@@ -175,9 +182,10 @@ impl AbstractTree for Tree {
         0
     }
 
+    #[cfg(feature = "std")]
     fn create_checkpoint(
         &self,
-        target_path: &std::path::Path,
+        target_path: &crate::path::Path,
     ) -> crate::Result<crate::CheckpointInfo> {
         crate::checkpoint::run_checkpoint(
             self,
@@ -196,12 +204,7 @@ impl AbstractTree for Tree {
     }
 
     fn print_trace(&self, key: &[u8]) -> crate::Result<()> {
-        #[expect(clippy::expect_used, reason = "lock is expected to not be poisoned")]
-        let super_version = self
-            .version_history
-            .read()
-            .expect("lock is poisoned")
-            .latest_version();
+        let super_version = self.version_history.read().latest_version();
 
         let key = Slice::from(key);
 
@@ -268,12 +271,7 @@ impl AbstractTree for Tree {
 
         // Historical snapshot read (seqno <= latest.seqno): consult the locked
         // version history for the correct point-in-time SuperVersion.
-        #[expect(clippy::expect_used, reason = "lock is expected to not be poisoned")]
-        let super_version = self
-            .version_history
-            .read()
-            .expect("lock is poisoned")
-            .get_version_for_snapshot(seqno);
+        let super_version = self.version_history.read().get_version_for_snapshot(seqno);
 
         Self::get_internal_entry_from_version(
             &super_version,
@@ -284,17 +282,11 @@ impl AbstractTree for Tree {
     }
 
     fn current_version(&self) -> Version {
-        #[expect(clippy::expect_used, reason = "lock is expected to not be poisoned")]
-        self.version_history
-            .read()
-            .expect("poisoned")
-            .latest_version()
-            .version
+        self.version_history.read().latest_version().version
     }
 
-    fn get_flush_lock(&self) -> std::sync::MutexGuard<'_, ()> {
-        #[expect(clippy::expect_used, reason = "lock is expected to not be poisoned")]
-        self.flush_lock.lock().expect("lock is poisoned")
+    fn get_flush_lock(&self) -> FlushGuard<'_> {
+        self.flush_lock.lock()
     }
 
     #[cfg(feature = "metrics")]
@@ -303,11 +295,7 @@ impl AbstractTree for Tree {
     }
 
     fn version_free_list_len(&self) -> usize {
-        #[expect(clippy::expect_used, reason = "lock is expected to not be poisoned")]
-        self.version_history
-            .read()
-            .expect("lock is poisoned")
-            .free_list_len()
+        self.version_history.read().free_list_len()
     }
 
     fn prefix<K: AsRef<[u8]>>(
@@ -368,12 +356,7 @@ impl AbstractTree for Tree {
         let strategy = Arc::new(crate::compaction::drop_range::Strategy::new(bounds));
 
         // IMPORTANT: Write lock so we can be the only compaction going on
-        #[expect(clippy::expect_used, reason = "lock is expected to not be poisoned")]
-        let _lock = self
-            .0
-            .major_compaction_lock
-            .write()
-            .expect("lock is poisoned");
+        let _lock = self.0.major_compaction_lock.write();
 
         log::info!("Starting drop_range compaction");
         self.inner_compact(strategy, 0)?;
@@ -439,12 +422,7 @@ impl AbstractTree for Tree {
         let strategy = Arc::new(crate::compaction::major::Strategy::new(target_size));
 
         // IMPORTANT: Write lock so we can be the only compaction going on
-        #[expect(clippy::expect_used, reason = "lock is expected to not be poisoned")]
-        let _lock = self
-            .0
-            .major_compaction_lock
-            .write()
-            .expect("lock is poisoned");
+        let _lock = self.0.major_compaction_lock.write();
 
         log::info!("Starting major compaction");
         self.inner_compact(strategy, seqno_threshold)
@@ -485,10 +463,8 @@ impl AbstractTree for Tree {
     }
 
     fn sealed_memtable_count(&self) -> usize {
-        #[expect(clippy::expect_used, reason = "lock is expected to not be poisoned")]
         self.version_history
             .read()
-            .expect("lock is poisoned")
             .latest_version()
             .sealed_memtables
             .len()
@@ -500,7 +476,7 @@ impl AbstractTree for Tree {
         range_tombstones: Vec<crate::range_tombstone::RangeTombstone>,
     ) -> crate::Result<Option<(Vec<Table>, Option<Vec<BlobFile>>)>> {
         use crate::table::multi_writer::MultiWriter;
-        use std::time::Instant;
+        use crate::time::Instant;
 
         let start = Instant::now();
 
@@ -668,10 +644,8 @@ impl AbstractTree for Tree {
             }
         }
 
-        #[expect(clippy::expect_used, reason = "lock is expected to not be poisoned")]
-        let mut _compaction_state = self.compaction_state.lock().expect("lock is poisoned");
-        #[expect(clippy::expect_used, reason = "lock is expected to not be poisoned")]
-        let mut version_lock = self.version_history.write().expect("lock is poisoned");
+        let mut _compaction_state = self.compaction_state.lock();
+        let mut version_lock = self.version_history.write();
 
         version_lock.upgrade_version(
             &self.config.path,
@@ -711,8 +685,7 @@ impl AbstractTree for Tree {
     fn clear_active_memtable(&self) {
         use crate::tree::sealed::SealedMemtables;
 
-        #[expect(clippy::expect_used, reason = "lock is expected to not be poisoned")]
-        let mut version_history_lock = self.version_history.write().expect("lock is poisoned");
+        let mut version_history_lock = self.version_history.write();
         let super_version = version_history_lock.latest_version();
 
         if super_version.active_memtable.is_empty() {
@@ -742,12 +715,7 @@ impl AbstractTree for Tree {
         // NOTE: Read lock major compaction lock
         // That way, if a major compaction is running, we cannot proceed
         // But in general, parallel (non-major) compactions can occur
-        #[expect(clippy::expect_used, reason = "lock is expected to not be poisoned")]
-        let _lock = self
-            .0
-            .major_compaction_lock
-            .read()
-            .expect("lock is poisoned");
+        let _lock = self.0.major_compaction_lock.read();
 
         self.inner_compact(strategy, seqno_threshold)
     }
@@ -761,18 +729,12 @@ impl AbstractTree for Tree {
     }
 
     fn active_memtable(&self) -> Arc<Memtable> {
-        #[expect(clippy::expect_used, reason = "lock is expected to not be poisoned")]
-        self.version_history
-            .read()
-            .expect("lock is poisoned")
-            .latest_version()
-            .active_memtable
+        self.version_history.read().latest_version().active_memtable
     }
 
     #[expect(clippy::significant_drop_tightening)]
     fn rotate_memtable(&self) -> Option<Arc<Memtable>> {
-        #[expect(clippy::expect_used, reason = "lock is expected to not be poisoned")]
-        let mut version_history_lock = self.version_history.write().expect("lock is poisoned");
+        let mut version_history_lock = self.version_history.write();
         let super_version = version_history_lock.latest_version();
 
         if super_version.active_memtable.is_empty() {
@@ -811,12 +773,7 @@ impl AbstractTree for Tree {
     }
 
     fn approximate_len(&self) -> usize {
-        #[expect(clippy::expect_used, reason = "lock is expected to not be poisoned")]
-        let super_version = self
-            .version_history
-            .read()
-            .expect("lock is poisoned")
-            .latest_version();
+        let super_version = self.version_history.read().latest_version();
 
         let tables_item_count = self
             .current_version()
@@ -845,12 +802,7 @@ impl AbstractTree for Tree {
     }
 
     fn get_highest_memtable_seqno(&self) -> Option<SeqNo> {
-        #[expect(clippy::expect_used, reason = "lock is expected to not be poisoned")]
-        let version = self
-            .version_history
-            .read()
-            .expect("lock is poisoned")
-            .latest_version();
+        let version = self.version_history.read().latest_version();
 
         let active = version.active_memtable.get_highest_seqno();
 
@@ -874,12 +826,7 @@ impl AbstractTree for Tree {
     fn get<K: AsRef<[u8]>>(&self, key: K, seqno: SeqNo) -> crate::Result<Option<UserValue>> {
         let key = key.as_ref();
 
-        #[expect(clippy::expect_used, reason = "lock is expected to not be poisoned")]
-        let super_version = self
-            .version_history
-            .read()
-            .expect("lock is poisoned")
-            .get_version_for_snapshot(seqno);
+        let super_version = self.version_history.read().get_version_for_snapshot(seqno);
 
         Self::resolve_or_passthrough(
             &super_version,
@@ -897,12 +844,7 @@ impl AbstractTree for Tree {
     ) -> crate::Result<Option<crate::PinnableSlice>> {
         let key = key.as_ref();
 
-        #[expect(clippy::expect_used, reason = "lock is expected to not be poisoned")]
-        let super_version = self
-            .version_history
-            .read()
-            .expect("lock is poisoned")
-            .get_version_for_snapshot(seqno);
+        let super_version = self.version_history.read().get_version_for_snapshot(seqno);
 
         Self::resolve_or_passthrough_pinned(
             &super_version,
@@ -1054,15 +996,7 @@ impl AbstractTree for Tree {
     }
 
     fn remove_range<K: Into<UserKey>>(&self, start: K, end: K, seqno: SeqNo) -> u64 {
-        #[expect(clippy::expect_used, reason = "lock is expected to not be poisoned")]
-        let memtable = Arc::clone(
-            &self
-                .version_history
-                .read()
-                .expect("lock is poisoned")
-                .latest_version()
-                .active_memtable,
-        );
+        let memtable = Arc::clone(&self.version_history.read().latest_version().active_memtable);
 
         memtable.insert_range_tombstone(start.into(), end.into(), seqno)
     }
@@ -1125,16 +1059,11 @@ impl Tree {
         &self,
         target_seqno: SeqNo,
         resolve_indirection: F,
-    ) -> crate::Result<std::vec::IntoIter<ScanSinceEvent>>
+    ) -> crate::Result<alloc::vec::IntoIter<ScanSinceEvent>>
     where
         F: Fn(&Version, InternalValue) -> crate::Result<ScanSinceEvent>,
     {
-        #[expect(clippy::expect_used, reason = "lock is expected to not be poisoned")]
-        let super_version = self
-            .version_history
-            .read()
-            .expect("lock is poisoned")
-            .latest_version();
+        let super_version = self.version_history.read().latest_version();
         let version = &super_version.version;
 
         // Stable upper watermark, captured once before walking any source: the
@@ -1622,7 +1551,7 @@ impl Tree {
         prefix_hash: Option<u64>,
     ) -> impl DoubleEndedIterator<Item = crate::Result<InternalValue>> + 'static {
         use crate::range::{IterState, TreeIter};
-        use std::ops::Bound::{self, Excluded, Included, Unbounded};
+        use core::ops::Bound::{self, Excluded, Included, Unbounded};
 
         let lo: Bound<UserKey> = match range.start_bound() {
             Included(x) => Included(x.as_ref().into()),
@@ -1760,8 +1689,8 @@ impl Tree {
             .filter(|t| {
                 // Early reject: skip tables whose key range doesn't contain the key.
                 let kr = &t.metadata.key_range;
-                comparator.compare(kr.min(), key) != std::cmp::Ordering::Greater
-                    && comparator.compare(key, kr.max()) != std::cmp::Ordering::Greater
+                comparator.compare(kr.min(), key) != core::cmp::Ordering::Greater
+                    && comparator.compare(key, kr.max()) != core::cmp::Ordering::Greater
             })
         {
             let rts = table.range_tombstones();
@@ -1769,14 +1698,14 @@ impl Tree {
             // Binary search: find the first RT whose start is > key (in comparator order).
             // All RTs before that index have start <= key and are candidates.
             let candidate_end = rts.partition_point(|rt| {
-                comparator.compare(&rt.start, key) != std::cmp::Ordering::Greater
+                comparator.compare(&rt.start, key) != core::cmp::Ordering::Greater
             });
 
             for rt in rts.iter().take(candidate_end) {
                 // Check: start <= key < end (in comparator order) AND seqno visibility.
                 if rt.visible_at(read_seqno)
-                    && comparator.compare(&rt.start, key) != std::cmp::Ordering::Greater
-                    && comparator.compare(key, &rt.end) == std::cmp::Ordering::Less
+                    && comparator.compare(&rt.start, key) != core::cmp::Ordering::Greater
+                    && comparator.compare(key, &rt.end) == core::cmp::Ordering::Less
                     && key_seqno < rt.seqno
                 {
                     return true;
@@ -2002,11 +1931,7 @@ impl Tree {
     }
 
     pub(crate) fn get_version_for_snapshot(&self, seqno: SeqNo) -> SuperVersion {
-        #[expect(clippy::expect_used, reason = "lock is expected to not be poisoned")]
-        self.version_history
-            .read()
-            .expect("lock is poisoned")
-            .get_version_for_snapshot(seqno)
+        self.version_history.read().get_version_for_snapshot(seqno)
     }
 
     /// Normalizes a user-provided range into owned `Bound<Slice>` values.
@@ -2111,7 +2036,7 @@ impl Tree {
             config.encryption.clone(),
         ) {
             Ok(_) => Self::recover(config),
-            Err(crate::Error::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+            Err(crate::Error::Io(e)) if e.kind() == crate::io::ErrorKind::NotFound => {
                 // Missing CURRENT MUST coincide with a directory that
                 // has no version artifacts; otherwise we are looking at
                 // a half-written checkpoint (or other interrupted
@@ -2137,8 +2062,8 @@ impl Tree {
                         config.path.display(),
                     );
                     log::error!("{msg}");
-                    return Err(crate::Error::Io(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
+                    return Err(crate::Error::from(crate::io::Error::new(
+                        crate::io::ErrorKind::InvalidData,
                         msg,
                     )));
                 }
@@ -2154,13 +2079,7 @@ impl Tree {
     #[doc(hidden)]
     #[must_use]
     pub fn is_compacting(&self) -> bool {
-        #[expect(clippy::expect_used, reason = "lock is expected to not be poisoned")]
-        !self
-            .compaction_state
-            .lock()
-            .expect("lock is poisoned")
-            .hidden_set()
-            .is_empty()
+        !self.compaction_state.lock().hidden_set().is_empty()
     }
 
     fn inner_compact(
@@ -2197,12 +2116,7 @@ impl Tree {
         seqno: SeqNo,
         ephemeral: Option<(Arc<Memtable>, SeqNo)>,
     ) -> impl DoubleEndedIterator<Item = crate::Result<KvPair>> + 'static {
-        #[expect(clippy::expect_used, reason = "lock is expected to not be poisoned")]
-        let super_version = self
-            .version_history
-            .read()
-            .expect("lock is poisoned")
-            .get_version_for_snapshot(seqno);
+        let super_version = self.version_history.read().get_version_for_snapshot(seqno);
 
         Self::create_internal_range(
             super_version,
@@ -2234,12 +2148,7 @@ impl Tree {
 
         let range = prefix_to_range(prefix_bytes);
 
-        #[expect(clippy::expect_used, reason = "lock is expected to not be poisoned")]
-        let super_version = self
-            .version_history
-            .read()
-            .expect("lock is poisoned")
-            .get_version_for_snapshot(seqno);
+        let super_version = self.version_history.read().get_version_for_snapshot(seqno);
 
         let iter_state = IterState {
             version: super_version,
@@ -2265,10 +2174,8 @@ impl Tree {
     #[doc(hidden)]
     #[must_use]
     pub fn append_entry(&self, value: InternalValue) -> (u64, u64) {
-        #[expect(clippy::expect_used, reason = "lock is expected to not be poisoned")]
         self.version_history
             .read()
-            .expect("lock is poisoned")
             .latest_version()
             .active_memtable
             .insert(value)
@@ -2286,10 +2193,8 @@ impl Tree {
         // Hold the read guard for the entire insert to prevent rotate_memtable()
         // from sealing this memtable mid-batch (which could cause data loss if
         // a concurrent flush persists only a prefix of the batch).
-        #[expect(clippy::expect_used, reason = "lock is expected to not be poisoned")]
         self.version_history
             .read()
-            .expect("lock is poisoned")
             .latest_version()
             .active_memtable
             .insert_batch(items)
@@ -2343,7 +2248,7 @@ impl Tree {
             let mut archive_reader = crate::manifest_blocks::reader::ManifestArchiveReader::open(
                 &manifest_path,
                 &*config.fs,
-                std::sync::Arc::new(crate::runtime_config::RuntimeConfig::default()),
+                alloc::sync::Arc::new(crate::runtime_config::RuntimeConfig::default()),
                 config.encryption.clone(),
             )?;
             let manifest = Manifest::decode_from(&mut archive_reader)?;
@@ -2454,18 +2359,11 @@ impl Tree {
         // Drop impls consult it when a checkpoint is in flight. Snapshot
         // the Arc handles into owned collections so the read lock is
         // released before iterating (avoids `significant_drop_tightening`).
-        #[expect(clippy::expect_used, reason = "lock is expected to not be poisoned")]
-        let (recovered_tables, recovered_blobs): (Vec<Table>, Vec<BlobFile>) = inner
-            .version_history
-            .read()
-            .map(|lock| {
-                let version = &lock.latest_version().version;
-                (
-                    version.iter_tables().cloned().collect(),
-                    version.blob_files.iter().cloned().collect(),
-                )
-            })
-            .expect("lock is poisoned");
+        // Snapshot the version under the read lock, then drop the lock before
+        // collecting so the version_history lock isn't held across the clones.
+        let version = inner.version_history.read().latest_version().version;
+        let recovered_tables: Vec<Table> = version.iter_tables().cloned().collect();
+        let recovered_blobs: Vec<BlobFile> = version.blob_files.iter().cloned().collect();
 
         for table in &recovered_tables {
             table.install_deletion_pause(Arc::clone(&deletion_pause));
@@ -2589,7 +2487,7 @@ impl Tree {
         // junctions, or case-insensitive aliases of the same directory) are
         // skipped rather than orphan-deleted.
         let mut recovered_table_ids: crate::HashSet<TableId> = crate::HashSet::default();
-        let mut orphaned_tables: Vec<(std::path::PathBuf, Arc<dyn crate::fs::Fs>)> = vec![];
+        let mut orphaned_tables: Vec<(crate::path::PathBuf, Arc<dyn crate::fs::Fs>)> = vec![];
 
         // Scan all configured table folders (primary + level routes).
         let all_folders = config.all_tables_folders();
@@ -2794,7 +2692,7 @@ impl Tree {
                 log::trace!("Cleanup orphaned manifest file {name}");
                 match fs.remove_file(&dirent.path) {
                     Ok(()) => {}
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) if e.kind() == crate::io::ErrorKind::NotFound => {}
                     Err(e) => return Err(e.into()),
                 }
             }
@@ -2822,7 +2720,7 @@ fn has_existing_version_state(folder: &Path, fs: &dyn Fs) -> crate::Result<bool>
     }
     let entries = match fs.read_dir(folder) {
         Ok(entries) => entries,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) if e.kind() == crate::io::ErrorKind::NotFound => return Ok(false),
         Err(e) => return Err(e.into()),
     };
     for entry in entries {

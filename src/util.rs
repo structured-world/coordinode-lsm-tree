@@ -4,7 +4,7 @@
 
 use crate::UserKey;
 use crate::range::prefix_upper_range;
-use std::ops::RangeBounds;
+use core::ops::RangeBounds;
 
 pub use crate::range::prefix_to_range;
 
@@ -19,7 +19,7 @@ pub fn prefixed_range<P: AsRef<[u8]>, K: AsRef<[u8]>, R: RangeBounds<K>>(
     prefix: P,
     range: R,
 ) -> impl RangeBounds<UserKey> {
-    use std::ops::Bound::{Excluded, Included, Unbounded};
+    use core::ops::Bound::{Excluded, Included, Unbounded};
 
     let prefix = prefix.as_ref();
 
@@ -65,8 +65,8 @@ pub fn prefixed_range<P: AsRef<[u8]>, K: AsRef<[u8]>, R: RangeBounds<K>>(
 mod tests {
     use super::prefixed_range;
     use crate::UserKey;
-    use std::ops::Bound::{Excluded, Included};
-    use std::ops::RangeBounds;
+    use core::ops::Bound::{Excluded, Included};
+    use core::ops::RangeBounds;
     use test_log::test;
 
     #[test]

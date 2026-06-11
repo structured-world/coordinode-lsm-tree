@@ -6,21 +6,21 @@ use super::{
     Block,
     encoder::{Encodable, Encoder},
 };
+use crate::io::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use crate::table::block::hash_index::MAX_POINTERS_FOR_HASH_INDEX;
-use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 
 pub const TRAILER_START_MARKER: u8 = 255;
 
-const TRAILER_SIZE: usize = 5 * std::mem::size_of::<u32>()
-    + (2 * std::mem::size_of::<u8>())
+const TRAILER_SIZE: usize = 5 * core::mem::size_of::<u32>()
+    + (2 * core::mem::size_of::<u8>())
     // Fixed key size (unused)
-    + std::mem::size_of::<u8>()
-    + std::mem::size_of::<u16>()
+    + core::mem::size_of::<u8>()
+    + core::mem::size_of::<u16>()
     // Prefix truncation on/off (always on)
-    + std::mem::size_of::<u8>()
+    + core::mem::size_of::<u8>()
     // Fixed value size (unused)
-    + std::mem::size_of::<u8>()
-    + std::mem::size_of::<u32>();
+    + core::mem::size_of::<u8>()
+    + core::mem::size_of::<u32>();
 
 /// Block trailer
 ///
@@ -72,7 +72,7 @@ impl<'a> Trailer<'a> {
             clippy::indexing_slicing,
             reason = "the item_count is at the end and is a u32"
         )]
-        let reader = &mut &reader[(TRAILER_SIZE - std::mem::size_of::<u32>())..];
+        let reader = &mut &reader[(TRAILER_SIZE - core::mem::size_of::<u32>())..];
 
         #[expect(
             clippy::expect_used,

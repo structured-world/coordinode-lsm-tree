@@ -13,6 +13,7 @@ use super::{
     block::{BlockOffset, Encoder, Trailer},
 };
 use crate::Slice;
+use crate::io::{Error, ErrorKind};
 use crate::{
     SeqNo,
     table::{
@@ -20,7 +21,8 @@ use crate::{
         util::{SliceIndexes, compare_prefixed_slice},
     },
 };
-use std::io::{Error, ErrorKind};
+#[cfg(not(feature = "std"))]
+use alloc::{boxed::Box, string::String, vec::Vec};
 
 #[derive(Debug)]
 pub struct IndexBlockParsedItem {
@@ -40,7 +42,7 @@ impl ParsedItem<KeyedBlockHandle> for IndexBlockParsedItem {
         needle: &[u8],
         bytes: &[u8],
         cmp: &dyn crate::comparator::UserComparator,
-    ) -> std::cmp::Ordering {
+    ) -> core::cmp::Ordering {
         // SAFETY: slice indexes come from the block parser which validates them
         // during decoding. The block format guarantees they are within bounds.
         if let Some(prefix) = &self.prefix {
@@ -188,7 +190,7 @@ impl IndexBlock {
     ///
     /// # Errors
     ///
-    /// Returns [`std::io::ErrorKind::InvalidInput`] when `restart_interval == 0`.
+    /// Returns [`crate::io::ErrorKind::InvalidInput`] when `restart_interval == 0`.
     ///
     /// # Panics
     ///
@@ -217,7 +219,7 @@ impl IndexBlock {
     ///
     /// # Errors
     ///
-    /// Returns [`std::io::ErrorKind::InvalidInput`] when `restart_interval == 0`.
+    /// Returns [`crate::io::ErrorKind::InvalidInput`] when `restart_interval == 0`.
     ///
     /// # Panics
     ///
@@ -294,7 +296,9 @@ mod tests {
         let Err(err) = IndexBlock::encode_into_vec_with_restart_interval(&handles, 0) else {
             panic!("restart interval of zero must be rejected");
         };
-        assert!(matches!(err, crate::Error::Io(e) if e.kind() == ErrorKind::InvalidInput));
+        assert!(
+            matches!(err, crate::Error::Io(e) if e.kind() == crate::io::ErrorKind::InvalidInput)
+        );
     }
 
     #[test]
@@ -340,8 +344,8 @@ mod tests {
         use super::*;
         use crate::comparator::UserComparator;
         use crate::table::BlockHandle;
+        use core::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
         use std::sync::Arc;
-        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
         struct CountingComparator {
             /// Counts `compare()` invocations — proves the lex devirt path
@@ -367,7 +371,7 @@ mod tests {
             fn name(&self) -> &'static str {
                 "counting"
             }
-            fn compare(&self, a: &[u8], b: &[u8]) -> std::cmp::Ordering {
+            fn compare(&self, a: &[u8], b: &[u8]) -> core::cmp::Ordering {
                 self.count.fetch_add(1, AtomicOrdering::Relaxed);
                 a.cmp(b)
             }

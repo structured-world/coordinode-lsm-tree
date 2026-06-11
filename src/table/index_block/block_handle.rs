@@ -2,6 +2,8 @@
 // Copyright (c) 2025-present, fjall-rs
 // Copyright (c) 2026-present, Structured World Foundation
 
+use crate::io::Cursor;
+use crate::io::{ReadBytesExt, WriteBytesExt};
 use crate::{SeqNo, UserKey};
 use crate::{
     coding::{Decode, Encode},
@@ -11,8 +13,15 @@ use crate::{
         util::SliceIndexes,
     },
 };
-use byteorder::{ReadBytesExt, WriteBytesExt};
-use std::io::{Cursor, Seek};
+// `Seek` resolves to std under `std` (so `seek_relative` on `Cursor` comes
+// from `std::io::Seek`) and to the native trait under `no_std`.
+#[cfg(not(feature = "std"))]
+use crate::io::Seek;
+#[cfg(not(feature = "std"))]
+use crate::io::{VarintReader, VarintWriter};
+#[cfg(feature = "std")]
+use std::io::Seek;
+#[cfg(feature = "std")]
 use varint_rs::{VarintReader, VarintWriter};
 
 /// Points to a block on file
@@ -43,7 +52,7 @@ impl BlockHandle {
 }
 
 impl Encode for BlockHandle {
-    fn encode_into<W: std::io::Write>(&self, writer: &mut W) -> Result<(), crate::Error> {
+    fn encode_into<W: crate::io::Write>(&self, writer: &mut W) -> Result<(), crate::Error> {
         writer.write_u64_varint(*self.offset)?;
         writer.write_u32_varint(self.size)?;
         Ok(())
@@ -51,7 +60,7 @@ impl Encode for BlockHandle {
 }
 
 impl Decode for BlockHandle {
-    fn decode_from<R: std::io::Read>(reader: &mut R) -> Result<Self, crate::Error>
+    fn decode_from<R: crate::io::Read>(reader: &mut R) -> Result<Self, crate::Error>
     where
         Self: Sized,
     {
@@ -172,7 +181,7 @@ impl PartialEq for KeyedBlockHandle {
 }
 
 impl Encodable<BlockOffset> for KeyedBlockHandle {
-    fn encode_full_into<W: std::io::Write>(
+    fn encode_full_into<W: crate::io::Write>(
         &self,
         writer: &mut W,
         state: &mut BlockOffset,
@@ -210,7 +219,7 @@ impl Encodable<BlockOffset> for KeyedBlockHandle {
     }
 
     // TODO: see https://github.com/structured-world/coordinode-lsm-tree/issues/184
-    fn encode_truncated_into<W: std::io::Write>(
+    fn encode_truncated_into<W: crate::io::Write>(
         &self,
         writer: &mut W,
         _state: &mut BlockOffset,

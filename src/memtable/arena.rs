@@ -12,7 +12,7 @@
 //!
 //! # Memory is uninitialized
 //!
-//! Blocks are allocated with [`alloc`](std::alloc::alloc), NOT `alloc_zeroed`
+//! Blocks are allocated with [`alloc`](alloc::alloc::alloc), NOT `alloc_zeroed`
 //! (same as the `RocksDB` arena, which uses an uninitialized `new char[]`). The
 //! caller MUST fully initialize every byte it later reads before publishing the
 //! allocation to other threads — the arena makes no zeroing guarantee. The
@@ -22,8 +22,10 @@
 //! creation. This removes the per-flush zeroing cost (a fresh memtable no
 //! longer eagerly zeroes its arena block).
 
-use std::ptr;
-use std::sync::atomic::{AtomicPtr, AtomicU32, Ordering};
+#[cfg(not(feature = "std"))]
+use alloc::{boxed::Box, string::String, vec::Vec};
+use core::ptr;
+use core::sync::atomic::{AtomicPtr, AtomicU32, Ordering};
 
 /// Bits used for the within-block offset.
 ///
@@ -170,7 +172,7 @@ impl Arena {
             "get_bytes: off={off} + len={len} exceeds BLOCK_SIZE={BLOCK_SIZE} (offset={offset})",
         );
         // SAFETY: caller guarantees the range is allocated and initialised.
-        unsafe { std::slice::from_raw_parts(ptr.add(off), len as usize) }
+        unsafe { core::slice::from_raw_parts(ptr.add(off), len as usize) }
     }
 
     /// Returns an exclusive reference to `len` bytes at the encoded `offset`.
@@ -186,7 +188,7 @@ impl Arena {
         let (ptr, off) = unsafe { self.decode(offset) };
         // SAFETY: caller guarantees exclusive access (typically right after alloc,
         // before the node offset is published to other threads).
-        unsafe { std::slice::from_raw_parts_mut(ptr.add(off), len as usize) }
+        unsafe { core::slice::from_raw_parts_mut(ptr.add(off), len as usize) }
     }
 
     /// Interprets 4 bytes at `offset` as an [`AtomicU32`] reference.
@@ -235,7 +237,7 @@ impl Arena {
             // Spin briefly — ensure_block uses CAS with AcqRel, so the
             // pointer will become visible after a few iterations.
             for _ in 0..1000 {
-                std::hint::spin_loop();
+                core::hint::spin_loop();
                 ptr = self.blocks[block_idx].load(Ordering::Acquire);
                 if !ptr.is_null() {
                     return (ptr, off);
@@ -273,9 +275,9 @@ impl Arena {
             // SAFETY: layout is non-zero (BLOCK_SIZE > 0). Visibility: the CAS
             // below (AcqRel) makes the block pointer (and the writes the caller
             // makes into it before publishing a node) visible to readers.
-            let raw = unsafe { std::alloc::alloc(layout) };
+            let raw = unsafe { alloc::alloc::alloc(layout) };
             if raw.is_null() {
-                std::alloc::handle_alloc_error(layout);
+                alloc::alloc::handle_alloc_error(layout);
             }
 
             // CAS null → raw.  If another thread won, free our block.
@@ -285,7 +287,7 @@ impl Arena {
             {
                 // SAFETY: raw was just allocated with `layout`.
                 unsafe {
-                    std::alloc::dealloc(raw, layout);
+                    alloc::alloc::dealloc(raw, layout);
                 }
             }
         }
@@ -293,9 +295,9 @@ impl Arena {
 
     /// Layout for arena blocks: `BLOCK_SIZE` bytes with 4-byte alignment
     /// (required for `AtomicU32` tower pointers).
-    fn block_layout() -> std::alloc::Layout {
+    fn block_layout() -> alloc::alloc::Layout {
         // SAFETY: BLOCK_SIZE > 0 and align (4) is a power of two.
-        unsafe { std::alloc::Layout::from_size_align_unchecked(BLOCK_SIZE as usize, 4) }
+        unsafe { alloc::alloc::Layout::from_size_align_unchecked(BLOCK_SIZE as usize, 4) }
     }
 }
 
@@ -314,7 +316,7 @@ impl Drop for Arena {
                 // SAFETY: `ptr` was allocated for this arena using `block_layout()`,
                 // so deallocating with the same layout is valid.
                 unsafe {
-                    std::alloc::dealloc(ptr, layout);
+                    alloc::alloc::dealloc(ptr, layout);
                 }
             }
         }

@@ -69,7 +69,7 @@ fn tree_reopen_rejects_non_utf8_filename_in_data_dir() -> lsm_tree::Result<()> {
         lsm_tree::Error::Io(ref io_err) => {
             assert_eq!(
                 io_err.kind(),
-                std::io::ErrorKind::InvalidData,
+                lsm_tree::io::ErrorKind::InvalidData,
                 "expected InvalidData, got: {err:?}"
             );
         }

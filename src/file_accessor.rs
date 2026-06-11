@@ -4,9 +4,10 @@
 
 use crate::GlobalTableId;
 use crate::descriptor_table::DescriptorTable;
+use alloc::sync::Arc;
+
 use crate::fs::{Fs, FsFile, FsOpenOptions};
-use std::path::Path;
-use std::sync::Arc;
+use crate::path::Path;
 
 /// Allows accessing a file (either cached or pinned)
 #[derive(Clone)]
@@ -49,7 +50,7 @@ impl FileAccessor {
         &self,
         table_id: &GlobalTableId,
         path: &Path,
-    ) -> std::io::Result<(Arc<dyn FsFile>, Option<bool>)> {
+    ) -> crate::io::Result<(Arc<dyn FsFile>, Option<bool>)> {
         match self {
             Self::File(fd) => Ok((fd.clone(), None)),
             Self::DescriptorTable { table, fs } => {
@@ -61,7 +62,7 @@ impl FileAccessor {
                 table.insert_for_table(*table_id, fd.clone());
                 Ok((fd, Some(false)))
             }
-            Self::Closed => Err(std::io::Error::other("file accessor closed")),
+            Self::Closed => Err(crate::io::Error::other("file accessor closed")),
         }
     }
 
@@ -73,7 +74,7 @@ impl FileAccessor {
         &self,
         table_id: &GlobalTableId,
         path: &Path,
-    ) -> std::io::Result<(Arc<dyn FsFile>, Option<bool>)> {
+    ) -> crate::io::Result<(Arc<dyn FsFile>, Option<bool>)> {
         match self {
             Self::File(fd) => Ok((fd.clone(), None)),
             Self::DescriptorTable { table, fs } => {
@@ -85,7 +86,7 @@ impl FileAccessor {
                 table.insert_for_blob_file(*table_id, fd.clone());
                 Ok((fd, Some(false)))
             }
-            Self::Closed => Err(std::io::Error::other("file accessor closed")),
+            Self::Closed => Err(crate::io::Error::other("file accessor closed")),
         }
     }
 
@@ -115,8 +116,8 @@ impl FileAccessor {
     }
 }
 
-impl std::fmt::Debug for FileAccessor {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+impl core::fmt::Debug for FileAccessor {
+    fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
         match self {
             Self::File(_) => write!(f, "FileAccessor::Pinned"),
             Self::DescriptorTable { .. } => {

@@ -64,18 +64,18 @@ impl<'a> Iter<'a> {
         if cmp.is_lexicographic() {
             self.decoder.inner_mut().seek(
                 |head_key, head_seqno| match head_key.cmp(needle) {
-                    std::cmp::Ordering::Less => true,
-                    std::cmp::Ordering::Equal => head_seqno >= seqno,
-                    std::cmp::Ordering::Greater => false,
+                    core::cmp::Ordering::Less => true,
+                    core::cmp::Ordering::Equal => head_seqno >= seqno,
+                    core::cmp::Ordering::Greater => false,
                 },
                 false,
             )
         } else {
             self.decoder.inner_mut().seek(
                 |head_key, head_seqno| match cmp.compare(head_key, needle) {
-                    std::cmp::Ordering::Less => true,
-                    std::cmp::Ordering::Equal => head_seqno >= seqno,
-                    std::cmp::Ordering::Greater => false,
+                    core::cmp::Ordering::Less => true,
+                    core::cmp::Ordering::Equal => head_seqno >= seqno,
+                    core::cmp::Ordering::Greater => false,
                 },
                 false,
             )
@@ -99,13 +99,13 @@ impl<'a> Iter<'a> {
             };
 
             match item.compare_key(needle, self.bytes, self.comparator.as_ref()) {
-                std::cmp::Ordering::Equal => {
+                core::cmp::Ordering::Equal => {
                     return true;
                 }
-                std::cmp::Ordering::Greater => {
+                core::cmp::Ordering::Greater => {
                     return false;
                 }
-                std::cmp::Ordering::Less => {
+                core::cmp::Ordering::Less => {
                     // Continue
 
                     #[expect(
@@ -133,7 +133,7 @@ impl<'a> Iter<'a> {
                 .seek_upper(|head_key, _| head_key <= needle, false)
         } else {
             self.decoder.inner_mut().seek_upper(
-                |head_key, _| cmp.compare(head_key, needle) != std::cmp::Ordering::Greater,
+                |head_key, _| cmp.compare(head_key, needle) != core::cmp::Ordering::Greater,
                 false,
             )
         };
@@ -148,13 +148,13 @@ impl<'a> Iter<'a> {
             };
 
             match item.compare_key(needle, self.bytes, self.comparator.as_ref()) {
-                std::cmp::Ordering::Equal => {
+                core::cmp::Ordering::Equal => {
                     return true;
                 }
-                std::cmp::Ordering::Less => {
+                core::cmp::Ordering::Less => {
                     return false;
                 }
-                std::cmp::Ordering::Greater => {
+                core::cmp::Ordering::Greater => {
                     // Continue
 
                     #[expect(
@@ -180,10 +180,10 @@ impl<'a> Iter<'a> {
             };
 
             match item.compare_key(needle, self.bytes, self.comparator.as_ref()) {
-                std::cmp::Ordering::Greater => {
+                core::cmp::Ordering::Greater => {
                     return true;
                 }
-                std::cmp::Ordering::Equal | std::cmp::Ordering::Less => {
+                core::cmp::Ordering::Equal | core::cmp::Ordering::Less => {
                     #[expect(
                         clippy::expect_used,
                         reason = "we peeked a value successfully, so there must be a next item in the stream"
@@ -206,7 +206,7 @@ impl<'a> Iter<'a> {
                 .seek_upper(|head_key, _| head_key <= needle, false)
         } else {
             self.decoder.inner_mut().seek_upper(
-                |head_key, _| cmp.compare(head_key, needle) != std::cmp::Ordering::Greater,
+                |head_key, _| cmp.compare(head_key, needle) != core::cmp::Ordering::Greater,
                 false,
             )
         };
@@ -220,10 +220,10 @@ impl<'a> Iter<'a> {
             };
 
             match item.compare_key(needle, self.bytes, self.comparator.as_ref()) {
-                std::cmp::Ordering::Less => {
+                core::cmp::Ordering::Less => {
                     return true;
                 }
-                std::cmp::Ordering::Equal | std::cmp::Ordering::Greater => {
+                core::cmp::Ordering::Equal | core::cmp::Ordering::Greater => {
                     #[expect(
                         clippy::expect_used,
                         reason = "we peeked a value successfully, so there must be a next item in the stream"

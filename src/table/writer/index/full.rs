@@ -8,7 +8,9 @@ use crate::{
     encryption::EncryptionProvider,
     table::{Block, IndexBlock, index_block::KeyedBlockHandle, writer::index::BlockIndexWriter},
 };
-use std::sync::Arc;
+use alloc::sync::Arc;
+#[cfg(not(feature = "std"))]
+use alloc::{boxed::Box, string::String, vec::Vec};
 
 pub struct FullIndexWriter {
     compression: CompressionType,
@@ -40,7 +42,7 @@ impl FullIndexWriter {
     }
 }
 
-impl<W: std::io::Write + std::io::Seek> BlockIndexWriter<W> for FullIndexWriter {
+impl<W: crate::io::Write + crate::io::Seek> BlockIndexWriter<W> for FullIndexWriter {
     fn use_encryption(
         mut self: Box<Self>,
         encryption: Option<Arc<dyn EncryptionProvider>>,

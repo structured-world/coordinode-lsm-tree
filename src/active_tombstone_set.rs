@@ -13,7 +13,9 @@
 //! when multiple tombstones share the same boundary key.
 
 use crate::{SeqNo, UserKey, comparator::SharedComparator, range_tombstone::RangeTombstone};
-use std::collections::BTreeMap;
+use alloc::collections::BTreeMap;
+#[cfg(not(feature = "std"))]
+use alloc::{boxed::Box, string::String, vec::Vec};
 
 /// Tracks active range tombstones during forward iteration.
 ///
@@ -103,7 +105,7 @@ impl ActiveTombstoneSet {
     /// Panics if an expiry pop has no matching activation in the seqno multiset.
     pub fn expire_until(&mut self, current_key: &[u8]) {
         while let Some((end, _, seqno)) = self.pending_expiry.last() {
-            if self.comparator.compare(end, current_key) == std::cmp::Ordering::Greater {
+            if self.comparator.compare(end, current_key) == core::cmp::Ordering::Greater {
                 break;
             }
             let seqno = *seqno;
@@ -252,7 +254,7 @@ impl ActiveTombstoneSetReverse {
     /// Panics if an expiry pop has no matching activation in the seqno multiset.
     pub fn expire_until(&mut self, current_key: &[u8]) {
         while let Some((start, _, seqno)) = self.pending_expiry.last() {
-            if self.comparator.compare(current_key, start) == std::cmp::Ordering::Less {
+            if self.comparator.compare(current_key, start) == core::cmp::Ordering::Less {
                 let seqno = *seqno;
                 self.pending_expiry.pop();
                 #[expect(

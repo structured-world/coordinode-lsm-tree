@@ -2,21 +2,21 @@
 // This source code is licensed under both the Apache 2.0 and MIT License
 // (found in the LICENSE-* files in the repository)
 
+use crate::io::WriteBytesExt;
 use crate::sfa::checksum::Checksum;
-use byteorder::WriteBytesExt;
 
 pub const TRAILER_MAGIC: &[u8] = b"SFA!";
 
 pub struct TrailerWriter;
 
 impl TrailerWriter {
-    pub fn write_into<W: std::io::Write>(
+    pub fn write_into<W: crate::io::Write>(
         mut writer: W,
         toc_checksum: Checksum,
         toc_pos: u64,
         toc_len: u64,
     ) -> crate::sfa::Result<()> {
-        use byteorder::LE;
+        use crate::io::LE;
 
         log::trace!("Writing trailer");
 

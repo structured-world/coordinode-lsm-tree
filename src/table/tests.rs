@@ -865,7 +865,7 @@ fn table_point_read_zstd_dictionary() -> crate::Result<()> {
 
 #[test]
 fn table_range_exclusive_bounds() -> crate::Result<()> {
-    use std::ops::Bound::{Excluded, Included};
+    use core::ops::Bound::{Excluded, Included};
 
     let items = [
         crate::InternalValue::from_components(b"a", b"v", 0, crate::ValueType::Value),
@@ -1955,7 +1955,7 @@ fn assert_rt_decode_error(data: Vec<u8>, expected_field: &str, expected_offset: 
 #[test]
 #[expect(clippy::unwrap_used)]
 fn decode_range_tombstones_invalid_interval_returns_error() {
-    use byteorder::{LE, WriteBytesExt};
+    use crate::io::{LE, WriteBytesExt};
 
     // Build a single tombstone where start ("z") >= end ("a")
     let mut buf = Vec::new();
@@ -1984,7 +1984,7 @@ fn decode_range_tombstones_empty_block_returns_error() {
 #[test]
 #[expect(clippy::unwrap_used)]
 fn decode_range_tombstones_start_len_exceeds_remaining_returns_error() {
-    use byteorder::{LE, WriteBytesExt};
+    use crate::io::{LE, WriteBytesExt};
 
     // start_len = 100 but only 1 byte of data follows; offset = 0 (entry start)
     let mut buf = Vec::new();
@@ -1997,7 +1997,7 @@ fn decode_range_tombstones_start_len_exceeds_remaining_returns_error() {
 #[test]
 #[expect(clippy::unwrap_used)]
 fn decode_range_tombstones_truncated_end_len_returns_error() {
-    use byteorder::{LE, WriteBytesExt};
+    use crate::io::{LE, WriteBytesExt};
 
     // Valid start_len + start, then truncated before end_len completes
     // offset = 3 (after u16 start_len + 1-byte key)
@@ -2012,7 +2012,7 @@ fn decode_range_tombstones_truncated_end_len_returns_error() {
 #[test]
 #[expect(clippy::unwrap_used)]
 fn decode_range_tombstones_end_len_exceeds_remaining_returns_error() {
-    use byteorder::{LE, WriteBytesExt};
+    use crate::io::{LE, WriteBytesExt};
 
     // Valid start, then end_len = 100 but only 1 byte follows
     // offset = 3 (after u16 start_len + 1-byte key)
@@ -2028,7 +2028,7 @@ fn decode_range_tombstones_end_len_exceeds_remaining_returns_error() {
 #[test]
 #[expect(clippy::unwrap_used)]
 fn decode_range_tombstones_truncated_seqno_returns_error() {
-    use byteorder::{LE, WriteBytesExt};
+    use crate::io::{LE, WriteBytesExt};
 
     // Valid start + end, but seqno truncated (only 4 of 8 bytes)
     // offset = 6 (after u16+1+u16+1 = 6 bytes for start/end fields)
@@ -2055,7 +2055,7 @@ fn load_block_range_tombstone_metrics() -> crate::Result<()> {
         range_tombstone::RangeTombstone,
         table::{block::BlockType, util::load_block},
     };
-    use std::sync::atomic::Ordering::Relaxed;
+    use core::sync::atomic::Ordering::Relaxed;
 
     let dir = tempdir()?;
     let file = dir.path().join("table");
@@ -2548,7 +2548,7 @@ fn meta_seqno_kv_max_corruption_returns_invalid_data() -> crate::Result<()> {
 
         let err = result.expect_err("corrupted seqno#kv_max should cause an error");
         assert!(
-            matches!(&err, crate::Error::Io(e) if e.kind() == std::io::ErrorKind::InvalidData),
+            matches!(&err, crate::Error::Io(e) if e.kind() == crate::io::ErrorKind::InvalidData),
             "expected InvalidData, got: {err:?}",
         );
     }

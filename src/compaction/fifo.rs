@@ -7,6 +7,8 @@ use crate::{
     HashSet, KvPair, compaction::state::CompactionState, config::Config, time::unix_timestamp,
     version::Version,
 };
+#[cfg(not(feature = "std"))]
+use alloc::{boxed::Box, string::String, vec::Vec};
 
 #[doc(hidden)]
 pub const NAME: &str = "FifoCompaction";

@@ -7,7 +7,7 @@ use crate::compaction::state::CompactionState;
 use crate::version::Version;
 use crate::{HashSet, Table};
 use crate::{KeyRange, config::Config, slice::Slice, version::run::Ranged};
-use std::ops::{Bound, RangeBounds};
+use core::ops::{Bound, RangeBounds};
 
 #[derive(Clone, Debug)]
 pub struct OwnedBounds {
@@ -38,7 +38,7 @@ impl OwnedBounds {
     /// using the given comparator for key ordering.
     #[must_use]
     pub fn contains(&self, range: &KeyRange, cmp: &dyn crate::comparator::UserComparator) -> bool {
-        use std::cmp::Ordering;
+        use core::cmp::Ordering;
 
         let lower_ok = match &self.start {
             Bound::Unbounded => true,

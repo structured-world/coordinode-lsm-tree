@@ -33,8 +33,13 @@ use crate::{
     time::unix_timestamp,
     vlog::BlobFileId,
 };
+use alloc::sync::Arc;
+#[cfg(not(feature = "std"))]
+use alloc::{boxed::Box, string::String, vec::Vec};
 use index::BlockIndexWriter;
-use std::{io::BufWriter, path::PathBuf, sync::Arc};
+
+use crate::io::BufWriter;
+use crate::path::PathBuf;
 
 #[cfg(feature = "std")] // no-std: parallel compaction unavailable (no threads)
 use {parallel_compressor::BlockCompressor, std::collections::VecDeque};
@@ -50,7 +55,7 @@ struct HandleMeta {
     item_count: usize,
 }
 
-#[derive(Copy, Clone, PartialEq, Eq, Debug, std::hash::Hash)]
+#[derive(Copy, Clone, PartialEq, Eq, Debug, core::hash::Hash)]
 pub struct LinkedFile {
     pub blob_file_id: BlobFileId,
     pub bytes: u64,
@@ -221,6 +226,8 @@ impl Writer {
     ) -> crate::Result<Self> {
         // Normalize path once so open(), remove_file(), and fsync_directory()
         // all see the same absolute path.
+        // no-std: caller must pass an already-absolute path (no cwd concept)
+        #[cfg(feature = "std")]
         let path = std::path::absolute(path)?;
 
         let file = fs.open(&path, &FsOpenOptions::new().write(true).create_new(true))?;
@@ -827,7 +834,7 @@ impl Writer {
             &transform,
             kv_flags,
         )?;
-        let layout = std::mem::take(&mut prepared.layout);
+        let layout = core::mem::take(&mut prepared.layout);
         let header = prepared.write_to(&mut self.file_writer)?;
 
         self.register_written_block(
@@ -957,12 +964,12 @@ impl Writer {
         };
         let mut prepared = prepared?;
         let Some(meta) = self.pending_meta.pop_front() else {
-            return Err(crate::Error::Io(std::io::Error::other(
+            return Err(crate::Error::Io(crate::io::Error::other(
                 "parallel block pipeline meta desync",
             )));
         };
         // Take the inner-block layout before `write_to` consumes the block.
-        let layout = std::mem::take(&mut prepared.layout);
+        let layout = core::mem::take(&mut prepared.layout);
         let header = prepared.write_to(&mut self.file_writer)?;
         // Header is Copy; read the in-flight size before handing it off.
         self.parallel_pending_bytes = self
@@ -982,6 +989,9 @@ impl Writer {
     #[expect(clippy::too_many_lines)]
     /// Finishes the table, making sure all data is written durably
     pub fn finish(mut self) -> crate::Result<Option<(TableId, Checksum)>> {
+        #[cfg(not(feature = "std"))]
+        use crate::io::Write;
+        #[cfg(feature = "std")]
         use std::io::Write;
 
         self.spill_block()?;
@@ -1128,7 +1138,7 @@ impl Writer {
 
         // Write range tombstones block (if any)
         if !self.range_tombstones.is_empty() {
-            use byteorder::{LE, WriteBytesExt};
+            use crate::io::{LE, WriteBytesExt};
 
             self.file_writer.start("range_tombstones")?;
 
@@ -1136,14 +1146,14 @@ impl Writer {
             self.block_buffer.clear();
             for rt in &self.range_tombstones {
                 let start_len = u16::try_from(rt.start.len()).map_err(|_| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
+                    crate::io::Error::new(
+                        crate::io::ErrorKind::InvalidData,
                         "range tombstone start key length exceeds u16::MAX",
                     )
                 })?;
                 let end_len = u16::try_from(rt.end.len()).map_err(|_| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
+                    crate::io::Error::new(
+                        crate::io::ErrorKind::InvalidData,
                         "range tombstone end key length exceeds u16::MAX",
                     )
                 })?;
@@ -1273,7 +1283,7 @@ impl Writer {
         )?;
 
         if !self.linked_blob_files.is_empty() {
-            use byteorder::{LE, WriteBytesExt};
+            use crate::io::{LE, WriteBytesExt};
 
             self.file_writer.start("linked_blob_files")?;
 
@@ -1527,7 +1537,7 @@ fn meta_kv(key: &str, value: &[u8]) -> InternalValue {
     InternalValue::from_components(key, value, 0, crate::ValueType::Value)
 }
 
-fn write_meta_section<W: std::io::Write + std::io::Seek>(
+fn write_meta_section<W: crate::io::Write + crate::io::Seek>(
     file_writer: &mut crate::sfa::Writer<ChecksummedWriter<W>>,
     block_buffer: &mut Vec<u8>,
     encryption: Option<&dyn EncryptionProvider>,

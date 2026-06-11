@@ -39,6 +39,9 @@
 mod checksum;
 mod checksum_writer;
 mod error;
+// The archive `Reader` opens a file by path (std::fs + BufReader), so it is
+// genuinely std-bound; the wire codec (toc / trailer / writer over generic
+// Read/Write) is no_std-capable and stays ungated.
 mod reader;
 mod toc;
 mod trailer;
@@ -51,7 +54,7 @@ mod writer;
 // outside the crate, so any type in their signatures must be at least
 // as visible as the fn. The alias stays doc-hidden via the parent
 // module's `#[doc(hidden)]`.
-pub type Result<T> = std::result::Result<T, Error>;
+pub type Result<T> = core::result::Result<T, Error>;
 
 pub use checksum::Checksum;
 pub use error::Error;

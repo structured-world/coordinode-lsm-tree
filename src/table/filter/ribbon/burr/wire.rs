@@ -33,10 +33,19 @@
 //! at parse time. Keeps the format compact and removes the temptation
 //! to drift seeds across encode/decode.
 
-use std::hash::BuildHasher;
+#[cfg(not(feature = "std"))]
+use alloc::{boxed::Box, string::String, vec::Vec};
+use core::hash::BuildHasher;
 
-use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
-use std::io::{Cursor, Read};
+use crate::io::Cursor;
+use crate::io::{LittleEndian, ReadBytesExt, WriteBytesExt};
+// `Read` in scope for the raw `cursor.read_exact` below: the std trait under
+// `std` (where `crate::io::Read` is a method-less alias), the native one under
+// `no_std`.
+#[cfg(not(feature = "std"))]
+use crate::io::Read;
+#[cfg(feature = "std")]
+use std::io::Read;
 
 use super::super::hashing::{StandardEquation, standard_equation_from_hash};
 use super::super::params::{Mode, Params};

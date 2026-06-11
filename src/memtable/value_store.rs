@@ -13,9 +13,11 @@
 //! and caused 15-27% throughput regression under concurrent reads.
 
 use crate::value::UserValue;
+#[cfg(not(feature = "std"))]
+use alloc::{boxed::Box, string::String, vec::Vec};
 
-use std::ptr;
-use std::sync::atomic::{AtomicPtr, AtomicU32, Ordering};
+use core::ptr;
+use core::sync::atomic::{AtomicPtr, AtomicU32, Ordering};
 
 /// Number of entries per segment.  2^16 = 65 536.
 const SEGMENT_SHIFT: u32 = 16;
@@ -154,7 +156,7 @@ impl ValueStore {
                 reason = "Layout::array with compile-time-known size cannot fail"
             )]
             let layout =
-                std::alloc::Layout::array::<UserValue>(SEGMENT_SIZE).expect("segment layout");
+                alloc::alloc::Layout::array::<UserValue>(SEGMENT_SIZE).expect("segment layout");
 
             // SAFETY: layout is non-zero (SEGMENT_SIZE > 0, UserValue is non-ZST).
             // The cast to *mut UserValue is safe because alloc_zeroed returns
@@ -164,9 +166,9 @@ impl ValueStore {
                 clippy::cast_ptr_alignment,
                 reason = "Layout::array ensures correct alignment"
             )]
-            let raw = unsafe { std::alloc::alloc_zeroed(layout) }.cast::<UserValue>();
+            let raw = unsafe { alloc::alloc::alloc_zeroed(layout) }.cast::<UserValue>();
             if raw.is_null() {
-                std::alloc::handle_alloc_error(layout);
+                alloc::alloc::handle_alloc_error(layout);
             }
 
             // CAS null → raw.  Loser frees its allocation.
@@ -177,7 +179,7 @@ impl ValueStore {
                 // SAFETY: raw was just allocated with the same layout; no
                 // slots were initialised (we lost the race before any append).
                 unsafe {
-                    std::alloc::dealloc(raw.cast::<u8>(), layout);
+                    alloc::alloc::dealloc(raw.cast::<u8>(), layout);
                 }
             }
         }
@@ -236,13 +238,13 @@ impl Drop for ValueStore {
                 reason = "Layout::array with compile-time-known size cannot fail"
             )]
             let layout =
-                std::alloc::Layout::array::<UserValue>(SEGMENT_SIZE).expect("segment layout");
+                alloc::alloc::Layout::array::<UserValue>(SEGMENT_SIZE).expect("segment layout");
             // SAFETY: `seg_ptr` came from `alloc_zeroed(layout)` in
             // `ensure_segment()`, all initialised entries were dropped above,
             // and `Drop` has exclusive access — so this frees that allocation
             // exactly once with the original layout.
             unsafe {
-                std::alloc::dealloc(seg_ptr.cast::<u8>(), layout);
+                alloc::alloc::dealloc(seg_ptr.cast::<u8>(), layout);
             }
         }
     }

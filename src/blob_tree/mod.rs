@@ -9,6 +9,8 @@ pub mod ingest;
 #[doc(hidden)]
 pub use gc::{FragmentationEntry, FragmentationMap};
 
+use crate::path::{Path, PathBuf};
+use crate::tree::inner::{FlushGuard, VersionsWriteGuard};
 use crate::{
     Cache, Config, Memtable, ScanSinceEvent, SeqNo, TableId, TreeId, UserKey, UserValue,
     abstract_tree::{AbstractTree, RangeItem},
@@ -20,12 +22,15 @@ use crate::{
     version::Version,
     vlog::{Accessor, BlobFile, BlobFileWriter},
 };
-use handle::BlobIndirection;
-use std::{
-    ops::RangeBounds,
-    path::{Path, PathBuf},
-    sync::{Arc, MutexGuard},
+use alloc::sync::Arc;
+#[cfg(not(feature = "std"))]
+use alloc::{
+    boxed::Box,
+    string::{String, ToString},
+    vec::Vec,
 };
+use core::ops::RangeBounds;
+use handle::BlobIndirection;
 
 /// Iterator value guard
 pub struct Guard {
@@ -70,7 +75,7 @@ impl IterGuard for Guard {
         let kv = self.kv?;
 
         if kv.key.value_type.is_indirection() {
-            let mut cursor = std::io::Cursor::new(kv.value);
+            let mut cursor = crate::io::Cursor::new(kv.value);
             Ok(BlobIndirection::decode_from(&mut cursor)?.size)
         } else {
             #[expect(clippy::cast_possible_truncation, reason = "values are u32 max length")]
@@ -105,7 +110,7 @@ fn resolve_value_handle(
     #[cfg(zstd_any)] zstd_dictionary: Option<&crate::compression::ZstdDictionary>,
 ) -> RangeItem {
     if item.key.value_type.is_indirection() {
-        let mut cursor = std::io::Cursor::new(item.value);
+        let mut cursor = crate::io::Cursor::new(item.value);
         let vptr = BlobIndirection::decode_from(&mut cursor)?;
 
         // Resolve indirection using value log
@@ -267,9 +272,10 @@ impl BlobTree {
 impl crate::abstract_tree::sealed::Sealed for BlobTree {}
 
 impl AbstractTree for BlobTree {
+    #[cfg(feature = "std")]
     fn create_checkpoint(
         &self,
-        target_path: &std::path::Path,
+        target_path: &crate::path::Path,
     ) -> crate::Result<crate::CheckpointInfo> {
         crate::checkpoint::run_checkpoint(
             self,
@@ -295,9 +301,7 @@ impl AbstractTree for BlobTree {
         self.index.table_file_cache_size()
     }
 
-    fn get_version_history_lock(
-        &self,
-    ) -> std::sync::RwLockWriteGuard<'_, crate::version::SuperVersions> {
+    fn get_version_history_lock(&self) -> VersionsWriteGuard<'_> {
         self.index.get_version_history_lock()
     }
 
@@ -481,7 +485,7 @@ impl AbstractTree for BlobTree {
         };
 
         Ok(Some(if item.key.value_type.is_indirection() {
-            let mut cursor = std::io::Cursor::new(item.value);
+            let mut cursor = crate::io::Cursor::new(item.value);
             let vptr = BlobIndirection::decode_from(&mut cursor)?;
             vptr.size
         } else {
@@ -512,7 +516,7 @@ impl AbstractTree for BlobTree {
         self.index.sealed_memtable_count()
     }
 
-    fn get_flush_lock(&self) -> MutexGuard<'_, ()> {
+    fn get_flush_lock(&self) -> FlushGuard<'_> {
         self.index.get_flush_lock()
     }
 
@@ -524,7 +528,7 @@ impl AbstractTree for BlobTree {
     ) -> crate::Result<Option<(Vec<Table>, Option<Vec<BlobFile>>)>> {
         use crate::{coding::Encode, file::BLOBS_FOLDER, table::multi_writer::MultiWriter};
 
-        let start = std::time::Instant::now();
+        let start = crate::time::Instant::now();
 
         let (table_folder, level_fs) = self.index.config.tables_folder_for_level(0);
 

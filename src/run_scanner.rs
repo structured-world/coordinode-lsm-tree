@@ -2,8 +2,9 @@
 // Copyright (c) 2024-present, fjall-rs
 // Copyright (c) 2026-present, Structured World Foundation
 
+use alloc::sync::Arc;
+
 use crate::{InternalValue, Table, table::Scanner, version::Run};
-use std::sync::Arc;
 
 /// Scans through a disjoint run
 ///

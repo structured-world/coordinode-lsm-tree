@@ -82,6 +82,12 @@ impl ErrorKind {
     }
 }
 
+impl fmt::Display for ErrorKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// I/O error mirroring [`std::io::Error`].
 ///
 /// Carries an [`ErrorKind`] plus an optional message string for
@@ -154,6 +160,12 @@ impl Error {
     pub const fn kind(&self) -> ErrorKind {
         self.kind
     }
+
+    /// Construct an [`ErrorKind::Other`] error carrying `message`.
+    /// Mirrors [`std::io::Error::other`].
+    pub fn other<M: Into<String>>(message: M) -> Self {
+        Self::new(ErrorKind::Other, message)
+    }
 }
 
 impl From<ErrorKind> for Error {
@@ -182,8 +194,11 @@ impl fmt::Display for Error {
     }
 }
 
-#[cfg(feature = "std")]
-impl std::error::Error for Error {}
+// `core::error::Error` (stable since 1.81, MSRV here is 1.92) so this error
+// is usable as a trait-object source under both `std` and `no_std`. Under
+// `std`, `std::error::Error` re-exports `core::error::Error`, so this is the
+// same impl std callers have always seen.
+impl core::error::Error for Error {}
 
 /// Bridge from `std::io::Error`. Maps the std `ErrorKind` to
 /// this crate's [`ErrorKind`] when a variant exists for it, and
@@ -322,7 +337,7 @@ impl From<std::io::SeekFrom> for SeekFrom {
 // this module are supertrait aliases over `std::io::{Read,Write,
 // Seek}`. Any `T: std::io::Read` automatically implements
 // `crate::io::Read` via the blanket below — AND `T: crate::io::Read`
-// implies `T: std::io::Read` (because std::io::Read is a supertrait).
+// implies `T: std::io::Read` (because crate::io::Read is a supertrait).
 // This second direction is what lets `dyn FsFile` (bounded on
 // `crate::io::Read`) flow into `std::io::BufReader`, `byteorder`,
 // and the rest of the std ecosystem without any explicit adapter.
@@ -362,6 +377,14 @@ impl<W: std::io::Write + ?Sized> Write for W {}
 pub trait Seek: std::io::Seek {}
 #[cfg(feature = "std")]
 impl<S: std::io::Seek + ?Sized> Seek for S {}
+
+/// Buffered-read trait. Under `std` this is a supertrait alias of
+/// [`std::io::BufRead`] (blanket-implemented), so std readers satisfy it
+/// directly; under `no_std` it is the native trait defined below.
+#[cfg(feature = "std")]
+pub trait BufRead: std::io::BufRead {}
+#[cfg(feature = "std")]
+impl<B: std::io::BufRead + ?Sized> BufRead for B {}
 
 /// Read trait mirroring [`std::io::Read`]. Only the methods this
 /// crate depends on are surfaced; default implementations follow the
@@ -416,6 +439,59 @@ pub trait Read {
             ))
         }
     }
+
+    /// Adapter that reads at most `limit` bytes from this reader, mirroring
+    /// [`std::io::Read::take`]. Used to bound a parser against a forged length
+    /// prefix.
+    fn take(self, limit: u64) -> Take<Self>
+    where
+        Self: Sized,
+    {
+        Take { inner: self, limit }
+    }
+}
+
+/// Limit-bounded reader returned by [`Read::take`], mirroring
+/// [`std::io::Take`].
+#[cfg(not(feature = "std"))]
+pub struct Take<R> {
+    inner: R,
+    limit: u64,
+}
+
+#[cfg(not(feature = "std"))]
+impl<R: Read> Read for Take<R> {
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
+        if self.limit == 0 {
+            return Ok(0);
+        }
+        // Cap this read at the remaining limit; `min` keeps `max <= buf.len()`.
+        let max = (buf.len() as u64).min(self.limit) as usize;
+        // `split_at_mut` instead of `&mut buf[..max]` to satisfy the crate's
+        // `deny(clippy::indexing_slicing)` on the no_std build.
+        let (head, _) = buf.split_at_mut(max);
+        let n = self.inner.read(head)?;
+        self.limit -= n as u64;
+        Ok(n)
+    }
+}
+
+/// Buffered-read trait mirroring the [`std::io::BufRead`] subset the storage
+/// layer uses (`fill_buf` + `consume`). Lets a record reader peek at the next
+/// bytes — and detect a clean EOF via an empty fill — without consuming them.
+#[cfg(not(feature = "std"))]
+pub trait BufRead: Read {
+    /// Return the buffer's current contents, refilling from the underlying
+    /// reader when empty. An empty return means EOF.
+    ///
+    /// # Errors
+    ///
+    /// Returns any I/O error from the underlying reader.
+    fn fill_buf(&mut self) -> Result<&[u8]>;
+
+    /// Mark `amt` bytes from the start of the buffer as consumed so they are
+    /// not returned by the next [`fill_buf`](Self::fill_buf)/[`read`](Read::read).
+    fn consume(&mut self, amt: usize);
 }
 
 /// Write trait mirroring [`std::io::Write`].
@@ -482,6 +558,828 @@ pub trait Seek {
     ///
     /// Returns any I/O error from the underlying seeker.
     fn seek(&mut self, pos: SeekFrom) -> Result<u64>;
+
+    /// Current stream position (offset from the start). Mirrors
+    /// [`std::io::Seek::stream_position`].
+    ///
+    /// # Errors
+    ///
+    /// Returns any I/O error from the underlying seeker.
+    fn stream_position(&mut self) -> Result<u64> {
+        self.seek(SeekFrom::Current(0))
+    }
+
+    /// Seek relative to the current position. Mirrors
+    /// [`std::io::Seek::seek_relative`].
+    ///
+    /// # Errors
+    ///
+    /// Returns any I/O error from the underlying seeker.
+    fn seek_relative(&mut self, offset: i64) -> Result<()> {
+        self.seek(SeekFrom::Current(offset))?;
+        Ok(())
+    }
+}
+
+// Blanket forwarding impls so readers/writers behind a reference or a box
+// (e.g. `&mut R`, `Box<dyn FsFile>`) satisfy the io traits — std provides the
+// equivalent blankets for its own io traits, so this only fills the no_std gap.
+#[cfg(not(feature = "std"))]
+impl<R: Read + ?Sized> Read for &mut R {
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
+        (**self).read(buf)
+    }
+    fn read_exact(&mut self, buf: &mut [u8]) -> Result<()> {
+        (**self).read_exact(buf)
+    }
+}
+
+#[cfg(not(feature = "std"))]
+impl<R: Read + ?Sized> Read for alloc::boxed::Box<R> {
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
+        (**self).read(buf)
+    }
+    fn read_exact(&mut self, buf: &mut [u8]) -> Result<()> {
+        (**self).read_exact(buf)
+    }
+}
+
+#[cfg(not(feature = "std"))]
+impl<W: Write + ?Sized> Write for &mut W {
+    fn write(&mut self, buf: &[u8]) -> Result<usize> {
+        (**self).write(buf)
+    }
+    fn flush(&mut self) -> Result<()> {
+        (**self).flush()
+    }
+    fn write_all(&mut self, buf: &[u8]) -> Result<()> {
+        (**self).write_all(buf)
+    }
+}
+
+#[cfg(not(feature = "std"))]
+impl<W: Write + ?Sized> Write for alloc::boxed::Box<W> {
+    fn write(&mut self, buf: &[u8]) -> Result<usize> {
+        (**self).write(buf)
+    }
+    fn flush(&mut self) -> Result<()> {
+        (**self).flush()
+    }
+    fn write_all(&mut self, buf: &[u8]) -> Result<()> {
+        (**self).write_all(buf)
+    }
+}
+
+#[cfg(not(feature = "std"))]
+impl<S: Seek + ?Sized> Seek for &mut S {
+    fn seek(&mut self, pos: SeekFrom) -> Result<u64> {
+        (**self).seek(pos)
+    }
+    fn stream_position(&mut self) -> Result<u64> {
+        (**self).stream_position()
+    }
+    fn seek_relative(&mut self, offset: i64) -> Result<()> {
+        (**self).seek_relative(offset)
+    }
+}
+
+#[cfg(not(feature = "std"))]
+impl<S: Seek + ?Sized> Seek for alloc::boxed::Box<S> {
+    fn seek(&mut self, pos: SeekFrom) -> Result<u64> {
+        (**self).seek(pos)
+    }
+    fn stream_position(&mut self) -> Result<u64> {
+        (**self).stream_position()
+    }
+    fn seek_relative(&mut self, offset: i64) -> Result<()> {
+        (**self).seek_relative(offset)
+    }
+}
+
+#[cfg(not(feature = "std"))]
+impl<B: BufRead + ?Sized> BufRead for &mut B {
+    fn fill_buf(&mut self) -> Result<&[u8]> {
+        (**self).fill_buf()
+    }
+    fn consume(&mut self, amt: usize) {
+        (**self).consume(amt);
+    }
+}
+
+#[cfg(not(feature = "std"))]
+impl<B: BufRead + ?Sized> BufRead for alloc::boxed::Box<B> {
+    fn fill_buf(&mut self) -> Result<&[u8]> {
+        (**self).fill_buf()
+    }
+    fn consume(&mut self, amt: usize) {
+        (**self).consume(amt);
+    }
+}
+
+// `varint-rs` only blankets its traits over `std::io` (under its `std`
+// feature), and a foreign trait cannot be blanket-impl'd here (orphan rule).
+// So `no_std` builds get crate-local varint extension traits with the same
+// method surface, blanketed over this module's `Read`/`Write`. The encoding is
+// canonical unsigned LEB128 — byte-identical to `varint-rs` — so frames written
+// under `std` and `no_std` interoperate. Call sites swap only the import path.
+/// Writes unsigned integers as canonical LEB128 varints over a [`Write`].
+///
+/// The `no_std` counterpart of `varint-rs`'s `VarintWriter`; the encoding is
+/// identical so frames interoperate across `std` / `no_std` builds.
+#[cfg(not(feature = "std"))]
+pub trait VarintWriter: Write {
+    /// Writes `value` as canonical unsigned LEB128.
+    ///
+    /// # Errors
+    /// Propagates the underlying writer's error.
+    fn write_u64_varint(&mut self, mut value: u64) -> Result<()> {
+        loop {
+            let mut byte = (value & 0x7f) as u8;
+            value >>= 7;
+            if value != 0 {
+                byte |= 0x80;
+            }
+            self.write_all(&[byte])?;
+            if value == 0 {
+                return Ok(());
+            }
+        }
+    }
+
+    /// Writes `value` as canonical unsigned LEB128.
+    ///
+    /// # Errors
+    /// Propagates the underlying writer's error.
+    fn write_u32_varint(&mut self, value: u32) -> Result<()> {
+        self.write_u64_varint(u64::from(value))
+    }
+
+    /// Writes `value` as canonical unsigned LEB128.
+    ///
+    /// # Errors
+    /// Propagates the underlying writer's error.
+    fn write_u16_varint(&mut self, value: u16) -> Result<()> {
+        self.write_u64_varint(u64::from(value))
+    }
+}
+
+#[cfg(not(feature = "std"))]
+impl<W: Write + ?Sized> VarintWriter for W {}
+
+/// Reads canonical LEB128 varints over a [`Read`].
+///
+/// The `no_std` counterpart of `varint-rs`'s `VarintReader`; the encoding is
+/// identical so frames interoperate across `std` / `no_std` builds.
+#[cfg(not(feature = "std"))]
+pub trait VarintReader: Read {
+    /// Reads a canonical unsigned LEB128 value.
+    ///
+    /// # Errors
+    /// [`ErrorKind::UnexpectedEof`] on a truncated value, or
+    /// [`ErrorKind::InvalidData`] on an overlong encoding; plus any underlying
+    /// reader error.
+    fn read_u64_varint(&mut self) -> Result<u64> {
+        let mut result: u64 = 0;
+        let mut shift: u32 = 0;
+        loop {
+            let mut byte = [0u8; 1];
+            self.read_exact(&mut byte)?;
+            // 10 groups of 7 bits cover a full u64; reject overlong encodings.
+            if shift >= 64 {
+                return Err(Error::new(ErrorKind::InvalidData, "varint overflows u64"));
+            }
+            result |= (u64::from(byte[0] & 0x7f)) << shift;
+            if byte[0] & 0x80 == 0 {
+                return Ok(result);
+            }
+            shift += 7;
+        }
+    }
+
+    /// Reads a canonical unsigned LEB128 value, narrowed to `u32`.
+    ///
+    /// # Errors
+    /// As [`Self::read_u64_varint`], plus [`ErrorKind::InvalidData`] if the
+    /// value does not fit `u32`.
+    fn read_u32_varint(&mut self) -> Result<u32> {
+        let v = self.read_u64_varint()?;
+        u32::try_from(v).map_err(|_| Error::new(ErrorKind::InvalidData, "varint exceeds u32"))
+    }
+
+    /// Reads a canonical unsigned LEB128 value, narrowed to `u16`.
+    ///
+    /// # Errors
+    /// As [`Self::read_u64_varint`], plus [`ErrorKind::InvalidData`] if the
+    /// value does not fit `u16`.
+    fn read_u16_varint(&mut self) -> Result<u16> {
+        let v = self.read_u64_varint()?;
+        u16::try_from(v).map_err(|_| Error::new(ErrorKind::InvalidData, "varint exceeds u16"))
+    }
+}
+
+#[cfg(not(feature = "std"))]
+impl<R: Read + ?Sized> VarintReader for R {}
+
+// ---------------------------------------------------------------------------
+// Fixed-width integer I/O — a `no_std`-capable, drop-in replacement for
+// `byteorder`'s `WriteBytesExt` / `ReadBytesExt` / `ByteOrder` over this
+// module's `Read` / `Write` (which is `std::io` under `std` and the native
+// traits under `no_std`). The API mirrors `byteorder` exactly — same
+// `w.write_u32::<LittleEndian>(x)` / `r.read_u32::<LittleEndian>()` call
+// shape — so migrating a wire-format module off `byteorder` is just an
+// import swap, and the encoding is byte-identical (`to_le_bytes` /
+// `to_be_bytes`). High-level round-trip tests cover correctness; no
+// low-level duplication here.
+// ---------------------------------------------------------------------------
+
+/// Byte-order marker for fixed-width integer encoding.
+///
+/// Mirrors `byteorder::ByteOrder`. Implemented by [`LittleEndian`] /
+/// [`BigEndian`]; methods convert between fixed-size byte arrays and integers
+/// so call sites stay free of slice indexing.
+pub trait ByteOrder {
+    /// Decode a `u16` from its 2-byte representation.
+    fn u16_from(b: [u8; 2]) -> u16;
+    /// Decode a `u32` from its 4-byte representation.
+    fn u32_from(b: [u8; 4]) -> u32;
+    /// Decode a `u64` from its 8-byte representation.
+    fn u64_from(b: [u8; 8]) -> u64;
+    /// Decode a `u128` from its 16-byte representation.
+    fn u128_from(b: [u8; 16]) -> u128;
+    /// Encode a `u16` to its 2-byte representation.
+    fn u16_to(n: u16) -> [u8; 2];
+    /// Encode a `u32` to its 4-byte representation.
+    fn u32_to(n: u32) -> [u8; 4];
+    /// Encode a `u64` to its 8-byte representation.
+    fn u64_to(n: u64) -> [u8; 8];
+    /// Encode a `u128` to its 16-byte representation.
+    fn u128_to(n: u128) -> [u8; 16];
+
+    // Static slice helpers matching `byteorder::ByteOrder`'s API, so call
+    // sites of the form `LittleEndian::write_u32(buf, n)` / `read_u32(buf)`
+    // migrate unchanged. `split_at[_mut]` (not indexing) keeps the crate-level
+    // `deny(indexing_slicing)` happy; like byteorder, they panic if `buf` is
+    // shorter than the integer width (a caller bug, not a data condition).
+    /// Read a `u16` from the first 2 bytes of `buf`.
+    #[must_use]
+    fn read_u16(buf: &[u8]) -> u16 {
+        let (head, _) = buf.split_at(2);
+        let mut a = [0u8; 2];
+        a.copy_from_slice(head);
+        Self::u16_from(a)
+    }
+    /// Read a `u32` from the first 4 bytes of `buf`.
+    #[must_use]
+    fn read_u32(buf: &[u8]) -> u32 {
+        let (head, _) = buf.split_at(4);
+        let mut a = [0u8; 4];
+        a.copy_from_slice(head);
+        Self::u32_from(a)
+    }
+    /// Read a `u64` from the first 8 bytes of `buf`.
+    #[must_use]
+    fn read_u64(buf: &[u8]) -> u64 {
+        let (head, _) = buf.split_at(8);
+        let mut a = [0u8; 8];
+        a.copy_from_slice(head);
+        Self::u64_from(a)
+    }
+    /// Write `n` into the first 2 bytes of `buf`.
+    fn write_u16(buf: &mut [u8], n: u16) {
+        let (head, _) = buf.split_at_mut(2);
+        head.copy_from_slice(&Self::u16_to(n));
+    }
+    /// Write `n` into the first 4 bytes of `buf`.
+    fn write_u32(buf: &mut [u8], n: u32) {
+        let (head, _) = buf.split_at_mut(4);
+        head.copy_from_slice(&Self::u32_to(n));
+    }
+    /// Write `n` into the first 8 bytes of `buf`.
+    fn write_u64(buf: &mut [u8], n: u64) {
+        let (head, _) = buf.split_at_mut(8);
+        head.copy_from_slice(&Self::u64_to(n));
+    }
+}
+
+/// Little-endian [`ByteOrder`] (matches `byteorder::LittleEndian`).
+#[derive(Clone, Copy, Debug)]
+pub enum LittleEndian {}
+/// Big-endian [`ByteOrder`] (matches `byteorder::BigEndian`).
+#[derive(Clone, Copy, Debug)]
+pub enum BigEndian {}
+
+/// Short alias for [`LittleEndian`] (matches `byteorder::LE`).
+pub type LE = LittleEndian;
+/// Short alias for [`BigEndian`] (matches `byteorder::BE`).
+pub type BE = BigEndian;
+
+impl ByteOrder for LittleEndian {
+    fn u16_from(b: [u8; 2]) -> u16 {
+        u16::from_le_bytes(b)
+    }
+    fn u32_from(b: [u8; 4]) -> u32 {
+        u32::from_le_bytes(b)
+    }
+    fn u64_from(b: [u8; 8]) -> u64 {
+        u64::from_le_bytes(b)
+    }
+    fn u128_from(b: [u8; 16]) -> u128 {
+        u128::from_le_bytes(b)
+    }
+    fn u16_to(n: u16) -> [u8; 2] {
+        n.to_le_bytes()
+    }
+    fn u32_to(n: u32) -> [u8; 4] {
+        n.to_le_bytes()
+    }
+    fn u64_to(n: u64) -> [u8; 8] {
+        n.to_le_bytes()
+    }
+    fn u128_to(n: u128) -> [u8; 16] {
+        n.to_le_bytes()
+    }
+}
+
+impl ByteOrder for BigEndian {
+    fn u16_from(b: [u8; 2]) -> u16 {
+        u16::from_be_bytes(b)
+    }
+    fn u32_from(b: [u8; 4]) -> u32 {
+        u32::from_be_bytes(b)
+    }
+    fn u64_from(b: [u8; 8]) -> u64 {
+        u64::from_be_bytes(b)
+    }
+    fn u128_from(b: [u8; 16]) -> u128 {
+        u128::from_be_bytes(b)
+    }
+    fn u16_to(n: u16) -> [u8; 2] {
+        n.to_be_bytes()
+    }
+    fn u32_to(n: u32) -> [u8; 4] {
+        n.to_be_bytes()
+    }
+    fn u64_to(n: u64) -> [u8; 8] {
+        n.to_be_bytes()
+    }
+    fn u128_to(n: u128) -> [u8; 16] {
+        n.to_be_bytes()
+    }
+}
+
+/// Fixed-width integer writes over [`Write`], mirroring
+/// `byteorder::WriteBytesExt`. Blanket-implemented for every [`Write`].
+pub trait WriteBytesExt: Write {
+    /// Write a single byte.
+    ///
+    /// # Errors
+    /// Propagates the underlying writer's error.
+    fn write_u8(&mut self, n: u8) -> Result<()> {
+        self.write_all(&[n])?;
+        Ok(())
+    }
+    /// Write a signed byte.
+    ///
+    /// # Errors
+    /// Propagates the underlying writer's error.
+    fn write_i8(&mut self, n: i8) -> Result<()> {
+        self.write_all(&n.to_le_bytes())?;
+        Ok(())
+    }
+    /// Write a `u16` in the byte order `T`.
+    ///
+    /// # Errors
+    /// Propagates the underlying writer's error.
+    fn write_u16<T: ByteOrder>(&mut self, n: u16) -> Result<()> {
+        self.write_all(&T::u16_to(n))?;
+        Ok(())
+    }
+    /// Write a `u32` in the byte order `T`.
+    ///
+    /// # Errors
+    /// Propagates the underlying writer's error.
+    fn write_u32<T: ByteOrder>(&mut self, n: u32) -> Result<()> {
+        self.write_all(&T::u32_to(n))?;
+        Ok(())
+    }
+    /// Write a `u64` in the byte order `T`.
+    ///
+    /// # Errors
+    /// Propagates the underlying writer's error.
+    fn write_u64<T: ByteOrder>(&mut self, n: u64) -> Result<()> {
+        self.write_all(&T::u64_to(n))?;
+        Ok(())
+    }
+    /// Write a `u128` in the byte order `T`.
+    ///
+    /// # Errors
+    /// Propagates the underlying writer's error.
+    fn write_u128<T: ByteOrder>(&mut self, n: u128) -> Result<()> {
+        self.write_all(&T::u128_to(n))?;
+        Ok(())
+    }
+    /// Write an `f32` (IEEE-754 bit pattern) in the byte order `T`.
+    ///
+    /// # Errors
+    /// Propagates the underlying writer's error.
+    fn write_f32<T: ByteOrder>(&mut self, n: f32) -> Result<()> {
+        self.write_u32::<T>(n.to_bits())
+    }
+    /// Write an `f64` (IEEE-754 bit pattern) in the byte order `T`.
+    ///
+    /// # Errors
+    /// Propagates the underlying writer's error.
+    fn write_f64<T: ByteOrder>(&mut self, n: f64) -> Result<()> {
+        self.write_u64::<T>(n.to_bits())
+    }
+}
+impl<W: Write + ?Sized> WriteBytesExt for W {}
+
+/// Fixed-width integer reads over [`Read`], mirroring
+/// `byteorder::ReadBytesExt`. Blanket-implemented for every [`Read`].
+pub trait ReadBytesExt: Read {
+    /// Read a single byte.
+    ///
+    /// # Errors
+    /// [`ErrorKind::UnexpectedEof`] on short read, or the reader's error.
+    fn read_u8(&mut self) -> Result<u8> {
+        let mut b = [0u8; 1];
+        self.read_exact(&mut b)?;
+        Ok(u8::from_le_bytes(b))
+    }
+    /// Read a signed byte.
+    ///
+    /// # Errors
+    /// [`ErrorKind::UnexpectedEof`] on short read, or the reader's error.
+    fn read_i8(&mut self) -> Result<i8> {
+        let mut b = [0u8; 1];
+        self.read_exact(&mut b)?;
+        Ok(i8::from_le_bytes(b))
+    }
+    /// Read a `u16` in the byte order `T`.
+    ///
+    /// # Errors
+    /// [`ErrorKind::UnexpectedEof`] on short read, or the reader's error.
+    fn read_u16<T: ByteOrder>(&mut self) -> Result<u16> {
+        let mut b = [0u8; 2];
+        self.read_exact(&mut b)?;
+        Ok(T::u16_from(b))
+    }
+    /// Read a `u32` in the byte order `T`.
+    ///
+    /// # Errors
+    /// [`ErrorKind::UnexpectedEof`] on short read, or the reader's error.
+    fn read_u32<T: ByteOrder>(&mut self) -> Result<u32> {
+        let mut b = [0u8; 4];
+        self.read_exact(&mut b)?;
+        Ok(T::u32_from(b))
+    }
+    /// Read a `u64` in the byte order `T`.
+    ///
+    /// # Errors
+    /// [`ErrorKind::UnexpectedEof`] on short read, or the reader's error.
+    fn read_u64<T: ByteOrder>(&mut self) -> Result<u64> {
+        let mut b = [0u8; 8];
+        self.read_exact(&mut b)?;
+        Ok(T::u64_from(b))
+    }
+    /// Read a `u128` in the byte order `T`.
+    ///
+    /// # Errors
+    /// [`ErrorKind::UnexpectedEof`] on short read, or the reader's error.
+    fn read_u128<T: ByteOrder>(&mut self) -> Result<u128> {
+        let mut b = [0u8; 16];
+        self.read_exact(&mut b)?;
+        Ok(T::u128_from(b))
+    }
+    /// Read an `f32` (IEEE-754 bit pattern) in the byte order `T`.
+    ///
+    /// # Errors
+    /// [`ErrorKind::UnexpectedEof`] on short read, or the reader's error.
+    fn read_f32<T: ByteOrder>(&mut self) -> Result<f32> {
+        Ok(f32::from_bits(self.read_u32::<T>()?))
+    }
+    /// Read an `f64` (IEEE-754 bit pattern) in the byte order `T`.
+    ///
+    /// # Errors
+    /// [`ErrorKind::UnexpectedEof`] on short read, or the reader's error.
+    fn read_f64<T: ByteOrder>(&mut self) -> Result<f64> {
+        Ok(f64::from_bits(self.read_u64::<T>()?))
+    }
+}
+impl<R: Read + ?Sized> ReadBytesExt for R {}
+
+// `no_std` concrete impls so wire-format code that writes into a `Vec<u8>` or
+// reads from a `&[u8]` keeps compiling once it moves off `byteorder` (under
+// `std` these come from `std::io`'s own impls via the supertrait aliases).
+#[cfg(not(feature = "std"))]
+impl Write for alloc::vec::Vec<u8> {
+    fn write(&mut self, buf: &[u8]) -> Result<usize> {
+        self.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> Result<()> {
+        Ok(())
+    }
+    fn write_all(&mut self, buf: &[u8]) -> Result<()> {
+        self.extend_from_slice(buf);
+        Ok(())
+    }
+}
+
+#[cfg(not(feature = "std"))]
+impl Read for &[u8] {
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
+        let n = buf.len().min(self.len());
+        let (head, rest) = self.split_at(n);
+        let (dst, _) = buf.split_at_mut(n);
+        dst.copy_from_slice(head);
+        *self = rest;
+        Ok(n)
+    }
+}
+
+// In-memory cursor, mirroring `crate::io::Cursor`. Under `std` it IS
+// `crate::io::Cursor` (re-export); under `no_std` it's a local equivalent so
+// wire-format code reading/seeking over a `&[u8]` or writing into a `Vec<u8>`
+// keeps compiling. Same API surface (`new` / `position` / `set_position` /
+// `into_inner` / `get_ref`) so call sites are identical across both builds.
+#[cfg(feature = "std")]
+pub use std::io::Cursor;
+
+/// In-memory `Read` + `Seek` (and `Write` for `Vec` inner) cursor over a
+/// byte buffer, mirroring [`crate::io::Cursor`] for `no_std` builds.
+#[cfg(not(feature = "std"))]
+pub struct Cursor<T> {
+    inner: T,
+    pos: u64,
+}
+
+#[cfg(not(feature = "std"))]
+impl<T> Cursor<T> {
+    /// Wraps `inner`, starting the cursor at position 0.
+    pub const fn new(inner: T) -> Self {
+        Self { inner, pos: 0 }
+    }
+    /// Current byte position.
+    #[must_use]
+    pub const fn position(&self) -> u64 {
+        self.pos
+    }
+    /// Sets the byte position.
+    pub const fn set_position(&mut self, pos: u64) {
+        self.pos = pos;
+    }
+    /// Consumes the cursor, returning the wrapped buffer.
+    pub fn into_inner(self) -> T {
+        self.inner
+    }
+    /// Borrows the wrapped buffer.
+    pub const fn get_ref(&self) -> &T {
+        &self.inner
+    }
+    /// Mutably borrows the wrapped buffer.
+    pub const fn get_mut(&mut self) -> &mut T {
+        &mut self.inner
+    }
+}
+
+#[cfg(not(feature = "std"))]
+impl<T: AsRef<[u8]>> Read for Cursor<T> {
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
+        let inner = self.inner.as_ref();
+        // Position past end → 0 bytes (matches std).
+        let start = (self.pos as usize).min(inner.len());
+        let (_, remaining) = inner.split_at(start);
+        let n = buf.len().min(remaining.len());
+        let (src, _) = remaining.split_at(n);
+        let (dst, _) = buf.split_at_mut(n);
+        dst.copy_from_slice(src);
+        self.pos += n as u64;
+        Ok(n)
+    }
+}
+
+#[cfg(not(feature = "std"))]
+impl<T: AsRef<[u8]>> Seek for Cursor<T> {
+    fn seek(&mut self, pos: SeekFrom) -> Result<u64> {
+        let len = self.inner.as_ref().len() as u64;
+        let new = match pos {
+            SeekFrom::Start(n) => n,
+            SeekFrom::End(off) => len.saturating_add_signed(off),
+            SeekFrom::Current(off) => self.pos.saturating_add_signed(off),
+        };
+        self.pos = new;
+        Ok(new)
+    }
+}
+
+#[cfg(not(feature = "std"))]
+impl Write for Cursor<alloc::vec::Vec<u8>> {
+    fn write(&mut self, buf: &[u8]) -> Result<usize> {
+        // Like std: writing at `pos` overwrites in place and extends the Vec
+        // when the write runs past the current end.
+        let pos = self.pos as usize;
+        if pos > self.inner.len() {
+            self.inner.resize(pos, 0);
+        }
+        let end = pos + buf.len();
+        if end > self.inner.len() {
+            self.inner.resize(end, 0);
+        }
+        let (_, tail) = self.inner.split_at_mut(pos);
+        let (dst, _) = tail.split_at_mut(buf.len());
+        dst.copy_from_slice(buf);
+        self.pos = end as u64;
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> Result<()> {
+        Ok(())
+    }
+}
+
+#[cfg(feature = "std")]
+pub use std::io::BufReader;
+
+/// Buffering reader, mirroring the subset of [`std::io::BufReader`] the storage
+/// layer uses (record framing reads), for `no_std` builds. Coalesces small
+/// reads and exposes [`BufRead`] so a record parser can peek for a clean EOF.
+#[cfg(not(feature = "std"))]
+pub struct BufReader<R: Read> {
+    inner: R,
+    // `capacity`-sized; the valid (filled, not-yet-consumed) window is
+    // `buf[pos..cap]`.
+    buf: alloc::vec::Vec<u8>,
+    pos: usize,
+    cap: usize,
+}
+
+#[cfg(not(feature = "std"))]
+impl<R: Read> BufReader<R> {
+    /// Wraps `inner` with the default 8 KiB buffer.
+    pub fn new(inner: R) -> Self {
+        Self::with_capacity(8 * 1024, inner)
+    }
+
+    /// Wraps `inner` with a `capacity`-byte buffer.
+    pub fn with_capacity(capacity: usize, inner: R) -> Self {
+        Self {
+            inner,
+            buf: alloc::vec![0u8; capacity],
+            pos: 0,
+            cap: 0,
+        }
+    }
+
+    /// Mutable access to the inner reader. Bypasses the buffer — mixing direct
+    /// inner reads with buffered ones loses buffered bytes, like std.
+    pub fn get_mut(&mut self) -> &mut R {
+        &mut self.inner
+    }
+
+    /// Shared access to the inner reader.
+    pub fn get_ref(&self) -> &R {
+        &self.inner
+    }
+}
+
+#[cfg(not(feature = "std"))]
+impl<R: Read> Read for BufReader<R> {
+    fn read(&mut self, dest: &mut [u8]) -> Result<usize> {
+        // A read at least as large as the buffer, with nothing buffered, goes
+        // straight to the inner reader (buffering would just add a copy).
+        if self.pos >= self.cap && dest.len() >= self.buf.len() {
+            return self.inner.read(dest);
+        }
+        let n = {
+            let available = self.fill_buf()?;
+            let n = available.len().min(dest.len());
+            let (src, _) = available.split_at(n);
+            let (dst, _) = dest.split_at_mut(n);
+            dst.copy_from_slice(src);
+            n
+        };
+        self.consume(n);
+        Ok(n)
+    }
+}
+
+#[cfg(not(feature = "std"))]
+impl<R: Read> BufRead for BufReader<R> {
+    fn fill_buf(&mut self) -> Result<&[u8]> {
+        if self.pos >= self.cap {
+            self.cap = self.inner.read(&mut self.buf)?;
+            self.pos = 0;
+        }
+        // Return `buf[pos..cap]` via split_at to keep `deny(indexing_slicing)`.
+        let (_, rest) = self.buf.split_at(self.pos);
+        let (out, _) = rest.split_at(self.cap - self.pos);
+        Ok(out)
+    }
+
+    fn consume(&mut self, amt: usize) {
+        self.pos = (self.pos + amt).min(self.cap);
+    }
+}
+
+#[cfg(not(feature = "std"))]
+impl<R: Read + Seek> Seek for BufReader<R> {
+    fn seek(&mut self, pos: SeekFrom) -> Result<u64> {
+        // The buffered bytes belong to the old position; drop them.
+        self.pos = 0;
+        self.cap = 0;
+        self.inner.seek(pos)
+    }
+}
+
+#[cfg(feature = "std")]
+pub use std::io::BufWriter;
+
+/// Buffering writer, mirroring the subset of [`std::io::BufWriter`] the
+/// storage layer uses, for `no_std` builds. Coalesces small writes into one
+/// `capacity`-sized buffer and flushes it to the inner writer on overflow,
+/// explicit [`flush`](Write::flush), [`seek`](Seek::seek), or drop.
+#[cfg(not(feature = "std"))]
+pub struct BufWriter<W: Write> {
+    inner: W,
+    buf: alloc::vec::Vec<u8>,
+}
+
+#[cfg(not(feature = "std"))]
+impl<W: Write> BufWriter<W> {
+    /// Wraps `inner` with the default 8 KiB buffer.
+    pub fn new(inner: W) -> Self {
+        Self::with_capacity(8 * 1024, inner)
+    }
+
+    /// Wraps `inner` with a `capacity`-byte buffer.
+    pub fn with_capacity(capacity: usize, inner: W) -> Self {
+        Self {
+            inner,
+            buf: alloc::vec::Vec::with_capacity(capacity),
+        }
+    }
+
+    /// Mutable access to the inner writer. Does NOT flush the buffer first —
+    /// matches [`std::io::BufWriter::get_mut`].
+    pub fn get_mut(&mut self) -> &mut W {
+        &mut self.inner
+    }
+
+    /// Shared access to the inner writer.
+    pub fn get_ref(&self) -> &W {
+        &self.inner
+    }
+
+    fn flush_buf(&mut self) -> Result<()> {
+        if !self.buf.is_empty() {
+            self.inner.write_all(&self.buf)?;
+            self.buf.clear();
+        }
+        Ok(())
+    }
+}
+
+#[cfg(not(feature = "std"))]
+impl<W: Write> Write for BufWriter<W> {
+    fn write(&mut self, data: &[u8]) -> Result<usize> {
+        // Flush first if this write wouldn't fit alongside what's buffered.
+        if self.buf.len() + data.len() > self.buf.capacity() {
+            self.flush_buf()?;
+        }
+        // A write at least as large as the whole buffer bypasses it entirely
+        // (buffering it would just add a copy), matching std::io::BufWriter.
+        if data.len() >= self.buf.capacity() {
+            self.inner.write(data)
+        } else {
+            self.buf.extend_from_slice(data);
+            Ok(data.len())
+        }
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        self.flush_buf()?;
+        self.inner.flush()
+    }
+}
+
+#[cfg(not(feature = "std"))]
+impl<W: Write + Seek> Seek for BufWriter<W> {
+    fn seek(&mut self, pos: SeekFrom) -> Result<u64> {
+        // Buffered bytes belong before the seek target, so flush them out
+        // before moving the inner cursor (matches std::io::BufWriter).
+        self.flush_buf()?;
+        self.inner.seek(pos)
+    }
+}
+
+#[cfg(not(feature = "std"))]
+impl<W: Write> Drop for BufWriter<W> {
+    fn drop(&mut self) {
+        // Best-effort flush, like std: a drop can't surface an error, and the
+        // storage writer always flushes explicitly before teardown anyway.
+        let _ = self.flush_buf();
+    }
 }
 
 #[cfg(test)]

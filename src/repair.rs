@@ -354,7 +354,7 @@ fn repair_tree(config: &Config) -> crate::Result<RepairReport> {
         }
         match config.fs.remove_file(&dirent.path) {
             Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) if e.kind() == crate::io::ErrorKind::NotFound => {}
             Err(e) => return Err(e.into()),
         }
     }

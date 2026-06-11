@@ -58,8 +58,13 @@
 //!   a MAC. AEAD (`Config::with_encryption(...)`) provides the
 //!   per-Block authenticated-encryption layer for that threat.
 
+#[cfg(not(feature = "std"))]
+use crate::io::Write;
+use crate::io::{LittleEndian, WriteBytesExt};
 use crate::manifest_blocks::footer::{FooterPayload, TocEntry};
-use byteorder::{LittleEndian, WriteBytesExt};
+#[cfg(not(feature = "std"))]
+use alloc::{boxed::Box, string::String, vec::Vec};
+#[cfg(feature = "std")]
 use std::io::Write;
 
 /// Compute the canonical XXH3-128 digest a CURRENT pointer carries

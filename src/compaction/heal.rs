@@ -169,8 +169,7 @@ mod tests {
             }
             tree.flush_active_memtable(2_000)?;
 
-            #[expect(clippy::expect_used, reason = "test asserts the tree shape")]
-            let versions = tree.version_history.read().expect("lock not poisoned");
+            let versions = tree.version_history.read();
             let binding = versions.latest_version();
             #[expect(clippy::expect_used, reason = "flush produced exactly one table")]
             let table = binding.version.iter_tables().next().expect("one table");
@@ -301,8 +300,7 @@ mod tests {
             }
             tree.flush_active_memtable(0)?;
 
-            #[expect(clippy::expect_used, reason = "test asserts the tree shape")]
-            let versions = tree.version_history.read().expect("lock not poisoned");
+            let versions = tree.version_history.read();
             let binding = versions.latest_version();
             #[expect(clippy::expect_used, reason = "flush produced exactly one table")]
             let table = binding.version.iter_tables().next().expect("one table");

@@ -21,6 +21,10 @@
 //! [`start`]: ManifestArchiveWriter::start
 //! [`finish`]: ManifestArchiveWriter::finish
 
+#[cfg(not(feature = "std"))]
+use crate::io::{self, Seek, SeekFrom, Write};
+use crate::io::{LittleEndian, WriteBytesExt};
+use crate::path::Path;
 use crate::{
     encryption::EncryptionProvider,
     fs::{Fs, FsFile, FsOpenOptions, SyncMode},
@@ -32,13 +36,16 @@ use crate::{
     runtime_config::RuntimeConfig,
     table::block::{Block, BlockIdentity, BlockTransform, BlockType},
 };
-use byteorder::{LittleEndian, WriteBytesExt};
-use std::{
-    collections::BTreeSet,
-    io::{self, Seek, SeekFrom, Write},
-    path::Path,
-    sync::Arc,
+use alloc::collections::BTreeSet;
+use alloc::sync::Arc;
+#[cfg(not(feature = "std"))]
+use alloc::{
+    boxed::Box,
+    string::{String, ToString},
+    vec::Vec,
 };
+#[cfg(feature = "std")]
+use std::io::{self, Seek, SeekFrom, Write};
 
 /// Streaming writer for V5-2 manifest files. See module docs.
 pub struct ManifestArchiveWriter {
@@ -256,7 +263,7 @@ impl ManifestArchiveWriter {
         } else {
             0
         };
-        let payload = FooterPayload::new(flags, std::mem::take(&mut self.toc));
+        let payload = FooterPayload::new(flags, core::mem::take(&mut self.toc));
         let mut payload_bytes = Vec::new();
         payload.encode(&mut payload_bytes)?;
 
@@ -433,7 +440,7 @@ impl ManifestArchiveWriter {
         let section_checksum = {
             use crate::coding::Decode;
             use crate::table::block::Header;
-            let mut cursor = std::io::Cursor::new(block_bytes.as_slice());
+            let mut cursor = crate::io::Cursor::new(block_bytes.as_slice());
             Header::decode_from(&mut cursor)?.checksum.into_u128()
         };
 

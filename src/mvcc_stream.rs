@@ -6,7 +6,9 @@ use crate::double_ended_peekable::{DoubleEndedPeekable, DoubleEndedPeekableExt};
 use crate::merge_operator::MergeOperator;
 use crate::range_tombstone::RangeTombstone;
 use crate::{InternalValue, SeqNo, UserKey, UserValue, ValueType, comparator::SharedComparator};
-use std::sync::Arc;
+use alloc::sync::Arc;
+#[cfg(not(feature = "std"))]
+use alloc::{boxed::Box, string::String, vec::Vec};
 
 /// Consumes a stream of KVs and emits a new stream according to MVCC and tombstone rules
 ///
@@ -326,7 +328,7 @@ impl<I: DoubleEndedIterator<Item = crate::Result<InternalValue>>> DoubleEndedIte
                     && !self.is_rt_suppressed(&tail)
                 {
                     self.key_entries_buf.push(tail);
-                    let entries = std::mem::take(&mut self.key_entries_buf);
+                    let entries = core::mem::take(&mut self.key_entries_buf);
                     return Some(self.resolve_merge_buffered(entries));
                 }
                 return Some(Ok(tail));
@@ -416,7 +418,7 @@ mod tests {
                     999,
                     ValueType::Value,
                 )),
-                Err(crate::Error::Io(std::io::Error::other("test error"))),
+                Err(crate::Error::Io(crate::io::Error::other("test error"))),
             ];
 
             let iter = Box::new(vec.into_iter());
@@ -436,7 +438,7 @@ mod tests {
                     999,
                     ValueType::Value,
                 )),
-                Err(crate::Error::Io(std::io::Error::other("test error"))),
+                Err(crate::Error::Io(crate::io::Error::other("test error"))),
             ];
 
             let iter = Box::new(vec.into_iter());

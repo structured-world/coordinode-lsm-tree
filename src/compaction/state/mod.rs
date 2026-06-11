@@ -98,13 +98,7 @@ mod tests {
 
         assert!(tree.major_compact(u64::MAX, 4).is_err());
 
-        assert!(
-            tree.compaction_state
-                .lock()
-                .expect("lock is poisoned")
-                .hidden_set()
-                .is_empty()
-        );
+        assert!(tree.compaction_state.lock().hidden_set().is_empty());
 
         assert_eq!(table_count_before_major_compact, tree.table_count());
 

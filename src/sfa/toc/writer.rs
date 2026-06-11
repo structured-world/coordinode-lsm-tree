@@ -2,8 +2,13 @@
 // This source code is licensed under both the Apache 2.0 and MIT License
 // (found in the LICENSE-* files in the repository)
 
+use crate::io::WriteBytesExt;
 use crate::sfa::{checksum::Checksum, checksum_writer::ChecksummedWriter, toc::entry::TocEntry};
-use byteorder::WriteBytesExt;
+// `Write` is the std trait under `std` (so the concrete `ChecksummedWriter`'s
+// `write_all` resolves from `std::io`) and the native trait under `no_std`.
+#[cfg(not(feature = "std"))]
+use crate::io::Write;
+#[cfg(feature = "std")]
 use std::io::Write;
 
 pub const TOC_MAGIC: &[u8] = b"TOC!";
@@ -15,7 +20,7 @@ impl TocWriter {
         mut writer: impl Write,
         entries: &[TocEntry],
     ) -> crate::sfa::Result<Checksum> {
-        use byteorder::LE;
+        use crate::io::LE;
 
         log::trace!("Writing ToC");
         log::trace!("ToC: {entries:#?}");

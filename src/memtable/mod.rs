@@ -14,9 +14,18 @@ use crate::{
     UserKey, ValueType,
     value::{InternalValue, SeqNo},
 };
-use std::ops::RangeBounds;
-use std::sync::RwLock;
-use std::sync::atomic::{AtomicBool, AtomicU64};
+#[cfg(not(feature = "std"))]
+use alloc::{boxed::Box, string::String, vec::Vec};
+use core::ops::RangeBounds;
+use core::sync::atomic::AtomicBool;
+use portable_atomic::AtomicU64;
+// `parking_lot::RwLock` (std: small, userspace fast-path, no poisoning) /
+// `spin::RwLock` (no_std). Neither poisons on a panicked holder, so the read/
+// write guards are taken without a `LockResult` unwrap.
+#[cfg(feature = "std")]
+use parking_lot::RwLock;
+#[cfg(not(feature = "std"))]
+use spin::RwLock;
 
 pub use crate::tree::inner::MemtableId;
 
@@ -74,13 +83,13 @@ impl Memtable {
     /// Returns `true` if the memtable was already flagged for rotation.
     pub fn is_flagged_for_rotation(&self) -> bool {
         self.requested_rotation
-            .load(std::sync::atomic::Ordering::Relaxed)
+            .load(core::sync::atomic::Ordering::Relaxed)
     }
 
     /// Flags the memtable as requested for rotation.
     pub fn flag_rotated(&self) {
         self.requested_rotation
-            .store(true, std::sync::atomic::Ordering::Relaxed);
+            .store(true, core::sync::atomic::Ordering::Relaxed);
     }
 
     // `pub` + `#[doc(hidden)]`: used by the host crate (fjall) to construct
@@ -159,7 +168,7 @@ impl Memtable {
         let cmp = self.comparator.as_ref();
 
         let mut iter = self.items.range(lower_bound..).take_while(|entry| {
-            cmp.compare(entry.user_key_bytes(), key) == std::cmp::Ordering::Equal
+            cmp.compare(entry.user_key_bytes(), key) == core::cmp::Ordering::Equal
         });
 
         iter.next().map(|entry| InternalValue {
@@ -171,7 +180,7 @@ impl Memtable {
     /// Gets approximate size of memtable in bytes.
     pub fn size(&self) -> u64 {
         self.approximate_size
-            .load(std::sync::atomic::Ordering::Acquire)
+            .load(core::sync::atomic::Ordering::Acquire)
     }
 
     /// Counts the number of items in the memtable.
@@ -197,7 +206,7 @@ impl Memtable {
         if items.is_empty() {
             let size = self
                 .approximate_size
-                .load(std::sync::atomic::Ordering::Acquire);
+                .load(core::sync::atomic::Ordering::Acquire);
             return (0, size);
         }
 
@@ -205,7 +214,7 @@ impl Memtable {
         let mut max_seqno: u64 = 0;
 
         let overhead =
-            std::mem::size_of::<InternalValue>() + std::mem::size_of::<SharedComparator>();
+            core::mem::size_of::<InternalValue>() + core::mem::size_of::<SharedComparator>();
 
         for item in &items {
             #[expect(
@@ -225,7 +234,7 @@ impl Memtable {
 
         let size_before = self
             .approximate_size
-            .fetch_add(total_size, std::sync::atomic::Ordering::AcqRel);
+            .fetch_add(total_size, core::sync::atomic::Ordering::AcqRel);
 
         for item in items {
             let key = InternalKey::new(item.key.user_key, item.key.seqno, item.key.value_type);
@@ -233,7 +242,7 @@ impl Memtable {
         }
 
         self.highest_seqno
-            .fetch_max(max_seqno, std::sync::atomic::Ordering::AcqRel);
+            .fetch_max(max_seqno, core::sync::atomic::Ordering::AcqRel);
 
         // fetch_add returns value BEFORE the add, so size_before + total_size
         // = value AFTER add = new memtable size. Same pattern as Memtable::insert().
@@ -250,20 +259,20 @@ impl Memtable {
         // Account for MemtableKey overhead (InternalKey + Arc<dyn UserComparator>)
         let item_size = (item.key.user_key.len()
             + item.value.len()
-            + std::mem::size_of::<InternalValue>()
-            + std::mem::size_of::<SharedComparator>())
+            + core::mem::size_of::<InternalValue>()
+            + core::mem::size_of::<SharedComparator>())
         .try_into()
         .expect("should fit into u64");
 
         let size_before = self
             .approximate_size
-            .fetch_add(item_size, std::sync::atomic::Ordering::AcqRel);
+            .fetch_add(item_size, core::sync::atomic::Ordering::AcqRel);
 
         let key = InternalKey::new(item.key.user_key, item.key.seqno, item.key.value_type);
         self.items.insert(&key, &item.value);
 
         self.highest_seqno
-            .fetch_max(item.key.seqno, std::sync::atomic::Ordering::AcqRel);
+            .fetch_max(item.key.seqno, core::sync::atomic::Ordering::AcqRel);
 
         (item_size, size_before + item_size)
     }
@@ -292,7 +301,7 @@ impl Memtable {
         );
 
         // Reject invalid intervals in release builds (debug_assert is not enough)
-        if self.comparator.compare(&start, &end) != std::cmp::Ordering::Less {
+        if self.comparator.compare(&start, &end) != core::cmp::Ordering::Less {
             return 0;
         }
 
@@ -309,71 +318,43 @@ impl Memtable {
             return 0;
         }
 
-        let size = (start.len() + end.len() + std::mem::size_of::<RangeTombstone>()) as u64;
+        let size = (start.len() + end.len() + core::mem::size_of::<RangeTombstone>()) as u64;
 
-        // Panic on poison is intentional — a poisoned lock indicates a prior panic
-        // during a write, leaving the tree in an unknown state. Recovery would
-        // require validating AVL invariants which is not worth the complexity.
-        // This pattern is consistent with the original Mutex implementation.
-        #[expect(clippy::expect_used, reason = "lock is expected to not be poisoned")]
         self.range_tombstones
             .write()
-            .expect("lock is poisoned")
             .insert(RangeTombstone::new(start, end, seqno));
 
         self.approximate_size
-            .fetch_add(size, std::sync::atomic::Ordering::AcqRel);
+            .fetch_add(size, core::sync::atomic::Ordering::AcqRel);
 
         self.highest_seqno
-            .fetch_max(seqno, std::sync::atomic::Ordering::AcqRel);
+            .fetch_max(seqno, core::sync::atomic::Ordering::AcqRel);
 
         size
     }
 
     /// Returns `true` if the key at `key_seqno` is suppressed by a range tombstone
     /// visible at `read_seqno`.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal `RwLock` is poisoned.
     pub(crate) fn is_key_suppressed_by_range_tombstone(
         &self,
         key: &[u8],
         key_seqno: SeqNo,
         read_seqno: SeqNo,
     ) -> bool {
-        #[expect(clippy::expect_used, reason = "lock is expected to not be poisoned")]
         self.range_tombstones
             .read()
-            .expect("lock is poisoned")
             .query_suppression(key, key_seqno, read_seqno)
     }
 
     /// Returns all range tombstones in sorted order (for flush).
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal `RwLock` is poisoned.
     pub(crate) fn range_tombstones_sorted(&self) -> Vec<RangeTombstone> {
-        #[expect(clippy::expect_used, reason = "lock is expected to not be poisoned")]
-        self.range_tombstones
-            .read()
-            .expect("lock is poisoned")
-            .iter_sorted()
+        self.range_tombstones.read().iter_sorted()
     }
 
     /// Returns the number of range tombstones.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal `RwLock` is poisoned.
     #[must_use]
     pub fn range_tombstone_count(&self) -> usize {
-        #[expect(clippy::expect_used, reason = "lock is expected to not be poisoned")]
-        self.range_tombstones
-            .read()
-            .expect("lock is poisoned")
-            .len()
+        self.range_tombstones.read().len()
     }
 
     /// Returns the highest sequence number in the memtable.
@@ -383,7 +364,7 @@ impl Memtable {
         } else {
             Some(
                 self.highest_seqno
-                    .load(std::sync::atomic::Ordering::Acquire),
+                    .load(core::sync::atomic::Ordering::Acquire),
             )
         }
     }
@@ -418,7 +399,7 @@ mod tests {
         let rt_ref = &mt.range_tombstones;
         std::thread::scope(|s| {
             s.spawn(move || {
-                let _guard = rt_ref.read().expect("lock is poisoned");
+                let _guard = rt_ref.read();
                 let _ = held_tx.send(()); // signal: guard held
                 let _ = release_rx.recv(); // wait: main thread done
             });
@@ -428,7 +409,7 @@ mod tests {
                 .expect("spawned thread panicked before acquiring guard");
             let guard2 = mt.range_tombstones.try_read();
             assert!(
-                guard2.is_ok(),
+                guard2.is_some(),
                 "second read lock must succeed while first is held"
             );
             drop(guard2);

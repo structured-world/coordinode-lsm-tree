@@ -7,9 +7,16 @@ use crate::{
     BlobIndirection, SeqNo, UserKey, UserValue, config::FilterPolicyEntry, fs::Fs,
     table::multi_writer::MultiWriter,
 };
-use std::cmp::Ordering;
-use std::path::PathBuf;
-use std::sync::Arc;
+use alloc::sync::Arc;
+#[cfg(not(feature = "std"))]
+use alloc::{
+    boxed::Box,
+    string::{String, ToString},
+    vec::Vec,
+};
+use core::cmp::Ordering;
+
+use crate::path::PathBuf;
 
 pub const INITIAL_CANONICAL_LEVEL: usize = 1;
 
@@ -319,11 +326,9 @@ impl<'a> Ingestion<'a> {
         // Acquire locks for version registration. We must hold both the
         // compaction state lock and version history lock to safely modify
         // the tree's version.
-        #[expect(clippy::expect_used, reason = "lock is expected to not be poisoned")]
-        let mut _compaction_state = self.tree.compaction_state.lock().expect("lock is poisoned");
+        let mut _compaction_state = self.tree.compaction_state.lock();
 
-        #[expect(clippy::expect_used, reason = "lock is expected to not be poisoned")]
-        let mut version_lock = self.tree.version_history.write().expect("lock is poisoned");
+        let mut version_lock = self.tree.version_history.write();
 
         // Allocate the next global sequence number. This seqno will be shared
         // by all ingested tables and the version that registers them, ensuring

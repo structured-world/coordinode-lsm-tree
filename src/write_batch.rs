@@ -20,6 +20,8 @@
 //! fjall's keyspace for single-writer batches.
 
 use crate::{UserKey, UserValue, ValueType, value::InternalValue};
+#[cfg(not(feature = "std"))]
+use alloc::{boxed::Box, string::String, vec::Vec};
 
 /// A single entry in a [`WriteBatch`].
 #[derive(Clone, Debug)]
@@ -151,8 +153,8 @@ impl WriteBatch {
         // ties on `(user_key, seqno)` without `value_type` as tie-breaker,
         // making the read/compaction outcome ambiguous.
         {
-            let mut seen: std::collections::HashMap<&[u8], ValueType, rustc_hash::FxBuildHasher> =
-                std::collections::HashMap::with_capacity_and_hasher(
+            let mut seen: crate::HashMap<&[u8], ValueType> =
+                crate::HashMap::with_capacity_and_hasher(
                     self.entries.len(),
                     rustc_hash::FxBuildHasher,
                 );

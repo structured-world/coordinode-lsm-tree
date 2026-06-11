@@ -17,8 +17,10 @@ use crate::{
         util::load_block,
     },
 };
+use alloc::sync::Arc;
+
+use crate::path::PathBuf;
 use self_cell::self_cell;
-use std::{path::PathBuf, sync::Arc};
 
 #[cfg(feature = "metrics")]
 use crate::metrics::Metrics;

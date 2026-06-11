@@ -570,7 +570,8 @@ fn second_checkpoint_into_same_target_rejected() -> lsm_tree::Result<()> {
     // surface `Io(NotFound | AlreadyExists)`-class refusal so callers
     // can detect double-target programmatically.
     match err {
-        lsm_tree::Error::Io(ref io_err) if io_err.kind() == std::io::ErrorKind::AlreadyExists => {}
+        lsm_tree::Error::Io(ref io_err)
+            if io_err.kind() == lsm_tree::io::ErrorKind::AlreadyExists => {}
         other => panic!("expected Io(AlreadyExists) on second checkpoint, got {other:?}"),
     }
     Ok(())
@@ -608,7 +609,7 @@ fn checkpoint_failure_leaves_source_intact() -> lsm_tree::Result<()> {
         matches!(
             &err,
             lsm_tree::Error::Io(io_err)
-                if io_err.kind() == std::io::ErrorKind::AlreadyExists,
+                if io_err.kind() == lsm_tree::io::ErrorKind::AlreadyExists,
         ),
         "expected Io(AlreadyExists) on early reject, got {err:?}",
     );
@@ -742,7 +743,9 @@ fn checkpoint_open_rejects_missing_current_pointer() -> lsm_tree::Result<()> {
         Err(e) => e,
     };
     match err {
-        lsm_tree::Error::Io(ref io_err) if io_err.kind() == std::io::ErrorKind::InvalidData => {
+        lsm_tree::Error::Io(ref io_err)
+            if io_err.kind() == lsm_tree::io::ErrorKind::InvalidData =>
+        {
             let msg = io_err.to_string();
             assert!(
                 msg.contains("current") && msg.contains("version artifacts"),

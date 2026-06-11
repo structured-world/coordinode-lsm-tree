@@ -2,6 +2,9 @@
 // Copyright (c) 2024-present, fjall-rs
 // Copyright (c) 2026-present, Structured World Foundation
 
+#[cfg(not(feature = "std"))]
+use alloc::vec::Vec;
+
 pub use crate::table::filter::BloomConstructionPolicy;
 
 /// Filter policy entry
@@ -20,7 +23,7 @@ pub enum FilterPolicyEntry {
 #[derive(Debug, Clone, PartialEq)]
 pub struct FilterPolicy(Vec<FilterPolicyEntry>);
 
-impl std::ops::Deref for FilterPolicy {
+impl core::ops::Deref for FilterPolicy {
     type Target = [FilterPolicyEntry];
 
     fn deref(&self) -> &Self::Target {

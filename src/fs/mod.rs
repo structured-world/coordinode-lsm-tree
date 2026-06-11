@@ -36,7 +36,12 @@ mod aligned_buf;
 // gate is the first concrete step.
 #[cfg(feature = "std")]
 mod direct_io;
+// `std_fs` (std::fs) is genuinely std-bound and gated out of a `no_std` build.
+// `mem_fs` is the no_std-capable reference backend (spin + hashbrown over the
+// `crate::io` `Fs` trait): it stays unconditional so a `no_std` consumer has a
+// working `Fs` implementation to use and to copy for a real backend.
 mod mem_fs;
+#[cfg(feature = "std")]
 mod std_fs;
 
 pub use aligned_buf::AlignedBuf;
@@ -45,7 +50,9 @@ pub use aligned_buf::AlignedBuf;
 mod io_uring_fs;
 
 pub use mem_fs::MemFs;
+#[cfg(feature = "std")]
 pub use std_fs::StdFs;
+#[cfg(feature = "std")]
 pub(crate) use std_fs::is_cross_device;
 
 #[cfg(all(target_os = "linux", feature = "io-uring"))]
@@ -57,17 +64,15 @@ pub use io_uring_fs::{IoUringFs, is_io_uring_available};
 // existing std-backed backends (`std_fs`, `io_uring_fs`) satisfy
 // these bounds without any change to their own impls.
 //
-// `io::{Result, Error, ErrorKind}` still come from `std::io` here
-// (no public re-export - `use std::io;` is a local module alias).
-// The trait *bounds* are what blocked no-std for this module; the
-// surrounding `io::Result<T>` return type still resolves to
-// `std::io::Result<T>` and will be migrated to `crate::io::Result<T>`
-// in a follow-up so we keep the diff scoped to what this issue
-// actually unblocks. `std::path::Path` likewise stays for now -
-// the path migration is the second blocker tracked separately.
-use crate::io::{Read, Seek, Write};
-use std::io;
-use std::path::{Path, PathBuf};
+// `io::{Result, Error, ErrorKind}` come from `crate::io` (the local mirror of
+// `std::io`): under `std` they bridge to/from `std::io` via `From`, so std
+// backends' `?`-chains convert transparently; under `no_std` they are the
+// native types. `Path`/`PathBuf` come from `crate::path` (a re-export of
+// `std::path` under `std`, a `str`-key newtype under `no_std`).
+use crate::io::{self, Read, Seek, Write};
+use crate::path::{Path, PathBuf};
+#[cfg(not(feature = "std"))]
+use alloc::{boxed::Box, string::String, vec::Vec};
 
 /// Options for opening a file through the [`Fs`] trait.
 ///
@@ -850,8 +855,11 @@ pub(crate) fn copy_file_streamed<F: Fs + ?Sized>(fs: &F, src: &Path, dst: &Path)
             let n = match src_file.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => n,
+                #[cfg(feature = "std")]
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                #[cfg(not(feature = "std"))]
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                Err(e) => return Err(e),
+                Err(e) => return Err(e.into()),
             };
             let chunk = buf.get(..n).ok_or_else(|| {
                 io::Error::other("read returned more bytes than the buffer holds")

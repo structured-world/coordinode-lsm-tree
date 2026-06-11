@@ -12,11 +12,13 @@ use crate::{
     CompressionType, UserKey, checksum::ChecksummedWriter, config::BloomConstructionPolicy,
     encryption::EncryptionProvider, prefix::PrefixExtractor,
 };
-use std::sync::Arc;
+use alloc::sync::Arc;
+#[cfg(not(feature = "std"))]
+use alloc::{boxed::Box, string::String, vec::Vec};
 
 // All methods are required (no defaults) by design so that implementations must
 // explicitly handle configuration changes (e.g., filter policies, prefix extractors).
-pub trait FilterWriter<W: std::io::Write + std::io::Seek> {
+pub trait FilterWriter<W: crate::io::Write + crate::io::Seek> {
     // NOTE: We purposefully use a UserKey instead of &[u8]
     // so we can clone it without heap allocation, if needed
     /// Registers a key in the block index.

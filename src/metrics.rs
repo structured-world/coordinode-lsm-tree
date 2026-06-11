@@ -2,8 +2,8 @@
 // Copyright (c) 2024-present, fjall-rs
 // Copyright (c) 2026-present, Structured World Foundation
 
-use std::sync::atomic::Ordering::Relaxed;
-use std::sync::atomic::{AtomicU64, AtomicUsize};
+use core::sync::atomic::Ordering::Relaxed;
+use core::sync::atomic::{AtomicU64, AtomicUsize};
 
 /// Runtime metrics
 ///
@@ -262,7 +262,7 @@ impl Metrics {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::Ordering::Relaxed;
+    use core::sync::atomic::Ordering::Relaxed;
 
     #[test]
     fn range_tombstone_counters_default_zero() {

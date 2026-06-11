@@ -61,7 +61,7 @@ impl BurrParams {
         if !(0.0 < fpr && fpr < 1.0) {
             return Err(BurrBuildError::InvalidParams("fpr must be in (0.0, 1.0)"));
         }
-        let r_f = (-fpr.log2()).ceil();
+        let r_f = crate::f32_ceil(-crate::f32_log2(fpr));
         if !r_f.is_finite() || r_f < 1.0 || r_f > 64.0 {
             return Err(BurrBuildError::InvalidParams(
                 "computed r out of supported range [1, 64]",
@@ -99,7 +99,7 @@ impl BurrParams {
             clippy::cast_sign_loss,
             reason = "bpk is validated to 1.0..=64.0 above, then clamped to the same range"
         )]
-        let r = bpk.round().clamp(1.0, 64.0) as u8;
+        let r = crate::f32_round(bpk).clamp(1.0, 64.0) as u8;
         Ok(Self {
             n,
             r,
@@ -144,7 +144,7 @@ impl BurrParams {
             clippy::cast_precision_loss,
             reason = "layer_input_keys is bounded by the filter capacity; ceil result fits usize on supported platforms"
         )]
-        let raw = ((layer_input_keys as f64) * (1.0 + overhead)).ceil() as usize;
+        let raw = crate::f64_ceil((layer_input_keys as f64) * (1.0 + overhead)) as usize;
         let raw = raw.max(usize::from(self.b)); // ≥ one block
         // Round UP to a multiple of b (so block_count = m / b is exact).
         // `raw.div_ceil(b) * b` can wrap on extreme inputs in release builds,

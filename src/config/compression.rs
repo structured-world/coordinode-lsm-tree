@@ -3,12 +3,14 @@
 // Copyright (c) 2026-present, Structured World Foundation
 
 use crate::CompressionType;
+#[cfg(not(feature = "std"))]
+use alloc::{boxed::Box, string::String, vec::Vec};
 
 /// Compression policy
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct CompressionPolicy(Vec<CompressionType>);
 
-impl std::ops::Deref for CompressionPolicy {
+impl core::ops::Deref for CompressionPolicy {
     type Target = [CompressionType];
 
     fn deref(&self) -> &Self::Target {

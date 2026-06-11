@@ -2,11 +2,14 @@
 // Copyright (c) 2024-present, fjall-rs
 // Copyright (c) 2026-present, Structured World Foundation
 
+#[cfg(not(feature = "std"))]
+use alloc::vec::Vec;
+
 /// Restart interval policy
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct RestartIntervalPolicy(Vec<u8>);
 
-impl std::ops::Deref for RestartIntervalPolicy {
+impl core::ops::Deref for RestartIntervalPolicy {
     type Target = [u8];
 
     fn deref(&self) -> &Self::Target {

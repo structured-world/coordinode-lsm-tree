@@ -35,7 +35,7 @@ impl FragmentationEntry {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct FragmentationMap(crate::HashMap<BlobFileId, FragmentationEntry>);
 
-impl std::ops::Deref for FragmentationMap {
+impl core::ops::Deref for FragmentationMap {
     type Target = crate::HashMap<BlobFileId, FragmentationEntry>;
 
     fn deref(&self) -> &Self::Target {
@@ -43,7 +43,7 @@ impl std::ops::Deref for FragmentationMap {
     }
 }
 
-impl std::ops::DerefMut for FragmentationMap {
+impl core::ops::DerefMut for FragmentationMap {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.0
     }
@@ -82,8 +82,8 @@ impl FragmentationMap {
 }
 
 impl crate::coding::Encode for FragmentationMap {
-    fn encode_into<W: std::io::Write>(&self, writer: &mut W) -> Result<(), crate::Error> {
-        use byteorder::{LE, WriteBytesExt};
+    fn encode_into<W: crate::io::Write>(&self, writer: &mut W) -> Result<(), crate::Error> {
+        use crate::io::{LE, WriteBytesExt};
 
         #[expect(
             clippy::cast_possible_truncation,
@@ -110,11 +110,11 @@ impl crate::coding::Encode for FragmentationMap {
 }
 
 impl crate::coding::Decode for FragmentationMap {
-    fn decode_from<R: std::io::Read>(reader: &mut R) -> Result<Self, crate::Error>
+    fn decode_from<R: crate::io::Read>(reader: &mut R) -> Result<Self, crate::Error>
     where
         Self: Sized,
     {
-        use byteorder::{LE, ReadBytesExt};
+        use crate::io::{LE, ReadBytesExt};
 
         let len = reader.read_u32::<LE>()?;
         let mut map =
@@ -167,6 +167,7 @@ impl DroppedKvCallback for FragmentationMap {
 #[expect(clippy::expect_used, clippy::indexing_slicing)]
 mod tests {
     use super::*;
+    use crate::HashMap;
     use crate::{
         ValueType,
         coding::{Decode, Encode},
@@ -174,7 +175,6 @@ mod tests {
         value::InternalValue,
         vlog::ValueHandle,
     };
-    use std::collections::HashMap;
     use test_log::test;
 
     #[test]

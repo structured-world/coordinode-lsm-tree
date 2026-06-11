@@ -18,8 +18,14 @@
 
 use super::edit::{VersionEdit, replay_edits};
 use crate::fs::{Fs, FsOpenOptions, SyncMode};
+#[cfg(not(feature = "std"))]
+use alloc::{boxed::Box, string::String, vec::Vec};
+
+#[cfg(not(feature = "std"))]
+use crate::io::{Seek, SeekFrom};
+use crate::path::Path;
+#[cfg(feature = "std")]
 use std::io::{Seek, SeekFrom};
-use std::path::Path;
 
 /// Appends one framed [`VersionEdit`] to the log at `path` (created on first
 /// write) and fsyncs per `sync_mode`, so the edit is durable before the caller
@@ -42,9 +48,9 @@ pub fn append_edit(
             path,
             &FsOpenOptions::new().write(true).create(true).append(true),
         )
-        .map_err(crate::Error::Io)?;
+        .map_err(crate::Error::from)?;
     edit.append_to(&mut file, scratch)?;
-    file.sync_all_with(sync_mode).map_err(crate::Error::Io)?;
+    file.sync_all_with(sync_mode).map_err(crate::Error::from)?;
     Ok(())
 }
 
@@ -69,8 +75,8 @@ pub fn replay_log(
 ) -> crate::Result<Vec<VersionEdit>> {
     match fs.open(path, &FsOpenOptions::new().read(true)) {
         Ok(mut file) => replay_edits(&mut file, mode),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
-        Err(e) => Err(crate::Error::Io(e)),
+        Err(e) if e.kind() == crate::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(e) => Err(crate::Error::from(e)),
     }
 }
 
@@ -83,9 +89,9 @@ pub fn replay_log(
 /// Returns an I/O error if the open (other than not-found) or the seek fails.
 pub fn log_size(fs: &dyn Fs, path: &Path) -> crate::Result<u64> {
     match fs.open(path, &FsOpenOptions::new().read(true)) {
-        Ok(mut file) => file.seek(SeekFrom::End(0)).map_err(crate::Error::Io),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(0),
-        Err(e) => Err(crate::Error::Io(e)),
+        Ok(mut file) => file.seek(SeekFrom::End(0)).map_err(crate::Error::from),
+        Err(e) if e.kind() == crate::io::ErrorKind::NotFound => Ok(0),
+        Err(e) => Err(crate::Error::from(e)),
     }
 }
 

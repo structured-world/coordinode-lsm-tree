@@ -773,7 +773,7 @@ pub fn iter_data_block_entries(path: &Path) -> crate::Result<DataBlockEntryIter>
     let regions = ParsedRegions::parse_from_toc(toc)?;
 
     if regions.index.is_some() {
-        return Err(crate::Error::Io(std::io::Error::new(
+        return Err(crate::Error::from(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
             "partitioned-index SST (separate `index` section present) is not yet supported \
              by iter_data_block_entries; walking sub-index leaves to enumerate data blocks \

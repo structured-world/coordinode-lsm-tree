@@ -14,7 +14,15 @@ use crate::{
     value::InternalValue,
     vlog::BlobFileId,
 };
-use std::{path::PathBuf, sync::Arc};
+use alloc::sync::Arc;
+#[cfg(not(feature = "std"))]
+use alloc::{
+    boxed::Box,
+    string::{String, ToString},
+    vec::Vec,
+};
+
+use crate::path::PathBuf;
 
 /// Like `Writer` but will rotate to a new table, once a table grows larger than `target_size`
 ///
@@ -297,11 +305,11 @@ impl MultiWriter {
                             if let Some(existing) = &mut writer.meta.last_key {
                                 let safe = clip_upper.is_some_and(|upper| {
                                     comparator.compare(&clipped.end, upper.as_ref())
-                                        == std::cmp::Ordering::Less
+                                        == core::cmp::Ordering::Less
                                 });
                                 if safe
                                     && comparator.compare(&clipped.end, existing.as_ref())
-                                        == std::cmp::Ordering::Greater
+                                        == core::cmp::Ordering::Greater
                                 {
                                     *existing = clipped.end.clone();
                                 }
@@ -318,14 +326,14 @@ impl MultiWriter {
                     // disjoint-run invariant that point reads rely on.
                     for rt in tombstones {
                         let clipped_start = if comparator.compare(&rt.start, first_key.as_ref())
-                            == std::cmp::Ordering::Greater
+                            == core::cmp::Ordering::Greater
                         {
                             rt.start.as_ref()
                         } else {
                             first_key.as_ref()
                         };
 
-                        if comparator.compare(clipped_start, &rt.end) == std::cmp::Ordering::Less {
+                        if comparator.compare(clipped_start, &rt.end) == core::cmp::Ordering::Less {
                             writer.write_range_tombstone(RangeTombstone::new(
                                 UserKey::from(clipped_start),
                                 rt.end.clone(),
@@ -348,7 +356,7 @@ impl MultiWriter {
                     match &mut writer.meta.first_key {
                         Some(existing) => {
                             if comparator.compare(&rt.start, existing.as_ref())
-                                == std::cmp::Ordering::Less
+                                == core::cmp::Ordering::Less
                             {
                                 *existing = rt.start.clone();
                             }
@@ -360,7 +368,7 @@ impl MultiWriter {
                     match &mut writer.meta.last_key {
                         Some(existing) => {
                             if comparator.compare(&rt.end, existing.as_ref())
-                                == std::cmp::Ordering::Greater
+                                == core::cmp::Ordering::Greater
                             {
                                 *existing = rt.end.clone();
                             }
@@ -601,7 +609,7 @@ impl MultiWriter {
             new_writer = new_writer.use_parallel_compression(spawner, self.parallel_threads);
         }
 
-        let mut old_writer = std::mem::replace(&mut self.writer, new_writer);
+        let mut old_writer = core::mem::replace(&mut self.writer, new_writer);
         old_writer.spill_block()?;
 
         // Write range tombstones to the finishing writer.

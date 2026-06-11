@@ -2,21 +2,30 @@
 // This source code is licensed under both the Apache 2.0 and MIT License
 // (found in the LICENSE-* files in the repository)
 
+#[cfg(not(feature = "std"))]
+use alloc::vec::Vec;
+
 use super::writer::TOC_MAGIC;
+use crate::io::ReadBytesExt;
 use crate::sfa::{
     Result,
     checksum::Checksum,
     toc::{Toc, entry::TocEntry},
 };
-use byteorder::ReadBytesExt;
+// `Read`/`Seek`/`SeekFrom` resolve to std under `std` and to the native
+// `crate::io` types under `no_std`; the `take`/`seek` calls and the `SeekFrom`
+// value below track whichever is in play.
+#[cfg(not(feature = "std"))]
+use crate::io::{Read, Seek, SeekFrom};
+#[cfg(feature = "std")]
 use std::io::{Read, Seek, SeekFrom};
 
-struct ChecksummedReader<R: std::io::Read> {
+struct ChecksummedReader<R: crate::io::Read> {
     inner: R,
     hasher: xxhash_rust::xxh3::Xxh3Default,
 }
 
-impl<R: std::io::Read> ChecksummedReader<R> {
+impl<R: crate::io::Read> ChecksummedReader<R> {
     pub fn new(reader: R) -> Self {
         Self {
             inner: reader,
@@ -29,8 +38,24 @@ impl<R: std::io::Read> ChecksummedReader<R> {
     }
 }
 
-impl<R: std::io::Read> std::io::Read for ChecksummedReader<R> {
+// `crate::io::Read` is the std trait (via the std-mode supertrait blanket)
+// under `std` and the native trait under `no_std`; gated impls differ only
+// in the trait path and `Result` type.
+#[cfg(feature = "std")]
+impl<R: crate::io::Read> std::io::Read for ChecksummedReader<R> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+
+        #[expect(clippy::indexing_slicing)]
+        self.hasher.update(&buf[..n]);
+
+        Ok(n)
+    }
+}
+
+#[cfg(not(feature = "std"))]
+impl<R: crate::io::Read> crate::io::Read for ChecksummedReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> crate::io::Result<usize> {
         let n = self.inner.read(buf)?;
 
         #[expect(clippy::indexing_slicing)]
@@ -49,7 +74,7 @@ impl TocReader {
         toc_len: u64,
         toc_checksum: Checksum,
     ) -> Result<Toc> {
-        use byteorder::LE;
+        use crate::io::LE;
 
         log::trace!("Reading ToC");
 

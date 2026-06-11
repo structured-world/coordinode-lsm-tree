@@ -2,11 +2,14 @@
 // Copyright (c) 2024-present, fjall-rs
 // Copyright (c) 2026-present, Structured World Foundation
 
+#[cfg(not(feature = "std"))]
+use alloc::vec::Vec;
+
 /// Pinning policy
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct PinningPolicy(Vec<bool>);
 
-impl std::ops::Deref for PinningPolicy {
+impl core::ops::Deref for PinningPolicy {
     type Target = [bool];
 
     fn deref(&self) -> &Self::Target {

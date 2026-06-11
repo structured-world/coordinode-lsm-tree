@@ -15,7 +15,9 @@ use crate::{
         util::load_block,
     },
 };
-use std::{path::PathBuf, sync::Arc};
+use alloc::sync::Arc;
+
+use crate::path::PathBuf;
 
 #[cfg(feature = "metrics")]
 use crate::Metrics;

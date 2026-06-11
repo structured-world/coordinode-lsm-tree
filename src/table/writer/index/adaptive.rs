@@ -39,10 +39,11 @@ use crate::{
         writer::index::{BlockIndexWriter, FullIndexWriter, PartitionedIndexWriter},
     },
 };
-use std::{
-    io::{Seek, Write},
-    sync::Arc,
-};
+use alloc::sync::Arc;
+#[cfg(not(feature = "std"))]
+use alloc::{boxed::Box, string::String, vec::Vec};
+
+use crate::io::{Seek, Write};
 
 /// Index-size threshold (bytes) at or below which the index is written
 /// single-level. The estimate mirrors [`PartitionedIndexWriter`]'s own
@@ -133,7 +134,7 @@ impl<W: Write + Seek + 'static> BlockIndexWriter<W> for AdaptiveIndexWriter<W> {
         // Mirror PartitionedIndexWriter's per-entry size estimate so the
         // threshold compares like-for-like against the partition logic.
         let entry_size =
-            (block_handle.end_key().len() + std::mem::size_of::<KeyedBlockHandle>()) as u64;
+            (block_handle.end_key().len() + core::mem::size_of::<KeyedBlockHandle>()) as u64;
         self.buffered_bytes += entry_size;
         self.buffer.push(block_handle);
 

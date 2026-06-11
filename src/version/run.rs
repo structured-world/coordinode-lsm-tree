@@ -4,7 +4,9 @@
 
 use crate::KeyRange;
 use crate::comparator::UserComparator;
-use std::ops::{Bound, RangeBounds};
+#[cfg(not(feature = "std"))]
+use alloc::{boxed::Box, string::String, vec::Vec};
+use core::ops::{Bound, RangeBounds};
 
 pub trait Ranged {
     fn key_range(&self) -> &KeyRange;
@@ -42,7 +44,7 @@ impl<T: Ranged> Ranged for Indexed<T> {
     }
 }
 
-impl<T: Ranged> std::ops::Deref for Indexed<T> {
+impl<T: Ranged> core::ops::Deref for Indexed<T> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
@@ -54,7 +56,7 @@ impl<T: Ranged> std::ops::Deref for Indexed<T> {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Run<T: Ranged>(Vec<T>);
 
-impl<T: Ranged> std::ops::Deref for Run<T> {
+impl<T: Ranged> core::ops::Deref for Run<T> {
     type Target = [T];
 
     fn deref(&self) -> &Self::Target {
@@ -161,12 +163,13 @@ impl<T: Ranged> Run<T> {
         key: &[u8],
         cmp: &dyn crate::comparator::UserComparator,
     ) -> Option<&T> {
-        let idx = self
-            .partition_point(|x| cmp.compare(x.key_range().max(), key) == std::cmp::Ordering::Less);
+        let idx = self.partition_point(|x| {
+            cmp.compare(x.key_range().max(), key) == core::cmp::Ordering::Less
+        });
 
         self.0
             .get(idx)
-            .filter(|x| cmp.compare(x.key_range().min(), key) != std::cmp::Ordering::Greater)
+            .filter(|x| cmp.compare(x.key_range().min(), key) != core::cmp::Ordering::Greater)
     }
 
     /// Returns the run's key range.
@@ -304,7 +307,7 @@ impl<T: Ranged> Run<T> {
         key_range: &R,
         cmp: &dyn UserComparator,
     ) -> Option<(usize, usize)> {
-        use std::cmp::Ordering;
+        use core::cmp::Ordering;
 
         let level = &self.0;
 
@@ -396,7 +399,7 @@ mod tests {
             "reverse"
         }
 
-        fn compare(&self, a: &[u8], b: &[u8]) -> std::cmp::Ordering {
+        fn compare(&self, a: &[u8], b: &[u8]) -> core::cmp::Ordering {
             b.cmp(a)
         }
     }
@@ -572,7 +575,7 @@ mod tests {
             fn name(&self) -> &'static str {
                 "reverse"
             }
-            fn compare(&self, a: &[u8], b: &[u8]) -> std::cmp::Ordering {
+            fn compare(&self, a: &[u8], b: &[u8]) -> core::cmp::Ordering {
                 b.cmp(a)
             }
         }

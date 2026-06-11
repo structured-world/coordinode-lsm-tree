@@ -1,4 +1,6 @@
-use std::hash::{BuildHasher, Hash};
+#[cfg(not(feature = "std"))]
+use alloc::{boxed::Box, string::String, vec::Vec};
+use core::hash::{BuildHasher, Hash};
 
 use super::super::builder::Scratch;
 use super::super::filter::RibbonFilter;

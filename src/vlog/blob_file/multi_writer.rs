@@ -4,6 +4,7 @@
 
 use super::writer::Writer;
 use crate::fs::FsFile;
+use crate::path::{Path, PathBuf};
 use crate::{
     BlobFile, CompressionType, DescriptorTable, SeqNo, SequenceNumberCounter, TreeId,
     file_accessor::FileAccessor,
@@ -13,10 +14,14 @@ use crate::{
         blob_file::{Inner as BlobFileInner, Metadata},
     },
 };
-use std::{
-    path::{Path, PathBuf},
-    sync::{Arc, atomic::AtomicBool},
+use alloc::sync::Arc;
+#[cfg(not(feature = "std"))]
+use alloc::{
+    boxed::Box,
+    string::{String, ToString},
+    vec::Vec,
 };
+use core::sync::atomic::AtomicBool;
 
 /// Blob file writer, may write multiple blob files
 pub struct MultiWriter {
@@ -40,7 +45,7 @@ pub struct MultiWriter {
 
     /// Dictionary for `ZstdDict` compression, shared across all rotated writers.
     #[cfg(zstd_any)]
-    zstd_dictionary: Option<std::sync::Arc<crate::compression::ZstdDictionary>>,
+    zstd_dictionary: Option<alloc::sync::Arc<crate::compression::ZstdDictionary>>,
 
     tree_id: TreeId,
     descriptor_table: Option<Arc<DescriptorTable>>,
@@ -130,7 +135,7 @@ impl MultiWriter {
     #[must_use]
     pub fn use_zstd_dictionary(
         mut self,
-        dict: Option<std::sync::Arc<crate::compression::ZstdDictionary>>,
+        dict: Option<alloc::sync::Arc<crate::compression::ZstdDictionary>>,
     ) -> Self {
         self.active_writer = self.active_writer.use_zstd_dictionary(dict.clone());
         self.zstd_dictionary = dict;
@@ -153,7 +158,7 @@ impl MultiWriter {
             w
         };
 
-        let old_writer = std::mem::replace(&mut self.active_writer, new_writer);
+        let old_writer = core::mem::replace(&mut self.active_writer, new_writer);
         let blob_file = Self::consume_writer(
             old_writer,
             self.passthrough_compression,

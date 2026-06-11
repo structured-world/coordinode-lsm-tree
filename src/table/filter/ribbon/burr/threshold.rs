@@ -25,6 +25,8 @@
 //! warning.
 
 use super::super::hashing::StandardEquation;
+#[cfg(not(feature = "std"))]
+use alloc::{boxed::Box, string::String, vec::Vec};
 
 /// Capacity numerator: per-block keep-capacity = `b * CAP_NUM / CAP_DEN`.
 /// 90% load factor (CAP_NUM=9, CAP_DEN=10) — leaves ~10% margin for the

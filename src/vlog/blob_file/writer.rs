@@ -4,8 +4,15 @@
 
 #[cfg(zstd_any)]
 use crate::compression::CompressionProvider as _;
+#[cfg(not(feature = "std"))]
+use alloc::{boxed::Box, string::String, vec::Vec};
 
 use super::meta::Metadata;
+use crate::io::BufWriter;
+#[cfg(not(feature = "std"))]
+use crate::io::Write;
+use crate::io::{LittleEndian, WriteBytesExt};
+use crate::path::{Path, PathBuf};
 use crate::{
     Checksum, CompressionType, KeyRange, SeqNo, TreeId, UserKey,
     checksum::ChecksummedWriter,
@@ -13,11 +20,8 @@ use crate::{
     time::unix_timestamp,
     vlog::BlobFileId,
 };
-use byteorder::{LittleEndian, WriteBytesExt};
-use std::{
-    io::{BufWriter, Write},
-    path::{Path, PathBuf},
-};
+#[cfg(feature = "std")]
+use std::io::Write;
 
 /// Safety cap on blob value size (256 MiB).
 ///
@@ -51,14 +55,14 @@ pub const BLOB_HEADER_MAGIC_V4: &[u8] = b"BLO4";
 
 /// V3 blob frame header length (38 bytes, no `header_crc`).
 pub const BLOB_HEADER_LEN_V3: usize = BLOB_HEADER_MAGIC_V3.len()
-    + std::mem::size_of::<u128>() // Checksum
-    + std::mem::size_of::<u64>() // SeqNo
-    + std::mem::size_of::<u16>() // Key length
-    + std::mem::size_of::<u32>() // Real value length
-    + std::mem::size_of::<u32>(); // On-disk value length
+    + core::mem::size_of::<u128>() // Checksum
+    + core::mem::size_of::<u64>() // SeqNo
+    + core::mem::size_of::<u16>() // Key length
+    + core::mem::size_of::<u32>() // Real value length
+    + core::mem::size_of::<u32>(); // On-disk value length
 
 /// V4 blob frame header length (42 bytes, includes `header_crc`).
-pub const BLOB_HEADER_LEN_V4: usize = BLOB_HEADER_LEN_V3 + std::mem::size_of::<u32>(); // Header CRC
+pub const BLOB_HEADER_LEN_V4: usize = BLOB_HEADER_LEN_V3 + core::mem::size_of::<u32>(); // Header CRC
 
 /// Compute V4 header CRC from header fields.
 /// Returns a 4-byte truncated xxh3 hash.
@@ -129,7 +133,7 @@ pub struct Writer {
     /// Dictionary for `ZstdDict` compression.  Must be supplied when
     /// `compression` is [`CompressionType::ZstdDict`].
     #[cfg(zstd_any)]
-    pub(crate) zstd_dictionary: Option<std::sync::Arc<crate::compression::ZstdDictionary>>,
+    pub(crate) zstd_dictionary: Option<alloc::sync::Arc<crate::compression::ZstdDictionary>>,
 }
 
 impl Writer {
@@ -200,7 +204,7 @@ impl Writer {
     #[must_use]
     pub fn use_zstd_dictionary(
         mut self,
-        dict: Option<std::sync::Arc<crate::compression::ZstdDictionary>>,
+        dict: Option<alloc::sync::Arc<crate::compression::ZstdDictionary>>,
     ) -> Self {
         self.zstd_dictionary = dict;
         self
@@ -238,20 +242,20 @@ impl Writer {
         // the cap applies uniformly to all blob data regardless of
         // compression state).
         let value = match &self.compression {
-            CompressionType::None => std::borrow::Cow::Borrowed(value),
+            CompressionType::None => alloc::borrow::Cow::Borrowed(value),
 
             #[cfg(feature = "lz4")]
             CompressionType::Lz4 => {
                 let compressed = lz4_flex::compress(value);
                 check_size_cap(compressed.len())?;
-                std::borrow::Cow::Owned(compressed)
+                alloc::borrow::Cow::Owned(compressed)
             }
 
             #[cfg(zstd_any)]
             CompressionType::Zstd(level) => {
                 let compressed = crate::compression::ZstdBackend::compress(value, *level)?;
                 check_size_cap(compressed.len())?;
-                std::borrow::Cow::Owned(compressed)
+                alloc::borrow::Cow::Owned(compressed)
             }
 
             #[cfg(zstd_any)]
@@ -272,7 +276,7 @@ impl Writer {
                 let compressed =
                     crate::compression::ZstdBackend::compress_with_dict(value, *level, dict.raw())?;
                 check_size_cap(compressed.len())?;
-                std::borrow::Cow::Owned(compressed)
+                alloc::borrow::Cow::Owned(compressed)
             }
         };
 
@@ -280,7 +284,7 @@ impl Writer {
         // to disk as a 32-bit length. This prevents truncation if compression
         // expands the payload (possible for incompressible data near u32 boundary).
         let compressed_len_u32 = u32::try_from(value.len())
-            .map_err(|_| std::io::Error::other("compressed value length exceeds u32::MAX"))?;
+            .map_err(|_| crate::io::Error::other("compressed value length exceeds u32::MAX"))?;
 
         if self.first_key.is_none() {
             self.first_key = Some(key.into());
@@ -535,7 +539,7 @@ mod tests {
         };
         let mut writer = Writer::new(&path, 0, 0, &StdFs)?
             .use_compression(compression)
-            .use_zstd_dictionary(Some(std::sync::Arc::new(dict)));
+            .use_zstd_dictionary(Some(alloc::sync::Arc::new(dict)));
 
         let result = writer.write(b"key", 0, b"hello world blob value");
         assert!(

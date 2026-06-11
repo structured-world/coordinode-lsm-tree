@@ -48,7 +48,7 @@ impl fmt::Display for BurrBuildError {
     }
 }
 
-impl std::error::Error for BurrBuildError {}
+impl core::error::Error for BurrBuildError {}
 
 /// Detailed construction failure for diagnostics.
 #[derive(Debug, Clone)]
@@ -77,7 +77,7 @@ impl fmt::Display for BurrConstructionFailure {
     }
 }
 
-impl std::error::Error for BurrConstructionFailure {}
+impl core::error::Error for BurrConstructionFailure {}
 
 #[cfg(test)]
 mod tests {
@@ -119,7 +119,7 @@ mod tests {
     #[test]
     fn burr_build_error_implements_std_error() {
         let err = BurrBuildError::InvalidParams("x");
-        let _: &dyn std::error::Error = &err;
+        let _: &dyn core::error::Error = &err;
     }
 
     #[test]
@@ -139,7 +139,7 @@ mod tests {
             layer_index: 0,
             block_index: 0,
         };
-        let _: &dyn std::error::Error = &err;
+        let _: &dyn core::error::Error = &err;
     }
 
     #[test]

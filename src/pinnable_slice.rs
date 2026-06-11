@@ -103,8 +103,8 @@ impl PinnableSlice {
     }
 }
 
-impl std::fmt::Debug for PinnableSlice {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Debug for PinnableSlice {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::Pinned { value, .. } => {
                 f.debug_struct("Pinned").field("len", &value.len()).finish()

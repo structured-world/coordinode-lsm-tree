@@ -2,12 +2,14 @@
 // Copyright (c) 2024-present, fjall-rs
 // Copyright (c) 2026-present, Structured World Foundation
 
+use crate::path::Path;
 use crate::{
     Cache, GlobalTableId, TreeId, UserValue,
     version::BlobFileList,
     vlog::{ValueHandle, blob_file::reader::Reader},
 };
-use std::path::Path;
+#[cfg(not(feature = "std"))]
+use alloc::string::ToString;
 
 pub struct Accessor<'a> {
     blob_files: &'a BlobFileList,

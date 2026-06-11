@@ -19,6 +19,9 @@ pub use restart_interval::RestartIntervalPolicy;
 /// Partitioning policy for indexes and filters
 pub type PartitioningPolicy = PinningPolicy;
 
+#[cfg(feature = "std")]
+use crate::fs::StdFs;
+use crate::path::{Path, PathBuf};
 use crate::{
     AnyTree, BlobTree, Cache, CompressionType, DescriptorTable, SequenceNumberCounter,
     SharedSequenceNumberGenerator, Tree,
@@ -26,17 +29,16 @@ use crate::{
     comparator::{self, SharedComparator},
     encryption::EncryptionProvider,
     file::TABLES_FOLDER,
-    fs::{Fs, StdFs, SyncMode},
+    fs::{Fs, SyncMode},
     merge_operator::MergeOperator,
     path::absolute_path,
     prefix::PrefixExtractor,
     version::DEFAULT_LEVEL_COUNT,
 };
-use std::{
-    ops::Range,
-    path::{Path, PathBuf},
-    sync::Arc,
-};
+use alloc::sync::Arc;
+#[cfg(not(feature = "std"))]
+use alloc::{boxed::Box, string::String, vec::Vec};
+use core::ops::Range;
 
 /// Per-level filesystem routing entry for tiered storage.
 ///
@@ -76,8 +78,8 @@ pub struct LevelRoute {
     pub fs: Arc<dyn Fs>,
 }
 
-impl std::fmt::Debug for LevelRoute {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Debug for LevelRoute {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("LevelRoute")
             .field("levels", &self.levels)
             .field("path", &self.path)
@@ -245,7 +247,7 @@ pub struct KvSeparationOptions {
     /// The `dict_id` in the compression type must match [`ZstdDictionary::id`](crate::ZstdDictionary::id).
     #[cfg(zstd_any)]
     #[doc(hidden)]
-    pub zstd_dictionary: Option<std::sync::Arc<crate::compression::ZstdDictionary>>,
+    pub zstd_dictionary: Option<alloc::sync::Arc<crate::compression::ZstdDictionary>>,
 }
 
 impl Default for KvSeparationOptions {
@@ -335,7 +337,10 @@ impl KvSeparationOptions {
     /// they disagree.
     #[cfg(zstd_any)]
     #[must_use]
-    pub fn dict(mut self, dictionary: std::sync::Arc<crate::compression::ZstdDictionary>) -> Self {
+    pub fn dict(
+        mut self,
+        dictionary: alloc::sync::Arc<crate::compression::ZstdDictionary>,
+    ) -> Self {
         self.zstd_dictionary = Some(dictionary);
         self
     }
@@ -569,7 +574,7 @@ pub struct Config {
     /// rollback paths (sibling output rollback, input restore) can be exercised
     /// deterministically. Behind `cfg(test)`, never compiled into release builds.
     #[cfg(all(test, feature = "std"))]
-    pub(crate) fail_one_subcompaction: Arc<std::sync::atomic::AtomicBool>,
+    pub(crate) fail_one_subcompaction: Arc<core::sync::atomic::AtomicBool>,
 
     /// Pre-trained zstd dictionary for dictionary compression.
     ///
@@ -594,6 +599,10 @@ pub struct Config {
 }
 
 // TODO: remove default?
+// std-only: the default backend is `StdFs` and the default path is resolved
+// via std::path::absolute. no_std callers construct `Config` explicitly with a
+// caller-provided `Fs`.
+#[cfg(feature = "std")]
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -691,13 +700,17 @@ impl Default for Config {
             #[cfg(feature = "std")]
             subcompaction_min_bytes: crate::compaction::worker::SUBCOMPACTION_MIN_INPUT_BYTES,
             #[cfg(all(test, feature = "std"))]
-            fail_one_subcompaction: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            fail_one_subcompaction: Arc::new(core::sync::atomic::AtomicBool::new(false)),
         }
     }
 }
 
 impl Config {
     /// Initializes a new config
+    // std-only: seeds the remaining fields from `Config::default`, whose
+    // default `Fs` is `StdFs`. no_std callers build `Config` field-by-field
+    // with a caller-provided `Fs`.
+    #[cfg(feature = "std")]
     pub fn new<P: AsRef<Path>>(
         path: P,
         seqno: SequenceNumberCounter,
@@ -852,6 +865,8 @@ impl Config {
     /// This is useful when the caller already has
     /// [`SharedSequenceNumberGenerator`] instances (e.g., from a higher-level
     /// database that shares generators across multiple trees).
+    // std-only: see [`Config::new`] — seeds via `Config::default` (`StdFs`).
+    #[cfg(feature = "std")]
     pub fn new_with_generators<P: AsRef<Path>>(
         path: P,
         seqno: SharedSequenceNumberGenerator,
@@ -870,7 +885,7 @@ impl Config {
 mod tests {
     use super::*;
     use crate::{CompressionType, SequenceNumberCounter, compression::ZstdDictionary};
-    use std::sync::Arc;
+    use alloc::sync::Arc;
 
     #[test]
     fn blob_zstd_dict_no_dict_is_rejected() {

@@ -16,13 +16,18 @@ use crate::{
 fn remove_if_present(fs: &dyn Fs, path: &Path) -> crate::Result<()> {
     match fs.remove_file(path) {
         Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) if e.kind() == crate::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e.into()),
     }
 }
+use alloc::collections::VecDeque;
+use alloc::sync::Arc;
+#[cfg(not(feature = "std"))]
+use alloc::vec::Vec;
 #[cfg(feature = "std")]
 use arc_swap::ArcSwap;
-use std::{collections::VecDeque, path::Path, sync::Arc};
+
+use crate::path::Path;
 
 /// A super version is a point-in-time snapshot of memtables and a [`Version`] (list of disk files)
 #[derive(Clone)]
@@ -176,7 +181,7 @@ impl SuperVersions {
                     let path = folder.join(format!("v{evicted_id}"));
                     match fs.remove_file(&path) {
                         Ok(()) => {}
-                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(e) if e.kind() == crate::io::ErrorKind::NotFound => {}
                         Err(e) => return Err(e.into()),
                     }
                 }
@@ -232,8 +237,8 @@ impl SuperVersions {
         seqno: &SharedSequenceNumberGenerator,
         visible_seqno: &SharedSequenceNumberGenerator,
         fs: &dyn Fs,
-        runtime: std::sync::Arc<crate::runtime_config::RuntimeConfig>,
-        encryption: Option<std::sync::Arc<dyn crate::encryption::EncryptionProvider>>,
+        runtime: Arc<crate::runtime_config::RuntimeConfig>,
+        encryption: Option<Arc<dyn crate::encryption::EncryptionProvider>>,
     ) -> crate::Result<()> {
         self.upgrade_version_with_seqno(
             tree_path,
@@ -265,8 +270,8 @@ impl SuperVersions {
         seqno: SeqNo,
         visible_seqno: &SharedSequenceNumberGenerator,
         fs: &dyn Fs,
-        runtime: std::sync::Arc<crate::runtime_config::RuntimeConfig>,
-        encryption: Option<std::sync::Arc<dyn crate::encryption::EncryptionProvider>>,
+        runtime: Arc<crate::runtime_config::RuntimeConfig>,
+        encryption: Option<Arc<dyn crate::encryption::EncryptionProvider>>,
     ) -> crate::Result<()> {
         let prior = self.latest_version();
         let mut next_version = f(&prior)?;
@@ -309,8 +314,8 @@ impl SuperVersions {
         prior: &Version,
         next: &Version,
         fs: &dyn Fs,
-        runtime: std::sync::Arc<crate::runtime_config::RuntimeConfig>,
-        encryption: Option<std::sync::Arc<dyn crate::encryption::EncryptionProvider>>,
+        runtime: Arc<crate::runtime_config::RuntimeConfig>,
+        encryption: Option<Arc<dyn crate::encryption::EncryptionProvider>>,
     ) -> crate::Result<()> {
         let log_path = tree_path.join(format!("edits-{}", self.snapshot_id));
 

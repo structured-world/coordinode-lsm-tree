@@ -2,14 +2,18 @@
 // Copyright (c) 2024-present, fjall-rs
 // Copyright (c) 2026-present, Structured World Foundation
 
+#[cfg(not(feature = "std"))]
+use crate::io::{Read, Write};
+#[cfg(not(feature = "std"))]
+use crate::io::{VarintReader, VarintWriter};
 use crate::{
     coding::{Decode, Encode},
     vlog::BlobFileId,
 };
-use std::{
-    hash::Hash,
-    io::{Read, Write},
-};
+use core::hash::Hash;
+#[cfg(feature = "std")]
+use std::io::{Read, Write};
+#[cfg(feature = "std")]
 use varint_rs::{VarintReader, VarintWriter};
 
 /// A value handle points into the value log

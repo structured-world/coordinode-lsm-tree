@@ -14,9 +14,11 @@ use crate::{
     CompressionType, checksum::ChecksummedWriter, encryption::EncryptionProvider,
     table::index_block::KeyedBlockHandle,
 };
-use std::sync::Arc;
+use alloc::sync::Arc;
+#[cfg(not(feature = "std"))]
+use alloc::{boxed::Box, string::String, vec::Vec};
 
-pub trait BlockIndexWriter<W: std::io::Write + std::io::Seek> {
+pub trait BlockIndexWriter<W: crate::io::Write + crate::io::Seek> {
     /// Registers a data block in the block index.
     fn register_data_block(&mut self, block_handle: KeyedBlockHandle) -> crate::Result<()>;
 

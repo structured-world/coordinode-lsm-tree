@@ -96,7 +96,7 @@ impl Params {
         if !(0.0 < fpr && fpr < 1.0) {
             return Err(ParamError::InvalidFalsePositiveRate { fpr });
         }
-        let r = (-fpr.log2()).ceil() as usize;
+        let r = crate::f64_ceil(-crate::f64_log2(fpr)) as usize;
         Ok(r.max(1))
     }
 
@@ -114,7 +114,7 @@ impl Params {
             return Err(ParamError::InvalidOverhead { overhead });
         }
 
-        let m = ((n as f64) * (1.0 + overhead)).ceil() as usize;
+        let m = crate::f64_ceil((n as f64) * (1.0 + overhead)) as usize;
         Self::new(m.max(w), w, r, mode)
     }
 

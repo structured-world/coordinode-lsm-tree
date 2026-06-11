@@ -10,10 +10,11 @@ mod slice_bytes;
 #[cfg(not(feature = "bytes_1"))]
 mod slice_default;
 
-use std::{
-    path::{Path, PathBuf},
-    sync::Arc,
-};
+use alloc::sync::Arc;
+#[cfg(not(feature = "std"))]
+use alloc::{boxed::Box, string::String, vec::Vec};
+
+use crate::path::{Path, PathBuf};
 
 #[cfg(not(feature = "bytes_1"))]
 pub use slice_default::{Builder, Slice};
@@ -67,13 +68,29 @@ impl From<&String> for Slice {
 
 impl From<&Path> for Slice {
     fn from(value: &Path) -> Self {
-        Self::from(value.as_os_str().as_encoded_bytes())
+        // std: `OsStr::as_encoded_bytes`. no_std: the key is UTF-8, so
+        // `as_os_str()` is a `&str` and `as_bytes()` yields the same bytes.
+        #[cfg(feature = "std")]
+        {
+            Self::from(value.as_os_str().as_encoded_bytes())
+        }
+        #[cfg(not(feature = "std"))]
+        {
+            Self::from(value.as_os_str().as_bytes())
+        }
     }
 }
 
 impl From<PathBuf> for Slice {
     fn from(value: PathBuf) -> Self {
-        Self::from(value.as_os_str().as_encoded_bytes())
+        #[cfg(feature = "std")]
+        {
+            Self::from(value.as_os_str().as_encoded_bytes())
+        }
+        #[cfg(not(feature = "std"))]
+        {
+            Self::from(value.as_os_str().as_bytes())
+        }
     }
 }
 
@@ -104,7 +121,7 @@ impl FromIterator<u8> for Slice {
     }
 }
 
-impl std::ops::Deref for Slice {
+impl core::ops::Deref for Slice {
     type Target = [u8];
 
     fn deref(&self) -> &Self::Target {
@@ -112,7 +129,7 @@ impl std::ops::Deref for Slice {
     }
 }
 
-impl std::borrow::Borrow<[u8]> for Slice {
+impl core::borrow::Borrow<[u8]> for Slice {
     fn borrow(&self) -> &[u8] {
         self
     }
@@ -137,13 +154,13 @@ impl<T> PartialOrd<T> for Slice
 where
     T: AsRef<[u8]>,
 {
-    fn partial_cmp(&self, other: &T) -> Option<std::cmp::Ordering> {
+    fn partial_cmp(&self, other: &T) -> Option<core::cmp::Ordering> {
         self.as_ref().partial_cmp(other.as_ref())
     }
 }
 
 impl PartialOrd<Slice> for &[u8] {
-    fn partial_cmp(&self, other: &Slice) -> Option<std::cmp::Ordering> {
+    fn partial_cmp(&self, other: &Slice) -> Option<core::cmp::Ordering> {
         (*self).partial_cmp(other.as_ref())
     }
 }

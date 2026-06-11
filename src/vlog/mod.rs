@@ -13,16 +13,17 @@ pub use {
     blob_file::scanner::Scanner as BlobFileScanner, handle::ValueHandle,
 };
 
+use crate::path::{Path, PathBuf};
 use crate::{
     Checksum, DescriptorTable, TreeId,
     file_accessor::FileAccessor,
     fs::Fs,
     vlog::blob_file::{Inner as BlobFileInner, Metadata},
 };
-use std::{
-    path::{Path, PathBuf},
-    sync::{Arc, atomic::AtomicBool},
-};
+use alloc::sync::Arc;
+#[cfg(not(feature = "std"))]
+use alloc::{boxed::Box, string::String, vec::Vec};
+use core::sync::atomic::AtomicBool;
 
 pub fn recover_blob_files(
     folder: &Path,
@@ -37,7 +38,7 @@ pub fn recover_blob_files(
     // is missing, that is unrecoverable corruption — fail fast.
     let entries = match fs.read_dir(folder) {
         Ok(entries) => entries,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+        Err(e) if e.kind() == crate::io::ErrorKind::NotFound => {
             if ids.is_empty() {
                 return Ok((vec![], vec![]));
             }

@@ -9,15 +9,16 @@ pub mod reader;
 pub mod scanner;
 pub mod writer;
 
+use crate::path::{Path, PathBuf};
 use crate::{
     Checksum, GlobalTableId, TreeId, blob_tree::FragmentationMap, deletion_pause::DeletionPause,
     file_accessor::FileAccessor, fs::Fs, vlog::BlobFileId,
 };
+#[cfg(not(feature = "std"))]
+use alloc::boxed::Box;
+use alloc::sync::Arc;
+use core::sync::atomic::AtomicBool;
 pub use meta::Metadata;
-use std::{
-    path::{Path, PathBuf},
-    sync::{Arc, atomic::AtomicBool},
-};
 
 /// A blob file is an immutable, sorted, contiguous file that contains large key-value pairs (blobs)
 //
@@ -86,7 +87,7 @@ impl core::fmt::Debug for Inner {
             .field("path", &self.path)
             .field(
                 "is_deleted",
-                &self.is_deleted.load(std::sync::atomic::Ordering::Relaxed),
+                &self.is_deleted.load(core::sync::atomic::Ordering::Relaxed),
             )
             .field("meta", &self.meta)
             .finish_non_exhaustive()
@@ -95,7 +96,7 @@ impl core::fmt::Debug for Inner {
 
 impl Drop for Inner {
     fn drop(&mut self) {
-        if self.is_deleted.load(std::sync::atomic::Ordering::Acquire) {
+        if self.is_deleted.load(core::sync::atomic::Ordering::Acquire) {
             log::trace!(
                 "Cleanup deleted blob file {:?} at {}",
                 self.id,
@@ -111,7 +112,7 @@ impl Drop for Inner {
             // table::Inner::drop. Eviction from the descriptor table
             // happens through the same accessor before the drop.
             let global_id = self.global_id();
-            let file_accessor = std::mem::replace(&mut self.file_accessor, FileAccessor::Closed);
+            let file_accessor = core::mem::replace(&mut self.file_accessor, FileAccessor::Closed);
             file_accessor
                 .as_descriptor_table()
                 .inspect(|d| d.remove_for_blob_file(&global_id));
@@ -185,8 +186,8 @@ impl PartialEq for BlobFile {
     }
 }
 
-impl std::hash::Hash for BlobFile {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+impl core::hash::Hash for BlobFile {
+    fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
         self.id().hash(state);
     }
 }
@@ -195,7 +196,7 @@ impl BlobFile {
     pub(crate) fn mark_as_deleted(&self) {
         self.0
             .is_deleted
-            .store(true, std::sync::atomic::Ordering::Release);
+            .store(true, core::sync::atomic::Ordering::Release);
     }
 
     /// Installs the tree-wide deletion pause used by checkpoints.

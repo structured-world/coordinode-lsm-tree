@@ -16,12 +16,12 @@
 
 use super::{Fs, FsDirEntry, FsFile, FsMetadata, FsOpenOptions};
 use crate::HashMap;
+use core::sync::atomic::AtomicU64;
 use io_uring::{IoUring, opcode, types};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::unix::io::AsRawFd;
 use std::path::Path;
-use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 

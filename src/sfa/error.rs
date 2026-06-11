@@ -8,7 +8,7 @@ use crate::sfa::checksum::Checksum;
 #[derive(Debug)]
 pub enum Error {
     /// IO error
-    Io(std::io::Error),
+    Io(crate::io::Error),
 
     /// Invalid header
     InvalidHeader,
@@ -29,20 +29,30 @@ pub enum Error {
     },
 }
 
-impl std::fmt::Display for Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for Error {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(f, "SfaError: {self:?}")
     }
 }
 
-impl From<std::io::Error> for Error {
-    fn from(inner: std::io::Error) -> Self {
+impl From<crate::io::Error> for Error {
+    fn from(inner: crate::io::Error) -> Self {
         Self::Io(inner)
     }
 }
 
-impl std::error::Error for Error {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+// Std file-I/O paths (the archive reader/writer over `std::fs`) surface
+// `std::io::Error`; bridge it through `crate::io::Error` so `?` keeps working
+// in those call sites.
+#[cfg(feature = "std")]
+impl From<std::io::Error> for Error {
+    fn from(inner: std::io::Error) -> Self {
+        Self::Io(inner.into())
+    }
+}
+
+impl core::error::Error for Error {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
         match self {
             Self::Io(inner) => Some(inner),
             _ => None,

@@ -13,14 +13,25 @@ use super::block::{
     Block, Decodable, Decoder, Encodable, Encoder, ParsedItem, TRAILER_START_MARKER, Trailer,
     binary_index::Reader as BinaryIndexReader, hash_index::Reader as HashIndexReader,
 };
+use crate::io::Cursor;
+use crate::io::WriteBytesExt;
+use crate::io::{LittleEndian, ReadBytesExt};
 use crate::key::InternalKey;
 use crate::table::block::hash_index::{MARKER_CONFLICT, MARKER_FREE};
 use crate::table::util::{SliceIndexes, compare_prefixed_slice};
 use crate::{InternalValue, SeqNo, Slice, ValueType};
-use byteorder::WriteBytesExt;
-use byteorder::{LittleEndian, ReadBytesExt};
-use std::io::Cursor;
+#[cfg(not(feature = "std"))]
+use alloc::{boxed::Box, string::String, vec::Vec};
+// `Seek` resolves to std under `std` (so `seek_relative` on `Cursor` comes
+// from `std::io::Seek`) and to the native trait under `no_std`; written bare
+// so the `seek_relative` calls below track whichever is imported.
+#[cfg(not(feature = "std"))]
+use crate::io::Seek;
+#[cfg(not(feature = "std"))]
+use crate::io::{VarintReader, VarintWriter};
+#[cfg(feature = "std")]
 use std::io::Seek;
+#[cfg(feature = "std")]
 use varint_rs::{VarintReader, VarintWriter};
 
 impl Decodable<DataBlockParsedItem> for InternalValue {
@@ -235,7 +246,7 @@ impl Decodable<DataBlockParsedItem> for InternalValue {
 }
 
 impl Encodable<()> for InternalValue {
-    fn encode_full_into<W: std::io::Write>(
+    fn encode_full_into<W: crate::io::Write>(
         &self,
         writer: &mut W,
         _state: &mut (),
@@ -261,7 +272,7 @@ impl Encodable<()> for InternalValue {
         Ok(())
     }
 
-    fn encode_truncated_into<W: std::io::Write>(
+    fn encode_truncated_into<W: crate::io::Write>(
         &self,
         writer: &mut W,
         _state: &mut (),
@@ -326,7 +337,7 @@ impl ParsedItem<InternalValue> for DataBlockParsedItem {
         needle: &[u8],
         bytes: &[u8],
         cmp: &dyn crate::comparator::UserComparator,
-    ) -> std::cmp::Ordering {
+    ) -> core::cmp::Ordering {
         // SAFETY: slice indexes come from the block parser which validates them
         // during decoding. The block format guarantees they are within bounds.
         if let Some(prefix) = &self.prefix {
@@ -466,7 +477,7 @@ impl DataBlock {
     }
 
     pub(crate) fn get_binary_index_reader(&self) -> BinaryIndexReader<'_> {
-        use std::mem::size_of;
+        use core::mem::size_of;
 
         let trailer = Trailer::new(&self.inner);
 
@@ -495,7 +506,7 @@ impl DataBlock {
 
     #[must_use]
     pub fn get_hash_index_reader(&self) -> Option<HashIndexReader<'_>> {
-        use std::mem::size_of;
+        use core::mem::size_of;
 
         let trailer = Trailer::new(&self.inner);
 
@@ -588,14 +599,14 @@ impl DataBlock {
         // Linear scan
         for item in iter {
             match item.compare_key(needle, &self.inner.data, comparator.as_ref()) {
-                std::cmp::Ordering::Greater => {
+                core::cmp::Ordering::Greater => {
                     // We are past our searched key
                     return Ok(None);
                 }
-                std::cmp::Ordering::Equal => {
+                core::cmp::Ordering::Equal => {
                     // If key is same as needle, check sequence number
                 }
-                std::cmp::Ordering::Less => {
+                core::cmp::Ordering::Less => {
                     // We are before our searched key
                     continue;
                 }
@@ -655,7 +666,7 @@ impl DataBlock {
     /// The number of pointers is equal to the number of restart intervals.
     #[must_use]
     pub fn binary_index_len(&self) -> u32 {
-        use std::mem::size_of;
+        use core::mem::size_of;
 
         let trailer = Trailer::new(&self.inner);
 
@@ -874,6 +885,7 @@ impl DataBlock {
 mod tests {
     use super::DataBlockParsedItem;
     use crate::comparator::default_comparator;
+    use crate::io::ReadBytesExt;
     use crate::{
         InternalValue, SeqNo, Slice,
         ValueType::{Tombstone, Value},
@@ -882,7 +894,6 @@ mod tests {
             block::{BlockType, Decodable, Encodable, Header, ParsedItem},
         },
     };
-    use byteorder::ReadBytesExt;
     use std::io::{Cursor, Seek};
     use test_log::test;
     use varint_rs::VarintReader;

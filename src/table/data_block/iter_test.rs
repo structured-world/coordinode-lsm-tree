@@ -1329,8 +1329,8 @@ mod tests {
                 block::{BlockType, Header, ParsedItem},
             },
         };
+        use core::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
         use std::sync::Arc;
-        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
         struct CountingComparator {
             /// Counts `compare()` invocations — proves the lex devirt path

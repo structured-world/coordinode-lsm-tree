@@ -2,6 +2,10 @@
 // This source code is licensed under both the Apache 2.0 and MIT License
 // (found in the LICENSE-* files in the repository)
 
+#[cfg(not(feature = "std"))]
+use alloc::vec::Vec;
+
+use crate::io::{Seek, Write};
 use crate::sfa::{
     toc::{
         entry::{SectionName, TocEntry},
@@ -9,7 +13,6 @@ use crate::sfa::{
     },
     trailer::writer::TrailerWriter,
 };
-use std::io::{Seek, Write};
 
 /// Archive writer
 #[expect(
@@ -42,6 +45,10 @@ impl<W: Write + Seek> Writer<W> {
     }
 }
 
+// `crate::io::Write` is the std trait (via the std-mode supertrait blanket)
+// under `std` and the native trait under `no_std`; gated impls differ only in
+// the trait path and `Result` type.
+#[cfg(feature = "std")]
 impl<W: Write + Seek> std::io::Write for Writer<W> {
     fn flush(&mut self) -> std::io::Result<()> {
         self.writer.flush()
@@ -52,23 +59,34 @@ impl<W: Write + Seek> std::io::Write for Writer<W> {
     }
 }
 
+#[cfg(not(feature = "std"))]
+impl<W: Write + Seek> crate::io::Write for Writer<W> {
+    fn flush(&mut self) -> crate::io::Result<()> {
+        self.writer.flush()
+    }
+
+    fn write(&mut self, buf: &[u8]) -> crate::io::Result<usize> {
+        self.writer.write(buf)
+    }
+}
+
 impl<W: Write + Seek> Writer<W> {
     /// Starts the first named section.
     ///
     /// # Errors
     ///
     /// Returns error, if an IO error occurred.
-    pub fn start(&mut self, name: impl Into<SectionName>) -> std::io::Result<()> {
+    pub fn start(&mut self, name: impl Into<SectionName>) -> crate::io::Result<()> {
         self.append_toc_entry()?;
         self.section_name = name.into();
         Ok(())
     }
 
-    fn append_toc_entry(&mut self) -> std::io::Result<()> {
+    fn append_toc_entry(&mut self) -> crate::io::Result<()> {
         let file_pos = self.writer.stream_position()?;
 
         if file_pos > 0 {
-            let name = std::mem::take(&mut self.section_name);
+            let name = core::mem::take(&mut self.section_name);
             self.toc.push(TocEntry {
                 name,
                 pos: self.last_section_pos,

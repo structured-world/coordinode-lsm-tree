@@ -31,6 +31,8 @@ use crate::{
     version::Version,
     vlog::BlobFile,
 };
+#[cfg(not(feature = "std"))]
+use alloc::{boxed::Box, string::String, vec::Vec};
 use alloc::{sync::Arc, vec};
 use std::{
     io::{Read, Write},
@@ -69,9 +71,9 @@ pub fn prepare_target(target: &Path, include_blobs: bool, target_fs: &dyn Fs) ->
     // Atomic claim — fails with AlreadyExists if any other process /
     // thread / prior checkpoint already created the directory.
     target_fs.create_dir(target).map_err(|e| {
-        if e.kind() == std::io::ErrorKind::AlreadyExists {
-            std::io::Error::new(
-                std::io::ErrorKind::AlreadyExists,
+        if e.kind() == crate::io::ErrorKind::AlreadyExists {
+            crate::io::Error::new(
+                crate::io::ErrorKind::AlreadyExists,
                 format!(
                     "checkpoint target {} already exists; refusing to overwrite",
                     target.display(),
@@ -203,7 +205,7 @@ pub fn link_or_copy_cross_fs(
             // link itself.
             Ok(()) => return Ok(dst_fs.metadata(dst)?.len),
             Err(e)
-                if crate::fs::is_cross_device(&e) || e.kind() == std::io::ErrorKind::NotFound =>
+                if crate::fs::is_cross_device(&e) || e.kind() == crate::io::ErrorKind::NotFound =>
             {
                 // The link didn't take, for one of:
                 //   - cross-device (EXDEV / CrossesDevices) — src and dst
@@ -226,7 +228,7 @@ pub fn link_or_copy_cross_fs(
                     e.kind(),
                 );
             }
-            Err(e) => return Err(e),
+            Err(e) => return Err(e.into()),
         }
     } else {
         // Backends do not share a namespace (e.g. MemFs source vs
@@ -386,7 +388,7 @@ fn copy_metadata_file_optional(
     let src = src_root.join(file_name);
     let mut src_file = match src_fs.open(&src, &FsOpenOptions::new().read(true)) {
         Ok(f) => f,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) if e.kind() == crate::io::ErrorKind::NotFound => return Ok(()),
         Err(e) => return Err(e.into()),
     };
     let dst = target_root.join(file_name);
@@ -430,8 +432,8 @@ fn write_current_for_version(
 ) -> crate::Result<()> {
     use crate::checksum::ChecksumType;
     use crate::file::rewrite_atomic;
+    use crate::io::{LittleEndian, WriteBytesExt};
     use crate::manifest_blocks::{current_digest, reader::ManifestArchiveReader};
-    use byteorder::{LittleEndian, WriteBytesExt};
 
     let manifest_path = target_root.join(format!("v{version_id}"));
     // Open the freshly-written manifest through the same reader
@@ -663,7 +665,7 @@ pub fn run_checkpoint<T: AbstractTree>(
         .filter(|c| !matches!(c, std::path::Component::CurDir))
         .collect();
     if normalized_target.as_os_str().is_empty() {
-        return Err(crate::Error::Io(std::io::Error::new(
+        return Err(crate::Error::from(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "checkpoint target_root must name at least one path component",
         )));

@@ -3,7 +3,7 @@
 // Copyright (c) 2026-present, Structured World Foundation
 
 use crate::UserValue;
-use std::panic::RefUnwindSafe;
+use core::panic::RefUnwindSafe;
 
 /// A user-defined merge operator for commutative LSM operations.
 ///

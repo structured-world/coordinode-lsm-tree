@@ -3,7 +3,9 @@
 // Copyright (c) 2026-present, Structured World Foundation
 
 use crate::{Slice, UserKey};
-use std::ops::Bound;
+#[cfg(not(feature = "std"))]
+use alloc::{boxed::Box, string::String, vec::Vec};
+use core::ops::Bound;
 
 /// A key range in the format of [min, max] (inclusive on both sides)
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -80,8 +82,8 @@ impl KeyRange {
     ) -> bool {
         let (start1, end1) = self.as_tuple();
         let (start2, end2) = other.as_tuple();
-        cmp.compare(start1, start2) != std::cmp::Ordering::Greater
-            && cmp.compare(end1, end2) != std::cmp::Ordering::Less
+        cmp.compare(start1, start2) != core::cmp::Ordering::Greater
+            && cmp.compare(end1, end2) != core::cmp::Ordering::Less
     }
 
     /// Returns `true` if the `other` overlaps at least partially with this range.
@@ -101,8 +103,8 @@ impl KeyRange {
     ) -> bool {
         let (start1, end1) = self.as_tuple();
         let (start2, end2) = other.as_tuple();
-        cmp.compare(end1, start2) != std::cmp::Ordering::Less
-            && cmp.compare(start1, end2) != std::cmp::Ordering::Greater
+        cmp.compare(end1, start2) != core::cmp::Ordering::Less
+            && cmp.compare(start1, end2) != core::cmp::Ordering::Greater
     }
 
     /// Like [`Self::overlaps_with_bounds`], but uses a custom comparator for key ordering.
@@ -112,7 +114,7 @@ impl KeyRange {
         bounds: &(Bound<&[u8]>, Bound<&[u8]>),
         cmp: &dyn crate::comparator::UserComparator,
     ) -> bool {
-        use std::cmp::Ordering;
+        use core::cmp::Ordering;
 
         let (lo, hi) = bounds;
         let (my_lo, my_hi) = self.as_tuple();
@@ -217,7 +219,7 @@ impl KeyRange {
                 debug_assert!(
                     prev_min
                         .as_ref()
-                        .is_none_or(|pm| cmp.compare(pm, r.min()) != std::cmp::Ordering::Greater),
+                        .is_none_or(|pm| cmp.compare(pm, r.min()) != core::cmp::Ordering::Greater),
                     "merge_sorted_cmp: input ranges must be sorted by min key in comparator order",
                 );
                 prev_min = Some(r.min().clone());
@@ -225,9 +227,9 @@ impl KeyRange {
 
             if let Some(last) = out.last_mut() {
                 // Ranges overlap or are adjacent when last.max >= r.min
-                if cmp.compare(last.max(), r.min()) != std::cmp::Ordering::Less {
+                if cmp.compare(last.max(), r.min()) != core::cmp::Ordering::Less {
                     // Extend the current interval if r.max is beyond last.max
-                    if cmp.compare(r.max(), last.max()) == std::cmp::Ordering::Greater {
+                    if cmp.compare(r.max(), last.max()) == core::cmp::Ordering::Greater {
                         last.1 = r.1;
                     }
                     continue;
@@ -277,12 +279,12 @@ impl KeyRange {
 
         for other in iter {
             let x = other.min();
-            if cmp.compare(x, min) == std::cmp::Ordering::Less {
+            if cmp.compare(x, min) == core::cmp::Ordering::Less {
                 min = x;
             }
 
             let x = other.max();
-            if cmp.compare(x, max) == std::cmp::Ordering::Greater {
+            if cmp.compare(x, max) == core::cmp::Ordering::Greater {
                 max = x;
             }
         }
@@ -388,7 +390,7 @@ mod tests {
 
     mod overlaps_with_bounds {
         use super::*;
-        use std::ops::Bound::{Excluded, Included, Unbounded};
+        use core::ops::Bound::{Excluded, Included, Unbounded};
         use test_log::test;
 
         #[test]
@@ -479,7 +481,7 @@ mod tests {
     mod overlaps_with_bounds_cmp {
         use super::*;
         use crate::comparator::UserComparator;
-        use std::ops::Bound::{Excluded, Included, Unbounded};
+        use core::ops::Bound::{Excluded, Included, Unbounded};
         use test_log::test;
 
         struct ReverseComparator;
@@ -489,7 +491,7 @@ mod tests {
                 "reverse"
             }
 
-            fn compare(&self, a: &[u8], b: &[u8]) -> std::cmp::Ordering {
+            fn compare(&self, a: &[u8], b: &[u8]) -> core::cmp::Ordering {
                 b.cmp(a)
             }
         }
@@ -670,7 +672,7 @@ mod tests {
                 fn name(&self) -> &'static str {
                     "reverse"
                 }
-                fn compare(&self, a: &[u8], b: &[u8]) -> std::cmp::Ordering {
+                fn compare(&self, a: &[u8], b: &[u8]) -> core::cmp::Ordering {
                     b.cmp(a)
                 }
             }

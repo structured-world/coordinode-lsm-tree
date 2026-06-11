@@ -2,7 +2,9 @@
 // Copyright (c) 2024-present, fjall-rs
 // Copyright (c) 2026-present, Structured World Foundation
 
-use std::sync::Arc;
+#[cfg(not(feature = "std"))]
+use alloc::boxed::Box;
+use alloc::sync::Arc;
 
 /// Trait for custom user key comparison.
 ///
@@ -37,7 +39,7 @@ use std::sync::Arc;
 ///
 /// ```
 /// use lsm_tree::UserComparator;
-/// use std::cmp::Ordering;
+/// use core::cmp::Ordering;
 ///
 /// /// Comparator that orders u64 keys stored as big-endian bytes.
 /// struct U64Comparator;
@@ -61,7 +63,7 @@ use std::sync::Arc;
 ///     }
 /// }
 /// ```
-pub trait UserComparator: Send + Sync + std::panic::RefUnwindSafe + 'static {
+pub trait UserComparator: Send + Sync + core::panic::RefUnwindSafe + 'static {
     /// Returns a stable identifier for this comparator.
     ///
     /// The name is persisted when a tree is first created. On subsequent
@@ -78,7 +80,7 @@ pub trait UserComparator: Send + Sync + std::panic::RefUnwindSafe + 'static {
     fn name(&self) -> &'static str;
 
     /// Compares two user keys, returning their ordering.
-    fn compare(&self, a: &[u8], b: &[u8]) -> std::cmp::Ordering;
+    fn compare(&self, a: &[u8], b: &[u8]) -> core::cmp::Ordering;
 
     /// Returns `true` if this comparator is lexicographic byte ordering.
     ///
@@ -103,7 +105,7 @@ impl UserComparator for DefaultUserComparator {
     }
 
     #[inline]
-    fn compare(&self, a: &[u8], b: &[u8]) -> std::cmp::Ordering {
+    fn compare(&self, a: &[u8], b: &[u8]) -> core::cmp::Ordering {
         a.cmp(b)
     }
 
@@ -129,7 +131,7 @@ impl<T: UserComparator + ?Sized> UserComparator for Arc<T> {
         (**self).name()
     }
     #[inline]
-    fn compare(&self, a: &[u8], b: &[u8]) -> std::cmp::Ordering {
+    fn compare(&self, a: &[u8], b: &[u8]) -> core::cmp::Ordering {
         (**self).compare(a, b)
     }
     #[inline]
@@ -148,10 +150,13 @@ pub const MAX_COMPARATOR_NAME_BYTES: usize = 256;
 /// Uses a shared static instance to avoid repeated allocations.
 #[must_use]
 pub fn default_comparator() -> SharedComparator {
-    // LazyLock creates the Arc once; subsequent calls just clone the Arc (ref-count bump).
-    static DEFAULT: std::sync::LazyLock<SharedComparator> =
-        std::sync::LazyLock::new(|| Arc::new(DefaultUserComparator));
-    DEFAULT.clone()
+    // OnceBox builds the Arc once; subsequent calls just clone it (ref-count
+    // bump). `once_cell::race::OnceBox` is lock-free (atomic pointer) and
+    // no_std + alloc, so this path is identical under std and no_std.
+    static DEFAULT: once_cell::race::OnceBox<SharedComparator> = once_cell::race::OnceBox::new();
+    DEFAULT
+        .get_or_init(|| Box::new(Arc::new(DefaultUserComparator)))
+        .clone()
 }
 
 #[cfg(test)]

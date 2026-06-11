@@ -51,9 +51,13 @@ use crate::{
     comparator::UserComparator,
     vlog::{BlobFile, BlobFileId},
 };
+use alloc::sync::Arc;
+#[cfg(not(feature = "std"))]
+use alloc::{boxed::Box, string::String, vec::Vec};
+use core::ops::Deref;
+
 use optimize::optimize_runs;
 use run::Ranged;
-use std::{ops::Deref, sync::Arc};
 
 /// Context threaded through [`Version`] transformation methods.
 ///
@@ -92,7 +96,7 @@ pub struct GenericLevel<T: Ranged> {
     runs: Vec<Arc<Run<T>>>,
 }
 
-impl<T: Ranged> std::ops::Deref for GenericLevel<T> {
+impl<T: Ranged> core::ops::Deref for GenericLevel<T> {
     type Target = [Arc<Run<T>>];
 
     fn deref(&self) -> &Self::Target {
@@ -129,7 +133,7 @@ impl<T: Ranged> GenericLevel<T> {
 #[derive(Clone)]
 pub struct Level(Arc<GenericLevel<Table>>);
 
-impl std::ops::Deref for Level {
+impl core::ops::Deref for Level {
     type Target = GenericLevel<Table>;
 
     fn deref(&self) -> &Self::Target {
@@ -244,7 +248,7 @@ pub struct Version {
     inner: Arc<VersionInner>,
 }
 
-impl std::ops::Deref for Version {
+impl core::ops::Deref for Version {
     type Target = VersionInner;
 
     fn deref(&self) -> &Self::Target {
@@ -730,7 +734,10 @@ impl Version {
         comparator_name: &str,
     ) -> Result<(), crate::Error> {
         use crate::FormatVersion;
-        use byteorder::{LittleEndian, WriteBytesExt};
+        #[cfg(not(feature = "std"))]
+        use crate::io::Write;
+        use crate::io::{LittleEndian, WriteBytesExt};
+        #[cfg(feature = "std")]
         use std::io::Write;
 
         //

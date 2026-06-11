@@ -33,8 +33,10 @@
 //! but draining ahead of compaction) is a planned refinement; this
 //! revision throttles compaction alone.
 
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::Ordering;
 use core::time::Duration;
+
+use portable_atomic::AtomicU64;
 
 use spin::Mutex;
 
@@ -189,6 +191,16 @@ impl RateLimiter {
             remaining = remaining.saturating_sub(chunk);
         }
         false
+    }
+
+    /// `no_std` variant: there is no ambient monotonic clock to throttle
+    /// against, so this never sleeps. It still honors the caller's stop signal
+    /// so a shutdown is observed promptly; rate limiting itself is a no-op.
+    // no-std: wire a caller-provided clock + `acquire_wait` poll loop to restore
+    // throttling.
+    #[cfg(not(feature = "std"))]
+    pub fn request_interruptible(&self, _bytes: u64, should_stop: impl Fn() -> bool) -> bool {
+        should_stop()
     }
 
     /// Maximum single sleep span inside

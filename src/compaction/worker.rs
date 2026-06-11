@@ -3,6 +3,8 @@
 // Copyright (c) 2026-present, Structured World Foundation
 
 use super::{CompactionAction, CompactionResult, CompactionStrategy, Input as CompactionPayload};
+use crate::time::Instant;
+use crate::tree::inner::{CompactionGuard, VersionsReadGuard};
 use crate::{
     BlobFile, Config, HashSet, InternalValue, SeqNo, SequenceNumberCounter,
     SharedSequenceNumberGenerator, Table, TableId, UserKey,
@@ -22,10 +24,14 @@ use crate::{
     version::{Run, SuperVersions, Version},
     vlog::{BlobFileMergeScanner, BlobFileScanner, BlobFileWriter},
 };
-use std::{
-    sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard},
-    time::Instant,
-};
+use alloc::sync::Arc;
+#[cfg(not(feature = "std"))]
+use alloc::{boxed::Box, string::String, vec::Vec};
+// no-std: spin mirrors parking_lot's Mutex/RwLock API without an allocator.
+#[cfg(feature = "std")]
+use parking_lot::{Mutex, RwLock};
+#[cfg(not(feature = "std"))]
+use spin::{Mutex, RwLock};
 
 #[cfg(feature = "metrics")]
 use crate::metrics::Metrics;
@@ -123,11 +129,9 @@ impl Options {
 ///
 /// This will block until the compactor is fully finished.
 pub fn do_compaction(opts: &Options) -> crate::Result<CompactionResult> {
-    #[expect(clippy::expect_used, reason = "lock is expected to not be poisoned")]
-    let compaction_state = opts.compaction_state.lock().expect("lock is poisoned");
+    let compaction_state = opts.compaction_state.lock();
 
-    #[expect(clippy::expect_used, reason = "lock is expected to not be poisoned")]
-    let version_history_lock = opts.version_history.read().expect("lock is poisoned");
+    let version_history_lock = opts.version_history.read();
 
     let start = Instant::now();
     log::trace!(
@@ -250,7 +254,7 @@ fn create_compaction_stream<'a>(
 fn create_bounded_compaction_stream<'a>(
     version: &'a Version,
     to_compact: &HashSet<TableId>,
-    bounds: (std::ops::Bound<UserKey>, std::ops::Bound<UserKey>),
+    bounds: (core::ops::Bound<UserKey>, core::ops::Bound<UserKey>),
     eviction_seqno: SeqNo,
     merge_operator: Option<Arc<dyn crate::merge_operator::MergeOperator>>,
     comparator: crate::comparator::SharedComparator,
@@ -333,8 +337,8 @@ fn range_tombstones_after_gc(
                 .any(|t| {
                     let kr = &t.metadata.key_range;
                     // [rt.start, rt.end) overlaps [kr.min, kr.max].
-                    cmp.compare(&rt.start, kr.max()) != std::cmp::Ordering::Greater
-                        && cmp.compare(kr.min(), &rt.end) == std::cmp::Ordering::Less
+                    cmp.compare(&rt.start, kr.max()) != core::cmp::Ordering::Greater
+                        && cmp.compare(kr.min(), &rt.end) == core::cmp::Ordering::Less
                 })
         })
         .cloned()
@@ -408,8 +412,8 @@ fn subcompaction_boundaries(
 #[cfg(feature = "std")]
 fn ranges_from_boundaries(
     boundaries: &[UserKey],
-) -> Vec<(std::ops::Bound<UserKey>, std::ops::Bound<UserKey>)> {
-    use std::ops::Bound::{Excluded, Included, Unbounded};
+) -> Vec<(core::ops::Bound<UserKey>, core::ops::Bound<UserKey>)> {
+    use core::ops::Bound::{Excluded, Included, Unbounded};
     let mut ranges = Vec::with_capacity(boundaries.len() + 1);
     let mut lo = Unbounded;
     for b in boundaries {
@@ -425,8 +429,8 @@ fn ranges_from_boundaries(
 /// of committing a truncated sub-range.
 #[cfg(feature = "std")]
 fn cancelled_compaction() -> crate::Error {
-    crate::Error::Io(std::io::Error::new(
-        std::io::ErrorKind::Interrupted,
+    crate::Error::from(crate::io::Error::new(
+        crate::io::ErrorKind::Interrupted,
         "sub-compaction cancelled by stop signal",
     ))
 }
@@ -452,7 +456,7 @@ fn run_subcompaction(
     version: &Version,
     tables_for_deletion: Vec<Table>,
     input_range_tombstones: &[crate::range_tombstone::RangeTombstone],
-    bounds: (std::ops::Bound<UserKey>, std::ops::Bound<UserKey>),
+    bounds: (core::ops::Bound<UserKey>, core::ops::Bound<UserKey>),
     dst_lvl: usize,
     is_last_level: bool,
     blobs_folder: &std::path::Path,
@@ -487,7 +491,7 @@ fn run_subcompaction(
         // the source tables (this range may own input deletion) while producing
         // no replacement SSTs. Returning an error makes the parallel caller
         // re-show the inputs and skip the install entirely.
-        return Err(crate::Error::Io(std::io::Error::other(
+        return Err(crate::Error::from(crate::io::Error::other(
             "sub-compaction input tables disappeared mid-flight",
         )));
     };
@@ -618,12 +622,11 @@ fn run_subcompaction(
     reason = "version_history_lock must be held across upgrade_version and maintenance"
 )]
 fn move_tables(
-    compaction_state: &MutexGuard<'_, CompactionState>,
+    compaction_state: &CompactionGuard<'_>,
     opts: &Options,
     payload: &CompactionPayload,
 ) -> crate::Result<CompactionResult> {
-    #[expect(clippy::expect_used, reason = "lock is expected to not be poisoned")]
-    let mut version_history_lock = opts.version_history.write().expect("lock is poisoned");
+    let mut version_history_lock = opts.version_history.write();
 
     // Fail-safe for buggy compaction strategies
     if compaction_state
@@ -766,8 +769,7 @@ fn hidden_guard<T>(
         log::error!("Compaction failed: {e:?}");
 
         // IMPORTANT: We need to show tables again on error
-        #[expect(clippy::expect_used, reason = "lock is expected to not be poisoned")]
-        let mut compaction_state = opts.compaction_state.lock().expect("lock is poisoned");
+        let mut compaction_state = opts.compaction_state.lock();
 
         compaction_state
             .hidden_set_mut()
@@ -777,8 +779,8 @@ fn hidden_guard<T>(
 
 #[expect(clippy::too_many_lines)]
 fn merge_tables(
-    mut compaction_state: MutexGuard<'_, CompactionState>,
-    version_history_lock: RwLockReadGuard<'_, SuperVersions>,
+    mut compaction_state: CompactionGuard<'_>,
+    version_history_lock: VersionsReadGuard<'_>,
     opts: &Options,
     payload: &CompactionPayload,
 ) -> crate::Result<CompactionResult> {
@@ -939,7 +941,7 @@ fn merge_tables(
                             slot.unwrap_or_else(|| {
                                 // A worker panicked before sending: treat as a
                                 // failed sub-compaction so install is skipped.
-                                Err(crate::Error::Io(std::io::Error::other(
+                                Err(crate::Error::from(crate::io::Error::other(
                                     "sub-compaction worker did not report a result",
                                 )))
                             })
@@ -991,8 +993,7 @@ fn merge_tables(
                     done.rollback_uninstalled();
                 }
                 {
-                    #[expect(clippy::expect_used, reason = "lock is expected to not be poisoned")]
-                    let mut state = opts.compaction_state.lock().expect("lock is poisoned");
+                    let mut state = opts.compaction_state.lock();
                     state
                         .hidden_set_mut()
                         .show(payload.table_ids.iter().copied());
@@ -1002,10 +1003,8 @@ fn merge_tables(
             let outputs = committed;
 
             // Re-acquire locks and install one atomic version edit for all outputs.
-            #[expect(clippy::expect_used, reason = "lock is expected to not be poisoned")]
-            let mut compaction_state = opts.compaction_state.lock().expect("lock is poisoned");
-            #[expect(clippy::expect_used, reason = "lock is expected to not be poisoned")]
-            let mut version_history_lock = opts.version_history.write().expect("lock is poisoned");
+            let mut compaction_state = opts.compaction_state.lock();
+            let mut version_history_lock = opts.version_history.write();
 
             let tables_out =
                 super::flavour::install_merge(&mut version_history_lock, opts, payload, outputs)
@@ -1140,7 +1139,7 @@ fn merge_tables(
                 let scanner = BlobFileMergeScanner::new(
                     blob_files_to_rewrite
                         .iter()
-                        .map(|bf| BlobFileScanner::new(&bf.0.path, bf.id()))
+                        .map(|bf| BlobFileScanner::new(&bf.0.path, &*bf.0.fs, bf.id()))
                         .collect::<crate::Result<Vec<_>>>()?,
                 );
 
@@ -1265,12 +1264,10 @@ fn merge_tables(
         filter.finish();
     }
 
-    #[expect(clippy::expect_used, reason = "lock is expected to not be poisoned")]
-    let mut compaction_state = opts.compaction_state.lock().expect("lock is poisoned");
+    let mut compaction_state = opts.compaction_state.lock();
 
     log::trace!("Acquiring super version write lock");
-    #[expect(clippy::expect_used, reason = "lock is expected to not be poisoned")]
-    let mut version_history_lock = opts.version_history.write().expect("lock is poisoned");
+    let mut version_history_lock = opts.version_history.write();
     log::trace!("Acquired super version write lock");
 
     log::trace!("Blob fragmentation diff: {blob_frag_map:#?}");
@@ -1355,12 +1352,11 @@ fn merge_tables(
 }
 
 fn drop_tables(
-    compaction_state: MutexGuard<'_, CompactionState>,
+    compaction_state: CompactionGuard<'_>,
     opts: &Options,
     ids_to_drop: &[TableId],
 ) -> crate::Result<CompactionResult> {
-    #[expect(clippy::expect_used, reason = "lock is expected to not be poisoned")]
-    let mut version_history_lock = opts.version_history.write().expect("lock is poisoned");
+    let mut version_history_lock = opts.version_history.write();
 
     // Fail-safe for buggy compaction strategies
     if compaction_state
@@ -1474,7 +1470,7 @@ mod tests {
             "test-first-byte"
         }
 
-        fn compare(&self, a: &[u8], b: &[u8]) -> std::cmp::Ordering {
+        fn compare(&self, a: &[u8], b: &[u8]) -> core::cmp::Ordering {
             a.first().cmp(&b.first())
         }
     }
@@ -1512,7 +1508,7 @@ mod tests {
     #[cfg(feature = "parallel")]
     #[test]
     fn failed_subcompaction_rolls_back_and_restores_inputs() -> crate::Result<()> {
-        use std::sync::atomic::Ordering;
+        use core::sync::atomic::Ordering;
 
         const N: u64 = 4_000;
         let key = |i: u64| format!("key_{i:08}");

@@ -4,6 +4,8 @@
 
 #[cfg(feature = "metrics")]
 use crate::metrics::Metrics;
+#[cfg(not(feature = "std"))]
+use alloc::{boxed::Box, string::String, vec::Vec};
 
 use super::{
     block_index::BlockIndexImpl, block_layout::BlockLayoutMap, meta::ParsedMeta,
@@ -21,10 +23,11 @@ use crate::{
     table::{IndexBlock, filter::block::FilterBlock},
     tree::inner::TreeId,
 };
-use std::{
-    path::PathBuf,
-    sync::{Arc, OnceLock, atomic::AtomicBool},
-};
+use alloc::sync::Arc;
+use core::sync::atomic::AtomicBool;
+
+use crate::path::PathBuf;
+use portable_atomic::AtomicU64;
 
 pub struct Inner {
     pub path: Arc<PathBuf>,
@@ -76,8 +79,13 @@ pub struct Inner {
     pub(crate) metrics: Arc<Metrics>,
 
     /// Cached sum of referenced blob file bytes for this table.
-    /// Lazily computed on first access to avoid repeated I/O in compaction decisions.
-    pub(crate) cached_blob_bytes: OnceLock<u64>,
+    ///
+    /// Lazily computed on first access to avoid repeated I/O in compaction
+    /// decisions. `u64::MAX` is the "not yet computed" sentinel (a real sum
+    /// can never reach 18 EiB), so a single relaxed-ordered load resolves a
+    /// cache hit without a separate init flag. Concurrent computers race to
+    /// the same value, so the store is idempotent.
+    pub(crate) cached_blob_bytes: AtomicU64,
 
     /// Range tombstones stored in this table. Loaded on open.
     pub(crate) range_tombstones: Vec<RangeTombstone>,
@@ -156,16 +164,16 @@ impl Drop for Inner {
     fn drop(&mut self) {
         let global_id = self.global_id();
 
-        if self.is_deleted.load(std::sync::atomic::Ordering::Acquire) {
+        if self.is_deleted.load(core::sync::atomic::Ordering::Acquire) {
             log::trace!("Cleanup deleted table {global_id:?} at {:?}", self.path);
 
             // Move the accessor and block index out so all file handles
             // (including clones held by the block index) are closed before
             // attempting deletion. On Windows, remove_file fails while any
             // handle is open.
-            let file_accessor = std::mem::replace(&mut self.file_accessor, FileAccessor::Closed);
+            let file_accessor = core::mem::replace(&mut self.file_accessor, FileAccessor::Closed);
             let block_index =
-                std::mem::replace(&mut self.block_index, Arc::new(BlockIndexImpl::Closed));
+                core::mem::replace(&mut self.block_index, Arc::new(BlockIndexImpl::Closed));
 
             // Evict cached FD from the descriptor table.
             file_accessor.as_descriptor_table().inspect(|d| {
