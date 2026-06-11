@@ -22,7 +22,7 @@
 use crate::InternalValue;
 use crate::comparator::SharedComparator;
 #[cfg(not(feature = "std"))]
-use alloc::{boxed::Box, string::String, vec::Vec};
+use alloc::vec::Vec;
 use core::cmp::Ordering;
 
 /// A single entry in the merge heap.

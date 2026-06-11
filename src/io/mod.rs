@@ -748,6 +748,15 @@ pub trait VarintReader: Read {
             if shift >= 64 {
                 return Err(Error::new(ErrorKind::InvalidData, "varint overflows u64"));
             }
+            // 10th byte (shift == 63): only bit 0 fits in u64. Any higher bit
+            // set is a non-canonical / overflowing encoding — reject it rather
+            // than silently shifting those bits away.
+            if shift == 63 && byte[0] & 0xFE != 0 {
+                return Err(Error::new(
+                    ErrorKind::InvalidData,
+                    "non-canonical varint overflow",
+                ));
+            }
             result |= (u64::from(byte[0] & 0x7f)) << shift;
             if byte[0] & 0x80 == 0 {
                 return Ok(result);

@@ -14,7 +14,7 @@ use super::Version;
 use super::edit::{AddedBlobFile, ChangedLevel, TableDesc, VersionEdit};
 use crate::coding::Encode;
 #[cfg(not(feature = "std"))]
-use alloc::{boxed::Box, string::String, vec::Vec};
+use alloc::vec::Vec;
 
 impl Version {
     /// Computes the edit that turns `prior` into `self`.

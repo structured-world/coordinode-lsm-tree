@@ -4,7 +4,7 @@
 
 use crate::io::{Read, Write};
 #[cfg(not(feature = "std"))]
-use alloc::{boxed::Box, string::String, vec::Vec};
+use alloc::vec::Vec;
 
 /// Trait to serialize stuff
 pub trait Encode {

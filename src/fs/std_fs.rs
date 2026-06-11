@@ -31,7 +31,7 @@ fn normal_fsync(file: &File) -> io::Result<()> {
 #[cfg(not(target_os = "macos"))]
 fn normal_fsync(file: &File) -> io::Result<()> {
     // No `F_FULLFSYNC` distinction off macOS - `sync_all` is plain `fsync`.
-    File::sync_all(file)
+    File::sync_all(file).map_err(io::Error::from)
 }
 
 /// Default [`Fs`] implementation backed by [`std::fs`].
@@ -379,7 +379,7 @@ impl Fs for StdFs {
             Err(e) if linux_caps::clone_should_fall_back(&e) => {
                 super::copy_file_streamed(self, src, dst)
             }
-            Err(e) => Err(e),
+            Err(e) => Err(e.into()),
         }
     }
 
@@ -391,7 +391,7 @@ impl Fs for StdFs {
     /// filesystems that do not support the inode-flags ioctl.
     #[cfg(target_os = "linux")]
     fn try_disable_cow(&self, path: &Path) -> io::Result<()> {
-        linux_caps::try_disable_cow(path)
+        linux_caps::try_disable_cow(path).map_err(io::Error::from)
     }
 }
 

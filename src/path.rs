@@ -25,9 +25,11 @@ pub use std::path::{Path, PathBuf};
 #[cfg(feature = "std")]
 #[must_use]
 pub fn absolute_path(path: &Path) -> PathBuf {
-    // Not sure if this can even fail realistically
-    #[expect(clippy::expect_used, reason = "not much we can do about it")]
-    std::path::absolute(path).expect("should be absolute path")
+    // `std::path::absolute` only fails on a degenerate input (e.g. an empty
+    // path). Rather than abort the process, fall back to the path as given so
+    // a caller-supplied path can never trigger a panic; an already-relative
+    // path simply stays relative, which the caller resolves against its cwd.
+    std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 #[cfg(not(feature = "std"))]
@@ -149,6 +151,10 @@ mod nostd {
             }
             self.inner
                 .strip_prefix(base)
+                // Match only on a component boundary: "tables" must not strip
+                // the prefix of "tables10". The remainder is either empty
+                // (exact match) or begins with the `/` separator.
+                .filter(|rest| rest.is_empty() || rest.starts_with('/'))
                 .map(|rest| Self::new(rest.trim_start_matches('/')))
                 .ok_or(StripPrefixError(()))
         }

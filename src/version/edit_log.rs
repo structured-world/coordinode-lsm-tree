@@ -19,7 +19,7 @@
 use super::edit::{VersionEdit, replay_edits};
 use crate::fs::{Fs, FsOpenOptions, SyncMode};
 #[cfg(not(feature = "std"))]
-use alloc::{boxed::Box, string::String, vec::Vec};
+use alloc::vec::Vec;
 
 #[cfg(not(feature = "std"))]
 use crate::io::{Seek, SeekFrom};

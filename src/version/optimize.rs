@@ -6,7 +6,7 @@ use super::run::Ranged;
 use crate::comparator::UserComparator;
 use crate::version::Run;
 #[cfg(not(feature = "std"))]
-use alloc::{boxed::Box, string::String, vec::Vec};
+use alloc::vec::Vec;
 
 pub fn optimize_runs<T: Clone + Ranged>(
     runs: Vec<Run<T>>,

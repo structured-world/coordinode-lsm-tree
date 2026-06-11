@@ -35,7 +35,7 @@ use crate::{
 };
 use alloc::sync::Arc;
 #[cfg(not(feature = "std"))]
-use alloc::{boxed::Box, string::String, vec::Vec};
+use alloc::{boxed::Box, vec::Vec};
 use index::BlockIndexWriter;
 
 use crate::io::BufWriter;

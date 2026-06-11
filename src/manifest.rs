@@ -8,9 +8,7 @@ use crate::{
 #[cfg(not(feature = "std"))]
 use alloc::{
     borrow::ToOwned,
-    boxed::Box,
     string::{String, ToString},
-    vec::Vec,
 };
 
 pub struct Manifest {

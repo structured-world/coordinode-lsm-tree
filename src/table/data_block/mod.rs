@@ -21,7 +21,7 @@ use crate::table::block::hash_index::{MARKER_CONFLICT, MARKER_FREE};
 use crate::table::util::{SliceIndexes, compare_prefixed_slice};
 use crate::{InternalValue, SeqNo, Slice, ValueType};
 #[cfg(not(feature = "std"))]
-use alloc::{boxed::Box, string::String, vec::Vec};
+use alloc::vec::Vec;
 // `Seek` resolves to std under `std` (so `seek_relative` on `Cursor` comes
 // from `std::io::Seek`) and to the native trait under `no_std`; written bare
 // so the `seek_relative` calls below track whichever is imported.

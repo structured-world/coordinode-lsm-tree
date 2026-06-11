@@ -11,7 +11,7 @@ use crate::range_tombstone::CoveringRt;
 use crate::range_tombstone::RangeTombstone;
 use crate::{SeqNo, UserKey, comparator::SharedComparator};
 #[cfg(not(feature = "std"))]
-use alloc::{boxed::Box, string::String, vec::Vec};
+use alloc::{boxed::Box, vec::Vec};
 use core::cmp::Ordering;
 
 /// An AVL-balanced BST keyed by range tombstone `start`, augmented with

@@ -13,7 +13,7 @@ use crate::{
     vlog::BlobFileId,
 };
 #[cfg(not(feature = "std"))]
-use alloc::{boxed::Box, string::String, vec::Vec};
+use alloc::vec::Vec;
 
 use crate::path::Path;
 

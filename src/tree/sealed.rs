@@ -5,7 +5,7 @@
 use crate::{Memtable, tree::inner::MemtableId};
 use alloc::sync::Arc;
 #[cfg(not(feature = "std"))]
-use alloc::{boxed::Box, string::String, vec::Vec};
+use alloc::vec::Vec;
 
 /// Stores references to all sealed memtables
 ///

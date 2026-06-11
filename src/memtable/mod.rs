@@ -15,7 +15,7 @@ use crate::{
     value::{InternalValue, SeqNo},
 };
 #[cfg(not(feature = "std"))]
-use alloc::{boxed::Box, string::String, vec::Vec};
+use alloc::vec::Vec;
 use core::ops::RangeBounds;
 use core::sync::atomic::AtomicBool;
 use portable_atomic::AtomicU64;

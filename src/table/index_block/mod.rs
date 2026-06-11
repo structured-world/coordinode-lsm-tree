@@ -22,7 +22,7 @@ use crate::{
     },
 };
 #[cfg(not(feature = "std"))]
-use alloc::{boxed::Box, string::String, vec::Vec};
+use alloc::vec::Vec;
 
 #[derive(Debug)]
 pub struct IndexBlockParsedItem {

@@ -63,7 +63,7 @@ use crate::io::Write;
 use crate::io::{LittleEndian, WriteBytesExt};
 use crate::manifest_blocks::footer::{FooterPayload, TocEntry};
 #[cfg(not(feature = "std"))]
-use alloc::{boxed::Box, string::String, vec::Vec};
+use alloc::vec::Vec;
 #[cfg(feature = "std")]
 use std::io::Write;
 

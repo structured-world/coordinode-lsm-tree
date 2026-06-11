@@ -68,7 +68,7 @@
 
 use crate::io::{LittleEndian, ReadBytesExt, WriteBytesExt};
 #[cfg(not(feature = "std"))]
-use alloc::{boxed::Box, string::String, vec::Vec};
+use alloc::vec::Vec;
 
 use crate::io::{Read, Write};
 

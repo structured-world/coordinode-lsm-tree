@@ -4,7 +4,7 @@
 
 use crate::{Checksum, CompressionType};
 #[cfg(not(feature = "std"))]
-use alloc::{boxed::Box, string::String, vec::Vec};
+use alloc::string::String;
 
 /// Represents errors that can occur in the LSM-tree
 #[derive(Debug)]

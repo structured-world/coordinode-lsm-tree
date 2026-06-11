@@ -8,7 +8,7 @@ use crate::range_tombstone::RangeTombstone;
 use crate::{InternalValue, SeqNo, UserKey, UserValue, ValueType, comparator::SharedComparator};
 use alloc::sync::Arc;
 #[cfg(not(feature = "std"))]
-use alloc::{boxed::Box, string::String, vec::Vec};
+use alloc::vec::Vec;
 
 /// Consumes a stream of KVs and emits a new stream according to MVCC and tombstone rules
 ///

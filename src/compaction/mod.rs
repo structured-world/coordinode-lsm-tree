@@ -45,7 +45,7 @@ use crate::{
     HashSet, KvPair, TableId, compaction::state::CompactionState, config::Config, version::Version,
 };
 #[cfg(not(feature = "std"))]
-use alloc::{boxed::Box, string::String, vec::Vec};
+use alloc::vec::Vec;
 
 /// The action taken during a compaction run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

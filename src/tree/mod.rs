@@ -28,11 +28,7 @@ use crate::{
 };
 use alloc::sync::Arc;
 #[cfg(not(feature = "std"))]
-use alloc::{
-    boxed::Box,
-    string::{String, ToString},
-    vec::Vec,
-};
+use alloc::{boxed::Box, string::ToString, vec::Vec};
 use core::ops::{Bound, RangeBounds};
 use inner::{FlushGuard, TreeId, TreeInner, VersionsWriteGuard};
 // no-std: spin mirrors parking_lot's Mutex/RwLock API without an allocator.

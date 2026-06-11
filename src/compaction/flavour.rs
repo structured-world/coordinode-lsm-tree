@@ -15,11 +15,7 @@ use crate::vlog::blob_file::scanner::ScanEntry;
 use crate::vlog::{BlobFileId, BlobFileMergeScanner, BlobFileWriter};
 use crate::{BlobFile, HashSet, InternalValue, Table};
 #[cfg(not(feature = "std"))]
-use alloc::{
-    boxed::Box,
-    string::{String, ToString},
-    vec::Vec,
-};
+use alloc::{boxed::Box, string::ToString, vec::Vec};
 use core::iter::Peekable;
 
 /// Drains all blobs that come "before" the given vptr.

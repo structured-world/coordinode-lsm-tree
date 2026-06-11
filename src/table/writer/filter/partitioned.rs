@@ -16,7 +16,7 @@ use crate::{
 };
 use alloc::sync::Arc;
 #[cfg(not(feature = "std"))]
-use alloc::{boxed::Box, string::String, vec::Vec};
+use alloc::{boxed::Box, vec::Vec};
 
 // Concrete writers (sfa::Writer / ChecksummedWriter) carry the io trait via
 // their own impls; the defining trait must be in scope for raw method calls.

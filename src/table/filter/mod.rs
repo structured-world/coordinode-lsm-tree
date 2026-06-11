@@ -6,7 +6,7 @@ pub mod block;
 pub mod ribbon;
 
 #[cfg(not(feature = "std"))]
-use alloc::{boxed::Box, string::String, vec::Vec};
+use alloc::vec::Vec;
 use core::hash::BuildHasherDefault;
 use ribbon::burr::{BurrBuilder, BurrParams};
 use rustc_hash::FxHasher;

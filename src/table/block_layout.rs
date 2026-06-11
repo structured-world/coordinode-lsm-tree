@@ -26,7 +26,7 @@
 
 use crate::table::block::BlockOffset;
 #[cfg(not(feature = "std"))]
-use alloc::{boxed::Box, string::String, vec::Vec};
+use alloc::vec::Vec;
 
 /// Serialize the per-block inner-block layouts into `out`.
 ///

@@ -5,7 +5,7 @@
 use super::{MARKER_CONFLICT, MARKER_FREE, calculate_bucket_position};
 use crate::io::WriteBytesExt;
 #[cfg(not(feature = "std"))]
-use alloc::{boxed::Box, string::String, vec::Vec};
+use alloc::vec::Vec;
 
 /// With 254, pointers [0 - 253] can be indexed.
 pub const MAX_POINTERS_FOR_HASH_INDEX: usize = 254;

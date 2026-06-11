@@ -21,7 +21,7 @@
 
 use crate::{UserKey, UserValue, ValueType, value::InternalValue};
 #[cfg(not(feature = "std"))]
-use alloc::{boxed::Box, string::String, vec::Vec};
+use alloc::vec::Vec;
 
 /// A single entry in a [`WriteBatch`].
 #[derive(Clone, Debug)]

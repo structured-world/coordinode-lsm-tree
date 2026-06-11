@@ -22,7 +22,7 @@ use crate::{
     version::{Level, Version, run::Ranged},
 };
 #[cfg(not(feature = "std"))]
-use alloc::{boxed::Box, string::String, vec::Vec};
+use alloc::vec::Vec;
 
 /// Tries to find the most optimal compaction set from one level into the other.
 ///

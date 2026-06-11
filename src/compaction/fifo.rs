@@ -8,7 +8,7 @@ use crate::{
     version::Version,
 };
 #[cfg(not(feature = "std"))]
-use alloc::{boxed::Box, string::String, vec::Vec};
+use alloc::vec::Vec;
 
 #[doc(hidden)]
 pub const NAME: &str = "FifoCompaction";

@@ -34,7 +34,7 @@
 //! to drift seeds across encode/decode.
 
 #[cfg(not(feature = "std"))]
-use alloc::{boxed::Box, string::String, vec::Vec};
+use alloc::vec::Vec;
 use core::hash::BuildHasher;
 
 use crate::io::Cursor;

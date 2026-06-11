@@ -4,7 +4,7 @@
 
 use crate::io::{LittleEndian, WriteBytesExt};
 #[cfg(not(feature = "std"))]
-use alloc::{boxed::Box, string::String, vec::Vec};
+use alloc::vec::Vec;
 
 #[derive(Debug)]
 pub struct Builder(Vec<u32>);

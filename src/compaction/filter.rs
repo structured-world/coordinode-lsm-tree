@@ -15,7 +15,7 @@ use crate::{
     vlog::{Accessor, BlobFileWriter, ValueHandle},
 };
 #[cfg(not(feature = "std"))]
-use alloc::{boxed::Box, string::String, vec::Vec};
+use alloc::boxed::Box;
 use core::panic::RefUnwindSafe;
 
 /// Verdict returned by a [`CompactionFilter`].

@@ -4,7 +4,7 @@
 
 use crate::{Slice, UserKey};
 #[cfg(not(feature = "std"))]
-use alloc::{boxed::Box, string::String, vec::Vec};
+use alloc::vec::Vec;
 use core::ops::Bound;
 
 /// A key range in the format of [min, max] (inclusive on both sides)

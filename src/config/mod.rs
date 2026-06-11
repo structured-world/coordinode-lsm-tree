@@ -21,23 +21,26 @@ pub type PartitioningPolicy = PinningPolicy;
 
 #[cfg(feature = "std")]
 use crate::fs::StdFs;
-use crate::path::{Path, PathBuf};
+use crate::path::PathBuf;
 use crate::{
-    AnyTree, BlobTree, Cache, CompressionType, DescriptorTable, SequenceNumberCounter,
-    SharedSequenceNumberGenerator, Tree,
+    AnyTree, BlobTree, Cache, CompressionType, DescriptorTable, SharedSequenceNumberGenerator,
+    Tree,
     compaction::filter::Factory,
-    comparator::{self, SharedComparator},
+    comparator::SharedComparator,
     encryption::EncryptionProvider,
     file::TABLES_FOLDER,
     fs::{Fs, SyncMode},
     merge_operator::MergeOperator,
     path::absolute_path,
     prefix::PrefixExtractor,
-    version::DEFAULT_LEVEL_COUNT,
 };
+// std-only: used solely by the std-gated `Config::default` / `Config::new`
+// constructors (the no_std path builds `Config` field-by-field).
+#[cfg(feature = "std")]
+use crate::{SequenceNumberCounter, comparator, path::Path, version::DEFAULT_LEVEL_COUNT};
 use alloc::sync::Arc;
 #[cfg(not(feature = "std"))]
-use alloc::{boxed::Box, string::String, vec::Vec};
+use alloc::vec::Vec;
 use core::ops::Range;
 
 /// Per-level filesystem routing entry for tiered storage.

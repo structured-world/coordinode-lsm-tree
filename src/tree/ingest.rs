@@ -9,11 +9,7 @@ use crate::{
 };
 use alloc::sync::Arc;
 #[cfg(not(feature = "std"))]
-use alloc::{
-    boxed::Box,
-    string::{String, ToString},
-    vec::Vec,
-};
+use alloc::{string::ToString, vec::Vec};
 use core::cmp::Ordering;
 
 use crate::path::PathBuf;

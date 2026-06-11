@@ -205,7 +205,9 @@ pub fn link_or_copy_cross_fs(
             // link itself.
             Ok(()) => return Ok(dst_fs.metadata(dst)?.len),
             Err(e)
-                if crate::fs::is_cross_device(&e) || e.kind() == crate::io::ErrorKind::NotFound =>
+                if crate::fs::is_cross_device(&e)
+                    || e.kind() == crate::io::ErrorKind::Unsupported
+                    || e.kind() == crate::io::ErrorKind::NotFound =>
             {
                 // The link didn't take, for one of:
                 //   - cross-device (EXDEV / CrossesDevices) — src and dst

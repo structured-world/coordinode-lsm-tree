@@ -4,7 +4,7 @@
 
 use crate::CompressionType;
 #[cfg(not(feature = "std"))]
-use alloc::{boxed::Box, string::String, vec::Vec};
+use alloc::vec::Vec;
 
 /// Compression policy
 #[derive(Debug, Clone, Eq, PartialEq)]

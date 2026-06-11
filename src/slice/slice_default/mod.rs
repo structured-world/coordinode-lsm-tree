@@ -4,7 +4,7 @@
 
 use crate::byteview::ByteView;
 #[cfg(not(feature = "std"))]
-use alloc::{boxed::Box, string::String, vec::Vec};
+use alloc::{string::String, vec::Vec};
 
 pub use crate::byteview::Builder;
 

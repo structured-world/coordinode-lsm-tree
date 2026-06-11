@@ -5,7 +5,7 @@
 #[cfg(feature = "metrics")]
 use crate::metrics::Metrics;
 #[cfg(not(feature = "std"))]
-use alloc::{boxed::Box, string::String, vec::Vec};
+use alloc::vec::Vec;
 
 use super::{
     block_index::BlockIndexImpl, block_layout::BlockLayoutMap, meta::ParsedMeta,
@@ -80,11 +80,15 @@ pub struct Inner {
 
     /// Cached sum of referenced blob file bytes for this table.
     ///
-    /// Lazily computed on first access to avoid repeated I/O in compaction
-    /// decisions. `u64::MAX` is the "not yet computed" sentinel (a real sum
-    /// can never reach 18 EiB), so a single relaxed-ordered load resolves a
-    /// cache hit without a separate init flag. Concurrent computers race to
-    /// the same value, so the store is idempotent.
+    /// Initialized to `AtomicU64::new(u64::MAX)`, the "not yet computed"
+    /// sentinel (a real sum can never reach 18 EiB). Lazily computed on first
+    /// access to avoid repeated I/O in compaction decisions:
+    /// `Table::referenced_blob_bytes` does an `Acquire` load, returns early
+    /// when the value is not `u64::MAX`, otherwise sums the table's
+    /// `LinkedFile.on_disk_bytes` and publishes it with a `Release` store.
+    /// The store is idempotent under races because the table's linked-blob-file
+    /// region is immutable after open, so every racing computer re-reads the
+    /// same on-disk byte counts and computes the same sum.
     pub(crate) cached_blob_bytes: AtomicU64,
 
     /// Range tombstones stored in this table. Loaded on open.

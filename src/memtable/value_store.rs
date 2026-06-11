@@ -14,7 +14,7 @@
 
 use crate::value::UserValue;
 #[cfg(not(feature = "std"))]
-use alloc::{boxed::Box, string::String, vec::Vec};
+use alloc::{boxed::Box, vec::Vec};
 
 use core::ptr;
 use core::sync::atomic::{AtomicPtr, AtomicU32, Ordering};

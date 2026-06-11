@@ -40,7 +40,7 @@ use crate::io::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use crate::io::{Read, Write};
 use crate::manifest_blocks::{MANIFEST_LAYOUT_VERSION_V1, MAX_SECTION_NAME_BYTES};
 #[cfg(not(feature = "std"))]
-use alloc::{boxed::Box, string::String, vec::Vec};
+use alloc::{string::String, vec::Vec};
 #[cfg(feature = "std")]
 use std::io::{Read, Write};
 

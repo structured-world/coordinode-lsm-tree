@@ -392,7 +392,9 @@ fn reread_block_is_corrected(
 /// narrower hosts that fail the wider checks before taking their lane).
 #[must_use]
 pub fn longest_shared_prefix_length(s1: &[u8], s2: &[u8]) -> usize {
-    #[cfg(target_arch = "x86_64")]
+    // std-gated: `is_x86_feature_detected!` is std-only. Under no_std the
+    // scalar tail handles x86.
+    #[cfg(all(feature = "std", target_arch = "x86_64"))]
     {
         if std::is_x86_feature_detected!("avx512bw") {
             // SAFETY: AVX-512BW availability just verified via runtime CPU feature detection.
@@ -407,7 +409,7 @@ pub fn longest_shared_prefix_length(s1: &[u8], s2: &[u8]) -> usize {
         // attribute on `lsp_sse2` documents this contract explicitly.
         return unsafe { lsp_sse2(s1, s2) };
     }
-    #[cfg(target_arch = "x86")]
+    #[cfg(all(feature = "std", target_arch = "x86"))]
     {
         if std::is_x86_feature_detected!("avx512bw") {
             // SAFETY: AVX-512BW availability just verified via runtime CPU feature detection.
@@ -439,7 +441,7 @@ pub fn longest_shared_prefix_length(s1: &[u8], s2: &[u8]) -> usize {
     // riscv, powerpc, …), which is the whole point of having a portable fallback.
     #[cfg_attr(
         any(
-            target_arch = "x86_64",
+            all(feature = "std", target_arch = "x86_64"),
             all(target_arch = "aarch64", target_endian = "little")
         ),
         expect(

@@ -5,7 +5,7 @@
 use crate::KeyRange;
 use crate::comparator::UserComparator;
 #[cfg(not(feature = "std"))]
-use alloc::{boxed::Box, string::String, vec::Vec};
+use alloc::vec::Vec;
 use core::ops::{Bound, RangeBounds};
 
 pub trait Ranged {

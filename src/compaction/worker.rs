@@ -26,7 +26,7 @@ use crate::{
 };
 use alloc::sync::Arc;
 #[cfg(not(feature = "std"))]
-use alloc::{boxed::Box, string::String, vec::Vec};
+use alloc::{boxed::Box, vec::Vec};
 // no-std: spin mirrors parking_lot's Mutex/RwLock API without an allocator.
 #[cfg(feature = "std")]
 use parking_lot::{Mutex, RwLock};

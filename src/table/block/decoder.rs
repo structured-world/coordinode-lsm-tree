@@ -9,7 +9,7 @@ use crate::{
     table::{Block, block::Trailer},
 };
 #[cfg(not(feature = "std"))]
-use alloc::{boxed::Box, string::String, vec::Vec};
+use alloc::vec::Vec;
 use core::marker::PhantomData;
 
 use crate::io::Cursor;

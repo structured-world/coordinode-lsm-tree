@@ -5,7 +5,7 @@
 #[cfg(zstd_any)]
 use crate::compression::CompressionProvider as _;
 #[cfg(not(feature = "std"))]
-use alloc::{boxed::Box, string::String, vec::Vec};
+use alloc::boxed::Box;
 
 use super::meta::Metadata;
 use crate::io::BufWriter;

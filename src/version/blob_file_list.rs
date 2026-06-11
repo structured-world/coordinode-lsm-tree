@@ -4,7 +4,7 @@ use crate::{
     vlog::{BlobFile, BlobFileId},
 };
 #[cfg(not(feature = "std"))]
-use alloc::{boxed::Box, string::String, vec::Vec};
+use alloc::vec::Vec;
 
 #[derive(Clone, Default)]
 pub struct BlobFileList(HashMap<BlobFileId, BlobFile>);

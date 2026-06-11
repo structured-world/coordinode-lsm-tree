@@ -14,7 +14,7 @@ use crate::active_tombstone_set::{ActiveTombstoneSet, ActiveTombstoneSetReverse}
 use crate::range_tombstone::RangeTombstone;
 use crate::{InternalValue, SeqNo, comparator::SharedComparator};
 #[cfg(not(feature = "std"))]
-use alloc::{boxed::Box, string::String, vec::Vec};
+use alloc::vec::Vec;
 
 /// Wraps a bidirectional KV stream and suppresses entries covered by range tombstones.
 ///

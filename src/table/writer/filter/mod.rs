@@ -12,9 +12,9 @@ use crate::{
     CompressionType, UserKey, checksum::ChecksummedWriter, config::BloomConstructionPolicy,
     encryption::EncryptionProvider, prefix::PrefixExtractor,
 };
-use alloc::sync::Arc;
 #[cfg(not(feature = "std"))]
-use alloc::{boxed::Box, string::String, vec::Vec};
+use alloc::boxed::Box;
+use alloc::sync::Arc;
 
 // All methods are required (no defaults) by design so that implementations must
 // explicitly handle configuration changes (e.g., filter policies, prefix extractors).

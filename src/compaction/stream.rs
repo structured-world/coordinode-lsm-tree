@@ -9,7 +9,7 @@ use crate::{InternalValue, SeqNo, UserKey, UserValue, ValueType, merge_operator:
 use alloc::collections::VecDeque;
 use alloc::sync::Arc;
 #[cfg(not(feature = "std"))]
-use alloc::{boxed::Box, string::String, vec::Vec};
+use alloc::vec::Vec;
 use core::iter::Peekable;
 
 type Item = crate::Result<InternalValue>;

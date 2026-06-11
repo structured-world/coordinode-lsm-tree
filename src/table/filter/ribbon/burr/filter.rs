@@ -1,5 +1,5 @@
 #[cfg(not(feature = "std"))]
-use alloc::{boxed::Box, string::String, vec::Vec};
+use alloc::vec::Vec;
 use core::hash::{BuildHasher, Hash};
 
 use super::super::builder::Scratch;

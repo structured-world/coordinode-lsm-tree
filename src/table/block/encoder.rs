@@ -11,7 +11,7 @@ use super::{
     Trailer,
 };
 #[cfg(not(feature = "std"))]
-use alloc::{boxed::Box, string::String, vec::Vec};
+use alloc::vec::Vec;
 use core::marker::PhantomData;
 
 pub trait Encodable<Context: Default> {

@@ -16,7 +16,7 @@ use crate::{
 };
 use alloc::sync::Arc;
 #[cfg(not(feature = "std"))]
-use alloc::{boxed::Box, string::String, vec::Vec};
+use alloc::{boxed::Box, vec::Vec};
 
 pub trait BlockIndexWriter<W: crate::io::Write + crate::io::Seek> {
     /// Registers a data block in the block index.

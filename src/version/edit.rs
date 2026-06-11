@@ -60,7 +60,7 @@
 use super::framing;
 use crate::io::{LittleEndian, ReadBytesExt, WriteBytesExt};
 #[cfg(not(feature = "std"))]
-use alloc::{boxed::Box, string::String, vec::Vec};
+use alloc::vec::Vec;
 
 #[cfg(not(feature = "std"))]
 use crate::io::{Read, Write};

@@ -15,7 +15,7 @@
 use crate::{SeqNo, UserKey, comparator::SharedComparator, range_tombstone::RangeTombstone};
 use alloc::collections::BTreeMap;
 #[cfg(not(feature = "std"))]
-use alloc::{boxed::Box, string::String, vec::Vec};
+use alloc::vec::Vec;
 
 /// Tracks active range tombstones during forward iteration.
 ///

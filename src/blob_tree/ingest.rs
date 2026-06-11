@@ -7,11 +7,7 @@ use crate::{
     table::Table, tree::ingest::Ingestion as TableIngestion, vlog::BlobFileWriter,
 };
 #[cfg(not(feature = "std"))]
-use alloc::{
-    boxed::Box,
-    string::{String, ToString},
-    vec::Vec,
-};
+use alloc::{string::ToString, vec::Vec};
 use core::cmp::Ordering;
 
 /// Bulk ingestion for [`BlobTree`](crate::BlobTree)
