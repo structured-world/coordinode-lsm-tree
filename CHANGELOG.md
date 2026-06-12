@@ -11,6 +11,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [5.2.1](https://github.com/structured-world/coordinode-lsm-tree/compare/v5.2.0...v5.2.1) - 2026-06-12
+
+### Refactored
+
+- *(no-std)* make the core LSM path no_std + alloc capable ([#451](https://github.com/structured-world/coordinode-lsm-tree/pull/451))
+
 ## [5.2.0](https://github.com/structured-world/coordinode-lsm-tree/compare/v5.1.0...v5.2.0) - 2026-06-10
 
 ### Added
