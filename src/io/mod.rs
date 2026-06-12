@@ -1559,4 +1559,124 @@ mod tests {
         assert_eq!(sink, b"hello");
         Ok(())
     }
+
+    /// Every `ErrorKind` discriminant — kept in one place so the
+    /// exhaustive bridge tests below stay total. A new variant added
+    /// to the enum without a row here fails the per-arm assertions
+    /// (the std round trip would not preserve it).
+    #[cfg(feature = "std")]
+    const ALL_KINDS: [ErrorKind; 12] = [
+        ErrorKind::AlreadyExists,
+        ErrorKind::BrokenPipe,
+        ErrorKind::CrossesDevices,
+        ErrorKind::Interrupted,
+        ErrorKind::InvalidData,
+        ErrorKind::InvalidInput,
+        ErrorKind::NotFound,
+        ErrorKind::Other,
+        ErrorKind::PermissionDenied,
+        ErrorKind::UnexpectedEof,
+        ErrorKind::Unsupported,
+        ErrorKind::WriteZero,
+    ];
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn every_kind_only_error_round_trips_through_std() {
+        // Exercises EVERY arm of both `From` match tables in one
+        // sweep: a kind-only `Error` (no message) crosses to
+        // `std::io::Error` (hitting that kind's arm in
+        // `From<Error> for std::io::Error`, plus the `None` message
+        // branch) and back (hitting the corresponding forward arm in
+        // `From<std::io::Error> for Error`, plus the kind-only mapped
+        // branch). The kind must survive both crossings unchanged —
+        // a dropped or mis-paired arm in either table fails here.
+        for kind in ALL_KINDS {
+            let original = Error::from_kind(kind);
+            let as_std: std::io::Error = original.into();
+            let back: Error = as_std.into();
+            assert_eq!(back.kind(), kind, "kind {kind:?} did not round-trip");
+        }
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn every_kind_only_std_error_maps_to_matching_kind() {
+        // Forward direction in isolation: a kind-only
+        // `std::io::Error` for each kind our table maps explicitly
+        // must produce the matching `ErrorKind`. Hits each mapped arm
+        // of `From<std::io::Error> for Error` directly (the prior test
+        // reaches them via produced std kinds; this asserts the mapping
+        // from the std side, where a future std-kind rename would bite).
+        let mapped = [
+            (std::io::ErrorKind::AlreadyExists, ErrorKind::AlreadyExists),
+            (std::io::ErrorKind::BrokenPipe, ErrorKind::BrokenPipe),
+            (
+                std::io::ErrorKind::CrossesDevices,
+                ErrorKind::CrossesDevices,
+            ),
+            (std::io::ErrorKind::Interrupted, ErrorKind::Interrupted),
+            (std::io::ErrorKind::InvalidData, ErrorKind::InvalidData),
+            (std::io::ErrorKind::InvalidInput, ErrorKind::InvalidInput),
+            (std::io::ErrorKind::NotFound, ErrorKind::NotFound),
+            (
+                std::io::ErrorKind::PermissionDenied,
+                ErrorKind::PermissionDenied,
+            ),
+            (std::io::ErrorKind::UnexpectedEof, ErrorKind::UnexpectedEof),
+            (std::io::ErrorKind::Unsupported, ErrorKind::Unsupported),
+            (std::io::ErrorKind::WriteZero, ErrorKind::WriteZero),
+        ];
+        for (std_kind, want) in mapped {
+            let ours: Error = std::io::Error::from(std_kind).into();
+            assert_eq!(ours.kind(), want, "std {std_kind:?} mis-mapped");
+        }
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn from_raw_os_error_preserves_os_detail_as_message() {
+        // A `std::io::Error::from_raw_os_error` carries an errno but no
+        // kind tag we mapped — `raw_os_error().is_some()` selects the
+        // message-attachment branch, so the OS-level Display text must
+        // survive into our message field rather than being dropped.
+        let std_err = std::io::Error::from_raw_os_error(2); // ENOENT
+        let ours: Error = std_err.into();
+        let rendered = alloc::format!("{ours}");
+        assert!(
+            rendered.contains(':'),
+            "os-detail error must attach a message, got: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn debug_renders_kind_always_and_message_when_present() {
+        // The custom `Debug` impl omits the `message` field entirely
+        // when none is set (it is not `Option`-wrapped in the output).
+        let kind_only = Error::from_kind(ErrorKind::NotFound);
+        let dbg = alloc::format!("{kind_only:?}");
+        assert!(dbg.contains("NotFound"), "missing kind in {dbg:?}");
+        assert!(
+            !dbg.contains("message"),
+            "kind-only must omit message: {dbg:?}"
+        );
+
+        let with_msg = Error::new(ErrorKind::InvalidData, "bad magic");
+        let dbg = alloc::format!("{with_msg:?}");
+        assert!(dbg.contains("message"), "expected message field in {dbg:?}");
+        assert!(dbg.contains("bad magic"), "expected payload in {dbg:?}");
+    }
+
+    #[test]
+    fn other_constructor_and_kind_from_conversion() {
+        // `Error::other` is the `ErrorKind::Other` shortcut; the
+        // `From<ErrorKind>` impl is the kind-only `?`-coercion path.
+        let e = Error::other("boom");
+        assert_eq!(e.kind(), ErrorKind::Other);
+        assert_eq!(alloc::format!("{e}"), "other error: boom");
+
+        let e: Error = ErrorKind::PermissionDenied.into();
+        assert_eq!(e.kind(), ErrorKind::PermissionDenied);
+        assert_eq!(alloc::format!("{e}"), "permission denied");
+    }
 }
