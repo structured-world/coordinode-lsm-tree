@@ -25,10 +25,10 @@ Input Size (Elements)
 2.5
 </text>
 <polyline fill="none" opacity="1" stroke="#000000" stroke-width="1" points="80,303 85,303 "/>
-<text x="76" y="259" dy="0.5ex" text-anchor="end" font-family="sans-serif" font-size="9.67741935483871" opacity="1" fill="#000000">
+<text x="76" y="260" dy="0.5ex" text-anchor="end" font-family="sans-serif" font-size="9.67741935483871" opacity="1" fill="#000000">
 3.0
 </text>
-<polyline fill="none" opacity="1" stroke="#000000" stroke-width="1" points="80,259 85,259 "/>
+<polyline fill="none" opacity="1" stroke="#000000" stroke-width="1" points="80,260 85,260 "/>
 <text x="76" y="216" dy="0.5ex" text-anchor="end" font-family="sans-serif" font-size="9.67741935483871" opacity="1" fill="#000000">
 3.5
 </text>
@@ -37,14 +37,14 @@ Input Size (Elements)
 4.0
 </text>
 <polyline fill="none" opacity="1" stroke="#000000" stroke-width="1" points="80,173 85,173 "/>
-<text x="76" y="129" dy="0.5ex" text-anchor="end" font-family="sans-serif" font-size="9.67741935483871" opacity="1" fill="#000000">
+<text x="76" y="130" dy="0.5ex" text-anchor="end" font-family="sans-serif" font-size="9.67741935483871" opacity="1" fill="#000000">
 4.5
 </text>
-<polyline fill="none" opacity="1" stroke="#000000" stroke-width="1" points="80,129 85,129 "/>
-<text x="76" y="86" dy="0.5ex" text-anchor="end" font-family="sans-serif" font-size="9.67741935483871" opacity="1" fill="#000000">
+<polyline fill="none" opacity="1" stroke="#000000" stroke-width="1" points="80,130 85,130 "/>
+<text x="76" y="87" dy="0.5ex" text-anchor="end" font-family="sans-serif" font-size="9.67741935483871" opacity="1" fill="#000000">
 5.0
 </text>
-<polyline fill="none" opacity="1" stroke="#000000" stroke-width="1" points="80,86 85,86 "/>
+<polyline fill="none" opacity="1" stroke="#000000" stroke-width="1" points="80,87 85,87 "/>
 <polyline fill="none" opacity="1" stroke="#000000" stroke-width="1" points="86,474 933,474 "/>
 <text x="86" y="484" dy="0.76em" text-anchor="middle" font-family="sans-serif" font-size="9.67741935483871" opacity="1" fill="#000000">
 1000.0
