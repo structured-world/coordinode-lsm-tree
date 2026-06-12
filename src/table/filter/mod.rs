@@ -5,9 +5,11 @@
 pub mod block;
 pub mod ribbon;
 
+#[cfg(not(feature = "std"))]
+use alloc::vec::Vec;
+use core::hash::BuildHasherDefault;
 use ribbon::burr::{BurrBuilder, BurrParams};
-use std::collections::hash_map::DefaultHasher;
-use std::hash::BuildHasherDefault;
+use rustc_hash::FxHasher;
 
 /// Hasher type embedded in `BuRR` filters. Only its type identity is used —
 /// the construction + probe paths in this crate go through
@@ -15,8 +17,12 @@ use std::hash::BuildHasherDefault;
 /// `BurrFilterReader::contains_hash`, all of which take pre-computed u64
 /// hashes (xxh3 via `crate::hash::hash64`) and never invoke the
 /// `BuildHasher`. The type slot exists only to satisfy the vendored
-/// ribbon-filter's generic `S: BuildHasher` bound.
-type FilterHasher = BuildHasherDefault<DefaultHasher>;
+/// ribbon-filter's generic `S: BuildHasher` bound; the concrete hasher is
+/// never constructed or called, so the choice has no on-disk or runtime
+/// effect. `FxHasher` (a no_std-capable hasher already in the dependency
+/// tree) replaces the std-only `DefaultHasher` purely to keep this module
+/// off `std`.
+type FilterHasher = BuildHasherDefault<FxHasher>;
 
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub enum BloomConstructionPolicy {

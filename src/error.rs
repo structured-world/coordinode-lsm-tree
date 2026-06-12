@@ -3,13 +3,15 @@
 // Copyright (c) 2026-present, Structured World Foundation
 
 use crate::{Checksum, CompressionType};
+#[cfg(not(feature = "std"))]
+use alloc::string::String;
 
 /// Represents errors that can occur in the LSM-tree
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum Error {
     /// I/O error
-    Io(std::io::Error),
+    Io(crate::io::Error),
 
     /// Decompression failed
     Decompress(CompressionType),
@@ -61,7 +63,7 @@ pub enum Error {
     },
 
     /// UTF-8 error
-    Utf8(std::str::Utf8Error),
+    Utf8(core::str::Utf8Error),
 
     /// Merge operator failed.
     ///
@@ -309,14 +311,14 @@ pub enum Error {
     },
 }
 
-impl std::fmt::Display for Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for Error {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(f, "LsmTreeError: {self:?}")
     }
 }
 
-impl std::error::Error for Error {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+impl core::error::Error for Error {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
         match self {
             Self::Io(e) => Some(e),
             _ => None,
@@ -351,11 +353,21 @@ impl From<crate::sfa::Error> for Error {
     }
 }
 
-impl From<std::io::Error> for Error {
-    fn from(value: std::io::Error) -> Self {
+// The `Io` variant carries `crate::io::Error` (the no_std-capable I/O error),
+// so this bridge is a direct wrap. Std file-I/O paths surface `std::io::Error`;
+// the std-gated bridge below folds those through `crate::io::Error`.
+impl From<crate::io::Error> for Error {
+    fn from(value: crate::io::Error) -> Self {
         Self::Io(value)
     }
 }
 
+#[cfg(feature = "std")]
+impl From<std::io::Error> for Error {
+    fn from(value: std::io::Error) -> Self {
+        Self::Io(value.into())
+    }
+}
+
 /// Tree result
-pub type Result<T> = std::result::Result<T, Error>;
+pub type Result<T> = core::result::Result<T, Error>;

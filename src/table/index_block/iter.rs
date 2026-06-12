@@ -56,18 +56,18 @@ impl<'a> Iter<'a> {
         let landed = if cmp.is_lexicographic() {
             self.decoder.inner_mut().seek(
                 |end_key, s| match end_key.cmp(needle) {
-                    std::cmp::Ordering::Greater => false,
-                    std::cmp::Ordering::Less => true,
-                    std::cmp::Ordering::Equal => s >= seqno,
+                    core::cmp::Ordering::Greater => false,
+                    core::cmp::Ordering::Less => true,
+                    core::cmp::Ordering::Equal => s >= seqno,
                 },
                 true,
             )
         } else {
             self.decoder.inner_mut().seek(
                 |end_key, s| match cmp.compare(end_key, needle) {
-                    std::cmp::Ordering::Greater => false,
-                    std::cmp::Ordering::Less => true,
-                    std::cmp::Ordering::Equal => s >= seqno,
+                    core::cmp::Ordering::Greater => false,
+                    core::cmp::Ordering::Less => true,
+                    core::cmp::Ordering::Equal => s >= seqno,
                 },
                 true,
             )
@@ -79,9 +79,9 @@ impl<'a> Iter<'a> {
         if self.decoder.inner_mut().restart_interval() > 1 {
             self.decoder.inner_mut().advance_while(|item, bytes| {
                 match item.compare_key(needle, bytes, cmp.as_ref()) {
-                    std::cmp::Ordering::Greater => false,
-                    std::cmp::Ordering::Less => true,
-                    std::cmp::Ordering::Equal => item.seqno() >= seqno,
+                    core::cmp::Ordering::Greater => false,
+                    core::cmp::Ordering::Less => true,
+                    core::cmp::Ordering::Equal => item.seqno() >= seqno,
                 }
             });
         }
@@ -137,7 +137,7 @@ impl<'a> Iter<'a> {
                         .seek_upper(|end_key, _s| end_key < needle, true)
                 } else {
                     self.decoder.inner_mut().seek_upper(
-                        |end_key, _s| cmp.compare(end_key, needle) == std::cmp::Ordering::Less,
+                        |end_key, _s| cmp.compare(end_key, needle) == core::cmp::Ordering::Less,
                         true,
                     )
                 }
@@ -158,7 +158,7 @@ impl<'a> Iter<'a> {
                         .seek_upper(|end_key, _s| end_key <= needle, true)
                 } else {
                     self.decoder.inner_mut().seek_upper(
-                        |end_key, _s| cmp.compare(end_key, needle) != std::cmp::Ordering::Greater,
+                        |end_key, _s| cmp.compare(end_key, needle) != core::cmp::Ordering::Greater,
                         true,
                     )
                 }
@@ -169,7 +169,7 @@ impl<'a> Iter<'a> {
                 .seek_upper(|end_key, _s| end_key <= needle, true)
         } else {
             self.decoder.inner_mut().seek_upper(
-                |end_key, _s| cmp.compare(end_key, needle) != std::cmp::Ordering::Greater,
+                |end_key, _s| cmp.compare(end_key, needle) != core::cmp::Ordering::Greater,
                 true,
             )
         };
@@ -188,7 +188,7 @@ impl<'a> Iter<'a> {
                 .decoder
                 .inner_mut()
                 .upper_stack_tail_cmp(|item, bytes| item.compare_key(needle, bytes, cmp.as_ref()))
-                == Some(std::cmp::Ordering::Less)
+                == Some(core::cmp::Ordering::Less)
             {
                 if !self.decoder.inner_mut().advance_upper_restart_interval() {
                     break;
@@ -280,6 +280,8 @@ impl DoubleEndedIterator for Iter<'_> {
 )]
 mod tests {
     use super::*;
+    use crate::io::Cursor;
+    use crate::io::{ByteOrder, LittleEndian, ReadBytesExt};
     use crate::{
         coding::Decode,
         comparator::default_comparator,
@@ -288,8 +290,6 @@ mod tests {
             block::{BlockType, Header, ParsedItem, Trailer},
         },
     };
-    use byteorder::{ByteOrder, LittleEndian, ReadBytesExt};
-    use std::io::Cursor;
     use varint_rs::VarintReader;
 
     fn make_handles(count: usize) -> Vec<KeyedBlockHandle> {
@@ -346,7 +346,7 @@ mod tests {
             header: Header::test_dummy(BlockType::Index),
         });
         let trailer_offset = Trailer::new(&trailer_probe.inner).trailer_offset();
-        let binary_index_offset_pos = trailer_offset + 1 + 1 + std::mem::size_of::<u32>();
+        let binary_index_offset_pos = trailer_offset + 1 + 1 + core::mem::size_of::<u32>();
         #[expect(
             clippy::cast_possible_truncation,
             reason = "test block sizes stay well below u32::MAX"
@@ -354,7 +354,7 @@ mod tests {
         let invalid_binary_index_offset = (bytes.len() as u32).saturating_add(1);
         LittleEndian::write_u32(
             &mut bytes
-                [binary_index_offset_pos..binary_index_offset_pos + std::mem::size_of::<u32>()],
+                [binary_index_offset_pos..binary_index_offset_pos + core::mem::size_of::<u32>()],
             invalid_binary_index_offset,
         );
 

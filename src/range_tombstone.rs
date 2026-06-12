@@ -2,8 +2,11 @@
 // Copyright (c) 2024-present, fjall-rs
 // Copyright (c) 2026-present, Structured World Foundation
 
+#[cfg(not(feature = "std"))]
+use alloc::vec::Vec;
+
 use crate::{SeqNo, UserKey, comparator::UserComparator};
-use std::cmp::Reverse;
+use core::cmp::Reverse;
 
 /// A range tombstone that deletes all keys in `[start, end)` at a given sequence number.
 ///
@@ -44,8 +47,8 @@ impl RangeTombstone {
     /// Returns `true` if `key` is within `[start, end)` using the tree comparator.
     #[must_use]
     pub fn contains_key_with(&self, key: &[u8], comparator: &dyn UserComparator) -> bool {
-        comparator.compare(&self.start, key) != std::cmp::Ordering::Greater
-            && comparator.compare(key, &self.end) == std::cmp::Ordering::Less
+        comparator.compare(&self.start, key) != core::cmp::Ordering::Greater
+            && comparator.compare(key, &self.end) == core::cmp::Ordering::Less
     }
 
     /// Returns `true` if this tombstone is visible at the given read seqno.
@@ -102,18 +105,19 @@ impl RangeTombstone {
         max: &[u8],
         comparator: &dyn UserComparator,
     ) -> Option<Self> {
-        let new_start_ref = if comparator.compare(&self.start, min) == std::cmp::Ordering::Greater {
+        let new_start_ref = if comparator.compare(&self.start, min) == core::cmp::Ordering::Greater
+        {
             self.start.as_ref()
         } else {
             min
         };
-        let new_end_ref = if comparator.compare(&self.end, max) == std::cmp::Ordering::Less {
+        let new_end_ref = if comparator.compare(&self.end, max) == core::cmp::Ordering::Less {
             self.end.as_ref()
         } else {
             max
         };
 
-        if comparator.compare(new_start_ref, new_end_ref) == std::cmp::Ordering::Less {
+        if comparator.compare(new_start_ref, new_end_ref) == core::cmp::Ordering::Less {
             Some(Self {
                 start: UserKey::from(new_start_ref),
                 end: UserKey::from(new_end_ref),
@@ -142,8 +146,8 @@ impl RangeTombstone {
         max: &[u8],
         comparator: &dyn UserComparator,
     ) -> bool {
-        comparator.compare(&self.start, min) != std::cmp::Ordering::Greater
-            && comparator.compare(max, &self.end) == std::cmp::Ordering::Less
+        comparator.compare(&self.start, min) != core::cmp::Ordering::Greater
+            && comparator.compare(max, &self.end) == core::cmp::Ordering::Less
     }
 
     /// Comparator-aware ordering for range tombstone processing.
@@ -155,7 +159,7 @@ impl RangeTombstone {
         &self,
         other: &Self,
         comparator: &dyn UserComparator,
-    ) -> std::cmp::Ordering {
+    ) -> core::cmp::Ordering {
         comparator
             .compare(&self.start, &other.start)
             .then_with(|| other.seqno.cmp(&self.seqno))
@@ -168,7 +172,7 @@ impl RangeTombstone {
 /// The `end` tiebreaker ensures deterministic ordering for debug output
 /// and property tests.
 impl Ord for RangeTombstone {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
         (&self.start, Reverse(self.seqno), &self.end).cmp(&(
             &other.start,
             Reverse(other.seqno),
@@ -178,7 +182,7 @@ impl Ord for RangeTombstone {
 }
 
 impl PartialOrd for RangeTombstone {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
         Some(self.cmp(other))
     }
 }
@@ -221,8 +225,8 @@ impl CoveringRt {
         table_max_seqno: SeqNo,
         comparator: &dyn UserComparator,
     ) -> bool {
-        comparator.compare(&self.start, table_min) != std::cmp::Ordering::Greater
-            && comparator.compare(table_max, &self.end) == std::cmp::Ordering::Less
+        comparator.compare(&self.start, table_min) != core::cmp::Ordering::Greater
+            && comparator.compare(table_max, &self.end) == core::cmp::Ordering::Less
             && self.seqno > table_max_seqno
     }
 }

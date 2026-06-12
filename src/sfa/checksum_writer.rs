@@ -4,12 +4,12 @@
 
 use crate::sfa::Checksum;
 
-pub struct ChecksummedWriter<W: std::io::Write> {
+pub struct ChecksummedWriter<W: crate::io::Write> {
     inner: W,
     hasher: xxhash_rust::xxh3::Xxh3Default,
 }
 
-impl<W: std::io::Write> ChecksummedWriter<W> {
+impl<W: crate::io::Write> ChecksummedWriter<W> {
     pub fn new(writer: W) -> Self {
         Self {
             inner: writer,
@@ -22,7 +22,11 @@ impl<W: std::io::Write> ChecksummedWriter<W> {
     }
 }
 
-impl<W: std::io::Write> std::io::Write for ChecksummedWriter<W> {
+// `crate::io::Write` is the std trait (via the std-mode supertrait blanket)
+// under `std` and the native trait under `no_std`; the impls differ only in
+// the trait path and `Result` type, so each is gated to its build.
+#[cfg(feature = "std")]
+impl<W: crate::io::Write> std::io::Write for ChecksummedWriter<W> {
     fn flush(&mut self) -> std::io::Result<()> {
         self.inner.flush()
     }
@@ -36,11 +40,29 @@ impl<W: std::io::Write> std::io::Write for ChecksummedWriter<W> {
         // `inner.write` first so a failed write does not corrupt
         // the hasher state.
         let n = self.inner.write(buf)?;
-        // Safe slice: `n <= buf.len()` per `std::io::Write::write`
-        // contract.
+        // Safe slice: `n <= buf.len()` per the `Write::write` contract.
         #[expect(
             clippy::indexing_slicing,
-            reason = "n bounded by buf.len() per std::io::Write::write contract"
+            reason = "n bounded by buf.len() per Write::write contract"
+        )]
+        self.hasher.update(&buf[..n]);
+        Ok(n)
+    }
+}
+
+#[cfg(not(feature = "std"))]
+impl<W: crate::io::Write> crate::io::Write for ChecksummedWriter<W> {
+    fn flush(&mut self) -> crate::io::Result<()> {
+        self.inner.flush()
+    }
+
+    fn write(&mut self, buf: &[u8]) -> crate::io::Result<usize> {
+        // See the std impl above: hash only accepted bytes, inner.write
+        // first so a failed write cannot corrupt the hasher state.
+        let n = self.inner.write(buf)?;
+        #[expect(
+            clippy::indexing_slicing,
+            reason = "n bounded by buf.len() per Write::write contract"
         )]
         self.hasher.update(&buf[..n]);
         Ok(n)

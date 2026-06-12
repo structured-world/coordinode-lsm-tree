@@ -21,7 +21,9 @@
 
 use crate::InternalValue;
 use crate::comparator::SharedComparator;
-use std::cmp::Ordering;
+#[cfg(not(feature = "std"))]
+use alloc::vec::Vec;
+use core::cmp::Ordering;
 
 /// A single entry in the merge heap.
 ///
@@ -140,7 +142,7 @@ impl MergeHeap {
     pub fn replace_min(&mut self, entry: HeapEntry) -> HeapEntry {
         debug_assert!(!self.data.is_empty());
 
-        let old = std::mem::replace(&mut self.data[0], entry);
+        let old = core::mem::replace(&mut self.data[0], entry);
 
         // Slide right until in sorted position.
         let cmp = self.comparator.as_ref();
@@ -172,7 +174,7 @@ impl MergeHeap {
         debug_assert!(!self.data.is_empty());
 
         let last = self.data.len() - 1;
-        let old = std::mem::replace(&mut self.data[last], entry);
+        let old = core::mem::replace(&mut self.data[last], entry);
 
         // Slide left until in sorted position.
         let cmp = self.comparator.as_ref();

@@ -17,11 +17,12 @@ use crate::{
     value::{SeqNo, UserKey},
     version::{Run, SuperVersion},
 };
+use alloc::sync::Arc;
+#[cfg(not(feature = "std"))]
+use alloc::{boxed::Box, vec::Vec};
+use core::ops::{Bound, RangeBounds};
+
 use self_cell::self_cell;
-use std::{
-    ops::{Bound, RangeBounds},
-    sync::Arc,
-};
 
 #[must_use]
 pub fn seqno_filter(item_seqno: SeqNo, seqno: SeqNo) -> bool {
@@ -65,7 +66,7 @@ fn build_seeking<'a>(
 ///
 /// Panics if the prefix is empty.
 pub(crate) fn prefix_upper_range(prefix: &[u8]) -> Bound<UserKey> {
-    use std::ops::Bound::{Excluded, Unbounded};
+    use core::ops::Bound::{Excluded, Unbounded};
 
     assert!(!prefix.is_empty(), "prefix may not be empty");
 
@@ -89,7 +90,7 @@ pub(crate) fn prefix_upper_range(prefix: &[u8]) -> Bound<UserKey> {
 #[must_use]
 #[expect(clippy::module_name_repetitions)]
 pub fn prefix_to_range(prefix: &[u8]) -> (Bound<UserKey>, Bound<UserKey>) {
-    use std::ops::Bound::{Included, Unbounded};
+    use core::ops::Bound::{Included, Unbounded};
 
     if prefix.is_empty() {
         return (Unbounded, Unbounded);
@@ -169,14 +170,14 @@ fn range_tombstone_overlaps_bounds(
 ) -> bool {
     let overlaps_lo = match &bounds.0 {
         Bound::Included(key) | Bound::Excluded(key) => {
-            comparator.compare(&rt.end, key) == std::cmp::Ordering::Greater
+            comparator.compare(&rt.end, key) == core::cmp::Ordering::Greater
         }
         Bound::Unbounded => true,
     };
 
     let overlaps_hi = match &bounds.1 {
-        Bound::Included(key) => comparator.compare(&rt.start, key) != std::cmp::Ordering::Greater,
-        Bound::Excluded(key) => comparator.compare(&rt.start, key) == std::cmp::Ordering::Less,
+        Bound::Included(key) => comparator.compare(&rt.start, key) != core::cmp::Ordering::Greater,
+        Bound::Excluded(key) => comparator.compare(&rt.start, key) == core::cmp::Ordering::Less,
         Bound::Unbounded => true,
     };
 
@@ -194,7 +195,7 @@ fn bloom_passes(state: &IterState, table: &crate::table::Table) -> bool {
                 #[cfg(feature = "metrics")]
                 if let Some(m) = &state.metrics {
                     m.prefix_bloom_skips
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                 }
                 return false;
             }
@@ -278,8 +279,8 @@ impl TreeIter {
             // Constant for a point key — computed once and reused for
             // key-range overlap checks and bloom filtering across all runs.
             let bounds = (
-                user_range.0.as_ref().map(std::convert::AsRef::as_ref),
-                user_range.1.as_ref().map(std::convert::AsRef::as_ref),
+                user_range.0.as_ref().map(core::convert::AsRef::as_ref),
+                user_range.1.as_ref().map(core::convert::AsRef::as_ref),
             );
 
             for run in lock
@@ -562,8 +563,8 @@ impl TreeIter {
                         // running the O(rt_count) table-skip scan.
                         if table.check_key_range_overlap_cmp(
                             &(
-                                user_range.0.as_ref().map(std::convert::AsRef::as_ref),
-                                user_range.1.as_ref().map(std::convert::AsRef::as_ref),
+                                user_range.0.as_ref().map(core::convert::AsRef::as_ref),
+                                user_range.1.as_ref().map(core::convert::AsRef::as_ref),
                             ),
                             lock.comparator.as_ref(),
                         ) && bloom_passes(lock, table)
@@ -597,8 +598,8 @@ impl TreeIter {
                         // and point-read merge pipelines (key_hash).
                         if lock.prefix_hash.is_some() || lock.key_hash.is_some() {
                             let bounds = (
-                                user_range.0.as_ref().map(std::convert::AsRef::as_ref),
-                                user_range.1.as_ref().map(std::convert::AsRef::as_ref),
+                                user_range.0.as_ref().map(core::convert::AsRef::as_ref),
+                                user_range.1.as_ref().map(core::convert::AsRef::as_ref),
                             );
 
                             let surviving: Vec<_> = run
@@ -675,7 +676,7 @@ impl TreeIter {
                 let table_kv_seqno = table.get_highest_kv_seqno();
 
                 let candidate_end = all_range_tombstones.partition_point(|(rt, _)| {
-                    lock.comparator.compare(&rt.start, table_min) != std::cmp::Ordering::Greater
+                    lock.comparator.compare(&rt.start, table_min) != core::cmp::Ordering::Greater
                 });
 
                 let is_covered =
@@ -843,7 +844,7 @@ impl TreeIter {
 mod tests {
     use super::*;
     use crate::Slice;
-    use std::ops::Bound::{Excluded, Included, Unbounded};
+    use core::ops::Bound::{Excluded, Included, Unbounded};
     use test_log::test;
 
     fn test_prefix(prefix: &[u8], upper_bound: Bound<&[u8]>) {

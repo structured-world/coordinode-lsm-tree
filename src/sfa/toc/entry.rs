@@ -2,13 +2,20 @@
 // This source code is licensed under both the Apache 2.0 and MIT License
 // (found in the LICENSE-* files in the repository)
 
-use byteorder::ReadBytesExt;
-use byteorder::WriteBytesExt;
-use std::{
-    fs::File,
-    io::{BufReader, Read, Seek, Write},
-    path::Path,
-};
+#[cfg(not(feature = "std"))]
+use alloc::vec::Vec;
+
+use crate::io::{ReadBytesExt, WriteBytesExt};
+// Codec `impl Read`/`impl Write` bounds resolve to std under `std` and to the
+// native `crate::io` traits under `no_std`. The `reader`/`buf_reader` helpers
+// are std-only (they open a file), so `File`/`BufReader`/`Path` plus the
+// `Seek` trait for `file.seek` live behind the std gate.
+#[cfg(not(feature = "std"))]
+use crate::io::{Read, Write};
+#[cfg(feature = "std")]
+use std::io::{Read, Seek, Write};
+#[cfg(feature = "std")]
+use std::{fs::File, io::BufReader, path::Path};
 
 pub type SectionName = Vec<u8>;
 
@@ -41,6 +48,7 @@ impl TocEntry {
     }
 
     #[doc(hidden)]
+    #[cfg(feature = "std")]
     pub fn reader(&self, path: &Path) -> std::io::Result<impl std::io::Read> {
         let mut file = File::open(path)?;
         file.seek(std::io::SeekFrom::Start(self.pos))?;
@@ -48,6 +56,7 @@ impl TocEntry {
     }
 
     #[doc(hidden)]
+    #[cfg(feature = "std")]
     pub fn buf_reader(&self, path: &Path) -> std::io::Result<impl std::io::BufRead> {
         let mut file = BufReader::new(File::open(path)?);
         file.seek(std::io::SeekFrom::Start(self.pos))?;
@@ -55,7 +64,7 @@ impl TocEntry {
     }
 
     pub(crate) fn write_into(&self, mut writer: impl Write) -> crate::sfa::Result<()> {
-        use byteorder::LE;
+        use crate::io::LE;
 
         writer.write_u64::<LE>(self.pos())?;
         writer.write_u64::<LE>(self.len())?;
@@ -73,7 +82,7 @@ impl TocEntry {
     }
 
     pub(crate) fn read_from_file(reader: &mut impl Read) -> crate::sfa::Result<Self> {
-        use byteorder::LE;
+        use crate::io::LE;
 
         let pos = reader.read_u64::<LE>()?;
         let len = reader.read_u64::<LE>()?;

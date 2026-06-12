@@ -27,18 +27,25 @@
 //! never buffers its entire compressed output: when the cap is reached it
 //! drains (and writes) one block before submitting the next.
 
+// `Box` for the (no_std-able) CompactionSpawner trait; under std it's in the
+// prelude. Everything below the trait is the std-only parallel pipeline.
+#[cfg(feature = "std")]
 use crate::{
     CompressionType, TableId,
     table::block::{Block, BlockIdentity, BlockTransform, BlockType, PreparedBlock},
 };
+#[cfg(not(feature = "std"))]
+use alloc::boxed::Box;
+#[cfg(feature = "std")]
 use std::{
     collections::BTreeMap,
     sync::{Arc, Condvar, Mutex, PoisonError},
 };
 
-#[cfg(zstd_any)]
+#[cfg(all(feature = "std", zstd_any))]
 use crate::compression::ZstdDictionary;
 
+#[cfg(feature = "std")]
 use crate::encryption::EncryptionProvider;
 
 /// Caller-injectable execution backend for parallel block compression.
@@ -76,7 +83,7 @@ impl RayonSpawner {
             .num_threads(threads)
             .thread_name(|i| format!("lsm-compress-{i}"))
             .build()
-            .map_err(|e| crate::Error::Io(std::io::Error::other(e)))?;
+            .map_err(|e| crate::Error::Io(crate::io::Error::other(e.to_string())))?;
         Ok(Self {
             pool: Arc::new(pool),
         })
@@ -97,6 +104,7 @@ impl CompactionSpawner for RayonSpawner {
 }
 
 /// Shared reorder slot: finished blocks keyed by submission sequence number.
+#[cfg(feature = "std")]
 struct Shared {
     ready: Mutex<BTreeMap<u64, crate::Result<PreparedBlock<'static>>>>,
     woke: Condvar,
@@ -108,6 +116,7 @@ struct Shared {
 /// shared reorder slot. The writer feeds encoded block buffers in via
 /// [`Self::submit`] and pulls finished blocks back out, in submission order,
 /// via [`Self::take_next`].
+#[cfg(feature = "std")]
 pub struct BlockCompressor {
     spawner: Arc<dyn CompactionSpawner>,
     shared: Arc<Shared>,
@@ -124,6 +133,7 @@ pub struct BlockCompressor {
     next_drain: u64,
 }
 
+#[cfg(feature = "std")]
 impl BlockCompressor {
     pub fn new(
         spawner: Arc<dyn CompactionSpawner>,
@@ -221,6 +231,7 @@ impl BlockCompressor {
 
 /// Worker-side block preparation: rebuild the transform from owned parts, run
 /// the pipeline, and detach the result from the borrowed `encoded` buffer.
+#[cfg(feature = "std")]
 fn prepare_owned(
     encoded: &[u8],
     table_id: TableId,

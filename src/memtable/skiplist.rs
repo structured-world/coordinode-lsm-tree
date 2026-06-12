@@ -21,9 +21,10 @@ use crate::key::InternalKey;
 use crate::value::{SeqNo, UserValue};
 use crate::{UserKey, ValueType};
 
-use std::cmp::Ordering as CmpOrdering;
-use std::ops::{Bound, RangeBounds};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use core::cmp::Ordering as CmpOrdering;
+use core::ops::{Bound, RangeBounds};
+use core::sync::atomic::{AtomicUsize, Ordering};
+use portable_atomic::AtomicU64;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -470,7 +471,7 @@ impl SkipMap {
         clippy::cast_possible_truncation,
         reason = "level < MAX_HEIGHT (20), fits in u32"
     )]
-    unsafe fn tower_atomic(&self, node: u32, level: usize) -> &std::sync::atomic::AtomicU32 {
+    unsafe fn tower_atomic(&self, node: u32, level: usize) -> &core::sync::atomic::AtomicU32 {
         // SAFETY: caller guarantees level < node height; node + OFF_TOWER + level*4
         // is within the node's arena allocation and 4-byte aligned.
         unsafe {

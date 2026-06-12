@@ -2,6 +2,7 @@
 // Copyright (c) 2024-present, fjall-rs
 // Copyright (c) 2026-present, Structured World Foundation
 
+use crate::io::{LittleEndian, ReadBytesExt};
 use crate::{
     Checksum, SeqNo, TableId, TreeType,
     coding::Decode,
@@ -11,8 +12,10 @@ use crate::{
     version::VersionId,
     vlog::BlobFileId,
 };
-use byteorder::{LittleEndian, ReadBytesExt};
-use std::path::Path;
+#[cfg(not(feature = "std"))]
+use alloc::vec::Vec;
+
+use crate::path::Path;
 
 /// Exact on-disk size of a `tables`-section record payload (post-framing):
 /// `id: u64 (8) | checksum_type: u8 (1) | checksum: u128 (16) | global_seqno: u64 (8)`.
@@ -48,7 +51,7 @@ fn decode_table_entry_payload(payload: &[u8]) -> crate::Result<RecoveredTable> {
     if payload.len() != TABLE_ENTRY_PAYLOAD_LEN as usize {
         return Err(crate::Error::InvalidHeader("tables record payload length"));
     }
-    let mut cursor = std::io::Cursor::new(payload);
+    let mut cursor = crate::io::Cursor::new(payload);
     let id = cursor.read_u64::<LittleEndian>()?;
     let checksum_type = cursor.read_u8()?;
     if checksum_type != 0 {
@@ -72,7 +75,7 @@ fn decode_blob_entry_payload(payload: &[u8]) -> crate::Result<(BlobFileId, Check
             "blob_files record payload length",
         ));
     }
-    let mut cursor = std::io::Cursor::new(payload);
+    let mut cursor = crate::io::Cursor::new(payload);
     let id = cursor.read_u64::<LittleEndian>()?;
     let checksum_type = cursor.read_u8()?;
     if checksum_type != 0 {
@@ -116,9 +119,9 @@ fn decode_blob_entry_payload(payload: &[u8]) -> crate::Result<(BlobFileId, Check
 pub fn get_current_version(
     folder: &Path,
     fs: &dyn Fs,
-    encryption: Option<std::sync::Arc<dyn crate::encryption::EncryptionProvider>>,
+    encryption: Option<alloc::sync::Arc<dyn crate::encryption::EncryptionProvider>>,
 ) -> crate::Result<VersionId> {
-    use byteorder::{LittleEndian, ReadBytesExt};
+    use crate::io::{LittleEndian, ReadBytesExt};
 
     let path = folder.join(CURRENT_VERSION_FILE);
     let mut file = fs.open(&path, &FsOpenOptions::new().read(true))?;
@@ -154,11 +157,11 @@ pub fn get_current_version(
     let archive = crate::manifest_blocks::reader::ManifestArchiveReader::open(
         &manifest_path,
         fs,
-        std::sync::Arc::new(crate::runtime_config::RuntimeConfig::default()),
+        alloc::sync::Arc::new(crate::runtime_config::RuntimeConfig::default()),
         encryption,
     )
     .map_err(|e| match e {
-        crate::Error::Io(io) if io.kind() == std::io::ErrorKind::NotFound => {
+        crate::Error::Io(io) if io.kind() == crate::io::ErrorKind::NotFound => {
             crate::Error::ManifestFooterInvalid(
                 "manifest file referenced by CURRENT does not exist",
             )
@@ -346,7 +349,7 @@ pub fn recover(
     folder: &Path,
     fs: &dyn Fs,
     mode: ManifestRecoveryMode,
-    encryption: Option<std::sync::Arc<dyn crate::encryption::EncryptionProvider>>,
+    encryption: Option<alloc::sync::Arc<dyn crate::encryption::EncryptionProvider>>,
 ) -> crate::Result<Recovery> {
     // Per-record framing constants used by both the tables and
     // blob_files sections. Each on-disk record is a
@@ -372,7 +375,7 @@ pub fn recover(
     let mut archive = crate::manifest_blocks::reader::ManifestArchiveReader::open(
         &version_file_path,
         fs,
-        std::sync::Arc::new(crate::runtime_config::RuntimeConfig::default()),
+        alloc::sync::Arc::new(crate::runtime_config::RuntimeConfig::default()),
         encryption,
     )?;
 
@@ -447,7 +450,7 @@ pub fn recover(
         }
         let section_bytes = archive.read_section("tables")?;
         let section_len: u64 = section_bytes.len() as u64;
-        let mut reader = std::io::Cursor::new(section_bytes);
+        let mut reader = crate::io::Cursor::new(section_bytes);
 
         // Wrap the level-count read in tail tolerance too: a manifest
         // truncated before the first byte of `tables` (or right after
@@ -473,7 +476,7 @@ pub fn recover(
                 tables_bytes_consumed += 1;
                 n
             }
-            Err(e) if tolerate_tail && e.kind() == std::io::ErrorKind::UnexpectedEof => {
+            Err(e) if tolerate_tail && e.kind() == crate::io::ErrorKind::UnexpectedEof => {
                 log::warn!(
                     "tables section truncated before level_count byte in version \
                      #{curr_version_id}; tail-tolerant mode produces 0 levels"
@@ -506,7 +509,7 @@ pub fn recover(
                     tables_bytes_consumed += 1;
                     n
                 }
-                Err(e) if tolerate_tail && e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                Err(e) if tolerate_tail && e.kind() == crate::io::ErrorKind::UnexpectedEof => {
                     // No runs in this level had a chance to start;
                     // pushing the empty `level` keeps the level slot
                     // visible to downstream code (instead of silently
@@ -536,7 +539,7 @@ pub fn recover(
                         tables_bytes_consumed += 4;
                         n
                     }
-                    Err(e) if tolerate_tail && e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                    Err(e) if tolerate_tail && e.kind() == crate::io::ErrorKind::UnexpectedEof => {
                         // Push the partial `level` so any fully
                         // decoded runs earlier in this level survive
                         // — breaking out of `'levels` without this
@@ -778,8 +781,8 @@ pub fn recover(
                         // corruption that the operator needs to know
                         // about as such).
                         FramedRecordOutcome::TailTruncation => {
-                            return Err(crate::Error::Io(std::io::Error::new(
-                                std::io::ErrorKind::UnexpectedEof,
+                            return Err(crate::Error::from(crate::io::Error::new(
+                                crate::io::ErrorKind::UnexpectedEof,
                                 "manifest tables record truncated mid-frame",
                             )));
                         }
@@ -877,11 +880,11 @@ pub fn recover(
         }
         let section_bytes = archive.read_section("blob_files")?;
         let section_len: u64 = section_bytes.len() as u64;
-        let mut reader = std::io::Cursor::new(section_bytes);
+        let mut reader = crate::io::Cursor::new(section_bytes);
 
         let blob_file_count = match reader.read_u32::<LittleEndian>() {
             Ok(n) => n,
-            Err(e) if tolerate_tail && e.kind() == std::io::ErrorKind::UnexpectedEof => {
+            Err(e) if tolerate_tail && e.kind() == crate::io::ErrorKind::UnexpectedEof => {
                 log::warn!(
                     "blob_files section truncated before count header in version \
                      #{curr_version_id}; tail-tolerant mode produces 0 blob files"
@@ -1027,8 +1030,8 @@ pub fn recover(
                 // because the writer never produces a header above
                 // MAX_FRAME_PAYLOAD on its own.
                 FramedRecordOutcome::TailTruncation => {
-                    return Err(crate::Error::Io(std::io::Error::new(
-                        std::io::ErrorKind::UnexpectedEof,
+                    return Err(crate::Error::from(crate::io::Error::new(
+                        crate::io::ErrorKind::UnexpectedEof,
                         "manifest blob_files record truncated mid-frame",
                     )));
                 }
@@ -1090,7 +1093,7 @@ pub fn recover(
             return Err(crate::Error::Unrecoverable);
         }
         let section_bytes = archive.read_section("blob_gc_stats")?;
-        let mut reader = std::io::Cursor::new(section_bytes);
+        let mut reader = crate::io::Cursor::new(section_bytes);
 
         // Same tail-tolerance contract as the record-list sections:
         // a power-loss between the `blob_files` commit and the
@@ -1103,7 +1106,7 @@ pub fn recover(
         match crate::blob_tree::FragmentationMap::decode_from(&mut reader) {
             Ok(m) => m,
             Err(crate::Error::Io(e))
-                if tolerate_tail && e.kind() == std::io::ErrorKind::UnexpectedEof =>
+                if tolerate_tail && e.kind() == crate::io::ErrorKind::UnexpectedEof =>
             {
                 log::warn!(
                     "blob_gc_stats section truncated in version #{curr_version_id}; \
@@ -1181,8 +1184,8 @@ mod tests {
     use super::*;
     use crate::coding::Encode;
     use crate::fs::{FsOpenOptions, MemFs};
+    use crate::io::{LittleEndian, WriteBytesExt};
     use crate::version::edit::{AddedBlobFile, ChangedLevel, TableDesc, VersionEdit};
-    use byteorder::{LittleEndian, WriteBytesExt};
     use std::io::Write;
 
     /// A snapshot-state `Recovery` with the given level layout and no blobs /
@@ -1371,7 +1374,7 @@ mod tests {
         let archive = crate::manifest_blocks::reader::ManifestArchiveReader::open(
             &manifest_path,
             fs,
-            std::sync::Arc::new(crate::runtime_config::RuntimeConfig::default()),
+            alloc::sync::Arc::new(crate::runtime_config::RuntimeConfig::default()),
             None,
         )?;
         let checksum =
@@ -1398,7 +1401,7 @@ mod tests {
         FixtureWriter::create(
             &path,
             fs,
-            std::sync::Arc::new(crate::runtime_config::RuntimeConfig::default()),
+            alloc::sync::Arc::new(crate::runtime_config::RuntimeConfig::default()),
             None,
             crate::fs::SyncMode::Normal,
         )
@@ -1576,7 +1579,7 @@ mod tests {
         // acceptable strict-mode failures. The contract is: SOMETHING
         // surfaces, the open does not silently succeed with partial data.
         assert!(
-            matches!(&err, crate::Error::Io(e) if e.kind() == std::io::ErrorKind::UnexpectedEof)
+            matches!(&err, crate::Error::Io(e) if e.kind() == crate::io::ErrorKind::UnexpectedEof)
                 || matches!(err, crate::Error::Unrecoverable),
             "expected UnexpectedEof or Unrecoverable, got: {err:?}",
         );

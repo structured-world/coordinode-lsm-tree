@@ -2,7 +2,9 @@
 // Copyright (c) 2024-present, fjall-rs
 // Copyright (c) 2026-present, Structured World Foundation
 
-use std::io::{Read, Write};
+use crate::io::{Read, Write};
+#[cfg(not(feature = "std"))]
+use alloc::vec::Vec;
 
 /// Trait to serialize stuff
 pub trait Encode {

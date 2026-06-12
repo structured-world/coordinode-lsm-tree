@@ -23,8 +23,14 @@
 //!   at the call site (see [`RuntimeConfigHandle::update`]).
 
 use super::types::RuntimeConfig;
+use alloc::sync::Arc;
+#[cfg(feature = "std")]
 use arc_swap::ArcSwap;
-use std::sync::Arc;
+// no-std: arc-swap 1.x is not no_std; spin::RwLock<Arc<_>> gives the same
+// snapshot-swap semantics (serialized writers, consistent readers) without an
+// allocator. parking_lot/arc-swap win the std hot path, so keep them there.
+#[cfg(not(feature = "std"))]
+use spin::RwLock;
 
 /// Lockless atomic snapshot of [`RuntimeConfig`].
 ///
@@ -37,7 +43,13 @@ use std::sync::Arc;
 /// need an owned reference from a `Guard` can clone the inner
 /// `Arc` out of it via `Arc::clone(&*guard)`.
 pub struct RuntimeConfigHandle {
+    /// `std`: lock-free `ArcSwap` (single atomic load on the read hot path).
+    #[cfg(feature = "std")]
     inner: ArcSwap<RuntimeConfig>,
+    /// `no_std`: `spin::RwLock<Arc<_>>` — reads take a brief read lock, writes
+    /// serialize. Slower than `ArcSwap` but allocator-only.
+    #[cfg(not(feature = "std"))]
+    inner: RwLock<Arc<RuntimeConfig>>,
 }
 
 impl RuntimeConfigHandle {
@@ -45,16 +57,27 @@ impl RuntimeConfigHandle {
     #[must_use]
     pub fn new(initial: RuntimeConfig) -> Self {
         Self {
+            #[cfg(feature = "std")]
             inner: ArcSwap::from_pointee(initial),
+            #[cfg(not(feature = "std"))]
+            inner: RwLock::new(Arc::new(initial)),
         }
     }
 
-    /// Load the current snapshot — lockless single atomic load.
-    /// The returned guard is cheap to drop; for longer-lived
-    /// references use [`Self::load_full`] which returns an
-    /// owned `Arc<RuntimeConfig>`.
+    /// Load the current snapshot — lockless single atomic load under `std`
+    /// (`no_std` takes a brief read lock). The returned guard is cheap to
+    /// drop; for longer-lived references use [`Self::load_full`] which returns
+    /// an owned `Arc<RuntimeConfig>`.
+    #[cfg(feature = "std")]
     pub fn load(&self) -> arc_swap::Guard<Arc<RuntimeConfig>> {
         self.inner.load()
+    }
+
+    /// See the `std` variant. Under `no_std` the guard borrows the handle via
+    /// the read lock; deref reaches `RuntimeConfig` through the inner `Arc`.
+    #[cfg(not(feature = "std"))]
+    pub fn load(&self) -> spin::RwLockReadGuard<'_, Arc<RuntimeConfig>> {
+        self.inner.read()
     }
 
     /// Load the current snapshot as an owned `Arc`.
@@ -62,7 +85,14 @@ impl RuntimeConfigHandle {
     /// increment) but the result outlives the handle.
     #[must_use]
     pub fn load_full(&self) -> Arc<RuntimeConfig> {
-        self.inner.load_full()
+        #[cfg(feature = "std")]
+        {
+            self.inner.load_full()
+        }
+        #[cfg(not(feature = "std"))]
+        {
+            self.inner.read().clone()
+        }
     }
 
     /// Apply `mutator` to a clone of the current snapshot, then
@@ -112,7 +142,7 @@ impl RuntimeConfigHandle {
     where
         F: FnOnce(&mut RuntimeConfig),
     {
-        let current = self.inner.load_full();
+        let current = self.load_full();
         let mut next = (*current).clone();
         mutator(&mut next);
         // Validate the EFFECTIVE ECC state, not just the global `page_ecc`
@@ -173,7 +203,14 @@ impl RuntimeConfigHandle {
                 "kv_checksum_compute_point=AtInsert",
             ));
         }
-        self.inner.store(Arc::new(next));
+        #[cfg(feature = "std")]
+        {
+            self.inner.store(Arc::new(next));
+        }
+        #[cfg(not(feature = "std"))]
+        {
+            *self.inner.write() = Arc::new(next);
+        }
         Ok(())
     }
 }

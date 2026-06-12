@@ -2,11 +2,15 @@
 // Copyright (c) 2024-present, fjall-rs
 // Copyright (c) 2026-present, Structured World Foundation
 
+#[cfg(not(feature = "std"))]
+use crate::io::Write;
+use crate::path::Path;
 use crate::{
     Slice,
     fs::{Fs, FsFile, SyncMode},
 };
-use std::{io::Write, path::Path};
+#[cfg(feature = "std")]
+use std::io::Write;
 
 // The trailing byte is bumped on every wire-format break of the block
 // header. Pre-V5 readers see `4` and reject the header immediately
@@ -24,7 +28,7 @@ pub const CURRENT_VERSION_FILE: &str = "current";
 ///
 /// Uses [`FsFile::read_at`] (equivalent to `pread(2)`) so multiple threads
 /// can call this concurrently on the same file handle.
-pub fn read_exact(file: &dyn FsFile, offset: u64, size: usize) -> std::io::Result<Slice> {
+pub fn read_exact(file: &dyn FsFile, offset: u64, size: usize) -> crate::io::Result<Slice> {
     // SAFETY: This slice builder starts uninitialized, but we know its length
     //
     // We use FsFile::read_at which gives us the number of bytes read.
@@ -41,8 +45,8 @@ pub fn read_exact(file: &dyn FsFile, offset: u64, size: usize) -> std::io::Resul
     let bytes_read = file.read_at(&mut builder, offset)?;
 
     if bytes_read != size {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::UnexpectedEof,
+        return Err(crate::io::Error::new(
+            crate::io::ErrorKind::UnexpectedEof,
             format!(
                 "read_exact({bytes_read}) at {offset} did not read enough bytes {size}; file has length {}",
                 file.metadata()?.len
@@ -62,9 +66,10 @@ pub fn rewrite_atomic(
     content: &[u8],
     fs: &dyn Fs,
     mode: SyncMode,
-) -> std::io::Result<()> {
+) -> crate::io::Result<()> {
     use crate::fs::FsOpenOptions;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use core::sync::atomic::Ordering;
+    use portable_atomic::AtomicU64;
 
     static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -74,7 +79,12 @@ pub fn rewrite_atomic(
     )]
     let folder = path.parent().expect("should have a parent");
 
+    // no-std: no process model — a fixed id is fine, the seq counter
+    // disambiguates temp names within a process.
+    #[cfg(feature = "std")]
     let pid = std::process::id();
+    #[cfg(not(feature = "std"))]
+    let pid = 0u32;
 
     // Retry with incrementing seq on AlreadyExists — handles leftover temp
     // files from a previous crash (PID can be reused, especially in containers).
@@ -88,7 +98,8 @@ pub fn rewrite_atomic(
             Ok(mut file) => {
                 let write_result = file
                     .write_all(content)
-                    .and_then(|()| file.flush())
+                    .map_err(crate::io::Error::from)
+                    .and_then(|()| file.flush().map_err(crate::io::Error::from))
                     .and_then(|()| FsFile::sync_all_with(&*file, mode));
                 if let Err(e) = write_result {
                     drop(file);
@@ -98,7 +109,7 @@ pub fn rewrite_atomic(
                 break candidate;
             }
             // Leftover temp file from a previous crash — retry with next seq.
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) if e.kind() == crate::io::ErrorKind::AlreadyExists => {}
             Err(e) => return Err(e),
         }
     };
@@ -119,7 +130,7 @@ pub fn rewrite_atomic(
 /// On Windows, `StdFs::sync_directory` already returns `Ok(())` (directory
 /// fsync is unsupported), but non-`StdFs` backends (e.g., `MemFs`) may use
 /// this call for path validation. Always delegate rather than short-circuiting.
-pub fn fsync_directory(path: &Path, fs: &dyn Fs, mode: SyncMode) -> std::io::Result<()> {
+pub fn fsync_directory(path: &Path, fs: &dyn Fs, mode: SyncMode) -> crate::io::Result<()> {
     fs.sync_directory_with(path, mode)
 }
 
@@ -149,7 +160,7 @@ mod tests {
         let file = File::open(&path)?;
         // Request 10 bytes from a 5-byte file → short read → UnexpectedEof
         let err = read_exact(&file, 0, 10).unwrap_err();
-        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+        assert_eq!(err.kind(), crate::io::ErrorKind::UnexpectedEof);
 
         Ok(())
     }

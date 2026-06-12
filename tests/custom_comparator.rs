@@ -419,7 +419,7 @@ fn oversized_comparator_name_rejected_on_create() {
 
     match result {
         Err(lsm_tree::Error::Io(e)) => {
-            assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput);
+            assert_eq!(e.kind(), lsm_tree::io::ErrorKind::InvalidInput);
         }
         Ok(_) => panic!("expected InvalidInput error for oversized comparator name"),
         Err(e) => panic!("expected InvalidInput Io error, got {e:?}"),

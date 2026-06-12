@@ -42,6 +42,10 @@
 //! [`FooterPayload`]: crate::manifest_blocks::footer::FooterPayload
 //! [`HEAD_FOOTER_RESERVED_SIZE`]: crate::manifest_blocks::HEAD_FOOTER_RESERVED_SIZE
 
+#[cfg(not(feature = "std"))]
+use crate::io::{Cursor, Read, Seek, SeekFrom};
+use crate::io::{LittleEndian, ReadBytesExt};
+use crate::path::{Path, PathBuf};
 use crate::{
     encryption::EncryptionProvider,
     fs::{Fs, FsFile, FsOpenOptions},
@@ -53,12 +57,11 @@ use crate::{
     runtime_config::RuntimeConfig,
     table::block::{Block, BlockIdentity, BlockTransform, BlockType, Header},
 };
-use byteorder::{LittleEndian, ReadBytesExt};
-use std::{
-    io::{Cursor, Read, Seek, SeekFrom},
-    path::{Path, PathBuf},
-    sync::Arc,
-};
+use alloc::sync::Arc;
+#[cfg(not(feature = "std"))]
+use alloc::{boxed::Box, vec::Vec};
+#[cfg(feature = "std")]
+use std::io::{Cursor, Read, Seek, SeekFrom};
 
 /// Reader over an already-validated manifest file: holds the parsed
 /// footer payload and an open file handle for on-demand section

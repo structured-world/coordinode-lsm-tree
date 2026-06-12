@@ -1,3 +1,4 @@
+use crate::io::{LittleEndian, WriteBytesExt};
 use crate::{
     encryption::EncryptionProvider,
     file::{CURRENT_VERSION_FILE, fsync_directory, rewrite_atomic},
@@ -6,8 +7,9 @@ use crate::{
     runtime_config::RuntimeConfig,
     version::Version,
 };
-use byteorder::{LittleEndian, WriteBytesExt};
-use std::{path::Path, sync::Arc};
+use alloc::sync::Arc;
+
+use crate::path::Path;
 
 /// Crate-internal (version module is not exported).
 ///
@@ -28,8 +30,8 @@ pub fn persist_version(
     sync_mode: SyncMode,
 ) -> crate::Result<()> {
     if comparator_name.len() > crate::comparator::MAX_COMPARATOR_NAME_BYTES {
-        return Err(crate::Error::from(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
+        return Err(crate::Error::from(crate::io::Error::new(
+            crate::io::ErrorKind::InvalidInput,
             format!(
                 "comparator name is {} bytes (max {})",
                 comparator_name.len(),

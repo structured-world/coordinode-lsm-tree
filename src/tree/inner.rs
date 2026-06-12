@@ -11,7 +11,40 @@ use crate::{
     stop_signal::StopSignal,
     version::{SuperVersions, Version, persist_version},
 };
-use std::sync::{Arc, Mutex, RwLock, atomic::AtomicU64};
+use alloc::sync::Arc;
+use portable_atomic::AtomicU64;
+// no-std: parking_lot is std-only; spin provides the same Mutex/RwLock API
+// without an allocator. parking_lot wins on the std hot path (8-byte,
+// userspace fast path), so keep it for std and fall back to spin for no_std.
+#[cfg(feature = "std")]
+use parking_lot::{Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
+#[cfg(not(feature = "std"))]
+use spin::{Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
+
+// RwLock guard aliases: parking_lot's and spin's read/write guards both take
+// `<'a, T>` (spin defaults its relax-strategy param to `Spin`), so one alias
+// per guard covers both backends.
+/// Write guard over the tree's version history. Backend-specific guard type
+/// (`parking_lot` under std, `spin` under `no_std`), aliased so
+/// [`crate::AbstractTree`] and its impls share one signature.
+pub type VersionsWriteGuard<'a> = RwLockWriteGuard<'a, SuperVersions>;
+/// Read guard over the tree's version history. See [`VersionsWriteGuard`].
+pub type VersionsReadGuard<'a> = RwLockReadGuard<'a, SuperVersions>;
+
+// spin's `MutexGuard` (unlike its RwLock guards) has no default relax-strategy
+// param, so the Mutex-based aliases name the backend guard explicitly.
+/// Guard over the tree's compaction state. See [`VersionsWriteGuard`].
+#[cfg(feature = "std")]
+pub type CompactionGuard<'a> = parking_lot::MutexGuard<'a, CompactionState>;
+/// Guard over the tree's compaction state. See [`VersionsWriteGuard`].
+#[cfg(not(feature = "std"))]
+pub type CompactionGuard<'a> = spin::MutexGuard<'a, CompactionState, spin::Spin>;
+/// Guard over the tree's flush-serialization mutex. See [`VersionsWriteGuard`].
+#[cfg(feature = "std")]
+pub type FlushGuard<'a> = parking_lot::MutexGuard<'a, ()>;
+/// Guard over the tree's flush-serialization mutex. See [`VersionsWriteGuard`].
+#[cfg(not(feature = "std"))]
+pub type FlushGuard<'a> = spin::MutexGuard<'a, (), spin::Spin>;
 
 #[cfg(feature = "metrics")]
 use crate::metrics::Metrics;
@@ -29,7 +62,7 @@ pub type MemtableId = u64;
 /// Hands out a unique (monotonically increasing) tree ID.
 pub fn get_next_tree_id() -> TreeId {
     static TREE_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
-    TREE_ID_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    TREE_ID_COUNTER.fetch_add(1, core::sync::atomic::Ordering::Relaxed)
 }
 
 pub struct TreeInner {
@@ -145,13 +178,13 @@ impl TreeInner {
         // `Config::with_runtime_config`). Reused below to initialize
         // the Tree's `RuntimeConfigHandle` so the on-disk manifest
         // bytes and the live runtime handle agree on byte zero.
-        let initial_runtime = std::sync::Arc::new(config.initial_runtime_config.clone());
+        let initial_runtime = Arc::new(config.initial_runtime_config.clone());
         persist_version(
             &config.path,
             &version,
             config.comparator.name(),
             &*config.fs,
-            std::sync::Arc::clone(&initial_runtime),
+            Arc::clone(&initial_runtime),
             config.encryption.clone(),
             config.sync_mode,
         )?;

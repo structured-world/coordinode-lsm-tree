@@ -2,6 +2,9 @@
 // This source code is licensed under both the Apache 2.0 and MIT License
 // (found in the LICENSE-* files in the repository)
 
+#[cfg(not(feature = "std"))]
+use alloc::vec::Vec;
+
 use crate::sfa::TocEntry;
 
 pub mod entry;
@@ -19,7 +22,7 @@ impl Toc {
     }
 }
 
-impl std::ops::Deref for Toc {
+impl core::ops::Deref for Toc {
     type Target = [TocEntry];
 
     fn deref(&self) -> &Self::Target {

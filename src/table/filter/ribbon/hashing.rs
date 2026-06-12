@@ -1,5 +1,5 @@
+use core::hash::BuildHasher;
 use core::hash::Hash;
-use std::hash::BuildHasher;
 
 use super::params::{Mode, Params};
 

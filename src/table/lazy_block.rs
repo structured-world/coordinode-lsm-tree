@@ -90,7 +90,7 @@ impl LazyBlock {
         let mut decoder = FrameDecoder::new();
         decoder
             .reset(&mut source)
-            .map_err(|e| crate::Error::Io(std::io::Error::other(e)))?;
+            .map_err(|e| crate::Error::Io(crate::io::Error::other(e.to_string())))?;
         Ok(Self {
             source,
             decoder,
@@ -190,7 +190,7 @@ impl LazyBlock {
         self.source.set_position(0);
         self.decoder
             .reset(&mut self.source)
-            .map_err(|e| crate::Error::Io(std::io::Error::other(e)))?;
+            .map_err(|e| crate::Error::Io(crate::io::Error::other(e.to_string())))?;
 
         let resuming = self.resume_state.is_some();
         let pd = if let Some(state) = self.resume_state.as_deref() {
@@ -206,14 +206,14 @@ impl LazyBlock {
                     }),
                     true,
                 )
-                .map_err(|e| crate::Error::Io(std::io::Error::other(e)))?
+                .map_err(|e| crate::Error::Io(crate::io::Error::other(e.to_string())))?
         } else {
             self.decoder
                 .decode_blocks_partial(&mut self.source, 0, end_block, None, true)
-                .map_err(|e| crate::Error::Io(std::io::Error::other(e)))?
+                .map_err(|e| crate::Error::Io(crate::io::Error::other(e.to_string())))?
         };
         if let Some((idx, err)) = pd.stopped_at {
-            return Err(crate::Error::Io(std::io::Error::other(format!(
+            return Err(crate::Error::Io(crate::io::Error::other(format!(
                 "lazy partial decode stopped at inner block {idx}: {err:?}"
             ))));
         }

@@ -2,19 +2,23 @@
 // Copyright (c) 2024-present, fjall-rs
 // Copyright (c) 2026-present, Structured World Foundation
 
+use alloc::boxed::Box;
+use alloc::sync::Arc;
+
 use super::{Block, DataBlock};
+use crate::io::BufReader;
+use crate::path::Path;
 use crate::{
     CompressionType, InternalValue, SeqNo,
     comparator::SharedComparator,
     encryption::EncryptionProvider,
-    fs::{FileHint, FsFile},
+    fs::{FileHint, Fs, FsFile, FsOpenOptions},
     table::{block::BlockType, iter::OwnedDataBlockIter},
 };
-use std::{fs::File, io::BufReader, path::Path, sync::Arc};
 
 /// Table reader that is optimized for consuming an entire table
 pub struct Scanner {
-    reader: BufReader<File>,
+    reader: BufReader<Box<dyn FsFile>>,
     iter: OwnedDataBlockIter,
 
     compression: CompressionType,
@@ -51,6 +55,7 @@ impl Scanner {
                   makes about the values"
     )]
     pub fn new(
+        fs: &Arc<dyn Fs>,
         path: &Path,
         block_count: usize,
         compression: CompressionType,
@@ -73,7 +78,7 @@ impl Scanner {
         // tuning beyond this would benefit from a configurable knob,
         // tracked as the configurable-readahead follow-up under #133.
         const SCANNER_READAHEAD_BYTES: usize = 2 * 1024 * 1024;
-        let file = File::open(path)?;
+        let file = fs.open(path, &FsOpenOptions::new().read(true))?;
         // The scanner walks every block in order — tell the kernel so
         // it can ramp readahead aggressively and evict already-read
         // pages instead of pinning them. Best-effort: hint() is
@@ -119,7 +124,7 @@ impl Scanner {
     }
 
     fn fetch_next_block(
-        reader: &mut BufReader<File>,
+        reader: &mut BufReader<Box<dyn FsFile>>,
         table_id: crate::TableId,
         compression: CompressionType,
         encryption: Option<&dyn EncryptionProvider>,

@@ -3,7 +3,9 @@
 // Copyright (c) 2026-present, Structured World Foundation
 
 use super::{MARKER_CONFLICT, MARKER_FREE, calculate_bucket_position};
-use byteorder::WriteBytesExt;
+use crate::io::WriteBytesExt;
+#[cfg(not(feature = "std"))]
+use alloc::vec::Vec;
 
 /// With 254, pointers [0 - 253] can be indexed.
 pub const MAX_POINTERS_FOR_HASH_INDEX: usize = 254;
@@ -115,7 +117,7 @@ impl Builder {
     }
 
     /// Appends the raw index bytes to a writer.
-    pub fn write<W: std::io::Write>(self, writer: &mut W) -> std::io::Result<()> {
+    pub fn write<W: crate::io::Write>(self, writer: &mut W) -> crate::io::Result<()> {
         for byte in self.0 {
             writer.write_u8(byte)?;
         }

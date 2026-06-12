@@ -53,15 +53,17 @@ use crate::{
         writer::LinkedFile,
     },
 };
+use alloc::borrow::Cow;
+use alloc::sync::Arc;
+#[cfg(not(feature = "std"))]
+use alloc::{boxed::Box, vec::Vec};
 use block_index::BlockIndexImpl;
+use core::ops::{Bound, RangeBounds};
 use inner::Inner;
 use iter::Iter;
-use std::{
-    borrow::Cow,
-    ops::{Bound, RangeBounds},
-    path::PathBuf,
-    sync::Arc,
-};
+
+use crate::path::PathBuf;
+use portable_atomic::AtomicU64;
 use util::load_block;
 
 #[cfg(feature = "metrics")]
@@ -81,7 +83,7 @@ pub type TableInner = Inner;
 #[derive(Clone)]
 pub struct Table(Arc<Inner>);
 
-impl std::ops::Deref for Table {
+impl core::ops::Deref for Table {
     type Target = Inner;
 
     fn deref(&self) -> &Self::Target {
@@ -90,8 +92,8 @@ impl std::ops::Deref for Table {
 }
 
 #[cfg_attr(coverage_nightly, coverage(off))]
-impl std::fmt::Debug for Table {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Debug for Table {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(f, "Table:{}({:?})", self.id(), self.metadata.key_range)
     }
 }
@@ -132,8 +134,12 @@ impl Table {
     }
 
     pub fn referenced_blob_bytes(&self) -> crate::Result<u64> {
-        if let Some(v) = self.0.cached_blob_bytes.get() {
-            return Ok(*v);
+        let cached = self
+            .0
+            .cached_blob_bytes
+            .load(core::sync::atomic::Ordering::Acquire);
+        if cached != u64::MAX {
+            return Ok(cached);
         }
 
         let sum = self
@@ -141,12 +147,14 @@ impl Table {
             .map(|bf| bf.iter().map(|f| f.on_disk_bytes).sum::<u64>())
             .unwrap_or_default();
 
-        let _ = self.0.cached_blob_bytes.set(sum);
+        self.0
+            .cached_blob_bytes
+            .store(sum, core::sync::atomic::Ordering::Release);
         Ok(sum)
     }
 
     pub fn list_blob_file_references(&self) -> crate::Result<Option<Vec<LinkedFile>>> {
-        use byteorder::{LE, ReadBytesExt};
+        use crate::io::{LE, ReadBytesExt};
 
         Ok(if let Some(handle) = &self.regions.linked_blob_files {
             let table_id = self.global_id();
@@ -360,7 +368,7 @@ impl Table {
                 // Key sorts past the last filter partition — definite miss.
                 #[cfg(feature = "metrics")]
                 {
-                    use std::sync::atomic::Ordering::Relaxed;
+                    use core::sync::atomic::Ordering::Relaxed;
                     self.metrics.filter_queries.fetch_add(1, Relaxed);
                     self.metrics.io_skipped_by_filter.fetch_add(1, Relaxed);
                 }
@@ -388,7 +396,7 @@ impl Table {
         {
             #[cfg(feature = "metrics")]
             {
-                use std::sync::atomic::Ordering::Relaxed;
+                use core::sync::atomic::Ordering::Relaxed;
                 self.metrics.filter_queries.fetch_add(1, Relaxed);
                 self.metrics.io_skipped_by_filter.fetch_add(1, Relaxed);
             }
@@ -427,7 +435,7 @@ impl Table {
 
         #[cfg(feature = "metrics")]
         {
-            use std::sync::atomic::Ordering::Relaxed;
+            use core::sync::atomic::Ordering::Relaxed;
             // NOTE: `check_bloom()` accounts for lookups rejected by the filter
             // (skip I/O entirely). This path accounts for negative point lookups
             // that still reached storage even though a filter was present, so
@@ -473,7 +481,7 @@ impl Table {
 
         #[cfg(feature = "metrics")]
         {
-            use std::sync::atomic::Ordering::Relaxed;
+            use core::sync::atomic::Ordering::Relaxed;
             if result.is_none() && bloom.has_filter() {
                 self.metrics.filter_queries.fetch_add(1, Relaxed);
             }
@@ -858,6 +866,7 @@ impl Table {
             .expect("data block count should fit");
 
         Scanner::new(
+            &self.fs,
             &self.path,
             block_count,
             self.metadata.data_block_compression,
@@ -1151,9 +1160,9 @@ impl Table {
         comparator: SharedComparator,
         #[cfg(feature = "metrics")] metrics: Arc<Metrics>,
     ) -> crate::Result<Self> {
+        use core::sync::atomic::AtomicBool;
         use meta::ParsedMeta;
         use regions::ParsedRegions;
-        use std::sync::atomic::AtomicBool;
 
         log::debug!("Recovering table from file {}", file_path.display());
         let mut file = fs.open(&file_path, &FsOpenOptions::new().read(true))?;
@@ -1162,7 +1171,7 @@ impl Table {
         #[cfg(feature = "metrics")]
         metrics
             .table_file_opened_uncached
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
 
         let trailer = crate::sfa::Reader::from_reader(&mut file)?;
         let regions = ParsedRegions::parse_from_toc(trailer.toc())?;
@@ -1534,7 +1543,7 @@ impl Table {
             #[cfg(feature = "metrics")]
             metrics,
 
-            cached_blob_bytes: std::sync::OnceLock::new(),
+            cached_blob_bytes: AtomicU64::new(u64::MAX),
             range_tombstones,
             block_layout,
             encryption,
@@ -1592,7 +1601,7 @@ impl Table {
         reason = "block sizes are bounded well within usize on all supported platforms"
     )]
     fn read_checked_slice(
-        cursor: &mut std::io::Cursor<&[u8]>,
+        cursor: &mut crate::io::Cursor<&[u8]>,
         field: &'static str,
         len: usize,
     ) -> crate::Result<Vec<u8>> {
@@ -1625,8 +1634,7 @@ impl Table {
         block: &Block,
         comparator: &dyn crate::comparator::UserComparator,
     ) -> crate::Result<Vec<RangeTombstone>> {
-        use byteorder::{LE, ReadBytesExt};
-        use std::io::Cursor;
+        use crate::io::{Cursor, LE, ReadBytesExt};
 
         let mut tombstones = Vec::new();
         let data = block.data.as_ref();
@@ -1729,7 +1737,7 @@ impl Table {
     pub(crate) fn mark_as_deleted(&self) {
         self.0
             .is_deleted
-            .store(true, std::sync::atomic::Ordering::Release);
+            .store(true, core::sync::atomic::Ordering::Release);
     }
 
     /// Checks if a key range overlaps (partially or fully) with this table's key range.

@@ -14,10 +14,16 @@ use crate::{
         filter::build_burr_filter_bytes,
     },
 };
-use std::{
-    io::{Seek, Write},
-    sync::Arc,
-};
+use alloc::sync::Arc;
+#[cfg(not(feature = "std"))]
+use alloc::{boxed::Box, vec::Vec};
+
+// Concrete writers (sfa::Writer / ChecksummedWriter) carry the io trait via
+// their own impls; the defining trait must be in scope for raw method calls.
+#[cfg(not(feature = "std"))]
+use crate::io::{Seek, Write};
+#[cfg(feature = "std")]
+use std::io::{Seek, Write};
 
 pub struct PartitionedFilterWriter {
     final_filter_buffer: Vec<u8>,
@@ -92,7 +98,7 @@ impl PartitionedFilterWriter {
         // flush/compaction, so the saved reallocations matter on the
         // write hot path.
         let old_cap = self.bloom_hash_buffer.capacity();
-        let hashes = std::mem::replace(&mut self.bloom_hash_buffer, Vec::with_capacity(old_cap));
+        let hashes = core::mem::replace(&mut self.bloom_hash_buffer, Vec::with_capacity(old_cap));
         let filter_bytes = build_burr_filter_bytes(self.bloom_policy, hashes)?;
 
         // An empty BuRR build result means the policy is inactive for
@@ -216,7 +222,7 @@ impl PartitionedFilterWriter {
     }
 }
 
-impl<W: std::io::Write + std::io::Seek> FilterWriter<W> for PartitionedFilterWriter {
+impl<W: crate::io::Write + crate::io::Seek> FilterWriter<W> for PartitionedFilterWriter {
     fn use_encryption(
         mut self: Box<Self>,
         encryption: Option<Arc<dyn EncryptionProvider>>,

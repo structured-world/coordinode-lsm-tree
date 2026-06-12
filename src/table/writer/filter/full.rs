@@ -11,7 +11,9 @@ use crate::{
     prefix::PrefixExtractor,
     table::{Block, filter::build_burr_filter_bytes},
 };
-use std::sync::Arc;
+use alloc::sync::Arc;
+#[cfg(not(feature = "std"))]
+use alloc::{boxed::Box, vec::Vec};
 
 pub struct FullFilterWriter {
     /// Key hashes for AMQ filter
@@ -46,7 +48,7 @@ impl FullFilterWriter {
     }
 }
 
-impl<W: std::io::Write + std::io::Seek> FilterWriter<W> for FullFilterWriter {
+impl<W: crate::io::Write + crate::io::Seek> FilterWriter<W> for FullFilterWriter {
     fn use_partition_size(self: Box<Self>, _: u32) -> Box<dyn FilterWriter<W>> {
         self
     }
@@ -124,6 +126,8 @@ impl<W: std::io::Write + std::io::Seek> FilterWriter<W> for FullFilterWriter {
             self.bloom_policy,
         );
 
+        // no-std: caller-provided Clock trait (timing is trace-only here)
+        #[cfg(feature = "std")]
         let start = std::time::Instant::now();
         // Build BEFORE opening the archive section. An invalid policy
         // can produce empty bytes; opening start("filter") and then
@@ -141,11 +145,14 @@ impl<W: std::io::Write + std::io::Seek> FilterWriter<W> for FullFilterWriter {
 
         file_writer.start("filter")?;
 
+        #[cfg(feature = "std")]
         log::trace!(
             "Built BuRR filter ({}B) in {:?}",
             filter_bytes.len(),
             start.elapsed(),
         );
+        #[cfg(not(feature = "std"))]
+        log::trace!("Built BuRR filter ({}B)", filter_bytes.len());
 
         Block::write_into(
             file_writer,

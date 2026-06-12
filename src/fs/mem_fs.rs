@@ -14,10 +14,24 @@
 //!   may fail with `ENOENT` on virtual paths.
 
 use super::{Fs, FsCapabilities, FsDirEntry, FsFile, FsMetadata, FsOpenOptions};
-use std::collections::{HashMap, HashSet};
-use std::io::{self, Read, Seek, SeekFrom, Write};
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, RwLock};
+use crate::io::{self, SeekFrom};
+// Trait names referenced only by the no_std trait impls below (the std impls
+// target `std::io::*` directly, so these would be unused under `std`).
+#[cfg(not(feature = "std"))]
+use crate::io::{Read, Seek, Write};
+use crate::path::{Path, PathBuf};
+#[cfg(not(feature = "std"))]
+use alloc::borrow::ToOwned;
+use alloc::sync::Arc;
+#[cfg(not(feature = "std"))]
+use alloc::{boxed::Box, vec::Vec};
+// no_std-capable primitives so this reference backend compiles on
+// `--no-default-features --features alloc` (it's the template a no_std
+// consumer copies for a real backend, e.g. WASM/IndexedDB): `spin` locks
+// (no poisoning, userspace), `hashbrown` maps. The locks see no real
+// contention here — a single ephemeral in-memory tree — so spin is fine.
+use hashbrown::{HashMap, HashSet};
+use spin::{Mutex, RwLock};
 
 // ---------------------------------------------------------------------------
 // MemFs
@@ -74,10 +88,13 @@ impl MemFs {
 /// values never collide; cloned `MemFs` instances reuse the same ID
 /// because `MemFs` derives `Clone`.
 fn next_mem_fs_namespace_id() -> u64 {
-    use core::sync::atomic::{AtomicU64, Ordering};
+    use core::sync::atomic::{AtomicU32, Ordering};
+    // `AtomicU32`, not `AtomicU64`: 64-bit atomics are unavailable on some
+    // no_std targets (e.g. thumbv7em). u32 IDs are ample for distinct
+    // in-memory backends in one process; widened to u64 at the call site.
     // Start at 1 so a future `0` sentinel stays available if needed.
-    static COUNTER: AtomicU64 = AtomicU64::new(1);
-    COUNTER.fetch_add(1, Ordering::Relaxed)
+    static COUNTER: AtomicU32 = AtomicU32::new(1);
+    u64::from(COUNTER.fetch_add(1, Ordering::Relaxed))
 }
 
 impl Default for MemFs {
@@ -109,8 +126,13 @@ fn copy_from_data(buf: &mut [u8], data: &[u8], pos: usize) -> usize {
     n
 }
 
-impl Read for MemFile {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+// Bodies live on inherent `*_impl` methods returning `crate::io::Result`; the
+// trait impls are dual-gated thin wrappers. Under `std`, `crate::io::{Read,
+// Write,Seek}` are method-less supertrait aliases (blanket-impl'd for
+// `std::io::*`), so the real impl must target `std::io::*` there and bridge the
+// error back via `Into`; under `no_std` it targets the native `crate::io::*`.
+impl MemFile {
+    fn read_impl(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         if !self.readable {
             return Err(io::Error::other("file not opened for reading"));
         }
@@ -126,10 +148,8 @@ impl Read for MemFile {
         self.cursor += n as u64;
         Ok(n)
     }
-}
 
-impl Write for MemFile {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+    fn write_impl(&mut self, buf: &[u8]) -> io::Result<usize> {
         if !self.writable {
             return Err(io::Error::other("file not opened for writing"));
         }
@@ -163,13 +183,7 @@ impl Write for MemFile {
         Ok(buf.len())
     }
 
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
-impl Seek for MemFile {
-    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+    fn seek_impl(&mut self, pos: SeekFrom) -> io::Result<u64> {
         let new_pos: u64 = match pos {
             SeekFrom::Start(n) => n,
             SeekFrom::End(n) => {
@@ -206,6 +220,51 @@ impl Seek for MemFile {
 
         self.cursor = new_pos;
         Ok(self.cursor)
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::io::Read for MemFile {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.read_impl(buf).map_err(Into::into)
+    }
+}
+#[cfg(not(feature = "std"))]
+impl Read for MemFile {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.read_impl(buf)
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::io::Write for MemFile {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.write_impl(buf).map_err(Into::into)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+#[cfg(not(feature = "std"))]
+impl Write for MemFile {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.write_impl(buf)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::io::Seek for MemFile {
+    fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+        self.seek_impl(pos.into()).map_err(Into::into)
+    }
+}
+#[cfg(not(feature = "std"))]
+impl Seek for MemFile {
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        self.seek_impl(pos)
     }
 }
 
@@ -299,10 +358,6 @@ fn ensure_parent_dir(path: &Path, state: &State) -> io::Result<()> {
 // Fs for MemFs
 // ---------------------------------------------------------------------------
 
-#[expect(
-    clippy::significant_drop_tightening,
-    reason = "RwLock guards are intentionally held for the duration of each method"
-)]
 impl Fs for MemFs {
     fn open(&self, path: &Path, opts: &FsOpenOptions) -> io::Result<Box<dyn FsFile>> {
         ensure_non_empty_path(path)?;
@@ -492,6 +547,7 @@ impl Fs for MemFs {
                 && let Some(name) = file_path.file_name()
             {
                 // Match StdFs contract: reject non-UTF-8 names with InvalidData.
+                #[cfg(feature = "std")]
                 let file_name = name.to_str().ok_or_else(|| {
                     io::Error::new(
                         io::ErrorKind::InvalidData,
@@ -502,6 +558,9 @@ impl Fs for MemFs {
                         ),
                     )
                 })?;
+                // no_std: keys are UTF-8 `&str` by construction.
+                #[cfg(not(feature = "std"))]
+                let file_name = name;
                 entries.push(FsDirEntry {
                     path: file_path.clone(),
                     file_name: file_name.to_owned(),
@@ -515,6 +574,7 @@ impl Fs for MemFs {
                 && dir_path != path
                 && let Some(name) = dir_path.file_name()
             {
+                #[cfg(feature = "std")]
                 let file_name = name.to_str().ok_or_else(|| {
                     io::Error::new(
                         io::ErrorKind::InvalidData,
@@ -525,6 +585,9 @@ impl Fs for MemFs {
                         ),
                     )
                 })?;
+                // no_std: keys are UTF-8 `&str` by construction.
+                #[cfg(not(feature = "std"))]
+                let file_name = name;
                 entries.push(FsDirEntry {
                     path: dir_path.clone(),
                     file_name: file_name.to_owned(),
@@ -720,16 +783,34 @@ impl Fs for MemFs {
 // Lock helpers - convert PoisonError to io::Error
 // ---------------------------------------------------------------------------
 
-fn lock<T>(m: &Mutex<T>) -> io::Result<std::sync::MutexGuard<'_, T>> {
-    m.lock().map_err(|_| io::Error::other("mutex poisoned"))
+// `spin` locks cannot be poisoned (no unwind-during-hold concept), so these
+// always succeed; the `io::Result` return is kept so the `?`-using call sites
+// stay unchanged.
+// Kept returning `io::Result` (always `Ok`) so the `?`-using call sites are
+// untouched — spin locks never poison, but a future fallible lock layer would
+// slot in here without churning every caller.
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "Result kept for ?-compatible call sites and future fallible-lock parity"
+)]
+fn lock<T>(m: &Mutex<T>) -> io::Result<impl core::ops::DerefMut<Target = T> + '_> {
+    Ok(m.lock())
 }
 
-fn read_state(rw: &RwLock<State>) -> io::Result<std::sync::RwLockReadGuard<'_, State>> {
-    rw.read().map_err(|_| io::Error::other("rwlock poisoned"))
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "Result kept for ?-compatible call sites and future fallible-lock parity"
+)]
+fn read_state(rw: &RwLock<State>) -> io::Result<impl core::ops::Deref<Target = State> + '_> {
+    Ok(rw.read())
 }
 
-fn write_state(rw: &RwLock<State>) -> io::Result<std::sync::RwLockWriteGuard<'_, State>> {
-    rw.write().map_err(|_| io::Error::other("rwlock poisoned"))
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "Result kept for ?-compatible call sites and future fallible-lock parity"
+)]
+fn write_state(rw: &RwLock<State>) -> io::Result<impl core::ops::DerefMut<Target = State> + '_> {
+    Ok(rw.write())
 }
 
 // ---------------------------------------------------------------------------
@@ -1048,10 +1129,10 @@ mod tests {
         let mut file = fs.open(path, &opts)?;
         file.write_all(b"hello world")?;
 
-        file.seek(SeekFrom::Start(6))?;
+        file.seek(std::io::SeekFrom::Start(6))?;
         file.write_all(b"rust!")?;
 
-        file.seek(SeekFrom::Start(0))?;
+        file.seek(std::io::SeekFrom::Start(0))?;
         let mut buf = String::new();
         file.read_to_string(&mut buf)?;
         assert_eq!(buf, "hello rust!");

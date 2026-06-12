@@ -58,7 +58,13 @@
 //! record shape is recognised on both paths.
 
 use super::framing;
-use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
+use crate::io::{LittleEndian, ReadBytesExt, WriteBytesExt};
+#[cfg(not(feature = "std"))]
+use alloc::vec::Vec;
+
+#[cfg(not(feature = "std"))]
+use crate::io::{Read, Write};
+#[cfg(feature = "std")]
 use std::io::{Read, Write};
 
 /// One table in a run: the snapshot's per-table record minus the positional
@@ -321,7 +327,10 @@ pub fn replay_edits<R: Read>(
     mode: crate::config::ManifestRecoveryMode,
 ) -> crate::Result<Vec<VersionEdit>> {
     use crate::config::ManifestRecoveryMode;
+    #[cfg(not(feature = "std"))]
+    use crate::io::BufRead;
     use framing::FramedRecordOutcome;
+    #[cfg(feature = "std")]
     use std::io::BufRead;
 
     // Only AbsoluteConsistency refuses to roll back a writer-incomplete tail.
@@ -335,14 +344,14 @@ pub fn replay_edits<R: Read>(
 
     // Buffer the reader so a clean record boundary can be detected (empty fill)
     // without consuming bytes from a genuine trailing record.
-    let mut reader = std::io::BufReader::new(reader);
+    let mut reader = crate::io::BufReader::new(reader);
     let mut edits = Vec::new();
     let mut scratch = Vec::new();
     loop {
         // No bytes left at a record boundary: the normal end of the log. A crash
         // exactly at a boundary is indistinguishable from a pristine close, so
         // this is always a successful end — never a "torn tail", in any mode.
-        if reader.fill_buf().map_err(crate::Error::Io)?.is_empty() {
+        if reader.fill_buf().map_err(crate::Error::from)?.is_empty() {
             break;
         }
         let outcome = framing::read_framed_record(&mut reader, u64::MAX, None, &mut scratch)?;

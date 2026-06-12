@@ -3,15 +3,16 @@
 // Copyright (c) 2026-present, Structured World Foundation
 
 use crate::sharded_cache::{ShardedCache, UnitWeighter};
+use alloc::sync::Arc;
+
 use crate::{GlobalTableId, fs::FsFile};
-use std::sync::Arc;
 
 const TAG_BLOCK: u8 = 0;
 const TAG_BLOB: u8 = 1;
 
 type Item = Arc<dyn FsFile>;
 
-#[derive(Clone, Copy, Eq, std::hash::Hash, PartialEq)]
+#[derive(Clone, Copy, Eq, core::hash::Hash, PartialEq)]
 struct CacheKey(u8, u64, u64);
 
 /// Number of shards in the FD cache. Smaller than the block cache: the FD cache

@@ -3,6 +3,8 @@ use crate::{
     blob_tree::FragmentationMap,
     vlog::{BlobFile, BlobFileId},
 };
+#[cfg(not(feature = "std"))]
+use alloc::vec::Vec;
 
 #[derive(Clone, Default)]
 pub struct BlobFileList(HashMap<BlobFileId, BlobFile>);

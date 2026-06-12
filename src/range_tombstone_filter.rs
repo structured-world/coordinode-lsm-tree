@@ -13,6 +13,8 @@
 use crate::active_tombstone_set::{ActiveTombstoneSet, ActiveTombstoneSetReverse};
 use crate::range_tombstone::RangeTombstone;
 use crate::{InternalValue, SeqNo, comparator::SharedComparator};
+#[cfg(not(feature = "std"))]
+use alloc::vec::Vec;
 
 /// Wraps a bidirectional KV stream and suppresses entries covered by range tombstones.
 ///
@@ -110,7 +112,7 @@ impl<I> RangeTombstoneFilter<I> {
     /// Activates forward tombstones whose start <= `current_key`.
     fn fwd_activate_up_to(&mut self, key: &[u8]) {
         while let Some((rt, cutoff)) = self.fwd_tombstones.get(self.fwd_idx) {
-            if self.comparator.compare(&rt.start, key) == std::cmp::Ordering::Greater {
+            if self.comparator.compare(&rt.start, key) == core::cmp::Ordering::Greater {
                 break;
             }
             self.fwd_active.activate(rt, *cutoff);
@@ -121,7 +123,7 @@ impl<I> RangeTombstoneFilter<I> {
     /// Activates reverse tombstones whose end > `current_key`.
     fn rev_activate_up_to(&mut self, key: &[u8]) {
         while let Some((rt, cutoff)) = self.rev_tombstones.get(self.rev_idx) {
-            if self.comparator.compare(&rt.end, key) == std::cmp::Ordering::Greater {
+            if self.comparator.compare(&rt.end, key) == core::cmp::Ordering::Greater {
                 self.rev_active.activate(rt, *cutoff);
                 self.rev_idx += 1;
             } else {

@@ -3,7 +3,9 @@
 // Copyright (c) 2026-present, Structured World Foundation
 
 use crate::{Memtable, tree::inner::MemtableId};
-use std::sync::Arc;
+use alloc::sync::Arc;
+#[cfg(not(feature = "std"))]
+use alloc::vec::Vec;
 
 /// Stores references to all sealed memtables
 ///

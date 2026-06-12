@@ -5,6 +5,9 @@
 #[cfg(zstd_any)]
 use crate::compression::CompressionProvider as _;
 
+#[cfg(not(feature = "std"))]
+use crate::io::{Cursor, Read};
+use crate::io::{LittleEndian, ReadBytesExt};
 use crate::{
     BlobFile, Checksum, CompressionType, UserValue,
     fs::FsFile,
@@ -15,7 +18,7 @@ use crate::{
         },
     },
 };
-use byteorder::{LittleEndian, ReadBytesExt};
+#[cfg(feature = "std")]
 use std::io::{Cursor, Read};
 
 /// Safety cap on blob value size (256 MiB).
@@ -425,7 +428,7 @@ mod tests {
     #[test]
     #[cfg(feature = "lz4")]
     fn blob_reader_lz4_corrupted_real_val_len_triggers_header_crc_mismatch() -> crate::Result<()> {
-        use byteorder::WriteBytesExt;
+        use crate::io::WriteBytesExt;
 
         let id_generator = SequenceNumberCounter::default();
 
@@ -503,7 +506,7 @@ mod tests {
     #[test]
     #[cfg(zstd_any)]
     fn blob_reader_zstd_corrupted_real_val_len_triggers_header_crc_mismatch() -> crate::Result<()> {
-        use byteorder::WriteBytesExt;
+        use crate::io::WriteBytesExt;
 
         let id_generator = SequenceNumberCounter::default();
 
@@ -965,8 +968,8 @@ mod tests {
     #[test]
     fn blob_reader_v3_backward_compat_roundtrip() -> crate::Result<()> {
         use crate::file_accessor::FileAccessor;
+        use crate::io::WriteBytesExt;
         use crate::vlog::{ValueHandle, blob_file::Inner as BlobFileInner};
-        use byteorder::WriteBytesExt;
         use std::io::Write;
         use std::sync::{Arc, atomic::AtomicBool};
 
@@ -992,23 +995,23 @@ mod tests {
 
             // V3 frame: BLOB magic, no header_crc
             sfa_writer.write_all(b"BLOB")?;
-            sfa_writer.write_u128::<byteorder::LittleEndian>(checksum)?;
-            sfa_writer.write_u64::<byteorder::LittleEndian>(42)?; // seqno
+            sfa_writer.write_u128::<crate::io::LittleEndian>(checksum)?;
+            sfa_writer.write_u64::<crate::io::LittleEndian>(42)?; // seqno
             #[expect(
                 clippy::cast_possible_truncation,
                 reason = "test key length fits in u16"
             )]
-            sfa_writer.write_u16::<byteorder::LittleEndian>(key.len() as u16)?;
+            sfa_writer.write_u16::<crate::io::LittleEndian>(key.len() as u16)?;
             #[expect(
                 clippy::cast_possible_truncation,
                 reason = "test value length fits in u32"
             )]
-            sfa_writer.write_u32::<byteorder::LittleEndian>(value.len() as u32)?;
+            sfa_writer.write_u32::<crate::io::LittleEndian>(value.len() as u32)?;
             #[expect(
                 clippy::cast_possible_truncation,
                 reason = "test value length fits in u32"
             )]
-            sfa_writer.write_u32::<byteorder::LittleEndian>(value.len() as u32)?;
+            sfa_writer.write_u32::<crate::io::LittleEndian>(value.len() as u32)?;
             sfa_writer.write_all(key)?;
             sfa_writer.write_all(value)?;
 

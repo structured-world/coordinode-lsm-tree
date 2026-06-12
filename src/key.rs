@@ -3,7 +3,7 @@
 // Copyright (c) 2026-present, Structured World Foundation
 
 use crate::{SeqNo, UserKey, ValueType, comparator::UserComparator};
-use std::cmp::Reverse;
+use core::cmp::Reverse;
 
 #[derive(Clone, Eq)]
 pub struct InternalKey {
@@ -19,8 +19,8 @@ impl PartialEq for InternalKey {
 }
 
 #[cfg_attr(coverage_nightly, coverage(off))]
-impl std::fmt::Debug for InternalKey {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Debug for InternalKey {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(
             f,
             "{:?}:{}:{}",
@@ -74,14 +74,14 @@ impl InternalKey {
         &self,
         other: &Self,
         cmp: &C,
-    ) -> std::cmp::Ordering {
+    ) -> core::cmp::Ordering {
         cmp.compare(&self.user_key, &other.user_key)
             .then_with(|| Reverse(self.seqno).cmp(&Reverse(other.seqno)))
     }
 }
 
 impl PartialOrd for InternalKey {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
         Some(self.cmp(other))
     }
 }
@@ -90,7 +90,7 @@ impl PartialOrd for InternalKey {
 // This is one of the most important functions
 // Otherwise queries will not match expected behaviour
 impl Ord for InternalKey {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
         (&self.user_key, Reverse(self.seqno)).cmp(&(&other.user_key, Reverse(other.seqno)))
     }
 }

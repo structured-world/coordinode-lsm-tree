@@ -6,7 +6,9 @@ use crate::{
     SeqNo, UserKey, UserValue, blob_tree::handle::BlobIndirection, file::BLOBS_FOLDER,
     table::Table, tree::ingest::Ingestion as TableIngestion, vlog::BlobFileWriter,
 };
-use std::cmp::Ordering;
+#[cfg(not(feature = "std"))]
+use alloc::{string::ToString, vec::Vec};
+use core::cmp::Ordering;
 
 /// Bulk ingestion for [`BlobTree`](crate::BlobTree)
 ///
@@ -199,10 +201,8 @@ impl<'a> BlobIngestion<'a> {
         // Acquire locks for version registration on the index tree. We must
         // hold both the compaction state lock and version history lock to
         // safely modify the tree's version.
-        #[expect(clippy::expect_used, reason = "lock is expected to not be poisoned")]
-        let mut _compaction_state = index.compaction_state.lock().expect("lock is poisoned");
-        #[expect(clippy::expect_used, reason = "lock is expected to not be poisoned")]
-        let mut version_lock = index.version_history.write().expect("lock is poisoned");
+        let mut _compaction_state = index.compaction_state.lock();
+        let mut version_lock = index.version_history.write();
 
         // Allocate the next global sequence number. This seqno will be shared
         // by all ingested tables, blob files, and the version that registers

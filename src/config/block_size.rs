@@ -2,11 +2,14 @@
 // Copyright (c) 2024-present, fjall-rs
 // Copyright (c) 2026-present, Structured World Foundation
 
+#[cfg(not(feature = "std"))]
+use alloc::vec::Vec;
+
 /// Block size policy
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct BlockSizePolicy(Vec<u32>);
 
-impl std::ops::Deref for BlockSizePolicy {
+impl core::ops::Deref for BlockSizePolicy {
     type Target = [u32];
 
     fn deref(&self) -> &Self::Target {

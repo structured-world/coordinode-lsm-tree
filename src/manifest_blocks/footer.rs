@@ -35,8 +35,13 @@
 //! validates structural invariants (UTF-8, non-empty names, no
 //! duplicates, bounded sizes).
 
+use crate::io::{LittleEndian, ReadBytesExt, WriteBytesExt};
+#[cfg(not(feature = "std"))]
+use crate::io::{Read, Write};
 use crate::manifest_blocks::{MANIFEST_LAYOUT_VERSION_V1, MAX_SECTION_NAME_BYTES};
-use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
+#[cfg(not(feature = "std"))]
+use alloc::{string::String, vec::Vec};
+#[cfg(feature = "std")]
 use std::io::{Read, Write};
 
 /// One entry in the footer's table of contents — locates a single

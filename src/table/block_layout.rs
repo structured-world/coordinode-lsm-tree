@@ -25,6 +25,8 @@
 //! ```
 
 use crate::table::block::BlockOffset;
+#[cfg(not(feature = "std"))]
+use alloc::vec::Vec;
 
 /// Serialize the per-block inner-block layouts into `out`.
 ///
@@ -74,7 +76,7 @@ impl BlockLayoutMap {
     /// the entries are not strictly ascending by offset (a corrupt section
     /// must surface rather than silently mis-map a range).
     pub fn decode(bytes: &[u8]) -> crate::Result<Self> {
-        // Manual little-endian slice parsing (no `std::io::Read`), so the codec
+        // Manual little-endian slice parsing (no `crate::io::Read`), so the codec
         // stays `no_std + alloc`-clean. Any truncation or invariant violation
         // surfaces as a typed `InvalidHeader`, not a stringly-typed I/O error.
         const ERR: crate::Error = crate::Error::InvalidHeader("BlockLayout");

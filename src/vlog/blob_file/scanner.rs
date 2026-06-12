@@ -5,13 +5,17 @@
 // Format constants live in writer (the format definition site).
 // Extracting to a shared module is an upstream structural decision.
 use super::writer::{BLOB_HEADER_MAGIC_V3, BLOB_HEADER_MAGIC_V4, validate_header_crc};
+use crate::fs::{Fs, FsFile, FsOpenOptions};
+use crate::io::BufReader;
+use crate::io::{LittleEndian, ReadBytesExt};
+#[cfg(not(feature = "std"))]
+use crate::io::{Read, Seek, SeekFrom};
+use crate::path::Path;
 use crate::{Checksum, SeqNo, UserKey, UserValue, vlog::BlobFileId};
-use byteorder::{LittleEndian, ReadBytesExt};
-use std::{
-    fs::File,
-    io::{BufReader, Read, Seek},
-    path::Path,
-};
+#[cfg(not(feature = "std"))]
+use alloc::boxed::Box;
+#[cfg(feature = "std")]
+use std::io::{Read, Seek, SeekFrom};
 
 /// Reads through a blob file in order.
 ///
@@ -22,7 +26,7 @@ use std::{
 /// magic (`META`).
 pub struct Scanner {
     pub(crate) blob_file_id: BlobFileId, // TODO: remove unused?
-    inner: BufReader<File>,
+    inner: BufReader<Box<dyn FsFile>>,
     is_terminated: bool,
 
     /// Byte offset where the "data" section ends (from the SFA TOC).
@@ -40,10 +44,14 @@ impl Scanner {
     ///
     /// Will return `Err` if an IO error occurs or the blob file lacks
     /// a "data" section.
-    pub fn new<P: AsRef<Path>>(path: P, blob_file_id: BlobFileId) -> crate::Result<Self> {
+    pub fn new<P: AsRef<Path>>(
+        path: P,
+        fs: &dyn Fs,
+        blob_file_id: BlobFileId,
+    ) -> crate::Result<Self> {
         let path = path.as_ref();
 
-        let mut file = File::open(path)?;
+        let mut file = fs.open(path, &FsOpenOptions::new().read(true))?;
         let sfa_reader = crate::sfa::Reader::from_reader(&mut file)?;
         let data_section = sfa_reader.toc().section(b"data").ok_or_else(|| {
             log::error!("BlobFile: SFA TOC has no \"data\" section");
@@ -58,7 +66,7 @@ impl Scanner {
             crate::Error::InvalidHeader("BlobFile")
         })?;
 
-        file.seek(std::io::SeekFrom::Start(data_start))?;
+        file.seek(SeekFrom::Start(data_start))?;
         let file_reader = BufReader::with_capacity(32_000, file);
 
         Ok(Self {
@@ -223,7 +231,7 @@ mod tests {
         }
 
         {
-            let mut scanner = Scanner::new(&blob_file_path, 0)?;
+            let mut scanner = Scanner::new(&blob_file_path, &StdFs, 0)?;
 
             for key in keys {
                 assert_eq!(
@@ -268,7 +276,7 @@ mod tests {
             .copy_from_slice(&99u64.to_le_bytes()[..seqno_len]);
         std::fs::write(&blob_file_path, &raw)?;
 
-        let mut scanner = Scanner::new(&blob_file_path, 0)?;
+        let mut scanner = Scanner::new(&blob_file_path, &StdFs, 0)?;
         let result = scanner.next().unwrap();
         assert!(
             matches!(result, Err(crate::Error::HeaderCrcMismatch { .. })),
@@ -304,7 +312,7 @@ mod tests {
         raw[value_offset] ^= 0xFF;
         std::fs::write(&blob_file_path, &raw)?;
 
-        let mut scanner = Scanner::new(&blob_file_path, 0)?;
+        let mut scanner = Scanner::new(&blob_file_path, &StdFs, 0)?;
         let result = scanner.next().unwrap();
         assert!(
             matches!(result, Err(crate::Error::ChecksumMismatch { .. })),
@@ -318,7 +326,7 @@ mod tests {
     /// then verify the scanner can read it with V3 backward compat path.
     #[test]
     fn blob_scanner_reads_v3_format() -> crate::Result<()> {
-        use byteorder::{LittleEndian, WriteBytesExt};
+        use crate::io::{LittleEndian, WriteBytesExt};
         use std::io::Write;
 
         let dir = tempdir()?;
@@ -381,7 +389,7 @@ mod tests {
         }
 
         // Scanner should read the V3 frame successfully
-        let mut scanner = Scanner::new(&blob_file_path, 0)?;
+        let mut scanner = Scanner::new(&blob_file_path, &StdFs, 0)?;
         let entry = scanner.next().unwrap()?;
         assert_eq!(entry.key, Slice::from(&key[..]));
         assert_eq!(entry.value, Slice::from(&value[..]));
@@ -409,7 +417,7 @@ mod tests {
         raw[0..4].copy_from_slice(b"XXXX");
         std::fs::write(&blob_file_path, &raw)?;
 
-        let mut scanner = Scanner::new(&blob_file_path, 0)?;
+        let mut scanner = Scanner::new(&blob_file_path, &StdFs, 0)?;
         let result = scanner.next().unwrap();
         assert!(
             matches!(result, Err(crate::Error::InvalidHeader("Blob"))),
@@ -467,7 +475,7 @@ mod tests {
             .copy_from_slice(b"META");
         std::fs::write(&blob_file_path, &raw)?;
 
-        let mut scanner = Scanner::new(&blob_file_path, 0)?;
+        let mut scanner = Scanner::new(&blob_file_path, &StdFs, 0)?;
 
         // First frame should still be readable (it's intact).
         let first = scanner.next().unwrap();
@@ -501,7 +509,7 @@ mod tests {
             sfa_writer.finish()?;
         }
 
-        let result = Scanner::new(&blob_file_path, 0);
+        let result = Scanner::new(&blob_file_path, &StdFs, 0);
         assert!(result.is_err(), "expected error for missing data section");
         let err = result.err().unwrap();
         assert!(
@@ -516,7 +524,7 @@ mod tests {
     /// section whose pos + len overflows u64.
     #[test]
     fn blob_scanner_rejects_data_section_offset_overflow() -> crate::Result<()> {
-        use byteorder::{LittleEndian, WriteBytesExt};
+        use crate::io::{LittleEndian, WriteBytesExt};
         use std::io::Write;
 
         let dir = tempdir()?;
@@ -568,7 +576,7 @@ mod tests {
             file.sync_all()?;
         }
 
-        let result = Scanner::new(&blob_file_path, 0);
+        let result = Scanner::new(&blob_file_path, &StdFs, 0);
         assert!(
             result.is_err(),
             "expected error for overflowing data section"

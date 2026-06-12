@@ -121,12 +121,72 @@
 // `Box`, and other heap types throughout. `extern crate alloc` makes the
 // `alloc` crate root visible to `no_std` builds; under `std` it is a
 // no-op alias because the standard library re-exports the same types.
+#[macro_use]
 extern crate alloc;
 
-#[doc(hidden)]
-pub type HashMap<K, V> = std::collections::HashMap<K, V, rustc_hash::FxBuildHasher>;
+// f64 ceil / round: the native `f64` methods are std-only (they bind to
+// platform float intrinsics), so the `no_std` build routes through `libm`.
+// std keeps the native path (equal or faster); the results are identical.
+#[cfg(feature = "std")]
+#[inline]
+pub(crate) fn f64_ceil(x: f64) -> f64 {
+    x.ceil()
+}
+#[cfg(not(feature = "std"))]
+#[inline]
+pub(crate) fn f64_ceil(x: f64) -> f64 {
+    libm::ceil(x)
+}
+#[cfg(feature = "std")]
+#[inline]
+pub(crate) fn f32_round(x: f32) -> f32 {
+    x.round()
+}
+#[cfg(not(feature = "std"))]
+#[inline]
+pub(crate) fn f32_round(x: f32) -> f32 {
+    libm::roundf(x)
+}
+#[cfg(feature = "std")]
+#[inline]
+pub(crate) fn f32_ceil(x: f32) -> f32 {
+    x.ceil()
+}
+#[cfg(not(feature = "std"))]
+#[inline]
+pub(crate) fn f32_ceil(x: f32) -> f32 {
+    libm::ceilf(x)
+}
+#[cfg(feature = "std")]
+#[inline]
+pub(crate) fn f64_log2(x: f64) -> f64 {
+    x.log2()
+}
+#[cfg(not(feature = "std"))]
+#[inline]
+pub(crate) fn f64_log2(x: f64) -> f64 {
+    libm::log2(x)
+}
+#[cfg(feature = "std")]
+#[inline]
+pub(crate) fn f32_log2(x: f32) -> f32 {
+    x.log2()
+}
+#[cfg(not(feature = "std"))]
+#[inline]
+pub(crate) fn f32_log2(x: f32) -> f32 {
+    libm::log2f(x)
+}
 
-pub(crate) type HashSet<K> = std::collections::HashSet<K, rustc_hash::FxBuildHasher>;
+// `hashbrown` (not `std::collections`) so the crate-wide map / set aliases
+// compile on `no_std + alloc`. hashbrown IS the implementation std's HashMap
+// wraps, so the API and performance match; using it directly just drops the
+// std dependency. Hasher stays `FxHasher` (fast, non-DoS — internal keys are
+// not attacker-controlled).
+#[doc(hidden)]
+pub type HashMap<K, V> = hashbrown::HashMap<K, V, rustc_hash::FxBuildHasher>;
+
+pub(crate) type HashSet<K> = hashbrown::HashSet<K, rustc_hash::FxBuildHasher>;
 
 macro_rules! fail_iter {
     ($e:expr) => {
@@ -154,6 +214,7 @@ pub mod heal_hints;
 // it via `pub` (even with `#[doc(hidden)]`) would lock the helpers into
 // the stable surface; tests that need to exercise them live inline as
 // unit tests inside `src/checkpoint.rs`.
+#[cfg(feature = "std")]
 pub(crate) mod checkpoint;
 
 #[doc(hidden)]
@@ -240,17 +301,6 @@ mod key;
 mod key_range;
 mod loser_tree;
 mod manifest;
-// Unconditional today. Gating behind `feature = "std"` requires
-// cascading `#[cfg]` onto every consumer that imports from this
-// module — `manifest`, `version::{persist,recovery}`, `tree::inner`,
-// `checkpoint`, plus their downstream re-exports — none of which are
-// themselves cfg-gated yet (they're std-bound through `fs::Fs` /
-// `Box<dyn FsFile>` for unrelated reasons). A naive gate here adds
-// hundreds of unresolved-module errors to the `no-std-check` job
-// before unblocking any of them. The cascade migration of this whole
-// std-bound layer (manifest + version + tree + checkpoint) is tracked
-// as issue #358; gating `manifest_blocks` in isolation is not cheap
-// and is the wrong sequencing.
 #[doc(hidden)]
 pub mod manifest_blocks;
 mod memtable;
@@ -297,6 +347,7 @@ pub mod range;
 pub mod runtime_config;
 
 /// Disaster-recovery: rebuild a missing/corrupt manifest from on-disk SSTs.
+// std-only: scans table folders and rewrites the manifest via std::fs.
 #[cfg(feature = "std")]
 pub mod repair;
 
@@ -377,7 +428,6 @@ pub type KvPair = (UserKey, UserValue);
 // rustdoc output; only intra-crate test/bench code is expected to use them.
 #[doc(hidden)]
 pub use {
-    blob_tree::{Guard as BlobGuard, handle::BlobIndirection},
     checksum::Checksum,
     iter_guard::IterGuardImpl,
     key_range::KeyRange,
@@ -386,9 +436,14 @@ pub use {
     // Re-exported for `benches/lsp.rs` only — see hidden-block contract above.
     table::util::longest_shared_prefix_length,
     table::{GlobalTableId, Table, TableId},
+    value::InternalValue,
+};
+
+#[doc(hidden)]
+pub use {
+    blob_tree::{Guard as BlobGuard, handle::BlobIndirection},
     tree::Guard as StandardGuard,
     tree::inner::TreeId,
-    value::InternalValue,
 };
 
 pub use encryption::EncryptionProvider;
@@ -396,8 +451,8 @@ pub use encryption::EncryptionProvider;
 #[cfg(feature = "encryption")]
 pub use encryption::Aes256GcmProvider;
 
-#[cfg(feature = "std")]
 #[doc(hidden)]
+#[cfg(feature = "std")]
 pub use background_deleter::BackgroundDeleter;
 pub use pinnable_slice::PinnableSlice;
 #[cfg(feature = "std")]
@@ -405,29 +460,32 @@ pub use repair::RepairReport;
 pub use write_batch::WriteBatch;
 
 pub use {
-    abstract_tree::{AbstractTree, CheckpointInfo},
-    any_tree::AnyTree,
-    blob_tree::BlobTree,
     cache::Cache,
     comparator::{DefaultUserComparator, SharedComparator, UserComparator},
     compression::CompressionType,
     config::{Config, KvSeparationOptions, TreeType},
-    descriptor_table::DescriptorTable,
     error::{Error, Result},
     format_version::FormatVersion,
-    ingestion::AnyIngestion,
     iter_guard::IterGuard as Guard,
     memtable::{Memtable, MemtableId},
     merge_operator::MergeOperator,
     prefix::PrefixExtractor,
-    scan_since::ScanSinceEvent,
     seqno::{
         MAX_SEQNO, SequenceNumberCounter, SequenceNumberGenerator, SharedSequenceNumberGenerator,
     },
     slice::Slice,
-    tree::Tree,
     value::SeqNo,
     value_type::ValueType,
+};
+
+pub use {
+    abstract_tree::{AbstractTree, CheckpointInfo},
+    any_tree::AnyTree,
+    blob_tree::BlobTree,
+    descriptor_table::DescriptorTable,
+    ingestion::AnyIngestion,
+    scan_since::ScanSinceEvent,
+    tree::Tree,
     vlog::BlobFile,
 };
 

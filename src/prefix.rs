@@ -2,6 +2,9 @@
 // Copyright (c) 2025-present, fjall-rs
 // Copyright (c) 2026-present, Structured World Foundation
 
+#[cfg(not(feature = "std"))]
+use alloc::boxed::Box;
+
 /// Extracts prefixes from keys for prefix bloom filter indexing.
 ///
 /// When a `PrefixExtractor` is configured on a tree, the bloom filter indexes
@@ -39,7 +42,7 @@
 /// }
 /// ```
 pub trait PrefixExtractor:
-    Send + Sync + std::panic::UnwindSafe + std::panic::RefUnwindSafe
+    Send + Sync + core::panic::UnwindSafe + core::panic::RefUnwindSafe
 {
     /// Returns an iterator of prefixes to index for the given key.
     ///
@@ -106,7 +109,7 @@ pub trait PrefixExtractor:
 /// Used by both `Tree::create_prefix` and `BlobTree::prefix` to avoid
 /// duplicating the boundary-check + hashing logic.
 pub fn compute_prefix_hash(
-    extractor: Option<&std::sync::Arc<dyn PrefixExtractor>>,
+    extractor: Option<&alloc::sync::Arc<dyn PrefixExtractor>>,
     prefix_bytes: &[u8],
 ) -> Option<u64> {
     if prefix_bytes.is_empty() {

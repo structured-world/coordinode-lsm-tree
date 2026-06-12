@@ -38,9 +38,12 @@
 // `Fs::remove_file(&Path)` anyway.
 use crate::fs::Fs;
 use alloc::sync::Arc;
+#[cfg(not(feature = "std"))]
+use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, Ordering};
+
+use crate::path::PathBuf;
 use spin::Mutex;
-use std::path::PathBuf;
 
 /// Shared state controlling whether file deletions are deferred.
 ///

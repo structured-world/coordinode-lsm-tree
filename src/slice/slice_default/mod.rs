@@ -3,6 +3,8 @@
 // Copyright (c) 2026-present, Structured World Foundation
 
 use crate::byteview::ByteView;
+#[cfg(not(feature = "std"))]
+use alloc::{string::String, vec::Vec};
 
 pub use crate::byteview::Builder;
 
@@ -33,7 +35,7 @@ impl Slice {
         unsafe { ByteView::builder_unzeroed(len) }
     }
 
-    pub(crate) fn slice(&self, range: impl std::ops::RangeBounds<usize>) -> Self {
+    pub(crate) fn slice(&self, range: impl core::ops::RangeBounds<usize>) -> Self {
         Self(self.0.slice(range))
     }
 
@@ -44,6 +46,17 @@ impl Slice {
     #[doc(hidden)]
     #[cfg(feature = "std")]
     pub fn from_reader<R: std::io::Read>(reader: &mut R, len: usize) -> std::io::Result<Self> {
+        ByteView::from_reader(reader, len).map(Self)
+    }
+
+    /// `no_std` mirror of [`Slice::from_reader`] over [`crate::io::Read`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if an I/O error occurred.
+    #[doc(hidden)]
+    #[cfg(not(feature = "std"))]
+    pub fn from_reader<R: crate::io::Read>(reader: &mut R, len: usize) -> crate::io::Result<Self> {
         ByteView::from_reader(reader, len).map(Self)
     }
 }

@@ -16,12 +16,12 @@
 
 use super::{Fs, FsDirEntry, FsFile, FsMetadata, FsOpenOptions};
 use crate::HashMap;
+use core::sync::atomic::AtomicU64;
 use io_uring::{IoUring, opcode, types};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::unix::io::AsRawFd;
 use std::path::Path;
-use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 
@@ -110,7 +110,7 @@ impl std::fmt::Debug for IoUringFs {
 // ---------------------------------------------------------------------------
 
 impl Fs for IoUringFs {
-    fn open(&self, path: &Path, opts: &FsOpenOptions) -> io::Result<Box<dyn FsFile>> {
+    fn open(&self, path: &Path, opts: &FsOpenOptions) -> crate::io::Result<Box<dyn FsFile>> {
         let mut builder = OpenOptions::new();
         builder
             .read(opts.read)
@@ -156,15 +156,15 @@ impl Fs for IoUringFs {
         }))
     }
 
-    fn create_dir_all(&self, path: &Path) -> io::Result<()> {
-        std::fs::create_dir_all(path)
+    fn create_dir_all(&self, path: &Path) -> crate::io::Result<()> {
+        std::fs::create_dir_all(path).map_err(crate::io::Error::from)
     }
 
-    fn create_dir(&self, path: &Path) -> io::Result<()> {
-        std::fs::create_dir(path)
+    fn create_dir(&self, path: &Path) -> crate::io::Result<()> {
+        std::fs::create_dir(path).map_err(crate::io::Error::from)
     }
 
-    fn read_dir(&self, path: &Path) -> io::Result<Vec<FsDirEntry>> {
+    fn read_dir(&self, path: &Path) -> crate::io::Result<Vec<FsDirEntry>> {
         // Delegate to std::fs — directory listing doesn't benefit from io_uring.
         std::fs::read_dir(path)?
             .map(|res| {
@@ -185,22 +185,23 @@ impl Fs for IoUringFs {
                     is_dir: file_type.is_dir(),
                 })
             })
-            .collect()
+            .collect::<io::Result<Vec<_>>>()
+            .map_err(crate::io::Error::from)
     }
 
-    fn remove_file(&self, path: &Path) -> io::Result<()> {
-        std::fs::remove_file(path)
+    fn remove_file(&self, path: &Path) -> crate::io::Result<()> {
+        std::fs::remove_file(path).map_err(crate::io::Error::from)
     }
 
-    fn remove_dir_all(&self, path: &Path) -> io::Result<()> {
-        std::fs::remove_dir_all(path)
+    fn remove_dir_all(&self, path: &Path) -> crate::io::Result<()> {
+        std::fs::remove_dir_all(path).map_err(crate::io::Error::from)
     }
 
-    fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
-        std::fs::rename(from, to)
+    fn rename(&self, from: &Path, to: &Path) -> crate::io::Result<()> {
+        std::fs::rename(from, to).map_err(crate::io::Error::from)
     }
 
-    fn metadata(&self, path: &Path) -> io::Result<FsMetadata> {
+    fn metadata(&self, path: &Path) -> crate::io::Result<FsMetadata> {
         let m = std::fs::metadata(path)?;
         Ok(FsMetadata {
             len: m.len(),
@@ -209,11 +210,11 @@ impl Fs for IoUringFs {
         })
     }
 
-    fn sync_directory(&self, path: &Path) -> io::Result<()> {
+    fn sync_directory(&self, path: &Path) -> crate::io::Result<()> {
         let dir = File::open(path)?;
         if !dir.metadata()?.is_dir() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
+            return Err(crate::io::Error::new(
+                crate::io::ErrorKind::InvalidInput,
                 "sync_directory: path is not a directory",
             ));
         }
@@ -221,11 +222,11 @@ impl Fs for IoUringFs {
         Ok(())
     }
 
-    fn exists(&self, path: &Path) -> io::Result<bool> {
-        path.try_exists()
+    fn exists(&self, path: &Path) -> crate::io::Result<bool> {
+        path.try_exists().map_err(crate::io::Error::from)
     }
 
-    fn hard_link(&self, src: &Path, dst: &Path) -> io::Result<()> {
+    fn hard_link(&self, src: &Path, dst: &Path) -> crate::io::Result<()> {
         // Hard linking is a metadata-only operation; io_uring offers no
         // throughput benefit, so delegate to [`StdFs`] for the EXDEV
         // fallback logic.
@@ -271,17 +272,17 @@ pub struct IoUringFile {
 }
 
 impl FsFile for IoUringFile {
-    fn sync_all(&self) -> io::Result<()> {
+    fn sync_all(&self) -> crate::io::Result<()> {
         self.ring.submit_fsync(self.file.as_raw_fd(), false)?;
         Ok(())
     }
 
-    fn sync_data(&self) -> io::Result<()> {
+    fn sync_data(&self) -> crate::io::Result<()> {
         self.ring.submit_fsync(self.file.as_raw_fd(), true)?;
         Ok(())
     }
 
-    fn metadata(&self) -> io::Result<FsMetadata> {
+    fn metadata(&self) -> crate::io::Result<FsMetadata> {
         let m = self.file.metadata()?;
         Ok(FsMetadata {
             len: m.len(),
@@ -290,13 +291,13 @@ impl FsFile for IoUringFile {
         })
     }
 
-    fn set_len(&self, size: u64) -> io::Result<()> {
-        self.file.set_len(size)
+    fn set_len(&self, size: u64) -> crate::io::Result<()> {
+        self.file.set_len(size).map_err(crate::io::Error::from)
     }
 
     // Fill-or-EOF: loop until buf is full or we hit EOF (0-byte read).
     // Retries on EINTR internally so callers can rely on short read = EOF.
-    fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+    fn read_at(&self, buf: &mut [u8], offset: u64) -> crate::io::Result<usize> {
         if buf.is_empty() {
             return Ok(0);
         }
@@ -316,7 +317,7 @@ impl FsFile for IoUringFile {
                 match self.ring.submit_read(fd, remaining, current_offset) {
                     Ok(n) => break n,
                     Err(ref e) if e.kind() == io::ErrorKind::Interrupted => {}
-                    Err(e) => return Err(e),
+                    Err(e) => return Err(e.into()),
                 }
             };
 
@@ -329,7 +330,7 @@ impl FsFile for IoUringFile {
         Ok(total_read)
     }
 
-    fn lock_exclusive(&self) -> io::Result<()> {
+    fn lock_exclusive(&self) -> crate::io::Result<()> {
         // Delegate to the platform-specific FsFile impl for std::fs::File.
         FsFile::lock_exclusive(&self.file)
     }
@@ -1162,7 +1163,8 @@ mod tests {
 
         match fs.sync_directory(&path) {
             Ok(()) => panic!("sync_directory on a file should fail"),
-            Err(err) => assert_eq!(err.kind(), io::ErrorKind::InvalidInput),
+            // sync_directory is an `Fs` method → returns `crate::io::Result`.
+            Err(err) => assert_eq!(err.kind(), crate::io::ErrorKind::InvalidInput),
         }
 
         Ok(())

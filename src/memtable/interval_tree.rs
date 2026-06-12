@@ -10,7 +10,9 @@
 use crate::range_tombstone::CoveringRt;
 use crate::range_tombstone::RangeTombstone;
 use crate::{SeqNo, UserKey, comparator::SharedComparator};
-use std::cmp::Ordering;
+#[cfg(not(feature = "std"))]
+use alloc::{boxed::Box, vec::Vec};
+use core::cmp::Ordering;
 
 /// An AVL-balanced BST keyed by range tombstone `start`, augmented with
 /// subtree-level metadata for efficient interval queries.

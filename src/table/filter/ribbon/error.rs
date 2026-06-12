@@ -37,7 +37,7 @@ impl fmt::Display for ParamError {
     }
 }
 
-impl std::error::Error for ParamError {}
+impl core::error::Error for ParamError {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConstructionFailure {
@@ -95,7 +95,7 @@ impl fmt::Display for ConstructionFailure {
     }
 }
 
-impl std::error::Error for ConstructionFailure {}
+impl core::error::Error for ConstructionFailure {}
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum BuildError {
@@ -123,7 +123,7 @@ impl fmt::Display for BuildError {
     }
 }
 
-impl std::error::Error for BuildError {}
+impl core::error::Error for BuildError {}
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum FilterReprError {
@@ -162,7 +162,7 @@ impl fmt::Display for FilterReprError {
     }
 }
 
-impl std::error::Error for FilterReprError {}
+impl core::error::Error for FilterReprError {}
 
 #[cfg(test)]
 mod tests {

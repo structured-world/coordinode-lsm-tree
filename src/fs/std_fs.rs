@@ -3,9 +3,11 @@
 // Copyright (c) 2026-present, Structured World Foundation
 
 use super::{FileHint, Fs, FsDirEntry, FsFile, FsMetadata, FsOpenOptions, SyncMode};
+use crate::io;
+use crate::path::Path;
+#[cfg(not(feature = "std"))]
+use alloc::{boxed::Box, string::String, vec::Vec};
 use std::fs::{File, OpenOptions};
-use std::io;
-use std::path::Path;
 
 /// Plain `fsync` (no `F_FULLFSYNC`) for [`SyncMode::Normal`].
 ///
@@ -22,14 +24,14 @@ fn normal_fsync(file: &File) -> io::Result<()> {
     if rc == 0 {
         Ok(())
     } else {
-        Err(io::Error::last_os_error())
+        Err(std::io::Error::last_os_error().into())
     }
 }
 
 #[cfg(not(target_os = "macos"))]
 fn normal_fsync(file: &File) -> io::Result<()> {
     // No `F_FULLFSYNC` distinction off macOS - `sync_all` is plain `fsync`.
-    File::sync_all(file)
+    File::sync_all(file).map_err(io::Error::from)
 }
 
 /// Default [`Fs`] implementation backed by [`std::fs`].
@@ -46,24 +48,24 @@ pub struct StdFs;
 
 impl FsFile for File {
     fn sync_all(&self) -> io::Result<()> {
-        Self::sync_all(self)
+        Self::sync_all(self).map_err(io::Error::from)
     }
 
     fn sync_data(&self) -> io::Result<()> {
-        Self::sync_data(self)
+        Self::sync_data(self).map_err(io::Error::from)
     }
 
     fn sync_all_with(&self, mode: SyncMode) -> io::Result<()> {
         match mode {
             // `File::sync_all` is `fcntl(F_FULLFSYNC)` on macOS.
-            SyncMode::Full => Self::sync_all(self),
+            SyncMode::Full => Self::sync_all(self).map_err(io::Error::from),
             SyncMode::Normal => normal_fsync(self),
         }
     }
 
     fn sync_data_with(&self, mode: SyncMode) -> io::Result<()> {
         match mode {
-            SyncMode::Full => Self::sync_data(self),
+            SyncMode::Full => Self::sync_data(self).map_err(io::Error::from),
             // Normal data-sync collapses to plain `fsync`: on macOS
             // `sync_data` is also `F_FULLFSYNC`, and a plain `fsync` already
             // covers the data, so there is no cheaper data-only barrier to
@@ -82,7 +84,7 @@ impl FsFile for File {
     }
 
     fn set_len(&self, size: u64) -> io::Result<()> {
-        Self::set_len(self, size)
+        Self::set_len(self, size).map_err(io::Error::from)
     }
 
     fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
@@ -102,8 +104,8 @@ impl FsFile for File {
                     use std::os::unix::fs::FileExt;
                     match FileExt::read_at(self, remaining, off) {
                         Ok(n) => n,
-                        Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                        Err(e) => return Err(e),
+                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                        Err(e) => return Err(e.into()),
                     }
                 }
 
@@ -112,8 +114,8 @@ impl FsFile for File {
                     use std::os::windows::fs::FileExt;
                     match FileExt::seek_read(self, remaining, off) {
                         Ok(n) => n,
-                        Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                        Err(e) => return Err(e),
+                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                        Err(e) => return Err(e.into()),
                     }
                 }
 
@@ -137,11 +139,11 @@ impl FsFile for File {
     }
 
     fn lock_exclusive(&self) -> io::Result<()> {
-        sys::lock_exclusive(self)
+        sys::lock_exclusive(self).map_err(io::Error::from)
     }
 
     fn hint(&self, hint: FileHint) -> io::Result<()> {
-        sys::fadvise(self, hint)
+        sys::fadvise(self, hint).map_err(io::Error::from)
     }
 }
 
@@ -176,11 +178,11 @@ impl Fs for StdFs {
     }
 
     fn create_dir_all(&self, path: &Path) -> io::Result<()> {
-        std::fs::create_dir_all(path)
+        std::fs::create_dir_all(path).map_err(io::Error::from)
     }
 
     fn create_dir(&self, path: &Path) -> io::Result<()> {
-        std::fs::create_dir(path)
+        std::fs::create_dir(path).map_err(io::Error::from)
     }
 
     fn read_dir(&self, path: &Path) -> io::Result<Vec<FsDirEntry>> {
@@ -209,15 +211,15 @@ impl Fs for StdFs {
     }
 
     fn remove_file(&self, path: &Path) -> io::Result<()> {
-        std::fs::remove_file(path)
+        std::fs::remove_file(path).map_err(io::Error::from)
     }
 
     fn remove_dir_all(&self, path: &Path) -> io::Result<()> {
-        std::fs::remove_dir_all(path)
+        std::fs::remove_dir_all(path).map_err(io::Error::from)
     }
 
     fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
-        std::fs::rename(from, to)
+        std::fs::rename(from, to).map_err(io::Error::from)
     }
 
     fn metadata(&self, path: &Path) -> io::Result<FsMetadata> {
@@ -239,7 +241,7 @@ impl Fs for StdFs {
                     "sync_directory: path is not a directory",
                 ));
             }
-            dir.sync_all()
+            dir.sync_all().map_err(io::Error::from)
         }
 
         // Windows cannot fsync directories - no-op, same as crate::file::fsync_directory.
@@ -261,7 +263,7 @@ impl Fs for StdFs {
                 ));
             }
             match mode {
-                SyncMode::Full => dir.sync_all(),
+                SyncMode::Full => dir.sync_all().map_err(io::Error::from),
                 SyncMode::Normal => normal_fsync(&dir),
             }
         }
@@ -275,7 +277,7 @@ impl Fs for StdFs {
     }
 
     fn exists(&self, path: &Path) -> io::Result<bool> {
-        path.try_exists()
+        path.try_exists().map_err(io::Error::from)
     }
 
     fn hard_link(&self, src: &Path, dst: &Path) -> io::Result<()> {
@@ -287,7 +289,19 @@ impl Fs for StdFs {
         // SyncMode-aware streamed copy. Keeping the copy in one place means
         // the copied file's durability honors `Config::sync_mode` instead
         // of always paying `F_FULLFSYNC` here.
-        std::fs::hard_link(src, dst)
+        //
+        // Normalise a cross-device failure to `ErrorKind::CrossesDevices`
+        // while the errno is still readable on the std error: once it folds
+        // into `crate::io::Error` at this trait boundary the errno is gone,
+        // so the caller's kind-based `is_cross_device` would otherwise miss
+        // the platforms where std reports EXDEV without the matching kind.
+        std::fs::hard_link(src, dst).map_err(|e| {
+            if is_std_cross_device(&e) {
+                io::Error::from_kind(io::ErrorKind::CrossesDevices)
+            } else {
+                e.into()
+            }
+        })
     }
 
     fn backend_id(&self) -> Option<u64> {
@@ -340,7 +354,7 @@ impl Fs for StdFs {
             Err(e) if macos_caps::clone_should_fall_back(&e) => {
                 super::copy_file_streamed(self, src, dst)
             }
-            Err(e) => Err(e),
+            Err(e) => Err(e.into()),
         }
     }
 
@@ -365,7 +379,7 @@ impl Fs for StdFs {
             Err(e) if linux_caps::clone_should_fall_back(&e) => {
                 super::copy_file_streamed(self, src, dst)
             }
-            Err(e) => Err(e),
+            Err(e) => Err(e.into()),
         }
     }
 
@@ -377,7 +391,7 @@ impl Fs for StdFs {
     /// filesystems that do not support the inode-flags ioctl.
     #[cfg(target_os = "linux")]
     fn try_disable_cow(&self, path: &Path) -> io::Result<()> {
-        linux_caps::try_disable_cow(path)
+        linux_caps::try_disable_cow(path).map_err(io::Error::from)
     }
 }
 
@@ -408,11 +422,12 @@ pub const KERNEL_BACKEND_ID: u64 = 0x4b45_524e_454c_5f46; // "KERNEL_F"
 // surface even if `std_fs` is ever exported. clippy's `redundant_pub_crate`
 // fires only because the enclosing module is currently private; the re-export
 // genuinely needs crate visibility, so the lint is a false positive here.
-#[expect(
-    clippy::redundant_pub_crate,
-    reason = "re-exported crate-wide via fs::mod; pub(crate) communicates the intended scope"
-)]
-pub(crate) fn is_cross_device(err: &io::Error) -> bool {
+/// Cross-device detection on a raw `std::io::Error`, where the errno is still
+/// available. Used by [`StdFs::hard_link`] to NORMALISE a cross-device link
+/// failure into [`crate::io::ErrorKind::CrossesDevices`] before the error
+/// crosses the `Fs` trait boundary into [`crate::io::Error`] (which carries no
+/// errno). After normalisation the kind-based [`is_cross_device`] is enough.
+fn is_std_cross_device(err: &std::io::Error) -> bool {
     #[cfg(unix)]
     {
         // POSIX `EXDEV` ("invalid cross-device link"). The raw value is
@@ -427,6 +442,20 @@ pub(crate) fn is_cross_device(err: &io::Error) -> bool {
             return true;
         }
     }
+    matches!(
+        err.kind(),
+        std::io::ErrorKind::CrossesDevices | std::io::ErrorKind::Unsupported
+    )
+}
+
+/// Cross-device detection on a [`crate::io::Error`] (post-`Fs`-boundary, no
+/// errno). [`StdFs::hard_link`] normalises the raw errno case to the
+/// `CrossesDevices` kind, so a kind check is authoritative here.
+#[expect(
+    clippy::redundant_pub_crate,
+    reason = "re-exported crate-wide via fs::mod; pub(crate) communicates the intended scope"
+)]
+pub(crate) fn is_cross_device(err: &io::Error) -> bool {
     matches!(
         err.kind(),
         io::ErrorKind::CrossesDevices | io::ErrorKind::Unsupported
@@ -465,8 +494,8 @@ mod sys {
                 return Ok(());
             }
 
-            let err = io::Error::last_os_error();
-            if err.kind() == io::ErrorKind::Interrupted {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::Interrupted {
                 continue;
             }
             return Err(err);
@@ -577,7 +606,7 @@ mod sys {
         if ret == 0 || ret == EINVAL {
             Ok(())
         } else {
-            Err(io::Error::from_raw_os_error(ret))
+            Err(std::io::Error::from_raw_os_error(ret))
         }
     }
 
@@ -620,7 +649,7 @@ mod sys {
     }
 
     pub(super) fn lock_exclusive(file: &File) -> io::Result<()> {
-        use std::ptr;
+        use core::ptr;
 
         // https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-lockfileex
         const LOCKFILE_EXCLUSIVE_LOCK: u32 = 0x0000_0002;
@@ -674,7 +703,7 @@ mod sys {
         };
 
         if ret == 0 {
-            return Err(io::Error::last_os_error());
+            return Err(std::io::Error::last_os_error().into());
         }
         Ok(())
     }
@@ -710,9 +739,9 @@ mod sys {
 #[cfg(target_os = "macos")]
 mod macos_caps {
     use crate::fs::FsCapabilities;
+    use core::mem::MaybeUninit;
     use std::ffi::{CStr, CString};
     use std::io;
-    use std::mem::MaybeUninit;
     use std::os::unix::ffi::OsStrExt;
     use std::path::Path;
 
@@ -735,7 +764,7 @@ mod macos_caps {
         #[expect(unsafe_code, reason = "statfs FFI to read the filesystem type name")]
         let rc = unsafe { libc::statfs(c.as_ptr(), buf.as_mut_ptr()) };
         if rc != 0 {
-            return Err(io::Error::last_os_error());
+            return Err(std::io::Error::last_os_error());
         }
         // SAFETY: statfs returned 0, so `buf` is initialized; `f_fstypename`
         // is a NUL-terminated `c_char` array.
@@ -774,7 +803,7 @@ mod macos_caps {
         #[expect(unsafe_code, reason = "clonefile FFI for an O(1) APFS clone")]
         let rc = unsafe { libc::clonefile(s.as_ptr(), d.as_ptr(), 0) };
         if rc != 0 {
-            return Err(io::Error::last_os_error());
+            return Err(std::io::Error::last_os_error());
         }
         Ok(())
     }
@@ -810,9 +839,9 @@ mod linux_caps {
     // numbers exceed i32::MAX); these imports + helper feed only that path, so
     // gate them to avoid unused-import / dead_code warnings on 32-bit targets.
     #[cfg(target_pointer_width = "64")]
-    use std::ffi::CString;
+    use core::mem::MaybeUninit;
     #[cfg(target_pointer_width = "64")]
-    use std::mem::MaybeUninit;
+    use std::ffi::CString;
     #[cfg(target_pointer_width = "64")]
     use std::os::unix::ffi::OsStrExt;
 
@@ -910,7 +939,7 @@ mod linux_caps {
             )
         };
         if rc != 0 {
-            let err = io::Error::last_os_error();
+            let err = std::io::Error::last_os_error();
             drop(dst_f);
             // Best-effort cleanup of the empty target so the copy fallback's
             // `create_new` does not trip over it.
@@ -967,7 +996,7 @@ mod linux_caps {
         )]
         let rc = unsafe { libc::ioctl(f.as_raw_fd(), FS_IOC_GETFLAGS as _, &raw mut flags) };
         if rc != 0 {
-            return ignore_if_unsupported(io::Error::last_os_error());
+            return ignore_if_unsupported(std::io::Error::last_os_error());
         }
         if flags & FS_NOCOW_FL != 0 {
             return Ok(()); // already NoCoW
@@ -983,7 +1012,7 @@ mod linux_caps {
         )]
         let rc = unsafe { libc::ioctl(f.as_raw_fd(), FS_IOC_SETFLAGS as _, &raw const flags) };
         if rc != 0 {
-            return ignore_if_unsupported(io::Error::last_os_error());
+            return ignore_if_unsupported(std::io::Error::last_os_error());
         }
         Ok(())
     }
@@ -1476,8 +1505,9 @@ mod tests {
         {
             // Matches the `EXDEV` constant inside `is_cross_device`.
             const EXDEV: i32 = 18;
-            let exdev = io::Error::from_raw_os_error(EXDEV);
-            assert!(is_cross_device(&exdev), "raw EXDEV must be recognised");
+            // Raw EXDEV (no matching kind) is detected by the std-side helper.
+            let exdev = std::io::Error::from_raw_os_error(EXDEV);
+            assert!(is_std_cross_device(&exdev), "raw EXDEV must be recognised");
         }
 
         // ErrorKind::CrossesDevices is the modern stable variant (Rust 1.85+).

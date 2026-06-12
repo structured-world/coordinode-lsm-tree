@@ -1,4 +1,6 @@
-use std::hash::{BuildHasher, Hash};
+#[cfg(not(feature = "std"))]
+use alloc::vec::Vec;
+use core::hash::{BuildHasher, Hash};
 
 use super::super::builder::RibbonBuilder;
 use super::super::hashing::{StandardEquation, standard_equation_w64};

@@ -6,16 +6,23 @@ use super::Checksum;
 use crate::checksum::ChecksummedWriter;
 use crate::coding::{Decode, Encode};
 use crate::file::MAGIC_BYTES;
+use crate::io::{ReadBytesExt, WriteBytesExt};
 use crate::table::block::BlockType;
-use byteorder::{ReadBytesExt, WriteBytesExt};
+// `Read`/`Write` resolve to the std traits under `std` (so raw
+// `write_all`/`read_exact` come from `std::io`) and to the native
+// `crate::io` traits under `no_std`; bounds below are written bare so
+// they track whichever is imported.
+#[cfg(not(feature = "std"))]
+use crate::io::{Read, Write};
+#[cfg(feature = "std")]
 use std::io::{Read, Write};
 
-struct ChecksummedReader<R: std::io::Read> {
+struct ChecksummedReader<R: Read> {
     inner: R,
     hasher: xxhash_rust::xxh3::Xxh3Default,
 }
 
-impl<R: std::io::Read> ChecksummedReader<R> {
+impl<R: Read> ChecksummedReader<R> {
     pub fn new(reader: R) -> Self {
         Self {
             inner: reader,
@@ -33,8 +40,21 @@ impl<R: std::io::Read> ChecksummedReader<R> {
     }
 }
 
-impl<R: std::io::Read> std::io::Read for ChecksummedReader<R> {
+#[cfg(feature = "std")]
+impl<R: Read> std::io::Read for ChecksummedReader<R> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+
+        #[expect(clippy::indexing_slicing)]
+        self.hasher.update(&buf[..n]);
+
+        Ok(n)
+    }
+}
+
+#[cfg(not(feature = "std"))]
+impl<R: Read> crate::io::Read for ChecksummedReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> crate::io::Result<usize> {
         let n = self.inner.read(buf)?;
 
         #[expect(clippy::indexing_slicing)]
@@ -134,13 +154,13 @@ impl Header {
         // the wire format is the contract and that contract is 1 byte.
         + 1
         // Data checksum
-        + std::mem::size_of::<Checksum>()
+        + core::mem::size_of::<Checksum>()
         // On-disk size
-        + std::mem::size_of::<u32>()
+        + core::mem::size_of::<u32>()
         // Uncompressed data length
-        + std::mem::size_of::<u32>()
+        + core::mem::size_of::<u32>()
         // Header checksum
-        + std::mem::size_of::<u32>();
+        + core::mem::size_of::<u32>();
 
     /// Largest possible header size: [`Self::MIN_LEN`] plus the optional
     /// `block_flags` byte. Used as a pre-decode upper bound where the
@@ -254,7 +274,7 @@ impl Header {
 
 impl Encode for Header {
     fn encode_into<W: Write>(&self, mut writer: &mut W) -> Result<(), crate::Error> {
-        use byteorder::LE;
+        use crate::io::LE;
 
         let checksum = {
             let mut writer = ChecksummedWriter::new(&mut writer);
@@ -298,7 +318,7 @@ impl Encode for Header {
 
 impl Decode for Header {
     fn decode_from<R: Read>(reader: &mut R) -> Result<Self, crate::Error> {
-        use byteorder::LE;
+        use crate::io::LE;
 
         let mut protected_reader = ChecksummedReader::new(reader);
 

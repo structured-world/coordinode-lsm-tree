@@ -3,8 +3,15 @@
 // (found in the LICENSE-* files in the repository)
 
 use super::writer::TRAILER_MAGIC;
+use crate::io::ReadBytesExt;
 use crate::sfa::{Result, checksum::Checksum};
-use byteorder::ReadBytesExt;
+// `Read`/`Seek`/`SeekFrom` resolve to std under `std` and to the native
+// `crate::io` types under `no_std`; gated together so the `SeekFrom` value
+// matches whichever `Seek::seek` is in play (crate::io::SeekFrom is a distinct
+// type from std's, not a re-export).
+#[cfg(not(feature = "std"))]
+use crate::io::{Read, Seek, SeekFrom};
+#[cfg(feature = "std")]
 use std::io::{Read, Seek, SeekFrom};
 
 #[expect(
@@ -35,7 +42,7 @@ pub struct TrailerReader;
 
 impl TrailerReader {
     pub fn from_reader<R: Read + Seek>(reader: &mut R) -> Result<ParsedTrailer> {
-        use byteorder::LE;
+        use crate::io::LE;
 
         log::trace!("Reading trailer");
 

@@ -27,8 +27,8 @@
 
 use std::io::Cursor;
 
+use crate::io::{BigEndian, ReadBytesExt};
 use aes_gcm::aead::Generate;
-use byteorder::{BigEndian, ReadBytesExt};
 use structured_zstd::skippable::SkippableFrame;
 
 use super::aad::{AAD_LEN, BlockIdentity, EncryptionContext, FORMAT_VERSION_V1, SuiteId, build};

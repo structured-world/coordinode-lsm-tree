@@ -66,8 +66,11 @@
 //! [`ManifestRecoveryMode::PointInTimeRecovery`]: crate::config::ManifestRecoveryMode::PointInTimeRecovery
 //! [`ManifestRecoveryMode::SkipAnyCorruptedRecords`]: crate::config::ManifestRecoveryMode::SkipAnyCorruptedRecords
 
-use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
-use std::io::{Read, Write};
+use crate::io::{LittleEndian, ReadBytesExt, WriteBytesExt};
+#[cfg(not(feature = "std"))]
+use alloc::vec::Vec;
+
+use crate::io::{Read, Write};
 
 /// Size of the framing header in bytes (4 B `len` + 8 B `xxh3_64`).
 pub const FRAME_HEADER_LEN: usize = 4 + 8;
@@ -276,7 +279,7 @@ pub fn read_framed_record<R: Read>(
 ) -> crate::Result<FramedRecordOutcome> {
     let len = match reader.read_u32::<LittleEndian>() {
         Ok(n) => n,
-        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+        Err(e) if e.kind() == crate::io::ErrorKind::UnexpectedEof => {
             return Ok(FramedRecordOutcome::TailTruncation);
         }
         Err(e) => return Err(e.into()),
@@ -329,7 +332,7 @@ pub fn read_framed_record<R: Read>(
 
     let digest_expected = match reader.read_u64::<LittleEndian>() {
         Ok(d) => d,
-        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+        Err(e) if e.kind() == crate::io::ErrorKind::UnexpectedEof => {
             return Ok(FramedRecordOutcome::TailTruncation);
         }
         Err(e) => return Err(e.into()),
@@ -343,7 +346,16 @@ pub fn read_framed_record<R: Read>(
     payload_scratch.resize(len as usize, 0);
     match reader.read_exact(payload_scratch) {
         Ok(()) => {}
+        // Two cfg arms, not one: under `std`, `crate::io::Read` is a method-less
+        // supertrait alias, so `read_exact` resolves to `std::io::Read` and
+        // `e.kind()` is `std::io::ErrorKind`; under no_std it is
+        // `crate::io::ErrorKind`. A single arm would not type-check on both.
+        #[cfg(feature = "std")]
         Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+            return Ok(FramedRecordOutcome::TailTruncation);
+        }
+        #[cfg(not(feature = "std"))]
+        Err(e) if e.kind() == crate::io::ErrorKind::UnexpectedEof => {
             return Ok(FramedRecordOutcome::TailTruncation);
         }
         Err(e) => return Err(e.into()),

@@ -2,6 +2,7 @@
 //!
 //! Compaction filters allow users to run custom logic during compactions, e.g. custom cleanup rules such as TTL.
 //! Because compactions run in background workers, using compactions filters instead of scans can massively increase the efficiency of the storage engine.
+use crate::path::Path;
 use crate::{
     BlobIndirection, InternalValue, KvSeparationOptions, SeqNo, UserKey, UserValue, ValueType,
     coding::{Decode, Encode},
@@ -13,7 +14,9 @@ use crate::{
     version::Version,
     vlog::{Accessor, BlobFileWriter, ValueHandle},
 };
-use std::{panic::RefUnwindSafe, path::Path};
+#[cfg(not(feature = "std"))]
+use alloc::boxed::Box;
+use core::panic::RefUnwindSafe;
 
 /// Verdict returned by a [`CompactionFilter`].
 #[non_exhaustive]

@@ -2,14 +2,15 @@
 // Copyright (c) 2024-present, fjall-rs
 // Copyright (c) 2026-present, Structured World Foundation
 
+use crate::tree::inner::{FlushGuard, VersionsWriteGuard};
 use crate::{
     AnyTree, BlobTree, Config, Guard, InternalValue, KvPair, Memtable, SeqNo, TableId, Tree,
     UserKey, UserValue, iter_guard::IterGuardImpl, table::Table, version::Version, vlog::BlobFile,
 };
-use std::{
-    ops::RangeBounds,
-    sync::{Arc, MutexGuard, RwLockWriteGuard},
-};
+use alloc::sync::Arc;
+#[cfg(not(feature = "std"))]
+use alloc::{boxed::Box, vec::Vec};
+use core::ops::RangeBounds;
 
 pub type RangeItem = crate::Result<KvPair>;
 
@@ -137,7 +138,7 @@ pub trait AbstractTree: sealed::Sealed {
     }
 
     #[doc(hidden)]
-    fn get_version_history_lock(&self) -> RwLockWriteGuard<'_, crate::version::SuperVersions>;
+    fn get_version_history_lock(&self) -> VersionsWriteGuard<'_>;
 
     /// Creates a hard-linked checkpoint of the tree's on-disk state in
     /// `target_path` for point-in-time recovery (PITR) backup.
@@ -192,7 +193,9 @@ pub trait AbstractTree: sealed::Sealed {
     ///
     /// On error any partial checkpoint files are removed automatically
     /// (best-effort) so callers can safely retry against the same path.
-    fn create_checkpoint(&self, target_path: &std::path::Path) -> crate::Result<CheckpointInfo>;
+    // std-only: checkpoint creation hard-links / copies files via std::fs.
+    #[cfg(feature = "std")]
+    fn create_checkpoint(&self, target_path: &crate::path::Path) -> crate::Result<CheckpointInfo>;
 
     /// Seals the active memtable and flushes to table(s).
     ///
@@ -216,11 +219,7 @@ pub trait AbstractTree: sealed::Sealed {
     /// # Errors
     ///
     /// Will return `Err` if an IO error occurs.
-    fn flush(
-        &self,
-        _lock: &MutexGuard<'_, ()>,
-        seqno_threshold: SeqNo,
-    ) -> crate::Result<Option<u64>> {
+    fn flush(&self, _lock: &FlushGuard<'_>, seqno_threshold: SeqNo) -> crate::Result<Option<u64>> {
         use crate::{
             compaction::stream::CompactionStream, merge::Merger, range_tombstone::RangeTombstone,
         };
@@ -387,7 +386,7 @@ pub trait AbstractTree: sealed::Sealed {
     fn metrics(&self) -> &Arc<crate::Metrics>;
 
     /// Acquires the flush lock which is required to call [`Tree::flush`].
-    fn get_flush_lock(&self) -> MutexGuard<'_, ()>;
+    fn get_flush_lock(&self) -> FlushGuard<'_>;
 
     /// Synchronously flushes a memtable to a table.
     ///
@@ -1016,7 +1015,7 @@ pub trait AbstractTree: sealed::Sealed {
     /// Returns 0 for empty prefixes or all-`0xFF` prefixes (cannot form valid half-open range).
     fn remove_prefix<K: AsRef<[u8]>>(&self, prefix: K, seqno: SeqNo) -> u64 {
         use crate::range::prefix_to_range;
-        use std::ops::Bound;
+        use core::ops::Bound;
 
         let (lo, hi) = prefix_to_range(prefix.as_ref());
 

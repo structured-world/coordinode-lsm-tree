@@ -66,6 +66,9 @@ pub mod block;
 pub mod error;
 pub mod key_chain;
 
+#[cfg(not(feature = "std"))]
+use alloc::vec::Vec;
+
 // Top-level re-exports so callers can spell `crate::encryption::
 // encrypt_block` / `decrypt_block` / `DecryptedBlock` /
 // `KeyChain` / `DecryptError` directly, instead of paging
@@ -95,7 +98,7 @@ pub use key_chain::StaticKeyChain;
 ///   sequence returned by `encrypt` and recover the original plaintext.
 /// - Both methods must be safe to call concurrently from multiple threads.
 pub trait EncryptionProvider:
-    Send + Sync + std::panic::UnwindSafe + std::panic::RefUnwindSafe
+    Send + Sync + core::panic::UnwindSafe + core::panic::RefUnwindSafe
 {
     /// Encrypt `plaintext`, returning an opaque ciphertext blob.
     ///
@@ -309,29 +312,45 @@ fn new_chacha_rng() -> rand_chacha::ChaCha20Rng {
     rand_chacha::ChaCha20Rng::from_seed(seed)
 }
 
+/// Current process id for fork detection. Under `std` this is the real PID;
+/// under `no_std` there is no process/fork concept, so it is a constant — the
+/// PID never "changes", the reseed branch never fires, and the RNG behaves as
+/// a plain thread-local CSPRNG.
+#[cfg(feature = "encryption")]
+fn process_pid() -> u32 {
+    #[cfg(feature = "std")]
+    {
+        std::process::id()
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        0
+    }
+}
+
 /// Thread-local CSPRNG wrapper with fork-aware PID tracking.
 ///
-/// On each access, compares the stored PID with `std::process::id()`.
-/// If they differ (i.e. the process was forked), the RNG is reseeded
-/// from the OS RNG to avoid nonce reuse across processes.
+/// On each access, compares the stored PID with [`process_pid`]. If they
+/// differ (i.e. the process was forked), the RNG is reseeded from the OS RNG
+/// to avoid nonce reuse across processes.
 #[cfg(feature = "encryption")]
 struct ForkAwareRng {
-    pid: std::cell::Cell<u32>,
-    rng: std::cell::RefCell<rand_chacha::ChaCha20Rng>,
+    pid: core::cell::Cell<u32>,
+    rng: core::cell::RefCell<rand_chacha::ChaCha20Rng>,
 }
 
 #[cfg(feature = "encryption")]
 impl ForkAwareRng {
     fn new() -> Self {
         Self {
-            pid: std::cell::Cell::new(std::process::id()),
-            rng: std::cell::RefCell::new(new_chacha_rng()),
+            pid: core::cell::Cell::new(process_pid()),
+            rng: core::cell::RefCell::new(new_chacha_rng()),
         }
     }
 
     fn with_rng<R>(&self, f: impl FnOnce(&mut rand_chacha::ChaCha20Rng) -> R) -> R {
         let mut rng_ref = self.rng.borrow_mut();
-        let current_pid = std::process::id();
+        let current_pid = process_pid();
         if self.pid.get() != current_pid {
             // Process was forked; reseed RNG to avoid nonce reuse across PIDs.
             self.pid.set(current_pid);
@@ -589,8 +608,8 @@ mod tests {
     /// exercising the default `encrypt_vec/decrypt_vec` implementations.
     struct XorProvider;
 
-    impl std::panic::UnwindSafe for XorProvider {}
-    impl std::panic::RefUnwindSafe for XorProvider {}
+    impl core::panic::UnwindSafe for XorProvider {}
+    impl core::panic::RefUnwindSafe for XorProvider {}
 
     impl EncryptionProvider for XorProvider {
         fn encrypt(&self, plaintext: &[u8]) -> crate::Result<Vec<u8>> {

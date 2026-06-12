@@ -11,10 +11,16 @@ use crate::{
         writer::index::BlockIndexWriter,
     },
 };
-use std::{
-    io::{Seek, Write},
-    sync::Arc,
-};
+use alloc::sync::Arc;
+#[cfg(not(feature = "std"))]
+use alloc::{boxed::Box, vec::Vec};
+
+// Concrete writers (sfa::Writer / ChecksummedWriter) carry the io trait via
+// their own impls; the defining trait must be in scope for raw method calls.
+#[cfg(not(feature = "std"))]
+use crate::io::{Seek, Write};
+#[cfg(feature = "std")]
+use std::io::{Seek, Write};
 
 pub struct PartitionedIndexWriter {
     relative_file_pos: u64,
@@ -206,7 +212,7 @@ impl PartitionedIndexWriter {
     }
 }
 
-impl<W: std::io::Write + std::io::Seek> BlockIndexWriter<W> for PartitionedIndexWriter {
+impl<W: crate::io::Write + crate::io::Seek> BlockIndexWriter<W> for PartitionedIndexWriter {
     fn use_encryption(
         mut self: Box<Self>,
         encryption: Option<Arc<dyn EncryptionProvider>>,
@@ -259,7 +265,7 @@ impl<W: std::io::Write + std::io::Seek> BlockIndexWriter<W> for PartitionedIndex
             reason = "key is u16 max, so we can not exceed u32::MAX"
         )]
         let block_handle_size =
-            (block_handle.end_key().len() + std::mem::size_of::<KeyedBlockHandle>()) as u32;
+            (block_handle.end_key().len() + core::mem::size_of::<KeyedBlockHandle>()) as u32;
 
         self.buffer_size += block_handle_size;
 

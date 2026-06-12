@@ -132,7 +132,7 @@ mod tests {
         }
 
         {
-            let mut merger = MergeScanner::new(vec![Scanner::new(&blob_file_path, 0)?]);
+            let mut merger = MergeScanner::new(vec![Scanner::new(&blob_file_path, &StdFs, 0)?]);
 
             assert_eq!(
                 (Slice::from(b"a"), Slice::from(b"1".repeat(100))),
@@ -192,8 +192,8 @@ mod tests {
 
         {
             let mut merger = MergeScanner::new(vec![
-                Scanner::new(&blob_file_0_path, 0)?,
-                Scanner::new(&blob_file_1_path, 1)?,
+                Scanner::new(&blob_file_0_path, &StdFs, 0)?,
+                Scanner::new(&blob_file_1_path, &StdFs, 1)?,
             ]);
 
             let merged_keys = [b"a", b"b", b"c", b"d", b"e"];

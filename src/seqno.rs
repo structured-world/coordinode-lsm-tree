@@ -2,17 +2,12 @@
 // Copyright (c) 2024-present, fjall-rs
 // Copyright (c) 2026-present, Structured World Foundation
 
+use alloc::sync::Arc;
+use core::fmt::Debug;
+use core::sync::atomic::Ordering::{AcqRel, Acquire, Release};
+
 use crate::SeqNo;
-use std::{
-    fmt::Debug,
-    sync::{
-        Arc,
-        atomic::{
-            AtomicU64,
-            Ordering::{AcqRel, Acquire, Release},
-        },
-    },
-};
+use portable_atomic::AtomicU64;
 
 /// The maximum allowed sequence number value.
 ///
@@ -71,7 +66,7 @@ pub const MAX_SEQNO: SeqNo = 0x7FFF_FFFF_FFFF_FFFF;
 /// MSB boundary in `new`, `set`, and `fetch_max` (via assert/clamp),
 /// and panics in `next` if the counter reaches the reserved range.
 pub trait SequenceNumberGenerator:
-    Send + Sync + Debug + std::panic::UnwindSafe + std::panic::RefUnwindSafe + 'static
+    Send + Sync + Debug + core::panic::UnwindSafe + core::panic::RefUnwindSafe + 'static
 {
     /// Gets the next sequence number, atomically incrementing the counter.
     ///

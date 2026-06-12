@@ -56,7 +56,6 @@
 
 pub mod types;
 
-#[cfg(feature = "std")]
 pub(crate) mod handle;
 
 pub use types::{

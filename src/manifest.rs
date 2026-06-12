@@ -5,6 +5,11 @@
 use crate::{
     FormatVersion, TreeType, checksum::ChecksumType, manifest_blocks::reader::ManifestArchiveReader,
 };
+#[cfg(not(feature = "std"))]
+use alloc::{
+    borrow::ToOwned,
+    string::{String, ToString},
+};
 
 pub struct Manifest {
     pub version: FormatVersion,
@@ -133,11 +138,11 @@ impl Manifest {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::io::WriteBytesExt;
     use crate::{
         fs::{Fs, MemFs, StdFs},
         manifest_blocks::writer::ManifestArchiveWriter,
     };
-    use byteorder::WriteBytesExt;
     use std::{io::Write, path::Path};
 
     /// Write a minimal valid Blocks-based manifest with all four

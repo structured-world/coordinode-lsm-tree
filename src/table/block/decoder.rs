@@ -3,12 +3,16 @@
 // Copyright (c) 2026-present, Structured World Foundation
 
 use super::{TRAILER_START_MARKER, binary_index::Reader as BinaryIndexReader};
+use crate::io::{LittleEndian, ReadBytesExt};
 use crate::{
     SeqNo, Slice,
     table::{Block, block::Trailer},
 };
-use byteorder::{LittleEndian, ReadBytesExt};
-use std::{io::Cursor, marker::PhantomData};
+#[cfg(not(feature = "std"))]
+use alloc::vec::Vec;
+use core::marker::PhantomData;
+
+use crate::io::Cursor;
 
 /// Validates that `restart_interval` and `binary_index_step_size` read from a
 /// block trailer are within their allowed ranges.
@@ -37,7 +41,7 @@ pub trait ParsedItem<M> {
         needle: &[u8],
         bytes: &[u8],
         cmp: &dyn crate::comparator::UserComparator,
-    ) -> std::cmp::Ordering;
+    ) -> core::cmp::Ordering;
 
     /// Returns the item's seqno.
     fn seqno(&self) -> SeqNo;
@@ -930,7 +934,10 @@ impl<'a, Item: Decodable<Parsed>, Parsed: ParsedItem<Item>> Decoder<'a, Item, Pa
         }
     }
 
-    pub fn trim_back_to_upper_bound(&mut self, cmp: impl Fn(&Parsed, &[u8]) -> std::cmp::Ordering) {
+    pub fn trim_back_to_upper_bound(
+        &mut self,
+        cmp: impl Fn(&Parsed, &[u8]) -> core::cmp::Ordering,
+    ) {
         let Some(entries_end) = self.entries_end() else {
             return;
         };
@@ -959,7 +966,7 @@ impl<'a, Item: Decodable<Parsed>, Parsed: ParsedItem<Item>> Decoder<'a, Item, Pa
                 break;
             };
 
-            if cmp(&item, self.entries()) != std::cmp::Ordering::Greater {
+            if cmp(&item, self.entries()) != core::cmp::Ordering::Greater {
                 break;
             }
 
@@ -989,7 +996,7 @@ impl<'a, Item: Decodable<Parsed>, Parsed: ParsedItem<Item>> Decoder<'a, Item, Pa
                 return;
             };
 
-            cmp(&item, self.entries()) == std::cmp::Ordering::Less
+            cmp(&item, self.entries()) == core::cmp::Ordering::Less
         } else {
             true
         };
@@ -1034,8 +1041,8 @@ impl<'a, Item: Decodable<Parsed>, Parsed: ParsedItem<Item>> Decoder<'a, Item, Pa
     #[must_use]
     pub fn upper_stack_tail_cmp(
         &self,
-        cmp: impl Fn(&Parsed, &[u8]) -> std::cmp::Ordering,
-    ) -> Option<std::cmp::Ordering> {
+        cmp: impl Fn(&Parsed, &[u8]) -> core::cmp::Ordering,
+    ) -> Option<core::cmp::Ordering> {
         let &offset = self.hi_scanner.stack.last()?;
         let entries_end = self.entries_end()?;
         let is_restart = self.hi_scanner.stack.len() == 1;
@@ -1176,6 +1183,7 @@ impl<Item: Decodable<Parsed>, Parsed: ParsedItem<Item>> DoubleEndedIterator
 )]
 mod tests {
     use super::Decoder;
+    use crate::io::{ByteOrder, LittleEndian};
     use crate::{
         InternalValue,
         table::{
@@ -1185,7 +1193,6 @@ mod tests {
             index_block::IndexBlockParsedItem,
         },
     };
-    use byteorder::{ByteOrder, LittleEndian};
 
     fn make_handles(count: usize) -> Vec<KeyedBlockHandle> {
         (0..count)
@@ -1206,7 +1213,7 @@ mod tests {
             header: Header::test_dummy(BlockType::Index),
         });
         let trailer_offset = Trailer::new(&trailer_probe.inner).trailer_offset();
-        trailer_offset + 1 + 1 + std::mem::size_of::<u32>()
+        trailer_offset + 1 + 1 + core::mem::size_of::<u32>()
     }
 
     fn binary_index_len_field_pos(bytes: &[u8]) -> usize {
@@ -1233,18 +1240,18 @@ mod tests {
             header: Header::test_dummy(BlockType::Index),
         });
         let trailer_offset = Trailer::new(&trailer_probe.inner).trailer_offset();
-        trailer_offset + 1 + 1 + (2 * std::mem::size_of::<u32>())
+        trailer_offset + 1 + 1 + (2 * core::mem::size_of::<u32>())
     }
 
     fn hash_index_offset_field_pos(bytes: &[u8]) -> usize {
-        hash_index_len_field_pos(bytes) + std::mem::size_of::<u32>()
+        hash_index_len_field_pos(bytes) + core::mem::size_of::<u32>()
     }
 
     fn first_restart_key_len_field_pos(bytes: &[u8]) -> usize {
         use crate::coding::Decode;
+        use crate::io::Cursor;
+        use crate::io::ReadBytesExt;
         use crate::table::BlockHandle;
-        use byteorder::ReadBytesExt;
-        use std::io::Cursor;
         use varint_rs::VarintReader;
 
         let mut cursor = Cursor::new(bytes);
@@ -1260,9 +1267,9 @@ mod tests {
 
     fn first_truncated_rest_key_len_field_pos(bytes: &[u8]) -> usize {
         use crate::coding::Decode;
+        use crate::io::Cursor;
+        use crate::io::ReadBytesExt;
         use crate::table::BlockHandle;
-        use byteorder::ReadBytesExt;
-        use std::io::Cursor;
         use varint_rs::VarintReader;
 
         let mut cursor = Cursor::new(bytes);
@@ -1285,9 +1292,9 @@ mod tests {
 
     fn nth_truncated_rest_key_len_field_pos(bytes: &[u8], ordinal: usize) -> usize {
         use crate::coding::Decode;
+        use crate::io::Cursor;
+        use crate::io::ReadBytesExt;
         use crate::table::BlockHandle;
-        use byteorder::ReadBytesExt;
-        use std::io::Cursor;
         use varint_rs::VarintReader;
 
         let mut cursor = Cursor::new(bytes);
@@ -1331,7 +1338,7 @@ mod tests {
         let invalid_binary_index_offset = (bytes.len() as u32).saturating_add(1);
         LittleEndian::write_u32(
             &mut bytes
-                [binary_index_offset_pos..binary_index_offset_pos + std::mem::size_of::<u32>()],
+                [binary_index_offset_pos..binary_index_offset_pos + core::mem::size_of::<u32>()],
             invalid_binary_index_offset,
         );
 
@@ -1355,7 +1362,7 @@ mod tests {
         let binary_index_offset_pos = binary_index_offset_field_pos(&bytes);
         LittleEndian::write_u32(
             &mut bytes
-                [binary_index_offset_pos..binary_index_offset_pos + std::mem::size_of::<u32>()],
+                [binary_index_offset_pos..binary_index_offset_pos + core::mem::size_of::<u32>()],
             0,
         );
 
@@ -1378,7 +1385,7 @@ mod tests {
         let mut bytes = IndexBlock::encode_into_vec_with_restart_interval(&handles, 8).unwrap();
         let binary_index_offset_pos = binary_index_offset_field_pos(&bytes);
         let binary_index_offset = LittleEndian::read_u32(
-            &bytes[binary_index_offset_pos..binary_index_offset_pos + std::mem::size_of::<u32>()],
+            &bytes[binary_index_offset_pos..binary_index_offset_pos + core::mem::size_of::<u32>()],
         ) as usize;
         bytes[binary_index_offset - 1] = 0;
 
@@ -1401,11 +1408,11 @@ mod tests {
         let mut bytes = IndexBlock::encode_into_vec_with_restart_interval(&handles, 8).unwrap();
         let binary_index_len_pos = binary_index_len_field_pos(&bytes);
         let current_binary_index_len = LittleEndian::read_u32(
-            &bytes[binary_index_len_pos..binary_index_len_pos + std::mem::size_of::<u32>()],
+            &bytes[binary_index_len_pos..binary_index_len_pos + core::mem::size_of::<u32>()],
         );
         let inflated_binary_index_len = current_binary_index_len.saturating_add(10_000);
         LittleEndian::write_u32(
-            &mut bytes[binary_index_len_pos..binary_index_len_pos + std::mem::size_of::<u32>()],
+            &mut bytes[binary_index_len_pos..binary_index_len_pos + core::mem::size_of::<u32>()],
             inflated_binary_index_len,
         );
 
@@ -1436,14 +1443,14 @@ mod tests {
         let trailer_offset = Trailer::new(&trailer_probe.inner).trailer_offset();
 
         let binary_index_offset = LittleEndian::read_u32(
-            &bytes[binary_index_offset_pos..binary_index_offset_pos + std::mem::size_of::<u32>()],
+            &bytes[binary_index_offset_pos..binary_index_offset_pos + core::mem::size_of::<u32>()],
         ) as usize;
         let step_size = usize::from(bytes[binary_index_step_size_pos]);
         let entries_before_trailer = trailer_offset - binary_index_offset;
         let inflated_binary_index_len = u32::try_from((entries_before_trailer / step_size) + 1)
             .expect("test fixture expects u32 binary index len");
         LittleEndian::write_u32(
-            &mut bytes[binary_index_len_pos..binary_index_len_pos + std::mem::size_of::<u32>()],
+            &mut bytes[binary_index_len_pos..binary_index_len_pos + core::mem::size_of::<u32>()],
             inflated_binary_index_len,
         );
 
@@ -1466,11 +1473,11 @@ mod tests {
         let mut bytes = IndexBlock::encode_into_vec_with_restart_interval(&handles, 8).unwrap();
         let binary_index_len_pos = binary_index_len_field_pos(&bytes);
         let current_binary_index_len = LittleEndian::read_u32(
-            &bytes[binary_index_len_pos..binary_index_len_pos + std::mem::size_of::<u32>()],
+            &bytes[binary_index_len_pos..binary_index_len_pos + core::mem::size_of::<u32>()],
         );
         let shortened_binary_index_len = current_binary_index_len.saturating_sub(1);
         LittleEndian::write_u32(
-            &mut bytes[binary_index_len_pos..binary_index_len_pos + std::mem::size_of::<u32>()],
+            &mut bytes[binary_index_len_pos..binary_index_len_pos + core::mem::size_of::<u32>()],
             shortened_binary_index_len,
         );
 
@@ -1494,7 +1501,7 @@ mod tests {
 
         let binary_index_offset_pos = binary_index_offset_field_pos(&bytes);
         let binary_index_offset = LittleEndian::read_u32(
-            &bytes[binary_index_offset_pos..binary_index_offset_pos + std::mem::size_of::<u32>()],
+            &bytes[binary_index_offset_pos..binary_index_offset_pos + core::mem::size_of::<u32>()],
         ) as usize;
         let entries_end = binary_index_offset - 1;
 
@@ -1605,10 +1612,10 @@ mod tests {
         let binary_index_len_pos = binary_index_len_field_pos(&bytes);
         let binary_index_step_size_pos = binary_index_step_size_field_pos(&bytes);
         let binary_index_offset = LittleEndian::read_u32(
-            &bytes[binary_index_offset_pos..binary_index_offset_pos + std::mem::size_of::<u32>()],
+            &bytes[binary_index_offset_pos..binary_index_offset_pos + core::mem::size_of::<u32>()],
         ) as usize;
         let binary_index_len = LittleEndian::read_u32(
-            &bytes[binary_index_len_pos..binary_index_len_pos + std::mem::size_of::<u32>()],
+            &bytes[binary_index_len_pos..binary_index_len_pos + core::mem::size_of::<u32>()],
         ) as usize;
         let binary_index_step_size = usize::from(bytes[binary_index_step_size_pos]);
         let mid = binary_index_len / 2;
@@ -1627,13 +1634,13 @@ mod tests {
                 )]
                 let trailer_start_u16 = trailer_start_u32 as u16;
                 LittleEndian::write_u16(
-                    &mut bytes[mid_offset..mid_offset + std::mem::size_of::<u16>()],
+                    &mut bytes[mid_offset..mid_offset + core::mem::size_of::<u16>()],
                     trailer_start_u16,
                 );
             }
             4 => {
                 LittleEndian::write_u32(
-                    &mut bytes[mid_offset..mid_offset + std::mem::size_of::<u32>()],
+                    &mut bytes[mid_offset..mid_offset + core::mem::size_of::<u32>()],
                     trailer_start_u32,
                 );
             }
@@ -1669,10 +1676,10 @@ mod tests {
         let binary_index_len_pos = binary_index_len_field_pos(&bytes);
         let binary_index_step_size_pos = binary_index_step_size_field_pos(&bytes);
         let binary_index_offset = LittleEndian::read_u32(
-            &bytes[binary_index_offset_pos..binary_index_offset_pos + std::mem::size_of::<u32>()],
+            &bytes[binary_index_offset_pos..binary_index_offset_pos + core::mem::size_of::<u32>()],
         ) as usize;
         let binary_index_len = LittleEndian::read_u32(
-            &bytes[binary_index_len_pos..binary_index_len_pos + std::mem::size_of::<u32>()],
+            &bytes[binary_index_len_pos..binary_index_len_pos + core::mem::size_of::<u32>()],
         ) as usize;
         let binary_index_step_size = usize::from(bytes[binary_index_step_size_pos]);
         let mid = binary_index_len / 2;
@@ -1691,13 +1698,13 @@ mod tests {
                 )]
                 let trailer_start_u16 = trailer_start_u32 as u16;
                 LittleEndian::write_u16(
-                    &mut bytes[mid_offset..mid_offset + std::mem::size_of::<u16>()],
+                    &mut bytes[mid_offset..mid_offset + core::mem::size_of::<u16>()],
                     trailer_start_u16,
                 );
             }
             4 => {
                 LittleEndian::write_u32(
-                    &mut bytes[mid_offset..mid_offset + std::mem::size_of::<u32>()],
+                    &mut bytes[mid_offset..mid_offset + core::mem::size_of::<u32>()],
                     trailer_start_u32,
                 );
             }
@@ -1827,10 +1834,13 @@ mod tests {
         };
 
         let trailer_offset = Trailer::new(&block).trailer_offset();
-        let hash_index_offset_pos =
-            trailer_offset + 1 + 1 + (2 * std::mem::size_of::<u32>()) + std::mem::size_of::<u32>();
+        let hash_index_offset_pos = trailer_offset
+            + 1
+            + 1
+            + (2 * core::mem::size_of::<u32>())
+            + core::mem::size_of::<u32>();
         let hash_index_offset = LittleEndian::read_u32(
-            &block.data[hash_index_offset_pos..hash_index_offset_pos + std::mem::size_of::<u32>()],
+            &block.data[hash_index_offset_pos..hash_index_offset_pos + core::mem::size_of::<u32>()],
         );
         assert!(hash_index_offset > 0, "fixture must encode a hash index");
 
@@ -1850,13 +1860,13 @@ mod tests {
         let mut bytes = DataBlock::encode_into_vec(&items, 1, 1.33).expect("encode data block");
         let hash_index_offset_pos = hash_index_offset_field_pos(&bytes);
         let hash_index_offset = LittleEndian::read_u32(
-            &bytes[hash_index_offset_pos..hash_index_offset_pos + std::mem::size_of::<u32>()],
+            &bytes[hash_index_offset_pos..hash_index_offset_pos + core::mem::size_of::<u32>()],
         );
         assert!(hash_index_offset > 0, "fixture must encode a hash index");
 
         let hash_index_len_pos = hash_index_len_field_pos(&bytes);
         LittleEndian::write_u32(
-            &mut bytes[hash_index_len_pos..hash_index_len_pos + std::mem::size_of::<u32>()],
+            &mut bytes[hash_index_len_pos..hash_index_len_pos + core::mem::size_of::<u32>()],
             u32::MAX,
         );
 
@@ -1884,14 +1894,14 @@ mod tests {
         let mut bytes = DataBlock::encode_into_vec(&items, 1, 1.33).expect("encode data block");
         let hash_index_len_pos = hash_index_len_field_pos(&bytes);
         let hash_index_len = LittleEndian::read_u32(
-            &bytes[hash_index_len_pos..hash_index_len_pos + std::mem::size_of::<u32>()],
+            &bytes[hash_index_len_pos..hash_index_len_pos + core::mem::size_of::<u32>()],
         );
         assert!(
             hash_index_len > 0,
             "fixture must encode a non-empty hash index"
         );
         LittleEndian::write_u32(
-            &mut bytes[hash_index_len_pos..hash_index_len_pos + std::mem::size_of::<u32>()],
+            &mut bytes[hash_index_len_pos..hash_index_len_pos + core::mem::size_of::<u32>()],
             hash_index_len - 1,
         );
 
@@ -1916,7 +1926,7 @@ mod tests {
         // Zero out binary_index_len in the trailer
         let bi_len_pos = binary_index_len_field_pos(&bytes);
         LittleEndian::write_u32(
-            &mut bytes[bi_len_pos..bi_len_pos + std::mem::size_of::<u32>()],
+            &mut bytes[bi_len_pos..bi_len_pos + core::mem::size_of::<u32>()],
             0,
         );
 
@@ -1943,11 +1953,11 @@ mod tests {
         let bi_len_pos = binary_index_len_field_pos(&bytes);
         let bi_step_pos = binary_index_step_size_field_pos(&bytes);
         let bi_offset = LittleEndian::read_u32(
-            &bytes[bi_offset_pos..bi_offset_pos + std::mem::size_of::<u32>()],
+            &bytes[bi_offset_pos..bi_offset_pos + core::mem::size_of::<u32>()],
         ) as usize;
         let step = usize::from(bytes[bi_step_pos]);
         let bi_len =
-            LittleEndian::read_u32(&bytes[bi_len_pos..bi_len_pos + std::mem::size_of::<u32>()])
+            LittleEndian::read_u32(&bytes[bi_len_pos..bi_len_pos + core::mem::size_of::<u32>()])
                 as usize;
 
         // Write data.len() into every binary index slot so seek lands at EOF

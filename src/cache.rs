@@ -48,7 +48,7 @@ pub struct PartialBlockEntry {
     pub hits: u32,
 }
 
-#[derive(Clone, Copy, Eq, std::hash::Hash, PartialEq)]
+#[derive(Clone, Copy, Eq, core::hash::Hash, PartialEq)]
 struct CacheKey(u8, u64, u64, u64);
 
 impl From<(u8, u64, u64, u64)> for CacheKey {

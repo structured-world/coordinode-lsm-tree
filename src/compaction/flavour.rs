@@ -9,12 +9,14 @@ use crate::compaction::Input as CompactionPayload;
 use crate::compaction::worker::Options;
 use crate::range_tombstone::RangeTombstone;
 use crate::table::multi_writer::MultiWriter;
+use crate::time::Instant;
 use crate::version::{SuperVersions, Version};
 use crate::vlog::blob_file::scanner::ScanEntry;
 use crate::vlog::{BlobFileId, BlobFileMergeScanner, BlobFileWriter};
 use crate::{BlobFile, HashSet, InternalValue, Table};
-use std::iter::Peekable;
-use std::time::Instant;
+#[cfg(not(feature = "std"))]
+use alloc::{boxed::Box, string::ToString, vec::Vec};
+use core::iter::Peekable;
 
 /// Drains all blobs that come "before" the given vptr.
 fn drain_blobs<I: Iterator<Item = crate::Result<(ScanEntry, BlobFileId)>>>(
@@ -339,7 +341,7 @@ pub struct RelocatingCompaction {
     /// encoded handle in `item.value`; the real payload moved here is
     /// debited at the relocation write site so KV-separated compactions
     /// are throttled by their actual bandwidth.
-    rate_limiter: std::sync::Arc<crate::rate_limiter::RateLimiter>,
+    rate_limiter: alloc::sync::Arc<crate::rate_limiter::RateLimiter>,
     /// Polled by the blob throttle so a long wait under a low limit stays
     /// interruptible by tree drop / shutdown.
     stop_signal: crate::stop_signal::StopSignal,
@@ -351,7 +353,7 @@ impl RelocatingCompaction {
         blob_scanner: Peekable<BlobFileMergeScanner>,
         blob_writer: BlobFileWriter,
         rewriting_blob_files: Vec<BlobFile>,
-        rate_limiter: std::sync::Arc<crate::rate_limiter::RateLimiter>,
+        rate_limiter: alloc::sync::Arc<crate::rate_limiter::RateLimiter>,
         stop_signal: crate::stop_signal::StopSignal,
     ) -> Self {
         Self {
@@ -491,7 +493,7 @@ impl CompactionFlavour for RelocatingCompaction {
             self.inner.start.elapsed(),
         );
 
-        let tables_to_delete = std::mem::take(&mut self.inner.tables_to_rewrite);
+        let tables_to_delete = core::mem::take(&mut self.inner.tables_to_rewrite);
 
         let created_tables = self.inner.consume_writer(opts, dst_lvl)?;
         // The output SSTs are already finalized; if blob finalization fails the
@@ -596,7 +598,7 @@ impl CompactionFlavour for StandardCompaction {
     ) -> crate::Result<ProducedOutput> {
         log::debug!("Compaction done in {:?}", self.start.elapsed());
 
-        let tables_to_delete = std::mem::take(&mut self.tables_to_rewrite);
+        let tables_to_delete = core::mem::take(&mut self.tables_to_rewrite);
         let created_tables = self.consume_writer(opts, dst_lvl)?;
 
         Ok(ProducedOutput {

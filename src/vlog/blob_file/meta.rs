@@ -2,6 +2,9 @@
 // Copyright (c) 2024-present, fjall-rs
 // Copyright (c) 2026-present, Structured World Foundation
 
+use crate::io::{LittleEndian, ReadBytesExt};
+#[cfg(not(feature = "std"))]
+use crate::io::{Read, Write};
 use crate::{
     CompressionType, InternalValue, KeyRange, SeqNo, Slice,
     checksum::ChecksumType,
@@ -10,7 +13,7 @@ use crate::{
     table::{Block, DataBlock},
     vlog::BlobFileId,
 };
-use byteorder::{LittleEndian, ReadBytesExt};
+#[cfg(feature = "std")]
 use std::io::{Read, Write};
 
 macro_rules! read_u64 {

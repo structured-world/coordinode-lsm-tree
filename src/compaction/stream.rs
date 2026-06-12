@@ -6,7 +6,11 @@ use crate::active_tombstone_set::ActiveTombstoneSet;
 use crate::comparator::SharedComparator;
 use crate::range_tombstone::RangeTombstone;
 use crate::{InternalValue, SeqNo, UserKey, UserValue, ValueType, merge_operator::MergeOperator};
-use std::{collections::VecDeque, iter::Peekable, sync::Arc};
+use alloc::collections::VecDeque;
+use alloc::sync::Arc;
+#[cfg(not(feature = "std"))]
+use alloc::vec::Vec;
+use core::iter::Peekable;
 
 type Item = crate::Result<InternalValue>;
 
@@ -206,7 +210,7 @@ impl<'a, I: Iterator<Item = Item>, F: StreamFilter + 'a> CompactionStream<'a, I,
             self.rt_sorted = true;
         }
         while let Some(rt) = self.rt_apply.get(self.rt_idx) {
-            if comparator.compare(&rt.start, user_key) == std::cmp::Ordering::Greater {
+            if comparator.compare(&rt.start, user_key) == core::cmp::Ordering::Greater {
                 break;
             }
             // cutoff = MAX: every applicable tombstone is active; `is_suppressed`
@@ -979,7 +983,7 @@ mod tests {
 
     pub mod custom_mvcc {
         use super::*;
-        use byteorder::{BE, ReadBytesExt, WriteBytesExt};
+        use crate::io::{BE, ReadBytesExt, WriteBytesExt};
         use test_log::test;
 
         /// MVCC trailer size (anything but user key)

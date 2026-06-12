@@ -5,6 +5,8 @@
 use crate::InternalValue;
 use crate::comparator::SharedComparator;
 use crate::heap::{HeapEntry, MergeHeap};
+#[cfg(not(feature = "std"))]
+use alloc::{boxed::Box, vec::Vec};
 
 type IterItem = crate::Result<InternalValue>;
 

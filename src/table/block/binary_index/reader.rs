@@ -2,7 +2,7 @@
 // Copyright (c) 2025-present, fjall-rs
 // Copyright (c) 2026-present, Structured World Foundation
 
-use byteorder::{LittleEndian, ReadBytesExt};
+use crate::io::{LittleEndian, ReadBytesExt};
 
 pub struct Reader<'a> {
     bytes: &'a [u8],

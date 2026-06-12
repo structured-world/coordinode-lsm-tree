@@ -3,11 +3,9 @@
 // (found in the LICENSE-* files in the repository)
 
 use alloc::{string::String, sync::Arc, vec::Vec};
-use core::{
-    mem::ManuallyDrop,
-    ops::Deref,
-    sync::atomic::{AtomicU64, Ordering},
-};
+use core::{mem::ManuallyDrop, ops::Deref, sync::atomic::Ordering};
+
+use portable_atomic::AtomicU64;
 
 pub use super::builder::Builder;
 
@@ -273,6 +271,21 @@ impl ByteView {
         // NOTE: We can use _unzeroed to skip zeroing of the heap allocated slice
         // because we receive the `len` parameter
         // If the reader does not give us exactly `len` bytes, `read_exact` fails anyway
+        let mut s = unsafe { Self::with_size_unzeroed(len) };
+        {
+            let mut builder = Mutator(&mut s);
+            reader.read_exact(&mut builder)?;
+        }
+        Ok(s)
+    }
+
+    /// `no_std` mirror of [`ByteView::from_reader`] over [`crate::io::Read`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if an I/O error occurred.
+    #[cfg(not(feature = "std"))]
+    pub fn from_reader<R: crate::io::Read>(reader: &mut R, len: usize) -> crate::io::Result<Self> {
         let mut s = unsafe { Self::with_size_unzeroed(len) };
         {
             let mut builder = Mutator(&mut s);
@@ -858,18 +871,18 @@ mod tests {
         use super::{LongRepr, ShortRepr, Trailer};
 
         assert_eq!(
-            std::mem::size_of::<ShortRepr>(),
-            std::mem::size_of::<LongRepr>()
+            core::mem::size_of::<ShortRepr>(),
+            core::mem::size_of::<LongRepr>()
         );
         assert_eq!(
-            std::mem::size_of::<Trailer>(),
-            std::mem::size_of::<LongRepr>()
+            core::mem::size_of::<Trailer>(),
+            core::mem::size_of::<LongRepr>()
         );
 
-        assert_eq!(24, std::mem::size_of::<ByteView>());
+        assert_eq!(24, core::mem::size_of::<ByteView>());
         assert_eq!(
             32,
-            std::mem::size_of::<ByteView>() + std::mem::size_of::<HeapAllocationHeader>()
+            core::mem::size_of::<ByteView>() + core::mem::size_of::<HeapAllocationHeader>()
         );
     }
 

@@ -87,7 +87,7 @@ impl OwnedIndexBlockIter {
     ) -> crate::Result<Option<Self>> {
         // Short-circuit contradictory bounds: lo > hi means an empty range.
         if let (Some((lo_key, _)), Some((hi_key, _))) = (lo, hi)
-            && comparator.compare(lo_key, hi_key) == std::cmp::Ordering::Greater
+            && comparator.compare(lo_key, hi_key) == core::cmp::Ordering::Greater
         {
             return Ok(None);
         }

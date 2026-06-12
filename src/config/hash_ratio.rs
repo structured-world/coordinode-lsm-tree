@@ -2,11 +2,14 @@
 // Copyright (c) 2024-present, fjall-rs
 // Copyright (c) 2026-present, Structured World Foundation
 
+#[cfg(not(feature = "std"))]
+use alloc::vec::Vec;
+
 /// Hash ratio policy
 #[derive(Debug, Clone, PartialEq)]
 pub struct HashRatioPolicy(Vec<f32>);
 
-impl std::ops::Deref for HashRatioPolicy {
+impl core::ops::Deref for HashRatioPolicy {
     type Target = [f32];
 
     fn deref(&self) -> &Self::Target {

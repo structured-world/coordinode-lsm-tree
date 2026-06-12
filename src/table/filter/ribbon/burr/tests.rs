@@ -27,8 +27,8 @@
     reason = "test code indexes into fixture buffers with known sizes"
 )]
 
+use core::hash::BuildHasherDefault;
 use std::collections::hash_map::DefaultHasher;
-use std::hash::BuildHasherDefault;
 
 use super::{BurrBuilder, BurrParams};
 
@@ -86,7 +86,7 @@ fn burr_wire_format_round_trips() {
     // BurrFilterReader, and verify contains_hash answers match
     // BurrFilter::contains for every inserted key.
     use super::filter::BurrFilterReader;
-    use std::hash::BuildHasher;
+    use core::hash::BuildHasher;
 
     let n = 500_usize;
     let params = BurrParams::with_fp_rate(n, 0.01).expect("valid params");

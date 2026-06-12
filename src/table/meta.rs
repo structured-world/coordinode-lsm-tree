@@ -8,7 +8,7 @@ use crate::{
     CompressionType, KeyRange, SeqNo, TableId, checksum::ChecksumType, coding::Decode,
     comparator::default_comparator, runtime_config::ChecksumAlgorithm, table::block::BlockType,
 };
-use std::ops::Deref;
+use core::ops::Deref;
 
 /// Nanosecond timestamp.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Ord, PartialOrd)]
@@ -163,8 +163,8 @@ macro_rules! read_u128 {
 /// A value above `max_seqno` indicates on-disk corruption.
 fn validated_kv_seqno(kv_seqno: SeqNo, max_seqno: SeqNo) -> crate::Result<SeqNo> {
     if kv_seqno > max_seqno {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
+        return Err(crate::io::Error::new(
+            crate::io::ErrorKind::InvalidData,
             "seqno#kv_max exceeds seqno#max",
         )
         .into());
@@ -174,8 +174,8 @@ fn validated_kv_seqno(kv_seqno: SeqNo, max_seqno: SeqNo) -> crate::Result<SeqNo>
 
 fn validated_restart_interval_index(restart_interval: u8) -> crate::Result<u8> {
     if restart_interval == 0 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
+        return Err(crate::io::Error::new(
+            crate::io::ErrorKind::InvalidData,
             "restart_interval#index must be greater than zero",
         )
         .into());
@@ -480,7 +480,9 @@ mod tests {
     #[test]
     fn validated_kv_seqno_exceeds_max_returns_error() {
         let err = validated_kv_seqno(11, 10).unwrap_err();
-        assert!(matches!(err, crate::Error::Io(e) if e.kind() == std::io::ErrorKind::InvalidData));
+        assert!(
+            matches!(err, crate::Error::Io(e) if e.kind() == crate::io::ErrorKind::InvalidData)
+        );
     }
 
     #[test]
@@ -492,7 +494,9 @@ mod tests {
     #[test]
     fn validated_restart_interval_index_zero_returns_error() {
         let err = validated_restart_interval_index(0).unwrap_err();
-        assert!(matches!(err, crate::Error::Io(e) if e.kind() == std::io::ErrorKind::InvalidData));
+        assert!(
+            matches!(err, crate::Error::Io(e) if e.kind() == crate::io::ErrorKind::InvalidData)
+        );
     }
 
     // ---------------------------------------------------------------

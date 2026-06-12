@@ -6,11 +6,10 @@
 mod zstd_backend;
 
 use crate::coding::{Decode, Encode};
-use byteorder::{ReadBytesExt, WriteBytesExt};
-use std::io::{Read, Write};
+use crate::io::{Read, ReadBytesExt, Write, WriteBytesExt};
 
 #[cfg(zstd_any)]
-use std::sync::Arc;
+use alloc::sync::Arc;
 
 #[cfg(feature = "zstd")]
 use once_cell::race::OnceBox;
@@ -212,7 +211,7 @@ impl ZstdDictionary {
             .get_or_try_init(|| -> crate::Result<Box<DictionaryHandle>> {
                 let handle = if self.raw.starts_with(&DICT_MAGIC) {
                     DictionaryHandle::decode_dict(&self.raw)
-                        .map_err(|e| crate::Error::Io(std::io::Error::other(e)))?
+                        .map_err(|e| crate::Error::Io(crate::io::Error::other(e.to_string())))?
                 } else {
                     #[expect(
                         clippy::cast_possible_truncation,
@@ -220,7 +219,7 @@ impl ZstdDictionary {
                     )]
                     let raw_content_id = (self.id as u32).max(1);
                     let dict = Dictionary::from_raw_content(raw_content_id, self.raw.to_vec())
-                        .map_err(|e| crate::Error::Io(std::io::Error::other(e)))?;
+                        .map_err(|e| crate::Error::Io(crate::io::Error::other(e.to_string())))?;
                     DictionaryHandle::from_dictionary(dict)
                 };
                 Ok(Box::new(handle))
@@ -266,8 +265,8 @@ impl ZstdDictionary {
 }
 
 #[cfg(zstd_any)]
-impl std::fmt::Debug for ZstdDictionary {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Debug for ZstdDictionary {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("ZstdDictionary")
             .field("id", &format_args!("{:#018x}", self.id))
             .field("size", &self.raw.len())
@@ -362,7 +361,7 @@ impl CompressionType {
         if !(1..=22).contains(&level) {
             // NOTE: Uses Error::other (not ErrorKind::InvalidInput) to match
             // upstream's error style and minimize fork divergence.
-            return Err(crate::Error::Io(std::io::Error::other(format!(
+            return Err(crate::Error::Io(crate::io::Error::other(format!(
                 "invalid zstd compression level {level}, expected 1..=22"
             ))));
         }
@@ -399,8 +398,8 @@ impl CompressionType {
     }
 }
 
-impl std::fmt::Display for CompressionType {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for CompressionType {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(
             f,
             "{}",
@@ -460,7 +459,7 @@ impl Encode for CompressionType {
                     reason = "level range 1..=22 fits i8"
                 )]
                 writer.write_i8(*level as i8)?;
-                byteorder::WriteBytesExt::write_u32::<byteorder::LittleEndian>(writer, *dict_id)?;
+                crate::io::WriteBytesExt::write_u32::<crate::io::LittleEndian>(writer, *dict_id)?;
             }
         }
 
@@ -490,7 +489,7 @@ impl Decode for CompressionType {
             4 => {
                 let level = i32::from(reader.read_i8()?);
                 Self::validate_zstd_level(level)?;
-                let dict_id = byteorder::ReadBytesExt::read_u32::<byteorder::LittleEndian>(reader)?;
+                let dict_id = crate::io::ReadBytesExt::read_u32::<crate::io::LittleEndian>(reader)?;
                 Ok(Self::ZstdDict { level, dict_id })
             }
 

@@ -1,4 +1,6 @@
-use std::hash::BuildHasher;
+#[cfg(not(feature = "std"))]
+use alloc::vec::Vec;
+use core::hash::BuildHasher;
 
 use super::error::{BuildError, ConstructionFailure};
 use super::filter::RibbonFilter;
@@ -64,7 +66,7 @@ where
     /// No retry budget: a single attempt with the given seed. Caller is
     /// responsible for sizing `m` (via `Params::m`) generously enough that
     /// the banded solver succeeds with the keys provided.
-    pub(crate) fn build_with_seed_verbatim<K: std::hash::Hash>(
+    pub(crate) fn build_with_seed_verbatim<K: core::hash::Hash>(
         &self,
         keys: &[K],
         seed: u64,
@@ -101,7 +103,7 @@ where
             })
     }
 
-    pub fn build<K: std::hash::Hash>(&self, keys: &[K]) -> Result<RibbonFilter<S>, BuildError> {
+    pub fn build<K: core::hash::Hash>(&self, keys: &[K]) -> Result<RibbonFilter<S>, BuildError> {
         self.params.validate().map_err(BuildError::InvalidParams)?;
 
         let mut attempts = 0usize;
@@ -162,7 +164,7 @@ where
         })
     }
 
-    fn build_once<K: std::hash::Hash>(
+    fn build_once<K: core::hash::Hash>(
         &self,
         keys: &[K],
         m: usize,

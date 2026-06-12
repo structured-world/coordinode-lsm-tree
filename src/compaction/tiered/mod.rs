@@ -7,6 +7,8 @@ use crate::{
     HashSet, KvPair, TableId, compaction::state::CompactionState, config::Config, table::Table,
     version::Version,
 };
+#[cfg(not(feature = "std"))]
+use alloc::vec::Vec;
 
 #[cfg(test)]
 mod tests;
@@ -191,7 +193,7 @@ impl CompactionStrategy for Strategy {
     }
 
     fn get_config(&self) -> Vec<KvPair> {
-        use byteorder::{LittleEndian, WriteBytesExt};
+        use crate::io::{LittleEndian, WriteBytesExt};
 
         let mut size_ratio_bytes = vec![];
         #[expect(clippy::expect_used, reason = "writing into Vec should not fail")]

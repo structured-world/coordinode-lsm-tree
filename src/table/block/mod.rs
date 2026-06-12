@@ -314,8 +314,7 @@ impl PreparedBlock<'_> {
     /// Writes the framed block (header + payload + optional parity trailer)
     /// to `writer` and returns the header. This is the single point where
     /// block bytes hit the file, so it must run in on-disk order.
-    // no-std: core2::io::Write (whole block-write path migrates together)
-    pub(crate) fn write_to<W: std::io::Write>(self, mut writer: &mut W) -> crate::Result<Header> {
+    pub(crate) fn write_to<W: crate::io::Write>(self, mut writer: &mut W) -> crate::Result<Header> {
         self.header.encode_into(&mut writer)?;
         writer.write_all(&self.payload)?;
         if let Some(parity) = &self.parity {
@@ -399,7 +398,7 @@ impl Block {
     /// independently. When ECC recovery succeeds, the original
     /// checksum-mismatch is logged at WARN level — the block is
     /// returned to the caller as if no corruption ever happened.
-    fn read_payload_and_verify<R: std::io::Read>(
+    fn read_payload_and_verify<R: crate::io::Read>(
         reader: &mut R,
         data_length: u32,
         ecc_length: u32,
@@ -535,7 +534,7 @@ impl Block {
     /// the mismatch before the call reaches `write_into`, so the
     /// guard is unreachable from any in-tree caller and exists purely
     /// as a "should-never-fire" assertion.
-    pub fn write_into<W: std::io::Write>(
+    pub fn write_into<W: crate::io::Write>(
         writer: &mut W,
         data: &[u8],
         identity: BlockIdentity,
@@ -567,7 +566,7 @@ impl Block {
     /// caller could only guess magic values and a wrong bit would serialize
     /// a header claiming a transform the payload doesn't carry. External
     /// code uses the safe [`Self::write_into`] wrapper instead.
-    pub(crate) fn write_into_with_flags<W: std::io::Write>(
+    pub(crate) fn write_into_with_flags<W: crate::io::Write>(
         writer: &mut W,
         data: &[u8],
         identity: BlockIdentity,
@@ -860,7 +859,7 @@ impl Block {
         clippy::too_many_lines,
         reason = "encrypt/no-encrypt branches duplicate compression match — see comment above"
     )]
-    pub fn from_reader<R: std::io::Read>(
+    pub fn from_reader<R: crate::io::Read>(
         reader: &mut R,
         identity: BlockIdentity,
         transform: &BlockTransform<'_>,
@@ -1211,8 +1210,8 @@ impl Block {
             let mut buf = vec![0u8; block_size];
             let n = file.read_at(&mut buf, *handle.offset())?;
             if n != block_size {
-                return Err(crate::Error::Io(std::io::Error::new(
-                    std::io::ErrorKind::UnexpectedEof,
+                return Err(crate::Error::Io(crate::io::Error::new(
+                    crate::io::ErrorKind::UnexpectedEof,
                     format!(
                         "block read_at: expected {block_size} bytes, got {n} at offset {}",
                         *handle.offset(),
@@ -1300,7 +1299,7 @@ impl Block {
                 (buf, false)
             } else {
                 #[expect(clippy::indexing_slicing, reason = "header was decoded from buf")]
-                let mut cursor = std::io::Cursor::new(&buf[header_len..]);
+                let mut cursor = crate::io::Cursor::new(&buf[header_len..]);
                 Self::read_payload_and_verify(
                     &mut cursor,
                     parsed_header.data_length,
@@ -1452,7 +1451,7 @@ impl Block {
                 (buf.slice(header_len..header_len + actual_data_len), false)
             } else {
                 #[expect(clippy::indexing_slicing, reason = "header was decoded from buf")]
-                let mut cursor = std::io::Cursor::new(&buf[header_len..]);
+                let mut cursor = crate::io::Cursor::new(&buf[header_len..]);
                 let (payload, corrected) = Self::read_payload_and_verify(
                     &mut cursor,
                     parsed_header.data_length,
@@ -1576,7 +1575,7 @@ impl Block {
         transform: &BlockTransform<'_>,
     ) -> crate::Result<(Header, Slice, bool)> {
         if transform.encryption().is_some() {
-            return Err(crate::Error::Io(std::io::Error::other(
+            return Err(crate::Error::Io(crate::io::Error::other(
                 "read_data_frame: encrypted blocks are not supported on the lazy path",
             )));
         }
@@ -1644,7 +1643,7 @@ impl Block {
             (buf.slice(header_len..header_len + actual_data_len), false)
         } else {
             #[expect(clippy::indexing_slicing, reason = "header was decoded from buf")]
-            let mut cursor = std::io::Cursor::new(&buf[header_len..]);
+            let mut cursor = crate::io::Cursor::new(&buf[header_len..]);
             // `corrected` is surfaced so the partial-decode caller can schedule
             // auto-heal (the recovered bytes are correct but the on-disk copy is
             // still faulty); a heal is also logged inside read_payload_and_verify.

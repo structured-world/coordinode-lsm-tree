@@ -2,7 +2,9 @@
 // Copyright (c) 2025-present, fjall-rs
 // Copyright (c) 2026-present, Structured World Foundation
 
-use byteorder::{LittleEndian, WriteBytesExt};
+use crate::io::{LittleEndian, WriteBytesExt};
+#[cfg(not(feature = "std"))]
+use alloc::vec::Vec;
 
 #[derive(Debug)]
 pub struct Builder(Vec<u32>);
@@ -16,7 +18,7 @@ impl Builder {
         self.0.push(pos);
     }
 
-    pub fn write<W: std::io::Write>(&self, writer: &mut W) -> crate::Result<(u8, usize)> {
+    pub fn write<W: crate::io::Write>(&self, writer: &mut W) -> crate::Result<(u8, usize)> {
         // NOTE: We check if the pointers may fit in 16-bits
         // If so, we halve the index size by storing u16 instead of u32
         let step_size = {

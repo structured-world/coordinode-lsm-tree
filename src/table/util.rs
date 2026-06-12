@@ -2,12 +2,15 @@
 // Copyright (c) 2025-present, fjall-rs
 // Copyright (c) 2026-present, Structured World Foundation
 
+#[cfg(not(feature = "std"))]
+use alloc::vec::Vec;
+
 use super::{Block, BlockHandle, GlobalTableId};
+use crate::path::Path;
 use crate::{
     Cache, CompressionType, KeyRange, Table, encryption::EncryptionProvider,
     file_accessor::FileAccessor, table::block::BlockType, version::run::Ranged,
 };
-use std::path::Path;
 
 #[cfg(feature = "metrics")]
 use crate::metrics::Metrics;
@@ -62,7 +65,7 @@ pub fn load_block(
     #[cfg(feature = "metrics")] metrics: &Metrics,
 ) -> crate::Result<Block> {
     #[cfg(feature = "metrics")]
-    use std::sync::atomic::Ordering::Relaxed;
+    use core::sync::atomic::Ordering::Relaxed;
 
     log::trace!("load {block_type:?} block {handle:?}");
 
@@ -265,7 +268,7 @@ pub(crate) fn maybe_record_persistent_heal(
                 #[cfg(feature = "metrics")]
                 metrics
                     .ecc_auto_heal_scheduled
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                 log::warn!(
                     "Persistent ECC correction on table {table_id:?} block {handle:?}; \
                      queued for healing recompaction"
@@ -389,7 +392,9 @@ fn reread_block_is_corrected(
 /// narrower hosts that fail the wider checks before taking their lane).
 #[must_use]
 pub fn longest_shared_prefix_length(s1: &[u8], s2: &[u8]) -> usize {
-    #[cfg(target_arch = "x86_64")]
+    // std-gated: `is_x86_feature_detected!` is std-only. Under no_std the
+    // scalar tail handles x86.
+    #[cfg(all(feature = "std", target_arch = "x86_64"))]
     {
         if std::is_x86_feature_detected!("avx512bw") {
             // SAFETY: AVX-512BW availability just verified via runtime CPU feature detection.
@@ -404,7 +409,7 @@ pub fn longest_shared_prefix_length(s1: &[u8], s2: &[u8]) -> usize {
         // attribute on `lsp_sse2` documents this contract explicitly.
         return unsafe { lsp_sse2(s1, s2) };
     }
-    #[cfg(target_arch = "x86")]
+    #[cfg(all(feature = "std", target_arch = "x86"))]
     {
         if std::is_x86_feature_detected!("avx512bw") {
             // SAFETY: AVX-512BW availability just verified via runtime CPU feature detection.
@@ -436,7 +441,7 @@ pub fn longest_shared_prefix_length(s1: &[u8], s2: &[u8]) -> usize {
     // riscv, powerpc, …), which is the whole point of having a portable fallback.
     #[cfg_attr(
         any(
-            target_arch = "x86_64",
+            all(feature = "std", target_arch = "x86_64"),
             all(target_arch = "aarch64", target_endian = "little")
         ),
         expect(
@@ -508,15 +513,23 @@ pub(crate) fn lsp_scalar(s1: &[u8], s2: &[u8]) -> usize {
 /// # Safety
 ///
 /// Caller must ensure the host CPU supports AVX2 (`is_x86_feature_detected!("avx2")`).
-#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+// Exists only where it is used: the std-gated runtime dispatch above, or the
+// #[cfg(test)] kernel tests below (kept alive under `--all-targets` clippy on
+// the no-default-features build, where the std dispatch is compiled out).
+#[cfg(all(
+    any(target_arch = "x86_64", target_arch = "x86"),
+    any(feature = "std", test)
+))]
 #[target_feature(enable = "avx2")]
 #[expect(unsafe_code, reason = "intrinsics require unsafe")]
 #[must_use]
 unsafe fn lsp_avx2(s1: &[u8], s2: &[u8]) -> usize {
     #[cfg(target_arch = "x86")]
-    use std::arch::x86::{__m256i, _mm256_cmpeq_epi8, _mm256_loadu_si256, _mm256_movemask_epi8};
+    use core::arch::x86::{__m256i, _mm256_cmpeq_epi8, _mm256_loadu_si256, _mm256_movemask_epi8};
     #[cfg(target_arch = "x86_64")]
-    use std::arch::x86_64::{__m256i, _mm256_cmpeq_epi8, _mm256_loadu_si256, _mm256_movemask_epi8};
+    use core::arch::x86_64::{
+        __m256i, _mm256_cmpeq_epi8, _mm256_loadu_si256, _mm256_movemask_epi8,
+    };
 
     let min_len = s1.len().min(s2.len());
     let mut i = 0;
@@ -574,7 +587,11 @@ unsafe fn lsp_avx2(s1: &[u8], s2: &[u8]) -> usize {
 /// Caller must ensure the host CPU supports AVX-512BW
 /// (`is_x86_feature_detected!("avx512bw")`). BW implies the F subset, so the
 /// 512-bit load and the byte-granular compare-mask are both available.
-#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+// See `lsp_avx2`: gated to where it is used (std dispatch or kernel tests).
+#[cfg(all(
+    any(target_arch = "x86_64", target_arch = "x86"),
+    any(feature = "std", test)
+))]
 // List both ISA features the body relies on: `_mm512_loadu_si512` is AVX-512F,
 // `_mm512_cmpeq_epi8_mask` is AVX-512BW. BW implies F (so `avx512bw` alone would
 // compile), but naming both keeps the gate matching the actual requirements and
@@ -586,9 +603,9 @@ unsafe fn lsp_avx2(s1: &[u8], s2: &[u8]) -> usize {
 #[must_use]
 unsafe fn lsp_avx512(s1: &[u8], s2: &[u8]) -> usize {
     #[cfg(target_arch = "x86")]
-    use std::arch::x86::{__m512i, _mm512_cmpeq_epi8_mask, _mm512_loadu_si512};
+    use core::arch::x86::{__m512i, _mm512_cmpeq_epi8_mask, _mm512_loadu_si512};
     #[cfg(target_arch = "x86_64")]
-    use std::arch::x86_64::{__m512i, _mm512_cmpeq_epi8_mask, _mm512_loadu_si512};
+    use core::arch::x86_64::{__m512i, _mm512_cmpeq_epi8_mask, _mm512_loadu_si512};
 
     let min_len = s1.len().min(s2.len());
     let mut i = 0;
@@ -641,15 +658,19 @@ unsafe fn lsp_avx512(s1: &[u8], s2: &[u8]) -> usize {
 /// Caller must ensure the host supports SSE2. On `x86_64` this is the mandatory
 /// ISA baseline (always true); on 32-bit `x86` it must be runtime-detected via
 /// `is_x86_feature_detected!("sse2")` because pre-Pentium-4 CPUs lack it.
-#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+// See `lsp_avx2`: gated to where it is used (std dispatch or kernel tests).
+#[cfg(all(
+    any(target_arch = "x86_64", target_arch = "x86"),
+    any(feature = "std", test)
+))]
 #[target_feature(enable = "sse2")]
 #[expect(unsafe_code, reason = "intrinsics require unsafe")]
 #[must_use]
 unsafe fn lsp_sse2(s1: &[u8], s2: &[u8]) -> usize {
     #[cfg(target_arch = "x86")]
-    use std::arch::x86::{__m128i, _mm_cmpeq_epi8, _mm_loadu_si128, _mm_movemask_epi8};
+    use core::arch::x86::{__m128i, _mm_cmpeq_epi8, _mm_loadu_si128, _mm_movemask_epi8};
     #[cfg(target_arch = "x86_64")]
-    use std::arch::x86_64::{__m128i, _mm_cmpeq_epi8, _mm_loadu_si128, _mm_movemask_epi8};
+    use core::arch::x86_64::{__m128i, _mm_cmpeq_epi8, _mm_loadu_si128, _mm_movemask_epi8};
 
     let min_len = s1.len().min(s2.len());
     let mut i = 0;
@@ -710,7 +731,7 @@ unsafe fn lsp_sse2(s1: &[u8], s2: &[u8]) -> usize {
 #[expect(unsafe_code, reason = "intrinsics require unsafe")]
 #[must_use]
 unsafe fn lsp_neon(s1: &[u8], s2: &[u8]) -> usize {
-    use std::arch::aarch64::{
+    use core::arch::aarch64::{
         vandq_u8, vceqq_u8, vdupq_n_u8, vgetq_lane_u64, vld1q_u8, vreinterpretq_u64_u8,
     };
 
@@ -768,7 +789,7 @@ pub fn compare_prefixed_slice(
     suffix: &[u8],
     needle: &[u8],
     cmp: &dyn crate::comparator::UserComparator,
-) -> std::cmp::Ordering {
+) -> core::cmp::Ordering {
     // Fast path: zero-allocation bytewise comparison for the default
     // (lexicographic) comparator. This is the hot path for block index
     // and data block binary searches.
@@ -809,8 +830,8 @@ fn compare_prefixed_slice_lexicographic(
     prefix: &[u8],
     suffix: &[u8],
     needle: &[u8],
-) -> std::cmp::Ordering {
-    use std::cmp::Ordering::{Equal, Greater};
+) -> core::cmp::Ordering {
+    use core::cmp::Ordering::{Equal, Greater};
 
     if needle.is_empty() {
         let combined_len = prefix.len() + suffix.len();
@@ -1124,7 +1145,7 @@ mod tests {
 
     #[test]
     fn test_compare_prefixed_slice() {
-        use std::cmp::Ordering::{Equal, Greater, Less};
+        use core::cmp::Ordering::{Equal, Greater, Less};
 
         assert_eq!(
             Greater,
@@ -1241,14 +1262,14 @@ mod tests {
             "test-reverse"
         }
 
-        fn compare(&self, a: &[u8], b: &[u8]) -> std::cmp::Ordering {
+        fn compare(&self, a: &[u8], b: &[u8]) -> core::cmp::Ordering {
             b.cmp(a)
         }
     }
 
     #[test]
     fn test_compare_prefixed_slice_custom_comparator() {
-        use std::cmp::Ordering::{Equal, Greater, Less};
+        use core::cmp::Ordering::{Equal, Greater, Less};
 
         use crate::comparator::UserComparator as _;
         assert_eq!(ReverseComparator.name(), "test-reverse");

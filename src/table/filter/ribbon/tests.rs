@@ -1,6 +1,6 @@
 use super::{BuildError, Mode, ParamError, Params, RibbonBuilder};
+use core::hash::BuildHasherDefault;
 use std::collections::hash_map::DefaultHasher;
-use std::hash::BuildHasherDefault;
 
 use super::hashing::{standard_equation_w64, start_position_from_stream};
 

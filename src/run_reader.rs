@@ -3,10 +3,10 @@
 // Copyright (c) 2026-present, Structured World Foundation
 
 use crate::{BoxedIterator, InternalValue, Table, UserKey, version::Run};
-use std::{
-    ops::{Bound, Deref, RangeBounds},
-    sync::Arc,
-};
+#[cfg(not(feature = "std"))]
+use alloc::boxed::Box;
+use alloc::sync::Arc;
+use core::ops::{Bound, Deref, RangeBounds};
 
 type OwnedRange = (Bound<UserKey>, Bound<UserKey>);
 
