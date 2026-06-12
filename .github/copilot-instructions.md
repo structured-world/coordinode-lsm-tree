@@ -1,9 +1,5 @@
 # GitHub Copilot Instructions for coordinode-lsm-tree (structured-world fork)
 
-## Project Overview
-
-This is a **maintained fork** of [fjall-rs/lsm-tree](https://github.com/fjall-rs/lsm-tree) — a K.I.S.S. LSM-tree implementation in Rust. We maintain additional features and hardening for the [CoordiNode](https://github.com/structured-world/coordinode) database engine while contributing patches upstream.
-
 ## Review Scope Rules (CRITICAL)
 
 **Review ONLY code within the PR's diff.** For issues found in code outside the diff:
@@ -59,7 +55,7 @@ cargo fmt --all -- --check                   # Format check
 
 | Flag | Description |
 |------|-------------|
-| `lz4` | LZ4 compression (enabled by default in fjall) |
+| `lz4` | LZ4 compression (enabled by default) |
 | `zstd` | Zstd compression (PR #1) |
 | `bytes_1` | Use `bytes` crate for Slice type |
 | `metrics` | Expose prometheus metrics |
