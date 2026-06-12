@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1781238013514,
+  "lastUpdate": 1781239408764,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -15210,6 +15210,84 @@ window.BENCHMARK_DATA = {
             "value": 566040.1970559134,
             "unit": "ops/sec",
             "extra": "P50: 1.6us | P99: 4.9us | P99.9: 7.4us\nthreads: 1 | elapsed: 0.35s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "255865126+sw-release-bot[bot]@users.noreply.github.com",
+            "name": "sw-release-bot[bot]",
+            "username": "sw-release-bot[bot]"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "69e7ed96c9ac2fe5c4f14c3a5cf175698ad96149",
+          "message": "chore: release v5.2.1 (#452)\n\n## 🤖 New release\n\n* `coordinode-lsm-tree`: 5.2.0 -> 5.2.1\n\n<details><summary><i><b>Changelog</b></i></summary><p>\n\n<blockquote>\n\n##\n[5.2.1](https://github.com/structured-world/coordinode-lsm-tree/compare/v5.2.0...v5.2.1)\n- 2026-06-12\n\n### Refactored\n\n- *(no-std)* make the core LSM path no_std + alloc capable\n([#451](https://github.com/structured-world/coordinode-lsm-tree/pull/451))\n</blockquote>\n\n\n</p></details>\n\n---\nThis PR was generated with\n[release-plz](https://github.com/release-plz/release-plz/).\n\nCo-authored-by: sw-release-bot[bot] <255865126+sw-release-bot[bot]@users.noreply.github.com>",
+          "timestamp": "2026-06-12T07:34:31+03:00",
+          "tree_id": "74b8ae404dc2dd73f5f819b5e6cff4517f322d64",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/69e7ed96c9ac2fe5c4f14c3a5cf175698ad96149"
+        },
+        "date": 1781239403385,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 1971284.5541664492,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.6us | P99.9: 3.8us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1170380.7118543405,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.2us | P99.9: 4.4us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 611190.9353636738,
+            "unit": "ops/sec",
+            "extra": "P50: 1.5us | P99: 4.6us | P99.9: 7.5us\nthreads: 1 | elapsed: 0.33s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3687125.2279173415,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 3.1us | P99.9: 5.8us\nthreads: 1 | elapsed: 0.05s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 416522.64528450446,
+            "unit": "ops/sec",
+            "extra": "P50: 2.1us | P99: 5.5us | P99.9: 8.5us\nthreads: 1 | elapsed: 0.48s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 225212.8423231684,
+            "unit": "ops/sec",
+            "extra": "P50: 4.1us | P99: 5.2us | P99.9: 8.4us\nthreads: 1 | elapsed: 0.89s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1175175.6966990924,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.2us | P99.9: 4.4us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1116577.7267844174,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 1.5us | P99.9: 3.6us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 515676.96521094424,
+            "unit": "ops/sec",
+            "extra": "P50: 1.7us | P99: 6.1us | P99.9: 9.3us\nthreads: 1 | elapsed: 0.39s | num: 200000 | iterations: 3"
           }
         ]
       }
