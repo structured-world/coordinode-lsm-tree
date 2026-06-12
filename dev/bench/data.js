@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1781121301031,
+  "lastUpdate": 1781238013514,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -15132,6 +15132,84 @@ window.BENCHMARK_DATA = {
             "value": 551043.0365768757,
             "unit": "ops/sec",
             "extra": "P50: 1.6us | P99: 5.2us | P99.9: 7.7us\nthreads: 1 | elapsed: 0.36s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "4156d5c9c984c43bdba7133bd598cbada6ed6e48",
+          "message": "refactor(no-std): make the core LSM path no_std + alloc capable (#451)\n\n## Summary\n\nMakes the **entire crate** compile on `thumbv7em-none-eabihf\n--no-default-features --features alloc` with **zero errors**. The core\nLSM path is fully no_std; the std::fs-bound diagnostic / maintenance\ntools are gated behind `std`.\n\n## What changed\n\n**Core path → core/alloc/crate mirrors**\n- `cmp`/`mem`/`ops`/`hash`/`fmt` → `core`; `Arc`/`Vec`/`VecDeque`/`Cow`\n→ `alloc`; `path` → `crate::path`;\n`io::{Read,Write,Seek,Error,Cursor,BufReader,BufWriter}` → `crate::io`\n(gated-import where concrete writers call the trait methods).\n\n**Dual-backend (std hot path unchanged)**\n- Tree-level locks + `RuntimeConfigHandle`: `parking_lot` / `arc-swap`\nunder std, `spin` / `spin::RwLock` under no_std. `AtomicU64` via\n`portable-atomic`. Guard return types centralized as aliases so\n`AbstractTree` and its impls share one signature per build.\n\n**io plumbing**\n- Blanket `Read`/`Write`/`Seek`/`BufRead` impls for `&mut R` / `Box<R>`\nso `Box<dyn FsFile>` satisfies the io traits the way std's blankets do.\n- Crate-local LEB128 `VarintReader`/`VarintWriter` for no_std\n(byte-identical to `varint-rs`, which only blankets `std::io`). Call\nsites swap only the import path.\n\n**Fs-routed file access** — blob-file `Scanner` opens via `fs.open`;\n`sfa::Reader`'s wire codec is un-gated (only its path constructor stays\nstd-only).\n\n**Float / time / path primitives**\n- `crate::time::Instant` shim (std re-export / no_std ZST).\n`libm`-backed f32/f64 `ceil`/`round`/`log2` for targets without float\nintrinsics.\n- no_std `Path`/`PathBuf` gain `Ord`/`Hash`/`Borrow`/`PartialEq` +\n`as_os_str`, so the in-memory `MemFs` backend compiles unchanged.\n\n**std-only surface gated behind `std`**\n- The std::fs-bound diagnostic / maintenance tools: `verify` (bit-rot\nscrub), `repair` (last-resort manifest rebuild), `checkpoint` (PITR\nbackup), `inspect` (forensic dump). These need real filesystem syscalls\n(dir-walk, hard-link, `std::path::absolute`) with no `Fs`-trait\nequivalent yet.\n- `Config::default` / `Config::new` (StdFs default),\n`BackgroundDeleter`, thread-pool defaults,\n`RateLimiter::request_interruptible` (no_std gets a non-throttling,\nstop-aware variant).\n\n> The **normal crash-recovery-on-open** path (`version::recovery` —\nmanifest / version replay) is no_std-capable. What no_std loses is the\nmanual disaster-recovery (`repair`) and PITR (`checkpoint`) tooling, not\nthe everyday open-after-crash path.\n\n## Testing\n\n- `cargo check --all-features` — green\n- `cargo clippy --all-features` — clean\n- `cargo nextest run --all-features` — **2060 passed**, 2 skipped\n- `cargo test --doc --all-features` — **49 passed**\n- `cargo check --target thumbv7em-none-eabihf --no-default-features\n--features alloc` — **0 errors**\n\nPart of #358\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n## Summary by CodeRabbit\n\n* **Refactor**\n* Improved portability: broad no-std + alloc support across the library\nwhile preserving std behavior\n* Unified I/O, error, and formatting surfaces for consistent behavior\nacross targets\n* Pluggable filesystem and synchronization backends for more deployment\nflexibility\n\n* **Build & Infrastructure**\n* Adjusted dependency wiring to support both std and no-std builds and\ninternal I/O helpers\n* Optional compression dependency version bumped; test/dev dependency\nadjustments for integration tests\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-06-12T07:19:09+03:00",
+          "tree_id": "82230fc50c45d97678f66ff33032b2ce55083bf7",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/4156d5c9c984c43bdba7133bd598cbada6ed6e48"
+        },
+        "date": 1781237998419,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 1995929.7005616447,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.6us | P99.9: 3.7us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1154820.6225788102,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.2us | P99.9: 4.9us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 668305.3312898293,
+            "unit": "ops/sec",
+            "extra": "P50: 1.3us | P99: 4.6us | P99.9: 7.3us\nthreads: 1 | elapsed: 0.30s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3660036.419192389,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 3.1us | P99.9: 5.6us\nthreads: 1 | elapsed: 0.05s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 436687.0464726634,
+            "unit": "ops/sec",
+            "extra": "P50: 2.0us | P99: 5.3us | P99.9: 8.7us\nthreads: 1 | elapsed: 0.46s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 225025.99435591826,
+            "unit": "ops/sec",
+            "extra": "P50: 4.2us | P99: 5.2us | P99.9: 8.0us\nthreads: 1 | elapsed: 0.89s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1218027.3232639462,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.2us | P99.9: 4.4us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1133774.1220364985,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 1.4us | P99.9: 2.5us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 566040.1970559134,
+            "unit": "ops/sec",
+            "extra": "P50: 1.6us | P99: 4.9us | P99.9: 7.4us\nthreads: 1 | elapsed: 0.35s | num: 200000 | iterations: 3"
           }
         ]
       }
