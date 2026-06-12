@@ -1739,16 +1739,21 @@ mod tests {
 
     #[cfg(feature = "std")]
     #[test]
-    fn read_bytes_ext_reads_floats_in_byte_order() {
+    fn read_bytes_ext_reads_floats_in_byte_order() -> crate::io::Result<()> {
         // `read_f32` / `read_f64` decode IEEE-754 bit patterns through
         // the integer readers; exercise both over a `Cursor` so the
-        // bit-cast path is covered.
+        // bit-cast path is covered. Compare via `to_bits` (exact integer
+        // equality) so the assertion is bit-precise and avoids float_cmp.
         let f32_bytes = 1.5f32.to_le_bytes();
         let mut cur = Cursor::new(&f32_bytes[..]);
-        assert_eq!(cur.read_f32::<LittleEndian>().unwrap(), 1.5);
+        assert_eq!(cur.read_f32::<LittleEndian>()?.to_bits(), 1.5f32.to_bits());
 
         let f64_bytes = (-2.25f64).to_le_bytes();
         let mut cur = Cursor::new(&f64_bytes[..]);
-        assert_eq!(cur.read_f64::<LittleEndian>().unwrap(), -2.25);
+        assert_eq!(
+            cur.read_f64::<LittleEndian>()?.to_bits(),
+            (-2.25f64).to_bits()
+        );
+        Ok(())
     }
 }
