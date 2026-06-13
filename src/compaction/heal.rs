@@ -230,11 +230,30 @@ mod tests {
             "a persistent ECC correction must record a heal hint",
         );
         #[cfg(feature = "metrics")]
-        assert_eq!(
-            tree.metrics().ecc_auto_heal_scheduled_count(),
-            1,
-            "the scheduled SST is counted once",
-        );
+        {
+            assert_eq!(
+                tree.metrics().ecc_auto_heal_scheduled_count(),
+                1,
+                "the scheduled SST is counted once",
+            );
+            // The recovery is attributed to the RS shard path (this SST uses an
+            // RS scheme), not SEC-DED, and counted once on the primary read.
+            assert_eq!(
+                tree.metrics().ecc_shard_recovered_count(),
+                1,
+                "the RS recovery is counted once",
+            );
+            assert_eq!(
+                tree.metrics().ecc_secded_corrected_count(),
+                0,
+                "an RS recovery must not increment the SEC-DED counter",
+            );
+            assert_eq!(
+                tree.metrics().ecc_recovered_count(),
+                1,
+                "one total recovery"
+            );
+        }
 
         // Run the heal strategy: it claims the SST and rewrites it clean.
         let result = tree.compact(
@@ -257,6 +276,98 @@ mod tests {
             "the rewritten SST must read clean (no further correction)",
         );
 
+        Ok(())
+    }
+
+    /// End-to-end SEC-DED recovery through a tree read: a single-bit flip in a
+    /// SEC-DED-protected SST is healed on read by the SEC-DED fast path and
+    /// attributed to the SEC-DED counter (NOT the RS shard counter), proving the
+    /// unified recovery metric distinguishes the two heal mechanisms. Gated on
+    /// `metrics`: the counter is the whole point.
+    #[cfg(feature = "metrics")]
+    #[test]
+    fn read_healing_single_bit_increments_secded_counter() -> crate::Result<()> {
+        let dir = tempfile::tempdir()?;
+
+        // Write one SST whose data blocks carry SEC-DED parity, capture the
+        // first data block's on-disk offset.
+        let (sst_path, corrupt_pos) = {
+            let crate::AnyTree::Standard(tree) = Config::new(
+                dir.path(),
+                SequenceNumberCounter::default(),
+                SequenceNumberCounter::default(),
+            )
+            .page_ecc(true)
+            .ecc_scheme(EccScheme::Secded)
+            .open()?
+            else {
+                unreachable!("standard tree configured (no kv separation)");
+            };
+            for i in 0u64..2_000 {
+                tree.insert(format!("key-{i:06}"), format!("v{i:06}"), i);
+            }
+            tree.flush_active_memtable(2_000)?;
+
+            let binding = tree.version_history.read().latest_version();
+            #[expect(clippy::expect_used, reason = "flush produced exactly one table")]
+            let table = binding.version.iter_tables().next().expect("one table");
+            #[expect(clippy::expect_used, reason = "table has at least one data block")]
+            let keyed = table.block_index.iter().next().expect("a data block")?;
+            // Target-conditional truncation: `as usize` only narrows on 32-bit
+            // pointer widths, so `allow` (not `expect`) keeps it clean on the
+            // 64-bit host.
+            #[allow(
+                clippy::cast_possible_truncation,
+                reason = "in-file block offset fits usize; only narrows on 32-bit targets"
+            )]
+            let off = keyed.offset().0 as usize;
+            ((*table.path).clone(), off + Header::MIN_LEN + 3)
+        };
+
+        // Flip a SINGLE bit: the SEC-DED fast path corrects one bit per word.
+        let mut bytes = std::fs::read(&sst_path)?;
+        {
+            #[expect(
+                clippy::expect_used,
+                reason = "corrupt_pos is an in-file block offset, in range for the SST bytes"
+            )]
+            let slot = bytes.get_mut(corrupt_pos).expect("corrupt_pos in range");
+            *slot ^= 0x01;
+        }
+        std::fs::write(&sst_path, &bytes)?;
+
+        // Reopen (fresh caches + fds) so the read hits the tampered bytes.
+        let crate::AnyTree::Standard(tree) = Config::new(
+            dir.path(),
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .page_ecc(true)
+        .ecc_scheme(EccScheme::Secded)
+        .open()?
+        else {
+            unreachable!("standard tree configured (no kv separation)");
+        };
+
+        #[expect(clippy::expect_used, reason = "key was inserted before flush")]
+        let got = tree.get(b"key-000000", MAX_SEQNO)?.expect("key present");
+        assert_eq!(&*got, b"v000000", "SEC-DED must heal the single-bit flip");
+
+        assert_eq!(
+            tree.metrics().ecc_secded_corrected_count(),
+            1,
+            "the SEC-DED heal is counted once",
+        );
+        assert_eq!(
+            tree.metrics().ecc_shard_recovered_count(),
+            0,
+            "a SEC-DED heal must not increment the RS shard counter",
+        );
+        assert_eq!(
+            tree.metrics().ecc_recovered_count(),
+            1,
+            "one total recovery"
+        );
         Ok(())
     }
 
