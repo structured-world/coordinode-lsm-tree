@@ -181,14 +181,19 @@ fn recover_blob_files(
         }
 
         let Ok(blob_id) = file_name.parse::<crate::vlog::BlobFileId>() else {
-            let reason = match quarantine_file(&*config.fs, &blobs_folder, &blob_path, &file_name) {
-                Ok(dest) => format!(
+            // A non-numeric name aborts the reopen's blob recovery (it parses
+            // every name in blobs/), so it MUST be moved out of the way. If the
+            // quarantine itself fails the bad name stays in place and the tree
+            // would not reopen, so fail the repair rather than report a false
+            // success.
+            let dest = quarantine_file(&*config.fs, &blobs_folder, &blob_path, &file_name)?;
+            unreadable.push((
+                blob_path,
+                format!(
                     "file name is not a blob id; quarantined to {}",
                     dest.display()
                 ),
-                Err(e) => format!("file name is not a blob id; quarantine failed: {e}"),
-            };
-            unreadable.push((blob_path, reason));
+            ));
             continue;
         };
 
@@ -310,18 +315,17 @@ fn repair_tree(config: &Config) -> crate::Result<RepairReport> {
                 // `tables/`). Leaving it in place would let repair report
                 // success while the tree still cannot reopen, so move it out of
                 // `tables/` into a sibling quarantine dir; report where it went.
-                let reason =
-                    match quarantine_file(&*folder_fs, &table_base_folder, &table_path, &file_name)
-                    {
-                        Ok(dest) => {
-                            format!(
-                                "file name is not a table id; quarantined to {}",
-                                dest.display()
-                            )
-                        }
-                        Err(e) => format!("file name is not a table id; quarantine failed: {e}"),
-                    };
-                unreadable_files.push((table_path, reason));
+                // If the quarantine itself fails the bad name stays in place, so
+                // fail the repair rather than report a false success.
+                let dest =
+                    quarantine_file(&*folder_fs, &table_base_folder, &table_path, &file_name)?;
+                unreadable_files.push((
+                    table_path,
+                    format!(
+                        "file name is not a table id; quarantined to {}",
+                        dest.display()
+                    ),
+                ));
                 continue;
             };
 
