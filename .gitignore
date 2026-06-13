@@ -31,3 +31,7 @@ old
 **/proptest-regressions/
 **/*.proptest-regressions
 benchmark-results.json
+
+# Per-tree exclusive directory lock file: a runtime artifact created when a tree
+# directory is opened. Never committed (e.g. when tests open a fixture tree).
+LOCK
