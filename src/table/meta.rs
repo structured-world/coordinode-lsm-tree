@@ -88,8 +88,9 @@ pub struct ParsedMeta {
     pub ecc_params: Option<crate::table::block::EccParams>,
 
     /// `true` when the `descriptor#page_ecc` value decoded to an ECC scheme
-    /// this build cannot apply: an unimplemented scheme (`Secded`), page
-    /// granularity, an unknown kind, or a non-canonical descriptor. The
+    /// this build cannot apply: page granularity, an unknown kind, or a
+    /// non-canonical descriptor (recognized block-granularity `Secded` /
+    /// `Xor` / `ReedSolomon` are applicable, not flagged here). The
     /// per-block read still returns the payload (framed by `data_length`,
     /// checksum-verified) with `EccStatus::Unrecognized`, but the trailer
     /// length is not derivable from a scheme — so the sequential scrub walk
@@ -373,17 +374,25 @@ impl ParsedMeta {
                 .ok_or(crate::Error::InvalidHeader("TableMeta"))?;
             use crate::runtime_config::{EccDescriptor, EccGranularity};
             // Three-state ECC contract: a recognized + applicable scheme
-            // (`Xor`/`ReedSolomon`, block granularity, valid shards) yields the
-            // recovery params (`ecc_unrecognized = false`). Anything else that
-            // still decodes — an unimplemented scheme (`Secded`), page
-            // granularity, an unknown kind, or a non-canonical descriptor — is
-            // NOT a hard error: it resolves to "no recovery scheme" (`None`)
-            // with `ecc_unrecognized = true`. The per-block read then frames
-            // the payload by `data_length`, verifies it by checksum, and
-            // reports `EccStatus::Unrecognized` (a WARN + recompaction hint)
-            // instead of failing; the scrub skips ECC-walk of such tables.
+            // (`Secded`, `Xor`/`ReedSolomon`, block granularity, valid shards)
+            // yields the recovery params (`ecc_unrecognized = false`). Anything
+            // else that still decodes (page granularity, an unknown kind, or a
+            // non-canonical descriptor) is NOT a hard error: it resolves to "no
+            // recovery scheme" (`None`) with `ecc_unrecognized = true`. The
+            // per-block read then frames the payload by `data_length`, verifies
+            // it by checksum, and reports `EccStatus::Unrecognized` (a WARN +
+            // recompaction hint) instead of failing; the scrub skips ECC-walk of
+            // such tables.
+            use crate::runtime_config::EccScheme;
             match crate::runtime_config::ecc_descriptor_from_bytes(&v.value)? {
                 EccDescriptor::Off => (false, None, false),
+                // SEC-DED has no shard layout (`shard_params() == None`); it
+                // sizes its parity from `block_parity_len` instead, so it is
+                // mapped to its dedicated `EccParams::SECDED` rather than going
+                // through the shard path. Mirrors the writer's `resolve_ecc`.
+                EccDescriptor::Recognized(EccScheme::Secded, EccGranularity::Block) => {
+                    (true, Some(crate::table::block::EccParams::SECDED), false)
+                }
                 EccDescriptor::Recognized(scheme, EccGranularity::Block) => {
                     let params = scheme
                         .shard_params()
@@ -395,8 +404,7 @@ impl ParsedMeta {
                             crate::table::block::EccParams::try_new(d as u8, p as u8)
                         })
                         .transpose()?;
-                    // `Secded` is recognized but has no shard layout
-                    // (`shard_params() == None`) → unimplemented → unrecognized.
+                    // A non-SECDED scheme with no shard layout is unimplemented.
                     let unrecognized = params.is_none();
                     (params.is_some(), params, unrecognized)
                 }
@@ -859,17 +867,16 @@ mod tests {
         );
     }
 
-    /// An unsupported-but-decodable ECC descriptor (page granularity, the
-    /// unimplemented `Secded` scheme) does NOT fail meta load: it resolves to
-    /// "no recovery scheme" (`ecc_params == None`). The per-block read then
-    /// frames the payload by `data_length` and reports `EccStatus::Unrecognized`
-    /// (a WARN) rather than failing the read. This is the three-state contract:
+    /// An unsupported-but-decodable ECC descriptor (page granularity, an unknown
+    /// kind, a non-canonical "off") does NOT fail meta load: it resolves to "no
+    /// recovery scheme" (`ecc_params == None`). The per-block read then frames
+    /// the payload by `data_length` and reports `EccStatus::Unrecognized` (a
+    /// WARN) rather than failing the read. This is the three-state contract:
     /// unrecognized ECC is a typing warning, not corruption.
     #[test]
     fn load_with_handle_unsupported_ecc_descriptor_parses_without_recovery_scheme() {
         for descriptor in [
             [3u8, 8, 2, 1], // ReedSolomon(8,2) with page granularity
-            [1u8, 0, 0, 0], // Secded, block granularity (unimplemented)
             [9u8, 0, 0, 0], // unknown kind
             [0u8, 8, 2, 1], // non-canonical "off" with junk reserved bytes
         ] {
@@ -913,6 +920,28 @@ mod tests {
         assert!(
             parsed.page_ecc && !parsed.ecc_unrecognized && parsed.ecc_params.is_some(),
             "recognized RS(8,2) is applicable, not unrecognized",
+        );
+
+        // SEC-DED (block granularity, no shard layout) is a recognized,
+        // applicable scheme: it resolves to its dedicated `EccParams::SECDED`,
+        // is NOT flagged unrecognized, and turns Page ECC on.
+        let mut items = valid_meta_items();
+        if let Some(item) = items
+            .iter_mut()
+            .find(|iv| &*iv.key.user_key == b"descriptor#page_ecc")
+        {
+            *item = meta("descriptor#page_ecc", &[1u8, 0, 0, 0]); // Secded, block
+        }
+        let parsed = load_meta_from_items(&items).unwrap();
+        assert!(parsed.page_ecc, "SEC-DED turns Page ECC on");
+        assert!(
+            !parsed.ecc_unrecognized,
+            "SEC-DED is recognized, not a warning"
+        );
+        assert_eq!(
+            parsed.ecc_params,
+            Some(crate::table::block::EccParams::SECDED),
+            "SEC-DED resolves to its dedicated parity params",
         );
     }
 

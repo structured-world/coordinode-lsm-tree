@@ -137,7 +137,7 @@ pub fn load_block(
         #[cfg(zstd_any)]
         zstd_dict,
     )?;
-    let (block, ecc_status) = Block::from_file_with_status(
+    let (block, ecc_status, recovery) = Block::from_file_with_recovery(
         fd.as_ref(),
         *handle,
         crate::table::block::BlockIdentity {
@@ -148,6 +148,15 @@ pub fn load_block(
         },
         &transform,
     )?;
+    // Count the on-read ECC recovery (by mechanism) at this primary read site.
+    // The persistence-confirming re-read below goes through a path that does
+    // NOT count, so a single fault is counted exactly once.
+    #[cfg(feature = "metrics")]
+    if let Some(kind) = recovery {
+        metrics.record_ecc_recovery(kind);
+    }
+    #[cfg(not(feature = "metrics"))]
+    let _ = recovery;
     let corrected = matches!(ecc_status, crate::table::block::EccStatus::Corrected);
 
     if block.header.block_type != block_type {
@@ -362,7 +371,7 @@ pub(crate) fn scrub_block(
         #[cfg(zstd_any)]
         zstd_dict,
     )?;
-    let (_block, ecc_status) = Block::from_file_with_status(
+    let (_block, ecc_status, recovery) = Block::from_file_with_recovery(
         fd.as_ref(),
         *handle,
         crate::table::block::BlockIdentity {
@@ -376,6 +385,15 @@ pub(crate) fn scrub_block(
 
     Ok(match ecc_status {
         crate::table::block::EccStatus::Corrected => {
+            // Primary read for the scrub: count the recovery by mechanism here
+            // (the confirming re-read inside maybe_record_persistent_heal does
+            // not count).
+            #[cfg(feature = "metrics")]
+            if let Some(kind) = recovery {
+                metrics.record_ecc_recovery(kind);
+            }
+            #[cfg(not(feature = "metrics"))]
+            let _ = recovery;
             let scheduled = maybe_record_persistent_heal(
                 table_id,
                 path,

@@ -71,6 +71,19 @@ pub struct Metrics {
     /// only when `auto_heal` is enabled). Each SST is counted once per pending
     /// schedule.
     pub(crate) ecc_auto_heal_scheduled: AtomicUsize,
+
+    /// On-read blocks healed by the SEC-DED single-bit fast path (one corrected
+    /// bit flip). Counted on every primary read that observes the recovery
+    /// (point/range loads, partial-decode, patrol scrub); the persistence
+    /// confirming re-read does NOT re-count. A non-zero, growing value is a
+    /// scrapeable latent-bit-rot signal.
+    pub(crate) ecc_secded_corrected: AtomicUsize,
+
+    /// On-read blocks recovered from Reed-Solomon shard parity (the general
+    /// multi-byte path). Same counting discipline as
+    /// [`Self::ecc_secded_corrected`]; the two are disjoint by recovery
+    /// mechanism and sum to the total on-read ECC recoveries.
+    pub(crate) ecc_shard_recovered: AtomicUsize,
 }
 
 #[expect(
@@ -143,6 +156,36 @@ impl Metrics {
     /// ECC correction on read (`auto_heal` enabled).
     pub fn ecc_auto_heal_scheduled_count(&self) -> usize {
         self.ecc_auto_heal_scheduled.load(Relaxed)
+    }
+
+    /// On-read blocks healed by the SEC-DED single-bit fast path.
+    pub fn ecc_secded_corrected_count(&self) -> usize {
+        self.ecc_secded_corrected.load(Relaxed)
+    }
+
+    /// On-read blocks recovered from Reed-Solomon shard parity.
+    pub fn ecc_shard_recovered_count(&self) -> usize {
+        self.ecc_shard_recovered.load(Relaxed)
+    }
+
+    /// Total on-read ECC recoveries across both mechanisms (SEC-DED + RS shard).
+    /// A scrapeable latent-bit-rot signal: growth here means the medium is
+    /// returning faulty bytes that parity is silently repairing.
+    pub fn ecc_recovered_count(&self) -> usize {
+        self.ecc_secded_corrected_count() + self.ecc_shard_recovered_count()
+    }
+
+    /// Records one on-read ECC recovery, attributing it to the mechanism that
+    /// did the repair. Called from the primary read paths (`load_block`, the
+    /// partial-decode path, patrol scrub); the persistence-confirming re-read
+    /// must NOT call this, to avoid double-counting a single fault.
+    pub(crate) fn record_ecc_recovery(&self, kind: crate::table::block::EccRecoveryKind) {
+        use crate::table::block::EccRecoveryKind;
+        match kind {
+            EccRecoveryKind::Secded => &self.ecc_secded_corrected,
+            EccRecoveryKind::Shard => &self.ecc_shard_recovered,
+        }
+        .fetch_add(1, Relaxed);
     }
 
     /// Number of blocks that were loaded from disk or OS page cache.
@@ -270,6 +313,22 @@ mod tests {
         assert_eq!(0, m.range_tombstone_block_load_count());
         assert_eq!(0, m.range_tombstone_block_load_cached_count());
         assert_eq!(0, m.range_tombstone_block_io());
+    }
+
+    #[test]
+    fn record_ecc_recovery_attributes_each_kind_to_its_own_counter() {
+        use crate::table::block::EccRecoveryKind;
+        let m = Metrics::default();
+        assert_eq!(0, m.ecc_recovered_count(), "counters start at zero");
+
+        m.record_ecc_recovery(EccRecoveryKind::Secded);
+        m.record_ecc_recovery(EccRecoveryKind::Secded);
+        m.record_ecc_recovery(EccRecoveryKind::Shard);
+
+        assert_eq!(2, m.ecc_secded_corrected_count(), "two SEC-DED heals");
+        assert_eq!(1, m.ecc_shard_recovered_count(), "one RS shard recovery");
+        // The two mechanisms are disjoint and sum to the total.
+        assert_eq!(3, m.ecc_recovered_count(), "total across both mechanisms");
     }
 
     #[test]

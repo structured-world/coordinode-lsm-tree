@@ -349,13 +349,14 @@ impl PreparedBlock<'_> {
 /// - [`Self::Corrected`] — ECC repaired the on-disk payload (the caller saw
 ///   correct bytes, but the on-disk copy still holds a latent fault). Treat as
 ///   a signal to confirm persistence and potentially schedule an auto-heal
-///   recompaction.
+///   recompaction. Which mechanism did the repair (SEC-DED vs RS shard) is
+///   surfaced separately to internal read paths via [`EccRecoveryKind`] for
+///   metrics attribution.
 /// - [`Self::Unrecognized`] — the block carries an ECC trailer this build
-///   cannot interpret (an unimplemented or non-canonical scheme: Secded,
-///   page granularity, unknown kind, …). The payload was returned (its
-///   checksum passed), but ECC recovery is unavailable for this block;
-///   recompaction re-stamps it with a supported scheme. A "typing" warning,
-///   not a read failure.
+///   cannot interpret (a non-canonical scheme, page granularity, unknown kind,
+///   …). The payload was returned (its checksum passed), but ECC recovery is
+///   unavailable for this block; recompaction re-stamps it with a supported
+///   scheme. A "typing" warning, not a read failure.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, Default)]
 pub enum EccStatus {
     /// ECC absent or a recognized scheme verified normally.
@@ -372,6 +373,21 @@ pub enum EccStatus {
     /// persistent (not a transient read-path fault) and, if so, schedule a
     /// recompaction so the corrected bytes are persisted to a fresh SST.
     Corrected,
+}
+
+/// Which ECC mechanism recovered a block whose checksum failed on read.
+///
+/// Returned alongside [`EccStatus`] by the internal recovery-aware read paths
+/// (kept out of the public `EccStatus` to keep that enum stable) so an operator
+/// metric can attribute each on-read recovery to the right heal path: the cheap
+/// single-bit fast path versus full shard reconstruction.
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
+pub enum EccRecoveryKind {
+    /// A single-bit flip healed by the SEC-DED fast path (one XOR-and-recheck
+    /// per word, no shard arithmetic).
+    Secded,
+    /// Recovered from Reed-Solomon shard parity (the general multi-byte path).
+    Shard,
 }
 
 #[derive(Clone)]
@@ -408,7 +424,7 @@ impl Block {
             expect(unused_variables, reason = "recovery scheme only used under page_ecc")
         )]
         ecc_params: EccParams,
-    ) -> crate::Result<(Vec<u8>, bool)> {
+    ) -> crate::Result<(Vec<u8>, Option<EccRecoveryKind>)> {
         let mut data = vec![0u8; data_length as usize];
         reader.read_exact(&mut data)?;
 
@@ -420,7 +436,7 @@ impl Block {
                     "Checksum mismatch for block payload, got={computed}, expected={expected}",
                 );
             })?;
-            return Ok((data, false));
+            return Ok((data, None));
         }
 
         // ECC trailer present — always consume the parity bytes so
@@ -430,7 +446,7 @@ impl Block {
         reader.read_exact(&mut parity)?;
 
         if computed == expected {
-            return Ok((data, false));
+            return Ok((data, None));
         }
 
         // Mismatch — try ECC recovery before failing.
@@ -455,7 +471,7 @@ impl Block {
                          checksum mismatch (data_len={}, ecc_len={ecc_length})",
                         data.len(),
                     );
-                    return Ok((healed, true));
+                    return Ok((healed, Some(EccRecoveryKind::Secded)));
                 }
                 log::error!(
                     "Checksum mismatch on SEC-DED block, heal failed, \
@@ -481,7 +497,7 @@ impl Block {
                      (data_len={}, ecc_len={ecc_length})",
                     data.len(),
                 );
-                return Ok((recovered, true));
+                return Ok((recovered, Some(EccRecoveryKind::Shard)));
             }
             log::error!(
                 "Checksum mismatch on ECC-protected block, recovery failed, \
@@ -917,7 +933,7 @@ impl Block {
             // `from_reader` returns no EccStatus, so a heal here is logged but
             // not surfaced; the status-returning `from_file_with_status` path is
             // what auto-heal observes.
-            let (raw_vec, _corrected) = Self::read_payload_and_verify(
+            let (raw_vec, _recovery) = Self::read_payload_and_verify(
                 reader,
                 header.data_length,
                 ecc_length,
@@ -1017,7 +1033,7 @@ impl Block {
                 s
             } else {
                 // from_reader has no EccStatus return; a heal is logged only.
-                let (payload, _corrected) = Self::read_payload_and_verify(
+                let (payload, _recovery) = Self::read_payload_and_verify(
                     reader,
                     header.data_length,
                     ecc_length,
@@ -1129,17 +1145,34 @@ impl Block {
     ///
     /// Pipeline: read → verify checksum → decrypt → decompress. When
     /// `encryption` is `None`, the decrypt step is skipped.
-    // Same duplication rationale as from_reader — see comment there.
-    #[expect(
-        clippy::too_many_lines,
-        reason = "encrypt/no-encrypt branches duplicate compression match — see from_reader"
-    )]
     pub fn from_file_with_status(
         file: &dyn FsFile,
         handle: BlockHandle,
         identity: BlockIdentity,
         transform: &BlockTransform<'_>,
     ) -> crate::Result<(Self, EccStatus)> {
+        let (block, status, _recovery) =
+            Self::from_file_with_recovery(file, handle, identity, transform)?;
+        Ok((block, status))
+    }
+
+    /// Like [`Self::from_file_with_status`] but additionally reports which ECC
+    /// mechanism repaired the block (`Some(kind)` iff the status is
+    /// [`EccStatus::Corrected`]). Internal to the read path: the primary read
+    /// call sites (`load_block`, the partial-decode path, patrol scrub) use it
+    /// to attribute the on-read recovery to the right metric counter, keeping
+    /// the public [`EccStatus`] free of the kind.
+    // Same duplication rationale as from_reader — see comment there.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "encrypt/no-encrypt branches duplicate compression match — see from_reader"
+    )]
+    pub(crate) fn from_file_with_recovery(
+        file: &dyn FsFile,
+        handle: BlockHandle,
+        identity: BlockIdentity,
+        transform: &BlockTransform<'_>,
+    ) -> crate::Result<(Self, EccStatus, Option<EccRecoveryKind>)> {
         let compression = transform.compression();
         let encryption = transform.encryption();
         #[cfg(zstd_any)]
@@ -1193,7 +1226,7 @@ impl Block {
         // No intermediate Slice, no overlap of encrypted + decrypted buffers.
         // When no encryption, read into a Slice (zero-copy on the
         // None-compression path).
-        let (header, data, ecc_status) = if let Some(enc) = encryption {
+        let (header, data, ecc_status, recovery) = if let Some(enc) = encryption {
             let block_size = handle.size() as usize;
 
             // Pre-decode lower bound: every header is at least MIN_LEN; the
@@ -1296,7 +1329,7 @@ impl Block {
                 // Strip header prefix + any opaque trailer so buf is the payload.
                 buf.copy_within(header_len..header_len + actual_data_len, 0);
                 buf.truncate(actual_data_len);
-                (buf, false)
+                (buf, None)
             } else {
                 #[expect(clippy::indexing_slicing, reason = "header was decoded from buf")]
                 let mut cursor = crate::io::Cursor::new(&buf[header_len..]);
@@ -1309,9 +1342,10 @@ impl Block {
                 )?
             };
 
-            // Fold a successful ECC repair into the reported status (an
-            // unrecognized scheme never heals, so the two are exclusive).
-            let ecc_status = if payload_corrected {
+            // Fold a successful ECC repair into the reported status; an
+            // unrecognized scheme never heals, so the two are exclusive. The
+            // recovery mechanism is carried out separately as `payload_corrected`.
+            let ecc_status = if payload_corrected.is_some() {
                 EccStatus::Corrected
             } else {
                 ecc_status
@@ -1391,7 +1425,7 @@ impl Block {
                 }
             };
 
-            (parsed_header, data, ecc_status)
+            (parsed_header, data, ecc_status, payload_corrected)
         } else {
             // Single I/O read — header + payload in one Slice.
             let buf = crate::file::read_exact(file, *handle.offset(), handle.size() as usize)?;
@@ -1433,36 +1467,38 @@ impl Block {
             // opaque trailer); recognized-ECC blocks go through the
             // recovery-capable helper. The checksum covers exactly the
             // `data_length` payload bytes, so an opaque trailer is excluded.
-            let (payload_slice, payload_corrected): (Slice, bool) = if ecc_length == 0 {
-                #[expect(
-                    clippy::indexing_slicing,
-                    reason = "actual_data_len <= post-header len"
-                )]
-                let checksum = Checksum::from_raw(crate::hash::hash128(
-                    &buf[header_len..header_len + actual_data_len],
-                ));
-                checksum.check(parsed_header.checksum).inspect_err(|_| {
-                    log::error!(
-                        "Checksum mismatch for block {handle:?}, got={}, expected={}",
-                        checksum,
+            let (payload_slice, payload_corrected): (Slice, Option<EccRecoveryKind>) =
+                if ecc_length == 0 {
+                    #[expect(
+                        clippy::indexing_slicing,
+                        reason = "actual_data_len <= post-header len"
+                    )]
+                    let checksum = Checksum::from_raw(crate::hash::hash128(
+                        &buf[header_len..header_len + actual_data_len],
+                    ));
+                    checksum.check(parsed_header.checksum).inspect_err(|_| {
+                        log::error!(
+                            "Checksum mismatch for block {handle:?}, got={}, expected={}",
+                            checksum,
+                            parsed_header.checksum,
+                        );
+                    })?;
+                    (buf.slice(header_len..header_len + actual_data_len), None)
+                } else {
+                    #[expect(clippy::indexing_slicing, reason = "header was decoded from buf")]
+                    let mut cursor = crate::io::Cursor::new(&buf[header_len..]);
+                    let (payload, recovery) = Self::read_payload_and_verify(
+                        &mut cursor,
+                        parsed_header.data_length,
+                        ecc_length,
                         parsed_header.checksum,
-                    );
-                })?;
-                (buf.slice(header_len..header_len + actual_data_len), false)
-            } else {
-                #[expect(clippy::indexing_slicing, reason = "header was decoded from buf")]
-                let mut cursor = crate::io::Cursor::new(&buf[header_len..]);
-                let (payload, corrected) = Self::read_payload_and_verify(
-                    &mut cursor,
-                    parsed_header.data_length,
-                    ecc_length,
-                    parsed_header.checksum,
-                    block_ecc_params(&parsed_header, transform),
-                )?;
-                (Slice::from(payload), corrected)
-            };
-            // Fold a successful ECC repair into the reported status.
-            let ecc_status = if payload_corrected {
+                        block_ecc_params(&parsed_header, transform),
+                    )?;
+                    (Slice::from(payload), recovery)
+                };
+            // Fold a successful ECC repair into the status; the recovery
+            // mechanism is carried out separately as `payload_corrected`.
+            let ecc_status = if payload_corrected.is_some() {
                 EccStatus::Corrected
             } else {
                 ecc_status
@@ -1547,16 +1583,17 @@ impl Block {
                 }
             };
 
-            (parsed_header, data, ecc_status)
+            (parsed_header, data, ecc_status, payload_corrected)
         };
 
-        Ok((Self { header, data }, ecc_status))
+        Ok((Self { header, data }, ecc_status, recovery))
     }
 
     /// Reads a data block's verified COMPRESSED payload (the zstd frame) WITHOUT
-    /// decompressing it, for partial / lazy decode. Returns the header and the
+    /// decompressing it, for partial / lazy decode. Returns the header, the
     /// compressed-frame bytes (checksum-verified; ECC-recovered if a recognized
-    /// parity trailer is present).
+    /// parity trailer is present), and `Some(kind)` when a recovery occurred so
+    /// the caller can schedule auto-heal and count the recovery.
     ///
     /// Non-encrypted blocks only — the caller must ensure
     /// `transform.encryption().is_none()` (an encrypted block's plaintext frame
@@ -1573,7 +1610,7 @@ impl Block {
         file: &dyn FsFile,
         handle: BlockHandle,
         transform: &BlockTransform<'_>,
-    ) -> crate::Result<(Header, Slice, bool)> {
+    ) -> crate::Result<(Header, Slice, Option<EccRecoveryKind>)> {
         if transform.encryption().is_some() {
             return Err(crate::Error::Io(crate::io::Error::other(
                 "read_data_frame: encrypted blocks are not supported on the lazy path",
@@ -1631,7 +1668,7 @@ impl Block {
             &handle,
         )?;
 
-        let (payload, corrected): (Slice, bool) = if ecc_length == 0 {
+        let (payload, recovery): (Slice, Option<EccRecoveryKind>) = if ecc_length == 0 {
             #[expect(
                 clippy::indexing_slicing,
                 reason = "actual_data_len <= post-header len, checked via classify_block_trailer"
@@ -1640,24 +1677,25 @@ impl Block {
                 &buf[header_len..header_len + actual_data_len],
             ));
             checksum.check(parsed_header.checksum)?;
-            (buf.slice(header_len..header_len + actual_data_len), false)
+            (buf.slice(header_len..header_len + actual_data_len), None)
         } else {
             #[expect(clippy::indexing_slicing, reason = "header was decoded from buf")]
             let mut cursor = crate::io::Cursor::new(&buf[header_len..]);
-            // `corrected` is surfaced so the partial-decode caller can schedule
+            // `recovery` is surfaced so the partial-decode caller can schedule
             // auto-heal (the recovered bytes are correct but the on-disk copy is
-            // still faulty); a heal is also logged inside read_payload_and_verify.
-            let (frame, corrected) = Self::read_payload_and_verify(
+            // still faulty) and count the recovery; a heal is also logged inside
+            // read_payload_and_verify.
+            let (frame, recovery) = Self::read_payload_and_verify(
                 &mut cursor,
                 parsed_header.data_length,
                 ecc_length,
                 parsed_header.checksum,
                 block_ecc_params(&parsed_header, transform),
             )?;
-            (Slice::from(frame), corrected)
+            (Slice::from(frame), recovery)
         };
 
-        Ok((parsed_header, payload, corrected))
+        Ok((parsed_header, payload, recovery))
     }
 }
 
@@ -3604,7 +3642,7 @@ mod tests {
             std::fs::write(&path, &bytes)?;
 
             let file = std::fs::File::open(&path)?;
-            let (block, status) = Block::from_file_with_status(
+            let (block, status, recovery) = Block::from_file_with_recovery(
                 &file,
                 tmp.handle,
                 BlockIdentity::for_test(0, BlockType::Data),
@@ -3614,7 +3652,56 @@ mod tests {
             assert_eq!(
                 status,
                 EccStatus::Corrected,
-                "a read that repaired the block must report Corrected",
+                "a repaired read reports Corrected"
+            );
+            assert_eq!(
+                recovery,
+                Some(EccRecoveryKind::Shard),
+                "an RS repair is attributed to the shard mechanism",
+            );
+            Ok(())
+        }
+
+        /// A single-bit flip in a SEC-DED-protected block is healed by the
+        /// SEC-DED fast path and reported as `Corrected(Secded)`, distinct from
+        /// the RS shard path. This is the kind-attribution the unified recovery
+        /// metric relies on (the per-kind counter is bumped from this status at
+        /// the `load_block` / scrub / partial-decode call sites).
+        #[test]
+        fn from_file_with_status_reports_secded_kind_after_single_bit_heal() -> crate::Result<()> {
+            let transform = BlockTransform::PlainEcc(EccParams::SECDED);
+            let tmp = super::write_block_to_tempfile(
+                PAYLOAD,
+                BlockIdentity::for_test(0, BlockType::Data),
+                &transform,
+            )?;
+            let path = tmp.dir.path().join("block");
+
+            // Flip a SINGLE bit so the SEC-DED per-word code heals it.
+            let mut bytes = std::fs::read(&path)?;
+            bytes[Header::MIN_LEN + 3] ^= 0x01;
+            std::fs::write(&path, &bytes)?;
+
+            let file = std::fs::File::open(&path)?;
+            let (block, status, recovery) = Block::from_file_with_recovery(
+                &file,
+                tmp.handle,
+                BlockIdentity::for_test(0, BlockType::Data),
+                &transform,
+            )?;
+            assert_eq!(
+                &*block.data, PAYLOAD,
+                "SEC-DED must heal the single-bit flip"
+            );
+            assert_eq!(
+                status,
+                EccStatus::Corrected,
+                "a repaired read reports Corrected"
+            );
+            assert_eq!(
+                recovery,
+                Some(EccRecoveryKind::Secded),
+                "a SEC-DED single-bit heal is attributed to the SEC-DED mechanism",
             );
             Ok(())
         }
