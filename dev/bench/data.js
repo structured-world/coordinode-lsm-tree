@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1781360197536,
+  "lastUpdate": 1781367700103,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -15600,6 +15600,84 @@ window.BENCHMARK_DATA = {
             "value": 554291.7334505062,
             "unit": "ops/sec",
             "extra": "P50: 1.6us | P99: 5.0us | P99.9: 7.8us\nthreads: 1 | elapsed: 0.36s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "ee870f28e2d37a976a8413b339e854b0d95e7c61",
+          "message": "feat(recovery): cross-process directory lock for exclusive tree access (#458)\n\n## Summary\n\n`Config::open` and `Config::repair` now acquire an exclusive advisory\nlock on a `LOCK` file in the tree directory and hold it for the lifetime\nof the `Tree` (open) or the duration of the call (repair). A second\nprocess opening or repairing the same directory **fails fast with\n`Error::Locked`** instead of racing on the manifest, where two writers\nof `CURRENT` / snapshots / `edits-*` logs would corrupt it. This matches\nthe `LOCK`-file model of RocksDB and friends, and closes a hole raised\nin the #421 (incremental manifest) review where `repair()` against a\nlive instance destroys its manifest state.\n\n## Design\n\n- **`FsFile::try_lock_exclusive(&self) -> io::Result<bool>`** —\nnon-blocking exclusive lock (`flock` `LOCK_NB` on unix, `LockFileEx`\n`LOCKFILE_FAIL_IMMEDIATELY` on windows), returning `Ok(false)` on\ncontention so a second opener fails fast rather than blocking. The\ndefault trivially acquires (`Ok(true)`), so in-memory / single-process\nbackends are unaffected; `StdFs` and the io_uring backend perform the\nreal OS lock.\n- **`Config::with_directory_lock(false)`** — opt-out for embedders that\nalready enforce exclusive directory ownership at a higher layer\n(keyspace / journal manager).\n- The locked handle lives in `TreeInner` and releases on `Tree` drop\n(the OS frees an advisory lock when the fd / handle closes).\n- Acquired in `recover()`, `TreeInner::create_new()`, and\n`repair_tree()` before any manifest mutation; `BlobTree::open` delegates\nto `Tree::open` and is covered.\n- std-gated; **no on-disk format change**.\n\n## Non-breaking\n\n`Error::Locked` is an additive variant on the `#[non_exhaustive]` error\nenum; the new trait method has a default impl; `with_directory_lock` is\nadditive. The behavioural change is that an in-process double-open of\nthe same directory (always unsafe — manifest corruption) now fails\nloudly with `Error::Locked`; the opt-out is the escape hatch. Two\nexisting tests reopened a directory while still holding the first handle\n(a fresh-cache cold-read shortcut) and were fixed to drop the first tree\nbefore reopening.\n\n## Testing\n\n- 5 new integration tests (`tests/directory_lock.rs`): second open of a\nlocked dir fails with `Error::Locked`; lock released on `Tree` drop\n(reopen succeeds); `repair()` of an open dir fails; opt-out allows\nconcurrent open; reopen after a lock-disabled run still works.\n- Full suite `--all-features`: 2064 passed.\n- `clippy --all-features --all-targets -D warnings` clean on **both**\nmacOS and the `x86_64-unknown-linux-gnu` cross target (the io_uring\nbackend is Linux-only and is verified there). no-std `alloc` build: 0\nerrors. Doctests pass.\n\nCloses #422\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n## Summary by CodeRabbit\n\n* **New Features**\n* Cross-process directory locking to prevent concurrent access; lock\nheld for the lifetime of an open tree.\n* New configuration option to enable/disable the directory lock (enabled\nby default).\n* Attempts to open an already-locked directory fail fast with an\nexplicit Locked error.\n\n* **Documentation**\n* Repair operation docs updated to describe exclusive-access locking\nbehavior.\n\n* **Tests**\n* New and adjusted tests cover locking, lock release on drop,\ndisablement, and interaction with repair.\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-06-13T19:20:41+03:00",
+          "tree_id": "0d2cb324feaca82ee571b7fca722552cf35a9a03",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/ee870f28e2d37a976a8413b339e854b0d95e7c61"
+        },
+        "date": 1781367689594,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 1961883.3338412978,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.6us | P99.9: 3.8us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1169382.541052007,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.2us | P99.9: 4.8us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 657817.4995466156,
+            "unit": "ops/sec",
+            "extra": "P50: 1.3us | P99: 4.7us | P99.9: 7.9us\nthreads: 1 | elapsed: 0.30s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3702226.5153240897,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 3.2us | P99.9: 5.7us\nthreads: 1 | elapsed: 0.05s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 417648.0473473224,
+            "unit": "ops/sec",
+            "extra": "P50: 2.0us | P99: 5.8us | P99.9: 9.4us\nthreads: 1 | elapsed: 0.48s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 215458.96460507246,
+            "unit": "ops/sec",
+            "extra": "P50: 4.2us | P99: 9.2us | P99.9: 11.8us\nthreads: 1 | elapsed: 0.93s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1210468.5264293002,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.2us | P99.9: 4.7us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1095349.0744415333,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.5us | P99.9: 2.8us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 573245.1131269708,
+            "unit": "ops/sec",
+            "extra": "P50: 1.6us | P99: 5.0us | P99.9: 7.5us\nthreads: 1 | elapsed: 0.35s | num: 200000 | iterations: 3"
           }
         ]
       }
