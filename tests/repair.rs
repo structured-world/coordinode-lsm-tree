@@ -477,6 +477,52 @@ fn repair_fails_when_a_bad_filename_cannot_be_quarantined() -> lsm_tree::Result<
     Ok(())
 }
 
+#[test]
+fn repair_fails_when_a_bad_table_filename_cannot_be_quarantined() -> lsm_tree::Result<()> {
+    // Sibling of the blob-side test above, covering the standard `tables/`
+    // quarantine path so the false-success regression cannot slip back for
+    // standard trees.
+    let dir = tempfile::tempdir()?;
+
+    {
+        let tree = Config::new(
+            &dir,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .open()?;
+        for i in 0..10 {
+            tree.insert(key(i), format!("v-{i}").as_bytes(), i);
+        }
+        tree.flush_active_memtable(0)?;
+    }
+    assert!(count_sst_files(dir.path())? >= 1);
+
+    nuke_manifest(dir.path())?;
+
+    // A non-numeric name in tables/ would make the reopened tree's recovery
+    // (which parses every name) abort, so repair must quarantine it.
+    std::fs::write(dir.path().join("tables").join("not-a-table-id"), b"junk")?;
+    // Block the quarantine by occupying the `repair-quarantine` directory path
+    // with a regular file. Repair must abort rather than report success while
+    // leaving the un-quarantined name in place.
+    std::fs::write(dir.path().join("repair-quarantine"), b"blocker")?;
+
+    let result = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .repair();
+
+    assert!(
+        result.is_err(),
+        "repair must fail when it cannot quarantine a bad table filename, got {result:?}",
+    );
+
+    Ok(())
+}
+
 /// Counts numerically-named blob files in a tree's `blobs/` folder.
 fn count_blob_files(dir: &std::path::Path) -> std::io::Result<usize> {
     let blobs = dir.join("blobs");
