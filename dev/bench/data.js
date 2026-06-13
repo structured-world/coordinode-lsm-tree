@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1781335045816,
+  "lastUpdate": 1781360197536,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -15522,6 +15522,84 @@ window.BENCHMARK_DATA = {
             "value": 567684.6167709886,
             "unit": "ops/sec",
             "extra": "P50: 1.6us | P99: 5.0us | P99.9: 7.7us\nthreads: 1 | elapsed: 0.35s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "bc9a8efc628ba502791bd56dd39fd9fa3c4700a7",
+          "message": "feat(metrics): unified ECC-recovery counters, wire SEC-DED reads (#457)\n\n## Summary\n\nAdds a scrapeable on-read **ECC-recovery counter**, split by heal\nmechanism, and wires tree-level SEC-DED reads so SEC-DED actually\nprotects data.\n\n### Counters\n\n- `ecc_secded_corrected` — single-bit SEC-DED fast-path heals\n- `ecc_shard_recovered` — Reed-Solomon shard reconstructions\n- `ecc_recovered` — the total (the two are disjoint and sum to it)\n\nThe block read path now reports which mechanism repaired a block via a\nnew `EccRecoveryKind`, returned alongside `EccStatus`. The three\n**primary** read sites (`load_block`, the partial-decode path, patrol\nscrub) bump the matching counter; the persistence-confirming re-read\ndoes **not** re-count, so a single fault is counted exactly once. A\ngrowing value is an operator's latent-bit-rot signal.\n\n### Non-breaking\n\n`EccStatus` is publicly reachable (`lsm_tree::table::block::EccStatus`),\nso embedding the kind in `EccStatus::Corrected` would be a breaking\nchange. Instead the kind is threaded through a new pub(crate)\n`Block::from_file_with_recovery`, with the existing public\n`from_file_with_status` kept as a thin wrapper. Public enum + signature\nare unchanged; `EccRecoveryKind` is purely additive. No format / version\nbump.\n\n### Wire SEC-DED reads\n\nDiscovered SEC-DED was inert at the tree level: the writer already emits\nSEC-DED parity (`resolve_ecc` → `EccParams::SECDED`), but the meta\nreader mapped the `Secded` descriptor to *unrecognized* (`ecc_params =\nNone`), so reads never recovered — a SEC-DED-configured tree carried\nparity it never used and got **zero** bit-rot protection. This maps\n`Secded` to its dedicated `EccParams::SECDED` on read (mirroring the\nwriter), so SEC-DED SSTs self-heal single-bit flips and the SEC-DED\ncounter is live. On-disk descriptor encoding is unchanged.\n\n## Testing\n\n- RS recovery counter asserted end-to-end through a tree read.\n- SEC-DED recovery counter asserted end-to-end through a tree read (now\nthat SEC-DED reads recover).\n- Per-kind attribution verified at the block level (RS + SEC-DED) and\nvia a `Metrics` unit test.\n- Updated meta tests for the now-recognized SEC-DED descriptor.\n- Full suite `--all-features`: 2059 passed. `clippy --all-features\n--all-targets -D warnings` clean (also clean without the metrics\nfeature). no-std `alloc` build: 0 errors. Doctests pass.\n\nCloses #436\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n\n## Summary by CodeRabbit\n\n* **New Features**\n* Added error correction recovery metrics to distinguish between SEC-DED\nand Reed-Solomon shard correction mechanisms, improving observability\ninto recovery operations.\n\n* **Tests**\n* Extended test coverage for SEC-DED single-bit correction and\nReed-Solomon shard recovery scenarios.\n\n* **Documentation**\n* Clarified error correction scheme handling and recovery attribution\nsemantics.\n\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-06-13T17:15:37+03:00",
+          "tree_id": "a9f4239fba538be164bfd9a89b17ed79c64978f4",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/bc9a8efc628ba502791bd56dd39fd9fa3c4700a7"
+        },
+        "date": 1781360188080,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 2052028.4213734067,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.6us | P99.9: 3.7us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1204733.0443491992,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.2us | P99.9: 4.4us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 623377.078684765,
+            "unit": "ops/sec",
+            "extra": "P50: 1.5us | P99: 4.6us | P99.9: 7.3us\nthreads: 1 | elapsed: 0.32s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3597041.045259841,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 3.2us | P99.9: 5.8us\nthreads: 1 | elapsed: 0.06s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 418065.2770509916,
+            "unit": "ops/sec",
+            "extra": "P50: 2.1us | P99: 5.4us | P99.9: 8.4us\nthreads: 1 | elapsed: 0.48s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 224728.62709234346,
+            "unit": "ops/sec",
+            "extra": "P50: 4.2us | P99: 5.3us | P99.9: 8.3us\nthreads: 1 | elapsed: 0.89s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1111237.9959696177,
+            "unit": "ops/sec",
+            "extra": "P50: 0.8us | P99: 2.3us | P99.9: 4.4us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1155856.265690207,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 1.5us | P99.9: 2.7us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 554291.7334505062,
+            "unit": "ops/sec",
+            "extra": "P50: 1.6us | P99: 5.0us | P99.9: 7.8us\nthreads: 1 | elapsed: 0.36s | num: 200000 | iterations: 3"
           }
         ]
       }
