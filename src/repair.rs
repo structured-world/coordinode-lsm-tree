@@ -34,9 +34,11 @@
 //!
 //! ## Scope
 //!
-//! KV-separated (blob) trees are not yet supported: their manifest also tracks
-//! blob-file fragmentation statistics that cannot be reconstructed from a
-//! directory scan alone. Repairing one returns [`crate::Error::FeatureUnsupported`].
+//! KV-separated (blob) trees are supported: the `blobs/` folder is scanned to
+//! rediscover the blob files and record them in the rebuilt manifest. Blob-file
+//! fragmentation statistics cannot be reconstructed from a directory scan
+//! (they are derived from compaction history), so they start empty; blob GC is
+//! advisory and re-learns reclaimable space over time without dropping data.
 
 use crate::{
     Table, TableId,
