@@ -77,10 +77,10 @@ mod tests {
     fn from_std_io_error_bridges_through_crate_io() {
         let std_err = std::io::Error::from(std::io::ErrorKind::NotFound);
         let err = Error::from(std_err);
-        match err {
-            Error::Io(inner) => assert_eq!(inner.kind(), crate::io::ErrorKind::NotFound),
-            other => panic!("expected Io variant, got {other:?}"),
-        }
+        assert!(
+            matches!(&err, Error::Io(inner) if inner.kind() == crate::io::ErrorKind::NotFound),
+            "expected Io(NotFound), got {err:?}"
+        );
     }
 
     #[test]

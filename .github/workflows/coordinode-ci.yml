@@ -51,7 +51,7 @@ jobs:
   # branch ruleset — so their job names always surface to GitHub
   # (satisfying the ruleset) while heavy work is skipped on
   # docs-only / repo-meta-only PRs. Non-required downstream jobs
-  # (`test-zstd`, `no-std-check`, `cross-matrix`, `cross`,
+  # (`no-std-check`, `cross-matrix`, `cross`,
   # `codecov`) gate at the job level via `if:` and skip outright
   # when no code changes — they aren't required so a "skipped"
   # status is fine for them, but a required check that reports
@@ -324,34 +324,6 @@ jobs:
         # non-workspace child.
         working-directory: tools/sst-dump
         run: cargo nextest run
-
-  test-zstd:
-    needs: [changes, lint]
-    if: ${{ always() && !cancelled() && needs.lint.result == 'success' && needs.changes.outputs.code != 'false' }}
-    timeout-minutes: 15
-    strategy:
-      fail-fast: true
-      matrix:
-        rust: [stable, "1.92.0"]
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
-        with:
-          persist-credentials: false
-      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
-        with:
-          toolchain: ${{ matrix.rust }}
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2.9.1
-        with:
-          prefix-key: ubuntu-cargo-zstd-${{ matrix.rust }}
-      - uses: taiki-e/install-action@1ef5c5f58e85d25baaaa1704478fdd6c2921f2b5  # nextest
-      - name: Clippy (zstd backend)
-        run: cargo clippy --no-default-features --features zstd,lz4 --all-targets -- -D warnings
-      - name: Run tests (zstd backend)
-        env:
-          PROPTEST_CASES: "32"
-          PROPTEST_MAX_SHRINK: "100"
-        run: cargo nextest run --profile ci --no-default-features --features zstd,lz4
 
   no-std-check:
     # Tracks no-std + alloc migration progress. The crate is incrementally

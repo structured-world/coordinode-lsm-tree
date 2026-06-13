@@ -1679,4 +1679,81 @@ mod tests {
         assert_eq!(e.kind(), ErrorKind::PermissionDenied);
         assert_eq!(alloc::format!("{e}"), "permission denied");
     }
+
+    #[test]
+    fn error_kind_display_matches_as_str() {
+        // The `Display` impl on `ErrorKind` itself (distinct from the
+        // `Error` Display) must render exactly the `as_str` tag for
+        // every variant — no prefix, no decoration.
+        let all = [
+            ErrorKind::AlreadyExists,
+            ErrorKind::BrokenPipe,
+            ErrorKind::CrossesDevices,
+            ErrorKind::Interrupted,
+            ErrorKind::InvalidData,
+            ErrorKind::InvalidInput,
+            ErrorKind::NotFound,
+            ErrorKind::Other,
+            ErrorKind::PermissionDenied,
+            ErrorKind::UnexpectedEof,
+            ErrorKind::Unsupported,
+            ErrorKind::WriteZero,
+        ];
+        for kind in all {
+            assert_eq!(alloc::format!("{kind}"), kind.as_str());
+        }
+    }
+
+    #[test]
+    fn big_endian_byte_order_round_trips_all_widths() {
+        // `BigEndian` is the rarely-exercised twin of `LittleEndian`
+        // (the wire format is LE), so assert each width converts to
+        // big-endian bytes and back. `0x0102..` payloads make the byte
+        // order observable: the most-significant byte lands first.
+        assert_eq!(BigEndian::u16_to(0x0102), [0x01, 0x02]);
+        assert_eq!(BigEndian::u16_from([0x01, 0x02]), 0x0102);
+        assert_eq!(BigEndian::u32_to(0x0102_0304), [0x01, 0x02, 0x03, 0x04]);
+        assert_eq!(BigEndian::u32_from([0x01, 0x02, 0x03, 0x04]), 0x0102_0304);
+        assert_eq!(
+            BigEndian::u64_to(0x0102_0304_0506_0708),
+            [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08]
+        );
+        assert_eq!(
+            BigEndian::u64_from([0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08]),
+            0x0102_0304_0506_0708
+        );
+        let v = 0x0102_0304_0506_0708_090a_0b0c_0d0e_0f10u128;
+        assert_eq!(BigEndian::u128_from(BigEndian::u128_to(v)), v);
+        assert_eq!(BigEndian::u128_to(v)[0], 0x01, "MSB must land first");
+    }
+
+    #[test]
+    fn byte_order_buf_helpers_round_trip_u64() {
+        // The static `write_u64` / `read_u64` buffer helpers on the
+        // `ByteOrder` trait (the default-method path used by callers
+        // that own a fixed slice rather than a stream).
+        let mut buf = [0u8; 8];
+        LittleEndian::write_u64(&mut buf, 0xdead_beef_cafe_f00d);
+        assert_eq!(LittleEndian::read_u64(&buf), 0xdead_beef_cafe_f00d);
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn read_bytes_ext_reads_floats_in_byte_order() -> crate::io::Result<()> {
+        // `read_f32` / `read_f64` decode IEEE-754 bit patterns through
+        // the integer readers; exercise both over a `Cursor` so the
+        // bit-cast path is covered. Compare via `to_bits` (exact integer
+        // equality) so the assertion is bit-precise and avoids float_cmp.
+        let f32_bytes = 1.5f32.to_le_bytes();
+        let mut cur = Cursor::new(&f32_bytes[..]);
+        assert_eq!(cur.read_f32::<LittleEndian>()?.to_bits(), 1.5f32.to_bits());
+
+        let f64_bytes = (-2.25f64).to_le_bytes();
+        let mut cur = Cursor::new(&f64_bytes[..]);
+        assert_eq!(
+            cur.read_f64::<LittleEndian>()?.to_bits(),
+            (-2.25f64).to_bits()
+        );
+        Ok(())
+    }
 }
