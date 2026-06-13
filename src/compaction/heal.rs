@@ -169,19 +169,27 @@ mod tests {
             }
             tree.flush_active_memtable(2_000)?;
 
-            let versions = tree.version_history.read();
-            let binding = versions.latest_version();
+            let binding = tree.version_history.read().latest_version();
             #[expect(clippy::expect_used, reason = "flush produced exactly one table")]
             let table = binding.version.iter_tables().next().expect("one table");
             #[expect(clippy::expect_used, reason = "table has at least one data block")]
             let keyed = table.block_index.iter().next().expect("a data block")?;
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "an in-file block offset fits usize on the 64-bit test host"
+            )]
             let off = keyed.offset().0 as usize;
             ((*table.path).clone(), off + Header::MIN_LEN + 3)
         };
 
         // Flip one payload byte of the first data block (RS-correctable).
         let mut bytes = std::fs::read(&sst_path)?;
-        bytes[corrupt_pos] ^= 0x80;
+        #[expect(
+            clippy::indexing_slicing,
+            reason = "corrupt_pos is an in-file block offset, in range for the SST bytes"
+        )]
+        let slot = &mut bytes[corrupt_pos];
+        *slot ^= 0x80;
         std::fs::write(&sst_path, &bytes)?;
 
         // Reopen (fresh caches + fds) so the read hits the tampered bytes.
@@ -300,19 +308,27 @@ mod tests {
             }
             tree.flush_active_memtable(0)?;
 
-            let versions = tree.version_history.read();
-            let binding = versions.latest_version();
+            let binding = tree.version_history.read().latest_version();
             #[expect(clippy::expect_used, reason = "flush produced exactly one table")]
             let table = binding.version.iter_tables().next().expect("one table");
             #[expect(clippy::expect_used, reason = "table has at least one data block")]
             let keyed = table.block_index.iter().next().expect("a data block")?;
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "an in-file block offset fits usize on the 64-bit test host"
+            )]
             let off = keyed.offset().0 as usize;
             ((*table.path).clone(), off + Header::MIN_LEN + 8)
         };
 
         // Flip one byte of the first block's compressed frame (RS-correctable).
         let mut bytes = std::fs::read(&sst_path)?;
-        bytes[corrupt_pos] ^= 0x01;
+        #[expect(
+            clippy::indexing_slicing,
+            reason = "corrupt_pos is an in-file block offset, in range for the SST bytes"
+        )]
+        let slot = &mut bytes[corrupt_pos];
+        *slot ^= 0x01;
         std::fs::write(&sst_path, &bytes)?;
 
         // Reopen (fresh caches/fds), opt into healing, then run a bounded range

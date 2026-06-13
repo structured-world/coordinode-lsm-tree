@@ -2370,6 +2370,10 @@ fn load_block_records_heal_hint_on_persistent_ecc_correction() -> crate::Result<
     // via RS parity, and drop any cached fd so the re-read re-opens the tampered
     // file from disk (confirming the fault is persistent).
     let mut bytes = std::fs::read(&file)?;
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "an in-file block offset fits usize on the 64-bit test host"
+    )]
     let pos = handle.offset().0 as usize + Header::MIN_LEN + 3;
     bytes[pos] ^= 0x80;
     std::fs::write(&file, &bytes)?;

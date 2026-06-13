@@ -226,7 +226,9 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Clippy (strict)
         if: needs.changes.outputs.code != 'false'
-        run: cargo clippy --all-features -- -D warnings
+        # `--all-targets` lints tests + benches too, not just the lib; without
+        # it, test-harness code under `--all-features` is never clippy-checked.
+        run: cargo clippy --all-features --all-targets -- -D warnings
 
   test:
     needs: [changes, lint]
