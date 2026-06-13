@@ -174,9 +174,12 @@ mod tests {
             let table = binding.version.iter_tables().next().expect("one table");
             #[expect(clippy::expect_used, reason = "table has at least one data block")]
             let keyed = table.block_index.iter().next().expect("a data block")?;
-            #[expect(
+            // Target-conditional truncation: `as usize` only narrows on 32-bit
+            // pointer widths, so `allow` (not `expect`) keeps it clean on the
+            // 64-bit host where clippy frames it as a portability note.
+            #[allow(
                 clippy::cast_possible_truncation,
-                reason = "an in-file block offset fits usize on the 64-bit test host"
+                reason = "in-file block offset fits usize; only narrows on 32-bit targets"
             )]
             let off = keyed.offset().0 as usize;
             ((*table.path).clone(), off + Header::MIN_LEN + 3)
@@ -313,9 +316,12 @@ mod tests {
             let table = binding.version.iter_tables().next().expect("one table");
             #[expect(clippy::expect_used, reason = "table has at least one data block")]
             let keyed = table.block_index.iter().next().expect("a data block")?;
-            #[expect(
+            // Target-conditional truncation: `as usize` only narrows on 32-bit
+            // pointer widths, so `allow` (not `expect`) keeps it clean on the
+            // 64-bit host where clippy frames it as a portability note.
+            #[allow(
                 clippy::cast_possible_truncation,
-                reason = "an in-file block offset fits usize on the 64-bit test host"
+                reason = "in-file block offset fits usize; only narrows on 32-bit targets"
             )]
             let off = keyed.offset().0 as usize;
             ((*table.path).clone(), off + Header::MIN_LEN + 8)
