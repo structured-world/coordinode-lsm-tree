@@ -55,7 +55,7 @@ cargo fmt --all -- --check                   # Format check
 
 | Flag | Description |
 |------|-------------|
-| `lz4` | LZ4 compression (enabled by default) |
+| `lz4` | LZ4 compression (optional) |
 | `zstd` | Zstd compression (PR #1) |
 | `bytes_1` | Use `bytes` crate for Slice type |
 | `metrics` | Expose prometheus metrics |
