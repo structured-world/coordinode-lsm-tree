@@ -2015,6 +2015,22 @@ impl Tree {
             return Err(crate::Error::PageEccUnsupported);
         }
 
+        // Acquire the cross-process directory lock BEFORE any manifest access
+        // (the `CURRENT` probe + `has_existing_version_state` check below, and
+        // the recover / create paths). Acquiring it here makes `open()`
+        // exclusive end-to-end: a concurrent opener fails fast with
+        // `Error::Locked` instead of racing through the probe and observing a
+        // peer's half-created directory (which would surface as the InvalidData
+        // "half-written checkpoint" path rather than `Locked`). The `LOCK` file
+        // needs its directory to exist, so create the root directory first
+        // (idempotent; `create_new` re-creates the `tables/` subtree). The lock
+        // is threaded into the constructor so it lives for the tree's lifetime.
+        #[cfg(feature = "std")]
+        let directory_lock = {
+            config.fs.create_dir_all(&config.path)?;
+            crate::config::acquire_directory_lock(&*config.fs, &config.path, config.directory_lock)?
+        };
+
         // Check for old version
         if config.fs.exists(&config.path.join("version"))? {
             log::error!(
@@ -2031,7 +2047,11 @@ impl Tree {
             &*config.fs,
             config.encryption.clone(),
         ) {
-            Ok(_) => Self::recover(config),
+            Ok(_) => Self::recover(
+                config,
+                #[cfg(feature = "std")]
+                directory_lock,
+            ),
             Err(crate::Error::Io(e)) if e.kind() == crate::io::ErrorKind::NotFound => {
                 // Missing CURRENT MUST coincide with a directory that
                 // has no version artifacts; otherwise we are looking at
@@ -2063,7 +2083,11 @@ impl Tree {
                         msg,
                     )));
                 }
-                Self::create_new(config)
+                Self::create_new(
+                    config,
+                    #[cfg(feature = "std")]
+                    directory_lock,
+                )
             }
             Err(e) => Err(e),
         }?;
@@ -2208,22 +2232,17 @@ impl Tree {
                   TreeInner assembly) — splitting it would create helper functions whose \
                   only caller is this one site"
     )]
-    fn recover(mut config: Config) -> crate::Result<Self> {
+    fn recover(
+        mut config: Config,
+        // The cross-process directory lock acquired by `Tree::open` before the
+        // manifest probe; held for the tree's lifetime via
+        // `TreeInner::_directory_lock`.
+        #[cfg(feature = "std")] directory_lock: Option<Box<dyn crate::fs::FsFile>>,
+    ) -> crate::Result<Self> {
         use crate::stop_signal::StopSignal;
         use inner::get_next_tree_id;
 
         log::info!("Recovering LSM-tree at {}", config.path.display());
-
-        // Acquire the cross-process directory lock before any recovery work
-        // mutates the on-disk manifest (CURRENT / snapshots / edit logs). The
-        // directory already exists on the recover path. Held for the tree's
-        // lifetime via `TreeInner::_directory_lock`.
-        #[cfg(feature = "std")]
-        let directory_lock = crate::config::acquire_directory_lock(
-            &*config.fs,
-            &config.path,
-            config.directory_lock,
-        )?;
 
         // Validate manifest metadata (format version, comparator name)
         // BEFORE recover_levels, so a rejected open is side-effect free
@@ -2390,7 +2409,12 @@ impl Tree {
     }
 
     /// Creates a new LSM-tree in a directory.
-    fn create_new(config: Config) -> crate::Result<Self> {
+    fn create_new(
+        config: Config,
+        // The cross-process directory lock acquired by `Tree::open`, held for
+        // the tree's lifetime.
+        #[cfg(feature = "std")] directory_lock: Option<Box<dyn crate::fs::FsFile>>,
+    ) -> crate::Result<Self> {
         use crate::file::fsync_directory;
 
         let path = config.path.clone();
@@ -2418,7 +2442,11 @@ impl Tree {
         // IMPORTANT: fsync primary folder on Unix
         fsync_directory(&path, &*config.fs, sync_mode)?;
 
-        let inner = TreeInner::create_new(config)?;
+        let inner = TreeInner::create_new(
+            config,
+            #[cfg(feature = "std")]
+            directory_lock,
+        )?;
         Ok(Self(Arc::new(inner)))
     }
 

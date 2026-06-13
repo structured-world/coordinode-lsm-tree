@@ -176,17 +176,12 @@ pub struct TreeInner {
 }
 
 impl TreeInner {
-    pub(crate) fn create_new(config: Config) -> crate::Result<Self> {
-        // Acquire the cross-process directory lock before the first manifest
-        // write below. The caller (`Tree::create_new`) has already created the
-        // tree directory, so the `LOCK` file can be opened here.
-        #[cfg(feature = "std")]
-        let directory_lock = crate::config::acquire_directory_lock(
-            &*config.fs,
-            &config.path,
-            config.directory_lock,
-        )?;
-
+    pub(crate) fn create_new(
+        config: Config,
+        // The cross-process directory lock acquired by `Tree::open` before the
+        // manifest probe; held for the tree's lifetime.
+        #[cfg(feature = "std")] directory_lock: Option<Box<dyn crate::fs::FsFile>>,
+    ) -> crate::Result<Self> {
         let version = Version::new(
             0,
             if config.kv_separation_opts.is_some() {
