@@ -111,6 +111,19 @@ pub struct TreeInner {
     /// Serializes flush operations.
     pub(crate) flush_lock: Mutex<()>,
 
+    /// Holds the cross-process exclusive directory lock for this tree's
+    /// lifetime: the locked `LOCK` file handle acquired by `Config::open` (via
+    /// `acquire_directory_lock`). Dropping it on tree close releases the OS
+    /// advisory lock so another process can open the directory. `None` when the
+    /// lock is disabled via
+    /// [`Config::with_directory_lock`](crate::Config::with_directory_lock). The
+    /// field is never read directly (the `_` prefix marks it as a lifetime
+    /// guard); its sole job is to keep the lock held.
+    // std-only: cross-process file locking needs real OS files; a no_std build
+    // is single-context and has nothing to guard against.
+    #[cfg(feature = "std")]
+    pub(crate) _directory_lock: Option<Box<dyn crate::fs::FsFile>>,
+
     /// Tree-wide gate that defers SST / blob-file deletions while a
     /// [`Tree::create_checkpoint`](crate::Tree::create_checkpoint) is in
     /// flight. Acquired by checkpoint code via
@@ -163,7 +176,12 @@ pub struct TreeInner {
 }
 
 impl TreeInner {
-    pub(crate) fn create_new(config: Config) -> crate::Result<Self> {
+    pub(crate) fn create_new(
+        config: Config,
+        // The cross-process directory lock acquired by `Tree::open` before the
+        // manifest probe; held for the tree's lifetime.
+        #[cfg(feature = "std")] directory_lock: Option<Box<dyn crate::fs::FsFile>>,
+    ) -> crate::Result<Self> {
         let version = Version::new(
             0,
             if config.kv_separation_opts.is_some() {
@@ -217,6 +235,8 @@ impl TreeInner {
             stop_signal: StopSignal::default(),
             major_compaction_lock: RwLock::default(),
             flush_lock: Mutex::default(),
+            #[cfg(feature = "std")]
+            _directory_lock: directory_lock,
             compaction_state: Arc::new(Mutex::new(CompactionState::default())),
             deletion_pause: DeletionPause::new_shared(),
             #[cfg(feature = "std")]

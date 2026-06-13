@@ -146,14 +146,17 @@ impl Config {
     /// compaction restructures it into proper levels (expect elevated I/O for a
     /// period proportional to the data size).
     ///
-    /// # Exclusive access (required)
+    /// # Exclusive access
     ///
-    /// The caller MUST guarantee no other instance has this tree directory open.
     /// Repair rewrites `CURRENT`, writes a fresh snapshot, and removes the stale
-    /// `edits-*` logs in place — `lsm-tree` takes no cross-process directory lock
-    /// here (nor does [`Config::open`]; exclusive directory ownership is the
-    /// embedder's responsibility). Running repair against a live tree corrupts
-    /// that instance's manifest state.
+    /// `edits-*` logs in place, so it requires exclusive access to the tree
+    /// directory. It acquires the same cross-process directory lock as
+    /// [`Config::open`] for the duration of the call: if another live instance
+    /// holds the directory (open or repairing), this fails fast with
+    /// [`crate::Error::Locked`] instead of corrupting that instance's manifest
+    /// state. The lock can be disabled via
+    /// [`Config::with_directory_lock`](crate::Config::with_directory_lock) for
+    /// embedders enforcing exclusivity at a higher layer.
     ///
     /// # Errors
     ///
@@ -196,6 +199,16 @@ fn repair_tree(config: &Config) -> crate::Result<RepairReport> {
             "repair of KV-separated (blob) trees",
         ));
     }
+
+    // Hold the cross-process directory lock for the whole repair: it rewrites
+    // CURRENT, writes a fresh snapshot, and sweeps `edits-*` in place, so a
+    // concurrent open / repair of the same directory would corrupt the manifest.
+    // A second acquirer fails fast with `Error::Locked`. Dropped at function
+    // return, releasing the lock. The directory is expected to exist (repair
+    // operates on an existing tree).
+    #[cfg(feature = "std")]
+    let _directory_lock =
+        crate::config::acquire_directory_lock(&*config.fs, &config.path, config.directory_lock)?;
 
     let mut recovered_tables: Vec<Table> = Vec::new();
     let mut unreadable_files: Vec<(PathBuf, String)> = Vec::new();

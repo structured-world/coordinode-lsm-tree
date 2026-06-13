@@ -161,6 +161,11 @@ fn tree_kv_checksums_all_levels_round_trips_through_disk() {
         );
     }
 
+    // Drop the first tree to release the cross-process directory lock before
+    // reopening the same directory (a second concurrent open would be rejected
+    // with `Error::Locked`).
+    drop(tree);
+
     // Reopen (fresh block cache) and re-read to exercise the cold disk
     // read path, not just the post-flush cache.
     let reopened = open_tree(folder.path());

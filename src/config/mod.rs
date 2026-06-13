@@ -520,6 +520,19 @@ pub struct Config {
     /// `fsync`. Set via [`Config::sync_mode`].
     pub(crate) sync_mode: SyncMode,
 
+    /// When `true` (the default), [`Config::open`] and [`Config::repair`]
+    /// acquire an exclusive cross-process lock on a `LOCK` file in the tree
+    /// directory (an advisory OS file lock) and hold it for the lifetime of the
+    /// [`Tree`](crate::Tree) (open) or the duration of the call (repair). A
+    /// second process attempting to open / repair the same directory fails fast
+    /// with [`Error::Locked`](crate::Error::Locked) instead of racing on the
+    /// manifest. Set `false` via [`Config::with_directory_lock`] only when the
+    /// embedder already enforces exclusive directory ownership at a higher layer
+    /// (e.g. a keyspace / journal manager). Best-effort per `Fs` backend: real
+    /// on-disk backends enforce it, in-memory backends are single-process and
+    /// satisfy it vacuously.
+    pub(crate) directory_lock: bool,
+
     /// Edit-log size (bytes) past which the next manifest persist rotates: it
     /// writes a fresh full snapshot and starts an empty log instead of appending
     /// another [`VersionEdit`](crate::version::edit::VersionEdit). Bounds both
@@ -692,6 +705,7 @@ impl Default for Config {
             encryption: None,
             manifest_recovery_mode: ManifestRecoveryMode::AbsoluteConsistency,
             sync_mode: SyncMode::Normal,
+            directory_lock: true,
             manifest_log_rotate_bytes: 1024 * 1024,
             compaction_rate_limit: 0,
 
@@ -705,6 +719,44 @@ impl Default for Config {
             #[cfg(all(test, feature = "std"))]
             fail_one_subcompaction: Arc::new(core::sync::atomic::AtomicBool::new(false)),
         }
+    }
+}
+
+/// Name of the lock file created in a tree directory for the cross-process
+/// exclusive directory lock.
+pub(crate) const DIRECTORY_LOCK_FILE: &str = "LOCK";
+
+/// Acquires the cross-process exclusive directory lock when `enabled`.
+///
+/// Opens (creating if absent) a `LOCK` file under `dir` and takes a
+/// non-blocking exclusive advisory lock on it through the `Fs` backend. Returns
+/// the locked handle to hold for as long as exclusivity is required; dropping it
+/// releases the lock (the OS frees an advisory lock when the fd / handle
+/// closes). `Ok(None)` when `enabled` is false. Fails with
+/// [`Error::Locked`](crate::Error::Locked) when another live instance holds the
+/// lock. The directory must already exist (the caller creates it for a fresh
+/// tree before acquiring).
+#[cfg(feature = "std")]
+pub(crate) fn acquire_directory_lock(
+    fs: &dyn Fs,
+    dir: &Path,
+    enabled: bool,
+) -> crate::Result<Option<Box<dyn crate::fs::FsFile>>> {
+    if !enabled {
+        return Ok(None);
+    }
+    let lock_path = dir.join(DIRECTORY_LOCK_FILE);
+    let file = fs.open(
+        &lock_path,
+        &crate::fs::FsOpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true),
+    )?;
+    if file.try_lock_exclusive()? {
+        Ok(Some(file))
+    } else {
+        Err(crate::Error::Locked(dir.display().to_string()))
     }
 }
 
@@ -1156,6 +1208,21 @@ impl Config {
     #[must_use]
     pub fn page_ecc(mut self, enabled: bool) -> Self {
         self.page_ecc = enabled;
+        self
+    }
+
+    /// Enables or disables the cross-process directory lock (default: enabled).
+    ///
+    /// When enabled, [`Config::open`] and [`Config::repair`] acquire an
+    /// exclusive advisory lock on a `LOCK` file in the tree directory, so a
+    /// second process opening / repairing the same directory fails fast with
+    /// [`Error::Locked`](crate::Error::Locked) rather than corrupting the shared
+    /// manifest. Disable ONLY when exclusive directory ownership is already
+    /// guaranteed at a higher layer (e.g. an embedding keyspace / journal
+    /// manager that opens each directory at most once per host).
+    #[must_use]
+    pub fn with_directory_lock(mut self, enabled: bool) -> Self {
+        self.directory_lock = enabled;
         self
     }
 

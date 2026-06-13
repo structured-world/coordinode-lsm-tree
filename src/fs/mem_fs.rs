@@ -319,6 +319,14 @@ impl FsFile for MemFile {
     fn lock_exclusive(&self) -> io::Result<()> {
         Ok(())
     }
+
+    fn try_lock_exclusive(&self) -> io::Result<bool> {
+        // `MemFs` is a single-process in-memory backend: there is no other
+        // process to contend with, so the directory lock is vacuously held.
+        // Opt in explicitly (the trait default fails closed for backends that
+        // have not implemented non-blocking locking).
+        Ok(true)
+    }
 }
 
 /// Rejects empty paths before they can create entries in the `/`-rooted namespace.

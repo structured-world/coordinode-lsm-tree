@@ -451,6 +451,38 @@ pub trait FsFile: Read + Write + Seek + Send + Sync {
     /// Returns an I/O error if locking fails or is unsupported.
     fn lock_exclusive(&self) -> io::Result<()>;
 
+    /// Tries to acquire an exclusive (write) lock on this file WITHOUT blocking.
+    ///
+    /// Returns `Ok(true)` if the lock was acquired, `Ok(false)` if another holder
+    /// (typically another process) currently owns it. Used for the cross-process
+    /// directory lock acquired at [`Config::open`](crate::Config::open) /
+    /// [`Config::repair`](crate::Config::repair): a second opener must fail fast
+    /// (`Ok(false)` → `Error::Locked`), not hang on a blocking acquire.
+    ///
+    /// The default implementation **fails closed**: it returns an
+    /// [`io::ErrorKind::Unsupported`] error so a backend that has not opted in
+    /// cannot silently bypass the cross-process directory lock. A disk-backed
+    /// backend that forgot to override this would otherwise let two processes
+    /// race on the same tree's manifest. Real on-disk backends override this
+    /// with a non-blocking OS lock (`flock` `LOCK_NB` / `LockFileEx`
+    /// `LOCKFILE_FAIL_IMMEDIATELY`); intentionally single-process backends
+    /// (e.g. in-memory) override it to return `Ok(true)` (exclusivity is
+    /// vacuous when there is only one process).
+    ///
+    /// # Errors
+    ///
+    /// [`io::ErrorKind::Unsupported`] from the default (un-opted-in) impl, or an
+    /// I/O error if a real lock operation fails (a held lock is reported as
+    /// `Ok(false)`, not an error).
+    fn try_lock_exclusive(&self) -> io::Result<bool> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "FsFile::try_lock_exclusive is not implemented for this backend; \
+             override it (real lock, or Ok(true) for single-process backends) \
+             or disable the directory lock via Config::with_directory_lock(false)",
+        ))
+    }
+
     /// Advise the kernel about the expected access pattern for this file.
     ///
     /// Implementations translate the [`FileHint`] to the platform's
