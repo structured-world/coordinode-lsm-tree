@@ -223,13 +223,17 @@ pub fn load_block(
 /// ECC-corrected and the fault is confirmed persistent.
 ///
 /// Call this on any read path that recovers a block from parity (full
-/// [`load_block`] and the zstd partial-decode path both feed it). No-op unless
-/// `heal_hints` is `Some` and enabled (`auto_heal`). On a corrected read it
-/// re-reads the block straight from disk (cache-bypassing) to tell a persistent
-/// medium fault from a transient read-path glitch, recording the SST only on
-/// confirmed persistence. A re-read error is treated as non-persistent: a
-/// genuinely faulty medium resurfaces on the next read, and this must never mask
-/// a live-path I/O failure.
+/// [`load_block`], the zstd partial-decode path, and [`scrub_block`] all feed
+/// it). No-op unless `heal_hints` is `Some` and enabled (`auto_heal`). On a
+/// corrected read it re-reads the block straight from disk (cache-bypassing) to
+/// tell a persistent medium fault from a transient read-path glitch, recording
+/// the SST only on confirmed persistence. A re-read error is treated as
+/// non-persistent: a genuinely faulty medium resurfaces on the next read, and
+/// this must never mask a live-path I/O failure.
+///
+/// Returns `true` when this call newly queued `table_id` for healing (confirmed
+/// persistent fault, scheduling enabled, not already queued). Read paths ignore
+/// the return; the patrol scrub uses it to count distinct SSTs it scheduled.
 #[expect(
     clippy::too_many_arguments,
     reason = "mirrors the block read context needed for the confirming re-read"
@@ -246,10 +250,12 @@ pub(crate) fn maybe_record_persistent_heal(
     #[cfg(zstd_any)] zstd_dict: Option<&crate::compression::ZstdDictionary>,
     heal_hints: Option<&crate::heal_hints::HealHints>,
     #[cfg(feature = "metrics")] metrics: &Metrics,
-) {
-    let Some(hints) = heal_hints else { return };
+) -> bool {
+    let Some(hints) = heal_hints else {
+        return false;
+    };
     if !hints.is_enabled() {
-        return;
+        return false;
     }
     match reread_block_is_corrected(
         table_id,
@@ -273,16 +279,124 @@ pub(crate) fn maybe_record_persistent_heal(
                     "Persistent ECC correction on table {table_id:?} block {handle:?}; \
                      queued for healing recompaction"
                 );
+                return true;
             }
+            false
         }
-        Ok(false) => log::debug!(
-            "Transient ECC correction on table {table_id:?} block {handle:?}; \
-             re-read clean, not scheduling"
-        ),
-        Err(e) => log::debug!(
-            "ECC re-read confirmation for table {table_id:?} block {handle:?} failed: {e:?}"
-        ),
+        Ok(false) => {
+            log::debug!(
+                "Transient ECC correction on table {table_id:?} block {handle:?}; \
+                 re-read clean, not scheduling"
+            );
+            false
+        }
+        Err(e) => {
+            log::debug!(
+                "ECC re-read confirmation for table {table_id:?} block {handle:?} failed: {e:?}"
+            );
+            false
+        }
     }
+}
+
+/// Outcome of patrol-scrubbing a single block via [`scrub_block`].
+//
+// Std-gated: the sole consumer (`Table::scrub_data_blocks` → `crate::scrub`)
+// is std-only, so gating keeps the no_std build free of dead code.
+#[cfg(feature = "std")]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(crate) enum BlockScrubOutcome {
+    /// The block read clean: its checksum verified with no parity correction
+    /// (covers [`EccStatus::Ok`](crate::table::block::EccStatus::Ok) and
+    /// [`EccStatus::Unrecognized`](crate::table::block::EccStatus::Unrecognized)
+    /// — in both cases the payload verified against its stored checksum).
+    Clean,
+    /// The block was recovered from its Page-ECC parity (a latent on-disk fault
+    /// was corrected in-flight). `scheduled` is `true` when this read confirmed
+    /// the fault is persistent and newly queued the owning SST for a healing
+    /// rewrite (`auto_heal` on and the SST not already queued).
+    Corrected {
+        /// `true` iff this block newly scheduled the SST for healing.
+        scheduled: bool,
+    },
+}
+
+/// Reads one block straight from disk (bypassing the block cache) and runs the
+/// full Page-ECC verify+correct path, recording a heal hint on a confirmed
+/// persistent correction.
+///
+/// This is the per-block primitive of the patrol scrub: it proactively reads a
+/// (typically cold) block so latent single-block bit-rot is corrected on read
+/// and the SST scheduled for a clean rewrite before a second fault in the same
+/// block exceeds the parity budget. Unlike [`load_block`] it deliberately
+/// **bypasses the block cache** in both directions: it neither serves a cached
+/// (already-clean) copy that would hide the on-disk fault, nor inserts the cold
+/// block and evicts the live working set.
+///
+/// Returns the [`BlockScrubOutcome`], or `Err` when the block is uncorrectable
+/// (checksum failed and parity could not recover it) or unreadable; the caller
+/// records that as an uncorrectable finding rather than silently skipping it.
+#[cfg(feature = "std")]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "mirrors load_block's read context minus the cache"
+)]
+pub(crate) fn scrub_block(
+    table_id: GlobalTableId,
+    path: &Path,
+    file_accessor: &FileAccessor,
+    handle: &BlockHandle,
+    block_type: BlockType,
+    compression: CompressionType,
+    encryption: Option<&dyn EncryptionProvider>,
+    ecc: Option<crate::table::block::EccParams>,
+    #[cfg(zstd_any)] zstd_dict: Option<&crate::compression::ZstdDictionary>,
+    heal_hints: Option<&crate::heal_hints::HealHints>,
+    #[cfg(feature = "metrics")] metrics: &Metrics,
+) -> crate::Result<BlockScrubOutcome> {
+    let (fd, _cache_event) = file_accessor.get_or_open_table(&table_id, path)?;
+    let transform = build_block_transform(
+        compression,
+        encryption,
+        ecc,
+        #[cfg(zstd_any)]
+        zstd_dict,
+    )?;
+    let (_block, ecc_status) = Block::from_file_with_status(
+        fd.as_ref(),
+        *handle,
+        crate::table::block::BlockIdentity {
+            table_id: table_id.table_id(),
+            block_type,
+            dict_id: compression.dict_id(),
+            window_log: 0,
+        },
+        &transform,
+    )?;
+
+    Ok(match ecc_status {
+        crate::table::block::EccStatus::Corrected => {
+            let scheduled = maybe_record_persistent_heal(
+                table_id,
+                path,
+                file_accessor,
+                handle,
+                block_type,
+                compression,
+                encryption,
+                ecc,
+                #[cfg(zstd_any)]
+                zstd_dict,
+                heal_hints,
+                #[cfg(feature = "metrics")]
+                metrics,
+            );
+            BlockScrubOutcome::Corrected { scheduled }
+        }
+        crate::table::block::EccStatus::Ok | crate::table::block::EccStatus::Unrecognized => {
+            BlockScrubOutcome::Clean
+        }
+    })
 }
 
 /// Builds the [`BlockTransform`](crate::table::block::BlockTransform) for a

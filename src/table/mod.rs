@@ -281,6 +281,95 @@ impl Table {
         self.metadata.file_size
     }
 
+    /// Patrol-scrubs every data block of this table: a cache-bypassing read that
+    /// runs the Page-ECC verify+correct path, recording a heal hint (when
+    /// `auto_heal` is on) on a confirmed-persistent correction.
+    ///
+    /// Returns a partial [`PatrolScrubReport`](crate::scrub::PatrolScrubReport)
+    /// for this SST (`sst_files_scanned == 1`) so the caller can merge it across
+    /// the tree. Always runs to completion: an uncorrectable / unreadable block
+    /// is recorded (and logged), not silently skipped, and the next block is
+    /// still scrubbed. A block-index walk failure stops this table early (later
+    /// offsets are untrustworthy) but other tables still scrub.
+    #[cfg(feature = "std")]
+    pub(crate) fn scrub_data_blocks(&self) -> crate::scrub::PatrolScrubReport {
+        use crate::scrub::{PatrolScrubReport, ScrubError};
+        use crate::table::util::{BlockScrubOutcome, scrub_block};
+
+        let mut report = PatrolScrubReport {
+            sst_files_scanned: 1,
+            ..PatrolScrubReport::default()
+        };
+
+        for entry in self.block_index.iter() {
+            let keyed = match entry {
+                Ok(h) => h,
+                Err(e) => {
+                    // A structural index error means later offsets can't be
+                    // trusted — stop this table, record it, let others run.
+                    log::error!(
+                        "patrol scrub: block index of table {} at {} unreadable: {e:?}",
+                        self.id(),
+                        self.path.display(),
+                    );
+                    report.errors.push(ScrubError::BlockIndexUnreadable {
+                        table_id: self.id(),
+                        path: self.path.to_path_buf(),
+                        reason: alloc::format!("{e:?}"),
+                    });
+                    break;
+                }
+            };
+
+            let block_offset = keyed.offset().0;
+            let handle = BlockHandle::new(keyed.offset(), keyed.size());
+            report.blocks_scanned += 1;
+
+            match scrub_block(
+                self.global_id(),
+                &self.path,
+                &self.file_accessor,
+                &handle,
+                BlockType::Data,
+                self.metadata.data_block_compression,
+                self.encryption.as_deref(),
+                self.metadata.ecc_params,
+                #[cfg(zstd_any)]
+                self.zstd_dictionary.as_deref(),
+                self.heal_hints.get().map(AsRef::as_ref),
+                #[cfg(feature = "metrics")]
+                &self.metrics,
+            ) {
+                Ok(BlockScrubOutcome::Clean) => {}
+                Ok(BlockScrubOutcome::Corrected { scheduled }) => {
+                    report.corrections_applied += 1;
+                    if scheduled {
+                        // heal_hints dedups per SST, so `scheduled` is true at
+                        // most once per table — this counts distinct SSTs.
+                        report.ssts_scheduled_for_rewrite += 1;
+                    }
+                }
+                Err(e) => {
+                    report.uncorrectable_blocks += 1;
+                    log::error!(
+                        "patrol scrub: uncorrectable block at offset {block_offset} in table {} \
+                         at {}: {e:?}",
+                        self.id(),
+                        self.path.display(),
+                    );
+                    report.errors.push(ScrubError::UncorrectableBlock {
+                        table_id: self.id(),
+                        path: self.path.to_path_buf(),
+                        block_offset,
+                        reason: alloc::format!("{e:?}"),
+                    });
+                }
+            }
+        }
+
+        report
+    }
+
     /// Scrub: verifies the per-KV checksum footer of every data block in this
     /// table, decoding each block and recomputing each entry's logical-content
     /// digest.
