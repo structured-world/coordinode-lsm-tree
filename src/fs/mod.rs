@@ -451,6 +451,28 @@ pub trait FsFile: Read + Write + Seek + Send + Sync {
     /// Returns an I/O error if locking fails or is unsupported.
     fn lock_exclusive(&self) -> io::Result<()>;
 
+    /// Tries to acquire an exclusive (write) lock on this file WITHOUT blocking.
+    ///
+    /// Returns `Ok(true)` if the lock was acquired, `Ok(false)` if another holder
+    /// (typically another process) currently owns it. Used for the cross-process
+    /// directory lock acquired at [`Config::open`](crate::Config::open) /
+    /// [`Config::repair`](crate::Config::repair): a second opener must fail fast
+    /// (`Ok(false)` → `Error::Locked`), not hang on a blocking acquire.
+    ///
+    /// The default implementation returns `Ok(true)` (a trivial acquire): an
+    /// in-memory or single-process backend has no cross-process contention to
+    /// guard against, so exclusivity is satisfied vacuously. Real on-disk
+    /// backends override this with a non-blocking OS lock (`flock` `LOCK_NB` /
+    /// `LockFileEx` `LOCKFILE_FAIL_IMMEDIATELY`).
+    ///
+    /// # Errors
+    ///
+    /// An I/O error if the lock operation itself fails (a held lock is reported
+    /// as `Ok(false)`, not an error).
+    fn try_lock_exclusive(&self) -> io::Result<bool> {
+        Ok(true)
+    }
+
     /// Advise the kernel about the expected access pattern for this file.
     ///
     /// Implementations translate the [`FileHint`] to the platform's

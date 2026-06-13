@@ -2214,6 +2214,17 @@ impl Tree {
 
         log::info!("Recovering LSM-tree at {}", config.path.display());
 
+        // Acquire the cross-process directory lock before any recovery work
+        // mutates the on-disk manifest (CURRENT / snapshots / edit logs). The
+        // directory already exists on the recover path. Held for the tree's
+        // lifetime via `TreeInner::_directory_lock`.
+        #[cfg(feature = "std")]
+        let directory_lock = crate::config::acquire_directory_lock(
+            &*config.fs,
+            &config.path,
+            config.directory_lock,
+        )?;
+
         // Validate manifest metadata (format version, comparator name)
         // BEFORE recover_levels, so a rejected open is side-effect free
         // — recover_levels loads tables and cleans up orphans.
@@ -2338,6 +2349,8 @@ impl Tree {
             config: Arc::new(config),
             major_compaction_lock: RwLock::default(),
             flush_lock: Mutex::default(),
+            #[cfg(feature = "std")]
+            _directory_lock: directory_lock,
             compaction_state: Arc::new(Mutex::new(CompactionState::default())),
             deletion_pause: Arc::clone(&deletion_pause),
             #[cfg(feature = "std")]

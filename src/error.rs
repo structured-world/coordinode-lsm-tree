@@ -202,6 +202,19 @@ pub enum Error {
     /// strings.
     FeatureUnsupported(&'static str),
 
+    /// The tree directory is already locked by another live instance.
+    ///
+    /// Returned by [`Config::open`](crate::Config::open) and
+    /// [`Config::repair`](crate::Config::repair) when the cross-process
+    /// directory lock (a `LOCK` file under the tree directory, held via an
+    /// advisory OS file lock) could not be acquired because another process
+    /// owns it. Holds the directory path as a display string for diagnostics.
+    /// Two processes mutating the same manifest would corrupt it, so the second
+    /// acquirer fails fast here. Disable the lock with
+    /// [`Config::with_directory_lock`](crate::Config::with_directory_lock) only
+    /// when exclusivity is enforced at a higher layer.
+    Locked(String),
+
     /// Manifest footer / TOC / file-level discovery failure.
     ///
     /// Scoped to errors detected at or before the TOC is parsed —

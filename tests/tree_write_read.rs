@@ -33,6 +33,11 @@ fn tree_write_and_read() -> lsm_tree::Result<()> {
 
     tree.flush_active_memtable(0)?;
 
+    // Drop the first tree to release the cross-process directory lock before
+    // reopening the same directory (a second concurrent open would fail with
+    // `Error::Locked`).
+    drop(tree);
+
     let tree = Config::new(
         &folder,
         SequenceNumberCounter::default(),

@@ -142,6 +142,10 @@ impl FsFile for File {
         sys::lock_exclusive(self).map_err(io::Error::from)
     }
 
+    fn try_lock_exclusive(&self) -> io::Result<bool> {
+        sys::try_lock_exclusive(self).map_err(io::Error::from)
+    }
+
     fn hint(&self, hint: FileHint) -> io::Result<()> {
         sys::fadvise(self, hint).map_err(io::Error::from)
     }
@@ -476,6 +480,9 @@ mod sys {
 
     // Declare flock directly to avoid requiring libc as a direct dependency.
     const LOCK_EX: c_int = 2;
+    // Non-blocking modifier: flock returns EWOULDBLOCK instead of waiting when
+    // the lock is already held.
+    const LOCK_NB: c_int = 4;
 
     // SAFETY: declaration matches the POSIX `flock` ABI on Unix targets.
     unsafe extern "C" {
@@ -497,6 +504,32 @@ mod sys {
             let err = std::io::Error::last_os_error();
             if err.kind() == std::io::ErrorKind::Interrupted {
                 continue;
+            }
+            return Err(err);
+        }
+    }
+
+    pub(super) fn try_lock_exclusive(file: &File) -> io::Result<bool> {
+        let fd = file.as_raw_fd();
+
+        loop {
+            // SAFETY: fd is a valid file descriptor owned by `file`.
+            #[expect(unsafe_code, reason = "flock FFI call with valid fd")]
+            let ret = unsafe { flock(fd, LOCK_EX | LOCK_NB) };
+
+            if ret == 0 {
+                return Ok(true);
+            }
+
+            // EINTR can interrupt even the non-blocking call; retry. EWOULDBLOCK
+            // (the lock is held elsewhere) is the expected contention signal and
+            // maps to `Ok(false)`, not an error.
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            if err.kind() == std::io::ErrorKind::WouldBlock {
+                return Ok(false);
             }
             return Err(err);
         }
@@ -707,6 +740,72 @@ mod sys {
         }
         Ok(())
     }
+
+    pub(super) fn try_lock_exclusive(file: &File) -> io::Result<bool> {
+        use core::ptr;
+
+        const LOCKFILE_EXCLUSIVE_LOCK: u32 = 0x0000_0002;
+        // Non-blocking: fail immediately with ERROR_LOCK_VIOLATION instead of
+        // waiting when the region is already locked.
+        const LOCKFILE_FAIL_IMMEDIATELY: u32 = 0x0000_0001;
+        // Windows system error code returned when the lock is already held.
+        const ERROR_LOCK_VIOLATION: i32 = 33;
+
+        // SAFETY: declaration matches the Windows `LockFileEx` ABI and `Overlapped` layout.
+        #[allow(non_snake_case, reason = "FFI name matches Windows API")]
+        unsafe extern "system" {
+            fn LockFileEx(
+                h_file: *mut std::ffi::c_void,
+                dw_flags: u32,
+                dw_reserved: u32,
+                n_number_of_bytes_to_lock_low: u32,
+                n_number_of_bytes_to_lock_high: u32,
+                lp_overlapped: *mut Overlapped,
+            ) -> i32;
+        }
+
+        #[repr(C)]
+        struct Overlapped {
+            internal: usize,
+            internal_high: usize,
+            offset: u32,
+            offset_high: u32,
+            h_event: *mut std::ffi::c_void,
+        }
+
+        let handle = file.as_raw_handle();
+        let mut overlapped = Overlapped {
+            internal: 0,
+            internal_high: 0,
+            offset: 0,
+            offset_high: 0,
+            h_event: ptr::null_mut(),
+        };
+
+        // SAFETY: handle is a valid file handle owned by `file`.
+        #[expect(unsafe_code, reason = "LockFileEx FFI call with valid handle")]
+        let ret = unsafe {
+            LockFileEx(
+                handle as *mut std::ffi::c_void,
+                LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
+                0,
+                u32::MAX,
+                u32::MAX,
+                &mut overlapped,
+            )
+        };
+
+        if ret == 0 {
+            let err = std::io::Error::last_os_error();
+            // The "already locked" case is the expected contention signal and
+            // maps to `Ok(false)`, mirroring the unix EWOULDBLOCK path.
+            if err.raw_os_error() == Some(ERROR_LOCK_VIOLATION) {
+                return Ok(false);
+            }
+            return Err(err);
+        }
+        Ok(true)
+    }
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -716,6 +815,13 @@ mod sys {
     use std::io;
 
     pub(super) fn lock_exclusive(_file: &File) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "file locking is not supported on this platform",
+        ))
+    }
+
+    pub(super) fn try_lock_exclusive(_file: &File) -> io::Result<bool> {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "file locking is not supported on this platform",

@@ -334,6 +334,12 @@ impl FsFile for IoUringFile {
         // Delegate to the platform-specific FsFile impl for std::fs::File.
         FsFile::lock_exclusive(&self.file)
     }
+
+    fn try_lock_exclusive(&self) -> crate::io::Result<bool> {
+        // io_uring wraps a real on-disk file, so it needs the genuine
+        // non-blocking OS lock, not the trivial-acquire default.
+        FsFile::try_lock_exclusive(&self.file)
+    }
 }
 
 impl Read for IoUringFile {
