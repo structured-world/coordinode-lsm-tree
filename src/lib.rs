@@ -408,6 +408,14 @@ pub mod verify;
 #[cfg(feature = "std")]
 pub mod inspect;
 
+/// ECC patrol scrub: a proactive sweep over Page-ECC-protected SST blocks.
+///
+/// Reads blocks to detect and correct latent bit-rot before it accumulates
+/// past the parity budget. Std-gated for the same reason as [`verify`]: the
+/// sweep needs real filesystem I/O and thread-based parallelism.
+#[cfg(feature = "std")]
+pub mod scrub;
+
 mod version;
 mod vlog;
 
