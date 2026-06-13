@@ -1,10 +1,6 @@
 use super::{BuildError, Mode, ParamError, Params, RibbonBuilder};
-use core::hash::BuildHasherDefault;
-use std::collections::hash_map::DefaultHasher;
 
-use super::hashing::{standard_equation_w64, start_position_from_stream};
-
-type DefaultBuildHasher = BuildHasherDefault<DefaultHasher>;
+use super::hashing::{standard_equation_from_hash, start_position_from_stream};
 
 #[test]
 fn params_rejects_zero_m() {
@@ -80,379 +76,62 @@ fn params_from_expected_items_rejects_overhead_out_of_range() {
     assert!(matches!(err, ParamError::InvalidOverhead { .. }));
 }
 
+// The equation pipeline is exercised directly from pre-computed hashes
+// (the only path the crate uses now that keys arrive pre-hashed).
+
 #[test]
-fn hash_pipeline_start_in_range_and_pivot_forced() {
-    let hasher = DefaultBuildHasher::default();
+fn equation_start_in_range_and_pivot_forced() {
     let params = Params::new(128, 17, 13, Mode::Standard).expect("params must be valid");
     let mut fp = vec![0u64; params.fingerprint_words()];
 
-    let eq = standard_equation_w64(&hasher, &"hello-key", 42, &params, &mut fp);
+    let eq = standard_equation_from_hash(0x0123_4567_89AB_CDEF, 42, &params, &mut fp);
 
     assert!(eq.start < params.start_range());
     assert_eq!(eq.coeff_lo & 1, 1);
 }
 
 #[test]
-fn hash_pipeline_masks_fingerprint_to_r_bits() {
-    let hasher = DefaultBuildHasher::default();
+fn equation_masks_fingerprint_to_r_bits() {
     let params = Params::new(64, 8, 9, Mode::Standard).expect("params must be valid");
     let mut fp = vec![0u64; params.fingerprint_words()];
 
-    let _ = standard_equation_w64(&hasher, &12345u64, 7, &params, &mut fp);
+    let _ = standard_equation_from_hash(0xDEAD_BEEF_CAFE_F00D, 7, &params, &mut fp);
 
     assert_eq!(fp[0] & !params.fingerprint_last_word_mask(), 0);
 }
 
 #[test]
-fn hash_pipeline_is_deterministic_for_seed_and_key() {
-    let hasher = DefaultBuildHasher::default();
+fn equation_is_deterministic_for_seed_and_hash() {
     let params = Params::new(96, 16, 20, Mode::Standard).expect("params must be valid");
     let mut fp_a = vec![0u64; params.fingerprint_words()];
     let mut fp_b = vec![0u64; params.fingerprint_words()];
 
-    let eq_a = standard_equation_w64(&hasher, &"deterministic-key", 999, &params, &mut fp_a);
-    let eq_b = standard_equation_w64(&hasher, &"deterministic-key", 999, &params, &mut fp_b);
+    let h = 0x1122_3344_5566_7788;
+    let eq_a = standard_equation_from_hash(h, 999, &params, &mut fp_a);
+    let eq_b = standard_equation_from_hash(h, 999, &params, &mut fp_b);
 
     assert_eq!(eq_a, eq_b);
     assert_eq!(fp_a, fp_b);
 }
 
 #[test]
-fn standard_builder_has_no_false_negatives_1k() {
-    let hasher = DefaultBuildHasher::default();
-    let params = Params::new(3000, 16, 12, Mode::Standard).expect("params should be valid");
-    let builder = RibbonBuilder::new(params.with_seed(11), hasher).expect("builder should build");
-
-    let keys: Vec<u64> = (0..1000).collect();
-    let filter = builder.build(&keys).expect("construction should succeed");
-
-    for key in &keys {
-        assert!(filter.contains(key), "false negative for key {key}");
-    }
-}
-
-#[test]
-fn standard_builder_has_no_false_negatives_10k() {
-    let hasher = DefaultBuildHasher::default();
-    let params = Params::new(30000, 16, 10, Mode::Standard).expect("params should be valid");
-    let builder = RibbonBuilder::new(params.with_seed(13), hasher).expect("builder should build");
-
-    let keys: Vec<u64> = (0..10000).collect();
-    let filter = builder.build(&keys).expect("construction should succeed");
-
-    for key in &keys {
-        assert!(filter.contains(key), "false negative for key {key}");
-    }
-}
-
-#[test]
-fn standard_builder_reports_inconsistent_equation_failure() {
-    let hasher = DefaultBuildHasher::default();
-    let params = Params::new(16, 16, 8, Mode::Standard)
-        .expect("params should be valid")
-        .with_seed(5);
-    let builder = RibbonBuilder::new(params, hasher).expect("builder should build");
-
-    let keys: Vec<u64> = (0..200).collect();
-    let result = builder.build(&keys);
-
-    match result {
-        Err(BuildError::ConstructionFailed { last_failure, .. }) => {
-            assert!(matches!(
-                last_failure,
-                super::ConstructionFailure::InconsistentEquation { .. }
-            ));
-        }
-        Err(other) => panic!("expected construction failure, got {other}"),
-        Ok(_) => panic!("expected failure, got success"),
-    }
-}
-
-#[test]
-fn standard_builder_is_deterministic_for_same_input() {
-    let hasher = DefaultBuildHasher::default();
-    let params = Params::new(3000, 16, 9, Mode::Standard)
-        .expect("params should be valid")
-        .with_seed(99);
-
-    let builder_a = RibbonBuilder::new(params, hasher.clone()).expect("builder should build");
-    let builder_b = RibbonBuilder::new(params, hasher).expect("builder should build");
-
-    let keys: Vec<u64> = (1000..2000).collect();
-    let filter_a = builder_a.build(&keys).expect("first build should succeed");
-    let filter_b = builder_b.build(&keys).expect("second build should succeed");
-
-    for probe in 990..2010u64 {
-        assert_eq!(
-            filter_a.contains(&probe),
-            filter_b.contains(&probe),
-            "non-deterministic result for key {probe}"
-        );
-    }
-}
-
-#[derive(Default, Clone)]
-struct ConstantBuildHasher;
-
-impl std::hash::BuildHasher for ConstantBuildHasher {
-    type Hasher = ConstantHasher;
-
-    fn build_hasher(&self) -> Self::Hasher {
-        ConstantHasher
-    }
-}
-
-#[derive(Default, Clone)]
-struct ConstantHasher;
-
-impl std::hash::Hasher for ConstantHasher {
-    fn finish(&self) -> u64 {
-        0
-    }
-
-    fn write(&mut self, _bytes: &[u8]) {}
-}
-
-#[test]
-fn builder_supports_custom_buildhasher() {
-    let hasher = ConstantBuildHasher;
-    let params = Params::new(3000, 16, 9, Mode::Standard)
-        .expect("params should be valid")
-        .with_seed(88);
-    let builder = RibbonBuilder::new(params, hasher).expect("builder should build");
-
-    let keys: Vec<u64> = (0..200).collect();
-    let filter = builder.build(&keys).expect("build should succeed");
-
-    let mut scratch = filter.new_scratch();
-    for key in &keys {
-        assert!(filter.contains_in(key, &mut scratch));
-    }
-}
-
-#[test]
-fn contains_and_contains_in_are_equivalent() {
-    let hasher = DefaultBuildHasher::default();
-    let params = Params::new(3000, 16, 9, Mode::Standard)
-        .expect("params should be valid")
-        .with_seed(77);
-    let builder = RibbonBuilder::new(params, hasher).expect("builder should build");
-    let keys: Vec<u64> = (1000..2000).collect();
-    let filter = builder.build(&keys).expect("build should succeed");
-
-    let mut scratch = filter.new_scratch();
-    for probe in 900..2100u64 {
-        assert_eq!(
-            filter.contains(&probe),
-            filter.contains_in(&probe, &mut scratch),
-            "contains mismatch at key {probe}"
-        );
-    }
-}
-
-#[test]
-fn retry_path_is_exercised_and_eventually_succeeds() {
-    let hasher = DefaultBuildHasher::default();
-    let keys: Vec<u64> = (0..500).collect();
-    let params = Params::new(16, 16, 8, Mode::Standard)
-        .expect("params valid")
-        .with_seed(1)
-        .with_retry_policy(3, 0)
-        .expect("retry policy valid");
-    let builder = RibbonBuilder::new(params, hasher).expect("builder valid");
-
-    match builder.build(&keys) {
-        Err(BuildError::ConstructionFailed {
-            final_m,
-            attempts,
-            last_failure,
-        }) => {
-            assert_eq!(final_m, 16);
-            assert_eq!(attempts, 3);
-            assert!(matches!(
-                last_failure,
-                super::ConstructionFailure::InconsistentEquation { .. }
-            ));
-        }
-        other => panic!("expected retry-exhausted failure, got {other:?}"),
-    }
-}
-
-#[test]
-fn growth_path_is_exercised_and_reports_grown_m() {
-    let hasher = DefaultBuildHasher::default();
-    let keys: Vec<u64> = (0..500).collect();
-    let params = Params::new(16, 16, 8, Mode::Standard)
-        .expect("params valid")
-        .with_seed(1)
-        .with_retry_policy(2, 2)
-        .expect("retry policy valid");
-    let builder = RibbonBuilder::new(params, hasher).expect("builder valid");
-
-    match builder.build(&keys) {
-        Err(BuildError::ConstructionFailed {
-            final_m,
-            attempts,
-            last_failure,
-        }) => {
-            assert_eq!(attempts, 6);
-            assert_eq!(final_m, 19);
-            assert!(matches!(
-                last_failure,
-                super::ConstructionFailure::InconsistentEquation { .. }
-            ));
-        }
-        other => panic!("expected growth-exhausted failure, got {other:?}"),
-    }
-}
-
-#[test]
-fn terminal_failure_reports_attempts_and_final_m() {
-    let hasher = DefaultBuildHasher::default();
-    let params = Params::new(16, 16, 8, Mode::Standard)
-        .expect("params valid")
-        .with_seed(1)
-        .with_retry_policy(2, 2)
-        .expect("retry policy valid");
-    let builder = RibbonBuilder::new(params, hasher).expect("builder valid");
-    let keys: Vec<u64> = (0..500).collect();
-
-    match builder.build(&keys) {
-        Err(BuildError::ConstructionFailed {
-            final_m,
-            attempts,
-            last_failure,
-        }) => {
-            assert_eq!(attempts, 6);
-            assert_eq!(final_m, 19);
-            assert!(matches!(
-                last_failure,
-                super::ConstructionFailure::InconsistentEquation { .. }
-            ));
-        }
-        other => panic!("expected terminal construction failure, got {other:?}"),
-    }
-}
-
-#[test]
-fn successful_build_persists_selected_attempt_seed() {
-    let hasher = DefaultBuildHasher::default();
-    let base_seed = 123u64;
-    let params = Params::new(3000, 16, 9, Mode::Standard)
-        .expect("params valid")
-        .with_seed(base_seed)
-        .with_retry_policy(1, 0)
-        .expect("retry policy valid");
-    let builder = RibbonBuilder::new(params, hasher).expect("builder valid");
-    let keys: Vec<u64> = (0..1000).collect();
-
-    let filter = builder.build(&keys).expect("build should succeed");
-    assert_eq!(
-        filter.params().seed,
-        super::hashing::derive_attempt_seed(base_seed, 0)
-    );
-}
-
-#[test]
-fn homogeneous_build_succeeds_and_has_no_false_negatives() {
-    let hasher = DefaultBuildHasher::default();
-    let params = Params::new(4000, 16, 8, Mode::Homogeneous)
-        .expect("params valid")
-        .with_seed(55);
-    let builder = RibbonBuilder::new(params, hasher).expect("builder valid");
-    let keys: Vec<u64> = (0..1000).collect();
-
-    let filter = builder
-        .build(&keys)
-        .expect("homogeneous build should succeed");
-    let mut scratch = filter.new_scratch();
-    for key in &keys {
-        assert!(filter.contains_in(key, &mut scratch));
-    }
-}
-
-#[test]
-fn homogeneous_mode_false_positive_rate_is_sane_across_seeds_and_sizes() {
-    let hasher = DefaultBuildHasher::default();
-    let r = 8usize;
-    let seeds = [7u64, 77u64, 777u64];
-    let sizes = [2_000usize, 8_000usize];
-    let queries = 40_000usize;
-
-    for &seed in &seeds {
-        for &n in &sizes {
-            let params = Params::new(n * 4, 16, r, Mode::Homogeneous)
-                .expect("params valid")
-                .with_seed(seed)
-                .with_retry_policy(2, 0)
-                .expect("retry policy valid");
-            let builder = RibbonBuilder::new(params, hasher.clone()).expect("builder valid");
-            let keys: Vec<u64> = (0..n as u64).collect();
-            let filter = builder
-                .build(&keys)
-                .expect("homogeneous build should succeed");
-
-            let mut scratch = filter.new_scratch();
-            let mut fp = 0usize;
-            let query_start = 10_000_000u64 + (seed << 20) + n as u64;
-            for q in 0..queries {
-                if filter.contains_in(&(query_start + q as u64), &mut scratch) {
-                    fp += 1;
-                }
-            }
-
-            let observed = fp as f64 / queries as f64;
-            let expected = 2f64.powi(-(r as i32));
-
-            assert!(
-                observed > 0.0005,
-                "homogeneous fp unexpectedly near-zero seed={seed} n={n}: observed={observed}, expected~{expected}"
-            );
-            assert!(
-                observed < 0.05,
-                "homogeneous fp unexpectedly near-trivial-high seed={seed} n={n}: observed={observed}, expected~{expected}"
-            );
-            assert!(
-                observed >= expected / 8.0 && observed <= expected * 8.0,
-                "homogeneous fp far from expected envelope seed={seed} n={n}: observed={observed}, expected~{expected}"
-            );
-        }
-    }
-}
-
-#[test]
-fn construction_failure_out_of_bounds_display_contains_context() {
-    let err = super::ConstructionFailure::OutOfBounds {
-        key_index: Some(12),
-        row_index: 99,
-        m: 80,
-    };
-    let msg = err.to_string();
-    assert!(msg.contains("row index 99"));
-    assert!(msg.contains("m=80"));
-    assert!(msg.contains("key at index 12"));
-}
-
-#[test]
 fn homogeneous_pipeline_has_zero_fingerprint() {
-    let hasher = DefaultBuildHasher::default();
     let params = Params::new(128, 16, 9, Mode::Homogeneous).expect("params must be valid");
     let mut fp = vec![0u64; params.fingerprint_words()];
 
-    let _ = standard_equation_w64(&hasher, &"h-key", 11, &params, &mut fp);
+    let _ = standard_equation_from_hash(0xABCD_1234_5678_9ABC, 11, &params, &mut fp);
 
     assert!(fp.iter().all(|&w| w == 0));
 }
 
 #[test]
 fn width_128_pipeline_sets_bits_in_both_halves() {
-    let hasher = DefaultBuildHasher::default();
     let params = Params::new(400, 128, 8, Mode::Standard).expect("params valid");
 
     let mut saw_hi = false;
     for seed in 0..500u64 {
         let mut fp = vec![0u64; params.fingerprint_words()];
-        let eq = standard_equation_w64(&hasher, &"w128-key", seed, &params, &mut fp);
+        let eq = standard_equation_from_hash(0xF00D_BA11_0BAD_F00D, seed, &params, &mut fp);
 
         if eq.coeff_hi != 0 {
             saw_hi = true;
@@ -464,72 +143,6 @@ fn width_128_pipeline_sets_bits_in_both_halves() {
         saw_hi,
         "expected at least one seed with high-half coefficient bits"
     );
-}
-
-#[test]
-fn builder_supports_width_above_64() {
-    let hasher = DefaultBuildHasher::default();
-    let params = Params::new(4000, 96, 10, Mode::Standard)
-        .expect("params should be valid")
-        .with_seed(303)
-        .with_retry_policy(4, 1)
-        .expect("retry policy valid");
-    let builder = RibbonBuilder::new(params, hasher).expect("builder should build");
-    let keys: Vec<u64> = (0..800).collect();
-    let filter = builder.build(&keys).expect("construction should succeed");
-    let mut scratch = filter.new_scratch();
-
-    for key in &keys {
-        assert!(filter.contains_in(key, &mut scratch));
-    }
-}
-
-#[test]
-fn bitpacked_storage_maintains_membership_behavior() {
-    let hasher = DefaultBuildHasher::default();
-    let params = Params::new(3000, 16, 12, Mode::Standard)
-        .expect("params should be valid")
-        .with_seed(1234);
-    let builder = RibbonBuilder::new(params, hasher).expect("builder should build");
-    let keys: Vec<u64> = (0..1000).collect();
-    let filter = builder.build(&keys).expect("build should succeed");
-
-    let mut scratch = filter.new_scratch();
-    for key in &keys {
-        assert!(filter.contains_in(key, &mut scratch));
-    }
-}
-
-#[test]
-fn compatibility_matrix_modes_widths_and_fingerprints() {
-    let hasher = DefaultBuildHasher::default();
-    let modes = [Mode::Standard, Mode::Homogeneous];
-    let widths = [16usize, 80usize, 128usize];
-    let rs = [8usize, 12usize];
-
-    for mode in modes {
-        for w in widths {
-            for r in rs {
-                let params = Params::new(6000, w, r, mode)
-                    .expect("params should be valid")
-                    .with_seed(700 + w as u64 + r as u64)
-                    .with_retry_policy(5, 2)
-                    .expect("retry policy valid");
-                let builder =
-                    RibbonBuilder::new(params, hasher.clone()).expect("builder should build");
-                let keys: Vec<u64> = (0..1000).collect();
-                let filter = builder.build(&keys).expect("construction should succeed");
-                let mut scratch = filter.new_scratch();
-
-                for key in &keys {
-                    assert!(
-                        filter.contains_in(key, &mut scratch),
-                        "false negative for mode={mode}, w={w}, r={r}, key={key}"
-                    );
-                }
-            }
-        }
-    }
 }
 
 #[test]
@@ -545,239 +158,87 @@ fn start_position_hook_stays_in_bounds() {
 }
 
 #[test]
-fn statistical_false_positive_rates_are_within_confidence_bounds() {
-    let hasher = DefaultBuildHasher::default();
-    let seeds = [11u64, 42u64, 777u64];
-    let sizes = [1000usize, 5000usize];
-    let rs = [8usize, 12usize];
-
-    for &seed in &seeds {
-        for &n in &sizes {
-            for &r in &rs {
-                let params = Params::new(n * 4, 16, r, Mode::Standard)
-                    .expect("params should be valid")
-                    .with_seed(seed)
-                    .with_retry_policy(4, 1)
-                    .expect("retry policy should be valid");
-                let builder =
-                    RibbonBuilder::new(params, hasher.clone()).expect("builder should be valid");
-                let keys: Vec<u64> = (0..n as u64).collect();
-                let filter = builder.build(&keys).expect("construction should succeed");
-
-                let queries = 20_000usize;
-                let query_start = 10_000_000u64 + (seed << 20) + n as u64;
-                let mut scratch = filter.new_scratch();
-                let mut fp = 0usize;
-                for q in 0..queries {
-                    if filter.contains_in(&(query_start + q as u64), &mut scratch) {
-                        fp += 1;
-                    }
-                }
-
-                let p = 2f64.powi(-(r as i32));
-                let mean = (queries as f64) * p;
-                let var = (queries as f64) * p * (1.0 - p);
-                let sigma = var.sqrt();
-                let tolerance = (8.0 * sigma).max(8.0);
-                let lower = (mean - tolerance).max(0.0);
-                let upper = mean + tolerance;
-                let observed = fp as f64;
-
-                assert!(
-                    observed >= lower && observed <= upper,
-                    "fp out of bounds seed={seed} n={n} r={r}: observed={observed} expected~{mean} bounds=[{lower}, {upper}]"
-                );
-            }
-        }
-    }
-}
-
-fn lcg_next(state: &mut u64) -> u64 {
-    *state = state
-        .wrapping_mul(6364136223846793005)
-        .wrapping_add(1442695040888963407);
-    *state
-}
-
-#[test]
-fn property_no_false_negatives_across_generated_cases() {
-    let hasher = DefaultBuildHasher::default();
-    let mut rng = 1u64;
-
-    for case in 0..20u64 {
-        let seed = lcg_next(&mut rng);
-        let n = 200 + (lcg_next(&mut rng) % 400) as usize;
-        let w_choices = [16usize, 32usize, 80usize, 128usize];
-        let w = w_choices[(lcg_next(&mut rng) as usize) % w_choices.len()];
-        let r_choices = [8usize, 10usize, 12usize];
-        let r = r_choices[(lcg_next(&mut rng) as usize) % r_choices.len()];
-        let mode = if (lcg_next(&mut rng) & 1) == 0 {
-            Mode::Standard
-        } else {
-            Mode::Homogeneous
-        };
-
-        let params = Params::new((n * 5).max(w), w, r, mode)
-            .expect("params should be valid")
-            .with_seed(seed)
-            .with_retry_policy(4, 2)
-            .expect("retry policy should be valid");
-        let builder = RibbonBuilder::new(params, hasher.clone()).expect("builder should be valid");
-        let keys: Vec<u64> = (0..n as u64)
-            .map(|i| i.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(seed))
-            .collect();
-        let filter = builder
-            .build(&keys)
-            .expect("construction should succeed for generated case");
-        let mut scratch = filter.new_scratch();
-
-        for key in &keys {
-            assert!(
-                filter.contains_in(key, &mut scratch),
-                "false negative for case={case}, mode={mode}, w={w}, r={r}, seed={seed}, key={key}"
-            );
-        }
-    }
-}
-
-#[test]
-fn property_determinism_across_generated_cases() {
-    let hasher = DefaultBuildHasher::default();
-    let mut rng = 99u64;
-
-    for case in 0..16u64 {
-        let seed = lcg_next(&mut rng);
-        let n = 180 + (lcg_next(&mut rng) % 320) as usize;
-        let w_choices = [16usize, 64usize, 96usize];
-        let w = w_choices[(lcg_next(&mut rng) as usize) % w_choices.len()];
-        let r = if (lcg_next(&mut rng) & 1) == 0 { 8 } else { 12 };
-        let mode = if (lcg_next(&mut rng) & 1) == 0 {
-            Mode::Standard
-        } else {
-            Mode::Homogeneous
-        };
-
-        let params = Params::new((n * 5).max(w), w, r, mode)
-            .expect("params should be valid")
-            .with_seed(seed)
-            .with_retry_policy(4, 2)
-            .expect("retry policy should be valid");
-        let keys: Vec<u64> = (0..n as u64)
-            .map(|i| i.wrapping_mul(0xD6E8_FEB8_6659_FD93).wrapping_add(seed))
-            .collect();
-
-        let builder_a = RibbonBuilder::new(params, hasher.clone()).expect("builder a valid");
-        let builder_b = RibbonBuilder::new(params, hasher.clone()).expect("builder b valid");
-        let filter_a = builder_a.build(&keys).expect("build a should succeed");
-        let filter_b = builder_b.build(&keys).expect("build b should succeed");
-
-        let mut scratch_a = filter_a.new_scratch();
-        let mut scratch_b = filter_b.new_scratch();
-        for probe in 0..(n as u64 + 128) {
-            let q = probe.wrapping_mul(0x94D0_49BB_1331_11EB).wrapping_add(seed);
-            assert_eq!(
-                filter_a.contains_in(&q, &mut scratch_a),
-                filter_b.contains_in(&q, &mut scratch_b),
-                "determinism mismatch case={case}, mode={mode}, w={w}, r={r}, seed={seed}, q={q}"
-            );
-        }
-    }
-}
-
-fn adversarial_patterns(n: usize) -> Vec<(&'static str, Vec<u64>)> {
-    let ordered: Vec<u64> = (0..n as u64).collect();
-    let constant_low_bits: Vec<u64> = (0..n as u64).map(|i| (i << 16) | 0xFFFF).collect();
-    let stride_1024: Vec<u64> = (0..n as u64).map(|i| i * 1024).collect();
-    let gray_code: Vec<u64> = (0..n as u64).map(|i| i ^ (i >> 1)).collect();
-    let mul_mix_a: Vec<u64> = (0..n as u64)
-        .map(|i| i.wrapping_mul(0x9E37_79B9_7F4A_7C15))
+fn build_with_seed_verbatim_from_hashes_round_trips() {
+    // The entry point BuRR uses with xxh3-hashed LSM keys.
+    let params = Params::new(3000, 16, 9, Mode::Standard).expect("valid");
+    let builder = RibbonBuilder::new(params).expect("builder");
+    let hashes: Vec<u64> = (0..500_u64)
+        .map(|i| crate::hash::hash64(&i.to_le_bytes()))
         .collect();
-    let mul_mix_b: Vec<u64> = (0..n as u64)
-        .map(|i| i.wrapping_mul(0xD6E8_FEB8_6659_FD93))
-        .collect();
-
-    vec![
-        ("ordered_u64", ordered),
-        ("constant_low_bits", constant_low_bits),
-        ("stride_1024", stride_1024),
-        ("gray_code", gray_code),
-        ("mul_mix_a", mul_mix_a),
-        ("mul_mix_b", mul_mix_b),
-    ]
+    let filter = builder
+        .build_with_seed_verbatim_from_hashes(&hashes, 0x1234_5678_9ABC_DEF0, 3000)
+        .expect("verbatim-from-hashes build should land");
+    assert_eq!(filter.params().seed, 0x1234_5678_9ABC_DEF0);
 }
 
 #[test]
-fn adversarial_regression_corpus_has_no_false_negatives() {
-    let hasher = DefaultBuildHasher::default();
-    let n = 2000usize;
-
-    for (name, keys) in adversarial_patterns(n) {
-        let params = Params::new(8000, 16, 10, Mode::Standard)
-            .expect("params should be valid")
-            .with_seed(404)
-            .with_retry_policy(6, 2)
-            .expect("retry policy should be valid");
-        let builder = RibbonBuilder::new(params, hasher.clone()).expect("builder should be valid");
-        let filter = builder
-            .build(&keys)
-            .expect("construction should succeed for adversarial set");
-        let mut scratch = filter.new_scratch();
-
-        for key in &keys {
-            assert!(
-                filter.contains_in(key, &mut scratch),
-                "false negative in adversarial set '{name}' for key {key}"
-            );
+fn build_with_seed_verbatim_from_hashes_propagates_failure() {
+    // Hashes that overload a tight m must surface ConstructionFailed
+    // through the from-hashes wrapper — single-attempt contract.
+    let params = Params::new(16, 16, 8, Mode::Standard).expect("valid");
+    let builder = RibbonBuilder::new(params).expect("builder");
+    let hashes: Vec<u64> = (0..200_u64)
+        .map(|i| crate::hash::hash64(&i.to_le_bytes()))
+        .collect();
+    let result = builder.build_with_seed_verbatim_from_hashes(&hashes, 7, 16);
+    match result {
+        Err(BuildError::ConstructionFailed {
+            attempts, final_m, ..
+        }) => {
+            assert_eq!(attempts, 1);
+            assert_eq!(final_m, 16);
         }
+        Ok(_) => panic!("tight m=16 with 200 hashes must not build"),
+        Err(other) => panic!("expected ConstructionFailed, got {other:?}"),
     }
 }
 
 #[cfg(feature = "ribbon-serde")]
 #[test]
-fn serde_roundtrip_preserves_membership_behavior() {
-    let hasher = DefaultBuildHasher::default();
+fn serde_roundtrip_preserves_storage() {
     let params = Params::new(3000, 16, 10, Mode::Standard)
         .expect("params should be valid")
         .with_seed(4242);
-    let builder = RibbonBuilder::new(params, hasher).expect("builder should be valid");
-    let keys: Vec<u64> = (0..1000).collect();
-    let filter = builder.build(&keys).expect("build should succeed");
+    let builder = RibbonBuilder::new(params).expect("builder should be valid");
+    let hashes: Vec<u64> = (0..1000_u64)
+        .map(|i| crate::hash::hash64(&i.to_le_bytes()))
+        .collect();
+    let filter = builder
+        .build_with_seed_verbatim_from_hashes(&hashes, params.seed, 3000)
+        .expect("build should succeed");
 
     let repr = filter.to_repr();
     let encoded = serde_json::to_string(&repr).expect("serialize should succeed");
     let decoded_repr: super::RibbonFilterRepr =
         serde_json::from_str(&encoded).expect("deserialize should succeed");
-    let decoded = super::RibbonFilter::from_repr(decoded_repr, DefaultBuildHasher::default())
-        .expect("reconstructing filter should succeed");
+    let decoded =
+        super::RibbonFilter::from_repr(decoded_repr).expect("reconstructing filter should succeed");
 
-    let mut scratch_original = filter.new_scratch();
-    let mut scratch_decoded = decoded.new_scratch();
-    for probe in 0..1200u64 {
-        assert_eq!(
-            filter.contains_in(&probe, &mut scratch_original),
-            decoded.contains_in(&probe, &mut scratch_decoded),
-            "membership mismatch for probe {probe}"
-        );
-    }
+    // No on-disk change: the solution matrix and seed survive the round trip.
+    assert_eq!(filter.z_raw_words(), decoded.z_raw_words());
+    assert_eq!(filter.params().seed, decoded.params().seed);
 }
 
 #[cfg(feature = "ribbon-serde")]
 #[test]
 fn serde_rejects_unknown_filter_version() {
-    let hasher = DefaultBuildHasher::default();
     let params = Params::new(512, 16, 8, Mode::Standard)
         .expect("params should be valid")
         .with_seed(9);
-    let builder = RibbonBuilder::new(params, hasher).expect("builder should be valid");
-    let keys: Vec<u64> = (0..100).collect();
-    let filter = builder.build(&keys).expect("build should succeed");
+    let builder = RibbonBuilder::new(params).expect("builder should be valid");
+    let hashes: Vec<u64> = (0..100_u64)
+        .map(|i| crate::hash::hash64(&i.to_le_bytes()))
+        .collect();
+    let filter = builder
+        .build_with_seed_verbatim_from_hashes(&hashes, params.seed, 512)
+        .expect("build should succeed");
 
     let mut value = serde_json::to_value(filter.to_repr()).expect("serialize should succeed");
     value["version"] = serde_json::Value::from(99u64);
 
     let repr = serde_json::from_value::<super::RibbonFilterRepr>(value)
         .expect("deserializing repr should succeed");
-    let err = super::RibbonFilter::from_repr(repr, DefaultBuildHasher::default())
+    let err = super::RibbonFilter::from_repr(repr)
         .expect_err("reconstructing unknown version should fail");
     assert!(err.to_string().contains("unsupported RibbonFilter version"));
 }
@@ -785,25 +246,41 @@ fn serde_rejects_unknown_filter_version() {
 #[cfg(feature = "ribbon-serde")]
 #[test]
 fn serde_rejects_incorrect_storage_word_length() {
-    let hasher = DefaultBuildHasher::default();
     let params = Params::new(512, 16, 8, Mode::Standard)
         .expect("params should be valid")
         .with_seed(10);
-    let builder = RibbonBuilder::new(params, hasher).expect("builder should be valid");
-    let keys: Vec<u64> = (0..100).collect();
-    let filter = builder.build(&keys).expect("build should succeed");
+    let builder = RibbonBuilder::new(params).expect("builder should be valid");
+    let hashes: Vec<u64> = (0..100_u64)
+        .map(|i| crate::hash::hash64(&i.to_le_bytes()))
+        .collect();
+    let filter = builder
+        .build_with_seed_verbatim_from_hashes(&hashes, params.seed, 512)
+        .expect("build should succeed");
 
     let mut repr = filter.to_repr();
     let expected_words = repr.params.m * repr.params.fingerprint_words();
     let wrong_words = expected_words - 1;
     repr.z = vec![0_u64; wrong_words];
 
-    let err = super::RibbonFilter::from_repr(repr, DefaultBuildHasher::default())
+    let err = super::RibbonFilter::from_repr(repr)
         .expect_err("reconstructing invalid storage should fail");
     assert!(
         err.to_string()
             .contains("invalid RibbonFilter storage word length")
     );
+}
+
+#[test]
+fn construction_failure_out_of_bounds_display_contains_context() {
+    let err = super::ConstructionFailure::OutOfBounds {
+        key_index: Some(12),
+        row_index: 99,
+        m: 80,
+    };
+    let msg = err.to_string();
+    assert!(msg.contains("row index 99"));
+    assert!(msg.contains("m=80"));
+    assert!(msg.contains("key at index 12"));
 }
 
 #[test]
@@ -913,149 +390,4 @@ fn filter_repr_error_display_covers_variants() {
         }
     );
     assert!(s.contains('5') && s.contains("10"), "got: {s}");
-}
-
-#[test]
-fn build_with_seed_verbatim_succeeds_with_generous_m() {
-    // Direct exercise of `build_with_seed_verbatim` (the no-retry,
-    // verbatim-seed entry BuRR builds layers through). Generous m so a
-    // single attempt with the fixed seed lands.
-    let hasher = DefaultBuildHasher::default();
-    let params = Params::new(3000, 16, 9, Mode::Standard).expect("valid");
-    let builder = RibbonBuilder::new(params, hasher).expect("builder");
-    let keys: Vec<u64> = (0..500).collect();
-    let filter = builder
-        .build_with_seed_verbatim(&keys, 0xABCD_1234, 3000)
-        .expect("verbatim build should land at m=3000");
-    for k in &keys {
-        assert!(filter.contains(k), "false negative for {k}");
-    }
-    // Persisted seed must be the one we passed, not derive_attempt_seed-mixed.
-    assert_eq!(filter.params().seed, 0xABCD_1234);
-}
-
-#[test]
-fn build_with_seed_verbatim_reports_single_attempt_on_failure() {
-    // Tight m forces a build failure even with a verbatim seed.
-    // The error must carry attempts=1 (no retry budget on verbatim).
-    let hasher = DefaultBuildHasher::default();
-    let params = Params::new(16, 16, 8, Mode::Standard).expect("valid");
-    let builder = RibbonBuilder::new(params, hasher).expect("builder");
-    let keys: Vec<u64> = (0..200).collect();
-    let result = builder.build_with_seed_verbatim(&keys, 0xDEAD_BEEF, 16);
-    match result {
-        Err(BuildError::ConstructionFailed {
-            attempts, final_m, ..
-        }) => {
-            assert_eq!(attempts, 1, "verbatim must not retry");
-            assert_eq!(final_m, 16);
-        }
-        Ok(_) => panic!("tight m=16 with 200 keys should not build"),
-        Err(other) => panic!("expected ConstructionFailed, got {other:?}"),
-    }
-}
-
-#[test]
-fn build_with_seed_verbatim_from_hashes_round_trips() {
-    // Same as build_with_seed_verbatim but feeds raw u64 hashes — the
-    // entry point BuRR actually uses with xxh3-hashed LSM keys.
-    let bh = DefaultBuildHasher::default();
-    let params = Params::new(3000, 16, 9, Mode::Standard).expect("valid");
-    let builder = RibbonBuilder::new(params, bh).expect("builder");
-    let hashes: Vec<u64> = (0..500_u64)
-        .map(|i| crate::hash::hash64(&i.to_le_bytes()))
-        .collect();
-    let filter = builder
-        .build_with_seed_verbatim_from_hashes(&hashes, 0x1234_5678_9ABC_DEF0, 3000)
-        .expect("verbatim-from-hashes build should land");
-    assert_eq!(filter.params().seed, 0x1234_5678_9ABC_DEF0);
-}
-
-#[test]
-fn build_with_seed_verbatim_from_hashes_propagates_failure() {
-    // Hashes that overload a tight m must surface ConstructionFailed
-    // through the from-hashes wrapper too — same single-attempt
-    // contract as the key-based variant.
-    let bh = DefaultBuildHasher::default();
-    let params = Params::new(16, 16, 8, Mode::Standard).expect("valid");
-    let builder = RibbonBuilder::new(params, bh).expect("builder");
-    let hashes: Vec<u64> = (0..200_u64)
-        .map(|i| crate::hash::hash64(&i.to_le_bytes()))
-        .collect();
-    let result = builder.build_with_seed_verbatim_from_hashes(&hashes, 7, 16);
-    match result {
-        Err(BuildError::ConstructionFailed {
-            attempts, final_m, ..
-        }) => {
-            assert_eq!(attempts, 1);
-            assert_eq!(final_m, 16);
-        }
-        Ok(_) => panic!("tight m=16 with 200 hashes must not build"),
-        Err(other) => panic!("expected ConstructionFailed, got {other:?}"),
-    }
-}
-
-#[test]
-fn build_homogeneous_does_not_iterate_retries() {
-    // In Homogeneous mode the inner retry loop must break after the
-    // first attempt (the algorithm has no notion of retrying with a
-    // different seed). With retry_limit=5 we should see attempts=1 on
-    // failure, not 5.
-    let hasher = DefaultBuildHasher::default();
-    let params = Params::new(16, 16, 8, Mode::Homogeneous)
-        .expect("valid")
-        .with_seed(1)
-        .with_retry_policy(5, 0)
-        .expect("retry policy valid");
-    let builder = RibbonBuilder::new(params, hasher).expect("builder");
-    let keys: Vec<u64> = (0..200).collect();
-    let result = builder.build(&keys);
-    // Homogeneous "build" always succeeds on insertable input because
-    // unoccupied rows get random fingerprints. With m=16 << 200 keys
-    // the insertion loop should fail; if so, attempts must be 1.
-    if let Err(BuildError::ConstructionFailed { attempts, .. }) = result {
-        assert_eq!(attempts, 1, "Homogeneous must break after first attempt");
-    }
-    // If it succeeded, that's also fine — the break path was still
-    // exercised on the success arm via the loop's natural exit.
-}
-
-#[test]
-fn build_homogeneous_does_not_grow() {
-    // The outer grow loop must also short-circuit in Homogeneous mode:
-    // even with grow_limit=3 we should never grow m past the original.
-    let hasher = DefaultBuildHasher::default();
-    let params = Params::new(16, 16, 8, Mode::Homogeneous)
-        .expect("valid")
-        .with_seed(2)
-        .with_retry_policy(2, 3)
-        .expect("retry policy valid");
-    let builder = RibbonBuilder::new(params, hasher).expect("builder");
-    let keys: Vec<u64> = (0..200).collect();
-    if let Err(BuildError::ConstructionFailed { final_m, .. }) = builder.build(&keys) {
-        assert_eq!(final_m, 16, "Homogeneous must not grow m");
-    }
-}
-
-#[test]
-fn builder_terminal_failure_after_grow_exhausted() {
-    let hasher = DefaultBuildHasher::default();
-    // Tight: m=16, w=16 — small chance of single-attempt success. With
-    // grow_limit=0 + retry_limit=1 it should fail.
-    let params = Params::new(16, 16, 8, Mode::Standard)
-        .expect("valid")
-        .with_seed(123)
-        .with_retry_limit(1)
-        .expect("retry");
-    let builder = RibbonBuilder::new(params, hasher).expect("builder");
-    let keys: Vec<u64> = (0..16).collect();
-    let result = builder.build(&keys);
-    if let Err(super::error::BuildError::ConstructionFailed {
-        attempts, final_m, ..
-    }) = result
-    {
-        assert_eq!(attempts, 1);
-        assert_eq!(final_m, 16);
-    }
-    // Either succeeds or fails — both are valid; we just exercised the path.
 }

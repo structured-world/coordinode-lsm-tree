@@ -1,16 +1,14 @@
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
-use core::hash::{BuildHasher, Hash};
 
-use super::super::builder::Scratch;
 use super::super::filter::RibbonFilter;
-use super::super::hashing::{standard_equation_from_hash, standard_equation_w64};
+use super::super::hashing::standard_equation_from_hash;
 use super::super::params::{Mode, Params};
 use super::params::BurrParams;
 use super::threshold::is_bumped;
 
 /// One layer of a built BuRR filter.
-pub(crate) struct BurrLayer<S> {
+pub(crate) struct BurrLayer {
     /// Slot count for this layer (== ribbon's m). Kept here so we don't
     /// have to reach into ribbon.params() on every probe.
     pub(crate) m: usize,
@@ -25,10 +23,10 @@ pub(crate) struct BurrLayer<S> {
     /// Length = `m.div_ceil(b)`.
     pub(crate) thresholds: Vec<u8>,
     /// The vendored Ribbon filter holding this layer's KEPT keys.
-    pub(crate) ribbon: RibbonFilter<S>,
+    pub(crate) ribbon: RibbonFilter,
 }
 
-impl<S> core::fmt::Debug for BurrLayer<S> {
+impl core::fmt::Debug for BurrLayer {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("BurrLayer")
             .field("m", &self.m)
@@ -43,31 +41,14 @@ impl<S> core::fmt::Debug for BurrLayer<S> {
 /// (the bumped-from-layer-0 set), etc. A key is "present" if any layer's
 /// Ribbon body reports a match. False positives carry the FPR ≈ 2⁻ʳ of
 /// the underlying Ribbon layers.
-///
-/// The probe path is allocation-free after the initial `new_scratch` call
-/// (one `Scratch` is reused across layers — the largest layer's stride is
-/// used).
-pub struct BurrFilter<S> {
+pub struct BurrFilter {
     params: BurrParams,
-    /// Hasher used by the probe-time equation re-compute for the per-
-    /// layer bump-check. All `BurrLayer::ribbon`s were given clones of
-    /// this same hasher at build time, so hashes agree at the boundary
-    /// (`BuildHasher::hash_one` is deterministic for a given hasher
-    /// state).
-    hasher: S,
-    layers: Vec<BurrLayer<S>>,
+    layers: Vec<BurrLayer>,
 }
 
-impl<S> BurrFilter<S>
-where
-    S: BuildHasher + Clone,
-{
-    pub(crate) fn from_layers(params: BurrParams, hasher: S, layers: Vec<BurrLayer<S>>) -> Self {
-        Self {
-            params,
-            hasher,
-            layers,
-        }
+impl BurrFilter {
+    pub(crate) fn from_layers(params: BurrParams, layers: Vec<BurrLayer>) -> Self {
+        Self { params, layers }
     }
 
     /// Returns the layer count after construction. Useful for diagnostics
@@ -81,7 +62,7 @@ where
     /// wire-format encoder; `pub(crate)` so it doesn't leak into the
     /// public API.
     #[must_use]
-    pub(crate) fn layers_inner(&self) -> &[BurrLayer<S>] {
+    pub(crate) fn layers_inner(&self) -> &[BurrLayer] {
         &self.layers
     }
 
@@ -111,58 +92,11 @@ where
         self.params
     }
 
-    /// Returns a fresh `Scratch` sized for the largest layer's stride.
-    #[must_use]
-    pub fn new_scratch(&self) -> Scratch {
-        // All layers share the same r (fingerprint stride), so any
-        // layer's scratch is interchangeable.
-        match self.layers.first() {
-            Some(layer) => layer.ribbon.new_scratch(),
-            None => Scratch::new(0),
-        }
-    }
-
-    /// Returns `true` if the key may be present.
-    ///
-    /// MUST be paired with [`BurrBuilder::build`] (the key-based build
-    /// path): the probe hashes `key` via the filter's `BuildHasher` and
-    /// looks the hash up under the same hashing the builder used.
-    /// Calling `contains(&k)` on a filter built via
-    /// [`BurrBuilder::build_from_hashes`] is NOT valid — those filters
-    /// were built from caller-supplied u64 hashes that, in general, do
-    /// not equal `BuildHasher::hash_one(&k)`, and the probe will report
-    /// inserted keys as absent (false negative). Use
-    /// [`Self::contains_hash`] with the same u64 hashing the builder
-    /// used in that case.
-    pub fn contains<Q: Hash + ?Sized>(&self, key: &Q) -> bool {
-        let mut scratch = self.new_scratch();
-        self.contains_in(key, &mut scratch)
-    }
-
     /// Probe with a pre-computed u64 hash (e.g. xxh3 output from
-    /// `crate::hash::hash64`). Equivalent to `contains` when the caller
-    /// has already hashed the key — avoids re-running the
-    /// `BuildHasher` on the hot path.
-    ///
-    /// MUST be paired with [`BurrBuilder::build_from_hashes`]: a filter
-    /// built via `build(keys)` (which hashes with `BuildHasher`) is NOT
-    /// queryable by `contains_hash(h)` unless `h` is the
-    /// `BuildHasher::hash_one(key)` value. The on-disk LSM filter
-    /// always uses the hash-based build + probe pair so the two stay
+    /// `crate::hash::hash64`). The hash must be produced the same way
+    /// the builder's input hashes were (the on-disk LSM filter uses
+    /// `crate::hash::hash64` on both build and probe), so the two stay
     /// consistent.
-    ///
-    /// Note on probe-mode tagging: a previous reviewer asked whether
-    /// the construction mode (keyed vs hashed) should be encoded in
-    /// the type so that mismatched pairs fail fast at runtime. The
-    /// trade-off was considered and rejected: the in-tree LSM caller
-    /// uses [`BurrBuilder::build_from_hashes`] + `contains_hash`
-    /// exclusively (see the table filter pipeline), so the keyed API
-    /// has a single, well-defined call site (this crate's own tests
-    /// plus external callers who explicitly opt in). Adding a runtime
-    /// mode tag would cost an extra branch on every probe; splitting
-    /// into two filter types would bifurcate every consumer (writer,
-    /// reader, builder, wire codec) for no in-tree benefit. The
-    /// doc-comment contract above is the canonical guarantee.
     #[inline]
     #[expect(
         clippy::indexing_slicing,
@@ -226,82 +160,9 @@ where
         }
         false
     }
-
-    /// Allocation-free probe using a caller-provided scratch.
-    ///
-    /// Same pairing contract as [`Self::contains`]: only valid when
-    /// the filter was built via [`BurrBuilder::build`] (key-based
-    /// path). A filter built via [`BurrBuilder::build_from_hashes`]
-    /// must be probed with [`Self::contains_hash`] instead, otherwise
-    /// the probe reports inserted keys as absent.
-    ///
-    /// Walks layers descend-only: for each layer, recompute the equation
-    /// under that layer's seed+m and check the per-block threshold. If
-    /// the key would have been BUMPED at construction time
-    /// (`offset >= thresholds[block]`), continue to the next layer. Else
-    /// delegate to the layer's `RibbonFilter::contains_in` — which
-    /// re-derives the same equation internally and runs the GF(2) XOR-
-    /// reduce against the stored solution.
-    ///
-    /// The double equation work per kept-layer is the MVP cost
-    /// (correctness first); a follow-up can expose a `contains_with_eq`
-    /// path on `RibbonFilter` that reuses our pre-computed equation.
-    pub fn contains_in<Q: Hash + ?Sized>(&self, key: &Q, scratch: &mut Scratch) -> bool {
-        // Stack-sized throwaway fingerprint buffer reused across layers.
-        // `BurrParams::with_*` clamp `r` to 1..=64 so `stride` is 1; the
-        // assert pins the invariant.
-        debug_assert!(self.params.r <= 64, "BuRR params pin r <= 64");
-        let mut fp_throwaway = [0_u64; 1];
-        for layer in &self.layers {
-            // Build a Params reflecting this layer's m/w/r/seed so the
-            // equation-computation matches what the builder did.
-            let layer_params = match Params::new(
-                layer.m,
-                usize::from(self.params.w),
-                usize::from(self.params.r),
-                Mode::Standard,
-            ) {
-                Ok(p) => p.with_seed(layer.seed),
-                // Unreachable for built filters; fail closed defensively
-                // so a future param-validation regression yields a
-                // false positive (caller does an index lookup) rather
-                // than a false negative.
-                Err(_) => return true,
-            };
-
-            // Re-hash to learn this layer's `start` and decide bump.
-            // Throwaway fingerprint; the real probe uses `scratch`
-            // inside `ribbon.contains_in`. The hasher is the one
-            // BurrFilter holds — all layers' RibbonFilters were given
-            // clones of THIS hasher at build time, so hashes agree by
-            // construction (BuildHasher is deterministic).
-            fp_throwaway[0] = 0;
-            let equation = standard_equation_w64(
-                &self.hasher,
-                key,
-                layer.seed,
-                &layer_params,
-                &mut fp_throwaway,
-            );
-
-            if is_bumped(&equation, &layer.thresholds, self.params.b) {
-                // Bumped at build time → not in this layer's ribbon;
-                // continue to the next layer.
-                continue;
-            }
-
-            // Kept at this layer → ribbon authoritatively decides.
-            return layer.ribbon.contains_in(key, scratch);
-        }
-        // Walked all layers without finding a non-bumped layer — would
-        // only happen if the input was never inserted in any layer
-        // (i.e. a non-member key whose hash always lands at a bumped
-        // offset). Definite-not-present.
-        false
-    }
 }
 
-impl<S> core::fmt::Debug for BurrFilter<S> {
+impl core::fmt::Debug for BurrFilter {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("BurrFilter")
             .field("params", &self.params)
@@ -360,7 +221,7 @@ impl<'a> BurrFilterReader<'a> {
     /// Probe with a pre-computed key hash. Used by the LSM filter
     /// framework's `block::FilterBlock` — the table read path already
     /// computes a u64 hash for block indexing, and the filter consumes
-    /// that same hash directly (no re-hash via `BuildHasher`).
+    /// that same hash directly (no re-hashing).
     #[inline]
     #[must_use]
     pub fn contains_hash(&self, hash: u64) -> bool {

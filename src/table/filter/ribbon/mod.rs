@@ -84,8 +84,8 @@
 //! equations (smaller storage at the cost of slightly higher false-positive
 //! rate at small `r`).
 //!
-//! See [`Params::new`] for the entry point and [`RibbonBuilder::build`] for
-//! the construction call.
+//! See [`Params::new`] for the entry point; ribbons are constructed from
+//! pre-hashed keys via `RibbonBuilder::build_with_seed_verbatim_from_hashes`.
 
 pub mod builder;
 pub mod burr;
@@ -94,7 +94,7 @@ pub mod filter;
 pub mod hashing;
 pub mod params;
 
-pub use builder::{RibbonBuilder, Scratch};
+pub use builder::RibbonBuilder;
 pub use error::{BuildError, ConstructionFailure, FilterReprError, ParamError};
 pub use filter::RibbonFilter;
 #[cfg(feature = "ribbon-serde")]

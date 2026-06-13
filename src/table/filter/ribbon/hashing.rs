@@ -1,6 +1,3 @@
-use core::hash::BuildHasher;
-use core::hash::Hash;
-
 use super::params::{Mode, Params};
 
 const MIX_CONST: u64 = 0x9E37_79B9_7F4A_7C15;
@@ -64,28 +61,11 @@ pub(crate) fn start_position_from_stream(next_word: u64, m: usize, w: usize) -> 
     fastrange_u64(next_word, start_range)
 }
 
-pub(crate) fn derive_attempt_seed(base_seed: u64, attempt_index: u64) -> u64 {
-    let mut sm = SplitMix64::new(base_seed ^ attempt_index.wrapping_mul(MIX_CONST));
-    sm.next_u64().wrapping_mul(MIX_CONST)
-}
-
-pub(crate) fn standard_equation_w64<S: BuildHasher, Q: Hash + ?Sized>(
-    build_hasher: &S,
-    key: &Q,
-    seed: u64,
-    params: &Params,
-    fingerprint: &mut [u64],
-) -> StandardEquation {
-    let base_hash = build_hasher.hash_one(key);
-    standard_equation_from_hash(base_hash, seed, params, fingerprint)
-}
-
 /// Compute the equation directly from a pre-computed key hash.
 ///
-/// This is the inner loop of [`standard_equation_w64`], factored out so
-/// the BuRR wire-format probe path (which consumes pre-hashed inputs from
-/// the LSM filter framework) can skip the `build_hasher.hash_one(key)`
-/// step entirely.
+/// The LSM filter framework hands in keys already hashed to a stable
+/// `u64` (xxh3 / `crate::hash::hash64`), so the ribbon never hashes keys
+/// itself — this is the sole equation entry point.
 #[expect(
     clippy::inline_always,
     reason = "called per layer on the BuRR filter probe hot path; inlining lets LLVM fold the \

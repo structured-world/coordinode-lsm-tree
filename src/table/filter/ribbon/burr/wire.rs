@@ -35,7 +35,6 @@
 
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
-use core::hash::BuildHasher;
 
 use crate::io::Cursor;
 use crate::io::{LittleEndian, ReadBytesExt, WriteBytesExt};
@@ -70,10 +69,7 @@ const HEADER_LEN: usize = MAGIC_BYTES.len() + 6 + 8;
 const LAYER_HEADER_LEN: usize = 12;
 
 /// Serialize a built [`BurrFilter`] into the wire format.
-pub(crate) fn encode<S>(filter: &BurrFilter<S>) -> Vec<u8>
-where
-    S: BuildHasher + Clone,
-{
+pub(crate) fn encode(filter: &BurrFilter) -> Vec<u8> {
     let params = filter.params();
     let layers = filter.layers_inner();
 
@@ -507,7 +503,7 @@ pub(crate) fn contains_hash_from_bytes(bytes: &[u8], hash: u64) -> crate::Result
 /// This is the hot path for the LSM filter framework: the table read
 /// path already computes the key's u64 hash for hash-table indexing
 /// elsewhere; the filter consumes that same hash directly instead of
-/// re-hashing via a `BuildHasher`.
+/// re-hashing.
 #[inline]
 pub(crate) fn contains_hash(decoded: &DecodedFilter<'_>, hash: u64) -> bool {
     // r is validated to 1..=64 in decode, so stride_words is always 1
