@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1781239408764,
+  "lastUpdate": 1781317385564,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -15288,6 +15288,84 @@ window.BENCHMARK_DATA = {
             "value": 515676.96521094424,
             "unit": "ops/sec",
             "extra": "P50: 1.7us | P99: 6.1us | P99.9: 9.3us\nthreads: 1 | elapsed: 0.39s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "d2c9685ee8e3999fccd75e54794541680803bdb8",
+          "message": "chore: io/sfa test coverage, drop upstream tracking, bump structured-zstd (#453)\n\n## Summary\n\nMaintenance bundle:\n\n- **Test coverage** for the in-tree `crate::io` byteorder/error bridge\nand `sfa::Error`. Closes the codecov patch gap left after the no_std\nmerge: the std-compiled lines in `src/io/mod.rs` (`From`-bridge arms,\n`BigEndian`/`ByteOrder` helpers, `ReadBytesExt` float reads, `ErrorKind`\nDisplay) plus the `sfa::Error` From/source/Display surface.\n- **Drop upstream tracking.** The fork has diverged well beyond\nfjall-rs/lsm-tree and no longer tracks or contributes upstream. Removes\nthe daily Upstream Monitor workflow and retires the `upstream-candidate`\n/ `upstream-sync` / `fork-only` issue labels.\n- **Drop the dedicated `test-zstd` CI job.** zstd is a feature gate and\nits tests are `#[cfg(feature)]`-gated, so they already run in the\n`--all-features` `test` matrix (which pulls `structured-zstd` with the\n`lsm` feature). The separate narrow-feature job was redundant.\n- **Bump `structured-zstd` 0.0.34 -> 0.0.36** (API-compatible).\n\n## Changes\n\n- `src/io/mod.rs` — exhaustive `ErrorKind` bridge round-trips +\nbyteorder width / `ErrorKind` Display tests; `ReadBytesExt` float reads\ncompared by `to_bits()` (exact, avoids `float_cmp`)\n- `src/sfa/error.rs` — `From`/`source`/`Display` tests (one uses a\n`matches!` guard, no unreachable arm)\n- `.github/workflows/upstream-monitor.yml` — removed\n- `.github/workflows/coordinode-ci.yml` — dropped the `test-zstd` job\n- `.github/copilot-instructions.md` — removed the Project Overview\nsection (it belongs in the README, which already carries it) and a stray\n`in fjall` note\n- `Cargo.toml` — `structured-zstd` 0.0.36\n\n## Testing\n\n- Full lib suite green (`cargo nextest run --lib --all-features`),\nincluding the zstd/compression/dict tests against 0.0.36\n- `cargo clippy --all-features -- -D warnings` and `cargo clippy\n--all-features --all-targets -- -D warnings` clean\n- `no-std-check` (`thumbv7em-none-eabihf --no-default-features\n--features alloc`) stays at 0 errors\n\n## Notes\n\n#396 (size-based single-level index) and #398 (cache-managed\nsingle-level index + 4 MiB spill threshold) are already implemented on\n`main`: `AdaptiveIndexWriter` selects single-level vs two-level by index\nsize, `VolatileBlockIndex` is the cache-managed (evictable) single-level\npath used on deep levels, and the 4 MiB `DEFAULT_SPILL_THRESHOLD` landed\nin #399. Both issues are closed as done.\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n\n## Summary by CodeRabbit\n\n## Release Notes\n\n* **Tests**\n* Added comprehensive unit tests for byte-order handling and error\nscenarios.\n\n* **Chores**\n  * Updated structured-zstd dependency to version 0.0.36.\n  * Streamlined CI workflow by consolidating test execution stages.\n  * Removed upstream monitoring automation.\n\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-06-13T05:22:11+03:00",
+          "tree_id": "e1069a1f7154a822e898bd7a7d2ebc0ea60a8371",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/d2c9685ee8e3999fccd75e54794541680803bdb8"
+        },
+        "date": 1781317379135,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 2068826.7417703185,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.6us | P99.9: 3.7us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1171979.9952156262,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.2us | P99.9: 4.4us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 665927.997134645,
+            "unit": "ops/sec",
+            "extra": "P50: 1.4us | P99: 4.5us | P99.9: 7.0us\nthreads: 1 | elapsed: 0.30s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3775602.5734280604,
+            "unit": "ops/sec",
+            "extra": "P50: 0.1us | P99: 3.1us | P99.9: 5.6us\nthreads: 1 | elapsed: 0.05s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 443949.43391974387,
+            "unit": "ops/sec",
+            "extra": "P50: 2.0us | P99: 5.3us | P99.9: 8.2us\nthreads: 1 | elapsed: 0.45s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 225561.4983015456,
+            "unit": "ops/sec",
+            "extra": "P50: 4.1us | P99: 5.2us | P99.9: 8.9us\nthreads: 1 | elapsed: 0.89s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1244028.283256706,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.3us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1165131.5960794021,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 1.5us | P99.9: 2.7us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 555241.6697279685,
+            "unit": "ops/sec",
+            "extra": "P50: 1.6us | P99: 6.0us | P99.9: 9.5us\nthreads: 1 | elapsed: 0.36s | num: 200000 | iterations: 3"
           }
         ]
       }
