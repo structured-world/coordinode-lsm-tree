@@ -45,6 +45,10 @@ use crate::{
 };
 use std::{path::PathBuf, sync::Arc};
 
+/// Per-file repair failures: `(path, human-readable reason)`. Mirrors
+/// [`RepairReport::unreadable_files`].
+type UnreadableFiles = Vec<(PathBuf, String)>;
+
 /// Outcome of a [`Config::repair`] run.
 ///
 /// `recovered` plus `unreadable` accounts for every SST-named file the scan
@@ -136,6 +140,83 @@ fn quarantine_file(
     Ok(dest)
 }
 
+/// Discovers the blob files of a KV-separated tree for `repair` by scanning the
+/// single `blobs/` folder, with no manifest id list to filter against.
+///
+/// Mirrors the table scan in [`repair_tree`]: a non-numeric name is quarantined
+/// out of `blobs/` (the reopened tree's blob recovery parses every name and
+/// would abort on a bad one); a blob file that cannot be checksummed or whose
+/// metadata is unreadable is reported and left in place (it reads back as a
+/// harmless orphan on the next open). The recovered checksum is the whole-file
+/// XXH3-128 digest, identical to the one the blob writer accumulated via
+/// `ChecksummedWriter`, since blob files are written strictly sequentially.
+///
+/// Returns the recovered blob files and the per-file failure reasons (merged
+/// into the repair report's `unreadable_files`).
+fn recover_blob_files(
+    config: &Config,
+) -> crate::Result<(Vec<crate::vlog::BlobFile>, UnreadableFiles)> {
+    let blobs_folder = config.path.join(crate::file::BLOBS_FOLDER);
+    let mut blob_files: Vec<crate::vlog::BlobFile> = Vec::new();
+    let mut unreadable: UnreadableFiles = Vec::new();
+
+    // No `blobs/` folder = no blob files (a blob tree that never spilled a value
+    // to the value log). Nothing to recover; the manifest records an empty list.
+    if !config.fs.exists(&blobs_folder)? {
+        return Ok((blob_files, unreadable));
+    }
+
+    // Guard against the same id surfacing twice (symlinked / aliased entries).
+    let mut seen_ids: crate::HashSet<crate::vlog::BlobFileId> = crate::HashSet::default();
+
+    for dirent in config.fs.read_dir(&blobs_folder)? {
+        let crate::fs::FsDirEntry {
+            path: blob_path,
+            file_name,
+            is_dir,
+        } = dirent;
+
+        if is_dir || file_name == ".DS_Store" || file_name.starts_with("._") {
+            continue;
+        }
+
+        let Ok(blob_id) = file_name.parse::<crate::vlog::BlobFileId>() else {
+            let reason = match quarantine_file(&*config.fs, &blobs_folder, &blob_path, &file_name) {
+                Ok(dest) => format!(
+                    "file name is not a blob id; quarantined to {}",
+                    dest.display()
+                ),
+                Err(e) => format!("file name is not a blob id; quarantine failed: {e}"),
+            };
+            unreadable.push((blob_path, reason));
+            continue;
+        };
+
+        if !seen_ids.insert(blob_id) {
+            continue;
+        }
+
+        let checksum = match compute_table_checksum(&*config.fs, &blob_path) {
+            Ok(c) => crate::Checksum::from_raw(c),
+            Err(e) => {
+                seen_ids.remove(&blob_id);
+                unreadable.push((blob_path, e.to_string()));
+                continue;
+            }
+        };
+
+        match crate::vlog::recover_blob_file(&blob_path, blob_id, checksum, 0, &config.fs) {
+            Ok(bf) => blob_files.push(bf),
+            Err(e) => {
+                seen_ids.remove(&blob_id);
+                unreadable.push((blob_path, e.to_string()));
+            }
+        }
+    }
+
+    Ok((blob_files, unreadable))
+}
+
 impl Config {
     /// Rebuilds the `MANIFEST` for the tree at this config's path from the SST
     /// files present on disk, then returns a [`RepairReport`].
@@ -190,16 +271,6 @@ impl Config {
 /// Core repair routine. Separated from the [`Config::repair`] entry point so the
 /// logic is testable against a borrowed config.
 fn repair_tree(config: &Config) -> crate::Result<RepairReport> {
-    if config.kv_separation_opts.is_some() {
-        // The blob manifest also records per-blob-file fragmentation stats that
-        // a directory scan cannot reconstruct; supporting it needs its own
-        // design (tracked in #408). Fail loudly rather than write a manifest
-        // that drops blobs.
-        return Err(crate::Error::FeatureUnsupported(
-            "repair of KV-separated (blob) trees",
-        ));
-    }
-
     // Hold the cross-process directory lock for the whole repair: it rewrites
     // CURRENT, writes a fresh snapshot, and sweeps `edits-*` in place, so a
     // concurrent open / repair of the same directory would corrupt the manifest.
@@ -332,11 +403,32 @@ fn repair_tree(config: &Config) -> crate::Result<RepairReport> {
     let version_id = highest_existing_version_id(&*config.fs, &config.path)?
         .map_or(0, |max| max.saturating_add(1));
 
+    // KV-separated (blob) trees additionally carry a blob-file list. Discover the
+    // blob files from the `blobs/` folder (no manifest to filter against) and
+    // record them in the rebuilt manifest with the matching `TreeType::Blob` so
+    // the tree reopens (the reopened tree's type must match its config's
+    // `kv_separation_opts`). Fragmentation stats are NOT reconstructable from a
+    // directory scan (they are derived from compaction history), so they start
+    // empty: blob GC is advisory and re-learns them over time. The empty start
+    // never drops live data; it only resets GC's view of reclaimable space.
+    let (tree_type, blob_file_list) = if config.kv_separation_opts.is_some() {
+        let (blob_files, blob_unreadable) = recover_blob_files(config)?;
+        unreadable_files.extend(blob_unreadable);
+        let map: crate::HashMap<crate::vlog::BlobFileId, crate::vlog::BlobFile> =
+            blob_files.into_iter().map(|bf| (bf.id(), bf)).collect();
+        (TreeType::Blob, BlobFileList::new(map))
+    } else {
+        (
+            TreeType::Standard,
+            BlobFileList::new(crate::HashMap::default()),
+        )
+    };
+
     let version = Version::from_levels(
         version_id,
-        TreeType::Standard,
+        tree_type,
         levels,
-        BlobFileList::new(crate::HashMap::default()),
+        blob_file_list,
         crate::blob_tree::FragmentationMap::default(),
     );
 
@@ -372,15 +464,22 @@ fn repair_tree(config: &Config) -> crate::Result<RepairReport> {
         }
     }
 
+    let mut warnings = vec![
+        "All recovered tables placed at L0; background compaction will redistribute them",
+        "Recent unlogged version edits (in-flight compactions, recent deletions) are lost",
+    ];
+    if config.kv_separation_opts.is_some() {
+        warnings.push(
+            "Blob fragmentation stats reset to empty; blob GC will re-learn reclaimable space over time",
+        );
+    }
+
     Ok(RepairReport {
         recovered,
         unreadable: unreadable_files.len(),
         unreadable_files,
         method: "all-to-L0 with sequence-number ordering",
-        warnings: vec![
-            "All recovered tables placed at L0; background compaction will redistribute them",
-            "Recent unlogged version edits (in-flight compactions, recent deletions) are lost",
-        ],
+        warnings,
     })
 }
 

@@ -172,7 +172,8 @@ enum Command {
     /// Uses the default comparator and no encryption: a tree created
     /// with a custom comparator or with encryption must be repaired via
     /// the library `Config::repair` API with the matching config.
-    /// KV-separated (blob) trees are not supported by repair.
+    /// A KV-separated (blob) tree is detected by its `blobs/` folder and
+    /// repaired with KV separation enabled so its blob files are recovered.
     Repair,
 
     /// Print sizing stats for the SST's BuRR filter: on-disk filter
@@ -266,13 +267,22 @@ fn main() -> ExitCode {
 }
 
 fn run_repair(db_dir: &std::path::Path) -> ExitCode {
-    use lsm_tree::{Config, SequenceNumberCounter};
+    use lsm_tree::{Config, KvSeparationOptions, SequenceNumberCounter};
 
-    let config = Config::new(
+    let mut config = Config::new(
         db_dir,
         SequenceNumberCounter::default(),
         SequenceNumberCounter::default(),
     );
+
+    // A `blobs/` folder marks a KV-separated (blob) tree. Enable KV separation so
+    // repair rediscovers the blob files and records the matching tree type;
+    // without it, repair would rebuild a standard-tree manifest and drop the
+    // blobs. The separation options only affect future writes, so defaults are
+    // fine for recovery.
+    if db_dir.join("blobs").is_dir() {
+        config = config.with_kv_separation(Some(KvSeparationOptions::default()));
+    }
 
     let report = match config.repair() {
         Ok(report) => report,
