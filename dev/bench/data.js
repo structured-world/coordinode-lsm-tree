@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1781326038947,
+  "lastUpdate": 1781335045816,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -15442,6 +15442,84 @@ window.BENCHMARK_DATA = {
           {
             "name": "readwhilewriting",
             "value": 563703.7762022727,
+            "unit": "ops/sec",
+            "extra": "P50: 1.6us | P99: 5.0us | P99.9: 7.7us\nthreads: 1 | elapsed: 0.35s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "c6c350a712c3f4451665141a92fb05a93c36ab0b",
+          "message": "feat(ecc): patrol scrub for proactive latent-error correction (#456)\n\n## Summary\n\nAdds an **ECC patrol scrub**: a proactive background sweep over\nPage-ECC-protected SSTs that reads (cold) data blocks straight from\ndisk, corrects single-block bit-rot via the live verify+correct path\n(SEC-DED single-bit fast path → Reed-Solomon shard recovery), and — when\n`auto_heal` is on — schedules a healing recompaction of any SST that\nneeded correction. Uncorrectable blocks are reported and logged, never\nsilently skipped.\n\nThis is the storage-engine analogue of ECC-RAM patrol scrub / `zpool\nscrub`: it catches an isolated correctable fault before a second fault\nin the same block pushes it past the parity budget into unrecoverable\nterritory.\n\n## Design: a primitive, not a daemon\n\n`scrub::patrol_scrub(tree, &PatrolScrubOptions) -> PatrolScrubReport` is\nthe sweep pass. The **cadence** and **leader-only** gating in a\nclustered deployment stay the caller's concern, mirroring the existing\nauto-heal split (`EccHeal` + `heal_hints`): the engine provides the\nprimitive, the consumer schedules it leader-only. No built-in thread,\n**no manifest/format change** — `auto_heal` (a runtime field) already\ngates the rewrite-scheduling half.\n\n- Scope = **data blocks** (the cold bulk where latent rot lives;\nindex/filter/meta are pinned and verified at open).\n- **Cache-bypass in both directions**: re-reads the medium (a cached\nclean copy would hide an on-disk fault) and never evicts the live\nworking set with cold blocks.\n- Honours a per-worker throttle + configurable parallelism so a scrub\ndoesn't starve production I/O. Off by default (only runs when called).\n\n## Changes\n\n- `scrub::{patrol_scrub, PatrolScrubOptions, PatrolScrubReport,\nScrubError}` (new module, std-gated like `verify`/`inspect`)\n- `Table::scrub_data_blocks` + cache-bypassing `scrub_block` primitive\nreusing the live ECC-correct + heal-record path\n- `maybe_record_persistent_heal` now returns whether it newly scheduled\na heal, so the scrub counts distinct SSTs queued\n- Bumps `structured-zstd` 0.0.36 → 0.0.37\n\n## Testing\n\n- 10 new scrub tests, incl. 4 ECC scenarios: corrects a seeded\nsingle-bit fault + schedules the rewrite (metric counted);\ncorrects-but-does-not-schedule when `auto_heal` is off; reports an\nuncorrectable (over-budget) block rather than skipping it; clean tree\nreports no findings. Plus report/options unit tests, clean non-ECC\nscrub, empty tree, and parallel multi-SST.\n- Full suite `--all-features`: 2056 passed.\n- `clippy --all-features --all-targets -D warnings`: clean. no-std\n`alloc` build: 0 errors (all new code std-gated). Doctests pass.\n\nCloses #412\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n\n## Summary by CodeRabbit\n\n* **New Features**\n* Added patrol scrub to proactively detect and correct latent data\ncorruption\n  * Configurable parallelism and throttling for scrub performance tuning\n* Comprehensive reporting on scanned blocks, corrections applied, and\nuncorrectable issues\n\n* **Chores**\n  * Updated structured-zstd dependency to version 0.0.37\n\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-06-13T10:16:28+03:00",
+          "tree_id": "7ff2a21f226879561348b8e4e809a5c3bc64c433",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/c6c350a712c3f4451665141a92fb05a93c36ab0b"
+        },
+        "date": 1781335036954,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 1899480.1198891068,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.6us | P99.9: 3.8us\nthreads: 1 | elapsed: 0.11s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1202615.8385732607,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.7us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 656908.1666590077,
+            "unit": "ops/sec",
+            "extra": "P50: 1.4us | P99: 4.6us | P99.9: 7.6us\nthreads: 1 | elapsed: 0.30s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3660824.801765879,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 3.1us | P99.9: 5.7us\nthreads: 1 | elapsed: 0.05s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 422961.905663156,
+            "unit": "ops/sec",
+            "extra": "P50: 2.0us | P99: 5.5us | P99.9: 8.9us\nthreads: 1 | elapsed: 0.47s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 225048.94575455657,
+            "unit": "ops/sec",
+            "extra": "P50: 4.1us | P99: 5.2us | P99.9: 10.0us\nthreads: 1 | elapsed: 0.89s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1278281.564165657,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.0us | P99.9: 4.1us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1160478.6800483398,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 1.4us | P99.9: 2.6us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 567684.6167709886,
             "unit": "ops/sec",
             "extra": "P50: 1.6us | P99: 5.0us | P99.9: 7.7us\nthreads: 1 | elapsed: 0.35s | num: 200000 | iterations: 3"
           }
