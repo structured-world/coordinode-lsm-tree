@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1781317385564,
+  "lastUpdate": 1781326038947,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -15366,6 +15366,84 @@ window.BENCHMARK_DATA = {
             "value": 555241.6697279685,
             "unit": "ops/sec",
             "extra": "P50: 1.6us | P99: 6.0us | P99.9: 9.5us\nthreads: 1 | elapsed: 0.36s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "0988072fdaa7a16c1d0d81807bfde3cd57245530",
+          "message": "refactor(filter): remove dead from-keys BuildHasher path from vendored ribbon (#455)\n\n## Summary\n\nStrip the dead from-keys `BuildHasher` surface from the vendored ribbon\nfilter (`src/table/filter/ribbon/`). The LSM filter path always\npre-hashes keys with xxh3 (`crate::hash::hash64`) and builds via\n`build_from_hashes` / probes via `contains_hash`, so the generic `S:\nBuildHasher` slot and the key-hashing construction/query API were never\nexercised.\n\n## Changes\n\n- Drop the `S` generic from `RibbonBuilder`, `RibbonFilter`,\n`BurrBuilder`, `BurrFilter`, `BurrLayer`, and delete the phantom\n`FilterHasher = BuildHasherDefault<FxHasher>` in `filter/mod.rs`.\n- Remove the from-keys surface: `RibbonBuilder::build` /\n`build_with_seed_verbatim`, `BurrBuilder::build`,\n`RibbonFilter::contains` / `contains_in`, `BurrFilter::contains` /\n`contains_in`, and `standard_equation_w64`.\n- Remove the now-dead `Scratch` / `new_scratch` / `derive_attempt_seed`\nmachinery that only the removed key-based probe used.\n- Rebuild the ribbon and BuRR test suites against the\n`build_from_hashes` + `contains_hash` pair (membership coverage lives at\nthe BuRR level, which is the only queryable surface).\n\n## Outcome\n\n- Simpler types: one fewer type parameter on every filter struct, no\n`BuildHasher` dependency.\n- ~1500 lines of dead code removed.\n- **No behavioural or on-disk change** — the hasher was never invoked on\nthe build-from-hashes path the crate actually uses.\n\n## Testing\n\n- `cargo nextest run --lib --all-features` — 1412 pass (incl. 122\nribbon/BuRR filter tests)\n- `cargo clippy --all-features -- -D warnings` clean; benches compile\n- `cargo test --doc --features lz4` — 47 pass\n- `no-std-check` (`thumbv7em-none-eabihf --no-default-features\n--features alloc`) — 0 errors\n\nCloses #450\n\n## Also: CI clippy now lints test + bench targets\n\nFound in review: the strict clippy job ran `--all-features` **without**\n`--all-targets`, so test-harness and bench code was never clippy-checked\nunder the full feature set (the only `--all-targets` job ran a narrow\n`--no-default-features --features zstd,lz4` subset that cfg'd the\nencryption / ECC tests out, and was since removed). This left 8 latent\nclippy violations in real tests that no CI job caught.\n\nThis PR adds `--all-targets` to the `lint` job and clears those\nviolations (`significant_drop_tightening`, `indexing_slicing`,\n`cast_possible_truncation`, `expect_used`) in `compaction/heal.rs`,\n`encryption/block.rs`, and `table/tests.rs`. The tests are valid; only\nthe wiring was incomplete.\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n\n## Summary by CodeRabbit\n\n* **Refactor**\n* Simplified the internal filter builder API by removing generic hasher\nparameter requirements, streamlining filter construction from\npre-computed hashes.\n\n* **Chores**\n  * Updated CI workflow to lint additional code paths and test targets.\n* Added clippy warning annotations throughout test code for improved\ncode quality.\n\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-06-13T07:46:21+03:00",
+          "tree_id": "cedf43834dff58accf6ef838643642ed70eb2bf5",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/0988072fdaa7a16c1d0d81807bfde3cd57245530"
+        },
+        "date": 1781326031328,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 1914764.1402627155,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.7us | P99.9: 3.7us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1208704.7166710023,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.3us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 675026.2707567835,
+            "unit": "ops/sec",
+            "extra": "P50: 1.3us | P99: 4.6us | P99.9: 7.1us\nthreads: 1 | elapsed: 0.30s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3728508.9906935487,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 3.1us | P99.9: 5.7us\nthreads: 1 | elapsed: 0.05s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 435117.17691433,
+            "unit": "ops/sec",
+            "extra": "P50: 2.0us | P99: 5.3us | P99.9: 8.4us\nthreads: 1 | elapsed: 0.46s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 227392.20689023446,
+            "unit": "ops/sec",
+            "extra": "P50: 4.1us | P99: 5.2us | P99.9: 7.6us\nthreads: 1 | elapsed: 0.88s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1231261.083581413,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.3us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1169947.8331375709,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 1.5us | P99.9: 2.7us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 563703.7762022727,
+            "unit": "ops/sec",
+            "extra": "P50: 1.6us | P99: 5.0us | P99.9: 7.7us\nthreads: 1 | elapsed: 0.35s | num: 200000 | iterations: 3"
           }
         ]
       }
