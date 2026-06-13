@@ -18,7 +18,7 @@ pub struct BurrParams {
     /// `w=64` band assumes single-word `b` vectors).
     pub r: u8,
     /// Band width — fixed at 64 to match the vendored Ribbon
-    /// `standard_equation_w64` solver.
+    /// `standard_equation_from_hash` solver.
     pub w: u8,
     /// Block size (rows per block, drives the per-block threshold byte).
     /// Default 64; must be ≤ 255 so the threshold fits one byte.

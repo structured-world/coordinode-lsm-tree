@@ -7,22 +7,7 @@ pub mod ribbon;
 
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
-use core::hash::BuildHasherDefault;
 use ribbon::burr::{BurrBuilder, BurrParams};
-use rustc_hash::FxHasher;
-
-/// Hasher type embedded in `BuRR` filters. Only its type identity is used —
-/// the construction + probe paths in this crate go through
-/// `BurrBuilder::build_from_hashes` / `BurrFilter::contains_hash` /
-/// `BurrFilterReader::contains_hash`, all of which take pre-computed u64
-/// hashes (xxh3 via `crate::hash::hash64`) and never invoke the
-/// `BuildHasher`. The type slot exists only to satisfy the vendored
-/// ribbon-filter's generic `S: BuildHasher` bound; the concrete hasher is
-/// never constructed or called, so the choice has no on-disk or runtime
-/// effect. `FxHasher` (a no_std-capable hasher already in the dependency
-/// tree) replaces the std-only `DefaultHasher` purely to keep this module
-/// off `std`.
-type FilterHasher = BuildHasherDefault<FxHasher>;
 
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub enum BloomConstructionPolicy {
@@ -111,8 +96,7 @@ pub(crate) fn build_burr_filter_bytes(
     let Some(params) = policy.burr_params(hashes.len()) else {
         return Ok(Vec::new());
     };
-    let build_hasher = FilterHasher::default();
-    let builder = BurrBuilder::new(params, build_hasher).map_err(|e| {
+    let builder = BurrBuilder::new(params).map_err(|e| {
         log::error!("BuRR builder init failed: {e:?}");
         crate::Error::Unrecoverable
     })?;

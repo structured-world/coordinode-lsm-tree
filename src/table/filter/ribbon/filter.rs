@@ -1,11 +1,8 @@
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
-use core::hash::{BuildHasher, Hash};
 
-use super::builder::Scratch;
 #[cfg(feature = "ribbon-serde")]
 use super::error::FilterReprError;
-use super::hashing::{for_each_set_bit_u128_parts, standard_equation_w64, xor_words};
 use super::params::Params;
 
 #[cfg(feature = "ribbon-serde")]
@@ -30,82 +27,18 @@ pub struct RibbonFilterRepr {
 }
 
 #[derive(Debug, Clone)]
-pub struct RibbonFilter<S> {
+pub struct RibbonFilter {
     params: Params,
-    build_hasher: S,
     z: Vec<u64>,
-    stride_words: usize,
 }
 
-impl<S> RibbonFilter<S>
-where
-    S: BuildHasher + Clone,
-{
-    pub(crate) fn new(params: Params, build_hasher: S, z: Vec<u64>) -> Self {
-        let stride_words = params.fingerprint_words();
-        Self {
-            params,
-            build_hasher,
-            z,
-            stride_words,
-        }
+impl RibbonFilter {
+    pub(crate) fn new(params: Params, z: Vec<u64>) -> Self {
+        Self { params, z }
     }
 
     pub fn params(&self) -> Params {
         self.params
-    }
-
-    pub fn new_scratch(&self) -> Scratch {
-        Scratch::new(self.stride_words)
-    }
-
-    pub fn contains<Q: Hash + ?Sized>(&self, key: &Q) -> bool {
-        let mut scratch = self.new_scratch();
-        self.contains_in(key, &mut scratch)
-    }
-
-    pub fn contains_in<Q: Hash + ?Sized>(&self, key: &Q, scratch: &mut Scratch) -> bool {
-        // Hard runtime check, not debug_assert: a mismatched Scratch in
-        // release would silently truncate via `xor_words` (shorter slice
-        // wins the zip) and could produce false negatives. The caller
-        // contract is "Scratch came from RibbonFilter::new_scratch on
-        // this same filter" — violating it is a programmer error worth
-        // panicking on in production.
-        assert_eq!(
-            scratch.fingerprint.len(),
-            self.stride_words,
-            "scratch fingerprint width mismatch; use RibbonFilter::new_scratch() from this filter",
-        );
-        assert_eq!(
-            scratch.acc.len(),
-            self.stride_words,
-            "scratch accumulator width mismatch; use RibbonFilter::new_scratch() from this filter",
-        );
-        scratch.reset();
-
-        let equation = standard_equation_w64(
-            &self.build_hasher,
-            key,
-            self.params.seed,
-            &self.params,
-            &mut scratch.fingerprint,
-        );
-
-        for_each_set_bit_u128_parts(equation.coeff_lo, equation.coeff_hi, |offset| {
-            let row_index = equation.start + offset;
-            if row_index < self.params.m {
-                let row = self.z_row(row_index);
-                xor_words(&mut scratch.acc, row);
-            }
-        });
-
-        scratch.acc == scratch.fingerprint
-    }
-
-    fn z_row(&self, row: usize) -> &[u64] {
-        let start = row * self.stride_words;
-        let end = start + self.stride_words;
-        &self.z[start..end]
     }
 
     /// Borrowed access to the raw solution-matrix words.
@@ -128,7 +61,7 @@ where
     }
 
     #[cfg(feature = "ribbon-serde")]
-    pub fn from_repr(repr: RibbonFilterRepr, build_hasher: S) -> Result<Self, FilterReprError> {
+    pub fn from_repr(repr: RibbonFilterRepr) -> Result<Self, FilterReprError> {
         if repr.version != RIBBON_FILTER_FORMAT_VERSION {
             return Err(FilterReprError::UnsupportedVersion {
                 found: repr.version,
@@ -156,8 +89,6 @@ where
 
         Ok(Self {
             params: repr.params,
-            build_hasher,
-            stride_words,
             z: repr.z,
         })
     }

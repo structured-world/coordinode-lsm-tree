@@ -27,26 +27,23 @@
     reason = "test code indexes into fixture buffers with known sizes"
 )]
 
-use core::hash::BuildHasherDefault;
-use std::collections::hash_map::DefaultHasher;
-
 use super::{BurrBuilder, BurrParams};
-
-type DefaultBuildHasher = BuildHasherDefault<DefaultHasher>;
 
 #[test]
 fn burr_builds_and_reports_inserted_keys_present() {
     let n = 1_000_usize;
     let params = BurrParams::with_fp_rate(n, 0.01).expect("valid params");
-    let builder = BurrBuilder::new(params, DefaultBuildHasher::default()).expect("builder");
-    let keys: Vec<u64> = (0..n as u64).collect();
-    let filter = builder.build(&keys).expect("build");
+    let builder = BurrBuilder::new(params).expect("builder");
+    let hashes: Vec<u64> = (0..n as u64)
+        .map(|i| crate::hash::hash64(&i.to_le_bytes()))
+        .collect();
+    let filter = builder.build_from_hashes(&hashes).expect("build");
 
-    // Every inserted key must report as present (no false negatives).
-    for key in &keys {
+    // Every inserted hash must report as present (no false negatives).
+    for h in &hashes {
         assert!(
-            filter.contains(key),
-            "inserted key {key} reported absent — BuRR must be FN-free",
+            filter.contains_hash(*h),
+            "inserted hash {h} reported absent — BuRR must be FN-free",
         );
     }
 }
@@ -58,14 +55,17 @@ fn burr_fpr_at_one_percent_is_within_envelope() {
     // sample size some slack.
     let n = 1_000_usize;
     let params = BurrParams::with_fp_rate(n, 0.01).expect("valid params");
-    let builder = BurrBuilder::new(params, DefaultBuildHasher::default()).expect("builder");
-    let keys: Vec<u64> = (0..n as u64).collect();
-    let filter = builder.build(&keys).expect("build");
+    let builder = BurrBuilder::new(params).expect("builder");
+    let hashes: Vec<u64> = (0..n as u64)
+        .map(|i| crate::hash::hash64(&i.to_le_bytes()))
+        .collect();
+    let filter = builder.build_from_hashes(&hashes).expect("build");
 
     let probe_count = 10_000_usize;
     let mut false_positives = 0_usize;
-    for key in (n as u64)..(n as u64 + probe_count as u64) {
-        if filter.contains(&key) {
+    for i in (n as u64)..(n as u64 + probe_count as u64) {
+        let h = crate::hash::hash64(&i.to_le_bytes());
+        if filter.contains_hash(h) {
             false_positives += 1;
         }
     }
@@ -81,51 +81,13 @@ fn burr_fpr_at_one_percent_is_within_envelope() {
 }
 
 #[test]
-fn burr_wire_format_round_trips() {
-    // Build a BuRR, serialize to wire bytes, parse via
-    // BurrFilterReader, and verify contains_hash answers match
-    // BurrFilter::contains for every inserted key.
-    use super::filter::BurrFilterReader;
-    use core::hash::BuildHasher;
-
-    let n = 500_usize;
-    let params = BurrParams::with_fp_rate(n, 0.01).expect("valid params");
-    let hasher = DefaultBuildHasher::default();
-    let builder = BurrBuilder::new(params, hasher.clone()).expect("builder");
-    let keys: Vec<u64> = (0..n as u64).collect();
-    let filter = builder.build(&keys).expect("build");
-
-    let bytes = filter.to_wire_bytes();
-    assert!(bytes.len() > 20, "wire buffer too small ({})", bytes.len());
-
-    let reader = BurrFilterReader::new(&bytes).expect("parse");
-    assert_eq!(
-        reader.layer_count(),
-        filter.layer_count(),
-        "decoded layer count must match",
-    );
-
-    // The reader's contains_hash takes a pre-computed u64. We must
-    // use the SAME hasher state the BurrFilter was built with so the
-    // base_hash matches. BuildHasher::hash_one is the convention used
-    // by both sides.
-    for key in &keys {
-        let h = hasher.hash_one(key);
-        assert!(
-            reader.contains_hash(h),
-            "inserted key {key} not found in decoded reader (hash {h})",
-        );
-    }
-}
-
-#[test]
 fn burr_build_from_hashes_and_contains_hash_round_trip() {
     // The hash-based build + probe pair is what the LSM filter writer
     // and reader use. Insert n xxh3-hashed u64s and verify
     // contains_hash reports each as present.
     let n = 500_usize;
     let params = BurrParams::with_fp_rate(n, 0.01).expect("valid params");
-    let builder = BurrBuilder::new(params, DefaultBuildHasher::default()).expect("builder");
+    let builder = BurrBuilder::new(params).expect("builder");
 
     let hashes: Vec<u64> = (0..n as u64)
         .map(|i| crate::hash::hash64(&i.to_le_bytes()))
@@ -166,7 +128,7 @@ fn burr_hash_build_wire_format_round_trips() {
 
     let n = 500_usize;
     let params = BurrParams::with_fp_rate(n, 0.01).expect("valid params");
-    let builder = BurrBuilder::new(params, DefaultBuildHasher::default()).expect("builder");
+    let builder = BurrBuilder::new(params).expect("builder");
     let hashes: Vec<u64> = (0..n as u64)
         .map(|i| crate::hash::hash64(&i.to_le_bytes()))
         .collect();
@@ -191,7 +153,7 @@ fn burr_wire_rejects_bad_magic() {
     // arbitrary zeros could also fail later in decode (e.g. on the
     // version byte) and mask whether the magic check fires at all.
     let params = BurrParams::with_fp_rate(50, 0.01).expect("params");
-    let builder = BurrBuilder::new(params, DefaultBuildHasher::default()).expect("builder");
+    let builder = BurrBuilder::new(params).expect("builder");
     let hashes: Vec<u64> = (0..50_u64)
         .map(|i| crate::hash::hash64(&[i as u8]))
         .collect();
@@ -210,7 +172,7 @@ fn burr_single_key_round_trips() {
     // Smallest possible filter. Last-layer enlargement must accommodate
     // n=1 without LayerExhaustion. Hash-based + key-based both work.
     let params = BurrParams::with_fp_rate(1, 0.01).expect("params");
-    let builder = BurrBuilder::new(params, DefaultBuildHasher::default()).expect("builder");
+    let builder = BurrBuilder::new(params).expect("builder");
     let key_hash = crate::hash::hash64(b"only-one");
     let filter = builder
         .build_from_hashes(&[key_hash])
@@ -232,14 +194,14 @@ fn burr_build_is_deterministic_for_fixed_seed() {
         .map(|i| crate::hash::hash64(&i.to_le_bytes()))
         .collect();
     let bytes_a = {
-        let builder = BurrBuilder::new(params, DefaultBuildHasher::default()).expect("builder");
+        let builder = BurrBuilder::new(params).expect("builder");
         builder
             .build_from_hashes(&hashes)
             .expect("build")
             .to_wire_bytes()
     };
     let bytes_b = {
-        let builder = BurrBuilder::new(params, DefaultBuildHasher::default()).expect("builder");
+        let builder = BurrBuilder::new(params).expect("builder");
         builder
             .build_from_hashes(&hashes)
             .expect("build")
@@ -266,7 +228,7 @@ fn burr_wire_rejects_unknown_version() {
     // Build a real filter, mutate the version byte, decode must fail.
     use super::filter::BurrFilterReader;
     let params = BurrParams::with_fp_rate(50, 0.01).expect("params");
-    let builder = BurrBuilder::new(params, DefaultBuildHasher::default()).expect("builder");
+    let builder = BurrBuilder::new(params).expect("builder");
     let hashes: Vec<u64> = (0..50_u64)
         .map(|i| crate::hash::hash64(&[i as u8]))
         .collect();
@@ -286,7 +248,7 @@ fn burr_wire_rejects_unknown_version() {
 fn burr_wire_rejects_unknown_filter_type() {
     use super::filter::BurrFilterReader;
     let params = BurrParams::with_fp_rate(50, 0.01).expect("params");
-    let builder = BurrBuilder::new(params, DefaultBuildHasher::default()).expect("builder");
+    let builder = BurrBuilder::new(params).expect("builder");
     let hashes: Vec<u64> = (0..50_u64)
         .map(|i| crate::hash::hash64(&[i as u8]))
         .collect();
@@ -307,7 +269,7 @@ fn burr_negative_keys_obey_fpr_envelope_at_low_target() {
     // probes must stay within a safety envelope around the target.
     let n = 2_000_usize;
     let params = BurrParams::with_fp_rate(n, 0.001).expect("params");
-    let builder = BurrBuilder::new(params, DefaultBuildHasher::default()).expect("builder");
+    let builder = BurrBuilder::new(params).expect("builder");
     let hashes: Vec<u64> = (0..n as u64)
         .map(|i| crate::hash::hash64(&i.to_le_bytes()))
         .collect();
@@ -337,7 +299,7 @@ fn burr_negative_keys_obey_fpr_envelope_at_very_low_target() {
     // sample should be well below the 1‰ ceiling we accept here.
     let n = 5_000_usize;
     let params = BurrParams::with_fp_rate(n, 0.0001).expect("params");
-    let builder = BurrBuilder::new(params, DefaultBuildHasher::default()).expect("builder");
+    let builder = BurrBuilder::new(params).expect("builder");
     let hashes: Vec<u64> = (0..n as u64)
         .map(|i| crate::hash::hash64(&i.to_le_bytes()))
         .collect();
@@ -365,31 +327,10 @@ fn burr_negative_keys_obey_fpr_envelope_at_very_low_target() {
 }
 
 #[test]
-fn burr_contains_in_matches_contains_with_external_scratch() {
-    // The allocation-free probe path (contains_in with caller scratch)
-    // must agree with the convenience contains for every key in the set.
-    let n = 300_usize;
-    let params = BurrParams::with_fp_rate(n, 0.01).expect("params");
-    let builder = BurrBuilder::new(params, DefaultBuildHasher::default()).expect("builder");
-    let keys: Vec<u64> = (0..n as u64).collect();
-    let filter = builder.build(&keys).expect("build");
-    let mut scratch = filter.new_scratch();
-    for key in &keys {
-        let via_contains = filter.contains(key);
-        let via_contains_in = filter.contains_in(key, &mut scratch);
-        assert_eq!(
-            via_contains, via_contains_in,
-            "probe paths disagree on {key}"
-        );
-        assert!(via_contains, "inserted key {key} not present");
-    }
-}
-
-#[test]
 fn burr_wire_rejects_zero_b() {
     use super::filter::BurrFilterReader;
     let params = BurrParams::with_fp_rate(50, 0.01).expect("params");
-    let builder = BurrBuilder::new(params, DefaultBuildHasher::default()).expect("builder");
+    let builder = BurrBuilder::new(params).expect("builder");
     let hashes: Vec<u64> = (0..50_u64)
         .map(|i| crate::hash::hash64(&[i as u8]))
         .collect();
@@ -410,7 +351,7 @@ fn burr_wire_rejects_zero_b() {
 fn burr_wire_rejects_zero_num_layers() {
     use super::filter::BurrFilterReader;
     let params = BurrParams::with_fp_rate(50, 0.01).expect("params");
-    let builder = BurrBuilder::new(params, DefaultBuildHasher::default()).expect("builder");
+    let builder = BurrBuilder::new(params).expect("builder");
     let hashes: Vec<u64> = (0..50_u64)
         .map(|i| crate::hash::hash64(&[i as u8]))
         .collect();
@@ -430,7 +371,7 @@ fn burr_wire_rejects_zero_num_layers() {
 fn burr_wire_rejects_out_of_range_r() {
     use super::filter::BurrFilterReader;
     let params = BurrParams::with_fp_rate(50, 0.01).expect("params");
-    let builder = BurrBuilder::new(params, DefaultBuildHasher::default()).expect("builder");
+    let builder = BurrBuilder::new(params).expect("builder");
     let hashes: Vec<u64> = (0..50_u64)
         .map(|i| crate::hash::hash64(&[i as u8]))
         .collect();
@@ -458,7 +399,7 @@ fn burr_wire_rejects_out_of_range_r() {
 fn burr_wire_rejects_corrupted_num_blocks() {
     use super::filter::BurrFilterReader;
     let params = BurrParams::with_fp_rate(50, 0.01).expect("params");
-    let builder = BurrBuilder::new(params, DefaultBuildHasher::default()).expect("builder");
+    let builder = BurrBuilder::new(params).expect("builder");
     let hashes: Vec<u64> = (0..50_u64)
         .map(|i| crate::hash::hash64(&[i as u8]))
         .collect();
@@ -481,7 +422,7 @@ fn burr_wire_rejects_corrupted_num_blocks() {
 fn burr_wire_rejects_corrupted_z_byte_len() {
     use super::filter::BurrFilterReader;
     let params = BurrParams::with_fp_rate(50, 0.01).expect("params");
-    let builder = BurrBuilder::new(params, DefaultBuildHasher::default()).expect("builder");
+    let builder = BurrBuilder::new(params).expect("builder");
     let hashes: Vec<u64> = (0..50_u64)
         .map(|i| crate::hash::hash64(&[i as u8]))
         .collect();
@@ -502,9 +443,11 @@ fn burr_wire_rejects_corrupted_z_byte_len() {
 fn burr_settles_in_few_layers() {
     let n = 5_000_usize;
     let params = BurrParams::with_fp_rate(n, 0.01).expect("valid params");
-    let builder = BurrBuilder::new(params, DefaultBuildHasher::default()).expect("builder");
-    let keys: Vec<u64> = (0..n as u64).collect();
-    let filter = builder.build(&keys).expect("build");
+    let builder = BurrBuilder::new(params).expect("builder");
+    let hashes: Vec<u64> = (0..n as u64)
+        .map(|i| crate::hash::hash64(&i.to_le_bytes()))
+        .collect();
+    let filter = builder.build_from_hashes(&hashes).expect("build");
 
     // BuRR's design target is 1-3 layers for well-tuned parameters.
     // Each layer absorbs ~90% of incoming keys; 3 layers reach ≈
@@ -581,8 +524,7 @@ fn burr_params_with_seed_sets_seed_field() {
 fn burr_builder_rejects_n_zero() {
     let mut params = BurrParams::with_fp_rate(100, 0.01).unwrap();
     params.n = 0;
-    let err = BurrBuilder::new(params, DefaultBuildHasher::default())
-        .expect_err("builder must reject n=0");
+    let err = BurrBuilder::new(params).expect_err("builder must reject n=0");
     let msg = format!("{err}");
     assert!(msg.contains("n must be > 0"), "got: {msg}");
 }
@@ -591,8 +533,7 @@ fn burr_builder_rejects_n_zero() {
 fn burr_builder_rejects_zero_r() {
     let mut params = BurrParams::with_fp_rate(100, 0.01).unwrap();
     params.r = 0;
-    let err = BurrBuilder::new(params, DefaultBuildHasher::default())
-        .expect_err("builder must reject r=0");
+    let err = BurrBuilder::new(params).expect_err("builder must reject r=0");
     let msg = format!("{err}");
     assert!(msg.contains("r must be in 1..=64"), "got: {msg}");
 }
@@ -601,8 +542,7 @@ fn burr_builder_rejects_zero_r() {
 fn burr_builder_rejects_zero_b() {
     let mut params = BurrParams::with_fp_rate(100, 0.01).unwrap();
     params.b = 0;
-    let err = BurrBuilder::new(params, DefaultBuildHasher::default())
-        .expect_err("builder must reject b=0");
+    let err = BurrBuilder::new(params).expect_err("builder must reject b=0");
     let msg = format!("{err}");
     assert!(msg.contains("b must be > 0"), "got: {msg}");
 }
@@ -611,8 +551,7 @@ fn burr_builder_rejects_zero_b() {
 fn burr_builder_rejects_zero_max_layers() {
     let mut params = BurrParams::with_fp_rate(100, 0.01).unwrap();
     params.max_layers = 0;
-    let err = BurrBuilder::new(params, DefaultBuildHasher::default())
-        .expect_err("builder must reject max_layers=0");
+    let err = BurrBuilder::new(params).expect_err("builder must reject max_layers=0");
     let msg = format!("{err}");
     assert!(msg.contains("max_layers"), "got: {msg}");
 }
@@ -624,7 +563,7 @@ fn burr_layer_count_for_tiny_input_is_at_most_one() {
     // is now rejected by the builder; see
     // burr_builder_rejects_empty_input_via_build_from_hashes.)
     let params = BurrParams::with_fp_rate(100, 0.01).unwrap();
-    let builder = BurrBuilder::new(params, DefaultBuildHasher::default()).unwrap();
+    let builder = BurrBuilder::new(params).unwrap();
     let hashes: Vec<u64> = (0..4_u64)
         .map(|i| crate::hash::hash64(&i.to_le_bytes()))
         .collect();
@@ -635,7 +574,7 @@ fn burr_layer_count_for_tiny_input_is_at_most_one() {
 #[test]
 fn burr_filter_debug_format_includes_layer_count() {
     let params = BurrParams::with_fp_rate(100, 0.01).unwrap();
-    let builder = BurrBuilder::new(params, DefaultBuildHasher::default()).unwrap();
+    let builder = BurrBuilder::new(params).unwrap();
     let hashes: Vec<u64> = (0..100_u64)
         .map(|i| crate::hash::hash64(&i.to_le_bytes()))
         .collect();
@@ -648,7 +587,7 @@ fn burr_filter_debug_format_includes_layer_count() {
 #[test]
 fn burr_filter_params_accessor() {
     let params = BurrParams::with_fp_rate(500, 0.01).unwrap();
-    let builder = BurrBuilder::new(params, DefaultBuildHasher::default()).unwrap();
+    let builder = BurrBuilder::new(params).unwrap();
     let hashes: Vec<u64> = (0..500_u64)
         .map(|i| crate::hash::hash64(&i.to_le_bytes()))
         .collect();
@@ -664,7 +603,7 @@ fn burr_filter_contains_returns_false_for_definitely_absent() {
     // for inserted; some false-positive is expected for non-inserted).
     let n = 64_usize;
     let params = BurrParams::with_fp_rate(n, 0.001).unwrap();
-    let builder = BurrBuilder::new(params, DefaultBuildHasher::default()).unwrap();
+    let builder = BurrBuilder::new(params).unwrap();
     let hashes: Vec<u64> = (0..n as u64)
         .map(|i| crate::hash::hash64(&i.to_le_bytes()))
         .collect();
@@ -692,7 +631,7 @@ fn contains_hash_from_bytes_round_trips_against_decoded() {
 
     let n = 500_usize;
     let params = BurrParams::with_fp_rate(n, 0.01).expect("params");
-    let builder = BurrBuilder::new(params, DefaultBuildHasher::default()).expect("builder");
+    let builder = BurrBuilder::new(params).expect("builder");
     let hashes: Vec<u64> = (0..n as u64)
         .map(|i| crate::hash::hash64(&i.to_le_bytes()))
         .collect();
@@ -735,7 +674,7 @@ fn contains_hash_from_bytes_rejects_short_buffer() {
 fn contains_hash_from_bytes_rejects_bad_magic() {
     use super::contains_hash_from_bytes;
     let params = BurrParams::with_fp_rate(50, 0.01).expect("params");
-    let builder = BurrBuilder::new(params, DefaultBuildHasher::default()).expect("builder");
+    let builder = BurrBuilder::new(params).expect("builder");
     let hashes: Vec<u64> = (0..50_u64)
         .map(|i| crate::hash::hash64(&[i as u8]))
         .collect();
@@ -753,7 +692,7 @@ fn contains_hash_from_bytes_rejects_bad_magic() {
 fn contains_hash_from_bytes_rejects_bad_version() {
     use super::contains_hash_from_bytes;
     let params = BurrParams::with_fp_rate(50, 0.01).expect("params");
-    let builder = BurrBuilder::new(params, DefaultBuildHasher::default()).expect("builder");
+    let builder = BurrBuilder::new(params).expect("builder");
     let hashes: Vec<u64> = (0..50_u64)
         .map(|i| crate::hash::hash64(&[i as u8]))
         .collect();
@@ -772,7 +711,7 @@ fn contains_hash_from_bytes_rejects_bad_version() {
 fn contains_hash_from_bytes_rejects_bad_filter_type() {
     use super::contains_hash_from_bytes;
     let params = BurrParams::with_fp_rate(50, 0.01).expect("params");
-    let builder = BurrBuilder::new(params, DefaultBuildHasher::default()).expect("builder");
+    let builder = BurrBuilder::new(params).expect("builder");
     let hashes: Vec<u64> = (0..50_u64)
         .map(|i| crate::hash::hash64(&[i as u8]))
         .collect();
@@ -791,7 +730,7 @@ fn contains_hash_from_bytes_rejects_bad_filter_type() {
 fn contains_hash_from_bytes_rejects_bad_params() {
     use super::contains_hash_from_bytes;
     let params = BurrParams::with_fp_rate(50, 0.01).expect("params");
-    let builder = BurrBuilder::new(params, DefaultBuildHasher::default()).expect("builder");
+    let builder = BurrBuilder::new(params).expect("builder");
     let hashes: Vec<u64> = (0..50_u64)
         .map(|i| crate::hash::hash64(&[i as u8]))
         .collect();
@@ -814,7 +753,7 @@ fn contains_hash_from_bytes_rejects_corrupted_layer_payload() {
     // reaching the slice.
     use super::contains_hash_from_bytes;
     let params = BurrParams::with_fp_rate(50, 0.01).expect("params");
-    let builder = BurrBuilder::new(params, DefaultBuildHasher::default()).expect("builder");
+    let builder = BurrBuilder::new(params).expect("builder");
     let hashes: Vec<u64> = (0..50_u64)
         .map(|i| crate::hash::hash64(&[i as u8]))
         .collect();
@@ -843,7 +782,7 @@ fn contains_hash_from_bytes_returns_false_for_non_inserted() {
     use super::filter::BurrFilterReader;
     let n = 200_usize;
     let params = BurrParams::with_fp_rate(n, 0.001).expect("params");
-    let builder = BurrBuilder::new(params, DefaultBuildHasher::default()).expect("builder");
+    let builder = BurrBuilder::new(params).expect("builder");
     let hashes: Vec<u64> = (0..n as u64)
         .map(|i| crate::hash::hash64(&i.to_le_bytes()))
         .collect();
@@ -879,7 +818,7 @@ fn burr_wire_rejects_corrupted_m_below_w() {
     use super::filter::BurrFilterReader;
     // Build a single-layer filter (n = 50 → one layer).
     let params = BurrParams::with_fp_rate(50, 0.01).expect("params");
-    let builder = BurrBuilder::new(params, DefaultBuildHasher::default()).expect("builder");
+    let builder = BurrBuilder::new(params).expect("builder");
     let hashes: Vec<u64> = (0..50_u64)
         .map(|i| crate::hash::hash64(&[i as u8]))
         .collect();
@@ -913,7 +852,7 @@ fn burr_wire_rejects_corrupted_m_below_w() {
 #[test]
 fn burr_builder_rejects_empty_input_via_build_from_hashes() {
     let params = BurrParams::with_fp_rate(100, 0.01).expect("params");
-    let builder = BurrBuilder::new(params, DefaultBuildHasher::default()).expect("builder");
+    let builder = BurrBuilder::new(params).expect("builder");
     let err = builder
         .build_from_hashes(&[])
         .expect_err("empty hash input must error");
@@ -925,25 +864,10 @@ fn burr_builder_rejects_empty_input_via_build_from_hashes() {
 }
 
 #[test]
-fn burr_builder_rejects_empty_input_via_build_keys() {
-    let params = BurrParams::with_fp_rate(100, 0.01).expect("params");
-    let builder = BurrBuilder::new(params, DefaultBuildHasher::default()).expect("builder");
-    let keys: [u64; 0] = [];
-    let err = builder
-        .build(&keys)
-        .expect_err("empty key input must error");
-    let msg = format!("{err}");
-    assert!(
-        msg.contains("non-empty"),
-        "expected non-empty mention: {msg}"
-    );
-}
-
-#[test]
 fn burr_builder_new_rejects_zero_n() {
     let mut params = BurrParams::with_fp_rate(100, 0.01).expect("params");
     params.n = 0;
-    let err = BurrBuilder::new(params, DefaultBuildHasher::default()).expect_err("n=0 must reject");
+    let err = BurrBuilder::new(params).expect_err("n=0 must reject");
     assert!(format!("{err}").contains("n must be > 0"));
 }
 
@@ -951,13 +875,12 @@ fn burr_builder_new_rejects_zero_n() {
 fn burr_builder_new_rejects_r_out_of_range() {
     let mut params = BurrParams::with_fp_rate(100, 0.01).expect("params");
     params.r = 0;
-    let err = BurrBuilder::new(params, DefaultBuildHasher::default()).expect_err("r=0 must reject");
+    let err = BurrBuilder::new(params).expect_err("r=0 must reject");
     assert!(format!("{err}").contains("r must be in 1..=64"));
 
     let mut params = BurrParams::with_fp_rate(100, 0.01).expect("params");
     params.r = 65;
-    let err =
-        BurrBuilder::new(params, DefaultBuildHasher::default()).expect_err("r=65 must reject");
+    let err = BurrBuilder::new(params).expect_err("r=65 must reject");
     assert!(format!("{err}").contains("r must be in 1..=64"));
 }
 
@@ -965,8 +888,7 @@ fn burr_builder_new_rejects_r_out_of_range() {
 fn burr_builder_new_rejects_non_64_w() {
     let mut params = BurrParams::with_fp_rate(100, 0.01).expect("params");
     params.w = 32;
-    let err =
-        BurrBuilder::new(params, DefaultBuildHasher::default()).expect_err("w=32 must reject");
+    let err = BurrBuilder::new(params).expect_err("w=32 must reject");
     assert!(format!("{err}").contains("w must be exactly 64"));
 }
 
@@ -974,7 +896,7 @@ fn burr_builder_new_rejects_non_64_w() {
 fn burr_builder_new_rejects_zero_b() {
     let mut params = BurrParams::with_fp_rate(100, 0.01).expect("params");
     params.b = 0;
-    let err = BurrBuilder::new(params, DefaultBuildHasher::default()).expect_err("b=0 must reject");
+    let err = BurrBuilder::new(params).expect_err("b=0 must reject");
     assert!(format!("{err}").contains("b must be > 0"));
 }
 
@@ -984,7 +906,7 @@ fn burr_builder_new_rejects_b_below_w() {
     // invariant: the builder must reject hand-built params with b < w.
     let mut params = BurrParams::with_fp_rate(100, 0.01).expect("params");
     params.b = 32; // < w (= 64)
-    let err = BurrBuilder::new(params, DefaultBuildHasher::default()).expect_err("b<w must reject");
+    let err = BurrBuilder::new(params).expect_err("b<w must reject");
     let msg = format!("{err}");
     assert!(msg.contains("b must be >= w"), "got: {msg}");
 }
@@ -993,15 +915,14 @@ fn burr_builder_new_rejects_b_below_w() {
 fn burr_builder_new_rejects_zero_max_layers() {
     let mut params = BurrParams::with_fp_rate(100, 0.01).expect("params");
     params.max_layers = 0;
-    let err = BurrBuilder::new(params, DefaultBuildHasher::default())
-        .expect_err("max_layers=0 must reject");
+    let err = BurrBuilder::new(params).expect_err("max_layers=0 must reject");
     assert!(format!("{err}").contains("max_layers must be > 0"));
 }
 
 #[test]
 fn burr_builder_debug_includes_params() {
     let params = BurrParams::with_fp_rate(100, 0.01).expect("params");
-    let builder = BurrBuilder::new(params, DefaultBuildHasher::default()).expect("builder");
+    let builder = BurrBuilder::new(params).expect("builder");
     let debug = format!("{builder:?}");
     assert!(debug.contains("BurrBuilder"), "got: {debug}");
     assert!(debug.contains("params"), "got: {debug}");
@@ -1010,7 +931,7 @@ fn burr_builder_debug_includes_params() {
 #[test]
 fn burr_filter_debug_includes_layer_count() {
     let params = BurrParams::with_fp_rate(100, 0.01).expect("params");
-    let builder = BurrBuilder::new(params, DefaultBuildHasher::default()).expect("builder");
+    let builder = BurrBuilder::new(params).expect("builder");
     let hashes: Vec<u64> = (0..100_u64)
         .map(|i| crate::hash::hash64(&i.to_le_bytes()))
         .collect();

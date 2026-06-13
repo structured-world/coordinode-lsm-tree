@@ -59,9 +59,9 @@ impl Params {
             // seed; the retry just iterates derived seeds within that
             // seed family).
             //
-            // BuRR's own build path bypasses retry entirely via
-            // `build_with_seed_verbatim`, so this default only affects
-            // direct `RibbonBuilder::build` consumers.
+            // BuRR's build path bypasses retry entirely via
+            // `build_with_seed_verbatim_from_hashes` (single verbatim-seed
+            // attempt), so retry/grow are inert for the in-crate caller.
             retry_limit: 8,
             grow_limit: 0,
         };

@@ -788,13 +788,22 @@ impl Drop for RingThread {
 
 #[cfg(test)]
 mod tests {
+    #![expect(
+        clippy::expect_used,
+        reason = "test assertions over known-good fixtures; failure surfaces via panic"
+    )]
+    #![expect(
+        clippy::indexing_slicing,
+        reason = "test code indexes fixture buffers with known sizes"
+    )]
+
     use super::*;
     use std::io::{Read, Write};
     use std::sync::Arc;
     // Shadows #[test] to enable log capture in test output.
     use test_log::test;
 
-    /// Returns an `IoUringFs`, skipping only if the kernel lacks io_uring.
+    /// Returns an `IoUringFs`, skipping only if the kernel lacks `io_uring`.
     /// Constructor bugs (e.g. broken `RingThread::spawn`) will panic the
     /// test instead of silently skipping.
     fn try_io_uring() -> Option<IoUringFs> {
@@ -1063,7 +1072,7 @@ mod tests {
         let mut file = fs.open(&path, &opts)?;
         // Write 1000 bytes: each byte = (offset % 256)
         #[expect(clippy::cast_possible_truncation, reason = "% 256 guarantees 0..=255")]
-        let data: Vec<u8> = (0..1000).map(|i| (i % 256) as u8).collect();
+        let data: Vec<u8> = (0u32..1000).map(|i| (i % 256) as u8).collect();
         file.write_all(&data)?;
         file.sync_all()?;
 
@@ -1088,7 +1097,7 @@ mod tests {
         for h in handles {
             match h.join() {
                 Ok(result) => result?,
-                Err(_) => return Err(io::Error::new(io::ErrorKind::Other, "thread panicked")),
+                Err(_) => return Err(io::Error::other("thread panicked")),
             }
         }
 

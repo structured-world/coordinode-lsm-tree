@@ -2370,6 +2370,13 @@ fn load_block_records_heal_hint_on_persistent_ecc_correction() -> crate::Result<
     // via RS parity, and drop any cached fd so the re-read re-opens the tampered
     // file from disk (confirming the fault is persistent).
     let mut bytes = std::fs::read(&file)?;
+    // `as usize` is a target-conditional truncation (only narrows on 32-bit
+    // pointer widths); `allow`, not `expect`, so it stays clean on the 64-bit
+    // host where clippy frames it purely as a portability note.
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "in-file block offset fits usize; only narrows on 32-bit targets"
+    )]
     let pos = handle.offset().0 as usize + Header::MIN_LEN + 3;
     bytes[pos] ^= 0x80;
     std::fs::write(&file, &bytes)?;

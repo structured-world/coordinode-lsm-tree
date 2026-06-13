@@ -922,6 +922,10 @@ mod tests {
             sealed.len() > cut,
             "test setup: sealed block must extend past the body header",
         );
+        #[expect(
+            clippy::expect_used,
+            reason = "test asserts the truncated frame is rejected"
+        )]
         let err = parse_encrypted_block_metadata(&sealed[..cut])
             .expect_err("truncated body must be rejected");
         assert!(
