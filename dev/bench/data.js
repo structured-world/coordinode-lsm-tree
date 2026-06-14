@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1781469175654,
+  "lastUpdate": 1781479538620,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -15990,6 +15990,84 @@ window.BENCHMARK_DATA = {
             "value": 563746.7536044213,
             "unit": "ops/sec",
             "extra": "P50: 1.6us | P99: 5.0us | P99.9: 7.5us\nthreads: 1 | elapsed: 0.35s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "42d63dbd33dd5542b4166e7973ba14d7be5cf5c7",
+          "message": "perf(table): cut point-read per-get overhead (#465)\n\n## Summary\n\nSqueezes the per-get cost on the point-read path toward RocksDB parity.\nNo format or public-behaviour change; point reads return identical\nresults.\n\n- **Slice-based LEB128 decode** for the index restart-key probe and the\ndata-block entry parse, replacing per-byte `Cursor::read_u8`.\nSingle-byte varint fast path.\n- **Value-only point-read path**: the value-returning `get` no longer\nfuses the matched entry's key; the value is a zero-copy sub-slice of the\ncached block.\n- **Drive the decoders directly** on point reads (data + index block)\ninstead of the double-ended peeking iterator: parse the block trailer\nonce, build index readers from the decoder's cached metadata,\nseqno-aware seek with a comparator-borrowing closure (no `Arc` bump),\nskip the no-op cache resets.\n- **Cache: hash the key once per access** (`hashbrown::HashTable` keyed\nby the precomputed hash) instead of hashing for the shard and again in\nthe map.\n\n## Performance\n\n`point_read/10000`: ~12.8ms → ~10.3ms; gap to RocksDB closes from ~21%\nto ~parity. The `point_read` bench chart now overlays `ours-hash-index`\n/ `rocksdb-hash-index` series (data-block hash index ON) alongside the\nbinary-search `ours` / `rocksdb` lines, so both index strategies are\ncompared head-to-head on one plot.\n\n## Corruption-validation fixes (from review)\n\nThe slice-decode had dropped two on-disk validations; both restored,\neach with a regression test committed first (fails on the pre-fix code):\n\n- `read_leb128` now rejects a 10-byte varint whose final payload byte\noverflows u64, instead of returning a wrapped `Some(_)`.\n- `parse_restart_key` decodes the block-handle offset/size (rejecting an\noverlong offset and a size beyond `u32::MAX`) instead of skipping them\nunchecked.\n\n## Test robustness\n\nThe concurrent encryption stress test raises its own open-file soft\nlimit (`rlimit::increase_nofile_limit`) so a low default does not\nsurface as EMFILE under the fd-heavy `--all-features` suite.\n\n## Testing\n\n- `cargo nextest run --all-features`: 2071 passed, 2 skipped.\n- `cargo clippy --all-features --all-targets`: clean.\n- `cargo fmt --check`: clean.\n\nCloses #463\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n## Summary by CodeRabbit\n\n## Release Notes\n\n* **New Features**\n* Added value-only point read paths for tables and trees to retrieve\nvalues without reconstructing full keys.\n\n* **Performance Improvements**\n* Optimized sharded cache lookups to reduce hashing and streamline entry\naccess/removal.\n* Improved block decoding with a faster, stricter LEB128/varint decoder\nand better reuse of validated index-reader metadata.\n\n* **Bug Fixes**\n* Strengthened restart/data-block parsing validation, including\nrejection of malformed varint/LEB128 encodings and invalid bounds.\n\n* **Tests / Reliability**\n* Increased soft file-descriptor limits for the encryption stress test;\nadded targeted decoder coverage.\n\n* **Benchmarks**\n* Extended point-read benchmarks to include hash-index overlay\ncomparisons.\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-06-15T02:24:36+03:00",
+          "tree_id": "41a6599c06b702d6623e671eddbe3b3e1a9de022",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/42d63dbd33dd5542b4166e7973ba14d7be5cf5c7"
+        },
+        "date": 1781479524239,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 2096454.8257067206,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.6us | P99.9: 3.7us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1207779.3405503063,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.3us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 724808.9461602637,
+            "unit": "ops/sec",
+            "extra": "P50: 1.2us | P99: 4.4us | P99.9: 6.9us\nthreads: 1 | elapsed: 0.28s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3701057.1736721448,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 3.0us | P99.9: 5.6us\nthreads: 1 | elapsed: 0.05s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 448168.2194033512,
+            "unit": "ops/sec",
+            "extra": "P50: 1.9us | P99: 5.2us | P99.9: 8.0us\nthreads: 1 | elapsed: 0.45s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 229709.36650657875,
+            "unit": "ops/sec",
+            "extra": "P50: 4.1us | P99: 5.0us | P99.9: 7.6us\nthreads: 1 | elapsed: 0.87s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1262158.180428339,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.2us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1143625.0445970881,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 1.4us | P99.9: 2.8us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 597342.2814251344,
+            "unit": "ops/sec",
+            "extra": "P50: 1.5us | P99: 4.8us | P99.9: 7.3us\nthreads: 1 | elapsed: 0.33s | num: 200000 | iterations: 3"
           }
         ]
       }
