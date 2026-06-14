@@ -23,7 +23,9 @@ publish = false
 # (`CompressionType::Zstd(22)`); the `None`-compression baseline
 # groups still run on the same build. Future `*_lz4` variants add the
 # `lz4` feature alongside their workload.
-lsm-tree = { package = "coordinode-lsm-tree", path = "../..", features = ["zstd"] }
+# `page_ecc` is compiled in so the `lsm-paranoid` bench preset can measure
+# Page-ECC write overhead; the default `rocksdb-parity` preset keeps it OFF.
+lsm-tree = { package = "coordinode-lsm-tree", path = "../..", features = ["zstd", "page_ecc"] }
 # RocksDB binding — the whole reason this crate exists outside the
 # main `--all-features` graph. `default-features = false` strips
 # the upstream default compression codecs (snappy, lz4, bz2, zlib);
