@@ -5,9 +5,60 @@
 use crate::comparator::SharedComparator;
 use crate::table::block::{BlockType, Decoder, DecoderMeta, ParsedItem};
 use crate::table::block_index::{BlockIndexIter, iter::OwnedIndexBlockIter};
-use crate::table::index_block::{IndexBlockParsedItem, Iter as BorrowedIndexIter};
+use crate::table::index_block::IndexBlockParsedItem;
 use crate::table::{IndexBlock, KeyedBlockHandle};
 use crate::{SeqNo, Slice};
+
+/// Seqno-aware binary search positioning a freshly-built index decoder at the
+/// first block handle whose `end_key >= needle` (or equal with a head seqno at
+/// least the snapshot boundary). Borrows the comparator (lex fast path is
+/// statically dispatched). Mirrors `index_block::Iter::seek_with_cache_resets`
+/// but drives the decoder directly: a fresh decoder has no peek/back-cursor
+/// state to reset, so those resets (and the double-ended peeking wrapper) are
+/// pure overhead on the point-read path.
+fn seek_index_block(
+    decoder: &mut Decoder<'_, KeyedBlockHandle, IndexBlockParsedItem>,
+    needle: &[u8],
+    seqno: SeqNo,
+    comparator: &SharedComparator,
+) -> bool {
+    let landed = if comparator.is_lexicographic() {
+        decoder.seek(
+            |end_key, s| match end_key.cmp(needle) {
+                core::cmp::Ordering::Greater => false,
+                core::cmp::Ordering::Less => true,
+                core::cmp::Ordering::Equal => s >= seqno,
+            },
+            true,
+        )
+    } else {
+        decoder.seek(
+            |end_key, s| match comparator.compare(end_key, needle) {
+                core::cmp::Ordering::Greater => false,
+                core::cmp::Ordering::Less => true,
+                core::cmp::Ordering::Equal => s >= seqno,
+            },
+            true,
+        )
+    };
+    if !landed {
+        return false;
+    }
+
+    // Restart heads only carry every Nth handle's key; scan within the landed
+    // interval to the first handle that actually covers the needle.
+    if decoder.restart_interval() > 1 {
+        decoder.advance_while(|item, bytes| {
+            match item.compare_key(needle, bytes, comparator.as_ref()) {
+                core::cmp::Ordering::Greater => false,
+                core::cmp::Ordering::Less => true,
+                core::cmp::Ordering::Equal => item.seqno() >= seqno,
+            }
+        });
+    }
+
+    true
+}
 
 /// Index that translates item keys to data block handles
 ///
@@ -62,12 +113,16 @@ impl FullBlockIndex {
     /// refcount bump nor a trailer re-parse. Used by the table point-read
     /// path; range scans keep the owned [`Self::forward_reader`].
     pub fn point_read_reader(&self, needle: &[u8], seqno: SeqNo) -> Option<PointReadIter<'_>> {
-        let mut it = self
-            .block
-            .iter_with_meta(self.comparator.clone(), self.meta);
-        if it.seek(needle, seqno) {
+        // from_meta reuses the trailer parsed at construction; the seek closure
+        // borrows the comparator (no Arc bump). Driving the decoder directly
+        // skips the double-ended peeking wrapper and its no-op cache resets.
+        let mut decoder = Decoder::<KeyedBlockHandle, IndexBlockParsedItem>::from_meta(
+            &self.block.inner,
+            self.meta,
+        );
+        if seek_index_block(&mut decoder, needle, seqno, &self.comparator) {
             Some(PointReadIter {
-                iter: it,
+                decoder,
                 data: &self.block.inner.data,
             })
         } else {
@@ -95,12 +150,12 @@ impl FullBlockIndex {
 /// Borrowing point-read iterator returned by
 /// [`FullBlockIndex::point_read_reader`].
 ///
-/// Wraps the borrowing index-block [`BorrowedIndexIter`] (which yields raw
-/// parsed items) and materializes each into a [`KeyedBlockHandle`] against
-/// the borrowed block data. Both fields share an immutable borrow of the
-/// index block, so no `Arc`/`Bytes` clone happens per lookup.
+/// Drives the index-block [`Decoder`] directly (forward-only) and materializes
+/// each parsed item into a [`KeyedBlockHandle`] against the borrowed block
+/// data. Both fields share an immutable borrow of the index block, so no
+/// `Arc`/`Bytes` clone happens per lookup.
 pub struct PointReadIter<'a> {
-    iter: BorrowedIndexIter<'a>,
+    decoder: Decoder<'a, KeyedBlockHandle, IndexBlockParsedItem>,
     data: &'a Slice,
 }
 
@@ -110,7 +165,9 @@ impl Iterator for PointReadIter<'_> {
     fn next(&mut self) -> Option<Self::Item> {
         // materialize is infallible; wrap in Ok to match the owned
         // `forward_reader` iterator's item type so the caller's `?` works.
-        self.iter.next().map(|item| Ok(item.materialize(self.data)))
+        self.decoder
+            .next()
+            .map(|item| Ok(item.materialize(self.data)))
     }
 }
 
