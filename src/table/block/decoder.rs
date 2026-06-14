@@ -14,6 +14,43 @@ use core::marker::PhantomData;
 
 use crate::io::Cursor;
 
+/// Decodes one LEB128 varint directly from `buf` at `pos`, returning the value
+/// and the position just past it.
+///
+/// Reads through a plain slice index instead of `std::io::Cursor::read_u8` (a
+/// `read_exact` of one byte each), which is the hottest cost on the point-read
+/// path's block-entry parse. Rejects an overlong (> 64-bit) encoding, matching
+/// `VarintReader::read_u64_varint`.
+#[inline]
+pub(crate) fn read_leb128(buf: &[u8], mut pos: usize) -> Option<(u64, usize)> {
+    let mut result = 0u64;
+    let mut shift = 0u32;
+    loop {
+        let byte = *buf.get(pos)?;
+        pos += 1;
+        result |= u64::from(byte & 0x7f) << shift;
+        if byte & 0x80 == 0 {
+            return Some((result, pos));
+        }
+        shift += 7;
+        if shift >= 64 {
+            return None;
+        }
+    }
+}
+
+/// Advances past one LEB128 varint in `buf` without materializing its value.
+#[inline]
+pub(crate) fn skip_leb128(buf: &[u8], mut pos: usize) -> Option<usize> {
+    loop {
+        let byte = *buf.get(pos)?;
+        pos += 1;
+        if byte & 0x80 == 0 {
+            return Some(pos);
+        }
+    }
+}
+
 /// Validates that `restart_interval` and `binary_index_step_size` read from a
 /// block trailer are within their allowed ranges.
 ///

@@ -8,7 +8,10 @@ use crate::{SeqNo, UserKey};
 use crate::{
     coding::{Decode, Encode},
     table::{
-        block::{BlockOffset, Decodable, Encodable, TRAILER_START_MARKER},
+        block::{
+            BlockOffset, Decodable, Encodable, TRAILER_START_MARKER,
+            decoder::{read_leb128, skip_leb128},
+        },
         index_block::IndexBlockParsedItem,
         util::SliceIndexes,
     },
@@ -23,45 +26,6 @@ use crate::io::{VarintReader, VarintWriter};
 use std::io::Seek;
 #[cfg(feature = "std")]
 use varint_rs::{VarintReader, VarintWriter};
-
-/// Decodes one LEB128 varint directly from `buf` at `pos`, returning the value
-/// and the position just past it.
-///
-/// Reads through a plain slice index instead of `std::io::Cursor::read_u8` (a
-/// `read_exact` of one byte each), which is the hottest cost on the point-read
-/// path's restart-key parse. Rejects an overlong (> 64-bit) encoding, matching
-/// `VarintReader::read_u64_varint`.
-#[inline]
-fn read_leb128(buf: &[u8], mut pos: usize) -> Option<(u64, usize)> {
-    let mut result = 0u64;
-    let mut shift = 0u32;
-    loop {
-        let byte = *buf.get(pos)?;
-        pos += 1;
-        result |= u64::from(byte & 0x7f) << shift;
-        if byte & 0x80 == 0 {
-            return Some((result, pos));
-        }
-        shift += 7;
-        if shift >= 64 {
-            return None;
-        }
-    }
-}
-
-/// Advances past one LEB128 varint in `buf` without materializing its value.
-/// Used to skip the block handle (file offset + size) on the binary-search
-/// probe, which never reads it.
-#[inline]
-fn skip_leb128(buf: &[u8], mut pos: usize) -> Option<usize> {
-    loop {
-        let byte = *buf.get(pos)?;
-        pos += 1;
-        if byte & 0x80 == 0 {
-            return Some(pos);
-        }
-    }
-}
 
 /// Points to a block on file
 #[derive(Copy, Clone, Debug, Default)]

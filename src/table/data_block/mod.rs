@@ -11,9 +11,12 @@ pub use iter::Iter;
 
 use super::block::{
     Block, Decodable, Decoder, Encodable, Encoder, ParsedItem, TRAILER_START_MARKER, Trailer,
-    binary_index::Reader as BinaryIndexReader, hash_index::Reader as HashIndexReader,
+    binary_index::Reader as BinaryIndexReader, decoder::read_leb128,
+    hash_index::Reader as HashIndexReader,
 };
 use crate::io::Cursor;
+#[cfg(not(feature = "std"))]
+use crate::io::VarintWriter;
 use crate::io::WriteBytesExt;
 use crate::io::{LittleEndian, ReadBytesExt};
 use crate::key::InternalKey;
@@ -22,17 +25,8 @@ use crate::table::util::{SliceIndexes, compare_prefixed_slice};
 use crate::{InternalValue, SeqNo, Slice, ValueType};
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
-// `Seek` resolves to std under `std` (so `seek_relative` on `Cursor` comes
-// from `std::io::Seek`) and to the native trait under `no_std`; written bare
-// so the `seek_relative` calls below track whichever is imported.
-#[cfg(not(feature = "std"))]
-use crate::io::Seek;
-#[cfg(not(feature = "std"))]
-use crate::io::{VarintReader, VarintWriter};
 #[cfg(feature = "std")]
-use std::io::Seek;
-#[cfg(feature = "std")]
-use varint_rs::{VarintReader, VarintWriter};
+use varint_rs::VarintWriter;
 
 impl Decodable<DataBlockParsedItem> for InternalValue {
     fn parse_restart_key<'a>(
@@ -41,35 +35,34 @@ impl Decodable<DataBlockParsedItem> for InternalValue {
         data: &'a [u8],
         entries_end: usize,
     ) -> Option<(&'a [u8], SeqNo)> {
-        let value_type = reader.read_u8().ok()?;
+        // Slice-based decode (see `parse_full` / `read_leb128`).
+        let buf: &[u8] = *reader.get_ref();
+        let mut pos = usize::try_from(reader.position()).ok()?;
 
+        let value_type = *buf.get(pos)?;
+        pos += 1;
         if value_type == TRAILER_START_MARKER {
             return None;
         }
 
-        let seqno = reader.read_u64_varint().ok()?;
+        let (seqno, np) = read_leb128(buf, pos)?;
+        pos = np;
 
-        let key_len: usize = reader.read_u16_varint().ok()?.into();
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "blocks tend to be some megabytes in size at most, so position should fit into usize"
-        )]
-        let key_start = offset.checked_add(reader.position() as usize)?;
+        let (key_len_raw, np) = read_leb128(buf, pos)?;
+        pos = np;
+        let key_len = usize::try_from(key_len_raw)
+            .ok()
+            .filter(|&k| k <= usize::from(u16::MAX))?;
+        let key_start = offset.checked_add(pos)?;
         let key_end = key_start.checked_add(key_len)?;
         if key_end > entries_end {
             return None;
         }
+        pos = pos.checked_add(key_len)?;
 
-        #[expect(
-            clippy::cast_possible_wrap,
-            reason = "key_len is bounded by u16::MAX, no wrap expected"
-        )]
-        let key_len_i64 = key_len as i64;
-        reader.seek_relative(key_len_i64).ok()?;
-
-        let key = data.get(key_start..key_end);
-
-        key.map(|k| (k, seqno))
+        let key = data.get(key_start..key_end)?;
+        reader.set_position(pos as u64);
+        Some((key, seqno))
     }
 
     fn parse_full(
@@ -77,26 +70,30 @@ impl Decodable<DataBlockParsedItem> for InternalValue {
         offset: usize,
         entries_end: usize,
     ) -> Option<DataBlockParsedItem> {
-        let value_type = reader.read_u8().ok()?;
+        // Slice-based decode: read from the cursor's buffer through a local
+        // index instead of `Cursor::read_u8` per byte; advance the cursor once
+        // at the end. See `read_leb128`.
+        let buf: &[u8] = *reader.get_ref();
+        let mut pos = usize::try_from(reader.position()).ok()?;
+
+        let value_type = *buf.get(pos)?;
+        pos += 1;
         if value_type == TRAILER_START_MARKER {
             return None;
         }
 
         let value_type = ValueType::try_from(value_type).ok()?;
 
-        let seqno = reader.read_u64_varint().ok()?;
+        let (seqno, np) = read_leb128(buf, pos)?;
+        pos = np;
 
-        let key_len: usize = reader.read_u16_varint().ok()?.into();
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "blocks tend to be some megabytes in size at most, so position should fit into usize"
-        )]
-        let key_start = offset.checked_add(reader.position() as usize)?;
-        #[expect(
-            clippy::cast_possible_wrap,
-            reason = "key_len is bounded by u16::MAX, no wrap expected"
-        )]
-        let key_len_i64 = key_len as i64;
+        let (key_len_raw, np) = read_leb128(buf, pos)?;
+        pos = np;
+        // key_len is encoded as a u16 varint on the wire.
+        let key_len = usize::try_from(key_len_raw)
+            .ok()
+            .filter(|&k| k <= usize::from(u16::MAX))?;
+        let key_start = offset.checked_add(pos)?;
         if key_start > entries_end {
             return None;
         }
@@ -104,25 +101,21 @@ impl Decodable<DataBlockParsedItem> for InternalValue {
         if key_end > entries_end {
             return None;
         }
-        reader.seek_relative(key_len_i64).ok()?;
+        pos = pos.checked_add(key_len)?;
 
         let is_value = !value_type.is_tombstone();
 
         let val_len: usize = if is_value {
-            reader.read_u32_varint().ok()? as usize
+            let (val_len_raw, np) = read_leb128(buf, pos)?;
+            pos = np;
+            // val_len is encoded as a u32 varint on the wire.
+            usize::try_from(val_len_raw)
+                .ok()
+                .filter(|&v| v <= u32::MAX as usize)?
         } else {
             0
         };
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "blocks tend to be some megabytes in size at most, so position should fit into usize"
-        )]
-        let val_offset = offset.checked_add(reader.position() as usize)?;
-        #[expect(
-            clippy::cast_possible_wrap,
-            reason = "val_len is bounded by u32::MAX, no wrap expected"
-        )]
-        let val_len_i64 = val_len as i64;
+        let val_offset = offset.checked_add(pos)?;
         if val_offset > entries_end {
             return None;
         }
@@ -130,7 +123,8 @@ impl Decodable<DataBlockParsedItem> for InternalValue {
         if val_end > entries_end {
             return None;
         }
-        reader.seek_relative(val_len_i64).ok()?;
+        pos = pos.checked_add(val_len)?;
+        reader.set_position(pos as u64);
 
         Some(if is_value {
             DataBlockParsedItem {
@@ -158,16 +152,31 @@ impl Decodable<DataBlockParsedItem> for InternalValue {
         base_key_end: usize,
         entries_end: usize,
     ) -> Option<DataBlockParsedItem> {
-        let value_type = reader.read_u8().ok()?;
+        // Slice-based decode (see `parse_full` / `read_leb128`).
+        let buf: &[u8] = *reader.get_ref();
+        let mut pos = usize::try_from(reader.position()).ok()?;
+
+        let value_type = *buf.get(pos)?;
+        pos += 1;
         if value_type == TRAILER_START_MARKER {
             return None;
         }
         let value_type = ValueType::try_from(value_type).ok()?;
 
-        let seqno = reader.read_u64_varint().ok()?;
+        let (seqno, np) = read_leb128(buf, pos)?;
+        pos = np;
 
-        let shared_prefix_len: usize = reader.read_u16_varint().ok()?.into();
-        let rest_key_len: usize = reader.read_u16_varint().ok()?.into();
+        let (shared_raw, np) = read_leb128(buf, pos)?;
+        pos = np;
+        let shared_prefix_len = usize::try_from(shared_raw)
+            .ok()
+            .filter(|&k| k <= usize::from(u16::MAX))?;
+        let (rest_raw, np) = read_leb128(buf, pos)?;
+        pos = np;
+        let rest_key_len = usize::try_from(rest_raw)
+            .ok()
+            .filter(|&k| k <= usize::from(u16::MAX))?;
+
         if base_key_end < base_key_offset || base_key_end > offset {
             return None;
         }
@@ -179,11 +188,7 @@ impl Decodable<DataBlockParsedItem> for InternalValue {
             return None;
         }
 
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "truncation is not expected to happen"
-        )]
-        let key_offset = offset.checked_add(reader.position() as usize)?;
+        let key_offset = offset.checked_add(pos)?;
         if key_offset > entries_end {
             return None;
         }
@@ -191,26 +196,20 @@ impl Decodable<DataBlockParsedItem> for InternalValue {
         if key_end > entries_end {
             return None;
         }
-
-        #[expect(
-            clippy::cast_possible_wrap,
-            reason = "rest_key_len is bounded by u16::MAX, no wrap expected"
-        )]
-        let rest_key_len_i64 = rest_key_len as i64;
-        reader.seek_relative(rest_key_len_i64).ok()?;
+        pos = pos.checked_add(rest_key_len)?;
 
         let is_value = !value_type.is_tombstone();
 
         let val_len: usize = if is_value {
-            reader.read_u32_varint().ok()? as usize
+            let (val_len_raw, np) = read_leb128(buf, pos)?;
+            pos = np;
+            usize::try_from(val_len_raw)
+                .ok()
+                .filter(|&v| v <= u32::MAX as usize)?
         } else {
             0
         };
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "truncation is not expected to happen"
-        )]
-        let val_offset = offset.checked_add(reader.position() as usize)?;
+        let val_offset = offset.checked_add(pos)?;
         if val_offset > entries_end {
             return None;
         }
@@ -218,12 +217,8 @@ impl Decodable<DataBlockParsedItem> for InternalValue {
         if val_end > entries_end {
             return None;
         }
-        #[expect(
-            clippy::cast_possible_wrap,
-            reason = "val_len is bounded by u32::MAX, fits in i64 without wrap"
-        )]
-        let val_len_i64 = val_len as i64;
-        reader.seek_relative(val_len_i64).ok()?;
+        pos = pos.checked_add(val_len)?;
+        reader.set_position(pos as u64);
 
         Some(if is_value {
             DataBlockParsedItem {
