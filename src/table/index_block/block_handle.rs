@@ -905,4 +905,34 @@ mod tests {
             "inverted seqno bounds must be rejected by parse_restart_key",
         );
     }
+
+    #[test]
+    fn parse_restart_key_rejects_oversized_block_handle_size() {
+        // A restart head whose block-handle size varint encodes a value beyond
+        // u32::MAX is corrupt: BlockHandle::size is u32. parse_restart_key must
+        // reject it (like parse_full / parse_truncated validate their handle
+        // fields) instead of skipping the field and feeding a forged entry into
+        // restart-table navigation. Built by hand because the encoder cannot
+        // emit an out-of-range size.
+        let mut bytes = Vec::new();
+        bytes.push(0u8); // marker 0 (legacy full restart head)
+        bytes.push(0u8); // file offset varint = 0
+        // size varint = u32::MAX + 1 = 4_294_967_296 (5-byte LEB128).
+        bytes.extend_from_slice(&[0x80, 0x80, 0x80, 0x80, 0x10]);
+        bytes.push(7u8); // seqno varint = 7
+        bytes.push(6u8); // key_len u16 varint = 6
+        bytes.extend_from_slice(b"abcdef"); // key
+
+        let mut cursor = Cursor::new(bytes.as_slice());
+        let parsed = <KeyedBlockHandle as Decodable<IndexBlockParsedItem>>::parse_restart_key(
+            &mut cursor,
+            0,
+            bytes.as_slice(),
+            bytes.len(),
+        );
+        assert!(
+            parsed.is_none(),
+            "block-handle size beyond u32::MAX must be rejected by parse_restart_key",
+        );
+    }
 }

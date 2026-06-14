@@ -1267,6 +1267,26 @@ mod tests {
         },
     };
 
+    #[test]
+    fn read_leb128_rejects_overlong_10th_byte() {
+        use super::read_leb128;
+        // A 10-byte varint whose final payload byte exceeds 1 encodes a value
+        // wider than u64. It must be rejected (None), not silently truncated
+        // into a Some(_), or corruption in on-disk seqnos/lengths that every
+        // slice-based parse path now decodes through read_leb128 goes
+        // undetected. Nine continuation bytes (payload 0) + a terminating 10th
+        // byte with payload 2.
+        let overlong = [0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x02];
+        assert!(
+            read_leb128(&overlong, 0).is_none(),
+            "10-byte varint with 10th-byte payload > 1 overflows u64 and must be rejected",
+        );
+        // The boundary-valid case (10th-byte payload 1 → sets bit 63) is still
+        // accepted and round-trips to 1 << 63, so the reject is not over-broad.
+        let max_bit = [0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x01];
+        assert_eq!(read_leb128(&max_bit, 0), Some((1u64 << 63, 10)));
+    }
+
     fn make_handles(count: usize) -> Vec<KeyedBlockHandle> {
         (0..count)
             .map(|i| {
