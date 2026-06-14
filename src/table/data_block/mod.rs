@@ -11,8 +11,7 @@ pub use iter::Iter;
 
 use super::block::{
     Block, Decodable, Decoder, Encodable, Encoder, ParsedItem, TRAILER_START_MARKER, Trailer,
-    binary_index::Reader as BinaryIndexReader, decoder::read_leb128,
-    hash_index::Reader as HashIndexReader,
+    decoder::read_leb128, hash_index::Reader as HashIndexReader,
 };
 use crate::io::Cursor;
 #[cfg(not(feature = "std"))]
@@ -402,6 +401,39 @@ pub struct DataBlock {
     pub inner: Block,
 }
 
+/// Seqno-aware binary search positioning the decoder's forward cursor at the
+/// last restart interval whose head key is below `needle` (or equal with a
+/// seqno at least the snapshot boundary). Borrows the comparator: the lex fast
+/// path is statically dispatched and inlinable, the custom-comparator branch
+/// keeps the `dyn UserComparator::compare` call. Mirrors
+/// [`Iter::seek_to_key_seqno`] but drives the decoder directly.
+fn seek_data_block(
+    decoder: &mut Decoder<'_, InternalValue, DataBlockParsedItem>,
+    needle: &[u8],
+    seqno: SeqNo,
+    comparator: &crate::comparator::SharedComparator,
+) -> bool {
+    if comparator.is_lexicographic() {
+        decoder.seek(
+            |head_key, head_seqno| match head_key.cmp(needle) {
+                core::cmp::Ordering::Less => true,
+                core::cmp::Ordering::Equal => head_seqno >= seqno,
+                core::cmp::Ordering::Greater => false,
+            },
+            false,
+        )
+    } else {
+        decoder.seek(
+            |head_key, head_seqno| match comparator.compare(head_key, needle) {
+                core::cmp::Ordering::Less => true,
+                core::cmp::Ordering::Equal => head_seqno >= seqno,
+                core::cmp::Ordering::Greater => false,
+            },
+            false,
+        )
+    }
+}
+
 impl DataBlock {
     /// Interprets a block as a data block.
     ///
@@ -469,34 +501,6 @@ impl DataBlock {
     #[must_use]
     pub fn as_slice(&self) -> &Slice {
         &self.inner.data
-    }
-
-    pub(crate) fn get_binary_index_reader(&self) -> BinaryIndexReader<'_> {
-        use core::mem::size_of;
-
-        let trailer = Trailer::new(&self.inner);
-
-        // NOTE: Skip restart interval (u8)
-        let offset = size_of::<u8>();
-
-        let mut reader = unwrap!(trailer.as_slice().get(offset..));
-
-        let binary_index_step_size = unwrap!(reader.read_u8());
-
-        debug_assert!(
-            binary_index_step_size == 2 || binary_index_step_size == 4,
-            "invalid binary index step size",
-        );
-
-        let binary_index_len = unwrap!(reader.read_u32::<LittleEndian>());
-        let binary_index_offset = unwrap!(reader.read_u32::<LittleEndian>());
-
-        BinaryIndexReader::new(
-            &self.inner.data,
-            binary_index_offset,
-            binary_index_len,
-            binary_index_step_size,
-        )
     }
 
     #[must_use]
@@ -585,6 +589,14 @@ impl DataBlock {
     /// Shared point-read seek + scan, parameterized over how the matched entry
     /// is turned into a result. `point_read` materializes a full
     /// [`InternalValue`]; `point_read_value` extracts only the value.
+    ///
+    /// Drives the [`Decoder`] directly rather than through [`Iter`]: point reads
+    /// are forward-only seek + scan, so the double-ended peeking wrapper is pure
+    /// overhead here. The hash / binary index readers are built from the
+    /// decoder's trailer metadata (parsed once in `try_new`), avoiding the
+    /// per-lookup trailer re-parse a fresh reader off the block would incur.
+    /// The seqno-aware seek closure borrows the comparator, so no `Arc`
+    /// refcount bump happens per lookup.
     #[inline]
     fn point_read_with<R>(
         &self,
@@ -593,44 +605,48 @@ impl DataBlock {
         comparator: &crate::comparator::SharedComparator,
         extract: impl FnOnce(&DataBlockParsedItem, &Slice) -> R,
     ) -> crate::Result<Option<R>> {
-        // Validate trailer once via try_iter (which calls Decoder::try_new
-        // internally). This must happen before get_hash_index_reader /
-        // get_binary_index_reader which read trailer fields without their own
-        // validation.
-        let mut iter = self.try_iter(comparator.clone())?;
+        use crate::table::block::BlockType;
 
-        let iter = if let Some(hash_index_reader) = self.get_hash_index_reader() {
+        // DataBlock is used for both Data and Meta blocks (same encoding).
+        if !matches!(
+            self.inner.header.block_type,
+            BlockType::Data | BlockType::Meta
+        ) {
+            return Err(crate::Error::InvalidTag((
+                "BlockType",
+                self.inner.header.block_type.into(),
+            )));
+        }
+
+        // try_new validates + caches all trailer fields once.
+        let mut decoder = Decoder::<InternalValue, DataBlockParsedItem>::try_new(&self.inner)?;
+
+        let positioned = if let Some(hash_index_reader) = decoder.cached_hash_index_reader() {
             match hash_index_reader.get(needle) {
-                MARKER_FREE => {
-                    return Ok(None);
-                }
-                MARKER_CONFLICT => {
-                    // NOTE: Fallback to seqno-aware binary search
-                    if !iter.seek_to_key_seqno(needle, seqno) {
-                        return Ok(None);
+                MARKER_FREE => return Ok(None),
+                // NOTE: Fallback to seqno-aware binary search on a hash conflict.
+                MARKER_CONFLICT => seek_data_block(&mut decoder, needle, seqno, comparator),
+                idx => match decoder.cached_binary_index_reader() {
+                    Some(binary_index_reader) => {
+                        let offset: usize = binary_index_reader.get(usize::from(idx));
+                        decoder.set_lo_offset(offset);
+                        true
                     }
-
-                    iter
-                }
-                idx => {
-                    let offset: usize = self.get_binary_index_reader().get(usize::from(idx));
-                    iter.seek_to_offset(offset);
-
-                    iter
-                }
+                    None => seek_data_block(&mut decoder, needle, seqno, comparator),
+                },
             }
         } else {
             // NOTE: Seqno-aware binary search reduces linear scanning by skipping most
             // restart intervals that contain only versions newer than the target seqno
-            if !iter.seek_to_key_seqno(needle, seqno) {
-                return Ok(None);
-            }
-
-            iter
+            seek_data_block(&mut decoder, needle, seqno, comparator)
         };
 
-        // Linear scan
-        for item in iter {
+        if !positioned {
+            return Ok(None);
+        }
+
+        // Linear scan (forward-only; the decoder is its own Iterator).
+        for item in decoder.by_ref() {
             match item.compare_key(needle, &self.inner.data, comparator.as_ref()) {
                 core::cmp::Ordering::Greater => {
                     // We are past our searched key

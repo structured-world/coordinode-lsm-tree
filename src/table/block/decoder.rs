@@ -2,7 +2,10 @@
 // Copyright (c) 2025-present, fjall-rs
 // Copyright (c) 2026-present, Structured World Foundation
 
-use super::{TRAILER_START_MARKER, binary_index::Reader as BinaryIndexReader};
+use super::{
+    TRAILER_START_MARKER, binary_index::Reader as BinaryIndexReader,
+    hash_index::Reader as HashIndexReader,
+};
 use crate::io::{LittleEndian, ReadBytesExt};
 use crate::{
     SeqNo, Slice,
@@ -515,6 +518,28 @@ impl<'a, Item: Decodable<Parsed>, Parsed: ParsedItem<Item>> Decoder<'a, Item, Pa
             self.binary_index_offset,
             self.binary_index_len,
             self.binary_index_step_size,
+        ))
+    }
+
+    /// Binary index reader built from the trailer metadata cached at
+    /// construction, with no re-parse of the block trailer. Returns `None`
+    /// if the cached layout is inconsistent (mirrors the validation in
+    /// [`Self::get_binary_index_reader`]).
+    pub(crate) fn cached_binary_index_reader(&self) -> Option<BinaryIndexReader<'_>> {
+        self.get_binary_index_reader()
+    }
+
+    /// Hash index reader built from the trailer metadata cached at
+    /// construction, with no re-parse of the block trailer. Returns `None`
+    /// when the block carries no hash index (`hash_index_len == 0`).
+    pub(crate) fn cached_hash_index_reader(&self) -> Option<HashIndexReader<'_>> {
+        if self.hash_index_len == 0 {
+            return None;
+        }
+        Some(HashIndexReader::new(
+            &self.block.data,
+            self.hash_index_offset,
+            self.hash_index_len,
         ))
     }
 
