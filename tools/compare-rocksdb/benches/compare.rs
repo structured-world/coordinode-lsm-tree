@@ -68,7 +68,11 @@
 //!   pre-populated with N keys and flushed to disk. Warm: the engine
 //!   is opened + populated + flushed ONCE outside the timed window,
 //!   so the measurement is steady-state read latency (block cache +
-//!   bloom filter + on-disk block fetch), not setup cost.
+//!   bloom filter + on-disk block fetch), not setup cost. The `ours` /
+//!   `rocksdb` series use a binary-search data-block index; the same chart
+//!   overlays `ours-hash-index` / `rocksdb-hash-index` series (data-block
+//!   hash index ON — ours: 1.33 buckets/entry; RocksDB: `BinaryAndHash` @
+//!   0.75) so both index strategies are compared head-to-head on one plot.
 //! - `range_scan/{1k,10k}` — full forward scan reading every value
 //!   from a warm, pre-populated engine. Steady-state sequential-scan
 //!   throughput (block decode + iterator advance).
@@ -94,7 +98,7 @@ use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_m
 // for method resolution (clippy `-D warnings` confirms it is live).
 use lsm_tree::{
     AbstractTree, CompressionType, Config, Guard, MAX_SEQNO, SequenceNumberCounter,
-    config::{CompressionPolicy, KvSeparationOptions},
+    config::{CompressionPolicy, HashRatioPolicy, KvSeparationOptions},
     runtime_config::{KvChecksumPolicy, RuntimeConfig},
 };
 use surrealkv::{
@@ -430,13 +434,22 @@ impl WorkloadInputs {
 /// per-variant setting: `None` leaves RocksDB uncompressed; `Zstd22`
 /// sets `DBCompressionType::Zstd` and pins the level to 22 via
 /// `set_compression_options`.
-fn rocksdb_options(compression: Compression) -> rocksdb::Options {
+fn rocksdb_options(compression: Compression, hash_index: bool) -> rocksdb::Options {
     let mut block_opts = rocksdb::BlockBasedOptions::default();
     let cache = rocksdb::Cache::new_lru_cache(16 * 1024 * 1024);
     block_opts.set_block_cache(&cache);
     // bits_per_key = 10.0, block_based = false → modern full-block filter,
     // the closest match to our `BitsPerKey(10.0)` policy.
     block_opts.set_bloom_filter(10.0, false);
+    if hash_index {
+        // Data-block hash index: a point get resolves a key to its in-block
+        // offset by hash instead of binary-searching the restart array. The
+        // 0.75 utilization is RocksDB's recommended default and is the rough
+        // equal of our 1.33 buckets/entry (1 / 1.33 ≈ 0.75) for an
+        // apples-to-apples hash-index overlay.
+        block_opts.set_data_block_index_type(rocksdb::DataBlockIndexType::BinaryAndHash);
+        block_opts.set_data_block_hash_ratio(0.75);
+    }
     let mut opts = rocksdb::Options::default();
     opts.create_if_missing(true);
     match compression {
@@ -470,12 +483,22 @@ fn open_ours(
     dir: &std::path::Path,
     compression: Compression,
     kv_separated: bool,
+    hash_index: bool,
 ) -> Result<lsm_tree::AnyTree, Box<dyn std::error::Error>> {
     let config = Config::new(
         dir,
         SequenceNumberCounter::default(),
         SequenceNumberCounter::default(),
     );
+    // Data-block hash index: a point get resolves a key to its in-block offset
+    // by hash instead of binary-searching the restart array. 1.33 buckets/entry
+    // is the rough equal of RocksDB's 0.75 utilization for the hash-index
+    // overlay. Default policy (0.0) leaves it off for the binary-search arms.
+    let config = if hash_index {
+        config.data_block_hash_ratio_policy(HashRatioPolicy::all(1.33))
+    } else {
+        config
+    };
     let config = match compression {
         Compression::None => {
             config.data_block_compression_policy(CompressionPolicy::all(CompressionType::None))
@@ -548,7 +571,7 @@ fn run_write_throughput(
     let start = std::time::Instant::now();
     let elapsed = match engine {
         Engine::Ours | Engine::BlobTree => {
-            let tree = open_ours(dir.path(), compression, engine.kv_separated())?;
+            let tree = open_ours(dir.path(), compression, engine.kv_separated(), false)?;
             // Zip the seqno counter as a native `u64` instead of
             // enumerate()+try_from(usize). lsm-tree's `insert` takes
             // SeqNo (= u64) directly; using `0u64..` avoids the
@@ -570,7 +593,7 @@ fn run_write_throughput(
             // our engine's defaults — see `rocksdb_options`. Our engine
             // builds a bloom filter at flush, so giving RocksDB the same
             // keeps the write comparison apples-to-apples.
-            let opts = rocksdb_options(compression);
+            let opts = rocksdb_options(compression, false);
             // Match our engine's durability shape: lsm-tree has no
             // WAL — durability is the caller's responsibility, and
             // `flush_active_memtable` is the equivalent of an
@@ -713,18 +736,40 @@ fn write_throughput_variant(c: &mut Criterion, group_name: &str, compression: Co
 /// bare `get` + `black_box` with no per-read branch.
 fn bench_point_read(c: &mut Criterion) {
     // `None` baseline + `Zstd22` high-ratio variant in sibling groups,
-    // mirroring `bench_write_throughput`.
-    point_read_variant(c, "point_read", Compression::None);
-    point_read_variant(c, "point_read_zstd22", Compression::Zstd22);
+    // mirroring `bench_write_throughput`. The `point_read` group ADDS the
+    // hash-index series (`ours-hash-index`, `rocksdb-hash-index`) as extra
+    // overlays ON THE SAME chart alongside the binary-search `ours` / `rocksdb`
+    // lines, so one chart shows both index strategies head-to-head.
+    point_read_variant(c, "point_read", Compression::None, true);
+    point_read_variant(c, "point_read_zstd22", Compression::Zstd22, false);
 }
 
-fn point_read_variant(c: &mut Criterion, group_name: &str, compression: Compression) {
+fn point_read_variant(
+    c: &mut Criterion,
+    group_name: &str,
+    compression: Compression,
+    hash_overlays: bool,
+) {
+    // Series overlaid on this ONE chart: every base engine with the data-block
+    // hash index OFF (binary search), plus — when `hash_overlays` is set — the
+    // two engines that support a data-block hash index again with it ON. Extend
+    // this list to add more index strategies (e.g. a future `ours-burr` ribbon
+    // series) as additional overlays on the same chart.
+    let mut series: Vec<(&str, Engine, bool)> = engines_for(compression)
+        .iter()
+        .map(|&engine| (engine.label(), engine, false))
+        .collect();
+    if hash_overlays {
+        series.push(("ours-hash-index", Engine::Ours, true));
+        series.push(("rocksdb-hash-index", Engine::RocksDb, true));
+    }
+
     let mut group = c.benchmark_group(group_name);
     for &n in &[1_000_u64, 10_000_u64] {
         let inputs = WorkloadInputs::build(n);
         group.throughput(Throughput::Elements(n));
-        for &engine in engines_for(compression) {
-            group.bench_with_input(BenchmarkId::new(engine.label(), n), &n, |b, _| {
+        for &(label, engine, hash_index) in &series {
+            group.bench_with_input(BenchmarkId::new(label, n), &n, |b, _| {
                 // The temp dir + engine handle outlive every timed
                 // iteration: build the on-disk database once here so
                 // the criterion warmup / measurement loop only ever
@@ -732,8 +777,9 @@ fn point_read_variant(c: &mut Criterion, group_name: &str, compression: Compress
                 let dir = tempfile::tempdir().expect("tempdir");
                 match engine {
                     Engine::Ours | Engine::BlobTree => {
-                        let tree = open_ours(dir.path(), compression, engine.kv_separated())
-                            .expect("ours: open");
+                        let tree =
+                            open_ours(dir.path(), compression, engine.kv_separated(), hash_index)
+                                .expect("ours: open");
                         for ((key, value), seqno) in
                             inputs.keys.iter().zip(inputs.values.iter()).zip(0u64..)
                         {
@@ -768,7 +814,7 @@ fn point_read_variant(c: &mut Criterion, group_name: &str, compression: Compress
                         // matching our engine's defaults so the per-`get`
                         // overhead is attributable, not a config artefact —
                         // see `rocksdb_options`.
-                        let opts = rocksdb_options(compression);
+                        let opts = rocksdb_options(compression, hash_index);
                         let db = rocksdb::DB::open(&opts, dir.path()).expect("rocksdb: open");
                         let mut write_opts = rocksdb::WriteOptions::default();
                         write_opts.disable_wal(true);
@@ -841,7 +887,7 @@ fn populate_rocksdb(
     compression: Compression,
     inputs: &WorkloadInputs,
 ) -> rocksdb::DB {
-    let opts = rocksdb_options(compression);
+    let opts = rocksdb_options(compression, false);
     let db = rocksdb::DB::open(&opts, dir).expect("rocksdb: open");
     let mut write_opts = rocksdb::WriteOptions::default();
     write_opts.disable_wal(true);
@@ -861,7 +907,7 @@ fn populate_ours(
     inputs: &WorkloadInputs,
     kv_separated: bool,
 ) -> lsm_tree::AnyTree {
-    let tree = open_ours(dir, compression, kv_separated).expect("ours: open");
+    let tree = open_ours(dir, compression, kv_separated, false).expect("ours: open");
     for ((key, value), seqno) in inputs.keys.iter().zip(inputs.values.iter()).zip(0u64..) {
         tree.insert(key, value, seqno);
     }
