@@ -94,7 +94,7 @@ use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_m
 // for method resolution (clippy `-D warnings` confirms it is live).
 use lsm_tree::{
     AbstractTree, CompressionType, Config, Guard, MAX_SEQNO, SequenceNumberCounter,
-    config::{CompressionPolicy, KvSeparationOptions},
+    config::{CompressionPolicy, HashRatioPolicy, KvSeparationOptions},
     runtime_config::{KvChecksumPolicy, RuntimeConfig},
 };
 use surrealkv::{
@@ -227,6 +227,13 @@ impl Engine {
 /// `blob_tree` arm exists to measure. Below the default 1 KiB threshold, which
 /// would leave the 256-byte values inlined (no separation, no measurement).
 const BLOB_SEPARATION_THRESHOLD: u32 = 128;
+
+/// Hash-table fill ratio for the per-block hash index, used by the `_hashidx`
+/// parity groups on our side. Matches RocksDB's default `data_block_hash_table_
+/// util_ratio` of 0.75 (the rocksdb-0.24 binding exposes no setter for it), so
+/// `DataBlockIndexType::BinaryAndHash` and `HashRatioPolicy::all(0.75)` compare
+/// the same knob at parity.
+const HASH_INDEX_RATIO: f32 = 0.75;
 
 /// Engines to overlay for a given compression variant.
 ///
@@ -430,13 +437,19 @@ impl WorkloadInputs {
 /// per-variant setting: `None` leaves RocksDB uncompressed; `Zstd22`
 /// sets `DBCompressionType::Zstd` and pins the level to 22 via
 /// `set_compression_options`.
-fn rocksdb_options(compression: Compression) -> rocksdb::Options {
+fn rocksdb_options(compression: Compression, hash_index: bool) -> rocksdb::Options {
     let mut block_opts = rocksdb::BlockBasedOptions::default();
     let cache = rocksdb::Cache::new_lru_cache(16 * 1024 * 1024);
     block_opts.set_block_cache(&cache);
     // bits_per_key = 10.0, block_based = false → modern full-block filter,
     // the closest match to our `BitsPerKey(10.0)` policy.
     block_opts.set_bloom_filter(10.0, false);
+    if hash_index {
+        // Per-block hash index: the symmetric peer of our `HashRatioPolicy`.
+        // RocksDB defaults the hash-table util ratio to 0.75 (the binding has no
+        // setter for it), which our side matches via `HASH_INDEX_RATIO`.
+        block_opts.set_data_block_index_type(rocksdb::DataBlockIndexType::BinaryAndHash);
+    }
     let mut opts = rocksdb::Options::default();
     opts.create_if_missing(true);
     match compression {
@@ -470,6 +483,7 @@ fn open_ours(
     dir: &std::path::Path,
     compression: Compression,
     kv_separated: bool,
+    hash_index: bool,
 ) -> Result<lsm_tree::AnyTree, Box<dyn std::error::Error>> {
     let config = Config::new(
         dir,
@@ -483,6 +497,14 @@ fn open_ours(
         Compression::Zstd22 => config.data_block_compression_policy(CompressionPolicy::all(
             CompressionType::Zstd(Compression::ZSTD_MAX_LEVEL),
         )),
+    };
+    // Per-block hash index: the symmetric peer of RocksDB's
+    // `DataBlockIndexType::BinaryAndHash`. Turns the within-block restart-interval
+    // scan into a hash bucket lookup; off (ratio 0.0) by default on both engines.
+    let config = if hash_index {
+        config.data_block_hash_ratio_policy(HashRatioPolicy::all(HASH_INDEX_RATIO))
+    } else {
+        config
     };
     let config = if kv_separated {
         // Blobs stay `None`-compressed (the bench crate has no `lz4` feature, so
@@ -548,7 +570,7 @@ fn run_write_throughput(
     let start = std::time::Instant::now();
     let elapsed = match engine {
         Engine::Ours | Engine::BlobTree => {
-            let tree = open_ours(dir.path(), compression, engine.kv_separated())?;
+            let tree = open_ours(dir.path(), compression, engine.kv_separated(), false)?;
             // Zip the seqno counter as a native `u64` instead of
             // enumerate()+try_from(usize). lsm-tree's `insert` takes
             // SeqNo (= u64) directly; using `0u64..` avoids the
@@ -570,7 +592,7 @@ fn run_write_throughput(
             // our engine's defaults — see `rocksdb_options`. Our engine
             // builds a bloom filter at flush, so giving RocksDB the same
             // keeps the write comparison apples-to-apples.
-            let opts = rocksdb_options(compression);
+            let opts = rocksdb_options(compression, false);
             // Match our engine's durability shape: lsm-tree has no
             // WAL — durability is the caller's responsibility, and
             // `flush_active_memtable` is the equivalent of an
@@ -732,7 +754,7 @@ fn point_read_variant(c: &mut Criterion, group_name: &str, compression: Compress
                 let dir = tempfile::tempdir().expect("tempdir");
                 match engine {
                     Engine::Ours | Engine::BlobTree => {
-                        let tree = open_ours(dir.path(), compression, engine.kv_separated())
+                        let tree = open_ours(dir.path(), compression, engine.kv_separated(), false)
                             .expect("ours: open");
                         for ((key, value), seqno) in
                             inputs.keys.iter().zip(inputs.values.iter()).zip(0u64..)
@@ -768,7 +790,7 @@ fn point_read_variant(c: &mut Criterion, group_name: &str, compression: Compress
                         // matching our engine's defaults so the per-`get`
                         // overhead is attributable, not a config artefact —
                         // see `rocksdb_options`.
-                        let opts = rocksdb_options(compression);
+                        let opts = rocksdb_options(compression, false);
                         let db = rocksdb::DB::open(&opts, dir.path()).expect("rocksdb: open");
                         let mut write_opts = rocksdb::WriteOptions::default();
                         write_opts.disable_wal(true);
@@ -831,6 +853,86 @@ fn point_read_variant(c: &mut Criterion, group_name: &str, compression: Compress
     group.finish();
 }
 
+/// Warm point-read with the per-block hash index turned ON for BOTH engines.
+///
+/// The hash index is a knob both engines expose (ours via [`HashRatioPolicy`],
+/// RocksDB via `DataBlockIndexType::BinaryAndHash`), so the Benchmark Symmetry
+/// Invariant requires comparing it at parity rather than enabling it on one
+/// side only. The plain `point_read` group is the both-OFF parity baseline;
+/// this group answers "does our per-block hash index match RocksDB's?". It is
+/// ours-vs-rocksdb only: surrealkv (B+tree) and blob_tree do not expose this
+/// exact knob. None compression throughout.
+fn bench_point_read_hashidx(c: &mut Criterion) {
+    let mut group = c.benchmark_group("point_read_hashidx");
+    for &n in &[1_000_u64, 10_000_u64] {
+        let inputs = WorkloadInputs::build(n);
+        group.throughput(Throughput::Elements(n));
+        for &engine in &[Engine::Ours, Engine::RocksDb] {
+            group.bench_with_input(BenchmarkId::new(engine.label(), n), &n, |b, _| {
+                let dir = tempfile::tempdir().expect("tempdir");
+                match engine {
+                    Engine::Ours => {
+                        let tree = open_ours(dir.path(), Compression::None, false, true)
+                            .expect("ours: open");
+                        for ((key, value), seqno) in
+                            inputs.keys.iter().zip(inputs.values.iter()).zip(0u64..)
+                        {
+                            tree.insert(key, value, seqno);
+                        }
+                        tree.flush_active_memtable(0).expect("ours: flush");
+                        for key in &inputs.keys {
+                            assert!(
+                                tree.get(key, MAX_SEQNO).expect("ours: verify").is_some(),
+                                "ours: key unexpectedly missing"
+                            );
+                        }
+                        b.iter_custom(|iters| {
+                            let start = std::time::Instant::now();
+                            for _ in 0..iters {
+                                for key in &inputs.keys {
+                                    std::hint::black_box(
+                                        tree.get(key, MAX_SEQNO).expect("ours: get"),
+                                    );
+                                }
+                            }
+                            start.elapsed()
+                        });
+                    }
+                    Engine::RocksDb => {
+                        let opts = rocksdb_options(Compression::None, true);
+                        let db = rocksdb::DB::open(&opts, dir.path()).expect("rocksdb: open");
+                        let mut write_opts = rocksdb::WriteOptions::default();
+                        write_opts.disable_wal(true);
+                        for (key, value) in inputs.keys.iter().zip(inputs.values.iter()) {
+                            db.put_opt(key, value, &write_opts).expect("rocksdb: put");
+                        }
+                        db.flush().expect("rocksdb: flush");
+                        for key in &inputs.keys {
+                            assert!(
+                                db.get(key).expect("rocksdb: verify").is_some(),
+                                "rocksdb: key unexpectedly missing"
+                            );
+                        }
+                        b.iter_custom(|iters| {
+                            let start = std::time::Instant::now();
+                            for _ in 0..iters {
+                                for key in &inputs.keys {
+                                    std::hint::black_box(db.get(key).expect("rocksdb: get"));
+                                }
+                            }
+                            start.elapsed()
+                        });
+                    }
+                    Engine::SurrealKv | Engine::BlobTree => {
+                        unreachable!("point_read_hashidx is ours-vs-rocksdb only")
+                    }
+                }
+            });
+        }
+    }
+    group.finish();
+}
+
 /// Opens a RocksDB instance at `dir` with the matched options, populates
 /// it with `inputs` (WAL disabled, matching the untimed populate phase of
 /// our warm read scenarios), and flushes. Used by the warm read groups
@@ -841,7 +943,7 @@ fn populate_rocksdb(
     compression: Compression,
     inputs: &WorkloadInputs,
 ) -> rocksdb::DB {
-    let opts = rocksdb_options(compression);
+    let opts = rocksdb_options(compression, false);
     let db = rocksdb::DB::open(&opts, dir).expect("rocksdb: open");
     let mut write_opts = rocksdb::WriteOptions::default();
     write_opts.disable_wal(true);
@@ -861,7 +963,7 @@ fn populate_ours(
     inputs: &WorkloadInputs,
     kv_separated: bool,
 ) -> lsm_tree::AnyTree {
-    let tree = open_ours(dir, compression, kv_separated).expect("ours: open");
+    let tree = open_ours(dir, compression, kv_separated, false).expect("ours: open");
     for ((key, value), seqno) in inputs.keys.iter().zip(inputs.values.iter()).zip(0u64..) {
         tree.insert(key, value, seqno);
     }
@@ -1505,6 +1607,7 @@ criterion_group!(
     benches,
     bench_write_throughput,
     bench_point_read,
+    bench_point_read_hashidx,
     bench_range_scan,
     bench_seek_random,
     bench_overwrite,
