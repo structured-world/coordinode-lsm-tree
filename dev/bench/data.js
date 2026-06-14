@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1781367700103,
+  "lastUpdate": 1781425344085,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -15678,6 +15678,84 @@ window.BENCHMARK_DATA = {
             "value": 573245.1131269708,
             "unit": "ops/sec",
             "extra": "P50: 1.6us | P99: 5.0us | P99.9: 7.5us\nthreads: 1 | elapsed: 0.35s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "18d5748d306bcfab762ff5ecbd59c7d0a90f276a",
+          "message": "feat(tooling): repair KV-separated (blob) trees (#459)\n\n## Summary\n\n`Config::repair` now rebuilds the manifest of a KV-separated (blob) tree\ninstead of returning `Error::FeatureUnsupported`. It discovers blob\nfiles by scanning the `blobs/` folder (there is no manifest to filter\nagainst), computes each file's whole-file XXH3-128 checksum, recovers\nits metadata, and records them in the rebuilt manifest with\n`TreeType::Blob` so the tree reopens correctly.\n\nBlob fragmentation statistics start **empty**: they are derived from\ncompaction history and cannot be reconstructed from a directory scan.\nBlob GC is advisory, so it re-learns reclaimable space over time without\never dropping live data. This is surfaced as a warning in the\n`RepairReport`.\n\n## Changes\n\n- **`vlog::recover_blob_file`** (new): single-file blob recovery for the\nmanifest-rebuild path. Unlike `recover_blob_files` (which filters a\nknown id list and fails fast on any miss), this is used by a directory\nscan with per-file error handling: a corrupt blob is reported and left\nin place (it reads back as a harmless orphan on the next open) rather\nthan aborting the whole repair.\n- **`repair.rs`**: lifts the `FeatureUnsupported` guard; scans `blobs/`,\nquarantines non-numeric names (the reopen's blob recovery parses every\nname and would abort otherwise), reports unreadable blobs, and wires the\nrecovered list into the rebuilt `Version` with `TreeType::Blob`.\n- **`sst-dump repair`**: detects a blob tree by its `blobs/` folder and\nenables KV separation, so the CLI recovers blobs too (a default config\nwould rebuild a standard-tree manifest and silently drop them).\n- **`.gitignore`**: ignore the per-tree `LOCK` file (a runtime artifact\nof the directory lock; tests that open a fixture tree would otherwise\nleave it untracked).\n\n## Non-breaking\n\nThe new `vlog::recover_blob_file` is additive, and repair only removes\nan error path (enabling a previously-rejected operation). No public API\nwas changed or removed.\n\n## Testing\n\n- `repair_rebuilds_blob_tree_manifest_and_preserves_values`: writes ~4\nKiB (blob-backed) values, drops the manifest, repairs, reopens, and\nreads every value back (replaces the former\n`repair_rejects_kv_separated_trees`).\n- `recover_blob_file_on_non_blob_file_errors`: error-path unit test.\n- Full library suite `--all-features`: 2065 passed. `clippy\n--all-features --all-targets -D warnings` clean. sst-dump (separate\ncrate): clippy clean + 31 tests pass. no-std `alloc` build: 0 errors.\nDoctests pass.\n\nCloses #408\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n## Summary by CodeRabbit\n\n* **New Features**\n* Repair can now recover KV-separated (“blob”) trees, restoring\nblob-backed data after manifest rebuild scenarios.\n* **Improvements**\n* Repair tooling auto-detects existing `blobs/` storage and enables KV\nseparation; `sst-dump` help and behavior updated accordingly.\n* Blob fragmentation stats are reset during blob-tree repair, with a new\nwarning.\n* **Bug Fixes**\n* Invalid/non-blob entries in blob storage are quarantined and reported\nas unreadable, preventing bogus recovery.\n* **Tests**\n  * Expanded blob-tree repair success and failure/quarantine coverage.\n* **Chores**\n  * Updated `.gitignore` to ignore transient `LOCK` files.\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-06-14T11:21:24+03:00",
+          "tree_id": "d372976b269529471fc07cc4f0a69b744cf11972",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/18d5748d306bcfab762ff5ecbd59c7d0a90f276a"
+        },
+        "date": 1781425331953,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 1966479.4309496216,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.6us | P99.9: 3.7us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1113991.3295047048,
+            "unit": "ops/sec",
+            "extra": "P50: 0.8us | P99: 2.2us | P99.9: 4.4us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 667376.187660578,
+            "unit": "ops/sec",
+            "extra": "P50: 1.4us | P99: 4.5us | P99.9: 7.0us\nthreads: 1 | elapsed: 0.30s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3587237.9776006043,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 3.1us | P99.9: 5.8us\nthreads: 1 | elapsed: 0.06s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 428012.6974332423,
+            "unit": "ops/sec",
+            "extra": "P50: 2.0us | P99: 5.4us | P99.9: 8.6us\nthreads: 1 | elapsed: 0.47s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 223519.63723782127,
+            "unit": "ops/sec",
+            "extra": "P50: 4.2us | P99: 5.3us | P99.9: 7.7us\nthreads: 1 | elapsed: 0.89s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1133161.874610086,
+            "unit": "ops/sec",
+            "extra": "P50: 0.8us | P99: 2.2us | P99.9: 4.3us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1164414.0058860546,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 1.4us | P99.9: 3.1us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 551311.828163998,
+            "unit": "ops/sec",
+            "extra": "P50: 1.6us | P99: 5.0us | P99.9: 7.4us\nthreads: 1 | elapsed: 0.36s | num: 200000 | iterations: 3"
           }
         ]
       }
