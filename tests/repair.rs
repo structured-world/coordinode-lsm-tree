@@ -431,8 +431,9 @@ fn repair_reports_unopenable_file_as_unreadable() -> lsm_tree::Result<()> {
 }
 
 #[test]
-fn repair_rejects_kv_separated_trees() -> lsm_tree::Result<()> {
+fn repair_fails_when_a_bad_filename_cannot_be_quarantined() -> lsm_tree::Result<()> {
     let dir = tempfile::tempdir()?;
+    let big = |i: u64| format!("{i:08}").repeat(512);
 
     {
         let tree = Config::new(
@@ -442,11 +443,23 @@ fn repair_rejects_kv_separated_trees() -> lsm_tree::Result<()> {
         )
         .with_kv_separation(Some(KvSeparationOptions::default()))
         .open()?;
-        tree.insert("k", "v", 0);
+        for i in 0..10 {
+            tree.insert(key(i), big(i).as_bytes(), i);
+        }
         tree.flush_active_memtable(0)?;
     }
+    assert!(count_blob_files(dir.path())? >= 1);
 
     nuke_manifest(dir.path())?;
+
+    // A non-numeric name in blobs/ would make the reopened tree's blob recovery
+    // (which parses every name) abort, so repair must quarantine it.
+    std::fs::write(dir.path().join("blobs").join("not-a-blob-id"), b"junk")?;
+    // Block the quarantine: occupy the `repair-quarantine` directory path with a
+    // regular file so the rename's `create_dir_all` fails. Repair must then abort
+    // rather than report success while leaving the un-quarantined name in place
+    // (which would make the tree unopenable).
+    std::fs::write(dir.path().join("repair-quarantine"), b"blocker")?;
 
     let result = Config::new(
         dir.path(),
@@ -457,9 +470,141 @@ fn repair_rejects_kv_separated_trees() -> lsm_tree::Result<()> {
     .repair();
 
     assert!(
-        matches!(result, Err(lsm_tree::Error::FeatureUnsupported(_))),
-        "blob trees are not yet repairable, got {result:?}",
+        result.is_err(),
+        "repair must fail when it cannot quarantine a bad filename, got {result:?}",
     );
+
+    Ok(())
+}
+
+#[test]
+fn repair_fails_when_a_bad_table_filename_cannot_be_quarantined() -> lsm_tree::Result<()> {
+    // Sibling of the blob-side test above, covering the standard `tables/`
+    // quarantine path so the false-success regression cannot slip back for
+    // standard trees.
+    let dir = tempfile::tempdir()?;
+
+    {
+        let tree = Config::new(
+            &dir,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .open()?;
+        for i in 0..10 {
+            tree.insert(key(i), format!("v-{i}").as_bytes(), i);
+        }
+        tree.flush_active_memtable(0)?;
+    }
+    assert!(count_sst_files(dir.path())? >= 1);
+
+    nuke_manifest(dir.path())?;
+
+    // A non-numeric name in tables/ would make the reopened tree's recovery
+    // (which parses every name) abort, so repair must quarantine it.
+    std::fs::write(dir.path().join("tables").join("not-a-table-id"), b"junk")?;
+    // Block the quarantine by occupying the `repair-quarantine` directory path
+    // with a regular file. Repair must abort rather than report success while
+    // leaving the un-quarantined name in place.
+    std::fs::write(dir.path().join("repair-quarantine"), b"blocker")?;
+
+    let result = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .repair();
+
+    assert!(
+        result.is_err(),
+        "repair must fail when it cannot quarantine a bad table filename, got {result:?}",
+    );
+
+    Ok(())
+}
+
+/// Counts numerically-named blob files in a tree's `blobs/` folder.
+fn count_blob_files(dir: &std::path::Path) -> std::io::Result<usize> {
+    let blobs = dir.join("blobs");
+    if !blobs.exists() {
+        return Ok(0);
+    }
+    Ok(std::fs::read_dir(blobs)?
+        .filter_map(Result::ok)
+        .filter(|e| e.file_name().to_string_lossy().parse::<u64>().is_ok())
+        .count())
+}
+
+#[test]
+fn repair_rebuilds_blob_tree_manifest_and_preserves_values() -> lsm_tree::Result<()> {
+    let dir = tempfile::tempdir()?;
+
+    // ~4 KiB values, above the 1 KiB KV-separation threshold, so they spill into
+    // the value log as blob files: the artifact a blob-tree repair must
+    // rediscover (a plain SST scan would otherwise lose them).
+    let big = |i: u64| format!("{i:08}").repeat(512);
+
+    {
+        let tree = Config::new(
+            &dir,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_kv_separation(Some(KvSeparationOptions::default()))
+        .open()?;
+
+        for i in 0..50 {
+            tree.insert(key(i), big(i).as_bytes(), i);
+        }
+        tree.flush_active_memtable(0)?;
+
+        for i in 50..100 {
+            tree.insert(key(i), big(i).as_bytes(), i);
+        }
+        tree.flush_active_memtable(0)?;
+    }
+
+    let blob_count = count_blob_files(dir.path())?;
+    assert!(
+        blob_count >= 1,
+        "expected at least one blob file to exist, got {blob_count}",
+    );
+    let sst_count = count_sst_files(dir.path())?;
+
+    nuke_manifest(dir.path())?;
+
+    let report = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_kv_separation(Some(KvSeparationOptions::default()))
+    .repair()?;
+
+    assert_eq!(
+        report.recovered, sst_count,
+        "every SST on disk must be recovered",
+    );
+    assert_eq!(report.unreadable, 0, "no file should be unreadable");
+
+    // Reopen and verify every blob-backed value reads back, proving the blob
+    // files were rediscovered and wired into the rebuilt manifest.
+    let tree = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_kv_separation(Some(KvSeparationOptions::default()))
+    .open()?;
+
+    for i in 0..100 {
+        assert_eq!(
+            tree.get(key(i), MAX_SEQNO)?.as_deref(),
+            Some(big(i).as_bytes()),
+            "blob-backed value for key {} must survive repair",
+            key(i),
+        );
+    }
 
     Ok(())
 }

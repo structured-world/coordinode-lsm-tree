@@ -165,6 +165,64 @@ pub fn recover_blob_files(
     Ok((blob_files, orphaned_blob_files))
 }
 
+/// Recovers a SINGLE blob file from its path, for the manifest-rebuild
+/// (`Config::repair`) path where there is no manifest id list to filter against.
+///
+/// Reads the file's `meta` SFA section and constructs a [`BlobFile`] bound to
+/// the caller-computed `checksum`. Unlike [`recover_blob_files`] (which filters
+/// a known id list and fails fast on any miss), the caller discovers ids from a
+/// directory scan and handles per-file errors itself: a corrupt blob is reported
+/// and left in place (it reads back as a harmless orphan on the next open)
+/// rather than aborting the whole repair.
+///
+/// `tree_id` is `0` and there is no descriptor table, mirroring the table
+/// recovery in `repair`: the repaired tree is reopened fresh afterwards, so a
+/// transient handle must not pollute any shared cache.
+///
+/// # Errors
+///
+/// Returns an error if the file cannot be opened or its `meta` section is
+/// missing / undecodable.
+pub fn recover_blob_file(
+    path: &Path,
+    id: BlobFileId,
+    checksum: Checksum,
+    tree_id: TreeId,
+    fs: &Arc<dyn Fs>,
+) -> crate::Result<BlobFile> {
+    let mut file = fs.open(path, &crate::fs::FsOpenOptions::new().read(true))?;
+
+    // Same meta-section read as `recover_blob_files`' per-id branch above.
+    let meta = {
+        let reader = crate::sfa::Reader::from_reader(&mut file)?;
+        let toc = reader.toc();
+        let metadata_section = toc.section(b"meta").ok_or_else(|| {
+            log::error!("meta section in blob file #{id} is missing (file may be corrupted)");
+            crate::Error::Unrecoverable
+        })?;
+        let metadata_len =
+            usize::try_from(metadata_section.len()).map_err(|_| crate::Error::Unrecoverable)?;
+        let metadata_slice = crate::file::read_exact(&*file, metadata_section.pos(), metadata_len)?;
+        Metadata::from_slice(&metadata_slice)?
+    };
+
+    let file: Arc<dyn crate::fs::FsFile> = Arc::from(file);
+    Ok(BlobFile(Arc::new(BlobFileInner {
+        id,
+        path: path.to_path_buf(),
+        meta,
+        is_deleted: AtomicBool::new(false),
+        checksum,
+        file_accessor: FileAccessor::File(file),
+        tree_id,
+        fs: fs.clone(),
+        deletion_pause: once_cell::race::OnceBox::new(),
+
+        #[cfg(feature = "std")]
+        background_deleter: once_cell::race::OnceBox::new(),
+    })))
+}
+
 /// The unique identifier for a value log blob file.
 pub type BlobFileId = u64;
 
@@ -217,5 +275,21 @@ mod tests {
             &(Arc::new(crate::fs::StdFs) as Arc<dyn crate::fs::Fs>),
         );
         assert!(matches!(result, Err(crate::Error::Unrecoverable)));
+    }
+
+    #[test]
+    fn recover_blob_file_on_non_blob_file_errors() {
+        // A file that is not a valid blob (no SFA trailer / `meta` section) must
+        // surface an error instead of producing a bogus BlobFile, so the repair
+        // caller can report it and skip it rather than wiring corruption into the
+        // rebuilt manifest.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("000042");
+        std::fs::write(&path, b"this is not a blob file").unwrap();
+
+        let fs: Arc<dyn crate::fs::Fs> = Arc::new(crate::fs::StdFs);
+        let result = recover_blob_file(path.as_path(), 42, Checksum::from_raw(0), 0, &fs);
+        // `BlobFile` is not `Debug`, so assert on the boolean rather than the value.
+        assert!(result.is_err(), "recovering a non-blob file must fail");
     }
 }
