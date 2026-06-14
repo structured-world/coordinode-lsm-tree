@@ -54,3 +54,9 @@ tempfile = "3"
 name = "compare"
 harness = false
 path = "benches/compare.rs"
+
+# Debug symbols in the bench profile so perf / cargo-flamegraph can symbolize the
+# lsm-tree read path (point_read attribution on the Linux bench runner). The
+# path-dependency lsm-tree inherits this profile, so its frames are named too.
+[profile.bench]
+debug = true
