@@ -60,3 +60,9 @@ path = "benches/compare.rs"
 # path-dependency lsm-tree inherits this profile, so its frames are named too.
 [profile.bench]
 debug = true
+
+# Own workspace root: this nested tool crate is NOT a member of the lsm-tree
+# package above it. Declaring an empty workspace stops cargo from walking up the
+# directory tree and accidentally joining a parent workspace (e.g. a stray
+# Cargo.toml in a shared build dir), which would break the path dependency.
+[workspace]
