@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1781430205126,
+  "lastUpdate": 1781434406802,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -15834,6 +15834,84 @@ window.BENCHMARK_DATA = {
             "value": 556794.7982715464,
             "unit": "ops/sec",
             "extra": "P50: 1.6us | P99: 5.0us | P99.9: 7.5us\nthreads: 1 | elapsed: 0.36s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "b2cb5f02cfd7594861c34c0b74fadd36b8fd6570",
+          "message": "feat(bench): RocksDbParity preset + Benchmark Symmetry Invariant (#461)\n\n## Summary\n\nImplements the Benchmark Symmetry Invariant (#353) end-to-end: public\nhead-to-head benchmarks must not run our engine with on-disk opt-ins\nthat RocksDB has no equivalent for. The `compare-rocksdb` harness\npreviously ran `ours` with its production defaults (manifest footer\nmirror, FS-aware CoW/reflink) active while RocksDB had none, so the\ncomparison silently was not apples-to-apples.\n\n### Preset selector\n\nA `Preset` enum, selected via the `LSM_BENCH_PRESET` env var (default\n`rocksdb-parity`):\n\n| Value | Preset | Purpose |\n|-------|--------|---------|\n| `rocksdb-parity` (default) | `RocksDbParity` | Every lsm-tree-only\nopt-in OFF, matching RocksDB's durability defaults. The honest dashboard\nnumber. |\n| `lsm-default` | `LsmTreeDefault` | Production defaults. |\n| `lsm-paranoid` | `LsmTreeParanoid` | Every opt-in ON. Worst-case\noverhead. |\n\n`apply_preset` is the single source of truth for the parity surface:\n`RocksDbParity` explicitly disables `manifest_footer_mirror`,\n`kv_checksums`, `seqno_in_index`, `page_ecc`,\n`disable_cow_on_sst_files`, `use_reflink_for_checkpoint` (even those\nalready off by default), and keeps `manifest_kv_checksums` ON (parity\nwith RocksDB's per-record MANIFEST CRC). Only our config moves across\npresets; RocksDB stays the fixed baseline. The active preset is logged\nonce to stderr for dashboard provenance.\n\nThe bench crate now compiles in the `page_ecc` feature so `lsm-paranoid`\ncan measure Page-ECC write overhead; `rocksdb-parity` keeps it off.\n\n### Used in the default CI dashboard run\n\nThe `benchmark.yml` head-to-head step now sets\n`LSM_BENCH_PRESET=rocksdb-parity` explicitly, pinning the published\ngh-pages comparison to the parity preset rather than relying on the\nin-code default that a future change could silently alter.\n\n### Docs\n\n- `docs/BENCHMARKING.md`: the invariant, the preset matrix, how to run,\nand the per-PR checklist for format-changing PRs.\n- `CONTRIBUTING.md`: cross-link for format-changing PRs.\n\n## Acceptance criteria (#353)\n\n- [x] preset selector in `compare-rocksdb`\n- [x] `RocksDbParity` implemented and used in the default benchmark CI\nrun\n- [x] `docs/BENCHMARKING.md` documents the invariant + preset matrix\n- [x] CONTRIBUTING cross-link for format-changing PRs\n- [x] per-PR discipline documented (BENCHMARKING.md checklist)\n\n## Testing\n\n- `cargo bench --no-run` compiles (libclang)\n- `cargo clippy --benches` clean; `cargo fmt --check` clean\n- all three presets smoke-run: `rocksdb-parity` (default),\n`lsm-paranoid` (ECC + kv_checksums on), `lsm-default`\n- no `src/` changes, so the main test suite is unaffected\n\nCloses #353\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n\n## Summary by CodeRabbit\n\n* **Documentation**\n* Updated the benchmarking guide with an on-disk format “symmetry\ninvariant” for fair comparisons, including a preset parity approach and\na run/checklist workflow.\n* Expanded contributor guidance with requirements for any on-disk format\nchanges (including OFF-by-default and parity/opt-in constraints).\n\n* **Benchmarks / Tooling**\n* Added a configurable benchmark preset mechanism controlled by\n`LSM_BENCH_PRESET` (rocksdb-parity, lsm-default, lsm-paranoid) and\napplied consistently across benchmark scenarios.\n* Enabled Page-ECC coverage in the benchmark tooling and pinned the\nworkflow to `rocksdb-parity`.\n\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-06-14T13:38:33+03:00",
+          "tree_id": "36b8ecb03a29496dabf858c3469fed8862698011",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/b2cb5f02cfd7594861c34c0b74fadd36b8fd6570"
+        },
+        "date": 1781434394114,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 2065952.8166126406,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.6us | P99.9: 3.7us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1203592.1641432033,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.4us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 673343.099164972,
+            "unit": "ops/sec",
+            "extra": "P50: 1.3us | P99: 4.5us | P99.9: 7.0us\nthreads: 1 | elapsed: 0.30s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3693874.508850902,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 3.1us | P99.9: 5.6us\nthreads: 1 | elapsed: 0.05s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 428915.11518955056,
+            "unit": "ops/sec",
+            "extra": "P50: 2.0us | P99: 5.3us | P99.9: 8.4us\nthreads: 1 | elapsed: 0.47s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 219238.09889164596,
+            "unit": "ops/sec",
+            "extra": "P50: 4.3us | P99: 5.4us | P99.9: 7.8us\nthreads: 1 | elapsed: 0.91s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1237274.4926497173,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.2us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1136926.8867388377,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.4us | P99.9: 2.7us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 554397.0812545983,
+            "unit": "ops/sec",
+            "extra": "P50: 1.6us | P99: 6.0us | P99.9: 10.0us\nthreads: 1 | elapsed: 0.36s | num: 200000 | iterations: 3"
           }
         ]
       }
