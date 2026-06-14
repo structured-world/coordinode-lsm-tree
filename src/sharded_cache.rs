@@ -144,6 +144,7 @@ where
     /// Read without promotion: returns the value (cloned) without touching the
     /// frequency counter. Used by the partial-decode tier, which inspects an
     /// entry without counting it as a hit.
+    #[cfg(any(feature = "zstd", test))]
     fn peek(&self, key: &K) -> Option<V> {
         self.map.get(key).map(|slot| slot.value.clone())
     }
@@ -396,6 +397,7 @@ where
     }
 
     /// Returns the value for `key` WITHOUT counting it as a hit (no promotion).
+    #[cfg(any(feature = "zstd", test))]
     pub fn peek(&self, key: &K) -> Option<V> {
         self.shard(key).read().peek(key)
     }
