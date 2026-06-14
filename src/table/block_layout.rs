@@ -141,7 +141,9 @@ impl BlockLayoutMap {
     }
 
     /// Recorded block offsets, ascending. Test-only enumeration helper.
-    #[cfg(test)]
+    /// Its sole caller is the zstd large-block roundtrip test, so it is gated
+    /// to that feature to stay dead-code-clean in every other test build.
+    #[cfg(all(test, feature = "zstd"))]
     pub(crate) fn offsets(&self) -> Vec<u64> {
         self.entries.iter().map(|(o, _)| *o).collect()
     }

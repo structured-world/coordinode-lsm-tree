@@ -8,7 +8,7 @@ use crate::{SeqNo, UserKey};
 use crate::{
     coding::{Decode, Encode},
     table::{
-        block::{BlockOffset, Decodable, Encodable, TRAILER_START_MARKER},
+        block::{BlockOffset, Decodable, Encodable, TRAILER_START_MARKER, decoder::read_leb128},
         index_block::IndexBlockParsedItem,
         util::SliceIndexes,
     },
@@ -339,8 +339,15 @@ impl Decodable<IndexBlockParsedItem> for KeyedBlockHandle {
         data: &'a [u8],
         entries_end: usize,
     ) -> Option<(&'a [u8], SeqNo)> {
-        let marker = reader.read_u8().ok()?;
+        // Slice-based decode: read directly from the cursor's buffer through a
+        // local index instead of `Cursor::read_u8` (a `read_exact` of one byte
+        // each), then advance the cursor once at the end. This is the hottest
+        // function on the point-read path (index restart-key probe).
+        let buf: &[u8] = reader.get_ref();
+        let mut pos = usize::try_from(reader.position()).ok()?;
 
+        let marker = *buf.get(pos)?;
+        pos += 1;
         if marker == TRAILER_START_MARKER {
             return None;
         }
@@ -351,43 +358,51 @@ impl Decodable<IndexBlockParsedItem> for KeyedBlockHandle {
             _ => return None,
         };
 
-        let _file_offset = reader.read_u64_varint().ok()?;
-        let _size = reader.read_u32_varint().ok()?;
-        let seqno = reader.read_u64_varint().ok()?;
+        // The binary-search probe only needs `(key, seqno)`, but the block
+        // handle (file offset + size) is still decoded so a corrupt restart
+        // head fails the probe instead of feeding forged metadata into
+        // restart-table navigation: read_leb128 rejects an overlong offset,
+        // and the size must fit u32 exactly as `parse_full` / `parse_truncated`
+        // require.
+        let (_file_offset, np) = read_leb128(buf, pos)?;
+        pos = np;
+        let (size, np) = read_leb128(buf, pos)?;
+        u32::try_from(size).ok()?;
+        pos = np;
+        let (seqno, np) = read_leb128(buf, pos)?;
+        pos = np;
 
         if has_bounds {
             // The restart key only needs the key, but still reject inverted
             // bounds (seqno_min > seqno_max) here as `parse_full` /
             // `parse_truncated` do — a malformed marker-2 head must not feed a
             // forged entry into restart-table navigation.
-            let seqno_min = reader.read_u64_varint().ok()?;
-            let seqno_max = reader.read_u64_varint().ok()?;
+            let (seqno_min, np) = read_leb128(buf, pos)?;
+            let (seqno_max, np2) = read_leb128(buf, np)?;
+            pos = np2;
             if seqno_min > seqno_max {
                 return None;
             }
         }
 
-        let key_len: usize = reader.read_u16_varint().ok()?.into();
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "blocks tend to be some megabytes in size at most, so position should fit into usize"
-        )]
-        let key_start = offset.checked_add(reader.position() as usize)?;
+        let (key_len_raw, np) = read_leb128(buf, pos)?;
+        pos = np;
+        // key_len is encoded as a u16 varint on the wire; reject an overlong
+        // value exactly as `read_u16_varint` did.
+        let key_len = usize::try_from(key_len_raw)
+            .ok()
+            .filter(|&k| u16::try_from(k).is_ok())?;
+
+        let key_start = offset.checked_add(pos)?;
         let key_end = key_start.checked_add(key_len)?;
         if key_end > entries_end {
             return None;
         }
+        pos = pos.checked_add(key_len)?;
 
-        #[expect(
-            clippy::cast_possible_wrap,
-            reason = "key_len is bounded by u16::MAX, no wrap expected"
-        )]
-        let key_len_i64 = key_len as i64;
-        reader.seek_relative(key_len_i64).ok()?;
-
-        let key = data.get(key_start..key_end);
-
-        key.map(|k| (k, seqno))
+        let key = data.get(key_start..key_end)?;
+        reader.set_position(pos as u64);
+        Some((key, seqno))
     }
 
     fn parse_truncated(
@@ -891,6 +906,36 @@ mod tests {
         assert!(
             parsed.is_none(),
             "inverted seqno bounds must be rejected by parse_restart_key",
+        );
+    }
+
+    #[test]
+    fn parse_restart_key_rejects_oversized_block_handle_size() {
+        // A restart head whose block-handle size varint encodes a value beyond
+        // u32::MAX is corrupt: BlockHandle::size is u32. parse_restart_key must
+        // reject it (like parse_full / parse_truncated validate their handle
+        // fields) instead of skipping the field and feeding a forged entry into
+        // restart-table navigation. Built by hand because the encoder cannot
+        // emit an out-of-range size.
+        let mut bytes = Vec::new();
+        bytes.push(0u8); // marker 0 (legacy full restart head)
+        bytes.push(0u8); // file offset varint = 0
+        // size varint = u32::MAX + 1 = 4_294_967_296 (5-byte LEB128).
+        bytes.extend_from_slice(&[0x80, 0x80, 0x80, 0x80, 0x10]);
+        bytes.push(7u8); // seqno varint = 7
+        bytes.push(6u8); // key_len u16 varint = 6
+        bytes.extend_from_slice(b"abcdef"); // key
+
+        let mut cursor = Cursor::new(bytes.as_slice());
+        let parsed = <KeyedBlockHandle as Decodable<IndexBlockParsedItem>>::parse_restart_key(
+            &mut cursor,
+            0,
+            bytes.as_slice(),
+            bytes.len(),
+        );
+        assert!(
+            parsed.is_none(),
+            "block-handle size beyond u32::MAX must be rejected by parse_restart_key",
         );
     }
 }

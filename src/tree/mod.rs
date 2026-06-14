@@ -132,6 +132,33 @@ impl TablePointLookup for TableEntryWithBlock {
     }
 }
 
+/// Lookup result for the value-returning `get()` path: `(value_type, seqno,
+/// value)`, no key reconstruction (the caller has the needle).
+type TableValue = (ValueType, SeqNo, crate::Slice);
+
+impl TablePointLookup for TableValue {
+    fn lookup(
+        table: &Table,
+        key: &[u8],
+        seqno: SeqNo,
+        key_hash: u64,
+    ) -> crate::Result<Option<Self>> {
+        table.get_value(key, seqno, key_hash)
+    }
+
+    fn entry_seqno(&self) -> SeqNo {
+        self.1
+    }
+
+    fn filter_tombstone(self) -> Option<Self> {
+        if self.0.is_tombstone() {
+            None
+        } else {
+            Some(self)
+        }
+    }
+}
+
 fn ignore_tombstone_value(item: InternalValue) -> Option<InternalValue> {
     if item.is_tombstone() {
         None
@@ -1315,10 +1342,10 @@ impl Tree {
         merge_operator: Option<&Arc<dyn crate::merge_operator::MergeOperator>>,
         comparator: &dyn crate::comparator::UserComparator,
     ) -> crate::Result<Option<UserValue>> {
-        let entry = Self::get_internal_entry_from_version(super_version, key, seqno, comparator)?;
+        let entry = Self::get_value(super_version, key, seqno, comparator)?;
 
         match entry {
-            Some(entry) if entry.key.value_type == ValueType::MergeOperand => {
+            Some((ValueType::MergeOperand, entry_seqno, value)) => {
                 if let Some(merge_op) = merge_operator {
                     // Build a bloom-filtered single-key iterator pipeline that
                     // reuses MvccStream for merge/RT/Indirection resolution,
@@ -1332,16 +1359,16 @@ impl Tree {
                 } else if Self::is_suppressed_by_range_tombstones(
                     super_version,
                     key,
-                    entry.key.seqno,
+                    entry_seqno,
                     seqno,
                     comparator,
                 ) {
                     Ok(None)
                 } else {
-                    Ok(Some(entry.value))
+                    Ok(Some(value))
                 }
             }
-            Some(entry) => Ok(Some(entry.value)),
+            Some((_, _, value)) => Ok(Some(value)),
             None => Ok(None),
         }
     }
@@ -1640,6 +1667,78 @@ impl Tree {
                 return Ok(None);
             }
             return Ok(Some(entry));
+        }
+
+        Ok(None)
+    }
+
+    /// Value-only mirror of [`Self::get_internal_entry_from_version`].
+    ///
+    /// Returns `(value_type, seqno, value)` for the newest visible entry without
+    /// reconstructing the entry key. Same search order (active -> sealed -> SST,
+    /// newest first), tombstone filtering, and range-tombstone suppression; only
+    /// the SST path differs, using the value-only [`TableValue`] lookup that
+    /// skips the delta-key fusion of the full `InternalValue` path. Used by the
+    /// value-returning `get` path, which never reads the matched key.
+    pub(crate) fn get_value(
+        super_version: &SuperVersion,
+        key: &[u8],
+        seqno: SeqNo,
+        comparator: &dyn crate::comparator::UserComparator,
+    ) -> crate::Result<Option<(ValueType, SeqNo, crate::Slice)>> {
+        if let Some(entry) = super_version.active_memtable.get(key, seqno) {
+            let Some(entry) = ignore_tombstone_value(entry) else {
+                return Ok(None);
+            };
+            if Self::is_suppressed_by_range_tombstones(
+                super_version,
+                key,
+                entry.key.seqno,
+                seqno,
+                comparator,
+            ) {
+                return Ok(None);
+            }
+            return Ok(Some((entry.key.value_type, entry.key.seqno, entry.value)));
+        }
+
+        if let Some(entry) =
+            Self::get_internal_entry_from_sealed_memtables(super_version, key, seqno)
+        {
+            let Some(entry) = ignore_tombstone_value(entry) else {
+                return Ok(None);
+            };
+            if Self::is_suppressed_by_range_tombstones(
+                super_version,
+                key,
+                entry.key.seqno,
+                seqno,
+                comparator,
+            ) {
+                return Ok(None);
+            }
+            return Ok(Some((entry.key.value_type, entry.key.seqno, entry.value)));
+        }
+
+        let key_hash = crate::hash::hash64(key);
+        let entry = Self::find_in_tables::<TableValue>(
+            &super_version.version,
+            key,
+            seqno,
+            key_hash,
+            comparator,
+        )?;
+        if let Some((value_type, entry_seqno, value)) = entry {
+            if Self::is_suppressed_by_range_tombstones(
+                super_version,
+                key,
+                entry_seqno,
+                seqno,
+                comparator,
+            ) {
+                return Ok(None);
+            }
+            return Ok(Some((value_type, entry_seqno, value)));
         }
 
         Ok(None)

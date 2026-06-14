@@ -538,6 +538,76 @@ impl Table {
         Ok(item)
     }
 
+    /// Value-only point read: `(value_type, seqno, value)` without
+    /// reconstructing the entry key. Used by the value-returning `get` path,
+    /// which never reads the matched key (the caller has the needle), so the
+    /// delta-key fusion in [`DataBlock::point_read`] is skipped. The value is a
+    /// zero-copy slice of the cached block.
+    pub(crate) fn get_value(
+        &self,
+        key: &[u8],
+        seqno: SeqNo,
+        key_hash: u64,
+    ) -> crate::Result<Option<(crate::ValueType, SeqNo, crate::Slice)>> {
+        let global_seqno = self.global_seqno();
+        let seqno = seqno.saturating_sub(global_seqno);
+
+        if self.metadata.seqnos.0 >= seqno {
+            return Ok(None);
+        }
+
+        let bloom = self.check_bloom(key, key_hash)?;
+        if bloom.should_skip() {
+            return Ok(None);
+        }
+
+        let item = self.point_read_value(key, seqno)?;
+
+        // Translate table-local seqno back to the global coordinate, mirroring
+        // `Table::get`.
+        let item = item.map(|(vt, s, v)| (vt, s.saturating_add(global_seqno), v));
+
+        #[cfg(feature = "metrics")]
+        {
+            use core::sync::atomic::Ordering::Relaxed;
+            if item.is_none() && bloom.has_filter() {
+                self.metrics.filter_queries.fetch_add(1, Relaxed);
+            }
+        }
+
+        Ok(item)
+    }
+
+    /// Value-only block-index walk: companion to [`Table::point_read_inner`]
+    /// that reads each candidate data block with
+    /// [`DataBlock::point_read_value`] (no key fusion, no retained block).
+    fn point_read_value(
+        &self,
+        key: &[u8],
+        seqno: SeqNo,
+    ) -> crate::Result<Option<(crate::ValueType, SeqNo, crate::Slice)>> {
+        let Some(iter) = self.block_index.point_read_reader(key, seqno) else {
+            return Ok(None);
+        };
+
+        for block_handle in iter {
+            let block_handle = block_handle?;
+
+            let data_block = self.load_data_block(block_handle.as_ref())?;
+
+            if let Some(found) = data_block.point_read_value(key, seqno, &self.comparator)? {
+                return Ok(Some(found));
+            }
+
+            if self.comparator.compare(block_handle.end_key(), key) == core::cmp::Ordering::Greater
+            {
+                return Ok(None);
+            }
+        }
+
+        Ok(None)
+    }
+
     /// Like [`Table::get`], but also returns the [`Block`] containing the value.
     ///
     /// Used by `get_pinned()` to construct `PinnableSlice::Pinned`.

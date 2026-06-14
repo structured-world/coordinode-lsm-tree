@@ -41,6 +41,19 @@ fn test_key() -> [u8; 32] {
     [0x42; 32]
 }
 
+/// Raise this process's open-file soft limit toward its hard limit.
+///
+/// The concurrent stress test flushes many SSTs while readers hold descriptors
+/// open via the engine's descriptor cache, so its live fd count can exceed a
+/// low default soft limit (macOS defaults to 256) and surface as EMFILE — a
+/// resource limit, not an encryption fault. `increase_nofile_limit` raises the
+/// soft limit toward the hard limit (capping to the per-process maximum on
+/// macOS). Best-effort: any failure leaves the limit unchanged and the test
+/// simply runs closer to the original budget.
+fn raise_fd_limit() {
+    let _ = rlimit::increase_nofile_limit(u64::MAX);
+}
+
 /// Default config + per-cell compression + optional encryption + optional
 /// Page ECC. When `ecc` is set the SST blocks carry a Reed-Solomon parity
 /// trailer OUTSIDE the encryption envelope, so this exercises the
@@ -498,6 +511,13 @@ fn major_compaction_encrypted_round_trips() -> lsm_tree::Result<()> {
 
 #[test]
 fn concurrent_encrypted_no_corruption() -> lsm_tree::Result<()> {
+    // This test flushes many SSTs while readers hold descriptors open via the
+    // engine's descriptor cache, so its live fd count can exceed a low default
+    // soft limit (e.g. macOS's 256) and surface as EMFILE — a resource limit,
+    // not an encryption fault. Raise this process's soft limit to its hard
+    // limit so the assertion measures encryption correctness, not fd budget.
+    raise_fd_limit();
+
     let dir = tempfile::tempdir()?;
     let tree = Arc::new(open_tree(dir.path(), CompressionType::None, true, false)?);
 
