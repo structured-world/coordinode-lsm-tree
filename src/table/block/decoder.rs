@@ -40,6 +40,13 @@ pub fn read_leb128(buf: &[u8], pos: usize) -> Option<(u64, usize)> {
     loop {
         let byte = *buf.get(p)?;
         p += 1;
+        // The 10th byte (shift == 63) can only carry bit 63; any higher payload
+        // bit (mask 0x7e) would overflow u64. Reject before folding it in so a
+        // corrupt overlong encoding fails the decode instead of silently
+        // truncating to a wrapped value.
+        if shift == 63 && (byte & 0x7e) != 0 {
+            return None;
+        }
         result |= u64::from(byte & 0x7f) << shift;
         if byte & 0x80 == 0 {
             return Some((result, p));
@@ -47,18 +54,6 @@ pub fn read_leb128(buf: &[u8], pos: usize) -> Option<(u64, usize)> {
         shift += 7;
         if shift >= 64 {
             return None;
-        }
-    }
-}
-
-/// Advances past one LEB128 varint in `buf` without materializing its value.
-#[inline]
-pub fn skip_leb128(buf: &[u8], mut pos: usize) -> Option<usize> {
-    loop {
-        let byte = *buf.get(pos)?;
-        pos += 1;
-        if byte & 0x80 == 0 {
-            return Some(pos);
         }
     }
 }

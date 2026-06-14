@@ -8,10 +8,7 @@ use crate::{SeqNo, UserKey};
 use crate::{
     coding::{Decode, Encode},
     table::{
-        block::{
-            BlockOffset, Decodable, Encodable, TRAILER_START_MARKER,
-            decoder::{read_leb128, skip_leb128},
-        },
+        block::{BlockOffset, Decodable, Encodable, TRAILER_START_MARKER, decoder::read_leb128},
         index_block::IndexBlockParsedItem,
         util::SliceIndexes,
     },
@@ -361,11 +358,17 @@ impl Decodable<IndexBlockParsedItem> for KeyedBlockHandle {
             _ => return None,
         };
 
-        // The binary-search probe only needs `(key, seqno)`: the block handle
-        // (file offset + size) is never read on a probe, so skip both varints
-        // without materializing their values.
-        pos = skip_leb128(buf, pos)?; // file offset
-        pos = skip_leb128(buf, pos)?; // size
+        // The binary-search probe only needs `(key, seqno)`, but the block
+        // handle (file offset + size) is still decoded so a corrupt restart
+        // head fails the probe instead of feeding forged metadata into
+        // restart-table navigation: read_leb128 rejects an overlong offset,
+        // and the size must fit u32 exactly as `parse_full` / `parse_truncated`
+        // require.
+        let (_file_offset, np) = read_leb128(buf, pos)?;
+        pos = np;
+        let (size, np) = read_leb128(buf, pos)?;
+        u32::try_from(size).ok()?;
+        pos = np;
         let (seqno, np) = read_leb128(buf, pos)?;
         pos = np;
 
