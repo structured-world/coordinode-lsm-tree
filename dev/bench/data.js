@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1781434406802,
+  "lastUpdate": 1781469175654,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -15912,6 +15912,84 @@ window.BENCHMARK_DATA = {
             "value": 554397.0812545983,
             "unit": "ops/sec",
             "extra": "P50: 1.6us | P99: 6.0us | P99.9: 10.0us\nthreads: 1 | elapsed: 0.36s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "203e27ce17487a1b1e62ff591ed45fe746932374",
+          "message": "feat(bench): blob_tree (KV-separation) arm + read-gap attribution (#462)\n\n## Summary\n\nAdds a `blob_tree` (KV-separated) engine arm to the `compare-rocksdb`\nharness, overlaid alongside `ours` / `rocksdb` / `surrealkv` on the\nNone-compression read/write groups. This isolates the #426 question: is\nsurrealkv's read advantage from **KV-separation** (it stores values\nout-of-line, exactly what our `blob_tree` does) or from **residual\nread-path overhead**?\n\nValues at/above a documented 128-byte threshold are separated, so the\n256-byte bench values all go out-of-line, mirroring surrealkv's vlog.\nThe arm reuses the existing `AbstractTree` workload bodies and stays out\nof the zstd-level compaction benches (where surrealkv does not run).\n\n## Analysis (local macOS run; indicative, canonical numbers come from\nthe dashboard runner)\n\nMedian wall-time, None-compression:\n\n| group | n | ours | rocksdb | surrealkv | blob_tree |\n|-------|---|------|---------|-----------|-----------|\n| point_read | 1k | 1.09 ms | 0.99 ms | **0.28 ms** | 1.11 ms |\n| point_read | 10k | 12.4 ms | 10.6 ms | **4.0 ms** | 13.7 ms |\n| range_scan | 1k | 145 µs | 195 µs | **92 µs** | 227 µs |\n| range_scan | 10k | 1.45 ms | 1.90 ms | **1.06 ms** | ~2.6-3.5 ms |\n| seek_random | 1k | ~1.8 ms | 1.82 ms | **1.00 ms** | 1.78 ms |\n| write | 1k | **2.53 ms** | 4.16 ms | 39.7 ms | 3.42 ms |\n| write | 10k | **12.8 ms** | 14.3 ms | 58.7 ms | 18.5 ms |\n\n### How much of the surrealkv read advantage is KV-separation?\n\n**Essentially none.** `blob_tree` (KV-separated) tracks `ours`, not\nsurrealkv:\n\n- **point_read:** blob_tree is within ~2-10% of `ours` (1.11 vs 1.09 ms;\n13.7 vs 12.4 ms), while surrealkv is **3.1-3.9x faster** than both.\nSeparating values out-of-line did not move the warm point-read needle at\nthis scale.\n- **range_scan:** blob_tree is **1.6-2.4x slower** than `ours` (227 µs\nvs 145 µs) because the blob indirection gathers each value from a\nseparate blob file, breaking the sequential locality a scan relies on.\nsurrealkv is faster than both.\n- **write:** blob_tree costs ~1.35-1.45x more than `ours` (extra\nblob-file writes), as expected.\n\nSo at the 1k-10k / 256-byte working set, KV-separation does **not**\nclose the surrealkv read gap (and hurts scans + writes). The surrealkv\nread advantage is **residual read-path overhead, not KV layout**.\n\n### Recommendation\n\nDo **not** build a new on-disk index on top of KV-separation expecting\nit to close the read gap: `blob_tree` already provides KV-separation and\ndoes not help. The residual ~3-4x point_read gap vs surrealkv lives in\nthe LSM read path (block-index descent, within-block restart scan, block\ndecode, bloom probe, cache behaviour), not in value placement.\n\n## Remaining for #426 (needs the Linux perf runner)\n\nThe one acceptance bullet not delivered here is the **flamegraph\ncomponent-bucketing** of `ours`' read path (`cargo flamegraph --bench\ncompare -- point_read` / `range_scan`, attributing the residual to\nblock-index search / restart scan / decompress / cache miss / filter\nprobe). macOS `dtrace` needs elevated privileges unavailable in this\nenvironment, so the attribution should run on the self-hosted Linux\nbench runner (`perf`). The headline conclusion above (KV-separation does\nnot close the gap; the gap is read-path) does not depend on it.\n\n## Testing\n\n- `cargo bench --no-run` compiles (libclang); `cargo clippy --benches`\nclean; `cargo fmt --check` clean\n- all four engines smoke-run on point_read / range_scan / seek_random /\nwrite_throughput\n- no `src/` changes, so the main test suite is unaffected\n\nPart of #426\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n\n## Summary by CodeRabbit\n\n* **New Features**\n  * Added support for benchmarking key-value separated storage behavior\n* Introduced BlobTree engine variant to the benchmark suite for extended\nperformance comparison across storage configurations\n\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-06-14T23:05:12+03:00",
+          "tree_id": "1bc221b1ce205ba285faccbc2f2b2e4b1ce512e3",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/203e27ce17487a1b1e62ff591ed45fe746932374"
+        },
+        "date": 1781469162120,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 1900802.2259762646,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.6us | P99.9: 3.7us\nthreads: 1 | elapsed: 0.11s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1230385.4792169651,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.3us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 676764.8395165371,
+            "unit": "ops/sec",
+            "extra": "P50: 1.3us | P99: 4.5us | P99.9: 7.0us\nthreads: 1 | elapsed: 0.30s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3700130.6109104343,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 3.0us | P99.9: 5.6us\nthreads: 1 | elapsed: 0.05s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 435981.3061243504,
+            "unit": "ops/sec",
+            "extra": "P50: 2.0us | P99: 5.4us | P99.9: 8.4us\nthreads: 1 | elapsed: 0.46s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 222851.56593940052,
+            "unit": "ops/sec",
+            "extra": "P50: 4.2us | P99: 5.3us | P99.9: 7.6us\nthreads: 1 | elapsed: 0.90s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1251992.4364132134,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.6us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1122486.0668751043,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 1.5us | P99.9: 2.7us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 563746.7536044213,
+            "unit": "ops/sec",
+            "extra": "P50: 1.6us | P99: 5.0us | P99.9: 7.5us\nthreads: 1 | elapsed: 0.35s | num: 200000 | iterations: 3"
           }
         ]
       }
