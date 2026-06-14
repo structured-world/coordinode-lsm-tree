@@ -8,7 +8,10 @@ use crate::{SeqNo, UserKey};
 use crate::{
     coding::{Decode, Encode},
     table::{
-        block::{BlockOffset, Decodable, Encodable, TRAILER_START_MARKER},
+        block::{
+            BlockOffset, Decodable, Encodable, TRAILER_START_MARKER,
+            decoder::{read_leb128, skip_leb128},
+        },
         index_block::IndexBlockParsedItem,
         util::SliceIndexes,
     },
@@ -339,8 +342,15 @@ impl Decodable<IndexBlockParsedItem> for KeyedBlockHandle {
         data: &'a [u8],
         entries_end: usize,
     ) -> Option<(&'a [u8], SeqNo)> {
-        let marker = reader.read_u8().ok()?;
+        // Slice-based decode: read directly from the cursor's buffer through a
+        // local index instead of `Cursor::read_u8` (a `read_exact` of one byte
+        // each), then advance the cursor once at the end. This is the hottest
+        // function on the point-read path (index restart-key probe).
+        let buf: &[u8] = reader.get_ref();
+        let mut pos = usize::try_from(reader.position()).ok()?;
 
+        let marker = *buf.get(pos)?;
+        pos += 1;
         if marker == TRAILER_START_MARKER {
             return None;
         }
@@ -351,43 +361,45 @@ impl Decodable<IndexBlockParsedItem> for KeyedBlockHandle {
             _ => return None,
         };
 
-        let _file_offset = reader.read_u64_varint().ok()?;
-        let _size = reader.read_u32_varint().ok()?;
-        let seqno = reader.read_u64_varint().ok()?;
+        // The binary-search probe only needs `(key, seqno)`: the block handle
+        // (file offset + size) is never read on a probe, so skip both varints
+        // without materializing their values.
+        pos = skip_leb128(buf, pos)?; // file offset
+        pos = skip_leb128(buf, pos)?; // size
+        let (seqno, np) = read_leb128(buf, pos)?;
+        pos = np;
 
         if has_bounds {
             // The restart key only needs the key, but still reject inverted
             // bounds (seqno_min > seqno_max) here as `parse_full` /
             // `parse_truncated` do — a malformed marker-2 head must not feed a
             // forged entry into restart-table navigation.
-            let seqno_min = reader.read_u64_varint().ok()?;
-            let seqno_max = reader.read_u64_varint().ok()?;
+            let (seqno_min, np) = read_leb128(buf, pos)?;
+            let (seqno_max, np2) = read_leb128(buf, np)?;
+            pos = np2;
             if seqno_min > seqno_max {
                 return None;
             }
         }
 
-        let key_len: usize = reader.read_u16_varint().ok()?.into();
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "blocks tend to be some megabytes in size at most, so position should fit into usize"
-        )]
-        let key_start = offset.checked_add(reader.position() as usize)?;
+        let (key_len_raw, np) = read_leb128(buf, pos)?;
+        pos = np;
+        // key_len is encoded as a u16 varint on the wire; reject an overlong
+        // value exactly as `read_u16_varint` did.
+        let key_len = usize::try_from(key_len_raw)
+            .ok()
+            .filter(|&k| u16::try_from(k).is_ok())?;
+
+        let key_start = offset.checked_add(pos)?;
         let key_end = key_start.checked_add(key_len)?;
         if key_end > entries_end {
             return None;
         }
+        pos = pos.checked_add(key_len)?;
 
-        #[expect(
-            clippy::cast_possible_wrap,
-            reason = "key_len is bounded by u16::MAX, no wrap expected"
-        )]
-        let key_len_i64 = key_len as i64;
-        reader.seek_relative(key_len_i64).ok()?;
-
-        let key = data.get(key_start..key_end);
-
-        key.map(|k| (k, seqno))
+        let key = data.get(key_start..key_end)?;
+        reader.set_position(pos as u64);
+        Some((key, seqno))
     }
 
     fn parse_truncated(

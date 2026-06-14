@@ -2,7 +2,10 @@
 // Copyright (c) 2025-present, fjall-rs
 // Copyright (c) 2026-present, Structured World Foundation
 
-use super::{TRAILER_START_MARKER, binary_index::Reader as BinaryIndexReader};
+use super::{
+    TRAILER_START_MARKER, binary_index::Reader as BinaryIndexReader,
+    hash_index::Reader as HashIndexReader,
+};
 use crate::io::{LittleEndian, ReadBytesExt};
 use crate::{
     SeqNo, Slice,
@@ -13,6 +16,52 @@ use alloc::vec::Vec;
 use core::marker::PhantomData;
 
 use crate::io::Cursor;
+
+/// Decodes one LEB128 varint directly from `buf` at `pos`, returning the value
+/// and the position just past it.
+///
+/// Reads through a plain slice index instead of `std::io::Cursor::read_u8` (a
+/// `read_exact` of one byte each), which is the hottest cost on the point-read
+/// path's block-entry parse. Rejects an overlong (> 64-bit) encoding, matching
+/// `VarintReader::read_u64_varint`.
+#[inline]
+pub fn read_leb128(buf: &[u8], pos: usize) -> Option<(u64, usize)> {
+    // Fast path: a single-byte varint (value < 128) is by far the most common
+    // on the read path (small keys, seqnos, shared/rest lengths). One
+    // bounds-checked load, a compare, and a return — no loop setup.
+    let first = *buf.get(pos)?;
+    if first < 0x80 {
+        return Some((u64::from(first), pos + 1));
+    }
+    // Multi-byte continuation: fold in the low 7 bits already read, then loop.
+    let mut result = u64::from(first & 0x7f);
+    let mut shift = 7u32;
+    let mut p = pos + 1;
+    loop {
+        let byte = *buf.get(p)?;
+        p += 1;
+        result |= u64::from(byte & 0x7f) << shift;
+        if byte & 0x80 == 0 {
+            return Some((result, p));
+        }
+        shift += 7;
+        if shift >= 64 {
+            return None;
+        }
+    }
+}
+
+/// Advances past one LEB128 varint in `buf` without materializing its value.
+#[inline]
+pub fn skip_leb128(buf: &[u8], mut pos: usize) -> Option<usize> {
+    loop {
+        let byte = *buf.get(pos)?;
+        pos += 1;
+        if byte & 0x80 == 0 {
+            return Some(pos);
+        }
+    }
+}
 
 /// Validates that `restart_interval` and `binary_index_step_size` read from a
 /// block trailer are within their allowed ranges.
@@ -155,7 +204,9 @@ impl<'a, Item: Decodable<Parsed>, Parsed: ParsedItem<Item>> Decoder<'a, Item, Pa
 
     /// Byte length of the entry region (offset where the trailer begins).
     /// Test-only: lets headerless-decode tests slice the exact entry region.
-    #[cfg(test)]
+    /// Only the zstd partial-decode / lazy-block tests use it, so it is gated
+    /// to that feature to stay dead-code-clean in the default test build.
+    #[cfg(all(test, feature = "zstd"))]
     #[must_use]
     pub(crate) fn entries_end_for_test(&self) -> Option<usize> {
         self.cached_entries_end
@@ -469,6 +520,28 @@ impl<'a, Item: Decodable<Parsed>, Parsed: ParsedItem<Item>> Decoder<'a, Item, Pa
             self.binary_index_offset,
             self.binary_index_len,
             self.binary_index_step_size,
+        ))
+    }
+
+    /// Binary index reader built from the trailer metadata cached at
+    /// construction, with no re-parse of the block trailer. Returns `None`
+    /// if the cached layout is inconsistent (mirrors the validation in
+    /// [`Self::get_binary_index_reader`]).
+    pub(crate) fn cached_binary_index_reader(&self) -> Option<BinaryIndexReader<'_>> {
+        self.get_binary_index_reader()
+    }
+
+    /// Hash index reader built from the trailer metadata cached at
+    /// construction, with no re-parse of the block trailer. Returns `None`
+    /// when the block carries no hash index (`hash_index_len == 0`).
+    pub(crate) fn cached_hash_index_reader(&self) -> Option<HashIndexReader<'_>> {
+        if self.hash_index_len == 0 {
+            return None;
+        }
+        Some(HashIndexReader::new(
+            &self.block.data,
+            self.hash_index_offset,
+            self.hash_index_len,
         ))
     }
 
