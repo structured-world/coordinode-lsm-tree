@@ -25,7 +25,7 @@ use crate::io::Cursor;
 /// path's block-entry parse. Rejects an overlong (> 64-bit) encoding, matching
 /// `VarintReader::read_u64_varint`.
 #[inline]
-pub(crate) fn read_leb128(buf: &[u8], pos: usize) -> Option<(u64, usize)> {
+pub fn read_leb128(buf: &[u8], pos: usize) -> Option<(u64, usize)> {
     // Fast path: a single-byte varint (value < 128) is by far the most common
     // on the read path (small keys, seqnos, shared/rest lengths). One
     // bounds-checked load, a compare, and a return — no loop setup.
@@ -53,7 +53,7 @@ pub(crate) fn read_leb128(buf: &[u8], pos: usize) -> Option<(u64, usize)> {
 
 /// Advances past one LEB128 varint in `buf` without materializing its value.
 #[inline]
-pub(crate) fn skip_leb128(buf: &[u8], mut pos: usize) -> Option<usize> {
+pub fn skip_leb128(buf: &[u8], mut pos: usize) -> Option<usize> {
     loop {
         let byte = *buf.get(pos)?;
         pos += 1;

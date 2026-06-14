@@ -35,7 +35,7 @@ impl Decodable<DataBlockParsedItem> for InternalValue {
         entries_end: usize,
     ) -> Option<(&'a [u8], SeqNo)> {
         // Slice-based decode (see `parse_full` / `read_leb128`).
-        let buf: &[u8] = *reader.get_ref();
+        let buf: &[u8] = reader.get_ref();
         let mut pos = usize::try_from(reader.position()).ok()?;
 
         let value_type = *buf.get(pos)?;
@@ -51,7 +51,7 @@ impl Decodable<DataBlockParsedItem> for InternalValue {
         pos = np;
         let key_len = usize::try_from(key_len_raw)
             .ok()
-            .filter(|&k| k <= usize::from(u16::MAX))?;
+            .filter(|&k| u16::try_from(k).is_ok())?;
         let key_start = offset.checked_add(pos)?;
         let key_end = key_start.checked_add(key_len)?;
         if key_end > entries_end {
@@ -72,7 +72,7 @@ impl Decodable<DataBlockParsedItem> for InternalValue {
         // Slice-based decode: read from the cursor's buffer through a local
         // index instead of `Cursor::read_u8` per byte; advance the cursor once
         // at the end. See `read_leb128`.
-        let buf: &[u8] = *reader.get_ref();
+        let buf: &[u8] = reader.get_ref();
         let mut pos = usize::try_from(reader.position()).ok()?;
 
         let value_type = *buf.get(pos)?;
@@ -91,7 +91,7 @@ impl Decodable<DataBlockParsedItem> for InternalValue {
         // key_len is encoded as a u16 varint on the wire.
         let key_len = usize::try_from(key_len_raw)
             .ok()
-            .filter(|&k| k <= usize::from(u16::MAX))?;
+            .filter(|&k| u16::try_from(k).is_ok())?;
         let key_start = offset.checked_add(pos)?;
         if key_start > entries_end {
             return None;
@@ -110,7 +110,7 @@ impl Decodable<DataBlockParsedItem> for InternalValue {
             // val_len is encoded as a u32 varint on the wire.
             usize::try_from(val_len_raw)
                 .ok()
-                .filter(|&v| v <= u32::MAX as usize)?
+                .filter(|&v| u32::try_from(v).is_ok())?
         } else {
             0
         };
@@ -152,7 +152,7 @@ impl Decodable<DataBlockParsedItem> for InternalValue {
         entries_end: usize,
     ) -> Option<DataBlockParsedItem> {
         // Slice-based decode (see `parse_full` / `read_leb128`).
-        let buf: &[u8] = *reader.get_ref();
+        let buf: &[u8] = reader.get_ref();
         let mut pos = usize::try_from(reader.position()).ok()?;
 
         let value_type = *buf.get(pos)?;
@@ -169,12 +169,12 @@ impl Decodable<DataBlockParsedItem> for InternalValue {
         pos = np;
         let shared_prefix_len = usize::try_from(shared_raw)
             .ok()
-            .filter(|&k| k <= usize::from(u16::MAX))?;
+            .filter(|&k| u16::try_from(k).is_ok())?;
         let (rest_raw, np) = read_leb128(buf, pos)?;
         pos = np;
         let rest_key_len = usize::try_from(rest_raw)
             .ok()
-            .filter(|&k| k <= usize::from(u16::MAX))?;
+            .filter(|&k| u16::try_from(k).is_ok())?;
 
         if base_key_end < base_key_offset || base_key_end > offset {
             return None;
@@ -204,7 +204,7 @@ impl Decodable<DataBlockParsedItem> for InternalValue {
             pos = np;
             usize::try_from(val_len_raw)
                 .ok()
-                .filter(|&v| v <= u32::MAX as usize)?
+                .filter(|&v| u32::try_from(v).is_ok())?
         } else {
             0
         };
@@ -570,7 +570,7 @@ impl DataBlock {
     /// On the value-returning `get` path the caller has the needle and never
     /// reads the matched entry's key bytes, so fusing the delta-encoded key (an
     /// allocation + copy per hit) is pure waste. The value is a zero-copy
-    /// sub-slice of the cached block, mirroring RocksDB's `PinnableSlice`.
+    /// sub-slice of the cached block, mirroring the `RocksDB` `PinnableSlice`.
     pub fn point_read_value(
         &self,
         needle: &[u8],

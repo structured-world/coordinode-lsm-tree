@@ -346,7 +346,7 @@ impl Decodable<IndexBlockParsedItem> for KeyedBlockHandle {
         // local index instead of `Cursor::read_u8` (a `read_exact` of one byte
         // each), then advance the cursor once at the end. This is the hottest
         // function on the point-read path (index restart-key probe).
-        let buf: &[u8] = *reader.get_ref();
+        let buf: &[u8] = reader.get_ref();
         let mut pos = usize::try_from(reader.position()).ok()?;
 
         let marker = *buf.get(pos)?;
@@ -388,7 +388,7 @@ impl Decodable<IndexBlockParsedItem> for KeyedBlockHandle {
         // value exactly as `read_u16_varint` did.
         let key_len = usize::try_from(key_len_raw)
             .ok()
-            .filter(|&k| k <= usize::from(u16::MAX))?;
+            .filter(|&k| u16::try_from(k).is_ok())?;
 
         let key_start = offset.checked_add(pos)?;
         let key_end = key_start.checked_add(key_len)?;
