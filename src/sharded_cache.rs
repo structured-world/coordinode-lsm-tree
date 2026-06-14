@@ -88,14 +88,7 @@ struct Padded<T>(T);
 /// via lazy tombstoning — a removed key stays in its FIFO queue and is skipped
 /// (as "stale") when popped during eviction.
 struct ShardCore<K, V, S> {
-    /// Keyed by the entry's precomputed hash. The sharded wrapper already hashes
-    /// the key once (to pick the shard), so it passes that hash straight in and
-    /// the table never re-hashes on the read path. `(K, Slot)` tuples carry the
-    /// key for equality checks and rehashing during resize/eviction.
-    map: hashbrown::HashTable<(K, Slot<V>)>,
-    /// Kept so the cold paths (insert-resize, eviction lookups) can rehash a key
-    /// the wrapper did not pre-hash.
-    hasher: S,
+    map: hashbrown::HashMap<K, Slot<V>, S>,
     small: VecDeque<K>,
     main: VecDeque<K>,
     ghost: VecDeque<K>,
@@ -119,8 +112,7 @@ where
 {
     fn new(capacity: u64, ghost_capacity: usize, hasher: S) -> Self {
         Self {
-            map: hashbrown::HashTable::new(),
-            hasher: hasher.clone(),
+            map: hashbrown::HashMap::with_hasher(hasher.clone()),
             small: VecDeque::new(),
             main: VecDeque::new(),
             ghost: VecDeque::new(),
@@ -138,8 +130,8 @@ where
     /// Lock-free-path read: returns the value (cloned) and bumps the frequency
     /// counter. Runs under a shared lock — the only mutation is the atomic
     /// `freq` bump, which is safe to race (the counter is a hint).
-    fn get(&self, hash: u64, key: &K) -> Option<V> {
-        let (_, slot) = self.map.find(hash, |(k, _)| k == key)?;
+    fn get(&self, key: &K) -> Option<V> {
+        let slot = self.map.get(key)?;
         // Saturating bump. A racing pair of `get`s may drop one increment; that
         // only mildly under-counts frequency, never corrupts state.
         let f = slot.freq.load(Ordering::Relaxed);
@@ -153,10 +145,8 @@ where
     /// frequency counter. Used by the partial-decode tier, which inspects an
     /// entry without counting it as a hit.
     #[cfg(any(feature = "zstd", test))]
-    fn peek(&self, hash: u64, key: &K) -> Option<V> {
-        self.map
-            .find(hash, |(k, _)| k == key)
-            .map(|(_, slot)| slot.value.clone())
+    fn peek(&self, key: &K) -> Option<V> {
+        self.map.get(key).map(|slot| slot.value.clone())
     }
 
     fn len(&self) -> usize {
@@ -166,8 +156,8 @@ where
     /// Inserts or replaces `key`, evicting to stay within capacity. The shard's
     /// running `small_bytes` / `main_bytes` tallies are kept current throughout
     /// (the sharded wrapper reads them under a shared lock for `weight()`).
-    fn insert(&mut self, hash: u64, key: K, value: V, weight: u64) {
-        if let Some((_, slot)) = self.map.find_mut(hash, |(k, _)| *k == key) {
+    fn insert(&mut self, key: K, value: V, weight: u64) {
+        if let Some(slot) = self.map.get_mut(&key) {
             // Replace in place: adjust the owning queue's byte tally by the
             // weight delta, keep the queue position and frequency.
             let old = slot.weight;
@@ -186,19 +176,14 @@ where
             } else {
                 Location::Small
             };
-            let hasher = &self.hasher;
-            self.map.insert_unique(
-                hash,
-                (
-                    key.clone(),
-                    Slot {
-                        value,
-                        weight,
-                        freq: AtomicU8::new(0),
-                        loc,
-                    },
-                ),
-                |(k, _)| hasher.hash_one(k),
+            self.map.insert(
+                key.clone(),
+                Slot {
+                    value,
+                    weight,
+                    freq: AtomicU8::new(0),
+                    loc,
+                },
             );
             match loc {
                 Location::Small => {
@@ -217,11 +202,10 @@ where
 
     /// Removes `key` if present (lazy tombstone — the stale queue entry is
     /// skipped on its next pop).
-    fn remove(&mut self, hash: u64, key: &K) {
-        let Ok(entry) = self.map.find_entry(hash, |(k, _)| k == key) else {
+    fn remove(&mut self, key: &K) {
+        let Some(slot) = self.map.remove(key) else {
             return;
         };
-        let (_, slot) = entry.remove().0;
         match slot.loc {
             Location::Small => self.small_bytes -= slot.weight,
             Location::Main => self.main_bytes -= slot.weight,
@@ -264,8 +248,7 @@ where
     /// no live entry.
     fn evict_from_small(&mut self) -> bool {
         while let Some(key) = self.small.pop_front() {
-            let hash = self.hasher.hash_one(&key);
-            let Some((_, slot)) = self.map.find_mut(hash, |(k, _)| *k == key) else {
+            let Some(slot) = self.map.get_mut(&key) else {
                 continue; // stale tombstone — already removed
             };
             let w = slot.weight;
@@ -278,9 +261,7 @@ where
                 self.main.push_back(key);
             } else {
                 // Cold: evict, remember the fingerprint in the ghost queue.
-                if let Ok(entry) = self.map.find_entry(hash, |(k, _)| *k == key) {
-                    entry.remove();
-                }
+                self.map.remove(&key);
                 self.small_bytes -= w;
                 self.push_ghost(key);
             }
@@ -295,8 +276,7 @@ where
     /// entry.
     fn evict_from_main(&mut self) -> bool {
         while let Some(key) = self.main.pop_front() {
-            let hash = self.hasher.hash_one(&key);
-            let Some((_, slot)) = self.map.find_mut(hash, |(k, _)| *k == key) else {
+            let Some(slot) = self.map.get_mut(&key) else {
                 continue; // stale tombstone
             };
             let f = slot.freq.load(Ordering::Relaxed);
@@ -305,9 +285,7 @@ where
                 self.main.push_back(key);
             } else {
                 let w = slot.weight;
-                if let Ok(entry) = self.map.find_entry(hash, |(k, _)| *k == key) {
-                    entry.remove();
-                }
+                self.map.remove(&key);
                 self.main_bytes -= w;
             }
             return true;
@@ -392,11 +370,8 @@ where
         }
     }
 
-    /// Hashes `key` once and resolves both the owning shard and the hash that
-    /// the shard's table reuses for its own lookup. Hashing here (instead of
-    /// once for the shard and again inside the table) is the per-access win.
     #[inline]
-    fn locate(&self, key: &K) -> (u64, &RwLock<ShardCore<K, V, S>>) {
+    fn shard(&self, key: &K) -> &RwLock<ShardCore<K, V, S>> {
         let h = self.hasher.hash_one(key);
         // High bits are the best-mixed for most hashers; fold them down to the
         // shard index. `shards.len()` is a power of two, so `& mask` is exact.
@@ -413,33 +388,29 @@ where
             clippy::indexing_slicing,
             reason = "idx = hash & (len - 1) with len a power of two, so idx < len"
         )]
-        (h, &self.shards[idx].0)
+        &self.shards[idx].0
     }
 
     /// Returns the value for `key`, counting the access as a hit (promotes).
     pub fn get(&self, key: &K) -> Option<V> {
-        let (h, shard) = self.locate(key);
-        shard.read().get(h, key)
+        self.shard(key).read().get(key)
     }
 
     /// Returns the value for `key` WITHOUT counting it as a hit (no promotion).
     #[cfg(any(feature = "zstd", test))]
     pub fn peek(&self, key: &K) -> Option<V> {
-        let (h, shard) = self.locate(key);
-        shard.read().peek(h, key)
+        self.shard(key).read().peek(key)
     }
 
     /// Inserts or replaces `key`, evicting as needed to stay within capacity.
     pub fn insert(&self, key: K, value: V) {
         let weight = self.weighter.weight(&key, &value);
-        let (h, shard) = self.locate(&key);
-        shard.write().insert(h, key, value, weight);
+        self.shard(&key).write().insert(key, value, weight);
     }
 
     /// Removes `key` if present.
     pub fn remove(&self, key: &K) {
-        let (h, shard) = self.locate(key);
-        shard.write().remove(h, key);
+        self.shard(key).write().remove(key);
     }
 
     /// Total resident weight across all shards. Sums each shard's tally under a
