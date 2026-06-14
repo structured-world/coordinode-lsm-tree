@@ -94,7 +94,7 @@ use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_m
 // for method resolution (clippy `-D warnings` confirms it is live).
 use lsm_tree::{
     AbstractTree, CompressionType, Config, Guard, MAX_SEQNO, SequenceNumberCounter,
-    config::CompressionPolicy,
+    config::{CompressionPolicy, KvSeparationOptions},
     runtime_config::{KvChecksumPolicy, RuntimeConfig},
 };
 use surrealkv::{
@@ -196,6 +196,12 @@ enum Engine {
     /// (only None / Snappy), so it participates ONLY in the
     /// None-compression (codec-neutral) groups — see [`engines_for`].
     SurrealKv,
+    /// Our engine in its KV-separated (`blob_tree`) configuration: values at or
+    /// above [`BLOB_SEPARATION_THRESHOLD`] are stored out-of-line in blob files,
+    /// so the key-LSM the reads walk is smaller (like surrealkv's vlog). Drives
+    /// the same `AbstractTree` API as `Ours`; participates only in the
+    /// None-compression groups where surrealkv overlays (see [`engines_for`]).
+    BlobTree,
 }
 
 impl Engine {
@@ -204,9 +210,23 @@ impl Engine {
             Self::Ours => "ours",
             Self::RocksDb => "rocksdb",
             Self::SurrealKv => "surrealkv",
+            Self::BlobTree => "blob_tree",
         }
     }
+
+    /// Whether this engine opens our tree with KV-separation enabled.
+    fn kv_separated(self) -> bool {
+        matches!(self, Self::BlobTree)
+    }
 }
+
+/// KV-separation threshold for the `blob_tree` arm: values at or above this many
+/// bytes are stored out-of-line. The benchmark value is 256 bytes (see
+/// [`value_for`]), so 128 separates every value out-of-line, mirroring
+/// surrealkv's vlog and isolating the "smaller key-LSM" read effect the
+/// `blob_tree` arm exists to measure. Below the default 1 KiB threshold, which
+/// would leave the 256-byte values inlined (no separation, no measurement).
+const BLOB_SEPARATION_THRESHOLD: u32 = 128;
 
 /// Engines to overlay for a given compression variant.
 ///
@@ -217,7 +237,12 @@ impl Engine {
 /// engines run codec-neutral. The `_zstd22` groups stay ours-vs-rocksdb.
 fn engines_for(compression: Compression) -> &'static [Engine] {
     match compression {
-        Compression::None => &[Engine::Ours, Engine::RocksDb, Engine::SurrealKv],
+        Compression::None => &[
+            Engine::Ours,
+            Engine::RocksDb,
+            Engine::SurrealKv,
+            Engine::BlobTree,
+        ],
         Compression::Zstd22 => &[Engine::Ours, Engine::RocksDb],
     }
 }
@@ -437,9 +462,14 @@ fn rocksdb_options(compression: Compression) -> rocksdb::Options {
 /// "uncompressed baseline"); `Zstd22` applies level-22 zstd to every
 /// level. Keeping the `None` arm explicit holds the baseline apples-to-
 /// apples with RocksDB's `DBCompressionType::None`.
+///
+/// When `kv_separated` is set, values at or above [`BLOB_SEPARATION_THRESHOLD`]
+/// are stored out-of-line (the `blob_tree` arm); the blob files inherit the
+/// `None`-compression baseline so the separated path stays codec-neutral too.
 fn open_ours(
     dir: &std::path::Path,
     compression: Compression,
+    kv_separated: bool,
 ) -> Result<lsm_tree::AnyTree, Box<dyn std::error::Error>> {
     let config = Config::new(
         dir,
@@ -453,6 +483,18 @@ fn open_ours(
         Compression::Zstd22 => config.data_block_compression_policy(CompressionPolicy::all(
             CompressionType::Zstd(Compression::ZSTD_MAX_LEVEL),
         )),
+    };
+    let config = if kv_separated {
+        // Blobs stay `None`-compressed (the bench crate has no `lz4` feature, so
+        // `KvSeparationOptions::default().compression` is already `None`; set it
+        // explicitly so a future feature flip cannot silently compress blobs).
+        config.with_kv_separation(Some(
+            KvSeparationOptions::default()
+                .separation_threshold(BLOB_SEPARATION_THRESHOLD)
+                .compression(CompressionType::None),
+        ))
+    } else {
+        config
     };
     // Apply the symmetry preset (RocksDbParity by default) so our opt-ins match
     // RocksDB's feature set for the head-to-head.
@@ -505,8 +547,8 @@ fn run_write_throughput(
     let dir = tempfile::tempdir()?;
     let start = std::time::Instant::now();
     let elapsed = match engine {
-        Engine::Ours => {
-            let tree = open_ours(dir.path(), compression)?;
+        Engine::Ours | Engine::BlobTree => {
+            let tree = open_ours(dir.path(), compression, engine.kv_separated())?;
             // Zip the seqno counter as a native `u64` instead of
             // enumerate()+try_from(usize). lsm-tree's `insert` takes
             // SeqNo (= u64) directly; using `0u64..` avoids the
@@ -689,8 +731,9 @@ fn point_read_variant(c: &mut Criterion, group_name: &str, compression: Compress
                 // pays for reads, never for open / write / flush.
                 let dir = tempfile::tempdir().expect("tempdir");
                 match engine {
-                    Engine::Ours => {
-                        let tree = open_ours(dir.path(), compression).expect("ours: open");
+                    Engine::Ours | Engine::BlobTree => {
+                        let tree = open_ours(dir.path(), compression, engine.kv_separated())
+                            .expect("ours: open");
                         for ((key, value), seqno) in
                             inputs.keys.iter().zip(inputs.values.iter()).zip(0u64..)
                         {
@@ -810,13 +853,15 @@ fn populate_rocksdb(
 }
 
 /// Populates our engine at `dir` and flushes, returning the warm handle.
-/// Companion to [`populate_rocksdb`] for the warm read groups.
+/// Companion to [`populate_rocksdb`] for the warm read groups. `kv_separated`
+/// selects the `blob_tree` (KV-separated) configuration.
 fn populate_ours(
     dir: &std::path::Path,
     compression: Compression,
     inputs: &WorkloadInputs,
+    kv_separated: bool,
 ) -> lsm_tree::AnyTree {
-    let tree = open_ours(dir, compression).expect("ours: open");
+    let tree = open_ours(dir, compression, kv_separated).expect("ours: open");
     for ((key, value), seqno) in inputs.keys.iter().zip(inputs.values.iter()).zip(0u64..) {
         tree.insert(key, value, seqno);
     }
@@ -844,8 +889,9 @@ fn range_scan_variant(c: &mut Criterion, group_name: &str, compression: Compress
             group.bench_with_input(BenchmarkId::new(engine.label(), n), &n, |b, _| {
                 let dir = tempfile::tempdir().expect("tempdir");
                 match engine {
-                    Engine::Ours => {
-                        let tree = populate_ours(dir.path(), compression, &inputs);
+                    Engine::Ours | Engine::BlobTree => {
+                        let tree =
+                            populate_ours(dir.path(), compression, &inputs, engine.kv_separated());
                         b.iter_custom(|iters| {
                             let start = std::time::Instant::now();
                             for _ in 0..iters {
@@ -917,8 +963,9 @@ fn seek_random_variant(c: &mut Criterion, group_name: &str, compression: Compres
             group.bench_with_input(BenchmarkId::new(engine.label(), n), &n, |b, _| {
                 let dir = tempfile::tempdir().expect("tempdir");
                 match engine {
-                    Engine::Ours => {
-                        let tree = populate_ours(dir.path(), compression, &inputs);
+                    Engine::Ours | Engine::BlobTree => {
+                        let tree =
+                            populate_ours(dir.path(), compression, &inputs, engine.kv_separated());
                         b.iter_custom(|iters| {
                             let start = std::time::Instant::now();
                             for _ in 0..iters {
@@ -1008,10 +1055,15 @@ fn overwrite_variant(c: &mut Criterion, group_name: &str, compression: Compressi
                     for _ in 0..iters {
                         let dir = tempfile::tempdir().expect("tempdir");
                         match engine {
-                            Engine::Ours => {
+                            Engine::Ours | Engine::BlobTree => {
                                 // First copy (untimed): populate + flush so the
                                 // timed pass overwrites existing keys.
-                                let tree = populate_ours(dir.path(), compression, &inputs);
+                                let tree = populate_ours(
+                                    dir.path(),
+                                    compression,
+                                    &inputs,
+                                    engine.kv_separated(),
+                                );
                                 let start = std::time::Instant::now();
                                 // Second seqno range so the overwrite produces a
                                 // newer version of every key.
@@ -1173,6 +1225,12 @@ fn run_compaction(
         // loop is fixed to ours+rocksdb). The arm exists only for exhaustiveness.
         Engine::SurrealKv => {
             unreachable!("surrealkv is excluded from zstd-level compaction benches")
+        }
+        // blob_tree overlays only the read/write groups (where surrealkv runs),
+        // not the zstd-level compaction benches whose loop is fixed to
+        // ours+rocksdb. The arm exists only for exhaustiveness.
+        Engine::BlobTree => {
+            unreachable!("blob_tree is excluded from the zstd-level compaction benches")
         }
     };
     drop(dir);
@@ -1395,6 +1453,12 @@ fn run_subcompaction_bench(
         // loop is fixed to ours+rocksdb). The arm exists only for exhaustiveness.
         Engine::SurrealKv => {
             unreachable!("surrealkv is excluded from zstd-level compaction benches")
+        }
+        // blob_tree overlays only the read/write groups (where surrealkv runs),
+        // not the zstd-level compaction benches whose loop is fixed to
+        // ours+rocksdb. The arm exists only for exhaustiveness.
+        Engine::BlobTree => {
+            unreachable!("blob_tree is excluded from the zstd-level compaction benches")
         }
     };
     drop(dir);
