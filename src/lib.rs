@@ -381,6 +381,12 @@ mod format_version;
 mod time;
 mod tree;
 
+pub use time::Clock;
+#[cfg(feature = "std")]
+pub use time::SystemClock;
+#[cfg(not(feature = "std"))]
+pub use time::set_clock;
+
 /// Utility functions
 pub mod util;
 
