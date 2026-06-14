@@ -24,6 +24,22 @@ use std::io::Seek;
 #[cfg(feature = "std")]
 use varint_rs::{VarintReader, VarintWriter};
 
+/// Advances `reader` past one LEB128 varint without decoding its value.
+///
+/// A LEB128 varint terminates at the first byte whose continuation bit (`0x80`)
+/// is clear. Used on the hot index restart-key probe to skip the block handle
+/// (file offset + size), which the binary search never reads: skipping avoids
+/// the accumulate/shift of a full decode and the (non-inlined) varint call.
+/// Returns `None` if the buffer ends mid-varint (same failure as a decode).
+#[inline]
+fn skip_leb128(reader: &mut Cursor<&[u8]>) -> Option<()> {
+    loop {
+        if reader.read_u8().ok()? & 0x80 == 0 {
+            return Some(());
+        }
+    }
+}
+
 /// Points to a block on file
 #[derive(Copy, Clone, Debug, Default)]
 pub struct BlockHandle {
@@ -351,8 +367,13 @@ impl Decodable<IndexBlockParsedItem> for KeyedBlockHandle {
             _ => return None,
         };
 
-        let _file_offset = reader.read_u64_varint().ok()?;
-        let _size = reader.read_u32_varint().ok()?;
+        // The binary-search probe only needs `(key, seqno)`: the block handle
+        // (file offset + size) is decoded-then-discarded here on every probe.
+        // Skip past both LEB128 varints without materializing their values
+        // (no accumulate / shift, no separate varint call) — this is the
+        // hottest function on the point-read path (index restart-key parse).
+        skip_leb128(reader)?; // file offset
+        skip_leb128(reader)?; // size
         let seqno = reader.read_u64_varint().ok()?;
 
         if has_bounds {
