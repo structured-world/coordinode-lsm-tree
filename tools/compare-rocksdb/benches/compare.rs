@@ -95,6 +95,7 @@ use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_m
 use lsm_tree::{
     AbstractTree, CompressionType, Config, Guard, MAX_SEQNO, SequenceNumberCounter,
     config::CompressionPolicy,
+    runtime_config::{KvChecksumPolicy, RuntimeConfig},
 };
 use surrealkv::{
     Durability as SkvDurability, LSMIterator as _, Options as SkvOptions, Tree as SkvTree,
@@ -240,6 +241,101 @@ impl Compression {
     const ZSTD_MAX_LEVEL: i32 = 22;
 }
 
+/// Which lsm-tree-only on-disk opt-ins are active for the `ours` engine, per
+/// the Benchmark Symmetry Invariant: any feature RocksDB has no equivalent for
+/// must be OFF when we publish a head-to-head, or we either pay for protection
+/// the competitor lacks (losing a comparison we should win) or win unfairly on
+/// a benchmark where the competitor lacks a feature we enable by default.
+///
+/// Only OUR config moves across presets; RocksDB is the fixed baseline. The
+/// default is [`Preset::RocksDbParity`], so the public dashboard is honest
+/// out of the box.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Preset {
+    /// Every lsm-tree-only opt-in OFF, matching RocksDB's durability defaults.
+    /// The single source of truth for "disable features RocksDB has no
+    /// equivalent for": when a new opt-in lands it must be turned off here too.
+    RocksDbParity,
+    /// Production defaults (manifest hardening + FS-aware optimizations on):
+    /// what a real lsm-tree deployment runs.
+    LsmTreeDefault,
+    /// Every opt-in ON: the worst-case protection-overhead measurement.
+    LsmTreeParanoid,
+}
+
+impl Preset {
+    /// Selects the preset from the `LSM_BENCH_PRESET` env var
+    /// (`rocksdb-parity` | `lsm-default` | `lsm-paranoid`), defaulting to
+    /// [`Preset::RocksDbParity`] (also used for any unrecognized value).
+    fn from_env() -> Self {
+        match std::env::var("LSM_BENCH_PRESET").as_deref() {
+            Ok("lsm-default") => Self::LsmTreeDefault,
+            Ok("lsm-paranoid") => Self::LsmTreeParanoid,
+            _ => Self::RocksDbParity,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::RocksDbParity => "rocksdb-parity",
+            Self::LsmTreeDefault => "lsm-default",
+            Self::LsmTreeParanoid => "lsm-paranoid",
+        }
+    }
+}
+
+/// The preset for this whole bench process, resolved once from the environment.
+/// Cached so every engine open in the run sees the same preset (and the choice
+/// is logged exactly once, to stderr, for the dashboard provenance).
+fn active_preset() -> Preset {
+    static PRESET: std::sync::OnceLock<Preset> = std::sync::OnceLock::new();
+    *PRESET.get_or_init(|| {
+        let p = Preset::from_env();
+        eprintln!(
+            "compare-rocksdb: lsm-tree preset = {} (set LSM_BENCH_PRESET to override)",
+            p.label()
+        );
+        p
+    })
+}
+
+/// Applies the active [`Preset`]'s on-disk feature toggles to our engine config.
+/// `RocksDbParity` explicitly disables every lsm-tree-only opt-in (even those
+/// already off by default) so the preset stays correct if a default ever flips,
+/// and documents the full parity surface in one place.
+fn apply_preset(config: Config, preset: Preset) -> Config {
+    let mut rc = RuntimeConfig::default();
+    match preset {
+        Preset::RocksDbParity => {
+            // Disable every feature RocksDB has no equivalent for.
+            rc.manifest_footer_mirror = false;
+            rc.kv_checksums = KvChecksumPolicy::Off;
+            rc.seqno_in_index = false;
+            rc.page_ecc = false;
+            rc.disable_cow_on_sst_files = false;
+            rc.use_reflink_for_checkpoint = false;
+            // Keep manifest per-record checksums ON: this matches RocksDB's
+            // per-record MANIFEST CRC32 granularity (same durability profile),
+            // so it is parity, not an extra opt-in.
+            rc.manifest_kv_checksums = true;
+            // `Config::page_ecc` is the separate tree-open gate for DATA-block
+            // ECC (the runtime `page_ecc` above covers manifest blocks).
+            config.with_runtime_config(rc).page_ecc(false)
+        }
+        // Production defaults are exactly `RuntimeConfig::default()` + the
+        // `Config` defaults, so leave the config untouched.
+        Preset::LsmTreeDefault => config,
+        Preset::LsmTreeParanoid => {
+            rc.manifest_footer_mirror = true;
+            rc.manifest_kv_checksums = true;
+            rc.kv_checksums = KvChecksumPolicy::AllLevels;
+            rc.seqno_in_index = true;
+            rc.page_ecc = true;
+            config.with_runtime_config(rc).page_ecc(true)
+        }
+    }
+}
+
 /// Deterministic but pseudo-random key derivation. Each key is the
 /// big-endian encoding of `(i * GOLDEN_RATIO_64) wrapping_mul()` —
 /// avoids hot-path RNG cost inside the timing loop while still
@@ -358,6 +454,9 @@ fn open_ours(
             CompressionType::Zstd(Compression::ZSTD_MAX_LEVEL),
         )),
     };
+    // Apply the symmetry preset (RocksDbParity by default) so our opt-ins match
+    // RocksDB's feature set for the head-to-head.
+    let config = apply_preset(config, active_preset());
     Ok(config.open()?)
 }
 
@@ -1006,7 +1105,7 @@ fn run_compaction(
 
     let elapsed = match engine {
         Engine::Ours => {
-            let tree = Config::new(
+            let config = Config::new(
                 dir.path(),
                 SequenceNumberCounter::default(),
                 SequenceNumberCounter::default(),
@@ -1015,8 +1114,8 @@ fn run_compaction(
             .compaction_threads(COMPACTION_THREADS)
             // Disable range-split sub-compaction so this bench isolates parallel
             // block compression only, matching RocksDB's max_subcompactions(1).
-            .subcompaction_min_bytes(u64::MAX)
-            .open()?;
+            .subcompaction_min_bytes(u64::MAX);
+            let tree = apply_preset(config, active_preset()).open()?;
 
             let mut written = 0u64;
             for ((key, value), seqno) in inputs.keys.iter().zip(inputs.values.iter()).zip(0u64..) {
@@ -1208,15 +1307,15 @@ fn run_subcompaction_bench(
 
     let elapsed = match engine {
         Engine::Ours => {
-            let tree = Config::new(
+            let config = Config::new(
                 dir.path(),
                 SequenceNumberCounter::default(),
                 SequenceNumberCounter::default(),
             )
             .data_block_compression_policy(CompressionPolicy::all(CompressionType::Zstd(level)))
             .compaction_threads(SUBCOMPACTION_THREADS)
-            .subcompaction_min_bytes(0)
-            .open()?;
+            .subcompaction_min_bytes(0);
+            let tree = apply_preset(config, active_preset()).open()?;
 
             // Step 1: populate the bottom level with several tables.
             for ((key, value), seqno) in inputs.keys.iter().zip(inputs.values.iter()).zip(0u64..) {
