@@ -555,6 +555,44 @@ impl DataBlock {
         seqno: SeqNo,
         comparator: &crate::comparator::SharedComparator,
     ) -> crate::Result<Option<InternalValue>> {
+        self.point_read_with(needle, seqno, comparator, |item, bytes| {
+            item.materialize(bytes)
+        })
+    }
+
+    /// Value-only point read: returns `(value_type, seqno, value)` without
+    /// reconstructing the entry key.
+    ///
+    /// On the value-returning `get` path the caller has the needle and never
+    /// reads the matched entry's key bytes, so fusing the delta-encoded key (an
+    /// allocation + copy per hit) is pure waste. The value is a zero-copy
+    /// sub-slice of the cached block, mirroring RocksDB's `PinnableSlice`.
+    pub fn point_read_value(
+        &self,
+        needle: &[u8],
+        seqno: SeqNo,
+        comparator: &crate::comparator::SharedComparator,
+    ) -> crate::Result<Option<(ValueType, SeqNo, Slice)>> {
+        self.point_read_with(needle, seqno, comparator, |item, bytes| {
+            let value = item
+                .value
+                .as_ref()
+                .map_or_else(Slice::empty, |v| bytes.slice(v.0..v.1));
+            (item.value_type, item.seqno, value)
+        })
+    }
+
+    /// Shared point-read seek + scan, parameterized over how the matched entry
+    /// is turned into a result. `point_read` materializes a full
+    /// [`InternalValue`]; `point_read_value` extracts only the value.
+    #[inline]
+    fn point_read_with<R>(
+        &self,
+        needle: &[u8],
+        seqno: SeqNo,
+        comparator: &crate::comparator::SharedComparator,
+        extract: impl FnOnce(&DataBlockParsedItem, &Slice) -> R,
+    ) -> crate::Result<Option<R>> {
         // Validate trailer once via try_iter (which calls Decoder::try_new
         // internally). This must happen before get_hash_index_reader /
         // get_binary_index_reader which read trailer fields without their own
@@ -611,7 +649,7 @@ impl DataBlock {
                 continue;
             }
 
-            return Ok(Some(item.materialize(&self.inner.data)));
+            return Ok(Some(extract(&item, &self.inner.data)));
         }
 
         Ok(None)
