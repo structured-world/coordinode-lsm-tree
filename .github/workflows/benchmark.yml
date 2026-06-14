@@ -176,6 +176,14 @@ jobs:
           fi
 
       - name: Run compare-rocksdb head-to-head benches
+        # Pin the published dashboard to the RocksDbParity preset (the apples-to-
+        # apples comparison): every lsm-tree-only on-disk opt-in is OFF so the
+        # numbers are not paying for protection RocksDB has no equivalent for.
+        # Set explicitly rather than relying on the in-code default, so a future
+        # default change cannot silently alter the public comparison. See
+        # docs/BENCHMARKING.md.
+        env:
+          LSM_BENCH_PRESET: rocksdb-parity
         run: |
           cd tools/compare-rocksdb
           cargo bench --bench compare -- \
