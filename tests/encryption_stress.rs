@@ -43,57 +43,16 @@ fn test_key() -> [u8; 32] {
 
 /// Raise this process's open-file soft limit toward its hard limit.
 ///
-/// `setrlimit(RLIMIT_NOFILE)` raising the soft limit up to the hard limit is
-/// unprivileged. On macOS the hard limit is reported as an unbounded sentinel
-/// but the kernel rejects a soft limit above `kern.maxfilesperproc`, so the
-/// target is capped to that value there. Best-effort: any failure leaves the
-/// limit unchanged and the test simply runs closer to the original budget.
-#[cfg(unix)]
+/// The concurrent stress test flushes many SSTs while readers hold descriptors
+/// open via the engine's descriptor cache, so its live fd count can exceed a
+/// low default soft limit (macOS defaults to 256) and surface as EMFILE — a
+/// resource limit, not an encryption fault. `increase_nofile_limit` raises the
+/// soft limit toward the hard limit (capping to the per-process maximum on
+/// macOS). Best-effort: any failure leaves the limit unchanged and the test
+/// simply runs closer to the original budget.
 fn raise_fd_limit() {
-    // SAFETY: get/setrlimit operate on an `rlimit` we own; the macOS sysctl
-    // reads one `c_int` into a stack buffer whose byte length we pass and read
-    // back, so the kernel never writes past it.
-    unsafe {
-        let mut rlim: libc::rlimit = std::mem::zeroed();
-        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut rlim) != 0 {
-            return;
-        }
-
-        // On macOS an unbounded hard limit must be capped to the kernel's
-        // per-process file cap, else setrlimit is rejected. Elsewhere the hard
-        // limit is a usable finite value.
-        #[cfg(target_os = "macos")]
-        let target = if rlim.rlim_max == libc::RLIM_INFINITY {
-            let mut per_proc: libc::c_int = 0;
-            let mut len = std::mem::size_of::<libc::c_int>();
-            let queried = libc::sysctlbyname(
-                c"kern.maxfilesperproc".as_ptr(),
-                std::ptr::addr_of_mut!(per_proc).cast(),
-                &mut len,
-                std::ptr::null_mut(),
-                0,
-            ) == 0
-                && per_proc > 0;
-            if queried {
-                libc::rlim_t::try_from(per_proc).unwrap_or(8192)
-            } else {
-                8192
-            }
-        } else {
-            rlim.rlim_max
-        };
-        #[cfg(not(target_os = "macos"))]
-        let target = rlim.rlim_max;
-
-        if target > rlim.rlim_cur {
-            rlim.rlim_cur = target;
-            let _ = libc::setrlimit(libc::RLIMIT_NOFILE, &rlim);
-        }
-    }
+    let _ = rlimit::increase_nofile_limit(u64::MAX);
 }
-
-#[cfg(not(unix))]
-fn raise_fd_limit() {}
 
 /// Default config + per-cell compression + optional encryption + optional
 /// Page ECC. When `ecc` is set the SST blocks carry a Reed-Solomon parity
