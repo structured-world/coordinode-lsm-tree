@@ -204,7 +204,9 @@ impl<'a, Item: Decodable<Parsed>, Parsed: ParsedItem<Item>> Decoder<'a, Item, Pa
 
     /// Byte length of the entry region (offset where the trailer begins).
     /// Test-only: lets headerless-decode tests slice the exact entry region.
-    #[cfg(test)]
+    /// Only the zstd partial-decode / lazy-block tests use it, so it is gated
+    /// to that feature to stay dead-code-clean in the default test build.
+    #[cfg(all(test, feature = "zstd"))]
     #[must_use]
     pub(crate) fn entries_end_for_test(&self) -> Option<usize> {
         self.cached_entries_end
