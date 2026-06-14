@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1781425344085,
+  "lastUpdate": 1781430205126,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -15756,6 +15756,84 @@ window.BENCHMARK_DATA = {
             "value": 551311.828163998,
             "unit": "ops/sec",
             "extra": "P50: 1.6us | P99: 5.0us | P99.9: 7.4us\nthreads: 1 | elapsed: 0.36s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "43f6df943c1e6112dcaf6edbf4a3b8c4109900ce",
+          "message": "feat(time): injectable Clock trait + no-std-check as a required gate (#460)\n\n## Summary\n\nCompletes the last two unmet acceptance criteria of #449 (no-std full\nalloc engine), which turned out far closer to done than its body\nsuggested: the core engine (`tree` mod is unconditional) already\ncompiles on the no-std-only `thumbv7em-none-eabihf` target\n(`--no-default-features --features alloc`) with **0 errors**, so\ncriteria 1/3/4/5 were already met. Only the `Clock` trait and the CI\ngate remained.\n\n### Clock trait (criterion 2)\n\nA no_std consumer (e.g. a WASM host exposing `Date.now()`) needs to\nsupply wall-clock time, which the engine reads for the `created_at`\nstamp on tables/blob files and for FIFO TTL expiry.\n\n- `Clock` trait with `unix_time()` + `#[diagnostic::on_unimplemented]`;\nthe std `SystemClock` default is gated behind `feature = \"std\"` and used\nautomatically.\n- The no_std injection point `set_clock` now takes `Box<dyn Clock>` (was\na bare `fn() -> Duration`), stored in the same set-once lock-free\n`OnceBox` (the idiomatic no_std hook, like `log::set_logger`).\n- `unix_timestamp()` reads through the active clock, encapsulating the\nonly direct `std::time::SystemTime` use behind the gated `SystemClock`\nimpl.\n- `Clock` / `SystemClock` / `set_clock` are re-exported from the crate\nroot (the `time` module was private, so the injection point was\npreviously unreachable).\n\nA process-wide wall-clock is injected as a trait object behind the\nglobal set-once hook rather than threaded per-tree through writers:\nper-tree wall-clocks have no meaning and would add an `Arc` clone +\nvtable call to the hot writer-construction path for zero functional\ngain.\n\n### no-std-check as a required gate (criterion 6)\n\nThe alloc build is clean on the no-std-only target, so the\n`no-std-check` job no longer needs `continue-on-error`. The flag is\nremoved and the stale \"expected to fail\" comment rewritten: a non-zero\ncount now means a `std::*` leak crept onto an engine path and must be\nfixed, not tolerated.\n\n## Testing\n\n- `cargo check --all-features` clean\n- `cargo check --target thumbv7em-none-eabihf --no-default-features\n--features alloc` → **0 errors**\n- `cargo clippy --all-features --all-targets` clean\n- `cargo test --doc` (new `Clock` doctest) passes\n- full `cargo nextest run --all-features` → **2070 passed**, 2 skipped\n(+3 new `time::tests`)\n- fmt clean; `tools/sst-dump` (separate crate) compiles\n\nPart of #449\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n## Summary by CodeRabbit\n\n* **New Features**\n* Added a pluggable wall-clock abstraction so `unix_timestamp()` can use\nan active clock implementation.\n  * Provided a `SystemClock` for standard-library builds.\n* **Breaking Changes**\n* In no-std builds, `set_clock()` now takes a boxed clock trait object\ninstead of a function pointer.\n* **Chores**\n* Tightened CI behavior for the no-std check to fail the workflow on\nfailures (removed “allow failure” behavior).\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-06-14T12:42:12+03:00",
+          "tree_id": "0827c811b2de992ac4e1d311873b95f1ab1f2e00",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/43f6df943c1e6112dcaf6edbf4a3b8c4109900ce"
+        },
+        "date": 1781430192982,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 1910917.78992803,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.6us | P99.9: 3.7us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1177837.6281572732,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.2us | P99.9: 4.8us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 660078.2670643136,
+            "unit": "ops/sec",
+            "extra": "P50: 1.4us | P99: 4.6us | P99.9: 7.6us\nthreads: 1 | elapsed: 0.30s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3683776.3157237954,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 3.1us | P99.9: 5.5us\nthreads: 1 | elapsed: 0.05s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 428289.7133644325,
+            "unit": "ops/sec",
+            "extra": "P50: 2.1us | P99: 5.3us | P99.9: 8.4us\nthreads: 1 | elapsed: 0.47s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 222172.38377251974,
+            "unit": "ops/sec",
+            "extra": "P50: 4.2us | P99: 5.3us | P99.9: 7.6us\nthreads: 1 | elapsed: 0.90s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1268472.5919414621,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.2us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1155610.172773948,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 1.4us | P99.9: 2.6us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 556794.7982715464,
+            "unit": "ops/sec",
+            "extra": "P50: 1.6us | P99: 5.0us | P99.9: 7.5us\nthreads: 1 | elapsed: 0.36s | num: 200000 | iterations: 3"
           }
         ]
       }
