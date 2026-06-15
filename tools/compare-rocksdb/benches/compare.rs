@@ -507,12 +507,23 @@ fn open_ours(
     compression: Compression,
     kv_separated: bool,
     strategy: IndexStrategy,
+    row_cache: bool,
 ) -> Result<lsm_tree::AnyTree, Box<dyn std::error::Error>> {
     let config = Config::new(
         dir,
         SequenceNumberCounter::default(),
         SequenceNumberCounter::default(),
     );
+    // Row cache: a key->resolved-value layer in front of the block cache so a
+    // repeat point read skips the index walk + data-block decode. Off for the
+    // other arms (a fresh default cache otherwise matches Config's 16 MiB).
+    let config = if row_cache {
+        config.use_cache(std::sync::Arc::new(
+            lsm_tree::Cache::with_capacity_bytes(16 * 1024 * 1024).with_row_cache(true),
+        ))
+    } else {
+        config
+    };
     // Data-block hash index: a point get resolves a key to its in-block offset
     // by hash instead of binary-searching the restart array. 1.33 buckets/entry
     // is the rough equal of RocksDB's 0.75 utilization for the hash-index
@@ -611,6 +622,7 @@ fn run_write_throughput(
                 compression,
                 engine.kv_separated(),
                 IndexStrategy::Binary,
+                false,
             )?;
             // Zip the seqno counter as a native `u64` instead of
             // enumerate()+try_from(usize). lsm-tree's `insert` takes
@@ -794,25 +806,36 @@ fn point_read_variant(
     // data-block index, plus — when `hash_overlays` is set — the data-block
     // hash index (ours + RocksDB) and the retrieval-ribbon locator (ours only)
     // as additional index strategies on the same chart.
-    let mut series: Vec<(&str, Engine, IndexStrategy)> = engines_for(compression)
+    // Tuple: (label, engine, index strategy, row_cache). The row cache is a cache
+    // property orthogonal to the index strategy, so it rides as a 4th field.
+    let mut series: Vec<(&str, Engine, IndexStrategy, bool)> = engines_for(compression)
         .iter()
-        .map(|&engine| (engine.label(), engine, IndexStrategy::Binary))
+        .map(|&engine| (engine.label(), engine, IndexStrategy::Binary, false))
         .collect();
     if hash_overlays {
-        series.push(("ours-hash-index", Engine::Ours, IndexStrategy::HashIndex));
+        series.push((
+            "ours-hash-index",
+            Engine::Ours,
+            IndexStrategy::HashIndex,
+            false,
+        ));
         series.push((
             "rocksdb-hash-index",
             Engine::RocksDb,
             IndexStrategy::HashIndex,
+            false,
         ));
-        series.push(("ours-ribbon", Engine::Ours, IndexStrategy::Ribbon));
+        series.push(("ours-ribbon", Engine::Ours, IndexStrategy::Ribbon, false));
+        // Row cache: binary-search index + a key->value cache in front, so a
+        // repeat point read skips the index walk + data-block decode entirely.
+        series.push(("ours-row-cache", Engine::Ours, IndexStrategy::Binary, true));
     }
 
     let mut group = c.benchmark_group(group_name);
     for &n in &[1_000_u64, 10_000_u64] {
         let inputs = WorkloadInputs::build(n);
         group.throughput(Throughput::Elements(n));
-        for &(label, engine, strategy) in &series {
+        for &(label, engine, strategy, row_cache) in &series {
             group.bench_with_input(BenchmarkId::new(label, n), &n, |b, _| {
                 // The temp dir + engine handle outlive every timed
                 // iteration: build the on-disk database once here so
@@ -821,9 +844,14 @@ fn point_read_variant(
                 let dir = tempfile::tempdir().expect("tempdir");
                 match engine {
                     Engine::Ours | Engine::BlobTree => {
-                        let tree =
-                            open_ours(dir.path(), compression, engine.kv_separated(), strategy)
-                                .expect("ours: open");
+                        let tree = open_ours(
+                            dir.path(),
+                            compression,
+                            engine.kv_separated(),
+                            strategy,
+                            row_cache,
+                        )
+                        .expect("ours: open");
                         for ((key, value), seqno) in
                             inputs.keys.iter().zip(inputs.values.iter()).zip(0u64..)
                         {
@@ -952,8 +980,8 @@ fn populate_ours(
     inputs: &WorkloadInputs,
     kv_separated: bool,
 ) -> lsm_tree::AnyTree {
-    let tree =
-        open_ours(dir, compression, kv_separated, IndexStrategy::Binary).expect("ours: open");
+    let tree = open_ours(dir, compression, kv_separated, IndexStrategy::Binary, false)
+        .expect("ours: open");
     for ((key, value), seqno) in inputs.keys.iter().zip(inputs.values.iter()).zip(0u64..) {
         tree.insert(key, value, seqno);
     }
