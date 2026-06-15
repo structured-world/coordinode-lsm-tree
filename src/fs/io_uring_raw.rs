@@ -78,18 +78,53 @@ const IORING_FSYNC_DATASYNC: u32 = 1;
 /// `openat` dir-fd sentinel meaning "resolve relative paths against the cwd".
 const AT_FDCWD: i32 = -100;
 
-// `open(2)` access-mode / creation flags for [`open_raw`] callers (Linux
-// generic ABI values).
+// `open(2)` access-mode / creation flags for [`open_raw`] callers.
+//
+// The access modes (O_RDONLY/O_WRONLY/O_RDWR = 0/1/2) are universal across every
+// Linux architecture. O_CREAT and O_TRUNC, however, are among the handful of
+// open() flags whose bit values are arch-specific: x86/x86_64, ARM, AArch64,
+// RISC-V, PowerPC, etc. use the asm-generic values, while MIPS and SPARC define
+// their own (verified against each arch's kernel <asm/fcntl.h>). Hardcoding the
+// asm-generic values unconditionally would silently pass the wrong flag on a
+// MIPS or SPARC build, so they are selected per target_arch below.
+
 /// Open read-only.
 pub const O_RDONLY: i32 = 0;
 /// Open write-only.
 pub const O_WRONLY: i32 = 1;
 /// Open read-write.
 pub const O_RDWR: i32 = 2;
-/// Create the file if it does not exist.
+
+/// Create the file if it does not exist. Asm-generic value (`0o100`); MIPS and
+/// SPARC override below.
+#[cfg(not(any(
+    target_arch = "mips",
+    target_arch = "mips32r6",
+    target_arch = "mips64",
+    target_arch = "mips64r6",
+    target_arch = "sparc",
+    target_arch = "sparc64"
+)))]
 pub const O_CREAT: i32 = 0o100;
-/// Truncate the file to zero length on open.
+/// Create the file if it does not exist (MIPS: `0x100`).
+#[cfg(any(
+    target_arch = "mips",
+    target_arch = "mips32r6",
+    target_arch = "mips64",
+    target_arch = "mips64r6"
+))]
+pub const O_CREAT: i32 = 0x100;
+/// Create the file if it does not exist (SPARC: `0x200`).
+#[cfg(any(target_arch = "sparc", target_arch = "sparc64"))]
+pub const O_CREAT: i32 = 0x200;
+
+/// Truncate the file to zero length on open. Asm-generic and MIPS share `0o1000`
+/// (`0x200`); only SPARC overrides below.
+#[cfg(not(any(target_arch = "sparc", target_arch = "sparc64")))]
 pub const O_TRUNC: i32 = 0o1000;
+/// Truncate the file to zero length on open (SPARC: `0x400`).
+#[cfg(any(target_arch = "sparc", target_arch = "sparc64"))]
+pub const O_TRUNC: i32 = 0x400;
 
 // `mmap` protection / flags.
 const PROT_READ: usize = 0x1;
