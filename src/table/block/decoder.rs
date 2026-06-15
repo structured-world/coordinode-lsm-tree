@@ -17,45 +17,71 @@ use core::marker::PhantomData;
 
 use crate::io::Cursor;
 
-/// Decodes one LEB128 varint directly from `buf` at `pos`, returning the value
-/// and the position just past it.
+/// Decodes one LEB128 varint from `$buf` at byte offset `$pos`, evaluating to
+/// `(u64, usize)`: the value and the position just past it.
 ///
-/// Reads through a plain slice index instead of `std::io::Cursor::read_u8` (a
-/// `read_exact` of one byte each), which is the hottest cost on the point-read
-/// path's block-entry parse. Rejects an overlong (> 64-bit) encoding, matching
-/// `VarintReader::read_u64_varint`.
-#[inline]
-pub fn read_leb128(buf: &[u8], pos: usize) -> Option<(u64, usize)> {
-    // Fast path: a single-byte varint (value < 128) is by far the most common
-    // on the read path (small keys, seqnos, shared/rest lengths). One
-    // bounds-checked load, a compare, and a return — no loop setup.
-    let first = *buf.get(pos)?;
-    if first < 0x80 {
-        return Some((u64::from(first), pos + 1));
-    }
-    // Multi-byte continuation: fold in the low 7 bits already read, then loop.
-    let mut result = u64::from(first & 0x7f);
-    let mut shift = 7u32;
-    let mut p = pos + 1;
-    loop {
-        let byte = *buf.get(p)?;
-        p += 1;
-        // The 10th byte (shift == 63) can only carry bit 63; any higher payload
-        // bit (mask 0x7e) would overflow u64. Reject before folding it in so a
-        // corrupt overlong encoding fails the decode instead of silently
-        // truncating to a wrapped value.
-        if shift == 63 && (byte & 0x7e) != 0 {
-            return None;
+/// A macro, not a function, so the whole decode (single-byte fast path **and**
+/// the multi-byte continuation) expands inline at the call site. This is the
+/// hottest cost on the point-read path's block-entry parse, where several
+/// varints are decoded per entry; as a `#[inline]` function it still showed up
+/// as a standalone hot symbol (LLVM declined to inline the body once the loop
+/// made it large enough), so each varint paid a call. The macro removes that
+/// call for every case and lets the decode fuse with the caller's bounds checks
+/// and constants. Reads through a plain slice index (no `Cursor::read_u8`
+/// `read_exact`-per-byte) and rejects an overlong (> 64-bit) encoding, matching
+/// [`VarintReader::read_u64_varint`].
+///
+/// On a truncated buffer (`?` on the bounds-checked load) or an overlong
+/// encoding it returns `None` from the **enclosing** function, so every call
+/// site must sit in a function returning `Option`.
+macro_rules! read_leb128 {
+    ($buf:expr, $pos:expr) => {{
+        let buf: &[u8] = $buf;
+        let start: usize = $pos;
+        let first = *buf.get(start)?;
+        if first < 0x80 {
+            // Single-byte fast path (the common case: small keys, seqnos,
+            // shared/rest lengths). One bounds-checked load, a compare, done.
+            (u64::from(first), start + 1)
+        } else {
+            // Multi-byte continuation: fold in the low 7 bits already read,
+            // then loop. Block offsets / sizes routinely land here, so this
+            // path is inlined too rather than outlined.
+            let mut result = u64::from(first & 0x7f);
+            let mut shift = 7u32;
+            let mut p = start + 1;
+            loop {
+                let byte = *buf.get(p)?;
+                p += 1;
+                // The 10th byte (shift == 63) can only carry bit 63; any higher
+                // payload bit (mask 0x7e) would overflow u64. Reject before
+                // folding it in so a corrupt overlong encoding fails the decode
+                // instead of silently truncating to a wrapped value.
+                if shift == 63 && (byte & 0x7e) != 0 {
+                    return None;
+                }
+                result |= u64::from(byte & 0x7f) << shift;
+                if byte & 0x80 == 0 {
+                    break (result, p);
+                }
+                shift += 7;
+                if shift >= 64 {
+                    return None;
+                }
+            }
         }
-        result |= u64::from(byte & 0x7f) << shift;
-        if byte & 0x80 == 0 {
-            return Some((result, p));
-        }
-        shift += 7;
-        if shift >= 64 {
-            return None;
-        }
-    }
+    }};
+}
+pub(crate) use read_leb128;
+
+/// Function form of [`read_leb128!`] for the unit tests, which assert on the
+/// `Option` return directly. Returns the decoded `(value, position)` or `None`
+/// on a truncated or overlong encoding. Production call sites use the macro so
+/// the decode inlines; a non-test caller that prefers the function form can lift
+/// this out of the `cfg(test)` gate.
+#[cfg(test)]
+fn read_leb128_fn(buf: &[u8], pos: usize) -> Option<(u64, usize)> {
+    Some(read_leb128!(buf, pos))
 }
 
 /// Validates that `restart_interval` and `binary_index_step_size` read from a
@@ -1264,22 +1290,23 @@ mod tests {
 
     #[test]
     fn read_leb128_rejects_overlong_10th_byte() {
-        use super::read_leb128;
+        use super::read_leb128_fn;
         // A 10-byte varint whose final payload byte exceeds 1 encodes a value
         // wider than u64. It must be rejected (None), not silently truncated
         // into a Some(_), or corruption in on-disk seqnos/lengths that every
         // slice-based parse path now decodes through read_leb128 goes
         // undetected. Nine continuation bytes (payload 0) + a terminating 10th
-        // byte with payload 2.
+        // byte with payload 2. `read_leb128_fn` is the function form of the
+        // `read_leb128!` macro (same body), exercised here.
         let overlong = [0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x02];
         assert!(
-            read_leb128(&overlong, 0).is_none(),
+            read_leb128_fn(&overlong, 0).is_none(),
             "10-byte varint with 10th-byte payload > 1 overflows u64 and must be rejected",
         );
         // The boundary-valid case (10th-byte payload 1 → sets bit 63) is still
         // accepted and round-trips to 1 << 63, so the reject is not over-broad.
         let max_bit = [0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x01];
-        assert_eq!(read_leb128(&max_bit, 0), Some((1u64 << 63, 10)));
+        assert_eq!(read_leb128_fn(&max_bit, 0), Some((1u64 << 63, 10)));
     }
 
     fn make_handles(count: usize) -> Vec<KeyedBlockHandle> {

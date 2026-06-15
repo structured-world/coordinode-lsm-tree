@@ -44,10 +44,10 @@ impl Decodable<DataBlockParsedItem> for InternalValue {
             return None;
         }
 
-        let (seqno, np) = read_leb128(buf, pos)?;
+        let (seqno, np) = read_leb128!(buf, pos);
         pos = np;
 
-        let (key_len_raw, np) = read_leb128(buf, pos)?;
+        let (key_len_raw, np) = read_leb128!(buf, pos);
         pos = np;
         let key_len = usize::try_from(key_len_raw)
             .ok()
@@ -83,10 +83,10 @@ impl Decodable<DataBlockParsedItem> for InternalValue {
 
         let value_type = ValueType::try_from(value_type).ok()?;
 
-        let (seqno, np) = read_leb128(buf, pos)?;
+        let (seqno, np) = read_leb128!(buf, pos);
         pos = np;
 
-        let (key_len_raw, np) = read_leb128(buf, pos)?;
+        let (key_len_raw, np) = read_leb128!(buf, pos);
         pos = np;
         // key_len is encoded as a u16 varint on the wire.
         let key_len = usize::try_from(key_len_raw)
@@ -105,7 +105,7 @@ impl Decodable<DataBlockParsedItem> for InternalValue {
         let is_value = !value_type.is_tombstone();
 
         let val_len: usize = if is_value {
-            let (val_len_raw, np) = read_leb128(buf, pos)?;
+            let (val_len_raw, np) = read_leb128!(buf, pos);
             pos = np;
             // val_len is encoded as a u32 varint on the wire.
             usize::try_from(val_len_raw)
@@ -162,15 +162,15 @@ impl Decodable<DataBlockParsedItem> for InternalValue {
         }
         let value_type = ValueType::try_from(value_type).ok()?;
 
-        let (seqno, np) = read_leb128(buf, pos)?;
+        let (seqno, np) = read_leb128!(buf, pos);
         pos = np;
 
-        let (shared_raw, np) = read_leb128(buf, pos)?;
+        let (shared_raw, np) = read_leb128!(buf, pos);
         pos = np;
         let shared_prefix_len = usize::try_from(shared_raw)
             .ok()
             .filter(|&k| u16::try_from(k).is_ok())?;
-        let (rest_raw, np) = read_leb128(buf, pos)?;
+        let (rest_raw, np) = read_leb128!(buf, pos);
         pos = np;
         let rest_key_len = usize::try_from(rest_raw)
             .ok()
@@ -200,7 +200,7 @@ impl Decodable<DataBlockParsedItem> for InternalValue {
         let is_value = !value_type.is_tombstone();
 
         let val_len: usize = if is_value {
-            let (val_len_raw, np) = read_leb128(buf, pos)?;
+            let (val_len_raw, np) = read_leb128!(buf, pos);
             pos = np;
             usize::try_from(val_len_raw)
                 .ok()
