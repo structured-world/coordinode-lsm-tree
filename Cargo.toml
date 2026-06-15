@@ -1,10 +1,16 @@
 # Standalone workspace root. This crate publishes to crates.io and is also
 # checked out as a subdirectory of larger trees (and CI runners that host other
-# workspaces). Declaring an empty workspace here pins it as its own root so
-# Cargo never absorbs it into a surrounding workspace — which would otherwise
-# try to resolve that workspace's path dependencies (absent in a standalone
-# clone) and fail before the build even starts.
+# workspaces). Declaring a workspace here pins it as its own root so Cargo never
+# absorbs it into a surrounding workspace — which would otherwise try to resolve
+# that workspace's path dependencies (absent in a standalone clone) and fail
+# before the build even starts.
+#
+# The `tools/*` crates are standalone binaries that build independently (they
+# pull in heavy, optional deps like librocksdb); they are NOT members of this
+# single-package workspace, so they are excluded — otherwise Cargo would treat
+# them as orphan members of this root and refuse to build.
 [workspace]
+exclude = ["tools/compare-rocksdb", "tools/db_bench", "tools/sst-dump"]
 
 [package]
 name = "coordinode-lsm-tree"
