@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1781539241612,
+  "lastUpdate": 1781541966805,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -16458,6 +16458,84 @@ window.BENCHMARK_DATA = {
             "value": 685741.5602031751,
             "unit": "ops/sec",
             "extra": "P50: 1.3us | P99: 4.5us | P99.9: 7.1us\nthreads: 1 | elapsed: 0.29s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "d2573908c0d4ee184651cffc6d0745d872771f35",
+          "message": "fix(build): pin standalone tool crates as their own workspace roots (#473)\n\n## Summary\n\nThe three `tools/` crates (`compare-rocksdb`, `db_bench`, `sst-dump`)\nbuild standalone and are listed under the main crate's\n`workspace.exclude`. Exclusion stops them joining the main crate's\nworkspace, but it does **not** stop Cargo absorbing them into a\n*different* workspace manifest higher up the tree: an excluded package\nkeeps searching upward and joins the next workspace that doesn't exclude\nit.\n\nOn a bench runner this bit us: a stray root-owned `/tmp/Cargo.toml` left\nby another job claimed `tools/compare-rocksdb` when building from a\ntemp-dir clone, so `cargo bench` failed at resolve time trying to read a\nphantom member crate.\n\n## Fix\n\nGive each tool crate an empty `[workspace]` table so it is its own root.\nCargo never walks past the crate directory, making standalone builds\nimmune to whatever workspace lives above.\n\n## Verification\n\n`cargo metadata --no-deps` on each tool now reports its own directory as\n`workspace_root` (previously could resolve to a parent). Surfaced while\nsetting up the #426 read-path profiling on the bench runner.",
+          "timestamp": "2026-06-15T19:44:49+03:00",
+          "tree_id": "f9df559d60005d7b739dc938fa5a203702fd1e92",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/d2573908c0d4ee184651cffc6d0745d872771f35"
+        },
+        "date": 1781541948523,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 1860034.5918073177,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.7us | P99.9: 3.8us\nthreads: 1 | elapsed: 0.11s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1107364.852750069,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.3us | P99.9: 4.8us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 902410.5483851894,
+            "unit": "ops/sec",
+            "extra": "P50: 1.0us | P99: 4.1us | P99.9: 6.6us\nthreads: 1 | elapsed: 0.22s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3724385.3535119537,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 3.1us | P99.9: 5.5us\nthreads: 1 | elapsed: 0.05s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 430879.46644161205,
+            "unit": "ops/sec",
+            "extra": "P50: 2.0us | P99: 5.4us | P99.9: 9.4us\nthreads: 1 | elapsed: 0.46s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 230605.5540425269,
+            "unit": "ops/sec",
+            "extra": "P50: 4.0us | P99: 5.1us | P99.9: 7.7us\nthreads: 1 | elapsed: 0.87s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1183552.8361272449,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.2us | P99.9: 4.2us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1084834.679439597,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 1.5us | P99.9: 2.4us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 712869.6166140509,
+            "unit": "ops/sec",
+            "extra": "P50: 1.2us | P99: 4.4us | P99.9: 6.9us\nthreads: 1 | elapsed: 0.28s | num: 200000 | iterations: 3"
           }
         ]
       }
