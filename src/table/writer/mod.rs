@@ -140,6 +140,26 @@ pub struct Writer {
     /// partial decode.
     block_layouts: Vec<(BlockOffset, Vec<u32>)>,
 
+    /// Resolved retrieval-ribbon locator settings for this table, or `None`
+    /// (default) when the level's [`crate::config::LocatorPolicy`] is disabled.
+    /// `Some` makes the writer accumulate a per-key locator and emit the
+    /// optional `locator` section at finish. Wired via [`Self::use_locator`].
+    locator: Option<crate::table::locator::LocatorSpec>,
+
+    /// Accumulated `(key_hash, block_id, slot)` triples, one per unique user key
+    /// (the newest version's position), captured at the global new-key boundary
+    /// in [`Self::write`]. `block_id` is the data block's ordinal; `slot` is the
+    /// restart index (or exact entry index for `Entry` precision) of the key's
+    /// newest version within that block. Empty unless `locator` is `Some`;
+    /// packed and built into the `locator` section at finish.
+    locators: Vec<(u64, u64, u64)>,
+
+    /// Ordinal of the data block currently being filled (0-based, in write
+    /// order). Incremented once per spilled block, so it matches the block's
+    /// eventual registration ordinal in both the serial and parallel paths.
+    /// Stamped into each accumulated locator's `block_id`.
+    locator_block_id: u64,
+
     initial_level: u8,
 
     /// Block encryption provider (if encryption at rest is enabled)
@@ -268,6 +288,10 @@ impl Writer {
                 .use_table_id(table_id),
 
             block_layouts: Vec::new(),
+
+            locator: None,
+            locators: Vec::new(),
+            locator_block_id: 0,
 
             block_buffer: Vec::new(),
             file_writer: writer,
@@ -613,6 +637,31 @@ impl Writer {
         self
     }
 
+    /// Wires the resolved per-level retrieval-ribbon locator policy entry.
+    ///
+    /// `Enabled` makes the writer accumulate a per-key `(block_id, slot)`
+    /// locator and emit the optional `locator` section at finish; `None` leaves
+    /// the writer producing byte-identical SSTs (no section, no padding). Must
+    /// be set before the first key, like the other format-affecting `use_*`
+    /// toggles, since it changes which sections the table emits.
+    #[must_use]
+    pub fn use_locator(mut self, entry: crate::config::LocatorPolicyEntry) -> Self {
+        self.assert_not_started("use_locator");
+        self.locator = match entry {
+            crate::config::LocatorPolicyEntry::None => None,
+            crate::config::LocatorPolicyEntry::Enabled {
+                precision,
+                block_id_bits,
+                slot_bits,
+            } => Some(crate::table::locator::LocatorSpec {
+                precision,
+                block_id_bits,
+                slot_bits,
+            }),
+        };
+        self
+    }
+
     /// When `enabled`, clears per-file copy-on-write on this table's (still
     /// empty) file via [`crate::fs::Fs::try_disable_cow`], so a write-once SST
     /// on a copy-on-write filesystem (Btrfs) avoids the fragmentation penalty.
@@ -695,6 +744,25 @@ impl Writer {
             if self.bloom_policy.is_active() {
                 self.filter_writer.register_key(&user_key)?;
             }
+
+            // Retrieval-ribbon locator: record this key's newest version (its
+            // first occurrence in scan order) at its position in the forming
+            // data block. `chunk.len()` is the item index this key will take
+            // (it is pushed below at the same index); `locator_block_id` is the
+            // current block's ordinal. `slot` is the restart index the encoder
+            // will assign (`item_index / restart_interval`) for `Restart`, or
+            // the exact item index for `Entry`.
+            if let Some(spec) = self.locator {
+                let pos = self.chunk.len() as u64;
+                let slot = match spec.precision {
+                    crate::config::LocatorPrecision::Restart => {
+                        pos / u64::from(self.data_block_restart_interval)
+                    }
+                    crate::config::LocatorPrecision::Entry => pos,
+                };
+                self.locators
+                    .push((crate::hash::hash64(&user_key), self.locator_block_id, slot));
+            }
         }
 
         if self.meta.first_key.is_none() {
@@ -731,6 +799,15 @@ impl Writer {
         let Some(last) = self.chunk.last() else {
             return Ok(());
         };
+
+        // Advance the locator block ordinal: this spill flushes the block whose
+        // keys were recorded with the current `locator_block_id`, so the next
+        // block's keys belong to the next ordinal. Done here (not per write
+        // path) so it stays correct for both the serial and parallel spills.
+        // Gated on the feature so an unenabled writer pays nothing.
+        if self.locator.is_some() {
+            self.locator_block_id += 1;
+        }
 
         // Order-independent index-handle data, captured before the chunk is
         // consumed. The parallel path needs it owned because the chunk is
@@ -1122,6 +1199,40 @@ impl Writer {
                 // Layout metadata is small and read on the cold-block path;
                 // store it uncompressed. Encryption / page_ecc still apply via
                 // the configured providers, matching the other meta sections.
+                &{
+                    let t = match self.encryption.as_deref() {
+                        Some(enc) => crate::table::block::BlockTransform::Encrypted(enc),
+                        None => crate::table::block::BlockTransform::PLAIN,
+                    };
+                    if let Some(ecc) = self.ecc {
+                        t.with_ecc(ecc)
+                    } else {
+                        t
+                    }
+                },
+            )?;
+        }
+
+        // Write the optional retrieval-ribbon locator section. Emitted only when
+        // the level's locator policy is enabled AND the per-SST widths fit the
+        // actual layout (`build_locator_section` returns `None` to skip
+        // gracefully otherwise). Absent for a default table, so no bytes added.
+        if let Some(spec) = self.locator
+            && let Some(section) =
+                crate::table::locator::build_locator_section(&self.locators, spec)
+        {
+            self.file_writer.start("locator")?;
+            Block::write_into(
+                &mut self.file_writer,
+                &section,
+                crate::table::block::BlockIdentity {
+                    table_id: self.table_id,
+                    block_type: crate::table::block::BlockType::Locator,
+                    dict_id: 0,
+                    window_log: 0,
+                },
+                // Same protection envelope as the other meta sections: optional
+                // encryption + page ECC via the configured providers.
                 &{
                     let t = match self.encryption.as_deref() {
                         Some(enc) => crate::table::block::BlockTransform::Encrypted(enc),

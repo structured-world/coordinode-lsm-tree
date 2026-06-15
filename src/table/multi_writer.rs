@@ -117,6 +117,12 @@ pub struct MultiWriter {
     /// table in the run is flagged the same way. No-op on non-CoW filesystems.
     disable_cow_on_sst: bool,
 
+    /// Resolved retrieval-ribbon locator policy entry for this run's level,
+    /// preserved here so the rotation path stamps the same setting on every
+    /// successor [`Writer`]. Each table gets its own per-SST locator section
+    /// (block ordinals reset per table). Defaults to `None` (disabled).
+    locator_entry: crate::config::LocatorPolicyEntry,
+
     #[cfg(zstd_any)]
     zstd_dictionary: Option<Arc<crate::compression::ZstdDictionary>>,
 
@@ -185,6 +191,7 @@ impl MultiWriter {
             kv_checksum: None,
             use_seqno_in_index: false,
             disable_cow_on_sst: false,
+            locator_entry: crate::config::LocatorPolicyEntry::None,
 
             #[cfg(zstd_any)]
             zstd_dictionary: None,
@@ -540,6 +547,17 @@ impl MultiWriter {
         self
     }
 
+    /// Wires the resolved retrieval-ribbon locator policy entry through to the
+    /// inner [`Writer`] and preserves it across rotations, so every successor
+    /// table in the run emits its own per-SST locator section (or none, when
+    /// disabled). Block ordinals reset per table.
+    #[must_use]
+    pub fn use_locator(mut self, entry: crate::config::LocatorPolicyEntry) -> Self {
+        self.locator_entry = entry;
+        self.writer = self.writer.use_locator(entry);
+        self
+    }
+
     /// Wires the `disable_cow_on_sst_files` runtime config through to the inner
     /// [`Writer`] (clearing per-file copy-on-write on the current output file) and
     /// preserves it across rotations so every successor SST is flagged the same
@@ -594,6 +612,7 @@ impl MultiWriter {
         }
         new_writer = new_writer.use_seqno_in_index(self.use_seqno_in_index);
         new_writer = new_writer.use_disable_cow(self.disable_cow_on_sst);
+        new_writer = new_writer.use_locator(self.locator_entry);
 
         #[cfg(zstd_any)]
         {
@@ -967,6 +986,118 @@ mod tests {
         tree.major_compact(1_024, 0)?;
         assert_eq!(3, tree.table_count());
         assert_eq!(3, tree.len(SeqNo::MAX, None)?);
+
+        Ok(())
+    }
+
+    // D5b round-trip: the retrieval-ribbon locator section must survive the real
+    // table writer + reader path. With the policy enabled every inserted key
+    // recovers a `(block_id, slot)` from the on-disk section (validating the
+    // writer's per-key block_id/slot accumulation, not just synthetic inputs);
+    // with the policy disabled the section is absent entirely (zero bytes, the
+    // byte-identical guarantee).
+    #[test]
+    #[expect(
+        clippy::expect_used,
+        reason = "test asserts a freshly-written section is present + recovers"
+    )]
+    fn locator_section_round_trips_through_writer() -> crate::Result<()> {
+        use crate::config::{LocatorPolicyEntry, LocatorPrecision};
+        use crate::table::block::BlockType;
+        use crate::table::locator::locate_in_section;
+        use crate::{CompressionType, InternalValue, UserKey, fs::StdFs};
+        use std::sync::Arc;
+
+        let folder = tempfile::tempdir()?;
+        let fs: Arc<dyn crate::fs::Fs> = Arc::new(StdFs);
+        // Small data blocks + many small KVs → many data blocks, so block_id is
+        // non-trivial and the accumulation across block boundaries is exercised.
+        let n = 2_000u64;
+
+        let write_and_recover =
+            |base: &std::path::Path, entry: LocatorPolicyEntry| -> crate::Result<crate::Table> {
+                std::fs::create_dir_all(base)?;
+                let mut mw = super::MultiWriter::new(
+                    base.to_path_buf(),
+                    SequenceNumberCounter::default(),
+                    64 * 1_024 * 1_024,
+                    1,
+                    fs.clone(),
+                )?
+                .use_data_block_size(4_096)
+                .use_locator(entry);
+                for i in 0..n {
+                    mw.write(InternalValue::from_components(
+                        UserKey::from(i.to_be_bytes().as_slice()),
+                        vec![0u8; 64],
+                        1,
+                        crate::ValueType::Value,
+                    ))?;
+                }
+                let results = mw.finish()?;
+                assert_eq!(results.len(), 1, "single output table expected");
+                let (table_id, checksum) = results[0];
+                crate::Table::recover(
+                    base.join(table_id.to_string()),
+                    checksum,
+                    0,
+                    0,
+                    table_id,
+                    Arc::new(crate::Cache::with_capacity_bytes(1 << 20)),
+                    None,
+                    Arc::new(StdFs),
+                    false,
+                    false,
+                    None,
+                    #[cfg(zstd_any)]
+                    None,
+                    Arc::new(crate::DefaultUserComparator),
+                    #[cfg(feature = "metrics")]
+                    Arc::new(crate::Metrics::default()),
+                )
+            };
+
+        // 1) Enabled (auto widths): section present, every key recovers.
+        let base_on = folder.path().join("on");
+        let table = write_and_recover(
+            &base_on,
+            LocatorPolicyEntry::Enabled {
+                precision: LocatorPrecision::Restart,
+                block_id_bits: None,
+                slot_bits: None,
+            },
+        )?;
+        let handle = table
+            .regions
+            .locator
+            .expect("locator section must be present when enabled");
+        let block = table.load_block(
+            &handle,
+            BlockType::Locator,
+            CompressionType::None,
+            #[cfg(zstd_any)]
+            None,
+        )?;
+        let section_bytes: &[u8] = &block.data;
+        let num_blocks = table.metadata.data_block_count;
+        assert!(num_blocks > 1, "test should produce multiple data blocks");
+        for i in 0..n {
+            let h = crate::hash::hash64(&i.to_be_bytes());
+            let (block_id, _slot) = locate_in_section(section_bytes, h)
+                .unwrap_or_else(|| panic!("inserted key {i} must locate"));
+            assert!(
+                block_id < num_blocks,
+                "key {i}: block_id {block_id} >= data_block_count {num_blocks}",
+            );
+        }
+
+        // 2) Disabled (default): no section (zero bytes, byte-identical).
+        let base_off = folder.path().join("off");
+        let table_off = write_and_recover(&base_off, LocatorPolicyEntry::None)?;
+        assert!(
+            table_off.regions.locator.is_none(),
+            "disabled policy must emit no locator section",
+        );
 
         Ok(())
     }

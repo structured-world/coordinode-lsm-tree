@@ -13,6 +13,7 @@ mod inner;
 pub(crate) mod iter;
 #[cfg(feature = "zstd")]
 pub(crate) mod lazy_block;
+pub(crate) mod locator;
 pub(crate) mod meta;
 pub(crate) mod multi_writer;
 pub(crate) mod regions;
