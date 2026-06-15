@@ -34,17 +34,22 @@
     reason = "Linux syscall/mmap ABI: register-width arg casts + page-aligned ring field reads"
 )]
 
+use alloc::boxed::Box;
+use alloc::ffi::CString;
 #[cfg(not(feature = "std"))]
 use alloc::format;
+use alloc::string::{String, ToString};
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 
 use core::sync::atomic::{Ordering, fence};
 
 use spin::Mutex;
 use syscalls::{Errno, Sysno, syscall1, syscall2, syscall3, syscall4, syscall5, syscall6};
 
-use crate::fs::{FsFile, FsMetadata};
+use crate::fs::{Fs, FsDirEntry, FsFile, FsMetadata, FsOpenOptions};
 use crate::io::{Error, ErrorKind, SeekFrom};
+use crate::path::Path;
 
 // ---- Linux io_uring ABI constants (stable kernel uapi, linux/io_uring.h) ----
 
@@ -527,6 +532,120 @@ pub fn file_size_raw(fd: i32) -> Result<u64, Error> {
     lseek_raw(fd, 0, SEEK_END)
 }
 
+// ---- Directory / path syscalls (for the `Fs` backend) ----
+//
+// These use the asm-generic flag values, authoritative on x86/x86_64, ARM,
+// AArch64, RISC-V, PowerPC, etc. (the realistic `io_uring` targets). The handful
+// of flags that diverge on MIPS / SPARC (O_APPEND / O_EXCL / O_DIRECTORY) are not
+// remapped here, matching the `direct_io` policy documented on `FsOpenOptions`.
+
+/// Append: writes always land at end of file.
+const O_APPEND: i32 = 0o2000;
+/// Fail `open` with `EEXIST` if the path already exists (with `O_CREAT`).
+const O_EXCL: i32 = 0o200;
+/// Require the opened path to be a directory.
+const O_DIRECTORY: i32 = 0o200_000;
+
+/// `unlinkat` flag: remove a directory (`rmdir`) instead of a file.
+const AT_REMOVEDIR: i32 = 0x200;
+
+/// `linux_dirent64.d_type`: directory.
+const DT_DIR: u8 = 4;
+
+/// `mkdirat(AT_FDCWD, path, mode)` — create a directory.
+///
+/// # Errors
+/// Returns an [`Error`] if the `mkdirat` syscall fails.
+pub fn mkdirat_raw(path: &core::ffi::CStr, mode: u32) -> Result<(), Error> {
+    // SAFETY: `path` is a valid NUL-terminated C string the kernel only reads.
+    unsafe {
+        syscall3(
+            Sysno::mkdirat,
+            AT_FDCWD as usize,
+            path.as_ptr() as usize,
+            mode as usize,
+        )
+    }
+    .map_err(|e| err("mkdirat", e))?;
+    Ok(())
+}
+
+/// `unlinkat(AT_FDCWD, path, flags)` — remove a file (`flags == 0`) or directory
+/// (`flags == AT_REMOVEDIR`).
+///
+/// # Errors
+/// Returns an [`Error`] if the `unlinkat` syscall fails.
+pub fn unlinkat_raw(path: &core::ffi::CStr, remove_dir: bool) -> Result<(), Error> {
+    let flags = if remove_dir { AT_REMOVEDIR } else { 0 };
+    // SAFETY: `path` is a valid NUL-terminated C string the kernel only reads.
+    unsafe {
+        syscall4(
+            Sysno::unlinkat,
+            AT_FDCWD as usize,
+            path.as_ptr() as usize,
+            flags as usize,
+            0,
+        )
+    }
+    .map_err(|e| err("unlinkat", e))?;
+    Ok(())
+}
+
+/// `renameat2(AT_FDCWD, from, AT_FDCWD, to, 0)` — rename, replacing the
+/// destination (the plain `rename(2)` behaviour).
+///
+/// # Errors
+/// Returns an [`Error`] if the `renameat2` syscall fails.
+pub fn renameat2_raw(from: &core::ffi::CStr, to: &core::ffi::CStr) -> Result<(), Error> {
+    // SAFETY: both paths are valid NUL-terminated C strings the kernel reads.
+    unsafe {
+        syscall5(
+            Sysno::renameat2,
+            AT_FDCWD as usize,
+            from.as_ptr() as usize,
+            AT_FDCWD as usize,
+            to.as_ptr() as usize,
+            0,
+        )
+    }
+    .map_err(|e| err("renameat2", e))?;
+    Ok(())
+}
+
+/// `statx(AT_FDCWD, path, 0, STATX_BASIC_STATS, &buf)` — stat a path (follows
+/// symlinks). Returns [`None`] if the path does not exist (`ENOENT`).
+///
+/// # Errors
+/// Returns an [`Error`] if `statx` fails for a reason other than `ENOENT`.
+pub fn statx_path_raw(path: &core::ffi::CStr) -> Result<Option<RawMetadata>, Error> {
+    let mut buf = Statx::default();
+    // SAFETY: `path` is a valid NUL-terminated C string; `buf` is a valid,
+    // writable Statx the kernel fills.
+    let r = unsafe {
+        syscall5(
+            Sysno::statx,
+            AT_FDCWD as usize,
+            path.as_ptr() as usize,
+            0,
+            STATX_BASIC_STATS as usize,
+            &raw mut buf as usize,
+        )
+    };
+    match r {
+        Ok(_) => {
+            let kind = buf.stx_mode & S_IFMT;
+            Ok(Some(RawMetadata {
+                size: buf.stx_size,
+                is_dir: kind == S_IFDIR,
+                is_file: kind == S_IFREG,
+            }))
+        }
+        // ENOENT (2): the path does not exist — a normal "not found" answer.
+        Err(e) if e.into_raw() == 2 => Ok(None),
+        Err(e) => Err(err("statx", e)),
+    }
+}
+
 // SAFETY: `IoUringRaw`'s raw pointers address `mmap` regions it owns for its
 // whole lifetime, and its ring fd is process-global; moving it to another
 // thread is sound because every access is serialized through the `Mutex` that
@@ -723,6 +842,220 @@ impl std::io::Seek for IoUringRawFile {
 impl crate::io::Seek for IoUringRawFile {
     fn seek(&mut self, pos: SeekFrom) -> crate::io::Result<u64> {
         self.seek_impl(pos)
+    }
+}
+
+/// Converts a path to a NUL-terminated C string for the path syscalls. Errors
+/// on a non-UTF-8 path or an interior NUL. Uses `to_str` (common to the std and
+/// `no_std` `Path`), not the `no_std`-only `as_str`.
+fn path_to_cstring(path: &Path) -> Result<CString, Error> {
+    let s = path
+        .to_str()
+        .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "path is not valid UTF-8"))?;
+    CString::new(s.as_bytes())
+        .map_err(|_| Error::new(ErrorKind::InvalidInput, "path contains an interior NUL"))
+}
+
+/// Maps [`FsOpenOptions`] to `open(2)` flags (asm-generic values; see the
+/// directory-syscall note for the MIPS / SPARC caveat on the divergent flags).
+fn open_flags(opts: &FsOpenOptions) -> i32 {
+    let mut flags = if opts.read && (opts.write || opts.append) {
+        O_RDWR
+    } else if opts.write || opts.append {
+        O_WRONLY
+    } else {
+        O_RDONLY
+    };
+    if opts.create || opts.create_new {
+        flags |= O_CREAT;
+    }
+    if opts.create_new {
+        flags |= O_EXCL;
+    }
+    if opts.truncate {
+        flags |= O_TRUNC;
+    }
+    if opts.append {
+        flags |= O_APPEND;
+    }
+    flags
+}
+
+/// Reads every entry of an open directory `fd` via `getdents64`, returning
+/// `(file_name, is_dir)` pairs and skipping `.` / `..`.
+fn read_dir_entries(fd: i32) -> Result<Vec<(String, bool)>, Error> {
+    let mut entries = Vec::new();
+    let mut buf = [0u8; 4096];
+    loop {
+        // SAFETY: `buf` is a valid writable region of `buf.len()` bytes that the
+        // kernel fills with packed `linux_dirent64` records.
+        let n = unsafe {
+            syscall3(
+                Sysno::getdents64,
+                fd as usize,
+                buf.as_mut_ptr() as usize,
+                buf.len(),
+            )
+        }
+        .map_err(|e| err("getdents64", e))?;
+        if n == 0 {
+            break; // end of directory
+        }
+        let n = n as usize;
+        let mut off = 0usize;
+        // linux_dirent64: d_ino(8) d_off(8) d_reclen(u16 @16) d_type(u8 @18)
+        // d_name(@19, NUL-terminated). Walk record by record via d_reclen.
+        while off + 19 <= n {
+            let reclen = {
+                let b: [u8; 2] = buf
+                    .get(off + 16..off + 18)
+                    .and_then(|s| s.try_into().ok())
+                    .ok_or_else(|| {
+                        Error::new(ErrorKind::InvalidData, "dirent reclen out of range")
+                    })?;
+                usize::from(u16::from_le_bytes(b))
+            };
+            if reclen < 19 || off + reclen > n {
+                return Err(Error::new(
+                    ErrorKind::InvalidData,
+                    "dirent record length invalid",
+                ));
+            }
+            let d_type = *buf
+                .get(off + 18)
+                .ok_or_else(|| Error::new(ErrorKind::InvalidData, "dirent type out of range"))?;
+            let name_region = buf
+                .get(off + 19..off + reclen)
+                .ok_or_else(|| Error::new(ErrorKind::InvalidData, "dirent name out of range"))?;
+            let name_len = name_region
+                .iter()
+                .position(|&c| c == 0)
+                .unwrap_or(name_region.len());
+            let name_bytes = name_region
+                .get(..name_len)
+                .ok_or_else(|| Error::new(ErrorKind::InvalidData, "dirent name slice"))?;
+            let name = core::str::from_utf8(name_bytes)
+                .map_err(|_| Error::new(ErrorKind::InvalidData, "dirent name is not UTF-8"))?;
+            if name != "." && name != ".." {
+                entries.push((name.to_string(), d_type == DT_DIR));
+            }
+            off += reclen;
+        }
+    }
+    Ok(entries)
+}
+
+/// An [`Fs`] backend over the raw `no_std` `io_uring` driver.
+///
+/// Opened files share one ring (the hot read / write / fsync path); directory
+/// operations use plain blocking syscalls. Pure syscalls throughout — no
+/// `io-uring` crate and no `std::fs`, unlike the std-bound [`IoUringFs`].
+pub struct IoUringRawFs {
+    ring: Arc<Mutex<IoUringRaw>>,
+}
+
+impl IoUringRawFs {
+    /// Creates a backend with its own ring sized for `ring_entries` SQEs (the
+    /// kernel rounds up to a power of two).
+    ///
+    /// # Errors
+    /// Returns an [`Error`] if `io_uring_setup` / `mmap` fails.
+    pub fn new(ring_entries: u32) -> Result<Self, Error> {
+        Ok(Self {
+            ring: Arc::new(Mutex::new(IoUringRaw::new(ring_entries)?)),
+        })
+    }
+}
+
+impl Fs for IoUringRawFs {
+    fn open(&self, path: &Path, opts: &FsOpenOptions) -> crate::io::Result<Box<dyn FsFile>> {
+        let cpath = path_to_cstring(path)?;
+        let fd = open_raw(&cpath, open_flags(opts), 0o644)?;
+        Ok(Box::new(IoUringRawFile::new(
+            Arc::clone(&self.ring),
+            fd,
+            opts.append,
+        )))
+    }
+
+    fn create_dir_all(&self, path: &Path) -> crate::io::Result<()> {
+        // Create each ancestor first; an already-existing component is success.
+        if let Some(parent) = path.parent()
+            && !parent.to_str().unwrap_or("").is_empty()
+        {
+            self.create_dir_all(parent)?;
+        }
+        match self.create_dir(path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == ErrorKind::AlreadyExists => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn create_dir(&self, path: &Path) -> crate::io::Result<()> {
+        mkdirat_raw(&path_to_cstring(path)?, 0o755)
+    }
+
+    fn read_dir(&self, path: &Path) -> crate::io::Result<Vec<FsDirEntry>> {
+        let cpath = path_to_cstring(path)?;
+        let fd = open_raw(&cpath, O_RDONLY | O_DIRECTORY, 0)?;
+        let result = read_dir_entries(fd);
+        let _ = close_raw(fd);
+        let names = result?;
+        Ok(names
+            .into_iter()
+            .map(|(name, is_dir)| FsDirEntry {
+                path: path.join(&name),
+                file_name: name,
+                is_dir,
+            })
+            .collect())
+    }
+
+    fn remove_file(&self, path: &Path) -> crate::io::Result<()> {
+        unlinkat_raw(&path_to_cstring(path)?, false)
+    }
+
+    fn remove_dir_all(&self, path: &Path) -> crate::io::Result<()> {
+        // Depth-first: remove children (recursing into subdirectories) before
+        // the directory itself, since the kernel rejects rmdir on a non-empty
+        // directory.
+        for entry in self.read_dir(path)? {
+            let child = path.join(&entry.file_name);
+            if entry.is_dir {
+                self.remove_dir_all(&child)?;
+            } else {
+                self.remove_file(&child)?;
+            }
+        }
+        unlinkat_raw(&path_to_cstring(path)?, true)
+    }
+
+    fn rename(&self, from: &Path, to: &Path) -> crate::io::Result<()> {
+        renameat2_raw(&path_to_cstring(from)?, &path_to_cstring(to)?)
+    }
+
+    fn metadata(&self, path: &Path) -> crate::io::Result<FsMetadata> {
+        match statx_path_raw(&path_to_cstring(path)?)? {
+            Some(m) => Ok(FsMetadata {
+                len: m.size,
+                is_dir: m.is_dir,
+                is_file: m.is_file,
+            }),
+            None => Err(Error::new(ErrorKind::NotFound, "path not found")),
+        }
+    }
+
+    fn sync_directory(&self, path: &Path) -> crate::io::Result<()> {
+        let cpath = path_to_cstring(path)?;
+        let fd = open_raw(&cpath, O_RDONLY | O_DIRECTORY, 0)?;
+        let r = self.ring.lock().fsync(fd, false);
+        let _ = close_raw(fd);
+        r
+    }
+
+    fn exists(&self, path: &Path) -> crate::io::Result<bool> {
+        Ok(statx_path_raw(&path_to_cstring(path)?)?.is_some())
     }
 }
 
@@ -1181,6 +1514,56 @@ mod tests {
 
         drop(file); // closes the fd
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn raw_fs_directory_and_file_ops() {
+        // Exercises the IoUringRawFs Fs surface end to end: create_dir_all
+        // (mkdirat), open + write (ring), metadata + exists (statx), read_dir
+        // (getdents64), rename (renameat2), remove_file + remove_dir_all
+        // (unlinkat) — all over the raw no_std driver.
+        use crate::fs::Fs;
+        use crate::path::Path;
+        use std::io::Write;
+
+        let base =
+            std::env::temp_dir().join(format!("iou_rawfs_{}_{}", std::process::id(), line!()));
+        let base_s = base.to_str().expect("utf8 temp path");
+        let fs = IoUringRawFs::new(8).expect("fs setup");
+        let dir = Path::new(base_s);
+
+        fs.create_dir_all(dir).expect("create_dir_all");
+        assert!(fs.exists(dir).expect("dir exists"));
+        assert!(fs.metadata(dir).expect("dir metadata").is_dir);
+
+        // Open + write a file through the ring.
+        let fpath = dir.join("a.txt");
+        let mut file = fs
+            .open(&fpath, &FsOpenOptions::new().write(true).create(true))
+            .expect("open");
+        file.write_all(b"hello").expect("write");
+        file.sync_all().expect("sync");
+        drop(file);
+
+        // statx-backed metadata + getdents64 listing see the file.
+        assert_eq!(fs.metadata(&fpath).expect("file metadata").len, 5);
+        let entries = fs.read_dir(dir).expect("read_dir");
+        assert!(
+            entries.iter().any(|e| e.file_name == "a.txt" && !e.is_dir),
+            "read_dir must list the written file"
+        );
+
+        // rename (renameat2) moves it.
+        let fpath2 = dir.join("b.txt");
+        fs.rename(&fpath, &fpath2).expect("rename");
+        assert!(!fs.exists(&fpath).expect("old gone"));
+        assert!(fs.exists(&fpath2).expect("new present"));
+
+        // unlinkat removes the file, then the (now empty) directory.
+        fs.remove_file(&fpath2).expect("remove_file");
+        assert!(!fs.exists(&fpath2).expect("file gone"));
+        fs.remove_dir_all(dir).expect("remove_dir_all");
+        assert!(!fs.exists(dir).expect("dir gone"));
     }
 
     #[test]
