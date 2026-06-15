@@ -559,9 +559,40 @@ impl DataBlock {
         seqno: SeqNo,
         comparator: &crate::comparator::SharedComparator,
     ) -> crate::Result<Option<InternalValue>> {
-        self.point_read_with(needle, seqno, comparator, |item, bytes| {
+        self.point_read_with(needle, seqno, comparator, None, |item, bytes| {
             item.materialize(bytes)
         })
+    }
+
+    /// Like [`Self::point_read`], but positioned by a retrieval-ribbon locator
+    /// `slot` instead of the in-block binary search.
+    ///
+    /// `slot` is the restart index (`is_entry == false`) or the exact entry
+    /// index (`is_entry == true`, mapped to its restart via the block's
+    /// `restart_interval`). The scan jumps straight to that restart head and
+    /// proceeds forward, skipping the binary search. If the block has no binary
+    /// index or the restart is out of range, it falls back to the seqno-aware
+    /// seek, so a stale hint never returns a wrong answer.
+    ///
+    /// # Errors
+    ///
+    /// Propagates a trailer/decoder error (same conditions as
+    /// [`Self::point_read`]).
+    pub fn point_read_at_slot(
+        &self,
+        slot: u64,
+        is_entry: bool,
+        needle: &[u8],
+        seqno: SeqNo,
+        comparator: &crate::comparator::SharedComparator,
+    ) -> crate::Result<Option<InternalValue>> {
+        self.point_read_with(
+            needle,
+            seqno,
+            comparator,
+            Some((slot, is_entry)),
+            DataBlockParsedItem::materialize,
+        )
     }
 
     /// Value-only point read: returns `(value_type, seqno, value)` without
@@ -577,7 +608,7 @@ impl DataBlock {
         seqno: SeqNo,
         comparator: &crate::comparator::SharedComparator,
     ) -> crate::Result<Option<(ValueType, SeqNo, Slice)>> {
-        self.point_read_with(needle, seqno, comparator, |item, bytes| {
+        self.point_read_with(needle, seqno, comparator, None, |item, bytes| {
             let value = item
                 .value
                 .as_ref()
@@ -586,9 +617,43 @@ impl DataBlock {
         })
     }
 
+    /// Value-only counterpart of [`Self::point_read_at_slot`]: positioned by a
+    /// retrieval-ribbon locator `slot`, returns `(value_type, seqno, value)`.
+    ///
+    /// # Errors
+    ///
+    /// Propagates a trailer/decoder error (same conditions as
+    /// [`Self::point_read_value`]).
+    pub fn point_read_value_at_slot(
+        &self,
+        slot: u64,
+        is_entry: bool,
+        needle: &[u8],
+        seqno: SeqNo,
+        comparator: &crate::comparator::SharedComparator,
+    ) -> crate::Result<Option<(ValueType, SeqNo, Slice)>> {
+        self.point_read_with(
+            needle,
+            seqno,
+            comparator,
+            Some((slot, is_entry)),
+            |item, bytes| {
+                let value = item
+                    .value
+                    .as_ref()
+                    .map_or_else(Slice::empty, |v| bytes.slice(v.0..v.1));
+                (item.value_type, item.seqno, value)
+            },
+        )
+    }
+
     /// Shared point-read seek + scan, parameterized over how the matched entry
     /// is turned into a result. `point_read` materializes a full
     /// [`InternalValue`]; `point_read_value` extracts only the value.
+    ///
+    /// `slot_hint` (`Some((slot, is_entry))`) positions the scan directly at a
+    /// retrieval-ribbon locator's restart head instead of binary-searching;
+    /// `None` keeps the default hash-index / seqno-seek positioning.
     ///
     /// Drives the [`Decoder`] directly rather than through [`Iter`]: point reads
     /// are forward-only seek + scan, so the double-ended peeking wrapper is pure
@@ -603,6 +668,7 @@ impl DataBlock {
         needle: &[u8],
         seqno: SeqNo,
         comparator: &crate::comparator::SharedComparator,
+        slot_hint: Option<(u64, bool)>,
         extract: impl FnOnce(&DataBlockParsedItem, &Slice) -> R,
     ) -> crate::Result<Option<R>> {
         use crate::table::block::BlockType;
@@ -621,7 +687,30 @@ impl DataBlock {
         // try_new validates + caches all trailer fields once.
         let mut decoder = Decoder::<InternalValue, DataBlockParsedItem>::try_new(&self.inner)?;
 
-        let positioned = if let Some(hash_index_reader) = decoder.cached_hash_index_reader() {
+        let positioned = if let Some((slot, is_entry)) = slot_hint {
+            // Retrieval-ribbon positioning: jump straight to the restart head the
+            // key's newest version lives in, skipping the binary search. For
+            // Entry precision the slot is an exact entry index, mapped to its
+            // restart via the block's restart_interval.
+            let restart_idx = if is_entry {
+                let ri = u64::from(decoder.restart_interval());
+                if ri == 0 { slot } else { slot / ri }
+            } else {
+                slot
+            };
+            let restart_idx = usize::try_from(restart_idx).unwrap_or(usize::MAX);
+            match decoder.cached_binary_index_reader() {
+                Some(binary_index_reader) if restart_idx < binary_index_reader.len() => {
+                    let offset: usize = binary_index_reader.get(restart_idx);
+                    decoder.set_lo_offset(offset);
+                    true
+                }
+                // No binary index, or a stale/out-of-range restart (corruption /
+                // format drift): fall back to the seqno-aware seek so the hint
+                // can never produce a wrong answer.
+                _ => seek_data_block(&mut decoder, needle, seqno, comparator),
+            }
+        } else if let Some(hash_index_reader) = decoder.cached_hash_index_reader() {
             match hash_index_reader.get(needle) {
                 MARKER_FREE => return Ok(None),
                 // NOTE: Fallback to seqno-aware binary search on a hash conflict.
@@ -1304,6 +1393,63 @@ mod tests {
             assert_eq!(got.key.seqno, want.key.seqno);
             assert_eq!(got.key.value_type, want.key.value_type);
             assert_eq!(got.value, want.value);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn point_read_at_slot_positions_by_restart_and_matches_point_read() -> crate::Result<()> {
+        // restart_interval = 4 → 25 restart intervals over 100 sorted keys, so
+        // the locator slot positioning is meaningfully exercised.
+        let ri: u8 = 4;
+        let items: Vec<InternalValue> = (0..100u32)
+            .map(|i| {
+                InternalValue::from_components(
+                    format!("key{i:04}").into_bytes(),
+                    format!("val{i}").into_bytes(),
+                    0,
+                    Value,
+                )
+            })
+            .collect();
+        let bytes = DataBlock::encode_into_vec(&items, ri, 0.0)?;
+        let block = DataBlock::new(Block {
+            data: bytes.into(),
+            header: Header::test_dummy(BlockType::Data),
+        });
+        let cmp = default_comparator();
+
+        for (idx, it) in items.iter().enumerate() {
+            let key = &it.key.user_key;
+            let expected = block.point_read(key, crate::SeqNo::MAX, &cmp)?;
+            assert!(expected.is_some(), "key {idx} must be present");
+
+            let restart_idx = (idx / usize::from(ri)) as u64;
+            // Restart precision: slot IS the key's restart index → exact hit.
+            assert_eq!(
+                block.point_read_at_slot(restart_idx, false, key, crate::SeqNo::MAX, &cmp)?,
+                expected,
+                "restart-slot read mismatch at key {idx}",
+            );
+            // Entry precision: slot is the exact entry index, mapped to its
+            // restart via restart_interval internally.
+            assert_eq!(
+                block.point_read_at_slot(idx as u64, true, key, crate::SeqNo::MAX, &cmp)?,
+                expected,
+                "entry-slot read mismatch at key {idx}",
+            );
+            // Restart 0 scans the whole block → still finds every key.
+            assert_eq!(
+                block.point_read_at_slot(0, false, key, crate::SeqNo::MAX, &cmp)?,
+                expected,
+                "restart-0 read mismatch at key {idx}",
+            );
+            // An out-of-range restart falls back to the seqno seek → same answer.
+            assert_eq!(
+                block.point_read_at_slot(9_999, false, key, crate::SeqNo::MAX, &cmp)?,
+                expected,
+                "out-of-range-slot read mismatch at key {idx}",
+            );
         }
         Ok(())
     }

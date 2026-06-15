@@ -160,6 +160,13 @@ pub(super) fn prepare_table_writer(
     // data-block payload encoding is unchanged; the V5 header/meta layout
     // still differs from pre-V5 regardless).
     let table_writer = table_writer.use_kv_checksums(rc.kv_checksums, rc.kv_checksum_algo);
+    // Resolve the locator policy for the output level (compaction is the
+    // migration mechanism: a toggle takes effect as data is rewritten down).
+    let table_writer = table_writer.use_locator(
+        opts.config
+            .locator_policy
+            .get(usize::from(payload.dest_level)),
+    );
 
     #[cfg(zstd_any)]
     let table_writer = table_writer.use_zstd_dictionary(opts.config.zstd_dictionary.clone());

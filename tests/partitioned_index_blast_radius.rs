@@ -12,6 +12,12 @@
 //! justifies flipping the partitioned-index default ON for every
 //! level: blast radius shrinks from "whole SST unreadable" to "one
 //! partition unreadable".
+//!
+//! These tests run with the default config, which enables the retrieval-ribbon
+//! locator (block precision). The locator must NOT widen this blast radius: a
+//! corrupt sub-index block must still degrade the locator to a graceful skip at
+//! open (falling back to the sorted index) rather than failing the whole table
+//! open — so this suite also guards that interaction.
 
 use lsm_tree::{
     AbstractTree, Config, SequenceNumberCounter,

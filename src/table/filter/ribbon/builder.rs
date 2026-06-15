@@ -37,7 +37,33 @@ impl RibbonBuilder {
         m: usize,
     ) -> Result<RibbonFilter, BuildError> {
         self.params.validate().map_err(BuildError::InvalidParams)?;
-        self.build_once_from_hashes(hashes, m, seed)
+        self.build_once_core(hashes, None, m, seed)
+            .map_err(|failure| BuildError::ConstructionFailed {
+                final_m: m,
+                attempts: 1,
+                last_failure: failure,
+            })
+    }
+
+    /// Build a Ribbon mapping each hashed key to a caller-supplied r-bit
+    /// value (a *retrieval* ribbon) instead of a hash-derived membership
+    /// fingerprint. Verbatim seed, no retry.
+    ///
+    /// `values[i]` is the value stored for `hashes[i]`; both slices must be
+    /// the same length and each value must already fit in `r` bits. The band
+    /// placement (`coeff`, `start`) is still derived from the key hash, so
+    /// the solve is identical to the membership path apart from the RHS — a
+    /// later dot-product query recovers `values[i]` exactly for a key in the
+    /// set (garbage for an absent key, which the caller verifies separately).
+    pub(crate) fn build_with_seed_verbatim_from_values(
+        &self,
+        hashes: &[u64],
+        values: &[u64],
+        seed: u64,
+        m: usize,
+    ) -> Result<RibbonFilter, BuildError> {
+        self.params.validate().map_err(BuildError::InvalidParams)?;
+        self.build_once_core(hashes, Some(values), m, seed)
             .map_err(|failure| BuildError::ConstructionFailed {
                 final_m: m,
                 attempts: 1,
@@ -47,16 +73,32 @@ impl RibbonBuilder {
 
     /// Build a single ribbon over pre-computed key hashes.
     ///
-    /// Used by BuRR through `build_with_seed_verbatim_from_hashes` so the
-    /// LSM-side stable u64 hash (xxh3 / `crate::hash::hash64`) flows
-    /// straight into the banded solver.
-    fn build_once_from_hashes(
+    /// Used by BuRR through `build_with_seed_verbatim_from_hashes` (RHS =
+    /// hash-derived fingerprint, `values = None`) and
+    /// `build_with_seed_verbatim_from_values` (RHS = caller locator,
+    /// `values = Some`). The band placement and Gaussian-elimination solve
+    /// are shared verbatim between the two paths — only the per-key RHS
+    /// differs — so the membership and retrieval ribbons cannot drift.
+    fn build_once_core(
         &self,
         hashes: &[u64],
+        values: Option<&[u64]>,
         m: usize,
         seed: u64,
     ) -> Result<RibbonFilter, ConstructionFailure> {
         debug_assert!(m >= self.params.w);
+        if let Some(values) = values {
+            debug_assert_eq!(
+                values.len(),
+                hashes.len(),
+                "retrieval RHS values must be parallel to hashes",
+            );
+            debug_assert_eq!(
+                self.params.fingerprint_words(),
+                1,
+                "retrieval ribbon stores a single-word (r<=64) value",
+            );
+        }
 
         let stride_words = self.params.fingerprint_words();
         let total_words = m
@@ -80,6 +122,16 @@ impl RibbonBuilder {
             let mut c_lo = equation.coeff_lo;
             let mut c_hi = equation.coeff_hi;
             let mut b = key_fp.clone();
+            if let Some(values) = values {
+                // Retrieval ribbon: replace the hash-derived fingerprint
+                // RHS with the caller's r-bit value. The band (coeff/start)
+                // above is still hash-derived, so the solve is unchanged;
+                // only what it solves *for* differs. stride is 1 for r<=64
+                // (asserted above), so the value lives in word 0, masked to
+                // r bits (identity for an already-fitting value).
+                b.fill(0);
+                b[0] = values[key_index] & fp_last_mask;
+            }
 
             if i >= m {
                 return Err(ConstructionFailure::OutOfBounds {

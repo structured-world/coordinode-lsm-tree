@@ -53,10 +53,18 @@ use super::filter::BurrFilter;
 use super::threshold::is_bumped;
 use crate::file::MAGIC_BYTES;
 
-/// Wire-format identifier for the BuRR filter. Distinct from the legacy
-/// bloom values (0 = StandardBloom, 1 = BlockedBloom — both retired
-/// alongside this rollout in task #17/#18); 2 is the new BuRR slot.
+/// Wire-format identifier for the membership BuRR filter. Distinct from
+/// the legacy bloom values (0 = StandardBloom, 1 = BlockedBloom, both
+/// retired); 2 is the BuRR membership slot.
 pub(crate) const BURR_FILTER_TYPE_BYTE: u8 = 2;
+
+/// Wire-format identifier for a retrieval BuRR (key → locator). Structurally
+/// identical to the membership payload — same header, same per-layer z words
+/// — but the stored RHS is a caller locator, so it answers
+/// [`recover_value_from_bytes`] rather than `contains_hash_from_bytes`. A new
+/// tag within the same `FORMAT_VERSION`, NOT a version bump: membership
+/// readers reject it as a wrong-type tag, retrieval readers reject tag 2.
+pub(crate) const BURR_RETRIEVAL_TYPE_BYTE: u8 = 3;
 
 /// Format version. Bumped if/when the wire layout changes
 /// incompatibly. Readers reject mismatched versions explicitly.
@@ -83,11 +91,18 @@ pub(crate) fn encode(filter: &BurrFilter) -> Vec<u8> {
             .sum::<usize>();
     let mut buf = Vec::with_capacity(estimated_size);
 
-    // Header.
+    // Header. The filter_type tag distinguishes a membership payload
+    // (probe → bool) from a retrieval payload (recover → locator); both
+    // share the rest of the layout. A membership filter writes tag 2
+    // verbatim, so existing on-disk output is byte-identical.
+    let filter_type_byte = match filter.kind() {
+        super::filter::BurrFilterKind::Membership => BURR_FILTER_TYPE_BYTE,
+        super::filter::BurrFilterKind::Retrieval => BURR_RETRIEVAL_TYPE_BYTE,
+    };
     buf.extend_from_slice(&MAGIC_BYTES);
     #[expect(clippy::expect_used, reason = "writing to a Vec<u8> cannot fail")]
     {
-        buf.write_u8(BURR_FILTER_TYPE_BYTE).expect("vec write");
+        buf.write_u8(filter_type_byte).expect("vec write");
         buf.write_u8(FORMAT_VERSION).expect("vec write");
         buf.write_u8(params.r).expect("vec write");
         buf.write_u8(params.w).expect("vec write");
@@ -334,24 +349,38 @@ pub(crate) fn decode(bytes: &[u8]) -> crate::Result<DecodedFilter<'_>> {
     })
 }
 
-/// Single-pass parse + probe over raw wire bytes.
+/// Outcome of walking a wire-format BuRR to the layer that holds `hash`
+/// (the first layer whose per-block threshold does not bump it).
 ///
-/// Equivalent to `decode(bytes).map(|d| contains_hash(&d, hash))` but
-/// without allocating the intermediate `DecodedFilter` (and its
-/// `Vec<LayerView>`). Used on the LSM table read hot path
-/// (`FilterBlock::maybe_contains_hash`) where the wire buffer is
-/// already in the block cache — re-parsing the header and walking
-/// per-layer payloads in place avoids the per-probe heap allocation.
-///
-/// Returns:
-/// - `Ok(true)`  — hash may be present (or wire is corrupted in a way
-///   we cannot validate → fail-closed: caller falls through to a real
-///   index lookup rather than reporting a false negative);
-/// - `Ok(false)` — hash is definitely not in the inserted set;
-/// - `Err(InvalidHeader)` — wire prefix is unparseable (bad magic,
-///   wrong filter_type/version, truncated). Differs from the
-///   fail-closed `true` path: a structurally invalid header is a real
-///   error returned upstream so the table read path can surface it.
+/// The header + per-layer bounds parsing is byte-for-byte identical for the
+/// membership probe and the retrieval recover, and it is security-sensitive
+/// (every slice is gated by a checked length / `checked_add` endpoint).
+/// Sharing it in [`walk_first_layer`] keeps that parsing in ONE place so the
+/// two query paths cannot drift on the bounds checks; each caller only
+/// interprets the terminal `acc`.
+enum FirstLayerWalk {
+    /// `hash` is kept at some layer: `acc` is the GF(2) dot-product over
+    /// that layer's z rows (the recovered r-bit RHS — already masked to r
+    /// bits because the builder masks every stored z row); `fingerprint` is
+    /// the hash-derived fingerprint recomputed for the membership compare.
+    Found { acc: u64, fingerprint: u64 },
+    /// Every layer bumped `hash`. For a membership filter that is
+    /// definitely-absent; normally unreachable since the last layer accepts
+    /// all keys.
+    AllBumped,
+    /// A layer's z payload was truncated mid-row past the header-validated
+    /// lengths (structure parsed, but a row slice is short). The caller
+    /// fail-closes (membership → possibly-present; retrieval → fall back to
+    /// the sorted index).
+    Truncated,
+}
+
+/// Parse a wire-format BuRR header (rejecting a wrong `expected_type`) and
+/// walk per-layer payloads in place to the first non-bumped layer, returning
+/// its dot-product `acc` and recomputed fingerprint. No allocation — used on
+/// the LSM table read hot path where the wire buffer is already in the block
+/// cache, so re-parsing in place avoids the per-probe heap allocation an
+/// intermediate `DecodedFilter` would cost.
 #[inline]
 #[expect(
     clippy::many_single_char_names,
@@ -363,13 +392,12 @@ pub(crate) fn decode(bytes: &[u8]) -> crate::Result<DecodedFilter<'_>> {
               length check: bytes[..MAGIC_BYTES.len()] and the per-byte \
               MAGIC_BYTES.len() + N reads are gated by `bytes.len() < HEADER_LEN` \
               on the line above (HEADER_LEN >= MAGIC_BYTES.len() + 6 + 8); \
-              the bytes[seed_off..seed_off+8] window is bounded by HEADER_LEN. \
-              Replacing with .get(..).ok_or(...) would multiply the function's \
-              error-return paths without improving safety — and this function \
-              is on the read-path hot loop, so the explicit pre-check + raw \
-              indexing avoids per-field Option unwrapping."
+              the bytes[seed_off..seed_off+8] window is bounded by HEADER_LEN; \
+              per-layer windows are gated by checked_add endpoints + \
+              `bytes.len() < ...`. Raw indexing avoids per-field Option \
+              unwrapping on the read hot loop."
 )]
-pub(crate) fn contains_hash_from_bytes(bytes: &[u8], hash: u64) -> crate::Result<bool> {
+fn walk_first_layer(bytes: &[u8], hash: u64, expected_type: u8) -> crate::Result<FirstLayerWalk> {
     if bytes.len() < HEADER_LEN {
         return Err(crate::Error::InvalidHeader("BurrFilter"));
     }
@@ -378,7 +406,7 @@ pub(crate) fn contains_hash_from_bytes(bytes: &[u8], hash: u64) -> crate::Result
         return Err(crate::Error::InvalidHeader("BurrFilter"));
     }
     let filter_type = bytes[MAGIC_BYTES.len()];
-    if filter_type != BURR_FILTER_TYPE_BYTE {
+    if filter_type != expected_type {
         return Err(crate::Error::InvalidTag(("FilterType", filter_type)));
     }
     let version = bytes[MAGIC_BYTES.len() + 1];
@@ -480,20 +508,71 @@ pub(crate) fn contains_hash_from_bytes(bytes: &[u8], hash: u64) -> crate::Result
             let row_byte = (equation.start + offset) * 8;
             let Some(slice) = z.get(row_byte..row_byte + 8) else {
                 // row_byte+8 > z len: payload truncated mid-row.
-                // Fail closed.
-                return Ok(true);
+                return Ok(FirstLayerWalk::Truncated);
             };
             let Ok(arr) = <[u8; 8]>::try_from(slice) else {
-                return Ok(true);
+                return Ok(FirstLayerWalk::Truncated);
             };
             acc ^= u64::from_le_bytes(arr);
             lo &= lo - 1;
         }
         debug_assert_eq!(equation.coeff_hi, 0, "w <= 64 keeps coeff_hi == 0");
-        return Ok(acc == fingerprint);
+        return Ok(FirstLayerWalk::Found { acc, fingerprint });
     }
 
-    Ok(false)
+    Ok(FirstLayerWalk::AllBumped)
+}
+
+/// Single-pass parse + membership probe over raw wire bytes.
+///
+/// Used on the LSM table read hot path (`FilterBlock::maybe_contains_hash`)
+/// where the wire buffer is already in the block cache.
+///
+/// Returns:
+/// - `Ok(true)`  — hash may be present (or wire is corrupted in a way we
+///   cannot validate → fail-closed: caller falls through to a real index
+///   lookup rather than reporting a false negative);
+/// - `Ok(false)` — hash is definitely not in the inserted set;
+/// - `Err(InvalidHeader)` / `Err(InvalidTag)` — wire prefix is unparseable
+///   (bad magic, wrong filter_type/version, truncated). Differs from the
+///   fail-closed `true` path: a structurally invalid header is a real error
+///   returned upstream so the table read path can surface it.
+#[inline]
+pub(crate) fn contains_hash_from_bytes(bytes: &[u8], hash: u64) -> crate::Result<bool> {
+    match walk_first_layer(bytes, hash, BURR_FILTER_TYPE_BYTE)? {
+        FirstLayerWalk::Found { acc, fingerprint } => Ok(acc == fingerprint),
+        FirstLayerWalk::AllBumped => Ok(false),
+        // Truncated payload → fail closed: report possibly-present so the
+        // table read path falls through to a real index lookup rather than
+        // a false negative on substituted zeros.
+        FirstLayerWalk::Truncated => Ok(true),
+    }
+}
+
+/// Single-pass parse + locator recovery over raw retrieval-BuRR wire bytes.
+///
+/// The retrieval counterpart of [`contains_hash_from_bytes`]: it accepts only
+/// a retrieval payload (filter_type tag [`BURR_RETRIEVAL_TYPE_BYTE`]) and
+/// recovers the r-bit locator stored for `hash`.
+///
+/// Returns:
+/// - `Ok(Some(locator))` — the value recovered at the first non-bumped layer.
+///   For a key in the built set this is its exact stored locator; for an
+///   absent key it is an unspecified r-bit value, so the caller MUST verify
+///   the key at the located slot (the locate step subsumes membership).
+/// - `Ok(None)` — the ribbon cannot answer (every layer bumped the key, or a
+///   payload was truncated mid-row): the caller falls back to the sorted
+///   index.
+/// - `Err(InvalidHeader)` / `Err(InvalidTag)` — the wire prefix is
+///   unparseable or is not a retrieval payload (e.g. a membership tag 2).
+#[inline]
+pub(crate) fn recover_value_from_bytes(bytes: &[u8], hash: u64) -> crate::Result<Option<u64>> {
+    // `acc` is already masked to r bits (the builder masks every stored z
+    // row to the fingerprint width), so no extra masking is needed here.
+    match walk_first_layer(bytes, hash, BURR_RETRIEVAL_TYPE_BYTE)? {
+        FirstLayerWalk::Found { acc, .. } => Ok(Some(acc)),
+        FirstLayerWalk::AllBumped | FirstLayerWalk::Truncated => Ok(None),
+    }
 }
 
 /// Probe a decoded BuRR filter with a pre-computed hash. Returns

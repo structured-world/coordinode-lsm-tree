@@ -109,7 +109,10 @@ pub fn load_block(
             // Manifest variants are rejected by the function-level guard
             // above; the block-layout section is loaded once on open via
             // `Block::from_file`, never through this cached data-block path.
-            BlockType::Manifest | BlockType::ManifestFooter | BlockType::BlockLayout => {}
+            BlockType::Manifest
+            | BlockType::ManifestFooter
+            | BlockType::BlockLayout
+            | BlockType::Locator => {}
         }
 
         return Ok(block);
@@ -199,7 +202,10 @@ pub fn load_block(
         // Manifest variants are rejected by the function-level guard above;
         // the block-layout section is loaded once on open via
         // `Block::from_file`, never through this cached data-block path.
-        BlockType::Manifest | BlockType::ManifestFooter | BlockType::BlockLayout => {}
+        BlockType::Manifest
+        | BlockType::ManifestFooter
+        | BlockType::BlockLayout
+        | BlockType::Locator => {}
     }
 
     // ECC recovered this block's payload from parity. The bytes returned below
