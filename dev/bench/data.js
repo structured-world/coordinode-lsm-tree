@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1781549357613,
+  "lastUpdate": 1781559445568,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -16692,6 +16692,84 @@ window.BENCHMARK_DATA = {
             "value": 671596.3856160038,
             "unit": "ops/sec",
             "extra": "P50: 1.3us | P99: 4.5us | P99.9: 7.3us\nthreads: 1 | elapsed: 0.30s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "849fc134a0ff9f3fec72b187edf2bb46e55fb817",
+          "message": "feat(fs): raw io_uring Fs / FsFile backend (no_std) (#477)\n\n## Summary\n\nBuilds the [`Fs`] / [`FsFile`] surface on top of the raw `no_std`\nio_uring driver core (slice-1, #471), so a Linux `no_std + alloc`\nconsumer gets a full filesystem backend with **pure syscalls — no\n`io-uring` crate, no `std::fs`** (unlike the std-bound `IoUringFs`,\nwhich delegates cold paths to `std::fs::File`).\n\n## What landed\n\n- **`IoUringRawFile`** (`FsFile` + `Read`/`Write`/`Seek`): the hot read\n/ write / fsync path goes through a shared ring\n(`Arc<spin::Mutex<IoUringRaw>>`, since ring ops take `&mut self` but\n`FsFile` hands out `&self`); a userspace cursor drives sequential I/O\nwhile `read_at` uses an explicit offset (fill-or-EOF + EINTR retry).\nRead/Write/Seek are cfg-split between `std::io` and the crate's `no_std`\nio traits, mirroring `MemFile`.\n- **`IoUringRawFs`** (`Fs`): `open` maps `FsOpenOptions` to `open(2)`\nflags + wraps the fd with the shared ring; directory / path operations\nuse plain blocking syscalls.\n- **New raw syscall wrappers**: `statx` (architecture-independent struct\n→ file type + size), `ftruncate`, `lseek`, `flock` (exclusive,\nnon-blocking variant maps `EWOULDBLOCK` → `Ok(false)`), `mkdirat`,\n`unlinkat` (`AT_REMOVEDIR` for rmdir), `renameat2`, and `getdents64`\n(bounds-checked `linux_dirent64` record walk, no indexing).\n\n`Fs` uses the crate's `no_std`-capable `Path` (`repr(transparent)` over\n`str`), so `IoUringRawFs` is `no_std`, not std-gated. Open flags use the\nasm-generic values; the MIPS/SPARC-divergent `O_APPEND`/`O_EXCL` are not\nremapped (same policy the `direct_io` doc already states).\n\n## Verification\n\n- Cross-compiles for `x86_64-unknown-linux-gnu` with `--features\nio-uring-raw` (0 errors / 0 warnings); clippy clean; host build\nunaffected (module is `cfg(all(target_os = \"linux\", feature =\n\"io-uring-raw\"))`).\n- **Runner (Fedora, kernel 7.0.11): 9/9 io_uring_raw tests pass**,\nincluding `raw_file_fsfile_round_trips` (write / read_at / metadata /\nseek+read / set_len / fsync / try_lock) and\n`raw_fs_directory_and_file_ops` (create_dir_all / open+write / metadata\n/ read_dir / rename / remove) — exercising every new syscall ABI on a\nreal kernel.\n\n## Scope\n\nThe driver (slice-1) is already on main via #471; this is the Fs/FsFile\nlayer on top. The remaining epic item is a CI job that runs the\nio_uring_raw tests on a Linux runner.\n\nPart of #346.\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n## Summary by CodeRabbit\n\n* **New Features**\n* Added a Linux-only `io-uring` raw filesystem backend, including new\nraw file support for read/write/seek, truncation, metadata/size queries,\nand exclusive file locking.\n* Added directory/path operations such as create, remove, rename, and\nexistence/metadata lookup.\n* Supports append-mode writes to accumulate correctly across reopenings.\n* **Tests**\n* Added integration tests for raw file round-trips, directory\noperations, and append-mode behavior.\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-06-15T21:34:46Z",
+          "tree_id": "735f9d6ef7b4b3cf6b1fa62ce9bcdf234ddd56a8",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/849fc134a0ff9f3fec72b187edf2bb46e55fb817"
+        },
+        "date": 1781559424495,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 2058915.8566488482,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.6us | P99.9: 3.8us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1133204.46192231,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.2us | P99.9: 4.8us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 833804.8569283001,
+            "unit": "ops/sec",
+            "extra": "P50: 1.1us | P99: 4.2us | P99.9: 6.8us\nthreads: 1 | elapsed: 0.24s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3679170.247035863,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 3.0us | P99.9: 5.6us\nthreads: 1 | elapsed: 0.05s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 435584.6089715367,
+            "unit": "ops/sec",
+            "extra": "P50: 2.0us | P99: 5.3us | P99.9: 8.7us\nthreads: 1 | elapsed: 0.46s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 227454.90081374708,
+            "unit": "ops/sec",
+            "extra": "P50: 4.1us | P99: 5.2us | P99.9: 7.8us\nthreads: 1 | elapsed: 0.88s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1197426.8398843578,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.3us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1073171.2002381582,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 1.5us | P99.9: 2.7us\nthreads: 1 | elapsed: 0.19s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 702018.6627379175,
+            "unit": "ops/sec",
+            "extra": "P50: 1.3us | P99: 4.5us | P99.9: 6.9us\nthreads: 1 | elapsed: 0.28s | num: 200000 | iterations: 3"
           }
         ]
       }
