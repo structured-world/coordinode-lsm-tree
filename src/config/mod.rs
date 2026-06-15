@@ -1393,10 +1393,12 @@ impl Config {
 
     /// Sets the retrieval-ribbon locator policy.
     ///
-    /// Off by default. When enabled for a level, written SSTs on that level
-    /// carry an optional `locator` section mapping each key to its data block
-    /// and slot, letting point reads skip the index-block and in-block binary
-    /// searches. Disabled levels are unaffected and emit byte-identical SSTs.
+    /// On by default at [`LocatorPrecision::Block`] (see
+    /// [`LocatorPolicy::block_level`]). When enabled for a level, written SSTs on
+    /// that level carry an optional `locator` section mapping each key to its
+    /// data block (and, at finer precisions, its slot), letting point reads skip
+    /// the index-block binary search. Set [`LocatorPolicy::disabled`] to opt out;
+    /// disabled levels emit byte-identical SSTs.
     #[must_use]
     pub fn locator_policy(mut self, policy: LocatorPolicy) -> Self {
         self.locator_policy = policy;

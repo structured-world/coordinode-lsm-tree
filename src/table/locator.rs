@@ -226,7 +226,16 @@ pub fn locate(section: &[u8], hash: u64) -> crate::Result<Option<(u64, u64)>> {
     } else {
         (1u64 << slot_bits) - 1
     };
-    Ok(Some((packed >> slot_bits, packed & slot_mask)))
+    // Guard the block-id shift the same way the mask is guarded: `packed >> 64`
+    // panics in debug and wraps to `>> 0` in release. A valid section always has
+    // `slot_bits <= 63`, so this only matters for a checksum-surviving corruption
+    // — but it keeps both extractions consistent and panic-free.
+    let block_id = if slot_bits >= 64 {
+        0
+    } else {
+        packed >> slot_bits
+    };
+    Ok(Some((block_id, packed & slot_mask)))
 }
 
 /// A loaded `locator` section ready for point-read resolution: the framed
