@@ -83,14 +83,6 @@ pub struct KeyedBlockHandle {
     /// Seqno of last item in block
     seqno: SeqNo,
 
-    /// Per-block seqno bounds `(min, max)` for the referenced data block.
-    /// `Some` ⇒ this index entry uses the seqno-bounded wire format (markers
-    /// 2 / 3), letting a seqno-scoped scan skip a data block whose `max` is
-    /// below the target without reading it; `None` ⇒ legacy entry (markers
-    /// 0 / 1, no bounds on disk). The writer sets this uniformly per SST from
-    /// the runtime config; the decoder populates it from the on-disk marker.
-    seqno_bounds: Option<(SeqNo, SeqNo)>,
-
     inner: BlockHandle,
 }
 
@@ -111,46 +103,13 @@ impl KeyedBlockHandle {
         Self {
             end_key,
             seqno,
-            seqno_bounds: None,
             inner: handle,
         }
-    }
-
-    /// Attaches per-block seqno bounds `(min, max)`, switching this handle to
-    /// the seqno-bounded wire format (markers 2 / 3) when encoded.
-    ///
-    /// # Panics
-    ///
-    /// In debug builds, panics if `seqno_min > seqno_max`. Inverted bounds are
-    /// a caller invariant violation (the writer derives them from a single
-    /// min/max fold over the block, so it cannot produce them); encoding an
-    /// inverted pair would let a seqno-scoped scan skip a block that still
-    /// holds visible entries. Corruption arriving from disk is rejected
-    /// separately on the decode path (`parse_full` / `parse_truncated`).
-    #[must_use]
-    pub fn with_seqno_bounds(mut self, seqno_min: SeqNo, seqno_max: SeqNo) -> Self {
-        debug_assert!(
-            seqno_min <= seqno_max,
-            "inverted seqno bounds: min {seqno_min} > max {seqno_max}",
-        );
-        self.seqno_bounds = Some((seqno_min, seqno_max));
-        self
     }
 
     #[must_use]
     pub fn seqno(&self) -> SeqNo {
         self.seqno
-    }
-
-    /// Per-block seqno bounds `(min, max)` if this entry uses the
-    /// seqno-bounded wire format (markers 2 / 3), else `None` (legacy entry).
-    ///
-    /// A seqno-scoped scan skips the referenced data block without reading it
-    /// when `max < target`; `None` means the bounds are unavailable on disk and
-    /// the caller must fall back to reading and filtering the block.
-    #[must_use]
-    pub fn seqno_bounds(&self) -> Option<(SeqNo, SeqNo)> {
-        self.seqno_bounds
     }
 
     pub fn shift(&mut self, delta: BlockOffset) {
@@ -186,28 +145,18 @@ impl Encodable<BlockOffset> for KeyedBlockHandle {
         writer: &mut W,
         state: &mut BlockOffset,
     ) -> crate::Result<()> {
-        // Legacy full entry (marker 0):
+        // Full entry (marker 0):
         // [marker=0] [offset] [size] [seqno] [key len] [end key]
         // 1          2        3      4       5         6
         //
-        // Seqno-bounded full entry (marker 2): same, with per-block seqno
-        // bounds inserted right after [seqno]:
-        // [marker=2] [offset] [size] [seqno] [seqno min] [seqno max] [key len] [end key]
-        // 1          2        3      4       4a          4b          5         6
-
-        match self.seqno_bounds {
-            None => writer.write_u8(0)?, // 1
-            Some(_) => writer.write_u8(2)?,
-        }
+        // Per-block seqno bounds are NOT stored inline; they live in the
+        // optional parallel `seqno_bounds` section keyed by block offset, so a
+        // point read never pays for them. See `crate::table::seqno_bounds`.
+        writer.write_u8(0)?; // 1
 
         self.inner.encode_into(writer)?; // 2, 3
 
         writer.write_u64_varint(self.seqno)?; // 4
-
-        if let Some((seqno_min, seqno_max)) = self.seqno_bounds {
-            writer.write_u64_varint(seqno_min)?; // 4a
-            writer.write_u64_varint(seqno_max)?; // 4b
-        }
 
         #[expect(clippy::cast_possible_truncation, reason = "keys are u16 long max")]
         writer.write_u16_varint(self.end_key.len() as u16)?; // 5
@@ -225,24 +174,16 @@ impl Encodable<BlockOffset> for KeyedBlockHandle {
         _state: &mut BlockOffset,
         shared_len: usize,
     ) -> crate::Result<()> {
-        // Legacy truncated entry (marker 1):
+        // Truncated entry (marker 1):
         // [marker=1] [offset] [size] [seqno] [shared prefix len] [rest key len] [rest key]
         // 1          2        3      4       5                   6              7
         //
-        // Seqno-bounded truncated entry (marker 3): same, with per-block seqno
-        // bounds inserted right after [seqno].
-        match self.seqno_bounds {
-            None => writer.write_u8(1)?,
-            Some(_) => writer.write_u8(3)?,
-        }
+        // Per-block seqno bounds live in the parallel `seqno_bounds` section,
+        // never inline (see `encode_full_into`).
+        writer.write_u8(1)?;
 
         self.inner.encode_into(writer)?;
         writer.write_u64_varint(self.seqno)?;
-
-        if let Some((seqno_min, seqno_max)) = self.seqno_bounds {
-            writer.write_u64_varint(seqno_min)?;
-            writer.write_u64_varint(seqno_max)?;
-        }
 
         #[expect(clippy::cast_possible_truncation, reason = "keys are u16 long max")]
         writer.write_u16_varint(shared_len as u16)?;
@@ -277,30 +218,14 @@ impl Decodable<IndexBlockParsedItem> for KeyedBlockHandle {
         if marker == TRAILER_START_MARKER {
             return None;
         }
-        // Full entries are marker 0 (legacy) or marker 2 (seqno-bounded).
-        let has_bounds = match marker {
-            0 => false,
-            2 => true,
-            _ => return None,
-        };
+        // Full entries are marker 0. (Seqno bounds are no longer inline; they
+        // live in the parallel `seqno_bounds` section.)
+        if marker != 0 {
+            return None;
+        }
 
         let handle = BlockHandle::decode_from(reader).ok()?;
         let seqno = reader.read_u64_varint().ok()?;
-
-        let seqno_bounds = if has_bounds {
-            let seqno_min = reader.read_u64_varint().ok()?;
-            let seqno_max = reader.read_u64_varint().ok()?;
-            // Reject inverted bounds: a forged `seqno_max < seqno_min` would
-            // let a seqno-scoped scan skip a block that still holds visible
-            // entries, silently returning incomplete results. Surface it as a
-            // decode failure instead of propagating bogus bounds.
-            if seqno_min > seqno_max {
-                return None;
-            }
-            Some((seqno_min, seqno_max))
-        } else {
-            None
-        };
 
         let key_len: usize = reader.read_u16_varint().ok()?.into();
         #[expect(
@@ -329,7 +254,6 @@ impl Decodable<IndexBlockParsedItem> for KeyedBlockHandle {
             offset: handle.offset(),
             size: handle.size(),
             seqno,
-            seqno_bounds,
         })
     }
 
@@ -351,12 +275,10 @@ impl Decodable<IndexBlockParsedItem> for KeyedBlockHandle {
         if marker == TRAILER_START_MARKER {
             return None;
         }
-        // Restart heads are full entries: marker 0 (legacy) or 2 (seqno-bounded).
-        let has_bounds = match marker {
-            0 => false,
-            2 => true,
-            _ => return None,
-        };
+        // Restart heads are full entries: marker 0.
+        if marker != 0 {
+            return None;
+        }
 
         // The binary-search probe only needs `(key, seqno)`, but the block
         // handle (file offset + size) is still decoded so a corrupt restart
@@ -371,19 +293,6 @@ impl Decodable<IndexBlockParsedItem> for KeyedBlockHandle {
         pos = np;
         let (seqno, np) = read_leb128(buf, pos)?;
         pos = np;
-
-        if has_bounds {
-            // The restart key only needs the key, but still reject inverted
-            // bounds (seqno_min > seqno_max) here as `parse_full` /
-            // `parse_truncated` do — a malformed marker-2 head must not feed a
-            // forged entry into restart-table navigation.
-            let (seqno_min, np) = read_leb128(buf, pos)?;
-            let (seqno_max, np2) = read_leb128(buf, np)?;
-            pos = np2;
-            if seqno_min > seqno_max {
-                return None;
-            }
-        }
 
         let (key_len_raw, np) = read_leb128(buf, pos)?;
         pos = np;
@@ -418,28 +327,14 @@ impl Decodable<IndexBlockParsedItem> for KeyedBlockHandle {
             return None;
         }
 
-        // Truncated entries are marker 1 (legacy) or marker 3 (seqno-bounded).
-        let has_bounds = match marker {
-            1 => false,
-            3 => true,
-            _ => return None,
-        };
+        // Truncated entries are marker 1. (Seqno bounds live in the parallel
+        // `seqno_bounds` section, never inline.)
+        if marker != 1 {
+            return None;
+        }
 
         let handle = BlockHandle::decode_from(reader).ok()?;
         let seqno = reader.read_u64_varint().ok()?;
-
-        let seqno_bounds = if has_bounds {
-            let seqno_min = reader.read_u64_varint().ok()?;
-            let seqno_max = reader.read_u64_varint().ok()?;
-            // Reject inverted bounds (see `parse_full`): a forged
-            // `seqno_max < seqno_min` could drive an incorrect block-skip.
-            if seqno_min > seqno_max {
-                return None;
-            }
-            Some((seqno_min, seqno_max))
-        } else {
-            None
-        };
 
         let shared_prefix_len: usize = reader.read_u16_varint().ok()?.into();
         let rest_key_len: usize = reader.read_u16_varint().ok()?.into();
@@ -486,7 +381,6 @@ impl Decodable<IndexBlockParsedItem> for KeyedBlockHandle {
             offset: handle.offset(),
             size: handle.size(),
             seqno,
-            seqno_bounds,
         })
     }
 }
@@ -642,8 +536,8 @@ mod tests {
     #[test]
     fn parse_truncated_rejects_invalid_marker() {
         let mut bytes = make_truncated_entry(1);
-        // 99 is outside the valid marker set {0 full, 1 truncated, 2 full+bounds,
-        // 3 truncated+bounds, 255 trailer}, so parse_truncated must reject it.
+        // 99 is outside the valid marker set {0 full, 1 truncated, 255 trailer},
+        // so parse_truncated must reject it.
         let invalid_marker = 99u8;
         *bytes.get_mut(0).unwrap() = invalid_marker;
         let offset = 16;
@@ -693,9 +587,9 @@ mod tests {
     }
 
     #[test]
-    fn full_entry_without_bounds_keeps_legacy_marker() {
-        // A handle with no seqno bounds must encode with the legacy full
-        // marker (0) so off-mode SSTs stay byte-identical to the prior layout.
+    fn full_entry_encodes_with_legacy_marker() {
+        // A full index entry encodes with marker 0; seqno bounds are never
+        // inline (they live in the parallel `seqno_bounds` section).
         let bytes = make_full_entry();
         assert_eq!(bytes.first().copied(), Some(0));
 
@@ -706,207 +600,7 @@ mod tests {
             bytes.len(),
         )
         .unwrap();
-        assert_eq!(parsed.seqno_bounds, None);
-    }
-
-    #[test]
-    fn full_entry_with_seqno_bounds_round_trips() {
-        // marker 2: seqno bounds survive an encode -> parse_full round-trip,
-        // and the marker byte switches to the seqno-bounded variant.
-        let handle = KeyedBlockHandle::new(
-            b"abcdef".to_vec().into(),
-            7,
-            BlockHandle::new(BlockOffset(0), 1),
-        )
-        .with_seqno_bounds(3, 9);
-        let mut bytes = Vec::new();
-        let mut state = BlockOffset(0);
-        handle.encode_full_into(&mut bytes, &mut state).unwrap();
-        assert_eq!(bytes.first().copied(), Some(2));
-
-        let mut cursor = Cursor::new(bytes.as_slice());
-        let parsed = <KeyedBlockHandle as Decodable<IndexBlockParsedItem>>::parse_full(
-            &mut cursor,
-            0,
-            bytes.len(),
-        )
-        .unwrap();
-        assert_eq!(parsed.seqno, 7);
-        assert_eq!(parsed.seqno_bounds, Some((3, 9)));
-        assert_eq!(
-            bytes.get(parsed.end_key.0..parsed.end_key.1).unwrap(),
-            b"abcdef"
-        );
-    }
-
-    #[test]
-    fn full_entry_with_inverted_seqno_bounds_is_rejected() {
-        // A forged entry whose seqno_min > seqno_max must fail to decode, not
-        // propagate bounds that could drive an incorrect seqno block-skip
-        // (skipping a block that still holds visible entries). Build a VALID
-        // (3, 9) entry — `with_seqno_bounds` debug-asserts min <= max — then
-        // swap the two single-byte bound varints on the wire to invert them.
-        let handle = KeyedBlockHandle::new(
-            b"abcdef".to_vec().into(),
-            7,
-            BlockHandle::new(BlockOffset(0), 1),
-        )
-        .with_seqno_bounds(3, 9);
-        let mut bytes = Vec::new();
-        let mut state = BlockOffset(0);
-        handle.encode_full_into(&mut bytes, &mut state).unwrap();
-        // Layout: [marker=2][offset=0][size=1][seqno=7][seqno_min=3][seqno_max=9]…
-        // all single-byte varints, so the bounds sit at indices 4 and 5.
-        assert_eq!(bytes.first().copied(), Some(2));
-        assert_eq!(
-            (bytes.get(4).copied(), bytes.get(5).copied()),
-            (Some(3), Some(9)),
-            "bound varint layout changed",
-        );
-        bytes.swap(4, 5); // → seqno_min=9, seqno_max=3 (inverted)
-
-        let mut cursor = Cursor::new(bytes.as_slice());
-        let parsed = <KeyedBlockHandle as Decodable<IndexBlockParsedItem>>::parse_full(
-            &mut cursor,
-            0,
-            bytes.len(),
-        );
-        assert!(
-            parsed.is_none(),
-            "inverted seqno bounds (min > max) must be rejected on decode",
-        );
-    }
-
-    #[test]
-    fn truncated_entry_with_inverted_seqno_bounds_is_rejected() {
-        let handle = KeyedBlockHandle::new(
-            b"abcdef".to_vec().into(),
-            7,
-            BlockHandle::new(BlockOffset(0), 1),
-        )
-        .with_seqno_bounds(3, 9);
-        let mut bytes = Vec::new();
-        let mut state = BlockOffset(0);
-        handle
-            .encode_truncated_into(&mut bytes, &mut state, 2)
-            .unwrap();
-        // Layout: [marker=3][offset=0][size=1][seqno=7][seqno_min=3][seqno_max=9]…
-        assert_eq!(bytes.first().copied(), Some(3));
-        assert_eq!(
-            (bytes.get(4).copied(), bytes.get(5).copied()),
-            (Some(3), Some(9)),
-            "bound varint layout changed",
-        );
-        bytes.swap(4, 5); // invert
-
-        let offset = 16;
-        let entries_end = offset + bytes.len();
-        let mut cursor = Cursor::new(bytes.as_slice());
-        let parsed = <KeyedBlockHandle as Decodable<IndexBlockParsedItem>>::parse_truncated(
-            &mut cursor,
-            offset,
-            12,
-            16,
-            entries_end,
-        );
-        assert!(
-            parsed.is_none(),
-            "inverted seqno bounds (min > max) must be rejected on decode",
-        );
-    }
-
-    #[test]
-    fn truncated_entry_with_seqno_bounds_round_trips() {
-        // marker 3: seqno bounds survive an encode -> parse_truncated
-        // round-trip on a truncated (prefix-compressed) entry.
-        let handle = KeyedBlockHandle::new(
-            b"abcdef".to_vec().into(),
-            7,
-            BlockHandle::new(BlockOffset(0), 1),
-        )
-        .with_seqno_bounds(3, 9);
-        let mut bytes = Vec::new();
-        let mut state = BlockOffset(0);
-        handle
-            .encode_truncated_into(&mut bytes, &mut state, 2)
-            .unwrap();
-        assert_eq!(bytes.first().copied(), Some(3));
-
-        let offset = 16;
-        let entries_end = offset + bytes.len();
-        let mut cursor = Cursor::new(bytes.as_slice());
-        let parsed = <KeyedBlockHandle as Decodable<IndexBlockParsedItem>>::parse_truncated(
-            &mut cursor,
-            offset,
-            12,
-            16,
-            entries_end,
-        )
-        .unwrap();
-        assert_eq!(parsed.seqno, 7);
-        assert_eq!(parsed.seqno_bounds, Some((3, 9)));
-    }
-
-    #[test]
-    fn parse_restart_key_skips_seqno_bounds_on_marker_2() {
-        // parse_restart_key must step over the two seqno-bounds varints so the
-        // returned restart key is correct for a marker-2 (seqno-bounded) head.
-        let handle = KeyedBlockHandle::new(
-            b"abcdef".to_vec().into(),
-            7,
-            BlockHandle::new(BlockOffset(0), 1),
-        )
-        .with_seqno_bounds(3, 9);
-        let mut bytes = Vec::new();
-        let mut state = BlockOffset(0);
-        handle.encode_full_into(&mut bytes, &mut state).unwrap();
-
-        let mut cursor = Cursor::new(bytes.as_slice());
-        let (key, seqno) =
-            <KeyedBlockHandle as Decodable<IndexBlockParsedItem>>::parse_restart_key(
-                &mut cursor,
-                0,
-                bytes.as_slice(),
-                bytes.len(),
-            )
-            .unwrap();
-        assert_eq!(key, b"abcdef");
-        assert_eq!(seqno, 7);
-    }
-
-    #[test]
-    fn parse_restart_key_rejects_inverted_seqno_bounds() {
-        // A marker-2 restart head with seqno_min > seqno_max must be rejected
-        // (like parse_full / parse_truncated), not feed a forged entry into
-        // restart-table navigation. Build valid (3, 9), then swap the two
-        // single-byte bound varints on the wire to invert them.
-        let handle = KeyedBlockHandle::new(
-            b"abcdef".to_vec().into(),
-            7,
-            BlockHandle::new(BlockOffset(0), 1),
-        )
-        .with_seqno_bounds(3, 9);
-        let mut bytes = Vec::new();
-        let mut state = BlockOffset(0);
-        handle.encode_full_into(&mut bytes, &mut state).unwrap();
-        assert_eq!(
-            (bytes.get(4).copied(), bytes.get(5).copied()),
-            (Some(3), Some(9)),
-            "bound varint layout changed",
-        );
-        bytes.swap(4, 5); // invert
-
-        let mut cursor = Cursor::new(bytes.as_slice());
-        let parsed = <KeyedBlockHandle as Decodable<IndexBlockParsedItem>>::parse_restart_key(
-            &mut cursor,
-            0,
-            bytes.as_slice(),
-            bytes.len(),
-        );
-        assert!(
-            parsed.is_none(),
-            "inverted seqno bounds must be rejected by parse_restart_key",
-        );
+        assert_eq!(parsed.seqno, 0);
     }
 
     #[test]

@@ -18,6 +18,7 @@ pub(crate) mod meta;
 pub(crate) mod multi_writer;
 pub(crate) mod regions;
 mod scanner;
+pub(crate) mod seqno_bounds;
 pub mod util;
 pub mod writer;
 
@@ -1116,12 +1117,12 @@ impl Table {
     /// Collects every entry in this SST with `seqno >= target_seqno`,
     /// applying the per-block seqno-bounds skip when the SST carries it.
     ///
-    /// A data block whose index entry reports `seqno_max < target_seqno`
-    /// (seqno-bounded format, `Properties.index_format = 1`) cannot hold a
-    /// qualifying record, so it is skipped without being read. Blocks without
-    /// bounds on disk (legacy `index_format = 0`) are always read and filtered
-    /// per entry, so the result is correct regardless of the SST's index
-    /// format. Entries come back in the SST's stored order (key-ascending,
+    /// A data block whose `seqno_bounds` section entry reports
+    /// `seqno_max < target_seqno` cannot hold a qualifying record, so it is
+    /// skipped without being read. When the SST has no `seqno_bounds` section
+    /// (the feature was off), every block is read and filtered per entry, so
+    /// the result is correct regardless. Entries come back in the SST's stored
+    /// order (key-ascending,
     /// seqno-descending within a key); ordering across sources is the caller's
     /// job.
     ///
@@ -1182,12 +1183,17 @@ impl Table {
         for handle in self.block_index.iter() {
             let handle = handle?;
 
-            // Block-skip: a seqno-bounded entry whose (local) min exceeds the
-            // upper bound, or whose (local) max is below the target, cannot
-            // reference any qualifying record — skip the data-block read.
-            // Disabled in paranoid full-scan mode (`block_skip == false`).
+            // Block-skip: look this block's seqno bounds up in the parallel
+            // `seqno_bounds` section (keyed by file offset). If its (local) min
+            // exceeds the upper bound, or its (local) max is below the target, it
+            // cannot reference a qualifying record — skip the data-block read.
+            // Bounds live in the section, NOT inline in the index entry, so a
+            // point read never pays for them. Disabled in paranoid full-scan
+            // mode (`block_skip == false`); absent for legacy/off tables → no
+            // skip, full filter (correct regardless).
             if block_skip
-                && let Some((seqno_min, seqno_max)) = handle.seqno_bounds()
+                && let Some((seqno_min, seqno_max)) =
+                    self.seqno_bounds.bounds_for(handle.as_ref().offset().0)
                 && (seqno_max < local_target || seqno_min >= local_end)
             {
                 continue;
@@ -1740,6 +1746,45 @@ impl Table {
             crate::table::block_layout::BlockLayoutMap::default()
         };
 
+        // Load the optional seqno-bounds section (parallel to the index; powers
+        // the scan_since_seqno block-skip). Absent unless seqno_in_index was on.
+        let seqno_bounds = if let Some(sb_handle) = regions.seqno_bounds {
+            let block = Block::from_file(
+                file_handle.as_ref(),
+                sb_handle,
+                crate::table::block::BlockIdentity {
+                    table_id: metadata.id,
+                    block_type: BlockType::SeqnoBounds,
+                    dict_id: 0,
+                    window_log: 0,
+                },
+                &{
+                    let t = match encryption.as_deref() {
+                        Some(enc) => crate::table::block::BlockTransform::Encrypted(enc),
+                        None => crate::table::block::BlockTransform::PLAIN,
+                    };
+                    if let Some(ecc) = metadata.ecc_params {
+                        t.with_ecc(ecc)
+                    } else {
+                        t
+                    }
+                },
+            )?;
+            if block.header.block_type != BlockType::SeqnoBounds {
+                return Err(crate::Error::InvalidTag((
+                    "BlockType",
+                    block.header.block_type.into(),
+                )));
+            }
+            let map = crate::table::seqno_bounds::SeqnoBoundsMap::decode(&block.data)?;
+            if !map.is_empty() {
+                log::trace!("Loaded {} seqno-bounds entries", map.len());
+            }
+            map
+        } else {
+            crate::table::seqno_bounds::SeqnoBoundsMap::default()
+        };
+
         // Load the optional retrieval-ribbon locator section and pair it with an
         // ordinal → data-block-handle map (the index yields handles in key/write
         // order, which is the writer's block_id ordering). Only when the section
@@ -1824,6 +1869,7 @@ impl Table {
             cached_blob_bytes: AtomicU64::new(u64::MAX),
             range_tombstones,
             block_layout,
+            seqno_bounds,
             locator_index,
             encryption,
 

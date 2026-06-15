@@ -1182,10 +1182,10 @@ impl Tree {
     ///
     /// # Block-skip
     ///
-    /// On SSTs written in the seqno-bounded index format (`seqno_in_index`),
-    /// data blocks whose `seqno_max < target_seqno` are skipped without being
-    /// read; legacy SSTs are read and filtered per entry, so mixed-format trees
-    /// are handled transparently.
+    /// On SSTs written with the `seqno_bounds` section (`seqno_in_index`), data
+    /// blocks whose bounds cannot overlap the target window are skipped without
+    /// being read; SSTs without the section are read and filtered per entry, so
+    /// mixed trees are handled transparently.
     ///
     /// # KV-separation
     ///
@@ -1196,13 +1196,15 @@ impl Tree {
     ///
     /// # Corruption resilience
     ///
-    /// The per-block seqno-bounds used for skipping live in the index block and
-    /// are covered by its XXH3-128 checksum (+ optional Page ECC), so a
-    /// corrupted bound is caught on read, not trusted. Even in the impossible
-    /// case of a fault bypassing those checks, a bad bound can only cause a
-    /// *missed* record, never a wrong one. Callers who want defense against that
-    /// hypothetical can use [`Self::scan_since_seqno_full_scan`], which reads
-    /// every block (slower, no skip).
+    /// The per-block seqno-bounds used for skipping live in the optional
+    /// `seqno_bounds` SST section, a Block covered by XXH3-128 (+ optional Page
+    /// ECC) and verified when it is loaded at open, plus a decode that rejects
+    /// non-ascending offsets and inverted bounds, so a corrupted bound is caught
+    /// rather than trusted. Even in the impossible case of a fault bypassing
+    /// those checks, a bad bound can only cause a *missed* record, never a wrong
+    /// one. Callers who want defense against that hypothetical can use
+    /// [`Self::scan_since_seqno_full_scan`], which reads every block (slower, no
+    /// skip).
     ///
     /// # Panics
     ///
@@ -1234,9 +1236,10 @@ impl Tree {
     ///
     /// The fast [`Self::scan_since_seqno`] trusts each block's recorded
     /// `[seqno_min, seqno_max]` to skip blocks that cannot hold a qualifying
-    /// record. Those bounds live inside the index block and are covered by its
-    /// XXH3-128 checksum (and optional Page ECC), so on-disk corruption is
-    /// caught on read, not silently trusted. This method exists for callers who
+    /// record. Those bounds live in the `seqno_bounds` SST section, a Block
+    /// covered by XXH3-128 (and optional Page ECC) and verified at open, so
+    /// on-disk corruption is caught, not silently trusted. This method exists
+    /// for callers who
     /// want defense even against a fault that somehow bypassed those checks: a
     /// corrupted `seqno_max` can only ever cause a *missed* record (never a
     /// wrong one), and a full scan cannot miss. It is slower (no skip), so
