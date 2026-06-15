@@ -70,12 +70,19 @@ fn bits_for(max: u64) -> u8 {
     bits.max(1)
 }
 
+/// On-disk precision byte: `slot` is a restart index.
+const PRECISION_RESTART: u8 = 0;
+/// On-disk precision byte: `slot` is an exact entry index.
+const PRECISION_ENTRY: u8 = 1;
+/// On-disk precision byte: per-block (no `slot`; `slot_bits == 0`).
+const PRECISION_BLOCK: u8 = 2;
+
 /// Maps the precision enum to its on-disk byte.
 fn precision_byte(p: LocatorPrecision) -> u8 {
     match p {
-        LocatorPrecision::Restart => 0,
-        LocatorPrecision::Entry => 1,
-        LocatorPrecision::Block => 2,
+        LocatorPrecision::Restart => PRECISION_RESTART,
+        LocatorPrecision::Entry => PRECISION_ENTRY,
+        LocatorPrecision::Block => PRECISION_BLOCK,
     }
 }
 
@@ -232,16 +239,33 @@ pub fn locate(section: &[u8], hash: u64) -> crate::Result<Option<(u64, u64)>> {
 pub struct LoadedLocator {
     section: crate::Slice,
     blocks: Vec<crate::table::BlockHandle>,
+    /// The on-disk precision byte (`PRECISION_*`), governing how a recovered
+    /// `slot` is interpreted on the read path.
+    precision: u8,
 }
 
+/// A resolved locator: the data block holding the key's newest version, plus an
+/// optional in-block slot hint. `Some((slot, is_entry))` lets the read jump
+/// straight to the restart head (`is_entry` selects entry-index vs restart-index
+/// semantics); `None` (per-block precision) leaves the in-block binary search.
+pub type Located = (crate::table::BlockHandle, Option<(u64, bool)>);
+
 impl LoadedLocator {
-    /// Wrap the framed section bytes and the ordinal → handle map.
+    /// Wrap the framed section bytes and the ordinal → handle map. The precision
+    /// is read from the section header (defaulting to per-block, the safe
+    /// no-slot-hint mode, if the header is somehow short).
     #[must_use]
     pub fn new(section: crate::Slice, blocks: Vec<crate::table::BlockHandle>) -> Self {
-        Self { section, blocks }
+        let precision = section.get(1).copied().unwrap_or(PRECISION_BLOCK);
+        Self {
+            section,
+            blocks,
+            precision,
+        }
     }
 
-    /// Resolve `key_hash` to the data block holding the key's newest version.
+    /// Resolve `key_hash` to the data block holding the key's newest version and
+    /// an optional in-block slot hint.
     ///
     /// `Ok(None)` means the ribbon could not answer or the recovered `block_id`
     /// is out of range; the caller falls back to the sorted index. The caller
@@ -251,18 +275,25 @@ impl LoadedLocator {
     /// # Errors
     ///
     /// Propagates a parse error from [`locate`].
-    pub fn locate_block(&self, key_hash: u64) -> crate::Result<Option<crate::table::BlockHandle>> {
-        let Some((block_id, _slot)) = locate(&self.section, key_hash)? else {
+    pub fn locate_block(&self, key_hash: u64) -> crate::Result<Option<Located>> {
+        let Some((block_id, slot)) = locate(&self.section, key_hash)? else {
             return Ok(None);
         };
-        // Block-id is bounds-validated against the ordinal map; the in-block
-        // `slot` is recovered but not yet used (the located block's own
-        // point_read does the in-block lookup), so block-id alone already
-        // eliminates the index-block binary search.
-        Ok(usize::try_from(block_id)
+        let Some(handle) = usize::try_from(block_id)
             .ok()
             .and_then(|i| self.blocks.get(i))
-            .copied())
+            .copied()
+        else {
+            return Ok(None);
+        };
+        let hint = match self.precision {
+            PRECISION_RESTART => Some((slot, false)),
+            PRECISION_ENTRY => Some((slot, true)),
+            // Per-block (or an unrecognised precision): no slot hint, the block's
+            // own point_read does the in-block lookup.
+            _ => None,
+        };
+        Ok(Some((handle, hint)))
     }
 }
 

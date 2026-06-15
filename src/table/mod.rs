@@ -591,9 +591,19 @@ impl Table {
         // Fast path: retrieval-ribbon locator (see `point_read_inner` for the
         // MVCC-correctness argument). A located-block miss falls through to the
         // index walk below.
-        if let Some(handle) = self.locator_block(key_hash)? {
+        if let Some((handle, hint)) = self.locator_block(key_hash)? {
             let data_block = self.load_data_block(&handle)?;
-            if let Some(found) = data_block.point_read_value(key, seqno, &self.comparator)? {
+            let found = match hint {
+                Some((slot, is_entry)) => data_block.point_read_value_at_slot(
+                    slot,
+                    is_entry,
+                    key,
+                    seqno,
+                    &self.comparator,
+                )?,
+                None => data_block.point_read_value(key, seqno, &self.comparator)?,
+            };
+            if let Some(found) = found {
                 return Ok(Some(found));
             }
         }
@@ -664,10 +674,14 @@ impl Table {
     /// Shared block-index walk for point reads. Returns the matching entry
     /// together with the [`DataBlock`] it was found in, so callers that need
     /// the block (e.g. for [`PinnableSlice`]) can keep it alive.
-    /// Resolve the data block holding `key_hash`'s newest version via the
-    /// retrieval-ribbon locator, if one is loaded. `Ok(None)` means no locator
-    /// or the ribbon could not answer → the caller uses the sorted-index walk.
-    fn locator_block(&self, key_hash: u64) -> crate::Result<Option<BlockHandle>> {
+    /// Resolve the data block holding `key_hash`'s newest version (plus an
+    /// optional in-block slot hint) via the retrieval-ribbon locator, if one is
+    /// loaded. `Ok(None)` means no locator or the ribbon could not answer → the
+    /// caller uses the sorted-index walk.
+    fn locator_block(
+        &self,
+        key_hash: u64,
+    ) -> crate::Result<Option<crate::table::locator::Located>> {
         match &self.locator_index {
             Some(loc) => loc.locate_block(key_hash),
             None => Ok(None),
@@ -686,9 +700,15 @@ impl Table {
         // hit returns the correct MVCC answer and a miss (absent key, or the
         // visible version lives in a later block) safely falls through to the
         // index walk below.
-        if let Some(handle) = self.locator_block(key_hash)? {
+        if let Some((handle, hint)) = self.locator_block(key_hash)? {
             let data_block = self.load_data_block(&handle)?;
-            if let Some(item) = data_block.point_read(key, seqno, &self.comparator)? {
+            let found = match hint {
+                Some((slot, is_entry)) => {
+                    data_block.point_read_at_slot(slot, is_entry, key, seqno, &self.comparator)?
+                }
+                None => data_block.point_read(key, seqno, &self.comparator)?,
+            };
+            if let Some(item) = found {
                 return Ok(Some((item, data_block)));
             }
         }
