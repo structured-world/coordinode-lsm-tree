@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1781541966805,
+  "lastUpdate": 1781544527195,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -16536,6 +16536,84 @@ window.BENCHMARK_DATA = {
             "value": 712869.6166140509,
             "unit": "ops/sec",
             "extra": "P50: 1.2us | P99: 4.4us | P99.9: 6.9us\nthreads: 1 | elapsed: 0.28s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "a98b99a9374863577cf9435821ecc5b46d96831a",
+          "message": "perf(table): move seqno bounds to a parallel section (#474)\n\n## Summary\n\nMoves per-block seqno bounds (the data powering `scan_since_seqno`\nblock-skip) out of the inline index entries and into an optional\nparallel `seqno_bounds` SST section (new `BlockType::SeqnoBounds`),\nkeyed by data-block file offset with a binary-search lookup.\n\nInline bounds made every point-read index probe step over two extra\nvarints and enlarged the index block: a measurable **~12% point-read\npenalty** on any SST with `seqno_in_index` on. With the parallel\nsection, index entries return to their legacy size (a point read never\ntouches the bounds), while a seqno-scoped scan looks the bounds up by\noffset and skips non-overlapping blocks. The section is emitted only\nwhen `seqno_in_index` is on, so a table written without it carries zero\nextra bytes (no format-version bump).\n\nThe decoder validates a corrupt section up front (entry count must fit\nthe payload, bounding the allocation) and rejects trailing bytes,\nsurfacing `InvalidHeader` instead of panicking or silently mis-skipping.\n\nAlso removes the now-dead inline machinery (inline markers, the\n`KeyedBlockHandle` seqno-bounds field, the vestigial `index_format`\ntable property) and adds the `scan_since` paranoid full-scan mode +\ncorruption matrix, the CDC event stream / synchronous `clear()` reclaim,\nand a `scan_since` benchmark.\n\n## Why a fresh PR\n\nSupersedes #470. That branch had accumulated a tangle of back-merge\ncommits from its old `#464` base; #464 has since landed on main, leaving\n#470 conflicting. This branch is the same feature cleanly reconstructed\non the current main (with the locator, SIMD key-compare, and io_uring\nwork already merged), conflict-free.\n\n## Verification\n\n- Rebased cleanly onto current main; `cargo check --all-features` clean\n- 1233/1233 lib unit tests + 79 seqno/scan integration tests pass,\nincluding `scan_since_with_locator_enabled_is_correct` (confirms correct\ninteraction with the merged locator)\n- Decoder hardening covered by\n`decode_rejects_trailing_bytes_after_last_entry` +\n`decode_rejects_count_larger_than_payload`\n\nPart of #224.\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n\n## Summary by CodeRabbit\n\n* **New Features**\n* Added optional seqno bounds metadata section to improve scan\nperformance when `seqno_in_index` configuration is enabled\n* Implemented block-skip optimization for seqno-scoped scans to skip\nnon-overlapping data blocks\n\n* **Tests**\n  * Added benchmark for seqno-scoped scan performance\n  * Added validation tests for corruption detection in seqno bounds\n\n* **Documentation**\n* Updated configuration documentation for `seqno_in_index` behavior and\nseqno bounds section\n\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-06-15T20:27:35+03:00",
+          "tree_id": "ad1f663476d3760e77bc2cc5dc91a7ef68e80fb1",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/a98b99a9374863577cf9435821ecc5b46d96831a"
+        },
+        "date": 1781544508719,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 1941336.8764025553,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.6us | P99.9: 3.8us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1205011.0408232857,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.3us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 892907.9230090679,
+            "unit": "ops/sec",
+            "extra": "P50: 1.0us | P99: 4.1us | P99.9: 6.6us\nthreads: 1 | elapsed: 0.22s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3737900.36977927,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 3.0us | P99.9: 5.6us\nthreads: 1 | elapsed: 0.05s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 451643.73286408634,
+            "unit": "ops/sec",
+            "extra": "P50: 1.9us | P99: 5.3us | P99.9: 8.3us\nthreads: 1 | elapsed: 0.44s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 230329.9691936891,
+            "unit": "ops/sec",
+            "extra": "P50: 4.1us | P99: 5.2us | P99.9: 9.3us\nthreads: 1 | elapsed: 0.87s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1208844.6350746767,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.6us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1051274.6655384107,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 1.4us | P99.9: 2.6us\nthreads: 1 | elapsed: 0.19s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 688747.2633961936,
+            "unit": "ops/sec",
+            "extra": "P50: 1.3us | P99: 4.5us | P99.9: 7.0us\nthreads: 1 | elapsed: 0.29s | num: 200000 | iterations: 3"
           }
         ]
       }
