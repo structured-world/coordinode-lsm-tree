@@ -742,4 +742,54 @@ mod tests {
         close_raw(fd).expect("close should succeed");
         let _ = std::fs::remove_file(&path);
     }
+
+    #[test]
+    fn errno_maps_to_expected_error_kinds() {
+        // Every explicitly-mapped errno lands on its kind; anything else folds
+        // into `Other`. Covers the whole `errno_to_kind` table without needing
+        // to provoke each real failure.
+        assert_eq!(errno_to_kind(1), ErrorKind::PermissionDenied); // EPERM
+        assert_eq!(errno_to_kind(2), ErrorKind::NotFound); // ENOENT
+        assert_eq!(errno_to_kind(4), ErrorKind::Interrupted); // EINTR
+        assert_eq!(errno_to_kind(9), ErrorKind::InvalidInput); // EBADF
+        assert_eq!(errno_to_kind(13), ErrorKind::PermissionDenied); // EACCES
+        assert_eq!(errno_to_kind(17), ErrorKind::AlreadyExists); // EEXIST
+        assert_eq!(errno_to_kind(22), ErrorKind::InvalidInput); // EINVAL
+        assert_eq!(errno_to_kind(95), ErrorKind::Unsupported); // EOPNOTSUPP
+        assert_eq!(errno_to_kind(132), ErrorKind::Other); // unmapped
+    }
+
+    #[test]
+    fn ring_setup_with_zero_entries_is_rejected() {
+        // `io_uring_setup` rejects a zero-entry ring with EINVAL; this covers
+        // the setup error path (and the fd guard never arming). `IoUringRaw`
+        // is not `Debug`, so match rather than `expect_err`.
+        match IoUringRaw::new(0) {
+            Ok(_) => panic!("zero-entry ring must be rejected"),
+            Err(e) => assert_eq!(e.kind(), ErrorKind::InvalidInput),
+        }
+    }
+
+    #[test]
+    fn open_raw_missing_file_returns_not_found() {
+        // Opening a missing path read-only (no O_CREAT) fails with ENOENT,
+        // exercising `open_raw`'s error path and the `err` -> `ErrorKind`
+        // conversion.
+        let cpath = std::ffi::CString::new("/proc/does-not-exist/iou_raw_missing")
+            .expect("no interior NUL");
+        let err = open_raw(&cpath, O_RDONLY, 0).expect_err("missing file must fail to open");
+        assert_eq!(err.kind(), ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn ring_op_on_bad_fd_surfaces_completion_error() {
+        // A write against a descriptor that is not open completes with -EBADF;
+        // the reaper must surface that negative `res` as an error (covering the
+        // `res < 0` branch of `submit_and_reap_one`).
+        let mut ring = IoUringRaw::new(4).expect("ring setup");
+        let err = ring
+            .write_at(1 << 30, b"x", 0)
+            .expect_err("write to a non-open fd must fail");
+        assert_eq!(err.kind(), ErrorKind::InvalidInput); // EBADF -> InvalidInput
+    }
 }
