@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1781562965973,
+  "lastUpdate": 1781564992075,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -16848,6 +16848,84 @@ window.BENCHMARK_DATA = {
             "value": 708180.2645952677,
             "unit": "ops/sec",
             "extra": "P50: 1.2us | P99: 4.6us | P99.9: 7.1us\nthreads: 1 | elapsed: 0.28s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "4f7e3e26e71602d41913f843cace0e4134a5f3dd",
+          "message": "ci: remove the per-commit Flamegraphs workflow (#479)\n\n## Why\n\nThe **Flamegraphs** workflow ran `db_bench --benchmark all` on every\npush to main and published one combined flamegraph SVG to gh-pages. Two\nproblems:\n\n1. **Low signal.** It merges every workload (write / read / scan) into a\nsingle graph, so no specific path is attributable — strictly inferior to\nthe targeted, per-benchmark, symbol-attributed profiling we actually\nuse.\n2. **It races gh-pages.** Its concurrency group was per-workflow\n(`Flamegraphs-<ref>`), which only serialises against itself, **not**\nagainst `benchmark.yml` (which also deploys to gh-pages: the db_bench\ndashboard + compare-rocksdb overlays). After a merge, both workflows\npush gh-pages concurrently and the loser is rejected on a moved ref —\nexactly the failure on the #478 merge run.\n\n## Change\n\nRemove `.github/workflows/flamegraph.yml`. The db_bench `flamegraph`\nfeature (`tracing-flame`) stays for local profiling runs.\n\nNo other workflow references it; this also removes one of the two\ngh-pages deployers, so the remaining `benchmark.yml` no longer has a\nconcurrent racer.",
+          "timestamp": "2026-06-16T02:08:56+03:00",
+          "tree_id": "68d8f3667ab2e99011209c40bc5b4a4f5a5db225",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/4f7e3e26e71602d41913f843cace0e4134a5f3dd"
+        },
+        "date": 1781564984267,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 2006829.8037344534,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.6us | P99.9: 3.7us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1228325.188677505,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.3us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 917886.4685594444,
+            "unit": "ops/sec",
+            "extra": "P50: 0.9us | P99: 4.1us | P99.9: 6.6us\nthreads: 1 | elapsed: 0.22s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3803678.8954055626,
+            "unit": "ops/sec",
+            "extra": "P50: 0.1us | P99: 3.0us | P99.9: 5.5us\nthreads: 1 | elapsed: 0.05s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 472942.92240337265,
+            "unit": "ops/sec",
+            "extra": "P50: 1.8us | P99: 5.2us | P99.9: 8.0us\nthreads: 1 | elapsed: 0.42s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 243533.27702746555,
+            "unit": "ops/sec",
+            "extra": "P50: 3.8us | P99: 4.7us | P99.9: 7.2us\nthreads: 1 | elapsed: 0.82s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1221023.4498896678,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.3us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1104445.774724837,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 1.5us | P99.9: 2.3us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 719077.8002666563,
+            "unit": "ops/sec",
+            "extra": "P50: 1.2us | P99: 4.5us | P99.9: 7.1us\nthreads: 1 | elapsed: 0.28s | num: 200000 | iterations: 3"
           }
         ]
       }
