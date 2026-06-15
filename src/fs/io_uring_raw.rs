@@ -39,7 +39,7 @@ use alloc::format;
 
 use core::sync::atomic::{Ordering, fence};
 
-use syscalls::{Errno, Sysno, syscall1, syscall2, syscall6};
+use syscalls::{Errno, Sysno, syscall1, syscall2, syscall4, syscall6};
 
 use crate::io::{Error, ErrorKind};
 
@@ -63,6 +63,33 @@ const IORING_FEAT_SINGLE_MMAP: u32 = 1;
 /// No-op opcode: completes immediately with `res == 0`. Used to smoke-test the
 /// ring without touching a file.
 const IORING_OP_NOP: u8 = 0;
+/// `fsync` opcode: flush the file's data + metadata (or just data, with the
+/// `IORING_FSYNC_DATASYNC` flag) to stable storage.
+const IORING_OP_FSYNC: u8 = 3;
+/// `read` opcode: read into a single buffer at an explicit offset (the `addr` /
+/// `len` form, not the iovec `readv`).
+const IORING_OP_READ: u8 = 22;
+/// `write` opcode: write a single buffer at an explicit offset.
+const IORING_OP_WRITE: u8 = 23;
+/// `op_flags` bit for [`IORING_OP_FSYNC`]: flush data only (skip non-essential
+/// metadata), matching `fdatasync(2)`.
+const IORING_FSYNC_DATASYNC: u32 = 1;
+
+/// `openat` dir-fd sentinel meaning "resolve relative paths against the cwd".
+const AT_FDCWD: i32 = -100;
+
+// `open(2)` access-mode / creation flags for [`open_raw`] callers (Linux
+// generic ABI values).
+/// Open read-only.
+pub const O_RDONLY: i32 = 0;
+/// Open write-only.
+pub const O_WRONLY: i32 = 1;
+/// Open read-write.
+pub const O_RDWR: i32 = 2;
+/// Create the file if it does not exist.
+pub const O_CREAT: i32 = 0o100;
+/// Truncate the file to zero length on open.
+pub const O_TRUNC: i32 = 0o1000;
 
 // `mmap` protection / flags.
 const PROT_READ: usize = 0x1;
@@ -264,6 +291,43 @@ unsafe fn close(fd: i32) {
     let _ = unsafe { syscall1(Sysno::close, fd as usize) };
 }
 
+/// Opens a file via the raw `openat(AT_FDCWD, path, flags, mode)` syscall,
+/// returning the new descriptor.
+///
+/// Path resolution is relative to the process cwd; `mode` only applies when
+/// `flags` requests creation (`O_CREAT`). File open is a one-shot control
+/// operation, so it goes through a plain blocking syscall rather than the
+/// ring; the ring is reserved for the hot read / write / fsync data path.
+///
+/// # Errors
+/// Returns an [`Error`] if the `openat` syscall fails.
+pub fn open_raw(path: &core::ffi::CStr, flags: i32, mode: u32) -> Result<i32, Error> {
+    // SAFETY: `path` is a valid, NUL-terminated C string for the call's
+    // duration (borrowed `&CStr`); the kernel only reads it.
+    let fd = unsafe {
+        syscall4(
+            Sysno::openat,
+            AT_FDCWD as usize,
+            path.as_ptr() as usize,
+            flags as usize,
+            mode as usize,
+        )
+    }
+    .map_err(|e| err("openat", e))?;
+    Ok(fd as i32)
+}
+
+/// Closes a descriptor returned by [`open_raw`].
+///
+/// # Errors
+/// Returns an [`Error`] if `close` fails (e.g. a write-back error flushed at
+/// close time on some filesystems).
+pub fn close_raw(fd: i32) -> Result<(), Error> {
+    // SAFETY: `fd` is a descriptor the caller owns.
+    unsafe { syscall1(Sysno::close, fd as usize) }.map_err(|e| err("close", e))?;
+    Ok(())
+}
+
 /// A minimal, `no_std` `io_uring` instance: an `mmap`'d submission ring, an
 /// `mmap`'d completion ring, the SQE array, and the ring fd.
 ///
@@ -429,6 +493,59 @@ impl IoUringRaw {
         self.submit_and_reap_one(&sqe)
     }
 
+    /// Reads up to `buf.len()` bytes from `fd` starting at `offset` through the
+    /// ring, returning the number of bytes read (`0` at end of file).
+    ///
+    /// # Errors
+    /// Returns an [`Error`] if the read completes with a negative `-errno`.
+    pub fn read_at(&mut self, fd: i32, buf: &mut [u8], offset: u64) -> Result<usize, Error> {
+        let sqe = IoUringSqe {
+            opcode: IORING_OP_READ,
+            fd,
+            addr: buf.as_mut_ptr() as u64,
+            len: buf.len() as u32,
+            off: offset,
+            ..IoUringSqe::default()
+        };
+        let res = self.submit_and_reap_one(&sqe)?;
+        Ok(res as usize)
+    }
+
+    /// Writes up to `buf.len()` bytes to `fd` starting at `offset` through the
+    /// ring, returning the number of bytes written.
+    ///
+    /// # Errors
+    /// Returns an [`Error`] if the write completes with a negative `-errno`.
+    pub fn write_at(&mut self, fd: i32, buf: &[u8], offset: u64) -> Result<usize, Error> {
+        let sqe = IoUringSqe {
+            opcode: IORING_OP_WRITE,
+            fd,
+            addr: buf.as_ptr() as u64,
+            len: buf.len() as u32,
+            off: offset,
+            ..IoUringSqe::default()
+        };
+        let res = self.submit_and_reap_one(&sqe)?;
+        Ok(res as usize)
+    }
+
+    /// Flushes `fd` to stable storage through the ring. With `datasync`, only
+    /// the file data (and the metadata needed to read it back) is flushed,
+    /// matching `fdatasync(2)`; otherwise all metadata is flushed too.
+    ///
+    /// # Errors
+    /// Returns an [`Error`] if the fsync completes with a negative `-errno`.
+    pub fn fsync(&mut self, fd: i32, datasync: bool) -> Result<(), Error> {
+        let sqe = IoUringSqe {
+            opcode: IORING_OP_FSYNC,
+            fd,
+            op_flags: if datasync { IORING_FSYNC_DATASYNC } else { 0 },
+            ..IoUringSqe::default()
+        };
+        self.submit_and_reap_one(&sqe)?;
+        Ok(())
+    }
+
     /// Submits one SQE and reaps exactly one completion, returning its `res`.
     ///
     /// This is the shared submit/complete path the opcode helpers build on. It
@@ -568,5 +685,55 @@ mod tests {
             let res = ring.nop(i).expect("nop");
             assert_eq!(res, 0);
         }
+    }
+
+    #[test]
+    fn file_write_fsync_read_round_trips_through_the_ring() {
+        // Real data path: open a file (raw openat), write a payload at an
+        // offset through the ring, fsync it through the ring, read it back
+        // through the ring, and verify the bytes — then close (raw) + clean up.
+        let path = std::env::temp_dir().join(format!(
+            "iou_raw_rt_{}_{}.bin",
+            std::process::id(),
+            // a per-test suffix so parallel runs do not collide
+            line!()
+        ));
+        let cpath = std::ffi::CString::new(path.to_str().expect("utf8 path"))
+            .expect("path has no interior NUL");
+
+        let fd =
+            open_raw(&cpath, O_CREAT | O_RDWR | O_TRUNC, 0o600).expect("openat should succeed");
+
+        let mut ring = IoUringRaw::new(8).expect("ring setup");
+
+        let payload = b"io_uring raw round-trip payload";
+        let offset = 4096u64; // a non-zero offset to exercise positioned I/O
+
+        let written = ring
+            .write_at(fd, payload, offset)
+            .expect("write_at should succeed");
+        assert_eq!(written, payload.len(), "short write");
+
+        ring.fsync(fd, false).expect("fsync should succeed");
+
+        let mut readback = vec![0u8; payload.len()];
+        let read = ring
+            .read_at(fd, &mut readback, offset)
+            .expect("read_at should succeed");
+        assert_eq!(read, payload.len(), "short read");
+        assert_eq!(
+            &readback, payload,
+            "read-back bytes must match what we wrote"
+        );
+
+        // Reading past EOF returns 0 bytes (the file is exactly offset+len long).
+        let mut tail = [0u8; 8];
+        let eof = ring
+            .read_at(fd, &mut tail, offset + payload.len() as u64)
+            .expect("read at EOF should succeed");
+        assert_eq!(eof, 0, "read past EOF must return 0");
+
+        close_raw(fd).expect("close should succeed");
+        let _ = std::fs::remove_file(&path);
     }
 }
