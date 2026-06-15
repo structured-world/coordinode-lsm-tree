@@ -36,12 +36,15 @@
 
 #[cfg(not(feature = "std"))]
 use alloc::format;
+use alloc::sync::Arc;
 
 use core::sync::atomic::{Ordering, fence};
 
-use syscalls::{Errno, Sysno, syscall1, syscall2, syscall4, syscall6};
+use spin::Mutex;
+use syscalls::{Errno, Sysno, syscall1, syscall2, syscall3, syscall4, syscall5, syscall6};
 
-use crate::io::{Error, ErrorKind};
+use crate::fs::{FsFile, FsMetadata};
+use crate::io::{Error, ErrorKind, SeekFrom};
 
 // ---- Linux io_uring ABI constants (stable kernel uapi, linux/io_uring.h) ----
 
@@ -364,6 +367,363 @@ pub fn close_raw(fd: i32) -> Result<(), Error> {
     // SAFETY: `fd` is a descriptor the caller owns.
     unsafe { syscall1(Sysno::close, fd as usize) }.map_err(|e| err("close", e))?;
     Ok(())
+}
+
+// ---- Cold-path file syscalls (metadata / truncate / lock / seek) ----
+//
+// The std `io_uring` backend delegates these to `std::fs::File`; the `no_std`
+// raw backend cannot, so they go through plain blocking syscalls (only the
+// hot read / write / fsync data path uses the ring).
+
+/// `lseek` whence: position relative to the end (used to resolve file size).
+const SEEK_END: i32 = 2;
+
+/// `flock` operation: exclusive lock.
+const LOCK_EX: i32 = 2;
+/// `flock` operation bit: non-blocking (fail with `EWOULDBLOCK` instead of waiting).
+const LOCK_NB: i32 = 4;
+
+/// `statx` flag: operate on `dirfd` itself when the path is empty (stat an fd).
+const AT_EMPTY_PATH: i32 = 0x1000;
+/// `statx` mask: request the basic stat fields (type, mode, size, …).
+const STATX_BASIC_STATS: u32 = 0x0000_07ff;
+/// `st_mode` file-type mask and the regular-file / directory type bits.
+const S_IFMT: u16 = 0o170_000;
+const S_IFDIR: u16 = 0o040_000;
+const S_IFREG: u16 = 0o100_000;
+
+/// A `statx_timestamp` (`linux/stat.h`).
+#[repr(C)]
+#[derive(Default, Clone, Copy)]
+struct StatxTimestamp {
+    tv_sec: i64,
+    tv_nsec: u32,
+    _reserved: i32,
+}
+
+/// The kernel `struct statx` (256 bytes, architecture-independent — unlike the
+/// arch-specific `struct stat`, which is why `statx` is used here). Only
+/// `stx_mode` and `stx_size` are read; the remaining fields keep the layout the
+/// exact size the kernel writes into.
+#[repr(C)]
+#[derive(Default, Clone, Copy)]
+struct Statx {
+    stx_mask: u32,
+    stx_blksize: u32,
+    stx_attributes: u64,
+    stx_nlink: u32,
+    stx_uid: u32,
+    stx_gid: u32,
+    stx_mode: u16,
+    _spare0: u16,
+    stx_ino: u64,
+    stx_size: u64,
+    stx_blocks: u64,
+    stx_attributes_mask: u64,
+    stx_atime: StatxTimestamp,
+    stx_btime: StatxTimestamp,
+    stx_ctime: StatxTimestamp,
+    stx_mtime: StatxTimestamp,
+    stx_rdev_major: u32,
+    stx_rdev_minor: u32,
+    stx_dev_major: u32,
+    stx_dev_minor: u32,
+    stx_mnt_id: u64,
+    stx_dio_mem_align: u32,
+    stx_dio_offset_align: u32,
+    _spare3: [u64; 12],
+}
+
+/// File type + size, the subset of `statx` the [`Fs`](crate::fs::Fs) metadata
+/// surface needs.
+pub struct RawMetadata {
+    /// File length in bytes (`stx_size`).
+    pub size: u64,
+    /// Whether the entry is a directory (`S_IFDIR`).
+    pub is_dir: bool,
+    /// Whether the entry is a regular file (`S_IFREG`).
+    pub is_file: bool,
+}
+
+/// `statx(fd, "", AT_EMPTY_PATH, STATX_BASIC_STATS, &buf)` — stats an open
+/// descriptor without a path lookup.
+///
+/// # Errors
+/// Returns an [`Error`] if the `statx` syscall fails.
+pub fn fstat_raw(fd: i32) -> Result<RawMetadata, Error> {
+    let mut buf = Statx::default();
+    // Empty path + AT_EMPTY_PATH makes statx operate on `fd` directly.
+    let empty: &core::ffi::CStr = c"";
+    // SAFETY: `buf` is a valid, writable Statx the kernel fills; `empty` is a
+    // valid NUL-terminated C string read by the kernel.
+    unsafe {
+        syscall5(
+            Sysno::statx,
+            fd as usize,
+            empty.as_ptr() as usize,
+            AT_EMPTY_PATH as usize,
+            STATX_BASIC_STATS as usize,
+            &raw mut buf as usize,
+        )
+    }
+    .map_err(|e| err("statx", e))?;
+    let kind = buf.stx_mode & S_IFMT;
+    Ok(RawMetadata {
+        size: buf.stx_size,
+        is_dir: kind == S_IFDIR,
+        is_file: kind == S_IFREG,
+    })
+}
+
+/// `ftruncate(fd, length)` — set the file size (extend with zeros or truncate).
+///
+/// # Errors
+/// Returns an [`Error`] if the `ftruncate` syscall fails.
+pub fn ftruncate_raw(fd: i32, length: u64) -> Result<(), Error> {
+    // SAFETY: `fd` is an owned writable descriptor; `length` is a plain value.
+    unsafe { syscall2(Sysno::ftruncate, fd as usize, length as usize) }
+        .map_err(|e| err("ftruncate", e))?;
+    Ok(())
+}
+
+/// `lseek(fd, offset, whence)` — reposition; returns the resulting absolute
+/// offset. Used to resolve the file size (`SEEK_END`) for append / `Seek::End`.
+///
+/// # Errors
+/// Returns an [`Error`] if the `lseek` syscall fails.
+pub fn lseek_raw(fd: i32, offset: i64, whence: i32) -> Result<u64, Error> {
+    // SAFETY: `fd` is an owned descriptor; offset/whence are plain values.
+    let pos = unsafe { syscall3(Sysno::lseek, fd as usize, offset as usize, whence as usize) }
+        .map_err(|e| err("lseek", e))?;
+    Ok(pos as u64)
+}
+
+/// `flock(fd, LOCK_EX[|LOCK_NB])` — take an advisory exclusive lock. With
+/// `non_blocking`, returns `Ok(false)` instead of waiting when the lock is held.
+///
+/// # Errors
+/// Returns an [`Error`] if the `flock` syscall fails for a reason other than the
+/// non-blocking contention case.
+pub fn flock_exclusive_raw(fd: i32, non_blocking: bool) -> Result<bool, Error> {
+    let op = if non_blocking {
+        LOCK_EX | LOCK_NB
+    } else {
+        LOCK_EX
+    };
+    // SAFETY: `fd` is an owned descriptor; `op` is a valid flock operation.
+    match unsafe { syscall2(Sysno::flock, fd as usize, op as usize) } {
+        Ok(_) => Ok(true),
+        // EWOULDBLOCK / EAGAIN (11): held by someone else, non-blocking request.
+        Err(e) if non_blocking && e.into_raw() == 11 => Ok(false),
+        Err(e) => Err(err("flock", e)),
+    }
+}
+
+/// Resolves the current file size via `lseek(fd, 0, SEEK_END)`.
+///
+/// # Errors
+/// Returns an [`Error`] if the `lseek` syscall fails.
+pub fn file_size_raw(fd: i32) -> Result<u64, Error> {
+    lseek_raw(fd, 0, SEEK_END)
+}
+
+// SAFETY: `IoUringRaw`'s raw pointers address `mmap` regions it owns for its
+// whole lifetime, and its ring fd is process-global; moving it to another
+// thread is sound because every access is serialized through the `Mutex` that
+// wraps it in `IoUringRawFile` (no concurrent unsynchronized use). It is only
+// `Send` (moved across threads), never shared by `&` directly.
+unsafe impl Send for IoUringRaw {}
+
+/// A [`FsFile`] backed by the raw `no_std` `io_uring` driver.
+///
+/// The hot read / write / fsync path goes through a shared ring (serialized by a
+/// `Mutex`), while cold operations (size, truncate, lock) use plain blocking
+/// syscalls. It slots into the [`Fs`](crate::fs::Fs) abstraction like the
+/// std-bound backends.
+pub struct IoUringRawFile {
+    /// Shared submission/completion ring. `Mutex` because the ring ops take
+    /// `&mut self` while [`FsFile`] hands out `&self`, and one ring is shared
+    /// across the files an `Fs` opens.
+    ring: Arc<Mutex<IoUringRaw>>,
+    /// The open file descriptor (owned: closed on [`Drop`]).
+    fd: i32,
+    /// Byte cursor for the sequential `Read` / `Write` / `Seek` path. `read_at`
+    /// ignores it (explicit offset).
+    cursor: u64,
+    /// `O_APPEND` semantics: every write goes to the current end of file.
+    is_append: bool,
+}
+
+impl IoUringRawFile {
+    /// Wraps an open descriptor `fd` (from [`open_raw`]) with the shared `ring`.
+    /// `is_append` selects `O_APPEND`-style writes (always at EOF). Takes
+    /// ownership of `fd` (closed on [`Drop`]).
+    #[must_use]
+    pub fn new(ring: Arc<Mutex<IoUringRaw>>, fd: i32, is_append: bool) -> Self {
+        Self {
+            ring,
+            fd,
+            cursor: 0,
+            is_append,
+        }
+    }
+
+    /// Adds a signed delta to a base offset, erroring on overflow / underflow
+    /// (a seek before byte 0 or past `u64::MAX`).
+    fn offset_add(base: u64, delta: i64) -> Result<u64, Error> {
+        let r = if delta >= 0 {
+            base.checked_add(delta as u64)
+        } else {
+            base.checked_sub(delta.unsigned_abs())
+        };
+        r.ok_or_else(|| Error::new(ErrorKind::InvalidInput, "seek position out of range"))
+    }
+
+    fn read_impl(&mut self, buf: &mut [u8]) -> Result<usize, Error> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        let n = self.ring.lock().read_at(self.fd, buf, self.cursor)?;
+        self.cursor = self.cursor.saturating_add(n as u64);
+        Ok(n)
+    }
+
+    fn write_impl(&mut self, buf: &[u8]) -> Result<usize, Error> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        // O_APPEND: resolve the current EOF before each write so writes never
+        // overwrite, matching the kernel's append semantics.
+        if self.is_append {
+            self.cursor = file_size_raw(self.fd)?;
+        }
+        let n = self.ring.lock().write_at(self.fd, buf, self.cursor)?;
+        self.cursor = self.cursor.saturating_add(n as u64);
+        Ok(n)
+    }
+
+    fn seek_impl(&mut self, pos: SeekFrom) -> Result<u64, Error> {
+        let target = match pos {
+            SeekFrom::Start(o) => o,
+            SeekFrom::Current(d) => Self::offset_add(self.cursor, d)?,
+            SeekFrom::End(d) => Self::offset_add(file_size_raw(self.fd)?, d)?,
+        };
+        self.cursor = target;
+        Ok(target)
+    }
+}
+
+impl Drop for IoUringRawFile {
+    fn drop(&mut self) {
+        // Best-effort close; a write-back error at close is not actionable here.
+        let _ = close_raw(self.fd);
+    }
+}
+
+impl FsFile for IoUringRawFile {
+    fn sync_all(&self) -> crate::io::Result<()> {
+        self.ring.lock().fsync(self.fd, false)
+    }
+
+    fn sync_data(&self) -> crate::io::Result<()> {
+        self.ring.lock().fsync(self.fd, true)
+    }
+
+    fn metadata(&self) -> crate::io::Result<FsMetadata> {
+        let m = fstat_raw(self.fd)?;
+        Ok(FsMetadata {
+            len: m.size,
+            is_dir: m.is_dir,
+            is_file: m.is_file,
+        })
+    }
+
+    fn set_len(&self, size: u64) -> crate::io::Result<()> {
+        ftruncate_raw(self.fd, size)
+    }
+
+    fn read_at(&self, buf: &mut [u8], offset: u64) -> crate::io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        // Fill-or-EOF: loop until the buffer is full or a 0-byte read signals
+        // EOF, retrying the ring op on EINTR (mirrors the std io_uring backend).
+        let mut total = 0usize;
+        while total < buf.len() {
+            let remaining = buf
+                .get_mut(total..)
+                .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "read_at slice out of range"))?;
+            let at = offset
+                .checked_add(total as u64)
+                .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "read_at offset overflow"))?;
+            let n = loop {
+                match self.ring.lock().read_at(self.fd, remaining, at) {
+                    Ok(n) => break n,
+                    Err(e) if e.kind() == ErrorKind::Interrupted => {}
+                    Err(e) => return Err(e),
+                }
+            };
+            if n == 0 {
+                break;
+            }
+            total += n;
+        }
+        Ok(total)
+    }
+
+    fn lock_exclusive(&self) -> crate::io::Result<()> {
+        flock_exclusive_raw(self.fd, false)?;
+        Ok(())
+    }
+
+    fn try_lock_exclusive(&self) -> crate::io::Result<bool> {
+        flock_exclusive_raw(self.fd, true)
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::io::Read for IoUringRawFile {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.read_impl(buf).map_err(Into::into)
+    }
+}
+#[cfg(not(feature = "std"))]
+impl crate::io::Read for IoUringRawFile {
+    fn read(&mut self, buf: &mut [u8]) -> crate::io::Result<usize> {
+        self.read_impl(buf)
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::io::Write for IoUringRawFile {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.write_impl(buf).map_err(Into::into)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+#[cfg(not(feature = "std"))]
+impl crate::io::Write for IoUringRawFile {
+    fn write(&mut self, buf: &[u8]) -> crate::io::Result<usize> {
+        self.write_impl(buf)
+    }
+    fn flush(&mut self) -> crate::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::io::Seek for IoUringRawFile {
+    fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+        self.seek_impl(pos.into()).map_err(Into::into)
+    }
+}
+#[cfg(not(feature = "std"))]
+impl crate::io::Seek for IoUringRawFile {
+    fn seek(&mut self, pos: SeekFrom) -> crate::io::Result<u64> {
+        self.seek_impl(pos)
+    }
 }
 
 /// A minimal, `no_std` `io_uring` instance: an `mmap`'d submission ring, an
@@ -745,6 +1105,83 @@ mod tests {
     // These tests require a Linux kernel with io_uring; they are compiled only
     // under `cfg(target_os = "linux")` (the module gate) and run on the Linux
     // CI / bench runner, not on the macOS dev host.
+
+    #[test]
+    fn raw_file_fsfile_round_trips() {
+        // Exercises the full IoUringRawFile FsFile surface: sequential write
+        // (ring), positioned read_at (ring, fill-or-EOF), metadata (statx),
+        // Seek + sequential Read (cursor), set_len (ftruncate), fsync (ring),
+        // and try_lock_exclusive (flock) — all over the raw no_std driver.
+        use std::io::{Read, Seek, Write};
+
+        let path = std::env::temp_dir().join(format!(
+            "iou_rawfile_{}_{}.bin",
+            std::process::id(),
+            line!()
+        ));
+        let cpath = std::ffi::CString::new(path.to_str().expect("utf8 path"))
+            .expect("path has no interior NUL");
+
+        let fd =
+            open_raw(&cpath, O_CREAT | O_RDWR | O_TRUNC, 0o600).expect("openat should succeed");
+        let ring = Arc::new(Mutex::new(IoUringRaw::new(8).expect("ring setup")));
+        let mut file = IoUringRawFile::new(ring, fd, false);
+
+        let payload = b"raw io_uring file round-trip payload";
+        let written = Write::write(&mut file, payload).expect("write");
+        assert_eq!(written, payload.len(), "short write");
+
+        // statx-backed metadata reflects the written length.
+        assert_eq!(
+            FsFile::metadata(&file).expect("metadata").len,
+            payload.len() as u64,
+            "metadata len must match what was written"
+        );
+
+        // Positioned fill-or-EOF read returns the exact bytes.
+        let mut rb = vec![0u8; payload.len()];
+        let n = FsFile::read_at(&file, &mut rb, 0).expect("read_at");
+        assert_eq!(n, payload.len(), "short read_at");
+        assert_eq!(&rb, payload, "read_at bytes must match");
+
+        // Seek + sequential Read from an offset uses the userspace cursor.
+        file.seek(std::io::SeekFrom::Start(4)).expect("seek");
+        let mut tail = vec![0u8; payload.len() - 4];
+        let mut got = 0;
+        while got < tail.len() {
+            let chunk = tail.get_mut(got..).expect("in-bounds");
+            let r = Read::read(&mut file, chunk).expect("read");
+            if r == 0 {
+                break;
+            }
+            got += r;
+        }
+        assert_eq!(
+            tail.get(..got).expect("in-bounds"),
+            payload.get(4..).expect("in-bounds"),
+            "seek+read bytes must match"
+        );
+
+        FsFile::sync_all(&file).expect("sync_all");
+        FsFile::sync_data(&file).expect("sync_data");
+
+        // ftruncate shrinks the file; metadata reflects it.
+        FsFile::set_len(&file, 4).expect("set_len");
+        assert_eq!(
+            FsFile::metadata(&file).expect("metadata after set_len").len,
+            4,
+            "set_len must shrink the file"
+        );
+
+        // A fresh file is unlocked, so a non-blocking exclusive lock succeeds.
+        assert!(
+            FsFile::try_lock_exclusive(&file).expect("try_lock_exclusive"),
+            "exclusive lock on a fresh file must succeed"
+        );
+
+        drop(file); // closes the fd
+        let _ = std::fs::remove_file(&path);
+    }
 
     #[test]
     fn ring_setup_and_nop_round_trips() {
