@@ -378,4 +378,47 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn block_precision_section_round_trips_block_id_only() {
+        // Block precision is the default: `slot` is dropped (locator = block_id),
+        // so every key resolves to (block_id, 0). Covers the `block_only` build
+        // path and a zero-width slot decode.
+        let spec = LocatorSpec {
+            precision: LocatorPrecision::Block,
+            block_id_bits: None,
+            slot_bits: None,
+        };
+        let entries: Vec<(u64, u64, u64)> =
+            (0..300u64).map(|i| (key_hash(i), i % 12, i % 25)).collect();
+        let bytes = build_locator_section(&entries, spec).expect("section built");
+        assert_eq!(bytes[3], 0, "block precision must record slot_bits = 0");
+        for i in 0..300u64 {
+            assert_eq!(
+                locate(&bytes, key_hash(i)).unwrap(),
+                Some((i % 12, 0)),
+                "key {i} must resolve to its block with slot 0",
+            );
+        }
+    }
+
+    #[test]
+    fn locate_rejects_truncated_section() {
+        // A section shorter than the fixed header cannot be parsed.
+        let err = locate(&[0u8; SECTION_HEADER_LEN - 1], 123).unwrap_err();
+        assert!(matches!(err, crate::Error::InvalidHeader("LocatorSection")));
+    }
+
+    #[test]
+    fn locate_rejects_unknown_version() {
+        // A header whose version byte is not the one this build writes is a
+        // forward-incompatibility / corruption signal, surfaced as an error.
+        let mut section = [0u8; SECTION_HEADER_LEN];
+        section[0] = SECTION_VERSION.wrapping_add(1);
+        let err = locate(&section, 123).unwrap_err();
+        assert!(matches!(
+            err,
+            crate::Error::InvalidHeader("LocatorSection version")
+        ));
+    }
 }
