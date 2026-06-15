@@ -1,5 +1,12 @@
 # Standalone benchmark tool — not part of the main coordinode-lsm-tree crate.
 # Build with: cd tools/db_bench && cargo build --release
+#
+# The empty `[workspace]` pins this crate as its own root so a standalone build
+# is never absorbed into a workspace manifest higher up the tree (the main crate
+# excludes it, but exclusion alone does not stop a DIFFERENT parent workspace,
+# e.g. a stray one in a CI runner's temp dir, from claiming it).
+[workspace]
+
 [package]
 name = "db-bench"
 version = "0.1.0"

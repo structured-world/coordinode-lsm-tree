@@ -8,6 +8,13 @@
 #
 # Modeled after RocksDB's sst_dump utility; follows the tools/db_bench
 # layout convention (separate Cargo crate, path dep on the main lib).
+#
+# The empty `[workspace]` pins this crate as its own root so a standalone build
+# is never absorbed into a workspace manifest higher up the tree (the main crate
+# excludes it, but exclusion alone does not stop a DIFFERENT parent workspace,
+# e.g. a stray one in a CI runner's temp dir, from claiming it).
+[workspace]
+
 [package]
 name = "sst-dump"
 version = "0.1.0"
