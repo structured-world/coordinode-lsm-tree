@@ -1538,6 +1538,98 @@ fn subcompaction_variant(c: &mut Criterion, group_name: &str, level: i32) {
     group.finish();
 }
 
+/// Recursively copies `src` into `dst` (created if missing). Used by the
+/// clean-profile subcompaction bench to clone the pre-compact on-disk state.
+fn copy_dir(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let to = dst.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_dir(&entry.path(), &to)?;
+        } else {
+            std::fs::copy(entry.path(), to)?;
+        }
+    }
+    Ok(())
+}
+
+/// Builds our pre-compact subcompaction state (gen-0 compacted to the bottom,
+/// gen-1 overwrite flushed into `COMPACTION_FLUSHES` L0 tables) into `dir`, then
+/// drops the tree so the state is resident on disk for cloning.
+fn build_subcompaction_master(dir: &std::path::Path, level: i32, inputs: &SubcompactionInputs) {
+    let config = Config::new(
+        dir,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .data_block_compression_policy(CompressionPolicy::all(CompressionType::Zstd(level)))
+    .compaction_threads(SUBCOMPACTION_THREADS)
+    .subcompaction_min_bytes(0);
+    let tree = apply_preset(config, active_preset())
+        .open()
+        .expect("master: open");
+    let total = inputs.keys.len() as u64;
+    for ((key, value), seqno) in inputs.keys.iter().zip(inputs.values.iter()).zip(0u64..) {
+        tree.insert(key, value, seqno);
+    }
+    tree.flush_active_memtable(0).expect("master: flush");
+    tree.major_compact(SUBCOMPACTION_BOTTOM_TARGET, 0)
+        .expect("master: bottom compact");
+    let flush_points: Vec<u64> = (1..COMPACTION_FLUSHES)
+        .map(|b| (b * total) / COMPACTION_FLUSHES)
+        .collect();
+    let mut written = 0u64;
+    for ((key, value), seqno) in inputs.keys.iter().zip(inputs.values.iter()).zip(total..) {
+        tree.insert(key, value, seqno);
+        written += 1;
+        if flush_points.contains(&written) {
+            tree.flush_active_memtable(0).expect("master: flush");
+        }
+    }
+    tree.flush_active_memtable(0).expect("master: flush");
+}
+
+/// Clean timed-only subcompaction profile (ours). The pre-compact state is built
+/// ONCE into a master dir; each iteration clones it to a fresh dir and times
+/// ONLY `major_compact`. perf-recording this isolates the compaction cost (the
+/// clone + open are distinct symbols), unlike `subcompaction_zstd3` whose
+/// per-iteration input rebuild contaminates the flamegraph.
+fn bench_subcompaction_clean(c: &mut Criterion) {
+    let level = 3;
+    let n = 40_000u64;
+    let inputs = SubcompactionInputs::build(n);
+    let master = tempfile::tempdir().expect("master tempdir");
+    build_subcompaction_master(master.path(), level, &inputs);
+
+    let mut group = c.benchmark_group("subcompaction_clean");
+    group.bench_function(BenchmarkId::new("ours", n), |b| {
+        b.iter_custom(|iters| {
+            let mut elapsed = std::time::Duration::ZERO;
+            for _ in 0..iters {
+                let work = tempfile::tempdir().expect("work tempdir");
+                copy_dir(master.path(), work.path()).expect("clone master");
+                let config = Config::new(
+                    work.path(),
+                    SequenceNumberCounter::default(),
+                    SequenceNumberCounter::default(),
+                )
+                .data_block_compression_policy(CompressionPolicy::all(CompressionType::Zstd(level)))
+                .compaction_threads(SUBCOMPACTION_THREADS)
+                .subcompaction_min_bytes(0);
+                let tree = apply_preset(config, active_preset())
+                    .open()
+                    .expect("work: open");
+                let start = std::time::Instant::now();
+                tree.major_compact(u64::MAX, 0).expect("work: compact");
+                elapsed += start.elapsed();
+            }
+            elapsed
+        });
+    });
+    group.finish();
+}
+
 /// Sub-compaction head-to-head: our range-parallel split vs RocksDB
 /// `max_subcompactions`. Pinned to zstd level 3 — the level RocksDB actually
 /// applies to bottommost compaction output (see [`bench_compaction`]) — with
@@ -1555,6 +1647,7 @@ criterion_group!(
     bench_seek_random,
     bench_overwrite,
     bench_compaction,
-    bench_subcompaction
+    bench_subcompaction,
+    bench_subcompaction_clean
 );
 criterion_main!(benches);
