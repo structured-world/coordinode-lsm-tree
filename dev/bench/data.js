@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1781538441223,
+  "lastUpdate": 1781539241612,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -16380,6 +16380,84 @@ window.BENCHMARK_DATA = {
             "value": 579361.2619721167,
             "unit": "ops/sec",
             "extra": "P50: 1.5us | P99: 4.9us | P99.9: 7.4us\nthreads: 1 | elapsed: 0.35s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "65e7c6b5bc821489b079e659894b99213eaf9449",
+          "message": "feat(table): retrieval-ribbon point-read locator (O(1) point reads) (#468)\n\n## Summary\n\nAdds an opt-in **retrieval-ribbon point-read locator**: a per-SST\nstructure that maps each key to its `(block_id, slot)` so a point read\nresolves the location in O(1), skipping both the index-block and\nin-block binary searches. Off by default; when disabled, SSTs are\nbyte-identical (the section is simply absent from the TOC, no\nformat-version bump, V5 unchanged).\n\nThe membership BuRR ribbon already solves `coeff . solution = value` for\nan r-bit value; this generalizes it to store a caller-supplied locator\ninstead of a hash-derived fingerprint, so one structure does both locate\nand membership.\n\n## What lands\n\n- **Filter primitive** (`build_from_hashes_with_values` +\n`recover_value`): the retrieval ribbon, sharing the band-solve core with\nthe membership path so they cannot drift.\n- **Wire recovery + tag**: a retrieval payload carries a new\n`filter_type` tag within the existing wire version;\n`recover_value_from_bytes` answers from on-disk bytes; the\nsecurity-sensitive parse is shared with the membership probe.\n- **Write side**: per-level `LocatorPolicy` (off by default;\n`LocatorPrecision` Block / Restart / Entry; widths each `Option`, auto\nper-SST). The writer accumulates `(key_hash, block_id, slot)` per unique\nkey and emits an optional `locator` section (new `Locator` BlockType +\nTOC section, in-place V5). Graceful skip (no section) on width overflow\nor build failure: never aborts a compaction. Wired at flush / ingest /\ncompaction.\n- **Read side**: point read resolves the block in O(1) via an ordinal ->\nhandle map; for Restart/Entry precision it also jumps to the exact\nrestart head, skipping the in-block search. The located block holds the\nkey's newest version (the run's highest-seqno prefix), so a hit is the\ncorrect MVCC answer and any miss falls through to the index walk\n(correct by construction: the block's own `point_read` verifies key +\nseqno, so a stray locator only wastes a block read).\n- **Bench**: an `ours-ribbon` overlay on the existing `point_read` chart\nalongside the binary and hash-index series.\n\n## Configurability\n\nThree granularities, per level, widths auto or explicit:\n\n- **Block** (per-block): locator = `block_id`; read does the in-block\nbinary search.\n- **Restart** (per-sub-block): + restart index; read jumps to the\nrestart head and scans the interval.\n- **Entry** (per-key): + exact entry index; read jumps straight to the\nentry's restart.\n\n## Benchmark (compare-rocksdb, runner, rocksdb-parity preset)\n\nPoint read, ns/key (lower is better):\n\n| series | n=1000 | n=10000 |\n|--------|-------:|--------:|\n| ours (binary) | 961.4 | 1061.5 |\n| ours-hash-index | 930.0 | 1059.6 |\n| rocksdb (binary) | 875.7 | 965.7 |\n| rocksdb-hash-index | 903.8 | 968.6 |\n| **ours-ribbon** | **725.6** | **739.0** |\n\n`ours-ribbon` is the fastest in every point: **1.21x faster than RocksDB\nat n=1000, 1.31x at n=10000**, and the gap widens with size because the\nribbon removes the index-block binary search (O(log B) for RocksDB)\nentirely. A data-block hash index barely helps either engine, since the\nindex-block search dominates: removing it is the structural win.\n\n## Testing\n\n- Filter primitive: single / multi-layer exact recovery, full-width\nr=64, input rejections.\n- Wire: recover round-trip, cross-tag rejection, filter-type byte\nassertions.\n- Write side: end-to-end writer round-trip recovering every key's\n`(block_id, slot)` from the real on-disk section; disabled run emits no\nsection.\n- Read side: a locator-enabled tree returns byte-identical results to a\ndisabled one across 1500 keys x 3 snapshots x present/absent, with\nmultiple versions per key and tombstones, for all three precisions; a\ndirect `DataBlock` test pins the slot positioning (restart index, entry\nindex, restart-0 full scan, out-of-range fallback).\n- Gates: `clippy --all-features -D warnings`, no-std `thumbv7em` (0\nerrors), full suite 2094 tests, doctests.\n\nCloses #464",
+          "timestamp": "2026-06-15T18:58:41+03:00",
+          "tree_id": "170c4c0d2584e665691bf10c8c2295b5d3fb1947",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/65e7c6b5bc821489b079e659894b99213eaf9449"
+        },
+        "date": 1781539240471,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 2057153.5472882052,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.6us | P99.9: 3.7us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1184619.0110075509,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.3us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 908833.4076690899,
+            "unit": "ops/sec",
+            "extra": "P50: 1.0us | P99: 4.0us | P99.9: 6.5us\nthreads: 1 | elapsed: 0.22s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3644597.2453988236,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 3.1us | P99.9: 5.6us\nthreads: 1 | elapsed: 0.05s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 437217.6467565518,
+            "unit": "ops/sec",
+            "extra": "P50: 1.9us | P99: 5.4us | P99.9: 9.1us\nthreads: 1 | elapsed: 0.46s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 223491.20828273438,
+            "unit": "ops/sec",
+            "extra": "P50: 4.1us | P99: 9.4us | P99.9: 11.9us\nthreads: 1 | elapsed: 0.89s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1219721.6451278664,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.2us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1094737.7810445726,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 1.4us | P99.9: 2.5us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 685741.5602031751,
+            "unit": "ops/sec",
+            "extra": "P50: 1.3us | P99: 4.5us | P99.9: 7.1us\nthreads: 1 | elapsed: 0.29s | num: 200000 | iterations: 3"
           }
         ]
       }
