@@ -7,17 +7,27 @@ use crate::UserKey;
 use crate::sharded_cache::{ShardedCache, Weighter};
 use crate::table::block::Header;
 use crate::table::{Block, BlockOffset};
+use crate::value::InternalValue;
 use crate::{GlobalTableId, UserValue};
 
 const TAG_BLOCK: u8 = 0;
 const TAG_BLOB: u8 = 1;
 #[cfg(feature = "zstd")]
 const TAG_PARTIAL_BLOCK: u8 = 2;
+/// Row-cache tag: a fully resolved point-read result (`InternalValue`) keyed by
+/// the owning SST's id + the user key's hash, so a repeat point read returns the
+/// decoded value without re-loading and re-decoding its data block.
+const TAG_ROW: u8 = 3;
 
 #[derive(Clone)]
 enum Item {
     Block(Block),
     Blob(UserValue),
+    /// A resolved point-read result for one user key in one (immutable) SST: the
+    /// newest version found there. The full key is carried in `key.user_key` so a
+    /// hash collision on the cache key is caught (verified on lookup) rather than
+    /// returning a wrong value.
+    Row(InternalValue),
     /// The adaptive partial-tier entry for a cold zstd block: the decompressed
     /// prefix + resume snapshot (so a later read extends it without re-decoding
     /// from block 0) plus the access stats driving promotion to a full resident
@@ -70,6 +80,9 @@ impl Weighter<CacheKey, Item> for BlockWeighter {
                     + u64::from(b.header.uncompressed_length)
             }
             Blob(b) => b.len() as u64,
+            // Key bytes + value bytes + a fixed term for the InternalKey scalars
+            // (seqno + value_type) and the entry's own bookkeeping.
+            Item::Row(iv) => iv.key.user_key.len() as u64 + iv.value.len() as u64 + 16,
             // Weighed by the resident decompressed prefix + covered key; the
             // shared `Arc<ResumeState>` scratch is approximated by a small fixed
             // term rather than counted per entry.
@@ -109,6 +122,11 @@ pub struct Cache {
     // NOTE: rustc_hash performed best: https://fjall-rs.github.io/post/fjall-2-1
     /// In-tree sharded S3-FIFO cache (byte-weighted).
     data: ShardedCache<CacheKey, Item, BlockWeighter, rustc_hash::FxBuildHasher>,
+    /// Opt-in: when false, the row cache (decoded point-read results) is off, so
+    /// `get_row` always misses and `insert_row` is a no-op. Blocks / blobs are
+    /// cached regardless. Off by default to avoid spending the shared capacity on
+    /// rows for workloads that do not benefit (e.g. uniform / scan-heavy).
+    row_cache_enabled: bool,
 }
 
 /// Number of shards in the block cache. 64 keeps per-shard write contention low
@@ -132,7 +150,23 @@ impl Cache {
                 BlockWeighter,
                 rustc_hash::FxBuildHasher,
             ),
+            row_cache_enabled: false,
         }
+    }
+
+    /// Enables or disables the row cache (decoded point-read results), returning
+    /// the cache for builder-style configuration. Off by default; rows share the
+    /// block cache's byte capacity when enabled.
+    #[must_use]
+    pub fn with_row_cache(mut self, enabled: bool) -> Self {
+        self.row_cache_enabled = enabled;
+        self
+    }
+
+    /// Whether the row cache is enabled (see [`Cache::with_row_cache`]).
+    #[must_use]
+    pub fn row_cache_enabled(&self) -> bool {
+        self.row_cache_enabled
     }
 
     /// Returns the amount of cached bytes.
@@ -154,7 +188,7 @@ impl Cache {
 
         Some(match self.data.get(&key)? {
             Item::Block(block) => block,
-            Item::Blob(_) => unreachable!("invalid cache item"),
+            Item::Blob(_) | Item::Row(_) => unreachable!("invalid cache item"),
             #[cfg(feature = "zstd")]
             Item::PartialBlock(_) => unreachable!("invalid cache item"),
         })
@@ -224,6 +258,48 @@ impl Cache {
         );
     }
 
+    /// Looks up the cached point-read result for `user_key` in SST `id`. The
+    /// stored key is verified against `user_key` so a hash collision on the
+    /// cache slot is rejected (returns `None`) rather than serving a wrong value.
+    /// `key_hash` is the same hash the bloom filter uses, so the caller passes
+    /// the value it already computed.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn get_row(
+        &self,
+        id: GlobalTableId,
+        key_hash: u64,
+        user_key: &[u8],
+    ) -> Option<InternalValue> {
+        if !self.row_cache_enabled {
+            return None;
+        }
+        let key: CacheKey = (TAG_ROW, id.tree_id(), id.table_id(), key_hash).into();
+        match self.data.get(&key)? {
+            Item::Row(iv) if &*iv.key.user_key == user_key => Some(iv),
+            // Hash collision (a different key hashed to this slot) or a foreign
+            // item kind: treat as a miss so the caller does the real lookup.
+            _ => None,
+        }
+    }
+
+    /// Caches the resolved point-read result `iv` for SST `id`, keyed by
+    /// `key_hash`. Only a newest-version result (from a latest-version read)
+    /// should be inserted, so the seqno-visibility check on lookup stays correct.
+    /// SSTs are immutable, so an entry stays valid until its SST is compacted
+    /// away (after which its `table_id` is never read again and the entry ages
+    /// out of the cache).
+    #[doc(hidden)]
+    pub fn insert_row(&self, id: GlobalTableId, key_hash: u64, iv: InternalValue) {
+        if !self.row_cache_enabled {
+            return;
+        }
+        self.data.insert(
+            (TAG_ROW, id.tree_id(), id.table_id(), key_hash).into(),
+            Item::Row(iv),
+        );
+    }
+
     #[doc(hidden)]
     pub fn insert_blob(
         &self,
@@ -248,7 +324,7 @@ impl Cache {
 
         Some(match self.data.get(&key)? {
             Item::Blob(blob) => blob,
-            Item::Block(_) => unreachable!("invalid cache item"),
+            Item::Block(_) | Item::Row(_) => unreachable!("invalid cache item"),
             #[cfg(feature = "zstd")]
             Item::PartialBlock(_) => unreachable!("invalid cache item"),
         })

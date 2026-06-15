@@ -515,7 +515,36 @@ impl Table {
             return Ok(None);
         }
 
+        // Row-cache fast path: a prior latest-version read cached this key's
+        // resolved value for this (immutable) SST, so we can skip the index walk
+        // + data-block decode. The cached value is in table-local seqno space
+        // (same as `point_read`). Use it only when the cached newest version is
+        // visible at the query snapshot; otherwise fall through, because an older
+        // version may apply at this snapshot.
+        if let Some(mut iv) = self.cache.get_row(self.global_id(), key_hash, key) {
+            // Snapshot reads are exclusive: a version is visible iff its seqno is
+            // strictly less than the query seqno. Only serve the cached newest
+            // version when it is visible; otherwise fall through (an older
+            // version may apply at this snapshot).
+            if iv.key.seqno < seqno {
+                iv.key.seqno = iv.key.seqno.saturating_add(global_seqno);
+                return Ok(Some(iv));
+            }
+        }
+
         let item = self.point_read(key, seqno, key_hash)?;
+
+        // Populate the row cache only when this read could see the SST's newest
+        // version (`seqno > max`, exclusive), so the resolved value is the SST's
+        // newest version for this key — which keeps the seqno-visibility check
+        // above correct for later snapshot reads. SSTs are immutable, so the
+        // entry stays valid until the SST is compacted away.
+        if seqno > self.metadata.seqnos.1
+            && let Some(iv) = &item
+        {
+            self.cache
+                .insert_row(self.global_id(), key_hash, iv.clone());
+        }
 
         // Translate table-local seqno back to global coordinate so callers
         // can compare across tables/memtables (L0 best-selection, RT suppression).
@@ -563,7 +592,33 @@ impl Table {
             return Ok(None);
         }
 
+        // Row-cache fast path (mirrors `Table::get`): serve the value tuple from
+        // a prior cached point-read result, skipping the index walk + block
+        // decode, when the cached newest version is visible at this snapshot.
+        if let Some(iv) = self.cache.get_row(self.global_id(), key_hash, key) {
+            // Exclusive snapshot visibility (see `Table::get`): serve only when
+            // the cached newest version is strictly older than the query seqno.
+            if iv.key.seqno < seqno {
+                let s = iv.key.seqno.saturating_add(global_seqno);
+                return Ok(Some((iv.key.value_type, s, iv.value)));
+            }
+        }
+
         let item = self.point_read_value(key, seqno, key_hash)?;
+
+        // Populate only when this read could see the SST's newest version
+        // (`seqno > max`, exclusive), mirroring `Table::get`. The value path does
+        // not reconstruct the matched key, so rebuild the `InternalValue` from
+        // the query key (the needle) + the resolved `(value_type, seqno, value)`.
+        if seqno > self.metadata.seqnos.1
+            && let Some((vt, s, v)) = &item
+        {
+            let iv = InternalValue {
+                key: crate::key::InternalKey::new(crate::UserKey::from(key), *s, *vt),
+                value: v.clone(),
+            };
+            self.cache.insert_row(self.global_id(), key_hash, iv);
+        }
 
         // Translate table-local seqno back to the global coordinate, mirroring
         // `Table::get`.
