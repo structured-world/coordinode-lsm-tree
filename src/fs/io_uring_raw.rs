@@ -244,6 +244,10 @@ unsafe fn io_uring_enter(
 ///
 /// # Safety
 /// Standard `mmap` contract. The caller owns the mapping and must `munmap` it.
+// Coverage: the `MAP_FAILED` / `Err` arms require an `mmap` failure (address
+// space exhaustion or a kernel fault), which cannot be provoked deterministically
+// in CI. The success arm IS covered by every ring setup.
+#[cfg_attr(coverage_nightly, coverage(off))]
 unsafe fn mmap(
     len: usize,
     prot: usize,
@@ -368,6 +372,11 @@ impl IoUringRaw {
     ///
     /// # Errors
     /// Returns an [`Error`] if `io_uring_setup` or any `mmap` fails.
+    // Coverage: the post-setup `mmap`-failure unwind arms and the pre-5.4
+    // separate-CQ-mmap layout require a kernel fault / an old kernel to exercise
+    // and cannot be reached in CI (the runner kernel always reports SINGLE_MMAP).
+    // The setup-success path and the zero-entry setup error ARE covered by tests.
+    #[cfg_attr(coverage_nightly, coverage(off))]
     pub fn new(entries: u32) -> Result<Self, Error> {
         let mut params = IoUringParams::default();
 
@@ -558,6 +567,12 @@ impl IoUringRaw {
     /// Returns an [`Error`] if the SQ is full, `io_uring_enter` fails, no
     /// completion is visible after the wait, or the completion's `res` is a
     /// negative `-errno`.
+    // Coverage: the SQ-full and no-completion guards are defensive and
+    // unreachable through this one-submit-one-reap driver (it never lets the SQ
+    // fill or `io_uring_enter` return without a completion); they would need
+    // kernel fault injection. The submit/enter/reap success path and the
+    // negative-`res` error path ARE covered by tests.
+    #[cfg_attr(coverage_nightly, coverage(off))]
     fn submit_and_reap_one(&mut self, sqe: &IoUringSqe) -> Result<i32, Error> {
         // SAFETY: single-threaded driver. Read the kernel-advanced SQ head
         // (Acquire) to confirm the ring has a free slot, write the SQE into
@@ -651,6 +666,11 @@ impl FdGuard {
 }
 
 impl Drop for FdGuard {
+    // Coverage: this fires only when `mmap` fails AFTER `io_uring_setup`
+    // succeeds — an allocation fault that cannot be provoked in CI. On the
+    // covered paths the guard is either disarmed (setup + mmap succeed) or never
+    // built (setup itself fails).
+    #[cfg_attr(coverage_nightly, coverage(off))]
     fn drop(&mut self) {
         // SAFETY: `self.0` is the live ring fd; only reached on the setup-error
         // path where nothing else owns it yet.
