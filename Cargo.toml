@@ -353,3 +353,9 @@ name = "partial_decode"
 harness = false
 path = "benches/partial_decode.rs"
 required-features = ["zstd"]
+
+[[bench]]
+name = "scan_since"
+harness = false
+path = "benches/scan_since.rs"
+required-features = []

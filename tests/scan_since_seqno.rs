@@ -4,9 +4,9 @@
 //! End-to-end coverage for `Tree::scan_since_seqno` (CDC event stream):
 //! target filtering, increasing-seqno replay order, event-type mapping
 //! (Insert / PointTombstone / RangeTombstone), coverage across memtable and
-//! SSTs, the seqno-bounded block-skip path, and mixed-format trees (a tree
-//! that holds both legacy `index_format=0` and seqno-bounded `index_format=1`
-//! SSTs must scan correctly).
+//! SSTs, the per-block seqno-bounds block-skip path, and mixed trees (a tree
+//! that holds both SSTs with a `seqno_bounds` section and SSTs without one
+//! must scan correctly).
 
 use lsm_tree::{
     AbstractTree, AnyTree, BlobTree, Config, ScanSinceEvent, SeqNo, SequenceNumberCounter, Tree,
@@ -205,13 +205,13 @@ fn scan_since_mixed_format_tree_scans_correctly() -> lsm_tree::Result<()> {
     let folder = get_tmp_folder();
     let tree = open_tree(folder.path())?;
 
-    // First SST: legacy index_format=0 (seqno_in_index defaults off).
+    // First SST: no seqno_bounds section (seqno_in_index defaults off).
     for i in 0..250u64 {
         tree.insert(format!("key{i:05}").as_bytes(), b"v", i);
     }
     tree.flush_active_memtable(0)?;
 
-    // Toggle on, second SST: seqno-bounded index_format=1.
+    // Toggle on, second SST: emits a seqno_bounds section.
     tree.update_runtime_config(|cfg| {
         cfg.seqno_in_index = true;
     })?;
@@ -343,5 +343,190 @@ fn scan_since_caught_up_target_returns_empty() -> lsm_tree::Result<()> {
         events(&tree, 100)?.is_empty(),
         "a far-future target must yield no events"
     );
+    Ok(())
+}
+
+// ---- Corruption matrix (#224) ---------------------------------------------
+
+/// The paranoid full-scan variant disables the per-block seqno-bounds skip but
+/// must return byte-identical results to the fast block-skip path. This proves
+/// the no-skip path is correct (and, by extension, that a hypothetical
+/// undetected-corrupt bound which made the fast path skip a block could only
+/// ever cause a missed record, which the full scan recovers).
+#[test]
+fn scan_since_full_scan_matches_block_skip() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let tree = open_tree(folder.path())?;
+    tree.update_runtime_config(|cfg| {
+        cfg.seqno_in_index = true;
+    })?;
+    for i in 0..500u64 {
+        tree.insert(format!("key{i:05}").as_bytes(), b"v", i);
+    }
+    tree.flush_active_memtable(0)?;
+
+    for target in [0u64, 123, 450, 499, 500] {
+        let fast: Vec<SeqNo> = events(&tree, target)?
+            .iter()
+            .map(ScanSinceEvent::seqno)
+            .collect();
+        let full: Vec<SeqNo> = tree
+            .scan_since_seqno_full_scan(target)?
+            .map(|e| e.seqno())
+            .collect();
+        assert_eq!(
+            fast, full,
+            "paranoid full scan must equal block-skip scan at target {target}",
+        );
+    }
+    Ok(())
+}
+
+/// A bit-flip in a sub-index block must be caught by the index block's XXH3-128
+/// on the scan's index walk, not silently trusted: the seqno-scoped scan still
+/// reads the full index to enumerate data blocks, so a corrupt sub-index block
+/// must surface as an error. Forces a partitioned index so
+/// `read_top_level_index_entries` yields multiple sub-index blocks.
+#[test]
+fn scan_since_seqno_index_corruption_is_caught() -> lsm_tree::Result<()> {
+    use lsm_tree::config::{BlockSizePolicy, PinningPolicy};
+    use lsm_tree::inspect::read_top_level_index_entries;
+    use lsm_tree::runtime_config::RuntimeConfig;
+    use std::io::{Seek, Write};
+
+    // Runtime config at open: enable the seqno_bounds section + force the index
+    // to partition (zero spill threshold) so the index spills into multiple
+    // checksummed sub-index blocks.
+    let mut rc = RuntimeConfig::default();
+    rc.seqno_in_index = true;
+    rc.index_partition_spill_threshold = 0;
+
+    let folder = get_tmp_folder();
+    {
+        let any = Config::new(
+            folder.path(),
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .index_block_partitioning_policy(PinningPolicy::all(true))
+        .data_block_size_policy(BlockSizePolicy::all(256))
+        .with_runtime_config(rc)
+        .open()?;
+        let tree = match any {
+            AnyTree::Standard(t) => t,
+            AnyTree::Blob(_) => panic!("expected Standard tree"),
+        };
+        // Large corpus → many small data blocks → many index handles → multiple
+        // sub-index partitions (the partition budget is ~4 KiB).
+        for i in 0..30_000u64 {
+            tree.insert(format!("key{i:08}").as_bytes(), b"v", i);
+        }
+        tree.flush_active_memtable(0)?;
+    }
+
+    // Locate the single SST and a sub-index block to corrupt.
+    let sst = std::fs::read_dir(folder.path().join("tables"))
+        .expect("tables dir")
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .find(|p| p.is_file())
+        .expect("one SST file");
+    let tli = read_top_level_index_entries(&sst).expect("read top-level index");
+    assert!(
+        tli.len() > 1,
+        "test needs a partitioned index (>1 sub-index block), got {}",
+        tli.len(),
+    );
+    let victim = &tli[0];
+    {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&sst)
+            .expect("open sst");
+        f.seek(std::io::SeekFrom::Start(victim.offset))
+            .expect("seek");
+        f.write_all(&vec![0xFF; victim.size as usize])
+            .expect("flip");
+        f.sync_all().expect("sync");
+    }
+
+    // Reopen and scan: the corrupted sub-index block fails its checksum.
+    let tree = open_tree(folder.path())?;
+    let res: lsm_tree::Result<Vec<ScanSinceEvent>> =
+        tree.scan_since_seqno(0).map(Iterator::collect);
+    assert!(
+        res.is_err(),
+        "a corrupted sub-index block must be caught by XXH3 on the scan, not trusted",
+    );
+    Ok(())
+}
+
+/// The retrieval-ribbon locator (point-read fast path) and the `seqno_bounds`
+/// section (scan_since_seqno block-skip) are independent optional SST sections.
+/// An SST that carries BOTH must serve both paths correctly: point reads via the
+/// locator and seqno-scoped scans via the block-skip, neither perturbing the
+/// other. Locks down that the two features compose.
+#[test]
+fn scan_since_with_locator_enabled_is_correct() -> lsm_tree::Result<()> {
+    use lsm_tree::config::{LocatorPolicy, LocatorPolicyEntry, LocatorPrecision};
+
+    let folder = get_tmp_folder();
+    let any = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    // Many small data blocks so both the locator's block_id space and the
+    // seqno-bounds block-skip are non-trivial.
+    .data_block_size_policy(lsm_tree::config::BlockSizePolicy::all(4_096))
+    .locator_policy(LocatorPolicy::all(LocatorPolicyEntry::Enabled {
+        precision: LocatorPrecision::Block,
+        block_id_bits: None,
+        slot_bits: None,
+    }))
+    .open()?;
+    let tree = match any {
+        AnyTree::Standard(t) => t,
+        AnyTree::Blob(_) => panic!("expected Standard tree"),
+    };
+    // Enable the seqno_bounds section too, so the flushed SST carries BOTH.
+    tree.update_runtime_config(|cfg| {
+        cfg.seqno_in_index = true;
+    })?;
+
+    // Fixed-width big-endian keys (the locator's proven corpus shape) so the
+    // ribbon is well-conditioned; rising seqnos so block-skip has work to do.
+    for i in 0..1_500u64 {
+        tree.insert(i.to_be_bytes(), format!("v{i:05}").as_bytes(), i);
+    }
+    tree.flush_active_memtable(0)?;
+
+    // Point reads resolve through the locator and must be exact.
+    for i in 0..1_500u64 {
+        let got = tree.get(i.to_be_bytes(), SeqNo::MAX)?;
+        assert_eq!(
+            got.as_deref(),
+            Some(format!("v{i:05}").as_bytes()),
+            "locator point read of key {i} must be exact",
+        );
+    }
+
+    // Seqno-scoped scans block-skip via the seqno_bounds section; the fast path
+    // must equal the paranoid full scan at every target despite the locator
+    // also being present in the same SST.
+    for target in [0u64, 500, 1_234, 1_499, 1_500] {
+        let fast: Vec<SeqNo> = events(&tree, target)?
+            .iter()
+            .map(ScanSinceEvent::seqno)
+            .collect();
+        let full: Vec<SeqNo> = tree
+            .scan_since_seqno_full_scan(target)?
+            .map(|e| e.seqno())
+            .collect();
+        assert_eq!(
+            fast, full,
+            "block-skip scan must equal full scan at target {target} with the locator enabled",
+        );
+    }
     Ok(())
 }

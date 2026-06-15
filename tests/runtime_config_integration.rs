@@ -180,12 +180,13 @@ fn tree_kv_checksums_all_levels_round_trips_through_disk() {
 
 #[test]
 fn seqno_in_index_round_trips_through_disk_and_reopen() -> lsm_tree::Result<()> {
-    // With `seqno_in_index` enabled, every data-block index entry is written
-    // in the seqno-bounded format (markers 2 / 3) and the SST is tagged
-    // index_format=1. The whole point of the format is that the data must
-    // read back identically: flush, point-read, reopen, point-read again.
-    // Reopen is the load-bearing step — it re-parses the on-disk index from
-    // scratch, so a broken seqno-bounded decode surfaces as a read failure.
+    // With `seqno_in_index` enabled, the writer emits the parallel
+    // `seqno_bounds` SST section (one `(seqno_min, seqno_max)` per data block);
+    // the index entries themselves stay legacy. The whole point is that the
+    // data must read back identically: flush, point-read, reopen, point-read
+    // again. Reopen is the load-bearing step — it re-parses the on-disk index
+    // and the seqno-bounds section from scratch, so a broken decode surfaces as
+    // a read failure.
     let folder = get_tmp_folder();
 
     {
@@ -230,9 +231,9 @@ fn seqno_in_index_round_trips_through_disk_and_reopen() -> lsm_tree::Result<()> 
         }
     }
 
-    // Reopen: the index blocks are decoded fresh from disk. Runtime config
-    // resets to default on reopen (not persisted), but the on-disk
-    // index_format=1 entries must still decode via per-marker dispatch.
+    // Reopen: the index blocks and the seqno-bounds section are decoded fresh
+    // from disk. Runtime config resets to default on reopen (not persisted),
+    // but the on-disk data must still read back correctly.
     let tree = open_tree(folder.path());
     for i in 0..500u64 {
         let key = format!("key{i:05}");
@@ -244,8 +245,7 @@ fn seqno_in_index_round_trips_through_disk_and_reopen() -> lsm_tree::Result<()> 
         );
     }
 
-    // A key never inserted must still be absent (index seek lands correctly
-    // on the seqno-bounded entries).
+    // A key never inserted must still be absent (index seek lands correctly).
     assert!(tree.get(b"key99999", SeqNo::MAX)?.is_none());
 
     Ok(())

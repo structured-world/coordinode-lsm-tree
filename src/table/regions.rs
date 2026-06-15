@@ -88,6 +88,11 @@ pub struct ParsedRegions {
     /// widths fit; maps each key to its data block and slot for O(1) point
     /// reads. Absent on tables written without the locator feature.
     pub locator: Option<BlockHandle>,
+    /// Optional seqno-bounds section (the `seqno_bounds` section). Present only
+    /// when `seqno_in_index` was on; maps each data block's offset to its
+    /// `[seqno_min, seqno_max]` for the `scan_since_seqno` block-skip, kept
+    /// parallel to the index so point reads pay nothing for it.
+    pub seqno_bounds: Option<BlockHandle>,
     pub linked_blob_files: Option<BlockHandle>,
     pub metadata: BlockHandle,
     /// Mid-file backup of the meta block. Writer order:
@@ -137,6 +142,10 @@ impl ParsedRegions {
                 .transpose()?,
             locator: toc
                 .section(b"locator")
+                .map(toc_entry_to_handle)
+                .transpose()?,
+            seqno_bounds: toc
+                .section(b"seqno_bounds")
                 .map(toc_entry_to_handle)
                 .transpose()?,
             linked_blob_files: toc
