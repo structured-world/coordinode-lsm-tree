@@ -109,6 +109,13 @@ pub struct Inner {
     )]
     pub(crate) block_layout: BlockLayoutMap,
 
+    /// Retrieval-ribbon locator, loaded on open from the optional `locator`
+    /// section. `Some` only when the table was written with a locator policy
+    /// enabled; lets a point read resolve a key to its data block in O(1),
+    /// skipping the index-block binary search. `None` (default) leaves the
+    /// point read on the sorted-index path.
+    pub(crate) locator_index: Option<crate::table::locator::LoadedLocator>,
+
     /// Block encryption provider for encryption at rest.
     pub(crate) encryption: Option<Arc<dyn EncryptionProvider>>,
 

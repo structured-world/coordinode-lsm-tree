@@ -5,7 +5,7 @@ use super::super::builder::RibbonBuilder;
 use super::super::hashing::StandardEquation;
 use super::super::params::{Mode, Params};
 use super::error::BurrBuildError;
-use super::filter::{BurrFilter, BurrLayer};
+use super::filter::{BurrFilter, BurrFilterKind, BurrLayer};
 use super::params::BurrParams;
 use super::threshold::{compute_thresholds, partition_keys_by_threshold};
 
@@ -103,6 +103,60 @@ impl BurrBuilder {
     /// so per-partition construction doesn't pay the copy cost twice
     /// (once here, once during the per-layer recursion).
     pub fn build_from_hashes_owned(&self, hashes: Vec<u64>) -> Result<BurrFilter, BurrBuildError> {
+        self.build_layers(hashes, None)
+    }
+
+    /// Build a *retrieval* BuRR from pre-computed key hashes plus a parallel
+    /// slice of r-bit locators. Where [`Self::build_from_hashes`] stores a
+    /// hash-derived membership fingerprint per key, this stores `locators[i]`
+    /// as the value recovered for `hashes[i]`.
+    ///
+    /// A later [`BurrFilter::recover_value`] query returns the exact locator
+    /// for a key in the set; for an absent key it returns an unspecified
+    /// r-bit value, which the caller distinguishes by verifying the key at
+    /// the located slot (the locate step subsumes the membership check).
+    ///
+    /// # Errors
+    /// - `InvalidParams` if `hashes` is empty, `hashes.len() != locators.len()`,
+    ///   or any locator does not fit in `r` bits.
+    /// - `RibbonLayerFailed` / `LayerExhaustion` on a construction failure
+    ///   (same conditions as [`Self::build_from_hashes`]).
+    pub fn build_from_hashes_with_values(
+        &self,
+        hashes: &[u64],
+        locators: &[u64],
+    ) -> Result<BurrFilter, BurrBuildError> {
+        if hashes.len() != locators.len() {
+            return Err(BurrBuildError::InvalidParams(
+                "hashes and locators must have equal length",
+            ));
+        }
+        // A locator wider than r bits would be silently truncated by the
+        // ribbon and resolve to the wrong block/slot. Reject loudly at build
+        // time rather than mis-locating at read time.
+        let value_mask = if self.params.r == 64 {
+            u64::MAX
+        } else {
+            (1u64 << self.params.r) - 1
+        };
+        if locators.iter().any(|&loc| loc & !value_mask != 0) {
+            return Err(BurrBuildError::InvalidParams(
+                "locator does not fit in r bits",
+            ));
+        }
+        self.build_layers(hashes.to_vec(), Some(locators.to_vec()))
+    }
+
+    /// Shared layer-recursion driver for both the membership build
+    /// (`values = None`, RHS = hash fingerprint) and the retrieval build
+    /// (`values = Some`, RHS = caller locator). Keeping one loop means the
+    /// threshold / partition / per-layer sizing logic cannot diverge between
+    /// the two filter flavours.
+    fn build_layers(
+        &self,
+        hashes: Vec<u64>,
+        values: Option<Vec<u64>>,
+    ) -> Result<BurrFilter, BurrBuildError> {
         // Empty input would produce a zero-layer filter that
         // `to_wire_bytes` correctly serialises as an empty Vec, but
         // `BurrFilterReader::new` rejects num_layers == 0 — so the
@@ -112,7 +166,16 @@ impl BurrBuilder {
         if hashes.is_empty() {
             return Err(BurrBuildError::InvalidParams("key set must be non-empty"));
         }
+        // Capture the flavour before the loop drains `values`: presence of
+        // a value slice means a retrieval (key → locator) build, absence a
+        // membership build. The wire encoder maps it to the filter_type tag.
+        let kind = if values.is_some() {
+            BurrFilterKind::Retrieval
+        } else {
+            BurrFilterKind::Membership
+        };
         let mut remaining: Vec<u64> = hashes;
+        let mut remaining_values: Option<Vec<u64>> = values;
         let mut layers: Vec<BurrLayer> = Vec::with_capacity(usize::from(self.params.max_layers));
 
         for layer_idx in 0..self.params.max_layers {
@@ -160,9 +223,6 @@ impl BurrBuilder {
                 compute_thresholds(&equations, m, self.params.b)
             };
 
-            let (kept, bumped) =
-                partition_keys_by_threshold(&remaining, &equations, &thresholds, self.params.b);
-
             let ribbon_builder = RibbonBuilder::new(equation_params).map_err(|e| {
                 BurrBuildError::RibbonLayerFailed {
                     layer_index: usize::from(layer_idx),
@@ -170,21 +230,64 @@ impl BurrBuilder {
                 }
             })?;
 
-            let ribbon = ribbon_builder
-                .build_with_seed_verbatim_from_hashes(&kept, layer_seed, m)
-                .map_err(|e| BurrBuildError::RibbonLayerFailed {
-                    layer_index: usize::from(layer_idx),
-                    ribbon_error: e,
-                })?;
+            // Partition the layer input into kept (built here) and bumped
+            // (forwarded to the next layer). For the retrieval build each
+            // locator travels with its key through the partition so the
+            // bumped set carries the right values; build the ribbon over the
+            // kept locators. For the membership build the RHS is the hash
+            // fingerprint, so no values ride along.
+            let (kept_ribbon, bumped_values) = match &remaining_values {
+                None => {
+                    let (kept, bumped) = partition_keys_by_threshold(
+                        &remaining,
+                        &equations,
+                        &thresholds,
+                        self.params.b,
+                    );
+                    let ribbon = ribbon_builder
+                        .build_with_seed_verbatim_from_hashes(&kept, layer_seed, m)
+                        .map_err(|e| BurrBuildError::RibbonLayerFailed {
+                            layer_index: usize::from(layer_idx),
+                            ribbon_error: e,
+                        })?;
+                    remaining = bumped;
+                    (ribbon, None)
+                }
+                Some(vals) => {
+                    let pairs: Vec<(u64, u64)> = remaining
+                        .iter()
+                        .copied()
+                        .zip(vals.iter().copied())
+                        .collect();
+                    let (kept, bumped) =
+                        partition_keys_by_threshold(&pairs, &equations, &thresholds, self.params.b);
+                    let (kept_hashes, kept_values): (Vec<u64>, Vec<u64>) = kept.into_iter().unzip();
+                    let (bumped_hashes, bumped_vals): (Vec<u64>, Vec<u64>) =
+                        bumped.into_iter().unzip();
+                    let ribbon = ribbon_builder
+                        .build_with_seed_verbatim_from_values(
+                            &kept_hashes,
+                            &kept_values,
+                            layer_seed,
+                            m,
+                        )
+                        .map_err(|e| BurrBuildError::RibbonLayerFailed {
+                            layer_index: usize::from(layer_idx),
+                            ribbon_error: e,
+                        })?;
+                    remaining = bumped_hashes;
+                    (ribbon, Some(bumped_vals))
+                }
+            };
 
             layers.push(BurrLayer {
                 m,
                 seed: layer_seed,
                 thresholds,
-                ribbon,
+                ribbon: kept_ribbon,
             });
 
-            remaining = bumped;
+            remaining_values = bumped_values;
         }
 
         if !remaining.is_empty() {
@@ -194,7 +297,7 @@ impl BurrBuilder {
             });
         }
 
-        Ok(BurrFilter::from_layers(self.params, layers))
+        Ok(BurrFilter::from_layers(self.params, kind, layers))
     }
 }
 

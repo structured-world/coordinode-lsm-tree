@@ -582,6 +582,8 @@ impl AbstractTree for Tree {
         // and the meta block a descriptor key regardless, so the on-disk bytes
         // are not identical to a pre-V5 table).
         table_writer = table_writer.use_kv_checksums(rc.kv_checksums, rc.kv_checksum_algo);
+        // Flush writes level 0; resolve that level's locator policy entry.
+        table_writer = table_writer.use_locator(self.config.locator_policy.get(0));
 
         #[cfg(zstd_any)]
         {

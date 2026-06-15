@@ -146,6 +146,7 @@ impl<'a> Ingestion<'a> {
         writer = writer.use_seqno_in_index(rc.seqno_in_index);
         writer = writer.use_disable_cow_on_sst(rc.disable_cow_on_sst_files);
         writer = writer.use_kv_checksums(rc.kv_checksums, rc.kv_checksum_algo);
+        writer = writer.use_locator(tree.config.locator_policy.get(INITIAL_CANONICAL_LEVEL));
 
         #[cfg(zstd_any)]
         {
