@@ -600,6 +600,12 @@ impl IoUringRaw {
                 ));
             }
             let cqe = core::ptr::read(self.cqes.add((head & self.cq_ring_mask) as usize));
+            // Release the CQE read before publishing the advanced head: the
+            // (non-volatile) read above must complete before the kernel can see
+            // the new head and reuse the slot, otherwise the read could be
+            // reordered after the head store and observe a torn / overwritten
+            // entry. Matters once a future reaper drains multiple CQEs.
+            fence(Ordering::Release);
             core::ptr::write_volatile(self.cq_khead, head.wrapping_add(1));
             cqe.res
         };
