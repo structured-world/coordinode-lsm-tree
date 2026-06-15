@@ -35,20 +35,55 @@ impl core::fmt::Debug for BurrLayer {
     }
 }
 
+/// Whether a built BuRR stores membership fingerprints (probe → bool) or
+/// caller-supplied locators (recover → value).
+///
+/// Recorded in the wire header as the `filter_type` byte so a retrieval
+/// filter can never be mis-queried as a membership filter (or vice versa):
+/// the membership decoders accept only [`Membership`], the retrieval
+/// recover path only [`Retrieval`]. This is a new tag within the existing
+/// wire `FORMAT_VERSION`, not a version bump.
+///
+/// [`Membership`]: BurrFilterKind::Membership
+/// [`Retrieval`]: BurrFilterKind::Retrieval
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BurrFilterKind {
+    /// RHS = hash-derived fingerprint; query compares and yields presence.
+    Membership,
+    /// RHS = caller locator; query recovers and yields the stored value.
+    Retrieval,
+}
+
 /// A built, queryable BuRR filter.
 ///
 /// Layers are tried in order on each probe: layer 0 first, then layer 1
-/// (the bumped-from-layer-0 set), etc. A key is "present" if any layer's
-/// Ribbon body reports a match. False positives carry the FPR ≈ 2⁻ʳ of
-/// the underlying Ribbon layers.
+/// (the bumped-from-layer-0 set), etc. A membership filter reports a key
+/// "present" if any layer's Ribbon body matches (FPR ≈ 2⁻ʳ); a retrieval
+/// filter recovers the stored locator at the first non-bumped layer.
 pub struct BurrFilter {
     params: BurrParams,
+    kind: BurrFilterKind,
     layers: Vec<BurrLayer>,
 }
 
 impl BurrFilter {
-    pub(crate) fn from_layers(params: BurrParams, layers: Vec<BurrLayer>) -> Self {
-        Self { params, layers }
+    pub(crate) fn from_layers(
+        params: BurrParams,
+        kind: BurrFilterKind,
+        layers: Vec<BurrLayer>,
+    ) -> Self {
+        Self {
+            params,
+            kind,
+            layers,
+        }
+    }
+
+    /// Whether this filter stores membership fingerprints or retrieval
+    /// locators. The wire encoder maps it to the `filter_type` byte.
+    #[must_use]
+    pub(crate) fn kind(&self) -> BurrFilterKind {
+        self.kind
     }
 
     /// Returns the layer count after construction. Useful for diagnostics
@@ -270,6 +305,28 @@ pub struct BurrFilterReader<'a> {
 #[inline]
 pub fn contains_hash_from_bytes(bytes: &[u8], hash: u64) -> crate::Result<bool> {
     super::wire::contains_hash_from_bytes(bytes, hash)
+}
+
+/// Single-pass parse + locator recovery over a wire-format *retrieval* BuRR
+/// (one serialized from a filter built via
+/// [`BurrBuilder::build_from_hashes_with_values`]).
+///
+/// The retrieval counterpart of [`contains_hash_from_bytes`]: accepts only a
+/// retrieval payload and returns the r-bit locator stored for `hash`.
+/// `Ok(Some(locator))` is the value at the first non-bumped layer (exact for
+/// a key in the set, unspecified for an absent key — the caller verifies the
+/// key at the located slot); `Ok(None)` means the ribbon cannot answer (all
+/// layers bumped, or a truncated payload) and the caller should fall back to
+/// the sorted index.
+///
+/// # Errors
+/// Returns `InvalidHeader` / `InvalidTag` if the wire prefix is unparseable
+/// or is not a retrieval payload (e.g. a membership filter).
+///
+/// [`BurrBuilder::build_from_hashes_with_values`]: super::builder::BurrBuilder::build_from_hashes_with_values
+#[inline]
+pub fn recover_value_from_bytes(bytes: &[u8], hash: u64) -> crate::Result<Option<u64>> {
+    super::wire::recover_value_from_bytes(bytes, hash)
 }
 
 impl<'a> BurrFilterReader<'a> {

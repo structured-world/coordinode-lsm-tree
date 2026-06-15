@@ -5,7 +5,7 @@ use super::super::builder::RibbonBuilder;
 use super::super::hashing::StandardEquation;
 use super::super::params::{Mode, Params};
 use super::error::BurrBuildError;
-use super::filter::{BurrFilter, BurrLayer};
+use super::filter::{BurrFilter, BurrFilterKind, BurrLayer};
 use super::params::BurrParams;
 use super::threshold::{compute_thresholds, partition_keys_by_threshold};
 
@@ -166,6 +166,14 @@ impl BurrBuilder {
         if hashes.is_empty() {
             return Err(BurrBuildError::InvalidParams("key set must be non-empty"));
         }
+        // Capture the flavour before the loop drains `values`: presence of
+        // a value slice means a retrieval (key → locator) build, absence a
+        // membership build. The wire encoder maps it to the filter_type tag.
+        let kind = if values.is_some() {
+            BurrFilterKind::Retrieval
+        } else {
+            BurrFilterKind::Membership
+        };
         let mut remaining: Vec<u64> = hashes;
         let mut remaining_values: Option<Vec<u64>> = values;
         let mut layers: Vec<BurrLayer> = Vec::with_capacity(usize::from(self.params.max_layers));
@@ -289,7 +297,7 @@ impl BurrBuilder {
             });
         }
 
-        Ok(BurrFilter::from_layers(self.params, layers))
+        Ok(BurrFilter::from_layers(self.params, kind, layers))
     }
 }
 

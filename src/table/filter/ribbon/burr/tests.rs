@@ -1096,3 +1096,127 @@ fn retrieval_ribbon_full_width_locator_round_trips() {
         );
     }
 }
+
+#[test]
+fn retrieval_ribbon_wire_round_trips_recover_value() {
+    // Serialize a retrieval ribbon and recover locators straight from the
+    // wire bytes — the on-disk read path. Must match the in-memory query.
+    use super::filter::recover_value_from_bytes;
+
+    let n = 1_000_usize;
+    let params = retrieval_params(n, 24.0);
+    let builder = BurrBuilder::new(params).expect("builder");
+    let hashes: Vec<u64> = (0..n as u64)
+        .map(|i| crate::hash::hash64(&i.to_le_bytes()))
+        .collect();
+    let locators: Vec<u64> = (0..n as u64).collect();
+
+    let filter = builder
+        .build_from_hashes_with_values(&hashes, &locators)
+        .expect("retrieval build");
+    let bytes = filter.to_wire_bytes();
+
+    for (i, h) in hashes.iter().enumerate() {
+        assert_eq!(
+            recover_value_from_bytes(&bytes, *h).expect("recover"),
+            Some(locators[i]),
+            "wire recover for key {i} disagrees with stored locator",
+        );
+        // Wire and in-memory recovery must agree exactly.
+        assert_eq!(
+            recover_value_from_bytes(&bytes, *h).expect("recover"),
+            filter.recover_value(*h),
+            "wire vs in-memory recovery diverged for key {i}",
+        );
+    }
+}
+
+#[test]
+fn recover_value_from_bytes_rejects_membership_filter() {
+    // A membership filter (tag 2) must not be recoverable as a retrieval
+    // ribbon — the locate path would otherwise return fingerprint garbage as
+    // a locator. The tag guard rejects it instead.
+    use super::filter::recover_value_from_bytes;
+
+    let params = BurrParams::with_fp_rate(64, 0.01).expect("params");
+    let builder = BurrBuilder::new(params).expect("builder");
+    let hashes: Vec<u64> = (0..64_u64)
+        .map(|i| crate::hash::hash64(&i.to_le_bytes()))
+        .collect();
+    let filter = builder.build_from_hashes(&hashes).expect("build");
+    let bytes = filter.to_wire_bytes();
+
+    let err = recover_value_from_bytes(&bytes, hashes[0]).expect_err("membership tag must reject");
+    assert!(
+        matches!(err, crate::Error::InvalidTag(("FilterType", 2))),
+        "expected InvalidTag(FilterType, 2), got: {err:?}",
+    );
+}
+
+#[test]
+fn contains_hash_from_bytes_rejects_retrieval_filter() {
+    // Symmetric guard: a retrieval ribbon (tag 3) must not be probed for
+    // membership — the stored locators are not fingerprints.
+    use super::filter::contains_hash_from_bytes;
+
+    let n = 64_usize;
+    let params = retrieval_params(n, 16.0);
+    let builder = BurrBuilder::new(params).expect("builder");
+    let hashes: Vec<u64> = (0..n as u64)
+        .map(|i| crate::hash::hash64(&i.to_le_bytes()))
+        .collect();
+    let locators: Vec<u64> = (0..n as u64).collect();
+    let filter = builder
+        .build_from_hashes_with_values(&hashes, &locators)
+        .expect("retrieval build");
+    let bytes = filter.to_wire_bytes();
+
+    let err = contains_hash_from_bytes(&bytes, hashes[0]).expect_err("retrieval tag must reject");
+    assert!(
+        matches!(err, crate::Error::InvalidTag(("FilterType", 3))),
+        "expected InvalidTag(FilterType, 3), got: {err:?}",
+    );
+}
+
+#[test]
+fn membership_wire_bytes_keep_filter_type_two() {
+    // The membership wire payload is unchanged by the retrieval-tag work:
+    // the filter_type byte at the MAGIC offset stays 2, so existing on-disk
+    // filter blocks remain byte-identical (no format-version bump).
+    let params = BurrParams::with_fp_rate(64, 0.01).expect("params");
+    let builder = BurrBuilder::new(params).expect("builder");
+    let hashes: Vec<u64> = (0..64_u64)
+        .map(|i| crate::hash::hash64(&i.to_le_bytes()))
+        .collect();
+    let bytes = builder
+        .build_from_hashes(&hashes)
+        .expect("build")
+        .to_wire_bytes();
+    assert_eq!(
+        bytes[crate::file::MAGIC_BYTES.len()],
+        2,
+        "membership filter_type tag must stay 2",
+    );
+}
+
+#[test]
+fn retrieval_wire_bytes_use_filter_type_three() {
+    // The retrieval payload is tagged 3 (a new tag in the same wire version),
+    // so it is distinguishable from membership without a version bump.
+    let n = 64_usize;
+    let params = retrieval_params(n, 16.0);
+    let builder = BurrBuilder::new(params).expect("builder");
+    let hashes: Vec<u64> = (0..n as u64)
+        .map(|i| crate::hash::hash64(&i.to_le_bytes()))
+        .collect();
+    let locators: Vec<u64> = (0..n as u64).collect();
+    let bytes = builder
+        .build_from_hashes_with_values(&hashes, &locators)
+        .expect("retrieval build")
+        .to_wire_bytes();
+    assert_eq!(
+        bytes[crate::file::MAGIC_BYTES.len()],
+        3,
+        "retrieval filter_type tag must be 3",
+    );
+}
