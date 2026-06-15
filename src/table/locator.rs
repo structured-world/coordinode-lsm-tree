@@ -410,6 +410,27 @@ mod tests {
     }
 
     #[test]
+    fn build_skips_when_ribbon_cannot_satisfy_conflicting_values() {
+        // Two entries share a key hash but map to different locators, so the
+        // retrieval ribbon has no consistent solution. The build must fail
+        // gracefully and skip the section (the point read falls back to the
+        // index) rather than abort the SST.
+        let spec = LocatorSpec {
+            precision: LocatorPrecision::Restart,
+            block_id_bits: None,
+            slot_bits: None,
+        };
+        let mut entries: Vec<(u64, u64, u64)> =
+            (0..200u64).map(|i| (key_hash(i), i % 8, i % 4)).collect();
+        // Re-use entry 0's hash with a different (block_id, slot) → conflict.
+        entries.push((key_hash(0), 7, 3));
+        assert!(
+            build_locator_section(&entries, spec).is_none(),
+            "a conflicting hash collision must skip the section, not panic or abort",
+        );
+    }
+
+    #[test]
     fn locate_rejects_unknown_version() {
         // A header whose version byte is not the one this build writes is a
         // forward-incompatibility / corruption signal, surfaced as an error.
