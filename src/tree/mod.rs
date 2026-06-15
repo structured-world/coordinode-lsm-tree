@@ -1083,6 +1083,7 @@ impl Tree {
     pub(crate) fn scan_since_seqno_with<F>(
         &self,
         target_seqno: SeqNo,
+        block_skip: bool,
         resolve_indirection: F,
     ) -> crate::Result<alloc::vec::IntoIter<ScanSinceEvent>>
     where
@@ -1133,7 +1134,9 @@ impl Tree {
         for table in version.iter_tables() {
             // `scan_seqno_range` upper bound is exclusive; `end_seqno` is the
             // inclusive max, so add one (saturating for the MAX edge).
-            for entry in table.scan_seqno_range(target_seqno, end_seqno.saturating_add(1))? {
+            for entry in
+                table.scan_seqno_range(target_seqno, end_seqno.saturating_add(1), block_skip)?
+            {
                 events.push(Self::map_event(entry, version, &resolve_indirection)?);
             }
         }
@@ -1191,6 +1194,16 @@ impl Tree {
     /// blob resolution into [`ScanSinceEvent::Insert`] is provided by the
     /// blob-tree scan path, which owns the blob files.
     ///
+    /// # Corruption resilience
+    ///
+    /// The per-block seqno-bounds used for skipping live in the index block and
+    /// are covered by its XXH3-128 checksum (+ optional Page ECC), so a
+    /// corrupted bound is caught on read, not trusted. Even in the impossible
+    /// case of a fault bypassing those checks, a bad bound can only cause a
+    /// *missed* record, never a wrong one. Callers who want defense against that
+    /// hypothetical can use [`Self::scan_since_seqno_full_scan`], which reads
+    /// every block (slower, no skip).
+    ///
     /// # Panics
     ///
     /// Panics if the internal version-history lock is poisoned.
@@ -1206,7 +1219,42 @@ impl Tree {
         // A standard tree never stores blob-indirected values; the resolver
         // errors so an indirected entry (only reachable via a blob tree's inner
         // index) surfaces as a clear error rather than a wrong event.
-        self.scan_since_seqno_with(target_seqno, |_version, _entry| {
+        self.scan_since_seqno_with(target_seqno, true, |_version, _entry| {
+            Err(crate::Error::FeatureUnsupported(
+                "scan_since_seqno on KV-separated values requires the blob-tree scan path",
+            ))
+        })
+    }
+
+    /// Paranoid variant of [`Self::scan_since_seqno`] that disables the
+    /// per-block seqno-bounds skip: every data block is read and filtered per
+    /// entry, even on seqno-indexed SSTs.
+    ///
+    /// # When to use
+    ///
+    /// The fast [`Self::scan_since_seqno`] trusts each block's recorded
+    /// `[seqno_min, seqno_max]` to skip blocks that cannot hold a qualifying
+    /// record. Those bounds live inside the index block and are covered by its
+    /// XXH3-128 checksum (and optional Page ECC), so on-disk corruption is
+    /// caught on read, not silently trusted. This method exists for callers who
+    /// want defense even against a fault that somehow bypassed those checks: a
+    /// corrupted `seqno_max` can only ever cause a *missed* record (never a
+    /// wrong one), and a full scan cannot miss. It is slower (no skip), so
+    /// prefer [`Self::scan_since_seqno`] unless you specifically need this
+    /// guarantee.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal version-history lock is poisoned.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::scan_since_seqno`].
+    pub fn scan_since_seqno_full_scan(
+        &self,
+        target_seqno: SeqNo,
+    ) -> crate::Result<impl Iterator<Item = ScanSinceEvent> + use<>> {
+        self.scan_since_seqno_with(target_seqno, false, |_version, _entry| {
             Err(crate::Error::FeatureUnsupported(
                 "scan_since_seqno on KV-separated values requires the blob-tree scan path",
             ))

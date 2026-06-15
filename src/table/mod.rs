@@ -1130,13 +1130,20 @@ impl Table {
     /// Returns `Err` if reading the index or a data block fails.
     #[doc(hidden)]
     pub fn scan_since_seqno(&self, target_seqno: SeqNo) -> crate::Result<Vec<InternalValue>> {
-        self.scan_seqno_range(target_seqno, SeqNo::MAX)
+        self.scan_seqno_range(target_seqno, SeqNo::MAX, true)
     }
 
     /// Like [`Self::scan_since_seqno`] but also bounds the result above:
     /// collects entries whose global seqno is in `[target_seqno, end_seqno)`.
     /// The upper bound lets the tree-level scan pin a stable snapshot watermark
     /// so a concurrent write cannot leak in mid-scan.
+    ///
+    /// `block_skip` enables the per-block seqno-bounds optimization (skip data
+    /// blocks whose recorded `[seqno_min, seqno_max]` cannot overlap the
+    /// window). Pass `false` for a paranoid full scan that reads every block and
+    /// filters per entry, so even an undetected-corrupt seqno bound (one that
+    /// somehow slipped past the block XXH3 checksum) cannot cause a qualifying
+    /// record to be skipped.
     ///
     /// # Errors
     ///
@@ -1146,6 +1153,7 @@ impl Table {
         &self,
         target_seqno: SeqNo,
         end_seqno: SeqNo,
+        block_skip: bool,
     ) -> crate::Result<Vec<InternalValue>> {
         // Bulk-ingested tables store entries at LOCAL seqno coordinates with a
         // `global_seqno` offset; the on-disk seqno bounds and per-entry seqnos
@@ -1177,7 +1185,9 @@ impl Table {
             // Block-skip: a seqno-bounded entry whose (local) min exceeds the
             // upper bound, or whose (local) max is below the target, cannot
             // reference any qualifying record — skip the data-block read.
-            if let Some((seqno_min, seqno_max)) = handle.seqno_bounds()
+            // Disabled in paranoid full-scan mode (`block_skip == false`).
+            if block_skip
+                && let Some((seqno_min, seqno_max)) = handle.seqno_bounds()
                 && (seqno_max < local_target || seqno_min >= local_end)
             {
                 continue;

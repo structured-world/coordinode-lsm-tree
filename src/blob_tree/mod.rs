@@ -245,7 +245,7 @@ impl BlobTree {
         target_seqno: SeqNo,
     ) -> crate::Result<impl Iterator<Item = ScanSinceEvent> + use<>> {
         self.index
-            .scan_since_seqno_with(target_seqno, |version, entry| {
+            .scan_since_seqno_with(target_seqno, true, |version, entry| {
                 let seqno = entry.key.seqno;
                 let (key, value) = resolve_value_handle(
                     self.id(),

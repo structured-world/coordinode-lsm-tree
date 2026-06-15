@@ -345,3 +345,118 @@ fn scan_since_caught_up_target_returns_empty() -> lsm_tree::Result<()> {
     );
     Ok(())
 }
+
+// ---- Corruption matrix (#224) ---------------------------------------------
+
+/// The paranoid full-scan variant disables the per-block seqno-bounds skip but
+/// must return byte-identical results to the fast block-skip path. This proves
+/// the no-skip path is correct (and, by extension, that a hypothetical
+/// undetected-corrupt bound which made the fast path skip a block could only
+/// ever cause a missed record, which the full scan recovers).
+#[test]
+fn scan_since_full_scan_matches_block_skip() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let tree = open_tree(folder.path())?;
+    tree.update_runtime_config(|cfg| {
+        cfg.seqno_in_index = true;
+    })?;
+    for i in 0..500u64 {
+        tree.insert(format!("key{i:05}").as_bytes(), b"v", i);
+    }
+    tree.flush_active_memtable(0)?;
+
+    for target in [0u64, 123, 450, 499, 500] {
+        let fast: Vec<SeqNo> = events(&tree, target)?
+            .iter()
+            .map(ScanSinceEvent::seqno)
+            .collect();
+        let full: Vec<SeqNo> = tree
+            .scan_since_seqno_full_scan(target)?
+            .map(|e| e.seqno())
+            .collect();
+        assert_eq!(
+            fast, full,
+            "paranoid full scan must equal block-skip scan at target {target}",
+        );
+    }
+    Ok(())
+}
+
+/// A bit-flip in a seqno-bounded sub-index block (which stores the per-block
+/// `[seqno_min, seqno_max]`) must be caught by the index block's XXH3-128 on the
+/// scan's index walk, not silently trusted. Forces a partitioned index so
+/// `read_top_level_index_entries` yields the sub-index blocks that carry the
+/// bounds.
+#[test]
+fn scan_since_seqno_index_corruption_is_caught() -> lsm_tree::Result<()> {
+    use lsm_tree::config::{BlockSizePolicy, PinningPolicy};
+    use lsm_tree::inspect::read_top_level_index_entries;
+    use lsm_tree::runtime_config::RuntimeConfig;
+    use std::io::{Seek, Write};
+
+    // Runtime config at open: seqno bounds in the index + force the index to
+    // partition (zero spill threshold) so the bounds land in checksummed
+    // sub-index blocks.
+    let mut rc = RuntimeConfig::default();
+    rc.seqno_in_index = true;
+    rc.index_partition_spill_threshold = 0;
+
+    let folder = get_tmp_folder();
+    {
+        let any = Config::new(
+            folder.path(),
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .index_block_partitioning_policy(PinningPolicy::all(true))
+        .data_block_size_policy(BlockSizePolicy::all(256))
+        .with_runtime_config(rc)
+        .open()?;
+        let tree = match any {
+            AnyTree::Standard(t) => t,
+            AnyTree::Blob(_) => panic!("expected Standard tree"),
+        };
+        // Large corpus → many small data blocks → many index handles → multiple
+        // sub-index partitions (the partition budget is ~4 KiB).
+        for i in 0..30_000u64 {
+            tree.insert(format!("key{i:08}").as_bytes(), b"v", i);
+        }
+        tree.flush_active_memtable(0)?;
+    }
+
+    // Locate the single SST and a sub-index block to corrupt.
+    let sst = std::fs::read_dir(folder.path().join("tables"))
+        .expect("tables dir")
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .find(|p| p.is_file())
+        .expect("one SST file");
+    let tli = read_top_level_index_entries(&sst).expect("read top-level index");
+    assert!(
+        tli.len() > 1,
+        "test needs a partitioned index (>1 sub-index block), got {}",
+        tli.len(),
+    );
+    let victim = &tli[0];
+    {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&sst)
+            .expect("open sst");
+        f.seek(std::io::SeekFrom::Start(victim.offset))
+            .expect("seek");
+        f.write_all(&vec![0xFF; victim.size as usize])
+            .expect("flip");
+        f.sync_all().expect("sync");
+    }
+
+    // Reopen and scan: the corrupted sub-index block fails its checksum.
+    let tree = open_tree(folder.path())?;
+    let res: lsm_tree::Result<Vec<ScanSinceEvent>> =
+        tree.scan_since_seqno(0).map(Iterator::collect);
+    assert!(
+        res.is_err(),
+        "a corrupted seqno-bounded sub-index block must be caught by XXH3, not trusted",
+    );
+    Ok(())
+}
