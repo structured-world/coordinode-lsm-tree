@@ -431,6 +431,28 @@ mod tests {
     }
 
     #[test]
+    fn locate_does_not_panic_on_forged_slot_bits_64() {
+        // The writer never emits slot_bits == 64 (it enforces block_id_bits >= 1
+        // and r <= 64), but a checksum-surviving corruption could. The block-id
+        // extraction `packed >> slot_bits` must be guarded the same way the slot
+        // mask is: `>> 64` panics in debug and wraps to `>> 0` in release. locate
+        // must return without panicking for every key.
+        let spec = LocatorSpec {
+            precision: LocatorPrecision::Restart,
+            block_id_bits: None,
+            slot_bits: None,
+        };
+        let entries: Vec<(u64, u64, u64)> =
+            (0..100u64).map(|i| (key_hash(i), i % 8, i % 4)).collect();
+        let mut bytes = build_locator_section(&entries, spec).expect("section built");
+        bytes[3] = 64; // forge slot_bits = 64
+        for i in 0..100u64 {
+            // Decoded values may be garbage, but the shift must not panic.
+            let _ = locate(&bytes, key_hash(i)).expect("locate must not error");
+        }
+    }
+
+    #[test]
     fn locate_rejects_unknown_version() {
         // A header whose version byte is not the one this build writes is a
         // forward-incompatibility / corruption signal, surfaced as an error.
