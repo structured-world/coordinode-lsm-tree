@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1781499459829,
+  "lastUpdate": 1781536900557,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -16224,6 +16224,84 @@ window.BENCHMARK_DATA = {
             "value": 581802.9542365693,
             "unit": "ops/sec",
             "extra": "P50: 1.5us | P99: 4.8us | P99.9: 7.3us\nthreads: 1 | elapsed: 0.34s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "6f78f13531ed778789e79a0dd7eca18c4b977bdf",
+          "message": "feat(fs): no_std io_uring driver core on raw Linux syscalls (#471)\n\nFirst slices of #346 — a pure-Rust, `no_std` io_uring backend (the\nstd-bound `IoUringFs` wraps the `io-uring` crate, which pulls in `std`).\n\n## What this adds\n\n**Driver core** (`IoUringRaw`):\n- **`io-uring-raw` Cargo feature** (no `std` dep) + a Linux-target-gated\noptional `syscalls` dependency. The backend module is `cfg(all(target_os\n= \"linux\", feature = \"io-uring-raw\"))`, so enabling the feature on a\nnon-Linux target compiles to nothing.\n- `io_uring_setup` + `mmap` of the SQ/CQ rings and SQE array (both the\nsingle-mmap and separate-mmap kernel layouts), with RAII teardown\n(`munmap` + `close`) and a setup-time fd guard.\n- ABI structs (`io_uring_params`, SQ/CQ ring offsets, SQE, CQE)\ntranscribed from the stable kernel uapi; raw `errno` → the crate's\n`no_std` `ErrorKind`.\n- `submit_and_reap_one`: the full ring protocol — SQ-overflow guard\nagainst the kernel head, `io_uring_enter`, CQ-tail-checked reap with the\ncorrect Acquire/Release fences. Smoke-tested by an `IORING_OP_NOP`\nround-trip.\n\n**File I/O opcodes** on `IoUringRaw`:\n- `read_at` / `write_at` (`IORING_OP_READ` / `IORING_OP_WRITE`,\npositioned single-buffer I/O) and `fsync` (`IORING_OP_FSYNC` + optional\n`IORING_FSYNC_DATASYNC`).\n- `open_raw` / `close_raw` (`openat(AT_FDCWD, …)` / `close`) for the\none-shot control path, plus `O_*` flag constants.\n\nAlso pins this crate as a **standalone workspace root** (empty\n`[workspace]`): a bare clone inside another tree (e.g. a CI runner\nhosting a different workspace) was otherwise absorbed into the\nsurrounding workspace and failed `cargo metadata` before building.\n\n## Verification\n\n- Compiles on `x86_64-unknown-linux-gnu` under both `std` and\n`--no-default-features --features alloc,io-uring-raw`.\n- `thumbv7em-none-eabihf` no-std baseline unchanged (the feature is\nLinux-gated): 0 errors.\n- `cargo clippy` clean for the new module on x86_64-linux.\n- **All ring tests pass on a real Linux io_uring host** (kernel 7.0.11),\nfrom a pristine standalone clone: NOP round-trip + slot reuse, and a\nwrite → fsync → read round-trip at a non-zero offset (with an at-EOF\nread returning 0).\n\n## Follow-up slices (this epic)\n\n- `IoUringRawFs` / `IoUringRawFile` implementing `Fs` / `FsFile`.\n- The raw-syscall path operations the `Fs` trait needs beyond the ring\n(openat variants, statx, getdents64, unlinkat, renameat2, ftruncate,\nflock).\n- A CI job that builds + runs the `io-uring-raw` tests on the Linux\nrunner.\n\nPart of #346.",
+          "timestamp": "2026-06-15T18:20:27+03:00",
+          "tree_id": "b2deef1e6784a6ced604eaf5c29d5d5fcdf04af9",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/6f78f13531ed778789e79a0dd7eca18c4b977bdf"
+        },
+        "date": 1781536882797,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 2055049.2833185166,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.6us | P99.9: 3.7us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1229730.5133505724,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.2us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 745609.0820196683,
+            "unit": "ops/sec",
+            "extra": "P50: 1.2us | P99: 4.4us | P99.9: 6.9us\nthreads: 1 | elapsed: 0.27s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3727790.9630779643,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 3.1us | P99.9: 5.6us\nthreads: 1 | elapsed: 0.05s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 443338.40182916814,
+            "unit": "ops/sec",
+            "extra": "P50: 2.0us | P99: 5.3us | P99.9: 8.2us\nthreads: 1 | elapsed: 0.45s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 221939.88115581,
+            "unit": "ops/sec",
+            "extra": "P50: 4.1us | P99: 9.2us | P99.9: 11.6us\nthreads: 1 | elapsed: 0.90s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1257027.561856582,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.2us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1159024.70968242,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 1.5us | P99.9: 2.6us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 596592.7692061483,
+            "unit": "ops/sec",
+            "extra": "P50: 1.5us | P99: 5.8us | P99.9: 9.9us\nthreads: 1 | elapsed: 0.34s | num: 200000 | iterations: 3"
           }
         ]
       }
