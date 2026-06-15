@@ -90,8 +90,20 @@ impl SeqnoBoundsMap {
             Some(u64::from_le_bytes(b))
         }
 
+        // Each entry is exactly three u64s on the wire.
+        const ENTRY_SIZE: usize = 3 * core::mem::size_of::<u64>();
+
         let mut r = bytes;
         let count = read_u32(&mut r).ok_or(ERR)?;
+        // Reject a corrupt count BEFORE the speculative allocation below: a
+        // count claiming more entries than the remaining payload can hold is
+        // invalid, and validating it up front bounds `with_capacity` to the
+        // real payload size (so a corrupt count cannot trigger a multi-GB
+        // pre-allocation / OOM instead of a clean `InvalidHeader`).
+        match (count as usize).checked_mul(ENTRY_SIZE) {
+            Some(needed) if needed <= r.len() => {}
+            _ => return Err(ERR),
+        }
         let mut entries = Vec::with_capacity(count as usize);
         let mut prev: Option<u64> = None;
         for _ in 0..count {
@@ -106,6 +118,12 @@ impl SeqnoBoundsMap {
                 return Err(ERR);
             }
             entries.push((offset, (seqno_min, seqno_max)));
+        }
+        // The section must contain exactly `count` entries and nothing more:
+        // leftover bytes mean a wrong count or a corrupt / padded section, so
+        // reject them rather than silently accept a mis-sized parse.
+        if !r.is_empty() {
+            return Err(ERR);
         }
         Ok(Self { entries })
     }
