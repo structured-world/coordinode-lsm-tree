@@ -6,6 +6,7 @@ mod block_size;
 mod compression;
 mod filter;
 mod hash_ratio;
+mod locator;
 mod pinning;
 mod restart_interval;
 
@@ -13,6 +14,7 @@ pub use block_size::BlockSizePolicy;
 pub use compression::CompressionPolicy;
 pub use filter::{BloomConstructionPolicy, FilterPolicy, FilterPolicyEntry};
 pub use hash_ratio::HashRatioPolicy;
+pub use locator::{LocatorPolicy, LocatorPolicyEntry, LocatorPrecision};
 pub use pinning::PinningPolicy;
 pub use restart_interval::RestartIntervalPolicy;
 
@@ -467,6 +469,13 @@ pub struct Config {
     /// Filter construction policy
     pub filter_policy: FilterPolicy,
 
+    /// Retrieval-ribbon locator policy (per level). Defaults to
+    /// [`LocatorPolicy::block_level`]: written SSTs carry an optional `locator`
+    /// section mapping each key to its data block for O(1) point reads (skipping
+    /// the index-block binary search). Set [`LocatorPolicy::disabled`] to opt
+    /// out — disabled levels produce byte-identical SSTs (no section).
+    pub locator_policy: LocatorPolicy,
+
     /// Compaction filter factory
     pub compaction_filter_factory: Option<Arc<dyn Factory>>,
 
@@ -681,6 +690,7 @@ impl Default for Config {
 
             data_block_hash_ratio_policy: HashRatioPolicy::all(0.0),
 
+            locator_policy: LocatorPolicy::block_level(),
             filter_policy: FilterPolicy::all(FilterPolicyEntry::Bloom(
                 BloomConstructionPolicy::BitsPerKey(10.0),
             )),
@@ -1378,6 +1388,20 @@ impl Config {
     #[must_use]
     pub fn filter_policy(mut self, policy: FilterPolicy) -> Self {
         self.filter_policy = policy;
+        self
+    }
+
+    /// Sets the retrieval-ribbon locator policy.
+    ///
+    /// On by default at [`LocatorPrecision::Block`] (see
+    /// [`LocatorPolicy::block_level`]). When enabled for a level, written SSTs on
+    /// that level carry an optional `locator` section mapping each key to its
+    /// data block (and, at finer precisions, its slot), letting point reads skip
+    /// the index-block binary search. Set [`LocatorPolicy::disabled`] to opt out;
+    /// disabled levels emit byte-identical SSTs.
+    #[must_use]
+    pub fn locator_policy(mut self, policy: LocatorPolicy) -> Self {
+        self.locator_policy = policy;
         self
     }
 

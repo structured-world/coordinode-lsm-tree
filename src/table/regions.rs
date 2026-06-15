@@ -83,6 +83,11 @@ pub struct ParsedRegions {
     /// Present only when the table has at least one data block that compressed
     /// into >= 2 inner zstd blocks; powers range-query partial decode.
     pub block_layout: Option<BlockHandle>,
+    /// Optional retrieval-ribbon locator section (the `locator` section).
+    /// Present only when the level's locator policy is enabled and the per-SST
+    /// widths fit; maps each key to its data block and slot for O(1) point
+    /// reads. Absent on tables written without the locator feature.
+    pub locator: Option<BlockHandle>,
     pub linked_blob_files: Option<BlockHandle>,
     pub metadata: BlockHandle,
     /// Mid-file backup of the meta block. Writer order:
@@ -128,6 +133,10 @@ impl ParsedRegions {
                 .transpose()?,
             block_layout: toc
                 .section(b"block_layout")
+                .map(toc_entry_to_handle)
+                .transpose()?,
+            locator: toc
+                .section(b"locator")
                 .map(toc_entry_to_handle)
                 .transpose()?,
             linked_blob_files: toc
