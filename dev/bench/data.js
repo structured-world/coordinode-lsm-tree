@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1781485510285,
+  "lastUpdate": 1781499459829,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -16146,6 +16146,84 @@ window.BENCHMARK_DATA = {
             "value": 597934.6863564844,
             "unit": "ops/sec",
             "extra": "P50: 1.5us | P99: 5.0us | P99.9: 7.5us\nthreads: 1 | elapsed: 0.33s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "255865126+sw-release-bot[bot]@users.noreply.github.com",
+            "name": "sw-release-bot[bot]",
+            "username": "sw-release-bot[bot]"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "9b1eaf35df084af4693ba42f6136f2aa45d66af6",
+          "message": "chore: release v5.3.0 (#454)\n\n## 🤖 New release\n\n* `coordinode-lsm-tree`: 5.2.1 -> 5.3.0\n\n<details><summary><i><b>Changelog</b></i></summary><p>\n\n<blockquote>\n\n##\n[5.3.0](https://github.com/structured-world/coordinode-lsm-tree/compare/v5.2.1...v5.3.0)\n- 2026-06-15\n\n### Added\n\n- *(bench)* blob_tree (KV-separation) arm + read-gap attribution\n([#462](https://github.com/structured-world/coordinode-lsm-tree/pull/462))\n- *(bench)* RocksDbParity preset + Benchmark Symmetry Invariant\n([#461](https://github.com/structured-world/coordinode-lsm-tree/pull/461))\n- *(time)* injectable Clock trait + no-std-check as a required gate\n([#460](https://github.com/structured-world/coordinode-lsm-tree/pull/460))\n- *(tooling)* repair KV-separated (blob) trees\n([#459](https://github.com/structured-world/coordinode-lsm-tree/pull/459))\n- *(recovery)* cross-process directory lock for exclusive tree access\n([#458](https://github.com/structured-world/coordinode-lsm-tree/pull/458))\n- *(metrics)* unified ECC-recovery counters, wire SEC-DED reads\n([#457](https://github.com/structured-world/coordinode-lsm-tree/pull/457))\n- *(ecc)* patrol scrub for proactive latent-error correction\n([#456](https://github.com/structured-world/coordinode-lsm-tree/pull/456))\n\n### Documentation\n\n- *(compaction)* clarify major_compact watermark + clean subcompaction\nprofile\n([#467](https://github.com/structured-world/coordinode-lsm-tree/pull/467))\n\n### Performance\n\n- *(table)* cut point-read per-get overhead\n([#465](https://github.com/structured-world/coordinode-lsm-tree/pull/465))\n\n### Refactored\n\n- *(filter)* remove dead from-keys BuildHasher path from vendored ribbon\n([#455](https://github.com/structured-world/coordinode-lsm-tree/pull/455))\n</blockquote>\n\n\n</p></details>\n\n---\nThis PR was generated with\n[release-plz](https://github.com/release-plz/release-plz/).\n\nCo-authored-by: sw-release-bot[bot] <255865126+sw-release-bot[bot]@users.noreply.github.com>",
+          "timestamp": "2026-06-15T07:56:33+03:00",
+          "tree_id": "d2a5766d8db2fa77e05088f483c2bf04717c5a04",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/9b1eaf35df084af4693ba42f6136f2aa45d66af6"
+        },
+        "date": 1781499443062,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 2049414.0576626624,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.6us | P99.9: 3.7us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1170814.6649618123,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.2us | P99.9: 4.9us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 632023.657176388,
+            "unit": "ops/sec",
+            "extra": "P50: 1.4us | P99: 4.5us | P99.9: 7.7us\nthreads: 1 | elapsed: 0.32s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3607266.4414469865,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 3.1us | P99.9: 5.8us\nthreads: 1 | elapsed: 0.06s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 410205.1459726908,
+            "unit": "ops/sec",
+            "extra": "P50: 2.1us | P99: 5.6us | P99.9: 9.4us\nthreads: 1 | elapsed: 0.49s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 229041.27913974953,
+            "unit": "ops/sec",
+            "extra": "P50: 4.1us | P99: 5.1us | P99.9: 7.9us\nthreads: 1 | elapsed: 0.87s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1225948.6723365118,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.3us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1149159.4550734127,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 1.4us | P99.9: 2.8us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 581802.9542365693,
+            "unit": "ops/sec",
+            "extra": "P50: 1.5us | P99: 4.8us | P99.9: 7.3us\nthreads: 1 | elapsed: 0.34s | num: 200000 | iterations: 3"
           }
         ]
       }
