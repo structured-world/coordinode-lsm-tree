@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1781559445568,
+  "lastUpdate": 1781562965973,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -16770,6 +16770,84 @@ window.BENCHMARK_DATA = {
             "value": 702018.6627379175,
             "unit": "ops/sec",
             "extra": "P50: 1.3us | P99: 4.5us | P99.9: 6.9us\nthreads: 1 | elapsed: 0.28s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "aa002a2b76e54e4eb265ad8aec84061e7b014dac",
+          "message": "perf(table): expand leb128 decode as a macro at call sites (#478)\n\n## Summary\n\n`read_leb128` carried `#[inline]`, but the multi-byte continuation loop\nmade the body large enough that LLVM declined to inline it — so on the\npoint-read flamegraph it showed up as a **standalone hot self-time\nsymbol (~5%)**: every block-entry parse decodes several varints, and\neach paid a real function call.\n\nReplace the function with a `read_leb128!` macro that expands the whole\ndecode (single-byte fast path **and** the multi-byte continuation)\ninline at every call site. This removes the call for all cases and lets\nthe decode fuse with each caller's bounds checks and constants. The\nblock-entry parsers in `data_block` (×9) and\n`index_block::parse_restart_key` (×4) now invoke the macro; decode\nbehaviour (including the overlong-encoding reject) is unchanged.\n\n## Why a macro and not `#[inline(always)]`\n\n`#[inline]` is a hint LLVM can (and did) decline once the body grew past\nits threshold; a macro is textual expansion, so inlining is guaranteed.\nA naive hot/cold split (`#[inline(always)]` fast path + `#[cold]\n#[inline(never)]` multi-byte helper) is the wrong fix here: block\n**sizes** (e.g. 4096 → a 2-byte varint) and **offsets** are routinely\nmulti-byte on the read path, so outlining the multi-byte path would add\na call to the common case. The macro inlines every case, so there is no\nsuch penalty.\n\n## Mechanics\n\nThe macro is a block expression evaluating to `(u64, usize)`; `?` on the\nbounds-checked load and the overlong-encoding `return None` propagate to\nthe **enclosing** function, so every call site sits in a function\nreturning `Option` (all 13 do). A `#[cfg(test)] read_leb128_fn` keeps\nthe function form the overlong-reject unit test asserts on.\n\n## Proof\n\nMeasured on a Linux bench runner, **pinned to dedicated cores**\n(`taskset`) so a concurrent CI benchmark on other cores could not\ncontaminate it; criterion `--save-baseline`/`--baseline` back-to-back,\n10 s measurement:\n\n| group | baseline | macro | change |\n|-------|----------|-------|--------|\n| point_read/ours/1000 | 956.85 µs | **879.84 µs** | **−8.97%** (p <\n0.05) |\n| point_read/ours/10000 | 10.96 ms | **9.52 ms** | **−13.14%** (p <\n0.05, CI ±0.2%) |\n\nBoth report \"Performance has improved\". 1234/1234 lib tests + the 136\ndecode/point-read tests pass; clippy clean.",
+          "timestamp": "2026-06-16T01:34:56+03:00",
+          "tree_id": "e4cb5a091bad5e726560aa4eba4ecb869e7cbab3",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/aa002a2b76e54e4eb265ad8aec84061e7b014dac"
+        },
+        "date": 1781562944543,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 1995734.1780664083,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.6us | P99.9: 3.8us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1176487.1767044857,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.2us | P99.9: 4.6us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 900238.8198553254,
+            "unit": "ops/sec",
+            "extra": "P50: 0.9us | P99: 4.2us | P99.9: 7.1us\nthreads: 1 | elapsed: 0.22s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3720941.0319404835,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 3.1us | P99.9: 5.5us\nthreads: 1 | elapsed: 0.05s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 470639.97579197393,
+            "unit": "ops/sec",
+            "extra": "P50: 1.8us | P99: 5.2us | P99.9: 8.4us\nthreads: 1 | elapsed: 0.42s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 244592.47167241588,
+            "unit": "ops/sec",
+            "extra": "P50: 3.8us | P99: 4.8us | P99.9: 8.4us\nthreads: 1 | elapsed: 0.82s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1234674.6548635226,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.3us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1082660.6478529803,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.5us | P99.9: 2.5us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 708180.2645952677,
+            "unit": "ops/sec",
+            "extra": "P50: 1.2us | P99: 4.6us | P99.9: 7.1us\nthreads: 1 | elapsed: 0.28s | num: 200000 | iterations: 3"
           }
         ]
       }
