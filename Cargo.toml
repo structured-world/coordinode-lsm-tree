@@ -1,3 +1,17 @@
+# Standalone workspace root. This crate publishes to crates.io and is also
+# checked out as a subdirectory of larger trees (and CI runners that host other
+# workspaces). Declaring a workspace here pins it as its own root so Cargo never
+# absorbs it into a surrounding workspace — which would otherwise try to resolve
+# that workspace's path dependencies (absent in a standalone clone) and fail
+# before the build even starts.
+#
+# The `tools/*` crates are standalone binaries that build independently (they
+# pull in heavy, optional deps like librocksdb); they are NOT members of this
+# single-package workspace, so they are excluded — otherwise Cargo would treat
+# them as orphan members of this root and refuse to build.
+[workspace]
+exclude = ["tools/compare-rocksdb", "tools/db_bench", "tools/sst-dump"]
+
 [package]
 name = "coordinode-lsm-tree"
 description = "Embedded LSM-tree storage engine: BuRR filters, zstd dictionary compression, MVCC, range tombstones, merge operators, K/V separation, AES-256-GCM at rest."
@@ -66,6 +80,14 @@ alloc = []
 # no-std + alloc (tracked in the migration epic), the `std`
 # transitive dep can be lifted on a per-feature basis.
 io-uring = ["dep:io-uring", "std"]
+# Pure-Rust `no_std` io_uring backend on raw Linux syscalls (#346). Unlike
+# `io-uring` (the std-bound `io-uring` crate wrapper), this needs NO `std`: it
+# drives the kernel ring through the `syscalls` crate's raw `syscall!` and its
+# own mmap'd ring management, so a Linux no-std consumer gets kernel async I/O.
+# Linux-only by nature (io_uring is a Linux kernel API); the backend module is
+# additionally `cfg(target_os = "linux")`, so enabling this on a non-Linux
+# target compiles to nothing.
+io-uring-raw = ["dep:syscalls"]
 lz4 = ["dep:lz4_flex", "std"]
 # The previous `zstd-pure = ["zstd"]` alias was removed. It was
 # documented as deprecated when there were two candidate zstd backends
@@ -221,6 +243,11 @@ cpufeatures = "0.3"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = { version = "0.7", optional = true }
+# `#![no_std]` raw Linux syscall layer for the `io-uring-raw` backend (#346):
+# the `syscall!` macro + `Sysno` numbers for `io_uring_setup` / `io_uring_enter`
+# / `mmap` / `openat` / `close` etc. No libc, no std. Linux-target-gated since
+# io_uring is Linux-only.
+syscalls = { version = "0.8", optional = true, default-features = false }
 
 [target.'cfg(unix)'.dependencies]
 # Unix syscall surface that std does not expose:
