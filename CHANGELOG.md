@@ -11,6 +11,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [5.3.0](https://github.com/structured-world/coordinode-lsm-tree/compare/v5.2.1...v5.3.0) - 2026-06-15
+
+### Added
+
+- *(bench)* blob_tree (KV-separation) arm + read-gap attribution ([#462](https://github.com/structured-world/coordinode-lsm-tree/pull/462))
+- *(bench)* RocksDbParity preset + Benchmark Symmetry Invariant ([#461](https://github.com/structured-world/coordinode-lsm-tree/pull/461))
+- *(time)* injectable Clock trait + no-std-check as a required gate ([#460](https://github.com/structured-world/coordinode-lsm-tree/pull/460))
+- *(tooling)* repair KV-separated (blob) trees ([#459](https://github.com/structured-world/coordinode-lsm-tree/pull/459))
+- *(recovery)* cross-process directory lock for exclusive tree access ([#458](https://github.com/structured-world/coordinode-lsm-tree/pull/458))
+- *(metrics)* unified ECC-recovery counters, wire SEC-DED reads ([#457](https://github.com/structured-world/coordinode-lsm-tree/pull/457))
+- *(ecc)* patrol scrub for proactive latent-error correction ([#456](https://github.com/structured-world/coordinode-lsm-tree/pull/456))
+
+### Documentation
+
+- *(compaction)* clarify major_compact watermark + clean subcompaction profile ([#467](https://github.com/structured-world/coordinode-lsm-tree/pull/467))
+
+### Performance
+
+- *(table)* cut point-read per-get overhead ([#465](https://github.com/structured-world/coordinode-lsm-tree/pull/465))
+
+### Refactored
+
+- *(filter)* remove dead from-keys BuildHasher path from vendored ribbon ([#455](https://github.com/structured-world/coordinode-lsm-tree/pull/455))
+
 ## [5.2.1](https://github.com/structured-world/coordinode-lsm-tree/compare/v5.2.0...v5.2.1) - 2026-06-12
 
 ### Refactored
