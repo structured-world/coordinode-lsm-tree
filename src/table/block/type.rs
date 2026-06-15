@@ -45,8 +45,9 @@ pub enum BlockType {
     /// Absent unless the table has at least one such multi-inner-block block.
     BlockLayout,
     /// Optional per-table retrieval-ribbon locator section: maps each key to a
-    /// packed `(block_id, slot)` for O(1) point reads. Absent unless the level's
-    /// locator policy is enabled, so a default table gains no bytes.
+    /// packed `(block_id, slot)` for O(1) point reads. Present by default (block
+    /// precision); absent when the level's locator policy is disabled or the
+    /// per-SST ribbon could not be built.
     Locator,
 }
 

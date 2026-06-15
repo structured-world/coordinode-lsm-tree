@@ -39,8 +39,8 @@ pub enum LocatorPrecision {
 #[derive(Copy, Debug, Clone, PartialEq, Eq)]
 pub enum LocatorPolicyEntry {
     /// No locator section is built for this level. The point read uses the
-    /// sorted index, exactly as without the feature. This is the default and
-    /// produces byte-identical SSTs (no section, no padding).
+    /// sorted index, exactly as without the feature, producing byte-identical
+    /// SSTs (no section, no padding).
     None,
 
     /// Build a per-SST retrieval-ribbon locator section for this level.
@@ -63,10 +63,12 @@ pub enum LocatorPolicyEntry {
 /// Retrieval-ribbon locator policy.
 ///
 /// One [`LocatorPolicyEntry`] per LSM level (the last entry covers any deeper
-/// level). Off by default ([`Self::disabled`]); enabling it adds an optional,
-/// format-gated `locator` section to written SSTs so point reads can resolve a
-/// key to its data block and slot in O(1) via the retrieval ribbon, skipping
-/// both the index-block and in-block binary searches.
+/// level). Defaults to [`Self::block_level`]; the optional, format-gated
+/// `locator` section it adds to written SSTs lets a point read resolve a key to
+/// its data block in O(1) via the retrieval ribbon, skipping the index-block
+/// binary search. Finer precisions ([`LocatorPrecision::Restart`] /
+/// [`LocatorPrecision::Entry`]) also skip the in-block search; [`Self::disabled`]
+/// turns the section off entirely.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocatorPolicy(Vec<LocatorPolicyEntry>);
 
@@ -90,10 +92,29 @@ impl LocatorPolicy {
             .unwrap_or_else(|| self.last().copied().expect("policy should not be empty"))
     }
 
-    /// Disables the locator on every level (the default).
+    /// Disables the locator on every level.
     #[must_use]
     pub fn disabled() -> Self {
         Self::all(LocatorPolicyEntry::None)
+    }
+
+    /// Enables the locator at [`LocatorPrecision::Block`] on every level with
+    /// auto-sized widths (the default).
+    ///
+    /// Block precision is the cheapest tier: the ribbon stores only `block_id`
+    /// (no `slot`), so it is the narrowest ribbon to build and store while still
+    /// delivering the structural win — a point read resolves the data block in
+    /// O(1) and skips the index-block binary search (the costly part on
+    /// partitioned indexes), then does the existing in-block lookup. An SST
+    /// whose ribbon cannot be built simply omits the section and falls back to
+    /// the sorted index, so enabling this by default never risks a write.
+    #[must_use]
+    pub fn block_level() -> Self {
+        Self::all(LocatorPolicyEntry::Enabled {
+            precision: LocatorPrecision::Block,
+            block_id_bits: None,
+            slot_bits: None,
+        })
     }
 
     /// Uses the same locator entry on every level.
