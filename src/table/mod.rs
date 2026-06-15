@@ -1789,7 +1789,15 @@ impl Table {
         // ordinal → data-block-handle map (the index yields handles in key/write
         // order, which is the writer's block_id ordering). Only when the section
         // exists, so non-locator tables pay nothing.
-        let locator_index = if let Some(loc_handle) = regions.locator {
+        // Load the optional retrieval-ribbon locator as a BEST-EFFORT point-read
+        // accelerator: any failure (corrupt locator section, unexpected block
+        // type, or a corrupt sub-index block hit while walking the index to pair
+        // locators with their data-block handles) degrades to `None` rather than
+        // failing the table open. Point reads then use the sorted-index path,
+        // which isolates a corrupt sub-index partition to its own keys — so
+        // enabling the locator by default does NOT widen the blast radius of a
+        // partitioned-index corruption from "one partition" back to "whole SST".
+        let locator_index = regions.locator.and_then(|loc_handle| {
             let block = Block::from_file(
                 file_handle.as_ref(),
                 loc_handle,
@@ -1810,17 +1818,26 @@ impl Table {
                         t
                     }
                 },
-            )?;
+            )
+            .inspect_err(|e| {
+                log::warn!("retrieval-ribbon locator disabled: section load failed: {e:?}");
+            })
+            .ok()?;
             if block.header.block_type != BlockType::Locator {
-                return Err(crate::Error::InvalidTag((
-                    "BlockType",
-                    block.header.block_type.into(),
-                )));
+                log::warn!(
+                    "retrieval-ribbon locator disabled: unexpected block type {:?}",
+                    block.header.block_type
+                );
+                return None;
             }
             let blocks: Vec<BlockHandle> = block_index
                 .iter()
                 .map(|r| r.map(|kbh| *kbh.as_ref()))
-                .collect::<crate::Result<Vec<_>>>()?;
+                .collect::<crate::Result<Vec<_>>>()
+                .inspect_err(|e| {
+                    log::warn!("retrieval-ribbon locator disabled: index walk failed: {e:?}");
+                })
+                .ok()?;
             log::trace!(
                 "Loaded retrieval-ribbon locator over {} blocks",
                 blocks.len()
@@ -1828,9 +1845,7 @@ impl Table {
             Some(crate::table::locator::LoadedLocator::new(
                 block.data, blocks,
             ))
-        } else {
-            None
-        };
+        });
 
         log::debug!(
             "Recovered table #{} from {}",

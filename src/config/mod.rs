@@ -469,10 +469,11 @@ pub struct Config {
     /// Filter construction policy
     pub filter_policy: FilterPolicy,
 
-    /// Retrieval-ribbon locator policy (per level). Off by default; when
-    /// enabled, written SSTs carry an optional `locator` section that maps each
-    /// key to its data block and slot for O(1) point reads. Disabled levels
-    /// produce byte-identical SSTs (no section).
+    /// Retrieval-ribbon locator policy (per level). Defaults to
+    /// [`LocatorPolicy::block_level`]: written SSTs carry an optional `locator`
+    /// section mapping each key to its data block for O(1) point reads (skipping
+    /// the index-block binary search). Set [`LocatorPolicy::disabled`] to opt
+    /// out — disabled levels produce byte-identical SSTs (no section).
     pub locator_policy: LocatorPolicy,
 
     /// Compaction filter factory
@@ -689,7 +690,7 @@ impl Default for Config {
 
             data_block_hash_ratio_policy: HashRatioPolicy::all(0.0),
 
-            locator_policy: LocatorPolicy::disabled(),
+            locator_policy: LocatorPolicy::block_level(),
             filter_policy: FilterPolicy::all(FilterPolicyEntry::Bloom(
                 BloomConstructionPolicy::BitsPerKey(10.0),
             )),

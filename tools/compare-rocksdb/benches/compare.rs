@@ -367,7 +367,12 @@ fn apply_preset(config: Config, preset: Preset) -> Config {
             rc.manifest_kv_checksums = true;
             // `Config::page_ecc` is the separate tree-open gate for DATA-block
             // ECC (the runtime `page_ecc` above covers manifest blocks).
-            config.with_runtime_config(rc).page_ecc(false)
+            // The retrieval-ribbon locator is on by default (block precision);
+            // RocksDB has no equivalent, so parity disables it.
+            config
+                .with_runtime_config(rc)
+                .page_ecc(false)
+                .locator_policy(LocatorPolicy::disabled())
         }
         // Production defaults are exactly `RuntimeConfig::default()` + the
         // `Config` defaults, so leave the config untouched.
