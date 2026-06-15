@@ -1,3 +1,11 @@
+# Standalone workspace root. This crate publishes to crates.io and is also
+# checked out as a subdirectory of larger trees (and CI runners that host other
+# workspaces). Declaring an empty workspace here pins it as its own root so
+# Cargo never absorbs it into a surrounding workspace — which would otherwise
+# try to resolve that workspace's path dependencies (absent in a standalone
+# clone) and fail before the build even starts.
+[workspace]
+
 [package]
 name = "coordinode-lsm-tree"
 description = "Embedded LSM-tree storage engine: BuRR filters, zstd dictionary compression, MVCC, range tombstones, merge operators, K/V separation, AES-256-GCM at rest."
