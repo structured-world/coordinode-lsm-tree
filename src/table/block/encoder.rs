@@ -6,7 +6,7 @@ use super::{
     super::{
         block::binary_index::Builder as BinaryIndexBuilder,
         block::hash_index::{Builder as HashIndexBuilder, MAX_POINTERS_FOR_HASH_INDEX},
-        util::longest_shared_prefix_length,
+        util::{LspKernel, resolve_lsp_kernel},
     },
     Trailer,
 };
@@ -76,6 +76,11 @@ pub struct Encoder<'a, Context: Default, Item: Encodable<Context>> {
     pub(crate) hash_index_builder: HashIndexBuilder,
 
     base_key: &'a [u8],
+
+    /// Longest-shared-prefix kernel resolved once at construction so the
+    /// per-item `write` loop calls the selected SIMD kernel directly without
+    /// re-running CPU-feature detection on every truncated entry.
+    lsp: LspKernel,
 }
 
 // TODO: support no binary index -> use in meta blocks with restart interval = 1
@@ -109,6 +114,10 @@ impl<'a, Context: Default, Item: Encodable<Context>> Encoder<'a, Context, Item> 
             hash_index_builder,
 
             base_key: first_key,
+
+            // Resolve the SIMD kernel once here, at the entry to the per-item
+            // encode loop, rather than detecting CPU features on every call.
+            lsp: resolve_lsp_kernel(),
         }
     }
 
@@ -141,7 +150,10 @@ impl<'a, Context: Default, Item: Encodable<Context>> Encoder<'a, Context, Item> 
 
             self.base_key = item.key();
         } else {
-            let shared_prefix_len = longest_shared_prefix_length(self.base_key, item.key());
+            // SAFETY: `self.lsp` was produced by `resolve_lsp_kernel` on this
+            // same host, so its required CPU feature is present (or it is the
+            // scalar kernel); the call cannot execute an unsupported instruction.
+            let shared_prefix_len = unsafe { (self.lsp)(self.base_key, item.key()) };
             item.encode_truncated_into(&mut *self.writer, &mut self.state, shared_prefix_len)?;
         }
 
