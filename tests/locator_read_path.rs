@@ -119,3 +119,58 @@ fn locator_precisions_match_index_path() {
     // Absent key → None.
     assert_eq!(on.get(key_of(N + 50), SeqNo::MAX).expect("get"), None);
 }
+
+/// A corrupt on-disk locator section must NOT fail table open: the loader is
+/// best-effort, so it degrades the section to `None` and every point read still
+/// returns the right answer via the sorted-index fallback. Exercises the
+/// section-load failure branch of the locator open path.
+#[test]
+fn corrupt_locator_section_degrades_to_index_fallback() {
+    use std::io::{Seek, SeekFrom, Write};
+
+    let (folder, tree) = build(Some(LocatorPrecision::Block));
+    let baseline = answers(&tree);
+
+    let lsm_tree::AnyTree::Standard(std_tree) = &tree else {
+        panic!("expected a standard tree");
+    };
+    let (sst_path, offset, size) = {
+        let version = std_tree.current_version();
+        let table = version
+            .iter_tables()
+            .next()
+            .expect("corpus compacts to a single SST");
+        let loc = table
+            .regions
+            .locator
+            .expect("a default Block-precision SST carries a locator section");
+        (table.path.as_ref().clone(), *loc.offset(), loc.size())
+    };
+    drop(tree);
+
+    // Overwrite the locator section so its block checksum no longer matches.
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&sst_path)
+        .expect("open SST for corruption");
+    f.seek(SeekFrom::Start(offset)).expect("seek");
+    f.write_all(&vec![0xFF; size as usize]).expect("corrupt");
+    f.sync_all().expect("sync");
+    drop(f);
+
+    // Reopen: the table must still open (no hard failure on the corrupt
+    // section), and answers must match the pre-corruption baseline.
+    let reopened = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .data_block_size_policy(lsm_tree::config::BlockSizePolicy::all(4_096))
+    .open()
+    .expect("reopen must succeed despite a corrupt locator section");
+    assert_eq!(
+        answers(&reopened),
+        baseline,
+        "index fallback must return identical answers after locator degrades",
+    );
+}

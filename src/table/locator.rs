@@ -226,7 +226,16 @@ pub fn locate(section: &[u8], hash: u64) -> crate::Result<Option<(u64, u64)>> {
     } else {
         (1u64 << slot_bits) - 1
     };
-    Ok(Some((packed >> slot_bits, packed & slot_mask)))
+    // Guard the block-id shift the same way the mask is guarded: `packed >> 64`
+    // panics in debug and wraps to `>> 0` in release. A valid section always has
+    // `slot_bits <= 63`, so this only matters for a checksum-surviving corruption
+    // — but it keeps both extractions consistent and panic-free.
+    let block_id = if slot_bits >= 64 {
+        0
+    } else {
+        packed >> slot_bits
+    };
+    Ok(Some((block_id, packed & slot_mask)))
 }
 
 /// A loaded `locator` section ready for point-read resolution: the framed
@@ -377,5 +386,91 @@ mod tests {
                 Some((i % 1000, i % 4000))
             );
         }
+    }
+
+    #[test]
+    fn block_precision_section_round_trips_block_id_only() {
+        // Block precision is the default: `slot` is dropped (locator = block_id),
+        // so every key resolves to (block_id, 0). Covers the `block_only` build
+        // path and a zero-width slot decode.
+        let spec = LocatorSpec {
+            precision: LocatorPrecision::Block,
+            block_id_bits: None,
+            slot_bits: None,
+        };
+        let entries: Vec<(u64, u64, u64)> =
+            (0..300u64).map(|i| (key_hash(i), i % 12, i % 25)).collect();
+        let bytes = build_locator_section(&entries, spec).expect("section built");
+        assert_eq!(bytes[3], 0, "block precision must record slot_bits = 0");
+        for i in 0..300u64 {
+            assert_eq!(
+                locate(&bytes, key_hash(i)).unwrap(),
+                Some((i % 12, 0)),
+                "key {i} must resolve to its block with slot 0",
+            );
+        }
+    }
+
+    #[test]
+    fn locate_rejects_truncated_section() {
+        // A section shorter than the fixed header cannot be parsed.
+        let err = locate(&[0u8; SECTION_HEADER_LEN - 1], 123).unwrap_err();
+        assert!(matches!(err, crate::Error::InvalidHeader("LocatorSection")));
+    }
+
+    #[test]
+    fn build_skips_when_ribbon_cannot_satisfy_conflicting_values() {
+        // Two entries share a key hash but map to different locators, so the
+        // retrieval ribbon has no consistent solution. The build must fail
+        // gracefully and skip the section (the point read falls back to the
+        // index) rather than abort the SST.
+        let spec = LocatorSpec {
+            precision: LocatorPrecision::Restart,
+            block_id_bits: None,
+            slot_bits: None,
+        };
+        let mut entries: Vec<(u64, u64, u64)> =
+            (0..200u64).map(|i| (key_hash(i), i % 8, i % 4)).collect();
+        // Re-use entry 0's hash with a different (block_id, slot) → conflict.
+        entries.push((key_hash(0), 7, 3));
+        assert!(
+            build_locator_section(&entries, spec).is_none(),
+            "a conflicting hash collision must skip the section, not panic or abort",
+        );
+    }
+
+    #[test]
+    fn locate_does_not_panic_on_forged_slot_bits_64() {
+        // The writer never emits slot_bits == 64 (it enforces block_id_bits >= 1
+        // and r <= 64), but a checksum-surviving corruption could. The block-id
+        // extraction `packed >> slot_bits` must be guarded the same way the slot
+        // mask is: `>> 64` panics in debug and wraps to `>> 0` in release. locate
+        // must return without panicking for every key.
+        let spec = LocatorSpec {
+            precision: LocatorPrecision::Restart,
+            block_id_bits: None,
+            slot_bits: None,
+        };
+        let entries: Vec<(u64, u64, u64)> =
+            (0..100u64).map(|i| (key_hash(i), i % 8, i % 4)).collect();
+        let mut bytes = build_locator_section(&entries, spec).expect("section built");
+        bytes[3] = 64; // forge slot_bits = 64
+        for i in 0..100u64 {
+            // Decoded values may be garbage, but the shift must not panic.
+            let _ = locate(&bytes, key_hash(i)).expect("locate must not error");
+        }
+    }
+
+    #[test]
+    fn locate_rejects_unknown_version() {
+        // A header whose version byte is not the one this build writes is a
+        // forward-incompatibility / corruption signal, surfaced as an error.
+        let mut section = [0u8; SECTION_HEADER_LEN];
+        section[0] = SECTION_VERSION.wrapping_add(1);
+        let err = locate(&section, 123).unwrap_err();
+        assert!(matches!(
+            err,
+            crate::Error::InvalidHeader("LocatorSection version")
+        ));
     }
 }
