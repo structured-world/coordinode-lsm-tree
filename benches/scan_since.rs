@@ -49,6 +49,37 @@ fn build_tree(seqno_in_index: bool, n: u64) -> (TempDir, Tree) {
     (dir, tree)
 }
 
+/// Run `iters` timed invocations of `op` for Criterion's `iter_custom`, also
+/// recording each op's individual latency and printing P99/P999 to stderr.
+///
+/// Aggregate throughput still comes from Criterion's own statistics over the
+/// returned total; the per-op tail percentiles surface latency regressions that
+/// a central-tendency-only view would hide. stderr keeps the line out of
+/// Criterion's stdout report.
+fn timed_with_tail<F: FnMut()>(label: &str, iters: u64, mut op: F) -> std::time::Duration {
+    use std::time::Instant;
+    let mut samples = Vec::with_capacity(iters as usize);
+    let started = Instant::now();
+    for _ in 0..iters {
+        let t0 = Instant::now();
+        op();
+        samples.push(t0.elapsed());
+    }
+    let total = started.elapsed();
+    if !samples.is_empty() {
+        samples.sort_unstable();
+        let pct =
+            |per_mille: usize| samples[(samples.len() * per_mille / 1000).min(samples.len() - 1)];
+        eprintln!(
+            "{label}: p50={:?} p99={:?} p999={:?}",
+            pct(500),
+            pct(990),
+            pct(999)
+        );
+    }
+    total
+}
+
 /// Sparse-changes scan: target near the top of the seqno range so only ~1% of
 /// entries qualify. With `seqno_in_index = true` the scan skips data blocks
 /// whose `seqno_max < target`; with it off, every block is read and filtered.
@@ -69,9 +100,11 @@ fn bench_scan_since_sparse(c: &mut Criterion) {
             "seqno_index_off"
         };
         group.bench_function(label, |b| {
-            b.iter(|| {
-                let c = tree.scan_since_seqno(target).expect("scan").count();
-                std::hint::black_box(c);
+            b.iter_custom(|iters| {
+                timed_with_tail(label, iters, || {
+                    let c = tree.scan_since_seqno(target).expect("scan").count();
+                    std::hint::black_box(c);
+                })
             });
         });
     }
@@ -90,9 +123,11 @@ fn bench_write_throughput(c: &mut Criterion) {
             "seqno_index_off"
         };
         group.bench_function(label, |b| {
-            b.iter(|| {
-                let (dir, _tree) = build_tree(on, n);
-                std::hint::black_box(&dir);
+            b.iter_custom(|iters| {
+                timed_with_tail(label, iters, || {
+                    let (dir, _tree) = build_tree(on, n);
+                    std::hint::black_box(&dir);
+                })
             });
         });
     }
@@ -123,11 +158,13 @@ fn bench_point_lookup(c: &mut Criterion) {
         };
         group.bench_function(label, |b| {
             let mut i = 0usize;
-            b.iter(|| {
-                let key = &keys[i % keys.len()];
-                i = i.wrapping_add(1);
-                let v = tree.get(key, SeqNo::MAX).expect("get");
-                std::hint::black_box(v);
+            b.iter_custom(|iters| {
+                timed_with_tail(label, iters, || {
+                    let key = &keys[i % keys.len()];
+                    i = i.wrapping_add(1);
+                    let v = tree.get(key, SeqNo::MAX).expect("get");
+                    std::hint::black_box(v);
+                })
             });
         });
     }
