@@ -307,15 +307,15 @@ impl Decodable<IndexBlockParsedItem> for KeyedBlockHandle {
         // restart-table navigation: read_leb128 rejects an overlong offset,
         // and the size must fit u32 exactly as `parse_full` / `parse_truncated`
         // require.
-        let (_file_offset, np) = read_leb128(buf, pos)?;
+        let (_file_offset, np) = read_leb128!(buf, pos);
         pos = np;
-        let (size, np) = read_leb128(buf, pos)?;
+        let (size, np) = read_leb128!(buf, pos);
         u32::try_from(size).ok()?;
         pos = np;
-        let (seqno, np) = read_leb128(buf, pos)?;
+        let (seqno, np) = read_leb128!(buf, pos);
         pos = np;
 
-        let (key_len_raw, np) = read_leb128(buf, pos)?;
+        let (key_len_raw, np) = read_leb128!(buf, pos);
         pos = np;
         // key_len is encoded as a u16 varint on the wire; reject an overlong
         // value exactly as `read_u16_varint` did.
