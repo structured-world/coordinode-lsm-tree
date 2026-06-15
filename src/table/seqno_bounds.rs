@@ -36,18 +36,32 @@ use crate::SeqNo;
 /// Serialize the per-data-block seqno bounds into the `seqno_bounds` section.
 /// `bounds[i]` is `(block_offset, (seqno_min, seqno_max))` for one data block,
 /// in write (ascending-offset) order.
-pub fn encode_seqno_bounds(out: &mut Vec<u8>, bounds: &[(BlockOffset, (SeqNo, SeqNo))]) {
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "data-block count is bounded well within u32"
-    )]
-    let count = bounds.len() as u32;
+///
+/// # Errors
+///
+/// Returns [`crate::Error::InvalidHeader`] if the block count does not fit the
+/// `u32` section-header width. Validating at encode time fails fast at the
+/// source rather than deferring detection to the decoder.
+pub fn encode_seqno_bounds(
+    out: &mut Vec<u8>,
+    bounds: &[(BlockOffset, (SeqNo, SeqNo))],
+) -> crate::Result<()> {
+    let count =
+        u32::try_from(bounds.len()).map_err(|_| crate::Error::InvalidHeader("SeqnoBounds"))?;
     out.extend_from_slice(&count.to_le_bytes());
     for (offset, (seqno_min, seqno_max)) in bounds {
+        // Write-side invariant: a block's bounds must be ordered. Asserted here
+        // (debug builds) so a writer bug surfaces at its source, in addition to
+        // the decoder's runtime check that catches it at open time.
+        debug_assert!(
+            seqno_min <= seqno_max,
+            "seqno bounds inverted: min {seqno_min} > max {seqno_max}"
+        );
         out.extend_from_slice(&offset.0.to_le_bytes());
         out.extend_from_slice(&seqno_min.to_le_bytes());
         out.extend_from_slice(&seqno_max.to_le_bytes());
     }
+    Ok(())
 }
 
 /// Decoded `seqno_bounds` section: a lookup from a data block's file offset to
@@ -165,7 +179,7 @@ mod tests {
             (BlockOffset(9000), (0, 1_000_000)),
         ];
         let mut buf = Vec::new();
-        encode_seqno_bounds(&mut buf, &bounds);
+        encode_seqno_bounds(&mut buf, &bounds).expect("encode");
         let map = SeqnoBoundsMap::decode(&buf).expect("decode");
         assert_eq!(map.len(), 3);
         assert_eq!(map.bounds_for(0), Some((10, 20)));
@@ -179,7 +193,7 @@ mod tests {
     #[test]
     fn decode_empty_section_is_empty_map() {
         let mut buf = Vec::new();
-        encode_seqno_bounds(&mut buf, &[]);
+        encode_seqno_bounds(&mut buf, &[]).expect("encode");
         let map = SeqnoBoundsMap::decode(&buf).expect("decode empty");
         assert!(map.is_empty());
         assert_eq!(map.bounds_for(0), None);
@@ -221,7 +235,7 @@ mod tests {
         // silently parsed with the wrong length: leftover data means a wrong
         // count or a corrupt / padded section, so it must surface as an error.
         let mut buf = Vec::new();
-        encode_seqno_bounds(&mut buf, &[(BlockOffset(0), (1u64, 2u64))]);
+        encode_seqno_bounds(&mut buf, &[(BlockOffset(0), (1u64, 2u64))]).expect("encode");
         buf.push(0xAB); // one stray trailing byte
         assert!(SeqnoBoundsMap::decode(&buf).is_err());
     }

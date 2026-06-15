@@ -1239,7 +1239,7 @@ impl Writer {
             crate::table::seqno_bounds::encode_seqno_bounds(
                 &mut self.block_buffer,
                 &self.seqno_bounds_section,
-            );
+            )?;
             Block::write_into(
                 &mut self.file_writer,
                 &self.block_buffer,
