@@ -160,6 +160,75 @@ impl BurrFilter {
         }
         false
     }
+
+    /// Recover the r-bit value stored for `hash` in a *retrieval* BuRR
+    /// (one built via [`BurrBuilder::build_from_hashes_with_values`]).
+    ///
+    /// For a key in the built set this returns its exact stored value
+    /// (`Some(locator)`); for an absent key it returns an unspecified r-bit
+    /// value, so the caller must verify the key at the located slot to reject
+    /// absent keys — the locate step subsumes the membership probe. Returns
+    /// `None` only if no layer can answer (every layer bumps the key), which
+    /// a well-formed build never produces since the final layer accepts all.
+    ///
+    /// [`BurrBuilder::build_from_hashes_with_values`]: super::builder::BurrBuilder::build_from_hashes_with_values
+    #[inline]
+    #[must_use]
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "Same bounds invariant as `contains_hash`: start ∈ [0, m-w] and every set-bit \
+                  offset ∈ [0, w-1], so `z_words[start + offset]` is `< m = z_words.len()`. A \
+                  per-row `.get()` would add a branch on the locate hot path."
+    )]
+    pub fn recover_value(&self, hash: u64) -> Option<u64> {
+        debug_assert!(self.params.r <= 64, "BuRR params pin r <= 64");
+        let value_mask = if self.params.r == 64 {
+            u64::MAX
+        } else {
+            (1u64 << self.params.r) - 1
+        };
+        let mut fingerprint_buf = [0_u64; 1];
+        for layer in &self.layers {
+            let layer_params = match Params::new(
+                layer.m,
+                usize::from(self.params.w),
+                usize::from(self.params.r),
+                Mode::Standard,
+            ) {
+                Ok(p) => p.with_seed(layer.seed),
+                // Layer params were valid at build time → unreachable.
+                Err(_) => return None,
+            };
+
+            fingerprint_buf[0] = 0;
+            let equation =
+                standard_equation_from_hash(hash, layer.seed, &layer_params, &mut fingerprint_buf);
+
+            // The first layer that does NOT bump this key is the layer that
+            // holds it (the builder kept it at exactly that layer). Same
+            // routing as `contains_hash`.
+            if is_bumped(&equation, &layer.thresholds, self.params.b) {
+                continue;
+            }
+
+            // GF(2) XOR-reduce recovers the stored RHS = the locator.
+            let z_words = layer.ribbon.z_raw_words();
+            let mut acc: u64 = 0;
+            let mut lo = equation.coeff_lo;
+            while lo != 0 {
+                let offset = lo.trailing_zeros() as usize;
+                acc ^= z_words[equation.start + offset];
+                lo &= lo - 1;
+            }
+            debug_assert_eq!(
+                equation.coeff_hi, 0,
+                "BuRR builds with w <= 64; coeff_hi must be 0",
+            );
+
+            return Some(acc & value_mask);
+        }
+        None
+    }
 }
 
 impl core::fmt::Debug for BurrFilter {
