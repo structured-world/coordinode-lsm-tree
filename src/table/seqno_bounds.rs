@@ -196,4 +196,29 @@ mod tests {
         let buf = 1u32.to_le_bytes().to_vec();
         assert!(SeqnoBoundsMap::decode(&buf).is_err());
     }
+
+    #[test]
+    fn decode_rejects_trailing_bytes_after_last_entry() {
+        // A section with bytes past the declared entries must be rejected, not
+        // silently parsed with the wrong length: leftover data means a wrong
+        // count or a corrupt / padded section, so it must surface as an error.
+        let mut buf = Vec::new();
+        encode_seqno_bounds(&mut buf, &[(BlockOffset(0), (1u64, 2u64))]);
+        buf.push(0xAB); // one stray trailing byte
+        assert!(SeqnoBoundsMap::decode(&buf).is_err());
+    }
+
+    #[test]
+    fn decode_rejects_count_larger_than_payload() {
+        // A corrupt count must be rejected up front, before any speculative
+        // allocation sized by that count: each entry is exactly 24 bytes, so a
+        // count claiming far more entries than the payload can hold is invalid.
+        // (The pathological multi-GB count that would OOM the old `with_capacity`
+        // cannot itself be unit-tested without risking an allocator abort; this
+        // guards the same contract with a count the decoder must reject fast.)
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&100_000u32.to_le_bytes()); // claims 100k entries
+        buf.extend_from_slice(&0u64.to_le_bytes()); // ...but only 8 stray bytes
+        assert!(SeqnoBoundsMap::decode(&buf).is_err());
+    }
 }
