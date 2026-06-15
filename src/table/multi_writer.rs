@@ -106,9 +106,9 @@ pub struct MultiWriter {
     )>,
 
     /// `seqno_in_index` runtime config — preserved here so the rotation
-    /// path stamps the same index format on every successor [`Writer`],
-    /// keeping all SSTs of one flush / compaction at a uniform
-    /// `index_format`.
+    /// path sets the same flag on every successor [`Writer`], so all SSTs
+    /// of one flush / compaction uniformly emit (or omit) the `seqno_bounds`
+    /// section.
     use_seqno_in_index: bool,
 
     /// When `true`, each output SST has per-file copy-on-write cleared at
@@ -539,7 +539,7 @@ impl MultiWriter {
 
     /// Wires the `seqno_in_index` runtime config through to the inner
     /// [`Writer`] and preserves it across rotations so every successor
-    /// writer stamps the same `index_format` on its index entries.
+    /// writer emits a matching `seqno_bounds` section.
     #[must_use]
     pub fn use_seqno_in_index(mut self, seqno_in_index: bool) -> Self {
         self.use_seqno_in_index = seqno_in_index;

@@ -49,6 +49,11 @@ pub enum BlockType {
     /// precision); absent when the level's locator policy is disabled or the
     /// per-SST ribbon could not be built.
     Locator,
+    /// Optional per-table seqno-bounds section: maps each data block's file
+    /// offset to its `[seqno_min, seqno_max]`, powering the `scan_since_seqno`
+    /// block-skip without bloating the index entries. Absent unless
+    /// `seqno_in_index` is on.
+    SeqnoBounds,
 }
 
 // Wire tags are renumbered contiguously `0..=6` for V5. The previous
@@ -71,6 +76,7 @@ impl From<BlockType> for u8 {
             BlockType::ManifestFooter => 6,
             BlockType::BlockLayout => 7,
             BlockType::Locator => 8,
+            BlockType::SeqnoBounds => 9,
         }
     }
 }
@@ -89,6 +95,7 @@ impl TryFrom<u8> for BlockType {
             6 => Ok(Self::ManifestFooter),
             7 => Ok(Self::BlockLayout),
             8 => Ok(Self::Locator),
+            9 => Ok(Self::SeqnoBounds),
             _ => Err(crate::Error::InvalidTag(("BlockType", value))),
         }
     }
@@ -116,6 +123,7 @@ mod tests {
             (6, BlockType::ManifestFooter),
             (7, BlockType::BlockLayout),
             (8, BlockType::Locator),
+            (9, BlockType::SeqnoBounds),
         ] {
             assert_eq!(
                 u8::from(variant),
@@ -134,9 +142,9 @@ mod tests {
     fn block_type_rejects_unknown_wire_tag() {
         // Forward-incompatibility guard: a tag this build doesn't know
         // (newer writer, older reader) must surface as a typed error,
-        // not a silent coercion to a known variant. 9 is the first
+        // not a silent coercion to a known variant. 10 is the first
         // unused tag past the contiguous range.
-        assert!(BlockType::try_from(9).is_err());
+        assert!(BlockType::try_from(10).is_err());
         assert!(BlockType::try_from(255).is_err());
     }
 }
