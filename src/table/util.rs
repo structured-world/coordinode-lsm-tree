@@ -499,6 +499,22 @@ fn reread_block_is_corrected(
     ))
 }
 
+// Cached, `no_std`-friendly CPU-feature tokens for the SIMD dispatch below.
+// `cpufeatures::new!` generates a module whose `get()` runs CPUID once (atomic
+// load thereafter) AND verifies OS AVX-state enablement via XCR0, so the AVX
+// paths cannot SIGILL on a CPU/OS that does not actually support them. These
+// work identically under `std` and `no_std` — which is why the dispatch is no
+// longer `std`-gated and `no_std` x86 builds keep the wide SIMD lanes instead
+// of dropping to the scalar tail.
+#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+cpufeatures::new!(cpu_avx512bw, "avx512bw");
+#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+cpufeatures::new!(cpu_avx2, "avx2");
+// SSE2 is the mandatory `x86_64` ISA baseline, so it is only runtime-detected on
+// 32-bit x86 (pre-Pentium-4 may lack it); `x86_64` takes the SSE2 arm directly.
+#[cfg(target_arch = "x86")]
+cpufeatures::new!(cpu_sse2, "sse2");
+
 /// Returns the length of the longest shared byte prefix of `s1` and `s2`.
 ///
 /// This is on the hot path of block encoding during flush and compaction —
@@ -519,69 +535,87 @@ fn reread_block_is_corrected(
 ///   targets and `leading_zeros() / 8` on big-endian, so the byte ordering of the word matches
 ///   the byte ordering of the source slice on either endianness.
 ///
-/// `is_x86_feature_detected!` caches the CPUID result, so the per-call dispatch
-/// cost is one to three cached atomic loads on x86 (one for AVX-512 hosts; more for
-/// narrower hosts that fail the wider checks before taking their lane).
+/// CPU-feature detection is cached (one CPUID on first call via `cpufeatures`,
+/// an atomic load thereafter) and works under `no_std`, so the per-call dispatch
+/// cost is one to three cached atomic loads on x86 and the wide lanes are taken
+/// on capable hosts regardless of whether the `std` feature is enabled.
+///
+/// This convenience wrapper resolves the kernel on every call. In a hot loop,
+/// resolve once with [`resolve_lsp_kernel`] at loop entry and call the returned
+/// pointer per item so feature detection does not run per comparison.
 #[must_use]
 pub fn longest_shared_prefix_length(s1: &[u8], s2: &[u8]) -> usize {
-    // std-gated: `is_x86_feature_detected!` is std-only. Under no_std the
-    // scalar tail handles x86.
-    #[cfg(all(feature = "std", target_arch = "x86_64"))]
+    // SAFETY: `resolve_lsp_kernel` only returns a kernel whose required CPU
+    // feature it has just verified present on this host (or the always-safe
+    // scalar kernel), so invoking it on this same host cannot execute an
+    // unsupported instruction.
+    unsafe { resolve_lsp_kernel()(s1, s2) }
+}
+
+/// Function-pointer type for the longest-shared-prefix kernel.
+///
+/// `unsafe` because the SIMD kernels require their target CPU feature to be
+/// present; [`resolve_lsp_kernel`] only ever hands back a pointer whose feature
+/// it verified (or the always-safe scalar kernel), so a caller invoking the
+/// returned pointer on the same host upholds that contract.
+pub type LspKernel = unsafe fn(&[u8], &[u8]) -> usize;
+
+/// Resolves the best longest-shared-prefix kernel for the current CPU **once**
+/// and returns it as a function pointer.
+///
+/// Call this at the entry to a hot loop (e.g. when a block encoder is built) and
+/// invoke the returned pointer per item, so CPU-feature detection runs a single
+/// time instead of on every comparison. Selection order matches
+/// [`longest_shared_prefix_length`]: AVX-512BW, then AVX2, then SSE2 (the
+/// `x86_64` baseline; runtime-detected on 32-bit `x86`), then NEON on LE
+/// `aarch64`, then the portable scalar kernel.
+#[must_use]
+pub fn resolve_lsp_kernel() -> LspKernel {
+    #[cfg(target_arch = "x86_64")]
     {
-        if std::is_x86_feature_detected!("avx512bw") {
-            // SAFETY: AVX-512BW availability just verified via runtime CPU feature detection.
-            return unsafe { lsp_avx512(s1, s2) };
+        if cpu_avx512bw::get() {
+            return lsp_avx512;
         }
-        if std::is_x86_feature_detected!("avx2") {
-            // SAFETY: AVX2 availability just verified via runtime CPU feature detection.
-            return unsafe { lsp_avx2(s1, s2) };
+        if cpu_avx2::get() {
+            return lsp_avx2;
         }
-        // SAFETY: SSE2 is part of the mandatory x86_64 ISA baseline — every x86_64 CPU
-        // supports it, so no runtime check is required. The `#[target_feature(enable = "sse2")]`
-        // attribute on `lsp_sse2` documents this contract explicitly.
-        return unsafe { lsp_sse2(s1, s2) };
+        // SSE2 is part of the mandatory x86_64 ISA baseline — no runtime check.
+        return lsp_sse2;
     }
-    #[cfg(all(feature = "std", target_arch = "x86"))]
+    #[cfg(target_arch = "x86")]
     {
-        if std::is_x86_feature_detected!("avx512bw") {
-            // SAFETY: AVX-512BW availability just verified via runtime CPU feature detection.
-            return unsafe { lsp_avx512(s1, s2) };
+        if cpu_avx512bw::get() {
+            return lsp_avx512;
         }
-        if std::is_x86_feature_detected!("avx2") {
-            // SAFETY: AVX2 availability just verified via runtime CPU feature detection.
-            return unsafe { lsp_avx2(s1, s2) };
+        if cpu_avx2::get() {
+            return lsp_avx2;
         }
-        if std::is_x86_feature_detected!("sse2") {
-            // SAFETY: SSE2 availability just verified via runtime CPU feature detection.
-            // Unlike x86_64, SSE2 is not a guaranteed baseline on 32-bit x86, so the
-            // check is required; pre-SSE2 hosts fall through to the scalar tail below.
-            return unsafe { lsp_sse2(s1, s2) };
+        if cpu_sse2::get() {
+            return lsp_sse2;
         }
-        // Pre-SSE2 32-bit x86 (i586 and earlier): fall through to the scalar kernel.
+        // Pre-SSE2 32-bit x86 (i586 and earlier): falls through to the scalar tail.
     }
     #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
     {
-        // SAFETY: NEON is mandatory in the ARMv8 baseline that `target_arch = "aarch64"` implies.
-        // The kernel relies on LE byte order for `trailing_zeros() / 8` mismatch position math
-        // and for NEON lane-to-memory mapping — restricted to LE aarch64 (the only practically
-        // shipped flavour: Linux servers, Apple Silicon, Android, iOS).
-        return unsafe { lsp_neon(s1, s2) };
+        // NEON is mandatory in the ARMv8 baseline `target_arch = "aarch64"` implies.
+        return lsp_neon;
     }
-    // On x86_64 the SSE2 arm above unconditionally returns, and on LE aarch64 the NEON
-    // arm does the same — so the scalar tail is statically unreachable on both. It IS
-    // reachable on 32-bit x86 (pre-SSE2 fall-through) and every other target (BE aarch64,
-    // riscv, powerpc, …), which is the whole point of having a portable fallback.
+    // Portable fallback, also taken by pre-SSE2 32-bit x86. Naming it
+    // unconditionally here keeps it referenced on every target (no dead-code on
+    // the baseline-SIMD arches) and keeps the arch arms' `return`s off the tail
+    // position (no needless-return). On x86_64 (SSE2 baseline) and LE aarch64
+    // (NEON baseline) the arms above always return, so this tail is unreachable.
     #[cfg_attr(
         any(
-            all(feature = "std", target_arch = "x86_64"),
+            target_arch = "x86_64",
             all(target_arch = "aarch64", target_endian = "little")
         ),
         expect(
             unreachable_code,
-            reason = "x86_64 SSE2 and LE aarch64 NEON arms above are unconditional; scalar tail only reached on other archs/endianness"
+            reason = "x86_64 SSE2 and LE aarch64 NEON arms above always return; scalar tail only reached on other archs"
         )
     )]
-    lsp_scalar(s1, s2)
+    lsp_scalar
 }
 
 /// 8-byte word-stride scalar implementation — works on every platform, no intrinsics.
@@ -644,14 +678,11 @@ pub(crate) fn lsp_scalar(s1: &[u8], s2: &[u8]) -> usize {
 ///
 /// # Safety
 ///
-/// Caller must ensure the host CPU supports AVX2 (`is_x86_feature_detected!("avx2")`).
-// Exists only where it is used: the std-gated runtime dispatch above, or the
-// #[cfg(test)] kernel tests below (kept alive under `--all-targets` clippy on
-// the no-default-features build, where the std dispatch is compiled out).
-#[cfg(all(
-    any(target_arch = "x86_64", target_arch = "x86"),
-    any(feature = "std", test)
-))]
+/// Caller must ensure the host CPU supports AVX2 (`cpu_avx2::get()`).
+// Compiled on every x86 / x86_64 build (std and no_std): the runtime dispatch
+// above selects it via cached CPU-feature detection, and the #[cfg(test)]
+// kernel tests below exercise it directly.
+#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
 #[target_feature(enable = "avx2")]
 #[expect(unsafe_code, reason = "intrinsics require unsafe")]
 #[must_use]
@@ -716,14 +747,11 @@ unsafe fn lsp_avx2(s1: &[u8], s2: &[u8]) -> usize {
 ///
 /// # Safety
 ///
-/// Caller must ensure the host CPU supports AVX-512BW
-/// (`is_x86_feature_detected!("avx512bw")`). BW implies the F subset, so the
-/// 512-bit load and the byte-granular compare-mask are both available.
-// See `lsp_avx2`: gated to where it is used (std dispatch or kernel tests).
-#[cfg(all(
-    any(target_arch = "x86_64", target_arch = "x86"),
-    any(feature = "std", test)
-))]
+/// Caller must ensure the host CPU supports AVX-512BW (`cpu_avx512bw::get()`).
+/// BW implies the F subset, so the 512-bit load and the byte-granular
+/// compare-mask are both available.
+// See `lsp_avx2`: compiled on every x86 build (std and no_std).
+#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
 // List both ISA features the body relies on: `_mm512_loadu_si512` is AVX-512F,
 // `_mm512_cmpeq_epi8_mask` is AVX-512BW. BW implies F (so `avx512bw` alone would
 // compile), but naming both keeps the gate matching the actual requirements and
@@ -789,12 +817,9 @@ unsafe fn lsp_avx512(s1: &[u8], s2: &[u8]) -> usize {
 ///
 /// Caller must ensure the host supports SSE2. On `x86_64` this is the mandatory
 /// ISA baseline (always true); on 32-bit `x86` it must be runtime-detected via
-/// `is_x86_feature_detected!("sse2")` because pre-Pentium-4 CPUs lack it.
-// See `lsp_avx2`: gated to where it is used (std dispatch or kernel tests).
-#[cfg(all(
-    any(target_arch = "x86_64", target_arch = "x86"),
-    any(feature = "std", test)
-))]
+/// `cpu_sse2::get()` because pre-Pentium-4 CPUs lack it.
+// See `lsp_avx2`: compiled on every x86 build (std and no_std).
+#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
 #[target_feature(enable = "sse2")]
 #[expect(unsafe_code, reason = "intrinsics require unsafe")]
 #[must_use]
