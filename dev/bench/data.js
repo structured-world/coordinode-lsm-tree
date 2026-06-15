@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1781536900557,
+  "lastUpdate": 1781538441223,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -16302,6 +16302,84 @@ window.BENCHMARK_DATA = {
             "value": 596592.7692061483,
             "unit": "ops/sec",
             "extra": "P50: 1.5us | P99: 5.8us | P99.9: 9.9us\nthreads: 1 | elapsed: 0.34s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "bb53ac813fe94065f7b3b11169dd9b80c91d79eb",
+          "message": "perf(table): no-std SIMD key-comparison dispatch (#469)\n\n## Summary\n\nThe longest-shared-prefix kernel (flush/compaction hot path, one call\nper truncated index/data entry) dispatched to its AVX-512 / AVX2 / SSE2\nlanes **only** behind `#[cfg(feature = \"std\")]`, because it used\n`std::is_x86_feature_detected!`. A `no_std` x86 build therefore lost all\nSIMD and fell back to the scalar word-stride kernel.\n\nThis change:\n\n- **Replaces the std-only detection with `cpufeatures`** — a\n`#![no_std]` cached-CPUID detector that also performs the XCR0/XGETBV\nOS-state check, so AVX detection cannot SIGILL. The dispatch is no\nlonger std-gated, so the wide SIMD lanes light up under `no_std` too.\nThe dependency is target-gated to `x86` / `x86_64` (the crate\n`compile_error!`s on other arches, e.g. the `thumbv7em-none-eabihf`\nno-std-check target); the dispatch references it under the same `cfg`.\n- **Resolves the kernel once, at the entry to the per-item encode\nloop**, instead of detecting features on every comparison.\n`resolve_lsp_kernel` returns the selected kernel as a function pointer;\nthe block `Encoder` stores it at construction and `write` calls it\ndirectly per item. `longest_shared_prefix_length` stays as a per-call\nconvenience wrapper for non-hot callers.\n\n## Why\n\n- `no_std` x86 consumers regain the AVX-512 / AVX2 / SSE2 key-comparison\nfast path (the hottest path in block encoding), instead of scalar.\n- CPU-feature detection no longer runs inside the per-item hot loop —\nthe kernel is chosen once at loop entry, matching the project's SIMD\ndispatch guidance.\n\n## Testing\n\n- Full suite: 2072 passed\n- `cargo clippy --all-features --all-targets`: clean on aarch64 and\nx86_64 (cross)\n- no-std-check (`thumbv7em-none-eabihf`, `--no-default-features\n--features alloc`): 0 errors (unchanged from baseline)\n- x86_64-unknown-linux-gnu cross build + clippy: clean",
+          "timestamp": "2026-06-15T18:39:09+03:00",
+          "tree_id": "76a347f93e955ee91e19cca53ec3c3aa5e7636d6",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/bb53ac813fe94065f7b3b11169dd9b80c91d79eb"
+        },
+        "date": 1781538421850,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 1898423.7188527875,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.7us | P99.9: 3.7us\nthreads: 1 | elapsed: 0.11s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1215235.1675398243,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.3us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 717882.067568697,
+            "unit": "ops/sec",
+            "extra": "P50: 1.2us | P99: 4.5us | P99.9: 7.1us\nthreads: 1 | elapsed: 0.28s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3742879.802786166,
+            "unit": "ops/sec",
+            "extra": "P50: 0.1us | P99: 3.1us | P99.9: 5.7us\nthreads: 1 | elapsed: 0.05s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 436854.64637138415,
+            "unit": "ops/sec",
+            "extra": "P50: 2.0us | P99: 5.4us | P99.9: 8.6us\nthreads: 1 | elapsed: 0.46s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 228183.81936739763,
+            "unit": "ops/sec",
+            "extra": "P50: 4.1us | P99: 5.1us | P99.9: 7.6us\nthreads: 1 | elapsed: 0.88s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1218643.970738847,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.2us | P99.9: 4.6us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1104005.4742773846,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 1.5us | P99.9: 2.7us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 579361.2619721167,
+            "unit": "ops/sec",
+            "extra": "P50: 1.5us | P99: 4.9us | P99.9: 7.4us\nthreads: 1 | elapsed: 0.35s | num: 200000 | iterations: 3"
           }
         ]
       }
