@@ -515,12 +515,17 @@ pub fn flock_exclusive_raw(fd: i32, non_blocking: bool) -> Result<bool, Error> {
     } else {
         LOCK_EX
     };
-    // SAFETY: `fd` is an owned descriptor; `op` is a valid flock operation.
-    match unsafe { syscall2(Sysno::flock, fd as usize, op as usize) } {
-        Ok(_) => Ok(true),
-        // EWOULDBLOCK / EAGAIN (11): held by someone else, non-blocking request.
-        Err(e) if non_blocking && e.into_raw() == 11 => Ok(false),
-        Err(e) => Err(err("flock", e)),
+    loop {
+        // SAFETY: `fd` is an owned descriptor; `op` is a valid flock operation.
+        match unsafe { syscall2(Sysno::flock, fd as usize, op as usize) } {
+            Ok(_) => return Ok(true),
+            // EINTR (4): interrupted by a signal mid-syscall — retry, so a stray
+            // signal does not spuriously fail the lock (matches std's flock).
+            Err(e) if e.into_raw() == 4 => {}
+            // EWOULDBLOCK / EAGAIN (11): held by someone else, non-blocking request.
+            Err(e) if non_blocking && e.into_raw() == 11 => return Ok(false),
+            Err(e) => return Err(err("flock", e)),
+        }
     }
 }
 
@@ -579,12 +584,11 @@ pub fn unlinkat_raw(path: &core::ffi::CStr, remove_dir: bool) -> Result<(), Erro
     let flags = if remove_dir { AT_REMOVEDIR } else { 0 };
     // SAFETY: `path` is a valid NUL-terminated C string the kernel only reads.
     unsafe {
-        syscall4(
+        syscall3(
             Sysno::unlinkat,
             AT_FDCWD as usize,
             path.as_ptr() as usize,
             flags as usize,
-            0,
         )
     }
     .map_err(|e| err("unlinkat", e))?;
@@ -711,10 +715,14 @@ impl IoUringRawFile {
         if buf.is_empty() {
             return Ok(0);
         }
-        // O_APPEND: resolve the current EOF before each write so writes never
-        // overwrite, matching the kernel's append semantics.
         if self.is_append {
-            self.cursor = file_size_raw(self.fd)?;
+            // O_APPEND: write with the io_uring "use the file offset" sentinel
+            // (`-1`), so the kernel performs the append atomically against the
+            // O_APPEND descriptor. Resolving the offset in userspace
+            // (`lseek` + positioned write) would race with other appenders,
+            // because a positioned write ignores O_APPEND and two writers could
+            // land at the same offset, silently losing one.
+            return self.ring.lock().write_at(self.fd, buf, u64::MAX);
         }
         let n = self.ring.lock().write_at(self.fd, buf, self.cursor)?;
         self.cursor = self.cursor.saturating_add(n as u64);
@@ -913,7 +921,10 @@ fn read_dir_entries(fd: i32) -> Result<Vec<(String, bool)>, Error> {
                     .ok_or_else(|| {
                         Error::new(ErrorKind::InvalidData, "dirent reclen out of range")
                     })?;
-                usize::from(u16::from_le_bytes(b))
+                // `d_reclen` is a native-endian `u16` (the kernel writes the
+                // struct in host byte order), so decode native-endian — not
+                // little-endian, which would be wrong on big-endian targets.
+                usize::from(u16::from_ne_bytes(b))
             };
             if reclen < 19 || off + reclen > n {
                 return Err(Error::new(
@@ -1447,11 +1458,8 @@ mod tests {
         // and try_lock_exclusive (flock) — all over the raw no_std driver.
         use std::io::{Read, Seek, Write};
 
-        let path = std::env::temp_dir().join(format!(
-            "iou_rawfile_{}_{}.bin",
-            std::process::id(),
-            line!()
-        ));
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("iou_rawfile.bin");
         let cpath = std::ffi::CString::new(path.to_str().expect("utf8 path"))
             .expect("path has no interior NUL");
 
@@ -1512,8 +1520,7 @@ mod tests {
             "exclusive lock on a fresh file must succeed"
         );
 
-        drop(file); // closes the fd
-        let _ = std::fs::remove_file(&path);
+        drop(file); // closes the fd; `tmp` drops at end of scope, removing the dir
     }
 
     #[test]
@@ -1526,8 +1533,11 @@ mod tests {
         use crate::path::Path;
         use std::io::Write;
 
-        let base =
-            std::env::temp_dir().join(format!("iou_rawfs_{}_{}", std::process::id(), line!()));
+        // A subdirectory under a `tempfile::tempdir()` guard: `create_dir_all`
+        // creates it, and the guard removes the whole tree on drop even if an
+        // assertion panics before the explicit `remove_dir_all` below.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let base = tmp.path().join("rawfs");
         let base_s = base.to_str().expect("utf8 temp path");
         let fs = IoUringRawFs::new(8).expect("fs setup");
         let dir = Path::new(base_s);
@@ -1564,6 +1574,45 @@ mod tests {
         assert!(!fs.exists(&fpath2).expect("file gone"));
         fs.remove_dir_all(dir).expect("remove_dir_all");
         assert!(!fs.exists(dir).expect("dir gone"));
+    }
+
+    #[test]
+    fn raw_file_append_writes_accumulate_at_eof() {
+        // O_APPEND writes always land at end of file: two sequential appends
+        // (across reopens) both persist, in order — exercising the kernel's
+        // atomic-append path (offset -1) the write impl uses for append mode.
+        use crate::fs::Fs;
+        use crate::path::Path;
+        use std::io::Write;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let p = tmp.path().join("log.bin");
+        let ps = p.to_str().expect("utf8 temp path");
+        let fs = IoUringRawFs::new(8).expect("fs setup");
+        let path = Path::new(ps);
+
+        {
+            let mut f = fs
+                .open(path, &FsOpenOptions::new().append(true).create(true))
+                .expect("open append");
+            f.write_all(b"aaa").expect("first append");
+            f.sync_all().expect("sync");
+        }
+        {
+            let mut f = fs
+                .open(path, &FsOpenOptions::new().append(true).create(true))
+                .expect("reopen append");
+            f.write_all(b"bbb").expect("second append");
+            f.sync_all().expect("sync");
+        }
+
+        let f = fs
+            .open(path, &FsOpenOptions::new().read(true))
+            .expect("open read");
+        let mut buf = [0u8; 6];
+        let n = f.read_at(&mut buf, 0).expect("read_at");
+        assert_eq!(n, 6, "both appends must be present");
+        assert_eq!(&buf, b"aaabbb", "appends land in order at EOF");
     }
 
     #[test]
