@@ -215,6 +215,17 @@ impl Decodable<IndexBlockParsedItem> for KeyedBlockHandle {
     ) -> Option<IndexBlockParsedItem> {
         let marker = reader.read_u8().ok()?;
 
+        // Markers 2/3 were the pre-release inline seqno-bounds entries; this
+        // build never writes them and there is no on-disk compat obligation, so
+        // a 2/3 here means a stale-format SST or a reader/writer mismatch. Assert
+        // against them (debug-only, zero release cost) so that case surfaces
+        // instead of silently ending iteration like the trailer. Genuine
+        // corruption is still rejected gracefully as `None` below (and caught
+        // upstream by the index block's checksum).
+        debug_assert!(
+            marker != 2 && marker != 3,
+            "stale inline seqno-bounds marker {marker} in index full entry (pre-release format, unsupported)"
+        );
         if marker == TRAILER_START_MARKER {
             return None;
         }
@@ -272,6 +283,16 @@ impl Decodable<IndexBlockParsedItem> for KeyedBlockHandle {
 
         let marker = *buf.get(pos)?;
         pos += 1;
+        // Markers 2/3 were the pre-release inline seqno-bounds entries (no
+        // on-disk compat); a 2/3 restart head means a stale-format SST or a
+        // reader/writer mismatch. Assert against them so that case surfaces
+        // instead of a silent miss. `debug_assert` is a no-op in release, so the
+        // point-read hot path pays nothing; genuine corruption is still rejected
+        // gracefully as `None` below (and caught upstream by the checksum).
+        debug_assert!(
+            marker != 2 && marker != 3,
+            "stale inline seqno-bounds marker {marker} in index restart head (pre-release format, unsupported)"
+        );
         if marker == TRAILER_START_MARKER {
             return None;
         }
@@ -323,6 +344,17 @@ impl Decodable<IndexBlockParsedItem> for KeyedBlockHandle {
     ) -> Option<IndexBlockParsedItem> {
         let marker = reader.read_u8().ok()?;
 
+        // Markers 2/3 were the pre-release inline seqno-bounds entries; this
+        // build never writes them and there is no on-disk compat obligation, so
+        // a 2/3 here means a stale-format SST or a reader/writer mismatch. Assert
+        // against them (debug-only, zero release cost) so that case surfaces
+        // instead of silently ending iteration like the trailer. Genuine
+        // corruption is still rejected gracefully as `None` below (and caught
+        // upstream by the index block's checksum).
+        debug_assert!(
+            marker != 2 && marker != 3,
+            "stale inline seqno-bounds marker {marker} in index truncated entry (pre-release format, unsupported)"
+        );
         if marker == TRAILER_START_MARKER {
             return None;
         }
@@ -584,6 +616,27 @@ mod tests {
             bytes.len(),
         );
         assert!(parsed.is_none());
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "stale inline seqno-bounds marker")]
+    fn parse_full_asserts_on_stale_inline_marker() {
+        // Marker 2 was the pre-release inline seqno-bounds full entry. This
+        // build never writes it and has no on-disk compat obligation, so a 2
+        // must fire the debug assertion rather than silently ending iteration
+        // like the trailer (the silent-stop a stale-format SST would otherwise
+        // cause). Release builds compile the assert out and reject it as `None`;
+        // genuine corruption is caught upstream by the index block checksum.
+        let mut bytes = make_full_entry();
+        *bytes.get_mut(0).unwrap() = 2;
+        let entries_end = bytes.len();
+        let mut cursor = Cursor::new(bytes.as_slice());
+        let _ = <KeyedBlockHandle as Decodable<IndexBlockParsedItem>>::parse_full(
+            &mut cursor,
+            0,
+            entries_end,
+        );
     }
 
     #[test]
