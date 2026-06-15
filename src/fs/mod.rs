@@ -62,13 +62,15 @@ pub(crate) use std_fs::is_cross_device;
 #[cfg(all(target_os = "linux", feature = "io-uring"))]
 pub use io_uring_fs::{IoUringFs, is_io_uring_available};
 
-// Raw-syscall `no_std` io_uring driver core (#346). The `IoUringRawFs`
-// [`Fs`](crate::fs::Fs) backend built on top of it lands in follow-up work; the
-// driver is exposed now so feature-gated `no_std` consumers can drive the ring
-// directly.
+// Raw-syscall `no_std` io_uring driver (#346): the driver core (`IoUringRaw`),
+// the [`FsFile`] handle (`IoUringRawFile`), and the [`Fs`] backend
+// (`IoUringRawFs`) that opens files on a shared ring and handles directory
+// operations via plain blocking syscalls — all pure syscalls, no `io-uring`
+// crate and no `std::fs`.
 #[cfg(all(target_os = "linux", feature = "io-uring-raw"))]
 pub use io_uring_raw::{
-    IoUringRaw, O_CREAT, O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY, close_raw, open_raw,
+    IoUringRaw, IoUringRawFile, IoUringRawFs, O_CREAT, O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY,
+    close_raw, open_raw,
 };
 
 // `Read` / `Write` / `Seek` come from `crate::io`, the local mirror
