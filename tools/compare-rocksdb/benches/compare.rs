@@ -72,7 +72,9 @@
 //!   `rocksdb` series use a binary-search data-block index; the same chart
 //!   overlays `ours-hash-index` / `rocksdb-hash-index` series (data-block
 //!   hash index ON — ours: 1.33 buckets/entry; RocksDB: `BinaryAndHash` @
-//!   0.75) so both index strategies are compared head-to-head on one plot.
+//!   0.75) and an `ours-ribbon` series (retrieval-ribbon locator: key ->
+//!   block + restart in O(1), skipping both the index-block and in-block
+//!   searches) so every index strategy is compared head-to-head on one plot.
 //! - `range_scan/{1k,10k}` — full forward scan reading every value
 //!   from a warm, pre-populated engine. Steady-state sequential-scan
 //!   throughput (block decode + iterator advance).
@@ -98,9 +100,25 @@ use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_m
 // for method resolution (clippy `-D warnings` confirms it is live).
 use lsm_tree::{
     AbstractTree, CompressionType, Config, Guard, MAX_SEQNO, SequenceNumberCounter,
-    config::{CompressionPolicy, HashRatioPolicy, KvSeparationOptions},
+    config::{
+        CompressionPolicy, HashRatioPolicy, KvSeparationOptions, LocatorPolicy, LocatorPolicyEntry,
+        LocatorPrecision,
+    },
     runtime_config::{KvChecksumPolicy, RuntimeConfig},
 };
+
+/// In-block index strategy overlaid as a separate `point_read` series.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum IndexStrategy {
+    /// Binary search over the restart array (the engine default).
+    Binary,
+    /// Data-block hash index (key -> restart by hash). Supported by both ours
+    /// and RocksDB.
+    HashIndex,
+    /// Retrieval-ribbon locator (ours only): key -> (block_id, slot) in O(1),
+    /// skipping both the index-block and in-block searches.
+    Ribbon,
+}
 use surrealkv::{
     Durability as SkvDurability, LSMIterator as _, Options as SkvOptions, Tree as SkvTree,
     TreeBuilder as SkvTreeBuilder,
@@ -483,7 +501,7 @@ fn open_ours(
     dir: &std::path::Path,
     compression: Compression,
     kv_separated: bool,
-    hash_index: bool,
+    strategy: IndexStrategy,
 ) -> Result<lsm_tree::AnyTree, Box<dyn std::error::Error>> {
     let config = Config::new(
         dir,
@@ -494,8 +512,20 @@ fn open_ours(
     // by hash instead of binary-searching the restart array. 1.33 buckets/entry
     // is the rough equal of RocksDB's 0.75 utilization for the hash-index
     // overlay. Default policy (0.0) leaves it off for the binary-search arms.
-    let config = if hash_index {
+    let config = if strategy == IndexStrategy::HashIndex {
         config.data_block_hash_ratio_policy(HashRatioPolicy::all(1.33))
+    } else {
+        config
+    };
+    // Retrieval-ribbon locator: a point get resolves the key to its data block
+    // and restart in O(1), skipping both the index-block and in-block searches.
+    // Restart precision (per-sub-block) is the recommended default.
+    let config = if strategy == IndexStrategy::Ribbon {
+        config.locator_policy(LocatorPolicy::all(LocatorPolicyEntry::Enabled {
+            precision: LocatorPrecision::Restart,
+            block_id_bits: None,
+            slot_bits: None,
+        }))
     } else {
         config
     };
@@ -571,7 +601,12 @@ fn run_write_throughput(
     let start = std::time::Instant::now();
     let elapsed = match engine {
         Engine::Ours | Engine::BlobTree => {
-            let tree = open_ours(dir.path(), compression, engine.kv_separated(), false)?;
+            let tree = open_ours(
+                dir.path(),
+                compression,
+                engine.kv_separated(),
+                IndexStrategy::Binary,
+            )?;
             // Zip the seqno counter as a native `u64` instead of
             // enumerate()+try_from(usize). lsm-tree's `insert` takes
             // SeqNo (= u64) directly; using `0u64..` avoids the
@@ -750,25 +785,29 @@ fn point_read_variant(
     compression: Compression,
     hash_overlays: bool,
 ) {
-    // Series overlaid on this ONE chart: every base engine with the data-block
-    // hash index OFF (binary search), plus — when `hash_overlays` is set — the
-    // two engines that support a data-block hash index again with it ON. Extend
-    // this list to add more index strategies (e.g. a future `ours-burr` ribbon
-    // series) as additional overlays on the same chart.
-    let mut series: Vec<(&str, Engine, bool)> = engines_for(compression)
+    // Series overlaid on this ONE chart: every base engine with binary-search
+    // data-block index, plus — when `hash_overlays` is set — the data-block
+    // hash index (ours + RocksDB) and the retrieval-ribbon locator (ours only)
+    // as additional index strategies on the same chart.
+    let mut series: Vec<(&str, Engine, IndexStrategy)> = engines_for(compression)
         .iter()
-        .map(|&engine| (engine.label(), engine, false))
+        .map(|&engine| (engine.label(), engine, IndexStrategy::Binary))
         .collect();
     if hash_overlays {
-        series.push(("ours-hash-index", Engine::Ours, true));
-        series.push(("rocksdb-hash-index", Engine::RocksDb, true));
+        series.push(("ours-hash-index", Engine::Ours, IndexStrategy::HashIndex));
+        series.push((
+            "rocksdb-hash-index",
+            Engine::RocksDb,
+            IndexStrategy::HashIndex,
+        ));
+        series.push(("ours-ribbon", Engine::Ours, IndexStrategy::Ribbon));
     }
 
     let mut group = c.benchmark_group(group_name);
     for &n in &[1_000_u64, 10_000_u64] {
         let inputs = WorkloadInputs::build(n);
         group.throughput(Throughput::Elements(n));
-        for &(label, engine, hash_index) in &series {
+        for &(label, engine, strategy) in &series {
             group.bench_with_input(BenchmarkId::new(label, n), &n, |b, _| {
                 // The temp dir + engine handle outlive every timed
                 // iteration: build the on-disk database once here so
@@ -778,7 +817,7 @@ fn point_read_variant(
                 match engine {
                     Engine::Ours | Engine::BlobTree => {
                         let tree =
-                            open_ours(dir.path(), compression, engine.kv_separated(), hash_index)
+                            open_ours(dir.path(), compression, engine.kv_separated(), strategy)
                                 .expect("ours: open");
                         for ((key, value), seqno) in
                             inputs.keys.iter().zip(inputs.values.iter()).zip(0u64..)
@@ -814,7 +853,8 @@ fn point_read_variant(
                         // matching our engine's defaults so the per-`get`
                         // overhead is attributable, not a config artefact —
                         // see `rocksdb_options`.
-                        let opts = rocksdb_options(compression, hash_index);
+                        let opts =
+                            rocksdb_options(compression, strategy == IndexStrategy::HashIndex);
                         let db = rocksdb::DB::open(&opts, dir.path()).expect("rocksdb: open");
                         let mut write_opts = rocksdb::WriteOptions::default();
                         write_opts.disable_wal(true);
@@ -907,7 +947,8 @@ fn populate_ours(
     inputs: &WorkloadInputs,
     kv_separated: bool,
 ) -> lsm_tree::AnyTree {
-    let tree = open_ours(dir, compression, kv_separated, false).expect("ours: open");
+    let tree =
+        open_ours(dir, compression, kv_separated, IndexStrategy::Binary).expect("ours: open");
     for ((key, value), seqno) in inputs.keys.iter().zip(inputs.values.iter()).zip(0u64..) {
         tree.insert(key, value, seqno);
     }
