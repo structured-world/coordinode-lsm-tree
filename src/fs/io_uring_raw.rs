@@ -96,8 +96,6 @@ const PROT_READ: usize = 0x1;
 const PROT_WRITE: usize = 0x2;
 const MAP_SHARED: usize = 0x01;
 const MAP_POPULATE: usize = 0x0_8000;
-/// `mmap` sentinel return for failure (`MAP_FAILED` is `(void *) -1`).
-const MAP_FAILED: usize = usize::MAX;
 
 // ---- ABI structs (repr(C), field order per linux/io_uring.h) ----
 
@@ -187,6 +185,7 @@ fn errno_to_kind(errno: i32) -> ErrorKind {
         2 => ErrorKind::NotFound,              // ENOENT
         4 => ErrorKind::Interrupted,           // EINTR
         9 | 22 => ErrorKind::InvalidInput,     // EBADF / EINVAL
+        11 => ErrorKind::WouldBlock,           // EAGAIN / EWOULDBLOCK
         17 => ErrorKind::AlreadyExists,        // EEXIST
         95 => ErrorKind::Unsupported,          // EOPNOTSUPP
         _ => ErrorKind::Other,
@@ -244,9 +243,9 @@ unsafe fn io_uring_enter(
 ///
 /// # Safety
 /// Standard `mmap` contract. The caller owns the mapping and must `munmap` it.
-// Coverage: the `MAP_FAILED` / `Err` arms require an `mmap` failure (address
-// space exhaustion or a kernel fault), which cannot be provoked deterministically
-// in CI. The success arm IS covered by every ring setup.
+// Coverage: the `Err` arm requires an `mmap` failure (address-space exhaustion
+// or a kernel fault), which cannot be provoked deterministically in CI. The
+// success arm IS covered by every ring setup.
 #[cfg_attr(coverage_nightly, coverage(off))]
 unsafe fn mmap(
     len: usize,
@@ -255,9 +254,10 @@ unsafe fn mmap(
     fd: i32,
     offset: u64,
 ) -> Result<*mut u8, Error> {
-    // SAFETY: forwarded to the kernel. `mmap` returns `MAP_FAILED` (`-1` as
-    // usize) on error rather than `-errno`, so check that sentinel explicitly;
-    // the syscalls Result form would otherwise treat the huge address as Ok.
+    // SAFETY: forwarded to the kernel. The raw `mmap` syscall returns `-errno`
+    // (in `[-4095, -1]`) on failure, which the `syscalls` Result form maps to
+    // `Err` for us; a success is the actual mapping address (page 0 included,
+    // though the kernel does not hand it out for a NULL hint).
     let ret = unsafe {
         syscall6(
             Sysno::mmap,
@@ -270,8 +270,7 @@ unsafe fn mmap(
         )
     };
     match ret {
-        Ok(addr) if addr != MAP_FAILED && addr != 0 => Ok(addr as *mut u8),
-        Ok(_) => Err(Error::new(ErrorKind::Other, "mmap returned MAP_FAILED")),
+        Ok(addr) => Ok(addr as *mut u8),
         Err(e) => Err(err("mmap", e)),
     }
 }
@@ -508,11 +507,17 @@ impl IoUringRaw {
     /// # Errors
     /// Returns an [`Error`] if the read completes with a negative `-errno`.
     pub fn read_at(&mut self, fd: i32, buf: &mut [u8], offset: u64) -> Result<usize, Error> {
+        let len = u32::try_from(buf.len()).map_err(|_| {
+            Error::new(
+                ErrorKind::InvalidInput,
+                "read length exceeds the 4 GiB io_uring single-op limit",
+            )
+        })?;
         let sqe = IoUringSqe {
             opcode: IORING_OP_READ,
             fd,
             addr: buf.as_mut_ptr() as u64,
-            len: buf.len() as u32,
+            len,
             off: offset,
             ..IoUringSqe::default()
         };
@@ -526,11 +531,17 @@ impl IoUringRaw {
     /// # Errors
     /// Returns an [`Error`] if the write completes with a negative `-errno`.
     pub fn write_at(&mut self, fd: i32, buf: &[u8], offset: u64) -> Result<usize, Error> {
+        let len = u32::try_from(buf.len()).map_err(|_| {
+            Error::new(
+                ErrorKind::InvalidInput,
+                "write length exceeds the 4 GiB io_uring single-op limit",
+            )
+        })?;
         let sqe = IoUringSqe {
             opcode: IORING_OP_WRITE,
             fd,
             addr: buf.as_ptr() as u64,
-            len: buf.len() as u32,
+            len,
             off: offset,
             ..IoUringSqe::default()
         };
@@ -595,9 +606,22 @@ impl IoUringRaw {
             core::ptr::write_volatile(self.sq_ktail, tail.wrapping_add(1));
         }
 
-        // Submit 1, wait for 1 completion.
-        // SAFETY: `self.ring_fd` is the live ring fd owned by this `IoUringRaw`.
-        let _ = unsafe { io_uring_enter(self.ring_fd, 1, 1, IORING_ENTER_GETEVENTS) }?;
+        // Submit 1, wait for 1 completion. Retry on EINTR: the SQE is already
+        // published to the SQ (the tail was advanced above), so a
+        // signal-interrupted `enter` must be re-entered to reap that in-flight
+        // submission rather than returning and leaking it (the next call would
+        // then reap this completion against the wrong `user_data`). The kernel
+        // submits `min(to_submit, pending)` SQEs, so a retry after the first
+        // `enter` already consumed the entry simply waits for the completion.
+        loop {
+            // SAFETY: `self.ring_fd` is the live ring fd owned by this `IoUringRaw`.
+            match unsafe { io_uring_enter(self.ring_fd, 1, 1, IORING_ENTER_GETEVENTS) } {
+                Ok(_) => break,
+                // EINTR: fall through to re-enter the ring on the next iteration.
+                Err(e) if e.kind() == ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
+            }
+        }
 
         // SAFETY: read the kernel-advanced CQ tail (Acquire) before touching the
         // CQE so we never read a slot the kernel has not published. After a
@@ -772,6 +796,7 @@ mod tests {
         assert_eq!(errno_to_kind(2), ErrorKind::NotFound); // ENOENT
         assert_eq!(errno_to_kind(4), ErrorKind::Interrupted); // EINTR
         assert_eq!(errno_to_kind(9), ErrorKind::InvalidInput); // EBADF
+        assert_eq!(errno_to_kind(11), ErrorKind::WouldBlock); // EAGAIN
         assert_eq!(errno_to_kind(13), ErrorKind::PermissionDenied); // EACCES
         assert_eq!(errno_to_kind(17), ErrorKind::AlreadyExists); // EEXIST
         assert_eq!(errno_to_kind(22), ErrorKind::InvalidInput); // EINVAL

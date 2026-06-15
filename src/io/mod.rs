@@ -56,6 +56,9 @@ pub enum ErrorKind {
     UnexpectedEof,
     /// Operation is not supported on this platform / backend / build.
     Unsupported,
+    /// Operation would block (`EAGAIN` / `EWOULDBLOCK`-equivalent); the caller
+    /// can retry. Mirrors [`std::io::ErrorKind::WouldBlock`].
+    WouldBlock,
     /// `write` returned `Ok(0)` while bytes still needed to be
     /// written. Mirrors [`std::io::ErrorKind::WriteZero`] so callers
     /// can distinguish a stuck-writer short write from a generic
@@ -77,6 +80,7 @@ impl ErrorKind {
             Self::PermissionDenied => "permission denied",
             Self::UnexpectedEof => "unexpected end of file",
             Self::Unsupported => "unsupported",
+            Self::WouldBlock => "operation would block",
             Self::WriteZero => "write returned 0 bytes",
         }
     }
@@ -230,6 +234,7 @@ impl From<std::io::Error> for Error {
             std::io::ErrorKind::PermissionDenied => (ErrorKind::PermissionDenied, true),
             std::io::ErrorKind::UnexpectedEof => (ErrorKind::UnexpectedEof, true),
             std::io::ErrorKind::Unsupported => (ErrorKind::Unsupported, true),
+            std::io::ErrorKind::WouldBlock => (ErrorKind::WouldBlock, true),
             std::io::ErrorKind::WriteZero => (ErrorKind::WriteZero, true),
             // `Other` is a mapped kind: a kind-only `Other` std error
             // would otherwise fall through to the unmapped branch and
@@ -291,6 +296,7 @@ impl From<Error> for std::io::Error {
             ErrorKind::PermissionDenied => std::io::ErrorKind::PermissionDenied,
             ErrorKind::UnexpectedEof => std::io::ErrorKind::UnexpectedEof,
             ErrorKind::Unsupported => std::io::ErrorKind::Unsupported,
+            ErrorKind::WouldBlock => std::io::ErrorKind::WouldBlock,
             ErrorKind::WriteZero => std::io::ErrorKind::WriteZero,
         };
         match err.message {
@@ -1424,6 +1430,7 @@ mod tests {
             ErrorKind::PermissionDenied,
             ErrorKind::UnexpectedEof,
             ErrorKind::Unsupported,
+            ErrorKind::WouldBlock,
             ErrorKind::WriteZero,
         ];
         for (i, a) in all.iter().enumerate() {
@@ -1565,7 +1572,7 @@ mod tests {
     /// to the enum without a row here fails the per-arm assertions
     /// (the std round trip would not preserve it).
     #[cfg(feature = "std")]
-    const ALL_KINDS: [ErrorKind; 12] = [
+    const ALL_KINDS: [ErrorKind; 13] = [
         ErrorKind::AlreadyExists,
         ErrorKind::BrokenPipe,
         ErrorKind::CrossesDevices,
@@ -1577,6 +1584,7 @@ mod tests {
         ErrorKind::PermissionDenied,
         ErrorKind::UnexpectedEof,
         ErrorKind::Unsupported,
+        ErrorKind::WouldBlock,
         ErrorKind::WriteZero,
     ];
 
@@ -1625,6 +1633,7 @@ mod tests {
             ),
             (std::io::ErrorKind::UnexpectedEof, ErrorKind::UnexpectedEof),
             (std::io::ErrorKind::Unsupported, ErrorKind::Unsupported),
+            (std::io::ErrorKind::WouldBlock, ErrorKind::WouldBlock),
             (std::io::ErrorKind::WriteZero, ErrorKind::WriteZero),
         ];
         for (std_kind, want) in mapped {
@@ -1697,6 +1706,7 @@ mod tests {
             ErrorKind::PermissionDenied,
             ErrorKind::UnexpectedEof,
             ErrorKind::Unsupported,
+            ErrorKind::WouldBlock,
             ErrorKind::WriteZero,
         ];
         for kind in all {
