@@ -49,6 +49,10 @@ pub use aligned_buf::AlignedBuf;
 #[cfg(all(target_os = "linux", feature = "io-uring"))]
 mod io_uring_fs;
 
+// Pure-Rust `no_std` io_uring driver core on raw Linux syscalls (#346).
+#[cfg(all(target_os = "linux", feature = "io-uring-raw"))]
+mod io_uring_raw;
+
 pub use mem_fs::MemFs;
 #[cfg(feature = "std")]
 pub use std_fs::StdFs;
@@ -57,6 +61,13 @@ pub(crate) use std_fs::is_cross_device;
 
 #[cfg(all(target_os = "linux", feature = "io-uring"))]
 pub use io_uring_fs::{IoUringFs, is_io_uring_available};
+
+// Raw-syscall `no_std` io_uring driver core (#346). The `IoUringRawFs`
+// [`Fs`](crate::fs::Fs) backend built on top of it lands in follow-up work; the
+// driver is exposed now so feature-gated `no_std` consumers can drive the ring
+// directly.
+#[cfg(all(target_os = "linux", feature = "io-uring-raw"))]
+pub use io_uring_raw::IoUringRaw;
 
 // `Read` / `Write` / `Seek` come from `crate::io`, the local mirror
 // of `std::io` that compiles under `no_std + alloc`. Under `feature =
