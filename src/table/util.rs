@@ -571,51 +571,66 @@ pub type LspKernel = unsafe fn(&[u8], &[u8]) -> usize;
 /// `aarch64`, then the portable scalar kernel.
 #[must_use]
 pub fn resolve_lsp_kernel() -> LspKernel {
-    #[cfg(target_arch = "x86_64")]
+    // Each `cfg` block below is a tail expression and exactly one compiles per
+    // target, so there is no `return`/unreachable-tail bookkeeping. The x86
+    // path detects features at runtime and defers the actual choice to the pure
+    // `select_lsp_kernel`, which is exhaustively unit-tested on any host (the
+    // detection itself can only exercise the current CPU's lane).
+    #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
     {
-        if cpu_avx512bw::get() {
-            return lsp_avx512;
-        }
-        if cpu_avx2::get() {
-            return lsp_avx2;
-        }
-        // SSE2 is part of the mandatory x86_64 ISA baseline — no runtime check.
-        return lsp_sse2;
-    }
-    #[cfg(target_arch = "x86")]
-    {
-        if cpu_avx512bw::get() {
-            return lsp_avx512;
-        }
-        if cpu_avx2::get() {
-            return lsp_avx2;
-        }
-        if cpu_sse2::get() {
-            return lsp_sse2;
-        }
-        // Pre-SSE2 32-bit x86 (i586 and earlier): falls through to the scalar tail.
+        select_lsp_kernel(LspCpuFeatures {
+            avx512bw: cpu_avx512bw::get(),
+            avx2: cpu_avx2::get(),
+            // SSE2 is the mandatory x86_64 ISA baseline (always present); on
+            // 32-bit x86 it is runtime-detected.
+            #[cfg(target_arch = "x86_64")]
+            sse2: true,
+            #[cfg(target_arch = "x86")]
+            sse2: cpu_sse2::get(),
+        })
     }
     #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
     {
         // NEON is mandatory in the ARMv8 baseline `target_arch = "aarch64"` implies.
-        return lsp_neon;
+        lsp_neon
     }
-    // Portable fallback, also taken by pre-SSE2 32-bit x86. Naming it
-    // unconditionally here keeps it referenced on every target (no dead-code on
-    // the baseline-SIMD arches) and keeps the arch arms' `return`s off the tail
-    // position (no needless-return). On x86_64 (SSE2 baseline) and LE aarch64
-    // (NEON baseline) the arms above always return, so this tail is unreachable.
-    #[cfg_attr(
-        any(
-            target_arch = "x86_64",
-            all(target_arch = "aarch64", target_endian = "little")
-        ),
-        expect(
-            unreachable_code,
-            reason = "x86_64 SSE2 and LE aarch64 NEON arms above always return; scalar tail only reached on other archs"
-        )
-    )]
-    lsp_scalar
+    #[cfg(not(any(
+        target_arch = "x86_64",
+        target_arch = "x86",
+        all(target_arch = "aarch64", target_endian = "little")
+    )))]
+    {
+        // Portable fallback (big-endian aarch64, riscv, powerpc, …).
+        lsp_scalar
+    }
+}
+
+/// Detected x86 SIMD features the longest-shared-prefix dispatch selects on.
+#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+#[derive(Clone, Copy)]
+struct LspCpuFeatures {
+    avx512bw: bool,
+    avx2: bool,
+    sse2: bool,
+}
+
+/// Pure kernel selection from detected x86 features: widest lane first
+/// (AVX-512BW, then AVX2, then SSE2), else the portable scalar kernel.
+///
+/// Split out from [`resolve_lsp_kernel`]'s runtime detection so every branch is
+/// exhaustively unit-testable on any host — the detection can only ever
+/// exercise the lane the test CPU happens to expose.
+#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+fn select_lsp_kernel(f: LspCpuFeatures) -> LspKernel {
+    if f.avx512bw {
+        lsp_avx512
+    } else if f.avx2 {
+        lsp_avx2
+    } else if f.sse2 {
+        lsp_sse2
+    } else {
+        lsp_scalar
+    }
 }
 
 /// 8-byte word-stride scalar implementation — works on every platform, no intrinsics.
@@ -1267,6 +1282,35 @@ mod tests {
         }
         // SAFETY: AVX-512BW availability just verified via runtime CPU feature detection.
         assert_kernel_matches_reference("avx512bw", |a, b| unsafe { lsp_avx512(a, b) });
+    }
+
+    /// Exhaustively covers the kernel-selection ladder on any x86 host: the
+    /// runtime dispatch can only exercise the lane the test CPU exposes, but
+    /// `select_lsp_kernel` is a pure function of the detected-feature flags, so
+    /// every arm (AVX-512BW, AVX2, SSE2, scalar fallback) is reachable here.
+    #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+    #[test]
+    fn select_lsp_kernel_picks_widest_available_lane() {
+        use core::ptr::fn_addr_eq;
+        let pick = |avx512bw, avx2, sse2| {
+            select_lsp_kernel(LspCpuFeatures {
+                avx512bw,
+                avx2,
+                sse2,
+            })
+        };
+        assert!(fn_addr_eq(pick(true, true, true), lsp_avx512 as LspKernel));
+        assert!(fn_addr_eq(pick(false, true, true), lsp_avx2 as LspKernel));
+        assert!(fn_addr_eq(pick(false, false, true), lsp_sse2 as LspKernel));
+        assert!(fn_addr_eq(
+            pick(false, false, false),
+            lsp_scalar as LspKernel
+        ));
+        // The widest available lane wins even when narrower lanes are absent.
+        assert!(fn_addr_eq(
+            pick(true, false, false),
+            lsp_avx512 as LspKernel
+        ));
     }
 
     /// Direct test for the NEON 16-byte kernel on LE aarch64. Required because
