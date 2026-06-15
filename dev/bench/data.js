@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1781479538620,
+  "lastUpdate": 1781485510285,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -16068,6 +16068,84 @@ window.BENCHMARK_DATA = {
             "value": 597342.2814251344,
             "unit": "ops/sec",
             "extra": "P50: 1.5us | P99: 4.8us | P99.9: 7.3us\nthreads: 1 | elapsed: 0.33s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "7301c0035448e5bb9cfb390a5b1c4534cc5ac79b",
+          "message": "docs(compaction): clarify major_compact watermark + clean subcompaction profile (#467)\n\nTwo compaction-area items, no production behaviour change.\n\n## #466 — major_compact GC/merge-fold watermark (docs)\n\n`major_compact(target, seqno_threshold)`'s `seqno_threshold` is the MVCC\nGC watermark, but the trait doc never explained it. A caller passing `0`\n(intending \"no constraint\") actually certifies nothing as collapsible,\nso tombstones are not GC'd and a merge-only key's operand chain is never\nfolded — reads then re-apply every operand (`O(operands)` per read).\n\nNot a folding bug: the fold logic is correct. Documented the contract so\n`0` is no longer a silent \"fold nothing\" footgun, and added\n`merge_only_key_folds_operands_after_major_compaction`, which proves a\nmerge-only key folds to `O(1)` after a major compaction with a watermark\nabove the operands. The engine does not track snapshots (the caller owns\nsnapshot lifecycle and supplies the watermark); an internal snapshot\ntracker was considered and rejected as it would duplicate the consumer's\nMVCC layer. Re-scoped #466 from \"bug\" to \"clarify\".\n\n## #410 — subcompaction clean-profile harness + attribution\n\nThe `subcompaction_zstd3` bench rebuilds its inputs every iteration, so\na flamegraph is dominated by setup, masking the timed `major_compact`.\nAdded `subcompaction_clean`: build the pre-compact state ONCE into a\nmaster dir, clone it per iteration, time only `major_compact`. The clean\nprofile shows the merge / range-split orchestration is `< 1%` and the\ncost is structured-zstd's level-3 block encoder (`DfastMatchGenerator`)\non the compression pool. So the residual `~1.27x` vs RocksDB is the\nlevel-3 encoder (structured-zstd), not lsm-tree's subcompaction path.\nFull diagnosis in #410.\n\n## Testing\n\n- `cargo nextest run`: 1775 passed, 2 skipped.\n- `cargo clippy --all-features --all-targets`: clean.\n- `cargo test --doc`: passed.\n- compare-rocksdb bench builds + runs on the Linux runner.\n\nCloses #466\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n\n## Summary by CodeRabbit\n\n* **Documentation**\n* Enhanced documentation for compaction and garbage collection\nthresholds.\n\n* **Tests**\n* Added test verifying merge operation correctness during major\ncompaction.\n\n* **Chores**\n  * Improved performance benchmarking tools for compaction measurements.\n\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-06-15T01:04:04Z",
+          "tree_id": "d37e38c098bb7b1de51e51999708d5c39812dfc4",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/7301c0035448e5bb9cfb390a5b1c4534cc5ac79b"
+        },
+        "date": 1781485494498,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 2089649.7350010688,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.6us | P99.9: 3.7us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1233653.7181385488,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.3us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 735081.5223417773,
+            "unit": "ops/sec",
+            "extra": "P50: 1.2us | P99: 4.5us | P99.9: 7.0us\nthreads: 1 | elapsed: 0.27s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3731041.7374476376,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 3.0us | P99.9: 5.5us\nthreads: 1 | elapsed: 0.05s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 446915.45189572126,
+            "unit": "ops/sec",
+            "extra": "P50: 1.9us | P99: 5.3us | P99.9: 8.2us\nthreads: 1 | elapsed: 0.45s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 225381.69138830734,
+            "unit": "ops/sec",
+            "extra": "P50: 4.1us | P99: 8.4us | P99.9: 11.0us\nthreads: 1 | elapsed: 0.89s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1281672.5149597137,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.0us | P99.9: 4.2us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1106523.348508508,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 1.5us | P99.9: 2.9us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 597934.6863564844,
+            "unit": "ops/sec",
+            "extra": "P50: 1.5us | P99: 5.0us | P99.9: 7.5us\nthreads: 1 | elapsed: 0.33s | num: 200000 | iterations: 3"
           }
         ]
       }
