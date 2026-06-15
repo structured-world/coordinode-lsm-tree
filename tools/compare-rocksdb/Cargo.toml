@@ -11,6 +11,15 @@
 # and through RocksDB side-by-side; results land in
 # `tools/compare-rocksdb/target/criterion/`. The gh-pages
 # dashboard pipeline consumes those JSON outputs (per #244).
+#
+# An empty `[workspace]` pins this crate as its own workspace root. The main
+# crate already lists it under `workspace.exclude`, but exclusion alone does not
+# stop Cargo from absorbing it into a DIFFERENT workspace manifest higher up the
+# directory tree (e.g. a stray one in a CI runner's temp dir, or a surrounding
+# monorepo). Declaring our own root makes a standalone `cargo bench` here immune
+# to whatever lives above this directory.
+[workspace]
+
 [package]
 name = "compare-rocksdb-bench"
 version = "0.1.0"
