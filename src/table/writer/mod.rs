@@ -755,6 +755,9 @@ impl Writer {
             if let Some(spec) = self.locator {
                 let pos = self.chunk.len() as u64;
                 let slot = match spec.precision {
+                    // Per-block precision drops slot (the section build masks it
+                    // to 0-width); record 0 to keep max_slot minimal.
+                    crate::config::LocatorPrecision::Block => 0,
                     crate::config::LocatorPrecision::Restart => {
                         pos / u64::from(self.data_block_restart_interval)
                     }

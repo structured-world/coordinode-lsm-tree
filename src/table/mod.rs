@@ -514,7 +514,7 @@ impl Table {
             return Ok(None);
         }
 
-        let item = self.point_read(key, seqno)?;
+        let item = self.point_read(key, seqno, key_hash)?;
 
         // Translate table-local seqno back to global coordinate so callers
         // can compare across tables/memtables (L0 best-selection, RT suppression).
@@ -562,7 +562,7 @@ impl Table {
             return Ok(None);
         }
 
-        let item = self.point_read_value(key, seqno)?;
+        let item = self.point_read_value(key, seqno, key_hash)?;
 
         // Translate table-local seqno back to the global coordinate, mirroring
         // `Table::get`.
@@ -586,7 +586,18 @@ impl Table {
         &self,
         key: &[u8],
         seqno: SeqNo,
+        key_hash: u64,
     ) -> crate::Result<Option<(crate::ValueType, SeqNo, crate::Slice)>> {
+        // Fast path: retrieval-ribbon locator (see `point_read_inner` for the
+        // MVCC-correctness argument). A located-block miss falls through to the
+        // index walk below.
+        if let Some(handle) = self.locator_block(key_hash)? {
+            let data_block = self.load_data_block(&handle)?;
+            if let Some(found) = data_block.point_read_value(key, seqno, &self.comparator)? {
+                return Ok(Some(found));
+            }
+        }
+
         let Some(iter) = self.block_index.point_read_reader(key, seqno) else {
             return Ok(None);
         };
@@ -631,7 +642,7 @@ impl Table {
             return Ok(None);
         }
 
-        let result = self.point_read_with_block(key, seqno)?;
+        let result = self.point_read_with_block(key, seqno, key_hash)?;
 
         // Translate table-local seqno back to global coordinate (see Table::get).
         let result = result.map(|(mut iv, block)| {
@@ -653,11 +664,35 @@ impl Table {
     /// Shared block-index walk for point reads. Returns the matching entry
     /// together with the [`DataBlock`] it was found in, so callers that need
     /// the block (e.g. for [`PinnableSlice`]) can keep it alive.
+    /// Resolve the data block holding `key_hash`'s newest version via the
+    /// retrieval-ribbon locator, if one is loaded. `Ok(None)` means no locator
+    /// or the ribbon could not answer → the caller uses the sorted-index walk.
+    fn locator_block(&self, key_hash: u64) -> crate::Result<Option<BlockHandle>> {
+        match &self.locator_index {
+            Some(loc) => loc.locate_block(key_hash),
+            None => Ok(None),
+        }
+    }
+
     fn point_read_inner(
         &self,
         key: &[u8],
         seqno: SeqNo,
+        key_hash: u64,
     ) -> crate::Result<Option<(InternalValue, DataBlock)>> {
+        // Fast path: a retrieval-ribbon locator resolves the key to its data
+        // block in O(1), skipping the index-block binary search. The located
+        // block holds the newest version (the run's highest-seqno prefix), so a
+        // hit returns the correct MVCC answer and a miss (absent key, or the
+        // visible version lives in a later block) safely falls through to the
+        // index walk below.
+        if let Some(handle) = self.locator_block(key_hash)? {
+            let data_block = self.load_data_block(&handle)?;
+            if let Some(item) = data_block.point_read(key, seqno, &self.comparator)? {
+                return Ok(Some((item, data_block)));
+            }
+        }
+
         // Borrowing point-read seek: avoids cloning the index block + reuses
         // the trailer metadata parsed at table open (see
         // `BlockIndexImpl::point_read_reader`).
@@ -685,8 +720,13 @@ impl Table {
         Ok(None)
     }
 
-    fn point_read(&self, key: &[u8], seqno: SeqNo) -> crate::Result<Option<InternalValue>> {
-        self.point_read_inner(key, seqno)
+    fn point_read(
+        &self,
+        key: &[u8],
+        seqno: SeqNo,
+        key_hash: u64,
+    ) -> crate::Result<Option<InternalValue>> {
+        self.point_read_inner(key, seqno, key_hash)
             .map(|opt| opt.map(|(iv, _)| iv))
     }
 
@@ -699,8 +739,9 @@ impl Table {
         &self,
         key: &[u8],
         seqno: SeqNo,
+        key_hash: u64,
     ) -> crate::Result<Option<(InternalValue, Block)>> {
-        self.point_read_inner(key, seqno)
+        self.point_read_inner(key, seqno, key_hash)
             .map(|opt| opt.map(|(iv, db)| (iv, db.inner)))
     }
 
@@ -1669,6 +1710,53 @@ impl Table {
             crate::table::block_layout::BlockLayoutMap::default()
         };
 
+        // Load the optional retrieval-ribbon locator section and pair it with an
+        // ordinal → data-block-handle map (the index yields handles in key/write
+        // order, which is the writer's block_id ordering). Only when the section
+        // exists, so non-locator tables pay nothing.
+        let locator_index = if let Some(loc_handle) = regions.locator {
+            let block = Block::from_file(
+                file_handle.as_ref(),
+                loc_handle,
+                crate::table::block::BlockIdentity {
+                    table_id: metadata.id,
+                    block_type: BlockType::Locator,
+                    dict_id: 0,
+                    window_log: 0,
+                },
+                &{
+                    let t = match encryption.as_deref() {
+                        Some(enc) => crate::table::block::BlockTransform::Encrypted(enc),
+                        None => crate::table::block::BlockTransform::PLAIN,
+                    };
+                    if let Some(ecc) = metadata.ecc_params {
+                        t.with_ecc(ecc)
+                    } else {
+                        t
+                    }
+                },
+            )?;
+            if block.header.block_type != BlockType::Locator {
+                return Err(crate::Error::InvalidTag((
+                    "BlockType",
+                    block.header.block_type.into(),
+                )));
+            }
+            let blocks: Vec<BlockHandle> = block_index
+                .iter()
+                .map(|r| r.map(|kbh| *kbh.as_ref()))
+                .collect::<crate::Result<Vec<_>>>()?;
+            log::trace!(
+                "Loaded retrieval-ribbon locator over {} blocks",
+                blocks.len()
+            );
+            Some(crate::table::locator::LoadedLocator::new(
+                block.data, blocks,
+            ))
+        } else {
+            None
+        };
+
         log::debug!(
             "Recovered table #{} from {}",
             metadata.id,
@@ -1706,6 +1794,7 @@ impl Table {
             cached_blob_bytes: AtomicU64::new(u64::MAX),
             range_tombstones,
             block_layout,
+            locator_index,
             encryption,
 
             #[cfg(zstd_any)]

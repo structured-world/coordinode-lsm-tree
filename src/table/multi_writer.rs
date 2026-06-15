@@ -1004,7 +1004,7 @@ mod tests {
     fn locator_section_round_trips_through_writer() -> crate::Result<()> {
         use crate::config::{LocatorPolicyEntry, LocatorPrecision};
         use crate::table::block::BlockType;
-        use crate::table::locator::locate_in_section;
+        use crate::table::locator::locate;
         use crate::{CompressionType, InternalValue, UserKey, fs::StdFs};
         use std::sync::Arc;
 
@@ -1083,8 +1083,8 @@ mod tests {
         assert!(num_blocks > 1, "test should produce multiple data blocks");
         for i in 0..n {
             let h = crate::hash::hash64(&i.to_be_bytes());
-            let (block_id, _slot) = locate_in_section(section_bytes, h)
-                .unwrap_or_else(|| panic!("inserted key {i} must locate"));
+            let (block_id, _slot) =
+                locate(section_bytes, h)?.unwrap_or_else(|| panic!("inserted key {i} must locate"));
             assert!(
                 block_id < num_blocks,
                 "key {i}: block_id {block_id} >= data_block_count {num_blocks}",

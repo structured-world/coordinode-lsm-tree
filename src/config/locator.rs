@@ -7,19 +7,26 @@ use alloc::vec::Vec;
 
 /// In-block addressing precision for the retrieval-ribbon locator.
 ///
-/// A locator is `(block_id, slot)`; this selects what `slot` indexes, trading
-/// ribbon width against in-block read work. Data blocks are delta-coded within
-/// restart intervals, so only a restart head has a directly-addressable byte
-/// offset; both modes land there and differ in how the exact entry is reached.
+/// Selects the locator granularity, trading ribbon width against in-block read
+/// work. The three modes correspond to **per-block**, **per-sub-block**, and
+/// **per-key** addressing. Data blocks are delta-coded within restart intervals,
+/// so only a restart head has a directly-addressable byte offset; the finer
+/// modes land there and differ in how the exact entry is reached.
 #[derive(Copy, Debug, Clone, PartialEq, Eq)]
 pub enum LocatorPrecision {
-    /// `slot` is the restart index. The read jumps to the restart head and
-    /// scans up to `restart_interval` entries. Most compact; the in-block
+    /// **Per-block**: the locator is `block_id` only (no `slot`). The read
+    /// resolves the data block in O(1) and does the existing in-block binary
+    /// search. Most compact; eliminates the index-block search (the structural
+    /// win over a data-block hash index) while leaving the in-block lookup.
+    Block,
+    /// **Per-sub-block**: `slot` is the restart index. The read jumps to the
+    /// restart head and scans up to `restart_interval` entries. In-block
     /// granularity matches a data-block hash index.
     Restart,
-    /// `slot` is the exact entry index. The read jumps to the restart head and
-    /// decodes forward to the entry with no key comparisons. Costs roughly
-    /// `log2(restart_interval)` more bits per key than [`Restart`].
+    /// **Per-key**: `slot` is the exact entry index. The read jumps to the
+    /// restart head and decodes forward to the entry with no key comparisons.
+    /// Costs roughly `log2(restart_interval)` more bits per key than
+    /// [`Restart`].
     ///
     /// [`Restart`]: LocatorPrecision::Restart
     Entry,

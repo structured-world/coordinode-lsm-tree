@@ -75,6 +75,7 @@ fn precision_byte(p: LocatorPrecision) -> u8 {
     match p {
         LocatorPrecision::Restart => 0,
         LocatorPrecision::Entry => 1,
+        LocatorPrecision::Block => 2,
     }
 }
 
@@ -101,12 +102,20 @@ pub fn build_locator_section(entries: &[(u64, u64, u64)], spec: LocatorSpec) -> 
     let max_block = entries.iter().map(|e| e.1).max().unwrap_or(0);
     let max_slot = entries.iter().map(|e| e.2).max().unwrap_or(0);
 
+    // Per-block precision drops `slot` entirely (locator = block_id), so its
+    // width is 0 regardless of the recorded slot values and there is no slot
+    // fit to check.
+    let block_only = spec.precision == LocatorPrecision::Block;
     let block_id_bits = spec.block_id_bits.unwrap_or_else(|| bits_for(max_block));
-    let slot_bits = spec.slot_bits.unwrap_or_else(|| bits_for(max_slot));
+    let slot_bits = if block_only {
+        0
+    } else {
+        spec.slot_bits.unwrap_or_else(|| bits_for(max_slot))
+    };
 
     // Explicit widths that cannot hold the real layout → graceful skip.
     let block_fits = block_id_bits >= bits_for(max_block);
-    let slot_fits = slot_bits >= bits_for(max_slot);
+    let slot_fits = block_only || slot_bits >= bits_for(max_slot);
     let r = u16::from(block_id_bits) + u16::from(slot_bits);
     if !block_fits || !slot_fits || r == 0 || r > 64 {
         log::debug!(
@@ -115,6 +124,13 @@ pub fn build_locator_section(entries: &[(u64, u64, u64)], spec: LocatorSpec) -> 
         );
         return None;
     }
+    let slot_mask: u64 = if slot_bits == 0 {
+        0
+    } else if slot_bits >= 64 {
+        u64::MAX
+    } else {
+        (1u64 << slot_bits) - 1
+    };
     #[expect(
         clippy::cast_possible_truncation,
         reason = "r is validated to 1..=64 above, fits u8"
@@ -125,9 +141,10 @@ pub fn build_locator_section(entries: &[(u64, u64, u64)], spec: LocatorSpec) -> 
     let mut locators = Vec::with_capacity(entries.len());
     for &(hash, block_id, slot) in entries {
         hashes.push(hash);
-        // Pack (block_id, slot) into the low r bits. Both are proven to fit
-        // their widths by the checks above.
-        locators.push((block_id << slot_bits) | slot);
+        // Pack (block_id, slot) into the low r bits. block_id is proven to fit;
+        // slot is masked to its width (0 for per-block precision → block_id
+        // only).
+        locators.push((block_id << slot_bits) | (slot & slot_mask));
     }
 
     let params = match BurrParams::with_bpk(entries.len(), f32::from(r_u8)) {
@@ -165,23 +182,36 @@ pub fn build_locator_section(entries: &[(u64, u64, u64)], spec: LocatorSpec) -> 
     Some(section)
 }
 
-/// Test-only reader: parse a framed section and recover `(block_id, slot)` for
-/// `hash`. The production reader lands with the point-read path; this mirrors its
-/// unpack so the write-side build can be round-trip-tested here and from the
-/// table-writer integration test. `None` = the ribbon could not answer.
-#[cfg(test)]
+/// Recover the `(block_id, slot)` locator stored for `hash` in a framed
+/// `locator` section.
+///
+/// For a key in the table this is exact; for an absent key it is an unspecified
+/// pair (the caller verifies the key at the located block, so a stray locator
+/// only costs a wasted block read, never a wrong answer). `Ok(None)` means the
+/// ribbon could not answer and the caller should fall back to the sorted index.
+///
+/// # Errors
+///
+/// Returns [`crate::Error::InvalidHeader`] if the section is shorter than its
+/// fixed header or carries an unrecognised section version, or propagates a
+/// wire-parse error from the retrieval ribbon.
 #[expect(
     clippy::indexing_slicing,
-    clippy::unwrap_used,
-    reason = "test helper over a freshly-built section; out-of-range or parse \
-              failure is a bug to surface via panic"
+    reason = "header bytes [0..4) are gated by the `section.len() < SECTION_HEADER_LEN` \
+              check on the line above; the wire slice starts at the validated header end"
 )]
-pub fn locate_in_section(section: &[u8], hash: u64) -> Option<(u64, u64)> {
+pub fn locate(section: &[u8], hash: u64) -> crate::Result<Option<(u64, u64)>> {
     use crate::table::filter::ribbon::burr::recover_value_from_bytes;
-    assert!(section.len() >= SECTION_HEADER_LEN);
-    assert_eq!(section[0], SECTION_VERSION);
+    if section.len() < SECTION_HEADER_LEN {
+        return Err(crate::Error::InvalidHeader("LocatorSection"));
+    }
+    if section[0] != SECTION_VERSION {
+        return Err(crate::Error::InvalidHeader("LocatorSection version"));
+    }
     let slot_bits = section[3];
-    let packed = recover_value_from_bytes(&section[SECTION_HEADER_LEN..], hash).unwrap()?;
+    let Some(packed) = recover_value_from_bytes(&section[SECTION_HEADER_LEN..], hash)? else {
+        return Ok(None);
+    };
     let slot_mask = if slot_bits == 0 {
         0
     } else if slot_bits >= 64 {
@@ -189,13 +219,58 @@ pub fn locate_in_section(section: &[u8], hash: u64) -> Option<(u64, u64)> {
     } else {
         (1u64 << slot_bits) - 1
     };
-    Some((packed >> slot_bits, packed & slot_mask))
+    Ok(Some((packed >> slot_bits, packed & slot_mask)))
+}
+
+/// A loaded `locator` section ready for point-read resolution: the framed
+/// section bytes plus an ordinal → data-block-handle map.
+///
+/// `block_id` is the data block's 0-based ordinal in key (write) order, which
+/// the SST index yields in iteration order, so `blocks[block_id]` is the handle
+/// of the block the writer addressed. Built once at table open.
+#[derive(Debug)]
+pub struct LoadedLocator {
+    section: crate::Slice,
+    blocks: Vec<crate::table::BlockHandle>,
+}
+
+impl LoadedLocator {
+    /// Wrap the framed section bytes and the ordinal → handle map.
+    #[must_use]
+    pub fn new(section: crate::Slice, blocks: Vec<crate::table::BlockHandle>) -> Self {
+        Self { section, blocks }
+    }
+
+    /// Resolve `key_hash` to the data block holding the key's newest version.
+    ///
+    /// `Ok(None)` means the ribbon could not answer or the recovered `block_id`
+    /// is out of range; the caller falls back to the sorted index. The caller
+    /// MUST still verify the key inside the returned block: an absent key yields
+    /// a stray locator (a wasted block read), never a wrong answer.
+    ///
+    /// # Errors
+    ///
+    /// Propagates a parse error from [`locate`].
+    pub fn locate_block(&self, key_hash: u64) -> crate::Result<Option<crate::table::BlockHandle>> {
+        let Some((block_id, _slot)) = locate(&self.section, key_hash)? else {
+            return Ok(None);
+        };
+        // Block-id is bounds-validated against the ordinal map; the in-block
+        // `slot` is recovered but not yet used (the located block's own
+        // point_read does the in-block lookup), so block-id alone already
+        // eliminates the index-block binary search.
+        Ok(usize::try_from(block_id)
+            .ok()
+            .and_then(|i| self.blocks.get(i))
+            .copied())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     #![expect(
         clippy::expect_used,
+        clippy::unwrap_used,
         clippy::indexing_slicing,
         reason = "test assertions over known-good fixtures; failure surfaces via panic"
     )]
@@ -232,7 +307,7 @@ mod tests {
         assert_eq!(bytes[3], 5);
         for i in 0..300u64 {
             assert_eq!(
-                locate_in_section(&bytes, key_hash(i)),
+                locate(&bytes, key_hash(i)).unwrap(),
                 Some((i % 12, i % 25)),
                 "key {i} locator mismatch",
             );
@@ -267,7 +342,7 @@ mod tests {
         assert_eq!(bytes[3], 12);
         for i in 0..500u64 {
             assert_eq!(
-                locate_in_section(&bytes, key_hash(i)),
+                locate(&bytes, key_hash(i)).unwrap(),
                 Some((i % 1000, i % 4000))
             );
         }
