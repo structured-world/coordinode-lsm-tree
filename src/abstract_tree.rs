@@ -353,6 +353,33 @@ pub trait AbstractTree: sealed::Sealed {
     ///
     /// Returns a [`crate::compaction::CompactionResult`] describing what action was taken.
     ///
+    /// # Garbage-collection / merge-fold watermark (`seqno_threshold`)
+    ///
+    /// `seqno_threshold` is the MVCC garbage-collection watermark: the engine may
+    /// collapse history that no snapshot reading at a seqno `< seqno_threshold`
+    /// can still observe. Concretely, only entries whose seqno is `< seqno_threshold`
+    /// are eligible for:
+    ///
+    /// - dropping shadowed versions / GC-ing tombstones, and
+    /// - **folding merge operands** via the [`crate::MergeOperator`]: a key written
+    ///   only through [`Self::merge`] (no base value) accumulates one operand per
+    ///   call, and reads re-apply the whole chain (`O(operands)` per read) until
+    ///   compaction folds it. Folding a chain into a single value is only
+    ///   MVCC-safe when no live snapshot reads *between* the operands, which is
+    ///   exactly what `seqno_threshold` certifies.
+    ///
+    /// The engine does **not** track snapshots (unlike a `RocksDB`-style
+    /// snapshot list); the caller owns snapshot lifecycle and must supply this
+    /// watermark:
+    ///
+    /// - To fold/GC everything (no active snapshots), pass a value **above every
+    ///   live seqno** (e.g. the next value from the [`crate::SequenceNumberCounter`]).
+    /// - With outstanding snapshots, pass the **oldest** snapshot's seqno so their
+    ///   reads stay correct.
+    /// - `seqno_threshold == 0` certifies nothing as collapsible, so **no folding
+    ///   or GC happens** — `major_compact(target, 0)` only restructures tables and
+    ///   leaves a merge-only key's full operand chain intact.
+    ///
     /// # Errors
     ///
     /// Will return `Err` if an IO error occurs.

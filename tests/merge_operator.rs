@@ -1022,3 +1022,79 @@ fn merge_bloom_with_overlapping_non_matching_table() -> lsm_tree::Result<()> {
 
     Ok(())
 }
+
+/// Records the largest operand count a single `merge()` call received, so a
+/// test can detect whether compaction folded a merge-only key's operand chain.
+struct CountingMerge {
+    max_operands: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl MergeOperator for CountingMerge {
+    fn merge(
+        &self,
+        _key: &[u8],
+        base_value: Option<&[u8]>,
+        operands: &[&[u8]],
+    ) -> lsm_tree::Result<UserValue> {
+        self.max_operands
+            .fetch_max(operands.len(), std::sync::atomic::Ordering::Relaxed);
+        let mut counter: i64 = match base_value {
+            Some(bytes) if bytes.len() == 8 => {
+                i64::from_le_bytes(bytes.try_into().expect("checked length"))
+            }
+            Some(_) => return Err(lsm_tree::Error::MergeOperator),
+            None => 0,
+        };
+        for operand in operands {
+            if operand.len() != 8 {
+                return Err(lsm_tree::Error::MergeOperator);
+            }
+            counter += i64::from_le_bytes((*operand).try_into().expect("checked length"));
+        }
+        Ok(counter.to_le_bytes().to_vec().into())
+    }
+}
+
+#[test]
+fn merge_only_key_folds_operands_after_major_compaction() -> lsm_tree::Result<()> {
+    // #466: a key written ONLY via merge() (no base put) must have its operand
+    // chain folded by major compaction, so a later read applies O(1) operands
+    // instead of O(N). Without folding every read re-applies all N operands
+    // (the issue measured ~540x slowdown for a 1000-operand key).
+    let folder = tempfile::tempdir().unwrap();
+    let max_operands = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let tree = Config::new(
+        &folder,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_merge_operator(Some(Arc::new(CountingMerge {
+        max_operands: Arc::clone(&max_operands),
+    })))
+    .open()?;
+
+    const N: u64 = 100;
+    for i in 1..=N {
+        tree.merge("k", 1_i64.to_le_bytes(), i);
+    }
+    tree.flush_active_memtable(N + 1)?;
+    // Watermark above every operand seqno: no live snapshot reads between the
+    // operands, so the whole chain is safe to fold into a single value.
+    tree.major_compact(u64::MAX, N + 1)?;
+
+    // Read the key: the merge operator is applied over whatever operands the
+    // compaction left on disk. If folding worked, that is one operand (or a
+    // folded Value); if not, all N operands are re-applied.
+    max_operands.store(0, std::sync::atomic::Ordering::Relaxed);
+    let v = tree.get("k", lsm_tree::MAX_SEQNO)?.expect("key present");
+    let got = i64::from_le_bytes((*v).try_into().unwrap());
+    assert_eq!(got, N as i64, "merged value must be the sum of {N} ones");
+
+    let seen = max_operands.load(std::sync::atomic::Ordering::Relaxed);
+    assert!(
+        seen <= 1,
+        "after major compaction a merge-only key must read with O(1) operands, \
+         got {seen} (operands not folded — #466)"
+    );
+    Ok(())
+}
