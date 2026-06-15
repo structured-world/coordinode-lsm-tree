@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1781544527195,
+  "lastUpdate": 1781549357613,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -16614,6 +16614,84 @@ window.BENCHMARK_DATA = {
             "value": 688747.2633961936,
             "unit": "ops/sec",
             "extra": "P50: 1.3us | P99: 4.5us | P99.9: 7.0us\nthreads: 1 | elapsed: 0.29s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "dd47e51a663c58cceafa4aeff060b93c0fee9ecc",
+          "message": "feat(read): opt-in row cache for point reads (#476)\n\n## Summary\n\nAdds a **row cache**: a `key -> resolved point-read result` layer keyed\nby the owning (immutable) SST id + the user key's hash, so a repeat\npoint read returns the decoded value without re-walking the index or\nre-decoding the data block.\n\nFlamegraph attribution (#426) showed the in-block KV decode is the\nlargest read-path bucket (~25% on warm-cache point reads) and is\ninherent to the SSTable block format (RocksDB pays it too). A row cache\neliminates it for hot / repeated keys — the surrealkv-style \"serve from\nmemory\" effect, but as an explicit, bounded, opt-in cache.\n\n## Design\n\n- `cache.rs`: `TAG_ROW` + `Item::Row(InternalValue)`; `get_row`\n(verifies the full stored key to reject hash collisions) / `insert_row`;\nbyte weighting; `Cache::with_row_cache(bool)` opt-in (off by default —\nrows share the block-cache capacity when enabled).\n- `Table::get` / `Table::get_value`: check the row cache after the bloom\nprobe, before the index walk; populate only when the read could see the\nSST's newest version (`seqno > max`, exclusive snapshot semantics);\nserve a cached entry only when visible at the query snapshot\n(`cached.seqno < query`).\n\n## Correctness\n\nRests on three invariants:\n1. **memtable before SSTs** — fresh writes are never masked by a cached\nrow.\n2. **SSTs are immutable** — a cached row never goes stale within its\nSST; after compaction the new SST has a fresh table id, so reads of it\nmiss the stale rows (which age out via S3-FIFO).\n3. **exclusive seqno-visibility check** — snapshot reads stay correct.\n\nCovered by `tests/row_cache.rs` (5 tests): repeat-read value correctness\nacross all keys, snapshot returns the older version,\noverwrite-after-flush is not stale, row-cache-off matches row-cache-on,\noff-by-default. Full lib suite (1234) green, clippy clean.\n\n## Measured win\n\n`ours-row-cache` overlay vs `ours` on the `point_read` group (runner:\nFedora, kernel 7.0.11; criterion warm-cache repeat reads, None\ncompression):\n\n| group | `ours` | `ours-row-cache` | speedup |\n|-------|--------|------------------|---------|\n| point_read/1000 | 948 µs | **267 µs** | **3.5×** |\n| point_read/10000 | 10.93 ms | **2.84 ms** | **3.85×** |\n\nThis confirms the #426 hypothesis: the surrealkv read advantage was the\nin-block decode an LSM pays on flushed SSTs, and a memory-served\ndecoded-value cache closes it — bringing warm repeat point reads into\nsurrealkv's in-memory-skiplist class. Best case (repeated reads of the\nsame keys → ~100% hit); skewed/hot-key workloads benefit by hit rate,\nuniform/scan-heavy should leave it off (hence opt-in, off by default).\n\n## Enabling\n\n```rust\nlet cache = Arc::new(Cache::with_capacity_bytes(64 * 1024 * 1024).with_row_cache(true));\nlet tree = Config::new(path, ..).use_cache(cache).open()?;\n```\n\nCloses #475.",
+          "timestamp": "2026-06-15T21:48:03+03:00",
+          "tree_id": "cbdbe4266456406c9d6cb2895b92b63800070bd2",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/dd47e51a663c58cceafa4aeff060b93c0fee9ecc"
+        },
+        "date": 1781549338477,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 2061556.8931257364,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.6us | P99.9: 3.7us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1218433.7623706667,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.3us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 871797.7283854284,
+            "unit": "ops/sec",
+            "extra": "P50: 1.0us | P99: 4.1us | P99.9: 7.1us\nthreads: 1 | elapsed: 0.23s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3746797.9864407876,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 3.0us | P99.9: 5.5us\nthreads: 1 | elapsed: 0.05s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 451900.5422942077,
+            "unit": "ops/sec",
+            "extra": "P50: 1.9us | P99: 5.3us | P99.9: 8.2us\nthreads: 1 | elapsed: 0.44s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 231622.82153394545,
+            "unit": "ops/sec",
+            "extra": "P50: 4.0us | P99: 5.1us | P99.9: 8.3us\nthreads: 1 | elapsed: 0.86s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1275625.6530844574,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.0us | P99.9: 4.2us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1059323.7788649113,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 1.4us | P99.9: 2.7us\nthreads: 1 | elapsed: 0.19s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 671596.3856160038,
+            "unit": "ops/sec",
+            "extra": "P50: 1.3us | P99: 4.5us | P99.9: 7.3us\nthreads: 1 | elapsed: 0.30s | num: 200000 | iterations: 3"
           }
         ]
       }
