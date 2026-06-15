@@ -155,7 +155,7 @@ spin = { version = "0.12", default-features = false, features = ["mutex", "spin_
 hashbrown = { version = "0.16", default-features = false, features = ["default-hasher"] }
 parking_lot = { version = "0.12", optional = true }
 lz4_flex = { version = "0.13.0", optional = true, default-features = false }
-structured-zstd = { version = "0.0.39", optional = true, default-features = false, features = ["std", "lsm"] }
+structured-zstd = { version = "0.0.40", optional = true, default-features = false, features = ["std", "lsm"] }
 # `once_cell::race::OnceBox` — the no-std + alloc one-shot primitive.
 # We pick it over `std::sync::OnceLock` (which has both `set` and the
 # stabilised `get_or_try_init` on our 1.92 MSRV) because OnceLock is
@@ -353,3 +353,9 @@ name = "partial_decode"
 harness = false
 path = "benches/partial_decode.rs"
 required-features = ["zstd"]
+
+[[bench]]
+name = "scan_since"
+harness = false
+path = "benches/scan_since.rs"
+required-features = []

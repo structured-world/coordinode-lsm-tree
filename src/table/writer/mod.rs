@@ -140,6 +140,14 @@ pub struct Writer {
     /// partial decode.
     block_layouts: Vec<(BlockOffset, Vec<u32>)>,
 
+    /// Per-data-block `(offset, (seqno_min, seqno_max))`, accumulated in write
+    /// order when `use_seqno_in_index` is on and serialized into the optional
+    /// `seqno_bounds` SST section at finish. The bounds live here (a parallel
+    /// section) rather than inline in the index entries, so a point read's index
+    /// walk never pays for them; only a seqno-scoped scan loads the section.
+    /// Empty when `use_seqno_in_index` is off (section absent, zero extra bytes).
+    seqno_bounds_section: Vec<(BlockOffset, (u64, u64))>,
+
     /// Resolved retrieval-ribbon locator settings for this table, or `None`
     /// (default) when the level's [`crate::config::LocatorPolicy`] is disabled.
     /// `Some` makes the writer accumulate a per-key locator and emit the
@@ -193,13 +201,14 @@ pub struct Writer {
     )>,
 
     /// Per-block seqno bounds opt-in (the `seqno_in_index` runtime config).
-    /// When `true`, every data-block index entry carries `(seqno_min,
-    /// seqno_max)` (wire markers 2 / 3) and the SST is tagged
-    /// `index_format = 1`, letting a seqno-scoped scan skip blocks below the
-    /// target without reading them. Default `false` (legacy `index_format =
-    /// 0`, byte-identical index entries). Caller wires the live runtime
-    /// config into this field via [`Self::use_seqno_in_index`] before the
-    /// first key is added.
+    /// When `true`, the writer accumulates each data block's `(seqno_min,
+    /// seqno_max)` and emits them in the optional parallel `seqno_bounds`
+    /// SST section, letting a seqno-scoped scan skip blocks that cannot
+    /// overlap the target window without reading them. The index entries
+    /// stay byte-identical to the off-mode layout, so a point read pays
+    /// nothing. Default `false` (no section emitted). Caller wires the live
+    /// runtime config into this field via [`Self::use_seqno_in_index`]
+    /// before the first key is added.
     use_seqno_in_index: bool,
 
     /// Pre-trained zstd dictionary for dictionary compression
@@ -288,6 +297,7 @@ impl Writer {
                 .use_table_id(table_id),
 
             block_layouts: Vec::new(),
+            seqno_bounds_section: Vec::new(),
 
             locator: None,
             locators: Vec::new(),
@@ -618,20 +628,19 @@ impl Writer {
         self
     }
 
-    /// Enables per-block seqno bounds in the data-block index (the
-    /// `seqno_in_index` runtime config). When `true`, each index entry
-    /// carries `(seqno_min, seqno_max)` and the SST is tagged
-    /// `index_format = 1`. Must be called BEFORE the first key is added so
-    /// every index entry in the table uses the same format; callers
-    /// (`Tree` flush + compaction worker) pass the live config once at
-    /// writer construction. Default `false` (legacy `index_format = 0`).
+    /// Enables the optional per-block seqno-bounds section (the
+    /// `seqno_in_index` runtime config). When `true`, the writer records each
+    /// data block's `(seqno_min, seqno_max)` and emits the parallel
+    /// `seqno_bounds` section at `finish()`, powering the `scan_since_seqno`
+    /// block-skip. Must be called BEFORE the first key is added so the section
+    /// covers every block; callers (`Tree` flush + compaction worker) pass the
+    /// live config once at writer construction. Default `false` (no section).
     #[must_use]
     pub fn use_seqno_in_index(mut self, seqno_in_index: bool) -> Self {
-        // Must be fixed before the first key: `finish()` stamps a single
-        // SST-wide `index_format` from the final flag, while `spill_block`
-        // snapshots it per block — a mid-write toggle would leave mixed
-        // index-entry encodings behind incorrect table metadata. Same
-        // contract as `use_page_ecc` / `use_kv_checksums`.
+        // Must be fixed before the first key: the section must cover every
+        // block, so the flag is snapshotted per block in `spill_block` and a
+        // mid-write toggle would leave some blocks unrecorded. Same contract
+        // as `use_page_ecc` / `use_kv_checksums`.
         self.assert_not_started("use_seqno_in_index");
         self.use_seqno_in_index = seqno_in_index;
         self
@@ -993,13 +1002,18 @@ impl Writer {
         // or the handle over-reads on a non-default scheme.
         let bytes_written = header.on_disk_size_with(self.ecc);
 
-        let mut handle = KeyedBlockHandle::new(
+        let handle = KeyedBlockHandle::new(
             last_key.clone(),
             last_seqno,
             BlockHandle::new(self.meta.file_pos, bytes_written),
         );
+        // Seqno bounds go into the parallel `seqno_bounds` section keyed by this
+        // block's file offset, NOT inline in the index entry: keeping them out of
+        // the index keeps point-read index probes at their legacy cost while the
+        // seqno-scoped scan loads the section.
         if let Some((seqno_min, seqno_max)) = seqno_bounds {
-            handle = handle.with_seqno_bounds(seqno_min, seqno_max);
+            self.seqno_bounds_section
+                .push((self.meta.file_pos, (seqno_min, seqno_max)));
         }
         self.index_writer.register_data_block(handle)?;
 
@@ -1216,6 +1230,39 @@ impl Writer {
             )?;
         }
 
+        // Write the optional seqno-bounds section (only when seqno_in_index is on
+        // and at least one block was written). Parallel to the index, keyed by
+        // data-block offset; absent otherwise, so the index stays legacy-sized.
+        if !self.seqno_bounds_section.is_empty() {
+            self.file_writer.start("seqno_bounds")?;
+            self.block_buffer.clear();
+            crate::table::seqno_bounds::encode_seqno_bounds(
+                &mut self.block_buffer,
+                &self.seqno_bounds_section,
+            )?;
+            Block::write_into(
+                &mut self.file_writer,
+                &self.block_buffer,
+                crate::table::block::BlockIdentity {
+                    table_id: self.table_id,
+                    block_type: crate::table::block::BlockType::SeqnoBounds,
+                    dict_id: 0,
+                    window_log: 0,
+                },
+                &{
+                    let t = match self.encryption.as_deref() {
+                        Some(enc) => crate::table::block::BlockTransform::Encrypted(enc),
+                        None => crate::table::block::BlockTransform::PLAIN,
+                    };
+                    if let Some(ecc) = self.ecc {
+                        t.with_ecc(ecc)
+                    } else {
+                        t
+                    }
+                },
+            )?;
+        }
+
         // Write the optional retrieval-ribbon locator section. Emitted only when
         // the level's locator policy is enabled AND the per-SST widths fit the
         // actual layout (`build_locator_section` returns `None` to skip
@@ -1368,11 +1415,6 @@ impl Writer {
             data_block_restart_interval: self.data_block_restart_interval,
             index_block_restart_interval: self.index_block_restart_interval,
             initial_level: self.initial_level,
-            // `1` when the writer was built with `use_seqno_in_index(true)`:
-            // every data-block index entry carries `(seqno_min, seqno_max)`
-            // (wire markers 2 / 3) for seqno-scoped block-skip. `0` is the
-            // legacy format, byte-identical to the pre-seqno-bounds layout.
-            index_format: u8::from(self.use_seqno_in_index),
             range_tombstone_count,
             created_at_nanos,
         };
@@ -1589,11 +1631,6 @@ struct MetaSectionParams<'a> {
     data_block_restart_interval: u8,
     index_block_restart_interval: u8,
     initial_level: u8,
-    /// Index block format byte written to the SST Properties (#224).
-    /// `0` = legacy (no per-block seqno bounds); `1` = each data-block
-    /// index entry carries `(seqno_min, seqno_max)`. Set from the writer's
-    /// `seqno_in_index` config (`u8::from(self.use_seqno_in_index)`).
-    index_format: u8,
     range_tombstone_count: u64,
     /// `created_at` snapshot taken once in `finish()`. Both MID and
     /// TAIL writes consume this same value; generating it inside
@@ -1746,12 +1783,6 @@ fn write_meta_section<W: crate::io::Write + crate::io::Seek>(
         meta("descriptor#page_ecc", &ecc_descriptor),
         meta("file_size", &p.file_size.to_le_bytes()),
         meta("filter_hash_type", &[u8::from(ChecksumType::Xxh3)]),
-        // Index block format: 0 = legacy (no per-block seqno bounds in
-        // index entries, byte-identical to the prior layout); 1 = each
-        // data-block index entry carries `(seqno_min, seqno_max)` for
-        // seqno-scoped block-skip. Set from the writer's `seqno_in_index`
-        // config at build time.
-        meta("index_format", &[p.index_format]),
         meta("index_keys_have_seqno", &[0x1]),
         meta("initial_level", &p.initial_level.to_le_bytes()),
         meta("item_count", &p.item_count.to_le_bytes()),

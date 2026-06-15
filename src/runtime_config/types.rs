@@ -764,24 +764,23 @@ pub struct RuntimeConfig {
     /// compaction I/O. Toggling takes effect immediately for subsequent reads.
     pub auto_heal: bool,
 
-    /// Per-block seqno bounds in SST index entries (#224). When `true`,
-    /// SSTs written by the next flush / compaction record each data
-    /// block's `seqno_min` / `seqno_max` in its index entry
-    /// (`index_format = 1` in the table Properties), enabling fast
-    /// `scan_since_seqno` via block-skip: the scan skips any block whose
-    /// `seqno_max < target` without reading it.
+    /// Per-block seqno bounds for `scan_since_seqno` block-skip (#224). When
+    /// `true`, SSTs written by the next flush / compaction emit the optional
+    /// parallel `seqno_bounds` section, recording each data block's
+    /// `seqno_min` / `seqno_max` keyed by its file offset. A seqno-scoped scan
+    /// then skips any block whose bounds cannot overlap the target window
+    /// without reading it.
     ///
-    /// Default `false`: index blocks are byte-identical to the pre-#224
-    /// `index_format = 0` format, and `scan_since_seqno` falls back to a
-    /// per-entry filter. Decoding is marker-based: each index entry is
-    /// self-describing (legacy markers `0`/`1`, seqno-bounded `2`/`3`), so
-    /// mixed-format trees (some SSTs migrated, some not) read correctly
-    /// regardless of this setting; the stored `index_format` byte is a
-    /// metadata hint, not the decode switch.
+    /// Default `false`: no section is emitted (zero extra bytes) and
+    /// `scan_since_seqno` falls back to a per-entry filter. The index entries
+    /// are byte-identical regardless of this setting, so a point read pays
+    /// nothing either way, and a tree mixing SSTs with and without the section
+    /// reads correctly (a missing section simply means full-filter scan for
+    /// that SST).
     ///
-    /// Toggle takes effect on the next compaction / flush; existing SSTs
-    /// keep their original `index_format`. Compaction migrates source
-    /// SSTs to the current setting over time.
+    /// Toggle takes effect on the next compaction / flush; existing SSTs keep
+    /// whatever they were written with. Compaction migrates source SSTs to the
+    /// current setting over time.
     pub seqno_in_index: bool,
 
     /// Index-size threshold (bytes) at or below which an SST's block index
@@ -1272,10 +1271,9 @@ mod tests {
 
     #[test]
     fn runtime_config_default_seqno_in_index_off() {
-        // seqno_in_index is explicit opt-in (#224): default false keeps
-        // index blocks byte-identical to the pre-#224 index_format=0
-        // format. A regression flipping this default would change the
-        // on-disk index layout for every existing tree.
+        // seqno_in_index is explicit opt-in (#224): default false emits no
+        // seqno_bounds section, so SSTs carry zero extra bytes. A regression
+        // flipping this default would add the section to every new tree.
         assert!(!RuntimeConfig::default().seqno_in_index);
     }
 

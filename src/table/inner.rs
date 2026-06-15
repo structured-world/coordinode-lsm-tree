@@ -109,6 +109,12 @@ pub struct Inner {
     )]
     pub(crate) block_layout: BlockLayoutMap,
 
+    /// Per-data-block seqno bounds, loaded on open from the optional
+    /// `seqno_bounds` section. Empty when the table has none (legacy or
+    /// `seqno_in_index` off), so `scan_since_seqno` falls back to a full
+    /// per-entry filter. Read only by the seqno-scoped scan path.
+    pub(crate) seqno_bounds: crate::table::seqno_bounds::SeqnoBoundsMap,
+
     /// Retrieval-ribbon locator, loaded on open from the optional `locator`
     /// section. `Some` only when the table was written with a locator policy
     /// enabled; lets a point read resolve a key to its data block in O(1),
