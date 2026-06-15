@@ -231,6 +231,16 @@ reed-solomon-simd = { version = "3", optional = true, default-features = false }
 # minimal / no-std builds drop it.
 rayon = { version = "1.10", optional = true }
 
+[target.'cfg(any(target_arch = "x86_64", target_arch = "x86"))'.dependencies]
+# `cpufeatures` is a `#![no_std]` runtime CPU-feature detector (cached CPUID
+# with the XCR0/XGETBV OS-state check baked in, so AVX detection cannot SIGILL).
+# Replaces `std::is_x86_feature_detected!` (std-only) on the key-comparison hot
+# path so the AVX-512 / AVX2 SIMD lanes light up under `no_std` too. Target-gated
+# to x86 because the crate `compile_error!`s on other arches (e.g. the
+# `thumbv7em-none-eabihf` no-std-check target); the key-comparison dispatch only
+# references it under the same `cfg`. Used by: `table::util`.
+cpufeatures = "0.3"
+
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = { version = "0.7", optional = true }
 # `#![no_std]` raw Linux syscall layer for the `io-uring-raw` backend (#346):
