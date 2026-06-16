@@ -1045,6 +1045,58 @@ mod tests {
     }
 
     #[test]
+    fn custom_comparator_orders_and_reverse_iterates() {
+        // A non-lexicographic comparator (orders user keys in REVERSE byte
+        // order) exercises the trait-dispatch (`else`) branch of compare_key
+        // (via insert / find_splice) and compare_nodes (via reverse iteration /
+        // find_predecessor) — the paths the default lexicographic fast path
+        // skips.
+        #[derive(Debug)]
+        struct ReverseComparator;
+        impl crate::comparator::UserComparator for ReverseComparator {
+            fn name(&self) -> &'static str {
+                "reverse-test"
+            }
+            fn compare(&self, a: &[u8], b: &[u8]) -> core::cmp::Ordering {
+                b.cmp(a)
+            }
+            fn is_lexicographic(&self) -> bool {
+                false
+            }
+        }
+
+        let map = SkipMap::new(alloc::sync::Arc::new(ReverseComparator));
+        assert!(
+            !map.is_lexicographic,
+            "a custom comparator must take the trait-dispatch path"
+        );
+
+        map.insert(&make_key(b"aaa", 1), &make_value(b"a"));
+        map.insert(&make_key(b"ccc", 1), &make_value(b"c"));
+        map.insert(&make_key(b"bbb", 1), &make_value(b"b"));
+
+        // Forward iteration follows the custom (reverse) order.
+        let fwd: Vec<Vec<u8>> = map.iter().map(|e| e.key().user_key.to_vec()).collect();
+        assert_eq!(
+            fwd,
+            vec![b"ccc".to_vec(), b"bbb".to_vec(), b"aaa".to_vec()],
+            "custom comparator orders entries in reverse byte order"
+        );
+
+        // Reverse iteration (drives compare_nodes via find_predecessor) mirrors it.
+        let rev: Vec<Vec<u8>> = map
+            .iter()
+            .rev()
+            .map(|e| e.key().user_key.to_vec())
+            .collect();
+        assert_eq!(
+            rev,
+            vec![b"aaa".to_vec(), b"bbb".to_vec(), b"ccc".to_vec()],
+            "reverse iteration mirrors the custom order"
+        );
+    }
+
+    #[test]
     fn ordering_user_key_asc_seqno_desc() {
         let map = new_map();
 
