@@ -1271,6 +1271,30 @@ mod tests {
     }
 
     #[test]
+    #[expect(clippy::expect_used, reason = "test helper computes a known digest")]
+    fn verify_kv_digests_rejects_non_4_byte_algorithm_tag() {
+        // AtInsert only ever stores a 4-byte algorithm. A present-digest node
+        // whose algorithm bits decode to a non-4-byte algorithm (e.g. Xxh3_64
+        // after a single-bit flip from Xxh3Low32's tag 1 to tag 0) is metadata
+        // corruption. Store the Xxh3_64 digest truncated to u32 under the
+        // 8-byte Xxh3_64 tag: the worst case where comparing the digest alone
+        // would pass. Verification must reject it on the algorithm tag instead.
+        let map = new_map();
+        let key = make_key(b"k", 1);
+        let val = make_value(b"v");
+        let item = InternalValue::new(key.clone(), val.clone());
+        #[expect(clippy::cast_possible_truncation, reason = "low 32 bits on purpose")]
+        let d64 = crate::table::block::kv_checksum::kv_digest(&item, ChecksumAlgorithm::Xxh3_64)
+            .expect("xxh3 always available") as u32;
+        map.insert_with_kv_digest(&key, &val, Some((d64, ChecksumAlgorithm::Xxh3_64)));
+
+        assert!(
+            map.verify_kv_digests().is_err(),
+            "a present digest under a non-4-byte algorithm must be rejected, not verified"
+        );
+    }
+
+    #[test]
     fn insert_and_get_single() {
         let map = new_map();
         let key = make_key(b"hello", 1);
