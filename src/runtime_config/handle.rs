@@ -196,13 +196,23 @@ impl RuntimeConfigHandle {
         if matches!(
             next.kv_checksum_compute_point,
             crate::runtime_config::KvChecksumComputePoint::AtInsert
-        ) && next.kv_checksum_algo.digest_size() != 4
-        {
-            // Short, machine-matchable marker per the FeatureUnsupported
+        ) {
+            // Short, machine-matchable markers per the FeatureUnsupported
             // contract; the 4-byte-slot rationale lives in the comment above.
-            return Err(crate::Error::FeatureUnsupported(
-                "kv_checksum_compute_point=AtInsert requires a 4-byte algorithm",
-            ));
+            if next.kv_checksum_algo.digest_size() != 4 {
+                return Err(crate::Error::FeatureUnsupported(
+                    "kv_checksum_compute_point=AtInsert requires a 4-byte algorithm",
+                ));
+            }
+            // The algorithm must also be compiled in: a 4-byte algorithm whose
+            // digest cannot be computed (e.g. Crc32c without the `crc32c`
+            // feature) would silently skip residence digests at insert and fail
+            // at flush. Reject it here instead.
+            if !next.kv_checksum_algo.is_available() {
+                return Err(crate::Error::FeatureUnsupported(
+                    "kv_checksum_compute_point=AtInsert requires a compiled-in algorithm",
+                ));
+            }
         }
         #[cfg(feature = "std")]
         {
@@ -393,12 +403,11 @@ mod tests {
     fn try_update_accepts_at_insert_with_4_byte_algorithm() {
         use super::super::types::KvChecksumComputePoint;
 
-        // A 4-byte algorithm fits the node's reserved slot, so AtInsert is
-        // accepted and becomes visible on the next load.
-        for algo in [ChecksumAlgorithm::Xxh3Low32, ChecksumAlgorithm::Crc32c] {
-            // Crc32c needs the cargo feature to be a usable runtime algo, but
-            // its digest width is 4 regardless, so the config-level acceptance
-            // check is independent of the feature.
+        // Asserts AtInsert + a compiled 4-byte algorithm is accepted and
+        // visible on the next load. Xxh3Low32 is always compiled; Crc32c only
+        // when the `crc32c` feature is on (its rejection without the feature is
+        // covered by `try_update_rejects_at_insert_with_uncompiled_algorithm`).
+        let assert_accepted = |algo: ChecksumAlgorithm| {
             let handle = RuntimeConfigHandle::new(RuntimeConfig::default());
             let result = handle.try_update(|c| {
                 c.kv_checksum_algo = algo;
@@ -406,14 +415,18 @@ mod tests {
             });
             assert!(
                 result.is_ok(),
-                "AtInsert + 4-byte {algo:?} must be accepted, got {result:?}"
+                "AtInsert + compiled 4-byte {algo:?} must be accepted, got {result:?}"
             );
             assert_eq!(
                 handle.load().kv_checksum_compute_point,
                 KvChecksumComputePoint::AtInsert,
                 "accepted AtInsert must be visible on next load for {algo:?}"
             );
-        }
+        };
+
+        assert_accepted(ChecksumAlgorithm::Xxh3Low32);
+        #[cfg(feature = "crc32c")]
+        assert_accepted(ChecksumAlgorithm::Crc32c);
     }
 
     #[cfg(not(feature = "crc32c"))]

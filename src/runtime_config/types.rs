@@ -75,6 +75,24 @@ impl ChecksumAlgorithm {
         }
     }
 
+    /// Whether this algorithm can actually compute a digest in this build.
+    ///
+    /// [`Self::Xxh3_64`] / [`Self::Xxh3Low32`] are always available;
+    /// [`Self::Crc32c`] only when the `crc32c` cargo feature is enabled (its
+    /// [`Self::compute`] returns `None` otherwise). Config validation uses this
+    /// to reject selecting an uncompiled algorithm up front, rather than
+    /// silently skipping digests or failing later at flush.
+    #[must_use]
+    pub const fn is_available(self) -> bool {
+        match self {
+            Self::Xxh3_64 | Self::Xxh3Low32 => true,
+            #[cfg(feature = "crc32c")]
+            Self::Crc32c => true,
+            #[cfg(not(feature = "crc32c"))]
+            Self::Crc32c => false,
+        }
+    }
+
     /// Compute the digest of `bytes` under this algorithm, returned as a
     /// `u64` (the low [`Self::digest_size`] bytes are the meaningful
     /// digest; wider algorithms fill more of the word).

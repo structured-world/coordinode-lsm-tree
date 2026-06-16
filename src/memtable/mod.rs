@@ -17,7 +17,7 @@ use crate::{
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
 use core::ops::RangeBounds;
-use core::sync::atomic::{AtomicBool, AtomicU8};
+use core::sync::atomic::AtomicBool;
 use portable_atomic::AtomicU64;
 // `parking_lot::RwLock` (std: small, userspace fast-path, no poisoning) /
 // `spin::RwLock` (no_std). Neither poisons on a panicked holder, so the read/
@@ -73,13 +73,13 @@ pub struct Memtable {
 
     pub(crate) requested_rotation: AtomicBool,
 
-    /// Algorithm of the insert-time per-KV digests stored in this memtable's
-    /// nodes (`KvChecksumComputePoint::AtInsert`), as `1 + wire_tag`, or `0`
-    /// when no `AtInsert` digest has been inserted. Set (idempotently) on the
-    /// first digest-bearing insert and read once at flush by
-    /// [`Self::verify_kv_residence`]. `0` means there is nothing to verify, so
-    /// the default (`Off` / `AtBlockCompile`) path never walks the nodes.
-    kv_insert_algo: AtomicU8,
+    /// Whether any insert-time per-KV digest (`KvChecksumComputePoint::AtInsert`)
+    /// has been stored in this memtable. Set on the first digest-bearing insert
+    /// and read once at flush by [`Self::verify_kv_residence`] to skip walking
+    /// the nodes entirely when there is nothing to verify (the default `Off` /
+    /// `AtBlockCompile` path). The per-node digest carries its own algorithm, so
+    /// no memtable-wide algorithm is tracked here.
+    has_at_insert_digests: AtomicBool,
 }
 
 impl Memtable {
@@ -121,7 +121,7 @@ impl Memtable {
             approximate_size: AtomicU64::default(),
             highest_seqno: AtomicU64::default(),
             requested_rotation: AtomicBool::default(),
-            kv_insert_algo: AtomicU8::new(0),
+            has_at_insert_digests: AtomicBool::default(),
         }
     }
 
@@ -261,10 +261,11 @@ impl Memtable {
             .approximate_size
             .fetch_add(total_size, core::sync::atomic::Ordering::AcqRel);
 
-        if let Some(algo) = kv_algo {
-            // Record the algorithm once (idempotent) for the flush-time verify.
-            self.kv_insert_algo
-                .store(1 + algo.wire_tag(), core::sync::atomic::Ordering::Relaxed);
+        if kv_algo.is_some() {
+            // Flag that this memtable carries residence digests for the
+            // flush-time verify. The algorithm lives per node.
+            self.has_at_insert_digests
+                .store(true, core::sync::atomic::Ordering::Relaxed);
         }
 
         for item in items {
@@ -275,7 +276,7 @@ impl Memtable {
                         reason = "AtInsert is config-validated to a 4-byte algorithm; the digest fits u32"
                     )]
                     let lo = d as u32;
-                    lo
+                    (lo, algo)
                 })
             });
             let key = InternalKey::new(item.key.user_key, item.key.seqno, item.key.value_type);
@@ -323,11 +324,12 @@ impl Memtable {
     ///
     /// `kv_digest` is `Some((digest, algo))` when the caller computed the
     /// entry's 4-byte logical-content digest at insert (under `AtInsert` with a
-    /// 4-byte algorithm), or `None` for the plain path. When present, the
-    /// digest is stored in the skiplist node and the memtable records `algo`
-    /// so [`Self::verify_kv_residence`] can re-check every digest-bearing node
-    /// at flush. Mixed inserts (some with, some without a digest) are supported
-    /// for the `Off` -> `AtInsert` live toggle.
+    /// 4-byte algorithm), or `None` for the plain path. When present, the digest
+    /// and its algorithm are stored in the skiplist node (per node, so a later
+    /// config change cannot misverify it) and the memtable flags that it carries
+    /// at least one digest so [`Self::verify_kv_residence`] knows to walk at
+    /// flush. Mixed inserts (some with, some without a digest) are supported for
+    /// the `Off` -> `AtInsert` live toggle.
     #[doc(hidden)]
     pub fn insert_with_kv_digest(
         &self,
@@ -349,17 +351,17 @@ impl Memtable {
             .approximate_size
             .fetch_add(item_size, core::sync::atomic::Ordering::AcqRel);
 
-        if let Some((_, algo)) = kv_digest {
-            // Record the algorithm (idempotent) so the flush-time verify knows
-            // how to recompute. `1 + wire_tag` keeps `0` meaning "no AtInsert
-            // digest written" (so the default path never walks nodes).
-            self.kv_insert_algo
-                .store(1 + algo.wire_tag(), core::sync::atomic::Ordering::Relaxed);
+        if kv_digest.is_some() {
+            // Flag that this memtable carries at least one residence digest so
+            // the flush-time verify walks the nodes. The algorithm lives per
+            // node, not here.
+            self.has_at_insert_digests
+                .store(true, core::sync::atomic::Ordering::Relaxed);
         }
 
         let key = InternalKey::new(item.key.user_key, item.key.seqno, item.key.value_type);
         self.items
-            .insert_with_kv_digest(&key, &item.value, kv_digest.map(|(d, _)| d));
+            .insert_with_kv_digest(&key, &item.value, kv_digest);
 
         self.highest_seqno
             .fetch_max(item.key.seqno, core::sync::atomic::Ordering::AcqRel);
@@ -372,25 +374,23 @@ impl Memtable {
     /// [`KvChecksumComputePoint::AtInsert`](crate::runtime_config::KvChecksumComputePoint::AtInsert)
     /// residence check), called once at flush.
     ///
-    /// Returns `Ok` immediately when no `AtInsert` digest was ever inserted (the
-    /// recorded algorithm is `0`), so the default path pays nothing.
+    /// Returns `Ok` immediately when no `AtInsert` digest was ever inserted, so
+    /// the default path pays nothing.
     ///
     /// # Errors
     ///
     /// - [`crate::Error::MemtableKvChecksumMismatch`] when an entry's stored
     ///   digest diverges from the recompute (a RAM bit-flip during residence).
-    /// - [`crate::Error::FeatureUnsupported`] when the recorded algorithm is
-    ///   not compiled into this build.
+    /// - [`crate::Error::FeatureUnsupported`] when a node's algorithm is not
+    ///   compiled into this build.
     pub fn verify_kv_residence(&self) -> crate::Result<()> {
-        let tag = self
-            .kv_insert_algo
-            .load(core::sync::atomic::Ordering::Relaxed);
-        if tag == 0 {
+        if !self
+            .has_at_insert_digests
+            .load(core::sync::atomic::Ordering::Relaxed)
+        {
             return Ok(());
         }
-        let algo = crate::runtime_config::ChecksumAlgorithm::from_wire_tag(tag - 1)
-            .ok_or(crate::Error::FeatureUnsupported("kv-checksum-algorithm"))?;
-        self.items.verify_kv_digests(algo)
+        self.items.verify_kv_digests()
     }
 
     /// Inserts a range tombstone covering `[start, end)` at the given seqno.
