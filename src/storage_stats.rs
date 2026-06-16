@@ -1,0 +1,250 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026-present, Structured World Foundation
+
+//! Read-only storage introspection: how much is stored, the average shape of a
+//! stored entry, and an estimate of how many more entries fit in a byte budget.
+//!
+//! Computed from the live version's table + blob-file metadata plus one
+//! size-stat per live file (the same accounting `Tree::create_checkpoint`
+//! uses), so it never touches the data blocks. See
+//! [`crate::AbstractTree::storage_stats`].
+
+use crate::version::Version;
+
+/// Coarse storage state of a tree.
+///
+/// This release reports [`Self::Healthy`] and [`Self::CompactionInProgress`].
+/// The capacity-dependent variants are populated once storage admission control
+/// (a configured byte quota / disk-free probe) lands; they are defined now so
+/// the enum stays stable across that work.
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
+#[non_exhaustive]
+pub enum StorageStatus {
+    /// Normal operation: writes and a full compaction are available.
+    Healthy,
+    /// Enough free space for a normal (full) compaction.
+    FullCompactionAvailable,
+    /// Not enough space for a full compaction, but the opt-in tight-space
+    /// (incremental-reclaim) compaction mode can still run.
+    TightCompactionAvailable,
+    /// Out of space: the tree is read-only until space is freed or the quota
+    /// is raised.
+    ReadOnlyOutOfSpace,
+    /// A compaction is currently running.
+    CompactionInProgress,
+}
+
+/// A point-in-time snapshot of a tree's on-disk storage footprint and the
+/// average shape of a stored entry.
+///
+/// All byte figures are on-disk (post-compression, including any per-block
+/// overhead and blob files). Averages are over every stored entry version, so
+/// they pair with [`Self::item_count`].
+#[must_use]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct StorageStats {
+    /// Total on-disk bytes of all live SSTs plus blob files.
+    pub used_bytes: u64,
+
+    /// Number of live entries (all versions) across all live SSTs.
+    pub item_count: u64,
+
+    /// Number of live SSTs.
+    pub table_count: u64,
+
+    /// Average on-disk bytes per entry (`used_bytes / item_count`), or `0` when
+    /// the tree is empty. This is the figure
+    /// [`Self::estimated_remaining_entries`] divides a budget by.
+    pub avg_entry_on_disk_bytes: u64,
+
+    /// Average user-key byte length per entry, or `None` if any live table was
+    /// written before per-table key/value byte sums were recorded (the average
+    /// key/value split is only exact when every table carries the figures).
+    pub avg_key_bytes: Option<u64>,
+
+    /// Average value byte length per entry, or `None` under the same condition
+    /// as [`Self::avg_key_bytes`].
+    pub avg_value_bytes: Option<u64>,
+
+    /// Estimated bytes a full compaction could reclaim, from the
+    /// weak-tombstone-reclaimable entry count times the average on-disk entry
+    /// size. An estimate, not an exact figure.
+    pub reclaimable_bytes_estimate: u64,
+
+    /// Coarse storage state.
+    pub status: StorageStatus,
+}
+
+impl StorageStats {
+    /// Approximately how many more average-shaped entries fit in `budget_bytes`,
+    /// using [`Self::avg_entry_on_disk_bytes`].
+    ///
+    /// Returns `0` when the average entry size is unknown (an empty tree), since
+    /// there is no basis for the estimate.
+    #[must_use]
+    pub fn estimated_remaining_entries(&self, budget_bytes: u64) -> u64 {
+        if self.avg_entry_on_disk_bytes == 0 {
+            0
+        } else {
+            budget_bytes / self.avg_entry_on_disk_bytes
+        }
+    }
+}
+
+/// Computes [`StorageStats`] from a live version's table + blob-file metadata.
+///
+/// `is_compacting` selects [`StorageStatus::CompactionInProgress`] vs
+/// [`StorageStatus::Healthy`]; the caller supplies it because compaction state
+/// is engine-internal.
+///
+/// `value_bytes_are_user_values` must be `false` for a KV-separated
+/// (`BlobTree`) tree: there the SST records a small indirection pointer per
+/// large value, not the user value, so the per-table value-byte sum measures
+/// pointers and the value average would misreport. When `false`,
+/// [`StorageStats::avg_value_bytes`] is forced to `None`. Key bytes are never
+/// separated, so [`StorageStats::avg_key_bytes`] stays exact either way.
+///
+/// `used_bytes` is the true on-disk file size of every live table and blob
+/// file (one metadata stat per file), not the writer's `Metadata::file_size`
+/// or [`crate::version::Version::blob_files`]' compressed-payload sum: those
+/// undercount the physical file by the meta block / footer / blob trailer.
+/// Statting matches the figure `Tree::create_checkpoint` reports, so the two
+/// agree on disk reality.
+///
+/// # Errors
+///
+/// Returns an error if a live table or blob file's size cannot be stat-ed.
+pub(crate) fn compute_storage_stats(
+    version: &Version,
+    is_compacting: bool,
+    value_bytes_are_user_values: bool,
+) -> crate::Result<StorageStats> {
+    let mut used_bytes = 0u64;
+    let mut item_count = 0u64;
+    let mut table_count = 0u64;
+    let mut reclaimable_entries = 0u64;
+    let mut sum_key = 0u64;
+    let mut sum_value = 0u64;
+    // The key/value split is only exact when EVERY live table records the byte
+    // sums; a single legacy table without them makes the average unrepresentable.
+    let mut all_have_shape = true;
+
+    for table in version.iter_tables() {
+        let m = &table.metadata;
+        // Physical file size, NOT m.file_size (which undercounts — see above).
+        let on_disk = table.fs.metadata(&table.path)?.len;
+        used_bytes = used_bytes.saturating_add(on_disk);
+        item_count = item_count.saturating_add(m.item_count);
+        table_count += 1;
+        reclaimable_entries = reclaimable_entries.saturating_add(m.weak_tombstone_reclaimable);
+        match (m.sum_user_key_bytes, m.sum_value_bytes) {
+            (Some(k), Some(v)) => {
+                sum_key = sum_key.saturating_add(k);
+                sum_value = sum_value.saturating_add(v);
+            }
+            _ => all_have_shape = false,
+        }
+    }
+
+    // Physical blob-file size (metadata + trailer included), NOT
+    // BlobFileList::on_disk_size() which sums only the compressed payload.
+    for blob in version.blob_files.iter() {
+        used_bytes = used_bytes.saturating_add(blob.0.fs.metadata(&blob.0.path)?.len);
+    }
+
+    let avg_entry_on_disk_bytes = if item_count == 0 {
+        0
+    } else {
+        used_bytes / item_count
+    };
+
+    let have_shape = all_have_shape && item_count > 0;
+    let avg_key_bytes = have_shape.then(|| sum_key / item_count);
+    // Value bytes are only meaningful when not KV-separated (see param doc).
+    let avg_value_bytes =
+        (have_shape && value_bytes_are_user_values).then(|| sum_value / item_count);
+
+    let reclaimable_bytes_estimate = reclaimable_entries.saturating_mul(avg_entry_on_disk_bytes);
+
+    let status = if is_compacting {
+        StorageStatus::CompactionInProgress
+    } else {
+        StorageStatus::Healthy
+    };
+
+    Ok(StorageStats {
+        used_bytes,
+        item_count,
+        table_count,
+        avg_entry_on_disk_bytes,
+        avg_key_bytes,
+        avg_value_bytes,
+        reclaimable_bytes_estimate,
+        status,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn stats_with_avg(avg_entry_on_disk_bytes: u64) -> StorageStats {
+        StorageStats {
+            used_bytes: 0,
+            item_count: 0,
+            table_count: 0,
+            avg_entry_on_disk_bytes,
+            avg_key_bytes: None,
+            avg_value_bytes: None,
+            reclaimable_bytes_estimate: 0,
+            status: StorageStatus::Healthy,
+        }
+    }
+
+    #[test]
+    fn estimated_remaining_entries_divides_budget_by_average() {
+        // budget / avg_entry_on_disk: 1000 bytes at 50 bytes/entry = 20 entries.
+        let stats = stats_with_avg(50);
+        assert_eq!(stats.estimated_remaining_entries(1000), 20);
+        // Partial entries round down (integer division).
+        assert_eq!(stats.estimated_remaining_entries(1049), 20);
+        assert_eq!(stats.estimated_remaining_entries(0), 0);
+    }
+
+    #[test]
+    fn estimated_remaining_entries_is_zero_when_average_is_unknown() {
+        // An empty tree has no average to extrapolate from, so any budget
+        // yields 0 rather than dividing by zero.
+        let stats = stats_with_avg(0);
+        assert_eq!(stats.estimated_remaining_entries(1_000_000), 0);
+    }
+
+    #[test]
+    fn compute_on_empty_version_maps_compaction_flag_to_status() {
+        use crate::TreeType;
+        use crate::version::Version;
+
+        // An empty version has no tables, so no file is stat-ed: the call is
+        // pure and exercises only the status mapping and the zero-table path.
+        let version = Version::new(0, TreeType::Standard);
+
+        #[expect(
+            clippy::unwrap_used,
+            reason = "compute_storage_stats cannot fail on an empty in-memory version (no file to stat)"
+        )]
+        let busy = compute_storage_stats(&version, true, true).unwrap();
+        assert_eq!(busy.status, StorageStatus::CompactionInProgress);
+        assert_eq!(busy.used_bytes, 0);
+        assert_eq!(busy.item_count, 0);
+        assert_eq!(busy.table_count, 0);
+        assert_eq!(busy.avg_key_bytes, None);
+        assert_eq!(busy.estimated_remaining_entries(1_000_000), 0);
+
+        #[expect(
+            clippy::unwrap_used,
+            reason = "compute_storage_stats cannot fail on an empty in-memory version (no file to stat)"
+        )]
+        let idle = compute_storage_stats(&version, false, true).unwrap();
+        assert_eq!(idle.status, StorageStatus::Healthy);
+    }
+}

@@ -54,6 +54,16 @@ pub struct ParsedMeta {
     pub weak_tombstone_count: u64,
     pub weak_tombstone_reclaimable: u64,
 
+    /// Sum of user-key byte lengths across all entries in this table (every
+    /// version), or `None` for tables written before this field existed.
+    /// Used by storage introspection to report the average key size; callers
+    /// fall back to a file-size estimate when absent.
+    pub sum_user_key_bytes: Option<u64>,
+
+    /// Sum of value byte lengths across all entries in this table (every
+    /// version), or `None` for tables written before this field existed.
+    pub sum_value_bytes: Option<u64>,
+
     pub data_block_compression: CompressionType,
     pub index_block_compression: CompressionType,
 
@@ -402,6 +412,22 @@ impl ParsedMeta {
             }
         };
 
+        // Optional shape fields (absent on tables written before storage
+        // introspection support; callers fall back to a file-size estimate).
+        // Present-but-wrong-width is corrupt meta, so require exactly 8 bytes.
+        let read_opt_u64 = |key: &[u8]| -> crate::Result<Option<u64>> {
+            match block.point_read(key, SeqNo::MAX, &cmp)? {
+                Some(item) => {
+                    let bytes = <[u8; 8]>::try_from(&item.value[..])
+                        .map_err(|_| crate::Error::InvalidHeader("TableMeta"))?;
+                    Ok(Some(u64::from_le_bytes(bytes)))
+                }
+                None => Ok(None),
+            }
+        };
+        let sum_user_key_bytes = read_opt_u64(b"key_bytes#sum")?;
+        let sum_value_bytes = read_opt_u64(b"value_bytes#sum")?;
+
         Ok(Self {
             id,
             created_at,
@@ -415,6 +441,8 @@ impl ParsedMeta {
             tombstone_count,
             weak_tombstone_count,
             weak_tombstone_reclaimable,
+            sum_user_key_bytes,
+            sum_value_bytes,
             data_block_compression,
             index_block_compression,
             kv_checksum_algo,
@@ -596,6 +624,33 @@ mod tests {
         let items = valid_meta_items();
         let result = load_meta_from_items(&items);
         assert!(result.is_ok(), "valid meta must parse: {result:?}");
+    }
+
+    /// Backward compatibility: an SST written before the per-table key/value
+    /// byte sums existed has no `key_bytes#sum` / `value_bytes#sum` meta keys
+    /// (`valid_meta_items` omits them, mirroring an older writer). The parse
+    /// must succeed with both fields `None`, never error.
+    #[test]
+    fn load_with_handle_missing_key_value_byte_sums_parses_as_none() {
+        let items = valid_meta_items();
+        let parsed = load_meta_from_items(&items).unwrap();
+        assert_eq!(parsed.sum_user_key_bytes, None);
+        assert_eq!(parsed.sum_value_bytes, None);
+    }
+
+    /// When present, the byte sums round-trip through the meta block as
+    /// `Some(_)`.
+    #[test]
+    fn load_with_handle_key_value_byte_sums_present_round_trip() {
+        let mut items = valid_meta_items();
+        items.push(meta("key_bytes#sum", &320u64.to_le_bytes()));
+        items.push(meta("value_bytes#sum", &640u64.to_le_bytes()));
+        // The meta block is a sorted KV block; re-sort after appending.
+        items.sort_by(|a, b| a.key.user_key.cmp(&b.key.user_key));
+
+        let parsed = load_meta_from_items(&items).unwrap();
+        assert_eq!(parsed.sum_user_key_bytes, Some(320));
+        assert_eq!(parsed.sum_value_bytes, Some(640));
     }
 
     /// Missing `table_version` must return `Err(InvalidHeader)`, not panic.

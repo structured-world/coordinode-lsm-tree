@@ -98,6 +98,48 @@ pub trait AbstractTree: sealed::Sealed {
     #[doc(hidden)]
     fn current_version(&self) -> Version;
 
+    /// Returns a read-only snapshot of the tree's on-disk storage footprint:
+    /// total used bytes, entry count, the average shape of a stored entry
+    /// (average key / value bytes), and an estimate of how many more
+    /// average-shaped entries fit in a byte budget (see
+    /// [`StorageStats::estimated_remaining_entries`](crate::StorageStats::estimated_remaining_entries)).
+    ///
+    /// Computed from the live version's table + blob metadata plus one
+    /// size-stat per live file; it never reads a data block. The default
+    /// implementation reports [`StorageStatus::Healthy`](crate::StorageStatus::Healthy);
+    /// the standard tree overrides it to report
+    /// [`StorageStatus::CompactionInProgress`](crate::StorageStatus::CompactionInProgress) while a
+    /// compaction runs.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use lsm_tree::Error as TreeError;
+    /// use lsm_tree::{AbstractTree, Config};
+    ///
+    /// let folder = tempfile::tempdir()?;
+    /// let tree = Config::new(&folder, Default::default(), Default::default()).open()?;
+    ///
+    /// for i in 0..100u64 {
+    ///     tree.insert(format!("key{i:04}"), "value", i);
+    /// }
+    /// tree.flush_active_memtable(0)?;
+    ///
+    /// let stats = tree.storage_stats()?;
+    /// assert_eq!(stats.item_count, 100);
+    /// // Roughly how many more average-shaped entries fit in another 1 MiB.
+    /// let _headroom = stats.estimated_remaining_entries(1024 * 1024);
+    /// #
+    /// # Ok::<(), TreeError>(())
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a live file's size cannot be stat-ed.
+    fn storage_stats(&self) -> crate::Result<crate::StorageStats> {
+        crate::storage_stats::compute_storage_stats(&self.current_version(), false, true)
+    }
+
     /// Proactively verifies every block's XXH3 checksum across every SST in
     /// the tree's current version — a scrubber for catching bit rot before it
     /// surfaces as a user-visible read failure (cron / scrub jobs).

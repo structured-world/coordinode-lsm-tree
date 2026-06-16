@@ -23,6 +23,14 @@ pub struct Metadata {
     /// Written key count (unique keys)
     pub key_count: usize,
 
+    /// Sum of user-key byte lengths across all written entries (every version,
+    /// pairs with `item_count`). Drives the average-entry-shape introspection.
+    pub sum_user_key_bytes: u64,
+
+    /// Sum of value byte lengths across all written entries (every version,
+    /// pairs with `item_count`).
+    pub sum_value_bytes: u64,
+
     /// Current file position of writer
     pub file_pos: BlockOffset,
 
@@ -59,6 +67,8 @@ impl Default for Metadata {
             weak_tombstone_count: 0,
             weak_tombstone_reclaimable_count: 0,
             key_count: 0,
+            sum_user_key_bytes: 0,
+            sum_value_bytes: 0,
             file_pos: BlockOffset(0),
             uncompressed_size: 0,
 
