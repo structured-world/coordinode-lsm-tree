@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1781564992075,
+  "lastUpdate": 1781592341626,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -16926,6 +16926,84 @@ window.BENCHMARK_DATA = {
             "value": 719077.8002666563,
             "unit": "ops/sec",
             "extra": "P50: 1.2us | P99: 4.5us | P99.9: 7.1us\nthreads: 1 | elapsed: 0.28s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "fbc783b3f584f0953a47e7740571863b9a7a22e0",
+          "message": "perf(memtable): devirtualize the default comparator in skiplist search (#480)\n\n## Summary\n\nThe skiplist's `compare_key` / `compare_nodes` dispatched user-key\ncomparison through the `SharedComparator` trait object — a `dyn` vtable\nindirect call — on **every node visited** during a search (O(log n) per\ninsert/lookup, on the hottest memtable path). The indirect call also\nblocks LLVM from inlining the underlying `memcmp`.\n\nCache `comparator.is_lexicographic()` once at construction and, for the\ndefault byte-ordering comparator (the overwhelmingly common case),\ncompare the user keys with a direct `slice::cmp` instead of the vtable\ncall. Custom comparators still go through the trait. Ordering semantics\nare unchanged.\n\n## Why land it\n\nRemoving a per-comparison vtable indirect call on the hottest\nmemtable-write path is an architecturally clean, zero-risk reduction of\nwork — the kind of small hot-path win that compounds (many such gains\nsum into P99).\n\n## Honest measurement note\n\nI could **not** decisively prove a wall-clock win on the available\nshared bench runner, and I'm not going to claim one inside the noise:\n\n- `db_bench fillrandom` wall-clock: ~1.5-2% median improvement, but the\nrun-to-run distributions overlap (~5% spread on the pinned single-core\nbench) — at the noise floor.\n- `db_bench` instruction counts are non-deterministic here (random keys\n→ varying skiplist depth; even small-N fillseq varied ~6%), so they\ndon't give a clean delta.\n- The `memtable get` criterion microbench uses a non-deterministic\n(random) setup, so its cross-run comparison is meaningless (swings of\n±20-90% between configs, not from this change).\n\nWhat **is** solid: the change is mechanically a strict reduction (one\nindirect call + an un-inlined `memcmp` per comparison removed for the\ndefault comparator), and correctness is unchanged — the full\n**1234-test** lib suite passes and clippy is clean.\n\n## Verification\n\n- `cargo check --all-features`: clean.\n- 1234/1234 lib tests pass; 86/86 skiplist/memtable tests pass; clippy\nclean.\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n## Summary by CodeRabbit\n\n* **Refactor**\n* Optimized skip list key comparisons by leveraging a cached\nlexicographic check to speed up common ordering paths, while keeping\ncustom comparator behavior consistent.\n\n* **Tests**\n* Added coverage for non-lexicographic custom comparators to confirm\nboth forward and reverse iteration follow the expected custom ordering.\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-06-16T09:44:43+03:00",
+          "tree_id": "b5503a0b624ea47518cd1313d71d85c707f95b46",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/fbc783b3f584f0953a47e7740571863b9a7a22e0"
+        },
+        "date": 1781592331948,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 2162656.206359963,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 1.6us | P99.9: 3.7us\nthreads: 1 | elapsed: 0.09s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1166545.4003838121,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.2us | P99.9: 4.6us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 891178.2624725044,
+            "unit": "ops/sec",
+            "extra": "P50: 1.0us | P99: 4.3us | P99.9: 7.3us\nthreads: 1 | elapsed: 0.22s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3660624.9272450795,
+            "unit": "ops/sec",
+            "extra": "P50: 0.1us | P99: 3.2us | P99.9: 5.8us\nthreads: 1 | elapsed: 0.05s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 470209.3991981218,
+            "unit": "ops/sec",
+            "extra": "P50: 1.8us | P99: 5.2us | P99.9: 8.4us\nthreads: 1 | elapsed: 0.43s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 236848.48515107672,
+            "unit": "ops/sec",
+            "extra": "P50: 3.8us | P99: 8.7us | P99.9: 11.1us\nthreads: 1 | elapsed: 0.84s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1188853.2077054712,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.2us | P99.9: 4.7us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1076219.2229283943,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 1.4us | P99.9: 2.5us\nthreads: 1 | elapsed: 0.19s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 725392.4730535013,
+            "unit": "ops/sec",
+            "extra": "P50: 1.2us | P99: 4.6us | P99.9: 7.2us\nthreads: 1 | elapsed: 0.28s | num: 200000 | iterations: 3"
           }
         ]
       }
