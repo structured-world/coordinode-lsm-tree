@@ -198,6 +198,72 @@ fn admission_counts_blob_files_not_just_the_index() -> lsm_tree::Result<()> {
 }
 
 #[test]
+fn every_gated_write_admits_when_the_gate_is_open() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let tree = open_tree(folder.path());
+    seed(&tree);
+
+    // Admission enabled but with a generous budget: the gate is open, so every
+    // gated write entry takes its Ok branch.
+    tree.update_runtime_config(|c| {
+        c.storage_admission_check = true;
+        c.storage_limit_bytes = Some(1024 * 1024 * 1024);
+    })?;
+    assert!(tree.write_admission().is_ok());
+    assert!(!tree.is_read_only());
+
+    assert!(
+        tree.try_insert(b"a".as_slice(), b"v".as_slice(), 1000)
+            .is_ok()
+    );
+    assert!(
+        tree.try_merge(b"b".as_slice(), b"v".as_slice(), 1001)
+            .is_ok()
+    );
+    assert!(tree.try_remove(b"a".as_slice(), 1002).is_ok());
+    assert!(tree.try_remove_weak(b"b".as_slice(), 1003).is_ok());
+    assert!(
+        tree.try_remove_range(b"a".as_slice(), b"z".as_slice(), 1004)
+            .is_ok()
+    );
+    Ok(())
+}
+
+#[test]
+fn admission_enabled_without_a_budget_is_unbounded() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let tree = open_tree(folder.path());
+    seed(&tree);
+
+    // Admission on but no configured quota → unbounded (the disk-free probe
+    // that would otherwise narrow the limit is a follow-up). Writes admit.
+    tree.update_runtime_config(|c| {
+        c.storage_admission_check = true;
+        c.storage_limit_bytes = None;
+    })?;
+    assert!(!tree.is_read_only());
+    assert!(
+        tree.try_insert(b"k".as_slice(), b"v".as_slice(), 1000)
+            .is_ok()
+    );
+    Ok(())
+}
+
+#[test]
+fn blob_tree_admits_gated_writes_when_open() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let tree = open_blob_tree(folder.path());
+    tree.insert(b"seed".as_slice(), b"value".as_slice(), 0);
+    tree.flush_active_memtable(0)?;
+
+    // Gate open (admission off by default): the BlobTree forward admits.
+    assert!(tree.write_admission().is_ok());
+    assert!(!tree.is_read_only());
+    assert!(tree.try_insert(b"k".as_slice(), b"v".as_slice(), 1).is_ok());
+    Ok(())
+}
+
+#[test]
 fn flush_and_bare_insert_are_never_gated_at_the_limit() -> lsm_tree::Result<()> {
     let folder = get_tmp_folder();
     let tree = open_tree(folder.path());
