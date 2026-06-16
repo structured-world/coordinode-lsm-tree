@@ -306,7 +306,7 @@ impl SkipMap {
 
     /// Test-only: corrupts the first node's `value_type` low bits to an invalid
     /// discriminant (0b111), keeping the presence + algorithm bits intact.
-    /// Simulates a RAM bit-flip in the value_type byte so the residence
+    /// Simulates a RAM bit-flip in the `value_type` byte so the residence
     /// verifier can be checked to fail closed instead of panicking.
     #[cfg(test)]
     #[expect(
@@ -354,8 +354,12 @@ impl SkipMap {
             match self.node_kv_digest(node) {
                 NodeKvDigest::Absent => {}
                 NodeKvDigest::Present(stored, algo) => {
-                    let item =
-                        InternalValue::new(self.node_internal_key(node), self.node_value(node));
+                    // Decode the key fallibly: a corrupt value_type on a
+                    // digest-bearing node must fail closed here, not panic.
+                    let item = InternalValue::new(
+                        self.node_internal_key_checked(node)?,
+                        self.node_value(node),
+                    );
                     let recomputed = crate::table::block::kv_checksum::kv_digest(&item, algo)
                         .ok_or(crate::Error::FeatureUnsupported("kv-checksum-algorithm"))?;
                     // AtInsert stores the low 32 bits; truncate the recompute the
@@ -657,6 +661,28 @@ impl SkipMap {
             seqno,
             value_type: vt,
         }
+    }
+
+    /// Like [`Self::node_internal_key`] but returns a typed error instead of
+    /// panicking when the node's `value_type` bits are not a valid discriminant.
+    ///
+    /// Used on the residence-verify path ([`Self::verify_kv_digests`]) so a node
+    /// whose metadata was corrupted in RAM fails closed with
+    /// [`crate::Error::InvalidTag`] rather than aborting the process via the
+    /// `expect` in [`Self::node_value_type`].
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "metadata is exactly OFF_TOWER (24) bytes by construction"
+    )]
+    fn node_internal_key_checked(&self, node: u32) -> crate::Result<InternalKey> {
+        let vt_byte = unsafe { self.meta(node) }[10] & VALUE_TYPE_MASK;
+        let value_type = ValueType::try_from(vt_byte)
+            .map_err(|()| crate::Error::InvalidTag(("memtable-value-type", vt_byte)))?;
+        Ok(InternalKey {
+            user_key: self.node_user_key_bytes(node).into(),
+            seqno: self.node_seqno(node),
+            value_type,
+        })
     }
 
     /// Reads the value for `node` from the lock-free value store (wait-free).
