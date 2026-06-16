@@ -304,6 +304,26 @@ impl SkipMap {
         }
     }
 
+    /// Test-only: corrupts the first node's `value_type` low bits to an invalid
+    /// discriminant (0b111), keeping the presence + algorithm bits intact.
+    /// Simulates a RAM bit-flip in the value_type byte so the residence
+    /// verifier can be checked to fail closed instead of panicking.
+    #[cfg(test)]
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "node metadata is exactly OFF_TOWER bytes; index 10 is the value_type byte"
+    )]
+    pub(crate) fn test_corrupt_first_node_value_type(&self) {
+        let node = self.first_node();
+        assert_ne!(node, UNSET, "skiplist must be non-empty to corrupt");
+        // SAFETY: `node` is a valid allocated node; its metadata is OFF_TOWER
+        // bytes, so index 10 (the value_type byte) is in bounds.
+        unsafe {
+            let m = self.arena.get_bytes_mut(node, OFF_TOWER);
+            m[10] = (m[10] & !VALUE_TYPE_MASK) | VALUE_TYPE_MASK; // low bits = 0b111 (invalid)
+        }
+    }
+
     /// Returns `true` if the skiplist is empty.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
@@ -1324,6 +1344,26 @@ mod tests {
         assert!(
             map.verify_kv_digests().is_err(),
             "a present digest under a non-4-byte algorithm must be rejected, not verified"
+        );
+    }
+
+    #[test]
+    fn verify_kv_digests_fails_closed_on_corrupt_value_type() {
+        // A digest-bearing node whose value_type bits were corrupted to an
+        // invalid discriminant must surface a typed error from the residence
+        // verifier, not panic (the verifier reconstructs the key, which decodes
+        // value_type). Fail closed.
+        let algo = ChecksumAlgorithm::Xxh3Low32;
+        let map = new_map();
+        let key = make_key(b"k", 1);
+        let val = make_value(b"v");
+        map.insert_with_kv_digest(&key, &val, Some((digest4(&key, &val, algo), algo)));
+
+        map.test_corrupt_first_node_value_type();
+
+        assert!(
+            map.verify_kv_digests().is_err(),
+            "corrupt value_type on a digest-bearing node must fail closed, not panic"
         );
     }
 
