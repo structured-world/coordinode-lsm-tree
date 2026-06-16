@@ -88,6 +88,11 @@ pub struct SkipMap {
     values: ValueStore,
     /// User key comparator for ordering entries.
     comparator: SharedComparator,
+    /// Cached `comparator.is_lexicographic()`, read once at construction.
+    /// Lets the per-comparison hot path (`compare_key`) take a direct,
+    /// inlinable `slice::cmp` for the default byte-ordering comparator instead
+    /// of an indirect `dyn` vtable call on every node visited during a search.
+    is_lexicographic: bool,
     /// Offset of the sentinel head node in the arena.
     head: u32,
     /// Current maximum height of any inserted node.
@@ -146,10 +151,12 @@ impl SkipMap {
             if p == 0 { 0xDEAD_BEEF } else { p }
         };
 
+        let is_lexicographic = comparator.is_lexicographic();
         Self {
             arena,
             values: ValueStore::new(),
             comparator,
+            is_lexicographic,
             head,
             height: AtomicUsize::new(1),
             len: AtomicUsize::new(0),
@@ -503,7 +510,18 @@ impl SkipMap {
         let node_uk = self.node_user_key_bytes(node);
         let target_uk: &[u8] = &target.user_key;
 
-        match self.comparator.compare(node_uk, target_uk) {
+        // Hot path: for the default byte-ordering comparator, compare the user
+        // keys with a direct `slice::cmp` (inlines to `memcmp`) instead of the
+        // `dyn` vtable call. This search visits O(log n) nodes per insert/lookup
+        // and is the dominant memtable-write cost, so removing the indirect call
+        // per visit matters. Custom comparators still go through the trait.
+        let uk_ord = if self.is_lexicographic {
+            node_uk.cmp(target_uk)
+        } else {
+            self.comparator.compare(node_uk, target_uk)
+        };
+
+        match uk_ord {
             CmpOrdering::Equal => {
                 // Reverse seqno: higher seqno sorts first.
                 let node_seq = self.node_seqno(node);
@@ -521,7 +539,14 @@ impl SkipMap {
     fn compare_nodes(&self, a: u32, b: u32) -> CmpOrdering {
         let a_uk = self.node_user_key_bytes(a);
         let b_uk = self.node_user_key_bytes(b);
-        match self.comparator.compare(a_uk, b_uk) {
+        // Same direct-`slice::cmp` fast path as `compare_key` for the default
+        // comparator (avoids the `dyn` vtable call per comparison).
+        let uk_ord = if self.is_lexicographic {
+            a_uk.cmp(b_uk)
+        } else {
+            self.comparator.compare(a_uk, b_uk)
+        };
+        match uk_ord {
             CmpOrdering::Equal => {
                 let a_seq = self.node_seqno(a);
                 let b_seq = self.node_seqno(b);
@@ -1017,6 +1042,58 @@ mod tests {
         assert_eq!(entry.key().seqno, 1);
         assert_eq!(&*entry.value(), b"world");
         assert!(iter.next().is_none());
+    }
+
+    #[test]
+    fn custom_comparator_orders_and_reverse_iterates() {
+        // A non-lexicographic comparator (orders user keys in REVERSE byte
+        // order) exercises the trait-dispatch (`else`) branch of compare_key
+        // (via insert / find_splice) and compare_nodes (via reverse iteration /
+        // find_predecessor) — the paths the default lexicographic fast path
+        // skips.
+        #[derive(Debug)]
+        struct ReverseComparator;
+        impl crate::comparator::UserComparator for ReverseComparator {
+            fn name(&self) -> &'static str {
+                "reverse-test"
+            }
+            fn compare(&self, a: &[u8], b: &[u8]) -> core::cmp::Ordering {
+                b.cmp(a)
+            }
+            fn is_lexicographic(&self) -> bool {
+                false
+            }
+        }
+
+        let map = SkipMap::new(alloc::sync::Arc::new(ReverseComparator));
+        assert!(
+            !map.is_lexicographic,
+            "a custom comparator must take the trait-dispatch path"
+        );
+
+        map.insert(&make_key(b"aaa", 1), &make_value(b"a"));
+        map.insert(&make_key(b"ccc", 1), &make_value(b"c"));
+        map.insert(&make_key(b"bbb", 1), &make_value(b"b"));
+
+        // Forward iteration follows the custom (reverse) order.
+        let fwd: Vec<Vec<u8>> = map.iter().map(|e| e.key().user_key.to_vec()).collect();
+        assert_eq!(
+            fwd,
+            vec![b"ccc".to_vec(), b"bbb".to_vec(), b"aaa".to_vec()],
+            "custom comparator orders entries in reverse byte order"
+        );
+
+        // Reverse iteration (drives compare_nodes via find_predecessor) mirrors it.
+        let rev: Vec<Vec<u8>> = map
+            .iter()
+            .rev()
+            .map(|e| e.key().user_key.to_vec())
+            .collect();
+        assert_eq!(
+            rev,
+            vec![b"aaa".to_vec(), b"bbb".to_vec(), b"ccc".to_vec()],
+            "reverse iteration mirrors the custom order"
+        );
     }
 
     #[test]
