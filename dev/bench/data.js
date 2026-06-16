@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1781624166914,
+  "lastUpdate": 1781635437879,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -17238,6 +17238,84 @@ window.BENCHMARK_DATA = {
             "value": 715017.3685762773,
             "unit": "ops/sec",
             "extra": "P50: 1.2us | P99: 4.4us | P99.9: 6.8us\nthreads: 1 | elapsed: 0.28s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "49699333+dependabot[bot]@users.noreply.github.com",
+            "name": "dependabot[bot]",
+            "username": "dependabot[bot]"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "c37650e2a4816dacbee17a186c90cb0aad1b1a52",
+          "message": "ci(deps): bump rust-lang/crates-io-auth-action from 1.0.4 to 1.0.5 (#491)\n\nBumps\n[rust-lang/crates-io-auth-action](https://github.com/rust-lang/crates-io-auth-action)\nfrom 1.0.4 to 1.0.5.\n<details>\n<summary>Release notes</summary>\n<p><em>Sourced from <a\nhref=\"https://github.com/rust-lang/crates-io-auth-action/releases\">rust-lang/crates-io-auth-action's\nreleases</a>.</em></p>\n<blockquote>\n<h2>v1.0.5</h2>\n<h2>What's Changed</h2>\n<ul>\n<li>update to tsdown 0.22 by <a\nhref=\"https://github.com/marcoieni\"><code>@​marcoieni</code></a> in <a\nhref=\"https://redirect.github.com/rust-lang/crates-io-auth-action/pull/239\">rust-lang/crates-io-auth-action#239</a>\nand <a\nhref=\"https://redirect.github.com/rust-lang/crates-io-auth-action/pull/254\">rust-lang/crates-io-auth-action#254</a></li>\n<li>update to typescript 6 by <a\nhref=\"https://github.com/marcoieni\"><code>@​marcoieni</code></a> in <a\nhref=\"https://redirect.github.com/rust-lang/crates-io-auth-action/pull/256\">rust-lang/crates-io-auth-action#256</a></li>\n<li>other dependency updates</li>\n</ul>\n<h2>Internal changes</h2>\n<ul>\n<li>renovate: rename updateTypes field by <a\nhref=\"https://github.com/marcoieni\"><code>@​marcoieni</code></a> in <a\nhref=\"https://redirect.github.com/rust-lang/crates-io-auth-action/pull/219\">rust-lang/crates-io-auth-action#219</a></li>\n<li>renovate: don't raise individual PRs for crates non breaking changes\nby <a href=\"https://github.com/marcoieni\"><code>@​marcoieni</code></a>\nin <a\nhref=\"https://redirect.github.com/rust-lang/crates-io-auth-action/pull/220\">rust-lang/crates-io-auth-action#220</a></li>\n<li>use rust-lang renovate preset by <a\nhref=\"https://github.com/marcoieni\"><code>@​marcoieni</code></a> in <a\nhref=\"https://redirect.github.com/rust-lang/crates-io-auth-action/pull/235\">rust-lang/crates-io-auth-action#235</a></li>\n<li>ci(links): accept 403 as success by <a\nhref=\"https://github.com/marcoieni\"><code>@​marcoieni</code></a> in <a\nhref=\"https://redirect.github.com/rust-lang/crates-io-auth-action/pull/263\">rust-lang/crates-io-auth-action#263</a></li>\n</ul>\n<p><strong>Full Changelog</strong>: <a\nhref=\"https://github.com/rust-lang/crates-io-auth-action/compare/v1.0.4...v1.0.5\">https://github.com/rust-lang/crates-io-auth-action/compare/v1.0.4...v1.0.5</a></p>\n</blockquote>\n</details>\n<details>\n<summary>Commits</summary>\n<ul>\n<li><a\nhref=\"https://github.com/rust-lang/crates-io-auth-action/commit/c6f97d42243bad5fab37ca0427f495c86d5b1a18\"><code>c6f97d4</code></a>\nMerge pull request <a\nhref=\"https://redirect.github.com/rust-lang/crates-io-auth-action/issues/259\">#259</a>\nfrom rust-lang/renovate/lock-file-maintenance</li>\n<li><a\nhref=\"https://github.com/rust-lang/crates-io-auth-action/commit/b929a92a23966592174006fd5b96e64d1cd075df\"><code>b929a92</code></a>\npackage dist</li>\n<li><a\nhref=\"https://github.com/rust-lang/crates-io-auth-action/commit/9d23f3b135e2f6cca30b6009ba96b400571031c9\"><code>9d23f3b</code></a>\nchore(deps): lock file maintenance</li>\n<li><a\nhref=\"https://github.com/rust-lang/crates-io-auth-action/commit/2b6b194a918a46e109251a59b4ebbc1301217ebb\"><code>2b6b194</code></a>\nMerge pull request <a\nhref=\"https://redirect.github.com/rust-lang/crates-io-auth-action/issues/263\">#263</a>\nfrom rust-lang/ci-links-accept-403-as-failure</li>\n<li><a\nhref=\"https://github.com/rust-lang/crates-io-auth-action/commit/1a7afc2bc1530b81a443462a0bf0c991f6638eac\"><code>1a7afc2</code></a>\nci(links): accept 403 as success</li>\n<li><a\nhref=\"https://github.com/rust-lang/crates-io-auth-action/commit/701b15ca19185730da2d99d59d5ab21abc40c188\"><code>701b15c</code></a>\nMerge pull request <a\nhref=\"https://redirect.github.com/rust-lang/crates-io-auth-action/issues/260\">#260</a>\nfrom rust-lang/renovate/tsdown-0.x-lockfile</li>\n<li><a\nhref=\"https://github.com/rust-lang/crates-io-auth-action/commit/cf898e1b39ff976b829787fb4df05671cd380fda\"><code>cf898e1</code></a>\npackage dist</li>\n<li><a\nhref=\"https://github.com/rust-lang/crates-io-auth-action/commit/1a6a6213fc40463948b2c5791665943b6f911792\"><code>1a6a621</code></a>\nchore(deps): update dependency tsdown to v0.22.2</li>\n<li><a\nhref=\"https://github.com/rust-lang/crates-io-auth-action/commit/9f93ac2286e4f1a6e86b5f77b890fda4566f5c03\"><code>9f93ac2</code></a>\nMerge pull request <a\nhref=\"https://redirect.github.com/rust-lang/crates-io-auth-action/issues/261\">#261</a>\nfrom rust-lang/renovate/github-actions</li>\n<li><a\nhref=\"https://github.com/rust-lang/crates-io-auth-action/commit/54634519e6897c380989f809cc0e8c9374f3342d\"><code>5463451</code></a>\nchore(deps): update github actions to v6.0.3</li>\n<li>Additional commits viewable in <a\nhref=\"https://github.com/rust-lang/crates-io-auth-action/compare/bbd81622f20ce9e2dd9622e3218b975523e45bbe...c6f97d42243bad5fab37ca0427f495c86d5b1a18\">compare\nview</a></li>\n</ul>\n</details>\n<br />\n\n\n[![Dependabot compatibility\nscore](https://dependabot-badges.githubapp.com/badges/compatibility_score?dependency-name=rust-lang/crates-io-auth-action&package-manager=github_actions&previous-version=1.0.4&new-version=1.0.5)](https://docs.github.com/en/github/managing-security-vulnerabilities/about-dependabot-security-updates#about-compatibility-scores)\n\nDependabot will resolve any conflicts with this PR as long as you don't\nalter it yourself. You can also trigger a rebase manually by commenting\n`@dependabot rebase`.\n\n[//]: # (dependabot-automerge-start)\n[//]: # (dependabot-automerge-end)\n\n---\n\n<details>\n<summary>Dependabot commands and options</summary>\n<br />\n\nYou can trigger Dependabot actions by commenting on this PR:\n- `@dependabot rebase` will rebase this PR\n- `@dependabot recreate` will recreate this PR, overwriting any edits\nthat have been made to it\n- `@dependabot show <dependency name> ignore conditions` will show all\nof the ignore conditions of the specified dependency\n- `@dependabot ignore this major version` will close this PR and stop\nDependabot creating any more for this major version (unless you reopen\nthe PR or upgrade to it yourself)\n- `@dependabot ignore this minor version` will close this PR and stop\nDependabot creating any more for this minor version (unless you reopen\nthe PR or upgrade to it yourself)\n- `@dependabot ignore this dependency` will close this PR and stop\nDependabot creating any more for this dependency (unless you reopen the\nPR or upgrade to it yourself)\n\n\n</details>\n\nSigned-off-by: dependabot[bot] <support@github.com>\nCo-authored-by: dependabot[bot] <49699333+dependabot[bot]@users.noreply.github.com>",
+          "timestamp": "2026-06-16T21:42:47+03:00",
+          "tree_id": "3e27a3082749e22108978dcf4c986cd43102f9b2",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/c37650e2a4816dacbee17a186c90cb0aad1b1a52"
+        },
+        "date": 1781635422355,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 1882851.3784538521,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.7us | P99.9: 3.7us\nthreads: 1 | elapsed: 0.11s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1192867.4494875208,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.2us | P99.9: 4.4us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 914588.2496262535,
+            "unit": "ops/sec",
+            "extra": "P50: 0.9us | P99: 4.1us | P99.9: 6.6us\nthreads: 1 | elapsed: 0.22s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3787079.7714270134,
+            "unit": "ops/sec",
+            "extra": "P50: 0.1us | P99: 3.1us | P99.9: 5.5us\nthreads: 1 | elapsed: 0.05s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 470282.1480085379,
+            "unit": "ops/sec",
+            "extra": "P50: 1.8us | P99: 5.2us | P99.9: 8.3us\nthreads: 1 | elapsed: 0.43s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 238088.64502384298,
+            "unit": "ops/sec",
+            "extra": "P50: 3.8us | P99: 8.6us | P99.9: 10.9us\nthreads: 1 | elapsed: 0.84s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1196561.1240126658,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.2us | P99.9: 4.7us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1063258.8342069697,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 1.5us | P99.9: 2.6us\nthreads: 1 | elapsed: 0.19s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 702693.8432526774,
+            "unit": "ops/sec",
+            "extra": "P50: 1.2us | P99: 5.6us | P99.9: 9.3us\nthreads: 1 | elapsed: 0.28s | num: 200000 | iterations: 3"
           }
         ]
       }
